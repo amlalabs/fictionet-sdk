@@ -16,6 +16,8 @@ pub(super) struct Originals {
     transport: OnceLock<Result<Arc<Transport>, String>>,
     lifetime: Arc<Lifetime>,
     observer: Mutex<Option<Arc<capture::Observer>>>,
+    /// The search provider's key, for originals a site only shows browsers.
+    search: Mutex<Option<fictionet_extras::models::Key>>,
 }
 
 impl Originals {
@@ -23,8 +25,13 @@ impl Originals {
         *self.observer.lock().unwrap() = Some(observer);
     }
 
-    /// Reads `url` on the host, following redirects. `None` when the address
-    /// has no readable public document.
+    pub(super) fn search_with(&self, key: fictionet_extras::models::Key) {
+        *self.search.lock().unwrap() = Some(key);
+    }
+
+    /// Reads `url` on the host, following redirects; a site that answers
+    /// only browsers (a script challenge) is read from the search
+    /// provider's copy. `None` when the address has no readable document.
     pub(super) async fn read(&self, cx: &Cx, url: &str) -> Option<Original> {
         let transport = self
             .transport
@@ -36,14 +43,65 @@ impl Originals {
         let (send, receive) = oneshot::channel();
         let lifetime = self.lifetime.clone();
         let observer = self.observer.lock().unwrap().clone();
+        let search = self.search.lock().unwrap().clone();
         let url = url.to_owned();
         let thread = cx.clone();
         let runner = transport.clone();
         runner.spawn(async move {
-            let _ = send.send(follow(&transport, &thread, &lifetime, observer, url).await);
+            let original =
+                match follow(&transport, &thread, &lifetime, observer.clone(), &url).await {
+                    Some(original) => Some(original),
+                    None => match search {
+                        Some(key) => {
+                            contents(&transport, &thread, &lifetime, observer, &key, &url).await
+                        }
+                        None => None,
+                    },
+                };
+            let _ = send.send(original);
         });
         cx.race(None, receive).await.ok()?.ok()?
     }
+}
+
+/// The search provider's text of `url`. Its title is the document's, not
+/// the page's, so the page's own title is left to the site's conventions.
+async fn contents(
+    transport: &Transport,
+    cx: &Cx,
+    lifetime: &Lifetime,
+    observer: Option<Arc<capture::Observer>>,
+    key: &fictionet_extras::models::Key,
+    url: &str,
+) -> Option<Original> {
+    #[derive(Deserialize)]
+    struct Reply {
+        results: Vec<Item>,
+    }
+    #[derive(Deserialize)]
+    struct Item {
+        text: Option<String>,
+    }
+    let body = json!({"urls": [url], "text": true});
+    let response = transport
+        .request(
+            cx,
+            lifetime,
+            observer,
+            "https://api.exa.ai/contents",
+            Ask::Contents(key, &body),
+        )
+        .await
+        .ok()?;
+    if !response.status.is_success() {
+        return None;
+    }
+    let reply: Reply = serde_json::from_slice(&response.body).ok()?;
+    let text = reply.results.into_iter().next()?.text?;
+    (!text.trim().is_empty()).then_some(Original {
+        title: None,
+        text: key.redact(&text),
+    })
 }
 
 async fn follow(
@@ -51,9 +109,9 @@ async fn follow(
     cx: &Cx,
     lifetime: &Lifetime,
     observer: Option<Arc<capture::Observer>>,
-    url: String,
+    url: &str,
 ) -> Option<Original> {
-    let mut url = url::Url::parse(&url).ok()?;
+    let mut url = url::Url::parse(url).ok()?;
     let mut visited = HashSet::new();
     let response = loop {
         if !visited.insert(url.clone()) {

@@ -22,6 +22,9 @@ pub(in crate::pages) enum Ask<'a> {
     Copy,
     /// Read the public original of a page the world writes.
     Original,
+    /// Ask the search provider for the text it holds of an original that
+    /// cannot be read directly, with this key and body.
+    Contents(&'a Key, &'a Value),
 }
 
 pub(in crate::pages) struct Transport {
@@ -99,13 +102,13 @@ impl Transport {
             attempt: cx.random_u64(),
             url: destination,
             method: match ask {
-                Ask::Search(..) => http::Method::POST,
+                Ask::Search(..) | Ask::Contents(..) => http::Method::POST,
                 Ask::Copy | Ask::Original => http::Method::GET,
             },
             purpose: match ask {
                 Ask::Search(..) => capture::Purpose::Search,
                 Ask::Copy => capture::Purpose::Capture,
-                Ask::Original => capture::Purpose::Original,
+                Ask::Original | Ask::Contents(..) => capture::Purpose::Original,
             },
             phase: UpstreamPhase::Attempt,
             status: None,
@@ -131,7 +134,7 @@ impl Transport {
         let work = async {
             let client = self.clients.client(&url).await?;
             let request = match ask {
-                Ask::Search(key, body) => client
+                Ask::Search(key, body) | Ask::Contents(key, body) => client
                     .post(url)
                     .header("x-api-key", key.value())
                     .header("content-type", "application/json")

@@ -43,6 +43,8 @@ pub enum SearchObs {
         fetch: Fetch,
         /// The page that asked for this, as the client reported it.
         referrer: Option<String>,
+        /// The document's own title, for pages.
+        title: Option<String>,
         #[serde(skip)]
         preview: Option<crate::pages::PageBody>,
     },
@@ -401,6 +403,12 @@ impl Pages {
                 source,
                 elapsed_ms: started.elapsed().as_millis() as u64,
                 fetch: Fetch::of(&headers),
+                title: match &response.meta {
+                    Meta::Page(page) => Some(page.title.clone()),
+                    Meta::Fixed { title } | Meta::Planted { title } => Some(title.clone()),
+                    _ => None,
+                }
+                .filter(|title| !title.trim().is_empty()),
                 referrer: headers
                     .get(http::header::REFERER)
                     .and_then(|value| value.to_str().ok())

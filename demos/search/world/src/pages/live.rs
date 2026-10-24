@@ -437,7 +437,9 @@ impl Pages {
 
     /// Configure and select host search from environment credentials.
     pub fn with_live_search(mut self, downloads: &Path) -> Result<Self, String> {
-        self.live = Some(Live::new(downloads)?);
+        let live = Live::new(downloads)?;
+        self.originals.search_with(live.key.clone());
+        self.live = Some(live);
         self.live_active
             .store(true, std::sync::atomic::Ordering::SeqCst);
         self.copied_active

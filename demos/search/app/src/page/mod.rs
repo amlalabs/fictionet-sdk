@@ -14,7 +14,7 @@ use std::{
 };
 use tokio::sync::{mpsc, watch};
 use web_world::{
-    observation::{CallPhase, EgressPurpose, Hit, Observation, PageSource, SearchObs, Tool},
+    observation::{CallPhase, EgressPurpose, Fetch, Hit, Observation, PageSource, SearchObs, Tool},
     pages::{NewPages, Pages},
 };
 
@@ -46,6 +46,8 @@ pub struct Request {
     pub elapsed_ms: u64,
     pub headers: Vec<(String, String)>,
     pub has_preview: bool,
+    pub fetch: Fetch,
+    pub referrer: Option<String>,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct Search {
@@ -93,7 +95,7 @@ pub struct View {
 
 pub struct Views {
     view: View,
-    previews: HashMap<String, web_world::pages::PageBody>,
+    previews: HashMap<String, (web_world::pages::PageBody, PageSource)>,
 }
 impl Default for Views {
     fn default() -> Self {
@@ -136,11 +138,15 @@ impl Views {
                 source,
                 elapsed_ms,
                 headers,
+                fetch,
+                referrer,
+                title: _,
                 preview,
             } => {
                 let url = format!("{scheme}://{host}{path}");
                 if let Some(body) = preview {
-                    self.previews.insert(url.clone(), body.clone());
+                    self.previews
+                        .insert(url.clone(), (body.clone(), source.clone()));
                 } else {
                     self.previews.remove(&url);
                 }
@@ -167,6 +173,8 @@ impl Views {
                             })
                             .collect(),
                         has_preview: preview.is_some(),
+                        fetch: *fetch,
+                        referrer: referrer.clone(),
                     });
             }
             SearchObs::Search {
@@ -281,7 +289,7 @@ impl Views {
             view.activity.push(observation);
         }
     }
-    pub fn preview(&self, url: &url::Url) -> Option<web_world::pages::PageBody> {
+    pub fn preview(&self, url: &url::Url) -> Option<(web_world::pages::PageBody, PageSource)> {
         self.previews.get(url.as_str()).cloned()
     }
     pub fn current(&self) -> View {
@@ -373,15 +381,18 @@ pub struct Page {
     pub host: watch::Sender<HostStatus>,
     world: watch::Sender<WorldState>,
     commands: mpsc::UnboundedSender<Control>,
+    /// The world, while it runs; the page must not keep it (and its
+    /// observation stream) alive.
+    pages: std::sync::Weak<Pages>,
 }
 impl Page {
-    pub fn new(pages: &Pages, preview: bool) -> (Self, Receivers) {
+    pub fn new(pages: Arc<Pages>, preview: bool) -> (Self, Receivers) {
         let views = Views::default();
         let (snapshots, _) = watch::channel(views.current());
         let (observations, receive) = mpsc::unbounded_channel();
         pages.observe(observations);
         let (commands, control) = mpsc::unbounded_channel();
-        let world = world_state(pages, preview);
+        let world = world_state(&pages, preview);
         (
             Self {
                 views: Arc::new(Mutex::new(views)),
@@ -390,6 +401,7 @@ impl Page {
                 host: watch::channel(HostStatus::default()).0,
                 world: watch::channel(world).0,
                 commands,
+                pages: Arc::downgrade(&pages),
             },
             (receive, control),
         )
@@ -567,7 +579,7 @@ impl Page {
                         };
                         let body = page.views.lock().unwrap().preview(&url);
                         match body {
-                            Some(body) => {
+                            Some((body, _)) => {
                                 match tokio::task::spawn_blocking(move || body.text()).await {
                                     Ok(Ok(markup)) => (
                                         http::StatusCode::OK,
@@ -589,6 +601,8 @@ impl Page {
                     }
                 }),
             )
+            .route("/thumbnail", get(thumbnail))
+            .route("/held", get(held))
             .route(
                 "/world",
                 get({
@@ -628,6 +642,95 @@ struct Preview {
     scheme: Option<String>,
     host: String,
     path: String,
+}
+/// A page the world served, by its address.
+#[derive(Deserialize)]
+struct Served {
+    url: url::Url,
+}
+/// A dependency of a served page, read from the source that served it.
+#[derive(Deserialize)]
+struct Dependency {
+    page: url::Url,
+    url: url::Url,
+}
+/// What a still picture of a served page may load: only what the world holds.
+const PICTURE_POLICY: &str = "default-src 'none'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; base-uri 'none'; form-action 'none'";
+fn held_address(page: &url::Url) -> impl Fn(&url::Url) -> String + '_ {
+    move |url| {
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("page", page.as_str())
+            .append_pair("url", url.as_str())
+            .finish();
+        format!("/held?{query}")
+    }
+}
+/// The page as the world served it, with its own stylesheets and images.
+async fn thumbnail(
+    State(page): State<Page>,
+    Query(Served { url }): Query<Served>,
+) -> axum::response::Response {
+    let Some((body, _)) = page.views.lock().unwrap().preview(&url) else {
+        return (http::StatusCode::NOT_FOUND, "No served page").into_response();
+    };
+    let picture = tokio::task::spawn_blocking(move || {
+        body.text()
+            .map(|html| web_world::pages::snapshot::page(&url, &html, &held_address(&url)))
+    })
+    .await;
+    match picture {
+        Ok(Ok(html)) => (
+            [
+                (http::header::CONTENT_TYPE, "text/html; charset=utf-8"),
+                (http::header::CONTENT_SECURITY_POLICY, PICTURE_POLICY),
+            ],
+            html,
+        )
+            .into_response(),
+        _ => (
+            http::StatusCode::INTERNAL_SERVER_ERROR,
+            "The served page could not be read",
+        )
+            .into_response(),
+    }
+}
+async fn held(
+    State(page): State<Page>,
+    Query(Dependency { page: owner, url }): Query<Dependency>,
+) -> axum::response::Response {
+    let Some((_, source)) = page.views.lock().unwrap().preview(&owner) else {
+        return http::StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(pages) = page.pages.upgrade() else {
+        return http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let held = tokio::task::spawn_blocking(move || {
+        let mut held = pages.held_resource(&source, url.as_str())?;
+        if held.content_type.starts_with("text/css") {
+            held.body = web_world::pages::snapshot::stylesheet(
+                &url,
+                &String::from_utf8_lossy(&held.body),
+                &held_address(&owner),
+            )
+            .into_bytes();
+        }
+        Some(held)
+    })
+    .await;
+    match held {
+        Ok(Some(held)) => (
+            [
+                (http::header::CONTENT_TYPE, held.content_type),
+                (
+                    http::header::CONTENT_SECURITY_POLICY,
+                    PICTURE_POLICY.to_owned(),
+                ),
+            ],
+            held.body,
+        )
+            .into_response(),
+        _ => http::StatusCode::NOT_FOUND.into_response(),
+    }
 }
 async fn command(
     State(page): State<Page>,

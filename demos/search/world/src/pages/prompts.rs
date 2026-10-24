@@ -512,8 +512,10 @@ pub fn search(
     let user = format!(
         "Someone searched for: {query}
 
-Pages that already exist in this world. Rank those that fit the query, with
-their URL and title exactly as given:
+Pages that already exist in this world. Include those a real engine would
+rank for this query, with their URL and title exactly as given. They are a
+few of the web's pages; the rest of the list comes from the sites a real
+engine would show:
 {known}
 
 What the world has already said:

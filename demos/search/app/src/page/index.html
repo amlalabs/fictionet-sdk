@@ -16,12 +16,12 @@
     <button data-source="model_written" aria-pressed="false">Model-written</button>
     <button data-source="live" aria-pressed="false">Live</button>
   </div>
-  <div class="toolbar"><button id="agent-toggle" aria-pressed="true">Hide agent</button><span class="run-clock"><span id="clock">00:00</span><span>UTC</span></span><button id="world-toggle" aria-expanded="false" aria-controls="world-menu">World settings</button></div>
+  <div class="toolbar"><button id="agent-toggle" aria-pressed="true">Hide agent</button><span class="run-clock"><span id="clock">00:00:00</span> UTC</span><button id="world-toggle" aria-expanded="false" aria-controls="world-menu">World settings</button></div>
 </header>
 <main>
   <section id="agent" class="agent panel" aria-label="Workstation">
     <div class="windowbar"><span>workstation</span><div class="segments"><button id="terminal-tab" aria-pressed="true">Terminal</button><button id="screen-tab" aria-pressed="false">Screen</button></div></div>
-    <div id="console-status" role="status">Waiting for the workstation…</div>
+    <div id="console-status" role="status">Starting the workstation…</div>
     <div id="terminal" class="console"></div><div id="screen" class="console" hidden></div>
   </section>
   <section id="world" class="world panel" aria-label="Search network">

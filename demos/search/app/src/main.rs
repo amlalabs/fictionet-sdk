@@ -82,7 +82,7 @@ async fn main() -> Result {
     let pages = Arc::new(app_pages(seed.clone(), &downloads, claude_key)?);
     let output = downloads.join("search");
     std::fs::create_dir_all(&output)?;
-    let (page, (observations, commands)) = page::Page::new(&pages, false);
+    let (page, (observations, commands)) = page::Page::new(pages.clone(), false);
     let server = page::serve(page.router(), kit::PAGE_PORT).await?;
     let _access = kit::PageAccess::new(&server.url)?;
     let observe_page = page.clone();
