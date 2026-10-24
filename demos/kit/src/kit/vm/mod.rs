@@ -62,7 +62,7 @@ pub struct Vm {
 impl Vm {
     /// Starts Cloud Hypervisor in its own process group. `dir` holds the
     /// run's API socket and logs.
-    pub fn start(config: &Config, dir: &Path) -> io::Result<Vm> {
+    pub fn start(config: &Config, dir: &Path, ownership: &Ownership) -> io::Result<Vm> {
         let console_log = dir.join("console.log");
         let stderr_log = dir.join("ch.stderr.log");
         let socket_dir = std::fs::File::open(dir)?;
@@ -122,6 +122,7 @@ impl Vm {
             .stderr(Stdio::from(std::fs::File::create(&stderr_log)?))
             .kill_on_drop(true);
         own_child(&mut command);
+        ownership.inherit(&mut command);
         let child = command.spawn()?;
         Ok(Vm {
             child,
@@ -212,30 +213,50 @@ pub fn own_child(command: &mut Command) {
     }
 }
 
-/// Refuses another VM with a disk belonging to the same demo.
-pub(super) fn ensure_stopped(name: &str) -> io::Result<()> {
-    let prefix = std::env::temp_dir().join(format!("{name}-"));
-    let prefix = format!("path={}", prefix.display());
-    for entry in std::fs::read_dir("/proc")? {
-        let entry = entry?;
-        if entry.file_name().to_string_lossy().parse::<u32>().is_err() {
-            continue;
-        }
-        let Ok(args) = std::fs::read(entry.path().join("cmdline")) else {
-            continue;
-        };
-        let args: Vec<_> = args.split(|b| *b == 0).collect();
-        if args
-            .windows(2)
-            .any(|pair| pair[0] == b"--disk" && pair[1].starts_with(prefix.as_bytes()))
+/// Exclusive ownership of a demo, retained by its owner and VM children.
+pub struct Ownership(std::fs::File);
+
+impl Ownership {
+    pub(super) fn acquire(name: &str) -> io::Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"-_".contains(&c))
         {
-            return Err(io::Error::other(format!(
-                "{name} still has a VM running as PID {}; stop that process before starting again",
-                entry.file_name().to_string_lossy()
-            )));
+            return Err(io::Error::other("invalid demo name"));
+        }
+        // The file stays in place so contenders always lock the same inode.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(
+                std::env::temp_dir().join(format!("{name}-{}.lock", unsafe { libc::geteuid() })),
+            )?;
+        file.try_lock().map_err(|error| {
+            io::Error::other(format!(
+                "{name} is already owned or cannot be locked: {error}"
+            ))
+        })?;
+        Ok(Self(file))
+    }
+
+    fn inherit(&self, command: &mut Command) {
+        let fd = self.0.as_raw_fd();
+        // SAFETY: fcntl changes only the child's descriptor flags before exec.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
         }
     }
-    Ok(())
 }
 
 /// Writes `bytes` to a write-protected, in-memory file and returns it, ready to exec
@@ -297,28 +318,21 @@ mod process_tests {
     use super::*;
 
     #[tokio::test]
-    async fn startup_refuses_a_vm_using_the_same_demos_disk() {
+    async fn demo_ownership_is_exclusive_until_owner_and_children_exit() {
         let name = format!("owned-demo-{}", std::process::id());
-        let disk = format!(
-            "path={}/{}-old/workstation/overlay.qcow2,image_type=qcow2",
-            std::env::temp_dir().display(),
-            name
-        );
-        let mut stale = Command::new("sh")
-            .args(["-c", "read value", "--disk", &disk])
+        let ownership = Ownership::acquire(&name).unwrap();
+        assert!(Ownership::acquire(&name).is_err());
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "read value"])
             .stdin(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
-        let error = ensure_stopped(&name).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains(&format!("PID {}", stale.id().unwrap()))
-        );
-        ensure_stopped(&format!("{name}-different")).unwrap();
-        stale.kill().await.unwrap();
-        ensure_stopped(&name).unwrap();
+            .kill_on_drop(true);
+        ownership.inherit(&mut command);
+        let mut child = command.spawn().unwrap();
+        drop(ownership);
+        assert!(Ownership::acquire(&name).is_err());
+        child.kill().await.unwrap();
+        Ownership::acquire(&name).unwrap();
     }
 
     #[tokio::test]

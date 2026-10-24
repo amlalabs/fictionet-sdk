@@ -12,6 +12,7 @@ fictionet-host = { path = "../../../host" }
 bytes = "1"
 fictionet = { path = "../../..", features = ["web-proxy"] }
 http = "1"
+libc = "0.2"
 http-body-util = "0.1"
 form_urlencoded = "1"
 regex = "1"

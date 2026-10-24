@@ -2,9 +2,15 @@
 
 use super::*;
 use std::{
-    io::Write,
+    io::{Read, Write},
+    os::{
+        fd::AsRawFd,
+        unix::{net::UnixStream, process::CommandExt},
+    },
     path::PathBuf,
     process::{Command, Stdio},
+    sync::atomic::{AtomicUsize, Ordering},
+    time::{Duration, Instant},
 };
 
 impl Pages {
@@ -55,15 +61,14 @@ impl Pages {
         *backend_request.method_mut() = request.method.clone();
         *backend_request.uri_mut() = request.uri.clone();
         *backend_request.headers_mut() = request.headers.clone();
-        let (send, receive) = tokio::sync::oneshot::channel();
-        std::thread::spawn(move || {
-            let _ = send.send(backend(repository.join(endpoint), backend_request));
-        });
         let response = cx
-            .race(Some(cx.now() + std::time::Duration::from_secs(30)), receive)
+            .race(
+                Some(cx.now() + Duration::from_secs(30)),
+                backend(repository.join(endpoint), backend_request),
+            )
             .await;
         Some(match response {
-            Ok(Ok(Ok(response))) => replay(Ok(Some(response))),
+            Ok(Ok(response)) => replay(Ok(Some(response))),
             _ => Response::new(
                 502,
                 "text/plain; charset=utf-8",
@@ -75,7 +80,7 @@ impl Pages {
     }
 }
 
-fn backend(
+async fn backend(
     path: PathBuf,
     request: http::Request<Vec<u8>>,
 ) -> std::io::Result<fictionet_extras::warc::Response> {
@@ -116,24 +121,37 @@ fn backend(
             command.env(variable, value);
         }
     }
-    let mut child = command.spawn()?;
-    let mut input = child.stdin.take().expect("piped backend input");
-    // Drain stdout while supplying input: upload-pack can answer before consuming
-    // the whole negotiation, so a serial write followed by read can deadlock.
-    let writer = std::thread::spawn(move || input.write_all(&body));
-    let output = child.wait_with_output()?;
-    writer
-        .join()
-        .map_err(|_| std::io::Error::other("backend input stopped"))??;
-    if !output.status.success() {
-        return Err(std::io::Error::other("Git backend failed"));
+    static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+    struct Permit;
+    impl Drop for Permit {
+        fn drop(&mut self) {
+            ACTIVE.fetch_sub(1, Ordering::SeqCst);
+        }
     }
+    ACTIVE
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+            (n < 4).then_some(n + 1)
+        })
+        .map_err(|_| std::io::Error::other("Git backend is busy"))?;
+    let permit = Permit;
+    command.process_group(0);
+    let process = Backend(command.spawn()?);
+    let (cancel, stopped) = UnixStream::pair()?;
+    let (send, receive) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let _permit = permit;
+        let _ = send.send(process.exchange(&body, stopped, Duration::from_secs(30)));
+    });
+    // Dropping the future closes the socket and wakes the owned process worker.
+    let output = receive
+        .await
+        .map_err(|_| std::io::Error::other("Git backend stopped"))??;
+    drop(cancel);
     let end = output
-        .stdout
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .ok_or_else(|| std::io::Error::other("missing CGI headers"))?;
-    let head = std::str::from_utf8(&output.stdout[..end]).map_err(std::io::Error::other)?;
+    let head = std::str::from_utf8(&output[..end]).map_err(std::io::Error::other)?;
     let mut status = http::StatusCode::OK;
     let mut headers = http::HeaderMap::new();
     for line in head.lines() {
@@ -155,7 +173,7 @@ fn backend(
             );
         }
     }
-    let body = bytes::Bytes::copy_from_slice(&output.stdout[end + 4..]);
+    let body = bytes::Bytes::copy_from_slice(&output[end + 4..]);
     headers.insert(http::header::CONTENT_LENGTH, body.len().into());
     Ok(fictionet_extras::warc::Response {
         status,
@@ -164,103 +182,259 @@ fn backend(
     })
 }
 
+struct Backend(std::process::Child);
+impl Drop for Backend {
+    fn drop(&mut self) {
+        // SAFETY: this child was started in its own process group.
+        unsafe {
+            libc::kill(-(self.0.id() as libc::pid_t), libc::SIGKILL);
+        }
+        let _ = self.0.wait();
+    }
+}
+impl Backend {
+    fn exchange(
+        mut self,
+        body: &[u8],
+        cancelled: UnixStream,
+        timeout: Duration,
+    ) -> std::io::Result<Vec<u8>> {
+        let input = self.0.stdin.take().expect("piped backend input");
+        let mut output = self.0.stdout.take().expect("piped backend output");
+        for fd in [input.as_raw_fd(), output.as_raw_fd()] {
+            // SAFETY: these are owned, open pipe descriptors.
+            if unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) } < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        let mut input = Some(input);
+        let mut written = 0;
+        let mut bytes = Vec::new();
+        let mut eof = false;
+        let deadline = Instant::now() + timeout;
+        loop {
+            if Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "Git backend timed out",
+                ));
+            }
+            let mut poll = [
+                libc::pollfd {
+                    fd: cancelled.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: if eof { -1 } else { output.as_raw_fd() },
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: input.as_ref().map_or(-1, |pipe| pipe.as_raw_fd()),
+                    events: libc::POLLOUT,
+                    revents: 0,
+                },
+            ];
+            // SAFETY: poll receives a valid array of owned descriptors.
+            if unsafe { libc::poll(poll.as_mut_ptr(), poll.len() as _, 25) } < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            if poll[0].revents != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "Git request cancelled",
+                ));
+            }
+            if poll[2].revents != 0
+                && let Some(pipe) = input.as_mut()
+            {
+                match pipe.write(&body[written..]) {
+                    Ok(n) => {
+                        written += n;
+                        if written == body.len() {
+                            input = None;
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => input = None,
+                    Err(error) => return Err(error),
+                }
+            }
+            if eof && let Some(status) = self.0.try_wait()? {
+                return if status.success() {
+                    Ok(bytes)
+                } else {
+                    Err(std::io::Error::other("Git backend failed"))
+                };
+            }
+            if poll[1].revents != 0 {
+                let mut chunk = [0u8; 16384];
+                match output.read(&mut chunk) {
+                    Ok(0) => {
+                        eof = true;
+                        if let Some(status) = self.0.try_wait()? {
+                            return if status.success() {
+                                Ok(bytes)
+                            } else {
+                                Err(std::io::Error::other("Git backend failed"))
+                            };
+                        }
+                    }
+                    Ok(n) => {
+                        if bytes.len() + n > 64 * 1024 * 1024 {
+                            return Err(std::io::Error::other("Git response exceeds size limit"));
+                        }
+                        bytes.extend_from_slice(&chunk[..n]);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn backend_advertises_captured_refs_and_refuses_writes() {
-        let root = std::env::temp_dir().join(format!(
-            "search-git-{}-{}",
-            std::process::id(),
-            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let git = |args: &[&str]| {
-            let output = Command::new("git")
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .current_dir(&root)
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
+    fn cancellation_and_deadlines_kill_and_reap_the_backend() {
+        for cancelled in [false, true] {
+            let mut command = Command::new("sh");
+            command
+                .args(["-c", "read value"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .process_group(0);
+            let child = command.spawn().unwrap();
+            let pid = child.id();
+            let (owner, stopped) = UnixStream::pair().unwrap();
+            let timeout = if cancelled {
+                Duration::from_secs(30)
+            } else {
+                Duration::ZERO
+            };
+            if cancelled {
+                drop(owner);
+            }
+            let error = Backend(child).exchange(b"", stopped, timeout).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                if cancelled {
+                    std::io::ErrorKind::Interrupted
+                } else {
+                    std::io::ErrorKind::TimedOut
+                }
             );
-            output.stdout
-        };
-        git(&["init", "--bare"]);
-        let tree = String::from_utf8(git(&["mktree"])).unwrap();
-        let commit = String::from_utf8(git(&[
-            "-c",
-            "user.name=Researcher",
-            "-c",
-            "user.email=researcher@users.noreply.github.com",
-            "commit-tree",
-            tree.trim(),
-            "-m",
-            "Initial content",
-        ]))
-        .unwrap();
-        git(&["update-ref", "refs/heads/main", commit.trim()]);
-        git(&["symbolic-ref", "HEAD", "refs/heads/main"]);
-        let advertisement = backend(
-            root.join("info/refs"),
-            http::Request::get("/info/refs?service=git-upload-pack")
-                .body(Vec::new())
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(advertisement.status, 200);
-        assert_eq!(
-            advertisement.headers[http::header::CONTENT_TYPE],
-            "application/x-git-upload-pack-advertisement"
-        );
-        assert!(
-            advertisement
-                .body
-                .starts_with(b"001e# service=git-upload-pack\n")
-        );
-        assert!(String::from_utf8_lossy(&advertisement.body).contains(commit.trim()));
-        let mut compressed =
-            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-        write!(compressed, "0032want {}\n00000009done\n", commit.trim()).unwrap();
-        let fetch = backend(
-            root.join("git-upload-pack"),
-            http::Request::post("/git-upload-pack")
-                .header(
-                    http::header::CONTENT_TYPE,
-                    "application/x-git-upload-pack-request",
-                )
-                .header(http::header::CONTENT_ENCODING, "gzip")
-                .body(compressed.finish().unwrap())
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(fetch.status, 200);
-        assert!(fetch.body.windows(4).any(|bytes| bytes == b"PACK"));
-        let push = backend(
-            root.join("info/refs"),
-            http::Request::get("/info/refs?service=git-receive-pack")
-                .body(Vec::new())
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(push.status, 403);
-        let push = backend(
-            root.join("git-receive-pack"),
-            http::Request::post("/git-receive-pack")
-                .header(
-                    http::header::CONTENT_TYPE,
-                    "application/x-git-receive-pack-request",
-                )
-                .body(Vec::new())
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(push.status, 403);
-        std::fs::remove_dir_all(root).unwrap();
+            assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+        }
+    }
+
+    #[test]
+    fn backend_advertises_captured_refs_and_refuses_writes() {
+        fictionet::block_on(async {
+            let root = std::env::temp_dir().join(format!(
+                "search-git-{}-{}",
+                std::process::id(),
+                time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let git = |args: &[&str]| {
+                let output = Command::new("git")
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .current_dir(&root)
+                    .args(args)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                output.stdout
+            };
+            git(&["init", "--bare"]);
+            let tree = String::from_utf8(git(&["mktree"])).unwrap();
+            let commit = String::from_utf8(git(&[
+                "-c",
+                "user.name=Researcher",
+                "-c",
+                "user.email=researcher@users.noreply.github.com",
+                "commit-tree",
+                tree.trim(),
+                "-m",
+                "Initial content",
+            ]))
+            .unwrap();
+            git(&["update-ref", "refs/heads/main", commit.trim()]);
+            git(&["symbolic-ref", "HEAD", "refs/heads/main"]);
+            let advertisement = backend(
+                root.join("info/refs"),
+                http::Request::get("/info/refs?service=git-upload-pack")
+                    .body(Vec::new())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(advertisement.status, 200);
+            assert_eq!(
+                advertisement.headers[http::header::CONTENT_TYPE],
+                "application/x-git-upload-pack-advertisement"
+            );
+            assert!(
+                advertisement
+                    .body
+                    .starts_with(b"001e# service=git-upload-pack\n")
+            );
+            assert!(String::from_utf8_lossy(&advertisement.body).contains(commit.trim()));
+            let mut compressed =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            write!(compressed, "0032want {}\n00000009done\n", commit.trim()).unwrap();
+            let fetch = backend(
+                root.join("git-upload-pack"),
+                http::Request::post("/git-upload-pack")
+                    .header(
+                        http::header::CONTENT_TYPE,
+                        "application/x-git-upload-pack-request",
+                    )
+                    .header(http::header::CONTENT_ENCODING, "gzip")
+                    .body(compressed.finish().unwrap())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(fetch.status, 200);
+            assert!(fetch.body.windows(4).any(|bytes| bytes == b"PACK"));
+            let push = backend(
+                root.join("info/refs"),
+                http::Request::get("/info/refs?service=git-receive-pack")
+                    .body(Vec::new())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(push.status, 403);
+            let push = backend(
+                root.join("git-receive-pack"),
+                http::Request::post("/git-receive-pack")
+                    .header(
+                        http::header::CONTENT_TYPE,
+                        "application/x-git-receive-pack-request",
+                    )
+                    .body(Vec::new())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(push.status, 403);
+            std::fs::remove_dir_all(root).unwrap();
+        });
     }
 }
