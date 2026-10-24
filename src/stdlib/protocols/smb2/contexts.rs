@@ -325,6 +325,27 @@ pub(super) fn create_contexts(region: &[u8]) -> Result<Vec<CreateContext>, Error
     }
 }
 
+/// Where a create context's name and data go after its 16-byte header:
+/// `(name_at, data_at, size)`. The name comes first, then the data at the
+/// next multiple of 8. When that would put the data past the 16-bit
+/// DataOffset, the data comes first, which section 2.2.13.2 also allows.
+/// A context without data has a DataOffset of 0.
+fn create_context_layout(c: &CreateContext) -> Result<(usize, usize, usize), Error> {
+    let name_end = 16usize.checked_add(c.name.len()).ok_or(Error::Unwritable)?;
+    if c.data.is_empty() {
+        return Ok((16, 0, name_end));
+    }
+    let after_name = name_end.next_multiple_of(8);
+    if u16::try_from(after_name).is_ok() {
+        return Ok((16, after_name, after_name.saturating_add(c.data.len())));
+    }
+    let after_data = 16usize
+        .checked_add(c.data.len())
+        .ok_or(Error::Unwritable)?
+        .next_multiple_of(8);
+    Ok((after_data, 16, after_data.saturating_add(c.name.len())))
+}
+
 /// Writes create contexts after the bytes already in `w`, 8-byte aligned,
 /// and puts their offset and length at `field` in the fixed part.
 pub(super) fn write_create_contexts(
@@ -339,17 +360,7 @@ pub(super) fn write_create_contexts(
     let start = w.len();
     for (i, c) in contexts.iter().enumerate() {
         let here = w.len();
-        let name_end = 16usize.checked_add(c.name.len()).ok_or(Error::Unwritable)?;
-        let data_at = if c.data.is_empty() {
-            0
-        } else {
-            name_end.next_multiple_of(8)
-        };
-        let size = if c.data.is_empty() {
-            name_end
-        } else {
-            data_at.saturating_add(c.data.len())
-        };
+        let (name_at, data_at, size) = create_context_layout(c)?;
         too_long(here.saturating_add(size))?;
         let last = i + 1 == contexts.len();
         let next = if last {
@@ -358,16 +369,14 @@ pub(super) fn write_create_contexts(
             fit32(size.next_multiple_of(8))?
         };
         put32(w, next);
-        put16(w, 16);
+        put16(w, fit16(name_at)?);
         put16(w, fit16(c.name.len())?);
         put16(w, 0);
         put16(w, fit16(data_at)?);
         put32(w, fit32(c.data.len())?);
-        w.extend_from_slice(&c.name);
-        if !c.data.is_empty() {
-            w.resize(here + data_at, 0);
-            w.extend_from_slice(&c.data);
-        }
+        w.resize(here + size, 0);
+        w[here + name_at..][..c.name.len()].copy_from_slice(&c.name);
+        w[here + data_at..][..c.data.len()].copy_from_slice(&c.data);
         if !last {
             w.resize(here + size.next_multiple_of(8), 0);
         }
