@@ -58,16 +58,6 @@ impl Pages {
         if self.copied_only() {
             return Ok(self.copied_listing(query, start));
         }
-        let _writing = if self.live_calls.is_some() {
-            Some(
-                self.locks
-                    .lock(cx, "writing".into())
-                    .await
-                    .map_err(Stop::store)?,
-            )
-        } else {
-            None
-        };
         let key = if engine == Engine::YouTube {
             format!("youtube {}", query_key(query, start))
         } else {
