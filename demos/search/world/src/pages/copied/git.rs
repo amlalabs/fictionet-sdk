@@ -437,4 +437,53 @@ mod tests {
             std::fs::remove_dir_all(root).unwrap();
         });
     }
+
+    #[test]
+    fn unknown_wants_get_the_backend_error_line() {
+        fictionet::block_on(async {
+            let root = std::env::temp_dir().join(format!(
+                "search-git-unknown-{}-{}",
+                std::process::id(),
+                time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let output = Command::new("git")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .current_dir(&root)
+                .args(["init", "--bare"])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            // git http-backend writes a whole response, then exits 1 because
+            // upload-pack died. Git clients show that ERR line to the user.
+            let unknown = "1111111111111111111111111111111111111111";
+            for protocol in [None, Some("version=2")] {
+                let request = match protocol {
+                    None => format!("0032want {unknown}\n00000009done\n"),
+                    Some(_) => format!("0012command=fetch\n00010032want {unknown}\n0009done\n0000"),
+                };
+                let mut post = http::Request::post("/git-upload-pack").header(
+                    http::header::CONTENT_TYPE,
+                    "application/x-git-upload-pack-request",
+                );
+                if let Some(protocol) = protocol {
+                    post = post.header("git-protocol", protocol);
+                }
+                let fetch = backend(
+                    root.join("git-upload-pack"),
+                    post.body(request.into_bytes()).unwrap(),
+                )
+                .await
+                .expect("a complete backend response reaches the client");
+                assert_eq!(fetch.status, 200, "{protocol:?}");
+                let body = String::from_utf8_lossy(&fetch.body);
+                assert!(
+                    body.contains(&format!("ERR upload-pack: not our ref {unknown}")),
+                    "{protocol:?}: {body}"
+                );
+            }
+            std::fs::remove_dir_all(root).unwrap();
+        });
+    }
 }
