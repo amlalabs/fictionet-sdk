@@ -61,7 +61,6 @@ function localSites() {
 
 function graph(upstream, newData) {
   const map = $('map'), width = Math.min(map.clientWidth, 760), height = map.clientHeight;
-  $('world').classList.toggle('world-compact', map.clientWidth < 820);
   map.replaceChildren();
   if (!width || !height) return;
   map.setAttribute('viewBox', `0 0 ${width} ${height}`);
@@ -121,9 +120,9 @@ function graph(upstream, newData) {
     const nodeWidth = (width - 52 - 12 * (visibleDestinations.length - 1)) / visibleDestinations.length;
     const x = 26 + index * (nodeWidth + 12);
     const purposes = [...new Set(shown.connections.filter((row) => row.host === host).map((row) => row.purpose))];
-    for (const source of new Set(purposes.map((purpose) => purpose === 'setup' ? 'router' : ['model', 'page writer'].includes(purpose) ? 'calls' : 'signin'))) {
+    for (const source of new Set(purposes.map((purpose) => purpose === 'account' ? 'signin' : 'calls'))) {
       const active = live && upstream?.host === host;
-      wire(`M${source === 'router' ? 140 : width - 40} ${positions.get(source)} H${width - 25} V${internet + 58} H${x + nodeWidth}`, active ? 'outside observed hot' : 'outside observed', active);
+      wire(`M${width - 40} ${positions.get(source)} H${width - 25} V${internet + 58} H${x + nodeWidth}`, active ? 'outside observed hot' : 'outside observed', active);
     }
     node(`egress:${host}`, x, internet + 36, nodeWidth, 44, host, purposes.join(' · '), true);
   }
@@ -142,11 +141,11 @@ function activityText(row) {
   const fact = row.fact;
   switch (fact.kind) {
     case 'resolved': return [fact.name, 'DNS', `${fact.name} → ${fact.address || 'no answer'}`, `site:${fact.name}`];
-    case 'request': return [fact.host, 'HTTP', `${fact.method} ${briefPath(fact.path)} · ${fact.status}`, `site:${fact.host}`];
+    case 'request': return [fact.host, fact.scheme.toUpperCase(), `${fact.method} ${briefPath(fact.path)} · ${fact.status}`, `site:${fact.host}`];
     case 'search': return [{google:'www.google.com',bing:'www.bing.com',duck_duck_go:'html.duckduckgo.com',you_tube:'www.youtube.com'}[fact.engine] || 'Search', 'Search', fact.query, 'sites'];
     case 'model_call': return [fact.host, 'HTTPS', `${fact.method} ${briefPath(fact.path)} · ${fact.status || 'connecting'}${fact.phase === 'streaming' ? ' · streaming' : ''}`, 'calls'];
     case 'tool': return ['model gateway', 'Tool', `${fact.tool === 'fetch' ? 'Fetch' : 'web_search'} · ${fact.target}`, 'calls'];
-    case 'signin': return ['Sign-in', 'Policy', fact.open ? 'Opened sign-in' : ['Closed sign-in', fact.exceptions.join(', ')].filter(Boolean).join(' · '), 'signin'];
+    case 'signin': return ['Sign-in', 'Policy', fact.open ? 'Open' : 'Closed', 'signin'];
     case 'egress': return [fact.host, 'Upstream', `${fact.purpose} · ${fact.method} ${briefPath(fact.path)} · ${fact.status || fact.phase}`, `egress:${fact.host}`];
     case 'page_revision': {
       const target = fact.target.url || fact.target.host || fact.target.query || 'Pages';
@@ -158,6 +157,7 @@ function activityText(row) {
   }
 }
 function feed() {
+  const scrollTop = $('activity').scrollTop;
   const atBottom = $('activity').scrollHeight - $('activity').scrollTop - $('activity').clientHeight < 24;
   $('activity').replaceChildren();
   for (const row of activityRows().filter((r) => r.fact.kind !== 'run_started' && !(r.fact.kind === 'egress' && r.fact.purpose === 'model')).slice(-100)) {
@@ -167,14 +167,17 @@ function feed() {
     item.title = `${target} · ${text}`;
     $('activity').append(item);
   }
-  if (atBottom) $('activity').scrollTop = $('activity').scrollHeight;
+  $('activity').scrollTop = atBottom ? $('activity').scrollHeight : scrollTop;
   if (world?.preview) {
     $('preview-output').textContent = latest.activity.filter((r) => r.fact.kind !== 'run_started').slice(-10).map((r) => { const [host, protocol, text] = activityText(r); return `${protocol}  ${host}\n  ${text}`; }).join('\n\n');
   }
 }
 function activityRows() {
+  const upstream = new Map();
+  for (const row of shown.activity) if (row.fact.kind === 'egress') upstream.set(row.fact.attempt, row);
   const attempts = new Map();
   return shown.activity.filter((row) => {
+    if (row.fact.kind === 'egress') return upstream.get(row.fact.attempt) === row;
     if (row.fact.kind !== 'no_route') return true;
     const key = `${row.fact.from}:${row.fact.to}`, previous = attempts.get(key);
     if (previous !== undefined && row.at_ms - previous <= 8000) return false;
@@ -268,22 +271,12 @@ function details() {
     heading(hit?.title || 'Page', url);
     body.append(element('p', request ? `Opened · ${request.status} · ${sourceName(request.source)}` : 'Unopened', 'page-state'));
     if (request?.has_preview) {
-      const container = element('div', undefined, 'reading-view');
+      const container = element('div', 'Loading page…', 'reading-view');
       body.append(container);
-      let loaded = false;
-      const read = button('Read page', async () => {
-        if (loaded) {
-          const expanded = document.body.classList.toggle('page-expanded');
-          read.textContent = expanded ? 'Shrink page' : 'Expand page';
-          return;
-        }
-        read.disabled = true;
-        try {
-          await readPage(url, request, container);
-          loaded = true;
-          read.textContent = 'Expand page';
-        } catch (error) { notice(error.message); }
-        finally { read.disabled = false; }
+      readPage(url, request, container).catch((error) => { container.textContent = error.message; });
+      const read = button(document.body.classList.contains('page-expanded') ? 'Shrink page' : 'Expand page', () => {
+        const expanded = document.body.classList.toggle('page-expanded');
+        read.textContent = expanded ? 'Shrink page' : 'Expand page';
       });
       actions.append(read);
     }
@@ -307,15 +300,18 @@ function details() {
     }
     if (!site?.requests.length && !site?.searches.length) body.append(element('p', 'Unopened', 'detail-empty'));
   } else if (['egress', 'signin'].includes(selection) || selection.startsWith('egress:')) {
-    const accepts = (row) => selection === 'signin' ? ['sign-in', 'token refresh', 'account', 'startup'].includes(row.purpose) : selection.startsWith('egress:') ? row.host === selection.slice(7) : true;
+    const accepts = (row) => selection === 'signin' ? row.purpose === 'account' : selection.startsWith('egress:') ? row.host === selection.slice(7) : true;
     const connections = shown.connections.filter(accepts), egress = shown.egress.filter((row) => accepts(row.fact) && row.fact.phase !== 'attempt');
     heading(selection === 'signin' ? 'Sign-in' : selection.startsWith('egress:') ? selection.slice(7) : 'Internet');
     if (shown.signin && ['signin', 'egress'].includes(selection)) {
       body.append(detailRow(shown.signin.at_ms, shown.signin.fact.open ? 'Sign-in open' : 'Sign-in closed', ''));
-      const exceptions = element('details', undefined, 'exceptions');
-      exceptions.append(element('summary', 'Exceptions'));
-      for (const exception of shown.signin.fact.exceptions) exceptions.append(element('p', exception, 'meta'));
-      body.append(exceptions);
+      if (shown.signin.fact.exceptions.length) {
+        const exceptions = element('details', undefined, 'exceptions');
+        exceptions.open = true;
+        exceptions.append(element('summary', 'Exceptions'));
+        for (const exception of shown.signin.fact.exceptions) exceptions.append(element('p', exception, 'meta'));
+        body.append(exceptions);
+      }
     }
     for (const connection of connections.filter((connection) => !egress.some((row) => row.fact.host === connection.host && row.fact.purpose === connection.purpose))) body.append(detailRow(connection.at_ms, connection.host, connection.purpose));
     for (const row of egress) body.append(detailRow(row.at_ms, row.fact.host, `${row.fact.purpose} · ${row.fact.method} ${row.fact.path} · ${row.fact.status || row.fact.phase}`));
@@ -389,9 +385,11 @@ async function loadWorld() {
   $('brief').textContent = world.instructions;
   $('source').value = world.source.kind === 'copy' ? 'copied' : world.source.kind === 'live' ? 'live' : 'model_written';
   for (const option of $('source').options) {
-    option.disabled = !world[option.value];
+    const availability = world[option.value];
+    option.disabled = availability.kind !== 'available';
     const text = { copied: 'Copied pages', model_written: 'Model-written pages', live: 'Live search' }[option.value];
-    option.textContent = text;
+    const reason = { no_captures: 'No captures', no_page_writer: 'No page writer', no_search_key: 'No search key' }[availability.reason];
+    option.textContent = reason ? `${text} · ${reason}` : text;
   }
   if (world.preview) {
     $('console-status').hidden = true;
@@ -419,12 +417,6 @@ $('story').onclick = async () => {
   catch (error) { notice(error.message); }
   finally { $('story').disabled = false; }
 };
-const scheme = matchMedia('(prefers-color-scheme: light)');
-function terminalTheme() { return scheme.matches ? { background: '#ffffff', foreground: '#243047', cursor: '#275fbb' } : { background: '#0b0f18', foreground: '#d6dee8', cursor: '#9dbdf5' }; }
-scheme.addEventListener('change', () => {
-  const terminal = consoles.get('terminal');
-  if (terminal) { terminal.component.dispose(); terminal.socket.close(); consoles.delete('terminal'); mountConsole(); }
-});
 async function mountConsole() {
   if (world?.preview || !hostStatus) return;
   const kind = activeConsole;
@@ -445,7 +437,7 @@ async function mountConsole() {
     if (kind === 'terminal') {
       const [library, component] = await Promise.all([import('/vendor/ghostty-web/dist/ghostty-web.js'), import('/terminal.mjs')]);
       const ghostty = await library.Ghostty.load('/vendor/ghostty-web/dist/ghostty-vt.wasm');
-      create = (socket) => component.mount($('terminal'), library, socket, { ghostty, fontSize, fontFamily: 'monospace', theme: terminalTheme() });
+      create = (socket) => component.mount($('terminal'), library, socket, { ghostty, fontSize, fontFamily: 'monospace', theme: { background: '#0b0f18', foreground: '#d6dee8', cursor: '#9dbdf5' } });
     } else {
       const [{ default: RFB }, component] = await Promise.all([import('/vendor/novnc/core/rfb.js'), import('/screen.mjs')]);
       create = (socket) => component.mount($('screen'), RFB, socket);

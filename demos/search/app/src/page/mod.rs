@@ -206,6 +206,7 @@ impl Views {
                             elapsed_ms: *elapsed_ms,
                             headers: headers
                                 .iter()
+                                .filter(|(_, value)| value.as_bytes() != b"[redacted]")
                                 .map(|(name, value)| {
                                     (
                                         name.to_string(),
@@ -346,12 +347,34 @@ fn site<'a>(sites: &'a mut Vec<Site>, host: &str, at_ms: u64) -> &'a mut Site {
 #[derive(Clone, Debug, Serialize)]
 pub struct WorldState {
     pub source: PageSource,
-    pub copied: bool,
-    pub model_written: bool,
-    pub live: bool,
+    pub copied: Availability,
+    pub model_written: Availability,
+    pub live: Availability,
     pub date: String,
     pub instructions: String,
     pub preview: bool,
+}
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Availability {
+    Available,
+    Unavailable { reason: UnavailableReason },
+}
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnavailableReason {
+    NoCaptures,
+    NoPageWriter,
+    NoSearchKey,
+}
+impl Availability {
+    fn new(available: bool, reason: UnavailableReason) -> Self {
+        if available {
+            Self::Available
+        } else {
+            Self::Unavailable { reason }
+        }
+    }
 }
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
@@ -680,12 +703,15 @@ async fn open_console(
 fn world_state(pages: &Pages, preview: bool) -> WorldState {
     WorldState {
         source: pages.source(),
-        copied: pages.has_copied(),
-        model_written: matches!(
-            pages.generator_kind(),
-            web_world::pages::GeneratorKind::Model(_)
+        copied: Availability::new(pages.has_copied(), UnavailableReason::NoCaptures),
+        model_written: Availability::new(
+            matches!(
+                pages.generator_kind(),
+                web_world::pages::GeneratorKind::Model(_)
+            ),
+            UnavailableReason::NoPageWriter,
         ),
-        live: pages.live_available(),
+        live: Availability::new(pages.live_available(), UnavailableReason::NoSearchKey),
         date: pages.seed().date.clone(),
         instructions: pages.seed().instructions.clone(),
         preview,

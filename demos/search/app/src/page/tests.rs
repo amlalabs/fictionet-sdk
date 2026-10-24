@@ -356,7 +356,7 @@ async fn authenticated_server_rejects_cross_origin_reads_and_writes() {
     }
     let allowed=request(&uri,format!("GET /world HTTP/1.1\r\nHost: {host}\r\nCookie: search={token}\r\nConnection: close\r\n\r\n")).await;
     assert!(allowed.starts_with("HTTP/1.1 200"));
-    assert!(allowed.contains("\"copied\":true"));
+    assert!(allowed.contains("\"copied\":{\"kind\":\"available\"}"));
     server.shutdown().await;
 }
 
@@ -544,6 +544,56 @@ fn previews_match_the_exact_page_scheme_query_and_observation_time() {
         views
             .preview(&"https://sky.org/unopened".parse().unwrap(), 400)
             .is_none()
+    );
+}
+
+#[test]
+fn request_details_show_retained_headers_and_omit_removed_values() {
+    let mut views = Views::default();
+    views.push(Observation {
+        at_ms: 100,
+        fact: SearchObs::Request {
+            scheme: http::uri::Scheme::HTTPS,
+            host: "sky.org".parse().unwrap(),
+            method: http::Method::GET,
+            path: "/black-hole".parse().unwrap(),
+            status: http::StatusCode::OK,
+            bytes: 0,
+            content_type: "text/html".into(),
+            source: PageSource::Copy { captured: None },
+            elapsed_ms: 0,
+            headers: http::HeaderMap::from_iter([
+                (http::header::HOST, "sky.org".parse().unwrap()),
+                (http::header::ACCEPT_ENCODING, "gzip".parse().unwrap()),
+                (http::header::CONNECTION, "[redacted]".parse().unwrap()),
+                (http::header::AUTHORIZATION, "[redacted]".parse().unwrap()),
+            ]),
+            preview: None,
+        },
+    });
+    let view = views.current();
+    let headers = &view.sites[0].requests[0].headers;
+    assert_eq!(headers.len(), 2);
+    assert!(headers.contains(&("host".into(), "sky.org".into())));
+    assert!(headers.contains(&("accept-encoding".into(), "gzip".into())));
+    assert_eq!(view.sites[0].requests[0].url, "https://sky.org/black-hole");
+}
+
+#[test]
+fn source_choices_include_the_reason_they_are_unavailable() {
+    let state = serde_json::to_value(world_state(&pages(), true)).unwrap();
+    assert_eq!(state["copied"], json!({"kind": "available"}));
+    assert_eq!(
+        state["model_written"],
+        json!({"kind": "unavailable", "reason": "no_page_writer"})
+    );
+    assert_eq!(
+        serde_json::to_value(Availability::new(false, UnavailableReason::NoCaptures)).unwrap(),
+        json!({"kind": "unavailable", "reason": "no_captures"})
+    );
+    assert_eq!(
+        serde_json::to_value(Availability::new(false, UnavailableReason::NoSearchKey)).unwrap(),
+        json!({"kind": "unavailable", "reason": "no_search_key"})
     );
 }
 
