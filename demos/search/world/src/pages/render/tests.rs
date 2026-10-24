@@ -35,7 +35,7 @@ fn layouts_keep_content_and_vary_by_style() {
     ] {
         for style in 0..10 {
             let mut profile = super::super::make::site_profile("site.com");
-            profile.kind = kind.into();
+            profile.kind = kind.parse().unwrap();
             profile.style = style;
             let html = page("site.com", &profile, &p, "2026");
             assert!(html.contains("<title>A &amp; B</title>"));

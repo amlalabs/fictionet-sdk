@@ -95,11 +95,11 @@ impl Pages {
                     _ => None,
                 };
                 let status = if answer.is_ok() {
-                    "ok"
+                    model::GenerationOutcome::Ok
                 } else if repaired.is_some() {
-                    "recovered"
+                    model::GenerationOutcome::Recovered
                 } else {
-                    "error"
+                    model::GenerationOutcome::Error
                 };
                 let mut rows = ledger.rows(&context, status);
                 rows.iter_mut().for_each(|row| model.redact_json(row));
@@ -195,7 +195,7 @@ impl Pages {
 
     pub(super) async fn site_stylesheet(&self, cx: &Cx, host: &str) -> Result<make::Profile, Stop> {
         let profile = make::site_profile(host);
-        if profile.kind == "qa" {
+        if profile.kind == make::SiteKind::Qa {
             return Ok(profile);
         }
         let _site = self
@@ -294,7 +294,7 @@ impl Pages {
         let kind = self
             .store()
             .site(host)
-            .map(|p| p.kind.clone())
+            .map(|p| p.kind)
             .unwrap_or_else(|| make::site_profile(host).kind);
         let mut known = {
             let store = self.store();
@@ -348,7 +348,7 @@ impl Pages {
                             mentions.push(json!({"snippet": fact}));
                         }
                     }
-                    make::page_with_known(&seed, host, target, &mentions, &kind, &known)
+                    make::page_with_known(&seed, host, target, &mentions, kind, &known)
                 },
                 || {
                     let (system, user) = prompts::page(

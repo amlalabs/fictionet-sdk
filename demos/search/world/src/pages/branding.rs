@@ -45,7 +45,7 @@ pub fn site_profile(host: &str) -> Profile {
             | "www.weatherbug.com"
             | "www.ventusky.com"
     ) {
-        "weather"
+        SiteKind::Weather
     } else if matches!(
         host,
         "www.autotrader.co.uk"
@@ -56,7 +56,7 @@ pub fn site_profile(host: &str) -> Profile {
             | "www.heycar.com"
             | "www.pistonheads.com"
     ) {
-        "marketplace"
+        SiteKind::Marketplace
     } else if matches!(
         host,
         "www.rac.co.uk"
@@ -80,7 +80,7 @@ pub fn site_profile(host: &str) -> Profile {
             | "www.expertreviews.co.uk"
             | "www.tomsguide.com"
     ) {
-        "review"
+        SiteKind::Review
     } else if matches!(
         host,
         "www.amazon.co.uk"
@@ -93,7 +93,7 @@ pub fn site_profile(host: &str) -> Profile {
             | "www.sportsdirect.com"
             | "www.argos.co.uk"
     ) {
-        "shop"
+        SiteKind::Shop
     } else if matches!(
         host,
         "www.britannica.com"
@@ -101,7 +101,7 @@ pub fn site_profile(host: &str) -> Profile {
             | "www.merriam-webster.com"
             | "www.collinsdictionary.com"
     ) {
-        "wiki"
+        SiteKind::Wiki
     } else if matches!(
         host,
         "www.tomshardware.com"
@@ -155,7 +155,7 @@ pub fn site_profile(host: &str) -> Profile {
             | "www.gardeningetc.com"
             | "www.explainthatstuff.com"
     ) {
-        "howto"
+        SiteKind::Howto
     } else if matches!(
         host,
         "www.reuters.com"
@@ -166,14 +166,14 @@ pub fn site_profile(host: &str) -> Profile {
             | "www.zdnet.com"
             | "www.wired.com"
     ) {
-        "news"
+        SiteKind::News
     } else if matches!(host, "www.quora.com") {
-        "qa"
+        SiteKind::Qa
     } else if matches!(
         host,
         "www.howtogeek.com" | "www.lifewire.com" | "www.techradar.com" | "www.which.co.uk"
     ) {
-        "howto"
+        SiteKind::Howto
     } else if matches!(
         host,
         "www.eater.com"
@@ -183,7 +183,7 @@ pub fn site_profile(host: &str) -> Profile {
             | "www.visitnaples.eu"
             | "www.italymagazine.com"
     ) {
-        "listings"
+        SiteKind::Listings
     } else if matches!(
         host,
         "www.easyjet.com"
@@ -194,11 +194,11 @@ pub fn site_profile(host: &str) -> Profile {
             | "www.travelocity.com"
             | "www.lastminute.com"
     ) {
-        "lodging"
+        SiteKind::Lodging
     } else if host == "www.ebay.com" {
-        "shop"
+        SiteKind::Shop
     } else if host == "www.linkedin.com" {
-        "company"
+        SiteKind::Company
     } else if matches!(
         host,
         "www.booking.com"
@@ -207,7 +207,7 @@ pub fn site_profile(host: &str) -> Profile {
             | "www.kayak.co.uk"
             | "www.trivago.co.uk"
     ) {
-        "lodging"
+        SiteKind::Lodging
     } else if matches!(
         host,
         "www.tripadvisor.co.uk"
@@ -217,7 +217,7 @@ pub fn site_profile(host: &str) -> Profile {
             | "www.deliveroo.co.uk"
             | "www.designmynight.com"
     ) {
-        "listings"
+        SiteKind::Listings
     } else if matches!(
         host,
         "www.kingarthurbaking.com"
@@ -235,7 +235,7 @@ pub fn site_profile(host: &str) -> Profile {
             | "sallysbakingaddiction.com"
             | "www.wikihow.com"
     ) {
-        "howto"
+        SiteKind::Howto
     } else if matches!(
         host,
         "www.britishairways.com"
@@ -244,7 +244,7 @@ pub fn site_profile(host: &str) -> Profile {
             | "www.momondo.co.uk"
             | "www.kiwi.com"
     ) {
-        "lodging"
+        SiteKind::Lodging
     } else if matches!(
         host,
         "realpython.com"
@@ -262,25 +262,25 @@ pub fn site_profile(host: &str) -> Profile {
             | "www.asus.com"
     ) {
         if host == "dev.to" {
-            "blog"
+            SiteKind::Blog
         } else if matches!(host, "www.tp-link.com" | "www.netgear.com" | "www.asus.com") {
-            "docs"
+            SiteKind::Docs
         } else {
-            "howto"
+            SiteKind::Howto
         }
     } else if host.contains("wiki") {
-        "wiki"
+        SiteKind::Wiki
     } else if host.starts_with("docs.")
         || host.starts_with("doc.")
         || host == "developer.mozilla.org"
         || host.contains("github")
     {
-        "docs"
+        SiteKind::Docs
     } else if matches!(
         host,
         "stackoverflow.com" | "serverfault.com" | "superuser.com"
     ) {
-        "qa"
+        SiteKind::Qa
     } else if host == "ask.metafilter.com"
         || [
             "users.rust-lang.org",
@@ -294,23 +294,28 @@ pub fn site_profile(host: &str) -> Profile {
         || host.contains("stackoverflow")
         || host == "superuser.com"
     {
-        "forum"
+        SiteKind::Forum
     } else if host.starts_with("shop.") || host.starts_with("store.") {
-        "shop"
+        SiteKind::Shop
     } else if host.contains("systems") || host.ends_with(".gov") {
-        "company"
+        SiteKind::Company
     } else if host.contains("blog") || host.contains("medium") {
-        "blog"
+        SiteKind::Blog
     } else {
-        "news"
+        SiteKind::News
     };
-    let links = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let links = |items: &[&str]| {
+        items
+            .iter()
+            .map(|s| Link::parse(s).expect("navigation link"))
+            .collect::<Vec<_>>()
+    };
     let (tagline, nav) = match kind {
-        "weather" => (
+        SiteKind::Weather => (
             String::new(),
             links(&["Forecast|/weather/", "Maps|/maps/", "Warnings|/warnings/"]),
         ),
-        "marketplace" => (
+        SiteKind::Marketplace => (
             String::new(),
             links(&[
                 "Used cars|/used-cars/",
@@ -318,11 +323,11 @@ pub fn site_profile(host: &str) -> Profile {
                 "Reviews|/reviews/",
             ]),
         ),
-        "review" => (
+        SiteKind::Review => (
             String::new(),
             links(&["Reviews|/reviews/", "Buying guides|/buying-guides/"]),
         ),
-        "lodging" => (
+        SiteKind::Lodging => (
             String::new(),
             links(&[
                 "Stays|/",
@@ -332,7 +337,7 @@ pub fn site_profile(host: &str) -> Profile {
                 "Help|/help/",
             ]),
         ),
-        "listings" => (
+        SiteKind::Listings => (
             String::new(),
             links(&[
                 "Discover|/",
@@ -342,7 +347,7 @@ pub fn site_profile(host: &str) -> Profile {
                 "Review|/reviews/",
             ]),
         ),
-        "howto" => (
+        SiteKind::Howto => (
             "How to do anything".into(),
             links(&[
                 "Explore|/",
@@ -350,7 +355,7 @@ pub fn site_profile(host: &str) -> Profile {
                 "Help|/Help:About-wikiHow",
             ]),
         ),
-        "wiki" => (
+        SiteKind::Wiki => (
             "The free encyclopedia".to_owned(),
             links(&[
                 "Main page|/wiki/Main_Page",
@@ -360,7 +365,7 @@ pub fn site_profile(host: &str) -> Profile {
                 "Help|/wiki/Help:Contents",
             ]),
         ),
-        "docs" => (
+        SiteKind::Docs => (
             format!("{name} documentation"),
             links(&[
                 "Docs|/docs/",
@@ -370,7 +375,7 @@ pub fn site_profile(host: &str) -> Profile {
                 "Support|/support/",
             ]),
         ),
-        "forum" | "qa" => (
+        SiteKind::Forum | SiteKind::Qa => (
             format!("{name} community"),
             links(&[
                 "Latest|/latest",
@@ -380,7 +385,7 @@ pub fn site_profile(host: &str) -> Profile {
                 "Sign up|/signup",
             ]),
         ),
-        "company" => (
+        SiteKind::Company => (
             String::new(),
             links(&[
                 "Products|/products/",
@@ -390,7 +395,7 @@ pub fn site_profile(host: &str) -> Profile {
                 "About|/about/",
             ]),
         ),
-        "shop" => (
+        SiteKind::Shop => (
             format!("Shop {name}"),
             links(&[
                 "New in|/new/",
@@ -400,7 +405,7 @@ pub fn site_profile(host: &str) -> Profile {
                 "Stores|/stores/",
             ]),
         ),
-        "blog" => (
+        SiteKind::Blog => (
             format!("Notes from {name}"),
             links(&[
                 "Home|/",
@@ -458,17 +463,17 @@ pub fn site_profile(host: &str) -> Profile {
     if !accent.is_empty() {
         css.push_str(&format!("body {{ --accent:{accent};background:#fff;color:#222;font-family:Arial,sans-serif }} header {{ border-top:0;border-bottom:1px solid #ddd }} .brand a,.home,.logo {{color:{accent}}} .ad-slot,.newsletter,.tagline {{display:none}} .columns>nav {{background:#f7f8fa;padding:24px}}"));
     }
-    if kind == "qa" {
+    if kind == SiteKind::Qa {
         css.push_str(".qa header .home,.qa header>a{color:var(--accent-text)}");
     }
-    if ["listings", "lodging", "howto"].contains(&kind) {
+    if [SiteKind::Listings, SiteKind::Lodging, SiteKind::Howto].contains(&kind) {
         css.push_str("header{display:flex;align-items:center;gap:42px;padding:20px max(28px,calc((100% - 1160px)/2))}header .brand{white-space:nowrap}.site-content{max-width:1120px;margin:36px auto;padding:0 24px}.site-content h1{font-size:36px}.restaurant-list{margin:28px 0}.restaurant-list article{border:1px solid #ddd;border-radius:12px;padding:24px;margin:16px 0}.restaurant-list h3{margin-top:0}.site-content ol{padding:0;list-style-position:inside;counter-reset:step}.site-content ol li{margin:20px 0;padding:24px;background:#f3f6ef;border:1px solid #dbe2d6;border-radius:6px;font-size:18px}.filters{display:flex;gap:12px;border-bottom:1px solid #ddd;padding:18px 0}.filters span{border:1px solid #aaa;border-radius:22px;padding:7px 18px}body.howto>header{background:#93b874}.site-content>article{max-width:860px}.site-content>article>h1{margin-top:20px}body.howto{background:#f6f5f1}");
     }
     Profile {
         css,
         tagline,
         name,
-        kind: kind.into(),
+        kind,
         style: 0,
         nav,
         footer: links(&[

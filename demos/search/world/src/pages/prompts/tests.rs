@@ -90,7 +90,19 @@ BODY:
         )]
     );
     let site = page.site.as_ref().unwrap();
-    assert_eq!(site.nav, ["Security|/security/", "Software|/software/"]);
+    assert_eq!(
+        site.nav,
+        [
+            super::super::make::Link {
+                label: "Security".into(),
+                href: "/security/".into()
+            },
+            super::super::make::Link {
+                label: "Software".into(),
+                href: "/software/".into()
+            }
+        ]
+    );
     assert_eq!(site.tagline, "Biting the hand that feeds IT");
     assert_eq!(page.ad, "");
     assert!(page.body.starts_with("<h1>"));

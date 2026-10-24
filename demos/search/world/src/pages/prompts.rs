@@ -83,7 +83,11 @@ editorial context. They describe the same persistent web, not independent storie
 Preserve established names, dates, versions, claims and URL paths.
 All coverage of one event must agree on its date, location, organization and
 numbers, including across different sites. Distinguish publication dates from
-event dates. Search snippets establish these facts before any page is opened.
+event dates. Every event date, publication date, search snippet and stored claim uses
+a concrete calendar date including its year. Never use relative dates such as
+last week, yesterday, today, days ago or the second week of a month. When a
+source used relative wording, state the exact date or inclusive date range
+that it means in that source, preserving the established timeline. Search snippets establish these facts before any page is opened.
 Use earlier published text as binding context even when it has no explicit claims.
 Do not introduce a second incompatible timeline or leave an established identity vague.
 Use public site domains, never reserved example domains or special-use hostnames. A page must

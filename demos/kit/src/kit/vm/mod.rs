@@ -319,6 +319,13 @@ mod process_tests {
 
     #[tokio::test]
     async fn demo_ownership_is_exclusive_until_owner_and_children_exit() {
+        if std::env::var_os("DEMO_OWNERSHIP_TEST").is_none() {
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "kit::vm::process_tests::demo_ownership_is_exclusive_until_owner_and_children_exit"])
+                .env("DEMO_OWNERSHIP_TEST", "1").kill_on_drop(true).status().await.unwrap();
+            assert!(status.success());
+            return;
+        }
         let name = format!("owned-demo-{}", std::process::id());
         let ownership = Ownership::acquire(&name).unwrap();
         assert!(Ownership::acquire(&name).is_err());

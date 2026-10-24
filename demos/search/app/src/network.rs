@@ -27,34 +27,23 @@ pub fn build(
         cx,
         SearchObs::Signin {
             open: false,
-            exceptions: if claude_token.is_some() {
-                vec![SigninException::CodexAccount]
-            } else {
-                vec![
-                    SigninException::ClaudeAccount,
-                    SigninException::CodexAccount,
-                ]
-            },
+            exceptions: vec![],
         },
     );
-    let models = [Provider::Anthropic, Provider::OpenAi, Provider::ChatGpt]
+    let models = [Provider::Anthropic]
         .into_iter()
         .map(|provider| {
             Ok((
                 provider.host(),
                 (
                     Gateway {
-                        model: if provider == Provider::Anthropic {
-                            if let Some(credential) = &claude_token {
-                                Model::at(
-                                    cx,
-                                    provider,
-                                    credential.clone(),
-                                    "https://api.anthropic.com".parse()?,
-                                )?
-                            } else {
-                                Model::guest(cx, provider)?
-                            }
+                        model: if let Some(credential) = &claude_token {
+                            Model::at(
+                                cx,
+                                provider,
+                                credential.clone(),
+                                "https://api.anthropic.com".parse()?,
+                            )?
                         } else {
                             Model::guest(cx, provider)?
                         },
@@ -86,7 +75,7 @@ pub fn build(
 
 use fictionet::stdlib::web::{Body, httpd};
 use fictionet_extras::models::CallPhase as ModelPhase;
-use web_world::observation::{CallPhase, EgressPurpose, Hit, SearchObs, SigninException, Tool};
+use web_world::observation::{CallPhase, EgressPurpose, Hit, SearchObs, Tool};
 
 #[derive(Clone)]
 struct Gateway {

@@ -678,3 +678,42 @@ fn incomplete_or_empty_documents_fail_without_becoming_cached_successes() {
         });
     }
 }
+
+#[test]
+fn a_credential_split_across_provider_blocks_cannot_reach_an_accepted_page() {
+    let dir = Dir::new("assembled-answer");
+    let fake = Fake::new(|_, _| {
+        let text = PAGE.replace("Story", &format!("Story {KEY}"));
+        let split = text.find(KEY).unwrap() + KEY.len() / 2;
+        let reply = json!({"content":[{"type":"text","text":&text[..split]},{"type":"text","text":&text[split..]}],"stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":10}});
+        (ms(1), Ok((200, reply.to_string().into_bytes())))
+    });
+    let model = Model::new(
+        Provider::Anthropic,
+        "writer",
+        "",
+        Key::new("writer key", Some(KEY.into())).unwrap(),
+        fake,
+    );
+    let pages = on_disk(
+        &dir.0,
+        Seed::builtin("web").unwrap(),
+        Some(Maker::Model(model)),
+        0,
+    )
+    .unwrap();
+    no_cast(&pages);
+    lab(|cx| async move {
+        let response = get(&pages, &cx, "https://docs.fields.com/guide").await;
+        assert_eq!(response.status, 200);
+        assert!(!String::from_utf8_lossy(&response.body).contains(KEY));
+        let record = pages
+            .store()
+            .page("docs.fields.com", "/guide")
+            .unwrap()
+            .clone();
+        assert!(!serde_json::to_string(&record)?.contains(KEY));
+        Ok(())
+    });
+    assert!(dir.texts().iter().all(|text| !text.contains(KEY)));
+}

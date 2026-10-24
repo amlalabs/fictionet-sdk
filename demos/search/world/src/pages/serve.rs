@@ -289,7 +289,7 @@ impl Pages {
                 &url,
                 &profile.name,
                 store.cast().map_or(&[], |cast| cast.people.as_slice()),
-                (make::site_profile(host).kind == "wiki").then(|| {
+                (make::site_profile(host).kind == make::SiteKind::Wiki).then(|| {
                     store
                         .page(host, target)
                         .map_or(self.seed.date.as_str(), |p| p.date.as_str())
@@ -410,7 +410,7 @@ impl Pages {
                         Ok(profile) => Response::new(
                             200,
                             "text/css",
-                            format!("{}\n{}", make::stylesheet(&profile.kind), profile.css),
+                            format!("{}\n{}", make::stylesheet(profile.kind), profile.css),
                             vec![],
                             Meta::Asset,
                         ),

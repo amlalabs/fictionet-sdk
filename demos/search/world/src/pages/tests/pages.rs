@@ -77,7 +77,7 @@ fn model_site_stylesheets_start_with_shared_layout_and_end_with_site_rules() {
         assert_eq!(css.status, 200);
         assert_eq!(css.content_type, "text/css");
         let css = String::from_utf8(css.body).unwrap();
-        let base = make::stylesheet("news");
+        let base = make::stylesheet(make::SiteKind::News);
         assert_eq!(css, format!("{base}\n{own}"));
         assert_eq!(pages.store().site("news.fields.com").unwrap().css, own);
         let audit = fictionet_extras::guest_content::Audit::default();
@@ -149,7 +149,11 @@ fn concurrent_model_pages_share_one_stylesheet() {
         let css = get(&pages, &cx, "https://docs.fields.com/static/css/main.css").await;
         assert_eq!(
             css.body,
-            format!("{}\nbody {{ color: #17472c; }}", make::stylesheet("docs")).as_bytes()
+            format!(
+                "{}\nbody {{ color: #17472c; }}",
+                make::stylesheet(make::SiteKind::Docs)
+            )
+            .as_bytes()
         );
         let replay = on_disk(&path, seed(), None, 0).unwrap();
         assert_eq!(
@@ -192,7 +196,7 @@ fn fixed_model_host_gets_one_stylesheet_without_rewriting_pages() {
                 css.body,
                 format!(
                     "{}\nbody {{color: #17472c}}",
-                    make::stylesheet(&make::site_profile(&fixed.host).kind)
+                    make::stylesheet(make::site_profile(&fixed.host).kind)
                 )
                 .as_bytes()
             );
