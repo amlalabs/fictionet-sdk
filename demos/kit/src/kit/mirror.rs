@@ -24,8 +24,6 @@ use std::{
 use tokio::io::{AsyncRead, AsyncWriteExt};
 use tower_service::Service;
 
-type UpstreamObserver = dyn Fn(&Request<Body>, Option<StatusCode>) + Send + Sync;
-
 type Answer = Result<Response<Body>, Error>;
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
@@ -44,32 +42,17 @@ pub struct Mirror<S> {
     root: PathBuf,
     pub(crate) closed: Arc<AtomicBool>,
     download: Arc<tokio::sync::Mutex<()>>,
-    observer: Option<Arc<UpstreamObserver>>,
 }
 impl<S> Mirror<S> {
-    /// Reports only requests that use the upstream, excluding cache hits and closed setup.
-    pub fn observe_upstream(mut self, observer: Arc<UpstreamObserver>) -> Self {
-        self.observer = Some(observer);
-        self
-    }
     fn new(upstream: S, root: PathBuf) -> Self {
         Self {
             upstream,
             root,
             closed: Arc::default(),
             download: Arc::default(),
-            observer: None,
         }
     }
 }
-
-// Versioned release directories contain immutable files.
-const RELEASES: [(&str, &[&str]); 2] = [
-    // Claude Code's native builds and their manifests.
-    ("downloads.claude.ai", &["claude-code-releases"]),
-    // Codex's packages and their checksums.
-    ("releases.openai.com", &["codex", "releases"]),
-];
 
 // No decoding is done on disk. Permit the encoded colon used in package
 // versions, but reject encoded separators, dots, NULs and ambiguous escapes.
@@ -94,29 +77,6 @@ fn segments(path: &str) -> Option<Vec<&str>> {
         return None;
     }
     Some(parts)
-}
-
-/// A file inside a version directory of a host in [`RELEASES`].
-fn release(host: &str, path: &str) -> bool {
-    let Some((_, prefix)) = RELEASES.iter().find(|(name, _)| *name == host) else {
-        return false;
-    };
-    segments(path).is_some_and(|parts| {
-        parts.len() > prefix.len() + 1 && parts.starts_with(prefix) && version(parts[prefix.len()])
-    })
-}
-
-/// A release version: `2.1.292`, or one with a suffix like `0.164.0-alpha.3`.
-fn version(name: &str) -> bool {
-    let (number, suffix) = name.split_once('-').unwrap_or((name, ""));
-    let fields: Vec<_> = number.split('.').collect();
-    fields.len() == 3
-        && fields
-            .iter()
-            .all(|f| !f.is_empty() && f.bytes().all(|b| b.is_ascii_digit()))
-        && suffix
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'.')
 }
 
 fn immutable(path: &str) -> bool {
@@ -162,7 +122,7 @@ fn key(request: &Request<Body>) -> Option<PathBuf> {
                     | "if-unmodified-since"
             )
         })
-        || (!immutable(request.uri().path()) && !release(&target.host, request.uri().path()))
+        || !immutable(request.uri().path())
     {
         return None;
     }
@@ -217,22 +177,7 @@ where
             if mirror.closed.load(Ordering::Acquire) {
                 return Ok(web::httpd::text(StatusCode::FORBIDDEN, "Forbidden\n"));
             }
-            let observed = if mirror.observer.is_some() {
-                let mut head = Request::new(Body::empty());
-                *head.method_mut() = request.method().clone();
-                *head.uri_mut() = request.uri().clone();
-                *head.extensions_mut() = request.extensions().clone();
-                Some(head)
-            } else {
-                None
-            };
-            if let (Some(observer), Some(head)) = (&mirror.observer, &observed) {
-                observer(head, None);
-            }
             let response = mirror.upstream.call(request).await?;
-            if let (Some(observer), Some(head)) = (&mirror.observer, &observed) {
-                observer(head, Some(response.status()));
-            }
             let Some(path) = path.filter(|_| {
                 response.status() == StatusCode::OK
                     && !response.headers().contains_key(header::CONTENT_ENCODING)

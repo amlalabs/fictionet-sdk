@@ -55,9 +55,11 @@ function svg(tag, attrs = {}, text) {
   return node;
 }
 function localSites() {
-  const upstream = new Set([...shown.connections.map((row) => row.host), ...shown.calls.map((call) => call.host)]);
+  const upstream = new Set([...shown.connections.filter((row) => ['model', 'account', 'page writer'].includes(row.purpose)).map((row) => row.host), ...shown.calls.map((call) => call.host)]);
   return shown.sites.filter((site) => !upstream.has(site.host));
 }
+
+const egressSource = (purpose) => ({ model: 'calls', 'page writer': 'sites', account: 'signin', live_search: 'search', live_capture: 'sites' })[purpose];
 
 function graph(upstream, newData) {
   const map = $('map'), width = Math.min(map.clientWidth, 760), height = map.clientHeight;
@@ -90,12 +92,12 @@ function graph(upstream, newData) {
     map.append(group);
   };
   const sites = localSites().sort((a, b) => b.at_ms - a.at_ms);
-  const count = Math.max(0, Math.min(3, Math.floor((bottom - top - 34) / 44) - 4));
+  const count = Math.max(0, Math.min(3, Math.floor((bottom - top - 34) / 44) - 5));
   const visible = sites.slice(0, count);
   const selectedHost = selection?.startsWith('site:') ? selection.slice(5) : selection?.startsWith('page:') ? hostOf(selection.slice(5)) : null;
   const selected = sites.find((site) => site.host === selectedHost);
   if (selected && !visible.includes(selected)) visible.splice(Math.max(0, count - 1), 1, selected);
-  const services = [{ id: 'dns', title: 'DNS', address: '10.0.0.1:53' }, ...visible.map((site) => ({ id: `site:${site.host}`, title: site.host, address: site.address || '' })), { id: 'sites', title: 'All sites ›' }, { id: 'calls', title: 'model gateway' }, { id: 'signin', title: 'sign-in', address: shown.signin ? shown.signin.fact.open ? 'Open' : 'Closed' : '' }];
+  const services = [{ id: 'dns', title: 'DNS', address: '10.0.0.1:53' }, { id: 'search', title: 'Search' }, ...visible.map((site) => ({ id: `site:${site.host}`, title: site.host, address: site.address || '' })), { id: 'sites', title: 'Sites ›' }, { id: 'calls', title: 'model gateway' }, { id: 'signin', title: 'sign-in', address: shown.signin ? shown.signin.fact.open ? 'Open' : 'Closed' : '' }];
   const step = Math.min(48, (bottom - top - 34) / services.length), nodeHeight = step - 6;
   const first = top + 30, routerY = (top + bottom) / 2 - 4;
   wire(`M139 58 V${routerY + 20}`, shown.activity.length ? 'hot' : '');
@@ -120,8 +122,8 @@ function graph(upstream, newData) {
     const nodeWidth = (width - 52 - 12 * (visibleDestinations.length - 1)) / visibleDestinations.length;
     const x = 26 + index * (nodeWidth + 12);
     const purposes = [...new Set(shown.connections.filter((row) => row.host === host).map((row) => row.purpose))];
-    for (const source of new Set(purposes.map((purpose) => purpose === 'account' ? 'signin' : 'calls'))) {
-      const active = live && upstream?.host === host;
+    for (const source of new Set(purposes.map(egressSource))) {
+      const active = live && upstream?.host === host && purposes.includes(upstream.purpose) && egressSource(upstream.purpose) === source;
       wire(`M${width - 40} ${positions.get(source)} H${width - 25} V${internet + 58} H${x + nodeWidth}`, active ? 'outside observed hot' : 'outside observed', active);
     }
     node(`egress:${host}`, x, internet + 36, nodeWidth, 44, host, purposes.join(' · '), true);
@@ -316,6 +318,14 @@ function details() {
     for (const connection of connections.filter((connection) => !egress.some((row) => row.fact.host === connection.host && row.fact.purpose === connection.purpose))) body.append(detailRow(connection.at_ms, connection.host, connection.purpose));
     for (const row of egress) body.append(detailRow(row.at_ms, row.fact.host, `${row.fact.purpose} · ${row.fact.method} ${row.fact.path} · ${row.fact.status || row.fact.phase}`));
     if (!connections.length && !egress.length) body.append(element('p', 'No connections', 'detail-empty'));
+  } else if (selection === 'search') {
+    heading('Search');
+    const searches = [...shown.sites.flatMap((site) => site.searches), ...shown.calls.flatMap((call) => call.tools.filter((tool) => tool.tool === 'web_search').map((tool) => ({ ...tool, query: tool.target })))].sort((a, b) => b.at_ms - a.at_ms);
+    for (const search of searches) {
+      const content = element('div'); content.append(element('p', search.query, 'tool-query'), search.error ? element('p', search.error, 'world-answer') : results(search.results));
+      body.append(detailRow(search.at_ms, 'Search', `${search.results.length} results`, content));
+    }
+    if (!searches.length) body.append(element('p', 'No searches', 'detail-empty'));
   } else if (selection === 'sites') {
     heading('Sites');
     for (const site of localSites()) {

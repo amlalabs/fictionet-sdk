@@ -123,7 +123,6 @@ pub enum EgressPurpose {
     #[serde(rename = "page writer")]
     PageWriter,
     Account,
-    Setup,
     LiveSearch,
     LiveCapture,
 }
@@ -167,8 +166,6 @@ pub enum SigninException {
         rename = "GET chatgpt.com/backend-api/codex/models, /backend-api/wham/accounts/check and /backend-api/wham/usage"
     )]
     CodexAccount,
-    #[serde(rename = "Host-owned token refresh")]
-    TokenRefresh,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]

@@ -396,10 +396,10 @@ fn activity_updates_a_model_call_in_place_and_local_calls_have_no_egress() {
         at_ms: 400,
         fact: SearchObs::Egress {
             attempt: 1,
-            host: "archive.ubuntu.com".parse().unwrap(),
+            host: "www.cisa.gov".parse().unwrap(),
             method: "GET".into(),
-            path: "/ubuntu/dists/noble/InRelease".into(),
-            purpose: web_world::observation::EgressPurpose::Setup,
+            path: "/news-events/cybersecurity-advisories".into(),
+            purpose: web_world::observation::EgressPurpose::LiveCapture,
             phase: web_world::observation::EgressPhase::Attempt,
             status: None,
         },
@@ -598,16 +598,16 @@ fn source_choices_include_the_reason_they_are_unavailable() {
 }
 
 #[test]
-fn setup_connections_and_sign_in_policy_remain_visible_after_activity_expires() {
+fn live_connections_and_sign_in_policy_remain_visible_after_activity_expires() {
     let mut views = Views::default();
     views.push(Observation {
         at_ms: 100,
         fact: SearchObs::Egress {
             attempt: 1,
-            host: "archive.ubuntu.com".parse().unwrap(),
+            host: "www.cisa.gov".parse().unwrap(),
             method: "GET".into(),
-            path: "/ubuntu/dists/noble/InRelease".into(),
-            purpose: web_world::observation::EgressPurpose::Setup,
+            path: "/news-events/cybersecurity-advisories".into(),
+            purpose: web_world::observation::EgressPurpose::LiveCapture,
             phase: web_world::observation::EgressPhase::Attempt,
             status: None,
         },
@@ -616,7 +616,7 @@ fn setup_connections_and_sign_in_policy_remain_visible_after_activity_expires() 
         at_ms: 200,
         fact: SearchObs::Signin {
             open: false,
-            exceptions: vec![web_world::observation::SigninException::TokenRefresh],
+            exceptions: vec![web_world::observation::SigninException::ClaudeAccount],
         },
     });
     for at_ms in 300..HISTORY as u64 + 400 {
@@ -631,11 +631,99 @@ fn setup_connections_and_sign_in_policy_remain_visible_after_activity_expires() 
     let view = views.current();
     assert!(view.egress.is_empty());
     assert_eq!(view.connections.len(), 1);
-    assert_eq!(view.connections[0].host, "archive.ubuntu.com");
+    assert_eq!(view.connections[0].host, "www.cisa.gov");
     assert!(matches!(
         view.signin.unwrap().fact,
         SearchObs::Signin { open: false, .. }
     ));
     assert!(views.at(99).connections.is_empty());
     assert!(views.at(199).signin.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_destinations_start_at_the_search_and_sites_services() {
+    use fictionet_demo::kit::{RunDir, shot};
+    use std::time::Duration;
+    use web_world::observation::{EgressPhase, EgressPurpose};
+    let (page, _) = Page::new(&pages(), true);
+    {
+        let mut views = page.views.lock().unwrap();
+        for (at_ms, host, purpose) in [
+            (100, "api.exa.ai", EgressPurpose::LiveSearch),
+            (200, "www.cisa.gov", EgressPurpose::LiveCapture),
+        ] {
+            views.push(Observation {
+                at_ms,
+                fact: SearchObs::Egress {
+                    attempt: at_ms,
+                    host: host.parse().unwrap(),
+                    method: "GET".into(),
+                    path: "/".into(),
+                    purpose,
+                    phase: EgressPhase::Response,
+                    status: Some(200),
+                },
+            });
+        }
+        views.push(Observation {
+            at_ms: 210,
+            fact: SearchObs::Resolved {
+                name: "www.cisa.gov".parse().unwrap(),
+                address: Some("104.16.80.12".parse().unwrap()),
+            },
+        });
+        views.push(Observation {
+            at_ms: 220,
+            fact: SearchObs::Search {
+                engine: web_world::observation::Engine::Google,
+                query: "supply chain".into(),
+                results: vec![web_world::observation::Hit {
+                    title: "Supply chain advisory".into(),
+                    url: "https://www.cisa.gov/advisory".into(),
+                }],
+            },
+        });
+        page.snapshots.send_replace(views.current());
+    }
+    let server = serve(page.router(), 0).await.unwrap();
+    let url = server.url.clone();
+    tokio::task::spawn_blocking(move || {
+        let temporary = RunDir::new(&std::env::temp_dir(), "search-page").unwrap();
+        let output = std::env::var_os("SEARCH_SCREENSHOTS").map(std::path::PathBuf::from)
+            .unwrap_or_else(|| temporary.path().into());
+        std::fs::create_dir_all(&output).unwrap();
+        let ready = "document.querySelectorAll('#map .wire.observed').length === 2";
+        let routes = r#"(() => {
+            const map = document.getElementById('map');
+            const center = label => {
+                const rect = map.querySelector(`.node[aria-label="${label}"] rect`);
+                if (!rect) throw new Error(`missing ${label}`);
+                return Number(rect.getAttribute('y')) + Number(rect.getAttribute('height')) / 2;
+            };
+            const starts = [...map.querySelectorAll('.wire.observed')].map(path => Number(path.getAttribute('d').match(/^M[\d.]+ ([\d.]+)/)[1]));
+            for (const label of ['Search', 'Sites ›']) {
+                if (!starts.includes(center(label))) throw new Error(`no upstream route from ${label}`);
+            }
+            if (starts.includes(center('model gateway'))) throw new Error('Live traffic crossed the model gateway');
+            for (const node of map.querySelectorAll('.node rect')) {
+                if (Number(node.getAttribute('height')) <= 0) throw new Error('collapsed map node');
+            }
+            map.querySelector('.node[aria-label="Sites ›"]').dispatchEvent(new MouseEvent('click'));
+            if (!document.getElementById('detail-body').textContent.includes('www.cisa.gov')) throw new Error('captured site disappeared');
+            map.querySelector('.node[aria-label="Search"]').dispatchEvent(new MouseEvent('click'));
+            if (document.getElementById('detail-title').textContent !== 'Search') throw new Error('search inspector');
+            if (!document.getElementById('detail-body').textContent.includes('supply chain')) throw new Error('missing search');
+        })()"#;
+        for (name, size, scheme) in [
+            ("live-map-dark", (1440, 900), "dark"),
+            ("live-map-light", (1440, 900), "light"),
+            ("live-map-laptop", (1280, 800), "light"),
+        ] {
+            let path = output.join(format!("{name}.png"));
+            shot::capture_at(&url, &[shot::Step {
+                ready, action: Some(routes), color_scheme: Some(scheme), out: Some(&path),
+            }], Duration::from_secs(15), size).unwrap();
+        }
+    }).await.unwrap();
+    server.shutdown().await;
 }

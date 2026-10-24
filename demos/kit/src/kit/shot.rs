@@ -57,6 +57,16 @@ pub struct Step<'a> {
 /// The timeout bounds navigation and readiness. Errors include the condition,
 /// Chromium's stderr tail, and collected JavaScript exceptions.
 pub fn capture(url: &str, steps: &[Step<'_>], timeout: Duration) -> io::Result<()> {
+    capture_at(url, steps, timeout, (1440, 900))
+}
+
+/// Runs page steps at a chosen desktop or laptop viewport.
+pub fn capture_at(
+    url: &str,
+    steps: &[Step<'_>],
+    timeout: Duration,
+    (width, height): (u32, u32),
+) -> io::Result<()> {
     let mut condition = "";
     let profile_dir = super::util::RunDir::new(&std::env::temp_dir(), "chrome")?;
     let profile = profile_dir.path();
@@ -137,7 +147,7 @@ pub fn capture(url: &str, steps: &[Step<'_>], timeout: Duration) -> io::Result<(
             &to_write,
             Some(&session),
             "Emulation.setDeviceMetricsOverride",
-            json!({"width":1440,"height":900,"deviceScaleFactor":1,"mobile":false}),
+            json!({"width":width,"height":height,"deviceScaleFactor":1,"mobile":false}),
         )?;
         reader.call(&to_write, Some(&session), "Runtime.enable", json!({}))?;
         reader.call(
