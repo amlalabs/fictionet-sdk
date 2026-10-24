@@ -28,12 +28,14 @@ fn idle_drains_spawned_and_woken_work_before_advancing_time() {
         assert_eq!(cx.now(), Instant::ZERO);
         assert_eq!(stage.load(std::sync::atomic::Ordering::SeqCst), 1);
         task.join(&cx).await?;
-        cx.idle().await?;
-        assert_eq!(cx.now(), Instant::ZERO);
-        cx.sleep(ms(1)).await?;
+        // The join found the task already done, so this idle waits for the
+        // next idle point: the child's timer fires first.
         cx.idle().await?;
         assert_eq!(stage.load(std::sync::atomic::Ordering::SeqCst), 2);
         assert_eq!(cx.now(), Instant::ZERO + ms(1));
+        cx.sleep(ms(1)).await?;
+        cx.idle().await?;
+        assert_eq!(cx.now(), Instant::ZERO + ms(2));
         cx.cancel();
         assert_eq!(cx.idle().await, Err(Cancelled));
         Ok(())

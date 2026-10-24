@@ -202,6 +202,9 @@ struct Queue {
     next_id: u64,
     idle: BTreeMap<u64, Waker>,
     next_idle: u64,
+    /// The last turn only ran the tasks an idle point woke, and they found
+    /// no work: their new idle waits belong to the next idle point.
+    idle_woken: bool,
 }
 
 struct NewTask {
@@ -524,7 +527,12 @@ impl RunState {
             });
         }
         let more = !q.ready.is_empty() || !q.incoming.is_empty() || q.wake_all;
-        if !more && !q.idle.is_empty() {
+        // An idle wait that follows another with no work in between waits for
+        // the next idle point, so a task that loops on idle lets time pass.
+        let repeated = std::mem::take(&mut q.idle_woken);
+        let wake_idle = !more && !q.idle.is_empty() && !repeated;
+        if wake_idle {
+            q.idle_woken = true;
             let idle = std::mem::take(&mut q.idle);
             drop(q);
             for waker in idle.into_values() {
