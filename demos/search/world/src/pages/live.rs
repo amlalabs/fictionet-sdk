@@ -114,7 +114,7 @@ impl Live {
         let lifetime = lifetime.clone();
         let cx = cx.clone();
         self.fetcher.spawn(async move {
-            let result = live.download(&lifetime, &cx, &url, &send).await;
+            let result = live.download(&lifetime, &cx, &url).await;
             send.send_replace(match result {
                 Ok(()) => CaptureState::Ready,
                 Err(_) if lifetime.cancelled() || cx.is_cancelled() => CaptureState::Cancelled,
@@ -129,7 +129,6 @@ impl Live {
         lifetime: &Arc<Lifetime>,
         cx: &Cx,
         url: &str,
-        ready: &watch::Sender<CaptureState>,
     ) -> Result<(), String> {
         if self.state().archive.contains(url) {
             return Ok(());
@@ -173,19 +172,6 @@ impl Live {
                 .archive
                 .append(&path, url, &response)
                 .map_err(|error| error.to_string())?;
-        }
-        ready.send_replace(CaptureState::Ready);
-        let url = url.to_owned();
-        let links = self
-            .fetcher
-            .process(cx, lifetime, move || {
-                capture::links(&url, &response).map_err(|error| error.to_string())
-            })
-            .await;
-        if let Ok(links) = links {
-            for url in links.assets {
-                let _ = self.capture(lifetime, cx, url);
-            }
         }
         Ok(())
     }
@@ -270,9 +256,6 @@ impl Live {
             state
                 .searches
                 .insert((query.to_owned(), start), search.clone());
-        }
-        for result in &search.results {
-            let _ = self.capture(lifetime, cx, result.url.clone());
         }
         Ok(search)
     }

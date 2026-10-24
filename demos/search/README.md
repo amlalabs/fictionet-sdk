@@ -80,7 +80,7 @@ tool handlers, its name resolver and the typed no-route callback on its network.
 model calls and recent activity. Selecting a site or gateway keeps the map
 above its details while the agent remains visible. The scrubber replays the
 retained observation history; the agent stays live. The World menu chooses the page source or restarts world pages.
-The last 1024 observations are kept for rewind. Observed internet destinations
+Observations are retained for rewind throughout the launch. Observed internet destinations
 and sign-in policy survive activity expiry and page restarts. Each launch writes its facts to a separate
 `<downloads>/search/run-<uuid>.jsonl` with RFC 3339 wall-clock timestamps and
 owner-only permissions. Preview records are under `demos/downloads/search-preview/`.
@@ -98,7 +98,7 @@ Capture dates appear when the archive records them.
 
 ## Page sources
 
-- **Copied** serves offline English Wikipedia, Python, Rust, MDN and GitHub documentation,
+- **Copied** serves offline English Wikipedia, Python, Rust, MDN and GitHub documentation, recipes,
   and the captured security sources at their original URLs. A prepared Tantivy
   index ranks partial matches by BM25 with extra title weight. Google, Bing,
   DuckDuckGo and Claude's search tool share that index. Result counts come from
@@ -110,9 +110,9 @@ Capture dates appear when the archive records them.
   Claude Haiku 5.5, without thinking, with the API's 128K output maximum.
 - **Live** is selected by default when `EXA_API_KEY` is present. Exa supplies search
   results, and the host copies any public URL the guest or Claude requests,
-  including URLs that never appeared in search. Pages and static dependencies
-  are retained at their original URLs. Separate downloads can progress together.
-  Navigation links are fetched when opened. Actual host requests appear in the
+  including URLs that never appeared in search. Each page, stylesheet or image
+  is copied when requested and retained at its original URL. Separate downloads
+  can progress together. Actual host requests appear in the
   page's internet activity. Transport failures return a gateway error; upstream
   status codes, including real missing pages, are preserved.
 

@@ -18,8 +18,6 @@ use web_world::{
     pages::{NewPages, Pages},
 };
 
-const HISTORY: usize = 1024;
-
 fn wall_start() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -125,9 +123,6 @@ impl Views {
                     .iter()
                     .any(|connection| connection.host == host && connection.purpose == *purpose)
                 {
-                    if self.connections.len() == HISTORY {
-                        self.connections.remove(0);
-                    }
                     self.connections.push(Connection {
                         host,
                         purpose: *purpose,
@@ -136,16 +131,9 @@ impl Views {
                 }
             }
             SearchObs::Signin { .. } => {
-                if self.signin.len() == HISTORY {
-                    self.signin.pop_front();
-                }
                 self.signin.push_back(observation.clone());
             }
             _ => {}
-        }
-        if self.observations.len() == HISTORY {
-            self.observations.pop_front();
-            self.oldest_ms = self.observations.front().map_or(0, |row| row.at_ms);
         }
         self.observations.push_back(observation);
     }
