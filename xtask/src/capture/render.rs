@@ -336,6 +336,7 @@ where
                         let headers = response.headers.iter().map(|(name, value)| json!({"name":name.as_str(),"value":value.to_str().unwrap_or("")})).collect::<Vec<_>>();
                         ("Fetch.fulfillRequest", json!({"requestId":paused.request_id,"responseCode":response.status.as_u16(),"responseHeaders":headers,"body":fictionet::stdlib::codec::base64::encode(&response.body)}))
                     } else {
+                        if let Err(error) = response { eprintln!("Rendered requisite unavailable: {}: {error}", paused.request.url); }
                         ("Fetch.failRequest", json!({"requestId":paused.request_id,"errorReason":"BlockedByClient"}))
                     };
                     send(&mut writer, json!({"id":id,"sessionId":session,"method":method,"params":params})).await?;

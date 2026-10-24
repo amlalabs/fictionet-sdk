@@ -299,10 +299,15 @@ pub fn links(url: &str, response: &warc::Response) -> io::Result<Links> {
         {
             return Ok(());
         }
-        for name in ["src", "data", "data-src", "data-lazy-src", "data-original"] {
+        for name in ["src", "data-src", "data-lazy-src", "data-original"] {
             if let Some(value) = attr(name) {
                 link(&base, value, &mut links.assets)?;
             }
+        }
+        if name == "object"
+            && let Some(value) = attr("data")
+        {
+            link(&base, value, &mut links.assets)?;
         }
         for name in ["srcset", "data-srcset", "data-lazy-srcset"] {
             if let Some(value) = attr(name) {
@@ -316,8 +321,11 @@ pub fn links(url: &str, response: &warc::Response) -> io::Result<Links> {
         }
         if name == "link"
             && attr("rel").is_some_and(|r| {
-                r.split_whitespace()
-                    .any(|v| matches!(v, "stylesheet" | "icon" | "preload" | "modulepreload"))
+                r.split_whitespace().any(|value| {
+                    ["stylesheet", "icon", "preload", "modulepreload"]
+                        .iter()
+                        .any(|rel| value.eq_ignore_ascii_case(rel))
+                })
             })
             && let Some(value) = attr("href")
         {
