@@ -38,7 +38,7 @@ pub async fn run() -> Result {
         "black hole"
     };
     let pages = if captured {
-        Arc::new(super::app_pages(seed.clone(), &downloads)?)
+        Arc::new(super::app_pages(seed.clone(), &downloads, None)?)
     } else {
         println!("No corpus downloads found. Preview uses the small bundled sky.org capture.");
         std::fs::write(

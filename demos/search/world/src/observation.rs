@@ -2,6 +2,7 @@
 
 use crate::pages::{Meta, NewPages, Pages, Response};
 pub use fictionet::stdlib::protocols::dns::rr::Name as HostName;
+pub use fictionet_extras::models::UpstreamPhase as EgressPhase;
 use http::{
     HeaderMap, Method, StatusCode,
     uri::{PathAndQuery, Scheme},
@@ -70,15 +71,16 @@ pub enum SearchObs {
     },
     Signin {
         open: bool,
-        exceptions: Vec<String>,
+        exceptions: Vec<SigninException>,
     },
     Egress {
+        attempt: u64,
         #[serde(serialize_with = "display")]
         host: HostName,
         method: String,
         path: String,
-        purpose: String,
-        phase: String,
+        purpose: EgressPurpose,
+        phase: EgressPhase,
         status: Option<u16>,
     },
     ObservationFailed {
@@ -88,6 +90,30 @@ pub enum SearchObs {
         from: IpAddr,
         to: IpAddr,
     },
+}
+
+/// The reason a request entered the real network.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EgressPurpose {
+    Model,
+    #[serde(rename = "page writer")]
+    PageWriter,
+    Account,
+    Setup,
+}
+
+/// Operational account endpoints; interactive setup and refresh stay host-owned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum SigninException {
+    #[serde(rename = "GET api.anthropic.com/api/oauth/profile and /api/oauth/roles")]
+    ClaudeAccount,
+    #[serde(
+        rename = "GET chatgpt.com/backend-api/codex/models, /backend-api/wham/accounts/check and /backend-api/wham/usage"
+    )]
+    CodexAccount,
+    #[serde(rename = "Host-owned token refresh")]
+    TokenRefresh,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -148,46 +174,25 @@ impl Pages {
     /// Installs this world's concrete observation destination. No SDK observer is used.
     pub fn observe(&self, destination: Sender<Observation>) {
         *self.observation.lock().unwrap() = Some(destination);
+        let destination = self.observation.clone();
+        self.observe_writer(std::sync::Arc::new(move |cx, provider, event| {
+            report(
+                &destination,
+                cx,
+                SearchObs::Egress {
+                    attempt: event.attempt,
+                    host: provider.host().parse().expect("provider hostname"),
+                    method: event.method.to_string(),
+                    path: event.path.path().into(),
+                    purpose: EgressPurpose::PageWriter,
+                    phase: event.phase,
+                    status: event.status.map(|s| s.as_u16()),
+                },
+            );
+        }));
     }
-    pub fn report(&self, cx: &fictionet::Cx, mut fact: SearchObs) {
-        match &mut fact {
-            SearchObs::Search { results, .. } | SearchObs::Tool { results, .. } => {
-                for hit in results {
-                    hit.url = redact_url(&hit.url);
-                }
-            }
-            _ => {}
-        }
-        if let SearchObs::Tool {
-            tool: Tool::Fetch,
-            target,
-            ..
-        } = &mut fact
-        {
-            *target = redact_url(target);
-        }
-        let mut destination = self.observation.lock().unwrap();
-        let Some(sender) = destination.as_ref() else {
-            return;
-        };
-        let reason = if sender.capacity() <= 1 {
-            Some("Observation queue exceeded its capacity")
-        } else if serde_json::to_vec(&fact).map_or(true, |bytes| bytes.len() > 256 * 1024) {
-            Some("Observation exceeded its byte limit")
-        } else {
-            None
-        };
-        let failed = reason.is_some();
-        let fact = reason.map_or(fact, |reason| SearchObs::ObservationFailed {
-            reason: reason.into(),
-        });
-        let _ = sender.try_send(Observation {
-            at_ms: cx.now().since_start().as_millis() as u64,
-            fact,
-        });
-        if failed {
-            *destination = None;
-        }
+    pub fn report(&self, cx: &fictionet::Cx, fact: SearchObs) {
+        report(&self.observation, cx, fact);
     }
 
     pub fn source(&self) -> PageSource {
@@ -212,13 +217,8 @@ impl Pages {
             method,
             path,
             mut source,
-            mut headers,
+            headers,
         } = request;
-        for (name, value) in &mut headers {
-            if sensitive(name.as_str()) {
-                *value = http::HeaderValue::from_static("[redacted]");
-            }
-        }
         if let Meta::Search(list) = &response.meta {
             self.report(
                 cx,
@@ -293,6 +293,77 @@ impl Pages {
     }
 }
 
+fn report(
+    destination: &std::sync::Mutex<Option<Sender<Observation>>>,
+    cx: &fictionet::Cx,
+    mut fact: SearchObs,
+) {
+    let too_large = serde_json::to_vec(&fact).map_or(true, |bytes| bytes.len() > 256 * 1024);
+    match &mut fact {
+        SearchObs::Search { results, .. } | SearchObs::Tool { results, .. } => {
+            for hit in results {
+                hit.url = redact_url(&hit.url);
+            }
+        }
+        SearchObs::Request { path, headers, .. } => {
+            *path = redact_path(path);
+            for (name, value) in headers {
+                *value = match name.as_str() {
+                    "user-agent" | "accept" | "accept-language" | "accept-encoding"
+                    | "content-type" | "content-length" | "host" => value.clone(),
+                    "referer" | "origin" | "location" | "content-location" => value
+                        .to_str()
+                        .ok()
+                        .and_then(|v| redact_url(v).parse().ok())
+                        .unwrap_or_else(|| http::HeaderValue::from_static("[redacted]")),
+                    _ => http::HeaderValue::from_static("[redacted]"),
+                };
+            }
+        }
+        SearchObs::ModelCall { path, .. } => *path = redact_path(path),
+        SearchObs::Egress { path, .. } => {
+            *path = if path.starts_with("https://") || path.starts_with("http://") {
+                redact_url(path)
+            } else {
+                path.parse()
+                    .map(|p| redact_path(&p).to_string())
+                    .unwrap_or_else(|_| "[redacted]".into())
+            };
+        }
+        _ => {}
+    }
+    if let SearchObs::Tool {
+        tool: Tool::Fetch,
+        target,
+        ..
+    } = &mut fact
+    {
+        *target = redact_url(target);
+    }
+    let mut destination = destination.lock().unwrap();
+    let Some(sender) = destination.as_ref() else {
+        return;
+    };
+    let reason = if sender.capacity() <= 1 {
+        Some("Observation queue exceeded its capacity")
+    } else if too_large {
+        Some("Observation exceeded its byte limit")
+    } else {
+        None
+    };
+    let failed = reason.is_some();
+    let fact = reason.map_or(fact, |reason| SearchObs::ObservationFailed {
+        reason: reason.into(),
+    });
+    let _ = sender.try_send(Observation {
+        at_ms: cx.now().since_start().as_millis() as u64,
+        fact,
+    });
+    if failed {
+        *destination = None;
+    }
+}
+
 /// Serializes a protocol value as its wire spelling for the page.
 pub fn display<T: std::fmt::Display, S: serde::Serializer>(
     value: &T,
@@ -342,8 +413,16 @@ fn sensitive(name: &str) -> bool {
 
 fn redact_url(value: &str) -> String {
     let Ok(mut url) = url::Url::parse(value) else {
-        return value.into();
+        let path = value.split_once('#').map_or(value, |(path, _)| path);
+        return if path.starts_with('/') {
+            path.parse()
+                .map(|path| redact_path(&path).to_string())
+                .unwrap_or_else(|_| "[redacted]".into())
+        } else {
+            "[redacted]".into()
+        };
     };
+    url.set_fragment(None);
     let _ = url.set_username("");
     let _ = url.set_password(None);
     if url.query().is_some() {
@@ -363,14 +442,18 @@ pub fn redact_path(path: &PathAndQuery) -> PathAndQuery {
     };
     let mut redacted = url::form_urlencoded::Serializer::new(String::new());
     for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
-        redacted.append_pair(
-            &key,
-            if sensitive(&key) {
-                "[redacted]"
-            } else {
-                &value
-            },
-        );
+        let value = if sensitive(&key) {
+            "[redacted]".into()
+        } else if let Ok(mut nested) = url::Url::parse(&value) {
+            let _ = nested.set_username("");
+            let _ = nested.set_password(None);
+            nested.set_query(None);
+            nested.set_fragment(None);
+            nested.into()
+        } else {
+            value.into_owned()
+        };
+        redacted.append_pair(&key, &value);
     }
     format!("{}?{}", path.path(), redacted.finish())
         .parse()
@@ -429,6 +512,36 @@ mod tests {
     }
 
     #[test]
+    fn all_url_positions_remove_credentials_and_fragments() {
+        let url = "https://user:private-password@example.org/path?code=private-code&q=stars#access_token=private-token";
+        let redacted = redact_url(url);
+        assert!(!redacted.contains("private"));
+        assert!(redacted.contains("q=stars"));
+        assert!(!redacted.contains('#'));
+        let path = redact_path(&"/callback?next=https%3A%2F%2Fexample.org%2F%3Ftoken%3Dprivate-value%23private-fragment".parse().unwrap());
+        assert!(!path.as_str().contains("private"));
+        assert!(!redact_url("/callback?code=private-code#private-fragment").contains("private"));
+    }
+
+    #[test]
+    fn tool_and_search_urls_are_scrubbed_before_entering_the_record() {
+        fictionet::block_on(fictionet::lab(fictionet::Seed::from_u64(10), |cx| async move {
+            let pages = Pages::new(crate::pages::Seed::builtin("web")?);
+            let (sender, mut receiver) = tokio::sync::mpsc::channel(OBSERVATION_CAPACITY);
+            pages.observe(sender);
+            let url = "https://user:private-password@example.org/page?code=private-code&q=stars#access_token=private-fragment";
+            pages.report(&cx, SearchObs::Search { engine: Engine::Google, query: "stars".into(), results: vec![Hit { url: url.into(), title: "Stars".into() }] });
+            pages.report(&cx, SearchObs::Tool { call: 1, tool: Tool::Fetch, target: url.into(), results: vec![Hit { url: url.into(), title: "Stars".into() }], error: None });
+            let rows = [receiver.try_recv().unwrap(), receiver.try_recv().unwrap()];
+            let recorded = serde_json::to_string(&rows)?;
+            assert!(!recorded.contains("private"));
+            assert!(recorded.contains("q=stars"));
+            assert!(recorded.contains("Stars"));
+            Ok(())
+        })).unwrap();
+    }
+
+    #[test]
     fn request_credentials_are_redacted_before_recording_or_display() {
         fictionet::block_on(fictionet::lab(
             fictionet::Seed::from_u64(1),
@@ -441,6 +554,8 @@ mod tests {
                     headers.insert(name, "sensitive-value".parse().unwrap());
                 }
                 headers.insert("user-agent", "Firefox/1".parse().unwrap());
+                headers.insert("referer", "https://user:password@example.org/callback?code=sensitive-value#access_token=sensitive-value".parse().unwrap());
+                headers.insert("link", "<https://example.org/?code=sensitive-value>; rel=next".parse().unwrap());
                 pages.report_response(
                     &cx,
                     RequestContext {
@@ -470,6 +585,8 @@ mod tests {
                 assert!(path.as_str().contains("q=black+hole"));
                 assert_eq!(headers["user-agent"], "Firefox/1");
                 assert_eq!(headers["authorization"], "[redacted]");
+                assert_eq!(headers["referer"], "https://example.org/callback?code=%5Bredacted%5D");
+                assert_eq!(headers["link"], "[redacted]");
                 Ok(())
             },
         ))

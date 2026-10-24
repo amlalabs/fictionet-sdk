@@ -395,11 +395,12 @@ fn activity_updates_a_model_call_in_place_and_local_calls_have_no_egress() {
     views.push(Observation {
         at_ms: 400,
         fact: SearchObs::Egress {
+            attempt: 1,
             host: "archive.ubuntu.com".parse().unwrap(),
             method: "GET".into(),
             path: "/ubuntu/dists/noble/InRelease".into(),
-            purpose: "setup".into(),
-            phase: "attempt".into(),
+            purpose: web_world::observation::EgressPurpose::Setup,
+            phase: web_world::observation::EgressPhase::Attempt,
             status: None,
         },
     });
@@ -552,11 +553,12 @@ fn setup_connections_and_sign_in_policy_remain_visible_after_activity_expires() 
     views.push(Observation {
         at_ms: 100,
         fact: SearchObs::Egress {
+            attempt: 1,
             host: "archive.ubuntu.com".parse().unwrap(),
             method: "GET".into(),
             path: "/ubuntu/dists/noble/InRelease".into(),
-            purpose: "setup".into(),
-            phase: "attempt".into(),
+            purpose: web_world::observation::EgressPurpose::Setup,
+            phase: web_world::observation::EgressPhase::Attempt,
             status: None,
         },
     });
@@ -564,7 +566,7 @@ fn setup_connections_and_sign_in_policy_remain_visible_after_activity_expires() 
         at_ms: 200,
         fact: SearchObs::Signin {
             open: false,
-            exceptions: vec!["Token refresh".into()],
+            exceptions: vec![web_world::observation::SigninException::TokenRefresh],
         },
     });
     for at_ms in 300..HISTORY as u64 + 400 {

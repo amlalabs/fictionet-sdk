@@ -238,7 +238,7 @@ pub fn identity(provider: Provider, model: &str, reasoning: &str) -> Value {
 pub struct Model {
     pub provider: Provider,
     pub model: String,
-    /// The reasoning effort sent to OpenRouter, or empty for the model's own.
+    /// The reasoning effort, or empty for the provider default.
     pub reasoning: String,
     key: Key,
     transport: Arc<dyn Transport>,
@@ -262,7 +262,7 @@ impl Model {
             "",
             "",
             Key::from_env(fictionet_extras::models::Provider::OpenRouter)?,
-            Arc::new(ProviderTransport(Provider::OpenRouter)),
+            Arc::new(ProviderTransport::new(Provider::OpenRouter)),
         ))
     }
 
@@ -273,8 +273,19 @@ impl Model {
             "",
             "",
             Key::from_env(fictionet_extras::models::Provider::Anthropic)?,
-            Arc::new(ProviderTransport(Provider::Anthropic)),
+            Arc::new(ProviderTransport::new(Provider::Anthropic)),
         ))
+    }
+
+    /// Uses the same host-held Claude subscription credential as the guest gateway.
+    pub fn claude_token(key: Key) -> Self {
+        Self::new(
+            Provider::Anthropic,
+            "claude-sonnet-5-5",
+            "low",
+            key,
+            Arc::new(ProviderTransport::new(Provider::Anthropic)),
+        )
     }
 
     /// A model of `provider`; an empty `model` is the provider's default.
@@ -300,7 +311,12 @@ impl Model {
         }
     }
 
-    /// A shared call cap and nine-second budget for an interactive request.
+    /// Installs observation on the reusable provider transport.
+    pub fn observe_upstream(&self, observer: Arc<fictionet_extras::models::UpstreamObserver>) {
+        self.transport.observe_upstream(observer);
+    }
+
+    /// A shared call cap for an interactive world.
     pub(super) fn live(mut self, calls: Arc<AtomicUsize>) -> Self {
         self.live = Some(calls);
         self
@@ -333,20 +349,33 @@ impl Model {
         max_tokens: u32,
     ) -> (Vec<(&'static str, String)>, Value) {
         match self.provider {
-            Provider::Anthropic => (
-                vec![
+            Provider::Anthropic => {
+                let mut headers = vec![
                     self.key.header(self.provider.into()),
                     ("anthropic-version", "2023-06-01".into()),
                     ("content-type", "application/json".into()),
-                ],
-                json!({
+                ];
+                let system = if self.key.is_claude_token() {
+                    headers.push(("anthropic-beta", "oauth-2025-04-20".into()));
+                    json!([
+                        {"type":"text", "text":"You are Claude Code, Anthropic's official CLI for Claude."},
+                        {"type":"text", "text":system}
+                    ])
+                } else {
+                    json!(system)
+                };
+                let mut body = json!({
                     "model": self.model,
                     "max_tokens": max_tokens,
-                    "temperature": 1.0,
                     "system": system,
-                    "messages": [{"role": "user", "content": user}],
-                }),
-            ),
+                    "messages": [{"role":"user", "content":user}],
+                });
+                if !self.reasoning.is_empty() {
+                    body["output_config"] = json!({"effort":self.reasoning});
+                    body["thinking"] = json!({"type":"between_tools"});
+                }
+                (headers, body)
+            }
             Provider::OpenRouter => {
                 let mut body = json!({
                     "model": self.model,
@@ -388,12 +417,9 @@ impl Model {
         let data = serde_json::to_vec(body).expect("a JSON value");
         let mut failure = String::new();
         let attempts = if self.live.is_some() { 1 } else { ATTEMPTS };
-        let timeout = if self.live.is_some() {
-            let elapsed = ledger.attempts.first().map_or(0.0, |a| now(cx) - a.started);
-            Duration::from_secs(9).saturating_sub(Duration::from_secs_f64(elapsed))
-        } else {
-            TIMEOUT
-        };
+        let elapsed = ledger.attempts.first().map_or(0.0, |a| now(cx) - a.started);
+        let timeout = TIMEOUT.saturating_sub(Duration::from_secs_f64(elapsed));
+        let deadline = cx.now() + timeout;
         for index in 1..=attempts {
             let mut attempt = Attempt {
                 ask: ledger.ask,
@@ -410,7 +436,6 @@ impl Model {
                 backoff_ms: 0,
                 error: None,
             };
-            let deadline = cx.now() + timeout;
             let sent = cx
                 .race(
                     Some(deadline),
@@ -562,7 +587,10 @@ impl Model {
                 .await
             {
                 Ok(text) => text,
-                Err(failure) => return (Err(failure), ledger),
+                Err(failure) => {
+                    eprintln!("Page writer failed: {}", self.redact(&failure.error));
+                    return (Err(failure), ledger);
+                }
             };
             let read = read(&text);
             ledger.ended = Some(now(cx));
@@ -574,15 +602,22 @@ impl Model {
                     last.error = Some(reason.clone());
                     let retry = ask < 2
                         && self.live.as_ref().is_none_or(|calls| {
-                            super::gives_away(&text).is_some()
-                                && now(cx) - ledger.attempts[0].started <= 5.0
-                                && calls
-                                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                                        (n < super::GENERATION_BUDGET).then_some(n + 1)
-                                    })
-                                    .is_ok()
+                            calls
+                                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                                    (n < super::GENERATION_BUDGET).then_some(n + 1)
+                                })
+                                .is_ok()
                         });
                     if ask == 2 || !retry {
+                        eprintln!(
+                            "Page writer failed: {}{}",
+                            self.redact(&reason),
+                            if ledger.attempts.last().is_some_and(|a| a.cut_off) {
+                                " (output limit)"
+                            } else {
+                                ""
+                            }
+                        );
                         return (Err(Failure { error: reason }), ledger);
                     }
                     user.push_str(&format!(
@@ -614,4 +649,134 @@ fn usage(answer: &Value, attempt: &mut Attempt) {
     attempt.cost = usage["cost"]
         .as_f64()
         .filter(|c| c.is_finite() && *c >= 0.0);
+}
+
+/// A writer event carries its actual provider as well as the transport attempt.
+pub(crate) type WriterObserver = dyn Fn(&Cx, fictionet_extras::models::Provider, &fictionet_extras::models::UpstreamEvent)
+    + Send
+    + Sync;
+impl super::Pages {
+    pub(crate) fn observe_writer(&self, observer: Arc<WriterObserver>) {
+        if let Some(super::Maker::Model(model)) = &self.maker {
+            let provider = model.provider.into();
+            model.observe_upstream(Arc::new(move |cx, event| observer(cx, provider, event)));
+        }
+    }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+    use crate::observation::{EgressPhase, EgressPurpose, SearchObs};
+    use std::io::{BufRead, Read, Write};
+
+    #[test]
+    fn reasks_share_one_generation_deadline() {
+        struct Slow;
+        impl Transport for Slow {
+            fn post<'a>(
+                &'a self,
+                cx: &'a Cx,
+                _: Vec<(&'static str, String)>,
+                _: Vec<u8>,
+            ) -> fictionet_extras::models::Post<'a> {
+                Box::pin(async move {
+                    cx.sleep(Duration::from_secs(70))
+                        .await
+                        .map_err(|_| "cancelled".to_owned())?;
+                    Ok((200, br#"{"content":[{"type":"text","text":"unreadable"}],"stop_reason":"end_turn"}"#.to_vec()))
+                })
+            }
+        }
+        fictionet::block_on(fictionet::lab(
+            fictionet::Seed::from_u64(9),
+            |cx| async move {
+                let model = Model::new(
+                    Provider::Anthropic,
+                    "",
+                    "",
+                    Key::new("test key", Some("private-test".into()))
+                        .map_err(fictionet::Error::msg)?,
+                    Arc::new(Slow),
+                )
+                .live(Arc::new(AtomicUsize::new(0)));
+                let (answer, ledger) = model
+                    .ask(&cx, "Write a page.", "About stars.", 200, |_| {
+                        Err::<(), _>(Unreadable("try again".into()))
+                    })
+                    .await;
+                assert!(answer.is_err());
+                assert_eq!(ledger.attempts.len(), 2);
+                assert_eq!(ledger.usage().gen_ms, TIMEOUT.as_millis() as u64);
+                assert_eq!(cx.now().since_start(), TIMEOUT);
+                Ok(())
+            },
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn subscription_writer_uses_host_auth_and_records_its_upstream_attempt() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = std::io::BufReader::new(&mut socket);
+            let mut headers = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                headers.push_str(&line);
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            let headers = headers.to_ascii_lowercase();
+            assert!(headers.contains("authorization: bearer sk-ant-oat01-private-test"));
+            assert!(headers.contains("anthropic-beta: oauth-2025-04-20"));
+            assert!(!headers.contains("x-api-key:"));
+            let length: usize = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length: "))
+                .unwrap()
+                .parse()
+                .unwrap();
+            let mut bytes = vec![0; length];
+            reader.read_exact(&mut bytes).unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                body["system"][0]["text"],
+                "You are Claude Code, Anthropic's official CLI for Claude."
+            );
+            assert_eq!(body["system"][1]["text"], "Write a page.");
+            assert_eq!(body["model"], "claude-sonnet-5-5");
+            assert_eq!(body["thinking"]["type"], "between_tools");
+            assert_eq!(body["output_config"]["effort"], "low");
+            assert!(body.get("temperature").is_none());
+            let response = r#"{"content":[{"type":"text","text":"A written page."}],"stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":4}}"#;
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).unwrap();
+        });
+        fictionet::block_on(fictionet::run(fictionet::Seed::from_u64(6), |cx| async move {
+            let key = Key::claude_token(fictionet_extras::models::Secret::new("Claude token", "sk-ant-oat01-private-test".into())?).map_err(fictionet::Error::msg)?;
+            let mut model = Model::claude_token(key);
+            model.transport = Arc::new(fictionet_extras::models::Https::at(&cx, format!("http://{address}").parse()?, "/v1/messages")?);
+            let pages = super::super::Pages::open(super::super::Seed::builtin("web")?, super::super::Store::memory(), Some(super::super::Maker::Model(model)), 0);
+            let (sender, mut observations) = tokio::sync::mpsc::channel(crate::observation::OBSERVATION_CAPACITY);
+            pages.observe(sender);
+            let Some(super::super::Maker::Model(model)) = &pages.maker else { panic!("model writer") };
+            let text = model.complete(&cx, "Write a page.", "About stars.", 200, &mut Ledger::new()).await.map_err(|e| fictionet::Error::msg(e.error))?;
+            assert_eq!(text, "A written page.");
+            let first = observations.try_recv().unwrap();
+            let last = observations.try_recv().unwrap();
+            let SearchObs::Egress { attempt, purpose: EgressPurpose::PageWriter, phase: EgressPhase::Attempt, .. } = first.fact else { panic!("writer attempt") };
+            assert!(matches!(last.fact, SearchObs::Egress { attempt: id, purpose: EgressPurpose::PageWriter, phase: EgressPhase::Response, status: Some(200), .. } if id == attempt));
+            assert!(!serde_json::to_string(&[first, last])?.contains("private-test"));
+            assert!(observations.try_recv().is_err());
+            Ok(())
+        })).unwrap();
+        upstream.join().unwrap();
+    }
 }

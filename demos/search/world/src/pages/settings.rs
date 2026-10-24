@@ -18,7 +18,7 @@ impl Pages {
             dir: store.root().map(|root| root.join("locks")),
         };
         Self {
-            observation: Mutex::new(None),
+            observation: Default::default(),
             seed,
             maker,
             prefetch,
