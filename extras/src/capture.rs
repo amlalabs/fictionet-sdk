@@ -1,5 +1,9 @@
 //! Host side HTTP capture and discovery of page requisites.
 
+mod transport;
+
+pub use transport::{client, public_address, receive};
+
 use crate::warc;
 use kuchiki::traits::TendrilSink;
 use regex::Regex;

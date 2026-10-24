@@ -121,7 +121,7 @@ fn block_length(fields: &HashMap<String, String>) -> io::Result<usize> {
         .ok_or_else(|| invalid("missing WARC content length"))?
         .parse::<usize>()
         .map_err(invalid)?;
-    if length > RECORD_BYTES - 2 * HEADER_BYTES {
+    if length > RECORD_BYTES - HEADER_BYTES {
         return Err(invalid("WARC block exceeds size limit"));
     }
     Ok(length)
@@ -179,6 +179,9 @@ impl Archive {
     /// Append one record compressed HTTP response and publish it for replay.
     /// Callers serialize writes to each file. Failed writes are rolled back.
     pub fn append(&mut self, path: &Path, url: &str, response: &Response) -> io::Result<()> {
+        if response.body.len() > RECORD_BYTES - 2 * HEADER_BYTES {
+            return Err(invalid("HTTP response exceeds archive size limit"));
+        }
         let url = key(url).ok_or_else(|| invalid("not an HTTP URL"))?;
         let mut block = format!("HTTP/1.1 {}\r\n", response.status).into_bytes();
         for (name, value) in &response.headers {

@@ -2,6 +2,7 @@
 
 use super::*;
 use fictionet_extras::models::UpstreamPhase;
+#[cfg(test)]
 use std::net::IpAddr;
 
 struct Runtime(Option<tokio::runtime::Runtime>);
@@ -15,6 +16,7 @@ impl Drop for Runtime {
 
 pub(super) struct Transport {
     runtime: Runtime,
+    #[cfg(test)]
     loopback: bool,
     processing: Arc<tokio::sync::Semaphore>,
 }
@@ -26,7 +28,7 @@ impl Transport {
     pub(super) fn loopback() -> Result<Self, String> {
         Self::build(true)
     }
-    fn build(loopback: bool) -> Result<Self, String> {
+    fn build(_loopback: bool) -> Result<Self, String> {
         Ok(Self {
             runtime: Runtime(Some(
                 tokio::runtime::Builder::new_multi_thread()
@@ -35,7 +37,8 @@ impl Transport {
                     .build()
                     .map_err(|_| "Live transport could not start")?,
             )),
-            loopback,
+            #[cfg(test)]
+            loopback: _loopback,
             processing: Arc::new(tokio::sync::Semaphore::new(1)),
         })
     }
@@ -77,36 +80,14 @@ impl Transport {
             }
         }
     }
+    #[cfg(test)]
     fn permits(&self, ip: IpAddr) -> bool {
         if self.loopback {
             return ip.is_loopback();
         }
-        match ip {
-            IpAddr::V4(ip) => {
-                let [a, b, c, _] = ip.octets();
-                !ip.is_private()
-                    && !ip.is_loopback()
-                    && !ip.is_link_local()
-                    && !ip.is_documentation()
-                    && !ip.is_broadcast()
-                    && !matches!(a, 0 | 224..=255)
-                    && !(a == 100 && (64..=127).contains(&b))
-                    && !(a == 192 && b == 0 && c == 0)
-                    && !(a == 192 && b == 88 && c == 99)
-                    && !(a == 198 && matches!(b, 18 | 19))
-            }
-            IpAddr::V6(ip) => {
-                if let Some(ip) = ip.to_ipv4_mapped() {
-                    return self.permits(ip.into());
-                }
-                let [a, b, ..] = ip.segments();
-                (a & 0xe000) == 0x2000
-                    && !(a == 0x2001 && (b < 0x200 || b == 0xdb8))
-                    && a != 0x2002
-                    && !(a == 0x3fff && b < 0x1000)
-            }
-        }
+        capture::public_address(ip)
     }
+
     pub(super) async fn request(
         &self,
         cx: &Cx,
@@ -163,21 +144,35 @@ impl Transport {
             }
         });
         let work = async {
-            if !matches!(url.scheme(), "http" | "https")
-                || !url.username().is_empty()
-                || url.password().is_some()
-            {
-                return Err("Live URL is not a public HTTP destination".to_owned());
-            }
             let host = url.host_str().ok_or("Missing Live host")?;
-            let port = url.port_or_known_default().ok_or("Missing Live port")?;
-            let addresses: Vec<_> = tokio::net::lookup_host((host.trim_matches(['[', ']']), port))
-                .await
-                .map_err(|_| "Live DNS lookup failed")?
-                .collect();
-            if addresses.is_empty() || addresses.iter().any(|address| !self.permits(address.ip())) {
-                return Err("Live destination is outside the capture network".into());
-            }
+            let client = {
+                #[cfg(test)]
+                if self.loopback {
+                    let port = url.port_or_known_default().ok_or("Missing Live port")?;
+                    let addresses: Vec<_> =
+                        tokio::net::lookup_host((host.trim_matches(['[', ']']), port))
+                            .await
+                            .map_err(|_| "Live DNS lookup failed")?
+                            .collect();
+                    if !url.username().is_empty()
+                        || url.password().is_some()
+                        || addresses.is_empty()
+                        || addresses.iter().any(|a| !self.permits(a.ip()))
+                    {
+                        return Err("Live destination is outside the capture network".into());
+                    }
+                    reqwest::Client::builder()
+                        .no_proxy()
+                        .redirect(reqwest::redirect::Policy::none())
+                        .resolve_to_addrs(host, &addresses)
+                        .build()
+                        .map_err(|e| e.to_string())?
+                } else {
+                    capture::client(&url).await.map_err(|e| e.to_string())?
+                }
+                #[cfg(not(test))]
+                capture::client(&url).await.map_err(|e| e.to_string())?
+            };
             let host_time = {
                 let mut hosts = lifetime.hosts.lock().await;
                 hosts
@@ -189,13 +184,6 @@ impl Transport {
             };
             let mut next = host_time.lock().await;
             tokio::time::sleep_until(*next).await;
-            let client = reqwest::Client::builder()
-                .user_agent(capture::BROWSER)
-                .no_proxy()
-                .redirect(reqwest::redirect::Policy::none())
-                .resolve_to_addrs(host, &addresses)
-                .build()
-                .map_err(|_| "Live client failed")?;
             let request = if let Some((key, body)) = search {
                 client
                     .post(url)
@@ -209,33 +197,23 @@ impl Transport {
             *next = tokio::time::Instant::now()
                 + Duration::from_millis(if search.is_some() { 250 } else { 500 });
             drop(next);
-            let mut response = response.map_err(|_| "Live request failed")?;
+            let response = response.map_err(|_| "Live request failed")?;
             if let Some(attempt) = &mut attempt {
                 attempt.event.phase = UpstreamPhase::Response;
                 attempt.event.status = Some(response.status());
             }
-            let status = response.status();
-            let headers = response.headers().clone();
+            let mut response = capture::receive(response, warc::Response::DECODED_BYTES)
+                .await
+                .map_err(|e| e.to_string())?;
             let parse = search.is_some()
-                || headers
+                || response
+                    .headers
                     .get(http::header::CONTENT_TYPE)
                     .is_some_and(|value| {
                         value.as_bytes().starts_with(b"text/html")
                             || value.as_bytes().starts_with(b"text/css")
                     });
-            let mut body = Vec::new();
-            while let Some(chunk) = response.chunk().await.map_err(|_| "Live response failed")? {
-                if body.len() + chunk.len() > 32 * 1024 * 1024 {
-                    return Err("Live response exceeds capture size limit".into());
-                }
-                body.extend_from_slice(&chunk);
-            }
             self.process(cx, lifetime, move || {
-                let mut response = warc::Response {
-                    status,
-                    headers,
-                    body: body.into(),
-                };
                 // Archive a decoded representation once. Replay and previews cannot
                 // expand a compressed body again or bypass the retained-byte budget.
                 response.body = response
