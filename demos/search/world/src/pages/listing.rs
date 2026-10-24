@@ -52,7 +52,19 @@ impl Pages {
         query: &str,
         start: u64,
     ) -> Result<(fictionet_extras::search::Search, Cache, Option<Usage>, u64), Stop> {
-        self.during_source(self.listing_in(cx, engine, query, start), || {
+        self.listing_with_domains(cx, engine, query, start, &Default::default())
+            .await
+    }
+
+    pub(super) async fn listing_with_domains(
+        self: &Arc<Self>,
+        cx: &Cx,
+        engine: Engine,
+        query: &str,
+        start: u64,
+        domains: &fictionet_extras::models::tools::Domains,
+    ) -> Result<(fictionet_extras::search::Search, Cache, Option<Usage>, u64), Stop> {
+        self.during_source(self.listing_in(cx, engine, query, start, domains), || {
             Err(Stop::store(std::io::Error::other("Page source changed")))
         })
         .await
@@ -64,12 +76,24 @@ impl Pages {
         engine: Engine,
         query: &str,
         start: u64,
+        domains: &fictionet_extras::models::tools::Domains,
     ) -> Result<(fictionet_extras::search::Search, Cache, Option<Usage>, u64), Stop> {
+        if domains.allowed_domains.as_ref().is_some_and(Vec::is_empty) {
+            return Ok((
+                fictionet_extras::search::Search {
+                    total: Some(0),
+                    ..Default::default()
+                },
+                Cache::Fixed,
+                None,
+                0,
+            ));
+        }
         if self.live_only() {
-            return self.live_listing(cx, engine, query, start).await;
+            return self.live_listing(cx, engine, query, start, domains).await;
         }
         if self.copied_only() {
-            return self.copied_listing(query, start);
+            return self.copied_listing_in(query, start, domains);
         }
         // Search results establish shared facts before independent pages read them.
         let _publication = if self.interactive {
@@ -82,11 +106,14 @@ impl Pages {
         } else {
             None
         };
-        let key = if engine == Engine::YouTube {
+        let mut key = if engine == Engine::YouTube {
             format!("youtube {}", query_key(query, start))
         } else {
             query_key(query, start)
         };
+        if domains.allowed_domains.is_some() || domains.blocked_domains.is_some() {
+            key = serde_json::to_string(&(key, domains)).expect("search key");
+        }
         let _lock = self
             .locks
             .lock(cx, format!("search {key}"))
@@ -105,7 +132,7 @@ impl Pages {
             Some(record) => (Some(record), Cache::Cached),
             None if !self.generating() => (None, Cache::Missing),
             None => {
-                let record = self.make_search(cx, &key, query, engine).await?;
+                let record = self.make_search(cx, &key, query, engine, domains).await?;
                 self.start_prefetch(cx, &record);
                 (Some(record), Cache::Generated)
             }
@@ -192,7 +219,8 @@ impl Pages {
                 if make::shares_words(
                     &format!("{} {} {}", page.title, page.url, page.text.join(" ")),
                     query,
-                ) {
+                ) && fictionet_extras::models::tools::allowed(domains, &page.url)
+                {
                     search.results.retain(|r| r.url != page.url);
                     search.results.insert(
                         0,
@@ -236,6 +264,7 @@ impl Pages {
         key: &str,
         query: &str,
         engine: Engine,
+        domains: &fictionet_extras::models::tools::Domains,
     ) -> Result<SearchRecord, Stop> {
         let cast = self.cast(cx).await?;
         let seed = self.context();
@@ -245,7 +274,7 @@ impl Pages {
         };
         let mut reference = None;
         if self.copied.is_some() {
-            let (found, _, _, _) = self.copied_listing(query, 0)?;
+            let (found, _, _, _) = self.copied_listing_in(query, 0, domains)?;
             if let Some(result) = found.results.first() {
                 reference = self
                     .reference_text(&result.url)
@@ -258,6 +287,7 @@ impl Pages {
                 }
             }
         }
+        known.retain(|result| fictionet_extras::models::tools::allowed(domains, &result.url));
         let mut normalized = search::Search {
             results: known,
             ..search::Search::default()
@@ -286,6 +316,9 @@ impl Pages {
                 },
                 || {
                     let (system, mut user) = prompts::search(&seed, &cast, query, &known, &claims);
+                    if domains.allowed_domains.is_some() || domains.blocked_domains.is_some() {
+                        user.push_str(&format!("\nDomain restrictions for every result, including subdomains: {}", serde_json::to_string(domains).expect("domain restrictions")));
+                    }
                     if let Some((url, reference)) = &reference {
                         user.push_str(&format!("\nHighest-ranked captured reference, {url}:\n{reference}\nUse its established public facts to ground the result list. Preserve its names, outcomes and quantities unless the world's brief or previously published documents explicitly change them. The capture date does not change event dates."));
                     }
@@ -332,6 +365,7 @@ impl Pages {
             let chosen = made.usage.model != "stored"
                 && make::shares_words(&format!("{} {} {}", r.title, r.url, r.snippet), query);
             if host.is_empty()
+                || !fictionet_extras::models::tools::allowed(domains, &r.url)
                 || results.iter().any(|x| x.url == r.url)
                 || known_match.is_some_and(|k| !make::relevant(k, query) && !chosen)
             {

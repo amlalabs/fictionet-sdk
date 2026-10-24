@@ -45,7 +45,7 @@ pub(super) fn host(url: &str) -> Option<String> {
         .map(|host| host.strip_suffix('.').unwrap_or(host).to_owned())
 }
 /// Domain restrictions on a world's search and fetch results.
-#[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Domains {
     /// Permitted domains and their subdomains; absent means unrestricted.

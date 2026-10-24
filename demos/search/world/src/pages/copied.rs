@@ -479,26 +479,35 @@ impl Pages {
         self.copied.is_some() && self.copied_active.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    pub(super) fn copied_listing(
+    pub(super) fn copied_listing_in(
         &self,
         query: &str,
         start: u64,
+        domains: &fictionet_extras::models::tools::Domains,
     ) -> Result<(search::Search, Cache, Option<Usage>, u64), Stop> {
         let corpus = self.copied.as_ref().unwrap();
         let search = match &corpus.search {
             CorpusSearch::Reference(reference) => reference
                 .index
-                .search(query, start.try_into().unwrap_or(usize::MAX), 10, |url| {
-                    let response = corpus
-                        .response(url)?
-                        .ok_or_else(|| std::io::Error::other("indexed page is unavailable"))?;
-                    fictionet_extras::capture::page_text(&String::from_utf8_lossy(
-                        &response.decoded()?,
-                    ))
-                })
+                .search_in(
+                    query,
+                    start.try_into().unwrap_or(usize::MAX),
+                    10,
+                    domains,
+                    |url| {
+                        let response = corpus
+                            .response(url)?
+                            .ok_or_else(|| std::io::Error::other("indexed page is unavailable"))?;
+                        fictionet_extras::capture::page_text(&String::from_utf8_lossy(
+                            &response.decoded()?,
+                        ))
+                    },
+                )
                 .map_err(Stop::store)?,
             CorpusSearch::Crawled(index) => {
-                index.search(query, start.try_into().unwrap_or(usize::MAX), 10)
+                index.search_in(query, start.try_into().unwrap_or(usize::MAX), 10, |url| {
+                    fictionet_extras::models::tools::allowed(domains, url)
+                })
             }
         };
         Ok((search, Cache::Cached, None, 0))

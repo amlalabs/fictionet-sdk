@@ -248,6 +248,17 @@ impl Index {
 
     /// Rank all partial matches by BM25, with URL order breaking ties.
     pub fn search(&self, query: &str, start: usize, limit: usize) -> search::Search {
+        self.search_in(query, start, limit, |_| true)
+    }
+
+    /// Restrict the eligible documents before ranking and pagination.
+    pub fn search_in(
+        &self,
+        query: &str,
+        start: usize,
+        limit: usize,
+        eligible: impl Fn(&str) -> bool,
+    ) -> search::Search {
         if self.is_empty() {
             return search::Search {
                 total: Some(0),
@@ -276,6 +287,7 @@ impl Index {
         }
         let mut ranked: Vec<_> = scores
             .into_iter()
+            .filter(|(id, _)| eligible(&self.documents[*id].url))
             .map(|(id, (score, covered))| (id, covered, score))
             .collect();
         ranked.sort_by(|(a, ac, x), (b, bc, y)| {

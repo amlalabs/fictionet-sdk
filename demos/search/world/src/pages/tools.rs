@@ -10,8 +10,10 @@ impl fictionet_extras::models::Engine for Pages {
         settings: fictionet_extras::models::tools::Domains,
     ) -> fictionet_extras::models::tools::Answer<Vec<fictionet_extras::search::Result>> {
         Box::pin(async move {
-            let Ok((mut search, _, _, _)) = self.listing(&cx, Engine::Google, &query, 0).await
-            else {
+            let listing = self
+                .listing_with_domains(&cx, Engine::Google, &query, 0, &settings)
+                .await;
+            let Ok((mut search, _, _, _)) = listing else {
                 return Err(fictionet::Error::msg("Search is unavailable"));
             };
             search

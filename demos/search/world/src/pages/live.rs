@@ -50,7 +50,7 @@ struct State {
     lifetime: Arc<Lifetime>,
     epoch: usize,
     reached: HashMap<String, watch::Sender<CaptureState>>,
-    searches: HashMap<(String, u64), search::Search>,
+    searches: HashMap<(String, u64, fictionet_extras::models::tools::Domains), search::Search>,
 }
 
 pub(super) struct Live {
@@ -182,6 +182,7 @@ impl Live {
         _engine: Engine,
         query: &str,
         start: u64,
+        domains: &fictionet_extras::models::tools::Domains,
     ) -> Result<search::Search, String> {
         let lifetime = {
             let state = self.state();
@@ -194,9 +195,10 @@ impl Live {
         let live = self.clone();
         let cx_thread = cx.clone();
         let query = query.to_owned();
+        let domains = domains.clone();
         self.fetcher.spawn(async move {
             let result = live
-                .search_results(&cx_thread, &lifetime, &query, start)
+                .search_results(&cx_thread, &lifetime, &query, start, &domains)
                 .await;
             let _ = send.send(result);
         });
@@ -212,10 +214,20 @@ impl Live {
         lifetime: &Arc<Lifetime>,
         query: &str,
         start: u64,
+        domains: &fictionet_extras::models::tools::Domains,
     ) -> Result<search::Search, String> {
         let observer = self.observer.lock().unwrap().clone();
-        let request =
+        let mut request =
             json!({"query": query, "numResults": start + 10, "contents": {"highlights": true}});
+        if let Some(allowed) = &domains.allowed_domains {
+            if allowed.is_empty() {
+                return Ok(search::Search::default());
+            }
+            request["includeDomains"] = json!(allowed);
+        }
+        if let Some(blocked) = &domains.blocked_domains {
+            request["excludeDomains"] = json!(blocked);
+        }
         let response = self
             .fetcher
             .request(
@@ -255,7 +267,7 @@ impl Live {
             }
             state
                 .searches
-                .insert((query.to_owned(), start), search.clone());
+                .insert((query.to_owned(), start, domains.clone()), search.clone());
         }
         Ok(search)
     }
@@ -415,6 +427,7 @@ impl Pages {
         engine: Engine,
         query: &str,
         start: u64,
+        domains: &fictionet_extras::models::tools::Domains,
     ) -> Result<(search::Search, Cache, Option<Usage>, u64), Stop> {
         if !self.generation().generate {
             return Ok((
@@ -423,7 +436,7 @@ impl Pages {
                     .unwrap()
                     .state()
                     .searches
-                    .get(&(query.to_owned(), start))
+                    .get(&(query.to_owned(), start, domains.clone()))
                     .cloned()
                     .unwrap_or_default(),
                 Cache::Cached,
@@ -434,7 +447,7 @@ impl Pages {
         self.live
             .as_ref()
             .unwrap()
-            .search(cx, engine, query, start)
+            .search(cx, engine, query, start, domains)
             .await
             .map(|search| (search, Cache::Fixed, None, 0))
             .map_err(|error| Stop::Failed { error, usage: None })

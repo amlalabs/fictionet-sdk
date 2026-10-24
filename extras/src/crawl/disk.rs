@@ -5,7 +5,7 @@ use std::{io, path::Path};
 use tantivy::{
     Index, IndexReader, IndexWriter, TantivyDocument, Term,
     collector::{Count, TopDocs},
-    query::{BooleanQuery, BoostQuery, Occur, Query, TermQuery},
+    query::{BooleanQuery, BoostQuery, ConstScoreQuery, Occur, Query, RegexQuery, TermQuery},
     schema::{
         Field, IndexRecordOption, STORED, STRING, Schema, TextFieldIndexing, TextOptions, Value,
     },
@@ -77,6 +77,18 @@ impl DiskIndex {
         limit: usize,
         mut text_for: impl FnMut(&str) -> io::Result<String>,
     ) -> io::Result<search::Search> {
+        self.search_in(query, start, limit, &Default::default(), &mut text_for)
+    }
+
+    /// Apply domain restrictions before collecting scores, counts and pages.
+    pub fn search_in(
+        &self,
+        query: &str,
+        start: usize,
+        limit: usize,
+        domains: &crate::models::tools::Domains,
+        mut text_for: impl FnMut(&str) -> io::Result<String>,
+    ) -> io::Result<search::Search> {
         let mut analyzer = self
             .index
             .tokenizer_for_field(self.fields.body)
@@ -104,6 +116,32 @@ impl DiskIndex {
                     Box::new(BoostQuery::new(Box::new(term), boost)),
                 ));
             }
+        }
+        let mut clauses: Vec<(Occur, Box<dyn Query>)> =
+            vec![(Occur::Must, Box::new(BooleanQuery::new(clauses)))];
+        let domain_query = |domains: &[String]| -> io::Result<Box<dyn Query>> {
+            let mut alternatives: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+            for domain in domains {
+                let domain = regex::escape(&domain.trim_matches('.').to_ascii_lowercase());
+                let pattern = format!("https?://([^/]+\\.)?{domain}(:[0-9]+)?/.*");
+                alternatives.push((
+                    Occur::Should,
+                    Box::new(
+                        RegexQuery::from_pattern(&pattern, self.fields.url)
+                            .map_err(io::Error::other)?,
+                    ),
+                ));
+            }
+            Ok(Box::new(BooleanQuery::new(alternatives)))
+        };
+        if let Some(allowed) = &domains.allowed_domains {
+            clauses.push((
+                Occur::Must,
+                Box::new(ConstScoreQuery::new(domain_query(allowed)?, 0.0)),
+            ));
+        }
+        if let Some(blocked) = &domains.blocked_domains {
+            clauses.push((Occur::MustNot, domain_query(blocked)?));
         }
         let query = BooleanQuery::new(clauses);
         let searcher = self.reader.searcher();
