@@ -266,11 +266,7 @@ impl Backend {
                 }
             }
             if eof && let Some(status) = self.0.try_wait()? {
-                return if status.success() {
-                    Ok(bytes)
-                } else {
-                    Err(std::io::Error::other("Git backend failed"))
-                };
+                return finished(status, bytes);
             }
             if poll[1].revents != 0 {
                 let mut chunk = [0u8; 16384];
@@ -278,11 +274,7 @@ impl Backend {
                     Ok(0) => {
                         eof = true;
                         if let Some(status) = self.0.try_wait()? {
-                            return if status.success() {
-                                Ok(bytes)
-                            } else {
-                                Err(std::io::Error::other("Git backend failed"))
-                            };
+                            return finished(status, bytes);
                         }
                     }
                     Ok(n) => {
@@ -296,6 +288,20 @@ impl Backend {
                 }
             }
         }
+    }
+}
+
+/// The backend's whole output once it has exited and its output is closed.
+///
+/// git http-backend writes a complete response and then exits nonzero when
+/// upload-pack dies on a request (an unknown want, a bad pkt-line); that
+/// response carries the ERR line the client shows. Only a backend killed by a
+/// signal may have stopped partway through a response.
+fn finished(status: std::process::ExitStatus, bytes: Vec<u8>) -> std::io::Result<Vec<u8>> {
+    if status.code().is_some() {
+        Ok(bytes)
+    } else {
+        Err(std::io::Error::other("Git backend was killed"))
     }
 }
 
