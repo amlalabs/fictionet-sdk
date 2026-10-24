@@ -51,18 +51,52 @@ pub fn page_text(html: &str) -> io::Result<String> {
         match token {
             Token::TagToken(tag) => {
                 let name = tag.name.as_ref();
-                if matches!(
+                let excluded = matches!(
                     name,
-                    "script" | "style" | "noscript" | "nav" | "header" | "footer"
-                ) {
-                    match tag.kind {
-                        TagKind::StartTag => hidden.push(tag.name.clone()),
-                        TagKind::EndTag => {
-                            if let Some(at) = hidden.iter().rposition(|name| *name == tag.name) {
-                                hidden.truncate(at);
-                            }
+                    "head"
+                        | "script"
+                        | "style"
+                        | "noscript"
+                        | "nav"
+                        | "header"
+                        | "footer"
+                        | "aside"
+                ) || tag.attrs.iter().any(|attribute| {
+                    &*attribute.name.local == "role"
+                        && attribute
+                            .value
+                            .split_whitespace()
+                            .any(|role| role.eq_ignore_ascii_case("navigation"))
+                });
+                let void = matches!(
+                    name,
+                    "area"
+                        | "base"
+                        | "br"
+                        | "col"
+                        | "embed"
+                        | "hr"
+                        | "img"
+                        | "input"
+                        | "link"
+                        | "meta"
+                        | "param"
+                        | "source"
+                        | "track"
+                        | "wbr"
+                );
+                match tag.kind {
+                    TagKind::StartTag
+                        if (excluded || !hidden.is_empty()) && !tag.self_closing && !void =>
+                    {
+                        hidden.push(tag.name.clone())
+                    }
+                    TagKind::EndTag => {
+                        if let Some(at) = hidden.iter().rposition(|name| *name == tag.name) {
+                            hidden.truncate(at);
                         }
                     }
+                    _ => {}
                 }
                 if hidden.is_empty() {
                     text.push(' ');

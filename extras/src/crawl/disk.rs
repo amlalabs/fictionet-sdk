@@ -5,7 +5,7 @@ use std::{io, path::Path};
 use tantivy::{
     Index, IndexReader, IndexWriter, TantivyDocument, Term,
     collector::{Count, TopDocs},
-    query::{BooleanQuery, ConstScoreQuery, Occur, Query, RegexQuery, TermQuery},
+    query::{BooleanQuery, BoostQuery, ConstScoreQuery, Occur, Query, RegexQuery, TermQuery},
     schema::{
         Field, IndexRecordOption, STORED, STRING, Schema, TextFieldIndexing, TextOptions, Value,
     },
@@ -28,7 +28,15 @@ fn schema() -> (Schema, Fields) {
             .set_index_option(IndexRecordOption::WithFreqs),
     );
     let url = schema.add_text_field("url", STRING | STORED);
-    let title = schema.add_text_field("title", STORED);
+    let title = schema.add_text_field(
+        "title",
+        TextOptions::default().set_stored().set_indexing_options(
+            TextFieldIndexing::default()
+                .set_tokenizer("english")
+                .set_fieldnorms(false)
+                .set_index_option(IndexRecordOption::WithFreqs),
+        ),
+    );
     let body = schema.add_text_field("body", text);
     (schema.build(), Fields { url, title, body })
 }
@@ -118,11 +126,16 @@ impl DiskIndex {
         }
         let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
         for word in words {
-            let term = TermQuery::new(
-                Term::from_field_text(self.fields.body, &word),
-                IndexRecordOption::WithFreqs,
-            );
-            clauses.push((Occur::Should, Box::new(term)));
+            for (field, boost) in [(self.fields.title, 2.0), (self.fields.body, 1.0)] {
+                let term = TermQuery::new(
+                    Term::from_field_text(field, &word),
+                    IndexRecordOption::WithFreqs,
+                );
+                clauses.push((
+                    Occur::Should,
+                    Box::new(BoostQuery::new(Box::new(term), boost)),
+                ));
+            }
         }
         let mut clauses: Vec<(Occur, Box<dyn Query>)> =
             vec![(Occur::Must, Box::new(BooleanQuery::new(clauses)))];
@@ -241,7 +254,7 @@ impl DiskWriter {
         self.writer
             .add_document(tantivy::doc!(self.fields.url => url,
             self.fields.title => title,
-            self.fields.body => title, self.fields.body => title, self.fields.body => body))
+            self.fields.body => body))
             .map_err(io::Error::other)?;
         Ok(())
     }
