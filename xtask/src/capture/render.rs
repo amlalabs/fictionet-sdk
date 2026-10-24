@@ -265,6 +265,11 @@ where
             .as_str()
             .ok_or("missing browser session")?
             .to_owned();
+        call!(
+            "Emulation.setDeviceMetricsOverride",
+            json!({"width":1440,"height":1000,"deviceScaleFactor":1,"mobile":false,"screenWidth":1440,"screenHeight":1000}),
+            Some(&session)
+        );
         call!("Network.enable", json!({}), Some(&session));
         call!("Page.enable", json!({}), Some(&session));
         call!(

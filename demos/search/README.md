@@ -200,8 +200,10 @@ rustup run 1.99.0 cargo xtask search-capture demos/downloads --research
 ```
 
 Capture follows stylesheets, CSS imports, fonts, images and scripts across hosts.
-Chromium also loads the archived HTML to discover dependencies requested by
-JavaScript. Its requests use the same host transport with the browser's request
+Chromium refreshes page HTML and discovers dependencies requested by JavaScript
+at a desktop viewport. Successful refreshed pages become new records; a failed
+refresh retains a previous successful response and reports the upstream failure.
+Its requests use the same host transport with the browser's request
 headers; the browser itself has no Internet route.
 
 Complete requisites for every page in an existing corpus with:
