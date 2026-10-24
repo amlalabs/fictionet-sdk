@@ -430,27 +430,18 @@ impl Pages {
                         model.check_document(&page.content_type, &page.body)?;
                         self.check_page_dates(&store, host, target, &page, latest)?;
                     }
+                    let rendered = if page.content_type.starts_with("text/html") && !pdf {
+                        let profile = ask.profile.as_ref().or(page.site.as_ref()).cloned()
+                            .unwrap_or_else(|| make::site_profile(host));
+                        render::page_at(host, target, &profile, &page, &seed.date)
+                    } else {
+                        page.body.clone()
+                    };
                     if self.interactive {
-                        let body = if page.content_type.starts_with("text/html") && !pdf {
-                            let profile = ask
-                                .profile
-                                .as_ref()
-                                .or(page.site.as_ref())
-                                .cloned()
-                                .unwrap_or_else(|| make::site_profile(host));
-                            render::page_at(host, target, &profile, &page, &seed.date)
-                        } else {
-                            page.body.clone()
-                        };
-                        text::validate_page(&page.content_type, body.as_bytes())
+                        text::validate_page(&page.content_type, rendered.as_bytes())
                             .map_err(prompts::Unreadable::Content)?;
                     }
                     if let Maker::Model(model) = self.maker() {
-                        let profile = ask.profile.as_ref().or(page.site.as_ref()).cloned()
-                            .unwrap_or_else(|| make::site_profile(host));
-                        let rendered = if page.content_type.starts_with("text/html") && !pdf {
-                            render::page_at(host, target, &profile, &page, &seed.date)
-                        } else { page.body.clone() };
                         model.check_document(&page.content_type, &rendered)?;
                     }
                     if webpage
