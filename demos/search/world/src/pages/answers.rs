@@ -309,6 +309,8 @@ pub(super) fn dates(text: &str) -> Vec<time::Date> {
         .collect()
 }
 
+/// A page's DATE must be a calendar date no later than `latest`. What its
+/// CLAIMS say was known by then is settled by [`settle_claims`], not here.
 pub(super) fn chronology(page: &Page, latest: time::Date) -> Result<(), Unreadable> {
     let dateline = if page.date.is_empty() {
         latest
@@ -321,25 +323,18 @@ pub(super) fn chronology(page: &Page, latest: time::Date) -> Result<(), Unreadab
             "DATE must be on or before {latest}, when a referring page already links here. Write only what was known by then."
         )));
     }
-    let later: Vec<_> = page
-        .claims
-        .iter()
-        .filter(|claim| claim.known_on.is_some_and(|date| date > dateline))
-        .map(|claim| {
-            format!(
-                "- {} | {}",
-                claim.known_on.expect("dated claim"),
-                claim.text
-            )
-        })
-        .collect();
-    if !later.is_empty() {
-        return Err(Unreadable::Chronology(format!(
-            "The document is dated {dateline}, but these CLAIMS lines were first known later:\n{}\nRemove those lines and any text that depends on them, or explicitly update DATE and its visible dateline, no later than {latest}.",
-            later.join("\n")
-        )));
-    }
     Ok(())
+}
+
+/// A statement a page makes was known by the page's own date. A CLAIMS line
+/// dated later is a mislabelled line (a writer often dates timeless facts
+/// with the day it writes), so it takes the page's date. Whether the page's
+/// text reports later events is the chronology review's question.
+pub(super) fn settle_claims(page: &mut Page, latest: time::Date) {
+    let dateline = super::seed::parse_date(&page.date).unwrap_or(latest);
+    for claim in &mut page.claims {
+        claim.known_on = claim.known_on.map(|date| date.min(dateline));
+    }
 }
 
 /// Publication text that needs semantic review: dates alone cannot distinguish
@@ -351,7 +346,13 @@ pub(super) trait Publication {
 }
 impl Publication for Page {
     fn later_text(&self, latest: time::Date) -> Vec<(time::Date, String)> {
-        let dateline = super::seed::parse_date(&self.date).unwrap_or(latest);
+        // A real document can still not know what happens after the
+        // world's own date.
+        let dateline = if self.real {
+            latest
+        } else {
+            super::seed::parse_date(&self.date).unwrap_or(latest)
+        };
         let text = format!(
             "{}\n{}\n{}",
             self.title,

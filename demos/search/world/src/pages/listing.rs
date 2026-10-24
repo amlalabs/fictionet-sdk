@@ -268,7 +268,7 @@ impl Pages {
                 reference = self
                     .reference_text(&result.url)
                     .map_err(Stop::store)?
-                    .map(|original| (result.url.clone(), original.text));
+                    .map(|captured| (result.url.clone(), captured.original.text));
             }
             for result in found.results {
                 if !known.iter().any(|page| page.url == result.url) {

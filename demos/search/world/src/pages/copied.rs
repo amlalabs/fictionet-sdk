@@ -88,12 +88,49 @@ fn archived_response(
     if let Some(response) = archive.get(url)? {
         return Ok(Some(response));
     }
+    if let Some(file) = static_file(url)
+        && let Some(response) = archive.get(&file)?
+    {
+        return Ok(Some(response));
+    }
     if fallback.is_some() {
         return Ok(fallback);
     }
     Ok(archive
         .get(absent.as_str())?
         .filter(|response| response.status == http::StatusCode::NOT_FOUND))
+}
+
+/// A stylesheet, script, image or font asked for with a query, without it.
+/// Pages version their files (`pydoctheme.css?v=48df1187`) and their servers
+/// send the same file whatever the query; captures keep the file once.
+fn static_file(url: &str) -> Option<String> {
+    let mut url = url::Url::parse(url).ok()?;
+    url.query()?;
+    let (_, extension) = url.path().rsplit_once('.')?;
+    let file = matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "css"
+            | "js"
+            | "mjs"
+            | "png"
+            | "jpg"
+            | "jpeg"
+            | "gif"
+            | "svg"
+            | "webp"
+            | "avif"
+            | "ico"
+            | "woff"
+            | "woff2"
+            | "ttf"
+            | "otf"
+            | "eot"
+    );
+    file.then(|| {
+        url.set_query(None);
+        url.into()
+    })
 }
 
 fn missing_pages(root: &Path) -> std::io::Result<Archive> {
@@ -155,12 +192,21 @@ fn archive_files(root: &Path) -> std::io::Result<Vec<ArchiveFile>> {
     Ok(files)
 }
 
+/// A captured original of an address.
+pub(super) struct Captured {
+    pub original: prompts::Original,
+    /// The capture sent the address on to another document: when it was
+    /// made, the address had no document of its own.
+    pub redirected: bool,
+}
+
 impl Pages {
-    pub(super) fn reference_text(&self, url: &str) -> std::io::Result<Option<prompts::Original>> {
+    pub(super) fn reference_text(&self, url: &str) -> std::io::Result<Option<Captured>> {
         let Some(corpus) = &self.copied else {
             return Ok(None);
         };
-        let mut url = url::Url::parse(url).map_err(std::io::Error::other)?;
+        let asked = url::Url::parse(url).map_err(std::io::Error::other)?;
+        let mut url = asked.clone();
         let mut visited = HashSet::new();
         let response = loop {
             if !visited.insert(url.clone()) {
@@ -192,7 +238,7 @@ impl Pages {
             .unwrap_or_default()
             .to_ascii_lowercase();
         let body = response.decoded()?;
-        Ok(if content_type.starts_with("text/html") {
+        let original = if content_type.starts_with("text/html") {
             Some(super::prompts::Original {
                 title: fictionet_extras::capture::title(&response)
                     .ok()
@@ -213,7 +259,11 @@ impl Pages {
                 })
         } else {
             None
-        })
+        };
+        Ok(original.map(|original| Captured {
+            original,
+            redirected: url != asked,
+        }))
     }
 
     pub(crate) fn copied_body(&self, url: String) -> Option<PageBody> {

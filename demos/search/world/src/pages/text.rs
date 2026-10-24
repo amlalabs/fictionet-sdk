@@ -342,13 +342,24 @@ pub fn validate_page(content_type: &str, body: &[u8]) -> Result<(), String> {
     } else {
         String::new()
     };
+    // Bracketed notes a writer leaves for itself, and filler text. Words
+    // such as "todo" are ordinary text (git's rebase todo list).
     static PLACEHOLDER: OnceLock<Regex> = OnceLock::new();
     let pattern = PLACEHOLDER.get_or_init(|| {
-        Regex::new(r"(?i)\[\s*(?:video\s+placeholder|image)\s*:|\blorem\s+ipsum\b|\bTODO\b")
-            .unwrap()
+        Regex::new(
+            r"(?i)\[\s*(?:video\s+placeholder|image)\s*:|\[\s*(?:todo|tbd)\b|\blorem\s+ipsum\b",
+        )
+        .unwrap()
     });
-    if let Some(found) = pattern.find(&normalize_space(&visible)) {
-        return Err(format!("visible authoring placeholder: {}", found.as_str()));
+    let visible = normalize_space(&visible);
+    if let Some(found) = pattern.find(&visible) {
+        let start = visible.floor_char_boundary(found.start().saturating_sub(80));
+        let end = visible.ceil_char_boundary((found.end() + 80).min(visible.len()));
+        return Err(format!(
+            "the page shows the authoring placeholder \"{}\" in \"...{}...\"; replace it with the real content or remove it",
+            found.as_str(),
+            &visible[start..end]
+        ));
     }
     let audit = fictionet_extras::guest_content::Audit::default();
     audit.inspect("page", body);

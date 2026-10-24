@@ -164,6 +164,23 @@ fn key(host: &str, target: &str) -> (String, String) {
     (host.to_owned(), target.to_owned())
 }
 
+/// What a stored page is about, in words: its title, description, its
+/// address's own words and its claims. Its full text is not matched, since
+/// a long page shares a word or two with almost anything.
+fn about(page: &PageRecord) -> String {
+    let mut about = format!(
+        "{} {} {}",
+        page.title,
+        page.description,
+        super::make::title_from(&page.host, &page.target)
+    );
+    for claim in &page.claims {
+        about.push(' ');
+        about.push_str(&claim.text);
+    }
+    about
+}
+
 /// Why a store cannot be used, and how to start over.
 fn incompatible(root: &Path, reason: &str) -> String {
     format!(
@@ -404,21 +421,45 @@ impl Store {
         self.record(Entry::Page(page))
     }
 
-    /// The host's pages, newest first, as its next prompt shows them.
-    pub fn host_pages(&self, host: &str) -> Vec<HostPage> {
+    /// The host's pages about `subject`, newest first, as its next prompt
+    /// shows them.
+    pub fn host_pages(&self, host: &str, subject: &str) -> Vec<HostPage> {
         self.order
             .iter()
             .rev()
             .filter(|(h, _)| h == host)
-            .map(|at| {
-                let page = &self.pages[at];
-                HostPage {
-                    url: page.url.clone(),
-                    title: page.title.clone(),
-                    claims: page.claims.clone(),
-                }
+            .map(|at| &self.pages[at])
+            .filter(|page| super::make::related(subject, &about(page)))
+            .map(|page| HostPage {
+                url: page.url.clone(),
+                title: page.title.clone(),
+                claims: page.claims.clone(),
             })
             .collect()
+    }
+
+    /// What a page at `host` and `target` is about, in words: its address's
+    /// own words and what every search and link said of it. Addresses and
+    /// field names are not words about it.
+    pub fn subject(&self, host: &str, target: &str) -> String {
+        let mut subject = super::make::title_from(host, target);
+        for mention in self.mentions(host, target) {
+            let said: &[&str] = match mention {
+                Mention::Search {
+                    query,
+                    title,
+                    snippet,
+                    ..
+                } => &[query, title, snippet],
+                Mention::Link { anchor, .. } => &[anchor],
+                Mention::Fact { snippet } => &[snippet],
+            };
+            for text in said {
+                subject.push(' ');
+                subject.push_str(text);
+            }
+        }
+        subject
     }
 
     /// Pages the world has: the seed's fixed pages and every page made with
@@ -455,9 +496,26 @@ impl Store {
         fixed.chain(made).collect()
     }
 
-    /// Published text and search promises are context even when a writer omitted CLAIMS.
+    /// What the world has said about `subject`: the claims, published text
+    /// and search promises of pages and searches about it. Published text
+    /// is context even when a writer omitted CLAIMS. Pages about other
+    /// things stay out, so one question's facts do not leak into another's
+    /// pages.
     pub fn writing_context(&self, subject: &str) -> Vec<Claim> {
-        let mut claims = self.claims.clone();
+        let related = |text: &str| super::make::related(subject, text);
+        let mut claims: Vec<Claim> = self
+            .claims
+            .iter()
+            .filter(|claim| {
+                let (host, target) = super::text::target_of(&claim.url);
+                related(&format!(
+                    "{} {}",
+                    super::make::title_from(&host, &target),
+                    claim.claim.text
+                ))
+            })
+            .cloned()
+            .collect();
         for page in self
             .order
             .iter()
@@ -465,13 +523,13 @@ impl Store {
             .map(|key| &self.pages[key])
             .filter(|page| page.status == 200)
         {
-            let body = String::from_utf8_lossy(&page.body);
-            let text = if page.content_type.starts_with("text/html") {
-                super::text::text_of(&body)
-            } else {
-                body.into_owned()
-            };
-            if super::make::shares_words(&format!("{} {} {text}", page.title, page.url), subject) {
+            if related(&about(page)) {
+                let body = String::from_utf8_lossy(&page.body);
+                let text = if page.content_type.starts_with("text/html") {
+                    super::text::text_of(&body)
+                } else {
+                    body.into_owned()
+                };
                 claims.push(Claim {
                     url: page.url.clone(),
                     claim: super::prompts::Statement {
@@ -484,7 +542,7 @@ impl Store {
         for search in self
             .searches
             .values()
-            .filter(|search| super::make::shares_words(&search.query, subject))
+            .filter(|search| related(&search.query))
         {
             claims.extend(search.search.results.iter().map(Claim::search));
         }
@@ -495,11 +553,7 @@ impl Store {
     /// even when an opaque path shares no words with the query.
     pub fn page_context(&self, host: &str, target: &str) -> Vec<Claim> {
         let url = format!("https://{host}{target}");
-        let subject = format!(
-            "{url} {}",
-            serde_json::to_string(self.mentions(host, target)).expect("mentions")
-        );
-        let mut claims = self.writing_context(&subject);
+        let mut claims = self.writing_context(&self.subject(host, target));
         for search in self
             .searches
             .values()

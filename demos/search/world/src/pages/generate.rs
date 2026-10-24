@@ -17,10 +17,14 @@ impl Pages {
         target: &str,
         page: &make::Page,
         latest: time::Date,
+        real: bool,
     ) -> Result<(), prompts::Unreadable> {
         answers::chronology(page, latest)?;
         let dateline = seed::parse_date(&page.date).unwrap_or(latest);
-        if let Some(published) = store.publication_date(host, target)
+        // A real document keeps its own date, even where a result list
+        // guessed another one for it.
+        if !real
+            && let Some(published) = store.publication_date(host, target)
             && dateline < published
         {
             return Err(prompts::Unreadable::Chronology(format!(
@@ -261,7 +265,7 @@ impl Pages {
                 url: url.clone(),
                 mentions: store.mentions(host, target).to_vec(),
                 profile: store.site(host).filter(|p| !p.css.is_empty()).cloned(),
-                host_pages: store.host_pages(host),
+                host_pages: store.host_pages(host, &store.subject(host, target)),
                 claims: store.page_context(host, target),
                 cast,
                 original: None,
@@ -363,12 +367,21 @@ impl Pages {
         );
         let latest = self.latest_publication();
         // A document that exists is written from its real text: a capture,
-        // or else the public original the host reads now.
+        // or else the public original the host reads now. A capture that
+        // sent this address on to another document is older than the
+        // address's own document, when there is one now.
+        let model = matches!(self.maker(), Maker::Model(_));
         ask.original = match self.reference_text(&url).map_err(Stop::store)? {
-            Some(captured) => Some(captured),
-            None if matches!(self.maker(), Maker::Model(_)) => self.originals.read(cx, &url).await,
+            Some(captured) if !captured.redirected => Some(captured.original),
+            Some(captured) if model => match self.originals.read(cx, &url).await {
+                Some(original) => Some(original),
+                None => Some(captured.original),
+            },
+            Some(captured) => Some(captured.original),
+            None if model => self.originals.read(cx, &url).await,
             None => None,
         };
+        let real = ask.original.is_some();
         let made = self
             .generate(
                 cx,
@@ -394,22 +407,15 @@ impl Pages {
                 },
                 |text| {
                     let mut page = prompts::read_page(text, expected, !ask.mentions.is_empty())?;
+                    page.real = real;
                     if page.date.is_empty() && page.content_type.starts_with("text/html") {
                         page.date = latest.to_string();
                     }
-                    // What a real document states was known when it was
-                    // published, including the plans it schedules for later.
-                    if ask.original.is_some()
-                        && let Ok(dateline) = seed::parse_date(&page.date)
-                    {
-                        for claim in &mut page.claims {
-                            claim.known_on = claim.known_on.map(|date| date.min(dateline));
-                        }
-                    }
+                    answers::settle_claims(&mut page, latest);
                     if let Maker::Model(model) = self.maker() {
                         let store = self.store();
                         model.check_document(&page.content_type, &page.body)?;
-                        self.check_page_dates(&store, host, target, &page, latest)?;
+                        self.check_page_dates(&store, host, target, &page, latest, real)?;
                     }
                     let rendered = if page.content_type.starts_with("text/html") && !pdf {
                         let profile = ask.profile.as_ref().or(page.site.as_ref()).cloned()
@@ -537,6 +543,7 @@ impl Pages {
                     ..Default::default()
                 },
                 latest,
+                real,
             )
             .map_err(|reason| Stop::Failed {
                 error: reason.to_string(),

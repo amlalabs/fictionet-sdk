@@ -58,36 +58,38 @@ impl Pages {
         target: &str,
         prefetch: bool,
     ) -> Response {
-        let lock = match self.locks.lock(cx, page_key(host, target)).await {
-            Ok(lock) => lock,
-            Err(error) => return Stop::store(error).response(),
-        };
-        let stored = self.store().page(host, target).cloned();
-        let stored = stored.or_else(|| self.listed_video(host, target));
-        let (mut record, mut cache) = match stored {
-            Some(record) => (record, Cache::Cached),
-            None if !self.generating() => {
-                drop(lock);
-                return self.missing(host, target);
+        // The page is found or made in the world's own task, so a client
+        // that stops waiting does not stop it: its next request finds the
+        // page made, or waits on the same writing.
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let pages = self.clone();
+        let (host, target) = (host.to_owned(), target.to_owned());
+        let session = WRITING
+            .try_with(Clone::clone)
+            .unwrap_or_else(|_| self.writing.lock().unwrap().subscribe());
+        cx.spawn(move |cx| async move {
+            let mut cancelled = session.clone();
+            let found = WRITING
+                .scope(session, async {
+                    tokio::select! {
+                        biased;
+                        _ = cancelled.wait_for(|cancelled| *cancelled) => Err(Box::new(Stop::store(
+                            std::io::Error::other("Page source changed"),
+                        ).response())),
+                        found = pages.found(&cx, &host, &target, prefetch) => found,
+                    }
+                })
+                .await;
+            let _ = send.send(found);
+            Ok(())
+        });
+        let (record, mut cache) = match receive.await {
+            Ok(Ok(found)) => found,
+            Ok(Err(response)) => return *response,
+            Err(_) => {
+                return Stop::store(std::io::Error::other("the world stopped")).response();
             }
-            None => match self.make_page(cx, host, target, prefetch).await {
-                Ok(record) => (record, Cache::Generated),
-                Err(stop) => return stop.response(),
-            },
         };
-        if record.content_type.starts_with("text/html")
-            && let Some(html) = render::again(
-                &record.host,
-                target,
-                &record.title,
-                &String::from_utf8_lossy(&record.body),
-                &record.date,
-                &self.seed.date,
-            )
-        {
-            record.body = html.into_bytes();
-        }
-        drop(lock);
         if cache == Cache::Generated && record.content_type.starts_with("text/html") {
             self.note_links(&record.url, &String::from_utf8_lossy(&record.body));
         }
@@ -139,6 +141,45 @@ impl Pages {
         );
         response.carries = carries;
         response
+    }
+
+    /// The stored page at `host` and `target`, or one made now, laid out
+    /// for today; the answer instead when there is none.
+    async fn found(
+        &self,
+        cx: &Cx,
+        host: &str,
+        target: &str,
+        prefetch: bool,
+    ) -> Result<(PageRecord, Cache), Box<Response>> {
+        let _lock = self
+            .locks
+            .lock(cx, page_key(host, target))
+            .await
+            .map_err(|error| Box::new(Stop::store(error).response()))?;
+        let stored = self.store().page(host, target).cloned();
+        let stored = stored.or_else(|| self.listed_video(host, target));
+        let (mut record, cache) = match stored {
+            Some(record) => (record, Cache::Cached),
+            None if !self.generating() => return Err(Box::new(self.missing(host, target))),
+            None => match self.make_page(cx, host, target, prefetch).await {
+                Ok(record) => (record, Cache::Generated),
+                Err(stop) => return Err(Box::new(stop.response())),
+            },
+        };
+        if record.content_type.starts_with("text/html")
+            && let Some(html) = render::again(
+                &record.host,
+                target,
+                &record.title,
+                &String::from_utf8_lossy(&record.body),
+                &record.date,
+                &self.seed.date,
+            )
+        {
+            record.body = html.into_bytes();
+        }
+        Ok((record, cache))
     }
 
     /// Records the links of a page just made as mentions of the pages

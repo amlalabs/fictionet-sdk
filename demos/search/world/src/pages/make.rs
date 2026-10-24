@@ -130,6 +130,10 @@ pub struct Page {
     pub ad: String,
     /// How the generator describes the site, for a host's first page.
     pub site: Option<Profile>,
+    /// Written from the real document at its address, whose own text keeps
+    /// its own timeline: its later updates are not anachronisms.
+    #[serde(skip)]
+    pub real: bool,
 }
 
 /// Extracts lowercase search words, excluding common stop words.
@@ -144,6 +148,18 @@ pub fn words(s: &str) -> Vec<String> {
 pub(super) fn shares_words(a: &str, b: &str) -> bool {
     let a = words(a);
     words(b).iter().any(|w| w != "not" && a.contains(w))
+}
+
+/// Whether `text` is about `subject`: it has two of the subject's search
+/// words, or the only one a one-word subject has. One shared word such as
+/// a year or "error" does not make two pages about the same thing.
+pub(super) fn related(subject: &str, text: &str) -> bool {
+    let mut wanted = words(subject);
+    wanted.sort();
+    wanted.dedup();
+    let found = words(text);
+    let shared = wanted.iter().filter(|w| found.contains(w)).count();
+    shared > 0 && shared >= wanted.len().min(2)
 }
 /// Removes branding from a result title for headings and directory links.
 pub(super) fn heading(title: &str) -> &str {
