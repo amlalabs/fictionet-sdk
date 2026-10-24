@@ -1,5 +1,7 @@
 //! Copied pages and search results share one WARC response handler.
 
+mod git;
+
 use super::*;
 use fictionet_extras::{crawl::Index, warc::Archive};
 use std::{path::Path, time::Instant};
@@ -12,6 +14,7 @@ pub(super) struct Corpus {
 }
 
 struct PackageSites {
+    git: std::path::PathBuf,
     archive: Archive,
     hosts: HashSet<String>,
 }
@@ -28,7 +31,7 @@ fn archived_response(
     missing.set_query(None);
     Ok(archive
         .get(missing.as_str())?
-        .filter(|response| response.status == 404))
+        .filter(|response| response.status.is_client_error()))
 }
 
 impl Corpus {
@@ -165,7 +168,11 @@ impl Pages {
                 .urls()
                 .filter_map(|url| url::Url::parse(url).ok()?.host_str().map(str::to_owned))
                 .collect();
-            Some(PackageSites { archive, hosts })
+            Some(PackageSites {
+                git: package_root.join("git"),
+                archive,
+                hosts,
+            })
         } else {
             None
         };

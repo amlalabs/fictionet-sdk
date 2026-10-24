@@ -155,7 +155,7 @@ impl httpd::Handler for Gateway {
                     cx,
                     SearchObs::Egress {
                         attempt: event.attempt,
-                        host: host.clone(),
+                        host: host.clone().into(),
                         method: event.method.to_string(),
                         path: event.path.path().into(),
                         purpose: if event.path.path().contains("oauth")

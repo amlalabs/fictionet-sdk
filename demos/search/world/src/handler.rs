@@ -90,7 +90,14 @@ impl Handler {
         let path = parts.uri.path_and_query().map_or("/", |p| p.as_str());
         let action = route(&target.host, path, form);
         let url = format!("{}://{}{path}", target.scheme, target.host);
-        let package = self.pages.package_url(&url);
+        let package = match self
+            .pages
+            .git_request(&self.fcx, &target.host, &parts, &body)
+            .await
+        {
+            Some(response) => Some(response),
+            None => self.pages.package_url(&url),
+        };
         let page_source = package.as_ref().map_or_else(
             || self.pages.source(),
             |_| crate::observation::PageSource::Copy { captured: None },
