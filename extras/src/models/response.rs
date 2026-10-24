@@ -22,7 +22,13 @@ pub(super) struct Call {
     secret: Secret,
 }
 impl Call {
-    pub fn new(site: &Model, path: String, body: &Value, free: bool, secret: &Secret) -> Self {
+    pub fn new(
+        site: &Model,
+        path: String,
+        model: Option<&str>,
+        free: bool,
+        secret: &Secret,
+    ) -> Self {
         Self {
             provider: site.provider,
             path,
@@ -38,8 +44,8 @@ impl Call {
             complete: false,
             free,
             ledger: site.ledger.clone(),
-            prices: site.prices.as_ref().and_then(|(model, prices)| {
-                (body["model"].as_str() == Some(model.as_str())).then_some(*prices)
+            prices: site.prices.as_ref().and_then(|(priced_model, prices)| {
+                (model == Some(priced_model.as_str())).then_some(*prices)
             }),
             secret: secret.clone(),
         }

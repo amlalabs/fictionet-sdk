@@ -5,8 +5,14 @@ use super::*;
 #[derive(Clone)]
 pub struct Key {
     secret: Secret,
-    bearer: bool,
+    authentication: Authentication,
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Authentication {
+    ApiKey,
+    ClaudeToken,
+}
+
 impl fmt::Debug for Key {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(&self.secret, f)
@@ -21,7 +27,7 @@ impl Key {
         Ok(Self {
             secret: Secret::new(variable, value)
                 .map_err(|_| format!("{variable} holds characters an HTTP header cannot carry"))?,
-            bearer: false,
+            authentication: Authentication::ApiKey,
         })
     }
     /// Uses the host's long-lived Claude subscription token.
@@ -31,7 +37,7 @@ impl Key {
         }
         Ok(Self {
             secret,
-            bearer: true,
+            authentication: Authentication::ClaudeToken,
         })
     }
     /// Reads only the named provider variable.
@@ -47,11 +53,11 @@ impl Key {
     }
     /// Whether the credential uses Claude's subscription protocol.
     pub fn is_claude_token(&self) -> bool {
-        self.bearer
+        self.authentication == Authentication::ClaudeToken
     }
     /// The provider's credential header, for host-side requests only.
     pub fn header(&self, provider: Provider) -> (&'static str, String) {
-        let header = if self.bearer {
+        let header = if self.is_claude_token() {
             "authorization"
         } else {
             provider.header()
@@ -89,25 +95,43 @@ pub trait Transport: Send + Sync {
 
 /// An authenticated transport. Only scrubbed provider responses leave this client.
 pub struct Authenticated {
+    provider: Provider,
     key: Key,
     transport: Arc<dyn Transport>,
 }
 impl Authenticated {
     /// Owns authentication and response sanitization for this provider transport.
-    pub fn new(key: Key, transport: Arc<dyn Transport>) -> Self {
-        Self { key, transport }
+    pub fn new(provider: Provider, key: Key, transport: Arc<dyn Transport>) -> Self {
+        Self {
+            provider,
+            key,
+            transport,
+        }
     }
     /// Installs upstream observation without exposing authentication.
     pub fn observe_upstream(&self, observer: Arc<UpstreamObserver>) {
         self.transport.observe_upstream(observer);
     }
+    /// Whether the owned credential uses the Claude subscription protocol.
+    pub fn is_claude_token(&self) -> bool {
+        self.key.is_claude_token()
+    }
+    /// Removes the owned credential from assembled text and diagnostics.
+    pub fn redact(&self, text: &str) -> String {
+        self.key.redact(text)
+    }
     /// Sends a provider request and sanitizes successful bodies and errors alike.
-    pub async fn post(
-        &self,
-        cx: &Cx,
-        headers: Vec<(&'static str, String)>,
-        body: Vec<u8>,
-    ) -> Result<(u16, Vec<u8>), String> {
+    pub async fn post(&self, cx: &Cx, body: Vec<u8>) -> Result<(u16, Vec<u8>), String> {
+        let mut headers = vec![
+            self.key.header(self.provider),
+            ("content-type", "application/json".into()),
+        ];
+        if self.provider == Provider::Anthropic {
+            headers.push(("anthropic-version", "2023-06-01".into()));
+            if self.key.is_claude_token() {
+                headers.push(("anthropic-beta", "oauth-2025-04-20".into()));
+            }
+        }
         let (status, body) = self
             .transport
             .post(cx, headers, body)
@@ -212,7 +236,9 @@ impl Transport for Https {
                 request = request.header(name, value);
             }
             let request = request
-                .body(Body::from(body.to_string()))
+                .body(Body::from(
+                    serde_json::to_vec(&body).map_err(|_| "Invalid provider request")?,
+                ))
                 .map_err(|e| e.to_string())?;
             let mut request = request;
             request.headers_mut().insert(
@@ -277,10 +303,12 @@ mod tests {
             fn post<'a>(
                 &'a self,
                 _: &'a Cx,
-                _: Vec<(&'static str, String)>,
+                headers: Vec<(&'static str, String)>,
                 body: Vec<u8>,
             ) -> Post<'a> {
                 Box::pin(async move {
+                    assert!(headers.contains(&("x-api-key", "private-key".into())));
+                    assert!(headers.contains(&("anthropic-version", "2023-06-01".into())));
                     if body.is_empty() {
                         Err("connection failed with private-key".into())
                     } else {
@@ -293,12 +321,13 @@ mod tests {
             fictionet::Seed::from_u64(8),
             |cx| async move {
                 let client = Authenticated::new(
+                    Provider::Anthropic,
                     Key::new("provider key", Some("private-key".into())).unwrap(),
                     Arc::new(Echo),
                 );
-                let error = client.post(&cx, vec![], vec![]).await.unwrap_err();
+                let error = client.post(&cx, vec![]).await.unwrap_err();
                 assert_eq!(error, "connection failed with <provider key>");
-                let (status, body) = client.post(&cx, vec![], vec![1]).await.unwrap();
+                let (status, body) = client.post(&cx, vec![1]).await.unwrap();
                 assert_eq!(status, 401);
                 assert_eq!(
                     serde_json::from_slice::<Value>(&body)?["error"],

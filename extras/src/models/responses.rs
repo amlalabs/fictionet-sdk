@@ -18,27 +18,20 @@ const PAGE_CHARS: usize = 20_000;
 /// At most this many matching lines answer one `find_in_page`.
 const MATCHES: usize = 20;
 
-pub(super) fn needed(body: &Value) -> bool {
-    body["tools"]
-        .as_array()
-        .is_some_and(|tools| tools.iter().any(hosted))
-        || body["input"]
-            .as_array()
-            .is_some_and(|items| items.iter().any(|i| i["type"] == "web_search_call"))
+use request::{Block, Content, Responses, Tool, TypedBlock};
+fn hosted(value: &Value) -> bool {
+    serde_json::from_value::<Tool>(value.clone())
+        .ok()
+        .is_some_and(|tool| tool.web().is_some())
 }
-fn hosted(tool: &Value) -> bool {
-    matches!(
-        tool["type"].as_str(),
-        Some("web_search" | "web_search_preview")
-    )
-}
+
 /// The functions sent upstream in place of the hosted tool. They never
 /// change between turns, so a provider's prompt cache keeps working.
-fn functions() -> [Value; 3] {
+fn functions() -> [Tool; 3] {
     let function = |name: &str, description: &str, properties: Value| {
         let required: Vec<_> = properties.as_object().unwrap().keys().cloned().collect();
-        json!({"type":"function","name":name,"description":description,"strict":true,
-            "parameters":{"type":"object","properties":properties,"required":required,"additionalProperties":false}})
+        serde_json::from_value(json!({"type":"function","name":name,"description":description,"strict":true,
+            "parameters":{"type":"object","properties":properties,"required":required,"additionalProperties":false}})).expect("local function definition")
     };
     [
         function(
@@ -67,27 +60,35 @@ fn is_world(item: &Value) -> bool {
 }
 /// Turns the client's `web_search_call` items back into the function call
 /// and output the model saw. The world's encrypted token carries both.
-fn history(body: &mut Value, cipher: &splice::TokenCipher) -> fictionet::Result<()> {
-    let Some(items) = body["input"].as_array_mut() else {
+fn history(body: &mut Responses, cipher: &splice::TokenCipher) -> fictionet::Result<()> {
+    let Some(input) = body.input.take() else {
         return Ok(());
     };
     let mut restored = Vec::new();
-    for item in std::mem::take(items) {
-        if item["type"] != "web_search_call" {
+    for item in input.into_blocks() {
+        let Content::Block(block) = item else {
             restored.push(item);
             continue;
+        };
+        match *block {
+            Block::Typed(TypedBlock::WebSearchCall {
+                id,
+                encrypted_content,
+                ..
+            }) => {
+                let value = cipher.open(
+                    &encrypted_content.ok_or_else(|| Error::msg("Invalid search history"))?,
+                )?;
+                if value["id"] != id {
+                    return Err(Error::msg("Invalid search history"));
+                }
+                restored.push(serde_json::from_value(value["call"].clone())?);
+                restored.push(serde_json::from_value(value["result"].clone())?);
+            }
+            block => restored.push(Content::Block(Box::new(block))),
         }
-        let token = item["encrypted_content"]
-            .as_str()
-            .ok_or_else(|| Error::msg("Invalid search history"))?;
-        let value = cipher.open(token)?;
-        if value["id"] != item["id"] {
-            return Err(Error::msg("Invalid search history"));
-        }
-        restored.push(value["call"].clone());
-        restored.push(value["result"].clone());
     }
-    *items = restored;
+    body.input = Some(Content::Blocks(restored));
     Ok(())
 }
 
@@ -133,7 +134,7 @@ struct Turn {
 pub(super) async fn serve(
     mut model: Model,
     parts: http::request::Parts,
-    mut body: Value,
+    mut body: Responses,
 ) -> fictionet::Result<Response<Body>> {
     let engine = model.engine.take().expect("engine checked");
     if history(&mut body, &model.cipher).is_err() {
@@ -146,15 +147,15 @@ pub(super) async fn serve(
         sequence: 0,
         response: Value::Null,
         items: Vec::new(),
-        tools: body["tools"].clone(),
-        tool_choice: body["tool_choice"].clone(),
+        tools: serde_json::to_value(&body.tools)?,
+        tool_choice: body.tool_choice.clone().unwrap_or(Value::Null),
     };
     let mut settings = json!({});
-    if let Some(tools) = body["tools"].as_array_mut() {
+    if let Some(tools) = &mut body.tools {
         let mut rewritten = Vec::new();
         for tool in std::mem::take(tools) {
-            if hosted(&tool) {
-                settings = tool;
+            if let Some((_, web)) = tool.web() {
+                settings = serde_json::to_value(web)?;
                 rewritten.extend(functions());
             } else {
                 rewritten.push(tool);
@@ -162,10 +163,10 @@ pub(super) async fn serve(
         }
         *tools = rewritten;
     }
-    if hosted(&body["tool_choice"]) {
-        body["tool_choice"] = json!({"type":"function","name":"web_search"});
+    if body.tool_choice.as_ref().is_some_and(hosted) {
+        body.tool_choice = Some(json!({"type":"function","name":"web_search"}));
     }
-    let stream = body["stream"] == true;
+    let stream = body.stream == Some(true);
     let response = splice::upstream(&model, &parts, &body).await?;
     if !response.status().is_success() {
         return Ok(response);
@@ -441,14 +442,15 @@ async fn run(
     model: Model,
     engine: Arc<dyn Engine>,
     parts: http::request::Parts,
-    mut body: Value,
+    mut body: Responses,
     settings: Value,
     mut response: Response<Body>,
     output: &mut Output,
 ) -> fictionet::Result<Option<Response<Body>>> {
-    let limit = body["max_tool_calls"].as_u64().unwrap_or(8);
-    let include_sources = body["include"]
-        .as_array()
+    let limit = body.max_tool_calls.unwrap_or(8);
+    let include_sources = body
+        .include
+        .as_ref()
         .is_some_and(|fields| fields.iter().any(|f| f == "web_search_call.action.sources"));
     let mut used = 0;
     let mut tokens = 0;
@@ -533,13 +535,16 @@ async fn run(
                 .await?;
             return Ok(None);
         }
-        if !body["input"].is_array() {
-            body["input"] = json!([{"role":"user","content":body["input"]}]);
+        let mut input = body
+            .input
+            .take()
+            .unwrap_or(Content::Empty(()))
+            .into_blocks();
+        for item in original.iter().cloned().chain(results) {
+            input.push(serde_json::from_value(item)?);
         }
-        let input = body["input"].as_array_mut().unwrap();
-        input.extend(original.iter().cloned());
-        input.extend(results);
-        body["tool_choice"] = json!("auto");
+        body.input = Some(Content::Blocks(input));
+        body.tool_choice = Some(json!("auto"));
         response = splice::upstream(&model, &parts, &body).await?;
         if !response.status().is_success() {
             return Ok(Some(response));

@@ -2,6 +2,8 @@
 use super::*;
 use http_body::{Body as HttpBody, Frame};
 
+mod text;
+
 /// The outcome of one attempt to contact a provider.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -105,6 +107,7 @@ pub(super) fn sanitize(
             secret,
             pending: Vec::new(),
             streaming,
+            records: Vec::new(),
             done: false,
         })
     }))
@@ -133,48 +136,84 @@ struct Scrubbed {
     pending: Vec<u8>,
     streaming: bool,
     done: bool,
+    records: Vec<Record>,
+}
+enum Record {
+    Json(Value, bool),
+    Raw(Vec<u8>),
 }
 impl Scrubbed {
-    fn record(&self, bytes: &[u8]) -> Vec<u8> {
-        let (prefix, content) = if self.streaming && bytes.starts_with(b"data:") {
-            (b"data: ".as_slice(), &bytes[5..])
-        } else {
-            (b"".as_slice(), bytes)
-        };
-        if let Ok(mut value) = serde_json::from_slice::<Value>(content) {
-            scrub_json(&mut value, &self.secret);
-            let mut output = prefix.to_vec();
-            output.extend(serde_json::to_vec(&value).expect("provider JSON"));
-            if self.streaming && bytes.ends_with(b"\n") {
-                output.push(b'\n');
-            }
-            output
-        } else {
-            self.secret
-                .redact(&String::from_utf8_lossy(bytes))
-                .into_bytes()
-        }
-    }
     fn ready(&mut self, end: bool) -> Vec<u8> {
+        if !self.streaming {
+            if !end {
+                return Vec::new();
+            }
+            return if let Ok(mut value) = serde_json::from_slice::<Value>(&self.pending) {
+                text::scrub(std::slice::from_mut(&mut value), &self.secret, true);
+                serde_json::to_vec(&value).expect("provider JSON")
+            } else {
+                self.secret
+                    .redact(&String::from_utf8_lossy(&self.pending))
+                    .into_bytes()
+            };
+        }
         let length = if end {
             self.pending.len()
-        } else if self.streaming {
+        } else {
             self.pending
                 .iter()
                 .rposition(|b| *b == b'\n')
                 .map_or(0, |i| i + 1)
-        } else {
-            0
         };
         let bytes: Vec<_> = self.pending.drain(..length).collect();
-        if self.streaming {
-            bytes
-                .split_inclusive(|b| *b == b'\n')
-                .flat_map(|line| self.record(line))
-                .collect()
-        } else {
-            self.record(&bytes)
+        for line in bytes.split_inclusive(|b| *b == b'\n') {
+            let record = if let Some(data) = line.strip_prefix(b"data:")
+                && let Ok(value) = serde_json::from_slice::<Value>(data)
+            {
+                Record::Json(value, line.ends_with(b"\n"))
+            } else {
+                Record::Raw(
+                    self.secret
+                        .redact(&String::from_utf8_lossy(line))
+                        .into_bytes(),
+                )
+            };
+            self.records.push(record);
         }
+        let mut values: Vec<_> = self
+            .records
+            .iter()
+            .filter_map(|record| match record {
+                Record::Json(value, _) => Some(value.clone()),
+                Record::Raw(_) => None,
+            })
+            .collect();
+        let safe = text::scrub(&mut values, &self.secret, end);
+        let mut values = values.into_iter().enumerate();
+        let mut ready = self.records.len();
+        for (index, record) in self.records.iter_mut().enumerate() {
+            if let Record::Json(value, _) = record {
+                let (item, scrubbed) = values.next().expect("decoded record");
+                *value = scrubbed;
+                if item >= safe {
+                    ready = ready.min(index);
+                }
+            }
+        }
+        let mut output = Vec::new();
+        for record in self.records.drain(..ready) {
+            match record {
+                Record::Json(value, newline) => {
+                    output.extend(b"data: ");
+                    output.extend(serde_json::to_vec(&value).expect("provider JSON"));
+                    if newline {
+                        output.push(b'\n');
+                    }
+                }
+                Record::Raw(bytes) => output.extend(bytes),
+            }
+        }
+        output
     }
 }
 impl HttpBody for Scrubbed {
@@ -193,6 +232,20 @@ impl HttpBody for Scrubbed {
                 Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
                     Ok(bytes) => {
                         self.pending.extend_from_slice(&bytes);
+                        let held: usize = self
+                            .records
+                            .iter()
+                            .map(|record| match record {
+                                Record::Json(value, _) => value.to_string().len(),
+                                Record::Raw(bytes) => bytes.len(),
+                            })
+                            .sum();
+                        if self.pending.len() + held > 32 * 1024 * 1024 {
+                            self.done = true;
+                            return Poll::Ready(Some(Err(Error::msg(
+                                "Provider response exceeds sanitization limit",
+                            ))));
+                        }
                         let safe = self.ready(false);
                         if !safe.is_empty() {
                             return Poll::Ready(Some(Ok(Frame::data(safe.into()))));
@@ -274,6 +327,56 @@ mod tests {
             Ok(())
         }))
         .unwrap();
+    }
+
+    #[test]
+    fn assembled_blocks_and_stream_deltas_never_release_a_split_credential() {
+        fictionet::block_on(fictionet::lab(fictionet::Seed::from_u64(4), |_| async {
+            let secret = Secret::new("provider key", "private-key".into())?;
+            for split in 1.."private-key".len() {
+                let (first, second) = "private-key".split_at(split);
+                let value = json!({"content":[{"type":"text","text":format!("Before {first}")},{"type":"text","text":format!("{second} after")} ]});
+                let response = sanitize(Response::new(Body::from(value.to_string())), secret.clone())?;
+                let value: Value = serde_json::from_slice(&response.into_body().collect().await?.to_bytes())?;
+                let assembled = format!("{}{}", value["content"][0]["text"].as_str().unwrap(), value["content"][1]["text"].as_str().unwrap());
+                assert_eq!(assembled, "Before <provider key> after");
+                for chat in [false, true] {
+                    let event = |text: &str| if chat {
+                        json!({"choices":[{"index":0,"delta":{"content":text}}]})
+                    } else {
+                        json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":text}})
+                    };
+                    let input = format!("data: {}\n\nevent: ping\ndata: {{\"type\":\"ping\"}}\n\ndata: {}\n\ndata: {}\n\n", event(&format!("Before {first}")), event(second), event(" after"));
+                    let frames = input.bytes().map(|byte| Ok(Frame::data(Bytes::from(vec![byte])))).collect();
+                    let response = sanitize(Response::builder().header("content-type", "text/event-stream").body(Body::new(Chunks(frames)))?, secret.clone())?;
+                    let body = response.into_body().collect().await?.to_bytes();
+                    let output = std::str::from_utf8(&body)?;
+                    let values: Vec<Value> = output.lines().filter_map(|line| line.strip_prefix("data: ")).map(serde_json::from_str).collect::<Result<_, _>>()?;
+                    assert_eq!(values.len(), 4);
+                    assert_eq!(values[1]["type"], "ping");
+                    let path = if chat { "/choices/0/delta/content" } else { "/delta/text" };
+                    let assembled: String = values.iter().filter_map(|value| value.pointer(path).and_then(Value::as_str)).collect();
+                    assert_eq!(assembled, "Before <provider key> after", "{output}");
+                }
+            }
+            Ok(())
+        })).unwrap();
+    }
+
+    #[test]
+    fn tool_argument_streams_are_scrubbed_after_json_assembly() {
+        fictionet::block_on(fictionet::lab(fictionet::Seed::from_u64(9), |_| async {
+            let secret = Secret::new("provider key", "private-key".into())?;
+            let parts = [r#"{"value":"private\u00"#, r#"2dkey"}"#];
+            let input: String = parts.into_iter().map(|partial| format!("data: {}\n\n", json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":partial}}))).collect();
+            let response = sanitize(Response::builder().header("content-type", "text/event-stream").body(Body::from(input))?, secret)?;
+            let bytes = response.into_body().collect().await?.to_bytes();
+            let output = std::str::from_utf8(&bytes)?;
+            let arguments: String = output.lines().filter_map(|line| line.strip_prefix("data: ")).map(|line| serde_json::from_str::<Value>(line).unwrap()["delta"]["partial_json"].as_str().unwrap().to_owned()).collect();
+            let value: Value = serde_json::from_str(&arguments)?;
+            assert_eq!(value["value"], "<provider key>");
+            Ok(())
+        })).unwrap();
     }
 
     struct Failed;

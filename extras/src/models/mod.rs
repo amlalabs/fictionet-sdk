@@ -808,7 +808,7 @@ impl Model {
         };
         parts.headers.remove("content-encoding");
         parts.headers.remove("content-length");
-        let mut body: Value = match serde_json::from_slice(&bytes) {
+        let body: Value = match serde_json::from_slice(&bytes) {
             Ok(Value::Object(body)) => Value::Object(body),
             _ if (listing || policy_limits) && bytes.is_empty() => json!({}),
             _ => {
@@ -825,17 +825,7 @@ impl Model {
                 http::HeaderValue::from_static("application/json"),
             );
         }
-        // A searched response continues from the upstream turn that holds it.
-        let last = body["previous_response_id"].as_str().and_then(|id| {
-            let continued = self.continued.lock().unwrap();
-            continued.finals.get(id).cloned()
-        });
-        if let Some(last) = last
-            && path.ends_with("/responses")
-        {
-            body["previous_response_id"] = json!(last);
-        }
-        let Some(admitted) = admitted_request(self.provider, &path, &body, self.engine.is_some())
+        let Some(mut body) = admitted_request(self.provider, &path, &body, self.engine.is_some())
         else {
             return Ok(self.provider.error(
                 400,
@@ -843,25 +833,39 @@ impl Model {
                 "Remote sources and unsupported server tools are not enabled for this workspace.",
             ));
         };
-        body = admitted;
+        if let request::Admitted::Responses(request) = &mut body
+            && let Some(last) = request
+                .previous_response_id
+                .as_ref()
+                .and_then(|id| self.continued.lock().unwrap().finals.get(id).cloned())
+        {
+            request.previous_response_id = Some(last);
+        }
+        let body = match body {
+            request::Admitted::Messages(body)
+                if self.engine.is_some()
+                    && self.provider == Provider::Anthropic
+                    && body.needs_web() =>
+            {
+                if path.ends_with("/count_tokens") {
+                    return Box::pin(splice::count(self, parts, body)).await;
+                }
+                return Box::pin(splice::serve(self, parts, body)).await;
+            }
+            request::Admitted::Responses(body)
+                if self.engine.is_some()
+                    && matches!(self.provider, Provider::OpenAi | Provider::ChatGpt)
+                    && body.needs_web() =>
+            {
+                return Box::pin(responses::serve(self, parts, body)).await;
+            }
+            body => body,
+        };
         let bytes = if parts.method == http::Method::POST {
-            Bytes::from(body.to_string())
+            Bytes::from(serde_json::to_vec(&body)?)
         } else {
             bytes
         };
-        if self.provider == Provider::Anthropic && self.engine.is_some() && splice::needed(&body) {
-            if path.ends_with("/count_tokens") {
-                return Box::pin(splice::count(self, parts, body)).await;
-            }
-            return Box::pin(splice::serve(self, parts, body)).await;
-        }
-        if matches!(self.provider, Provider::OpenAi | Provider::ChatGpt)
-            && path.ends_with("/responses")
-            && self.engine.is_some()
-            && responses::needed(&body)
-        {
-            return Box::pin(responses::serve(self, parts, body)).await;
-        }
         let free = path.ends_with("/count_tokens") || listing;
         if !free && let Some(stop) = self.admit(&path, true) {
             return Ok(stop);
@@ -880,7 +884,7 @@ impl Model {
             Some(credential) => credential.real.clone(),
             None => self.guest_secret(&parts.headers)?,
         };
-        let mut call = response::Call::new(&self, path, &body, free, &secret);
+        let mut call = response::Call::new(&self, path, body.model(), free, &secret);
         if let Some(credential) = &self.credential {
             for name in [
                 "authorization",
@@ -964,102 +968,13 @@ fn safe_request(provider: Provider, path: &str, body: &Value, world: bool) -> bo
     admitted_request(provider, path, body, world).is_some()
 }
 
-fn admitted_request(provider: Provider, path: &str, body: &Value, world: bool) -> Option<Value> {
-    let admitted = request::Envelope::decode(body).ok()?;
-    if let Some(tools) = body.get("tools") {
-        let tools = tools.as_array()?;
-        if !tools
-            .iter()
-            .all(|tool| safe_tool(provider, path, tool, world))
-        {
-            return None;
-        }
-    }
-    if let Some(functions) = body.get("functions")
-        && !functions.as_array().is_some_and(|fs| {
-            fs.iter()
-                .all(|f| f["name"].is_string() && f["parameters"].is_object())
-        })
-    {
-        return None;
-    }
-    Some(admitted.value())
-}
-
-fn safe_tool(provider: Provider, path: &str, tool: &Value, world: bool) -> bool {
-    let Some(object) = tool.as_object() else {
-        return false;
-    };
-    match tool["type"].as_str() {
-        None => match provider {
-            Provider::Anthropic | Provider::OpenRouter
-                if path.ends_with("/messages") || path.ends_with("/messages/count_tokens") =>
-            {
-                tool["name"].is_string()
-                    && tool["input_schema"].is_object()
-                    && object.keys().all(|k| {
-                        matches!(
-                            k.as_str(),
-                            "name"
-                                | "description"
-                                | "input_schema"
-                                | "cache_control"
-                                | "strict"
-                                | "defer_loading"
-                                | "input_examples"
-                                | "allowed_callers"
-                        )
-                    })
-            }
-            Provider::Gemini => {
-                object.len() == 1
-                    && (tool["functionDeclarations"].is_array()
-                        || tool["function_declarations"].is_array())
-            }
-            _ => false,
-        },
-        Some("function" | "custom") => object.keys().all(|k| {
-            matches!(
-                k.as_str(),
-                "type"
-                    | "function"
-                    | "name"
-                    | "description"
-                    | "parameters"
-                    | "input_schema"
-                    | "cache_control"
-                    | "input_examples"
-                    | "allowed_callers"
-                    | "strict"
-                    | "format"
-                    | "defer_loading"
-            )
-        }),
-        Some("namespace") => {
-            object
-                .keys()
-                .all(|k| matches!(k.as_str(), "type" | "name" | "description" | "tools"))
-                && tool["tools"]
-                    .as_array()
-                    .is_some_and(|ts| ts.iter().all(|t| safe_tool(provider, path, t, false)))
-        }
-        Some(
-            "web_search_20250305"
-            | "web_search_20260209"
-            | "web_fetch_20250910"
-            | "web_fetch_20260209",
-        ) => {
-            world
-                && provider == Provider::Anthropic
-                && (path == "/v1/messages" || path == "/v1/messages/count_tokens")
-        }
-        Some("web_search" | "web_search_preview") => {
-            world
-                && matches!(provider, Provider::OpenAi | Provider::ChatGpt)
-                && path.ends_with("/responses")
-        }
-        Some(_) => false,
-    }
+fn admitted_request(
+    provider: Provider,
+    path: &str,
+    body: &Value,
+    world: bool,
+) -> Option<request::Admitted> {
+    request::Admitted::decode(provider, path, body, world)
 }
 
 fn from_env(cx: &Cx, provider: Provider) -> fictionet::Result<Model> {
