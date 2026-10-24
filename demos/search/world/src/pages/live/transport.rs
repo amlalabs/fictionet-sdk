@@ -161,8 +161,14 @@ impl Transport {
                 | Ask::Original => client.get(url).header("accept-encoding", "identity"),
             };
             let response = request.send().await;
+            // The innermost cause is the real error: a name that does not
+            // resolve, a refused connection, a certificate it would not accept.
             let response = response.map_err(|error| {
-                io::Error::other(format!("Live request failed: {:?}", error.without_url()))
+                let mut cause: &dyn std::error::Error = &error;
+                while let Some(source) = cause.source() {
+                    cause = source;
+                }
+                io::Error::other(cause.to_string())
             })?;
             if let Some(attempt) = &mut attempt {
                 attempt.event.phase = UpstreamPhase::Response;

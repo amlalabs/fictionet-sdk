@@ -122,10 +122,7 @@ impl Live {
                 .download(&lifetime, &cx, &url, user_agent.as_ref(), page.as_ref())
                 .await;
             let response = match result {
-                Ok(response) => {
-                    send.send_replace(CaptureState::Ready);
-                    response
-                }
+                Ok(response) => response,
                 Err(_) if lifetime.cancelled() || cx.is_cancelled() => {
                     send.send_replace(CaptureState::Cancelled);
                     return;
@@ -137,12 +134,15 @@ impl Live {
             };
             // A copied page brings its stylesheets, CSS imports, fonts, images
             // and scripts, including those of pages already in the archive.
-            // They all belong to the page the client asked for.
+            // They all belong to the page the client asked for. They are
+            // under way before the page is ready, so whatever shows the page
+            // can wait for them (see `settled`).
             let owner = page.or_else(|| url::Url::parse(&url).ok());
+            let page_url = url.clone();
             let links = live
                 .fetcher
                 .process(&cx, &lifetime, move || {
-                    capture::requisites(&url, &response, resource)
+                    capture::requisites(&page_url, &response, resource)
                         .map_err(|error| error.to_string())
                 })
                 .await;
@@ -161,6 +161,7 @@ impl Live {
                 }
                 Err(error) => eprintln!("Live dependency discovery failed: {error}"),
             }
+            send.send_replace(CaptureState::Ready);
         });
         Ok(receive)
     }
@@ -181,41 +182,14 @@ impl Live {
         {
             return Ok(response);
         }
+        // One request, as a browser makes it: a host that cannot be reached
+        // fails with its real error, which the client and the log both get.
         let observer = self.observer.lock().unwrap().clone();
-        let mut stopped = lifetime.stop.subscribe();
-        let mut pause = std::time::Duration::from_secs(1);
-        let response = loop {
-            match self
-                .fetcher
-                .request(
-                    cx,
-                    lifetime,
-                    observer.clone(),
-                    url,
-                    Ask::Copy { user_agent, page },
-                )
-                .await
-            {
-                Ok(response) => break response,
-                Err(error) => {
-                    if lifetime.cancelled()
-                        || cx.is_cancelled()
-                        || matches!(
-                            error.kind(),
-                            std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::InvalidInput
-                        )
-                    {
-                        return Err(error.to_string());
-                    }
-                    tokio::select! {
-                        _ = stopped.changed() => return Err("Live session stopped".into()),
-                        _ = cx.cancelled() => return Err("Live run stopped".into()),
-                        _ = tokio::time::sleep(pause) => {},
-                    }
-                    pause += std::time::Duration::from_secs(1);
-                }
-            }
-        };
+        let response = self
+            .fetcher
+            .request(cx, lifetime, observer, url, Ask::Copy { user_agent, page })
+            .await
+            .map_err(|error| error.to_string())?;
         {
             let mut state = self.state();
             if lifetime.cancelled() || !Arc::ptr_eq(lifetime, &state.lifetime) {
@@ -366,6 +340,20 @@ impl Live {
         let _ = std::fs::remove_file(old_path);
     }
 
+    /// Waits until a copy of `url` that is under way has arrived or failed.
+    /// A page's files are under way once the page is ready.
+    pub(super) async fn settled(&self, url: &str) {
+        let Some(key) = warc::key(url) else {
+            return;
+        };
+        let reached = self.state().reached.get(&key).map(watch::Sender::subscribe);
+        if let Some(mut reached) = reached {
+            let _ = reached
+                .wait_for(|state| !matches!(state, CaptureState::Pending))
+                .await;
+        }
+    }
+
     /// A response this session already copied, without copying anything.
     pub(super) fn held(&self, url: &str) -> Option<warc::Response> {
         self.state().archive.get(&warc::key(url)?).ok()?
@@ -503,12 +491,12 @@ impl Pages {
             .await
         {
             Ok(response) => copied::replay(Ok(Some(response))),
-            Err(_) => Response::new(
+            Err(error) => Response::new(
                 502,
                 "text/plain; charset=utf-8",
                 "Bad Gateway\n",
                 vec![],
-                Meta::Missing,
+                Meta::Error { error, usage: None },
             ),
         }
     }

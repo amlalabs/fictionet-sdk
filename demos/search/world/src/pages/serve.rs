@@ -498,6 +498,14 @@ impl Pages {
         )
     }
 
+    /// Waits for a file of a page served from `source` that the world is
+    /// still copying, so [`held_resource`](Self::held_resource) finds it.
+    pub async fn settled(&self, source: &crate::observation::PageSource, url: &str) {
+        if let (crate::observation::PageSource::Live, Some(live)) = (source, &self.live) {
+            live.settled(url).await;
+        }
+    }
+
     /// A stylesheet, image or font the world already holds for a page it
     /// served from `source`, read on the host: no guest request is answered
     /// and nothing new is copied or written.

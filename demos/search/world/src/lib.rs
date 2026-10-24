@@ -117,6 +117,14 @@ pub fn net(
             resolved(None);
             return None;
         }
+        // Live pages come from the internet, so its DNS decides: a name
+        // with no address there has none here either. The host's resolver
+        // answers from its cache or with one query, and the answer is kept
+        // for the run.
+        if forwarded.is_none() && refused_pages.live_only() && !on_the_internet(host) {
+            resolved(None);
+            return None;
+        }
         let (addr, _) = match addresses.assign(host) {
             Ok(Some(assigned)) => assigned,
             Ok(None) => {
@@ -167,6 +175,14 @@ pub fn net(
                 },
             );
         })
+}
+
+/// Whether the internet's DNS gives `host` an address.
+fn on_the_internet(host: &str) -> bool {
+    use std::net::ToSocketAddrs;
+    (host, 443)
+        .to_socket_addrs()
+        .is_ok_and(|mut addresses| addresses.next().is_some())
 }
 
 /// A world kept in memory, made from one seed: a new CA, the seed's fixed

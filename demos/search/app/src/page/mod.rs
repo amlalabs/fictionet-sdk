@@ -194,6 +194,7 @@ impl Views {
                 fetch,
                 referrer,
                 title: _,
+                error: _,
                 preview,
             } => {
                 let url = format!("{scheme}://{host}{path}");
@@ -320,6 +321,7 @@ impl Views {
             }
             SearchObs::Signin { .. } => view.signin = Some(observation.clone()),
             SearchObs::NoRoute { .. }
+            | SearchObs::Abandoned { .. }
             | SearchObs::PageRevision { .. }
             | SearchObs::RunStarted { .. } => {}
         }
@@ -768,6 +770,7 @@ async fn held(
     let Some(pages) = page.pages.upgrade() else {
         return http::StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    pages.settled(&source, url.as_str()).await;
     let held = tokio::task::spawn_blocking(move || {
         let mut held = pages.held_resource(&source, url.as_str())?;
         if held.content_type.starts_with("text/css") {

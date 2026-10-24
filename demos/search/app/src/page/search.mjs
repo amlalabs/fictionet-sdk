@@ -45,6 +45,8 @@ function select(key) {
   document.body.classList.toggle('details-open', !!key);
   if (key) showAgent(true);
   draw();
+  // Back on the feed, the newest rows are in view: they arrive at the top.
+  if (!key) $('activity').scrollTop = 0;
 }
 $('close-details').onclick = () => select(null);
 function showAgent(shown) {
@@ -312,7 +314,7 @@ function activityItem(row) {
       const where = `${fact.host}${briefPath(fact.path) === '/' ? '' : briefPath(fact.path)}`;
       if (fact.status >= 400) {
         const outcome = [404, 410].includes(fact.status) ? 'not found' : [502, 503, 504].includes(fact.status) ? 'unreachable' : 'failed';
-        return { title: `${outcome === 'unreachable' ? fact.host : where} ${outcome}`, meta: `${fact.status} · ${sourceName(fact.source)}`, target: `site:${fact.host}`, failed: true };
+        return { title: `${outcome === 'unreachable' ? fact.host : where} ${outcome}`, meta: [fact.status, sourceName(fact.source), fact.error].filter(Boolean).join(' · '), target: `site:${fact.host}`, failed: true };
       }
       const document = /(?:text\/html|application\/pdf)/.test(fact.content_type);
       const thumbnail = document && fact.status < 400 && /text\/html/.test(fact.content_type) ? url : null;
@@ -320,6 +322,10 @@ function activityItem(row) {
     }
     case 'search': return { title: `Searched “${fact.query}”`, meta: fact.results.length ? `${quantity(fact.results.length, 'result')} · ${hitHosts(fact.results)}` : 'No results', target: 'search' };
     case 'tool': return { title: `${fact.tool === 'fetch' ? 'Fetched' : 'Searched'} ${fact.tool === 'fetch' ? fact.target : `“${fact.target}”`}`, meta: fact.error || (fact.tool === 'fetch' ? 'Answered by the world' : fact.results.length ? `${quantity(fact.results.length, 'result')} · ${hitHosts(fact.results)}` : 'No results'), target: 'calls' };
+    case 'abandoned': {
+      const where = `${fact.host}${briefPath(fact.path) === '/' ? '' : briefPath(fact.path)}`;
+      return { title: `${where} timed out`, meta: `Agent stopped waiting after ${Math.round(fact.elapsed_ms / 1000)} s · ${sourceName(fact.source)}`, target: `site:${fact.host}`, failed: true };
+    }
     case 'no_route': return { title: `Tried ${fact.to}`, meta: 'No route', target: 'router' };
     case 'resolved': return { title: `${hostName(fact.name)} not found`, meta: 'No address', target: 'dns', failed: true };
   }
@@ -371,7 +377,7 @@ function feedRow(key, row, item, resources) {
 }
 function feed() {
   const groups = pageRequests();
-  const rows = activityRows().filter((row) => ['request', 'search', 'tool', 'no_route', 'resolved'].includes(row.fact.kind) && (row.fact.kind !== 'request' || groups.has(row)) && (row.fact.kind !== 'resolved' || !row.fact.address));
+  const rows = activityRows().filter((row) => ['request', 'abandoned', 'search', 'tool', 'no_route', 'resolved'].includes(row.fact.kind) && (row.fact.kind !== 'request' || groups.has(row)) && (row.fact.kind !== 'abandoned' || !isSubresource(row.fact)) && (row.fact.kind !== 'resolved' || !row.fact.address));
   const keep = new Set();
   const nodes = rows.reverse().map((row) => {
     const fact = row.fact;

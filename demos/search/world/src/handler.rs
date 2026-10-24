@@ -70,6 +70,25 @@ impl Handler {
             || self.pages.source(),
             |_| crate::observation::PageSource::Copy { captured: None },
         );
+        let request_path = parts
+            .uri
+            .path_and_query()
+            .cloned()
+            .unwrap_or_else(|| http::uri::PathAndQuery::from_static("/"));
+        let mut waiting = Waiting {
+            fcx: self.fcx.clone(),
+            pages: self.pages.clone(),
+            started,
+            fact: Some(crate::observation::SearchObs::Abandoned {
+                scheme: target.scheme.clone(),
+                host: target.host.parse()?,
+                method: parts.method.clone(),
+                path: request_path.clone(),
+                source: page_source.clone(),
+                elapsed_ms: 0,
+                fetch: crate::observation::Fetch::of(&parts.headers),
+            }),
+        };
         let answer = if let Some(package) = package {
             package
         } else if let Some(asset) = Pages::search_asset(&target.host, path) {
@@ -98,6 +117,7 @@ impl Handler {
                 .handle_route(&self.fcx, parts.method.as_str(), &target.host, path, action)
                 .await
         };
+        waiting.fact = None;
         self.pages.report_response(
             &self.fcx,
             crate::observation::RequestContext {
@@ -105,11 +125,7 @@ impl Handler {
                 scheme: &target.scheme,
                 host: &target.host.parse()?,
                 method: &parts.method,
-                path: &parts
-                    .uri
-                    .path_and_query()
-                    .cloned()
-                    .unwrap_or_else(|| http::uri::PathAndQuery::from_static("/")),
+                path: &request_path,
                 source: page_source,
                 headers: parts.headers.clone(),
             },
@@ -133,6 +149,30 @@ impl Handler {
         };
         let response = response.body(Full::new(body))?;
         Ok(response)
+    }
+}
+
+/// A request the world has not answered yet. Dropped before then, its
+/// connection closed: the client gave up waiting, and the page says so.
+struct Waiting {
+    fcx: fictionet::Cx,
+    pages: Arc<Pages>,
+    started: std::time::Instant,
+    fact: Option<crate::observation::SearchObs>,
+}
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        let Some(mut fact) = self.fact.take() else {
+            return;
+        };
+        if self.fcx.is_cancelled() {
+            return;
+        }
+        if let crate::observation::SearchObs::Abandoned { elapsed_ms, .. } = &mut fact {
+            *elapsed_ms = self.started.elapsed().as_millis() as u64;
+        }
+        self.pages.report(&self.fcx, fact);
     }
 }
 

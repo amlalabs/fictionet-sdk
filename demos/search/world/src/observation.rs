@@ -43,8 +43,26 @@ pub enum SearchObs {
         referrer: Option<String>,
         /// The document's own title, for pages.
         title: Option<String>,
+        /// Why the world could not answer with the page: the site it read
+        /// could not be reached, or the page could not be made.
+        error: Option<String>,
         #[serde(skip)]
         preview: Option<crate::pages::PageBody>,
+    },
+    /// The client closed its connection before the world answered, as a
+    /// client with a deadline does.
+    Abandoned {
+        #[serde(serialize_with = "display")]
+        scheme: Scheme,
+        #[serde(serialize_with = "display")]
+        host: HostName,
+        #[serde(serialize_with = "display")]
+        method: Method,
+        #[serde(serialize_with = "display")]
+        path: PathAndQuery,
+        source: PageSource,
+        elapsed_ms: u64,
+        fetch: Fetch,
     },
     Search {
         engine: Engine,
@@ -411,6 +429,10 @@ impl Pages {
                     _ => None,
                 }
                 .filter(|title| !title.trim().is_empty()),
+                error: match &response.meta {
+                    Meta::Error { error, .. } => Some(error.clone()),
+                    _ => None,
+                },
                 referrer: headers
                     .get(http::header::REFERER)
                     .and_then(|value| value.to_str().ok())
@@ -448,7 +470,9 @@ fn report(
                 };
             }
         }
-        SearchObs::ModelCall { path, .. } => *path = redact_path(path),
+        SearchObs::ModelCall { path, .. } | SearchObs::Abandoned { path, .. } => {
+            *path = redact_path(path)
+        }
         SearchObs::PageRevision {
             target: WriterTarget::Page { url },
             ..
