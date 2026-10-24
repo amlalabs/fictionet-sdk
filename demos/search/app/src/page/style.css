@@ -42,7 +42,7 @@ main{flex:1;min-height:0;display:flex;gap:20px;padding:0 20px 20px}
 .map-heading button{border:0;padding:0;text-align:left;border-radius:0;font-weight:500;color:var(--muted)}
 .traffic-lanes{position:relative;padding:10px 0}
 .world-boundary{position:absolute;inset:0 auto 0 calc(var(--vm-width) + var(--wire-gap) - 12px);width:calc((100% - var(--vm-width) - 2 * var(--wire-gap)) / 2 + 24px);border:1px solid var(--line);border-radius:4px;background:var(--panel)}
-.traffic-lane{position:relative;min-height:46px}
+.traffic-lane{position:relative;min-height:44px}
 .traffic-wires{position:absolute;inset:0;pointer-events:none;overflow:visible;z-index:1}
 .traffic-wires path{fill:none;stroke:var(--faint);stroke-width:1;stroke-linejoin:round}
 .traffic-wires circle{fill:var(--faint)}
@@ -52,11 +52,12 @@ main{flex:1;min-height:0;display:flex;gap:20px;padding:0 20px 20px}
 .vm-icon{display:block;font:20px/1.5 var(--mono);color:var(--muted);margin-bottom:7px}
 .vm-node strong{display:block;font-size:12px;font-weight:500}
 .vm-node small{display:block;font:10px/1.8 var(--mono);color:var(--muted);margin-top:3px}
-.service{grid-column:2;position:relative;text-align:left;border:0;border-radius:0;min-width:0;padding:9px 10px;background:var(--panel);z-index:2;line-height:1.3}
+.service{grid-column:2;position:relative;display:flex;align-items:center;justify-content:space-between;gap:8px;text-align:left;border:0;border-radius:0;min-width:0;padding:8px 10px;background:var(--panel);z-index:2;line-height:1.3}
+.service-label{display:contents}
 .service.unused{color:var(--faint)}
 .service[aria-pressed=true]{color:var(--blue);background:var(--blue-bg)}
 .service strong{font-size:13px;font-weight:500;display:block}
-.service small{display:block;font-size:11px;color:var(--muted);margin-top:3px;overflow-wrap:anywhere;line-height:1.4}
+.service small{display:block;font-size:11px;color:var(--muted);margin:0;text-align:right;overflow-wrap:anywhere;line-height:1.4}
 .destinations{grid-column:3;position:relative;min-width:0;font-size:12px;line-height:1.5;z-index:2}
 .destination{border:0;padding:7px 0;display:block;text-align:left;border-radius:0;width:100%;overflow-wrap:anywhere;background:var(--bg)}
 .destination strong{font-weight:500;color:var(--text)}

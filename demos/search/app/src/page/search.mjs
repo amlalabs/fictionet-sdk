@@ -12,10 +12,9 @@ const button = (text, action, className) => {
   return node;
 };
 const stamp = (ms) => new Date((shown.started_at_ms || Date.now()) + ms).toLocaleTimeString([], { hour12: false, timeZone: 'UTC' });
-const time = stamp;
 const size = (bytes) => bytes < 1000 ? `${bytes} B` : `${Math.round(bytes / 1000)} KB`;
 const quantity = (n, word, plural = `${word}s`) => `${n} ${n === 1 ? word : plural}`;
-const sourceName = (source) => source.kind === 'copy' ? source.captured ? `Copied · ${source.captured.slice(0, 10)}` : 'Copied' : source.kind === 'live' ? 'live' : 'model-written';
+const sourceName = (source) => source.kind === 'copy' ? source.captured ? `Copied · ${source.captured.slice(0, 10)}` : 'Copied' : source.kind === 'live' ? 'Live' : 'Model-written';
 const hostOf = (url) => { try { return new URL(url).host; } catch { return url; } };
 let shown = { at_ms: 0, sites: [], calls: [], activity: [], connections: [], egress: [], signin: null };
 let selection = null, world = null;
@@ -36,7 +35,7 @@ function select(key) {
   selection = key;
   $('details').hidden = !key;
   document.body.classList.toggle('details-open', !!key);
-  if (key) { $('agent').hidden = false; $('agent-toggle').setAttribute('aria-pressed', 'true'); }
+  if (key) { $('agent').hidden = false; $('agent-toggle').setAttribute('aria-pressed', 'true'); $('agent-toggle').textContent = 'Hide agent'; }
   draw();
 }
 $('close-details').onclick = () => select(null);
@@ -66,7 +65,7 @@ function graph() {
     { id: 'dns', title: 'DNS', subtitle: '10.0.0.1:53', reached: facts.some((fact) => fact.kind === 'resolved') },
     { id: 'search', title: 'Search', subtitle: searches ? quantity(searches, 'search', 'searches') : '', reached: searches > 0, purpose: 'live_search' },
     { id: 'sites', title: 'Sites', subtitle: sites.length ? quantity(sites.length, 'site') : '', reached: sites.some((site) => site.requests.length), purpose: 'live_capture' },
-    { id: 'calls', title: 'Model gateway', subtitle: shown.calls.length ? quantity(shown.calls.length, 'call') : '', reached: shown.calls.length > 0, purpose: 'model' },
+    { id: 'calls', title: 'Model gateway', subtitle: shown.calls.length ? quantity(shown.calls.length, 'request') : '', reached: shown.calls.length > 0, purpose: 'model' },
     { id: 'writer', title: 'Page writer', subtitle: '', reached: false, purpose: 'page writer' },
     { id: 'signin', title: 'Sign-in', subtitle: shown.signin?.fact.open ? 'Open' : 'Closed', reached: modelHosts('account').length > 0, purpose: 'account' },
     { id: 'router', title: 'Router', subtitle: facts.filter((fact) => fact.kind === 'no_route').at(-1)?.to || '10.0.0.1', reached: facts.some((fact) => fact.kind === 'no_route') },
@@ -194,25 +193,14 @@ function pageAssets() {
 function activityText(row) {
   const fact = row.fact;
   switch (fact.kind) {
-    case 'resolved': return [fact.name, 'DNS', `${fact.name} → ${fact.address || 'no answer'}`, `site:${fact.name}`];
-    case 'request': return [`Opened ${fact.host}${briefPath(fact.path) === '/' ? '' : briefPath(fact.path)}`, 'Page', `${fact.status} · ${sourceName(fact.source)}`, fact.preview || /(?:text\/html|application\/pdf)/.test(fact.content_type) ? `page:${fact.scheme}://${fact.host}${fact.path}` : `site:${fact.host}`];
-    case 'search': return [`Searched “${fact.query}”`, 'Search', quantity(fact.results.length, 'result'), 'search'];
-    case 'model_call': return ['Asked the model', 'HTTPS', `${fact.host} · ${phaseName(fact.phase)}`, 'calls'];
-    case 'tool': return [`${fact.tool === 'fetch' ? 'Fetched' : 'Searched'} ${fact.target}`, 'Tool', fact.error || (fact.tool === 'fetch' ? 'World answer' : quantity(fact.results.length, 'result')), 'calls'];
-    case 'signin': return ['Sign-in', 'Policy', fact.open ? 'Open' : 'Closed', 'signin'];
-    case 'egress': {
-      if (fact.purpose === 'live_capture') {
-        const copies = activityRows().filter((row) => row.fact.kind === 'egress' && row.fact.purpose === 'live_capture');
-        return ['Page copies', 'Upstream', `${quantity(copies.length, 'request')} · ${quantity(new Set(copies.map((row) => row.fact.host)).size, 'host')}`, 'copies'];
-      }
-      return [fact.host, 'Upstream', `${purposeName(fact.purpose)} · ${fact.method} ${briefPath(fact.path)} · ${fact.status || phaseName(fact.phase)}`, `egress:${fact.host}`];
+    case 'request': {
+      const url = `${fact.scheme}://${fact.host}${fact.path}`;
+      const hit = shown.sites.flatMap((site) => site.searches.flatMap((search) => search.results)).concat(shown.calls.flatMap((call) => call.tools.flatMap((tool) => tool.results))).find((hit) => hit.url === url);
+      return [`${fact.status >= 400 ? 'Requested' : 'Opened'} ${hit?.title || fact.host}`, `${fact.host}${briefPath(fact.path) === '/' ? '' : briefPath(fact.path)} · ${fact.status} · ${sourceName(fact.source)}`, /(?:text\/html|application\/pdf)/.test(fact.content_type) ? `page:${url}` : `site:${fact.host}`];
     }
-    case 'page_revision': {
-      const target = fact.target.url ? new URL(fact.target.url).hostname : fact.target.host || 'Search';
-      return [target, 'Writer', 'Revising page', 'writer'];
-    }
-    case 'no_route': return [`Tried ${fact.to}`, 'TCP', 'No route', 'router'];
-    default: return ['', '', '', 'router'];
+    case 'search': return [`Searched “${fact.query}”`, quantity(fact.results.length, 'result'), 'search'];
+    case 'tool': return [`${fact.tool === 'fetch' ? 'Fetched' : 'Searched'} ${fact.target}`, fact.error || (fact.tool === 'fetch' ? 'World answer' : quantity(fact.results.length, 'result')), 'calls'];
+    case 'no_route': return [`Tried ${fact.to}`, 'No route', 'router'];
   }
 }
 function feed() {
@@ -220,12 +208,12 @@ function feed() {
   const expanded = new Set([...$('activity').querySelectorAll('details[open]')].map((node) => node.dataset.key));
   $('activity').replaceChildren();
   const assets = pageAssets();
-  const rows = activityRows().filter((row) => ['request', 'search', 'model_call', 'tool', 'no_route'].includes(row.fact.kind) && !(row.fact.kind === 'request' && isAsset(row.fact)));
+  const rows = activityRows().filter((row) => ['request', 'search', 'tool', 'no_route'].includes(row.fact.kind) && !(row.fact.kind === 'request' && isAsset(row.fact)));
   for (const row of rows.reverse()) {
-    const [target, , text, selected] = activityText(row);
+    const [target, text, selected] = activityText(row);
     const item = button('', () => select(selected), `activity-row ${row.fact.kind}`);
     item.append(element('span', stamp(row.at_ms), 'stamp'), element('span', target), element('span', text));
-    item.title = `${target} · ${text}${row.fact.kind === 'page_revision' ? ` · ${row.fact.reason}` : ''}`;
+    item.title = `${target} · ${text}`;
     $('activity').append(item);
     const resources = assets.get(row);
     if (resources?.length) {
@@ -245,16 +233,11 @@ function feed() {
 
 }
 function activityRows() {
-  const upstream = new Map();
-  for (const row of shown.activity) if (row.fact.kind === 'egress') upstream.set(row.fact.attempt, row);
   const attempts = new Map();
+  for (const row of shown.activity) if (row.fact.kind === 'no_route') attempts.set(`${row.fact.from}:${row.fact.to}`, row);
   return shown.activity.filter((row) => {
-    if (row.fact.kind === 'egress') return upstream.get(row.fact.attempt) === row;
     if (row.fact.kind !== 'no_route') return true;
-    const key = `${row.fact.from}:${row.fact.to}`, previous = attempts.get(key);
-    attempts.set(key, row.at_ms);
-    if (previous !== undefined && row.at_ms - previous <= 30000) return false;
-    return true;
+    return attempts.get(`${row.fact.from}:${row.fact.to}`) === row;
   });
 }
 function detailRow(at, label, meta, content) {
@@ -284,7 +267,7 @@ function results(hits) {
   }
   return list;
 }
-async function readPage(url, request, container) {
+async function readPage(url, container) {
   const target = new URL(url);
   const query = new URLSearchParams({ scheme: target.protocol.slice(0, -1), host: target.host, path: `${target.pathname}${target.search}` });
   const response = await fetch(`/preview?${query}`);
@@ -345,7 +328,7 @@ function details() {
     if (request?.has_preview) {
       const container = element('div', 'Loading page…', 'reading-view');
       body.append(container);
-      readPage(url, request, container).catch((error) => { container.textContent = error.message; });
+      readPage(url, container).catch((error) => { container.textContent = error.message; });
       const read = button(document.body.classList.contains('page-expanded') ? 'Shrink page' : 'Expand page', () => {
         const expanded = document.body.classList.toggle('page-expanded');
         read.textContent = expanded ? 'Shrink page' : 'Expand page';
@@ -436,7 +419,7 @@ function details() {
 
 function draw() {
   graph(); feed(); details();
-  $("clock").textContent = time(shown.at_ms);
+  $("clock").textContent = stamp(shown.at_ms);
 }
 const stream = new EventSource("/state");
 stream.onerror = () => { $("clock").title = "Reconnecting"; };
