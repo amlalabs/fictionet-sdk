@@ -1409,4 +1409,102 @@ mod tests {
         ))
         .unwrap();
     }
+
+    struct NotFound;
+    impl Handler for NotFound {
+        fn call(&self, _: Request<Body>, _: &mut Exchange<'_>) -> Reply {
+            Reply::Now(text(StatusCode::NOT_FOUND, "Not found.\n"))
+        }
+    }
+
+    /// The client preface, its SETTINGS, and its acknowledgment of the server's.
+    fn client_preface() -> Vec<u8> {
+        let mut bytes = PREFACE.to_vec();
+        for flags in [0, 1] {
+            write(
+                &wire::Settings {
+                    flags,
+                    entries: Vec::new(),
+                },
+                &mut bytes,
+            );
+        }
+        bytes
+    }
+
+    /// `POST /` over HTTP as one HEADERS frame on `stream` that ends the
+    /// stream. With `self_dependent`, its priority names the stream itself,
+    /// which no writer produces.
+    fn post(stream: u32, self_dependent: bool) -> Vec<u8> {
+        let block = [0x83, 0x86, 0x84];
+        let priority = if self_dependent { 5 } else { 0 };
+        let mut bytes = vec![0, 0, (block.len() + priority) as u8, 1];
+        bytes.push(if self_dependent { 0x25 } else { 5 });
+        bytes.extend_from_slice(&stream.to_be_bytes());
+        if self_dependent {
+            bytes.extend_from_slice(&stream.to_be_bytes());
+            bytes.push(0);
+        }
+        bytes.extend_from_slice(&block);
+        bytes
+    }
+
+    fn frames(mut bytes: &[u8]) -> Vec<Frame> {
+        let mut frames = Vec::new();
+        while !bytes.is_empty() {
+            let header = wire::FrameHeader::parse(&bytes[..9]).unwrap();
+            let end = 9 + header.length;
+            frames.push(Frame::parse(&bytes[..end]).unwrap());
+            bytes = &bytes[end..];
+        }
+        frames
+    }
+
+    #[test]
+    fn self_dependent_headers_on_a_closed_stream_end_the_connection() {
+        // HEADERS on a stream that has ended, or below one already opened,
+        // ends the connection (RFC 9113 sections 5.1 and 5.1.1), whatever
+        // priority the frame carries.
+        for (open, again) in [(1, 1), (5, 3)] {
+            let mut harness =
+                serve::Harness::new(fictionet::Seed::from_u64(1), Http2::new(NotFound), ());
+            harness.push(&client_preface()).unwrap();
+            let output = frames(&harness.push(&post(open, false)).unwrap());
+            assert!(
+                output
+                    .iter()
+                    .any(|f| matches!(f, Frame::Headers(h) if h.stream == open))
+            );
+            let output = frames(&harness.push(&post(again, true)).unwrap());
+            assert!(
+                output.iter().any(|f| matches!(f, Frame::GoAway(g)
+                    if g.last_stream == open && g.code == ErrorCode::ProtocolError as u32)),
+                "{output:?}"
+            );
+            assert!(!output.iter().any(|f| matches!(f, Frame::Reset(_))));
+            assert!(harness.closed());
+        }
+    }
+
+    #[test]
+    fn late_frames_on_a_reset_stream_are_ignored() {
+        let mut harness =
+            serve::Harness::new(fictionet::Seed::from_u64(1), Http2::new(NotFound), ());
+        harness.push(&client_preface()).unwrap();
+        let output = frames(&harness.push(&post(1, true)).unwrap());
+        assert!(output.iter().any(|f| matches!(f, Frame::Reset(r)
+            if r.stream == 1 && r.code == ErrorCode::ProtocolError as u32)));
+        // The server reset stream 1, so it ignores the stream's late frames
+        // for a while (RFC 9113 section 5.1), even ones that would be
+        // stream errors on an open stream.
+        for late in [
+            post(1, false),
+            post(1, true),
+            // PRIORITY with a 4-byte payload.
+            vec![0, 0, 4, 2, 0, 0, 0, 0, 1, 0, 0, 0, 0],
+        ] {
+            assert_eq!(frames(&harness.push(&late).unwrap()), [], "{late:?}");
+        }
+        assert!(!harness.closed());
+    }
 }
