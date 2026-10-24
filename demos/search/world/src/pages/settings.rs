@@ -1,4 +1,4 @@
-//! Page sources, generation limits and world controls.
+//! Page sources and world controls.
 
 use super::*;
 
@@ -22,7 +22,7 @@ impl Pages {
             seed,
             maker,
             prefetch,
-            live_calls: None,
+            interactive: false,
             store: Mutex::new(store),
             writing: Mutex::new(tokio::sync::watch::channel(false).0),
             copied: None,
@@ -41,12 +41,12 @@ impl Pages {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// A world whose pages are written by a bounded model. Everything stays in memory.
+    /// A world whose pages are written by a model, driven from the demo
+    /// page. Everything stays in memory.
     pub fn with_model(seed: Seed, model: Model) -> Self {
         let mut pages = Self::new(seed);
-        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        pages.maker = Some(Maker::Model(model.live(calls.clone())));
-        pages.live_calls = Some(calls);
+        pages.maker = Some(Maker::Model(model));
+        pages.interactive = true;
         pages
     }
 

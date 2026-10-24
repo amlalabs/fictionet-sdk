@@ -35,7 +35,7 @@ use crate::route::{Route, query_key, route};
 use crate::search::{Cache, Reason};
 use fictionet::Cx;
 use fictionet_extras::search::{self, Engine};
-use meta::{Asked, Listing, Shown};
+use meta::{Listing, Shown};
 use model::{Failure, Ledger, Model, Provider, Usage};
 use prompts::{Claim, HostPage, Person};
 use provenance::Mention;
@@ -49,16 +49,6 @@ use store::{CastRecord, PageRecord, SearchRecord, Store};
 tokio::task_local! {
     static WRITING: tokio::sync::watch::Receiver<bool>;
 }
-
-/// New generations one world may start: searches, pages, prefetches and the
-/// cast, failed ones included.
-pub const GENERATION_BUDGET: usize = 200;
-
-/// Output budgets include document markup, site metadata and provider reasoning.
-/// Shorter complete answers are requested if a provider reaches its limit.
-const SEARCH_TOKENS: u32 = 3200;
-const PAGE_TOKENS: u32 = 2500;
-const CAST_TOKENS: u32 = 800;
 
 /// A change to the world: its generation setting, what answers, or a
 /// planted fact or page. Each carries the settings revision it expects.
@@ -256,20 +246,10 @@ impl Maker {
 struct Made<T> {
     fields: T,
     usage: Usage,
-    recovery: Option<Recovery>,
 }
 
-struct Recovery {
-    target: crate::observation::WriterTarget,
-    reason: String,
-    rows: Vec<Value>,
-}
-
-/// Why nothing was made.
+/// Why nothing was made: the generator or the store failed.
 enum Stop {
-    /// The generation budget is spent.
-    Budget,
-    /// The generator or the store failed.
     Failed {
         error: String,
         usage: Option<Box<Usage>>,
@@ -285,14 +265,9 @@ impl Stop {
     }
     /// The answer for a stopped search or page: the plain 503 page a busy
     /// server shows. The log keeps why.
-    fn response(self, asked: Asked) -> Response {
-        let meta = match self {
-            Self::Budget => Meta::Budget(asked),
-            Self::Failed { error, usage } => Meta::Error {
-                error: error.chars().take(400).collect(),
-                usage,
-            },
-        };
+    fn response(self) -> Response {
+        let Self::Failed { error, usage } = self;
+        let meta = Meta::Error { error, usage };
         let headers = vec![("Server".into(), "nginx".into())];
         Response::new(503, "text/html", UNAVAILABLE, headers, meta)
     }
@@ -399,18 +374,15 @@ fn page_key(host: &str, target: &str) -> String {
     format!("page {host}{target}")
 }
 
-/// Returns host, target and anchor of the first
-/// [`LINKS_PER_PAGE`](prompts::LINKS_PER_PAGE) links on a page, resolved
+/// Returns host, target and anchor of every link on a page, resolved
 /// against its URL, in source order: http(s) links with a host that is not
-/// a search engine, with anchor text, cut at
-/// [`ANCHOR_CHARS`](prompts::ANCHOR_CHARS).
+/// a search engine, with anchor text.
 pub fn links(url: &str, markup: &str) -> Vec<(String, String, String)> {
     static LINK: OnceLock<Regex> = OnceLock::new();
     let link = LINK.get_or_init(|| {
         Regex::new(r#"(?is)<a\b[^>]*\bhref\s*=\s*["']([^"'#]+)[^"']*["'][^>]*>(.*?)</a>"#).unwrap()
     });
     link.captures_iter(markup)
-        .take(prompts::LINKS_PER_PAGE)
         .filter_map(|c| {
             let absolute = text::join(url, &text::unescape(c[1].trim()))?;
             if !absolute.starts_with("http://") && !absolute.starts_with("https://") {
@@ -420,7 +392,7 @@ pub fn links(url: &str, markup: &str) -> Vec<(String, String, String)> {
             if host.is_empty() || crate::route::SEARCH_HOSTS.contains(&host.as_str()) {
                 return None;
             }
-            let anchor = text::take(&text::text_of(&c[2]), prompts::ANCHOR_CHARS);
+            let anchor = text::text_of(&c[2]);
             (!anchor.is_empty()).then_some((host, target, anchor))
         })
         .collect()
@@ -459,11 +431,12 @@ struct Planted {
 /// The world's pages: its seed, its store and what makes new pages.
 pub struct Pages {
     pub(crate) observation:
-        Arc<Mutex<Option<tokio::sync::mpsc::Sender<crate::observation::Observation>>>>,
+        Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<crate::observation::Observation>>>>,
     seed: Seed,
     maker: Option<Maker>,
     prefetch: usize,
-    live_calls: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    /// An in-memory world driven interactively from the demo page.
+    interactive: bool,
     store: Mutex<Store>,
     writing: Mutex<tokio::sync::watch::Sender<bool>>,
     copied: Option<Arc<copied::Corpus>>,
@@ -475,9 +448,6 @@ pub struct Pages {
     queries: std::sync::atomic::AtomicU64,
     locks: Locks,
 }
-
-/// The most form bytes a search reads from a POST.
-pub const MAX_FORM_BYTES: usize = 1 << 20;
 
 /// Planted text with its whitespace joined.
 /// Scripts, images and fonts are never made: they get a small

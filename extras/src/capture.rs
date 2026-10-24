@@ -10,9 +10,6 @@ use regex::Regex;
 use std::io;
 use url::Url;
 
-/// Maximum decoded input passed to HTML, CSS and search-response parsers.
-pub const PARSE_BYTES: usize = 2 * 1024 * 1024;
-
 /// An ordinary desktop browser identity for host side live copies.
 pub const BROWSER: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
 
@@ -48,7 +45,7 @@ pub type Observer = dyn Fn(&fictionet::Cx, &Event) + Send + Sync;
 /// URLs discovered in a response, separated by navigation and page requisites.
 #[derive(Default, Debug)]
 pub struct Links {
-    /// Navigable links. The caller enforces site and depth restrictions.
+    /// Navigable links. The caller enforces site restrictions.
     pub pages: Vec<String>,
     /// CSS, scripts, images, fonts and nested CSS requisites.
     pub assets: Vec<String>,
@@ -66,12 +63,7 @@ pub fn title(response: &warc::Response) -> io::Result<String> {
                 inside = tag.kind == TagKind::StartTag;
                 finished = !inside;
             }
-            Token::CharacterTokens(text) if inside => {
-                if title.len() + text.len() > 4096 {
-                    return Err(io::Error::other("document title exceeds size limit"));
-                }
-                title.push_str(&text);
-            }
+            Token::CharacterTokens(text) if inside => title.push_str(&text),
             _ => {}
         }
         Ok(())
@@ -89,7 +81,7 @@ pub fn references(url: &str, response: &warc::Response) -> io::Result<Vec<String
     {
         return Ok(Vec::new());
     }
-    let decoded = response.decoded_with_limit(PARSE_BYTES)?;
+    let decoded = response.decoded()?;
     let dom = kuchiki::parse_html().one(String::from_utf8_lossy(&decoded).into_owned());
     for node in dom
         .select("nav, header, footer, aside, [role=navigation]")
@@ -110,8 +102,7 @@ pub fn references(url: &str, response: &warc::Response) -> io::Result<Vec<String
         .or_else(|_| dom.select_first("main"));
     let content = article.map(|node| node.as_node().clone()).unwrap_or(dom);
     let mut seen = std::collections::HashSet::new();
-    let mut references = Vec::new();
-    for url in content
+    Ok(content
         .select("a[href], area[href]")
         .unwrap()
         .filter_map(|node| {
@@ -119,23 +110,13 @@ pub fn references(url: &str, response: &warc::Response) -> io::Result<Vec<String
             warc::key(url.as_str())
         })
         .filter(|url| url != original.as_str() && seen.insert(url.clone()))
-    {
-        if references.len() >= 2048 || url.len() > 8192 {
-            return Err(io::Error::other("capture discovery exceeds link limit"));
-        }
-        references.push(url);
-    }
-    Ok(references)
+        .collect())
 }
 
 fn link(base: &Url, value: &str, out: &mut Vec<String>) -> io::Result<()> {
-    let Some(url) = base.join(value).ok().and_then(|u| warc::key(u.as_str())) else {
-        return Ok(());
-    };
-    if out.len() >= 2048 || url.len() > 8192 {
-        return Err(io::Error::other("capture discovery exceeds link limit"));
+    if let Some(url) = base.join(value).ok().and_then(|u| warc::key(u.as_str())) {
+        out.push(url);
     }
-    out.push(url);
     Ok(())
 }
 
@@ -193,7 +174,7 @@ pub fn links(url: &str, response: &warc::Response) -> io::Result<Links> {
     if !(content_type.starts_with("text/html") || content_type.starts_with("text/css")) {
         return Ok(links);
     }
-    let decoded = response.decoded_with_limit(PARSE_BYTES)?;
+    let decoded = response.decoded()?;
     let text = String::from_utf8_lossy(&decoded);
     if content_type.starts_with("text/css") {
         css(&text, &base, &mut links.assets)?;
@@ -218,9 +199,6 @@ pub fn links(url: &str, response: &warc::Response) -> io::Result<Links> {
         Ok(())
     })?;
     let base = document_base.unwrap_or(base);
-    if base.as_str().len() > 8192 {
-        return Err(io::Error::other("capture discovery exceeds link limit"));
-    }
     let mut picture = 0usize;
     let mut style = None;
     tokens(&text, |token| {

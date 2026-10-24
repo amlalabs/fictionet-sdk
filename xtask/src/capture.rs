@@ -55,34 +55,13 @@ const REPOSITORIES: &[(&str, &str)] = &[
 
 struct Batch(std::path::PathBuf);
 
-#[derive(Clone, Copy)]
-enum Material {
-    Page,
-    Distribution,
-}
-
-impl Material {
-    fn bytes(self) -> usize {
-        match self {
-            Self::Page => fictionet_extras::warc::Response::DECODED_BYTES,
-            Self::Distribution => 256 * 1024 * 1024,
-        }
-    }
-}
-
 impl Drop for Batch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
-async fn capture_cached(
-    root: &Path,
-    name: &str,
-    urls: &[String],
-    requisites: bool,
-    material: Material,
-) -> Result {
+async fn capture_cached(root: &Path, name: &str, urls: &[String], requisites: bool) -> Result {
     std::fs::create_dir_all(root)?;
     let archive = if std::fs::read_dir(root)?
         .any(|entry| entry.is_ok_and(|entry| entry.path().to_string_lossy().ends_with(".warc.gz")))
@@ -106,16 +85,10 @@ async fn capture_cached(
             pending.push(url.clone());
         }
     }
-    download(root, name, &pending, requisites, material).await
+    download(root, name, &pending, requisites).await
 }
 
-async fn download(
-    root: &Path,
-    name: &str,
-    urls: &[String],
-    requisites: bool,
-    material: Material,
-) -> Result {
+async fn download(root: &Path, name: &str, urls: &[String], requisites: bool) -> Result {
     if urls.is_empty() {
         return Ok(());
     }
@@ -149,8 +122,8 @@ async fn download(
                 .send()
                 .await
                 .map_err(std::io::Error::other)?;
-            let mut response = capture::receive(response, material.bytes()).await?;
-            response.body = response.decoded_with_limit(material.bytes())?.into();
+            let mut response = capture::receive(response).await?;
+            response.body = response.decoded()?.into();
             response.headers.remove(http::header::CONTENT_ENCODING);
             response
                 .headers
@@ -343,7 +316,6 @@ async fn missing_pages(root: &Path, sources: &[String], required: &[String]) -> 
             "missing-assets",
             &assets.into_iter().collect::<Vec<_>>(),
             true,
-            Material::Page,
         ),
     )
     .await
@@ -376,15 +348,7 @@ async fn documents(root: &Path, name: &str, urls: &[String]) -> Result {
             let name = name.to_owned();
             let url = url.clone();
             jobs.spawn(async move {
-                match download(
-                    &root,
-                    &name,
-                    std::slice::from_ref(&url),
-                    false,
-                    Material::Page,
-                )
-                .await
-                {
+                match download(&root, &name, std::slice::from_ref(&url), false).await {
                     Err(error)
                         if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
                             matches!(
@@ -437,7 +401,7 @@ fn github_api(value: &str) -> Option<String> {
 
 async fn research(root: &Path, sources: &[String]) -> Result {
     // New batches sort after the original archives to supersede stale errors.
-    capture_cached(root, "zz-research", sources, true, Material::Page).await?;
+    capture_cached(root, "zz-research", sources, true).await?;
     documents(root, "zz-research", sources).await?;
     let mut archive = Archive::directory(root)?;
     let mut frontier = sources.to_vec();
@@ -632,14 +596,7 @@ pub async fn run(downloads: &Path, python: Option<&Path>) -> Result {
         .iter()
         .map(|(repo, _)| format!("https://api.github.com/repos/{repo}"))
         .collect::<Vec<_>>();
-    capture_cached(
-        &staged_corpus,
-        "zz-github-api",
-        &repositories,
-        false,
-        Material::Page,
-    )
-    .await?;
+    capture_cached(&staged_corpus, "zz-github-api", &repositories, false).await?;
     let archive = Archive::directory(&staged_corpus)?;
     for url in &repositories {
         verify(&archive, url)?;
@@ -761,14 +718,7 @@ pub async fn run(downloads: &Path, python: Option<&Path>) -> Result {
             }
         }
     }
-    capture_cached(
-        &packages,
-        "distributions",
-        &urls,
-        false,
-        Material::Distribution,
-    )
-    .await?;
+    capture_cached(&packages, "distributions", &urls, false).await?;
     let sources = Archive::directory(&packages)?
         .urls()
         .map(str::to_owned)

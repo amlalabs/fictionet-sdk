@@ -9,10 +9,7 @@ use http::{
 };
 use serde::Serialize;
 use std::net::IpAddr;
-use tokio::sync::mpsc::Sender;
-
-/// Pending facts, including one reserved failure notification.
-pub const OBSERVATION_CAPACITY: usize = 256;
+use tokio::sync::mpsc::UnboundedSender;
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -88,9 +85,6 @@ pub enum SearchObs {
         action: RevisionAction,
         reason: String,
     },
-    ObservationFailed {
-        reason: String,
-    },
     NoRoute {
         from: IpAddr,
         to: IpAddr,
@@ -107,12 +101,11 @@ pub enum WriterTarget {
     Page { url: String },
 }
 
-/// How the world recovered from a disclosure before serving content.
+/// What the world did with a writer's answer before serving content.
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RevisionAction {
     Rejected,
-    LocalRendering,
 }
 
 /// The reason a request entered the real network.
@@ -225,7 +218,7 @@ pub(crate) struct RequestContext<'a> {
 
 impl Pages {
     /// Installs this world's concrete observation destination. No SDK observer is used.
-    pub fn observe(&self, destination: Sender<Observation>) {
+    pub fn observe(&self, destination: UnboundedSender<Observation>) {
         *self.observation.lock().unwrap() = Some(destination);
         let destination = self.observation.clone();
         self.observe_live(std::sync::Arc::new(move |cx, event| {
@@ -387,11 +380,10 @@ impl Pages {
 }
 
 fn report(
-    destination: &std::sync::Mutex<Option<Sender<Observation>>>,
+    destination: &std::sync::Mutex<Option<UnboundedSender<Observation>>>,
     cx: &fictionet::Cx,
     mut fact: SearchObs,
 ) {
-    let too_large = serde_json::to_vec(&fact).map_or(true, |bytes| bytes.len() > 256 * 1024);
     match &mut fact {
         SearchObs::Search { results, .. } | SearchObs::Tool { results, .. } => {
             for hit in results {
@@ -437,27 +429,11 @@ fn report(
     {
         *target = redact_url(target);
     }
-    let mut destination = destination.lock().unwrap();
-    let Some(sender) = destination.as_ref() else {
-        return;
-    };
-    let reason = if sender.capacity() <= 1 {
-        Some("Observation queue exceeded its capacity")
-    } else if too_large {
-        Some("Observation exceeded its byte limit")
-    } else {
-        None
-    };
-    let failed = reason.is_some();
-    let fact = reason.map_or(fact, |reason| SearchObs::ObservationFailed {
-        reason: reason.into(),
-    });
-    let _ = sender.try_send(Observation {
-        at_ms: cx.now().since_start().as_millis() as u64,
-        fact,
-    });
-    if failed {
-        *destination = None;
+    if let Some(sender) = destination.lock().unwrap().as_ref() {
+        let _ = sender.send(Observation {
+            at_ms: cx.now().since_start().as_millis() as u64,
+            fact,
+        });
     }
 }
 

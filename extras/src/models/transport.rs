@@ -8,8 +8,6 @@ use http_body::{Body as HttpBody, Frame};
 
 mod text;
 
-pub(super) const RESPONSE_LIMIT: usize = 32 * 1024 * 1024;
-
 /// Provider response framing, shared by sanitization and its consumers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Framing {
@@ -145,7 +143,8 @@ pub(super) fn sanitize(
             pending: Vec::new(),
             streaming: framing == Framing::Events,
             records: Vec::new(),
-            lines: Stream::new(sse::RawLines::with_limit(RESPONSE_LIMIT)),
+            // The codec clamps the line length to its own buffer maximum.
+            lines: Stream::new(sse::RawLines::with_limit(usize::MAX)),
             event: Vec::new(),
             done: false,
         })
@@ -304,39 +303,6 @@ impl HttpBody for Scrubbed {
                             }
                         } else {
                             self.pending.extend_from_slice(&bytes);
-                        }
-                        let held: usize = self
-                            .records
-                            .iter()
-                            .map(|record| match record {
-                                Record::Json(value, metadata) => {
-                                    value.to_string().len() + metadata.len()
-                                }
-                                Record::Raw(bytes) => bytes.len(),
-                            })
-                            .sum();
-                        let event_bytes: usize = self.event.len()
-                            * std::mem::size_of::<sse::Line>()
-                            + self
-                                .event
-                                .iter()
-                                .map(|line| match line {
-                                    sse::Line::Data(text)
-                                    | sse::Line::Event(text)
-                                    | sse::Line::Id(text)
-                                    | sse::Line::Comment(text)
-                                    | sse::Line::Retry(text) => text.len(),
-                                    sse::Line::Ignored { name, value } => name.len() + value.len(),
-                                    sse::Line::Empty => 0,
-                                })
-                                .sum::<usize>();
-                        if self.pending.len() + held + event_bytes + self.lines.held()
-                            > RESPONSE_LIMIT
-                        {
-                            self.done = true;
-                            return Poll::Ready(Some(Err(Error::msg(
-                                "Provider response exceeds sanitization limit",
-                            ))));
                         }
                         let safe = self.ready(false);
                         if !safe.is_empty() {

@@ -230,7 +230,8 @@ impl Authenticated {
         let status = response.status().as_u16();
         let response = transport::sanitize(response, self.key.secret.clone())
             .map_err(|e| self.key.redact(&e.to_string()))?;
-        let bytes = http_body_util::Limited::new(response.into_body(), transport::RESPONSE_LIMIT)
+        let bytes = response
+            .into_body()
             .collect()
             .await
             .map_err(|e| self.key.redact(&e.to_string()))?
@@ -319,12 +320,12 @@ impl Transport for Https {
         Box::pin(async move {
             let response = self.incoming(cx, headers, body).await?;
             let status = response.status().as_u16();
-            let body =
-                http_body_util::Limited::new(response.into_body(), transport::RESPONSE_LIMIT)
-                    .collect()
-                    .await
-                    .map_err(|e| e.to_string())?
-                    .to_bytes();
+            let body = response
+                .into_body()
+                .collect()
+                .await
+                .map_err(|e| e.to_string())?
+                .to_bytes();
             Ok((status, body.to_vec()))
         })
     }
@@ -414,83 +415,6 @@ mod tests {
         client
             .check_document("application/json", r#"{"value":"public"}"#)
             .unwrap();
-    }
-
-    #[test]
-    fn authenticated_client_bounds_the_incoming_body_before_collection() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        struct Frames(Arc<AtomicUsize>, bool);
-        impl http_body::Body for Frames {
-            type Data = Bytes;
-            type Error = Error;
-            fn poll_frame(
-                self: Pin<&mut Self>,
-                _: &mut std::task::Context<'_>,
-            ) -> std::task::Poll<Option<fictionet::Result<http_body::Frame<Bytes>>>> {
-                let n = self.0.fetch_add(1, Ordering::SeqCst);
-                std::task::Poll::Ready((n < 64).then(|| {
-                    let bytes = if self.1 {
-                        format!("data: {}\n\n", serde_json::json!({"type":"content_block_delta", "index":0, "delta":{"type":"text_delta", "text":"a".repeat(1024 * 1024)}})).into_bytes()
-                    } else { vec![b' '; 1024 * 1024] };
-                    Ok(http_body::Frame::data(Bytes::from(bytes)))
-                }))
-            }
-        }
-        struct Streaming(Arc<AtomicUsize>, bool);
-        impl Transport for Streaming {
-            fn post<'a>(
-                &'a self,
-                _: &'a Cx,
-                _: Vec<(&'static str, String)>,
-                _: Vec<u8>,
-            ) -> Post<'a> {
-                panic!("buffered transport must not run")
-            }
-            fn incoming<'a>(
-                &'a self,
-                _: &'a Cx,
-                _: Vec<(&'static str, String)>,
-                _: Vec<u8>,
-            ) -> Incoming<'a> {
-                Box::pin(async move {
-                    let mut response = Response::new(Body::new(Frames(self.0.clone(), self.1)));
-                    if self.1 {
-                        response
-                            .headers_mut()
-                            .insert("content-type", "text/event-stream".parse().unwrap());
-                    }
-                    Ok(response)
-                })
-            }
-        }
-        for streaming in [false, true] {
-            let frames = Arc::new(AtomicUsize::new(0));
-            let counted = frames.clone();
-            fictionet::block_on(fictionet::lab(
-                fictionet::Seed::from_u64(6),
-                move |cx| async move {
-                    let client = Authenticated::new(
-                        Provider::Anthropic,
-                        Key::new("provider key", Some("private-key".into())).unwrap(),
-                        Arc::new(Streaming(counted, streaming)),
-                    );
-                    assert!(
-                        client
-                            .post(&cx, vec![])
-                            .await
-                            .unwrap_err()
-                            .contains("limit")
-                    );
-                    Ok(())
-                },
-            ))
-            .unwrap();
-            if !streaming {
-                assert_eq!(frames.load(Ordering::SeqCst), 33);
-            } else {
-                assert!(frames.load(Ordering::SeqCst) < 64);
-            }
-        }
     }
 
     #[tokio::test]

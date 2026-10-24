@@ -21,19 +21,11 @@ use super::text::split_url;
 use fictionet_extras::search::Result as Listed;
 use serde::{Deserialize, Serialize};
 
-/// Link candidates examined per source page, before filtering.
-pub const LINKS_PER_PAGE: usize = 80;
-/// Characters kept from a link's normalized anchor text.
-pub const ANCHOR_CHARS: usize = 160;
-/// Link mentions shown per target page; search mentions are never capped.
-pub const LINK_MENTIONS_PER_PAGE: usize = 8;
-
 /// An answer the world cannot read, and why.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Unreadable {
     Format(String),
     Disclosure(&'static str),
-    Incomplete,
     Credential,
     Content(String),
     Chronology(String),
@@ -43,9 +35,6 @@ impl std::fmt::Display for Unreadable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Credential => f.write_str("provider response contained a credential"),
-            Self::Incomplete => {
-                f.write_str("answer stopped at its output limit; write a shorter complete answer")
-            }
             Self::Format(reason) | Self::Content(reason) | Self::Chronology(reason) => {
                 f.write_str(reason)
             }
@@ -197,7 +186,6 @@ not just an introduction or an overview. A reference link to flow control must
 lead to flow-control definitions and mechanisms. Use roughly 900 to 1100 words
 for technical specifications, 700 to 900 for scientific papers, and 350 to 550
 for ordinary articles, as appropriate.
-Finish the document, including references, within the output budget.
 Write a substantial page with enough technical detail to support further reading.
 Preserve the requested document's scope. Shared facts constrain what it says;
 they do not require a general reference page to retell a particular incident.
@@ -390,7 +378,7 @@ SITE_CSS: the site's complete stylesheet on one line, no fences or style tags
 Write the stylesheet once for this host, with a distinctive design suited to its
 kind. Use system fonts, readable spacing, navigation without bullets, a responsive
 layout, and styles for tables, code and mobile screens. No scripts, external
-imports, remote fonts or images. Keep it under 400 tokens. The page links
+imports, remote fonts or images. The page links
 /static/css/main.css. Style the shared HTML structure described below:
 ";
 
@@ -417,7 +405,7 @@ pub fn stylesheet(seed: &Seed, host: &str, profile: &Profile) -> (String, String
             "Write only CSS for {host}, the site {} of kind {}. No fences or style tags. \
          Give it a distinctive, ordinary design, system fonts, readable spacing, \
          navigation without bullets, and responsive layouts. No scripts, external \
-         imports, remote fonts or images. Keep it under 400 tokens.\n{SITE_LAYOUT}\n\n\
+         imports, remote fonts or images.\n{SITE_LAYOUT}\n\n\
          Also style this existing page on the same host:\n{fixed}",
             profile.name, profile.kind
         ),
@@ -438,10 +426,10 @@ fn said_before(host_pages: &[HostPage], claims: &[Claim]) -> String {
     let mut out = Vec::new();
     if !host_pages.is_empty() {
         out.push("Pages this site already has:".to_owned());
-        for p in host_pages.iter().take(20) {
+        for p in host_pages {
             let mut line = format!("- {} \"{}\"", p.url, p.title);
             if !p.claims.is_empty() {
-                let shown: Vec<_> = p.claims.iter().take(4).map(ToString::to_string).collect();
+                let shown: Vec<_> = p.claims.iter().map(ToString::to_string).collect();
                 line.push_str(&format!(": {}", shown.join("; ")));
             }
             out.push(line);
@@ -473,7 +461,6 @@ pub fn search(
 ) -> (String, String) {
     let known: Vec<_> = super::make::rank(known, query)
         .into_iter()
-        .take(25)
         .map(|k| {
             let mut line = format!("- {} \"{}\"", k.url, k.title);
             if !k.snippet.is_empty() {
@@ -541,27 +528,8 @@ pub fn expected_type(url: &str) -> Option<&'static str> {
     }
 }
 
-/// All search mentions and the first [`LINK_MENTIONS_PER_PAGE`] link
-/// mentions, in their recorded order. The page prompt and the snippet check
-/// both use this selection.
-pub fn asked_mentions(mentions: &[Mention]) -> Vec<Mention> {
-    let mut links = 0;
-    mentions
-        .iter()
-        .filter(|m| {
-            if matches!(m, Mention::Link { .. }) {
-                links += 1;
-                links <= LINK_MENTIONS_PER_PAGE
-            } else {
-                true
-            }
-        })
-        .cloned()
-        .collect()
-}
-
-/// The page prompt: system and user text. `mentions` are the selection
-/// [`asked_mentions`] makes.
+/// The page prompt: system and user text. `mentions` are every mention
+/// of the page, in their recorded order.
 pub fn page(
     seed: &Seed,
     cast: &[Person],
@@ -634,8 +602,8 @@ pub fn page(
         .map(|expected| {
             format!(
                 "It is not an HTML page: CONTENT_TYPE is {expected} and BODY is the raw file. \
-                Keep it short: the main fields, at most five entries in any list. A real \
-                project, package or thing this URL asks about exists here: answer it, not 404."
+                A real project, package or thing this URL asks about exists here: answer it, \
+                not 404."
             )
         })
         .unwrap_or_default();

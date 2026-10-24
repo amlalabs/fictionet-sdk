@@ -67,7 +67,7 @@ async fn get(url: url::Url) -> std::io::Result<warc::Response> {
         .send()
         .await
         .map_err(std::io::Error::other)?;
-    let mut response = capture::receive(response, warc::Response::DECODED_BYTES).await?;
+    let mut response = capture::receive(response).await?;
     response.body = response.decoded()?.into();
     response.headers.remove(http::header::CONTENT_ENCODING);
     response.headers.remove(http::header::TRANSFER_ENCODING);
@@ -193,10 +193,8 @@ where
             r#"(() => {{
             if (!document.title.toLowerCase().includes({required}) || !document.body?.innerText.toLowerCase().includes({required})) return null;
             const html = document.documentElement.outerHTML;
-            if (html.length > {}) throw new Error('Document exceeds capture size limit');
             return {{url:location.href, html}};
-        }})()"#,
-            warc::Response::DECODED_BYTES
+        }})()"#
         );
         loop {
             tokio::select! {
@@ -222,7 +220,6 @@ where
                         if message["result"].get("exceptionDetails").is_some() { return Err("rendered document could not be retained".into()); }
                         let value = &message["result"]["result"]["value"];
                         if let (Some(url), Some(html)) = (value["url"].as_str(), value["html"].as_str()) {
-                            if html.len() > warc::Response::DECODED_BYTES { return Err("rendered document exceeds size limit".into()); }
                             let mut response = archive.get(url)?.ok_or("rendered document has no captured response")?;
                             if !response.status.is_success() { return Err("rendered document was not a successful response".into()); }
                             response.body = html.to_owned().into();

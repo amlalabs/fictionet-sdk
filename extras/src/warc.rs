@@ -11,9 +11,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const HEADER_BYTES: usize = 64 * 1024;
-const RECORD_BYTES: usize = 256 * 1024 * 1024 + 2 * HEADER_BYTES;
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Record {
     file: PathBuf,
@@ -42,18 +39,9 @@ pub struct Response {
 }
 
 impl Response {
-    /// Maximum decoded representation retained for replay or text consumers.
-    pub const DECODED_BYTES: usize = 32 * 1024 * 1024;
-
-    /// Decode representation compression with a bounded output allocation.
+    /// Decode representation compression.
     pub fn decoded(&self) -> io::Result<Vec<u8>> {
-        self.decoded_with_limit(Self::DECODED_BYTES)
-    }
-
-    /// Decode at most `limit` bytes, rejecting larger representations rather than
-    /// returning a truncated document to a parser.
-    pub fn decoded_with_limit(&self, limit: usize) -> io::Result<Vec<u8>> {
-        let reader: Box<dyn Read + '_> = match self
+        let mut reader: Box<dyn Read + '_> = match self
             .headers
             .get(http::header::CONTENT_ENCODING)
             .and_then(|v| v.to_str().ok())
@@ -67,12 +55,7 @@ impl Response {
             }
         };
         let mut bytes = Vec::new();
-        reader
-            .take(limit.saturating_add(1) as u64)
-            .read_to_end(&mut bytes)?;
-        if bytes.len() > limit {
-            return Err(invalid("decoded response exceeds size limit"));
-        }
+        reader.read_to_end(&mut bytes)?;
         Ok(bytes)
     }
 }
@@ -100,9 +83,6 @@ fn parse(bytes: &[u8]) -> io::Result<&[u8]> {
 }
 
 fn fields(head: &[u8]) -> io::Result<HashMap<String, String>> {
-    if head.len() > HEADER_BYTES {
-        return Err(invalid("WARC headers exceed size limit"));
-    }
     let head = std::str::from_utf8(head).map_err(invalid)?;
     if !head.starts_with("WARC/1.") {
         return Err(invalid("not a WARC record"));
@@ -116,36 +96,18 @@ fn fields(head: &[u8]) -> io::Result<HashMap<String, String>> {
 }
 
 fn block_length(fields: &HashMap<String, String>) -> io::Result<usize> {
-    let length = fields
+    fields
         .get("content-length")
         .ok_or_else(|| invalid("missing WARC content length"))?
         .parse::<usize>()
-        .map_err(invalid)?;
-    if length > RECORD_BYTES - HEADER_BYTES {
-        return Err(invalid("WARC block exceeds size limit"));
-    }
-    Ok(length)
-}
-
-fn bounded(reader: impl Read, limit: usize) -> io::Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    reader.take(limit as u64 + 1).read_to_end(&mut bytes)?;
-    if bytes.len() > limit {
-        return Err(invalid("WARC record exceeds size limit"));
-    }
-    Ok(bytes)
+        .map_err(invalid)
 }
 
 fn scan(reader: impl Read) -> io::Result<HashMap<String, String>> {
-    let mut reader = BufReader::new(reader.take(RECORD_BYTES as u64 + 1));
+    let mut reader = BufReader::new(reader);
     let mut head = Vec::new();
     loop {
-        let count = (&mut reader)
-            .take((HEADER_BYTES + 1 - head.len()) as u64)
-            .read_until(b'\n', &mut head)?;
-        if head.len() > HEADER_BYTES {
-            return Err(invalid("WARC headers exceed size limit"));
-        }
+        let count = reader.read_until(b'\n', &mut head)?;
         if head.ends_with(b"\r\n\r\n") {
             break;
         }
@@ -156,9 +118,6 @@ fn scan(reader: impl Read) -> io::Result<HashMap<String, String>> {
     let fields = fields(&head[..head.len() - 4])?;
     let length = block_length(&fields)?;
     let remaining = io::copy(&mut reader, &mut io::sink())? as usize;
-    if head.len() + remaining > RECORD_BYTES {
-        return Err(invalid("WARC record exceeds size limit"));
-    }
     if remaining < length {
         return Err(invalid("truncated WARC block"));
     }
@@ -179,9 +138,6 @@ impl Archive {
     /// Append one record compressed HTTP response and publish it for replay.
     /// Callers serialize writes to each file. Failed writes are rolled back.
     pub fn append(&mut self, path: &Path, url: &str, response: &Response) -> io::Result<()> {
-        if response.body.len() > RECORD_BYTES - 2 * HEADER_BYTES {
-            return Err(invalid("HTTP response exceeds archive size limit"));
-        }
         let url = key(url).ok_or_else(|| invalid("not an HTTP URL"))?;
         let mut block = format!("HTTP/1.1 {}\r\n", response.status).into_bytes();
         for (name, value) in &response.headers {
@@ -342,10 +298,8 @@ impl Archive {
         }
         let mut file = File::open(&record.file)?;
         file.seek(SeekFrom::Start(record.offset))?;
-        let bytes = bounded(
-            flate2::read::GzDecoder::new(file.take(record.length)),
-            RECORD_BYTES,
-        )?;
+        let mut bytes = Vec::new();
+        flate2::read::GzDecoder::new(file.take(record.length)).read_to_end(&mut bytes)?;
         let mut response = http_response(parse(&bytes)?)?;
         if let Some(reference) = &record.refers {
             let original = self
@@ -363,7 +317,15 @@ impl Archive {
 }
 
 fn http_response(block: &[u8]) -> io::Result<Response> {
-    let mut headers = [httparse::EMPTY_HEADER; 256];
+    // httparse fills a caller-sized header table; grow it until every header fits.
+    let mut count = 64;
+    let mut headers = loop {
+        let mut headers = vec![httparse::EMPTY_HEADER; count];
+        match httparse::Response::new(&mut headers).parse(block) {
+            Err(httparse::Error::TooManyHeaders) => count *= 2,
+            _ => break vec![httparse::EMPTY_HEADER; count],
+        }
+    };
     let mut parsed = httparse::Response::new(&mut headers);
     let offset = match parsed.parse(block).map_err(invalid)? {
         httparse::Status::Complete(offset) => offset,

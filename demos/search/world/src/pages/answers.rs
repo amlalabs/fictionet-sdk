@@ -268,62 +268,6 @@ pub fn read_page(text: &str, expected: Option<&str>, referenced: bool) -> Result
     Ok(page)
 }
 
-/// Removes isolated authoring debris from an otherwise intact HTML document.
-/// The caller reruns its complete parser, content audit and rendering checks.
-pub(super) fn repair_page(page: &mut Page) -> Result<(), Unreadable> {
-    use kuchiki::traits::TendrilSink;
-    if !page.content_type.starts_with("text/html") {
-        return Err(Unreadable::Content(
-            "no complete HTML document to repair".into(),
-        ));
-    }
-    let dom = kuchiki::parse_html().one(page.body.as_str());
-    let nodes: Vec<_> = dom.descendants().collect();
-    for node in nodes.iter().rev() {
-        if let Some(comment) = node.as_comment() {
-            if super::gives_away(&comment.borrow()).is_some() {
-                node.detach();
-            }
-        } else if let Some(element) = node.as_element() {
-            element
-                .attributes
-                .borrow_mut()
-                .map
-                .retain(|_, attribute| super::gives_away(&attribute.value).is_none());
-            if node.children().all(|child| child.as_element().is_none())
-                && super::text::validate_page("text/html", node.to_string().as_bytes()).is_err()
-            {
-                node.detach();
-            }
-        }
-    }
-    let body = dom
-        .select_first("body")
-        .map_err(|_| Unreadable::Content("missing document body".into()))?;
-    let retained = body
-        .as_node()
-        .children()
-        .map(|node| node.to_string())
-        .collect::<String>();
-    let substantive = body.as_node().descendants().any(|node| {
-        node.as_element().is_some_and(|e| {
-            matches!(
-                e.name.local.as_ref(),
-                "p" | "li" | "pre" | "table" | "section"
-            )
-        }) && !node.text_contents().trim().is_empty()
-    });
-    if !substantive {
-        return Err(Unreadable::Content(
-            "repair would leave no document content".into(),
-        ));
-    }
-    super::text::validate_page(&page.content_type, retained.as_bytes())
-        .map_err(Unreadable::Content)?;
-    page.body = retained;
-    Ok(())
-}
-
 /// Calendar dates in publication metadata and document prose.
 pub(super) fn dates(text: &str) -> Vec<time::Date> {
     static DATES: OnceLock<Regex> = OnceLock::new();

@@ -81,7 +81,7 @@ body.agent-expanded .agent{width:62vw}
 .activity-row>:nth-child(3){text-align:right;color:var(--faint)}
 .activity-row>:last-child{grid-column:2/4}
 .activity-row.request{color:var(--blue)}
-.activity-row.no_route,.activity-row.observation_failed{color:var(--red)}
+.activity-row.no_route{color:var(--red)}
 .activity-row.model_call,.activity-row.tool,.activity-row.egress{color:var(--orange)}
 .timeline{grid-row:3;min-width:0;border-top:1px solid var(--line);display:grid;grid-template-columns:28px 64px minmax(0,1fr) 54px;gap:9px;align-content:center;align-items:center;padding:10px 20px}
 .timeline>span{font:11px var(--mono);color:var(--muted)}

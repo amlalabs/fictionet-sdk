@@ -9,8 +9,6 @@ use std::{
     },
     path::PathBuf,
     process::{Command, Stdio},
-    sync::atomic::{AtomicUsize, Ordering},
-    time::{Duration, Instant},
 };
 
 impl Pages {
@@ -62,10 +60,7 @@ impl Pages {
         *backend_request.uri_mut() = request.uri.clone();
         *backend_request.headers_mut() = request.headers.clone();
         let response = cx
-            .race(
-                Some(cx.now() + Duration::from_secs(30)),
-                backend(repository.join(endpoint), backend_request),
-            )
+            .race(None, backend(repository.join(endpoint), backend_request))
             .await;
         Some(match response {
             Ok(Ok(response)) => replay(Ok(Some(response))),
@@ -121,26 +116,12 @@ async fn backend(
             command.env(variable, value);
         }
     }
-    static ACTIVE: AtomicUsize = AtomicUsize::new(0);
-    struct Permit;
-    impl Drop for Permit {
-        fn drop(&mut self) {
-            ACTIVE.fetch_sub(1, Ordering::SeqCst);
-        }
-    }
-    ACTIVE
-        .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-            (n < 4).then_some(n + 1)
-        })
-        .map_err(|_| std::io::Error::other("Git backend is busy"))?;
-    let permit = Permit;
     command.process_group(0);
     let process = Backend(command.spawn()?);
     let (cancel, stopped) = UnixStream::pair()?;
     let (send, receive) = tokio::sync::oneshot::channel();
     std::thread::spawn(move || {
-        let _permit = permit;
-        let _ = send.send(process.exchange(&body, stopped, Duration::from_secs(30)));
+        let _ = send.send(process.exchange(&body, stopped));
     });
     // Dropping the future closes the socket and wakes the owned process worker.
     let output = receive
@@ -193,12 +174,7 @@ impl Drop for Backend {
     }
 }
 impl Backend {
-    fn exchange(
-        mut self,
-        body: &[u8],
-        cancelled: UnixStream,
-        timeout: Duration,
-    ) -> std::io::Result<Vec<u8>> {
+    fn exchange(mut self, body: &[u8], cancelled: UnixStream) -> std::io::Result<Vec<u8>> {
         let input = self.0.stdin.take().expect("piped backend input");
         let mut output = self.0.stdout.take().expect("piped backend output");
         for fd in [input.as_raw_fd(), output.as_raw_fd()] {
@@ -211,14 +187,7 @@ impl Backend {
         let mut written = 0;
         let mut bytes = Vec::new();
         let mut eof = false;
-        let deadline = Instant::now() + timeout;
         loop {
-            if Instant::now() >= deadline {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "Git backend timed out",
-                ));
-            }
             let mut poll = [
                 libc::pollfd {
                     fd: cancelled.as_raw_fd(),
@@ -277,12 +246,7 @@ impl Backend {
                             return finished(status, bytes);
                         }
                     }
-                    Ok(n) => {
-                        if bytes.len() + n > PACKAGE_BYTES {
-                            return Err(std::io::Error::other("Git response exceeds size limit"));
-                        }
-                        bytes.extend_from_slice(&chunk[..n]);
-                    }
+                    Ok(n) => bytes.extend_from_slice(&chunk[..n]),
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
                     Err(error) => return Err(error),
                 }
@@ -304,4 +268,3 @@ fn finished(status: std::process::ExitStatus, bytes: Vec<u8>) -> std::io::Result
         Err(std::io::Error::other("Git backend was killed"))
     }
 }
-

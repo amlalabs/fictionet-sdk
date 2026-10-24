@@ -18,8 +18,6 @@ pub enum Cache {
     Planted,
     /// Absent from storage during replay.
     Missing,
-    /// Blocked by the generation budget.
-    Budget,
     /// An absent or unrecognized cache value.
     #[default]
     #[serde(other)]

@@ -7,7 +7,6 @@ use fictionet_extras::{crawl::Index, warc::Archive};
 use std::{path::Path, time::Instant};
 
 // Captured distributions and repository packs can exceed a public web response.
-const PACKAGE_BYTES: usize = 256 * 1024 * 1024;
 const INDEX_VERSION: u32 = 4;
 
 pub(super) struct Corpus {
@@ -216,7 +215,7 @@ impl Pages {
                     .map(|mut response| {
                         // Installers hash the distribution's identity bytes. Their
                         // requests need not accept the capture's content encoding.
-                        response.body = response.decoded_with_limit(PACKAGE_BYTES)?.into();
+                        response.body = response.decoded()?.into();
                         response.headers.remove(http::header::CONTENT_ENCODING);
                         response
                             .headers

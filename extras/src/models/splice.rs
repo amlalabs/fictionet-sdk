@@ -355,7 +355,8 @@ async fn failed(refused: Response<Body>, output: &mut Output) -> fictionet::Resu
         529 => "overloaded_error",
         _ => "api_error",
     };
-    let bytes = http_body_util::Limited::new(refused.into_body(), 64 * 1024)
+    let bytes = refused
+        .into_body()
         .collect()
         .await
         .map(|body| body.to_bytes())
@@ -548,7 +549,7 @@ async fn run(
     let mut uses: std::collections::HashMap<String, u64> = Default::default();
     let mut output_tokens = 0u64;
     let mut searches = 0u64;
-    for _ in 0..16 {
+    loop {
         let turn = read(response, &model, &tools, output).await?;
         output_tokens += turn.usage["output_tokens"].as_u64().unwrap_or(0);
         let mut results = Vec::new();
@@ -606,7 +607,6 @@ async fn run(
             return Ok(Some(response));
         }
     }
-    Err(Error::msg("Server tool turn limit reached"))
 }
 async fn answer(
     model: &Model,
@@ -626,7 +626,7 @@ async fn answer(
     let Some((id, _, input)) = block.tool() else {
         return error("invalid_input");
     };
-    if used > settings.max_uses.unwrap_or(8) {
+    if settings.max_uses.is_some_and(|max| used > max) {
         return error("max_uses_exceeded");
     }
     let domains = settings.domains();

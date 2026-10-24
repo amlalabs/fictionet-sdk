@@ -24,21 +24,11 @@ pub enum Meta {
     Planted { title: String },
     /// A page the store does not hold, while nothing new is made.
     Missing,
-    /// A list or page the generation budget left unmade.
-    Budget(Asked),
-    /// The generator or the store failed. `error` is cut at 400 characters.
+    /// The generator or the store failed.
     Error {
         error: String,
         usage: Option<Box<Usage>>,
     },
-}
-
-/// What a stopped answer was for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Asked {
-    Search,
-    Page,
 }
 
 /// A result list.

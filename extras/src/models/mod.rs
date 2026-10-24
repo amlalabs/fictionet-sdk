@@ -761,16 +761,13 @@ impl Model {
                 .body(Body::from(body.clone()))?);
         }
         let (mut parts, body) = request.into_parts();
-        let bytes = match http_body_util::Limited::new(body, 32 * 1024 * 1024)
-            .collect()
-            .await
-        {
+        let bytes = match body.collect().await {
             Ok(body) => body.to_bytes(),
             Err(_) => {
                 return Ok(self.provider.error(
-                    413,
-                    "request_too_large",
-                    "Model request is too large or unreadable",
+                    400,
+                    "invalid_request_error",
+                    "Model request is unreadable",
                 ));
             }
         };
@@ -783,14 +780,14 @@ impl Model {
             Some("zstd") => {
                 use std::io::Read;
                 let decoded =
-                    zstd::stream::read::Decoder::new(bytes.as_ref()).and_then(|decoder| {
+                    zstd::stream::read::Decoder::new(bytes.as_ref()).and_then(|mut decoder| {
                         let mut data = Vec::new();
-                        decoder.take(32 * 1024 * 1024 + 1).read_to_end(&mut data)?;
+                        decoder.read_to_end(&mut data)?;
                         Ok(data)
                     });
                 match decoded {
-                    Ok(data) if data.len() <= 32 * 1024 * 1024 => Bytes::from(data),
-                    _ => {
+                    Ok(data) => Bytes::from(data),
+                    Err(_) => {
                         return Ok(self.provider.error(
                             400,
                             "invalid_request_error",

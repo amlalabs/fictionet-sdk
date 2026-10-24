@@ -12,11 +12,7 @@ impl Pages {
         target: &str,
         form: Option<&[u8]>,
     ) -> Response {
-        let form = if method == "POST" {
-            form.map(|f| &f[..f.len().min(MAX_FORM_BYTES)])
-        } else {
-            None
-        };
+        let form = if method == "POST" { form } else { None };
         let route = route(host, target, form);
         self.handle_route(cx, method, host, target, route).await
     }
@@ -109,7 +105,7 @@ impl Pages {
         route: Route,
     ) -> Response {
         self.during_source(self.answer_route(cx, method, host, target, route), || {
-            Stop::store(std::io::Error::other("Page source changed")).response(Asked::Page)
+            Stop::store(std::io::Error::other("Page source changed")).response()
         })
         .await
     }
@@ -314,7 +310,7 @@ impl Pages {
                 error: reason.to_string(),
                 usage: None,
             }
-            .response(Asked::Page);
+            .response();
         }
         response
     }
@@ -413,7 +409,7 @@ impl Pages {
                     return planted;
                 }
                 if let Some(fixed) = self.seed.fixed_for(host, target)
-                    && (self.live_calls.is_none()
+                    && (!self.interactive
                         || self.copied_active.load(std::sync::atomic::Ordering::SeqCst))
                 {
                     return self.fixed(cx, fixed).await;
@@ -430,7 +426,7 @@ impl Pages {
                             vec![],
                             Meta::Asset,
                         ),
-                        Err(stop) => stop.response(Asked::Page),
+                        Err(stop) => stop.response(),
                     };
                 }
                 if let Some(asset) = static_asset(path) {
@@ -445,12 +441,12 @@ impl Pages {
         let (host, target) = (fixed.host.as_str(), fixed.target.as_str());
         let lock = match self.locks.lock(cx, page_key(host, target)).await {
             Ok(lock) => lock,
-            Err(error) => return Stop::store(error).response(Asked::Page),
+            Err(error) => return Stop::store(error).response(),
         };
         if self.generating()
             && let Err(stop) = self.site_stylesheet(cx, host).await
         {
-            return stop.response(Asked::Page);
+            return stop.response();
         }
         let stored = self.store().page(host, target).cloned();
         let (record, made) = match stored {
@@ -484,7 +480,7 @@ impl Pages {
                     .writing_store()
                     .and_then(|mut store| store.insert_page(record.clone()).map_err(Stop::store));
                 if let Err(stop) = inserted {
-                    return stop.response(Asked::Page);
+                    return stop.response();
                 }
                 (record, true)
             }

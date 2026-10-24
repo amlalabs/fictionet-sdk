@@ -6,7 +6,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use crate::pages::{MAX_FORM_BYTES, Pages};
+use crate::pages::Pages;
 use crate::route::{Route, route};
 use bytes::Bytes;
 use fictionet::stdlib::web::{self, Body};
@@ -43,45 +43,11 @@ impl Handler {
             .cloned()
             .ok_or_else(|| fictionet::Error::msg("request without a web::Target"))?;
         let (parts, body) = request.into_parts();
-        let body = match http_body_util::Limited::new(body, MAX_FORM_BYTES)
+        let body = body
             .collect()
             .await
-        {
-            Ok(body) => body.to_bytes(),
-            Err(error)
-                if error
-                    .downcast_ref::<http_body_util::LengthLimitError>()
-                    .is_some() =>
-            {
-                let answer = crate::pages::Response::new(
-                    413,
-                    "text/plain",
-                    "Request body too large",
-                    Vec::new(),
-                    crate::pages::Meta::Missing,
-                );
-                self.pages.report_response(
-                    &self.fcx,
-                    crate::observation::RequestContext {
-                        started,
-                        scheme: &target.scheme,
-                        host: &target.host.parse()?,
-                        method: &parts.method,
-                        path: parts
-                            .uri
-                            .path_and_query()
-                            .unwrap_or(&http::uri::PathAndQuery::from_static("/")),
-                        source: self.pages.source(),
-                        headers: parts.headers,
-                    },
-                    &answer,
-                );
-                return Ok(Response::builder()
-                    .status(StatusCode::PAYLOAD_TOO_LARGE)
-                    .body(Full::new(Bytes::from_static(b"Request body too large")))?);
-            }
-            Err(error) => return Err(fictionet::Error::msg(error)),
-        };
+            .map_err(fictionet::Error::msg)?
+            .to_bytes();
         let form = (parts.method == http::Method::POST
             && parts
                 .headers
