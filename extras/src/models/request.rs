@@ -712,7 +712,15 @@ pub(super) struct ModelName(String);
 impl<'de> Deserialize<'de> for ModelName {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let name = String::deserialize(deserializer)?;
-        if name.split(':').skip(1).any(|variant| variant == "online") || name.contains("-search-") {
+        // The model id after its vendor prefix: `perplexity/sonar-pro` is `sonar-pro`.
+        let model = name.rsplit('/').next().unwrap_or(&name);
+        // `:online` variants and `-search-` models search the web when asked;
+        // Perplexity's Sonar models search it on every call.
+        let searches_the_web = name.split(':').skip(1).any(|variant| variant == "online")
+            || name.contains("-search-")
+            || model.starts_with("sonar")
+            || model.contains("-sonar");
+        if searches_the_web {
             Err(serde::de::Error::custom(
                 "model requires external retrieval",
             ))
