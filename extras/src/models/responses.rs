@@ -51,12 +51,20 @@ fn functions() -> [Tool; 3] {
         ),
     ]
 }
+#[derive(Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WorldFunction {
+    WebSearch,
+    OpenPage,
+    FindInPage,
+}
+fn world_function(item: &Value) -> Option<WorldFunction> {
+    (item["type"] == "function_call")
+        .then(|| serde_json::from_value(item["name"].clone()).ok())
+        .flatten()
+}
 fn is_world(item: &Value) -> bool {
-    item["type"] == "function_call"
-        && matches!(
-            item["name"].as_str(),
-            Some("web_search" | "open_page" | "find_in_page")
-        )
+    world_function(item).is_some()
 }
 /// Turns the client's `web_search_call` items back into the function call
 /// and output the model saw. The world's encrypted token carries both.
@@ -150,12 +158,12 @@ pub(super) async fn serve(
         tools: serde_json::to_value(&body.tools)?,
         tool_choice: body.tool_choice.clone().unwrap_or(Value::Null),
     };
-    let mut settings = json!({});
+    let mut settings = request::WebSettings::default();
     if let Some(tools) = &mut body.tools {
         let mut rewritten = Vec::new();
         for tool in std::mem::take(tools) {
             if let Some((_, web)) = tool.web() {
-                settings = serde_json::to_value(web)?;
+                settings = web.clone();
                 rewritten.extend(functions());
             } else {
                 rewritten.push(tool);
@@ -355,30 +363,30 @@ async fn read(
 async fn answer(
     model: &Model,
     engine: &Arc<dyn Engine>,
-    settings: &Value,
+    settings: &request::WebSettings,
     include_sources: bool,
     call: &Value,
 ) -> (Value, String, u64) {
     let arguments: Value =
         serde_json::from_str(call["arguments"].as_str().unwrap_or("{}")).unwrap_or(Value::Null);
-    let text = |s: &str| arguments[s].as_str().unwrap_or("").to_owned();
     let error = |action: Value, code: &str| (action, json!({"error":code}).to_string(), 0);
-    let domains = match &settings["filters"]["allowed_domains"] {
-        allowed @ Value::Array(_) => json!({"allowed_domains":allowed}),
-        _ => json!({}),
+    let domains = settings.filters.clone().unwrap_or_default();
+    let Some(function) = world_function(call) else {
+        return error(json!({}), "invalid_input");
     };
-    match call["name"].as_str().unwrap_or("") {
-        "web_search" => {
-            let query = text("query");
+    match function {
+        WorldFunction::WebSearch => {
+            #[derive(serde::Deserialize)]
+            struct Search {
+                query: String,
+            }
+            let Ok(Search { query }) = serde_json::from_value(arguments) else {
+                return error(json!({"type":"search"}), "invalid_input");
+            };
             let mut action = json!({"type":"search","query":query,"queries":[query]});
             let Ok(found) = engine
                 .clone()
-                .search(
-                    model.cx.clone(),
-                    query.clone(),
-                    "codex_web_search",
-                    domains.clone(),
-                )
+                .search(model.cx.clone(), query.clone(), domains.clone())
                 .await
             else {
                 return error(action, "unavailable");
@@ -398,10 +406,17 @@ async fn answer(
             let count = found.len() as u64;
             (action, serde_json::to_string(&found).unwrap(), count)
         }
-        name => {
-            let url = text("url");
-            let pattern = text("pattern");
-            let action = if name == "open_page" {
+        WorldFunction::OpenPage | WorldFunction::FindInPage => {
+            #[derive(serde::Deserialize)]
+            struct Page {
+                url: String,
+                #[serde(default)]
+                pattern: String,
+            }
+            let Ok(Page { url, pattern }) = serde_json::from_value(arguments) else {
+                return error(json!({}), "invalid_input");
+            };
+            let action = if function == WorldFunction::OpenPage {
                 json!({"type":"open_page","url":url})
             } else {
                 json!({"type":"find_in_page","url":url,"pattern":pattern})
@@ -417,7 +432,7 @@ async fn answer(
             let Some(body) = tools::text(&page) else {
                 return error(action, "unsupported_content_type");
             };
-            if name == "open_page" {
+            if function == WorldFunction::OpenPage {
                 let body: String = body.chars().take(PAGE_CHARS).collect();
                 let output = json!({"url":url,"title":page.title,"text":body});
                 return (action, output.to_string(), 1);
@@ -443,7 +458,7 @@ async fn run(
     engine: Arc<dyn Engine>,
     parts: http::request::Parts,
     mut body: Responses,
-    settings: Value,
+    settings: request::WebSettings,
     mut response: Response<Body>,
     output: &mut Output,
 ) -> fictionet::Result<Option<Response<Body>>> {

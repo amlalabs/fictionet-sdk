@@ -193,14 +193,13 @@ impl fictionet_extras::models::Engine for Tools {
         self: Arc<Self>,
         cx: Cx,
         query: String,
-        source: &'static str,
-        settings: serde_json::Value,
+        settings: fictionet_extras::models::tools::Domains,
     ) -> fictionet_extras::models::tools::Answer<Vec<fictionet_extras::search::Result>> {
         Box::pin(async move {
             let result = self
                 .pages
                 .clone()
-                .search(cx.clone(), query.clone(), source, settings)
+                .search(cx.clone(), query.clone(), settings)
                 .await;
             let hits = result
                 .as_ref()

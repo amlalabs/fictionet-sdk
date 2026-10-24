@@ -925,8 +925,7 @@ impl Engine for ValidationPages {
         self: Arc<Self>,
         _: Cx,
         _: String,
-        _: &'static str,
-        _: Value,
+        _: tools::Domains,
     ) -> tools::Answer<Vec<crate::search::Result>> {
         panic!("refused before search")
     }

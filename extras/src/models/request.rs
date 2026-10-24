@@ -297,15 +297,15 @@ pub(super) struct WebSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     user_location: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    filters: Option<Value>,
+    pub(super) filters: Option<super::tools::Domains>,
     #[serde(skip_serializing_if = "Option::is_none")]
     search_context_size: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     external_web_access: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    citations: Option<Value>,
+    pub(super) citations: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    max_content_tokens: Option<u64>,
+    pub(super) max_content_tokens: Option<u64>,
 }
 impl Tool {
     fn allowed(&self, provider: super::Provider, path: &str, world: bool) -> bool {
@@ -864,5 +864,14 @@ impl Responses {
             .as_ref()
             .is_some_and(|tools| tools.iter().any(|tool| tool.web().is_some()))
             || self.input.as_ref().is_some_and(Content::has_server_history)
+    }
+}
+
+impl WebSettings {
+    pub(super) fn domains(&self) -> super::tools::Domains {
+        super::tools::Domains {
+            allowed_domains: self.allowed_domains.clone(),
+            blocked_domains: self.blocked_domains.clone(),
+        }
     }
 }

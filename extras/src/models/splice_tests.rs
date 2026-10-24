@@ -7,8 +7,7 @@ impl Engine for Pages {
         self: Arc<Self>,
         _: Cx,
         _: String,
-        _: &'static str,
-        _: Value,
+        _: tools::Domains,
     ) -> tools::Answer<Vec<crate::search::Result>> {
         self.0.fetch_add(1, Ordering::SeqCst);
         Box::pin(async {
@@ -221,7 +220,10 @@ fn search_splices_and_replays_exact_history_with_thinking() {
 
 #[test]
 fn domain_filters_match_host_boundaries() {
-    let tool = json!({"allowed_domains":["example.com"],"blocked_domains":["private.example.com"]});
+    let tool: tools::Domains = serde_json::from_value(
+        json!({"allowed_domains":["example.com"],"blocked_domains":["private.example.com"]}),
+    )
+    .unwrap();
     assert!(tools::allowed(&tool, "https://example.com/page"));
     assert!(tools::allowed(&tool, "https://www.example.com/page"));
     assert!(!tools::allowed(&tool, "https://notexample.com/page"));

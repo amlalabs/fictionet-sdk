@@ -587,8 +587,8 @@ async fn run(
                 engine.clone(),
                 &body,
                 block,
-                kind.name(),
-                &serde_json::to_value(settings)?,
+                *kind,
+                settings,
                 *count,
             )
             .await;
@@ -634,37 +634,33 @@ async fn answer(
     engine: Arc<dyn Engine>,
     body: &Messages,
     block: &Value,
-    kind: &str,
-    settings: &Value,
+    kind: WebTool,
+    settings: &WebSettings,
     used: u64,
 ) -> (Value, String) {
     let error = |code: &str| {
         (
-            json!({"type":format!("{kind}_tool_result_error"),"error_code":code}),
+            json!({"type":format!("{}_tool_result_error", kind.name()),"error_code":code}),
             json!({"error":code}).to_string(),
         )
     };
-    if used > settings["max_uses"].as_u64().unwrap_or(8) {
+    if used > settings.max_uses.unwrap_or(8) {
         return error("max_uses_exceeded");
     }
-    if kind == "web_search" {
+    let domains = settings.domains();
+    if kind == WebTool::Search {
         let Some(query) = block["input"]["query"].as_str() else {
             return error("invalid_input");
         };
         let Ok(results) = engine
-            .search(
-                model.cx.clone(),
-                query.into(),
-                "claude_web_search",
-                settings.clone(),
-            )
+            .search(model.cx.clone(), query.into(), domains.clone())
             .await
         else {
             return error("unavailable");
         };
         let results: Vec<_> = results
             .into_iter()
-            .filter(|r| tools::allowed(settings, &r.url))
+            .filter(|r| tools::allowed(&domains, &r.url))
             .collect();
         let text = serde_json::to_string(&results).unwrap();
         let mut content: Vec<Value> = results.iter().map(|r| json!({"type":"web_search_result","url":r.url,"title":r.title,"page_age":r.date})).collect();
@@ -683,7 +679,7 @@ async fn answer(
         if !serde_json::to_string(&body.messages).unwrap().contains(url) {
             return error("url_not_in_prior_context");
         }
-        if !tools::allowed(settings, url)
+        if !tools::allowed(&domains, url)
             || !tools::host(url).is_some_and(|host| engine.serves(&host))
         {
             return error("url_not_accessible");
@@ -699,7 +695,7 @@ async fn answer(
         } else {
             return error("unsupported_content_type");
         };
-        if let Some(limit) = settings["max_content_tokens"].as_u64() {
+        if let Some(limit) = settings.max_content_tokens {
             if pdf && text.len() as u64 > limit.saturating_mul(4) {
                 return error("max_content_tokens_exceeded");
             }
@@ -710,7 +706,7 @@ async fn answer(
                     .collect();
             }
         }
-        let content = json!({"type":"web_fetch_result","url":url,"retrieved_at":rfc3339(time::OffsetDateTime::now_utc()),"content":{"type":"document","source":{"type":if pdf {"base64"} else {"text"},"media_type":if pdf {"application/pdf"} else {"text/plain"},"data":text},"title":page.title,"citations":{"enabled":settings["citations"]["enabled"] == true}}});
+        let content = json!({"type":"web_fetch_result","url":url,"retrieved_at":rfc3339(time::OffsetDateTime::now_utc()),"content":{"type":"document","source":{"type":if pdf {"base64"} else {"text"},"media_type":if pdf {"application/pdf"} else {"text/plain"},"data":text},"title":page.title,"citations":{"enabled":settings.citations.as_ref().is_some_and(|citations| citations["enabled"] == true)}}});
         (content, text)
     }
 }
@@ -724,8 +720,7 @@ mod tests {
             self: Arc<Self>,
             _: Cx,
             _: String,
-            _: &'static str,
-            _: Value,
+            _: tools::Domains,
         ) -> tools::Answer<Vec<crate::search::Result>> {
             Box::pin(async { Ok(Vec::new()) })
         }
@@ -750,17 +745,17 @@ mod tests {
             let engine: Arc<dyn Engine> = Arc::new(Pages);
             let block = json!({"type":"tool_use","id":"toolu_fetch","name":"web_fetch","input":{"url":"https://example.com/page"}});
             let body: Messages = serde_json::from_value(json!({"messages":[{"role":"user","content":"Read https://example.com/page"}]}))?;
-            let settings = json!({"max_uses":1,"max_content_tokens":1});
-            let (content, text) = answer(&model, engine.clone(), &body, &block, "web_fetch", &settings, 1).await;
+            let settings: WebSettings = serde_json::from_value(json!({"max_uses":1,"max_content_tokens":1}))?;
+            let (content, text) = answer(&model, engine.clone(), &body, &block, WebTool::Fetch, &settings, 1).await;
             assert_eq!(text, "Visi");
             assert_eq!(content["content"]["source"]["data"], "Visi");
-            let (error, _) = answer(&model, engine.clone(), &serde_json::from_value(json!({"messages":[]}))?, &block, "web_fetch", &settings, 1).await;
+            let (error, _) = answer(&model, engine.clone(), &serde_json::from_value(json!({"messages":[]}))?, &block, WebTool::Fetch, &settings, 1).await;
             assert_eq!(error["error_code"], "url_not_in_prior_context");
-            let (error, _) = answer(&model, engine.clone(), &body, &block, "web_fetch", &settings, 2).await;
+            let (error, _) = answer(&model, engine.clone(), &body, &block, WebTool::Fetch, &settings, 2).await;
             assert_eq!(error["error_code"], "max_uses_exceeded");
-            let (error, _) = answer(&model, engine, &body, &block, "web_fetch", &json!({"blocked_domains":["example.com"]}), 1).await;
+            let (error, _) = answer(&model, engine, &body, &block, WebTool::Fetch, &serde_json::from_value(json!({"blocked_domains":["example.com"]}))?, 1).await;
             assert_eq!(error["error_code"], "url_not_accessible");
-            let shown = visible(block.clone(), &model, &std::collections::HashMap::from([("web_fetch".into(), (WebTool::Fetch, serde_json::from_value(settings)?))]), &mut Default::default());
+            let shown = visible(block.clone(), &model, &std::collections::HashMap::from([("web_fetch".into(), (WebTool::Fetch, settings))]), &mut Default::default());
             let mut replay = body.clone();
             replay.messages.as_mut().unwrap().push(serde_json::from_value(json!({"role":"assistant","content":[shown.clone(),{"type":"web_fetch_tool_result","tool_use_id":shown["id"],"content":content},{"type":"text","text":"Done"}]}))?);
             history(&mut replay, &model.cipher)?;
