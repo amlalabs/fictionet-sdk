@@ -67,6 +67,17 @@ impl Drop for Batch {
     }
 }
 
+fn install(path: &Path, root: &Path) -> Result {
+    std::fs::File::open(path)?.sync_all()?;
+    std::fs::hard_link(
+        path,
+        root.join(path.file_name().ok_or("missing archive name")?),
+    )?;
+    std::fs::File::open(root)?.sync_all()?;
+    std::fs::remove_file(path)?;
+    Ok(())
+}
+
 async fn capture_cached(root: &Path, name: &str, urls: &[String]) -> Result {
     download(root, name, urls).await?;
     if urls.is_empty() {
@@ -92,7 +103,7 @@ async fn download(root: &Path, name: &str, urls: &[String]) -> Result {
         .duration_since(SystemTime::UNIX_EPOCH)?
         .as_nanos();
     let staging = Batch(root.join(format!(".download-{}-{batch}", std::process::id())));
-    std::fs::create_dir_all(&staging.0)?;
+    std::fs::create_dir(&staging.0)?;
     let prefix = staging.0.join(format!("{name}-{batch}"));
     let path = prefix.with_extension("warc.gz");
     let mut archive = Archive::default();
@@ -176,9 +187,7 @@ async fn download(root: &Path, name: &str, urls: &[String]) -> Result {
         }
     }
     if path.exists() {
-        std::fs::File::open(&path)?.sync_all()?;
-        std::fs::rename(&path, root.join(path.file_name().unwrap()))?;
-        std::fs::File::open(root)?.sync_all()?;
+        install(&path, root)?;
     }
     Ok(())
 }

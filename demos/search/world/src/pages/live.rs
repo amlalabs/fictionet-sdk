@@ -98,10 +98,11 @@ impl Live {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn enqueue_in(self: &Arc<Self>, lifetime: &Arc<Lifetime>, job: Job, priority: bool) {
+    fn enqueue_in(self: &Arc<Self>, lifetime: &Arc<Lifetime>, mut job: Job, priority: bool) {
         let Some(url) = warc::key(&job.url) else {
             return;
         };
+        job.url = url.clone();
         let mut state = self.state();
         if lifetime.cancelled() || !Arc::ptr_eq(lifetime, &state.lifetime) {
             return;

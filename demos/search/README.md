@@ -211,7 +211,7 @@ rustup run 1.99.0 cargo xtask search-requisites demos/downloads/security
 ```
 
 Append URLs to that command to capture or repair individual pages. Cached pages
-are traversed too. New WARC batches are flushed and renamed into place atomically;
+are traversed too. New WARC batches are flushed and linked into place atomically;
 the original archives and URLs remain intact. Upstream HTTP errors are retained
 at their original URLs, and transport failures are reported in the capture output.
 

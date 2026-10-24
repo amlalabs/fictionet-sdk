@@ -41,6 +41,11 @@ struct Request {
     headers: std::collections::HashMap<String, String>,
 }
 
+enum Captured {
+    Cached(warc::Response),
+    Fetched(warc::Response),
+}
+
 fn method<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> std::result::Result<http::Method, D::Error> {
@@ -53,7 +58,7 @@ fn method<'de, D: serde::Deserializer<'de>>(
 /// as ordinary captures. Redirects return to interception for fresh admission.
 pub(super) async fn document(root: &Path, url: &str, title: &str) -> Result {
     capture::client(&url::Url::parse(url)?).await?;
-    render(root, url, Some(title), None, get).await.map(|_| ())
+    render(root, url, Some(title), get).await.map(|_| ())
 }
 
 pub(super) async fn requisites(root: &Path, urls: &[String]) -> Result<Vec<String>> {
@@ -92,11 +97,13 @@ pub(super) async fn requisites(root: &Path, urls: &[String]) -> Result<Vec<Strin
             let url = url.clone();
             pages.spawn(async move {
                 eprintln!("Rendering requisites: {url}");
-                render(&root, &url, None, Some(cache.clone()), move |request| {
+                render(&root, &url, None, move |request| {
                     let cache = cache.clone();
                     async move {
-                        if let Some(response) = cache.get(request.url.as_str())? {
-                            return Ok(response);
+                        if let Some(response) = cache.get(request.url.as_str())?
+                            && (response.status.is_success() || response.status.is_redirection())
+                        {
+                            return Ok(Captured::Cached(response));
                         }
                         get(request).await
                     }
@@ -112,7 +119,7 @@ pub(super) async fn requisites(root: &Path, urls: &[String]) -> Result<Vec<Strin
     Ok(assets)
 }
 
-async fn get(request: Request) -> std::io::Result<warc::Response> {
+async fn get(request: Request) -> std::io::Result<Captured> {
     let client = capture::client(&request.url).await?;
     let mut headers = http::HeaderMap::new();
     for (name, value) in request.headers {
@@ -135,19 +142,13 @@ async fn get(request: Request) -> std::io::Result<warc::Response> {
     response
         .headers
         .insert(http::header::CONTENT_LENGTH, response.body.len().into());
-    Ok(response)
+    Ok(Captured::Fetched(response))
 }
 
-async fn render<F, T>(
-    root: &Path,
-    url: &str,
-    title: Option<&str>,
-    existing: Option<Arc<warc::Archive>>,
-    fetch: F,
-) -> Result<Vec<String>>
+async fn render<F, T>(root: &Path, url: &str, title: Option<&str>, fetch: F) -> Result<Vec<String>>
 where
     F: Fn(Request) -> T + Send + Sync + 'static,
-    T: std::future::Future<Output = std::io::Result<warc::Response>> + Send,
+    T: std::future::Future<Output = std::io::Result<Captured>> + Send,
 {
     let fetch = Arc::new(fetch);
     let profile = RunDir::new(&std::env::temp_dir(), "capture-browser")?;
@@ -260,7 +261,7 @@ where
         let mut archive = warc::Archive::default();
         let staging =
             super::Batch(root.join(format!(".render-{}-{}", std::process::id(), time_stamp())));
-        std::fs::create_dir_all(&staging.0)?;
+        std::fs::create_dir(&staging.0)?;
         let path = staging.0.join(format!("rendered-{}.warc.gz", time_stamp()));
         let mut requests = tokio::task::JoinSet::new();
         let mut urls = Vec::new();
@@ -278,9 +279,7 @@ where
             if idle && requests.is_empty() && evaluation.is_none() {
                 if title.is_none() {
                     if path.exists() {
-                        std::fs::File::open(&path)?.sync_all()?;
-                        std::fs::rename(&path, root.join(path.file_name().unwrap()))?;
-                        std::fs::File::open(root)?.sync_all()?;
+                        super::install(&path, root)?;
                     }
                     return Ok(urls);
                 }
@@ -316,9 +315,7 @@ where
                             for header in ["etag", "content-md5", "content-length"] { response.headers.remove(header); }
                             response.headers.insert(http::header::CONTENT_LENGTH, response.body.len().into());
                             archive.append(&path, url, &response)?;
-                            std::fs::File::open(&path)?.sync_all()?;
-                            std::fs::rename(&path, root.join(path.file_name().unwrap()))?;
-                            std::fs::File::open(root)?.sync_all()?;
+                            super::install(&path, root)?;
                             return Ok(urls);
                         }
                         return Err("rendered document does not contain the requested text".into());
@@ -327,8 +324,12 @@ where
                 Some(result) = requests.join_next(), if !requests.is_empty() => {
                     let (paused, response) = result?;
                     id += 1;
-                    let (method, params) = if let Ok(response) = response {
-                        if existing.as_ref().is_none_or(|cache| !cache.contains(paused.request.url.as_str())) {
+                    let (method, params) = if let Ok(captured) = response {
+                        let (response, fetched) = match captured {
+                            Captured::Cached(response) => (response, false),
+                            Captured::Fetched(response) => (response, true),
+                        };
+                        if fetched {
                             archive.append(&path, paused.request.url.as_str(), &response)?;
                             eprintln!("Rendered requisite {}: {}", response.status, paused.request.url);
                         }
