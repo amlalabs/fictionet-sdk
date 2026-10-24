@@ -45,16 +45,6 @@ impl Pages {
                 "The search established publication on {published}; DATE must be on or after that date. Preserve this publication date visibly and label any later update explicitly."
             )));
         }
-        if let Some(published) = links(&format!("https://{host}{target}"), &page.body)
-            .iter()
-            .filter_map(|(host, target, _)| store.publication_date(host, target))
-            .filter(|date| *date > dateline)
-            .max()
-        {
-            return Err(prompts::Unreadable::Chronology(format!(
-                "A cited source was first published on {published}, after DATE {dateline}. Explicitly update this article and DATE on or after {published}, or remove the unavailable citation."
-            )));
-        }
         Ok(())
     }
 
