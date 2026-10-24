@@ -85,13 +85,126 @@ async fn real_search_page_and_dns_facts_reach_the_owned_views_without_an_observe
         assert_eq!(request.path,"/black-hole");
         assert_eq!(request.status,200);
         assert!(request.has_preview);
-        assert!(views.preview(&"https://sky.org/black-hole".parse().unwrap(),current.at_ms).unwrap().contains("bends spacetime"));
+        assert!(views.preview(&"https://sky.org/black-hole".parse().unwrap(),current.at_ms).unwrap().text().unwrap().contains("bends spacetime"));
         assert!(matches!(request.source,PageSource::Copy { .. }));
         assert_eq!(request.headers,vec![("host".into(),"sky.org".into()),("user-agent".into(),"Firefox/1".into())]);
         assert!(current.activity.iter().any(|row|matches!(&row.fact,SearchObs::Resolved {name,address:None} if name.to_ascii()=="wiki.corp")));
         assert!(current.activity.iter().any(|row|matches!(&row.fact,SearchObs::NoRoute {from,to} if *from == "10.0.0.2".parse::<std::net::IpAddr>().unwrap() && *to == "1.1.1.1".parse::<std::net::IpAddr>().unwrap())));
         cx.cancel();
         Ok(())
+    }).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_reader_loads_a_complete_compressed_article_from_the_corpus() {
+    use fictionet_demo::kit::{RunDir, shot};
+    use fictionet_extras::warc;
+    use std::{io::Write, time::Duration};
+    let root = RunDir::new(&std::env::temp_dir(), "search-reader").unwrap();
+    let document = format!(
+        "<html><head><title>Supply chain security</title><style>{}</style></head><body><main><h1>Supply chain security</h1><p>Pin actions to immutable commits.</p><p>Review changes to build credentials.</p></main></body></html>",
+        " ".repeat(200_000)
+    );
+    let mut compressed = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    compressed.write_all(document.as_bytes()).unwrap();
+    warc::Archive::default()
+        .append(
+            &root.path().join("pages.warc.gz"),
+            "https://sky.org/article",
+            &warc::Response {
+                status: http::StatusCode::OK,
+                headers: http::HeaderMap::from_iter([
+                    (http::header::CONTENT_TYPE, "text/html".parse().unwrap()),
+                    (http::header::CONTENT_ENCODING, "gzip".parse().unwrap()),
+                ]),
+                body: compressed.finish().unwrap().into(),
+            },
+        )
+        .unwrap();
+    let pages = Arc::new(
+        Pages::copied(
+            web_world::pages::Seed::builtin("web").unwrap(),
+            root.path(),
+            &["https://sky.org/article".into()],
+            None,
+        )
+        .unwrap(),
+    );
+    let (page, (mut observations, _)) = Page::new(&pages, true);
+    fictionet::lab(fictionet::Seed::from_u64(7), move |cx| async move {
+        let seed = pages.seed().clone();
+        let start = web_world::world_start(&seed.date)?;
+        let world = web_world::World {
+            pages,
+            ..web_world::World::new(&cx, seed, start)?
+        };
+        let (attacher, attachments) = fictionet::attachments();
+        let log = Arc::new(fictionet_extras::log::Log::new(
+            Box::new(std::io::sink()),
+            &[],
+            |s| s,
+        ));
+        crate::network::build(&world, &cx, log, None)?.start(&cx, attachments)?;
+        let client = machine(
+            &cx,
+            attacher.attach("workstation")?,
+            "10.0.0.2".parse::<std::net::Ipv4Addr>()?,
+        );
+        fetch(&cx, &client, "sky.org", "/article", start).await;
+        cx.cancel();
+        Ok(())
+    })
+    .await
+    .unwrap();
+    while let Ok(observation) = observations.try_recv() {
+        page.publish(observation);
+    }
+    let at_ms = page.views.lock().unwrap().current().at_ms;
+    let response = page
+        .router()
+        .call(
+            http::Request::get(format!(
+                "/preview?host=sky.org&path=%2Farticle&at_ms={at_ms}"
+            ))
+            .body(axum::body::Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .as_ref(),
+        document.as_bytes()
+    );
+    assert!(
+        !serde_json::to_string(&page.views.lock().unwrap().current())
+            .unwrap()
+            .contains("Pin actions")
+    );
+    let server = serve(page.router(), 0).await.unwrap();
+    let url = server.url.clone();
+    tokio::task::spawn_blocking(move || {
+        let temporary = RunDir::new(&std::env::temp_dir(), "reader-screenshots").unwrap();
+        let output = std::env::var_os("SEARCH_SCREENSHOTS").map(std::path::PathBuf::from).unwrap_or_else(|| temporary.path().into());
+        std::fs::create_dir_all(&output).unwrap();
+        for (name, size, scheme) in [
+            ("reader-dark", (1440, 900), "dark"),
+            ("reader-light", (1440, 900), "light"),
+            ("reader-laptop-dark", (1280, 800), "dark"),
+            ("reader-laptop-light", (1280, 800), "light"),
+        ] {
+            let path = output.join(format!("{name}.png"));
+            shot::capture_at(&url, &[
+                shot::Step { ready: "!!document.querySelector('#map .node[aria-label=\"sky.org\"]')", action: Some(r#"document.querySelector('#map .node[aria-label="Sites ›"]').dispatchEvent(new MouseEvent('click')); [...document.querySelectorAll('#detail-body button')].find(button => button.textContent.includes('sky.org')).click(); [...document.querySelectorAll('#detail-body button')].find(button => button.textContent === 'Page').click();"#), color_scheme: Some(scheme), out: None },
+                shot::Step { ready: "document.querySelector('.recorded-page')?.srcdoc.includes('Review changes to build credentials.')", action: Some(r#"(() => { const body = new DOMParser().parseFromString(document.querySelector('.recorded-page').srcdoc, 'text/html').body; if (!body.querySelector('h1') || body.querySelectorAll('p').length !== 2) throw new Error('incomplete article'); })()"#), color_scheme: Some(scheme), out: Some(&path) },
+            ], Duration::from_secs(15), size).unwrap();
+        }
     }).await.unwrap();
 }
 
@@ -262,7 +375,7 @@ async fn page_routes_serve_local_components_and_stream_current_state() {
             source: PageSource::Copy { captured: None },
             elapsed_ms: 1,
             headers: http::HeaderMap::new(),
-            preview: Some(Arc::from("<p>Document</p>")),
+            preview: Some(Arc::<str>::from("<p>Document</p>").into()),
         },
     });
     let mut preview = page.router();
@@ -520,7 +633,7 @@ fn previews_match_the_exact_page_scheme_query_and_observation_time() {
                 source: PageSource::Copy { captured: None },
                 elapsed_ms: 0,
                 headers: http::HeaderMap::new(),
-                preview: Some(Arc::from(text)),
+                preview: Some(Arc::<str>::from(text).into()),
             },
         });
     }
@@ -531,7 +644,10 @@ fn previews_match_the_exact_page_scheme_query_and_observation_time() {
         ("https://sky.org/black-hole?edition=2", "Second edition"),
     ] {
         assert_eq!(
-            views.preview(&url.parse().unwrap(), 400).as_deref(),
+            views
+                .preview(&url.parse().unwrap(), 400)
+                .map(|body| body.text().unwrap())
+                .as_deref(),
             Some(expected)
         );
     }
@@ -696,7 +812,7 @@ async fn live_destinations_start_at_the_search_and_sites_services() {
                 source: PageSource::Copy { captured: None },
                 elapsed_ms: 0,
                 headers: http::HeaderMap::new(),
-                preview: Some(Arc::from("<h1>Supply chain advisory</h1>")),
+                preview: Some(Arc::<str>::from("<h1>Supply chain advisory</h1>").into()),
             },
         });
         for at_ms in [1000, 12000, 23000, 34000, 45000, 80000] {

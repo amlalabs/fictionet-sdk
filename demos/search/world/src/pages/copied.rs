@@ -17,6 +17,46 @@ pub(super) struct Corpus {
     packages: Option<PackageSites>,
 }
 
+/// A retained page identity. Copied bodies are read from the immutable corpus
+/// when the reader opens them, independently of observation retention limits.
+#[derive(Clone)]
+pub struct PageBody(BodySource);
+
+#[derive(Clone)]
+enum BodySource {
+    Copied { corpus: Arc<Corpus>, url: String },
+    Text(Arc<str>),
+}
+
+impl std::fmt::Debug for PageBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PageBody")
+    }
+}
+
+impl From<Arc<str>> for PageBody {
+    fn from(text: Arc<str>) -> Self {
+        Self(BodySource::Text(text))
+    }
+}
+
+impl PageBody {
+    /// Load the complete decoded document without making a guest request.
+    pub fn text(&self) -> std::io::Result<Arc<str>> {
+        match &self.0 {
+            BodySource::Text(text) => Ok(text.clone()),
+            BodySource::Copied { corpus, url } => {
+                let response = corpus
+                    .response(url)?
+                    .ok_or_else(|| std::io::Error::other("recorded page is unavailable"))?;
+                Ok(Arc::from(
+                    String::from_utf8_lossy(&response.decoded()?).as_ref(),
+                ))
+            }
+        }
+    }
+}
+
 struct PackageSites {
     git: std::path::PathBuf,
     archive: Archive,
@@ -105,7 +145,51 @@ impl Corpus {
     }
 }
 
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+struct ArchiveFile {
+    path: std::path::PathBuf,
+    bytes: u64,
+    modified: std::time::SystemTime,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CachedCorpus {
+    version: u32,
+    files: Vec<ArchiveFile>,
+    seeds: Vec<String>,
+    archive: Archive,
+    missing: Archive,
+    index: Index,
+}
+
+fn archive_files(root: &Path) -> std::io::Result<Vec<ArchiveFile>> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(root)? {
+        let path = entry?.path();
+        if path.to_string_lossy().ends_with(".warc.gz") {
+            let path = std::fs::canonicalize(path)?;
+            let metadata = path.metadata()?;
+            files.push(ArchiveFile {
+                path,
+                bytes: metadata.len(),
+                modified: metadata.modified()?,
+            });
+        }
+    }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(files)
+}
+
 impl Pages {
+    pub(crate) fn copied_body(&self, url: String) -> Option<PageBody> {
+        self.copied_only().then(|| {
+            PageBody(BodySource::Copied {
+                corpus: self.copied.as_ref().unwrap().clone(),
+                url,
+            })
+        })
+    }
+
     pub(crate) fn capture_date(&self, url: &str) -> Option<String> {
         let corpus = self.copied.as_ref()?;
         corpus
@@ -183,7 +267,27 @@ impl Pages {
         model: Option<Model>,
     ) -> Result<Self, String> {
         let started = Instant::now();
-        let archive = Archive::directory(root).map_err(|e| e.to_string())?;
+        let research_root = Archive::directory_root(root).map_err(|e| e.to_string())?;
+        eprintln!("Loading copied pages…");
+        let files = archive_files(&research_root).map_err(|e| e.to_string())?;
+        let cache_path = research_root.join("search-index.json");
+        let cached = std::fs::File::open(&cache_path)
+            .ok()
+            .and_then(|file| {
+                serde_json::from_reader::<_, CachedCorpus>(std::io::BufReader::new(file)).ok()
+            })
+            .filter(|cache| cache.version == 3 && cache.files == files && cache.seeds == seeds);
+        let (archive, missing, index) = match cached {
+            Some(cache) => (cache.archive, cache.missing, Some(cache.index)),
+            None => {
+                eprintln!("Indexing copied pages…");
+                (
+                    Archive::directory(&research_root).map_err(|e| e.to_string())?,
+                    missing_pages(&research_root).map_err(|e| e.to_string())?,
+                    None,
+                )
+            }
+        };
         let hosts = archive
             .urls()
             .filter_map(|url| url::Url::parse(url).ok()?.host_str().map(str::to_owned))
@@ -217,17 +321,49 @@ impl Pages {
         };
         let mut corpus = Corpus {
             archive,
-            missing: missing_pages(root).map_err(|e| e.to_string())?,
+            missing,
             index: Index::default(),
             hosts,
             packages,
         };
-        corpus.index = Index::crawl(
-            seeds,
-            |url| corpus.archive.contains(url),
-            |url| corpus.response(url),
-        )
-        .map_err(|e| e.to_string())?;
+        corpus.index = match index {
+            Some(index) => index,
+            None => {
+                let index = Index::crawl(
+                    seeds,
+                    |url| corpus.archive.contains(url),
+                    |url| corpus.response(url),
+                )
+                .map_err(|e| e.to_string())?;
+                let cache = CachedCorpus {
+                    version: 3,
+                    files,
+                    seeds: seeds.to_vec(),
+                    archive: corpus.archive,
+                    missing: corpus.missing,
+                    index,
+                };
+                let temporary = cache_path.with_extension(format!(
+                    "{}-{}.tmp",
+                    std::process::id(),
+                    time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+                ));
+                let saved = (|| -> std::io::Result<()> {
+                    use std::io::Write;
+                    let mut file = std::io::BufWriter::new(std::fs::File::create(&temporary)?);
+                    serde_json::to_writer(&mut file, &cache)?;
+                    file.flush()?;
+                    std::fs::rename(&temporary, &cache_path)
+                })();
+                if let Err(error) = saved {
+                    let _ = std::fs::remove_file(&temporary);
+                    eprintln!("Search index cache unavailable: {error}");
+                }
+                corpus.archive = cache.archive;
+                corpus.missing = cache.missing;
+                cache.index
+            }
+        };
         if corpus.index.is_empty() {
             return Err("the copied corpus has no reachable HTML pages".into());
         }
@@ -242,7 +378,7 @@ impl Pages {
             None => Self::open(seed, Store::memory(), None, 0),
         };
         pages.prefetch = 0;
-        pages.copied = Some(corpus);
+        pages.copied = Some(Arc::new(corpus));
         pages.copied_active = true.into();
         pages.store().generation.generate = true;
         Ok(pages)
@@ -352,6 +488,61 @@ pub(super) fn replay(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_indexes_are_reused_and_archive_changes_invalidate_them() {
+        let root = std::env::temp_dir().join(format!(
+            "search-cache-{}-{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("pages.warc.gz");
+        let mut archive = Archive::default();
+        let mut write = |body: &'static str| {
+            archive
+                .append(
+                    &path,
+                    "https://source.org/",
+                    &fictionet_extras::warc::Response {
+                        status: http::StatusCode::OK,
+                        headers: http::HeaderMap::from_iter([(
+                            http::header::CONTENT_TYPE,
+                            "text/html".parse().unwrap(),
+                        )]),
+                        body: body.into(),
+                    },
+                )
+                .unwrap()
+        };
+        let open = || {
+            Pages::copied(
+                Seed::builtin("web").unwrap(),
+                &root,
+                &["https://source.org/".into()],
+                None,
+            )
+            .unwrap()
+        };
+        write("<title>Supply chain</title><p>Immutable actions</p>");
+        let first = open();
+        let cache = root.join("search-index.json");
+        let saved = std::fs::read(&cache).unwrap();
+        let second = open();
+        assert_eq!(std::fs::read(&cache).unwrap(), saved);
+        assert_eq!(
+            first.copied_listing("immutable", 0).0,
+            second.copied_listing("immutable", 0).0
+        );
+        write("<title>Build security</title><p>Credential isolation</p>");
+        let updated = open();
+        assert_eq!(updated.copied_listing("credential", 0).0.results.len(), 1);
+        assert!(updated.copied_listing("immutable", 0).0.results.is_empty());
+        assert_ne!(std::fs::read(&cache).unwrap(), saved);
+        std::fs::write(&cache, b"interrupted write").unwrap();
+        assert_eq!(open().copied_listing("credential", 0).0.results.len(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn only_real_not_found_pages_are_reused_and_override_raw_successes() {

@@ -3,6 +3,7 @@
 use bytes::Bytes;
 use flate2::bufread::GzDecoder;
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
@@ -10,7 +11,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[derive(Clone, Debug)]
+const HEADER_BYTES: usize = 64 * 1024;
+const RECORD_BYTES: usize = 256 * 1024 * 1024 + 2 * HEADER_BYTES;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct Record {
     file: PathBuf,
     offset: u64,
@@ -20,7 +24,7 @@ struct Record {
 }
 
 /// An in memory URL index. Payloads stay in the original archives.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Archive {
     urls: HashMap<String, Record>,
     ids: HashMap<String, Record>,
@@ -85,32 +89,80 @@ fn split(bytes: &[u8]) -> io::Result<(&[u8], &[u8])> {
     Ok((&bytes[..end], &bytes[end + 4..]))
 }
 
-struct Parsed<'a> {
-    fields: HashMap<String, String>,
-    block: &'a [u8],
+fn parse(bytes: &[u8]) -> io::Result<&[u8]> {
+    let (head, body) = split(bytes)?;
+    let fields = fields(head)?;
+    let length = block_length(&fields)?;
+    let block = body
+        .get(..length)
+        .ok_or_else(|| invalid("truncated WARC block"))?;
+    Ok(block)
 }
 
-fn parse(bytes: &[u8]) -> io::Result<Parsed<'_>> {
-    let (head, body) = split(bytes)?;
+fn fields(head: &[u8]) -> io::Result<HashMap<String, String>> {
+    if head.len() > HEADER_BYTES {
+        return Err(invalid("WARC headers exceed size limit"));
+    }
     let head = std::str::from_utf8(head).map_err(invalid)?;
     if !head.starts_with("WARC/1.") {
         return Err(invalid("not a WARC record"));
     }
-    let fields: HashMap<_, _> = head
+    Ok(head
         .lines()
         .skip(1)
         .filter_map(|line| line.split_once(':'))
         .map(|(key, value)| (key.to_ascii_lowercase(), value.trim().to_owned()))
-        .collect();
+        .collect())
+}
+
+fn block_length(fields: &HashMap<String, String>) -> io::Result<usize> {
     let length = fields
         .get("content-length")
         .ok_or_else(|| invalid("missing WARC content length"))?
         .parse::<usize>()
         .map_err(invalid)?;
-    let block = body
-        .get(..length)
-        .ok_or_else(|| invalid("truncated WARC block"))?;
-    Ok(Parsed { fields, block })
+    if length > RECORD_BYTES - 2 * HEADER_BYTES {
+        return Err(invalid("WARC block exceeds size limit"));
+    }
+    Ok(length)
+}
+
+fn bounded(reader: impl Read, limit: usize) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        return Err(invalid("WARC record exceeds size limit"));
+    }
+    Ok(bytes)
+}
+
+fn scan(reader: impl Read) -> io::Result<HashMap<String, String>> {
+    let mut reader = BufReader::new(reader.take(RECORD_BYTES as u64 + 1));
+    let mut head = Vec::new();
+    loop {
+        let count = (&mut reader)
+            .take((HEADER_BYTES + 1 - head.len()) as u64)
+            .read_until(b'\n', &mut head)?;
+        if head.len() > HEADER_BYTES {
+            return Err(invalid("WARC headers exceed size limit"));
+        }
+        if head.ends_with(b"\r\n\r\n") {
+            break;
+        }
+        if count == 0 {
+            return Err(invalid("truncated WARC headers"));
+        }
+    }
+    let fields = fields(&head[..head.len() - 4])?;
+    let length = block_length(&fields)?;
+    let remaining = io::copy(&mut reader, &mut io::sink())? as usize;
+    if head.len() + remaining > RECORD_BYTES {
+        return Err(invalid("WARC record exceeds size limit"));
+    }
+    if remaining < length {
+        return Err(invalid("truncated WARC block"));
+    }
+    Ok(fields)
 }
 
 /// Canonical URL key: fragments never go to an HTTP server.
@@ -192,11 +244,8 @@ impl Archive {
             let mut reader = BufReader::new(File::open(&file)?);
             while !reader.fill_buf()?.is_empty() {
                 let offset = reader.stream_position()?;
-                let mut bytes = Vec::new();
-                GzDecoder::new(&mut reader).read_to_end(&mut bytes)?;
+                let fields = scan(GzDecoder::new(&mut reader))?;
                 let length = reader.stream_position()? - offset;
-                let parsed = parse(&bytes)?;
-                let fields = &parsed.fields;
                 if !matches!(
                     fields.get("warc-type").map(String::as_str),
                     Some("response" | "revisit")
@@ -226,17 +275,34 @@ impl Archive {
         Ok(archive)
     }
 
-    /// Open all archives directly under a corpus directory in stable order.
+    /// Open immutable captures in publication order, with stable path ties.
     pub fn directory(root: &Path) -> io::Result<Self> {
-        let mut files = std::fs::read_dir(root)?
+        let root = Self::directory_root(root)?;
+        let mut files = std::fs::read_dir(&root)?
             .map(|entry| entry.map(|e| e.path()))
             .collect::<io::Result<Vec<_>>>()?;
         files.retain(|p| p.to_string_lossy().ends_with(".warc.gz"));
+        let mut files = files
+            .into_iter()
+            .map(|path| {
+                let modified = path.metadata()?.modified()?;
+                Ok((modified, path))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
         files.sort();
         if files.is_empty() {
             return Err(invalid("no WARC archives"));
         }
-        Self::open(files)
+        Self::open(files.into_iter().map(|(_, path)| path))
+    }
+
+    /// Resolve a published corpus once so its immutable paths stay stable.
+    pub fn directory_root(root: &Path) -> io::Result<PathBuf> {
+        if root.join("current").try_exists()? {
+            std::fs::canonicalize(root.join("current"))
+        } else {
+            std::fs::canonicalize(root)
+        }
     }
 
     /// URLs available for replay, including assets, redirects and errors.
@@ -271,10 +337,11 @@ impl Archive {
         }
         let mut file = File::open(&record.file)?;
         file.seek(SeekFrom::Start(record.offset))?;
-        let mut bytes = Vec::new();
-        flate2::read::GzDecoder::new(file.take(record.length)).read_to_end(&mut bytes)?;
-        let parsed = parse(&bytes)?;
-        let mut response = http_response(parsed.block)?;
+        let bytes = bounded(
+            flate2::read::GzDecoder::new(file.take(record.length)),
+            RECORD_BYTES,
+        )?;
+        let mut response = http_response(parse(&bytes)?)?;
         if let Some(reference) = &record.refers {
             let original = self
                 .resolve(reference, seen)?
@@ -453,6 +520,86 @@ mod tests {
     fn rejects_truncated_records() {
         assert!(parse(b"WARC/1.0\r\nContent-Length: 9\r\n\r\nx").is_err());
         assert!(http_response(b"HTTP/1.1 200").is_err());
+    }
+
+    #[test]
+    fn newer_captures_override_older_responses_regardless_of_their_filename() {
+        let root = std::env::temp_dir().join(format!(
+            "archive-order-{}-{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        for (name, seconds, body) in [
+            ("z-old.warc.gz", 1, "old shell"),
+            ("a-new.warc.gz", 2, "complete article"),
+        ] {
+            let path = root.join(name);
+            Archive::default()
+                .append(
+                    &path,
+                    "https://source.org/article",
+                    &Response {
+                        status: StatusCode::OK,
+                        headers: HeaderMap::new(),
+                        body: body.into(),
+                    },
+                )
+                .unwrap();
+            File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(
+                    std::fs::FileTimes::new().set_modified(
+                        std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds),
+                    ),
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            Archive::directory(&root)
+                .unwrap()
+                .get("https://source.org/article")
+                .unwrap()
+                .unwrap()
+                .body,
+            "complete article"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn compressed_records_enforce_header_and_body_budgets_during_expansion() {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(b"WARC/1.1\r\nX-Long: ").unwrap();
+        io::copy(
+            &mut io::repeat(b'x').take(HEADER_BYTES as u64),
+            &mut encoder,
+        )
+        .unwrap();
+        let compressed = encoder.finish().unwrap();
+        assert!(
+            scan(flate2::read::GzDecoder::new(compressed.as_slice()))
+                .unwrap_err()
+                .to_string()
+                .contains("headers exceed")
+        );
+        assert!(
+            scan(format!("WARC/1.1\r\nContent-Length: {}\r\n\r\n", RECORD_BYTES).as_bytes())
+                .unwrap_err()
+                .to_string()
+                .contains("block exceeds")
+        );
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        io::copy(&mut io::repeat(b'x').take(4097), &mut encoder).unwrap();
+        let compressed = encoder.finish().unwrap();
+        assert!(
+            bounded(flate2::read::GzDecoder::new(compressed.as_slice()), 4096)
+                .unwrap_err()
+                .to_string()
+                .contains("record exceeds")
+        );
     }
 }
 
