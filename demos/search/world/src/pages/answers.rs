@@ -139,9 +139,17 @@ pub fn read_page(text: &str, expected: Option<&str>, referenced: bool) -> Result
     let text = FENCE
         .get_or_init(|| Regex::new(r"^```[a-z]*\s*\n").unwrap())
         .replace(text, "");
-    let Some((head, body)) = text.split_once("\nBODY:") else {
+    // The header ends at BODY:, or where HTML starts when a writer leaves
+    // that line out.
+    let markup = || {
+        text.match_indices('\n')
+            .map(|(at, _)| at)
+            .find(|&at| text[at + 1..].starts_with('<'))
+            .map(|at| (&text[..at], &text[at..]))
+    };
+    let Some((head, body)) = text.split_once("\nBODY:").or_else(markup) else {
         return Err(Unreadable::Format(
-            "no BODY: line in the page answer".into(),
+            "the answer has no BODY: line; after the header lines, write BODY: on its own line and then the page's main content".into(),
         ));
     };
     let body = body.trim_start_matches('\n').trim_end();
@@ -167,19 +175,14 @@ pub fn read_page(text: &str, expected: Option<&str>, referenced: bool) -> Result
         {
             let item = item.trim();
             if section == "claims" {
-                let (known_on, statement) = if let Some((date, statement)) = item.split_once(" | ")
-                {
-                    (
-                        Some(super::seed::parse_date(date).map_err(|_| {
-                            Unreadable::Format(
-                                "CLAIMS needs a known-on date in YYYY-MM-DD form".into(),
-                            )
-                        })?),
-                        statement,
-                    )
-                } else {
-                    (None, item)
-                };
+                // A line without a readable date is still the statement.
+                let (known_on, statement) =
+                    match item.split_once(" | ").and_then(|(date, statement)| {
+                        Some((super::seed::parse_date(date).ok()?, statement))
+                    }) {
+                        Some((date, statement)) => (Some(date), statement),
+                        None => (None, item),
+                    };
                 page.claims.push(super::prompts::Statement {
                     text: statement.into(),
                     known_on,

@@ -424,7 +424,8 @@ Write the stylesheet once for this host, with a distinctive design suited to its
 kind. Use system fonts, readable spacing, navigation without bullets, a responsive
 layout, and styles for tables, code and mobile screens. No scripts, external
 imports, remote fonts or images. The page links
-/static/css/main.css. Style the shared HTML structure described below:
+/static/css/main.css. Style the shared page structure described after this format.
+
 ";
 
 const SITE_LAYOUT: &str = "Shared page structure: header with .brand a and .tagline for news/blog,
@@ -731,8 +732,8 @@ How the agent got here:
 What the world has already said:
 {said}
 {grounding}
-{PAGE_FORMAT_HEAD}{site}{layout}
-{PAGE_FORMAT_TAIL}
+{PAGE_FORMAT_HEAD}{site}{PAGE_FORMAT_TAIL}
+{layout}
 {captured_note}
 
 {vocabulary}",
