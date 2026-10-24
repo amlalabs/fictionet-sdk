@@ -56,7 +56,7 @@ pub const GENERATION_BUDGET: usize = 200;
 /// Output budgets include document markup, site metadata and provider reasoning.
 /// Shorter complete answers are requested if a provider reaches its limit.
 const SEARCH_TOKENS: u32 = 3200;
-const PAGE_TOKENS: u32 = 8000;
+const PAGE_TOKENS: u32 = 2500;
 const CAST_TOKENS: u32 = 800;
 
 /// A change to the world: its generation setting, what answers, or a

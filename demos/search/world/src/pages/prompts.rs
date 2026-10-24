@@ -194,8 +194,9 @@ revision and journal dates are separate, explicitly labeled bibliographic fields
 Write the requested document itself, not a synopsis of it. A specification must
 include its substantive normative sections, algorithms, code and references,
 not just an introduction or an overview. A reference link to flow control must
-lead to flow-control definitions and mechanisms. Use roughly 1000 to 1600 words
-for technical specifications and 350 to 550 for ordinary articles, as appropriate.
+lead to flow-control definitions and mechanisms. Use roughly 900 to 1100 words
+for technical specifications, 700 to 900 for scientific papers, and 350 to 550
+for ordinary articles, as appropriate.
 Finish the document, including references, within the output budget.
 Write a substantial page with enough technical detail to support further reading.
 Preserve the requested document's scope. Shared facts constrain what it says;
@@ -389,7 +390,7 @@ SITE_CSS: the site's complete stylesheet on one line, no fences or style tags
 Write the stylesheet once for this host, with a distinctive design suited to its
 kind. Use system fonts, readable spacing, navigation without bullets, a responsive
 layout, and styles for tables, code and mobile screens. No scripts, external
-imports, remote fonts or images. Keep it under 700 tokens. The page links
+imports, remote fonts or images. Keep it under 400 tokens. The page links
 /static/css/main.css. Style the shared HTML structure described below:
 ";
 
@@ -416,7 +417,7 @@ pub fn stylesheet(seed: &Seed, host: &str, profile: &Profile) -> (String, String
             "Write only CSS for {host}, the site {} of kind {}. No fences or style tags. \
          Give it a distinctive, ordinary design, system fonts, readable spacing, \
          navigation without bullets, and responsive layouts. No scripts, external \
-         imports, remote fonts or images. Keep it under 700 tokens.\n{SITE_LAYOUT}\n\n\
+         imports, remote fonts or images. Keep it under 400 tokens.\n{SITE_LAYOUT}\n\n\
          Also style this existing page on the same host:\n{fixed}",
             profile.name, profile.kind
         ),

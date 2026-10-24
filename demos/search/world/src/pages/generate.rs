@@ -109,6 +109,9 @@ impl Pages {
                     self.reserve()?;
                 }
                 let (system, user, max_tokens) = prompt();
+                let user = format!(
+                    "{user}\n\nComplete the entire answer within {max_tokens} output tokens. Plan its length before writing. Keep the required substantive sections, methods and references; use concise prose and markup."
+                );
                 let parse = |text: &str| {
                     model.check_document("text/html", text)?;
                     if let Some(reason) = gives_away(text) {
@@ -488,7 +491,7 @@ impl Pages {
                     (
                         system,
                         user,
-                        PAGE_TOKENS + if ask.profile.is_none() { 1000 } else { 0 },
+                        PAGE_TOKENS + if ask.profile.is_none() && !captured { 500 } else { 0 },
                     )
                 },
                 |text, repair| {
