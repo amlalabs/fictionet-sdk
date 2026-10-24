@@ -4879,8 +4879,10 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "fatfs",
+ "fictionet",
  "fictionet-demo",
  "fictionet-extras",
+ "http",
  "serde",
  "serde_json",
  "tokio",

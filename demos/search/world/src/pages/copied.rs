@@ -8,6 +8,7 @@ use std::{path::Path, time::Instant};
 
 pub(super) struct Corpus {
     archive: Archive,
+    missing: Archive,
     index: Index,
     hosts: HashSet<String>,
     packages: Option<PackageSites>,
@@ -16,22 +17,40 @@ pub(super) struct Corpus {
 struct PackageSites {
     git: std::path::PathBuf,
     archive: Archive,
+    missing: Archive,
     hosts: HashSet<String>,
 }
 
 fn archived_response(
     archive: &Archive,
+    missing: &Archive,
     url: &str,
 ) -> std::io::Result<Option<fictionet_extras::warc::Response>> {
+    let mut absent = url::Url::parse(url).map_err(std::io::Error::other)?;
+    absent.set_path("/404");
+    absent.set_query(None);
+    absent.set_fragment(None);
+    let fallback = missing
+        .get(absent.as_str())?
+        .filter(|response| response.status == http::StatusCode::NOT_FOUND);
+    // The curated not-found response takes precedence over raw captures of /404.
+    if fictionet_extras::warc::key(url).as_deref() == Some(absent.as_str()) && fallback.is_some() {
+        return Ok(fallback);
+    }
     if let Some(response) = archive.get(url)? {
         return Ok(Some(response));
     }
-    let mut missing = url::Url::parse(url).map_err(std::io::Error::other)?;
-    missing.set_path("/404");
-    missing.set_query(None);
+    if fallback.is_some() {
+        return Ok(fallback);
+    }
     Ok(archive
-        .get(missing.as_str())?
-        .filter(|response| response.status.is_client_error()))
+        .get(absent.as_str())?
+        .filter(|response| response.status == http::StatusCode::NOT_FOUND))
+}
+
+fn missing_pages(root: &Path) -> std::io::Result<Archive> {
+    let path = root.join("missing-pages.warc.gz");
+    Archive::open(path.is_file().then_some(path))
 }
 
 impl Corpus {
@@ -40,7 +59,7 @@ impl Corpus {
         url: &str,
     ) -> std::io::Result<Option<fictionet_extras::warc::Response>> {
         use kuchiki::traits::TendrilSink;
-        let Some(mut response) = archived_response(&self.archive, url)? else {
+        let Some(mut response) = archived_response(&self.archive, &self.missing, url)? else {
             return Ok(None);
         };
         // Reporting headers and these script elements only send telemetry or ads.
@@ -95,10 +114,16 @@ impl Pages {
 
     /// Package sites always replay captured responses, regardless of the page source.
     pub(crate) fn package_url(&self, url: &str) -> Option<Response> {
-        let packages = self.copied.as_ref()?.packages.as_ref()?;
+        let corpus = self.copied.as_ref()?;
+        let packages = corpus.packages.as_ref()?;
         let parsed = url::Url::parse(url).ok()?;
         packages.hosts.contains(parsed.host_str()?).then(|| {
-            let response = archived_response(&packages.archive, url).and_then(|response| {
+            let captured = if !packages.archive.contains(url) && corpus.archive.contains(url) {
+                corpus.response(url)
+            } else {
+                archived_response(&packages.archive, &packages.missing, url)
+            };
+            let response = captured.and_then(|response| {
                 response
                     .map(|mut response| {
                         // Installers hash the distribution's identity bytes. Their
@@ -163,6 +188,16 @@ impl Pages {
         let scanned = started.elapsed();
         let package_root = root.join("packages");
         let packages = if package_root.is_dir() {
+            // Resolve once: a later publication must not change this reader's paths.
+            let package_root = if package_root
+                .join("current")
+                .try_exists()
+                .map_err(|e| e.to_string())?
+            {
+                std::fs::canonicalize(package_root.join("current")).map_err(|e| e.to_string())?
+            } else {
+                package_root
+            };
             let archive = Archive::directory(&package_root).map_err(|e| e.to_string())?;
             let hosts = archive
                 .urls()
@@ -171,6 +206,7 @@ impl Pages {
             Some(PackageSites {
                 git: package_root.join("git"),
                 archive,
+                missing: missing_pages(&package_root).map_err(|e| e.to_string())?,
                 hosts,
             })
         } else {
@@ -178,6 +214,7 @@ impl Pages {
         };
         let mut corpus = Corpus {
             archive,
+            missing: missing_pages(root).map_err(|e| e.to_string())?,
             index: Index::default(),
             hosts,
             packages,
@@ -319,6 +356,93 @@ mod tests {
     use super::*;
 
     #[test]
+    fn only_real_not_found_pages_are_reused_and_override_raw_successes() {
+        let root = std::env::temp_dir().join(format!(
+            "copied-errors-{}-{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut archive = Archive::default();
+        let mut missing = Archive::default();
+        for (host, status) in [
+            ("github.com", 404),
+            ("denied.org", 403),
+            ("limited.org", 429),
+            ("login.org", 401),
+        ] {
+            let url = format!("https://{host}/404");
+            let response = fictionet_extras::warc::Response {
+                status: http::StatusCode::from_u16(status).unwrap(),
+                headers: http::HeaderMap::new(),
+                body: "Page not found · GitHub".into(),
+            };
+            missing
+                .append(&root.join("missing-pages.warc.gz"), &url, &response)
+                .unwrap();
+            let mut raw = response;
+            raw.status = http::StatusCode::OK;
+            archive
+                .append(&root.join("raw.warc.gz"), &url, &raw)
+                .unwrap();
+            archive
+                .append(
+                    &root.join("raw.warc.gz"),
+                    &format!("https://{host}/denied"),
+                    &fictionet_extras::warc::Response {
+                        status: http::StatusCode::FORBIDDEN,
+                        headers: Default::default(),
+                        body: "Forbidden".into(),
+                    },
+                )
+                .unwrap();
+            for path in ["/psf/requests", "/psf", "/absent?query=1"] {
+                let response =
+                    archived_response(&archive, &missing, &format!("https://{host}{path}"))
+                        .unwrap();
+                if status == 404 {
+                    let response = replay(Ok(response));
+                    assert_eq!(response.status, 404);
+                    assert_eq!(
+                        String::from_utf8(response.body).unwrap(),
+                        "Page not found · GitHub"
+                    );
+                } else {
+                    assert!(response.is_none());
+                }
+            }
+            assert_eq!(
+                archived_response(&archive, &missing, &format!("https://{host}/denied"))
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                403
+            );
+        }
+        let loaded = Archive::directory(&root).unwrap();
+        assert_eq!(
+            loaded
+                .get("https://github.com/404")
+                .unwrap()
+                .unwrap()
+                .status,
+            200
+        );
+        assert_eq!(
+            archived_response(
+                &loaded,
+                &missing_pages(&root).unwrap(),
+                "https://github.com/404"
+            )
+            .unwrap()
+            .unwrap()
+            .status,
+            404
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn packages_keep_identity_bytes_and_missing_pages_keep_the_sites_response() {
         use fictionet_extras::warc;
         use std::io::Write;
@@ -345,6 +469,28 @@ mod tests {
                     http::StatusCode::OK,
                     "text/html",
                     b"<title>Research</title><p>Source material</p>",
+                ),
+            )
+            .unwrap();
+        archive
+            .append(
+                &root.join("pages.warc.gz"),
+                "https://github.com/research/advisory",
+                &response(
+                    http::StatusCode::OK,
+                    "text/html",
+                    b"<title>Security advisory</title><p>Research reference</p>",
+                ),
+            )
+            .unwrap();
+        archive
+            .append(
+                &root.join("packages/missing-pages.warc.gz"),
+                "https://github.com/404",
+                &response(
+                    http::StatusCode::NOT_FOUND,
+                    "text/html",
+                    "<title>Page not found · GitHub</title>".as_bytes(),
                 ),
             )
             .unwrap();
@@ -392,6 +538,15 @@ mod tests {
                     tokio::sync::mpsc::channel(crate::observation::OBSERVATION_CAPACITY);
                 pages.observe(sender);
                 assert!(pages.serves_host("files.pythonhosted.org"));
+                let reference = pages
+                    .handle(&cx, "GET", "github.com", "/research/advisory", None)
+                    .await;
+                assert_eq!(reference.status, 200);
+                assert!(
+                    String::from_utf8(reference.body)
+                        .unwrap()
+                        .contains("Security advisory")
+                );
                 let absent = pages
                     .handle(&cx, "GET", "source.org", "/old-article", None)
                     .await;

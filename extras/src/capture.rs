@@ -333,6 +333,50 @@ pub struct Links {
     pub assets: Vec<String>,
 }
 
+/// Outbound article references, excluding surrounding site navigation.
+pub fn references(url: &str, response: &warc::Response) -> io::Result<Vec<String>> {
+    if !response.status.is_success()
+        || !response
+            .headers
+            .get("content-type")
+            .is_some_and(|value| value.as_bytes().starts_with(b"text/html"))
+    {
+        return Ok(Vec::new());
+    }
+    let decoded = response.decoded()?;
+    let dom = kuchiki::parse_html().one(String::from_utf8_lossy(&decoded).into_owned());
+    for node in dom
+        .select("nav, header, footer, aside")
+        .unwrap()
+        .collect::<Vec<_>>()
+    {
+        node.as_node().detach();
+    }
+    let original = Url::parse(url).map_err(io::Error::other)?;
+    let base = dom
+        .select_first("base[href]")
+        .ok()
+        .and_then(|node| original.join(node.attributes.borrow().get("href")?).ok())
+        .unwrap_or_else(|| original.clone());
+    let article = dom
+        .select_first("article")
+        .or_else(|_| dom.select_first("main"));
+    let content = article.map(|node| node.as_node().clone()).unwrap_or(dom);
+    let mut seen = std::collections::HashSet::new();
+    Ok(content
+        .select("a[href], area[href]")
+        .unwrap()
+        .filter_map(|node| {
+            let url = base.join(node.attributes.borrow().get("href")?).ok()?;
+            warc::key(url.as_str())
+        })
+        .filter(|url| {
+            Url::parse(url).is_ok_and(|url| url.origin() != original.origin() && url.path() != "/")
+                && seen.insert(url.clone())
+        })
+        .collect())
+}
+
 fn css(text: &str, base: &Url, out: &mut Vec<String>) {
     static URLS: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     let regex = URLS.get_or_init(|| {
@@ -717,6 +761,39 @@ mod tests {
             ]
         );
         assert!(links.pages.is_empty());
+    }
+
+    #[test]
+    fn article_references_exclude_site_navigation_and_keep_external_citations() {
+        let page = response(
+            "text/html",
+            r#"
+            <base href="https://publisher.org/posts/">
+            <nav><a href="https://accounts.org/login">Sign in</a></nav>
+            <main><article>
+              <a href="../about">About</a>
+              <a href="https://securitylab.github.com/research/pwn-requests/#mitigations">Research</a>
+              <a href="https://owasp.org/www-project-top-10-ci-cd-security-risks/">OWASP</a>
+              <a href="https://securitylab.github.com/research/pwn-requests/">Same research</a>
+              <a href="https://vendor.org/">Vendor</a>
+              <a href="mailto:team@publisher.org">Email</a>
+            </article></main>
+            <footer><a href="https://social.org/publisher">Follow</a></footer>
+        "#,
+        );
+        let found = references("https://publisher.org/posts/incident", &page).unwrap();
+        assert_eq!(found.len(), 2);
+        assert!(found.contains(&"https://securitylab.github.com/research/pwn-requests/".into()));
+        assert!(
+            found.contains(&"https://owasp.org/www-project-top-10-ci-cd-security-risks/".into())
+        );
+        let mut denied = page;
+        denied.status = http::StatusCode::FORBIDDEN;
+        assert!(
+            references("https://publisher.org/posts/incident", &denied)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
