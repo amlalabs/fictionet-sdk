@@ -41,6 +41,15 @@ impl Framing {
     }
 }
 
+/// Decodes an event stream the sanitizer released. The sanitizer reads lines
+/// of any length, so each of its readers accepts any line and event as well.
+pub(super) fn events() -> Stream<sse::Events> {
+    Stream::new(sse::Events::with_limits(sse::Limits {
+        line: usize::MAX,
+        event: usize::MAX,
+    }))
+}
+
 /// The outcome of one attempt to contact a provider.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -168,6 +177,65 @@ fn scrub_json(value: &mut Value, secret: &Secret) {
     }
 }
 
+/// Whether a JSON text may hold the credential: in its bytes, or in any
+/// string or key once decoded, including values a repeated key hides from
+/// [`Value`]. Text that is not one JSON value may hold it.
+fn holds(text: &str, secret: &Secret) -> bool {
+    use serde::de::{DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
+    #[derive(Clone, Copy)]
+    struct Search<'a>(&'a str);
+    impl<'de> DeserializeSeed<'de> for Search<'_> {
+        type Value = bool;
+        fn deserialize<D: Deserializer<'de>>(self, decoder: D) -> Result<bool, D::Error> {
+            decoder.deserialize_any(self)
+        }
+    }
+    impl<'de> Visitor<'de> for Search<'_> {
+        type Value = bool;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a JSON value")
+        }
+        fn visit_str<E>(self, text: &str) -> Result<bool, E> {
+            Ok(text.contains(self.0))
+        }
+        fn visit_bool<E>(self, _: bool) -> Result<bool, E> {
+            Ok(false)
+        }
+        fn visit_i64<E>(self, _: i64) -> Result<bool, E> {
+            Ok(false)
+        }
+        fn visit_u64<E>(self, _: u64) -> Result<bool, E> {
+            Ok(false)
+        }
+        fn visit_f64<E>(self, _: f64) -> Result<bool, E> {
+            Ok(false)
+        }
+        fn visit_unit<E>(self) -> Result<bool, E> {
+            Ok(false)
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut items: A) -> Result<bool, A::Error> {
+            let mut found = false;
+            while let Some(item) = items.next_element_seed(self)? {
+                found |= item;
+            }
+            Ok(found)
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut fields: A) -> Result<bool, A::Error> {
+            let mut found = false;
+            while let Some(key) = fields.next_key_seed(self)? {
+                found |= key | fields.next_value_seed(self)?;
+            }
+            Ok(found)
+        }
+    }
+    let mut decoder = serde_json::Deserializer::from_str(text);
+    text.contains(&secret.value)
+        || Search(&secret.value)
+            .deserialize(&mut decoder)
+            .and_then(|found| decoder.end().map(|()| found))
+            .unwrap_or(true)
+}
+
 struct Scrubbed {
     body: Body,
     secret: Secret,
@@ -179,7 +247,9 @@ struct Scrubbed {
     event: Vec<sse::Line>,
 }
 enum Record {
-    Json(Value, Vec<u8>),
+    /// A decoded event, its metadata lines, and its data text when that text
+    /// cannot hold the credential.
+    Json(Value, Vec<u8>, Option<String>),
     Raw(Vec<u8>),
 }
 impl Scrubbed {
@@ -221,6 +291,7 @@ impl Scrubbed {
                     self.secret
                         .redact(&String::from_utf8_lossy(&metadata))
                         .into_bytes(),
+                    (!holds(&data, &self.secret)).then_some(data),
                 ),
                 Err(_) if data.is_empty() || data == "[DONE]" => Record::Raw(
                     self.secret
@@ -240,8 +311,15 @@ impl Scrubbed {
                 return Vec::new();
             }
             return if let Ok(mut value) = serde_json::from_slice::<Value>(&self.pending) {
+                let original = std::str::from_utf8(&self.pending)
+                    .is_ok_and(|text| !holds(text, &self.secret))
+                    .then(|| value.clone());
                 text::scrub(std::slice::from_mut(&mut value), &self.secret, true);
-                serde_json::to_vec(&value).expect("provider JSON")
+                if original.as_ref() == Some(&value) {
+                    std::mem::take(&mut self.pending)
+                } else {
+                    serde_json::to_vec(&value).expect("provider JSON")
+                }
             } else {
                 b"null".to_vec()
             };
@@ -250,7 +328,7 @@ impl Scrubbed {
             .records
             .iter()
             .filter_map(|record| match record {
-                Record::Json(value, _) => Some(value.clone()),
+                Record::Json(value, _, _) => Some(value.clone()),
                 Record::Raw(_) => None,
             })
             .collect();
@@ -258,7 +336,7 @@ impl Scrubbed {
         let mut values = values.into_iter().enumerate();
         let mut ready = self.records.len();
         for (index, record) in self.records.iter_mut().enumerate() {
-            if let Record::Json(value, _) = record {
+            if let Record::Json(value, _, _) = record {
                 let (item, scrubbed) = values.next().expect("decoded record");
                 *value = scrubbed;
                 if item >= safe {
@@ -269,11 +347,25 @@ impl Scrubbed {
         let mut output = Vec::new();
         for record in self.records.drain(..ready) {
             match record {
-                Record::Json(value, metadata) => {
+                Record::Json(value, metadata, data) => {
                     output.extend(metadata);
-                    output.extend(b"data: ");
-                    output.extend(serde_json::to_vec(&value).expect("provider JSON"));
-                    output.extend(b"\n\n");
+                    // Unchanged events keep the provider's text, numbers included.
+                    let data = data.filter(|data| {
+                        serde_json::from_str::<Value>(data).is_ok_and(|parsed| parsed == value)
+                    });
+                    match data {
+                        Some(data) => {
+                            for line in data.split('\n') {
+                                output.extend(format!("data: {line}\n").bytes());
+                            }
+                        }
+                        None => {
+                            output.extend(b"data: ");
+                            output.extend(serde_json::to_vec(&value).expect("provider JSON"));
+                            output.push(b'\n');
+                        }
+                    }
+                    output.push(b'\n');
                 }
                 Record::Raw(bytes) => output.extend(bytes),
             }
@@ -459,6 +551,69 @@ mod tests {
             let arguments: String = output.lines().filter_map(|line| line.strip_prefix("data: ")).map(|line| serde_json::from_str::<Value>(line).unwrap()["delta"]["partial_json"].as_str().unwrap().to_owned()).collect();
             let value: Value = serde_json::from_str(&arguments)?;
             assert_eq!(value["value"], "<provider key>");
+            Ok(())
+        })).unwrap();
+    }
+
+    #[test]
+    fn finished_function_arguments_are_scrubbed_after_json_decoding() {
+        fictionet::block_on(fictionet::lab(fictionet::Seed::from_u64(14), |_| async {
+            let secret = Secret::new("provider key", "private-key".into())?;
+            let arguments = r#"{"value":"private\u002dkey"}"#;
+            let item = json!({"type":"function_call","name":"lookup","call_id":"call_1","arguments":arguments});
+            let input: String = [
+                json!({"type":"response.function_call_arguments.done","output_index":0,"item_id":"fc_1","arguments":arguments}),
+                json!({"type":"response.output_item.done","output_index":0,"item":item}),
+            ]
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect();
+            let response = sanitize(Response::builder().header("content-type", "text/event-stream").body(Body::from(input))?, secret)?;
+            let bytes = response.into_body().collect().await?.to_bytes();
+            let output = std::str::from_utf8(&bytes)?;
+            let events: Vec<Value> = output.lines().filter_map(|line| line.strip_prefix("data: ")).map(serde_json::from_str).collect::<Result<_, _>>()?;
+            assert_eq!(events.len(), 2);
+            for arguments in [&events[0]["arguments"], &events[1]["item"]["arguments"]] {
+                let value: Value = serde_json::from_str(arguments.as_str().unwrap())?;
+                assert_eq!(value["value"], "<provider key>", "{output}");
+            }
+            Ok(())
+        })).unwrap();
+    }
+
+    #[test]
+    fn tool_arguments_without_a_credential_keep_their_numbers() {
+        fictionet::block_on(fictionet::lab(fictionet::Seed::from_u64(16), |_| async {
+            let secret = Secret::new("provider key", "private-key".into())?;
+            let arguments = r#"{"n":123456789012345678901234567890,"pi":3.14159265358979323846}"#;
+            let body = json!({"output":[{"type":"function_call","name":"multiply","call_id":"call_1","arguments":arguments}]});
+            let response = sanitize(Response::new(Body::from(body.to_string())), secret.clone())?;
+            let value: Value = serde_json::from_slice(&response.into_body().collect().await?.to_bytes())?;
+            assert_eq!(value["output"][0]["arguments"], arguments);
+            let (first, second) = arguments.split_at(20);
+            let input: String = [first, second].into_iter().map(|partial| format!("data: {}\n\n", json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":partial}}))).collect();
+            let response = sanitize(Response::builder().header("content-type", "text/event-stream").body(Body::from(input))?, secret)?;
+            let bytes = response.into_body().collect().await?.to_bytes();
+            let output = std::str::from_utf8(&bytes)?;
+            let assembled: String = output.lines().filter_map(|line| line.strip_prefix("data: ")).map(|line| serde_json::from_str::<Value>(line).unwrap()["delta"]["partial_json"].as_str().unwrap().to_owned()).collect();
+            assert_eq!(assembled, arguments);
+            Ok(())
+        })).unwrap();
+    }
+
+    #[test]
+    fn legacy_function_call_argument_streams_are_scrubbed_after_assembly() {
+        fictionet::block_on(fictionet::lab(fictionet::Seed::from_u64(15), |_| async {
+            let secret = Secret::new("provider key", "private-key".into())?;
+            let parts = [r#"{"value":"private-"#, r#"key"}"#];
+            let input: String = parts.into_iter().map(|partial| format!("data: {}\n\n", json!({"choices":[{"index":0,"delta":{"function_call":{"arguments":partial}}}]}))).collect();
+            let frames = input.bytes().map(|byte| Ok(Frame::data(Bytes::from(vec![byte])))).collect();
+            let response = sanitize(Response::builder().header("content-type", "text/event-stream").body(Body::new(Chunks(frames)))?, secret)?;
+            let bytes = response.into_body().collect().await?.to_bytes();
+            let output = std::str::from_utf8(&bytes)?;
+            let arguments: String = output.lines().filter_map(|line| line.strip_prefix("data: ")).map(|line| serde_json::from_str::<Value>(line).unwrap()["choices"][0]["delta"]["function_call"]["arguments"].as_str().unwrap().to_owned()).collect();
+            let value: Value = serde_json::from_str(&arguments)?;
+            assert_eq!(value["value"], "<provider key>", "{output}");
             Ok(())
         })).unwrap();
     }

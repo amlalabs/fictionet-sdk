@@ -676,7 +676,7 @@ async fn events(response: Response<Body>, note: &impl Fn(Out)) -> fictionet::Res
         }
         return Ok(());
     }
-    let mut decoder = Stream::new(sse::Events::new());
+    let mut decoder = transport::events();
     let mut ended = false;
     while let Some(frame) = body.frame().await {
         let frame = frame?;

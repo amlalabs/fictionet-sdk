@@ -22,17 +22,24 @@ pub(super) fn scrub(values: &mut [Value], secret: &Secret, end: bool) -> usize {
     let mut replacements = BTreeMap::new();
     let mut ready = values.len();
     for (channel, pieces) in channels {
+        if channel == Channel::Arguments {
+            for (index, path, text) in pieces {
+                if let Some(safe) = arguments(&text, secret) {
+                    replacements.insert((index, path), safe);
+                }
+            }
+            continue;
+        }
         let joined: String = pieces.iter().map(|(_, _, text)| text.as_str()).collect();
         if matches!(channel, Channel::Tool(_, _)) {
             if !end {
                 ready = ready.min(pieces[0].0);
                 continue;
             }
-            if let Ok(mut arguments) = serde_json::from_str::<Value>(&joined) {
-                scrub(std::slice::from_mut(&mut arguments), secret, true);
-                let mut encoded = Some(serde_json::to_string(&arguments).expect("tool arguments"));
+            if let Some(safe) = arguments(&joined, secret) {
+                let mut safe = Some(safe);
                 for (index, path, _) in pieces {
-                    replacements.insert((index, path), encoded.take().unwrap_or_default());
+                    replacements.insert((index, path), safe.take().unwrap_or_default());
                 }
                 continue;
             }
@@ -92,4 +99,15 @@ pub(super) fn scrub(values: &mut [Value], secret: &Secret, end: bool) -> usize {
         scrub_json(value, secret);
     }
     ready
+}
+
+/// Tool arguments re-encoded without the credential, when their decoded
+/// JSON holds it. Other arguments keep their exact text.
+fn arguments(text: &str, secret: &Secret) -> Option<String> {
+    if !holds(text, secret) {
+        return None;
+    }
+    let mut arguments = serde_json::from_str::<Value>(text).ok()?;
+    scrub_json(&mut arguments, secret);
+    Some(serde_json::to_string(&arguments).expect("tool arguments"))
 }

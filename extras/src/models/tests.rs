@@ -989,6 +989,107 @@ impl Engine for ValidationPages {
 }
 
 #[test]
+fn usage_in_a_long_stream_event_counts_toward_the_budget() {
+    struct Transport;
+    impl web::Upstream for Transport {
+        fn request(self: Arc<Self>, _: Request<Body>) -> web::UpstreamFuture {
+            Box::pin(async move {
+                // OpenAI echoes the request's instructions in the terminal event.
+                let instructions = "a".repeat(70 * 1024);
+                let created = json!({"type":"response.created","response":{"id":"resp_1","status":"in_progress","instructions":instructions}});
+                let completed = json!({"type":"response.completed","response":{"id":"resp_1","status":"completed","instructions":instructions,"output":[],"usage":{"input_tokens":5,"output_tokens":2}}});
+                let body = format!("data: {created}\n\ndata: {completed}\n\n");
+                Ok(Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from(body))?)
+            })
+        }
+    }
+    fictionet::block_on(fictionet::run(
+        fictionet::Seed::from_u64(16),
+        |cx| async move {
+            let credential = Credential::api_key(
+                &cx,
+                Secret::new("OPENAI_API_KEY", "sk-proj-private".into())?,
+            );
+            let key = credential.wire(Provider::OpenAi, false);
+            let model = Model::with_forward(
+                &cx,
+                Provider::OpenAi,
+                Some(credential),
+                web::forward(&cx, "https://api.openai.com".parse()?, Arc::new(Transport))?,
+                "api.openai.com".into(),
+            )
+            .budget(Budget::new().input_tokens(1000).output_tokens(1000));
+            let body = json!({"model":"small","input":"hello","stream":true});
+            let request = Request::post("/v1/responses")
+                .header("authorization", &key)
+                .body(Body::from(body.to_string()))?;
+            let response = model.clone().send(request).await?;
+            assert_eq!(response.status(), 200);
+            let bytes = response.into_body().collect().await?.to_bytes();
+            assert!(std::str::from_utf8(&bytes)?.contains("response.completed"));
+            let ledger = model.ledger.lock().unwrap();
+            assert_eq!((ledger.input, ledger.output), (5, 2));
+            assert_eq!(ledger.exhausted(), None);
+            Ok(())
+        },
+    ))
+    .unwrap();
+}
+
+#[test]
+fn usage_in_a_long_json_response_counts_toward_the_budget() {
+    struct Transport;
+    impl web::Upstream for Transport {
+        fn request(self: Arc<Self>, _: Request<Body>) -> web::UpstreamFuture {
+            Box::pin(async move {
+                // OpenAI echoes the request's instructions in the response.
+                let instructions = "a".repeat(1024 * 1024);
+                let body = json!({"id":"resp_1","status":"completed","instructions":instructions,"output":[],"usage":{"input_tokens":5,"output_tokens":2}});
+                Ok(Response::builder()
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))?)
+            })
+        }
+    }
+    fictionet::block_on(fictionet::run(
+        fictionet::Seed::from_u64(17),
+        |cx| async move {
+            let credential = Credential::api_key(
+                &cx,
+                Secret::new("OPENAI_API_KEY", "sk-proj-private".into())?,
+            );
+            let key = credential.wire(Provider::OpenAi, false);
+            let model = Model::with_forward(
+                &cx,
+                Provider::OpenAi,
+                Some(credential),
+                web::forward(&cx, "https://api.openai.com".parse()?, Arc::new(Transport))?,
+                "api.openai.com".into(),
+            )
+            .budget(Budget::new().input_tokens(1000).output_tokens(1000));
+            let body = json!({"model":"small","input":"hello"});
+            let request = Request::post("/v1/responses")
+                .header("authorization", &key)
+                .body(Body::from(body.to_string()))?;
+            let response = model.clone().send(request).await?;
+            assert_eq!(response.status(), 200);
+            let bytes = response.into_body().collect().await?.to_bytes();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&bytes)?["usage"]["input_tokens"],
+                5
+            );
+            let ledger = model.ledger.lock().unwrap();
+            assert_eq!((ledger.input, ledger.output), (5, 2));
+            assert_eq!(ledger.exhausted(), None);
+            Ok(())
+        },
+    ))
+    .unwrap();
+}
+
+#[test]
 fn the_provider_receives_only_the_validated_json_value() {
     struct Transport;
     impl web::Upstream for Transport {

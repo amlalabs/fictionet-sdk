@@ -7,7 +7,7 @@
 //! continuation is relayed as the rest of the same response.
 
 use super::*;
-use fictionet::stdlib::codec::{Stream, try_pump};
+use fictionet::stdlib::codec::try_pump;
 use fictionet::stdlib::protocols::sse;
 use http_body::Frame;
 use response::{Block as OutputBlock, EventKind};
@@ -271,7 +271,7 @@ async fn read(
         return Ok(Turn { response, calls });
     }
     let mut body = response.into_body();
-    let mut decoder = Stream::new(sse::Events::new());
+    let mut decoder = transport::events();
     while let Some(frame) = body.frame().await {
         let frame = frame?;
         let Some(bytes) = frame.data_ref() else {
