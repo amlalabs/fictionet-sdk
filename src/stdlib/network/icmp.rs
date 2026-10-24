@@ -39,7 +39,9 @@ use fictionet::stdlib::network::ip::{self, Fields, Header, protocol};
 /// The reply comes from `addr`, goes to the request's source, and carries
 /// the request's identifier, sequence number and data, with a TTL or hop
 /// limit of 64 and correct checksums. A request with a wrong ICMP checksum
-/// gets no reply, as from a kernel. So does a fragment: put fragments back
+/// gets no reply, as from a kernel, and so does one from a source that is
+/// not one host: the unspecified address, loopback, a multicast address or
+/// the IPv4 broadcast address. So does a fragment: put fragments back
 /// together first, as [`split_protocols`](fictionet::stdlib::network::ip::split_protocols)
 /// does. IPv4 options and IPv6 extension headers of the request are not
 /// copied into the reply. A request with IPv6 extension headers that a host
@@ -49,7 +51,7 @@ use fictionet::stdlib::network::ip::{self, Fields, Header, protocol};
 pub fn echo_reply(packet: &Packet, addr: IpAddr) -> Option<Packet> {
     let bytes = &packet.0;
     let ip = Header::parse_whole(bytes)?;
-    if ip.dst != addr {
+    if ip.dst != addr || !is_one_host(ip.src) {
         return None;
     }
     let icmp = ip.payload(bytes);
@@ -154,13 +156,8 @@ pub fn error(packet: &[u8], from: IpAddr, kind: u8, code: u8, word: u32) -> Opti
     let later = ip.fragment.is_some_and(|f| f.offset != 0);
     let first = ip.payload(packet).first().copied();
     let (proto, limit) = match (ip.src, ip.dst, from) {
-        (IpAddr::V4(src), IpAddr::V4(dst), IpAddr::V4(_)) => {
-            if later
-                || src.is_unspecified()
-                || src.is_broadcast()
-                || src.is_multicast()
-                || src.is_loopback()
-            {
+        (IpAddr::V4(_), IpAddr::V4(dst), IpAddr::V4(_)) => {
+            if later || !is_one_host(ip.src) {
                 return None;
             }
             if dst.is_broadcast() || dst.is_multicast() {
@@ -172,9 +169,8 @@ pub fn error(packet: &[u8], from: IpAddr, kind: u8, code: u8, word: u32) -> Opti
             }
             (protocol::ICMP, 576 - 28)
         }
-        (IpAddr::V6(src), IpAddr::V6(dst), IpAddr::V6(_)) => {
-            if src.is_unspecified() || src.is_multicast() || src.is_loopback() || dst.is_multicast()
-            {
+        (IpAddr::V6(_), IpAddr::V6(dst), IpAddr::V6(_)) => {
+            if !is_one_host(ip.src) || dst.is_multicast() {
                 return None;
             }
             if ip.protocol == protocol::ICMPV6
@@ -194,6 +190,19 @@ pub fn error(packet: &[u8], from: IpAddr, kind: u8, code: u8, word: u32) -> Opti
     icmp.extend_from_slice(quote);
     set_checksum(&mut icmp, from, ip.src);
     Some(ip::packet(from, ip.src, proto, &icmp))
+}
+
+/// Whether `src` can be the source of one host: not the unspecified
+/// address, a multicast address, loopback (which never comes from the
+/// network) or the IPv4 broadcast address (RFC 1122, section 3.2.1.3; RFC
+/// 4291, section 2.5.2).
+fn is_one_host(src: IpAddr) -> bool {
+    match src {
+        IpAddr::V4(a) => {
+            !(a.is_unspecified() || a.is_broadcast() || a.is_multicast() || a.is_loopback())
+        }
+        IpAddr::V6(a) => !(a.is_unspecified() || a.is_multicast() || a.is_loopback()),
+    }
 }
 
 #[cfg(test)]
