@@ -355,7 +355,9 @@ async fn research(root: &Path, sources: &[String]) -> Result {
     let references: Vec<_> = references.into_iter().collect();
     let mut pending = Vec::new();
     for url in &references {
-        if !archive.contains(url) {
+        if !captured(&archive, url).is_ok_and(|response| {
+            response.status.is_success() || response.status == http::StatusCode::NOT_FOUND
+        }) {
             pending.push(url.clone());
         }
     }

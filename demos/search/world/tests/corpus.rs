@@ -30,6 +30,14 @@ fn linked_security_guidance_is_available_to_the_researcher() {
                 assert!(!page.body.is_empty(), "{url}");
                 eprintln!("reference {url}: {}", page.title);
             }
+            for url in [
+                "https://posthog.com/blog/nov-24-shai-hulud-attack-post-mortem",
+                "https://owasp.org/www-project-top-10-ci-cd-security-risks/",
+            ] {
+                let page = pages.clone().fetch(cx.clone(), url.into()).await?;
+                assert!(!page.title.is_empty(), "{url}");
+                assert!(!page.body.is_empty(), "{url}");
+            }
             Ok(())
         },
     ))
@@ -118,7 +126,7 @@ fn security_research_searches_and_citations_replay_without_internet() {
             ] {
                 let hits = pages
                     .clone()
-                    .search(cx.clone(), query.into(), "search", serde_json::json!({}))
+                    .search(cx.clone(), query.into(), Default::default())
                     .await?;
                 assert!(!hits.is_empty(), "{query}");
                 if query.starts_with("XZ Utils") {

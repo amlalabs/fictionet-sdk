@@ -36,6 +36,8 @@ urls = [
   "https://www.stepsecurity.io/blog/harden-runner-detection-tj-actions-changed-files-action-is-compromised",
   "https://www.cisa.gov/news-events/alerts/2025/03/18/supply-chain-compromise-third-party-tj-actionschanged-files-cve-2025-30066-and-reviewdogaction",
   "https://www.wiz.io/blog/shai-hulud-npm-supply-chain-attack",
+  "https://posthog.com/blog/nov-24-shai-hulud-attack-post-mortem",
+  "https://owasp.org/www-project-top-10-ci-cd-security-risks/",
   "https://unit42.paloaltonetworks.com/npm-supply-chain-attack/",
   "https://www.cisa.gov/news-events/alerts/2025/09/23/widespread-supply-chain-compromise-impacting-npm-ecosystem",
   "https://cloud.google.com/blog/topics/threat-intelligence/3cx-software-supply-chain-compromise/",

@@ -100,8 +100,10 @@ fn connection(
             let mut site = httpd::VHost::new(httpd::tower(Handler::new(&cx, pages)));
             site.https = true;
             sites.insert(&request_host, site);
-            let mut conn = fictionet::stdlib::services::serve::ConnInfo::default();
-            conn.tls = true;
+            let conn = fictionet::stdlib::services::serve::ConnInfo {
+                tls: true,
+                ..Default::default()
+            };
             let reply = sites.call(request, &mut httpd::Exchange::new(cx.now(), &cx, &conn));
             let response = match reply {
                 httpd::Reply::Now(response) => response,
