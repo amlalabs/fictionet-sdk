@@ -794,7 +794,7 @@ impl Reassembly {
 fn arrived(packet: &[u8]) -> Option<Arrived<'_>> {
     match version(packet)? {
         4 => {
-            let h = v4(packet, false)?;
+            let h = v4_checked(packet)?;
             let f = h.fragment?;
             let (IpAddr::V4(src), IpAddr::V4(dst)) = (h.src, h.dst) else {
                 return None;
@@ -1029,8 +1029,10 @@ impl Header {
     }
 
     /// Reads the header of a whole packet as a host that is its
-    /// destination takes it in, fragment or not. IPv6 extension headers
-    /// are checked as RFC 8200 asks (sections 4.1 to 4.6):
+    /// destination takes it in, fragment or not. An IPv4 header with a
+    /// wrong checksum discards the packet (RFC 1122, section 3.2.1.2).
+    /// IPv6 extension headers are checked as RFC 8200 asks (sections 4.1
+    /// to 4.6):
     ///
     /// - Hop-by-Hop Options may only come first. Anywhere else, it is
     ///   answered with Parameter Problem code 1, pointing at the "next
@@ -1060,7 +1062,7 @@ impl Header {
     /// discards it, and so does a packet that is not a whole IP packet.
     pub fn check(packet: &[u8]) -> Result<Header, Reject> {
         match version(packet) {
-            Some(4) => v4(packet, false).ok_or(Reject::Discard),
+            Some(4) => v4_checked(packet).ok_or(Reject::Discard),
             Some(6) => Ok(v6(packet, &chain6(packet, Walk::Check)?)),
             _ => Err(Reject::Discard),
         }
@@ -1128,6 +1130,14 @@ fn v4(bytes: &[u8], truncated: bool) -> Option<Header> {
         payload: ihl..total.min(bytes.len()),
         fragment,
     })
+}
+
+/// Reads the IPv4 header of a whole packet as a host takes it in: one
+/// with a wrong header checksum is discarded (RFC 1122, section 3.2.1.2).
+#[inline]
+fn v4_checked(bytes: &[u8]) -> Option<Header> {
+    let h = v4(bytes, false)?;
+    (checksum(&bytes[..h.payload.start]) == 0).then_some(h)
 }
 
 /// The header of an IPv6 packet whose chain [`chain6`] walked.
