@@ -77,6 +77,16 @@ impl Stream {
     }
 }
 
+/// The stream a client HEADERS lands on.
+enum HeadersOn {
+    /// One the server reset a moment ago: the frame is ignored.
+    Reset,
+    /// One already open: the block is its trailers.
+    Open,
+    /// A new stream, above every identifier used so far.
+    New,
+}
+
 struct Outbound {
     recv_window: i32,
     window: i32,
@@ -298,6 +308,34 @@ impl Http2 {
         );
     }
 
+    /// Finds the stream a client HEADERS on stream `id` lands on. One on an
+    /// even stream, a stream that ended, or one below an identifier already
+    /// used ends the connection.
+    fn headers_on(&self, id: u32) -> Result<HeadersOn, wire::Error> {
+        if id & 1 == 0 {
+            return Err(problem(
+                ErrorCode::ProtocolError,
+                "client opened an even stream",
+            ));
+        }
+        if self.ignored(id) {
+            return Ok(HeadersOn::Reset);
+        }
+        if self.streams.contains_key(&id) {
+            return Ok(HeadersOn::Open);
+        }
+        if id <= self.last_stream {
+            // A stream that ended, or one below an identifier already used
+            // (RFC 9113 sections 5.1 and 5.1.1): either is a connection
+            // error, and, as in h2, the two are not told apart.
+            return Err(problem(
+                ErrorCode::ProtocolError,
+                "HEADERS on a closed stream",
+            ));
+        }
+        Ok(HeadersOn::New)
+    }
+
     fn headers(
         &mut self,
         read: wire::BlockRead,
@@ -307,14 +345,12 @@ impl Http2 {
             return Ok(());
         };
         let id = read.stream;
-        if id & 1 == 0 {
-            return Err(problem(
-                ErrorCode::ProtocolError,
-                "client opened an even stream",
-            ));
-        }
-        if self.ignored(id) {
-            return Ok(());
+        match self.headers_on(id)? {
+            HeadersOn::Reset => return Ok(()),
+            HeadersOn::Open => {}
+            HeadersOn::New => {
+                self.last_stream = id;
+            }
         }
         if let Some(stream) = self.streams.get(&id) {
             if stream.recv_closed {
@@ -334,16 +370,6 @@ impl Http2 {
             }
             return Ok(());
         }
-        if id <= self.last_stream {
-            // A stream that ended, or one below an identifier already used
-            // (RFC 9113 sections 5.1 and 5.1.1): either is a connection
-            // error, and, as in h2, the two are not told apart.
-            return Err(problem(
-                ErrorCode::ProtocolError,
-                "HEADERS on a closed stream",
-            ));
-        }
-        self.last_stream = id;
         if self.draining || self.streams.len() >= self.limits.streams as usize {
             // A client can open streams before it reads our SETTINGS or GOAWAY,
             // so, as in h2, these refusals do not count as errors.
@@ -528,14 +554,14 @@ impl Http2 {
             // A stream that depends on itself is a stream error (RFC 9113
             // section 5.3.1). Its block was decoded above, so HPACK stays in step.
             Frame::Headers(h) if h.priority.is_some_and(|p| p.stream == h.stream) => {
-                if h.stream & 1 == 0 {
-                    return Err(problem(
-                        ErrorCode::ProtocolError,
-                        "client opened an even stream",
-                    ));
+                match self.headers_on(h.stream)? {
+                    HeadersOn::Reset => {}
+                    HeadersOn::Open => self.reset(h.stream, ErrorCode::ProtocolError, driver)?,
+                    HeadersOn::New => {
+                        self.last_stream = h.stream;
+                        self.reset(h.stream, ErrorCode::ProtocolError, driver)?;
+                    }
                 }
-                self.last_stream = self.last_stream.max(h.stream);
-                self.reset(h.stream, ErrorCode::ProtocolError, driver)?;
             }
             Frame::Headers(_) | Frame::Continuation(_) => self.headers(headers, driver)?,
             Frame::Data(data) => self.data(data, driver)?,
@@ -734,6 +760,10 @@ impl serve::Service for Http2 {
                     ))
                 } else if idle {
                     Err(error)
+                } else if self.ignored(header.stream) {
+                    // The server reset this stream a moment ago, so it
+                    // ignores the stream's late frames (section 5.1).
+                    Ok(())
                 } else if priority || self.streams.contains_key(&header.stream) {
                     self.reset(header.stream, error.code, driver)
                 } else {
@@ -1408,5 +1438,103 @@ mod tests {
             },
         ))
         .unwrap();
+    }
+
+    struct NotFound;
+    impl Handler for NotFound {
+        fn call(&self, _: Request<Body>, _: &mut Exchange<'_>) -> Reply {
+            Reply::Now(text(StatusCode::NOT_FOUND, "Not found.\n"))
+        }
+    }
+
+    /// The client preface, its SETTINGS, and its acknowledgment of the server's.
+    fn client_preface() -> Vec<u8> {
+        let mut bytes = PREFACE.to_vec();
+        for flags in [0, 1] {
+            write(
+                &wire::Settings {
+                    flags,
+                    entries: Vec::new(),
+                },
+                &mut bytes,
+            );
+        }
+        bytes
+    }
+
+    /// `POST /` over HTTP as one HEADERS frame on `stream` that ends the
+    /// stream. With `self_dependent`, its priority names the stream itself,
+    /// which no writer produces.
+    fn post(stream: u32, self_dependent: bool) -> Vec<u8> {
+        let block = [0x83, 0x86, 0x84];
+        let priority = if self_dependent { 5 } else { 0 };
+        let mut bytes = vec![0, 0, (block.len() + priority) as u8, 1];
+        bytes.push(if self_dependent { 0x25 } else { 5 });
+        bytes.extend_from_slice(&stream.to_be_bytes());
+        if self_dependent {
+            bytes.extend_from_slice(&stream.to_be_bytes());
+            bytes.push(0);
+        }
+        bytes.extend_from_slice(&block);
+        bytes
+    }
+
+    fn frames(mut bytes: &[u8]) -> Vec<Frame> {
+        let mut frames = Vec::new();
+        while !bytes.is_empty() {
+            let header = wire::FrameHeader::parse(&bytes[..9]).unwrap();
+            let end = 9 + header.length;
+            frames.push(Frame::parse(&bytes[..end]).unwrap());
+            bytes = &bytes[end..];
+        }
+        frames
+    }
+
+    #[test]
+    fn self_dependent_headers_on_a_closed_stream_end_the_connection() {
+        // HEADERS on a stream that has ended, or below one already opened,
+        // ends the connection (RFC 9113 sections 5.1 and 5.1.1), whatever
+        // priority the frame carries.
+        for (open, again) in [(1, 1), (5, 3)] {
+            let mut harness =
+                serve::Harness::new(fictionet::Seed::from_u64(1), Http2::new(NotFound), ());
+            harness.push(&client_preface()).unwrap();
+            let output = frames(&harness.push(&post(open, false)).unwrap());
+            assert!(
+                output
+                    .iter()
+                    .any(|f| matches!(f, Frame::Headers(h) if h.stream == open))
+            );
+            let output = frames(&harness.push(&post(again, true)).unwrap());
+            assert!(
+                output.iter().any(|f| matches!(f, Frame::GoAway(g)
+                    if g.last_stream == open && g.code == ErrorCode::ProtocolError as u32)),
+                "{output:?}"
+            );
+            assert!(!output.iter().any(|f| matches!(f, Frame::Reset(_))));
+            assert!(harness.closed());
+        }
+    }
+
+    #[test]
+    fn late_frames_on_a_reset_stream_are_ignored() {
+        let mut harness =
+            serve::Harness::new(fictionet::Seed::from_u64(1), Http2::new(NotFound), ());
+        harness.push(&client_preface()).unwrap();
+        let output = frames(&harness.push(&post(1, true)).unwrap());
+        assert!(output.iter().any(|f| matches!(f, Frame::Reset(r)
+            if r.stream == 1 && r.code == ErrorCode::ProtocolError as u32)));
+        // The server reset stream 1, so it ignores the stream's late frames
+        // for a while (RFC 9113 section 5.1), even ones that would be
+        // stream errors on an open stream.
+        for late in [
+            post(1, false),
+            post(1, true),
+            // PRIORITY with a 4-byte payload.
+            vec![0, 0, 4, 2, 0, 0, 0, 0, 1, 0, 0, 0, 0],
+        ] {
+            assert_eq!(frames(&harness.push(&late).unwrap()), [], "{late:?}");
+        }
+        assert!(!harness.closed());
     }
 }
