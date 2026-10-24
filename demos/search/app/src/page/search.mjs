@@ -123,7 +123,13 @@ function activityText(row) {
     case 'model_call': return [fact.host, 'HTTPS', `${phaseName(fact.phase)}`, 'calls'];
     case 'tool': return ['model gateway', 'Tool', `${fact.tool === 'fetch' ? 'Fetch' : 'Search'} · ${fact.target}`, 'calls'];
     case 'signin': return ['Sign-in', 'Policy', fact.open ? 'Open' : 'Closed', 'signin'];
-    case 'egress': return [fact.host, 'Upstream', `${purposeName(fact.purpose)} · ${fact.method} ${briefPath(fact.path)} · ${fact.status || phaseName(fact.phase)}`, `egress:${fact.host}`];
+    case 'egress': {
+      if (fact.purpose === 'live_capture') {
+        const copies = activityRows().filter((row) => row.fact.kind === 'egress' && row.fact.purpose === 'live_capture');
+        return ['Page copies', 'Upstream', `${copies.length} requests · ${new Set(copies.map((row) => row.fact.host)).size} hosts`, 'copies'];
+      }
+      return [fact.host, 'Upstream', `${purposeName(fact.purpose)} · ${fact.method} ${briefPath(fact.path)} · ${fact.status || phaseName(fact.phase)}`, `egress:${fact.host}`];
+    }
     case 'page_revision': {
       const target = fact.target.url ? new URL(fact.target.url).hostname : fact.target.host || 'Search';
       return [target, 'Writer', 'Revising page', 'writer'];
@@ -135,7 +141,11 @@ function activityText(row) {
 function feed() {
   const scrollTop = $('activity').scrollTop;
   $('activity').replaceChildren();
-  for (const row of activityRows().filter((r) => r.fact.kind !== 'run_started' && !(r.fact.kind === 'egress' && r.fact.purpose === 'model')).reverse()) {
+  const rows = activityRows();
+  const lastCopy = rows.findLast((row) => row.fact.kind === 'egress' && row.fact.purpose === 'live_capture');
+  for (const row of rows.reverse()) {
+    if (row.fact.kind === 'run_started') continue;
+    if (row.fact.kind === 'egress' && (row.fact.purpose === 'model' || (row.fact.purpose === 'live_capture' && row !== lastCopy))) continue;
     const [target, , text, selected] = activityText(row);
     const item = button('', () => select(selected), `activity-row ${row.fact.kind}`);
     item.append(element('span', stamp(row.at_ms), 'stamp'), element('span', target), element('span', text));

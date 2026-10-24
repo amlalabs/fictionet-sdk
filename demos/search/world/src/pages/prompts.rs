@@ -515,7 +515,12 @@ What the world has already said:
 pub fn expected_type(url: &str) -> Option<&'static str> {
     let (host, path, _) = split_url(url);
     let path = path.to_lowercase();
-    if path.ends_with(".pdf") || (host == "arxiv.org" && path.starts_with("/pdf/")) {
+    if path.ends_with(".pdf")
+        || (matches!(
+            host.as_str(),
+            "arxiv.org" | "www.arxiv.org" | "export.arxiv.org"
+        ) && path.starts_with("/pdf/"))
+    {
         Some("application/pdf")
     } else if path.ends_with(".json")
         || path.ends_with("/json")
