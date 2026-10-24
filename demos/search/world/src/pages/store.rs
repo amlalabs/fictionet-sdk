@@ -496,14 +496,30 @@ impl Store {
             .values()
             .filter(|search| super::make::shares_words(&search.query, subject))
         {
+            claims.extend(search.search.results.iter().map(Claim::search));
+        }
+        claims
+    }
+
+    /// A destination inherits the search that listed its exact address,
+    /// even when an opaque path shares no words with the query.
+    pub fn page_context(&self, host: &str, target: &str) -> Vec<Claim> {
+        let url = format!("https://{host}{target}");
+        let subject = format!(
+            "{url} {}",
+            serde_json::to_string(self.mentions(host, target)).expect("mentions")
+        );
+        let mut claims = self.writing_context(&subject);
+        for search in self
+            .searches
+            .values()
+            .filter(|search| search.search.results.iter().any(|result| result.url == url))
+        {
             for result in &search.search.results {
-                claims.push(Claim {
-                    url: result.url.clone(),
-                    claim: super::prompts::Statement {
-                        text: format!("Search result: {}: {}", result.title, result.snippet),
-                        known_on: super::answers::dates(&result.date).first().copied(),
-                    },
-                });
+                let claim = Claim::search(result);
+                if !claims.contains(&claim) {
+                    claims.push(claim);
+                }
             }
         }
         claims

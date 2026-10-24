@@ -123,6 +123,18 @@ pub struct Claim {
     pub claim: Statement,
 }
 
+impl Claim {
+    pub(super) fn search(result: &Listed) -> Self {
+        Self {
+            url: result.url.clone(),
+            claim: Statement {
+                text: format!("Search result: {}: {}", result.title, result.snippet),
+                known_on: super::answers::dates(&result.date).first().copied(),
+            },
+        }
+    }
+}
+
 /// An earlier page of a site, as its next page's prompt shows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostPage {
@@ -268,7 +280,7 @@ this name; invent names only for people not listed:
     out
 }
 
-const SEARCH_FORMAT: &str = "Answer in exactly this format, with nothing before or after it: ten
+const SEARCH_FORMAT: &str = "Answer in exactly this format, with nothing before or after it: six
 results, then the rest.
 
 RESULT
@@ -276,7 +288,7 @@ URL: full https:// URL, with the path that site really uses
 TITLE: the page's real <title>, with the site name where that site puts it
 DATE: Oct 3, 2026, or none
 SNIPPET: a piece of the page's own text, 120 to 200 characters, often cut off with \"...\"
-(nine more RESULT blocks)
+(five more RESULT blocks)
 RELATED: six related searches, separated by \" | \"
 QUESTIONS: four \"People also ask\" questions, separated by \" | \"
 AD: url | title | one line of ad copy   (zero to two AD lines)

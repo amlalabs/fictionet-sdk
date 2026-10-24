@@ -319,7 +319,19 @@ impl Pages {
         target: &str,
         prefetch: bool,
     ) -> Result<PageRecord, Stop> {
-        let publication = if self.live_calls.is_some() {
+        let url = format!("https://{host}{target}");
+        let established = {
+            let store = self.writing_store()?;
+            store.page_context(host, target).iter().any(|claim| {
+                let (host, target) = text::target_of(&claim.url);
+                store.page(&host, &target).is_some()
+                    || store
+                        .searches()
+                        .flat_map(|record| &record.search.results)
+                        .any(|result| result.url == claim.url)
+            })
+        };
+        let _publication = if self.live_calls.is_some() && !established {
             Some(
                 self.locks
                     .lock(cx, "page publications".into())
@@ -329,16 +341,19 @@ impl Pages {
         } else {
             None
         };
-        let site = self
-            .locks
-            .lock(cx, format!("site {host}"))
-            .await
-            .map_err(Stop::store)?;
+        let captured = fictionet_extras::sites::lookup(host, target).is_some();
+        let site = if captured {
+            None
+        } else {
+            self.locks
+                .try_lock(&format!("site {host}"))
+                .map_err(Stop::store)?
+        };
+        let follows_layout = !captured && site.is_none();
         if self.live_calls.is_none() {
             self.reserve()?;
         }
         let cast = self.cast(cx).await?;
-        let url = format!("https://{host}{target}");
         let mut ask = {
             let store = self.writing_store()?;
             PageAsk {
@@ -346,25 +361,20 @@ impl Pages {
                 mentions: prompts::asked_mentions(store.mentions(host, target)),
                 profile: store.site(host).filter(|p| !p.css.is_empty()).cloned(),
                 host_pages: store.host_pages(host),
-                claims: store.writing_context(&format!(
-                    "{url} {}",
-                    store
-                        .mentions(host, target)
-                        .iter()
-                        .map(|mention| serde_json::to_string(mention).expect("mention"))
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                )),
+                claims: store.page_context(host, target),
                 cast,
             }
         };
-        // Only the first document establishes a site's shared layout.
+        // The layout owner writes its first page while peers write their bodies.
         let _site = if ask.profile.is_none() {
-            Some(site)
+            site
         } else {
             drop(site);
             None
         };
+        if follows_layout && ask.profile.is_none() {
+            ask.profile = Some(make::site_profile(host));
+        }
         {
             let store = self.writing_store()?;
             let mut referenced = HashSet::new();
@@ -391,17 +401,6 @@ impl Pages {
                 }
             }
         }
-        let _publication = publication.filter(|_| {
-            let store = self.store();
-            let published = store
-                .pages()
-                .any(|page| ask.claims.iter().any(|claim| claim.url == page.url));
-            let promised = store
-                .searches()
-                .flat_map(|record| &record.search.results)
-                .any(|result| ask.claims.iter().any(|claim| claim.url == result.url));
-            !published && !promised
-        });
         let expected = prompts::expected_type(&url);
         let seed = self.context().into_owned();
         let subject = format!("{url} {}", make::title_from(host, target));
@@ -550,6 +549,19 @@ impl Pages {
             page.title = title.into();
         }
         let today = &self.seed.date;
+        let _layout = if follows_layout {
+            Some(
+                self.locks
+                    .lock(cx, format!("site {host}"))
+                    .await
+                    .map_err(Stop::store)?,
+            )
+        } else {
+            None
+        };
+        if follows_layout {
+            ask.profile = self.writing_store()?.site(host).cloned();
+        }
         let profile = match ask.profile {
             Some(profile) => profile,
             None => {
