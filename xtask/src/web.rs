@@ -349,6 +349,7 @@ pub async fn build(downloads: &Path, step: Step) -> Result {
         for (name, url) in [
             ("mdn", "https://developer.mozilla.org/en-US/docs/"),
             ("github-docs", "https://docs.github.com/en"),
+            ("cooking", "https://based.cooking/"),
             (
                 "wikipedia-missing",
                 "https://en.wikipedia.org/wiki/This_article_does_not_exist",

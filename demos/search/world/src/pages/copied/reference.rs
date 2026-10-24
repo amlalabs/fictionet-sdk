@@ -14,6 +14,7 @@ pub(super) struct ReferenceWeb {
     wikipedia: Zim,
     documents: Archive,
     hosts: HashSet<String>,
+    files: Vec<ArchiveFile>,
 }
 
 fn wiki_file(root: &Path) -> std::path::PathBuf {
@@ -39,10 +40,6 @@ fn sources(root: &Path, research: &Path) -> io::Result<Vec<ArchiveFile>> {
     Ok(files)
 }
 
-fn documents(root: &Path) -> io::Result<Archive> {
-    Archive::open(archive_files(root)?.into_iter().map(|file| file.path))
-}
-
 fn available_space(root: &Path) -> io::Result<u64> {
     let path = std::ffi::CString::new(root.as_os_str().as_encoded_bytes())?;
     let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
@@ -55,7 +52,7 @@ fn available_space(root: &Path) -> io::Result<u64> {
 }
 
 impl ReferenceWeb {
-    pub fn open(root: &Path, research: &Path) -> Result<Self, String> {
+    pub fn open(root: &Path) -> Result<Self, String> {
         let wikipedia = Zim::new(wiki_file(root))
             .map_err(|e| format!("Offline Wikipedia: {e}. Run cargo xtask search-web"))?;
         let index = DiskIndex::open(&root.join("index/current"))
@@ -67,8 +64,16 @@ impl ReferenceWeb {
                 .ok_or("offline index has no sources")?,
         )
         .map_err(|e| e.to_string())?;
-        if prepared.files != sources(root, research).map_err(|e| e.to_string())? {
-            return Err("Offline corpus changed. Run cargo xtask search-web with --index".into());
+        for file in &prepared.files {
+            let metadata = file.path.metadata().map_err(|e| e.to_string())?;
+            if metadata.len() != file.bytes
+                || metadata.modified().map_err(|e| e.to_string())? != file.modified
+            {
+                return Err(format!(
+                    "Indexed archive changed: {}. Run cargo xtask search-web with --index",
+                    file.path.display()
+                ));
+            }
         }
         let documents = prepared.documents;
         let hosts = documents
@@ -81,7 +86,16 @@ impl ReferenceWeb {
             wikipedia,
             documents,
             hosts,
+            files: prepared.files,
         })
+    }
+
+    pub fn files_for(&self, directory: &Path) -> Vec<ArchiveFile> {
+        self.files
+            .iter()
+            .filter(|file| file.path.parent() == Some(directory))
+            .cloned()
+            .collect()
     }
 
     pub fn serves(&self, host: &str) -> bool {
@@ -175,10 +189,10 @@ impl Pages {
             return Ok(());
         }
         let writer = DiskWriter::create(&staged).map_err(|e| e.to_string())?;
-        captured
-            .index
-            .write_to(&writer)
-            .map_err(|e| e.to_string())?;
+        let CorpusSearch::Crawled(index) = &captured.search else {
+            return Err("research pages must be loaded before reference indexing".into());
+        };
+        index.write_to(&writer).map_err(|e| e.to_string())?;
         eprintln!("Preparing Wikipedia articles…");
         // Physical cluster order decompresses each cluster once. Directory order
         // would repeatedly decompress the same multi-megabyte cluster.
@@ -236,7 +250,20 @@ impl Pages {
                     Ok(())
                 })
         })?;
-        let documents = documents(&root).map_err(|e| e.to_string())?;
+        drop(entries);
+        drop(wikipedia);
+        let files = sources(&root, &research).map_err(|e| e.to_string())?;
+        let document_root = std::fs::canonicalize(&root).map_err(|e| e.to_string())?;
+        let documents = Archive::open(
+            files
+                .iter()
+                .filter(|file| {
+                    file.path.parent() == Some(document_root.as_path())
+                        && file.path.to_string_lossy().ends_with(".warc.gz")
+                })
+                .map(|file| file.path.clone()),
+        )
+        .map_err(|e| e.to_string())?;
         let seeds = documents.urls().map(str::to_owned).collect::<Vec<_>>();
         let document_index = Index::crawl(
             &seeds,
@@ -247,10 +274,7 @@ impl Pages {
         document_index
             .write_to(&writer)
             .map_err(|e| e.to_string())?;
-        let prepared = Prepared {
-            files: sources(&root, &research).map_err(|e| e.to_string())?,
-            documents,
-        };
+        let prepared = Prepared { files, documents };
         writer
             .finish(&serde_json::to_string(&prepared).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;

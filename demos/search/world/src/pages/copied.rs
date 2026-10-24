@@ -12,10 +12,14 @@ const INDEX_VERSION: u32 = 5;
 pub(super) struct Corpus {
     archive: Archive,
     missing: Archive,
-    index: Index,
+    search: CorpusSearch,
     hosts: HashSet<String>,
     packages: Option<PackageSites>,
-    reference: Option<reference::ReferenceWeb>,
+}
+
+enum CorpusSearch {
+    Crawled(Index),
+    Reference(Box<reference::ReferenceWeb>),
 }
 
 /// A retained page identity. Copied bodies are read from the immutable corpus
@@ -103,7 +107,7 @@ impl Corpus {
         url: &str,
     ) -> std::io::Result<Option<fictionet_extras::warc::Response>> {
         use kuchiki::traits::TendrilSink;
-        let response = if let Some(reference) = &self.reference {
+        let response = if let CorpusSearch::Reference(reference) = &self.search {
             reference.response(url)?
         } else {
             None
@@ -152,7 +156,7 @@ impl Corpus {
     }
 }
 
-#[derive(Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct ArchiveFile {
     path: std::path::PathBuf,
     bytes: u64,
@@ -251,10 +255,7 @@ impl Pages {
                 || crate::route::SEARCH_HOSTS.contains(&host.as_str())
                 || self.copied.as_ref().is_some_and(|corpus| {
                     corpus.hosts.contains(&host)
-                        || corpus
-                            .reference
-                            .as_ref()
-                            .is_some_and(|web| web.serves(&host))
+                        || matches!(&corpus.search, CorpusSearch::Reference(web) if web.serves(&host))
                         || corpus
                             .packages
                             .as_ref()
@@ -274,13 +275,9 @@ impl Pages {
         let reference = corpus
             .reference
             .as_ref()
-            .map(|directory| reference::ReferenceWeb::open(&downloads.join(directory), &root))
+            .map(|directory| reference::ReferenceWeb::open(&downloads.join(directory)))
             .transpose()?;
-        let mut pages = Self::load_copied(seed, &root, &urls, model, true)?;
-        Arc::get_mut(pages.copied.as_mut().unwrap())
-            .unwrap()
-            .reference = reference;
-        Ok(pages)
+        Self::load_copied(seed, &root, &urls, model, true, reference)
     }
 
     /// Open the copied sites and crawl them from their starting URLs.
@@ -291,7 +288,7 @@ impl Pages {
         seeds: &[String],
         model: Option<Model>,
     ) -> Result<Self, String> {
-        Self::load_copied(seed, root, seeds, model, false)
+        Self::load_copied(seed, root, seeds, model, false, None)
     }
 
     fn load_copied(
@@ -300,11 +297,15 @@ impl Pages {
         seeds: &[String],
         model: Option<Model>,
         cache_index: bool,
+        reference: Option<reference::ReferenceWeb>,
     ) -> Result<Self, String> {
         let started = Instant::now();
         let research_root = Archive::directory_root(root).map_err(|e| e.to_string())?;
         eprintln!("Loading copied pages…");
-        let files = archive_files(&research_root).map_err(|e| e.to_string())?;
+        let files = match &reference {
+            Some(reference) => reference.files_for(&research_root),
+            None => archive_files(&research_root).map_err(|e| e.to_string())?,
+        };
         let cache_path = cache_index.then(|| research_root.join("search-index.json"));
         let cached = cache_path
             .as_ref()
@@ -313,18 +314,18 @@ impl Pages {
                 serde_json::from_reader::<_, CachedCorpus>(std::io::BufReader::new(file)).ok()
             })
             .filter(|cache| {
-                cache.version == INDEX_VERSION && cache.files == files && cache.seeds == seeds
+                (reference.is_some() || cache.version == INDEX_VERSION)
+                    && cache.files == files
+                    && cache.seeds == seeds
             });
         let (archive, missing, index) = match cached {
             Some(cache) => (cache.archive, cache.missing, Some(cache.index)),
-            None => {
-                eprintln!("Indexing copied pages…");
-                (
-                    Archive::directory(&research_root).map_err(|e| e.to_string())?,
-                    missing_pages(&research_root).map_err(|e| e.to_string())?,
-                    None,
-                )
-            }
+            None => (
+                Archive::open(files.iter().map(|file| file.path.clone()))
+                    .map_err(|e| e.to_string())?,
+                missing_pages(&research_root).map_err(|e| e.to_string())?,
+                None,
+            ),
         };
         if !seeds.iter().any(|url| archive.contains(url)) {
             return Err("the copied corpus has none of its starting URLs".into());
@@ -362,59 +363,66 @@ impl Pages {
         let mut corpus = Corpus {
             archive,
             missing,
-            index: Index::default(),
+            search: CorpusSearch::Crawled(Index::default()),
             hosts,
             packages,
-            reference: None,
         };
-        corpus.index = match index {
-            Some(index) => index,
-            None => {
-                let index = Index::crawl(
-                    &corpus.archive.urls().map(str::to_owned).collect::<Vec<_>>(),
-                    |url| corpus.archive.contains(url),
-                    |url| corpus.response(url),
-                )
-                .map_err(|e| e.to_string())?;
-                if let Some(cache_path) = cache_path {
-                    let cache = CachedCorpus {
-                        version: INDEX_VERSION,
-                        files,
-                        seeds: seeds.to_vec(),
-                        archive: corpus.archive,
-                        missing: corpus.missing,
-                        index,
-                    };
-                    let temporary = cache_path.with_extension(format!(
-                        "{}-{}.tmp",
-                        std::process::id(),
-                        time::OffsetDateTime::now_utc().unix_timestamp_nanos()
-                    ));
-                    let saved = (|| -> std::io::Result<()> {
-                        use std::io::Write;
-                        let mut file = std::io::BufWriter::new(std::fs::File::create(&temporary)?);
-                        serde_json::to_writer(&mut file, &cache)?;
-                        file.flush()?;
-                        std::fs::rename(&temporary, &cache_path)
-                    })();
-                    if let Err(error) = saved {
-                        let _ = std::fs::remove_file(&temporary);
-                        eprintln!("Search index cache unavailable: {error}");
+        corpus.search = if let Some(reference) = reference {
+            CorpusSearch::Reference(Box::new(reference))
+        } else {
+            CorpusSearch::Crawled(match index {
+                Some(index) => index,
+                None => {
+                    let index = Index::crawl(
+                        &corpus.archive.urls().map(str::to_owned).collect::<Vec<_>>(),
+                        |url| corpus.archive.contains(url),
+                        |url| corpus.response(url),
+                    )
+                    .map_err(|e| e.to_string())?;
+                    if let Some(cache_path) = cache_path {
+                        let cache = CachedCorpus {
+                            version: INDEX_VERSION,
+                            files,
+                            seeds: seeds.to_vec(),
+                            archive: corpus.archive,
+                            missing: corpus.missing,
+                            index,
+                        };
+                        let temporary = cache_path.with_extension(format!(
+                            "{}-{}.tmp",
+                            std::process::id(),
+                            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+                        ));
+                        let saved = (|| -> std::io::Result<()> {
+                            use std::io::Write;
+                            let mut file =
+                                std::io::BufWriter::new(std::fs::File::create(&temporary)?);
+                            serde_json::to_writer(&mut file, &cache)?;
+                            file.flush()?;
+                            std::fs::rename(&temporary, &cache_path)
+                        })();
+                        if let Err(error) = saved {
+                            let _ = std::fs::remove_file(&temporary);
+                            eprintln!("Search index cache unavailable: {error}");
+                        }
+                        corpus.archive = cache.archive;
+                        corpus.missing = cache.missing;
+                        cache.index
+                    } else {
+                        index
                     }
-                    corpus.archive = cache.archive;
-                    corpus.missing = cache.missing;
-                    cache.index
-                } else {
-                    index
                 }
-            }
+            })
         };
-        if corpus.index.is_empty() {
+        if matches!(&corpus.search, CorpusSearch::Crawled(index) if index.is_empty()) {
             return Err("the copied corpus has no reachable HTML pages".into());
         }
         eprintln!(
             "Copied pages: {} indexed; ready in {:.3}s",
-            corpus.index.len(),
+            match &corpus.search {
+                CorpusSearch::Crawled(index) => index.len() as u64,
+                CorpusSearch::Reference(reference) => reference.index.len(),
+            },
             started.elapsed().as_secs_f64()
         );
         let mut pages = match model {
@@ -438,8 +446,8 @@ impl Pages {
         start: u64,
     ) -> Result<(search::Search, Cache, Option<Usage>, u64), Stop> {
         let corpus = self.copied.as_ref().unwrap();
-        let search = if let Some(reference) = &corpus.reference {
-            reference
+        let search = match &corpus.search {
+            CorpusSearch::Reference(reference) => reference
                 .index
                 .search(query, start.try_into().unwrap_or(usize::MAX), 10, |url| {
                     let response = corpus
@@ -449,11 +457,10 @@ impl Pages {
                         &response.decoded()?,
                     ))
                 })
-                .map_err(Stop::store)?
-        } else {
-            corpus
-                .index
-                .search(query, start.try_into().unwrap_or(usize::MAX), 10)
+                .map_err(Stop::store)?,
+            CorpusSearch::Crawled(index) => {
+                index.search(query, start.try_into().unwrap_or(usize::MAX), 10)
+            }
         };
         Ok((search, Cache::Cached, None, 0))
     }
