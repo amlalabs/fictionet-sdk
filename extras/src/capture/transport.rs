@@ -23,7 +23,13 @@ impl Pool {
             return Ok(client.clone());
         }
         let client = client(url).await?;
-        Ok(self.clients.lock().await.entry(origin).or_insert(client).clone())
+        Ok(self
+            .clients
+            .lock()
+            .await
+            .entry(origin)
+            .or_insert(client)
+            .clone())
     }
 }
 

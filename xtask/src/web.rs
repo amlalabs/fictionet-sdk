@@ -141,7 +141,10 @@ async fn copy_site(root: &Path, name: &str, origin: &str) -> Result {
         missing_url.set_path("/404");
         archive.append(&temporary, missing_url.as_str(), &missing)?;
     } else {
-        eprintln!("{name}: upstream missing-page request returned {}", missing.status);
+        eprintln!(
+            "{name}: upstream missing-page request returned {}",
+            missing.status
+        );
     }
     std::fs::rename(temporary, destination)?;
     Ok(())
