@@ -6,6 +6,37 @@ use std::{collections::HashSet, path::PathBuf, sync::Arc};
 use web_world::pages::{Meta, Pages, Seed};
 
 #[test]
+fn linked_security_guidance_is_available_to_the_researcher() {
+    let downloads = std::env::var_os("SEARCH_DOWNLOADS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../downloads"));
+    let seed = Seed::builtin("security").unwrap();
+    let archive =
+        Archive::directory(&downloads.join(&seed.corpus.as_ref().unwrap().directory)).unwrap();
+    let source = "https://unit42.paloaltonetworks.com/github-actions-supply-chain-attack/";
+    let response = archive.get(source).unwrap().unwrap();
+    let references = fictionet_extras::capture::references(source, &response).unwrap();
+    let pages = Arc::new(Pages::from_corpus(seed, &downloads, None).unwrap());
+    fictionet::block_on(fictionet::lab(
+        fictionet::Seed::from_u64(12),
+        |cx| async move {
+            for host in ["securitylab.github.com", "owasp.org"] {
+                let url = references
+                    .iter()
+                    .find(|url| url::Url::parse(url).unwrap().host_str() == Some(host))
+                    .unwrap_or_else(|| panic!("no citation to {host}"));
+                let page = pages.clone().fetch(cx.clone(), url.clone()).await?;
+                assert!(!page.title.is_empty(), "{url}");
+                assert!(!page.body.is_empty(), "{url}");
+                eprintln!("reference {url}: {}", page.title);
+            }
+            Ok(())
+        },
+    ))
+    .unwrap();
+}
+
+#[test]
 fn security_research_searches_and_citations_replay_without_internet() {
     let downloads = std::env::var_os("SEARCH_DOWNLOADS")
         .map(PathBuf::from)
