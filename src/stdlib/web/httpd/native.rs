@@ -753,3 +753,138 @@ mod router_tests {
         assert_eq!(held.lock().last(), Some(&0));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use fictionet::stdlib::services::serve::Harness;
+    use fictionet::sync::Mutex;
+
+    /// Records the data frames of each request body until it ends or fails.
+    struct Frames(Arc<Mutex<Vec<u8>>>);
+
+    impl Handler for Frames {
+        fn call(&self, request: Request<Body>, _: &mut Exchange<'_>) -> Reply {
+            let mut body = request.into_body();
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            while let Poll::Ready(Some(Ok(frame))) = Pin::new(&mut body).poll_frame(&mut cx) {
+                if let Ok(data) = frame.into_data() {
+                    self.0.lock().extend_from_slice(&data);
+                }
+            }
+            Reply::Now(Response::new(Body::empty()))
+        }
+    }
+
+    #[test]
+    fn a_failed_chunked_body_reaches_the_handler_without_its_framing() {
+        for (rest, sent) in [
+            // A chunk size that is not hex.
+            (&b"3\r\nabc\r\nzz\r\n"[..], &b"abc"[..]),
+            // A chunk extension, then a whole second request.
+            (
+                b"3\r\nabc\r\n0;x\r\n\r\nGET /admin HTTP/1.1\r\nHost: a\r\n\r\n",
+                b"abc",
+            ),
+        ] {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let mut h = Harness::new(
+                fictionet::Seed::from_u64(0),
+                Http1::new(Frames(seen.clone())),
+                (),
+            );
+            let mut request =
+                b"POST /u HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+            request.extend_from_slice(rest);
+            let _ = h.push(&request);
+            assert_eq!(
+                String::from_utf8_lossy(&seen.lock()),
+                String::from_utf8_lossy(sent),
+                "{:?}",
+                String::from_utf8_lossy(rest)
+            );
+        }
+    }
+
+    /// A body that waits until `open` is set, then sends `done`.
+    struct Gate(Arc<AtomicBool>, bool);
+
+    impl http_body::Body for Gate {
+        type Data = Bytes;
+        type Error = Infallible;
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
+            if !self.0.load(Ordering::Relaxed) {
+                return Poll::Pending;
+            }
+            if self.1 {
+                return Poll::Ready(None);
+            }
+            self.1 = true;
+            Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(b"done")))))
+        }
+    }
+
+    struct Slow(Arc<AtomicBool>);
+
+    impl Handler for Slow {
+        fn call(&self, request: Request<Body>, _: &mut Exchange<'_>) -> Reply {
+            let body = if request.uri().path() == "/slow" {
+                Body::new(Gate(self.0.clone(), false))
+            } else {
+                Body::from("next")
+            };
+            Reply::Now(Response::new(body))
+        }
+    }
+
+    #[test]
+    fn a_pipelined_request_survives_a_response_slower_than_the_head_timeout() {
+        let open = Arc::new(AtomicBool::new(false));
+        let mut h = Harness::new(
+            fictionet::Seed::from_u64(0),
+            Http1::new(Slow(open.clone())),
+            (),
+        );
+        h.push(b"GET /slow HTTP/1.1\r\nHost: a\r\n\r\nGET /next HTTP/1.1\r\nHost: a\r\n\r\n")
+            .unwrap();
+        // The first response takes longer than the 30-second head timeout,
+        // while the second request already waits in the buffer.
+        h.advance(Duration::from_secs(31)).unwrap();
+        open.store(true, Ordering::Relaxed);
+        h.poll().unwrap();
+        let out = String::from_utf8_lossy(h.output()).into_owned();
+        assert_eq!(out.matches("HTTP/1.1 200 OK\r\n").count(), 2, "{out:?}");
+        assert!(out.ends_with("\r\n\r\nnext"), "{out:?}");
+        assert!(!h.closed());
+    }
+
+    struct Hello;
+
+    impl Handler for Hello {
+        fn call(&self, _: Request<Body>, _: &mut Exchange<'_>) -> Reply {
+            Reply::Now(Response::new(Body::from("hello")))
+        }
+    }
+
+    #[test]
+    fn a_successful_connect_answer_has_no_body_framing() {
+        let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(Hello), ());
+        let _ = h.push(b"CONNECT a.test:443 HTTP/1.1\r\nHost: a.test:443\r\n\r\n");
+        // After a 2xx to CONNECT every byte is tunnel data, so the answer
+        // must be a whole response for CONNECT with nothing after its head.
+        let out = h.output().to_vec();
+        assert_eq!(
+            http1::Response::parse_for(&out, "CONNECT").map(|r| r.head.status),
+            Ok(200),
+            "{:?}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+}
