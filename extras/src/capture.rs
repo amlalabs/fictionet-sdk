@@ -75,7 +75,7 @@ pub fn title(response: &warc::Response) -> io::Result<String> {
     Ok(title)
 }
 
-/// Outbound article references, excluding surrounding site navigation.
+/// Article references, including the publisher's own pages and cited site roots.
 pub fn references(url: &str, response: &warc::Response) -> io::Result<Vec<String>> {
     if !response.status.is_success()
         || !response
@@ -88,13 +88,14 @@ pub fn references(url: &str, response: &warc::Response) -> io::Result<Vec<String
     let decoded = response.decoded_with_limit(PARSE_BYTES)?;
     let dom = kuchiki::parse_html().one(String::from_utf8_lossy(&decoded).into_owned());
     for node in dom
-        .select("nav, header, footer, aside")
+        .select("nav, header, footer, aside, [role=navigation]")
         .unwrap()
         .collect::<Vec<_>>()
     {
         node.as_node().detach();
     }
-    let original = Url::parse(url).map_err(io::Error::other)?;
+    let mut original = Url::parse(url).map_err(io::Error::other)?;
+    original.set_fragment(None);
     let base = dom
         .select_first("base[href]")
         .ok()
@@ -105,18 +106,22 @@ pub fn references(url: &str, response: &warc::Response) -> io::Result<Vec<String
         .or_else(|_| dom.select_first("main"));
     let content = article.map(|node| node.as_node().clone()).unwrap_or(dom);
     let mut seen = std::collections::HashSet::new();
-    Ok(content
+    let mut references = Vec::new();
+    for url in content
         .select("a[href], area[href]")
         .unwrap()
         .filter_map(|node| {
             let url = base.join(node.attributes.borrow().get("href")?).ok()?;
             warc::key(url.as_str())
         })
-        .filter(|url| {
-            Url::parse(url).is_ok_and(|url| url.origin() != original.origin() && url.path() != "/")
-                && seen.insert(url.clone())
-        })
-        .collect())
+        .filter(|url| url != original.as_str() && seen.insert(url.clone()))
+    {
+        if references.len() >= 2048 || url.len() > 8192 {
+            return Err(io::Error::other("capture discovery exceeds link limit"));
+        }
+        references.push(url);
+    }
+    Ok(references)
 }
 
 fn link(base: &Url, value: &str, out: &mut Vec<String>) -> io::Result<()> {
@@ -455,14 +460,16 @@ mod tests {
     }
 
     #[test]
-    fn article_references_exclude_site_navigation_and_keep_external_citations() {
+    fn article_references_keep_citations_and_exclude_surrounding_navigation() {
         let page = response(
             "text/html",
             r#"
             <base href="https://publisher.org/posts/">
             <nav><a href="https://accounts.org/login">Sign in</a></nav>
             <main><article>
-              <a href="../about">About</a>
+              <div role="navigation"><a href="/topics">Topics</a></div>
+              <a href="reviewdog">Related incident</a>
+              <a href="incident#timeline">This article</a>
               <a href="https://securitylab.github.com/research/pwn-requests/#mitigations">Research</a>
               <a href="https://owasp.org/www-project-top-10-ci-cd-security-risks/">OWASP</a>
               <a href="https://securitylab.github.com/research/pwn-requests/">Same research</a>
@@ -473,10 +480,18 @@ mod tests {
         "#,
         );
         let found = references("https://publisher.org/posts/incident", &page).unwrap();
-        assert_eq!(found.len(), 2);
-        assert!(found.contains(&"https://securitylab.github.com/research/pwn-requests/".into()));
-        assert!(
-            found.contains(&"https://owasp.org/www-project-top-10-ci-cd-security-risks/".into())
+        assert_eq!(
+            found,
+            [
+                "https://publisher.org/posts/reviewdog",
+                "https://securitylab.github.com/research/pwn-requests/",
+                "https://owasp.org/www-project-top-10-ci-cd-security-risks/",
+                "https://vendor.org/",
+            ]
+        );
+        assert_eq!(
+            references("https://publisher.org/posts/incident#timeline", &page).unwrap(),
+            found
         );
         let mut denied = page;
         denied.status = http::StatusCode::FORBIDDEN;
