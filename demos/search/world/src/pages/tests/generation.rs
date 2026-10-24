@@ -893,3 +893,76 @@ fn future_plans_obey_the_same_publication_cutoff() {
         crate::pages::answers::chronology(&page, seed::parse_date("2026-10-24").unwrap()).is_err()
     );
 }
+
+#[test]
+fn search_promises_allow_parallel_first_sources() {
+    struct Peer {
+        ready: tokio::sync::Barrier,
+        fake: Arc<Fake>,
+    }
+    impl Transport for Peer {
+        fn post<'a>(&'a self, cx: &'a Cx, headers: Headers, body: Vec<u8>) -> Post<'a> {
+            Box::pin(async move {
+                self.ready.wait().await;
+                self.fake.post(cx, headers, body).await
+            })
+        }
+    }
+    let fake = Fake::new(|_, body| {
+        let prompt = body["messages"][1]["content"].as_str().unwrap();
+        assert!(prompt.contains("Reference guidance was published on 1 October 2026."));
+        completion(
+            0,
+            "STATUS: 200\nTITLE: Reference\nDATE: 2026-10-01\nSITE_CSS: body {color:#234}\nBODY:\n<h1>Reference</h1><p>Reference guidance was published on 1 October 2026.</p>",
+            None,
+        )
+    });
+    let model = Model::new(
+        Provider::OpenRouter,
+        "small",
+        "",
+        Key::new("provider key", Some(KEY.into())).unwrap(),
+        Arc::new(Peer {
+            ready: tokio::sync::Barrier::new(2),
+            fake,
+        }),
+    );
+    let pages = Arc::new(Pages::with_model(seed(), model));
+    pages
+        .store()
+        .insert_search(SearchRecord {
+            key: "reference".into(),
+            query: "reference".into(),
+            usage: Usage::stored(0),
+            search: search::Search {
+                results: ["news.fields.com", "research.fields.com"]
+                    .into_iter()
+                    .map(|host| search::Result {
+                        url: format!("https://{host}/reference"),
+                        title: "Reference".into(),
+                        date: "1 Oct 2026".into(),
+                        snippet: "Reference guidance was published on 1 October 2026.".into(),
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+        })
+        .unwrap();
+    lab(move |cx| async move {
+        let other = pages.clone();
+        let (done, response) = tokio::sync::oneshot::channel();
+        cx.spawn(move |cx| async move {
+            done.send(get(&other, &cx, "https://news.fields.com/reference").await)
+                .unwrap();
+            Ok(())
+        });
+        assert_eq!(
+            get(&pages, &cx, "https://research.fields.com/reference")
+                .await
+                .status,
+            200
+        );
+        assert_eq!(response.await.unwrap().status, 200);
+        Ok(())
+    });
+}

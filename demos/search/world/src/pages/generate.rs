@@ -378,10 +378,15 @@ impl Pages {
             }
         }
         let _publication = publication.filter(|_| {
-            !self
-                .store()
+            let store = self.store();
+            let published = store
                 .pages()
-                .any(|page| ask.claims.iter().any(|claim| claim.url == page.url))
+                .any(|page| ask.claims.iter().any(|claim| claim.url == page.url));
+            let promised = store
+                .searches()
+                .flat_map(|record| &record.search.results)
+                .any(|result| ask.claims.iter().any(|claim| claim.url == result.url));
+            !published && !promised
         });
         let expected = prompts::expected_type(&url);
         let seed = self.context().into_owned();
