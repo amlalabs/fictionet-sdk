@@ -3,7 +3,11 @@
 use crate::Result;
 use fictionet_extras::{capture::BROWSER, warc::Archive};
 use serde::Deserialize;
-use std::{collections::BTreeSet, path::Path, time::SystemTime};
+use std::{
+    collections::{BTreeSet, HashSet},
+    path::Path,
+    time::SystemTime,
+};
 use tokio::process::Command;
 
 #[derive(Deserialize)]
@@ -213,9 +217,9 @@ fn site_not_found(
 }
 
 async fn missing_pages(root: &Path, sources: &[String], required: &[String]) -> Result {
-    let required: BTreeSet<_> = required
+    let required: HashSet<_> = required
         .iter()
-        .map(|url| url::Url::parse(url).map(|url| url.origin().ascii_serialization()))
+        .map(|url| url::Url::parse(url).map(|url| url.origin()))
         .collect::<std::result::Result<_, _>>()?;
     let urls: BTreeSet<_> = sources
         .iter()
@@ -267,7 +271,7 @@ async fn missing_pages(root: &Path, sources: &[String], required: &[String]) -> 
                     let origin = url::Url::parse(&canonical)?.origin();
                     if let Some(response) = site_not_found(&archive, &origin)? {
                         missing.append(&path, &canonical, &response)?;
-                    } else if required.contains(&origin.ascii_serialization()) {
+                    } else if required.contains(&origin) {
                         failures.push(error.to_string());
                     } else {
                         eprintln!(
@@ -288,13 +292,23 @@ async fn missing_pages(root: &Path, sources: &[String], required: &[String]) -> 
             assets.extend(fictionet_extras::capture::links(&url, &response)?.assets);
         }
     }
-    wget(
-        root,
-        "missing-assets",
-        &assets.into_iter().collect::<Vec<_>>(),
-        true,
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        wget(
+            root,
+            "missing-assets",
+            &assets.into_iter().collect::<Vec<_>>(),
+            true,
+        ),
     )
     .await
+    {
+        Err(_) => {
+            eprintln!("Optional not-found assets exceeded their capture deadline");
+            Ok(())
+        }
+        Ok(result) => result,
+    }
 }
 
 async fn documents(root: &Path, name: &str, urls: &[String]) -> Result {
