@@ -34,6 +34,8 @@ pub(super) struct Envelope {
     function_call: Option<IgnoredAny>,
     parallel_tool_calls: Option<bool>,
     metadata: Option<IgnoredAny>,
+    diagnostics: Option<Diagnostics>,
+    safeguards: Option<Vec<Safeguard>>,
     client_metadata: Option<IgnoredAny>,
     user: Option<String>,
     safety_identifier: Option<String>,
@@ -47,7 +49,7 @@ pub(super) struct Envelope {
     reasoning: Option<IgnoredAny>,
     reasoning_effort: Option<IgnoredAny>,
     thinking: Option<IgnoredAny>,
-    output_config: Option<IgnoredAny>,
+    output_config: Option<OutputConfig>,
     text: Option<IgnoredAny>,
     response_format: Option<IgnoredAny>,
     service_tier: Option<String>,
@@ -90,13 +92,33 @@ enum PredictionKind {
     Content,
 }
 
-#[derive(Deserialize)]
-#[serde(untagged)]
 enum Content {
     Text(String),
     Blocks(Vec<Content>),
     Block(Box<Block>),
     Empty(()),
+}
+
+impl<'de> Deserialize<'de> for Content {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = Value::deserialize(deserializer)?;
+        match value {
+            Value::String(text) => Ok(Self::Text(text)),
+            Value::Array(items) => items
+                .into_iter()
+                .map(serde_json::from_value)
+                .collect::<Result<Vec<_>, _>>()
+                .map(Self::Blocks)
+                .map_err(serde::de::Error::custom),
+            Value::Object(_) => serde_json::from_value(value)
+                .map(Self::Block)
+                .map_err(serde::de::Error::custom),
+            Value::Null => Ok(Self::Empty(())),
+            _ => Err(serde::de::Error::custom(
+                "content must be text, blocks or a message",
+            )),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -105,6 +127,7 @@ struct Block {
     #[serde(rename = "type")]
     kind: Option<Kind>,
     role: Option<String>,
+    output_config: Option<OutputConfig>,
     content: Option<Content>,
     parts: Option<Content>,
     output: Option<Content>,
@@ -285,4 +308,23 @@ struct FunctionResponse {
     #[serde(rename = "willContinue", alias = "will_continue")]
     will_continue: Option<bool>,
     scheduling: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OutputConfig {
+    effort: Option<String>,
+    format: Option<Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Diagnostics {
+    previous_message_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum Safeguard {
+    DangerousToolUse { classifier_context: Value },
 }

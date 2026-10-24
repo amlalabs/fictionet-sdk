@@ -818,6 +818,8 @@ fn remote_content_and_mixed_server_tools_never_reach_the_transport() {
                 json!({"model":"small", "mcp_servers":[{"url":"https://example.com"}], "tools":[{"type":"web_search"}]}),
                 json!({"model":"small:online"}),
                 json!({"models":["small:online"]}),
+                json!({"safeguards":[{"type":"remote_fetch", "url":"https://example.org/file"}]}),
+                json!({"safeguards":[{"type":"dangerous_tool_use", "classifier_context":{}, "url":"https://example.org/file"}]}),
                 json!({"model":"small:online:free"}),
                 json!({"model":"small-search-preview"}),
             ]);
@@ -835,6 +837,7 @@ fn remote_content_and_mixed_server_tools_never_reach_the_transport() {
 fn inline_content_and_client_url_arguments_stay_usable() {
     for body in [
         json!({"messages":[{"role":"user","content":"Read https://example.com"}]}),
+        json!({"messages":[{"role":"user","content":"Research passkeys", "output_config":{"effort":"medium"}}], "output_config":{"effort":"medium"}, "safeguards":[{"type":"dangerous_tool_use","classifier_context":{"permission_mode":"auto","trusted_directories":{"primary":{"path":"/home/analyst"}}}}], "diagnostics":{"previous_message_id":null}}),
         json!({"messages":[{"role":"assistant","content":[{"type":"tool_use","name":"WebFetch","input":{"url":"https://example.com"}}]}]}),
         json!({"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"YQ=="}}]}]}),
         json!({"input":[{"role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,YQ=="},{"type":"input_file","file_data":"data:application/pdf;base64,YQ=="}]}]}),
