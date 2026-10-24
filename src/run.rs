@@ -599,3 +599,75 @@ impl Drop for RunState {
         self.root.cancel();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::time::ms;
+    use crate::{Cancelled, block_on};
+
+    /// A `Cx::idle` polled outside the run, as by a harness that keeps a
+    /// clone of the world's `Cx`, is woken when the run goes idle. The lab
+    /// must still jump its clock after that, or its sleeping tasks never
+    /// wake.
+    #[test]
+    fn a_lab_keeps_advancing_after_waking_an_idle_wait_outside_the_run() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let out = block_on(lab(Seed::from_u64(0), |fcx| async move {
+                let outside = fcx.clone();
+                let mut idle = Box::pin(async move { outside.idle().await });
+                // Polled with a waker that is not this run's task, as a
+                // harness thread would poll it.
+                assert!(
+                    idle.as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                        .is_pending()
+                );
+                fcx.sleep(ms(10)).await?;
+                drop(idle);
+                Ok(())
+            }));
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "the receiver is gone only once recv_timeout below has failed the test"
+            )]
+            let _ = tx.send(out.map_err(|e| e.to_string()));
+        });
+        let out = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the lab stopped jumping its clock after the idle wakeup");
+        assert_eq!(out, Ok(()));
+    }
+
+    /// `Cx::region` awaited outside the run is a wait on a `Cx` clone:
+    /// once the run is dropped it must end with `Cancelled`, even though
+    /// the work it spawned was dropped with the run instead of ending.
+    #[test]
+    fn a_region_outside_the_run_ends_when_the_run_is_dropped() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut world = Box::pin(run(Seed::from_u64(0), move |fcx| async move {
+            tx.send(fcx.clone()).unwrap();
+            std::future::pending::<()>().await;
+            Ok(())
+        }));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(world.as_mut().poll(&mut cx).is_pending());
+        let fcx = rx.recv().unwrap();
+        let mut region = Box::pin(fcx.region(|fcx| async move {
+            fcx.spawn(|fcx| async move {
+                fcx.sleep(std::time::Duration::from_secs(60)).await?;
+                Ok(())
+            });
+            fcx.cancelled().await;
+            Err(Cancelled.into())
+        }));
+        assert!(region.as_mut().poll(&mut cx).is_pending());
+        drop(world);
+        match region.as_mut().poll(&mut cx) {
+            Poll::Ready(Err(e)) => assert!(e.is::<Cancelled>(), "{e:?}"),
+            Poll::Ready(Ok(())) => panic!("the region was cut short, not finished"),
+            Poll::Pending => panic!("the region waits for work the dropped run will never end"),
+        }
+    }
+}
