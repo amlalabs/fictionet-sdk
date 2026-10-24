@@ -3,7 +3,10 @@
 mod render;
 
 use crate::Result;
-use fictionet_extras::{capture, warc::Archive};
+use fictionet_extras::{
+    capture::{self, Resource},
+    warc::Archive,
+};
 use serde::Deserialize;
 use std::{
     collections::{BTreeSet, HashSet},
@@ -55,12 +58,6 @@ const REPOSITORIES: &[(&str, &str)] = &[
 
 struct Batch(std::path::PathBuf);
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-enum Resource {
-    Document,
-    Requisite,
-}
-
 impl Drop for Batch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
@@ -79,15 +76,37 @@ fn install(path: &Path, root: &Path) -> Result {
 }
 
 async fn capture_cached(root: &Path, name: &str, urls: &[String]) -> Result {
+    complete(
+        root,
+        name,
+        &urls
+            .iter()
+            .cloned()
+            .map(|url| (url, Resource::Document))
+            .collect::<Vec<_>>(),
+    )
+    .await
+}
+
+async fn complete(root: &Path, name: &str, urls: &[(String, Resource)]) -> Result {
     download(root, name, urls).await?;
     if urls.is_empty() {
         return Ok(());
     }
-    let assets = render::requisites(root, urls).await?;
+    let documents = urls
+        .iter()
+        .filter(|(_, resource)| *resource == Resource::Document)
+        .map(|(url, _)| url.clone())
+        .collect::<Vec<_>>();
+    let assets = render::requisites(root, &documents)
+        .await?
+        .into_iter()
+        .map(|url| (url, Resource::Requisite))
+        .collect::<Vec<_>>();
     download(root, name, &assets).await
 }
 
-async fn download(root: &Path, name: &str, urls: &[String]) -> Result {
+async fn download(root: &Path, name: &str, urls: &[(String, Resource)]) -> Result {
     if urls.is_empty() {
         return Ok(());
     }
@@ -110,7 +129,6 @@ async fn download(root: &Path, name: &str, urls: &[String]) -> Result {
     let mut pending = urls
         .iter()
         .cloned()
-        .map(|url| (url, Resource::Document))
         .collect::<std::collections::VecDeque<_>>();
     let mut seen = HashSet::new();
     let mut requests = tokio::task::JoinSet::new();
@@ -128,16 +146,7 @@ async fn download(root: &Path, name: &str, urls: &[String]) -> Result {
                     || (resource == Resource::Document
                         && response.status == http::StatusCode::NOT_FOUND))
             {
-                let links = capture::links(&url, &response)?;
-                pending.extend(
-                    links
-                        .assets
-                        .into_iter()
-                        .map(|url| (url, Resource::Requisite)),
-                );
-                if response.status.is_redirection() {
-                    pending.extend(links.pages.into_iter().map(|url| (url, resource)));
-                }
+                pending.extend(capture::requisites(&url, &response, resource)?);
                 continue;
             }
             requests.spawn(async move {
@@ -175,16 +184,7 @@ async fn download(root: &Path, name: &str, urls: &[String]) -> Result {
         };
         archive.append(&path, &url, &response)?;
         eprintln!("Captured {}: {url}", response.status);
-        let links = capture::links(&url, &response)?;
-        pending.extend(
-            links
-                .assets
-                .into_iter()
-                .map(|url| (url, Resource::Requisite)),
-        );
-        if response.status.is_redirection() {
-            pending.extend(links.pages.into_iter().map(|url| (url, resource)));
-        }
+        pending.extend(capture::requisites(&url, &response, resource)?);
     }
     if path.exists() {
         install(&path, root)?;
@@ -198,16 +198,55 @@ pub async fn requisites(root: &Path, urls: &[String]) -> Result {
     let lock = std::fs::File::open(&root)?;
     lock.try_lock()?;
     let mut urls = if urls.is_empty() {
-        Archive::directory(&root)?
+        let archive = Archive::directory(&root)?;
+        let mut assets = HashSet::new();
+        for url in archive.urls() {
+            if let Some(response) = archive.get(url)? {
+                assets.extend(
+                    capture::links(url, &response)?
+                        .assets
+                        .into_iter()
+                        .filter(|asset| asset != url),
+                );
+            }
+        }
+        let mut redirects = assets
+            .iter()
+            .cloned()
+            .collect::<std::collections::VecDeque<_>>();
+        while let Some(url) = redirects.pop_front() {
+            if let Some(response) = archive.get(&url)?
+                && response.status.is_redirection()
+            {
+                for target in capture::links(&url, &response)?.pages {
+                    if assets.insert(target.clone()) {
+                        redirects.push_back(target);
+                    }
+                }
+            }
+        }
+        archive
             .urls()
-            .map(str::to_owned)
+            .map(|url| {
+                (
+                    url.to_owned(),
+                    if assets.contains(url) {
+                        Resource::Requisite
+                    } else {
+                        Resource::Document
+                    },
+                )
+            })
             .collect::<Vec<_>>()
     } else {
-        urls.to_vec()
+        urls.iter()
+            .cloned()
+            .map(|url| (url, Resource::Document))
+            .collect::<Vec<_>>()
     };
-    urls.sort();
+    urls.sort_by(|a, b| a.0.cmp(&b.0));
     println!("Completing requisites for {} captured URLs", urls.len());
-    capture_cached(&root, "requisites", &urls).await
+    complete(&root, "requisites", &urls).await
 }
 
 fn captured_at(archive: &Archive, url: &str) -> Result<(String, fictionet_extras::warc::Response)> {

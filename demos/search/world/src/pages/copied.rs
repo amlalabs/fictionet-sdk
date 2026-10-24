@@ -102,47 +102,7 @@ impl Corpus {
         &self,
         url: &str,
     ) -> std::io::Result<Option<fictionet_extras::warc::Response>> {
-        use kuchiki::traits::TendrilSink;
-        let Some(mut response) = archived_response(&self.archive, &self.missing, url)? else {
-            return Ok(None);
-        };
-        // Reporting headers and these script elements only send telemetry or ads.
-        response.headers.remove("report-to");
-        response.headers.remove("nel");
-        if response
-            .headers
-            .get("content-type")
-            .is_some_and(|v| v.as_bytes().starts_with(b"text/html"))
-        {
-            let decoded = response.decoded()?;
-            let dom = kuchiki::parse_html().one(String::from_utf8_lossy(&decoded).into_owned());
-            let mut changed = false;
-            for selector in [
-                "script[src*=\"googletagmanager.com\"]",
-                "script[src*=\"google-analytics.com\"]",
-                "script[src*=\"doubleclick.net\"]",
-                "script[src*=\"googlesyndication.com\"]",
-                "script[src*=\"connect.facebook.net\"]",
-                "iframe[src*=\"doubleclick.net\"]",
-                "ins.adsbygoogle",
-            ] {
-                for node in dom.select(selector).unwrap().collect::<Vec<_>>() {
-                    node.as_node().detach();
-                    changed = true;
-                }
-            }
-            if changed {
-                response.body = dom.to_string().into_bytes().into();
-                response.headers.remove("content-encoding");
-                response.headers.remove("etag");
-                response.headers.remove("content-md5");
-                response.headers.insert(
-                    http::header::CONTENT_LENGTH,
-                    http::HeaderValue::from(response.body.len()),
-                );
-            }
-        }
-        Ok(Some(response))
+        archived_response(&self.archive, &self.missing, url)
     }
 }
 

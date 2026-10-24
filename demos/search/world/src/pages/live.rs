@@ -41,6 +41,7 @@ impl Drop for Lifetime {
 
 struct Job {
     url: String,
+    resource: capture::Resource,
     cx: Cx,
 }
 
@@ -51,7 +52,6 @@ struct State {
     archive: Archive,
     lifetime: Arc<Lifetime>,
     epoch: usize,
-    searches_running: usize,
     reached: HashMap<String, watch::Sender<Completion>>,
     queue: VecDeque<Job>,
     running: bool,
@@ -177,12 +177,13 @@ impl Live {
                         true
                     }
                 };
-                let status = response.status;
+                let resource = job.resource;
                 let url = job.url.clone();
                 let links = if saved {
                     self.fetcher
                         .process(&job.cx, &lifetime, move || {
-                            capture::links(&url, &response).map_err(|error| error.to_string())
+                            capture::requisites(&url, &response, resource)
+                                .map_err(|error| error.to_string())
                         })
                         .await
                 } else {
@@ -190,27 +191,16 @@ impl Live {
                 };
                 if let Ok(links) = links {
                     // Dependencies get priority over the next navigation page.
-                    for url in links.assets.into_iter().rev() {
+                    for (url, resource) in links.into_iter().rev() {
                         self.enqueue_in(
                             &lifetime,
                             Job {
                                 url,
+                                resource,
                                 cx: job.cx.clone(),
                             },
                             true,
                         );
-                    }
-                    if status.is_redirection() {
-                        for url in links.pages {
-                            self.enqueue_in(
-                                &lifetime,
-                                Job {
-                                    url,
-                                    cx: job.cx.clone(),
-                                },
-                                true,
-                            );
-                        }
                     }
                 }
             }
@@ -234,18 +224,11 @@ impl Live {
         query: &str,
         start: u64,
     ) -> Result<search::Search, String> {
-        if start > 90 {
-            return Ok(search::Search::default());
-        }
         let lifetime = {
-            let mut state = self.state();
+            let state = self.state();
             if state.lifetime.cancelled() {
                 return Err("Live session stopped".into());
             }
-            if state.searches_running >= 2 || state.searches.len() >= 64 {
-                return Err("Live search capacity reached".into());
-            }
-            state.searches_running += 1;
             state.lifetime.clone()
         };
         let (send, receive) = oneshot::channel();
@@ -256,11 +239,6 @@ impl Live {
             let result = live
                 .search_results(&cx_thread, &lifetime, &query, start)
                 .await;
-            let mut state = live.state();
-            if Arc::ptr_eq(&lifetime, &state.lifetime) {
-                state.searches_running -= 1;
-            }
-            drop(state);
             let _ = send.send(result);
         });
         cx.race(None, receive)
@@ -321,6 +299,7 @@ impl Live {
                 lifetime,
                 Job {
                     url: result.url.clone(),
+                    resource: capture::Resource::Document,
                     cx: cx.clone(),
                 },
                 true,
@@ -348,7 +327,6 @@ impl Live {
         if reset {
             state.lifetime = Arc::default();
             state.searches.clear();
-            state.searches_running = 0;
             let completed: std::collections::HashSet<_> =
                 state.archive.urls().map(str::to_owned).collect();
             state.reached.retain(|url, _| completed.contains(url));
@@ -381,6 +359,7 @@ impl Live {
             &lifetime,
             Job {
                 url: url.clone(),
+                resource: capture::Resource::Document,
                 cx: cx.clone(),
             },
             true,

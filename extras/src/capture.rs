@@ -21,6 +21,15 @@ pub enum Purpose {
     Capture,
 }
 
+/// Whether a response was reached as a page or as one of its dependencies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Resource {
+    /// A page reached directly or through a navigation redirect.
+    Document,
+    /// A stylesheet, script, font, image or other page dependency.
+    Requisite,
+}
+
 /// A credential-free lifecycle event for a host request.
 #[derive(Clone, Debug)]
 pub struct Event {
@@ -119,6 +128,9 @@ pub fn references(url: &str, response: &warc::Response) -> io::Result<Vec<String
 }
 
 fn link(base: &Url, value: &str, out: &mut Vec<String>) -> io::Result<()> {
+    if value.trim().is_empty() || value.trim_start().starts_with('#') {
+        return Ok(());
+    }
     let Some(url) = base.join(value).ok().and_then(|u| warc::key(u.as_str())) else {
         return Ok(());
     };
@@ -201,6 +213,34 @@ fn srcset(mut input: &str, base: &Url, out: &mut Vec<String>) -> io::Result<()> 
         link(base, candidate.trim_end_matches(','), out)?;
     }
     Ok(())
+}
+
+/// Follow dependencies and redirects without expanding HTML returned in place
+/// of a stylesheet, script, font or image. SPA fallbacks are still archived.
+pub fn requisites(
+    url: &str,
+    response: &warc::Response,
+    resource: Resource,
+) -> io::Result<Vec<(String, Resource)>> {
+    if resource == Resource::Requisite
+        && !response.status.is_redirection()
+        && response
+            .headers
+            .get(http::header::CONTENT_TYPE)
+            .is_some_and(|value| value.as_bytes().starts_with(b"text/html"))
+    {
+        return Ok(Vec::new());
+    }
+    let links = links(url, response)?;
+    let mut next = links
+        .assets
+        .into_iter()
+        .map(|url| (url, Resource::Requisite))
+        .collect::<Vec<_>>();
+    if response.status.is_redirection() {
+        next.extend(links.pages.into_iter().map(|url| (url, resource)));
+    }
+    Ok(next)
 }
 
 /// Discover static dependencies using the response's base URL and HTML base tag.
