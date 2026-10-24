@@ -291,7 +291,15 @@ fn a_codex_turn_runs_over_the_socket_with_a_world_search() {
     let engine = pages.clone();
     let options = fictionet::Seed::from_u64(21);
     fictionet::block_on(fictionet::run(options, |cx| async move {
-        let model = openai(&cx, address)?.search(engine);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let observed = calls.clone();
+        let model = openai(&cx, address)?.search(engine.clone()).observe_calls(Arc::new(move |cx, method, path| {
+            assert_eq!(method, http::Method::POST);
+            assert_eq!(path.path(), "/v1/responses");
+            let call = cx.random_u64();
+            let observed = observed.clone();
+            Call { engine: engine.clone(), observe: Arc::new(move |phase, status| observed.lock().unwrap().push((call, phase, status))) }
+        }));
         let mut client = Client::open(&cx, &model).await;
         let request = |input: Value| {
             json!({"type":"response.create","model":"small","instructions":"Be brief.","input":input,
@@ -341,6 +349,13 @@ fn a_codex_turn_runs_over_the_socket_with_a_world_search() {
             "Welcome"
         );
         assert_eq!(model.ledger.lock().unwrap().calls, 3);
+        let calls = calls.lock().unwrap();
+        let ids: std::collections::HashSet<_> = calls.iter().map(|(id, _, _)| *id).collect();
+        assert_eq!(ids.len(), 2);
+        for id in ids {
+            let phases: Vec<_> = calls.iter().filter(|(call, _, _)| *call == id).map(|(_, phase, _)| *phase).collect();
+            assert_eq!(phases, [CallPhase::Connecting, CallPhase::Streaming, CallPhase::Complete]);
+        }
         cx.cancel();
         Ok(())
     }))

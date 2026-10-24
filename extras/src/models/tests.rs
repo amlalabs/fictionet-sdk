@@ -809,9 +809,15 @@ fn remote_content_and_mixed_server_tools_never_reach_the_transport() {
                 blocked.push(json!({"model":"small", "tools":[{"type":"web_search"},tool]}));
             }
             blocked.extend([
+                json!({"model":"small", "prompt":{"id":"pmpt_example", "variables":{"photo":{"type":"input_image", "image_url":"https://example.org/pixel.png", "detail":"auto"}}}}),
+                json!({"model":"small", "prompt":{"id":"pmpt_example", "variables":{"document":{"type":"input_file", "file_url":"https://example.org/private.pdf"}}}}),
+                json!({"model":"small", "prompt":{"id":"pmpt_example"}}),
+                json!({"model":"small", "future_inputs":{"image_url":"https://example.org/pixel.png"}}),
+                json!({"messages":[{"role":"user", "content":[{"type":"text", "text":"hello", "future_source":{"url":"https://example.org/pixel.png"}}]}]}),
                 json!({"model":"small", "plugins":[{"id":"web"}], "tools":[{"type":"web_search_20250305","name":"web_search"}]}),
                 json!({"model":"small", "mcp_servers":[{"url":"https://example.com"}], "tools":[{"type":"web_search"}]}),
                 json!({"model":"small:online"}),
+                json!({"models":["small:online"]}),
                 json!({"model":"small:online:free"}),
                 json!({"model":"small-search-preview"}),
             ]);
@@ -907,7 +913,7 @@ fn deferred_client_tool_references_preserve_the_provider_boundary() {
     ));
 }
 
-struct ValidationPages;
+pub(super) struct ValidationPages;
 impl Engine for ValidationPages {
     fn serves(&self, _: &str) -> bool {
         true
