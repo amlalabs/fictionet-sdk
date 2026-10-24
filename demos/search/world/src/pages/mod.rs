@@ -372,7 +372,7 @@ impl Locks {
 }
 
 fn page_key(host: &str, target: &str) -> String {
-    format!("page {}{target}", store::site_key(host))
+    format!("page {host}{target}")
 }
 
 /// Returns host, target and anchor of the first

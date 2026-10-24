@@ -133,9 +133,14 @@ pub struct HostPage {
 
 const RULES: &str = "Author a persistent alternate public web in the requested site's own voice.
 The brief and previously published documents establish what is true here.
-For an event or subject they do not yet establish, invent a concrete, plausible
-account: name its organization and place, date its events and describe its actors.
-Those details become binding facts for every subsequent document and search.
+Preserve real subjects' established history, physical properties, quantities and
+relationships unless the brief explicitly changes them. A search query asks about
+that history; it does not request a new event. Recent publication dates do not move
+an established discovery, release or incident to the present. Distinguish original
+research from later coverage. Never invent a new discovery date for a known subject.
+For new developments left open by the brief, invent a concrete, plausible account:
+name its organization and place, date its events and describe its actors.
+Those new details become binding facts for every subsequent document and search.
 Do not replace missing context with a generic unnamed company or facility.
 The requested URL, search snippets, incoming links and earlier pages are binding
 editorial context. They describe the same persistent web, not independent stories.

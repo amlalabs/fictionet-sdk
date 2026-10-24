@@ -1031,3 +1031,88 @@ fn readers_wait_for_chronology_rewrites_and_share_the_finished_page() {
         Ok(())
     });
 }
+
+#[test]
+fn undeclared_later_knowledge_is_reviewed_before_publication() {
+    let fake = Fake::script(vec![
+        completion(
+            0,
+            "STATUS: 200\nTITLE: Investigation\nDATE: 2026-10-07\nSITE_CSS: body {color:#234}\nBODY:\n<p>The investigation concluded on 14 October 2026.</p>",
+            None,
+        ),
+        completion(
+            0,
+            r#"{"chronology":"later_knowledge","reason":"The investigation's conclusion could first be known on 2026-10-14, after publication on 2026-10-07."}"#,
+            None,
+        ),
+        completion(
+            0,
+            "STATUS: 200\nTITLE: Investigation\nDATE: 2026-10-14\nSITE_CSS: body {color:#234}\nBODY:\n<p>Published 7 October 2026. Updated 14 October 2026. The investigation concluded on 14 October 2026.</p>",
+            None,
+        ),
+    ]);
+    let pages = Arc::new(Pages::with_model(seed(), openrouter(fake.clone())));
+    no_cast(&pages);
+    lab(move |cx| async move {
+        let response = get(&pages, &cx, "https://news.fields.com/investigation").await;
+        assert_eq!(response.status, 200);
+        let store = pages.store();
+        let page = store.page("news.fields.com", "/investigation").unwrap();
+        assert_eq!(page.date, "2026-10-14");
+        assert!(page.claims.is_empty());
+        let users = fake.users();
+        assert_eq!(users.len(), 3);
+        assert!(users[1].contains("PUBLICATION: 2026-10-07"));
+        assert!(users[1].contains("The investigation concluded on 14 October 2026"));
+        assert!(users[2].contains("could first be known on 2026-10-14"));
+        Ok(())
+    });
+}
+
+#[test]
+fn later_search_snippets_and_announced_plans_receive_semantic_review() {
+    let fake = Fake::script(vec![
+        completion(
+            0,
+            "RESULT\nURL: https://news.fields.com/investigation\nTITLE: Investigation results\nDATE: Oct 7, 2026\nSNIPPET: The investigation concluded on 14 October 2026.",
+            None,
+        ),
+        completion(
+            0,
+            r#"{"chronology":"later_knowledge","reason":"A conclusion on 2026-10-14 cannot be reported as completed on 2026-10-07."}"#,
+            None,
+        ),
+        completion(
+            0,
+            "RESULT\nURL: https://news.fields.com/investigation\nTITLE: Investigation results\nDATE: Oct 14, 2026\nSNIPPET: The investigation concluded on 14 October 2026.",
+            None,
+        ),
+        completion(
+            0,
+            "STATUS: 200\nTITLE: Investigation results\nDATE: 2026-10-14\nSITE_CSS: body {color:#234}\nBODY:\n<p>The investigation concluded on 14 October 2026. A follow-up hearing is scheduled for 28 October 2026.</p>",
+            None,
+        ),
+        completion(0, r#"{"chronology":"consistent"}"#, None),
+    ]);
+    let pages = Arc::new(Pages::with_model(seed(), openrouter(fake.clone())));
+    no_cast(&pages);
+    lab(move |cx| async move {
+        let response = google(&pages, &cx, "investigation results").await;
+        assert_eq!(response.status, 200);
+        let response = get(&pages, &cx, "https://news.fields.com/investigation").await;
+        assert_eq!(response.status, 200);
+        let users = fake.users();
+        assert_eq!(users.len(), 5);
+        assert!(users[1].contains("PUBLICATION: 2026-10-07"));
+        assert!(users[4].contains("A follow-up hearing is scheduled for 28 October 2026"));
+        let store = pages.store();
+        let context = store.writing_context("investigation results");
+        assert!(!context.is_empty());
+        assert!(
+            context
+                .iter()
+                .all(|claim| claim.claim.known_on == Some(seed::parse_date("2026-10-14").unwrap()))
+        );
+        Ok(())
+    });
+}

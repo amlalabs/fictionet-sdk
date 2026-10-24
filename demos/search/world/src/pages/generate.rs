@@ -93,7 +93,7 @@ impl Pages {
 
     /// Runs one generation with the maker's stored or model path and
     /// writes its rows. `context` names it in `generations.jsonl`.
-    pub(super) async fn generate<T: serde::Serialize>(
+    pub(super) async fn generate<T: serde::Serialize + answers::Publication + Send>(
         &self,
         cx: &Cx,
         target: crate::observation::WriterTarget,
@@ -111,10 +111,16 @@ impl Pages {
                 let (system, user, max_tokens) = prompt();
                 let parse = |text: &str| {
                     model.check_document("text/html", text)?;
-                    match gives_away(text) {
-                        Some(reason) => Err(prompts::Unreadable::Disclosure(reason)),
-                        None => read(text, false),
+                    if let Some(reason) = gives_away(text) {
+                        return Err(prompts::Unreadable::Disclosure(reason));
                     }
+                    let fields = read(text, false)?;
+                    let publications =
+                        fields.later_text(seed::parse_date(&self.seed.date).expect("world date"));
+                    Ok(model::Parsed {
+                        fields,
+                        publications,
+                    })
                 };
                 let rejected = |reason: &prompts::Unreadable| {
                     self.report(
@@ -127,7 +133,7 @@ impl Pages {
                     );
                 };
                 let (answer, ledger): (_, Ledger) = model
-                    .ask(cx, &system, &user, max_tokens, parse, rejected)
+                    .ask_reviewed(cx, &system, &user, max_tokens, parse, rejected)
                     .await;
                 let usage = ledger.usage();
                 let repaired = match &answer {
@@ -323,7 +329,7 @@ impl Pages {
         } else {
             None
         };
-        let _site = self
+        let site = self
             .locks
             .lock(cx, format!("site {host}"))
             .await
@@ -352,6 +358,13 @@ impl Pages {
                 cast,
             }
         };
+        // Only the first document establishes a site's shared layout.
+        let _site = if ask.profile.is_none() {
+            Some(site)
+        } else {
+            drop(site);
+            None
+        };
         {
             let store = self.writing_store()?;
             let mut referenced = HashSet::new();
@@ -369,7 +382,10 @@ impl Pages {
                         };
                         ask.claims.push(prompts::Claim {
                             url: url.into(),
-                            claim: format!("This document links to the requested page (publication/update {}): {}", page.date, text).into(),
+                            claim: prompts::Statement {
+                                text: format!("This document links to the requested page: {text}"),
+                                known_on: seed::parse_date(&page.date).ok(),
+                            },
                         });
                     }
                 }
@@ -606,9 +622,7 @@ impl Pages {
         }
         store.insert_page(record.clone()).map_err(Stop::store)?;
         if prefetch {
-            store
-                .unserved
-                .insert((store::site_key(host).into(), target.into()));
+            store.unserved.insert((host.into(), target.into()));
         }
         drop(store);
         if let Some(recovery) = made.recovery {
