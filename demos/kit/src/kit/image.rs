@@ -14,7 +14,7 @@ const TERMINAL: &str = "env DISPLAY=:1 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/u
 
 /// Runtime identity and consoles; all software is supplied by the image.
 pub fn workstation() -> Guest {
-    let mut guest = Guest::prepared(HOST, USER, WORKSTATION)
+    let mut guest = terminal_settings(Guest::prepared(HOST, USER, WORKSTATION))
         .resources(4, 4096)
         .desktop(desktop::VNC_PORT, READY)
         .terminal(TERMINAL);
@@ -24,6 +24,14 @@ pub fn workstation() -> Guest {
         firefox: true,
     };
     guest
+}
+
+fn terminal_settings(guest: Guest) -> Guest {
+    guest.file(
+        &format!("/home/{USER}/.tmux.conf"),
+        0o644,
+        "set -g status off\n",
+    )
 }
 
 /// Builds a settings disk without any package installation or network commands.
@@ -102,8 +110,8 @@ fn write_file(script: &mut String, path: &str, mode: u32, content: &str) {
 }
 
 fn definition() -> Guest {
-    desktop::codex(desktop::claude_code(desktop::browser_image(
-        HOST, USER, START,
+    terminal_settings(desktop::codex(desktop::claude_code(
+        desktop::browser_image(HOST, USER, START),
     )))
     .packages(&[
         "xclip",
@@ -234,6 +242,7 @@ mod tests {
         file("/etc/systemd/timesyncd.conf");
         file("/etc/systemd/system/apt-daily.timer.d/quiet.conf");
         file("/etc/claude-code/managed-settings.json");
+        assert_eq!(file("/home/analyst/.tmux.conf"), "set -g status off\n");
         assert!(
             guest
                 .steps
@@ -270,6 +279,10 @@ mod tests {
             assert!(script.contains(&fictionet::stdlib::codec::base64::encode(value.as_bytes())));
             assert!(!installation().unwrap().contains(value));
         }
+        assert!(script.contains(&fictionet::stdlib::codec::base64::encode(
+            b"set -g status off\n"
+        )));
+        assert!(script.contains(" > '/home/analyst/.tmux.conf'"));
         assert!(!script.contains("apt-get"));
         assert!(!script.contains("curl"));
         assert!(
