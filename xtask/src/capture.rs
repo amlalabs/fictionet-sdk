@@ -98,11 +98,7 @@ async fn complete(root: &Path, name: &str, urls: &[(String, Resource)]) -> Resul
         .filter(|(_, resource)| *resource == Resource::Document)
         .map(|(url, _)| url.clone())
         .collect::<Vec<_>>();
-    let assets = render::requisites(root, &documents)
-        .await?
-        .into_iter()
-        .map(|url| (url, Resource::Requisite))
-        .collect::<Vec<_>>();
+    let assets = render::requisites(root, &documents).await?;
     download(root, name, &assets).await
 }
 

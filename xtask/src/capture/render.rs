@@ -31,6 +31,23 @@ async fn receive(reader: &mut BufReader<OwnedReadHalf>, bytes: &mut Vec<u8>) -> 
 struct Paused {
     request_id: String,
     request: Request,
+    resource_type: Destination,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+enum Destination {
+    Document,
+    #[serde(other)]
+    Requisite,
+}
+
+impl From<Destination> for capture::Resource {
+    fn from(destination: Destination) -> Self {
+        match destination {
+            Destination::Document => Self::Document,
+            Destination::Requisite => Self::Requisite,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -61,7 +78,10 @@ pub(super) async fn document(root: &Path, url: &str, title: &str) -> Result {
     render(root, url, Some(title), get).await.map(|_| ())
 }
 
-pub(super) async fn requisites(root: &Path, urls: &[String]) -> Result<Vec<String>> {
+pub(super) async fn requisites(
+    root: &Path,
+    urls: &[String],
+) -> Result<Vec<(String, capture::Resource)>> {
     let existing = Arc::new(warc::Archive::directory(root)?);
     let mut assets = Vec::new();
     let mut urls = urls
@@ -97,15 +117,28 @@ pub(super) async fn requisites(root: &Path, urls: &[String]) -> Result<Vec<Strin
             let url = url.clone();
             pages.spawn(async move {
                 eprintln!("Rendering requisites: {url}");
-                render(&root, &url, None, move |request| {
+                render(&root, &url, None, move |request, resource| {
                     let cache = cache.clone();
                     async move {
-                        if let Some(response) = cache.get(request.url.as_str())?
-                            && (response.status.is_success() || response.status.is_redirection())
-                        {
+                        let cached = cache.get(request.url.as_str())?;
+                        if resource == capture::Resource::Requisite {
+                            if let Some(response) = cached && (response.status.is_success() || response.status.is_redirection()) {
+                                return Ok(Captured::Cached(response));
+                            }
+                            return get(request, resource).await;
+                        }
+                        let destination = request.url.clone();
+                        let fetched = get(request, resource).await;
+                        let unavailable = match &fetched {
+                            Err(error) => Some(error.to_string()),
+                            Ok(Captured::Fetched(response)) if !(response.status.is_success() || response.status.is_redirection()) => Some(response.status.to_string()),
+                            _ => None,
+                        };
+                        if let Some(reason) = unavailable && let Some(response) = cached && response.status.is_success() {
+                            eprintln!("Page refresh unavailable: {destination}: {reason}; retaining archived response");
                             return Ok(Captured::Cached(response));
                         }
-                        get(request).await
+                        fetched
                     }
                 })
                 .await
@@ -119,7 +152,7 @@ pub(super) async fn requisites(root: &Path, urls: &[String]) -> Result<Vec<Strin
     Ok(assets)
 }
 
-async fn get(request: Request) -> std::io::Result<Captured> {
+async fn get(request: Request, _: capture::Resource) -> std::io::Result<Captured> {
     let client = capture::client(&request.url).await?;
     let mut headers = http::HeaderMap::new();
     for (name, value) in request.headers {
@@ -145,9 +178,14 @@ async fn get(request: Request) -> std::io::Result<Captured> {
     Ok(Captured::Fetched(response))
 }
 
-async fn render<F, T>(root: &Path, url: &str, title: Option<&str>, fetch: F) -> Result<Vec<String>>
+async fn render<F, T>(
+    root: &Path,
+    url: &str,
+    title: Option<&str>,
+    fetch: F,
+) -> Result<Vec<(String, capture::Resource)>>
 where
-    F: Fn(Request) -> T + Send + Sync + 'static,
+    F: Fn(Request, capture::Resource) -> T + Send + Sync + 'static,
     T: std::future::Future<Output = std::io::Result<Captured>> + Send,
 {
     let fetch = Arc::new(fetch);
@@ -292,13 +330,13 @@ where
                     let message = message?;
                     if message["method"] == "Fetch.requestPaused" {
                         let paused: Paused = serde_json::from_value(message["params"].clone())?;
-                        urls.push(paused.request.url.to_string());
+                        urls.push((paused.request.url.to_string(), paused.resource_type.into()));
                         idle = false;
                         let fetch = fetch.clone();
                         requests.spawn(async move {
                             let response = async {
                                 if paused.request.method != http::Method::GET { return Err(std::io::Error::other("capture requires a GET response")); }
-                                fetch(Request { url: paused.request.url.clone(), method: paused.request.method.clone(), headers: paused.request.headers.clone() }).await
+                                fetch(Request { url: paused.request.url.clone(), method: paused.request.method.clone(), headers: paused.request.headers.clone() }, paused.resource_type.into()).await
                             };
                             let response = response.await;
                             (paused, response)
