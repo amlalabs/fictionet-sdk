@@ -3,29 +3,11 @@
 use super::*;
 
 impl Pages {
-    pub(super) fn latest_publication(
-        &self,
-        store: &Store,
-        host: &str,
-        target: &str,
-        mentions: &[Mention],
-    ) -> time::Date {
-        let today = seed::parse_date(&self.seed.date).expect("world date");
-        if store.publication_date(host, target).is_some() {
-            return today;
-        }
-        mentions
-            .iter()
-            .filter_map(|mention| mention.source())
-            .filter_map(|url| {
-                let (host, target) = text::target_of(url);
-                store
-                    .page(&host, &target)
-                    .and_then(|page| seed::parse_date(&page.date).ok())
-            })
-            .chain(Some(today))
-            .min()
-            .expect("world date")
+    /// The latest date a written page may carry: the world's own date. Pages
+    /// that link here may be older, as real pages are updated after they
+    /// first appear.
+    pub(super) fn latest_publication(&self) -> time::Date {
+        seed::parse_date(&self.seed.date).expect("world date")
     }
 
     pub(super) fn check_page_dates(
@@ -378,7 +360,7 @@ impl Pages {
                     date: String::new(),
                 }),
         );
-        let latest = self.latest_publication(&*self.writing_store()?, host, target, &ask.mentions);
+        let latest = self.latest_publication();
         let made = self
             .generate(
                 cx,
@@ -528,7 +510,7 @@ impl Pages {
         };
         let mut store = self.writing_store()?;
         if matches!(self.maker(), Maker::Model(_)) {
-            let latest = self.latest_publication(&store, host, target, &record.mentions);
+            let latest = self.latest_publication();
             self.check_page_dates(
                 &store,
                 host,
