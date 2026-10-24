@@ -24,9 +24,7 @@ pub enum Meta {
     Planted { title: String },
     /// A page the store does not hold, while nothing new is made.
     Missing,
-    /// A list or page the generation budget left unmade.
-    Budget(Asked),
-    /// The generator or the store failed. `error` is cut at 400 characters.
+    /// The generator or the store failed. The diagnostic describes the failure.
     Error {
         error: String,
         usage: Option<Box<Usage>>,

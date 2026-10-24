@@ -1,4 +1,4 @@
-//! Page sources, generation limits and world controls.
+//! Page sources and world controls.
 
 use super::*;
 
@@ -22,7 +22,7 @@ impl Pages {
             seed,
             maker,
             prefetch,
-            live_calls: None,
+            interactive: false,
             store: Mutex::new(store),
             writing: Mutex::new(tokio::sync::watch::channel(false).0),
             copied: None,
@@ -41,12 +41,11 @@ impl Pages {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// A world whose pages are written by a bounded model. Everything stays in memory.
+    /// A world whose pages are written by a model. Everything stays in memory.
     pub fn with_model(seed: Seed, model: Model) -> Self {
         let mut pages = Self::new(seed);
-        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        pages.maker = Some(Maker::Model(model.live(calls.clone())));
-        pages.live_calls = Some(calls);
+        pages.maker = Some(Maker::Model(model));
+        pages.interactive = true;
         pages
     }
 
@@ -225,8 +224,8 @@ impl Pages {
             }
             Command::PlantFact { text, .. } => {
                 let text = normalize(&text);
-                if text.is_empty() || text.chars().count() > 600 {
-                    return Err(invalid("Write a fact of 1 to 600 characters"));
+                if text.is_empty() {
+                    return Err(invalid("Write a fact"));
                 }
                 if let Some(word) = gives_away(&text) {
                     return Err(invalid(&format!("A page cannot say {word:?}")));

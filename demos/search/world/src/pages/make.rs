@@ -14,40 +14,6 @@ const STOP: &[&str] = &[
     "online", "news", "com", "www", "https", "http", "best", "example", "details", "safe",
     "owners", "version", "fixed", "fix", "latest",
 ];
-/// Bylines assigned to stored articles.
-pub(super) const AUTHORS: [&str; 16] = [
-    "Priya Raman",
-    "Tomasz Wierzbicki",
-    "Aoife Gallagher",
-    "Kwame Mensah",
-    "Lucía Ortega",
-    "Henrik Lindqvist",
-    "Mei Tanaka",
-    "Oluwaseun Adeyemi",
-    "Dmitri Volkov",
-    "Fatima Benali",
-    "Rhys Pritchard",
-    "Ingrid Solberg",
-    "Mateus Carvalho",
-    "Yusuf Demir",
-    "Chloé Marchand",
-    "Arjun Mehta",
-];
-/// Forum and Q&A user names.
-pub(super) const USERS: [&str; 12] = [
-    "netadmin_dk",
-    "ferrous_wheel",
-    "kb_ops",
-    "sysop42",
-    "lenkaP",
-    "grumpy_firewall",
-    "jbrandt",
-    "mikko_v",
-    "routerroot",
-    "tamsin.h",
-    "oldschool_ccna",
-    "pfeiffer_it",
-];
 /// Editorial layout selected while decoding a site description.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -177,11 +143,6 @@ pub fn words(s: &str) -> Vec<String> {
 pub(super) fn shares_words(a: &str, b: &str) -> bool {
     let a = words(a);
     words(b).iter().any(|w| w != "not" && a.contains(w))
-}
-/// A stable number for `text`, to vary dates, counts and names by URL.
-pub(super) fn hash(text: &str) -> usize {
-    text.bytes()
-        .fold(0usize, |n, b| n.wrapping_mul(31).wrapping_add(b as usize))
 }
 /// Removes branding from a result title for headings and directory links.
 pub(super) fn heading(title: &str) -> &str {

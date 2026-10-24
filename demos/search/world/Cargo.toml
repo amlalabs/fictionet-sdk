@@ -26,3 +26,5 @@ tokio = { version = "1", default-features = false, features = ["sync", "rt-multi
 url = "2"
 tower-service = "0.3"
 kuchiki = "0.8"
+krilla = { version = "0.8.2", default-features = false, features = ["simple-text"] }
+rustybuzz = "0.20.1"

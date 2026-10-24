@@ -67,26 +67,6 @@ impl Pages {
         Ok(())
     }
 
-    /// Starts one generation, or says the budget is spent.
-    pub(super) fn reserve(&self) -> Result<(), Stop> {
-        if let Some(calls) = &self.live_calls {
-            return calls
-                .try_update(
-                    std::sync::atomic::Ordering::SeqCst,
-                    std::sync::atomic::Ordering::SeqCst,
-                    |n| (n < GENERATION_BUDGET).then_some(n + 1),
-                )
-                .map(|_| ())
-                .map_err(|_| Stop::Budget);
-        }
-        let mut store = self.writing_store()?;
-        if store.made >= GENERATION_BUDGET {
-            return Err(Stop::Budget);
-        }
-        store.made += 1;
-        Ok(())
-    }
-
     pub(super) fn maker(&self) -> &Maker {
         self.maker.as_ref().expect("a world that is generating")
     }
@@ -98,20 +78,14 @@ impl Pages {
         cx: &Cx,
         target: crate::observation::WriterTarget,
         stored: impl FnOnce() -> T,
-        prompt: impl FnOnce() -> (String, String, u32),
+        prompt: impl FnOnce() -> (String, String),
         read: impl Fn(&str, bool) -> Result<T, prompts::Unreadable>,
     ) -> Result<Made<T>, Stop> {
         let context = serde_json::to_value(&target).expect("generation target");
         match self.maker() {
             Maker::Stored => self.stored(cx, target, stored),
             Maker::Model(model) => {
-                if self.live_calls.is_some() {
-                    self.reserve()?;
-                }
-                let (system, user, max_tokens) = prompt();
-                let user = format!(
-                    "{user}\n\nComplete the entire answer within {max_tokens} output tokens. Plan its length before writing. Keep the required substantive sections, methods and references; use concise prose and markup."
-                );
+                let (system, user) = prompt();
                 let parse = |text: &str| {
                     model.check_document("text/html", text)?;
                     if let Some(reason) = gives_away(text) {
@@ -136,7 +110,7 @@ impl Pages {
                     );
                 };
                 let (answer, ledger): (_, Ledger) = model
-                    .ask_reviewed(cx, &system, &user, max_tokens, parse, rejected)
+                    .ask_reviewed(cx, &system, &user, parse, rejected)
                     .await;
                 let usage = ledger.usage();
                 let repaired = match &answer {
@@ -229,7 +203,7 @@ impl Pages {
         if let Some(cast) = self.writing_store()?.cast() {
             return Ok(cast.people.clone());
         }
-        if self.live_calls.is_some() {
+        if self.interactive {
             let cast = CastRecord {
                 people: Vec::new(),
                 usage: Usage::stored(0),
@@ -239,16 +213,12 @@ impl Pages {
                 .map_err(Stop::store)?;
             return Ok(cast.people);
         }
-        self.reserve()?;
         let made = self
             .generate(
                 cx,
                 crate::observation::WriterTarget::Cast,
                 Vec::new,
-                || {
-                    let (system, user) = prompts::cast(&self.seed);
-                    (system, user, CAST_TOKENS)
-                },
+                || prompts::cast(&self.seed),
                 |text, _| prompts::read_cast(text),
             )
             .await?;
@@ -284,18 +254,12 @@ impl Pages {
             return Ok(profile);
         }
         if matches!(self.maker(), Maker::Model(_)) {
-            if self.live_calls.is_none() {
-                self.reserve()?;
-            }
             let made = self
                 .generate(
                     cx,
                     crate::observation::WriterTarget::Stylesheet { host: host.into() },
                     String::new,
-                    || {
-                        let (system, user) = prompts::stylesheet(&self.seed, host, &profile);
-                        (system, user, 1000)
-                    },
+                    || prompts::stylesheet(&self.seed, host, &profile),
                     |text, _| {
                         let css = text.trim();
                         if css.is_empty() {
@@ -334,7 +298,7 @@ impl Pages {
                         .any(|result| result.url == claim.url)
             })
         };
-        let _publication = if self.live_calls.is_some() && !established {
+        let _publication = if self.interactive && !established {
             Some(
                 self.locks
                     .lock(cx, "page publications".into())
@@ -353,9 +317,6 @@ impl Pages {
                 .map_err(Stop::store)?
         };
         let follows_layout = !captured && site.is_none();
-        if self.live_calls.is_none() {
-            self.reserve()?;
-        }
         let cast = self.cast(cx).await?;
         let mut ask = {
             let store = self.writing_store()?;
@@ -404,7 +365,12 @@ impl Pages {
                 }
             }
         }
-        let expected = prompts::expected_type(&url);
+        let pdf = prompts::expected_type(&url) == Some("application/pdf");
+        let expected = if pdf {
+            Some("text/html")
+        } else {
+            prompts::expected_type(&url)
+        };
         let seed = self.context().into_owned();
         let subject = format!("{url} {}", make::title_from(host, target));
         {
@@ -488,11 +454,7 @@ impl Pages {
                         &ask.claims,
                     );
                     user.push_str(&format!("\nThe latest permitted publication/update date is {latest}. Incoming links already published by this date must remain possible. Later context describes the wider world; do not import its later knowledge into this page."));
-                    (
-                        system,
-                        user,
-                        PAGE_TOKENS + if ask.profile.is_none() && !captured { 500 } else { 0 },
-                    )
+                    (system, user)
                 },
                 |text, repair| {
                     let mut page = prompts::read_page(text, expected, !ask.mentions.is_empty())?;
@@ -507,7 +469,7 @@ impl Pages {
                     if repair {
                         super::answers::repair_page(&mut page)?;
                     }
-                    if self.live_calls.is_some() {
+                    if self.interactive {
                         let body = if page.content_type.starts_with("text/html") {
                             let profile = ask
                                 .profile
@@ -592,13 +554,20 @@ impl Pages {
         });
         let (unsupported, unchecked) =
             text::check_snippets(&body, &page.content_type, &ask.mentions);
+        let body = if pdf {
+            page.content_type = "application/pdf".into();
+            pdf::render(&page.title, &page.body)
+                .map_err(|error| Stop::Failed { error, usage: None })?
+        } else {
+            body.into_bytes()
+        };
         let record = PageRecord {
             url,
             host: host.into(),
             target: target.into(),
             status: page.status,
             content_type: page.content_type,
-            body: body.into_bytes(),
+            body,
             headers: vec![("Server".into(), render::server_of(Some(&profile)).into())],
             title: page.title,
             description: page.description,

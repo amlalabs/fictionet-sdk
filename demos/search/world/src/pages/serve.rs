@@ -12,11 +12,7 @@ impl Pages {
         target: &str,
         form: Option<&[u8]>,
     ) -> Response {
-        let form = if method == "POST" {
-            form.map(|f| &f[..f.len().min(MAX_FORM_BYTES)])
-        } else {
-            None
-        };
+        let form = if method == "POST" { form } else { None };
         let route = route(host, target, form);
         self.handle_route(cx, method, host, target, route).await
     }
@@ -280,19 +276,8 @@ impl Pages {
             && let Ok(body) = std::str::from_utf8(&response.body)
         {
             let store = self.store();
-            let url = format!("https://{host}{target}");
-            let page_host = store
-                .page(host, target)
-                .map_or(host, |page| page.host.as_str());
-            let profile = store
-                .site(page_host)
-                .cloned()
-                .unwrap_or_else(|| make::site_profile(page_host));
             if let Some(body) = render::normalize_page(
                 body,
-                &url,
-                &profile.name,
-                store.cast().map_or(&[], |cast| cast.people.as_slice()),
                 (make::site_profile(host).kind == make::SiteKind::Wiki).then(|| {
                     store
                         .page(host, target)
@@ -413,7 +398,7 @@ impl Pages {
                     return planted;
                 }
                 if let Some(fixed) = self.seed.fixed_for(host, target)
-                    && (self.live_calls.is_none()
+                    && (!self.interactive
                         || self.copied_active.load(std::sync::atomic::Ordering::SeqCst))
                 {
                     return self.fixed(cx, fixed).await;

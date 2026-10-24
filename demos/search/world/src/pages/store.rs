@@ -156,8 +156,6 @@ pub struct Store {
     files: Option<Files>,
     /// The world's generation setting; not stored.
     pub generation: Generation,
-    /// Generations this run has started; not stored.
-    pub made: usize,
     /// Pages made ahead of time that no request has asked for yet.
     pub unserved: std::collections::HashSet<(String, String)>,
 }
@@ -188,7 +186,6 @@ impl Store {
             claims: Vec::new(),
             files: None,
             generation: Generation::default(),
-            made: 0,
             unserved: Default::default(),
         }
     }
@@ -413,13 +410,12 @@ impl Store {
             .iter()
             .rev()
             .filter(|(h, _)| h == host)
-            .take(20)
             .map(|at| {
                 let page = &self.pages[at];
                 HostPage {
                     url: page.url.clone(),
                     title: page.title.clone(),
-                    claims: page.claims.iter().take(6).cloned().collect(),
+                    claims: page.claims.clone(),
                 }
             })
             .collect()
@@ -466,14 +462,13 @@ impl Store {
 
     /// Published text and search promises are context even when a writer omitted CLAIMS.
     pub fn writing_context(&self, subject: &str) -> Vec<Claim> {
-        let mut claims = self.recent_claims(40);
+        let mut claims = self.claims.clone();
         for page in self
             .order
             .iter()
             .rev()
             .map(|key| &self.pages[key])
             .filter(|page| page.status == 200)
-            .take(12)
         {
             let body = String::from_utf8_lossy(&page.body);
             let text = if page.content_type.starts_with("text/html") {
@@ -485,7 +480,7 @@ impl Store {
                 claims.push(Claim {
                     url: page.url.clone(),
                     claim: super::prompts::Statement {
-                        text: format!("{}: {}", page.title, super::text::take(&text, 4000)),
+                        text: format!("{}: {}", page.title, text),
                         known_on: super::seed::parse_date(&page.date).ok(),
                     },
                 });

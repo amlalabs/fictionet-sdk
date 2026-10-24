@@ -86,7 +86,6 @@ pub fn read_search(text: &str) -> Result<Search, Unreadable> {
     search.results = results
         .into_iter()
         .filter(|r| r.url.starts_with("http") && !r.title.is_empty())
-        .take(10)
         .collect();
     if search.results.is_empty() {
         return Err(Unreadable::Format("no results in the search answer".into()));
@@ -126,9 +125,6 @@ pub fn read_search(text: &str) -> Result<Search, Unreadable> {
             ));
         }
     }
-    search.related.truncate(8);
-    search.questions.truncate(4);
-    search.ads.truncate(2);
     Ok(search)
 }
 

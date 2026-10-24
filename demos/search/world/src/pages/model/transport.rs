@@ -32,7 +32,8 @@ impl Transport for ProviderTransport {
             use http_body_util::BodyExt;
             let response = self.incoming(cx, headers, body).await?;
             let status = response.status().as_u16();
-            let body = http_body_util::Limited::new(response.into_body(), 32 * 1024 * 1024)
+            let body = response
+                .into_body()
                 .collect()
                 .await
                 .map_err(|e| e.to_string())?

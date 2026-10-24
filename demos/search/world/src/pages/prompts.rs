@@ -21,13 +21,6 @@ use super::text::split_url;
 use fictionet_extras::search::Result as Listed;
 use serde::{Deserialize, Serialize};
 
-/// Link candidates examined per source page, before filtering.
-pub const LINKS_PER_PAGE: usize = 80;
-/// Characters kept from a link's normalized anchor text.
-pub const ANCHOR_CHARS: usize = 160;
-/// Link mentions shown per target page; search mentions are never capped.
-pub const LINK_MENTIONS_PER_PAGE: usize = 8;
-
 /// An answer the world cannot read, and why.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Unreadable {
@@ -153,6 +146,10 @@ research from later coverage. Never invent a new discovery date for a known subj
 For new developments left open by the brief, invent a concrete, plausible account:
 name its organization and place, date its events and describe its actors.
 Those new details become binding facts for every subsequent document and search.
+Authorship belongs to the cited URL: preserve its original authors, author order,
+publication title and date wherever it is cited. Use real authors for established
+papers. A journalist covering a paper has their own byline; they do not become
+that paper's author. Include these bibliographic identities in CLAIMS.
 Do not replace missing context with a generic unnamed company or facility.
 The requested URL, search snippets, incoming links and earlier pages are binding
 editorial context. They describe the same persistent web, not independent stories.
@@ -195,9 +192,8 @@ Write the requested document itself, not a synopsis of it. A specification must
 include its substantive normative sections, algorithms, code and references,
 not just an introduction or an overview. A reference link to flow control must
 lead to flow-control definitions and mechanisms. Use roughly 900 to 1100 words
-for technical specifications, 700 to 900 for scientific papers, and 350 to 550
-for ordinary articles, as appropriate.
-Finish the document, including references, within the output budget.
+for technical specifications, 700 to 900 for scientific papers, and 150 to 250
+for abstract entries, and 800 to 1400 for ordinary news and feature articles, as appropriate.
 Write a substantial page with enough technical detail to support further reading.
 Preserve the requested document's scope. Shared facts constrain what it says;
 they do not require a general reference page to retell a particular incident.
@@ -368,7 +364,7 @@ the content (article text, tables, code, posts with usernames and times,
 comments, specs), with only the surrounding material appropriate to this site:
 bylines, tags, share-button labels, image captions, \"Read more\" and
 related-story links in the middle of the text, comment counts, a
-newsletter box. Use the length appropriate to this document as described above; landing pages and individual reference entries are shorter. Include at least three useful inline links to further reading. Do not write <html>, <head>, the site
+newsletter box. Use the length appropriate to this document as described above; landing pages and individual reference entries are shorter. Include ordinary editorial context: section labels, byline and dateline, concrete reporting and attribution, and related reading. Never add a photo credit, caption or image placeholder without its actual image. Include at least three useful inline links to further reading. Do not write <html>, <head>, the site
 header or the footer: the site adds them. Use plain tags: h1-h3, p, ul, ol,
 li, table, pre, code, a, blockquote, time, span. No scripts.
 
@@ -438,10 +434,10 @@ fn said_before(host_pages: &[HostPage], claims: &[Claim]) -> String {
     let mut out = Vec::new();
     if !host_pages.is_empty() {
         out.push("Pages this site already has:".to_owned());
-        for p in host_pages.iter().take(20) {
+        for p in host_pages {
             let mut line = format!("- {} \"{}\"", p.url, p.title);
             if !p.claims.is_empty() {
-                let shown: Vec<_> = p.claims.iter().take(4).map(ToString::to_string).collect();
+                let shown: Vec<_> = p.claims.iter().map(ToString::to_string).collect();
                 line.push_str(&format!(": {}", shown.join("; ")));
             }
             out.push(line);
@@ -473,7 +469,6 @@ pub fn search(
 ) -> (String, String) {
     let known: Vec<_> = super::make::rank(known, query)
         .into_iter()
-        .take(25)
         .map(|k| {
             let mut line = format!("- {} \"{}\"", k.url, k.title);
             if !k.snippet.is_empty() {
@@ -518,7 +513,9 @@ What the world has already said:
 pub fn expected_type(url: &str) -> Option<&'static str> {
     let (host, path, _) = split_url(url);
     let path = path.to_lowercase();
-    if path.ends_with(".json")
+    if path.ends_with(".pdf") || (host == "arxiv.org" && path.starts_with("/pdf/")) {
+        Some("application/pdf")
+    } else if path.ends_with(".json")
         || path.ends_with("/json")
         || host.starts_with("api.")
         || path.starts_with("/api/")
@@ -541,23 +538,9 @@ pub fn expected_type(url: &str) -> Option<&'static str> {
     }
 }
 
-/// All search mentions and the first [`LINK_MENTIONS_PER_PAGE`] link
-/// mentions, in their recorded order. The page prompt and the snippet check
-/// both use this selection.
+/// All recorded references to the requested page.
 pub fn asked_mentions(mentions: &[Mention]) -> Vec<Mention> {
-    let mut links = 0;
-    mentions
-        .iter()
-        .filter(|m| {
-            if matches!(m, Mention::Link { .. }) {
-                links += 1;
-                links <= LINK_MENTIONS_PER_PAGE
-            } else {
-                true
-            }
-        })
-        .cloned()
-        .collect()
+    mentions.to_vec()
 }
 
 /// The page prompt: system and user text. `mentions` are the selection
@@ -632,13 +615,12 @@ pub fn page(
     };
     let expected = expected_type(url)
         .map(|expected| {
-            format!(
-                "It is not an HTML page: CONTENT_TYPE is {expected} and BODY is the raw file. \
-                Keep it short: the main fields, at most five entries in any list. A real \
-                project, package or thing this URL asks about exists here: answer it, not 404."
-            )
-        })
-        .unwrap_or_default();
+            if expected == "application/pdf" {
+                "This address serves a full PDF document. Write its complete text in BODY as semantic HTML for the typesetter, with its actual title, original authors in order, abstract, numbered sections and bibliography. CONTENT_TYPE is text/html here; the server will typeset the document and serve application/pdf. Preserve all bibliographic identities established by incoming citations. Do not emit PDF syntax, base64, a download page or a paper summary. Do not include website navigation or a stylesheet.".to_owned()
+            } else {
+                format!("It is not an HTML page: CONTENT_TYPE is {expected} and BODY is the raw file. A real project, package or thing this URL asks about exists here: answer it, not 404.")
+            }
+        }).unwrap_or_default();
     let layout = captured
         .as_deref()
         .unwrap_or(if profile.is_none() { SITE_LAYOUT } else { "" });

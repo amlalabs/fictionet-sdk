@@ -72,7 +72,7 @@ impl Pages {
             return Ok(self.copied_listing(query, start));
         }
         // Search results establish shared facts before independent pages read them.
-        let _publication = if self.live_calls.is_some() {
+        let _publication = if self.interactive {
             Some(
                 self.locks
                     .lock(cx, "search publications".into())
@@ -237,9 +237,6 @@ impl Pages {
         query: &str,
         engine: Engine,
     ) -> Result<SearchRecord, Stop> {
-        if self.live_calls.is_none() {
-            self.reserve()?;
-        }
         let cast = self.cast(cx).await?;
         let seed = self.context();
         let (known, claims) = {
@@ -272,10 +269,7 @@ impl Pages {
                         make::search(query, &known)
                     }
                 },
-                || {
-                    let (system, user) = prompts::search(&seed, &cast, query, &known, &claims);
-                    (system, user, SEARCH_TOKENS)
-                },
+                || prompts::search(&seed, &cast, query, &known, &claims),
                 |text, _| {
                     let search = prompts::read_search(text)?;
                     for result in &search.results {
@@ -377,10 +371,14 @@ impl Pages {
     /// Makes the pages behind a new list's first results in the background.
     /// A page that fails here is made again when it is asked for.
     pub(super) fn start_prefetch(self: &Arc<Self>, cx: &Cx, record: &SearchRecord) {
-        if self.live_calls.is_some() && record.usage.model == "stored" {
+        if self.interactive && record.usage.model == "stored" {
             return;
         }
-        for r in record.search.results.iter().take(self.prefetch) {
+        for r in record.search.results.iter().take(if self.interactive {
+            record.search.results.len()
+        } else {
+            self.prefetch
+        }) {
             let (host, target) = text::target_of(&r.url);
             if self.seed.fixed_for(&host, &target).is_some()
                 || self.store().page(&host, &target).is_some()
