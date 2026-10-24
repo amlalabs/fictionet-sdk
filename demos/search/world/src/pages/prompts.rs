@@ -196,6 +196,13 @@ RELATED: six related searches, separated by \" | \"
 QUESTIONS: four \"People also ask\" questions, separated by \" | \"
 AD: url | title | one line of ad copy   (zero to two AD lines)
 
+For a query about incidents, investigations or other dated developments,
+establish a concrete chronology before writing the results. If no earlier
+source establishes an event date, choose its full calendar date now. State
+that event date, including the year, in the relevant snippets; all reports
+of that event share it. DATE is each report's publication date, never a
+substitute for the event date. Later articles inherit this chronology.
+
 Rank what a real search engine would rank for this query today. Real
 result lists are messy, not a tidy story:
 - Include relevant sites and known pages only when the query is about them.
@@ -232,6 +239,16 @@ BODY:
 the page's main content
 
 If the title names a number of items, list exactly that many items.
+
+In a report about an incident or investigation, explicitly date the incident
+and each development in BODY with full calendar dates including their years.
+Keep these event dates separate from the article's publication or update date.
+If earlier sources leave an event undated, establish its concrete date in this
+article and in CLAIMS so subsequent sources reuse it. Do not substitute vague
+recent damage or an ongoing inquiry for an account of what happened when.
+Preserve any quoted snippet, but explain any contextual time it contains with
+an explicit date or date range in the surrounding prose. A reader must be able
+to extract the timeline without calendar arithmetic or opening another page.
 
 For HTML, BODY is what goes inside <main>: start with the page's <h1>, then
 the content (article text, tables, code, posts with usernames and times,
