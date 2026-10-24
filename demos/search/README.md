@@ -81,7 +81,7 @@ model calls and recent activity. Selecting a site or gateway keeps the map
 above its details while the agent remains visible. The scrubber replays the
 retained observation history; the agent stays live. The World menu chooses the page source or restarts world pages.
 Observations are retained for rewind throughout the launch. Observed internet destinations
-and sign-in policy survive activity expiry and page restarts. Each launch writes its facts to a separate
+and sign-in policy survive page restarts. Each launch writes its facts to a separate
 `<downloads>/search/run-<uuid>.jsonl` with RFC 3339 wall-clock timestamps and
 owner-only permissions. Preview records are under `demos/downloads/search-preview/`.
 Request credentials are redacted before entering the observation channel; request
@@ -188,17 +188,15 @@ loads the prepared index instead of parsing Wikipedia again. `--documents` runs
 only capture; `--index` runs only indexing. Preparation leaves at least 60 GiB of
 free disk space. Downloads and indexes stay outside git.
 
-WARCs are stored in `demos/downloads/security/`, outside git, with their wget
-logs. Capture the URLs in the seed with:
+WARCs are stored in `demos/downloads/security/`, outside git. Capture the URLs
+in the seed with:
 
 ```sh
-wget --page-requisites --span-hosts --compression=auto --delete-after \
-  --inet4-only --no-http-keep-alive \
-  --warc-file=<directory>/<name> <URLs>
+rustup run 1.99.0 cargo xtask search-capture /path/to/demos/downloads --research
 ```
 
-Use a separate WARC name for each batch. Keep original URLs, redirects, HTTP
-headers and response bodies; do not rewrite links or unpack the archives.
+Each batch gets a separate archive. Captures keep original URLs, redirects, HTTP
+headers and response bodies.
 Microsoft's site required a browser User-Agent. Referenced NIST PDFs are also
 captured. Some upstream optional images and fonts return errors in the original
 sites and retain those errors in replay.
