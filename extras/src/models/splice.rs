@@ -1,5 +1,5 @@
 use super::*;
-use fictionet::stdlib::codec::{Stream, try_pump};
+use fictionet::stdlib::codec::try_pump;
 use fictionet::stdlib::protocols::sse;
 use http_body::{Body as HttpBody, Frame};
 use response::{Block as OutputBlock, Delta, EventKind};
@@ -426,7 +426,7 @@ async fn read(
         }
         return Ok(turn);
     }
-    let mut decoder = Stream::new(sse::Events::new());
+    let mut decoder = transport::events();
     let mut body = response.into_body();
     let mut inputs: std::collections::HashMap<usize, String> = Default::default();
     while let Some(frame) = body.frame().await {

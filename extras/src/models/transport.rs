@@ -41,6 +41,15 @@ impl Framing {
     }
 }
 
+/// Decodes an event stream the sanitizer released. The sanitizer reads lines
+/// of any length, so each of its readers accepts any line and event as well.
+pub(super) fn events() -> Stream<sse::Events> {
+    Stream::new(sse::Events::with_limits(sse::Limits {
+        line: usize::MAX,
+        event: usize::MAX,
+    }))
+}
+
 /// The outcome of one attempt to contact a provider.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -168,6 +177,65 @@ fn scrub_json(value: &mut Value, secret: &Secret) {
     }
 }
 
+/// Whether a JSON text may hold the credential: in its bytes, or in any
+/// string or key once decoded, including values a repeated key hides from
+/// [`Value`]. Text that is not one JSON value may hold it.
+fn holds(text: &str, secret: &Secret) -> bool {
+    use serde::de::{DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
+    #[derive(Clone, Copy)]
+    struct Search<'a>(&'a str);
+    impl<'de> DeserializeSeed<'de> for Search<'_> {
+        type Value = bool;
+        fn deserialize<D: Deserializer<'de>>(self, decoder: D) -> Result<bool, D::Error> {
+            decoder.deserialize_any(self)
+        }
+    }
+    impl<'de> Visitor<'de> for Search<'_> {
+        type Value = bool;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a JSON value")
+        }
+        fn visit_str<E>(self, text: &str) -> Result<bool, E> {
+            Ok(text.contains(self.0))
+        }
+        fn visit_bool<E>(self, _: bool) -> Result<bool, E> {
+            Ok(false)
+        }
+        fn visit_i64<E>(self, _: i64) -> Result<bool, E> {
+            Ok(false)
+        }
+        fn visit_u64<E>(self, _: u64) -> Result<bool, E> {
+            Ok(false)
+        }
+        fn visit_f64<E>(self, _: f64) -> Result<bool, E> {
+            Ok(false)
+        }
+        fn visit_unit<E>(self) -> Result<bool, E> {
+            Ok(false)
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut items: A) -> Result<bool, A::Error> {
+            let mut found = false;
+            while let Some(item) = items.next_element_seed(self)? {
+                found |= item;
+            }
+            Ok(found)
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut fields: A) -> Result<bool, A::Error> {
+            let mut found = false;
+            while let Some(key) = fields.next_key_seed(self)? {
+                found |= key | fields.next_value_seed(self)?;
+            }
+            Ok(found)
+        }
+    }
+    let mut decoder = serde_json::Deserializer::from_str(text);
+    text.contains(&secret.value)
+        || Search(&secret.value)
+            .deserialize(&mut decoder)
+            .and_then(|found| decoder.end().map(|()| found))
+            .unwrap_or(true)
+}
+
 struct Scrubbed {
     body: Body,
     secret: Secret,
@@ -179,7 +247,9 @@ struct Scrubbed {
     event: Vec<sse::Line>,
 }
 enum Record {
-    Json(Value, Vec<u8>),
+    /// A decoded event, its metadata lines, and its data text when that text
+    /// cannot hold the credential.
+    Json(Value, Vec<u8>, Option<String>),
     Raw(Vec<u8>),
 }
 impl Scrubbed {
@@ -221,6 +291,7 @@ impl Scrubbed {
                     self.secret
                         .redact(&String::from_utf8_lossy(&metadata))
                         .into_bytes(),
+                    (!holds(&data, &self.secret)).then_some(data),
                 ),
                 Err(_) if data.is_empty() || data == "[DONE]" => Record::Raw(
                     self.secret
@@ -240,8 +311,15 @@ impl Scrubbed {
                 return Vec::new();
             }
             return if let Ok(mut value) = serde_json::from_slice::<Value>(&self.pending) {
+                let original = std::str::from_utf8(&self.pending)
+                    .is_ok_and(|text| !holds(text, &self.secret))
+                    .then(|| value.clone());
                 text::scrub(std::slice::from_mut(&mut value), &self.secret, true);
-                serde_json::to_vec(&value).expect("provider JSON")
+                if original.as_ref() == Some(&value) {
+                    std::mem::take(&mut self.pending)
+                } else {
+                    serde_json::to_vec(&value).expect("provider JSON")
+                }
             } else {
                 b"null".to_vec()
             };
@@ -250,7 +328,7 @@ impl Scrubbed {
             .records
             .iter()
             .filter_map(|record| match record {
-                Record::Json(value, _) => Some(value.clone()),
+                Record::Json(value, _, _) => Some(value.clone()),
                 Record::Raw(_) => None,
             })
             .collect();
@@ -258,7 +336,7 @@ impl Scrubbed {
         let mut values = values.into_iter().enumerate();
         let mut ready = self.records.len();
         for (index, record) in self.records.iter_mut().enumerate() {
-            if let Record::Json(value, _) = record {
+            if let Record::Json(value, _, _) = record {
                 let (item, scrubbed) = values.next().expect("decoded record");
                 *value = scrubbed;
                 if item >= safe {
@@ -269,11 +347,25 @@ impl Scrubbed {
         let mut output = Vec::new();
         for record in self.records.drain(..ready) {
             match record {
-                Record::Json(value, metadata) => {
+                Record::Json(value, metadata, data) => {
                     output.extend(metadata);
-                    output.extend(b"data: ");
-                    output.extend(serde_json::to_vec(&value).expect("provider JSON"));
-                    output.extend(b"\n\n");
+                    // Unchanged events keep the provider's text, numbers included.
+                    let data = data.filter(|data| {
+                        serde_json::from_str::<Value>(data).is_ok_and(|parsed| parsed == value)
+                    });
+                    match data {
+                        Some(data) => {
+                            for line in data.split('\n') {
+                                output.extend(format!("data: {line}\n").bytes());
+                            }
+                        }
+                        None => {
+                            output.extend(b"data: ");
+                            output.extend(serde_json::to_vec(&value).expect("provider JSON"));
+                            output.push(b'\n');
+                        }
+                    }
+                    output.push(b'\n');
                 }
                 Record::Raw(bytes) => output.extend(bytes),
             }

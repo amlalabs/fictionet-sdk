@@ -176,7 +176,7 @@ impl Metered {
         Self {
             body,
             call: Some(call),
-            sse: sse.then(|| Stream::new(sse::Events::new())),
+            sse: sse.then(transport::events),
             json: Vec::new(),
 
             done: false,
@@ -198,7 +198,7 @@ impl Metered {
             {
                 call.stop = "invalid_stream".into();
             }
-        } else if self.json.len() + bytes.len() <= 1024 * 1024 {
+        } else {
             self.json.extend_from_slice(bytes);
         }
     }
@@ -263,6 +263,8 @@ pub(crate) enum Channel {
     Thinking(u64),
     Refusal(u64),
     Tool(u64, u64),
+    /// Complete tool arguments, each its own JSON text.
+    Arguments,
 }
 
 /// Interprets content once for assembly, credential removal and page publication.
@@ -299,6 +301,15 @@ pub(crate) fn content(value: &mut Value, visit: &mut impl FnMut(Channel, &mut St
         _ => Channel::Text(0),
     };
     field(value, "delta", channel, visit);
+    match EventKind::read(value) {
+        EventKind::ArgumentsDone => field(value, "arguments", Channel::Arguments, visit),
+        EventKind::ItemAdded | EventKind::ItemDone => {
+            if let Some(item) = value.get_mut("item") {
+                field(item, "arguments", Channel::Arguments, visit);
+            }
+        }
+        _ => {}
+    }
     if let Some(choices) = value.get_mut("choices").and_then(Value::as_array_mut) {
         for (index, choice) in choices.iter_mut().enumerate() {
             let channel = choice["index"].as_u64().unwrap_or(index as u64);
@@ -310,6 +321,10 @@ pub(crate) fn content(value: &mut Value, visit: &mut impl FnMut(Channel, &mut St
                     field(part, "refusal", Channel::Refusal(channel), visit);
                     if let Some(content) = part.get_mut("content") {
                         events::blocks(content, channel, visit);
+                    }
+                    // A message carries the legacy function_call or tool_calls, never both.
+                    if let Some(function) = part.get_mut("function_call") {
+                        field(function, "arguments", Channel::Tool(channel, 0), visit);
                     }
                     if let Some(tools) = part.get_mut("tool_calls").and_then(Value::as_array_mut) {
                         for (index, tool) in tools.iter_mut().enumerate() {
