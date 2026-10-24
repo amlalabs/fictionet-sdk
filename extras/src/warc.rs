@@ -28,7 +28,7 @@ pub struct Archive {
 }
 
 /// The original HTTP response, with transport framing removed.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Response {
     /// Stored HTTP status, including redirects and errors.
     pub status: StatusCode,

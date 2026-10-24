@@ -50,10 +50,16 @@ pub struct Zscaler {
 /// 2048 keys from `fcx`. `now_unix` is the run's wall-clock time in Unix
 /// seconds. The "(t)" CA's two-week window straddles it.
 pub fn zscaler(fcx: &Cx, cloud: &str, now_unix: i64) -> Result<Zscaler> {
+    zscaler_since(fcx, cloud, now_unix, now_unix)
+}
+
+/// [`zscaler`] for a run whose clock may also read as early as
+/// `earliest_unix`: the "(t)" CA's window opens three days before that.
+pub fn zscaler_since(fcx: &Cx, cloud: &str, earliest_unix: i64, now_unix: i64) -> Result<Zscaler> {
     let root_validity = validity(ROOT_NOT_BEFORE, ROOT_NOT_AFTER)?;
     let int_validity = validity(INT_NOT_BEFORE, INT_NOT_AFTER)?;
     let issuing_validity = validity(
-        now_unix.saturating_sub(3 * DAY),
+        earliest_unix.min(now_unix).saturating_sub(3 * DAY),
         now_unix.saturating_add(11 * DAY),
     )?;
     // The root uses PrintableString except for its IA5String email.
@@ -161,8 +167,20 @@ impl Zscaler {
     /// The leaf's window straddles `now_unix`. The first name is the common
     /// name, cut to 64 characters.
     pub fn issue(&self, fcx: &Cx, names: &[&str], now_unix: i64) -> Result<Leaf> {
+        self.issue_since(fcx, names, now_unix, now_unix)
+    }
+
+    /// [`issue`](Self::issue) for a run whose clock may also read as early
+    /// as `earliest_unix`: the leaf's window opens a day before that.
+    pub fn issue_since(
+        &self,
+        fcx: &Cx,
+        names: &[&str],
+        earliest_unix: i64,
+        now_unix: i64,
+    ) -> Result<Leaf> {
         let validity = validity(
-            now_unix.saturating_sub(DAY),
+            earliest_unix.min(now_unix).saturating_sub(DAY),
             now_unix.saturating_add(395 * DAY),
         )?;
         let sans = x509::SubjectAltName(
