@@ -156,14 +156,14 @@ fn pip_installs_research_tools_and_git_clones_captured_repositories_offline() ->
         let pages = pages.clone();
         async move {
             for host in hosts {
-                let response = pages
-                    .handle(&cx, "GET", host, "/no-such-project-or-page", None)
-                    .await;
-                assert_eq!(response.status, 404, "{host}");
-                let body = String::from_utf8_lossy(&response.body);
-                assert!(!body.contains("<center>nginx</center>"), "{host}");
-                if host == "github.com" {
-                    assert!(body.contains("GitHub"));
+                for path in ["/no-such-project-or-page", "/404"] {
+                    let response = pages.handle(&cx, "GET", host, path, None).await;
+                    assert_eq!(response.status, 404, "{host}{path}");
+                    let body = String::from_utf8_lossy(&response.body);
+                    assert!(!body.contains("<center>nginx</center>"), "{host}{path}");
+                    if host == "github.com" {
+                        assert!(body.contains("GitHub"));
+                    }
                 }
             }
             Ok(())

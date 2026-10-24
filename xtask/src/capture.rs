@@ -3,7 +3,11 @@
 use crate::Result;
 use fictionet_extras::{capture::BROWSER, warc::Archive};
 use serde::Deserialize;
-use std::{collections::BTreeSet, path::Path, time::SystemTime};
+use std::{
+    collections::{BTreeSet, HashSet},
+    path::Path,
+    time::SystemTime,
+};
 use tokio::process::Command;
 
 #[derive(Deserialize)]
@@ -64,23 +68,37 @@ async fn wget(root: &Path, name: &str, urls: &[String], requisites: bool) -> Res
     } else {
         None
     };
-    let urls: Vec<_> = urls
-        .iter()
-        .filter(|url| {
-            archive
-                .as_ref()
-                .is_none_or(|archive| !archive.contains(url))
-        })
-        .collect();
+    let mut pending = Vec::new();
+    for url in urls {
+        let response = archive
+            .as_ref()
+            .map(|archive| archive.get(url))
+            .transpose()?
+            .flatten();
+        if response.is_none_or(|response| {
+            !(response.status.is_success()
+                || response.status.is_redirection()
+                || response.status == http::StatusCode::NOT_FOUND)
+        }) {
+            pending.push(url.clone());
+        }
+    }
+    download(root, name, &pending, requisites).await
+}
+
+async fn download(root: &Path, name: &str, urls: &[String], requisites: bool) -> Result {
     if urls.is_empty() {
         return Ok(());
     }
     let batch = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)?
         .as_nanos();
-    let prefix = root.join(format!("{name}-{batch}"));
+    let staging = Batch(root.join(format!(".download-{}-{batch}", std::process::id())));
+    std::fs::create_dir_all(&staging.0)?;
+    let prefix = staging.0.join(format!("{name}-{batch}"));
+    let log = prefix.with_extension("log");
     let mut command = Command::new("wget");
-    command.args([
+    command.kill_on_drop(true).args([
         "--compression=auto",
         "--delete-after",
         "--content-on-error",
@@ -95,45 +113,54 @@ async fn wget(root: &Path, name: &str, urls: &[String], requisites: bool) -> Res
     if requisites {
         command.args(["--page-requisites", "--span-hosts"]);
     }
-    let status = command
+    let mut child = command
         .arg(format!("--warc-file={}", prefix.display()))
         .arg(format!(
             "--directory-prefix={}",
             prefix.with_extension("files").display()
         ))
-        .arg(format!(
-            "--output-file={}",
-            prefix.with_extension("log").display()
-        ))
+        .arg(format!("--output-file={}", log.display()))
         .args(urls)
-        .status()
-        .await?;
+        .spawn()?;
+    let deadline = std::time::Duration::from_secs((60 * urls.len() as u64).min(180));
+    let status = match tokio::time::timeout(deadline, child.wait()).await {
+        Ok(status) => status?,
+        Err(_) => {
+            child.kill().await?;
+            std::fs::rename(&log, root.join(log.file_name().unwrap()))?;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "capture exceeded its deadline",
+            )
+            .into());
+        }
+    };
+    let published_log = root.join(log.file_name().unwrap());
+    std::fs::rename(&log, &published_log)?;
     // Optional page assets and missing-page captures may return HTTP errors.
     // Required documents and distributions are verified from the archive below.
     if !status.success() && !matches!(status.code(), Some(4 | 8)) {
-        return Err(format!(
-            "wget failed: {status}; see {}",
-            prefix.with_extension("log").display()
-        )
-        .into());
+        return Err(format!("wget failed: {status}; see {}", published_log.display()).into());
     }
     if status.code() == Some(4) {
         eprintln!(
             "Some downloads were unreachable; required responses will be verified. See {}",
-            prefix.with_extension("log").display()
+            published_log.display()
         );
     }
+    let archive = prefix.with_extension("warc.gz");
+    std::fs::rename(&archive, root.join(archive.file_name().unwrap()))?;
     Ok(())
 }
 
-fn captured(archive: &Archive, url: &str) -> Result<fictionet_extras::warc::Response> {
+fn captured_at(archive: &Archive, url: &str) -> Result<(String, fictionet_extras::warc::Response)> {
     let mut url = url::Url::parse(url)?;
     for _ in 0..10 {
         let response = archive
             .get(url.as_str())?
             .ok_or_else(|| format!("missing capture: {url}"))?;
         if !response.status.is_redirection() {
-            return Ok(response);
+            return Ok((url.into(), response));
         }
         let location = response
             .headers
@@ -145,6 +172,22 @@ fn captured(archive: &Archive, url: &str) -> Result<fictionet_extras::warc::Resp
     Err(format!("too many redirects: {url}").into())
 }
 
+fn captured(archive: &Archive, url: &str) -> Result<fictionet_extras::warc::Response> {
+    captured_at(archive, url).map(|(_, response)| response)
+}
+
+fn not_found(archive: &Archive, url: &str) -> Result<fictionet_extras::warc::Response> {
+    let response = captured(archive, url)?;
+    if response.status != http::StatusCode::NOT_FOUND {
+        return Err(format!(
+            "expected a not-found response for {url}, got {}",
+            response.status
+        )
+        .into());
+    }
+    Ok(response)
+}
+
 fn verify(archive: &Archive, url: &str) -> Result {
     let response = captured(archive, url)?;
     if response.status.is_success() {
@@ -154,7 +197,30 @@ fn verify(archive: &Archive, url: &str) -> Result {
     }
 }
 
-async fn missing_pages(root: &Path, sources: &[String]) -> Result {
+fn site_not_found(
+    archive: &Archive,
+    origin: &url::Origin,
+) -> Result<Option<fictionet_extras::warc::Response>> {
+    let mut urls: Vec<_> = archive
+        .urls()
+        .filter(|url| url::Url::parse(url).is_ok_and(|url| &url.origin() == origin))
+        .collect();
+    urls.sort();
+    for url in urls {
+        if let Some(response) = archive.get(url)?
+            && response.status == http::StatusCode::NOT_FOUND
+        {
+            return Ok(Some(response));
+        }
+    }
+    Ok(None)
+}
+
+async fn missing_pages(root: &Path, sources: &[String], required: &[String]) -> Result {
+    let required: HashSet<_> = required
+        .iter()
+        .map(|url| url::Url::parse(url).map(|url| url.origin()))
+        .collect::<std::result::Result<_, _>>()?;
     let urls: BTreeSet<_> = sources
         .iter()
         .map(|url| {
@@ -165,58 +231,177 @@ async fn missing_pages(root: &Path, sources: &[String]) -> Result {
         })
         .collect::<Result<_>>()?;
     let urls: Vec<_> = urls.into_iter().collect();
-    wget(root, "missing", &urls, false).await?;
+    let path = root.join("missing-pages.warc.gz");
+    let mut missing = Archive::open(path.is_file().then_some(path.clone()))?;
+    let pending = urls
+        .iter()
+        .filter(|url| not_found(&missing, url).is_err())
+        .cloned()
+        .collect::<Vec<_>>();
+    documents(root, "missing", &pending).await?;
     let mut archive = Archive::directory(root)?;
     let mut alternatives = Vec::new();
     for url in &urls {
-        if archive
-            .get(url)?
-            .is_some_and(|response| response.status.is_client_error())
-        {
+        if not_found(&missing, url).is_ok() {
             continue;
         }
-        if let Ok(response) = captured(&archive, url)
-            && response.status.is_client_error()
-        {
-            archive.append(&root.join("missing-pages.warc.gz"), url, &response)?;
+        if let Ok(response) = not_found(&archive, url) {
+            missing.append(&path, url, &response)?;
         } else {
             let alternate = url::Url::parse(url)?.join("404/not-found")?.to_string();
             alternatives.push((url.clone(), alternate));
         }
     }
     if !alternatives.is_empty() {
-        wget(
+        documents(
             root,
             "missing",
             &alternatives
                 .iter()
                 .map(|(_, url)| url.clone())
                 .collect::<Vec<_>>(),
-            false,
         )
         .await?;
         archive = Archive::directory(root)?;
+        let mut failures = Vec::new();
         for (canonical, alternate) in alternatives {
-            let response = captured(&archive, &alternate)?;
-            if !response.status.is_client_error() {
-                return Err(format!("no not-found response captured for {alternate}").into());
+            match not_found(&archive, &alternate) {
+                Ok(response) => missing.append(&path, &canonical, &response)?,
+                Err(error) => {
+                    let origin = url::Url::parse(&canonical)?.origin();
+                    if let Some(response) = site_not_found(&archive, &origin)? {
+                        missing.append(&path, &canonical, &response)?;
+                    } else if required.contains(&origin) {
+                        failures.push(error.to_string());
+                    } else {
+                        eprintln!(
+                            "No not-found capture for {}: {error}",
+                            origin.ascii_serialization()
+                        );
+                    }
+                }
             }
-            archive.append(&root.join("missing-pages.warc.gz"), &canonical, &response)?;
+        }
+        if !failures.is_empty() {
+            return Err(failures.join("\n").into());
         }
     }
     let mut assets = BTreeSet::new();
     for url in urls {
-        if let Some(response) = archive.get(&url)? {
+        if let Some(response) = missing.get(&url)? {
             assets.extend(fictionet_extras::capture::links(&url, &response)?.assets);
         }
     }
-    wget(
-        root,
-        "missing-assets",
-        &assets.into_iter().collect::<Vec<_>>(),
-        true,
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        wget(
+            root,
+            "missing-assets",
+            &assets.into_iter().collect::<Vec<_>>(),
+            true,
+        ),
     )
     .await
+    {
+        Err(_) => {
+            eprintln!("Optional not-found assets exceeded their capture deadline");
+            Ok(())
+        }
+        Ok(result) => result,
+    }
+}
+
+async fn documents(root: &Path, name: &str, urls: &[String]) -> Result {
+    for group in urls.chunks(4) {
+        let mut jobs = tokio::task::JoinSet::new();
+        for url in group {
+            let root = root.to_owned();
+            let name = name.to_owned();
+            let url = url.clone();
+            jobs.spawn(async move {
+                match download(&root, &name, std::slice::from_ref(&url), false).await {
+                    Err(error)
+                        if error
+                            .downcast_ref::<std::io::Error>()
+                            .is_some_and(|error| error.kind() == std::io::ErrorKind::TimedOut) =>
+                    {
+                        eprintln!("Capture timed out: {url}");
+                        Ok(())
+                    }
+                    result => result,
+                }
+            });
+        }
+        while let Some(result) = jobs.join_next().await {
+            result??;
+        }
+    }
+    Ok(())
+}
+
+async fn research(root: &Path, sources: &[String]) -> Result {
+    wget(root, "research", sources, true).await?;
+    let archive = Archive::directory(root)?;
+    let mut references = BTreeSet::new();
+    for url in sources {
+        verify(&archive, url)?;
+        let (url, response) = captured_at(&archive, url)?;
+        references.extend(
+            fictionet_extras::capture::references(&url, &response)?
+                .into_iter()
+                .take(32),
+        );
+    }
+    let references: Vec<_> = references.into_iter().collect();
+    let mut pending = Vec::new();
+    for url in &references {
+        if !archive.contains(url) {
+            pending.push(url.clone());
+        }
+    }
+    println!(
+        "Capturing {} article references ({} already present)",
+        references.len(),
+        references.len() - pending.len()
+    );
+    // Only the source articles discover navigation. References are documents,
+    // so third-party application assets cannot expand the capture recursively.
+    documents(root, "references", &pending).await?;
+    let archive = Archive::directory(root)?;
+    let mut origins = sources.to_vec();
+    for url in references {
+        if captured(&archive, &url).is_ok_and(|response| response.status.is_success()) {
+            origins.push(url);
+        } else {
+            eprintln!("Reference unavailable: {url}");
+        }
+    }
+    missing_pages(root, &origins, sources).await
+}
+
+fn package_root(root: &Path) -> std::io::Result<std::path::PathBuf> {
+    if root.join("current").try_exists()? {
+        std::fs::canonicalize(root.join("current"))
+    } else {
+        Ok(root.to_owned())
+    }
+}
+
+fn publish(packages: &Path, destination: &Path) -> Result {
+    std::fs::create_dir_all(destination)?;
+    let name = format!(
+        "batch-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)?
+            .as_nanos()
+    );
+    std::fs::rename(packages, destination.join(&name))?;
+    let pointer = destination.join(format!(".{name}"));
+    std::os::unix::fs::symlink(&name, &pointer)?;
+    std::fs::rename(pointer, destination.join("current"))?;
+    // Published batches remain immutable, including paths held by older worlds.
+    Ok(())
 }
 
 pub async fn run(downloads: &Path, python: &Path) -> Result {
@@ -225,12 +410,11 @@ pub async fn run(downloads: &Path, python: &Path) -> Result {
     let root = downloads.join(&corpus.directory);
     std::fs::create_dir_all(&root)?;
     let root = std::fs::canonicalize(root)?;
-    wget(&root, "research", &corpus.urls, true).await?;
-    let archive = Archive::directory(&root)?;
-    for url in &corpus.urls {
-        verify(&archive, url)?;
-    }
-    missing_pages(&root, &corpus.urls).await?;
+    let capture = std::fs::File::open(&root)?;
+    capture
+        .try_lock()
+        .map_err(|error| format!("cannot own corpus capture: {error}"))?;
+    research(&root, &corpus.urls).await?;
 
     // Resolve and capture into an empty batch. Mutable indexes and their complete
     // dependency closure are published together only after an offline install.
@@ -307,7 +491,7 @@ pub async fn run(downloads: &Path, python: &Path) -> Result {
     let packages = staged_corpus.join("packages");
     std::fs::create_dir_all(&packages)?;
     if root.join("packages").is_dir() {
-        let previous = Archive::directory(&root.join("packages"))?;
+        let previous = Archive::directory(&package_root(&root.join("packages"))?)?;
         let mut reused = Archive::default();
         for url in immutable {
             if let Some(response) = previous.get(&url)?
@@ -322,7 +506,7 @@ pub async fn run(downloads: &Path, python: &Path) -> Result {
         .urls()
         .map(str::to_owned)
         .collect::<Vec<_>>();
-    missing_pages(&packages, &sources).await?;
+    missing_pages(&packages, &sources, &sources).await?;
     let archive = Archive::directory(&packages)?;
     for url in required {
         verify(&archive, &url)?;
@@ -360,17 +544,7 @@ pub async fn run(downloads: &Path, python: &Path) -> Result {
     if !status.success() {
         return Err("offline package installation and clone validation failed".into());
     }
-    let destination = root.join("packages");
-    let previous = batch.0.join("previous-packages");
-    if destination.exists() {
-        std::fs::rename(&destination, &previous)?;
-    }
-    if let Err(error) = std::fs::rename(&packages, &destination) {
-        if previous.exists() {
-            std::fs::rename(previous, &destination)?;
-        }
-        return Err(error.into());
-    }
+    publish(&packages, &root.join("packages"))?;
     println!(
         "Captured research sources and package distributions in {}",
         root.display()
@@ -381,6 +555,96 @@ pub async fn run(downloads: &Path, python: &Path) -> Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn publishing_keeps_existing_worlds_and_git_paths_on_their_batch() {
+        let root = Batch(std::env::temp_dir().join(format!(
+                "package-publication-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            )));
+        let corpus = root.0.join("security");
+        std::fs::create_dir_all(&corpus).unwrap();
+        let mut archive = Archive::default();
+        archive
+            .append(
+                &corpus.join("research.warc.gz"),
+                "https://source.org/",
+                &fictionet_extras::warc::Response {
+                    status: http::StatusCode::OK,
+                    headers: http::HeaderMap::from_iter([(
+                        http::header::CONTENT_TYPE,
+                        "text/html".parse().unwrap(),
+                    )]),
+                    body: "<title>Source</title><p>Research</p>".into(),
+                },
+            )
+            .unwrap();
+        let write_batch = |path: &Path, body: &'static str| {
+            std::fs::create_dir_all(path.join("git/psf/requests.git")).unwrap();
+            std::fs::write(path.join("git/psf/requests.git/HEAD"), body).unwrap();
+            Archive::default()
+                .append(
+                    &path.join("distributions.warc.gz"),
+                    "https://files.pythonhosted.org/tool.whl",
+                    &fictionet_extras::warc::Response {
+                        status: http::StatusCode::OK,
+                        headers: Default::default(),
+                        body: body.into(),
+                    },
+                )
+                .unwrap();
+        };
+        let open = || {
+            std::sync::Arc::new(
+                web_world::pages::Pages::copied(
+                    web_world::pages::Seed::builtin("web").unwrap(),
+                    &corpus,
+                    &["https://source.org/".into()],
+                    None,
+                )
+                .unwrap(),
+            )
+        };
+        let destination = corpus.join("packages");
+        write_batch(&destination, "legacy");
+        let legacy = open();
+        let first = root.0.join("first");
+        write_batch(&first, "first");
+        publish(&first, &destination).unwrap();
+        let first_path = package_root(&destination).unwrap();
+        let first = open();
+        let second = root.0.join("second");
+        write_batch(&second, "second");
+        publish(&second, &destination).unwrap();
+        let second = open();
+        assert_eq!(
+            std::fs::read_to_string(destination.join("git/psf/requests.git/HEAD")).unwrap(),
+            "legacy"
+        );
+        assert_eq!(
+            std::fs::read_to_string(first_path.join("git/psf/requests.git/HEAD")).unwrap(),
+            "first"
+        );
+        fictionet::block_on(fictionet::lab(
+            fictionet::Seed::from_u64(1),
+            |cx| async move {
+                for (pages, expected) in [(legacy, "legacy"), (first, "first"), (second, "second")]
+                {
+                    let answer = pages
+                        .handle(&cx, "GET", "files.pythonhosted.org", "/tool.whl", None)
+                        .await;
+                    assert_eq!(answer.status, 200);
+                    assert_eq!(answer.body, expected.as_bytes());
+                }
+                Ok(())
+            },
+        ))
+        .unwrap();
+    }
 
     #[test]
     fn captured_responses_follow_redirects_and_preserve_site_errors() {
@@ -419,6 +683,45 @@ mod tests {
         assert_eq!(response.body, "Page not found | Source");
         assert!(verify(&archive, "https://source.org/404").is_err());
         assert!(captured(&archive, "https://source.org/missing").is_err());
+        let origin = url::Url::parse("https://source.org/").unwrap().origin();
+        assert_eq!(
+            site_not_found(&archive, &origin).unwrap().unwrap().status,
+            404
+        );
+        assert!(
+            site_not_found(
+                &archive,
+                &url::Url::parse("https://other.org/").unwrap().origin()
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(
+            not_found(&archive, "https://source.org/404")
+                .unwrap()
+                .status,
+            404
+        );
+        for status in [200, 401, 403, 429] {
+            archive
+                .append(
+                    &path,
+                    "https://source.org/wrong-status",
+                    &fictionet_extras::warc::Response {
+                        status: http::StatusCode::from_u16(status).unwrap(),
+                        headers: Default::default(),
+                        body: "Unavailable".into(),
+                    },
+                )
+                .unwrap();
+            assert!(not_found(&archive, "https://source.org/wrong-status").is_err());
+            assert_eq!(
+                captured(&archive, "https://source.org/wrong-status")
+                    .unwrap()
+                    .status,
+                status
+            );
+        }
         std::fs::remove_file(path).unwrap();
     }
 }

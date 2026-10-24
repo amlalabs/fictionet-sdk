@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 fictionet-demo = { path = "../demos/kit" }
 fictionet-extras = { path = "../extras" }
+http = "1"
 web-world = { path = "../demos/search/world" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -15,3 +16,6 @@ url = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util", "time", "signal"] }
 
 fatfs = { version = "0.3", default-features = false, features = ["std", "alloc"] }
+
+[dev-dependencies]
+fictionet = { path = ".." }
