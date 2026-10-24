@@ -233,6 +233,51 @@ fn domain_filters_match_host_boundaries() {
 }
 
 #[test]
+fn blocked_domains_cover_the_fully_qualified_host() {
+    let tool: tools::Domains =
+        serde_json::from_value(json!({"blocked_domains":["example.com"]})).unwrap();
+    assert!(!tools::allowed(&tool, "https://example.com/page"));
+    // A trailing dot names the same host; worlds serve it as that host.
+    assert!(!tools::allowed(&tool, "https://example.com./page"));
+    assert!(!tools::allowed(&tool, "https://www.example.com./page"));
+}
+
+#[test]
+fn a_client_tool_sharing_a_search_call_id_is_returned_to_the_client() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        receive(&mut socket);
+        response(
+            &mut socket,
+            vec![
+                json!({"type":"tool_use","id":"toolu_same","name":"web_search","input":{"query":"page"}}),
+                json!({"type":"tool_use","id":"toolu_same","name":"lookup","input":{"key":"value"}}),
+            ],
+            "tool_use",
+            false,
+        );
+    });
+    let pages = Arc::new(Pages(AtomicUsize::new(0)));
+    fictionet::block_on(fictionet::run(fictionet::Seed::from_u64(14), |cx| async move {
+        let credential = Credential::api_key(&cx, Secret::new("key", "sk-ant-api03-private".into())?);
+        let key = credential.placeholder().to_owned();
+        let model = Model::at(&cx, Provider::Anthropic, credential, format!("http://{address}").parse()?)?.search(pages);
+        let body = json!({"model":"claude","max_tokens":100,"messages":[{"role":"user","content":"Search for page"}],
+            "tools":[{"type":"web_search_20250305","name":"web_search"},{"name":"lookup","input_schema":{"type":"object"}}]});
+        let request = Request::post("/v1/messages").header("x-api-key", &key).body(Body::from(body.to_string()))?;
+        let answer = collected(model.clone().send(request).await?, false).await;
+        assert!(
+            answer["content"].as_array().unwrap().iter().any(|block| block["type"] == "tool_use" && block["name"] == "lookup"),
+            "{answer}"
+        );
+        Ok(())
+    })).unwrap();
+    server.join().unwrap();
+}
+
+#[test]
 fn token_counting_with_web_tools_and_history_returns_the_count() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();

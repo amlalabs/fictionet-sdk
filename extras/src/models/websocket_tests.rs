@@ -496,3 +496,73 @@ fn an_interrupt_ends_a_running_response_with_its_finished_items() {
     .unwrap();
     upstream.join().unwrap();
 }
+
+#[test]
+fn a_message_at_the_size_limit_followed_by_a_ping_is_answered() {
+    fictionet::block_on(fictionet::run(
+        fictionet::Seed::from_u64(24),
+        |cx| async move {
+            // Nothing listens there: the message is refused before any upstream call.
+            let model = openai(&cx, "127.0.0.1:1".parse()?)?;
+            let mut client = Client::open(&cx, &model).await;
+            let (head, tail) = (r#"{"type":"response.unknown","pad":""#, r#""}"#);
+            let pad =
+                fictionet::stdlib::protocols::websocket::MAX_MESSAGE - head.len() - tail.len();
+            let text = format!("{head}{}{tail}", "a".repeat(pad));
+            // The largest message the socket accepts, and a ping right behind it.
+            let mut bytes = Message::Text(text)
+                .to_frame(Some([7, 1, 9, 4]))
+                .unwrap()
+                .to_bytes()
+                .unwrap();
+            bytes.extend(
+                Message::Ping(b"after".to_vec())
+                    .to_frame(Some([7, 1, 9, 4]))
+                    .unwrap()
+                    .to_bytes()
+                    .unwrap(),
+            );
+            client.conn.write_all(&cx, &bytes).await.unwrap();
+            let error = client.event().await;
+            assert_eq!(error["type"], "error");
+            assert_eq!(error["error"]["code"], "invalid_value");
+            assert_eq!(client.next().await, Message::Pong(b"after".to_vec()));
+            cx.cancel();
+            Ok(())
+        },
+    ))
+    .unwrap();
+}
+
+#[test]
+fn creates_queued_behind_a_running_response_are_bounded() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let upstream = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        received(&mut socket);
+        // Never answer: the first response stays running.
+        let _ = released.recv();
+    });
+    fictionet::block_on(fictionet::run(
+        fictionet::Seed::from_u64(25),
+        |cx| async move {
+            let model = openai(&cx, address)?;
+            let mut client = Client::open(&cx, &model).await;
+            let create =
+                json!({"type":"response.create","model":"small","input":"Count","store":false});
+            for _ in 0..1000 {
+                client.send(create.clone()).await;
+            }
+            // The session refuses work it would otherwise hold without limit.
+            let refused = client.event().await;
+            assert_eq!(refused["type"], "error");
+            release.send(()).unwrap();
+            cx.cancel();
+            Ok(())
+        },
+    ))
+    .unwrap();
+    upstream.join().unwrap();
+}
