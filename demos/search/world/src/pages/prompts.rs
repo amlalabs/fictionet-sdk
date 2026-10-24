@@ -184,8 +184,6 @@ Write the requested document itself, not a synopsis of it. Supply the substantiv
 information its title, incoming search query and links promise. A data page must
 contain the actual records and values, rather than instructions for using an
 absent interface or links to other pages that supposedly hold the information.
-An event that has finished by the world's date has an outcome; establish it if
-the brief leaves it open, then preserve it across all sources.
 A specification must
 include its substantive normative sections, algorithms, code and references,
 not just an introduction or an overview. A reference link to flow control must
@@ -295,11 +293,6 @@ SNIPPET: a piece of the page's own text, 120 to 200 characters, often cut off wi
 RELATED: six related searches, separated by \" | \"
 QUESTIONS: four \"People also ask\" questions, separated by \" | \"
 AD: url | title | one line of ad copy   (zero to two AD lines)
-
-For a direct factual question, include sources whose snippets state the answer
-and its concrete supporting details. Establish these facts before publishing the
-list so the destination pages can deliver them. Do not substitute directories,
-descriptions of unavailable interfaces or instructions to consult another source.
 
 For a query about incidents, investigations or other dated developments,
 establish the named participants and a concrete chronology before writing the results.

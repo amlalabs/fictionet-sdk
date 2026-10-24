@@ -239,10 +239,18 @@ impl Pages {
     ) -> Result<SearchRecord, Stop> {
         let cast = self.cast(cx).await?;
         let seed = self.context();
-        let (known, claims) = {
+        let (mut known, claims) = {
             let store = self.writing_store()?;
             (store.known(&seed), store.writing_context(query))
         };
+        if self.copied.is_some() {
+            let (reference, _, _, _) = self.copied_listing(query, 0)?;
+            for result in reference.results {
+                if !known.iter().any(|page| page.url == result.url) {
+                    known.push(result);
+                }
+            }
+        }
         let mut normalized = search::Search {
             results: known,
             ..search::Search::default()

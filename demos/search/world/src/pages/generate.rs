@@ -382,6 +382,7 @@ impl Pages {
                 }),
         );
         let latest = self.latest_publication(&*self.writing_store()?, host, target, &ask.mentions);
+        let reference = self.reference_text(&url).map_err(Stop::store)?;
         let made = self
             .generate(
                 cx,
@@ -410,6 +411,9 @@ impl Pages {
                         &ask.host_pages,
                         &ask.claims,
                     );
+                    if let Some(reference) = &reference {
+                        user.push_str(&format!("\nOriginal captured source at this URL:\n{reference}\nPreserve its established public facts and substantive data, except for changes explicitly required by the world's brief or previously published world documents. Write the requested document in full from that grounding. The snapshot date does not change the dates of events it describes."));
+                    }
                     user.push_str(&format!("\nThe latest permitted publication/update date is {latest}. Incoming links already published by this date must remain possible. Later context describes the wider world; do not import its later knowledge into this page."));
                     (system, user)
                 },

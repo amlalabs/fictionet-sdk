@@ -196,6 +196,26 @@ fn archive_files(root: &Path) -> std::io::Result<Vec<ArchiveFile>> {
 }
 
 impl Pages {
+    pub(super) fn reference_text(&self, url: &str) -> std::io::Result<Option<String>> {
+        let Some(corpus) = &self.copied else {
+            return Ok(None);
+        };
+        let Some(response) = corpus.response(url)? else {
+            return Ok(None);
+        };
+        if response.status != http::StatusCode::OK
+            || !response
+                .headers
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("text/html"))
+        {
+            return Ok(None);
+        }
+        fictionet_extras::capture::page_text(&String::from_utf8_lossy(&response.decoded()?))
+            .map(Some)
+    }
+
     pub(crate) fn copied_body(&self, url: String) -> Option<PageBody> {
         self.copied_only().then(|| {
             PageBody(BodySource::Copied {
