@@ -464,6 +464,69 @@ mod tests {
     }
 
     #[test]
+    fn finished_function_arguments_are_scrubbed_after_json_decoding() {
+        fictionet::block_on(fictionet::lab(fictionet::Seed::from_u64(14), |_| async {
+            let secret = Secret::new("provider key", "private-key".into())?;
+            let arguments = r#"{"value":"private\u002dkey"}"#;
+            let item = json!({"type":"function_call","name":"lookup","call_id":"call_1","arguments":arguments});
+            let input: String = [
+                json!({"type":"response.function_call_arguments.done","output_index":0,"item_id":"fc_1","arguments":arguments}),
+                json!({"type":"response.output_item.done","output_index":0,"item":item}),
+            ]
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect();
+            let response = sanitize(Response::builder().header("content-type", "text/event-stream").body(Body::from(input))?, secret)?;
+            let bytes = response.into_body().collect().await?.to_bytes();
+            let output = std::str::from_utf8(&bytes)?;
+            let events: Vec<Value> = output.lines().filter_map(|line| line.strip_prefix("data: ")).map(serde_json::from_str).collect::<Result<_, _>>()?;
+            assert_eq!(events.len(), 2);
+            for arguments in [&events[0]["arguments"], &events[1]["item"]["arguments"]] {
+                let value: Value = serde_json::from_str(arguments.as_str().unwrap())?;
+                assert_eq!(value["value"], "<provider key>", "{output}");
+            }
+            Ok(())
+        })).unwrap();
+    }
+
+    #[test]
+    fn tool_arguments_without_a_credential_keep_their_numbers() {
+        fictionet::block_on(fictionet::lab(fictionet::Seed::from_u64(16), |_| async {
+            let secret = Secret::new("provider key", "private-key".into())?;
+            let arguments = r#"{"n":123456789012345678901234567890,"pi":3.14159265358979323846}"#;
+            let body = json!({"output":[{"type":"function_call","name":"multiply","call_id":"call_1","arguments":arguments}]});
+            let response = sanitize(Response::new(Body::from(body.to_string())), secret.clone())?;
+            let value: Value = serde_json::from_slice(&response.into_body().collect().await?.to_bytes())?;
+            assert_eq!(value["output"][0]["arguments"], arguments);
+            let (first, second) = arguments.split_at(20);
+            let input: String = [first, second].into_iter().map(|partial| format!("data: {}\n\n", json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":partial}}))).collect();
+            let response = sanitize(Response::builder().header("content-type", "text/event-stream").body(Body::from(input))?, secret)?;
+            let bytes = response.into_body().collect().await?.to_bytes();
+            let output = std::str::from_utf8(&bytes)?;
+            let assembled: String = output.lines().filter_map(|line| line.strip_prefix("data: ")).map(|line| serde_json::from_str::<Value>(line).unwrap()["delta"]["partial_json"].as_str().unwrap().to_owned()).collect();
+            assert_eq!(assembled, arguments);
+            Ok(())
+        })).unwrap();
+    }
+
+    #[test]
+    fn legacy_function_call_argument_streams_are_scrubbed_after_assembly() {
+        fictionet::block_on(fictionet::lab(fictionet::Seed::from_u64(15), |_| async {
+            let secret = Secret::new("provider key", "private-key".into())?;
+            let parts = [r#"{"value":"private-"#, r#"key"}"#];
+            let input: String = parts.into_iter().map(|partial| format!("data: {}\n\n", json!({"choices":[{"index":0,"delta":{"function_call":{"arguments":partial}}}]}))).collect();
+            let frames = input.bytes().map(|byte| Ok(Frame::data(Bytes::from(vec![byte])))).collect();
+            let response = sanitize(Response::builder().header("content-type", "text/event-stream").body(Body::new(Chunks(frames)))?, secret)?;
+            let bytes = response.into_body().collect().await?.to_bytes();
+            let output = std::str::from_utf8(&bytes)?;
+            let arguments: String = output.lines().filter_map(|line| line.strip_prefix("data: ")).map(|line| serde_json::from_str::<Value>(line).unwrap()["choices"][0]["delta"]["function_call"]["arguments"].as_str().unwrap().to_owned()).collect();
+            let value: Value = serde_json::from_str(&arguments)?;
+            assert_eq!(value["value"], "<provider key>", "{output}");
+            Ok(())
+        })).unwrap();
+    }
+
+    #[test]
     fn multiline_events_are_decoded_before_text_blocks_are_assembled() {
         fictionet::block_on(fictionet::lab(fictionet::Seed::from_u64(11), |_| async {
             let input = b"id: report\r\nevent: message\r\ndata: {\"content\":[{\"type\":\"text\",\"text\":\"private-\"},\r\ndata: {\"type\":\"text\",\"text\":\"key\"}]}\r\n\r\n";
