@@ -1,4 +1,4 @@
-//! Search on the host; replay only URLs reached by those results and their crawl.
+//! Host search and on-demand public page copies, retained for replay.
 
 use super::*;
 use fictionet_extras::{
@@ -6,28 +6,19 @@ use fictionet_extras::{
     models::Key,
     warc::{self, Archive},
 };
-use std::{
-    collections::VecDeque,
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use std::path::{Path, PathBuf};
 use tokio::sync::{oneshot, watch};
 
 mod transport;
 use transport::Transport;
 
-const CAPTURE_JOBS: usize = 2048;
-const CAPTURE_BYTES: usize = 128 * 1024 * 1024;
-
 struct Lifetime {
     stop: watch::Sender<bool>,
-    hosts: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<tokio::time::Instant>>>>,
 }
 impl Default for Lifetime {
     fn default() -> Self {
         Self {
             stop: watch::channel(false).0,
-            hosts: Default::default(),
         }
     }
 }
@@ -45,11 +36,12 @@ impl Drop for Lifetime {
     }
 }
 
-struct Job {
-    url: String,
-    navigation: Option<(String, u8)>,
-    redirects: u8,
-    cx: Cx,
+#[derive(Clone)]
+enum CaptureState {
+    Pending,
+    Ready,
+    Failed(String),
+    Cancelled,
 }
 
 #[derive(Default)]
@@ -57,13 +49,7 @@ struct State {
     archive: Archive,
     lifetime: Arc<Lifetime>,
     epoch: usize,
-    jobs: usize,
-    bytes: usize,
-    searches_running: usize,
-    reached: HashMap<String, watch::Sender<bool>>,
-    depths: HashMap<(String, String), u8>,
-    queue: VecDeque<Job>,
-    running: bool,
+    reached: HashMap<String, watch::Sender<CaptureState>>,
     searches: HashMap<(String, u64), search::Search>,
 }
 
@@ -107,178 +93,73 @@ impl Live {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn enqueue_in(self: &Arc<Self>, lifetime: &Arc<Lifetime>, job: Job, priority: bool) {
-        let Some(url) = warc::key(&job.url) else {
-            return;
-        };
+    fn capture(
+        self: &Arc<Self>,
+        lifetime: &Arc<Lifetime>,
+        cx: &Cx,
+        url: String,
+    ) -> Result<watch::Receiver<CaptureState>, String> {
         let mut state = self.state();
-        if lifetime.cancelled()
-            || !Arc::ptr_eq(lifetime, &state.lifetime)
-            || state.jobs >= CAPTURE_JOBS
-            || state.bytes >= CAPTURE_BYTES
-        {
-            return;
+        if lifetime.cancelled() || !Arc::ptr_eq(lifetime, &state.lifetime) {
+            return Err("Live session stopped".into());
         }
-        let newly_reached = !state.reached.contains_key(&url);
-        let shallower = job.navigation.as_ref().is_some_and(|(site, depth)| {
-            let entry = state
-                .depths
-                .entry((url.clone(), site.clone()))
-                .or_insert(u8::MAX);
-            if *entry <= *depth {
-                false
-            } else {
-                *entry = *depth;
-                true
+        if let Some(reached) = state.reached.get(&url) {
+            if !matches!(*reached.borrow(), CaptureState::Failed(_)) {
+                return Ok(reached.subscribe());
             }
-        });
-        if !newly_reached && !shallower {
-            return;
         }
-        state.jobs += 1;
-        state
-            .reached
-            .entry(url)
-            .or_insert_with(|| watch::channel(false).0);
-        if priority {
-            state.queue.push_front(job);
-        } else {
-            state.queue.push_back(job);
-        }
-        if !state.running {
-            state.running = true;
-            let live = self.clone();
-            let lifetime = lifetime.clone();
-            self.fetcher.spawn(async move {
-                live.download(lifetime).await;
+        let (send, receive) = watch::channel(CaptureState::Pending);
+        state.reached.insert(url.clone(), send.clone());
+        let live = self.clone();
+        let lifetime = lifetime.clone();
+        let cx = cx.clone();
+        self.fetcher.spawn(async move {
+            let result = live.download(&lifetime, &cx, &url).await;
+            send.send_replace(match result {
+                Ok(()) => CaptureState::Ready,
+                Err(_) if lifetime.cancelled() || cx.is_cancelled() => CaptureState::Cancelled,
+                Err(error) => CaptureState::Failed(error),
             });
-        }
+        });
+        Ok(receive)
     }
 
-    async fn download(self: Arc<Self>, lifetime: Arc<Lifetime>) {
-        loop {
-            let job = {
-                let mut state = self.state();
-                if lifetime.cancelled() || !Arc::ptr_eq(&lifetime, &state.lifetime) {
-                    return;
-                }
-                let Some(job) = state.queue.pop_front() else {
-                    state.running = false;
-                    return;
-                };
-                job
-            };
-            if job.cx.is_cancelled() || lifetime.cancelled() {
-                return;
-            }
-            let observer = self.observer.lock().unwrap().clone();
-            let existing = self.state().archive.get(&job.url);
-            let result = match existing {
-                Ok(Some(response)) => Ok((response, false)),
-                Ok(None) => self
-                    .fetcher
-                    .request(&job.cx, &lifetime, observer, &job.url, None)
-                    .await
-                    .map(|response| (response, true))
-                    .map_err(std::io::Error::other),
-                Err(error) => Err(error),
-            };
-            if lifetime.cancelled() {
-                return;
-            }
-            if let Ok((response, downloaded)) = result {
-                let saved = {
-                    let mut state = self.state();
-                    if !Arc::ptr_eq(&lifetime, &state.lifetime) {
-                        return;
-                    }
-                    if downloaded && state.bytes + response.body.len() > CAPTURE_BYTES {
-                        for done in state.reached.values() {
-                            done.send_replace(true);
-                        }
-                        state.queue.clear();
-                        state.running = false;
-                        return;
-                    }
-                    let path = self.archive_path(state.epoch);
-                    let saved =
-                        !downloaded || state.archive.append(&path, &job.url, &response).is_ok();
-                    if saved && downloaded {
-                        state.bytes += response.body.len();
-                    }
-                    saved
-                };
-                let status = response.status;
-                let url = job.url.clone();
-                let links = if saved {
-                    self.fetcher
-                        .process(&job.cx, &lifetime, move || {
-                            capture::links(&url, &response).map_err(|error| error.to_string())
-                        })
-                        .await
-                } else {
-                    Err("Live capture could not be saved".into())
-                };
-                if let Ok(links) = links {
-                    // Dependencies get priority over the next navigation page.
-                    for url in links.assets.into_iter().rev() {
-                        self.enqueue_in(
-                            &lifetime,
-                            Job {
-                                url,
-                                navigation: None,
-                                redirects: 0,
-                                cx: job.cx.clone(),
-                            },
-                            true,
-                        );
-                    }
-                    if status.is_redirection() && job.redirects < 10 {
-                        for url in links.pages {
-                            self.enqueue_in(
-                                &lifetime,
-                                Job {
-                                    url,
-                                    navigation: job.navigation.clone(),
-                                    redirects: job.redirects + 1,
-                                    cx: job.cx.clone(),
-                                },
-                                true,
-                            );
-                        }
-                    } else if let Some((site, depth)) = &job.navigation
-                        && *depth < 5
-                    {
-                        for url in links.pages.into_iter().filter(|u| {
-                            url::Url::parse(u).ok().is_some_and(|u| {
-                                u.host_str().is_some_and(|host| {
-                                    host.trim_start_matches("www.")
-                                        == site.trim_start_matches("www.")
-                                })
-                            })
-                        }) {
-                            self.enqueue_in(
-                                &lifetime,
-                                Job {
-                                    url,
-                                    navigation: Some((site.clone(), depth + 1)),
-                                    redirects: 0,
-                                    cx: job.cx.clone(),
-                                },
-                                false,
-                            );
-                        }
-                    }
-                }
-            }
-            let state = self.state();
-            if !Arc::ptr_eq(&lifetime, &state.lifetime) {
-                return;
-            }
-            if let Some(done) = state.reached.get(&job.url) {
-                done.send_replace(true);
-            }
+    async fn download(
+        self: &Arc<Self>,
+        lifetime: &Arc<Lifetime>,
+        cx: &Cx,
+        url: &str,
+    ) -> Result<(), String> {
+        if self.state().archive.contains(url) {
+            return Ok(());
         }
+        let observer = self.observer.lock().unwrap().clone();
+        let response = self
+            .fetcher
+            .request(cx, lifetime, observer, url, None)
+            .await?;
+        {
+            let mut state = self.state();
+            if lifetime.cancelled() || !Arc::ptr_eq(lifetime, &state.lifetime) {
+                return Err("Live session stopped".into());
+            }
+            let path = self.archive_path(state.epoch);
+            state
+                .archive
+                .append(&path, url, &response)
+                .map_err(|error| error.to_string())?;
+        }
+        let url = url.to_owned();
+        let links = self
+            .fetcher
+            .process(cx, lifetime, move || {
+                capture::links(&url, &response).map_err(|error| error.to_string())
+            })
+            .await?;
+        for url in links.assets {
+            let _ = self.capture(lifetime, cx, url);
+        }
+        Ok(())
     }
 
     async fn search(
@@ -288,18 +169,11 @@ impl Live {
         query: &str,
         start: u64,
     ) -> Result<search::Search, String> {
-        if start > 90 {
-            return Ok(search::Search::default());
-        }
         let lifetime = {
-            let mut state = self.state();
+            let state = self.state();
             if state.lifetime.cancelled() {
                 return Err("Live session stopped".into());
             }
-            if state.searches_running >= 2 || state.searches.len() >= 64 {
-                return Err("Live search capacity reached".into());
-            }
-            state.searches_running += 1;
             state.lifetime.clone()
         };
         let (send, receive) = oneshot::channel();
@@ -310,16 +184,11 @@ impl Live {
             let result = live
                 .search_results(&cx_thread, &lifetime, &query, start)
                 .await;
-            let mut state = live.state();
-            if Arc::ptr_eq(&lifetime, &state.lifetime) {
-                state.searches_running -= 1;
-            }
-            drop(state);
             let _ = send.send(result);
         });
-        cx.race(Some(cx.now() + Duration::from_secs(30)), receive)
+        cx.race(None, receive)
             .await
-            .map_err(|_| "Live search timed out or was cancelled".to_owned())?
+            .map_err(|_| "Live search was cancelled".to_owned())?
             .map_err(|_| "Live search worker stopped".to_owned())?
     }
 
@@ -331,7 +200,8 @@ impl Live {
         start: u64,
     ) -> Result<search::Search, String> {
         let observer = self.observer.lock().unwrap().clone();
-        let request = json!({"query": query, "numResults": (start + 10).min(100), "contents": {"highlights": true}});
+        let request =
+            json!({"query": query, "numResults": start + 10, "contents": {"highlights": true}});
         let response = self
             .fetcher
             .request(
@@ -350,8 +220,8 @@ impl Live {
             .fetcher
             .process(cx, lifetime, move || {
                 let decoded = response
-                    .decoded_with_limit(capture::PARSE_BYTES)
-                    .map_err(|_| "Exa response exceeds parsing limit or has invalid encoding")?;
+                    .decoded()
+                    .map_err(|_| "Exa response has an invalid encoding")?;
                 let value: Value =
                     serde_json::from_slice(&decoded).map_err(|_| "Invalid Exa search response")?;
                 parse_search(&value, Some(&key))
@@ -372,21 +242,8 @@ impl Live {
                 .searches
                 .insert((query.to_owned(), start), search.clone());
         }
-        for result in search.results.iter().rev() {
-            if let Ok(url) = url::Url::parse(&result.url)
-                && let Some(host) = url.host_str()
-            {
-                self.enqueue_in(
-                    lifetime,
-                    Job {
-                        url: result.url.clone(),
-                        navigation: Some((host.to_owned(), 0)),
-                        redirects: 0,
-                        cx: cx.clone(),
-                    },
-                    true,
-                );
-            }
+        for result in &search.results {
+            let _ = self.capture(lifetime, cx, result.url.clone());
         }
         Ok(search)
     }
@@ -403,19 +260,14 @@ impl Live {
         let mut state = self.state();
         state.lifetime.cancel();
         for done in state.reached.values() {
-            done.send_replace(true);
+            done.send_replace(CaptureState::Cancelled);
         }
-        state.queue.clear();
-        state.running = false;
         if reset {
             state.lifetime = Arc::default();
             state.searches.clear();
-            state.depths.clear();
-            state.searches_running = 0;
             let completed: std::collections::HashSet<_> =
                 state.archive.urls().map(str::to_owned).collect();
             state.reached.retain(|url, _| completed.contains(url));
-            state.jobs = completed.len();
         }
     }
 
@@ -432,37 +284,34 @@ impl Live {
         let _ = std::fs::remove_file(old_path);
     }
 
-    async fn response(&self, cx: &Cx, url: &str) -> Option<warc::Response> {
-        let url = warc::key(url)?;
-        let (mut waiting, lifetime) = {
-            let mut state = self.state();
-            // Browser requests can prioritize an already reached URL, never admit one.
-            let waiting = state.reached.get(&url)?.subscribe();
-            if let Some(index) = state.queue.iter().position(|job| job.url == url) {
-                let job = state.queue.remove(index).unwrap();
-                state.queue.push_front(job);
-            }
-            (waiting, state.lifetime.clone())
-        };
+    async fn response(self: &Arc<Self>, cx: &Cx, url: &str) -> Result<warc::Response, String> {
+        let url = warc::key(url).ok_or("Invalid Live URL")?;
+        let lifetime = self.state().lifetime.clone();
+        let mut waiting = self.capture(&lifetime, cx, url.clone())?;
         let ready = async {
             loop {
-                if *waiting.borrow_and_update() {
-                    break;
+                let state = waiting.borrow_and_update().clone();
+                match state {
+                    CaptureState::Pending => {}
+                    CaptureState::Ready => return Ok(()),
+                    CaptureState::Failed(error) => return Err(error),
+                    CaptureState::Cancelled => return Err("Live session stopped".into()),
                 }
-                if waiting.changed().await.is_err() {
-                    break;
-                }
+                waiting.changed().await.map_err(|_| "Live worker stopped")?;
             }
         };
-        let _ = cx
-            .race(Some(cx.now() + Duration::from_secs(45)), ready)
-            .await;
-
+        cx.race(None, ready)
+            .await
+            .map_err(|_| "Live fetch was cancelled")??;
         let state = self.state();
         if !Arc::ptr_eq(&lifetime, &state.lifetime) {
-            return None;
+            return Err("Live session stopped".into());
         }
-        state.archive.get(&url).ok().flatten()
+        state
+            .archive
+            .get(&url)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "Live capture is unavailable".into())
     }
 }
 
@@ -532,7 +381,16 @@ impl Pages {
     }
 
     pub(crate) async fn live_url(&self, cx: &Cx, url: &str) -> Response {
-        copied::replay(Ok(self.live.as_ref().unwrap().response(cx, url).await))
+        match self.live.as_ref().unwrap().response(cx, url).await {
+            Ok(response) => copied::replay(Ok(Some(response))),
+            Err(_) => Response::new(
+                502,
+                "text/plain; charset=utf-8",
+                "Bad Gateway\n",
+                vec![],
+                Meta::Missing,
+            ),
+        }
     }
 
     pub(super) async fn live_listing(

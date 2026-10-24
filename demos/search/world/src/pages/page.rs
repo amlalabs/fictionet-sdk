@@ -60,7 +60,7 @@ impl Pages {
     ) -> Response {
         let lock = match self.locks.lock(cx, page_key(host, target)).await {
             Ok(lock) => lock,
-            Err(error) => return Stop::store(error).response(Asked::Page),
+            Err(error) => return Stop::store(error).response(),
         };
         let stored = self.store().page(host, target).cloned();
         let stored = stored.or_else(|| self.listed_video(host, target));
@@ -72,7 +72,7 @@ impl Pages {
             }
             None => match self.make_page(cx, host, target, prefetch).await {
                 Ok(record) => (record, Cache::Generated),
-                Err(stop) => return stop.response(Asked::Page),
+                Err(stop) => return stop.response(),
             },
         };
         if record.content_type.starts_with("text/html")

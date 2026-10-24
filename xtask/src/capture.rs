@@ -55,34 +55,13 @@ const REPOSITORIES: &[(&str, &str)] = &[
 
 struct Batch(std::path::PathBuf);
 
-#[derive(Clone, Copy)]
-enum Material {
-    Page,
-    Distribution,
-}
-
-impl Material {
-    fn bytes(self) -> usize {
-        match self {
-            Self::Page => fictionet_extras::warc::Response::DECODED_BYTES,
-            Self::Distribution => 256 * 1024 * 1024,
-        }
-    }
-}
-
 impl Drop for Batch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
-async fn capture_cached(
-    root: &Path,
-    name: &str,
-    urls: &[String],
-    requisites: bool,
-    material: Material,
-) -> Result {
+async fn capture_cached(root: &Path, name: &str, urls: &[String], requisites: bool) -> Result {
     std::fs::create_dir_all(root)?;
     let archive = if std::fs::read_dir(root)?
         .any(|entry| entry.is_ok_and(|entry| entry.path().to_string_lossy().ends_with(".warc.gz")))
@@ -106,16 +85,10 @@ async fn capture_cached(
             pending.push(url.clone());
         }
     }
-    download(root, name, &pending, requisites, material).await
+    download(root, name, &pending, requisites).await
 }
 
-async fn download(
-    root: &Path,
-    name: &str,
-    urls: &[String],
-    requisites: bool,
-    material: Material,
-) -> Result {
+async fn download(root: &Path, name: &str, urls: &[String], requisites: bool) -> Result {
     if urls.is_empty() {
         return Ok(());
     }
@@ -130,18 +103,15 @@ async fn download(
     let mut pending = urls
         .iter()
         .cloned()
-        .map(|url| (url, 0, 0))
+        .map(|url| url)
         .collect::<std::collections::VecDeque<_>>();
     let mut seen = HashSet::new();
-    while let Some((url, redirects, depth)) = pending.pop_front() {
+    while let Some(url) = pending.pop_front() {
         if !seen.insert(url.clone()) {
             continue;
         }
-        if seen.len() > 2048 {
-            return Err("capture exceeds URL limit".into());
-        }
         let destination = url::Url::parse(&url)?;
-        let response = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        let response = async {
             let client = capture::client(&destination).await?;
             let response = client
                 .get(destination.clone())
@@ -149,41 +119,35 @@ async fn download(
                 .send()
                 .await
                 .map_err(std::io::Error::other)?;
-            let mut response = capture::receive(response, material.bytes()).await?;
-            response.body = response.decoded_with_limit(material.bytes())?.into();
+            let mut response = capture::receive(response).await?;
+            response.body = response.decoded()?.into();
             response.headers.remove(http::header::CONTENT_ENCODING);
             response
                 .headers
                 .insert(http::header::CONTENT_LENGTH, response.body.len().into());
             Ok::<_, std::io::Error>(response)
-        })
+        }
         .await;
         let response = match response {
-            Ok(Ok(response)) => response,
-            Ok(Err(error)) => {
+            Ok(response) => response,
+            Err(error) => {
                 eprintln!("Capture unavailable: {url}: {error}");
-                continue;
-            }
-            Err(_) => {
-                eprintln!("Capture timed out: {url}");
                 continue;
             }
         };
         archive.append(&path, &url, &response)?;
-        if response.status.is_redirection() && redirects < 10 {
+        if response.status.is_redirection() {
             if let Some(next) = response
                 .headers
                 .get(http::header::LOCATION)
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| destination.join(v).ok())
             {
-                pending.push_back((next.into(), redirects + 1, depth));
+                pending.push_back(next.into());
             }
-        } else if requisites && depth < 8 {
+        } else if requisites {
             match capture::links(&url, &response) {
-                Ok(links) => {
-                    pending.extend(links.assets.into_iter().map(|url| (url, 0, depth + 1)))
-                }
+                Ok(links) => pending.extend(links.assets),
                 Err(error) => eprintln!("Asset discovery unavailable: {url}: {error}"),
             }
         }
@@ -196,7 +160,7 @@ async fn download(
 
 fn captured_at(archive: &Archive, url: &str) -> Result<(String, fictionet_extras::warc::Response)> {
     let mut url = url::Url::parse(url)?;
-    for _ in 0..10 {
+    loop {
         let response = archive
             .get(url.as_str())?
             .ok_or_else(|| format!("missing capture: {url}"))?;
@@ -210,7 +174,6 @@ fn captured_at(archive: &Archive, url: &str) -> Result<(String, fictionet_extras
             .to_str()?;
         url = url.join(location)?;
     }
-    Err(format!("too many redirects: {url}").into())
 }
 
 fn captured(archive: &Archive, url: &str) -> Result<fictionet_extras::warc::Response> {
@@ -336,32 +299,13 @@ async fn missing_pages(root: &Path, sources: &[String], required: &[String]) -> 
             }
         }
     }
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        capture_cached(
-            root,
-            "missing-assets",
-            &assets.into_iter().collect::<Vec<_>>(),
-            true,
-            Material::Page,
-        ),
+    capture_cached(
+        root,
+        "missing-assets",
+        &assets.into_iter().collect::<Vec<_>>(),
+        true,
     )
     .await
-    {
-        Err(_) => {
-            eprintln!("Optional not-found assets exceeded their capture deadline");
-            Ok(())
-        }
-        Ok(Err(error))
-            if error
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|error| error.kind() == std::io::ErrorKind::InvalidData) =>
-        {
-            eprintln!("Optional not-found assets were rejected: {error}");
-            Ok(())
-        }
-        Ok(result) => result,
-    }
 }
 
 async fn documents(root: &Path, name: &str, urls: &[String]) -> Result {
@@ -376,15 +320,7 @@ async fn documents(root: &Path, name: &str, urls: &[String]) -> Result {
             let name = name.to_owned();
             let url = url.clone();
             jobs.spawn(async move {
-                match download(
-                    &root,
-                    &name,
-                    std::slice::from_ref(&url),
-                    false,
-                    Material::Page,
-                )
-                .await
-                {
+                match download(&root, &name, std::slice::from_ref(&url), false).await {
                     Err(error)
                         if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
                             matches!(
@@ -437,7 +373,7 @@ fn github_api(value: &str) -> Option<String> {
 
 async fn research(root: &Path, sources: &[String]) -> Result {
     // New batches sort after the original archives to supersede stale errors.
-    capture_cached(root, "zz-research", sources, true, Material::Page).await?;
+    capture_cached(root, "zz-research", sources, true).await?;
     documents(root, "zz-research", sources).await?;
     let mut archive = Archive::directory(root)?;
     let mut frontier = sources.to_vec();
@@ -461,14 +397,11 @@ async fn research(root: &Path, sources: &[String]) -> Result {
                                 .filter(|url| github_api(url).is_some())
                                 .cloned(),
                         );
-                        references.extend(found.into_iter().take(32));
+                        references.extend(found);
                     }
                     Err(error) => eprintln!("Reference discovery unavailable: {url}: {error}"),
                 }
             }
-        }
-        if references.len() > 8192 {
-            return Err("article references exceed capture page limit".into());
         }
         for url in &references {
             if let Some(endpoint) = github_api(url) {
@@ -511,7 +444,7 @@ async fn research(root: &Path, sources: &[String]) -> Result {
         }
     }
     origins.extend(frontier);
-    let mut endpoints = api.into_iter().take(32).collect::<Vec<_>>();
+    let mut endpoints = api.into_iter().collect::<Vec<_>>();
     endpoints.sort();
     endpoints.dedup();
     let pending = endpoints
@@ -632,14 +565,7 @@ pub async fn run(downloads: &Path, python: Option<&Path>) -> Result {
         .iter()
         .map(|(repo, _)| format!("https://api.github.com/repos/{repo}"))
         .collect::<Vec<_>>();
-    capture_cached(
-        &staged_corpus,
-        "zz-github-api",
-        &repositories,
-        false,
-        Material::Page,
-    )
-    .await?;
+    capture_cached(&staged_corpus, "zz-github-api", &repositories, false).await?;
     let archive = Archive::directory(&staged_corpus)?;
     for url in &repositories {
         verify(&archive, url)?;
@@ -761,14 +687,7 @@ pub async fn run(downloads: &Path, python: Option<&Path>) -> Result {
             }
         }
     }
-    capture_cached(
-        &packages,
-        "distributions",
-        &urls,
-        false,
-        Material::Distribution,
-    )
-    .await?;
+    capture_cached(&packages, "distributions", &urls, false).await?;
     let sources = Archive::directory(&packages)?
         .urls()
         .map(str::to_owned)
@@ -817,4 +736,9 @@ pub async fn run(downloads: &Path, python: Option<&Path>) -> Result {
         root.display()
     );
     Ok(())
+}
+
+/// Capture requested source pages and their static dependencies.
+pub async fn urls(downloads: &Path, urls: &[String]) -> Result {
+    download(&downloads.join("security"), "zz-pages", urls, true).await
 }

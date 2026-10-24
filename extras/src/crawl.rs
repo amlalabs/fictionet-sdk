@@ -84,7 +84,14 @@ impl Index {
             if !contains(&url) || !seen.insert(url.clone()) {
                 continue;
             }
-            let Some(response) = fetch(&url)? else {
+            let response = match fetch(&url) {
+                Ok(response) => response,
+                Err(error) => {
+                    eprintln!("Cannot index {url}: {error}");
+                    continue;
+                }
+            };
+            let Some(response) = response else {
                 continue;
             };
             let base = url::Url::parse(&url).expect("canonical HTTP URL");

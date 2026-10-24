@@ -32,6 +32,13 @@ async fn main() -> Result {
         let selection = args
             .next()
             .ok_or("expected --research or Python with pip (Python 3.12)")?;
+        if selection == "--urls" {
+            let urls = args.collect::<Vec<_>>();
+            if urls.is_empty() {
+                return Err("missing capture URLs".into());
+            }
+            return capture::urls(&downloads, &urls).await;
+        }
         let python = (selection != "--research").then(|| PathBuf::from(selection));
         if args.next().is_some() {
             return Err("unexpected argument".into());

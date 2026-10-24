@@ -163,15 +163,6 @@ impl Pages {
             .index
             .write_to(&writer)
             .map_err(|e| e.to_string())?;
-        let documents = documents(&root).map_err(|e| e.to_string())?;
-        let seeds = documents.urls().map(str::to_owned).collect::<Vec<_>>();
-        let documents = Index::crawl(
-            &seeds,
-            |url| documents.contains(url),
-            |url| documents.get(url),
-        )
-        .map_err(|e| e.to_string())?;
-        documents.write_to(&writer).map_err(|e| e.to_string())?;
         eprintln!("Preparing Wikipedia articles…");
         // Physical cluster order decompresses each cluster once. Directory order
         // would repeatedly decompress the same multi-megabyte cluster.
@@ -224,6 +215,16 @@ impl Pages {
                     Ok(())
                 })
         })?;
+        let documents = documents(&root).map_err(|e| e.to_string())?;
+        let seeds = documents.urls().map(str::to_owned).collect::<Vec<_>>();
+        let documents = Index::crawl(
+            &seeds,
+            |url| documents.contains(url),
+            |url| documents.get(url),
+        )
+        .map_err(|e| e.to_string())?;
+        documents.write_to(&writer).map_err(|e| e.to_string())?;
+        let source = sources(&root, &research).map_err(|e| e.to_string())?;
         writer.finish(&source).map_err(|e| e.to_string())?;
         let published = parent.join(&stamp);
         std::fs::rename(&staged, &published).map_err(|e| e.to_string())?;

@@ -27,7 +27,6 @@ impl fictionet_extras::models::Engine for Pages {
     ) -> fictionet_extras::models::tools::Answer<fictionet_extras::models::tools::Page> {
         Box::pin(async move {
             let mut url = url;
-            let mut redirects = 0;
             let response = loop {
                 let started = std::time::Instant::now();
                 let parsed = url::Url::parse(&url)?;
@@ -60,11 +59,7 @@ impl fictionet_extras::models::Engine for Pages {
                     &response,
                 );
                 if let Meta::Redirect { location } = &response.meta {
-                    if redirects >= 10 {
-                        return Err(fictionet::Error::msg("Too many redirects"));
-                    }
                     url = parsed.join(location)?.into();
-                    redirects += 1;
                     continue;
                 }
                 if response.status != 200 {

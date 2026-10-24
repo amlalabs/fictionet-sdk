@@ -18,7 +18,7 @@ url = { version = "2", features = ["serde"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util", "time", "signal", "net"] }
 
 fatfs = { version = "0.3", default-features = false, features = ["std", "alloc"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 zim = "0.5"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 mime_guess = "2"

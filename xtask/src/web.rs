@@ -31,29 +31,26 @@ fn space(path: &Path, additional: u64) -> Result {
 }
 
 async fn fetch(url: url::Url) -> Result<Response> {
-    for attempt in 0..3 {
+    loop {
         let result: Result<Response> = async {
             let client = capture::client(&url).await?;
-            let response = client
-                .get(url.clone())
-                .timeout(std::time::Duration::from_secs(15))
-                .send()
-                .await?;
+            let response = client.get(url.clone()).send().await?;
             if response.status().is_server_error()
                 || response.status() == http::StatusCode::TOO_MANY_REQUESTS
             {
                 return Err(response.error_for_status().unwrap_err().into());
             }
-            Ok(capture::receive(response, Response::DECODED_BYTES).await?)
+            Ok(capture::receive(response).await?)
         }
         .await;
         match result {
             Ok(response) => return Ok(response),
-            Err(error) if attempt == 2 => return Err(error),
-            Err(_) => tokio::time::sleep(std::time::Duration::from_secs(1 << attempt)).await,
+            Err(error) => {
+                eprintln!("Retrying {url}: {error}");
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
         }
     }
-    unreachable!()
 }
 
 async fn copy_site(root: &Path, name: &str, origin: &str) -> Result {
@@ -76,9 +73,6 @@ async fn copy_site(root: &Path, name: &str, origin: &str) -> Result {
             if !seen.insert(url.clone()) {
                 continue;
             }
-            if seen.len() > 100_000 {
-                return Err("documentation capture exceeds page budget".into());
-            }
             let cached = archive.get(&url)?.filter(|response| {
                 response.status.is_success()
                     || response.status.is_redirection()
@@ -87,13 +81,7 @@ async fn copy_site(root: &Path, name: &str, origin: &str) -> Result {
             jobs.spawn(async move {
                 let response = match cached {
                     Some(response) => response,
-                    None => {
-                        tokio::time::timeout(
-                            std::time::Duration::from_secs(60),
-                            fetch(url::Url::parse(&url)?),
-                        )
-                        .await??
-                    }
+                    None => fetch(url::Url::parse(&url)?).await?,
                 };
                 Ok::<_, Box<dyn std::error::Error + Send + Sync>>((url, response))
             });
@@ -172,7 +160,7 @@ async fn python(root: &Path) -> Result {
         .send()
         .await?
         .error_for_status()?;
-    let response = capture::receive(response, 256 * 1024 * 1024).await?;
+    let response = capture::receive(response).await?;
     space(root, response.body.len() as u64 + 512 * 1024 * 1024)?;
     let mut zip = zip::ZipArchive::new(std::io::Cursor::new(response.body))?;
     let temporary = root.join(".python-archive.warc.gz");
@@ -180,7 +168,6 @@ async fn python(root: &Path) -> Result {
         std::fs::remove_file(&temporary)?;
     }
     let mut archive = Archive::default();
-    let mut total = 0;
     for entry in 0..zip.len() {
         let mut file = zip.by_index(entry)?;
         if file.is_dir() {
@@ -191,13 +178,7 @@ async fn python(root: &Path) -> Result {
             .ok_or("invalid documentation archive path")?;
         let relative = path.components().skip(1).collect::<std::path::PathBuf>();
         let mut body = Vec::new();
-        file.by_ref()
-            .take(Response::DECODED_BYTES as u64 + 1)
-            .read_to_end(&mut body)?;
-        total += body.len();
-        if body.len() > Response::DECODED_BYTES || total > 512 * 1024 * 1024 {
-            return Err("documentation archive exceeds decoded size budget".into());
-        }
+        file.read_to_end(&mut body)?;
         let mime = mime_guess::from_path(&relative)
             .first_or_octet_stream()
             .to_string();
@@ -231,7 +212,6 @@ pub async fn build(downloads: &Path, step: Step) -> Result {
         let client = reqwest::Client::builder()
             .user_agent(fictionet_extras::capture::BROWSER)
             .no_proxy()
-            .connect_timeout(std::time::Duration::from_secs(20))
             .build()?;
         let url = format!("https://ftpmirror.your.org/pub/kiwix/zim/wikipedia/{WIKIPEDIA}");
         let headers = client.head(&url).send().await?.error_for_status()?;

@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::os::fd::AsRawFd;
 use std::{path::Path, process::Stdio, sync::Arc, time::Duration};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
 async fn send(writer: &mut OwnedWriteHalf, value: Value) -> Result {
@@ -17,13 +17,9 @@ async fn send(writer: &mut OwnedWriteHalf, value: Value) -> Result {
 }
 
 async fn receive(reader: &mut BufReader<OwnedReadHalf>, bytes: &mut Vec<u8>) -> Result<Value> {
-    const LIMIT: usize = 64 * 1024 * 1024;
-    let count = (&mut *reader)
-        .take((LIMIT + 1 - bytes.len()) as u64)
-        .read_until(0, bytes)
-        .await?;
-    if count == 0 || bytes.len() > LIMIT || bytes.last() != Some(&0) {
-        return Err("invalid or oversized browser message".into());
+    let count = reader.read_until(0, bytes).await?;
+    if count == 0 || bytes.last() != Some(&0) {
+        return Err("incomplete browser message".into());
     }
     let value = serde_json::from_slice(&bytes[..bytes.len() - 1])?;
     bytes.clear();
@@ -67,7 +63,7 @@ async fn get(url: url::Url) -> std::io::Result<warc::Response> {
         .send()
         .await
         .map_err(std::io::Error::other)?;
-    let mut response = capture::receive(response, warc::Response::DECODED_BYTES).await?;
+    let mut response = capture::receive(response).await?;
     response.body = response.decoded()?.into();
     response.headers.remove(http::header::CONTENT_ENCODING);
     response.headers.remove(http::header::TRANSFER_ENCODING);
@@ -182,10 +178,7 @@ where
         .await?;
         let mut archive = warc::Archive::default();
         let path = root.join(format!("zz-rendered-{}.warc.gz", time_stamp()));
-        let permits = Arc::new(tokio::sync::Semaphore::new(8));
         let mut requests = tokio::task::JoinSet::new();
-        let mut count = 0;
-        let mut retained = 0;
         let mut tick = tokio::time::interval(Duration::from_millis(200));
         let mut evaluation = None;
         let required = serde_json::to_string(&title.to_ascii_lowercase())?;
@@ -193,10 +186,8 @@ where
             r#"(() => {{
             if (!document.title.toLowerCase().includes({required}) || !document.body?.innerText.toLowerCase().includes({required})) return null;
             const html = document.documentElement.outerHTML;
-            if (html.length > {}) throw new Error('Document exceeds capture size limit');
             return {{url:location.href, html}};
-        }})()"#,
-            warc::Response::DECODED_BYTES
+        }})()"#
         );
         loop {
             tokio::select! {
@@ -204,17 +195,13 @@ where
                     let message = message?;
                     if message["method"] == "Fetch.requestPaused" {
                         let paused: Paused = serde_json::from_value(message["params"].clone())?;
-                        count += 1;
-                        if count > 256 { return Err("rendered capture exceeds request limit".into()); }
-                        let permits = permits.clone();
                         let fetch = fetch.clone();
                         requests.spawn(async move {
                             let response = async {
-                                let _permit = permits.acquire().await.map_err(std::io::Error::other)?;
                                 if paused.request.method != http::Method::GET { return Err(std::io::Error::other("capture requires a GET response")); }
                                 fetch(paused.request.url.clone()).await
                             };
-                            let response = tokio::time::timeout(Duration::from_secs(20), response).await;
+                            let response = response.await;
                             (paused, response)
                         });
                     } else if evaluation.is_some() && message.get("id").and_then(Value::as_u64) == evaluation {
@@ -222,7 +209,6 @@ where
                         if message["result"].get("exceptionDetails").is_some() { return Err("rendered document could not be retained".into()); }
                         let value = &message["result"]["result"]["value"];
                         if let (Some(url), Some(html)) = (value["url"].as_str(), value["html"].as_str()) {
-                            if html.len() > warc::Response::DECODED_BYTES { return Err("rendered document exceeds size limit".into()); }
                             let mut response = archive.get(url)?.ok_or("rendered document has no captured response")?;
                             if !response.status.is_success() { return Err("rendered document was not a successful response".into()); }
                             response.body = html.to_owned().into();
@@ -236,9 +222,7 @@ where
                 Some(result) = requests.join_next(), if !requests.is_empty() => {
                     let (paused, response) = result?;
                     id += 1;
-                    let (method, params) = if let Ok(Ok(response)) = response {
-                        retained += response.body.len();
-                        if retained > 64 * 1024 * 1024 { return Err("rendered capture exceeds total size limit".into()); }
+                    let (method, params) = if let Ok(response) = response {
                         archive.append(&path, paused.request.url.as_str(), &response)?;
                         let headers = response.headers.iter().map(|(name, value)| json!({"name":name.as_str(),"value":value.to_str().unwrap_or("")})).collect::<Vec<_>>();
                         ("Fetch.fulfillRequest", json!({"requestId":paused.request_id,"responseCode":response.status.as_u16(),"responseHeaders":headers,"body":fictionet::stdlib::codec::base64::encode(&response.body)}))
@@ -255,9 +239,9 @@ where
             }
         }
     };
-    let result = tokio::time::timeout(Duration::from_secs(60), work).await;
+    let result = work.await;
     let _ = browser.kill().await;
-    result.map_err(|_| "rendered capture timed out")?
+    result
 }
 
 fn time_stamp() -> u128 {

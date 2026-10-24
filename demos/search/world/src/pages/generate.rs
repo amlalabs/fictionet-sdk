@@ -67,26 +67,6 @@ impl Pages {
         Ok(())
     }
 
-    /// Starts one generation, or says the budget is spent.
-    pub(super) fn reserve(&self) -> Result<(), Stop> {
-        if let Some(calls) = &self.live_calls {
-            return calls
-                .try_update(
-                    std::sync::atomic::Ordering::SeqCst,
-                    std::sync::atomic::Ordering::SeqCst,
-                    |n| (n < GENERATION_BUDGET).then_some(n + 1),
-                )
-                .map(|_| ())
-                .map_err(|_| Stop::Budget);
-        }
-        let mut store = self.writing_store()?;
-        if store.made >= GENERATION_BUDGET {
-            return Err(Stop::Budget);
-        }
-        store.made += 1;
-        Ok(())
-    }
-
     pub(super) fn maker(&self) -> &Maker {
         self.maker.as_ref().expect("a world that is generating")
     }
@@ -98,26 +78,20 @@ impl Pages {
         cx: &Cx,
         target: crate::observation::WriterTarget,
         stored: impl FnOnce() -> T,
-        prompt: impl FnOnce() -> (String, String, u32),
-        read: impl Fn(&str, bool) -> Result<T, prompts::Unreadable>,
+        prompt: impl FnOnce() -> (String, String),
+        read: impl Fn(&str) -> Result<T, prompts::Unreadable>,
     ) -> Result<Made<T>, Stop> {
         let context = serde_json::to_value(&target).expect("generation target");
         match self.maker() {
             Maker::Stored => self.stored(cx, target, stored),
             Maker::Model(model) => {
-                if self.live_calls.is_some() {
-                    self.reserve()?;
-                }
-                let (system, user, max_tokens) = prompt();
-                let user = format!(
-                    "{user}\n\nComplete the entire answer within {max_tokens} output tokens. Plan its length before writing. Keep the required substantive sections, methods and references; use concise prose and markup."
-                );
+                let (system, user) = prompt();
                 let parse = |text: &str| {
                     model.check_document("text/html", text)?;
                     if let Some(reason) = gives_away(text) {
                         return Err(prompts::Unreadable::Disclosure(reason));
                     }
-                    let fields = read(text, false)?;
+                    let fields = read(text)?;
                     let publications =
                         fields.later_text(seed::parse_date(&self.seed.date).expect("world date"));
                     Ok(model::Parsed {
@@ -136,57 +110,23 @@ impl Pages {
                     );
                 };
                 let (answer, ledger): (_, Ledger) = model
-                    .ask_reviewed(cx, &system, &user, max_tokens, parse, rejected)
+                    .ask_reviewed(cx, &system, &user, parse, rejected)
                     .await;
                 let usage = ledger.usage();
-                let repaired = match &answer {
-                    Err(failure)
-                        if failure.can_render_locally()
-                            && matches!(target, crate::observation::WriterTarget::Page { .. }) =>
-                    {
-                        failure
-                            .draft
-                            .as_deref()
-                            .and_then(|raw| read(raw, true).ok())
-                            .filter(|fields| {
-                                let audit = fictionet_extras::guest_content::Audit::default();
-                                audit.inspect(
-                                    "repaired document",
-                                    &serde_json::to_vec(fields).expect("page fields"),
-                                );
-                                audit.check().is_ok()
-                            })
-                    }
-                    _ => None,
-                };
                 let status = if answer.is_ok() {
                     model::GenerationOutcome::Ok
-                } else if repaired.is_some() {
-                    model::GenerationOutcome::Recovered
                 } else {
                     model::GenerationOutcome::Error
                 };
                 let mut rows = ledger.rows(&context, status);
                 rows.iter_mut().for_each(|row| model.redact_json(row));
-                if repaired.is_none() {
-                    self.log(cx, &rows)?;
-                }
-                match (answer, repaired) {
-                    (Ok(answer), _) => Ok(Made {
+                self.log(cx, &rows)?;
+                match answer {
+                    Ok(answer) => Ok(Made {
                         fields: answer.fields,
                         usage,
-                        recovery: None,
                     }),
-                    (Err(failure), Some(fields)) => Ok(Made {
-                        fields,
-                        usage,
-                        recovery: Some(Recovery {
-                            target,
-                            reason: model.redact(&failure.error),
-                            rows,
-                        }),
-                    }),
-                    (Err(Failure { error, .. }), None) => Err(Stop::Failed {
+                    Err(Failure { error, .. }) => Err(Stop::Failed {
                         error: model.redact(&error),
                         usage: Some(Box::new(usage)),
                     }),
@@ -211,11 +151,7 @@ impl Pages {
         }
         context["raw"] = Value::Null;
         self.log(cx, &[context])?;
-        Ok(Made {
-            fields,
-            usage,
-            recovery: None,
-        })
+        Ok(Made { fields, usage })
     }
 
     /// The people the world names, made the first time a list or page
@@ -229,7 +165,7 @@ impl Pages {
         if let Some(cast) = self.writing_store()?.cast() {
             return Ok(cast.people.clone());
         }
-        if self.live_calls.is_some() {
+        if self.interactive {
             let cast = CastRecord {
                 people: Vec::new(),
                 usage: Usage::stored(0),
@@ -239,17 +175,13 @@ impl Pages {
                 .map_err(Stop::store)?;
             return Ok(cast.people);
         }
-        self.reserve()?;
         let made = self
             .generate(
                 cx,
                 crate::observation::WriterTarget::Cast,
                 Vec::new,
-                || {
-                    let (system, user) = prompts::cast(&self.seed);
-                    (system, user, CAST_TOKENS)
-                },
-                |text, _| prompts::read_cast(text),
+                || prompts::cast(&self.seed),
+                prompts::read_cast,
             )
             .await?;
         let record = CastRecord {
@@ -284,19 +216,13 @@ impl Pages {
             return Ok(profile);
         }
         if matches!(self.maker(), Maker::Model(_)) {
-            if self.live_calls.is_none() {
-                self.reserve()?;
-            }
             let made = self
                 .generate(
                     cx,
                     crate::observation::WriterTarget::Stylesheet { host: host.into() },
                     String::new,
-                    || {
-                        let (system, user) = prompts::stylesheet(&self.seed, host, &profile);
-                        (system, user, 1000)
-                    },
-                    |text, _| {
+                    || prompts::stylesheet(&self.seed, host, &profile),
+                    |text| {
                         let css = text.trim();
                         if css.is_empty() {
                             Err(prompts::Unreadable::Format("empty stylesheet".into()))
@@ -334,7 +260,7 @@ impl Pages {
                         .any(|result| result.url == claim.url)
             })
         };
-        let _publication = if self.live_calls.is_some() && !established {
+        let _publication = if self.interactive && !established {
             Some(
                 self.locks
                     .lock(cx, "page publications".into())
@@ -353,15 +279,12 @@ impl Pages {
                 .map_err(Stop::store)?
         };
         let follows_layout = !captured && site.is_none();
-        if self.live_calls.is_none() {
-            self.reserve()?;
-        }
         let cast = self.cast(cx).await?;
         let mut ask = {
             let store = self.writing_store()?;
             PageAsk {
                 url: url.clone(),
-                mentions: prompts::asked_mentions(store.mentions(host, target)),
+                mentions: store.mentions(host, target).to_vec(),
                 profile: store.site(host).filter(|p| !p.css.is_empty()).cloned(),
                 host_pages: store.host_pages(host),
                 claims: store.page_context(host, target),
@@ -488,13 +411,9 @@ impl Pages {
                         &ask.claims,
                     );
                     user.push_str(&format!("\nThe latest permitted publication/update date is {latest}. Incoming links already published by this date must remain possible. Later context describes the wider world; do not import its later knowledge into this page."));
-                    (
-                        system,
-                        user,
-                        PAGE_TOKENS + if ask.profile.is_none() && !captured { 500 } else { 0 },
-                    )
+                    (system, user)
                 },
-                |text, repair| {
+                |text| {
                     let mut page = prompts::read_page(text, expected, !ask.mentions.is_empty())?;
                     if page.date.is_empty() && page.content_type.starts_with("text/html") {
                         page.date = latest.to_string();
@@ -504,10 +423,7 @@ impl Pages {
                         model.check_document(&page.content_type, &page.body)?;
                         self.check_page_dates(&store, host, target, &page, latest)?;
                     }
-                    if repair {
-                        super::answers::repair_page(&mut page)?;
-                    }
-                    if self.live_calls.is_some() {
+                    if self.interactive {
                         let body = if page.content_type.starts_with("text/html") {
                             let profile = ask
                                 .profile
@@ -640,17 +556,6 @@ impl Pages {
             store.unserved.insert((host.into(), target.into()));
         }
         drop(store);
-        if let Some(recovery) = made.recovery {
-            self.log(cx, &recovery.rows)?;
-            self.report(
-                cx,
-                crate::observation::SearchObs::PageRevision {
-                    target: recovery.target,
-                    action: crate::observation::RevisionAction::LocalRendering,
-                    reason: recovery.reason,
-                },
-            );
-        }
         Ok(record)
     }
 }

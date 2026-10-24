@@ -282,7 +282,6 @@ impl Views {
                 SearchObs::Signin { .. } => view.signin = Some(observation.clone()),
                 SearchObs::NoRoute { .. }
                 | SearchObs::PageRevision { .. }
-                | SearchObs::ObservationFailed { .. }
                 | SearchObs::RunStarted { .. } => {}
             }
             if let SearchObs::ModelCall { call, .. } = observation.fact
@@ -392,7 +391,7 @@ pub enum Source {
 
 type Control = (Command, tokio::sync::oneshot::Sender<Result<(), String>>);
 type Receivers = (
-    mpsc::Receiver<Observation>,
+    mpsc::UnboundedReceiver<Observation>,
     mpsc::UnboundedReceiver<Control>,
 );
 
@@ -409,7 +408,7 @@ impl Page {
     pub fn new(pages: &Pages, preview: bool) -> (Self, Receivers) {
         let views = Views::default();
         let (snapshots, _) = watch::channel(views.current());
-        let (observations, receive) = mpsc::channel(web_world::observation::OBSERVATION_CAPACITY);
+        let (observations, receive) = mpsc::unbounded_channel();
         pages.observe(observations);
         let (commands, control) = mpsc::unbounded_channel();
         let world = world_state(pages, preview);
@@ -433,7 +432,7 @@ impl Page {
     /// Writes a separate, private record for this launch before publishing each fact.
     pub async fn record(
         &self,
-        mut observations: mpsc::Receiver<Observation>,
+        mut observations: mpsc::UnboundedReceiver<Observation>,
         directory: &std::path::Path,
     ) -> std::io::Result<()> {
         use std::io::Write;
@@ -477,14 +476,7 @@ impl Page {
             )?;
             writeln!(file)?;
             file.flush()?;
-            let error = match &observation.fact {
-                SearchObs::ObservationFailed { reason } => Some(reason.clone()),
-                _ => None,
-            };
             self.publish(observation);
-            if let Some(error) = error {
-                return Err(std::io::Error::other(error));
-            }
         }
         Ok(())
     }

@@ -20,14 +20,14 @@ fictionet = { path = "..", features = ["web-proxy", "tokio"] }
 axum = { version = "0.8", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 xz2 = "0.1"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 tar = "0.4"
-quick-xml = { version = "0.38", features = ["escape-html"] }
+quick-xml = { version = "0.42", features = ["escape-html"] }
 brotli = "8"
 fictionet-host = { path = "../host" }
 flate2 = "1"
 httparse = "1"
-html5ever = "0.25"
+html5ever = "0.40"
 http-body = "1"
 http-body-util = "0.1"
 include_dir = "0.7"
@@ -35,7 +35,7 @@ kuchiki = "0.8"
 percent-encoding = "2"
 redb = "4.4"
 regex = "1"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
 ring = "0.17"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "macros", "io-util"] }
 time = "0.3"
