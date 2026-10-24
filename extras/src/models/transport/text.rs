@@ -3,138 +3,23 @@
 use super::*;
 use std::collections::BTreeMap;
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum Channel {
-    Text(u64),
-    Thinking(u64),
-    Refusal(u64),
-    Tool(u64, u64),
-}
-
-fn fields(value: &Value) -> Vec<(Channel, String)> {
-    let mut fields = Vec::new();
-    let mut add = |channel, path: String| {
-        if value.pointer(&path).is_some_and(Value::is_string) {
-            fields.push((channel, path));
-        }
-    };
-    if let Some(content) = value["content"].as_array() {
-        for (index, _) in content.iter().enumerate() {
-            add(Channel::Text(0), format!("/content/{index}/text"));
-            add(Channel::Thinking(0), format!("/content/{index}/thinking"));
-        }
-    }
-    add(Channel::Text(0), "/content_block/text".into());
-    add(Channel::Thinking(0), "/content_block/thinking".into());
-    add(Channel::Text(0), "/delta/text".into());
-    add(Channel::Thinking(0), "/delta/thinking".into());
-    add(
-        Channel::Tool(0, value["index"].as_u64().unwrap_or(0)),
-        "/delta/partial_json".into(),
-    );
-    // Responses uses a string delta and identifies its output item explicitly.
-    let output = value["output_index"].as_u64().unwrap_or(0);
-    let delta_channel = if value["type"] == "response.function_call_arguments.delta" {
-        Channel::Tool(0, output)
-    } else if value["type"] == "response.refusal.delta" {
-        Channel::Refusal(0)
-    } else {
-        Channel::Text(0)
-    };
-    add(delta_channel, "/delta".into());
-    if let Some(choices) = value["choices"].as_array() {
-        for (index, choice) in choices.iter().enumerate() {
-            let channel = choice["index"].as_u64().unwrap_or(index as u64);
-            for container in ["message", "delta"] {
-                add(
-                    Channel::Text(channel),
-                    format!("/choices/{index}/{container}/content"),
-                );
-                add(
-                    Channel::Thinking(channel),
-                    format!("/choices/{index}/{container}/reasoning_content"),
-                );
-                add(
-                    Channel::Thinking(channel),
-                    format!("/choices/{index}/{container}/reasoning"),
-                );
-                add(
-                    Channel::Refusal(channel),
-                    format!("/choices/{index}/{container}/refusal"),
-                );
-                if let Some(parts) = choice[container]["content"].as_array() {
-                    for (part, _) in parts.iter().enumerate() {
-                        add(
-                            Channel::Text(channel),
-                            format!("/choices/{index}/{container}/content/{part}/text"),
-                        );
-                    }
-                }
-                if let Some(tools) = choice[container]["tool_calls"].as_array() {
-                    for (tool_index, tool) in tools.iter().enumerate() {
-                        add(
-                            Channel::Tool(
-                                channel,
-                                tool["index"].as_u64().unwrap_or(tool_index as u64),
-                            ),
-                            format!(
-                                "/choices/{index}/{container}/tool_calls/{tool_index}/function/arguments"
-                            ),
-                        );
-                    }
-                }
-            }
-        }
-    }
-    if let Some(candidates) = value["candidates"].as_array() {
-        for (index, candidate) in candidates.iter().enumerate() {
-            if let Some(parts) = candidate["content"]["parts"].as_array() {
-                for (part, _) in parts.iter().enumerate() {
-                    add(
-                        Channel::Text(index as u64),
-                        format!("/candidates/{index}/content/parts/{part}/text"),
-                    );
-                }
-            }
-        }
-    }
-    // Complete Responses output is assembled in the same way as streamed text.
-    if let Some(output) = value["output"].as_array() {
-        for (index, item) in output.iter().enumerate() {
-            add(
-                Channel::Tool(0, index as u64),
-                format!("/output/{index}/arguments"),
-            );
-            if let Some(content) = item["content"].as_array() {
-                for (part, _) in content.iter().enumerate() {
-                    add(
-                        Channel::Refusal(0),
-                        format!("/output/{index}/content/{part}/refusal"),
-                    );
-                    add(
-                        Channel::Text(0),
-                        format!("/output/{index}/content/{part}/text"),
-                    );
-                }
-            }
-        }
-    }
-    fields
-}
+use super::super::response::{Channel, content};
 
 /// Scrub whole matches and return the first record whose suffix might still
 /// become a credential. Records before it can be released without guessing.
 pub(super) fn scrub(values: &mut [Value], secret: &Secret, end: bool) -> usize {
-    let mut channels: BTreeMap<Channel, Vec<(usize, String, String)>> = BTreeMap::new();
-    for (index, value) in values.iter().enumerate() {
-        for (channel, path) in fields(value) {
-            let text = value.pointer(&path).unwrap().as_str().unwrap().to_owned();
+    let mut channels: BTreeMap<Channel, Vec<(usize, usize, String)>> = BTreeMap::new();
+    for (index, value) in values.iter_mut().enumerate() {
+        let mut field = 0;
+        content(value, &mut |channel, text| {
             channels
                 .entry(channel)
                 .or_default()
-                .push((index, path, text));
-        }
+                .push((index, field, text.clone()));
+            field += 1;
+        });
     }
+    let mut replacements = BTreeMap::new();
     let mut ready = values.len();
     for (channel, pieces) in channels {
         let joined: String = pieces.iter().map(|(_, _, text)| text.as_str()).collect();
@@ -147,8 +32,7 @@ pub(super) fn scrub(values: &mut [Value], secret: &Secret, end: bool) -> usize {
                 scrub(std::slice::from_mut(&mut arguments), secret, true);
                 let mut encoded = Some(serde_json::to_string(&arguments).expect("tool arguments"));
                 for (index, path, _) in pieces {
-                    *values[index].pointer_mut(&path).unwrap() =
-                        Value::String(encoded.take().unwrap_or_default());
+                    replacements.insert((index, path), encoded.take().unwrap_or_default());
                 }
                 continue;
             }
@@ -186,8 +70,17 @@ pub(super) fn scrub(values: &mut [Value], secret: &Secret, end: bool) -> usize {
                 cursor = range.end.min(finish);
             }
             safe.push_str(&joined[cursor..finish]);
-            *values[index].pointer_mut(&path).unwrap() = Value::String(safe);
+            replacements.insert((index, path), safe);
         }
+    }
+    for (index, value) in values.iter_mut().enumerate() {
+        let mut field = 0;
+        content(value, &mut |_, text| {
+            if let Some(safe) = replacements.remove(&(index, field)) {
+                *text = safe;
+            }
+            field += 1;
+        });
     }
     for value in values {
         // Snapshots inside SSE terminal events are independent complete answers.

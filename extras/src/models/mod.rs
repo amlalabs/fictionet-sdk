@@ -34,10 +34,11 @@ mod client;
 pub use calls::{Call, CallObserver, CallPhase};
 mod request;
 mod transport;
-pub use client::{Authenticated, Https, Key, Post, Transport};
+pub use client::{Authenticated, Https, Incoming, Key, Post, Transport};
 pub use transport::{UpstreamEvent, UpstreamObserver, UpstreamPhase};
 pub mod oauth;
 mod response;
+pub use response::Completion;
 mod responses;
 #[cfg(test)]
 mod responses_tests;
@@ -848,16 +849,16 @@ impl Model {
                     && body.needs_web() =>
             {
                 if path.ends_with("/count_tokens") {
-                    return Box::pin(splice::count(self, parts, body)).await;
+                    return Box::pin(splice::count(self, parts, *body)).await;
                 }
-                return Box::pin(splice::serve(self, parts, body)).await;
+                return Box::pin(splice::serve(self, parts, *body)).await;
             }
             request::Admitted::Responses(body)
                 if self.engine.is_some()
                     && matches!(self.provider, Provider::OpenAi | Provider::ChatGpt)
                     && body.needs_web() =>
             {
-                return Box::pin(responses::serve(self, parts, body)).await;
+                return Box::pin(responses::serve(self, parts, *body)).await;
             }
             body => body,
         };

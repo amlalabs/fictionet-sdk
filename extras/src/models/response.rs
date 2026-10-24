@@ -250,3 +250,134 @@ impl HttpBody for Metered {
         }
     }
 }
+
+/// The assembled content channel represented by a provider record.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Channel {
+    Text(u64),
+    Thinking(u64),
+    Refusal(u64),
+    Tool(u64, u64),
+}
+
+/// Interprets content once for assembly, credential removal and page publication.
+pub(crate) fn content(value: &mut Value, visit: &mut impl FnMut(Channel, &mut String)) {
+    fn field(
+        value: &mut Value,
+        key: &str,
+        channel: Channel,
+        visit: &mut impl FnMut(Channel, &mut String),
+    ) {
+        if let Some(Value::String(text)) = value.get_mut(key) {
+            visit(channel, text);
+        }
+    }
+    fn blocks(value: &mut Value, channel: u64, visit: &mut impl FnMut(Channel, &mut String)) {
+        if let Some(blocks) = value.as_array_mut() {
+            for block in blocks {
+                field(block, "text", Channel::Text(channel), visit);
+                field(block, "thinking", Channel::Thinking(channel), visit);
+                field(block, "refusal", Channel::Refusal(channel), visit);
+            }
+        }
+    }
+    if let Some(parts) = value.get_mut("content") {
+        blocks(parts, 0, visit);
+    }
+    if let Some(block) = value.get_mut("content_block") {
+        field(block, "text", Channel::Text(0), visit);
+        field(block, "thinking", Channel::Thinking(0), visit);
+    }
+    let index = value["index"].as_u64().unwrap_or(0);
+    if let Some(delta) = value.get_mut("delta").filter(|v| v.is_object()) {
+        field(delta, "text", Channel::Text(0), visit);
+        field(delta, "thinking", Channel::Thinking(0), visit);
+        field(delta, "partial_json", Channel::Tool(0, index), visit);
+    }
+    let index = value["output_index"].as_u64().unwrap_or(0);
+    let channel = match value["type"].as_str() {
+        Some("response.function_call_arguments.delta") => Channel::Tool(0, index),
+        Some("response.refusal.delta") => Channel::Refusal(0),
+        _ => Channel::Text(0),
+    };
+    field(value, "delta", channel, visit);
+    if let Some(choices) = value.get_mut("choices").and_then(Value::as_array_mut) {
+        for (index, choice) in choices.iter_mut().enumerate() {
+            let channel = choice["index"].as_u64().unwrap_or(index as u64);
+            for container in ["message", "delta"] {
+                if let Some(part) = choice.get_mut(container) {
+                    field(part, "content", Channel::Text(channel), visit);
+                    field(part, "reasoning_content", Channel::Thinking(channel), visit);
+                    field(part, "reasoning", Channel::Thinking(channel), visit);
+                    field(part, "refusal", Channel::Refusal(channel), visit);
+                    if let Some(content) = part.get_mut("content") {
+                        blocks(content, channel, visit);
+                    }
+                    if let Some(tools) = part.get_mut("tool_calls").and_then(Value::as_array_mut) {
+                        for (index, tool) in tools.iter_mut().enumerate() {
+                            let index = tool["index"].as_u64().unwrap_or(index as u64);
+                            if let Some(function) = tool.get_mut("function") {
+                                field(function, "arguments", Channel::Tool(channel, index), visit);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(candidates) = value.get_mut("candidates").and_then(Value::as_array_mut) {
+        for (index, candidate) in candidates.iter_mut().enumerate() {
+            if let Some(parts) = candidate
+                .get_mut("content")
+                .and_then(|v| v.get_mut("parts"))
+            {
+                blocks(parts, index as u64, visit);
+            }
+        }
+    }
+    if let Some(output) = value.get_mut("output").and_then(Value::as_array_mut) {
+        for (index, item) in output.iter_mut().enumerate() {
+            field(item, "arguments", Channel::Tool(0, index as u64), visit);
+            if let Some(parts) = item.get_mut("content") {
+                blocks(parts, 0, visit);
+            }
+        }
+    }
+}
+
+/// A complete provider answer's text and output-limit status.
+pub struct Completion {
+    /// Text blocks in provider order.
+    pub text: String,
+    /// Whether the provider stopped at its output budget.
+    pub cut_off: bool,
+}
+impl Completion {
+    /// Reads the same content channels used by the streaming credential boundary.
+    pub fn read(provider: Provider, value: &Value) -> Result<Self, String> {
+        let valid = match provider {
+            Provider::Anthropic => value["content"].is_array(),
+            Provider::OpenRouter => value["choices"].is_array(),
+            Provider::OpenAi | Provider::ChatGpt => value["output"].is_array(),
+            Provider::Gemini => value["candidates"].is_array(),
+        };
+        if let Some(error) = value.get("error") {
+            return Err(error.to_string());
+        }
+        if !valid {
+            return Err("Unreadable provider answer".into());
+        }
+        let mut value = value.clone();
+        let mut text = String::new();
+        content(&mut value, &mut |channel, part| {
+            if channel == Channel::Text(0) {
+                text.push_str(part);
+            }
+        });
+        let cut_off = value["stop_reason"] == "max_tokens"
+            || value["choices"][0]["finish_reason"] == "length"
+            || value["incomplete_details"]["reason"] == "max_output_tokens"
+            || value["candidates"][0]["finishReason"] == "MAX_TOKENS";
+        Ok(Self { text, cut_off })
+    }
+}

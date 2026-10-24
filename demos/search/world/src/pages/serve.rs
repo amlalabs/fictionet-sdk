@@ -108,6 +108,20 @@ impl Pages {
         target: &str,
         route: Route,
     ) -> Response {
+        self.during_source(self.answer_route(cx, method, host, target, route), || {
+            Stop::store(std::io::Error::other("Page source changed")).response(Asked::Page)
+        })
+        .await
+    }
+
+    async fn answer_route(
+        self: &Arc<Self>,
+        cx: &Cx,
+        method: &str,
+        host: &str,
+        target: &str,
+        route: Route,
+    ) -> Response {
         if let Some(package) = self.package_url(&format!("https://{host}{target}")) {
             return package;
         }
@@ -300,6 +314,18 @@ impl Pages {
         }
         response.carries += reached.len() as u64;
         response.serve_ms = Some((cx.now().since_start() - started).as_millis() as u64);
+        if let Some(Maker::Model(model)) = &self.maker
+            && let Err(reason) = model.check_document(
+                &response.content_type,
+                &String::from_utf8_lossy(&response.body),
+            )
+        {
+            return Stop::Failed {
+                error: reason.to_string(),
+                usage: None,
+            }
+            .response(Asked::Page);
+        }
         response
     }
 
@@ -464,8 +490,11 @@ impl Pages {
                     fixed: true,
                     usage: None,
                 };
-                if let Err(error) = self.store().insert_page(record.clone()) {
-                    return Stop::store(error).response(Asked::Page);
+                let inserted = self
+                    .writing_store()
+                    .and_then(|mut store| store.insert_page(record.clone()).map_err(Stop::store));
+                if let Err(stop) = inserted {
+                    return stop.response(Asked::Page);
                 }
                 (record, true)
             }

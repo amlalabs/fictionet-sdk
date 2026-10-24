@@ -317,3 +317,113 @@ pub(super) fn repair_page(page: &mut Page) -> Result<(), Unreadable> {
     page.body = retained;
     Ok(())
 }
+
+/// Calendar dates in publication metadata and document prose.
+pub(super) fn dates(text: &str) -> Vec<time::Date> {
+    static DATES: OnceLock<Regex> = OnceLock::new();
+    let dates = DATES.get_or_init(|| Regex::new(
+        r"(?i)\b(?:[0-9]{4}-[0-9]{2}-[0-9]{2}|(?:[0-9]{1,2}\s+)?(?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?\s+[0-9]{1,4}(?:,?\s+[0-9]{4})?)\b"
+    ).unwrap());
+    dates
+        .find_iter(text)
+        .filter_map(|found| {
+            let text = found.as_str();
+            if let Ok(date) = super::seed::parse_date(text) {
+                return Some(date);
+            }
+            let words: Vec<_> = text
+                .split(|c: char| c.is_whitespace() || c == ',' || c == '.')
+                .filter(|word| !word.is_empty())
+                .collect();
+            let [first, second, year] = words.as_slice() else {
+                return None;
+            };
+            let (day, month) = if first.bytes().all(|b| b.is_ascii_digit()) {
+                (*first, *second)
+            } else {
+                (*second, *first)
+            };
+            let month = match &month.to_ascii_lowercase()[..3] {
+                "jan" => time::Month::January,
+                "feb" => time::Month::February,
+                "mar" => time::Month::March,
+                "apr" => time::Month::April,
+                "may" => time::Month::May,
+                "jun" => time::Month::June,
+                "jul" => time::Month::July,
+                "aug" => time::Month::August,
+                "sep" => time::Month::September,
+                "oct" => time::Month::October,
+                "nov" => time::Month::November,
+                "dec" => time::Month::December,
+                _ => return None,
+            };
+            time::Date::from_calendar_date(year.parse().ok()?, month, day.parse().ok()?).ok()
+        })
+        .collect()
+}
+
+pub(super) fn chronology(page: &Page, latest: time::Date) -> Result<(), Unreadable> {
+    let dateline = if page.date.is_empty() {
+        latest
+    } else {
+        super::seed::parse_date(&page.date)
+            .map_err(|_| Unreadable::Content("DATE must be YYYY-MM-DD".into()))?
+    };
+    if dateline > latest {
+        return Err(Unreadable::Content(format!(
+            "DATE must be on or before {latest}, when a referring page already links here. Write only what was known by then."
+        )));
+    }
+    let prose = if page.content_type.starts_with("text/html") {
+        super::text::text_of(&page.body)
+    } else {
+        page.body.clone()
+    };
+    if let Some(date) = dates(&format!(
+        "{} {} {} {}",
+        page.title,
+        page.description,
+        prose,
+        page.claims.join(" ")
+    ))
+    .into_iter()
+    .filter(|date| *date > dateline)
+    .max()
+    {
+        return Err(Unreadable::Content(format!(
+            "The document is dated {dateline} but cites {date}. Remove knowledge unavailable at its dateline, or explicitly update DATE and the visible dateline to at least {date}, no later than {latest}."
+        )));
+    }
+    Ok(())
+}
+
+/// Allocate opaque article identifiers from run entropy instead of model examples.
+pub(super) fn article_url(cx: &fictionet::Cx, original: &str) -> String {
+    let Ok(mut url) = url::Url::parse(original) else {
+        return original.into();
+    };
+    let path = url.path();
+    let trimmed = path.trim_end_matches('/');
+    let Some((prefix, id)) = trimmed.rsplit_once('-') else {
+        return original.into();
+    };
+    if !(8..=32).contains(&id.len())
+        || !id.bytes().all(|b| b.is_ascii_alphanumeric())
+        || !id.bytes().any(|b| b.is_ascii_uppercase())
+        || !id.bytes().any(|b| b.is_ascii_lowercase())
+        || !id.bytes().any(|b| b.is_ascii_digit())
+    {
+        return original.into();
+    }
+    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let id: String = (0..id.len())
+        .map(|_| ALPHABET[(cx.random_u64() % 62) as usize] as char)
+        .collect();
+    let path = format!(
+        "{prefix}-{id}{}",
+        if path.ends_with('/') { "/" } else { "" }
+    );
+    url.set_path(&path);
+    url.into()
+}

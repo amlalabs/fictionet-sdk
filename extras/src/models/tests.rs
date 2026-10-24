@@ -835,18 +835,39 @@ fn remote_content_and_mixed_server_tools_never_reach_the_transport() {
 
 #[test]
 fn inline_content_and_client_url_arguments_stay_usable() {
-    for body in [
-        json!({"messages":[{"role":"user","content":"Read https://example.com"}]}),
-        json!({"messages":[{"role":"user","content":"Research passkeys", "output_config":{"effort":"medium"}}], "output_config":{"effort":"medium"}, "safeguards":[{"type":"dangerous_tool_use","classifier_context":{"permission_mode":"auto","trusted_directories":{"primary":{"path":"/home/analyst"}}}}], "diagnostics":{"previous_message_id":null}}),
-        json!({"messages":[{"role":"assistant","content":[{"type":"tool_use","name":"WebFetch","input":{"url":"https://example.com"}}]}]}),
-        json!({"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"YQ=="}}]}]}),
-        json!({"input":[{"role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,YQ=="},{"type":"input_file","file_data":"data:application/pdf;base64,YQ=="}]}]}),
-        json!({"contents":[{"parts":[{"inlineData":{"mimeType":"image/png","data":"YQ=="}}]}]}),
+    for (provider, path, body) in [
+        (
+            Provider::Anthropic,
+            "/v1/messages",
+            json!({"messages":[{"role":"user","content":"Read https://example.com"}]}),
+        ),
+        (
+            Provider::Anthropic,
+            "/v1/messages",
+            json!({"messages":[{"role":"user","content":"Research passkeys", "output_config":{"effort":"medium"}}], "output_config":{"effort":"medium"}, "safeguards":[{"type":"dangerous_tool_use","classifier_context":{"permission_mode":"auto","trusted_directories":{"primary":{"path":"/home/analyst"}}}}], "diagnostics":{"previous_message_id":null}}),
+        ),
+        (
+            Provider::Anthropic,
+            "/v1/messages",
+            json!({"messages":[{"role":"assistant","content":[{"type":"tool_use","name":"WebFetch","input":{"url":"https://example.com"}}]}]}),
+        ),
+        (
+            Provider::Anthropic,
+            "/v1/messages",
+            json!({"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"YQ=="}}]}]}),
+        ),
+        (
+            Provider::OpenAi,
+            "/v1/responses",
+            json!({"input":[{"role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,YQ=="},{"type":"input_file","file_data":"data:application/pdf;base64,YQ=="}]}]}),
+        ),
+        (
+            Provider::Gemini,
+            "/v1beta/models/flash:generateContent",
+            json!({"contents":[{"parts":[{"inlineData":{"mimeType":"image/png","data":"YQ=="}}]}]}),
+        ),
     ] {
-        assert!(
-            safe_request(Provider::Anthropic, "/v1/messages", &body, false),
-            "{body}"
-        );
+        assert!(safe_request(provider, path, &body, false), "{body}");
     }
 }
 
@@ -1027,4 +1048,94 @@ fn custom_client_tool_formats_remain_local_inputs() {
         &json!({"input":"Read", "tools":[remote]}),
         false
     ));
+}
+
+#[test]
+fn protocols_reject_foreign_controls() {
+    for (provider, path, valid, foreign) in [
+        (
+            Provider::Anthropic,
+            "/v1/messages",
+            json!({"messages":[]}),
+            json!({"input":"text","conversation":"old","modalities":["audio"],"audio":{},"generationConfig":{},"provider":{}}),
+        ),
+        (
+            Provider::OpenAi,
+            "/v1/responses",
+            json!({"input":"text"}),
+            json!({"messages":[],"system":"text","thinking":{},"max_tokens":1,"generationConfig":{}}),
+        ),
+        (
+            Provider::OpenAi,
+            "/v1/chat/completions",
+            json!({"messages":[]}),
+            json!({"input":"text","instructions":"text","provider":{},"thinking":{},"max_output_tokens":1}),
+        ),
+        (
+            Provider::Gemini,
+            "/v1beta/models/flash:generateContent",
+            json!({"contents":[]}),
+            json!({"messages":[],"system":"text","input":"text","stream":true,"max_tokens":1}),
+        ),
+    ] {
+        assert!(safe_request(provider, path, &valid, false));
+        for (key, value) in foreign.as_object().unwrap() {
+            let mut body = valid.clone();
+            body[key] = value.clone();
+            assert!(
+                !safe_request(provider, path, &body, false),
+                "{provider:?}: {key}"
+            );
+        }
+    }
+}
+
+#[test]
+fn account_policy_messages_remain_executable() {
+    let body = json!({
+        "messages":[
+            {"role":"user","content":"Research passkeys"},
+            {"role":"system","content":[{"type":"text","text":"Use current account policy","cache_control":{"type":"ephemeral"}}],"output_config":{"effort":"medium"}}
+        ],
+        "thinking":{"type":"adaptive"},
+        "output_config":{"effort":"medium"}
+    });
+    assert!(safe_request(
+        Provider::Anthropic,
+        "/v1/messages",
+        &body,
+        false
+    ));
+}
+
+#[test]
+fn responses_messages_use_their_own_roles() {
+    for tagged in [false, true] {
+        for role in [
+            "system",
+            "developer",
+            "user",
+            "assistant",
+            "tool",
+            "function",
+            "model",
+            "unknown",
+        ] {
+            let mut message = json!({"role":role, "content":"Local text"});
+            if tagged {
+                message["type"] = json!("message");
+            }
+            let valid = safe_request(
+                Provider::OpenAi,
+                "/v1/responses",
+                &json!({"input":[message]}),
+                false,
+            );
+            assert_eq!(
+                valid,
+                matches!(role, "system" | "developer" | "user" | "assistant"),
+                "{tagged} {role}"
+            );
+        }
+    }
 }

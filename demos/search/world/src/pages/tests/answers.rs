@@ -717,3 +717,45 @@ fn a_credential_split_across_provider_blocks_cannot_reach_an_accepted_page() {
     });
     assert!(dir.texts().iter().all(|text| !text.contains(KEY)));
 }
+
+#[test]
+fn decoded_credentials_are_never_published_recorded_or_retried() {
+    for (path, kind, body) in [
+        (
+            "/article",
+            "text/html",
+            format!("<h1>Article</h1><p>{}</p>", KEY.replace('-', "&#45;")),
+        ),
+        (
+            "/data.json",
+            "application/json",
+            format!(r#"{{"value":"{}"}}"#, KEY.replace('-', r"\u002d")),
+        ),
+    ] {
+        let reply = format!(
+            "STATUS: 200\nTITLE: Article\nCONTENT_TYPE: {kind}\nSITE_CSS: body {{color:#234}}\nBODY:\n{body}"
+        );
+        let dir = Dir::new("encoded-credential");
+        let fake = Fake::script(vec![completion(0, &reply, None)]);
+        let pages = on_disk(
+            &dir.0,
+            seed(),
+            Some(Maker::Model(openrouter(fake.clone()))),
+            0,
+        )
+        .unwrap();
+        no_cast(&pages);
+        lab(move |cx| async move {
+            let response = get(&pages, &cx, &format!("https://news.fields.com{path}")).await;
+            assert_eq!(response.status, 503);
+            assert!(pages.store().page("news.fields.com", path).is_none());
+            assert_eq!(fake.users().len(), 1);
+            Ok(())
+        });
+        for text in dir.texts() {
+            assert!(!text.contains(KEY));
+            assert!(!text.contains("&#45;"));
+            assert!(!text.contains(r"\u002d"));
+        }
+    }
+}

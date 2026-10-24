@@ -372,6 +372,13 @@ impl Model {
         self.transport.redact(text)
     }
 
+    /// Validates content after its document syntax has been decoded.
+    pub fn check_document(&self, content_type: &str, document: &str) -> Result<(), Unreadable> {
+        self.transport
+            .check_document(content_type, document)
+            .map_err(|_| Unreadable::Credential)
+    }
+
     /// Every string in `value` without the key.
     pub fn redact_json(&self, value: &mut Value) {
         match value {
@@ -546,39 +553,9 @@ impl Model {
                 rejection: None,
             }
         };
-        let (text, cut_off) = match self.provider {
-            Provider::Anthropic => {
-                let Some(blocks) = answer["content"].as_array() else {
-                    let error = self.redact(&format!("{what}: unreadable response"));
-                    return Err(unreadable(attempt, error));
-                };
-                let text: String = blocks
-                    .iter()
-                    .filter(|b| b["type"] == "text")
-                    .filter_map(|b| b["text"].as_str())
-                    .collect();
-                (text, answer["stop_reason"] == "max_tokens")
-            }
-            Provider::OpenRouter => {
-                if let Some(error) = answer.get("error") {
-                    let detail: String =
-                        self.redact(&error.to_string()).chars().take(400).collect();
-                    let error = self.redact(&format!("{what} failed: {detail}"));
-                    return Err(unreadable(attempt, error));
-                }
-                let choice = &answer["choices"][0];
-                let content = &choice["message"]["content"];
-                let text = match content {
-                    Value::Null => String::new(),
-                    Value::String(text) => text.clone(),
-                    _ => {
-                        let error = self.redact(&format!("{what}: unreadable response"));
-                        return Err(unreadable(attempt, error));
-                    }
-                };
-                (text, choice["finish_reason"] == "length")
-            }
-        };
+        let completion = fictionet_extras::models::Completion::read(self.provider.into(), &answer)
+            .map_err(|reason| unreadable(attempt, self.redact(&format!("{what}: {reason}"))))?;
+        let (text, cut_off) = (completion.text, completion.cut_off);
         let text = self.redact(&text);
         attempt.raw = Some(text.clone());
         attempt.cut_off = cut_off;
@@ -629,6 +606,16 @@ impl Model {
                     let last = ledger.attempts.last_mut().expect("an attempt");
                     last.outcome = AttemptOutcome::Unreadable;
                     last.error = Some(reason.clone());
+                    if matches!(rejection, Unreadable::Credential) {
+                        last.raw = None;
+                        return (
+                            Err(Failure {
+                                error: reason,
+                                rejection: Some(rejection),
+                            }),
+                            ledger,
+                        );
+                    }
                     let retry = ask < 2
                         && self.live.as_ref().is_none_or(|calls| {
                             calls

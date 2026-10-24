@@ -34,12 +34,14 @@ pub enum Unreadable {
     Format(String),
     Disclosure(&'static str),
     Incomplete,
+    Credential,
     Content(String),
 }
 
 impl std::fmt::Display for Unreadable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Credential => f.write_str("provider response contained a credential"),
             Self::Incomplete => {
                 f.write_str("answer stopped at its output limit; write a shorter complete answer")
             }
@@ -89,6 +91,10 @@ last week, yesterday, today, days ago or the second week of a month. When a
 source used relative wording, state the exact date or inclusive date range
 that it means in that source, preserving the established timeline. Search snippets establish these facts before any page is opened.
 Use earlier published text as binding context even when it has no explicit claims.
+A document linking here is authoritative about what it quotes from this page,
+including the date of the quoted statement or guidance. Preserve that date.
+If this page was subsequently updated, distinguish its original statement date
+from its later update date explicitly; neither replaces the other.
 Do not introduce a second incompatible timeline or leave an established identity vague.
 Use public site domains, never reserved example domains or special-use hostnames. A page must
 fulfil what its search result and incoming anchor promised. Do not discuss the
@@ -122,8 +128,18 @@ methods, references and related documents. Use descriptive anchors and plausible
 stable paths, relative links on the same host and full URLs across hosts. Each
 link promises a real destination which will be available when opened. Keep links
 to earlier pages at their exact URLs. Never use placeholders or empty links.
+Use established contact channels only. If no phone number, postal address or
+named contact has been established, omit those details and link to the site's
+contact page. Do not invent contact coordinates or illustrative contact details.
 
 Nothing is dated after today. A dated article knows only what was known then.
+No calendar date in the headline, body or claims may be later than DATE.
+This includes forecasts, deadlines, planned shipments and dates quoted from
+other pages. Choose the publication/update dateline after all dates actually
+mentioned. If an older article would mention a later date, either omit that
+unavailable detail or write an explicit later update, retaining the original
+publication date separately. Do not retain a later date as a future plan on
+an earlier dateline; the publication validator rejects that too.
 When covering a development after an article's original publication date,
 give the article an explicit update date on or after that development. Set
 DATE to that update date and show both the original publication and update
@@ -213,7 +229,8 @@ result lists are messy, not a tidy story:
 - Include relevant sites and known pages only when the query is about them.
   An unrelated query has no relevant results. Do not impose a quota about the brief or add irrelevant filler. Rank
   by the actual query, including an unanticipated subject. Use plausible
-  stable destination paths and keep titles and snippets precise: they
+  stable destination paths in the site's actual style. Use descriptive article slugs;
+  opaque suffixes are allocated separately, never invent illustrative identifier sequences. Keep titles and snippets precise: they
   become commitments for the destination page.
 - Snippets are text cut out of the page, not summaries: often starting or
   ending mid-sentence, sometimes with a date, a rating, menu words or a

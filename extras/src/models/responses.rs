@@ -73,7 +73,7 @@ fn history(body: &mut Responses, cipher: &splice::TokenCipher) -> fictionet::Res
         return Ok(());
     };
     let mut restored = Vec::new();
-    for item in input.into_blocks() {
+    for item in input.into_input() {
         let Content::Block(block) = item else {
             restored.push(item);
             continue;
@@ -550,11 +550,7 @@ async fn run(
                 .await?;
             return Ok(None);
         }
-        let mut input = body
-            .input
-            .take()
-            .unwrap_or(Content::Empty(()))
-            .into_blocks();
+        let mut input = body.input.take().unwrap_or(Content::Empty(())).into_input();
         for item in original.iter().cloned().chain(results) {
             input.push(serde_json::from_value(item)?);
         }

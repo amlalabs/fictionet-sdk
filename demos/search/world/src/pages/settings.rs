@@ -24,6 +24,7 @@ impl Pages {
             prefetch,
             live_calls: None,
             store: Mutex::new(store),
+            writing: Mutex::new(tokio::sync::watch::channel(false).0),
             copied: None,
             copied_active: Default::default(),
             live: None,
@@ -113,8 +114,54 @@ impl Pages {
         store
     }
 
+    pub(super) async fn during_source<F: std::future::Future>(
+        &self,
+        work: F,
+        cancelled: impl FnOnce() -> F::Output,
+    ) -> F::Output {
+        if WRITING.try_with(|_| ()).is_ok() {
+            return work.await;
+        }
+        let mut session = {
+            let _store = self.store();
+            self.writing
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .subscribe()
+        };
+        WRITING
+            .scope(session.clone(), async {
+                tokio::select! {
+                    biased;
+                    _ = session.wait_for(|cancelled| *cancelled) => cancelled(),
+                    result = work => result,
+                }
+            })
+            .await
+    }
+
+    pub(super) fn writing_store(&self) -> Result<MutexGuard<'_, Store>, Stop> {
+        let store = self.store();
+        if WRITING
+            .try_with(|session| *session.borrow())
+            .unwrap_or(false)
+        {
+            return Err(Stop::store(std::io::Error::other("Page source changed")));
+        }
+        Ok(store)
+    }
+
+    fn revoke_writing(&self) {
+        let mut writing = self.writing.lock().unwrap_or_else(|e| e.into_inner());
+        writing.send_replace(true);
+        *writing = tokio::sync::watch::channel(false).0;
+    }
+
     pub(super) fn generating(&self) -> bool {
-        self.maker.is_some() && self.store().generation.generate
+        self.maker.is_some()
+            && self.store().generation.generate
+            && !self.copied_only()
+            && !self.live_only()
     }
 
     /// Applies a command against the current revision. A generation
@@ -142,6 +189,7 @@ impl Pages {
                 {
                     live.revoke(generate);
                 }
+                self.revoke_writing();
                 store.generation.generate = generate;
             }
             Command::SetNewPages { new_pages, .. } => {
@@ -170,6 +218,7 @@ impl Pages {
                         std::sync::atomic::Ordering::SeqCst,
                     );
                 }
+                self.revoke_writing();
                 self.copied_active
                     .store(copied, std::sync::atomic::Ordering::SeqCst);
                 store.generation.generate = new_pages != NewPages::Off;
@@ -204,6 +253,7 @@ impl Pages {
                 if let Some(live) = &self.live {
                     live.restart();
                 }
+                self.revoke_writing();
                 let generation = store.generation;
                 *store = Store::memory();
                 store.generation = Generation {

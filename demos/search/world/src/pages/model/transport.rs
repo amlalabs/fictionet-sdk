@@ -29,6 +29,25 @@ impl Transport for ProviderTransport {
         body: Vec<u8>,
     ) -> fictionet_extras::models::Post<'a> {
         Box::pin(async move {
+            use http_body_util::BodyExt;
+            let response = self.incoming(cx, headers, body).await?;
+            let status = response.status().as_u16();
+            let body = http_body_util::Limited::new(response.into_body(), 32 * 1024 * 1024)
+                .collect()
+                .await
+                .map_err(|e| e.to_string())?
+                .to_bytes();
+            Ok((status, body.to_vec()))
+        })
+    }
+
+    fn incoming<'a>(
+        &'a self,
+        cx: &'a Cx,
+        headers: Vec<(&'static str, String)>,
+        body: Vec<u8>,
+    ) -> fictionet_extras::models::Incoming<'a> {
+        Box::pin(async move {
             let client = {
                 let mut cached = self.client.lock().unwrap();
                 if cached.is_none() {
@@ -45,7 +64,7 @@ impl Transport for ProviderTransport {
             if let Some(observer) = self.observer.lock().unwrap().clone() {
                 client.observe_upstream(observer);
             }
-            client.post(cx, headers, body).await
+            client.incoming(cx, headers, body).await
         })
     }
 }
