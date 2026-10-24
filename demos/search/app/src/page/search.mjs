@@ -82,6 +82,7 @@ function graph() {
       lane.append(vm);
     }
     const control = button('', () => select(service.id), `service ${service.reached ? 'active' : 'unused'}`);
+    if (service.id === 'router' && service.reached) control.classList.add('refused');
     control.setAttribute('aria-pressed', String(selection === service.id));
     const label = element('span', undefined, 'service-label');
     label.append(element('strong', service.title));
