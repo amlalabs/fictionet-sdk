@@ -12,7 +12,7 @@ pub fn guest(token: Option<&str>) -> Guest<kit::PreparedImage> {
     guest = guest.file(
         &format!("/home/{USER}/.tmux.conf"),
         0o644,
-        "set -g status off\nset -g default-terminal tmux-256color\nset -as terminal-features ',xterm-256color:RGB'\nset -g update-environment 'DISPLAY DBUS_SESSION_BUS_ADDRESS COLORTERM'\n",
+        "set -g status off\nset -g mouse on\nset -g default-terminal tmux-256color\nset -as terminal-features ',xterm-256color:RGB'\nset -g update-environment 'DISPLAY DBUS_SESSION_BUS_ADDRESS COLORTERM'\n",
     );
     guest.features = kit::Features {
         claude_code: true,
