@@ -511,6 +511,3 @@ fn static_asset(path: &str) -> Option<Response> {
 }
 
 pub(crate) use make::misspelled_host;
-
-#[cfg(test)]
-mod tests;

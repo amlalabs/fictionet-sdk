@@ -46,4 +46,3 @@ tantivy = { version = "0.27", default-features = false, features = ["mmap", "lz4
 
 [dev-dependencies]
 axum = { version = "0.8", default-features = false, features = ["json", "http1", "tokio"] }
-fictionet-test-support = { path = "../tests/support" }

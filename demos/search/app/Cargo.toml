@@ -53,6 +53,3 @@ fictionet-demo = { path = "../../kit" }
 [[bin]]
 name = "search"
 path = "src/main.rs"
-
-[dev-dependencies]
-fatfs = { version = "0.3", default-features = false, features = ["std", "alloc"] }

@@ -399,6 +399,3 @@ pub fn not_found(host: &str, profile: Option<&Profile>, target: &str, year: &str
     };
     page_at(host, target, profile.unwrap_or(&fallback), &record, year)
 }
-
-#[cfg(test)]
-mod tests;

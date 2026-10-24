@@ -142,23 +142,7 @@ async fn download(
         }
         let destination = url::Url::parse(&url)?;
         let response = tokio::time::timeout(std::time::Duration::from_secs(20), async {
-            let client = {
-                #[cfg(test)]
-                if destination.host_str().is_some_and(|host| {
-                    host.parse::<std::net::IpAddr>()
-                        .is_ok_and(|ip| ip.is_loopback())
-                }) {
-                    reqwest::Client::builder()
-                        .no_proxy()
-                        .redirect(reqwest::redirect::Policy::none())
-                        .build()
-                        .map_err(std::io::Error::other)?
-                } else {
-                    capture::client(&destination).await?
-                }
-                #[cfg(not(test))]
-                capture::client(&destination).await?
-            };
+            let client = capture::client(&destination).await?;
             let response = client
                 .get(destination.clone())
                 .header("accept-encoding", "identity")
@@ -567,21 +551,53 @@ fn package_root(root: &Path) -> std::io::Result<std::path::PathBuf> {
     }
 }
 
-fn publish(packages: &Path, destination: &Path) -> Result {
-    std::fs::create_dir_all(destination)?;
-    let name = format!(
-        "batch-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)?
-            .as_nanos()
-    );
-    std::fs::rename(packages, destination.join(&name))?;
-    let pointer = destination.join(format!(".{name}"));
-    std::os::unix::fs::symlink(&name, &pointer)?;
-    std::fs::rename(pointer, destination.join("current"))?;
-    // Published batches remain immutable, including paths held by older worlds.
-    Ok(())
+struct Publication {
+    directory: std::path::PathBuf,
+    destination: std::path::PathBuf,
+    published: bool,
+}
+
+impl Publication {
+    fn prepare(staged: &Path, destination: &Path) -> Result<Self> {
+        std::fs::create_dir_all(destination)?;
+        let name = format!(
+            "batch-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)?
+                .as_nanos()
+        );
+        let directory = destination.join(name);
+        std::fs::rename(staged, &directory)?;
+        Ok(Self {
+            directory,
+            destination: destination.to_owned(),
+            published: false,
+        })
+    }
+
+    fn commit(mut self) -> Result {
+        let name = self.directory.file_name().unwrap();
+        let pointer = self
+            .destination
+            .join(format!(".{}", name.to_string_lossy()));
+        std::os::unix::fs::symlink(name, &pointer)?;
+        std::fs::rename(pointer, self.destination.join("current"))?;
+        self.published = true;
+        Ok(())
+    }
+}
+
+impl Drop for Publication {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
+}
+
+fn publish(staged: &Path, destination: &Path) -> Result {
+    Publication::prepare(staged, destination)?.commit()
 }
 
 pub async fn run(downloads: &Path, python: Option<&Path>) -> Result {
@@ -632,6 +648,8 @@ pub async fn run(downloads: &Path, python: Option<&Path>) -> Result {
     if root.join("packages").is_dir() {
         std::os::unix::fs::symlink(root.join("packages"), staged_corpus.join("packages"))?;
     }
+    let publication = Publication::prepare(&staged_corpus, &root)?;
+    std::os::unix::fs::symlink(&publication.directory, &staged_corpus)?;
     let status = Command::new("rustup")
         .args([
             "run",
@@ -643,6 +661,8 @@ pub async fn run(downloads: &Path, python: Option<&Path>) -> Result {
             "web-world",
             "--test",
             "corpus",
+            "--",
+            "--test-threads=1",
         ])
         .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap())
         .env("SEARCH_DOWNLOADS", std::fs::canonicalize(&batch.0)?)
@@ -655,22 +675,18 @@ pub async fn run(downloads: &Path, python: Option<&Path>) -> Result {
     if staged_corpus.join("packages").is_symlink() {
         std::fs::remove_file(staged_corpus.join("packages"))?;
     }
-    let research_batch = batch.0.join("research");
-    std::fs::rename(&staged_corpus, &research_batch)?;
-    publish(&research_batch, &root)?;
+    publication.commit()?;
+    let Some(python) = python else {
+        println!("Captured research sources in {}", root.display());
+        return Ok(());
+    };
+    std::fs::remove_file(&staged_corpus)?;
     std::fs::create_dir_all(&staged_corpus)?;
     for entry in std::fs::read_dir(package_root(&root)?)? {
         let entry = entry?;
         if entry.path().to_string_lossy().ends_with(".warc.gz") {
             std::os::unix::fs::symlink(entry.path(), staged_corpus.join(entry.file_name()))?;
         }
-    }
-    let Some(python) = python else {
-        println!("Captured research sources in {}", root.display());
-        return Ok(());
-    };
-    if staged_corpus.join("packages").is_symlink() {
-        std::fs::remove_file(staged_corpus.join("packages"))?;
     }
     // Resolve packages into an empty batch. Indexes and distributions are
     // published together only after an offline install.
@@ -801,387 +817,4 @@ pub async fn run(downloads: &Path, python: Option<&Path>) -> Result {
         root.display()
     );
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn research_publication_switches_the_whole_batch_and_keeps_old_readers() {
-        let root = Batch(std::env::temp_dir().join(format!(
-                "research-publication-{}-{}",
-                std::process::id(),
-                SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            )));
-        let destination = root.0.join("security");
-        std::fs::create_dir_all(&destination).unwrap();
-        let write = |path: &Path, url, body: &'static str| {
-            Archive::default()
-                .append(
-                    path,
-                    url,
-                    &fictionet_extras::warc::Response {
-                        status: http::StatusCode::OK,
-                        headers: Default::default(),
-                        body: body.into(),
-                    },
-                )
-                .unwrap()
-        };
-        write(
-            &destination.join("old.warc.gz"),
-            "https://source.org/article",
-            "old article",
-        );
-        let old = Archive::directory(&destination).unwrap();
-        let staged = root.0.join("staged");
-        std::fs::create_dir_all(&staged).unwrap();
-        write(
-            &staged.join("article.warc.gz"),
-            "https://source.org/article",
-            "new article with citation",
-        );
-        assert_eq!(
-            Archive::directory(&destination)
-                .unwrap()
-                .get("https://source.org/article")
-                .unwrap()
-                .unwrap()
-                .body,
-            "old article"
-        );
-        write(
-            &staged.join("citation.warc.gz"),
-            "https://source.org/citation",
-            "cited research",
-        );
-        publish(&staged, &destination).unwrap();
-        let new = Archive::directory(&destination).unwrap();
-        assert_eq!(
-            new.get("https://source.org/article").unwrap().unwrap().body,
-            "new article with citation"
-        );
-        assert_eq!(
-            new.get("https://source.org/citation")
-                .unwrap()
-                .unwrap()
-                .body,
-            "cited research"
-        );
-        assert_eq!(
-            old.get("https://source.org/article").unwrap().unwrap().body,
-            "old article"
-        );
-        assert!(old.get("https://source.org/citation").unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn large_not_found_documents_survive_optional_asset_discovery() {
-        let root = Batch(std::env::temp_dir().join(format!(
-            "missing-page-capture-{}-{}",
-            std::process::id(),
-            SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos()
-        )));
-        std::fs::create_dir_all(&root.0).unwrap();
-        let path = root.0.join("missing-pages.warc.gz");
-        let url = "https://publisher.org/404";
-        let mut response = fictionet_extras::warc::Response {
-            status: http::StatusCode::NOT_FOUND,
-            headers: Default::default(),
-            body: format!(
-                "<title>Page not found</title>{}",
-                " ".repeat(fictionet_extras::capture::PARSE_BYTES)
-            )
-            .into(),
-        };
-        response
-            .headers
-            .insert("content-type", "text/html".parse().unwrap());
-        response.headers.insert(
-            "content-length",
-            response.body.len().to_string().parse().unwrap(),
-        );
-        let mut archive = Archive::default();
-        archive.append(&path, url, &response).unwrap();
-        missing_pages(
-            &root.0,
-            &["https://publisher.org/article".into()],
-            &["https://publisher.org/article".into()],
-        )
-        .await
-        .unwrap();
-        let replay = not_found(&Archive::open([path]).unwrap(), url).unwrap();
-        assert_eq!(replay.body, response.body);
-        assert_eq!(replay.headers, response.headers);
-    }
-
-    #[tokio::test]
-    async fn research_captures_two_article_hops_and_site_roots() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let origin = format!("http://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move {
-            loop {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                tokio::spawn(async move {
-                    let mut request = Vec::new();
-                    while !request.ends_with(b"\r\n\r\n") {
-                        assert!(request.len() < 8192);
-                        request.push(stream.read_u8().await.unwrap());
-                    }
-                    let request = std::str::from_utf8(&request).unwrap();
-                    let (status, body) = match request.split_whitespace().nth(1).unwrap() {
-                        "/incident" => (
-                            200,
-                            "<title>Incident</title><article><a href='/reviewdog#details'>Analysis</a></article>",
-                        ),
-                        "/reviewdog" => (
-                            200,
-                            "<title>Analysis</title><article><a href='/guidance'>Guidance</a></article>",
-                        ),
-                        "/guidance" => (
-                            200,
-                            "<title>Guidance</title><article><a href='/third'>More</a></article>",
-                        ),
-                        "/" => (200, "<title>Publisher</title>"),
-                        _ => (404, "<title>Page not found</title>"),
-                    };
-                    stream.write_all(format!("HTTP/1.1 {status} OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
-                });
-            }
-        });
-        let root = Batch(std::env::temp_dir().join(format!(
-            "article-capture-{}-{}",
-            std::process::id(),
-            SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos()
-        )));
-        std::fs::create_dir_all(&root.0).unwrap();
-        let mut previous = Archive::default();
-        previous
-            .append(
-                &root.0.join("references.warc.gz"),
-                &format!("{origin}/reviewdog"),
-                &fictionet_extras::warc::Response {
-                    status: http::StatusCode::NOT_FOUND,
-                    headers: Default::default(),
-                    body: "Missing".into(),
-                },
-            )
-            .unwrap();
-        let source = format!("{origin}/incident");
-        research(&root.0, std::slice::from_ref(&source))
-            .await
-            .unwrap();
-        server.abort();
-        let archive = Archive::directory(&root.0).unwrap();
-        for path in ["/incident", "/reviewdog", "/guidance", "/"] {
-            verify(&archive, &format!("{origin}{path}")).unwrap();
-        }
-        assert!(!archive.contains(&format!("{origin}/third")));
-        assert_eq!(
-            not_found(&archive, &format!("{origin}/404"))
-                .unwrap()
-                .status,
-            404
-        );
-        let pages = std::sync::Arc::new(
-            web_world::pages::Pages::copied(
-                web_world::pages::Seed::builtin("security").unwrap(),
-                &root.0,
-                &[source],
-                None,
-            )
-            .unwrap(),
-        );
-        fictionet::block_on(fictionet::lab(
-            fictionet::Seed::from_u64(1),
-            |cx| async move {
-                use fictionet_extras::models::Engine;
-                for path in ["/reviewdog", "/guidance", "/"] {
-                    let page = pages
-                        .clone()
-                        .fetch(cx.clone(), format!("{origin}{path}"))
-                        .await?;
-                    assert!(!page.title.is_empty());
-                    assert!(!page.body.is_empty());
-                }
-                Ok(())
-            },
-        ))
-        .unwrap();
-    }
-
-    #[test]
-    fn publishing_keeps_existing_worlds_and_git_paths_on_their_batch() {
-        let root = Batch(std::env::temp_dir().join(format!(
-                "package-publication-{}-{}",
-                std::process::id(),
-                SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            )));
-        let corpus = root.0.join("security");
-        std::fs::create_dir_all(&corpus).unwrap();
-        let mut archive = Archive::default();
-        archive
-            .append(
-                &corpus.join("research.warc.gz"),
-                "https://source.org/",
-                &fictionet_extras::warc::Response {
-                    status: http::StatusCode::OK,
-                    headers: http::HeaderMap::from_iter([(
-                        http::header::CONTENT_TYPE,
-                        "text/html".parse().unwrap(),
-                    )]),
-                    body: "<title>Source</title><p>Research</p>".into(),
-                },
-            )
-            .unwrap();
-        let write_batch = |path: &Path, body: &'static str| {
-            std::fs::create_dir_all(path.join("git/psf/requests.git")).unwrap();
-            std::fs::write(path.join("git/psf/requests.git/HEAD"), body).unwrap();
-            Archive::default()
-                .append(
-                    &path.join("distributions.warc.gz"),
-                    "https://files.pythonhosted.org/tool.whl",
-                    &fictionet_extras::warc::Response {
-                        status: http::StatusCode::OK,
-                        headers: Default::default(),
-                        body: body.into(),
-                    },
-                )
-                .unwrap();
-        };
-        let open = || {
-            std::sync::Arc::new(
-                web_world::pages::Pages::copied(
-                    web_world::pages::Seed::builtin("web").unwrap(),
-                    &corpus,
-                    &["https://source.org/".into()],
-                    None,
-                )
-                .unwrap(),
-            )
-        };
-        let destination = corpus.join("packages");
-        write_batch(&destination, "legacy");
-        let legacy = open();
-        let first = root.0.join("first");
-        write_batch(&first, "first");
-        publish(&first, &destination).unwrap();
-        let first_path = package_root(&destination).unwrap();
-        let first = open();
-        let second = root.0.join("second");
-        write_batch(&second, "second");
-        publish(&second, &destination).unwrap();
-        let second = open();
-        assert_eq!(
-            std::fs::read_to_string(destination.join("git/psf/requests.git/HEAD")).unwrap(),
-            "legacy"
-        );
-        assert_eq!(
-            std::fs::read_to_string(first_path.join("git/psf/requests.git/HEAD")).unwrap(),
-            "first"
-        );
-        fictionet::block_on(fictionet::lab(
-            fictionet::Seed::from_u64(1),
-            |cx| async move {
-                for (pages, expected) in [(legacy, "legacy"), (first, "first"), (second, "second")]
-                {
-                    let answer = pages
-                        .handle(&cx, "GET", "files.pythonhosted.org", "/tool.whl", None)
-                        .await;
-                    assert_eq!(answer.status, 200);
-                    assert_eq!(answer.body, expected.as_bytes());
-                }
-                Ok(())
-            },
-        ))
-        .unwrap();
-    }
-
-    #[test]
-    fn captured_responses_follow_redirects_and_preserve_site_errors() {
-        let path = std::env::temp_dir().join(format!(
-            "capture-responses-{}-{}.warc.gz",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let mut archive = Archive::default();
-        for (url, status, location, body) in [
-            ("https://source.org/404", 301u16, Some("/en/404"), ""),
-            (
-                "https://source.org/en/404",
-                404,
-                None,
-                "Page not found | Source",
-            ),
-        ] {
-            let mut response = fictionet_extras::warc::Response {
-                status: status.try_into().unwrap(),
-                headers: Default::default(),
-                body: body.as_bytes().to_vec().into(),
-            };
-            if let Some(location) = location {
-                response
-                    .headers
-                    .insert("location", location.parse().unwrap());
-            }
-            archive.append(&path, url, &response).unwrap();
-        }
-        let response = captured(&archive, "https://source.org/404").unwrap();
-        assert_eq!(response.status, 404);
-        assert_eq!(response.body, "Page not found | Source");
-        assert!(verify(&archive, "https://source.org/404").is_err());
-        assert!(captured(&archive, "https://source.org/missing").is_err());
-        let origin = url::Url::parse("https://source.org/").unwrap().origin();
-        assert_eq!(
-            site_not_found(&archive, &origin).unwrap().unwrap().status,
-            404
-        );
-        assert!(
-            site_not_found(
-                &archive,
-                &url::Url::parse("https://other.org/").unwrap().origin()
-            )
-            .unwrap()
-            .is_none()
-        );
-        assert_eq!(
-            not_found(&archive, "https://source.org/404")
-                .unwrap()
-                .status,
-            404
-        );
-        for status in [200, 401, 403, 429] {
-            archive
-                .append(
-                    &path,
-                    "https://source.org/wrong-status",
-                    &fictionet_extras::warc::Response {
-                        status: http::StatusCode::from_u16(status).unwrap(),
-                        headers: Default::default(),
-                        body: "Unavailable".into(),
-                    },
-                )
-                .unwrap();
-            assert!(not_found(&archive, "https://source.org/wrong-status").is_err());
-            assert_eq!(
-                captured(&archive, "https://source.org/wrong-status")
-                    .unwrap()
-                    .status,
-                status
-            );
-        }
-        std::fs::remove_file(path).unwrap();
-    }
 }

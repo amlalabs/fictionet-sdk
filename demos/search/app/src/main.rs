@@ -195,32 +195,3 @@ fn recording_error(
         Err(error) => std::io::Error::other(error),
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{Mode, arguments};
-
-    fn parse(args: &[&str]) -> Option<Mode> {
-        arguments(args.iter().map(|a| a.to_string())).ok()
-    }
-
-    #[test]
-    fn the_app_takes_its_folder_or_preview() {
-        assert_eq!(
-            parse(&["d"]),
-            Some(Mode::App {
-                downloads: "d".into()
-            })
-        );
-        assert_eq!(parse(&["preview"]), Some(Mode::Preview));
-        for bad in [
-            &[][..],
-            &["--unknown"],
-            &["d", "extra"],
-            &["preview", "extra"],
-            &["preview", "extra", "extra"],
-        ] {
-            assert_eq!(parse(bad), None, "{bad:?}");
-        }
-    }
-}

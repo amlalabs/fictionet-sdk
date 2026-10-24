@@ -28,18 +28,3 @@ tower-service = "0.3"
 kuchiki = "0.8"
 zim = "0.5"
 rayon = "1"
-
-[dev-dependencies]
-flate2 = "1"
-http-body = "1"
-fictionet-test-support = { path = "../../../tests/support" }
-rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
-
-# This acceptance test requires the downloaded security corpus.
-[[test]]
-name = "corpus"
-test = false
-
-[[test]]
-name = "packages"
-test = false
