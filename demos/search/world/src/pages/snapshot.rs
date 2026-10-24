@@ -91,8 +91,26 @@ pub fn page(url: &url::Url, html: &str, held: &dyn Fn(&url::Url) -> String) -> S
         }
         node.append(kuchiki::NodeRef::new_text(rewritten));
     }
-    dom.to_string()
+    // A page made only for desktops (it names no viewport, like a filing
+    // laid out for letter paper) is pictured the way a phone shows it:
+    // laid out 980 px wide and zoomed out to fit, not cut to its left edge.
+    let desktop_only = dom.select_first("meta[name=viewport]").is_err();
+    let picture = dom.to_string();
+    if desktop_only {
+        // The parser always gives a document its head.
+        picture.replacen(
+            "</head>",
+            &format!("<style>html{{zoom:{DESKTOP_ZOOM}}}</style></head>"),
+            1,
+        )
+    } else {
+        picture
+    }
 }
+
+/// The zoom that fits a page laid out 980 px wide on the workstation
+/// phone's 390 px screen.
+const DESKTOP_ZOOM: &str = "0.398";
 
 /// A stylesheet served at `base` with its `url()` and `@import` addresses
 /// renamed by `held`.
