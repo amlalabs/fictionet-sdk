@@ -493,3 +493,21 @@ fn git_transport_paths_return_plain_missing_responses_without_pages() {
         Ok(())
     });
 }
+
+#[test]
+fn git_transport_paths_with_an_ampersand_return_plain_missing_responses() {
+    lab(|cx| async move {
+        let pages = plain();
+        for path in [
+            "/owner/a&b/info/refs?service=git-upload-pack",
+            "/owner/a&b/git-upload-pack",
+            "/owner/a&b.git",
+        ] {
+            let response = pages.handle(&cx, "GET", "github.com", path, None).await;
+            assert_eq!(response.status, 404, "{path}");
+            assert_eq!(response.body, b"Not found", "{path}");
+            assert!(pages.store().page("github.com", path).is_none(), "{path}");
+        }
+        Ok(())
+    });
+}
