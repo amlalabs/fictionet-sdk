@@ -193,7 +193,30 @@ fn verify(archive: &Archive, url: &str) -> Result {
     }
 }
 
-async fn missing_pages(root: &Path, sources: &[String]) -> Result {
+fn site_not_found(
+    archive: &Archive,
+    origin: &url::Origin,
+) -> Result<Option<fictionet_extras::warc::Response>> {
+    let mut urls: Vec<_> = archive
+        .urls()
+        .filter(|url| url::Url::parse(url).is_ok_and(|url| &url.origin() == origin))
+        .collect();
+    urls.sort();
+    for url in urls {
+        if let Some(response) = archive.get(url)?
+            && response.status == http::StatusCode::NOT_FOUND
+        {
+            return Ok(Some(response));
+        }
+    }
+    Ok(None)
+}
+
+async fn missing_pages(root: &Path, sources: &[String], required: &[String]) -> Result {
+    let required: BTreeSet<_> = required
+        .iter()
+        .map(|url| url::Url::parse(url).map(|url| url.origin().ascii_serialization()))
+        .collect::<std::result::Result<_, _>>()?;
     let urls: BTreeSet<_> = sources
         .iter()
         .map(|url| {
@@ -240,7 +263,19 @@ async fn missing_pages(root: &Path, sources: &[String]) -> Result {
         for (canonical, alternate) in alternatives {
             match not_found(&archive, &alternate) {
                 Ok(response) => missing.append(&path, &canonical, &response)?,
-                Err(error) => failures.push(error.to_string()),
+                Err(error) => {
+                    let origin = url::Url::parse(&canonical)?.origin();
+                    if let Some(response) = site_not_found(&archive, &origin)? {
+                        missing.append(&path, &canonical, &response)?;
+                    } else if required.contains(&origin.ascii_serialization()) {
+                        failures.push(error.to_string());
+                    } else {
+                        eprintln!(
+                            "No not-found capture for {}: {error}",
+                            origin.ascii_serialization()
+                        );
+                    }
+                }
             }
         }
         if !failures.is_empty() {
@@ -327,7 +362,7 @@ async fn research(root: &Path, sources: &[String]) -> Result {
             eprintln!("Reference unavailable: {url}");
         }
     }
-    missing_pages(root, &origins).await
+    missing_pages(root, &origins, sources).await
 }
 
 fn package_root(root: &Path) -> std::io::Result<std::path::PathBuf> {
@@ -457,7 +492,7 @@ pub async fn run(downloads: &Path, python: &Path) -> Result {
         .urls()
         .map(str::to_owned)
         .collect::<Vec<_>>();
-    missing_pages(&packages, &sources).await?;
+    missing_pages(&packages, &sources, &sources).await?;
     let archive = Archive::directory(&packages)?;
     for url in required {
         verify(&archive, &url)?;
@@ -634,6 +669,19 @@ mod tests {
         assert_eq!(response.body, "Page not found | Source");
         assert!(verify(&archive, "https://source.org/404").is_err());
         assert!(captured(&archive, "https://source.org/missing").is_err());
+        let origin = url::Url::parse("https://source.org/").unwrap().origin();
+        assert_eq!(
+            site_not_found(&archive, &origin).unwrap().unwrap().status,
+            404
+        );
+        assert!(
+            site_not_found(
+                &archive,
+                &url::Url::parse("https://other.org/").unwrap().origin()
+            )
+            .unwrap()
+            .is_none()
+        );
         assert_eq!(
             not_found(&archive, "https://source.org/404")
                 .unwrap()

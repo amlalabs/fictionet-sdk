@@ -336,17 +336,19 @@ pub(super) fn replay(
             answer.stored_headers = Some(headers);
             answer
         }
-        Ok(None) => Response::html(
-            "<html>\r\n<head><title>404 Not Found</title></head>\r\n<body>\r\n<center><h1>404 Not Found</h1></center>\r\n<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n",
-            Meta::Missing,
+        Ok(None) => Response::new(
             404,
-            "nginx",
-        ),
-        Err(_) => Response::html(
-            "<html>\r\n<head><title>500 Internal Server Error</title></head>\r\n<body>\r\n<center><h1>500 Internal Server Error</h1></center>\r\n<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n",
+            "text/plain; charset=utf-8",
+            "Not Found\n",
+            vec![],
             Meta::Missing,
+        ),
+        Err(_) => Response::new(
             500,
-            "nginx",
+            "text/plain; charset=utf-8",
+            "Internal Server Error\n",
+            vec![],
+            Meta::Missing,
         ),
     }
 }
@@ -409,6 +411,9 @@ mod tests {
                     );
                 } else {
                     assert!(response.is_none());
+                    let response = replay(Ok(response));
+                    assert_eq!(response.status, 404);
+                    assert_eq!(response.body, b"Not Found\n");
                 }
             }
             assert_eq!(
