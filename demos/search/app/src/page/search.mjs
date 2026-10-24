@@ -54,82 +54,100 @@ function svg(tag, attrs = {}, text) {
   if (text !== undefined) node.textContent = text;
   return node;
 }
+function localSites() {
+  const upstream = new Set([...shown.connections.map((row) => row.host), ...shown.calls.map((call) => call.host)]);
+  return shown.sites.filter((site) => !upstream.has(site.host));
+}
+
 function graph(upstream, newData) {
-  const map = $('map');
+  const map = $('map'), width = Math.min(map.clientWidth, 760), height = map.clientHeight;
+  $('world').classList.toggle('world-compact', map.clientWidth < 820);
   map.replaceChildren();
-  const compact = !!selection;
-  const y = (value) => compact ? value * .65 + 10 : value;
-  map.setAttribute('viewBox', compact ? '0 0 1000 410' : '0 0 1000 600');
-  map.append(svg('rect', { x: 18, y: y(244), width: 156, height: compact ? 78 : 112, rx: 16, class: 'vm-zone' }), svg('rect', { x: 195, y: y(20), width: 548, height: compact ? 376 : 560, rx: 22, class: 'world-zone' }), svg('rect', { x: 775, y: y(20), width: 207, height: compact ? 376 : 560, rx: 18, class: 'internet-zone' }));
-  for (const [x, top, title, kind] of [[34, 270, 'VM', ''], [215, 49, 'THE WORLD', 'world-label'], [793, 49, 'INTERNET', 'internet-label']]) map.append(svg('text', { x, y: y(top), class: `map-label ${kind}` }, title));
+  if (!width || !height) return;
+  map.setAttribute('viewBox', `0 0 ${width} ${height}`);
+  const destinations = [...new Set(shown.connections.map((row) => row.host))];
+  const top = 76, internet = height - (destinations.length ? 106 : 80), bottom = internet - 12;
+  map.append(svg('rect', { x: 14, y: 10, width: 212, height: 56, rx: 14, class: 'vm-zone' }), svg('rect', { x: 14, y: top, width: width - 28, height: bottom - top, rx: 16, class: 'world-zone' }), svg('rect', { x: 14, y: internet, width: width - 28, height: height - internet - 12, rx: 14, class: 'internet-zone' }));
+  map.append(svg('text', { x: 24, y: 43, class: 'map-label' }, 'VM'), svg('text', { x: 26, y: top + 23, class: 'map-label world-label' }, 'THE WORLD'));
+  const wires = svg('g'); map.append(wires);
   const wire = (path, kind = '', pulse = false) => {
-    map.append(svg('path', { d: path, class: `wire ${kind}` }));
+    wires.append(svg('path', { d: path, class: `wire ${kind}` }));
     if (pulse && live) {
       const dot = svg('circle', { r: 3, class: `packet ${kind}` });
       dot.append(svg('animateMotion', { path, dur: '1.2s', repeatCount: '1', fill: 'freeze' }));
-      map.append(dot);
+      wires.append(dot);
     }
   };
-  const node = (id, x, top, width, title, address = '', outside = false) => {
-    const at = y(top), height = compact ? 34 : 46;
+  const node = (id, x, y, w, h, title, address = '', outside = false) => {
     const group = svg('g', { class: `node ${selection === id ? 'selected' : ''} ${outside ? 'outside' : ''}`, role: 'button', tabindex: '0', 'aria-label': title, 'aria-pressed': String(selection === id) });
-    group.append(svg('title', {}, `${title}${address ? ` · ${address}` : ''}`), svg('rect', { x, y: at, width, height, rx: 10 }));
-    group.append(svg('text', { x: x + 11, y: at + (address ? compact ? 14 : 19 : compact ? 22 : 28) }, title.length > 24 ? `${title.slice(0, 22)}…` : title));
-    if (address) group.append(svg('text', { x: x + 11, y: at + (compact ? 27 : 35), class: 'address' }, address));
+    group.append(svg('title', {}, [title, address].filter(Boolean).join(' · ')), svg('rect', { x, y, width: w, height: h, rx: 8 }));
+    const subtitle = h >= 36 && address;
+    const limit = Math.floor((w - 22) / 7.5);
+    const label = title.length > limit ? `${title.slice(0, limit - 1)}…` : title;
+    group.append(svg('text', { x: x + 10, y: y + (subtitle ? 16 : h / 2 + 4) }, label));
+    if (subtitle) group.append(svg('text', { x: x + 10, y: y + 31, class: 'address' }, address.length > limit ? `${address.slice(0, limit - 1)}…` : address));
     group.onclick = () => select(id);
     group.onkeydown = (event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); select(id); } };
     map.append(group);
   };
-  wire(`M160 ${y(310)} L230 ${y(310)}`, shown.activity.length ? 'hot' : '');
-  node('workstation', 30, 287, 130, 'workstation', hostStatus?.addresses[0] || '10.0.0.2');
-  node('router', 230, 287, 112, 'router', '10.0.0.1');
-  const last = shown.activity.at(-1);
-  const externalHosts = new Set(shown.connections.map((row) => row.host));
-  const providerHosts = new Set(shown.calls.map((call) => call.host));
-  const sites = shown.sites.filter((site) => !externalHosts.has(site.host) && !providerHosts.has(site.host)).sort((a, b) => b.at_ms - a.at_ms);
-  const visible = sites.slice(0, 3);
+  const sites = localSites().sort((a, b) => b.at_ms - a.at_ms);
+  const count = Math.max(0, Math.min(3, Math.floor((bottom - top - 34) / 44) - 4));
+  const visible = sites.slice(0, count);
   const selectedHost = selection?.startsWith('site:') ? selection.slice(5) : selection?.startsWith('page:') ? hostOf(selection.slice(5)) : null;
   const selected = sites.find((site) => site.host === selectedHost);
-  if (selected && !visible.includes(selected)) visible.splice(2, 1, selected);
-  const services = [{ id: 'dns', title: 'DNS', address: '10.0.0.1:53', y: 70 }, ...visible.map((site, i) => ({ id: `site:${site.host}`, title: site.host, address: site.address || '', y: 132 + i * 62 }))];
-  if (sites.length > 3) services.push({ id: 'sites', title: 'All sites ›', y: 318 });
-  services.push({ id: 'calls', title: 'model gateway', y: 380 }, { id: 'signin', title: 'sign-in', address: shown.signin ? shown.signin.fact.open ? 'Open' : 'Closed' : '', y: 442 }, { id: 'mirror', title: 'package mirror', y: 504 });
-  for (const service of services) {
+  if (selected && !visible.includes(selected)) visible.splice(Math.max(0, count - 1), 1, selected);
+  const services = [{ id: 'dns', title: 'DNS', address: '10.0.0.1:53' }, ...visible.map((site) => ({ id: `site:${site.host}`, title: site.host, address: site.address || '' })), { id: 'sites', title: 'All sites ›' }, { id: 'calls', title: 'model gateway' }, { id: 'signin', title: 'sign-in', address: shown.signin ? shown.signin.fact.open ? 'Open' : 'Closed' : '' }];
+  const step = Math.min(48, (bottom - top - 34) / services.length), nodeHeight = step - 6;
+  const first = top + 30, routerY = (top + bottom) / 2 - 4;
+  wire(`M139 58 V${routerY + 20}`, shown.activity.length ? 'hot' : '');
+  node('workstation', 64, 18, 150, 40, 'workstation', hostStatus?.addresses[0] || '10.0.0.2');
+  node('router', 30, routerY, 110, 40, 'router', '10.0.0.1');
+  const last = shown.activity.at(-1), positions = new Map([['router', routerY + 20]]);
+  for (const [index, service] of services.entries()) {
+    const y = first + index * step, middle = y + nodeHeight / 2;
+    positions.set(service.id, middle);
     const hot = last && ((service.id === 'calls' && ['model_call', 'tool'].includes(last.fact.kind)) || service.id === `site:${last.fact.host}` || (service.id === 'dns' && last.fact.kind === 'resolved'));
-    wire(`M342 ${y(310)} C390 ${y(310)},390 ${y(service.y) + (compact ? 17 : 23)},445 ${y(service.y) + (compact ? 17 : 23)}`, hot ? 'hot' : '', hot && newData);
-    node(service.id, 445, service.y, 274, service.title, service.address);
+    wire(`M140 ${routerY + 20} C153 ${routerY + 20},151 ${middle},164 ${middle}`, hot ? 'hot' : '', hot && newData);
+    node(service.id, 164, y, width - 204, nodeHeight, service.title, service.address);
   }
-  const destinations = [...externalHosts].sort();
-  for (const [i, host] of destinations.slice(0, 7).entries()) {
+  const visibleDestinations = destinations.slice(-2);
+  const selectedDestination = selection?.startsWith('egress:') ? selection.slice(7) : upstream?.host;
+  if (destinations.includes(selectedDestination) && !visibleDestinations.includes(selectedDestination)) visibleDestinations[0] = selectedDestination;
+  const internetLabel = svg('text', { x: 26, y: internet + (destinations.length ? 23 : 38), class: 'map-label internet-label', role: 'button', tabindex: '0', 'aria-label': 'Internet' }, 'INTERNET ›');
+  internetLabel.onclick = () => select('egress');
+  internetLabel.onkeydown = (event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); select('egress'); } };
+  map.append(internetLabel);
+  for (const [index, host] of visibleDestinations.entries()) {
+    const nodeWidth = (width - 52 - 12 * (visibleDestinations.length - 1)) / visibleDestinations.length;
+    const x = 26 + index * (nodeWidth + 12);
     const purposes = [...new Set(shown.connections.filter((row) => row.host === host).map((row) => row.purpose))];
-    const top = 76 + i * 65;
-    const sources = [...new Set(purposes.map((purpose) => purpose === 'setup' ? 504 : ['sign-in', 'token refresh'].includes(purpose) ? 442 : 380))];
-    const active = live && upstream?.host === host;
-    for (const source of sources) {
-      const from = y(source) + (compact ? 17 : 23), to = y(top) + (compact ? 17 : 23);
-      wire(`M719 ${from} C753 ${from},750 ${to},790 ${to}`, active ? 'outside observed hot' : 'outside observed', active);
+    for (const source of new Set(purposes.map((purpose) => purpose === 'setup' ? 'router' : ['model', 'page writer'].includes(purpose) ? 'calls' : 'signin'))) {
+      const active = live && upstream?.host === host;
+      wire(`M${source === 'router' ? 140 : width - 40} ${positions.get(source)} H${width - 25} V${internet + 58} H${x + nodeWidth}`, active ? 'outside observed hot' : 'outside observed', active);
     }
-    node(`egress:${host}`, 790, top, 177, host, purposes.join(' · '), true);
+    node(`egress:${host}`, x, internet + 36, nodeWidth, 44, host, purposes.join(' · '), true);
   }
-  if (destinations.length > 7) node('egress', 790, 531, 177, 'All connections ›', '', true);
-  if (!destinations.length) map.append(svg('text', { x: 795, y: y(105), class: 'map-empty' }, 'No connections'));
+  if (!destinations.length) map.append(svg('text', { x: 150, y: internet + 38, class: 'map-empty' }, 'No connections'));
   const refusal = shown.activity.filter((row) => row.fact.kind === 'no_route').at(-1);
   if (refusal) {
-    wire(`M286 ${y(333)} L286 ${y(510)}`, 'no-route');
-    map.append(svg('circle', { cx: 286, cy: y(520), r: 10, class: 'refusal' }), svg('path', { d: `M282 ${y(516)} L290 ${y(524)} M290 ${y(516)} L282 ${y(524)}`, class: 'refusal-cross' }), svg('text', { x: 230, y: y(553), class: 'map-refusal' }, refusal.fact.to));
+    const y = bottom - 25;
+    wire(`M85 ${routerY + 40} V${y - 18}`, 'no-route');
+    map.append(svg('circle', { cx: 85, cy: y - 12, r: 7, class: 'refusal' }), svg('path', { d: `M82 ${y - 15} L88 ${y - 9} M88 ${y - 15} L82 ${y - 9}`, class: 'refusal-cross' }), svg('text', { x: 30, y: bottom - 8, class: 'map-refusal' }, refusal.fact.to));
   }
 }
+new ResizeObserver(() => graph(null, false)).observe($('map').parentElement);
 
+const briefPath = (path) => path.split('?')[0];
 function activityText(row) {
   const fact = row.fact;
   switch (fact.kind) {
     case 'resolved': return [fact.name, 'DNS', `${fact.name} → ${fact.address || 'no answer'}`, `site:${fact.name}`];
-    case 'request': return [fact.host, 'HTTP', `${fact.method} ${fact.path} · ${fact.status}`, `site:${fact.host}`];
+    case 'request': return [fact.host, 'HTTP', `${fact.method} ${briefPath(fact.path)} · ${fact.status}`, `site:${fact.host}`];
     case 'search': return [{google:'www.google.com',bing:'www.bing.com',duck_duck_go:'html.duckduckgo.com',you_tube:'www.youtube.com'}[fact.engine] || 'Search', 'Search', fact.query, 'sites'];
-    case 'model_call': return [fact.host, 'HTTPS', `${fact.method} ${fact.path} · ${fact.status || 'connecting'}${fact.phase === 'streaming' ? ' · streaming' : ''}`, 'calls'];
+    case 'model_call': return [fact.host, 'HTTPS', `${fact.method} ${briefPath(fact.path)} · ${fact.status || 'connecting'}${fact.phase === 'streaming' ? ' · streaming' : ''}`, 'calls'];
     case 'tool': return ['model gateway', 'Tool', `${fact.tool === 'fetch' ? 'Fetch' : 'web_search'} · ${fact.target}`, 'calls'];
     case 'signin': return ['Sign-in', 'Policy', fact.open ? 'Opened sign-in' : ['Closed sign-in', fact.exceptions.join(', ')].filter(Boolean).join(' · '), 'signin'];
-    case 'egress': return [fact.host, 'Upstream', `${fact.purpose} · ${fact.method} ${fact.path} · ${fact.status || fact.phase}`, `egress:${fact.host}`];
+    case 'egress': return [fact.host, 'Upstream', `${fact.purpose} · ${fact.method} ${briefPath(fact.path)} · ${fact.status || fact.phase}`, `egress:${fact.host}`];
     case 'observation_failed': return ['Recording', 'Error', fact.reason, 'egress'];
     case 'no_route': return [fact.to, 'TCP', 'no route', 'router'];
     default: return ['', '', '', 'router'];
@@ -138,7 +156,7 @@ function activityText(row) {
 function feed() {
   const atBottom = $('activity').scrollHeight - $('activity').scrollTop - $('activity').clientHeight < 24;
   $('activity').replaceChildren();
-  for (const row of shown.activity.filter((r) => r.fact.kind !== 'run_started' && !(r.fact.kind === 'egress' && r.fact.purpose === 'model')).slice(-100)) {
+  for (const row of activityRows().filter((r) => r.fact.kind !== 'run_started' && !(r.fact.kind === 'egress' && r.fact.purpose === 'model')).slice(-100)) {
     const [target, protocol, text, selected] = activityText(row);
     const item = button('', () => select(selected), `activity-row ${row.fact.kind}`);
     item.append(element('span', stamp(row.at_ms), 'stamp'), element('span', target), element('span', protocol), element('span', text));
@@ -149,6 +167,16 @@ function feed() {
   if (world?.preview) {
     $('preview-output').textContent = latest.activity.filter((r) => r.fact.kind !== 'run_started').slice(-10).map((r) => { const [host, protocol, text] = activityText(r); return `${protocol}  ${host}\n  ${text}`; }).join('\n\n');
   }
+}
+function activityRows() {
+  const attempts = new Map();
+  return shown.activity.filter((row) => {
+    if (row.fact.kind !== 'no_route') return true;
+    const key = `${row.fact.from}:${row.fact.to}`, previous = attempts.get(key);
+    if (previous !== undefined && row.at_ms - previous <= 8000) return false;
+    attempts.set(key, row.at_ms);
+    return true;
+  });
 }
 function detailRow(at, label, meta, content) {
   const row = element('div', undefined, 'detail-row');
@@ -168,6 +196,7 @@ function requestFor(url) {
 }
 function results(hits) {
   const list = element('div');
+  if (!hits.length) list.append(element('p', 'No results', 'world-answer'));
   for (const hit of hits) {
     const opened = requestFor(hit.url);
     const row = button('', () => select(`page:${hit.url}`), `result ${opened ? 'opened' : 'unopened'}`);
@@ -222,7 +251,10 @@ function details() {
       summary.append(element('div', `${call.host} · ${call.method} ${call.path}`, 'label'), element('div', `${call.status || ''} ${call.phase}`, 'meta'));
       content.append(summary);
       for (const tool of call.tools) {
-        content.append(element('p', tool.tool === 'fetch' ? 'Fetch' : 'Web search', 'meta'), element('p', tool.target, 'tool-query'), element('p', tool.error || 'World answer', 'world-answer'), results(tool.results));
+        content.append(element('p', tool.tool === 'fetch' ? 'Fetch' : 'Web search', 'meta'), element('p', tool.target, 'tool-query'));
+        if (tool.error) content.append(element('p', tool.error, 'world-answer'));
+        else if (tool.tool === 'web_search') content.append(results(tool.results));
+        else content.append(element('p', 'World answer', 'world-answer'));
       }
       const row = element('div', undefined, 'detail-row'); row.append(element('span', stamp(call.at_ms), 'stamp'), content); body.append(row);
     }
@@ -270,10 +302,10 @@ function details() {
       const row = element('div', undefined, 'detail-row'); row.append(element('span', stamp(request.at_ms), 'stamp'), content); body.append(row);
     }
     if (!site?.requests.length && !site?.searches.length) body.append(element('p', 'Unopened', 'detail-empty'));
-  } else if (['egress', 'signin', 'mirror'].includes(selection) || selection.startsWith('egress:')) {
-    const accepts = (row) => selection === 'mirror' ? row.purpose === 'setup' : selection === 'signin' ? ['sign-in', 'token refresh', 'account', 'startup'].includes(row.purpose) : selection.startsWith('egress:') ? row.host === selection.slice(7) : true;
-    const connections = shown.connections.filter(accepts), egress = shown.egress.filter((row) => accepts(row.fact));
-    heading(selection === 'mirror' ? 'Packages' : selection === 'signin' ? 'Sign-in' : selection.startsWith('egress:') ? selection.slice(7) : 'Internet');
+  } else if (['egress', 'signin'].includes(selection) || selection.startsWith('egress:')) {
+    const accepts = (row) => selection === 'signin' ? ['sign-in', 'token refresh', 'account', 'startup'].includes(row.purpose) : selection.startsWith('egress:') ? row.host === selection.slice(7) : true;
+    const connections = shown.connections.filter(accepts), egress = shown.egress.filter((row) => accepts(row.fact) && row.fact.phase !== 'attempt');
+    heading(selection === 'signin' ? 'Sign-in' : selection.startsWith('egress:') ? selection.slice(7) : 'Internet');
     if (shown.signin && ['signin', 'egress'].includes(selection)) {
       body.append(detailRow(shown.signin.at_ms, shown.signin.fact.open ? 'Sign-in open' : 'Sign-in closed', ''));
       const exceptions = element('details', undefined, 'exceptions');
@@ -286,16 +318,16 @@ function details() {
     if (!connections.length && !egress.length) body.append(element('p', 'No connections', 'detail-empty'));
   } else if (selection === 'sites') {
     heading('Sites');
-    for (const site of shown.sites) {
+    for (const site of localSites()) {
       const row = button(site.host, () => select(`site:${site.host}`), 'site-list'); row.append(element('small', site.address || '')); body.append(row);
     }
-    if (!shown.sites.length) body.append(element('p', 'No sites', 'detail-empty'));
+    if (!localSites().length) body.append(element('p', 'No sites', 'detail-empty'));
   } else if (selection === 'dns') {
     heading('DNS', '10.0.0.1:53');
     for (const row of shown.activity.filter((row) => row.fact.kind === 'resolved')) body.append(detailRow(row.at_ms, row.fact.name, row.fact.address || 'No answer'));
   } else if (selection === 'router') {
     heading('Router', '10.0.0.1');
-    for (const row of shown.activity.filter((row) => row.fact.kind === 'no_route')) body.append(detailRow(row.at_ms, row.fact.to, 'No route'));
+    for (const row of activityRows().filter((row) => row.fact.kind === 'no_route')) body.append(detailRow(row.at_ms, row.fact.to, 'No route'));
   } else {
     heading('Workstation', hostStatus?.addresses.join(' · ') || '10.0.0.2');
     actions.append(button('Show agent', () => { select(null); $('agent').hidden = false; $('agent-toggle').setAttribute('aria-pressed', 'true'); }));
