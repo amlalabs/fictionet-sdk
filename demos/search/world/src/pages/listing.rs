@@ -95,17 +95,6 @@ impl Pages {
         if self.copied_only() {
             return self.copied_listing_in(query, start, domains);
         }
-        // Search results establish shared facts before independent pages read them.
-        let _publication = if self.interactive {
-            Some(
-                self.locks
-                    .lock(cx, "search publications".into())
-                    .await
-                    .map_err(Stop::store)?,
-            )
-        } else {
-            None
-        };
         let mut key = if engine == Engine::YouTube {
             format!("youtube {}", query_key(query, start))
         } else {
@@ -355,6 +344,18 @@ impl Pages {
             .await?;
         let mut search = made.fields;
         make::finish_listing(&mut search);
+        // Lists are written side by side; each publishes its promises whole,
+        // after the lists before it, so a page reads one settled set of facts.
+        let _publication = if self.interactive {
+            Some(
+                self.locks
+                    .lock(cx, "search publications".into())
+                    .await
+                    .map_err(Stop::store)?,
+            )
+        } else {
+            None
+        };
         let mut results: Vec<fictionet_extras::search::Result> = Vec::new();
         for mut r in std::mem::take(&mut search.results) {
             let (host, target) = text::target_of(&r.url);
