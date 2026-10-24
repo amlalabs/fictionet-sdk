@@ -80,6 +80,10 @@ All coverage of one event must agree on its date, location, organization and
 numbers, including across different sites. Distinguish publication dates from
 event dates. Search snippets establish these facts before any page is opened.
 Use earlier published text as binding context even when it has no explicit claims.
+For a specific incident or case study, identify the subject, organization, place
+and event date in the search snippets and the first substantive article. When
+the brief leaves specifics open, establish them once and carry them forward.
+Avoid generic coverage of an unnamed facility, company or investigation.
 Do not introduce a second incompatible timeline or leave an established identity vague.
 Use public site domains, never reserved example domains or special-use hostnames. A page must
 fulfil what its search result and incoming anchor promised. Do not discuss the

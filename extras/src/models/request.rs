@@ -19,7 +19,7 @@ pub(super) struct Envelope {
     system: Option<Content>,
     #[serde(skip_serializing_if = "Option::is_none")]
     contents: Option<Content>,
-    #[serde(alias = "systemInstruction")]
+    #[serde(rename = "systemInstruction", alias = "system_instruction")]
     #[serde(skip_serializing_if = "Option::is_none")]
     system_instruction: Option<Content>,
     #[serde(skip_serializing_if = "Option::is_none")]
