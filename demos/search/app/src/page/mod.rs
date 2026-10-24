@@ -297,7 +297,7 @@ impl Views {
         }
         view
     }
-    pub fn preview(&self, url: &url::Url, at_ms: u64) -> Option<Arc<str>> {
+    pub fn preview(&self, url: &url::Url, at_ms: u64) -> Option<web_world::pages::PageBody> {
         self.observations
             .iter()
             .rev()
@@ -603,13 +603,23 @@ impl Page {
                         )) else {
                             return http::StatusCode::BAD_REQUEST.into_response();
                         };
-                        match page.views.lock().unwrap().preview(&url, query.at_ms) {
-                            Some(markup) => (
-                                http::StatusCode::OK,
-                                [(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-                                markup.to_string(),
-                            )
-                                .into_response(),
+                        let body = page.views.lock().unwrap().preview(&url, query.at_ms);
+                        match body {
+                            Some(body) => {
+                                match tokio::task::spawn_blocking(move || body.text()).await {
+                                    Ok(Ok(markup)) => (
+                                        http::StatusCode::OK,
+                                        [(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                                        markup.to_string(),
+                                    )
+                                        .into_response(),
+                                    _ => (
+                                        http::StatusCode::INTERNAL_SERVER_ERROR,
+                                        "Recorded page could not be read",
+                                    )
+                                        .into_response(),
+                                }
+                            }
                             None => (
                                 http::StatusCode::NOT_FOUND,
                                 "No recorded page at this point in the run",

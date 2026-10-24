@@ -2,10 +2,11 @@
 
 use crate::{search, warc};
 use kuchiki::traits::TendrilSink;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 /// A page's searchable representation.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 struct Document {
     url: String,
     title: String,
@@ -14,7 +15,7 @@ struct Document {
 }
 
 /// An in memory inverted index. No predetermined queries or result lists.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Index {
     documents: Vec<Document>,
     postings: HashMap<String, Vec<(usize, usize)>>,
@@ -28,6 +29,34 @@ fn terms(text: &str) -> Vec<String> {
         .collect()
 }
 
+fn search_key(value: &str) -> String {
+    let mut url = url::Url::parse(value).expect("HTTP URL");
+    let query: Vec<_> = url
+        .query_pairs()
+        .filter(|(key, _)| !key.starts_with("utm_"))
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    url.set_query(None);
+    if !query.is_empty() {
+        url.query_pairs_mut().extend_pairs(query);
+    }
+    // ATT&CK publishes historical snapshots under this archive namespace.
+    // Search groups those editions while replay keeps every original URL.
+    if url.host_str() == Some("attack.mitre.org") {
+        let path = url.path().to_owned();
+        if let Some(rest) = path.strip_prefix("/versions/")
+            && let Some((version, current)) = rest.split_once('/')
+            && version
+                .strip_prefix('v')
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        {
+            url.set_path(&format!("/{current}"));
+        }
+    }
+    url.set_fragment(None);
+    url.into()
+}
+
 impl Index {
     /// Follow links from the starting URLs, fetching only URLs in the corpus.
     /// `fetch` must be the same response handler used to serve copied sites.
@@ -38,6 +67,8 @@ impl Index {
     ) -> std::io::Result<Self> {
         let mut index = Self::default();
         let mut seen = HashSet::new();
+        let mut indexed = std::collections::BTreeMap::<String, (String, String, String)>::new();
+        let mut contents = HashSet::new();
         let mut pending: VecDeque<_> = seeds.iter().filter_map(|s| warc::key(s)).collect();
         while let Some(url) = pending.pop_front() {
             if !contains(&url) || !seen.insert(url.clone()) {
@@ -93,6 +124,33 @@ impl Index {
                     }
                 }
             }
+            // Navigation still reaches article links from profiles and noindex pages.
+            // Their surrounding text does not make them topical search documents.
+            let excluded = dom
+                .select(r#"meta[property="og:type"], meta[name=robots]"#)
+                .unwrap()
+                .any(|node| {
+                    node.attributes
+                        .borrow()
+                        .get("content")
+                        .is_some_and(|content| {
+                            content.eq_ignore_ascii_case("profile")
+                                || content
+                                    .split([',', ' '])
+                                    .any(|part| part.eq_ignore_ascii_case("noindex"))
+                        })
+                });
+            if excluded {
+                continue;
+            }
+            let canonical = dom
+                .select_first("link[rel=canonical][href]")
+                .ok()
+                .and_then(|node| base.join(node.attributes.borrow().get("href")?).ok())
+                .filter(|canonical| canonical.origin() == base.origin())
+                .map(|canonical| canonical.to_string())
+                .unwrap_or_else(|| url.clone());
+            let identity = search_key(&canonical);
             let title = dom
                 .select_first("title")
                 .ok()
@@ -121,7 +179,29 @@ impl Index {
                 .split_whitespace()
                 .collect::<Vec<_>>()
                 .join(" ");
-            index.add(url, title.trim().to_owned(), text);
+            let title = title.trim().to_owned();
+            let candidate = (url, title, text);
+            let priority = |value: &str| (value != search_key(value), value.to_owned());
+            match indexed.entry(identity) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(candidate);
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    if priority(&candidate.0) < priority(&entry.get().0) {
+                        entry.insert(candidate);
+                    }
+                }
+            }
+        }
+        for (_, (url, title, text)) in indexed {
+            let digest: [u8; 32] =
+                ring::digest::digest(&ring::digest::SHA256, format!("{title}\0{text}").as_bytes())
+                    .as_ref()
+                    .try_into()
+                    .expect("SHA256 digest");
+            if contents.insert(digest) {
+                index.add(url, title, text);
+            }
         }
         Ok(index)
     }
@@ -156,7 +236,7 @@ impl Index {
         self.documents.is_empty()
     }
 
-    /// Rank by query coverage, then BM25, using URL order to break ties.
+    /// Rank by BM25, using query coverage and URL order to break ties.
     /// A majority of the distinct terms must match so a shared word cannot
     /// fill a result page for an unrelated query.
     pub fn search(&self, query: &str, start: usize, limit: usize) -> search::Search {
@@ -193,8 +273,8 @@ impl Index {
             })
             .collect();
         ranked.sort_by(|(a, ac, x), (b, bc, y)| {
-            bc.cmp(ac)
-                .then_with(|| y.total_cmp(x))
+            y.total_cmp(x)
+                .then_with(|| bc.cmp(ac))
                 .then(self.documents[*a].url.cmp(&self.documents[*b].url))
         });
         search::Search {
@@ -245,6 +325,90 @@ impl Index {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_groups_page_editions_and_tracking_variants_without_merging_distinct_paths() {
+        let pages = HashMap::from([
+            (
+                "https://source.org/article?utm_source=feed",
+                "<title>Attack</title><main>Supply chain attack</main>",
+            ),
+            (
+                "https://source.org/article",
+                "<title>Attack</title><main>Supply chain attack</main>",
+            ),
+            (
+                "https://source.org/print",
+                "<link rel=canonical href='/article'><title>Attack</title><main>Supply chain attack printer edition</main>",
+            ),
+            (
+                "https://attack.mitre.org/versions/v20/techniques/T1195/",
+                "<title>Supply Chain Compromise</title><p>Supply chain attack old edition</p>",
+            ),
+            (
+                "https://attack.mitre.org/techniques/T1195/",
+                "<title>Supply Chain Compromise</title><p>Supply chain attack current edition</p>",
+            ),
+            (
+                "https://source.org/person",
+                "<meta property='og:type' content='profile'><title>Researcher</title><main>Supply chain attack researcher</main>",
+            ),
+            (
+                "https://source.org/private",
+                "<meta name=robots content='noindex, follow'><title>Private</title><p>Supply chain attack notes</p>",
+            ),
+            (
+                "https://source.org/Case",
+                "<title>Case</title><main>Supply chain attack uppercase identity</main>",
+            ),
+            (
+                "https://source.org/case",
+                "<title>case</title><main>Supply chain attack lowercase identity</main>",
+            ),
+            (
+                "https://source.org/article?edition=2",
+                "<title>New attack</title><main>Supply chain attack new edition</main>",
+            ),
+        ]);
+        let mut seeds: Vec<_> = pages.keys().map(|url| url.to_string()).collect();
+        seeds.sort();
+        let index = Index::crawl(
+            &seeds,
+            |url| pages.contains_key(url),
+            |url| {
+                Ok(Some(warc::Response {
+                    status: http::StatusCode::OK,
+                    headers: HeaderMap::from_iter([(
+                        http::header::CONTENT_TYPE,
+                        "text/html".parse().unwrap(),
+                    )]),
+                    body: pages[url].into(),
+                }))
+            },
+        )
+        .unwrap();
+        let found = index.search("supply chain attack", 0, 20);
+        assert_eq!(found.total, Some(5));
+        let urls: HashSet<_> = found.results.iter().map(|hit| hit.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            HashSet::from([
+                "https://source.org/article",
+                "https://source.org/article?edition=2",
+                "https://attack.mitre.org/techniques/T1195/",
+                "https://source.org/Case",
+                "https://source.org/case",
+            ])
+        );
+        assert!(
+            index
+                .search("dishwasher astronomy", 0, 10)
+                .results
+                .is_empty()
+        );
+        let decoded: Index = serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
+        assert_eq!(decoded.search("supply chain attack", 0, 20), found);
+    }
 
     #[test]
     fn unrelated_queries_are_empty_and_totals_precede_pagination() {

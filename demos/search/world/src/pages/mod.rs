@@ -26,6 +26,7 @@ pub mod seed;
 pub mod store;
 pub mod text;
 
+pub use copied::PageBody;
 pub use meta::Meta;
 pub use seed::Seed;
 
@@ -465,7 +466,7 @@ pub struct Pages {
     live_calls: Option<Arc<std::sync::atomic::AtomicUsize>>,
     store: Mutex<Store>,
     writing: Mutex<tokio::sync::watch::Sender<bool>>,
-    copied: Option<copied::Corpus>,
+    copied: Option<Arc<copied::Corpus>>,
     copied_active: std::sync::atomic::AtomicBool,
     live: Option<Arc<live::Live>>,
     live_active: std::sync::atomic::AtomicBool,

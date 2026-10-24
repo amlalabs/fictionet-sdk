@@ -4333,6 +4333,7 @@ dependencies = [
  "idna",
  "percent-encoding",
  "serde",
+ "serde_derive",
 ]
 
 [[package]]
@@ -4887,6 +4888,8 @@ dependencies = [
  "fictionet-demo",
  "fictionet-extras",
  "http",
+ "libc",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",

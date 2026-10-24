@@ -43,7 +43,7 @@ pub enum SearchObs {
         #[serde(serialize_with = "crate::observation::headers")]
         headers: HeaderMap,
         #[serde(skip)]
-        preview: Option<std::sync::Arc<str>>,
+        preview: Option<crate::pages::PageBody>,
     },
     Search {
         engine: Engine,
@@ -335,20 +335,35 @@ impl Pages {
         }
         // Copied bytes retain their capture provenance; they are not called written pages.
         let preview = if response.content_type.starts_with("text/") {
-            let decoded = response.stored_headers.as_ref().and_then(|headers| {
-                fictionet_extras::warc::Response {
-                    status: http::StatusCode::from_u16(response.status).ok()?,
-                    headers: headers.clone(),
-                    body: response.body.clone().into(),
-                }
-                .decoded()
-                .ok()
-            });
-            let bytes = decoded.as_deref().unwrap_or(&response.body);
-            let text = String::from_utf8_lossy(bytes);
-            Some(std::sync::Arc::from(
-                &text[..text.floor_char_boundary(text.len().min(64 << 10))],
-            ))
+            response
+                .stored_headers
+                .as_ref()
+                .and_then(|_| {
+                    self.copied_body(format!(
+                        "{scheme}://{}{path}",
+                        host.to_ascii().trim_end_matches('.')
+                    ))
+                })
+                .or_else(|| {
+                    let decoded = response
+                        .stored_headers
+                        .as_ref()
+                        .map(|headers| {
+                            fictionet_extras::warc::Response {
+                                status: http::StatusCode::from_u16(response.status)
+                                    .expect("valid response status"),
+                                headers: headers.clone(),
+                                body: response.body.clone().into(),
+                            }
+                            .decoded()
+                        })
+                        .transpose()
+                        .ok()?;
+                    let bytes = decoded.as_deref().unwrap_or(&response.body);
+                    Some(crate::pages::PageBody::from(std::sync::Arc::<str>::from(
+                        String::from_utf8_lossy(bytes).as_ref(),
+                    )))
+                })
         } else {
             None
         };

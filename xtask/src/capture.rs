@@ -1,7 +1,9 @@
 //! Capture the research web and Python distributions at their original URLs.
 
+mod render;
+
 use crate::Result;
-use fictionet_extras::{capture::BROWSER, warc::Archive};
+use fictionet_extras::{capture, warc::Archive};
 use serde::Deserialize;
 use std::{
     collections::{BTreeSet, HashSet},
@@ -53,13 +55,34 @@ const REPOSITORIES: &[(&str, &str)] = &[
 
 struct Batch(std::path::PathBuf);
 
+#[derive(Clone, Copy)]
+enum Material {
+    Page,
+    Distribution,
+}
+
+impl Material {
+    fn bytes(self) -> usize {
+        match self {
+            Self::Page => fictionet_extras::warc::Response::DECODED_BYTES,
+            Self::Distribution => 256 * 1024 * 1024,
+        }
+    }
+}
+
 impl Drop for Batch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
-async fn wget(root: &Path, name: &str, urls: &[String], requisites: bool) -> Result {
+async fn capture_cached(
+    root: &Path,
+    name: &str,
+    urls: &[String],
+    requisites: bool,
+    material: Material,
+) -> Result {
     std::fs::create_dir_all(root)?;
     let archive = if std::fs::read_dir(root)?
         .any(|entry| entry.is_ok_and(|entry| entry.path().to_string_lossy().ends_with(".warc.gz")))
@@ -83,10 +106,16 @@ async fn wget(root: &Path, name: &str, urls: &[String], requisites: bool) -> Res
             pending.push(url.clone());
         }
     }
-    download(root, name, &pending, requisites).await
+    download(root, name, &pending, requisites, material).await
 }
 
-async fn download(root: &Path, name: &str, urls: &[String], requisites: bool) -> Result {
+async fn download(
+    root: &Path,
+    name: &str,
+    urls: &[String],
+    requisites: bool,
+    material: Material,
+) -> Result {
     if urls.is_empty() {
         return Ok(());
     }
@@ -96,67 +125,88 @@ async fn download(root: &Path, name: &str, urls: &[String], requisites: bool) ->
     let staging = Batch(root.join(format!(".download-{}-{batch}", std::process::id())));
     std::fs::create_dir_all(&staging.0)?;
     let prefix = staging.0.join(format!("{name}-{batch}"));
-    let log = prefix.with_extension("log");
-    let mut command = Command::new("wget");
-    command.kill_on_drop(true).args([
-        "--compression=auto",
-        "--delete-after",
-        "--content-on-error",
-        "--inet4-only",
-        "--no-http-keep-alive",
-        "--timeout=20",
-        "--tries=2",
-        "--header=Accept: text/html",
-        "--user-agent",
-        BROWSER,
-    ]);
-    if requisites {
-        command.args(["--page-requisites", "--span-hosts"]);
-    }
-    let mut child = command
-        .arg(format!("--warc-file={}", prefix.display()))
-        .arg(format!(
-            "--directory-prefix={}",
-            prefix.with_extension("files").display()
-        ))
-        .arg(format!("--output-file={}", log.display()))
-        .args(urls)
-        .spawn()?;
-    let deadline = std::time::Duration::from_secs((60 * urls.len() as u64).min(180));
-    let status = match tokio::time::timeout(deadline, child.wait()).await {
-        Ok(status) => status?,
-        Err(_) => {
-            child.kill().await?;
-            std::fs::rename(&log, root.join(log.file_name().unwrap()))?;
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "capture exceeded its deadline",
-            )
-            .into());
+    let path = prefix.with_extension("warc.gz");
+    let mut archive = Archive::default();
+    let mut pending = urls
+        .iter()
+        .cloned()
+        .map(|url| (url, 0, 0))
+        .collect::<std::collections::VecDeque<_>>();
+    let mut seen = HashSet::new();
+    while let Some((url, redirects, depth)) = pending.pop_front() {
+        if !seen.insert(url.clone()) {
+            continue;
         }
-    };
-    let published_log = root.join(log.file_name().unwrap());
-    std::fs::rename(&log, &published_log)?;
-    // Optional page assets and missing-page captures may return HTTP errors.
-    // Required documents and distributions are verified from the archive below.
-    if !status.success() && !matches!(status.code(), Some(4..=8)) {
-        return Err(format!("wget failed: {status}; see {}", published_log.display()).into());
+        if seen.len() > 2048 {
+            return Err("capture exceeds URL limit".into());
+        }
+        let destination = url::Url::parse(&url)?;
+        let response = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            let client = {
+                #[cfg(test)]
+                if destination.host_str().is_some_and(|host| {
+                    host.parse::<std::net::IpAddr>()
+                        .is_ok_and(|ip| ip.is_loopback())
+                }) {
+                    reqwest::Client::builder()
+                        .no_proxy()
+                        .redirect(reqwest::redirect::Policy::none())
+                        .build()
+                        .map_err(std::io::Error::other)?
+                } else {
+                    capture::client(&destination).await?
+                }
+                #[cfg(not(test))]
+                capture::client(&destination).await?
+            };
+            let response = client
+                .get(destination.clone())
+                .header("accept-encoding", "identity")
+                .send()
+                .await
+                .map_err(std::io::Error::other)?;
+            let mut response = capture::receive(response, material.bytes()).await?;
+            response.body = response.decoded_with_limit(material.bytes())?.into();
+            response.headers.remove(http::header::CONTENT_ENCODING);
+            response
+                .headers
+                .insert(http::header::CONTENT_LENGTH, response.body.len().into());
+            Ok::<_, std::io::Error>(response)
+        })
+        .await;
+        let response = match response {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                eprintln!("Capture unavailable: {url}: {error}");
+                continue;
+            }
+            Err(_) => {
+                eprintln!("Capture timed out: {url}");
+                continue;
+            }
+        };
+        archive.append(&path, &url, &response)?;
+        if response.status.is_redirection() && redirects < 10 {
+            if let Some(next) = response
+                .headers
+                .get(http::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| destination.join(v).ok())
+            {
+                pending.push_back((next.into(), redirects + 1, depth));
+            }
+        } else if requisites && depth < 8 {
+            match capture::links(&url, &response) {
+                Ok(links) => {
+                    pending.extend(links.assets.into_iter().map(|url| (url, 0, depth + 1)))
+                }
+                Err(error) => eprintln!("Asset discovery unavailable: {url}: {error}"),
+            }
+        }
     }
-    if matches!(status.code(), Some(4..=7)) {
-        eprintln!(
-            "Some downloads were unreachable; required responses will be verified. See {}",
-            published_log.display()
-        );
+    if path.exists() {
+        std::fs::rename(&path, root.join(path.file_name().unwrap()))?;
     }
-    let archive = prefix.with_extension("warc.gz");
-    let captured = Archive::open([archive.clone()])?;
-    for url in captured.urls() {
-        captured
-            .get(url)?
-            .ok_or("missing response body")?
-            .decoded()?;
-    }
-    std::fs::rename(&archive, root.join(archive.file_name().unwrap()))?;
     Ok(())
 }
 
@@ -304,11 +354,12 @@ async fn missing_pages(root: &Path, sources: &[String], required: &[String]) -> 
     }
     match tokio::time::timeout(
         std::time::Duration::from_secs(30),
-        wget(
+        capture_cached(
             root,
             "missing-assets",
             &assets.into_iter().collect::<Vec<_>>(),
             true,
+            Material::Page,
         ),
     )
     .await
@@ -341,7 +392,15 @@ async fn documents(root: &Path, name: &str, urls: &[String]) -> Result {
             let name = name.to_owned();
             let url = url.clone();
             jobs.spawn(async move {
-                match download(&root, &name, std::slice::from_ref(&url), false).await {
+                match download(
+                    &root,
+                    &name,
+                    std::slice::from_ref(&url),
+                    false,
+                    Material::Page,
+                )
+                .await
+                {
                     Err(error)
                         if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
                             matches!(
@@ -364,13 +423,43 @@ async fn documents(root: &Path, name: &str, urls: &[String]) -> Result {
     }
 }
 
+fn github_api(value: &str) -> Option<String> {
+    let url = url::Url::parse(value).ok()?;
+    if url.host_str()? != "github.com" {
+        return None;
+    }
+    let segments: Vec<_> = url
+        .path_segments()?
+        .filter(|part| !part.is_empty())
+        .collect();
+    let [owner, repo, rest @ ..] = segments.as_slice() else {
+        return None;
+    };
+    let suffix = match rest {
+        [] => String::new(),
+        ["commit", sha] => format!("/commits/{sha}"),
+        ["pull", number] if number.bytes().all(|b| b.is_ascii_digit()) => {
+            format!("/pulls/{number}")
+        }
+        ["actions", "runs", number] if number.bytes().all(|b| b.is_ascii_digit()) => {
+            format!("/actions/runs/{number}")
+        }
+        _ => return None,
+    };
+    Some(format!(
+        "https://api.github.com/repos/{owner}/{repo}{suffix}"
+    ))
+}
+
 async fn research(root: &Path, sources: &[String]) -> Result {
     // New batches sort after the original archives to supersede stale errors.
-    wget(root, "zz-research", sources, true).await?;
+    capture_cached(root, "zz-research", sources, true, Material::Page).await?;
+    documents(root, "zz-research", sources).await?;
     let mut archive = Archive::directory(root)?;
     let mut frontier = sources.to_vec();
     let mut seen = HashSet::new();
     let mut origins = BTreeSet::new();
+    let mut api = BTreeSet::new();
     for url in sources {
         verify(&archive, url)?;
     }
@@ -381,9 +470,25 @@ async fn research(root: &Path, sources: &[String]) -> Result {
             origins.insert(url.clone());
             if seen.insert(url.clone()) {
                 match fictionet_extras::capture::references(&url, &response) {
-                    Ok(found) => references.extend(found.into_iter().take(32)),
+                    Ok(found) => {
+                        references.extend(
+                            found
+                                .iter()
+                                .filter(|url| github_api(url).is_some())
+                                .cloned(),
+                        );
+                        references.extend(found.into_iter().take(32));
+                    }
                     Err(error) => eprintln!("Reference discovery unavailable: {url}: {error}"),
                 }
+            }
+        }
+        if references.len() > 8192 {
+            return Err("article references exceed capture page limit".into());
+        }
+        for url in &references {
+            if let Some(endpoint) = github_api(url) {
+                api.insert(endpoint);
             }
         }
         references.retain(|url| !seen.contains(url));
@@ -399,6 +504,19 @@ async fn research(root: &Path, sources: &[String]) -> Result {
         );
         documents(root, "zz-references", &pending).await?;
         archive = Archive::directory(root)?;
+        for reference in &references {
+            let url = url::Url::parse(reference)?;
+            if url.host_str() == Some("nvd.nist.gov")
+                && let Some(cve) = url.path().strip_prefix("/vuln/detail/")
+                && verify(&archive, reference).is_ok()
+                && !capture::title(&captured(&archive, reference)?)?
+                    .to_ascii_lowercase()
+                    .contains(&cve.to_ascii_lowercase())
+            {
+                render::document(root, reference, cve).await?;
+                archive = Archive::directory(root)?;
+            }
+        }
         frontier.clear();
         for url in references {
             if verify(&archive, &url).is_ok() {
@@ -409,6 +527,14 @@ async fn research(root: &Path, sources: &[String]) -> Result {
         }
     }
     origins.extend(frontier);
+    let mut endpoints = api.into_iter().take(32).collect::<Vec<_>>();
+    endpoints.sort();
+    endpoints.dedup();
+    let pending = endpoints
+        .into_iter()
+        .filter(|url| verify(&archive, url).is_err())
+        .collect::<Vec<_>>();
+    documents(root, "zz-github-api", &pending).await?;
     let roots = origins
         .iter()
         .map(|url| {
@@ -441,21 +567,53 @@ fn package_root(root: &Path) -> std::io::Result<std::path::PathBuf> {
     }
 }
 
-fn publish(packages: &Path, destination: &Path) -> Result {
-    std::fs::create_dir_all(destination)?;
-    let name = format!(
-        "batch-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)?
-            .as_nanos()
-    );
-    std::fs::rename(packages, destination.join(&name))?;
-    let pointer = destination.join(format!(".{name}"));
-    std::os::unix::fs::symlink(&name, &pointer)?;
-    std::fs::rename(pointer, destination.join("current"))?;
-    // Published batches remain immutable, including paths held by older worlds.
-    Ok(())
+struct Publication {
+    directory: std::path::PathBuf,
+    destination: std::path::PathBuf,
+    published: bool,
+}
+
+impl Publication {
+    fn prepare(staged: &Path, destination: &Path) -> Result<Self> {
+        std::fs::create_dir_all(destination)?;
+        let name = format!(
+            "batch-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)?
+                .as_nanos()
+        );
+        let directory = destination.join(name);
+        std::fs::rename(staged, &directory)?;
+        Ok(Self {
+            directory,
+            destination: destination.to_owned(),
+            published: false,
+        })
+    }
+
+    fn commit(mut self) -> Result {
+        let name = self.directory.file_name().unwrap();
+        let pointer = self
+            .destination
+            .join(format!(".{}", name.to_string_lossy()));
+        std::os::unix::fs::symlink(name, &pointer)?;
+        std::fs::rename(pointer, self.destination.join("current"))?;
+        self.published = true;
+        Ok(())
+    }
+}
+
+impl Drop for Publication {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
+}
+
+fn publish(staged: &Path, destination: &Path) -> Result {
+    Publication::prepare(staged, destination)?.commit()
 }
 
 pub async fn run(downloads: &Path, python: Option<&Path>) -> Result {
@@ -474,7 +632,8 @@ pub async fn run(downloads: &Path, python: Option<&Path>) -> Result {
     let batch = Batch(downloads.join(format!(".capture-{}-{stamp}", std::process::id())));
     let staged_corpus = batch.0.join(&corpus.directory);
     std::fs::create_dir_all(&staged_corpus)?;
-    for entry in std::fs::read_dir(&root)? {
+    let previous = package_root(&root)?;
+    for entry in std::fs::read_dir(&previous)? {
         let entry = entry?;
         if entry.path().to_string_lossy().ends_with(".warc.gz") {
             let destination = staged_corpus.join(entry.file_name());
@@ -485,10 +644,28 @@ pub async fn run(downloads: &Path, python: Option<&Path>) -> Result {
             }
         }
     }
+    let repositories = REPOSITORIES
+        .iter()
+        .map(|(repo, _)| format!("https://api.github.com/repos/{repo}"))
+        .collect::<Vec<_>>();
+    capture_cached(
+        &staged_corpus,
+        "zz-github-api",
+        &repositories,
+        false,
+        Material::Page,
+    )
+    .await?;
+    let archive = Archive::directory(&staged_corpus)?;
+    for url in &repositories {
+        verify(&archive, url)?;
+    }
     research(&staged_corpus, &corpus.urls).await?;
     if root.join("packages").is_dir() {
         std::os::unix::fs::symlink(root.join("packages"), staged_corpus.join("packages"))?;
     }
+    let publication = Publication::prepare(&staged_corpus, &root)?;
+    std::os::unix::fs::symlink(&publication.directory, &staged_corpus)?;
     let status = Command::new("rustup")
         .args([
             "run",
@@ -500,6 +677,8 @@ pub async fn run(downloads: &Path, python: Option<&Path>) -> Result {
             "web-world",
             "--test",
             "corpus",
+            "--",
+            "--test-threads=1",
         ])
         .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap())
         .env("SEARCH_DOWNLOADS", std::fs::canonicalize(&batch.0)?)
@@ -508,24 +687,22 @@ pub async fn run(downloads: &Path, python: Option<&Path>) -> Result {
     if !status.success() {
         return Err("offline research replay failed".into());
     }
-    for entry in std::fs::read_dir(&staged_corpus)? {
-        let entry = entry?;
-        let path = entry.path();
-        if entry.file_type()?.is_file()
-            && (path.to_string_lossy().ends_with(".warc.gz")
-                || path.extension().is_some_and(|extension| extension == "log"))
-        {
-            let destination = root.join(entry.file_name());
-            std::fs::rename(&path, &destination)?;
-            std::os::unix::fs::symlink(destination, path)?;
-        }
+    // Package pointers are owned separately from the immutable research batch.
+    if staged_corpus.join("packages").is_symlink() {
+        std::fs::remove_file(staged_corpus.join("packages"))?;
     }
+    publication.commit()?;
     let Some(python) = python else {
         println!("Captured research sources in {}", root.display());
         return Ok(());
     };
-    if staged_corpus.join("packages").is_symlink() {
-        std::fs::remove_file(staged_corpus.join("packages"))?;
+    std::fs::remove_file(&staged_corpus)?;
+    std::fs::create_dir_all(&staged_corpus)?;
+    for entry in std::fs::read_dir(package_root(&root)?)? {
+        let entry = entry?;
+        if entry.path().to_string_lossy().ends_with(".warc.gz") {
+            std::os::unix::fs::symlink(entry.path(), staged_corpus.join(entry.file_name()))?;
+        }
     }
     // Resolve packages into an empty batch. Indexes and distributions are
     // published together only after an offline install.
@@ -600,7 +777,14 @@ pub async fn run(downloads: &Path, python: Option<&Path>) -> Result {
             }
         }
     }
-    wget(&packages, "distributions", &urls, false).await?;
+    capture_cached(
+        &packages,
+        "distributions",
+        &urls,
+        false,
+        Material::Distribution,
+    )
+    .await?;
     let sources = Archive::directory(&packages)?
         .urls()
         .map(str::to_owned)
@@ -654,6 +838,145 @@ pub async fn run(downloads: &Path, python: Option<&Path>) -> Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validation_paths_survive_publication_and_failed_batches_stay_private() {
+        let root = Batch(std::env::temp_dir().join(format!(
+                "corpus-validation-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            )));
+        let staged = root.0.join("staged");
+        let destination = root.0.join("corpus");
+        std::fs::create_dir_all(&staged).unwrap();
+        let body = "<title>Source</title><p>complete article</p>";
+        Archive::default()
+            .append(
+                &staged.join("pages.warc.gz"),
+                "https://source.org/article",
+                &fictionet_extras::warc::Response {
+                    status: http::StatusCode::OK,
+                    headers: http::HeaderMap::from_iter([(
+                        http::header::CONTENT_TYPE,
+                        "text/html".parse().unwrap(),
+                    )]),
+                    body: body.into(),
+                },
+            )
+            .unwrap();
+        let publication = Publication::prepare(&staged, &destination).unwrap();
+        let validation_reader = Archive::directory(&publication.directory).unwrap();
+        assert!(!destination.join("current").exists());
+        let seed = web_world::pages::Seed::parse(
+            "capture",
+            "+++\n[corpus]\ndirectory='.'\nurls=['https://source.org/article']\n+++\nResearch",
+            |_| unreachable!(),
+        )
+        .unwrap();
+        web_world::pages::Pages::from_corpus(seed.clone(), &publication.directory, None).unwrap();
+        let cache_path = publication.directory.join("search-index.json");
+        let cached = std::fs::read(&cache_path).unwrap();
+        publication.commit().unwrap();
+        web_world::pages::Pages::from_corpus(seed, &destination, None).unwrap();
+        assert_eq!(std::fs::read(cache_path).unwrap(), cached);
+        assert_eq!(
+            validation_reader
+                .get("https://source.org/article")
+                .unwrap()
+                .unwrap()
+                .body,
+            body
+        );
+        std::fs::create_dir_all(&staged).unwrap();
+        let failed = Publication::prepare(&staged, &destination).unwrap();
+        let discarded = failed.directory.clone();
+        drop(failed);
+        assert!(!discarded.exists());
+        assert_eq!(
+            Archive::directory(&destination)
+                .unwrap()
+                .get("https://source.org/article")
+                .unwrap()
+                .unwrap()
+                .body,
+            body
+        );
+    }
+
+    #[test]
+    fn research_publication_switches_the_whole_batch_and_keeps_old_readers() {
+        let root = Batch(std::env::temp_dir().join(format!(
+                "research-publication-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            )));
+        let destination = root.0.join("security");
+        std::fs::create_dir_all(&destination).unwrap();
+        let write = |path: &Path, url, body: &'static str| {
+            Archive::default()
+                .append(
+                    path,
+                    url,
+                    &fictionet_extras::warc::Response {
+                        status: http::StatusCode::OK,
+                        headers: Default::default(),
+                        body: body.into(),
+                    },
+                )
+                .unwrap()
+        };
+        write(
+            &destination.join("old.warc.gz"),
+            "https://source.org/article",
+            "old article",
+        );
+        let old = Archive::directory(&destination).unwrap();
+        let staged = root.0.join("staged");
+        std::fs::create_dir_all(&staged).unwrap();
+        write(
+            &staged.join("article.warc.gz"),
+            "https://source.org/article",
+            "new article with citation",
+        );
+        assert_eq!(
+            Archive::directory(&destination)
+                .unwrap()
+                .get("https://source.org/article")
+                .unwrap()
+                .unwrap()
+                .body,
+            "old article"
+        );
+        write(
+            &staged.join("citation.warc.gz"),
+            "https://source.org/citation",
+            "cited research",
+        );
+        publish(&staged, &destination).unwrap();
+        let new = Archive::directory(&destination).unwrap();
+        assert_eq!(
+            new.get("https://source.org/article").unwrap().unwrap().body,
+            "new article with citation"
+        );
+        assert_eq!(
+            new.get("https://source.org/citation")
+                .unwrap()
+                .unwrap()
+                .body,
+            "cited research"
+        );
+        assert_eq!(
+            old.get("https://source.org/article").unwrap().unwrap().body,
+            "old article"
+        );
+        assert!(old.get("https://source.org/citation").unwrap().is_none());
+    }
 
     #[tokio::test]
     async fn large_not_found_documents_survive_optional_asset_discovery() {
