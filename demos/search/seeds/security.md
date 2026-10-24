@@ -1,6 +1,7 @@
 +++
 [corpus]
 directory = "security"
+reference = "web"
 urls = [
   "https://attack.mitre.org/techniques/T1195/",
   "https://attack.mitre.org/techniques/T1195/001/",

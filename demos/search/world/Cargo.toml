@@ -26,6 +26,8 @@ tokio = { version = "1", default-features = false, features = ["sync", "rt-multi
 url = "2"
 tower-service = "0.3"
 kuchiki = "0.8"
+zim = "0.5"
+rayon = "1"
 
 [dev-dependencies]
 flate2 = "1"

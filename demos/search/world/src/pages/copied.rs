@@ -1,6 +1,7 @@
 //! Copied pages and search results share one WARC response handler.
 
 mod git;
+mod reference;
 
 use super::*;
 use fictionet_extras::{crawl::Index, warc::Archive};
@@ -8,7 +9,7 @@ use std::{path::Path, time::Instant};
 
 // Captured distributions and repository packs can exceed a public web response.
 const PACKAGE_BYTES: usize = 256 * 1024 * 1024;
-const INDEX_VERSION: u32 = 4;
+const INDEX_VERSION: u32 = 5;
 
 pub(super) struct Corpus {
     archive: Archive,
@@ -16,6 +17,7 @@ pub(super) struct Corpus {
     index: Index,
     hosts: HashSet<String>,
     packages: Option<PackageSites>,
+    reference: Option<reference::ReferenceWeb>,
 }
 
 /// A retained page identity. Copied bodies are read from the immutable corpus
@@ -103,7 +105,13 @@ impl Corpus {
         url: &str,
     ) -> std::io::Result<Option<fictionet_extras::warc::Response>> {
         use kuchiki::traits::TendrilSink;
-        let Some(mut response) = archived_response(&self.archive, &self.missing, url)? else {
+        let response = if let Some(reference) = &self.reference {
+            reference.response(url)?
+        } else {
+            None
+        };
+        let Some(mut response) = response.or(archived_response(&self.archive, &self.missing, url)?)
+        else {
             return Ok(None);
         };
         // Reporting headers and these script elements only send telemetry or ads.
@@ -166,7 +174,11 @@ struct CachedCorpus {
 fn archive_files(root: &Path) -> std::io::Result<Vec<ArchiveFile>> {
     let mut files = Vec::new();
     for entry in std::fs::read_dir(root)? {
-        let path = entry?.path();
+        let entry = entry?;
+        if entry.file_name().as_encoded_bytes().starts_with(b".") {
+            continue;
+        }
+        let path = entry.path();
         if path.to_string_lossy().ends_with(".warc.gz") {
             let path = std::fs::canonicalize(path)?;
             let metadata = path.metadata()?;
@@ -242,6 +254,10 @@ impl Pages {
                 || self.copied.as_ref().is_some_and(|corpus| {
                     corpus.hosts.contains(&host)
                         || corpus
+                            .reference
+                            .as_ref()
+                            .is_some_and(|web| web.serves(&host))
+                        || corpus
                             .packages
                             .as_ref()
                             .is_some_and(|packages| packages.hosts.contains(&host))
@@ -256,7 +272,16 @@ impl Pages {
             .ok_or("the seed has no copied corpus")?;
         let root = downloads.join(&corpus.directory);
         let urls = corpus.urls.clone();
-        Self::copied(seed, &root, &urls, model)
+        let reference = corpus
+            .reference
+            .as_ref()
+            .map(|directory| reference::ReferenceWeb::open(&downloads.join(directory), &root))
+            .transpose()?;
+        let mut pages = Self::copied(seed, &root, &urls, model)?;
+        Arc::get_mut(pages.copied.as_mut().unwrap())
+            .unwrap()
+            .reference = reference;
+        Ok(pages)
     }
 
     /// Open the copied sites and crawl them from their starting URLs.
@@ -291,6 +316,9 @@ impl Pages {
                 )
             }
         };
+        if !seeds.iter().any(|url| archive.contains(url)) {
+            return Err("the copied corpus has none of its starting URLs".into());
+        }
         let hosts = archive
             .urls()
             .filter_map(|url| url::Url::parse(url).ok()?.host_str().map(str::to_owned))
@@ -327,12 +355,13 @@ impl Pages {
             index: Index::default(),
             hosts,
             packages,
+            reference: None,
         };
         corpus.index = match index {
             Some(index) => index,
             None => {
                 let index = Index::crawl(
-                    seeds,
+                    &corpus.archive.urls().map(str::to_owned).collect::<Vec<_>>(),
                     |url| corpus.archive.contains(url),
                     |url| corpus.response(url),
                 )
@@ -393,17 +422,19 @@ impl Pages {
         &self,
         query: &str,
         start: u64,
-    ) -> (search::Search, Cache, Option<Usage>, u64) {
-        (
-            self.copied.as_ref().unwrap().index.search(
-                query,
-                start.try_into().unwrap_or(usize::MAX),
-                10,
-            ),
-            Cache::Cached,
-            None,
-            0,
-        )
+    ) -> Result<(search::Search, Cache, Option<Usage>, u64), Stop> {
+        let corpus = self.copied.as_ref().unwrap();
+        let search = if let Some(reference) = &corpus.reference {
+            reference
+                .index
+                .search(query, start.try_into().unwrap_or(usize::MAX), 10)
+                .map_err(Stop::store)?
+        } else {
+            corpus
+                .index
+                .search(query, start.try_into().unwrap_or(usize::MAX), 10)
+        };
+        Ok((search, Cache::Cached, None, 0))
     }
 
     pub(super) fn copied_page(&self, host: &str, target: &str) -> Response {
@@ -532,16 +563,39 @@ mod tests {
         let second = open();
         assert_eq!(std::fs::read(&cache).unwrap(), saved);
         assert_eq!(
-            first.copied_listing("immutable", 0).0,
-            second.copied_listing("immutable", 0).0
+            first.copied_listing("immutable", 0).unwrap().0,
+            second.copied_listing("immutable", 0).unwrap().0
         );
         write("<title>Build security</title><p>Credential isolation</p>");
         let updated = open();
-        assert_eq!(updated.copied_listing("credential", 0).0.results.len(), 1);
-        assert!(updated.copied_listing("immutable", 0).0.results.is_empty());
+        assert_eq!(
+            updated
+                .copied_listing("credential", 0)
+                .unwrap()
+                .0
+                .results
+                .len(),
+            1
+        );
+        assert!(
+            updated
+                .copied_listing("immutable", 0)
+                .unwrap()
+                .0
+                .results
+                .is_empty()
+        );
         assert_ne!(std::fs::read(&cache).unwrap(), saved);
         std::fs::write(&cache, b"interrupted write").unwrap();
-        assert_eq!(open().copied_listing("credential", 0).0.results.len(), 1);
+        assert_eq!(
+            open()
+                .copied_listing("credential", 0)
+                .unwrap()
+                .0
+                .results
+                .len(),
+            1
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 

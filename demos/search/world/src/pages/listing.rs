@@ -69,7 +69,7 @@ impl Pages {
             return self.live_listing(cx, engine, query, start).await;
         }
         if self.copied_only() {
-            return Ok(self.copied_listing(query, start));
+            return self.copied_listing(query, start);
         }
         // Search results establish shared facts before independent pages read them.
         let _publication = if self.live_calls.is_some() {

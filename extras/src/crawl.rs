@@ -5,6 +5,9 @@ use kuchiki::traits::TendrilSink;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 
+mod disk;
+pub use disk::{DiskIndex, DiskWriter};
+
 /// A page's searchable representation.
 #[derive(Debug, Serialize, Deserialize)]
 struct Document {
@@ -58,6 +61,13 @@ fn search_key(value: &str) -> String {
 }
 
 impl Index {
+    /// Copy the crawled documents into a persistent index.
+    pub fn write_to(&self, writer: &DiskWriter) -> std::io::Result<()> {
+        for document in &self.documents {
+            writer.add(&document.url, &document.title, &document.text)?;
+        }
+        Ok(())
+    }
     /// Follow links from the starting URLs, fetching only URLs in the corpus.
     /// `fetch` must be the same response handler used to serve copied sites.
     pub fn crawl(
@@ -236,9 +246,7 @@ impl Index {
         self.documents.is_empty()
     }
 
-    /// Rank by BM25, using query coverage and URL order to break ties.
-    /// A majority of the distinct terms must match so a shared word cannot
-    /// fill a result page for an unrelated query.
+    /// Rank all partial matches by BM25, with URL order breaking ties.
     pub fn search(&self, query: &str, start: usize, limit: usize) -> search::Search {
         if self.is_empty() {
             return search::Search {
@@ -268,9 +276,7 @@ impl Index {
         }
         let mut ranked: Vec<_> = scores
             .into_iter()
-            .filter_map(|(id, (score, covered))| {
-                (covered > words.len() / 2).then_some((id, covered, score))
-            })
+            .map(|(id, (score, covered))| (id, covered, score))
             .collect();
         ranked.sort_by(|(a, ac, x), (b, bc, y)| {
             y.total_cmp(x)
@@ -427,14 +433,19 @@ mod tests {
         );
         for query in ["solarwinds supply chain attack", "SOLARWINDS supply supply"] {
             let found = index.search(query, 0, 10);
-            assert_eq!(found.total, Some(1));
-            assert_eq!(found.results.len(), 1);
+            assert_eq!(found.total, Some(13));
+            assert_eq!(found.results.len(), 10);
             assert_eq!(found.results[0].url, "https://security.org/solarwinds");
         }
-        for query in ["supply dishwasher", "solar chain", "", "?!"] {
+        for query in ["dishwasher", "astronomy", "", "?!"] {
             let found = index.search(query, 0, 10);
             assert_eq!(found.total, Some(0));
             assert!(found.results.is_empty());
+        }
+        for query in ["supply dishwasher", "solar chain"] {
+            let found = index.search(query, 0, 10);
+            assert_eq!(found.total, Some(13));
+            assert_eq!(found.results.len(), 10);
         }
         let first = index.search("solar", 0, 10);
         let second = index.search("solar", 10, 10);
@@ -465,7 +476,7 @@ mod tests {
         assert_eq!(found.results[0].url, "https://security.org/xz");
         assert_eq!(
             index.search("backdoor dishwasher astronomy", 0, 10).total,
-            Some(0)
+            Some(1)
         );
         assert_eq!(index.search("xz utils extra", 0, 10).total, Some(1));
     }

@@ -266,6 +266,7 @@ struct Recovery {
 }
 
 /// Why nothing was made.
+#[derive(Debug)]
 enum Stop {
     /// The generation budget is spent.
     Budget,

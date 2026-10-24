@@ -48,6 +48,9 @@ pub struct Seed {
 pub struct Corpus {
     pub directory: String,
     pub urls: Vec<String>,
+    /// Prepared offline references shared across research corpora.
+    #[serde(default)]
+    pub reference: Option<String>,
 }
 
 #[derive(Deserialize, Default)]

@@ -128,18 +128,45 @@ pub fn references(url: &str, response: &warc::Response) -> io::Result<Vec<String
     Ok(references)
 }
 
-fn link(base: &Url, value: &str, out: &mut Vec<String>) -> io::Result<()> {
+/// A discovered navigation or static dependency.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkKind {
+    /// A navigable page.
+    Page,
+    /// A document prerequisite.
+    Asset,
+}
+
+/// Collect bounded discovery for request-time capture.
+pub fn links(url: &str, response: &warc::Response) -> io::Result<Links> {
+    let mut links = Links::default();
+    visit_links(url, response, |kind, url| {
+        let out = match kind {
+            LinkKind::Page => &mut links.pages,
+            LinkKind::Asset => &mut links.assets,
+        };
+        if out.len() >= 2048 {
+            return Err(io::Error::other("capture discovery exceeds link limit"));
+        }
+        out.push(url);
+        Ok(())
+    })?;
+    links.assets.sort();
+    links.assets.dedup();
+    Ok(links)
+}
+
+fn link(base: &Url, value: &str, out: &mut dyn FnMut(String) -> io::Result<()>) -> io::Result<()> {
     let Some(url) = base.join(value).ok().and_then(|u| warc::key(u.as_str())) else {
         return Ok(());
     };
-    if out.len() >= 2048 || url.len() > 8192 {
+    if url.len() > 8192 {
         return Err(io::Error::other("capture discovery exceeds link limit"));
     }
-    out.push(url);
-    Ok(())
+    out(url)
 }
 
-fn css(text: &str, base: &Url, out: &mut Vec<String>) -> io::Result<()> {
+fn css(text: &str, base: &Url, out: &mut dyn FnMut(String) -> io::Result<()>) -> io::Result<()> {
     static URLS: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     let regex = URLS.get_or_init(|| {
         Regex::new(r#"(?i)url\(\s*["']?([^\s\)"']+)|@import\s+["']([^"']+)"#).unwrap()
@@ -152,7 +179,11 @@ fn css(text: &str, base: &Url, out: &mut Vec<String>) -> io::Result<()> {
     Ok(())
 }
 
-fn srcset(mut input: &str, base: &Url, out: &mut Vec<String>) -> io::Result<()> {
+fn srcset(
+    mut input: &str,
+    base: &Url,
+    out: &mut dyn FnMut(String) -> io::Result<()>,
+) -> io::Result<()> {
     while !input.is_empty() {
         input = input.trim_start_matches(|c: char| c.is_whitespace() || c == ',');
         if input.is_empty() {
@@ -170,8 +201,11 @@ fn srcset(mut input: &str, base: &Url, out: &mut Vec<String>) -> io::Result<()> 
 }
 
 /// Discover static dependencies using the response's base URL and HTML base tag.
-pub fn links(url: &str, response: &warc::Response) -> io::Result<Links> {
-    let mut links = Links::default();
+pub fn visit_links(
+    url: &str,
+    response: &warc::Response,
+    mut visit: impl FnMut(LinkKind, String) -> io::Result<()>,
+) -> io::Result<()> {
     let base = Url::parse(url).map_err(io::Error::other)?;
     if response.status.is_redirection() {
         if let Some(next) = response
@@ -181,9 +215,9 @@ pub fn links(url: &str, response: &warc::Response) -> io::Result<Links> {
             .and_then(|v| base.join(v).ok())
             .and_then(|u| warc::key(u.as_str()))
         {
-            links.pages.push(next);
+            visit(LinkKind::Page, next)?;
         }
-        return Ok(links);
+        return Ok(());
     }
     let content_type = response
         .headers
@@ -191,13 +225,13 @@ pub fn links(url: &str, response: &warc::Response) -> io::Result<Links> {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     if !(content_type.starts_with("text/html") || content_type.starts_with("text/css")) {
-        return Ok(links);
+        return Ok(());
     }
     let decoded = response.decoded_with_limit(PARSE_BYTES)?;
     let text = String::from_utf8_lossy(&decoded);
     if content_type.starts_with("text/css") {
-        css(&text, &base, &mut links.assets)?;
-        return Ok(links);
+        css(&text, &base, &mut |url| visit(LinkKind::Asset, url))?;
+        return Ok(());
     }
     // Discovery needs tokens, not a DOM. Deeply nested hostile markup cannot
     // grow a tree or turn navigation discovery into quadratic tree building.
@@ -242,7 +276,7 @@ pub fn links(url: &str, response: &warc::Response) -> io::Result<Links> {
             if name == "style"
                 && let Some(text) = style.take()
             {
-                css(&text, &base, &mut links.assets)?;
+                css(&text, &base, &mut |url| visit(LinkKind::Asset, url))?;
             }
             return Ok(());
         }
@@ -258,10 +292,10 @@ pub fn links(url: &str, response: &warc::Response) -> io::Result<Links> {
         if matches!(name, "a" | "area")
             && let Some(value) = attr("href")
         {
-            link(&base, value, &mut links.pages)?;
+            link(&base, value, &mut |url| visit(LinkKind::Page, url))?;
         }
         if let Some(value) = attr("poster") {
-            link(&base, value, &mut links.assets)?;
+            link(&base, value, &mut |url| visit(LinkKind::Asset, url))?;
         }
         if matches!(name, "audio" | "video" | "track" | "iframe")
             || (name == "source" && picture == 0)
@@ -270,11 +304,11 @@ pub fn links(url: &str, response: &warc::Response) -> io::Result<Links> {
         }
         for name in ["src", "data"] {
             if let Some(value) = attr(name) {
-                link(&base, value, &mut links.assets)?;
+                link(&base, value, &mut |url| visit(LinkKind::Asset, url))?;
             }
         }
         if let Some(value) = attr("srcset") {
-            srcset(value, &base, &mut links.assets)?;
+            srcset(value, &base, &mut |url| visit(LinkKind::Asset, url))?;
         }
         if name == "link"
             && attr("rel").is_some_and(|r| {
@@ -283,10 +317,10 @@ pub fn links(url: &str, response: &warc::Response) -> io::Result<Links> {
             })
             && let Some(value) = attr("href")
         {
-            link(&base, value, &mut links.assets)?;
+            link(&base, value, &mut |url| visit(LinkKind::Asset, url))?;
         }
         if let Some(value) = attr("style") {
-            css(value, &base, &mut links.assets)?;
+            css(value, &base, &mut |url| visit(LinkKind::Asset, url))?;
         }
         if name == "style" {
             style = Some(String::new());
@@ -294,11 +328,9 @@ pub fn links(url: &str, response: &warc::Response) -> io::Result<Links> {
         Ok(())
     })?;
     if let Some(text) = style {
-        css(&text, &base, &mut links.assets)?;
+        css(&text, &base, &mut |url| visit(LinkKind::Asset, url))?;
     }
-    links.assets.sort();
-    links.assets.dedup();
-    Ok(links)
+    Ok(())
 }
 
 fn tokens(
@@ -338,9 +370,65 @@ fn tokens(
     tokenizer.sink.1
 }
 
+/// Extract searchable text without building a document tree. Markup and
+/// non-content elements never become search terms.
+pub fn page_text(html: &str) -> io::Result<String> {
+    use html5ever::tokenizer::{TagKind, Token};
+    let mut hidden = Vec::new();
+    let mut text = String::new();
+    tokens(html, |token| {
+        match token {
+            Token::TagToken(tag) => {
+                let name = tag.name.as_ref();
+                if tag.kind == TagKind::StartTag
+                    && matches!(
+                        name,
+                        "script" | "style" | "noscript" | "template" | "nav" | "header" | "footer"
+                    )
+                {
+                    hidden.push(tag.name.to_string());
+                } else if tag.kind == TagKind::EndTag
+                    && hidden.last().is_some_and(|last| last == name)
+                {
+                    hidden.pop();
+                }
+                if hidden.is_empty() {
+                    text.push(' ');
+                }
+            }
+            Token::CharacterTokens(value) if hidden.is_empty() => text.push_str(&value),
+            _ => {}
+        }
+        Ok(())
+    })?;
+    Ok(text.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn corpus_discovery_streams_large_documentation_indexes() {
+        let html = (0..5000)
+            .map(|page| format!("<a href='/page/{page}'>Page</a>"))
+            .collect::<String>();
+        let response = response("text/html", &html);
+        let mut count = 0;
+        visit_links("https://docs.org/", &response, |kind, url| {
+            assert_eq!(kind, LinkKind::Page);
+            assert_eq!(url, format!("https://docs.org/page/{count}"));
+            count += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(count, 5000);
+        assert!(links("https://docs.org/", &response).is_err());
+        assert_eq!(
+            page_text("<nav>Menu</nav><main>A &amp; B<script>secret()</script> C</main>").unwrap(),
+            "A & B C"
+        );
+    }
 
     #[test]
     fn discovery_rejects_oversized_text_and_handles_deep_markup_without_a_tree() {
@@ -398,14 +486,14 @@ mod tests {
         );
     }
 
-    fn response(mime: &'static str, body: &'static str) -> warc::Response {
+    fn response(mime: &'static str, body: &str) -> warc::Response {
         warc::Response {
             status: http::StatusCode::OK,
             headers: http::HeaderMap::from_iter([(
                 http::header::CONTENT_TYPE,
                 http::HeaderValue::from_static(mime),
             )]),
-            body: body.into(),
+            body: body.to_owned().into(),
         }
     }
 

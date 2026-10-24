@@ -6,6 +6,40 @@ use std::{collections::HashSet, path::PathBuf, sync::Arc};
 use web_world::pages::{Meta, Pages, Seed};
 
 #[test]
+fn wikipedia_archive_retains_article_identity_and_stylesheets() {
+    let downloads = std::env::var_os("SEARCH_DOWNLOADS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../downloads"));
+    let archive = zim::Zim::new(downloads.join("web/wikipedia_en_all_nopic_2026-06.zim")).unwrap();
+    for title in [
+        "Jupiter",
+        "Spectre_(security_vulnerability)",
+        "Meltdown_(security_vulnerability)",
+    ] {
+        let entry = archive
+            .get_by_path(zim::Namespace::UserContent, title)
+            .unwrap()
+            .unwrap();
+        let body = archive
+            .entry_content(&entry)
+            .unwrap()
+            .unwrap()
+            .to_vec()
+            .unwrap();
+        let dom = kuchiki::parse_html().one(String::from_utf8(body).unwrap());
+        let shown = dom.select_first("title").unwrap().text_contents();
+        assert!(shown.contains(title.split('_').next().unwrap()));
+        let styles = dom
+            .select("link[rel=stylesheet]")
+            .unwrap()
+            .map(|link| link.attributes.borrow().get("href").unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert!(!styles.is_empty());
+        eprintln!("{title}: {shown}, styles {styles:?}");
+    }
+}
+
+#[test]
 fn linked_security_guidance_is_available_to_the_researcher() {
     let downloads = std::env::var_os("SEARCH_DOWNLOADS")
         .map(PathBuf::from)
@@ -158,11 +192,64 @@ fn security_research_searches_and_citations_replay_without_internet() {
                     let Meta::Search(list) = response.meta else {
                         panic!("search metadata missing")
                     };
-                    assert!(list.listed.is_empty(), "{query}");
+                    assert!(!list.listed.is_empty(), "{query}");
                 }
+                let response = pages
+                    .handle(
+                        &cx,
+                        "GET",
+                        host,
+                        &format!("{path}?q=qzxvnonexistentterm"),
+                        None,
+                    )
+                    .await;
+                let Meta::Search(list) = response.meta else {
+                    panic!("search metadata missing")
+                };
+                assert!(list.listed.is_empty());
             }
             Ok(())
         },
     ))
     .unwrap();
+}
+
+#[test]
+fn reference_searches_open_full_articles_and_documentation_at_public_urls() {
+    let downloads = std::env::var_os("SEARCH_DOWNLOADS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../downloads"));
+    let pages =
+        Arc::new(Pages::from_corpus(Seed::builtin("security").unwrap(), &downloads, None).unwrap());
+    fictionet::block_on(fictionet::lab(fictionet::Seed::from_u64(13), |cx| async move {
+        for (query, article) in [
+            ("Spectre Meltdown vulnerabilities", "Meltdown_(security_vulnerability)"),
+            ("Jupiter", "Jupiter"),
+            ("Roman aqueducts", "Roman_aqueduct"),
+            ("photosynthesis", "Photosynthesis"),
+            ("Fourier transform", "Fourier_transform"),
+        ] {
+            let hits = pages.clone().search(cx.clone(), query.into(), Default::default()).await?;
+            assert_eq!(hits.len(), 10, "{query}");
+            assert!(hits.iter().any(|hit| hit.url == format!("https://en.wikipedia.org/wiki/{article}")), "{query}: {hits:?}");
+            for hit in hits {
+                let page = pages.clone().fetch(cx.clone(), hit.url.clone()).await?;
+                assert!(page.body.len() > 1000, "{}", hit.url);
+                eprintln!("{query}: {} — {}", hit.url, page.title);
+            }
+        }
+        for url in [
+            "https://docs.python.org/3/library/asyncio.html",
+            "https://developer.mozilla.org/en-US/docs/Web/HTTP",
+            "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows",
+        ] {
+            let page = pages.clone().fetch(cx.clone(), url.into()).await?;
+            assert!(page.body.len() > 1000, "{url}");
+        }
+        let missing = pages.handle(&cx, "GET", "en.wikipedia.org", "/wiki/Qzxvnonexistentterm", None).await;
+        assert_eq!(missing.status, 404);
+        assert!(missing.body.len() > 10_000);
+        assert!(String::from_utf8_lossy(&missing.body).contains("does not have an article with this exact name"));
+        Ok(())
+    })).unwrap();
 }
