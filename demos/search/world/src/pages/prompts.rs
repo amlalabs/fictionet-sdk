@@ -183,6 +183,14 @@ may fill gaps in the brief; never rename an established person or organization.
 Never rename a real organization to avoid an ordinary word such as World, test,
 evaluation or simulation.
 
+The URL selects a particular view of a document. An abstract landing page,
+catalogue entry or bibliographic record contains its metadata, abstract and links,
+not the full linked paper or book. Use 150 to 250 words for those views. Full-text
+URLs contain the full document. Keep an abstract faithful to the original paper:
+do not insert later discoveries or results into an older paper's abstract.
+A record page's DATE is its own publication or update date. The paper's submission,
+revision and journal dates are separate, explicitly labeled bibliographic fields.
+
 Write the requested document itself, not a synopsis of it. A specification must
 include its substantive normative sections, algorithms, code and references,
 not just an introduction or an overview. A reference link to flow control must

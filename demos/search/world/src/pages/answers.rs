@@ -396,7 +396,9 @@ pub(super) fn chronology(page: &Page, latest: time::Date) -> Result<(), Unreadab
 }
 
 /// Publication text that needs semantic review: dates alone cannot distinguish
-/// an announced plan from knowledge of its eventual outcome.
+/// an announced plan from knowledge of its eventual outcome. Explicit calendar
+/// dates select documents for semantic review; this does not prove the accuracy
+/// of arbitrary undated prose or scientific claims.
 pub(super) trait Publication {
     fn later_text(&self, latest: time::Date) -> Vec<(time::Date, String)>;
 }
