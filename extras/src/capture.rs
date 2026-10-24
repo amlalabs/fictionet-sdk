@@ -47,6 +47,8 @@ pub struct Event {
     pub phase: crate::models::UpstreamPhase,
     /// Status only when response headers arrived.
     pub status: Option<http::StatusCode>,
+    /// The page this request fetches a dependency of, when it is one.
+    pub page: Option<Url>,
 }
 
 /// Observes actual host transport operations, excluding payloads and credentials.

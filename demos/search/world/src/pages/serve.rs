@@ -132,7 +132,7 @@ impl Pages {
         }
         if self.live_only() && route == Route::Page {
             return self
-                .live_url(cx, &format!("https://{host}{target}"), None)
+                .live_url(cx, &format!("https://{host}{target}"), None, None)
                 .await;
         }
         if self.copied_only() && route == Route::Page {

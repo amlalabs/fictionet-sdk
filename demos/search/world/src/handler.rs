@@ -75,11 +75,19 @@ impl Handler {
         } else if let Some(asset) = Pages::search_asset(&target.host, path) {
             asset
         } else if self.pages.live_only() && action == Route::Page {
+            // A page's own request belongs to the page that asked for it.
+            let page = (crate::observation::Fetch::of(&parts.headers)
+                == crate::observation::Fetch::Subresource)
+                .then(|| parts.headers.get(http::header::REFERER))
+                .flatten()
+                .and_then(|referrer| referrer.to_str().ok())
+                .and_then(|referrer| url::Url::parse(referrer).ok());
             self.pages
                 .live_url(
                     &self.fcx,
                     &format!("{}://{}{path}", target.scheme, target.host),
                     parts.headers.get(http::header::USER_AGENT),
+                    page,
                 )
                 .await
         } else if self.pages.copied_only() && action == Route::Page {

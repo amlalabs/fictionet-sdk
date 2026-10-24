@@ -156,6 +156,7 @@ impl httpd::Handler for Gateway {
                         },
                         phase: event.phase,
                         status: event.status.map(|s| s.as_u16()),
+                        page: None,
                     },
                 );
             }))

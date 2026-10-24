@@ -101,6 +101,7 @@ impl Live {
         url: String,
         resource: capture::Resource,
         user_agent: Option<http::HeaderValue>,
+        page: Option<url::Url>,
     ) -> Result<watch::Receiver<CaptureState>, String> {
         let mut state = self.state();
         if lifetime.cancelled() || !Arc::ptr_eq(lifetime, &state.lifetime) {
@@ -118,7 +119,7 @@ impl Live {
         let cx = cx.clone();
         self.fetcher.spawn(async move {
             let result = live
-                .download(&lifetime, &cx, &url, user_agent.as_ref())
+                .download(&lifetime, &cx, &url, user_agent.as_ref(), page.as_ref())
                 .await;
             let response = match result {
                 Ok(response) => {
@@ -136,6 +137,8 @@ impl Live {
             };
             // A copied page brings its stylesheets, CSS imports, fonts, images
             // and scripts, including those of pages already in the archive.
+            // They all belong to the page the client asked for.
+            let owner = page.or_else(|| url::Url::parse(&url).ok());
             let links = live
                 .fetcher
                 .process(&cx, &lifetime, move || {
@@ -146,7 +149,14 @@ impl Live {
             match links {
                 Ok(links) => {
                     for (url, resource) in links {
-                        let _ = live.capture(&lifetime, &cx, url, resource, user_agent.clone());
+                        let _ = live.capture(
+                            &lifetime,
+                            &cx,
+                            url,
+                            resource,
+                            user_agent.clone(),
+                            owner.clone(),
+                        );
                     }
                 }
                 Err(error) => eprintln!("Live dependency discovery failed: {error}"),
@@ -161,6 +171,7 @@ impl Live {
         cx: &Cx,
         url: &str,
         user_agent: Option<&http::HeaderValue>,
+        page: Option<&url::Url>,
     ) -> Result<warc::Response, String> {
         if let Some(response) = self
             .state()
@@ -176,7 +187,13 @@ impl Live {
         let response = loop {
             match self
                 .fetcher
-                .request(cx, lifetime, observer.clone(), url, Ask::Copy(user_agent))
+                .request(
+                    cx,
+                    lifetime,
+                    observer.clone(),
+                    url,
+                    Ask::Copy { user_agent, page },
+                )
                 .await
             {
                 Ok(response) => break response,
@@ -359,6 +376,7 @@ impl Live {
         cx: &Cx,
         url: &str,
         user_agent: Option<&http::HeaderValue>,
+        page: Option<url::Url>,
     ) -> Result<warc::Response, String> {
         let url = warc::key(url).ok_or("Invalid Live URL")?;
         let lifetime = self.state().lifetime.clone();
@@ -368,6 +386,7 @@ impl Live {
             url.clone(),
             capture::Resource::Document,
             user_agent.cloned(),
+            page,
         )?;
         let ready = async {
             loop {
@@ -468,17 +487,19 @@ impl Pages {
 
     /// Answers from a Live copy of `url`, copied the way the asking client
     /// (by its `user_agent`) would be served: a phone gets the mobile site.
+    /// A page's own request names that `page`.
     pub(crate) async fn live_url(
         &self,
         cx: &Cx,
         url: &str,
         user_agent: Option<&http::HeaderValue>,
+        page: Option<url::Url>,
     ) -> Response {
         match self
             .live
             .as_ref()
             .unwrap()
-            .response(cx, url, user_agent)
+            .response(cx, url, user_agent, page)
             .await
         {
             Ok(response) => copied::replay(Ok(Some(response))),

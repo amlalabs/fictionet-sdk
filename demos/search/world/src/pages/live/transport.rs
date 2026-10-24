@@ -19,8 +19,12 @@ pub(in crate::pages) enum Ask<'a> {
     /// Query the search provider with this key and body.
     Search(&'a Key, &'a Value),
     /// Copy a page or dependency for Live replay, as this client (by its
-    /// User-Agent) would get it, or as the default browser.
-    Copy(Option<&'a http::HeaderValue>),
+    /// User-Agent) would get it, or as the default browser. A dependency
+    /// names the page it belongs to.
+    Copy {
+        user_agent: Option<&'a http::HeaderValue>,
+        page: Option<&'a url::Url>,
+    },
     /// Read the public original of a page the world writes.
     Original,
     /// Ask the search provider for the text it holds of an original that
@@ -104,15 +108,19 @@ impl Transport {
             url: destination,
             method: match ask {
                 Ask::Search(..) | Ask::Contents(..) => http::Method::POST,
-                Ask::Copy(_) | Ask::Original => http::Method::GET,
+                Ask::Copy { .. } | Ask::Original => http::Method::GET,
             },
             purpose: match ask {
                 Ask::Search(..) => capture::Purpose::Search,
-                Ask::Copy(_) => capture::Purpose::Capture,
+                Ask::Copy { .. } => capture::Purpose::Capture,
                 Ask::Original | Ask::Contents(..) => capture::Purpose::Original,
             },
             phase: UpstreamPhase::Attempt,
             status: None,
+            page: match ask {
+                Ask::Copy { page, .. } => page.cloned(),
+                _ => None,
+            },
         };
         // No attempt is published after a lifetime has been revoked.
         if lifetime.cancelled() || cx.is_cancelled() {
@@ -140,13 +148,17 @@ impl Transport {
                     .header("x-api-key", key.value())
                     .header("content-type", "application/json")
                     .body(body.to_string()),
-                Ask::Copy(Some(user_agent)) => client
+                Ask::Copy {
+                    user_agent: Some(user_agent),
+                    ..
+                } => client
                     .get(url)
                     .header("accept-encoding", "identity")
                     .header(http::header::USER_AGENT, user_agent),
-                Ask::Copy(None) | Ask::Original => {
-                    client.get(url).header("accept-encoding", "identity")
+                Ask::Copy {
+                    user_agent: None, ..
                 }
+                | Ask::Original => client.get(url).header("accept-encoding", "identity"),
             };
             let response = request.send().await;
             let response = response.map_err(|error| {

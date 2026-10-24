@@ -83,6 +83,8 @@ pub enum SearchObs {
         purpose: EgressPurpose,
         phase: EgressPhase,
         status: Option<u16>,
+        /// The page a dependency was fetched for; the fetch belongs to it.
+        page: Option<String>,
     },
     PageRevision {
         target: WriterTarget,
@@ -197,7 +199,7 @@ pub enum Fetch {
 }
 
 impl Fetch {
-    fn of(headers: &HeaderMap) -> Self {
+    pub(crate) fn of(headers: &HeaderMap) -> Self {
         match headers
             .get("sec-fetch-dest")
             .and_then(|value| value.to_str().ok())
@@ -269,6 +271,7 @@ impl Pages {
                     },
                     phase: event.phase,
                     status: event.status.map(|status| status.as_u16()),
+                    page: event.page.as_ref().map(|page| redact_url(page.as_str())),
                 },
             );
         }));
@@ -285,6 +288,7 @@ impl Pages {
                     purpose: EgressPurpose::PageWriter,
                     phase: event.phase,
                     status: event.status.map(|s| s.as_u16()),
+                    page: None,
                 },
             );
         }));
