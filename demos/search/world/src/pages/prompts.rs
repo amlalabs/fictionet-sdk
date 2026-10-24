@@ -124,6 +124,11 @@ link promises a real destination which will be available when opened. Keep links
 to earlier pages at their exact URLs. Never use placeholders or empty links.
 
 Nothing is dated after today. A dated article knows only what was known then.
+When covering a development after an article's original publication date,
+give the article an explicit update date on or after that development. Set
+DATE to that update date and show both the original publication and update
+dates visibly in BODY. A dated URL can retain its original publication date;
+it does not permit silently adding later knowledge to an unchanged dateline.
 Return only the requested format, without commentary.";
 
 fn world_brief(seed: &Seed) -> String {
