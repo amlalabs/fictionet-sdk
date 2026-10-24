@@ -605,6 +605,9 @@ fn accepted_pages_and_titles_never_carry_the_provider_credential() {
 fn reserved_result_domains_are_rejected_including_subdomains() {
     for host in [
         "example.com",
+        "EXAMPLE.COM",
+        "example.com.",
+        "news.test.",
         "fires.example.com",
         "example.org",
         "example.net",

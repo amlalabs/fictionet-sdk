@@ -513,3 +513,42 @@ fn captured_stored_pages_and_assets_are_available_with_generation_off() {
         Ok(())
     });
 }
+
+#[test]
+fn concurrent_interactive_searches_share_the_first_lists_promises() {
+    let fake = Fake::new(|_, body| {
+        let prompt = body["messages"][1]["content"].as_str().unwrap();
+        let query = prompt
+            .strip_prefix("Someone searched for: ")
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap();
+        completion(
+            20,
+            &format!(
+                "RESULT\nURL: https://news.fields.com/{query}\nTITLE: Cable incident {query}\nSNIPPET: Cable operator Lumenwave reported the break on 8 October 2026."
+            ),
+            None,
+        )
+    });
+    let mut pages = Pages::with_model(seed(), openrouter(fake.clone()));
+    pages.prefetch = 0;
+    let pages = Arc::new(pages);
+    lab(move |cx| async move {
+        let other = pages.clone();
+        let (send, receive) = tokio::sync::oneshot::channel();
+        cx.spawn(move |cx| async move {
+            send.send(google(&other, &cx, "cable cause").await).unwrap();
+            Ok(())
+        });
+        assert_eq!(google(&pages, &cx, "cable incident").await.status, 200);
+        assert_eq!(receive.await.unwrap().status, 200);
+        let prompts = fake.users();
+        assert_eq!(prompts.len(), 2);
+        assert!(
+            prompts[1].contains("Cable operator Lumenwave reported the break on 8 October 2026.")
+        );
+        Ok(())
+    });
+}

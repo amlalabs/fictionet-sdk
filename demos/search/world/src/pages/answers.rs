@@ -103,6 +103,7 @@ pub fn read_search(text: &str) -> Result<Search, Unreadable> {
         let public = url::Url::parse(url).ok().is_some_and(|url| {
             matches!(url.scheme(), "http" | "https")
                 && url.host_str().is_some_and(|host| {
+                    let host = host.trim_end_matches('.');
                     host.contains('.')
                         && ![
                             "example.com",

@@ -58,6 +58,17 @@ impl Pages {
         if self.copied_only() {
             return Ok(self.copied_listing(query, start));
         }
+        // Search results establish shared facts before independent pages read them.
+        let _publication = if self.live_calls.is_some() {
+            Some(
+                self.locks
+                    .lock(cx, "search publications".into())
+                    .await
+                    .map_err(Stop::store)?,
+            )
+        } else {
+            None
+        };
         let key = if engine == Engine::YouTube {
             format!("youtube {}", query_key(query, start))
         } else {
