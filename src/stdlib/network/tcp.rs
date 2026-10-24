@@ -444,6 +444,29 @@ struct Listen {
 }
 
 impl Listen {
+    /// Takes back a socket that left `embryonic` because a RST returned it
+    /// from SYN-RECEIVED to LISTEN, and forgets its connection. One spare
+    /// listening socket is enough (`ingress` makes one when there is none),
+    /// and every socket costs a little on every packet, so a burst of SYNs
+    /// must not leave a pool behind. Returns whether the socket is kept as
+    /// the spare; otherwise the caller removes it.
+    fn relisten(
+        &mut self,
+        h: Id,
+        conns: &mut BTreeMap<Id, Conn>,
+        by_tuple: &mut HashMap<(SocketAddr, SocketAddr), Id>,
+    ) -> bool {
+        if let Some(c) = conns.remove(&h) {
+            by_tuple.remove(&(c.local, c.remote));
+            self.left(c.remote.ip());
+        }
+        let spare = self.idle.is_empty();
+        if spare {
+            self.idle.push(h);
+        }
+        spare
+    }
+
     /// One connection from `peer` left `embryonic` or `ready` for good.
     fn left(&mut self, peer: IpAddr) {
         if let Some(n) = self.per_peer.get_mut(&peer) {
@@ -1004,6 +1027,18 @@ impl State {
                 self.sockets.get_mut(self.handles[&h]).set_ack_delay(None);
             }
             self.close_if_drained(h);
+            // A RST in SYN-RECEIVED put the socket back in LISTEN. It is
+            // taken back now: a later SYN in the same batch may land on it,
+            // and must not find it still named for the old peer.
+            if after == TcpState::Listen
+                && let Some(l) = self.listeners.get_mut(&dst.port())
+                && let Some(i) = l.embryonic.iter().position(|&e| e == h)
+            {
+                l.embryonic.swap_remove(i);
+                if !l.relisten(h, &mut self.conns, &mut self.by_tuple) {
+                    self.remove_socket(h);
+                }
+            }
         }
         if listening {
             // At most one idle socket took the SYN.
@@ -1040,20 +1075,10 @@ impl State {
                 let h = l.embryonic[i];
                 match self.sockets.get(self.handles[&h]).state() {
                     TcpState::SynReceived => i += 1,
-                    // A RST in SYN-RECEIVED puts the socket back in LISTEN.
-                    // One spare listening socket is enough (`ingress` makes
-                    // one when there is none), and every socket costs a
-                    // little on every packet, so a burst of SYNs must not
-                    // leave a pool behind.
+                    // `ingress` takes back a socket a RST returns to LISTEN.
                     TcpState::Listen => {
                         l.embryonic.swap_remove(i);
-                        if let Some(c) = self.conns.remove(&h) {
-                            self.by_tuple.remove(&(c.local, c.remote));
-                            l.left(c.remote.ip());
-                        }
-                        if l.idle.is_empty() {
-                            l.idle.push(h);
-                        } else {
+                        if !l.relisten(h, &mut self.conns, &mut self.by_tuple) {
                             gone.push(h);
                         }
                     }
