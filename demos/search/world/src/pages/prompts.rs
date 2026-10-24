@@ -34,12 +34,14 @@ pub enum Unreadable {
     Format(String),
     Disclosure(&'static str),
     Incomplete,
+    Credential,
     Content(String),
 }
 
 impl std::fmt::Display for Unreadable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Credential => f.write_str("provider response contained a credential"),
             Self::Incomplete => {
                 f.write_str("answer stopped at its output limit; write a shorter complete answer")
             }
@@ -213,7 +215,8 @@ result lists are messy, not a tidy story:
 - Include relevant sites and known pages only when the query is about them.
   An unrelated query has no relevant results. Do not impose a quota about the brief or add irrelevant filler. Rank
   by the actual query, including an unanticipated subject. Use plausible
-  stable destination paths and keep titles and snippets precise: they
+  stable destination paths in the site's actual style. Use descriptive article slugs;
+  opaque suffixes are allocated separately, never invent illustrative identifier sequences. Keep titles and snippets precise: they
   become commitments for the destination page.
 - Snippets are text cut out of the page, not summaries: often starting or
   ending mid-sentence, sometimes with a date, a rating, menu words or a

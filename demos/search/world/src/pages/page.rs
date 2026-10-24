@@ -173,7 +173,9 @@ impl Pages {
     /// behind them, unless those pages are stored. A later request has this
     /// context even without a Referer.
     pub(super) fn note_links(&self, url: &str, markup: &str) {
-        let mut store = self.store();
+        let Ok(mut store) = self.writing_store() else {
+            return;
+        };
         for (host, target, anchor) in links(url, markup) {
             if store.page(&host, &target).is_none() {
                 let mention = json!({"via": "link", "from": url, "anchor": anchor});

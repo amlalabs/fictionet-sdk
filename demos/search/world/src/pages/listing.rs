@@ -52,6 +52,19 @@ impl Pages {
         query: &str,
         start: u64,
     ) -> Result<(fictionet_extras::search::Search, Cache, Option<Usage>, u64), Stop> {
+        self.during_source(self.listing_in(cx, engine, query, start), || {
+            Err(Stop::store(std::io::Error::other("Page source changed")))
+        })
+        .await
+    }
+
+    async fn listing_in(
+        self: &Arc<Self>,
+        cx: &Cx,
+        engine: Engine,
+        query: &str,
+        start: u64,
+    ) -> Result<(fictionet_extras::search::Search, Cache, Option<Usage>, u64), Stop> {
         if self.live_only() {
             return self.live_listing(cx, engine, query, start).await;
         }
@@ -127,7 +140,7 @@ impl Pages {
                     let (host, target) = text::target_of(&result.url);
                     let mention = if self.generating() {
                         let mention = json!({"via":"search", "query":query, "title":result.title, "snippet":result.snippet, "date":result.date});
-                        self.store()
+                        self.writing_store()?
                             .reserve_mention(&self.seed, &host, &target, mention)
                             .map_err(Stop::store)?
                     } else {
@@ -232,7 +245,7 @@ impl Pages {
         let cast = self.cast(cx).await?;
         let seed = self.context();
         let (known, claims) = {
-            let store = self.store();
+            let store = self.writing_store()?;
             (store.known(&seed), store.writing_context(query))
         };
         let mut normalized = search::Search {
@@ -265,7 +278,46 @@ impl Pages {
                     let (system, user) = prompts::search(&seed, &cast, query, &known, &claims);
                     (system, user, SEARCH_TOKENS)
                 },
-                |text, _| prompts::read_search(text),
+                |text, _| {
+                    let mut search = prompts::read_search(text)?;
+                    for result in &search.results {
+                        let date = if result.date.is_empty() {
+                            String::new()
+                        } else {
+                            answers::dates(&result.date)
+                                .first()
+                                .ok_or_else(|| {
+                                    prompts::Unreadable::Content(
+                                        "Search DATE needs a full calendar date".into(),
+                                    )
+                                })?
+                                .to_string()
+                        };
+                        answers::chronology(
+                            &make::Page {
+                                date,
+                                body: result.snippet.clone(),
+                                content_type: "text/plain".into(),
+                                ..Default::default()
+                            },
+                            seed::parse_date(&seed.date).expect("world date"),
+                            &[],
+                        )?;
+                    }
+                    let mut urls = HashMap::new();
+                    for url in search
+                        .results
+                        .iter_mut()
+                        .map(|r| &mut r.url)
+                        .chain(search.ads.iter_mut().map(|ad| &mut ad.url))
+                    {
+                        *url = urls
+                            .entry(url.clone())
+                            .or_insert_with(|| self.article_url(cx, url))
+                            .clone();
+                    }
+                    Ok(search)
+                },
             )
             .await?;
         let mut search = made.fields;
@@ -307,7 +359,7 @@ impl Pages {
                 .await
                 .map_err(Stop::store)?;
             let mention = self
-                .store()
+                .writing_store()?
                 .reserve_mention(&self.seed, &host, &target, mention)
                 .map_err(Stop::store)?;
             r.title = mention["title"].as_str().unwrap_or_default().into();
@@ -336,7 +388,7 @@ impl Pages {
             search,
             usage: made.usage,
         };
-        self.store()
+        self.writing_store()?
             .insert_search(record.clone())
             .map_err(Stop::store)?;
         Ok(record)
@@ -354,27 +406,52 @@ impl Pages {
                 continue;
             }
             let pages = self.clone();
+            let session = WRITING
+                .try_with(Clone::clone)
+                .unwrap_or_else(|_| self.writing.lock().unwrap().subscribe());
             cx.spawn(move |cx| async move {
-                let started = cx.now().since_start();
-                let response = pages.page(&cx, &host, &target, true).await;
-                if let Meta::Error { error, usage } = &response.meta {
-                    let mut row = json!({
-                        "kind": "prefetch_error",
-                        "record": "diagnostic",
-                        "url": format!("https://{host}{target}"),
-                        "error": error,
-                        "serve_ms": (cx.now().since_start() - started).as_millis() as u64,
-                    });
-                    if let Some(usage) = usage {
-                        row["model"] = json!(usage.model);
-                        row["gen_ms"] = json!(usage.gen_ms);
-                        row["cost"] = json!(usage.cost);
-                    }
-                    // A world that cannot write the row says so on the next request.
-                    let _ = pages.log(&cx, &[row]);
-                }
-                Ok(())
+                WRITING
+                    .scope(session.clone(), async {
+                        let mut session = session;
+                        let started = cx.now().since_start();
+                        let response = tokio::select! {
+                            biased;
+                            _ = session.wait_for(|cancelled| *cancelled) => return Ok(()),
+                            response = pages.page(&cx, &host, &target, true) => response,
+                        };
+                        if let Meta::Error { error, usage } = &response.meta {
+                            let mut row = json!({
+                                "kind": "prefetch_error",
+                                "record": "diagnostic",
+                                "url": format!("https://{host}{target}"),
+                                "error": error,
+                                "serve_ms": (cx.now().since_start() - started).as_millis() as u64,
+                            });
+                            if let Some(usage) = usage {
+                                row["model"] = json!(usage.model);
+                                row["gen_ms"] = json!(usage.gen_ms);
+                                row["cost"] = json!(usage.cost);
+                            }
+                            // A world that cannot write the row says so on the next request.
+                            let _ = pages.log(&cx, &[row]);
+                        }
+                        Ok(())
+                    })
+                    .await
             });
+        }
+    }
+
+    pub(super) fn article_url(&self, cx: &Cx, url: &str) -> String {
+        let (host, target) = text::target_of(url);
+        let store = self.store();
+        if !store.mentions(&host, &target).is_empty()
+            || store.page(&host, &target).is_some()
+            || self.seed.fixed.iter().any(|page| page.url == url)
+        {
+            url.into()
+        } else {
+            answers::article_url(cx, url)
         }
     }
 

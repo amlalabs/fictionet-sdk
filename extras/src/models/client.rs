@@ -80,8 +80,27 @@ impl Key {
 /// A POST in flight: the status and body, or why it failed to arrive.
 pub type Post<'a> = Pin<Box<dyn Future<Output = Result<(u16, Vec<u8>), String>> + Send + 'a>>;
 
+/// A provider response whose body has not been collected.
+pub type Incoming<'a> = Pin<Box<dyn Future<Output = Result<Response<Body>, String>> + Send + 'a>>;
+
 /// Sends a request body to the provider and returns the status and body.
 pub trait Transport: Send + Sync {
+    /// Returns the incoming body so authentication can sanitize before collection.
+    fn incoming<'a>(
+        &'a self,
+        cx: &'a Cx,
+        headers: Vec<(&'static str, String)>,
+        body: Vec<u8>,
+    ) -> Incoming<'a> {
+        Box::pin(async move {
+            let (status, body) = self.post(cx, headers, body).await?;
+            Response::builder()
+                .status(status)
+                .body(Body::from(body))
+                .map_err(|e| e.to_string())
+        })
+    }
+
     /// Installs credential-free observation at the actual upstream boundary.
     fn observe_upstream(&self, _observer: Arc<UpstreamObserver>) {}
     /// One POST with these headers. `Err` is a transport failure.
@@ -120,6 +139,50 @@ impl Authenticated {
     pub fn redact(&self, text: &str) -> String {
         self.key.redact(text)
     }
+    /// Rejects a document whose decoded content would expose the owned credential.
+    pub fn check_document(&self, content_type: &str, document: &str) -> Result<(), String> {
+        use kuchiki::traits::TendrilSink;
+        let exposed = |text: &str| self.redact(text) != text;
+        fn json_exposes(value: &Value, exposed: &impl Fn(&str) -> bool) -> bool {
+            match value {
+                Value::String(text) => exposed(text),
+                Value::Array(items) => items.iter().any(|v| json_exposes(v, exposed)),
+                Value::Object(fields) => fields
+                    .iter()
+                    .any(|(k, v)| exposed(k) || json_exposes(v, exposed)),
+                _ => false,
+            }
+        }
+        let content_type = content_type.split(';').next().unwrap_or("");
+        let unsafe_content =
+            if content_type == "application/json" || content_type.ends_with("+json") {
+                let value: Value =
+                    serde_json::from_str(document).map_err(|_| "Invalid JSON document")?;
+                json_exposes(&value, &exposed)
+            } else if content_type == "text/html" {
+                let dom = kuchiki::parse_html().one(document);
+                exposed(&dom.text_contents())
+                    || dom.descendants().any(|node| {
+                        node.as_element().is_some_and(|element| {
+                            exposed(element.name.local.as_ref())
+                                || element.attributes.borrow().map.iter().any(
+                                    |(name, attribute)| {
+                                        exposed(name.local.as_ref()) || exposed(&attribute.value)
+                                    },
+                                )
+                        }) || node
+                            .as_comment()
+                            .is_some_and(|comment| exposed(&comment.borrow()))
+                    })
+            } else {
+                exposed(document)
+            };
+        if unsafe_content || exposed(document) {
+            Err("Document contains a provider credential".into())
+        } else {
+            Ok(())
+        }
+    }
     /// Sends a provider request and sanitizes successful bodies and errors alike.
     pub async fn post(&self, cx: &Cx, body: Vec<u8>) -> Result<(u16, Vec<u8>), String> {
         let mut headers = vec![
@@ -132,14 +195,14 @@ impl Authenticated {
                 headers.push(("anthropic-beta", "oauth-2025-04-20".into()));
             }
         }
-        let (status, body) = self
+        let response = self
             .transport
-            .post(cx, headers, body)
+            .incoming(cx, headers, body)
             .await
             .map_err(|e| self.key.redact(&e))?;
-        let response =
-            transport::sanitize(Response::new(Body::from(body)), self.key.secret.clone())
-                .map_err(|e| self.key.redact(&e.to_string()))?;
+        let status = response.status().as_u16();
+        let response = transport::sanitize(response, self.key.secret.clone())
+            .map_err(|e| self.key.redact(&e.to_string()))?;
         let bytes = response
             .into_body()
             .collect()
@@ -228,6 +291,25 @@ impl Transport for Https {
         body: Vec<u8>,
     ) -> Post<'a> {
         Box::pin(async move {
+            let response = self.incoming(cx, headers, body).await?;
+            let status = response.status().as_u16();
+            let body =
+                http_body_util::Limited::new(response.into_body(), transport::RESPONSE_LIMIT)
+                    .collect()
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .to_bytes();
+            Ok((status, body.to_vec()))
+        })
+    }
+
+    fn incoming<'a>(
+        &'a self,
+        cx: &'a Cx,
+        headers: Vec<(&'static str, String)>,
+        body: Vec<u8>,
+    ) -> Incoming<'a> {
+        Box::pin(async move {
             let body: Value = serde_json::from_slice(&body).map_err(|_| "Invalid model request")?;
             let body = admitted_request(self.provider, &self.path, &body, false)
                 .ok_or("Unsupported provider input")?;
@@ -253,14 +335,7 @@ impl Transport for Https {
             let response = transport::forward(cx, &forward, observer.as_ref(), request)
                 .await
                 .map_err(|e| e.to_string())?;
-            let status = response.status().as_u16();
-            let body = response
-                .into_body()
-                .collect()
-                .await
-                .map_err(|e| e.to_string())?
-                .to_bytes();
-            Ok((status, body.to_vec()))
+            Ok(response)
         })
     }
 }
@@ -268,6 +343,104 @@ impl Transport for Https {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn document_publication_checks_decoded_content() {
+        struct Unused;
+        impl Transport for Unused {
+            fn post<'a>(
+                &'a self,
+                _: &'a Cx,
+                _: Vec<(&'static str, String)>,
+                _: Vec<u8>,
+            ) -> Post<'a> {
+                unreachable!()
+            }
+        }
+        let client = Authenticated::new(
+            Provider::Anthropic,
+            Key::new("provider key", Some("private-key".into())).unwrap(),
+            Arc::new(Unused),
+        );
+        for (kind, body) in [
+            ("text/html", "<p>private&#45;key</p>"),
+            ("text/html", "<a title='private&#x2d;key'>read</a>"),
+            ("text/html", "<p>private<span>-</span>key</p>"),
+            ("text/html", "<!-- private-key -->"),
+            ("application/json", r#"{"value":"private\u002dkey"}"#),
+            ("application/json", r#"{"private\u002dkey":1}"#),
+        ] {
+            let error = client.check_document(kind, body).unwrap_err();
+            assert!(!error.contains("private-key"));
+        }
+        client
+            .check_document("text/html", "<p>Public documentation &amp; links.</p>")
+            .unwrap();
+        client
+            .check_document("application/json", r#"{"value":"public"}"#)
+            .unwrap();
+    }
+
+    #[test]
+    fn authenticated_client_bounds_the_incoming_body_before_collection() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Frames(Arc<AtomicUsize>);
+        impl http_body::Body for Frames {
+            type Data = Bytes;
+            type Error = Error;
+            fn poll_frame(
+                self: Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Option<fictionet::Result<http_body::Frame<Bytes>>>> {
+                let n = self.0.fetch_add(1, Ordering::SeqCst);
+                std::task::Poll::Ready(
+                    (n < 64)
+                        .then(|| Ok(http_body::Frame::data(Bytes::from(vec![b' '; 1024 * 1024])))),
+                )
+            }
+        }
+        struct Streaming(Arc<AtomicUsize>);
+        impl Transport for Streaming {
+            fn post<'a>(
+                &'a self,
+                _: &'a Cx,
+                _: Vec<(&'static str, String)>,
+                _: Vec<u8>,
+            ) -> Post<'a> {
+                panic!("buffered transport must not run")
+            }
+            fn incoming<'a>(
+                &'a self,
+                _: &'a Cx,
+                _: Vec<(&'static str, String)>,
+                _: Vec<u8>,
+            ) -> Incoming<'a> {
+                Box::pin(async move { Ok(Response::new(Body::new(Frames(self.0.clone())))) })
+            }
+        }
+        let frames = Arc::new(AtomicUsize::new(0));
+        let counted = frames.clone();
+        fictionet::block_on(fictionet::lab(
+            fictionet::Seed::from_u64(6),
+            move |cx| async move {
+                let client = Authenticated::new(
+                    Provider::Anthropic,
+                    Key::new("provider key", Some("private-key".into())).unwrap(),
+                    Arc::new(Streaming(counted)),
+                );
+                assert!(
+                    client
+                        .post(&cx, vec![])
+                        .await
+                        .unwrap_err()
+                        .contains("limit")
+                );
+                Ok(())
+            },
+        ))
+        .unwrap();
+        assert_eq!(frames.load(Ordering::SeqCst), 33);
+    }
 
     #[tokio::test]
     async fn host_transport_forwards_only_the_admitted_value() {

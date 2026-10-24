@@ -9,10 +9,10 @@ use serde_json::Value;
 #[derive(Clone, Serialize)]
 #[serde(untagged)]
 pub(super) enum Admitted {
-    Messages(Messages),
-    Responses(Responses),
-    Chat(Chat),
-    Gemini(Gemini),
+    Messages(Box<Messages>),
+    Responses(Box<Responses>),
+    Chat(Box<Chat>),
+    Gemini(Box<Gemini>),
 }
 
 macro_rules! protocol {
@@ -21,126 +21,112 @@ macro_rules! protocol {
         #[serde(deny_unknown_fields)]
         pub(super) struct $name {
             $($(#[$attr])* #[serde(skip_serializing_if = "Option::is_none")] pub(super) $field: Option<$ty>,)*
-    #[serde(skip_serializing_if = "Option::is_none")]
-            pub(super) model: Option<ModelName>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-            pub(super) instructions: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-            pub(super) max_tokens: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-            pub(super) max_output_tokens: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-            pub(super) max_completion_tokens: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-            pub(super) temperature: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-            pub(super) top_p: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-            pub(super) top_k: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-            pub(super) stream: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-            pub(super) stream_options: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-            pub(super) stop: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-            pub(super) stop_sequences: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-            pub(super) tool_choice: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-            pub(super) function_call: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-            pub(super) parallel_tool_calls: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-            pub(super) metadata: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-            diagnostics: Option<Diagnostics>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-            safeguards: Option<Vec<Safeguard>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-            pub(super) client_metadata: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-            pub(super) user: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-            pub(super) safety_identifier: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-            pub(super) prompt_cache_key: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-            pub(super) prompt_cache_retention: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-            pub(super) cache_control: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-            pub(super) store: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-            pub(super) previous_response_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-            pub(super) conversation: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-            pub(super) include: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-            pub(super) reasoning: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-            pub(super) reasoning_effort: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-            pub(super) thinking: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-            output_config: Option<OutputConfig>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-            pub(super) text: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-            pub(super) response_format: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-            pub(super) service_tier: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-            pub(super) truncation: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-            pub(super) context_management: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-            pub(super) frequency_penalty: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-            pub(super) presence_penalty: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-            pub(super) logit_bias: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-            pub(super) logprobs: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-            pub(super) top_logprobs: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-            pub(super) seed: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-            pub(super) n: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-            pub(super) modalities: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-            pub(super) audio: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-            prediction: Option<Prediction>,
-    #[serde(rename = "generationConfig", alias = "generation_config")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-            pub(super) generation_config: Option<Value>,
-    #[serde(rename = "safetySettings", alias = "safety_settings")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-            pub(super) safety_settings: Option<Value>,
-    #[serde(rename = "toolConfig", alias = "tool_config")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-            pub(super) tool_config: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-            pub(super) provider: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-            pub(super) usage: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-            pub(super) transforms: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-            pub(super) models: Option<Vec<ModelName>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-            pub(super) route: Option<String>,
         }
     };
 }
-protocol!(Messages { messages: Vec<Message>, system: Content, input: Content, contents: Content, tools: Vec<Tool> });
-protocol!(Responses { input: Content, tools: Vec<Tool>, max_tool_calls: u64 });
-protocol!(Chat { messages: Vec<Message>, tools: Vec<Tool>, functions: Vec<Function> });
-protocol!(Gemini { contents: Content, #[serde(rename = "systemInstruction", alias = "system_instruction")] system_instruction: Content, tools: Vec<Tool> });
+protocol!(Messages {
+    model: ModelName, messages: Vec<Message>, system: Content, tools: Vec<Tool>,
+    max_tokens: u64, temperature: f64, top_p: f64, top_k: u64, stream: bool,
+    stop_sequences: Vec<String>, tool_choice: Value, metadata: Value,
+    diagnostics: Diagnostics, safeguards: Vec<Safeguard>, cache_control: Value,
+    thinking: Thinking, output_config: OutputConfig, context_management: Value,
+    service_tier: String,
+});
+protocol!(Responses {
+    model: ModelName, input: Content, instructions: String, tools: Vec<Tool>,
+    max_output_tokens: u64, max_tool_calls: u64, temperature: f64, top_p: f64,
+    stream: bool, stream_options: Value, tool_choice: Value, parallel_tool_calls: bool,
+    metadata: Value, user: String, safety_identifier: String, prompt_cache_key: String,
+    prompt_cache_retention: String, store: bool, previous_response_id: String,
+    conversation: String, include: Vec<String>, reasoning: Reasoning, text: Value,
+    service_tier: String, truncation: String, context_management: Value,
+    client_metadata: Value,
+});
+protocol!(Chat {
+    model: ModelName, messages: Vec<Message>, tools: Vec<Tool>, functions: Vec<Function>,
+    max_tokens: u64, max_completion_tokens: u64, temperature: f64, top_p: f64,
+    stream: bool, stream_options: Value, stop: Stop, tool_choice: Value,
+    function_call: Value, parallel_tool_calls: bool, metadata: Value, user: String,
+    safety_identifier: String, prompt_cache_key: String, prompt_cache_retention: String,
+    store: bool, reasoning: Reasoning, reasoning_effort: String, response_format: Value,
+    service_tier: String, frequency_penalty: f64, presence_penalty: f64,
+    logit_bias: std::collections::HashMap<String, f64>, logprobs: bool, top_logprobs: u64,
+    seed: i64, n: u64, modalities: Vec<String>, audio: Value, prediction: Prediction,
+    provider: Value, usage: Value, transforms: Vec<String>, models: Vec<ModelName>, route: String,
+});
+protocol!(Gemini {
+    model: ModelName, contents: Content,
+    #[serde(rename = "systemInstruction", alias = "system_instruction")] system_instruction: Content,
+    tools: Vec<Tool>,
+    #[serde(rename = "generationConfig", alias = "generation_config")] generation_config: GenerationConfig,
+    #[serde(rename = "safetySettings", alias = "safety_settings")] safety_settings: Value,
+    #[serde(rename = "toolConfig", alias = "tool_config")] tool_config: Value,
+});
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub(super) enum Stop {
+    One(String),
+    Many(Vec<String>),
+}
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum Thinking {
+    Enabled { budget_tokens: u64 },
+    Disabled,
+    Adaptive,
+    BetweenTools,
+}
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Reasoning {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exclude: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u64>,
+}
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct GenerationConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_k: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    candidate_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_output_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stop_sequences: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_mime_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_schema: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_json_schema: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seed: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking_config: Option<GeminiThinking>,
+}
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct GeminiThinking {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking_budget: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    include_thoughts: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking_level: Option<String>,
+}
 
 impl Admitted {
     pub(super) fn model(&self) -> Option<&str> {
@@ -175,12 +161,54 @@ impl Admitted {
                 .filter(|object| object.is_empty())
                 .map(|_| Self::Messages(serde_json::from_value(value.clone()).unwrap()));
         };
+        let valid = match &admitted {
+            Self::Messages(r) => {
+                r.messages.as_ref().is_none_or(|messages| {
+                    messages
+                        .iter()
+                        .all(|message| message.allowed(Wire::Messages))
+                }) && r
+                    .system
+                    .as_ref()
+                    .is_none_or(|content| content.allowed(Wire::Messages))
+            }
+            Self::Responses(r) => r
+                .input
+                .as_ref()
+                .is_none_or(|content| content.allowed(Wire::Responses)),
+            Self::Chat(r) => r
+                .messages
+                .as_ref()
+                .is_none_or(|messages| messages.iter().all(|message| message.allowed(Wire::Chat))),
+            Self::Gemini(r) => {
+                r.contents
+                    .as_ref()
+                    .is_none_or(|content| content.allowed(Wire::Gemini))
+                    && r.system_instruction
+                        .as_ref()
+                        .is_none_or(|content| content.allowed(Wire::Gemini))
+            }
+        };
+        if !valid {
+            return None;
+        }
         let tools = match &admitted {
             Self::Messages(r) => &r.tools,
             Self::Responses(r) => &r.tools,
             Self::Chat(r) => &r.tools,
             Self::Gemini(r) => &r.tools,
         };
+        if let Self::Chat(chat) = &admitted
+            && provider != Provider::OpenRouter
+            && (chat.provider.is_some()
+                || chat.usage.is_some()
+                || chat.transforms.is_some()
+                || chat.models.is_some()
+                || chat.route.is_some()
+                || chat.reasoning.is_some())
+        {
+            return None;
+        }
         tools
             .as_ref()
             .is_none_or(|tools| tools.iter().all(|tool| tool.allowed(provider, path, world)))
@@ -319,7 +347,26 @@ impl Tool {
             Self::Tagged(TaggedTool::Namespace { tools, .. }) => {
                 tools.iter().all(|tool| tool.allowed(provider, path, false))
             }
-            Self::Tagged(TaggedTool::Function { .. } | TaggedTool::Custom { .. }) => true,
+            Self::Tagged(TaggedTool::Function { function, name, .. }) => {
+                if path.ends_with("/chat/completions") {
+                    function.is_some() && name.is_none()
+                } else {
+                    path.ends_with("/responses") && function.is_none() && name.is_some()
+                }
+            }
+            Self::Tagged(TaggedTool::Custom {
+                input_schema,
+                format,
+                ..
+            }) => {
+                if path.ends_with("/messages") || path.ends_with("/messages/count_tokens") {
+                    matches!(provider, Provider::Anthropic | Provider::OpenRouter)
+                        && input_schema.is_some()
+                        && format.is_none()
+                } else {
+                    path.ends_with("/responses") && input_schema.is_none()
+                }
+            }
             Self::Tagged(
                 TaggedTool::WebSearch20250305(_)
                 | TaggedTool::WebSearch20260209(_)
@@ -341,7 +388,7 @@ impl Tool {
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct Prediction {
+pub(super) struct Prediction {
     #[serde(rename = "type")]
     kind: PredictionKind,
     content: Content,
@@ -721,7 +768,7 @@ struct FunctionResponse {
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct OutputConfig {
+pub(super) struct OutputConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -730,14 +777,14 @@ struct OutputConfig {
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct Diagnostics {
+pub(super) struct Diagnostics {
     #[serde(skip_serializing_if = "Option::is_none")]
     previous_message_id: Option<String>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-enum Safeguard {
+pub(super) enum Safeguard {
     DangerousToolUse { classifier_context: Value },
 }
 
@@ -834,6 +881,17 @@ impl Content {
             block => vec![block],
         }
     }
+    pub(super) fn into_input(self) -> Vec<Content> {
+        match self {
+            Self::Text(text) => vec![Self::Block(Box::new(Block::Message(Message::new(
+                Role::User,
+                Self::Text(text),
+            ))))],
+            Self::Blocks(blocks) => blocks,
+            Self::Empty(()) => vec![],
+            block => vec![block],
+        }
+    }
     pub(super) fn has_server_history(&self) -> bool {
         match self {
             Self::Blocks(blocks) => blocks.iter().any(Self::has_server_history),
@@ -872,6 +930,117 @@ impl WebSettings {
         super::tools::Domains {
             allowed_domains: self.allowed_domains.clone(),
             blocked_domains: self.blocked_domains.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Wire {
+    Messages,
+    Responses,
+    Chat,
+    Gemini,
+}
+impl Message {
+    fn allowed(&self, wire: Wire) -> bool {
+        let role = match wire {
+            Wire::Messages => matches!(self.role, Role::User | Role::Assistant),
+            Wire::Chat | Wire::Responses => matches!(
+                self.role,
+                Role::System
+                    | Role::Developer
+                    | Role::User
+                    | Role::Assistant
+                    | Role::Tool
+                    | Role::Function
+            ),
+            Wire::Gemini => false,
+        };
+        role && self
+            .content
+            .as_ref()
+            .is_none_or(|content| content.allowed(wire))
+            && (wire == Wire::Messages || self.output_config.is_none())
+            && (wire == Wire::Chat
+                || (self.name.is_none()
+                    && self.tool_calls.is_none()
+                    && self.tool_call_id.is_none()
+                    && self.function_call.is_none()))
+    }
+}
+impl Content {
+    fn allowed(&self, wire: Wire) -> bool {
+        match self {
+            Self::Text(_) | Self::Empty(()) => true,
+            Self::Blocks(items) => items.iter().all(|item| item.allowed(wire)),
+            Self::Block(block) => match block.as_ref() {
+                Block::Message(message) => message.allowed(wire),
+                Block::Parts(parts) => {
+                    wire == Wire::Gemini
+                        && parts
+                            .parts
+                            .as_ref()
+                            .is_none_or(|content| content.allowed(wire))
+                }
+                Block::Typed(block) => match block {
+                    TypedBlock::Text { .. } => matches!(wire, Wire::Messages | Wire::Chat),
+                    TypedBlock::Image { .. }
+                    | TypedBlock::ToolUse { .. }
+                    | TypedBlock::ToolReference { .. }
+                    | TypedBlock::ServerToolUse { .. }
+                    | TypedBlock::WebSearchResult { .. }
+                    | TypedBlock::WebSearchToolResultError { .. }
+                    | TypedBlock::WebFetchToolResultError { .. }
+                    | TypedBlock::Thinking { .. }
+                    | TypedBlock::RedactedThinking { .. } => wire == Wire::Messages,
+                    TypedBlock::Document { source, .. } => {
+                        wire == Wire::Messages && source.allowed(wire)
+                    }
+                    TypedBlock::ToolResult { content, .. } => {
+                        wire == Wire::Messages
+                            && content.as_ref().is_none_or(|content| content.allowed(wire))
+                    }
+                    TypedBlock::WebFetchResult { content, .. }
+                    | TypedBlock::WebSearchToolResult { content, .. }
+                    | TypedBlock::WebFetchToolResult { content, .. } => {
+                        wire == Wire::Messages && content.allowed(wire)
+                    }
+                    TypedBlock::InputText { .. }
+                    | TypedBlock::InputImage { .. }
+                    | TypedBlock::InputFile { .. }
+                    | TypedBlock::OutputText { .. }
+                    | TypedBlock::Refusal { .. }
+                    | TypedBlock::FunctionCall { .. }
+                    | TypedBlock::CustomToolCall { .. }
+                    | TypedBlock::SummaryText { .. }
+                    | TypedBlock::WebSearchCall { .. } => wire == Wire::Responses,
+                    TypedBlock::Message { content, .. }
+                    | TypedBlock::CustomToolCallOutput {
+                        output: content, ..
+                    }
+                    | TypedBlock::FunctionCallOutput {
+                        output: content, ..
+                    } => wire == Wire::Responses && content.allowed(wire),
+                    TypedBlock::Reasoning {
+                        summary, content, ..
+                    } => {
+                        wire == Wire::Responses
+                            && summary.as_ref().is_none_or(|content| content.allowed(wire))
+                            && content.as_ref().is_none_or(|content| content.allowed(wire))
+                    }
+                    TypedBlock::ImageUrl { .. }
+                    | TypedBlock::InputAudio { .. }
+                    | TypedBlock::Audio { .. } => wire == Wire::Chat,
+                },
+            },
+        }
+    }
+}
+impl Source {
+    fn allowed(&self, wire: Wire) -> bool {
+        match self {
+            Self::Content { content } => content.allowed(wire),
+            Self::Base64 { .. } | Self::Text { .. } => true,
         }
     }
 }

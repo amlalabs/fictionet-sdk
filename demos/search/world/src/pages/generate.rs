@@ -5,7 +5,7 @@ use super::*;
 impl Pages {
     /// Writes a generation's ledger rows, or a stored generation's one row.
     pub(super) fn log(&self, _cx: &Cx, rows: &[Value]) -> Result<(), Stop> {
-        let mut store = self.store();
+        let mut store = self.writing_store()?;
         for row in rows {
             store.log_generation(row).map_err(Stop::store)?;
         }
@@ -24,7 +24,7 @@ impl Pages {
                 .map(|_| ())
                 .map_err(|_| Stop::Budget);
         }
-        let mut store = self.store();
+        let mut store = self.writing_store()?;
         if store.made >= GENERATION_BUDGET {
             return Err(Stop::Budget);
         }
@@ -54,9 +54,12 @@ impl Pages {
                     self.reserve()?;
                 }
                 let (system, user, max_tokens) = prompt();
-                let parse = |text: &str| match gives_away(text) {
-                    Some(reason) => Err(prompts::Unreadable::Disclosure(reason)),
-                    None => read(text, false),
+                let parse = |text: &str| {
+                    model.check_document("text/html", text)?;
+                    match gives_away(text) {
+                        Some(reason) => Err(prompts::Unreadable::Disclosure(reason)),
+                        None => read(text, false),
+                    }
                 };
                 let rejected = |reason: &prompts::Unreadable| {
                     self.report(
@@ -161,7 +164,7 @@ impl Pages {
             .lock(cx, "cast".into())
             .await
             .map_err(Stop::store)?;
-        if let Some(cast) = self.store().cast() {
+        if let Some(cast) = self.writing_store()?.cast() {
             return Ok(cast.people.clone());
         }
         if self.live_calls.is_some() {
@@ -169,7 +172,9 @@ impl Pages {
                 people: Vec::new(),
                 usage: Usage::stored(0),
             };
-            self.store().set_cast(cast.clone()).map_err(Stop::store)?;
+            self.writing_store()?
+                .set_cast(cast.clone())
+                .map_err(Stop::store)?;
             return Ok(cast.people);
         }
         self.reserve()?;
@@ -189,7 +194,9 @@ impl Pages {
             people: made.fields,
             usage: made.usage,
         };
-        self.store().set_cast(record.clone()).map_err(Stop::store)?;
+        self.writing_store()?
+            .set_cast(record.clone())
+            .map_err(Stop::store)?;
         Ok(record.people)
     }
 
@@ -203,7 +210,7 @@ impl Pages {
             .lock(cx, format!("site {host}"))
             .await
             .map_err(Stop::store)?;
-        let stored = self.store().site(host).cloned();
+        let stored = self.writing_store()?.site(host).cloned();
         if let Some(profile) = &stored
             && !profile.css.is_empty()
         {
@@ -241,7 +248,9 @@ impl Pages {
         } else {
             profile.css = make::site_profile(host).css;
         }
-        self.store().site_once(host, profile).map_err(Stop::store)
+        self.writing_store()?
+            .site_once(host, profile)
+            .map_err(Stop::store)
     }
 
     pub(super) async fn make_page(
@@ -272,7 +281,7 @@ impl Pages {
         let cast = self.cast(cx).await?;
         let url = format!("https://{host}{target}");
         let mut ask = {
-            let store = self.store();
+            let store = self.writing_store()?;
             PageAsk {
                 url: url.clone(),
                 mentions: prompts::asked_mentions(store.mentions(host, target)),
@@ -290,7 +299,6 @@ impl Pages {
                 cast,
             }
         };
-        // Establish shared facts before parallel writers reuse the published context.
         let _publication = publication.filter(|_| {
             !self
                 .store()
@@ -314,7 +322,7 @@ impl Pages {
             .map(|p| p.kind)
             .unwrap_or_else(|| make::site_profile(host).kind);
         let mut known = {
-            let store = self.store();
+            let store = self.writing_store()?;
             let mut known = store.known(&seed);
             if host == "www.youtube.com" && target == "/" {
                 known.extend(
@@ -349,6 +357,21 @@ impl Pages {
                     date: String::new(),
                 }),
         );
+        let latest = {
+            let store = self.writing_store()?;
+            ask.mentions
+                .iter()
+                .filter_map(|mention| mention["from"].as_str())
+                .filter_map(|url| {
+                    let (host, target) = text::target_of(url);
+                    store
+                        .page(&host, &target)
+                        .and_then(|page| seed::parse_date(&page.date).ok())
+                })
+                .chain(seed::parse_date(&seed.date).ok())
+                .min()
+                .expect("world date")
+        };
         let made = self
             .generate(
                 cx,
@@ -368,7 +391,7 @@ impl Pages {
                     make::page_with_known(&seed, host, target, &mentions, kind, &known)
                 },
                 || {
-                    let (system, user) = prompts::page(
+                    let (system, mut user) = prompts::page(
                         &seed,
                         &ask.cast,
                         &ask.url,
@@ -377,6 +400,7 @@ impl Pages {
                         &ask.host_pages,
                         &ask.claims,
                     );
+                    user.push_str(&format!("\nThe latest permitted publication/update date is {latest}. Incoming links already published by this date must remain possible. Later context describes the wider world; do not import its later knowledge into this page."));
                     (
                         system,
                         user,
@@ -385,6 +409,41 @@ impl Pages {
                 },
                 |text, repair| {
                     let mut page = prompts::read_page(text, expected, !ask.mentions.is_empty())?;
+                    if page.date.is_empty() && page.content_type.starts_with("text/html") {
+                        page.date = latest.to_string();
+                    }
+                    if let Maker::Model(model) = self.maker() {
+                        let store = self.store();
+                        let linked: Vec<_> = links(&url, &page.body).iter()
+                            .filter_map(|(host, target, _)| store.page(host, target))
+                            .filter_map(|page| seed::parse_date(&page.date).ok()).collect();
+                        answers::chronology(&page, latest, &linked)?;
+                        model.check_document(&page.content_type, &page.body)?;
+                    }
+                    if page.content_type.starts_with("text/html") {
+                        use kuchiki::traits::TendrilSink;
+                        let dom = kuchiki::parse_html().one(page.body.as_str());
+                        let mut urls = HashMap::new();
+                        for link in dom.select("a[href]").expect("link selector") {
+                            let mut attrs = link.attributes.borrow_mut();
+                            if let Some(href) = attrs.get_mut("href")
+                                && let Some(absolute) = text::join(&url, href)
+                            {
+                                *href = urls.entry(absolute.clone()).or_insert_with(|| self.article_url(cx, &absolute)).clone();
+                            }
+                        }
+                        let mut normalize_url = |href: &mut String| {
+                            if let Some(absolute) = text::join(&url, href) {
+                                *href = urls.entry(absolute.clone()).or_insert_with(|| self.article_url(cx, &absolute)).clone();
+                            }
+                        };
+                        for (_, href) in &mut page.sidebar { normalize_url(href); }
+                        if let Some(site) = &mut page.site {
+                            for link in site.nav.iter_mut().chain(&mut site.footer) { normalize_url(&mut link.href); }
+                        }
+                        page.body = dom.select_first("body").expect("HTML body").as_node().children()
+                            .map(|node| node.to_string()).collect();
+                    }
                     if repair {
                         super::answers::repair_page(&mut page)?;
                     }
@@ -402,6 +461,14 @@ impl Pages {
                         };
                         text::validate_page(&page.content_type, body.as_bytes())
                             .map_err(prompts::Unreadable::Content)?;
+                    }
+                    if let Maker::Model(model) = self.maker() {
+                        let profile = ask.profile.as_ref().or(page.site.as_ref()).cloned()
+                            .unwrap_or_else(|| make::site_profile(host));
+                        let rendered = if page.content_type.starts_with("text/html") {
+                            render::page_at(host, target, &profile, &page, &seed.date)
+                        } else { page.body.clone() };
+                        model.check_document(&page.content_type, &rendered)?;
                     }
                     if ask.profile.is_none()
                         && fictionet_extras::sites::lookup(host, target).is_none()
@@ -432,7 +499,7 @@ impl Pages {
                 if described.name.is_empty() {
                     described.name = make::site_profile(host).name;
                 }
-                self.store()
+                self.writing_store()?
                     .site_once(host, described)
                     .map_err(Stop::store)?
             }
@@ -472,7 +539,43 @@ impl Pages {
             fixed: false,
             usage: Some(made.usage),
         };
-        let mut store = self.store();
+        let mut store = self.writing_store()?;
+        if matches!(self.maker(), Maker::Model(_)) {
+            let latest = record
+                .mentions
+                .iter()
+                .filter_map(|mention| mention["from"].as_str())
+                .filter_map(|url| {
+                    let (host, target) = text::target_of(url);
+                    store
+                        .page(&host, &target)
+                        .and_then(|page| seed::parse_date(&page.date).ok())
+                })
+                .chain(seed::parse_date(&seed.date).ok())
+                .min()
+                .expect("world date");
+            let linked: Vec<_> = links(&record.url, &String::from_utf8_lossy(&record.body))
+                .iter()
+                .filter_map(|(host, target, _)| store.page(host, target))
+                .filter_map(|page| seed::parse_date(&page.date).ok())
+                .collect();
+            answers::chronology(
+                &make::Page {
+                    date: record.date.clone(),
+                    body: page.body.clone(),
+                    content_type: record.content_type.clone(),
+                    description: record.description.clone(),
+                    claims: record.claims.clone(),
+                    ..Default::default()
+                },
+                latest,
+                &linked,
+            )
+            .map_err(|reason| Stop::Failed {
+                error: reason.to_string(),
+                usage: None,
+            })?;
+        }
         store.insert_page(record.clone()).map_err(Stop::store)?;
         if prefetch {
             store

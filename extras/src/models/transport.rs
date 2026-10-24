@@ -8,6 +8,8 @@ use http_body::{Body as HttpBody, Frame};
 
 mod text;
 
+pub(super) const RESPONSE_LIMIT: usize = 32 * 1024 * 1024;
+
 /// The outcome of one attempt to contact a provider.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -112,7 +114,7 @@ pub(super) fn sanitize(
             pending: Vec::new(),
             streaming,
             records: Vec::new(),
-            lines: Stream::new(sse::RawLines::with_limit(32 * 1024 * 1024)),
+            lines: Stream::new(sse::RawLines::with_limit(RESPONSE_LIMIT)),
             event: Vec::new(),
             done: false,
         })
@@ -299,7 +301,7 @@ impl HttpBody for Scrubbed {
                                 })
                                 .sum::<usize>();
                         if self.pending.len() + held + event_bytes + self.lines.held()
-                            > 32 * 1024 * 1024
+                            > RESPONSE_LIMIT
                         {
                             self.done = true;
                             return Poll::Ready(Some(Err(Error::msg(

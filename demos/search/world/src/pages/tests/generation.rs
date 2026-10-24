@@ -552,3 +552,174 @@ fn concurrent_interactive_searches_share_the_first_lists_promises() {
         Ok(())
     });
 }
+
+#[test]
+fn source_changes_drop_writers_and_queued_searches() {
+    struct Held {
+        started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        calls: AtomicUsize,
+        dropped: Arc<AtomicUsize>,
+    }
+    struct InFlight(Arc<AtomicUsize>);
+    impl Drop for InFlight {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    impl Transport for Held {
+        fn post<'a>(&'a self, _: &'a Cx, _: Headers, _: Vec<u8>) -> Post<'a> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let _inflight = InFlight(self.dropped.clone());
+                if let Some(started) = self.started.lock().unwrap().take() {
+                    started.send(()).unwrap();
+                }
+                std::future::pending().await
+            })
+        }
+    }
+    for restart in [false, true] {
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let held = Arc::new(Held {
+            started: Mutex::new(Some(started)),
+            calls: AtomicUsize::new(0),
+            dropped: dropped.clone(),
+        });
+        let model = Model::new(
+            Provider::OpenRouter,
+            "small",
+            "",
+            Key::new("provider key", Some(KEY.into())).unwrap(),
+            held.clone(),
+        );
+        let pages = Arc::new(Pages::with_model(seed(), model));
+        lab(move |cx| async move {
+            let (done, response) = tokio::sync::oneshot::channel();
+            let searching = pages.clone();
+            cx.spawn(move |cx| async move {
+                let result = fictionet_extras::models::Engine::search(
+                    searching,
+                    cx,
+                    "cable incident".into(),
+                    Default::default(),
+                )
+                .await;
+                done.send(result.is_err()).unwrap();
+                Ok(())
+            });
+            ready.await.unwrap();
+            let (queued, entered) = tokio::sync::oneshot::channel();
+            let (done, queued_response) = tokio::sync::oneshot::channel();
+            let searching = pages.clone();
+            cx.spawn(move |cx| async move {
+                queued.send(()).unwrap();
+                done.send(google(&searching, &cx, "cable cause").await.status)
+                    .unwrap();
+                Ok(())
+            });
+            entered.await.unwrap();
+            let revision = pages.generation().revision;
+            pages
+                .apply(
+                    &cx,
+                    if restart {
+                        Command::Restart {
+                            expected_revision: revision,
+                        }
+                    } else {
+                        Command::SetNewPages {
+                            new_pages: NewPages::Off,
+                            expected_revision: revision,
+                        }
+                    },
+                )
+                .unwrap();
+            assert!(response.await.unwrap());
+            assert_eq!(queued_response.await.unwrap(), 503);
+            assert_eq!(held.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(dropped.load(Ordering::SeqCst), 1);
+            assert_eq!(pages.store().searches().count(), 0);
+            assert_eq!(pages.store().pages().count(), 0);
+            Ok(())
+        });
+    }
+}
+
+#[test]
+fn written_pages_rewrite_future_knowledge_and_respect_referring_datelines() {
+    let fake = Fake::script(vec![
+        completion(
+            0,
+            "STATUS: 200\nTITLE: Cable report\nDATE: 2026-10-07\nSITE_CSS: body {color:#234}\nBODY:\n<h1>Cable report</h1><p>The cable incident occurred on 6 October 2026. The report of 14 October 2026 confirms it.</p><a href='https://research.fields.com/analysis'>Analysis</a>",
+            None,
+        ),
+        completion(
+            0,
+            "STATUS: 200\nTITLE: Cable report\nDATE: 2026-10-14\nSITE_CSS: body {color:#234}\nBODY:\n<h1>Cable report</h1><p>Published 7 October 2026. Updated 14 October 2026. The cable incident occurred on 6 October 2026.</p><a href='https://research.fields.com/analysis'>Analysis</a>",
+            None,
+        ),
+        completion(
+            0,
+            "STATUS: 200\nTITLE: Cable analysis\nDATE: 2026-10-15\nSITE_CSS: body {color:#234}\nBODY:\n<h1>Cable analysis</h1><p>The cable incident occurred on 6 October 2026.</p>",
+            None,
+        ),
+        completion(
+            0,
+            "STATUS: 200\nTITLE: Cable analysis\nDATE: 2026-10-14\nSITE_CSS: body {color:#234}\nBODY:\n<h1>Cable analysis</h1><p>The cable incident occurred on 6 October 2026.</p>",
+            None,
+        ),
+    ]);
+    let pages = Arc::new(Pages::with_model(seed(), openrouter(fake.clone())));
+    lab(move |cx| async move {
+        let first = get(&pages, &cx, "https://news.fields.com/report").await;
+        assert_eq!(first.status, 200);
+        assert_eq!(
+            pages
+                .store()
+                .page("news.fields.com", "/report")
+                .unwrap()
+                .date,
+            "2026-10-14"
+        );
+        let next = get(&pages, &cx, "https://research.fields.com/analysis").await;
+        assert_eq!(next.status, 200);
+        assert_eq!(
+            pages
+                .store()
+                .page("research.fields.com", "/analysis")
+                .unwrap()
+                .date,
+            "2026-10-14"
+        );
+        assert_eq!(fake.users().len(), 4);
+        assert!(fake.users()[3].contains("latest permitted publication/update date is 2026-10-14"));
+        Ok(())
+    });
+}
+
+#[test]
+fn calendar_dates_and_article_identifiers_are_concrete() {
+    assert_eq!(
+        crate::pages::answers::dates(
+            "2026-10-14; 14 October 2026; October 14, 2026; 14 Oct 2026; Oct 14, 2026"
+        ),
+        vec![seed::parse_date("2026-10-14").unwrap(); 5]
+    );
+    lab(|cx| async move {
+        let url = "https://www.which.co.uk/news/article/battery-recalls-aBc3dEf9GhIj";
+        let first = crate::pages::answers::article_url(&cx, url);
+        let next = crate::pages::answers::article_url(&cx, url);
+        assert_ne!(first, url);
+        assert_ne!(first, next);
+        assert!(first.starts_with("https://www.which.co.uk/news/article/battery-recalls-"));
+        assert_eq!(
+            crate::pages::answers::article_url(
+                &cx,
+                "https://www.bbc.com/news/articles/battery-recalls"
+            ),
+            "https://www.bbc.com/news/articles/battery-recalls"
+        );
+        Ok(())
+    });
+}

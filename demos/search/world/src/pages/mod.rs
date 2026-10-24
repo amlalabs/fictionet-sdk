@@ -43,6 +43,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use store::{CastRecord, PageRecord, SearchRecord, Store};
 
+tokio::task_local! {
+    static WRITING: tokio::sync::watch::Receiver<bool>;
+}
+
 /// New generations one world may start: searches, pages, prefetches and the
 /// cast, failed ones included.
 pub const GENERATION_BUDGET: usize = 200;
@@ -435,6 +439,7 @@ pub struct Pages {
     prefetch: usize,
     live_calls: Option<Arc<std::sync::atomic::AtomicUsize>>,
     store: Mutex<Store>,
+    writing: Mutex<tokio::sync::watch::Sender<bool>>,
     copied: Option<copied::Corpus>,
     copied_active: std::sync::atomic::AtomicBool,
     live: Option<Arc<live::Live>>,
