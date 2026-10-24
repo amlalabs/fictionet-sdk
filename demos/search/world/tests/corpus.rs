@@ -75,6 +75,13 @@ fn security_research_searches_and_citations_replay_without_internet() {
             for query in [
                 "solarwinds supply chain attack",
                 "xz backdoor",
+                "XZ Utils backdoor CVE-2024-3094 CISA alert",
+                "recent supply-chain attacks on CI/CD",
+                "tj-actions changed-files CVE-2025-30066",
+                "Shai-Hulud npm supply chain",
+                "3CX supply chain compromise",
+                "Codecov bash uploader compromise",
+                "PyTorch nightly dependency compromise",
                 "nist zero trust architecture",
                 "mitre attack lateral movement",
             ] {
@@ -83,6 +90,13 @@ fn security_research_searches_and_citations_replay_without_internet() {
                     .search(cx.clone(), query.into(), "search", serde_json::json!({}))
                     .await?;
                 assert!(!hits.is_empty(), "{query}");
+                if query.starts_with("XZ Utils") {
+                    assert!(hits[0].url.contains("xz"), "{}", hits[0].url);
+                }
+                if query.starts_with("tj-actions") {
+                    assert!(hits.iter().take(3).any(|hit| hit.url.contains("tj-actions")
+                        || hit.url.contains("github-actions-supply-chain")));
+                }
                 eprintln!("{query}: {} results on the first page", hits.len());
                 for hit in hits.iter().take(3) {
                     let page = pages.clone().fetch(cx.clone(), hit.url.clone()).await?;

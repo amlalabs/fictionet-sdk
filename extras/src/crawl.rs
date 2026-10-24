@@ -156,7 +156,9 @@ impl Index {
         self.documents.is_empty()
     }
 
-    /// Rank documents covering every query term with BM25, using URL order to break ties.
+    /// Rank by query coverage, then BM25, using URL order to break ties.
+    /// A majority of the distinct terms must match so a shared word cannot
+    /// fill a result page for an unrelated query.
     pub fn search(&self, query: &str, start: usize, limit: usize) -> search::Search {
         if self.is_empty() {
             return search::Search {
@@ -172,10 +174,7 @@ impl Index {
         words.dedup();
         for word in &words {
             let Some(postings) = self.postings.get(word) else {
-                return search::Search {
-                    total: Some(0),
-                    ..Default::default()
-                };
+                continue;
             };
             let frequency = postings.len() as f64;
             let idf = (1.0 + (n - frequency + 0.5) / (frequency + 0.5)).ln();
@@ -189,10 +188,13 @@ impl Index {
         }
         let mut ranked: Vec<_> = scores
             .into_iter()
-            .filter_map(|(id, (score, covered))| (covered == words.len()).then_some((id, score)))
+            .filter_map(|(id, (score, covered))| {
+                (covered > words.len() / 2).then_some((id, covered, score))
+            })
             .collect();
-        ranked.sort_by(|(a, x), (b, y)| {
-            y.total_cmp(x)
+        ranked.sort_by(|(a, ac, x), (b, bc, y)| {
+            bc.cmp(ac)
+                .then_with(|| y.total_cmp(x))
                 .then(self.documents[*a].url.cmp(&self.documents[*b].url))
         });
         search::Search {
@@ -201,7 +203,7 @@ impl Index {
                 .into_iter()
                 .skip(start)
                 .take(limit)
-                .map(|(id, _)| {
+                .map(|(id, _, _)| {
                     let doc = &self.documents[id];
                     let lower = doc.text.to_lowercase();
                     let matched = words
@@ -245,7 +247,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_query_term_must_be_covered_and_totals_precede_pagination() {
+    fn unrelated_queries_are_empty_and_totals_precede_pagination() {
         let mut index = Index::default();
         for page in 0..12 {
             index.add(
@@ -279,6 +281,29 @@ mod tests {
         let past = index.search("solar", usize::MAX, 10);
         assert_eq!(past.total, Some(12));
         assert!(past.results.is_empty());
+    }
+
+    #[test]
+    fn coverage_ranks_a_relevant_page_with_additional_query_words() {
+        let mut index = Index::default();
+        index.add(
+            "https://security.org/xz".into(),
+            "XZ Utils backdoor CVE-2024-3094".into(),
+            "A backdoor in XZ Utils compromises SSH authentication.".into(),
+        );
+        index.add(
+            "https://security.org/alerts".into(),
+            "CISA alert".into(),
+            "CISA issued an alert for CVE-2024-3094.".into(),
+        );
+        let found = index.search("XZ Utils backdoor CVE-2024-3094 CISA alert", 0, 10);
+        assert_eq!(found.total, Some(2));
+        assert_eq!(found.results[0].url, "https://security.org/xz");
+        assert_eq!(
+            index.search("backdoor dishwasher astronomy", 0, 10).total,
+            Some(0)
+        );
+        assert_eq!(index.search("xz utils extra", 0, 10).total, Some(1));
     }
     #[test]
     fn follows_only_corpus_links_and_ranks_page_text() {

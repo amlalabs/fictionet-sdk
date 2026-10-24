@@ -32,12 +32,25 @@ urls = [
   "https://www.crowdstrike.com/en-us/blog/sunspot-malware-technical-analysis/",
   "https://attack.mitre.org/software/S0559/",
   "https://attack.mitre.org/software/S0562/",
+  "https://unit42.paloaltonetworks.com/github-actions-supply-chain-attack/",
+  "https://www.stepsecurity.io/blog/harden-runner-detection-tj-actions-changed-files-action-is-compromised",
+  "https://www.cisa.gov/news-events/alerts/2025/03/18/supply-chain-compromise-third-party-tj-actionschanged-files-cve-2025-30066-and-reviewdogaction",
+  "https://www.wiz.io/blog/shai-hulud-npm-supply-chain-attack",
+  "https://unit42.paloaltonetworks.com/npm-supply-chain-attack/",
+  "https://www.cisa.gov/news-events/alerts/2025/09/23/widespread-supply-chain-compromise-impacting-npm-ecosystem",
+  "https://cloud.google.com/blog/topics/threat-intelligence/3cx-software-supply-chain-compromise/",
+  "https://attack.mitre.org/campaigns/C0057/",
+  "https://about.codecov.io/security-update/",
+  "https://www.cisa.gov/news-events/alerts/2021/04/30/codecov-releases-new-detections-supply-chain-compromise",
+  "https://about.codecov.io/apr-2021-post-mortem/",
+  "https://pytorch.org/blog/compromised-nightly-dependency/",
 ]
 +++
 
 The web contains security research, incident analyses, advisories and defensive
 guidance. Sources include MITRE ATT&CK, CISA, NIST and security researchers and
-vendors. Research software supply chain compromises such as SolarWinds and the
-XZ backdoor, initial access, lateral movement, credential theft and zero trust
+vendors. Research software supply chain compromises such as tj-actions,
+Shai-Hulud, SolarWinds, the XZ backdoor, 3CX, Codecov and PyTorch nightly,
+initial access, lateral movement, credential theft and zero trust
 architecture using primary sources. Keep claims grounded in the sources and
 distinguish observations from recommendations.
