@@ -567,21 +567,53 @@ fn package_root(root: &Path) -> std::io::Result<std::path::PathBuf> {
     }
 }
 
-fn publish(packages: &Path, destination: &Path) -> Result {
-    std::fs::create_dir_all(destination)?;
-    let name = format!(
-        "batch-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)?
-            .as_nanos()
-    );
-    std::fs::rename(packages, destination.join(&name))?;
-    let pointer = destination.join(format!(".{name}"));
-    std::os::unix::fs::symlink(&name, &pointer)?;
-    std::fs::rename(pointer, destination.join("current"))?;
-    // Published batches remain immutable, including paths held by older worlds.
-    Ok(())
+struct Publication {
+    directory: std::path::PathBuf,
+    destination: std::path::PathBuf,
+    published: bool,
+}
+
+impl Publication {
+    fn prepare(staged: &Path, destination: &Path) -> Result<Self> {
+        std::fs::create_dir_all(destination)?;
+        let name = format!(
+            "batch-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)?
+                .as_nanos()
+        );
+        let directory = destination.join(name);
+        std::fs::rename(staged, &directory)?;
+        Ok(Self {
+            directory,
+            destination: destination.to_owned(),
+            published: false,
+        })
+    }
+
+    fn commit(mut self) -> Result {
+        let name = self.directory.file_name().unwrap();
+        let pointer = self
+            .destination
+            .join(format!(".{}", name.to_string_lossy()));
+        std::os::unix::fs::symlink(name, &pointer)?;
+        std::fs::rename(pointer, self.destination.join("current"))?;
+        self.published = true;
+        Ok(())
+    }
+}
+
+impl Drop for Publication {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
+}
+
+fn publish(staged: &Path, destination: &Path) -> Result {
+    Publication::prepare(staged, destination)?.commit()
 }
 
 pub async fn run(downloads: &Path, python: Option<&Path>) -> Result {
@@ -632,6 +664,8 @@ pub async fn run(downloads: &Path, python: Option<&Path>) -> Result {
     if root.join("packages").is_dir() {
         std::os::unix::fs::symlink(root.join("packages"), staged_corpus.join("packages"))?;
     }
+    let publication = Publication::prepare(&staged_corpus, &root)?;
+    std::os::unix::fs::symlink(&publication.directory, &staged_corpus)?;
     let status = Command::new("rustup")
         .args([
             "run",
@@ -643,6 +677,8 @@ pub async fn run(downloads: &Path, python: Option<&Path>) -> Result {
             "web-world",
             "--test",
             "corpus",
+            "--",
+            "--test-threads=1",
         ])
         .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap())
         .env("SEARCH_DOWNLOADS", std::fs::canonicalize(&batch.0)?)
@@ -655,22 +691,18 @@ pub async fn run(downloads: &Path, python: Option<&Path>) -> Result {
     if staged_corpus.join("packages").is_symlink() {
         std::fs::remove_file(staged_corpus.join("packages"))?;
     }
-    let research_batch = batch.0.join("research");
-    std::fs::rename(&staged_corpus, &research_batch)?;
-    publish(&research_batch, &root)?;
+    publication.commit()?;
+    let Some(python) = python else {
+        println!("Captured research sources in {}", root.display());
+        return Ok(());
+    };
+    std::fs::remove_file(&staged_corpus)?;
     std::fs::create_dir_all(&staged_corpus)?;
     for entry in std::fs::read_dir(package_root(&root)?)? {
         let entry = entry?;
         if entry.path().to_string_lossy().ends_with(".warc.gz") {
             std::os::unix::fs::symlink(entry.path(), staged_corpus.join(entry.file_name()))?;
         }
-    }
-    let Some(python) = python else {
-        println!("Captured research sources in {}", root.display());
-        return Ok(());
-    };
-    if staged_corpus.join("packages").is_symlink() {
-        std::fs::remove_file(staged_corpus.join("packages"))?;
     }
     // Resolve packages into an empty batch. Indexes and distributions are
     // published together only after an offline install.
@@ -806,6 +838,73 @@ pub async fn run(downloads: &Path, python: Option<&Path>) -> Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validation_paths_survive_publication_and_failed_batches_stay_private() {
+        let root = Batch(std::env::temp_dir().join(format!(
+                "corpus-validation-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            )));
+        let staged = root.0.join("staged");
+        let destination = root.0.join("corpus");
+        std::fs::create_dir_all(&staged).unwrap();
+        let body = "<title>Source</title><p>complete article</p>";
+        Archive::default()
+            .append(
+                &staged.join("pages.warc.gz"),
+                "https://source.org/article",
+                &fictionet_extras::warc::Response {
+                    status: http::StatusCode::OK,
+                    headers: http::HeaderMap::from_iter([(
+                        http::header::CONTENT_TYPE,
+                        "text/html".parse().unwrap(),
+                    )]),
+                    body: body.into(),
+                },
+            )
+            .unwrap();
+        let publication = Publication::prepare(&staged, &destination).unwrap();
+        let validation_reader = Archive::directory(&publication.directory).unwrap();
+        assert!(!destination.join("current").exists());
+        let seed = web_world::pages::Seed::parse(
+            "capture",
+            "+++\n[corpus]\ndirectory='.'\nurls=['https://source.org/article']\n+++\nResearch",
+            |_| unreachable!(),
+        )
+        .unwrap();
+        web_world::pages::Pages::from_corpus(seed.clone(), &publication.directory, None).unwrap();
+        let cache_path = publication.directory.join("search-index.json");
+        let cached = std::fs::read(&cache_path).unwrap();
+        publication.commit().unwrap();
+        web_world::pages::Pages::from_corpus(seed, &destination, None).unwrap();
+        assert_eq!(std::fs::read(cache_path).unwrap(), cached);
+        assert_eq!(
+            validation_reader
+                .get("https://source.org/article")
+                .unwrap()
+                .unwrap()
+                .body,
+            body
+        );
+        std::fs::create_dir_all(&staged).unwrap();
+        let failed = Publication::prepare(&staged, &destination).unwrap();
+        let discarded = failed.directory.clone();
+        drop(failed);
+        assert!(!discarded.exists());
+        assert_eq!(
+            Archive::directory(&destination)
+                .unwrap()
+                .get("https://source.org/article")
+                .unwrap()
+                .unwrap()
+                .body,
+            body
+        );
+    }
 
     #[test]
     fn research_publication_switches_the_whole_batch_and_keeps_old_readers() {

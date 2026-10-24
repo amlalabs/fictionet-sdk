@@ -34,6 +34,8 @@ urls = [
   "https://attack.mitre.org/software/S0562/",
   "https://unit42.paloaltonetworks.com/github-actions-supply-chain-attack/",
   "https://www.stepsecurity.io/blog/harden-runner-detection-tj-actions-changed-files-action-is-compromised",
+  "https://www.stepsecurity.io/blog/state-of-open-source-supply-chain-attacks",
+  "https://www.wiz.io/blog/new-github-action-supply-chain-attack-reviewdog-action-setup",
   "https://www.cisa.gov/news-events/alerts/2025/03/18/supply-chain-compromise-third-party-tj-actionschanged-files-cve-2025-30066-and-reviewdogaction",
   "https://www.wiz.io/blog/shai-hulud-npm-supply-chain-attack",
   "https://posthog.com/blog/nov-24-shai-hulud-attack-post-mortem",

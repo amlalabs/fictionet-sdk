@@ -249,6 +249,7 @@ impl Pages {
     }
 
     /// Open the corpus chosen by the world's brief, relative to the downloads root.
+    /// Its search index is cached beside the immutable archives.
     pub fn from_corpus(seed: Seed, downloads: &Path, model: Option<Model>) -> Result<Self, String> {
         let corpus = seed
             .corpus
@@ -256,7 +257,7 @@ impl Pages {
             .ok_or("the seed has no copied corpus")?;
         let root = downloads.join(&corpus.directory);
         let urls = corpus.urls.clone();
-        Self::copied(seed, &root, &urls, model)
+        Self::load_copied(seed, &root, &urls, model, true)
     }
 
     /// Open the copied sites and crawl them from their starting URLs.
@@ -267,13 +268,24 @@ impl Pages {
         seeds: &[String],
         model: Option<Model>,
     ) -> Result<Self, String> {
+        Self::load_copied(seed, root, seeds, model, false)
+    }
+
+    fn load_copied(
+        seed: Seed,
+        root: &Path,
+        seeds: &[String],
+        model: Option<Model>,
+        cache_index: bool,
+    ) -> Result<Self, String> {
         let started = Instant::now();
         let research_root = Archive::directory_root(root).map_err(|e| e.to_string())?;
         eprintln!("Loading copied pages…");
         let files = archive_files(&research_root).map_err(|e| e.to_string())?;
-        let cache_path = research_root.join("search-index.json");
-        let cached = std::fs::File::open(&cache_path)
-            .ok()
+        let cache_path = cache_index.then(|| research_root.join("search-index.json"));
+        let cached = cache_path
+            .as_ref()
+            .and_then(|path| std::fs::File::open(path).ok())
             .and_then(|file| {
                 serde_json::from_reader::<_, CachedCorpus>(std::io::BufReader::new(file)).ok()
             })
@@ -337,33 +349,37 @@ impl Pages {
                     |url| corpus.response(url),
                 )
                 .map_err(|e| e.to_string())?;
-                let cache = CachedCorpus {
-                    version: INDEX_VERSION,
-                    files,
-                    seeds: seeds.to_vec(),
-                    archive: corpus.archive,
-                    missing: corpus.missing,
-                    index,
-                };
-                let temporary = cache_path.with_extension(format!(
-                    "{}-{}.tmp",
-                    std::process::id(),
-                    time::OffsetDateTime::now_utc().unix_timestamp_nanos()
-                ));
-                let saved = (|| -> std::io::Result<()> {
-                    use std::io::Write;
-                    let mut file = std::io::BufWriter::new(std::fs::File::create(&temporary)?);
-                    serde_json::to_writer(&mut file, &cache)?;
-                    file.flush()?;
-                    std::fs::rename(&temporary, &cache_path)
-                })();
-                if let Err(error) = saved {
-                    let _ = std::fs::remove_file(&temporary);
-                    eprintln!("Search index cache unavailable: {error}");
+                if let Some(cache_path) = cache_path {
+                    let cache = CachedCorpus {
+                        version: INDEX_VERSION,
+                        files,
+                        seeds: seeds.to_vec(),
+                        archive: corpus.archive,
+                        missing: corpus.missing,
+                        index,
+                    };
+                    let temporary = cache_path.with_extension(format!(
+                        "{}-{}.tmp",
+                        std::process::id(),
+                        time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+                    ));
+                    let saved = (|| -> std::io::Result<()> {
+                        use std::io::Write;
+                        let mut file = std::io::BufWriter::new(std::fs::File::create(&temporary)?);
+                        serde_json::to_writer(&mut file, &cache)?;
+                        file.flush()?;
+                        std::fs::rename(&temporary, &cache_path)
+                    })();
+                    if let Err(error) = saved {
+                        let _ = std::fs::remove_file(&temporary);
+                        eprintln!("Search index cache unavailable: {error}");
+                    }
+                    corpus.archive = cache.archive;
+                    corpus.missing = cache.missing;
+                    cache.index
+                } else {
+                    index
                 }
-                corpus.archive = cache.archive;
-                corpus.missing = cache.missing;
-                cache.index
             }
         };
         if corpus.index.is_empty() {
@@ -517,11 +533,12 @@ mod tests {
                 .unwrap()
         };
         let open = || {
-            Pages::copied(
+            Pages::load_copied(
                 Seed::builtin("web").unwrap(),
                 &root,
                 &["https://source.org/".into()],
                 None,
+                true,
             )
             .unwrap()
         };
@@ -797,7 +814,15 @@ mod tests {
 
     #[test]
     fn the_seed_selects_the_corpus_and_starting_urls() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../extras/tests/fixtures");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../extras/tests/fixtures/sky.warc.gz");
+        let root = std::env::temp_dir().join(format!(
+            "seed-corpus-{}-{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::copy(fixture, root.join("sky.warc.gz")).unwrap();
         let seed = Seed::parse(
             "capture",
             "+++\n[corpus]\ndirectory='.'\nurls=['https://sky.org/']\n+++\nCaptured pages",
@@ -811,6 +836,7 @@ mod tests {
         let mut absent = seed;
         absent.corpus.as_mut().unwrap().urls = vec!["https://uncaptured.org/".into()];
         assert!(Pages::from_corpus(absent, &root, None).is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
