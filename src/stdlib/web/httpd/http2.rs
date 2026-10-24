@@ -77,6 +77,16 @@ impl Stream {
     }
 }
 
+/// The stream a client HEADERS lands on.
+enum HeadersOn {
+    /// One the server reset a moment ago: the frame is ignored.
+    Reset,
+    /// One already open: the block is its trailers.
+    Open,
+    /// A new stream, above every identifier used so far.
+    New,
+}
+
 struct Outbound {
     recv_window: i32,
     window: i32,
@@ -298,6 +308,34 @@ impl Http2 {
         );
     }
 
+    /// Finds the stream a client HEADERS on stream `id` lands on. One on an
+    /// even stream, a stream that ended, or one below an identifier already
+    /// used ends the connection.
+    fn headers_on(&self, id: u32) -> Result<HeadersOn, wire::Error> {
+        if id & 1 == 0 {
+            return Err(problem(
+                ErrorCode::ProtocolError,
+                "client opened an even stream",
+            ));
+        }
+        if self.ignored(id) {
+            return Ok(HeadersOn::Reset);
+        }
+        if self.streams.contains_key(&id) {
+            return Ok(HeadersOn::Open);
+        }
+        if id <= self.last_stream {
+            // A stream that ended, or one below an identifier already used
+            // (RFC 9113 sections 5.1 and 5.1.1): either is a connection
+            // error, and, as in h2, the two are not told apart.
+            return Err(problem(
+                ErrorCode::ProtocolError,
+                "HEADERS on a closed stream",
+            ));
+        }
+        Ok(HeadersOn::New)
+    }
+
     fn headers(
         &mut self,
         read: wire::BlockRead,
@@ -307,14 +345,12 @@ impl Http2 {
             return Ok(());
         };
         let id = read.stream;
-        if id & 1 == 0 {
-            return Err(problem(
-                ErrorCode::ProtocolError,
-                "client opened an even stream",
-            ));
-        }
-        if self.ignored(id) {
-            return Ok(());
+        match self.headers_on(id)? {
+            HeadersOn::Reset => return Ok(()),
+            HeadersOn::Open => {}
+            HeadersOn::New => {
+                self.last_stream = id;
+            }
         }
         if let Some(stream) = self.streams.get(&id) {
             if stream.recv_closed {
@@ -334,16 +370,6 @@ impl Http2 {
             }
             return Ok(());
         }
-        if id <= self.last_stream {
-            // A stream that ended, or one below an identifier already used
-            // (RFC 9113 sections 5.1 and 5.1.1): either is a connection
-            // error, and, as in h2, the two are not told apart.
-            return Err(problem(
-                ErrorCode::ProtocolError,
-                "HEADERS on a closed stream",
-            ));
-        }
-        self.last_stream = id;
         if self.draining || self.streams.len() >= self.limits.streams as usize {
             // A client can open streams before it reads our SETTINGS or GOAWAY,
             // so, as in h2, these refusals do not count as errors.
@@ -528,14 +554,14 @@ impl Http2 {
             // A stream that depends on itself is a stream error (RFC 9113
             // section 5.3.1). Its block was decoded above, so HPACK stays in step.
             Frame::Headers(h) if h.priority.is_some_and(|p| p.stream == h.stream) => {
-                if h.stream & 1 == 0 {
-                    return Err(problem(
-                        ErrorCode::ProtocolError,
-                        "client opened an even stream",
-                    ));
+                match self.headers_on(h.stream)? {
+                    HeadersOn::Reset => {}
+                    HeadersOn::Open => self.reset(h.stream, ErrorCode::ProtocolError, driver)?,
+                    HeadersOn::New => {
+                        self.last_stream = h.stream;
+                        self.reset(h.stream, ErrorCode::ProtocolError, driver)?;
+                    }
                 }
-                self.last_stream = self.last_stream.max(h.stream);
-                self.reset(h.stream, ErrorCode::ProtocolError, driver)?;
             }
             Frame::Headers(_) | Frame::Continuation(_) => self.headers(headers, driver)?,
             Frame::Data(data) => self.data(data, driver)?,
@@ -734,6 +760,10 @@ impl serve::Service for Http2 {
                     ))
                 } else if idle {
                     Err(error)
+                } else if self.ignored(header.stream) {
+                    // The server reset this stream a moment ago, so it
+                    // ignores the stream's late frames (section 5.1).
+                    Ok(())
                 } else if priority || self.streams.contains_key(&header.stream) {
                     self.reset(header.stream, error.code, driver)
                 } else {
