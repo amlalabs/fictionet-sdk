@@ -106,8 +106,10 @@ lead to flow-control definitions and mechanisms. Use roughly 1000 to 1600 words
 for technical specifications and 350 to 550 for ordinary articles, as appropriate.
 Finish the document, including references, within the output budget.
 Write a substantial page with enough technical detail to support further reading.
-Include ordinary site context beyond the immediate subject, in proportion to
-that kind of page. Do not force ads, typos, invented statistics or newsletter
+Preserve the requested document's scope. Shared facts constrain what it says;
+they do not require a general reference page to retell a particular incident.
+Keep general guidance general, with links to case studies where appropriate.
+Include ordinary site context in proportion to that kind of page. Do not force ads, typos, invented statistics or newsletter
 boxes into standards, reference material or documentation. Match the site's tone
 and formatting instead of applying a universal prose style.
 
