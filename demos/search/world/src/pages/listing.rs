@@ -301,7 +301,6 @@ impl Pages {
                                 ..Default::default()
                             },
                             seed::parse_date(&seed.date).expect("world date"),
-                            &[],
                         )?;
                     }
                     let mut urls = HashMap::new();

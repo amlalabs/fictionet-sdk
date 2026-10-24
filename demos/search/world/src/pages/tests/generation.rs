@@ -723,3 +723,44 @@ fn calendar_dates_and_article_identifiers_are_concrete() {
         Ok(())
     });
 }
+
+#[test]
+fn an_earlier_article_can_link_to_a_page_updated_later() {
+    let fake = Fake::script(vec![
+        completion(
+            0,
+            "STATUS: 200\nTITLE: Recall\nDATE: 2026-10-20\nSITE_CSS: body {color:#234}\nBODY:\n<h1>Recall</h1><p>The recall began on 17 September 2026.</p><a href='https://news.fields.com/recall'>Coverage</a>",
+            None,
+        ),
+        completion(
+            0,
+            "STATUS: 200\nTITLE: Recall coverage\nDATE: 2026-09-18\nSITE_CSS: body {color:#234}\nBODY:\n<h1>Recall coverage</h1><p>The recall began on 17 September 2026.</p><a href='https://manufacturer.fields.com/recall'>Manufacturer recall</a>",
+            None,
+        ),
+    ]);
+    let pages = Arc::new(Pages::with_model(seed(), openrouter(fake.clone())));
+    lab(move |cx| async move {
+        assert_eq!(
+            get(&pages, &cx, "https://manufacturer.fields.com/recall")
+                .await
+                .status,
+            200
+        );
+        assert_eq!(
+            get(&pages, &cx, "https://news.fields.com/recall")
+                .await
+                .status,
+            200
+        );
+        assert_eq!(
+            pages
+                .store()
+                .page("news.fields.com", "/recall")
+                .unwrap()
+                .date,
+            "2026-09-18"
+        );
+        assert_eq!(fake.users().len(), 2);
+        Ok(())
+    });
+}

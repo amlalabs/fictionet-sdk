@@ -413,11 +413,7 @@ impl Pages {
                         page.date = latest.to_string();
                     }
                     if let Maker::Model(model) = self.maker() {
-                        let store = self.store();
-                        let linked: Vec<_> = links(&url, &page.body).iter()
-                            .filter_map(|(host, target, _)| store.page(host, target))
-                            .filter_map(|page| seed::parse_date(&page.date).ok()).collect();
-                        answers::chronology(&page, latest, &linked)?;
+                        answers::chronology(&page, latest)?;
                         model.check_document(&page.content_type, &page.body)?;
                     }
                     if page.content_type.starts_with("text/html") {
@@ -554,11 +550,6 @@ impl Pages {
                 .chain(seed::parse_date(&seed.date).ok())
                 .min()
                 .expect("world date");
-            let linked: Vec<_> = links(&record.url, &String::from_utf8_lossy(&record.body))
-                .iter()
-                .filter_map(|(host, target, _)| store.page(host, target))
-                .filter_map(|page| seed::parse_date(&page.date).ok())
-                .collect();
             answers::chronology(
                 &make::Page {
                     date: record.date.clone(),
@@ -569,7 +560,6 @@ impl Pages {
                     ..Default::default()
                 },
                 latest,
-                &linked,
             )
             .map_err(|reason| Stop::Failed {
                 error: reason.to_string(),

@@ -363,11 +363,7 @@ pub(super) fn dates(text: &str) -> Vec<time::Date> {
         .collect()
 }
 
-pub(super) fn chronology(
-    page: &Page,
-    latest: time::Date,
-    linked: &[time::Date],
-) -> Result<(), Unreadable> {
+pub(super) fn chronology(page: &Page, latest: time::Date) -> Result<(), Unreadable> {
     let dateline = if page.date.is_empty() {
         latest
     } else {
@@ -391,7 +387,6 @@ pub(super) fn chronology(
         page.claims.join(" ")
     ))
     .into_iter()
-    .chain(linked.iter().copied())
     .filter(|date| *date > dateline)
     .max()
     {
