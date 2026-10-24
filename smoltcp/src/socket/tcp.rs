@@ -744,6 +744,15 @@ impl<'a> Socket<'a> {
     }
 
     fn reset(&mut self) {
+        self.rx_buffer.clear();
+        self.rx_fin_received = false;
+        self.forget_connection();
+    }
+
+    /// Closes the socket and forgets its connection, but keeps the bytes
+    /// the application has not read, and the peer's FIN after them. Those
+    /// bytes were acknowledged, so they stay readable until read.
+    fn forget_connection(&mut self) {
         let rx_cap_log2 =
             mem::size_of::<usize>() * 8 - self.rx_buffer.capacity().leading_zeros() as usize;
 
@@ -752,8 +761,6 @@ impl<'a> Socket<'a> {
         self.rtte = RttEstimator::default();
         self.assembler = Assembler::new();
         self.tx_buffer.clear();
-        self.rx_buffer.clear();
-        self.rx_fin_received = false;
         self.listen_endpoint = IpListenEndpoint::default();
         self.tuple = None;
         self.local_seq_no = TcpSeqNumber::default();
@@ -1154,7 +1161,7 @@ impl<'a> Socket<'a> {
         // [...] an empty acknowledgment segment containing the current send-sequence number
         // and an acknowledgment indicating the next sequence number expected
         // to be received.
-        reply_repr.seq_number = self.remote_last_seq;
+        reply_repr.seq_number = self.send_next();
         reply_repr.ack_number = Some(self.remote_seq_no + self.rx_buffer.len());
 
         // From RFC 1323:
@@ -1203,6 +1210,14 @@ impl<'a> Socket<'a> {
         // Since the sACK option may have changed the length of the payload, update that.
         ip_reply_repr.set_payload_len(reply_repr.buffer_len());
         (ip_reply_repr, reply_repr)
+    }
+
+    /// The sequence number of a segment that occupies no sequence space:
+    /// the highest one sent, which the peer may already have. An RTO rewinds
+    /// `remote_last_seq` for retransmission, and a peer that has the
+    /// rewound bytes finds that number behind its window.
+    fn send_next(&self) -> TcpSeqNumber {
+        self.local_seq_max
     }
 
     fn challenge_ack_reply(
@@ -1269,11 +1284,10 @@ impl<'a> Socket<'a> {
                         || (segment_start == window_end
                             && repr.control.quash_psh() == TcpControl::None))
             }
-            (false, true) => {
-                repr.payload.is_empty()
-                    && repr.control == TcpControl::Fin
-                    && segment_start == window_start
-            }
+            // A segment at the start of a closed window, such as a probe, is
+            // acceptable for its ACK and window; its text is dropped. RFC 9293
+            // section 3.10.7.4 asks that valid ACKs be accepted in a zero window.
+            (false, true) => segment_start == window_start,
             (false, false) => {
                 (window_start <= segment_start && segment_start < window_end)
                     || (window_start < segment_end && segment_end <= window_end)
@@ -1378,6 +1392,9 @@ impl<'a> Socket<'a> {
             };
         }
 
+        // Text sent into a closed window, such as a zero-window probe's, is
+        // dropped; the segment counts for its ACK and is answered with one.
+        let mut dropped_probe = false;
         let (payload, payload_offset) = match self.state {
             _ if repr.control == TcpControl::Rst => (&[][..], 0),
             // In LISTEN and SYN-SENT states, we have not yet synchronized with the remote end.
@@ -1391,6 +1408,7 @@ impl<'a> Socket<'a> {
                     debug_assert!(overlap_start <= overlap_end);
 
                     self.local_rx_last_seq = Some(repr.seq_number);
+                    dropped_probe = window_start == window_end && !repr.payload.is_empty();
 
                     if self.rx_fin_received {
                         // RFC 9293 section 3.10.7.4: the remote sends nothing after its
@@ -1524,8 +1542,9 @@ impl<'a> Socket<'a> {
             (State::SynSent, TcpControl::Syn) => {
                 self.negotiate_options(repr);
 
+                // Our SYN may not have gone out yet; if not, the SYN|ACK is
+                // still to send. The ACK below moves past a SYN it acknowledges.
                 self.remote_seq_no = repr.seq_number + 1;
-                self.remote_last_seq = self.local_seq_no + 1;
                 self.remote_last_ack = Some(repr.seq_number);
                 self.remote_win_end = Some(
                     self.remote_seq_no
@@ -1680,7 +1699,7 @@ impl<'a> Socket<'a> {
 
         let payload_len = payload.len();
         if payload_len == 0 {
-            return None;
+            return dropped_probe.then(|| self.ack_reply(ip_repr, repr));
         }
 
         let assembler_was_empty = self.assembler.is_empty();
@@ -2018,7 +2037,7 @@ impl<'a> Socket<'a> {
             || self.timer.should_zero_window_probe(cx.now());
         if !should_send {
             if self.timer.should_close(cx.now()) {
-                self.reset();
+                self.forget_connection();
             }
             return Ok(());
         }
@@ -2161,6 +2180,10 @@ impl<'a> Socket<'a> {
         // sequence space will elicit an ACK, we only need to send an explicit packet if we
         // couldn't fill the sequence space with anything.
 
+        if repr.segment_len() == 0 {
+            repr.seq_number = self.send_next();
+        }
+
         let is_keep_alive = if self.timer.should_keep_alive(cx.now()) && repr.is_empty() {
             repr.seq_number = repr.seq_number - 1;
             repr.payload = b"\x00"; // RFC 1122 says we should do this
@@ -2203,14 +2226,13 @@ impl<'a> Socket<'a> {
         // We've sent a packet successfully, so we can update the internal state now.
         // Use max() so a fast-retransmit segment (whose seq_number is local_seq_no, well
         // behind the current frontier) doesn't rewind the tracked "highest sent" sequence.
-        self.remote_last_seq = self
-            .remote_last_seq
-            .max(repr.seq_number + repr.segment_len());
+        // A segment with no sequence space sits at `send_next()` and moves nothing.
         let segment_len = repr.segment_len();
         let segment_end = repr.seq_number + segment_len;
         self.remember_window(repr.ack_number, repr.window_len);
 
         if segment_len > 0 {
+            self.remote_last_seq = self.remote_last_seq.max(segment_end);
             self.rtte.on_send(cx.now(), segment_end);
         }
 
@@ -3544,6 +3566,39 @@ mod test {
         );
         assert_eq!(s.state, State::Established);
         sanity!(s, socket_established());
+    }
+
+    /// When both ends open at once, the peer's SYN can arrive before this
+    /// socket has sent its own, and the peer can repeat it before this
+    /// socket gets to send. The socket must still send its SYN|ACK, or
+    /// neither end ever completes the handshake.
+    #[test]
+    fn test_syn_sent_peer_syn_before_own_syn() {
+        let mut s = socket();
+        s.socket.connect(&mut s.cx, REMOTE_END, LOCAL_END).unwrap();
+        let syn = TcpRepr {
+            control: TcpControl::Syn,
+            seq_number: REMOTE_SEQ,
+            ack_number: None,
+            max_seg_size: Some(BASE_MSS - 80),
+            window_scale: Some(0),
+            ..SEND_TEMPL
+        };
+        send!(s, syn);
+        assert_eq!(s.state, State::SynReceived);
+        // The repeated SYN draws an ACK, and nothing else.
+        let _ = send(&mut s, Instant::from_millis(0), &syn);
+        let mut syn_ack = false;
+        for t in (0..=60_000).step_by(100) {
+            s.cx.set_now(Instant::from_millis(t));
+            let _ = s.socket.dispatch(&mut s.cx, |_, (_, repr)| {
+                syn_ack |= repr.control == TcpControl::Syn
+                    && repr.seq_number == LOCAL_SEQ
+                    && repr.ack_number == Some(REMOTE_SEQ + 1);
+                Ok::<(), ()>(())
+            });
+        }
+        assert!(syn_ack, "no SYN|ACK within a minute");
     }
 
     #[test]
@@ -7969,7 +8024,8 @@ mod test {
             ack_number: Some(LOCAL_SEQ + 13),
             ..SEND_TEMPL
         }, Some(TcpRepr {
-            seq_number: LOCAL_SEQ + 5,
+            // The challenge ACK carries the highest sequence number sent.
+            seq_number: LOCAL_SEQ + 9,
             ack_number: Some(REMOTE_SEQ + 1),
             ..RECV_TEMPL
         }));
@@ -8230,6 +8286,191 @@ mod test {
             payload: b"a",
             ..RECV_TEMPL
         }]);
+    }
+
+    /// The segment `s` sends at `now`, if any, with its payload copied out.
+    fn sent_at(s: &mut TestSocket, now: Instant) -> Option<(IpRepr, TcpRepr<'static>)> {
+        s.cx.set_now(now);
+        let mut sent = None;
+        let _ = s.socket.dispatch(&mut s.cx, |_, (ip, tcp)| {
+            let payload: &'static [u8] = Vec::leak(tcp.payload.to_vec());
+            sent = Some((ip, TcpRepr { payload, ..tcp }));
+            Ok::<(), ()>(())
+        });
+        sent
+    }
+
+    /// Gives `to` a segment, and gives `from` the reply `to` sends at once.
+    fn deliver(
+        from: &mut TestSocket,
+        to: &mut TestSocket,
+        now: Instant,
+        (ip, tcp): (IpRepr, TcpRepr<'static>),
+    ) {
+        to.cx.set_now(now);
+        from.cx.set_now(now);
+        if to.socket.accepts(&mut to.cx, &ip, &tcp)
+            && let Some((ip, tcp)) = to.socket.process(&mut to.cx, &ip, &tcp)
+            && from.socket.accepts(&mut from.cx, &ip, &tcp)
+        {
+            from.socket.process(&mut from.cx, &ip, &tcp);
+        }
+    }
+
+    /// Lets two sockets talk at `now`, with no loss, until both are quiet.
+    fn exchange(a: &mut TestSocket, b: &mut TestSocket, now: Instant) {
+        for _ in 0..64 {
+            let from_a = sent_at(a, now);
+            let quiet_a = from_a.is_none();
+            if let Some(segment) = from_a {
+                deliver(a, b, now, segment);
+            }
+            let from_b = sent_at(b, now);
+            let quiet_b = from_b.is_none();
+            if let Some(segment) = from_b {
+                deliver(b, a, now, segment);
+            }
+            if quiet_a && quiet_b {
+                return;
+            }
+        }
+    }
+
+    /// Two sockets whose windows are both closed probe each other at the
+    /// same moment, and both applications read while the probes are on
+    /// their way, in order on each path. Each probe carries a byte, which
+    /// the other side, its window now open, takes in. The transfer must go
+    /// on: each side's later segments must be acceptable to a peer that
+    /// has its probe byte, so the window updates and ACKs get through.
+    #[test]
+    fn test_crossing_zero_window_probes_keep_the_transfer_going() {
+        let mut a = socket_with_buffer_sizes(64, 16);
+        let mut b = socket_with_buffer_sizes(64, 16);
+        a.listen(LISTEN_END).unwrap();
+        b.socket.connect(&mut b.cx, LOCAL_END, REMOTE_END).unwrap();
+        exchange(&mut a, &mut b, Instant::from_millis(0));
+        assert_eq!((a.state, b.state), (State::Established, State::Established));
+
+        // Each side sends more than the other can hold.
+        assert_eq!(a.send_slice(&[1; 32]), Ok(32));
+        assert_eq!(b.send_slice(&[2; 32]), Ok(32));
+        exchange(&mut a, &mut b, Instant::from_millis(0));
+        assert_eq!((a.recv_queue(), b.recv_queue()), (16, 16));
+
+        // Both probes leave before either arrives.
+        let now = Instant::from_millis(1000);
+        let probe_a = sent_at(&mut a, now).unwrap();
+        let probe_b = sent_at(&mut b, now).unwrap();
+        assert_eq!((probe_a.1.payload.len(), probe_b.1.payload.len()), (1, 1));
+        // Both applications read before the probes arrive.
+        let mut got_a = Vec::new();
+        let mut got_b = Vec::new();
+        let mut buf = [0; 64];
+        let n = a.recv_slice(&mut buf).unwrap();
+        got_a.extend_from_slice(&buf[..n]);
+        let n = b.recv_slice(&mut buf).unwrap();
+        got_b.extend_from_slice(&buf[..n]);
+        let update_a = sent_at(&mut a, now).unwrap();
+        let update_b = sent_at(&mut b, now).unwrap();
+        // Each way, the probe arrives first, then the window update.
+        deliver(&mut a, &mut b, now, probe_a);
+        deliver(&mut b, &mut a, now, probe_b);
+        deliver(&mut a, &mut b, now, update_a);
+        deliver(&mut b, &mut a, now, update_b);
+
+        // A lossless network and readers that keep up from here on.
+        for t in (1000..=600_000).step_by(100) {
+            exchange(&mut a, &mut b, Instant::from_millis(t));
+            while let Ok(n @ 1..) = a.recv_slice(&mut buf) {
+                got_a.extend_from_slice(&buf[..n]);
+            }
+            while let Ok(n @ 1..) = b.recv_slice(&mut buf) {
+                got_b.extend_from_slice(&buf[..n]);
+            }
+        }
+        assert_eq!(got_a, [2; 32]);
+        assert_eq!(got_b, [1; 32]);
+    }
+
+    /// One socket's window is closed, its application does not read, and
+    /// the other socket has a probe byte out that the closed window
+    /// dropped. Data the closed side sends must still be acknowledged, or
+    /// an application that writes before it reads never gets to read. The
+    /// probes carry the ACKs into the closed window.
+    #[test]
+    fn test_acks_reach_a_closed_window() {
+        let mut a = socket_with_buffer_sizes(64, 64);
+        let mut b = socket_with_buffer_sizes(64, 16);
+        a.set_nagle_enabled(false);
+        b.set_nagle_enabled(false);
+        a.listen(LISTEN_END).unwrap();
+        b.socket.connect(&mut b.cx, LOCAL_END, REMOTE_END).unwrap();
+        exchange(&mut a, &mut b, Instant::from_millis(0));
+        assert_eq!(a.send_slice(&[1; 32]), Ok(32));
+        exchange(&mut a, &mut b, Instant::from_millis(0));
+        assert_eq!(b.recv_queue(), 16);
+        // The probes into the closed window drop their byte.
+        for t in (100..=3000).step_by(100) {
+            exchange(&mut a, &mut b, Instant::from_millis(t));
+        }
+        // The closed side sends, and never reads.
+        assert_eq!(b.send_slice(&[2; 10]), Ok(10));
+        let mut buf = [0; 64];
+        for t in (3000..=600_000).step_by(100) {
+            exchange(&mut a, &mut b, Instant::from_millis(t));
+            while let Ok(1..) = a.recv_slice(&mut buf) {}
+        }
+        assert_eq!(b.send_queue(), 0);
+    }
+
+    /// Two sockets send each other two segments at once, and all the ACKs
+    /// are lost. Both retransmission timers fire before either
+    /// retransmission arrives, and each resends only its first segment.
+    /// The transfer must still finish once the network delivers
+    /// everything: each side's later segments must be acceptable to a peer
+    /// that has both its segments, so the ACKs get through.
+    #[test]
+    fn test_crossing_retransmissions_keep_the_transfer_going() {
+        let mut a = socket_with_buffer_sizes(4096, 4096);
+        let mut b = socket_with_buffer_sizes(4096, 4096);
+        a.set_nagle_enabled(false);
+        b.set_nagle_enabled(false);
+        a.listen(LISTEN_END).unwrap();
+        b.socket.connect(&mut b.cx, LOCAL_END, REMOTE_END).unwrap();
+        exchange(&mut a, &mut b, Instant::from_millis(0));
+        assert_eq!((a.state, b.state), (State::Established, State::Established));
+
+        // The data crosses and arrives; the ACKs are lost.
+        let now = Instant::from_millis(0);
+        assert_eq!(a.send_slice(&[1; 2000]), Ok(2000));
+        assert_eq!(b.send_slice(&[2; 2000]), Ok(2000));
+        let data_a: Vec<_> = core::iter::from_fn(|| sent_at(&mut a, now)).collect();
+        let data_b: Vec<_> = core::iter::from_fn(|| sent_at(&mut b, now)).collect();
+        assert_eq!((data_a.len(), data_b.len()), (2, 2));
+        for (ip, tcp) in data_a {
+            b.cx.set_now(now);
+            b.socket.process(&mut b.cx, &ip, &tcp);
+        }
+        for (ip, tcp) in data_b {
+            a.cx.set_now(now);
+            a.socket.process(&mut a.cx, &ip, &tcp);
+        }
+        while sent_at(&mut a, now).is_some() {}
+        while sent_at(&mut b, now).is_some() {}
+
+        // Both retransmissions leave before either arrives.
+        let now = Instant::from_millis(1000);
+        let again_a = sent_at(&mut a, now).unwrap();
+        let again_b = sent_at(&mut b, now).unwrap();
+        assert!(again_a.1.payload.len() < 2000 && again_b.1.payload.len() < 2000);
+        deliver(&mut a, &mut b, now, again_a);
+        deliver(&mut b, &mut a, now, again_b);
+
+        // A lossless network from here on.
+        for t in (1000..=600_000).step_by(100) {
+            exchange(&mut a, &mut b, Instant::from_millis(t));
+        }
+        assert_eq!((a.send_queue(), b.send_queue()), (0, 0));
     }
 
     #[test]

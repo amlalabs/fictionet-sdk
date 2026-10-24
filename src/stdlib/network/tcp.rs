@@ -2619,6 +2619,57 @@ mod tests {
         })).unwrap();
     }
 
+    /// Bytes the peer sent before its FIN were acknowledged, so they stay
+    /// readable after TIME-WAIT ends, as a kernel keeps them until the
+    /// application closes the socket. The application reads them, then
+    /// end of stream.
+    #[test]
+    fn unread_bytes_outlive_time_wait() {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
+            let (_raw, side) = pair();
+            let local: SocketAddr = "10.0.0.1:80".parse()?;
+            let peer: SocketAddr = "10.0.0.2:1234".parse()?;
+            let ep = endpoint(&fcx, side, local.ip());
+            let _listener = ep.listen(local.port())?;
+            let now = smol_now(&fcx);
+            let mut conn = {
+                let mut st = ep.shared.state.lock();
+                let (h, ack) = established(&mut st, now, local, peer);
+                let conn = TcpConnection {
+                    shared: ep.shared.clone(),
+                    handle: h,
+                    local,
+                    remote: peer,
+                    read_wait: CancelWait::default(),
+                    write_wait: CancelWait::default(),
+                };
+                // This side shuts down first; the peer answers with its last
+                // bytes, its FIN and the ACK of this side's FIN.
+                st.conns.get_mut(&h).unwrap().shut = true;
+                st.close_if_drained(h);
+                egress(&mut st, now);
+                let mut last = segment(peer, local, 101, ack.wrapping_add(1), 0x19).0;
+                last.extend_from_slice(b"last words");
+                fix_lengths(&mut last, 20, peer.ip(), local.ip());
+                st.ingress(local.ip(), now, last);
+                assert_eq!(st.get(h).state(), TcpState::TimeWait);
+                assert_eq!(st.get(h).recv_queue(), 10);
+                egress(&mut st, now);
+                // The application reads only after TIME-WAIT is over.
+                egress(&mut st, now + smoltcp::time::Duration::from_secs(11));
+                st.housekeeping();
+                conn
+            };
+            let mut buf = [0; 32];
+            let n = conn.read(&fcx, &mut buf).await?;
+            assert_eq!(&buf[..n], b"last words");
+            assert_eq!(conn.read(&fcx, &mut buf).await?, 0);
+            drop(conn);
+            fcx.cancel();
+            Ok(())
+        })).unwrap();
+    }
+
     #[test]
     fn client_advertised_window_uses_negotiated_scale() {
         for scaled in [false, true] {
