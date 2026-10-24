@@ -4961,6 +4961,30 @@ mod tests {
     }
 
     #[test]
+    fn create_context_data_before_a_long_name_writes_back() {
+        // 2.2.13.2: data at 16, then a name long enough that putting the
+        // name first would move DataOffset past its 16 bits.
+        let name = vec![b'n'; 65513];
+        let mut region = le(&[0, 24, name.len() as u64, 0, 16, 8], &[4, 2, 2, 2, 2, 4]);
+        region.extend_from_slice(&[7; 8]);
+        region.extend_from_slice(&name);
+        let body = create_with(120, &[], &region);
+        let Ok(Request::Create(c)) = Request::parse(command::CREATE, &body) else {
+            panic!()
+        };
+        let want = CreateContext {
+            name,
+            data: vec![7; 8],
+        };
+        assert_eq!(c.contexts, [want]);
+        // What reads writes back and reads the same.
+        let back = Request::Create(c.clone()).message(0).map(|m| m.body);
+        assert_eq!(back.as_ref().err(), None);
+        let again = back.and_then(|b| Request::parse(command::CREATE, &b));
+        assert!(again == Ok(Request::Create(c)), "read back changed");
+    }
+
+    #[test]
     fn create_names_are_aligned_and_next_points_at_a_context() {
         // 2.2.13: the file name is 8-byte aligned.
         let body = create_with(122, &u16s("a"), &[]);
