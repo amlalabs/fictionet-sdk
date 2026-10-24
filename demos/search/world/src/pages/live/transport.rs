@@ -13,12 +13,23 @@ impl Drop for Runtime {
     }
 }
 
-pub(super) struct Transport {
+/// What one host request is for.
+#[derive(Clone, Copy)]
+pub(in crate::pages) enum Ask<'a> {
+    /// Query the search provider with this key and body.
+    Search(&'a Key, &'a Value),
+    /// Copy a page or dependency for Live replay.
+    Copy,
+    /// Read the public original of a page the world writes.
+    Original,
+}
+
+pub(in crate::pages) struct Transport {
     runtime: Runtime,
     clients: capture::Pool,
 }
 impl Transport {
-    pub(super) fn new() -> Result<Self, String> {
+    pub(in crate::pages) fn new() -> Result<Self, String> {
         Ok(Self {
             clients: capture::Pool::default(),
             runtime: Runtime(Some(
@@ -30,10 +41,13 @@ impl Transport {
             )),
         })
     }
-    pub(super) fn spawn(&self, work: impl std::future::Future<Output = ()> + Send + 'static) {
+    pub(in crate::pages) fn spawn(
+        &self,
+        work: impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
         self.runtime.0.as_ref().unwrap().spawn(work);
     }
-    pub(super) async fn process<T: Send + 'static>(
+    pub(in crate::pages) async fn process<T: Send + 'static>(
         &self,
         cx: &Cx,
         lifetime: &Lifetime,
@@ -56,13 +70,13 @@ impl Transport {
         }
     }
 
-    pub(super) async fn request(
+    pub(in crate::pages) async fn request(
         &self,
         cx: &Cx,
         lifetime: &Lifetime,
         observer: Option<Arc<capture::Observer>>,
         url: &str,
-        search: Option<(&Key, &Value)>,
+        ask: Ask<'_>,
     ) -> io::Result<warc::Response> {
         struct Attempt {
             cx: Cx,
@@ -84,15 +98,14 @@ impl Transport {
         let event = capture::Event {
             attempt: cx.random_u64(),
             url: destination,
-            method: if search.is_some() {
-                http::Method::POST
-            } else {
-                http::Method::GET
+            method: match ask {
+                Ask::Search(..) => http::Method::POST,
+                Ask::Copy | Ask::Original => http::Method::GET,
             },
-            purpose: if search.is_some() {
-                capture::Purpose::Search
-            } else {
-                capture::Purpose::Capture
+            purpose: match ask {
+                Ask::Search(..) => capture::Purpose::Search,
+                Ask::Copy => capture::Purpose::Capture,
+                Ask::Original => capture::Purpose::Original,
             },
             phase: UpstreamPhase::Attempt,
             status: None,
@@ -117,14 +130,13 @@ impl Transport {
         });
         let work = async {
             let client = self.clients.client(&url).await?;
-            let request = if let Some((key, body)) = search {
-                client
+            let request = match ask {
+                Ask::Search(key, body) => client
                     .post(url)
                     .header("x-api-key", key.value())
                     .header("content-type", "application/json")
-                    .body(body.to_string())
-            } else {
-                client.get(url).header("accept-encoding", "identity")
+                    .body(body.to_string()),
+                Ask::Copy | Ask::Original => client.get(url).header("accept-encoding", "identity"),
             };
             let response = request.send().await;
             let response = response.map_err(|error| {

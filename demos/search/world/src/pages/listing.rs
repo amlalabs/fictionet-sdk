@@ -172,7 +172,7 @@ impl Pages {
                                 usage: None,
                             })?;
                         self.writing_store()?
-                            .reserve_mention(&self.seed, &host, &target, mention)
+                            .reserve_mention(&self.seed, &host, &target, mention, false)
                             .map_err(Stop::store)?
                     } else {
                         self.store()
@@ -279,7 +279,7 @@ impl Pages {
                 reference = self
                     .reference_text(&result.url)
                     .map_err(Stop::store)?
-                    .map(|text| (result.url.clone(), text));
+                    .map(|original| (result.url.clone(), original.text));
             }
             for result in found.results {
                 if !known.iter().any(|page| page.url == result.url) {
@@ -378,15 +378,18 @@ impl Pages {
                         usage: None,
                     }
                 })?;
-            let _page = self
+            // A page another request is writing keeps its lock for the whole
+            // write; the list promises what that page was asked to show
+            // instead of waiting for it.
+            let page = self
                 .locks
-                .lock(cx, page_key(&host, &target))
-                .await
+                .try_lock(&page_key(&host, &target))
                 .map_err(Stop::store)?;
             let mention = self
                 .writing_store()?
-                .reserve_mention(&self.seed, &host, &target, mention)
+                .reserve_mention(&self.seed, &host, &target, mention, page.is_none())
                 .map_err(Stop::store)?;
+            drop(page);
             r.title = mention.title().unwrap_or_default().into();
             r.snippet = mention.snippet().unwrap_or_default().into();
             r.date = mention

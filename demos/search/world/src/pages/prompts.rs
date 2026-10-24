@@ -51,6 +51,14 @@ pub struct Person {
     pub organization: String,
 }
 
+/// The real document at an address, as text: a capture of it, or the
+/// public original the host read.
+pub struct Original {
+    /// Its `<title>`, for HTML documents that have one.
+    pub title: Option<String>,
+    pub text: String,
+}
+
 /// A claim a page in this world made.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(from = "RecordedStatement")]
@@ -572,6 +580,7 @@ pub fn page(
     profile: Option<&Profile>,
     host_pages: &[HostPage],
     claims: &[Claim],
+    original: Option<&Original>,
 ) -> (String, String) {
     let mut led = Vec::new();
     for mention in mentions {
@@ -602,14 +611,37 @@ pub fn page(
     } else {
         led.join("\n")
     };
-    let must = mentions
-        .iter()
-        .filter_map(Mention::title)
-        .find(|title| !title.is_empty())
-        .map(|title| {
+    let must = match original {
+        Some(original) => {
+            let title = original
+                .title
+                .as_deref()
+                .map(|title| format!("\nThe TITLE is exactly: {title}"))
+                .unwrap_or_default();
             format!(
-                "\nThe TITLE is exactly: {title}\nThe page contains the text of every snippet \
-                above word for word (without the \"...\"), in its natural place."
+                "{title}\nWhere a search snippet or link above differs from the real document below, the real document is right."
+            )
+        }
+        None => mentions
+            .iter()
+            .filter_map(Mention::title)
+            .find(|title| !title.is_empty())
+            .map(|title| {
+                format!(
+                    "\nThe TITLE is exactly: {title}\nThe page contains the text of every snippet \
+                    above word for word (without the \"...\"), in its natural place."
+                )
+            })
+            .unwrap_or_default(),
+    };
+    let grounding = original
+        .map(|original| {
+            format!(
+                "\nThe real document at this address:\n{}\n\nWrite this document as it is: its title, authors, dates, sections, names, numbers and wording. \
+                Keep its full length and every section; the length guidance in these instructions does not apply to it. \
+                Change only what the world's brief or earlier world documents explicitly change. \
+                DATE is the document's own publication or update date; the dates of the events it describes stay as they are.\n",
+                original.text
             )
         })
         .unwrap_or_default();
@@ -658,7 +690,7 @@ How the agent got here:
 
 What the world has already said:
 {said}
-
+{grounding}
 {PAGE_FORMAT_HEAD}{site}{layout}
 {PAGE_FORMAT_TAIL}
 {captured_note}

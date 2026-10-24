@@ -29,6 +29,7 @@ impl Pages {
             copied_active: Default::default(),
             live: None,
             live_active: Default::default(),
+            originals: Default::default(),
             planted: Mutex::default(),
             queries: std::sync::atomic::AtomicU64::new(1),
             locks,

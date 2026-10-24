@@ -9,6 +9,7 @@ mod generate;
 mod layout;
 mod listing;
 mod normalize;
+mod original;
 mod page;
 mod pdf;
 pub mod provenance;
@@ -24,12 +25,14 @@ pub mod model;
 pub mod prompts;
 pub mod render;
 pub mod seed;
+pub mod snapshot;
 pub mod store;
 pub mod text;
 
 pub use copied::PageBody;
 pub use meta::Meta;
 pub use seed::Seed;
+pub use serve::HeldResource;
 
 use crate::files::FileLock;
 use crate::route::{Route, query_key, route};
@@ -446,6 +449,7 @@ pub struct Pages {
     copied_active: std::sync::atomic::AtomicBool,
     live: Option<Arc<live::Live>>,
     live_active: std::sync::atomic::AtomicBool,
+    originals: original::Originals,
     planted: Mutex<Planted>,
     /// The id of the next search, shared by every way a search arrives.
     queries: std::sync::atomic::AtomicU64,

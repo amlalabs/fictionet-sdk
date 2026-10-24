@@ -321,15 +321,22 @@ pub(super) fn chronology(page: &Page, latest: time::Date) -> Result<(), Unreadab
             "DATE must be on or before {latest}, when a referring page already links here. Write only what was known by then."
         )));
     }
-    if let Some(known_on) = page
+    let later: Vec<_> = page
         .claims
         .iter()
-        .filter_map(|claim| claim.known_on)
-        .filter(|date| *date > dateline)
-        .max()
-    {
+        .filter(|claim| claim.known_on.is_some_and(|date| date > dateline))
+        .map(|claim| {
+            format!(
+                "- {} | {}",
+                claim.known_on.expect("dated claim"),
+                claim.text
+            )
+        })
+        .collect();
+    if !later.is_empty() {
         return Err(Unreadable::Chronology(format!(
-            "The document is dated {dateline} but uses knowledge first available on {known_on}. Explicitly update DATE and its visible dateline, no later than {latest}, or omit that later knowledge."
+            "The document is dated {dateline}, but these CLAIMS lines were first known later:\n{}\nRemove those lines and any text that depends on them, or explicitly update DATE and its visible dateline, no later than {latest}.",
+            later.join("\n")
         )));
     }
     Ok(())

@@ -156,7 +156,7 @@ fn archive_files(root: &Path) -> std::io::Result<Vec<ArchiveFile>> {
 }
 
 impl Pages {
-    pub(super) fn reference_text(&self, url: &str) -> std::io::Result<Option<String>> {
+    pub(super) fn reference_text(&self, url: &str) -> std::io::Result<Option<prompts::Original>> {
         let Some(corpus) = &self.copied else {
             return Ok(None);
         };
@@ -182,17 +182,33 @@ impl Pages {
             }
             break response;
         };
-        if response.status != http::StatusCode::OK
-            || !response
-                .headers
-                .get(http::header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .is_some_and(|value| value.starts_with("text/html"))
-        {
+        if response.status != http::StatusCode::OK {
             return Ok(None);
         }
-        fictionet_extras::capture::page_text(&String::from_utf8_lossy(&response.decoded()?))
-            .map(Some)
+        let content_type = response
+            .headers
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let body = response.decoded()?;
+        Ok(if content_type.starts_with("text/html") {
+            Some(super::prompts::Original {
+                title: fictionet_extras::capture::title(&response)
+                    .ok()
+                    .map(|title| title.trim().to_owned())
+                    .filter(|title| !title.is_empty()),
+                text: fictionet_extras::capture::page_text(&String::from_utf8_lossy(&body))?,
+            })
+        } else if content_type.starts_with("application/pdf") {
+            // A malformed PDF can panic inside the parser; it has no text then.
+            std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem(&body))
+                .ok()
+                .and_then(Result::ok)
+                .map(|text| super::prompts::Original { title: None, text })
+        } else {
+            None
+        })
     }
 
     pub(crate) fn copied_body(&self, url: String) -> Option<PageBody> {

@@ -10,10 +10,10 @@ use fictionet_extras::{
 use std::path::{Path, PathBuf};
 use tokio::sync::{oneshot, watch};
 
-mod transport;
-use transport::Transport;
+pub(super) mod transport;
+use transport::{Ask, Transport};
 
-struct Lifetime {
+pub(super) struct Lifetime {
     stop: watch::Sender<bool>,
 }
 impl Default for Lifetime {
@@ -172,7 +172,7 @@ impl Live {
         let response = loop {
             match self
                 .fetcher
-                .request(cx, lifetime, observer.clone(), url, None)
+                .request(cx, lifetime, observer.clone(), url, Ask::Copy)
                 .await
             {
                 Ok(response) => break response,
@@ -268,7 +268,7 @@ impl Live {
                 lifetime,
                 observer,
                 self.endpoint.as_str(),
-                Some((&self.key, &request)),
+                Ask::Search(&self.key, &request),
             )
             .await
             .map_err(|error| error.to_string())?;
@@ -345,6 +345,11 @@ impl Live {
         let _ = std::fs::remove_file(old_path);
     }
 
+    /// A response this session already copied, without copying anything.
+    pub(super) fn held(&self, url: &str) -> Option<warc::Response> {
+        self.state().archive.get(&warc::key(url)?).ok()?
+    }
+
     async fn response(self: &Arc<Self>, cx: &Cx, url: &str) -> Result<warc::Response, String> {
         let url = warc::key(url).ok_or("Invalid Live URL")?;
         let lifetime = self.state().lifetime.clone();
@@ -416,7 +421,10 @@ fn parse_search(value: &Value, key: Option<&Key>) -> Result<search::Search, Stri
 }
 
 impl Pages {
+    /// Observes every host request: Live copies and searches, and the
+    /// originals that ground written pages.
     pub(crate) fn observe_live(&self, observer: Arc<capture::Observer>) {
+        self.originals.observe(observer.clone());
         if let Some(live) = &self.live {
             *live.observer.lock().unwrap() = Some(observer);
         }

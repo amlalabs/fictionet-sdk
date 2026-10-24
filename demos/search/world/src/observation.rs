@@ -39,6 +39,10 @@ pub enum SearchObs {
         elapsed_ms: u64,
         #[serde(serialize_with = "crate::observation::headers")]
         headers: HeaderMap,
+        /// Whether the client navigated here or a page fetched this for itself.
+        fetch: Fetch,
+        /// The page that asked for this, as the client reported it.
+        referrer: Option<String>,
         #[serde(skip)]
         preview: Option<crate::pages::PageBody>,
     },
@@ -118,6 +122,7 @@ pub enum EgressPurpose {
     Account,
     LiveSearch,
     LiveCapture,
+    Original,
 }
 
 /// A host transport destination can be a DNS name or an IP literal.
@@ -181,6 +186,28 @@ pub enum PageSource {
     Written,
     Live,
 }
+/// How a request was made: a navigation to a document, or a page's own
+/// subresource or script request (`Sec-Fetch-Dest` other than a document).
+/// Clients that send no fetch metadata, like curl, navigate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Fetch {
+    Navigation,
+    Subresource,
+}
+
+impl Fetch {
+    fn of(headers: &HeaderMap) -> Self {
+        match headers
+            .get("sec-fetch-dest")
+            .and_then(|value| value.to_str().ok())
+        {
+            None | Some("document" | "iframe" | "frame") => Self::Navigation,
+            Some(_) => Self::Subresource,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Engine {
@@ -238,6 +265,7 @@ impl Pages {
                     purpose: match event.purpose {
                         fictionet_extras::capture::Purpose::Search => EgressPurpose::LiveSearch,
                         fictionet_extras::capture::Purpose::Capture => EgressPurpose::LiveCapture,
+                        fictionet_extras::capture::Purpose::Original => EgressPurpose::Original,
                     },
                     phase: event.phase,
                     status: event.status.map(|status| status.as_u16()),
@@ -372,6 +400,11 @@ impl Pages {
                 content_type: response.content_type.clone(),
                 source,
                 elapsed_ms: started.elapsed().as_millis() as u64,
+                fetch: Fetch::of(&headers),
+                referrer: headers
+                    .get(http::header::REFERER)
+                    .and_then(|value| value.to_str().ok())
+                    .map(redact_url),
                 headers,
                 preview,
             },

@@ -2,6 +2,12 @@
 
 use super::*;
 
+/// A page dependency as the world holds it, decoded.
+pub struct HeldResource {
+    pub content_type: String,
+    pub body: Vec<u8>,
+}
+
 impl Pages {
     /// Answers a request. Supply form bytes for form POSTs.
     pub async fn handle(
@@ -488,6 +494,72 @@ impl Pages {
             record.headers,
             meta,
         )
+    }
+
+    /// A stylesheet, image or font the world already holds for a page it
+    /// served from `source`, read on the host: no guest request is answered
+    /// and nothing new is copied or written.
+    pub fn held_resource(
+        &self,
+        source: &crate::observation::PageSource,
+        url: &str,
+    ) -> Option<HeldResource> {
+        let parsed = url::Url::parse(url).ok()?;
+        let host = parsed.host_str()?;
+        let path = parsed.path();
+        let fixed = |response: Response| {
+            (response.status == 200).then(|| HeldResource {
+                content_type: response.content_type,
+                body: response.body,
+            })
+        };
+        if let Some(response) = self.package_url(url) {
+            return fixed(response);
+        }
+        if let Some(asset) = Self::search_asset(host, path) {
+            return fixed(asset);
+        }
+        if path.starts_with("/_assets/") {
+            let (content_type, body) = fictionet_extras::sites::asset(host, path)?;
+            return Some(HeldResource {
+                content_type: content_type.into(),
+                body: body.into(),
+            });
+        }
+        let captured = |response: fictionet_extras::warc::Response| {
+            (response.status == http::StatusCode::OK).then_some(())?;
+            Some(HeldResource {
+                content_type: response
+                    .headers
+                    .get(http::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("application/octet-stream")
+                    .into(),
+                body: response.decoded().ok()?,
+            })
+        };
+        match source {
+            crate::observation::PageSource::Copy { .. } => {
+                captured(self.copied.as_ref()?.response(url).ok()??)
+            }
+            crate::observation::PageSource::Live => captured(self.live.as_ref()?.held(url)?),
+            crate::observation::PageSource::Written => {
+                if !path.to_ascii_lowercase().ends_with(".css") {
+                    return static_asset(path).and_then(fixed);
+                }
+                let profile = self
+                    .store()
+                    .site(host)
+                    .filter(|profile| !profile.css.is_empty())
+                    .cloned()
+                    .unwrap_or_else(|| make::site_profile(host));
+                Some(HeldResource {
+                    content_type: "text/css".into(),
+                    body: format!("{}\n{}", make::stylesheet(profile.kind), profile.css)
+                        .into_bytes(),
+                })
+            }
+        }
     }
 
     /// The 404 for a page the store does not hold while nothing new is made.

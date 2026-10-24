@@ -361,7 +361,13 @@ impl Pages {
                 }),
         );
         let latest = self.latest_publication();
-        let reference = self.reference_text(&url).map_err(Stop::store)?;
+        // A document that exists is written from its real text: a capture,
+        // or else the public original the host reads now.
+        let original = match self.reference_text(&url).map_err(Stop::store)? {
+            Some(captured) => Some(captured),
+            None if matches!(self.maker(), Maker::Model(_)) => self.originals.read(cx, &url).await,
+            None => None,
+        };
         let made = self
             .generate(
                 cx,
@@ -389,10 +395,8 @@ impl Pages {
                         ask.profile.as_ref(),
                         &ask.host_pages,
                         &ask.claims,
+                        original.as_ref(),
                     );
-                    if let Some(reference) = &reference {
-                        user.push_str(&format!("\nOriginal captured source at this URL:\n{reference}\nPreserve its established public facts and substantive data, except for changes explicitly required by the world's brief or previously published world documents. Write the requested document in full from that grounding. The snapshot date does not change the dates of events it describes."));
-                    }
                     user.push_str(&format!("\nThe latest permitted publication/update date is {latest}. Incoming links already published by this date must remain possible. Later context describes the wider world; do not import its later knowledge into this page."));
                     (system, user)
                 },
@@ -400,6 +404,15 @@ impl Pages {
                     let mut page = prompts::read_page(text, expected, !ask.mentions.is_empty())?;
                     if page.date.is_empty() && page.content_type.starts_with("text/html") {
                         page.date = latest.to_string();
+                    }
+                    // What a real document states was known when it was
+                    // published, including the plans it schedules for later.
+                    if original.is_some()
+                        && let Ok(dateline) = seed::parse_date(&page.date)
+                    {
+                        for claim in &mut page.claims {
+                            claim.known_on = claim.known_on.map(|date| date.min(dateline));
+                        }
                     }
                     if let Maker::Model(model) = self.maker() {
                         let store = self.store();
@@ -435,12 +448,15 @@ impl Pages {
             )
             .await?;
         let mut page = made.fields;
-        if let Some(title) = ask
-            .mentions
-            .iter()
-            .filter_map(Mention::title)
-            .find(|s| !s.is_empty())
-        {
+        let title = match &original {
+            Some(original) => original.title.as_deref(),
+            None => ask
+                .mentions
+                .iter()
+                .filter_map(Mention::title)
+                .find(|s| !s.is_empty()),
+        };
+        if let Some(title) = title {
             page.title = title.into();
         }
         let today = &self.seed.date;

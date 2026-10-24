@@ -542,12 +542,15 @@ impl Store {
     /// mention: a page that exists gives its title and description, then the
     /// seed's declaration of a fixed page, then the first title a mention
     /// showed. Returns the mention as recorded, so every engine shows it.
+    /// While the page is being written, only what it was asked to show
+    /// can be promised: the first recorded mention's title, snippet and date.
     pub fn reserve_mention(
         &mut self,
         seed: &Seed,
         host: &str,
         target: &str,
         mut mention: Mention,
+        writing: bool,
     ) -> io::Result<Mention> {
         let _held = self.hold()?;
         let page = self
@@ -564,6 +567,18 @@ impl Store {
             ..
         } = &mut mention
         {
+            let promised = self
+                .mentions(host, target)
+                .iter()
+                .find_map(|recorded| match recorded {
+                    Mention::Search {
+                        title,
+                        snippet,
+                        date,
+                        ..
+                    } if !title.is_empty() => Some((title.clone(), snippet.clone(), *date)),
+                    _ => None,
+                });
             if let Some((chosen_title, description)) = page.or(declared) {
                 if !chosen_title.is_empty() {
                     *title = chosen_title;
@@ -571,6 +586,10 @@ impl Store {
                 if !description.is_empty() {
                     *snippet = description;
                 }
+            } else if writing && let Some((chosen_title, chosen_snippet, chosen_date)) = promised {
+                *title = chosen_title;
+                *snippet = chosen_snippet;
+                *date = chosen_date;
             } else if let Some(chosen) = self
                 .mentions(host, target)
                 .iter()
