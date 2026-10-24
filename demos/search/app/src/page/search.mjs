@@ -22,7 +22,6 @@ let noticeTimer, activeConsole = 'terminal', hostStatus = null;
 const consoles = new Map();
 const mounting = new Set();
 const socketUrl = (path) => `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/${path}`;
-history.replaceState(null, '', '/');
 function notice(text) {
   $('notice').textContent = text;
   $('notice').hidden = false;
@@ -93,9 +92,9 @@ function graph() {
       control.classList.add('has-egress');
       const destinations = element('div', undefined, 'destinations');
       if (service.purpose === 'live_capture') {
-        const pages = shown.sites.flatMap((site) => site.requests.filter((request) => request.source.kind === 'live' && request.has_preview));
+        const requests = shown.egress.filter((row) => row.fact.purpose === 'live_capture');
         const copies = button('', () => select('copies'), 'destination');
-        copies.append(element('strong', 'Page copies'), element('small', `${quantity(pages.length, 'page')} · ${quantity(hosts.length, 'host')}`));
+        copies.append(element('strong', 'Page fetches'), element('small', `${quantity(requests.length, 'request')} · ${quantity(hosts.length, 'host')}`));
         destinations.append(copies);
       } else {
         for (const host of hosts) {
@@ -195,7 +194,7 @@ function activityText(row) {
   switch (fact.kind) {
     case 'request': {
       const url = `${fact.scheme}://${fact.host}${fact.path}`;
-      const hit = shown.sites.flatMap((site) => site.searches.flatMap((search) => search.results)).concat(shown.calls.flatMap((call) => call.tools.flatMap((tool) => tool.results))).find((hit) => hit.url === url);
+      const hit = hitFor(url);
       return [`${fact.status >= 400 ? 'Requested' : 'Opened'} ${hit?.title || fact.host}`, `${fact.host}${briefPath(fact.path) === '/' ? '' : briefPath(fact.path)} · ${fact.status} · ${sourceName(fact.source)}`, /(?:text\/html|application\/pdf)/.test(fact.content_type) ? `page:${url}` : `site:${fact.host}`];
     }
     case 'search': return [`Searched “${fact.query}”`, quantity(fact.results.length, 'result'), 'search'];
@@ -256,13 +255,17 @@ function requestFor(url) {
     return [...(shown.sites.find((site) => site.host === target.host)?.requests || [])].reverse().find((request) => request.url === target.href && request.method === 'GET');
   } catch { return null; }
 }
+function hitFor(url) {
+  return shown.sites.flatMap((site) => site.searches.flatMap((search) => search.results)).concat(shown.calls.flatMap((call) => call.tools.flatMap((tool) => tool.results))).find((hit) => hit.url === url);
+}
 function results(hits) {
   const list = element('div');
   if (!hits.length) list.append(element('p', 'No results', 'world-answer'));
   for (const hit of hits) {
     const opened = requestFor(hit.url);
     const row = button('', () => select(`page:${hit.url}`), `result ${opened ? 'opened' : 'unopened'}`);
-    row.append(element('span', hit.title || hit.url, 'result-title'), element('small', hit.url), element('span', opened ? 'Opened' : 'Unopened', 'result-state'));
+    row.append(element('span', hit.title || hit.url, 'result-title'), element('small', hit.url), element('span', opened ? opened.status >= 400 ? 'Failed' : 'Opened' : 'Unopened', 'result-state'));
+    if (opened?.status >= 400) row.classList.add('failed');
     list.append(row);
   }
   return list;
@@ -322,9 +325,9 @@ function details() {
     }
   } else if (selection.startsWith('page:')) {
     const url = selection.slice(5), request = requestFor(url);
-    const hit = shown.sites.flatMap((site) => site.searches.flatMap((search) => search.results)).concat(shown.calls.flatMap((call) => call.tools.flatMap((tool) => tool.results))).find((hit) => hit.url === url);
+    const hit = hitFor(url);
     heading(hit?.title || 'Page', url);
-    body.append(element('p', request ? `Opened · ${request.status} · ${sourceName(request.source)}` : 'Unopened', 'page-state'));
+    body.append(element('p', request ? `${request.status >= 400 ? 'Failed' : 'Opened'} · ${request.status} · ${sourceName(request.source)}` : 'Unopened', 'page-state'));
     if (request?.has_preview) {
       const container = element('div', 'Loading page…', 'reading-view');
       body.append(container);
@@ -355,8 +358,8 @@ function details() {
     }
     if (!site?.requests.length && !site?.searches.length) body.append(element('p', 'Unopened', 'detail-empty'));
   } else if (selection === 'copies') {
-    heading('Page copies');
-    for (const site of shown.sites) for (const request of site.requests.filter((request) => request.source.kind === 'live' && request.has_preview)) {
+    heading('Page fetches');
+    for (const site of shown.sites) for (const request of site.requests.filter((request) => request.source.kind === 'live' && request.status >= 200 && request.status < 300 && request.has_preview)) {
       const row = button(request.url, () => select(`page:${request.url}`), 'site-list');
       body.append(row);
     }
@@ -419,11 +422,11 @@ function details() {
 
 function draw() {
   graph(); feed(); details();
-  $("clock").textContent = stamp(shown.at_ms);
+  $('clock').textContent = stamp(shown.at_ms);
 }
-const stream = new EventSource("/state");
-stream.onerror = () => { $("clock").title = "Reconnecting"; };
-stream.onopen = () => { $("clock").title = ""; };
+const stream = new EventSource('/state');
+stream.onerror = () => { $('clock').title = 'Reconnecting'; };
+stream.onopen = () => { $('clock').title = ''; };
 stream.onmessage = (event) => {
   shown = JSON.parse(event.data);
   draw();
