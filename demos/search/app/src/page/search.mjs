@@ -17,9 +17,9 @@ const size = (bytes) => bytes < 1000 ? `${bytes} B` : `${Math.round(bytes / 1000
 const quantity = (n, word, plural = `${word}s`) => `${n} ${n === 1 ? word : plural}`;
 const sourceName = (source) => source.kind === 'copy' ? source.captured ? `Copied · ${source.captured.slice(0, 10)}` : 'Copied' : source.kind === 'live' ? 'live' : 'model-written';
 const hostOf = (url) => { try { return new URL(url).host; } catch { return url; } };
-let latest = { at_ms: 0, oldest_ms: 0, sites: [], calls: [], activity: [], connections: [], egress: [], signin: null };
-let shown = latest, selection = null, live = true, world = null;
-let rewindRequest, noticeTimer, activeConsole = 'terminal', hostStatus = null;
+let shown = { at_ms: 0, sites: [], calls: [], activity: [], connections: [], egress: [], signin: null };
+let selection = null, world = null;
+let noticeTimer, activeConsole = 'terminal', hostStatus = null;
 const consoles = new Map();
 const mounting = new Set();
 const socketUrl = (path) => `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/${path}`;
@@ -43,6 +43,7 @@ $('close-details').onclick = () => select(null);
 $('agent-toggle').onclick = () => {
   $('agent').hidden = !$('agent').hidden;
   $('agent-toggle').setAttribute('aria-pressed', String(!$('agent').hidden));
+  $('agent-toggle').textContent = $('agent').hidden ? 'Show agent' : 'Hide agent';
 };
 function localSites() {
   const upstream = new Set([...shown.connections.filter((row) => ['model', 'account', 'page writer'].includes(row.purpose)).map((row) => row.host), ...shown.calls.map((call) => call.host)]);
@@ -71,18 +72,17 @@ function graph() {
     { id: 'router', title: 'Router', subtitle: facts.filter((fact) => fact.kind === 'no_route').at(-1)?.to || '10.0.0.1', reached: facts.some((fact) => fact.kind === 'no_route') },
   ];
   const lanes = element('div', undefined, 'traffic-lanes');
-  const firstReached = services.findIndex((service) => service.reached);
-  const lastReached = services.findLastIndex((service) => service.reached);
+  const boundary = element('div', undefined, 'world-boundary');
+  lanes.append(boundary);
+  const vm = button('', () => select('workstation'), 'vm-node');
+  vm.append(element('span', '>_', 'vm-icon'), element('strong', 'workstation'), element('small', hostStatus?.addresses[0] || '10.0.0.2'));
+  lanes.append(vm);
   for (const [index, service] of services.entries()) {
     const lane = element('div', undefined, 'traffic-lane');
-    if (index >= firstReached && index <= lastReached) lane.append(element('span', undefined, 'vm-stem'));
-    if (index === Math.max(0, firstReached)) {
-      const vm = button('workstation', () => select('workstation'), 'vm-label');
-      vm.append(element('small', hostStatus?.addresses[0] || '10.0.0.2'));
-      if (firstReached >= 0) vm.classList.add('connected');
-      lane.append(vm);
-    }
-    const control = button('', () => select(service.id), `service ${service.reached ? 'active' : 'unused'}`);
+    const hosts = modelHosts(service.purpose);
+    const control = button('', () => select(service.id), `service ${service.reached || hosts.length ? 'active' : 'unused'}`);
+    control.dataset.service = service.id;
+    control.dataset.reached = service.reached;
     if (service.id === 'router' && service.reached) control.classList.add('refused');
     control.setAttribute('aria-pressed', String(selection === service.id));
     const label = element('span', undefined, 'service-label');
@@ -90,7 +90,6 @@ function graph() {
     if (service.subtitle) label.append(element('small', service.subtitle, service.id === 'router' && service.reached ? 'map-refusal' : ''));
     control.append(label);
     lane.append(control);
-    const hosts = modelHosts(service.purpose);
     if (hosts.length) {
       control.classList.add('has-egress');
       const destinations = element('div', undefined, 'destinations');
@@ -108,22 +107,98 @@ function graph() {
       }
       lane.append(destinations);
     } else if (!index && !shown.connections.length) lane.append(element('p', 'No connections', 'map-empty'));
-    if (index === firstReached) lane.classList.add('first-reached');
-    if (index === lastReached) lane.classList.add('last-reached');
     lanes.append(lane);
   }
   map.append(lanes);
+  drawWires();
 }
 
+function drawWires() {
+  const lanes = $('map').querySelector('.traffic-lanes');
+  if (!lanes || !lanes.clientWidth) return;
+  lanes.querySelector('svg')?.remove();
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.classList.add('traffic-wires');
+  svg.setAttribute('width', lanes.clientWidth);
+  svg.setAttribute('height', lanes.clientHeight);
+  svg.setAttribute('aria-hidden', 'true');
+  const origin = lanes.getBoundingClientRect();
+  const point = (node, side) => {
+    const rect = node.getBoundingClientRect();
+    return { x: rect[side] - origin.left, y: rect.top - origin.top + rect.height / 2 };
+  };
+  const line = (d, refused = false) => {
+    const path = document.createElementNS(svg.namespaceURI, 'path');
+    path.setAttribute('d', d);
+    if (refused) path.classList.add('refused');
+    svg.append(path);
+  };
+  const port = ({ x, y }, refused = false) => {
+    const dot = document.createElementNS(svg.namespaceURI, 'circle');
+    dot.setAttribute('cx', x); dot.setAttribute('cy', y); dot.setAttribute('r', 2.5);
+    if (refused) dot.classList.add('refused');
+    svg.append(dot);
+  };
+  const vm = point(lanes.querySelector('.vm-node'), 'right');
+  const reached = [...lanes.querySelectorAll('.service[data-reached="true"]')];
+  if (reached.length) {
+    const points = reached.map((node) => point(node, 'left'));
+    const junction = (vm.x + points[0].x) / 2;
+    line(`M${vm.x},${vm.y} H${junction}`);
+    line(`M${junction},${Math.min(vm.y, ...points.map((p) => p.y))} V${Math.max(vm.y, ...points.map((p) => p.y))}`);
+    for (const [index, node] of reached.entries()) {
+      const p = points[index], refused = node.classList.contains('refused');
+      line(`M${junction},${p.y} H${p.x}`, refused);
+      port(p, refused);
+    }
+  }
+  for (const lane of lanes.querySelectorAll('.traffic-lane')) {
+    const service = lane.querySelector('.service');
+    const destinations = [...lane.querySelectorAll('.destination')];
+    if (!destinations.length) continue;
+    const start = point(service, 'right');
+    const ends = destinations.map((node) => point(node, 'left'));
+    const junction = (start.x + ends[0].x) / 2;
+    line(`M${start.x},${start.y} H${junction}`);
+    line(`M${junction},${Math.min(start.y, ...ends.map((p) => p.y))} V${Math.max(start.y, ...ends.map((p) => p.y))}`);
+    port(start);
+    for (const end of ends) {
+      line(`M${junction},${end.y} H${end.x - 4} m-4,-3 l4,3 l-4,3`);
+    }
+  }
+  lanes.prepend(svg);
+}
+new ResizeObserver(drawWires).observe($('map'));
+
 const briefPath = (path) => path.split('?')[0];
+const isAsset = (request) => /^(image\/|font\/|audio\/|video\/|text\/css|(?:text|application)\/(?:x-)?javascript|application\/(?:font|x-font|vnd\.ms-fontobject))/.test(request.content_type)
+  || /\.(?:css|[cm]?js|map|ico|png|jpe?g|gif|svg|webp|avif|woff2?|ttf|otf|eot|mp[34]|webm)(?:\?|$)/i.test(request.path);
+function pageAssets() {
+  const groups = new Map();
+  let page = null;
+  const byHost = new Map();
+  for (const row of shown.activity) {
+    const fact = row.fact;
+    if (fact.kind !== 'request') continue;
+    if (isAsset(fact)) {
+      const parent = byHost.get(fact.host) || page;
+      if (parent) groups.get(parent).push(row);
+    } else {
+      page = row;
+      byHost.set(fact.host, row);
+      groups.set(row, []);
+    }
+  }
+  return groups;
+}
 function activityText(row) {
   const fact = row.fact;
   switch (fact.kind) {
     case 'resolved': return [fact.name, 'DNS', `${fact.name} → ${fact.address || 'no answer'}`, `site:${fact.name}`];
-    case 'request': return [fact.host, fact.scheme.toUpperCase(), `${fact.method} ${briefPath(fact.path)} · ${fact.status}`, `site:${fact.host}`];
-    case 'search': return [{google:'www.google.com',bing:'www.bing.com',duck_duck_go:'html.duckduckgo.com',you_tube:'www.youtube.com'}[fact.engine] || 'Search', 'Search', fact.query, 'sites'];
-    case 'model_call': return [fact.host, 'HTTPS', `${phaseName(fact.phase)}`, 'calls'];
-    case 'tool': return ['model gateway', 'Tool', `${fact.tool === 'fetch' ? 'Fetch' : 'Search'} · ${fact.target}`, 'calls'];
+    case 'request': return [`Opened ${fact.host}${briefPath(fact.path) === '/' ? '' : briefPath(fact.path)}`, 'Page', `${fact.status} · ${sourceName(fact.source)}`, fact.preview || /(?:text\/html|application\/pdf)/.test(fact.content_type) ? `page:${fact.scheme}://${fact.host}${fact.path}` : `site:${fact.host}`];
+    case 'search': return [`Searched “${fact.query}”`, 'Search', quantity(fact.results.length, 'result'), 'search'];
+    case 'model_call': return ['Asked the model', 'HTTPS', `${fact.host} · ${phaseName(fact.phase)}`, 'calls'];
+    case 'tool': return [`${fact.tool === 'fetch' ? 'Fetched' : 'Searched'} ${fact.target}`, 'Tool', fact.error || (fact.tool === 'fetch' ? 'World answer' : quantity(fact.results.length, 'result')), 'calls'];
     case 'signin': return ['Sign-in', 'Policy', fact.open ? 'Open' : 'Closed', 'signin'];
     case 'egress': {
       if (fact.purpose === 'live_capture') {
@@ -136,24 +211,36 @@ function activityText(row) {
       const target = fact.target.url ? new URL(fact.target.url).hostname : fact.target.host || 'Search';
       return [target, 'Writer', 'Revising page', 'writer'];
     }
-    case 'no_route': return [fact.to, 'TCP', 'no route', 'router'];
+    case 'no_route': return [`Tried ${fact.to}`, 'TCP', 'No route', 'router'];
     default: return ['', '', '', 'router'];
   }
 }
 function feed() {
   const scrollTop = $('activity').scrollTop;
+  const expanded = new Set([...$('activity').querySelectorAll('details[open]')].map((node) => node.dataset.key));
   $('activity').replaceChildren();
-  const rows = activityRows();
-  const lastCopy = rows.findLast((row) => row.fact.kind === 'egress' && row.fact.purpose === 'live_capture');
+  const assets = pageAssets();
+  const rows = activityRows().filter((row) => ['request', 'search', 'model_call', 'tool', 'no_route'].includes(row.fact.kind) && !(row.fact.kind === 'request' && isAsset(row.fact)));
   for (const row of rows.reverse()) {
-    if (row.fact.kind === 'run_started') continue;
-    if (row.fact.kind === 'egress' && (row.fact.purpose === 'model' || (row.fact.purpose === 'live_capture' && row !== lastCopy))) continue;
     const [target, , text, selected] = activityText(row);
     const item = button('', () => select(selected), `activity-row ${row.fact.kind}`);
     item.append(element('span', stamp(row.at_ms), 'stamp'), element('span', target), element('span', text));
     item.title = `${target} · ${text}${row.fact.kind === 'page_revision' ? ` · ${row.fact.reason}` : ''}`;
     $('activity').append(item);
+    const resources = assets.get(row);
+    if (resources?.length) {
+      const group = element('details', undefined, 'page-assets');
+      group.dataset.key = `${row.at_ms}:${row.fact.host}:${row.fact.path}`;
+      group.open = expanded.has(group.dataset.key);
+      group.append(element('summary', quantity(resources.length, 'asset')));
+      for (const resource of resources) {
+        const fact = resource.fact;
+        group.append(button(`${fact.host}${fact.path} · ${fact.status}`, () => select(`site:${fact.host}`), 'asset-row'));
+      }
+      $('activity').append(group);
+    }
   }
+  if (!rows.length) $('activity').append(element('p', 'Waiting for activity', 'feed-empty'));
   $('activity').scrollTop = scrollTop;
 
 }
@@ -199,7 +286,7 @@ function results(hits) {
 }
 async function readPage(url, request, container) {
   const target = new URL(url);
-  const query = new URLSearchParams({ scheme: target.protocol.slice(0, -1), host: target.host, path: `${target.pathname}${target.search}`, at_ms: request.at_ms });
+  const query = new URLSearchParams({ scheme: target.protocol.slice(0, -1), host: target.host, path: `${target.pathname}${target.search}` });
   const response = await fetch(`/preview?${query}`);
   if (!response.ok) throw new Error(await response.text());
   const doc = new DOMParser().parseFromString(await response.text(), 'text/html');
@@ -347,46 +434,16 @@ function details() {
   body.scrollTop = scroll;
 }
 
-function draw(upstream = null, newData = false) {
-  graph(upstream, newData); feed(); details();
-  $('clock').textContent = time(latest.at_ms);
-  $('cursor-time').textContent = time(shown.at_ms);
-  $('end-time').textContent = time(latest.at_ms);
-  $('oldest').textContent = time(latest.oldest_ms);
-  $('scrubber').min = latest.oldest_ms;
-  $('scrubber').max = Math.max(latest.at_ms, latest.oldest_ms);
-  $('scrubber').value = shown.at_ms;
-  $('live').setAttribute('aria-pressed', String(live));
-  $('play').textContent = live ? 'Ⅱ' : '▶';
-  $('play').setAttribute('aria-label', live ? 'Pause observation' : 'Return to live observation');
-  $('rewind-label').hidden = live;
+function draw() {
+  graph(); feed(); details();
+  $("clock").textContent = time(shown.at_ms);
 }
-async function rewind(at) {
-  live = false;
-  rewindRequest?.abort();
-  rewindRequest = new AbortController();
-  try {
-    const reply = await fetch(`/view?at_ms=${at}`, { signal: rewindRequest.signal });
-    if (!reply.ok) throw new Error('Could not load this point in the run');
-    shown = await reply.json(); draw();
-  } catch (error) { if (error.name !== 'AbortError') notice(error.message); }
-}
-$('scrubber').addEventListener('input', (event) => rewind(Number(event.target.value)));
-function goLive() { rewindRequest?.abort(); live = true; shown = latest; draw(); }
-$('live').onclick = goLive;
-$('play').onclick = () => live ? rewind(shown.at_ms) : goLive();
-const stream = new EventSource('/state');
-stream.onerror = () => { $('clock').title = 'Reconnecting'; };
-stream.onopen = () => { $('clock').title = ''; };
+const stream = new EventSource("/state");
+stream.onerror = () => { $("clock").title = "Reconnecting"; };
+stream.onopen = () => { $("clock").title = ""; };
 stream.onmessage = (event) => {
-  const forwarded = (row) => ['attempt', 'response', 'failed'].includes(row.fact.phase);
-  const before = latest.egress.filter(forwarded).at(-1);
-  const connected = !!latest.started_at_ms;
-  latest = JSON.parse(event.data);
-  const after = latest.egress.filter(forwarded).at(-1);
-  const upstream = connected && JSON.stringify(before) !== JSON.stringify(after) ? after?.fact : null;
-  if (live || shown.at_ms < latest.oldest_ms) { shown = latest; live = true; }
-  draw(upstream, true);
+  shown = JSON.parse(event.data);
+  draw();
 };
 async function loadWorld() {
   const response = await fetch('/world');
@@ -419,7 +476,7 @@ for (const control of $('source').querySelectorAll('button')) {
     catch (error) { notice(error.message); await loadWorld(); }
   };
 }
-$('restart').onclick = async () => { $('restart').disabled = true; try { await command({ command: 'restart' }); select(null); goLive(); } catch (error) { $('world-error').textContent = error.message; } finally { $('restart').disabled = false; } };
+$('restart').onclick = async () => { $('restart').disabled = true; try { await command({ command: 'restart' }); select(null); } catch (error) { $('world-error').textContent = error.message; } finally { $('restart').disabled = false; } };
 async function mountConsole() {
   if (!hostStatus) return;
   const kind = activeConsole;
@@ -466,4 +523,4 @@ status.onmessage = (event) => {
 };
 loadWorld().then(() => mountConsole()).catch((error) => notice(error.message));
 draw();
-window.addEventListener('pagehide', () => { stream.close(); status.close(); for (const console of consoles.values()) { console.component.dispose(); console.socket.close(); } rewindRequest?.abort(); });
+window.addEventListener('pagehide', () => { stream.close(); status.close(); for (const console of consoles.values()) { console.component.dispose(); console.socket.close(); } });

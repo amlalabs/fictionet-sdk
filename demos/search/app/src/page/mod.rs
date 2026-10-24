@@ -1,4 +1,4 @@
-//! Search owns its map, details, rewind and world controls.
+//! Search owns its map, details and world controls.
 
 use axum::{
     Json, Router,
@@ -9,7 +9,7 @@ use axum::{
 use fictionet_demo::kit::page::{self as pieces, Console, HostStatus};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::VecDeque,
+    collections::HashMap,
     sync::{Arc, Mutex},
 };
 use tokio::sync::{mpsc, watch};
@@ -83,7 +83,6 @@ pub struct Connection {
 pub struct View {
     pub started_at_ms: u64,
     pub at_ms: u64,
-    pub oldest_ms: u64,
     pub sites: Vec<Site>,
     pub calls: Vec<Call>,
     pub activity: Vec<Observation>,
@@ -93,224 +92,207 @@ pub struct View {
 }
 
 pub struct Views {
-    started_at_ms: u64,
-    observations: VecDeque<Observation>,
-    oldest_ms: u64,
-    connections: Vec<Connection>,
-    signin: VecDeque<Observation>,
+    view: View,
+    previews: HashMap<String, web_world::pages::PageBody>,
 }
 impl Default for Views {
     fn default() -> Self {
         Self {
-            started_at_ms: wall_start(),
-            observations: VecDeque::new(),
-            oldest_ms: 0,
-            connections: Vec::new(),
-            signin: VecDeque::new(),
+            view: View {
+                started_at_ms: wall_start(),
+                at_ms: 0,
+                sites: Vec::new(),
+                calls: Vec::new(),
+                activity: Vec::new(),
+                connections: Vec::new(),
+                egress: Vec::new(),
+                signin: None,
+            },
+            previews: HashMap::new(),
         }
     }
 }
 impl Views {
-    pub fn push(&mut self, observation: Observation) {
+    pub fn push(&mut self, mut observation: Observation) {
+        let view = &mut self.view;
+        view.at_ms = observation.at_ms;
         if let SearchObs::RunStarted { started_at_ms } = observation.fact {
-            self.started_at_ms = started_at_ms;
+            view.started_at_ms = started_at_ms;
         }
         match &observation.fact {
-            SearchObs::Egress { host, purpose, .. } => {
+            SearchObs::Resolved { name, address } => {
+                if address.is_some() {
+                    site(&mut view.sites, &name.to_ascii(), observation.at_ms).address = *address;
+                }
+            }
+            SearchObs::Request {
+                scheme,
+                host,
+                method,
+                path,
+                status,
+                bytes,
+                content_type,
+                source,
+                elapsed_ms,
+                headers,
+                preview,
+            } => {
+                let url = format!("{scheme}://{host}{path}");
+                if let Some(body) = preview {
+                    self.previews.insert(url.clone(), body.clone());
+                } else {
+                    self.previews.remove(&url);
+                }
+                site(&mut view.sites, &host.to_ascii(), observation.at_ms)
+                    .requests
+                    .push(Request {
+                        url,
+                        at_ms: observation.at_ms,
+                        method: method.to_string(),
+                        path: path.to_string(),
+                        status: status.as_u16(),
+                        bytes: *bytes,
+                        content_type: content_type.clone(),
+                        source: source.clone(),
+                        elapsed_ms: *elapsed_ms,
+                        headers: headers
+                            .iter()
+                            .filter(|(_, value)| value.as_bytes() != b"[redacted]")
+                            .map(|(name, value)| {
+                                (
+                                    name.to_string(),
+                                    String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                                )
+                            })
+                            .collect(),
+                        has_preview: preview.is_some(),
+                    });
+            }
+            SearchObs::Search {
+                engine,
+                query,
+                results,
+            } => {
+                let host = match engine {
+                    web_world::observation::Engine::Google => "www.google.com",
+                    web_world::observation::Engine::Bing => "www.bing.com",
+                    web_world::observation::Engine::DuckDuckGo => "html.duckduckgo.com",
+                    web_world::observation::Engine::YouTube => "www.youtube.com",
+                };
+                site(&mut view.sites, host, observation.at_ms)
+                    .searches
+                    .push(Search {
+                        at_ms: observation.at_ms,
+                        engine: *engine,
+                        query: query.clone(),
+                        results: results.clone(),
+                    });
+            }
+            SearchObs::ModelCall {
+                call,
+                host,
+                path,
+                status,
+                method,
+                phase,
+            } => {
+                if let Some(row) = view.calls.iter_mut().find(|row| row.call == *call) {
+                    row.status = status.map(|status| status.as_u16());
+                    row.phase = *phase;
+                } else {
+                    view.calls.push(Call {
+                        call: *call,
+                        at_ms: observation.at_ms,
+                        host: host.to_ascii(),
+                        path: path.to_string(),
+                        status: status.map(|status| status.as_u16()),
+                        method: method.to_string(),
+                        phase: *phase,
+                        tools: Vec::new(),
+                    });
+                }
+            }
+            SearchObs::Tool {
+                call,
+                tool,
+                target,
+                results,
+                error,
+            } => {
+                if let Some(row) = view.calls.iter_mut().find(|row| row.call == *call) {
+                    row.tools.push(ToolUse {
+                        at_ms: observation.at_ms,
+                        tool: *tool,
+                        target: target.clone(),
+                        results: results.clone(),
+                        error: error.clone(),
+                    });
+                }
+            }
+            SearchObs::Egress {
+                host,
+                purpose,
+                attempt,
+                ..
+            } => {
                 let host = host.to_ascii();
-                if !self
+                if !view
                     .connections
                     .iter()
                     .any(|connection| connection.host == host && connection.purpose == *purpose)
                 {
-                    self.connections.push(Connection {
+                    view.connections.push(Connection {
                         host,
                         purpose: *purpose,
                         at_ms: observation.at_ms,
                     });
                 }
+                if let Some(previous) = view.egress.iter_mut().find(
+                    |row| matches!(row.fact, SearchObs::Egress { attempt: id, .. } if id == *attempt),
+                ) {
+                    *previous = observation.clone();
+                } else {
+                    view.egress.push(observation.clone());
+                }
             }
-            SearchObs::Signin { .. } => {
-                self.signin.push_back(observation.clone());
-            }
-            _ => {}
+            SearchObs::Signin { .. } => view.signin = Some(observation.clone()),
+            SearchObs::NoRoute { .. }
+            | SearchObs::PageRevision { .. }
+            | SearchObs::RunStarted { .. } => {}
         }
-        self.observations.push_back(observation);
-    }
-    pub fn at(&self, at_ms: u64) -> View {
-        let mut view = View {
-            started_at_ms: self.started_at_ms,
-            at_ms,
-            oldest_ms: self.oldest_ms,
-            sites: Vec::new(),
-            calls: Vec::new(),
-            activity: Vec::new(),
-            connections: self
-                .connections
-                .iter()
-                .filter(|row| row.at_ms <= at_ms)
-                .cloned()
-                .collect(),
-            egress: Vec::new(),
-            signin: self
-                .signin
-                .iter()
-                .rev()
-                .find(|row| row.at_ms <= at_ms)
-                .cloned(),
-        };
-        for observation in self.observations.iter().filter(|row| row.at_ms <= at_ms) {
-            match &observation.fact {
-                SearchObs::Resolved { name, address } => {
-                    if address.is_some() {
-                        site(&mut view.sites, &name.to_ascii(), observation.at_ms).address =
-                            *address;
-                    }
-                }
-                SearchObs::Request {
-                    scheme,
-                    host,
-                    method,
-                    path,
-                    status,
-                    bytes,
-                    content_type,
-                    source,
-                    elapsed_ms,
-                    headers,
-                    preview,
-                } => {
-                    site(&mut view.sites, &host.to_ascii(), observation.at_ms)
-                        .requests
-                        .push(Request {
-                            url: format!("{scheme}://{host}{path}"),
-                            at_ms: observation.at_ms,
-                            method: method.to_string(),
-                            path: path.to_string(),
-                            status: status.as_u16(),
-                            bytes: *bytes,
-                            content_type: content_type.clone(),
-                            source: source.clone(),
-                            elapsed_ms: *elapsed_ms,
-                            headers: headers
-                                .iter()
-                                .filter(|(_, value)| value.as_bytes() != b"[redacted]")
-                                .map(|(name, value)| {
-                                    (
-                                        name.to_string(),
-                                        String::from_utf8_lossy(value.as_bytes()).into_owned(),
-                                    )
-                                })
-                                .collect(),
-                            has_preview: preview.is_some(),
-                        });
-                }
-                SearchObs::Search {
-                    engine,
-                    query,
-                    results,
-                } => {
-                    let host = match engine {
-                        web_world::observation::Engine::Google => "www.google.com",
-                        web_world::observation::Engine::Bing => "www.bing.com",
-                        web_world::observation::Engine::DuckDuckGo => "html.duckduckgo.com",
-                        web_world::observation::Engine::YouTube => "www.youtube.com",
-                    };
-                    site(&mut view.sites, host, observation.at_ms)
-                        .searches
-                        .push(Search {
-                            at_ms: observation.at_ms,
-                            engine: *engine,
-                            query: query.clone(),
-                            results: results.clone(),
-                        });
-                }
-                SearchObs::ModelCall {
-                    call,
-                    host,
-                    path,
-                    status,
-                    method,
-                    phase,
-                } => {
-                    if let Some(row) = view.calls.iter_mut().find(|row| row.call == *call) {
-                        row.status = status.map(|status| status.as_u16());
-                        row.phase = *phase;
-                    } else {
-                        view.calls.push(Call {
-                            call: *call,
-                            at_ms: observation.at_ms,
-                            host: host.to_ascii(),
-                            path: path.to_string(),
-                            status: status.map(|status| status.as_u16()),
-                            method: method.to_string(),
-                            phase: *phase,
-                            tools: Vec::new(),
-                        });
-                    }
-                }
-                SearchObs::Tool {
-                    call,
-                    tool,
-                    target,
-                    results,
-                    error,
-                } => {
-                    if let Some(row) = view.calls.iter_mut().find(|row| row.call == *call) {
-                        row.tools.push(ToolUse {
-                            at_ms: observation.at_ms,
-                            tool: *tool,
-                            target: target.clone(),
-                            results: results.clone(),
-                            error: error.clone(),
-                        });
-                    }
-                }
-                SearchObs::Egress { .. } => view.egress.push(observation.clone()),
-                SearchObs::Signin { .. } => view.signin = Some(observation.clone()),
-                SearchObs::NoRoute { .. }
-                | SearchObs::PageRevision { .. }
-                | SearchObs::RunStarted { .. } => {}
-            }
-            if let SearchObs::ModelCall { call, .. } = observation.fact
-                && let Some(previous) = view.activity.iter_mut().find(
-                    |row| matches!(row.fact, SearchObs::ModelCall { call: id, .. } if id == call),
-                )
-            {
-                previous.fact = observation.fact.clone();
-            } else {
-                view.activity.push(observation.clone());
-            }
+        if let SearchObs::Request { preview, .. } = &mut observation.fact {
+            *preview = None;
         }
-        view
+        if let SearchObs::ModelCall { call, .. } = observation.fact
+            && let Some(previous) = view
+                .activity
+                .iter_mut()
+                .find(|row| matches!(row.fact, SearchObs::ModelCall { call: id, .. } if id == call))
+        {
+            previous.fact = observation.fact;
+        } else if let SearchObs::Egress { attempt, .. } = observation.fact
+            && let Some(previous) = view.activity.iter_mut().find(
+                |row| matches!(row.fact, SearchObs::Egress { attempt: id, .. } if id == attempt),
+            )
+        {
+            *previous = observation;
+        } else {
+            view.activity.push(observation);
+        }
     }
-    pub fn preview(&self, url: &url::Url, at_ms: u64) -> Option<web_world::pages::PageBody> {
-        self.observations
-            .iter()
-            .rev()
-            .filter(|row| row.at_ms <= at_ms)
-            .find_map(|row| match &row.fact {
-                SearchObs::Request {
-                    scheme,
-                    host,
-                    path,
-                    preview,
-                    ..
-                } if scheme.as_str() == url.scheme()
-                    && Some(host.to_ascii().trim_end_matches('.')) == url.host_str()
-                    && path.as_str()
-                        == &url[url::Position::BeforePath..url::Position::AfterQuery] =>
-                {
-                    preview.clone()
-                }
-                _ => None,
-            })
+    pub fn preview(&self, url: &url::Url) -> Option<web_world::pages::PageBody> {
+        self.previews.get(url.as_str()).cloned()
     }
     pub fn current(&self) -> View {
-        self.at(self
-            .observations
-            .back()
-            .map_or(self.oldest_ms, |row| row.at_ms))
+        self.view.clone()
+    }
+    fn restart(&mut self) {
+        self.view.sites.clear();
+        self.view.calls.clear();
+        self.view.activity.clear();
+        self.view.egress.clear();
+        self.previews.clear();
     }
 }
 fn site<'a>(sites: &'a mut Vec<Site>, host: &str, at_ms: u64) -> &'a mut Site {
@@ -435,7 +417,7 @@ impl Page {
                 .open(&path)?,
         );
         println!("Run record: {}", path.display());
-        let mut started_at_ms = self.views.lock().unwrap().started_at_ms;
+        let mut started_at_ms = self.views.lock().unwrap().view.started_at_ms;
         while let Some(observation) = observations.recv().await {
             if let SearchObs::RunStarted {
                 started_at_ms: start,
@@ -498,8 +480,7 @@ impl Page {
                     .map(|_| {
                         if restart {
                             let mut views = page.views.lock().unwrap();
-                            views.observations.clear();
-                            views.oldest_ms = cx.now().since_start().as_millis() as u64;
+                            views.restart();
                             page.snapshots.send_replace(views.current());
                         }
                         let preview = page.world.borrow().preview;
@@ -517,7 +498,6 @@ impl Page {
         });
     }
     pub fn router(&self) -> Router {
-        let shared = self.clone();
         let preview = self.clone();
         let console = self.console.clone();
         let screen = console.clone();
@@ -573,13 +553,6 @@ impl Page {
                 }),
             )
             .route(
-                "/view",
-                get(move |Query(query): Query<Rewind>| {
-                    let page = shared.clone();
-                    async move { Json(page.views.lock().unwrap().at(query.at_ms)) }
-                }),
-            )
-            .route(
                 "/preview",
                 get(move |Query(query): Query<Preview>| {
                     let page = preview.clone();
@@ -592,7 +565,7 @@ impl Page {
                         )) else {
                             return http::StatusCode::BAD_REQUEST.into_response();
                         };
-                        let body = page.views.lock().unwrap().preview(&url, query.at_ms);
+                        let body = page.views.lock().unwrap().preview(&url);
                         match body {
                             Some(body) => {
                                 match tokio::task::spawn_blocking(move || body.text()).await {
@@ -609,11 +582,9 @@ impl Page {
                                         .into_response(),
                                 }
                             }
-                            None => (
-                                http::StatusCode::NOT_FOUND,
-                                "No recorded page at this point in the run",
-                            )
-                                .into_response(),
+                            None => {
+                                (http::StatusCode::NOT_FOUND, "No recorded page").into_response()
+                            }
                         }
                     }
                 }),
@@ -657,11 +628,6 @@ struct Preview {
     scheme: Option<String>,
     host: String,
     path: String,
-    at_ms: u64,
-}
-#[derive(Deserialize)]
-struct Rewind {
-    at_ms: u64,
 }
 async fn command(
     State(page): State<Page>,

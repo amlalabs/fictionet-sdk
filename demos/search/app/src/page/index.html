@@ -16,7 +16,7 @@
     <button data-source="model_written" aria-pressed="false">Model-written</button>
     <button data-source="live" aria-pressed="false">Live</button>
   </div>
-  <div class="toolbar"><button id="agent-toggle" aria-pressed="true">Agent</button><span class="run-clock"><span id="clock">00:00</span><span>UTC</span></span><button id="world-toggle" aria-expanded="false" aria-controls="world-menu">World</button></div>
+  <div class="toolbar"><button id="agent-toggle" aria-pressed="true">Hide agent</button><span class="run-clock"><span id="clock">00:00</span><span>UTC</span></span><button id="world-toggle" aria-expanded="false" aria-controls="world-menu">World settings</button></div>
 </header>
 <main>
   <section id="agent" class="agent panel" aria-label="Workstation">
@@ -26,9 +26,8 @@
   </section>
   <section id="world" class="world panel" aria-label="Search network">
     <div class="network-column">
-      <div class="map-wrap"><div id="map" aria-label="VM, world services and internet"></div><span id="rewind-label" hidden>Rewind</span></div>
+      <div class="map-wrap"><div id="map" aria-label="VM, world services and internet"></div></div>
       <div id="activity" class="activity" aria-label="Recent activity"></div>
-      <div class="timeline"><button id="play" aria-label="Pause observation">Ⅱ</button><span id="cursor-time">00:00</span><input id="scrubber" type="range" min="0" max="0" value="0" aria-label="Rewind observation"><button id="live" aria-pressed="true">Now</button><div class="timeline-labels"><span id="oldest">00:00</span><span id="end-time">00:00</span></div></div>
     </div>
     <aside id="details" hidden aria-label="Details"><div class="detail-heading"><div><h1 id="detail-title"></h1><p id="detail-subtitle"></p></div><button id="close-details" aria-label="Close details">×</button></div><div id="detail-body"></div><div id="detail-actions"></div></aside>
   </section>
