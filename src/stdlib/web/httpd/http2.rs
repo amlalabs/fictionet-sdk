@@ -24,7 +24,7 @@ use fictionet::time::Instant;
 use fictionet::{Cx, Error};
 
 use super::response::{
-    ResponsePolicy, error_response, request_held,
+    Asked, ResponsePolicy, error_response, request_held,
 };
 use super::{Body, Exchange, Handler, Later, Limits, Received, Reply, text};
 
@@ -1166,8 +1166,12 @@ impl Pending for Sending {
                 ))
                 .ok()
             });
-            let policy =
-                ResponsePolicy::new(&parts, body.size_hint().exact(), self.head_only, date);
+            let asked = if self.head_only {
+                Asked::Head
+            } else {
+                Asked::Body
+            };
+            let policy = ResponsePolicy::new(&parts, body.size_hint().exact(), asked, date);
             let mut fields = vec![hpack::Field::new(":status", parts.status.as_str())];
             for (name, value) in &parts.headers {
                 if matches!(

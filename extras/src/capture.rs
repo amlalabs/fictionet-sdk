@@ -79,7 +79,7 @@ pub fn page_text(html: &str) -> io::Result<String> {
 /// URLs discovered in a response, separated by navigation and page requisites.
 #[derive(Default, Debug)]
 pub struct Links {
-    /// Navigable links. The caller enforces site and depth restrictions.
+    /// Navigable links. The caller enforces site restrictions.
     pub pages: Vec<String>,
     /// CSS, scripts, images, fonts and nested CSS requisites.
     pub assets: Vec<String>,
@@ -138,8 +138,7 @@ pub fn references(url: &str, response: &warc::Response) -> io::Result<Vec<String
         .or_else(|_| dom.select_first("main"));
     let content = article.map(|node| node.as_node().clone()).unwrap_or(dom);
     let mut seen = std::collections::HashSet::new();
-    let mut references = Vec::new();
-    for url in content
+    Ok(content
         .select("a[href], area[href]")
         .unwrap()
         .filter_map(|node| {

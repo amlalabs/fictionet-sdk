@@ -455,6 +455,10 @@ pub struct Socket<'a> {
     local_rx_dup_acks: u8,
     /// If a fast retransmit needs to occur
     pending_fast_retransmit: bool,
+    /// Whether `close` left SYN-RECEIVED before the remote acknowledged our
+    /// SYN. Until it does, the SYN still holds its sequence number in
+    /// FIN-WAIT-1 or CLOSING, and the FIN waits behind it.
+    closed_before_syn_ack: bool,
 
     /// Duration for Delayed ACK. If None no ACKs will be delayed.
     ack_delay: Option<Duration>,
@@ -533,6 +537,7 @@ impl<'a> Socket<'a> {
             local_rx_last_seq: None,
             local_rx_dup_acks: 0,
             pending_fast_retransmit: false,
+            closed_before_syn_ack: false,
             ack_delay: Some(ACK_DELAY_DEFAULT),
             ack_delay_timer: AckDelayTimer::Idle,
             challenge_ack_timer: Instant::from_secs(0),
@@ -763,8 +768,16 @@ impl<'a> Socket<'a> {
         self.remote_win_shift = rx_cap_log2.saturating_sub(16).min(14) as u8;
         self.remote_mss = DEFAULT_MSS;
         self.remote_last_ts = None;
+        self.remote_has_sack = false;
+        self.local_rx_last_seq = None;
+        self.local_rx_last_ack = None;
+        self.local_rx_dup_acks = 0;
+        self.pending_fast_retransmit = false;
         self.ack_delay_timer = AckDelayTimer::Idle;
         self.challenge_ack_timer = Instant::from_secs(0);
+        self.closed_before_syn_ack = false;
+        self.last_remote_tsval = 0;
+        self.congestion_controller = reno::Reno::new();
 
         {
             self.rx_waker.wake();
@@ -888,7 +901,12 @@ impl<'a> Socket<'a> {
             }
             // In the SYN-RECEIVED, ESTABLISHED and CLOSE-WAIT states the transmit half
             // of the connection is open, and needs to be explicitly closed with a FIN.
-            State::SynReceived | State::Established => self.set_state(State::FinWait1),
+            // A SYN not yet acknowledged goes first; the FIN follows its ACK.
+            State::SynReceived => {
+                self.set_state(State::FinWait1);
+                self.closed_before_syn_ack = true;
+            }
+            State::Established => self.set_state(State::FinWait1),
             State::CloseWait => self.set_state(State::LastAck),
             // In the FIN-WAIT-1, FIN-WAIT-2, CLOSING, LAST-ACK, TIME-WAIT and CLOSED states,
             // the transmit half of the connection is already closed, and no further
@@ -911,6 +929,15 @@ impl<'a> Socket<'a> {
     /// the `CLOSED` state.
     pub fn abort(&mut self) {
         self.set_state(State::Closed);
+    }
+
+    /// Whether the SYN this socket sent still waits for its acknowledgement.
+    fn syn_unacked(&self) -> bool {
+        match self.state {
+            State::SynSent | State::SynReceived => true,
+            State::FinWait1 | State::Closing => self.closed_before_syn_ack,
+            _ => false,
+        }
     }
 
     fn is_open(&self) -> bool {
@@ -1268,15 +1295,13 @@ impl<'a> Socket<'a> {
         }
 
         // Consider how much the sequence number space differs from the transmit buffer space.
-        let (sent_syn, sent_fin) = match self.state {
-            // In SYN-SENT or SYN-RECEIVED, we've just sent a SYN.
-            State::SynSent | State::SynReceived => (true, false),
-            // In FIN-WAIT-1, LAST-ACK, or CLOSING, we've just sent a FIN.
-            State::FinWait1 | State::LastAck | State::Closing => (false, true),
-            // In all other states we've already got acknowledgements for
-            // all of the control flags we sent.
-            _ => (false, false),
-        };
+        // A SYN not yet acknowledged sits before the data.
+        let sent_syn = self.syn_unacked();
+        // In FIN-WAIT-1, LAST-ACK, or CLOSING, we've just sent a FIN.
+        let sent_fin = matches!(
+            self.state,
+            State::FinWait1 | State::LastAck | State::Closing
+        );
 
         // Reject unacceptable acknowledgements.
         match (self.state, repr.control, repr.ack_number) {
@@ -1367,10 +1392,17 @@ impl<'a> Socket<'a> {
 
                     self.local_rx_last_seq = Some(repr.seq_number);
 
-                    (
-                        &repr.payload[overlap_start - segment_start..overlap_end - segment_start],
-                        overlap_start - window_start,
-                    )
+                    if self.rx_fin_received {
+                        // RFC 9293 section 3.10.7.4: the remote sends nothing after its
+                        // FIN, so the text of a segment past it is ignored.
+                        (&[][..], 0)
+                    } else {
+                        (
+                            &repr.payload
+                                [overlap_start - segment_start..overlap_end - segment_start],
+                            overlap_start - window_start,
+                        )
+                    }
                 } else {
                     // If we're in the TIME-WAIT state, restart the TIME-WAIT timeout, since
                     // the remote end may not have realized we've closed the connection.
@@ -1441,9 +1473,11 @@ impl<'a> Socket<'a> {
             // Here we need to additionally check `listen_endpoint`, because we want to make sure
             // that SYN-RECEIVED was actually converted from the LISTEN state (another possible
             // reason is TCP simultaneous open).
+            // Nothing of the old peer's connection carries over to the next one.
             (State::SynReceived, TcpControl::Rst) if self.listen_endpoint.port != 0 => {
-                self.tuple = None;
-                self.remote_win_end = None;
+                let listen_endpoint = self.listen_endpoint;
+                self.reset();
+                self.listen_endpoint = listen_endpoint;
                 self.set_state(State::Listen);
                 return None;
             }
@@ -1617,6 +1651,9 @@ impl<'a> Socket<'a> {
                 self.congestion_controller.on_ack(ack_len);
             }
 
+            if sent_syn && ack_number > self.local_seq_no {
+                self.closed_before_syn_ack = false;
+            }
             self.local_seq_no = ack_number;
 
             // Skip retransmissions of bytes already acknowledged.
@@ -1796,7 +1833,7 @@ impl<'a> Socket<'a> {
         let data_in_flight = self.remote_last_seq != self.local_seq_no;
 
         // If we want to send a SYN and we haven't done so, do it!
-        if matches!(self.state, State::SynSent | State::SynReceived) && !data_in_flight {
+        if self.syn_unacked() && !data_in_flight {
             return true;
         }
 
@@ -1930,6 +1967,22 @@ impl<'a> Socket<'a> {
         self.rtte.on_retransmit();
     }
 
+    /// Makes `repr` our SYN, or our SYN|ACK once the remote's SYN arrived.
+    fn fill_syn(&self, repr: &mut TcpRepr) {
+        repr.control = TcpControl::Syn;
+        repr.seq_number = self.local_seq_no;
+        // window len must NOT be scaled in SYNs.
+        repr.window_len = u16::try_from(self.rx_buffer.window()).unwrap_or(u16::MAX);
+        if self.state == State::SynSent {
+            repr.ack_number = None;
+            repr.window_scale = Some(self.remote_win_shift);
+            repr.sack_permitted = true;
+        } else {
+            repr.sack_permitted = self.remote_has_sack;
+            repr.window_scale = self.remote_win_scale.map(|_| self.remote_win_shift);
+        }
+    }
+
     pub(crate) fn dispatch<F, E>(&mut self, cx: &mut Context, emit: F) -> Result<(), E>
     where
         F: FnOnce(&mut Context, (IpRepr, TcpRepr)) -> Result<(), E>,
@@ -2013,20 +2066,11 @@ impl<'a> Socket<'a> {
             State::Listen => return Ok(()),
 
             // We transmit a SYN in the SYN-SENT state.
-            // We transmit a SYN|ACK in the SYN-RECEIVED state.
-            State::SynSent | State::SynReceived => {
-                repr.control = TcpControl::Syn;
-                repr.seq_number = self.local_seq_no;
-                // window len must NOT be scaled in SYNs.
-                repr.window_len = u16::try_from(self.rx_buffer.window()).unwrap_or(u16::MAX);
-                if self.state == State::SynSent {
-                    repr.ack_number = None;
-                    repr.window_scale = Some(self.remote_win_shift);
-                    repr.sack_permitted = true;
-                } else {
-                    repr.sack_permitted = self.remote_has_sack;
-                    repr.window_scale = self.remote_win_scale.map(|_| self.remote_win_shift);
-                }
+            // We transmit a SYN|ACK in the SYN-RECEIVED state, and after a close there
+            // until the remote acknowledges it.
+            State::SynSent | State::SynReceived => self.fill_syn(&mut repr),
+            State::FinWait1 | State::Closing if self.closed_before_syn_ack => {
+                self.fill_syn(&mut repr)
             }
 
             // We transmit data in all states where we may have data in the buffer,

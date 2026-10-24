@@ -151,9 +151,8 @@ function activityText(row) {
     case 'egress': return [fact.host, 'Upstream', `${fact.purpose} · ${fact.method} ${briefPath(fact.path)} · ${fact.status || fact.phase}`, `egress:${fact.host}`];
     case 'page_revision': {
       const target = fact.target.url ? new URL(fact.target.url).hostname : fact.target.host || 'Search';
-      return [target, 'Writer', fact.action === 'rejected' ? 'Answer rejected' : 'Recovered', 'writer'];
+      return [target, 'Writer', 'Answer rejected', 'writer'];
     }
-    case 'observation_failed': return ['Recording', 'Error', fact.reason, 'egress'];
     case 'no_route': return [fact.to, 'TCP', 'no route', 'router'];
     default: return ['', '', '', 'router'];
   }
@@ -330,7 +329,7 @@ function details() {
     for (const row of shown.activity.filter((row) => row.fact.kind === 'page_revision')) {
       const fact = row.fact;
       const target = fact.target.url || fact.target.host || fact.target.query || 'Cast';
-      body.append(detailRow(row.at_ms, target, fact.action === 'rejected' ? 'Answer rejected' : 'Recovered', element('p', fact.reason, fact.action === 'rejected' ? 'writer-error' : 'meta')));
+      body.append(detailRow(row.at_ms, target, 'Answer rejected', element('p', fact.reason, 'writer-error')));
     }
   } else if (selection === 'sites') {
     heading('Sites');

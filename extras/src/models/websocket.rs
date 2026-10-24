@@ -11,7 +11,7 @@
 //! `previous_response_id` and send only its new input.
 
 use super::*;
-use fictionet::stdlib::codec::{AssembleError, Fail, Side, Stream, Wire, try_pump};
+use fictionet::stdlib::codec::{AssembleError, Fail, PumpError, Side, Stream, Wire, try_pump};
 use fictionet::stdlib::network::{Connection, ConnectionExt};
 use fictionet::stdlib::protocols::sse;
 use fictionet::stdlib::protocols::websocket::{self as ws, Message, Messages, close_code};
@@ -21,6 +21,8 @@ use tokio::sync::mpsc;
 
 /// Responses in flight at once on one connection, across its lanes.
 const ACTIVE: usize = 16;
+/// Responses one connection holds waiting behind running ones.
+const QUEUED: usize = 16;
 /// Named lanes one connection accepts.
 const LANES: usize = 32;
 /// How long one connection takes new responses.
@@ -193,6 +195,24 @@ impl Session {
     fn error(&mut self, lane: &Option<String>, status: u16, error: Value) {
         self.send(lane, json!({"type":"error","status":status,"error":error}));
     }
+    /// Handles one client message, or gives the close that ends the socket.
+    fn message(&mut self, message: Message) -> Result<(), Message> {
+        match message {
+            Message::Text(text) => self.receive(&text),
+            Message::Ping(data) => self.outbox.push(Message::Pong(data)),
+            Message::Pong(_) => {}
+            Message::Binary(_) => {
+                return Err(Message::Close(Some(ws::Close::new(
+                    close_code::UNSUPPORTED_DATA,
+                ))));
+            }
+            // Answer a close with its own code, as RFC 6455 asks.
+            Message::Close(frame) => {
+                return Err(Message::Close(frame.map(|f| ws::Close::new(f.code))));
+            }
+        }
+        Ok(())
+    }
     fn receive(&mut self, text: &str) {
         let event = match serde_json::from_str::<Value>(text) {
             Ok(Value::Object(event)) => event,
@@ -251,6 +271,17 @@ impl Session {
                 invalid(
                     Some("websocket_connection_limit_reached"),
                     "Responses websocket connection limit reached (60 minutes). Create a new websocket connection to continue.",
+                    None,
+                ),
+            );
+        }
+        if self.pending.len() >= QUEUED {
+            return self.error(
+                &lane,
+                400,
+                invalid(
+                    Some("websocket_queue_limit_reached"),
+                    "This WebSocket connection has reached its maximum number of queued responses (16). Wait for a response to finish before sending another response.create.",
                     None,
                 ),
             );
@@ -713,31 +744,8 @@ async fn serve(model: Model, head: http::request::Parts, cx: Cx, mut conn: Box<d
     let mut decoder = Stream::new(Messages::for_receiver(Side::Server));
     let mut buf = vec![0; 64 * 1024];
     let close = loop {
-        let mut close = None;
-        while close.is_none()
-            && let Some(item) = decoder.next()
-        {
-            match item {
-                Ok(Message::Text(text)) => session.receive(&text),
-                Ok(Message::Ping(data)) => session.outbox.push(Message::Pong(data)),
-                Ok(Message::Pong(_)) => {}
-                Ok(Message::Binary(_)) => {
-                    close = Some(Message::Close(Some(ws::Close::new(
-                        close_code::UNSUPPORTED_DATA,
-                    ))));
-                }
-                // Answer a close with its own code, as RFC 6455 asks.
-                Ok(Message::Close(frame)) => {
-                    close = Some(Message::Close(frame.map(|f| ws::Close::new(f.code))));
-                }
-                Err(fail) => close = Some(Message::Close(Some(ws::Close::new(broken(&fail))))),
-            }
-        }
         if session.flush(&cx, &mut conn).await.is_err() {
             break None;
-        }
-        if close.is_some() {
-            break close;
         }
         let wake = cx
             .race(
@@ -753,11 +761,15 @@ async fn serve(model: Model, head: http::request::Parts, cx: Cx, mut conn: Box<d
             .await;
         match wake {
             Ok(Wake::Note(note)) => session.deliver(note),
+            // Decodes as it pushes, so a read that completes one message
+            // and starts the next fits within the decoder's limit.
             Ok(Wake::Read(Ok(n))) if n > 0 => {
-                if decoder.push(&buf[..n]) < n {
-                    break Some(Message::Close(Some(ws::Close::new(
-                        close_code::MESSAGE_TOO_BIG,
-                    ))));
+                match try_pump(&mut decoder, &buf[..n], |message| session.message(message)) {
+                    Ok(_) => {}
+                    Err(PumpError::Handler(close)) => break Some(close),
+                    Err(PumpError::Decode(fail)) => {
+                        break Some(Message::Close(Some(ws::Close::new(broken(&fail)))));
+                    }
                 }
             }
             Ok(Wake::Read(_)) | Err(_) => break None,

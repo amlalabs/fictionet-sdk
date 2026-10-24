@@ -103,10 +103,10 @@ impl Live {
         if lifetime.cancelled() || !Arc::ptr_eq(lifetime, &state.lifetime) {
             return Err("Live session stopped".into());
         }
-        if let Some(reached) = state.reached.get(&url) {
-            if !matches!(*reached.borrow(), CaptureState::Failed(_)) {
-                return Ok(reached.subscribe());
-            }
+        if let Some(reached) = state.reached.get(&url)
+            && !matches!(*reached.borrow(), CaptureState::Failed(_))
+        {
+            return Ok(reached.subscribe());
         }
         let (send, receive) = watch::channel(CaptureState::Pending);
         state.reached.insert(url.clone(), send.clone());

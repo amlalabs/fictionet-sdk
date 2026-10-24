@@ -773,17 +773,19 @@ impl Time {
     }
 
     /// Seconds since 1970-01-01 00:00:00 UTC, with any fraction dropped.
-    /// A UTCTime's two-digit years 50 to 99 are 19xx, the rest 20xx. Text
-    /// not in the form DER allows gives `None`.
+    /// A UTCTime's two-digit years 50 to 99 are 19xx, the rest 20xx. A
+    /// GeneralizedTime's leap second, second 60, has no Unix time of its
+    /// own and counts as the first second of the next minute, as POSIX
+    /// counts it. Text not in the form DER allows gives `None`.
     pub fn unix(&self) -> Option<i64> {
-        let (year, rest) = match self {
+        let (year, rest, last_second) = match self {
             Time::Utc(s) => {
                 let b = s.as_bytes();
                 if b.len() != 13 || b[12] != b'Z' {
                     return None;
                 }
                 let yy = digits(b, 0, 2)?;
-                (if yy >= 50 { 1900 + yy } else { 2000 + yy }, &b[2..12])
+                (if yy >= 50 { 1900 + yy } else { 2000 + yy }, &b[2..12], 59)
             }
             Time::Generalized(s) => {
                 let b = s.as_bytes();
@@ -797,7 +799,7 @@ impl Time {
                 {
                     return None;
                 }
-                (digits(b, 0, 4)?, &b[4..14])
+                (digits(b, 0, 4)?, &b[4..14], 60)
             }
         };
         let (month, day) = (digits(rest, 0, 2)?, digits(rest, 2, 2)?);
@@ -812,7 +814,7 @@ impl Time {
         {
             return None;
         }
-        if hour > 23 || minute > 59 || second > 59 {
+        if hour > 23 || minute > 59 || second > last_second {
             return None;
         }
         Some(days_from_civil(year, month, day) * 86_400 + hour * 3600 + minute * 60 + second)
@@ -3608,6 +3610,23 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
         assert_eq!(n.to_string(), "CN=#140141");
         assert_eq!(Name::parse(&n.to_bytes().unwrap()).unwrap(), n);
         assert_eq!(Name::default().to_string(), "");
+    }
+
+    #[test]
+    fn a_validity_bound_on_a_leap_second_is_usable() {
+        // The DER reader takes second 60, a leap second, in a
+        // GeneralizedTime, so a certificate can carry one. Its validity
+        // must still be decidable.
+        let mut tbs = sample_tbs();
+        tbs.validity = Validity {
+            not_before: Time::Generalized("20501231235960Z".into()),
+            not_after: Time::from_unix(2_600_000_000).unwrap(),
+        };
+        let read = TbsCertificate::parse(&tbs.to_bytes().unwrap()).unwrap();
+        assert_eq!(read.validity, tbs.validity);
+        assert!(read.validity.not_before.unix().is_some());
+        // A day after 2051-01-01 00:00:00 is well inside the period.
+        assert!(read.validity.contains(2_556_144_000 + 86_400));
     }
 
     #[test]

@@ -412,7 +412,8 @@ impl OAuth {
         let exchange = async {
             let response = self.forward.clone().call(request).await?;
             let status = response.status();
-            let bytes = http_body_util::Limited::new(response.into_body(), 64 * 1024)
+            let bytes = response
+                .into_body()
                 .collect()
                 .await
                 .map_err(|_| Error::msg("OAuth response could not be read"))?
@@ -421,9 +422,9 @@ impl OAuth {
         };
         let (status, bytes) = self
             .cx
-            .race(Some(self.cx.now() + Duration::from_secs(20)), exchange)
+            .race(None, exchange)
             .await
-            .map_err(|_| Error::msg("OAuth token server did not respond"))?
+            .map_err(|_| Error::msg("OAuth refresh was cancelled"))?
             .map_err(|_| Error::msg("OAuth token server could not be reached"))?;
         let value: Value = serde_json::from_slice(&bytes)
             .map_err(|_| Error::msg("Invalid OAuth token response"))?;
@@ -508,10 +509,11 @@ impl OAuth {
         if request.method() != http::Method::POST || request.uri().path() != self.login.path() {
             return Ok(oauth_error(404, "invalid_request"));
         }
-        let bytes = http_body_util::Limited::new(request.into_body(), 64 * 1024)
+        let bytes = request
+            .into_body()
             .collect()
             .await
-            .map_err(|_| Error::msg("OAuth request is too large"))?
+            .map_err(|_| Error::msg("OAuth request could not be read"))?
             .to_bytes();
         let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
         if value["grant_type"] != "refresh_token"

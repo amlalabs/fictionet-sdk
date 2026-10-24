@@ -96,7 +96,7 @@ fn fields(head: &[u8]) -> io::Result<HashMap<String, String>> {
 }
 
 fn block_length(fields: &HashMap<String, String>) -> io::Result<usize> {
-    let length = fields
+    fields
         .get("content-length")
         .ok_or_else(|| invalid("missing WARC content length"))?
         .parse::<usize>()
@@ -319,7 +319,15 @@ impl Archive {
 }
 
 fn http_response(block: &[u8]) -> io::Result<Response> {
-    let mut headers = [httparse::EMPTY_HEADER; 256];
+    // httparse fills a caller-sized header table; grow it until every header fits.
+    let mut count = 64;
+    let mut headers = loop {
+        let mut headers = vec![httparse::EMPTY_HEADER; count];
+        match httparse::Response::new(&mut headers).parse(block) {
+            Err(httparse::Error::TooManyHeaders) => count *= 2,
+            _ => break vec![httparse::EMPTY_HEADER; count],
+        }
+    };
     let mut parsed = httparse::Response::new(&mut headers);
     let offset = match parsed.parse(block).map_err(invalid)? {
         httparse::Status::Complete(offset) => offset,

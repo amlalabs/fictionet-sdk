@@ -2,6 +2,7 @@
 
 use super::*;
 use fictionet_extras::models::UpstreamPhase;
+use std::time::Duration;
 
 struct Runtime(Option<tokio::runtime::Runtime>);
 impl Drop for Runtime {

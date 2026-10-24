@@ -40,7 +40,9 @@ pub(super) fn host(url: &str) -> Option<String> {
     {
         return None;
     }
-    url.host_str().map(str::to_owned)
+    // `example.com.` names the same host as `example.com`.
+    url.host_str()
+        .map(|host| host.strip_suffix('.').unwrap_or(host).to_owned())
 }
 /// Domain restrictions on a world's search and fetch results.
 #[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
@@ -59,7 +61,7 @@ pub fn allowed(domains: &Domains, url: &str) -> bool {
         return false;
     };
     let matches = |domain: &String| {
-        let domain = domain.trim_start_matches('.').to_ascii_lowercase();
+        let domain = domain.trim_matches('.').to_ascii_lowercase();
         host == domain
             || host
                 .strip_suffix(&domain)

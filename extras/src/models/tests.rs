@@ -900,6 +900,39 @@ fn inline_content_and_client_url_arguments_stay_usable() {
 }
 
 #[test]
+fn models_that_always_search_the_web_are_refused() {
+    // Perplexity's Sonar models answer every request with a live web search.
+    for model in [
+        "perplexity/sonar",
+        "perplexity/sonar-pro",
+        "perplexity/sonar-deep-research",
+    ] {
+        for (provider, path, body) in [
+            (
+                Provider::OpenRouter,
+                "/api/v1/chat/completions",
+                json!({"model":model,"messages":[{"role":"user","content":"hello"}]}),
+            ),
+            (
+                Provider::OpenRouter,
+                "/api/v1/messages",
+                json!({"model":model,"max_tokens":10,"messages":[{"role":"user","content":"hello"}]}),
+            ),
+            (
+                Provider::Anthropic,
+                "/v1/messages",
+                json!({"model":model,"max_tokens":10,"messages":[{"role":"user","content":"hello"}]}),
+            ),
+        ] {
+            assert!(
+                !safe_request(provider, path, &body, false),
+                "{provider:?} {body}"
+            );
+        }
+    }
+}
+
+#[test]
 fn anthropic_client_tools_accept_both_wire_spellings() {
     for provider in [Provider::Anthropic, Provider::OpenRouter] {
         let path = if provider == Provider::Anthropic {
