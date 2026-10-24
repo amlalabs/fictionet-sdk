@@ -89,7 +89,10 @@ async fn download(root: &Path, name: &str, urls: &[String], requisites: bool) ->
     let batch = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)?
         .as_nanos();
-    let prefix = root.join(format!("{name}-{batch}"));
+    let staging = Batch(root.join(format!(".download-{}-{batch}", std::process::id())));
+    std::fs::create_dir_all(&staging.0)?;
+    let prefix = staging.0.join(format!("{name}-{batch}"));
+    let log = prefix.with_extension("log");
     let mut command = Command::new("wget");
     command.kill_on_drop(true).args([
         "--compression=auto",
@@ -106,34 +109,43 @@ async fn download(root: &Path, name: &str, urls: &[String], requisites: bool) ->
     if requisites {
         command.args(["--page-requisites", "--span-hosts"]);
     }
-    let status = command
+    let mut child = command
         .arg(format!("--warc-file={}", prefix.display()))
         .arg(format!(
             "--directory-prefix={}",
             prefix.with_extension("files").display()
         ))
-        .arg(format!(
-            "--output-file={}",
-            prefix.with_extension("log").display()
-        ))
+        .arg(format!("--output-file={}", log.display()))
         .args(urls)
-        .status()
-        .await?;
+        .spawn()?;
+    let deadline = std::time::Duration::from_secs((60 * urls.len() as u64).min(180));
+    let status = match tokio::time::timeout(deadline, child.wait()).await {
+        Ok(status) => status?,
+        Err(_) => {
+            child.kill().await?;
+            std::fs::rename(&log, root.join(log.file_name().unwrap()))?;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "capture exceeded its deadline",
+            )
+            .into());
+        }
+    };
+    let published_log = root.join(log.file_name().unwrap());
+    std::fs::rename(&log, &published_log)?;
     // Optional page assets and missing-page captures may return HTTP errors.
     // Required documents and distributions are verified from the archive below.
     if !status.success() && !matches!(status.code(), Some(4 | 8)) {
-        return Err(format!(
-            "wget failed: {status}; see {}",
-            prefix.with_extension("log").display()
-        )
-        .into());
+        return Err(format!("wget failed: {status}; see {}", published_log.display()).into());
     }
     if status.code() == Some(4) {
         eprintln!(
             "Some downloads were unreachable; required responses will be verified. See {}",
-            prefix.with_extension("log").display()
+            published_log.display()
         );
     }
+    let archive = prefix.with_extension("warc.gz");
+    std::fs::rename(&archive, root.join(archive.file_name().unwrap()))?;
     Ok(())
 }
 
@@ -192,10 +204,15 @@ async fn missing_pages(root: &Path, sources: &[String]) -> Result {
         })
         .collect::<Result<_>>()?;
     let urls: Vec<_> = urls.into_iter().collect();
-    wget(root, "missing", &urls, false).await?;
-    let mut archive = Archive::directory(root)?;
     let path = root.join("missing-pages.warc.gz");
     let mut missing = Archive::open(path.is_file().then_some(path.clone()))?;
+    let pending = urls
+        .iter()
+        .filter(|url| not_found(&missing, url).is_err())
+        .cloned()
+        .collect::<Vec<_>>();
+    documents(root, "missing", &pending).await?;
+    let mut archive = Archive::directory(root)?;
     let mut alternatives = Vec::new();
     for url in &urls {
         if not_found(&missing, url).is_ok() {
@@ -209,20 +226,25 @@ async fn missing_pages(root: &Path, sources: &[String]) -> Result {
         }
     }
     if !alternatives.is_empty() {
-        wget(
+        documents(
             root,
             "missing",
             &alternatives
                 .iter()
                 .map(|(_, url)| url.clone())
                 .collect::<Vec<_>>(),
-            false,
         )
         .await?;
         archive = Archive::directory(root)?;
+        let mut failures = Vec::new();
         for (canonical, alternate) in alternatives {
-            let response = not_found(&archive, &alternate)?;
-            missing.append(&path, &canonical, &response)?;
+            match not_found(&archive, &alternate) {
+                Ok(response) => missing.append(&path, &canonical, &response)?,
+                Err(error) => failures.push(error.to_string()),
+            }
+        }
+        if !failures.is_empty() {
+            return Err(failures.join("\n").into());
         }
     }
     let mut assets = BTreeSet::new();
@@ -238,6 +260,34 @@ async fn missing_pages(root: &Path, sources: &[String]) -> Result {
         true,
     )
     .await
+}
+
+async fn documents(root: &Path, name: &str, urls: &[String]) -> Result {
+    for group in urls.chunks(4) {
+        let mut jobs = tokio::task::JoinSet::new();
+        for url in group {
+            let root = root.to_owned();
+            let name = name.to_owned();
+            let url = url.clone();
+            jobs.spawn(async move {
+                match download(&root, &name, std::slice::from_ref(&url), false).await {
+                    Err(error)
+                        if error
+                            .downcast_ref::<std::io::Error>()
+                            .is_some_and(|error| error.kind() == std::io::ErrorKind::TimedOut) =>
+                    {
+                        eprintln!("Capture timed out: {url}");
+                        Ok(())
+                    }
+                    result => result,
+                }
+            });
+        }
+        while let Some(result) = jobs.join_next().await {
+            result??;
+        }
+    }
+    Ok(())
 }
 
 async fn research(root: &Path, sources: &[String]) -> Result {
@@ -267,17 +317,7 @@ async fn research(root: &Path, sources: &[String]) -> Result {
     );
     // Only the source articles discover navigation. References are documents,
     // so third-party application assets cannot expand the capture recursively.
-    for group in pending.chunks(32 * 4) {
-        let mut jobs = tokio::task::JoinSet::new();
-        for urls in group.chunks(32) {
-            let root = root.to_owned();
-            let urls = urls.to_vec();
-            jobs.spawn(async move { download(&root, "references", &urls, false).await });
-        }
-        while let Some(result) = jobs.join_next().await {
-            result??;
-        }
-    }
+    documents(root, "references", &pending).await?;
     let archive = Archive::directory(root)?;
     let mut origins = sources.to_vec();
     for url in references {
@@ -321,6 +361,10 @@ pub async fn run(downloads: &Path, python: &Path) -> Result {
     let root = downloads.join(&corpus.directory);
     std::fs::create_dir_all(&root)?;
     let root = std::fs::canonicalize(root)?;
+    let capture = std::fs::File::open(&root)?;
+    capture
+        .try_lock()
+        .map_err(|error| format!("cannot own corpus capture: {error}"))?;
     research(&root, &corpus.urls).await?;
 
     // Resolve and capture into an empty batch. Mutable indexes and their complete
