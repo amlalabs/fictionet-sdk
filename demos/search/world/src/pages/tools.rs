@@ -29,6 +29,7 @@ impl fictionet_extras::models::Engine for Pages {
             let mut url = url;
             let mut redirects = 0;
             let response = loop {
+                let started = std::time::Instant::now();
                 let parsed = url::Url::parse(&url)?;
                 let (host, target) = text::target_of(&url);
                 let package = self.package_url(&url);
@@ -48,6 +49,7 @@ impl fictionet_extras::models::Engine for Pages {
                 self.report_response(
                     &cx,
                     crate::observation::RequestContext {
+                        started,
                         scheme: &parsed.scheme().parse()?,
                         host: &host.parse()?,
                         method: &http::Method::GET,

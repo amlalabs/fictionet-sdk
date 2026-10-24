@@ -683,6 +683,31 @@ async fn live_destinations_start_at_the_search_and_sites_services() {
                 }],
             },
         });
+        views.push(Observation {
+            at_ms: 230,
+            fact: SearchObs::Request {
+                scheme: http::uri::Scheme::HTTPS,
+                host: "www.cisa.gov".parse().unwrap(),
+                method: http::Method::GET,
+                path: "/advisory".parse().unwrap(),
+                status: http::StatusCode::OK,
+                bytes: 60_000,
+                content_type: "text/html".into(),
+                source: PageSource::Copy { captured: None },
+                elapsed_ms: 0,
+                headers: http::HeaderMap::new(),
+                preview: Some(Arc::from("<h1>Supply chain advisory</h1>")),
+            },
+        });
+        for at_ms in [1000, 12000, 23000, 34000, 45000, 80000] {
+            views.push(Observation {
+                at_ms,
+                fact: SearchObs::NoRoute {
+                    from: "10.0.0.2".parse().unwrap(),
+                    to: "1.1.1.1".parse().unwrap(),
+                },
+            });
+        }
         page.snapshots.send_replace(views.current());
     }
     let server = serve(page.router(), 0).await.unwrap();
@@ -713,6 +738,14 @@ async fn live_destinations_start_at_the_search_and_sites_services() {
             map.querySelector('.node[aria-label="Search"]').dispatchEvent(new MouseEvent('click'));
             if (document.getElementById('detail-title').textContent !== 'Search') throw new Error('search inspector');
             if (!document.getElementById('detail-body').textContent.includes('supply chain')) throw new Error('missing search');
+            map.querySelector('.node[aria-label="router"]').dispatchEvent(new MouseEvent('click'));
+            if (document.querySelectorAll('#detail-body .detail-row').length !== 2) throw new Error('TCP retries were split or a separate attempt disappeared');
+            map.querySelector('.node[aria-label="Sites ›"]').dispatchEvent(new MouseEvent('click'));
+            [...document.querySelectorAll('#detail-body button')].find(button => button.textContent.includes('www.cisa.gov')).click();
+            const request = document.querySelector('#detail-body details');
+            request.open = true;
+            if (!request.textContent.includes('60 KB on the wire')) throw new Error('missing transfer size label');
+            if (!request.textContent.includes('<1 ms') || request.textContent.includes('0 ms')) throw new Error('misleading elapsed time');
         })()"#;
         for (name, size, scheme) in [
             ("live-map-dark", (1440, 900), "dark"),

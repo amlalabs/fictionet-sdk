@@ -13,7 +13,7 @@ const button = (text, action, className) => {
 };
 const stamp = (ms) => new Date((shown.started_at_ms || Date.now()) + ms).toLocaleTimeString([], { hour12: false, timeZone: 'UTC' });
 const time = stamp;
-const size = (bytes) => bytes < 1024 ? `${bytes} B` : `${Math.round(bytes / 1024)} KB`;
+const size = (bytes) => bytes < 1000 ? `${bytes} B` : `${Math.round(bytes / 1000)} KB`;
 const sourceName = (source) => source.kind === 'copy' ? source.captured ? `Copied · ${source.captured.slice(0, 10)}` : 'Copied' : source.kind === 'live' ? 'live' : 'model-written';
 const hostOf = (url) => { try { return new URL(url).host; } catch { return url; } };
 let latest = { at_ms: 0, oldest_ms: 0, sites: [], calls: [], activity: [], connections: [], egress: [], signin: null };
@@ -181,8 +181,8 @@ function activityRows() {
     if (row.fact.kind === 'egress') return upstream.get(row.fact.attempt) === row;
     if (row.fact.kind !== 'no_route') return true;
     const key = `${row.fact.from}:${row.fact.to}`, previous = attempts.get(key);
-    if (previous !== undefined && row.at_ms - previous <= 8000) return false;
     attempts.set(key, row.at_ms);
+    if (previous !== undefined && row.at_ms - previous <= 30000) return false;
     return true;
   });
 }
@@ -293,8 +293,8 @@ function details() {
       const content = element('details'), summary = element('summary'), data = element('dl');
       content.dataset.key = `${request.method}:${request.path}:${request.at_ms}`;
       content.open = expanded.has(content.dataset.key);
-      summary.append(element('div', `${request.method} ${request.path}`, 'label'), element('div', `${request.status} · ${size(request.bytes)} · ${sourceName(request.source)}`, 'meta'));
-      for (const [key, value] of [...request.headers, ['content-type', request.content_type], ['elapsed', `${request.elapsed_ms} ms`]]) data.append(element('dt', key), element('dd', value));
+      summary.append(element('div', `${request.method} ${request.path}`, 'label'), element('div', `${request.status} · ${size(request.bytes)} on the wire · ${sourceName(request.source)}`, 'meta'));
+      for (const [key, value] of [...request.headers, ['content-type', request.content_type], ['elapsed', request.elapsed_ms ? `${request.elapsed_ms} ms` : '<1 ms']]) data.append(element('dt', key), element('dd', value));
       content.append(summary, data);
       if (request.has_preview) content.append(button('Page', () => select(`page:${request.url}`), 'more'));
       const row = element('div', undefined, 'detail-row'); row.append(element('span', stamp(request.at_ms), 'stamp'), content); body.append(row);

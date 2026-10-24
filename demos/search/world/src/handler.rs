@@ -36,6 +36,7 @@ impl Handler {
         self,
         request: Request<Body>,
     ) -> Result<Response<Full<Bytes>>, fictionet::Error> {
+        let started = std::time::Instant::now();
         let target = request
             .extensions()
             .get::<web::Target>()
@@ -62,6 +63,7 @@ impl Handler {
                 self.pages.report_response(
                     &self.fcx,
                     crate::observation::RequestContext {
+                        started,
                         scheme: &target.scheme,
                         host: &target.host.parse()?,
                         method: &parts.method,
@@ -124,6 +126,7 @@ impl Handler {
         self.pages.report_response(
             &self.fcx,
             crate::observation::RequestContext {
+                started,
                 scheme: &target.scheme,
                 host: &target.host.parse()?,
                 method: &parts.method,

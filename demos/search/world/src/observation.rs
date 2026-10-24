@@ -214,6 +214,7 @@ pub struct Observation {
 }
 
 pub(crate) struct RequestContext<'a> {
+    pub started: std::time::Instant,
     pub scheme: &'a Scheme,
     pub host: &'a HostName,
     pub method: &'a Method,
@@ -288,6 +289,7 @@ impl Pages {
             return;
         }
         let RequestContext {
+            started,
             scheme,
             host,
             method,
@@ -361,7 +363,7 @@ impl Pages {
                 bytes: response.body.len(),
                 content_type: response.content_type.clone(),
                 source,
-                elapsed_ms: response.serve_ms.unwrap_or(0),
+                elapsed_ms: started.elapsed().as_millis() as u64,
                 headers,
                 preview,
             },
@@ -623,6 +625,41 @@ mod tests {
     }
 
     #[test]
+    fn copied_request_timing_uses_the_request_lifetime() {
+        fictionet::block_on(fictionet::lab(
+            fictionet::Seed::from_u64(3),
+            |cx| async move {
+                let pages = Pages::new(crate::pages::Seed::builtin("web")?);
+                let (sender, mut receiver) = tokio::sync::mpsc::channel(OBSERVATION_CAPACITY);
+                pages.observe(sender);
+                let response = Response::new(200, "text/plain", "Page", vec![], Meta::Asset);
+                pages.report_response(
+                    &cx,
+                    RequestContext {
+                        started: std::time::Instant::now() - std::time::Duration::from_millis(1250),
+                        scheme: &Scheme::HTTPS,
+                        host: &"source.org".parse().unwrap(),
+                        method: &Method::GET,
+                        path: &"/page".parse().unwrap(),
+                        source: PageSource::Copy { captured: None },
+                        headers: HeaderMap::new(),
+                    },
+                    &response,
+                );
+                let request = std::iter::from_fn(|| receiver.try_recv().ok())
+                    .find_map(|observation| match observation.fact {
+                        SearchObs::Request { elapsed_ms, .. } => Some(elapsed_ms),
+                        _ => None,
+                    })
+                    .unwrap();
+                assert!(request >= 1250);
+                Ok(())
+            },
+        ))
+        .unwrap();
+    }
+
+    #[test]
     fn request_credentials_are_redacted_before_recording_or_display() {
         fictionet::block_on(fictionet::lab(
             fictionet::Seed::from_u64(1),
@@ -640,6 +677,7 @@ mod tests {
                 pages.report_response(
                     &cx,
                     RequestContext {
+                        started: std::time::Instant::now(),
                         scheme: &Scheme::HTTPS,
                         host: &"sky.org".parse().unwrap(),
                         method: &Method::GET,
