@@ -23,6 +23,8 @@ fn wiki_file(root: &Path) -> std::path::PathBuf {
 
 #[derive(Serialize, Deserialize)]
 struct Prepared {
+    #[serde(default)]
+    documents_version: u32,
     files: Vec<ArchiveFile>,
     documents: Archive,
 }
@@ -143,13 +145,42 @@ impl ReferenceWeb {
             .entry_content(&entry)
             .map_err(io::Error::other)?
             .ok_or_else(|| io::Error::other("Wikipedia entry has no content"))?;
+        let body = content.to_vec().map_err(io::Error::other)?;
+        if content_type.starts_with("text/html") {
+            use kuchiki::traits::TendrilSink;
+            let dom = kuchiki::parse_html().one(String::from_utf8_lossy(&body).into_owned());
+            if let Ok(refresh) = dom.select_first("meta[http-equiv]") {
+                let attributes = refresh.attributes.borrow();
+                if attributes
+                    .get("http-equiv")
+                    .is_some_and(|value| value.eq_ignore_ascii_case("refresh"))
+                    && let Some((_, destination)) = attributes
+                        .get("content")
+                        .and_then(|value| value.split_once(';'))
+                    && let Some((key, destination)) = destination.trim().split_once('=')
+                    && key.eq_ignore_ascii_case("url")
+                {
+                    let destination = parsed
+                        .join(destination.trim_matches(['\'', '"']))
+                        .map_err(io::Error::other)?;
+                    return Ok(Some(warc::Response {
+                        status: http::StatusCode::MOVED_PERMANENTLY,
+                        headers: http::HeaderMap::from_iter([(
+                            http::header::LOCATION,
+                            destination.as_str().parse().map_err(io::Error::other)?,
+                        )]),
+                        body: Default::default(),
+                    }));
+                }
+            }
+        }
         Ok(Some(warc::Response {
             status: http::StatusCode::OK,
             headers: http::HeaderMap::from_iter([(
                 http::header::CONTENT_TYPE,
                 content_type.parse().map_err(io::Error::other)?,
             )]),
-            body: content.to_vec().map_err(io::Error::other)?.into(),
+            body: body.into(),
         }))
     }
 }
@@ -167,6 +198,7 @@ impl Pages {
         let corpus = seed.corpus.as_mut().ok_or("seed has no corpus")?;
         let research = downloads.join(&corpus.directory);
         let root = downloads.join(corpus.reference.take().ok_or("seed has no reference web")?);
+        let source = sources(&root, &research).map_err(|e| e.to_string())?;
         let pages = Self::from_corpus(seed, downloads, None)?;
         let captured = pages.copied.as_ref().unwrap();
         let wikipedia = Zim::new(wiki_file(&root)).map_err(|e| e.to_string())?;
@@ -177,82 +209,137 @@ impl Pages {
             time::OffsetDateTime::now_utc().unix_timestamp_nanos()
         );
         let staged = parent.join(format!(".{stamp}"));
-        let source = sources(&root, &research).map_err(|e| e.to_string())?;
-        if let Ok(index) = DiskIndex::open(&root.join("index/current"))
-            && let Some(prepared) = index
+        let previous = if let Ok(index) = DiskIndex::open(&root.join("index/current")) {
+            index
                 .source()
                 .map_err(|e| e.to_string())?
                 .and_then(|payload| serde_json::from_str::<Prepared>(&payload).ok())
-            && prepared.files == source
-        {
+        } else {
+            None
+        };
+        if previous.as_ref().is_some_and(|prepared| {
+            prepared.files == source && prepared.documents_version == INDEX_VERSION
+        }) {
             eprintln!("Offline search index is current");
             return Ok(());
         }
-        let writer = DiskWriter::create(&staged).map_err(|e| e.to_string())?;
+        let wikipedia_path = std::fs::canonicalize(wiki_file(&root)).map_err(|e| e.to_string())?;
+        let reusable = previous.as_ref().filter(|prepared| {
+            let wikipedia = source.iter().find(|file| file.path == wikipedia_path);
+            wikipedia.is_some_and(|file| prepared.files.contains(file))
+        });
+        let writer = if let Some(prepared) = reusable {
+            let current = root.join("index/current");
+            let size = std::fs::read_dir(&current)
+                .map_err(|e| e.to_string())?
+                .map(|entry| {
+                    entry
+                        .and_then(|entry| entry.metadata())
+                        .map(|meta| meta.len())
+                })
+                .sum::<io::Result<u64>>()
+                .map_err(|e| e.to_string())?;
+            if available_space(&root).map_err(|e| e.to_string())? < size + 68 * 1024 * 1024 * 1024 {
+                return Err("index refresh must leave at least 60 GiB free".into());
+            }
+            std::fs::create_dir_all(&staged).map_err(|e| e.to_string())?;
+            for file in std::fs::read_dir(&current).map_err(|e| e.to_string())? {
+                let file = file.map_err(|e| e.to_string())?;
+                if file.file_type().map_err(|e| e.to_string())?.is_file() {
+                    std::fs::copy(file.path(), staged.join(file.file_name()))
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+            let writer = DiskWriter::open(&staged).map_err(|e| e.to_string())?;
+            let archives = Archive::open(
+                prepared
+                    .files
+                    .iter()
+                    .filter(|file| file.path.to_string_lossy().ends_with(".warc.gz"))
+                    .map(|file| file.path.clone()),
+            )
+            .map_err(|e| e.to_string())?;
+            for url in archives.urls() {
+                writer.remove(url);
+            }
+            eprintln!("Reusing indexed Wikipedia; refreshing captured documents…");
+            writer
+        } else {
+            DiskWriter::create(&staged).map_err(|e| e.to_string())?
+        };
         let CorpusSearch::Crawled(index) = &captured.search else {
             return Err("research pages must be loaded before reference indexing".into());
         };
         index.write_to(&writer).map_err(|e| e.to_string())?;
-        eprintln!("Preparing Wikipedia articles…");
-        // Physical cluster order decompresses each cluster once. Directory order
-        // would repeatedly decompress the same multi-megabyte cluster.
-        let mut entries = Vec::new();
-        for entry in wikipedia.iterate_by_urls() {
-            let entry = entry.map_err(|e| e.to_string())?;
-            if entry.namespace == Namespace::UserContent
-                && matches!(&entry.mime_type, MimeType::Type(mime) if mime.starts_with("text/html"))
-                && let Some(Target::Cluster(cluster, blob)) = entry.target
-            {
-                entries.push((cluster, blob, entry.url, entry.title));
+        if reusable.is_none() {
+            eprintln!("Preparing Wikipedia articles…");
+            // Physical cluster order decompresses each cluster once. Directory order
+            // would repeatedly decompress the same multi-megabyte cluster.
+            let mut entries = Vec::new();
+            for entry in wikipedia.iterate_by_urls() {
+                let entry = entry.map_err(|e| e.to_string())?;
+                if entry.namespace == Namespace::UserContent
+                    && matches!(&entry.mime_type, MimeType::Type(mime) if mime.starts_with("text/html"))
+                    && let Some(Target::Cluster(cluster, blob)) = entry.target
+                {
+                    entries.push((cluster, blob, entry.url, entry.title));
+                }
             }
-        }
-        entries.sort_unstable_by_key(|entry| (entry.0, entry.1));
-        let count = std::sync::atomic::AtomicUsize::new(0);
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(
-                std::thread::available_parallelism()
-                    .map_err(|e| e.to_string())?
-                    .get()
-                    .div_ceil(2),
-            )
-            .build()
-            .map_err(|e| e.to_string())?;
-        pool.install(|| {
-            entries
-                .par_chunk_by(|a, b| a.0 == b.0)
-                .try_for_each(|group| -> Result<(), String> {
-                    // Leave room for in-flight segment writes and merges above the reserve.
-                    if available_space(&root).map_err(|e| e.to_string())? < 68 * 1024 * 1024 * 1024
-                    {
-                        return Err("index preparation must leave at least 60 GiB free".into());
-                    }
-                    let cluster = wikipedia
-                        .get_cluster(group[0].0)
-                        .map_err(|e| e.to_string())?;
-                    let blobs = cluster.read().map_err(|e| e.to_string())?;
-                    for (_, blob, path, title) in group {
-                        let body = blobs.blob(*blob).map_err(|e| e.to_string())?;
-                        let text =
-                            fictionet_extras::capture::page_text(&String::from_utf8_lossy(body))
-                                .map_err(|e| e.to_string())?;
-                        writer
-                            .add(
-                                &article_url(path),
-                                if title.is_empty() { path } else { title },
-                                &text,
+            entries.sort_unstable_by_key(|entry| (entry.0, entry.1));
+            let count = std::sync::atomic::AtomicUsize::new(0);
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(
+                    std::thread::available_parallelism()
+                        .map_err(|e| e.to_string())?
+                        .get()
+                        .div_ceil(2),
+                )
+                .build()
+                .map_err(|e| e.to_string())?;
+            pool.install(|| {
+                entries.par_chunk_by(|a, b| a.0 == b.0).try_for_each(
+                    |group| -> Result<(), String> {
+                        // Leave room for in-flight segment writes and merges above the reserve.
+                        if available_space(&root).map_err(|e| e.to_string())?
+                            < 68 * 1024 * 1024 * 1024
+                        {
+                            return Err("index preparation must leave at least 60 GiB free".into());
+                        }
+                        let cluster = wikipedia
+                            .get_cluster(group[0].0)
+                            .map_err(|e| e.to_string())?;
+                        let blobs = cluster.read().map_err(|e| e.to_string())?;
+                        for (_, blob, path, title) in group {
+                            let body = blobs.blob(*blob).map_err(|e| e.to_string())?;
+                            let text = fictionet_extras::capture::page_text(
+                                &String::from_utf8_lossy(body),
                             )
                             .map_err(|e| e.to_string())?;
-                        let done = count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                        if done.is_multiple_of(100_000) {
-                            eprintln!("Indexed {done} Wikipedia articles");
+                            writer
+                                .add(
+                                    &article_url(path),
+                                    if title.is_empty() { path } else { title },
+                                    &text,
+                                )
+                                .map_err(|e| e.to_string())?;
+                            let done = count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                            if done.is_multiple_of(100_000) {
+                                eprintln!("Indexed {done} Wikipedia articles");
+                            }
                         }
-                    }
-                    Ok(())
-                })
-        })?;
-        drop(entries);
-        drop(wikipedia);
+                        Ok(())
+                    },
+                )
+            })?;
+            drop(entries);
+            drop(wikipedia);
+        }
         let files = sources(&root, &research).map_err(|e| e.to_string())?;
+        if files != source {
+            return Err(
+                "Captured archives changed during indexing; prepare the index again".into(),
+            );
+        }
         let document_root = std::fs::canonicalize(&root).map_err(|e| e.to_string())?;
         let documents = Archive::open(
             files
@@ -274,7 +361,11 @@ impl Pages {
         document_index
             .write_to(&writer)
             .map_err(|e| e.to_string())?;
-        let prepared = Prepared { files, documents };
+        let prepared = Prepared {
+            documents_version: INDEX_VERSION,
+            files,
+            documents,
+        };
         writer
             .finish(&serde_json::to_string(&prepared).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
@@ -283,10 +374,7 @@ impl Pages {
         let pointer = parent.join(format!(".{stamp}-current"));
         std::os::unix::fs::symlink(&stamp, &pointer).map_err(|e| e.to_string())?;
         std::fs::rename(pointer, parent.join("current")).map_err(|e| e.to_string())?;
-        eprintln!(
-            "Prepared {} Wikipedia articles and all captured pages",
-            count.load(std::sync::atomic::Ordering::Relaxed)
-        );
+        eprintln!("Prepared offline web index");
         Ok(())
     }
 }

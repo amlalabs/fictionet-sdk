@@ -159,6 +159,23 @@ pub struct DiskWriter {
 }
 
 impl DiskWriter {
+    /// Update a private copy of a published index.
+    pub fn open(path: &Path) -> io::Result<Self> {
+        let index = Index::open_in_dir(path).map_err(io::Error::other)?;
+        let (_, fields) = schema();
+        let threads = std::thread::available_parallelism()?.get().div_ceil(2);
+        let writer = index
+            .writer_with_num_threads(threads, threads * 64_000_000)
+            .map_err(io::Error::other)?;
+        Ok(Self { writer, fields })
+    }
+
+    /// Remove an earlier document at its original URL.
+    pub fn remove(&self, url: &str) {
+        self.writer
+            .delete_term(Term::from_field_text(self.fields.url, url));
+    }
+
     /// Start a new index in an empty staging directory.
     pub fn create(path: &Path) -> io::Result<Self> {
         std::fs::create_dir_all(path)?;

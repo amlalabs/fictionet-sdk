@@ -160,14 +160,7 @@ impl Index {
             if excluded {
                 continue;
             }
-            let canonical = dom
-                .select_first("link[rel=canonical][href]")
-                .ok()
-                .and_then(|node| base.join(node.attributes.borrow().get("href")?).ok())
-                .filter(|canonical| canonical.origin() == base.origin())
-                .map(|canonical| canonical.to_string())
-                .unwrap_or_else(|| url.clone());
-            let identity = search_key(&canonical);
+            let identity = search_key(&url);
             let title = dom
                 .select_first("title")
                 .ok()

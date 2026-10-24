@@ -7,7 +7,7 @@ use super::*;
 use fictionet_extras::{crawl::Index, warc::Archive};
 use std::{path::Path, time::Instant};
 
-const INDEX_VERSION: u32 = 5;
+const INDEX_VERSION: u32 = 6;
 
 pub(super) struct Corpus {
     archive: Archive,
