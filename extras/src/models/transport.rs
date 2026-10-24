@@ -10,6 +10,39 @@ mod text;
 
 pub(super) const RESPONSE_LIMIT: usize = 32 * 1024 * 1024;
 
+/// Provider response framing, shared by sanitization and its consumers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Framing {
+    Json,
+    Events,
+}
+impl Framing {
+    pub(super) fn of(response: &Response<Body>) -> Self {
+        response
+            .extensions()
+            .get::<Self>()
+            .copied()
+            .unwrap_or_else(|| {
+                let media = response
+                    .headers()
+                    .get("content-type")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("");
+                if media
+                    .split(';')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .eq_ignore_ascii_case("text/event-stream")
+                {
+                    Self::Events
+                } else {
+                    Self::Json
+                }
+            })
+    }
+}
+
 /// The outcome of one attempt to contact a provider.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -98,10 +131,8 @@ pub(super) fn sanitize(
     mut response: Response<Body>,
     secret: Secret,
 ) -> fictionet::Result<Response<Body>> {
-    let streaming = response
-        .headers()
-        .get("content-type")
-        .is_some_and(|value| value.as_bytes().starts_with(b"text/event-stream"));
+    let framing = Framing::of(&response);
+    response.extensions_mut().insert(framing);
     response.headers_mut().remove("content-length");
     for value in response.headers_mut().values_mut() {
         let text = String::from_utf8_lossy(value.as_bytes());
@@ -112,7 +143,7 @@ pub(super) fn sanitize(
             body,
             secret,
             pending: Vec::new(),
-            streaming,
+            streaming: framing == Framing::Events,
             records: Vec::new(),
             lines: Stream::new(sse::RawLines::with_limit(RESPONSE_LIMIT)),
             event: Vec::new(),
@@ -192,11 +223,12 @@ impl Scrubbed {
                         .redact(&String::from_utf8_lossy(&metadata))
                         .into_bytes(),
                 ),
-                Err(_) => Record::Raw(
+                Err(_) if data.is_empty() || data == "[DONE]" => Record::Raw(
                     self.secret
                         .redact(&String::from_utf8_lossy(&raw))
                         .into_bytes(),
                 ),
+                Err(_) => return Err(Error::msg("Invalid provider event data")),
             };
             self.records.push(record);
         }
@@ -212,9 +244,7 @@ impl Scrubbed {
                 text::scrub(std::slice::from_mut(&mut value), &self.secret, true);
                 serde_json::to_vec(&value).expect("provider JSON")
             } else {
-                self.secret
-                    .redact(&String::from_utf8_lossy(&self.pending))
-                    .into_bytes()
+                b"null".to_vec()
             };
         }
         let mut values: Vec<_> = self
@@ -350,7 +380,16 @@ mod tests {
     fn successful_json_and_streams_scrub_decoded_secrets_across_frames() {
         fictionet::block_on(fictionet::lab(fictionet::Seed::from_u64(3), |_| async {
             let secret = Secret::new("provider key", "private-key".into())?;
-            for streaming in [false, true] {
+            for media_type in [
+                "application/json",
+                "text/event-stream",
+                "Text/Event-Stream; Charset=UTF-8",
+            ] {
+                let streaming = Framing::of(
+                    &Response::builder()
+                        .header("content-type", media_type)
+                        .body(Body::empty())?,
+                ) == Framing::Events;
                 let json = r#"{"text":"private-key and private\u002dkey","private-key":"title"}"#;
                 let input = if streaming {
                     format!("event: content_block_delta\ndata: {json}\n\n")
@@ -361,14 +400,7 @@ mod tests {
                     .bytes()
                     .map(|byte| Ok::<_, Error>(Frame::data(Bytes::from(vec![byte]))));
                 let response = Response::builder()
-                    .header(
-                        "content-type",
-                        if streaming {
-                            "text/event-stream"
-                        } else {
-                            "application/json"
-                        },
-                    )
+                    .header("content-type", media_type)
                     .header("x-diagnostic", "private-key")
                     .header(
                         "x-opaque",
@@ -386,6 +418,30 @@ mod tests {
                 assert!(!output.contains("private"), "{output}");
                 assert_eq!(output.matches("<provider key>").count(), 3);
             }
+            Ok(())
+        }))
+        .unwrap();
+    }
+
+    #[test]
+    fn malformed_provider_records_never_release_their_original_bytes() {
+        fictionet::block_on(fictionet::lab(fictionet::Seed::from_u64(13), |_| async {
+            let secret = Secret::new("provider key", "private-key".into())?;
+            let response = sanitize(
+                Response::new(Body::from(r#"{"text":"private\u002dkey""#)),
+                secret.clone(),
+            )?;
+            assert_eq!(
+                response.into_body().collect().await?.to_bytes().as_ref(),
+                b"null"
+            );
+            let response = sanitize(
+                Response::builder()
+                    .header("content-type", "Text/Event-Stream")
+                    .body(Body::from("data: {broken private\\u002dkey\n\n"))?,
+                secret,
+            )?;
+            assert!(response.into_body().collect().await.is_err());
             Ok(())
         }))
         .unwrap();
