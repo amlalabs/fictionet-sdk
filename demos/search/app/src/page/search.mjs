@@ -482,9 +482,9 @@ async function mountConsole() {
     let create;
     if (kind === 'terminal') {
       const [library, component] = await Promise.all([import('/vendor/ghostty-web/dist/ghostty-web.js'), import('/terminal.mjs')]);
-      await document.fonts.load('19px "JetBrains Mono"');
+      await document.fonts.load('15px "JetBrains Mono"');
       const ghostty = await library.Ghostty.load('/vendor/ghostty-web/dist/ghostty-vt.wasm');
-      create = (socket) => component.mount($('terminal'), library, socket, { ghostty, fontSize: 19, fontFamily: 'JetBrains Mono', theme: { background: '#151917', foreground: '#dce2dc', cursor: '#dce2dc' } });
+      create = (socket) => component.mount($('terminal'), library, socket, { ghostty, fontSize: 15, fontFamily: 'JetBrains Mono', theme: { background: '#151917', foreground: '#dce2dc', cursor: '#dce2dc' } });
     } else {
       const [{ default: RFB }, component] = await Promise.all([import('/vendor/novnc/core/rfb.js'), import('/screen.mjs')]);
       create = (socket) => component.mount($('screen'), RFB, socket);
