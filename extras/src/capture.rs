@@ -19,8 +19,8 @@ pub enum Purpose {
     Search,
     /// Copy a reached page, redirect or dependency.
     Capture,
-    /// Read the public original of a page a model writes, to ground it.
-    Original,
+    /// Copy a package index or file a copied mirror lacks.
+    Package,
 }
 
 /// Whether a response was reached as a page or as one of its dependencies.

@@ -13,8 +13,8 @@
   <div class="brand"><strong>Fictionet</strong><span class="slash">/</span><span>Search</span></div>
   <div id="source" class="mode-switch" role="group" aria-label="Page source">
     <button data-source="copied" aria-pressed="false">Copied</button>
-    <button data-source="model_written" aria-pressed="false">Model-written</button>
     <button data-source="live" aria-pressed="false">Live</button>
+    <button data-source="edited" aria-pressed="false">Edited</button>
   </div>
   <div class="toolbar"><button id="agent-toggle" aria-pressed="true">Hide agent</button><span class="run-clock"><span id="clock">00:00:00</span> UTC</span><button id="world-toggle" aria-expanded="false" aria-controls="world-menu">World settings</button></div>
 </header>
@@ -30,7 +30,7 @@
     <aside id="details" hidden aria-label="Details"><div class="detail-heading"><div><h1 id="detail-title"></h1><p id="detail-subtitle"></p></div><button id="close-details" aria-label="Close details">×</button></div><div id="detail-body"></div><div id="detail-actions"></div></aside>
   </section>
 </main>
-<div id="world-menu" class="world-menu" hidden><h2>World</h2><p id="world-date"></p><details><summary>World brief</summary><p id="brief"></p></details><button id="restart">Restart pages</button><p id="world-error" role="alert"></p></div>
+<div id="world-menu" class="world-menu" hidden><h2>World</h2><p id="world-date"></p><form id="scenario-form"><label for="scenario">Scenario</label><textarea id="scenario" rows="3" placeholder="The Fed raised rates by 0.5 points on Oct 22"></textarea><div class="scenario-actions"><button type="submit" id="scenario-set">Set</button><button type="button" id="scenario-clear">Clear</button></div></form><button id="restart">Restart pages</button><p id="world-error" role="alert"></p></div>
 <div id="notice" role="status" hidden></div>
 </body>
 </html>

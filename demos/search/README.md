@@ -55,7 +55,7 @@ to a fresh disk overlay; the prepared image stays unchanged. All demo flows use
 this workstation. The terminal uses ghostty-web and a persistent tmux session;
 Screen shows Firefox. Terminal text starts at 15 px on a dark background in both
 page themes, using the bundled JetBrains Mono font. The page source switch stays
-visible and can change Copied, Model-written and Live during a session.
+visible and can change Copied, Live and Edited during a session.
 
 On the workstation, a before-and-after run reached full readiness in 63.384 s
 with boot-time installation and 7.213 s with the prepared image. Desktop readiness
@@ -81,7 +81,7 @@ and sign-in policy survive page restarts. Each launch writes its facts to a sepa
 owner-only permissions. Request credentials are redacted before entering the observation channel; request
 bodies are not retained. Header details show only values retained by recording.
 The map draws internet
-routes from upstream facts, including host page-writer calls, rather than from
+routes from upstream facts, including the editor's model calls, rather than from
 model call activity. Local and rejected model requests therefore leave the
 internet wire dark. The activity feed updates one row per upstream attempt;
 the run record retains each transport phase.
@@ -100,18 +100,6 @@ sites. Capture dates are shown only when the archive records them.
   layout. Result counts come from the index before pagination. An unmatched query
   returns an empty list. Missing pages use captured site responses; unknown hosts
   return NXDOMAIN.
-- **Model-written** writes pages for the requested subject from the prose brief,
-  captured reference material, earlier mentions and stored claims. Written searches
-  use the offline index for relevant sources; pages preserve the original source's
-  facts unless the brief or established world documents explicitly change them.
-  The host-held Claude token takes priority,
-  followed by `OPENROUTER_API_KEY` and `ANTHROPIC_API_KEY`. The page writer uses its
-  own host-side model client; it does not send its credential through the guest.
-  The Anthropic writer is Claude Haiku 5.5, without thinking, with the API's 128K
-  output maximum. Search results start writing their destination pages in parallel.
-  Each site shares its navigation, stylesheet and footer across pages. PDF URLs
-  return typeset PDF documents with embedded fonts. Authored claims preserve
-  citation identities across pages. Failed calls do not invent fallback articles.
 - **Live** is selected by default when `EXA_API_KEY` is present. [Exa search](https://github.com/exa-labs/openapi-spec/blob/master/exa-openapi-spec.yaml)
   supplies results, which keep their order, titles, URLs and snippets in each
   engine's skin. The host copies any public URL the guest or Claude requests,
@@ -121,13 +109,28 @@ sites. Capture dates are shown only when the archive records them.
   cross-host assets and redirects at their real URLs. Separate downloads
   can progress together. Actual host requests appear in the
   page's internet activity. Interrupted downloads retry until completion; upstream
-  status codes, including real missing pages, are preserved.
+  status codes, including real missing pages, are preserved. A host whose real
+  certificate fails verification (expired, issued for other names, or from an
+  untrusted issuer) presents a certificate that fails the same way.
+- **Edited** serves the real web as Live does, with the changes a scenario calls
+  for. The scenario is a short instruction set in the World menu, such as "The
+  Fed raised rates by 0.5 points on Oct 22". A model reads each page or result
+  list with the scenario, today's date and what readers have already been shown,
+  and returns only edits: an exact passage and its replacement. The world makes
+  them in the real bytes and serves everything else unchanged, then asks again
+  until nothing is left to change. Text that names nothing the scenario is about
+  is served without a model call. Real 404s, PDFs and other files stay real.
+  The host-held Claude token takes priority, followed by `OPENROUTER_API_KEY` and
+  `ANTHROPIC_API_KEY`; the editor is Claude Haiku 5.5 and never sends its
+  credential through the guest. The feed and the reading view mark each change;
+  the guest sees none of this. With no scenario, Edited behaves like Live.
 
-The source switch shows why a source is unavailable: missing captures, a page
-writer or a search key. Other sources remain usable. The page source can change
+The source switch shows why a source is unavailable: missing captures, a model
+key or a search key. Other sources remain usable. The page source can change
 during a session, and the page reports the source that answered each request.
-Copied mode has no public-web fallback. Wikipedia reflects its June 2026
-snapshot; documentation reflects its capture date. Live supplies current
+Copied mode has no public-web fallback. Its day is the Wikipedia snapshot's: the
+workstation clock, HTTP dates and the World menu move back to it while Copied
+answers, and return to the run day when another source is chosen. Live supplies current
 material. Live search and capture use a separate host HTTP transport, outside
 the guest model gateway. Search queries and served pages are logged and
 displayed. The crawler ignores robots.txt.
@@ -155,7 +158,7 @@ request occurred.
 
 The world's observations report sign-in policy and upstream attempts, responses
 and failures. An attempt means the request entered the host transport, not that
-a connection succeeded. Model gateway and page-writer requests share this
+a connection succeeded. Model gateway and editor requests share this
 observed provider transport. Local startup responses and rejected requests do
 not produce an upstream attempt. Live's host search and capture transport is
 separate from this provider boundary.
@@ -166,28 +169,9 @@ with unsupported features. Inline data and client tool arguments containing URLs
 remain usable. Provider-native search and fetch become client functions answered
 from the world's pages; they do not reach the provider as native web tools.
 
-## Briefs
-
-A file in [seeds/](seeds) has a world date and free-text instructions:
-
-```toml
-+++
-date = "2026-10-21"
-+++
-```
-
-Write the world's full brief after the closing marker: what is true, what the
-sites contain and which sources matter. Optional `[[fixed]]` entries retain
-`url`, `file`, `title`, `description` and `content_type`; their files are served
-verbatim. For the VM demo, the brief's date is replaced by the run day. The guest
-inherits the host clock; HTTP dates and certificates use the run clock. The
-standalone world can still run against a brief's historical date.
-Search ranking receives the prose without special treatment for named sites.
-Use unplanned research questions when driving the workstation.
-
 ## Corpus
 
-The default [brief](seeds/security.md) selects the security captures and the broad
+The [seed](seeds/security.md) selects the security captures and the broad
 reference web under the shared downloads directory. Prepare the reference web
 once before starting the demo:
 
@@ -240,9 +224,9 @@ The previous astronomy captures remain in `demos/downloads/astronomy/`.
 
 The corpus's `packages/` directory holds separate WARCs for PyPI indexes,
 wheel metadata and distributions, and GitHub source archives. These sites
-always replay locally, including in Model-written mode. There is no upstream
-transport. Missing distributions return 404, and a missing project cannot
-fall through to a generated page. Captured site 404 pages and their assets
+replay their captures in every mode. A file the capture lacks is copied from
+its real host when first asked for and kept for the run, so installs work for
+any package; a package that does not exist stays a 404. Captured site 404 pages and their assets
 also supply missing-page responses for the research sources.
 
 Capture the research sources and packages with Python 3.12 and pip available
@@ -262,8 +246,8 @@ Other versions and platforms require their own captures.
 
 ## Code
 
-The world's page modules separate routing, generation, listings, stored pages,
-corrections and model tools. Prompt construction and answer parsing are separate.
+The world's page modules separate the copied web, Live copies, the editor and
+the text it edits, listings and model tools.
 The WARC reader, crawler, BM25 index, model gateway and credential transport live in
 `fictionet-extras`. The shared demo kit supplies VM lifetime, prepared images
 and SSH console sockets. Search owns its HTML, styles and JavaScript, including copies of the

@@ -1,6 +1,6 @@
 @font-face{font-family:"JetBrains Mono";src:url('/fonts/terminal.woff2') format('woff2');font-weight:400;font-style:normal;font-display:block}
-:root{--screen-h:calc(100dvh - 126px);color-scheme:light dark;--bg:#f5f4f1;--panel:#fff;--raised:#efeee9;--line:#e0dfd9;--wire:#a9aea8;--text:#232624;--muted:#62685f;--faint:#8a9089;--accent:#2f6aa3;--accent-bg:#e9f0f7;--red:#a13b37;--terminal:#151917;--mono:"JetBrains Mono",ui-monospace,monospace;--sans:"Helvetica Neue",Arial,sans-serif;--t1:11px;--t2:12px;--t3:13px;--t4:15px;font:var(--t3)/1.45 var(--sans);color:var(--text);background:var(--bg)}
-@media(prefers-color-scheme:dark){:root{--bg:#161918;--panel:#1c201e;--raised:#252a27;--line:#323834;--wire:#5d655f;--text:#e2e6e0;--muted:#a3aca3;--faint:#7f897f;--accent:#8db8de;--accent-bg:#22323e;--red:#e6a19a}}
+:root{--screen-h:calc(100dvh - 126px);color-scheme:light dark;--bg:#f5f4f1;--panel:#fff;--raised:#efeee9;--line:#e0dfd9;--wire:#a9aea8;--text:#232624;--muted:#62685f;--faint:#8a9089;--accent:#2f6aa3;--accent-bg:#e9f0f7;--red:#a13b37;--amber:#8a5700;--mark:#ffe28a;--terminal:#151917;--mono:"JetBrains Mono",ui-monospace,monospace;--sans:"Helvetica Neue",Arial,sans-serif;--t1:11px;--t2:12px;--t3:13px;--t4:15px;font:var(--t3)/1.45 var(--sans);color:var(--text);background:var(--bg)}
+@media(prefers-color-scheme:dark){:root{--bg:#161918;--panel:#1c201e;--raised:#252a27;--line:#323834;--wire:#5d655f;--text:#e2e6e0;--muted:#a3aca3;--faint:#7f897f;--accent:#8db8de;--accent-bg:#22323e;--red:#e6a19a;--amber:#e3b45f;--mark:#6b5418}}
 *{box-sizing:border-box}
 body{margin:0;height:100dvh;display:flex;flex-direction:column;overflow:hidden;background:var(--bg)}
 [hidden]{display:none!important}
@@ -68,7 +68,7 @@ body.agent-hidden .world{max-width:1040px;margin-inline:auto}
 .vm-node strong{display:block;font-weight:500}
 .vm-node small{display:block;font:var(--t1) var(--mono);color:var(--muted);margin-top:4px}
 .services{grid-column:2;grid-row:1;position:relative;z-index:2;display:flex;flex-direction:column;padding:36px 0 10px;pointer-events:none}
-.service{pointer-events:auto;position:relative;display:flex;align-items:baseline;justify-content:space-between;gap:10px;min-width:0;min-height:32px;border:0;border-radius:4px;padding:7px 10px;background:transparent}
+.service{pointer-events:auto;position:relative;display:flex;align-items:baseline;justify-content:space-between;gap:10px;min-width:0;min-height:32px;border:0;border-radius:4px;padding:7px 16px;background:transparent}
 .service strong{font-weight:500;white-space:nowrap}
 .service small{font-size:var(--t2);color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .service.unused strong{color:var(--faint);font-weight:400}
@@ -91,6 +91,7 @@ body.agent-hidden .world{max-width:1040px;margin-inline:auto}
 .activity-title,.activity-meta{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .activity-meta{grid-column:2;color:var(--muted);font-size:var(--t2)}
 .activity-row.no_route .activity-title,.activity-row.no_route .activity-meta,.activity-row.failed .activity-title{color:var(--red)}
+.activity-row.retried .activity-meta{color:var(--amber)}
 /* A thumbnail is the top of the page at the workstation phone's width. */
 .thumbnail{width:98px;height:150px;margin:12px 0;border:1px solid var(--line);border-radius:4px;overflow:hidden;background:#fff;cursor:pointer;position:relative}
 .thumbnail iframe{width:390px;height:600px;border:0;transform:scale(.25);transform-origin:0 0;pointer-events:none;background:#fff}
@@ -126,7 +127,16 @@ aside{grid-row:2;min-height:0;min-width:0;border:1px solid var(--line);border-ra
 dt{color:var(--faint);overflow-wrap:anywhere}
 dd{margin:0;color:var(--muted);overflow-wrap:anywhere}
 .tool-query{font:var(--t2)/1.6 var(--mono);margin:8px 0;overflow-wrap:anywhere}
-.writer-error{font-size:var(--t2);color:var(--red);margin:8px 0;overflow-wrap:anywhere}
+/* A change: the real words struck through, then the scenario's. */
+.changes{display:flex;flex-direction:column;gap:4px;font-size:var(--t2);line-height:1.5;margin:2px 0 8px}
+.change{display:flex;flex-wrap:wrap;gap:2px 8px;min-width:0}
+.change del{color:var(--muted);text-decoration-color:var(--red);overflow-wrap:anywhere}
+.change ins{text-decoration:none;background:var(--mark);color:var(--text);border-radius:2px;padding:0 3px;overflow-wrap:anywhere}
+.change-more{color:var(--faint)}
+.activity-text>.changes{margin:-6px 0 12px 76px}
+.activity-text>.changes del,.activity-text>.changes ins{display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden}
+.detail-row .changes{margin:8px 0 0}
+body.page-selected #detail-body>.changes{flex:none;padding:0 20px 12px;margin:0}
 .world-answer{font-size:var(--t2);color:var(--muted);margin:8px 0}
 .result{width:100%;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:2px 12px;padding:9px 0;border:0;border-top:1px solid var(--line);border-radius:0}
 .result:hover{background:transparent}
@@ -151,9 +161,12 @@ body.page-expanded .map-wrap{visibility:hidden;padding:0}
 .world-menu{position:fixed;right:24px;top:52px;width:320px;max-height:calc(100dvh - 72px);overflow:auto;border:1px solid var(--line);border-radius:6px;background:var(--panel);padding:20px;box-shadow:0 6px 20px #0000001f;z-index:10}
 .world-menu h2{font-size:var(--t4);margin:0 0 6px}
 .world-menu p{color:var(--muted);font-size:var(--t2);line-height:1.6}
-.world-menu details{padding:14px 0;border-top:1px solid var(--line);margin-top:14px}
-.world-menu summary{color:var(--muted);cursor:pointer;font-size:var(--t2)}
-.world-menu details p{margin-top:10px}
+.world-menu form{display:flex;flex-direction:column;gap:8px;padding:14px 0;border-top:1px solid var(--line);margin:14px 0}
+.world-menu label{font-size:var(--t2);color:var(--muted)}
+.world-menu textarea{font:inherit;color:inherit;background:var(--bg);border:1px solid var(--line);border-radius:4px;padding:8px 10px;resize:vertical;min-height:64px}
+.world-menu textarea:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+.scenario-actions{display:flex;gap:8px}
+.scenario-actions button{font-size:var(--t2);padding:5px 12px}
 #world-error{color:var(--red);margin-top:10px}
 #notice{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);padding:12px 20px;border:1px solid var(--red);border-radius:6px;background:var(--panel);color:var(--red);z-index:20;max-width:90vw}
 @media(prefers-reduced-motion:reduce){.traffic-wires path{transition:none}}

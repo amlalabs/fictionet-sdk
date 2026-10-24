@@ -13,7 +13,7 @@ use web_world::{
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-/// The world's brief chooses both the copied corpus and model-written topics.
+/// The seed that chooses the copied web.
 const SEED: &str = "security";
 
 fn downloads() -> Result<PathBuf> {
@@ -40,18 +40,17 @@ fn app_pages(
     } else {
         None
     };
-    let pages = Pages::from_corpus(
+    let mut pages = Pages::from_corpus(
         seed,
         downloads.parent().ok_or("downloads folder has no parent")?,
-        model,
     )?;
-    Ok(
-        if std::env::var("EXA_API_KEY").is_ok_and(|key| !key.is_empty()) {
-            pages.with_live_search(downloads)?
-        } else {
-            pages
-        },
-    )
+    if let Some(model) = model {
+        pages = pages.with_editor(model);
+    }
+    if std::env::var("EXA_API_KEY").is_ok_and(|key| !key.is_empty()) {
+        pages = pages.with_live_search(downloads)?;
+    }
+    Ok(pages)
 }
 
 #[tokio::main]
@@ -87,6 +86,7 @@ async fn main() -> Result {
     let _access = kit::PageAccess::new(&server.url)?;
     let observe_page = page.clone();
     let ready_page = page.clone();
+    let (world_day, copied_lag) = (page.world(), pages.copied_lag());
     let mut observation_task =
         tokio::spawn(async move { observe_page.record(observations, &output).await });
     let log = Arc::new(Log::new(Box::new(std::io::sink()), &[], |s| s));
@@ -115,9 +115,12 @@ async fn main() -> Result {
         },
         move |cx, mut run| async move {
             let start = std::time::SystemTime::now();
+            // Copied mode sets the workstation's clock back to the day its
+            // pages were copied; certificates hold from then too.
+            let earliest = start - pages.copied_lag().unwrap_or_default();
             let web = World {
-                ca: Arc::new(Ca::in_memory(&cx, start)?),
-                addresses: Arc::new(Addresses::new(seed.fixed_addresses(), None)?),
+                ca: Arc::new(Ca::new(&cx, earliest, start)?),
+                addresses: Arc::new(Addresses::new(seed.fixed_addresses())),
                 pages: pages.clone(),
                 start,
             };
@@ -134,6 +137,7 @@ async fn main() -> Result {
         _ = interrupt.recv() => { server.shutdown().await; observation_task.abort(); return Ok(()); },
         result = &mut observation_task => return Err(recording_error(result).into()),
     };
+    guest::follow_world_day(run.guest(guest::HOST).ssh().clone(), world_day, copied_lag);
     let mut readiness = Box::pin(run.app_ready(guest::HOST));
     let mut ready = false;
     let mut recording_ended = false;

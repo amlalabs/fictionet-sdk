@@ -10,6 +10,8 @@ use std::io;
 use zim::{MimeType, Namespace, Target, Zim};
 
 pub(super) struct ReferenceWeb {
+    /// The day the Wikipedia copy was made, from its own metadata.
+    pub(super) date: Option<time::Date>,
     pub index: DiskIndex,
     wikipedia: Zim,
     documents: Archive,
@@ -105,7 +107,14 @@ impl ReferenceWeb {
             .filter_map(|url| url::Url::parse(url).ok()?.host_str().map(str::to_owned))
             .collect();
         eprintln!("Offline web: {} indexed pages", index.len());
+        let date = wikipedia
+            .metadata("Date")
+            .ok()
+            .flatten()
+            .and_then(|content| content.to_vec().ok())
+            .and_then(|date| super::seed::parse_date(String::from_utf8_lossy(&date).trim()).ok());
         Ok(Self {
+            date,
             index,
             wikipedia,
             documents,

@@ -7,7 +7,10 @@ use fictionet_extras::{
     models::Key,
     warc::{self, Archive},
 };
+use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{MutexGuard, OnceLock};
 use tokio::sync::{oneshot, watch};
 
 pub(super) mod transport;
@@ -51,7 +54,6 @@ struct State {
     lifetime: Arc<Lifetime>,
     epoch: usize,
     reached: HashMap<String, watch::Sender<CaptureState>>,
-    searches: HashMap<(String, u64, fictionet_extras::models::tools::Domains), search::Search>,
 }
 
 pub(super) struct Live {
@@ -207,7 +209,6 @@ impl Live {
     async fn search(
         self: &Arc<Self>,
         cx: &Cx,
-        _engine: Engine,
         query: &str,
         start: u64,
         domains: &fictionet_extras::models::tools::Domains,
@@ -288,14 +289,8 @@ impl Live {
             .skip(start as usize)
             .take(10)
             .collect();
-        {
-            let mut state = self.state();
-            if lifetime.cancelled() || !Arc::ptr_eq(lifetime, &state.lifetime) {
-                return Err("Live session stopped".into());
-            }
-            state
-                .searches
-                .insert((query.to_owned(), start, domains.clone()), search.clone());
+        if lifetime.cancelled() || !Arc::ptr_eq(lifetime, &self.state().lifetime) {
+            return Err("Live session stopped".into());
         }
         Ok(search)
     }
@@ -320,7 +315,6 @@ impl Live {
         }
         if reset {
             state.lifetime = Arc::default();
-            state.searches.clear();
             let completed: std::collections::HashSet<_> =
                 state.archive.urls().map(str::to_owned).collect();
             state.reached.retain(|url, _| completed.contains(url));
@@ -442,94 +436,129 @@ fn parse_search(value: &Value, key: Option<&Key>) -> Result<search::Search, Stri
     Ok(search)
 }
 
+/// Single requests from the host outside a Live session: package files
+/// the copied web lacks. Its transport starts on first use.
+#[derive(Default)]
+pub(super) struct Fetcher {
+    transport: OnceLock<Result<Arc<Transport>, String>>,
+    lifetime: Arc<Lifetime>,
+    observer: Mutex<Option<Arc<capture::Observer>>>,
+}
+
+impl Fetcher {
+    /// The real host's response for the package file at `url`, without
+    /// following redirects.
+    pub(super) async fn package(&self, cx: &Cx, url: &str) -> Result<warc::Response, String> {
+        let transport = self
+            .transport
+            .get_or_init(|| Transport::new().map(Arc::new))
+            .clone()?;
+        let (send, receive) = oneshot::channel();
+        let lifetime = self.lifetime.clone();
+        let observer = self.observer.lock().unwrap().clone();
+        let (thread, url) = (cx.clone(), url.to_owned());
+        transport.clone().spawn(async move {
+            let response = transport
+                .request(&thread, &lifetime, observer, &url, Ask::Package)
+                .await
+                .map_err(|error| error.to_string());
+            let _ = send.send(response);
+        });
+        cx.race(None, receive)
+            .await
+            .map_err(|_| "the world stopped".to_owned())?
+            .map_err(|_| "the package request stopped".to_owned())?
+    }
+}
+
 impl Pages {
-    /// Observes every host request: Live copies and searches, and the
-    /// originals that ground written pages.
+    /// Observes every host request: Live copies and searches, and package files.
     pub(crate) fn observe_live(&self, observer: Arc<capture::Observer>) {
-        self.originals.observe(observer.clone());
+        *self.fetcher.observer.lock().unwrap() = Some(observer.clone());
         if let Some(live) = &self.live {
             *live.observer.lock().unwrap() = Some(observer);
         }
     }
 
-    /// Whether Live mode has a configured host search credential.
-    pub fn live_available(&self) -> bool {
-        self.live.is_some()
-    }
-
     /// Configure and select host search from environment credentials.
     pub fn with_live_search(mut self, downloads: &Path) -> Result<Self, String> {
-        let live = Live::new(downloads)?;
-        self.originals.search_with(live.key.clone());
-        self.live = Some(live);
-        self.live_active
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        self.copied_active
-            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.live = Some(Live::new(downloads)?);
+        self.settings.get_mut().unwrap().source = Source::Live;
         Ok(self)
     }
 
-    pub(crate) fn live_only(&self) -> bool {
-        self.live_active.load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    /// Answers from a Live copy of `url`, copied the way the asking client
-    /// (by its `user_agent`) would be served: a phone gets the mobile site.
-    /// A page's own request names that `page`.
-    pub(crate) async fn live_url(
+    /// Answers from a Live copy of `url`, with the scenario's edits in
+    /// Edited mode.
+    pub(super) async fn live_url(
         &self,
         cx: &Cx,
         url: &str,
         user_agent: Option<&http::HeaderValue>,
         page: Option<url::Url>,
     ) -> Response {
-        match self
-            .live
-            .as_ref()
-            .unwrap()
-            .response(cx, url, user_agent, page)
-            .await
-        {
+        let live = self.live.as_ref().expect("a Live source");
+        match live.response(cx, url, user_agent, page).await {
+            Ok(response) if self.source() == Source::Edited => self.edited(cx, url, response).await,
             Ok(response) => copied::replay(Ok(Some(response))),
             Err(error) => Response::new(
                 502,
                 "text/plain; charset=utf-8",
                 "Bad Gateway\n",
                 vec![],
-                Meta::Error { error, usage: None },
+                Meta::Error { error },
             ),
         }
+    }
+
+    /// The real page `response` with the scenario's edits. Pages that are
+    /// not HTML, not found, or not touched by the scenario are served as
+    /// the site sent them.
+    async fn edited(&self, cx: &Cx, url: &str, response: warc::Response) -> Response {
+        let html = response.status == http::StatusCode::OK
+            && response
+                .headers
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.to_ascii_lowercase().starts_with("text/html"));
+        let editor = self.editor.as_ref().expect("Edited has an editor");
+        let Some(text) = html
+            .then(|| std::str::from_utf8(&response.body).ok())
+            .flatten()
+        else {
+            return copied::replay(Ok(Some(response)));
+        };
+        let revision = match editor.page(cx, url, text).await {
+            Ok(Some(revision)) => revision,
+            Ok(None) => return copied::replay(Ok(Some(response))),
+            Err(error) => {
+                eprintln!("{url} was not edited: {error}");
+                return copied::replay(Ok(Some(response)));
+            }
+        };
+        let mut served = response;
+        served.body = revision.served.into_bytes().into();
+        served
+            .headers
+            .insert(http::header::CONTENT_LENGTH, served.body.len().into());
+        let mut answer = copied::replay(Ok(Some(served)));
+        answer.edited = Some(Edited {
+            edits: revision.edits,
+            marked: Arc::from(revision.marked),
+        });
+        answer
     }
 
     pub(super) async fn live_listing(
         &self,
         cx: &Cx,
-        engine: Engine,
         query: &str,
         start: u64,
         domains: &fictionet_extras::models::tools::Domains,
-    ) -> Result<(search::Search, Cache, Option<Usage>, u64), Stop> {
-        if !self.generation().generate {
-            return Ok((
-                self.live
-                    .as_ref()
-                    .unwrap()
-                    .state()
-                    .searches
-                    .get(&(query.to_owned(), start, domains.clone()))
-                    .cloned()
-                    .unwrap_or_default(),
-                Cache::Cached,
-                None,
-                0,
-            ));
-        }
+    ) -> Result<search::Search, String> {
         self.live
             .as_ref()
-            .unwrap()
-            .search(cx, engine, query, start, domains)
+            .expect("a Live source")
+            .search(cx, query, start, domains)
             .await
-            .map(|search| (search, Cache::Fixed, None, 0))
-            .map_err(|error| Stop::Failed { error, usage: None })
     }
 }

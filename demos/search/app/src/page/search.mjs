@@ -20,7 +20,8 @@ const svgNode = (tag, attributes = {}) => {
 const stamp = (ms) => new Date((shown.started_at_ms || Date.now()) + ms).toLocaleTimeString([], { hour12: false, timeZone: 'UTC' });
 const size = (bytes) => bytes < 1000 ? `${bytes} B` : `${Math.round(bytes / 1000)} KB`;
 const quantity = (n, word, plural = `${word}s`) => `${n} ${n === 1 ? word : plural}`;
-const sourceName = (source) => source.kind === 'copy' ? source.captured ? `Copied ${source.captured.slice(0, 10)}` : 'Copied' : source.kind === 'live' ? 'Live' : 'Model-written';
+const sourceName = (source) => source.kind === 'copy' ? source.captured ? `Copied ${source.captured.slice(0, 10)}` : 'Copied' : ({ edited: 'Edited', package: 'Package' })[source.kind] || 'Live';
+const changes = (edits) => edits?.length ? quantity(edits.length, 'change') : null;
 const hostName = (name) => name.replace(/\.$/, '');
 const hostOf = (url) => { try { return new URL(url).host; } catch { return url; } };
 const originOf = (url) => { try { return new URL(url).origin; } catch { return null; } };
@@ -56,12 +57,12 @@ function showAgent(shown) {
   $('agent-toggle').textContent = shown ? 'Hide agent' : 'Show agent';
 }
 $('agent-toggle').onclick = () => showAgent($('agent').hidden);
-const UPSTREAM = ['model', 'account', 'page writer', 'original'];
+const UPSTREAM = ['model', 'account', 'editor'];
 function localSites() {
   const upstream = new Set([...shown.connections.filter((row) => UPSTREAM.includes(row.purpose)).map((row) => row.host), ...shown.calls.map((call) => call.host)]);
   return shown.sites.filter((site) => !upstream.has(site.host));
 }
-const purposeName = (purpose) => ({ model: 'Model', 'page writer': 'Page writer', account: 'Sign-in', live_search: 'Search', live_capture: 'Page copy', original: 'Original' })[purpose];
+const purposeName = (purpose) => ({ model: 'Model', editor: 'Editor', account: 'Sign-in', live_search: 'Search', live_capture: 'Page copy', package: 'Package' })[purpose];
 const phaseName = (phase) => ({ connecting: 'Connecting', receiving: 'Receiving', streaming: 'Streaming', complete: 'Complete', interrupted: 'Interrupted', attempt: 'Connecting', response: 'Received', failed: 'Failed' })[phase];
 
 // The network map is built once; each state only changes its text, its
@@ -70,9 +71,9 @@ const phaseName = (phase) => ({ connecting: 'Connecting', receiving: 'Receiving'
 const SERVICES = [
   { id: 'dns', title: 'DNS' },
   { id: 'search', title: 'Search', purposes: ['live_search'] },
-  { id: 'sites', title: 'Sites', purposes: ['live_capture'] },
+  { id: 'sites', title: 'Sites', purposes: ['live_capture', 'package'] },
   { id: 'calls', title: 'Model gateway', purposes: ['model'] },
-  { id: 'writer', title: 'Page writer', purposes: ['page writer', 'original'] },
+  { id: 'editor', title: 'Editor', purposes: ['editor'] },
   { id: 'signin', title: 'Sign-in', purposes: ['account'] },
   { id: 'router', title: 'Router' },
 ];
@@ -105,21 +106,26 @@ function buildMap() {
 }
 // Host fetches for a page's own files belong to that page.
 const pageFetches = (purpose) => shown.egress.filter((row) => row.fact.purpose === purpose && row.fact.phase !== 'attempt' && !row.fact.page);
+// The pages the workstation opened on the world's sites, each address once:
+// the same pages the host copies from the internet in Live and Edited.
+// Package files count on their own row.
+const openedPages = () => new Set(localSites().flatMap((site) => site.requests.filter((request) => !isSubresource(request) && !SEARCH_HOSTS.has(site.host) && request.source.kind !== 'package').map((request) => request.url)));
 function graph() {
   if (!map.lanes) buildMap();
   map.vm.querySelector('small').textContent = hostStatus?.addresses[0] || '10.0.0.2';
   map.vm.setAttribute('aria-pressed', String(selection === 'workstation'));
   const sites = localSites();
+  const pages = openedPages().size;
   const facts = shown.activity.map((row) => row.fact);
   const searches = shown.sites.flatMap((site) => site.searches).length + shown.calls.flatMap((call) => call.tools.filter((tool) => tool.tool === 'web_search')).length;
-  const written = egressRows('page writer').length;
+  const edits = editorCalls().length;
   const refusedTo = facts.filter((fact) => fact.kind === 'no_route').at(-1)?.to;
   const state = {
     dns: { detail: '10.0.0.1', reached: facts.some((fact) => fact.kind === 'resolved') },
     search: { detail: searches ? quantity(searches, 'search', 'searches') : '', reached: searches > 0 },
-    sites: { detail: sites.length ? quantity(sites.length, 'site') : '', reached: sites.some((site) => site.requests.length) },
+    sites: { detail: pages ? quantity(pages, 'page') : '', reached: sites.some((site) => site.requests.length) },
     calls: { detail: shown.calls.length ? quantity(shown.calls.length, 'call') : '', reached: shown.calls.length > 0 },
-    writer: { detail: written ? quantity(written, 'call') : '', reached: written > 0 },
+    editor: { detail: edits ? quantity(edits, 'call') : '', reached: edits > 0 },
     signin: { detail: shown.signin?.fact.open ? 'Open' : 'Closed', reached: false },
     router: { detail: refusedTo ? `No route to ${refusedTo}` : '', reached: !!refusedTo, refused: !!refusedTo },
   };
@@ -149,22 +155,27 @@ function graph() {
   const layout = layoutSignature();
   if (layout !== map.signature) drawWires();
 }
+// Wires follow where their ends are: a scrollbar or a font that arrives
+// late moves the boxes without resizing the map.
 function layoutSignature() {
-  return JSON.stringify([...map.services.values()].map((service) => service.control.dataset.reached).concat([map.destinations, map.lanes.clientWidth, map.lanes.clientHeight]));
+  const origin = map.lanes.getBoundingClientRect();
+  const at = (node) => { const rect = node.getBoundingClientRect(); return [Math.round(rect.left - origin.left), Math.round(rect.top - origin.top), Math.round(rect.width)]; };
+  return JSON.stringify([...map.services.values()].map((service) => [service.control.dataset.reached, at(service.control)]).concat([map.destinations, at(map.vm), [...map.internet.children].map(at), map.lanes.clientWidth, map.lanes.clientHeight]));
 }
+document.fonts?.ready.then(() => { if (map.lanes) { map.signature = ''; drawWires(); } });
 // One row per internet destination, in service order: a host the world
-// reached for a service, or the pages it read for Live and for the page writer.
+// reached for a service, or the pages and package files it copied.
+const COPIES = { live_capture: { target: 'copies', title: 'Page copies', unit: 'page' }, package: { target: 'packages', title: 'Packages', unit: 'file' } };
 function destinationsOf() {
   const rows = new Map();
   for (const service of map.services.values()) {
     for (const purpose of service.purposes || []) {
       const hosts = [...new Set(shown.connections.filter((row) => row.purpose === purpose).map((row) => row.host))];
       if (!hosts.length) continue;
-      if (purpose === 'live_capture' || purpose === 'original') {
-        const fetches = pageFetches(purpose);
-        const target = purpose === 'original' ? 'originals' : 'copies';
-        const fetched = new Set(fetches.map((row) => row.fact.host));
-        rows.set(target, { key: target, target, title: purpose === 'original' ? 'Originals' : 'Live sites', meta: purpose === 'original' ? quantity(fetches.length, 'request') : `${quantity(fetches.length, 'page')} · ${quantity(fetched.size, 'host')}`, from: [service.id] });
+      const copies = COPIES[purpose];
+      if (copies) {
+        const copied = new Set(pageFetches(purpose).map((row) => row.fact.path)).size;
+        rows.set(copies.target, { key: copies.target, target: copies.target, title: copies.title, meta: quantity(copied, copies.unit), from: [service.id] });
       } else {
         for (const host of hosts) {
           const row = rows.get(host) || { key: host, target: `egress:${host}`, title: host, meta: '', from: [] };
@@ -267,10 +278,10 @@ function pulses() {
       case 'model_call': pulse('vm>calls', `calls>${fact.host}`); break;
       case 'egress':
         if (fact.phase !== 'attempt') break;
-        if (fact.purpose === 'page writer') pulse('vm>writer', `writer>${fact.host}`);
-        else if (fact.purpose === 'original') pulse('writer>originals');
+        if (fact.purpose === 'editor') pulse('vm>editor', `editor>${fact.host}`);
         else if (fact.purpose === 'live_search') pulse(`search>${fact.host}`);
         else if (fact.purpose === 'live_capture' && !fact.page) pulse('sites>copies');
+        else if (fact.purpose === 'package') pulse('sites>packages');
         else if (fact.purpose === 'account') pulse(`signin>${fact.host}`);
         break;
     }
@@ -320,10 +331,10 @@ function activityItem(row) {
       const thumbnail = document && fact.status < 400 && /text\/html/.test(fact.content_type) ? url : null;
       // A page that took a while says how long: a client with a deadline may have stopped waiting.
       const took = fact.elapsed_ms >= 1000 ? `${Math.round(fact.elapsed_ms / 1000)} s` : null;
-      return { title: `${fact.status >= 400 ? 'Requested' : 'Opened'} ${fact.title || hit?.title || fact.host}`, meta: [where, fact.status, sourceName(fact.source), took].filter(Boolean).join(' · '), target: document ? `page:${url}` : `site:${fact.host}`, thumbnail };
+      return { title: `${fact.status >= 400 ? 'Requested' : 'Opened'} ${fact.title || hit?.title || fact.host}`, meta: [where, fact.status, sourceName(fact.source), changes(fact.edits), took].filter(Boolean).join(' · '), target: document ? `page:${url}` : `site:${fact.host}`, thumbnail, edits: fact.edits };
     }
-    case 'search': return { title: `Searched “${fact.query}”`, meta: fact.results.length ? `${quantity(fact.results.length, 'result')} · ${hitHosts(fact.results)}` : 'No results', target: 'search' };
-    case 'tool': return { title: `${fact.tool === 'fetch' ? 'Fetched' : 'Searched'} ${fact.tool === 'fetch' ? fact.target : `“${fact.target}”`}`, meta: fact.error || (fact.tool === 'fetch' ? 'Answered by the world' : fact.results.length ? `${quantity(fact.results.length, 'result')} · ${hitHosts(fact.results)}` : 'No results'), target: 'calls' };
+    case 'search': return { title: `Searched “${fact.query}”`, meta: fact.results.length ? [quantity(fact.results.length, 'result'), hitHosts(fact.results), changes(fact.edits)].filter(Boolean).join(' · ') : 'No results', target: 'search', edits: fact.edits };
+    case 'tool': return { title: `${fact.tool === 'fetch' ? 'Fetched' : 'Searched'} ${fact.tool === 'fetch' ? fact.target : `“${fact.target}”`}`, meta: fact.error || (fact.tool === 'fetch' ? 'Answered by the world' : fact.results.length ? [quantity(fact.results.length, 'result'), hitHosts(fact.results), changes(fact.edits)].filter(Boolean).join(' · ') : 'No results'), target: 'calls', edits: fact.edits };
     case 'abandoned': {
       const where = `${fact.host}${briefPath(fact.path) === '/' ? '' : briefPath(fact.path)}`;
       return { title: `${where} timed out`, meta: `Agent stopped waiting after ${Math.round(fact.elapsed_ms / 1000)} s · ${sourceName(fact.source)}`, target: `site:${fact.host}`, failed: true };
@@ -332,18 +343,30 @@ function activityItem(row) {
     case 'resolved': return { title: `${hostName(fact.name)} not found`, meta: 'No address', target: 'dns', failed: true };
   }
 }
+// A change reads as the real words struck through, then the world's words.
+function changeList(edits, limit = edits.length) {
+  const list = element('div', undefined, 'changes');
+  for (const edit of edits.slice(0, limit)) {
+    const row = element('div', undefined, 'change');
+    row.append(element('del', edit.passage), element('ins', edit.replacement));
+    list.append(row);
+  }
+  if (edits.length > limit) list.append(element('div', `${edits.length - limit} more`, 'change-more'));
+  return list;
+}
 // Feed rows are keyed and kept, so a page's picture loads once.
 const feedRows = new Map();
 function feedRow(key, row, item, resources) {
   const signature = JSON.stringify([item, row.at_ms, resources.length]);
   const kept = feedRows.get(key);
   if (kept?.signature === signature) return kept.node;
-  const node = element('div', undefined, `activity-row ${row.fact.kind}${item.failed ? ' failed' : ''}`);
+  const node = element('div', undefined, `activity-row ${row.fact.kind}${item.failed ? ' failed' : ''}${item.retried ? ' retried' : ''}${item.edits?.length ? ' edited' : ''}`);
   const open = button('', () => select(item.target), 'activity-open');
   open.title = `${item.title} · ${item.meta}`;
   open.append(element('span', stamp(row.at_ms), 'stamp'), element('span', item.title, 'activity-title'), element('span', item.meta, 'activity-meta'));
   const text = element('div', undefined, 'activity-text');
   text.append(open);
+  if (item.edits?.length) text.append(changeList(item.edits, 2));
   node.append(text);
   const picture = kept?.node.querySelector('.thumbnail');
   if (item.thumbnail) {
@@ -377,15 +400,51 @@ function feedRow(key, row, item, resources) {
   feedRows.set(key, { signature, node });
   return node;
 }
+// A client that stops waiting for a page and asks for it again makes one
+// page visit, not several: requests for one address that were waiting at
+// the same time, or that follow one the client gave up on, share a row.
+// The row shows the whole wait and how many times the page was asked for.
+function visits(rows, groups) {
+  const startOf = (row) => row.at_ms - (row.fact.elapsed_ms || 0);
+  const open = new Map(), shown = [];
+  for (const row of [...rows].sort((a, b) => startOf(a) - startOf(b))) {
+    const fact = row.fact;
+    if (!['request', 'abandoned'].includes(fact.kind)) { shown.push({ row, attempts: [row] }); continue; }
+    const key = `${fact.method} ${urlOf(fact)}`, visit = open.get(key);
+    if (visit && (visit.gaveUp || startOf(row) < visit.end)) {
+      visit.attempts.push(row);
+      visit.end = Math.max(visit.end, row.at_ms);
+      visit.gaveUp = fact.kind === 'abandoned';
+      continue;
+    }
+    const fresh = { attempts: [row], end: row.at_ms, gaveUp: fact.kind === 'abandoned' };
+    open.set(key, fresh);
+    shown.push(fresh);
+  }
+  return shown.map(({ attempts }) => {
+    const [row] = attempts;
+    if (attempts.length === 1) return { row, attempts, resources: groups.get(row) || [] };
+    // The row reads as the page's last answer, or the last time the client gave up.
+    const answered = attempts.filter((attempt) => attempt.fact.kind === 'request').at(-1) || attempts.at(-1);
+    const first = Math.min(...attempts.map(startOf)), last = Math.max(...attempts.map((attempt) => attempt.at_ms));
+    return { row: { ...answered, at_ms: last }, attempts, waited: last - first, resources: attempts.flatMap((attempt) => groups.get(attempt) || []) };
+  }).sort((a, b) => a.row.at_ms - b.row.at_ms);
+}
 function feed() {
   const groups = pageRequests();
   const rows = activityRows().filter((row) => ['request', 'abandoned', 'search', 'tool', 'no_route', 'resolved'].includes(row.fact.kind) && (row.fact.kind !== 'request' || groups.has(row)) && (row.fact.kind !== 'abandoned' || !isSubresource(row.fact)) && (row.fact.kind !== 'resolved' || !row.fact.address));
   const keep = new Set();
-  const nodes = rows.reverse().map((row) => {
-    const fact = row.fact;
-    const key = fact.kind === 'no_route' ? `no_route:${fact.from}:${fact.to}` : fact.kind === 'resolved' ? `resolved:${fact.name}` : `${fact.kind}:${row.at_ms}:${fact.host || ''}${fact.path || ''}${fact.query || ''}${fact.target || ''}`;
+  const nodes = visits(rows, groups).reverse().map(({ row, attempts, waited, resources }) => {
+    const fact = attempts[0].fact, started = attempts[0].at_ms;
+    const key = fact.kind === 'no_route' ? `no_route:${fact.from}:${fact.to}` : fact.kind === 'resolved' ? `resolved:${fact.name}` : `${fact.kind}:${started}:${fact.host || ''}${fact.path || ''}${fact.query || ''}${fact.target || ''}`;
     keep.add(key);
-    return feedRow(key, row, activityItem(row), groups.get(row) || []);
+    const item = activityItem(row);
+    if (attempts.length > 1) {
+      // Each earlier request was given up on: the client asked again.
+      item.meta = [item.meta.replace(/ · \d+ s$/, ''), `asked ${attempts.length} times`, `waited ${Math.round(waited / 1000)} s`].join(' · ');
+      item.retried = !item.failed;
+    }
+    return feedRow(key, row, item, resources);
   });
   for (const key of feedRows.keys()) if (!keep.has(key)) feedRows.delete(key);
   const list = $('activity');
@@ -448,6 +507,9 @@ function servedPage(url) {
 function egressRows(purpose) {
   return activityRows().filter((row) => row.fact.kind === 'egress' && row.fact.purpose === purpose && row.fact.phase !== 'attempt');
 }
+function editorCalls() {
+  return egressRows('editor');
+}
 let detailSignature = '';
 
 function details() {
@@ -471,6 +533,7 @@ function details() {
       content.append(summary);
       for (const tool of call.tools) {
         content.append(element('p', tool.tool === 'fetch' ? 'Fetch' : 'Web search', 'meta'), element('p', tool.target, 'tool-query'));
+        if (tool.edits?.length) content.append(changeList(tool.edits));
         if (tool.error) content.append(element('p', tool.error, 'world-answer'));
         else if (tool.tool === 'web_search') content.append(results(tool.results));
         else content.append(element('p', 'Answered by the world', 'world-answer'));
@@ -482,7 +545,8 @@ function details() {
     const hit = hitFor(url);
     const served = shown.activity.findLast((row) => row.fact.kind === 'request' && urlOf(row.fact) === url)?.fact.title;
     heading(served || hit?.title || 'Page', url);
-    body.append(element('p', request ? `${request.status >= 400 ? 'Failed' : 'Opened'} · ${request.status} · ${sourceName(request.source)}` : 'Not opened', 'page-state'));
+    body.append(element('p', request ? [request.status >= 400 ? 'Failed' : 'Opened', request.status, sourceName(request.source), changes(request.edits)].filter(Boolean).join(' · ') : 'Not opened', 'page-state'));
+    if (request?.edits.length) body.append(changeList(request.edits));
     if (request?.has_preview) {
       const container = element('div', undefined, 'reading-view');
       container.append(servedPage(request.url));
@@ -512,9 +576,9 @@ function details() {
       const row = element('div', undefined, 'detail-row'); row.append(element('span', stamp(request.at_ms), 'stamp'), content); body.append(row);
     }
     if (!site?.requests.length && !site?.searches.length) body.append(element('p', 'Not opened', 'detail-empty'));
-  } else if (selection === 'copies' || selection === 'originals') {
-    const purpose = selection === 'copies' ? 'live_capture' : 'original';
-    heading(selection === 'copies' ? 'Live sites' : 'Originals');
+  } else if (selection === 'copies' || selection === 'packages') {
+    const purpose = selection === 'copies' ? 'live_capture' : 'package';
+    heading(selection === 'copies' ? 'Page copies' : 'Packages');
     // Each page the host fetched, with the files it fetched for that page.
     const files = new Map();
     for (const row of egressRows(purpose)) if (row.fact.page) files.set(row.fact.page, [...(files.get(row.fact.page) || []), row]);
@@ -552,19 +616,27 @@ function details() {
     heading('Search');
     const searches = [...shown.sites.flatMap((site) => site.searches), ...shown.calls.flatMap((call) => call.tools.filter((tool) => tool.tool === 'web_search').map((tool) => ({ ...tool, query: tool.target })))].sort((a, b) => b.at_ms - a.at_ms);
     for (const search of searches) {
-      const content = element('div'); content.append(element('p', search.query, 'tool-query'), search.error ? element('p', search.error, 'world-answer') : results(search.results));
-      body.append(detailRow(search.at_ms, 'Search', quantity(search.results.length, 'result'), content));
+      const content = element('div'); content.append(element('p', search.query, 'tool-query'));
+      if (search.edits?.length) content.append(changeList(search.edits));
+      content.append(search.error ? element('p', search.error, 'world-answer') : results(search.results));
+      body.append(detailRow(search.at_ms, 'Search', [quantity(search.results.length, 'result'), changes(search.edits)].filter(Boolean).join(' · '), content));
     }
     if (!searches.length) body.append(element('p', 'No searches', 'detail-empty'));
-  } else if (selection === 'writer') {
-    heading('Page writer');
-    for (const row of egressRows('page writer')) body.append(detailRow(row.at_ms, row.fact.host, `${row.fact.method} ${row.fact.path} · ${row.fact.status || phaseName(row.fact.phase)}`));
-    for (const row of shown.activity.filter((row) => row.fact.kind === 'page_revision')) {
-      const fact = row.fact;
-      const target = fact.target.url || fact.target.host || fact.target.query || 'Cast';
-      body.append(detailRow(row.at_ms, target, 'Revising page', element('p', fact.reason, 'writer-error')));
+  } else if (selection === 'editor') {
+    heading('Editor', world?.scenario || '');
+    // Every real page and result list the scenario changed, newest first.
+    const edited = [
+      ...shown.sites.flatMap((site) => site.requests.filter((request) => request.edits.length).map((request) => ({ at_ms: request.at_ms, label: hitFor(request.url)?.title || request.url, meta: request.url, edits: request.edits, target: `page:${request.url}` }))),
+      ...shown.sites.flatMap((site) => site.searches.filter((search) => search.edits.length).map((search) => ({ at_ms: search.at_ms, label: `Results for “${search.query}”`, meta: '', edits: search.edits, target: 'search' }))),
+      ...shown.calls.flatMap((call) => call.tools.filter((tool) => tool.edits.length).map((tool) => ({ at_ms: tool.at_ms, label: `Results for “${tool.target}”`, meta: 'Search tool', edits: tool.edits, target: 'search' }))),
+    ].sort((a, b) => b.at_ms - a.at_ms);
+    for (const page of edited) {
+      const content = changeList(page.edits);
+      content.append(button('Open', () => select(page.target), 'more'));
+      body.append(detailRow(page.at_ms, page.label, page.meta, content));
     }
-    if (!body.childElementCount) body.append(element('p', 'No pages written', 'detail-empty'));
+    if (!edited.length) body.append(element('p', world?.scenario ? 'No pages changed yet' : 'No scenario', 'detail-empty'));
+    if (editorCalls().length) body.append(element('p', quantity(editorCalls().length, 'model call'), 'meta'));
   } else if (selection === 'sites') {
     heading('Sites');
     for (const site of localSites()) {
@@ -609,13 +681,14 @@ async function loadWorld() {
   if (date) hostOffset = date + 500 - Date.now();
   world = await response.json();
   $('world-date').textContent = world.date;
-  $('brief').textContent = world.instructions;
-  const active = world.source.kind === 'copy' ? 'copied' : world.source.kind === 'live' ? 'live' : 'model_written';
+  // The field keeps what is being typed; it shows the scenario in force otherwise.
+  if (document.activeElement !== $('scenario')) $('scenario').value = world.scenario || '';
+  $('scenario-form').hidden = world.edited.kind !== 'available';
   for (const control of $('source').querySelectorAll('button')) {
     const availability = world[control.dataset.source];
     control.disabled = availability.kind !== 'available';
-    control.setAttribute('aria-pressed', String(control.dataset.source === active));
-    control.title = { no_captures: 'No captures', no_page_writer: 'No page writer', no_search_key: 'No search key' }[availability.reason] || '';
+    control.setAttribute('aria-pressed', String(control.dataset.source === world.source));
+    control.title = { no_captures: 'No captures', no_search_key: 'No search key', no_model_key: 'No model key' }[availability.reason] || '';
   }
 }
 $('world-toggle').onclick = () => { $('world-menu').hidden = !$('world-menu').hidden; $('world-toggle').setAttribute('aria-expanded', String(!$('world-menu').hidden)); };
@@ -635,6 +708,15 @@ for (const control of $('source').querySelectorAll('button')) {
     catch (error) { notice(error.message); await loadWorld(); }
   };
 }
+async function setScenario(scenario) {
+  for (const control of $('scenario-form').querySelectorAll('button')) control.disabled = true;
+  try { await command({ command: 'set_scenario', scenario }); $('scenario').blur(); await loadWorld(); }
+  catch (error) { $('world-error').textContent = error.message; }
+  finally { for (const control of $('scenario-form').querySelectorAll('button')) control.disabled = false; }
+}
+$('scenario-form').onsubmit = (event) => { event.preventDefault(); setScenario($('scenario').value); };
+$('scenario').addEventListener('keydown', (event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); setScenario($('scenario').value); } });
+$('scenario-clear').onclick = () => { $('scenario').value = ''; setScenario(''); };
 $('restart').onclick = async () => { $('restart').disabled = true; try { await command({ command: 'restart' }); select(null); } catch (error) { $('world-error').textContent = error.message; } finally { $('restart').disabled = false; } };
 async function mountConsole() {
   if (!hostStatus) return;

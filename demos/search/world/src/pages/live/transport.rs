@@ -25,11 +25,8 @@ pub(in crate::pages) enum Ask<'a> {
         user_agent: Option<&'a http::HeaderValue>,
         page: Option<&'a url::Url>,
     },
-    /// Read the public original of a page the world writes.
-    Original,
-    /// Ask the search provider for the text it holds of an original that
-    /// cannot be read directly, with this key and body.
-    Contents(&'a Key, &'a Value),
+    /// Copy a package index or file the copied web lacks.
+    Package,
 }
 
 pub(in crate::pages) struct Transport {
@@ -107,13 +104,13 @@ impl Transport {
             attempt: cx.random_u64(),
             url: destination,
             method: match ask {
-                Ask::Search(..) | Ask::Contents(..) => http::Method::POST,
-                Ask::Copy { .. } | Ask::Original => http::Method::GET,
+                Ask::Search(..) => http::Method::POST,
+                Ask::Copy { .. } | Ask::Package => http::Method::GET,
             },
             purpose: match ask {
                 Ask::Search(..) => capture::Purpose::Search,
                 Ask::Copy { .. } => capture::Purpose::Capture,
-                Ask::Original | Ask::Contents(..) => capture::Purpose::Original,
+                Ask::Package => capture::Purpose::Package,
             },
             phase: UpstreamPhase::Attempt,
             status: None,
@@ -143,7 +140,7 @@ impl Transport {
         let work = async {
             let client = self.clients.client(&url).await?;
             let request = match ask {
-                Ask::Search(key, body) | Ask::Contents(key, body) => client
+                Ask::Search(key, body) => client
                     .post(url)
                     .header("x-api-key", key.value())
                     .header("content-type", "application/json")
@@ -158,7 +155,7 @@ impl Transport {
                 Ask::Copy {
                     user_agent: None, ..
                 }
-                | Ask::Original => client.get(url).header("accept-encoding", "identity"),
+                | Ask::Package => client.get(url).header("accept-encoding", "identity"),
             };
             let response = request.send().await;
             // The innermost cause is the real error: a name that does not

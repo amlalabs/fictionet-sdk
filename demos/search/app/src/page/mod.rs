@@ -15,7 +15,7 @@ use std::{
 use tokio::sync::{mpsc, watch};
 use web_world::{
     observation::{CallPhase, EgressPurpose, Fetch, Hit, Observation, PageSource, SearchObs, Tool},
-    pages::{NewPages, Pages},
+    pages::{Edit, Pages, Source},
 };
 
 fn wall_start() -> u64 {
@@ -48,6 +48,7 @@ pub struct Request {
     pub has_preview: bool,
     pub fetch: Fetch,
     pub referrer: Option<String>,
+    pub edits: Vec<Edit>,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct Search {
@@ -55,6 +56,7 @@ pub struct Search {
     pub engine: web_world::observation::Engine,
     pub query: String,
     pub results: Vec<Hit>,
+    pub edits: Vec<Edit>,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct Call {
@@ -73,6 +75,7 @@ pub struct ToolUse {
     pub tool: Tool,
     pub target: String,
     pub results: Vec<Hit>,
+    pub edits: Vec<Edit>,
     pub error: Option<String>,
 }
 #[derive(Clone, Debug, Serialize)]
@@ -195,6 +198,7 @@ impl Views {
                 referrer,
                 title: _,
                 error: _,
+                edits,
                 preview,
             } => {
                 let url = format!("{scheme}://{host}{path}");
@@ -230,12 +234,14 @@ impl Views {
                         has_preview: preview.is_some(),
                         fetch: *fetch,
                         referrer: referrer.clone(),
+                        edits: edits.clone(),
                     });
             }
             SearchObs::Search {
                 engine,
                 query,
                 results,
+                edits,
             } => {
                 let host = match engine {
                     web_world::observation::Engine::Google => "www.google.com",
@@ -250,6 +256,7 @@ impl Views {
                         engine: *engine,
                         query: query.clone(),
                         results: results.clone(),
+                        edits: edits.clone(),
                     });
             }
             SearchObs::ModelCall {
@@ -281,6 +288,7 @@ impl Views {
                 tool,
                 target,
                 results,
+                edits,
                 error,
             } => {
                 if let Some(row) = view.calls.iter_mut().find(|row| row.call == *call) {
@@ -289,6 +297,7 @@ impl Views {
                         tool: *tool,
                         target: target.clone(),
                         results: results.clone(),
+                        edits: edits.clone(),
                         error: error.clone(),
                     });
                 }
@@ -322,7 +331,6 @@ impl Views {
             SearchObs::Signin { .. } => view.signin = Some(observation.clone()),
             SearchObs::NoRoute { .. }
             | SearchObs::Abandoned { .. }
-            | SearchObs::PageRevision { .. }
             | SearchObs::RunStarted { .. } => {}
         }
         if let SearchObs::Request { preview, .. } = &mut observation.fact {
@@ -383,12 +391,13 @@ fn site<'a>(sites: &'a mut Vec<Site>, host: &str, at_ms: u64) -> &'a mut Site {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct WorldState {
-    pub source: PageSource,
+    pub source: Source,
     pub copied: Availability,
-    pub model_written: Availability,
     pub live: Availability,
+    pub edited: Availability,
     pub date: String,
-    pub instructions: String,
+    /// What Edited changes on real pages.
+    pub scenario: Option<String>,
     pub preview: bool,
 }
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -401,8 +410,8 @@ pub enum Availability {
 #[serde(rename_all = "snake_case")]
 pub enum UnavailableReason {
     NoCaptures,
-    NoPageWriter,
     NoSearchKey,
+    NoModelKey,
 }
 impl Availability {
     fn new(available: bool, reason: UnavailableReason) -> Self {
@@ -417,14 +426,8 @@ impl Availability {
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum Command {
     SetSource { source: Source },
+    SetScenario { scenario: String },
     Restart,
-}
-#[derive(Clone, Copy, Debug, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Source {
-    Copied,
-    ModelWritten,
-    Live,
 }
 
 type Control = (Command, tokio::sync::oneshot::Sender<Result<(), String>>);
@@ -446,6 +449,11 @@ pub struct Page {
     pages: std::sync::Weak<Pages>,
 }
 impl Page {
+    /// The world's settings as the page shows them, as they change.
+    pub fn world(&self) -> watch::Receiver<WorldState> {
+        self.world.subscribe()
+    }
+
     pub fn new(pages: Arc<Pages>, preview: bool) -> (Self, Receivers) {
         let views = Views::default();
         let (snapshots, _) = watch::channel(views.current());
@@ -541,14 +549,14 @@ impl Page {
         cx.spawn(move |cx| async move {
             while let Ok(Some((command, reply))) = cx.race(None, control.recv()).await {
                 let restart = matches!(command, Command::Restart);
-                let expected_revision = pages.generation().revision;
+                let expected_revision = pages.revision();
                 let command = match command {
-                    Command::SetSource { source } => web_world::pages::Command::SetNewPages {
-                        new_pages: match source {
-                            Source::Copied => NewPages::Copied,
-                            Source::ModelWritten => NewPages::ModelWritten,
-                            Source::Live => NewPages::LiveSearch,
-                        },
+                    Command::SetSource { source } => web_world::pages::Command::SetSource {
+                        source,
+                        expected_revision,
+                    },
+                    Command::SetScenario { scenario } => web_world::pages::Command::SetScenario {
+                        scenario,
                         expected_revision,
                     },
                     Command::Restart => web_world::pages::Command::Restart { expected_revision },
@@ -842,16 +850,16 @@ fn world_state(pages: &Pages, preview: bool) -> WorldState {
     WorldState {
         source: pages.source(),
         copied: Availability::new(pages.has_copied(), UnavailableReason::NoCaptures),
-        model_written: Availability::new(
-            matches!(
-                pages.generator_kind(),
-                web_world::pages::GeneratorKind::Model(_)
-            ),
-            UnavailableReason::NoPageWriter,
-        ),
         live: Availability::new(pages.live_available(), UnavailableReason::NoSearchKey),
-        date: pages.seed().date.clone(),
-        instructions: pages.seed().instructions.clone(),
+        edited: if !pages.live_available() {
+            Availability::Unavailable {
+                reason: UnavailableReason::NoSearchKey,
+            }
+        } else {
+            Availability::new(pages.edited_available(), UnavailableReason::NoModelKey)
+        },
+        date: pages.world_date(),
+        scenario: pages.scenario(),
         preview,
     }
 }

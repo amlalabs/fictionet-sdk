@@ -197,22 +197,21 @@ impl fictionet_extras::models::Engine for Tools {
         settings: fictionet_extras::models::tools::Domains,
     ) -> fictionet_extras::models::tools::Answer<Vec<fictionet_extras::search::Result>> {
         Box::pin(async move {
-            let result = self
-                .pages
-                .clone()
-                .search(cx.clone(), query.clone(), settings)
-                .await;
-            let hits = result
-                .as_ref()
-                .map(|hits| {
-                    hits.iter()
+            let result = self.pages.tool_search(&cx, &query, &settings).await;
+            let (hits, edits) = match &result {
+                Ok(found) => (
+                    found
+                        .results
+                        .iter()
                         .map(|hit| Hit {
                             url: hit.url.clone(),
                             title: hit.title.clone(),
                         })
-                        .collect()
-                })
-                .unwrap_or_default();
+                        .collect(),
+                    found.edits.clone(),
+                ),
+                Err(_) => (Vec::new(), Vec::new()),
+            };
             self.pages.report(
                 &cx,
                 SearchObs::Tool {
@@ -220,6 +219,7 @@ impl fictionet_extras::models::Engine for Tools {
                     tool: Tool::WebSearch,
                     target: query,
                     results: hits,
+                    edits,
                     error: result
                         .as_ref()
                         .err()
@@ -227,6 +227,8 @@ impl fictionet_extras::models::Engine for Tools {
                 },
             );
             result
+                .map(|found| found.results)
+                .map_err(|_| fictionet::Error::msg("Search is unavailable"))
         })
     }
     fn fetch(
@@ -243,6 +245,7 @@ impl fictionet_extras::models::Engine for Tools {
                     tool: Tool::Fetch,
                     target: url,
                     results: Vec::new(),
+                    edits: Vec::new(),
                     error: result.as_ref().err().map(|_| "Page is unavailable".into()),
                 },
             );
