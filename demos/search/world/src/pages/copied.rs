@@ -336,16 +336,17 @@ impl Pages {
         seeds: &[String],
         model: Option<Model>,
         cache_index: bool,
-        reference: Option<reference::ReferenceWeb>,
+        mut reference: Option<reference::ReferenceWeb>,
     ) -> Result<Self, String> {
         let started = Instant::now();
         let research_root = Archive::directory_root(root).map_err(|e| e.to_string())?;
         eprintln!("Loading copied pages…");
         let files = match &reference {
-            Some(reference) => reference.files_for(&research_root),
+            Some(_) => Vec::new(),
             None => archive_files(&research_root).map_err(|e| e.to_string())?,
         };
-        let cache_path = cache_index.then(|| research_root.join("search-index.json"));
+        let cache_path =
+            (cache_index && reference.is_none()).then(|| research_root.join("search-index.json"));
         let cached = cache_path
             .as_ref()
             .and_then(|path| std::fs::File::open(path).ok())
@@ -357,14 +358,22 @@ impl Pages {
                     && cache.files == files
                     && cache.seeds == seeds
             });
-        let (archive, missing, index) = match cached {
-            Some(cache) => (cache.archive, cache.missing, Some(cache.index)),
-            None => (
-                Archive::open(files.iter().map(|file| file.path.clone()))
-                    .map_err(|e| e.to_string())?,
-                missing_pages(&research_root).map_err(|e| e.to_string())?,
+        let (archive, missing, index) = if let Some(reference) = &mut reference {
+            (
+                std::mem::take(&mut reference.research),
+                std::mem::take(&mut reference.missing),
                 None,
-            ),
+            )
+        } else {
+            match cached {
+                Some(cache) => (cache.archive, cache.missing, Some(cache.index)),
+                None => (
+                    Archive::open(files.iter().map(|file| file.path.clone()))
+                        .map_err(|e| e.to_string())?,
+                    missing_pages(&research_root).map_err(|e| e.to_string())?,
+                    None,
+                ),
+            }
         };
         if !seeds.iter().any(|url| archive.contains(url)) {
             return Err("the copied corpus has none of its starting URLs".into());

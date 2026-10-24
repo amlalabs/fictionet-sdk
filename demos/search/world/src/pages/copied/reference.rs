@@ -14,7 +14,8 @@ pub(super) struct ReferenceWeb {
     wikipedia: Zim,
     documents: Archive,
     hosts: HashSet<String>,
-    files: Vec<ArchiveFile>,
+    pub(super) research: Archive,
+    pub(super) missing: Archive,
 }
 
 fn wiki_file(root: &Path) -> std::path::PathBuf {
@@ -27,6 +28,8 @@ struct Prepared {
     documents_version: u32,
     files: Vec<ArchiveFile>,
     documents: Archive,
+    research: Archive,
+    missing: Archive,
 }
 
 fn sources(root: &Path, research: &Path) -> io::Result<Vec<ArchiveFile>> {
@@ -88,16 +91,9 @@ impl ReferenceWeb {
             wikipedia,
             documents,
             hosts,
-            files: prepared.files,
+            research: prepared.research,
+            missing: prepared.missing,
         })
-    }
-
-    pub fn files_for(&self, directory: &Path) -> Vec<ArchiveFile> {
-        self.files
-            .iter()
-            .filter(|file| file.path.parent() == Some(directory))
-            .cloned()
-            .collect()
     }
 
     pub fn serves(&self, host: &str) -> bool {
@@ -199,8 +195,20 @@ impl Pages {
         let research = downloads.join(&corpus.directory);
         let root = downloads.join(corpus.reference.take().ok_or("seed has no reference web")?);
         let source = sources(&root, &research).map_err(|e| e.to_string())?;
-        let pages = Self::from_corpus(seed, downloads, None)?;
-        let captured = pages.copied.as_ref().unwrap();
+        let research_root = Archive::directory_root(&research).map_err(|e| e.to_string())?;
+        let captured = Corpus {
+            archive: Archive::open(
+                source
+                    .iter()
+                    .filter(|file| file.path.parent() == Some(research_root.as_path()))
+                    .map(|file| file.path.clone()),
+            )
+            .map_err(|e| e.to_string())?,
+            missing: missing_pages(&research_root).map_err(|e| e.to_string())?,
+            search: CorpusSearch::Crawled(Index::default()),
+            hosts: HashSet::new(),
+            packages: None,
+        };
         let wikipedia = Zim::new(wiki_file(&root)).map_err(|e| e.to_string())?;
         let parent = root.join("index");
         std::fs::create_dir_all(&parent).map_err(|e| e.to_string())?;
@@ -239,7 +247,7 @@ impl Pages {
                 })
                 .sum::<io::Result<u64>>()
                 .map_err(|e| e.to_string())?;
-            if available_space(&root).map_err(|e| e.to_string())? < size + 68 * 1024 * 1024 * 1024 {
+            if available_space(&root).map_err(|e| e.to_string())? < size + 60 * 1024 * 1024 * 1024 {
                 return Err("index refresh must leave at least 60 GiB free".into());
             }
             std::fs::create_dir_all(&staged).map_err(|e| e.to_string())?;
@@ -267,9 +275,16 @@ impl Pages {
         } else {
             DiskWriter::create(&staged).map_err(|e| e.to_string())?
         };
-        let CorpusSearch::Crawled(index) = &captured.search else {
-            return Err("research pages must be loaded before reference indexing".into());
-        };
+        let index = Index::crawl(
+            &captured
+                .archive
+                .urls()
+                .map(str::to_owned)
+                .collect::<Vec<_>>(),
+            |url| captured.archive.contains(url),
+            |url| captured.response(url),
+        )
+        .map_err(|e| e.to_string())?;
         index.write_to(&writer).map_err(|e| e.to_string())?;
         if reusable.is_none() {
             eprintln!("Preparing Wikipedia articles…");
@@ -299,9 +314,8 @@ impl Pages {
             pool.install(|| {
                 entries.par_chunk_by(|a, b| a.0 == b.0).try_for_each(
                     |group| -> Result<(), String> {
-                        // Leave room for in-flight segment writes and merges above the reserve.
                         if available_space(&root).map_err(|e| e.to_string())?
-                            < 68 * 1024 * 1024 * 1024
+                            < 60 * 1024 * 1024 * 1024
                         {
                             return Err("index preparation must leave at least 60 GiB free".into());
                         }
@@ -334,15 +348,19 @@ impl Pages {
             drop(entries);
             drop(wikipedia);
         }
-        let files = sources(&root, &research).map_err(|e| e.to_string())?;
-        if files != source {
-            return Err(
-                "Captured archives changed during indexing; prepare the index again".into(),
-            );
+        for file in &source {
+            let metadata = file.path.metadata().map_err(|e| e.to_string())?;
+            if metadata.len() != file.bytes
+                || metadata.modified().map_err(|e| e.to_string())? != file.modified
+            {
+                return Err(
+                    "Captured archive changed during indexing; prepare the index again".into(),
+                );
+            }
         }
         let document_root = std::fs::canonicalize(&root).map_err(|e| e.to_string())?;
         let documents = Archive::open(
-            files
+            source
                 .iter()
                 .filter(|file| {
                     file.path.parent() == Some(document_root.as_path())
@@ -363,8 +381,10 @@ impl Pages {
             .map_err(|e| e.to_string())?;
         let prepared = Prepared {
             documents_version: INDEX_VERSION,
-            files,
+            files: source,
             documents,
+            research: captured.archive,
+            missing: captured.missing,
         };
         writer
             .finish(&serde_json::to_string(&prepared).map_err(|e| e.to_string())?)

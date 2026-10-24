@@ -5,11 +5,12 @@ use std::{io, path::Path};
 use tantivy::{
     Index, IndexReader, IndexWriter, TantivyDocument, Term,
     collector::{Count, TopDocs},
-    query::{BooleanQuery, BoostQuery, ConstScoreQuery, Occur, Query, RegexQuery, TermQuery},
+    query::{BooleanQuery, ConstScoreQuery, Occur, Query, RegexQuery, TermQuery},
     schema::{
         Field, IndexRecordOption, STORED, STRING, Schema, TextFieldIndexing, TextOptions, Value,
     },
     snippet::SnippetGenerator,
+    tokenizer::{Language, LowerCaser, SimpleTokenizer, Stemmer, TextAnalyzer},
 };
 
 #[derive(Clone, Copy)]
@@ -23,13 +24,23 @@ fn schema() -> (Schema, Fields) {
     let mut schema = Schema::builder();
     let text = TextOptions::default().set_indexing_options(
         TextFieldIndexing::default()
-            .set_tokenizer("default")
+            .set_tokenizer("english")
             .set_index_option(IndexRecordOption::WithFreqs),
     );
     let url = schema.add_text_field("url", STRING | STORED);
-    let title = schema.add_text_field("title", text.clone().set_stored());
+    let title = schema.add_text_field("title", STORED);
     let body = schema.add_text_field("body", text);
     (schema.build(), Fields { url, title, body })
+}
+
+fn analyzer(index: &Index) {
+    index.tokenizers().register(
+        "english",
+        TextAnalyzer::builder(SimpleTokenizer::default())
+            .filter(LowerCaser)
+            .filter(Stemmer::new(Language::English))
+            .build(),
+    );
 }
 
 /// A read-only memory-mapped search index. Opening it never crawls pages.
@@ -47,6 +58,7 @@ impl DiskIndex {
         if index.schema() != schema {
             return Err(io::Error::other("search index needs rebuilding"));
         }
+        analyzer(&index);
         let reader = index.reader().map_err(io::Error::other)?;
         Ok(Self {
             index,
@@ -106,16 +118,11 @@ impl DiskIndex {
         }
         let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
         for word in words {
-            for (field, boost) in [(self.fields.title, 2.0), (self.fields.body, 1.0)] {
-                let term = TermQuery::new(
-                    Term::from_field_text(field, &word),
-                    IndexRecordOption::WithFreqs,
-                );
-                clauses.push((
-                    Occur::Should,
-                    Box::new(BoostQuery::new(Box::new(term), boost)),
-                ));
-            }
+            let term = TermQuery::new(
+                Term::from_field_text(self.fields.body, &word),
+                IndexRecordOption::WithFreqs,
+            );
+            clauses.push((Occur::Should, Box::new(term)));
         }
         let mut clauses: Vec<(Occur, Box<dyn Query>)> =
             vec![(Occur::Must, Box::new(BooleanQuery::new(clauses)))];
@@ -200,6 +207,7 @@ impl DiskWriter {
     /// Update a private copy of a published index.
     pub fn open(path: &Path) -> io::Result<Self> {
         let index = Index::open_in_dir(path).map_err(io::Error::other)?;
+        analyzer(&index);
         let (_, fields) = schema();
         let threads = std::thread::available_parallelism()?.get().div_ceil(2);
         let writer = index
@@ -219,6 +227,7 @@ impl DiskWriter {
         std::fs::create_dir_all(path)?;
         let (schema, fields) = schema();
         let mut index = Index::create_in_dir(path, schema).map_err(io::Error::other)?;
+        analyzer(&index);
         index.settings_mut().docstore_compression =
             tantivy::store::Compressor::Zstd(Default::default());
         let threads = std::thread::available_parallelism()?.get().div_ceil(2);
@@ -231,7 +240,8 @@ impl DiskWriter {
     pub fn add(&self, url: &str, title: &str, body: &str) -> io::Result<()> {
         self.writer
             .add_document(tantivy::doc!(self.fields.url => url,
-            self.fields.title => title, self.fields.body => body))
+            self.fields.title => title,
+            self.fields.body => title, self.fields.body => title, self.fields.body => body))
             .map_err(io::Error::other)?;
         Ok(())
     }

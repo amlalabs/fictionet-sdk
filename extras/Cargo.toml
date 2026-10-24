@@ -42,7 +42,7 @@ time = "0.3"
 tower-service = "0.3"
 url = "2"
 zstd = "0.14"
-tantivy = { version = "0.27", default-features = false, features = ["mmap", "lz4-compression", "zstd-compression"] }
+tantivy = { version = "0.27", default-features = false, features = ["mmap", "lz4-compression", "zstd-compression", "stemmer"] }
 
 [dev-dependencies]
 axum = { version = "0.8", default-features = false, features = ["json", "http1", "tokio"] }
