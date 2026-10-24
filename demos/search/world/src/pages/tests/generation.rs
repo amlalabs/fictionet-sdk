@@ -825,3 +825,17 @@ fn search_publication_dates_constrain_both_ends_of_a_citation() {
         today
     );
 }
+
+#[test]
+fn the_headline_obeys_the_document_dateline() {
+    let page = make::Page {
+        title: "Investigation results on 14 October 2026".into(),
+        date: "2026-10-07".into(),
+        body: "<p>The investigation continues.</p>".into(),
+        content_type: "text/html".into(),
+        ..Default::default()
+    };
+    assert!(
+        crate::pages::answers::chronology(&page, seed::parse_date("2026-10-21").unwrap()).is_err()
+    );
+}

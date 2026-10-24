@@ -381,7 +381,8 @@ pub(super) fn chronology(page: &Page, latest: time::Date) -> Result<(), Unreadab
         page.body.clone()
     };
     if let Some(date) = dates(&format!(
-        "{} {} {}",
+        "{} {} {} {}",
+        page.title,
         page.description,
         prose,
         page.claims.join(" ")

@@ -586,6 +586,7 @@ impl Pages {
                 target,
                 &make::Page {
                     date: record.date.clone(),
+                    title: record.title.clone(),
                     body: page.body.clone(),
                     content_type: record.content_type.clone(),
                     description: record.description.clone(),
