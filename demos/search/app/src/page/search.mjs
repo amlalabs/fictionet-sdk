@@ -21,6 +21,7 @@ const stamp = (ms) => new Date((shown.started_at_ms || Date.now()) + ms).toLocal
 const size = (bytes) => bytes < 1000 ? `${bytes} B` : `${Math.round(bytes / 1000)} KB`;
 const quantity = (n, word, plural = `${word}s`) => `${n} ${n === 1 ? word : plural}`;
 const sourceName = (source) => source.kind === 'copy' ? source.captured ? `Copied ${source.captured.slice(0, 10)}` : 'Copied' : source.kind === 'live' ? 'Live' : 'Model-written';
+const hostName = (name) => name.replace(/\.$/, '');
 const hostOf = (url) => { try { return new URL(url).host; } catch { return url; } };
 const originOf = (url) => { try { return new URL(url).origin; } catch { return null; } };
 const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
@@ -42,15 +43,17 @@ function select(key) {
   selection = key;
   $('details').hidden = !key;
   document.body.classList.toggle('details-open', !!key);
-  if (key) { $('agent').hidden = false; $('agent-toggle').setAttribute('aria-pressed', 'true'); $('agent-toggle').textContent = 'Hide agent'; }
+  if (key) showAgent(true);
   draw();
 }
 $('close-details').onclick = () => select(null);
-$('agent-toggle').onclick = () => {
-  $('agent').hidden = !$('agent').hidden;
-  $('agent-toggle').setAttribute('aria-pressed', String(!$('agent').hidden));
-  $('agent-toggle').textContent = $('agent').hidden ? 'Show agent' : 'Hide agent';
-};
+function showAgent(shown) {
+  $('agent').hidden = !shown;
+  document.body.classList.toggle('agent-hidden', !shown);
+  $('agent-toggle').setAttribute('aria-pressed', String(shown));
+  $('agent-toggle').textContent = shown ? 'Hide agent' : 'Show agent';
+}
+$('agent-toggle').onclick = () => showAgent($('agent').hidden);
 const UPSTREAM = ['model', 'account', 'page writer', 'original'];
 function localSites() {
   const upstream = new Set([...shown.connections.filter((row) => UPSTREAM.includes(row.purpose)).map((row) => row.host), ...shown.calls.map((call) => call.host)]);
@@ -60,7 +63,8 @@ const purposeName = (purpose) => ({ model: 'Model', 'page writer': 'Page writer'
 const phaseName = (phase) => ({ connecting: 'Connecting', receiving: 'Receiving', streaming: 'Streaming', complete: 'Complete', interrupted: 'Interrupted', attempt: 'Connecting', response: 'Received', failed: 'Failed' })[phase];
 
 // The network map is built once; each state only changes its text, its
-// destinations and, when the layout moves, its wires.
+// destinations and, when the layout moves, its wires. Each internet host
+// appears once, with a wire from every service that reached it.
 const SERVICES = [
   { id: 'dns', title: 'DNS' },
   { id: 'search', title: 'Search', purposes: ['live_search'] },
@@ -70,7 +74,7 @@ const SERVICES = [
   { id: 'signin', title: 'Sign-in', purposes: ['account'] },
   { id: 'router', title: 'Router' },
 ];
-const map = { lanes: null, wires: null, pulses: null, vm: null, services: new Map(), signature: '' };
+const map = { lanes: null, wires: null, pulses: null, vm: null, internet: null, services: new Map(), signature: '', destinations: '' };
 function buildMap() {
   const root = $('map');
   const lanes = element('div', undefined, 'traffic-lanes');
@@ -82,22 +86,23 @@ function buildMap() {
   map.pulses = svgNode('svg', { class: 'traffic-pulses', 'aria-hidden': 'true' });
   map.vm = button('', () => select('workstation'), 'vm-node');
   map.vm.append(element('strong', 'Workstation'), element('small', '10.0.0.2'));
-  lanes.append(world, internet, map.wires, map.vm);
+  const services = element('div', undefined, 'services');
+  map.internet = element('div', undefined, 'destinations');
+  lanes.append(world, internet, map.wires, map.vm, services, map.internet);
   for (const service of SERVICES) {
-    const lane = element('div', undefined, 'traffic-lane');
     const control = button('', () => select(service.id), 'service unused');
     control.dataset.service = service.id;
     const title = element('strong', service.title), detail = element('small', '');
     control.append(title, detail);
-    const destinations = element('div', undefined, 'destinations');
-    lane.append(control, destinations);
-    lanes.append(lane);
-    map.services.set(service.id, { ...service, control, detail, destinations, signature: '' });
+    services.append(control);
+    map.services.set(service.id, { ...service, control, detail });
   }
   lanes.append(map.pulses);
   root.replaceChildren(lanes);
   map.lanes = lanes;
 }
+// Host fetches for a page's own files belong to that page.
+const pageFetches = (purpose) => shown.egress.filter((row) => row.fact.purpose === purpose && row.fact.phase !== 'attempt' && !row.fact.page);
 function graph() {
   if (!map.lanes) buildMap();
   map.vm.querySelector('small').textContent = hostStatus?.addresses[0] || '10.0.0.2';
@@ -105,62 +110,75 @@ function graph() {
   const sites = localSites();
   const facts = shown.activity.map((row) => row.fact);
   const searches = shown.sites.flatMap((site) => site.searches).length + shown.calls.flatMap((call) => call.tools.filter((tool) => tool.tool === 'web_search')).length;
+  const written = egressRows('page writer').length;
   const refusedTo = facts.filter((fact) => fact.kind === 'no_route').at(-1)?.to;
   const state = {
     dns: { detail: '10.0.0.1', reached: facts.some((fact) => fact.kind === 'resolved') },
     search: { detail: searches ? quantity(searches, 'search', 'searches') : '', reached: searches > 0 },
     sites: { detail: sites.length ? quantity(sites.length, 'site') : '', reached: sites.some((site) => site.requests.length) },
     calls: { detail: shown.calls.length ? quantity(shown.calls.length, 'call') : '', reached: shown.calls.length > 0 },
-    writer: { detail: '', reached: false },
+    writer: { detail: written ? quantity(written, 'call') : '', reached: written > 0 },
     signin: { detail: shown.signin?.fact.open ? 'Open' : 'Closed', reached: false },
     router: { detail: refusedTo ? `No route to ${refusedTo}` : '', reached: !!refusedTo, refused: !!refusedTo },
   };
   for (const service of map.services.values()) {
     const { detail, reached, refused } = state[service.id];
     const purposes = service.purposes || [];
-    const connections = shown.connections.filter((row) => purposes.includes(row.purpose));
-    const used = reached || connections.length > 0;
+    const used = reached || shown.connections.some((row) => purposes.includes(row.purpose));
     service.control.className = `service ${used ? 'used' : 'unused'}${refused ? ' refused' : ''}`;
     service.control.dataset.reached = String(reached);
     service.control.setAttribute('aria-pressed', String(selection === service.id));
     if (service.detail.textContent !== detail) service.detail.textContent = detail;
-    const destinations = destinationsOf(service, connections);
-    const signature = JSON.stringify(destinations.map(({ key, title, meta }) => [key, title, meta, selection]));
-    if (signature !== service.signature) {
-      service.signature = signature;
-      service.destinations.replaceChildren(...destinations.map(({ key, title, meta, target, host }) => {
-        const node = button('', () => select(target), host ? 'destination host' : 'destination');
-        node.dataset.edge = key;
-        node.setAttribute('aria-pressed', String(selection === target));
-        node.append(element('strong', title));
-        if (meta) node.append(element('small', meta));
-        return node;
-      }));
-    }
   }
-  const layout = JSON.stringify([...map.services.values()].map((service) => [service.control.dataset.reached, service.signature.length, service.destinations.childElementCount]).concat([map.lanes.clientWidth, map.lanes.clientHeight]));
+  const destinations = destinationsOf();
+  const signature = JSON.stringify(destinations.map(({ key, title, meta, from }) => [key, title, meta, from, selection]));
+  if (signature !== map.destinations) {
+    map.destinations = signature;
+    map.internet.replaceChildren(...destinations.map(({ key, title, meta, target, from }) => {
+      const node = button('', () => select(target), 'destination');
+      node.dataset.key = key;
+      node.dataset.from = from.join(' ');
+      node.setAttribute('aria-pressed', String(selection === target));
+      node.append(element('strong', title));
+      if (meta) node.append(element('small', meta));
+      return node;
+    }));
+  }
+  const layout = layoutSignature();
   if (layout !== map.signature) drawWires();
 }
-function destinationsOf(service, connections) {
-  const rows = [];
-  for (const purpose of service.purposes || []) {
-    const hosts = [...new Set(connections.filter((row) => row.purpose === purpose).map((row) => row.host))];
-    if (!hosts.length) continue;
-    if (purpose === 'live_capture' || purpose === 'original') {
-      const requests = shown.egress.filter((row) => row.fact.purpose === purpose && row.fact.phase !== 'attempt');
-      const target = purpose === 'original' ? 'originals' : 'copies';
-      rows.push({ key: `${service.id}>${target}`, target, host: false, title: purpose === 'original' ? 'Originals' : 'Page copies', meta: `${quantity(requests.length, 'request')} · ${quantity(hosts.length, 'host')}` });
-    } else {
-      for (const host of hosts) rows.push({ key: `${service.id}>${host}`, target: `egress:${host}`, host: true, title: host, meta: '' });
+function layoutSignature() {
+  return JSON.stringify([...map.services.values()].map((service) => service.control.dataset.reached).concat([map.destinations, map.lanes.clientWidth, map.lanes.clientHeight]));
+}
+// One row per internet destination, in service order: a host the world
+// reached for a service, or the pages it read for Live and for the page writer.
+function destinationsOf() {
+  const rows = new Map();
+  for (const service of map.services.values()) {
+    for (const purpose of service.purposes || []) {
+      const hosts = [...new Set(shown.connections.filter((row) => row.purpose === purpose).map((row) => row.host))];
+      if (!hosts.length) continue;
+      if (purpose === 'live_capture' || purpose === 'original') {
+        const fetches = pageFetches(purpose);
+        const target = purpose === 'original' ? 'originals' : 'copies';
+        const fetched = new Set(fetches.map((row) => row.fact.host));
+        rows.set(target, { key: target, target, title: purpose === 'original' ? 'Originals' : 'Live sites', meta: purpose === 'original' ? quantity(fetches.length, 'request') : `${quantity(fetches.length, 'page')} · ${quantity(fetched.size, 'host')}`, from: [service.id] });
+      } else {
+        for (const host of hosts) {
+          const row = rows.get(host) || { key: host, target: `egress:${host}`, title: host, meta: '', from: [] };
+          if (!row.from.includes(service.id)) row.from.push(service.id);
+          rows.set(host, row);
+        }
+      }
     }
   }
-  return rows;
+  return [...rows.values()];
 }
 // Every wire is one path from its start to its end, so a pulse can travel it.
 function drawWires() {
   const lanes = map.lanes;
   if (!lanes?.clientWidth) return;
-  map.signature = JSON.stringify([...map.services.values()].map((service) => [service.control.dataset.reached, service.signature.length, service.destinations.childElementCount]).concat([lanes.clientWidth, lanes.clientHeight]));
+  map.signature = layoutSignature();
   for (const svg of [map.wires, map.pulses]) { svg.setAttribute('width', lanes.clientWidth); svg.setAttribute('height', lanes.clientHeight); }
   map.wires.replaceChildren();
   const origin = lanes.getBoundingClientRect();
@@ -182,14 +200,19 @@ function drawWires() {
     wire(`vm>${service.id}`, route(vm, end, vm.x + (end.x - vm.x) / 2), refused);
     map.wires.append(svgNode('circle', { cx: end.x, cy: end.y, r: 2.5, class: refused ? 'refused' : '' }));
   }
-  for (const service of map.services.values()) {
-    const destinations = [...service.destinations.children];
-    if (!destinations.length) continue;
-    const start = point(service.control, 'right');
-    for (const node of destinations) {
-      const end = point(node, 'left');
-      wire(node.dataset.edge, route(start, { x: end.x - 6, y: end.y }, start.x + (end.x - start.x) / 2));
+  const starts = new Set();
+  for (const node of map.internet.children) {
+    const end = point(node, 'left');
+    for (const id of node.dataset.from.split(' ')) {
+      const service = map.services.get(id);
+      if (!service) continue;
+      const start = point(service.control, 'right');
+      starts.add(service);
+      wire(`${id}>${node.dataset.key}`, route(start, { x: end.x - 6, y: end.y }, start.x + (end.x - start.x) / 2));
     }
+  }
+  for (const service of starts) {
+    const start = point(service.control, 'right');
     map.wires.append(svgNode('circle', { cx: start.x, cy: start.y, r: 2.5 }));
   }
 }
@@ -242,10 +265,10 @@ function pulses() {
       case 'model_call': pulse('vm>calls', `calls>${fact.host}`); break;
       case 'egress':
         if (fact.phase !== 'attempt') break;
-        if (fact.purpose === 'page writer') pulse(`writer>${fact.host}`);
+        if (fact.purpose === 'page writer') pulse('vm>writer', `writer>${fact.host}`);
         else if (fact.purpose === 'original') pulse('writer>originals');
         else if (fact.purpose === 'live_search') pulse(`search>${fact.host}`);
-        else if (fact.purpose === 'live_capture') pulse('sites>copies');
+        else if (fact.purpose === 'live_capture' && !fact.page) pulse('sites>copies');
         else if (fact.purpose === 'account') pulse(`signin>${fact.host}`);
         break;
     }
@@ -265,7 +288,9 @@ function pageRequests() {
   for (const row of shown.activity) {
     const fact = row.fact;
     if (fact.kind !== 'request') continue;
-    if (!isSubresource(fact) || !pages.length) { pages.push(row); groups.set(row, []); continue; }
+    if (!isSubresource(fact)) { pages.push(row); groups.set(row, []); continue; }
+    // A file no page in the feed asked for stays with its site.
+    if (!pages.length) continue;
     const referrer = fact.referrer, origin = referrer && originOf(referrer);
     const parent = [...pages].reverse().find((page) => referrer && urlOf(page.fact) === referrer)
       || [...pages].reverse().find((page) => origin && originOf(urlOf(page.fact)) === origin)
@@ -284,6 +309,11 @@ function activityItem(row) {
   switch (fact.kind) {
     case 'request': {
       const url = urlOf(fact), hit = hitFor(url);
+      const where = `${fact.host}${briefPath(fact.path) === '/' ? '' : briefPath(fact.path)}`;
+      if (fact.status >= 400) {
+        const outcome = [404, 410].includes(fact.status) ? 'not found' : [502, 503, 504].includes(fact.status) ? 'unreachable' : 'failed';
+        return { title: `${outcome === 'unreachable' ? fact.host : where} ${outcome}`, meta: `${fact.status} · ${sourceName(fact.source)}`, target: `site:${fact.host}`, failed: true };
+      }
       const document = /(?:text\/html|application\/pdf)/.test(fact.content_type);
       const thumbnail = document && fact.status < 400 && /text\/html/.test(fact.content_type) ? url : null;
       return { title: `${fact.status >= 400 ? 'Requested' : 'Opened'} ${fact.title || hit?.title || fact.host}`, meta: `${fact.host}${briefPath(fact.path) === '/' ? '' : briefPath(fact.path)} · ${fact.status} · ${sourceName(fact.source)}`, target: document ? `page:${url}` : `site:${fact.host}`, thumbnail };
@@ -291,6 +321,7 @@ function activityItem(row) {
     case 'search': return { title: `Searched “${fact.query}”`, meta: fact.results.length ? `${quantity(fact.results.length, 'result')} · ${hitHosts(fact.results)}` : 'No results', target: 'search' };
     case 'tool': return { title: `${fact.tool === 'fetch' ? 'Fetched' : 'Searched'} ${fact.tool === 'fetch' ? fact.target : `“${fact.target}”`}`, meta: fact.error || (fact.tool === 'fetch' ? 'Answered by the world' : fact.results.length ? `${quantity(fact.results.length, 'result')} · ${hitHosts(fact.results)}` : 'No results'), target: 'calls' };
     case 'no_route': return { title: `Tried ${fact.to}`, meta: 'No route', target: 'router' };
+    case 'resolved': return { title: `${hostName(fact.name)} not found`, meta: 'No address', target: 'dns', failed: true };
   }
 }
 // Feed rows are keyed and kept, so a page's picture loads once.
@@ -299,7 +330,7 @@ function feedRow(key, row, item, resources) {
   const signature = JSON.stringify([item, row.at_ms, resources.length]);
   const kept = feedRows.get(key);
   if (kept?.signature === signature) return kept.node;
-  const node = element('div', undefined, `activity-row ${row.fact.kind}`);
+  const node = element('div', undefined, `activity-row ${row.fact.kind}${item.failed ? ' failed' : ''}`);
   const open = button('', () => select(item.target), 'activity-open');
   open.title = `${item.title} · ${item.meta}`;
   open.append(element('span', stamp(row.at_ms), 'stamp'), element('span', item.title, 'activity-title'), element('span', item.meta, 'activity-meta'));
@@ -340,11 +371,11 @@ function feedRow(key, row, item, resources) {
 }
 function feed() {
   const groups = pageRequests();
-  const rows = activityRows().filter((row) => ['request', 'search', 'tool', 'no_route'].includes(row.fact.kind) && (row.fact.kind !== 'request' || groups.has(row)));
+  const rows = activityRows().filter((row) => ['request', 'search', 'tool', 'no_route', 'resolved'].includes(row.fact.kind) && (row.fact.kind !== 'request' || groups.has(row)) && (row.fact.kind !== 'resolved' || !row.fact.address));
   const keep = new Set();
   const nodes = rows.reverse().map((row) => {
     const fact = row.fact;
-    const key = fact.kind === 'no_route' ? `no_route:${fact.from}:${fact.to}` : `${fact.kind}:${row.at_ms}:${fact.host || ''}${fact.path || ''}${fact.query || ''}${fact.target || ''}`;
+    const key = fact.kind === 'no_route' ? `no_route:${fact.from}:${fact.to}` : fact.kind === 'resolved' ? `resolved:${fact.name}` : `${fact.kind}:${row.at_ms}:${fact.host || ''}${fact.path || ''}${fact.query || ''}${fact.target || ''}`;
     keep.add(key);
     return feedRow(key, row, activityItem(row), groups.get(row) || []);
   });
@@ -358,13 +389,12 @@ function feed() {
   nodes.forEach((node, index) => { if (list.children[index] !== node) list.insertBefore(node, list.children[index] || null); });
   while (list.children.length > nodes.length) list.lastChild.remove();
 }
+// Repeated refusals and failed lookups of one name show once, at the latest.
 function activityRows() {
-  const attempts = new Map();
-  for (const row of shown.activity) if (row.fact.kind === 'no_route') attempts.set(`${row.fact.from}:${row.fact.to}`, row);
-  return shown.activity.filter((row) => {
-    if (row.fact.kind !== 'no_route') return true;
-    return attempts.get(`${row.fact.from}:${row.fact.to}`) === row;
-  });
+  const keyOf = (fact) => fact.kind === 'no_route' ? `no_route:${fact.from}:${fact.to}` : fact.kind === 'resolved' && !fact.address ? `resolved:${fact.name}` : null;
+  const latest = new Map();
+  for (const row of shown.activity) { const key = keyOf(row.fact); if (key) latest.set(key, row); }
+  return shown.activity.filter((row) => { const key = keyOf(row.fact); return !key || latest.get(key) === row; });
 }
 function detailRow(at, label, meta, content) {
   const row = element('div', undefined, 'detail-row');
@@ -397,29 +427,15 @@ function results(hits) {
   }
   return list;
 }
-async function readPage(url, container) {
-  const target = new URL(url);
-  const query = new URLSearchParams({ scheme: target.protocol.slice(0, -1), host: target.host, path: `${target.pathname}${target.search}` });
-  const response = await fetch(`/preview?${query}`);
-  if (!response.ok) throw new Error(await response.text());
-  const doc = new DOMParser().parseFromString(await response.text(), 'text/html');
-  for (const node of doc.querySelectorAll('[hidden], [aria-hidden="true"]')) node.remove();
-  for (const node of doc.querySelectorAll('[style]')) {
-    if (node.style.display === 'none' || node.style.visibility === 'hidden') node.remove();
-  }
-  for (const node of doc.querySelectorAll('script,style,link,meta,iframe,object,embed,form,nav,header,footer,aside,svg,img,video,audio,source,template,noscript')) node.remove();
-  let content = doc.querySelector('main, article, [role="main"]');
-  if (!content) {
-    content = doc.querySelector('h1')?.parentElement || doc.body;
-    while (content !== doc.body && content.parentElement && content.querySelectorAll('p').length < 2) content = content.parentElement;
-  }
-  for (const node of [content, ...content.querySelectorAll('*')]) {
-    for (const attribute of [...node.attributes]) node.removeAttribute(attribute.name);
-  }
+// The page as the world served it, as the workstation's phone browser laid it
+// out: its own markup, styles and images, with no scripts.
+function servedPage(url) {
   const frame = element('iframe', undefined, 'recorded-page');
-  frame.setAttribute('sandbox', ''); frame.referrerPolicy = 'no-referrer'; frame.title = url;
-  frame.srcdoc = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'"><style>body{margin:24px;color:#243047;background:#fff;font:16px/1.7 system-ui}h1,h2,h3{line-height:1.25}a{color:#2c61bd}pre,table{white-space:pre-wrap;overflow-wrap:anywhere}*{max-width:100%;box-sizing:border-box}</style>${content.outerHTML}`;
-  container.replaceChildren(frame);
+  frame.setAttribute('sandbox', '');
+  frame.referrerPolicy = 'no-referrer';
+  frame.title = url;
+  frame.src = `/thumbnail?${new URLSearchParams({ url })}`;
+  return frame;
 }
 function egressRows(purpose) {
   return activityRows().filter((row) => row.fact.kind === 'egress' && row.fact.purpose === purpose && row.fact.phase !== 'attempt');
@@ -460,9 +476,9 @@ function details() {
     heading(served || hit?.title || 'Page', url);
     body.append(element('p', request ? `${request.status >= 400 ? 'Failed' : 'Opened'} · ${request.status} · ${sourceName(request.source)}` : 'Not opened', 'page-state'));
     if (request?.has_preview) {
-      const container = element('div', 'Loading page…', 'reading-view');
+      const container = element('div', undefined, 'reading-view');
+      container.append(servedPage(request.url));
       body.append(container);
-      readPage(url, container).catch((error) => { container.textContent = error.message; });
       const read = button(document.body.classList.contains('page-expanded') ? 'Shrink page' : 'Expand page', () => {
         const expanded = document.body.classList.toggle('page-expanded');
         read.textContent = expanded ? 'Shrink page' : 'Expand page';
@@ -490,17 +506,26 @@ function details() {
     if (!site?.requests.length && !site?.searches.length) body.append(element('p', 'Not opened', 'detail-empty'));
   } else if (selection === 'copies' || selection === 'originals') {
     const purpose = selection === 'copies' ? 'live_capture' : 'original';
-    heading(selection === 'copies' ? 'Page copies' : 'Originals');
-    if (selection === 'copies') {
-      for (const site of shown.sites) for (const request of site.requests.filter((request) => request.source.kind === 'live' && request.status >= 200 && request.status < 300 && request.has_preview)) {
-        body.append(button(request.url, () => select(`page:${request.url}`), 'site-list'));
+    heading(selection === 'copies' ? 'Live sites' : 'Originals');
+    // Each page the host fetched, with the files it fetched for that page.
+    const files = new Map();
+    for (const row of egressRows(purpose)) if (row.fact.page) files.set(row.fact.page, [...(files.get(row.fact.page) || []), row]);
+    for (const row of egressRows(purpose).filter((row) => !row.fact.page)) {
+      const own = files.get(row.fact.path) || [];
+      let content;
+      if (own.length) {
+        content = element('details', undefined, 'page-files');
+        content.dataset.key = `files:${row.fact.path}`;
+        content.open = expanded.has(content.dataset.key);
+        content.append(element('summary', quantity(own.length, 'file')));
+        for (const file of own) content.append(element('div', `${file.fact.path.replace(/^https?:\/\//, '')} · ${file.fact.status || phaseName(file.fact.phase)}`, 'asset-row'));
       }
+      body.append(detailRow(row.at_ms, row.fact.path, `${row.fact.method} · ${row.fact.status || phaseName(row.fact.phase)}`, content));
     }
-    for (const row of egressRows(purpose)) body.append(detailRow(row.at_ms, row.fact.host, `${row.fact.method} ${row.fact.path} · ${row.fact.status || phaseName(row.fact.phase)}`));
     if (!body.childElementCount) body.append(element('p', 'No requests', 'detail-empty'));
   } else if (['egress', 'signin'].includes(selection) || selection.startsWith('egress:')) {
     const accepts = (row) => selection === 'signin' ? row.purpose === 'account' : selection.startsWith('egress:') ? row.host === selection.slice(7) : true;
-    const connections = shown.connections.filter(accepts), egress = shown.egress.filter((row) => accepts(row.fact) && row.fact.phase !== 'attempt');
+    const connections = shown.connections.filter(accepts), egress = shown.egress.filter((row) => accepts(row.fact) && row.fact.phase !== 'attempt' && !row.fact.page);
     heading(selection === 'signin' ? 'Sign-in' : selection.startsWith('egress:') ? selection.slice(7) : 'Internet');
     if (shown.signin && ['signin', 'egress'].includes(selection)) {
       body.append(detailRow(shown.signin.at_ms, shown.signin.fact.open ? 'Sign-in open' : 'Sign-in closed', ''));
@@ -548,14 +573,18 @@ function details() {
     if (!body.childElementCount) body.append(element('p', 'Nothing refused', 'detail-empty'));
   } else {
     heading('Workstation', hostStatus?.addresses.join(' · ') || '10.0.0.2');
-    actions.append(button('Show agent', () => { select(null); $('agent').hidden = false; $('agent-toggle').setAttribute('aria-pressed', 'true'); }));
+    actions.append(button('Show agent', () => { select(null); showAgent(true); }));
   }
   body.scrollTop = scroll;
 }
 
+// The run clock is the host's clock, read from its replies, and ticks.
+let hostOffset = 0;
+function tick() { $('clock').textContent = new Date(Date.now() + hostOffset).toLocaleTimeString([], { hour12: false, timeZone: 'UTC' }); }
+setInterval(tick, 1000);
 function draw() {
   graph(); feed(); details();
-  $('clock').textContent = stamp(shown.at_ms);
+  tick();
 }
 const stream = new EventSource('/state');
 stream.onerror = () => { $('clock').title = 'Reconnecting'; };
@@ -568,6 +597,8 @@ stream.onmessage = (event) => {
 async function loadWorld() {
   const response = await fetch('/world');
   if (!response.ok) throw new Error('Could not read the world settings');
+  const date = Date.parse(response.headers.get('date'));
+  if (date) hostOffset = date + 500 - Date.now();
   world = await response.json();
   $('world-date').textContent = world.date;
   $('brief').textContent = world.instructions;

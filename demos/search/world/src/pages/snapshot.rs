@@ -8,7 +8,8 @@ use std::sync::OnceLock;
 
 /// The served `html` of `url` with every dependency the picture needs
 /// renamed by `held` (an absolute URL in, the address to load it from out).
-/// Scripts, frames, forms and event handlers are removed.
+/// Scripts, frames, forms and event handlers are removed, and links stay on
+/// the picture: following one would leave the world for the real site.
 pub fn page(url: &url::Url, html: &str, held: &dyn Fn(&url::Url) -> String) -> String {
     let dom = kuchiki::parse_html().one(html);
     let base = dom
@@ -48,6 +49,13 @@ pub fn page(url: &url::Url, html: &str, held: &dyn Fn(&url::Url) -> String) -> S
             }
         }
         let element = node.name.local.as_ref();
+        if matches!(element, "a" | "area")
+            && attributes
+                .get("href")
+                .is_some_and(|href| !href.trim_start().starts_with('#'))
+        {
+            attributes.insert("href", "#".into());
+        }
         let source = match element {
             "link" => Some("href"),
             "img" | "source" | "input" => Some("src"),

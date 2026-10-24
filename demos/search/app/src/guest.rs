@@ -3,11 +3,20 @@ use fictionet_demo::kit::{self, Guest};
 pub const HOST: &str = "workstation";
 pub const USER: &str = "analyst";
 
+/// The workstation is ready once Firefox shows its start page: its window
+/// title names a page, not only the browser.
+fn browser_shows_page() -> String {
+    format!(
+        "{} && env DISPLAY=:1 xdotool search --onlyvisible --class firefox getwindowname | grep -qv '^Mozilla Firefox$'",
+        kit::desktop::BROWSER_READY
+    )
+}
+
 /// The workstation inherits the host clock from the hypervisor.
 pub fn guest(token: Option<&str>) -> Guest<kit::PreparedImage> {
     let mut guest = Guest::prepared(HOST, USER, "search-workstation.qcow2")
         .resources(4, 4096)
-        .desktop(kit::desktop::VNC_PORT, kit::desktop::BROWSER_READY)
+        .desktop(kit::desktop::VNC_PORT, browser_shows_page())
         .terminal("env COLORTERM=truecolor DISPLAY=:1 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus tmux new-session -A -s main");
     guest = guest.file(
         &format!("/home/{USER}/.tmux.conf"),

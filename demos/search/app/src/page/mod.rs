@@ -96,6 +96,52 @@ pub struct View {
 pub struct Views {
     view: View,
     previews: HashMap<String, (web_world::pages::PageBody, PageSource)>,
+    boot: Boot,
+}
+
+/// The workstation's own start-up: its browser opening its start page.
+/// The run record keeps it; the page shows what happens after it.
+#[derive(Default)]
+struct Boot {
+    /// When the workstation became ready, in wall-clock milliseconds.
+    ended_at_ms: Option<u64>,
+    /// Addresses the start-up loaded; their own requests are start-up too.
+    pages: std::collections::HashSet<String>,
+}
+impl Boot {
+    /// Whether this fact belongs to start-up; remembers the pages it loaded.
+    fn claims(&mut self, wall_ms: u64, fact: &SearchObs) -> bool {
+        let booting = self.ended_at_ms.is_none_or(|ended| wall_ms < ended);
+        match fact {
+            SearchObs::RunStarted { .. } | SearchObs::Signin { .. } => false,
+            SearchObs::Request {
+                scheme,
+                host,
+                path,
+                fetch,
+                referrer,
+                ..
+            } => {
+                let url = format!("{scheme}://{host}{path}");
+                let owned = *fetch == Fetch::Subresource
+                    && referrer
+                        .as_ref()
+                        .is_some_and(|page| self.pages.contains(page));
+                if booting || owned {
+                    self.pages.insert(url);
+                    true
+                } else {
+                    // A later visit to the start page is the agent's own.
+                    self.pages.remove(&url);
+                    false
+                }
+            }
+            SearchObs::Egress { page, .. } => {
+                booting || page.as_ref().is_some_and(|page| self.pages.contains(page))
+            }
+            _ => booting,
+        }
+    }
 }
 impl Default for Views {
     fn default() -> Self {
@@ -111,6 +157,7 @@ impl Default for Views {
                 signin: None,
             },
             previews: HashMap::new(),
+            boot: Boot::default(),
         }
     }
 }
@@ -120,6 +167,12 @@ impl Views {
         view.at_ms = observation.at_ms;
         if let SearchObs::RunStarted { started_at_ms } = observation.fact {
             view.started_at_ms = started_at_ms;
+        }
+        if self
+            .boot
+            .claims(view.started_at_ms + observation.at_ms, &observation.fact)
+        {
+            return;
         }
         match &observation.fact {
             SearchObs::Resolved { name, address } => {
@@ -290,6 +343,10 @@ impl Views {
             view.activity.push(observation);
         }
     }
+    /// The workstation is ready: what happens from now on is shown.
+    pub fn end_boot(&mut self) {
+        self.boot.ended_at_ms.get_or_insert_with(wall_start);
+    }
     pub fn preview(&self, url: &url::Url) -> Option<(web_world::pages::PageBody, PageSource)> {
         self.previews.get(url.as_str()).cloned()
     }
@@ -406,6 +463,12 @@ impl Page {
             },
             (receive, control),
         )
+    }
+    /// Ends the workstation's start-up on the page.
+    pub fn end_boot(&self) {
+        let mut views = self.views.lock().unwrap();
+        views.end_boot();
+        self.snapshots.send_replace(views.current());
     }
     pub fn publish(&self, observation: Observation) {
         let mut views = self.views.lock().unwrap();
@@ -719,6 +782,8 @@ async fn held(
     })
     .await;
     match held {
+        // The picture is a sandboxed frame with no origin of its own; its
+        // fonts load only when the reply allows any origin.
         Ok(Some(held)) => (
             [
                 (http::header::CONTENT_TYPE, held.content_type),
@@ -726,6 +791,7 @@ async fn held(
                     http::header::CONTENT_SECURITY_POLICY,
                     PICTURE_POLICY.to_owned(),
                 ),
+                (http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".to_owned()),
             ],
             held.body,
         )

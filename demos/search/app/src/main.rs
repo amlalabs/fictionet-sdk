@@ -86,6 +86,7 @@ async fn main() -> Result {
     let server = page::serve(page.router(), kit::PAGE_PORT).await?;
     let _access = kit::PageAccess::new(&server.url)?;
     let observe_page = page.clone();
+    let ready_page = page.clone();
     let mut observation_task =
         tokio::spawn(async move { observe_page.record(observations, &output).await });
     let log = Arc::new(Log::new(Box::new(std::io::sink()), &[], |s| s));
@@ -139,7 +140,7 @@ async fn main() -> Result {
     let result = loop {
         tokio::select! {
             result = &mut readiness, if !ready => match result {
-                Ok(()) => { ready = true; println!("The Search page stays open until Ctrl-C."); },
+                Ok(()) => { ready = true; ready_page.end_boot(); println!("The Search page stays open until Ctrl-C."); },
                 Err(error) => break Err(error),
             },
             result = &mut observation_task => { recording_ended = true; break Err(recording_error(result)); },
