@@ -14,11 +14,6 @@ use response::{Block as OutputBlock, EventKind};
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 
-/// Page text handed to the model is cut at this many characters.
-const PAGE_CHARS: usize = 20_000;
-/// At most this many matching lines answer one `find_in_page`.
-const MATCHES: usize = 20;
-
 use request::{Block, Content, Responses, Tool, TypedBlock};
 fn hosted(value: &Value) -> bool {
     serde_json::from_value::<Tool>(value.clone())
@@ -213,7 +208,8 @@ pub(super) async fn serve(
 /// Ends a stream whose continuation was refused, such as by a budget stop,
 /// with the provider's `response.failed` carrying the refusal's error.
 async fn failed(refused: Response<Body>, output: &mut Output) -> fictionet::Result<()> {
-    let bytes = http_body_util::Limited::new(refused.into_body(), 64 * 1024)
+    let bytes = refused
+        .into_body()
         .collect()
         .await
         .map(|body| body.to_bytes())
@@ -441,7 +437,6 @@ async fn answer(
                 return error(action, "unsupported_content_type");
             };
             if function == WorldFunction::OpenPage {
-                let body: String = body.chars().take(PAGE_CHARS).collect();
                 let output = json!({"url":url,"title":page.title,"text":body});
                 return (action, output.to_string(), 1);
             }
@@ -450,7 +445,6 @@ async fn answer(
                 .lines()
                 .map(str::trim)
                 .filter(|line| !needle.is_empty() && line.to_lowercase().contains(&needle))
-                .take(MATCHES)
                 .collect();
             let count = matches.len() as u64;
             let output = json!({"url":url,"title":page.title,"pattern":pattern,"matches":matches});
@@ -470,12 +464,10 @@ async fn run(
     mut response: Response<Body>,
     output: &mut Output,
 ) -> fictionet::Result<Option<Response<Body>>> {
-    let limit = body.max_tool_calls.unwrap_or(8);
     let include_sources = body
         .include
         .as_ref()
         .is_some_and(|fields| fields.iter().any(|f| f == "web_search_call.action.sources"));
-    let mut used = 0;
     let mut tokens = 0;
     loop {
         let offset = output.items.len();
@@ -490,16 +482,8 @@ async fn run(
             let Some(id) = turn.calls.get(&index) else {
                 continue;
             };
-            used += 1;
-            let (action, text, _count) = if used > limit {
-                (
-                    json!({"type":"search"}),
-                    json!({"error":"max_tool_calls"}).to_string(),
-                    0,
-                )
-            } else {
-                answer(&model, &engine, &settings, include_sources, call).await
-            };
+            let (action, text, _count) =
+                answer(&model, &engine, &settings, include_sources, call).await;
             let result = json!({"type":"function_call_output","call_id":call.function().and_then(|(_, _, id)| id),"output":text});
             let token = model
                 .cipher

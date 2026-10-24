@@ -113,7 +113,7 @@ Capture dates appear when the archive records them.
   including URLs that never appeared in search. Each page, stylesheet or image
   is copied when requested and retained at its original URL. Separate downloads
   can progress together. Actual host requests appear in the
-  page's internet activity. Transport failures return a gateway error; upstream
+  page's internet activity. Interrupted downloads retry until completion; upstream
   status codes, including real missing pages, are preserved.
 
 The page source can change during a session. Copied mode has no public-web
@@ -193,7 +193,7 @@ logs. Capture the URLs in the seed with:
 
 ```sh
 wget --page-requisites --span-hosts --compression=auto --delete-after \
-  --inet4-only --no-http-keep-alive --wait=0.3 --timeout=30 --tries=2 \
+  --inet4-only --no-http-keep-alive \
   --warc-file=<directory>/<name> <URLs>
 ```
 

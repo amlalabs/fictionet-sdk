@@ -627,7 +627,7 @@ async fn relay(
         }
         Ok(response) => {
             let (parts, body) = response.into_parts();
-            let bytes = http_body_util::Limited::new(body, 64 * 1024)
+            let bytes = body
                 .collect()
                 .await
                 .map(|body| body.to_bytes())

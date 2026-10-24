@@ -399,23 +399,14 @@ enum Catalog {
 }
 
 /// Searched Responses ids: the id a client saw, and the final upstream turn
-/// that holds the whole response. The oldest go first past the bound.
+/// that holds the whole response.
 #[derive(Default)]
 struct Continued {
     finals: std::collections::HashMap<String, String>,
-    order: std::collections::VecDeque<String>,
 }
 impl Continued {
-    const LIMIT: usize = 4096;
     fn insert(&mut self, shown: String, last: String) {
-        if self.finals.insert(shown.clone(), last).is_none() {
-            self.order.push_back(shown);
-        }
-        while self.order.len() > Self::LIMIT {
-            if let Some(old) = self.order.pop_front() {
-                self.finals.remove(&old);
-            }
-        }
+        self.finals.insert(shown, last);
     }
 }
 impl Model {
