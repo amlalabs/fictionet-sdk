@@ -41,7 +41,7 @@ impl fictionet_extras::models::Engine for Pages {
                 let response = if let Some(package) = package {
                     package
                 } else if self.live_only() {
-                    self.live_url(&cx, &url).await
+                    self.live_url(&cx, &url, None).await
                 } else if self.copied_only() {
                     self.copied_url(&url)
                 } else {

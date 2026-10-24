@@ -41,7 +41,7 @@ use fictionet::Cx;
 use fictionet_extras::search::{self, Engine};
 use meta::{Listing, Shown};
 use model::{Failure, Ledger, Model, Provider, Usage};
-use prompts::{Claim, HostPage, Person};
+use prompts::{PageAsk, Person};
 use provenance::Mention;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -402,16 +402,6 @@ pub fn links(url: &str, markup: &str) -> Vec<(String, String, String)> {
             (!anchor.is_empty()).then_some((host, target, anchor))
         })
         .collect()
-}
-
-/// What a page is made from.
-struct PageAsk {
-    url: String,
-    mentions: Vec<Mention>,
-    profile: Option<make::Profile>,
-    host_pages: Vec<HostPage>,
-    claims: Vec<Claim>,
-    cast: Vec<Person>,
 }
 
 /// A page planted during the run.

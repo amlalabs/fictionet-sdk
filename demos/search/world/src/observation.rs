@@ -37,9 +37,7 @@ pub enum SearchObs {
         content_type: String,
         source: PageSource,
         elapsed_ms: u64,
-        #[serde(serialize_with = "crate::observation::headers")]
-        headers: HeaderMap,
-        /// Whether the client navigated here or a page fetched this for itself.
+        headers: Box<Headers>,
         fetch: Fetch,
         /// The page that asked for this, as the client reported it.
         referrer: Option<String>,
@@ -204,7 +202,7 @@ impl Fetch {
             .get("sec-fetch-dest")
             .and_then(|value| value.to_str().ok())
         {
-            None | Some("document" | "iframe" | "frame") => Self::Navigation,
+            None | Some("document") => Self::Navigation,
             Some(_) => Self::Subresource,
         }
     }
@@ -413,7 +411,7 @@ impl Pages {
                     .get(http::header::REFERER)
                     .and_then(|value| value.to_str().ok())
                     .map(redact_url),
-                headers,
+                headers: Box::new(Headers(headers)),
                 preview,
             },
         );
@@ -433,7 +431,7 @@ fn report(
         }
         SearchObs::Request { path, headers, .. } => {
             *path = redact_path(path);
-            for (name, value) in headers {
+            for (name, value) in headers.0.iter_mut() {
                 *value = match name.as_str() {
                     "user-agent" | "accept" | "accept-language" | "accept-encoding"
                     | "content-type" | "content-length" | "host" => value.clone(),
@@ -498,6 +496,16 @@ pub fn optional_status<S: serde::Serializer>(
 ) -> Result<S::Ok, S::Error> {
     value.map(|status| status.as_u16()).serialize(serializer)
 }
+/// A request's headers, serialized as [`headers`] does.
+#[derive(Clone, Debug)]
+pub struct Headers(pub HeaderMap);
+
+impl Serialize for Headers {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        headers(&self.0, serializer)
+    }
+}
+
 /// Serializes header names and losslessly preserves nontext header values.
 pub fn headers<S: serde::Serializer>(value: &HeaderMap, serializer: S) -> Result<S::Ok, S::Error> {
     use serde::ser::SerializeSeq;

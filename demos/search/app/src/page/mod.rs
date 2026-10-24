@@ -163,6 +163,7 @@ impl Views {
                         source: source.clone(),
                         elapsed_ms: *elapsed_ms,
                         headers: headers
+                            .0
                             .iter()
                             .filter(|(_, value)| value.as_bytes() != b"[redacted]")
                             .map(|(name, value)| {

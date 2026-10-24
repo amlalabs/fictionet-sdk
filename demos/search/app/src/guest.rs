@@ -14,6 +14,27 @@ pub fn guest(token: Option<&str>) -> Guest<kit::PreparedImage> {
         0o644,
         "set -g status off\nset -g mouse on\nset -g default-terminal tmux-256color\nset -as terminal-features ',xterm-256color:RGB'\nset -g update-environment 'DISPLAY DBUS_SESSION_BUS_ADDRESS COLORTERM'\n",
     );
+    // Firefox is a phone browser: sites see a mobile browser and lay out for
+    // the portrait screen the page gives it. Links opened from the terminal
+    // become tabs of its one window, which fills the screen.
+    guest = guest.file(
+        &format!("/home/{USER}/.mozilla/firefox/default/user.js"),
+        0o644,
+        "user_pref(\"general.useragent.override\", \"Mozilla/5.0 (Android 15; Mobile; rv:158.0) Gecko/158.0 Firefox/158.0\");\n\
+         user_pref(\"dom.meta-viewport.enabled\", true);\n\
+         user_pref(\"browser.link.open_newwindow.override.external\", 3);\n\
+         user_pref(\"widget.gtk.overlay-scrollbars.enabled\", true);\n",
+    );
+    // A phone browser's toolbar: back, reload, the address and the menu, and
+    // no desktop minimum width, so the window fits the portrait screen.
+    guest = guest.file(
+        &format!("/home/{USER}/.mozilla/firefox/default/chrome/userChrome.css"),
+        0o644,
+        "#TabsToolbar { visibility: collapse }\n\
+         :root, #nav-bar, #urlbar-container, #urlbar { min-width: 0 !important }\n\
+         #sidebar-button, #forward-button, #home-button, #unified-extensions-button,\n\
+         #star-button-box, #reader-mode-button, #picture-in-picture-button { display: none !important }\n",
+    );
     guest.features = kit::Features {
         claude_code: true,
         codex: true,

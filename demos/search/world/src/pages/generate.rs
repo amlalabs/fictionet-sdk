@@ -264,6 +264,7 @@ impl Pages {
                 host_pages: store.host_pages(host),
                 claims: store.page_context(host, target),
                 cast,
+                original: None,
             }
         };
         // The layout owner writes its first page while peers write their bodies.
@@ -363,7 +364,7 @@ impl Pages {
         let latest = self.latest_publication();
         // A document that exists is written from its real text: a capture,
         // or else the public original the host reads now.
-        let original = match self.reference_text(&url).map_err(Stop::store)? {
+        ask.original = match self.reference_text(&url).map_err(Stop::store)? {
             Some(captured) => Some(captured),
             None if matches!(self.maker(), Maker::Model(_)) => self.originals.read(cx, &url).await,
             None => None,
@@ -387,16 +388,7 @@ impl Pages {
                     make::page_with_known(&seed, host, target, &mentions, kind, &known)
                 },
                 || {
-                    let (system, mut user) = prompts::page(
-                        &seed,
-                        &ask.cast,
-                        &ask.url,
-                        &ask.mentions,
-                        ask.profile.as_ref(),
-                        &ask.host_pages,
-                        &ask.claims,
-                        original.as_ref(),
-                    );
+                    let (system, mut user) = prompts::page(&seed, &ask);
                     user.push_str(&format!("\nThe latest permitted publication/update date is {latest}. Incoming links already published by this date must remain possible. Later context describes the wider world; do not import its later knowledge into this page."));
                     (system, user)
                 },
@@ -407,7 +399,7 @@ impl Pages {
                     }
                     // What a real document states was known when it was
                     // published, including the plans it schedules for later.
-                    if original.is_some()
+                    if ask.original.is_some()
                         && let Ok(dateline) = seed::parse_date(&page.date)
                     {
                         for claim in &mut page.claims {
@@ -448,7 +440,7 @@ impl Pages {
             )
             .await?;
         let mut page = made.fields;
-        let title = match &original {
+        let title = match &ask.original {
             Some(original) => original.title.as_deref(),
             None => ask
                 .mentions

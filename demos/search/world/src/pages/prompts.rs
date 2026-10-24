@@ -57,6 +57,16 @@ pub struct Original {
     /// Its `<title>`, for HTML documents that have one.
     pub title: Option<String>,
     pub text: String,
+    pub read: Reading,
+}
+
+/// How the text of an original was read.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Reading {
+    /// The text the address itself serves.
+    Served,
+    /// A search provider's text of the document the address shows.
+    Indexed,
 }
 
 /// A claim a page in this world made.
@@ -512,11 +522,14 @@ pub fn search(
     let user = format!(
         "Someone searched for: {query}
 
-Pages that already exist in this world. Include those a real engine would
-rank for this query, with their URL and title exactly as given. They are a
-few of the web's pages; the rest of the list comes from the sites a real
-engine would show:
+Pages that already exist in this world, with their URL and title exactly as
+given. They are only the few pages the world already holds; include those a
+real engine would rank for this query, and none merely because they exist:
 {known}
+
+Fill the rest of the list with the pages a real engine shows for this query
+from the wider web (journals, official sites, news, forums, Q&A, video), at
+their real addresses.
 
 What the world has already said:
 {said}
@@ -572,18 +585,31 @@ pub fn expected_type(url: &str) -> Option<&'static str> {
     }
 }
 
-/// The page prompt: system and user text. `mentions` are every mention
-/// of the page, in their recorded order.
-pub fn page(
-    seed: &Seed,
-    cast: &[Person],
-    url: &str,
-    mentions: &[Mention],
-    profile: Option<&Profile>,
-    host_pages: &[HostPage],
-    claims: &[Claim],
-    original: Option<&Original>,
-) -> (String, String) {
+/// What a page is made from.
+pub struct PageAsk {
+    pub url: String,
+    /// Every mention of the page, in recorded order.
+    pub mentions: Vec<Mention>,
+    pub profile: Option<Profile>,
+    pub host_pages: Vec<HostPage>,
+    pub claims: Vec<Claim>,
+    pub cast: Vec<Person>,
+    /// The real document at the address, when it exists.
+    pub original: Option<Original>,
+}
+
+/// The page prompt: system and user text.
+pub fn page(seed: &Seed, ask: &PageAsk) -> (String, String) {
+    let PageAsk {
+        url,
+        mentions,
+        profile,
+        host_pages,
+        claims,
+        cast,
+        original,
+    } = ask;
+    let (profile, original) = (profile.as_ref(), original.as_ref());
     let mut led = Vec::new();
     for mention in mentions {
         match mention {
@@ -637,14 +663,20 @@ pub fn page(
             .unwrap_or_default(),
     };
     let grounding = original
-        .map(|original| {
-            format!(
+        .map(|original| match original.read {
+            Reading::Served => format!(
                 "\nThe real document at this address:\n{}\n\nWrite this document as it is: its title, authors, dates, sections, names, numbers and wording. \
                 Keep its full length and every section; the length guidance in these instructions does not apply to it. \
                 Change only what the world's brief or earlier world documents explicitly change. \
                 DATE is the document's own publication or update date; the dates of the events it describes stay as they are.\n",
                 original.text
-            )
+            ),
+            Reading::Indexed => format!(
+                "\nA search index's notes on the real document this address shows (not the page itself):\n{}\n\nWrite the page this address really serves, in the site's own form and length \
+                (a record page shows the citation, the authors with their real affiliations, the abstract and links). \
+                Its identity, authors, dates, names and numbers are the real document's. Leave out the index's own annotations, such as citation counts and author metrics.\n",
+                original.text
+            ),
         })
         .unwrap_or_default();
     let host = url.split('/').nth(2).unwrap_or_default();

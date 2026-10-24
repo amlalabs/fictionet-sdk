@@ -8,7 +8,7 @@ use super::live::{
 };
 use super::*;
 use fictionet_extras::capture;
-use prompts::Original;
+use prompts::{Original, Reading};
 use tokio::sync::oneshot;
 
 #[derive(Default)]
@@ -101,6 +101,7 @@ async fn contents(
     (!text.trim().is_empty()).then_some(Original {
         title: None,
         text: key.redact(&text),
+        read: Reading::Indexed,
     })
 }
 
@@ -149,7 +150,11 @@ async fn follow(
                 std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem(&body[..]))
                     .ok()
                     .and_then(Result::ok)
-                    .map(|text| Original { title: None, text })
+                    .map(|text| Original {
+                        title: None,
+                        text,
+                        read: Reading::Served,
+                    })
             } else if content_type.starts_with("text/html") {
                 capture::page_text(&String::from_utf8_lossy(body))
                     .ok()
@@ -159,11 +164,13 @@ async fn follow(
                             .map(|title| title.trim().to_owned())
                             .filter(|title| !title.is_empty()),
                         text,
+                        read: Reading::Served,
                     })
             } else if content_type.starts_with("text/") {
                 Some(Original {
                     title: None,
                     text: String::from_utf8_lossy(body).into_owned(),
+                    read: Reading::Served,
                 })
             } else {
                 None

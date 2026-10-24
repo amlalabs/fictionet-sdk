@@ -131,7 +131,9 @@ impl Pages {
             return asset;
         }
         if self.live_only() && route == Route::Page {
-            return self.live_url(cx, &format!("https://{host}{target}")).await;
+            return self
+                .live_url(cx, &format!("https://{host}{target}"), None)
+                .await;
         }
         if self.copied_only() && route == Route::Page {
             return self.copied_page(host, target);
@@ -508,7 +510,7 @@ impl Pages {
         let host = parsed.host_str()?;
         let path = parsed.path();
         let fixed = |response: Response| {
-            (response.status == 200).then(|| HeldResource {
+            (response.status == 200).then_some(HeldResource {
                 content_type: response.content_type,
                 body: response.body,
             })

@@ -199,13 +199,18 @@ impl Pages {
                     .map(|title| title.trim().to_owned())
                     .filter(|title| !title.is_empty()),
                 text: fictionet_extras::capture::page_text(&String::from_utf8_lossy(&body))?,
+                read: super::prompts::Reading::Served,
             })
         } else if content_type.starts_with("application/pdf") {
             // A malformed PDF can panic inside the parser; it has no text then.
             std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem(&body))
                 .ok()
                 .and_then(Result::ok)
-                .map(|text| super::prompts::Original { title: None, text })
+                .map(|text| super::prompts::Original {
+                    title: None,
+                    text,
+                    read: super::prompts::Reading::Served,
+                })
         } else {
             None
         })

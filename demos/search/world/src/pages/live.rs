@@ -100,6 +100,7 @@ impl Live {
         cx: &Cx,
         url: String,
         resource: capture::Resource,
+        user_agent: Option<http::HeaderValue>,
     ) -> Result<watch::Receiver<CaptureState>, String> {
         let mut state = self.state();
         if lifetime.cancelled() || !Arc::ptr_eq(lifetime, &state.lifetime) {
@@ -116,7 +117,9 @@ impl Live {
         let lifetime = lifetime.clone();
         let cx = cx.clone();
         self.fetcher.spawn(async move {
-            let result = live.download(&lifetime, &cx, &url).await;
+            let result = live
+                .download(&lifetime, &cx, &url, user_agent.as_ref())
+                .await;
             let response = match result {
                 Ok(response) => {
                     send.send_replace(CaptureState::Ready);
@@ -143,7 +146,7 @@ impl Live {
             match links {
                 Ok(links) => {
                     for (url, resource) in links {
-                        let _ = live.capture(&lifetime, &cx, url, resource);
+                        let _ = live.capture(&lifetime, &cx, url, resource, user_agent.clone());
                     }
                 }
                 Err(error) => eprintln!("Live dependency discovery failed: {error}"),
@@ -157,6 +160,7 @@ impl Live {
         lifetime: &Arc<Lifetime>,
         cx: &Cx,
         url: &str,
+        user_agent: Option<&http::HeaderValue>,
     ) -> Result<warc::Response, String> {
         if let Some(response) = self
             .state()
@@ -172,7 +176,7 @@ impl Live {
         let response = loop {
             match self
                 .fetcher
-                .request(cx, lifetime, observer.clone(), url, Ask::Copy)
+                .request(cx, lifetime, observer.clone(), url, Ask::Copy(user_agent))
                 .await
             {
                 Ok(response) => break response,
@@ -350,10 +354,21 @@ impl Live {
         self.state().archive.get(&warc::key(url)?).ok()?
     }
 
-    async fn response(self: &Arc<Self>, cx: &Cx, url: &str) -> Result<warc::Response, String> {
+    async fn response(
+        self: &Arc<Self>,
+        cx: &Cx,
+        url: &str,
+        user_agent: Option<&http::HeaderValue>,
+    ) -> Result<warc::Response, String> {
         let url = warc::key(url).ok_or("Invalid Live URL")?;
         let lifetime = self.state().lifetime.clone();
-        let mut waiting = self.capture(&lifetime, cx, url.clone(), capture::Resource::Document)?;
+        let mut waiting = self.capture(
+            &lifetime,
+            cx,
+            url.clone(),
+            capture::Resource::Document,
+            user_agent.cloned(),
+        )?;
         let ready = async {
             loop {
                 let state = waiting.borrow_and_update().clone();
@@ -451,8 +466,21 @@ impl Pages {
         self.live_active.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    pub(crate) async fn live_url(&self, cx: &Cx, url: &str) -> Response {
-        match self.live.as_ref().unwrap().response(cx, url).await {
+    /// Answers from a Live copy of `url`, copied the way the asking client
+    /// (by its `user_agent`) would be served: a phone gets the mobile site.
+    pub(crate) async fn live_url(
+        &self,
+        cx: &Cx,
+        url: &str,
+        user_agent: Option<&http::HeaderValue>,
+    ) -> Response {
+        match self
+            .live
+            .as_ref()
+            .unwrap()
+            .response(cx, url, user_agent)
+            .await
+        {
             Ok(response) => copied::replay(Ok(Some(response))),
             Err(_) => Response::new(
                 502,

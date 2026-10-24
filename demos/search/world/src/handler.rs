@@ -79,6 +79,7 @@ impl Handler {
                 .live_url(
                     &self.fcx,
                     &format!("{}://{}{path}", target.scheme, target.host),
+                    parts.headers.get(http::header::USER_AGENT),
                 )
                 .await
         } else if self.pages.copied_only() && action == Route::Page {

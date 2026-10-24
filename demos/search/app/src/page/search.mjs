@@ -600,7 +600,9 @@ $('restart').onclick = async () => { $('restart').disabled = true; try { await c
 async function mountConsole() {
   if (!hostStatus) return;
   const kind = activeConsole;
-  $('terminal').hidden = kind !== 'terminal'; $('screen').hidden = kind !== 'screen';
+  $('terminal').hidden = kind !== 'terminal'; $('screen').classList.toggle('off', kind !== 'screen');
+  // The workstation's screen is a phone: the pane takes its portrait shape.
+  $('agent').classList.toggle('phone', kind === 'screen');
   $('terminal-tab').setAttribute('aria-pressed', String(kind === 'terminal'));
   $('screen-tab').setAttribute('aria-pressed', String(kind === 'screen'));
   const ready = kind === 'screen' ? hostStatus.screen : hostStatus.terminal;
