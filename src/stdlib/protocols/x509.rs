@@ -3611,6 +3611,23 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
     }
 
     #[test]
+    fn a_validity_bound_on_a_leap_second_is_usable() {
+        // The DER reader takes second 60, a leap second, in a
+        // GeneralizedTime, so a certificate can carry one. Its validity
+        // must still be decidable.
+        let mut tbs = sample_tbs();
+        tbs.validity = Validity {
+            not_before: Time::Generalized("20501231235960Z".into()),
+            not_after: Time::from_unix(2_600_000_000).unwrap(),
+        };
+        let read = TbsCertificate::parse(&tbs.to_bytes().unwrap()).unwrap();
+        assert_eq!(read.validity, tbs.validity);
+        assert!(read.validity.not_before.unix().is_some());
+        // A day after 2051-01-01 00:00:00 is well inside the period.
+        assert!(read.validity.contains(2_556_144_000 + 86_400));
+    }
+
+    #[test]
     fn times() {
         assert_eq!(
             Time::from_unix(0).unwrap(),
