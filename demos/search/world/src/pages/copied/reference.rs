@@ -57,7 +57,9 @@ fn available_space(root: &Path) -> io::Result<u64> {
 }
 
 impl ReferenceWeb {
-    pub fn open(root: &Path) -> Result<Self, String> {
+    /// Open the prepared index. Research batches published after preparation,
+    /// such as later page requisites, are served without reindexing.
+    pub fn open(root: &Path, research_path: &Path) -> Result<Self, String> {
         let wikipedia = Zim::new(wiki_file(root))
             .map_err(|e| format!("Offline Wikipedia: {e}. Run cargo xtask search-web"))?;
         let index = DiskIndex::open(&root.join("index/current"))
@@ -80,6 +82,23 @@ impl ReferenceWeb {
                 ));
             }
         }
+        let mut research = prepared.research;
+        let indexed: HashSet<_> = prepared.files.iter().map(|file| &file.path).collect();
+        let mut later =
+            archive_files(&Archive::directory_root(research_path).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+        later.retain(|file| !indexed.contains(&file.path));
+        if !later.is_empty() {
+            later.sort_by(|a, b| (a.modified, &a.path).cmp(&(b.modified, &b.path)));
+            eprintln!(
+                "Captured archives published after indexing: {}",
+                later.len()
+            );
+            research.extend(
+                Archive::open(later.into_iter().map(|file| file.path))
+                    .map_err(|e| e.to_string())?,
+            );
+        }
         let documents = prepared.documents;
         let hosts = documents
             .urls()
@@ -91,7 +110,7 @@ impl ReferenceWeb {
             wikipedia,
             documents,
             hosts,
-            research: prepared.research,
+            research,
             missing: prepared.missing,
         })
     }

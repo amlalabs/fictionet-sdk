@@ -33,6 +33,8 @@ struct Configuration {
     generator: String,
     seeds: Option<String>,
     store: Option<String>,
+    downloads: Option<PathBuf>,
+    page_source: Option<web_world::pages::NewPages>,
     #[serde(default)]
     model: String,
     #[serde(default)]
@@ -48,6 +50,8 @@ fn real_main() -> fictionet::Result {
         generator,
         seeds,
         store,
+        downloads,
+        page_source,
         model,
         reasoning,
         prefetch,
@@ -155,7 +159,30 @@ fn real_main() -> fictionet::Result {
             (GeneratorKind::Model(_), None) => unreachable!("a model's key is read above"),
             (GeneratorKind::Replay, _) => None,
         };
-        let pages = Arc::new(Pages::open(seed, store, maker, prefetch));
+        let pages = if let Some(downloads) = downloads {
+            let mut pages =
+                Pages::from_corpus(seed, &downloads, None).map_err(fictionet::Error::msg)?;
+            if page_source == Some(web_world::pages::NewPages::LiveSearch) {
+                pages = pages
+                    .with_live_search(&args.state_dir)
+                    .map_err(fictionet::Error::msg)?;
+            }
+            pages
+        } else {
+            Pages::open(seed, store, maker, prefetch)
+        };
+        let pages = Arc::new(pages);
+        if let Some(new_pages) = page_source {
+            pages
+                .apply(
+                    &fcx,
+                    web_world::pages::Command::SetNewPages {
+                        new_pages,
+                        expected_revision: pages.generation().revision,
+                    },
+                )
+                .map_err(|error| fictionet::Error::msg(format!("page source: {error:?}")))?;
+        }
         let seed = pages.seed();
         let fixed: std::collections::BTreeMap<_, _> = seed
             .fixed_addresses()

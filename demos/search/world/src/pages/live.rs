@@ -1,4 +1,5 @@
-//! Host search and on-demand public page copies, retained for replay.
+//! Host search and on-demand public page copies with their dependencies,
+//! retained for replay.
 
 use super::*;
 use fictionet_extras::{
@@ -98,6 +99,7 @@ impl Live {
         lifetime: &Arc<Lifetime>,
         cx: &Cx,
         url: String,
+        resource: capture::Resource,
     ) -> Result<watch::Receiver<CaptureState>, String> {
         let mut state = self.state();
         if lifetime.cancelled() || !Arc::ptr_eq(lifetime, &state.lifetime) {
@@ -115,11 +117,37 @@ impl Live {
         let cx = cx.clone();
         self.fetcher.spawn(async move {
             let result = live.download(&lifetime, &cx, &url).await;
-            send.send_replace(match result {
-                Ok(()) => CaptureState::Ready,
-                Err(_) if lifetime.cancelled() || cx.is_cancelled() => CaptureState::Cancelled,
-                Err(error) => CaptureState::Failed(error),
-            });
+            let response = match result {
+                Ok(response) => {
+                    send.send_replace(CaptureState::Ready);
+                    response
+                }
+                Err(_) if lifetime.cancelled() || cx.is_cancelled() => {
+                    send.send_replace(CaptureState::Cancelled);
+                    return;
+                }
+                Err(error) => {
+                    send.send_replace(CaptureState::Failed(error));
+                    return;
+                }
+            };
+            // A copied page brings its stylesheets, CSS imports, fonts, images
+            // and scripts, including those of pages already in the archive.
+            let links = live
+                .fetcher
+                .process(&cx, &lifetime, move || {
+                    capture::requisites(&url, &response, resource)
+                        .map_err(|error| error.to_string())
+                })
+                .await;
+            match links {
+                Ok(links) => {
+                    for (url, resource) in links {
+                        let _ = live.capture(&lifetime, &cx, url, resource);
+                    }
+                }
+                Err(error) => eprintln!("Live dependency discovery failed: {error}"),
+            }
         });
         Ok(receive)
     }
@@ -129,9 +157,14 @@ impl Live {
         lifetime: &Arc<Lifetime>,
         cx: &Cx,
         url: &str,
-    ) -> Result<(), String> {
-        if self.state().archive.contains(url) {
-            return Ok(());
+    ) -> Result<warc::Response, String> {
+        if let Some(response) = self
+            .state()
+            .archive
+            .get(url)
+            .map_err(|error| error.to_string())?
+        {
+            return Ok(response);
         }
         let observer = self.observer.lock().unwrap().clone();
         let mut stopped = lifetime.stop.subscribe();
@@ -173,7 +206,7 @@ impl Live {
                 .append(&path, url, &response)
                 .map_err(|error| error.to_string())?;
         }
-        Ok(())
+        Ok(response)
     }
 
     async fn search(
@@ -315,7 +348,7 @@ impl Live {
     async fn response(self: &Arc<Self>, cx: &Cx, url: &str) -> Result<warc::Response, String> {
         let url = warc::key(url).ok_or("Invalid Live URL")?;
         let lifetime = self.state().lifetime.clone();
-        let mut waiting = self.capture(&lifetime, cx, url.clone())?;
+        let mut waiting = self.capture(&lifetime, cx, url.clone(), capture::Resource::Document)?;
         let ready = async {
             loop {
                 let state = waiting.borrow_and_update().clone();

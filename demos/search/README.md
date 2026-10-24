@@ -116,7 +116,9 @@ sites. Capture dates are shown only when the archive records them.
   supplies results, which keep their order, titles, URLs and snippets in each
   engine's skin. The host copies any public URL the guest or Claude requests,
   including URLs that never appeared in search. Each page, stylesheet or image
-  is copied when requested and retained at its original URL. Separate downloads
+  is copied when requested and retained at its original URL. A copied page also
+  brings its stylesheets, CSS imports, fonts, images and scripts, including
+  cross-host assets and redirects at their real URLs. Separate downloads
   can progress together. Actual host requests appear in the
   page's internet activity. Interrupted downloads retry until completion; upstream
   status codes, including real missing pages, are preserved.
@@ -128,7 +130,7 @@ Copied mode has no public-web fallback. Wikipedia reflects its June 2026
 snapshot; documentation reflects its capture date. Live supplies current
 material. Live search and capture use a separate host HTTP transport, outside
 the guest model gateway. Search queries and served pages are logged and
-displayed.
+displayed. The crawler ignores robots.txt.
 
 The content audit applies to text the world writes. Replayed WARC responses carry
 capture provenance and are outside that scope; their words are not allowlisted.
@@ -199,8 +201,8 @@ loads the prepared index and archive locations instead of parsing the sources ag
 only capture; `--index` runs only indexing. Preparation leaves at least 60 GiB of
 free disk space. Downloads and indexes stay outside git.
 
-WARCs are stored in `demos/downloads/security/`, outside git. Capture the URLs
-in the seed with:
+WARCs are stored in `demos/downloads/security/`, outside git. Capture the seed
+pages, references and their requisites with:
 
 ```sh
 rustup run 1.99.0 cargo xtask search-capture /path/to/demos/downloads --research
@@ -211,6 +213,26 @@ headers and response bodies.
 Microsoft's site required a browser User-Agent. Referenced NIST PDFs are also
 captured. Some upstream optional images and fonts return errors in the original
 sites and retain those errors in replay.
+
+Capture follows stylesheets, CSS imports, fonts, images and scripts across hosts.
+Chromium refreshes page HTML and discovers dependencies requested by JavaScript
+at a desktop viewport. Successful refreshed pages become new records; a failed
+refresh retains a previous successful response and reports the upstream failure.
+Its requests use the same host transport with the browser's request
+headers; the browser itself has no Internet route.
+
+Complete requisites for every page in an existing corpus with:
+
+```sh
+rustup run 1.99.0 cargo xtask search-requisites demos/downloads/security
+```
+
+Append URLs to that command to capture or repair individual pages. Cached pages
+are traversed too. New WARC batches are flushed and linked into place atomically;
+the original archives and URLs remain intact. Upstream HTTP errors are retained
+at their original URLs, and transport failures are reported in the capture output.
+Batches published after the offline index was prepared are served at startup
+without reindexing.
 
 The previous astronomy captures remain in `demos/downloads/astronomy/`.
 

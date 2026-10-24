@@ -50,6 +50,7 @@ impl Response {
             Some("gzip") => Box::new(flate2::read::GzDecoder::new(self.body.as_ref())),
             Some("deflate") => Box::new(flate2::read::ZlibDecoder::new(self.body.as_ref())),
             Some("br") => Box::new(brotli::Decompressor::new(self.body.as_ref(), 4096)),
+            Some("zstd") => Box::new(zstd::stream::read::Decoder::new(self.body.as_ref())?),
             Some(encoding) => {
                 return Err(invalid(format!("unsupported content encoding {encoding}")));
             }
@@ -233,6 +234,12 @@ impl Archive {
             }
         }
         Ok(archive)
+    }
+
+    /// Add later captures. Their records replace earlier records for the same URL.
+    pub fn extend(&mut self, later: Archive) {
+        self.urls.extend(later.urls);
+        self.ids.extend(later.ids);
     }
 
     /// Open immutable captures in publication order, with stable path ties.

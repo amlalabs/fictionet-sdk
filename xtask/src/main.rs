@@ -28,6 +28,9 @@ async fn main() -> Result {
         }
         return web::build(&downloads, step).await;
     }
+    if task == "search-requisites" {
+        return capture::requisites(&downloads, &args.collect::<Vec<_>>()).await;
+    }
     if task == "search-capture" {
         let selection = args
             .next()

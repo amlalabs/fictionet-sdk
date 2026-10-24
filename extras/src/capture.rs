@@ -6,7 +6,6 @@ pub use transport::{Pool, client, public_address, receive};
 
 use crate::warc;
 use kuchiki::traits::TendrilSink;
-use regex::Regex;
 use std::io;
 use url::Url;
 
@@ -20,6 +19,15 @@ pub enum Purpose {
     Search,
     /// Copy a reached page, redirect or dependency.
     Capture,
+}
+
+/// Whether a response was reached as a page or as one of its dependencies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Resource {
+    /// A page reached directly or through a navigation redirect.
+    Document,
+    /// A stylesheet, script, font, image or other page dependency.
+    Requisite,
 }
 
 /// A credential-free lifecycle event for a host request.
@@ -209,6 +217,9 @@ pub fn links(url: &str, response: &warc::Response) -> io::Result<Links> {
 }
 
 fn link(base: &Url, value: &str, out: &mut dyn FnMut(String) -> io::Result<()>) -> io::Result<()> {
+    if value.trim().is_empty() || value.trim_start().starts_with('#') {
+        return Ok(());
+    }
     let Some(url) = base.join(value).ok().and_then(|u| warc::key(u.as_str())) else {
         return Ok(());
     };
@@ -216,16 +227,58 @@ fn link(base: &Url, value: &str, out: &mut dyn FnMut(String) -> io::Result<()>) 
 }
 
 fn css(text: &str, base: &Url, out: &mut dyn FnMut(String) -> io::Result<()>) -> io::Result<()> {
-    static URLS: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    let regex = URLS.get_or_init(|| {
-        Regex::new(r#"(?i)url\(\s*["']?([^\s\)"']+)|@import\s+["']([^"']+)"#).unwrap()
-    });
-    for captures in regex.captures_iter(text) {
-        if let Some(value) = captures.get(1).or_else(|| captures.get(2)) {
-            link(base, value.as_str(), out)?;
+    css_tokens(&mut cssparser::Parser::new(text), base, out, false)
+}
+
+fn css_tokens(
+    input: &mut cssparser::Parser<'_>,
+    base: &Url,
+    out: &mut dyn FnMut(String) -> io::Result<()>,
+    strings: bool,
+) -> io::Result<()> {
+    use cssparser::Token;
+    let mut result = Ok(());
+    while result.is_ok()
+        && let Ok(token) = input.next().cloned()
+    {
+        match token {
+            Token::UnquotedUrl(value) => result = link(base, &value, out),
+            Token::QuotedString(value) if strings => result = link(base, &value, out),
+            Token::AtKeyword(name) if name.eq_ignore_ascii_case("import") => {
+                if let Ok(value) = input.try_parse(|input| input.expect_string_cloned()) {
+                    result = link(base, &value, out);
+                }
+            }
+            Token::Function(name) if name.eq_ignore_ascii_case("url") => {
+                let _: Result<_, cssparser::ParseError<()>> = input.parse_nested_block(|input| {
+                    if let Ok(value) = input.expect_string() {
+                        result = link(base, value, out);
+                    }
+                    Ok(())
+                });
+            }
+            Token::Function(name)
+                if name.eq_ignore_ascii_case("image-set")
+                    || name.eq_ignore_ascii_case("-webkit-image-set") =>
+            {
+                let _: Result<_, cssparser::ParseError<()>> = input.parse_nested_block(|input| {
+                    result = css_tokens(input, base, out, true);
+                    Ok(())
+                });
+            }
+            Token::Function(_)
+            | Token::ParenthesisBlock
+            | Token::SquareBracketBlock
+            | Token::CurlyBracketBlock => {
+                let _: Result<_, cssparser::ParseError<()>> = input.parse_nested_block(|input| {
+                    result = css_tokens(input, base, out, false);
+                    Ok(())
+                });
+            }
+            _ => {}
         }
     }
-    Ok(())
+    result
 }
 
 fn srcset(
@@ -247,6 +300,34 @@ fn srcset(
         link(base, candidate.trim_end_matches(','), out)?;
     }
     Ok(())
+}
+
+/// Follow dependencies and redirects without expanding HTML returned in place
+/// of a stylesheet, script, font or image. SPA fallbacks are still archived.
+pub fn requisites(
+    url: &str,
+    response: &warc::Response,
+    resource: Resource,
+) -> io::Result<Vec<(String, Resource)>> {
+    if resource == Resource::Requisite
+        && !response.status.is_redirection()
+        && response
+            .headers
+            .get(http::header::CONTENT_TYPE)
+            .is_some_and(|value| value.as_bytes().starts_with(b"text/html"))
+    {
+        return Ok(Vec::new());
+    }
+    let links = links(url, response)?;
+    let mut next = links
+        .assets
+        .into_iter()
+        .map(|url| (url, Resource::Requisite))
+        .collect::<Vec<_>>();
+    if response.status.is_redirection() {
+        next.extend(links.pages.into_iter().map(|url| (url, resource)));
+    }
+    Ok(next)
 }
 
 /// Discover static dependencies using the response's base URL and HTML base tag.
@@ -348,18 +429,33 @@ pub fn visit_links(
         {
             return Ok(());
         }
-        for name in ["src", "data"] {
+        for name in ["src", "data-src", "data-lazy-src", "data-original"] {
             if let Some(value) = attr(name) {
                 link(&base, value, &mut |url| visit(LinkKind::Asset, url))?;
             }
         }
-        if let Some(value) = attr("srcset") {
-            srcset(value, &base, &mut |url| visit(LinkKind::Asset, url))?;
+        if name == "object"
+            && let Some(value) = attr("data")
+        {
+            link(&base, value, &mut |url| visit(LinkKind::Asset, url))?;
+        }
+        for name in ["srcset", "data-srcset", "data-lazy-srcset"] {
+            if let Some(value) = attr(name) {
+                srcset(value, &base, &mut |url| visit(LinkKind::Asset, url))?;
+            }
+        }
+        if matches!(name, "image" | "use")
+            && let Some(value) = attr("href")
+        {
+            link(&base, value, &mut |url| visit(LinkKind::Asset, url))?;
         }
         if name == "link"
             && attr("rel").is_some_and(|r| {
-                r.split_whitespace()
-                    .any(|v| matches!(v, "stylesheet" | "icon" | "preload" | "modulepreload"))
+                r.split_whitespace().any(|value| {
+                    ["stylesheet", "icon", "preload", "modulepreload"]
+                        .iter()
+                        .any(|rel| value.eq_ignore_ascii_case(rel))
+                })
             })
             && let Some(value) = attr("href")
         {
