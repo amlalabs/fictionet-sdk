@@ -530,6 +530,9 @@ impl RunState {
             for waker in idle.into_values() {
                 waker.wake();
             }
+            // A waker outside the run does not wake it, so come back: a lab
+            // jumps its clock next if the wakeups gave no task work.
+            cx.waker().wake_by_ref();
         } else if !more && self.shared.environment.clock.mode() == crate::RunMode::Lab {
             // Admission and the time jump share this boundary. A spawn or
             // wake cannot slip between checking the queue and advancing.
@@ -561,10 +564,15 @@ impl Drop for RunState {
             q.outer = None;
             std::mem::take(&mut q.incoming)
         };
-        let joins: Vec<Arc<JoinState>> = incoming
+        // The dropped work, as its region and joiner see it ending.
+        let ended: Vec<(Arc<Region>, Arc<JoinState>)> = incoming
             .iter()
-            .map(|t| t.join.clone())
-            .chain(self.slots.values().map(|s| s.join.clone()))
+            .map(|t| (t.region.clone(), t.join.clone()))
+            .chain(
+                self.slots
+                    .values()
+                    .map(|s| (s.region.clone(), s.join.clone())),
+            )
             .collect();
         for task in incoming {
             let NewTask {
@@ -591,12 +599,17 @@ impl Drop for RunState {
         // Work spawned while the slots were dropped.
         let late = std::mem::take(&mut self.shared.queue.lock().incoming);
         drop(late);
-        // Waits outside the run end too: joins of the dropped work, and
-        // every wait on a `Cx` of the run, which reads `Cancelled`.
-        for join in joins {
-            join.finish(Err(JoinError::Cancelled));
-        }
+        // Every region of the run is cancelled before any of them sees its
+        // dropped work end, so a wait outside the run on one of its `Cx`
+        // clones reads `Cancelled`.
         self.root.cancel();
+        // Waits outside the run end too: joins of the dropped work, and
+        // regions waiting for it, which count it as ended by the cancel.
+        for (region, join) in ended {
+            join.finish(Err(JoinError::Cancelled));
+            region.ended_by_cancel();
+            region.task_done(false);
+        }
     }
 }
 

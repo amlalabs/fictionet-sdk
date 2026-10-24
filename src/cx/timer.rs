@@ -62,7 +62,9 @@ impl Timer {
                     Some(id) if self.deadline == Some(at) => {
                         self.fcx.run.environment.clock.update(id, cx.waker())
                     }
-                    Some(id) => self.fcx.run.environment.clock.reset(id, at, cx.waker()),
+                    Some(id) => {
+                        self.entry = Some(self.fcx.run.environment.clock.reset(id, at, cx.waker()))
+                    }
                     None => {
                         self.entry =
                             Some(self.fcx.run.environment.clock.add(at, cx.waker().clone()))
