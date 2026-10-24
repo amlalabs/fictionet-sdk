@@ -28,8 +28,9 @@ key and placeholder Claude credential before SSH and the desktop start. The real
 Claude token stays on the host. `claude` opens ready to work. Each launch writes
 to a fresh disk overlay; the prepared image stays unchanged. All demo flows use
 this workstation. The terminal uses ghostty-web and a persistent tmux session;
-Screen shows Firefox. Terminal text starts at 19 px; the text controls adjust its size and the expand control widens the agent pane. Pass `preview` instead of the downloads folder to run
-without a VM.
+Screen shows Firefox. Terminal text starts at 19 px on a dark background in both
+page themes; the text controls adjust its size and the expand control widens the
+agent pane. Pass `preview` instead of the downloads folder to run without a VM.
 
 On the workstation, a before-and-after run reached full readiness in 63.384 s
 with boot-time installation and 7.213 s with the prepared image. Desktop readiness
@@ -46,22 +47,25 @@ real requests inside the world. Model calls appear when an agent uses the
 gateway; preview does not invent provider traffic.
 
 [app/src/main.rs](app/src/main.rs) assembles the workstation and its owned page.
-[app/src/network.rs](app/src/network.rs) connects the model gateway and inspected
-provider sign-in. Search explicitly reports typed facts from its request and
+[app/src/network.rs](app/src/network.rs) connects the model gateway and local
+startup services. Search explicitly reports typed facts from its request and
 tool handlers, its name resolver and the typed no-route callback on its network.
 
 [app/src/page/](app/src/page/) projects those facts into the map, site details,
 model calls and recent activity. Selecting a site or gateway keeps the map
 above its details while the agent remains visible. The scrubber replays the
 retained observation history; the agent stays live. The World menu chooses the page source or restarts world pages.
-The last 1024 observations are kept for rewind. Setup connections and sign-in
-policy survive activity expiry and page restarts. Each launch writes its facts to a separate
+The last 1024 observations are kept for rewind. Observed internet destinations
+and sign-in policy survive activity expiry and page restarts. Each launch writes its facts to a separate
 `<downloads>/search/run-<uuid>.jsonl` with RFC 3339 wall-clock timestamps and
 owner-only permissions. Preview records are under `demos/downloads/search-preview/`.
 Request credentials are redacted before entering the observation channel; request
-bodies are not retained. The map draws internet routes from upstream facts,
-including setup downloads and sign-in, rather than from model call activity.
-Local and rejected model requests therefore leave the internet wire dark.
+bodies are not retained. Header details show only values retained by recording.
+The map draws internet
+routes from upstream facts, including host page-writer calls, rather than from
+model call activity. Local and rejected model requests therefore leave the
+internet wire dark. The activity feed updates one row per upstream attempt;
+the run record retains each transport phase.
 
 Page and search request bodies are limited to one MiB, including chunked requests; larger
 bodies receive 413 before routing. The observation queue holds at most 256 facts,
@@ -81,18 +85,24 @@ sites. Capture dates are shown only when the archive records them.
   searches have no results. Counts come from the index before pagination.
   Missing URLs on captured hosts return 404. Uncaptured hosts return NXDOMAIN,
   apart from the caller's declared model and sign-in services.
-- **Model-written** uses `OPENROUTER_API_KEY` to write pages from a prose brief,
-  prior mentions and stored claims. Failed calls do not invent fallback articles.
+- **Model-written** writes pages from a prose brief, prior mentions and stored
+  claims. The app chooses the host-held Claude token first, then
+  `OPENROUTER_API_KEY`, then `ANTHROPIC_API_KEY`. The page writer uses its own
+  host-side model client; it does not send its credential through the guest.
+  Failed calls do not invent fallback articles.
 - **Live** uses `EXA_API_KEY` for [Exa search](https://github.com/exa-labs/openapi-spec/blob/master/exa-openapi-spec.yaml).
   Results retain their order, titles, URLs and snippets in each engine's skin.
-  Without the key, the World menu identifies the missing configuration and the
-  other sources remain usable.
+  The World menu shows why a source is unavailable: missing captures, a page
+  writer or a search key. Other sources remain usable.
 
 Live downloads result pages and requisites, following navigation to depth five
 within each result's site. Redirects and cross-host assets are retained at their
-real URLs. Search queries and served pages are logged and displayed. The crawler ignores
+real URLs. Live search and capture use a separate host HTTP transport, outside
+the guest model gateway; selecting Live permits public-web downloads. Search
+queries and served pages are logged and displayed. The crawler ignores
 robots.txt and limits requests per host. Unknown URLs do not start downloads.
-The page reports the source that answered each request.
+The page reports the source that answered each request. Keep Copied selected
+for the bounded security research and offline package flows.
 
 The content audit applies to text the world writes. Replayed WARC responses carry
 capture provenance and are outside that scope; their words are not allowlisted.
@@ -100,22 +110,27 @@ capture provenance and are outside that scope; their words are not allowlisted.
 ## Provider boundary
 
 Every world-served HTTPS host uses the Zscaler look-alike chain from
-`fictionet-extras`, with its root installed in the guest. Sign-in hosts include
-`claude.com`. Their HTTPS requests are inspected and forwarded only during
-setup, including provider-hosted assets and hCaptcha. Its regional asset hosts
-follow the [published hCaptcha domains](https://docs.hcaptcha.com/#content-security-policy-settings).
-The first successful inference response closes interactive sign-in for
-the rest of the run, including requests on existing connections. Only validated
-refresh-token grants to the Claude and OpenAI token endpoints remain on these
-hosts. Refresh requests are serialized from the validated fields before sending.
-Account profile, policy, model-catalog and usage endpoints are restricted to
-specific paths and methods; API key creation closes with sign-in.
+`fictionet-extras`, with its root installed in the guest. The prepared image
+contains the software; boot has no installation window or download forwarding.
+Interactive provider sign-in, guest token refresh and API key creation stay
+closed throughout the run. This app provides no Codex sign-in or tokenless
+Claude sign-in flow.
 
-The world's observations report sign-in state and every remaining exception,
-and upstream attempts, responses and refusals. Interactive sign-in paths, query strings, headers
-and bodies are omitted because they can contain credentials. An attempt means
-the request entered the host transport, not that a connection succeeded. Local
-startup responses and rejected requests do not produce an upstream attempt.
+The host reads `CLAUDE_CODE_OAUTH_TOKEN_FILE` at startup. The guest receives a
+placeholder OAuth token; the gateway substitutes the real token only when
+forwarding an admitted Anthropic request. The long-lived token does not refresh
+inside the guest. Account provisioning and any refreshable credentials belong
+on the host. Startup checks and host-token policy reads are answered locally.
+The gateway restricts operational account, catalog and usage reads to specific
+provider paths and methods; these exceptions are policy, not evidence that a
+request occurred.
+
+The world's observations report sign-in policy and upstream attempts, responses
+and failures. An attempt means the request entered the host transport, not that
+a connection succeeded. Model gateway and page-writer requests share this
+observed provider transport. Local startup responses and rejected requests do
+not produce an upstream attempt. Live's host search and capture transport is
+separate from this provider boundary.
 
 Provider URL image, document and file sources and unsupported server tools are
 refused before web-tool splicing, including requests mixing allowed web tools
@@ -219,7 +234,7 @@ boots the VM or uses the demo's port.
 
 The world's page modules separate routing, generation, listings, stored pages,
 corrections and model tools. Prompt construction and answer parsing are separate.
-The WARC reader, crawler, BM25 index, model gateway and sign-in policy live in
+The WARC reader, crawler, BM25 index, model gateway and credential transport live in
 `fictionet-extras`. The shared demo kit supplies VM lifetime, prepared images
 and SSH console sockets. Search owns its HTML, styles and JavaScript, including copies of the
 terminal and screen pieces. ghostty-web 0.4.0 and noVNC 1.7.0, with their
