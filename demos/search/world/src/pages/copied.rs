@@ -441,7 +441,14 @@ impl Pages {
         let search = if let Some(reference) = &corpus.reference {
             reference
                 .index
-                .search(query, start.try_into().unwrap_or(usize::MAX), 10)
+                .search(query, start.try_into().unwrap_or(usize::MAX), 10, |url| {
+                    let response = corpus
+                        .response(url)?
+                        .ok_or_else(|| std::io::Error::other("indexed page is unavailable"))?;
+                    fictionet_extras::capture::page_text(&String::from_utf8_lossy(
+                        &response.decoded()?,
+                    ))
+                })
                 .map_err(Stop::store)?
         } else {
             corpus

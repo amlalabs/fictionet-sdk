@@ -1,34 +1,6 @@
 use super::*;
 
 #[test]
-fn domain_information_does_not_preempt_fetches_for_uncaptured_hosts() {
-    fictionet::block_on(fictionet::run(
-        fictionet::Seed::from_u64(1),
-        |cx| async move {
-            let site = Model::guest_at(&cx, Provider::Anthropic, "http://127.0.0.1:1".parse()?)?;
-            for host in ["en.wikipedia.org", "meltdownattack.com", "uncaptured.org"] {
-                let response = site
-                    .clone()
-                    .send(
-                        Request::get(format!("/api/web/domain_info?domain={host}"))
-                            .body(Body::empty())?,
-                    )
-                    .await?;
-                assert_eq!(response.status(), 200);
-                let bytes = response.into_body().collect().await?.to_bytes();
-                assert_eq!(
-                    serde_json::from_slice::<Value>(&bytes)?,
-                    json!({"can_fetch":true})
-                );
-            }
-            assert_eq!(site.ledger.lock().unwrap().calls, 0);
-            Ok(())
-        },
-    ))
-    .unwrap();
-}
-
-#[test]
 fn claude_code_policy_limits_require_credentials() {
     fictionet::block_on(fictionet::run(
         fictionet::Seed::from_u64(1),

@@ -21,13 +21,13 @@ struct Fields {
 
 fn schema() -> (Schema, Fields) {
     let mut schema = Schema::builder();
-    let text = TextOptions::default().set_stored().set_indexing_options(
+    let text = TextOptions::default().set_indexing_options(
         TextFieldIndexing::default()
             .set_tokenizer("default")
             .set_index_option(IndexRecordOption::WithFreqs),
     );
     let url = schema.add_text_field("url", STRING | STORED);
-    let title = schema.add_text_field("title", text.clone());
+    let title = schema.add_text_field("title", text.clone().set_stored());
     let body = schema.add_text_field("body", text);
     (schema.build(), Fields { url, title, body })
 }
@@ -70,7 +70,13 @@ impl DiskIndex {
     }
 
     /// Query text is data, never query syntax. Every matching term contributes.
-    pub fn search(&self, query: &str, start: usize, limit: usize) -> io::Result<search::Search> {
+    pub fn search(
+        &self,
+        query: &str,
+        start: usize,
+        limit: usize,
+        mut text_for: impl FnMut(&str) -> io::Result<String>,
+    ) -> io::Result<search::Search> {
         let mut analyzer = self
             .index
             .tokenizer_for_field(self.fields.body)
@@ -129,10 +135,12 @@ impl DiskIndex {
                     .unwrap_or("")
                     .to_owned()
             };
+            let url = text(self.fields.url);
+            let body = text_for(&url)?;
             results.push(search::Result {
-                url: text(self.fields.url),
+                url,
                 title: text(self.fields.title),
-                snippet: snippet.snippet_from_doc(&document).fragment().to_owned(),
+                snippet: snippet.snippet(&body).fragment().to_owned(),
                 ..Default::default()
             });
         }

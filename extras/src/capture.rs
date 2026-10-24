@@ -2,7 +2,7 @@
 
 mod transport;
 
-pub use transport::{client, public_address, receive};
+pub use transport::{Pool, client, public_address, receive};
 
 use crate::warc;
 use kuchiki::traits::TendrilSink;

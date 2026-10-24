@@ -5,6 +5,28 @@ use crate::warc;
 use std::{io, net::IpAddr};
 use url::Url;
 
+/// Reuse public connections without changing their pinned destinations.
+#[derive(Clone, Default)]
+pub struct Pool {
+    clients:
+        std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<url::Origin, reqwest::Client>>>,
+}
+
+impl Pool {
+    /// Obtain the connection pool for this URL's origin.
+    pub async fn client(&self, url: &Url) -> io::Result<reqwest::Client> {
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(io::Error::other("URL contains credentials"));
+        }
+        let origin = url.origin();
+        if let Some(client) = self.clients.lock().await.get(&origin) {
+            return Ok(client.clone());
+        }
+        let client = client(url).await?;
+        Ok(self.clients.lock().await.entry(origin).or_insert(client).clone())
+    }
+}
+
 /// Whether an address belongs to the public Internet.
 pub fn public_address(ip: IpAddr) -> bool {
     match ip {

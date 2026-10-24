@@ -20,7 +20,13 @@ fn wiki_file(root: &Path) -> std::path::PathBuf {
     root.join("wikipedia_en_all_nopic_2026-06.zim")
 }
 
-fn sources(root: &Path, research: &Path) -> io::Result<String> {
+#[derive(Serialize, Deserialize)]
+struct Prepared {
+    files: Vec<ArchiveFile>,
+    documents: Archive,
+}
+
+fn sources(root: &Path, research: &Path) -> io::Result<Vec<ArchiveFile>> {
     let mut files = archive_files(&Archive::directory_root(research)?)?;
     files.extend(archive_files(root)?);
     let path = std::fs::canonicalize(wiki_file(root))?;
@@ -30,7 +36,7 @@ fn sources(root: &Path, research: &Path) -> io::Result<String> {
         bytes: metadata.len(),
         modified: metadata.modified()?,
     });
-    serde_json::to_string(&files).map_err(io::Error::other)
+    Ok(files)
 }
 
 fn documents(root: &Path) -> io::Result<Archive> {
@@ -52,18 +58,24 @@ impl ReferenceWeb {
     pub fn open(root: &Path, research: &Path) -> Result<Self, String> {
         let wikipedia = Zim::new(wiki_file(root))
             .map_err(|e| format!("Offline Wikipedia: {e}. Run cargo xtask search-web"))?;
-        let documents = documents(root).map_err(|e| e.to_string())?;
+        let index = DiskIndex::open(&root.join("index/current"))
+            .map_err(|e| format!("Offline search index: {e}. Run cargo xtask search-web"))?;
+        let prepared: Prepared = serde_json::from_str(
+            &index
+                .source()
+                .map_err(|e| e.to_string())?
+                .ok_or("offline index has no sources")?,
+        )
+        .map_err(|e| e.to_string())?;
+        if prepared.files != sources(root, research).map_err(|e| e.to_string())? {
+            return Err("Offline corpus changed. Run cargo xtask search-web with --index".into());
+        }
+        let documents = prepared.documents;
         let hosts = documents
             .urls()
             .filter_map(|url| url::Url::parse(url).ok()?.host_str().map(str::to_owned))
             .collect();
-        let index = DiskIndex::open(&root.join("index/current"))
-            .map_err(|e| format!("Offline search index: {e}. Run cargo xtask search-web"))?;
-        if index.source().map_err(|e| e.to_string())?.as_deref()
-            != Some(sources(root, research).map_err(|e| e.to_string())?.as_str())
-        {
-            return Err("Offline corpus changed. Run cargo xtask search-web with --index".into());
-        }
+        eprintln!("Offline web: {} indexed pages", index.len());
         Ok(Self {
             index,
             wikipedia,
@@ -153,7 +165,11 @@ impl Pages {
         let staged = parent.join(format!(".{stamp}"));
         let source = sources(&root, &research).map_err(|e| e.to_string())?;
         if let Ok(index) = DiskIndex::open(&root.join("index/current"))
-            && index.source().map_err(|e| e.to_string())?.as_deref() == Some(source.as_str())
+            && let Some(prepared) = index
+                .source()
+                .map_err(|e| e.to_string())?
+                .and_then(|payload| serde_json::from_str::<Prepared>(&payload).ok())
+            && prepared.files == source
         {
             eprintln!("Offline search index is current");
             return Ok(());
@@ -222,15 +238,22 @@ impl Pages {
         })?;
         let documents = documents(&root).map_err(|e| e.to_string())?;
         let seeds = documents.urls().map(str::to_owned).collect::<Vec<_>>();
-        let documents = Index::crawl(
+        let document_index = Index::crawl(
             &seeds,
             |url| documents.contains(url),
             |url| documents.get(url),
         )
         .map_err(|e| e.to_string())?;
-        documents.write_to(&writer).map_err(|e| e.to_string())?;
-        let source = sources(&root, &research).map_err(|e| e.to_string())?;
-        writer.finish(&source).map_err(|e| e.to_string())?;
+        document_index
+            .write_to(&writer)
+            .map_err(|e| e.to_string())?;
+        let prepared = Prepared {
+            files: sources(&root, &research).map_err(|e| e.to_string())?,
+            documents,
+        };
+        writer
+            .finish(&serde_json::to_string(&prepared).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
         let published = parent.join(&stamp);
         std::fs::rename(&staged, &published).map_err(|e| e.to_string())?;
         let pointer = parent.join(format!(".{stamp}-current"));

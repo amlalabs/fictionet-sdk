@@ -30,24 +30,19 @@ fn space(path: &Path, additional: u64) -> Result {
     Ok(())
 }
 
-async fn fetch(url: url::Url) -> Result<Response> {
+async fn fetch(pool: &capture::Pool, url: url::Url) -> Result<Response> {
     let mut pause = std::time::Duration::from_secs(1);
     loop {
         let result: Result<Response> = async {
-            let client = capture::client(&url).await?;
+            let client = pool.client(&url).await?;
             let response = client.get(url.clone()).send().await?;
-            if response.status().is_server_error()
-                || response.status() == http::StatusCode::TOO_MANY_REQUESTS
-            {
-                return Err(response.error_for_status().unwrap_err().into());
-            }
             Ok(capture::receive(response).await?)
         }
         .await;
         match result {
             Ok(response) => return Ok(response),
             Err(error) => {
-                eprintln!("Retrying {url}: {error}");
+                eprintln!("Retrying {url}: {error:?}");
                 tokio::time::sleep(pause).await;
                 pause += std::time::Duration::from_secs(1);
             }
@@ -57,6 +52,7 @@ async fn fetch(url: url::Url) -> Result<Response> {
 
 async fn copy_site(root: &Path, name: &str, origin: &str) -> Result {
     use std::collections::{HashSet, VecDeque};
+    let pool = capture::Pool::default();
     let destination = root.join(format!("{name}.warc.gz"));
     if destination.exists() {
         return Ok(());
@@ -80,10 +76,11 @@ async fn copy_site(root: &Path, name: &str, origin: &str) -> Result {
                     || response.status.is_redirection()
                     || response.status == http::StatusCode::NOT_FOUND
             });
+            let pool = pool.clone();
             jobs.spawn(async move {
                 let response = match cached {
                     Some(response) => response,
-                    None => fetch(url::Url::parse(&url)?).await?,
+                    None => fetch(&pool, url::Url::parse(&url)?).await?,
                 };
                 Ok::<_, Box<dyn std::error::Error + Send + Sync>>((url, response))
             });
@@ -137,19 +134,21 @@ async fn copy_site(root: &Path, name: &str, origin: &str) -> Result {
         .filter(|page| page.status == http::StatusCode::NOT_FOUND)
     {
         Some(page) => page,
-        None => fetch(missing_url).await?,
+        None => fetch(&pool, missing_url).await?,
     };
-    if missing.status != http::StatusCode::NOT_FOUND {
-        return Err(format!("{name} did not return a missing-page response").into());
+    if missing.status == http::StatusCode::NOT_FOUND {
+        let mut missing_url = origin.clone();
+        missing_url.set_path("/404");
+        archive.append(&temporary, missing_url.as_str(), &missing)?;
+    } else {
+        eprintln!("{name}: upstream missing-page request returned {}", missing.status);
     }
-    let mut missing_url = origin.clone();
-    missing_url.set_path("/404");
-    archive.append(&temporary, missing_url.as_str(), &missing)?;
     std::fs::rename(temporary, destination)?;
     Ok(())
 }
 
 async fn python(root: &Path) -> Result {
+    let pool = capture::Pool::default();
     use std::io::Read;
     let destination = root.join("python.warc.gz");
     if destination.exists() {
@@ -195,13 +194,75 @@ async fn python(root: &Path) -> Result {
             archive.append(&temporary, "https://docs.python.org/3/", &response)?;
         }
     }
-    let missing = fetch(url::Url::parse("https://docs.python.org/3/404")?).await?;
+    let missing = fetch(&pool, url::Url::parse("https://docs.python.org/3/404")?).await?;
     if missing.status != http::StatusCode::NOT_FOUND {
         return Err("Python did not return its missing-page response".into());
     }
     archive.append(&temporary, "https://docs.python.org/404", &missing)?;
     std::fs::rename(temporary, destination)?;
     eprintln!("Captured the complete Python HTML documentation");
+    Ok(())
+}
+
+async fn rust(root: &Path) -> Result {
+    let pool = capture::Pool::default();
+    use std::io::Read;
+    let destination = root.join("rust.warc.gz");
+    if destination.exists() {
+        return Ok(());
+    }
+    let version = env!("CARGO_PKG_RUST_VERSION");
+    let url = url::Url::parse(&format!(
+        "https://static.rust-lang.org/dist/rust-docs-{version}.0-x86_64-unknown-linux-gnu.tar.xz"
+    ))?;
+    let source = root.join("rust-docs.tar.xz");
+    if !source.exists() {
+        let response = fetch(&pool, url).await?;
+        if !response.status.is_success() {
+            return Err(format!("Rust documentation returned {}", response.status).into());
+        }
+        space(root, response.body.len() as u64)?;
+        std::fs::write(&source, response.body)?;
+    }
+    let decoded = xz2::read::XzDecoder::new(std::fs::File::open(source)?);
+    let mut files = tar::Archive::new(decoded);
+    let temporary = root.join(".rust.warc.gz");
+    let mut archive = Archive::default();
+    for file in files.entries()? {
+        let mut file = file?;
+        if !file.header().entry_type().is_file() {
+            continue;
+        }
+        let path = file.path()?.into_owned();
+        let relative = path.components().skip(6).collect::<std::path::PathBuf>();
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+        let mut body = Vec::new();
+        file.read_to_end(&mut body)?;
+        space(root, body.len() as u64)?;
+        let mime = mime_guess::from_path(&relative).first_or_octet_stream();
+        let response = Response {
+            status: http::StatusCode::OK,
+            headers: http::HeaderMap::from_iter([(
+                http::header::CONTENT_TYPE,
+                mime.as_ref().parse()?,
+            )]),
+            body: body.into(),
+        };
+        let url = format!(
+            "https://doc.rust-lang.org/stable/{}",
+            relative.to_string_lossy()
+        );
+        archive.append(&temporary, &url, &response)?;
+        if let Some(directory) = url.strip_suffix("index.html") {
+            archive.append(&temporary, directory, &response)?;
+        }
+    }
+    let missing = fetch(&pool, url::Url::parse("https://doc.rust-lang.org/404")?).await?;
+    archive.append(&temporary, "https://doc.rust-lang.org/404", &missing)?;
+    std::fs::rename(temporary, destination)?;
+    eprintln!("Captured the complete Rust HTML documentation");
     Ok(())
 }
 
@@ -281,6 +342,7 @@ pub async fn build(downloads: &Path, step: Step) -> Result {
     }
     if !matches!(step, Step::Index) {
         python(&root).await?;
+        rust(&root).await?;
         for (name, url) in [
             ("mdn", "https://developer.mozilla.org/en-US/docs/"),
             ("github-docs", "https://docs.github.com/en"),

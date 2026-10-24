@@ -14,10 +14,12 @@ impl Drop for Runtime {
 
 pub(super) struct Transport {
     runtime: Runtime,
+    clients: capture::Pool,
 }
 impl Transport {
     pub(super) fn new() -> Result<Self, String> {
         Ok(Self {
+            clients: capture::Pool::default(),
             runtime: Runtime(Some(
                 tokio::runtime::Builder::new_multi_thread()
                     .worker_threads(1)
@@ -109,7 +111,7 @@ impl Transport {
             }
         });
         let work = async {
-            let client = capture::client(&url).await.map_err(|e| e.to_string())?;
+            let client = self.clients.client(&url).await.map_err(|e| e.to_string())?;
             let request = if let Some((key, body)) = search {
                 client
                     .post(url)

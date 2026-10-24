@@ -98,7 +98,7 @@ Capture dates appear when the archive records them.
 
 ## Page sources
 
-- **Copied** serves offline English Wikipedia, Python, MDN and GitHub documentation,
+- **Copied** serves offline English Wikipedia, Python, Rust, MDN and GitHub documentation,
   and the captured security sources at their original URLs. A prepared Tantivy
   index ranks partial matches by BM25 with extra title weight. Google, Bing,
   DuckDuckGo and Claude's search tool share that index. Result counts come from

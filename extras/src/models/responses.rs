@@ -477,7 +477,7 @@ async fn run(
         .is_some_and(|fields| fields.iter().any(|f| f == "web_search_call.action.sources"));
     let mut used = 0;
     let mut tokens = 0;
-    for _ in 0..16 {
+    loop {
         let offset = output.items.len();
         let turn = read(response, &model, output).await?;
         tokens += turn.response["usage"]["output_tokens"]
@@ -567,5 +567,4 @@ async fn run(
             return Ok(Some(response));
         }
     }
-    Err(Error::msg("Server tool turn limit reached"))
 }
