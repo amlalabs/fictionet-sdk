@@ -11,7 +11,7 @@ const button = (text, action, className) => {
   node.addEventListener('click', action);
   return node;
 };
-const stamp = (ms) => new Date((shown.started_at_ms || Date.now()) + ms).toLocaleTimeString([], { hour12: false });
+const stamp = (ms) => new Date((shown.started_at_ms || Date.now()) + ms).toLocaleTimeString([], { hour12: false, timeZone: 'UTC' });
 const time = stamp;
 const size = (bytes) => bytes < 1024 ? `${bytes} B` : `${Math.round(bytes / 1024)} KB`;
 const sourceName = (source) => source.kind === 'copy' ? source.captured ? `Copied · ${source.captured.slice(0, 10)}` : 'Copied' : source.kind === 'live' ? 'live' : 'model-written';
@@ -30,7 +30,7 @@ function notice(text) {
   noticeTimer = setTimeout(() => { $('notice').hidden = true; }, 6500);
 }
 function select(key) {
-  if (key !== selection) document.body.classList.remove('page-expanded');
+  if (key !== selection) document.body.classList.toggle('page-expanded', !!key?.startsWith('page:') && !!requestFor(key.slice(5))?.has_preview);
   document.body.classList.toggle('page-selected', !!key?.startsWith('page:'));
   selection = key;
   $('details').hidden = !key;
@@ -160,16 +160,15 @@ function activityText(row) {
 }
 function feed() {
   const scrollTop = $('activity').scrollTop;
-  const atBottom = $('activity').scrollHeight - $('activity').scrollTop - $('activity').clientHeight < 24;
   $('activity').replaceChildren();
-  for (const row of activityRows().filter((r) => r.fact.kind !== 'run_started' && !(r.fact.kind === 'egress' && r.fact.purpose === 'model')).slice(-100)) {
+  for (const row of activityRows().filter((r) => r.fact.kind !== 'run_started' && !(r.fact.kind === 'egress' && r.fact.purpose === 'model')).slice(-100).reverse()) {
     const [target, protocol, text, selected] = activityText(row);
     const item = button('', () => select(selected), `activity-row ${row.fact.kind}`);
     item.append(element('span', stamp(row.at_ms), 'stamp'), element('span', target), element('span', protocol), element('span', text));
     item.title = `${target} · ${text}`;
     $('activity').append(item);
   }
-  $('activity').scrollTop = atBottom ? $('activity').scrollHeight : scrollTop;
+  $('activity').scrollTop = scrollTop;
   if (world?.preview) {
     $('preview-output').textContent = latest.activity.filter((r) => r.fact.kind !== 'run_started').slice(-10).map((r) => { const [host, protocol, text] = activityText(r); return `${protocol}  ${host}\n  ${text}`; }).join('\n\n');
   }
