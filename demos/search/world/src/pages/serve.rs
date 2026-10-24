@@ -276,19 +276,8 @@ impl Pages {
             && let Ok(body) = std::str::from_utf8(&response.body)
         {
             let store = self.store();
-            let url = format!("https://{host}{target}");
-            let page_host = store
-                .page(host, target)
-                .map_or(host, |page| page.host.as_str());
-            let profile = store
-                .site(page_host)
-                .cloned()
-                .unwrap_or_else(|| make::site_profile(page_host));
             if let Some(body) = render::normalize_page(
                 body,
-                &url,
-                &profile.name,
-                store.cast().map_or(&[], |cast| cast.people.as_slice()),
                 (make::site_profile(host).kind == make::SiteKind::Wiki).then(|| {
                     store
                         .page(host, target)

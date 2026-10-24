@@ -180,50 +180,6 @@ pub(crate) fn cookie_words(host: &str) -> (&'static str, &'static str, &'static 
     }
 }
 
-pub(crate) fn hero(title: &str, name: &str) -> String {
-    let hash = host_hash(title);
-    let accent = if hash.is_multiple_of(2) {
-        "var(--accent, var(--app-photo-warm))"
-    } else {
-        "var(--app-mem, var(--app-photo-cool))"
-    };
-    let mut shapes = String::new();
-    for index in 0..6 + hash % 4 {
-        let mut n = (hash as u64).wrapping_add((index as u64 + 1).wrapping_mul(0x9e3779b97f4a7c15));
-        n = (n ^ (n >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-        n = (n ^ (n >> 27)).wrapping_mul(0x94d049bb133111eb);
-        n ^= n >> 31;
-        let x = n % 840;
-        let y = n.rotate_left(13) % 360;
-        let width = 90 + n.rotate_left(7) % 330;
-        let height = 35 + n.rotate_left(19) % 155;
-        let opacity = 25 + n % 45;
-        let color = if index % 3 == 0 {
-            accent
-        } else if index % 3 == 1 {
-            "var(--app-ink, currentColor)"
-        } else {
-            "var(--app-pane, var(--app-photo-paper))"
-        };
-        if index.is_multiple_of(2) {
-            shapes.push_str(&format!(
-                r#"<ellipse cx="{x}" cy="{y}" rx="{width}" ry="{height}" fill="{color}" opacity=".{opacity}"/>"#
-            ));
-        } else {
-            shapes.push_str(&format!(
-                r#"<rect x="{x}" y="{y}" width="{width}" height="{height}" rx="{}" transform="rotate({} {x} {y})" fill="{color}" opacity=".{opacity}"/>"#,
-                height / 2,
-                (n % 70) as isize - 35,
-            ));
-        }
-    }
-    format!(
-        r#"<figure class="article-hero" style="width:100%;margin:24px 0;--app-photo-paper:light-dark(#ffffff,#141917);--app-photo-warm:light-dark(#df5835,#f0704c);--app-photo-cool:light-dark(#2552c4,#86a4f6);--app-photo-mute:light-dark(#5d6761,#93a09a)"><svg role="img" aria-label="{}" viewBox="0 0 840 360" preserveAspectRatio="xMidYMid slice" style="display:block;width:100%;height:auto;aspect-ratio:21/9;max-height:300px;overflow:hidden"><defs><linearGradient id="article-ground" x1="0" y1="0" x2="1" y2="1"><stop stop-color="var(--app-pane, var(--app-photo-paper))"/><stop offset="1" stop-color="var(--accent, var(--app-ink, currentColor))"/></linearGradient><filter id="article-blur" x="-30%" y="-50%" width="160%" height="200%"><feGaussianBlur stdDeviation="24"/></filter></defs><rect width="840" height="360" fill="url(#article-ground)"/><g filter="url(#article-blur)">{shapes}</g></svg><figcaption style="color:var(--app-mute, var(--app-photo-mute));font:12px/1.5 system-ui,sans-serif;margin-top:6px">Photo: {}</figcaption></figure>"#,
-        e(title),
-        e(name)
-    )
-}
-
 /// Aligns a numbered list title with its main list or comparison table.
 pub(crate) fn counted(title: &str, html: &str) -> (String, String) {
     use kuchiki::traits::TendrilSink;

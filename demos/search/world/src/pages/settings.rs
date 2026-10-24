@@ -41,8 +41,7 @@ impl Pages {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// A world whose pages are written by a model, driven from the demo
-    /// page. Everything stays in memory.
+    /// A world whose pages are written by a model. Everything stays in memory.
     pub fn with_model(seed: Seed, model: Model) -> Self {
         let mut pages = Self::new(seed);
         pages.maker = Some(Maker::Model(model));
@@ -225,8 +224,8 @@ impl Pages {
             }
             Command::PlantFact { text, .. } => {
                 let text = normalize(&text);
-                if text.is_empty() || text.chars().count() > 600 {
-                    return Err(invalid("Write a fact of 1 to 600 characters"));
+                if text.is_empty() {
+                    return Err(invalid("Write a fact"));
                 }
                 if let Some(word) = gives_away(&text) {
                     return Err(invalid(&format!("A page cannot say {word:?}")));

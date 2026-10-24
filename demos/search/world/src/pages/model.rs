@@ -6,9 +6,9 @@
 //! failing servers, transport errors and unreadable responses) are asked
 //! again after a growing pause until an answer arrives. An answer the world
 //! cannot read is rewritten until it can; chronology corrections remain
-//! pending until a consistent document is ready. Every attempt becomes a row
-//! of the store's `generations.jsonl`, and the last row of a generation
-//! carries its totals.
+//! pending until a consistent document is ready. Source changes cancel
+//! outstanding work. Every attempt becomes a row of the store's
+//! `generations.jsonl`, and the last row of a generation carries its totals.
 //!
 //! The key comes from `ANTHROPIC_API_KEY` or `OPENROUTER_API_KEY`. It must
 //! be printable ASCII, is sent in the request's header and nowhere else,
@@ -433,16 +433,13 @@ impl Model {
                 } else {
                     json!(system)
                 };
-                let mut body = json!({
+                json!({
                     "model": self.model,
                     "max_tokens": OUTPUT_CEILING,
+                    "thinking": {"type": "disabled"},
                     "system": system,
                     "messages": [{"role":"user", "content":user}],
-                });
-                if !self.reasoning.is_empty() {
-                    body["output_config"] = json!({"effort":self.reasoning});
-                }
-                body
+                })
             }
             Provider::OpenRouter => {
                 let mut body = json!({
@@ -457,9 +454,7 @@ impl Model {
                     // The fastest provider that serves the model, not the cheapest.
                     "provider": {"sort": "throughput"},
                 });
-                if !self.reasoning.is_empty() {
-                    body["reasoning"] = json!({"effort": self.reasoning});
-                }
+                body["reasoning"] = json!({"enabled": false});
                 body
             }
         }
@@ -658,7 +653,7 @@ impl Model {
         Ok(Answer { fields, raw })
     }
 
-    /// Rewrites unreadable answers until one can be read. Chronology
+    /// Rewrites unreadable answers until they can be published. Chronology
     /// corrections keep the reader waiting for the completed document.
     pub async fn ask<T: Send>(
         &self,
@@ -765,7 +760,7 @@ impl Model {
                 }
             }
         }
-        unreachable!("the generation returns once an answer is read")
+        unreachable!("the generation loop returns its answer")
     }
 }
 

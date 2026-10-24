@@ -429,7 +429,11 @@ impl Pages {
         if self.interactive && record.usage.model == "stored" {
             return;
         }
-        for r in record.search.results.iter().take(self.prefetch) {
+        for r in record.search.results.iter().take(if self.interactive {
+            record.search.results.len()
+        } else {
+            self.prefetch
+        }) {
             let (host, target) = text::target_of(&r.url);
             if self.seed.fixed_for(&host, &target).is_some()
                 || self.store().page(&host, &target).is_some()

@@ -3,29 +3,11 @@
 use super::*;
 
 impl Pages {
-    pub(super) fn latest_publication(
-        &self,
-        store: &Store,
-        host: &str,
-        target: &str,
-        mentions: &[Mention],
-    ) -> time::Date {
-        let today = seed::parse_date(&self.seed.date).expect("world date");
-        if store.publication_date(host, target).is_some() {
-            return today;
-        }
-        mentions
-            .iter()
-            .filter_map(|mention| mention.source())
-            .filter_map(|url| {
-                let (host, target) = text::target_of(url);
-                store
-                    .page(&host, &target)
-                    .and_then(|page| seed::parse_date(&page.date).ok())
-            })
-            .chain(Some(today))
-            .min()
-            .expect("world date")
+    /// The latest date a written page may carry: the world's own date. Pages
+    /// that link here may be older, as real pages are updated after they
+    /// first appear.
+    pub(super) fn latest_publication(&self) -> time::Date {
+        seed::parse_date(&self.seed.date).expect("world date")
     }
 
     pub(super) fn check_page_dates(
@@ -43,16 +25,6 @@ impl Pages {
         {
             return Err(prompts::Unreadable::Chronology(format!(
                 "The search established publication on {published}; DATE must be on or after that date. Preserve this publication date visibly and label any later update explicitly."
-            )));
-        }
-        if let Some(published) = links(&format!("https://{host}{target}"), &page.body)
-            .iter()
-            .filter_map(|(host, target, _)| store.publication_date(host, target))
-            .filter(|date| *date > dateline)
-            .max()
-        {
-            return Err(prompts::Unreadable::Chronology(format!(
-                "A cited source was first published on {published}, after DATE {dateline}. Explicitly update this article and DATE on or after {published}, or remove the unavailable citation."
             )));
         }
         Ok(())
@@ -249,6 +221,9 @@ impl Pages {
         prefetch: bool,
     ) -> Result<PageRecord, Stop> {
         let url = format!("https://{host}{target}");
+        let document_type = prompts::expected_type(&url);
+        let pdf = document_type == Some("application/pdf");
+        let webpage = document_type.is_none();
         let established = {
             let store = self.writing_store()?;
             store.page_context(host, target).iter().any(|claim| {
@@ -271,14 +246,14 @@ impl Pages {
             None
         };
         let captured = fictionet_extras::sites::lookup(host, target).is_some();
-        let site = if captured {
+        let site = if captured || !webpage {
             None
         } else {
             self.locks
                 .try_lock(&format!("site {host}"))
                 .map_err(Stop::store)?
         };
-        let follows_layout = !captured && site.is_none();
+        let follows_layout = webpage && !captured && site.is_none();
         let cast = self.cast(cx).await?;
         let mut ask = {
             let store = self.writing_store()?;
@@ -327,7 +302,11 @@ impl Pages {
                 }
             }
         }
-        let expected = prompts::expected_type(&url);
+        let expected = if pdf {
+            Some("text/html")
+        } else {
+            document_type
+        };
         let seed = self.context().into_owned();
         let subject = format!("{url} {}", make::title_from(host, target));
         {
@@ -381,7 +360,7 @@ impl Pages {
                     date: String::new(),
                 }),
         );
-        let latest = self.latest_publication(&*self.writing_store()?, host, target, &ask.mentions);
+        let latest = self.latest_publication();
         let reference = self.reference_text(&url).map_err(Stop::store)?;
         let made = self
             .generate(
@@ -427,30 +406,23 @@ impl Pages {
                         model.check_document(&page.content_type, &page.body)?;
                         self.check_page_dates(&store, host, target, &page, latest)?;
                     }
+                    let rendered = if page.content_type.starts_with("text/html") && !pdf {
+                        let profile = ask.profile.as_ref().or(page.site.as_ref()).cloned()
+                            .unwrap_or_else(|| make::site_profile(host));
+                        render::page_at(host, target, &profile, &page, &seed.date)
+                    } else {
+                        page.body.clone()
+                    };
                     if self.interactive {
-                        let body = if page.content_type.starts_with("text/html") {
-                            let profile = ask
-                                .profile
-                                .as_ref()
-                                .or(page.site.as_ref())
-                                .cloned()
-                                .unwrap_or_else(|| make::site_profile(host));
-                            render::page_at(host, target, &profile, &page, &seed.date)
-                        } else {
-                            page.body.clone()
-                        };
-                        text::validate_page(&page.content_type, body.as_bytes())
+                        text::validate_page(&page.content_type, rendered.as_bytes())
                             .map_err(prompts::Unreadable::Content)?;
                     }
                     if let Maker::Model(model) = self.maker() {
-                        let profile = ask.profile.as_ref().or(page.site.as_ref()).cloned()
-                            .unwrap_or_else(|| make::site_profile(host));
-                        let rendered = if page.content_type.starts_with("text/html") {
-                            render::page_at(host, target, &profile, &page, &seed.date)
-                        } else { page.body.clone() };
                         model.check_document(&page.content_type, &rendered)?;
                     }
-                    if ask.profile.is_none()
+                    if webpage
+                        && page.content_type.starts_with("text/html")
+                        && ask.profile.is_none()
                         && fictionet_extras::sites::lookup(host, target).is_none()
                         && page.site.as_ref().is_none_or(|p| p.css.is_empty())
                     {
@@ -487,6 +459,7 @@ impl Pages {
         }
         let profile = match ask.profile {
             Some(profile) => profile,
+            None if !webpage => make::site_profile(host),
             None => {
                 let mut described = page.site.take().unwrap_or_else(|| make::site_profile(host));
                 if described.name.is_empty() {
@@ -498,7 +471,7 @@ impl Pages {
             }
         };
         let html = page.content_type.starts_with("text/html");
-        let body = if !html {
+        let body = if !html || pdf {
             page.body.clone()
         } else if page.status == 404 && ask.mentions.is_empty() {
             render::not_found(host, Some(&profile), target, today)
@@ -512,13 +485,20 @@ impl Pages {
         });
         let (unsupported, unchecked) =
             text::check_snippets(&body, &page.content_type, &ask.mentions);
+        let body = if pdf {
+            page.content_type = "application/pdf".into();
+            pdf::render(&page.title, &page.body)
+                .map_err(|error| Stop::Failed { error, usage: None })?
+        } else {
+            body.into_bytes()
+        };
         let record = PageRecord {
             url,
             host: host.into(),
             target: target.into(),
             status: page.status,
             content_type: page.content_type,
-            body: body.into_bytes(),
+            body,
             headers: vec![("Server".into(), render::server_of(Some(&profile)).into())],
             title: page.title,
             description: page.description,
@@ -534,7 +514,7 @@ impl Pages {
         };
         let mut store = self.writing_store()?;
         if matches!(self.maker(), Maker::Model(_)) {
-            let latest = self.latest_publication(&store, host, target, &record.mentions);
+            let latest = self.latest_publication();
             self.check_page_dates(
                 &store,
                 host,
@@ -560,6 +540,9 @@ impl Pages {
             store.unserved.insert((host.into(), target.into()));
         }
         drop(store);
+        if pdf {
+            self.note_links(&record.url, &page.body);
+        }
         Ok(record)
     }
 }

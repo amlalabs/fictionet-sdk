@@ -10,6 +10,7 @@ mod layout;
 mod listing;
 mod normalize;
 mod page;
+mod pdf;
 pub mod provenance;
 mod serve;
 mod settings;
@@ -248,9 +249,10 @@ struct Made<T> {
     usage: Usage,
 }
 
-/// Why nothing was made: the generator or the store failed.
+/// Why nothing was made.
 #[derive(Debug)]
 enum Stop {
+    /// The generator or the store failed.
     Failed {
         error: String,
         usage: Option<Box<Usage>>,

@@ -101,7 +101,7 @@ pub enum WriterTarget {
     Page { url: String },
 }
 
-/// What the world did with a writer's answer before serving content.
+/// Why the page writer is revising a document.
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RevisionAction {
@@ -429,12 +429,14 @@ fn report(
     {
         *target = redact_url(target);
     }
-    if let Some(sender) = destination.lock().unwrap().as_ref() {
-        let _ = sender.send(Observation {
-            at_ms: cx.now().since_start().as_millis() as u64,
-            fact,
-        });
-    }
+    let destination = destination.lock().unwrap();
+    let Some(sender) = destination.as_ref() else {
+        return;
+    };
+    let _ = sender.send(Observation {
+        at_ms: cx.now().since_start().as_millis() as u64,
+        fact,
+    });
 }
 
 /// Serializes a protocol value as its wire spelling for the page.

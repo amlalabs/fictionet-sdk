@@ -1,36 +1,36 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Search · Fictionet</title>
+<link rel="preload" href="/fonts/terminal.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="/style.css">
 <script type="module" src="/search.mjs"></script>
 </head>
 <body>
 <header class="topbar">
-  <div class="brand"><span class="mark"></span><strong>Fictionet</strong><span class="slash">/</span><span>Search</span></div>
-  <div class="toolbar"><span id="preview-label" hidden>Preview</span><button id="agent-toggle" aria-pressed="true">Agent</button><span class="run-clock"><i id="connection"></i><span id="clock">00:00</span><span>UTC</span></span><button id="world-toggle" aria-expanded="false" aria-controls="world-menu">World</button></div>
+  <div class="brand"><strong>Fictionet</strong><span class="slash">/</span><span>Search</span></div>
+  <div id="source" class="mode-switch" role="group" aria-label="Page source">
+    <button data-source="copied" aria-pressed="false">Copied</button>
+    <button data-source="model_written" aria-pressed="false">Model-written</button>
+    <button data-source="live" aria-pressed="false">Live</button>
+  </div>
+  <div class="toolbar"><button id="agent-toggle" aria-pressed="true">Hide agent</button><span class="run-clock"><span id="clock">00:00</span><span>UTC</span></span><button id="world-toggle" aria-expanded="false" aria-controls="world-menu">World settings</button></div>
 </header>
 <main>
   <section id="agent" class="agent panel" aria-label="Workstation">
-    <div class="windowbar"><span class="dots">● ● ●</span><span>workstation</span><div class="segments"><button id="smaller-text" aria-label="Smaller text">A−</button><button id="larger-text" aria-label="Larger text">A+</button><button id="agent-size" aria-pressed="false" aria-label="Expand agent">↔</button><button id="terminal-tab" aria-pressed="true">Terminal</button><button id="screen-tab" aria-pressed="false">Screen</button></div></div>
+    <div class="windowbar"><span>workstation</span><div class="segments"><button id="terminal-tab" aria-pressed="true">Terminal</button><button id="screen-tab" aria-pressed="false">Screen</button></div></div>
     <div id="console-status" role="status">Waiting for the workstation…</div>
     <div id="terminal" class="console"></div><div id="screen" class="console" hidden></div>
-    <div id="preview-console" hidden><span class="preview-star">✻</span> <strong>In-world client</strong><pre id="preview-output"></pre><button id="story">Run again</button></div>
-    <div class="agent-footer"><span id="host-status">Booting</span></div>
   </section>
   <section id="world" class="world panel" aria-label="Search network">
-    <div class="network-column">
-      <div class="map-wrap"><svg id="map" viewBox="0 0 1000 600" aria-label="Workstation, world services and internet" role="group"></svg><span id="rewind-label" hidden>Rewind</span></div>
+      <div class="map-wrap"><div id="map" aria-label="VM, world services and internet"></div></div>
       <div id="activity" class="activity" aria-label="Recent activity"></div>
-      <div class="timeline"><button id="play" aria-label="Pause observation">Ⅱ</button><span id="cursor-time">00:00</span><input id="scrubber" type="range" min="0" max="0" value="0" aria-label="Rewind observation"><button id="live" class="live active">Live</button><div class="timeline-labels"><span id="oldest">00:00</span><span id="end-time">00:00</span></div></div>
-    </div>
     <aside id="details" hidden aria-label="Details"><div class="detail-heading"><div><h1 id="detail-title"></h1><p id="detail-subtitle"></p></div><button id="close-details" aria-label="Close details">×</button></div><div id="detail-body"></div><div id="detail-actions"></div></aside>
   </section>
 </main>
-<div id="world-menu" class="world-menu" hidden><h2>World</h2><p id="world-date"></p><label for="source">Pages</label><select id="source"><option value="copied">Copied pages</option><option value="model_written">Model-written pages</option><option value="live">Live search</option></select><details><summary>World brief</summary><p id="brief"></p></details><button id="restart">Restart pages</button><p id="world-error" role="alert"></p></div>
-
+<div id="world-menu" class="world-menu" hidden><h2>World</h2><p id="world-date"></p><details><summary>World brief</summary><p id="brief"></p></details><button id="restart">Restart pages</button><p id="world-error" role="alert"></p></div>
 <div id="notice" role="status" hidden></div>
 </body>
 </html>

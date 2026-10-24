@@ -24,7 +24,7 @@ pub enum Meta {
     Planted { title: String },
     /// A page the store does not hold, while nothing new is made.
     Missing,
-    /// The generator or the store failed.
+    /// The generator or the store failed. The diagnostic describes the failure.
     Error {
         error: String,
         usage: Option<Box<Usage>>,

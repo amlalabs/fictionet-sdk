@@ -1,12 +1,6 @@
-//! The Search demo: an Ubuntu desktop with Firefox and Claude Code on the
-//! security corpus, with optional model-written pages.
-//!
-//! - `search <downloads>` is the app: it boots, opens the page and stays up
-//!   until Ctrl-C. Copied pages answer searches and fetches without a model.
-//! - `search preview` shows the page with an in-world client and no VM.
+//! An Ubuntu research workstation connected to the Search world.
 
 mod guest;
-mod preview;
 use fictionet_search_demo::{network, page};
 
 use fictionet_demo::kit;
@@ -22,29 +16,13 @@ type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + 
 /// The world's brief chooses both the copied corpus and model-written topics.
 const SEED: &str = "security";
 
-/// The app with its downloads folder, or the preview without a VM.
-#[derive(Debug, PartialEq)]
-enum Mode {
-    App { downloads: PathBuf },
-    Preview,
-}
-
-fn arguments(mut args: impl Iterator<Item = String>) -> Result<Mode> {
-    const USAGE: &str = "usage: search <downloads> or search preview";
-    let first = args.next().ok_or(USAGE)?;
-    let second = args.next();
-    if args.next().is_some() {
-        return Err(USAGE.into());
+fn downloads() -> Result<PathBuf> {
+    let mut args = std::env::args().skip(1);
+    let folder = args.next().ok_or("usage: search <downloads>")?;
+    if folder.starts_with('-') || args.next().is_some() {
+        return Err("usage: search <downloads>".into());
     }
-    match (first.as_str(), second.as_deref()) {
-        ("preview", None) => Ok(Mode::Preview),
-        ("preview", _) => Err(USAGE.into()),
-        (folder, _) if folder.starts_with('-') => Err(USAGE.into()),
-        (folder, None) => Ok(Mode::App {
-            downloads: folder.into(),
-        }),
-        _ => Err(USAGE.into()),
-    }
+    Ok(folder.into())
 }
 
 fn app_pages(
@@ -79,10 +57,7 @@ fn app_pages(
 #[tokio::main]
 async fn main() -> Result {
     let total = Instant::now();
-    let downloads = match arguments(std::env::args().skip(1))? {
-        Mode::Preview => return preview::run().await,
-        Mode::App { downloads } => downloads,
-    };
+    let downloads = downloads()?;
     let (claude_token, claude_key) =
         if let Some(path) = std::env::var_os("CLAUDE_CODE_OAUTH_TOKEN_FILE") {
             let value = std::fs::read_to_string(path)

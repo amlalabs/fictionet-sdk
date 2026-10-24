@@ -53,9 +53,9 @@ key and placeholder Claude credential before SSH and the desktop start. The real
 Claude token stays on the host. `claude` opens ready to work. Each launch writes
 to a fresh disk overlay; the prepared image stays unchanged. All demo flows use
 this workstation. The terminal uses ghostty-web and a persistent tmux session;
-Screen shows Firefox. Terminal text starts at 19 px on a dark background in both
-page themes; the text controls adjust its size and the expand control widens the
-agent pane. Pass `preview` instead of the downloads folder to run without a VM.
+Screen shows Firefox. Terminal text starts at 15 px on a dark background in both
+page themes, using the bundled JetBrains Mono font. The page source switch stays
+visible and can change Copied, Model-written and Live during a session.
 
 On the workstation, a before-and-after run reached full readiness in 63.384 s
 with boot-time installation and 7.213 s with the prepared image. Desktop readiness
@@ -66,11 +66,6 @@ were 0.468 s before and 0.532 s after, with no indexing changes. The image build
 took 98 s using the existing verified Ubuntu downloads and produced a standalone
 4.0 GiB disk. These are single-run wall-clock measurements, excluding compilation.
 
-`preview` needs no downloads or API keys. It uses the world's corpus when
-available, otherwise a small embedded sky.org capture. Its labeled client makes
-real requests inside the world. Model calls appear when an agent uses the
-gateway; preview does not invent provider traffic.
-
 [app/src/main.rs](app/src/main.rs) assembles the workstation and its owned page.
 [app/src/network.rs](app/src/network.rs) connects the model gateway and local
 startup services. Search explicitly reports typed facts from its request and
@@ -78,13 +73,12 @@ tool handlers, its name resolver and the typed no-route callback on its network.
 
 [app/src/page/](app/src/page/) projects those facts into the map, site details,
 model calls and recent activity. Selecting a site or gateway keeps the map
-above its details while the agent remains visible. The scrubber replays the
-retained observation history; the agent stays live. The World menu chooses the page source or restarts world pages.
-Observations are retained for rewind throughout the launch. Observed internet destinations
+above its details while the agent remains visible. The page always shows the
+live run. The visible source switch changes modes during a session; the World
+menu restarts pages. Observed internet destinations
 and sign-in policy survive page restarts. Each launch writes its facts to a separate
 `<downloads>/search/run-<uuid>.jsonl` with RFC 3339 wall-clock timestamps and
-owner-only permissions. Preview records are under `demos/downloads/search-preview/`.
-Request credentials are redacted before entering the observation channel; request
+owner-only permissions. Request credentials are redacted before entering the observation channel; request
 bodies are not retained. Header details show only values retained by recording.
 The map draws internet
 routes from upstream facts, including host page-writer calls, rather than from
@@ -92,9 +86,9 @@ model call activity. Local and rejected model requests therefore leave the
 internet wire dark. The activity feed updates one row per upstream attempt;
 the run record retains each transport phase.
 
-The page binds to localhost without authentication. Browser libraries are served
-locally. Recorded previews cannot execute scripts or contact upstream sites.
-Capture dates appear when the archive records them.
+The page binds to localhost with no authentication. Browser libraries are served
+locally. Recorded page previews are inert and cannot run scripts or contact
+sites. Capture dates are shown only when the archive records them.
 
 ## Page sources
 
@@ -102,27 +96,39 @@ Capture dates appear when the archive records them.
   and the captured security sources at their original URLs. A prepared Tantivy
   index ranks partial matches by BM25 with extra title weight and the same English
   word stemming for documents and queries. Google, Bing,
-  DuckDuckGo and Claude's search tool share that index. Result counts come from
-  the index before pagination. An unmatched query returns an empty list.
-  Missing pages use captured site responses; unknown hosts return NXDOMAIN.
+  DuckDuckGo and Claude's search tool share that index, each engine in its own
+  layout. Result counts come from the index before pagination. An unmatched query
+  returns an empty list. Missing pages use captured site responses; unknown hosts
+  return NXDOMAIN.
 - **Model-written** writes pages for the requested subject from the prose brief,
   captured reference material, earlier mentions and stored claims. Written searches
   use the offline index for relevant sources; pages preserve the original source's
   facts unless the brief or established world documents explicitly change them.
   The host-held Claude token takes priority,
-  followed by `OPENROUTER_API_KEY` and `ANTHROPIC_API_KEY`. The Anthropic writer is
-  Claude Haiku 5.5, without thinking, with the API's 128K output maximum.
-- **Live** is selected by default when `EXA_API_KEY` is present. Exa supplies search
-  results, and the host copies any public URL the guest or Claude requests,
+  followed by `OPENROUTER_API_KEY` and `ANTHROPIC_API_KEY`. The page writer uses its
+  own host-side model client; it does not send its credential through the guest.
+  The Anthropic writer is Claude Haiku 5.5, without thinking, with the API's 128K
+  output maximum. Search results start writing their destination pages in parallel.
+  Each site shares its navigation, stylesheet and footer across pages. PDF URLs
+  return typeset PDF documents with embedded fonts. Authored claims preserve
+  citation identities across pages. Failed calls do not invent fallback articles.
+- **Live** is selected by default when `EXA_API_KEY` is present. [Exa search](https://github.com/exa-labs/openapi-spec/blob/master/exa-openapi-spec.yaml)
+  supplies results, which keep their order, titles, URLs and snippets in each
+  engine's skin. The host copies any public URL the guest or Claude requests,
   including URLs that never appeared in search. Each page, stylesheet or image
   is copied when requested and retained at its original URL. Separate downloads
   can progress together. Actual host requests appear in the
   page's internet activity. Interrupted downloads retry until completion; upstream
   status codes, including real missing pages, are preserved.
 
-The page source can change during a session. Copied mode has no public-web
-fallback. Wikipedia reflects its June 2026 snapshot; documentation reflects its
-capture date. Live supplies current material.
+The source switch shows why a source is unavailable: missing captures, a page
+writer or a search key. Other sources remain usable. The page source can change
+during a session, and the page reports the source that answered each request.
+Copied mode has no public-web fallback. Wikipedia reflects its June 2026
+snapshot; documentation reflects its capture date. Live supplies current
+material. Live search and capture use a separate host HTTP transport, outside
+the guest model gateway. Search queries and served pages are logged and
+displayed.
 
 The content audit applies to text the world writes. Replayed WARC responses carry
 capture provenance and are outside that scope; their words are not allowlisted.
@@ -175,6 +181,7 @@ verbatim. For the VM demo, the brief's date is replaced by the run day. The gues
 inherits the host clock; HTTP dates and certificates use the run clock. The
 standalone world can still run against a brief's historical date.
 Search ranking receives the prose without special treatment for named sites.
+Use unplanned research questions when driving the workstation.
 
 ## Corpus
 
@@ -238,5 +245,6 @@ corrections and model tools. Prompt construction and answer parsing are separate
 The WARC reader, crawler, BM25 index, model gateway and credential transport live in
 `fictionet-extras`. The shared demo kit supplies VM lifetime, prepared images
 and SSH console sockets. Search owns its HTML, styles and JavaScript, including copies of the
-terminal and screen pieces. ghostty-web 0.4.0 and noVNC 1.7.0, with their
+terminal and screen pieces. Vendored upstream ghostty-web with wheel reporting
+and noVNC 1.7.0, with their
 licenses, live in `demos/kit/assets`.

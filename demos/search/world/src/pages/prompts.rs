@@ -142,6 +142,13 @@ research from later coverage. Never invent a new discovery date for a known subj
 For new developments left open by the brief, invent a concrete, plausible account:
 name its organization and place, date its events and describe its actors.
 Those new details become binding facts for every subsequent document and search.
+Authorship belongs to the cited URL: preserve its original authors, author order,
+publication title and date wherever it is cited. Use real authors for established
+papers. A journalist covering a paper has their own byline; they do not become
+that paper's author. An established DOI or paper identifier names one particular
+work: use its original title, authors and publication date, never a new paper
+about the same subject. An article landing page includes that full citation,
+abstract and the full-text link. Include these bibliographic identities in CLAIMS.
 Do not replace missing context with a generic unnamed company or facility.
 The requested URL, search snippets, incoming links and earlier pages are binding
 editorial context. They describe the same persistent web, not independent stories.
@@ -171,6 +178,15 @@ organizations, technical terminology and background facts intact. New identities
 may fill gaps in the brief; never rename an established person or organization.
 Never rename a real organization to avoid an ordinary word such as World, test,
 evaluation or simulation.
+An encyclopedia entry is a developed reference article, not a short news report:
+write a lead, background, substantive topic sections and cited references, roughly
+a thousand words for a substantial subject. Its numbered references link to the
+primary research behind its specific claims and include the original titles,
+authors and dates. A reader can follow those citations into the research itself.
+Shared facts do not require shared prose. Different publishers use their own
+wording, editorial emphasis and background; attribute any passage quoted from
+another publisher. A supplied site skeleton demonstrates structure and classes,
+not the requested article's subject, wording or length.
 
 The URL selects a particular view of a document. An abstract landing page,
 catalogue entry or bibliographic record contains its metadata, abstract and links,
@@ -188,8 +204,8 @@ A specification must
 include its substantive normative sections, algorithms, code and references,
 not just an introduction or an overview. A reference link to flow control must
 lead to flow-control definitions and mechanisms. Use roughly 900 to 1100 words
-for technical specifications, 700 to 900 for scientific papers, and 350 to 550
-for ordinary articles, as appropriate.
+for technical specifications, 700 to 900 for scientific papers, and 150 to 250
+for abstract entries, and 800 to 1400 for ordinary news and feature articles, as appropriate.
 Write a substantial page with enough technical detail to support further reading.
 Preserve the requested document's scope. Shared facts constrain what it says;
 they do not require a general reference page to retell a particular incident.
@@ -214,7 +230,10 @@ or photo credits unless an actual image accompanies them.
 Nothing is dated after today. A dated article knows only what was known then.
 Future plans and deadlines may be mentioned before their scheduled dates. They
 are known when announced; a forecast is not knowledge of its eventual outcome.
-For each CLAIMS entry record when the statement became known, separately from
+For each CLAIMS entry record the earliest date when the statement became known,
+usually its original publication date, never the date of this writing session.
+An old paper's title and authors were known when it was published.
+Keep that date separate from
 any event date in its text. No statement may depend on knowledge acquired after
 DATE. Keep the visible dateline and the statement's known-on date consistent.
 When covering a development after an article's original publication date,
@@ -332,7 +351,7 @@ TITLE: the page's <title>, with the site name where that site puts it
 DESCRIPTION: its meta description, one sentence
 DATE: YYYY-MM-DD it was published or last updated, or none
 CLAIMS:
-- YYYY-MM-DD | durable fact (0 to 8 entries). The date is when this statement
+- YYYY-MM-DD | durable fact. The date is when this statement
   became known, not the date of a planned event or deadline. Include names of
   people with roles, organizations, sites, versions, numbers and event dates.
 ";
@@ -360,9 +379,13 @@ the content (article text, tables, code, posts with usernames and times,
 comments, specs), with only the surrounding material appropriate to this site:
 bylines, tags, share-button labels, image captions, \"Read more\" and
 related-story links in the middle of the text, comment counts, a
-newsletter box. Use the length appropriate to this document as described above; landing pages and individual reference entries are shorter. Include at least three useful inline links to further reading. Do not write <html>, <head>, the site
+newsletter box. Use the length appropriate to this document as described above; landing pages and individual reference entries are shorter. Include ordinary editorial context: section labels, byline and dateline, concrete reporting and attribution, and related reading. Never add a photo credit, caption or image placeholder without its actual image. Include at least three useful inline links to further reading. Do not write <html>, <head>, the site
 header or the footer: the site adds them. Use plain tags: h1-h3, p, ul, ol,
 li, table, pre, code, a, blockquote, time, span. No scripts.
+An encyclopedia's References section uses an ol with class references. Each li
+gives the original authors, publication and date, with the paper's title inside
+an a element whose href leads directly to that primary paper or its abstract.
+Bibliography entries are navigable citations, never unlinked plain text.
 
 If the URL is not a web page (an API endpoint, a .json, .txt, .xml or .py
 file), set CONTENT_TYPE to its real type and make BODY the raw file. If the
@@ -509,7 +532,14 @@ What the world has already said:
 pub fn expected_type(url: &str) -> Option<&'static str> {
     let (host, path, _) = split_url(url);
     let path = path.to_lowercase();
-    if path.ends_with(".json")
+    if path.ends_with(".pdf")
+        || (matches!(
+            host.as_str(),
+            "arxiv.org" | "www.arxiv.org" | "export.arxiv.org"
+        ) && path.starts_with("/pdf/"))
+    {
+        Some("application/pdf")
+    } else if path.ends_with(".json")
         || path.ends_with("/json")
         || host.starts_with("api.")
         || path.starts_with("/api/")
@@ -587,6 +617,7 @@ pub fn page(
     let captured = fictionet_extras::sites::lookup(host, &super::text::target_of(url).1)
         .map(|skin| skin.prompt());
     let (site, site_line) = match profile {
+        _ if expected_type(url).is_some() => ("", String::new()),
         _ if captured.is_some() => ("", "The site's layout is already supplied.".to_owned()),
         Some(profile) => {
             let tagline = if profile.tagline.is_empty() {
@@ -604,16 +635,19 @@ pub fn page(
     };
     let expected = expected_type(url)
         .map(|expected| {
-            format!(
-                "It is not an HTML page: CONTENT_TYPE is {expected} and BODY is the raw file. \
-                A real project, package or thing this URL asks about exists here: answer it, \
-                not 404."
-            )
-        })
-        .unwrap_or_default();
-    let layout = captured
-        .as_deref()
-        .unwrap_or(if profile.is_none() { SITE_LAYOUT } else { "" });
+            if expected == "application/pdf" {
+                "This address serves a full PDF document. Write its complete text in BODY as semantic HTML for the typesetter, with its actual title, original authors in order, abstract, numbered sections and bibliography. CONTENT_TYPE is text/html here; the server will typeset the document and serve application/pdf. Preserve all bibliographic identities established by incoming citations. Do not emit PDF syntax, base64, a download page or a paper summary. Do not include website navigation or a stylesheet.".to_owned()
+            } else {
+                format!("It is not an HTML page: CONTENT_TYPE is {expected} and BODY is the raw file. A real project, package or thing this URL asks about exists here: answer it, not 404.")
+            }
+        }).unwrap_or_default();
+    let layout = if expected_type(url).is_some() {
+        ""
+    } else {
+        captured
+            .as_deref()
+            .unwrap_or(if profile.is_none() { SITE_LAYOUT } else { "" })
+    };
     let user = format!(
         "Write the page at: {url}
 {expected}
@@ -632,7 +666,7 @@ What the world has already said:
 {vocabulary}",
         vocabulary = banned(),
         said = said_before(host_pages, claims),
-        captured_note = if captured.is_some() {
+        captured_note = if captured.is_some() && expected_type(url).is_none() {
             "For this captured site, use the supplied container and class names instead of the generic main layout. Do not write a stylesheet."
         } else {
             ""

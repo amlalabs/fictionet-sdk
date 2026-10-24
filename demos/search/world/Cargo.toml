@@ -27,3 +27,5 @@ tower-service = "0.3"
 kuchiki = "0.8"
 zim = "0.5"
 rayon = "1"
+krilla = { version = "0.8.2", default-features = false, features = ["simple-text"] }
+rustybuzz = "0.20.1"
