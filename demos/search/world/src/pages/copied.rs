@@ -8,6 +8,7 @@ use std::{path::Path, time::Instant};
 
 // Captured distributions and repository packs can exceed a public web response.
 const PACKAGE_BYTES: usize = 256 * 1024 * 1024;
+const INDEX_VERSION: u32 = 4;
 
 pub(super) struct Corpus {
     archive: Archive,
@@ -276,7 +277,9 @@ impl Pages {
             .and_then(|file| {
                 serde_json::from_reader::<_, CachedCorpus>(std::io::BufReader::new(file)).ok()
             })
-            .filter(|cache| cache.version == 3 && cache.files == files && cache.seeds == seeds);
+            .filter(|cache| {
+                cache.version == INDEX_VERSION && cache.files == files && cache.seeds == seeds
+            });
         let (archive, missing, index) = match cached {
             Some(cache) => (cache.archive, cache.missing, Some(cache.index)),
             None => {
@@ -292,7 +295,6 @@ impl Pages {
             .urls()
             .filter_map(|url| url::Url::parse(url).ok()?.host_str().map(str::to_owned))
             .collect();
-        let scanned = started.elapsed();
         let package_root = root.join("packages");
         let packages = if package_root.is_dir() {
             // Resolve once: a later publication must not change this reader's paths.
@@ -336,7 +338,7 @@ impl Pages {
                 )
                 .map_err(|e| e.to_string())?;
                 let cache = CachedCorpus {
-                    version: 3,
+                    version: INDEX_VERSION,
                     files,
                     seeds: seeds.to_vec(),
                     archive: corpus.archive,
@@ -368,10 +370,9 @@ impl Pages {
             return Err("the copied corpus has no reachable HTML pages".into());
         }
         eprintln!(
-            "WARC scan: {:.3}s; crawl and index: {:.3}s; {} pages",
-            scanned.as_secs_f64(),
-            (started.elapsed() - scanned).as_secs_f64(),
-            corpus.index.len()
+            "Copied pages: {} indexed; ready in {:.3}s",
+            corpus.index.len(),
+            started.elapsed().as_secs_f64()
         );
         let mut pages = match model {
             Some(model) => Self::with_model(seed, model),

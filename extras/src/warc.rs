@@ -229,7 +229,7 @@ impl Archive {
         self.urls.insert(
             url,
             Record {
-                file: path.to_owned(),
+                file: std::fs::canonicalize(path)?,
                 offset,
                 length: file.metadata()?.len() - offset,
                 refers: None,
@@ -244,6 +244,7 @@ impl Archive {
     pub fn open(files: impl IntoIterator<Item = PathBuf>) -> io::Result<Self> {
         let mut archive = Self::default();
         for file in files {
+            let file = std::fs::canonicalize(file)?;
             let mut reader = BufReader::new(File::open(&file)?);
             while !reader.fill_buf()?.is_empty() {
                 let offset = reader.stream_position()?;
@@ -288,6 +289,7 @@ impl Archive {
         let mut files = files
             .into_iter()
             .map(|path| {
+                let path = std::fs::canonicalize(path)?;
                 let modified = path.metadata()?.modified()?;
                 Ok((modified, path))
             })
@@ -563,6 +565,41 @@ mod tests {
         assert_eq!(
             Archive::directory(&root)
                 .unwrap()
+                .get("https://source.org/article")
+                .unwrap()
+                .unwrap()
+                .body,
+            "complete article"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn readers_keep_the_archive_target_when_its_directory_alias_is_removed() {
+        let root = std::env::temp_dir().join(format!(
+            "archive-alias-{}-{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        std::fs::create_dir_all(root.join("immutable")).unwrap();
+        let target = root.join("immutable/pages.warc.gz");
+        Archive::default()
+            .append(
+                &target,
+                "https://source.org/article",
+                &Response {
+                    status: StatusCode::OK,
+                    headers: HeaderMap::new(),
+                    body: "complete article".into(),
+                },
+            )
+            .unwrap();
+        let alias = root.join("current-pages.warc.gz");
+        std::os::unix::fs::symlink(target, &alias).unwrap();
+        let reader = Archive::directory(&root).unwrap();
+        std::fs::remove_file(alias).unwrap();
+        assert_eq!(
+            reader
                 .get("https://source.org/article")
                 .unwrap()
                 .unwrap()
