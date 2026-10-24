@@ -60,7 +60,7 @@ impl Provider {
     /// The model used when none is named.
     pub fn default_model(self) -> &'static str {
         match self {
-            Self::Anthropic => "claude-haiku-4-5-20251001",
+            Self::Anthropic => "claude-haiku-5-5",
             Self::OpenRouter => "google/gemini-3.1-flash-lite",
         }
     }
@@ -371,7 +371,7 @@ impl Model {
     pub fn claude_token(key: Key) -> Self {
         Self::new(
             Provider::Anthropic,
-            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
             "low",
             key,
             Arc::new(ProviderTransport::new(Provider::Anthropic)),
@@ -470,7 +470,7 @@ impl Model {
                 });
                 if !self.reasoning.is_empty() {
                     body["output_config"] = json!({"effort":self.reasoning});
-                    body["thinking"] = json!({"type":"between_tools"});
+                    body["thinking"] = json!({"type":"adaptive"});
                 }
                 body
             }
