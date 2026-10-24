@@ -54,12 +54,65 @@ pub struct Features {
     pub firefox: bool,
 }
 
+/// Software installed while provisioning an Ubuntu cloud guest.
+#[derive(Clone, Default)]
+pub struct Installation {
+    packages: Vec<String>,
+    steps: Vec<String>,
+}
+
+/// An existing image; runtime settings cannot add installation steps.
+#[derive(Clone)]
+pub struct PreparedImage(String);
+
+/// The provisioning data needed to boot a guest.
+pub trait Software: Clone {
+    fn image(&self) -> Option<&str>;
+    fn installation(&self) -> Option<&Installation>;
+}
+impl Software for Installation {
+    fn image(&self) -> Option<&str> {
+        None
+    }
+    fn installation(&self) -> Option<&Installation> {
+        Some(self)
+    }
+}
+impl Software for PreparedImage {
+    fn image(&self) -> Option<&str> {
+        Some(&self.0)
+    }
+    fn installation(&self) -> Option<&Installation> {
+        None
+    }
+}
+
+#[derive(Clone)]
+pub enum Boot {
+    Cloud(Installation),
+    Prepared(PreparedImage),
+}
+impl Software for Boot {
+    fn image(&self) -> Option<&str> {
+        match self {
+            Self::Cloud(_) => None,
+            Self::Prepared(image) => image.image(),
+        }
+    }
+    fn installation(&self) -> Option<&Installation> {
+        match self {
+            Self::Cloud(installation) => Some(installation),
+            Self::Prepared(_) => None,
+        }
+    }
+}
+
 /// A guest's identity, resources, card, and provisioning.
 #[derive(Clone)]
-pub struct Guest {
+pub struct Guest<P = Installation> {
     /// Software installed by this guest's setup.
     pub features: Features,
-    image: Option<String>,
+    software: P,
     hostname: String,
     attachment: String,
     user: String,
@@ -68,20 +121,18 @@ pub struct Guest {
     manufacturer: String,
     product: String,
     family: Family<Ipv4Addr>,
-    packages: Vec<String>,
     files: Vec<File>,
-    steps: Vec<String>,
     desktop: Option<(u16, String)>,
     terminal: Option<String>,
     forbidden: Vec<String>,
 }
 
-impl Guest {
+impl<P: Software> Guest<P> {
     /// Creates an Ubuntu guest with 2 vCPUs, 2048 MiB, and `Family::FromWorld`.
     /// DMI defaults to manufacturer `LENOVO` and product `20UES000-WS`.
-    fn base(hostname: &str, user: &str) -> Self {
+    fn base(hostname: &str, user: &str, software: P) -> Self {
         Self {
-            image: None,
+            software,
             features: Features::default(),
             hostname: hostname.into(),
             attachment: hostname.into(),
@@ -91,86 +142,13 @@ impl Guest {
             manufacturer: "LENOVO".into(),
             product: "20UES000-WS".into(),
             family: Family::FromWorld,
-            packages: Vec::new(),
             files: Vec::new(),
-            steps: Vec::new(),
             desktop: None,
             terminal: None,
             forbidden: Vec::new(),
         }
     }
 
-    /// A guest whose software and services are already installed in an image.
-    pub fn prepared(hostname: &str, user: &str, image: &str) -> Self {
-        let mut guest = Self::base(hostname, user);
-        guest.image = Some(image.into());
-        guest
-    }
-
-    /// An Ubuntu cloud guest provisioned on its first boot, with background
-    /// refreshes and network time disabled.
-    pub fn ubuntu(hostname: &str, user: &str) -> Self {
-        let mut guest = Self::base(hostname, user);
-        guest = guest
-            // The Pro apt hook contacts the contract service during package setup.
-            .file("/etc/apt/apt.conf.d/20apt-esm-hook.conf", 0o644, "")
-            // Pro apt news fetches a remote news feed during package setup.
-            .file(
-                "/etc/ubuntu-advantage/uaclient.conf",
-                0o644,
-                "ua_config:\n  apt_news: false\n",
-            )
-            // Release checks fetch the upgrade list even when no upgrade is wanted.
-            .file(
-                "/etc/update-manager/release-upgrades",
-                0o644,
-                "[DEFAULT]\nPrompt=never\n",
-            )
-            // The clock comes from the host; network time would request another name.
-            .file(
-                "/etc/systemd/timesyncd.conf",
-                0o644,
-                "[Time]\nNTP=\nFallbackNTP=\n",
-            )
-            // Stop unattended apt work after cloud-init's explicit package setup.
-            .file(
-                "/etc/apt/apt.conf.d/99periodic",
-                0o644,
-                "APT::Periodic::Enable \"0\";\n",
-            )
-            // Login messages do not need remote news.
-            .file("/etc/default/motd-news", 0o644, "ENABLED=0\n");
-        // Prevent later refresh starts when desktop setup reloads systemd.
-        for unit in [
-            "systemd-timesyncd.service",
-            "snapd.socket",
-            "snapd.service",
-            "snapd.seeded.service",
-            "motd-news.service",
-            "motd-news.timer",
-            "ua-timer.timer",
-            "ua-timer.service",
-            "ubuntu-advantage.service",
-            "fwupd-refresh.service",
-            "fwupd-refresh.timer",
-            "apt-daily.timer",
-            "apt-daily.service",
-            "apt-daily-upgrade.timer",
-            "apt-daily-upgrade.service",
-        ] {
-            guest = guest
-                .file(
-                    &format!("/etc/systemd/system/{unit}.d/quiet.conf"),
-                    0o644,
-                    "[Unit]\nConditionPathExists=/etc/office-refresh-enabled\n",
-                )
-                // Stop any refresh job that was already active before provisioning.
-                .run(format!(
-                    "if systemctl is-active --quiet {unit}; then systemctl stop {unit}; fi"
-                ));
-        }
-        guest
-    }
     /// Sets the host-side attachment name independently of the guest hostname.
     pub fn attachment(mut self, name: &str) -> Self {
         self.attachment = name.into();
@@ -193,29 +171,14 @@ impl Guest {
         self.family = family;
         self
     }
-    /// Adds packages to install after the shared trust store is ready.
-    pub fn packages(mut self, packages: &[&str]) -> Self {
-        self.packages.extend(packages.iter().map(|s| s.to_string()));
-        self
-    }
     /// Adds a file with Unix permission bits and UTF-8 content to the seed.
     pub fn file(mut self, path: &str, mode: u32, content: impl Into<String>) -> Self {
+        self.files.retain(|file| file.path != path);
         self.files.push(File {
             path: path.into(),
             mode,
             content: content.into(),
         });
-        self
-    }
-    /// Appends a shell command to run after package installation.
-    pub fn run(mut self, command: impl Into<String>) -> Self {
-        self.steps.push(command.into());
-        self
-    }
-    /// Puts a shell command before every other step, still after package
-    /// installation: before the desktop starts, for one.
-    pub fn run_first(mut self, command: impl Into<String>) -> Self {
-        self.steps.insert(0, command.into());
         self
     }
     /// Declares a loopback VNC port and a command that exits zero when the desktop is ready.
@@ -285,20 +248,15 @@ impl Guest {
         {
             return Err(io::Error::other("terminal needs a nonempty command"));
         }
-        if let Some(image) = &self.image {
-            if !matches!(
+        if let Some(image) = self.software.image()
+            && !matches!(
                 Path::new(image).components().collect::<Vec<_>>().as_slice(),
                 [std::path::Component::Normal(_)]
-            ) {
-                return Err(io::Error::other(
-                    "prepared image must be a file in the downloads directory",
-                ));
-            }
-            if !self.packages.is_empty() || !self.steps.is_empty() {
-                return Err(io::Error::other(
-                    "prepared guests cannot install software at boot",
-                ));
-            }
+            )
+        {
+            return Err(io::Error::other(
+                "prepared image must be a file in the downloads directory",
+            ));
         }
         let texts = [
             ("DMI string", &self.manufacturer),
@@ -310,8 +268,20 @@ impl Guest {
                 .iter()
                 .flat_map(|f| [("file path", &f.path), ("file", &f.content)]),
         )
-        .chain(self.packages.iter().map(|p| ("package", p)))
-        .chain(self.steps.iter().map(|s| ("command", s)))
+        .chain(
+            self.software
+                .installation()
+                .into_iter()
+                .flat_map(|i| i.packages.iter())
+                .map(|p| ("package", p)),
+        )
+        .chain(
+            self.software
+                .installation()
+                .into_iter()
+                .flat_map(|i| i.steps.iter())
+                .map(|s| ("command", s)),
+        )
         .chain(
             self.desktop
                 .iter()
@@ -333,6 +303,153 @@ impl Guest {
             }
         }
         Ok(())
+    }
+}
+
+impl Guest<Installation> {
+    /// An Ubuntu cloud guest provisioned on its first boot, with background
+    /// refreshes and network time disabled.
+    pub fn ubuntu(hostname: &str, user: &str) -> Self {
+        let mut guest = Self::base(hostname, user, Installation::default());
+        guest = guest
+            // The Pro apt hook contacts the contract service during package setup.
+            .file("/etc/apt/apt.conf.d/20apt-esm-hook.conf", 0o644, "")
+            // Pro apt news fetches a remote news feed during package setup.
+            .file(
+                "/etc/ubuntu-advantage/uaclient.conf",
+                0o644,
+                "ua_config:\n  apt_news: false\n",
+            )
+            // Release checks fetch the upgrade list even when no upgrade is wanted.
+            .file(
+                "/etc/update-manager/release-upgrades",
+                0o644,
+                "[DEFAULT]\nPrompt=never\n",
+            )
+            // The clock comes from the host; network time would request another name.
+            .file(
+                "/etc/systemd/timesyncd.conf",
+                0o644,
+                "[Time]\nNTP=\nFallbackNTP=\n",
+            )
+            // Stop unattended apt work after cloud-init's explicit package setup.
+            .file(
+                "/etc/apt/apt.conf.d/99periodic",
+                0o644,
+                "APT::Periodic::Enable \"0\";\n",
+            )
+            // Login messages do not need remote news.
+            .file("/etc/default/motd-news", 0o644, "ENABLED=0\n");
+        // Prevent later refresh starts when desktop setup reloads systemd.
+        for unit in [
+            "systemd-timesyncd.service",
+            "snapd.socket",
+            "snapd.service",
+            "snapd.seeded.service",
+            "motd-news.service",
+            "motd-news.timer",
+            "ua-timer.timer",
+            "ua-timer.service",
+            "ubuntu-advantage.service",
+            "fwupd-refresh.service",
+            "fwupd-refresh.timer",
+            "apt-daily.timer",
+            "apt-daily.service",
+            "apt-daily-upgrade.timer",
+            "apt-daily-upgrade.service",
+        ] {
+            guest = guest
+                .file(
+                    &format!("/etc/systemd/system/{unit}.d/quiet.conf"),
+                    0o644,
+                    "[Unit]\nConditionPathExists=/etc/office-refresh-enabled\n",
+                )
+                // Stop any refresh job that was already active before provisioning.
+                .run(format!(
+                    "if systemctl is-active --quiet {unit}; then systemctl stop {unit}; fi"
+                ));
+        }
+        guest
+    }
+
+    /// Adds packages to install after the shared trust store is ready.
+    pub fn packages(mut self, packages: &[&str]) -> Self {
+        self.software
+            .packages
+            .extend(packages.iter().map(|s| s.to_string()));
+        self
+    }
+    /// Appends a shell command to run after package installation.
+    pub fn run(mut self, command: impl Into<String>) -> Self {
+        self.software.steps.push(command.into());
+        self
+    }
+    /// Puts a shell command before every other step, still after package
+    /// installation: before the desktop starts, for one.
+    pub fn run_first(mut self, command: impl Into<String>) -> Self {
+        self.software.steps.insert(0, command.into());
+        self
+    }
+
+    /// Takes the installation recipe without runtime network or resource settings.
+    pub fn into_recipe(self) -> io::Result<image::Recipe> {
+        self.validate()?;
+        Ok(image::Recipe {
+            hostname: self.hostname,
+            user: self.user,
+            files: self.files,
+            packages: self
+                .software
+                .packages
+                .into_iter()
+                .map(image::Package::Repository)
+                .collect(),
+            steps: self.software.steps,
+        })
+    }
+}
+
+impl Guest<PreparedImage> {
+    /// A guest whose software is already installed.
+    ///
+    /// ```compile_fail
+    /// use fictionet_demo::kit::Guest;
+    /// Guest::prepared("station", "analyst", "desktop.qcow2").packages(&["curl"]);
+    /// ```
+    pub fn prepared(hostname: &str, user: &str, image: &str) -> Self {
+        Self::base(hostname, user, PreparedImage(image.into()))
+    }
+}
+
+impl From<Installation> for Boot {
+    fn from(value: Installation) -> Self {
+        Self::Cloud(value)
+    }
+}
+impl From<PreparedImage> for Boot {
+    fn from(value: PreparedImage) -> Self {
+        Self::Prepared(value)
+    }
+}
+
+impl<P: Software + Into<Boot>> Guest<P> {
+    fn into_boot(self) -> Guest<Boot> {
+        Guest {
+            software: self.software.into(),
+            features: self.features,
+            hostname: self.hostname,
+            attachment: self.attachment,
+            user: self.user,
+            vcpus: self.vcpus,
+            memory_mib: self.memory_mib,
+            manufacturer: self.manufacturer,
+            product: self.product,
+            family: self.family,
+            files: self.files,
+            desktop: self.desktop,
+            terminal: self.terminal,
+            forbidden: self.forbidden,
+        }
     }
 }
 
@@ -409,7 +526,7 @@ struct Resources {
 }
 
 impl Resources {
-    fn new(root: &Path, guest: &Guest) -> io::Result<Self> {
+    fn new<P: Software>(root: &Path, guest: &Guest<P>) -> io::Result<Self> {
         let dir = root.join(&guest.hostname);
         std::fs::create_dir(&dir)?;
         let hash = crc32fast::hash(guest.hostname.as_bytes()).to_be_bytes();
@@ -434,7 +551,7 @@ impl Resources {
 
 /// A running guest reached through the admin's SSH session.
 pub struct GuestHandle {
-    guest: Guest,
+    guest: Guest<Boot>,
     resources: Resources,
     addr: watch::Receiver<Option<Ipv4Addr>>,
     vm: Option<vm::Vm>,
@@ -670,7 +787,7 @@ struct Prepared {
     backends: Vec<BackendInput>,
 }
 
-fn check_downloads(downloads: &Path, guests: &[Guest]) -> io::Result<()> {
+fn check_downloads<P: Software>(downloads: &Path, guests: &[Guest<P>]) -> io::Result<()> {
     for file in [
         "cloud-hypervisor",
         "ubuntu-24.04-server-cloudimg-amd64-vmlinuz-generic",
@@ -685,8 +802,8 @@ fn check_downloads(downloads: &Path, guests: &[Guest]) -> io::Result<()> {
     }
     for guest in guests {
         let file = guest
-            .image
-            .as_deref()
+            .software
+            .image()
             .unwrap_or("ubuntu-24.04-server-cloudimg-amd64.img");
         if !downloads.join(file).is_file() {
             return Err(io::Error::other(format!(
@@ -698,7 +815,10 @@ fn check_downloads(downloads: &Path, guests: &[Guest]) -> io::Result<()> {
     Ok(())
 }
 
-fn prepare(name: &str, guests: Vec<Guest>) -> io::Result<(Run, Prepared)> {
+fn prepare<P: Software + Into<Boot>>(
+    name: &str,
+    guests: Vec<Guest<P>>,
+) -> io::Result<(Run, Prepared)> {
     if guests.is_empty() {
         return Err(io::Error::other("declare at least one guest"));
     }
@@ -731,7 +851,7 @@ fn prepare(name: &str, guests: Vec<Guest>) -> io::Result<(Run, Prepared)> {
         bridges: Vec::new(),
         backends: Vec::new(),
     };
-    for guest in guests.into_iter() {
+    for guest in guests.into_iter().map(Guest::into_boot) {
         let resources = Resources::new(run.path(), &guest)?;
         let link = attacher
             .attach(&guest.attachment)
@@ -764,9 +884,9 @@ fn prepare(name: &str, guests: Vec<Guest>) -> io::Result<(Run, Prepared)> {
 }
 
 /// Boots guests after the app has connected their consoles to its own page.
-pub async fn boot<W, F>(
+pub async fn boot<W, F, P: Software + Into<Boot>>(
     name: &str,
-    guests: Vec<Guest>,
+    guests: Vec<Guest<P>>,
     downloads: impl AsRef<Path>,
     ready: impl FnOnce(Vec<page::GuestConsole>),
     start: W,
@@ -877,7 +997,7 @@ impl Run {
 
     fn provision(&self, image: &Path, key: &str, ca: Option<(&str, &str)>) -> io::Result<()> {
         for guest in &self.guests {
-            let image = std::fs::canonicalize(match &guest.guest.image {
+            let image = std::fs::canonicalize(match guest.guest.software.image() {
                 Some(name) => image.parent().unwrap().join(name),
                 None => image.to_path_buf(),
             })?;
@@ -1014,7 +1134,7 @@ impl Run {
 }
 impl GuestHandle {
     async fn wait_setup(&self, timeout: Duration) -> io::Result<Duration> {
-        if self.guest.image.is_none() {
+        if self.guest.software.image().is_none() {
             return self.wait_cloud_init(timeout).await;
         }
         let output = tokio::time::timeout(

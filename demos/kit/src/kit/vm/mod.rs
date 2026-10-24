@@ -196,7 +196,7 @@ impl Vm {
 }
 
 /// The kernel kills the VM even when its owner cannot run destructors.
-fn own_child(command: &mut Command) {
+pub fn own_child(command: &mut Command) {
     let parent = std::process::id() as libc::pid_t;
     // SAFETY: these operations are async-signal-safe and allocate nothing in the child.
     unsafe {

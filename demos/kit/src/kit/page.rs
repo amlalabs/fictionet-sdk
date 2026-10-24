@@ -74,7 +74,7 @@ enum Readiness {
 }
 
 impl GuestConsole {
-    pub(super) fn new(guest: &Guest) -> Self {
+    pub(super) fn new<P: super::Software>(guest: &Guest<P>) -> Self {
         Self {
             features: guest.features,
             name: guest.hostname.clone(),

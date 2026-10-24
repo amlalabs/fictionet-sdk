@@ -5,6 +5,8 @@ use super::{Guest, ssh};
 
 /// Xvnc's display port on the guest's loopback.
 pub const VNC_PORT: u16 = 5901;
+/// The browser desktop is usable once X, the window manager and Firefox answer.
+pub const BROWSER_READY: &str = "env DISPLAY=:1 xdpyinfo >/dev/null 2>&1 && pgrep -x xfwm4 >/dev/null && env DISPLAY=:1 xdotool search --onlyvisible --class firefox >/dev/null";
 /// HTTPS hosts used at boot. Serve these through World::mirror with TLS
 /// certificates from the CA passed to World::trust.
 pub const HOSTS: &[&str] = &["packages.mozilla.org"];
@@ -169,7 +171,7 @@ pub fn browser(hostname: &str, user: &str, start_url: &str) -> Guest {
 }
 
 /// The installed browser and desktop, enabled for the next boot.
-pub(super) fn browser_image(hostname: &str, user: &str, start_url: &str) -> Guest {
+pub fn browser_image(hostname: &str, user: &str, start_url: &str) -> Guest {
     let rest = start_url
         .strip_prefix("https://")
         .or_else(|| start_url.strip_prefix("http://"));
@@ -240,7 +242,7 @@ pub(super) fn browser_image(hostname: &str, user: &str, start_url: &str) -> Gues
         user,
         (1280, 800),
         &session,
-        "env DISPLAY=:1 xdpyinfo >/dev/null 2>&1 && pgrep -x xfwm4 >/dev/null && env DISPLAY=:1 xdotool search --onlyvisible --class firefox >/dev/null",
+        BROWSER_READY,
     )
     .packages(&[
         "xfce4",
@@ -549,7 +551,7 @@ mod tests {
         assert!(ready.contains("DISPLAY=:1 xdpyinfo"));
         assert!(ready.contains("pgrep -x xfwm4"));
         assert!(ready.contains("xdotool search --onlyvisible --class firefox"));
-        assert!(guest.packages.iter().any(|name| name == "xdotool"));
+        assert!(guest.software.packages.iter().any(|name| name == "xdotool"));
         let (data, files) = seed(&guest);
         let content = |path: &str| files[path].clone();
         assert_eq!(

@@ -1,5 +1,5 @@
 //! NoCloud provisioning for an unmodified Ubuntu cloud image.
-use super::Guest;
+use super::{Guest, Installation, Software};
 use fatfs::{FatType, FileSystem, FormatVolumeOptions, FsOptions};
 use fictionet::stdlib::codec::base64;
 use std::collections::BTreeMap;
@@ -7,16 +7,38 @@ use std::io::{Cursor, Write};
 
 /// The variables that point TLS clients at the system trust store: Node,
 /// Python's requests, and OpenSSL's users.
-const TRUST_ENV: &[(&str, &str)] = &[
+pub(super) const TRUST_ENV: &[(&str, &str)] = &[
     ("NODE_USE_SYSTEM_CA", "1"),
     ("REQUESTS_CA_BUNDLE", "/etc/ssl/certs/ca-certificates.crt"),
     ("SSL_CERT_FILE", "/etc/ssl/certs/ca-certificates.crt"),
 ];
 
+/// Shared TLS settings for cloud provisioning and prepared images.
+pub(super) fn trust_files() -> Vec<(&'static str, String)> {
+    let assignments: Vec<_> = TRUST_ENV.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    vec![
+        (
+            "/etc/systemd/network/05-eth0.network",
+            "[Match]\nName=eth0\n[Network]\nDHCP=ipv4\n".into(),
+        ),
+        (
+            "/etc/systemd/system.conf.d/trust.conf",
+            format!("[Manager]\nDefaultEnvironment={}\n", assignments.join(" ")),
+        ),
+        (
+            "/etc/profile.d/trust.sh",
+            assignments
+                .iter()
+                .map(|a| format!("export {a}\n"))
+                .collect(),
+        ),
+    ]
+}
+
 /// The guest configuration and credentials for one seed.
-pub struct Provision<'a> {
+pub struct Provision<'a, P = Installation> {
     /// The guest identity and provisioning steps.
-    pub guest: &'a Guest,
+    pub guest: &'a Guest<P>,
     /// The public SSH key allowed to log in.
     pub authorized_key: &'a str,
     /// An optional root certificate name and PEM content.
@@ -24,7 +46,7 @@ pub struct Provision<'a> {
 }
 
 /// Builds the `cidata` FAT image bytes for `provision`.
-pub fn build(provision: &Provision) -> std::io::Result<Vec<u8>> {
+pub fn build<P: Software>(provision: &Provision<P>) -> std::io::Result<Vec<u8>> {
     provision.guest.validate()?;
     if provision
         .ca
@@ -32,10 +54,10 @@ pub fn build(provision: &Provision) -> std::io::Result<Vec<u8>> {
     {
         return Err(std::io::Error::other("invalid root certificate name"));
     }
-    if provision.guest.image.is_some() {
+    let Some(installation) = provision.guest.software.installation() else {
         return super::image::seed(provision);
-    }
-    let user_data = user_data(provision);
+    };
+    let user_data = cloud_data(provision, installation);
     let audit = fictionet_extras::guest_content::Audit::default();
     for (path, content) in files(&user_data)? {
         audit.installed(&path, content.as_bytes());
@@ -111,7 +133,11 @@ pub fn files(user_data: &str) -> std::io::Result<BTreeMap<String, String>> {
 }
 
 /// Builds cloud-init's user data, including the shared trust store.
-pub fn user_data(p: &Provision) -> String {
+pub fn user_data(p: &Provision<'_>) -> String {
+    cloud_data(p, &p.guest.software)
+}
+
+fn cloud_data<P: Software>(p: &Provision<P>, installation: &Installation) -> String {
     let g = p.guest;
     let quote = |s: &str| serde_json::to_string(s).expect("a string");
     let mut out = format!(
@@ -124,26 +150,13 @@ pub fn user_data(p: &Provision) -> String {
         quote(&g.user),
         quote(p.authorized_key)
     );
-    let assignments: Vec<_> = TRUST_ENV.iter().map(|(k, v)| format!("{k}={v}")).collect();
-    let systemd = format!("[Manager]\nDefaultEnvironment={}\n", assignments.join(" "));
-    let profile: String = assignments
-        .iter()
-        .map(|a| format!("export {a}\n"))
-        .collect();
-    let shared = [
-        (
-            "/etc/systemd/network/05-eth0.network",
-            "[Match]\nName=eth0\n[Network]\nDHCP=ipv4\n",
-        ),
-        ("/etc/systemd/system.conf.d/trust.conf", systemd.as_str()),
-        ("/etc/profile.d/trust.sh", profile.as_str()),
-    ];
+    let shared = trust_files();
     let root =
         p.ca.map(|(name, pem)| (format!("/usr/local/share/ca-certificates/{name}.crt"), pem));
     for (path, mode, content) in root
         .iter()
         .map(|(path, pem)| (path.as_str(), 0o644, *pem))
-        .chain(shared.iter().map(|(p, c)| (*p, 0o644, *c)))
+        .chain(shared.iter().map(|(p, c)| (*p, 0o644, c.as_str())))
         .chain(
             g.files
                 .iter()
@@ -164,6 +177,7 @@ pub fn user_data(p: &Provision) -> String {
     }
     out.push_str("runcmd:\n");
     // The Ubuntu image already has the updater; trust the world before apt uses HTTPS.
+    let assignments: Vec<_> = TRUST_ENV.iter().map(|(k, v)| format!("{k}={v}")).collect();
     let mut commands = vec![
         "update-ca-certificates".into(),
         format!(
@@ -174,14 +188,15 @@ pub fn user_data(p: &Provision) -> String {
         "apt-get update".into(),
         format!(
             "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates {}",
-            g.packages
+            installation
+                .packages
                 .iter()
                 .map(|s| super::ssh::quote(s))
                 .collect::<Vec<_>>()
                 .join(" ")
         ),
     ];
-    commands.extend(g.steps.iter().cloned());
+    commands.extend(installation.steps.iter().cloned());
     // One shell stops provisioning on the first failed command.
     out.push_str(&format!(
         "  - [bash, -euc, {}]\n",

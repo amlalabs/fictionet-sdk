@@ -1,11 +1,19 @@
 use fictionet_demo::kit::{self, Guest};
 
-pub const HOST: &str = kit::image::HOST;
-pub const USER: &str = kit::image::USER;
+pub const HOST: &str = "workstation";
+pub const USER: &str = "analyst";
 
 /// The workstation inherits the host clock from the hypervisor.
-pub fn guest(token: Option<&str>) -> Guest {
-    let mut guest = kit::image::workstation();
+pub fn guest(token: Option<&str>) -> Guest<kit::PreparedImage> {
+    let mut guest = Guest::prepared(HOST, USER, "search-workstation.qcow2")
+        .resources(4, 4096)
+        .desktop(kit::desktop::VNC_PORT, kit::desktop::BROWSER_READY)
+        .terminal("env DISPLAY=:1 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus tmux new-session -A -s main");
+    guest.features = kit::Features {
+        claude_code: true,
+        codex: true,
+        firefox: true,
+    };
     if let Some(token) = token {
         let mut settings: serde_json::Value =
             serde_json::from_str(kit::desktop::CLAUDE_SETTINGS).expect("managed settings");
@@ -44,7 +52,7 @@ mod tests {
         let image = kit::seed::build(&kit::seed::Provision {
             guest: &guest,
             authorized_key: "fresh-key",
-            ca: None,
+            ca: Some(("office", "fresh-ca")),
         })
         .unwrap();
         let fs =
@@ -83,6 +91,10 @@ mod tests {
             true
         );
         assert!(script.contains("chmod 600 '/home/analyst/.claude/settings.json'"));
+        for value in ["fresh-key", "fresh-ca"] {
+            assert!(script.contains(&fictionet::stdlib::codec::base64::encode(value.as_bytes())));
+        }
+        assert!(!script.contains("curl"));
         assert!(!script.contains("apt-get"));
         assert!(!script.contains("date -u -s"));
     }

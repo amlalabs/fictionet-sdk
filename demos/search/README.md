@@ -9,10 +9,35 @@ rustup run 1.99.0 cargo xtask search-image demos/downloads/cloudimage
 
 The command verifies the pinned Ubuntu cloud disk, kernel and initrd and Cloud
 Hypervisor, then installs Xfce, Firefox, Claude Code, Codex, Python and the guest
-settings in a temporary VM. It writes `search-workstation.qcow2` atomically after
-successful shutdown. Construction needs the internet; the resulting workstation
-boots without downloading or installing software. Rebuilding replaces the image
-for subsequent launches; running guests retain their existing image.
+settings in a private build VM. Ubuntu packages come from the fixed
+`20261023T000000Z` [archive snapshot](https://snapshot.ubuntu.com/). Firefox's
+Debian archive and the Claude and Codex releases are pinned and checksum-checked.
+
+Before publishing, the candidate boots normally with upstream networking blocked.
+The builder checks Xfce, the Firefox window, the terminal settings and a Python
+virtual environment on a disposable overlay, then checks the compacted qcow2.
+Each VM returns its own completion result on its attached disk; shared summary logs never authorize a
+build. Partial downloads and progress logs belong to that build too.
+`search-image-build.log` and `search-image-verify.log` retain the latest completed
+stages for inspection.
+
+Only a verified candidate atomically replaces `search-workstation.qcow2`.
+Construction needs the internet; the resulting workstation boots without
+downloading or installing software. Running guests retain their existing image.
+Every invocation rebuilds from the verified Ubuntu base. To reproduce the tested
+software, run the command twice and compare its printed `Installed package set`
+digests; these cover every installed Debian package and version. Guest identities
+and filesystem allocation can differ between builds.
+
+Two overlapping clean builds completed in 199 s and 232 s and returned the same
+installed-package digest:
+`d8478626a1fc70965055f8ac2ff8f961310f01fb38cb0e65e457be830f0b0f28`.
+Both passed the desktop boot check. A separate Search demo run reached readiness
+in 7.312 s, searched for the XZ backdoor, followed a captured source, wrote a cited
+file, ran Python and installed `requests` into a virtual environment. Its record
+contained zero upstream attempts. Desktop and laptop screenshots showed both the
+terminal and Firefox. These measurements exclude compilation; the two builds ran
+concurrently and downloaded their packages from the fixed snapshot.
 
 Run the demo with a host-held Claude token:
 
