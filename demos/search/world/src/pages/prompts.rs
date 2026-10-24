@@ -674,7 +674,7 @@ pub fn page(seed: &Seed, ask: &PageAsk) -> (String, String) {
             Reading::Indexed => format!(
                 "\nA search index's notes on the real document this address shows (not the page itself):\n{}\n\nWrite the page this address really serves, in the site's own form and length \
                 (a record page shows the citation, the authors with their real affiliations, the abstract and links). \
-                Its identity, authors, dates, names and numbers are the real document's. Leave out the index's own annotations, such as citation counts and author metrics.\n",
+                Its identity, authors, dates, names and numbers are the real document's. The page says nothing about these notes or any index: it has no citation counts or author metrics, and gives each author the affiliation the real paper gives them.\n",
                 original.text
             ),
         })
