@@ -372,7 +372,7 @@ impl Model {
         Self::new(
             Provider::Anthropic,
             "claude-sonnet-5-5",
-            "",
+            "low",
             key,
             Arc::new(ProviderTransport::new(Provider::Anthropic)),
         )
@@ -1000,8 +1000,8 @@ mod transport_tests {
             );
             assert_eq!(body["system"][1]["text"], "Write a page.");
             assert_eq!(body["model"], "claude-sonnet-5-5");
-            assert!(body.get("thinking").is_none());
-            assert!(body.get("output_config").is_none());
+            assert_eq!(body["thinking"]["type"], "between_tools");
+            assert_eq!(body["output_config"]["effort"], "low");
             assert_eq!(body["system"][1]["cache_control"]["type"], "ephemeral");
             assert!(body.get("temperature").is_none());
             let response = r#"{"content":[{"type":"text","text":"A written page."}],"stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":4}}"#;
