@@ -32,8 +32,14 @@ impl fictionet_extras::models::Engine for Pages {
             let response = loop {
                 let parsed = url::Url::parse(&url)?;
                 let (host, target) = text::target_of(&url);
-                let page_source = self.source();
-                let response = if self.live_only() {
+                let package = self.package_url(&url);
+                let page_source = package.as_ref().map_or_else(
+                    || self.source(),
+                    |_| crate::observation::PageSource::Copy { captured: None },
+                );
+                let response = if let Some(package) = package {
+                    package
+                } else if self.live_only() {
                     self.live_url(&cx, &url).await
                 } else if self.copied_only() {
                     self.copied_url(&url)

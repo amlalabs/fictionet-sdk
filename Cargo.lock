@@ -4573,12 +4573,14 @@ dependencies = [
  "fictionet-extras",
  "fictionet-host",
  "fictionet-test-support",
+ "flate2",
  "form_urlencoded",
  "http",
  "http-body",
  "http-body-util",
  "kuchiki",
  "regex",
+ "rustls",
  "serde",
  "serde_json",
  "time",
@@ -4877,7 +4879,12 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "fictionet-demo",
+ "fictionet-extras",
+ "serde",
+ "serde_json",
  "tokio",
+ "url",
+ "web-world",
 ]
 
 [[package]]

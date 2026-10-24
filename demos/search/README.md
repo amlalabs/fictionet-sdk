@@ -76,7 +76,8 @@ sites. Capture dates are shown only when the archive records them.
 
 - **Copied** replays WARC responses at their real URLs. A crawler builds one
   BM25 index from their titles and text. Google, Bing and DuckDuckGo render that
-  index in their own layouts. Each result covers every query term; unrelated
+  index in their own layouts. Results rank by distinct query-term coverage,
+  then BM25 score. A result must cover a majority of the terms; unrelated
   searches have no results. Counts come from the index before pagination.
   Missing URLs on captured hosts return 404. Uncaptured hosts return NXDOMAIN,
   apart from the caller's declared model and sign-in services.
@@ -147,7 +148,8 @@ The default world is [security](seeds/security.md). Its `[corpus]` front matter
 chooses the capture directory under `demos/downloads/` and the starting URLs.
 The app opens that declaration; it does not choose a topic or URL list itself.
 The capture contains MITRE ATT&CK techniques, CISA advisories, NIST guidance,
-and SolarWinds and XZ analyses from researchers and vendors. It is a bounded
+and researcher and vendor analyses of tj-actions, Shai-Hulud, SolarWinds,
+XZ, 3CX, Codecov and PyTorch nightly. It is a bounded
 collection; links beyond the captures have no public-web fallback.
 
 WARCs are stored in `demos/downloads/security/`, outside git, with their wget
@@ -176,6 +178,42 @@ Set `SEARCH_DOWNLOADS` to another downloads root when testing captures outside
 this checkout. The test searches the real index, fetches citations through the
 world, and checks empty results without booting a VM or opening the demo port.
 The previous astronomy captures remain in `demos/downloads/astronomy/`.
+
+### Packages
+
+The corpus's `packages/` directory holds separate WARCs for PyPI indexes,
+wheel metadata and distributions, and GitHub source archives. These sites
+always replay locally, including in Model-written mode. There is no upstream
+transport. Missing distributions return 404, and a missing project cannot
+fall through to a generated page. Captured site 404 pages and their assets
+also supply missing-page responses for the research sources.
+
+Capture the research sources and packages with Python 3.12 and pip available
+on the host:
+
+```sh
+rustup run 1.99.0 cargo xtask search-capture demos/downloads <python-with-pip>
+```
+
+The command retains existing captures, resolves research tools with pip,
+and captures their dependency closure at the original PyPI URLs. It includes
+requests, pandas, numpy, matplotlib, beautifulsoup4, scipy, networkx, pyyaml,
+packaging, rich and pytest. The wheel selection targets the workstation's
+Python 3.12 on Linux x86-64. Requests, NetworkX and Click source archives are
+available at the tagged GitHub archive URLs declared in the capture command.
+Other versions and platforms require their own captures.
+
+The package acceptance test runs real pip through a loopback proxy backed by
+the world's HTTP handler, with its CA trusted and no upstream transport. It
+checks installation, package imports, plotting, and a GitHub archive download:
+
+```sh
+SEARCH_PYTHON=<python-with-pip> rustup run 1.99.0 cargo test -p web-world --test packages -- --nocapture
+```
+
+It uses a temporary installation directory and disables pip's cache. Set
+`SEARCH_DOWNLOADS` to test another downloads root. Neither acceptance test
+boots the VM or uses the demo's port.
 
 ## Code
 

@@ -354,7 +354,7 @@ impl Pages {
     }
 
     pub(crate) async fn live_url(&self, cx: &Cx, url: &str) -> Response {
-        copied::replay(url, Ok(self.live.as_ref().unwrap().response(cx, url).await))
+        copied::replay(Ok(self.live.as_ref().unwrap().response(cx, url).await))
     }
 
     pub(super) async fn live_listing(

@@ -89,8 +89,15 @@ impl Handler {
         .then_some(&body[..]);
         let path = parts.uri.path_and_query().map_or("/", |p| p.as_str());
         let action = route(&target.host, path, form);
-        let page_source = self.pages.source();
-        let answer = if let Some(asset) = Pages::search_asset(&target.host, path) {
+        let url = format!("{}://{}{path}", target.scheme, target.host);
+        let package = self.pages.package_url(&url);
+        let page_source = package.as_ref().map_or_else(
+            || self.pages.source(),
+            |_| crate::observation::PageSource::Copy { captured: None },
+        );
+        let answer = if let Some(package) = package {
+            package
+        } else if let Some(asset) = Pages::search_asset(&target.host, path) {
             asset
         } else if self.pages.live_only() && action == Route::Page {
             self.pages

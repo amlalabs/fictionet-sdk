@@ -1,4 +1,6 @@
-//! Host tooling for reproducible demo images.
+//! Host tooling for demo images and offline web captures.
+
+mod capture;
 
 use fictionet_demo::kit::{RunDir, image};
 use std::{
@@ -14,10 +16,20 @@ type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + 
 #[tokio::main]
 async fn main() -> Result {
     let mut args = std::env::args().skip(1);
-    if args.next().as_deref() != Some("search-image") {
-        return Err("usage: cargo xtask search-image <downloads>".into());
-    }
+    let task = args
+        .next()
+        .ok_or("expected search-image or search-capture")?;
     let downloads = PathBuf::from(args.next().ok_or("missing downloads directory")?);
+    if task == "search-capture" {
+        let python = PathBuf::from(args.next().ok_or("missing Python with pip (Python 3.12)")?);
+        if args.next().is_some() {
+            return Err("unexpected argument".into());
+        }
+        return capture::run(&downloads, &python).await;
+    }
+    if task != "search-image" {
+        return Err("expected search-image or search-capture".into());
+    }
     if args.next().is_some() {
         return Err("unexpected argument".into());
     }

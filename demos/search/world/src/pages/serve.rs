@@ -108,6 +108,9 @@ impl Pages {
         target: &str,
         route: Route,
     ) -> Response {
+        if let Some(package) = self.package_url(&format!("https://{host}{target}")) {
+            return package;
+        }
         if let Some(asset) = Self::search_asset(host, target) {
             return asset;
         }

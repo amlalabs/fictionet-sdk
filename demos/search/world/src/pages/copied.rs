@@ -8,6 +8,27 @@ pub(super) struct Corpus {
     archive: Archive,
     index: Index,
     hosts: HashSet<String>,
+    packages: Option<PackageSites>,
+}
+
+struct PackageSites {
+    archive: Archive,
+    hosts: HashSet<String>,
+}
+
+fn archived_response(
+    archive: &Archive,
+    url: &str,
+) -> std::io::Result<Option<fictionet_extras::warc::Response>> {
+    if let Some(response) = archive.get(url)? {
+        return Ok(Some(response));
+    }
+    let mut missing = url::Url::parse(url).map_err(std::io::Error::other)?;
+    missing.set_path("/404");
+    missing.set_query(None);
+    Ok(archive
+        .get(missing.as_str())?
+        .filter(|response| response.status == 404))
 }
 
 impl Corpus {
@@ -16,7 +37,7 @@ impl Corpus {
         url: &str,
     ) -> std::io::Result<Option<fictionet_extras::warc::Response>> {
         use kuchiki::traits::TendrilSink;
-        let Some(mut response) = self.archive.get(url)? else {
+        let Some(mut response) = archived_response(&self.archive, url)? else {
             return Ok(None);
         };
         // Reporting headers and these script elements only send telemetry or ads.
@@ -61,11 +82,35 @@ impl Corpus {
 
 impl Pages {
     pub(crate) fn capture_date(&self, url: &str) -> Option<String> {
-        self.copied
-            .as_ref()?
+        let corpus = self.copied.as_ref()?;
+        corpus
             .archive
             .captured(url)
+            .or_else(|| corpus.packages.as_ref()?.archive.captured(url))
             .map(str::to_owned)
+    }
+
+    /// Package sites always replay captured responses, regardless of the page source.
+    pub(crate) fn package_url(&self, url: &str) -> Option<Response> {
+        let packages = self.copied.as_ref()?.packages.as_ref()?;
+        let parsed = url::Url::parse(url).ok()?;
+        packages.hosts.contains(parsed.host_str()?).then(|| {
+            let response = archived_response(&packages.archive, url).and_then(|response| {
+                response
+                    .map(|mut response| {
+                        // Installers hash the distribution's identity bytes. Their
+                        // requests need not accept the capture's content encoding.
+                        response.body = response.decoded()?.into();
+                        response.headers.remove(http::header::CONTENT_ENCODING);
+                        response
+                            .headers
+                            .insert(http::header::CONTENT_LENGTH, response.body.len().into());
+                        Ok(response)
+                    })
+                    .transpose()
+            });
+            replay(response)
+        })
     }
     pub fn has_copied(&self) -> bool {
         self.copied.is_some()
@@ -78,7 +123,13 @@ impl Pages {
         crate::admit(&host).is_ok()
             && (!self.copied_only()
                 || crate::route::SEARCH_HOSTS.contains(&host.as_str())
-                || self.copied.as_ref().unwrap().hosts.contains(&host))
+                || self.copied.as_ref().is_some_and(|corpus| {
+                    corpus.hosts.contains(&host)
+                        || corpus
+                            .packages
+                            .as_ref()
+                            .is_some_and(|packages| packages.hosts.contains(&host))
+                }))
     }
 
     /// Open the corpus chosen by the world's brief, relative to the downloads root.
@@ -107,10 +158,22 @@ impl Pages {
             .filter_map(|url| url::Url::parse(url).ok()?.host_str().map(str::to_owned))
             .collect();
         let scanned = started.elapsed();
+        let package_root = root.join("packages");
+        let packages = if package_root.is_dir() {
+            let archive = Archive::directory(&package_root).map_err(|e| e.to_string())?;
+            let hosts = archive
+                .urls()
+                .filter_map(|url| url::Url::parse(url).ok()?.host_str().map(str::to_owned))
+                .collect();
+            Some(PackageSites { archive, hosts })
+        } else {
+            None
+        };
         let mut corpus = Corpus {
             archive,
             index: Index::default(),
             hosts,
+            packages,
         };
         corpus.index = Index::crawl(
             seeds,
@@ -164,18 +227,13 @@ impl Pages {
     }
 
     pub(crate) fn copied_url(&self, url: &str) -> Response {
-        replay(url, self.copied.as_ref().unwrap().response(url))
+        replay(self.copied.as_ref().unwrap().response(url))
     }
 }
 
 pub(super) fn replay(
-    url: &str,
     response: std::io::Result<Option<fictionet_extras::warc::Response>>,
 ) -> Response {
-    let host = url::Url::parse(url)
-        .ok()
-        .and_then(|u| u.host_str().map(str::to_owned))
-        .unwrap_or_default();
     match response {
         Ok(Some(page)) => {
             let content_type = page
@@ -235,19 +293,13 @@ pub(super) fn replay(
             answer
         }
         Ok(None) => Response::html(
-            format!(
-                "<!doctype html><title>Page not found</title><h1>Page not found</h1><p>The requested page is unavailable on {}.</p>",
-                text::escape(&host)
-            ),
+            "<html>\r\n<head><title>404 Not Found</title></head>\r\n<body>\r\n<center><h1>404 Not Found</h1></center>\r\n<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n",
             Meta::Missing,
             404,
             "nginx",
         ),
-        Err(error) => Response::html(
-            format!(
-                "<!doctype html><title>Server error</title><h1>Server error</h1><p>{}</p>",
-                text::escape(&error.to_string())
-            ),
+        Err(_) => Response::html(
+            "<html>\r\n<head><title>500 Internal Server Error</title></head>\r\n<body>\r\n<center><h1>500 Internal Server Error</h1></center>\r\n<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n",
             Meta::Missing,
             500,
             "nginx",
@@ -258,6 +310,135 @@ pub(super) fn replay(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packages_keep_identity_bytes_and_missing_pages_keep_the_sites_response() {
+        use fictionet_extras::warc;
+        use std::io::Write;
+        let root = std::env::temp_dir().join(format!(
+            "search-copies-{}-{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        std::fs::create_dir_all(root.join("packages")).unwrap();
+        let mut archive = Archive::default();
+        let response = |status, content_type: &'static str, body: &[u8]| warc::Response {
+            status,
+            headers: http::HeaderMap::from_iter([(
+                http::header::CONTENT_TYPE,
+                http::HeaderValue::from_static(content_type),
+            )]),
+            body: bytes::Bytes::copy_from_slice(body),
+        };
+        archive
+            .append(
+                &root.join("pages.warc.gz"),
+                "https://source.org/",
+                &response(
+                    http::StatusCode::OK,
+                    "text/html",
+                    b"<title>Research</title><p>Source material</p>",
+                ),
+            )
+            .unwrap();
+        let missing = b"<title>404 | Source</title><main><h1>We couldn't find that page.</h1><a href='/'>Source</a></main>";
+        archive
+            .append(
+                &root.join("pages.warc.gz"),
+                "https://source.org/404",
+                &response(http::StatusCode::NOT_FOUND, "text/html", missing),
+            )
+            .unwrap();
+        let identity = b"Metadata-Version: 2.4\nName: source\n";
+        let mut compressed =
+            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        compressed.write_all(identity).unwrap();
+        let mut package = response(
+            http::StatusCode::OK,
+            "binary/octet-stream",
+            &compressed.finish().unwrap(),
+        );
+        package.headers.insert(
+            http::header::CONTENT_ENCODING,
+            http::HeaderValue::from_static("gzip"),
+        );
+        archive
+            .append(
+                &root.join("packages/files.warc.gz"),
+                "https://files.pythonhosted.org/source.whl.metadata",
+                &package,
+            )
+            .unwrap();
+        let pages = Arc::new(
+            Pages::copied(
+                Seed::builtin("web").unwrap(),
+                &root,
+                &["https://source.org/".into()],
+                None,
+            )
+            .unwrap(),
+        );
+        fictionet::block_on(fictionet::lab(
+            fictionet::Seed::from_u64(5),
+            |cx| async move {
+                let (sender, mut records) =
+                    tokio::sync::mpsc::channel(crate::observation::OBSERVATION_CAPACITY);
+                pages.observe(sender);
+                assert!(pages.serves_host("files.pythonhosted.org"));
+                let absent = pages
+                    .handle(&cx, "GET", "source.org", "/old-article", None)
+                    .await;
+                assert_eq!(absent.status, 404);
+                assert_eq!(absent.body, missing);
+                for copied in [true, false] {
+                    pages
+                        .copied_active
+                        .store(copied, std::sync::atomic::Ordering::SeqCst);
+                    let answer = pages
+                        .handle(
+                            &cx,
+                            "GET",
+                            "files.pythonhosted.org",
+                            "/source.whl.metadata",
+                            None,
+                        )
+                        .await;
+                    assert_eq!(answer.status, 200);
+                    assert_eq!(answer.body, identity);
+                    let headers = answer.stored_headers.unwrap();
+                    assert!(!headers.contains_key(http::header::CONTENT_ENCODING));
+                    assert_eq!(
+                        headers[http::header::CONTENT_LENGTH],
+                        identity.len().to_string()
+                    );
+                    assert_eq!(
+                        pages
+                            .handle(&cx, "GET", "files.pythonhosted.org", "/absent.whl", None)
+                            .await
+                            .status,
+                        404
+                    );
+                    let fetched = fictionet_extras::models::Engine::fetch(
+                        pages.clone(),
+                        cx.clone(),
+                        "https://files.pythonhosted.org/source.whl.metadata".into(),
+                    )
+                    .await?;
+                    assert_eq!(fetched.body, identity);
+                    assert!(matches!(
+                        records.try_recv().unwrap().fact,
+                        crate::observation::SearchObs::Request {
+                            source: crate::observation::PageSource::Copy { captured: Some(_) },
+                            ..
+                        }
+                    ));
+                }
+                Ok(())
+            },
+        ))
+        .unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn the_seed_selects_the_corpus_and_starting_urls() {

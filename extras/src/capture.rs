@@ -175,9 +175,7 @@ pub fn links(url: &str, response: &warc::Response) -> io::Result<Links> {
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    if !response.status.is_success()
-        || !(content_type.starts_with("text/html") || content_type.starts_with("text/css"))
-    {
+    if !(content_type.starts_with("text/html") || content_type.starts_with("text/css")) {
         return Ok(links);
     }
     let decoded = response.decoded()?;
@@ -334,6 +332,20 @@ mod tests {
             ]
         );
         assert!(links.pages.is_empty());
+    }
+
+    #[test]
+    fn missing_pages_have_stylesheets_and_images_too() {
+        let mut missing = response(
+            "text/html",
+            "<title>Not found</title><link rel='stylesheet' href='/site.css'><img src='/logo.svg'>",
+        );
+        missing.status = http::StatusCode::NOT_FOUND;
+        let links = super::links("https://source.org/404", &missing).unwrap();
+        assert_eq!(
+            links.assets,
+            ["https://source.org/logo.svg", "https://source.org/site.css"]
+        );
     }
 
     #[test]
