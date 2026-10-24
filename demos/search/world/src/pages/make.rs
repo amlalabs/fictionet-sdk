@@ -5,6 +5,7 @@ use fictionet_extras::search::{Result, Search};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::borrow::Cow;
 use std::sync::OnceLock;
 
 const STOP: &[&str] = &[
@@ -448,10 +449,15 @@ pub fn title_from(host: &str, target: &str) -> String {
     }
 }
 
-pub(super) fn git_path(target: &str) -> bool {
+/// The path part of a request target, percent-decoded. A path is not form
+/// data, so a literal `&` or `+` stays as it is.
+fn decoded_path(target: &str) -> Cow<'_, str> {
     let path = target.split('?').next().unwrap_or(target);
-    let encoded = format!("path={path}");
-    let decoded = form_urlencoded::parse(encoded.as_bytes()).next().unwrap().1;
+    percent_encoding::percent_decode_str(path).decode_utf8_lossy()
+}
+
+pub(super) fn git_path(target: &str) -> bool {
+    let decoded = decoded_path(target);
     decoded.split('/').any(|part| {
         matches!(part, "git-upload-pack" | "git-receive-pack") || part.ends_with(".git")
     }) || decoded.ends_with("/info/refs")
@@ -460,9 +466,7 @@ pub(super) fn git_path(target: &str) -> bool {
 /// Rejects pasted addresses and domain names inside a page path.
 pub(super) fn broken_path(target: &str) -> bool {
     static BROKEN: OnceLock<Regex> = OnceLock::new();
-    let path = target.split('?').next().unwrap_or(target);
-    let encoded = format!("path={path}");
-    let decoded = form_urlencoded::parse(encoded.as_bytes()).next().unwrap().1;
+    let decoded = decoded_path(target);
     BROKEN
         .get_or_init(|| {
             Regex::new(r"(?i)https?:|(?:^|/)[^/]*\.(?:com|org|net|co\.uk)(?:/|$)").unwrap()
