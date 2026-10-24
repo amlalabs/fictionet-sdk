@@ -171,8 +171,11 @@ impl Clock {
             )
             .into());
         }
-        s.now = at.since_start();
-        let due = Self::take_due(&mut s, at);
+        // A timer registered from outside the run can name a deadline the
+        // clock has already passed; it is due now, and the clock stays put.
+        s.now = s.now.max(at.since_start());
+        let now = Instant::from_since_start(s.now);
+        let due = Self::take_due(&mut s, now);
         Ok(due)
     }
 }
