@@ -278,8 +278,106 @@ async fn dns_conn(fcx: &Cx, conn: tcp::TcpConnection, context: &Context) -> Resu
 
 #[cfg(test)]
 mod tests {
+    use super::super::addresses::Placed;
+    use super::super::hosts::{Known, Peers, World};
+    use super::super::{Hooks, Limits, MAX_HOSTS, Shared, Subnet, route};
     use super::*;
+    use fictionet::stdlib::network::DatagramSocket;
     use fictionet::stdlib::protocols::dns::{op::Query, rr::Name};
+    use fictionet::sync::Mutex;
+    use std::collections::{BTreeMap, VecDeque};
+    use std::net::SocketAddr;
+    use std::sync::atomic::AtomicU64;
+
+    /// A UDP socket that hands out `queued` and keeps what is sent.
+    struct Datagrams {
+        queued: VecDeque<(Vec<u8>, SocketAddr)>,
+        sent: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl DatagramSocket for Datagrams {
+        fn recv(
+            &mut self,
+            _: &Cx,
+        ) -> impl Future<Output = Result<(Vec<u8>, SocketAddr), fictionet::RecvError>> + Send
+        {
+            let next = self.queued.pop_front();
+            async move { next.ok_or(fictionet::RecvError::Closed) }
+        }
+
+        fn send_to(&mut self, data: &[u8], _: SocketAddr) {
+            self.sent.lock().push(data.to_vec());
+        }
+    }
+
+    /// Replies the UDP service sends for `queries`.
+    fn udp_replies(lookup: Arc<LookupName>, queries: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let socket = Datagrams {
+            queued: queries
+                .into_iter()
+                .map(|q| (q, "10.0.0.2:5353".parse().unwrap()))
+                .collect(),
+            sent: sent.clone(),
+        };
+        let state = State {
+            lookup,
+            tcp_idle: Duration::from_secs(10),
+        };
+        fictionet::block_on(fictionet::lab(
+            fictionet::Seed::from_u64(1),
+            |fcx| async move {
+                let _ = serve::datagram(
+                    &fcx,
+                    socket,
+                    "10.0.0.1:53".parse().unwrap(),
+                    &mut Dns { tcp: false },
+                    &state,
+                    &ServeOptions::default(),
+                )
+                .await;
+                Ok(())
+            },
+        ))
+        .unwrap();
+        let sent = sent.lock().clone();
+        sent
+    }
+
+    /// A query whose questions after the second all point at the second
+    /// name. The first name has more labels than hickory keeps compression
+    /// candidates for, so a reply that echoes the questions spells every
+    /// copy of the second name out in full.
+    fn echo_query(pointers: u16) -> Vec<u8> {
+        let mut q = vec![0x12, 0x34, 0x01, 0x00];
+        q.extend_from_slice(&(2 + pointers).to_be_bytes());
+        q.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+        for _ in 0..100 {
+            q.extend_from_slice(&[1, b'a']);
+        }
+        q.push(0);
+        q.extend_from_slice(&[0, 1, 0, 1]);
+        let second = u16::try_from(q.len()).unwrap();
+        for len in [63, 63, 63, 61] {
+            q.push(len);
+            q.extend(std::iter::repeat_n(b'b', usize::from(len)));
+        }
+        q.push(0);
+        q.extend_from_slice(&[0, 1, 0, 1]);
+        for _ in 0..pointers {
+            q.extend_from_slice(&(0xC000 | second).to_be_bytes());
+            q.extend_from_slice(&[0, 1, 0, 1]);
+        }
+        q
+    }
+
+    fn a_query(id: u16, name: &str) -> Message {
+        let mut query = Message::new(id, MessageType::Query, OpCode::Query);
+        query
+            .queries
+            .push(Query::query(Name::from_ascii(name).unwrap(), RecordType::A));
+        query
+    }
 
     #[test]
     fn unknown_names_answer_nxdomain() {
@@ -293,5 +391,116 @@ mod tests {
         assert_eq!(parsed.metadata.id, 7);
         assert_eq!(parsed.metadata.response_code, ResponseCode::NXDomain);
         assert_eq!(parsed.queries, query.queries);
+    }
+
+    #[test]
+    fn udp_replies_fit_in_512_bytes_without_edns() {
+        let query = echo_query(150);
+        assert!(query.len() < 1400, "the query fits one Ethernet frame");
+        let replies = udp_replies(Arc::new(|_| Lookup::NoHost), vec![query]);
+        assert_eq!(replies.len(), 1);
+        let reply = Message::from_vec(&replies[0]).unwrap();
+        assert_eq!(reply.metadata.id, 0x1234);
+        assert!(
+            replies[0].len() <= 512,
+            "a {}-byte UDP reply to a query without EDNS (TC={})",
+            replies[0].len(),
+            reply.metadata.truncation
+        );
+    }
+
+    #[test]
+    fn queries_whose_echo_is_too_long_still_get_a_reply() {
+        let query = echo_query(260);
+        assert!(query.len() < 4096);
+        let reply = answer(&|_| Lookup::NoHost, &query).expect("every query gets a reply");
+        let parsed = Message::from_vec(&reply).unwrap();
+        assert_eq!(parsed.metadata.id, 0x1234);
+        assert_eq!(parsed.metadata.response_code, ResponseCode::FormErr);
+    }
+
+    #[test]
+    fn malformed_queries_keep_their_opcode() {
+        // NOTIFY with one question announced and none present.
+        let bytes = [0x00, 0x42, 0x20, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        let reply = answer(&|_| Lookup::NoHost, &bytes).unwrap();
+        let parsed = Message::from_vec(&reply).unwrap();
+        assert_eq!(parsed.metadata.id, 0x42);
+        assert_eq!(parsed.metadata.response_code, ResponseCode::FormErr);
+        assert_eq!(parsed.metadata.op_code, OpCode::Notify);
+    }
+
+    #[test]
+    fn unknown_edns_versions_get_badvers() {
+        let mut query = a_query(9, "api.stripe.com.");
+        let mut edns = Edns::new();
+        edns.set_version(1);
+        query.edns = Some(edns);
+        let host = Lookup::Host(Placed {
+            v4: Some("104.18.0.1".parse().unwrap()),
+            v6: None,
+        });
+        let reply = answer(&move |_| host, &query.to_vec().unwrap()).unwrap();
+        let parsed = Message::from_vec(&reply).unwrap();
+        assert!(parsed.edns.is_some());
+        assert_eq!(
+            u16::from(parsed.metadata.response_code),
+            u16::from(ResponseCode::BADVERS)
+        );
+        assert!(parsed.answers.is_empty());
+    }
+
+    #[test]
+    fn parents_of_declared_hosts_are_not_nxdomain() {
+        fictionet::block_on(fictionet::lab(
+            fictionet::Seed::from_u64(1),
+            |fcx| async move {
+                let shared = Arc::new(Shared {
+                    fcx: fcx.clone(),
+                    resolver: None,
+                    subnet: Subnet::new("10.0.0.0/24".parse().unwrap()).unwrap(),
+                    subnet6: None,
+                    router: route::router(&fcx, Vec::new()),
+                    world: Arc::new(Mutex::new(World::new(MAX_HOSTS))),
+                    leases: Arc::default(),
+                    gateway_tcp: Arc::default(),
+                    hooks: Arc::new(Hooks {
+                        by_addr: Mutex::default(),
+                        conns: AtomicU64::new(0),
+                        attached: Mutex::default(),
+                    }),
+                    fixed: Vec::new(),
+                    peers: Peers::new(Limits::default().connections_per_peer),
+                    limits: Limits::default(),
+                    lans: BTreeMap::new(),
+                });
+                let placed = Placed {
+                    v4: Some("104.18.0.1".parse().unwrap()),
+                    v6: None,
+                };
+                // What Net::start does for a host declared with the name.
+                shared
+                    .world
+                    .lock()
+                    .names
+                    .insert("api.stripe.com".into(), Known::Host(placed));
+                let lookup = shared.dns().state.lookup;
+                let child =
+                    answer(&*lookup, &a_query(1, "api.stripe.com.").to_vec().unwrap()).unwrap();
+                let child = Message::from_vec(&child).unwrap();
+                assert_eq!(child.metadata.response_code, ResponseCode::NoError);
+                assert_eq!(child.answers.len(), 1);
+                // NXDOMAIN would say no name exists at or below stripe.com
+                // (RFC 8020), which api.stripe.com contradicts.
+                let parent =
+                    answer(&*lookup, &a_query(2, "stripe.com.").to_vec().unwrap()).unwrap();
+                let parent = Message::from_vec(&parent).unwrap();
+                assert_eq!(parent.metadata.response_code, ResponseCode::NoError);
+                assert!(parent.answers.is_empty());
+                fcx.cancel();
+                Ok(())
+            },
+        ))
+        .unwrap();
     }
 }
