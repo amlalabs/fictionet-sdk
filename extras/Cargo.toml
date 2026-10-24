@@ -36,7 +36,7 @@ kuchiki = "0.8"
 percent-encoding = "2"
 redb = "4.4"
 regex = "1"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "native-tls", "rustls-tls"] }
 ring = "0.17"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "macros", "io-util"] }
 time = "0.3"

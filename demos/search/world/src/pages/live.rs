@@ -1,4 +1,4 @@
-//! Search on the host; replay only URLs reached by those results and their crawl.
+//! Search and capture on the host, retaining pages and their dependencies.
 
 use super::*;
 use fictionet_extras::{
@@ -41,9 +41,10 @@ impl Drop for Lifetime {
 
 struct Job {
     url: String,
-    navigation: Option<(String, u8)>,
     cx: Cx,
 }
+
+type Completion = Option<Result<(), String>>;
 
 #[derive(Default)]
 struct State {
@@ -51,8 +52,7 @@ struct State {
     lifetime: Arc<Lifetime>,
     epoch: usize,
     searches_running: usize,
-    reached: HashMap<String, watch::Sender<bool>>,
-    depths: HashMap<(String, String), u8>,
+    reached: HashMap<String, watch::Sender<Completion>>,
     queue: VecDeque<Job>,
     running: bool,
     searches: HashMap<(String, u64), search::Search>,
@@ -106,26 +106,13 @@ impl Live {
         if lifetime.cancelled() || !Arc::ptr_eq(lifetime, &state.lifetime) {
             return;
         }
-        let newly_reached = !state.reached.contains_key(&url);
-        let shallower = job.navigation.as_ref().is_some_and(|(site, depth)| {
-            let entry = state
-                .depths
-                .entry((url.clone(), site.clone()))
-                .or_insert(u8::MAX);
-            if *entry <= *depth {
-                false
-            } else {
-                *entry = *depth;
-                true
-            }
-        });
-        if !newly_reached && !shallower {
+        if state.reached.contains_key(&url) {
             return;
         }
         state
             .reached
             .entry(url)
-            .or_insert_with(|| watch::channel(false).0);
+            .or_insert_with(|| watch::channel(None).0);
         if priority {
             state.queue.push_front(job);
         } else {
@@ -172,6 +159,7 @@ impl Live {
             if lifetime.cancelled() {
                 return;
             }
+            let mut completion = result.as_ref().map(|_| ()).map_err(ToString::to_string);
             if let Ok((response, downloaded)) = result {
                 let saved = {
                     let mut state = self.state();
@@ -179,7 +167,14 @@ impl Live {
                         return;
                     }
                     let path = self.archive_path(state.epoch);
-                    !downloaded || state.archive.append(&path, &job.url, &response).is_ok()
+                    if downloaded
+                        && let Err(error) = state.archive.append(&path, &job.url, &response)
+                    {
+                        completion = Err(error.to_string());
+                        false
+                    } else {
+                        true
+                    }
                 };
                 let status = response.status;
                 let url = job.url.clone();
@@ -199,7 +194,6 @@ impl Live {
                             &lifetime,
                             Job {
                                 url,
-                                navigation: None,
                                 cx: job.cx.clone(),
                             },
                             true,
@@ -211,31 +205,9 @@ impl Live {
                                 &lifetime,
                                 Job {
                                     url,
-                                    navigation: job.navigation.clone(),
                                     cx: job.cx.clone(),
                                 },
                                 true,
-                            );
-                        }
-                    } else if let Some((site, depth)) = &job.navigation
-                        && *depth < 5
-                    {
-                        for url in links.pages.into_iter().filter(|u| {
-                            url::Url::parse(u).ok().is_some_and(|u| {
-                                u.host_str().is_some_and(|host| {
-                                    host.trim_start_matches("www.")
-                                        == site.trim_start_matches("www.")
-                                })
-                            })
-                        }) {
-                            self.enqueue_in(
-                                &lifetime,
-                                Job {
-                                    url,
-                                    navigation: Some((site.clone(), depth + 1)),
-                                    cx: job.cx.clone(),
-                                },
-                                false,
                             );
                         }
                     }
@@ -246,7 +218,10 @@ impl Live {
                 return;
             }
             if let Some(done) = state.reached.get(&job.url) {
-                done.send_replace(true);
+                if let Err(error) = &completion {
+                    eprintln!("Live capture failed: {error}");
+                }
+                done.send_replace(Some(completion));
             }
         }
     }
@@ -341,19 +316,14 @@ impl Live {
                 .insert((query.to_owned(), start), search.clone());
         }
         for result in search.results.iter().rev() {
-            if let Ok(url) = url::Url::parse(&result.url)
-                && let Some(host) = url.host_str()
-            {
-                self.enqueue_in(
-                    lifetime,
-                    Job {
-                        url: result.url.clone(),
-                        navigation: Some((host.to_owned(), 0)),
-                        cx: cx.clone(),
-                    },
-                    true,
-                );
-            }
+            self.enqueue_in(
+                lifetime,
+                Job {
+                    url: result.url.clone(),
+                    cx: cx.clone(),
+                },
+                true,
+            );
         }
         Ok(search)
     }
@@ -370,14 +340,13 @@ impl Live {
         let mut state = self.state();
         state.lifetime.cancel();
         for done in state.reached.values() {
-            done.send_replace(true);
+            done.send_replace(Some(Err("Live session stopped".into())));
         }
         state.queue.clear();
         state.running = false;
         if reset {
             state.lifetime = Arc::default();
             state.searches.clear();
-            state.depths.clear();
             state.searches_running = 0;
             let completed: std::collections::HashSet<_> =
                 state.archive.urls().map(str::to_owned).collect();
@@ -398,21 +367,30 @@ impl Live {
         let _ = std::fs::remove_file(old_path);
     }
 
-    async fn response(self: &Arc<Self>, cx: &Cx, url: &str) -> Option<warc::Response> {
-        let url = warc::key(url)?;
+    async fn response(
+        self: &Arc<Self>,
+        cx: &Cx,
+        url: &str,
+    ) -> std::io::Result<Option<warc::Response>> {
+        let Some(url) = warc::key(url) else {
+            return Ok(None);
+        };
         let lifetime = self.state().lifetime.clone();
         self.enqueue_in(
             &lifetime,
             Job {
                 url: url.clone(),
-                navigation: None,
                 cx: cx.clone(),
             },
             true,
         );
         let (mut waiting, lifetime) = {
             let mut state = self.state();
-            let waiting = state.reached.get(&url)?.subscribe();
+            let waiting = state
+                .reached
+                .get(&url)
+                .ok_or_else(|| std::io::Error::other("Live session stopped"))?
+                .subscribe();
             if let Some(index) = state.queue.iter().position(|job| job.url == url) {
                 let job = state.queue.remove(index).unwrap();
                 state.queue.push_front(job);
@@ -421,21 +399,24 @@ impl Live {
         };
         let ready = async {
             loop {
-                if *waiting.borrow_and_update() {
-                    break;
+                if let Some(result) = waiting.borrow_and_update().clone() {
+                    break result;
                 }
                 if waiting.changed().await.is_err() {
-                    break;
+                    break Err("Live capture worker stopped".into());
                 }
             }
         };
-        let _ = cx.race(None, ready).await;
+        cx.race(None, ready)
+            .await
+            .map_err(std::io::Error::other)?
+            .map_err(std::io::Error::other)?;
 
         let state = self.state();
         if !Arc::ptr_eq(&lifetime, &state.lifetime) {
-            return None;
+            return Err(std::io::Error::other("Live session stopped"));
         }
-        state.archive.get(&url).ok().flatten()
+        state.archive.get(&url)
     }
 }
 
@@ -501,7 +482,7 @@ impl Pages {
     }
 
     pub(crate) async fn live_url(&self, cx: &Cx, url: &str) -> Response {
-        copied::replay(Ok(self.live.as_ref().unwrap().response(cx, url).await))
+        copied::replay(self.live.as_ref().unwrap().response(cx, url).await)
     }
 
     pub(super) async fn live_listing(

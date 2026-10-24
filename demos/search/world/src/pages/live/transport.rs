@@ -132,7 +132,8 @@ impl Transport {
                 client.get(url).header("accept-encoding", "identity")
             };
             let response = request.send().await;
-            let response = response.map_err(|_| "Live request failed")?;
+            let response = response
+                .map_err(|error| format!("Live request failed: {:?}", error.without_url()))?;
             if let Some(attempt) = &mut attempt {
                 attempt.event.phase = UpstreamPhase::Response;
                 attempt.event.status = Some(response.status());

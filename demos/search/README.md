@@ -120,12 +120,12 @@ sites. Capture dates are shown only when the archive records them.
   The World menu shows why a source is unavailable: missing captures, a page
   writer or a search key. Other sources remain usable.
 
-Live downloads result pages and requisites, following navigation to depth five
-within each result's site. Redirects and cross-host assets are retained at their
+Live downloads result pages and requisites, and captures browser requests.
+Redirects and cross-host assets are retained at their
 real URLs. Live search and capture use a separate host HTTP transport, outside
 the guest model gateway; selecting Live permits public-web downloads. Search
 queries and served pages are logged and displayed. The crawler ignores
-robots.txt and limits requests per host. Unknown URLs do not start downloads.
+robots.txt. Opening a new URL captures that page and its dependencies.
 The page reports the source that answered each request. Keep Copied selected
 for the bounded security research and offline package flows.
 
@@ -192,20 +192,28 @@ and researcher and vendor analyses of tj-actions, Shai-Hulud, SolarWinds,
 XZ, 3CX, Codecov and PyTorch nightly. It is a bounded
 collection; links beyond the captures have no public-web fallback.
 
-WARCs are stored in `demos/downloads/security/`, outside git, with their wget
-logs. Capture the URLs in the seed with:
+WARCs are stored in `demos/downloads/security/`, outside git. Capture the seed
+pages, references and their requisites with:
 
 ```sh
-wget --page-requisites --span-hosts --compression=auto --delete-after \
-  --inet4-only --no-http-keep-alive --wait=0.3 --timeout=30 --tries=2 \
-  --warc-file=<directory>/<name> <URLs>
+rustup run 1.99.0 cargo xtask search-capture demos/downloads --research
 ```
 
-Use a separate WARC name for each batch. Keep original URLs, redirects, HTTP
-headers and response bodies; do not rewrite links or unpack the archives.
-Microsoft's site required a browser User-Agent. Referenced NIST PDFs are also
-captured. Some upstream optional images and fonts return errors in the original
-sites and retain those errors in replay.
+Capture follows stylesheets, CSS imports, fonts, images and scripts across hosts.
+Chromium also loads the archived HTML to discover dependencies requested by
+JavaScript. Its requests use the same host transport with the browser's request
+headers; the browser itself has no Internet route.
+
+Complete requisites for every page in an existing corpus with:
+
+```sh
+rustup run 1.99.0 cargo xtask search-requisites demos/downloads/security
+```
+
+Append URLs to that command to capture or repair individual pages. Cached pages
+are traversed too. New WARC batches are flushed and renamed into place atomically;
+the original archives and URLs remain intact. Upstream HTTP errors are retained
+at their original URLs, and transport failures are reported in the capture output.
 
 The previous astronomy captures remain in `demos/downloads/astronomy/`.
 

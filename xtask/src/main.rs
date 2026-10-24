@@ -16,10 +16,7 @@ async fn main() -> Result {
         .ok_or("expected search-image or search-capture")?;
     let downloads = PathBuf::from(args.next().ok_or("missing downloads directory")?);
     if task == "search-requisites" {
-        if args.next().is_some() {
-            return Err("unexpected argument".into());
-        }
-        return capture::requisites(&downloads).await;
+        return capture::requisites(&downloads, &args.collect::<Vec<_>>()).await;
     }
     if task == "search-capture" {
         let selection = args

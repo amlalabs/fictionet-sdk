@@ -55,6 +55,12 @@ const REPOSITORIES: &[(&str, &str)] = &[
 
 struct Batch(std::path::PathBuf);
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Resource {
+    Document,
+    Requisite,
+}
+
 impl Drop for Batch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
@@ -62,7 +68,12 @@ impl Drop for Batch {
 }
 
 async fn capture_cached(root: &Path, name: &str, urls: &[String]) -> Result {
-    download(root, name, urls).await
+    download(root, name, urls).await?;
+    if urls.is_empty() {
+        return Ok(());
+    }
+    let assets = render::requisites(root, urls).await?;
+    download(root, name, &assets).await
 }
 
 async fn download(root: &Path, name: &str, urls: &[String]) -> Result {
@@ -88,26 +99,33 @@ async fn download(root: &Path, name: &str, urls: &[String]) -> Result {
     let mut pending = urls
         .iter()
         .cloned()
+        .map(|url| (url, Resource::Document))
         .collect::<std::collections::VecDeque<_>>();
     let mut seen = HashSet::new();
     let mut requests = tokio::task::JoinSet::new();
     let workers = std::thread::available_parallelism()?.get();
     loop {
         while requests.len() < workers
-            && let Some(url) = pending.pop_front()
+            && let Some((url, resource)) = pending.pop_front()
         {
-            if !seen.insert(url.clone()) {
+            if !seen.insert((url.clone(), resource)) {
                 continue;
             }
             if let Some(response) = existing.get(&url)?
                 && (response.status.is_success()
                     || response.status.is_redirection()
-                    || response.status == http::StatusCode::NOT_FOUND)
+                    || (resource == Resource::Document
+                        && response.status == http::StatusCode::NOT_FOUND))
             {
                 let links = capture::links(&url, &response)?;
-                pending.extend(links.assets);
+                pending.extend(
+                    links
+                        .assets
+                        .into_iter()
+                        .map(|url| (url, Resource::Requisite)),
+                );
                 if response.status.is_redirection() {
-                    pending.extend(links.pages);
+                    pending.extend(links.pages.into_iter().map(|url| (url, resource)));
                 }
                 continue;
             }
@@ -130,26 +148,31 @@ async fn download(root: &Path, name: &str, urls: &[String]) -> Result {
                     Ok::<_, std::io::Error>(response)
                 }
                 .await;
-                (url, response)
+                (url, resource, response)
             });
         }
         let Some(result) = requests.join_next().await else {
             break;
         };
-        let (url, response) = result?;
+        let (url, resource, response) = result?;
         let response = match response {
             Ok(response) => response,
             Err(error) => {
-                eprintln!("Capture unavailable: {url}: {error}");
+                eprintln!("Capture unavailable: {url}: {error:?}");
                 continue;
             }
         };
         archive.append(&path, &url, &response)?;
         eprintln!("Captured {}: {url}", response.status);
         let links = capture::links(&url, &response)?;
-        pending.extend(links.assets);
+        pending.extend(
+            links
+                .assets
+                .into_iter()
+                .map(|url| (url, Resource::Requisite)),
+        );
         if response.status.is_redirection() {
-            pending.extend(links.pages);
+            pending.extend(links.pages.into_iter().map(|url| (url, resource)));
         }
     }
     if path.exists() {
@@ -160,12 +183,19 @@ async fn download(root: &Path, name: &str, urls: &[String]) -> Result {
     Ok(())
 }
 
-pub async fn requisites(root: &Path) -> Result {
+pub async fn requisites(root: &Path, urls: &[String]) -> Result {
+    std::fs::create_dir_all(root)?;
     let root = Archive::directory_root(root)?;
     let lock = std::fs::File::open(&root)?;
     lock.try_lock()?;
-    let archive = Archive::directory(&root)?;
-    let mut urls = archive.urls().map(str::to_owned).collect::<Vec<_>>();
+    let mut urls = if urls.is_empty() {
+        Archive::directory(&root)?
+            .urls()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    } else {
+        urls.to_vec()
+    };
     urls.sort();
     println!("Completing requisites for {} captured URLs", urls.len());
     capture_cached(&root, "requisites", &urls).await
@@ -173,7 +203,8 @@ pub async fn requisites(root: &Path) -> Result {
 
 fn captured_at(archive: &Archive, url: &str) -> Result<(String, fictionet_extras::warc::Response)> {
     let mut url = url::Url::parse(url)?;
-    for _ in 0..10 {
+    let mut seen = HashSet::new();
+    while seen.insert(url.clone()) {
         let response = archive
             .get(url.as_str())?
             .ok_or_else(|| format!("missing capture: {url}"))?;
@@ -187,7 +218,7 @@ fn captured_at(archive: &Archive, url: &str) -> Result<(String, fictionet_extras
             .to_str()?;
         url = url.join(location)?;
     }
-    Err(format!("too many redirects: {url}").into())
+    Err(format!("redirect cycle: {url}").into())
 }
 
 fn captured(archive: &Archive, url: &str) -> Result<fictionet_extras::warc::Response> {
@@ -322,38 +353,7 @@ async fn missing_pages(root: &Path, sources: &[String], required: &[String]) -> 
 }
 
 async fn documents(root: &Path, name: &str, urls: &[String]) -> Result {
-    let mut jobs = tokio::task::JoinSet::new();
-    let mut urls = urls.iter();
-    loop {
-        while jobs.len() < 8 {
-            let Some(url) = urls.next() else {
-                break;
-            };
-            let root = root.to_owned();
-            let name = name.to_owned();
-            let url = url.clone();
-            jobs.spawn(async move {
-                match download(&root, &name, std::slice::from_ref(&url)).await {
-                    Err(error)
-                        if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
-                            matches!(
-                                error.kind(),
-                                std::io::ErrorKind::TimedOut | std::io::ErrorKind::InvalidData
-                            )
-                        }) =>
-                    {
-                        eprintln!("Capture unavailable: {url}: {error}");
-                        Ok(())
-                    }
-                    result => result,
-                }
-            });
-        }
-        let Some(result) = jobs.join_next().await else {
-            return Ok(());
-        };
-        result??;
-    }
+    capture_cached(root, name, urls).await
 }
 
 fn github_api(value: &str) -> Option<String> {
@@ -387,7 +387,6 @@ fn github_api(value: &str) -> Option<String> {
 async fn research(root: &Path, sources: &[String]) -> Result {
     // New batches sort after the original archives to supersede stale errors.
     capture_cached(root, "zz-research", sources).await?;
-    documents(root, "zz-research", sources).await?;
     let mut archive = Archive::directory(root)?;
     let mut frontier = sources.to_vec();
     let mut seen = HashSet::new();
@@ -410,14 +409,11 @@ async fn research(root: &Path, sources: &[String]) -> Result {
                                 .filter(|url| github_api(url).is_some())
                                 .cloned(),
                         );
-                        references.extend(found.into_iter().take(32));
+                        references.extend(found);
                     }
                     Err(error) => eprintln!("Reference discovery unavailable: {url}: {error}"),
                 }
             }
-        }
-        if references.len() > 8192 {
-            return Err("article references exceed capture page limit".into());
         }
         for url in &references {
             if let Some(endpoint) = github_api(url) {

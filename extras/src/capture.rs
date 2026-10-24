@@ -128,15 +128,23 @@ fn link(base: &Url, value: &str, out: &mut Vec<String>) -> io::Result<()> {
 
 fn css(text: &str, base: &Url, out: &mut Vec<String>) -> io::Result<()> {
     let mut input = cssparser::ParserInput::new(text);
-    css_tokens(&mut cssparser::Parser::new(&mut input), base, out);
+    css_tokens(&mut cssparser::Parser::new(&mut input), base, out, false);
     Ok(())
 }
 
-fn css_tokens(input: &mut cssparser::Parser<'_, '_>, base: &Url, out: &mut Vec<String>) {
+fn css_tokens(
+    input: &mut cssparser::Parser<'_, '_>,
+    base: &Url,
+    out: &mut Vec<String>,
+    strings: bool,
+) {
     use cssparser::Token;
     while let Ok(token) = input.next().cloned() {
         match token {
             Token::UnquotedUrl(value) => {
+                let _ = link(base, &value, out);
+            }
+            Token::QuotedString(value) if strings => {
                 let _ = link(base, &value, out);
             }
             Token::AtKeyword(name) if name.eq_ignore_ascii_case("import") => {
@@ -153,13 +161,23 @@ fn css_tokens(input: &mut cssparser::Parser<'_, '_>, base: &Url, out: &mut Vec<S
                         Ok(())
                     });
             }
+            Token::Function(name)
+                if name.eq_ignore_ascii_case("image-set")
+                    || name.eq_ignore_ascii_case("-webkit-image-set") =>
+            {
+                let _: Result<_, cssparser::ParseError<'_, ()>> =
+                    input.parse_nested_block(|input| {
+                        css_tokens(input, base, out, true);
+                        Ok(())
+                    });
+            }
             Token::Function(_)
             | Token::ParenthesisBlock
             | Token::SquareBracketBlock
             | Token::CurlyBracketBlock => {
                 let _: Result<_, cssparser::ParseError<'_, ()>> =
                     input.parse_nested_block(|input| {
-                        css_tokens(input, base, out);
+                        css_tokens(input, base, out, false);
                         Ok(())
                     });
             }

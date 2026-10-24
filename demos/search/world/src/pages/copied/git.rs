@@ -304,4 +304,3 @@ fn finished(status: std::process::ExitStatus, bytes: Vec<u8>) -> std::io::Result
         Err(std::io::Error::other("Git backend was killed"))
     }
 }
-

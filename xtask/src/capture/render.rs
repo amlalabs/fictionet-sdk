@@ -6,8 +6,8 @@ use fictionet_extras::{capture, warc};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::os::fd::AsRawFd;
-use std::{path::Path, process::Stdio, sync::Arc, time::Duration};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use std::{path::Path, process::Stdio, sync::Arc};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
 async fn send(writer: &mut OwnedWriteHalf, value: Value) -> Result {
@@ -17,13 +17,9 @@ async fn send(writer: &mut OwnedWriteHalf, value: Value) -> Result {
 }
 
 async fn receive(reader: &mut BufReader<OwnedReadHalf>, bytes: &mut Vec<u8>) -> Result<Value> {
-    const LIMIT: usize = 64 * 1024 * 1024;
-    let count = (&mut *reader)
-        .take((LIMIT + 1 - bytes.len()) as u64)
-        .read_until(0, bytes)
-        .await?;
-    if count == 0 || bytes.len() > LIMIT || bytes.last() != Some(&0) {
-        return Err("invalid or oversized browser message".into());
+    let count = reader.read_until(0, bytes).await?;
+    if count == 0 || bytes.last() != Some(&0) {
+        return Err("invalid browser message".into());
     }
     let value = serde_json::from_slice(&bytes[..bytes.len() - 1])?;
     bytes.clear();
@@ -42,6 +38,7 @@ struct Request {
     url: url::Url,
     #[serde(deserialize_with = "method")]
     method: http::Method,
+    headers: std::collections::HashMap<String, String>,
 }
 
 fn method<'de, D: serde::Deserializer<'de>>(
@@ -56,14 +53,78 @@ fn method<'de, D: serde::Deserializer<'de>>(
 /// as ordinary captures. Redirects return to interception for fresh admission.
 pub(super) async fn document(root: &Path, url: &str, title: &str) -> Result {
     capture::client(&url::Url::parse(url)?).await?;
-    render(root, url, title, get).await
+    render(root, url, Some(title), None, get).await.map(|_| ())
 }
 
-async fn get(url: url::Url) -> std::io::Result<warc::Response> {
-    let client = capture::client(&url).await?;
+pub(super) async fn requisites(root: &Path, urls: &[String]) -> Result<Vec<String>> {
+    let existing = Arc::new(warc::Archive::directory(root)?);
+    let mut assets = Vec::new();
+    let mut urls = urls
+        .iter()
+        .cloned()
+        .collect::<std::collections::VecDeque<_>>();
+    let mut seen = std::collections::HashSet::new();
+    let mut pages = tokio::task::JoinSet::new();
+    let workers = std::thread::available_parallelism()?.get();
+    loop {
+        while pages.len() < workers
+            && let Some(url) = urls.pop_front()
+        {
+            if !seen.insert(url.clone()) {
+                continue;
+            }
+            let Some(response) = existing.get(&url)? else {
+                continue;
+            };
+            if response.status.is_redirection() {
+                urls.extend(capture::links(&url, &response)?.pages);
+                continue;
+            }
+            if !response
+                .headers
+                .get(http::header::CONTENT_TYPE)
+                .is_some_and(|value| value.as_bytes().starts_with(b"text/html"))
+            {
+                continue;
+            }
+            let cache = existing.clone();
+            let root = root.to_owned();
+            let url = url.clone();
+            pages.spawn(async move {
+                eprintln!("Rendering requisites: {url}");
+                render(&root, &url, None, Some(cache.clone()), move |request| {
+                    let cache = cache.clone();
+                    async move {
+                        if let Some(response) = cache.get(request.url.as_str())? {
+                            return Ok(response);
+                        }
+                        get(request).await
+                    }
+                })
+                .await
+            });
+        }
+        let Some(result) = pages.join_next().await else {
+            break;
+        };
+        assets.extend(result??);
+    }
+    Ok(assets)
+}
+
+async fn get(request: Request) -> std::io::Result<warc::Response> {
+    let client = capture::client(&request.url).await?;
+    let mut headers = http::HeaderMap::new();
+    for (name, value) in request.headers {
+        headers.insert(
+            name.parse::<http::HeaderName>()
+                .map_err(std::io::Error::other)?,
+            value.parse().map_err(std::io::Error::other)?,
+        );
+    }
     let response = client
-        .get(url)
-        .header("accept-encoding", "identity")
+        .get(request.url)
+        .headers(headers)
         .send()
         .await
         .map_err(std::io::Error::other)?;
@@ -77,9 +138,15 @@ async fn get(url: url::Url) -> std::io::Result<warc::Response> {
     Ok(response)
 }
 
-async fn render<F, T>(root: &Path, url: &str, title: &str, fetch: F) -> Result
+async fn render<F, T>(
+    root: &Path,
+    url: &str,
+    title: Option<&str>,
+    existing: Option<Arc<warc::Archive>>,
+    fetch: F,
+) -> Result<Vec<String>>
 where
-    F: Fn(url::Url) -> T + Send + Sync + 'static,
+    F: Fn(Request) -> T + Send + Sync + 'static,
     T: std::future::Future<Output = std::io::Result<warc::Response>> + Send,
 {
     let fetch = Arc::new(fetch);
@@ -105,6 +172,7 @@ where
             "--use-mock-keychain",
             "--remote-debugging-pipe",
             "--no-startup-window",
+            "--window-size=1440,1000",
         ])
         .arg(format!("--user-data-dir={}", profile.path().display()))
         .stdin(Stdio::null())
@@ -159,6 +227,15 @@ where
             .ok_or("missing browser session")?
             .to_owned();
         call!("Network.enable", json!({}), Some(&session));
+        call!("Page.enable", json!({}), Some(&session));
+        call!(
+            "Page.setLifecycleEventsEnabled",
+            json!({"enabled":true}),
+            Some(&session)
+        );
+        let frame =
+            call!("Page.getFrameTree", json!({}), Some(&session))["frameTree"]["frame"]["id"]
+                .clone();
         call!(
             "Network.setBypassServiceWorker",
             json!({"bypass":true}),
@@ -181,65 +258,80 @@ where
         )
         .await?;
         let mut archive = warc::Archive::default();
-        let path = root.join(format!("zz-rendered-{}.warc.gz", time_stamp()));
-        let permits = Arc::new(tokio::sync::Semaphore::new(8));
+        let staging =
+            super::Batch(root.join(format!(".render-{}-{}", std::process::id(), time_stamp())));
+        std::fs::create_dir_all(&staging.0)?;
+        let path = staging.0.join(format!("rendered-{}.warc.gz", time_stamp()));
         let mut requests = tokio::task::JoinSet::new();
-        let mut count = 0;
-        let mut retained = 0;
-        let mut tick = tokio::time::interval(Duration::from_millis(200));
+        let mut urls = Vec::new();
+        let mut idle = false;
         let mut evaluation = None;
-        let required = serde_json::to_string(&title.to_ascii_lowercase())?;
+        let required = serde_json::to_string(&title.unwrap_or_default().to_ascii_lowercase())?;
         let expression = format!(
             r#"(() => {{
             if (!document.title.toLowerCase().includes({required}) || !document.body?.innerText.toLowerCase().includes({required})) return null;
             const html = document.documentElement.outerHTML;
-            if (html.length > {}) throw new Error('Document exceeds capture size limit');
             return {{url:location.href, html}};
-        }})()"#,
-            warc::Response::DECODED_BYTES
+        }})()"#
         );
         loop {
+            if idle && requests.is_empty() && evaluation.is_none() {
+                if title.is_none() {
+                    if path.exists() {
+                        std::fs::File::open(&path)?.sync_all()?;
+                        std::fs::rename(&path, root.join(path.file_name().unwrap()))?;
+                        std::fs::File::open(root)?.sync_all()?;
+                    }
+                    return Ok(urls);
+                }
+                id += 1;
+                evaluation = Some(id);
+                send(&mut writer, json!({"id":id,"sessionId":session,"method":"Runtime.evaluate","params":{"expression":expression,"returnByValue":true}})).await?;
+            }
             tokio::select! {
                 message = receive(&mut reader, &mut incoming) => {
                     let message = message?;
                     if message["method"] == "Fetch.requestPaused" {
                         let paused: Paused = serde_json::from_value(message["params"].clone())?;
-                        count += 1;
-                        if count > 256 { return Err("rendered capture exceeds request limit".into()); }
-                        let permits = permits.clone();
+                        urls.push(paused.request.url.to_string());
+                        idle = false;
                         let fetch = fetch.clone();
                         requests.spawn(async move {
                             let response = async {
-                                let _permit = permits.acquire().await.map_err(std::io::Error::other)?;
                                 if paused.request.method != http::Method::GET { return Err(std::io::Error::other("capture requires a GET response")); }
-                                fetch(paused.request.url.clone()).await
+                                fetch(Request { url: paused.request.url.clone(), method: paused.request.method.clone(), headers: paused.request.headers.clone() }).await
                             };
-                            let response = tokio::time::timeout(Duration::from_secs(20), response).await;
+                            let response = response.await;
                             (paused, response)
                         });
+                    } else if message["method"] == "Page.lifecycleEvent" && message["params"]["name"] == "networkIdle" && message["params"]["frameId"] == frame {
+                        idle = true;
                     } else if evaluation.is_some() && message.get("id").and_then(Value::as_u64) == evaluation {
-                        evaluation = None;
                         if message["result"].get("exceptionDetails").is_some() { return Err("rendered document could not be retained".into()); }
                         let value = &message["result"]["result"]["value"];
                         if let (Some(url), Some(html)) = (value["url"].as_str(), value["html"].as_str()) {
-                            if html.len() > warc::Response::DECODED_BYTES { return Err("rendered document exceeds size limit".into()); }
                             let mut response = archive.get(url)?.ok_or("rendered document has no captured response")?;
                             if !response.status.is_success() { return Err("rendered document was not a successful response".into()); }
                             response.body = html.to_owned().into();
                             for header in ["etag", "content-md5", "content-length"] { response.headers.remove(header); }
                             response.headers.insert(http::header::CONTENT_LENGTH, response.body.len().into());
                             archive.append(&path, url, &response)?;
-                            return Ok(());
+                            std::fs::File::open(&path)?.sync_all()?;
+                            std::fs::rename(&path, root.join(path.file_name().unwrap()))?;
+                            std::fs::File::open(root)?.sync_all()?;
+                            return Ok(urls);
                         }
+                        return Err("rendered document does not contain the requested text".into());
                     }
                 }
                 Some(result) = requests.join_next(), if !requests.is_empty() => {
                     let (paused, response) = result?;
                     id += 1;
-                    let (method, params) = if let Ok(Ok(response)) = response {
-                        retained += response.body.len();
-                        if retained > 64 * 1024 * 1024 { return Err("rendered capture exceeds total size limit".into()); }
-                        archive.append(&path, paused.request.url.as_str(), &response)?;
+                    let (method, params) = if let Ok(response) = response {
+                        if existing.as_ref().is_none_or(|cache| !cache.contains(paused.request.url.as_str())) {
+                            archive.append(&path, paused.request.url.as_str(), &response)?;
+                            eprintln!("Rendered requisite {}: {}", response.status, paused.request.url);
+                        }
                         let headers = response.headers.iter().map(|(name, value)| json!({"name":name.as_str(),"value":value.to_str().unwrap_or("")})).collect::<Vec<_>>();
                         ("Fetch.fulfillRequest", json!({"requestId":paused.request_id,"responseCode":response.status.as_u16(),"responseHeaders":headers,"body":fictionet::stdlib::codec::base64::encode(&response.body)}))
                     } else {
@@ -247,17 +339,12 @@ where
                     };
                     send(&mut writer, json!({"id":id,"sessionId":session,"method":method,"params":params})).await?;
                 }
-                _ = tick.tick(), if evaluation.is_none() => {
-                    id += 1;
-                    evaluation = Some(id);
-                    send(&mut writer, json!({"id":id,"sessionId":session,"method":"Runtime.evaluate","params":{"expression":expression,"returnByValue":true}})).await?;
-                }
             }
         }
     };
-    let result = tokio::time::timeout(Duration::from_secs(60), work).await;
+    let result = work.await;
     let _ = browser.kill().await;
-    result.map_err(|_| "rendered capture timed out")?
+    result
 }
 
 fn time_stamp() -> u128 {
