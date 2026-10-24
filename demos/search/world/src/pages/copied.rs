@@ -200,8 +200,27 @@ impl Pages {
         let Some(corpus) = &self.copied else {
             return Ok(None);
         };
-        let Some(response) = corpus.response(url)? else {
-            return Ok(None);
+        let mut url = url::Url::parse(url).map_err(std::io::Error::other)?;
+        let mut visited = HashSet::new();
+        let response = loop {
+            if !visited.insert(url.clone()) {
+                return Err(std::io::Error::other("Captured redirect cycle"));
+            }
+            let Some(response) = corpus.response(url.as_str())? else {
+                return Ok(None);
+            };
+            if response.status.is_redirection() {
+                let Some(location) = response
+                    .headers
+                    .get(http::header::LOCATION)
+                    .and_then(|value| value.to_str().ok())
+                else {
+                    return Ok(None);
+                };
+                url = url.join(location).map_err(std::io::Error::other)?;
+                continue;
+            }
+            break response;
         };
         if response.status != http::StatusCode::OK
             || !response

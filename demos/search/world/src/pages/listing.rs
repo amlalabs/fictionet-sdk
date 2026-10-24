@@ -243,9 +243,16 @@ impl Pages {
             let store = self.writing_store()?;
             (store.known(&seed), store.writing_context(query))
         };
+        let mut reference = None;
         if self.copied.is_some() {
-            let (reference, _, _, _) = self.copied_listing(query, 0)?;
-            for result in reference.results {
+            let (found, _, _, _) = self.copied_listing(query, 0)?;
+            if let Some(result) = found.results.first() {
+                reference = self
+                    .reference_text(&result.url)
+                    .map_err(Stop::store)?
+                    .map(|text| (result.url.clone(), text));
+            }
+            for result in found.results {
                 if !known.iter().any(|page| page.url == result.url) {
                     known.push(result);
                 }
@@ -277,7 +284,13 @@ impl Pages {
                         make::search(query, &known)
                     }
                 },
-                || prompts::search(&seed, &cast, query, &known, &claims),
+                || {
+                    let (system, mut user) = prompts::search(&seed, &cast, query, &known, &claims);
+                    if let Some((url, reference)) = &reference {
+                        user.push_str(&format!("\nHighest-ranked captured reference, {url}:\n{reference}\nUse its established public facts to ground the result list. Preserve its names, outcomes and quantities unless the world's brief or previously published documents explicitly change them. The capture date does not change event dates."));
+                    }
+                    (system, user)
+                },
                 |text| {
                     let search = prompts::read_search(text)?;
                     for result in &search.results {
