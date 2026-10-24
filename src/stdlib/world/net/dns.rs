@@ -65,7 +65,7 @@ fn answer(lookup: &LookupName, bytes: &[u8]) -> Option<Vec<u8>> {
             }
             return Message::error_msg(
                 u16::from_be_bytes([bytes[0], bytes[1]]),
-                OpCode::Query,
+                OpCode::from_u8((bytes[2] >> 3) & 0x0F),
                 ResponseCode::FormErr,
             )
             .to_vec()
@@ -79,13 +79,19 @@ fn answer(lookup: &LookupName, bytes: &[u8]) -> Option<Vec<u8>> {
     reply.metadata.authoritative = true;
     reply.metadata.recursion_desired = query.metadata.recursion_desired;
     reply.metadata.recursion_available = true;
-    reply.queries = query.queries.clone();
+    // Only a single question is echoed, so a reply is never much longer than
+    // the query and always fits the 512 bytes UDP allows without EDNS.
+    if query.queries.len() == 1 {
+        reply.queries = query.queries.clone();
+    }
     if query.edns.is_some() {
         let mut edns = Edns::new();
         edns.set_max_payload(1232);
         reply.edns = Some(edns);
     }
-    if query.metadata.op_code != OpCode::Query {
+    if query.edns.as_ref().is_some_and(|edns| edns.version() != 0) {
+        reply.metadata.response_code = ResponseCode::BADVERS;
+    } else if query.metadata.op_code != OpCode::Query {
         reply.metadata.response_code = ResponseCode::NotImp;
     } else if query.queries.len() != 1 {
         reply.metadata.response_code = ResponseCode::FormErr;
@@ -99,6 +105,7 @@ fn answer(lookup: &LookupName, bytes: &[u8]) -> Option<Vec<u8>> {
         };
         match found {
             Lookup::NoHost => reply.metadata.response_code = ResponseCode::NXDomain,
+            Lookup::Parent => {}
             Lookup::Full => reply.metadata.response_code = ResponseCode::ServFail,
             Lookup::Host(placed) => {
                 let class_ok = matches!(q.query_class(), DNSClass::IN | DNSClass::ANY);
@@ -340,8 +347,7 @@ mod tests {
             },
         ))
         .unwrap();
-        let sent = sent.lock().clone();
-        sent
+        sent.lock().clone()
     }
 
     /// A query whose questions after the second all point at the second
