@@ -1684,7 +1684,7 @@ class BA {
   measureFont() {
     const Q = document.createElement("canvas").getContext("2d");
     Q.font = `${this.fontSize}px ${this.fontFamily}`;
-    const g = Q.measureText("M"), E = Math.ceil(g.width), C = g.actualBoundingBoxAscent || this.fontSize * 0.8, I = g.actualBoundingBoxDescent || this.fontSize * 0.2, D = Math.ceil(C + I) + 2, o = Math.ceil(C) + 1;
+    const g = Q.measureText("M"), E = Math.round(g.width), C = g.actualBoundingBoxAscent || this.fontSize * 0.8, I = g.actualBoundingBoxDescent || this.fontSize * 0.2, D = Math.ceil(C + I) + 2, o = Math.ceil(C) + 1;
     return { width: E, height: D, baseline: o };
   }
   /**
