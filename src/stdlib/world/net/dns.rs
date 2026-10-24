@@ -509,4 +509,90 @@ mod tests {
         ))
         .unwrap();
     }
+
+    /// The network's shared state with no hosts yet, and `resolver`.
+    fn network(fcx: &Cx, resolver: Option<Arc<super::super::Resolver>>) -> Arc<Shared> {
+        Arc::new(Shared {
+            fcx: fcx.clone(),
+            resolver,
+            subnet: Subnet::new("10.0.0.0/24".parse().unwrap()).unwrap(),
+            subnet6: None,
+            router: route::router(fcx, Vec::new()),
+            world: Arc::new(Mutex::new(World::new(MAX_HOSTS))),
+            leases: Arc::default(),
+            gateway_tcp: Arc::default(),
+            hooks: Arc::new(Hooks {
+                by_addr: Mutex::default(),
+                conns: AtomicU64::new(0),
+                attached: Mutex::default(),
+            }),
+            fixed: Vec::new(),
+            peers: Peers::new(Limits::default().connections_per_peer),
+            limits: Limits::default(),
+            lans: BTreeMap::new(),
+        })
+    }
+
+    #[test]
+    fn the_root_is_not_nxdomain_while_hosts_exist() {
+        fictionet::block_on(fictionet::lab(
+            fictionet::Seed::from_u64(1),
+            |fcx| async move {
+                let shared = network(&fcx, None);
+                let placed = Placed {
+                    v4: Some("104.18.0.1".parse().unwrap()),
+                    v6: None,
+                };
+                // What Net::start does for a host declared with the name.
+                shared
+                    .world
+                    .lock()
+                    .names
+                    .insert("api.stripe.com".into(), Known::Host(placed));
+                let lookup = shared.dns().state.lookup;
+                let root = answer(&*lookup, &a_query(3, ".").to_vec().unwrap()).unwrap();
+                let root = Message::from_vec(&root).unwrap();
+                // NXDOMAIN for the root would say no name exists at all
+                // (RFC 8020), which api.stripe.com contradicts.
+                assert_eq!(root.metadata.response_code, ResponseCode::NoError);
+                assert!(root.answers.is_empty());
+                fcx.cancel();
+                Ok(())
+            },
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn every_name_of_a_resolved_host_answers_its_address() {
+        fictionet::block_on(fictionet::lab(
+            fictionet::Seed::from_u64(1),
+            |fcx| async move {
+                // A world that makes one site, with its www name, for either name.
+                let resolver = |name: &str| {
+                    matches!(name, "a.test" | "www.a.test").then(|| {
+                        super::super::Host::new("site")
+                            .dns_name("a.test")
+                            .dns_name("www.a.test")
+                    })
+                };
+                let shared = network(&fcx, Some(Arc::new(resolver)));
+                let lookup = shared.dns().state.lookup;
+                let address = |id, name| {
+                    let reply = answer(&*lookup, &a_query(id, name).to_vec().unwrap()).unwrap();
+                    let reply = Message::from_vec(&reply).unwrap();
+                    assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+                    assert_eq!(reply.answers.len(), 1, "{name} has an address");
+                    reply.answers[0].data.clone()
+                };
+                let site = address(1, "a.test");
+                // Host::dns_name: the gateway's DNS answers each of the
+                // host's names with the host's addresses.
+                assert_eq!(address(2, "www.a.test"), site);
+                fcx.cancel();
+                Ok(())
+            },
+        ))
+        .unwrap();
+    }
 }
