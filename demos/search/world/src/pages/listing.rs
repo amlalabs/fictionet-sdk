@@ -154,6 +154,7 @@ impl Pages {
                     };
                     result.title = mention["title"].as_str().unwrap_or_default().into();
                     result.snippet = mention["snippet"].as_str().unwrap_or_default().into();
+                    result.date = mention["date"].as_str().unwrap_or_default().into();
                 }
             }
         }
@@ -363,6 +364,7 @@ impl Pages {
                 .map_err(Stop::store)?;
             r.title = mention["title"].as_str().unwrap_or_default().into();
             r.snippet = mention["snippet"].as_str().unwrap_or_default().into();
+            r.date = mention["date"].as_str().unwrap_or_default().into();
             results.push(r);
         }
         let known_matches = results

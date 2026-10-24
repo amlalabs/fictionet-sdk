@@ -583,8 +583,32 @@ impl Store {
         {
             mention["title"] = title.into();
         }
+        if let Some(date) = self
+            .page(host, target)
+            .map(|page| page.date.as_str())
+            .filter(|date| !date.is_empty())
+        {
+            mention["date"] = date.into();
+        } else if let Some(date) = self
+            .mentions(host, target)
+            .iter()
+            .filter(|mention| mention["via"] == "search")
+            .filter_map(|mention| mention["date"].as_str())
+            .find(|date| !date.is_empty())
+        {
+            mention["date"] = date.into();
+        }
         self.mention_held(host, target, mention.clone())?;
         Ok(mention)
+    }
+
+    pub(super) fn publication_date(&self, host: &str, target: &str) -> Option<time::Date> {
+        self.mentions(host, target)
+            .iter()
+            .filter(|mention| mention["via"] == "search")
+            .filter_map(|mention| mention["date"].as_str())
+            .flat_map(super::answers::dates)
+            .min()
     }
 
     pub fn site(&self, host: &str) -> Option<&Profile> {

@@ -3,6 +3,61 @@
 use super::*;
 
 impl Pages {
+    pub(super) fn latest_publication(
+        &self,
+        store: &Store,
+        host: &str,
+        target: &str,
+        mentions: &[Value],
+    ) -> time::Date {
+        let today = seed::parse_date(&self.seed.date).expect("world date");
+        if store.publication_date(host, target).is_some() {
+            return today;
+        }
+        mentions
+            .iter()
+            .filter_map(|mention| mention["from"].as_str())
+            .filter_map(|url| {
+                let (host, target) = text::target_of(url);
+                store
+                    .page(&host, &target)
+                    .and_then(|page| seed::parse_date(&page.date).ok())
+            })
+            .chain(Some(today))
+            .min()
+            .expect("world date")
+    }
+
+    pub(super) fn check_page_dates(
+        &self,
+        store: &Store,
+        host: &str,
+        target: &str,
+        page: &make::Page,
+        latest: time::Date,
+    ) -> Result<(), prompts::Unreadable> {
+        answers::chronology(page, latest)?;
+        let dateline = seed::parse_date(&page.date).unwrap_or(latest);
+        if let Some(published) = store.publication_date(host, target)
+            && dateline < published
+        {
+            return Err(prompts::Unreadable::Content(format!(
+                "The search established publication on {published}; DATE must be on or after that date. Preserve this publication date visibly and label any later update explicitly."
+            )));
+        }
+        if let Some(published) = links(&format!("https://{host}{target}"), &page.body)
+            .iter()
+            .filter_map(|(host, target, _)| store.publication_date(host, target))
+            .filter(|date| *date > dateline)
+            .max()
+        {
+            return Err(prompts::Unreadable::Content(format!(
+                "A cited source was first published on {published}, after DATE {dateline}. Explicitly update this article and DATE on or after {published}, or remove the unavailable citation."
+            )));
+        }
+        Ok(())
+    }
+
     /// Writes a generation's ledger rows, or a stored generation's one row.
     pub(super) fn log(&self, _cx: &Cx, rows: &[Value]) -> Result<(), Stop> {
         let mut store = self.writing_store()?;
@@ -357,21 +412,7 @@ impl Pages {
                     date: String::new(),
                 }),
         );
-        let latest = {
-            let store = self.writing_store()?;
-            ask.mentions
-                .iter()
-                .filter_map(|mention| mention["from"].as_str())
-                .filter_map(|url| {
-                    let (host, target) = text::target_of(url);
-                    store
-                        .page(&host, &target)
-                        .and_then(|page| seed::parse_date(&page.date).ok())
-                })
-                .chain(seed::parse_date(&seed.date).ok())
-                .min()
-                .expect("world date")
-        };
+        let latest = self.latest_publication(&*self.writing_store()?, host, target, &ask.mentions);
         let made = self
             .generate(
                 cx,
@@ -413,7 +454,8 @@ impl Pages {
                         page.date = latest.to_string();
                     }
                     if let Maker::Model(model) = self.maker() {
-                        answers::chronology(&page, latest)?;
+                        let store = self.store();
+                        self.check_page_dates(&store, host, target, &page, latest)?;
                         model.check_document(&page.content_type, &page.body)?;
                     }
                     if page.content_type.starts_with("text/html") {
@@ -537,20 +579,11 @@ impl Pages {
         };
         let mut store = self.writing_store()?;
         if matches!(self.maker(), Maker::Model(_)) {
-            let latest = record
-                .mentions
-                .iter()
-                .filter_map(|mention| mention["from"].as_str())
-                .filter_map(|url| {
-                    let (host, target) = text::target_of(url);
-                    store
-                        .page(&host, &target)
-                        .and_then(|page| seed::parse_date(&page.date).ok())
-                })
-                .chain(seed::parse_date(&seed.date).ok())
-                .min()
-                .expect("world date");
-            answers::chronology(
+            let latest = self.latest_publication(&store, host, target, &record.mentions);
+            self.check_page_dates(
+                &store,
+                host,
+                target,
                 &make::Page {
                     date: record.date.clone(),
                     body: page.body.clone(),

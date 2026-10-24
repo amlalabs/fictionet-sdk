@@ -124,6 +124,9 @@ methods, references and related documents. Use descriptive anchors and plausible
 stable paths, relative links on the same host and full URLs across hosts. Each
 link promises a real destination which will be available when opened. Keep links
 to earlier pages at their exact URLs. Never use placeholders or empty links.
+Use established contact channels only. If no phone number, postal address or
+named contact has been established, omit those details and link to the site's
+contact page. Do not invent contact coordinates or illustrative contact details.
 
 Nothing is dated after today. A dated article knows only what was known then.
 When covering a development after an article's original publication date,

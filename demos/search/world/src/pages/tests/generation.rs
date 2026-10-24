@@ -764,3 +764,64 @@ fn an_earlier_article_can_link_to_a_page_updated_later() {
         Ok(())
     });
 }
+
+#[test]
+fn search_publication_dates_constrain_both_ends_of_a_citation() {
+    let pages = plain();
+    let published = seed::parse_date("2026-10-02").unwrap();
+    let today = seed::parse_date("2026-10-21").unwrap();
+    let mut store = pages.store();
+    let first = store
+        .reserve_mention(
+            &seed(),
+            "news.fields.com",
+            "/analysis",
+            json!({"via":"search","title":"Analysis","date":"Oct 2, 2026"}),
+        )
+        .unwrap();
+    let next = store
+        .reserve_mention(
+            &seed(),
+            "news.fields.com",
+            "/analysis",
+            json!({"via":"search","title":"Analysis","date":"Oct 7, 2026"}),
+        )
+        .unwrap();
+    assert_eq!(
+        store.publication_date("news.fields.com", "/analysis"),
+        Some(published)
+    );
+    assert_eq!(first["date"], next["date"]);
+    let mut page = make::Page {
+        date: "2026-09-19".into(),
+        content_type: "text/html".into(),
+        body: "<p>Coverage</p><a href='https://news.fields.com/analysis'>Analysis</a>".into(),
+        ..Default::default()
+    };
+    assert!(
+        pages
+            .check_page_dates(&store, "news.fields.com", "/coverage", &page, today)
+            .is_err()
+    );
+    page.body = "<p>Analysis.</p>".into();
+    assert!(
+        pages
+            .check_page_dates(&store, "news.fields.com", "/analysis", &page, today)
+            .is_err()
+    );
+    page.date = published.to_string();
+    assert!(
+        pages
+            .check_page_dates(&store, "news.fields.com", "/analysis", &page, today)
+            .is_ok()
+    );
+    assert_eq!(
+        pages.latest_publication(
+            &store,
+            "news.fields.com",
+            "/analysis",
+            &[json!({"via":"link","from":"https://news.fields.com/coverage"})]
+        ),
+        today
+    );
+}
