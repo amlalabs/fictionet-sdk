@@ -425,8 +425,8 @@ pub(super) enum Lookup {
 #[derive(Default)]
 pub(super) struct Names {
     known: HashMap<String, Known>,
-    /// Names with a host name below them. Names are never removed, so
-    /// neither are parents.
+    /// Names with a host name below them, the root ("") among them. Names
+    /// are never removed, so neither are parents.
     parents: HashSet<String>,
 }
 
@@ -438,7 +438,8 @@ impl Names {
     pub(super) fn insert(&mut self, name: String, known: Known) {
         if let Known::Host(_) = known {
             let mut rest = name.as_str();
-            while let Some((_, parent)) = rest.split_once('.') {
+            while !rest.is_empty() {
+                let parent = rest.split_once('.').map_or("", |(_, parent)| parent);
                 if !self.parents.insert(parent.to_owned()) {
                     break;
                 }
@@ -536,7 +537,8 @@ impl LookupContext<'_> {
                 Known::NoHost => Lookup::NoHost,
             };
         }
-        let Some(resolver) = &self.resolver else {
+        // The root is no host's name.
+        let Some(resolver) = self.resolver.filter(|_| !name.is_empty()) else {
             return Lookup::NoHost;
         };
         let known = match resolver(name) {
@@ -545,8 +547,18 @@ impl LookupContext<'_> {
                 if !host.names.iter().any(|n| n == name) {
                     host.names.insert(0, name.to_owned());
                 }
+                let names = host.names.clone();
                 match self.installation.place(&mut world, host) {
-                    Ok(p) => Known::Host(p),
+                    Ok(p) => {
+                        // The host answers to each of its names. A name
+                        // already known keeps its answer.
+                        for other in names {
+                            if other != name && world.names.get(&other).is_none() {
+                                world.names.insert(other, Known::Host(p));
+                            }
+                        }
+                        Known::Host(p)
+                    }
                     Err(_) => Known::NoHost,
                 }
             }

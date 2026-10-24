@@ -98,12 +98,7 @@ fn answer(lookup: &LookupName, bytes: &[u8]) -> Option<Vec<u8>> {
     } else {
         let q = &query.queries[0];
         let name = normalize(&q.name().to_ascii());
-        let found = if name.is_empty() {
-            Lookup::NoHost
-        } else {
-            lookup(&name)
-        };
-        match found {
+        match lookup(&name) {
             Lookup::NoHost => reply.metadata.response_code = ResponseCode::NXDomain,
             Lookup::Parent => {}
             Lookup::Full => reply.metadata.response_code = ResponseCode::ServFail,
