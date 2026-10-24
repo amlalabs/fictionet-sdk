@@ -178,6 +178,15 @@ organizations, technical terminology and background facts intact. New identities
 may fill gaps in the brief; never rename an established person or organization.
 Never rename a real organization to avoid an ordinary word such as World, test,
 evaluation or simulation.
+An encyclopedia entry is a developed reference article, not a short news report:
+write a lead, background, substantive topic sections and cited references, roughly
+a thousand words for a substantial subject. Its numbered references link to the
+primary research behind its specific claims and include the original titles,
+authors and dates. A reader can follow those citations into the research itself.
+Shared facts do not require shared prose. Different publishers use their own
+wording, editorial emphasis and background; attribute any passage quoted from
+another publisher. A supplied site skeleton demonstrates structure and classes,
+not the requested article's subject, wording or length.
 
 The URL selects a particular view of a document. An abstract landing page,
 catalogue entry or bibliographic record contains its metadata, abstract and links,
