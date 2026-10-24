@@ -591,7 +591,7 @@ pub(super) enum TypedBlock {
         data: String,
     },
     Message {
-        role: String,
+        role: Role,
         content: Content,
         #[serde(skip_serializing_if = "Option::is_none")]
         id: Option<String>,
@@ -945,7 +945,7 @@ impl Message {
     fn allowed(&self, wire: Wire) -> bool {
         let role = match wire {
             Wire::Messages => matches!(self.role, Role::System | Role::User | Role::Assistant),
-            Wire::Chat | Wire::Responses => matches!(
+            Wire::Chat => matches!(
                 self.role,
                 Role::System
                     | Role::Developer
@@ -953,6 +953,10 @@ impl Message {
                     | Role::Assistant
                     | Role::Tool
                     | Role::Function
+            ),
+            Wire::Responses => matches!(
+                self.role,
+                Role::System | Role::Developer | Role::User | Role::Assistant
             ),
             Wire::Gemini => false,
         };
@@ -1014,8 +1018,15 @@ impl Content {
                     | TypedBlock::CustomToolCall { .. }
                     | TypedBlock::SummaryText { .. }
                     | TypedBlock::WebSearchCall { .. } => wire == Wire::Responses,
-                    TypedBlock::Message { content, .. }
-                    | TypedBlock::CustomToolCallOutput {
+                    TypedBlock::Message { role, content, .. } => {
+                        wire == Wire::Responses
+                            && matches!(
+                                role,
+                                Role::System | Role::Developer | Role::User | Role::Assistant
+                            )
+                            && content.allowed(wire)
+                    }
+                    TypedBlock::CustomToolCallOutput {
                         output: content, ..
                     }
                     | TypedBlock::FunctionCallOutput {

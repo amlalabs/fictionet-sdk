@@ -1107,3 +1107,35 @@ fn account_policy_messages_remain_executable() {
         false
     ));
 }
+
+#[test]
+fn responses_messages_use_their_own_roles() {
+    for tagged in [false, true] {
+        for role in [
+            "system",
+            "developer",
+            "user",
+            "assistant",
+            "tool",
+            "function",
+            "model",
+            "unknown",
+        ] {
+            let mut message = json!({"role":role, "content":"Local text"});
+            if tagged {
+                message["type"] = json!("message");
+            }
+            let valid = safe_request(
+                Provider::OpenAi,
+                "/v1/responses",
+                &json!({"input":[message]}),
+                false,
+            );
+            assert_eq!(
+                valid,
+                matches!(role, "system" | "developer" | "user" | "assistant"),
+                "{tagged} {role}"
+            );
+        }
+    }
+}
