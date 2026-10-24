@@ -71,6 +71,25 @@ impl Provider {
     }
 }
 
+/// The outcome of one provider attempt, rendered to words at the record boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttemptOutcome {
+    Transport,
+    Ok,
+    Unreadable,
+    Http(u16),
+}
+impl Serialize for AttemptOutcome {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Transport => serializer.serialize_str("transport"),
+            Self::Ok => serializer.serialize_str("ok"),
+            Self::Unreadable => serializer.serialize_str("unreadable"),
+            Self::Http(status) => serializer.serialize_str(&format!("http {status}")),
+        }
+    }
+}
+
 /// One HTTP attempt. Times are seconds on the run's clock.
 #[derive(Clone, Debug, Serialize)]
 pub struct Attempt {
@@ -78,7 +97,7 @@ pub struct Attempt {
     pub attempt: u32,
     pub started: f64,
     pub ended: f64,
-    pub outcome: String,
+    pub outcome: AttemptOutcome,
     pub model: String,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
@@ -176,7 +195,7 @@ impl Ledger {
         Usage {
             model: last.model.clone(),
             gen_ms: ((ended - first.started) * 1000.0).round() as u64,
-            call_ms: (last.outcome == "ok").then(|| last.ms()),
+            call_ms: (last.outcome == AttemptOutcome::Ok).then(|| last.ms()),
             attempts: self.attempts.len() as u64,
             asks: u64::from(self.ask),
             backoff_ms: self.attempts.iter().map(|a| a.backoff_ms).sum(),
@@ -251,7 +270,7 @@ pub struct Model {
     /// The reasoning effort, or empty for the provider default.
     pub reasoning: String,
     key: Key,
-    transport: Arc<dyn Transport>,
+    transport: fictionet_extras::models::Authenticated,
     live: Option<Arc<AtomicUsize>>,
 }
 
@@ -315,8 +334,8 @@ impl Model {
             provider,
             model: model.into(),
             reasoning: reasoning.into(),
+            transport: fictionet_extras::models::Authenticated::new(key.clone(), transport),
             key,
-            transport,
             live: None,
         }
     }
@@ -436,7 +455,7 @@ impl Model {
                 attempt: index,
                 started: now(cx),
                 ended: 0.0,
-                outcome: "transport".into(),
+                outcome: AttemptOutcome::Transport,
                 model: self.model.clone(),
                 input_tokens: None,
                 output_tokens: None,
@@ -459,23 +478,23 @@ impl Model {
                     match serde_json::from_slice::<Value>(&reply) {
                         Ok(answer) if answer.is_object() => {
                             usage(&answer, &mut attempt);
-                            attempt.outcome = "ok".into();
+                            attempt.outcome = AttemptOutcome::Ok;
                             ledger.attempts.push(attempt);
                             ledger.ended = Some(now(cx));
                             return Ok(answer);
                         }
                         Ok(_) => {
-                            attempt.outcome = "unreadable".into();
+                            attempt.outcome = AttemptOutcome::Unreadable;
                             failure = "the model's response is not a JSON object".into();
                         }
                         Err(error) => {
-                            attempt.outcome = "unreadable".into();
+                            attempt.outcome = AttemptOutcome::Unreadable;
                             failure = format!("the model's response is not JSON: {error}");
                         }
                     }
                 }
                 Ok(Ok((status, reply))) => {
-                    attempt.outcome = format!("http {status}");
+                    attempt.outcome = AttemptOutcome::Http(status);
                     let detail = self.redact(&String::from_utf8_lossy(&reply));
                     let mut end = detail.len().min(400);
                     while !detail.is_char_boundary(end) {
@@ -536,7 +555,7 @@ impl Model {
         let attempt = ledger.attempts.last_mut().expect("an attempt");
         let what = format!("{} {}", self.provider.label(), self.model);
         let unreadable = |attempt: &mut Attempt, error: String| {
-            attempt.outcome = "unreadable".into();
+            attempt.outcome = AttemptOutcome::Unreadable;
             attempt.error = Some(error.clone());
             Failure {
                 error,
@@ -623,7 +642,7 @@ impl Model {
                     rejected(&rejection);
                     let reason = rejection.to_string();
                     let last = ledger.attempts.last_mut().expect("an attempt");
-                    last.outcome = "unreadable".into();
+                    last.outcome = AttemptOutcome::Unreadable;
                     last.error = Some(reason.clone());
                     let retry = ask < 2
                         && self.live.as_ref().is_none_or(|calls| {
@@ -798,7 +817,7 @@ mod transport_tests {
         fictionet::block_on(fictionet::run(fictionet::Seed::from_u64(6), |cx| async move {
             let key = Key::claude_token(fictionet_extras::models::Secret::new("Claude token", "sk-ant-oat01-private-test".into())?).map_err(fictionet::Error::msg)?;
             let mut model = Model::claude_token(key);
-            model.transport = Arc::new(fictionet_extras::models::Https::at(&cx, format!("http://{address}").parse()?, "/v1/messages")?);
+            model.transport = fictionet_extras::models::Authenticated::new(model.key.clone(), Arc::new(fictionet_extras::models::Https::at(&cx, format!("http://{address}").parse()?, "/v1/messages")?));
             let pages = super::super::Pages::open(super::super::Seed::builtin("web")?, super::super::Store::memory(), Some(super::super::Maker::Model(model)), 0);
             let (sender, mut observations) = tokio::sync::mpsc::channel(crate::observation::OBSERVATION_CAPACITY);
             pages.observe(sender);

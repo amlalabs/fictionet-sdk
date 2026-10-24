@@ -58,6 +58,17 @@ impl Pages {
         if self.copied_only() {
             return Ok(self.copied_listing(query, start));
         }
+        // Search results establish shared facts before independent pages read them.
+        let _publication = if self.live_calls.is_some() {
+            Some(
+                self.locks
+                    .lock(cx, "search publications".into())
+                    .await
+                    .map_err(Stop::store)?,
+            )
+        } else {
+            None
+        };
         let key = if engine == Engine::YouTube {
             format!("youtube {}", query_key(query, start))
         } else {
@@ -222,7 +233,7 @@ impl Pages {
         let seed = self.context();
         let (known, claims) = {
             let store = self.store();
-            (store.known(&seed), store.recent_claims(40))
+            (store.known(&seed), store.writing_context(query))
         };
         let mut normalized = search::Search {
             results: known,
@@ -233,7 +244,9 @@ impl Pages {
         let made = self
             .generate(
                 cx,
-                json!({"kind": "search", "query": query}),
+                crate::observation::WriterTarget::Search {
+                    query: query.into(),
+                },
                 || {
                     if engine == Engine::YouTube {
                         let store = self.store();
@@ -252,7 +265,7 @@ impl Pages {
                     let (system, user) = prompts::search(&seed, &cast, query, &known, &claims);
                     (system, user, SEARCH_TOKENS)
                 },
-                prompts::read_search,
+                |text, _| prompts::read_search(text),
             )
             .await?;
         let mut search = made.fields;

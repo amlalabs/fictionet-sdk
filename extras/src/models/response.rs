@@ -157,19 +157,17 @@ pub(super) struct Metered {
     call: Option<Call>,
     sse: Option<Stream<sse::Events>>,
     json: Vec<u8>,
-    secret: Secret,
-    pending: Vec<u8>,
+
     done: bool,
 }
 impl Metered {
-    pub fn new(body: Body, call: Call, sse: bool, secret: Secret) -> Self {
+    pub fn new(body: Body, call: Call, sse: bool) -> Self {
         Self {
             body,
             call: Some(call),
             sse: sse.then(|| Stream::new(sse::Events::new())),
             json: Vec::new(),
-            secret,
-            pending: Vec::new(),
+
             done: false,
         }
     }
@@ -192,26 +190,6 @@ impl Metered {
         } else if self.json.len() + bytes.len() <= 1024 * 1024 {
             self.json.extend_from_slice(bytes);
         }
-    }
-    fn scrub(&mut self, end: bool) -> Vec<u8> {
-        let needle = self.secret.value.as_bytes();
-        let replacement = self.secret.to_string();
-        let mut out = Vec::new();
-        let mut i = 0;
-        while i < self.pending.len() {
-            let rest = &self.pending[i..];
-            if rest.starts_with(needle) {
-                out.extend_from_slice(replacement.as_bytes());
-                i += needle.len();
-            } else if !end && needle.starts_with(rest) {
-                break;
-            } else {
-                out.push(rest[0]);
-                i += 1;
-            }
-        }
-        self.pending.drain(..i);
-        out
     }
     fn finish(&mut self) {
         if let Some(mut call) = self.call.take() {
@@ -245,11 +223,7 @@ impl HttpBody for Metered {
                 Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
                     Ok(bytes) => {
                         self.consume(&bytes);
-                        self.pending.extend_from_slice(&bytes);
-                        let safe = self.scrub(false);
-                        if !safe.is_empty() {
-                            return Poll::Ready(Some(Ok(Frame::data(safe.into()))));
-                        }
+                        return Poll::Ready(Some(Ok(Frame::data(bytes))));
                     }
                     Err(_) => continue,
                 },
@@ -259,15 +233,12 @@ impl HttpBody for Metered {
                         call.stop = "transport_error".into();
                     }
                     self.call.take();
-                    return Poll::Ready(Some(Err(Error::msg(
-                        self.secret.redact(&error.to_string()),
-                    ))));
+                    return Poll::Ready(Some(Err(error)));
                 }
                 Poll::Ready(None) => {
                     self.done = true;
-                    let tail = self.scrub(true);
                     self.finish();
-                    return Poll::Ready((!tail.is_empty()).then(|| Ok(Frame::data(tail.into()))));
+                    return Poll::Ready(None);
                 }
             }
         }

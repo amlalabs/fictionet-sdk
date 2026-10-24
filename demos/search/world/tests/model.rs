@@ -161,7 +161,10 @@ fn an_http_failure_is_redacted_and_not_retried_when_permanent() {
         "{error}"
     );
     assert_eq!(attempts.len(), 1);
-    assert_eq!(attempts[0].outcome, "http 401");
+    assert_eq!(
+        attempts[0].outcome,
+        web_world::pages::model::AttemptOutcome::Http(401)
+    );
     assert!(!attempts[0].error.as_deref().unwrap().contains(KEY));
     let (_, headers, _) = server.join().unwrap();
     assert!(headers.contains(&("x-api-key".into(), KEY.into())));

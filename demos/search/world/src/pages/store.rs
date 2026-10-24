@@ -479,6 +479,53 @@ impl Store {
         self.claims[self.claims.len().saturating_sub(n)..].to_vec()
     }
 
+    /// Published text and search promises are context even when a writer omitted CLAIMS.
+    pub fn writing_context(&self, subject: &str) -> Vec<Claim> {
+        let mut claims = self.recent_claims(40);
+        for page in self
+            .order
+            .iter()
+            .rev()
+            .map(|key| &self.pages[key])
+            .filter(|page| page.status == 200)
+            .take(12)
+        {
+            let body = String::from_utf8_lossy(&page.body);
+            let text = if page.content_type.starts_with("text/html") {
+                super::text::text_of(&body)
+            } else {
+                body.into_owned()
+            };
+            if super::make::shares_words(&format!("{} {} {text}", page.title, page.url), subject) {
+                claims.push(Claim {
+                    url: page.url.clone(),
+                    claim: format!(
+                        "{} (published {}): {}",
+                        page.title,
+                        page.date,
+                        super::text::take(&text, 4000)
+                    ),
+                });
+            }
+        }
+        for search in self
+            .searches
+            .values()
+            .filter(|search| super::make::shares_words(&search.query, subject))
+        {
+            for result in &search.search.results {
+                claims.push(Claim {
+                    url: result.url.clone(),
+                    claim: format!(
+                        "Search result: {} (published {}): {}",
+                        result.title, result.date, result.snippet
+                    ),
+                });
+            }
+        }
+        claims
+    }
+
     pub fn mentions(&self, host: &str, target: &str) -> &[Value] {
         self.mentions
             .get(&key(host, target))

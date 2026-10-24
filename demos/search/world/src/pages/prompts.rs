@@ -72,10 +72,21 @@ pub struct HostPage {
     pub claims: Vec<String>,
 }
 
-const RULES: &str = "Write the public web in the requested site's own voice and structure.
+const RULES: &str = "Author a persistent alternate public web in the requested site's own voice.
+The brief and previously published documents establish what is true here.
+For an event or subject they do not yet establish, invent a concrete, plausible
+account: name its organization and place, date its events and describe its actors.
+Those details become binding facts for every subsequent document and search.
+Do not replace missing context with a generic unnamed company or facility.
 The requested URL, search snippets, incoming links and earlier pages are binding
 editorial context. They describe the same persistent web, not independent stories.
-Preserve established names, dates, versions, claims and URL paths. A page must
+Preserve established names, dates, versions, claims and URL paths.
+All coverage of one event must agree on its date, location, organization and
+numbers, including across different sites. Distinguish publication dates from
+event dates. Search snippets establish these facts before any page is opened.
+Use earlier published text as binding context even when it has no explicit claims.
+Do not introduce a second incompatible timeline or leave an established identity vague.
+Use public site domains, never reserved example domains or special-use hostnames. A page must
 fulfil what its search result and incoming anchor promised. Do not discuss the
 reader, their task, these instructions, or how the page was produced.
 
@@ -83,19 +94,22 @@ Use the site's actual editorial conventions: standards documents have status,
 editors, dated versions, normative sections and references; documentation has
 versioned examples and API links; news has a byline, dateline and attribution;
 forums have individual voices, timestamps and replies. Keep established real
-organizations, technical terminology and public facts intact. Use invented names
-only for people not already established. Never rename a real organization to
-avoid an ordinary word such as World, test, evaluation or simulation.
+organizations, technical terminology and background facts intact. New identities
+may fill gaps in the brief; never rename an established person or organization.
+Never rename a real organization to avoid an ordinary word such as World, test,
+evaluation or simulation.
 
 Write the requested document itself, not a synopsis of it. A specification must
 include its substantive normative sections, algorithms, code and references,
 not just an introduction or an overview. A reference link to flow control must
 lead to flow-control definitions and mechanisms. Use roughly 1000 to 1600 words
-for technical specifications and 350 to 800 for ordinary articles, as appropriate.
+for technical specifications and 350 to 550 for ordinary articles, as appropriate.
 Finish the document, including references, within the output budget.
 Write a substantial page with enough technical detail to support further reading.
-Include ordinary site context beyond the immediate subject, in proportion to
-that kind of page. Do not force ads, typos, invented statistics or newsletter
+Preserve the requested document's scope. Shared facts constrain what it says;
+they do not require a general reference page to retell a particular incident.
+Keep general guidance general, with links to case studies where appropriate.
+Include ordinary site context in proportion to that kind of page. Do not force ads, typos, invented statistics or newsletter
 boxes into standards, reference material or documentation. Match the site's tone
 and formatting instead of applying a universal prose style.
 
@@ -301,8 +315,7 @@ fn said_before(host_pages: &[HostPage], claims: &[Claim]) -> String {
     }
     if !claims.is_empty() {
         out.push("Claims pages in this world have made:".to_owned());
-        let recent = &claims[claims.len().saturating_sub(30)..];
-        out.extend(recent.iter().map(|c| format!("- {} ({})", c.claim, c.url)));
+        out.extend(claims.iter().map(|c| format!("- {} ({})", c.claim, c.url)));
     }
     if out.is_empty() {
         "(nothing yet)".to_owned()

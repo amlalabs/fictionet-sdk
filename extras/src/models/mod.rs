@@ -34,7 +34,7 @@ mod client;
 pub use calls::{Call, CallObserver, CallPhase};
 mod request;
 mod transport;
-pub use client::{Https, Key, Post, Transport};
+pub use client::{Authenticated, Https, Key, Post, Transport};
 pub use transport::{UpstreamEvent, UpstreamObserver, UpstreamPhase};
 pub mod oauth;
 mod response;
@@ -835,19 +835,20 @@ impl Model {
         {
             body["previous_response_id"] = json!(last);
         }
-        // Forward the value we validate, including when an input repeated a field.
-        let bytes = if parts.method == http::Method::POST {
-            Bytes::from(body.to_string())
-        } else {
-            bytes
-        };
-        if !safe_request(self.provider, &path, &body, self.engine.is_some()) {
+        let Some(admitted) = admitted_request(self.provider, &path, &body, self.engine.is_some())
+        else {
             return Ok(self.provider.error(
                 400,
                 "invalid_request_error",
                 "Remote sources and unsupported server tools are not enabled for this workspace.",
             ));
-        }
+        };
+        body = admitted;
+        let bytes = if parts.method == http::Method::POST {
+            Bytes::from(body.to_string())
+        } else {
+            bytes
+        };
         if self.provider == Provider::Anthropic && self.engine.is_some() && splice::needed(&body) {
             if path.ends_with("/count_tokens") {
                 return Box::pin(splice::count(self, parts, body)).await;
@@ -910,25 +911,23 @@ impl Model {
         parts.headers.insert("host", self.authority.parse()?);
         parts.headers.insert("accept-encoding", "identity".parse()?);
         let request = Request::from_parts(parts, Body::from(bytes));
-        let result = self.forward_request(request).await;
+        let result = self
+            .forward_request(request)
+            .await
+            .map_err(|error| Error::msg(secret.redact(&error.to_string())))
+            .and_then(|response| transport::sanitize(response, secret));
         match result {
-            Ok(mut response) => {
+            Ok(response) => {
                 call.status = response.status().as_u16();
                 let sse = response
                     .headers()
                     .get("content-type")
                     .is_some_and(|v| v.as_bytes().starts_with(b"text/event-stream"));
-                response.headers_mut().remove("content-length");
-                for value in response.headers_mut().values_mut() {
-                    if let Ok(text) = value.to_str() {
-                        *value = secret.redact(text).parse()?;
-                    }
-                }
-                Ok(response.map(|body| Body::new(response::Metered::new(body, call, sse, secret))))
+                Ok(response.map(|body| Body::new(response::Metered::new(body, call, sse))))
             }
             Err(error) => {
                 call.stop = "transport_error".into();
-                Err(Error::msg(secret.redact(&error.to_string())))
+                Err(error)
             }
         }
     }
@@ -960,19 +959,20 @@ fn rfc3339(at: time::OffsetDateTime) -> String {
     )
 }
 /// Checks transport-bearing fields before any web tool can enter a splice.
+#[cfg(test)]
 fn safe_request(provider: Provider, path: &str, body: &Value, world: bool) -> bool {
-    if serde_json::from_value::<request::Envelope>(body.clone()).is_err() {
-        return false;
-    }
+    admitted_request(provider, path, body, world).is_some()
+}
+
+fn admitted_request(provider: Provider, path: &str, body: &Value, world: bool) -> Option<Value> {
+    let admitted = request::Envelope::decode(body).ok()?;
     if let Some(tools) = body.get("tools") {
-        let Some(tools) = tools.as_array() else {
-            return false;
-        };
+        let tools = tools.as_array()?;
         if !tools
             .iter()
             .all(|tool| safe_tool(provider, path, tool, world))
         {
-            return false;
+            return None;
         }
     }
     if let Some(functions) = body.get("functions")
@@ -981,9 +981,9 @@ fn safe_request(provider: Provider, path: &str, body: &Value, world: bool) -> bo
                 .all(|f| f["name"].is_string() && f["parameters"].is_object())
         })
     {
-        return false;
+        return None;
     }
-    true
+    Some(admitted.value())
 }
 
 fn safe_tool(provider: Provider, path: &str, tool: &Value, world: bool) -> bool {

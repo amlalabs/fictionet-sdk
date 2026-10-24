@@ -121,17 +121,7 @@ impl Vm {
             .stdout(Stdio::null())
             .stderr(Stdio::from(std::fs::File::create(&stderr_log)?))
             .kill_on_drop(true);
-        // Its own process group, so a Ctrl-C to the terminal does not reach
-        // the VM.
-        // SAFETY: setpgid in the child before exec is async-signal-safe.
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setpgid(0, 0) < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        own_child(&mut command);
         let child = command.spawn()?;
         Ok(Vm {
             child,
@@ -205,6 +195,49 @@ impl Vm {
     }
 }
 
+/// The kernel kills the VM even when its owner cannot run destructors.
+fn own_child(command: &mut Command) {
+    let parent = std::process::id() as libc::pid_t;
+    // SAFETY: these operations are async-signal-safe and allocate nothing in the child.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) < 0 || libc::setpgid(0, 0) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::getppid() != parent {
+                libc::_exit(1);
+            }
+            Ok(())
+        });
+    }
+}
+
+/// Refuses another VM with a disk belonging to the same demo.
+pub(super) fn ensure_stopped(name: &str) -> io::Result<()> {
+    let prefix = std::env::temp_dir().join(format!("{name}-"));
+    let prefix = format!("path={}", prefix.display());
+    for entry in std::fs::read_dir("/proc")? {
+        let entry = entry?;
+        if entry.file_name().to_string_lossy().parse::<u32>().is_err() {
+            continue;
+        }
+        let Ok(args) = std::fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        let args: Vec<_> = args.split(|b| *b == 0).collect();
+        if args
+            .windows(2)
+            .any(|pair| pair[0] == b"--disk" && pair[1].starts_with(prefix.as_bytes()))
+        {
+            return Err(io::Error::other(format!(
+                "{name} still has a VM running as PID {}; stop that process before starting again",
+                entry.file_name().to_string_lossy()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Writes `bytes` to a write-protected, in-memory file and returns it, ready to exec
 /// through `/proc/self/fd/<n>`. The bytes never touch disk, and the seals stop
 /// their contents changing before or after exec.
@@ -262,6 +295,71 @@ fn strip_ansi(text: &str) -> String {
 #[cfg(test)]
 mod process_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn startup_refuses_a_vm_using_the_same_demos_disk() {
+        let name = format!("owned-demo-{}", std::process::id());
+        let disk = format!(
+            "path={}/{}-old/workstation/overlay.qcow2,image_type=qcow2",
+            std::env::temp_dir().display(),
+            name
+        );
+        let mut stale = Command::new("sh")
+            .args(["-c", "read value", "--disk", &disk])
+            .stdin(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let error = ensure_stopped(&name).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("PID {}", stale.id().unwrap()))
+        );
+        ensure_stopped(&format!("{name}-different")).unwrap();
+        stale.kill().await.unwrap();
+        ensure_stopped(&name).unwrap();
+    }
+
+    #[tokio::test]
+    async fn child_dies_when_its_owner_is_killed() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+        if std::env::var_os("VM_OWNER_TEST").is_some() {
+            let mut command = Command::new("sleep");
+            command.arg("60");
+            own_child(&mut command);
+            let _child = command.spawn().unwrap();
+            println!("child ready");
+            std::future::pending::<()>().await;
+            return;
+        }
+        let mut owner = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "kit::vm::process_tests::child_dies_when_its_owner_is_killed",
+                "--nocapture",
+            ])
+            .env("VM_OWNER_TEST", "1")
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut output = BufReader::new(owner.stdout.take().unwrap());
+        let mut line = String::new();
+        loop {
+            line.clear();
+            assert_ne!(output.read_line(&mut line).await.unwrap(), 0);
+            if line.contains("child ready") {
+                break;
+            }
+        }
+        owner.kill().await.unwrap();
+        let mut tail = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), output.read_to_end(&mut tail))
+            .await
+            .expect("VM retained its owner's output pipe after parent death")
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn shutdown_rejects_unsuccessful_process_status() {

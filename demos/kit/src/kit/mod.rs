@@ -776,6 +776,7 @@ where
     F: Future<Output = fictionet::Result> + Send + 'static,
 {
     let downloads = downloads.as_ref();
+    vm::ensure_stopped(name)?;
     check_downloads(downloads, &guests)?;
     std::fs::OpenOptions::new()
         .read(true)

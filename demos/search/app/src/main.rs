@@ -118,6 +118,7 @@ async fn main() -> Result {
     let console_page = page.clone();
     let downloads_for_boot = downloads.clone();
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let boot = kit::boot(
         "search",
         vec![guest::guest(
@@ -153,6 +154,7 @@ async fn main() -> Result {
     );
     let run = tokio::select! {
         run = boot => run?,
+        _ = terminate.recv() => { server.shutdown().await; observation_task.abort(); return Ok(()); },
         _ = interrupt.recv() => { server.shutdown().await; observation_task.abort(); return Ok(()); },
         result = &mut observation_task => return Err(recording_error(result).into()),
     };
@@ -167,6 +169,7 @@ async fn main() -> Result {
             },
             result = &mut observation_task => { recording_ended = true; break Err(recording_error(result)); },
             _ = interrupt.recv() => break Ok(()),
+            _ = terminate.recv() => break Ok(()),
         }
     };
     drop(readiness);

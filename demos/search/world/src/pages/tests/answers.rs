@@ -472,6 +472,7 @@ fn disclosure_rewrites_preserve_context_and_recover_without_breaking_browsing() 
             let body = String::from_utf8_lossy(&response.body);
             assert!(!body.contains("This page is simulated"));
             assert!(body.contains("Story"));
+            assert!(body.contains("The report describes the investigation and its conclusions."));
             assert_eq!(
                 get(&world, &cx, "https://example.com/story").await.body,
                 response.body
@@ -571,4 +572,109 @@ fn rewrite_observations_redact_credentials_echoed_by_the_writer() {
         assert!(serialized.contains("OPENROUTER_API_KEY"));
         Ok(())
     });
+}
+
+#[test]
+fn accepted_pages_and_titles_never_carry_the_provider_credential() {
+    let dir = Dir::new("accepted-answer");
+    let script = Arc::new(Script::default());
+    script
+        .pages
+        .lock()
+        .unwrap()
+        .push_back(PAGE.replace("Story", &format!("Story {KEY}")));
+    let (pages, _) = model_world(&dir, &script, 0);
+    no_cast(&pages);
+    lab(|cx| async move {
+        let response = get(&pages, &cx, "https://docs.fields.com/guide").await;
+        assert_eq!(response.status, 200);
+        assert!(!String::from_utf8_lossy(&response.body).contains(KEY));
+        assert!(!serde_json::to_string(&response.logged())?.contains(KEY));
+        let record = pages
+            .store()
+            .page("docs.fields.com", "/guide")
+            .unwrap()
+            .clone();
+        assert!(!serde_json::to_string(&record)?.contains(KEY));
+        Ok(())
+    });
+    assert!(dir.texts().iter().all(|text| !text.contains(KEY)));
+}
+
+#[test]
+fn reserved_result_domains_are_rejected_including_subdomains() {
+    for host in [
+        "example.com",
+        "EXAMPLE.COM",
+        "example.com.",
+        "news.test.",
+        "fires.example.com",
+        "example.org",
+        "example.net",
+        "news.test",
+        "news.invalid",
+        "local.localhost",
+    ] {
+        let answer = format!("RESULT\nURL: https://{host}/story\nTITLE: Story\nSNIPPET: A report.");
+        assert!(prompts::read_search(&answer).is_err(), "{host}");
+    }
+}
+
+#[test]
+fn pages_without_claims_still_supply_cross_site_context() {
+    let dir = Dir::new("shared-facts");
+    let script = Arc::new(Script::default());
+    let first =
+        format!("{PAGE}<p>The battery fire at Harbor Works in Tacoma began on 7 October 2026.</p>");
+    script.pages.lock().unwrap().extend([first, PAGE.into()]);
+    let (pages, fake) = model_world(&dir, &script, 0);
+    no_cast(&pages);
+    lab(|cx| async move {
+        assert_eq!(
+            get(&pages, &cx, "https://news.fields.com/battery-fire")
+                .await
+                .status,
+            200
+        );
+        pages.store().add_mention("safety.fields.com", "/investigation", json!({"via":"search", "query":"battery fire", "title":"Battery fire investigation", "snippet":"Harbor Works battery fire"}))?;
+        assert_eq!(
+            get(&pages, &cx, "https://safety.fields.com/investigation")
+                .await
+                .status,
+            200
+        );
+        Ok(())
+    });
+    let prompts = fake.users();
+    assert!(prompts[1].contains("Harbor Works in Tacoma began on 7 October 2026"));
+    assert!(prompts[1].contains("https://news.fields.com/battery-fire"));
+}
+
+#[test]
+fn incomplete_or_empty_documents_fail_without_becoming_cached_successes() {
+    for (url, answer, cut_off) in [
+        (
+            "https://docs.fields.com/empty",
+            "STATUS: 200\nTITLE: Empty\nSITE_CSS: body {color: #234}\nBODY:\n<h1>Empty</h1><p>TODO</p>",
+            false,
+        ),
+        (
+            "https://docs.fields.com/report.json",
+            "STATUS: 200\nTITLE: Data\nBODY:\n{\"value\":",
+            true,
+        ),
+    ] {
+        let reply = json!({"model":"answered/model", "choices":[{"message":{"content":answer}, "finish_reason": if cut_off {"length"} else {"stop"}}]});
+        let fake = Fake::script(vec![(ms(1), Ok((200, reply.to_string().into_bytes()))); 4]);
+        let pages = Arc::new(Pages::with_model(seed(), openrouter(fake)));
+        lab(|cx| async move {
+            for _ in 0..2 {
+                let response = get(&pages, &cx, url).await;
+                assert_eq!(response.status, 503);
+                let (host, target) = text::target_of(url);
+                assert!(pages.store().page(&host, &target).is_none());
+            }
+            Ok(())
+        });
+    }
 }
