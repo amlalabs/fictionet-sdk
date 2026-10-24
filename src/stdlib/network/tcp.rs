@@ -3595,6 +3595,209 @@ mod tests {
         }));
         assert_eq!(result.unwrap_err().to_string(), "done");
     }
+
+    /// The SYN-ACK `local` sent to `peer`, by its sequence number.
+    fn syn_ack_to(packets: &[Vec<u8>], peer: SocketAddr) -> u32 {
+        packets
+            .iter()
+            .find_map(|p| {
+                let ip = Header::parse_whole(p).unwrap();
+                let t = ip.payload(p);
+                let to = SocketAddr::new(ip.dst, u16::from_be_bytes([t[2], t[3]]));
+                (to == peer && t[13] == 0x12).then(|| u32::from_be_bytes(t[4..8].try_into().unwrap()))
+            })
+            .expect("a SYN-ACK to the peer")
+    }
+
+    #[test]
+    fn a_handshake_reset_in_one_batch_does_not_lend_its_socket_to_another_peer() {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
+            let (_raw, side) = pair();
+            let local: SocketAddr = "10.0.0.1:80".parse()?;
+            let first: SocketAddr = "10.0.0.2:1000".parse()?;
+            let second: SocketAddr = "10.0.0.3:2000".parse()?;
+            let ep = endpoint(&fcx, side, local.ip());
+            let _listener = ep.listen(local.port())?;
+            let now = smol_now(&fcx);
+            let mut st = ep.shared.state.lock();
+            // One batch: housekeeping runs only after all three packets.
+            st.ingress(local.ip(), now, segment(first, local, 100, 0, 0x02).0);
+            st.ingress(local.ip(), now, segment(first, local, 101, 0, 0x04).0);
+            st.ingress(local.ip(), now, segment(second, local, 500, 0, 0x02).0);
+            let isn = syn_ack_to(&egress(&mut st, now), second);
+            st.ingress(local.ip(), now, segment(second, local, 501, isn.wrapping_add(1), 0x10).0);
+            st.housekeeping();
+            for (&h, c) in &st.conns {
+                if let Some(remote) = st.get(h).remote_endpoint() {
+                    assert_eq!(c.remote, SocketAddr::from(remote), "the peer its socket talks to");
+                }
+            }
+            let l = &st.listeners[&80];
+            let h = *l.ready.front().expect("the second peer's connection is ready");
+            assert_eq!(st.conns[&h].remote, second);
+            assert_eq!(st.by_tuple.get(&(local, second)), Some(&h));
+            assert_eq!(l.per_peer.get(&second.ip()), Some(&1));
+            assert_eq!(l.per_peer.get(&first.ip()), None);
+            drop(st);
+            fcx.cancel();
+            Ok(())
+        }))
+        .unwrap();
+    }
+
+    #[test]
+    fn a_handshake_restarted_in_one_batch_is_not_reported_reset() {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
+            let (_raw, side) = pair();
+            let local: SocketAddr = "10.0.0.1:80".parse()?;
+            let peer: SocketAddr = "10.0.0.2:1000".parse()?;
+            let ep = endpoint(&fcx, side, local.ip());
+            let _listener = ep.listen(local.port())?;
+            let now = smol_now(&fcx);
+            let mut st = ep.shared.state.lock();
+            // The peer resets its handshake and starts again, in one batch.
+            st.ingress(local.ip(), now, segment(peer, local, 100, 0, 0x02).0);
+            st.ingress(local.ip(), now, segment(peer, local, 101, 0, 0x04).0);
+            st.ingress(local.ip(), now, segment(peer, local, 300, 0, 0x02).0);
+            let isn = syn_ack_to(&egress(&mut st, now), peer);
+            st.ingress(local.ip(), now, segment(peer, local, 301, isn.wrapping_add(1), 0x10).0);
+            st.housekeeping();
+            let h = *st.listeners[&80].ready.front().expect("the new handshake finished");
+            assert_eq!(st.get(h).state(), TcpState::Established);
+            drop(st);
+            let watch = GoneWatch { shared: ep.shared.clone(), handle: h };
+            assert!(
+                watch.poll_gone(&mut Context::from_waker(Waker::noop())).is_pending(),
+                "an established connection is not gone"
+            );
+            fcx.cancel();
+            Ok(())
+        }))
+        .unwrap();
+    }
+
+    #[test]
+    fn bytes_after_the_peers_fin_are_not_read() {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
+            let (_raw, side) = pair();
+            let local: SocketAddr = "10.0.0.1:80".parse()?;
+            let peer: SocketAddr = "10.0.0.2:1234".parse()?;
+            let ep = endpoint(&fcx, side, local.ip());
+            let _listener = ep.listen(local.port())?;
+            let now = smol_now(&fcx);
+            let mut st = ep.shared.state.lock();
+            let (h, ack) = established(&mut st, now, local, peer);
+            st.ingress(local.ip(), now, segment(peer, local, 101, ack, 0x11).0);
+            assert_eq!(st.get(h).state(), TcpState::CloseWait);
+            egress(&mut st, now);
+            let mut buf = [0; 8];
+            assert_eq!(st.sock(h).recv_slice(&mut buf), Err(stcp::RecvError::Finished));
+            // The peer sends more after its FIN, next in sequence.
+            let mut late = segment(peer, local, 102, ack, 0x18).0;
+            late.extend_from_slice(b"late");
+            fix_lengths(&mut late, 20, peer.ip(), local.ip());
+            st.ingress(local.ip(), now, late);
+            assert_eq!(st.get(h).recv_queue(), 0, "bytes after the FIN entered the stream");
+            assert_eq!(st.sock(h).recv_slice(&mut buf), Err(stcp::RecvError::Finished));
+            drop(st);
+            fcx.cancel();
+            Ok(())
+        }))
+        .unwrap();
+    }
+
+    #[test]
+    fn closing_in_syn_received_waits_for_the_fin_to_be_acknowledged() {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
+            let (_raw, side) = pair();
+            let local: SocketAddr = "10.0.0.1:49152".parse()?;
+            let peer: SocketAddr = "10.0.0.2:80".parse()?;
+            let ep = endpoint(&fcx, side, local.ip());
+            let now = smol_now(&fcx);
+            let mut st = ep.shared.state.lock();
+            let mut s = new_socket(MIN_BUFFER);
+            s.0.connect(st.iface.context(), peer, local).unwrap();
+            let h = st.add_socket(s);
+            st.conns.insert(h, Conn::new(local, peer, Side::Client));
+            st.by_tuple.insert((local, peer), h);
+            egress(&mut st, now);
+            let iss = st.conns[&h].iss.unwrap();
+            // Simultaneous open: the peer's own SYN crosses ours.
+            st.ingress(local.ip(), now, segment(peer, local, 7, 0, 0x02).0);
+            assert_eq!(st.get(h).state(), TcpState::SynReceived);
+            egress(&mut st, now);
+            // The connect is abandoned, which drops its connection.
+            st.orphan(h, false);
+            assert_eq!(st.get(h).state(), TcpState::FinWait1);
+            assert!(egress(&mut st, now).iter().all(|p| {
+                Header::parse_whole(p).unwrap().payload(p)[13] & 1 == 0
+            }));
+            // The peer acknowledges our SYN, not a FIN it never saw.
+            st.ingress(local.ip(), now, segment(peer, local, 8, iss.wrapping_add(1), 0x10).0);
+            assert_eq!(st.get(h).state(), TcpState::FinWait1, "only our SYN was acknowledged");
+            let sent = egress(&mut st, now);
+            assert!(
+                sent.iter().any(|p| {
+                    let t = Header::parse_whole(p).unwrap().payload(p);
+                    t[13] & 1 != 0
+                        && u32::from_be_bytes(t[4..8].try_into().unwrap()) == iss.wrapping_add(1)
+                }),
+                "the FIN follows the SYN"
+            );
+            drop(st);
+            fcx.cancel();
+            Ok(())
+        }))
+        .unwrap();
+    }
+
+    #[test]
+    fn a_reused_listening_socket_forgets_the_previous_peers_mss() {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
+            let (_raw, side) = pair();
+            let local: SocketAddr = "10.0.0.1:80".parse()?;
+            let first: SocketAddr = "10.0.0.2:1000".parse()?;
+            let second: SocketAddr = "10.0.0.3:2000".parse()?;
+            let ep = endpoint(&fcx, side, local.ip());
+            let _listener = ep.listen(local.port())?;
+            let now = smol_now(&fcx);
+            let mut st = ep.shared.state.lock();
+            // The first peer offers a 1460-byte MSS, then resets its handshake.
+            let mut syn = segment(first, local, 100, 0, 0x02).0;
+            syn[32] = 6 << 4;
+            syn.extend_from_slice(&[2, 4, 0x05, 0xb4]);
+            fix_lengths(&mut syn, 20, first.ip(), local.ip());
+            st.ingress(local.ip(), now, syn);
+            egress(&mut st, now);
+            st.ingress(local.ip(), now, segment(first, local, 101, 0, 0x04).0);
+            st.housekeeping();
+            let spare = st.listeners[&80].idle.clone();
+            assert_eq!(spare.len(), 1, "the reset socket is the spare");
+            // The second peer sends no MSS option: RFC 9293 says 536 then.
+            st.ingress(local.ip(), now, segment(second, local, 500, 0, 0x02).0);
+            let isn = syn_ack_to(&egress(&mut st, now), second);
+            st.ingress(local.ip(), now, segment(second, local, 501, isn.wrapping_add(1), 0x10).0);
+            st.housekeeping();
+            let h = *st.listeners[&80].ready.front().expect("the second connection");
+            assert_eq!(h, spare[0], "the spare socket served the second peer");
+            assert_eq!(st.sock(h).send_slice(&[0x5a; 2000]).unwrap(), 2000);
+            let sent = egress(&mut st, now);
+            let largest = sent
+                .iter()
+                .map(|p| {
+                    let t = Header::parse_whole(p).unwrap().payload(p);
+                    t.len() - ((t[12] >> 4) as usize) * 4
+                })
+                .max()
+                .unwrap();
+            assert!(largest > 0);
+            assert!(largest <= 536, "sent a {largest}-byte segment to a peer that offered no MSS");
+            drop(st);
+            fcx.cancel();
+            Ok(())
+        }))
+        .unwrap();
+    }
 }
 
 }
