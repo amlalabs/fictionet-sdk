@@ -138,6 +138,11 @@ impl Pages {
                         at_ms: fcx.now().since_start().as_millis() as u64,
                     });
                 }
+                if self.live_only()
+                    && let Some(live) = &self.live
+                {
+                    live.revoke(generate);
+                }
                 store.generation.generate = generate;
             }
             Command::SetNewPages { new_pages, .. } => {
@@ -156,6 +161,9 @@ impl Pages {
                 }
                 if new_pages == NewPages::LiveSearch && self.live.is_none() {
                     return Err(invalid("Live search needs EXA_API_KEY on the host"));
+                }
+                if let Some(live) = &self.live {
+                    live.revoke(new_pages == NewPages::LiveSearch);
                 }
                 if new_pages != NewPages::Off {
                     self.live_active.store(
@@ -193,6 +201,9 @@ impl Pages {
             Command::Restart { .. } => {
                 if store.root().is_some() {
                     return Err(invalid("A world on a store directory cannot restart"));
+                }
+                if let Some(live) = &self.live {
+                    live.restart();
                 }
                 let generation = store.generation;
                 *store = Store::memory();

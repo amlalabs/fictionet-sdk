@@ -11,7 +11,7 @@ fn public_captures_record_private_destination_failures_without_archiving_them() 
         endpoint: "https://api.exa.ai/search".parse().unwrap(),
         path: path.clone(),
         state: Mutex::default(),
-        fetcher: Fetcher::new(capture::BROWSER).unwrap(),
+        fetcher: Transport::new().unwrap(),
         observer: Mutex::default(),
     });
     let mut pages = Pages::new(Seed::builtin("web").unwrap());
@@ -122,7 +122,7 @@ fn external_redirects_do_not_grant_a_crawl_of_another_site() {
         endpoint: "https://api.exa.ai/search".parse().unwrap(),
         path: path.clone(),
         state: Mutex::default(),
-        fetcher: Fetcher::loopback(capture::BROWSER).unwrap(),
+        fetcher: Transport::loopback().unwrap(),
         observer: Mutex::default(),
     });
     fictionet::block_on(fictionet::run(
@@ -231,7 +231,7 @@ fn every_engine_uses_the_host_api_and_logs_queries_downloads_and_replays() {
         endpoint: format!("{origin}/search").parse().unwrap(),
         path: path.clone(),
         state: Mutex::default(),
-        fetcher: Fetcher::loopback(capture::BROWSER).unwrap(),
+        fetcher: Transport::loopback().unwrap(),
         observer: Mutex::default(),
     });
     let mut pages = Pages::new(Seed::builtin("web").unwrap());
@@ -351,7 +351,7 @@ fn copies_dependencies_and_same_host_links_through_five_levels() {
         endpoint: url::Url::parse("https://api.exa.ai/search").unwrap(),
         path: path.clone(),
         state: Mutex::default(),
-        fetcher: Fetcher::loopback(capture::BROWSER).unwrap(),
+        fetcher: Transport::loopback().unwrap(),
         observer: Mutex::default(),
     });
     let copy = live.clone();
@@ -459,7 +459,7 @@ fn unknown_urls_do_not_fetch_and_completed_copies_survive_mode_changes() {
         endpoint: url::Url::parse("https://api.exa.ai/search").unwrap(),
         path: path.clone(),
         state: Mutex::default(),
-        fetcher: Fetcher::loopback(capture::BROWSER).unwrap(),
+        fetcher: Transport::loopback().unwrap(),
         observer: Mutex::default(),
     });
     let response = warc::Response {
@@ -535,4 +535,179 @@ fn unknown_urls_do_not_fetch_and_completed_copies_survive_mode_changes() {
     ))
     .unwrap();
     std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn authenticated_results_scrub_text_and_reject_credential_destinations() {
+    let key = Key::new("EXA_API_KEY", Some("private-key".into())).unwrap();
+    let results = parse_search(&json!({"results":[{"url":"https://sky.org/report", "title":"private-key stars", "highlights":["private-key gas"], "publishedDate":"private-key"}]}), Some(&key)).unwrap();
+    assert!(
+        !serde_json::to_string(&results)
+            .unwrap()
+            .contains("private-key")
+    );
+    assert_eq!(results.results[0].title, "<EXA_API_KEY> stars");
+    for url in [
+        "https://sky.org/private-key",
+        "https://sky.org/?key=private%2dkey",
+        "https://sky.org/#private-key",
+    ] {
+        let error = parse_search(
+            &json!({"results":[{"url":url,"title":"Stars"}]}),
+            Some(&key),
+        )
+        .unwrap_err();
+        assert!(!error.contains("private-key"));
+    }
+}
+
+#[test]
+fn source_changes_cancel_inflight_searches_and_do_not_publish_stale_results() {
+    use std::{
+        io::{BufRead, BufReader, Read},
+        net::TcpListener,
+    };
+    for restart in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/search", listener.local_addr().unwrap());
+        let (started, accepted) = oneshot::channel();
+        let (closed, disconnected) = oneshot::channel();
+        let server = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(socket);
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            started.send(()).unwrap();
+            let mut tail = Vec::new();
+            reader
+                .read_to_end(&mut tail)
+                .expect("revocation closes the held search connection");
+            closed.send(()).unwrap();
+        });
+        let live = Arc::new(Live {
+            key: Key::new("EXA_API_KEY", Some("private-key".into())).unwrap(),
+            endpoint: endpoint.parse().unwrap(),
+            path: std::env::temp_dir().join(format!(
+                "live-cancel-{}-{restart}.warc.gz",
+                std::process::id()
+            )),
+            state: Mutex::default(),
+            fetcher: Transport::loopback().unwrap(),
+            observer: Mutex::default(),
+        });
+        let mut pages = Pages::copied(
+            Seed::builtin("web").unwrap(),
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../extras/tests/fixtures"),
+            &["https://sky.org/".into()],
+            None,
+        )
+        .unwrap();
+        pages.live = Some(live.clone());
+        pages
+            .live_active
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        fictionet::block_on(fictionet::run(
+            fictionet::Seed::from_u64(16),
+            |cx| async move {
+                let mut search = Box::pin(live.search(&cx, Engine::Google, "stars", 0));
+                std::future::poll_fn(|task| {
+                    assert!(search.as_mut().poll(task).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                cx.race(Some(cx.now() + Duration::from_secs(5)), accepted)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let old = live.state().lifetime.clone();
+                pages
+                    .apply(
+                        &cx,
+                        if restart {
+                            Command::Restart {
+                                expected_revision: 0,
+                            }
+                        } else {
+                            Command::SetNewPages {
+                                new_pages: NewPages::Copied,
+                                expected_revision: 0,
+                            }
+                        },
+                    )
+                    .unwrap();
+                assert!(search.await.is_err());
+                cx.race(Some(cx.now() + Duration::from_secs(5)), disconnected)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(old.cancelled());
+                let state = live.state();
+                assert!(state.queue.is_empty());
+                assert!(state.searches.is_empty());
+                assert_eq!(state.archive.urls().count(), 0);
+                Ok(())
+            },
+        ))
+        .unwrap();
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn recursive_discovery_has_a_total_job_and_archive_budget() {
+    let live = Arc::new(Live {
+        key: Key::new("EXA_API_KEY", Some("private-key".into())).unwrap(),
+        endpoint: "https://api.exa.ai/search".parse().unwrap(),
+        path: std::env::temp_dir().join("live-budget.warc.gz"),
+        state: Mutex::default(),
+        fetcher: Transport::new().unwrap(),
+        observer: Mutex::default(),
+    });
+    fictionet::block_on(fictionet::lab(
+        fictionet::Seed::from_u64(17),
+        |cx| async move {
+            live.state().running = true;
+            for index in 0..CAPTURE_JOBS + 10 {
+                live.enqueue(
+                    Job {
+                        url: format!("https://sky.org/assets/{index}.css"),
+                        navigation: None,
+                        redirects: 0,
+                        cx: cx.clone(),
+                    },
+                    false,
+                );
+            }
+            assert_eq!(live.state().queue.len(), CAPTURE_JOBS);
+            assert_eq!(live.state().reached.len(), CAPTURE_JOBS);
+            live.revoke(true);
+            live.state().bytes = CAPTURE_BYTES;
+            live.enqueue(
+                Job {
+                    url: "https://sky.org/next".into(),
+                    navigation: None,
+                    redirects: 0,
+                    cx,
+                },
+                false,
+            );
+            assert!(live.state().queue.is_empty());
+            Ok(())
+        },
+    ))
+    .unwrap();
 }
