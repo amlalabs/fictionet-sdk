@@ -71,6 +71,7 @@ pub enum SiteKind {
     Recipe,
     Advisory,
     #[default]
+    #[serde(alias = "")]
     Other,
 }
 impl std::str::FromStr for SiteKind {
@@ -87,11 +88,29 @@ impl std::fmt::Display for SiteKind {
 }
 
 /// A navigation destination with its displayed label.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Link {
     pub label: String,
     pub href: String,
 }
+impl<'de> Deserialize<'de> for Link {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Saved {
+            Fields { label: String, href: String },
+            Text(String),
+        }
+        match Saved::deserialize(deserializer)? {
+            Saved::Fields { label, href } => Ok(Self { label, href }),
+            Saved::Text(text) => Self::parse(&text)
+                .ok_or_else(|| serde::de::Error::custom("invalid saved navigation link")),
+        }
+    }
+}
+
 impl Link {
     pub(super) fn parse(text: &str) -> Option<Self> {
         let (label, href) = text.split_once('|')?;

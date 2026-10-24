@@ -460,3 +460,13 @@ fn model_generation_switch_keeps_saved_pages_and_results() {
         Ok(())
     });
 }
+
+#[test]
+fn saved_navigation_decodes_to_typed_links_without_losing_destinations() {
+    let profile: make::Profile = serde_json::from_value(json!({"name":"Docs", "kind":"", "tagline":"", "nav":["Guide|/guide"], "footer":[], "style":0})).unwrap();
+    assert_eq!(profile.kind, make::SiteKind::Other);
+    assert_eq!(profile.nav[0].label, "Guide");
+    assert_eq!(profile.nav[0].href, "/guide");
+    let saved = serde_json::to_value(profile).unwrap();
+    assert_eq!(saved["nav"][0], json!({"label":"Guide", "href":"/guide"}));
+}
