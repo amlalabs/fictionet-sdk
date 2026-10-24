@@ -1,4 +1,6 @@
+mod events;
 use super::*;
+pub(super) use events::{Block, Delta, EventKind};
 use fictionet::stdlib::codec::{Stream, try_pump};
 use fictionet::stdlib::protocols::sse;
 use http_body::{Body as HttpBody, Frame};
@@ -53,8 +55,11 @@ impl Call {
 
     fn read(&mut self, value: &Value) {
         if matches!(
-            value["type"].as_str(),
-            Some("message_stop" | "response.completed" | "response.failed" | "response.incomplete")
+            EventKind::read(value),
+            EventKind::MessageStop
+                | EventKind::ResponseCompleted
+                | EventKind::ResponseFailed
+                | EventKind::ResponseIncomplete
         ) {
             self.complete = true;
         }
@@ -272,32 +277,25 @@ pub(crate) fn content(value: &mut Value, visit: &mut impl FnMut(Channel, &mut St
             visit(channel, text);
         }
     }
-    fn blocks(value: &mut Value, channel: u64, visit: &mut impl FnMut(Channel, &mut String)) {
-        if let Some(blocks) = value.as_array_mut() {
-            for block in blocks {
-                field(block, "text", Channel::Text(channel), visit);
-                field(block, "thinking", Channel::Thinking(channel), visit);
-                field(block, "refusal", Channel::Refusal(channel), visit);
-            }
-        }
-    }
     if let Some(parts) = value.get_mut("content") {
-        blocks(parts, 0, visit);
+        events::blocks(parts, 0, visit);
     }
     if let Some(block) = value.get_mut("content_block") {
         field(block, "text", Channel::Text(0), visit);
         field(block, "thinking", Channel::Thinking(0), visit);
     }
     let index = value["index"].as_u64().unwrap_or(0);
-    if let Some(delta) = value.get_mut("delta").filter(|v| v.is_object()) {
-        field(delta, "text", Channel::Text(0), visit);
-        field(delta, "thinking", Channel::Thinking(0), visit);
-        field(delta, "partial_json", Channel::Tool(0, index), visit);
+    if EventKind::read(value) == EventKind::BlockDelta
+        && let Some(delta) = value.get_mut("delta")
+        && let Ok(mut parsed) = serde_json::from_value::<Delta>(delta.clone())
+    {
+        parsed.content(index, visit);
+        *delta = serde_json::to_value(parsed).expect("native content delta");
     }
     let index = value["output_index"].as_u64().unwrap_or(0);
-    let channel = match value["type"].as_str() {
-        Some("response.function_call_arguments.delta") => Channel::Tool(0, index),
-        Some("response.refusal.delta") => Channel::Refusal(0),
+    let channel = match EventKind::read(value) {
+        EventKind::ArgumentsDelta => Channel::Tool(0, index),
+        EventKind::RefusalDelta => Channel::Refusal(0),
         _ => Channel::Text(0),
     };
     field(value, "delta", channel, visit);
@@ -311,7 +309,7 @@ pub(crate) fn content(value: &mut Value, visit: &mut impl FnMut(Channel, &mut St
                     field(part, "reasoning", Channel::Thinking(channel), visit);
                     field(part, "refusal", Channel::Refusal(channel), visit);
                     if let Some(content) = part.get_mut("content") {
-                        blocks(content, channel, visit);
+                        events::blocks(content, channel, visit);
                     }
                     if let Some(tools) = part.get_mut("tool_calls").and_then(Value::as_array_mut) {
                         for (index, tool) in tools.iter_mut().enumerate() {
@@ -331,7 +329,7 @@ pub(crate) fn content(value: &mut Value, visit: &mut impl FnMut(Channel, &mut St
                 .get_mut("content")
                 .and_then(|v| v.get_mut("parts"))
             {
-                blocks(parts, index as u64, visit);
+                events::blocks(parts, index as u64, visit);
             }
         }
     }
@@ -339,7 +337,7 @@ pub(crate) fn content(value: &mut Value, visit: &mut impl FnMut(Channel, &mut St
         for (index, item) in output.iter_mut().enumerate() {
             field(item, "arguments", Channel::Tool(0, index as u64), visit);
             if let Some(parts) = item.get_mut("content") {
-                blocks(parts, 0, visit);
+                events::blocks(parts, 0, visit);
             }
         }
     }

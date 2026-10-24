@@ -1,6 +1,33 @@
 //! Host-side model transport for page generators.
 use super::*;
 
+/// The decoding rules for an authored document's media type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DocumentType {
+    /// HTML text, attributes and comments have entity decoding.
+    Html,
+    /// JSON strings and member names have escape decoding.
+    Json,
+    /// Other documents retain their literal text.
+    Literal,
+}
+impl From<&str> for DocumentType {
+    fn from(media_type: &str) -> Self {
+        let media_type = media_type
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        match media_type.as_str() {
+            "text/html" => Self::Html,
+            "application/json" => Self::Json,
+            _ if media_type.ends_with("+json") => Self::Json,
+            _ => Self::Literal,
+        }
+    }
+}
+
 /// A host credential, checked once and never exposed through formatting.
 #[derive(Clone)]
 pub struct Key {
@@ -153,13 +180,13 @@ impl Authenticated {
                 _ => false,
             }
         }
-        let content_type = content_type.split(';').next().unwrap_or("");
-        let unsafe_content =
-            if content_type == "application/json" || content_type.ends_with("+json") {
+        let unsafe_content = match DocumentType::from(content_type) {
+            DocumentType::Json => {
                 let value: Value =
                     serde_json::from_str(document).map_err(|_| "Invalid JSON document")?;
                 json_exposes(&value, &exposed)
-            } else if content_type == "text/html" {
+            }
+            DocumentType::Html => {
                 let dom = kuchiki::parse_html().one(document);
                 exposed(&dom.text_contents())
                     || dom.descendants().any(|node| {
@@ -174,9 +201,9 @@ impl Authenticated {
                             .as_comment()
                             .is_some_and(|comment| exposed(&comment.borrow()))
                     })
-            } else {
-                exposed(document)
-            };
+            }
+            DocumentType::Literal => exposed(document),
+        };
         if unsafe_content || exposed(document) {
             Err("Document contains a provider credential".into())
         } else {
@@ -203,8 +230,7 @@ impl Authenticated {
         let status = response.status().as_u16();
         let response = transport::sanitize(response, self.key.secret.clone())
             .map_err(|e| self.key.redact(&e.to_string()))?;
-        let bytes = response
-            .into_body()
+        let bytes = http_body_util::Limited::new(response.into_body(), transport::RESPONSE_LIMIT)
             .collect()
             .await
             .map_err(|e| self.key.redact(&e.to_string()))?
@@ -369,6 +395,15 @@ mod tests {
             ("text/html", "<!-- private-key -->"),
             ("application/json", r#"{"value":"private\u002dkey"}"#),
             ("application/json", r#"{"private\u002dkey":1}"#),
+            ("Application/JSON", r#"{"value":"private\u002dkey"}"#),
+            (
+                " Application/Problem+JSON; Charset=UTF-8",
+                r#"{"private\u002dkey":1}"#,
+            ),
+            (
+                "Text/HTML; Charset=UTF-8",
+                "<a title='private&#45;key'>read</a>",
+            ),
         ] {
             let error = client.check_document(kind, body).unwrap_err();
             assert!(!error.contains("private-key"));
@@ -384,7 +419,7 @@ mod tests {
     #[test]
     fn authenticated_client_bounds_the_incoming_body_before_collection() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        struct Frames(Arc<AtomicUsize>);
+        struct Frames(Arc<AtomicUsize>, bool);
         impl http_body::Body for Frames {
             type Data = Bytes;
             type Error = Error;
@@ -393,13 +428,15 @@ mod tests {
                 _: &mut std::task::Context<'_>,
             ) -> std::task::Poll<Option<fictionet::Result<http_body::Frame<Bytes>>>> {
                 let n = self.0.fetch_add(1, Ordering::SeqCst);
-                std::task::Poll::Ready(
-                    (n < 64)
-                        .then(|| Ok(http_body::Frame::data(Bytes::from(vec![b' '; 1024 * 1024])))),
-                )
+                std::task::Poll::Ready((n < 64).then(|| {
+                    let bytes = if self.1 {
+                        format!("data: {}\n\n", serde_json::json!({"type":"content_block_delta", "index":0, "delta":{"type":"text_delta", "text":"a".repeat(1024 * 1024)}})).into_bytes()
+                    } else { vec![b' '; 1024 * 1024] };
+                    Ok(http_body::Frame::data(Bytes::from(bytes)))
+                }))
             }
         }
-        struct Streaming(Arc<AtomicUsize>);
+        struct Streaming(Arc<AtomicUsize>, bool);
         impl Transport for Streaming {
             fn post<'a>(
                 &'a self,
@@ -415,31 +452,45 @@ mod tests {
                 _: Vec<(&'static str, String)>,
                 _: Vec<u8>,
             ) -> Incoming<'a> {
-                Box::pin(async move { Ok(Response::new(Body::new(Frames(self.0.clone())))) })
+                Box::pin(async move {
+                    let mut response = Response::new(Body::new(Frames(self.0.clone(), self.1)));
+                    if self.1 {
+                        response
+                            .headers_mut()
+                            .insert("content-type", "text/event-stream".parse().unwrap());
+                    }
+                    Ok(response)
+                })
             }
         }
-        let frames = Arc::new(AtomicUsize::new(0));
-        let counted = frames.clone();
-        fictionet::block_on(fictionet::lab(
-            fictionet::Seed::from_u64(6),
-            move |cx| async move {
-                let client = Authenticated::new(
-                    Provider::Anthropic,
-                    Key::new("provider key", Some("private-key".into())).unwrap(),
-                    Arc::new(Streaming(counted)),
-                );
-                assert!(
-                    client
-                        .post(&cx, vec![])
-                        .await
-                        .unwrap_err()
-                        .contains("limit")
-                );
-                Ok(())
-            },
-        ))
-        .unwrap();
-        assert_eq!(frames.load(Ordering::SeqCst), 33);
+        for streaming in [false, true] {
+            let frames = Arc::new(AtomicUsize::new(0));
+            let counted = frames.clone();
+            fictionet::block_on(fictionet::lab(
+                fictionet::Seed::from_u64(6),
+                move |cx| async move {
+                    let client = Authenticated::new(
+                        Provider::Anthropic,
+                        Key::new("provider key", Some("private-key".into())).unwrap(),
+                        Arc::new(Streaming(counted, streaming)),
+                    );
+                    assert!(
+                        client
+                            .post(&cx, vec![])
+                            .await
+                            .unwrap_err()
+                            .contains("limit")
+                    );
+                    Ok(())
+                },
+            ))
+            .unwrap();
+            if !streaming {
+                assert_eq!(frames.load(Ordering::SeqCst), 33);
+            } else {
+                assert!(frames.load(Ordering::SeqCst) < 64);
+            }
+        }
     }
 
     #[tokio::test]

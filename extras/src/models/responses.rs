@@ -10,6 +10,7 @@ use super::*;
 use fictionet::stdlib::codec::{Stream, try_pump};
 use fictionet::stdlib::protocols::sse;
 use http_body::Frame;
+use response::{Block as OutputBlock, EventKind};
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 
@@ -58,12 +59,11 @@ enum WorldFunction {
     OpenPage,
     FindInPage,
 }
-fn world_function(item: &Value) -> Option<WorldFunction> {
-    (item["type"] == "function_call")
-        .then(|| serde_json::from_value(item["name"].clone()).ok())
-        .flatten()
+fn world_function(item: &OutputBlock) -> Option<WorldFunction> {
+    let (name, _, _) = item.function()?;
+    serde_json::from_value(json!(name)).ok()
 }
-fn is_world(item: &Value) -> bool {
+fn is_world(item: &OutputBlock) -> bool {
     world_function(item).is_some()
 }
 /// Turns the client's `web_search_call` items back into the function call
@@ -104,7 +104,7 @@ struct Output {
     tx: Option<mpsc::Sender<fictionet::Result<Frame<Bytes>>>>,
     sequence: u64,
     response: Value,
-    items: Vec<Value>,
+    items: Vec<OutputBlock>,
     tools: Value,
     tool_choice: Value,
 }
@@ -257,14 +257,13 @@ async fn read(
         if first {
             output.response = output.shown(response.clone());
         }
-        let items = response["output"]
-            .as_array()
-            .ok_or_else(|| Error::msg("Invalid response output"))?;
+        let items: Vec<OutputBlock> = serde_json::from_value(response["output"].clone())
+            .map_err(|_| Error::msg("Invalid response output"))?;
         for (index, item) in items.iter().enumerate() {
             if is_world(item) {
                 let visible = started(model);
                 calls.insert(index, visible["id"].as_str().unwrap().to_owned());
-                output.items.push(visible);
+                output.items.push(serde_json::from_value(visible)?);
             } else {
                 output.items.push(item.clone());
             }
@@ -294,30 +293,34 @@ async fn read(
             if event.get("output_index").is_some() {
                 event["output_index"] = json!(offset + index);
             }
-            match event["type"].as_str().unwrap_or("") {
+            match EventKind::read(&event) {
                 // The client sees one response: the first turn's start events.
-                "response.created" | "response.in_progress" => {
+                EventKind::ResponseCreated | EventKind::ResponseInProgress => {
                     if !first {
                         continue;
                     }
                     output.response = output.shown(event["response"].clone());
                     event["response"] = output.response.clone();
                 }
-                "response.completed" | "response.incomplete" | "response.failed" => {
+                EventKind::ResponseCompleted
+                | EventKind::ResponseIncomplete
+                | EventKind::ResponseFailed => {
                     return Ok(Turn {
                         response: event["response"].clone(),
                         calls,
                     });
                 }
-                "response.output_item.added" => {
+                EventKind::ItemAdded => {
                     if offset + index != output.items.len() {
                         return Err(Error::msg("Invalid response item index"));
                     }
-                    if is_world(&event["item"]) {
+                    if is_world(&serde_json::from_value(event["item"].clone())?) {
                         let visible = started(model);
                         let id = visible["id"].as_str().unwrap().to_owned();
                         event["item"] = visible;
-                        output.items.push(event["item"].clone());
+                        output
+                            .items
+                            .push(serde_json::from_value(event["item"].clone())?);
                         output.emit(event).await?;
                         output
                             .emit(json!({"type":"response.web_search_call.in_progress","item_id":id,"output_index":offset+index}))
@@ -325,15 +328,16 @@ async fn read(
                         calls.insert(index, id);
                         continue;
                     }
-                    output.items.push(event["item"].clone());
+                    output
+                        .items
+                        .push(serde_json::from_value(event["item"].clone())?);
                 }
-                "response.function_call_arguments.delta"
-                | "response.function_call_arguments.done"
+                EventKind::ArgumentsDelta | EventKind::ArgumentsDone
                     if calls.contains_key(&index) =>
                 {
                     continue;
                 }
-                "response.output_item.done" => {
+                EventKind::ItemDone => {
                     if let Some(id) = calls.get(&index) {
                         output
                             .emit(json!({"type":"response.web_search_call.searching","item_id":id,"output_index":offset+index}))
@@ -344,9 +348,9 @@ async fn read(
                         .items
                         .get_mut(offset + index)
                         .ok_or_else(|| Error::msg("Invalid response item"))?;
-                    *item = event["item"].clone();
+                    *item = serde_json::from_value(event["item"].clone())?;
                 }
-                "error" => {
+                EventKind::Error => {
                     output.emit(event).await?;
                     return Err(Error::msg("Model response reported an error"));
                 }
@@ -365,10 +369,14 @@ async fn answer(
     engine: &Arc<dyn Engine>,
     settings: &request::WebSettings,
     include_sources: bool,
-    call: &Value,
+    call: &OutputBlock,
 ) -> (Value, String, u64) {
-    let arguments: Value =
-        serde_json::from_str(call["arguments"].as_str().unwrap_or("{}")).unwrap_or(Value::Null);
+    let arguments = call
+        .function()
+        .map(|(_, arguments, _)| arguments)
+        .and_then(|arguments| arguments.as_str())
+        .and_then(|arguments| serde_json::from_str::<Value>(arguments).ok())
+        .unwrap_or(Value::Null);
     let error = |action: Value, code: &str| (action, json!({"error":code}).to_string(), 0);
     let domains = settings.filters.clone().unwrap_or_default();
     let Some(function) = world_function(call) else {
@@ -475,9 +483,8 @@ async fn run(
         tokens += turn.response["usage"]["output_tokens"]
             .as_u64()
             .unwrap_or(0);
-        let original = turn.response["output"]
-            .as_array()
-            .ok_or_else(|| Error::msg("Invalid response output"))?;
+        let original: Vec<OutputBlock> = serde_json::from_value(turn.response["output"].clone())
+            .map_err(|_| Error::msg("Invalid response output"))?;
         let mut results = Vec::new();
         for (index, call) in original.iter().enumerate() {
             let Some(id) = turn.calls.get(&index) else {
@@ -493,13 +500,12 @@ async fn run(
             } else {
                 answer(&model, &engine, &settings, include_sources, call).await
             };
-            let result =
-                json!({"type":"function_call_output","call_id":call["call_id"],"output":text});
+            let result = json!({"type":"function_call_output","call_id":call.function().and_then(|(_, _, id)| id),"output":text});
             let token = model
                 .cipher
                 .encrypt(&model.cx, &json!({"id":id,"call":call,"result":result}));
             let item = json!({"type":"web_search_call","id":id,"status":"completed","action":action,"encrypted_content":token});
-            output.items[offset + index] = item.clone();
+            output.items[offset + index] = serde_json::from_value(item.clone())?;
 
             output
                 .emit(json!({"type":"response.web_search_call.completed","item_id":id,"output_index":offset+index}))
@@ -509,12 +515,9 @@ async fn run(
                 .await?;
             results.push(result);
         }
-        let external = original.iter().any(|item| {
-            matches!(
-                item["type"].as_str(),
-                Some("function_call" | "custom_tool_call")
-            ) && !is_world(item)
-        });
+        let external = original
+            .iter()
+            .any(|item| item.external_function() && !is_world(item));
         if results.is_empty() || external || turn.response["status"] != "completed" {
             let mut usage = turn.response["usage"].clone();
             if !usage.is_object() {
@@ -551,8 +554,11 @@ async fn run(
             return Ok(None);
         }
         let mut input = body.input.take().unwrap_or(Content::Empty(())).into_input();
-        for item in original.iter().cloned().chain(results) {
-            input.push(serde_json::from_value(item)?);
+        for item in original {
+            input.push(item.into_content()?);
+        }
+        for result in results {
+            input.push(serde_json::from_value(result)?);
         }
         body.input = Some(Content::Blocks(input));
         body.tool_choice = Some(json!("auto"));

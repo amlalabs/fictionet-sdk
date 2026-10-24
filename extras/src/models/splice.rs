@@ -2,6 +2,7 @@ use super::*;
 use fictionet::stdlib::codec::{Stream, try_pump};
 use fictionet::stdlib::protocols::sse;
 use http_body::{Body as HttpBody, Frame};
+use response::{Block as OutputBlock, Delta, EventKind};
 use ring::aead;
 use tokio::sync::mpsc;
 
@@ -218,7 +219,7 @@ fn history(body: &mut Messages, cipher: &TokenCipher) -> fictionet::Result<()> {
 struct Output {
     sender: Option<mpsc::Sender<fictionet::Result<Frame<Bytes>>>>,
     message: Value,
-    content: Vec<Value>,
+    content: Vec<OutputBlock>,
 }
 impl Output {
     async fn event(&mut self, value: Value) -> fictionet::Result<()> {
@@ -232,7 +233,7 @@ impl Output {
         }
         Ok(())
     }
-    async fn block(&mut self, block: Value) -> fictionet::Result<()> {
+    async fn block(&mut self, block: OutputBlock) -> fictionet::Result<()> {
         let index = self.content.len();
         self.event(json!({"type":"content_block_start","index":index,"content_block":block}))
             .await?;
@@ -386,7 +387,7 @@ pub(super) async fn upstream(
 }
 
 struct Turn {
-    content: Vec<Value>,
+    content: Vec<OutputBlock>,
     ids: std::collections::HashMap<String, String>,
     usage: Value,
     stop: Value,
@@ -414,10 +415,8 @@ async fn read(
         if output.message.is_null() {
             output.message = message.clone();
         }
-        turn.content = message["content"]
-            .as_array()
-            .cloned()
-            .ok_or_else(|| Error::msg("Invalid model message"))?;
+        turn.content = serde_json::from_value(message["content"].clone())
+            .map_err(|_| Error::msg("Invalid model message"))?;
         turn.usage = message["usage"].clone();
         turn.stop = message["stop_reason"].clone();
         for block in &turn.content {
@@ -445,8 +444,8 @@ async fn read(
             let mut event: Value =
                 serde_json::from_str(&event.data).map_err(|_| Error::msg("Invalid model event"))?;
             let index = event["index"].as_u64().unwrap_or(0) as usize;
-            match event["type"].as_str().unwrap_or("") {
-                "message_start" => {
+            match EventKind::read(&event) {
+                EventKind::MessageStart => {
                     turn.usage = event["message"]["usage"].clone();
                     if output.message.is_null() {
                         output.message = event["message"].clone();
@@ -454,7 +453,7 @@ async fn read(
                     }
                     continue;
                 }
-                "message_delta" => {
+                EventKind::MessageDelta => {
                     if let Some(usage) = event["usage"].as_object() {
                         for (key, value) in usage {
                             turn.usage[key] = value.clone();
@@ -463,72 +462,54 @@ async fn read(
                     turn.stop = event["delta"]["stop_reason"].clone();
                     continue;
                 }
-                "message_stop" => return Ok(turn),
-                "content_block_start" => {
+                EventKind::MessageStop => return Ok(turn),
+                EventKind::BlockStart => {
                     if index != turn.content.len() {
                         return Err(Error::msg("Invalid model block index"));
                     }
-                    turn.content.push(event["content_block"].clone());
-                    event["content_block"] =
-                        visible(event["content_block"].clone(), model, tools, &mut turn.ids);
-                    output.content.push(event["content_block"].clone());
+                    let block: OutputBlock =
+                        serde_json::from_value(event["content_block"].clone())?;
+                    turn.content.push(block.clone());
+                    let shown = visible(block, model, tools, &mut turn.ids);
+                    event["content_block"] = serde_json::to_value(&shown)?;
+                    output.content.push(shown);
                     event["index"] = json!(offset + index);
                 }
-                "content_block_delta" => {
+                EventKind::BlockDelta => {
                     let block = turn
                         .content
                         .get_mut(index)
                         .ok_or_else(|| Error::msg("Invalid model block delta"))?;
-                    let delta = &event["delta"];
-                    match delta["type"].as_str().unwrap_or("") {
-                        "input_json_delta" => inputs
-                            .entry(index)
-                            .or_default()
-                            .push_str(delta["partial_json"].as_str().unwrap_or("")),
-                        "text_delta" | "thinking_delta" | "signature_delta" => {
-                            let field = match delta["type"].as_str().unwrap() {
-                                "text_delta" => "text",
-                                "thinking_delta" => "thinking",
-                                _ => "signature",
-                            };
-                            let text = format!(
-                                "{}{}",
-                                block[field].as_str().unwrap_or(""),
-                                delta[field].as_str().unwrap_or("")
-                            );
-                            block[field] = json!(text);
+                    let delta: Delta = serde_json::from_value(event["delta"].clone())
+                        .map_err(|_| Error::msg("Invalid model delta"))?;
+                    match delta {
+                        Delta::InputJson { partial_json } => {
+                            inputs.entry(index).or_default().push_str(&partial_json)
                         }
-                        "citations_delta" => {
-                            if !block["citations"].is_array() {
-                                block["citations"] = json!([]);
-                            }
-                            block["citations"]
-                                .as_array_mut()
-                                .unwrap()
-                                .push(delta["citation"].clone());
-                        }
-                        _ => {}
+                        delta => block.apply(delta)?,
                     }
                     event["index"] = json!(offset + index);
                 }
-                "content_block_stop" => {
+                EventKind::BlockStop => {
                     let block = turn
                         .content
                         .get_mut(index)
                         .ok_or_else(|| Error::msg("Invalid model block stop"))?;
                     if let Some(input) = inputs.remove(&index) {
-                        block["input"] = serde_json::from_str(&input)
-                            .map_err(|_| Error::msg("Invalid model tool input"))?;
+                        block.set_input(
+                            serde_json::from_str(&input)
+                                .map_err(|_| Error::msg("Invalid model tool input"))?,
+                        )?;
                     }
-                    let mut shown = block.clone();
-                    if let Some(id) = block["id"].as_str().and_then(|id| turn.ids.get(id)) {
-                        shown["id"] = json!(id);
-                        shown["type"] = json!("server_tool_use");
-                    }
+                    let shown = block
+                        .tool()
+                        .and_then(|(id, _, _)| turn.ids.get(id))
+                        .map(|id| block.show_tool(id.clone()))
+                        .unwrap_or_else(|| block.clone());
                     output.content[offset + index] = shown;
                     event["index"] = json!(offset + index);
                 }
-                "error" => return Err(Error::msg("Model stream reported an error")),
+                EventKind::Error => return Err(Error::msg("Model stream reported an error")),
                 _ => {}
             }
             output.event(event).await?;
@@ -537,24 +518,21 @@ async fn read(
     Err(Error::msg("Model stream ended before message_stop"))
 }
 fn visible(
-    mut block: Value,
+    block: OutputBlock,
     model: &Model,
     tools: &Tools,
     ids: &mut std::collections::HashMap<String, String>,
-) -> Value {
-    if block["type"] == "tool_use"
-        && block["name"]
-            .as_str()
-            .is_some_and(|name| tools.contains_key(name))
+) -> OutputBlock {
+    if let Some((original, _, _)) = block
+        .tool()
+        .filter(|(_, name, _)| tools.contains_key(*name))
     {
-        let original = block["id"].as_str().unwrap_or("").to_owned();
         let id = format!(
             "srvtoolu_{}",
             model.cipher.encrypt(&model.cx, &json!({"id":original}))
         );
-        ids.insert(original, id.clone());
-        block["type"] = json!("server_tool_use");
-        block["id"] = json!(id);
+        ids.insert(original.into(), id.clone());
+        return block.show_tool(id);
     }
     block
 }
@@ -575,10 +553,12 @@ async fn run(
         output_tokens += turn.usage["output_tokens"].as_u64().unwrap_or(0);
         let mut results = Vec::new();
         for block in &turn.content {
-            let Some(id) = block["id"].as_str().and_then(|id| turn.ids.get(id)) else {
+            let Some((original, name, _)) = block.tool() else {
                 continue;
             };
-            let name = block["name"].as_str().unwrap();
+            let Some(id) = turn.ids.get(original) else {
+                continue;
+            };
             let (kind, settings) = &tools[name];
             let count = uses.entry(name.into()).or_default();
             *count += 1;
@@ -596,12 +576,14 @@ async fn run(
                 searches += 1;
             }
 
-            output.block(json!({"type":format!("{}_tool_result", kind.name()),"tool_use_id":id,"content":content})).await?;
-            results.push(json!({"type":"tool_result","tool_use_id":block["id"],"content":text}));
+            output.block(serde_json::from_value(json!({"type":format!("{}_tool_result", kind.name()),"tool_use_id":id,"content":content}))?).await?;
+            results.push(json!({"type":"tool_result","tool_use_id":original,"content":text}));
         }
-        let external = turn.content.iter().any(|b| {
-            b["type"] == "tool_use" && !turn.ids.contains_key(b["id"].as_str().unwrap_or(""))
-        });
+        let external = turn
+            .content
+            .iter()
+            .filter_map(OutputBlock::tool)
+            .any(|(id, _, _)| !turn.ids.contains_key(id));
         if results.is_empty() || external {
             let mut usage = turn.usage;
             usage["output_tokens"] = json!(output_tokens);
@@ -633,7 +615,7 @@ async fn answer(
     model: &Model,
     engine: Arc<dyn Engine>,
     body: &Messages,
-    block: &Value,
+    block: &OutputBlock,
     kind: WebTool,
     settings: &WebSettings,
     used: u64,
@@ -644,12 +626,15 @@ async fn answer(
             json!({"error":code}).to_string(),
         )
     };
+    let Some((id, _, input)) = block.tool() else {
+        return error("invalid_input");
+    };
     if used > settings.max_uses.unwrap_or(8) {
         return error("max_uses_exceeded");
     }
     let domains = settings.domains();
     if kind == WebTool::Search {
-        let Some(query) = block["input"]["query"].as_str() else {
+        let Some(query) = input["query"].as_str() else {
             return error("invalid_input");
         };
         let Ok(results) = engine
@@ -664,16 +649,15 @@ async fn answer(
             .collect();
         let text = serde_json::to_string(&results).unwrap();
         let mut content: Vec<Value> = results.iter().map(|r| json!({"type":"web_search_result","url":r.url,"title":r.title,"page_age":r.date})).collect();
-        let token = model.cipher.encrypt(
-            &model.cx,
-            &json!({"id":block["id"],"text":text,"visible":content}),
-        );
+        let token = model
+            .cipher
+            .encrypt(&model.cx, &json!({"id":id,"text":text,"visible":content}));
         for entry in &mut content {
             entry["encrypted_content"] = json!(token);
         }
         (json!(content), text)
     } else {
-        let Some(url) = block["input"]["url"].as_str() else {
+        let Some(url) = input["url"].as_str() else {
             return error("invalid_input");
         };
         if !serde_json::to_string(&body.messages).unwrap().contains(url) {
@@ -744,18 +728,20 @@ mod tests {
             let model = Model::at(&cx, Provider::Anthropic, credential, "http://127.0.0.1:1".parse()?)?;
             let engine: Arc<dyn Engine> = Arc::new(Pages);
             let block = json!({"type":"tool_use","id":"toolu_fetch","name":"web_fetch","input":{"url":"https://example.com/page"}});
+            let native: OutputBlock = serde_json::from_value(block.clone())?;
             let body: Messages = serde_json::from_value(json!({"messages":[{"role":"user","content":"Read https://example.com/page"}]}))?;
             let settings: WebSettings = serde_json::from_value(json!({"max_uses":1,"max_content_tokens":1}))?;
-            let (content, text) = answer(&model, engine.clone(), &body, &block, WebTool::Fetch, &settings, 1).await;
+            let (content, text) = answer(&model, engine.clone(), &body, &native, WebTool::Fetch, &settings, 1).await;
             assert_eq!(text, "Visi");
             assert_eq!(content["content"]["source"]["data"], "Visi");
-            let (error, _) = answer(&model, engine.clone(), &serde_json::from_value(json!({"messages":[]}))?, &block, WebTool::Fetch, &settings, 1).await;
+            let (error, _) = answer(&model, engine.clone(), &serde_json::from_value(json!({"messages":[]}))?, &native, WebTool::Fetch, &settings, 1).await;
             assert_eq!(error["error_code"], "url_not_in_prior_context");
-            let (error, _) = answer(&model, engine.clone(), &body, &block, WebTool::Fetch, &settings, 2).await;
+            let (error, _) = answer(&model, engine.clone(), &body, &native, WebTool::Fetch, &settings, 2).await;
             assert_eq!(error["error_code"], "max_uses_exceeded");
-            let (error, _) = answer(&model, engine, &body, &block, WebTool::Fetch, &serde_json::from_value(json!({"blocked_domains":["example.com"]}))?, 1).await;
+            let (error, _) = answer(&model, engine, &body, &native, WebTool::Fetch, &serde_json::from_value(json!({"blocked_domains":["example.com"]}))?, 1).await;
             assert_eq!(error["error_code"], "url_not_accessible");
-            let shown = visible(block.clone(), &model, &std::collections::HashMap::from([("web_fetch".into(), (WebTool::Fetch, settings))]), &mut Default::default());
+            let shown = visible(native.clone(), &model, &std::collections::HashMap::from([("web_fetch".into(), (WebTool::Fetch, settings))]), &mut Default::default());
+            let shown = serde_json::to_value(shown)?;
             let mut replay = body.clone();
             replay.messages.as_mut().unwrap().push(serde_json::from_value(json!({"role":"assistant","content":[shown.clone(),{"type":"web_fetch_tool_result","tool_use_id":shown["id"],"content":content},{"type":"text","text":"Done"}]}))?);
             history(&mut replay, &model.cipher)?;

@@ -34,7 +34,7 @@ mod client;
 pub use calls::{Call, CallObserver, CallPhase};
 mod request;
 mod transport;
-pub use client::{Authenticated, Https, Incoming, Key, Post, Transport};
+pub use client::{Authenticated, DocumentType, Https, Incoming, Key, Post, Transport};
 pub use transport::{UpstreamEvent, UpstreamObserver, UpstreamPhase};
 pub mod oauth;
 mod response;
