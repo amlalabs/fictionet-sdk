@@ -286,7 +286,7 @@ impl Backend {
                         }
                     }
                     Ok(n) => {
-                        if bytes.len() + n > 64 * 1024 * 1024 {
+                        if bytes.len() + n > PACKAGE_BYTES {
                             return Err(std::io::Error::other("Git response exceeds size limit"));
                         }
                         bytes.extend_from_slice(&chunk[..n]);

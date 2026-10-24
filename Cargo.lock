@@ -1277,6 +1277,7 @@ dependencies = [
  "fictionet-host",
  "fictionet-test-support",
  "flate2",
+ "html5ever",
  "http",
  "http-body",
  "http-body-util",

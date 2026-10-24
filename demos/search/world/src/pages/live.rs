@@ -21,7 +21,7 @@ const CAPTURE_BYTES: usize = 128 * 1024 * 1024;
 
 struct Lifetime {
     stop: watch::Sender<bool>,
-    hosts: tokio::sync::Mutex<HashMap<String, tokio::time::Instant>>,
+    hosts: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<tokio::time::Instant>>>>,
 }
 impl Default for Lifetime {
     fn default() -> Self {
@@ -193,25 +193,39 @@ impl Live {
                 return;
             }
             if let Ok((response, downloaded)) = result {
-                let mut state = self.state();
-                if !Arc::ptr_eq(&lifetime, &state.lifetime) {
-                    return;
-                }
-                if downloaded && state.bytes + response.body.len() > CAPTURE_BYTES {
-                    for done in state.reached.values() {
-                        done.send_replace(true);
+                let saved = {
+                    let mut state = self.state();
+                    if !Arc::ptr_eq(&lifetime, &state.lifetime) {
+                        return;
                     }
-                    state.queue.clear();
-                    state.running = false;
-                    return;
-                }
-                let path = self.archive_path(state.epoch);
-                let saved = !downloaded || state.archive.append(&path, &job.url, &response).is_ok();
-                if saved && downloaded {
-                    state.bytes += response.body.len();
-                }
-                drop(state);
-                if saved && let Ok(links) = capture::links(&job.url, &response) {
+                    if downloaded && state.bytes + response.body.len() > CAPTURE_BYTES {
+                        for done in state.reached.values() {
+                            done.send_replace(true);
+                        }
+                        state.queue.clear();
+                        state.running = false;
+                        return;
+                    }
+                    let path = self.archive_path(state.epoch);
+                    let saved =
+                        !downloaded || state.archive.append(&path, &job.url, &response).is_ok();
+                    if saved && downloaded {
+                        state.bytes += response.body.len();
+                    }
+                    saved
+                };
+                let status = response.status;
+                let url = job.url.clone();
+                let links = if saved {
+                    self.fetcher
+                        .process(&job.cx, &lifetime, move || {
+                            capture::links(&url, &response).map_err(|error| error.to_string())
+                        })
+                        .await
+                } else {
+                    Err("Live capture could not be saved".into())
+                };
+                if let Ok(links) = links {
                     // Dependencies get priority over the next navigation page.
                     for url in links.assets.into_iter().rev() {
                         self.enqueue_in(
@@ -225,7 +239,7 @@ impl Live {
                             true,
                         );
                     }
-                    if response.status.is_redirection() && job.redirects < 10 {
+                    if status.is_redirection() && job.redirects < 10 {
                         for url in links.pages {
                             self.enqueue_in(
                                 &lifetime,
@@ -337,10 +351,18 @@ impl Live {
         if !response.status.is_success() {
             return Err(format!("Exa search API returned {}", response.status));
         }
-        let value: Value =
-            serde_json::from_slice(&response.decoded().map_err(|_| "Invalid Exa encoding")?)
-                .map_err(|_| "Invalid Exa search response")?;
-        let mut search = parse_search(&value, Some(&self.key))?;
+        let key = self.key.clone();
+        let mut search = self
+            .fetcher
+            .process(cx, lifetime, move || {
+                let decoded = response
+                    .decoded_with_limit(capture::PARSE_BYTES)
+                    .map_err(|_| "Exa response exceeds parsing limit or has invalid encoding")?;
+                let value: Value =
+                    serde_json::from_slice(&decoded).map_err(|_| "Invalid Exa search response")?;
+                parse_search(&value, Some(&key))
+            })
+            .await?;
         search.results = search
             .results
             .into_iter()

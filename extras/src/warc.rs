@@ -38,27 +38,36 @@ pub struct Response {
 }
 
 impl Response {
-    /// Decode representation compression for text consumers; replay keeps the stored bytes.
+    /// Maximum decoded representation retained for replay or text consumers.
+    pub const DECODED_BYTES: usize = 32 * 1024 * 1024;
+
+    /// Decode representation compression with a bounded output allocation.
     pub fn decoded(&self) -> io::Result<Vec<u8>> {
-        let mut bytes = Vec::new();
-        match self
+        self.decoded_with_limit(Self::DECODED_BYTES)
+    }
+
+    /// Decode at most `limit` bytes, rejecting larger representations rather than
+    /// returning a truncated document to a parser.
+    pub fn decoded_with_limit(&self, limit: usize) -> io::Result<Vec<u8>> {
+        let reader: Box<dyn Read + '_> = match self
             .headers
             .get(http::header::CONTENT_ENCODING)
             .and_then(|v| v.to_str().ok())
         {
-            None | Some("identity") => return Ok(self.body.to_vec()),
-            Some("gzip") => {
-                flate2::read::GzDecoder::new(self.body.as_ref()).read_to_end(&mut bytes)?;
-            }
-            Some("deflate") => {
-                flate2::read::ZlibDecoder::new(self.body.as_ref()).read_to_end(&mut bytes)?;
-            }
-            Some("br") => {
-                brotli::Decompressor::new(self.body.as_ref(), 4096).read_to_end(&mut bytes)?;
-            }
+            None | Some("identity") => Box::new(self.body.as_ref()),
+            Some("gzip") => Box::new(flate2::read::GzDecoder::new(self.body.as_ref())),
+            Some("deflate") => Box::new(flate2::read::ZlibDecoder::new(self.body.as_ref())),
+            Some("br") => Box::new(brotli::Decompressor::new(self.body.as_ref(), 4096)),
             Some(encoding) => {
                 return Err(invalid(format!("unsupported content encoding {encoding}")));
             }
+        };
+        let mut bytes = Vec::new();
+        reader
+            .take(limit.saturating_add(1) as u64)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > limit {
+            return Err(invalid("decoded response exceeds size limit"));
         }
         Ok(bytes)
     }
@@ -444,5 +453,47 @@ mod tests {
     fn rejects_truncated_records() {
         assert!(parse(b"WARC/1.0\r\nContent-Length: 9\r\n\r\nx").is_err());
         assert!(http_response(b"HTTP/1.1 200").is_err());
+    }
+}
+
+#[cfg(test)]
+mod decoding_tests {
+    use super::*;
+
+    #[test]
+    fn every_content_encoding_enforces_the_decoded_limit() {
+        let plain = vec![b'x'; 1025];
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gzip.write_all(&plain).unwrap();
+        let mut deflate =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        deflate.write_all(&plain).unwrap();
+        let mut br = brotli::CompressorWriter::new(Vec::new(), 4096, 4, 22);
+        br.write_all(&plain).unwrap();
+        for (encoding, body) in [
+            ("identity", plain.clone()),
+            ("gzip", gzip.finish().unwrap()),
+            ("deflate", deflate.finish().unwrap()),
+            ("br", br.into_inner()),
+        ] {
+            let response = Response {
+                status: StatusCode::OK,
+                headers: HeaderMap::from_iter([(
+                    http::header::CONTENT_ENCODING,
+                    encoding.parse().unwrap(),
+                )]),
+                body: body.into(),
+            };
+            assert_eq!(
+                response.decoded_with_limit(plain.len()).unwrap(),
+                plain,
+                "{encoding}"
+            );
+            assert_eq!(
+                response.decoded_with_limit(1024).unwrap_err().kind(),
+                io::ErrorKind::InvalidData,
+                "{encoding}"
+            );
+        }
     }
 }

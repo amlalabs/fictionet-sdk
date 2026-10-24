@@ -27,6 +27,7 @@ brotli = "8"
 fictionet-host = { path = "../host" }
 flate2 = "1"
 httparse = "1"
+html5ever = "0.25"
 http-body = "1"
 http-body-util = "0.1"
 include_dir = "0.7"

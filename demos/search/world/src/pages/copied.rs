@@ -6,6 +6,9 @@ use super::*;
 use fictionet_extras::{crawl::Index, warc::Archive};
 use std::{path::Path, time::Instant};
 
+// Captured distributions and repository packs can exceed a public web response.
+const PACKAGE_BYTES: usize = 256 * 1024 * 1024;
+
 pub(super) struct Corpus {
     archive: Archive,
     missing: Archive,
@@ -128,7 +131,7 @@ impl Pages {
                     .map(|mut response| {
                         // Installers hash the distribution's identity bytes. Their
                         // requests need not accept the capture's content encoding.
-                        response.body = response.decoded()?.into();
+                        response.body = response.decoded_with_limit(PACKAGE_BYTES)?.into();
                         response.headers.remove(http::header::CONTENT_ENCODING);
                         response
                             .headers
@@ -296,14 +299,7 @@ pub(super) fn replay(
                         .to_owned(),
                 }
             } else if content_type.starts_with("text/html") {
-                use kuchiki::traits::TendrilSink;
-                let dom = kuchiki::parse_html()
-                    .one(String::from_utf8_lossy(&page.decoded().unwrap_or_default()).into_owned());
-                let title = dom
-                    .select_first("title")
-                    .ok()
-                    .map(|n| n.text_contents())
-                    .unwrap_or_default();
+                let title = fictionet_extras::capture::title(&page).unwrap_or_default();
                 Meta::Fixed { title }
             } else {
                 Meta::Asset

@@ -16,6 +16,7 @@ impl Drop for Runtime {
 pub(super) struct Transport {
     runtime: Runtime,
     loopback: bool,
+    processing: Arc<tokio::sync::Semaphore>,
 }
 impl Transport {
     pub(super) fn new() -> Result<Self, String> {
@@ -35,10 +36,46 @@ impl Transport {
                     .map_err(|_| "Live transport could not start")?,
             )),
             loopback,
+            processing: Arc::new(tokio::sync::Semaphore::new(1)),
         })
     }
     pub(super) fn spawn(&self, work: impl std::future::Future<Output = ()> + Send + 'static) {
         self.runtime.0.as_ref().unwrap().spawn(work);
+    }
+    // CPU work owns a permit until it finishes even if its caller is cancelled.
+    // Bounded input and one worker keep revoked sessions from accumulating parsers.
+    pub(super) async fn process<T: Send + 'static>(
+        &self,
+        cx: &Cx,
+        lifetime: &Lifetime,
+        work: impl FnOnce() -> Result<T, String> + Send + 'static,
+    ) -> Result<T, String> {
+        let mut stopped = lifetime.stop.subscribe();
+        if *stopped.borrow() || cx.is_cancelled() {
+            return Err("Live session stopped".into());
+        }
+        let task = async {
+            let permit = self
+                .processing
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| "Live processing stopped")?;
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                work()
+            })
+            .await
+            .map_err(|_| "Live processing worker stopped")?
+        };
+        tokio::select! {
+            biased;
+            _ = stopped.changed() => Err("Live session stopped".into()),
+            _ = cx.cancelled() => Err("Live run stopped".into()),
+            result = tokio::time::timeout(Duration::from_secs(10), task) => {
+                result.map_err(|_| "Live processing timed out")?
+            }
+        }
     }
     fn permits(&self, ip: IpAddr) -> bool {
         if self.loopback {
@@ -134,22 +171,24 @@ impl Transport {
             }
             let host = url.host_str().ok_or("Missing Live host")?;
             let port = url.port_or_known_default().ok_or("Missing Live port")?;
-            let addresses: Vec<_> = tokio::net::lookup_host((host, port))
+            let addresses: Vec<_> = tokio::net::lookup_host((host.trim_matches(['[', ']']), port))
                 .await
                 .map_err(|_| "Live DNS lookup failed")?
                 .collect();
             if addresses.is_empty() || addresses.iter().any(|address| !self.permits(address.ip())) {
                 return Err("Live destination is outside the capture network".into());
             }
-            let now = tokio::time::Instant::now();
-            let next = {
+            let host_time = {
                 let mut hosts = lifetime.hosts.lock().await;
-                let next = hosts.entry(host.to_owned()).or_insert(now);
-                let reserved = (*next).max(now);
-                *next = reserved + Duration::from_millis(if search.is_some() { 250 } else { 500 });
-                reserved
+                hosts
+                    .entry(host.to_owned())
+                    .or_insert_with(|| {
+                        Arc::new(tokio::sync::Mutex::new(tokio::time::Instant::now()))
+                    })
+                    .clone()
             };
-            tokio::time::sleep_until(next).await;
+            let mut next = host_time.lock().await;
+            tokio::time::sleep_until(*next).await;
             let client = reqwest::Client::builder()
                 .user_agent(capture::BROWSER)
                 .no_proxy()
@@ -166,13 +205,24 @@ impl Transport {
             } else {
                 client.get(url).header("accept-encoding", "identity")
             };
-            let mut response = request.send().await.map_err(|_| "Live request failed")?;
+            let response = request.send().await;
+            *next = tokio::time::Instant::now()
+                + Duration::from_millis(if search.is_some() { 250 } else { 500 });
+            drop(next);
+            let mut response = response.map_err(|_| "Live request failed")?;
             if let Some(attempt) = &mut attempt {
                 attempt.event.phase = UpstreamPhase::Response;
                 attempt.event.status = Some(response.status());
             }
             let status = response.status();
             let headers = response.headers().clone();
+            let parse = search.is_some()
+                || headers
+                    .get(http::header::CONTENT_TYPE)
+                    .is_some_and(|value| {
+                        value.as_bytes().starts_with(b"text/html")
+                            || value.as_bytes().starts_with(b"text/css")
+                    });
             let mut body = Vec::new();
             while let Some(chunk) = response.chunk().await.map_err(|_| "Live response failed")? {
                 if body.len() + chunk.len() > 32 * 1024 * 1024 {
@@ -180,11 +230,29 @@ impl Transport {
                 }
                 body.extend_from_slice(&chunk);
             }
-            Ok(warc::Response {
-                status,
-                headers,
-                body: body.into(),
+            self.process(cx, lifetime, move || {
+                let mut response = warc::Response {
+                    status,
+                    headers,
+                    body: body.into(),
+                };
+                // Archive a decoded representation once. Replay and previews cannot
+                // expand a compressed body again or bypass the retained-byte budget.
+                response.body = response
+                    .decoded_with_limit(if parse {
+                        capture::PARSE_BYTES
+                    } else {
+                        warc::Response::DECODED_BYTES
+                    })
+                    .map_err(|error| error.to_string())?
+                    .into();
+                response.headers.remove(http::header::CONTENT_ENCODING);
+                response
+                    .headers
+                    .insert(http::header::CONTENT_LENGTH, response.body.len().into());
+                Ok(response)
             })
+            .await
         };
         let mut stopped = lifetime.stop.subscribe();
         if *stopped.borrow() {
@@ -204,3 +272,6 @@ impl Transport {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
