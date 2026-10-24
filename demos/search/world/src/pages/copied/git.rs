@@ -1,0 +1,266 @@
+//! Read-only smart HTTP over captured bare repositories.
+
+use super::*;
+use std::{
+    io::Write,
+    path::PathBuf,
+    process::{Command, Stdio},
+};
+
+impl Pages {
+    pub(crate) async fn git_request(
+        &self,
+        cx: &Cx,
+        host: &str,
+        request: &http::request::Parts,
+        body: &[u8],
+    ) -> Option<Response> {
+        if host != "github.com" {
+            return None;
+        }
+        let path = request.uri.path();
+        let mut segments = path.strip_prefix('/')?.split('/');
+        let owner = segments.next()?;
+        let name = segments.next()?;
+        let endpoint = segments.collect::<Vec<_>>().join("/");
+        if !matches!(
+            endpoint.as_str(),
+            "info/refs" | "git-upload-pack" | "git-receive-pack"
+        ) {
+            return None;
+        }
+        let name = name.strip_suffix(".git").unwrap_or(name);
+        for component in [owner, name] {
+            if component.is_empty()
+                || matches!(component, "." | "..")
+                || !component
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))
+            {
+                return None;
+            }
+        }
+        let packages = self.copied.as_ref()?.packages.as_ref()?;
+        let root = &packages.git;
+        let repository = root.join(owner).join(format!("{name}.git"));
+        if !repository.is_dir() {
+            return None;
+        }
+        // No CGI input may choose another repository or a file outside the capture.
+        let repository = std::fs::canonicalize(repository).ok()?;
+        if !repository.starts_with(std::fs::canonicalize(root).ok()?) {
+            return None;
+        }
+        let mut backend_request = http::Request::new(body.to_vec());
+        *backend_request.method_mut() = request.method.clone();
+        *backend_request.uri_mut() = request.uri.clone();
+        *backend_request.headers_mut() = request.headers.clone();
+        let (send, receive) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let _ = send.send(backend(repository.join(endpoint), backend_request));
+        });
+        let response = cx
+            .race(Some(cx.now() + std::time::Duration::from_secs(30)), receive)
+            .await;
+        Some(match response {
+            Ok(Ok(Ok(response))) => replay(Ok(Some(response))),
+            _ => Response::new(
+                502,
+                "text/plain; charset=utf-8",
+                "Bad Gateway",
+                vec![],
+                Meta::Missing,
+            ),
+        })
+    }
+}
+
+fn backend(
+    path: PathBuf,
+    request: http::Request<Vec<u8>>,
+) -> std::io::Result<fictionet_extras::warc::Response> {
+    let (request, body) = request.into_parts();
+    let mut command = Command::new("git");
+    command
+        .env_clear()
+        .args([
+            "-c",
+            "http.receivepack=false",
+            "-c",
+            "http.getanyfile=false",
+            "-c",
+            "http.uploadarchive=false",
+            "http-backend",
+        ])
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_HTTP_EXPORT_ALL", "1")
+        .env("REQUEST_METHOD", request.method.as_str())
+        .env("PATH_TRANSLATED", path)
+        .env("QUERY_STRING", request.uri.query().unwrap_or_default())
+        .env("CONTENT_LENGTH", body.len().to_string())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    for (header, variable) in [
+        ("git-protocol", "GIT_PROTOCOL"),
+        ("content-type", "CONTENT_TYPE"),
+        ("content-encoding", "HTTP_CONTENT_ENCODING"),
+    ] {
+        if let Some(value) = request
+            .headers
+            .get(header)
+            .and_then(|value| value.to_str().ok())
+        {
+            command.env(variable, value);
+        }
+    }
+    let mut child = command.spawn()?;
+    let mut input = child.stdin.take().expect("piped backend input");
+    // Drain stdout while supplying input: upload-pack can answer before consuming
+    // the whole negotiation, so a serial write followed by read can deadlock.
+    let writer = std::thread::spawn(move || input.write_all(&body));
+    let output = child.wait_with_output()?;
+    writer
+        .join()
+        .map_err(|_| std::io::Error::other("backend input stopped"))??;
+    if !output.status.success() {
+        return Err(std::io::Error::other("Git backend failed"));
+    }
+    let end = output
+        .stdout
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or_else(|| std::io::Error::other("missing CGI headers"))?;
+    let head = std::str::from_utf8(&output.stdout[..end]).map_err(std::io::Error::other)?;
+    let mut status = http::StatusCode::OK;
+    let mut headers = http::HeaderMap::new();
+    for line in head.lines() {
+        let (name, value) = line
+            .split_once(':')
+            .ok_or_else(|| std::io::Error::other("invalid CGI header"))?;
+        if name.eq_ignore_ascii_case("status") {
+            status = value
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .parse()
+                .map_err(std::io::Error::other)?;
+        } else {
+            headers.append(
+                name.parse::<http::HeaderName>()
+                    .map_err(std::io::Error::other)?,
+                value.trim().parse().map_err(std::io::Error::other)?,
+            );
+        }
+    }
+    let body = bytes::Bytes::copy_from_slice(&output.stdout[end + 4..]);
+    headers.insert(http::header::CONTENT_LENGTH, body.len().into());
+    Ok(fictionet_extras::warc::Response {
+        status,
+        headers,
+        body,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backend_advertises_captured_refs_and_refuses_writes() {
+        let root = std::env::temp_dir().join(format!(
+            "search-git-{}-{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .current_dir(&root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output.stdout
+        };
+        git(&["init", "--bare"]);
+        let tree = String::from_utf8(git(&["mktree"])).unwrap();
+        let commit = String::from_utf8(git(&[
+            "-c",
+            "user.name=Researcher",
+            "-c",
+            "user.email=researcher@users.noreply.github.com",
+            "commit-tree",
+            tree.trim(),
+            "-m",
+            "Initial content",
+        ]))
+        .unwrap();
+        git(&["update-ref", "refs/heads/main", commit.trim()]);
+        git(&["symbolic-ref", "HEAD", "refs/heads/main"]);
+        let advertisement = backend(
+            root.join("info/refs"),
+            http::Request::get("/info/refs?service=git-upload-pack")
+                .body(Vec::new())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(advertisement.status, 200);
+        assert_eq!(
+            advertisement.headers[http::header::CONTENT_TYPE],
+            "application/x-git-upload-pack-advertisement"
+        );
+        assert!(
+            advertisement
+                .body
+                .starts_with(b"001e# service=git-upload-pack\n")
+        );
+        assert!(String::from_utf8_lossy(&advertisement.body).contains(commit.trim()));
+        let mut compressed =
+            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        write!(compressed, "0032want {}\n00000009done\n", commit.trim()).unwrap();
+        let fetch = backend(
+            root.join("git-upload-pack"),
+            http::Request::post("/git-upload-pack")
+                .header(
+                    http::header::CONTENT_TYPE,
+                    "application/x-git-upload-pack-request",
+                )
+                .header(http::header::CONTENT_ENCODING, "gzip")
+                .body(compressed.finish().unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(fetch.status, 200);
+        assert!(fetch.body.windows(4).any(|bytes| bytes == b"PACK"));
+        let push = backend(
+            root.join("info/refs"),
+            http::Request::get("/info/refs?service=git-receive-pack")
+                .body(Vec::new())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(push.status, 403);
+        let push = backend(
+            root.join("git-receive-pack"),
+            http::Request::post("/git-receive-pack")
+                .header(
+                    http::header::CONTENT_TYPE,
+                    "application/x-git-receive-pack-request",
+                )
+                .body(Vec::new())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(push.status, 403);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
