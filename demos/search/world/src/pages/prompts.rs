@@ -671,6 +671,12 @@ pub fn page(seed: &Seed, ask: &PageAsk) -> (String, String) {
                 DATE is the document's own publication or update date; the dates of the events it describes stay as they are.\n",
                 original.text
             ),
+            Reading::Indexed if expected_type(url).is_some() => format!(
+                "\nA search index's text of the real document at this address:\n{}\n\nThis address serves the document itself: write all of it, \
+                at its full length, with its own title, authors or issuing organization, dates, sections, names, numbers and wording. \
+                The length guidance in these instructions does not apply to it. The document says nothing about this text or any index.\n",
+                original.text
+            ),
             Reading::Indexed => format!(
                 "\nA search index's notes on the real document this address shows (not the page itself):\n{}\n\nWrite the page this address really serves, in the site's own form and length \
                 (a record page shows the citation, the authors with their real affiliations, the abstract and links). \
@@ -702,7 +708,7 @@ pub fn page(seed: &Seed, ask: &PageAsk) -> (String, String) {
     let expected = expected_type(url)
         .map(|expected| {
             if expected == "application/pdf" {
-                "This address serves a full PDF document. Write its complete text in BODY as semantic HTML for the typesetter, with its actual title, original authors in order, abstract, numbered sections and bibliography. CONTENT_TYPE is text/html here; the server will typeset the document and serve application/pdf. Preserve all bibliographic identities established by incoming citations. Do not emit PDF syntax, base64, a download page or a paper summary. Do not include website navigation or a stylesheet.".to_owned()
+                "This address serves a full PDF document. Write its complete text in BODY as semantic HTML for the typesetter: its actual title, its authors in order or the organization that issued it, its date, and every section the document really has, at its full length. A paper has an abstract, numbered sections and references; a report, advisory, filing or manual keeps its own structure and headings. CONTENT_TYPE is text/html here; the server will typeset the document and serve application/pdf. Preserve all bibliographic identities established by incoming citations. Do not emit PDF syntax, base64, a download page or a paper summary. Do not include website navigation or a stylesheet.".to_owned()
             } else {
                 format!("It is not an HTML page: CONTENT_TYPE is {expected} and BODY is the raw file. A real project, package or thing this URL asks about exists here: answer it, not 404.")
             }
