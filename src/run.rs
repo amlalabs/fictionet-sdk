@@ -653,6 +653,39 @@ mod tests {
         assert_eq!(out, Ok(()));
     }
 
+    /// A task that waits on `Cx::idle` until another task's timer has done
+    /// its work is waiting too. Once it has seen the run idle, the lab must
+    /// jump its clock, or the timer never comes and the lab spins forever.
+    #[test]
+    fn a_lab_jumps_its_clock_while_a_task_waits_on_idle_in_a_loop() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let out = block_on(lab(Seed::from_u64(0), |fcx| async move {
+                let fired = Arc::new(AtomicBool::new(false));
+                let set = fired.clone();
+                fcx.spawn(move |fcx| async move {
+                    fcx.sleep(ms(10)).await?;
+                    set.store(true, Ordering::SeqCst);
+                    Ok(())
+                });
+                while !fired.load(Ordering::SeqCst) {
+                    fcx.idle().await?;
+                }
+                assert_eq!(fcx.now().since_start(), ms(10));
+                Ok(())
+            }));
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "the receiver is gone only once recv_timeout below has failed the test"
+            )]
+            let _ = tx.send(out.map_err(|e| e.to_string()));
+        });
+        let out = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the lab never jumped its clock while a task waited on idle");
+        assert_eq!(out, Ok(()));
+    }
+
     /// `Cx::region` awaited outside the run is a wait on a `Cx` clone:
     /// once the run is dropped it must end with `Cancelled`, even though
     /// the work it spawned was dropped with the run instead of ending.

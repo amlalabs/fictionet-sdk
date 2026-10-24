@@ -176,4 +176,96 @@ mod tests {
         }))
         .unwrap();
     }
+
+    /// A timer polled outside the run, as by a harness thread that keeps a
+    /// clone of the world's `Cx`, reads the clock and then registers its
+    /// deadline. If the lab jumps past that deadline in between, the timer
+    /// is due at once. The lab must not move its clock back to the late
+    /// deadline: world code that measured a later time would see time run
+    /// backwards.
+    #[test]
+    fn a_lab_clock_never_moves_back_for_a_deadline_set_from_another_thread() {
+        use fictionet::sync::Mutex;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, mpsc};
+        use std::task::{Context, RawWaker, RawWakerVTable, Waker};
+
+        const WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+        /// A waker whose first clone, which the timer makes right before it
+        /// registers its deadline, waits until the test lets it go. It notes
+        /// the clock when it is woken.
+        struct Gate {
+            hold: AtomicBool,
+            entered: mpsc::Sender<()>,
+            go: Mutex<mpsc::Receiver<()>>,
+            fcx: Cx,
+            woken_at: Mutex<Option<Instant>>,
+        }
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, release);
+        unsafe fn clone(data: *const ()) -> RawWaker {
+            // SAFETY: `data` came from `Arc::into_raw` of a `Gate`.
+            unsafe { Arc::increment_strong_count(data.cast::<Gate>()) };
+            let gate = unsafe { &*data.cast::<Gate>() };
+            if gate.hold.swap(false, Ordering::SeqCst) {
+                gate.entered.send(()).unwrap();
+                gate.go.lock().recv_timeout(WAIT).unwrap();
+            }
+            RawWaker::new(data, &VTABLE)
+        }
+        unsafe fn wake(data: *const ()) {
+            unsafe { wake_by_ref(data) };
+            unsafe { release(data) };
+        }
+        unsafe fn wake_by_ref(data: *const ()) {
+            // SAFETY: `data` came from `Arc::into_raw` of a `Gate`.
+            let gate = unsafe { &*data.cast::<Gate>() };
+            let now = gate.fcx.now();
+            gate.woken_at.lock().get_or_insert(now);
+        }
+        unsafe fn release(data: *const ()) {
+            // SAFETY: `data` came from `Arc::into_raw` of a `Gate`.
+            unsafe { Arc::decrement_strong_count(data.cast::<Gate>()) };
+        }
+
+        block_on(crate::lab(fictionet::Seed::from_u64(0), |fcx| async move {
+            let at = |t| Instant::from_since_start(ms(t));
+            let (entered_tx, entered) = mpsc::channel();
+            let (go, go_rx) = mpsc::channel();
+            let gate = Arc::new(Gate {
+                hold: AtomicBool::new(true),
+                entered: entered_tx,
+                go: Mutex::new(go_rx),
+                fcx: fcx.clone(),
+                woken_at: Mutex::new(None),
+            });
+            let outside = fcx.clone();
+            let gate_ptr = Arc::into_raw(gate.clone()).cast::<()>() as usize;
+            let harness = std::thread::spawn(move || {
+                // SAFETY: the pointer owns one count of the `Gate`.
+                let waker =
+                    unsafe { Waker::from_raw(RawWaker::new(gate_ptr as *const (), &VTABLE)) };
+                let mut timer = Timer::new(&outside);
+                let polled = timer.poll_until(&mut Context::from_waker(&waker), at(7));
+                assert!(polled.is_pending(), "the clock read 0 ms");
+                timer
+            });
+            // The harness has read the clock at 0 ms and holds its deadline.
+            entered.recv_timeout(WAIT).unwrap();
+            fcx.sleep_until(at(10)).await?;
+            assert_eq!(fcx.now(), at(10));
+            go.send(()).unwrap();
+            let timer = harness.join().unwrap();
+            fcx.sleep_until(at(20)).await?;
+            let woken_at = *gate.woken_at.lock();
+            assert!(
+                woken_at.is_some_and(|t| t >= at(10)),
+                "the lab moved its clock back from 10 ms to {woken_at:?}"
+            );
+            assert_eq!(fcx.now(), at(20));
+            drop(timer);
+            Ok(())
+        }))
+        .unwrap();
+    }
 }
