@@ -728,7 +728,7 @@ fn world_state(pages: &Pages, preview: bool) -> WorldState {
     }
 }
 
-/// Binds the app to loopback and requires the run token for reads and writes.
+/// Binds the app to loopback.
 pub async fn serve(router: Router, port: u16) -> std::io::Result<Server> {
     let listener = match tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await
     {
@@ -738,56 +738,6 @@ pub async fn serve(router: Router, port: u16) -> std::io::Result<Server> {
         result => result?,
     };
     let address = listener.local_addr()?;
-    let token = fictionet_demo::kit::random_uuid();
-    let expected = token.clone();
-    let origin = format!("http://{address}");
-    let router = router.layer(axum::middleware::from_fn(
-        move |request: axum::extract::Request, next: axum::middleware::Next| {
-            let token = expected.clone();
-            let origin = origin.clone();
-            async move {
-                let authenticated = request
-                    .headers()
-                    .get(http::header::COOKIE)
-                    .and_then(|v| v.to_str().ok())
-                    .is_some_and(|cookies| {
-                        cookies
-                            .split(';')
-                            .any(|cookie| cookie.trim() == format!("search={token}"))
-                    });
-                let bootstrap = request.uri().path() == "/"
-                    && request.uri().query() == Some(format!("token={token}").as_str());
-                let same_origin = request
-                    .headers()
-                    .get(http::header::ORIGIN)
-                    .is_none_or(|value| value.as_bytes() == origin.as_bytes());
-                if (!authenticated && !bootstrap) || !same_origin {
-                    return http::StatusCode::FORBIDDEN.into_response();
-                }
-                let mut response = next.run(request).await;
-                if bootstrap {
-                    response.headers_mut().insert(
-                        http::header::SET_COOKIE,
-                        format!("search={token}; HttpOnly; SameSite=Strict; Path=/")
-                            .parse()
-                            .unwrap(),
-                    );
-                }
-                response.headers_mut().insert(http::header::CONTENT_SECURITY_POLICY,
-                    "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'self'".parse().unwrap());
-                response
-                    .headers_mut()
-                    .insert("referrer-policy", "no-referrer".parse().unwrap());
-                response
-                    .headers_mut()
-                    .insert("x-content-type-options", "nosniff".parse().unwrap());
-                response
-                    .headers_mut()
-                    .insert(http::header::CACHE_CONTROL, "no-store".parse().unwrap());
-                response
-            }
-        },
-    ));
     let (stop, stopped) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {
         axum::serve(listener, router)
@@ -797,7 +747,7 @@ pub async fn serve(router: Router, port: u16) -> std::io::Result<Server> {
             .await
     });
     Ok(Server {
-        url: format!("http://{address}/?token={token}"),
+        url: format!("http://{address}/"),
         stop: Some(stop),
         task,
     })
