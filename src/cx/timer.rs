@@ -62,7 +62,9 @@ impl Timer {
                     Some(id) if self.deadline == Some(at) => {
                         self.fcx.run.environment.clock.update(id, cx.waker())
                     }
-                    Some(id) => self.fcx.run.environment.clock.reset(id, at, cx.waker()),
+                    Some(id) => {
+                        self.entry = Some(self.fcx.run.environment.clock.reset(id, at, cx.waker()))
+                    }
                     None => {
                         self.entry =
                             Some(self.fcx.run.environment.clock.add(at, cx.waker().clone()))
@@ -132,6 +134,44 @@ mod tests {
             // already under the same entry.
             let waited = wait(&fcx, &mut timer, ms(400), ms(30)).await?;
             assert_eq!(waited, ms(30));
+            Ok(())
+        }))
+        .unwrap();
+    }
+
+    /// A lab wakes timers due at the same instant in the order they were
+    /// set. A timer that moves its deadline is set again, so it wakes after
+    /// a timer that set the same deadline before it moved.
+    #[test]
+    fn a_moved_timer_wakes_after_timers_set_before_the_move() {
+        use fictionet::sync::Mutex;
+        use std::sync::Arc;
+        use std::task::{Context, Wake, Waker};
+
+        struct Log(&'static str, Arc<Mutex<Vec<&'static str>>>);
+        impl Wake for Log {
+            fn wake(self: Arc<Self>) {
+                self.1.lock().push(self.0);
+            }
+        }
+        fn pending(timer: &mut Timer, waker: &Waker, at: Duration) -> bool {
+            let deadline = Instant::from_since_start(at);
+            timer
+                .poll_until(&mut Context::from_waker(waker), deadline)
+                .is_pending()
+        }
+        block_on(crate::lab(fictionet::Seed::from_u64(0), |fcx| async move {
+            let woken = Arc::new(Mutex::new(Vec::new()));
+            let first = Waker::from(Arc::new(Log("first", woken.clone())));
+            let second = Waker::from(Arc::new(Log("second", woken.clone())));
+            let mut a = Timer::new(&fcx);
+            let mut b = Timer::new(&fcx);
+            // `a` sets a deadline first, `b` sets 20 ms, then `a` moves to 20 ms.
+            assert!(pending(&mut a, &first, ms(10)));
+            assert!(pending(&mut b, &second, ms(20)));
+            assert!(pending(&mut a, &first, ms(20)));
+            fcx.sleep_until(Instant::from_since_start(ms(30))).await?;
+            assert_eq!(*woken.lock(), ["second", "first"]);
             Ok(())
         }))
         .unwrap();
