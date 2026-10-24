@@ -227,7 +227,7 @@ impl Failure {
     pub(super) fn can_render_locally(&self) -> bool {
         matches!(
             self.rejection,
-            Some(Unreadable::Disclosure(_) | Unreadable::Incomplete)
+            Some(Unreadable::Disclosure(_) | Unreadable::Incomplete | Unreadable::Content(_))
         )
     }
 }

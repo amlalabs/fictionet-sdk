@@ -111,7 +111,7 @@ pub enum WriterTarget {
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RevisionAction {
-    Rewrite,
+    Rejected,
     LocalRendering,
 }
 
@@ -559,7 +559,7 @@ mod tests {
             let url = "https://user:private-password@example.org/page?code=private-code&q=stars#access_token=private-fragment";
             pages.report(&cx, SearchObs::Search { engine: Engine::Google, query: "stars".into(), results: vec![Hit { url: url.into(), title: "Stars".into() }] });
             pages.report(&cx, SearchObs::Tool { call: 1, tool: Tool::Fetch, target: url.into(), results: vec![Hit { url: url.into(), title: "Stars".into() }], error: None });
-            pages.report(&cx, SearchObs::PageRevision { target: WriterTarget::Page { url: url.into() }, action: RevisionAction::Rewrite, reason: "page provenance".into() });
+            pages.report(&cx, SearchObs::PageRevision { target: WriterTarget::Page { url: url.into() }, action: RevisionAction::Rejected, reason: "page provenance".into() });
             let rows = [receiver.try_recv().unwrap(), receiver.try_recv().unwrap(), receiver.try_recv().unwrap()];
             let recorded = serde_json::to_string(&rows)?;
             assert!(!recorded.contains("private"));

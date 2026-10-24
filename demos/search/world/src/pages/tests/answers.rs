@@ -484,7 +484,7 @@ fn disclosure_rewrites_preserve_context_and_recover_without_breaking_browsing() 
                 {
                     assert!(reason.contains("page provenance"));
                     match action {
-                        crate::observation::RevisionAction::Rewrite => rewrites += 1,
+                        crate::observation::RevisionAction::Rejected => rewrites += 1,
                         crate::observation::RevisionAction::LocalRendering => recoveries += 1,
                     }
                 }
@@ -505,4 +505,70 @@ fn disclosure_rewrites_preserve_context_and_recover_without_breaking_browsing() 
             if repeated { "recovered" } else { "ok" }
         );
     }
+}
+
+#[test]
+fn rendered_content_rejections_use_the_same_recovery_path() {
+    let script = Arc::new(Script::default());
+    let rejected = format!("{PAGE}<p>TODO</p>");
+    script
+        .pages
+        .lock()
+        .unwrap()
+        .extend([rejected.clone(), rejected]);
+    let pages = Arc::new(Pages::with_model(
+        seed(),
+        openrouter(fake_openrouter(script)),
+    ));
+    let (sender, mut observations) = tokio::sync::mpsc::channel(32);
+    pages.observe(sender);
+    lab(move |cx| async move {
+        let response = get(&pages, &cx, "https://docs.fields.com/guide").await;
+        assert_eq!(response.status, 200);
+        assert!(!String::from_utf8_lossy(&response.body).contains("TODO"));
+        let mut actions = Vec::new();
+        while let Ok(event) = observations.try_recv() {
+            if let crate::observation::SearchObs::PageRevision { action, reason, .. } = event.fact {
+                assert!(reason.contains("placeholder"));
+                actions.push(action);
+            }
+        }
+        assert!(matches!(
+            actions.as_slice(),
+            [
+                crate::observation::RevisionAction::Rejected,
+                crate::observation::RevisionAction::Rejected,
+                crate::observation::RevisionAction::LocalRendering
+            ]
+        ));
+        Ok(())
+    });
+}
+
+#[test]
+fn rewrite_observations_redact_credentials_echoed_by_the_writer() {
+    let dir = Dir::new("redacted-rewrite");
+    let script = Arc::new(Script::default());
+    script
+        .pages
+        .lock()
+        .unwrap()
+        .extend([format!("no body {KEY}"), PAGE.into()]);
+    let (pages, _) = model_world(&dir, &script, 0);
+    no_cast(&pages);
+    let (sender, mut observations) = tokio::sync::mpsc::channel(32);
+    pages.observe(sender);
+    lab(move |cx| async move {
+        assert_eq!(
+            get(&pages, &cx, "https://docs.fields.com/guide")
+                .await
+                .status,
+            200
+        );
+        let event = observations.try_recv().unwrap();
+        let serialized = serde_json::to_string(&event)?;
+        assert!(!serialized.contains(KEY));
+        assert!(serialized.contains("OPENROUTER_API_KEY"));
+        Ok(())
+    });
 }

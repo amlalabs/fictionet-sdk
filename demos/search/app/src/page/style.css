@@ -44,7 +44,7 @@ body.agent-expanded .agent{width:62vw}
 .world-zone{fill:var(--panel);fill-opacity:.6;stroke:var(--line)}
 .internet-zone{fill:var(--orange-bg);fill-opacity:.5;stroke:color-mix(in srgb,var(--orange),transparent 65%)}
 .node{cursor:pointer;outline:none}
-.node rect{fill:var(--raised);stroke:var(--line);stroke-width:1.5;transition:fill .15s,stroke .15s}
+.node rect{fill:var(--raised);stroke:var(--line);stroke-width:1.5;transition:stroke .15s}
 .node text{fill:var(--text);font:500 13px Inter,system-ui,sans-serif;pointer-events:none}
 .node .address{fill:var(--muted);font:12px var(--mono)}
 .internet-label[role=button]{cursor:pointer}

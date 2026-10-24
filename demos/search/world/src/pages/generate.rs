@@ -64,7 +64,7 @@ impl Pages {
                         cx,
                         crate::observation::SearchObs::PageRevision {
                             target: target.clone(),
-                            action: crate::observation::RevisionAction::Rewrite,
+                            action: crate::observation::RevisionAction::Rejected,
                             reason: model.redact(&reason.to_string()),
                         },
                     );
@@ -353,7 +353,7 @@ impl Pages {
                             page.body.clone()
                         };
                         text::validate_page(&page.content_type, body.as_bytes())
-                            .map_err(prompts::Unreadable::Format)?;
+                            .map_err(prompts::Unreadable::Content)?;
                     }
                     if ask.profile.is_none()
                         && fictionet_extras::sites::lookup(host, target).is_none()

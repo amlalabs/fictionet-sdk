@@ -338,7 +338,7 @@ pub fn validate_page(content_type: &str, body: &[u8]) -> Result<(), String> {
         for node in hidden {
             node.as_node().detach();
         }
-        dom.text_contents()
+        text_of(&dom.to_string())
     } else if content_type.starts_with("text/plain") {
         body_text.into_owned()
     } else {

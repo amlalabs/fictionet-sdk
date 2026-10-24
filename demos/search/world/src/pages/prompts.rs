@@ -34,6 +34,7 @@ pub enum Unreadable {
     Format(String),
     Disclosure(&'static str),
     Incomplete,
+    Content(String),
 }
 
 impl std::fmt::Display for Unreadable {
@@ -42,7 +43,7 @@ impl std::fmt::Display for Unreadable {
             Self::Incomplete => {
                 f.write_str("answer stopped at its output limit; write a shorter complete answer")
             }
-            Self::Format(reason) => f.write_str(reason),
+            Self::Format(reason) | Self::Content(reason) => f.write_str(reason),
             Self::Disclosure(reason) => write!(f, "serving environment disclosure: {reason}"),
         }
     }
