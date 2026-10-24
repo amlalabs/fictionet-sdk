@@ -100,7 +100,8 @@ Capture dates appear when the archive records them.
 
 - **Copied** serves offline English Wikipedia, Python, Rust, MDN and GitHub documentation, recipes,
   and the captured security sources at their original URLs. A prepared Tantivy
-  index ranks partial matches by BM25 with extra title weight. Google, Bing,
+  index ranks partial matches by BM25 with extra title weight and the same English
+  word stemming for documents and queries. Google, Bing,
   DuckDuckGo and Claude's search tool share that index. Result counts come from
   the index before pagination. An unmatched query returns an empty list.
   Missing pages use captured site responses; unknown hosts return NXDOMAIN.
@@ -185,9 +186,9 @@ once before starting the demo:
 rustup run 1.99.0 cargo xtask search-web /path/to/demos/downloads
 ```
 
-This downloads the English Wikipedia ZIM without images and captures complete
-English documentation sites, then publishes an immutable disk index. Startup
-loads the prepared index instead of parsing Wikipedia again. `--documents` runs
+This downloads the English Wikipedia ZIM without images and crawls English
+documentation and recipe sites, then publishes an immutable disk index. Startup
+loads the prepared index and archive locations instead of parsing the sources again. `--documents` runs
 only capture; `--index` runs only indexing. Preparation leaves at least 60 GiB of
 free disk space. Downloads and indexes stay outside git.
 
