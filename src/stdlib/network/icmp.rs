@@ -302,4 +302,59 @@ mod tests {
         assert!(host_unreachable(&icmp(3), "10.0.0.1".parse().unwrap()).is_none());
         assert!(host_unreachable(&icmp(8), "10.0.0.1".parse().unwrap()).is_some());
     }
+
+    /// A ping from `src` to `dst` with correct ICMP checksums.
+    fn ping(src: &str, dst: &str) -> Packet {
+        let (src, dst): (IpAddr, IpAddr) = (src.parse().unwrap(), dst.parse().unwrap());
+        let (proto, kind) = if src.is_ipv4() {
+            (protocol::ICMP, 8)
+        } else {
+            (protocol::ICMPV6, 128)
+        };
+        let mut message = vec![kind, 0, 0, 0, 0x12, 0x34, 0, 1, b'p', b'i', b'n', b'g'];
+        set_checksum(&mut message, src, dst);
+        ip::packet(src, dst, proto, &message)
+    }
+
+    /// A host discards a packet whose IPv4 header checksum is wrong
+    /// (RFC 1122, section 3.2.1.2), as a kernel does, so a ping with a
+    /// broken header gets no reply.
+    #[test]
+    fn a_ping_with_a_bad_header_checksum_gets_no_reply() {
+        let me: IpAddr = "10.0.0.1".parse().unwrap();
+        let good = ping("10.0.0.2", "10.0.0.1");
+        assert!(echo_reply(&good, me).is_some());
+        let mut bad = good.clone();
+        bad.0[11] ^= 0x01;
+        assert_ne!(
+            ip::checksum(&bad.0[..20]),
+            0,
+            "the header checksum is wrong"
+        );
+        assert!(echo_reply(&bad, me).is_none());
+    }
+
+    /// A ping from an address that is not one host gets no reply, as an
+    /// ICMP error gets none ([`error`]): the unspecified address, a
+    /// broadcast or multicast address, or loopback from the network
+    /// (RFC 1122, section 3.2.1.3).
+    #[test]
+    fn pings_from_an_address_that_is_not_one_host_get_no_reply() {
+        let v4: IpAddr = "10.0.0.1".parse().unwrap();
+        assert!(echo_reply(&ping("10.0.0.2", "10.0.0.1"), v4).is_some());
+        for src in ["0.0.0.0", "255.255.255.255", "224.0.0.1", "127.0.0.1"] {
+            assert!(
+                echo_reply(&ping(src, "10.0.0.1"), v4).is_none(),
+                "a ping from {src}"
+            );
+        }
+        let v6: IpAddr = DST.into();
+        assert!(echo_reply(&ping(&SRC.to_string(), &DST.to_string()), v6).is_some());
+        for src in ["::", "ff02::1", "::1"] {
+            assert!(
+                echo_reply(&ping(src, &DST.to_string()), v6).is_none(),
+                "a ping from {src}"
+            );
+        }
+    }
 }
