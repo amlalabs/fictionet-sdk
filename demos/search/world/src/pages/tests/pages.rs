@@ -513,3 +513,62 @@ fn concurrent_interactive_sites_read_the_preceding_sites_facts() {
         Ok(())
     });
 }
+
+#[test]
+fn established_facts_allow_parallel_site_generation() {
+    struct Parallel {
+        fake: Arc<Fake>,
+        calls: AtomicUsize,
+        ready: tokio::sync::Barrier,
+    }
+    impl Transport for Parallel {
+        fn post<'a>(&'a self, cx: &'a Cx, headers: Headers, body: Vec<u8>) -> Post<'a> {
+            let first = self.calls.fetch_add(1, Ordering::SeqCst) == 0;
+            Box::pin(async move {
+                if !first {
+                    self.ready.wait().await;
+                }
+                self.fake.post(cx, headers, body).await
+            })
+        }
+    }
+    let fake = fake_openrouter(Arc::new(Script::default()));
+    let model = Model::new(
+        Provider::OpenRouter,
+        "requested/model",
+        "",
+        Key::new("OPENROUTER_API_KEY", Some(KEY.into())).unwrap(),
+        Arc::new(Parallel {
+            fake: fake.clone(),
+            calls: AtomicUsize::new(0),
+            ready: tokio::sync::Barrier::new(2),
+        }),
+    );
+    let pages = Arc::new(Pages::with_model(seed(), model));
+    lab(move |cx| async move {
+        assert_eq!(
+            get(&pages, &cx, "https://docs.fields.com/guide")
+                .await
+                .status,
+            200
+        );
+        let other = pages.clone();
+        let (send, receive) = tokio::sync::oneshot::channel();
+        cx.spawn(move |cx| async move {
+            send.send(get(&other, &cx, "https://news.fields.com/reference").await)
+                .unwrap();
+            Ok(())
+        });
+        let first = get(&pages, &cx, "https://research.fields.com/reference").await;
+        let second = receive.await.unwrap();
+        assert_eq!((first.status, second.status), (200, 200));
+        let prompts = fake.users();
+        assert_eq!(prompts.len(), 3);
+        assert!(
+            prompts[1..]
+                .iter()
+                .all(|prompt| { prompt.contains("a claim about https://docs.fields.com/guide") })
+        );
+        Ok(())
+    });
+}

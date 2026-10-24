@@ -251,7 +251,7 @@ impl Pages {
         target: &str,
         prefetch: bool,
     ) -> Result<PageRecord, Stop> {
-        let _publication = if self.live_calls.is_some() {
+        let publication = if self.live_calls.is_some() {
             Some(
                 self.locks
                     .lock(cx, "page publications".into())
@@ -290,6 +290,13 @@ impl Pages {
                 cast,
             }
         };
+        // Establish shared facts before parallel writers reuse the published context.
+        let _publication = publication.filter(|_| {
+            !self
+                .store()
+                .pages()
+                .any(|page| ask.claims.iter().any(|claim| claim.url == page.url))
+        });
         let expected = prompts::expected_type(&url);
         let seed = self.context().into_owned();
         let subject = format!("{url} {}", make::title_from(host, target));
