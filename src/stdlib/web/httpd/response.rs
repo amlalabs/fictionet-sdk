@@ -1,7 +1,7 @@
 use std::time::SystemTime;
 
 use http::header::{CONTENT_LENGTH, DATE};
-use http::{HeaderName, HeaderValue, Request, Response, StatusCode};
+use http::{HeaderName, HeaderValue, Method, Request, Response, StatusCode};
 
 use fictionet::Error;
 use fictionet::stdlib::protocols::http1::{self, RequestHead};
@@ -51,6 +51,33 @@ pub(super) fn error_response(e: &Error) -> Response<Body> {
     }
 }
 
+/// What a request asks of its response's body.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Asked {
+    /// The body, when the status has one.
+    Body,
+    /// Only the head, as `HEAD` does: the length a `GET` would have, and
+    /// no body.
+    Head,
+    /// A tunnel, as `CONNECT` does: a 2xx response has no framing and no
+    /// body, since the bytes after its head are the tunnel's (RFC 9110
+    /// section 9.3.6).
+    Tunnel,
+}
+
+impl Asked {
+    /// What a request with `method` asks.
+    pub(super) fn of(method: &Method) -> Asked {
+        if method == Method::HEAD {
+            Asked::Head
+        } else if method == Method::CONNECT {
+            Asked::Tunnel
+        } else {
+            Asked::Body
+        }
+    }
+}
+
 /// Shared response decisions, before either backend chooses wire framing.
 pub(super) struct ResponsePolicy {
     pub(super) bodiless: bool,
@@ -62,12 +89,14 @@ impl ResponsePolicy {
     pub(super) fn new(
         parts: &http::response::Parts,
         len: Option<u64>,
-        head_only: bool,
+        asked: Asked,
         date: Option<HeaderValue>,
     ) -> Self {
         let no_body = parts.status.is_informational()
             || parts.status == StatusCode::NO_CONTENT
-            || parts.status == StatusCode::NOT_MODIFIED;
+            || parts.status == StatusCode::NOT_MODIFIED
+            || (asked == Asked::Tunnel && parts.status.is_success());
+        let head_only = asked == Asked::Head;
         let len = if no_body {
             None
         } else if head_only {
