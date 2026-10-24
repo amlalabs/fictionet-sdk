@@ -366,20 +366,20 @@ impl Pages {
                 }),
         );
         let latest = self.latest_publication();
-        // A document that exists is written from its real text: a capture,
-        // or else the public original the host reads now. A capture that
-        // sent this address on to another document is older than the
-        // address's own document, when there is one now.
-        let model = matches!(self.maker(), Maker::Model(_));
-        ask.original = match self.reference_text(&url).map_err(Stop::store)? {
-            Some(captured) if !captured.redirected => Some(captured.original),
-            Some(captured) if model => match self.originals.read(cx, &url).await {
-                Some(original) => Some(original),
-                None => Some(captured.original),
-            },
-            Some(captured) => Some(captured.original),
-            None if model => self.originals.read(cx, &url).await,
-            None => None,
+        // A document that exists is written from its real text as it is on
+        // the world's date: the public original the host reads now, else a
+        // capture of it. A capture is older than the world (the Wikipedia
+        // copy is from June 2026), so pages written from captures disagreed
+        // with pages read now. A capture that sent this address on to
+        // another document is not this address's document.
+        let captured = self
+            .reference_text(&url)
+            .map_err(Stop::store)?
+            .filter(|captured| !captured.redirected)
+            .map(|captured| captured.original);
+        ask.original = match self.maker() {
+            Maker::Model(_) => self.originals.read(cx, &url, captured).await,
+            Maker::Stored => captured,
         };
         let real = ask.original.is_some();
         let made = self

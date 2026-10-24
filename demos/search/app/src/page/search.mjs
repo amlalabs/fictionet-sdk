@@ -318,7 +318,9 @@ function activityItem(row) {
       }
       const document = /(?:text\/html|application\/pdf)/.test(fact.content_type);
       const thumbnail = document && fact.status < 400 && /text\/html/.test(fact.content_type) ? url : null;
-      return { title: `${fact.status >= 400 ? 'Requested' : 'Opened'} ${fact.title || hit?.title || fact.host}`, meta: `${fact.host}${briefPath(fact.path) === '/' ? '' : briefPath(fact.path)} · ${fact.status} · ${sourceName(fact.source)}`, target: document ? `page:${url}` : `site:${fact.host}`, thumbnail };
+      // A page that took a while says how long: a client with a deadline may have stopped waiting.
+      const took = fact.elapsed_ms >= 1000 ? `${Math.round(fact.elapsed_ms / 1000)} s` : null;
+      return { title: `${fact.status >= 400 ? 'Requested' : 'Opened'} ${fact.title || hit?.title || fact.host}`, meta: [where, fact.status, sourceName(fact.source), took].filter(Boolean).join(' · '), target: document ? `page:${url}` : `site:${fact.host}`, thumbnail };
     }
     case 'search': return { title: `Searched “${fact.query}”`, meta: fact.results.length ? `${quantity(fact.results.length, 'result')} · ${hitHosts(fact.results)}` : 'No results', target: 'search' };
     case 'tool': return { title: `${fact.tool === 'fetch' ? 'Fetched' : 'Searched'} ${fact.tool === 'fetch' ? fact.target : `“${fact.target}”`}`, meta: fact.error || (fact.tool === 'fetch' ? 'Answered by the world' : fact.results.length ? `${quantity(fact.results.length, 'result')} · ${hitHosts(fact.results)}` : 'No results'), target: 'calls' };

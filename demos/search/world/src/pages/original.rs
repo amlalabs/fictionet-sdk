@@ -29,17 +29,27 @@ impl Originals {
         *self.search.lock().unwrap() = Some(key);
     }
 
-    /// Reads `url` on the host, following redirects; a site that answers
-    /// only browsers (a script challenge) is read from the search
-    /// provider's copy. `None` when the address has no readable document.
-    pub(super) async fn read(&self, cx: &Cx, url: &str) -> Option<Original> {
-        let transport = self
+    /// Reads `url` on the host, following redirects. When the address
+    /// cannot be read, its `captured` text stands in; without one, a site
+    /// that answers only browsers (a script challenge) is read from the
+    /// search provider's copy. `None` when the address has no readable
+    /// document.
+    pub(super) async fn read(
+        &self,
+        cx: &Cx,
+        url: &str,
+        captured: Option<Original>,
+    ) -> Option<Original> {
+        let transport = match self
             .transport
             .get_or_init(|| Transport::new().map(Arc::new))
-            .as_ref()
-            .inspect_err(|error| eprintln!("Original documents are unavailable: {error}"))
-            .ok()?
-            .clone();
+        {
+            Ok(transport) => transport.clone(),
+            Err(error) => {
+                eprintln!("Original documents are unavailable: {error}");
+                return captured;
+            }
+        };
         let (send, receive) = oneshot::channel();
         let lifetime = self.lifetime.clone();
         let observer = self.observer.lock().unwrap().clone();
@@ -51,11 +61,12 @@ impl Originals {
             let original =
                 match follow(&transport, &thread, &lifetime, observer.clone(), &url).await {
                     Some(original) => Some(original),
-                    None => match search {
-                        Some(key) => {
+                    None => match (captured, search) {
+                        (Some(captured), _) => Some(captured),
+                        (None, Some(key)) => {
                             contents(&transport, &thread, &lifetime, observer, &key, &url).await
                         }
-                        None => None,
+                        (None, None) => None,
                     },
                 };
             let _ = send.send(original);
