@@ -2,7 +2,8 @@ use std::cell::RefCell;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use p256::elliptic_curve::{sec1::ToEncodedPoint, zeroize::Zeroizing};
+use p256::elliptic_curve::{sec1::ToSec1Point, zeroize::Zeroizing};
+use p256::pkcs8::{DecodePrivateKey as _, EncodePublicKey as _};
 use rsa::pkcs8::{DecodePrivateKey, EncodePublicKey};
 use rustls::ServerConfig;
 use rustls::crypto::{
@@ -203,8 +204,8 @@ impl SupportedKxGroup for CxGroup {
         };
         let public = match &secret {
             ExchangeSecret::X25519(s) => x25519_dalek::PublicKey::from(s).as_bytes().to_vec(),
-            ExchangeSecret::P256(s) => s.public_key().to_encoded_point(false).as_bytes().to_vec(),
-            ExchangeSecret::P384(s) => s.public_key().to_encoded_point(false).as_bytes().to_vec(),
+            ExchangeSecret::P256(s) => s.public_key().to_sec1_point(false).as_bytes().to_vec(),
+            ExchangeSecret::P384(s) => s.public_key().to_sec1_point(false).as_bytes().to_vec(),
         };
         Ok(Box::new(Exchange {
             secret,
@@ -470,7 +471,7 @@ impl Signer for RunSigner {
         self.scheme
     }
     fn sign(&self, message: &[u8]) -> Result<Vec<u8>, rustls::Error> {
-        use rsa::signature::hazmat::PrehashSigner;
+        use p256::ecdsa::signature::hazmat::PrehashSigner;
         match &*self.material {
             KeyMaterial::P256(key) => {
                 let signature: p256::ecdsa::Signature = key

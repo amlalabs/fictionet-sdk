@@ -31,6 +31,7 @@ fn space(path: &Path, additional: u64) -> Result {
 }
 
 async fn fetch(url: url::Url) -> Result<Response> {
+    let mut pause = std::time::Duration::from_secs(1);
     loop {
         let result: Result<Response> = async {
             let client = capture::client(&url).await?;
@@ -47,7 +48,8 @@ async fn fetch(url: url::Url) -> Result<Response> {
             Ok(response) => return Ok(response),
             Err(error) => {
                 eprintln!("Retrying {url}: {error}");
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                tokio::time::sleep(pause).await;
+                pause += std::time::Duration::from_secs(1);
             }
         }
     }

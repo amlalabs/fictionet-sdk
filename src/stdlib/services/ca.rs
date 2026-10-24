@@ -14,6 +14,7 @@ use fictionet::{Cx, Error};
 use p256::ecdsa::signature::Signer;
 use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey};
 use rsa::pkcs1::EncodeRsaPublicKey;
+use rsa::pkcs8::DecodePrivateKey as _;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use x509::{ExtensionValue, oid};
 
@@ -134,20 +135,14 @@ impl Key {
                     oid: id(oid::EC_PUBLIC_KEY),
                     parameters: Some(curve_parameters(oid::PRIME256V1)),
                 },
-                k.verifying_key()
-                    .to_encoded_point(false)
-                    .as_bytes()
-                    .to_vec(),
+                k.verifying_key().to_sec1_point(false).as_bytes().to_vec(),
             ),
             Self::P384(k) => (
                 x509::AlgorithmIdentifier {
                     oid: id(oid::EC_PUBLIC_KEY),
                     parameters: Some(curve_parameters(oid::SECP384R1)),
                 },
-                k.verifying_key()
-                    .to_encoded_point(false)
-                    .as_bytes()
-                    .to_vec(),
+                k.verifying_key().to_sec1_point(false).as_bytes().to_vec(),
             ),
             // RFC 4055 section 1.2: the algorithm is rsaEncryption with NULL
             // parameters, and the key is the DER of RSAPublicKey.
@@ -169,11 +164,13 @@ impl Key {
         }
     }
 
-    fn der(&self) -> Result<rsa::pkcs8::SecretDocument, Error> {
+    fn der(&self) -> Result<p256::pkcs8::SecretDocument, Error> {
         Ok(match self {
             Self::P256(key) => key.to_pkcs8_der()?,
             Self::P384(key) => key.to_pkcs8_der()?,
-            Self::Rsa(key) => rsa::pkcs8::EncodePrivateKey::to_pkcs8_der(key.as_ref())?,
+            Self::Rsa(key) => p256::pkcs8::SecretDocument::try_from(
+                rsa::pkcs8::EncodePrivateKey::to_pkcs8_der(key.as_ref())?.as_bytes(),
+            )?,
         })
     }
 }

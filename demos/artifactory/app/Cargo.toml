@@ -12,7 +12,7 @@ arc-swap = "1.9.3"
 fictionet-extras = { path = "../../../extras" }
 fictionet-host = { path = "../../../host" }
 artifactory-world = { path = "../world" }
-quick-xml = { version = "0.38", features = ["serialize"] }
+quick-xml = { version = "0.42", features = ["serialize"] }
 # `tokio` hands the jump host's TCP connection to the SSH client.
 fictionet = { path = "../../..", features = ["web-proxy", "tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "io-util", "fs", "process", "sync", "signal"] }
@@ -38,9 +38,9 @@ crc32fast = "1"
 # prepare and reach an unmodified distro image whatever hypervisor boots it.
 
 # The vhost-user-net backend that joins Cloud Hypervisor's guest to the
-# world. Versions track vhost-user-backend 0.18's own, so the virtio-queue,
+# world. Versions track vhost-user-backend 0.24's own, so the virtio-queue,
 # vm-memory and vhost types are one instance across the crates.
-vhost-user-backend = "0.18"
+vhost-user-backend = "0.24"
 
 
 fictionet-demo = { path = "../../kit" }

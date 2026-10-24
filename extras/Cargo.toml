@@ -23,7 +23,7 @@ xz2 = "0.1"
 zip = { version = "9", default-features = false, features = ["deflate"] }
 tar = "0.4"
 quick-xml = { version = "0.42", features = ["escape-html"] }
-brotli = "8"
+brotli = "9"
 fictionet-host = { path = "../host" }
 flate2 = "1"
 httparse = "1"
@@ -41,8 +41,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "macros",
 time = "0.3"
 tower-service = "0.3"
 url = "2"
-zstd = "0.13"
-tantivy = { version = "0.27", default-features = false, features = ["mmap", "lz4-compression"] }
+zstd = "0.14"
+tantivy = { version = "0.27", default-features = false, features = ["mmap", "lz4-compression", "zstd-compression"] }
 
 [dev-dependencies]
 axum = { version = "0.8", default-features = false, features = ["json", "http1", "tokio"] }

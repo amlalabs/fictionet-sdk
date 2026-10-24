@@ -179,7 +179,12 @@ impl Pages {
         entries.sort_unstable_by_key(|entry| (entry.0, entry.1));
         let count = std::sync::atomic::AtomicUsize::new(0);
         let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(4)
+            .num_threads(
+                std::thread::available_parallelism()
+                    .map_err(|e| e.to_string())?
+                    .get()
+                    .div_ceil(2),
+            )
             .build()
             .map_err(|e| e.to_string())?;
         pool.install(|| {

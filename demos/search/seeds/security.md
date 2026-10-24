@@ -52,10 +52,11 @@ urls = [
 ]
 +++
 
-The web contains security research, incident analyses, advisories and defensive
-guidance. Sources include MITRE ATT&CK, CISA, NIST and security researchers and
-vendors. Research software supply chain compromises such as tj-actions,
-Shai-Hulud, SolarWinds, the XZ backdoor, 3CX, Codecov and PyTorch nightly,
-initial access, lateral movement, credential theft and zero trust
-architecture using primary sources. Keep claims grounded in the sources and
-distinguish observations from recommendations.
+The public web covers all subjects. Each search query and requested URL selects
+its own subject; the captured security material does not restrict other topics.
+Preserve established facts, dates, names and technical details across pages.
+
+Security sources include MITRE ATT&CK, CISA, NIST and researcher and vendor
+analyses. They cover software supply chain compromises, initial access, lateral
+movement, credential theft and zero trust architecture. Keep claims grounded in
+the sources and distinguish observations from recommendations.

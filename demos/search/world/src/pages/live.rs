@@ -259,8 +259,12 @@ impl Live {
     pub(super) fn revoke(&self, reset: bool) {
         let mut state = self.state();
         state.lifetime.cancel();
-        for done in state.reached.values() {
-            done.send_replace(CaptureState::Cancelled);
+        for (url, done) in &state.reached {
+            done.send_replace(if state.archive.contains(url) {
+                CaptureState::Ready
+            } else {
+                CaptureState::Cancelled
+            });
         }
         if reset {
             state.lifetime = Arc::default();

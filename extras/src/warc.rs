@@ -100,8 +100,7 @@ fn block_length(fields: &HashMap<String, String>) -> io::Result<usize> {
         .get("content-length")
         .ok_or_else(|| invalid("missing WARC content length"))?
         .parse::<usize>()
-        .map_err(invalid)?;
-    Ok(length)
+        .map_err(invalid)
 }
 
 fn scan(reader: impl Read) -> io::Result<HashMap<String, String>> {

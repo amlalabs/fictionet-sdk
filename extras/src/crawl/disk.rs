@@ -155,9 +155,12 @@ impl DiskWriter {
     pub fn create(path: &Path) -> io::Result<Self> {
         std::fs::create_dir_all(path)?;
         let (schema, fields) = schema();
-        let index = Index::create_in_dir(path, schema).map_err(io::Error::other)?;
+        let mut index = Index::create_in_dir(path, schema).map_err(io::Error::other)?;
+        index.settings_mut().docstore_compression =
+            tantivy::store::Compressor::Zstd(Default::default());
+        let threads = std::thread::available_parallelism()?.get().div_ceil(2);
         let writer = index
-            .writer_with_num_threads(4, 256_000_000)
+            .writer_with_num_threads(threads, threads * 64_000_000)
             .map_err(io::Error::other)?;
         Ok(Self { writer, fields })
     }

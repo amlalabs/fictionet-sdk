@@ -146,10 +146,7 @@ pub fn references(url: &str, response: &warc::Response) -> io::Result<Vec<String
             warc::key(url.as_str())
         })
         .filter(|url| url != original.as_str() && seen.insert(url.clone()))
-    {
-        references.push(url);
-    }
-    Ok(references)
+        .collect())
 }
 
 /// A discovered navigation or static dependency.

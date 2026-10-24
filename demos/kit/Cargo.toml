@@ -15,7 +15,7 @@ futures-util = "0.3"
 arc-swap = "1.9.3"
 fictionet-extras = { path = "../../extras" }
 fictionet-host = { path = "../../host" }
-quick-xml = { version = "0.38", features = ["serialize"] }
+quick-xml = { version = "0.42", features = ["serialize"] }
 # `tokio` hands the jump host's TCP connection to the SSH client.
 fictionet = { path = "../..", features = ["web-proxy", "tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "io-util", "fs", "process", "sync", "signal"] }
@@ -44,10 +44,10 @@ fatfs = { version = "0.3", default-features = false, features = ["std", "alloc"]
 russh = "0.64"
 libc = "0.2"
 # The vhost-user-net backend that joins Cloud Hypervisor's guest to the
-# world. Versions track vhost-user-backend 0.18's own, so the virtio-queue,
+# world. Versions track vhost-user-backend 0.24's own, so the virtio-queue,
 # vm-memory and vhost types are one instance across the crates.
-vhost = { version = "0.14", features = ["vhost-user-backend"] }
-vhost-user-backend = "0.18"
-virtio-queue = "0.14"
-vm-memory = { version = "0.16.2", features = ["backend-mmap", "backend-atomic"] }
-vmm-sys-util = "0.14"
+vhost = { version = "0.18", features = ["vhost-user-backend"] }
+vhost-user-backend = "0.24"
+virtio-queue = "0.18"
+vm-memory = { version = "0.18", features = ["backend-mmap", "backend-atomic"] }
+vmm-sys-util = "0.15"

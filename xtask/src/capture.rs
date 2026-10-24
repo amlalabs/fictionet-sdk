@@ -103,7 +103,6 @@ async fn download(root: &Path, name: &str, urls: &[String], requisites: bool) ->
     let mut pending = urls
         .iter()
         .cloned()
-        .map(|url| url)
         .collect::<std::collections::VecDeque<_>>();
     let mut seen = HashSet::new();
     while let Some(url) = pending.pop_front() {
