@@ -79,6 +79,14 @@ impl Pages {
         target: &str,
         prefetch: bool,
     ) -> Response {
+        let _writing = if self.live_calls.is_some() {
+            match self.locks.lock(cx, "writing".into()).await {
+                Ok(lock) => Some(lock),
+                Err(error) => return Stop::store(error).response(Asked::Page),
+            }
+        } else {
+            None
+        };
         let lock = match self.locks.lock(cx, page_key(host, target)).await {
             Ok(lock) => lock,
             Err(error) => return Stop::store(error).response(Asked::Page),

@@ -249,6 +249,13 @@ impl Maker {
 struct Made<T> {
     fields: T,
     usage: Usage,
+    recovery: Option<Recovery>,
+}
+
+struct Recovery {
+    target: crate::observation::WriterTarget,
+    reason: String,
+    rows: Vec<Value>,
 }
 
 /// Why nothing was made.

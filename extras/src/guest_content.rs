@@ -422,15 +422,37 @@ impl Scan {
                 .map(|rule| regex::Regex::new(rule.pattern).unwrap())
                 .collect()
         });
-        static TAG: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-        let prose = TAG
-            .get_or_init(|| regex::Regex::new(r"<[^>]+>").unwrap())
-            .replace_all(text, " ");
-        let normalized = prose.split_whitespace().collect::<Vec<_>>().join(" ");
+        use kuchiki::traits::TendrilSink;
+        let dom = kuchiki::parse_html().one(text);
+        let joined = dom
+            .descendants()
+            .filter_map(|node| node.as_text().map(|value| value.borrow().to_string()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut fields = vec![text.to_owned(), dom.text_contents(), joined];
+        for node in dom.descendants() {
+            if let Some(element) = node.as_element() {
+                fields.extend(
+                    element
+                        .attributes
+                        .borrow()
+                        .map
+                        .values()
+                        .map(|a| a.value.clone()),
+                );
+            }
+            if let Some(comment) = node.as_comment() {
+                fields.push(comment.borrow().to_string());
+            }
+        }
+        let normalized: Vec<_> = fields
+            .iter()
+            .map(|field| field.split_whitespace().collect::<Vec<_>>().join(" "))
+            .collect();
         for (disclosure, rule) in DISCLOSURES.iter().zip(rules) {
             let applicable = matches!(disclosure.scope, Scope::Content)
                 || matches!(source, Content::Installed | Content::InstalledPath);
-            if applicable && rule.is_match(&normalized) {
+            if applicable && normalized.iter().any(|text| rule.is_match(text)) {
                 self.forbid(name, disclosure.name);
             }
         }
@@ -683,6 +705,10 @@ mod tests {
             "This%20page%20is%20simulated",
             "This page is &#115;imulated",
             "<p>This page is <strong>simulated</strong>.</p>",
+            "<p>This</p><p>page is simulated.</p>",
+            "<img alt=\"This page is simulated.\" src=\"/image.png\">",
+            "<meta content=\"This page is &#115;imulated.\">",
+            "<!-- This page is simulated. -->",
             r#"{"body":"This page is \u0073imulated."}"#,
             "This page\nis   simulated.",
         ] {

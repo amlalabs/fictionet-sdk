@@ -245,8 +245,9 @@ fn openrouter(fake: Arc<Fake>) -> Model {
     Model::new(Provider::OpenRouter, "requested/model", "", key, fake)
 }
 
-const PAGE: &str = "STATUS: 200\nTITLE: Story\nSITE_CSS: body {color: #234}\nBODY:\n<h1>Story</h1>";
-const SEARCH: &str = "RESULT\nURL: https://example.com/story\nTITLE: Story\nSNIPPET: A story.";
+const PAGE: &str = "STATUS: 200\nTITLE: Story\nSITE_CSS: body {color: #234}\nBODY:\n<h1>Story</h1><p>The report describes the investigation and its conclusions.</p>";
+const SEARCH: &str =
+    "RESULT\nURL: https://www.scientificamerican.com/story\nTITLE: Story\nSNIPPET: A story.";
 
 /// The model API the world tests use: a cast for a cast prompt, ten results
 /// for a search, and a page that quotes the first snippet it was shown.

@@ -87,6 +87,45 @@ pub trait Transport: Send + Sync {
     ) -> Post<'a>;
 }
 
+/// An authenticated transport. Only scrubbed provider responses leave this client.
+pub struct Authenticated {
+    key: Key,
+    transport: Arc<dyn Transport>,
+}
+impl Authenticated {
+    /// Owns authentication and response sanitization for this provider transport.
+    pub fn new(key: Key, transport: Arc<dyn Transport>) -> Self {
+        Self { key, transport }
+    }
+    /// Installs upstream observation without exposing authentication.
+    pub fn observe_upstream(&self, observer: Arc<UpstreamObserver>) {
+        self.transport.observe_upstream(observer);
+    }
+    /// Sends a provider request and sanitizes successful bodies and errors alike.
+    pub async fn post(
+        &self,
+        cx: &Cx,
+        headers: Vec<(&'static str, String)>,
+        body: Vec<u8>,
+    ) -> Result<(u16, Vec<u8>), String> {
+        let (status, body) = self
+            .transport
+            .post(cx, headers, body)
+            .await
+            .map_err(|e| self.key.redact(&e))?;
+        let response =
+            transport::sanitize(Response::new(Body::from(body)), self.key.secret.clone())
+                .map_err(|e| self.key.redact(&e.to_string()))?;
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .map_err(|e| self.key.redact(&e.to_string()))?
+            .to_bytes();
+        Ok((status, bytes.to_vec()))
+    }
+}
+
 /// The provider's API over HTTPS, through [`web::forward`].
 #[derive(Clone)]
 pub struct Https {
@@ -165,17 +204,16 @@ impl Transport for Https {
         body: Vec<u8>,
     ) -> Post<'a> {
         Box::pin(async move {
+            let body: Value = serde_json::from_slice(&body).map_err(|_| "Invalid model request")?;
+            let body = admitted_request(self.provider, &self.path, &body, false)
+                .ok_or("Unsupported provider input")?;
             let mut request = http::Request::post(self.path.as_str());
             for (name, value) in headers {
                 request = request.header(name, value);
             }
             let request = request
-                .body(Body::from(Bytes::copy_from_slice(&body)))
+                .body(Body::from(body.to_string()))
                 .map_err(|e| e.to_string())?;
-            let body: Value = serde_json::from_slice(&body).map_err(|_| "Invalid model request")?;
-            if !safe_request(self.provider, &self.path, &body, false) {
-                return Err("Unsupported provider input".into());
-            }
             let mut request = request;
             request.headers_mut().insert(
                 http::header::HOST,
@@ -204,6 +242,73 @@ impl Transport for Https {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn host_transport_forwards_only_the_admitted_value() {
+        let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let work = tokio::spawn(async move {
+            let router = axum::Router::new().route(
+                "/v1/responses",
+                axum::routing::post(|body: String| async move {
+                    assert!(!body.contains("web_search_preview"));
+                    assert!(!body.contains("remote.invalid"));
+                    assert_eq!(body.matches("input").count(), 1);
+                    let value: Value = serde_json::from_str(&body).unwrap();
+                    assert_eq!(value["input"], "local text");
+                    axum::Json(json!({"output":[]}))
+                }),
+            );
+            axum::serve(server, router).await.unwrap();
+        });
+        fictionet::run(fictionet::Seed::from_u64(8), |cx| async move {
+            let client = Https::at(&cx, format!("http://{address}").parse()?, "/v1/responses")?;
+            let body = br#"{"tools":[{"type":"web_search_preview"}],"input":[{"type":"input_image","image_url":"https://remote.invalid/img"}],"tools":[{"type":"function","name":"local","parameters":{}}],"input":"local text"}"#;
+            assert_eq!(client.post(&cx, vec![], body.to_vec()).await.map_err(Error::msg)?.0, 200);
+            Ok(())
+        }).await.unwrap();
+        work.abort();
+    }
+
+    #[test]
+    fn authenticated_transport_scrubs_provider_and_transport_errors() {
+        struct Echo;
+        impl Transport for Echo {
+            fn post<'a>(
+                &'a self,
+                _: &'a Cx,
+                _: Vec<(&'static str, String)>,
+                body: Vec<u8>,
+            ) -> Post<'a> {
+                Box::pin(async move {
+                    if body.is_empty() {
+                        Err("connection failed with private-key".into())
+                    } else {
+                        Ok((401, br#"{"error":"private\u002dkey"}"#.to_vec()))
+                    }
+                })
+            }
+        }
+        fictionet::block_on(fictionet::lab(
+            fictionet::Seed::from_u64(8),
+            |cx| async move {
+                let client = Authenticated::new(
+                    Key::new("provider key", Some("private-key".into())).unwrap(),
+                    Arc::new(Echo),
+                );
+                let error = client.post(&cx, vec![], vec![]).await.unwrap_err();
+                assert_eq!(error, "connection failed with <provider key>");
+                let (status, body) = client.post(&cx, vec![], vec![1]).await.unwrap();
+                assert_eq!(status, 401);
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&body)?["error"],
+                    "<provider key>"
+                );
+                Ok(())
+            },
+        ))
+        .unwrap();
+    }
 
     #[test]
     fn https_gemini_posts_key_path_and_returns_response() {

@@ -1,5 +1,6 @@
 //! Shared provider transport lifecycle for host and guest requests.
 use super::*;
+use http_body::{Body as HttpBody, Frame};
 
 /// The outcome of one attempt to contact a provider.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
@@ -84,9 +85,190 @@ pub(super) async fn forward(
     result
 }
 
+/// Removes credentials from decoded provider records before either caller sees them.
+pub(super) fn sanitize(
+    mut response: Response<Body>,
+    secret: Secret,
+) -> fictionet::Result<Response<Body>> {
+    let streaming = response
+        .headers()
+        .get("content-type")
+        .is_some_and(|value| value.as_bytes().starts_with(b"text/event-stream"));
+    response.headers_mut().remove("content-length");
+    for value in response.headers_mut().values_mut() {
+        if let Ok(text) = value.to_str() {
+            *value = secret.redact(text).parse()?;
+        }
+    }
+    Ok(response.map(|body| {
+        Body::new(Scrubbed {
+            body,
+            secret,
+            pending: Vec::new(),
+            streaming,
+            done: false,
+        })
+    }))
+}
+
+fn scrub_json(value: &mut Value, secret: &Secret) {
+    match value {
+        Value::String(text) => *text = secret.redact(text),
+        Value::Array(items) => items.iter_mut().for_each(|value| scrub_json(value, secret)),
+        Value::Object(fields) => {
+            *fields = std::mem::take(fields)
+                .into_iter()
+                .map(|(key, mut value)| {
+                    scrub_json(&mut value, secret);
+                    (secret.redact(&key), value)
+                })
+                .collect();
+        }
+        _ => {}
+    }
+}
+
+struct Scrubbed {
+    body: Body,
+    secret: Secret,
+    pending: Vec<u8>,
+    streaming: bool,
+    done: bool,
+}
+impl Scrubbed {
+    fn record(&self, bytes: &[u8]) -> Vec<u8> {
+        let (prefix, content) = if self.streaming && bytes.starts_with(b"data:") {
+            (b"data: ".as_slice(), &bytes[5..])
+        } else {
+            (b"".as_slice(), bytes)
+        };
+        if let Ok(mut value) = serde_json::from_slice::<Value>(content) {
+            scrub_json(&mut value, &self.secret);
+            let mut output = prefix.to_vec();
+            output.extend(serde_json::to_vec(&value).expect("provider JSON"));
+            if self.streaming && bytes.ends_with(b"\n") {
+                output.push(b'\n');
+            }
+            output
+        } else {
+            self.secret
+                .redact(&String::from_utf8_lossy(bytes))
+                .into_bytes()
+        }
+    }
+    fn ready(&mut self, end: bool) -> Vec<u8> {
+        let length = if end {
+            self.pending.len()
+        } else if self.streaming {
+            self.pending
+                .iter()
+                .rposition(|b| *b == b'\n')
+                .map_or(0, |i| i + 1)
+        } else {
+            0
+        };
+        let bytes: Vec<_> = self.pending.drain(..length).collect();
+        if self.streaming {
+            bytes
+                .split_inclusive(|b| *b == b'\n')
+                .flat_map(|line| self.record(line))
+                .collect()
+        } else {
+            self.record(&bytes)
+        }
+    }
+}
+impl HttpBody for Scrubbed {
+    type Data = Bytes;
+    type Error = Error;
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<fictionet::Result<Frame<Bytes>>>> {
+        if self.done {
+            return Poll::Ready(None);
+        }
+        loop {
+            match Pin::new(&mut self.body).poll_frame(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                    Ok(bytes) => {
+                        self.pending.extend_from_slice(&bytes);
+                        let safe = self.ready(false);
+                        if !safe.is_empty() {
+                            return Poll::Ready(Some(Ok(Frame::data(safe.into()))));
+                        }
+                    }
+                    Err(_) => continue,
+                },
+                Poll::Ready(Some(Err(error))) => {
+                    self.done = true;
+                    return Poll::Ready(Some(Err(Error::msg(
+                        self.secret.redact(&error.to_string()),
+                    ))));
+                }
+                Poll::Ready(None) => {
+                    self.done = true;
+                    let tail = self.ready(true);
+                    return Poll::Ready((!tail.is_empty()).then(|| Ok(Frame::data(tail.into()))));
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct Chunks(std::collections::VecDeque<fictionet::Result<Frame<Bytes>>>);
+    impl HttpBody for Chunks {
+        type Data = Bytes;
+        type Error = Error;
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<Option<fictionet::Result<Frame<Bytes>>>> {
+            Poll::Ready(self.0.pop_front())
+        }
+    }
+
+    #[test]
+    fn successful_json_and_streams_scrub_decoded_secrets_across_frames() {
+        fictionet::block_on(fictionet::lab(fictionet::Seed::from_u64(3), |_| async {
+            let secret = Secret::new("provider key", "private-key".into())?;
+            for streaming in [false, true] {
+                let json = r#"{"text":"private-key and private\u002dkey","private-key":"title"}"#;
+                let input = if streaming {
+                    format!("event: content_block_delta\ndata: {json}\n\n")
+                } else {
+                    json.into()
+                };
+                let frames = input
+                    .bytes()
+                    .map(|byte| Ok::<_, Error>(Frame::data(Bytes::from(vec![byte]))));
+                let response = Response::builder()
+                    .header(
+                        "content-type",
+                        if streaming {
+                            "text/event-stream"
+                        } else {
+                            "application/json"
+                        },
+                    )
+                    .header("x-diagnostic", "private-key")
+                    .body(Body::new(Chunks(frames.collect())))?;
+                let response = sanitize(response, secret.clone())?;
+                assert_eq!(response.headers()["x-diagnostic"], "<provider key>");
+                let body = response.into_body().collect().await?.to_bytes();
+                let output = String::from_utf8(body.to_vec())?;
+                assert!(!output.contains("private"), "{output}");
+                assert_eq!(output.matches("<provider key>").count(), 3);
+            }
+            Ok(())
+        }))
+        .unwrap();
+    }
+
     struct Failed;
     impl web::Upstream for Failed {
         fn request(self: Arc<Self>, _: Request<Body>) -> web::UpstreamFuture {

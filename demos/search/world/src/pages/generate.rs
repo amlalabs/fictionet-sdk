@@ -41,23 +41,22 @@ impl Pages {
     pub(super) async fn generate<T: serde::Serialize>(
         &self,
         cx: &Cx,
-        context: Value,
+        target: crate::observation::WriterTarget,
         stored: impl FnOnce() -> T,
         prompt: impl FnOnce() -> (String, String, u32),
-        read: impl Fn(&str) -> Result<T, prompts::Unreadable>,
+        read: impl Fn(&str, bool) -> Result<T, prompts::Unreadable>,
     ) -> Result<Made<T>, Stop> {
+        let context = serde_json::to_value(&target).expect("generation target");
         match self.maker() {
-            Maker::Stored => self.stored(cx, context, stored),
+            Maker::Stored => self.stored(cx, target, stored),
             Maker::Model(model) => {
                 if self.live_calls.is_some() {
                     self.reserve()?;
                 }
                 let (system, user, max_tokens) = prompt();
-                let target: crate::observation::WriterTarget =
-                    serde_json::from_value(context.clone()).expect("generation context");
-                let read = |text: &str| match gives_away(text) {
+                let parse = |text: &str| match gives_away(text) {
                     Some(reason) => Err(prompts::Unreadable::Disclosure(reason)),
-                    None => read(text),
+                    None => read(text, false),
                 };
                 let rejected = |reason: &prompts::Unreadable| {
                     self.report(
@@ -70,43 +69,59 @@ impl Pages {
                     );
                 };
                 let (answer, ledger): (_, Ledger) = model
-                    .ask(cx, &system, &user, max_tokens, read, rejected)
+                    .ask(cx, &system, &user, max_tokens, parse, rejected)
                     .await;
-                let status = match &answer {
-                    Ok(_) => "ok",
-                    Err(failure) if failure.can_render_locally() => "recovered",
-                    Err(_) => "error",
+                let usage = ledger.usage();
+                let repaired = match &answer {
+                    Err(failure)
+                        if failure.can_render_locally()
+                            && matches!(target, crate::observation::WriterTarget::Page { .. }) =>
+                    {
+                        ledger
+                            .attempts
+                            .last()
+                            .filter(|a| !a.cut_off)
+                            .and_then(|a| a.raw.as_deref())
+                            .and_then(|raw| read(raw, true).ok())
+                            .filter(|fields| {
+                                let audit = fictionet_extras::guest_content::Audit::default();
+                                audit.inspect(
+                                    "repaired document",
+                                    &serde_json::to_vec(fields).expect("page fields"),
+                                );
+                                audit.check().is_ok()
+                            })
+                    }
+                    _ => None,
+                };
+                let status = if answer.is_ok() {
+                    "ok"
+                } else if repaired.is_some() {
+                    "recovered"
+                } else {
+                    "error"
                 };
                 let mut rows = ledger.rows(&context, status);
                 rows.iter_mut().for_each(|row| model.redact_json(row));
-                self.log(cx, &rows)?;
-                let usage = ledger.usage();
-                match answer {
-                    Ok(answer) => Ok(Made {
+                if repaired.is_none() {
+                    self.log(cx, &rows)?;
+                }
+                match (answer, repaired) {
+                    (Ok(answer), _) => Ok(Made {
                         fields: answer.fields,
                         usage,
+                        recovery: None,
                     }),
-                    Err(failure) if failure.can_render_locally() => {
-                        let fields = stored();
-                        let audit = fictionet_extras::guest_content::Audit::default();
-                        audit.inspect(
-                            "local rendering",
-                            &serde_json::to_vec(&fields).expect("page fields"),
-                        );
-                        audit
-                            .check()
-                            .map_err(|error| Stop::store(std::io::Error::other(error)))?;
-                        self.report(
-                            cx,
-                            crate::observation::SearchObs::PageRevision {
-                                target,
-                                action: crate::observation::RevisionAction::LocalRendering,
-                                reason: model.redact(&failure.error),
-                            },
-                        );
-                        Ok(Made { fields, usage })
-                    }
-                    Err(Failure { error, .. }) => Err(Stop::Failed {
+                    (Err(failure), Some(fields)) => Ok(Made {
+                        fields,
+                        usage,
+                        recovery: Some(Recovery {
+                            target,
+                            reason: model.redact(&failure.error),
+                            rows,
+                        }),
+                    }),
+                    (Err(Failure { error, .. }), None) => Err(Stop::Failed {
                         error: model.redact(&error),
                         usage: Some(Box::new(usage)),
                     }),
@@ -118,9 +133,10 @@ impl Pages {
     pub(super) fn stored<T>(
         &self,
         cx: &Cx,
-        mut context: Value,
+        target: crate::observation::WriterTarget,
         stored: impl FnOnce() -> T,
     ) -> Result<Made<T>, Stop> {
+        let mut context = serde_json::to_value(target).expect("generation target");
         let started = cx.now().since_start();
         let fields = stored();
         let usage = Usage::stored((cx.now().since_start() - started).as_millis() as u64);
@@ -130,7 +146,11 @@ impl Pages {
         }
         context["raw"] = Value::Null;
         self.log(cx, &[context])?;
-        Ok(Made { fields, usage })
+        Ok(Made {
+            fields,
+            usage,
+            recovery: None,
+        })
     }
 
     /// The people the world names, made the first time a list or page
@@ -156,13 +176,13 @@ impl Pages {
         let made = self
             .generate(
                 cx,
-                json!({"kind": "cast"}),
+                crate::observation::WriterTarget::Cast,
                 Vec::new,
                 || {
                     let (system, user) = prompts::cast(&self.seed);
                     (system, user, CAST_TOKENS)
                 },
-                prompts::read_cast,
+                |text, _| prompts::read_cast(text),
             )
             .await?;
         let record = CastRecord {
@@ -201,13 +221,13 @@ impl Pages {
             let made = self
                 .generate(
                     cx,
-                    json!({"kind": "stylesheet", "host": host}),
+                    crate::observation::WriterTarget::Stylesheet { host: host.into() },
                     String::new,
                     || {
                         let (system, user) = prompts::stylesheet(&self.seed, host, &profile);
                         (system, user, 1000)
                     },
-                    |text| {
+                    |text, _| {
                         let css = text.trim();
                         if css.is_empty() {
                             Err(prompts::Unreadable::Format("empty stylesheet".into()))
@@ -248,7 +268,15 @@ impl Pages {
                 mentions: prompts::asked_mentions(store.mentions(host, target)),
                 profile: store.site(host).filter(|p| !p.css.is_empty()).cloned(),
                 host_pages: store.host_pages(host),
-                claims: store.recent_claims(40),
+                claims: store.writing_context(&format!(
+                    "{url} {}",
+                    store
+                        .mentions(host, target)
+                        .iter()
+                        .map(Value::to_string)
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                )),
                 cast,
             }
         };
@@ -307,7 +335,7 @@ impl Pages {
         let made = self
             .generate(
                 cx,
-                json!({"kind": "page", "url": url}),
+                crate::observation::WriterTarget::Page { url: url.clone() },
                 || {
                     let mut mentions = ask.mentions.clone();
                     for fact in &self.planted.lock().unwrap_or_else(|e| e.into_inner()).facts {
@@ -338,8 +366,11 @@ impl Pages {
                         PAGE_TOKENS + if ask.profile.is_none() { 1000 } else { 0 },
                     )
                 },
-                |text| {
-                    let page = prompts::read_page(text, expected, !ask.mentions.is_empty())?;
+                |text, repair| {
+                    let mut page = prompts::read_page(text, expected, !ask.mentions.is_empty())?;
+                    if repair {
+                        super::answers::repair_page(&mut page)?;
+                    }
                     if self.live_calls.is_some() {
                         let body = if page.content_type.starts_with("text/html") {
                             let profile = ask
@@ -430,6 +461,18 @@ impl Pages {
             store
                 .unserved
                 .insert((store::site_key(host).into(), target.into()));
+        }
+        drop(store);
+        if let Some(recovery) = made.recovery {
+            self.log(cx, &recovery.rows)?;
+            self.report(
+                cx,
+                crate::observation::SearchObs::PageRevision {
+                    target: recovery.target,
+                    action: crate::observation::RevisionAction::LocalRendering,
+                    reason: recovery.reason,
+                },
+            );
         }
         Ok(record)
     }

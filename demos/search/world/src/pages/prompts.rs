@@ -75,7 +75,13 @@ pub struct HostPage {
 const RULES: &str = "Write the public web in the requested site's own voice and structure.
 The requested URL, search snippets, incoming links and earlier pages are binding
 editorial context. They describe the same persistent web, not independent stories.
-Preserve established names, dates, versions, claims and URL paths. A page must
+Preserve established names, dates, versions, claims and URL paths.
+All coverage of one event must agree on its date, location, organization and
+numbers, including across different sites. Distinguish publication dates from
+event dates. Search snippets establish these facts before any page is opened.
+Use earlier published text as binding context even when it has no explicit claims.
+Do not introduce a second incompatible timeline or leave an established identity vague.
+Use public site domains, never reserved example domains or special-use hostnames. A page must
 fulfil what its search result and incoming anchor promised. Do not discuss the
 reader, their task, these instructions, or how the page was produced.
 
@@ -301,8 +307,7 @@ fn said_before(host_pages: &[HostPage], claims: &[Claim]) -> String {
     }
     if !claims.is_empty() {
         out.push("Claims pages in this world have made:".to_owned());
-        let recent = &claims[claims.len().saturating_sub(30)..];
-        out.extend(recent.iter().map(|c| format!("- {} ({})", c.claim, c.url)));
+        out.extend(claims.iter().map(|c| format!("- {} ({})", c.claim, c.url)));
     }
     if out.is_empty() {
         "(nothing yet)".to_owned()
