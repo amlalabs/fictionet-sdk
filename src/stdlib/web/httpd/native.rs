@@ -7,13 +7,13 @@ use std::time::SystemTime;
 
 use bytes::Bytes;
 use http::header::HOST;
-use http::{HeaderName, HeaderValue, Method, Request, Response, StatusCode, Version};
+use http::{HeaderName, HeaderValue, Request, Response, StatusCode, Version};
 use http_body::{Body as _, Frame};
 
 use fictionet::stdlib::codec::{Decode, Step};
 use fictionet::stdlib::protocols::http1::{self, Event as H1, RequestHead};
 use fictionet::stdlib::services::serve::{
-    self, Driver, Flow, Pending, PendingDriver,
+    self, Driver, Flow, Pending, PendingDriver, WakeHandle,
 };
 use fictionet::time::Instant;
 use fictionet::{Cx, Error};
@@ -21,7 +21,7 @@ use fictionet::{Cx, Error};
 use super::body::Inner;
 use super::handlers::status_only;
 use super::response::{
-    ResponsePolicy, error_response, head_held, request_held,
+    Asked, ResponsePolicy, error_response, head_held, request_held,
 };
 use super::sites::no_host;
 use super::{
@@ -118,7 +118,7 @@ impl Http1 {
         let mut request = request;
         request.extensions_mut().insert(driver.conn().clone());
 
-        let head_only = request.method() == Method::HEAD;
+        let wants = Asked::of(request.method());
         let held = held + request_held(&request);
         let now = driver.now();
         let conn = driver.conn().clone();
@@ -150,26 +150,22 @@ impl Http1 {
             Reply::Later(work) => (Some(work), None),
 
         };
-        driver.defer(
-            Streaming::new(work, response, version, head_only, close)
-                .dated(self.date, now)
-                .holding_request(held),
-        );
-        if self.upgrade.is_some() {
-            driver.cancel_timer(Timer::Body);
-            Flow::Upgrade(serve::Upgrade::Handoff)
-        } else {
-            self.after(driver, close)
-        }
-    }
-
-    fn after(&mut self, driver: &mut Driver<'_, http1::RequestEvents, Timer>, close: bool) -> Flow {
+        let streaming = Streaming::new(work, response, version, wants, close)
+            .dated(self.date, now)
+            .holding_request(held);
         driver.cancel_timer(Timer::Body);
-        if close {
-            return Flow::Close;
+        if self.upgrade.is_some() {
+            driver.defer(streaming);
+            Flow::Upgrade(serve::Upgrade::Handoff)
+        } else if close {
+            driver.defer(streaming);
+            Flow::Close
+        } else {
+            // The head timer starts once the response is written, in
+            // `on_wake`: the next request's head is not awaited before.
+            driver.defer(streaming.waking(driver.wake_handle()));
+            Flow::Continue
         }
-        driver.set_timer(Timer::Head, self.opts.header_timeout);
-        Flow::Continue
     }
 }
 
@@ -321,7 +317,7 @@ fn write_simple(
     date: Option<HeaderValue>,
 ) {
     let (parts, _) = status_only(status).into_parts();
-    let policy = ResponsePolicy::new(&parts, Some(0), false, date);
+    let policy = ResponsePolicy::new(&parts, Some(0), Asked::Body, date);
     encode(out, version, &parts, &policy, true);
 }
 
@@ -383,6 +379,18 @@ impl serve::Service for Http1 {
         Ok(Flow::Continue)
     }
 
+    /// The response is written: the service waits for the next head.
+    fn on_wake(
+        &mut self,
+        _: &(),
+        driver: &mut Driver<'_, http1::RequestEvents, Timer>,
+    ) -> Result<Flow, Infallible> {
+        if self.head.is_none() {
+            driver.set_timer(Timer::Head, self.opts.header_timeout);
+        }
+        Ok(Flow::Continue)
+    }
+
     fn on_timer(
         &mut self,
         _: Timer,
@@ -407,10 +415,13 @@ impl serve::Service for Http1 {
         if self.head.is_some() {
 
             // The body was cut off: the handler still sees what came, as a
-            // body that ends in an error.
+            // body that ends in an error. Of the unread bytes, only body
+            // data counts: chunk framing and later requests are not body.
             let mut got = std::mem::take(&mut self.body);
             let room = self.opts.body.saturating_sub(got.len());
-            got.extend_from_slice(&driver.unread()[..driver.unread().len().min(room)]);
+            let unread = driver.unread();
+            let pending = driver.peek_decoder().pending_body_len(unread.len());
+            got.extend_from_slice(&unread[..pending.min(room)]);
             let held = got.capacity();
             let body = partial(Bytes::from(got), "the request body was cut off");
             self.dispatch(driver, body, true, held);
@@ -484,9 +495,12 @@ struct Streaming {
     request_held: usize,
     response: Option<Response<Body>>,
     version: Version,
-    head_only: bool,
+    wants: Asked,
     close: bool,
     chunked: bool,
+    /// Woken once the response is written, when the connection stays
+    /// open for another request.
+    written: Option<WakeHandle>,
     /// Body bytes the connection took.
     /// Bytes returned to the driver, and the body bytes in the last piece,
     /// which count once the driver has written that far.
@@ -501,7 +515,7 @@ impl Streaming {
         work: Option<Later>,
         response: Option<Response<Body>>,
         version: Version,
-        head_only: bool,
+        wants: Asked,
         close: bool,
     ) -> Streaming {
         Streaming {
@@ -513,9 +527,10 @@ impl Streaming {
             request_held: 0,
             response,
             version,
-            head_only,
+            wants,
             close,
             chunked: false,
+            written: None,
             date: None,
             asked: Instant::ZERO,
         }
@@ -525,6 +540,12 @@ impl Streaming {
         if self.work.is_some() {
             self.request_held = held;
         }
+        self
+    }
+
+    /// Wakes the service through `handle` once the response is written.
+    fn waking(mut self, handle: WakeHandle) -> Self {
+        self.written = Some(handle);
         self
     }
 
@@ -602,7 +623,7 @@ impl Pending for Streaming {
                 let policy = ResponsePolicy::new(
                     &parts,
                     body.size_hint().exact(),
-                    self.head_only,
+                    self.wants,
                     date_header(self.date, now),
                 );
                 let mut head = Vec::new();
@@ -641,7 +662,9 @@ impl Pending for Streaming {
                 return self.piece(out, piece.len());
             }
             let Some(body) = &mut self.body else {
-
+                if let Some(written) = self.written.take() {
+                    written.wake();
+                }
                 return Poll::Ready(None);
             };
             match Pin::new(body).poll_frame(cx) {
@@ -734,7 +757,7 @@ mod router_tests {
             None,
             Some(Response::new(Body::from(vec![b'x'; 3 * PIECE]))),
             Version::HTTP_11,
-            false,
+            Asked::Body,
             true,
         );
         let mut harness = Harness::new(
