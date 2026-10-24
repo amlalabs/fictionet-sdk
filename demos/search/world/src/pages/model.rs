@@ -59,7 +59,7 @@ impl Provider {
     pub fn default_model(self) -> &'static str {
         match self {
             Self::Anthropic => "claude-haiku-5-5",
-            Self::OpenRouter => "google/gemini-3.1-flash-lite",
+            Self::OpenRouter => "anthropic/claude-haiku-5.5",
         }
     }
     fn label(self) -> &'static str {
