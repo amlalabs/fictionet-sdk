@@ -773,17 +773,19 @@ impl Time {
     }
 
     /// Seconds since 1970-01-01 00:00:00 UTC, with any fraction dropped.
-    /// A UTCTime's two-digit years 50 to 99 are 19xx, the rest 20xx. Text
-    /// not in the form DER allows gives `None`.
+    /// A UTCTime's two-digit years 50 to 99 are 19xx, the rest 20xx. A
+    /// GeneralizedTime's leap second, second 60, has no Unix time of its
+    /// own and counts as the first second of the next minute, as POSIX
+    /// counts it. Text not in the form DER allows gives `None`.
     pub fn unix(&self) -> Option<i64> {
-        let (year, rest) = match self {
+        let (year, rest, last_second) = match self {
             Time::Utc(s) => {
                 let b = s.as_bytes();
                 if b.len() != 13 || b[12] != b'Z' {
                     return None;
                 }
                 let yy = digits(b, 0, 2)?;
-                (if yy >= 50 { 1900 + yy } else { 2000 + yy }, &b[2..12])
+                (if yy >= 50 { 1900 + yy } else { 2000 + yy }, &b[2..12], 59)
             }
             Time::Generalized(s) => {
                 let b = s.as_bytes();
@@ -797,7 +799,7 @@ impl Time {
                 {
                     return None;
                 }
-                (digits(b, 0, 4)?, &b[4..14])
+                (digits(b, 0, 4)?, &b[4..14], 60)
             }
         };
         let (month, day) = (digits(rest, 0, 2)?, digits(rest, 2, 2)?);
@@ -812,7 +814,7 @@ impl Time {
         {
             return None;
         }
-        if hour > 23 || minute > 59 || second > 59 {
+        if hour > 23 || minute > 59 || second > last_second {
             return None;
         }
         Some(days_from_civil(year, month, day) * 86_400 + hour * 3600 + minute * 60 + second)
