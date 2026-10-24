@@ -296,6 +296,8 @@ impl Reassembler {
     ///
     /// SYN resets its direction. Unless it acknowledges an observed peer
     /// SYN, it also removes the reverse direction and sets `restarted`.
+    /// A SYN repeating the one that opened its direction is a
+    /// retransmission and resets nothing.
     /// FIN consumes one sequence number only when all preceding bytes
     /// have arrived. RST emits an end even when preceding bytes are missing.
     pub fn push(&mut self, segment: Segment<'_>) -> Reassembled {
@@ -322,7 +324,12 @@ impl Reassembler {
         }
         let syn = flags & 0x02 != 0;
         let back = (key.2, key.3, key.0, key.1);
-        if syn {
+        let reopens = syn
+            && !self
+                .flows
+                .get(&key)
+                .is_some_and(|f| f.opened.is_some() && f.isn == seq);
+        if reopens {
             let answers = flags & 0x10 != 0
                 && self
                     .flows
@@ -337,7 +344,7 @@ impl Reassembler {
             }
         }
         let flow = self.flows.entry(key).or_insert_with(|| Flow::new(seq));
-        if syn {
+        if reopens {
             release(&mut self.held, flow.held_bytes);
             *flow = Flow::new(seq);
             flow.next = Some(seq.wrapping_add(1));
