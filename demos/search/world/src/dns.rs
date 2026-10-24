@@ -228,5 +228,4 @@ impl Addresses {
 }
 
 #[cfg(test)]
-#[path = "world_tests.rs"]
 mod tests;

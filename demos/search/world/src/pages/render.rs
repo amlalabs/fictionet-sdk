@@ -388,5 +388,4 @@ pub fn not_found(host: &str, profile: Option<&Profile>, target: &str, year: &str
 }
 
 #[cfg(test)]
-#[path = "render_tests.rs"]
 mod tests;

@@ -539,7 +539,6 @@ What the world has already said:
 /// that type, and JSON must parse. Only status 200 and 404 are allowed, and
 /// a page something points at (`referenced`) cannot be a 404.
 #[cfg(test)]
-#[path = "prompt_tests.rs"]
 mod tests;
 
 pub use super::answers::{read_cast, read_page, read_search};

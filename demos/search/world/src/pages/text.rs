@@ -322,7 +322,6 @@ pub fn check_snippets(
 }
 
 #[cfg(test)]
-#[path = "text_tests.rs"]
 mod tests;
 
 /// Checks authored page content before a store is published.
