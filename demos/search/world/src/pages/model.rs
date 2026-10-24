@@ -470,7 +470,6 @@ impl Model {
                 });
                 if !self.reasoning.is_empty() {
                     body["output_config"] = json!({"effort":self.reasoning});
-                    body["thinking"] = json!({"type":"adaptive"});
                 }
                 body
             }
