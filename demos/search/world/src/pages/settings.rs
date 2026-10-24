@@ -45,7 +45,6 @@ impl Pages {
         let mut pages = Self::new(seed);
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         pages.maker = Some(Maker::Model(model.live(calls.clone())));
-        pages.prefetch = 5;
         pages.live_calls = Some(calls);
         pages
     }

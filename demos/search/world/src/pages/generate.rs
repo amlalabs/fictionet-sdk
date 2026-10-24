@@ -251,6 +251,16 @@ impl Pages {
         target: &str,
         prefetch: bool,
     ) -> Result<PageRecord, Stop> {
+        let _publication = if self.live_calls.is_some() {
+            Some(
+                self.locks
+                    .lock(cx, "page publications".into())
+                    .await
+                    .map_err(Stop::store)?,
+            )
+        } else {
+            None
+        };
         let _site = self
             .locks
             .lock(cx, format!("site {host}"))

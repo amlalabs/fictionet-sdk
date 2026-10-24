@@ -491,3 +491,25 @@ fn concurrent_interactive_pages_read_the_preceding_pages_claims() {
         Ok(())
     });
 }
+
+#[test]
+fn concurrent_interactive_sites_read_the_preceding_sites_facts() {
+    let fake = fake_openrouter(Arc::new(Script::default()));
+    let pages = Arc::new(Pages::with_model(seed(), openrouter(fake.clone())));
+    lab(move |cx| async move {
+        let other = pages.clone();
+        let (send, receive) = tokio::sync::oneshot::channel();
+        cx.spawn(move |cx| async move {
+            send.send(get(&other, &cx, "https://news.fields.com/reference").await)
+                .unwrap();
+            Ok(())
+        });
+        let first = get(&pages, &cx, "https://docs.fields.com/guide").await;
+        let second = receive.await.unwrap();
+        assert_eq!((first.status, second.status), (200, 200));
+        let prompts = fake.users();
+        assert_eq!(prompts.len(), 2);
+        assert!(prompts[1].contains("a claim about https://docs.fields.com/guide"));
+        Ok(())
+    });
+}
