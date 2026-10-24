@@ -93,7 +93,7 @@ impl Pages {
 
     /// Runs one generation with the maker's stored or model path and
     /// writes its rows. `context` names it in `generations.jsonl`.
-    pub(super) async fn generate<T: serde::Serialize>(
+    pub(super) async fn generate<T: serde::Serialize + answers::Publication + Send>(
         &self,
         cx: &Cx,
         target: crate::observation::WriterTarget,
@@ -109,12 +109,21 @@ impl Pages {
                     self.reserve()?;
                 }
                 let (system, user, max_tokens) = prompt();
+                let user = format!(
+                    "{user}\n\nComplete the entire answer within {max_tokens} output tokens. Plan its length before writing. Keep the required substantive sections, methods and references; use concise prose and markup."
+                );
                 let parse = |text: &str| {
                     model.check_document("text/html", text)?;
-                    match gives_away(text) {
-                        Some(reason) => Err(prompts::Unreadable::Disclosure(reason)),
-                        None => read(text, false),
+                    if let Some(reason) = gives_away(text) {
+                        return Err(prompts::Unreadable::Disclosure(reason));
                     }
+                    let fields = read(text, false)?;
+                    let publications =
+                        fields.later_text(seed::parse_date(&self.seed.date).expect("world date"));
+                    Ok(model::Parsed {
+                        fields,
+                        publications,
+                    })
                 };
                 let rejected = |reason: &prompts::Unreadable| {
                     self.report(
@@ -127,7 +136,7 @@ impl Pages {
                     );
                 };
                 let (answer, ledger): (_, Ledger) = model
-                    .ask(cx, &system, &user, max_tokens, parse, rejected)
+                    .ask_reviewed(cx, &system, &user, max_tokens, parse, rejected)
                     .await;
                 let usage = ledger.usage();
                 let repaired = match &answer {
@@ -313,7 +322,19 @@ impl Pages {
         target: &str,
         prefetch: bool,
     ) -> Result<PageRecord, Stop> {
-        let publication = if self.live_calls.is_some() {
+        let url = format!("https://{host}{target}");
+        let established = {
+            let store = self.writing_store()?;
+            store.page_context(host, target).iter().any(|claim| {
+                let (host, target) = text::target_of(&claim.url);
+                store.page(&host, &target).is_some()
+                    || store
+                        .searches()
+                        .flat_map(|record| &record.search.results)
+                        .any(|result| result.url == claim.url)
+            })
+        };
+        let _publication = if self.live_calls.is_some() && !established {
             Some(
                 self.locks
                     .lock(cx, "page publications".into())
@@ -323,16 +344,19 @@ impl Pages {
         } else {
             None
         };
-        let _site = self
-            .locks
-            .lock(cx, format!("site {host}"))
-            .await
-            .map_err(Stop::store)?;
+        let captured = fictionet_extras::sites::lookup(host, target).is_some();
+        let site = if captured {
+            None
+        } else {
+            self.locks
+                .try_lock(&format!("site {host}"))
+                .map_err(Stop::store)?
+        };
+        let follows_layout = !captured && site.is_none();
         if self.live_calls.is_none() {
             self.reserve()?;
         }
         let cast = self.cast(cx).await?;
-        let url = format!("https://{host}{target}");
         let mut ask = {
             let store = self.writing_store()?;
             PageAsk {
@@ -340,18 +364,20 @@ impl Pages {
                 mentions: prompts::asked_mentions(store.mentions(host, target)),
                 profile: store.site(host).filter(|p| !p.css.is_empty()).cloned(),
                 host_pages: store.host_pages(host),
-                claims: store.writing_context(&format!(
-                    "{url} {}",
-                    store
-                        .mentions(host, target)
-                        .iter()
-                        .map(|mention| serde_json::to_string(mention).expect("mention"))
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                )),
+                claims: store.page_context(host, target),
                 cast,
             }
         };
+        // The layout owner writes its first page while peers write their bodies.
+        let _site = if ask.profile.is_none() {
+            site
+        } else {
+            drop(site);
+            None
+        };
+        if follows_layout && ask.profile.is_none() {
+            ask.profile = Some(make::site_profile(host));
+        }
         {
             let store = self.writing_store()?;
             let mut referenced = HashSet::new();
@@ -369,23 +395,15 @@ impl Pages {
                         };
                         ask.claims.push(prompts::Claim {
                             url: url.into(),
-                            claim: format!("This document links to the requested page (publication/update {}): {}", page.date, text).into(),
+                            claim: prompts::Statement {
+                                text: format!("This document links to the requested page: {text}"),
+                                known_on: seed::parse_date(&page.date).ok(),
+                            },
                         });
                     }
                 }
             }
         }
-        let _publication = publication.filter(|_| {
-            let store = self.store();
-            let published = store
-                .pages()
-                .any(|page| ask.claims.iter().any(|claim| claim.url == page.url));
-            let promised = store
-                .searches()
-                .flat_map(|record| &record.search.results)
-                .any(|result| ask.claims.iter().any(|claim| claim.url == result.url));
-            !published && !promised
-        });
         let expected = prompts::expected_type(&url);
         let seed = self.context().into_owned();
         let subject = format!("{url} {}", make::title_from(host, target));
@@ -473,7 +491,7 @@ impl Pages {
                     (
                         system,
                         user,
-                        PAGE_TOKENS + if ask.profile.is_none() { 1000 } else { 0 },
+                        PAGE_TOKENS + if ask.profile.is_none() && !captured { 500 } else { 0 },
                     )
                 },
                 |text, repair| {
@@ -534,6 +552,19 @@ impl Pages {
             page.title = title.into();
         }
         let today = &self.seed.date;
+        let _layout = if follows_layout {
+            Some(
+                self.locks
+                    .lock(cx, format!("site {host}"))
+                    .await
+                    .map_err(Stop::store)?,
+            )
+        } else {
+            None
+        };
+        if follows_layout {
+            ask.profile = self.writing_store()?.site(host).cloned();
+        }
         let profile = match ask.profile {
             Some(profile) => profile,
             None => {
@@ -606,9 +637,7 @@ impl Pages {
         }
         store.insert_page(record.clone()).map_err(Stop::store)?;
         if prefetch {
-            store
-                .unserved
-                .insert((store::site_key(host).into(), target.into()));
+            store.unserved.insert((host.into(), target.into()));
         }
         drop(store);
         if let Some(recovery) = made.recovery {

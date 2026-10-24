@@ -127,7 +127,7 @@ fn swap_stream_and_budget_against_upstream() {
             "event: message_delta\ndata: {\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n",
             "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
         );
-        write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+        write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: Text/Event-Stream; Charset=UTF-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
         for byte in body.bytes() {
             socket.write_all(&[byte]).unwrap();
         }

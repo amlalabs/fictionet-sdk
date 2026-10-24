@@ -3,27 +3,6 @@
 use super::*;
 
 impl Pages {
-    pub(super) fn canonical_page(&self, host: &str, target: &str) -> Option<(String, String)> {
-        let matches = |other_host: &str, other_target: &str| {
-            let (path, query) = target.split_once('?').unwrap_or((target, ""));
-            let (other_path, other_query) =
-                other_target.split_once('?').unwrap_or((other_target, ""));
-            store::site_key(host) == store::site_key(other_host)
-                && path
-                    .trim_end_matches('/')
-                    .eq_ignore_ascii_case(other_path.trim_end_matches('/'))
-                && query == other_query
-        };
-        if let Some(page) = self.seed.fixed.iter().find(|p| matches(&p.host, &p.target)) {
-            return Some((page.url.clone(), page.title.clone()));
-        }
-        let store = self.store();
-        store
-            .pages()
-            .find(|p| matches(&p.host, &p.target))
-            .map(|p| (p.url.clone(), p.title.clone()))
-    }
-
     pub(super) fn listed_video(&self, host: &str, target: &str) -> Option<PageRecord> {
         if host != "www.youtube.com" || !target.starts_with("/watch?v=") {
             return None;
@@ -117,7 +96,7 @@ impl Pages {
             && self
                 .store()
                 .unserved
-                .remove(&(store::site_key(&record.host).into(), record.target.clone()))
+                .remove(&(record.host.clone(), record.target.clone()))
         {
             cache = Cache::Prefetched;
         }

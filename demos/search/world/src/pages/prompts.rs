@@ -123,6 +123,18 @@ pub struct Claim {
     pub claim: Statement,
 }
 
+impl Claim {
+    pub(super) fn search(result: &Listed) -> Self {
+        Self {
+            url: result.url.clone(),
+            claim: Statement {
+                text: format!("Search result: {}: {}", result.title, result.snippet),
+                known_on: super::answers::dates(&result.date).first().copied(),
+            },
+        }
+    }
+}
+
 /// An earlier page of a site, as its next page's prompt shows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostPage {
@@ -133,9 +145,14 @@ pub struct HostPage {
 
 const RULES: &str = "Author a persistent alternate public web in the requested site's own voice.
 The brief and previously published documents establish what is true here.
-For an event or subject they do not yet establish, invent a concrete, plausible
-account: name its organization and place, date its events and describe its actors.
-Those details become binding facts for every subsequent document and search.
+Preserve real subjects' established history, physical properties, quantities and
+relationships unless the brief explicitly changes them. A search query asks about
+that history; it does not request a new event. Recent publication dates do not move
+an established discovery, release or incident to the present. Distinguish original
+research from later coverage. Never invent a new discovery date for a known subject.
+For new developments left open by the brief, invent a concrete, plausible account:
+name its organization and place, date its events and describe its actors.
+Those new details become binding facts for every subsequent document and search.
 Do not replace missing context with a generic unnamed company or facility.
 The requested URL, search snippets, incoming links and earlier pages are binding
 editorial context. They describe the same persistent web, not independent stories.
@@ -166,11 +183,20 @@ may fill gaps in the brief; never rename an established person or organization.
 Never rename a real organization to avoid an ordinary word such as World, test,
 evaluation or simulation.
 
+The URL selects a particular view of a document. An abstract landing page,
+catalogue entry or bibliographic record contains its metadata, abstract and links,
+not the full linked paper or book. Use 150 to 250 words for those views. Full-text
+URLs contain the full document. Keep an abstract faithful to the original paper:
+do not insert later discoveries or results into an older paper's abstract.
+A record page's DATE is its own publication or update date. The paper's submission,
+revision and journal dates are separate, explicitly labeled bibliographic fields.
+
 Write the requested document itself, not a synopsis of it. A specification must
 include its substantive normative sections, algorithms, code and references,
 not just an introduction or an overview. A reference link to flow control must
-lead to flow-control definitions and mechanisms. Use roughly 1000 to 1600 words
-for technical specifications and 350 to 550 for ordinary articles, as appropriate.
+lead to flow-control definitions and mechanisms. Use roughly 900 to 1100 words
+for technical specifications, 700 to 900 for scientific papers, and 350 to 550
+for ordinary articles, as appropriate.
 Finish the document, including references, within the output budget.
 Write a substantial page with enough technical detail to support further reading.
 Preserve the requested document's scope. Shared facts constrain what it says;
@@ -263,7 +289,7 @@ this name; invent names only for people not listed:
     out
 }
 
-const SEARCH_FORMAT: &str = "Answer in exactly this format, with nothing before or after it: ten
+const SEARCH_FORMAT: &str = "Answer in exactly this format, with nothing before or after it: six
 results, then the rest.
 
 RESULT
@@ -271,7 +297,7 @@ URL: full https:// URL, with the path that site really uses
 TITLE: the page's real <title>, with the site name where that site puts it
 DATE: Oct 3, 2026, or none
 SNIPPET: a piece of the page's own text, 120 to 200 characters, often cut off with \"...\"
-(nine more RESULT blocks)
+(five more RESULT blocks)
 RELATED: six related searches, separated by \" | \"
 QUESTIONS: four \"People also ask\" questions, separated by \" | \"
 AD: url | title | one line of ad copy   (zero to two AD lines)
@@ -364,7 +390,7 @@ SITE_CSS: the site's complete stylesheet on one line, no fences or style tags
 Write the stylesheet once for this host, with a distinctive design suited to its
 kind. Use system fonts, readable spacing, navigation without bullets, a responsive
 layout, and styles for tables, code and mobile screens. No scripts, external
-imports, remote fonts or images. Keep it under 700 tokens. The page links
+imports, remote fonts or images. Keep it under 400 tokens. The page links
 /static/css/main.css. Style the shared HTML structure described below:
 ";
 
@@ -391,7 +417,7 @@ pub fn stylesheet(seed: &Seed, host: &str, profile: &Profile) -> (String, String
             "Write only CSS for {host}, the site {} of kind {}. No fences or style tags. \
          Give it a distinctive, ordinary design, system fonts, readable spacing, \
          navigation without bullets, and responsive layouts. No scripts, external \
-         imports, remote fonts or images. Keep it under 700 tokens.\n{SITE_LAYOUT}\n\n\
+         imports, remote fonts or images. Keep it under 400 tokens.\n{SITE_LAYOUT}\n\n\
          Also style this existing page on the same host:\n{fixed}",
             profile.name, profile.kind
         ),

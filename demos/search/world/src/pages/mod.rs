@@ -57,7 +57,7 @@ pub const GENERATION_BUDGET: usize = 200;
 /// Output budgets include document markup, site metadata and provider reasoning.
 /// Shorter complete answers are requested if a provider reaches its limit.
 const SEARCH_TOKENS: u32 = 3200;
-const PAGE_TOKENS: u32 = 8000;
+const PAGE_TOKENS: u32 = 2500;
 const CAST_TOKENS: u32 = 800;
 
 /// A change to the world: its generation setting, what answers, or a
@@ -319,23 +319,20 @@ struct KeyLock {
 }
 
 impl Locks {
-    async fn lock(&self, cx: &Cx, key: String) -> std::io::Result<KeyLock> {
-        let local = self
-            .local
+    fn local(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.local
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .entry(key.clone())
+            .entry(key.into())
             .or_default()
-            .clone();
-        let local = local.lock_owned().await;
+            .clone()
+    }
+
+    fn file(&self, key: &str) -> std::io::Result<Option<std::fs::File>> {
         let Some(dir) = &self.dir else {
-            return Ok(KeyLock {
-                _local: local,
-                _file: None,
-            });
+            return Ok(None);
         };
         std::fs::create_dir_all(dir)?;
-        // Keys that share a file name only wait for each other.
         let name: String = key
             .chars()
             .map(|c| {
@@ -347,13 +344,39 @@ impl Locks {
             })
             .take(200)
             .collect();
-        let file = std::fs::OpenOptions::new()
+        std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
-            .open(dir.join(name))?;
-        // Another world may hold it while it makes the item, for seconds,
-        // so this world waits without blocking its thread.
+            .open(dir.join(name))
+            .map(Some)
+    }
+
+    fn try_lock(&self, key: &str) -> std::io::Result<Option<KeyLock>> {
+        let Ok(local) = self.local(key).try_lock_owned() else {
+            return Ok(None);
+        };
+        let file = match self.file(key)? {
+            Some(file) => match FileLock::try_take(&file)? {
+                Some(held) => Some(held),
+                None => return Ok(None),
+            },
+            None => None,
+        };
+        Ok(Some(KeyLock {
+            _local: local,
+            _file: file,
+        }))
+    }
+
+    async fn lock(&self, cx: &Cx, key: String) -> std::io::Result<KeyLock> {
+        let local = self.local(&key).lock_owned().await;
+        let Some(file) = self.file(&key)? else {
+            return Ok(KeyLock {
+                _local: local,
+                _file: None,
+            });
+        };
         loop {
             if let Some(held) = FileLock::try_take(&file)? {
                 return Ok(KeyLock {
@@ -373,7 +396,7 @@ impl Locks {
 }
 
 fn page_key(host: &str, target: &str) -> String {
-    format!("page {}{target}", store::site_key(host))
+    format!("page {host}{target}")
 }
 
 /// Returns host, target and anchor of the first

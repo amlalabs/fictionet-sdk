@@ -662,7 +662,7 @@ fn written_pages_rewrite_future_knowledge_and_respect_referring_datelines() {
         ),
         completion(
             0,
-            "STATUS: 200\nTITLE: Cable report\nDATE: 2026-10-14\nSITE_CSS: body {color:#234}\nBODY:\n<h1>Cable report</h1><p>Published 7 October 2026. Updated 14 October 2026. The cable incident occurred on 6 October 2026.</p><a href='https://research.fields.com/analysis'>Analysis</a>",
+            &json!({"edits":[{"before":"DATE: 2026-10-07","after":"DATE: 2026-10-14"},{"before":"<h1>Cable report</h1>","after":"<h1>Cable report</h1><p>Published 7 October 2026. Updated 14 October 2026.</p>"}]}).to_string(),
             None,
         ),
         completion(
@@ -672,7 +672,7 @@ fn written_pages_rewrite_future_knowledge_and_respect_referring_datelines() {
         ),
         completion(
             0,
-            "STATUS: 200\nTITLE: Cable analysis\nDATE: 2026-10-14\nSITE_CSS: body {color:#234}\nBODY:\n<h1>Cable analysis</h1><p>The cable incident occurred on 6 October 2026.</p>",
+            &json!({"edits":[{"before":"DATE: 2026-10-15","after":"DATE: 2026-10-14"}]}).to_string(),
             None,
         ),
     ]);
@@ -928,83 +928,124 @@ fn future_plans_are_known_when_announced() {
 fn search_promises_allow_parallel_first_sources() {
     struct Peer {
         ready: tokio::sync::Barrier,
+        started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
         fake: Arc<Fake>,
     }
     impl Transport for Peer {
         fn post<'a>(&'a self, cx: &'a Cx, headers: Headers, body: Vec<u8>) -> Post<'a> {
             Box::pin(async move {
+                if let Some(started) = self.started.lock().unwrap().take() {
+                    let _ = started.send(());
+                }
                 self.ready.wait().await;
                 self.fake.post(cx, headers, body).await
             })
         }
     }
-    let fake = Fake::new(|_, body| {
-        let prompt = body["messages"][1]["content"].as_str().unwrap();
-        assert!(prompt.contains("Reference guidance was published on 1 October 2026."));
-        completion(
-            0,
-            "STATUS: 200\nTITLE: Reference\nDATE: 2026-10-01\nSITE_CSS: body {color:#234}\nBODY:\n<h1>Reference</h1><p>Reference guidance was published on 1 October 2026.</p>",
-            None,
-        )
-    });
-    let model = Model::new(
-        Provider::OpenRouter,
-        "small",
-        "",
-        Key::new("provider key", Some(KEY.into())).unwrap(),
-        Arc::new(Peer {
-            ready: tokio::sync::Barrier::new(2),
-            fake,
-        }),
-    );
-    let pages = Arc::new(Pages::with_model(seed(), model));
-    pages
-        .store()
-        .insert_search(SearchRecord {
-            key: "reference".into(),
-            query: "reference".into(),
-            usage: Usage::stored(0),
-            search: search::Search {
-                results: ["news.fields.com", "research.fields.com"]
-                    .into_iter()
-                    .map(|host| search::Result {
-                        url: format!("https://{host}/reference"),
-                        title: "Reference".into(),
-                        date: "1 Oct 2026".into(),
-                        snippet: "Reference guidance was published on 1 October 2026.".into(),
-                    })
-                    .collect(),
-                ..Default::default()
-            },
-        })
-        .unwrap();
-    lab(move |cx| async move {
-        let other = pages.clone();
-        let (done, response) = tokio::sync::oneshot::channel();
-        cx.spawn(move |cx| async move {
-            done.send(get(&other, &cx, "https://news.fields.com/reference").await)
-                .unwrap();
+    for (first, second, first_listed) in [
+        (
+            "https://news.fields.com/reference",
+            "https://research.fields.com/reference",
+            true,
+        ),
+        (
+            "https://news.fields.com/reference",
+            "https://news.fields.com/appendix",
+            true,
+        ),
+        (
+            "https://research.fields.com/opaque-a123",
+            "https://news.fields.com/reference",
+            false,
+        ),
+    ] {
+        let fake = Fake::new(move |_, body| {
+            let prompt = body["messages"][1]["content"].as_str().unwrap();
+            if first_listed || prompt.starts_with(&format!("Write the page at: {second}")) {
+                assert!(prompt.contains("Reference guidance was published on 1 October 2026."));
+            }
+            completion(
+                0,
+                "STATUS: 200\nTITLE: Reference\nDATE: 2026-10-01\nSITE_CSS: body {color:#234}\nBODY:\n<h1>Reference</h1><p>Reference guidance was published on 1 October 2026.</p>",
+                None,
+            )
+        });
+        let (started, waiting) = tokio::sync::oneshot::channel();
+        let model = Model::new(
+            Provider::OpenRouter,
+            "small",
+            "",
+            Key::new("provider key", Some(KEY.into())).unwrap(),
+            Arc::new(Peer {
+                ready: tokio::sync::Barrier::new(2),
+                started: Mutex::new(Some(started)),
+                fake: fake.clone(),
+            }),
+        );
+        let pages = Arc::new(Pages::with_model(seed(), model));
+        pages
+            .store()
+            .insert_search(SearchRecord {
+                key: "reference".into(),
+                query: "reference".into(),
+                usage: Usage::stored(0),
+                search: search::Search {
+                    results: [first, second]
+                        .into_iter()
+                        .filter(|url| first_listed || *url == second)
+                        .map(|url| search::Result {
+                            url: url.into(),
+                            title: "Reference".into(),
+                            date: "1 Oct 2026".into(),
+                            snippet: "Reference guidance was published on 1 October 2026.".into(),
+                        })
+                        .collect(),
+                    ..Default::default()
+                },
+            })
+            .unwrap();
+        lab(move |cx| async move {
+            let other = pages.clone();
+            let (done, response) = tokio::sync::oneshot::channel();
+            cx.spawn(move |cx| async move {
+                done.send(get(&other, &cx, first).await).unwrap();
+                Ok(())
+            });
+            waiting.await.unwrap();
+            assert_eq!(get(&pages, &cx, second).await.status, 200);
+            assert_eq!(response.await.unwrap().status, 200);
+            if text::target_of(first).0 == text::target_of(second).0 {
+                assert_eq!(
+                    fake.users()
+                        .iter()
+                        .filter(|prompt| prompt.contains("SITE_CSS:"))
+                        .count(),
+                    1
+                );
+                assert_eq!(pages.store().host_pages(&text::target_of(first).0).len(), 2);
+            }
             Ok(())
         });
-        assert_eq!(
-            get(&pages, &cx, "https://research.fields.com/reference")
-                .await
-                .status,
-            200
-        );
-        assert_eq!(response.await.unwrap().status, 200);
-        Ok(())
-    });
+    }
 }
 
 #[test]
 fn readers_wait_for_chronology_rewrites_and_share_the_finished_page() {
     let bad = "STATUS: 200\nTITLE: Investigation\nDATE: 2026-10-07\nCLAIMS:\n- 2026-10-14 | The investigation concluded on 14 October 2026.\nSITE_CSS: body {color:#234}\nBODY:\n<h1>Investigation</h1><p>The investigation concluded on 14 October 2026.</p>";
-    let good = bad.replace("DATE: 2026-10-07", "DATE: 2026-10-14");
     let fake = Fake::script(vec![
         completion(10, bad, None),
-        completion(10, bad, None),
-        completion(10, &good, None),
+        completion(
+            10,
+            &json!({"edits":[{"before":"DATE: 2026-10-07","after":"DATE: 2026-10-07"}]})
+                .to_string(),
+            None,
+        ),
+        completion(
+            10,
+            &json!({"edits":[{"before":"DATE: 2026-10-07","after":"DATE: 2026-10-14"}]})
+                .to_string(),
+            None,
+        ),
     ]);
     let pages = Arc::new(Pages::with_model(seed(), openrouter(fake.clone())));
     lab(move |cx| async move {
@@ -1027,6 +1068,92 @@ fn readers_wait_for_chronology_rewrites_and_share_the_finished_page() {
                 .unwrap()
                 .date,
             "2026-10-14"
+        );
+        Ok(())
+    });
+}
+
+#[test]
+fn undeclared_later_knowledge_is_reviewed_before_publication() {
+    let fake = Fake::script(vec![
+        completion(
+            0,
+            "STATUS: 200\nTITLE: Investigation\nDATE: 2026-10-07\nSITE_CSS: body {color:#234}\nBODY:\n<p>The investigation concluded on 14 October 2026.</p>",
+            None,
+        ),
+        completion(
+            0,
+            r#"{"chronology":"later_knowledge","reason":"The investigation's conclusion could first be known on 2026-10-14, after publication on 2026-10-07."}"#,
+            None,
+        ),
+        completion(
+            0,
+            &json!({"edits":[{"before":"DATE: 2026-10-07","after":"DATE: 2026-10-14"},{"before":"BODY:\n","after":"BODY:\n<p>Published 7 October 2026. Updated 14 October 2026.</p>"}]}).to_string(),
+            None,
+        ),
+    ]);
+    let pages = Arc::new(Pages::with_model(seed(), openrouter(fake.clone())));
+    no_cast(&pages);
+    lab(move |cx| async move {
+        let response = get(&pages, &cx, "https://news.fields.com/investigation").await;
+        assert_eq!(response.status, 200);
+        let store = pages.store();
+        let page = store.page("news.fields.com", "/investigation").unwrap();
+        assert_eq!(page.date, "2026-10-14");
+        assert!(page.claims.is_empty());
+        let users = fake.users();
+        assert_eq!(users.len(), 3);
+        assert!(users[1].contains("PUBLICATION: 2026-10-07"));
+        assert!(users[1].contains("The investigation concluded on 14 October 2026"));
+        assert!(users[2].contains("could first be known on 2026-10-14"));
+        Ok(())
+    });
+}
+
+#[test]
+fn later_search_snippets_and_announced_plans_receive_semantic_review() {
+    let fake = Fake::script(vec![
+        completion(
+            0,
+            "RESULT\nURL: https://news.fields.com/investigation\nTITLE: Investigation results\nDATE: Oct 7, 2026\nSNIPPET: The investigation concluded on 14 October 2026.",
+            None,
+        ),
+        completion(
+            0,
+            r#"{"chronology":"later_knowledge","reason":"A conclusion on 2026-10-14 cannot be reported as completed on 2026-10-07."}"#,
+            None,
+        ),
+        completion(
+            0,
+            &json!({"edits":[{"before":"DATE: Oct 7, 2026","after":"DATE: Oct 14, 2026"}]})
+                .to_string(),
+            None,
+        ),
+        completion(
+            0,
+            "STATUS: 200\nTITLE: Investigation results\nDATE: 2026-10-14\nSITE_CSS: body {color:#234}\nBODY:\n<p>The investigation concluded on 14 October 2026. A follow-up hearing is scheduled for 28 October 2026.</p>",
+            None,
+        ),
+        completion(0, r#"{"chronology":"consistent"}"#, None),
+    ]);
+    let pages = Arc::new(Pages::with_model(seed(), openrouter(fake.clone())));
+    no_cast(&pages);
+    lab(move |cx| async move {
+        let response = google(&pages, &cx, "investigation results").await;
+        assert_eq!(response.status, 200);
+        let response = get(&pages, &cx, "https://news.fields.com/investigation").await;
+        assert_eq!(response.status, 200);
+        let users = fake.users();
+        assert_eq!(users.len(), 5);
+        assert!(users[1].contains("PUBLICATION: 2026-10-07"));
+        assert!(users[4].contains("A follow-up hearing is scheduled for 28 October 2026"));
+        let store = pages.store();
+        let context = store.writing_context("investigation results");
+        assert!(!context.is_empty());
+        assert!(
+            context
+                .iter()
+                .all(|claim| claim.claim.known_on == Some(seed::parse_date("2026-10-14").unwrap()))
         );
         Ok(())
     });

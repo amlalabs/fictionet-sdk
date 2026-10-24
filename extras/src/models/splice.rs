@@ -398,10 +398,7 @@ async fn read(
     tools: &Tools,
     output: &mut Output,
 ) -> fictionet::Result<Turn> {
-    let streaming = response
-        .headers()
-        .get("content-type")
-        .is_some_and(|s| s.as_bytes().starts_with(b"text/event-stream"));
+    let streaming = transport::Framing::of(&response) == transport::Framing::Events;
     let offset = output.content.len();
     let mut turn = Turn {
         content: Vec::new(),

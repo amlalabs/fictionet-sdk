@@ -149,16 +149,6 @@ impl Pages {
         let started = cx.now().since_start();
         let search = matches!(route, Route::Search { .. });
         let host_lower = host.to_lowercase();
-        let route = if matches!(method, "GET" | "HEAD") && route == Route::Page {
-            self.canonical_page(&host_lower, target)
-                .filter(|(url, _)| text::target_of(url).1 != target)
-                .map_or(route, |(location, _)| Route::Redirect {
-                    location,
-                    status: 301,
-                })
-        } else {
-            route
-        };
         let mut response = self.answer(cx, &host_lower, target, route).await;
         if self.copied_only() || self.live_only() {
             response.serve_ms = Some((cx.now().since_start() - started).as_millis() as u64);
@@ -290,7 +280,7 @@ impl Pages {
             && let Ok(body) = std::str::from_utf8(&response.body)
         {
             let store = self.store();
-            let url = format!("https://{}{target}", store::site_key(host));
+            let url = format!("https://{host}{target}");
             let page_host = store
                 .page(host, target)
                 .map_or(host, |page| page.host.as_str());
