@@ -96,9 +96,8 @@ pub(super) fn sanitize(
         .is_some_and(|value| value.as_bytes().starts_with(b"text/event-stream"));
     response.headers_mut().remove("content-length");
     for value in response.headers_mut().values_mut() {
-        if let Ok(text) = value.to_str() {
-            *value = secret.redact(text).parse()?;
-        }
+        let text = String::from_utf8_lossy(value.as_bytes());
+        *value = http::HeaderValue::from_bytes(secret.redact(&text).as_bytes())?;
     }
     Ok(response.map(|body| {
         Body::new(Scrubbed {
@@ -256,9 +255,17 @@ mod tests {
                         },
                     )
                     .header("x-diagnostic", "private-key")
+                    .header(
+                        "x-opaque",
+                        http::HeaderValue::from_bytes(b"\xff private-key").unwrap(),
+                    )
                     .body(Body::new(Chunks(frames.collect())))?;
                 let response = sanitize(response, secret.clone())?;
                 assert_eq!(response.headers()["x-diagnostic"], "<provider key>");
+                assert!(
+                    !String::from_utf8_lossy(response.headers()["x-opaque"].as_bytes())
+                        .contains("private-key")
+                );
                 let body = response.into_body().collect().await?.to_bytes();
                 let output = String::from_utf8(body.to_vec())?;
                 assert!(!output.contains("private"), "{output}");

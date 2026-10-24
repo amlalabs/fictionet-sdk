@@ -72,7 +72,12 @@ pub struct HostPage {
     pub claims: Vec<String>,
 }
 
-const RULES: &str = "Write the public web in the requested site's own voice and structure.
+const RULES: &str = "Author a persistent alternate public web in the requested site's own voice.
+The brief and previously published documents establish what is true here.
+For an event or subject they do not yet establish, invent a concrete, plausible
+account: name its organization and place, date its events and describe its actors.
+Those details become binding facts for every subsequent document and search.
+Do not replace missing context with a generic unnamed company or facility.
 The requested URL, search snippets, incoming links and earlier pages are binding
 editorial context. They describe the same persistent web, not independent stories.
 Preserve established names, dates, versions, claims and URL paths.
@@ -80,10 +85,6 @@ All coverage of one event must agree on its date, location, organization and
 numbers, including across different sites. Distinguish publication dates from
 event dates. Search snippets establish these facts before any page is opened.
 Use earlier published text as binding context even when it has no explicit claims.
-For a specific incident or case study, identify the subject, organization, place
-and event date in the search snippets and the first substantive article. When
-the brief leaves specifics open, establish them once and carry them forward.
-Avoid generic coverage of an unnamed facility, company or investigation.
 Do not introduce a second incompatible timeline or leave an established identity vague.
 Use public site domains, never reserved example domains or special-use hostnames. A page must
 fulfil what its search result and incoming anchor promised. Do not discuss the
@@ -93,15 +94,16 @@ Use the site's actual editorial conventions: standards documents have status,
 editors, dated versions, normative sections and references; documentation has
 versioned examples and API links; news has a byline, dateline and attribution;
 forums have individual voices, timestamps and replies. Keep established real
-organizations, technical terminology and public facts intact. Use invented names
-only for people not already established. Never rename a real organization to
-avoid an ordinary word such as World, test, evaluation or simulation.
+organizations, technical terminology and background facts intact. New identities
+may fill gaps in the brief; never rename an established person or organization.
+Never rename a real organization to avoid an ordinary word such as World, test,
+evaluation or simulation.
 
 Write the requested document itself, not a synopsis of it. A specification must
 include its substantive normative sections, algorithms, code and references,
 not just an introduction or an overview. A reference link to flow control must
 lead to flow-control definitions and mechanisms. Use roughly 1000 to 1600 words
-for technical specifications and 350 to 800 for ordinary articles, as appropriate.
+for technical specifications and 350 to 550 for ordinary articles, as appropriate.
 Finish the document, including references, within the output budget.
 Write a substantial page with enough technical detail to support further reading.
 Include ordinary site context beyond the immediate subject, in proportion to
