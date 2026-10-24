@@ -1010,3 +1010,22 @@ async fn long_lived_claude_token_stays_on_the_host() {
     }).await.unwrap();
     server.abort();
 }
+
+#[test]
+fn custom_client_tool_formats_remain_local_inputs() {
+    let tool = json!({"type":"custom","name":"local_tool","format":{"type":"text"}});
+    assert!(safe_request(
+        Provider::OpenAi,
+        "/v1/responses",
+        &json!({"input":"Read https://sky.org", "tools":[tool.clone()]}),
+        false
+    ));
+    let mut remote = tool;
+    remote["server_url"] = json!("https://sky.org/mcp");
+    assert!(!safe_request(
+        Provider::OpenAi,
+        "/v1/responses",
+        &json!({"input":"Read", "tools":[remote]}),
+        false
+    ));
+}

@@ -248,8 +248,21 @@ pub(super) enum TaggedTool {
         defer_loading: Option<bool>,
     },
     Custom {
-        #[serde(flatten)]
-        definition: ClientTool,
+        name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        input_schema: Option<serde_json::Map<String, Value>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        strict: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        defer_loading: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        input_examples: Option<Vec<Value>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        allowed_callers: Option<Vec<String>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         format: Option<Value>,
     },
