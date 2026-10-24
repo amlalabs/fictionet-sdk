@@ -151,7 +151,7 @@ function activityText(row) {
     case 'egress': return [fact.host, 'Upstream', `${fact.purpose} · ${fact.method} ${briefPath(fact.path)} · ${fact.status || fact.phase}`, `egress:${fact.host}`];
     case 'page_revision': {
       const target = fact.target.url ? new URL(fact.target.url).hostname : fact.target.host || 'Search';
-      return [target, 'Writer', fact.action === 'rejected' ? 'Rewriting' : 'Recovered', 'sites'];
+      return [target, 'Writer', fact.action === 'rejected' ? 'Answer rejected' : 'Recovered', 'writer'];
     }
     case 'observation_failed': return ['Recording', 'Error', fact.reason, 'egress'];
     case 'no_route': return [fact.to, 'TCP', 'no route', 'router'];
@@ -165,7 +165,7 @@ function feed() {
     const [target, protocol, text, selected] = activityText(row);
     const item = button('', () => select(selected), `activity-row ${row.fact.kind}`);
     item.append(element('span', stamp(row.at_ms), 'stamp'), element('span', target), element('span', protocol), element('span', text));
-    item.title = `${target} · ${text}`;
+    item.title = `${target} · ${text}${row.fact.kind === 'page_revision' ? ` · ${row.fact.reason}` : ''}`;
     $('activity').append(item);
   }
   $('activity').scrollTop = scrollTop;
@@ -325,6 +325,13 @@ function details() {
       body.append(detailRow(search.at_ms, 'Search', `${search.results.length} results`, content));
     }
     if (!searches.length) body.append(element('p', 'No searches', 'detail-empty'));
+  } else if (selection === 'writer') {
+    heading('Writer');
+    for (const row of shown.activity.filter((row) => row.fact.kind === 'page_revision')) {
+      const fact = row.fact;
+      const target = fact.target.url || fact.target.host || fact.target.query || 'Cast';
+      body.append(detailRow(row.at_ms, target, fact.action === 'rejected' ? 'Answer rejected' : 'Recovered', element('p', fact.reason, fact.action === 'rejected' ? 'writer-error' : 'meta')));
+    }
   } else if (selection === 'sites') {
     heading('Sites');
     for (const site of localSites()) {

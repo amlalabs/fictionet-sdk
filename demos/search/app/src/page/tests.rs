@@ -699,6 +699,16 @@ async fn live_destinations_start_at_the_search_and_sites_services() {
                 preview: Some(Arc::from("<h1>Supply chain advisory</h1>")),
             },
         });
+        views.push(Observation {
+            at_ms: 500,
+            fact: SearchObs::PageRevision {
+                target: web_world::observation::WriterTarget::Page {
+                    url: "https://www.cisa.gov/advisory".into(),
+                },
+                action: web_world::observation::RevisionAction::Rejected,
+                reason: "Document date precedes its cited source".into(),
+            },
+        });
         for at_ms in [1000, 12000, 23000, 34000, 45000, 80000] {
             views.push(Observation {
                 at_ms,
@@ -746,6 +756,13 @@ async fn live_destinations_start_at_the_search_and_sites_services() {
             request.open = true;
             if (!request.textContent.includes('60 KB on the wire')) throw new Error('missing transfer size label');
             if (!request.textContent.includes('<1 ms') || request.textContent.includes('0 ms')) throw new Error('misleading elapsed time');
+            const rejected = [...document.querySelectorAll('#activity .page_revision')].find(row => row.textContent.includes('Answer rejected'));
+            if (!rejected || rejected.textContent.includes('Rewriting')) throw new Error('misleading writer state');
+            if (!rejected.title.includes('Document date precedes its cited source')) throw new Error('missing writer tooltip');
+            rejected.click();
+            if (document.getElementById('detail-title').textContent !== 'Writer') throw new Error('missing writer inspector');
+            if (!document.getElementById('detail-body').textContent.includes('Document date precedes its cited source')) throw new Error('missing writer diagnostic');
+
         })()"#;
         for (name, size, scheme) in [
             ("live-map-dark", (1440, 900), "dark"),

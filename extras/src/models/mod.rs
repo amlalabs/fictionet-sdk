@@ -924,10 +924,7 @@ impl Model {
         match result {
             Ok(response) => {
                 call.status = response.status().as_u16();
-                let sse = response
-                    .headers()
-                    .get("content-type")
-                    .is_some_and(|v| v.as_bytes().starts_with(b"text/event-stream"));
+                let sse = transport::Framing::of(&response) == transport::Framing::Events;
                 Ok(response.map(|body| Body::new(response::Metered::new(body, call, sse))))
             }
             Err(error) => {

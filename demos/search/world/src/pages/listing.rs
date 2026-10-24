@@ -207,16 +207,6 @@ impl Pages {
                 }
             }
         }
-        for result in &mut search.results {
-            let (host, target) = text::target_of(&result.url);
-            if let Some((url, title)) = self
-                .canonical_page(&host, &target)
-                .filter(|(url, _)| text::target_of(url).1 != target)
-            {
-                result.url = url;
-                result.title = title;
-            }
-        }
         make::finish_listing(&mut search);
         let mut reached = HashSet::new();
         for result in &mut search.results {
@@ -320,14 +310,6 @@ impl Pages {
         let mut results: Vec<fictionet_extras::search::Result> = Vec::new();
         for mut r in std::mem::take(&mut search.results) {
             let (host, target) = text::target_of(&r.url);
-            if let Some((url, title)) = self
-                .canonical_page(&host, &target)
-                .filter(|(url, _)| text::target_of(url).1 != target)
-            {
-                r.url = url;
-                r.title = title;
-            }
-            let (host, target) = text::target_of(&r.url);
             let known_match = known.iter().find(|k| k.url == r.url);
             // A page the world already holds stays out of an unrelated list.
             // A model that lists it for this search with a row sharing the
@@ -400,7 +382,9 @@ impl Pages {
         }
         for r in record.search.results.iter().take(self.prefetch) {
             let (host, target) = text::target_of(&r.url);
-            if self.canonical_page(&host, &target).is_some() {
+            if self.seed.fixed_for(&host, &target).is_some()
+                || self.store().page(&host, &target).is_some()
+            {
                 continue;
             }
             let pages = self.clone();

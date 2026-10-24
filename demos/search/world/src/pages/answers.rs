@@ -394,3 +394,61 @@ pub(super) fn chronology(page: &Page, latest: time::Date) -> Result<(), Unreadab
     }
     Ok(())
 }
+
+/// Publication text that needs semantic review: dates alone cannot distinguish
+/// an announced plan from knowledge of its eventual outcome. Explicit calendar
+/// dates select documents for semantic review; this does not prove the accuracy
+/// of arbitrary undated prose or scientific claims.
+pub(super) trait Publication {
+    fn later_text(&self, latest: time::Date) -> Vec<(time::Date, String)>;
+}
+impl Publication for Page {
+    fn later_text(&self, latest: time::Date) -> Vec<(time::Date, String)> {
+        let dateline = super::seed::parse_date(&self.date).unwrap_or(latest);
+        let text = format!(
+            "{}\n{}\n{}",
+            self.title,
+            self.description,
+            if self.content_type.starts_with("text/html") {
+                super::text::text_of(&self.body)
+            } else {
+                self.body.clone()
+            }
+        );
+        if dates(&text).iter().any(|date| *date > dateline) {
+            vec![(dateline, text)]
+        } else {
+            Vec::new()
+        }
+    }
+}
+impl Publication for Search {
+    fn later_text(&self, latest: time::Date) -> Vec<(time::Date, String)> {
+        self.results
+            .iter()
+            .flat_map(|result| {
+                Page {
+                    date: dates(&result.date)
+                        .first()
+                        .map(ToString::to_string)
+                        .unwrap_or_default(),
+                    title: result.title.clone(),
+                    body: result.snippet.clone(),
+                    content_type: "text/plain".into(),
+                    ..Default::default()
+                }
+                .later_text(latest)
+            })
+            .collect()
+    }
+}
+impl Publication for String {
+    fn later_text(&self, _: time::Date) -> Vec<(time::Date, String)> {
+        Vec::new()
+    }
+}
+impl Publication for Vec<Person> {
+    fn later_text(&self, _: time::Date) -> Vec<(time::Date, String)> {
+        Vec::new()
+    }
+}

@@ -162,23 +162,8 @@ pub struct Store {
     pub unserved: std::collections::HashSet<(String, String)>,
 }
 
-pub(super) fn site_key(host: &str) -> &str {
-    let host = host.strip_prefix("www.").unwrap_or(host);
-    if let Some((language, domain)) = host.split_once('.') {
-        let parts: Vec<_> = domain.split('.').collect();
-        if language.len() == 2
-            && language.bytes().all(|b| b.is_ascii_lowercase())
-            && (parts.len() == 2
-                || (parts.len() == 3 && parts[2].len() == 2 && parts[1].len() <= 3))
-        {
-            return domain;
-        }
-    }
-    host
-}
-
 fn key(host: &str, target: &str) -> (String, String) {
-    (site_key(host).to_owned(), target.to_owned())
+    (host.to_owned(), target.to_owned())
 }
 
 /// Why a store cannot be used, and how to start over.
@@ -427,7 +412,7 @@ impl Store {
         self.order
             .iter()
             .rev()
-            .filter(|(h, _)| site_key(h) == site_key(host))
+            .filter(|(h, _)| h == host)
             .take(20)
             .map(|at| {
                 let page = &self.pages[at];
@@ -456,7 +441,7 @@ impl Store {
                 !seed
                     .fixed
                     .iter()
-                    .any(|f| site_key(&f.host) == at.0 && f.target == at.1)
+                    .any(|f| f.host == at.0 && f.target == at.1)
             })
             .map(|at| &self.pages[at])
             .filter(|p| {
@@ -499,13 +484,10 @@ impl Store {
             if super::make::shares_words(&format!("{} {} {text}", page.title, page.url), subject) {
                 claims.push(Claim {
                     url: page.url.clone(),
-                    claim: format!(
-                        "{} (published {}): {}",
-                        page.title,
-                        page.date,
-                        super::text::take(&text, 4000)
-                    )
-                    .into(),
+                    claim: super::prompts::Statement {
+                        text: format!("{}: {}", page.title, super::text::take(&text, 4000)),
+                        known_on: super::seed::parse_date(&page.date).ok(),
+                    },
                 });
             }
         }
@@ -514,15 +496,30 @@ impl Store {
             .values()
             .filter(|search| super::make::shares_words(&search.query, subject))
         {
+            claims.extend(search.search.results.iter().map(Claim::search));
+        }
+        claims
+    }
+
+    /// A destination inherits the search that listed its exact address,
+    /// even when an opaque path shares no words with the query.
+    pub fn page_context(&self, host: &str, target: &str) -> Vec<Claim> {
+        let url = format!("https://{host}{target}");
+        let subject = format!(
+            "{url} {}",
+            serde_json::to_string(self.mentions(host, target)).expect("mentions")
+        );
+        let mut claims = self.writing_context(&subject);
+        for search in self
+            .searches
+            .values()
+            .filter(|search| search.search.results.iter().any(|result| result.url == url))
+        {
             for result in &search.search.results {
-                claims.push(Claim {
-                    url: result.url.clone(),
-                    claim: format!(
-                        "Search result: {} (published {}): {}",
-                        result.title, result.date, result.snippet
-                    )
-                    .into(),
-                });
+                let claim = Claim::search(result);
+                if !claims.contains(&claim) {
+                    claims.push(claim);
+                }
             }
         }
         claims
