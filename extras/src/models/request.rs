@@ -944,7 +944,7 @@ enum Wire {
 impl Message {
     fn allowed(&self, wire: Wire) -> bool {
         let role = match wire {
-            Wire::Messages => matches!(self.role, Role::User | Role::Assistant),
+            Wire::Messages => matches!(self.role, Role::System | Role::User | Role::Assistant),
             Wire::Chat | Wire::Responses => matches!(
                 self.role,
                 Role::System

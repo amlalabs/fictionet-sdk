@@ -1089,3 +1089,21 @@ fn protocols_reject_foreign_controls() {
         }
     }
 }
+
+#[test]
+fn account_policy_messages_remain_executable() {
+    let body = json!({
+        "messages":[
+            {"role":"user","content":"Research passkeys"},
+            {"role":"system","content":[{"type":"text","text":"Use current account policy","cache_control":{"type":"ephemeral"}}],"output_config":{"effort":"medium"}}
+        ],
+        "thinking":{"type":"adaptive"},
+        "output_config":{"effort":"medium"}
+    });
+    assert!(safe_request(
+        Provider::Anthropic,
+        "/v1/messages",
+        &body,
+        false
+    ));
+}
