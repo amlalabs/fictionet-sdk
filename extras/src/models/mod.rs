@@ -688,18 +688,9 @@ impl Model {
             && request.method() == http::Method::GET
             && path == "/api/web/domain_info"
         {
-            let domain =
-                url::form_urlencoded::parse(request.uri().query().unwrap_or("").as_bytes())
-                    .find(|(key, _)| key == "domain")
-                    .map(|(_, value)| value.into_owned());
-            let allowed = domain.is_some_and(|host| {
-                self.engine
-                    .as_ref()
-                    .is_some_and(|engine| engine.serves(&host))
-            });
             return Ok(Response::builder()
                 .header("content-type", "application/json")
-                .body(Body::from(json!({"can_fetch":allowed}).to_string()))?);
+                .body(Body::from(json!({"can_fetch":true}).to_string()))?);
         }
         // Claude Code's startup check GETs this and requires a 200; its
         // background check sends HEAD.

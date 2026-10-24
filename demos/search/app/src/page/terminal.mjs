@@ -7,6 +7,30 @@ export function mount(root, { Terminal, FitAddon }, socket, options = {}) {
   terminal.open(root);
   socket.binaryType = 'arraybuffer';
   const send = (value) => { if (socket.readyState === 1) socket.send(value); };
+  let wheelPixels = 0;
+  terminal.attachCustomWheelEventHandler((event) => {
+    const canvas = root.querySelector('canvas');
+    if (!canvas || !event.deltaY) return true;
+    const bounds = canvas.getBoundingClientRect();
+    const cellHeight = bounds.height / terminal.rows;
+    const pixels = event.deltaY * (event.deltaMode === 1 ? cellHeight : event.deltaMode === 2 ? bounds.height : 1);
+    const tracking = terminal.hasMouseTracking();
+    if (tracking && !event.shiftKey) {
+      if (Math.sign(wheelPixels) !== Math.sign(pixels)) wheelPixels = 0;
+      wheelPixels += pixels;
+      const lines = Math.min(terminal.rows, Math.trunc(Math.abs(wheelPixels) / cellHeight));
+      if (!lines) return true;
+      wheelPixels %= cellHeight;
+      const column = Math.max(1, Math.min(terminal.cols, Math.floor((event.clientX - bounds.left) * terminal.cols / bounds.width) + 1));
+      const row = Math.max(1, Math.min(terminal.rows, Math.floor((event.clientY - bounds.top) / cellHeight) + 1));
+      const button = (pixels < 0 ? 64 : 65) + (event.altKey ? 8 : 0) + (event.ctrlKey ? 16 : 0);
+      send(new TextEncoder().encode(`\x1b[<${button};${column};${row}M`.repeat(lines)));
+    } else {
+      wheelPixels = 0;
+      terminal.scrollLines(pixels / cellHeight);
+    }
+    return true;
+  });
   const input = terminal.onData((text) => send(new TextEncoder().encode(text)));
   const resize = () => {
     if (!root.clientWidth || !root.clientHeight) return;

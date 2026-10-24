@@ -93,6 +93,6 @@ impl fictionet_extras::models::Engine for Pages {
         })
     }
     fn serves(&self, host: &str) -> bool {
-        self.serves_host(host)
+        crate::admit(host).is_ok()
     }
 }

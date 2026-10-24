@@ -16,7 +16,8 @@ pub trait Engine: Send + Sync {
     ) -> Answer<Vec<crate::search::Result>>;
     /// Reads a page through the world's handler, without a host internet request.
     fn fetch(self: Arc<Self>, cx: Cx, url: String) -> Answer<Page>;
-    /// Whether the world serves a hostname.
+    /// Whether the world permits fetching from a hostname. Missing pages are
+    /// answered by the fetch handler, independently of domain admission.
     fn serves(&self, host: &str) -> bool;
 }
 

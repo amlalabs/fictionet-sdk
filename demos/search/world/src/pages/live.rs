@@ -528,9 +528,13 @@ impl Pages {
         self.live.is_some()
     }
 
-    /// Configure host search from environment credentials. The World menu selects it.
+    /// Configure and select host search from environment credentials.
     pub fn with_live_search(mut self, downloads: &Path) -> Result<Self, String> {
         self.live = Some(Live::new(downloads)?);
+        self.live_active
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.copied_active
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         Ok(self)
     }
 

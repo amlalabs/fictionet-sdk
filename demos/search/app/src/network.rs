@@ -359,7 +359,7 @@ mod tests {
         upstream.abort();
     }
     #[test]
-    fn domain_checks_delegate_to_the_copied_corpus() {
+    fn domain_checks_allow_fetches_to_reach_the_world() {
         fictionet::block_on(fictionet::lab(
             fictionet::Seed::from_u64(8),
             |cx| async move {
@@ -378,10 +378,10 @@ mod tests {
                         &cx,
                         fictionet_extras::models::Provider::Anthropic,
                     )?,
-                    pages,
+                    pages: pages.clone(),
                     host: "api.anthropic.com".parse()?,
                 };
-                for (host, allowed) in [("sky.org", true), ("uncaptured.org", false)] {
+                for host in ["sky.org", "uncaptured.org"] {
                     let request = http::Request::get(format!("/api/web/domain_info?domain={host}"))
                         .body(Body::empty())?;
                     let httpd::Reply::Later(work) = gateway.call(
@@ -393,8 +393,16 @@ mod tests {
                     let response = work(cx.clone()).await?;
                     let body = response.into_body().collect().await?.to_bytes();
                     let body: Value = serde_json::from_slice(&body)?;
-                    assert_eq!(body["can_fetch"], allowed);
+                    assert_eq!(body["can_fetch"], true);
                 }
+                assert!(!pages.serves_host("uncaptured.org"));
+                assert_eq!(
+                    pages
+                        .handle(&cx, "GET", "uncaptured.org", "/article", None)
+                        .await
+                        .status,
+                    404
+                );
                 let request =
                     http::Request::post("/api/oauth/cli/create_api_key").body(Body::empty())?;
                 let httpd::Reply::Now(response) = gateway.call(
