@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 enum Channel {
     Text(u64),
     Thinking(u64),
+    Refusal(u64),
     Tool(u64, u64),
 }
 
@@ -35,8 +36,10 @@ fn fields(value: &Value) -> Vec<(Channel, String)> {
     let output = value["output_index"].as_u64().unwrap_or(0);
     let delta_channel = if value["type"] == "response.function_call_arguments.delta" {
         Channel::Tool(0, output)
+    } else if value["type"] == "response.refusal.delta" {
+        Channel::Refusal(0)
     } else {
-        Channel::Text(output)
+        Channel::Text(0)
     };
     add(delta_channel, "/delta".into());
     if let Some(choices) = value["choices"].as_array() {
@@ -51,6 +54,22 @@ fn fields(value: &Value) -> Vec<(Channel, String)> {
                     Channel::Thinking(channel),
                     format!("/choices/{index}/{container}/reasoning_content"),
                 );
+                add(
+                    Channel::Thinking(channel),
+                    format!("/choices/{index}/{container}/reasoning"),
+                );
+                add(
+                    Channel::Refusal(channel),
+                    format!("/choices/{index}/{container}/refusal"),
+                );
+                if let Some(parts) = choice[container]["content"].as_array() {
+                    for (part, _) in parts.iter().enumerate() {
+                        add(
+                            Channel::Text(channel),
+                            format!("/choices/{index}/{container}/content/{part}/text"),
+                        );
+                    }
+                }
                 if let Some(tools) = choice[container]["tool_calls"].as_array() {
                     for (tool_index, tool) in tools.iter().enumerate() {
                         add(
@@ -89,7 +108,11 @@ fn fields(value: &Value) -> Vec<(Channel, String)> {
             if let Some(content) = item["content"].as_array() {
                 for (part, _) in content.iter().enumerate() {
                     add(
-                        Channel::Text(index as u64),
+                        Channel::Refusal(0),
+                        format!("/output/{index}/content/{part}/refusal"),
+                    );
+                    add(
+                        Channel::Text(0),
                         format!("/output/{index}/content/{part}/text"),
                     );
                 }

@@ -1,5 +1,9 @@
 //! Shared provider transport lifecycle for host and guest requests.
 use super::*;
+use fictionet::stdlib::{
+    codec::{Stream, Wire, try_pump},
+    protocols::sse,
+};
 use http_body::{Body as HttpBody, Frame};
 
 mod text;
@@ -108,6 +112,8 @@ pub(super) fn sanitize(
             pending: Vec::new(),
             streaming,
             records: Vec::new(),
+            lines: Stream::new(sse::RawLines::with_limit(32 * 1024 * 1024)),
+            event: Vec::new(),
             done: false,
         })
     }))
@@ -137,12 +143,64 @@ struct Scrubbed {
     streaming: bool,
     done: bool,
     records: Vec<Record>,
+    lines: Stream<sse::RawLines>,
+    event: Vec<sse::Line>,
 }
 enum Record {
-    Json(Value, bool),
+    Json(Value, Vec<u8>),
     Raw(Vec<u8>),
 }
 impl Scrubbed {
+    fn feed(&mut self, bytes: &[u8]) -> fictionet::Result<()> {
+        let mut decoded = Vec::new();
+        try_pump(&mut self.lines, bytes, |line| {
+            decoded.push(line);
+            Ok::<_, Error>(())
+        })
+        .map_err(|_| Error::msg("Invalid provider event stream"))?;
+        for line in decoded {
+            if line != sse::Line::Empty {
+                self.event.push(line);
+                continue;
+            }
+            let mut data = Vec::new();
+            let mut metadata = Vec::new();
+            let mut raw = Vec::new();
+            for line in self.event.drain(..) {
+                if let sse::Line::Data(text) = &line {
+                    data.push(text.as_str().to_owned());
+                } else {
+                    line.write(&mut metadata)
+                        .map_err(|_| Error::msg("Invalid provider event metadata"))?;
+                }
+                // Payload lines may exceed the ordinary line writer's default bound.
+                if let sse::Line::Data(text) = line {
+                    raw.extend(format!("data: {text}\n").bytes());
+                } else {
+                    line.write(&mut raw)
+                        .map_err(|_| Error::msg("Invalid provider event metadata"))?;
+                }
+            }
+            raw.push(b'\n');
+            let data = data.join("\n");
+            let record = match serde_json::from_str(&data) {
+                Ok(value) => Record::Json(
+                    value,
+                    self.secret
+                        .redact(&String::from_utf8_lossy(&metadata))
+                        .into_bytes(),
+                ),
+                Err(_) => Record::Raw(
+                    self.secret
+                        .redact(&String::from_utf8_lossy(&raw))
+                        .into_bytes(),
+                ),
+            };
+            self.records.push(record);
+        }
+        Ok(())
+    }
+
     fn ready(&mut self, end: bool) -> Vec<u8> {
         if !self.streaming {
             if !end {
@@ -156,29 +214,6 @@ impl Scrubbed {
                     .redact(&String::from_utf8_lossy(&self.pending))
                     .into_bytes()
             };
-        }
-        let length = if end {
-            self.pending.len()
-        } else {
-            self.pending
-                .iter()
-                .rposition(|b| *b == b'\n')
-                .map_or(0, |i| i + 1)
-        };
-        let bytes: Vec<_> = self.pending.drain(..length).collect();
-        for line in bytes.split_inclusive(|b| *b == b'\n') {
-            let record = if let Some(data) = line.strip_prefix(b"data:")
-                && let Ok(value) = serde_json::from_slice::<Value>(data)
-            {
-                Record::Json(value, line.ends_with(b"\n"))
-            } else {
-                Record::Raw(
-                    self.secret
-                        .redact(&String::from_utf8_lossy(line))
-                        .into_bytes(),
-                )
-            };
-            self.records.push(record);
         }
         let mut values: Vec<_> = self
             .records
@@ -203,12 +238,11 @@ impl Scrubbed {
         let mut output = Vec::new();
         for record in self.records.drain(..ready) {
             match record {
-                Record::Json(value, newline) => {
+                Record::Json(value, metadata) => {
+                    output.extend(metadata);
                     output.extend(b"data: ");
                     output.extend(serde_json::to_vec(&value).expect("provider JSON"));
-                    if newline {
-                        output.push(b'\n');
-                    }
+                    output.extend(b"\n\n");
                 }
                 Record::Raw(bytes) => output.extend(bytes),
             }
@@ -231,16 +265,42 @@ impl HttpBody for Scrubbed {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
                     Ok(bytes) => {
-                        self.pending.extend_from_slice(&bytes);
+                        if self.streaming {
+                            if let Err(error) = self.feed(&bytes) {
+                                self.done = true;
+                                return Poll::Ready(Some(Err(error)));
+                            }
+                        } else {
+                            self.pending.extend_from_slice(&bytes);
+                        }
                         let held: usize = self
                             .records
                             .iter()
                             .map(|record| match record {
-                                Record::Json(value, _) => value.to_string().len(),
+                                Record::Json(value, metadata) => {
+                                    value.to_string().len() + metadata.len()
+                                }
                                 Record::Raw(bytes) => bytes.len(),
                             })
                             .sum();
-                        if self.pending.len() + held > 32 * 1024 * 1024 {
+                        let event_bytes: usize = self.event.len()
+                            * std::mem::size_of::<sse::Line>()
+                            + self
+                                .event
+                                .iter()
+                                .map(|line| match line {
+                                    sse::Line::Data(text)
+                                    | sse::Line::Event(text)
+                                    | sse::Line::Id(text)
+                                    | sse::Line::Comment(text)
+                                    | sse::Line::Retry(text) => text.len(),
+                                    sse::Line::Ignored { name, value } => name.len() + value.len(),
+                                    sse::Line::Empty => 0,
+                                })
+                                .sum::<usize>();
+                        if self.pending.len() + held + event_bytes + self.lines.held()
+                            > 32 * 1024 * 1024
+                        {
                             self.done = true;
                             return Poll::Ready(Some(Err(Error::msg(
                                 "Provider response exceeds sanitization limit",
@@ -375,6 +435,39 @@ mod tests {
             let arguments: String = output.lines().filter_map(|line| line.strip_prefix("data: ")).map(|line| serde_json::from_str::<Value>(line).unwrap()["delta"]["partial_json"].as_str().unwrap().to_owned()).collect();
             let value: Value = serde_json::from_str(&arguments)?;
             assert_eq!(value["value"], "<provider key>");
+            Ok(())
+        })).unwrap();
+    }
+
+    #[test]
+    fn multiline_events_are_decoded_before_text_blocks_are_assembled() {
+        fictionet::block_on(fictionet::lab(fictionet::Seed::from_u64(11), |_| async {
+            let input = b"id: report\r\nevent: message\r\ndata: {\"content\":[{\"type\":\"text\",\"text\":\"private-\"},\r\ndata: {\"type\":\"text\",\"text\":\"key\"}]}\r\n\r\n";
+            let frames = input.iter().map(|byte| Ok(Frame::data(Bytes::from(vec![*byte])))).collect();
+            let response = sanitize(Response::builder().header("content-type", "text/event-stream").body(Body::new(Chunks(frames)))?, Secret::new("provider key", "private-key".into())?)?;
+            let bytes = response.into_body().collect().await?.to_bytes();
+            let event = sse::Event::parse(&bytes)?;
+            assert_eq!(event.id, "report");
+            assert_eq!(event.event, "message");
+            let value: Value = serde_json::from_str(&event.data)?;
+            let text: String = value["content"].as_array().unwrap().iter().map(|block| block["text"].as_str().unwrap()).collect();
+            assert_eq!(text, "<provider key>");
+            Ok(())
+        })).unwrap();
+    }
+
+    #[test]
+    fn response_items_and_chat_content_parts_are_scrubbed_as_assembled_text() {
+        fictionet::block_on(fictionet::lab(fictionet::Seed::from_u64(12), |_| async {
+            for (body, pointers) in [
+                (json!({"output":[{"content":[{"text":"private-"}]},{"content":[{"text":"key"}]}]}), ["/output/0/content/0/text", "/output/1/content/0/text"]),
+                (json!({"choices":[{"message":{"content":[{"text":"private-"},{"text":"key"}]}}]}), ["/choices/0/message/content/0/text", "/choices/0/message/content/1/text"]),
+            ] {
+                let response = sanitize(Response::new(Body::from(body.to_string())), Secret::new("provider key", "private-key".into())?)?;
+                let value: Value = serde_json::from_slice(&response.into_body().collect().await?.to_bytes())?;
+                let text: String = pointers.into_iter().map(|path| value.pointer(path).unwrap().as_str().unwrap()).collect();
+                assert_eq!(text, "<provider key>");
+            }
             Ok(())
         })).unwrap();
     }
