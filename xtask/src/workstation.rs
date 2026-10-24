@@ -12,7 +12,8 @@ fn definition() -> Guest {
         "https://www.google.com/",
     )))
     .packages(&["xclip", "nmap", "tmux", "python3", "python3-pip", "python3-venv"])
-    .file("/home/analyst/.tmux.conf", 0o644, "set -g status off\n")
+    .file("/home/analyst/.tmux.conf", 0o644, "set -g status off\nset -g mouse on\n")
+    .file("/home/analyst/.hushlogin", 0o644, "")
     .file("/etc/apt/sources.list.d/mozilla.sources", 0o644, "")
     .file("/etc/apt/sources.list.d/ubuntu.sources", 0o644,
         "Types: deb\nURIs: https://snapshot.ubuntu.com/ubuntu/20261023T000000Z/\nSuites: noble noble-updates noble-security noble-backports\nComponents: main restricted universe multiverse\nSigned-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\nCheck-Valid-Until: no\n")
@@ -86,7 +87,11 @@ mod tests {
         file("/etc/systemd/timesyncd.conf");
         file("/etc/systemd/system/apt-daily.timer.d/quiet.conf");
         file("/etc/claude-code/managed-settings.json");
-        assert_eq!(file("/home/analyst/.tmux.conf"), "set -g status off\n");
+        assert_eq!(
+            file("/home/analyst/.tmux.conf"),
+            "set -g status off\nset -g mouse on\n"
+        );
+        assert!(file("/home/analyst/.hushlogin").is_empty());
         assert!(command.contains("then systemctl stop apt-daily.timer; fi"));
         assert!(!command.contains("systemctl start vnc"));
         assert!(!file("/opt/setup-desktop.sh").contains("enable --now"));

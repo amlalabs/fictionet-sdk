@@ -317,6 +317,8 @@ trap 'systemctl poweroff' EXIT
 timeout 90 bash -c 'until runuser -u analyst -- sh -c "{ready}"; do sleep 0.2; done'
 runuser -u analyst -- tmux -f /home/analyst/.tmux.conf new-session -d -s check
 [ "$(runuser -u analyst -- tmux show-options -gv status)" = off ]
+[ "$(runuser -u analyst -- tmux show-options -gv mouse)" = on ]
+[ -f /home/analyst/.hushlogin ]
 runuser -u analyst -- tmux kill-server
 python3 -m venv /var/tmp/check-venv
 /var/tmp/check-venv/bin/python -c 'import ssl; import pip'
