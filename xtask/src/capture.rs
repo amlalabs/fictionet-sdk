@@ -89,16 +89,17 @@ async fn capture_cached(root: &Path, name: &str, urls: &[String]) -> Result {
 }
 
 async fn complete(root: &Path, name: &str, urls: &[(String, Resource)]) -> Result {
-    download(root, name, urls).await?;
     if urls.is_empty() {
         return Ok(());
     }
+    std::fs::create_dir_all(root)?;
     let documents = urls
         .iter()
         .filter(|(_, resource)| *resource == Resource::Document)
         .map(|(url, _)| url.clone())
         .collect::<Vec<_>>();
     let assets = render::requisites(root, &documents).await?;
+    download(root, name, urls).await?;
     download(root, name, &assets).await
 }
 
