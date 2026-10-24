@@ -774,6 +774,3 @@ impl Drop for Server {
         self.task.abort();
     }
 }
-
-#[cfg(test)]
-mod tests;

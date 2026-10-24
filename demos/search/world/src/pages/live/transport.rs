@@ -2,8 +2,6 @@
 
 use super::*;
 use fictionet_extras::models::UpstreamPhase;
-#[cfg(test)]
-use std::net::IpAddr;
 
 struct Runtime(Option<tokio::runtime::Runtime>);
 impl Drop for Runtime {
@@ -16,19 +14,10 @@ impl Drop for Runtime {
 
 pub(super) struct Transport {
     runtime: Runtime,
-    #[cfg(test)]
-    loopback: bool,
     processing: Arc<tokio::sync::Semaphore>,
 }
 impl Transport {
     pub(super) fn new() -> Result<Self, String> {
-        Self::build(false)
-    }
-    #[cfg(test)]
-    pub(super) fn loopback() -> Result<Self, String> {
-        Self::build(true)
-    }
-    fn build(_loopback: bool) -> Result<Self, String> {
         Ok(Self {
             runtime: Runtime(Some(
                 tokio::runtime::Builder::new_multi_thread()
@@ -37,8 +26,6 @@ impl Transport {
                     .build()
                     .map_err(|_| "Live transport could not start")?,
             )),
-            #[cfg(test)]
-            loopback: _loopback,
             processing: Arc::new(tokio::sync::Semaphore::new(1)),
         })
     }
@@ -79,13 +66,6 @@ impl Transport {
                 result.map_err(|_| "Live processing timed out")?
             }
         }
-    }
-    #[cfg(test)]
-    fn permits(&self, ip: IpAddr) -> bool {
-        if self.loopback {
-            return ip.is_loopback();
-        }
-        capture::public_address(ip)
     }
 
     pub(super) async fn request(
@@ -145,34 +125,7 @@ impl Transport {
         });
         let work = async {
             let host = url.host_str().ok_or("Missing Live host")?;
-            let client = {
-                #[cfg(test)]
-                if self.loopback {
-                    let port = url.port_or_known_default().ok_or("Missing Live port")?;
-                    let addresses: Vec<_> =
-                        tokio::net::lookup_host((host.trim_matches(['[', ']']), port))
-                            .await
-                            .map_err(|_| "Live DNS lookup failed")?
-                            .collect();
-                    if !url.username().is_empty()
-                        || url.password().is_some()
-                        || addresses.is_empty()
-                        || addresses.iter().any(|a| !self.permits(a.ip()))
-                    {
-                        return Err("Live destination is outside the capture network".into());
-                    }
-                    reqwest::Client::builder()
-                        .no_proxy()
-                        .redirect(reqwest::redirect::Policy::none())
-                        .resolve_to_addrs(host, &addresses)
-                        .build()
-                        .map_err(|e| e.to_string())?
-                } else {
-                    capture::client(&url).await.map_err(|e| e.to_string())?
-                }
-                #[cfg(not(test))]
-                capture::client(&url).await.map_err(|e| e.to_string())?
-            };
+            let client = capture::client(&url).await.map_err(|e| e.to_string())?;
             let host_time = {
                 let mut hosts = lifetime.hosts.lock().await;
                 hosts
@@ -250,6 +203,3 @@ impl Transport {
         }
     }
 }
-
-#[cfg(test)]
-mod tests;

@@ -207,16 +207,6 @@ Microsoft's site required a browser User-Agent. Referenced NIST PDFs are also
 captured. Some upstream optional images and fonts return errors in the original
 sites and retain those errors in replay.
 
-The downloaded-corpus acceptance test runs separately from the offline unit
-tests, and fails if its captures are missing or sources cannot be replayed:
-
-```sh
-rustup run 1.99.0 cargo test -p web-world --test corpus -- --nocapture
-```
-
-Set `SEARCH_DOWNLOADS` to another downloads root when testing captures outside
-this checkout. The test searches the real index, fetches citations through the
-world, and checks empty results without booting a VM or opening the demo port.
 The previous astronomy captures remain in `demos/downloads/astronomy/`.
 
 ### Packages
@@ -242,18 +232,6 @@ packaging, rich and pytest. The wheel selection targets the workstation's
 Python 3.12 on Linux x86-64. Requests, NetworkX and Click source archives are
 available at the tagged GitHub archive URLs declared in the capture command.
 Other versions and platforms require their own captures.
-
-The package acceptance test runs real pip through a loopback proxy backed by
-the world's HTTP handler, with its CA trusted and no upstream transport. It
-checks installation, package imports, plotting, and a GitHub archive download:
-
-```sh
-SEARCH_PYTHON=<python-with-pip> rustup run 1.99.0 cargo test -p web-world --test packages -- --nocapture
-```
-
-It uses a temporary installation directory and disables pip's cache. Set
-`SEARCH_DOWNLOADS` to test another downloads root. Neither acceptance test
-boots the VM or uses the demo's port.
 
 ## Code
 

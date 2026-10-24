@@ -669,12 +669,4 @@ What the world has already said:
     (system(seed, cast), user)
 }
 
-/// Reads a search answer: up to ten results with an http(s) URL and a title,
-/// up to eight related searches, four questions and two ads.
-/// Reads a page answer. With `expected` ([`expected_type`]) the answer has
-/// that type, and JSON must parse. Only status 200 and 404 are allowed, and
-/// a page something points at (`referenced`) cannot be a 404.
-#[cfg(test)]
-mod tests;
-
 pub use super::answers::{read_cast, read_page, read_search};

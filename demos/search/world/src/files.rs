@@ -80,12 +80,6 @@ impl Appended {
         })
     }
 
-    /// Appends to `writer` instead of the file.
-    #[cfg(test)]
-    pub(crate) fn set_writer(&mut self, writer: Box<dyn Write + Send>) {
-        self.writer = writer;
-    }
-
     /// Reads the lines after the ones applied so far and hands them to
     /// `apply` in order. Without the store's lock (`held` false) a line
     /// still being written waits for the next read. While it is held, every

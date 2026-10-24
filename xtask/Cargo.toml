@@ -18,6 +18,3 @@ url = { version = "2", features = ["serde"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util", "time", "signal", "net"] }
 
 fatfs = { version = "0.3", default-features = false, features = ["std", "alloc"] }
-
-[dev-dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }

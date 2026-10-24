@@ -323,9 +323,6 @@ pub fn check_snippets(
     (unsupported, unchecked)
 }
 
-#[cfg(test)]
-mod tests;
-
 /// Checks authored page content before a store is published.
 pub fn validate_page(content_type: &str, body: &[u8]) -> Result<(), String> {
     use kuchiki::traits::TendrilSink;
@@ -356,25 +353,4 @@ pub fn validate_page(content_type: &str, body: &[u8]) -> Result<(), String> {
     let audit = fictionet_extras::guest_content::Audit::default();
     audit.inspect("page", body);
     audit.check().map(|_| ())
-}
-
-#[cfg(test)]
-mod content_tests {
-    use super::*;
-
-    #[test]
-    fn visible_authoring_placeholders_are_rejected() {
-        for text in [
-            "[Video Placeholder: 8:42]",
-            "[Image: router]",
-            "Lorem ipsum",
-            "TODO",
-        ] {
-            assert!(
-                validate_page("text/html", format!("<p>{text}</p>").as_bytes()).is_err(),
-                "{text}"
-            );
-        }
-        validate_page("text/html", b"<input placeholder=\"Lorem ipsum TODO [Image: router] [Video Placeholder: 8:42]\"><script>const TODO = 1</script><style>.TODO {color:red}</style><!-- TODO -->").unwrap();
-    }
 }

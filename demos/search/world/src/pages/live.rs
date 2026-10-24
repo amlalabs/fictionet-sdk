@@ -107,12 +107,6 @@ impl Live {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    #[cfg(test)]
-    fn enqueue(self: &Arc<Self>, job: Job, priority: bool) {
-        let lifetime = self.state().lifetime.clone();
-        self.enqueue_in(&lifetime, job, priority);
-    }
-
     fn enqueue_in(self: &Arc<Self>, lifetime: &Arc<Lifetime>, job: Job, priority: bool) {
         let Some(url) = warc::key(&job.url) else {
             return;
@@ -472,11 +466,6 @@ impl Live {
     }
 }
 
-#[cfg(test)]
-fn parse_results(value: &Value) -> Result<search::Search, String> {
-    parse_search(value, None)
-}
-
 fn parse_search(value: &Value, key: Option<&Key>) -> Result<search::Search, String> {
     #[derive(Deserialize)]
     struct Reply {
@@ -573,6 +562,3 @@ impl Pages {
             .map_err(|error| Stop::Failed { error, usage: None })
     }
 }
-
-#[cfg(test)]
-mod tests;

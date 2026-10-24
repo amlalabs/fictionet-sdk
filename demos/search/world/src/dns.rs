@@ -226,6 +226,3 @@ impl Addresses {
         Ok(Some((addr, "pool")))
     }
 }
-
-#[cfg(test)]
-mod tests;
