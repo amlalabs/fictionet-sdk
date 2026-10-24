@@ -588,7 +588,7 @@ async fn relay(
         let event = wrapped(500, &http::HeaderMap::new(), b"");
         Out::Event(event.to_string(), event)
     };
-    match model.clone().send(request).await {
+    match model.clone().send_observed(request).await {
         Ok(response) if response.status().is_success() => {
             if let Err(error) = events(response, &note).await {
                 note(failed(&model, error));

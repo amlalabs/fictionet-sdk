@@ -29,9 +29,13 @@ use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use tower_service::Service;
 
+mod calls;
 mod client;
-pub mod signin;
+pub use calls::{Call, CallObserver, CallPhase};
+mod request;
+mod transport;
 pub use client::{Https, Key, Post, Transport};
+pub use transport::{UpstreamEvent, UpstreamObserver, UpstreamPhase};
 pub mod oauth;
 mod response;
 mod responses;
@@ -384,10 +388,8 @@ pub struct Model {
     continued: Arc<Mutex<Continued>>,
     catalog: Option<Catalog>,
     upstream: Option<Arc<UpstreamObserver>>,
+    calls: Option<Arc<CallObserver>>,
 }
-/// Reports an upstream attempt and then its response status, without credentials or bodies.
-pub type UpstreamObserver =
-    dyn Fn(&Cx, &http::Method, &http::uri::PathAndQuery, Option<http::StatusCode>) + Send + Sync;
 
 #[derive(Clone)]
 enum Catalog {
@@ -508,6 +510,7 @@ impl Model {
             continued: Arc::default(),
             catalog: None,
             upstream: None,
+            calls: None,
         }
     }
     /// Observes requests that actually enter the upstream transport, including splice turns.
@@ -517,20 +520,7 @@ impl Model {
     }
 
     async fn forward_request(&self, request: Request<Body>) -> fictionet::Result<Response<Body>> {
-        let method = request.method().clone();
-        let path = request
-            .uri()
-            .path_and_query()
-            .cloned()
-            .unwrap_or_else(|| http::uri::PathAndQuery::from_static("/"));
-        if let Some(observer) = &self.upstream {
-            observer(&self.cx, &method, &path, None);
-        }
-        let result = self.forward.clone().call(request).await;
-        if let (Some(observer), Ok(response)) = (&self.upstream, &result) {
-            observer(&self.cx, &method, &path, Some(response.status()));
-        }
-        result
+        transport::forward(&self.cx, &self.forward, self.upstream.as_ref(), request).await
     }
 
     /// Serves Codex's API-key catalog from an origin or a supplied catalog.
@@ -718,8 +708,8 @@ impl Model {
         {
             return Ok(Response::new(Body::empty()));
         }
-        // The guest's subscription login reads its profile and account at
-        // the API host as well as exchanging tokens at the sign-in host.
+        // Account reads and explicit credential setup at the API host. Worlds
+        // running agents must close credential setup before mounting this site.
         if self.credential.is_none()
             && self.provider == Provider::Anthropic
             && matches!(
@@ -953,7 +943,7 @@ impl httpd::Handler for Model {
         if self.catalog.is_none() && websocket::wanted(self.provider, &request) {
             return httpd::Reply::Now(websocket::accept(model, request));
         }
-        httpd::Reply::Later(Box::new(move |_| Box::pin(model.send(request))))
+        httpd::Reply::Later(Box::new(move |_| Box::pin(model.send_observed(request))))
     }
 }
 /// An RFC 3339 UTC timestamp to the second, as the providers write them.
@@ -971,22 +961,7 @@ fn rfc3339(at: time::OffsetDateTime) -> String {
 }
 /// Checks transport-bearing fields before any web tool can enter a splice.
 fn safe_request(provider: Provider, path: &str, body: &Value, world: bool) -> bool {
-    if [
-        "mcp_servers",
-        "plugins",
-        "web_search_options",
-        "connector_ids",
-        "connectors",
-        "vector_store_ids",
-        "container",
-        "environment",
-    ]
-    .iter()
-    .any(|key| body.get(key).is_some())
-        || body["model"].as_str().is_some_and(|name| {
-            name.split(':').skip(1).any(|variant| variant == "online") || name.contains("-search-")
-        })
-    {
+    if serde_json::from_value::<request::Envelope>(body.clone()).is_err() {
         return false;
     }
     if let Some(tools) = body.get("tools") {
@@ -1007,20 +982,6 @@ fn safe_request(provider: Provider, path: &str, body: &Value, world: bool) -> bo
         })
     {
         return false;
-    }
-    for key in [
-        "messages",
-        "input",
-        "system",
-        "contents",
-        "systemInstruction",
-        "system_instruction",
-    ] {
-        if let Some(content) = body.get(key)
-            && !safe_content(content)
-        {
-            return false;
-        }
     }
     true
 }
@@ -1101,90 +1062,6 @@ fn safe_tool(provider: Provider, path: &str, tool: &Value, world: bool) -> bool 
     }
 }
 
-fn inline_data(value: &Value) -> bool {
-    value.as_str().is_some_and(|data| {
-        data.starts_with("data:")
-            && data
-                .split_once(',')
-                .is_some_and(|(head, _)| head.ends_with(";base64"))
-    })
-}
-
-/// Text and client tool arguments are opaque; only provider content containers are traversed.
-fn safe_content(content: &Value) -> bool {
-    match content {
-        Value::Null | Value::String(_) => true,
-        Value::Array(items) => items.iter().all(safe_content),
-        Value::Object(object) => {
-            if ["fileData", "file_uri", "fileUri", "file_url", "file_id"]
-                .iter()
-                .any(|key| object.contains_key(*key))
-            {
-                return false;
-            }
-            if object
-                .get("file_data")
-                .is_some_and(|value| !inline_data(value))
-            {
-                return false;
-            }
-            if let Some(source) = object.get("source")
-                && (!matches!(source["type"].as_str(), Some("text" | "base64"))
-                    || source.get("url").is_some())
-            {
-                return false;
-            }
-            match content["type"].as_str() {
-                Some("image_url" | "input_image") => {
-                    let image = &content["image_url"];
-                    if !inline_data(image) && !inline_data(&image["url"]) {
-                        return false;
-                    }
-                }
-                Some("input_file") => {
-                    if !inline_data(&content["file_data"]) {
-                        return false;
-                    }
-                }
-                Some(
-                    "text"
-                    | "input_text"
-                    | "output_text"
-                    | "refusal"
-                    | "image"
-                    | "document"
-                    | "tool_use"
-                    | "tool_result"
-                    | "tool_reference"
-                    | "server_tool_use"
-                    | "web_search_result"
-                    | "web_search_tool_result_error"
-                    | "web_fetch_result"
-                    | "web_fetch_tool_result_error"
-                    | "web_search_tool_result"
-                    | "web_fetch_tool_result"
-                    | "thinking"
-                    | "redacted_thinking"
-                    | "message"
-                    | "function_call"
-                    | "function_call_output"
-                    | "custom_tool_call"
-                    | "custom_tool_call_output"
-                    | "reasoning"
-                    | "web_search_call"
-                    | "input_audio"
-                    | "audio",
-                )
-                | None => {}
-                Some(_) => return false,
-            }
-            ["content", "parts", "output"]
-                .iter()
-                .all(|key| object.get(*key).is_none_or(safe_content))
-        }
-        _ => false,
-    }
-}
 fn from_env(cx: &Cx, provider: Provider) -> fictionet::Result<Model> {
     let credential = Credential::api_key(cx, Secret::from_env(provider.key_variable())?);
     Model::at(

@@ -47,9 +47,15 @@ fn arguments(mut args: impl Iterator<Item = String>) -> Result<Mode> {
     }
 }
 
-fn app_pages(seed: Seed, downloads: &std::path::Path) -> Result<Pages> {
+fn app_pages(
+    seed: Seed,
+    downloads: &std::path::Path,
+    claude_key: Option<fictionet_extras::models::Key>,
+) -> Result<Pages> {
     use web_world::pages::model::Model;
-    let model = if std::env::var("OPENROUTER_API_KEY").is_ok_and(|key| !key.is_empty()) {
+    let model = if let Some(key) = claude_key {
+        Some(Model::claude_token(key))
+    } else if std::env::var("OPENROUTER_API_KEY").is_ok_and(|key| !key.is_empty()) {
         Some(Model::openrouter()?)
     } else if std::env::var("ANTHROPIC_API_KEY").is_ok_and(|key| !key.is_empty()) {
         Some(Model::anthropic()?)
@@ -77,26 +83,28 @@ async fn main() -> Result {
         Mode::Preview => return preview::run().await,
         Mode::App { downloads } => downloads,
     };
-    let claude_token = if let Some(path) = std::env::var_os("CLAUDE_CODE_OAUTH_TOKEN_FILE") {
-        let value = std::fs::read_to_string(path)
-            .map_err(|_| "Cannot read the host Claude OAuth token file")?;
-        let secret =
-            fictionet_extras::models::Secret::new("Claude OAuth token", value.trim().into())?;
-        let (send, receive) = tokio::sync::oneshot::channel();
-        fictionet::run(fictionet::Seed::random(), |cx| async move {
-            let token = fictionet_extras::models::Credential::claude_token(&cx, secret)?;
-            let _ = send.send(token);
-            Ok(())
-        })
-        .await?;
-        Some(receive.await?)
-    } else {
-        None
-    };
+    let (claude_token, claude_key) =
+        if let Some(path) = std::env::var_os("CLAUDE_CODE_OAUTH_TOKEN_FILE") {
+            let value = std::fs::read_to_string(path)
+                .map_err(|_| "Cannot read the host Claude OAuth token file")?;
+            let secret =
+                fictionet_extras::models::Secret::new("Claude OAuth token", value.trim().into())?;
+            let key = fictionet_extras::models::Key::claude_token(secret.clone())?;
+            let (send, receive) = tokio::sync::oneshot::channel();
+            fictionet::run(fictionet::Seed::random(), |cx| async move {
+                let token = fictionet_extras::models::Credential::claude_token(&cx, secret)?;
+                let _ = send.send(token);
+                Ok(())
+            })
+            .await?;
+            (Some(receive.await?), Some(key))
+        } else {
+            (None, None)
+        };
     let mut seed = Seed::builtin(SEED)?;
     let today = time::OffsetDateTime::now_utc().date();
     seed.date = today.to_string();
-    let pages = Arc::new(app_pages(seed.clone(), &downloads)?);
+    let pages = Arc::new(app_pages(seed.clone(), &downloads, claude_key)?);
     let output = downloads.join("search");
     std::fs::create_dir_all(&output)?;
     let (page, (observations, commands)) = page::Page::new(&pages, false);

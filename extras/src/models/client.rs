@@ -1,57 +1,73 @@
 //! Host-side model transport for page generators.
 use super::*;
 
-/// A provider's API key: checked once, sent only in its request header.
+/// A host credential, checked once and never exposed through formatting.
 #[derive(Clone)]
 pub struct Key {
-    variable: &'static str,
-    value: String,
+    secret: Secret,
+    bearer: bool,
 }
-
-impl std::fmt::Debug for Key {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "<{}>", self.variable)
+impl fmt::Debug for Key {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.secret, f)
     }
 }
-
 impl Key {
-    /// Checks a key from `variable`: it must be set and be printable ASCII,
-    /// so an HTTP header can carry it. Errors never hold the key.
+    /// Checks a printable HTTP credential without including it in errors.
     pub fn new(variable: &'static str, value: Option<String>) -> Result<Self, String> {
-        let value = value.unwrap_or_default();
-        if value.is_empty() {
-            return Err(format!("{variable} is not set"));
-        }
-        if !value.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
-            return Err(format!(
-                "{variable} holds characters an HTTP header cannot carry"
-            ));
-        }
-        Ok(Self { variable, value })
+        let value = value
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("{variable} is not set"))?;
+        Ok(Self {
+            secret: Secret::new(variable, value)
+                .map_err(|_| format!("{variable} holds characters an HTTP header cannot carry"))?,
+            bearer: false,
+        })
     }
-    /// Reads the provider's key from the environment.
+    /// Uses the host's long-lived Claude subscription token.
+    pub fn claude_token(secret: Secret) -> Result<Self, String> {
+        if !secret.value.starts_with("sk-ant-oat01-") {
+            return Err("Claude OAuth token has an invalid prefix".into());
+        }
+        Ok(Self {
+            secret,
+            bearer: true,
+        })
+    }
+    /// Reads only the named provider variable.
     pub fn from_env(provider: Provider) -> Result<Self, String> {
-        let variable = provider.key_variable();
-        Self::new(variable, std::env::var(variable).ok())
+        Self::new(
+            provider.key_variable(),
+            std::env::var(provider.key_variable()).ok(),
+        )
     }
-    /// The credential value for a host-side API request header.
+    /// The value for host-side authentication only.
     pub fn value(&self) -> &str {
-        &self.value
+        &self.secret.value
+    }
+    /// Whether the credential uses Claude's subscription protocol.
+    pub fn is_claude_token(&self) -> bool {
+        self.bearer
     }
     /// The provider's credential header, for host-side requests only.
     pub fn header(&self, provider: Provider) -> (&'static str, String) {
+        let header = if self.bearer {
+            "authorization"
+        } else {
+            provider.header()
+        };
         (
-            provider.header(),
-            if provider.header() == "authorization" {
-                format!("Bearer {}", self.value)
+            header,
+            if header == "authorization" {
+                format!("Bearer {}", self.secret.value)
             } else {
-                self.value.clone()
+                self.secret.value.clone()
             },
         )
     }
-    /// `text` with the key replaced by its variable's name.
+    /// Removes this credential from diagnostics.
     pub fn redact(&self, text: &str) -> String {
-        text.replace(&self.value, &format!("<{}>", self.variable))
+        self.secret.redact(text)
     }
 }
 
@@ -60,6 +76,8 @@ pub type Post<'a> = Pin<Box<dyn Future<Output = Result<(u16, Vec<u8>), String>> 
 
 /// Sends a request body to the provider and returns the status and body.
 pub trait Transport: Send + Sync {
+    /// Installs credential-free observation at the actual upstream boundary.
+    fn observe_upstream(&self, _observer: Arc<UpstreamObserver>) {}
     /// One POST with these headers. `Err` is a transport failure.
     fn post<'a>(
         &'a self,
@@ -70,11 +88,14 @@ pub trait Transport: Send + Sync {
 }
 
 /// The provider's API over HTTPS, through [`web::forward`].
+#[derive(Clone)]
 pub struct Https {
-    forward: web::Forward,
+    client: Arc<fictionet_host::Client>,
+    origin: http::Uri,
     path: String,
     authority: String,
     provider: Provider,
+    observer: Arc<Mutex<Option<Arc<UpstreamObserver>>>>,
 }
 
 impl Https {
@@ -114,7 +135,7 @@ impl Https {
     }
 
     fn with_provider(
-        fcx: &Cx,
+        _fcx: &Cx,
         origin: http::Uri,
         provider: Provider,
         path: String,
@@ -125,17 +146,18 @@ impl Https {
                 .ok_or_else(|| Error::msg("Model origin needs an authority"))?
                 .to_string(),
             provider,
-            forward: web::forward(
-                fcx,
-                origin,
-                std::sync::Arc::new(fictionet_host::Client::new()),
-            )?,
+            observer: Arc::default(),
+            client: Arc::new(fictionet_host::Client::new()),
+            origin,
             path,
         })
     }
 }
 
 impl Transport for Https {
+    fn observe_upstream(&self, observer: Arc<UpstreamObserver>) {
+        *self.observer.lock().unwrap() = Some(observer);
+    }
     fn post<'a>(
         &'a self,
         cx: &'a Cx,
@@ -148,39 +170,25 @@ impl Transport for Https {
                 request = request.header(name, value);
             }
             let request = request
-                .body(Body::from(Bytes::from(body)))
+                .body(Body::from(Bytes::copy_from_slice(&body)))
                 .map_err(|e| e.to_string())?;
-            let value = request
-                .headers()
-                .get(self.provider.header())
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("");
-            let value = if self.provider.header() == "authorization" {
-                value.strip_prefix("Bearer ").unwrap_or("")
-            } else {
-                value
-            };
-            let credential = Credential::api_key(
-                cx,
-                Secret::new(self.provider.key_variable(), value.into())
-                    .map_err(|e| e.to_string())?,
-            );
+            let body: Value = serde_json::from_slice(&body).map_err(|_| "Invalid model request")?;
+            if !safe_request(self.provider, &self.path, &body, false) {
+                return Err("Unsupported provider input".into());
+            }
             let mut request = request;
             request.headers_mut().insert(
-                self.provider.header(),
-                credential
-                    .wire(self.provider, false)
+                http::header::HOST,
+                self.authority
                     .parse()
-                    .map_err(|_| "Invalid placeholder".to_owned())?,
+                    .map_err(|_| "Invalid provider host")?,
             );
-            let site = Model::with_forward(
-                cx,
-                self.provider,
-                Some(credential),
-                self.forward.clone(),
-                self.authority.clone(),
-            );
-            let response = site.send(request).await.map_err(|e| e.to_string())?;
+            let forward = web::forward(cx, self.origin.clone(), self.client.clone())
+                .map_err(|e| e.to_string())?;
+            let observer = self.observer.lock().unwrap().clone();
+            let response = transport::forward(cx, &forward, observer.as_ref(), request)
+                .await
+                .map_err(|e| e.to_string())?;
             let status = response.status().as_u16();
             let body = response
                 .into_body()

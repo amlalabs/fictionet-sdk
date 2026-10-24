@@ -14,7 +14,7 @@ use std::{
 };
 use tokio::sync::{mpsc, watch};
 use web_world::{
-    observation::{CallPhase, Hit, Observation, PageSource, SearchObs, Tool},
+    observation::{CallPhase, EgressPurpose, Hit, Observation, PageSource, SearchObs, Tool},
     pages::{NewPages, Pages},
 };
 
@@ -78,7 +78,7 @@ pub struct ToolUse {
 #[derive(Clone, Debug, Serialize)]
 pub struct Connection {
     pub host: String,
-    pub purpose: String,
+    pub purpose: EgressPurpose,
     pub at_ms: u64,
 }
 #[derive(Clone, Debug, Serialize)]
@@ -118,12 +118,7 @@ impl Views {
             self.started_at_ms = started_at_ms;
         }
         match &observation.fact {
-            SearchObs::Egress {
-                host,
-                purpose,
-                phase,
-                ..
-            } if matches!(phase.as_str(), "attempt" | "response" | "failed") => {
+            SearchObs::Egress { host, purpose, .. } => {
                 let host = host.to_ascii();
                 if !self
                     .connections
@@ -135,7 +130,7 @@ impl Views {
                     }
                     self.connections.push(Connection {
                         host,
-                        purpose: purpose.clone(),
+                        purpose: *purpose,
                         at_ms: observation.at_ms,
                     });
                 }
