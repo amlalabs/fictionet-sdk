@@ -249,6 +249,9 @@ impl Pages {
         prefetch: bool,
     ) -> Result<PageRecord, Stop> {
         let url = format!("https://{host}{target}");
+        let document_type = prompts::expected_type(&url);
+        let pdf = document_type == Some("application/pdf");
+        let webpage = document_type.is_none();
         let established = {
             let store = self.writing_store()?;
             store.page_context(host, target).iter().any(|claim| {
@@ -271,14 +274,14 @@ impl Pages {
             None
         };
         let captured = fictionet_extras::sites::lookup(host, target).is_some();
-        let site = if captured {
+        let site = if captured || !webpage {
             None
         } else {
             self.locks
                 .try_lock(&format!("site {host}"))
                 .map_err(Stop::store)?
         };
-        let follows_layout = !captured && site.is_none();
+        let follows_layout = webpage && !captured && site.is_none();
         let cast = self.cast(cx).await?;
         let mut ask = {
             let store = self.writing_store()?;
@@ -327,11 +330,10 @@ impl Pages {
                 }
             }
         }
-        let pdf = prompts::expected_type(&url) == Some("application/pdf");
         let expected = if pdf {
             Some("text/html")
         } else {
-            prompts::expected_type(&url)
+            document_type
         };
         let seed = self.context().into_owned();
         let subject = format!("{url} {}", make::title_from(host, target));
@@ -429,7 +431,7 @@ impl Pages {
                         self.check_page_dates(&store, host, target, &page, latest)?;
                     }
                     if self.interactive {
-                        let body = if page.content_type.starts_with("text/html") {
+                        let body = if page.content_type.starts_with("text/html") && !pdf {
                             let profile = ask
                                 .profile
                                 .as_ref()
@@ -446,12 +448,14 @@ impl Pages {
                     if let Maker::Model(model) = self.maker() {
                         let profile = ask.profile.as_ref().or(page.site.as_ref()).cloned()
                             .unwrap_or_else(|| make::site_profile(host));
-                        let rendered = if page.content_type.starts_with("text/html") {
+                        let rendered = if page.content_type.starts_with("text/html") && !pdf {
                             render::page_at(host, target, &profile, &page, &seed.date)
                         } else { page.body.clone() };
                         model.check_document(&page.content_type, &rendered)?;
                     }
-                    if ask.profile.is_none()
+                    if webpage
+                        && page.content_type.starts_with("text/html")
+                        && ask.profile.is_none()
                         && fictionet_extras::sites::lookup(host, target).is_none()
                         && page.site.as_ref().is_none_or(|p| p.css.is_empty())
                     {
@@ -488,6 +492,7 @@ impl Pages {
         }
         let profile = match ask.profile {
             Some(profile) => profile,
+            None if !webpage => make::site_profile(host),
             None => {
                 let mut described = page.site.take().unwrap_or_else(|| make::site_profile(host));
                 if described.name.is_empty() {
@@ -499,7 +504,7 @@ impl Pages {
             }
         };
         let html = page.content_type.starts_with("text/html");
-        let body = if !html {
+        let body = if !html || pdf {
             page.body.clone()
         } else if page.status == 404 && ask.mentions.is_empty() {
             render::not_found(host, Some(&profile), target, today)
@@ -568,6 +573,9 @@ impl Pages {
             store.unserved.insert((host.into(), target.into()));
         }
         drop(store);
+        if pdf {
+            self.note_links(&record.url, &page.body);
+        }
         Ok(record)
     }
 }

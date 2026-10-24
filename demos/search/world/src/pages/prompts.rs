@@ -600,6 +600,7 @@ pub fn page(
     let captured = fictionet_extras::sites::lookup(host, &super::text::target_of(url).1)
         .map(|skin| skin.prompt());
     let (site, site_line) = match profile {
+        _ if expected_type(url).is_some() => ("", String::new()),
         _ if captured.is_some() => ("", "The site's layout is already supplied.".to_owned()),
         Some(profile) => {
             let tagline = if profile.tagline.is_empty() {
@@ -623,9 +624,13 @@ pub fn page(
                 format!("It is not an HTML page: CONTENT_TYPE is {expected} and BODY is the raw file. A real project, package or thing this URL asks about exists here: answer it, not 404.")
             }
         }).unwrap_or_default();
-    let layout = captured
-        .as_deref()
-        .unwrap_or(if profile.is_none() { SITE_LAYOUT } else { "" });
+    let layout = if expected_type(url).is_some() {
+        ""
+    } else {
+        captured
+            .as_deref()
+            .unwrap_or(if profile.is_none() { SITE_LAYOUT } else { "" })
+    };
     let user = format!(
         "Write the page at: {url}
 {expected}
@@ -644,7 +649,7 @@ What the world has already said:
 {vocabulary}",
         vocabulary = banned(),
         said = said_before(host_pages, claims),
-        captured_note = if captured.is_some() {
+        captured_note = if captured.is_some() && expected_type(url).is_none() {
             "For this captured site, use the supplied container and class names instead of the generic main layout. Do not write a stylesheet."
         } else {
             ""
