@@ -54,8 +54,8 @@ Claude token stays on the host. `claude` opens ready to work. Each launch writes
 to a fresh disk overlay; the prepared image stays unchanged. All demo flows use
 this workstation. The terminal uses ghostty-web and a persistent tmux session;
 Screen shows Firefox. Terminal text starts at 19 px on a dark background in both
-page themes; the text controls adjust its size and the expand control widens the
-agent pane. Pass `preview` instead of the downloads folder to run without a VM.
+page themes, using the bundled JetBrains Mono font. The page source switch stays
+visible and can change Copied, Model-written and Live during a session.
 
 On the workstation, a before-and-after run reached full readiness in 63.384 s
 with boot-time installation and 7.213 s with the prepared image. Desktop readiness
@@ -65,11 +65,6 @@ Firefox's start page was served inside the world. Corpus loading and indexing
 were 0.468 s before and 0.532 s after, with no indexing changes. The image build
 took 98 s using the existing verified Ubuntu downloads and produced a standalone
 4.0 GiB disk. These are single-run wall-clock measurements, excluding compilation.
-
-`preview` needs no downloads or API keys. It uses the world's corpus when
-available, otherwise a small embedded sky.org capture. Its labeled client makes
-real requests inside the world. Model calls appear when an agent uses the
-gateway; preview does not invent provider traffic.
 
 [app/src/main.rs](app/src/main.rs) assembles the workstation and its owned page.
 [app/src/network.rs](app/src/network.rs) connects the model gateway and local
