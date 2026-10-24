@@ -88,8 +88,11 @@ fn snippet_pieces_split_on_sentences_fields_and_ellipses() {
     }
 }
 
-fn search(snippet: &str) -> serde_json::Value {
-    json!({"via": "search", "snippet": snippet})
+fn search(snippet: &str) -> crate::pages::provenance::Mention {
+    serde_json::from_value::<crate::pages::provenance::Mention>(
+        json!({"via": "search", "snippet": snippet}),
+    )
+    .unwrap()
 }
 
 #[test]
@@ -134,7 +137,14 @@ fn every_piece_of_a_snippet_must_be_on_the_page() {
         check_snippets(
             "anything",
             "text/plain",
-            &[json!({"via": "search"}), json!({"via": "link"})]
+            &[
+                serde_json::from_value::<crate::pages::provenance::Mention>(
+                    json!({"via": "search"})
+                )
+                .unwrap(),
+                serde_json::from_value::<crate::pages::provenance::Mention>(json!({"via": "link"}))
+                    .unwrap()
+            ]
         ),
         (vec![], vec![String::new()])
     );
@@ -163,7 +173,10 @@ fn snippets_check_html_text_and_json_values() {
     let mentions = vec![
         search("Version 7.2.4. Safe."),
         search("... — !!!"),
-        json!({"via": "link", "anchor": "Ignored"}),
+        serde_json::from_value::<crate::pages::provenance::Mention>(
+            json!({"via": "link", "anchor": "Ignored"}),
+        )
+        .unwrap(),
     ];
     let (bad, unchecked) =
         check_snippets("<p>VERSION 7.2.4</p><p>Safe</p>", "text/html", &mentions);

@@ -8,7 +8,7 @@ impl Pages {
         store: &Store,
         host: &str,
         target: &str,
-        mentions: &[Value],
+        mentions: &[Mention],
     ) -> time::Date {
         let today = seed::parse_date(&self.seed.date).expect("world date");
         if store.publication_date(host, target).is_some() {
@@ -16,7 +16,7 @@ impl Pages {
         }
         mentions
             .iter()
-            .filter_map(|mention| mention["from"].as_str())
+            .filter_map(|mention| mention.source())
             .filter_map(|url| {
                 let (host, target) = text::target_of(url);
                 store
@@ -41,7 +41,7 @@ impl Pages {
         if let Some(published) = store.publication_date(host, target)
             && dateline < published
         {
-            return Err(prompts::Unreadable::Content(format!(
+            return Err(prompts::Unreadable::Chronology(format!(
                 "The search established publication on {published}; DATE must be on or after that date. Preserve this publication date visibly and label any later update explicitly."
             )));
         }
@@ -51,7 +51,7 @@ impl Pages {
             .filter(|date| *date > dateline)
             .max()
         {
-            return Err(prompts::Unreadable::Content(format!(
+            return Err(prompts::Unreadable::Chronology(format!(
                 "A cited source was first published on {published}, after DATE {dateline}. Explicitly update this article and DATE on or after {published}, or remove the unavailable citation."
             )));
         }
@@ -135,11 +135,9 @@ impl Pages {
                         if failure.can_render_locally()
                             && matches!(target, crate::observation::WriterTarget::Page { .. }) =>
                     {
-                        ledger
-                            .attempts
-                            .last()
-                            .filter(|a| !a.cut_off)
-                            .and_then(|a| a.raw.as_deref())
+                        failure
+                            .draft
+                            .as_deref()
                             .and_then(|raw| read(raw, true).ok())
                             .filter(|fields| {
                                 let audit = fictionet_extras::guest_content::Audit::default();
@@ -347,7 +345,7 @@ impl Pages {
                     store
                         .mentions(host, target)
                         .iter()
-                        .map(Value::to_string)
+                        .map(|mention| serde_json::to_string(mention).expect("mention"))
                         .collect::<Vec<_>>()
                         .join(" ")
                 )),
@@ -358,7 +356,7 @@ impl Pages {
             let store = self.writing_store()?;
             let mut referenced = HashSet::new();
             for mention in &ask.mentions {
-                if let Some(url) = mention["from"].as_str()
+                if let Some(url) = mention.source()
                     && referenced.insert(url)
                 {
                     let (host, target) = text::target_of(url);
@@ -371,7 +369,7 @@ impl Pages {
                         };
                         ask.claims.push(prompts::Claim {
                             url: url.into(),
-                            claim: format!("This document links to the requested page (publication/update {}): {}", page.date, text),
+                            claim: format!("This document links to the requested page (publication/update {}): {}", page.date, text).into(),
                         });
                     }
                 }
@@ -395,7 +393,9 @@ impl Pages {
             let planted = self.planted.lock().unwrap_or_else(|e| e.into_inner());
             for fact in &planted.facts {
                 if correction(fact).is_none() && make::shares_words(fact, &subject) {
-                    ask.mentions.push(json!({"via":"fact", "snippet":fact}));
+                    ask.mentions.push(Mention::Fact {
+                        snippet: fact.clone(),
+                    });
                 }
             }
         }
@@ -454,7 +454,7 @@ impl Pages {
                                 &format!("{url} {}", make::title_from(host, target)),
                             )
                         {
-                            mentions.push(json!({"snippet": fact}));
+                            mentions.push(Mention::Fact { snippet: fact.clone() });
                         }
                     }
                     make::page_with_known(&seed, host, target, &mentions, kind, &known)
@@ -483,32 +483,8 @@ impl Pages {
                     }
                     if let Maker::Model(model) = self.maker() {
                         let store = self.store();
-                        self.check_page_dates(&store, host, target, &page, latest)?;
                         model.check_document(&page.content_type, &page.body)?;
-                    }
-                    if page.content_type.starts_with("text/html") {
-                        use kuchiki::traits::TendrilSink;
-                        let dom = kuchiki::parse_html().one(page.body.as_str());
-                        let mut urls = HashMap::new();
-                        for link in dom.select("a[href]").expect("link selector") {
-                            let mut attrs = link.attributes.borrow_mut();
-                            if let Some(href) = attrs.get_mut("href")
-                                && let Some(absolute) = text::join(&url, href)
-                            {
-                                *href = urls.entry(absolute.clone()).or_insert_with(|| self.article_url(cx, &absolute)).clone();
-                            }
-                        }
-                        let mut normalize_url = |href: &mut String| {
-                            if let Some(absolute) = text::join(&url, href) {
-                                *href = urls.entry(absolute.clone()).or_insert_with(|| self.article_url(cx, &absolute)).clone();
-                            }
-                        };
-                        for (_, href) in &mut page.sidebar { normalize_url(href); }
-                        if let Some(site) = &mut page.site {
-                            for link in site.nav.iter_mut().chain(&mut site.footer) { normalize_url(&mut link.href); }
-                        }
-                        page.body = dom.select_first("body").expect("HTML body").as_node().children()
-                            .map(|node| node.to_string()).collect();
+                        self.check_page_dates(&store, host, target, &page, latest)?;
                     }
                     if repair {
                         super::answers::repair_page(&mut page)?;
@@ -552,7 +528,7 @@ impl Pages {
         if let Some(title) = ask
             .mentions
             .iter()
-            .filter_map(|m| m["title"].as_str())
+            .filter_map(Mention::title)
             .find(|s| !s.is_empty())
         {
             page.title = title.into();

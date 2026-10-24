@@ -150,8 +150,8 @@ function activityText(row) {
     case 'signin': return ['Sign-in', 'Policy', fact.open ? 'Open' : 'Closed', 'signin'];
     case 'egress': return [fact.host, 'Upstream', `${fact.purpose} · ${fact.method} ${briefPath(fact.path)} · ${fact.status || fact.phase}`, `egress:${fact.host}`];
     case 'page_revision': {
-      const target = fact.target.url || fact.target.host || fact.target.query || 'Pages';
-      return [target, 'Writer', `${fact.action === 'rejected' ? 'Rejected' : 'Recovered'} · ${fact.reason}`, 'sites'];
+      const target = fact.target.url ? new URL(fact.target.url).hostname : fact.target.host || 'Search';
+      return [target, 'Writer', fact.action === 'rejected' ? 'Rewriting' : 'Recovered', 'sites'];
     }
     case 'observation_failed': return ['Recording', 'Error', fact.reason, 'egress'];
     case 'no_route': return [fact.to, 'TCP', 'no route', 'router'];

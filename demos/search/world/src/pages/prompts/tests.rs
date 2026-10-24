@@ -1,5 +1,5 @@
 use super::*;
-use serde_json::json;
+use serde_json::{Value, json};
 
 #[test]
 fn json_urls_need_json() {
@@ -81,7 +81,10 @@ BODY:
 <p>Text.</p>";
     let page = read_page(text, None, false).unwrap();
     assert_eq!(page.title, "Example patches gateway flaw | The Register");
-    assert_eq!(page.claims, ["Example fixed CVE-2026-41877 in 7.2.4."]);
+    assert_eq!(
+        page.claims,
+        [Statement::from("Example fixed CVE-2026-41877 in 7.2.4.")]
+    );
     assert_eq!(
         page.sidebar,
         [(

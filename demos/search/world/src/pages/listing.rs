@@ -139,7 +139,11 @@ impl Pages {
                 for result in &mut search.results {
                     let (host, target) = text::target_of(&result.url);
                     let mention = if self.generating() {
-                        let mention = json!({"via":"search", "query":query, "title":result.title, "snippet":result.snippet, "date":result.date});
+                        let mention =
+                            Mention::search(query, 0, result).map_err(|reason| Stop::Failed {
+                                error: reason.to_string(),
+                                usage: None,
+                            })?;
                         self.writing_store()?
                             .reserve_mention(&self.seed, &host, &target, mention)
                             .map_err(Stop::store)?
@@ -148,13 +152,16 @@ impl Pages {
                             .mentions(&host, &target)
                             .first()
                             .cloned()
-                            .unwrap_or_else(
-                                || json!({"title":result.title,"snippet":result.snippet}),
-                            )
+                            .unwrap_or_else(|| {
+                                Mention::search(query, 0, result).expect("stored search date")
+                            })
                     };
-                    result.title = mention["title"].as_str().unwrap_or_default().into();
-                    result.snippet = mention["snippet"].as_str().unwrap_or_default().into();
-                    result.date = mention["date"].as_str().unwrap_or_default().into();
+                    result.title = mention.title().unwrap_or_default().into();
+                    result.snippet = mention.snippet().unwrap_or_default().into();
+                    result.date = mention
+                        .date()
+                        .map(|date| date.to_string())
+                        .unwrap_or_default();
                 }
             }
         }
@@ -280,7 +287,7 @@ impl Pages {
                     (system, user, SEARCH_TOKENS)
                 },
                 |text, _| {
-                    let mut search = prompts::read_search(text)?;
+                    let search = prompts::read_search(text)?;
                     for result in &search.results {
                         let date = if result.date.is_empty() {
                             String::new()
@@ -303,18 +310,6 @@ impl Pages {
                             },
                             seed::parse_date(&seed.date).expect("world date"),
                         )?;
-                    }
-                    let mut urls = HashMap::new();
-                    for url in search
-                        .results
-                        .iter_mut()
-                        .map(|r| &mut r.url)
-                        .chain(search.ads.iter_mut().map(|ad| &mut ad.url))
-                    {
-                        *url = urls
-                            .entry(url.clone())
-                            .or_insert_with(|| self.article_url(cx, url))
-                            .clone();
                     }
                     Ok(search)
                 },
@@ -345,14 +340,13 @@ impl Pages {
             {
                 continue;
             }
-            let mention = json!({
-                "via": "search",
-                "query": query,
-                "rank": results.len() + 1,
-                "title": r.title,
-                "snippet": r.snippet,
-                "date": r.date,
-            });
+            let mention =
+                Mention::search(query, results.len() as u64 + 1, &r).map_err(|reason| {
+                    Stop::Failed {
+                        error: reason.to_string(),
+                        usage: None,
+                    }
+                })?;
             let _page = self
                 .locks
                 .lock(cx, page_key(&host, &target))
@@ -362,9 +356,12 @@ impl Pages {
                 .writing_store()?
                 .reserve_mention(&self.seed, &host, &target, mention)
                 .map_err(Stop::store)?;
-            r.title = mention["title"].as_str().unwrap_or_default().into();
-            r.snippet = mention["snippet"].as_str().unwrap_or_default().into();
-            r.date = mention["date"].as_str().unwrap_or_default().into();
+            r.title = mention.title().unwrap_or_default().into();
+            r.snippet = mention.snippet().unwrap_or_default().into();
+            r.date = mention
+                .date()
+                .map(|date| date.to_string())
+                .unwrap_or_default();
             results.push(r);
         }
         let known_matches = results
@@ -440,19 +437,6 @@ impl Pages {
                     })
                     .await
             });
-        }
-    }
-
-    pub(super) fn article_url(&self, cx: &Cx, url: &str) -> String {
-        let (host, target) = text::target_of(url);
-        let store = self.store();
-        if !store.mentions(&host, &target).is_empty()
-            || store.page(&host, &target).is_some()
-            || self.seed.fixed.iter().any(|page| page.url == url)
-        {
-            url.into()
-        } else {
-            answers::article_url(cx, url)
         }
     }
 

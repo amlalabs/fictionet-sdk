@@ -158,7 +158,17 @@ impl Pages {
             .take(3)
             .map(|r| (r.title, r.url))
             .collect::<Vec<_>>();
-        let article = make::page(host, target, &[serde_json::json!({"title":page.title})]);
+        let article = make::page(
+            host,
+            target,
+            &[Mention::Search {
+                query: String::new(),
+                rank: 0,
+                title: page.title.clone(),
+                snippet: String::new(),
+                date: None,
+            }],
+        );
         use kuchiki::traits::TendrilSink;
         let dom = kuchiki::parse_html().one(article.body);
         let byline = dom

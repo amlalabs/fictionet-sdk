@@ -5,7 +5,8 @@
 //! of its HTTP attempts: retryable failures (rate limits, overloaded or
 //! failing servers, transport errors and unreadable responses) get at most
 //! three attempts, 1.5 s and 3 s apart. An answer the world cannot read is
-//! asked for once more with the reason. Every attempt becomes a row of the
+//! rewritten within its original deadline and budget; chronology corrections
+//! remain pending until a consistent document is ready. Every attempt becomes a row of the
 //! store's `generations.jsonl`, and the last row of a generation carries
 //! its totals.
 //!
@@ -245,10 +246,19 @@ impl Ledger {
 }
 
 /// A failed model call: why, with every attempt kept for the ledger.
-#[derive(Debug)]
 pub struct Failure {
     pub error: String,
     pub rejection: Option<Unreadable>,
+    pub(super) draft: Option<String>,
+}
+
+impl std::fmt::Debug for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Failure")
+            .field("error", &self.error)
+            .field("rejection", &self.rejection)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Failure {
@@ -379,6 +389,15 @@ impl Model {
             .map_err(|_| Unreadable::Credential)
     }
 
+    fn diagnostic(&self, text: &str) -> String {
+        let text = self.redact(text);
+        if self.transport.check_document("text/html", &text).is_err() {
+            "provider diagnostic contained a credential".into()
+        } else {
+            text
+        }
+    }
+
     /// Every string in `value` without the key.
     pub fn redact_json(&self, value: &mut Value) {
         match value {
@@ -486,21 +505,15 @@ impl Model {
                 }
                 Ok(Ok((status, reply))) => {
                     attempt.outcome = AttemptOutcome::Http(status);
-                    let detail = self.redact(&String::from_utf8_lossy(&reply));
-                    let mut end = detail.len().min(400);
-                    while !detail.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    failure = format!("HTTP {status}: {}", &detail[..end]);
-                    match serde_json::from_slice::<Value>(&reply) {
-                        Ok(answer) => usage(&answer, &mut attempt),
-                        Err(error) => {
-                            failure.push_str(&format!(" (unreadable error response: {error})"));
-                        }
+                    let detail = self.diagnostic(&String::from_utf8_lossy(&reply));
+                    let detail: String = detail.chars().take(400).collect();
+                    failure = format!("HTTP {status}: {detail}");
+                    if let Ok(answer) = serde_json::from_slice::<Value>(&reply) {
+                        usage(&answer, &mut attempt);
                     }
                     retry = RETRY.contains(&status);
                 }
-                Ok(Err(error)) => failure = self.redact(&error),
+                Ok(Err(error)) => failure = self.diagnostic(&error),
                 Err(fictionet::RaceError::Deadline) => {
                     failure = format!("no answer within {} s", timeout.as_secs());
                 }
@@ -528,6 +541,7 @@ impl Model {
         Err(Failure {
             error: self.redact(&format!("{what} failed: {failure}")),
             rejection: None,
+            draft: None,
         })
     }
 
@@ -551,20 +565,20 @@ impl Model {
             Failure {
                 error,
                 rejection: None,
+                draft: None,
             }
         };
         let completion = fictionet_extras::models::Completion::read(self.provider.into(), &answer)
-            .map_err(|reason| unreadable(attempt, self.redact(&format!("{what}: {reason}"))))?;
+            .map_err(|reason| unreadable(attempt, self.diagnostic(&format!("{what}: {reason}"))))?;
         let (text, cut_off) = (completion.text, completion.cut_off);
         let text = self.redact(&text);
-        attempt.raw = Some(text.clone());
         attempt.cut_off = cut_off;
         ledger.ended = Some(now(cx));
         Ok(text)
     }
 
-    /// Asks once, and once more with the reason if the answer cannot be
-    /// read. Returns the read answer or the failure, and the ledger.
+    /// Rewrites unreadable answers within the generation deadline. Chronology
+    /// corrections keep the reader waiting for the completed document.
     pub async fn ask<T>(
         &self,
         cx: &Cx,
@@ -576,7 +590,7 @@ impl Model {
     ) -> (Result<Answer<T>, Failure>, Ledger) {
         let mut ledger = Ledger::new();
         let mut user = user.to_owned();
-        for ask in 1..=2 {
+        for ask in 1.. {
             ledger.ask = ask;
             let text = match self
                 .complete(cx, system, &user, max_tokens, &mut ledger)
@@ -599,24 +613,30 @@ impl Model {
             };
             ledger.ended = Some(now(cx));
             match read {
-                Ok(fields) => return (Ok(Answer { fields, raw: text }), ledger),
+                Ok(fields) => {
+                    ledger.attempts.last_mut().expect("an attempt").raw = Some(text.clone());
+                    return (Ok(Answer { fields, raw: text }), ledger);
+                }
                 Err(rejection) => {
                     rejected(&rejection);
                     let reason = rejection.to_string();
                     let last = ledger.attempts.last_mut().expect("an attempt");
                     last.outcome = AttemptOutcome::Unreadable;
                     last.error = Some(reason.clone());
+                    let cut_off = last.cut_off;
                     if matches!(rejection, Unreadable::Credential) {
                         last.raw = None;
                         return (
                             Err(Failure {
                                 error: reason,
+                                draft: None,
                                 rejection: Some(rejection),
                             }),
                             ledger,
                         );
                     }
-                    let retry = ask < 2
+                    let retry = (ask < 2 || matches!(rejection, Unreadable::Chronology(_)))
+                        && now(cx) - ledger.attempts[0].started < TIMEOUT.as_secs_f64()
                         && self.live.as_ref().is_none_or(|calls| {
                             calls
                                 .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
@@ -624,7 +644,7 @@ impl Model {
                                 })
                                 .is_ok()
                         });
-                    if ask == 2 || !retry {
+                    if !retry {
                         eprintln!(
                             "Page writer failed: {}{}",
                             self.redact(&reason),
@@ -637,18 +657,19 @@ impl Model {
                         return (
                             Err(Failure {
                                 error: reason,
+                                draft: (!cut_off).then_some(text),
                                 rejection: Some(rejection),
                             }),
                             ledger,
                         );
                     }
                     user = format!(
-                        "{user}\n\nPrevious answer:\n{text}\n\nThe previous answer could not be read: {reason}\nRewrite the full answer in the requested format. Preserve its legitimate facts and links, and fix the named issue. Finish the entire answer within {max_tokens} output tokens."
+                        "{user}\n\nThe previous answer could not be read: {reason}\nRewrite the full answer in the requested format using the established facts and links above. Finish the entire answer within {max_tokens} output tokens."
                     );
                 }
             }
         }
-        unreachable!("the second ask returns")
+        unreachable!("the generation returns within its deadline")
     }
 }
 

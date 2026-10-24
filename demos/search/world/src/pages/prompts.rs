@@ -14,12 +14,12 @@
 //! name the tells that give generated pages away; each was seen in a real
 //! run.
 
+use super::Mention;
 use super::Seed;
 use super::make::Profile;
 use super::text::split_url;
 use fictionet_extras::search::Result as Listed;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 /// Link candidates examined per source page, before filtering.
 pub const LINKS_PER_PAGE: usize = 80;
@@ -36,6 +36,7 @@ pub enum Unreadable {
     Incomplete,
     Credential,
     Content(String),
+    Chronology(String),
 }
 
 impl std::fmt::Display for Unreadable {
@@ -45,7 +46,9 @@ impl std::fmt::Display for Unreadable {
             Self::Incomplete => {
                 f.write_str("answer stopped at its output limit; write a shorter complete answer")
             }
-            Self::Format(reason) | Self::Content(reason) => f.write_str(reason),
+            Self::Format(reason) | Self::Content(reason) | Self::Chronology(reason) => {
+                f.write_str(reason)
+            }
             Self::Disclosure(reason) => write!(f, "serving environment disclosure: {reason}"),
         }
     }
@@ -61,9 +64,63 @@ pub struct Person {
 
 /// A claim a page in this world made.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "RecordedStatement")]
+pub struct Statement {
+    pub text: String,
+    pub known_on: Option<time::Date>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RecordedStatement {
+    Text(String),
+    Dated {
+        text: String,
+        known_on: Option<time::Date>,
+    },
+}
+impl From<RecordedStatement> for Statement {
+    fn from(statement: RecordedStatement) -> Self {
+        match statement {
+            RecordedStatement::Text(text) => text.into(),
+            RecordedStatement::Dated { text, known_on } => Self { text, known_on },
+        }
+    }
+}
+
+impl From<String> for Statement {
+    fn from(text: String) -> Self {
+        Self {
+            text,
+            known_on: None,
+        }
+    }
+}
+impl From<&str> for Statement {
+    fn from(text: &str) -> Self {
+        text.to_owned().into()
+    }
+}
+impl std::ops::Deref for Statement {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.text
+    }
+}
+impl std::fmt::Display for Statement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(date) = self.known_on {
+            write!(f, "Known on {date}: ")?;
+        }
+        f.write_str(&self.text)
+    }
+}
+
+/// A statement and the page that published it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Claim {
     pub url: String,
-    pub claim: String,
+    pub claim: Statement,
 }
 
 /// An earlier page of a site, as its next page's prompt shows it.
@@ -71,7 +128,7 @@ pub struct Claim {
 pub struct HostPage {
     pub url: String,
     pub title: String,
-    pub claims: Vec<String>,
+    pub claims: Vec<Statement>,
 }
 
 const RULES: &str = "Author a persistent alternate public web in the requested site's own voice.
@@ -130,16 +187,18 @@ link promises a real destination which will be available when opened. Keep links
 to earlier pages at their exact URLs. Never use placeholders or empty links.
 Use established contact channels only. If no phone number, postal address or
 named contact has been established, omit those details and link to the site's
-contact page. Do not invent contact coordinates or illustrative contact details.
+contact page. Do not invent contact coordinates or illustrative contact details. This rule
+concerns phone numbers, addresses and contact channels; it does not prohibit
+naming the company, facility, locality, spokesperson or investigator in a new
+story. Establish and consistently reuse those names. Do not show image captions
+or photo credits unless an actual image accompanies them.
 
 Nothing is dated after today. A dated article knows only what was known then.
-No calendar date in the headline, body or claims may be later than DATE.
-This includes forecasts, deadlines, planned shipments and dates quoted from
-other pages. Choose the publication/update dateline after all dates actually
-mentioned. If an older article would mention a later date, either omit that
-unavailable detail or write an explicit later update, retaining the original
-publication date separately. Do not retain a later date as a future plan on
-an earlier dateline; the publication validator rejects that too.
+Future plans and deadlines may be mentioned before their scheduled dates. They
+are known when announced; a forecast is not knowledge of its eventual outcome.
+For each CLAIMS entry record when the statement became known, separately from
+any event date in its text. No statement may depend on knowledge acquired after
+DATE. Keep the visible dateline and the statement's known-on date consistent.
 When covering a development after an article's original publication date,
 give the article an explicit update date on or after that development. Set
 DATE to that update date and show both the original publication and update
@@ -218,7 +277,12 @@ QUESTIONS: four \"People also ask\" questions, separated by \" | \"
 AD: url | title | one line of ad copy   (zero to two AD lines)
 
 For a query about incidents, investigations or other dated developments,
-establish a concrete chronology before writing the results. If no earlier
+establish the named participants and a concrete chronology before writing the results.
+Name the organization, specific site or facility and people involved in the
+relevant titles and snippets. If this event is new to the world, choose those
+identities now, using plausible names appropriate to its location and industry.
+Reuse the same identities throughout the results; never defer them to an
+unnamed operator or company. These are commitments for subsequent pages. If no earlier
 source establishes an event date, choose its full calendar date now. State
 that event date, including the year, in the relevant snippets; all reports
 of that event share it. DATE is each report's publication date, never a
@@ -230,7 +294,7 @@ result lists are messy, not a tidy story:
   An unrelated query has no relevant results. Do not impose a quota about the brief or add irrelevant filler. Rank
   by the actual query, including an unanticipated subject. Use plausible
   stable destination paths in the site's actual style. Use descriptive article slugs;
-  opaque suffixes are allocated separately, never invent illustrative identifier sequences. Keep titles and snippets precise: they
+  use the real site’s identifier format where required, never illustrative identifier sequences. Keep titles and snippets precise: they
   become commitments for the destination page.
 - Snippets are text cut out of the page, not summaries: often starting or
   ending mid-sentence, sometimes with a date, a rating, menu words or a
@@ -250,8 +314,9 @@ TITLE: the page's <title>, with the site name where that site puts it
 DESCRIPTION: its meta description, one sentence
 DATE: YYYY-MM-DD it was published or last updated, or none
 CLAIMS:
-- durable facts this page establishes, one per line (0 to 8), even when unrelated to the brief: names
-  of people with their roles, companies, products, versions, numbers, dates
+- YYYY-MM-DD | durable fact (0 to 8 entries). The date is when this statement
+  became known, not the date of a planned event or deadline. Include names of
+  people with roles, organizations, sites, versions, numbers and event dates.
 ";
 
 const PAGE_FORMAT_TAIL: &str = "SIDEBAR:
@@ -350,7 +415,7 @@ fn said_before(host_pages: &[HostPage], claims: &[Claim]) -> String {
         for p in host_pages.iter().take(20) {
             let mut line = format!("- {} \"{}\"", p.url, p.title);
             if !p.claims.is_empty() {
-                let shown: Vec<_> = p.claims.iter().take(4).map(String::as_str).collect();
+                let shown: Vec<_> = p.claims.iter().take(4).map(ToString::to_string).collect();
                 line.push_str(&format!(": {}", shown.join("; ")));
             }
             out.push(line);
@@ -453,12 +518,12 @@ pub fn expected_type(url: &str) -> Option<&'static str> {
 /// All search mentions and the first [`LINK_MENTIONS_PER_PAGE`] link
 /// mentions, in their recorded order. The page prompt and the snippet check
 /// both use this selection.
-pub fn asked_mentions(mentions: &[Value]) -> Vec<Value> {
+pub fn asked_mentions(mentions: &[Mention]) -> Vec<Mention> {
     let mut links = 0;
     mentions
         .iter()
         .filter(|m| {
-            if m["via"] == "link" {
+            if matches!(m, Mention::Link { .. }) {
                 links += 1;
                 links <= LINK_MENTIONS_PER_PAGE
             } else {
@@ -475,31 +540,33 @@ pub fn page(
     seed: &Seed,
     cast: &[Person],
     url: &str,
-    mentions: &[Value],
+    mentions: &[Mention],
     profile: Option<&Profile>,
     host_pages: &[HostPage],
     claims: &[Claim],
 ) -> (String, String) {
-    let text = |m: &Value, key: &str| m[key].as_str().unwrap_or_default().to_owned();
     let mut led = Vec::new();
-    for m in mentions {
-        if m["via"] == "search" {
-            let mut line = format!(
-                "- A search for \"{}\" showed it with the title \"{}\" and the snippet \"{}\"",
-                text(m, "query"),
-                text(m, "title"),
-                text(m, "snippet")
-            );
-            if !text(m, "date").is_empty() {
-                line.push_str(&format!(", dated {}", text(m, "date")));
+    for mention in mentions {
+        match mention {
+            Mention::Search {
+                query,
+                title,
+                snippet,
+                date,
+                ..
+            } => {
+                let mut line = format!(
+                    "- A search for \"{query}\" showed it with the title \"{title}\" and the snippet \"{snippet}\""
+                );
+                if let Some(date) = date {
+                    line.push_str(&format!(", dated {date}"));
+                }
+                led.push(line);
             }
-            led.push(line);
-        } else if m["via"] == "link" {
-            led.push(format!(
-                "- {} links to it with the text \"{}\"",
-                text(m, "from"),
-                text(m, "anchor")
-            ));
+            Mention::Link { from, anchor } => {
+                led.push(format!("- {from} links to it with the text \"{anchor}\""))
+            }
+            Mention::Fact { snippet } => led.push(format!("- Established fact: {snippet}")),
         }
     }
     let led = if led.is_empty() {
@@ -509,8 +576,8 @@ pub fn page(
     };
     let must = mentions
         .iter()
-        .filter_map(|m| m["title"].as_str().filter(|t| !t.is_empty()))
-        .next()
+        .filter_map(Mention::title)
+        .find(|title| !title.is_empty())
         .map(|title| {
             format!(
                 "\nThe TITLE is exactly: {title}\nThe page contains the text of every snippet \

@@ -154,7 +154,7 @@ pub struct Page {
     /// Publication date in year-month-day form.
     pub date: String,
     /// Claims supported by prior mentions.
-    pub claims: Vec<String>,
+    pub claims: Vec<super::prompts::Statement>,
     /// HTML fragment or complete text or JSON body.
     pub body: String,
     /// Sidebar links as label and target pairs.
@@ -513,7 +513,7 @@ pub(super) fn page_with_known(
     seed: &Seed,
     host: &str,
     target: &str,
-    mentions: &[Value],
+    mentions: &[super::Mention],
     kind: SiteKind,
     known: &[Result],
 ) -> Page {
@@ -543,7 +543,11 @@ pub(super) fn page_with_known(
         .find(|(k, _)| ["q", "search", "search_query", "searchTerm"].contains(&k.as_ref()))
         .map(|(_, v)| v.into_owned());
     let search = query.is_some() && directory(target);
-    let directory = !article && directory(target) && mentions.iter().all(|m| m["via"] != "search");
+    let directory = !article
+        && directory(target)
+        && mentions
+            .iter()
+            .all(|m| !matches!(m, super::Mention::Search { .. }));
     if !search && !directory {
         return page(host, target, mentions);
     }
@@ -580,7 +584,7 @@ pub(super) fn page_with_known(
     };
     let mut body = format!("<h1>{}</h1>", escape(&title));
     for mention in mentions {
-        if let Some(snippet) = mention["snippet"].as_str() {
+        if let Some(snippet) = mention.snippet() {
             body.push_str(&format!("<p>{}</p>", escape(snippet)));
         }
     }
@@ -609,14 +613,14 @@ pub(super) fn page_with_known(
 }
 
 /// Preserve prior mentions without inventing page content.
-pub fn page(host: &str, target: &str, mentions: &[Value]) -> Page {
+pub fn page(host: &str, target: &str, mentions: &[super::Mention]) -> Page {
     let title = mentions
         .iter()
-        .find_map(|m| m["title"].as_str())
+        .find_map(|m| m.title())
         .map(str::to_owned)
         .unwrap_or_else(|| title_from(host, target));
     let mut body = format!("<h1>{}</h1>", escape(&title));
-    for snippet in mentions.iter().filter_map(|m| m["snippet"].as_str()) {
+    for snippet in mentions.iter().filter_map(|m| m.snippet()) {
         body.push_str(&format!("<p>{}</p>", escape(snippet)));
     }
     Page {

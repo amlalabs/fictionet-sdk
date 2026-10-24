@@ -55,7 +55,7 @@ fn a_search_and_a_page_publish_one_title() {
             let store = pages.store();
             let mentions = store.mentions("race.example-site.com", "/story");
             assert_eq!(mentions.len(), 1);
-            assert_eq!(mentions[0]["title"], title);
+            assert_eq!(mentions[0].title(), Some(title));
             let snippet = if page_first {
                 "The story."
             } else {
@@ -109,14 +109,20 @@ fn competing_searches_publish_one_title() {
         assert_eq!(page.logged()["title"], "first");
         let store = pages.store();
         let mentions = store.mentions("race.example-site.com", "/story");
-        let queries: Vec<_> = mentions.iter().map(|m| m["query"].clone()).collect();
+        let queries: Vec<_> = mentions
+            .iter()
+            .map(|m| match m {
+                Mention::Search { query, .. } => json!(query),
+                _ => panic!("search mention"),
+            })
+            .collect();
         assert_eq!(queries, [json!("first"), json!("second")]);
         assert!(
             mentions
                 .iter()
-                .all(|m| m["title"] == "first" && m["rank"] == 1)
+                .all(|m| matches!(m, Mention::Search { title, rank: 1, .. } if title == "first"))
         );
-        assert_eq!(mentions[1]["snippet"], "Snippet for second.");
+        assert_eq!(mentions[1].snippet(), Some("Snippet for second."));
         Ok(())
     });
 }
@@ -403,7 +409,7 @@ fn cut_off_answers_are_rewritten_and_every_attempt_is_counted() {
         (Some(40), Some(20), 2, false)
     );
     assert_eq!(usage.cost, None);
-    assert_eq!(raw.as_deref(), Some(SEARCH));
+    assert!(raw.is_none());
     let requests = fake.requests.lock().unwrap();
     assert_eq!(requests.len(), 2);
     assert!(
@@ -651,7 +657,7 @@ fn written_pages_rewrite_future_knowledge_and_respect_referring_datelines() {
     let fake = Fake::script(vec![
         completion(
             0,
-            "STATUS: 200\nTITLE: Cable report\nDATE: 2026-10-07\nSITE_CSS: body {color:#234}\nBODY:\n<h1>Cable report</h1><p>The cable incident occurred on 6 October 2026. The report of 14 October 2026 confirms it.</p><a href='https://research.fields.com/analysis'>Analysis</a>",
+            "STATUS: 200\nTITLE: Cable report\nDATE: 2026-10-07\nCLAIMS:\n- 2026-10-14 | The report confirmed the incident on 14 October 2026.\nSITE_CSS: body {color:#234}\nBODY:\n<h1>Cable report</h1><p>The cable incident occurred on 6 October 2026. The report of 14 October 2026 confirms it.</p><a href='https://research.fields.com/analysis'>Analysis</a>",
             None,
         ),
         completion(
@@ -699,26 +705,33 @@ fn written_pages_rewrite_future_knowledge_and_respect_referring_datelines() {
 }
 
 #[test]
-fn calendar_dates_and_article_identifiers_are_concrete() {
+fn calendar_dates_and_article_destinations_are_preserved() {
     assert_eq!(
         crate::pages::answers::dates(
             "2026-10-14; 14 October 2026; October 14, 2026; 14 Oct 2026; Oct 14, 2026"
         ),
         vec![seed::parse_date("2026-10-14").unwrap(); 5]
     );
-    lab(|cx| async move {
-        let url = "https://www.which.co.uk/news/article/battery-recalls-aBc3dEf9GhIj";
-        let first = crate::pages::answers::article_url(&cx, url);
-        let next = crate::pages::answers::article_url(&cx, url);
-        assert_ne!(first, url);
-        assert_ne!(first, next);
-        assert!(first.starts_with("https://www.which.co.uk/news/article/battery-recalls-"));
+    let url = "https://news.fields.com/article-aBc3dEf9";
+    let fake = Fake::script(vec![completion(
+        0,
+        &format!("{PAGE}<a href='{url}#summary'>Summary</a><a href='{url}#details'>Details</a>"),
+        None,
+    )]);
+    let pages = Arc::new(Pages::with_model(seed(), openrouter(fake)));
+    lab(move |cx| async move {
+        let page = get(&pages, &cx, url).await;
+        assert_eq!(page.status, 200);
+        let body = String::from_utf8(page.body).unwrap();
+        assert!(body.contains(&format!("{url}#summary")));
+        assert!(body.contains(&format!("{url}#details")));
         assert_eq!(
-            crate::pages::answers::article_url(
-                &cx,
-                "https://www.bbc.com/news/articles/battery-recalls"
-            ),
-            "https://www.bbc.com/news/articles/battery-recalls"
+            pages
+                .store()
+                .page("news.fields.com", "/article-aBc3dEf9")
+                .unwrap()
+                .url,
+            url
         );
         Ok(())
     });
@@ -776,7 +789,10 @@ fn search_publication_dates_constrain_both_ends_of_a_citation() {
             &seed(),
             "news.fields.com",
             "/analysis",
-            json!({"via":"search","title":"Analysis","date":"Oct 2, 2026"}),
+            serde_json::from_value::<crate::pages::provenance::Mention>(
+                json!({"via":"search","title":"Analysis","date":"Oct 2, 2026"}),
+            )
+            .unwrap(),
         )
         .unwrap();
     let next = store
@@ -784,14 +800,17 @@ fn search_publication_dates_constrain_both_ends_of_a_citation() {
             &seed(),
             "news.fields.com",
             "/analysis",
-            json!({"via":"search","title":"Analysis","date":"Oct 7, 2026"}),
+            serde_json::from_value::<crate::pages::provenance::Mention>(
+                json!({"via":"search","title":"Analysis","date":"Oct 7, 2026"}),
+            )
+            .unwrap(),
         )
         .unwrap();
     assert_eq!(
         store.publication_date("news.fields.com", "/analysis"),
         Some(published)
     );
-    assert_eq!(first["date"], next["date"]);
+    assert_eq!(first.date(), next.date());
     let mut page = make::Page {
         date: "2026-09-19".into(),
         content_type: "text/html".into(),
@@ -820,7 +839,10 @@ fn search_publication_dates_constrain_both_ends_of_a_citation() {
             &store,
             "news.fields.com",
             "/analysis",
-            &[json!({"via":"link","from":"https://news.fields.com/coverage"})]
+            &[serde_json::from_value::<crate::pages::provenance::Mention>(
+                json!({"via":"link","from":"https://news.fields.com/coverage"})
+            )
+            .unwrap()]
         ),
         today
     );
@@ -830,6 +852,10 @@ fn search_publication_dates_constrain_both_ends_of_a_citation() {
 fn the_headline_obeys_the_document_dateline() {
     let page = make::Page {
         title: "Investigation results on 14 October 2026".into(),
+        claims: vec![prompts::Statement {
+            text: "The investigation results were released on 14 October 2026.".into(),
+            known_on: Some(seed::parse_date("2026-10-14").unwrap()),
+        }],
         date: "2026-10-07".into(),
         body: "<p>The investigation continues.</p>".into(),
         content_type: "text/html".into(),
@@ -882,15 +908,19 @@ fn linked_pages_receive_the_complete_referring_document() {
 }
 
 #[test]
-fn future_plans_obey_the_same_publication_cutoff() {
+fn future_plans_are_known_when_announced() {
     let page = make::Page {
         date: "2026-09-24".into(),
         body: "<p>Replacement kits will begin shipping on 5 October 2026.</p>".into(),
+        claims: vec![prompts::Statement {
+            text: "Shipping is planned for 5 October 2026.".into(),
+            known_on: Some(seed::parse_date("2026-09-24").unwrap()),
+        }],
         content_type: "text/html".into(),
         ..Default::default()
     };
     assert!(
-        crate::pages::answers::chronology(&page, seed::parse_date("2026-10-24").unwrap()).is_err()
+        crate::pages::answers::chronology(&page, seed::parse_date("2026-10-24").unwrap()).is_ok()
     );
 }
 
@@ -963,6 +993,41 @@ fn search_promises_allow_parallel_first_sources() {
             200
         );
         assert_eq!(response.await.unwrap().status, 200);
+        Ok(())
+    });
+}
+
+#[test]
+fn readers_wait_for_chronology_rewrites_and_share_the_finished_page() {
+    let bad = "STATUS: 200\nTITLE: Investigation\nDATE: 2026-10-07\nCLAIMS:\n- 2026-10-14 | The investigation concluded on 14 October 2026.\nSITE_CSS: body {color:#234}\nBODY:\n<h1>Investigation</h1><p>The investigation concluded on 14 October 2026.</p>";
+    let good = bad.replace("DATE: 2026-10-07", "DATE: 2026-10-14");
+    let fake = Fake::script(vec![
+        completion(10, bad, None),
+        completion(10, bad, None),
+        completion(10, &good, None),
+    ]);
+    let pages = Arc::new(Pages::with_model(seed(), openrouter(fake.clone())));
+    lab(move |cx| async move {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let peer = pages.clone();
+        cx.spawn(move |cx| async move {
+            tx.send(get(&peer, &cx, "https://news.fields.com/investigation").await)
+                .unwrap();
+            Ok(())
+        });
+        let first = get(&pages, &cx, "https://news.fields.com/investigation").await;
+        let second = rx.await.unwrap();
+        assert_eq!((first.status, second.status), (200, 200));
+        assert_eq!(first.body, second.body);
+        assert_eq!(fake.users().len(), 3);
+        assert_eq!(
+            pages
+                .store()
+                .page("news.fields.com", "/investigation")
+                .unwrap()
+                .date,
+            "2026-10-14"
+        );
         Ok(())
     });
 }

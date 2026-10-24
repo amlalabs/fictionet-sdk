@@ -10,6 +10,7 @@ mod layout;
 mod listing;
 mod normalize;
 mod page;
+pub mod provenance;
 mod serve;
 mod settings;
 mod tools;
@@ -36,6 +37,7 @@ use fictionet_extras::search::{self, Engine};
 use meta::{Asked, Listing, Shown};
 use model::{Failure, Ledger, Model, Provider, Usage};
 use prompts::{Claim, HostPage, Person};
+use provenance::Mention;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -403,7 +405,7 @@ pub fn links(url: &str, markup: &str) -> Vec<(String, String, String)> {
 /// What a page is made from.
 struct PageAsk {
     url: String,
-    mentions: Vec<Value>,
+    mentions: Vec<Mention>,
     profile: Option<make::Profile>,
     host_pages: Vec<HostPage>,
     claims: Vec<Claim>,

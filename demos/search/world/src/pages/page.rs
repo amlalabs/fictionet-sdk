@@ -125,10 +125,8 @@ impl Pages {
         let reason = record
             .mentions
             .iter()
-            .find(|m| m["via"] != "fact")
-            .map_or(Reason::Direct, |m| {
-                Reason::deserialize(m).unwrap_or_default()
-            });
+            .find_map(Mention::reason)
+            .unwrap_or(Reason::Direct);
         let visible = String::from_utf8_lossy(&record.body);
         let visible = normalize(&if record.content_type.starts_with("text/html") {
             text::text_of(&visible)
@@ -138,18 +136,13 @@ impl Pages {
         let carries = record
             .mentions
             .iter()
-            .filter(|m| {
-                m["via"] == "fact"
-                    && m["snippet"]
-                        .as_str()
-                        .is_some_and(|fact| visible.contains(&normalize(fact)))
-            })
+            .filter(|mention| matches!(mention, Mention::Fact { snippet } if visible.contains(&normalize(snippet))))
             .count() as u64;
         let shown = Shown {
             cache,
             title: record.title,
             prefetched: record.prefetched,
-            claims: record.claims,
+            claims: record.claims.iter().map(ToString::to_string).collect(),
             mentions: record.mentions.len(),
             unsupported_snippets: record.unsupported_snippets,
             unchecked_snippets: record.unchecked_snippets,
@@ -178,7 +171,10 @@ impl Pages {
         };
         for (host, target, anchor) in links(url, markup) {
             if store.page(&host, &target).is_none() {
-                let mention = json!({"via": "link", "from": url, "anchor": anchor});
+                let mention = Mention::Link {
+                    from: url.into(),
+                    anchor,
+                };
                 // A mention the store cannot keep loses only context.
                 let _ = store.add_mention(&host, &target, mention);
             }

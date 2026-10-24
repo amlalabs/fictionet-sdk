@@ -2,6 +2,7 @@
 
 use super::make::{Link, Page, Profile};
 use super::prompts::*;
+use fictionet_extras::models::DocumentType;
 use fictionet_extras::search::{Ad, Result as Listed, Search};
 use regex::Regex;
 use serde_json::Value;
@@ -30,10 +31,9 @@ pub fn read_cast(text: &str) -> Result<Vec<Person>, Unreadable> {
         })
         .collect();
     if people.len() < 3 {
-        return Err(Unreadable::Format(format!(
-            "fewer than three people in the cast answer: {:?}",
-            prefix(text, 200)
-        )));
+        return Err(Unreadable::Format(
+            "fewer than three people in the cast answer".into(),
+        ));
     }
     Ok(people)
 }
@@ -89,10 +89,7 @@ pub fn read_search(text: &str) -> Result<Search, Unreadable> {
         .take(10)
         .collect();
     if search.results.is_empty() {
-        return Err(Unreadable::Format(format!(
-            "no results in the search answer: {:?}",
-            prefix(text, 200)
-        )));
+        return Err(Unreadable::Format("no results in the search answer".into()));
     }
     for url in search
         .results
@@ -147,10 +144,9 @@ pub fn read_page(text: &str, expected: Option<&str>, referenced: bool) -> Result
         .get_or_init(|| Regex::new(r"^```[a-z]*\s*\n").unwrap())
         .replace(text, "");
     let Some((head, body)) = text.split_once("\nBODY:") else {
-        return Err(Unreadable::Format(format!(
-            "no BODY: line in the page answer: {:?}",
-            prefix(&text, 200)
-        )));
+        return Err(Unreadable::Format(
+            "no BODY: line in the page answer".into(),
+        ));
     };
     let body = body.trim_start_matches('\n').trim_end();
     let body = CLOSE
@@ -175,7 +171,23 @@ pub fn read_page(text: &str, expected: Option<&str>, referenced: bool) -> Result
         {
             let item = item.trim();
             if section == "claims" {
-                page.claims.push(item.into());
+                let (known_on, statement) = if let Some((date, statement)) = item.split_once(" | ")
+                {
+                    (
+                        Some(super::seed::parse_date(date).map_err(|_| {
+                            Unreadable::Format(
+                                "CLAIMS needs a known-on date in YYYY-MM-DD form".into(),
+                            )
+                        })?),
+                        statement,
+                    )
+                } else {
+                    (None, item)
+                };
+                page.claims.push(super::prompts::Statement {
+                    text: statement.into(),
+                    known_on,
+                });
             } else if let Some((label, href)) = item.split_once('|') {
                 page.sidebar.push((label.trim().into(), href.trim().into()));
             }
@@ -193,7 +205,8 @@ pub fn read_page(text: &str, expected: Option<&str>, referenced: bool) -> Result
                     .unwrap_or(if digits.is_empty() { 200 } else { 0 });
             }
             "CONTENT_TYPE" => {
-                let ctype = value.split(';').next().unwrap().trim();
+                let normalized = value.split(';').next().unwrap().trim().to_ascii_lowercase();
+                let ctype = normalized.as_str();
                 let ctype = if ctype.is_empty() { "text/html" } else { ctype };
                 let charset = ctype.starts_with("text/") || ctype.contains("json");
                 page.content_type =
@@ -219,10 +232,9 @@ pub fn read_page(text: &str, expected: Option<&str>, referenced: bool) -> Result
         }
     }
     if page.title.is_empty() {
-        return Err(Unreadable::Format(format!(
-            "no TITLE: line in the page answer: {:?}",
-            prefix(&text, 200)
-        )));
+        return Err(Unreadable::Format(
+            "no TITLE: line in the page answer".into(),
+        ));
     }
     if let Some(expected) = expected {
         let charset = if expected == "application/xml" {
@@ -232,14 +244,12 @@ pub fn read_page(text: &str, expected: Option<&str>, referenced: bool) -> Result
         };
         page.content_type = format!("{expected}{charset}");
     }
-    let ctype = page.content_type.split(';').next().unwrap().to_lowercase();
-    if (ctype == "application/json" || ctype.ends_with("+json"))
-        && let Err(error) = serde_json::from_str::<Value>(&page.body)
+    if DocumentType::from(page.content_type.as_str()) == DocumentType::Json
+        && serde_json::from_str::<Value>(&page.body).is_err()
     {
-        return Err(Unreadable::Format(format!(
-            "the body of a JSON URL is not JSON ({error}): {:?}",
-            prefix(&page.body, 200)
-        )));
+        return Err(Unreadable::Format(
+            "the body of a JSON URL is not JSON".into(),
+        ));
     }
     if !matches!(page.status, 200 | 404) {
         return Err(Unreadable::Format(format!(
@@ -256,10 +266,6 @@ pub fn read_page(text: &str, expected: Option<&str>, referenced: bool) -> Result
         page.site = Some(site);
     }
     Ok(page)
-}
-
-fn prefix(text: &str, n: usize) -> String {
-    text.chars().take(n).collect()
 }
 
 /// Removes isolated authoring debris from an otherwise intact HTML document.
@@ -368,62 +374,23 @@ pub(super) fn chronology(page: &Page, latest: time::Date) -> Result<(), Unreadab
         latest
     } else {
         super::seed::parse_date(&page.date)
-            .map_err(|_| Unreadable::Content("DATE must be YYYY-MM-DD".into()))?
+            .map_err(|_| Unreadable::Chronology("DATE must be YYYY-MM-DD".into()))?
     };
     if dateline > latest {
-        return Err(Unreadable::Content(format!(
+        return Err(Unreadable::Chronology(format!(
             "DATE must be on or before {latest}, when a referring page already links here. Write only what was known by then."
         )));
     }
-    let prose = if page.content_type.starts_with("text/html") {
-        super::text::text_of(&page.body)
-    } else {
-        page.body.clone()
-    };
-    if let Some(date) = dates(&format!(
-        "{} {} {} {}",
-        page.title,
-        page.description,
-        prose,
-        page.claims.join(" ")
-    ))
-    .into_iter()
-    .filter(|date| *date > dateline)
-    .max()
+    if let Some(known_on) = page
+        .claims
+        .iter()
+        .filter_map(|claim| claim.known_on)
+        .filter(|date| *date > dateline)
+        .max()
     {
-        return Err(Unreadable::Content(format!(
-            "The document is dated {dateline} but cites {date}. Remove knowledge unavailable at its dateline, or explicitly update DATE and the visible dateline to at least {date}, no later than {latest}."
+        return Err(Unreadable::Chronology(format!(
+            "The document is dated {dateline} but uses knowledge first available on {known_on}. Explicitly update DATE and its visible dateline, no later than {latest}, or omit that later knowledge."
         )));
     }
     Ok(())
-}
-
-/// Allocate opaque article identifiers from run entropy instead of model examples.
-pub(super) fn article_url(cx: &fictionet::Cx, original: &str) -> String {
-    let Ok(mut url) = url::Url::parse(original) else {
-        return original.into();
-    };
-    let path = url.path();
-    let trimmed = path.trim_end_matches('/');
-    let Some((prefix, id)) = trimmed.rsplit_once('-') else {
-        return original.into();
-    };
-    if !(8..=32).contains(&id.len())
-        || !id.bytes().all(|b| b.is_ascii_alphanumeric())
-        || !id.bytes().any(|b| b.is_ascii_uppercase())
-        || !id.bytes().any(|b| b.is_ascii_lowercase())
-        || !id.bytes().any(|b| b.is_ascii_digit())
-    {
-        return original.into();
-    }
-    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    let id: String = (0..id.len())
-        .map(|_| ALPHABET[(cx.random_u64() % 62) as usize] as char)
-        .collect();
-    let path = format!(
-        "{prefix}-{id}{}",
-        if path.ends_with('/') { "/" } else { "" }
-    );
-    url.set_path(&path);
-    url.into()
 }

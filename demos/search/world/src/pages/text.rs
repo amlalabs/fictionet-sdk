@@ -288,7 +288,7 @@ fn json_strings(value: &serde_json::Value, out: &mut Vec<String>) {
 pub fn check_snippets(
     body: &str,
     content_type: &str,
-    mentions: &[serde_json::Value],
+    mentions: &[super::Mention],
 ) -> (Vec<String>, Vec<String>) {
     let ctype = content_type
         .split(';')
@@ -309,8 +309,10 @@ pub fn check_snippets(
     }
     let texts: Vec<_> = texts.iter().map(|s| normalize_snippet(s)).collect();
     let (mut unsupported, mut unchecked) = (Vec::new(), Vec::new());
-    for m in mentions.iter().filter(|m| m["via"] == "search") {
-        let snippet = m["snippet"].as_str().unwrap_or("");
+    for snippet in mentions.iter().filter_map(|mention| match mention {
+        super::Mention::Search { snippet, .. } => Some(snippet.as_str()),
+        _ => None,
+    }) {
         let pieces = snippet_pieces(snippet);
         if pieces.is_empty() {
             unchecked.push(snippet.into());

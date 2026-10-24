@@ -33,7 +33,7 @@ use serde_json::{Value, json};
 use super::make::Profile;
 use super::model::Usage;
 use super::prompts::{Claim, HostPage, Person};
-use super::{Generation, Seed};
+use super::{Generation, Mention, Seed};
 use crate::files::{self, Appended, FileLock};
 
 /// The format of `store.json` and `world.jsonl`.
@@ -53,9 +53,9 @@ pub struct PageRecord {
     pub title: String,
     pub description: String,
     pub date: String,
-    pub claims: Vec<String>,
+    pub claims: Vec<super::prompts::Statement>,
     /// The mentions the page was made from, in their recorded order.
-    pub mentions: Vec<Value>,
+    pub mentions: Vec<Mention>,
     pub tells: Vec<String>,
     pub unsupported_snippets: Vec<String>,
     pub unchecked_snippets: Vec<String>,
@@ -93,7 +93,7 @@ enum Entry {
     Mention {
         host: String,
         target: String,
-        mention: Value,
+        mention: Mention,
     },
     Site {
         host: String,
@@ -148,7 +148,7 @@ pub struct Store {
     pages: HashMap<(String, String), PageRecord>,
     /// Pages in the order they were made.
     order: Vec<(String, String)>,
-    mentions: HashMap<(String, String), Vec<Value>>,
+    mentions: HashMap<(String, String), Vec<Mention>>,
     sites: Vec<(String, Profile)>,
     searches: HashMap<String, SearchRecord>,
     cast: Option<CastRecord>,
@@ -504,7 +504,8 @@ impl Store {
                         page.title,
                         page.date,
                         super::text::take(&text, 4000)
-                    ),
+                    )
+                    .into(),
                 });
             }
         }
@@ -519,26 +520,27 @@ impl Store {
                     claim: format!(
                         "Search result: {} (published {}): {}",
                         result.title, result.date, result.snippet
-                    ),
+                    )
+                    .into(),
                 });
             }
         }
         claims
     }
 
-    pub fn mentions(&self, host: &str, target: &str) -> &[Value] {
+    pub fn mentions(&self, host: &str, target: &str) -> &[Mention] {
         self.mentions
             .get(&key(host, target))
             .map_or(&[], Vec::as_slice)
     }
 
     /// Records a mention of a URL, unless it is already recorded.
-    pub fn add_mention(&mut self, host: &str, target: &str, mention: Value) -> io::Result<()> {
+    pub fn add_mention(&mut self, host: &str, target: &str, mention: Mention) -> io::Result<()> {
         let _held = self.hold()?;
         self.mention_held(host, target, mention)
     }
 
-    fn mention_held(&mut self, host: &str, target: &str, mention: Value) -> io::Result<()> {
+    fn mention_held(&mut self, host: &str, target: &str, mention: Mention) -> io::Result<()> {
         if self.mentions(host, target).contains(&mention) {
             return Ok(());
         }
@@ -558,8 +560,8 @@ impl Store {
         seed: &Seed,
         host: &str,
         target: &str,
-        mut mention: Value,
-    ) -> io::Result<Value> {
+        mut mention: Mention,
+    ) -> io::Result<Mention> {
         let _held = self.hold()?;
         let page = self
             .page(host, target)
@@ -568,35 +570,35 @@ impl Store {
         let declared = seed
             .fixed_for(host, target)
             .map(|f| (f.title.clone(), f.description.clone()));
-        if let Some((title, description)) = page.or(declared) {
-            if !title.is_empty() {
-                mention["title"] = title.into();
+        if let Mention::Search {
+            title,
+            snippet,
+            date,
+            ..
+        } = &mut mention
+        {
+            if let Some((chosen_title, description)) = page.or(declared) {
+                if !chosen_title.is_empty() {
+                    *title = chosen_title;
+                }
+                if !description.is_empty() {
+                    *snippet = description;
+                }
+            } else if let Some(chosen) = self
+                .mentions(host, target)
+                .iter()
+                .filter_map(Mention::title)
+                .find(|title| !title.is_empty())
+            {
+                *title = chosen.into();
             }
-            if !description.is_empty() {
-                mention["snippet"] = description.into();
+            if let Some(chosen) = self
+                .page(host, target)
+                .and_then(|page| super::seed::parse_date(&page.date).ok())
+                .or_else(|| self.publication_date(host, target))
+            {
+                *date = Some(chosen);
             }
-        } else if let Some(title) = self
-            .mentions(host, target)
-            .iter()
-            .filter_map(|m| m["title"].as_str())
-            .find(|s| !s.is_empty())
-        {
-            mention["title"] = title.into();
-        }
-        if let Some(date) = self
-            .page(host, target)
-            .map(|page| page.date.as_str())
-            .filter(|date| !date.is_empty())
-        {
-            mention["date"] = date.into();
-        } else if let Some(date) = self
-            .mentions(host, target)
-            .iter()
-            .filter(|mention| mention["via"] == "search")
-            .filter_map(|mention| mention["date"].as_str())
-            .find(|date| !date.is_empty())
-        {
-            mention["date"] = date.into();
         }
         self.mention_held(host, target, mention.clone())?;
         Ok(mention)
@@ -605,9 +607,7 @@ impl Store {
     pub(super) fn publication_date(&self, host: &str, target: &str) -> Option<time::Date> {
         self.mentions(host, target)
             .iter()
-            .filter(|mention| mention["via"] == "search")
-            .filter_map(|mention| mention["date"].as_str())
-            .flat_map(super::answers::dates)
+            .filter_map(Mention::date)
             .min()
     }
 

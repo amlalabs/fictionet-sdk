@@ -41,37 +41,52 @@ fn mentions_reserve_titles_and_keep_creation_order() {
         .add_mention(
             "site.com",
             "/p",
-            json!({"via":"link","from":"https://source.com/","anchor":"An anchor"}),
+            serde_json::from_value::<crate::pages::provenance::Mention>(
+                json!({"via":"link","from":"https://source.com/","anchor":"An anchor"}),
+            )
+            .unwrap(),
         )
         .unwrap();
-    let first = json!({"via":"search","query":"first","title":"First title",
-        "snippet":"First snippet","rank":2});
+    let first = serde_json::from_value::<crate::pages::provenance::Mention>(
+        json!({"via":"search","query":"first","title":"First title",
+        "snippet":"First snippet","rank":2}),
+    )
+    .unwrap();
     store
         .reserve_mention(&seed, "site.com", "/p", first.clone())
         .unwrap();
     store
         .reserve_mention(&seed, "site.com", "/p", first)
         .unwrap();
-    let later = json!({"via":"search","query":"second","title":"Different title",
-        "snippet":"Second snippet","rank":1});
+    let later = serde_json::from_value::<crate::pages::provenance::Mention>(
+        json!({"via":"search","query":"second","title":"Different title",
+        "snippet":"Second snippet","rank":1}),
+    )
+    .unwrap();
     let later = store
         .reserve_mention(&seed, "site.com", "/p", later)
         .unwrap();
-    assert_eq!(later["title"], "First title");
-    assert_eq!(later["snippet"], "Second snippet");
+    assert_eq!(later.title(), Some("First title"));
+    assert_eq!(later.snippet(), Some("Second snippet"));
     assert_eq!(store.mentions("site.com", "/p").len(), 3);
-    assert_eq!(store.mentions("site.com", "/p")[0]["via"], "link");
+    assert!(matches!(
+        store.mentions("site.com", "/p")[0],
+        Mention::Link { .. }
+    ));
     let f = &seed.fixed[0];
     let reserved = store
         .reserve_mention(
             &seed,
             &f.host,
             &f.target,
-            json!({"via":"search","title":"wrong","snippet":"wrong"}),
+            serde_json::from_value::<crate::pages::provenance::Mention>(
+                json!({"via":"search","title":"wrong","snippet":"wrong"}),
+            )
+            .unwrap(),
         )
         .unwrap();
-    assert_eq!(reserved["title"], f.title);
-    assert_eq!(reserved["snippet"], f.description);
+    assert_eq!(reserved.title(), Some(f.title.as_str()));
+    assert_eq!(reserved.snippet(), Some(f.description.as_str()));
 }
 
 #[test]

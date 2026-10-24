@@ -12,7 +12,7 @@ fn a_planted_correction_changes_every_later_answer() {
         let mut record = pages.store().page(&host, &target).unwrap().clone();
         record.body = b"<html><body><p>The fixed firmware is 7.2.4.</p></body></html>".to_vec();
         record.description = "The fixed firmware is 7.2.4.".into();
-        record.claims = vec![record.description.clone()];
+        record.claims = vec![record.description.clone().into()];
         pages.store().insert_page(record)?;
         let before = String::from_utf8(get(&pages, &cx, advisory).await.body).unwrap();
         assert!(before.contains("7.2.4"));
@@ -383,7 +383,7 @@ fn served_pages_and_lists_report_the_facts_their_text_carries() {
             title: fixed.title,
             description: fixed.description.clone(),
             date: String::new(),
-            claims: vec![fixed.description.clone()],
+            claims: vec![fixed.description.clone().into()],
             mentions: Vec::new(),
             tells: Vec::new(),
             unsupported_snippets: Vec::new(),

@@ -289,13 +289,29 @@ fn links_bound_candidates_before_filtering_and_cut_characters() {
     );
     let mut mentions = Vec::new();
     for n in 0..12 {
-        mentions.push(json!({"via":"link","anchor":n}));
-        mentions.push(json!({"via":"search","title":n}));
+        mentions.push(
+            serde_json::from_value::<crate::pages::provenance::Mention>(
+                json!({"via":"link","anchor":n.to_string()}),
+            )
+            .unwrap(),
+        );
+        mentions.push(
+            serde_json::from_value::<crate::pages::provenance::Mention>(
+                json!({"via":"search","title":n.to_string()}),
+            )
+            .unwrap(),
+        );
     }
     let asked = prompts::asked_mentions(&mentions);
     assert_eq!(asked.len(), 20);
-    assert_eq!(asked.iter().filter(|m| m["via"] == "link").count(), 8);
-    assert_eq!(asked.last().unwrap()["title"], 11);
+    assert_eq!(
+        asked
+            .iter()
+            .filter(|m| matches!(m, Mention::Link { .. }))
+            .count(),
+        8
+    );
+    assert_eq!(asked.last().unwrap().title(), Some("11"));
 }
 
 #[test]
@@ -348,7 +364,10 @@ fn noted_links_skip_stored_pages_and_cut_anchors() {
         for (host, target, anchor) in &expected {
             assert_eq!(
                 store.mentions(host, target),
-                [json!({"via": "link", "from": url, "anchor": anchor})],
+                [serde_json::from_value::<crate::pages::provenance::Mention>(
+                    json!({"via": "link", "from": url, "anchor": anchor})
+                )
+                .unwrap()],
                 "{host}{target}"
             );
         }

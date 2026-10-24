@@ -63,14 +63,20 @@ fn model_pages_keep_titles_count_cost_and_never_store_the_key() {
 fn a_page_is_checked_against_the_mentions_its_model_was_shown() {
     let searches: Vec<_> = (0..=prompts::LINK_MENTIONS_PER_PAGE)
         .map(|i| {
-            json!({"via": "search", "query": format!("query {i}"), "title": "Story",
-            "snippet": format!("Evidence number {i}.")})
+            serde_json::from_value::<crate::pages::provenance::Mention>(
+                json!({"via": "search", "query": format!("query {i}"), "title": "Story",
+            "snippet": format!("Evidence number {i}.")}),
+            )
+            .unwrap()
         })
         .collect();
     let links: Vec<_> = (0..=prompts::LINK_MENTIONS_PER_PAGE)
         .map(|i| {
-            json!({"via": "link", "from": format!("https://source.example-site.com/{i}"),
-            "anchor": format!("Source {i}")})
+            serde_json::from_value::<crate::pages::provenance::Mention>(
+                json!({"via": "link", "from": format!("https://source.example-site.com/{i}"),
+            "anchor": format!("Source {i}")}),
+            )
+            .unwrap()
         })
         .collect();
     for missing in [false, true] {
@@ -89,10 +95,7 @@ fn a_page_is_checked_against_the_mentions_its_model_was_shown() {
         } else {
             &searches[..]
         };
-        let body: Vec<_> = shown
-            .iter()
-            .map(|m| m["snippet"].as_str().unwrap())
-            .collect();
+        let body: Vec<_> = shown.iter().map(|m| m.snippet().unwrap()).collect();
         script.pages.lock().unwrap().push_back(format!(
             "STATUS: 200\nCONTENT_TYPE: text/plain\nTITLE: Story\nSITE_CSS: body {{color: #234}}\nBODY:\n{}",
             body.join(" ")
@@ -113,15 +116,15 @@ fn a_page_is_checked_against_the_mentions_its_model_was_shown() {
             assert_eq!(record.mentions, asked);
             let prompt = fake.users().pop().unwrap();
             for mention in &searches {
-                let snippet = mention["snippet"].as_str().unwrap();
+                let snippet = mention.snippet().unwrap();
                 assert!(prompt.contains(&format!("snippet \"{snippet}\"")));
             }
             for (i, mention) in links.iter().enumerate() {
-                let from = mention["from"].as_str().unwrap();
+                let from = mention.source().unwrap();
                 assert_eq!(prompt.contains(from), i < prompts::LINK_MENTIONS_PER_PAGE);
             }
             let expected = if missing {
-                json!([searches.last().unwrap()["snippet"]])
+                json!([searches.last().unwrap().snippet()])
             } else {
                 json!([])
             };
@@ -370,7 +373,10 @@ fn a_referenced_page_is_never_a_404() {
             (format!("{target}.txt"), "Page not found"),
         ] {
             if path != target {
-                let mention = json!({"via": "link", "from": url, "anchor": "Details"});
+                let mention = serde_json::from_value::<crate::pages::provenance::Mention>(
+                    json!({"via": "link", "from": url, "anchor": "Details"}),
+                )
+                .unwrap();
                 world.store().add_mention(&host, &path, mention).unwrap();
             }
             let bad = format!(
@@ -462,7 +468,7 @@ fn disclosure_rewrites_preserve_context_and_recover_without_breaking_browsing() 
             .lock()
             .unwrap()
             .extend([rejected.clone(), if repeated { rejected } else { accepted }]);
-        pages.store().add_mention("example.com", "/story", json!({"via":"search", "query":"web standards", "title":"Story", "snippet":"A story."})).unwrap();
+        pages.store().add_mention("example.com", "/story", serde_json::from_value::<crate::pages::provenance::Mention>(json!({"via":"search", "query":"web standards", "title":"Story", "snippet":"A story."})).unwrap()).unwrap();
         let (sender, mut observations) = tokio::sync::mpsc::channel(32);
         pages.observe(sender);
         let world = pages.clone();
@@ -496,7 +502,7 @@ fn disclosure_rewrites_preserve_context_and_recover_without_breaking_browsing() 
         });
         let prompts = fake.users();
         assert_eq!(prompts.len(), 2);
-        assert!(prompts[1].contains("Previous answer:"));
+        assert!(!prompts[1].contains("Previous answer:"));
         assert!(prompts[1].contains("page provenance"));
         assert!(prompts[1].contains("web standards"));
         let rows = dir.rows();
@@ -547,7 +553,7 @@ fn rendered_content_rejections_use_the_same_recovery_path() {
 }
 
 #[test]
-fn rewrite_observations_redact_credentials_echoed_by_the_writer() {
+fn rewrite_observations_omit_unchecked_provider_text() {
     let dir = Dir::new("redacted-rewrite");
     let script = Arc::new(Script::default());
     script
@@ -569,7 +575,8 @@ fn rewrite_observations_redact_credentials_echoed_by_the_writer() {
         let event = observations.try_recv().unwrap();
         let serialized = serde_json::to_string(&event)?;
         assert!(!serialized.contains(KEY));
-        assert!(serialized.contains("OPENROUTER_API_KEY"));
+        assert!(serialized.contains("no BODY: line in the page answer"));
+        assert!(!serialized.contains("no body"));
         Ok(())
     });
 }
@@ -636,7 +643,7 @@ fn pages_without_claims_still_supply_cross_site_context() {
                 .status,
             200
         );
-        pages.store().add_mention("safety.fields.com", "/investigation", json!({"via":"search", "query":"battery fire", "title":"Battery fire investigation", "snippet":"Harbor Works battery fire"}))?;
+        pages.store().add_mention("safety.fields.com", "/investigation", serde_json::from_value::<crate::pages::provenance::Mention>(json!({"via":"search", "query":"battery fire", "title":"Battery fire investigation", "snippet":"Harbor Works battery fire"})).unwrap())?;
         assert_eq!(
             get(&pages, &cx, "https://safety.fields.com/investigation")
                 .await
@@ -757,5 +764,39 @@ fn decoded_credentials_are_never_published_recorded_or_retried() {
             assert!(!text.contains("&#45;"));
             assert!(!text.contains(r"\u002d"));
         }
+    }
+}
+
+#[test]
+fn rejected_and_truncated_drafts_leave_only_safe_generation_metadata() {
+    for cut_off in [true, false] {
+        let encoded = KEY.replace('-', "&#45;");
+        let answer =
+            format!("STATUS: 200\nTITLE: Report\nDATE: 2026-11-12\nBODY:\n<p>{encoded}</p>");
+        let reply = json!({"choices":[{"message":{"content":answer},"finish_reason":if cut_off {"length"} else {"stop"}}]});
+        let dir = Dir::new("unchecked-draft");
+        let fake = Fake::script(vec![
+            (ms(1), Ok((200, reply.to_string().into_bytes()))),
+            completion(1, PAGE, None),
+        ]);
+        let pages = on_disk(
+            &dir.0,
+            seed(),
+            Some(Maker::Model(openrouter(fake.clone()))),
+            0,
+        )
+        .unwrap();
+        no_cast(&pages);
+        lab(move |cx| async move {
+            let response = get(&pages, &cx, "https://news.fields.com/report").await;
+            assert_eq!(response.status, if cut_off { 200 } else { 503 });
+            assert!(fake.users().iter().all(|prompt| !prompt.contains(&encoded)));
+            assert!(dir.rows()[0]["raw"].is_null());
+            for text in dir.texts() {
+                assert!(!text.contains(KEY));
+                assert!(!text.contains("&#45;"));
+            }
+            Ok(())
+        });
     }
 }
