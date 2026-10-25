@@ -294,8 +294,12 @@ function pulses() {
 }
 
 const briefPath = (path) => path.split('?')[0];
-const isAsset = (request) => /^(image\/|font\/|audio\/|video\/|text\/css|(?:text|application)\/(?:x-)?javascript|application\/(?:font|x-font|vnd\.ms-fontobject))/.test(request.content_type)
-  || /\.(?:css|[cm]?js|map|ico|png|jpe?g|gif|svg|webp|avif|woff2?|ttf|otf|eot|mp[34]|webm)(?:\?|$)/i.test(request.path);
+// A file is known by its type; an address that only looks like a file's
+// (en.wikipedia.org/wiki/Node.js) is a page when the site sent a document.
+const DOCUMENT_TYPE = /^(text\/html|application\/xhtml\+xml|application\/pdf|(?:text|application)\/(?:[\w.+-]+\+)?(?:json|xml)|text\/plain)/;
+const isAsset = (request) => !(request.status < 400 && DOCUMENT_TYPE.test(request.content_type))
+  && (/^(image\/|font\/|audio\/|video\/|text\/css|(?:text|application)\/(?:x-)?javascript|application\/(?:font|x-font|vnd\.ms-fontobject))/.test(request.content_type)
+    || /\.(?:css|[cm]?js|map|ico|png|jpe?g|gif|svg|webp|avif|woff2?|ttf|otf|eot|mp[34]|webm)(?:\?|$)/i.test(request.path));
 const isSubresource = (fact) => fact.fetch === 'subresource' || isAsset(fact);
 const urlOf = (fact) => `${fact.scheme}://${fact.host}${fact.path}`;
 // A page's own requests (stylesheets, scripts, XHR, third-party calls)

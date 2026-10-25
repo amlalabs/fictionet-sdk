@@ -290,7 +290,7 @@ impl<'a> Document<'a> {
         Self::read(source, format, reader)
     }
 
-    /// Reads JSON as its string values, one per line under its keys.
+    /// Reads JSON as its values, one per line under its keys.
     fn json(source: &'a str) -> Self {
         let mut reader = Reader::default();
         for value in literal::values(source, 0..source.len(), Code::Json, Reading::Scalars) {
