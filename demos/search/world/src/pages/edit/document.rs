@@ -1247,7 +1247,7 @@ fn fold(character: char) -> Option<char> {
 }
 
 /// `passage` as the document's search compares it.
-fn normalized(passage: &str) -> String {
+pub(super) fn normalized(passage: &str) -> String {
     passage
         .split_whitespace()
         .collect::<Vec<_>>()

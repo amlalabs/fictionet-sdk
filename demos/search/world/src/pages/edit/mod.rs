@@ -106,6 +106,10 @@ struct Run {
     titles: Mutex<HashMap<String, Arc<Vec<Edit>>>>,
     /// The edits made to each result snippet, by its text.
     snippets: Mutex<HashMap<String, Arc<OnceCell<Vec<Edit>>>>>,
+    /// What each passage edited this run became, by the passage as the
+    /// search compares it: the same words are edited the same way wherever
+    /// they appear.
+    decided: Mutex<HashMap<String, String>>,
 }
 
 /// What readers have been shown of one address this run.
@@ -444,7 +448,10 @@ impl Editor {
                         of: count,
                     };
                     let question = self.question(&run, scenario, &account, subject, &part.text);
-                    self.ask(cx, question)
+                    async {
+                        let answer = self.ask(cx, question).await?;
+                        Ok::<_, String>(run.settle(answer))
+                    }
                 });
                 let answers = futures_util::future::try_join_all(asks).await?;
                 let scoped: Vec<Scoped<'_>> = parts
@@ -551,11 +558,17 @@ impl Editor {
             };
             let passages: String = unknown.iter().map(|title| format!("{title}\n")).collect();
             let question = self.question(&run, scenario, account, subject, &passages);
-            let answer = self.ask(cx, question).await?;
-            let mut known = run.titles.lock().unwrap();
+            let answer = run.settle(self.ask(cx, question).await?);
             let mut used = vec![false; answer.len()];
+            let mut made_for = Vec::new();
             for title in unknown {
-                let made = made_in(&title, &answer);
+                let mut edits = answer.clone();
+                edits.extend(run.known_in(&title, &answer));
+                let made = made_in(&title, &edits);
+                made_for.push((title, made));
+            }
+            let mut known = run.titles.lock().unwrap();
+            for (title, made) in made_for {
                 for (used, edit) in used.iter_mut().zip(&answer) {
                     *used |= made.contains(edit);
                 }
@@ -589,7 +602,8 @@ impl Editor {
                     let subject = Subject::Results { query, urls, part };
                     let passages = part.passages(rows);
                     let question = self.question(run, scenario, &account, subject, &passages);
-                    let answer = self.ask(cx, question).await?;
+                    let mut answer = run.settle(self.ask(cx, question).await?);
+                    answer.extend(run.known_in(result.snippet.trim(), &answer));
                     let made = made_in(result.snippet.trim(), &answer);
                     for edit in answer.iter().filter(|edit| !made.contains(edit)) {
                         eprintln!("{}: snippet edit not made: {:?}", result.url, edit.passage);
@@ -823,6 +837,52 @@ impl Run {
             .entry(url.to_owned())
             .or_default()
             .page = Some(edits.to_vec());
+    }
+
+    /// `answer` with each passage edited earlier this run made as it was
+    /// then; its new passages are decided now.
+    fn settle(&self, answer: Vec<Edit>) -> Vec<Edit> {
+        let mut decided = self.decided.lock().unwrap();
+        answer
+            .into_iter()
+            .map(|edit| {
+                if document::normalized(&edit.passage) == document::normalized(&edit.replacement) {
+                    return edit;
+                }
+                let replacement = decided
+                    .entry(document::normalized(&edit.passage))
+                    .or_insert_with(|| edit.replacement.clone())
+                    .clone();
+                Edit {
+                    passage: edit.passage,
+                    replacement,
+                }
+            })
+            .collect()
+    }
+
+    /// The passages of several words edited earlier this run that `text`
+    /// holds and `edits` leave alone, made as they were then.
+    fn known_in(&self, text: &str, edits: &[Edit]) -> Vec<Edit> {
+        let text = document::normalized(text);
+        let asked: Vec<String> = edits
+            .iter()
+            .map(|edit| document::normalized(&edit.passage))
+            .collect();
+        self.decided
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(passage, _)| {
+                passage.split_whitespace().count() >= 3
+                    && text.contains(passage.as_str())
+                    && !asked.contains(passage)
+            })
+            .map(|(passage, replacement)| Edit {
+                passage: passage.clone(),
+                replacement: replacement.clone(),
+            })
+            .collect()
     }
 
     fn shown_listed(&self, url: &str, row: String, edited: bool) {
