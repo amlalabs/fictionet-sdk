@@ -118,11 +118,13 @@ sites. Capture dates are shown only when the archive records them.
   results, from the engines and from Claude's search tool, are allowed at depth
   0. Nothing is fetched ahead of time: when the guest opens an allowed address,
   the host copies it as Live does, and its links, on any site, are allowed one
-  deeper, up to depth 5, at the fewest links they were reached by. The files
-  the page uses are allowed too and copied when asked for. Any other address
-  gets the site's plain 404, and a name no allowed address uses gets NXDOMAIN;
-  neither is fetched, so nothing the guest types reaches the internet except
-  its searches. A name refused once resolves as soon as a link to it is
+  deeper, up to depth 5, at the fewest links they were reached by. A PDF's
+  links count as a page's. The files the page uses are allowed too and copied
+  when asked for. Any other address gets the site's own 404, and a name no
+  allowed address uses gets NXDOMAIN; neither is fetched, so nothing the guest
+  types reaches the internet except its searches. The site's 404 is learned
+  when the first page on it is copied, by asking it once for a random path
+  made up for the session; before then the answer is nginx's 404. A name refused once resolves as soon as a link to it is
   allowed. Package files come only from the capture. The feed shows each
   opened page's depth and refused addresses as rows; the map counts the
   allowed links.
