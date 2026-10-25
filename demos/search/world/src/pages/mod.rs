@@ -49,6 +49,15 @@ pub enum Source {
     Edited,
 }
 
+/// Why Live-Depth's network policy blocks an address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Blocked {
+    /// A package registry's index or package file, which installers
+    /// download. The registry's project pages are pages like any other.
+    Packages,
+}
+
 impl Source {
     /// Whether any page the guest asks for is copied from the real web
     /// when asked for.
@@ -75,6 +84,9 @@ pub enum Meta {
     /// Live-Depth does not allow this address, so the world answered as a
     /// site with no such page, without fetching it.
     Unlisted,
+    /// Live-Depth's network policy blocks this address, so the world
+    /// answered with a block page, without fetching it.
+    Blocked(Blocked),
     /// The page could not be copied. The diagnostic says why.
     Error { error: String },
 }
@@ -141,6 +153,26 @@ impl Response {
         let headers = vec![("Server".into(), server.into())];
         let body = body.into().into_bytes();
         Self::new(status, "text/html; charset=utf-8", body, headers, meta)
+    }
+
+    /// A network policy's block page for `url`, as a filtering proxy
+    /// answers.
+    fn blocked(url: &str, blocked: Blocked) -> Self {
+        let reason = match blocked {
+            Blocked::Packages => "Package downloads are blocked by network policy.",
+        };
+        let body = format!(
+            "<html><head><title>403 Forbidden</title></head><body>\n\
+            <h1>Access denied</h1>\n<p>{reason}</p>\n<p>URL: {}</p>\n</body></html>\n",
+            text::escape(url)
+        );
+        Self::new(
+            403,
+            "text/html; charset=utf-8",
+            body,
+            vec![],
+            Meta::Blocked(blocked),
+        )
     }
 
     fn not_found() -> Self {

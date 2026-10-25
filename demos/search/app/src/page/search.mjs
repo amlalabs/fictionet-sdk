@@ -354,6 +354,7 @@ function activityItem(row) {
     case 'request': {
       const url = urlOf(fact), hit = hitFor(url);
       const where = whereOf(fact);
+      if (fact.blocked) return { title: `Blocked ${whereOf(fact, true)}`, meta: `${BLOCKED[fact.blocked]} · ${fact.status}`, target: `site:${fact.host}`, failed: true };
       if (fact.unlisted) return { title: `Refused ${whereOf(fact, true)}`, meta: `Not allowed · ${fact.status}`, target: `site:${fact.host}`, failed: true };
       if (fact.status >= 400) {
         const outcome = [404, 410].includes(fact.status) ? 'not found' : [502, 503, 504].includes(fact.status) ? 'unreachable' : 'failed';
@@ -378,6 +379,8 @@ function activityItem(row) {
   }
 }
 // How a real site's certificate fails, as the feed says it.
+// Why Live-Depth's network policy blocked an address, as the feed says it.
+const BLOCKED = { packages: 'Packages' };
 const CERTIFICATE = { expired: 'expired', not_yet_valid: 'not yet valid', wrong_name: 'for another name', untrusted: 'not trusted' };
 // A change reads as the real words struck through, then the world's words.
 function changeList(edits, limit = edits.length) {
