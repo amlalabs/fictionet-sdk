@@ -540,6 +540,16 @@ impl Pages {
         else {
             return copied::replay(Ok(Some(response)));
         };
+        // Data served as plain text, as a code host serves a raw file, is
+        // read as the data it is.
+        let format = if format == edit::Format::Text
+            && text.trim_start().starts_with(['{', '['])
+            && serde_json::from_str::<serde::de::IgnoredAny>(text).is_ok()
+        {
+            edit::Format::Json
+        } else {
+            format
+        };
         let revision = match editor.page(cx, url, text, format).await {
             Ok(Some(revision)) => revision,
             Ok(None) => return copied::replay(Ok(Some(response))),

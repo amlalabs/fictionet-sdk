@@ -13,11 +13,12 @@ pub(super) enum Code {
     Script,
 }
 
-/// A string value: its characters with the source bytes behind each, the
-/// quote it is written in, and the keys it sits under.
+/// A value: its characters with the source bytes behind each, the quote
+/// it is written in, and the keys it sits under.
 pub(super) struct Literal {
-    /// The bytes between the quotes.
+    /// The bytes between the quotes, or of the whole value when it is bare.
     pub content: Range<usize>,
+    /// The quote; [`BARE`] for a number or `true`/`false` in data.
     pub quote: u8,
     /// Each character of the value with the source bytes it is written in.
     pub characters: Vec<(char, Range<usize>)>,
@@ -26,8 +27,26 @@ pub(super) struct Literal {
     pub label: String,
 }
 
-/// The string values (not keys) in `range` of `source`.
-pub(super) fn values(source: &str, range: Range<usize>, code: Code) -> Vec<Literal> {
+/// The quote of a value written without one: a number, `true` or `false`.
+pub(super) const BARE: u8 = 0;
+
+/// What [`values`] reads.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Reading {
+    /// String values only: the text in a page's scripts and data.
+    Strings,
+    /// Numbers, `true` and `false` too: a data file states facts in them
+    /// as much as in its strings.
+    Scalars,
+}
+
+/// The values (not keys) in `range` of `source`.
+pub(super) fn values(
+    source: &str,
+    range: Range<usize>,
+    code: Code,
+    reading: Reading,
+) -> Vec<Literal> {
     let bytes = source.as_bytes();
     let end = range.end.min(source.len());
     let mut at = range.start;
@@ -62,6 +81,35 @@ pub(super) fn values(source: &str, range: Range<usize>, code: Code) -> Vec<Liter
             b',' | b';' => key = None,
             b'"' => {}
             b'\'' | b'`' if code == Code::Script => {}
+            b'-' | b'0'..=b'9' | b't' | b'f'
+                if code == Code::Json && reading == Reading::Scalars =>
+            {
+                // A bare value: JSON's keys are always quoted.
+                let start = at;
+                while at < end
+                    && (bytes[at].is_ascii_alphanumeric()
+                        || matches!(bytes[at], b'-' | b'+' | b'.'))
+                {
+                    at += 1;
+                }
+                let token = &source[start..at];
+                let scalar = matches!(token, "true" | "false") || token.parse::<f64>().is_ok();
+                if scalar {
+                    let parent = holders.last().filter(|holder| !holder.is_empty());
+                    found.push(Literal {
+                        content: start..at,
+                        quote: BARE,
+                        characters: token
+                            .char_indices()
+                            .map(|(offset, character)| {
+                                (character, start + offset..start + offset + 1)
+                            })
+                            .collect(),
+                        label: label(parent, key.take()),
+                    });
+                }
+                continue;
+            }
             _ if code == Code::Script
                 && (byte.is_ascii_alphabetic() || byte == b'_' || byte == b'$') =>
             {
@@ -103,21 +151,25 @@ pub(super) fn values(source: &str, range: Range<usize>, code: Code) -> Vec<Liter
             continue;
         }
         let parent = holders.last().filter(|holder| !holder.is_empty());
-        let label = match (parent, &key) {
-            (Some(parent), Some(key)) => format!("{parent}.{key}"),
-            (None, Some(key)) => key.clone(),
-            (Some(parent), None) => parent.clone(),
-            (None, None) => String::new(),
-        };
-        key = None;
         found.push(Literal {
             content,
             quote: byte,
             characters,
-            label,
+            label: label(parent, key.take()),
         });
     }
     found
+}
+
+/// The names a value sits under: its key after the key that holds it, as
+/// `parent.key`.
+fn label(parent: Option<&String>, key: Option<String>) -> String {
+    match (parent, key) {
+        (Some(parent), Some(key)) => format!("{parent}.{key}"),
+        (None, Some(key)) => key,
+        (Some(parent), None) => parent.clone(),
+        (None, None) => String::new(),
+    }
 }
 
 /// Whether a colon (and not `::`) follows `at`, past any spaces.

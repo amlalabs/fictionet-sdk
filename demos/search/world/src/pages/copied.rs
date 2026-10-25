@@ -214,8 +214,15 @@ impl Pages {
         })
     }
 
+    /// When the copy Copied mode answers `url` with was made, from the
+    /// source that answers it.
     pub(crate) fn capture_date(&self, url: &str) -> Option<String> {
         let corpus = self.copied.as_ref()?;
+        if let CorpusSearch::Reference(reference) = &corpus.search
+            && let Some(captured) = reference.captured(url)
+        {
+            return captured;
+        }
         corpus
             .archive
             .captured(url)

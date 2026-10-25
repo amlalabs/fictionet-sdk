@@ -7,7 +7,9 @@
 //! changes, what follows from it, what stays, and the facts the changes
 //! must not contradict. Every page, data file and result list starts as
 //! the real one. One that names none of the subjects is served without a
-//! model call, and without waiting for the account. One that does is read
+//! model call, and without waiting for the account. A data file names them
+//! the way data does, as well: a project in its address, keys or values,
+//! with the version or item the scenario is about. One that does is read
 //! in parts, all at once, and the model returns only edits for each part:
 //! an exact passage and its replacement. The world makes them in the real
 //! bytes and serves the rest unchanged.
@@ -92,6 +94,10 @@ type Edited = Option<Arc<Revision>>;
 #[derive(Default)]
 struct Run {
     scenario: Option<String>,
+    /// Where the scenario's subjects and account are being asked for:
+    /// cancelled when another scenario is set, so a cleared scenario asks
+    /// nothing more.
+    preparing: Mutex<Option<Cx>>,
     /// The names that mark a document as being about the scenario, asked
     /// for first, so documents that name none need not wait for the account.
     subjects: OnceCell<Arc<Subjects>>,
@@ -133,11 +139,61 @@ struct Account {
     subjects: Subjects,
 }
 
-/// The names that mark text as being about a scenario, as one pattern.
-struct Subjects(Option<Regex>);
+/// The names that mark text as being about a scenario, as one pattern,
+/// and how data files and addresses write them.
+struct Subjects {
+    names: Option<Regex>,
+    data: DataNames,
+}
+
+/// How data files and web addresses write a scenario's subjects: the
+/// projects (`django`, `openssl`) and, when the scenario is about one
+/// version or item of them, that item as data writes it on its own (`v5`,
+/// `3.0`).
+/// Data names its subject this way, in its address, keys and values, and
+/// seldom by the names pages use.
+#[derive(Default)]
+struct DataNames {
+    projects: Vec<String>,
+    items: Vec<String>,
+}
+
+impl DataNames {
+    fn new(projects: &[String], items: &[String]) -> Self {
+        let words = |names: &[String]| -> Vec<String> {
+            names
+                .iter()
+                .map(|name| name.trim().to_lowercase())
+                .filter(|name| !name.is_empty())
+                .collect()
+        };
+        Self {
+            projects: words(projects),
+            items: words(items),
+        }
+    }
+
+    /// Whether `text` (an address with a data file's text) names one of
+    /// the projects and, when there are items, one of those.
+    fn named_in(&self, text: &str) -> bool {
+        let text = text.to_lowercase();
+        let any = |names: &[String]| names.iter().any(|name| whole_word(&text, name));
+        any(&self.projects) && (self.items.is_empty() || any(&self.items))
+    }
+}
+
+/// Whether `name` appears in `text` with no letter or digit right before
+/// or after it.
+fn whole_word(text: &str, name: &str) -> bool {
+    text.match_indices(name).any(|(at, found)| {
+        let before = text[..at].chars().next_back();
+        let after = text[at + found.len()..].chars().next();
+        !before.is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric)
+    })
+}
 
 impl Subjects {
-    fn new(names: &[String]) -> Result<Self, String> {
+    fn new(names: &[String], data: DataNames) -> Result<Self, String> {
         let word = |character: Option<char>| character.is_some_and(|c| c.is_alphanumeric());
         let mut alternatives: Vec<String> = names
             .iter()
@@ -153,18 +209,26 @@ impl Subjects {
             .collect();
         alternatives.sort();
         alternatives.dedup();
-        if alternatives.is_empty() {
-            return Ok(Self(None));
-        }
-        Regex::new(&format!("(?i)(?:{})", alternatives.join("|")))
-            .map(|pattern| Self(Some(pattern)))
-            .map_err(|error| error.to_string())
+        let names = if alternatives.is_empty() {
+            None
+        } else {
+            let pattern = Regex::new(&format!("(?i)(?:{})", alternatives.join("|")))
+                .map_err(|error| error.to_string())?;
+            Some(pattern)
+        };
+        Ok(Self { names, data })
     }
 
-    fn named_in(&self, text: &str) -> bool {
-        self.0
+    /// Whether `text`, the text of the document at `address` (with its
+    /// format) if it has one, is about the subjects: a page names one, and
+    /// a data file names one or names them the way data does.
+    fn named_in(&self, text: &str, address: Option<(&str, Format)>) -> bool {
+        self.names
             .as_ref()
             .is_some_and(|pattern| pattern.is_match(text))
+            || address.is_some_and(|(url, format)| {
+                format != Format::Html && self.data.named_in(&format!("{url}\n{text}"))
+            })
     }
 }
 
@@ -172,6 +236,8 @@ impl Subjects {
 #[derive(Deserialize)]
 struct SubjectsAnswer {
     subjects: Vec<String>,
+    projects: Vec<String>,
+    items: Vec<String>,
 }
 
 /// The model's account of a scenario.
@@ -211,8 +277,21 @@ tournament as well as its final, the project as well as its release), in every s
 abbreviation and language pages use. Never list a country, place, person, team, company, \
 common word or number on its own, since unrelated pages name those too.";
 
-const SUBJECTS: &str = "A scenario changes facts on real web pages. Before anything else, the \
-world needs to know which pages may be about it. List the scenario's subjects.";
+const SUBJECTS: &str = "A scenario changes facts on real web pages and data files. Before \
+anything else, the world needs to know which pages and files may be about it. List the \
+scenario's subjects, and how data names them.";
+
+/// How data files name a scenario's subjects, asked with the subjects.
+const DATA_NAMES: &str = "- projects: the names data files and web addresses use for what \
+the scenario is about, as they write them in paths, keys and values: the package, project, \
+product, distribution or article name and its slugs (django, python-django, openssl, debian, \
+Eiffel_Tower). Data files (JSON from an API, a project's schedule file, raw wikitext) \
+seldom use the names pages use. Never list a common word (release, schedule, dist, api, lts), \
+a file name or a website on its own.
+- items: when the scenario is about one version, release line, edition or item of a project, \
+that item as data writes it on its own, in every form (5, v5, 5.x and the codename for a \
+release line; 3.0.2 for a version; 12 and bookworm for a distribution release). Leave this empty \
+when the scenario is about the whole of its subject.";
 
 const ACCOUNT: &str = "A scenario changes facts on real web pages. Many editors will each edit \
 one part of one page at the same time, and every page must agree with every other and with \
@@ -226,18 +305,30 @@ agree; events that no longer happened, with what pages say instead; and what rea
 to do (steps, sign-ups, eligibility, prices, instructions) that no longer applies or now \
 applies, with what pages say instead. Pages write a range's end both as the first value \
 past it and as the last value in it (fixed in 2.0, affects versions up to 1.9.3); when the end \
-moves, give both forms. Work out every number exactly. Change only what the scenario states or \
-strictly requires.
+moves, give both forms. Work out every number exactly. When pages will need a value the \
+scenario implies but does not give (the version number and date of a release that now \
+happens, a new total, a new deadline), decide it here, once and exactly, from the real values \
+around it (the next number after the real latest release, say), so that every page gives the \
+same one. When the scenario says something goes on (releases, updates, payments), decide the \
+items pages published by today would list: each one's number, date and contents. Change only what the scenario states or strictly requires.
 - conflicts: true facts the changes collide with, which stay true. Moving a date or changing a \
 fact can make other statements impossible: a person who no longer held an office or role at \
 the new date, a building, work or event dated before the new date that copied, followed, \
 answered or competed with the subject, an anniversary or record counted from the old date, an \
-event that no longer includes the subject. Those other facts never move. For each, give the \
+event that no longer includes the subject. Those other facts never move. An event that really \
+happened (a celebration, a walk, a report) keeps its real date and its sources even when the \
+scenario changes what it marked: pages describe it without the label that no longer fits (the \
+1990 festival rather than the centenary festival), and never move it to a new date. \
+For each, give the \
 fixed fact and how pages put it so that both stay true: name who held an office at the new \
 date only when certain, and otherwise leave the name out; say what an earlier structure is \
 without calling it a copy; take the subject out of an event it is no longer part of. Leave out \
 anything you are not sure of.
-- unchanged: facts close to the scenario that stay as they are, so no editor changes them.
+- unchanged: facts close to the scenario that stay as they are, so no editor changes them. \
+Include the facts pages state beside the subject that look like it but are about something \
+else, each with its real values: other advisories, vulnerabilities and fixes of the same \
+project, other releases and versions, other events at the same place. Include that sources \
+(news reports, books, papers, archived pages) keep their own titles and publication dates.
 - ";
 
 const TIMING: &str = "
@@ -266,13 +357,34 @@ versions, a period of validity), change every statement of that end however it i
 (`< 2.0`, `before 2.0`, `until 2019`), including a last affected version given in place of the first \
 fixed one (`up to 1.9.3` when the fix was 2.0), which moves with the fix.
 - Some lines are values from data in the document (JSON, or the data in a page's scripts), \
-each after the names of the keys that hold it and a colon, like `release.date: 2019-04-01`. The \
-names say what the value is. Edit only the value; a passage may start with the names to tell \
-equal values apart. An edit changes one value, and its passage never reaches past that \
-value's line: values cannot be added, removed or joined.
+each after the names of the keys that hold it and a colon, like `release.date: 2019-04-01` or \
+`v5.lts: true`. The names say what the value is, and the lines around it what it belongs to. \
+Edit only the value; a passage may start with the names to tell equal values apart. An edit \
+changes one value, and its passage never reaches past that value's line: values cannot be \
+added, removed or joined. A value may be text, a number, true or false; write a number, true \
+or false as it is.
+- A text file (Markdown, wikitext, a changelog) keeps its markup: copy it exactly in passages \
+and write replacements in the same markup.
+- Change a table row, list item or line where it is, cell by cell. Never remove one to write \
+it again somewhere else (a release moving from one table to another): only edits to PASSAGES \
+are made, so what is removed is lost. A document may show the same fact more than once (a \
+table repeated for small screens, a summary and its details, the page's text and its source \
+data): change every one the same way.
 - Change nothing the account does not change. Every other fact, figure, name and word stays. A \
 figure beside a changed one is often a different fact (a half-time score, an earlier version, \
-another date): leave it unless the account changes that very figure.
+another date): leave it unless the account changes that very figure. A statement about \
+something else that names the subject (another advisory, vulnerability, fix, release or event \
+of the same project or place) keeps its own versions and dates unless the account changes \
+that very thing.
+- Use only values the account gives. Never make up a value it does not give (a version \
+number, a date, a figure, a name), and never add an item carrying one (a release, a version in \
+a list, a row); when a statement would need one, write it without that value.
+- References and citations record other works: a cited work's title or headline, author, \
+publisher, publication date, archive date and access date never change unless the account \
+changes that work itself. A title in quotation marks or italics in a reference, a citation \
+template's fields (|title=, |date=, |access-date=, |archive-date=) and a link's text naming \
+another work stay word for word, even when they name the subject or a changed fact. Body text keeps agreeing with its sources: an event the account \
+leaves at its real date keeps that date in the text too.
 - When a change would make another statement in PASSAGES false or impossible (an earlier \
 event, building or work tied to the old fact, a person acting in a role at the new date), \
 rewrite that statement so it stays true, as the account's conflicts say, together with the \
@@ -310,8 +422,10 @@ from. Copy each passage from the snippet, never from the address.";
 
 fn schema_subjects() -> Value {
     json!({"type":"object","properties":{
-        "subjects":{"type":"array","items":{"type":"string"}}
-    },"required":["subjects"],"additionalProperties":false})
+        "subjects":{"type":"array","items":{"type":"string"}},
+        "projects":{"type":"array","items":{"type":"string"}},
+        "items":{"type":"array","items":{"type":"string"}}
+    },"required":["subjects","projects","items"],"additionalProperties":false})
 }
 
 fn schema_account() -> Value {
@@ -377,25 +491,39 @@ impl Editor {
             scenario: scenario.clone(),
             ..Run::default()
         });
-        *self.run.lock().unwrap() = run.clone();
+        let previous = std::mem::replace(&mut *self.run.lock().unwrap(), run.clone());
+        if let Some(preparing) = previous.preparing.lock().unwrap().take() {
+            preparing.cancel();
+        }
         self.scenario.send_replace(scenario.map(|text| Scenario {
             text,
             readiness: Readiness::Preparing,
         }));
+        let Some(scenario) = run.scenario.clone() else {
+            return;
+        };
         let editor = self.clone();
         fcx.spawn(move |cx| async move {
-            if let Some(scenario) = &run.scenario {
+            cx.region(|cx| async move {
+                *run.preparing.lock().unwrap() = Some(cx.clone());
+                // Another scenario may have been set before this began.
+                if !editor.current(&run) {
+                    return Ok(());
+                }
                 let (subjects, account) = futures_util::future::join(
-                    editor.subjects(&cx, &run, scenario),
-                    editor.account(&cx, &run, scenario),
+                    editor.subjects(&cx, &run, &scenario),
+                    editor.account(&cx, &run, &scenario),
                 )
                 .await;
-                if let Err(error) = subjects.and(account) {
+                if let Err(error) = subjects.and(account)
+                    && editor.current(&run)
+                {
                     eprintln!("The scenario's account is not ready: {error}");
                     editor.ready(&run, Readiness::Failed { error });
                 }
-            }
-            Ok(())
+                Ok(())
+            })
+            .await
         });
     }
 
@@ -434,7 +562,12 @@ impl Editor {
                     .unwrap()
                     .get(url)
                     .is_some_and(|shown| shown.listed_edited);
-                if !listed_edited && !self.about(cx, &run, scenario, document.text()).await? {
+                let address = Some((url, format));
+                if !listed_edited
+                    && !self
+                        .about(cx, &run, scenario, document.text(), address)
+                        .await?
+                {
                     return Ok::<_, String>(None);
                 }
                 let account = self.account(cx, &run, scenario).await?;
@@ -524,7 +657,7 @@ impl Editor {
                     .is_some_and(|edits| !edits.is_empty())
             })
         };
-        let account = if opened_edited || self.about(cx, &run, scenario, &listing).await? {
+        let account = if opened_edited || self.about(cx, &run, scenario, &listing, None).await? {
             Some(self.account(cx, &run, scenario).await?)
         } else {
             None
@@ -644,15 +777,23 @@ impl Editor {
         Ok(edits)
     }
 
-    /// Whether `text` names the scenario's subjects. Only those asked for
-    /// first are waited for; those the account adds count once it is ready.
-    async fn about(&self, cx: &Cx, run: &Run, scenario: &str, text: &str) -> Result<bool, String> {
+    /// Whether `text`, of the document at `address` if it has one, names
+    /// the scenario's subjects. Only those asked for first are waited for;
+    /// those the account adds count once it is ready.
+    async fn about(
+        &self,
+        cx: &Cx,
+        run: &Run,
+        scenario: &str,
+        text: &str,
+        address: Option<(&str, Format)>,
+    ) -> Result<bool, String> {
         let subjects = self.subjects(cx, run, scenario).await?;
-        Ok(subjects.named_in(text)
+        Ok(subjects.named_in(text, address)
             || run
                 .account
                 .get()
-                .is_some_and(|account| account.subjects.named_in(text)))
+                .is_some_and(|account| account.subjects.named_in(text, None)))
     }
 
     async fn subjects(&self, cx: &Cx, run: &Run, scenario: &str) -> Result<Arc<Subjects>, String> {
@@ -665,13 +806,19 @@ impl Editor {
                     .json(
                         cx,
                         Care::Exact,
-                        &format!("{SUBJECTS}\n\n- {SUBJECT_RULES}"),
+                        &format!("{SUBJECTS}\n\n- {SUBJECT_RULES}\n{DATA_NAMES}"),
                         &mut conversation,
                         &schema_subjects(),
                     )
                     .await?;
-                eprintln!("Scenario subjects: {}", answer.subjects.join(", "));
-                Ok::<_, String>(Arc::new(Subjects::new(&answer.subjects)?))
+                eprintln!(
+                    "Scenario subjects: {}; in data: {} with {}",
+                    answer.subjects.join(", "),
+                    answer.projects.join(", "),
+                    answer.items.join(", ")
+                );
+                let data = DataNames::new(&answer.projects, &answer.items);
+                Ok::<_, String>(Arc::new(Subjects::new(&answer.subjects, data)?))
             })
             .await
             .cloned()
@@ -724,7 +871,7 @@ impl Editor {
                 );
                 Ok::<_, String>(Arc::new(Account {
                     text,
-                    subjects: Subjects::new(&answer.subjects)?,
+                    subjects: Subjects::new(&answer.subjects, DataNames::default())?,
                 }))
             })
             .await

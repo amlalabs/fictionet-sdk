@@ -4,7 +4,7 @@ use axum::{
     Json, Router,
     extract::{Query, State},
     response::{Html, IntoResponse},
-    routing::{get, post},
+    routing::get,
 };
 use fictionet_demo::kit::page::{self as pieces, Console, HostStatus};
 use serde::{Deserialize, Serialize};
@@ -703,7 +703,7 @@ impl Page {
                     }
                 }),
             )
-            .route("/command", post(command))
+            .route("/updates", get(updates))
             .route(
                 "/terminal",
                 get(move |upgrade: axum::extract::ws::WebSocketUpgrade| {
@@ -719,15 +719,6 @@ impl Page {
                 }),
             )
             .with_state(self.clone())
-            .merge(fictionet::stdlib::page::state(self.snapshots.subscribe()))
-            .nest(
-                "/host",
-                fictionet::stdlib::page::state(self.host.subscribe()),
-            )
-            .nest(
-                "/world",
-                fictionet::stdlib::page::state(self.world.subscribe()),
-            )
             .merge(pieces::libraries())
     }
 }
@@ -741,20 +732,39 @@ struct Preview {
 #[derive(Deserialize)]
 struct Served {
     url: url::Url,
+    picture: Picture,
 }
 /// A dependency of a served page, read from the source that served it.
 #[derive(Deserialize)]
 struct Dependency {
     page: url::Url,
     url: url::Url,
+    picture: Picture,
+}
+/// Where a picture of a served page is shown, which decides whether it may
+/// copy what the world does not hold yet.
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Picture {
+    /// A small picture in the feed: drawn from what the world holds, so a
+    /// feed of many pages sends no requests to their sites.
+    Feed,
+    /// The page opened to read: its images are copied as they come into
+    /// view, as a browser loads them.
+    Reading,
 }
 /// What a still picture of a served page may load: only what the world holds.
 const PICTURE_POLICY: &str = "default-src 'none'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; base-uri 'none'; form-action 'none'";
-fn held_address(page: &url::Url) -> impl Fn(&url::Url) -> String + '_ {
+fn held_address(page: &url::Url, picture: Picture) -> impl Fn(&url::Url) -> String + '_ {
     move |url| {
+        let picture = match picture {
+            Picture::Feed => "feed",
+            Picture::Reading => "reading",
+        };
         let query = url::form_urlencoded::Serializer::new(String::new())
             .append_pair("page", page.as_str())
             .append_pair("url", url.as_str())
+            .append_pair("picture", picture)
             .finish();
         format!("/held?{query}")
     }
@@ -762,14 +772,14 @@ fn held_address(page: &url::Url) -> impl Fn(&url::Url) -> String + '_ {
 /// The page as the world served it, with its own stylesheets and images.
 async fn thumbnail(
     State(page): State<Page>,
-    Query(Served { url }): Query<Served>,
+    Query(Served { url, picture }): Query<Served>,
 ) -> axum::response::Response {
     let Some((body, _)) = page.views.lock().unwrap().preview(&url) else {
         return (http::StatusCode::NOT_FOUND, "No served page").into_response();
     };
     let picture = tokio::task::spawn_blocking(move || {
         body.text()
-            .map(|html| web_world::pages::snapshot::page(&url, &html, &held_address(&url)))
+            .map(|html| web_world::pages::snapshot::page(&url, &html, &held_address(&url, picture)))
     })
     .await;
     match picture {
@@ -790,7 +800,11 @@ async fn thumbnail(
 }
 async fn held(
     State(page): State<Page>,
-    Query(Dependency { page: owner, url }): Query<Dependency>,
+    Query(Dependency {
+        page: owner,
+        url,
+        picture,
+    }): Query<Dependency>,
 ) -> axum::response::Response {
     let Some((_, source)) = page.views.lock().unwrap().preview(&owner) else {
         return http::StatusCode::NOT_FOUND.into_response();
@@ -799,12 +813,13 @@ async fn held(
         return http::StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     pages.settled(&source, url.as_str()).await;
-    // An image is copied when the picture first shows it.
+    // An image is copied when the page opened to read first shows it.
     let holds = {
         let (pages, source, url) = (pages.clone(), source.clone(), url.clone());
         tokio::task::spawn_blocking(move || pages.held_resource(&source, url.as_str()).is_some())
     };
-    if !holds.await.unwrap_or(false)
+    if matches!(picture, Picture::Reading)
+        && !holds.await.unwrap_or(false)
         && let Some(cx) = page.cx.get()
     {
         pages
@@ -817,7 +832,7 @@ async fn held(
             held.body = web_world::pages::snapshot::stylesheet(
                 &url,
                 &String::from_utf8_lossy(&held.body),
-                &held_address(&owner),
+                &held_address(&owner, picture),
             )
             .into_bytes();
         }
@@ -842,26 +857,82 @@ async fn held(
         _ => http::StatusCode::NOT_FOUND.into_response(),
     }
 }
-async fn command(
+/// What the page's socket sends: each stream's latest state as it changes,
+/// and the reply to each command the page sent on it.
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum Update {
+    View { state: Box<View> },
+    World { state: WorldState },
+    Host { state: HostStatus },
+    Reply { id: u64, error: Option<String> },
+}
+/// A command the page sends on its socket, numbered for its reply.
+#[derive(Deserialize)]
+struct Asked {
+    id: u64,
+    command: Command,
+}
+/// The page's one socket: its states and its commands share it, so they
+/// never wait behind the page's pictures for one of the few connections a
+/// browser opens to a host, however many tabs show the page.
+async fn updates(
     State(page): State<Page>,
-    Json(command): Json<Command>,
+    upgrade: axum::extract::ws::WebSocketUpgrade,
 ) -> axum::response::Response {
-    let (reply, receive) = tokio::sync::oneshot::channel();
-    if page.commands.send((command, reply)).is_err() {
-        return (
-            http::StatusCode::SERVICE_UNAVAILABLE,
-            "The world has stopped",
-        )
-            .into_response();
-    }
-    match receive.await {
-        Ok(Ok(())) => http::StatusCode::NO_CONTENT.into_response(),
-        Ok(Err(error)) => (http::StatusCode::BAD_REQUEST, error).into_response(),
-        Err(_) => (
-            http::StatusCode::SERVICE_UNAVAILABLE,
-            "The world has stopped",
-        )
-            .into_response(),
+    upgrade.on_upgrade(move |socket| page.serve_updates(socket))
+}
+impl Page {
+    async fn serve_updates(self, mut socket: axum::extract::ws::WebSocket) {
+        use axum::extract::ws::Message;
+        let mut view = self.snapshots.subscribe();
+        let mut world = self.world.subscribe();
+        let mut host = self.host.subscribe();
+        view.mark_changed();
+        world.mark_changed();
+        host.mark_changed();
+        let (replied, mut replies) = mpsc::unbounded_channel::<Update>();
+        loop {
+            // States go before replies, so a reply finds the page showing
+            // what its command changed.
+            let update = tokio::select! {
+                biased;
+                Ok(()) = world.changed() => Update::World { state: world.borrow_and_update().clone() },
+                Ok(()) = host.changed() => Update::Host { state: host.borrow_and_update().clone() },
+                Ok(()) = view.changed() => Update::View { state: Box::new(view.borrow_and_update().clone()) },
+                Some(reply) = replies.recv() => reply,
+                message = socket.recv() => match message {
+                    Some(Ok(Message::Text(text))) => {
+                        let Ok(Asked { id, command }) = serde_json::from_str(&text) else {
+                            break;
+                        };
+                        let (reply, receive) = tokio::sync::oneshot::channel();
+                        if self.commands.send((command, reply)).is_err() {
+                            let error = Some("The world has stopped".to_owned());
+                            let _ = replied.send(Update::Reply { id, error });
+                            continue;
+                        }
+                        let replied = replied.clone();
+                        tokio::spawn(async move {
+                            let error = match receive.await {
+                                Ok(result) => result.err(),
+                                Err(_) => Some("The world has stopped".to_owned()),
+                            };
+                            let _ = replied.send(Update::Reply { id, error });
+                        });
+                        continue;
+                    }
+                    Some(Ok(_)) => continue,
+                    Some(Err(_)) | None => break,
+                },
+            };
+            let Ok(text) = serde_json::to_string(&update) else {
+                break;
+            };
+            if socket.send(Message::Text(text.into())).await.is_err() {
+                break;
+            }
+        }
     }
 }
 async fn open_console(
