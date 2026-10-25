@@ -128,10 +128,10 @@ impl ReferenceWeb {
         host == "en.wikipedia.org" || self.hosts.contains(host)
     }
 
-    pub fn response(&self, url: &str) -> io::Result<Option<warc::Response>> {
-        let parsed = url::Url::parse(url).map_err(io::Error::other)?;
+    /// The Wikipedia copy's entry for `url`, when it holds one.
+    fn article(&self, parsed: &url::Url) -> io::Result<Option<zim::DirectoryEntry>> {
         if parsed.host_str() != Some("en.wikipedia.org") {
-            return archived_response(&self.documents, &self.documents, url);
+            return Ok(None);
         }
         let path = percent_encoding::percent_decode_str(parsed.path())
             .decode_utf8()
@@ -140,11 +140,27 @@ impl ReferenceWeb {
             .strip_prefix("/wiki/")
             .unwrap_or_else(|| path.trim_start_matches('/'));
         let path = path.replace(' ', "_");
-        let entry = self
-            .wikipedia
+        self.wikipedia
             .get_by_path(Namespace::UserContent, &path)
-            .map_err(io::Error::other)?;
-        let Some(entry) = entry else {
+            .map_err(io::Error::other)
+    }
+
+    /// When the copy this web answers `url` with was made (RFC 3339): the
+    /// Wikipedia copy's day for its articles, the capture's time for other
+    /// pages. `None` when this web does not answer it.
+    pub fn captured(&self, url: &str) -> Option<Option<String>> {
+        let parsed = url::Url::parse(url).ok()?;
+        if self.article(&parsed).ok().flatten().is_some() {
+            return Some(self.date.map(|date| format!("{date}T00:00:00Z")));
+        }
+        self.documents
+            .contains(url)
+            .then(|| self.documents.captured(url).map(str::to_owned))
+    }
+
+    pub fn response(&self, url: &str) -> io::Result<Option<warc::Response>> {
+        let parsed = url::Url::parse(url).map_err(io::Error::other)?;
+        let Some(entry) = self.article(&parsed)? else {
             return archived_response(&self.documents, &self.documents, url);
         };
         if let Some(Target::Redirect(target)) = entry.target {

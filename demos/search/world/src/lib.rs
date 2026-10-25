@@ -168,6 +168,11 @@ pub fn net(
                                 crate::observation::SearchObs::Certificate {
                                     host,
                                     problem: (&refusal).into(),
+                                    source: if pages.source() == crate::pages::Source::Edited {
+                                        crate::observation::PageSource::Edited
+                                    } else {
+                                        crate::observation::PageSource::Live
+                                    },
                                 },
                             );
                         }

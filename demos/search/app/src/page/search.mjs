@@ -345,7 +345,7 @@ function activityItem(row) {
       return { title: `${where} timed out`, meta: `Agent stopped waiting after ${Math.round(fact.elapsed_ms / 1000)} s · ${sourceName(fact.source)}`, target: `site:${fact.host}`, failed: true };
     }
     case 'no_route': return { title: `Tried ${fact.to}`, meta: 'No route', target: 'router' };
-    case 'certificate': return { title: `${hostName(fact.host)} certificate ${CERTIFICATE[fact.problem]}`, meta: 'TLS · Live', target: `site:${hostName(fact.host)}`, failed: true };
+    case 'certificate': return { title: `${hostName(fact.host)} certificate ${CERTIFICATE[fact.problem]}`, meta: `TLS · ${sourceName(fact.source)}`, target: `site:${hostName(fact.host)}`, failed: true };
     case 'resolved': return { title: `${hostName(fact.name)} not found`, meta: 'No address', target: 'dns', failed: true };
   }
 }
@@ -390,7 +390,7 @@ function feedRow(key, row, item, resources) {
       view.setAttribute('tabindex', '-1');
       view.setAttribute('aria-hidden', 'true');
       view.referrerPolicy = 'no-referrer';
-      view.src = `/thumbnail?${new URLSearchParams({ url: item.thumbnail })}`;
+      view.src = `/thumbnail?${new URLSearchParams({ url: item.thumbnail, picture: 'feed' })}`;
       frame.append(view);
       frame.addEventListener('click', () => select(item.target));
       node.append(frame);
@@ -516,7 +516,7 @@ function servedPage(url) {
   frame.setAttribute('sandbox', 'allow-scripts');
   frame.referrerPolicy = 'no-referrer';
   frame.title = url;
-  frame.src = `/thumbnail?${new URLSearchParams({ url })}`;
+  frame.src = `/thumbnail?${new URLSearchParams({ url, picture: 'reading' })}`;
   return frame;
 }
 function egressRows(purpose) {
@@ -681,17 +681,34 @@ function draw() {
   graph(); feed(); details();
   tick();
 }
-const stream = new EventSource('/state');
-stream.onerror = () => { $('clock').title = 'Reconnecting'; };
-stream.onopen = () => { $('clock').title = ''; };
-stream.onmessage = (event) => {
-  shown = JSON.parse(event.data);
-  draw();
-  pulses();
-};
-// The world's settings as they change, such as the scenario becoming ready.
-const worldStream = new EventSource('/world/state');
-worldStream.onmessage = (event) => showWorld(JSON.parse(event.data));
+// One socket carries what the page shows (the run, the world's settings,
+// the workstation) and the commands it sends, so none of it waits behind
+// the pictures for a connection, however many tabs show the page.
+let updates = null, asked = 0;
+const waiting = new Map();
+function connect() {
+  const socket = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/updates`);
+  socket.onopen = () => { $('clock').title = ''; };
+  socket.onmessage = (event) => {
+    const update = JSON.parse(event.data);
+    if (update.kind === 'view') { shown = update.state; draw(); pulses(); }
+    else if (update.kind === 'world') showWorld(update.state);
+    else if (update.kind === 'host') showHost(update.state);
+    else if (update.kind === 'reply') {
+      const reply = waiting.get(update.id);
+      waiting.delete(update.id);
+      if (update.error) reply?.reject(new Error(update.error)); else reply?.resolve();
+    }
+  };
+  socket.onclose = () => {
+    $('clock').title = 'Reconnecting';
+    for (const reply of waiting.values()) reply.reject(new Error('The page lost its connection to the world. Try again.'));
+    waiting.clear();
+    if (updates === socket) setTimeout(connect, 1000);
+  };
+  updates = socket;
+}
+connect();
 async function loadWorld() {
   const response = await fetch('/world');
   if (!response.ok) throw new Error('Could not read the world settings');
@@ -726,23 +743,28 @@ function showWorld(next) {
 $('world-toggle').onclick = () => { $('world-menu').hidden = !$('world-menu').hidden; $('world-toggle').setAttribute('aria-expanded', String(!$('world-menu').hidden)); };
 document.addEventListener('click', (event) => { if (!$('world-menu').contains(event.target) && !$('world-toggle').contains(event.target)) { $('world-menu').hidden = true; $('world-toggle').setAttribute('aria-expanded', 'false'); } });
 document.addEventListener('keydown', (event) => { if (event.key === 'Escape') { $('world-menu').hidden = true; $('world-toggle').setAttribute('aria-expanded', 'false'); select(null); } });
-async function command(command) {
+// Sends a command on the socket; settles when the world has applied it,
+// after the socket has brought the settings it changed.
+function command(command) {
   $('world-error').textContent = '';
-  const response = await fetch('/command', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(command) });
-  if (!response.ok) throw new Error(await response.text());
-  await loadWorld();
+  if (updates?.readyState !== WebSocket.OPEN) return Promise.reject(new Error('The page is reconnecting to the world. Try again.'));
+  const id = ++asked;
+  const reply = new Promise((resolve, reject) => waiting.set(id, { resolve, reject }));
+  updates.send(JSON.stringify({ id, command }));
+  return reply;
 }
 for (const control of $('source').querySelectorAll('button')) {
   control.onclick = async () => {
     if (control.getAttribute('aria-pressed') === 'true') return;
     for (const control of $('source').querySelectorAll('button')) control.disabled = true;
     try { await command({ command: 'set_source', source: control.dataset.source }); }
-    catch (error) { notice(error.message); await loadWorld(); }
+    catch (error) { notice(error.message); }
+    finally { if (world) showWorld(world); }
   };
 }
 async function setScenario(scenario) {
   for (const control of $('scenario-form').querySelectorAll('button')) control.disabled = true;
-  try { await command({ command: 'set_scenario', scenario }); $('scenario').blur(); await loadWorld(); }
+  try { await command({ command: 'set_scenario', scenario }); $('scenario').blur(); showWorld(world); }
   catch (error) { $('world-error').textContent = error.message; }
   finally { for (const control of $('scenario-form').querySelectorAll('button')) control.disabled = false; }
 }
@@ -789,13 +811,12 @@ async function mountConsole() {
 }
 $('terminal-tab').onclick = () => { activeConsole = 'terminal'; mountConsole(); };
 $('screen-tab').onclick = () => { activeConsole = 'screen'; mountConsole(); };
-const status = new EventSource('/host/state');
-status.onmessage = (event) => {
-  const next = JSON.parse(event.data);
+function showHost(next) {
   const changed = JSON.stringify(next) !== JSON.stringify(hostStatus);
   hostStatus = next;
   if (changed) mountConsole();
-};
+}
 loadWorld().then(() => mountConsole()).catch((error) => notice(error.message));
 draw();
-window.addEventListener('pagehide', () => { stream.close(); status.close(); worldStream.close(); for (const console of consoles.values()) { console.component.dispose(); console.socket.close(); } });
+window.addEventListener('pageshow', (event) => { if (event.persisted && !updates) connect(); });
+window.addEventListener('pagehide', () => { const socket = updates; updates = null; socket?.close(); for (const console of consoles.values()) { console.component.dispose(); console.socket.close(); } });

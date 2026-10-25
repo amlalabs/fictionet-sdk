@@ -106,18 +106,23 @@ pub fn page(url: &url::Url, html: &str, held: &dyn Fn(&url::Url) -> String) -> S
     // laid out for letter paper) is pictured the way a phone shows it:
     // laid out 980 px wide and zoomed out to fit, not cut to its left edge.
     let desktop_only = dom.select_first("meta[name=viewport]").is_err();
-    let picture = dom.to_string();
-    if desktop_only {
-        // The parser always gives a document its head.
-        picture.replacen(
-            "</head>",
-            &format!("<style>html{{zoom:{DESKTOP_ZOOM}}}</style></head>"),
-            1,
-        )
+    let zoom = if desktop_only {
+        format!("html{{zoom:{DESKTOP_ZOOM}}}")
     } else {
-        picture
-    }
+        String::new()
+    };
+    // The picture scrolls as one page, down only: a box inside it that
+    // scrolls (a contents list a script would have folded away) shows no
+    // scrollbar of its own. The parser always gives a document its head.
+    dom.to_string().replacen(
+        "</head>",
+        &format!("<style>{zoom}{PICTURE_STYLE}</style></head>"),
+        1,
+    )
 }
+
+/// The picture's own style: one scrollbar, the frame's.
+const PICTURE_STYLE: &str = "html{overflow-x:hidden}body *{scrollbar-width:none}";
 
 /// The zoom that fits a page laid out 980 px wide on the workstation
 /// phone's 390 px screen.

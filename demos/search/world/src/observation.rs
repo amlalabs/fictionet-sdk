@@ -121,6 +121,8 @@ pub enum SearchObs {
         #[serde(serialize_with = "display")]
         host: HostName,
         problem: CertificateProblem,
+        /// Live or Edited: where the guest's pages were coming from.
+        source: PageSource,
     },
 }
 
