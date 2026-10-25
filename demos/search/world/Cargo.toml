@@ -16,6 +16,7 @@ percent-encoding = "2"
 http-body-util = "0.1"
 form_urlencoded = "1"
 regex = "1"
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 time = { version = "0.3", features = ["serde", "parsing", "formatting"] }

@@ -478,15 +478,15 @@ impl Pages {
             .filter(|lag| !lag.is_zero())
     }
 
-    /// The world's day as the active source shows it.
+    /// The world's day as the active source shows it now, the day of the
+    /// guest's clock and of every answer's date: the host's day, or in
+    /// Copied mode the day [`copied_lag`](Self::copied_lag) behind it.
     pub fn world_date(&self) -> String {
-        match self
-            .copied_date()
+        let lag = self
+            .copied_lag()
             .filter(|_| self.source() == Source::Copied)
-        {
-            Some(date) => date.to_string(),
-            None => self.seed.date.clone(),
-        }
+            .unwrap_or_default();
+        (time::OffsetDateTime::now_utc() - lag).date().to_string()
     }
 
     pub(super) fn copied_listing(

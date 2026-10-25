@@ -108,7 +108,7 @@ async fn copy_site(root: &Path, name: &str, origin: &str) -> Result {
             }
         } else if response.status.is_success() || response.status == http::StatusCode::NOT_FOUND {
             capture::visit_links(&url, &response, |kind, next| {
-                let admitted = kind == capture::LinkKind::Asset
+                let admitted = kind != capture::LinkKind::Page
                     || response.status.is_success()
                         && url::Url::parse(&next).is_ok_and(|url| {
                             url.host_str() == origin.host_str()

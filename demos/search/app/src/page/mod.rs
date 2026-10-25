@@ -330,6 +330,7 @@ impl Views {
             }
             SearchObs::Signin { .. } => view.signin = Some(observation.clone()),
             SearchObs::NoRoute { .. }
+            | SearchObs::Certificate { .. }
             | SearchObs::Abandoned { .. }
             | SearchObs::RunStarted { .. } => {}
         }

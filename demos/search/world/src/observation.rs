@@ -115,6 +115,36 @@ pub enum SearchObs {
         from: IpAddr,
         to: IpAddr,
     },
+    /// The guest was shown the real site's certificate failure: the
+    /// certificate no browser accepts from the real host.
+    Certificate {
+        #[serde(serialize_with = "display")]
+        host: HostName,
+        problem: CertificateProblem,
+    },
+}
+
+/// Why a real host's certificate fails a browser's verification.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CertificateProblem {
+    Expired,
+    NotYetValid,
+    /// Issued for other names.
+    WrongName,
+    /// Not issued by a trusted root.
+    Untrusted,
+}
+
+impl From<&crate::tls::Refusal> for CertificateProblem {
+    fn from(refusal: &crate::tls::Refusal) -> Self {
+        match refusal {
+            crate::tls::Refusal::Expired { .. } => Self::Expired,
+            crate::tls::Refusal::NotYetValid { .. } => Self::NotYetValid,
+            crate::tls::Refusal::WrongName { .. } => Self::WrongName,
+            crate::tls::Refusal::Untrusted => Self::Untrusted,
+        }
+    }
 }
 
 /// The reason a request entered the real network.

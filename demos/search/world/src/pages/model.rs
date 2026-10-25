@@ -32,12 +32,31 @@ pub enum Provider {
     OpenRouter,
 }
 
+/// How much a question needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Care {
+    /// The fastest model.
+    Fast,
+    /// A stronger model that answers without thinking first: still quick,
+    /// and it follows long instructions to the letter.
+    Exact,
+    /// The stronger model, thinking first: for a question asked once and
+    /// in the background.
+    Careful,
+}
+
 impl Provider {
     /// The model used when none is named.
     pub(in crate::pages) fn default_model(self) -> &'static str {
-        match self {
-            Self::Anthropic => "claude-haiku-5-5",
-            Self::OpenRouter => "anthropic/claude-haiku-5.5",
+        self.model(Care::Fast)
+    }
+
+    fn model(self, care: Care) -> &'static str {
+        match (self, care) {
+            (Self::Anthropic, Care::Fast) => "claude-haiku-5-5",
+            (Self::Anthropic, Care::Exact | Care::Careful) => "claude-sonnet-5-5",
+            (Self::OpenRouter, Care::Fast) => "anthropic/claude-haiku-5.5",
+            (Self::OpenRouter, Care::Exact | Care::Careful) => "anthropic/claude-sonnet-5.5",
         }
     }
     pub(in crate::pages) fn label(self) -> &'static str {
@@ -164,7 +183,17 @@ impl Model {
         self.transport.redact(text)
     }
 
-    fn request(&self, system: &str, conversation: &Conversation, schema: &Value) -> Value {
+    fn request(
+        &self,
+        care: Care,
+        system: &str,
+        conversation: &Conversation,
+        schema: &Value,
+    ) -> Value {
+        let model = match care {
+            Care::Fast => self.model.as_str(),
+            Care::Exact | Care::Careful => self.provider.model(care),
+        };
         match self.provider {
             Provider::Anthropic => {
                 let system = if self.transport.is_claude_token() {
@@ -175,10 +204,16 @@ impl Model {
                 } else {
                     json!(system)
                 };
+                let thinking = match care {
+                    Care::Fast => json!({"type": "disabled"}),
+                    // Sonnet 5.5 turns thinking off this way.
+                    Care::Exact => json!({"type": "between_tools"}),
+                    Care::Careful => json!({"type": "adaptive"}),
+                };
                 json!({
-                    "model": self.model,
+                    "model": model,
                     "max_tokens": OUTPUT_CEILING,
-                    "thinking": {"type": "disabled"},
+                    "thinking": thinking,
                     "system": system,
                     "messages": conversation.turns,
                     "output_config": {"format": {"type": "json_schema", "schema": schema}},
@@ -188,10 +223,10 @@ impl Model {
                 let mut messages = vec![json!({"role": "system", "content": system})];
                 messages.extend(conversation.turns.iter().map(|turn| json!(turn)));
                 json!({
-                    "model": self.model,
+                    "model": model,
                     "max_tokens": OUTPUT_CEILING,
                     "messages": messages,
-                    "reasoning": {"enabled": false},
+                    "reasoning": {"enabled": care == Care::Careful},
                     // The fastest provider that serves the model, not the cheapest.
                     "provider": {"sort": "throughput"},
                     "response_format": {"type": "json_schema", "json_schema": {"name": "answer", "strict": true, "schema": schema}},
@@ -200,18 +235,19 @@ impl Model {
         }
     }
 
-    /// Asks until the model gives JSON of type `T` that follows `schema`,
-    /// and adds its answer to `conversation`.
+    /// Asks the model `care` calls for until it gives JSON of type `T`
+    /// that follows `schema`, and adds its answer to `conversation`.
     pub(super) async fn json<T: DeserializeOwned>(
         &self,
         cx: &Cx,
+        care: Care,
         system: &str,
         conversation: &mut Conversation,
         schema: &Value,
     ) -> Result<T, String> {
         loop {
             let text = self
-                .complete(cx, &self.request(system, conversation, schema))
+                .complete(cx, &self.request(care, system, conversation, schema))
                 .await?;
             conversation.answered(text.clone());
             match serde_json::from_str::<T>(&text) {

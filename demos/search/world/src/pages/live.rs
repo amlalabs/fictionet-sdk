@@ -134,31 +134,35 @@ impl Live {
                     return;
                 }
             };
-            // A copied page brings its stylesheets, CSS imports, fonts, images
-            // and scripts, including those of pages already in the archive.
-            // They all belong to the page the client asked for. They are
-            // under way before the page is ready, so whatever shows the page
-            // can wait for them (see `settled`).
+            // A copied page brings what a still picture of it shows: its
+            // stylesheets, CSS imports, fonts and images, including those of
+            // pages already in the archive, so the host's picture of the page
+            // is drawn from what the world holds. Scripts, preloads and an
+            // image's other sizes come only when a client asks for them. They
+            // all belong to the page the client asked for. They are under way
+            // before the page is ready, so whatever shows the page can wait
+            // for them (see `settled`).
             let owner = page.or_else(|| url::Url::parse(&url).ok());
             let page_url = url.clone();
             let links = live
                 .fetcher
                 .process(&cx, &lifetime, move || {
-                    capture::requisites(&page_url, &response, resource)
+                    capture::shown_requisites(&page_url, &response, resource)
                         .map_err(|error| error.to_string())
                 })
                 .await;
             match links {
                 Ok(links) => {
+                    // A redirect is followed as the client asked. A page's
+                    // files are asked for as a browser asks, whatever client
+                    // asked for the page: a client such as curl never loads
+                    // them, and sites throttle file requests that name one.
                     for (url, resource) in links {
-                        let _ = live.capture(
-                            &lifetime,
-                            &cx,
-                            url,
-                            resource,
-                            user_agent.clone(),
-                            owner.clone(),
-                        );
+                        let asking = match resource {
+                            capture::Resource::Requisite => None,
+                            capture::Resource::Document => user_agent.clone(),
+                        };
+                        let _ = live.capture(&lifetime, &cx, url, resource, asking, owner.clone());
                     }
                 }
                 Err(error) => eprintln!("Live dependency discovery failed: {error}"),
@@ -536,14 +540,14 @@ impl Pages {
             }
         };
         let mut served = response;
-        served.body = revision.served.into_bytes().into();
+        served.body = revision.served.clone().into_bytes().into();
         served
             .headers
             .insert(http::header::CONTENT_LENGTH, served.body.len().into());
         let mut answer = copied::replay(Ok(Some(served)));
         answer.edited = Some(Edited {
-            edits: revision.edits,
-            marked: Arc::from(revision.marked),
+            edits: revision.edits.clone(),
+            marked: Arc::from(revision.marked.as_str()),
         });
         answer
     }

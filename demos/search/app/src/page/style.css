@@ -76,7 +76,7 @@ body.agent-hidden .world{max-width:1040px;margin-inline:auto}
 .service[aria-pressed=true]{background:var(--accent-bg)}
 .service[aria-pressed=true] strong{color:var(--accent)}
 .destinations{grid-column:3;grid-row:1;position:relative;z-index:2;min-width:0;display:flex;flex-direction:column;padding:36px 0 10px;pointer-events:none}
-.destination{pointer-events:auto;display:flex;align-items:baseline;gap:8px;min-height:32px;border:0;border-radius:4px;padding:7px 10px;min-width:0;background:transparent}
+.destination{pointer-events:auto;display:flex;align-items:baseline;gap:8px;min-height:32px;border:0;border-radius:4px;padding:7px 10px 7px 16px;min-width:0;background:transparent}
 .destination strong{font-weight:400;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
 .destination small{font-size:var(--t2);color:var(--muted);white-space:nowrap}
 .destination[aria-pressed=true]{background:var(--accent-bg)}

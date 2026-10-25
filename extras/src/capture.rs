@@ -204,6 +204,9 @@ pub enum LinkKind {
     Page,
     /// A document prerequisite.
     Asset,
+    /// A prerequisite a still picture of the page does without: a script,
+    /// a preloaded file, or one of an image's other sizes.
+    Optional,
 }
 
 /// Collect navigation and static dependencies for capture.
@@ -212,7 +215,7 @@ pub fn links(url: &str, response: &warc::Response) -> io::Result<Links> {
     visit_links(url, response, |kind, url| {
         let out = match kind {
             LinkKind::Page => &mut links.pages,
-            LinkKind::Asset => &mut links.assets,
+            LinkKind::Asset | LinkKind::Optional => &mut links.assets,
         };
         out.push(url);
         Ok(())
@@ -232,33 +235,54 @@ fn link(base: &Url, value: &str, out: &mut dyn FnMut(String) -> io::Result<()>) 
     out(url)
 }
 
-fn css(text: &str, base: &Url, out: &mut dyn FnMut(String) -> io::Result<()>) -> io::Result<()> {
-    css_tokens(&mut cssparser::Parser::new(text), base, out, false)
+/// The addresses a stylesheet names: its imports and font files, which
+/// lay the page out, as [`LinkKind::Asset`]; its other images (icons and
+/// backgrounds, of which a browser loads only those a rule on the page
+/// uses) as [`LinkKind::Optional`].
+fn css(
+    text: &str,
+    base: &Url,
+    out: &mut dyn FnMut(LinkKind, String) -> io::Result<()>,
+) -> io::Result<()> {
+    css_tokens(
+        &mut cssparser::Parser::new(text),
+        base,
+        out,
+        false,
+        LinkKind::Optional,
+    )
 }
 
 fn css_tokens(
     input: &mut cssparser::Parser<'_>,
     base: &Url,
-    out: &mut dyn FnMut(String) -> io::Result<()>,
+    out: &mut dyn FnMut(LinkKind, String) -> io::Result<()>,
     strings: bool,
+    kind: LinkKind,
 ) -> io::Result<()> {
     use cssparser::Token;
     let mut result = Ok(());
+    // The block after `@font-face` names font files.
+    let mut font_face = false;
     while result.is_ok()
         && let Ok(token) = input.next().cloned()
     {
+        let mut emit = |value: &str| link(base, value, &mut |url| out(kind, url));
         match token {
-            Token::UnquotedUrl(value) => result = link(base, &value, out),
-            Token::QuotedString(value) if strings => result = link(base, &value, out),
+            Token::UnquotedUrl(value) => result = emit(&value),
+            Token::QuotedString(value) if strings => result = emit(&value),
             Token::AtKeyword(name) if name.eq_ignore_ascii_case("import") => {
                 if let Ok(value) = input.try_parse(|input| input.expect_string_cloned()) {
-                    result = link(base, &value, out);
+                    result = link(base, &value, &mut |url| out(LinkKind::Asset, url));
+                } else if let Ok(value) = input.try_parse(|input| input.expect_url()) {
+                    result = link(base, &value, &mut |url| out(LinkKind::Asset, url));
                 }
             }
+            Token::AtKeyword(name) if name.eq_ignore_ascii_case("font-face") => font_face = true,
             Token::Function(name) if name.eq_ignore_ascii_case("url") => {
                 let _: Result<_, cssparser::ParseError<()>> = input.parse_nested_block(|input| {
                     if let Ok(value) = input.expect_string() {
-                        result = link(base, value, out);
+                        result = link(base, value, &mut |url| out(kind, url));
                     }
                     Ok(())
                 });
@@ -268,16 +292,24 @@ fn css_tokens(
                     || name.eq_ignore_ascii_case("-webkit-image-set") =>
             {
                 let _: Result<_, cssparser::ParseError<()>> = input.parse_nested_block(|input| {
-                    result = css_tokens(input, base, out, true);
+                    result = css_tokens(input, base, out, true, kind);
                     Ok(())
                 });
             }
-            Token::Function(_)
-            | Token::ParenthesisBlock
-            | Token::SquareBracketBlock
-            | Token::CurlyBracketBlock => {
+            Token::CurlyBracketBlock => {
+                let inner = if std::mem::take(&mut font_face) {
+                    LinkKind::Asset
+                } else {
+                    kind
+                };
                 let _: Result<_, cssparser::ParseError<()>> = input.parse_nested_block(|input| {
-                    result = css_tokens(input, base, out, false);
+                    result = css_tokens(input, base, out, false, inner);
+                    Ok(())
+                });
+            }
+            Token::Function(_) | Token::ParenthesisBlock | Token::SquareBracketBlock => {
+                let _: Result<_, cssparser::ParseError<()>> = input.parse_nested_block(|input| {
+                    result = css_tokens(input, base, out, false, kind);
                     Ok(())
                 });
             }
@@ -315,6 +347,26 @@ pub fn requisites(
     response: &warc::Response,
     resource: Resource,
 ) -> io::Result<Vec<(String, Resource)>> {
+    next(url, response, resource, true)
+}
+
+/// The dependencies a still picture of the page shows: its stylesheets,
+/// their imports, fonts and images, and its images at their own address.
+/// Redirects are followed as [`requisites`] follows them.
+pub fn shown_requisites(
+    url: &str,
+    response: &warc::Response,
+    resource: Resource,
+) -> io::Result<Vec<(String, Resource)>> {
+    next(url, response, resource, false)
+}
+
+fn next(
+    url: &str,
+    response: &warc::Response,
+    resource: Resource,
+    optional: bool,
+) -> io::Result<Vec<(String, Resource)>> {
     if resource == Resource::Requisite
         && !response.status.is_redirection()
         && response
@@ -324,14 +376,25 @@ pub fn requisites(
     {
         return Ok(Vec::new());
     }
-    let links = links(url, response)?;
-    let mut next = links
-        .assets
+    let mut assets = Vec::new();
+    let mut pages = Vec::new();
+    visit_links(url, response, |kind, url| {
+        match kind {
+            LinkKind::Page => pages.push(url),
+            LinkKind::Asset => assets.push(url),
+            LinkKind::Optional if optional => assets.push(url),
+            LinkKind::Optional => {}
+        }
+        Ok(())
+    })?;
+    assets.sort();
+    assets.dedup();
+    let mut next = assets
         .into_iter()
         .map(|url| (url, Resource::Requisite))
         .collect::<Vec<_>>();
     if response.status.is_redirection() {
-        next.extend(links.pages.into_iter().map(|url| (url, resource)));
+        next.extend(pages.into_iter().map(|url| (url, resource)));
     }
     Ok(next)
 }
@@ -366,7 +429,7 @@ pub fn visit_links(
     let decoded = response.decoded()?;
     let text = String::from_utf8_lossy(&decoded);
     if content_type.starts_with("text/css") {
-        css(&text, &base, &mut |url| visit(LinkKind::Asset, url))?;
+        css(&text, &base, &mut |kind, url| visit(kind, url))?;
         return Ok(());
     }
     // Discovery needs tokens, not a DOM. Deeply nested hostile markup cannot
@@ -409,7 +472,7 @@ pub fn visit_links(
             if name == "style"
                 && let Some(text) = style.take()
             {
-                css(&text, &base, &mut |url| visit(LinkKind::Asset, url))?;
+                css(&text, &base, &mut |kind, url| visit(kind, url))?;
             }
             return Ok(());
         }
@@ -435,9 +498,14 @@ pub fn visit_links(
         {
             return Ok(());
         }
+        let source = if name == "script" {
+            LinkKind::Optional
+        } else {
+            LinkKind::Asset
+        };
         for name in ["src", "data-src", "data-lazy-src", "data-original"] {
             if let Some(value) = attr(name) {
-                link(&base, value, &mut |url| visit(LinkKind::Asset, url))?;
+                link(&base, value, &mut |url| visit(source, url))?;
             }
         }
         if name == "object"
@@ -447,7 +515,7 @@ pub fn visit_links(
         }
         for name in ["srcset", "data-srcset", "data-lazy-srcset"] {
             if let Some(value) = attr(name) {
-                srcset(value, &base, &mut |url| visit(LinkKind::Asset, url))?;
+                srcset(value, &base, &mut |url| visit(LinkKind::Optional, url))?;
             }
         }
         if matches!(name, "image" | "use")
@@ -455,20 +523,23 @@ pub fn visit_links(
         {
             link(&base, value, &mut |url| visit(LinkKind::Asset, url))?;
         }
-        if name == "link"
-            && attr("rel").is_some_and(|r| {
-                r.split_whitespace().any(|value| {
-                    ["stylesheet", "icon", "preload", "modulepreload"]
-                        .iter()
-                        .any(|rel| value.eq_ignore_ascii_case(rel))
-                })
+        let rel = |names: &[&str]| {
+            attr("rel").is_some_and(|r| {
+                r.split_whitespace()
+                    .any(|value| names.iter().any(|rel| value.eq_ignore_ascii_case(rel)))
             })
+        };
+        if name == "link"
             && let Some(value) = attr("href")
         {
-            link(&base, value, &mut |url| visit(LinkKind::Asset, url))?;
+            if rel(&["stylesheet", "icon"]) {
+                link(&base, value, &mut |url| visit(LinkKind::Asset, url))?;
+            } else if rel(&["preload", "modulepreload"]) {
+                link(&base, value, &mut |url| visit(LinkKind::Optional, url))?;
+            }
         }
         if let Some(value) = attr("style") {
-            css(value, &base, &mut |url| visit(LinkKind::Asset, url))?;
+            css(value, &base, &mut |kind, url| visit(kind, url))?;
         }
         if name == "style" {
             style = Some(String::new());
@@ -476,7 +547,7 @@ pub fn visit_links(
         Ok(())
     })?;
     if let Some(text) = style {
-        css(&text, &base, &mut |url| visit(LinkKind::Asset, url))?;
+        css(&text, &base, &mut |kind, url| visit(kind, url))?;
     }
     Ok(())
 }

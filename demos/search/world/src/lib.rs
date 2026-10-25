@@ -162,6 +162,15 @@ pub fn net(
                     if pages.source().is_live()
                         && let Some(refusal) = upstream.refusal(&name)
                     {
+                        if let Ok(host) = name.parse() {
+                            pages.report(
+                                fcx,
+                                crate::observation::SearchObs::Certificate {
+                                    host,
+                                    problem: (&refusal).into(),
+                                },
+                            );
+                        }
                         return refused
                             .get_or_init(|| {
                                 ca.refused(fcx, &name, &refusal)

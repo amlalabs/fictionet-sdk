@@ -106,10 +106,13 @@ function buildMap() {
 }
 // Host fetches for a page's own files belong to that page.
 const pageFetches = (purpose) => shown.egress.filter((row) => row.fact.purpose === purpose && row.fact.phase !== 'attempt' && !row.fact.page);
-// The pages the workstation opened on the world's sites, each address once:
-// the same pages the host copies from the internet in Live and Edited.
-// Package files count on their own row.
-const openedPages = () => new Set(localSites().flatMap((site) => site.requests.filter((request) => !isSubresource(request) && !SEARCH_HOSTS.has(site.host) && request.source.kind !== 'package').map((request) => request.url)));
+// The pages the workstation opened on the world's sites, each address once.
+// Package files count on their own row. Those that came from the internet
+// (Live and Edited) are the pages the host copied, so Sites and Page copies
+// count the same pages.
+const openedRequests = () => localSites().flatMap((site) => site.requests.filter((request) => !isSubresource(request) && !SEARCH_HOSTS.has(site.host) && request.source.kind !== 'package'));
+const openedPages = () => new Set(openedRequests().map((request) => request.url));
+const copiedPages = () => new Set(openedRequests().filter((request) => ['live', 'edited'].includes(request.source.kind)).map((request) => request.url));
 function graph() {
   if (!map.lanes) buildMap();
   map.vm.querySelector('small').textContent = hostStatus?.addresses[0] || '10.0.0.2';
@@ -174,7 +177,7 @@ function destinationsOf() {
       if (!hosts.length) continue;
       const copies = COPIES[purpose];
       if (copies) {
-        const copied = new Set(pageFetches(purpose).map((row) => row.fact.path)).size;
+        const copied = purpose === 'live_capture' ? copiedPages().size : new Set(pageFetches(purpose).map((row) => row.fact.path)).size;
         rows.set(copies.target, { key: copies.target, target: copies.target, title: copies.title, meta: quantity(copied, copies.unit), from: [service.id] });
       } else {
         for (const host of hosts) {
@@ -221,7 +224,7 @@ function drawWires() {
       if (!service) continue;
       const start = point(service.control, 'right');
       starts.add(service);
-      wire(`${id}>${node.dataset.key}`, route(start, { x: end.x - 6, y: end.y }, start.x + (end.x - start.x) / 2));
+      wire(`${id}>${node.dataset.key}`, route(start, { x: end.x + 4, y: end.y }, start.x + (end.x - start.x) / 2));
     }
   }
   for (const service of starts) {
@@ -275,6 +278,7 @@ function pulses() {
       case 'request': pulse(SEARCH_HOSTS.has(fact.host) ? 'vm>search' : 'vm>sites'); break;
       case 'search': pulse('vm>search'); break;
       case 'no_route': pulse('vm>router'); break;
+      case 'certificate': pulse('vm>sites'); break;
       case 'model_call': pulse('vm>calls', `calls>${fact.host}`); break;
       case 'egress':
         if (fact.phase !== 'attempt') break;
@@ -328,7 +332,8 @@ function activityItem(row) {
         return { title: `${outcome === 'unreachable' ? fact.host : where} ${outcome}`, meta: [fact.status, sourceName(fact.source), fact.error].filter(Boolean).join(' · '), target: `site:${fact.host}`, failed: true };
       }
       const document = /(?:text\/html|application\/pdf)/.test(fact.content_type);
-      const thumbnail = document && fact.status < 400 && /text\/html/.test(fact.content_type) ? url : null;
+      // Package indexes and files are not pages: they get no picture.
+      const thumbnail = document && fact.status < 400 && /text\/html/.test(fact.content_type) && fact.source.kind !== 'package' ? url : null;
       // A page that took a while says how long: a client with a deadline may have stopped waiting.
       const took = fact.elapsed_ms >= 1000 ? `${Math.round(fact.elapsed_ms / 1000)} s` : null;
       return { title: `${fact.status >= 400 ? 'Requested' : 'Opened'} ${fact.title || hit?.title || fact.host}`, meta: [where, fact.status, sourceName(fact.source), changes(fact.edits), took].filter(Boolean).join(' · '), target: document ? `page:${url}` : `site:${fact.host}`, thumbnail, edits: fact.edits };
@@ -340,9 +345,12 @@ function activityItem(row) {
       return { title: `${where} timed out`, meta: `Agent stopped waiting after ${Math.round(fact.elapsed_ms / 1000)} s · ${sourceName(fact.source)}`, target: `site:${fact.host}`, failed: true };
     }
     case 'no_route': return { title: `Tried ${fact.to}`, meta: 'No route', target: 'router' };
+    case 'certificate': return { title: `${hostName(fact.host)} certificate ${CERTIFICATE[fact.problem]}`, meta: 'TLS · Live', target: `site:${hostName(fact.host)}`, failed: true };
     case 'resolved': return { title: `${hostName(fact.name)} not found`, meta: 'No address', target: 'dns', failed: true };
   }
 }
+// How a real site's certificate fails, as the feed says it.
+const CERTIFICATE = { expired: 'expired', not_yet_valid: 'not yet valid', wrong_name: 'for another name', untrusted: 'not trusted' };
 // A change reads as the real words struck through, then the world's words.
 function changeList(edits, limit = edits.length) {
   const list = element('div', undefined, 'changes');
@@ -402,8 +410,10 @@ function feedRow(key, row, item, resources) {
 }
 // A client that stops waiting for a page and asks for it again makes one
 // page visit, not several: requests for one address that were waiting at
-// the same time, or that follow one the client gave up on, share a row.
-// The row shows the whole wait and how many times the page was asked for.
+// the same time, or that come next after one the client gave up on, share
+// a row. The row shows the whole wait and how many times the page was
+// asked for. A later visit to the same page, after other activity, is its
+// own row.
 function visits(rows, groups) {
   const startOf = (row) => row.at_ms - (row.fact.elapsed_ms || 0);
   const open = new Map(), shown = [];
@@ -411,7 +421,9 @@ function visits(rows, groups) {
     const fact = row.fact;
     if (!['request', 'abandoned'].includes(fact.kind)) { shown.push({ row, attempts: [row] }); continue; }
     const key = `${fact.method} ${urlOf(fact)}`, visit = open.get(key);
-    if (visit && (visit.gaveUp || startOf(row) < visit.end)) {
+    const waiting = visit && startOf(row) < visit.end;
+    const askedAgain = visit?.gaveUp && shown.at(-1) === visit;
+    if (waiting || askedAgain) {
       visit.attempts.push(row);
       visit.end = Math.max(visit.end, row.at_ms);
       visit.gaveUp = fact.kind === 'abandoned';
@@ -432,11 +444,11 @@ function visits(rows, groups) {
 }
 function feed() {
   const groups = pageRequests();
-  const rows = activityRows().filter((row) => ['request', 'abandoned', 'search', 'tool', 'no_route', 'resolved'].includes(row.fact.kind) && (row.fact.kind !== 'request' || groups.has(row)) && (row.fact.kind !== 'abandoned' || !isSubresource(row.fact)) && (row.fact.kind !== 'resolved' || !row.fact.address));
+  const rows = activityRows().filter((row) => ['request', 'abandoned', 'search', 'tool', 'no_route', 'resolved', 'certificate'].includes(row.fact.kind) && (row.fact.kind !== 'request' || groups.has(row)) && (row.fact.kind !== 'abandoned' || !isSubresource(row.fact)) && (row.fact.kind !== 'resolved' || !row.fact.address));
   const keep = new Set();
   const nodes = visits(rows, groups).reverse().map(({ row, attempts, waited, resources }) => {
     const fact = attempts[0].fact, started = attempts[0].at_ms;
-    const key = fact.kind === 'no_route' ? `no_route:${fact.from}:${fact.to}` : fact.kind === 'resolved' ? `resolved:${fact.name}` : `${fact.kind}:${started}:${fact.host || ''}${fact.path || ''}${fact.query || ''}${fact.target || ''}`;
+    const key = fact.kind === 'no_route' ? `no_route:${fact.from}:${fact.to}` : fact.kind === 'resolved' ? `resolved:${fact.name}` : fact.kind === 'certificate' ? `certificate:${fact.host}` : `${fact.kind}:${started}:${fact.host || ''}${fact.path || ''}${fact.query || ''}${fact.target || ''}`;
     keep.add(key);
     const item = activityItem(row);
     if (attempts.length > 1) {
@@ -458,7 +470,7 @@ function feed() {
 }
 // Repeated refusals and failed lookups of one name show once, at the latest.
 function activityRows() {
-  const keyOf = (fact) => fact.kind === 'no_route' ? `no_route:${fact.from}:${fact.to}` : fact.kind === 'resolved' && !fact.address ? `resolved:${fact.name}` : null;
+  const keyOf = (fact) => fact.kind === 'no_route' ? `no_route:${fact.from}:${fact.to}` : fact.kind === 'resolved' && !fact.address ? `resolved:${fact.name}` : fact.kind === 'certificate' ? `certificate:${fact.host}` : null;
   const latest = new Map();
   for (const row of shown.activity) { const key = keyOf(row.fact); if (key) latest.set(key, row); }
   return shown.activity.filter((row) => { const key = keyOf(row.fact); return !key || latest.get(key) === row; });

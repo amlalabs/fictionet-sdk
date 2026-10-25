@@ -5782,6 +5782,7 @@ dependencies = [
  "fictionet-extras",
  "flate2",
  "form_urlencoded",
+ "futures-util",
  "http",
  "http-body-util",
  "kuchiki",
