@@ -236,6 +236,7 @@ pub struct Net {
     resolver: Option<Arc<Resolver>>,
     unreachable: Option<Arc<dyn Fn(Unreachable) + Send + Sync>>,
     drop_unrouted: bool,
+    keep_misses: bool,
     max_hosts: usize,
     routes: Vec<(String, Prefix)>,
     limits: Limits,
@@ -266,6 +267,7 @@ impl Net {
             resolver: None,
             unreachable: None,
             drop_unrouted: false,
+            keep_misses: true,
             max_hosts: MAX_HOSTS,
             routes: Vec::new(),
             limits: Limits::default(),
@@ -334,6 +336,15 @@ impl Net {
     /// [`Net::on_unreachable`] still reports each dropped packet.
     pub fn drop_unrouted(mut self) -> Self {
         self.drop_unrouted = true;
+        self
+    }
+
+    /// Asks [`resolve`](Net::resolve) again each time a name it gave no
+    /// host is looked up, instead of keeping NXDOMAIN for the run: for a
+    /// world whose names come into being as it runs. A name that gets a
+    /// host keeps it.
+    pub fn resolve_misses_again(mut self) -> Self {
+        self.keep_misses = false;
         self
     }
 
@@ -456,7 +467,13 @@ impl Net {
             subnet,
             subnet6,
             router,
-            world: Arc::new(Mutex::new(World::new(self.max_hosts))),
+            world: Arc::new(Mutex::new({
+                let mut world = World::new(self.max_hosts);
+                if !self.keep_misses {
+                    world.max_unknown = 0;
+                }
+                world
+            })),
             leases: Arc::new(Mutex::new(Leases::default())),
             gateway_tcp: Arc::new(Mutex::new(Vec::new())),
             hooks,

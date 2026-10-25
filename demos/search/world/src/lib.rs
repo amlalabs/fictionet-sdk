@@ -197,7 +197,7 @@ pub fn net(
     };
     let report_cx = fcx.clone();
     let report_pages = pages.clone();
-    fictionet::stdlib::world::net::Net::new()
+    let net = fictionet::stdlib::world::net::Net::new()
         .ipv4_only()
         .drop_unrouted()
         .resolve(site_for)
@@ -209,7 +209,14 @@ pub fn net(
                     to: unreachable.to,
                 },
             );
-        })
+        });
+    // Live-Depth's names come into being as pages bring links to them: a
+    // name refused before its first link resolves once one appears.
+    if pages.source() == crate::pages::Source::LiveDepth {
+        net.resolve_misses_again()
+    } else {
+        net
+    }
 }
 
 /// Whether the internet's DNS gives `host` an address.

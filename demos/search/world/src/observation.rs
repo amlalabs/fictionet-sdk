@@ -46,9 +46,12 @@ pub enum SearchObs {
         /// Why the world could not answer with the page: the site it read
         /// could not be reached.
         error: Option<String>,
-        /// Live-Depth did not collect the address: the world answered as
-        /// a site with no such page and fetched nothing.
-        uncollected: bool,
+        /// Live-Depth does not allow the address: the world answered as a
+        /// site with no such page and fetched nothing.
+        unlisted: bool,
+        /// How many links from a search result a page Live-Depth allows
+        /// is.
+        depth: Option<u8>,
         /// The scenario's edits to the real page; empty when it is served
         /// as the site sent it.
         edits: Vec<Edit>,
@@ -79,18 +82,11 @@ pub enum SearchObs {
         /// The mode that answered.
         source: PageSource,
     },
-    /// Live-Depth's crawl around one search so far: reported as each page
-    /// arrives and when nothing is left in line.
-    Crawl {
-        /// The search whose results the crawl started from.
-        search: String,
-        pages: u64,
-        files: u64,
-        failed: u64,
-        /// Addresses still in line.
-        waiting: u64,
-        /// The most links from a search result a collected page is.
-        depth: u8,
+    /// Live-Depth's allowlist grew: a search listed results, or a page the
+    /// guest opened brought its links and files.
+    Allowlist {
+        /// How many addresses it allows.
+        links: u64,
     },
     ModelCall {
         call: u64,
@@ -180,8 +176,8 @@ pub enum EgressPurpose {
     Account,
     LiveSearch,
     LiveCapture,
-    /// Live-Depth's crawl of a search's results and their sites.
-    Crawl,
+    /// Live-Depth's copy of a page it allows, or of that page's file.
+    LiveDepth,
     /// A package index or file the copied web lacks.
     Package,
     /// The public original of a page a model writes, read to ground it.
@@ -247,7 +243,7 @@ pub enum PageSource {
         captured: Option<time::OffsetDateTime>,
     },
     Live,
-    /// A real page Live-Depth's crawl collected.
+    /// A real page Live-Depth allowed and copied.
     LiveDepth,
     /// A live page with the scenario's edits.
     Edited,
@@ -325,7 +321,7 @@ impl Pages {
     /// Installs this world's concrete observation destination. No SDK observer is used.
     pub fn observe(&self, destination: UnboundedSender<Observation>) {
         *self.observation.lock().unwrap() = Some(destination);
-        // Live-Depth's copies are its crawl.
+        // Live-Depth's copies are told apart from Live's.
         let observer =
             |copy: EgressPurpose| -> std::sync::Arc<fictionet_extras::capture::Observer> {
                 let destination = self.observation.clone();
@@ -364,7 +360,7 @@ impl Pages {
             };
         self.observe_live(
             observer(EgressPurpose::LiveCapture),
-            observer(EgressPurpose::Crawl),
+            observer(EgressPurpose::LiveDepth),
         );
         let destination = self.observation.clone();
         self.observe_editor(std::sync::Arc::new(move |cx, provider, event| {
@@ -442,6 +438,16 @@ impl Pages {
                 },
             );
         }
+        let depth = match &source {
+            PageSource::LiveDepth => match self.allowed(&format!(
+                "{scheme}://{}{path}",
+                host.to_ascii().trim_end_matches('.')
+            )) {
+                Some(crate::pages::Allowed::Page { depth }) => Some(depth),
+                _ => None,
+            },
+            _ => None,
+        };
         let edits = response
             .edited
             .as_ref()
@@ -520,7 +526,8 @@ impl Pages {
                     Meta::Error { error } => Some(error.clone()),
                     _ => None,
                 },
-                uncollected: matches!(response.meta, Meta::Uncollected),
+                unlisted: matches!(response.meta, Meta::Unlisted),
+                depth,
                 edits,
                 referrer: headers
                     .get(http::header::REFERER)

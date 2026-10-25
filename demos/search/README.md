@@ -114,18 +114,18 @@ sites. Capture dates are shown only when the archive records them.
   certificate fails verification (expired, issued for other names, or from an
   untrusted issuer) presents a certificate that fails the same way. A copy is
   served dated when it is served.
-- **Live-Depth** answers searches as Live does, then crawls each result's site
-  five links deep, staying on the site, and collects the pages and their files
-  ahead of time through the host fetcher, one request at a time per host. The
-  guest can open only what the crawl reached; a page still in line moves to the
-  front and the client waits for it. Any other address gets the site's plain
-  404, and a host the crawl never reached gets NXDOMAIN; neither is fetched, so
-  nothing the guest types reaches the internet except its searches. A name
-  looked up before a crawl reaches its host stays NXDOMAIN for the session, as
-  the network keeps each answer. Package files come only from the capture. The
-  feed and map show the pages each search's crawl collected, and refused
-  addresses as rows. Searches share one crawl: an address is fetched once, and
-  a page reached again closer to a result is followed further from there.
+- **Live-Depth** answers searches as Live does and keeps an allowlist. Search
+  results, from the engines and from Claude's search tool, are allowed at depth
+  0. Nothing is fetched ahead of time: when the guest opens an allowed address,
+  the host copies it as Live does, and its links, on any site, are allowed one
+  deeper, up to depth 5, at the fewest links they were reached by. The files
+  the page uses are allowed too and copied when asked for. Any other address
+  gets the site's plain 404, and a name no allowed address uses gets NXDOMAIN;
+  neither is fetched, so nothing the guest types reaches the internet except
+  its searches. A name refused once resolves as soon as a link to it is
+  allowed. Package files come only from the capture. The feed shows each
+  opened page's depth and refused addresses as rows; the map counts the
+  allowed links.
 - **Edited** serves the real web as Live does, with the changes a scenario calls
   for. The scenario is a short instruction set in the World menu, such as "The
   Fed raised rates by 0.5 points on Oct 22". A model reads each page or result

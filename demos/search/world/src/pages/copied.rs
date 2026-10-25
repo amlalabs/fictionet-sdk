@@ -275,7 +275,7 @@ impl Pages {
     /// project's pages on the same sites, which are pages like any other.
     pub(crate) async fn package(&self, cx: &Cx, url: &str) -> Option<Response> {
         let captured = self.package_url(url)?;
-        // Live-Depth reaches the internet only for searches and its crawl.
+        // Live-Depth reaches the internet only for searches and the pages it allows.
         if captured.status != 404 || self.source() == Source::LiveDepth {
             return Some(captured);
         }
@@ -339,7 +339,7 @@ impl Pages {
 
     /// In copied mode only captured hosts and the local search engines exist.
     /// Live and Edited may admit any public hostname. Live-Depth admits the
-    /// search engines, the hosts its crawl reached and the captured package
+    /// search engines, the hosts of the addresses it allows and the captured package
     /// sites. A written world admits any name spelled the way a registered
     /// site is.
     pub fn serves_host(&self, host: &str) -> bool {
@@ -363,7 +363,7 @@ impl Pages {
                         || self
                             .depth
                             .as_ref()
-                            .is_some_and(|depth| depth.reached_host(&host))
+                            .is_some_and(|depth| depth.allows_host(&host))
                         || packaged()
                 }
                 Source::Copied => {

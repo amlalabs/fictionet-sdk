@@ -92,8 +92,8 @@ impl Pages {
 
     /// Copies a file the host's picture of `page`, served from `source`,
     /// asks for and the world does not hold yet: an image coming into
-    /// view. Only a Live or Edited page's files are copied; the copied web
-    /// and Live-Depth's crawl hold all they have.
+    /// view. A Live or Edited page's files are copied, and a Live-Depth
+    /// page's files it allows; the copied web holds all it has.
     pub async fn copy_for_picture(
         &self,
         cx: &Cx,

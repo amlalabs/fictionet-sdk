@@ -130,7 +130,7 @@ impl Pages {
     }
 
     /// Starts a session that answers from `source`, in the world `fcx`:
-    /// nothing a previous session copied, crawled, fetched or edited
+    /// nothing a previous session copied, allowed, fetched or edited
     /// carries over. A scenario stays, with the account already written
     /// for it.
     pub fn start_session(&self, fcx: &Cx, source: Source) -> Result<(), Rejected> {
@@ -141,7 +141,7 @@ impl Pages {
         }
         let mut settings = self.settings.lock().unwrap();
         for live in self.live.iter().chain(&self.depth) {
-            live.restart(fcx);
+            live.restart();
         }
         if let Some(editor) = &self.editor {
             editor.new_session(fcx);

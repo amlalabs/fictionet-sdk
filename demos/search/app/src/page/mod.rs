@@ -96,6 +96,8 @@ pub struct View {
     pub connections: Vec<Connection>,
     pub egress: Vec<Observation>,
     pub signin: Option<Observation>,
+    /// How many addresses Live-Depth allows, once it allows any.
+    pub allowed: Option<u64>,
 }
 
 pub struct Views {
@@ -160,6 +162,7 @@ impl Default for Views {
                 connections: Vec::new(),
                 egress: Vec::new(),
                 signin: None,
+                allowed: None,
             },
             previews: HashMap::new(),
             boot: Boot::default(),
@@ -204,7 +207,8 @@ impl Views {
                 referrer,
                 title: _,
                 error: _,
-                uncollected: _,
+                unlisted: _,
+                depth: _,
                 edits,
                 preview,
             } => {
@@ -320,21 +324,16 @@ impl Views {
                 ..
             } => {
                 let host = host.to_ascii();
-                let new_connection = !view
+                if !view
                     .connections
                     .iter()
-                    .any(|connection| connection.host == host && connection.purpose == *purpose);
-                if new_connection {
+                    .any(|connection| connection.host == host && connection.purpose == *purpose)
+                {
                     view.connections.push(Connection {
                         host,
                         purpose: *purpose,
                         at_ms: observation.at_ms,
                     });
-                }
-                // The crawl's fetches are counted by its search; the run
-                // record keeps each one.
-                if *purpose == EgressPurpose::Crawl {
-                    return new_connection;
                 }
                 if let Some(previous) = view.egress.iter_mut().find(
                     |row| matches!(row.fact, SearchObs::Egress { attempt: id, .. } if id == *attempt),
@@ -344,9 +343,12 @@ impl Views {
                     view.egress.push(observation.clone());
                 }
             }
+            SearchObs::Allowlist { links } => {
+                view.allowed = Some(*links);
+                return true;
+            }
             SearchObs::Signin { .. } => view.signin = Some(observation.clone()),
             SearchObs::NoRoute { .. }
-            | SearchObs::Crawl { .. }
             | SearchObs::Certificate { .. }
             | SearchObs::Abandoned { .. }
             | SearchObs::RunStarted { .. } => {}
@@ -360,13 +362,6 @@ impl Views {
                 .iter_mut()
                 .find(|row| matches!(row.fact, SearchObs::ModelCall { call: id, .. } if id == call))
         {
-            previous.fact = observation.fact;
-        } else if let SearchObs::Crawl { search, .. } = &observation.fact
-            && let Some(previous) = view.activity.iter_mut().find(
-                |row| matches!(&row.fact, SearchObs::Crawl { search: id, .. } if id == search),
-            )
-        {
-            // A crawl keeps its place in the feed as it grows.
             previous.fact = observation.fact;
         } else if let SearchObs::Egress { attempt, .. } = observation.fact
             && let Some(previous) = view.activity.iter_mut().find(

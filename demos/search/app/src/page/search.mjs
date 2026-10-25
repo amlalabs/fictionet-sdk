@@ -62,7 +62,7 @@ function localSites() {
   const upstream = new Set([...shown.connections.filter((row) => UPSTREAM.includes(row.purpose)).map((row) => row.host), ...shown.calls.map((call) => call.host)]);
   return shown.sites.filter((site) => !upstream.has(site.host));
 }
-const purposeName = (purpose) => ({ model: 'Model', editor: 'Editor', account: 'Sign-in', live_search: 'Search', live_capture: 'Page copy', crawl: 'Crawl', package: 'Package' })[purpose];
+const purposeName = (purpose) => ({ model: 'Model', editor: 'Editor', account: 'Sign-in', live_search: 'Search', live_capture: 'Page copy', live_depth: 'Allowed page', package: 'Package' })[purpose];
 const phaseName = (phase) => ({ connecting: 'Connecting', receiving: 'Receiving', streaming: 'Streaming', complete: 'Complete', interrupted: 'Interrupted', attempt: 'Connecting', response: 'Received', failed: 'Failed' })[phase];
 
 // The network map is built once; each state only changes its text, its
@@ -71,7 +71,7 @@ const phaseName = (phase) => ({ connecting: 'Connecting', receiving: 'Receiving'
 const SERVICES = [
   { id: 'dns', title: 'DNS' },
   { id: 'search', title: 'Search', purposes: ['live_search'] },
-  { id: 'sites', title: 'Sites', purposes: ['live_capture', 'crawl', 'package'] },
+  { id: 'sites', title: 'Sites', purposes: ['live_capture', 'live_depth', 'package'] },
   { id: 'calls', title: 'Model gateway', purposes: ['model'] },
   { id: 'editor', title: 'Editor', purposes: ['editor'] },
   { id: 'signin', title: 'Sign-in', purposes: ['account'] },
@@ -112,9 +112,6 @@ const pageFetches = (purpose) => shown.egress.filter((row) => row.fact.purpose =
 // count the same pages.
 const openedRequests = () => localSites().flatMap((site) => site.requests.filter((request) => !isSubresource(request) && !SEARCH_HOSTS.has(site.host) && request.source.kind !== 'package'));
 const openedPages = () => new Set(openedRequests().map((request) => request.url));
-// Live-Depth's crawl around each search, as far as it has gone.
-const crawls = () => shown.activity.filter((row) => row.fact.kind === 'crawl').map((row) => ({ at_ms: row.at_ms, ...row.fact }));
-const crawlMeta = (crawl) => [quantity(crawl.pages, 'page'), quantity(crawl.files, 'file'), crawl.failed ? `${crawl.failed} failed` : null, crawl.depth ? `${crawl.depth} deep` : null, crawl.waiting ? 'collecting' : null].filter(Boolean).join(' · ');
 const copiedPages = () => new Set(openedRequests().filter((request) => ['live', 'edited'].includes(request.source.kind)).map((request) => request.url));
 function graph() {
   if (!map.lanes) buildMap();
@@ -171,16 +168,17 @@ function layoutSignature() {
 document.fonts?.ready.then(() => { if (map.lanes) { map.signature = ''; drawWires(); } });
 // One row per internet destination, in service order: a host the world
 // reached for a service, or the pages and package files it copied.
-const COPIES = { live_capture: { target: 'copies', title: 'Page copies', unit: 'page' }, crawl: { target: 'crawl', title: 'Crawl', unit: 'page' }, package: { target: 'packages', title: 'Packages', unit: 'file' } };
+const COPIES = { live_capture: { target: 'copies', title: 'Page copies', unit: 'page' }, live_depth: { target: 'allowed', title: 'Allowed', unit: 'link' }, package: { target: 'packages', title: 'Packages', unit: 'file' } };
 function destinationsOf() {
   const rows = new Map();
   for (const service of map.services.values()) {
     for (const purpose of service.purposes || []) {
       const hosts = [...new Set(shown.connections.filter((row) => row.purpose === purpose).map((row) => row.host))];
-      if (!hosts.length) continue;
+      // Live-Depth's allowlist shows from its first search, before any page is copied.
+      if (!hosts.length && !(purpose === 'live_depth' && shown.allowed)) continue;
       const copies = COPIES[purpose];
       if (copies) {
-        const copied = purpose === 'live_capture' ? copiedPages().size : purpose === 'crawl' ? crawls().reduce((sum, crawl) => sum + crawl.pages, 0) : new Set(pageFetches(purpose).map((row) => row.fact.path)).size;
+        const copied = purpose === 'live_capture' ? copiedPages().size : purpose === 'live_depth' ? shown.allowed || 0 : new Set(pageFetches(purpose).map((row) => row.fact.path)).size;
         rows.set(copies.target, { key: copies.target, target: copies.target, title: copies.title, meta: quantity(copied, copies.unit), from: [service.id] });
       } else {
         for (const host of hosts) {
@@ -281,7 +279,6 @@ function pulses() {
       case 'request': pulse(SEARCH_HOSTS.has(fact.host) ? 'vm>search' : 'vm>sites'); break;
       case 'search': pulse('vm>search'); break;
       case 'no_route': pulse('vm>router'); break;
-      case 'crawl': pulse('sites>crawl'); break;
       case 'certificate': pulse('vm>sites'); break;
       case 'model_call': pulse('vm>calls', `calls>${fact.host}`); break;
       case 'egress':
@@ -289,6 +286,7 @@ function pulses() {
         if (fact.purpose === 'editor') pulse('vm>editor', `editor>${fact.host}`);
         else if (fact.purpose === 'live_search') pulse(`search>${fact.host}`);
         else if (fact.purpose === 'live_capture' && !fact.page) pulse('sites>copies');
+        else if (fact.purpose === 'live_depth' && !fact.page) pulse('sites>allowed');
         else if (fact.purpose === 'package') pulse('sites>packages');
         else if (fact.purpose === 'account') pulse(`signin>${fact.host}`);
         break;
@@ -335,7 +333,7 @@ function activityItem(row) {
     case 'request': {
       const url = urlOf(fact), hit = hitFor(url);
       const where = `${fact.host}${briefPath(fact.path) === '/' ? '' : briefPath(fact.path)}`;
-      if (fact.uncollected) return { title: `Refused ${where}`, meta: `Not collected · ${fact.status}`, target: `site:${fact.host}`, failed: true };
+      if (fact.unlisted) return { title: `Refused ${where}`, meta: `Not allowed · ${fact.status}`, target: `site:${fact.host}`, failed: true };
       if (fact.status >= 400) {
         const outcome = [404, 410].includes(fact.status) ? 'not found' : [502, 503, 504].includes(fact.status) ? 'unreachable' : 'failed';
         return { title: `${outcome === 'unreachable' ? fact.host : where} ${outcome}`, meta: [fact.status, sourceName(fact.source), fact.error].filter(Boolean).join(' · '), target: `site:${fact.host}`, failed: true };
@@ -345,7 +343,7 @@ function activityItem(row) {
       const thumbnail = document && fact.status < 400 && /text\/html/.test(fact.content_type) && fact.source.kind !== 'package' ? url : null;
       // A page that took a while says how long: a client with a deadline may have stopped waiting.
       const took = fact.elapsed_ms >= 1000 ? `${Math.round(fact.elapsed_ms / 1000)} s` : null;
-      return { title: `${fact.status >= 400 ? 'Requested' : 'Opened'} ${fact.title || hit?.title || fact.host}`, meta: [where, fact.status, sourceName(fact.source), changes(fact.edits), took].filter(Boolean).join(' · '), target: document ? `page:${url}` : `site:${fact.host}`, thumbnail, edits: fact.edits };
+      return { title: `${fact.status >= 400 ? 'Requested' : 'Opened'} ${fact.title || hit?.title || fact.host}`, meta: [where, fact.status, sourceName(fact.source), fact.depth == null ? null : `depth ${fact.depth}`, changes(fact.edits), took].filter(Boolean).join(' · '), target: document ? `page:${url}` : `site:${fact.host}`, thumbnail, edits: fact.edits };
     }
     case 'search': return { title: `Searched “${fact.query}”`, meta: [fact.results.length ? [quantity(fact.results.length, 'result'), hitHosts(fact.results)].join(' · ') : 'No results', sourceName(fact.source), changes(fact.edits)].filter(Boolean).join(' · '), target: 'search', edits: fact.edits };
     case 'tool': return { title: `${fact.tool === 'fetch' ? 'Fetched' : 'Searched'} ${fact.tool === 'fetch' ? fact.target : `“${fact.target}”`}`, meta: [fact.error || (fact.tool === 'fetch' ? 'Answered by the world' : fact.results.length ? [quantity(fact.results.length, 'result'), hitHosts(fact.results)].join(' · ') : 'No results'), sourceName(fact.source), changes(fact.edits)].filter(Boolean).join(' · '), target: 'calls', edits: fact.edits };
@@ -356,7 +354,6 @@ function activityItem(row) {
     case 'no_route': return { title: `Tried ${fact.to}`, meta: 'No route', target: 'router' };
     case 'certificate': return { title: `${hostName(fact.host)} certificate ${CERTIFICATE[fact.problem]}`, meta: `TLS · ${sourceName(fact.source)}`, target: `site:${hostName(fact.host)}`, failed: true };
     case 'resolved': return { title: `${hostName(fact.name)} not found`, meta: 'No address', target: 'dns', failed: true };
-    case 'crawl': return { title: `Crawled “${fact.search}”`, meta: crawlMeta(fact), target: 'crawl' };
   }
 }
 // How a real site's certificate fails, as the feed says it.
@@ -456,7 +453,7 @@ function visits(rows, groups) {
 }
 function feed() {
   const groups = pageRequests();
-  const rows = activityRows().filter((row) => ['request', 'abandoned', 'search', 'tool', 'no_route', 'resolved', 'certificate', 'crawl'].includes(row.fact.kind) && (row.fact.kind !== 'request' || groups.has(row)) && (row.fact.kind !== 'abandoned' || !isSubresource(row.fact)) && (row.fact.kind !== 'resolved' || !row.fact.address));
+  const rows = activityRows().filter((row) => ['request', 'abandoned', 'search', 'tool', 'no_route', 'resolved', 'certificate'].includes(row.fact.kind) && (row.fact.kind !== 'request' || groups.has(row)) && (row.fact.kind !== 'abandoned' || !isSubresource(row.fact)) && (row.fact.kind !== 'resolved' || !row.fact.address));
   const keep = new Set();
   const nodes = visits(rows, groups).reverse().map(({ row, attempts, waited, resources }) => {
     const fact = attempts[0].fact, started = attempts[0].at_ms;
@@ -676,10 +673,21 @@ function details() {
     heading('Router', '10.0.0.1');
     for (const row of activityRows().filter((row) => row.fact.kind === 'no_route')) body.append(detailRow(row.at_ms, row.fact.to, 'No route'));
     if (!body.childElementCount) body.append(element('p', 'Nothing refused', 'detail-empty'));
-  } else if (selection === 'crawl') {
-    heading('Crawl');
-    for (const crawl of crawls()) body.append(detailRow(crawl.at_ms, `“${crawl.search}”`, crawlMeta(crawl)));
-    if (!body.childElementCount) body.append(element('p', 'No crawls', 'detail-empty'));
+  } else if (selection === 'allowed') {
+    // The pages the workstation opened within reach of its searches, each
+    // with its depth, and what was refused.
+    heading('Allowed', quantity(shown.allowed || 0, 'link'));
+    for (const row of activityRows()) {
+      const fact = row.fact;
+      const opened = fact.kind === 'request' && fact.source.kind === 'live_depth' && !isSubresource(fact);
+      const refused = fact.kind === 'resolved' && !fact.address;
+      if (!opened && !refused) continue;
+      const item = activityItem(row);
+      const shownRow = detailRow(row.at_ms, item.title, item.meta);
+      if (item.failed) shownRow.classList.add('failed');
+      body.append(shownRow);
+    }
+    if (!body.childElementCount) body.append(element('p', 'No pages opened', 'detail-empty'));
   } else {
     heading('Workstation', hostStatus?.addresses.join(' · ') || '10.0.0.2');
     // What the workstation did, in order: the pages it opened, its
