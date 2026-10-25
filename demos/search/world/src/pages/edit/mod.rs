@@ -147,8 +147,9 @@ struct Subjects {
 }
 
 /// How data files and web addresses write a scenario's subjects: the
-/// projects (`nodejs`, `idna`) and, when the scenario is about one version
-/// or item of them, that item as data writes it on its own (`v20`, `3.7`).
+/// projects (`django`, `openssl`) and, when the scenario is about one
+/// version or item of them, that item as data writes it on its own (`v5`,
+/// `3.0`).
 /// Data names its subject this way, in its address, keys and values, and
 /// seldom by the names pages use.
 #[derive(Default)]
@@ -283,13 +284,13 @@ scenario's subjects, and how data names them.";
 /// How data files name a scenario's subjects, asked with the subjects.
 const DATA_NAMES: &str = "- projects: the names data files and web addresses use for what \
 the scenario is about, as they write them in paths, keys and values: the package, project, \
-product, distribution or article name and its slugs (nodejs, node, python-idna, idna, ubuntu, \
-Golden_Gate_Bridge). Data files (JSON from an API, a project's schedule file, raw wikitext) \
+product, distribution or article name and its slugs (django, python-django, openssl, debian, \
+Eiffel_Tower). Data files (JSON from an API, a project's schedule file, raw wikitext) \
 seldom use the names pages use. Never list a common word (release, schedule, dist, api, lts), \
 a file name or a website on its own.
 - items: when the scenario is about one version, release line, edition or item of a project, \
-that item as data writes it on its own, in every form (20, v20, 20.x and the codename for a \
-release line; 3.7 for a version; 20.04 and focal for a distribution release). Leave this empty \
+that item as data writes it on its own, in every form (5, v5, 5.x and the codename for a \
+release line; 3.0.2 for a version; 12 and bookworm for a distribution release). Leave this empty \
 when the scenario is about the whole of its subject.";
 
 const ACCOUNT: &str = "A scenario changes facts on real web pages. Many editors will each edit \
@@ -308,12 +309,17 @@ moves, give both forms. Work out every number exactly. When pages will need a va
 scenario implies but does not give (the version number and date of a release that now \
 happens, a new total, a new deadline), decide it here, once and exactly, from the real values \
 around it (the next number after the real latest release, say), so that every page gives the \
-same one. Change only what the scenario states or strictly requires.
+same one. When the scenario says something goes on (releases, updates, payments), decide the \
+items pages published by today would list: each one's number, date and contents. Change only what the scenario states or strictly requires.
 - conflicts: true facts the changes collide with, which stay true. Moving a date or changing a \
 fact can make other statements impossible: a person who no longer held an office or role at \
 the new date, a building, work or event dated before the new date that copied, followed, \
 answered or competed with the subject, an anniversary or record counted from the old date, an \
-event that no longer includes the subject. Those other facts never move. For each, give the \
+event that no longer includes the subject. Those other facts never move. An event that really \
+happened (a celebration, a walk, a report) keeps its real date and its sources even when the \
+scenario changes what it marked: pages describe it without the label that no longer fits (the \
+1990 festival rather than the centenary festival), and never move it to a new date. \
+For each, give the \
 fixed fact and how pages put it so that both stay true: name who held an office at the new \
 date only when certain, and otherwise leave the name out; say what an earlier structure is \
 without calling it a copy; take the subject out of an event it is no longer part of. Leave out \
@@ -352,7 +358,7 @@ versions, a period of validity), change every statement of that end however it i
 fixed one (`up to 1.9.3` when the fix was 2.0), which moves with the fix.
 - Some lines are values from data in the document (JSON, or the data in a page's scripts), \
 each after the names of the keys that hold it and a colon, like `release.date: 2019-04-01` or \
-`v20.lts: true`. The names say what the value is, and the lines around it what it belongs to. \
+`v5.lts: true`. The names say what the value is, and the lines around it what it belongs to. \
 Edit only the value; a passage may start with the names to tell equal values apart. An edit \
 changes one value, and its passage never reaches past that value's line: values cannot be \
 added, removed or joined. A value may be text, a number, true or false; write a number, true \
@@ -371,11 +377,13 @@ something else that names the subject (another advisory, vulnerability, fix, rel
 of the same project or place) keeps its own versions and dates unless the account changes \
 that very thing.
 - Use only values the account gives. Never make up a value it does not give (a version \
-number, a date, a figure, a name); when a statement would need one, write it without that \
-value.
+number, a date, a figure, a name), and never add an item carrying one (a release, a version in \
+a list, a row); when a statement would need one, write it without that value.
 - References and citations record other works: a cited work's title or headline, author, \
 publisher, publication date, archive date and access date never change unless the account \
-changes that work itself. Body text keeps agreeing with its sources: an event the account \
+changes that work itself. A title in quotation marks or italics in a reference, a citation \
+template's fields (|title=, |date=, |access-date=, |archive-date=) and a link's text naming \
+another work stay word for word, even when they name the subject or a changed fact. Body text keeps agreeing with its sources: an event the account \
 leaves at its real date keeps that date in the text too.
 - When a change would make another statement in PASSAGES false or impossible (an earlier \
 event, building or work tied to the old fact, a person acting in a role at the new date), \

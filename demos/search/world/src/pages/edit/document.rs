@@ -448,29 +448,53 @@ impl<'a> Document<'a> {
                 let replacement = unescaped(&edit.replacement).unwrap_or(edit.replacement.clone());
                 readings.push((passage, replacement));
             }
-            let Some((found, replacement)) =
-                readings.into_iter().find_map(|(passage, replacement)| {
-                    let found = self.occurrences(&passage);
-                    (!found.is_empty()).then_some((found, replacement))
-                })
-            else {
-                continue;
-            };
-            let within: Vec<_> = found
-                .iter()
-                .filter(|place| {
-                    scoped.within.start <= place.start && place.end <= scoped.within.end
-                })
-                .cloned()
-                .collect();
-            let found = if within.is_empty() || distinctive(&edit.passage) {
+            let in_scope = |found: &[Range<usize>]| -> Vec<Range<usize>> {
                 found
-            } else {
-                within
+                    .iter()
+                    .filter(|place| {
+                        scoped.within.start <= place.start && place.end <= scoped.within.end
+                    })
+                    .cloned()
+                    .collect()
             };
-            let pieces = found
-                .into_iter()
-                .flat_map(|place| self.lines_of(place, &replacement));
+            let found = readings.iter().find_map(|(passage, replacement)| {
+                let found = self.occurrences(passage);
+                (!found.is_empty()).then_some((found, replacement.clone()))
+            });
+            let pieces: Vec<(Range<usize>, String)> = match found {
+                Some((found, replacement)) => {
+                    let within = in_scope(&found);
+                    let found = if within.is_empty() || distinctive(&edit.passage) {
+                        found
+                    } else {
+                        within
+                    };
+                    found
+                        .into_iter()
+                        .flat_map(|place| self.lines_of(place, &replacement))
+                        .collect()
+                }
+                // A passage over several lines that the text does not hold
+                // together (lines copied side by side that stand apart, as
+                // the cells of a table can) is its changed lines, each made
+                // where it appears in the part it was asked about.
+                None => edit
+                    .passage
+                    .trim()
+                    .split('\n')
+                    .zip(edit.replacement.trim().split('\n'))
+                    .filter(|_| {
+                        let lines = edit.passage.trim().lines().count();
+                        lines > 1 && lines == edit.replacement.trim().lines().count()
+                    })
+                    .filter(|(line, new)| normalized(line) != normalized(new))
+                    .flat_map(|(line, new)| {
+                        in_scope(&self.occurrences(line))
+                            .into_iter()
+                            .map(move |place| (place, new.trim().to_owned()))
+                    })
+                    .collect(),
+            };
             for (place, replacement) in pieces {
                 let Some((chars, replacement)) = self.unlabeled(place, &replacement) else {
                     continue;

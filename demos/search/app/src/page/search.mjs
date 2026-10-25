@@ -684,10 +684,11 @@ function draw() {
 // One socket carries what the page shows (the run, the world's settings,
 // the workstation) and the commands it sends, so none of it waits behind
 // the pictures for a connection, however many tabs show the page.
-let updates = null, asked = 0;
+let updates = null, asked = 0, opened = null;
 const waiting = new Map();
 function connect() {
   const socket = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/updates`);
+  opened = new Promise((resolve) => socket.addEventListener('open', resolve, { once: true }));
   socket.onopen = () => { $('clock').title = ''; };
   socket.onmessage = (event) => {
     const update = JSON.parse(event.data);
@@ -745,9 +746,11 @@ document.addEventListener('click', (event) => { if (!$('world-menu').contains(ev
 document.addEventListener('keydown', (event) => { if (event.key === 'Escape') { $('world-menu').hidden = true; $('world-toggle').setAttribute('aria-expanded', 'false'); select(null); } });
 // Sends a command on the socket; settles when the world has applied it,
 // after the socket has brought the settings it changed.
-function command(command) {
+async function command(command) {
   $('world-error').textContent = '';
-  if (updates?.readyState !== WebSocket.OPEN) return Promise.reject(new Error('The page is reconnecting to the world. Try again.'));
+  // A command sent while the socket opens goes once it is open.
+  if (updates?.readyState === WebSocket.CONNECTING) await opened;
+  if (updates?.readyState !== WebSocket.OPEN) throw new Error('The page is reconnecting to the world. Try again.');
   const id = ++asked;
   const reply = new Promise((resolve, reject) => waiting.set(id, { resolve, reject }));
   updates.send(JSON.stringify({ id, command }));
