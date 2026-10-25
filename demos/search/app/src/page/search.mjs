@@ -20,7 +20,7 @@ const svgNode = (tag, attributes = {}) => {
 const stamp = (ms) => new Date((shown.started_at_ms || Date.now()) + ms).toLocaleTimeString([], { hour12: false, timeZone: 'UTC' });
 const size = (bytes) => bytes < 1000 ? `${bytes} B` : `${Math.round(bytes / 1000)} KB`;
 const quantity = (n, word, plural = `${word}s`) => `${n} ${n === 1 ? word : plural}`;
-const sourceName = (source) => source.kind === 'copy' ? source.captured ? `Copied ${source.captured.slice(0, 10)}` : 'Copied' : ({ edited: 'Edited', package: 'Package' })[source.kind] || 'Live';
+const sourceName = (source) => source.kind === 'copy' ? source.captured ? `Copied ${source.captured.slice(0, 10)}` : 'Copied' : ({ live_depth: 'Live-Depth', edited: 'Edited', package: 'Package' })[source.kind] || 'Live';
 const changes = (edits) => edits?.length ? quantity(edits.length, 'change') : null;
 const hostName = (name) => name.replace(/\.$/, '');
 const hostOf = (url) => { try { return new URL(url).host; } catch { return url; } };
@@ -62,7 +62,7 @@ function localSites() {
   const upstream = new Set([...shown.connections.filter((row) => UPSTREAM.includes(row.purpose)).map((row) => row.host), ...shown.calls.map((call) => call.host)]);
   return shown.sites.filter((site) => !upstream.has(site.host));
 }
-const purposeName = (purpose) => ({ model: 'Model', editor: 'Editor', account: 'Sign-in', live_search: 'Search', live_capture: 'Page copy', package: 'Package' })[purpose];
+const purposeName = (purpose) => ({ model: 'Model', editor: 'Editor', account: 'Sign-in', live_search: 'Search', live_capture: 'Page copy', crawl: 'Crawl', package: 'Package' })[purpose];
 const phaseName = (phase) => ({ connecting: 'Connecting', receiving: 'Receiving', streaming: 'Streaming', complete: 'Complete', interrupted: 'Interrupted', attempt: 'Connecting', response: 'Received', failed: 'Failed' })[phase];
 
 // The network map is built once; each state only changes its text, its
@@ -71,7 +71,7 @@ const phaseName = (phase) => ({ connecting: 'Connecting', receiving: 'Receiving'
 const SERVICES = [
   { id: 'dns', title: 'DNS' },
   { id: 'search', title: 'Search', purposes: ['live_search'] },
-  { id: 'sites', title: 'Sites', purposes: ['live_capture', 'package'] },
+  { id: 'sites', title: 'Sites', purposes: ['live_capture', 'crawl', 'package'] },
   { id: 'calls', title: 'Model gateway', purposes: ['model'] },
   { id: 'editor', title: 'Editor', purposes: ['editor'] },
   { id: 'signin', title: 'Sign-in', purposes: ['account'] },
@@ -112,6 +112,9 @@ const pageFetches = (purpose) => shown.egress.filter((row) => row.fact.purpose =
 // count the same pages.
 const openedRequests = () => localSites().flatMap((site) => site.requests.filter((request) => !isSubresource(request) && !SEARCH_HOSTS.has(site.host) && request.source.kind !== 'package'));
 const openedPages = () => new Set(openedRequests().map((request) => request.url));
+// Live-Depth's crawl around each search, as far as it has gone.
+const crawls = () => shown.activity.filter((row) => row.fact.kind === 'crawl').map((row) => ({ at_ms: row.at_ms, ...row.fact }));
+const crawlMeta = (crawl) => [quantity(crawl.pages, 'page'), quantity(crawl.files, 'file'), crawl.failed ? `${crawl.failed} failed` : null, crawl.depth ? `${crawl.depth} deep` : null, crawl.waiting ? 'collecting' : null].filter(Boolean).join(' · ');
 const copiedPages = () => new Set(openedRequests().filter((request) => ['live', 'edited'].includes(request.source.kind)).map((request) => request.url));
 function graph() {
   if (!map.lanes) buildMap();
@@ -168,7 +171,7 @@ function layoutSignature() {
 document.fonts?.ready.then(() => { if (map.lanes) { map.signature = ''; drawWires(); } });
 // One row per internet destination, in service order: a host the world
 // reached for a service, or the pages and package files it copied.
-const COPIES = { live_capture: { target: 'copies', title: 'Page copies', unit: 'page' }, package: { target: 'packages', title: 'Packages', unit: 'file' } };
+const COPIES = { live_capture: { target: 'copies', title: 'Page copies', unit: 'page' }, crawl: { target: 'crawl', title: 'Crawl', unit: 'page' }, package: { target: 'packages', title: 'Packages', unit: 'file' } };
 function destinationsOf() {
   const rows = new Map();
   for (const service of map.services.values()) {
@@ -177,7 +180,7 @@ function destinationsOf() {
       if (!hosts.length) continue;
       const copies = COPIES[purpose];
       if (copies) {
-        const copied = purpose === 'live_capture' ? copiedPages().size : new Set(pageFetches(purpose).map((row) => row.fact.path)).size;
+        const copied = purpose === 'live_capture' ? copiedPages().size : purpose === 'crawl' ? crawls().reduce((sum, crawl) => sum + crawl.pages, 0) : new Set(pageFetches(purpose).map((row) => row.fact.path)).size;
         rows.set(copies.target, { key: copies.target, target: copies.target, title: copies.title, meta: quantity(copied, copies.unit), from: [service.id] });
       } else {
         for (const host of hosts) {
@@ -278,6 +281,7 @@ function pulses() {
       case 'request': pulse(SEARCH_HOSTS.has(fact.host) ? 'vm>search' : 'vm>sites'); break;
       case 'search': pulse('vm>search'); break;
       case 'no_route': pulse('vm>router'); break;
+      case 'crawl': pulse('sites>crawl'); break;
       case 'certificate': pulse('vm>sites'); break;
       case 'model_call': pulse('vm>calls', `calls>${fact.host}`); break;
       case 'egress':
@@ -331,6 +335,7 @@ function activityItem(row) {
     case 'request': {
       const url = urlOf(fact), hit = hitFor(url);
       const where = `${fact.host}${briefPath(fact.path) === '/' ? '' : briefPath(fact.path)}`;
+      if (fact.uncollected) return { title: `Refused ${where}`, meta: `Not collected · ${fact.status}`, target: `site:${fact.host}`, failed: true };
       if (fact.status >= 400) {
         const outcome = [404, 410].includes(fact.status) ? 'not found' : [502, 503, 504].includes(fact.status) ? 'unreachable' : 'failed';
         return { title: `${outcome === 'unreachable' ? fact.host : where} ${outcome}`, meta: [fact.status, sourceName(fact.source), fact.error].filter(Boolean).join(' · '), target: `site:${fact.host}`, failed: true };
@@ -351,6 +356,7 @@ function activityItem(row) {
     case 'no_route': return { title: `Tried ${fact.to}`, meta: 'No route', target: 'router' };
     case 'certificate': return { title: `${hostName(fact.host)} certificate ${CERTIFICATE[fact.problem]}`, meta: `TLS · ${sourceName(fact.source)}`, target: `site:${hostName(fact.host)}`, failed: true };
     case 'resolved': return { title: `${hostName(fact.name)} not found`, meta: 'No address', target: 'dns', failed: true };
+    case 'crawl': return { title: `Crawled “${fact.search}”`, meta: crawlMeta(fact), target: 'crawl' };
   }
 }
 // How a real site's certificate fails, as the feed says it.
@@ -450,11 +456,11 @@ function visits(rows, groups) {
 }
 function feed() {
   const groups = pageRequests();
-  const rows = activityRows().filter((row) => ['request', 'abandoned', 'search', 'tool', 'no_route', 'resolved', 'certificate'].includes(row.fact.kind) && (row.fact.kind !== 'request' || groups.has(row)) && (row.fact.kind !== 'abandoned' || !isSubresource(row.fact)) && (row.fact.kind !== 'resolved' || !row.fact.address));
+  const rows = activityRows().filter((row) => ['request', 'abandoned', 'search', 'tool', 'no_route', 'resolved', 'certificate', 'crawl'].includes(row.fact.kind) && (row.fact.kind !== 'request' || groups.has(row)) && (row.fact.kind !== 'abandoned' || !isSubresource(row.fact)) && (row.fact.kind !== 'resolved' || !row.fact.address));
   const keep = new Set();
   const nodes = visits(rows, groups).reverse().map(({ row, attempts, waited, resources }) => {
     const fact = attempts[0].fact, started = attempts[0].at_ms;
-    const key = fact.kind === 'no_route' ? `no_route:${fact.from}:${fact.to}` : fact.kind === 'resolved' ? `resolved:${fact.name}` : fact.kind === 'certificate' ? `certificate:${fact.host}` : `${fact.kind}:${started}:${fact.host || ''}${fact.path || ''}${fact.query || ''}${fact.target || ''}`;
+    const key = fact.kind === 'no_route' ? `no_route:${fact.from}:${fact.to}` : fact.kind === 'resolved' ? `resolved:${fact.name}` : fact.kind === 'certificate' ? `certificate:${fact.host}` : `${fact.kind}:${started}:${fact.host || ''}${fact.path || ''}${fact.query || ''}${fact.target || ''}${fact.search || ''}`;
     keep.add(key);
     const item = activityItem(row);
     if (attempts.length > 1) {
@@ -670,9 +676,31 @@ function details() {
     heading('Router', '10.0.0.1');
     for (const row of activityRows().filter((row) => row.fact.kind === 'no_route')) body.append(detailRow(row.at_ms, row.fact.to, 'No route'));
     if (!body.childElementCount) body.append(element('p', 'Nothing refused', 'detail-empty'));
+  } else if (selection === 'crawl') {
+    heading('Crawl');
+    for (const crawl of crawls()) body.append(detailRow(crawl.at_ms, `“${crawl.search}”`, crawlMeta(crawl)));
+    if (!body.childElementCount) body.append(element('p', 'No crawls', 'detail-empty'));
   } else {
     heading('Workstation', hostStatus?.addresses.join(' · ') || '10.0.0.2');
-    actions.append(button('Show agent', () => { select(null); showAgent(true); }));
+    // What the workstation did, in order: the pages it opened, its
+    // lookups, searches and model calls, and what failed or was refused.
+    for (const row of activityRows()) {
+      const fact = row.fact;
+      let shownRow = null;
+      if (fact.kind === 'request' && !isSubresource(fact) || ['search', 'tool', 'abandoned', 'no_route', 'certificate'].includes(fact.kind)) {
+        const item = activityItem(row);
+        shownRow = detailRow(row.at_ms, item.title, item.meta, item.target.startsWith('page:') && requestFor(item.target.slice(5))?.has_preview ? button('Page', () => select(item.target), 'more') : null);
+        if (item.failed) shownRow.classList.add('failed');
+      } else if (fact.kind === 'resolved') {
+        shownRow = detailRow(row.at_ms, `Looked up ${hostName(fact.name)}`, fact.address || 'No address');
+        if (!fact.address) shownRow.classList.add('failed');
+      } else if (fact.kind === 'model_call') {
+        shownRow = detailRow(row.at_ms, `Called ${fact.host}`, [`${fact.method} ${fact.path}`, fact.status, phaseName(fact.phase)].filter(Boolean).join(' · '));
+        if (fact.phase === 'interrupted' || fact.status >= 400) shownRow.classList.add('failed');
+      }
+      if (shownRow) body.append(shownRow);
+    }
+    if (!body.childElementCount) body.append(element('p', 'No activity yet', 'detail-empty'));
   }
   body.scrollTop = scroll;
 }
@@ -688,7 +716,7 @@ function draw() {
 // One socket carries what the page shows (the run, the world's settings,
 // the workstation) and the commands it sends, so none of it waits behind
 // the pictures for a connection, however many tabs show the page.
-let updates = null, asked = 0, opened = null;
+let updates = null, asked = 0, opened = null, drawing = 0;
 const waiting = new Map();
 function connect() {
   const socket = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/updates`);
@@ -696,7 +724,9 @@ function connect() {
   socket.onopen = () => { $('clock').title = ''; };
   socket.onmessage = (event) => {
     const update = JSON.parse(event.data);
-    if (update.kind === 'view') { shown = update.state; draw(); pulses(); }
+    // A busy run sends states faster than a screen shows them: each frame
+    // draws the latest.
+    if (update.kind === 'view') { shown = update.state; if (!drawing) drawing = requestAnimationFrame(() => { drawing = 0; draw(); pulses(); }); }
     else if (update.kind === 'world') showWorld(update.state);
     else if (update.kind === 'host') showHost(update.state);
     else if (update.kind === 'reply') {
@@ -738,9 +768,12 @@ function showWorld(next) {
     state.title = readiness?.error || '';
   }
   if (selection === 'editor') details();
+  const starting = world.session === 'starting';
+  if (starting) consoleStatus();
+  else if (hostStatus) mountConsole();
   for (const control of $('source').querySelectorAll('button')) {
     const availability = world[control.dataset.source];
-    control.disabled = availability.kind !== 'available';
+    control.disabled = starting || availability.kind !== 'available';
     control.setAttribute('aria-pressed', String(control.dataset.source === world.source));
     control.title = { no_captures: 'No captures', no_search_key: 'No search key', no_model_key: 'No model key' }[availability.reason] || '';
   }
@@ -778,7 +811,18 @@ async function setScenario(scenario) {
 $('scenario-form').onsubmit = (event) => { event.preventDefault(); setScenario($('scenario').value); };
 $('scenario').addEventListener('keydown', (event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); setScenario($('scenario').value); } });
 $('scenario-clear').onclick = () => { $('scenario').value = ''; setScenario(''); };
-$('restart').onclick = async () => { $('restart').disabled = true; try { await command({ command: 'restart' }); select(null); } catch (error) { $('world-error').textContent = error.message; } finally { $('restart').disabled = false; } };
+const MODES = { copied: 'Copied', live: 'Live', live_depth: 'Live-Depth', edited: 'Edited' };
+// While a session starts, the previous workstation's console is gone: the
+// pane says which session is starting until the new one's terminal opens.
+function consoleStatus() {
+  const starting = world?.session === 'starting';
+  const kind = activeConsole, ready = !starting && hostStatus && (kind === 'screen' ? hostStatus.screen : hostStatus.terminal);
+  $('console-status').hidden = !!ready;
+  $('console-status').textContent = starting ? `Starting ${MODES[world.source]} session…` : hostStatus?.state === 'failed' ? 'The workstation failed to start. See the process output.' : hostStatus?.state === 'stopped' ? 'The workstation has stopped.' : 'Starting the workstation…';
+  if (starting) for (const console of consoles.values()) { console.component.dispose(); console.socket.close(); }
+  if (starting) { consoles.clear(); $('terminal').replaceChildren(); $('screen').replaceChildren(); }
+  return ready;
+}
 async function mountConsole() {
   if (!hostStatus) return;
   const kind = activeConsole;
@@ -787,9 +831,7 @@ async function mountConsole() {
   $('agent').classList.toggle('phone', kind === 'screen');
   $('terminal-tab').setAttribute('aria-pressed', String(kind === 'terminal'));
   $('screen-tab').setAttribute('aria-pressed', String(kind === 'screen'));
-  const ready = kind === 'screen' ? hostStatus.screen : hostStatus.terminal;
-  $('console-status').hidden = ready;
-  $('console-status').textContent = hostStatus.state === 'failed' ? 'The workstation failed to start. See the process output.' : hostStatus.state === 'stopped' ? 'The workstation has stopped.' : 'Starting the workstation…';
+  const ready = consoleStatus();
   if (!ready || mounting.has(kind)) return;
   const existing = consoles.get(kind);
   if (existing && existing.socket.readyState <= 1) return;

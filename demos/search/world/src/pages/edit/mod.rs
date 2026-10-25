@@ -527,9 +527,24 @@ impl Editor {
         });
     }
 
-    /// Forgets the edits made, keeping the scenario.
-    pub(super) fn restart(self: &Arc<Self>, fcx: &Cx) {
-        self.set_scenario(fcx, self.run().scenario.clone());
+    /// Starts a new session in the world `fcx`: forgets the edits made and
+    /// keeps the scenario. An account already written for it is kept; one
+    /// still being written is asked for again, since the previous world's
+    /// requests ended with it.
+    pub(super) fn new_session(self: &Arc<Self>, fcx: &Cx) {
+        let previous = self.run();
+        let (Some(subjects), Some(account)) = (previous.subjects.get(), previous.account.get())
+        else {
+            self.set_scenario(fcx, previous.scenario.clone());
+            return;
+        };
+        let run = Arc::new(Run {
+            scenario: previous.scenario.clone(),
+            subjects: OnceCell::new_with(Some(subjects.clone())),
+            account: OnceCell::new_with(Some(account.clone())),
+            ..Run::default()
+        });
+        *self.run.lock().unwrap() = run;
     }
 
     /// The document at `url`, whose real text `source` is written in

@@ -1,5 +1,6 @@
-//! The world's pages: copied captures, live copies of the real web, and
-//! live copies edited for a scenario share one response path. Each search
+//! The world's pages: copied captures, live copies of the real web, a
+//! crawl of the real web around each search, and live copies edited for a
+//! scenario share one response path. Each search
 //! engine renders the active source's results in its own format. The
 //! standalone `web-world` serves the [`written`] web instead.
 
@@ -38,12 +39,17 @@ pub enum Source {
     Copied,
     /// The real web, copied from the host when asked for, with real search.
     Live,
+    /// The real web around each search: real results, and each result's
+    /// site crawled five links deep with the pages' files, collected ahead
+    /// of time. Only collected pages exist.
+    LiveDepth,
     /// The real web as Live serves it, with the scenario's edits.
     Edited,
 }
 
 impl Source {
-    /// Whether pages come from the real web.
+    /// Whether any page the guest asks for is copied from the real web
+    /// when asked for.
     pub fn is_live(self) -> bool {
         matches!(self, Self::Live | Self::Edited)
     }
@@ -64,6 +70,9 @@ pub enum Meta {
     Document { title: String },
     /// No page at this address.
     Missing,
+    /// Live-Depth did not collect this address, so the world answered as
+    /// a site with no such page, without fetching it.
+    Uncollected,
     /// The page could not be copied. The diagnostic says why.
     Error { error: String },
 }
@@ -141,6 +150,15 @@ impl Response {
             Meta::Missing,
         )
     }
+
+    /// What a site with no page at an address answers: Live-Depth's
+    /// answer for an address it did not collect.
+    fn uncollected() -> Self {
+        Self {
+            meta: Meta::Uncollected,
+            ..Self::not_found()
+        }
+    }
 }
 
 /// The source in use and its revision, which every accepted command advances.
@@ -157,6 +175,8 @@ pub struct Pages {
     settings: Mutex<Settings>,
     copied: Option<Arc<copied::Corpus>>,
     live: Option<Arc<live::Live>>,
+    /// Live-Depth's crawl of the real web around each search.
+    depth: Option<Arc<live::Live>>,
     editor: Option<Arc<edit::Editor>>,
     /// Single requests from the host: package files the copied web lacks.
     fetcher: live::Fetcher,

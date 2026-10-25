@@ -237,7 +237,8 @@ impl Pages {
     /// project's pages on the same sites, which are pages like any other.
     pub(crate) async fn package(&self, cx: &Cx, url: &str) -> Option<Response> {
         let captured = self.package_url(url)?;
-        if captured.status != 404 {
+        // Live-Depth reaches the internet only for searches and its crawl.
+        if captured.status != 404 || self.source() == Source::LiveDepth {
             return Some(captured);
         }
         let packages = self.copied.as_ref()?.packages.as_ref()?;
@@ -287,25 +288,55 @@ impl Pages {
         self.copied.is_some()
     }
 
+    /// Forgets the package files copied from their real hosts.
+    pub(super) fn forget_packages(&self) {
+        if let Some(packages) = self
+            .copied
+            .as_ref()
+            .and_then(|corpus| corpus.packages.as_ref())
+        {
+            packages.fetched.lock().unwrap().clear();
+        }
+    }
+
     /// In copied mode only captured hosts and the local search engines exist.
-    /// Live worlds may admit any public hostname; a written world, any
-    /// spelled the way a registered site is.
+    /// Live and Edited may admit any public hostname. Live-Depth admits the
+    /// search engines, the hosts its crawl reached and the captured package
+    /// sites. A written world admits any name spelled the way a registered
+    /// site is.
     pub fn serves_host(&self, host: &str) -> bool {
         let host = host.trim_end_matches('.').to_ascii_lowercase();
         if self.written.is_some() {
             return crate::admit(&host).is_ok() && !written::misspelled_host(&host);
         }
+        let packaged = || {
+            self.copied.as_ref().is_some_and(|corpus| {
+                corpus
+                    .packages
+                    .as_ref()
+                    .is_some_and(|packages| packages.hosts.contains(&host))
+            })
+        };
         crate::admit(&host).is_ok()
-            && (self.source() != Source::Copied
-                || crate::route::SEARCH_HOSTS.contains(&host.as_str())
-                || self.copied.as_ref().is_some_and(|corpus| {
-                    corpus.hosts.contains(&host)
-                        || matches!(&corpus.search, CorpusSearch::Reference(web) if web.serves(&host))
-                        || corpus
-                            .packages
+            && match self.source() {
+                Source::Live | Source::Edited => true,
+                Source::LiveDepth => {
+                    crate::route::SEARCH_HOSTS.contains(&host.as_str())
+                        || self
+                            .depth
                             .as_ref()
-                            .is_some_and(|packages| packages.hosts.contains(&host))
-                }))
+                            .is_some_and(|depth| depth.reached_host(&host))
+                        || packaged()
+                }
+                Source::Copied => {
+                    crate::route::SEARCH_HOSTS.contains(&host.as_str())
+                        || packaged()
+                        || self.copied.as_ref().is_some_and(|corpus| {
+                            corpus.hosts.contains(&host)
+                                || matches!(&corpus.search, CorpusSearch::Reference(web) if web.serves(&host))
+                        })
+                }
+            }
     }
 
     /// Open the corpus chosen by the world's brief, relative to the downloads root.

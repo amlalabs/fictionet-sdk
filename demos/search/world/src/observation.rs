@@ -46,6 +46,9 @@ pub enum SearchObs {
         /// Why the world could not answer with the page: the site it read
         /// could not be reached.
         error: Option<String>,
+        /// Live-Depth did not collect the address: the world answered as
+        /// a site with no such page and fetched nothing.
+        uncollected: bool,
         /// The scenario's edits to the real page; empty when it is served
         /// as the site sent it.
         edits: Vec<Edit>,
@@ -73,6 +76,19 @@ pub enum SearchObs {
         results: Vec<Hit>,
         /// The scenario's edits to the real results' titles and snippets.
         edits: Vec<Edit>,
+    },
+    /// Live-Depth's crawl around one search so far: reported as each page
+    /// arrives and when nothing is left in line.
+    Crawl {
+        /// The search whose results the crawl started from.
+        search: String,
+        pages: u64,
+        files: u64,
+        failed: u64,
+        /// Addresses still in line.
+        waiting: u64,
+        /// The most links from a search result a collected page is.
+        depth: u8,
     },
     ModelCall {
         call: u64,
@@ -160,6 +176,8 @@ pub enum EgressPurpose {
     Account,
     LiveSearch,
     LiveCapture,
+    /// Live-Depth's crawl of a search's results and their sites.
+    Crawl,
     /// A package index or file the copied web lacks.
     Package,
     /// The public original of a page a model writes, read to ground it.
@@ -225,6 +243,8 @@ pub enum PageSource {
         captured: Option<time::OffsetDateTime>,
     },
     Live,
+    /// A real page Live-Depth's crawl collected.
+    LiveDepth,
     /// A live page with the scenario's edits.
     Edited,
     /// A page the standalone world wrote for its seed.
@@ -237,7 +257,7 @@ pub enum PageSource {
 impl PageSource {
     /// Whether the page came from the real web.
     pub fn is_live(&self) -> bool {
-        matches!(self, Self::Live | Self::Edited)
+        matches!(self, Self::Live | Self::LiveDepth | Self::Edited)
     }
 }
 /// How a request was made: a navigation to a document, or a page's own
@@ -301,33 +321,47 @@ impl Pages {
     /// Installs this world's concrete observation destination. No SDK observer is used.
     pub fn observe(&self, destination: UnboundedSender<Observation>) {
         *self.observation.lock().unwrap() = Some(destination);
-        let destination = self.observation.clone();
-        self.observe_live(std::sync::Arc::new(move |cx, event| {
-            report(
-                &destination,
-                cx,
-                SearchObs::Egress {
-                    attempt: event.attempt,
-                    host: event
-                        .url
-                        .host_str()
-                        .expect("capture host")
-                        .parse()
-                        .expect("capture hostname"),
-                    method: event.method.to_string(),
-                    path: event.url.as_str().into(),
-                    purpose: match event.purpose {
-                        fictionet_extras::capture::Purpose::Search => EgressPurpose::LiveSearch,
-                        fictionet_extras::capture::Purpose::Capture => EgressPurpose::LiveCapture,
-                        fictionet_extras::capture::Purpose::Package => EgressPurpose::Package,
-                        fictionet_extras::capture::Purpose::Original => EgressPurpose::Original,
-                    },
-                    phase: event.phase,
-                    status: event.status.map(|status| status.as_u16()),
-                    page: event.page.as_ref().map(|page| redact_url(page.as_str())),
-                },
-            );
-        }));
+        // Live-Depth's copies are its crawl.
+        let observer =
+            |copy: EgressPurpose| -> std::sync::Arc<fictionet_extras::capture::Observer> {
+                let destination = self.observation.clone();
+                std::sync::Arc::new(move |cx, event| {
+                    report(
+                        &destination,
+                        cx,
+                        SearchObs::Egress {
+                            attempt: event.attempt,
+                            host: event
+                                .url
+                                .host_str()
+                                .expect("capture host")
+                                .parse()
+                                .expect("capture hostname"),
+                            method: event.method.to_string(),
+                            path: event.url.as_str().into(),
+                            purpose: match event.purpose {
+                                fictionet_extras::capture::Purpose::Search => {
+                                    EgressPurpose::LiveSearch
+                                }
+                                fictionet_extras::capture::Purpose::Capture => copy,
+                                fictionet_extras::capture::Purpose::Package => {
+                                    EgressPurpose::Package
+                                }
+                                fictionet_extras::capture::Purpose::Original => {
+                                    EgressPurpose::Original
+                                }
+                            },
+                            phase: event.phase,
+                            status: event.status.map(|status| status.as_u16()),
+                            page: event.page.as_ref().map(|page| redact_url(page.as_str())),
+                        },
+                    );
+                })
+            };
+        self.observe_live(
+            observer(EgressPurpose::LiveCapture),
+            observer(EgressPurpose::Crawl),
+        );
         let destination = self.observation.clone();
         self.observe_editor(std::sync::Arc::new(move |cx, provider, event| {
             report(
@@ -358,6 +392,7 @@ impl Pages {
         match self.source() {
             Source::Copied => PageSource::Copy { captured: None },
             Source::Live => PageSource::Live,
+            Source::LiveDepth => PageSource::LiveDepth,
             Source::Edited => PageSource::Edited,
         }
     }
@@ -484,6 +519,7 @@ impl Pages {
                     Meta::Error { error } => Some(error.clone()),
                     _ => None,
                 },
+                uncollected: matches!(response.meta, Meta::Uncollected),
                 edits,
                 referrer: headers
                     .get(http::header::REFERER)
@@ -496,7 +532,7 @@ impl Pages {
     }
 }
 
-fn report(
+pub(crate) fn report(
     destination: &std::sync::Mutex<Option<UnboundedSender<Observation>>>,
     cx: &fictionet::Cx,
     mut fact: SearchObs,

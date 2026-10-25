@@ -165,17 +165,21 @@ impl Default for Views {
     }
 }
 impl Views {
-    pub fn push(&mut self, mut observation: Observation) {
+    /// Adds `observation` to what the page shows; `false` when the page
+    /// shows nothing new.
+    pub fn push(&mut self, mut observation: Observation) -> bool {
+        // Each session is a new run: the page shows only its own.
+        if let SearchObs::RunStarted { started_at_ms } = observation.fact {
+            *self = Self::default();
+            self.view.started_at_ms = started_at_ms;
+        }
         let view = &mut self.view;
         view.at_ms = observation.at_ms;
-        if let SearchObs::RunStarted { started_at_ms } = observation.fact {
-            view.started_at_ms = started_at_ms;
-        }
         if self
             .boot
             .claims(view.started_at_ms + observation.at_ms, &observation.fact)
         {
-            return;
+            return false;
         }
         match &observation.fact {
             SearchObs::Resolved { name, address } => {
@@ -198,6 +202,7 @@ impl Views {
                 referrer,
                 title: _,
                 error: _,
+                uncollected: _,
                 edits,
                 preview,
             } => {
@@ -309,16 +314,21 @@ impl Views {
                 ..
             } => {
                 let host = host.to_ascii();
-                if !view
+                let new_connection = !view
                     .connections
                     .iter()
-                    .any(|connection| connection.host == host && connection.purpose == *purpose)
-                {
+                    .any(|connection| connection.host == host && connection.purpose == *purpose);
+                if new_connection {
                     view.connections.push(Connection {
                         host,
                         purpose: *purpose,
                         at_ms: observation.at_ms,
                     });
+                }
+                // The crawl's fetches are counted by its search; the run
+                // record keeps each one.
+                if *purpose == EgressPurpose::Crawl {
+                    return new_connection;
                 }
                 if let Some(previous) = view.egress.iter_mut().find(
                     |row| matches!(row.fact, SearchObs::Egress { attempt: id, .. } if id == *attempt),
@@ -330,6 +340,7 @@ impl Views {
             }
             SearchObs::Signin { .. } => view.signin = Some(observation.clone()),
             SearchObs::NoRoute { .. }
+            | SearchObs::Crawl { .. }
             | SearchObs::Certificate { .. }
             | SearchObs::Abandoned { .. }
             | SearchObs::RunStarted { .. } => {}
@@ -344,6 +355,13 @@ impl Views {
                 .find(|row| matches!(row.fact, SearchObs::ModelCall { call: id, .. } if id == call))
         {
             previous.fact = observation.fact;
+        } else if let SearchObs::Crawl { search, .. } = &observation.fact
+            && let Some(previous) = view.activity.iter_mut().find(
+                |row| matches!(&row.fact, SearchObs::Crawl { search: id, .. } if id == search),
+            )
+        {
+            // A crawl keeps its place in the feed as it grows.
+            previous.fact = observation.fact;
         } else if let SearchObs::Egress { attempt, .. } = observation.fact
             && let Some(previous) = view.activity.iter_mut().find(
                 |row| matches!(row.fact, SearchObs::Egress { attempt: id, .. } if id == attempt),
@@ -353,6 +371,7 @@ impl Views {
         } else {
             view.activity.push(observation);
         }
+        true
     }
     /// The workstation is ready: what happens from now on is shown.
     pub fn end_boot(&mut self) {
@@ -363,13 +382,6 @@ impl Views {
     }
     pub fn current(&self) -> View {
         self.view.clone()
-    }
-    fn restart(&mut self) {
-        self.view.sites.clear();
-        self.view.calls.clear();
-        self.view.activity.clear();
-        self.view.egress.clear();
-        self.previews.clear();
     }
 }
 fn site<'a>(sites: &'a mut Vec<Site>, host: &str, at_ms: u64) -> &'a mut Site {
@@ -392,14 +404,27 @@ fn site<'a>(sites: &'a mut Vec<Site>, host: &str, at_ms: u64) -> &'a mut Site {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct WorldState {
+    /// The mode of the session running or starting.
     pub source: Source,
+    pub session: Session,
     pub copied: Availability,
     pub live: Availability,
+    pub live_depth: Availability,
     pub edited: Availability,
     pub date: String,
     /// What Edited changes on real pages.
     pub scenario: Option<Scenario>,
     pub preview: bool,
+}
+/// Where the session is: each mode chosen starts a new one, with a
+/// workstation booted afresh.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Session {
+    /// The workstation is booting for the session.
+    Starting,
+    /// The workstation's terminal and screen are the session's.
+    Running,
 }
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -426,9 +451,13 @@ impl Availability {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum Command {
-    SetSource { source: Source },
-    SetScenario { scenario: String },
-    Restart,
+    /// Start a new session in this mode.
+    SetSource {
+        source: Source,
+    },
+    SetScenario {
+        scenario: String,
+    },
 }
 
 type Control = (Command, tokio::sync::oneshot::Sender<Result<(), String>>);
@@ -448,8 +477,11 @@ pub struct Page {
     /// The world, while it runs; the page must not keep it (and its
     /// observation stream) alive.
     pages: std::sync::Weak<Pages>,
-    /// The world's context once it runs, for copies the page asks for.
-    cx: Arc<std::sync::OnceLock<fictionet::Cx>>,
+    /// The running session's world, for copies the page asks for and
+    /// scenarios it sets.
+    cx: Arc<Mutex<Option<fictionet::Cx>>>,
+    /// Shows the session's workstation status on the page.
+    following: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 impl Page {
     /// The world's settings as the page shows them, as they change.
@@ -463,7 +495,7 @@ impl Page {
         let (observations, receive) = mpsc::unbounded_channel();
         pages.observe(observations);
         let (commands, control) = mpsc::unbounded_channel();
-        let world = world_state(&pages, preview);
+        let world = world_state(&pages, preview, pages.source(), Session::Starting);
         (
             Self {
                 views: Arc::new(Mutex::new(views)),
@@ -474,6 +506,7 @@ impl Page {
                 commands,
                 pages: Arc::downgrade(&pages),
                 cx: Arc::default(),
+                following: Arc::default(),
             },
             (receive, control),
         )
@@ -486,10 +519,66 @@ impl Page {
     }
     pub fn publish(&self, observation: Observation) {
         let mut views = self.views.lock().unwrap();
-        views.push(observation);
-        self.snapshots.send_replace(views.current());
+        if views.push(observation) {
+            self.snapshots.send_replace(views.current());
+        }
     }
-    /// Writes a separate, private record for this launch before publishing each fact.
+    /// Shows the world's settings again, for the session in `source`.
+    fn refresh(&self, pages: &Pages, source: Source, session: Session) {
+        let preview = self.world.borrow().preview;
+        self.world
+            .send_replace(world_state(pages, preview, source, session));
+    }
+    /// A session in `source` is starting: the previous workstation's
+    /// console and status leave the page.
+    pub fn begin_session(&self, pages: &Pages, source: Source) {
+        if let Some(following) = self.following.lock().unwrap().take() {
+            following.abort();
+        }
+        self.console.lock().unwrap().take();
+        self.cx.lock().unwrap().take();
+        self.host.send_modify(|status| {
+            status.state = fictionet_demo::kit::page::HostState::Booting;
+            status.addresses.clear();
+            status.screen = false;
+            status.terminal = false;
+        });
+        self.refresh(pages, source, Session::Starting);
+    }
+    /// The session's world runs in `cx`: the scenario's readiness reaches
+    /// the page as it changes.
+    pub fn attach_world(&self, cx: &fictionet::Cx, pages: Arc<Pages>) {
+        *self.cx.lock().unwrap() = Some(cx.clone());
+        if let Some(mut changes) = pages.scenario_changes() {
+            let page = self.clone();
+            cx.spawn(move |cx| async move {
+                while let Ok(Ok(())) = cx.race(None, changes.changed()).await {
+                    let (source, session) = {
+                        let world = page.world.borrow();
+                        (world.source, world.session)
+                    };
+                    page.refresh(&pages, source, session);
+                }
+                Ok(())
+            });
+        }
+    }
+    /// The session's workstation is ready for its terminal and screen.
+    pub fn attach_console(&self, pages: &Pages, console: fictionet_demo::kit::page::GuestConsole) {
+        let mut status = console.status.subscribe();
+        *self.console.lock().unwrap() = Some(Arc::new(console));
+        let destination = self.host.clone();
+        destination.send_replace(status.borrow().clone());
+        *self.following.lock().unwrap() = Some(tokio::spawn(async move {
+            while status.changed().await.is_ok() {
+                destination.send_replace(status.borrow().clone());
+            }
+        }));
+        let source = self.world.borrow().source;
+        self.refresh(pages, source, Session::Running);
+    }
+    /// Writes a separate, private record of each session, a run of its
+    /// own, before publishing each fact.
     pub async fn record(
         &self,
         mut observations: mpsc::UnboundedReceiver<Observation>,
@@ -498,15 +587,17 @@ impl Page {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
         std::fs::create_dir_all(directory)?;
-        let path = directory.join(format!("run-{}.jsonl", fictionet_demo::kit::random_uuid()));
-        let mut file = std::io::BufWriter::new(
-            std::fs::OpenOptions::new()
+        let open = || -> std::io::Result<_> {
+            let path = directory.join(format!("run-{}.jsonl", fictionet_demo::kit::random_uuid()));
+            let file = std::fs::OpenOptions::new()
                 .create_new(true)
                 .write(true)
                 .mode(0o600)
-                .open(&path)?,
-        );
-        println!("Run record: {}", path.display());
+                .open(&path)?;
+            println!("Run record: {}", path.display());
+            Ok(std::io::BufWriter::new(file))
+        };
+        let mut file = None;
         let mut started_at_ms = self.views.lock().unwrap().view.started_at_ms;
         while let Some(observation) = observations.recv().await {
             if let SearchObs::RunStarted {
@@ -514,7 +605,12 @@ impl Page {
             } = observation.fact
             {
                 started_at_ms = start;
+                file = None;
             }
+            let file = match &mut file {
+                Some(file) => file,
+                None => file.insert(open()?),
+            };
             #[derive(Serialize)]
             struct Entry<'a> {
                 timestamp: String,
@@ -528,7 +624,7 @@ impl Page {
             .format(&time::format_description::well_known::Rfc3339)
             .map_err(std::io::Error::other)?;
             serde_json::to_writer(
-                &mut file,
+                &mut *file,
                 &Entry {
                     timestamp,
                     observation: &observation,
@@ -540,63 +636,57 @@ impl Page {
         }
         Ok(())
     }
-    pub fn run_commands(
+    /// Answers the page's commands: a mode chosen goes to `sessions`,
+    /// which starts a session in it; a scenario applies to the running
+    /// session's world.
+    pub fn serve_commands(
         &self,
-        cx: &fictionet::Cx,
         pages: Arc<Pages>,
-        mut control: mpsc::UnboundedReceiver<(
-            Command,
-            tokio::sync::oneshot::Sender<Result<(), String>>,
-        )>,
+        mut control: mpsc::UnboundedReceiver<Control>,
+        sessions: watch::Sender<Source>,
     ) {
-        let _ = self.cx.set(cx.clone());
-        // The scenario's readiness reaches the page as it changes.
-        if let Some(mut changes) = pages.scenario_changes() {
-            let (page, pages) = (self.clone(), pages.clone());
-            cx.spawn(move |cx| async move {
-                while let Ok(Ok(())) = cx.race(None, changes.changed()).await {
-                    let preview = page.world.borrow().preview;
-                    page.world.send_replace(world_state(&pages, preview));
-                }
-                Ok(())
-            });
-        }
         let page = self.clone();
-        cx.spawn(move |cx| async move {
-            while let Ok(Some((command, reply))) = cx.race(None, control.recv()).await {
-                let restart = matches!(command, Command::Restart);
-                let expected_revision = pages.revision();
-                let command = match command {
-                    Command::SetSource { source } => web_world::pages::Command::SetSource {
-                        source,
-                        expected_revision,
+        tokio::spawn(async move {
+            while let Some((command, reply)) = control.recv().await {
+                let result = match command {
+                    Command::SetSource { source } => match pages.unavailable(source) {
+                        Some(message) => Err(message.to_owned()),
+                        None => {
+                            page.refresh(&pages, source, Session::Starting);
+                            sessions.send_replace(source);
+                            Ok(())
+                        }
                     },
-                    Command::SetScenario { scenario } => web_world::pages::Command::SetScenario {
-                        scenario,
-                        expected_revision,
-                    },
-                    Command::Restart => web_world::pages::Command::Restart { expected_revision },
+                    Command::SetScenario { scenario } => {
+                        let cx = page.cx.lock().unwrap().clone();
+                        match cx {
+                            None => Err("The workstation is starting; try again".into()),
+                            Some(cx) => pages
+                                .apply(
+                                    &cx,
+                                    web_world::pages::Command::SetScenario {
+                                        scenario,
+                                        expected_revision: pages.revision(),
+                                    },
+                                )
+                                .map(|_| {
+                                    let (source, session) = {
+                                        let world = page.world.borrow();
+                                        (world.source, world.session)
+                                    };
+                                    page.refresh(&pages, source, session);
+                                })
+                                .map_err(|error| match error {
+                                    web_world::pages::Rejected::Invalid { message } => message,
+                                    web_world::pages::Rejected::Stale { .. } => {
+                                        "The settings changed; try again".into()
+                                    }
+                                }),
+                        }
+                    }
                 };
-                let result = pages
-                    .apply(&cx, command)
-                    .map(|_| {
-                        if restart {
-                            let mut views = page.views.lock().unwrap();
-                            views.restart();
-                            page.snapshots.send_replace(views.current());
-                        }
-                        let preview = page.world.borrow().preview;
-                        page.world.send_replace(world_state(&pages, preview));
-                    })
-                    .map_err(|error| match error {
-                        web_world::pages::Rejected::Invalid { message } => message,
-                        web_world::pages::Rejected::Stale { .. } => {
-                            "The source changed; try again".into()
-                        }
-                    });
                 let _ = reply.send(result);
             }
-            Ok(())
         });
     }
     pub fn router(&self) -> Router {
@@ -818,12 +908,13 @@ async fn held(
         let (pages, source, url) = (pages.clone(), source.clone(), url.clone());
         tokio::task::spawn_blocking(move || pages.held_resource(&source, url.as_str()).is_some())
     };
+    let cx = page.cx.lock().unwrap().clone();
     if matches!(picture, Picture::Reading)
         && !holds.await.unwrap_or(false)
-        && let Some(cx) = page.cx.get()
+        && let Some(cx) = cx
     {
         pages
-            .copy_for_picture(cx, &source, &owner, url.as_str())
+            .copy_for_picture(&cx, &source, &owner, url.as_str())
             .await;
     }
     let held = tokio::task::spawn_blocking(move || {
@@ -949,11 +1040,19 @@ async fn open_console(
     };
     pieces::upgrade(upgrade, console, screen).await
 }
-fn world_state(pages: &Pages, preview: bool) -> WorldState {
+fn world_state(pages: &Pages, preview: bool, source: Source, session: Session) -> WorldState {
+    let live = Availability::new(pages.live_available(), UnavailableReason::NoSearchKey);
+    // A Copied session's day is the day its pages were copied.
+    let lag = pages
+        .copied_lag()
+        .filter(|_| source == Source::Copied)
+        .unwrap_or_default();
     WorldState {
-        source: pages.source(),
+        source,
+        session,
         copied: Availability::new(pages.has_copied(), UnavailableReason::NoCaptures),
-        live: Availability::new(pages.live_available(), UnavailableReason::NoSearchKey),
+        live,
+        live_depth: live,
         edited: if !pages.live_available() {
             Availability::Unavailable {
                 reason: UnavailableReason::NoSearchKey,
@@ -961,7 +1060,7 @@ fn world_state(pages: &Pages, preview: bool) -> WorldState {
         } else {
             Availability::new(pages.edited_available(), UnavailableReason::NoModelKey)
         },
-        date: pages.world_date(),
+        date: (time::OffsetDateTime::now_utc() - lag).date().to_string(),
         scenario: pages.scenario(),
         preview,
     }

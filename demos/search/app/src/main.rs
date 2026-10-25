@@ -8,7 +8,7 @@ use fictionet_extras::log::Log;
 use std::{path::PathBuf, sync::Arc, time::Instant};
 use web_world::{
     Addresses, Ca, World,
-    pages::{Pages, Seed},
+    pages::{Pages, Seed, Source},
 };
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -53,6 +53,14 @@ fn app_pages(
     Ok(pages)
 }
 
+/// How a session ended.
+enum Ended {
+    /// A mode was chosen: the next session runs in it.
+    Chosen,
+    /// The app is stopping.
+    Stopping,
+}
+
 #[tokio::main]
 async fn main() -> Result {
     let total = Instant::now();
@@ -85,84 +93,100 @@ async fn main() -> Result {
     let server = page::serve(page.router(), kit::PAGE_PORT).await?;
     let _access = kit::PageAccess::new(&server.url)?;
     let observe_page = page.clone();
-    let ready_page = page.clone();
-    let (world_day, copied_lag) = (page.world(), pages.copied_lag());
     let mut observation_task =
         tokio::spawn(async move { observe_page.record(observations, &output).await });
-    let log = Arc::new(Log::new(Box::new(std::io::sink()), &[], |s| s));
-    let world_log = log.clone();
-    let console_page = page.clone();
-    let downloads_for_boot = downloads.clone();
+    let (sessions, mut chosen) = tokio::sync::watch::channel(pages.source());
+    page.serve_commands(pages.clone(), commands, sessions);
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let boot = kit::boot(
-        "search",
-        vec![guest::guest(
-            claude_token.as_ref().map(|token| token.placeholder()),
-        )],
-        downloads_for_boot,
-        move |consoles| {
-            let console = consoles.into_iter().next().expect("one workstation");
-            *console_page.console.lock().unwrap() = Some(Arc::new(console.clone()));
-            let mut status = console.status.subscribe();
-            let destination = console_page.host.clone();
-            destination.send_replace(status.borrow().clone());
-            tokio::spawn(async move {
-                while status.changed().await.is_ok() {
-                    destination.send_replace(status.borrow().clone());
-                }
-            });
-        },
-        move |cx, mut run| async move {
-            let start = std::time::SystemTime::now();
-            // Copied mode sets the workstation's clock back to the day its
-            // pages were copied; certificates hold from then too.
-            let earliest = start - pages.copied_lag().unwrap_or_default();
-            let web = World {
-                ca: Arc::new(Ca::new(&cx, earliest, start)?),
-                addresses: Arc::new(Addresses::new(seed.fixed_addresses(), None)?),
-                pages: pages.clone(),
-                start,
-            };
-            run.trust("office", &web.ca.cert_pem())?;
-            page.run_commands(&cx, pages.clone(), commands);
-            let net = network::build(&web, &cx, world_log, claude_token)?
-                .route(kit::JUMP, kit::jump_prefix());
-            net.start(&cx, run.into_attachments())
-        },
-    );
-    let run = tokio::select! {
-        run = boot => run?,
-        _ = terminate.recv() => { server.shutdown().await; observation_task.abort(); return Ok(()); },
-        _ = interrupt.recv() => { server.shutdown().await; observation_task.abort(); return Ok(()); },
-        result = &mut observation_task => return Err(recording_error(result).into()),
-    };
-    guest::follow_world_day(run.guest(guest::HOST).ssh().clone(), world_day, copied_lag);
-    let mut readiness = Box::pin(run.app_ready(guest::HOST));
-    let mut ready = false;
-    let mut recording_ended = false;
+    // Each session boots a fresh workstation on its mode's clock, with a
+    // world that starts empty, and runs until another mode is chosen.
     let result = loop {
-        tokio::select! {
-            result = &mut readiness, if !ready => match result {
-                Ok(()) => { ready = true; ready_page.end_boot(); println!("The Search page stays open until Ctrl-C."); },
-                Err(error) => break Err(error),
+        let source = *chosen.borrow_and_update();
+        page.begin_session(&pages, source);
+        println!("Starting a {source:?} session");
+        let log = Arc::new(Log::new(Box::new(std::io::sink()), &[], |s| s));
+        let console_slot = Arc::new(std::sync::Mutex::new(None));
+        let console = console_slot.clone();
+        let (world_page, world_pages, world_log, world_token, world_seed) = (
+            page.clone(),
+            pages.clone(),
+            log.clone(),
+            claude_token.clone(),
+            seed.clone(),
+        );
+        let boot = kit::boot(
+            "search",
+            vec![guest::guest(
+                claude_token.as_ref().map(|token| token.placeholder()),
+            )],
+            downloads.clone(),
+            move |consoles| {
+                *console.lock().unwrap() = consoles.into_iter().next();
             },
-            result = &mut observation_task => { recording_ended = true; break Err(recording_error(result)); },
-            _ = interrupt.recv() => break Ok(()),
+            move |cx, mut run| async move {
+                let start = std::time::SystemTime::now();
+                // Copied mode sets the workstation's clock back to the day
+                // its pages were copied; certificates hold from then too.
+                let earliest = start - world_pages.copied_lag().unwrap_or_default();
+                world_pages
+                    .start_session(&cx, source)
+                    .map_err(|error| fictionet::Error::msg(format!("{error:?}")))?;
+                world_page.attach_world(&cx, world_pages.clone());
+                let web = World {
+                    ca: Arc::new(Ca::new(&cx, earliest, start)?),
+                    addresses: Arc::new(Addresses::new(world_seed.fixed_addresses(), None)?),
+                    pages: world_pages,
+                    start,
+                };
+                run.trust("office", &web.ca.cert_pem())?;
+                let net = network::build(&web, &cx, world_log, world_token)?
+                    .route(kit::JUMP, kit::jump_prefix());
+                net.start(&cx, run.into_attachments())
+            },
+        );
+        let run = tokio::select! {
+            run = boot => run?,
             _ = terminate.recv() => break Ok(()),
+            _ = interrupt.recv() => break Ok(()),
+            result = &mut observation_task => break Err(recording_error(result)),
+        };
+        // The terminal and screen open on the session's clock.
+        let ssh = run.guest(guest::HOST).ssh().clone();
+        if source == Source::Copied
+            && let Some(lag) = pages.copied_lag()
+        {
+            guest::set_clock_back(&ssh, lag).await;
+        }
+        if let Some(console) = console_slot.lock().unwrap().take() {
+            page.attach_console(&pages, console);
+        }
+        let mut readiness = Box::pin(run.app_ready(guest::HOST));
+        let mut ready = false;
+        let ended = loop {
+            tokio::select! {
+                result = &mut readiness, if !ready => match result {
+                    Ok(()) => { ready = true; page.end_boot(); println!("The Search page stays open until Ctrl-C."); },
+                    Err(error) => break Err(error),
+                },
+                Ok(()) = chosen.changed() => break Ok(Ended::Chosen),
+                result = &mut observation_task => break Err(recording_error(result)),
+                _ = interrupt.recv() => break Ok(Ended::Stopping),
+                _ = terminate.recv() => break Ok(Ended::Stopping),
+            }
+        };
+        drop(readiness);
+        let shutdown = run.shutdown().await.and_then(|()| log.finish());
+        match (ended, shutdown) {
+            (Ok(Ended::Chosen), Ok(())) => continue,
+            (Ok(Ended::Stopping), shutdown) => break shutdown,
+            (Err(error), _) | (Ok(Ended::Chosen), Err(error)) => break Err(error),
         }
     };
-    drop(readiness);
-    let shutdown = run.shutdown().await;
     server.shutdown().await;
-    if !recording_ended {
-        observation_task.await.map_err(std::io::Error::other)??;
-    }
-    let finish = log.finish();
+    observation_task.abort();
     println!("whole run: {} ms", total.elapsed().as_millis());
     result?;
-    shutdown?;
-    finish?;
     Ok(())
 }
 

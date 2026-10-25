@@ -1,5 +1,6 @@
-//! Host search and on-demand public page copies with their dependencies,
-//! retained for replay.
+//! Host search and public page copies with their dependencies, retained
+//! for replay: copied when a client asks for them (Live and Edited), or
+//! collected ahead of time by a crawl around each search (Live-Depth).
 
 use super::*;
 use fictionet_extras::{
@@ -8,7 +9,7 @@ use fictionet_extras::{
     warc::{self, Archive},
 };
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{MutexGuard, OnceLock};
 use tokio::sync::{oneshot, watch};
@@ -40,6 +41,20 @@ impl Drop for Lifetime {
     }
 }
 
+/// How a session reaches the real web.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Reach {
+    /// Live and Edited: any page a client asks for is copied when asked.
+    Asked,
+    /// Live-Depth: each search's results and their sites are crawled
+    /// [`DEPTH`] links deep ahead of time, and only what the crawl reached
+    /// exists.
+    Crawl,
+}
+
+/// How many links from a search result Live-Depth follows on its site.
+const DEPTH: u8 = 5;
+
 #[derive(Clone)]
 enum CaptureState {
     Pending,
@@ -48,21 +63,101 @@ enum CaptureState {
     Cancelled,
 }
 
+/// Why a copy of an address could not be served.
+pub(super) enum Unanswered {
+    /// Live-Depth's crawl did not reach it, so it was not fetched.
+    Uncollected,
+    /// The copy failed, or the session stopped, and why.
+    Failed(String),
+}
+
+impl From<String> for Unanswered {
+    fn from(error: String) -> Self {
+        Self::Failed(error)
+    }
+}
+
+impl From<&str> for Unanswered {
+    fn from(error: &str) -> Self {
+        Self::Failed(error.into())
+    }
+}
+
+/// Where a crawled page sits: the site of the search result the crawl
+/// started from, and how many links from that result it is.
+#[derive(Clone)]
+struct Navigation {
+    site: String,
+    depth: u8,
+}
+
+/// One address the crawl fetches.
+struct Job {
+    url: String,
+    resource: capture::Resource,
+    /// A page's place in the crawl; `None` for a file.
+    navigation: Option<Navigation>,
+    /// The page a file belongs to.
+    page: Option<url::Url>,
+    /// The search whose crawl reached it first.
+    search: Arc<str>,
+    /// Whether this job admitted the address; a job that follows a page
+    /// again from closer to a search result does not count it twice.
+    fresh: bool,
+    cx: Cx,
+}
+
+/// One host's crawl requests, fetched one at a time, as a polite crawler
+/// fetches from a site.
+#[derive(Default)]
+struct Queue {
+    jobs: VecDeque<Job>,
+    running: bool,
+}
+
+/// What one search's crawl collected so far.
+#[derive(Clone, Copy, Default)]
+struct Tally {
+    pages: u64,
+    files: u64,
+    failed: u64,
+    waiting: u64,
+    deepest: u8,
+}
+
 #[derive(Default)]
 struct State {
     archive: Archive,
     lifetime: Arc<Lifetime>,
     epoch: usize,
     reached: HashMap<String, watch::Sender<CaptureState>>,
+    /// The session's world, which the crawl runs in.
+    cx: Option<Cx>,
+    /// Live-Depth: the fewest links from a search result each page was
+    /// reached at.
+    depths: HashMap<String, u8>,
+    /// Live-Depth: the hosts the crawl reached, which the world's DNS
+    /// answers for.
+    hosts: HashSet<String>,
+    /// Live-Depth: each host's crawl requests.
+    queues: HashMap<String, Queue>,
+    /// Live-Depth: what each search's crawl collected.
+    crawls: HashMap<Arc<str>, Tally>,
 }
+
+type Observations =
+    Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<crate::observation::Observation>>>>;
 
 pub(super) struct Live {
     key: Key,
     endpoint: url::Url,
     path: PathBuf,
+    reach: Reach,
     state: Mutex<State>,
     fetcher: Transport,
     observer: Mutex<Option<Arc<capture::Observer>>>,
+    /// Where the crawl's progress is reported.
+    observations: Observations,
 }
 
 impl Drop for Live {
@@ -72,23 +167,26 @@ impl Drop for Live {
 }
 
 impl Live {
-    fn new(root: &Path) -> Result<Arc<Self>, String> {
+    fn new(root: &Path, reach: Reach, observations: Observations) -> Result<Arc<Self>, String> {
         let key = Key::new("EXA_API_KEY", std::env::var("EXA_API_KEY").ok())?;
         std::fs::create_dir_all(root).map_err(|e| e.to_string())?;
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|e| e.to_string())?
             .as_nanos();
+        let name = match reach {
+            Reach::Asked => "live-search",
+            Reach::Crawl => "live-depth",
+        };
         Ok(Arc::new(Self {
             key,
             endpoint: url::Url::parse("https://api.exa.ai/search").unwrap(),
-            path: root.join(format!(
-                "live-search-{}-{stamp}.warc.gz",
-                std::process::id()
-            )),
+            path: root.join(format!("{name}-{}-{stamp}.warc.gz", std::process::id())),
+            reach,
             state: Mutex::default(),
             fetcher: Transport::new()?,
             observer: Mutex::default(),
+            observations,
         }))
     }
 
@@ -213,6 +311,334 @@ impl Live {
         Ok(response)
     }
 
+    /// Admits `job` to the crawl: an address no job reached yet, or a page
+    /// reached again closer to a search result, which is followed further
+    /// from there. Jobs `first` in line go before the host's others: a
+    /// search's results, a page's files and redirects, and what a client
+    /// is waiting for.
+    fn crawl(self: &Arc<Self>, lifetime: &Arc<Lifetime>, mut job: Job, first: bool) {
+        let Some(url) = warc::key(&job.url) else {
+            return;
+        };
+        let Some(host) = url::Url::parse(&url)
+            .ok()
+            .and_then(|parsed| parsed.host_str().map(str::to_owned))
+        else {
+            return;
+        };
+        let mut state = self.state();
+        if lifetime.cancelled() || !Arc::ptr_eq(lifetime, &state.lifetime) {
+            return;
+        }
+        job.fresh = !state.reached.contains_key(&url);
+        if job.fresh {
+            state
+                .reached
+                .insert(url.clone(), watch::channel(CaptureState::Pending).0);
+            state.crawls.entry(job.search.clone()).or_default().waiting += 1;
+        } else {
+            let Some(navigation) = &job.navigation else {
+                return;
+            };
+            if state
+                .depths
+                .get(&url)
+                .is_some_and(|depth| *depth <= navigation.depth)
+            {
+                return;
+            }
+        }
+        if let Some(navigation) = &job.navigation {
+            state.depths.insert(url.clone(), navigation.depth);
+        }
+        job.url = url;
+        state.hosts.insert(host.clone());
+        self.enqueue(lifetime, &mut state, host, job, first);
+    }
+
+    /// Puts `job` in `host`'s line, starting the host's fetches if none
+    /// are running.
+    fn enqueue(
+        self: &Arc<Self>,
+        lifetime: &Arc<Lifetime>,
+        state: &mut State,
+        host: String,
+        job: Job,
+        first: bool,
+    ) {
+        let queue = state.queues.entry(host.clone()).or_default();
+        if first {
+            queue.jobs.push_front(job);
+        } else {
+            queue.jobs.push_back(job);
+        }
+        if !queue.running {
+            queue.running = true;
+            let (live, lifetime) = (self.clone(), lifetime.clone());
+            self.fetcher
+                .spawn(async move { live.work(lifetime, host).await });
+        }
+    }
+
+    /// Fetches `host`'s crawl requests in turn until none are left.
+    async fn work(self: Arc<Self>, lifetime: Arc<Lifetime>, host: String) {
+        loop {
+            let job = {
+                let mut state = self.state();
+                if lifetime.cancelled() || !Arc::ptr_eq(&lifetime, &state.lifetime) {
+                    return;
+                }
+                let queue = state.queues.entry(host.clone()).or_default();
+                let Some(job) = queue.jobs.pop_front() else {
+                    queue.running = false;
+                    return;
+                };
+                job
+            };
+            self.collect(&lifetime, job).await;
+        }
+    }
+
+    /// Fetches one crawl request and admits what it leads to: a redirect's
+    /// target, a page's files, a stylesheet's imports and fonts, and the
+    /// pages a page links to on its site, while they are fewer than
+    /// [`DEPTH`] links from the search result. They are admitted before
+    /// the address is ready, so the hosts a page's files live on resolve
+    /// by the time a client has the page.
+    async fn collect(self: &Arc<Self>, lifetime: &Arc<Lifetime>, job: Job) {
+        let cx = job.cx.clone();
+        let outcome = match self
+            .download(lifetime, &cx, &job.url, None, job.page.as_ref())
+            .await
+        {
+            Ok(response) => {
+                let (url, resource) = (job.url.clone(), job.resource);
+                let redirect = response.status.is_redirection();
+                let followed = redirect
+                    || resource == capture::Resource::Document
+                    || response
+                        .headers
+                        .get(http::header::CONTENT_TYPE)
+                        .is_some_and(|value| value.as_bytes().starts_with(b"text/css"));
+                let links = if followed {
+                    self.fetcher
+                        .process(&cx, lifetime, move || {
+                            capture::links(&url, &response).map_err(|error| error.to_string())
+                        })
+                        .await
+                } else {
+                    Ok(capture::Links::default())
+                };
+                match links {
+                    Ok(links) => {
+                        self.follow(lifetime, &job, redirect, links);
+                        CaptureState::Ready
+                    }
+                    Err(_) if lifetime.cancelled() || cx.is_cancelled() => CaptureState::Cancelled,
+                    Err(error) => {
+                        eprintln!("Live-Depth link discovery failed: {error}");
+                        CaptureState::Ready
+                    }
+                }
+            }
+            Err(_) if lifetime.cancelled() || cx.is_cancelled() => CaptureState::Cancelled,
+            Err(error) => CaptureState::Failed(error),
+        };
+        let mut state = self.state();
+        if !Arc::ptr_eq(lifetime, &state.lifetime) {
+            return;
+        }
+        if let Some(reached) = state.reached.get(&job.url) {
+            reached.send_replace(outcome.clone());
+        }
+        if !job.fresh {
+            return;
+        }
+        let tally = state.crawls.entry(job.search.clone()).or_default();
+        tally.waiting = tally.waiting.saturating_sub(1);
+        let page = job.resource == capture::Resource::Document;
+        match outcome {
+            CaptureState::Ready if page => tally.pages += 1,
+            CaptureState::Ready => tally.files += 1,
+            CaptureState::Failed(_) => tally.failed += 1,
+            CaptureState::Pending | CaptureState::Cancelled => return,
+        }
+        if let Some(navigation) = &job.navigation {
+            tally.deepest = tally.deepest.max(navigation.depth);
+        }
+        // Each page collected, and the end of the crawl, reach the page.
+        if page || tally.waiting == 0 {
+            let tally = *tally;
+            drop(state);
+            crate::observation::report(
+                &self.observations,
+                &cx,
+                crate::observation::SearchObs::Crawl {
+                    search: job.search.to_string(),
+                    pages: tally.pages,
+                    files: tally.files,
+                    failed: tally.failed,
+                    waiting: tally.waiting,
+                    depth: tally.deepest,
+                },
+            );
+        }
+    }
+
+    /// Admits what the crawl request `job` led to.
+    fn follow(
+        self: &Arc<Self>,
+        lifetime: &Arc<Lifetime>,
+        job: &Job,
+        redirect: bool,
+        links: capture::Links,
+    ) {
+        let next = |url: String, resource, navigation, page| Job {
+            url,
+            resource,
+            navigation,
+            page,
+            search: job.search.clone(),
+            fresh: true,
+            cx: job.cx.clone(),
+        };
+        if redirect {
+            // A search result that moved puts its crawl on the site it
+            // moved to; a page further in keeps the result's site.
+            for url in links.pages {
+                let navigation = job.navigation.as_ref().map(|navigation| Navigation {
+                    site: match navigation.depth {
+                        0 => site_of(&url).unwrap_or_else(|| navigation.site.clone()),
+                        _ => navigation.site.clone(),
+                    },
+                    depth: navigation.depth,
+                });
+                self.crawl(
+                    lifetime,
+                    next(url, job.resource, navigation, job.page.clone()),
+                    true,
+                );
+            }
+            return;
+        }
+        let owner = job.page.clone().or_else(|| url::Url::parse(&job.url).ok());
+        for url in links.assets.into_iter().rev() {
+            self.crawl(
+                lifetime,
+                next(url, capture::Resource::Requisite, None, owner.clone()),
+                true,
+            );
+        }
+        let Some(navigation) = &job.navigation else {
+            return;
+        };
+        // A page reached again closer to a search result is followed from
+        // there.
+        let depth = self
+            .state()
+            .depths
+            .get(&job.url)
+            .map_or(navigation.depth, |depth| (*depth).min(navigation.depth));
+        if depth >= DEPTH {
+            return;
+        }
+        for url in links.pages {
+            if site_of(&url).as_deref() == Some(navigation.site.as_str()) {
+                let navigation = Navigation {
+                    site: navigation.site.clone(),
+                    depth: depth + 1,
+                };
+                self.crawl(
+                    lifetime,
+                    next(url, capture::Resource::Document, Some(navigation), None),
+                    false,
+                );
+            }
+        }
+    }
+
+    /// Starts crawling each result of the search `query` on its site.
+    fn crawl_results(
+        self: &Arc<Self>,
+        lifetime: &Arc<Lifetime>,
+        cx: &Cx,
+        query: &str,
+        search: &search::Search,
+    ) {
+        let cx = self.state().cx.clone().unwrap_or_else(|| cx.clone());
+        let query: Arc<str> = Arc::from(query);
+        for result in search.results.iter().rev() {
+            let Some(site) = site_of(&result.url) else {
+                continue;
+            };
+            self.crawl(
+                lifetime,
+                Job {
+                    url: result.url.clone(),
+                    resource: capture::Resource::Document,
+                    navigation: Some(Navigation { site, depth: 0 }),
+                    page: None,
+                    search: query.clone(),
+                    fresh: true,
+                    cx: cx.clone(),
+                },
+                true,
+            );
+        }
+    }
+
+    /// The crawl's progress on `url` for a client asking for it, moved to
+    /// the front of its host's line; `None` when the crawl did not reach
+    /// it. A copy that failed is fetched again.
+    fn asked(
+        self: &Arc<Self>,
+        lifetime: &Arc<Lifetime>,
+        url: &str,
+    ) -> Option<watch::Receiver<CaptureState>> {
+        let mut state = self.state();
+        if lifetime.cancelled() || !Arc::ptr_eq(lifetime, &state.lifetime) {
+            return None;
+        }
+        let reached = state.reached.get(url)?.subscribe();
+        let failed = matches!(*reached.borrow(), CaptureState::Failed(_));
+        let host = url::Url::parse(url).ok()?.host_str()?.to_owned();
+        let state = &mut *state;
+        let queue = state.queues.entry(host.clone()).or_default();
+        if let Some(index) = queue.jobs.iter().position(|job| job.url == url) {
+            let job = queue.jobs.remove(index).expect("a queued job");
+            queue.jobs.push_front(job);
+        } else if failed {
+            let cx = state.cx.clone()?;
+            let depth = state.depths.get(url).copied();
+            let navigation = depth.and_then(|depth| {
+                Some(Navigation {
+                    site: site_of(url)?,
+                    depth,
+                })
+            });
+            state.reached.get(url)?.send_replace(CaptureState::Pending);
+            let job = Job {
+                url: url.to_owned(),
+                resource: match navigation {
+                    Some(_) => capture::Resource::Document,
+                    None => capture::Resource::Requisite,
+                },
+                navigation,
+                page: None,
+                search: Arc::from(""),
+                fresh: false,
+                cx,
+            };
+            self.enqueue(lifetime, state, host, job, true);
+        }
+        Some(reached)
+    }
+
+    /// Whether Live-Depth's crawl reached a page or file on `host`.
+    pub(super) fn reached_host(&self, host: &str) -> bool {
+        self.state().hosts.contains(host)
+    }
+
     async fn search(
         self: &Arc<Self>,
         cx: &Cx,
@@ -299,6 +725,11 @@ impl Live {
         if lifetime.cancelled() || !Arc::ptr_eq(lifetime, &self.state().lifetime) {
             return Err("Live session stopped".into());
         }
+        // The results are in line before the list is shown, so their
+        // hosts resolve when the client follows them.
+        if self.reach == Reach::Crawl {
+            self.crawl_results(lifetime, cx, query, &search);
+        }
         Ok(search)
     }
 
@@ -310,7 +741,8 @@ impl Live {
         }
     }
 
-    pub(super) fn revoke(&self, reset: bool) {
+    /// Stops this session's copies and crawl.
+    fn revoke(&self) {
         let mut state = self.state();
         state.lifetime.cancel();
         for (url, done) in &state.reached {
@@ -320,21 +752,19 @@ impl Live {
                 CaptureState::Cancelled
             });
         }
-        if reset {
-            state.lifetime = Arc::default();
-            let completed: std::collections::HashSet<_> =
-                state.archive.urls().map(str::to_owned).collect();
-            state.reached.retain(|url, _| completed.contains(url));
-        }
+        state.queues.clear();
     }
 
-    pub(super) fn restart(&self) {
-        self.revoke(false);
+    /// Starts a new session in the world `fcx`, forgetting everything the
+    /// previous one copied or crawled.
+    pub(super) fn restart(&self, fcx: &Cx) {
+        self.revoke();
         let mut state = self.state();
         let epoch = state.epoch + 1;
         let old_path = self.archive_path(state.epoch);
         *state = State {
             epoch,
+            cx: Some(fcx.clone()),
             ..State::default()
         };
         drop(state);
@@ -360,8 +790,10 @@ impl Live {
         self.state().archive.get(&warc::key(url)?).ok()?
     }
 
-    /// The copy of `url`, made now if it is not made yet: a document as
-    /// the client by `user_agent` gets it, or a file of `page`.
+    /// The copy of `url`. Live and Edited make it now if it is not made
+    /// yet: a document as the client by `user_agent` gets it, or a file
+    /// of `page`. Live-Depth answers only from what its crawl reached,
+    /// waiting for a copy still in line.
     pub(super) async fn response(
         self: &Arc<Self>,
         cx: &Cx,
@@ -369,17 +801,20 @@ impl Live {
         resource: capture::Resource,
         user_agent: Option<&http::HeaderValue>,
         page: Option<url::Url>,
-    ) -> Result<warc::Response, String> {
+    ) -> Result<warc::Response, Unanswered> {
         let url = warc::key(url).ok_or("Invalid Live URL")?;
         let lifetime = self.state().lifetime.clone();
-        let mut waiting = self.capture(
-            &lifetime,
-            cx,
-            url.clone(),
-            resource,
-            user_agent.cloned(),
-            page,
-        )?;
+        let mut waiting = match self.reach {
+            Reach::Asked => self.capture(
+                &lifetime,
+                cx,
+                url.clone(),
+                resource,
+                user_agent.cloned(),
+                page,
+            )?,
+            Reach::Crawl => self.asked(&lifetime, &url).ok_or(Unanswered::Uncollected)?,
+        };
         let ready = async {
             loop {
                 let state = waiting.borrow_and_update().clone();
@@ -399,12 +834,18 @@ impl Live {
         if !Arc::ptr_eq(&lifetime, &state.lifetime) {
             return Err("Live session stopped".into());
         }
-        state
+        Ok(state
             .archive
             .get(&url)
             .map_err(|error| error.to_string())?
-            .ok_or_else(|| "Live capture is unavailable".into())
+            .ok_or("Live capture is unavailable")?)
     }
+}
+
+/// The site an address is on, for staying on it: its host without `www.`.
+fn site_of(url: &str) -> Option<String> {
+    let url = url::Url::parse(url).ok()?;
+    Some(url.host_str()?.trim_start_matches("www.").to_owned())
 }
 
 fn parse_search(value: &Value, key: Option<&Key>) -> Result<search::Search, String> {
@@ -482,23 +923,62 @@ impl Fetcher {
 }
 
 impl Pages {
-    /// Observes every host request: Live copies and searches, and package files.
-    pub(crate) fn observe_live(&self, observer: Arc<capture::Observer>) {
+    /// Observes every host request: Live copies and searches and package
+    /// files with `observer`, Live-Depth's searches and crawl with `crawl`.
+    pub(crate) fn observe_live(
+        &self,
+        observer: Arc<capture::Observer>,
+        crawl: Arc<capture::Observer>,
+    ) {
         *self.fetcher.observer.lock().unwrap() = Some(observer.clone());
         if let Some(live) = &self.live {
             *live.observer.lock().unwrap() = Some(observer);
         }
+        if let Some(depth) = &self.depth {
+            *depth.observer.lock().unwrap() = Some(crawl);
+        }
     }
 
-    /// Configure and select host search from environment credentials.
+    /// Configure host search from environment credentials, for Live,
+    /// Live-Depth and Edited, and select Live.
     pub fn with_live_search(mut self, downloads: &Path) -> Result<Self, String> {
-        self.live = Some(Live::new(downloads)?);
+        self.live = Some(Live::new(
+            downloads,
+            Reach::Asked,
+            self.observation.clone(),
+        )?);
+        self.depth = Some(Live::new(
+            downloads,
+            Reach::Crawl,
+            self.observation.clone(),
+        )?);
         self.settings.get_mut().unwrap().source = Source::Live;
         Ok(self)
     }
 
-    /// Answers from a Live copy of `url`, with the scenario's edits in
-    /// Edited mode.
+    /// The real web the active source answers from: Live-Depth's crawl,
+    /// or the copies Live and Edited make when asked.
+    fn real_web(&self) -> &Arc<Live> {
+        match self.source() {
+            Source::LiveDepth => self.depth.as_ref(),
+            _ => self.live.as_ref(),
+        }
+        .expect("a Live source")
+    }
+
+    /// The copies a page served from `source` was drawn from.
+    pub(super) fn copies_of(&self, source: &crate::observation::PageSource) -> Option<&Arc<Live>> {
+        match source {
+            crate::observation::PageSource::Live | crate::observation::PageSource::Edited => {
+                self.live.as_ref()
+            }
+            crate::observation::PageSource::LiveDepth => self.depth.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// Answers from a copy of `url` made by the active real-web source,
+    /// with the scenario's edits in Edited mode.
     pub(super) async fn live_url(
         &self,
         cx: &Cx,
@@ -506,14 +986,15 @@ impl Pages {
         user_agent: Option<&http::HeaderValue>,
         page: Option<url::Url>,
     ) -> Response {
-        let live = self.live.as_ref().expect("a Live source");
-        match live
+        match self
+            .real_web()
             .response(cx, url, capture::Resource::Document, user_agent, page)
             .await
         {
             Ok(response) if self.source() == Source::Edited => self.edited(cx, url, response).await,
             Ok(response) => copied::replay(Ok(Some(response))),
-            Err(error) => Response::new(
+            Err(Unanswered::Uncollected) => Response::uncollected(),
+            Err(Unanswered::Failed(error)) => Response::new(
                 502,
                 "text/plain; charset=utf-8",
                 "Bad Gateway\n",
@@ -578,10 +1059,6 @@ impl Pages {
         start: u64,
         domains: &fictionet_extras::models::tools::Domains,
     ) -> Result<search::Search, String> {
-        self.live
-            .as_ref()
-            .expect("a Live source")
-            .search(cx, query, start, domains)
-            .await
+        self.real_web().search(cx, query, start, domains).await
     }
 }
