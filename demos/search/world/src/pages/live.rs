@@ -60,8 +60,27 @@ const DEPTH: u8 = 5;
 enum CaptureState {
     Pending,
     Ready,
+    /// The site answered with an error status. The copy answers only the
+    /// requests waiting for it: a later request asks the site again, as
+    /// a client that changed its request may now be answered.
+    Unsuccessful,
     Failed(String),
     Cancelled,
+}
+
+/// Live-Depth: what a host answers for an address it has no page at, the
+/// answer for an address on it the allowlist does not have.
+#[derive(Clone)]
+enum NotFound {
+    /// The host is being asked for [`State::missing`].
+    Asking,
+    /// The host's own answer for `path`.
+    Answer {
+        path: String,
+        response: warc::Response,
+    },
+    /// The host gave no 404 for it, or could not be asked.
+    Unknown,
 }
 
 /// Why a copy of an address could not be served.
@@ -109,6 +128,12 @@ struct State {
     /// Live-Depth: how many allowed addresses each host has, which the
     /// world's DNS answers for.
     hosts: HashMap<String, usize>,
+    /// Live-Depth: each host's answer for an address it has no page at.
+    not_found: HashMap<String, watch::Sender<NotFound>>,
+    /// Live-Depth: the one made-up path each host is asked for to learn
+    /// its 404, random for the session and the same for every host, so
+    /// nothing the guest asked for reaches a site.
+    missing: Option<String>,
 }
 
 type Observations =
@@ -174,7 +199,10 @@ impl Live {
             return Err("Live session stopped".into());
         }
         if let Some(reached) = state.reached.get(&url)
-            && !matches!(*reached.borrow(), CaptureState::Failed(_))
+            && !matches!(
+                *reached.borrow(),
+                CaptureState::Failed(_) | CaptureState::Unsuccessful
+            )
         {
             return Ok(reached.subscribe());
         }
@@ -198,6 +226,14 @@ impl Live {
                     return;
                 }
             };
+            let unsuccessful =
+                response.status.is_client_error() || response.status.is_server_error();
+            if live.reach == Reach::Allowlist
+                && resource == capture::Resource::Document
+                && response.status.is_success()
+            {
+                live.learn_not_found(&lifetime, &cx, &url);
+            }
             // Live-Depth allows what an allowed copy links to and uses
             // before the copy is ready, so its links resolve and answer by
             // the time the client has it.
@@ -207,7 +243,12 @@ impl Live {
                 match live
                     .fetcher
                     .process(&cx, &lifetime, move || {
-                        capture::links(&page_url, &copy).map_err(|error| error.to_string())
+                        let mut links =
+                            capture::links(&page_url, &copy).map_err(|error| error.to_string())?;
+                        if copy.status.is_success() && is_pdf(&copy) {
+                            links.pages.extend(pdf_links(&page_url, &copy.body));
+                        }
+                        Ok(links)
                     })
                     .await
                 {
@@ -251,7 +292,11 @@ impl Live {
                 }
                 Err(error) => eprintln!("Live dependency discovery failed: {error}"),
             }
-            send.send_replace(CaptureState::Ready);
+            send.send_replace(if unsuccessful {
+                CaptureState::Unsuccessful
+            } else {
+                CaptureState::Ready
+            });
         });
         Ok(receive)
     }
@@ -269,6 +314,7 @@ impl Live {
             .archive
             .get(url)
             .map_err(|error| error.to_string())?
+            && !(response.status.is_client_error() || response.status.is_server_error())
         {
             return Ok(response);
         }
@@ -323,6 +369,121 @@ impl Live {
         let links = state.allowed.len() as u64;
         drop(state);
         self.report_allowlist(cx, links);
+    }
+
+    /// Asks the host of `url`, a page Live-Depth copied, once a session
+    /// for its answer to an address it has no page at: the session's one
+    /// made-up path. It is asked as the page's own copy is made, so a
+    /// refusal later sends nothing and the host learns nothing new.
+    fn learn_not_found(self: &Arc<Self>, lifetime: &Arc<Lifetime>, cx: &Cx, url: &str) {
+        let Ok(page) = url::Url::parse(url) else {
+            return;
+        };
+        let Some(host) = page.host_str().map(str::to_owned) else {
+            return;
+        };
+        let mut state = self.state();
+        if state.not_found.contains_key(&host) {
+            return;
+        }
+        let path = state
+            .missing
+            .get_or_insert_with(|| format!("/{:016x}", cx.random_u64()))
+            .clone();
+        let found = watch::channel(NotFound::Asking).0;
+        state.not_found.insert(host, found.clone());
+        drop(state);
+        let mut missing = page.clone();
+        missing.set_path(&path);
+        missing.set_query(None);
+        missing.set_fragment(None);
+        let (live, lifetime, cx) = (self.clone(), lifetime.clone(), cx.clone());
+        self.fetcher.spawn(async move {
+            let observer = live.observer.lock().unwrap().clone();
+            let response = live
+                .fetcher
+                .request(
+                    &cx,
+                    &lifetime,
+                    observer,
+                    missing.as_str(),
+                    Ask::Copy {
+                        user_agent: None,
+                        page: Some(&page),
+                    },
+                )
+                .await;
+            found.send_replace(match response {
+                Ok(response) if response.status == http::StatusCode::NOT_FOUND => {
+                    NotFound::Answer { path, response }
+                }
+                _ => NotFound::Unknown,
+            });
+        });
+    }
+
+    /// What Live-Depth answers for `url`, an address it does not allow,
+    /// without fetching it: the host's own 404, as it answered the
+    /// session's made-up path, with the guest's address in place of that
+    /// path; or, before any page on the host was copied, a web server's
+    /// plain 404.
+    pub(super) async fn refusal(&self, cx: &Cx, url: &str) -> warc::Response {
+        let parsed = url::Url::parse(url).ok();
+        let host = parsed.as_ref().and_then(url::Url::host_str);
+        let asking = host.and_then(|host| {
+            self.state()
+                .not_found
+                .get(host)
+                .map(watch::Sender::subscribe)
+        });
+        let found = match asking {
+            Some(mut asking) => cx
+                .race(None, async move {
+                    asking
+                        .wait_for(|found| !matches!(found, NotFound::Asking))
+                        .await
+                        .map(|found| found.clone())
+                        .ok()
+                })
+                .await
+                .ok()
+                .flatten(),
+            None => None,
+        };
+        match (found, parsed) {
+            (Some(NotFound::Answer { path, mut response }), Some(parsed)) => {
+                let asked = &parsed[url::Position::BeforePath..url::Position::AfterQuery];
+                if let Ok(body) = std::str::from_utf8(&response.body)
+                    && body.contains(&path)
+                {
+                    response.body = body.replace(&path, &text::escape(asked)).into();
+                }
+                response
+                    .headers
+                    .insert(http::header::CONTENT_LENGTH, response.body.len().into());
+                response
+            }
+            _ => {
+                let body = "<html>\r\n<head><title>404 Not Found</title></head>\r\n<body>\r\n\
+                    <center><h1>404 Not Found</h1></center>\r\n<hr><center>nginx</center>\r\n\
+                    </body>\r\n</html>\r\n";
+                let mut headers = http::HeaderMap::new();
+                headers.insert(
+                    http::header::SERVER,
+                    http::HeaderValue::from_static("nginx"),
+                );
+                headers.insert(
+                    http::header::CONTENT_TYPE,
+                    http::HeaderValue::from_static("text/html"),
+                );
+                headers.insert(http::header::CONTENT_LENGTH, body.len().into());
+                warc::Response {
+                    status: http::StatusCode::NOT_FOUND,
+                    headers,
+                    body: body.into(),
+                }
+            }
+        }
     }
 
     /// Allows the results of a search at depth 0.
@@ -532,7 +693,7 @@ impl Live {
                 let state = waiting.borrow_and_update().clone();
                 match state {
                     CaptureState::Pending => {}
-                    CaptureState::Ready => return Ok(()),
+                    CaptureState::Ready | CaptureState::Unsuccessful => return Ok(()),
                     CaptureState::Failed(error) => return Err(error),
                     CaptureState::Cancelled => return Err("Live session stopped".into()),
                 }
@@ -594,6 +755,68 @@ impl State {
             }
         }
     }
+}
+
+fn is_pdf(response: &warc::Response) -> bool {
+    response
+        .headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .trim_start()
+                .to_ascii_lowercase()
+                .starts_with("application/pdf")
+        })
+}
+
+/// The web addresses a PDF links to, as a PDF viewer makes links of them:
+/// its link annotations, and the addresses written in its text. A
+/// malformed PDF can panic inside the parser; it has no links then.
+fn pdf_links(url: &str, body: &[u8]) -> Vec<String> {
+    use pdf_extract::{Document, Object};
+    static WRITTEN: OnceLock<regex::Regex> = OnceLock::new();
+    let Ok(base) = url::Url::parse(url) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    let annotations = std::panic::catch_unwind(|| {
+        let mut uris = Vec::new();
+        if let Ok(document) = Document::load_mem(body) {
+            for page in document.get_pages().into_values() {
+                for annotation in document.get_page_annotations(page).unwrap_or_default() {
+                    if let Ok(uri) = annotation
+                        .get_deref(b"A", &document)
+                        .and_then(Object::as_dict)
+                        .and_then(|action| action.get_deref(b"URI", &document))
+                        .and_then(Object::as_str)
+                    {
+                        uris.push(String::from_utf8_lossy(uri).into_owned());
+                    }
+                }
+            }
+        }
+        uris
+    });
+    found.extend(annotations.unwrap_or_default());
+    if let Ok(Ok(text)) = std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem(body)) {
+        let written =
+            WRITTEN.get_or_init(|| regex::Regex::new(r#"https?://[^\s<>"'()\[\]{}]+"#).unwrap());
+        found.extend(written.find_iter(&text).map(|address| {
+            address
+                .as_str()
+                .trim_end_matches(['.', ',', ';', ':', '!', '?'])
+                .to_owned()
+        }));
+    }
+    let mut seen = std::collections::HashSet::new();
+    found
+        .into_iter()
+        .filter_map(|address| base.join(address.trim()).ok())
+        .filter(|address| matches!(address.scheme(), "http" | "https"))
+        .filter_map(|address| warc::key(address.as_str()))
+        .filter(|address| seen.insert(address.clone()))
+        .collect()
 }
 
 fn parse_search(value: &Value, key: Option<&Key>) -> Result<search::Search, String> {
@@ -746,7 +969,13 @@ impl Pages {
         {
             Ok(response) if self.source() == Source::Edited => self.edited(cx, url, response).await,
             Ok(response) => copied::replay(Ok(Some(response))),
-            Err(Unanswered::Unlisted) => Response::unlisted(),
+            Err(Unanswered::Unlisted) => {
+                let refusal = self.real_web().refusal(cx, url).await;
+                Response {
+                    meta: Meta::Unlisted,
+                    ..copied::replay(Ok(Some(refusal)))
+                }
+            }
             Err(Unanswered::Failed(error)) => Response::new(
                 502,
                 "text/plain; charset=utf-8",

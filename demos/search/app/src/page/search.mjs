@@ -296,6 +296,27 @@ function pulses() {
 }
 
 const briefPath = (path) => path.split('?')[0];
+// A row shows its query, shortened, where the query tells it apart: on a
+// refused address, and on an address also asked for with another query.
+const briefQuery = (path) => { const query = path.slice(briefPath(path).length + 1); return query ? `?${query.length > 32 ? `${query.slice(0, 31)}…` : query}` : ''; };
+let queried = { activity: null, varied: new Set() };
+function queryVaries(fact) {
+  if (queried.activity !== shown.activity) {
+    const paths = new Map();
+    for (const { fact } of shown.activity) {
+      if (fact.kind !== 'request') continue;
+      const key = `${fact.host}${briefPath(fact.path)}`;
+      if (!paths.has(key)) paths.set(key, new Set());
+      paths.get(key).add(fact.path);
+    }
+    queried = { activity: shown.activity, varied: new Set([...paths].filter(([, set]) => set.size > 1).map(([key]) => key)) };
+  }
+  return queried.varied.has(`${fact.host}${briefPath(fact.path)}`);
+}
+const whereOf = (fact, query = queryVaries(fact)) => {
+  const path = briefPath(fact.path), shownQuery = query ? briefQuery(fact.path) : '';
+  return `${fact.host}${path === '/' && !shownQuery ? '' : path}${shownQuery}`;
+};
 // A file is known by its type; an address that only looks like a file's
 // (en.wikipedia.org/wiki/Node.js) is a page when the site sent a document.
 const DOCUMENT_TYPE = /^(text\/html|application\/xhtml\+xml|application\/pdf|(?:text|application)\/(?:[\w.+-]+\+)?(?:json|xml)|text\/plain)/;
@@ -332,8 +353,8 @@ function activityItem(row) {
   switch (fact.kind) {
     case 'request': {
       const url = urlOf(fact), hit = hitFor(url);
-      const where = `${fact.host}${briefPath(fact.path) === '/' ? '' : briefPath(fact.path)}`;
-      if (fact.unlisted) return { title: `Refused ${where}`, meta: `Not allowed · ${fact.status}`, target: `site:${fact.host}`, failed: true };
+      const where = whereOf(fact);
+      if (fact.unlisted) return { title: `Refused ${whereOf(fact, true)}`, meta: `Not allowed · ${fact.status}`, target: `site:${fact.host}`, failed: true };
       if (fact.status >= 400) {
         const outcome = [404, 410].includes(fact.status) ? 'not found' : [502, 503, 504].includes(fact.status) ? 'unreachable' : 'failed';
         return { title: `${outcome === 'unreachable' ? fact.host : where} ${outcome}`, meta: [fact.status, sourceName(fact.source), fact.error].filter(Boolean).join(' · '), target: `site:${fact.host}`, failed: true };
@@ -348,7 +369,7 @@ function activityItem(row) {
     case 'search': return { title: `Searched “${fact.query}”`, meta: [fact.results.length ? [quantity(fact.results.length, 'result'), hitHosts(fact.results)].join(' · ') : 'No results', sourceName(fact.source), changes(fact.edits)].filter(Boolean).join(' · '), target: 'search', edits: fact.edits };
     case 'tool': return { title: `${fact.tool === 'fetch' ? 'Fetched' : 'Searched'} ${fact.tool === 'fetch' ? fact.target : `“${fact.target}”`}`, meta: [fact.error || (fact.tool === 'fetch' ? 'Answered by the world' : fact.results.length ? [quantity(fact.results.length, 'result'), hitHosts(fact.results)].join(' · ') : 'No results'), sourceName(fact.source), changes(fact.edits)].filter(Boolean).join(' · '), target: 'calls', edits: fact.edits };
     case 'abandoned': {
-      const where = `${fact.host}${briefPath(fact.path) === '/' ? '' : briefPath(fact.path)}`;
+      const where = whereOf(fact);
       return { title: `${where} timed out`, meta: `Agent stopped waiting after ${Math.round(fact.elapsed_ms / 1000)} s · ${sourceName(fact.source)}`, target: `site:${fact.host}`, failed: true };
     }
     case 'no_route': return { title: `Tried ${fact.to}`, meta: 'No route', target: 'router' };
@@ -690,9 +711,10 @@ function details() {
     if (!body.childElementCount) body.append(element('p', 'No pages opened', 'detail-empty'));
   } else {
     heading('Workstation', hostStatus?.addresses.join(' · ') || '10.0.0.2');
-    // What the workstation did, in order: the pages it opened, its
-    // lookups, searches and model calls, and what failed or was refused.
-    for (const row of activityRows()) {
+    // What the workstation did, newest first as in the feed: the pages it
+    // opened, its lookups, searches and model calls, and what failed or
+    // was refused.
+    for (const row of activityRows().reverse()) {
       const fact = row.fact;
       let shownRow = null;
       if (fact.kind === 'request' && !isSubresource(fact) || ['search', 'tool', 'abandoned', 'no_route', 'certificate'].includes(fact.kind)) {

@@ -152,15 +152,6 @@ impl Response {
             Meta::Missing,
         )
     }
-
-    /// What a site with no page at an address answers: Live-Depth's
-    /// answer for an address it does not allow.
-    fn unlisted() -> Self {
-        Self {
-            meta: Meta::Unlisted,
-            ..Self::not_found()
-        }
-    }
 }
 
 /// The source in use and its revision, which every accepted command advances.
