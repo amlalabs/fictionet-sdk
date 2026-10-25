@@ -134,14 +134,17 @@ impl Live {
                     return;
                 }
             };
-            // A copied page brings what a still picture of it shows: its
-            // stylesheets, CSS imports, fonts and images, including those of
+            // A copied page brings what lays a still picture of it out: its
+            // stylesheets, CSS imports, fonts and icons, including those of
             // pages already in the archive, so the host's picture of the page
-            // is drawn from what the world holds. Scripts, preloads and an
-            // image's other sizes come only when a client asks for them. They
-            // all belong to the page the client asked for. They are under way
-            // before the page is ready, so whatever shows the page can wait
-            // for them (see `settled`).
+            // is drawn from what the world holds. Its images come as the
+            // picture or a client asks for them, the way a browser loads
+            // them as they come into view, so a page with hundreds of images
+            // does not send hundreds of requests to its site at once.
+            // Scripts, preloads and an image's other sizes come only when a
+            // client asks for them. They all belong to the page the client
+            // asked for. They are under way before the page is ready, so
+            // whatever shows the page can wait for them (see `settled`).
             let owner = page.or_else(|| url::Url::parse(&url).ok());
             let page_url = url.clone();
             let links = live
@@ -357,10 +360,13 @@ impl Live {
         self.state().archive.get(&warc::key(url)?).ok()?
     }
 
-    async fn response(
+    /// The copy of `url`, made now if it is not made yet: a document as
+    /// the client by `user_agent` gets it, or a file of `page`.
+    pub(super) async fn response(
         self: &Arc<Self>,
         cx: &Cx,
         url: &str,
+        resource: capture::Resource,
         user_agent: Option<&http::HeaderValue>,
         page: Option<url::Url>,
     ) -> Result<warc::Response, String> {
@@ -370,7 +376,7 @@ impl Live {
             &lifetime,
             cx,
             url.clone(),
-            capture::Resource::Document,
+            resource,
             user_agent.cloned(),
             page,
         )?;
@@ -501,7 +507,10 @@ impl Pages {
         page: Option<url::Url>,
     ) -> Response {
         let live = self.live.as_ref().expect("a Live source");
-        match live.response(cx, url, user_agent, page).await {
+        match live
+            .response(cx, url, capture::Resource::Document, user_agent, page)
+            .await
+        {
             Ok(response) if self.source() == Source::Edited => self.edited(cx, url, response).await,
             Ok(response) => copied::replay(Ok(Some(response))),
             Err(error) => Response::new(
@@ -514,24 +523,24 @@ impl Pages {
         }
     }
 
-    /// The real page `response` with the scenario's edits. Pages that are
-    /// not HTML, not found, or not touched by the scenario are served as
-    /// the site sent them.
+    /// The real document `response` with the scenario's edits: a page,
+    /// JSON data, a text file or XML. Other files, documents not found and
+    /// documents the scenario does not touch are served as the site sent
+    /// them.
     async fn edited(&self, cx: &Cx, url: &str, response: warc::Response) -> Response {
-        let html = response.status == http::StatusCode::OK
-            && response
-                .headers
-                .get(http::header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .is_some_and(|value| value.to_ascii_lowercase().starts_with("text/html"));
+        let format = response
+            .headers
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(edit::Format::of)
+            .filter(|_| response.status == http::StatusCode::OK);
         let editor = self.editor.as_ref().expect("Edited has an editor");
-        let Some(text) = html
-            .then(|| std::str::from_utf8(&response.body).ok())
-            .flatten()
+        let Some((format, text)) =
+            format.and_then(|format| Some((format, std::str::from_utf8(&response.body).ok()?)))
         else {
             return copied::replay(Ok(Some(response)));
         };
-        let revision = match editor.page(cx, url, text).await {
+        let revision = match editor.page(cx, url, text, format).await {
             Ok(Some(revision)) => revision,
             Ok(None) => return copied::replay(Ok(Some(response))),
             Err(error) => {

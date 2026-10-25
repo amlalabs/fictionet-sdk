@@ -5801,6 +5801,7 @@ dependencies = [
  "toml",
  "tower-service",
  "ttf-parser",
+ "unicode-normalization",
  "url",
  "webpki-roots",
  "zim",

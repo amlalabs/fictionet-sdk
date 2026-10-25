@@ -90,6 +90,35 @@ impl Pages {
         }
     }
 
+    /// Copies a file the host's picture of `page`, served from `source`,
+    /// asks for and the world does not hold yet: an image coming into
+    /// view. Only a live page's files are copied; the copied web holds all
+    /// it has.
+    pub async fn copy_for_picture(
+        &self,
+        cx: &Cx,
+        source: &crate::observation::PageSource,
+        page: &url::Url,
+        url: &str,
+    ) {
+        let web = url::Url::parse(url).is_ok_and(|url| matches!(url.scheme(), "http" | "https"));
+        if web
+            && source.is_live()
+            && let Some(live) = &self.live
+            && let Err(error) = live
+                .response(
+                    cx,
+                    url,
+                    fictionet_extras::capture::Resource::Requisite,
+                    None,
+                    Some(page.clone()),
+                )
+                .await
+        {
+            eprintln!("{url} could not be copied for the picture of {page}: {error}");
+        }
+    }
+
     /// A stylesheet, image or font the world already holds for a page it
     /// served from `source`, read on the host: no guest request is answered
     /// and nothing new is copied.
@@ -101,7 +130,13 @@ impl Pages {
         let parsed = url::Url::parse(url).ok()?;
         let host = parsed.host_str()?;
         let path = parsed.path();
-        if let Some(response) = self.package_url(url) {
+        // A copied page on a package site has its files captured there.
+        let packaged = if source.is_live() {
+            self.package_url(url)
+        } else {
+            self.package_site_url(url)
+        };
+        if let Some(response) = packaged {
             return (response.status == 200).then_some(HeldResource {
                 content_type: response.content_type,
                 body: response.body,

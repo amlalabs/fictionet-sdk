@@ -1,22 +1,28 @@
 //! Edited pages: the real page with the changes a scenario calls for.
 //!
 //! The operator sets a scenario, a short instruction such as "The Fed
-//! raised rates by 0.5 points on Oct 22". When it is set, a model writes
-//! the account every edit follows: each fact the scenario changes, what
-//! follows from it, what stays, and the names that mark a page as being
-//! about it. Every page and result list starts as the real one. A page
-//! that names none of those subjects is served without a model call. A
-//! page that does is read in parts, all at once, and the model returns
-//! only edits for each part: an exact passage and its replacement. The
-//! world makes them in the real bytes and serves the rest unchanged.
+//! raised rates by 0.5 points on Oct 22". When it is set, a model names
+//! the scenario's subjects, the names that mark a document as being about
+//! it, and writes the account every edit follows: each fact the scenario
+//! changes, what follows from it, what stays, and the facts the changes
+//! must not contradict. Every page, data file and result list starts as
+//! the real one. One that names none of the subjects is served without a
+//! model call, and without waiting for the account. One that does is read
+//! in parts, all at once, and the model returns only edits for each part:
+//! an exact passage and its replacement. The world makes them in the real
+//! bytes and serves the rest unchanged.
 //!
-//! Each part is asked about once. Edits that cannot be made as written
-//! (a passage not in the text, or words a longer edit already changes)
-//! are left out, so an answer is never asked for again.
+//! Each part is asked about once, and each result title and snippet once
+//! per run, so the same text is edited the same way wherever it appears.
+//! Edits that cannot be made as written (a passage not in the text, or
+//! words a longer edit already changes) are left out, so an answer is
+//! never asked for again.
 
 mod document;
+mod literal;
 
 use super::model::{Care, Conversation, Model};
+pub(super) use document::Format;
 use document::{Document, Outcome, Scoped};
 use fictionet::Cx;
 use fictionet_extras::search;
@@ -25,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, watch};
 
 /// One change to a real page or result list: an exact passage of its text
 /// and what replaces it. Every occurrence of the passage is replaced.
@@ -33,6 +39,27 @@ use tokio::sync::OnceCell;
 pub struct Edit {
     pub passage: String,
     pub replacement: String,
+}
+
+/// The scenario Edited follows, and whether its account is written.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Scenario {
+    pub text: String,
+    pub readiness: Readiness,
+}
+
+/// How far the scenario's account is along. Until it is ready, documents
+/// that name the scenario's subjects wait for it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Readiness {
+    Preparing,
+    Ready,
+    /// The account could not be written; the next document that needs it
+    /// asks again.
+    Failed {
+        error: String,
+    },
 }
 
 /// A real page with its edits made.
@@ -54,6 +81,8 @@ pub(super) struct Editor {
     /// The world's day, which decides what a dated document can know.
     today: String,
     run: Mutex<Arc<Run>>,
+    /// The scenario and its readiness, as they change.
+    scenario: watch::Sender<Option<Scenario>>,
 }
 
 /// A page as edited; `None` when it is served as the site sent it.
@@ -63,6 +92,9 @@ type Edited = Option<Arc<Revision>>;
 #[derive(Default)]
 struct Run {
     scenario: Option<String>,
+    /// The names that mark a document as being about the scenario, asked
+    /// for first, so documents that name none need not wait for the account.
+    subjects: OnceCell<Arc<Subjects>>,
     /// The account of the scenario every edit follows.
     account: OnceCell<Arc<Account>>,
     /// What readers have seen of each address.
@@ -70,8 +102,10 @@ struct Run {
     /// Each page as edited, made once and kept for the run; `None` when it
     /// is served as the site sent it.
     pages: Mutex<HashMap<String, Arc<OnceCell<Edited>>>>,
-    /// Each result list's edits, made once and kept for the run.
-    lists: Mutex<HashMap<String, Arc<OnceCell<ListEdits>>>>,
+    /// The edits made to each result title, by its text.
+    titles: Mutex<HashMap<String, Arc<Vec<Edit>>>>,
+    /// The edits made to each result snippet, by its text.
+    snippets: Mutex<HashMap<String, Arc<OnceCell<Vec<Edit>>>>>,
 }
 
 /// What readers have been shown of one address this run.
@@ -91,8 +125,7 @@ struct Shown {
 struct Account {
     /// The account as each edit reads it.
     text: String,
-    /// The names whose presence means text may state a fact the scenario
-    /// changes.
+    /// The subjects the account names, with those named first.
     subjects: Subjects,
 }
 
@@ -102,7 +135,7 @@ struct Subjects(Option<Regex>);
 impl Subjects {
     fn new(names: &[String]) -> Result<Self, String> {
         let word = |character: Option<char>| character.is_some_and(|c| c.is_alphanumeric());
-        let alternatives: Vec<String> = names
+        let mut alternatives: Vec<String> = names
             .iter()
             .map(|name| name.trim())
             .filter(|name| !name.is_empty())
@@ -114,6 +147,8 @@ impl Subjects {
                 format!("{open}{spaced}{close}")
             })
             .collect();
+        alternatives.sort();
+        alternatives.dedup();
         if alternatives.is_empty() {
             return Ok(Self(None));
         }
@@ -129,10 +164,17 @@ impl Subjects {
     }
 }
 
+/// The model's subjects for a scenario.
+#[derive(Deserialize)]
+struct SubjectsAnswer {
+    subjects: Vec<String>,
+}
+
 /// The model's account of a scenario.
 #[derive(Deserialize)]
 struct AccountAnswer {
     changes: Vec<Change>,
+    conflicts: Vec<Conflict>,
     unchanged: Vec<String>,
     subjects: Vec<String>,
 }
@@ -143,6 +185,12 @@ struct Change {
     scenario: String,
 }
 
+#[derive(Deserialize)]
+struct Conflict {
+    fixed: String,
+    pages_say: String,
+}
+
 /// The model's answer for one part of a document: a note, which the
 /// schema asks for first so the edits follow from it, then the edits.
 /// Only the edits are read.
@@ -151,29 +199,49 @@ struct EditList {
     edits: Vec<Edit>,
 }
 
+/// How subjects are chosen, for both questions that name them.
+const SUBJECT_RULES: &str = "subjects: the names of what the scenario is about, so that any \
+page naming one may state a fact it changes: the event, competition, product, project, release, \
+document, building or identifier. Give the broader name as well as the narrow one (the \
+tournament as well as its final, the project as well as its release), in every spelling, \
+abbreviation and language pages use. Never list a country, place, person, team, company, \
+common word or number on its own, since unrelated pages name those too.";
+
+const SUBJECTS: &str = "A scenario changes facts on real web pages. Before anything else, the \
+world needs to know which pages may be about it. List the scenario's subjects.";
+
 const ACCOUNT: &str = "A scenario changes facts on real web pages. Many editors will each edit \
-one part of one page at the same time, and every page must agree with every other. Write the \
-one account they all follow.
+one part of one page at the same time, and every page must agree with every other and with \
+history that the scenario leaves alone. Write the one account they all follow.
 
 - changes: every fact real pages state that the scenario changes. For each, what real pages say \
 and what pages say in the scenario, in full: exact figures, versions, names, dates and \
 outcomes. Work through what follows from the scenario and include that too: totals, counts, \
 tallies, records, rankings, awards, descriptions and headings that must change for pages to \
-agree, and events that no longer happened, with what pages say instead. Work out every number \
-exactly.
+agree; events that no longer happened, with what pages say instead; and what readers are told \
+to do (steps, sign-ups, eligibility, prices, instructions) that no longer applies or now \
+applies, with what pages say instead. Work out every number exactly. Change only what the \
+scenario states or strictly requires.
+- conflicts: true facts the changes collide with, which stay true. Moving a date or changing a \
+fact can make other statements impossible: a person who no longer held an office or role at \
+the new date, a building, work or event dated before the new date that copied, followed, \
+answered or competed with the subject, an anniversary or record counted from the old date, an \
+event that no longer includes the subject. Those other facts never move. For each, give the \
+fixed fact and how pages put it so that both stay true: name who held an office at the new \
+date only when certain, and otherwise leave the name out; say what an earlier structure is \
+without calling it a copy; take the subject out of an event it is no longer part of. Leave out \
+anything you are not sure of.
 - unchanged: facts close to the scenario that stay as they are, so no editor changes them.
-- subjects: the names of what the scenario is about, so that any page naming one may state a \
-fact it changes: the event, competition, product, project, release, document or identifier. \
-Give the broader name as well as the narrow one (the tournament as well as its final, the \
-project as well as its release), in every spelling, abbreviation and language pages use. Never \
-list a country, place, person, team, company, common word or number on its own, since \
-unrelated pages name those too.
+- ";
+
+const TIMING: &str = "
 
 The scenario is how things are and always were, unless it says something happened on a date. \
 Then pages published before that date do not know of it, and changes says so. Keep the account \
 possible in time: when the scenario needs something to exist or have happened by a date (a \
-release, an event, a person in a role), move every real date that would contradict it, and list \
-each moved date in changes.";
+release, an event, a person in a role), move every real date of the subject that would \
+contradict it, list each moved date in changes, and list in conflicts what the move collides \
+with.";
 
 const EDITS: &str = "You edit one part of a real web document so it reads as it would if a \
 scenario were true. You get today's date, the scenario, the account every editor follows, what \
@@ -183,29 +251,49 @@ it.
 First write a note of one or two sentences: what the document is and which statements in \
 PASSAGES the scenario changes. Then list the edits.
 
-- PASSAGES are the page's text in reading order, one line per block. Change every statement \
-that disagrees with the account, wherever it is: titles, headings, contents entries, \
+- PASSAGES are the document's text in reading order, one line per block. Change every \
+statement that disagrees with the account, wherever it is: titles, headings, contents entries, \
 summaries, infobox and table cells, captions, lists, quotes, references and link text, in any \
 language. Short forms count: a score, a version range or a label in a table states a fact as \
-much as a sentence does.
+much as a sentence does. Ranges count too: when the account moves where a range ends (affected \
+versions, a period of validity), change every statement of that end however it is written \
+(`< 2.0`, `up to 1.9.3`, `before 2.0`, `until 2019`).
+- Some lines are values from data in the document (JSON, or the data in a page's scripts), \
+each after the names of the keys that hold it and a colon, like `events.fixed: 70.0.0`. The \
+names say what the value is. Edit only the value; a passage may start with the names to tell \
+equal values apart. An edit changes one value and stays on its line: values cannot be added or \
+removed.
 - Change nothing the account does not change. Every other fact, figure, name and word stays. A \
 figure beside a changed one is often a different fact (a half-time score, an earlier version, \
 another date): leave it unless the account changes that very figure.
-- When the account says an event no longer happened, rewrite or remove every line about it: \
-its heading and contents entry (renamed for what happened instead), captions, and short \
-lists of who took part in it. Nothing may still say or show it happened.
+- When a change would make another statement in PASSAGES false or impossible (an earlier \
+event, building or work tied to the old fact, a person acting in a role at the new date), \
+rewrite that statement so it stays true, as the account's conflicts say, together with the \
+sentences around it that make the same claim (an introduction that names it as an example of \
+the subject's influence, say). Never write a sentence in which something happens before what \
+it depends on, or a person acts in a role they did not hold then.
+- A date that is not the subject's own (another work, person or event) stays as it is unless \
+the account changes it or it now comes before something it depends on. Never shift such a \
+date to keep its distance from a changed one.
+- When the account says an event no longer happened, or the subject is no longer part of an \
+event, rewrite or remove every line about it: its heading and contents entry (renamed for what \
+happened instead), captions, and short lists of who took part in it. Never give it a new date \
+on that event's page. Nothing may still say or show it happened.
+- When the account says a step, sign-up, requirement or instruction no longer applies, rewrite \
+or remove every passage that tells readers to do it, so none is left beside its replacement.
 - Keep every number that depends on a changed fact right: sums, differences, counts, unit \
 conversions, ages and ranks. Check the arithmetic before you write it.
 - Keep the document consistent with what readers were already shown.
 
 Each edit is an exact passage copied character for character from PASSAGES and its \
-replacement. Every place the passage appears in PASSAGES is replaced, so use a passage long \
-enough to appear only where the change belongs, and never two edits for the same words. Write \
+replacement. Write characters as they appear, never as escapes such as \\u2013 or &ndash;. \
+Every place the passage appears in PASSAGES is replaced, so use a passage long enough to \
+appear only where the change belongs, and never two edits for the same words. Write \
 replacements in the document's own words, style, language and format. Never add notes, \
 disclaimers or remarks about editing. Return no edits when PASSAGES agree with the account.";
 
 /// What a result list's titles are, added to their question.
-const TITLES: &str = "PASSAGES are the titles of a search engine's results, one per line, in \
+const TITLES: &str = "PASSAGES are titles of a search engine's results, one per line, in \
 any language. Readers see each title on its own, so edit every title that states a fact the \
 account changes.";
 
@@ -213,12 +301,19 @@ account changes.";
 const SNIPPETS: &str = "PASSAGES are one search result's snippet, after the address it comes \
 from. Copy each passage from the snippet, never from the address.";
 
+fn schema_subjects() -> Value {
+    json!({"type":"object","properties":{
+        "subjects":{"type":"array","items":{"type":"string"}}
+    },"required":["subjects"],"additionalProperties":false})
+}
+
 fn schema_account() -> Value {
     json!({"type":"object","properties":{
         "changes":{"type":"array","items":{"type":"object","properties":{"real":{"type":"string"},"scenario":{"type":"string"}},"required":["real","scenario"],"additionalProperties":false}},
+        "conflicts":{"type":"array","items":{"type":"object","properties":{"fixed":{"type":"string"},"pages_say":{"type":"string"}},"required":["fixed","pages_say"],"additionalProperties":false}},
         "unchanged":{"type":"array","items":{"type":"string"}},
         "subjects":{"type":"array","items":{"type":"string"}}
-    },"required":["changes","unchanged","subjects"],"additionalProperties":false})
+    },"required":["changes","conflicts","unchanged","subjects"],"additionalProperties":false})
 }
 
 fn schema_edits() -> Value {
@@ -232,6 +327,7 @@ impl Editor {
             model,
             today,
             run: Mutex::default(),
+            scenario: watch::channel(None).0,
         }
     }
 
@@ -239,26 +335,58 @@ impl Editor {
         self.run.lock().unwrap().clone()
     }
 
-    /// The scenario edits follow, if any.
-    pub(super) fn scenario(&self) -> Option<String> {
-        self.run().scenario.clone()
+    /// Whether `run` is the one in force.
+    fn current(&self, run: &Run) -> bool {
+        std::ptr::eq(Arc::as_ptr(&self.run()), run)
     }
 
-    /// Follows `scenario` from now on, with no edits made yet. Its account
-    /// is written at once, in `fcx`, so the first page that needs it does
-    /// not wait for all of it.
+    /// The scenario edits follow, if any, and its readiness.
+    pub(super) fn scenario(&self) -> Option<Scenario> {
+        self.scenario.borrow().clone()
+    }
+
+    /// The scenario and its readiness, as they change.
+    pub(super) fn changes(&self) -> watch::Receiver<Option<Scenario>> {
+        self.scenario.subscribe()
+    }
+
+    fn ready(&self, run: &Run, readiness: Readiness) {
+        if self.current(run) {
+            self.scenario.send_if_modified(|scenario| match scenario {
+                Some(scenario) if scenario.readiness != readiness => {
+                    scenario.readiness = readiness;
+                    true
+                }
+                _ => false,
+            });
+        }
+    }
+
+    /// Follows `scenario` from now on, with no edits made yet. Its
+    /// subjects and account are asked for at once, in `fcx`, so the first
+    /// document that needs them does not wait for all of it.
     pub(super) fn set_scenario(self: &Arc<Self>, fcx: &Cx, scenario: Option<String>) {
         let run = Arc::new(Run {
-            scenario,
+            scenario: scenario.clone(),
             ..Run::default()
         });
         *self.run.lock().unwrap() = run.clone();
+        self.scenario.send_replace(scenario.map(|text| Scenario {
+            text,
+            readiness: Readiness::Preparing,
+        }));
         let editor = self.clone();
         fcx.spawn(move |cx| async move {
-            if let Some(scenario) = &run.scenario
-                && let Err(error) = editor.account(&cx, &run, scenario).await
-            {
-                eprintln!("The scenario's account is not ready: {error}");
+            if let Some(scenario) = &run.scenario {
+                let (subjects, account) = futures_util::future::join(
+                    editor.subjects(&cx, &run, scenario),
+                    editor.account(&cx, &run, scenario),
+                )
+                .await;
+                if let Err(error) = subjects.and(account) {
+                    eprintln!("The scenario's account is not ready: {error}");
+                    editor.ready(&run, Readiness::Failed { error });
+                }
             }
             Ok(())
         });
@@ -266,22 +394,23 @@ impl Editor {
 
     /// Forgets the edits made, keeping the scenario.
     pub(super) fn restart(self: &Arc<Self>, fcx: &Cx) {
-        self.set_scenario(fcx, self.scenario());
+        self.set_scenario(fcx, self.run().scenario.clone());
     }
 
-    /// The page at `url`, whose real markup is `html`, with the edits the
-    /// scenario calls for. `None` when the page stays as it is.
+    /// The document at `url`, whose real text `source` is written in
+    /// `format`, with the edits the scenario calls for. `None` when it
+    /// stays as it is.
     pub(super) async fn page(
         &self,
         cx: &Cx,
         url: &str,
-        html: &str,
+        source: &str,
+        format: Format,
     ) -> Result<Option<Arc<Revision>>, String> {
         let run = self.run();
         let Some(scenario) = &run.scenario else {
             return Ok(None);
         };
-        let account = self.account(cx, &run, scenario).await?;
         let cell = run
             .pages
             .lock()
@@ -291,21 +420,23 @@ impl Editor {
             .clone();
         let revision = cell
             .get_or_try_init(|| async {
-                let document = Document::html(html);
+                let document = Document::new(source, format);
                 let listed_edited = run
                     .shown
                     .lock()
                     .unwrap()
                     .get(url)
                     .is_some_and(|shown| shown.listed_edited);
-                if !listed_edited && !account.subjects.named_in(document.text()) {
+                if !listed_edited && !self.about(cx, &run, scenario, document.text()).await? {
                     return Ok::<_, String>(None);
                 }
+                let account = self.account(cx, &run, scenario).await?;
                 let parts = document.sections(PART);
                 let count = parts.len();
                 let asks = parts.iter().enumerate().map(|(index, part)| {
                     let subject = Subject::Page {
                         url,
+                        format,
                         part: index + 1,
                         of: count,
                     };
@@ -328,10 +459,22 @@ impl Editor {
                 if made.is_empty() {
                     return Ok(None);
                 }
+                if format == Format::Json
+                    && serde_json::from_str::<serde::de::IgnoredAny>(&edited.served).is_err()
+                {
+                    eprintln!("{url}: the edited data is not valid JSON; it is served as it was");
+                    return Ok(None);
+                }
+                // Only an HTML page is shown with its changes marked.
+                let marked = if format == Format::Html {
+                    edited.marked
+                } else {
+                    edited.served.clone()
+                };
                 Ok(Some(Arc::new(Revision {
                     edits: made,
                     served: edited.served,
-                    marked: edited.marked,
+                    marked,
                 })))
             })
             .await?
@@ -346,7 +489,8 @@ impl Editor {
     }
 
     /// Makes the scenario's edits in the titles and snippets of `results`,
-    /// the list for `query`, and returns them.
+    /// the list for `query`, and returns them. Each title and snippet is
+    /// edited once per run and the same way in every list that shows it.
     pub(super) async fn results(
         &self,
         cx: &Cx,
@@ -357,9 +501,10 @@ impl Editor {
         let Some(scenario) = &run.scenario else {
             return Ok(Vec::new());
         };
-        let parts = Part::of(results);
-        let listing: String = parts.iter().map(|part| part.passages(results)).collect();
-        let account = self.account(cx, &run, scenario).await?;
+        let listing: String = Part::of(results)
+            .iter()
+            .map(|part| part.passages(results))
+            .collect();
         let opened_edited = {
             let shown = run.shown.lock().unwrap();
             results.iter().any(|result| {
@@ -369,62 +514,150 @@ impl Editor {
                     .is_some_and(|edits| !edits.is_empty())
             })
         };
-        let edits = if opened_edited || account.subjects.named_in(&listing) {
+        let account = if opened_edited || self.about(cx, &run, scenario, &listing).await? {
+            Some(self.account(cx, &run, scenario).await?)
+        } else {
+            None
+        };
+        // The results as the questions read them; they are edited after.
+        let rows: &[search::Result] = results;
+        let urls: Vec<&str> = rows.iter().map(|result| result.url.as_str()).collect();
+        // The titles not yet edited, together: a title asked about beside
+        // its snippet is easily left as it was. Each snippet on its own.
+        // All at once, since short questions are answered fast.
+        let titles = async {
+            let Some(account) = &account else {
+                return Ok::<_, String>(());
+            };
+            let mut unknown: Vec<String> = {
+                let known = run.titles.lock().unwrap();
+                rows.iter()
+                    .map(|result| result.title.trim().to_owned())
+                    .filter(|title| !title.is_empty() && !known.contains_key(title))
+                    .collect()
+            };
+            unknown.sort();
+            unknown.dedup();
+            if unknown.is_empty() {
+                return Ok(());
+            }
+            let subject = Subject::Results {
+                query,
+                urls: urls.clone(),
+                part: Part::Titles,
+            };
+            let passages: String = unknown.iter().map(|title| format!("{title}\n")).collect();
+            let question = self.question(&run, scenario, account, subject, &passages);
+            let answer = self.ask(cx, question).await?;
+            let mut known = run.titles.lock().unwrap();
+            let mut used = vec![false; answer.len()];
+            for title in unknown {
+                let made = made_in(&title, &answer);
+                for (used, edit) in used.iter_mut().zip(&answer) {
+                    *used |= made.contains(edit);
+                }
+                known.entry(title).or_insert_with(|| Arc::new(made));
+            }
+            for (edit, _) in answer.iter().zip(used).filter(|(_, used)| !used) {
+                eprintln!(
+                    "Results for {query:?}: title edit not made: {:?}",
+                    edit.passage
+                );
+            }
+            Ok(())
+        };
+        let snippets = rows.iter().enumerate().map(|(index, result)| {
             let cell = run
-                .lists
+                .snippets
                 .lock()
                 .unwrap()
-                .entry(listing.clone())
+                .entry(result.snippet.trim().to_owned())
                 .or_default()
                 .clone();
-            cell.get_or_try_init(|| async {
-                // The titles together, and each snippet on its own, all at
-                // once: a title asked about beside its snippet is easily left
-                // as it was, and short questions are answered fast.
-                let asks = parts.iter().map(|part| {
-                    let subject = Subject::Results {
-                        query,
-                        urls: results.iter().map(|result| result.url.as_str()).collect(),
-                        part: *part,
-                    };
-                    let passages = part.passages(results);
-                    let question = self.question(&run, scenario, &account, subject, &passages);
-                    self.ask(cx, question)
-                });
-                let answers = futures_util::future::try_join_all(asks).await?;
-                let mut edits = ListEdits::default();
-                for (part, answer) in parts.iter().zip(answers) {
-                    let made = part.apply(&mut results.to_vec(), &answer);
-                    let made: Vec<Edit> = answer
-                        .into_iter()
-                        .zip(made)
-                        .filter_map(|(edit, made)| made.then_some(edit))
-                        .collect();
-                    edits.0.push((*part, made));
-                }
-                Ok::<_, String>(edits)
-            })
-            .await?
-            .clone()
-        } else {
-            ListEdits::default()
+            let account = account.clone();
+            let urls = urls.clone();
+            let run = &run;
+            async move {
+                let Some(account) = account else {
+                    return Ok::<_, String>(cell.get().cloned().unwrap_or_default());
+                };
+                cell.get_or_try_init(|| async {
+                    let part = Part::Snippet(index);
+                    let subject = Subject::Results { query, urls, part };
+                    let passages = part.passages(rows);
+                    let question = self.question(run, scenario, &account, subject, &passages);
+                    let answer = self.ask(cx, question).await?;
+                    let made = made_in(result.snippet.trim(), &answer);
+                    for edit in answer.iter().filter(|edit| !made.contains(edit)) {
+                        eprintln!("{}: snippet edit not made: {:?}", result.url, edit.passage);
+                    }
+                    Ok(made)
+                })
+                .await
+                .cloned()
+            }
+        });
+        let ((), snippets) =
+            futures_util::future::try_join(titles, futures_util::future::try_join_all(snippets))
+                .await?;
+        let titles: Vec<Arc<Vec<Edit>>> = {
+            let known = run.titles.lock().unwrap();
+            results
+                .iter()
+                .map(|result| known.get(result.title.trim()).cloned().unwrap_or_default())
+                .collect()
         };
-        let before: Vec<(String, String)> = results
-            .iter()
-            .map(|result| (result.title.clone(), result.snippet.clone()))
-            .collect();
-        for (part, made) in &edits.0 {
-            part.apply(results, made);
-        }
-        for (result, (title, snippet)) in results.iter().zip(before) {
-            let edited = result.title != title || result.snippet != snippet;
+        let mut edits: Vec<Edit> = Vec::new();
+        for ((result, title), snippet) in results.iter_mut().zip(titles).zip(snippets) {
+            let before = (result.title.clone(), result.snippet.clone());
+            result.title = applied(&result.title, &title);
+            result.snippet = applied(&result.snippet, &snippet);
+            for edit in title.iter().chain(&snippet) {
+                if !edits.contains(edit) {
+                    edits.push(edit.clone());
+                }
+            }
+            let edited = (result.title.clone(), result.snippet.clone()) != before;
             run.shown_listed(
                 &result.url,
                 format!("{} — {}", result.title, result.snippet),
                 edited,
             );
         }
-        Ok(edits.0.into_iter().flat_map(|(_, made)| made).collect())
+        Ok(edits)
+    }
+
+    /// Whether `text` names the scenario's subjects. Only those asked for
+    /// first are waited for; those the account adds count once it is ready.
+    async fn about(&self, cx: &Cx, run: &Run, scenario: &str, text: &str) -> Result<bool, String> {
+        let subjects = self.subjects(cx, run, scenario).await?;
+        Ok(subjects.named_in(text)
+            || run
+                .account
+                .get()
+                .is_some_and(|account| account.subjects.named_in(text)))
+    }
+
+    async fn subjects(&self, cx: &Cx, run: &Run, scenario: &str) -> Result<Arc<Subjects>, String> {
+        run.subjects
+            .get_or_try_init(|| async {
+                let mut conversation =
+                    Conversation::new(format!("TODAY\n{}\n\nSCENARIO\n{scenario}", self.today));
+                let answer: SubjectsAnswer = self
+                    .model
+                    .json(
+                        cx,
+                        Care::Exact,
+                        &format!("{SUBJECTS}\n\n- {SUBJECT_RULES}"),
+                        &mut conversation,
+                        &schema_subjects(),
+                    )
+                    .await?;
+                eprintln!("Scenario subjects: {}", answer.subjects.join(", "));
+                Ok::<_, String>(Arc::new(Subjects::new(&answer.subjects)?))
+            })
+            .await
+            .cloned()
     }
 
     async fn account(&self, cx: &Cx, run: &Run, scenario: &str) -> Result<Arc<Account>, String> {
@@ -439,7 +672,7 @@ impl Editor {
                     .json(
                         cx,
                         Care::Careful,
-                        ACCOUNT,
+                        &format!("{ACCOUNT}{SUBJECT_RULES}{TIMING}"),
                         &mut conversation,
                         &schema_account(),
                     )
@@ -452,13 +685,26 @@ impl Editor {
                         change.scenario.trim()
                     ));
                 }
+                if !answer.conflicts.is_empty() {
+                    text.push_str("\nWHAT MUST STAY TRUE\n");
+                    for conflict in &answer.conflicts {
+                        text.push_str(&format!(
+                            "- Fixed: {}\n  Pages put it this way: {}\n",
+                            conflict.fixed.trim(),
+                            conflict.pages_say.trim()
+                        ));
+                    }
+                }
                 if !answer.unchanged.is_empty() {
                     text.push_str("\nWHAT STAYS AS IT IS\n");
                     for fact in &answer.unchanged {
                         text.push_str(&format!("- {}\n", fact.trim()));
                     }
                 }
-                eprintln!("Scenario subjects: {}\n{text}", answer.subjects.join(", "));
+                eprintln!(
+                    "Scenario account, with subjects: {}\n{text}",
+                    answer.subjects.join(", ")
+                );
                 Ok::<_, String>(Arc::new(Account {
                     text,
                     subjects: Subjects::new(&answer.subjects)?,
@@ -466,6 +712,7 @@ impl Editor {
             })
             .await
             .cloned()
+            .inspect(|_| self.ready(run, Readiness::Ready))
     }
 
     /// The question for one document, or one part of it, with `passages`
@@ -483,15 +730,26 @@ impl Editor {
         let mut shown: Vec<String> = Vec::new();
         let seen = run.shown.lock().unwrap();
         let (document, note) = match subject {
-            Subject::Page { url, part, of } => {
+            Subject::Page {
+                url,
+                format,
+                part,
+                of,
+            } => {
                 // What readers saw of this page in result lists.
                 for row in seen.get(url).map_or(&[][..], |shown| &shown.listed) {
                     shown.push(format!("- a search result for this document read: {row}"));
                 }
+                let kind = match format {
+                    Format::Html | Format::Line => "",
+                    Format::Json => " (JSON data)",
+                    Format::Text => " (a text file)",
+                    Format::Xml => " (XML)",
+                };
                 let document = if of == 1 {
-                    url.to_owned()
+                    format!("{url}{kind}")
                 } else {
-                    format!("{url}, part {part} of {of}")
+                    format!("{url}{kind}, part {part} of {of}")
                 };
                 (document, "")
             }
@@ -586,7 +844,7 @@ fn made(url: &str, scoped: &[Scoped<'_>], outcomes: &[Outcome]) -> Vec<Edit> {
                 }
             }
             Outcome::Unchanged | Outcome::EmptyPassage => {}
-            Outcome::NotFound | Outcome::Covered => {
+            Outcome::NotFound | Outcome::Covered | Outcome::Lines => {
                 eprintln!(
                     "{url}: edit not made ({outcome:?}): {:?}",
                     scoped.edit.passage
@@ -595,6 +853,41 @@ fn made(url: &str, scoped: &[Scoped<'_>], outcomes: &[Outcome]) -> Vec<Edit> {
         }
     }
     made
+}
+
+/// The edits of `edits` that change the line `text`.
+fn made_in(text: &str, edits: &[Edit]) -> Vec<Edit> {
+    let document = Document::new(text, Format::Line);
+    let scoped: Vec<Scoped<'_>> = edits
+        .iter()
+        .map(|edit| Scoped {
+            edit,
+            within: 0..document.text().chars().count(),
+        })
+        .collect();
+    let outcomes = document.apply(&scoped).outcomes;
+    edits
+        .iter()
+        .zip(outcomes)
+        .filter(|(_, outcome)| *outcome == Outcome::Made)
+        .map(|(edit, _)| edit.clone())
+        .collect()
+}
+
+/// The line `text` with `edits` made.
+fn applied(text: &str, edits: &[Edit]) -> String {
+    if edits.is_empty() {
+        return text.to_owned();
+    }
+    let document = Document::new(text, Format::Line);
+    let scoped: Vec<Scoped<'_>> = edits
+        .iter()
+        .map(|edit| Scoped {
+            edit,
+            within: 0..document.text().chars().count(),
+        })
+        .collect();
+    document.apply(&scoped).served
 }
 
 /// Observes the editor's model calls, with the provider that answers.
@@ -617,6 +910,7 @@ impl super::Pages {
 enum Subject<'a> {
     Page {
         url: &'a str,
+        format: Format,
         part: usize,
         of: usize,
     },
@@ -627,8 +921,8 @@ enum Subject<'a> {
     },
 }
 
-/// A part of a result list the model reads on its own: every title, or
-/// one result's snippet.
+/// A part of a result list the model reads on its own: titles, or one
+/// result's snippet.
 #[derive(Clone, Copy)]
 enum Part {
     Titles,
@@ -662,38 +956,4 @@ impl Part {
             Self::Snippet(_) => SNIPPETS,
         }
     }
-
-    /// Makes `edits` in this part of `results`, and says which of them
-    /// were made somewhere.
-    fn apply(self, results: &mut [search::Result], edits: &[Edit]) -> Vec<bool> {
-        let texts: Vec<&mut String> = match self {
-            Self::Titles => results.iter_mut().map(|result| &mut result.title).collect(),
-            Self::Snippet(index) => results
-                .get_mut(index)
-                .map(|result| &mut result.snippet)
-                .into_iter()
-                .collect(),
-        };
-        let mut made = vec![false; edits.len()];
-        for text in texts {
-            let document = Document::plain(text);
-            let scoped: Vec<Scoped<'_>> = edits
-                .iter()
-                .map(|edit| Scoped {
-                    edit,
-                    within: 0..document.text().chars().count(),
-                })
-                .collect();
-            let edited = document.apply(&scoped);
-            for (made, outcome) in made.iter_mut().zip(&edited.outcomes) {
-                *made |= *outcome == Outcome::Made;
-            }
-            *text = edited.served;
-        }
-        made
-    }
 }
-
-/// A result list's edits, by the part they were made in.
-#[derive(Clone, Default)]
-struct ListEdits(Vec<(Part, Vec<Edit>)>);

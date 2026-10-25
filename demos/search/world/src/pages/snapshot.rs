@@ -35,7 +35,13 @@ pub fn page(url: &url::Url, html: &str, held: &dyn Fn(&url::Url) -> String) -> S
             node.as_node().detach();
         }
     }
-    let resolve = |value: &str| base.join(value.trim()).ok().map(|url| held(&url));
+    // A `data:` address carries its file and stays as it is.
+    let resolve = |value: &str| {
+        base.join(value.trim()).ok().map(|url| match url.scheme() {
+            "data" => url.to_string(),
+            _ => held(&url),
+        })
+    };
     for node in dom.select("*").unwrap() {
         let mut attributes = node.attributes.borrow_mut();
         let names: Vec<_> = attributes
@@ -77,6 +83,11 @@ pub fn page(url: &url::Url, html: &str, held: &dyn Fn(&url::Url) -> String) -> S
             && let Some(address) = resolve(&value)
         {
             attributes.insert("src", address);
+        }
+        // An image loads as it comes into view, so a picture of the top of
+        // a page asks only for the images there.
+        if element == "img" {
+            attributes.insert("loading", "lazy".into());
         }
         if let Some(style) = attributes.get("style").map(str::to_owned) {
             attributes.insert("style", stylesheet(&base, &style, held));

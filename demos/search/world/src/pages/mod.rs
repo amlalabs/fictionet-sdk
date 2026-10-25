@@ -17,7 +17,7 @@ mod tools;
 pub mod written;
 
 pub use copied::PageBody;
-pub use edit::Edit;
+pub use edit::{Edit, Readiness, Scenario};
 pub use seed::Seed;
 pub use serve::HeldResource;
 pub use settings::{Applied, Command, Rejected};

@@ -202,8 +202,12 @@ pub fn references(url: &str, response: &warc::Response) -> io::Result<Vec<String
 pub enum LinkKind {
     /// A navigable page.
     Page,
-    /// A document prerequisite.
+    /// A document prerequisite that lays the page out: a stylesheet, its
+    /// imports and fonts, an icon.
     Asset,
+    /// An image in the page's markup, which a reader's browser loads as it
+    /// comes into view.
+    Image,
     /// A prerequisite a still picture of the page does without: a script,
     /// a preloaded file, or one of an image's other sizes.
     Optional,
@@ -215,7 +219,7 @@ pub fn links(url: &str, response: &warc::Response) -> io::Result<Links> {
     visit_links(url, response, |kind, url| {
         let out = match kind {
             LinkKind::Page => &mut links.pages,
-            LinkKind::Asset | LinkKind::Optional => &mut links.assets,
+            LinkKind::Asset | LinkKind::Image | LinkKind::Optional => &mut links.assets,
         };
         out.push(url);
         Ok(())
@@ -350,9 +354,10 @@ pub fn requisites(
     next(url, response, resource, true)
 }
 
-/// The dependencies a still picture of the page shows: its stylesheets,
-/// their imports, fonts and images, and its images at their own address.
-/// Redirects are followed as [`requisites`] follows them.
+/// The dependencies that lay a still picture of the page out: its
+/// stylesheets, their imports and fonts, and its icons. Its images are
+/// left for the picture to ask for as they come into view, as a reader's
+/// browser does. Redirects are followed as [`requisites`] follows them.
 pub fn shown_requisites(
     url: &str,
     response: &warc::Response,
@@ -382,8 +387,8 @@ fn next(
         match kind {
             LinkKind::Page => pages.push(url),
             LinkKind::Asset => assets.push(url),
-            LinkKind::Optional if optional => assets.push(url),
-            LinkKind::Optional => {}
+            LinkKind::Image | LinkKind::Optional if optional => assets.push(url),
+            LinkKind::Image | LinkKind::Optional => {}
         }
         Ok(())
     })?;
@@ -491,17 +496,17 @@ pub fn visit_links(
             link(&base, value, &mut |url| visit(LinkKind::Page, url))?;
         }
         if let Some(value) = attr("poster") {
-            link(&base, value, &mut |url| visit(LinkKind::Asset, url))?;
+            link(&base, value, &mut |url| visit(LinkKind::Image, url))?;
         }
         if matches!(name, "audio" | "video" | "track" | "iframe")
             || (name == "source" && picture == 0)
         {
             return Ok(());
         }
-        let source = if name == "script" {
-            LinkKind::Optional
-        } else {
-            LinkKind::Asset
+        let source = match name {
+            "script" => LinkKind::Optional,
+            "img" | "source" | "input" => LinkKind::Image,
+            _ => LinkKind::Asset,
         };
         for name in ["src", "data-src", "data-lazy-src", "data-original"] {
             if let Some(value) = attr(name) {
@@ -521,7 +526,7 @@ pub fn visit_links(
         if matches!(name, "image" | "use")
             && let Some(value) = attr("href")
         {
-            link(&base, value, &mut |url| visit(LinkKind::Asset, url))?;
+            link(&base, value, &mut |url| visit(LinkKind::Image, url))?;
         }
         let rel = |names: &[&str]| {
             attr("rel").is_some_and(|r| {

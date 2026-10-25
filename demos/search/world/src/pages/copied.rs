@@ -223,10 +223,11 @@ impl Pages {
             .map(str::to_owned)
     }
 
-    /// A package site's answer for `url`, whatever the page source: the
-    /// captured response, else the real host's, copied when first asked
+    /// The answer for the package file at `url`, whatever the page source:
+    /// the captured response, else the real host's, copied when first asked
     /// for and kept for the run, so installs work for packages the capture
-    /// never saw. `None` for other sites.
+    /// never saw. `None` for anything that is not a package file, such as a
+    /// project's pages on the same sites, which are pages like any other.
     pub(crate) async fn package(&self, cx: &Cx, url: &str) -> Option<Response> {
         let captured = self.package_url(url)?;
         if captured.status != 404 {
@@ -250,8 +251,15 @@ impl Pages {
         }
     }
 
-    /// A package site's captured answer, or one already copied this run.
+    /// The package file's captured answer, or one already copied this run.
     pub(crate) fn package_url(&self, url: &str) -> Option<Response> {
+        PackageFile::of(&url::Url::parse(url).ok()?)?;
+        self.package_site_url(url)
+    }
+
+    /// A package site's captured answer for any address on it, or one
+    /// already copied this run.
+    pub(crate) fn package_site_url(&self, url: &str) -> Option<Response> {
         let corpus = self.copied.as_ref()?;
         let packages = corpus.packages.as_ref()?;
         let parsed = url::Url::parse(url).ok()?;
@@ -522,8 +530,11 @@ impl Pages {
         })
     }
 
+    /// The copied answer for `url`: the captured page, including pages
+    /// captured with the package sites.
     pub(crate) fn copied_url(&self, url: &str) -> Response {
-        replay(self.copied.as_ref().unwrap().response(url))
+        self.package_site_url(url)
+            .unwrap_or_else(|| replay(self.copied.as_ref().unwrap().response(url)))
     }
 }
 
@@ -609,4 +620,99 @@ fn package_response(
             })
             .transpose()
     }))
+}
+
+/// A file installers download, as opposed to a page people read. Package
+/// sites serve both: PyPI's and GitHub's project pages are pages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PackageFile {
+    /// An installer's index: pip's simple index, npm's registry.
+    Index,
+    /// A wheel, source distribution, other package or binary, or the
+    /// metadata and signature files beside one.
+    Distribution,
+    /// A git clone or fetch.
+    Repository,
+    /// A repository archive download.
+    Archive,
+    /// A file attached to a release.
+    ReleaseAsset,
+}
+
+/// Endings of package and binary files.
+const DISTRIBUTIONS: [&str; 22] = [
+    ".whl",
+    ".tar.gz",
+    ".tgz",
+    ".tar.bz2",
+    ".tar.xz",
+    ".tar.zst",
+    ".zip",
+    ".egg",
+    ".gem",
+    ".crate",
+    ".nupkg",
+    ".jar",
+    ".deb",
+    ".rpm",
+    ".apk",
+    ".exe",
+    ".msi",
+    ".dmg",
+    ".pkg",
+    ".appimage",
+    ".snap",
+    ".xpi",
+];
+
+/// Endings of the files published beside a package file.
+const BESIDE: [&str; 5] = [".metadata", ".asc", ".sig", ".sha256", ".sha512"];
+
+impl PackageFile {
+    /// What `url` is, when it is a package file.
+    fn of(url: &url::Url) -> Option<Self> {
+        let host = url.host_str()?;
+        let segments: Vec<&str> = url.path_segments()?.filter(|s| !s.is_empty()).collect();
+        if matches!(host, "codeload.github.com") {
+            return Some(Self::Archive);
+        }
+        if matches!(
+            host,
+            "objects.githubusercontent.com" | "release-assets.githubusercontent.com"
+        ) {
+            return Some(Self::ReleaseAsset);
+        }
+        if matches!(
+            host,
+            "registry.npmjs.org" | "registry.yarnpkg.com" | "index.crates.io"
+        ) || segments.first() == Some(&"simple")
+        {
+            return Some(Self::Index);
+        }
+        // A forge shows a file's page under `blob` or `tree`; that is a page.
+        if segments
+            .iter()
+            .any(|segment| matches!(*segment, "blob" | "tree"))
+        {
+            return None;
+        }
+        let tail = |offset: usize| segments.get(offset..).unwrap_or_default();
+        match tail(2) {
+            ["info", "refs"] | ["git-upload-pack"] | ["git-receive-pack"] => {
+                return Some(Self::Repository);
+            }
+            ["archive", ..] | ["-", "archive", ..] => return Some(Self::Archive),
+            ["releases", "download", ..] => return Some(Self::ReleaseAsset),
+            _ => {}
+        }
+        let name = segments.last()?.to_ascii_lowercase();
+        let name = BESIDE
+            .iter()
+            .find_map(|ending| name.strip_suffix(ending))
+            .unwrap_or(&name);
+        DISTRIBUTIONS
+            .iter()
+            .any(|ending| name.ends_with(ending))
+            .then_some(Self::Distribution)
+    }
 }

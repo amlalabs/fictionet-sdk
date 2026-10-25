@@ -383,7 +383,9 @@ function feedRow(key, row, item, resources) {
       const frame = element('div', undefined, 'thumbnail');
       frame.dataset.url = item.thumbnail;
       const view = element('iframe');
-      view.setAttribute('sandbox', '');
+      // Scripts are allowed only so the frame loads images as they come into
+      // view: the picture has none, and its policy runs none.
+      view.setAttribute('sandbox', 'allow-scripts');
       view.setAttribute('loading', 'lazy');
       view.setAttribute('tabindex', '-1');
       view.setAttribute('aria-hidden', 'true');
@@ -510,7 +512,8 @@ function results(hits) {
 // out: its own markup, styles and images, with no scripts.
 function servedPage(url) {
   const frame = element('iframe', undefined, 'recorded-page');
-  frame.setAttribute('sandbox', '');
+  // As in the feed: scripts are allowed only for images that load in view.
+  frame.setAttribute('sandbox', 'allow-scripts');
   frame.referrerPolicy = 'no-referrer';
   frame.title = url;
   frame.src = `/thumbnail?${new URLSearchParams({ url })}`;
@@ -635,7 +638,7 @@ function details() {
     }
     if (!searches.length) body.append(element('p', 'No searches', 'detail-empty'));
   } else if (selection === 'editor') {
-    heading('Editor', world?.scenario || '');
+    heading('Editor', world?.scenario?.text || '');
     // Every real page and result list the scenario changed, newest first.
     const edited = [
       ...shown.sites.flatMap((site) => site.requests.filter((request) => request.edits.length).map((request) => ({ at_ms: request.at_ms, label: hitFor(request.url)?.title || request.url, meta: request.url, edits: request.edits, target: `page:${request.url}` }))),
@@ -686,16 +689,33 @@ stream.onmessage = (event) => {
   draw();
   pulses();
 };
+// The world's settings as they change, such as the scenario becoming ready.
+const worldStream = new EventSource('/world/state');
+worldStream.onmessage = (event) => showWorld(JSON.parse(event.data));
 async function loadWorld() {
   const response = await fetch('/world');
   if (!response.ok) throw new Error('Could not read the world settings');
   const date = Date.parse(response.headers.get('date'));
   if (date) hostOffset = date + 500 - Date.now();
-  world = await response.json();
+  showWorld(await response.json());
+}
+// Whether the scenario's account is written yet, said briefly.
+const READINESS = { preparing: 'Preparing scenario', ready: 'Scenario ready', failed: 'Scenario failed. Set it again.' };
+function showWorld(next) {
+  world = next;
   $('world-date').textContent = world.date;
   // The field keeps what is being typed; it shows the scenario in force otherwise.
-  if (document.activeElement !== $('scenario')) $('scenario').value = world.scenario || '';
+  if (document.activeElement !== $('scenario')) $('scenario').value = world.scenario?.text || '';
   $('scenario-form').hidden = world.edited.kind !== 'available';
+  const readiness = world.scenario?.readiness;
+  for (const id of ['scenario-state', 'scenario-readiness']) {
+    const state = $(id);
+    state.hidden = !readiness || (id === 'scenario-state' && world.source !== 'edited');
+    state.dataset.kind = readiness?.kind || '';
+    state.textContent = readiness ? READINESS[readiness.kind] : '';
+    state.title = readiness?.error || '';
+  }
+  if (selection === 'editor') details();
   for (const control of $('source').querySelectorAll('button')) {
     const availability = world[control.dataset.source];
     control.disabled = availability.kind !== 'available';
@@ -778,4 +798,4 @@ status.onmessage = (event) => {
 };
 loadWorld().then(() => mountConsole()).catch((error) => notice(error.message));
 draw();
-window.addEventListener('pagehide', () => { stream.close(); status.close(); for (const console of consoles.values()) { console.component.dispose(); console.socket.close(); } });
+window.addEventListener('pagehide', () => { stream.close(); status.close(); worldStream.close(); for (const console of consoles.values()) { console.component.dispose(); console.socket.close(); } });

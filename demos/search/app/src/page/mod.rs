@@ -15,7 +15,7 @@ use std::{
 use tokio::sync::{mpsc, watch};
 use web_world::{
     observation::{CallPhase, EgressPurpose, Fetch, Hit, Observation, PageSource, SearchObs, Tool},
-    pages::{Edit, Pages, Source},
+    pages::{Edit, Pages, Scenario, Source},
 };
 
 fn wall_start() -> u64 {
@@ -398,7 +398,7 @@ pub struct WorldState {
     pub edited: Availability,
     pub date: String,
     /// What Edited changes on real pages.
-    pub scenario: Option<String>,
+    pub scenario: Option<Scenario>,
     pub preview: bool,
 }
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -448,6 +448,8 @@ pub struct Page {
     /// The world, while it runs; the page must not keep it (and its
     /// observation stream) alive.
     pages: std::sync::Weak<Pages>,
+    /// The world's context once it runs, for copies the page asks for.
+    cx: Arc<std::sync::OnceLock<fictionet::Cx>>,
 }
 impl Page {
     /// The world's settings as the page shows them, as they change.
@@ -471,6 +473,7 @@ impl Page {
                 world: watch::channel(world).0,
                 commands,
                 pages: Arc::downgrade(&pages),
+                cx: Arc::default(),
             },
             (receive, control),
         )
@@ -546,6 +549,18 @@ impl Page {
             tokio::sync::oneshot::Sender<Result<(), String>>,
         )>,
     ) {
+        let _ = self.cx.set(cx.clone());
+        // The scenario's readiness reaches the page as it changes.
+        if let Some(mut changes) = pages.scenario_changes() {
+            let (page, pages) = (self.clone(), pages.clone());
+            cx.spawn(move |cx| async move {
+                while let Ok(Ok(())) = cx.race(None, changes.changed()).await {
+                    let preview = page.world.borrow().preview;
+                    page.world.send_replace(world_state(&pages, preview));
+                }
+                Ok(())
+            });
+        }
         let page = self.clone();
         cx.spawn(move |cx| async move {
             while let Ok(Some((command, reply))) = cx.race(None, control.recv()).await {
@@ -709,6 +724,10 @@ impl Page {
                 "/host",
                 fictionet::stdlib::page::state(self.host.subscribe()),
             )
+            .nest(
+                "/world",
+                fictionet::stdlib::page::state(self.world.subscribe()),
+            )
             .merge(pieces::libraries())
     }
 }
@@ -780,6 +799,18 @@ async fn held(
         return http::StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     pages.settled(&source, url.as_str()).await;
+    // An image is copied when the picture first shows it.
+    let holds = {
+        let (pages, source, url) = (pages.clone(), source.clone(), url.clone());
+        tokio::task::spawn_blocking(move || pages.held_resource(&source, url.as_str()).is_some())
+    };
+    if !holds.await.unwrap_or(false)
+        && let Some(cx) = page.cx.get()
+    {
+        pages
+            .copy_for_picture(cx, &source, &owner, url.as_str())
+            .await;
+    }
     let held = tokio::task::spawn_blocking(move || {
         let mut held = pages.held_resource(&source, url.as_str())?;
         if held.content_type.starts_with("text/css") {

@@ -113,9 +113,15 @@ impl Pages {
         self.live.is_some() && self.editor.is_some()
     }
 
-    /// The scenario Edited follows, if any.
-    pub fn scenario(&self) -> Option<String> {
+    /// The scenario Edited follows, if any, and whether it is ready.
+    pub fn scenario(&self) -> Option<Scenario> {
         self.editor.as_ref()?.scenario()
+    }
+
+    /// The scenario and its readiness, as they change; `None` without an
+    /// editor.
+    pub fn scenario_changes(&self) -> Option<tokio::sync::watch::Receiver<Option<Scenario>>> {
+        Some(self.editor.as_ref()?.changes())
     }
 
     /// Applies a command against the current revision; every accepted
