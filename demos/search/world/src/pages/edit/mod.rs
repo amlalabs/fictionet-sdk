@@ -220,8 +220,10 @@ outcomes. Work through what follows from the scenario and include that too: tota
 tallies, records, rankings, awards, descriptions and headings that must change for pages to \
 agree; events that no longer happened, with what pages say instead; and what readers are told \
 to do (steps, sign-ups, eligibility, prices, instructions) that no longer applies or now \
-applies, with what pages say instead. Work out every number exactly. Change only what the \
-scenario states or strictly requires.
+applies, with what pages say instead. Pages write a range's end both as the first value \
+past it and as the last value in it (fixed in 2.0, affects versions up to 1.9.3); when the end \
+moves, give both forms. Work out every number exactly. Change only what the scenario states or \
+strictly requires.
 - conflicts: true facts the changes collide with, which stay true. Moving a date or changing a \
 fact can make other statements impossible: a person who no longer held an office or role at \
 the new date, a building, work or event dated before the new date that copied, followed, \
@@ -257,12 +259,13 @@ summaries, infobox and table cells, captions, lists, quotes, references and link
 language. Short forms count: a score, a version range or a label in a table states a fact as \
 much as a sentence does. Ranges count too: when the account moves where a range ends (affected \
 versions, a period of validity), change every statement of that end however it is written \
-(`< 2.0`, `up to 1.9.3`, `before 2.0`, `until 2019`).
+(`< 2.0`, `before 2.0`, `until 2019`), including a last affected version given in place of the first \
+fixed one (`up to 1.9.3` when the fix was 2.0), which moves with the fix.
 - Some lines are values from data in the document (JSON, or the data in a page's scripts), \
-each after the names of the keys that hold it and a colon, like `events.fixed: 70.0.0`. The \
+each after the names of the keys that hold it and a colon, like `release.date: 2019-04-01`. The \
 names say what the value is. Edit only the value; a passage may start with the names to tell \
-equal values apart. An edit changes one value and stays on its line: values cannot be added or \
-removed.
+equal values apart. An edit changes one value, and its passage never reaches past that \
+value's line: values cannot be added, removed or joined.
 - Change nothing the account does not change. Every other fact, figure, name and word stays. A \
 figure beside a changed one is often a different fact (a half-time score, an earlier version, \
 another date): leave it unless the account changes that very figure.
@@ -455,8 +458,8 @@ impl Editor {
                     })
                     .collect();
                 let edited = document.apply(&scoped);
-                let made = made(url, &scoped, &edited.outcomes);
-                if made.is_empty() {
+                report_unmade(url, &scoped, &edited.outcomes);
+                if edited.changes.is_empty() {
                     return Ok(None);
                 }
                 if format == Format::Json
@@ -472,7 +475,7 @@ impl Editor {
                     edited.served.clone()
                 };
                 Ok(Some(Arc::new(Revision {
-                    edits: made,
+                    edits: edited.changes,
                     served: edited.served,
                     marked,
                 })))
@@ -832,18 +835,12 @@ impl Run {
     }
 }
 
-/// The edits of `scoped` that were made on the page at `url`, in order.
-/// Those that were not are reported on the host's console.
-fn made(url: &str, scoped: &[Scoped<'_>], outcomes: &[Outcome]) -> Vec<Edit> {
-    let mut made = Vec::new();
+/// Reports on the host's console the edits of `scoped` that could not be
+/// made on the page at `url`.
+fn report_unmade(url: &str, scoped: &[Scoped<'_>], outcomes: &[Outcome]) {
     for (scoped, outcome) in scoped.iter().zip(outcomes) {
         match outcome {
-            Outcome::Made => {
-                if !made.contains(scoped.edit) {
-                    made.push(scoped.edit.clone());
-                }
-            }
-            Outcome::Unchanged | Outcome::EmptyPassage => {}
+            Outcome::Made | Outcome::Unchanged | Outcome::EmptyPassage => {}
             Outcome::NotFound | Outcome::Covered | Outcome::Lines => {
                 eprintln!(
                     "{url}: edit not made ({outcome:?}): {:?}",
@@ -852,7 +849,6 @@ fn made(url: &str, scoped: &[Scoped<'_>], outcomes: &[Outcome]) -> Vec<Edit> {
             }
         }
     }
-    made
 }
 
 /// The edits of `edits` that change the line `text`.

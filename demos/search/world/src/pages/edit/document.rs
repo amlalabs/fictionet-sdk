@@ -232,6 +232,9 @@ pub(super) struct Edited {
     pub served: String,
     pub marked: String,
     pub outcomes: Vec<Outcome>,
+    /// Each change as made: the words of the text it replaced and what
+    /// replaced them, the page's text first and its data after.
+    pub changes: Vec<Edit>,
 }
 
 impl<'a> Document<'a> {
@@ -271,6 +274,9 @@ impl<'a> Document<'a> {
             let character = source[at..].chars().next().expect("a character");
             reader.character(character, at..at + character.len_utf8());
             at += character.len_utf8();
+        }
+        for value in std::mem::take(&mut reader.deferred) {
+            reader.literal(&value, Holder::Attribute);
         }
         Self::read(source, format, reader)
     }
@@ -449,7 +455,10 @@ impl<'a> Document<'a> {
                 .cloned()
                 .collect();
             let found = if within.is_empty() { found } else { within };
-            for place in found {
+            let pieces = found
+                .into_iter()
+                .flat_map(|place| self.lines_of(place, &replacement));
+            for (place, replacement) in pieces {
                 let Some((chars, replacement)) = self.unlabeled(place, &replacement) else {
                     continue;
                 };
@@ -481,6 +490,7 @@ impl<'a> Document<'a> {
         });
         let mut taken: Vec<Range<usize>> = Vec::new();
         let mut splices = Vec::new();
+        let mut changes = Vec::new();
         for place in places {
             if taken
                 .iter()
@@ -494,6 +504,17 @@ impl<'a> Document<'a> {
             outcomes[place.edit] = Outcome::Made;
             let first = self.spans[place.chars.start].start;
             let field = self.field(first);
+            let words: String = self
+                .text
+                .chars()
+                .skip(place.chars.start)
+                .take(place.chars.len())
+                .collect();
+            let change = Edit {
+                passage: words,
+                replacement: place.replacement.clone(),
+            };
+            changes.push((field.is_some(), place.edit, place.chars.start, change));
             let written = self.written(&place.replacement, field);
             let marked = self.format == Format::Html
                 && field.is_none()
@@ -532,10 +553,18 @@ impl<'a> Document<'a> {
         }
         served.push_str(&self.source[at..]);
         marked.push_str(&self.source[at..]);
+        changes.sort_by_key(|(data, edit, start, _)| (*data, *edit, *start));
+        let mut listed: Vec<Edit> = Vec::new();
+        for (_, _, _, change) in changes {
+            if !listed.contains(&change) {
+                listed.push(change);
+            }
+        }
         Edited {
             served,
             marked,
             outcomes,
+            changes: listed,
         }
     }
 
@@ -575,6 +604,34 @@ impl<'a> Document<'a> {
         let found = index.checked_sub(1)?;
         let (range, _) = &self.fields[found];
         (range.contains(&byte) || range.start == byte).then_some(found)
+    }
+
+    /// A place that runs over several lines (table cells, values of data)
+    /// with a replacement of as many lines, as one edit per line that
+    /// changes, so each line keeps its own place; otherwise the place as
+    /// it is.
+    fn lines_of(&self, place: Range<usize>, replacement: &str) -> Vec<(Range<usize>, String)> {
+        let breaks: Vec<usize> = place
+            .clone()
+            .zip(self.text.chars().skip(place.start))
+            .filter(|(_, character)| *character == '\n')
+            .map(|(index, _)| index)
+            .collect();
+        let lines: Vec<&str> = replacement.split('\n').collect();
+        if breaks.is_empty() || lines.len() != breaks.len() + 1 {
+            return vec![(place, replacement.to_owned())];
+        }
+        let starts = std::iter::once(place.start).chain(breaks.iter().map(|at| at + 1));
+        let ends = breaks.iter().copied().chain(std::iter::once(place.end));
+        starts
+            .zip(ends)
+            .zip(lines)
+            .filter(|((start, end), line)| {
+                let real: String = self.text.chars().skip(*start).take(end - start).collect();
+                normalized(&real) != normalized(line)
+            })
+            .map(|((start, end), line)| (start..end, line.to_owned()))
+            .collect()
     }
 
     /// `place` without the key names it starts with, and `replacement`
@@ -715,7 +772,14 @@ fn readable(value: &Literal, code: Code) -> bool {
     }
     match code {
         Code::Json => true,
-        Code::Script => spaced || text.contains(|character: char| character.is_ascii_digit()),
+        // A word with no spaces is a figure (`1889`, `2.0.1`, `[,2.0)`) when it
+        // has digits and hardly any letters; otherwise it names something in
+        // the code (`cite_note-20`, `mwDAM`).
+        Code::Script => {
+            spaced
+                || (text.contains(|character: char| character.is_ascii_digit())
+                    && text.chars().filter(char::is_ascii_alphabetic).count() <= 1)
+        }
     }
 }
 
@@ -736,6 +800,9 @@ struct Reader {
     title_start: Option<usize>,
     fields: Vec<(Range<usize>, Field)>,
     labels: Vec<Range<usize>>,
+    /// Strings in tags' `data-` attributes, read after the page's text so
+    /// they never break a sentence that runs past a tag.
+    deferred: Vec<Literal>,
 }
 
 impl Reader {
@@ -954,7 +1021,7 @@ impl Reader {
                     label: found.label,
                 };
                 if readable(&value, Code::Script) {
-                    self.literal(&value, Holder::Attribute);
+                    self.deferred.push(value);
                 }
             }
         }
