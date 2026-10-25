@@ -399,23 +399,14 @@ enum Catalog {
 }
 
 /// Searched Responses ids: the id a client saw, and the final upstream turn
-/// that holds the whole response. The oldest go first past the bound.
+/// that holds the whole response.
 #[derive(Default)]
 struct Continued {
     finals: std::collections::HashMap<String, String>,
-    order: std::collections::VecDeque<String>,
 }
 impl Continued {
-    const LIMIT: usize = 4096;
     fn insert(&mut self, shown: String, last: String) {
-        if self.finals.insert(shown.clone(), last).is_none() {
-            self.order.push_back(shown);
-        }
-        while self.order.len() > Self::LIMIT {
-            if let Some(old) = self.order.pop_front() {
-                self.finals.remove(&old);
-            }
-        }
+        self.finals.insert(shown, last);
     }
 }
 impl Model {
@@ -688,18 +679,9 @@ impl Model {
             && request.method() == http::Method::GET
             && path == "/api/web/domain_info"
         {
-            let domain =
-                url::form_urlencoded::parse(request.uri().query().unwrap_or("").as_bytes())
-                    .find(|(key, _)| key == "domain")
-                    .map(|(_, value)| value.into_owned());
-            let allowed = domain.is_some_and(|host| {
-                self.engine
-                    .as_ref()
-                    .is_some_and(|engine| engine.serves(&host))
-            });
             return Ok(Response::builder()
                 .header("content-type", "application/json")
-                .body(Body::from(json!({"can_fetch":allowed}).to_string()))?);
+                .body(Body::from(json!({"can_fetch":true}).to_string()))?);
         }
         // Claude Code's startup check GETs this and requires a 200; its
         // background check sends HEAD.

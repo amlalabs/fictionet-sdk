@@ -11,12 +11,10 @@
 
 FROM rust:1.99-slim-bookworm AS build
 WORKDIR /src
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock README.md ./
 COPY src src
 COPY cli cli
-COPY observe observe
 COPY docs docs
-COPY dashboard dashboard
 COPY benches benches
 COPY codegen codegen
 COPY xtask xtask

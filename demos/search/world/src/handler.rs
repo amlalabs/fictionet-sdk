@@ -64,31 +64,59 @@ impl Handler {
             .await
         {
             Some(response) => Some(response),
-            None => self.pages.package_url(&url),
+            None => self.pages.package(&self.fcx, &url).await,
         };
-        let page_source = package.as_ref().map_or_else(
-            || self.pages.source(),
-            |_| crate::observation::PageSource::Copy { captured: None },
-        );
+        let page_source = match package {
+            Some(_) => crate::observation::PageSource::Package,
+            None => self.pages.page_source(),
+        };
+        let request_path = parts
+            .uri
+            .path_and_query()
+            .cloned()
+            .unwrap_or_else(|| http::uri::PathAndQuery::from_static("/"));
+        let mut waiting = Waiting {
+            fcx: self.fcx.clone(),
+            pages: self.pages.clone(),
+            started,
+            fact: Some(crate::observation::SearchObs::Abandoned {
+                scheme: target.scheme.clone(),
+                host: target.host.parse()?,
+                method: parts.method.clone(),
+                path: request_path.clone(),
+                source: page_source.clone(),
+                elapsed_ms: 0,
+                fetch: crate::observation::Fetch::of(&parts.headers),
+            }),
+        };
         let answer = if let Some(package) = package {
             package
         } else if let Some(asset) = Pages::search_asset(&target.host, path) {
             asset
-        } else if self.pages.live_only() && action == Route::Page {
+        } else if let Some(written) = self.pages.written() {
+            written
+                .handle_route(&self.fcx, &parts.method, &target.host, path, action)
+                .await
+        } else if action == Route::Page {
+            // A page's own request belongs to the page that asked for it.
+            let page = (crate::observation::Fetch::of(&parts.headers)
+                == crate::observation::Fetch::Subresource)
+                .then(|| parts.headers.get(http::header::REFERER))
+                .flatten()
+                .and_then(|referrer| referrer.to_str().ok())
+                .and_then(|referrer| url::Url::parse(referrer).ok());
             self.pages
-                .live_url(
+                .page(
                     &self.fcx,
-                    &format!("{}://{}{path}", target.scheme, target.host),
+                    &url,
+                    parts.headers.get(http::header::USER_AGENT),
+                    page,
                 )
                 .await
-        } else if self.pages.copied_only() && action == Route::Page {
-            self.pages
-                .copied_url(&format!("{}://{}{path}", target.scheme, target.host))
         } else {
-            self.pages
-                .handle_route(&self.fcx, parts.method.as_str(), &target.host, path, action)
-                .await
+            self.pages.handle_route(&self.fcx, action).await
         };
+        waiting.fact = None;
         self.pages.report_response(
             &self.fcx,
             crate::observation::RequestContext {
@@ -96,11 +124,7 @@ impl Handler {
                 scheme: &target.scheme,
                 host: &target.host.parse()?,
                 method: &parts.method,
-                path: &parts
-                    .uri
-                    .path_and_query()
-                    .cloned()
-                    .unwrap_or_else(|| http::uri::PathAndQuery::from_static("/")),
+                path: &request_path,
                 source: page_source,
                 headers: parts.headers.clone(),
             },
@@ -117,6 +141,18 @@ impl Handler {
                 response = response.header(name, value);
             }
         }
+        // Copied mode's day is the day its pages were copied, on the guest's
+        // clock and in every answer's date.
+        if self.pages.source() == crate::pages::Source::Copied
+            && let Some(lag) = self.pages.copied_lag()
+            && let Some(headers) = response.headers_mut()
+            && let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            && let Ok(date) = http::HeaderValue::from_str(&web::httpd::http_date(
+                now.saturating_sub(lag).as_secs(),
+            ))
+        {
+            headers.insert(http::header::DATE, date);
+        }
         let body = if parts.method == http::Method::HEAD {
             Bytes::new()
         } else {
@@ -124,6 +160,30 @@ impl Handler {
         };
         let response = response.body(Full::new(body))?;
         Ok(response)
+    }
+}
+
+/// A request the world has not answered yet. Dropped before then, its
+/// connection closed: the client gave up waiting, and the page says so.
+struct Waiting {
+    fcx: fictionet::Cx,
+    pages: Arc<Pages>,
+    started: std::time::Instant,
+    fact: Option<crate::observation::SearchObs>,
+}
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        let Some(mut fact) = self.fact.take() else {
+            return;
+        };
+        if self.fcx.is_cancelled() {
+            return;
+        }
+        if let crate::observation::SearchObs::Abandoned { elapsed_ms, .. } = &mut fact {
+            *elapsed_ms = self.started.elapsed().as_millis() as u64;
+        }
+        self.pages.report(&self.fcx, fact);
     }
 }
 

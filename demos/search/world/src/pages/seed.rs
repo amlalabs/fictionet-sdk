@@ -48,10 +48,13 @@ pub struct Seed {
 pub struct Corpus {
     pub directory: String,
     pub urls: Vec<String>,
+    /// Prepared offline references shared across research corpora.
+    #[serde(default)]
+    pub reference: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct Front {
     date: Option<toml::Value>,
     fixed: Vec<FixedFile>,
@@ -149,10 +152,7 @@ impl Seed {
     /// Loads a bundled brief without reading any files.
     pub fn builtin(name: &str) -> io::Result<Self> {
         let text = match name {
-            "web" => include_str!("../../../seeds/web.md"),
             "security" => include_str!("../../../seeds/security.md"),
-            "corvane-acquisition" => include_str!("../../../seeds/corvane-acquisition.md"),
-            "fastjsonl-package" => include_str!("../../../seeds/fastjsonl-package.md"),
             _ => return Err(invalid(format!("no seed named {name:?}"))),
         };
         Self::parse(name, text, |file| {

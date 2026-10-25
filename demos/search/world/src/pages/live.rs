@@ -1,4 +1,5 @@
-//! Search on the host; replay only URLs reached by those results and their crawl.
+//! Host search and on-demand public page copies with their dependencies,
+//! retained for replay.
 
 use super::*;
 use fictionet_extras::{
@@ -6,24 +7,22 @@ use fictionet_extras::{
     models::Key,
     warc::{self, Archive},
 };
-use std::{
-    collections::VecDeque,
-    path::{Path, PathBuf},
-};
+use serde_json::{Value, json};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{MutexGuard, OnceLock};
 use tokio::sync::{oneshot, watch};
 
-mod transport;
-use transport::Transport;
+pub(super) mod transport;
+use transport::{Ask, Transport};
 
-struct Lifetime {
+pub(super) struct Lifetime {
     stop: watch::Sender<bool>,
-    hosts: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<tokio::time::Instant>>>>,
 }
 impl Default for Lifetime {
     fn default() -> Self {
         Self {
             stop: watch::channel(false).0,
-            hosts: Default::default(),
         }
     }
 }
@@ -41,11 +40,12 @@ impl Drop for Lifetime {
     }
 }
 
-struct Job {
-    url: String,
-    /// The site whose pages a navigation job follows; none for a page requisite.
-    navigation: Option<String>,
-    cx: Cx,
+#[derive(Clone)]
+enum CaptureState {
+    Pending,
+    Ready,
+    Failed(String),
+    Cancelled,
 }
 
 #[derive(Default)]
@@ -53,12 +53,7 @@ struct State {
     archive: Archive,
     lifetime: Arc<Lifetime>,
     epoch: usize,
-    reached: HashMap<String, watch::Sender<bool>>,
-    /// URLs whose links have been followed, with the site they were followed for.
-    followed: HashSet<(String, String)>,
-    queue: VecDeque<Job>,
-    running: bool,
-    searches: HashMap<(String, u64), search::Search>,
+    reached: HashMap<String, watch::Sender<CaptureState>>,
 }
 
 pub(super) struct Live {
@@ -101,159 +96,130 @@ impl Live {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn enqueue_in(self: &Arc<Self>, lifetime: &Arc<Lifetime>, job: Job, priority: bool) {
-        let Some(url) = warc::key(&job.url) else {
-            return;
-        };
+    fn capture(
+        self: &Arc<Self>,
+        lifetime: &Arc<Lifetime>,
+        cx: &Cx,
+        url: String,
+        resource: capture::Resource,
+        user_agent: Option<http::HeaderValue>,
+        page: Option<url::Url>,
+    ) -> Result<watch::Receiver<CaptureState>, String> {
         let mut state = self.state();
         if lifetime.cancelled() || !Arc::ptr_eq(lifetime, &state.lifetime) {
-            return;
+            return Err("Live session stopped".into());
         }
-        let newly_reached = !state.reached.contains_key(&url);
-        let newly_followed = job
-            .navigation
-            .as_ref()
-            .is_some_and(|site| state.followed.insert((url.clone(), site.clone())));
-        if !newly_reached && !newly_followed {
-            return;
+        if let Some(reached) = state.reached.get(&url)
+            && !matches!(*reached.borrow(), CaptureState::Failed(_))
+        {
+            return Ok(reached.subscribe());
         }
-        state
-            .reached
-            .entry(url)
-            .or_insert_with(|| watch::channel(false).0);
-        if priority {
-            state.queue.push_front(job);
-        } else {
-            state.queue.push_back(job);
-        }
-        if !state.running {
-            state.running = true;
-            let live = self.clone();
-            let lifetime = lifetime.clone();
-            self.fetcher.spawn(async move {
-                live.download(lifetime).await;
-            });
-        }
+        let (send, receive) = watch::channel(CaptureState::Pending);
+        state.reached.insert(url.clone(), send.clone());
+        let live = self.clone();
+        let lifetime = lifetime.clone();
+        let cx = cx.clone();
+        self.fetcher.spawn(async move {
+            let result = live
+                .download(&lifetime, &cx, &url, user_agent.as_ref(), page.as_ref())
+                .await;
+            let response = match result {
+                Ok(response) => response,
+                Err(_) if lifetime.cancelled() || cx.is_cancelled() => {
+                    send.send_replace(CaptureState::Cancelled);
+                    return;
+                }
+                Err(error) => {
+                    send.send_replace(CaptureState::Failed(error));
+                    return;
+                }
+            };
+            // A copied page brings what lays a still picture of it out: its
+            // stylesheets, CSS imports, fonts and icons, including those of
+            // pages already in the archive, so the host's picture of the page
+            // is drawn from what the world holds. Its images come as the
+            // picture or a client asks for them, the way a browser loads
+            // them as they come into view, so a page with hundreds of images
+            // does not send hundreds of requests to its site at once.
+            // Scripts, preloads and an image's other sizes come only when a
+            // client asks for them. They all belong to the page the client
+            // asked for. They are under way before the page is ready, so
+            // whatever shows the page can wait for them (see `settled`).
+            let owner = page.or_else(|| url::Url::parse(&url).ok());
+            let page_url = url.clone();
+            let links = live
+                .fetcher
+                .process(&cx, &lifetime, move || {
+                    capture::shown_requisites(&page_url, &response, resource)
+                        .map_err(|error| error.to_string())
+                })
+                .await;
+            match links {
+                Ok(links) => {
+                    // A redirect is followed as the client asked. A page's
+                    // files are asked for as a browser asks, whatever client
+                    // asked for the page: a client such as curl never loads
+                    // them, and sites throttle file requests that name one.
+                    for (url, resource) in links {
+                        let asking = match resource {
+                            capture::Resource::Requisite => None,
+                            capture::Resource::Document => user_agent.clone(),
+                        };
+                        let _ = live.capture(&lifetime, &cx, url, resource, asking, owner.clone());
+                    }
+                }
+                Err(error) => eprintln!("Live dependency discovery failed: {error}"),
+            }
+            send.send_replace(CaptureState::Ready);
+        });
+        Ok(receive)
     }
 
-    async fn download(self: Arc<Self>, lifetime: Arc<Lifetime>) {
-        loop {
-            let job = {
-                let mut state = self.state();
-                if lifetime.cancelled() || !Arc::ptr_eq(&lifetime, &state.lifetime) {
-                    return;
-                }
-                let Some(job) = state.queue.pop_front() else {
-                    state.running = false;
-                    return;
-                };
-                job
-            };
-            if job.cx.is_cancelled() || lifetime.cancelled() {
-                return;
-            }
-            let observer = self.observer.lock().unwrap().clone();
-            let existing = self.state().archive.get(&job.url);
-            let result = match existing {
-                Ok(Some(response)) => Ok((response, false)),
-                Ok(None) => self
-                    .fetcher
-                    .request(&job.cx, &lifetime, observer, &job.url, None)
-                    .await
-                    .map(|response| (response, true))
-                    .map_err(std::io::Error::other),
-                Err(error) => Err(error),
-            };
-            if lifetime.cancelled() {
-                return;
-            }
-            if let Ok((response, downloaded)) = result {
-                let saved = {
-                    let mut state = self.state();
-                    if !Arc::ptr_eq(&lifetime, &state.lifetime) {
-                        return;
-                    }
-                    let path = self.archive_path(state.epoch);
-                    !downloaded || state.archive.append(&path, &job.url, &response).is_ok()
-                };
-                let status = response.status;
-                let url = job.url.clone();
-                let links = if saved {
-                    self.fetcher
-                        .process(&job.cx, &lifetime, move || {
-                            capture::links(&url, &response).map_err(|error| error.to_string())
-                        })
-                        .await
-                } else {
-                    Err("Live capture could not be saved".into())
-                };
-                if let Ok(links) = links {
-                    // Dependencies get priority over the next navigation page.
-                    for url in links.assets.into_iter().rev() {
-                        self.enqueue_in(
-                            &lifetime,
-                            Job {
-                                url,
-                                navigation: None,
-                                cx: job.cx.clone(),
-                            },
-                            true,
-                        );
-                    }
-                    if status.is_redirection() {
-                        for url in links.pages {
-                            self.enqueue_in(
-                                &lifetime,
-                                Job {
-                                    url,
-                                    navigation: job.navigation.clone(),
-                                    cx: job.cx.clone(),
-                                },
-                                true,
-                            );
-                        }
-                    } else if let Some(site) = &job.navigation {
-                        for url in links.pages.into_iter().filter(|u| {
-                            url::Url::parse(u).ok().is_some_and(|u| {
-                                u.host_str().is_some_and(|host| {
-                                    host.trim_start_matches("www.")
-                                        == site.trim_start_matches("www.")
-                                })
-                            })
-                        }) {
-                            self.enqueue_in(
-                                &lifetime,
-                                Job {
-                                    url,
-                                    navigation: Some(site.clone()),
-                                    cx: job.cx.clone(),
-                                },
-                                false,
-                            );
-                        }
-                    }
-                }
-            }
-            let state = self.state();
-            if !Arc::ptr_eq(&lifetime, &state.lifetime) {
-                return;
-            }
-            if let Some(done) = state.reached.get(&job.url) {
-                done.send_replace(true);
-            }
+    async fn download(
+        self: &Arc<Self>,
+        lifetime: &Arc<Lifetime>,
+        cx: &Cx,
+        url: &str,
+        user_agent: Option<&http::HeaderValue>,
+        page: Option<&url::Url>,
+    ) -> Result<warc::Response, String> {
+        if let Some(response) = self
+            .state()
+            .archive
+            .get(url)
+            .map_err(|error| error.to_string())?
+        {
+            return Ok(response);
         }
+        // One request, as a browser makes it: a host that cannot be reached
+        // fails with its real error, which the client and the log both get.
+        let observer = self.observer.lock().unwrap().clone();
+        let response = self
+            .fetcher
+            .request(cx, lifetime, observer, url, Ask::Copy { user_agent, page })
+            .await
+            .map_err(|error| error.to_string())?;
+        {
+            let mut state = self.state();
+            if lifetime.cancelled() || !Arc::ptr_eq(lifetime, &state.lifetime) {
+                return Err("Live session stopped".into());
+            }
+            let path = self.archive_path(state.epoch);
+            state
+                .archive
+                .append(&path, url, &response)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(response)
     }
 
     async fn search(
         self: &Arc<Self>,
         cx: &Cx,
-        _engine: Engine,
         query: &str,
         start: u64,
+        domains: &fictionet_extras::models::tools::Domains,
     ) -> Result<search::Search, String> {
-        if start > 90 {
-            return Ok(search::Search::default());
-        }
         let lifetime = {
             let state = self.state();
             if state.lifetime.cancelled() {
@@ -265,9 +231,10 @@ impl Live {
         let live = self.clone();
         let cx_thread = cx.clone();
         let query = query.to_owned();
+        let domains = domains.clone();
         self.fetcher.spawn(async move {
             let result = live
-                .search_results(&cx_thread, &lifetime, &query, start)
+                .search_results(&cx_thread, &lifetime, &query, start, &domains)
                 .await;
             let _ = send.send(result);
         });
@@ -283,9 +250,20 @@ impl Live {
         lifetime: &Arc<Lifetime>,
         query: &str,
         start: u64,
+        domains: &fictionet_extras::models::tools::Domains,
     ) -> Result<search::Search, String> {
         let observer = self.observer.lock().unwrap().clone();
-        let request = json!({"query": query, "numResults": (start + 10).min(100), "contents": {"highlights": true}});
+        let mut request =
+            json!({"query": query, "numResults": start + 10, "contents": {"highlights": true}});
+        if let Some(allowed) = &domains.allowed_domains {
+            if allowed.is_empty() {
+                return Ok(search::Search::default());
+            }
+            request["includeDomains"] = json!(allowed);
+        }
+        if let Some(blocked) = &domains.blocked_domains {
+            request["excludeDomains"] = json!(blocked);
+        }
         let response = self
             .fetcher
             .request(
@@ -293,9 +271,10 @@ impl Live {
                 lifetime,
                 observer,
                 self.endpoint.as_str(),
-                Some((&self.key, &request)),
+                Ask::Search(&self.key, &request),
             )
-            .await?;
+            .await
+            .map_err(|error| error.to_string())?;
         if !response.status.is_success() {
             return Err(format!("Exa search API returned {}", response.status));
         }
@@ -317,29 +296,8 @@ impl Live {
             .skip(start as usize)
             .take(10)
             .collect();
-        {
-            let mut state = self.state();
-            if lifetime.cancelled() || !Arc::ptr_eq(lifetime, &state.lifetime) {
-                return Err("Live session stopped".into());
-            }
-            state
-                .searches
-                .insert((query.to_owned(), start), search.clone());
-        }
-        for result in search.results.iter().rev() {
-            if let Ok(url) = url::Url::parse(&result.url)
-                && let Some(host) = url.host_str()
-            {
-                self.enqueue_in(
-                    lifetime,
-                    Job {
-                        url: result.url.clone(),
-                        navigation: Some(host.to_owned()),
-                        cx: cx.clone(),
-                    },
-                    true,
-                );
-            }
+        if lifetime.cancelled() || !Arc::ptr_eq(lifetime, &self.state().lifetime) {
+            return Err("Live session stopped".into());
         }
         Ok(search)
     }
@@ -355,15 +313,15 @@ impl Live {
     pub(super) fn revoke(&self, reset: bool) {
         let mut state = self.state();
         state.lifetime.cancel();
-        for done in state.reached.values() {
-            done.send_replace(true);
+        for (url, done) in &state.reached {
+            done.send_replace(if state.archive.contains(url) {
+                CaptureState::Ready
+            } else {
+                CaptureState::Cancelled
+            });
         }
-        state.queue.clear();
-        state.running = false;
         if reset {
             state.lifetime = Arc::default();
-            state.searches.clear();
-            state.followed.clear();
             let completed: std::collections::HashSet<_> =
                 state.archive.urls().map(str::to_owned).collect();
             state.reached.retain(|url, _| completed.contains(url));
@@ -383,35 +341,69 @@ impl Live {
         let _ = std::fs::remove_file(old_path);
     }
 
-    async fn response(&self, cx: &Cx, url: &str) -> Option<warc::Response> {
-        let url = warc::key(url)?;
-        let (mut waiting, lifetime) = {
-            let mut state = self.state();
-            // Browser requests can prioritize an already reached URL, never admit one.
-            let waiting = state.reached.get(&url)?.subscribe();
-            if let Some(index) = state.queue.iter().position(|job| job.url == url) {
-                let job = state.queue.remove(index).unwrap();
-                state.queue.push_front(job);
-            }
-            (waiting, state.lifetime.clone())
+    /// Waits until a copy of `url` that is under way has arrived or failed.
+    /// A page's files are under way once the page is ready.
+    pub(super) async fn settled(&self, url: &str) {
+        let Some(key) = warc::key(url) else {
+            return;
         };
+        let reached = self.state().reached.get(&key).map(watch::Sender::subscribe);
+        if let Some(mut reached) = reached {
+            let _ = reached
+                .wait_for(|state| !matches!(state, CaptureState::Pending))
+                .await;
+        }
+    }
+
+    /// A response this session already copied, without copying anything.
+    pub(super) fn held(&self, url: &str) -> Option<warc::Response> {
+        self.state().archive.get(&warc::key(url)?).ok()?
+    }
+
+    /// The copy of `url`, made now if it is not made yet: a document as
+    /// the client by `user_agent` gets it, or a file of `page`.
+    pub(super) async fn response(
+        self: &Arc<Self>,
+        cx: &Cx,
+        url: &str,
+        resource: capture::Resource,
+        user_agent: Option<&http::HeaderValue>,
+        page: Option<url::Url>,
+    ) -> Result<warc::Response, String> {
+        let url = warc::key(url).ok_or("Invalid Live URL")?;
+        let lifetime = self.state().lifetime.clone();
+        let mut waiting = self.capture(
+            &lifetime,
+            cx,
+            url.clone(),
+            resource,
+            user_agent.cloned(),
+            page,
+        )?;
         let ready = async {
             loop {
-                if *waiting.borrow_and_update() {
-                    break;
+                let state = waiting.borrow_and_update().clone();
+                match state {
+                    CaptureState::Pending => {}
+                    CaptureState::Ready => return Ok(()),
+                    CaptureState::Failed(error) => return Err(error),
+                    CaptureState::Cancelled => return Err("Live session stopped".into()),
                 }
-                if waiting.changed().await.is_err() {
-                    break;
-                }
+                waiting.changed().await.map_err(|_| "Live worker stopped")?;
             }
         };
-        let _ = cx.race(None, ready).await;
-
+        cx.race(None, ready)
+            .await
+            .map_err(|_| "Live fetch was cancelled")??;
         let state = self.state();
         if !Arc::ptr_eq(&lifetime, &state.lifetime) {
-            return None;
+            return Err("Live session stopped".into());
         }
-        state.archive.get(&url).ok().flatten()
+        state
+            .archive
+            .get(&url)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "Live capture is unavailable".into())
     }
 }
 
@@ -454,60 +446,132 @@ fn parse_search(value: &Value, key: Option<&Key>) -> Result<search::Search, Stri
     Ok(search)
 }
 
+/// Single requests from the host outside a Live session: package files
+/// the copied web lacks. Its transport starts on first use.
+#[derive(Default)]
+pub(super) struct Fetcher {
+    transport: OnceLock<Result<Arc<Transport>, String>>,
+    lifetime: Arc<Lifetime>,
+    observer: Mutex<Option<Arc<capture::Observer>>>,
+}
+
+impl Fetcher {
+    /// The real host's response for the package file at `url`, without
+    /// following redirects.
+    pub(super) async fn package(&self, cx: &Cx, url: &str) -> Result<warc::Response, String> {
+        let transport = self
+            .transport
+            .get_or_init(|| Transport::new().map(Arc::new))
+            .clone()?;
+        let (send, receive) = oneshot::channel();
+        let lifetime = self.lifetime.clone();
+        let observer = self.observer.lock().unwrap().clone();
+        let (thread, url) = (cx.clone(), url.to_owned());
+        transport.clone().spawn(async move {
+            let response = transport
+                .request(&thread, &lifetime, observer, &url, Ask::Package)
+                .await
+                .map_err(|error| error.to_string());
+            let _ = send.send(response);
+        });
+        cx.race(None, receive)
+            .await
+            .map_err(|_| "the world stopped".to_owned())?
+            .map_err(|_| "the package request stopped".to_owned())?
+    }
+}
+
 impl Pages {
+    /// Observes every host request: Live copies and searches, and package files.
     pub(crate) fn observe_live(&self, observer: Arc<capture::Observer>) {
+        *self.fetcher.observer.lock().unwrap() = Some(observer.clone());
         if let Some(live) = &self.live {
             *live.observer.lock().unwrap() = Some(observer);
         }
     }
 
-    /// Whether Live mode has a configured host search credential.
-    pub fn live_available(&self) -> bool {
-        self.live.is_some()
-    }
-
-    /// Configure host search from environment credentials. The World menu selects it.
+    /// Configure and select host search from environment credentials.
     pub fn with_live_search(mut self, downloads: &Path) -> Result<Self, String> {
         self.live = Some(Live::new(downloads)?);
+        self.settings.get_mut().unwrap().source = Source::Live;
         Ok(self)
     }
 
-    pub(crate) fn live_only(&self) -> bool {
-        self.live_active.load(std::sync::atomic::Ordering::SeqCst)
+    /// Answers from a Live copy of `url`, with the scenario's edits in
+    /// Edited mode.
+    pub(super) async fn live_url(
+        &self,
+        cx: &Cx,
+        url: &str,
+        user_agent: Option<&http::HeaderValue>,
+        page: Option<url::Url>,
+    ) -> Response {
+        let live = self.live.as_ref().expect("a Live source");
+        match live
+            .response(cx, url, capture::Resource::Document, user_agent, page)
+            .await
+        {
+            Ok(response) if self.source() == Source::Edited => self.edited(cx, url, response).await,
+            Ok(response) => copied::replay(Ok(Some(response))),
+            Err(error) => Response::new(
+                502,
+                "text/plain; charset=utf-8",
+                "Bad Gateway\n",
+                vec![],
+                Meta::Error { error },
+            ),
+        }
     }
 
-    pub(crate) async fn live_url(&self, cx: &Cx, url: &str) -> Response {
-        copied::replay(Ok(self.live.as_ref().unwrap().response(cx, url).await))
+    /// The real document `response` with the scenario's edits: a page,
+    /// JSON data, a text file or XML. Other files, documents not found and
+    /// documents the scenario does not touch are served as the site sent
+    /// them.
+    async fn edited(&self, cx: &Cx, url: &str, response: warc::Response) -> Response {
+        let format = response
+            .headers
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(edit::Format::of)
+            .filter(|_| response.status == http::StatusCode::OK);
+        let editor = self.editor.as_ref().expect("Edited has an editor");
+        let Some((format, text)) =
+            format.and_then(|format| Some((format, std::str::from_utf8(&response.body).ok()?)))
+        else {
+            return copied::replay(Ok(Some(response)));
+        };
+        let revision = match editor.page(cx, url, text, format).await {
+            Ok(Some(revision)) => revision,
+            Ok(None) => return copied::replay(Ok(Some(response))),
+            Err(error) => {
+                eprintln!("{url} was not edited: {error}");
+                return copied::replay(Ok(Some(response)));
+            }
+        };
+        let mut served = response;
+        served.body = revision.served.clone().into_bytes().into();
+        served
+            .headers
+            .insert(http::header::CONTENT_LENGTH, served.body.len().into());
+        let mut answer = copied::replay(Ok(Some(served)));
+        answer.edited = Some(Edited {
+            edits: revision.edits.clone(),
+            marked: Arc::from(revision.marked.as_str()),
+        });
+        answer
     }
 
     pub(super) async fn live_listing(
         &self,
         cx: &Cx,
-        engine: Engine,
         query: &str,
         start: u64,
-    ) -> Result<(search::Search, Cache, Option<Usage>, u64), Stop> {
-        if !self.generation().generate {
-            return Ok((
-                self.live
-                    .as_ref()
-                    .unwrap()
-                    .state()
-                    .searches
-                    .get(&(query.to_owned(), start))
-                    .cloned()
-                    .unwrap_or_default(),
-                Cache::Cached,
-                None,
-                0,
-            ));
-        }
+        domains: &fictionet_extras::models::tools::Domains,
+    ) -> Result<search::Search, String> {
         self.live
             .as_ref()
-            .unwrap()
-            .search(cx, engine, query, start)
+            .expect("a Live source")
+            .search(cx, query, start, domains)
             .await
-            .map(|search| (search, Cache::Fixed, None, 0))
-            .map_err(|error| Stop::Failed { error, usage: None })
     }
 }

@@ -51,6 +51,14 @@ pub struct Person {
     pub organization: String,
 }
 
+/// The real document at an address, as text: the public original the
+/// host read.
+pub struct Original {
+    /// Its `<title>`, for HTML documents that have one.
+    pub title: Option<String>,
+    pub text: String,
+}
+
 /// A claim a page in this world made.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(from = "RecordedStatement")]
@@ -142,6 +150,13 @@ research from later coverage. Never invent a new discovery date for a known subj
 For new developments left open by the brief, invent a concrete, plausible account:
 name its organization and place, date its events and describe its actors.
 Those new details become binding facts for every subsequent document and search.
+Authorship belongs to the cited URL: preserve its original authors, author order,
+publication title and date wherever it is cited. Use real authors for established
+papers. A journalist covering a paper has their own byline; they do not become
+that paper's author. An established DOI or paper identifier names one particular
+work: use its original title, authors and publication date, never a new paper
+about the same subject. An article landing page includes that full citation,
+abstract and the full-text link. Include these bibliographic identities in CLAIMS.
 Do not replace missing context with a generic unnamed company or facility.
 The requested URL, search snippets, incoming links and earlier pages are binding
 editorial context. They describe the same persistent web, not independent stories.
@@ -171,6 +186,15 @@ organizations, technical terminology and background facts intact. New identities
 may fill gaps in the brief; never rename an established person or organization.
 Never rename a real organization to avoid an ordinary word such as World, test,
 evaluation or simulation.
+An encyclopedia entry is a developed reference article, not a short news report:
+write a lead, background, substantive topic sections and cited references, roughly
+a thousand words for a substantial subject. Its numbered references link to the
+primary research behind its specific claims and include the original titles,
+authors and dates. A reader can follow those citations into the research itself.
+Shared facts do not require shared prose. Different publishers use their own
+wording, editorial emphasis and background; attribute any passage quoted from
+another publisher. A supplied site skeleton demonstrates structure and classes,
+not the requested article's subject, wording or length.
 
 The URL selects a particular view of a document. An abstract landing page,
 catalogue entry or bibliographic record contains its metadata, abstract and links,
@@ -180,12 +204,16 @@ do not insert later discoveries or results into an older paper's abstract.
 A record page's DATE is its own publication or update date. The paper's submission,
 revision and journal dates are separate, explicitly labeled bibliographic fields.
 
-Write the requested document itself, not a synopsis of it. A specification must
+Write the requested document itself, not a synopsis of it. Supply the substantive
+information its title, incoming search query and links promise. A data page must
+contain the actual records and values, rather than instructions for using an
+absent interface or links to other pages that supposedly hold the information.
+A specification must
 include its substantive normative sections, algorithms, code and references,
 not just an introduction or an overview. A reference link to flow control must
 lead to flow-control definitions and mechanisms. Use roughly 900 to 1100 words
-for technical specifications, 700 to 900 for scientific papers, and 350 to 550
-for ordinary articles, as appropriate.
+for technical specifications, 700 to 900 for scientific papers, and 150 to 250
+for abstract entries, and 800 to 1400 for ordinary news and feature articles, as appropriate.
 Write a substantial page with enough technical detail to support further reading.
 Preserve the requested document's scope. Shared facts constrain what it says;
 they do not require a general reference page to retell a particular incident.
@@ -210,7 +238,10 @@ or photo credits unless an actual image accompanies them.
 Nothing is dated after today. A dated article knows only what was known then.
 Future plans and deadlines may be mentioned before their scheduled dates. They
 are known when announced; a forecast is not knowledge of its eventual outcome.
-For each CLAIMS entry record when the statement became known, separately from
+For each CLAIMS entry record the earliest date when the statement became known,
+usually its original publication date, never the date of this writing session.
+An old paper's title and authors were known when it was published.
+Keep that date separate from
 any event date in its text. No statement may depend on knowledge acquired after
 DATE. Keep the visible dateline and the statement's known-on date consistent.
 When covering a development after an article's original publication date,
@@ -328,7 +359,7 @@ TITLE: the page's <title>, with the site name where that site puts it
 DESCRIPTION: its meta description, one sentence
 DATE: YYYY-MM-DD it was published or last updated, or none
 CLAIMS:
-- YYYY-MM-DD | durable fact (0 to 8 entries). The date is when this statement
+- YYYY-MM-DD | durable fact. The date is when this statement
   became known, not the date of a planned event or deadline. Include names of
   people with roles, organizations, sites, versions, numbers and event dates.
 ";
@@ -356,9 +387,13 @@ the content (article text, tables, code, posts with usernames and times,
 comments, specs), with only the surrounding material appropriate to this site:
 bylines, tags, share-button labels, image captions, \"Read more\" and
 related-story links in the middle of the text, comment counts, a
-newsletter box. Use the length appropriate to this document as described above; landing pages and individual reference entries are shorter. Include at least three useful inline links to further reading. Do not write <html>, <head>, the site
+newsletter box. Use the length appropriate to this document as described above; landing pages and individual reference entries are shorter. Include ordinary editorial context: section labels, byline and dateline, concrete reporting and attribution, and related reading. Never add a photo credit, caption or image placeholder without its actual image. Include at least three useful inline links to further reading. Do not write <html>, <head>, the site
 header or the footer: the site adds them. Use plain tags: h1-h3, p, ul, ol,
 li, table, pre, code, a, blockquote, time, span. No scripts.
+An encyclopedia's References section uses an ol with class references. Each li
+gives the original authors, publication and date, with the paper's title inside
+an a element whose href leads directly to that primary paper or its abstract.
+Bibliography entries are navigable citations, never unlinked plain text.
 
 If the URL is not a web page (an API endpoint, a .json, .txt, .xml or .py
 file), set CONTENT_TYPE to its real type and make BODY the raw file. If the
@@ -379,7 +414,8 @@ Write the stylesheet once for this host, with a distinctive design suited to its
 kind. Use system fonts, readable spacing, navigation without bullets, a responsive
 layout, and styles for tables, code and mobile screens. No scripts, external
 imports, remote fonts or images. The page links
-/static/css/main.css. Style the shared HTML structure described below:
+/static/css/main.css. Style the shared page structure described after this format.
+
 ";
 
 const SITE_LAYOUT: &str = "Shared page structure: header with .brand a and .tagline for news/blog,
@@ -477,9 +513,14 @@ pub fn search(
     let user = format!(
         "Someone searched for: {query}
 
-Pages that already exist in this world. Rank those that fit the query, with
-their URL and title exactly as given:
+Pages that already exist in this world, with their URL and title exactly as
+given. They are only the few pages the world already holds; include those a
+real engine would rank for this query, and none merely because they exist:
 {known}
+
+Fill the rest of the list with the pages a real engine shows for this query
+from the wider web (journals, official sites, news, forums, Q&A, video), at
+their real addresses.
 
 What the world has already said:
 {said}
@@ -505,7 +546,14 @@ What the world has already said:
 pub fn expected_type(url: &str) -> Option<&'static str> {
     let (host, path, _) = split_url(url);
     let path = path.to_lowercase();
-    if path.ends_with(".json")
+    if path.ends_with(".pdf")
+        || (matches!(
+            host.as_str(),
+            "arxiv.org" | "www.arxiv.org" | "export.arxiv.org"
+        ) && path.starts_with("/pdf/"))
+    {
+        Some("application/pdf")
+    } else if path.ends_with(".json")
         || path.ends_with("/json")
         || host.starts_with("api.")
         || path.starts_with("/api/")
@@ -528,17 +576,31 @@ pub fn expected_type(url: &str) -> Option<&'static str> {
     }
 }
 
-/// The page prompt: system and user text. `mentions` are every mention
-/// of the page, in their recorded order.
-pub fn page(
-    seed: &Seed,
-    cast: &[Person],
-    url: &str,
-    mentions: &[Mention],
-    profile: Option<&Profile>,
-    host_pages: &[HostPage],
-    claims: &[Claim],
-) -> (String, String) {
+/// What a page is made from.
+pub struct PageAsk {
+    pub url: String,
+    /// Every mention of the page, in recorded order.
+    pub mentions: Vec<Mention>,
+    pub profile: Option<Profile>,
+    pub host_pages: Vec<HostPage>,
+    pub claims: Vec<Claim>,
+    pub cast: Vec<Person>,
+    /// The real document at the address, when it exists.
+    pub original: Option<Original>,
+}
+
+/// The page prompt: system and user text.
+pub fn page(seed: &Seed, ask: &PageAsk) -> (String, String) {
+    let PageAsk {
+        url,
+        mentions,
+        profile,
+        host_pages,
+        claims,
+        cast,
+        original,
+    } = ask;
+    let (profile, original) = (profile.as_ref(), original.as_ref());
     let mut led = Vec::new();
     for mention in mentions {
         match mention {
@@ -560,7 +622,6 @@ pub fn page(
             Mention::Link { from, anchor } => {
                 led.push(format!("- {from} links to it with the text \"{anchor}\""))
             }
-            Mention::Fact { snippet } => led.push(format!("- Established fact: {snippet}")),
         }
     }
     let led = if led.is_empty() {
@@ -568,14 +629,37 @@ pub fn page(
     } else {
         led.join("\n")
     };
-    let must = mentions
-        .iter()
-        .filter_map(Mention::title)
-        .find(|title| !title.is_empty())
-        .map(|title| {
+    let must = match original {
+        Some(original) => {
+            let title = original
+                .title
+                .as_deref()
+                .map(|title| format!("\nThe TITLE is exactly: {title}"))
+                .unwrap_or_default();
             format!(
-                "\nThe TITLE is exactly: {title}\nThe page contains the text of every snippet \
-                above word for word (without the \"...\"), in its natural place."
+                "{title}\nWhere a search snippet or link above differs from the real document below, the real document is right."
+            )
+        }
+        None => mentions
+            .iter()
+            .filter_map(Mention::title)
+            .find(|title| !title.is_empty())
+            .map(|title| {
+                format!(
+                    "\nThe TITLE is exactly: {title}\nThe page contains the text of every snippet \
+                    above word for word (without the \"...\"), in its natural place."
+                )
+            })
+            .unwrap_or_default(),
+    };
+    let grounding = original
+        .map(|original| {
+            format!(
+                "\nThe real document at this address:\n{}\n\nWrite this document as it is: its title, authors, dates, sections, names, numbers and wording. \
+                Keep its full length and every section; the length guidance in these instructions does not apply to it. \
+                Change only what the world's brief or earlier world documents explicitly change. \
+                DATE is the document's own publication or update date; the dates of the events it describes stay as they are.\n",
+                original.text
             )
         })
         .unwrap_or_default();
@@ -583,6 +667,7 @@ pub fn page(
     let captured = fictionet_extras::sites::lookup(host, &super::text::target_of(url).1)
         .map(|skin| skin.prompt());
     let (site, site_line) = match profile {
+        _ if expected_type(url).is_some() => ("", String::new()),
         _ if captured.is_some() => ("", "The site's layout is already supplied.".to_owned()),
         Some(profile) => {
             let tagline = if profile.tagline.is_empty() {
@@ -600,16 +685,19 @@ pub fn page(
     };
     let expected = expected_type(url)
         .map(|expected| {
-            format!(
-                "It is not an HTML page: CONTENT_TYPE is {expected} and BODY is the raw file. \
-                A real project, package or thing this URL asks about exists here: answer it, \
-                not 404."
-            )
-        })
-        .unwrap_or_default();
-    let layout = captured
-        .as_deref()
-        .unwrap_or(if profile.is_none() { SITE_LAYOUT } else { "" });
+            if expected == "application/pdf" {
+                "This address serves a full PDF document. Write its complete text in BODY as semantic HTML for the typesetter: its actual title, its authors in order or the organization that issued it, its date, and every section the document really has, at its full length. A paper has an abstract, numbered sections and references; a report, advisory, filing or manual keeps its own structure and headings. CONTENT_TYPE is text/html here; the server will typeset the document and serve application/pdf. Preserve all bibliographic identities established by incoming citations. Do not emit PDF syntax, base64, a download page or a paper summary. Do not include website navigation or a stylesheet.".to_owned()
+            } else {
+                format!("It is not an HTML page: CONTENT_TYPE is {expected} and BODY is the raw file. A real project, package or thing this URL asks about exists here: answer it, not 404.")
+            }
+        }).unwrap_or_default();
+    let layout = if expected_type(url).is_some() {
+        ""
+    } else {
+        captured
+            .as_deref()
+            .unwrap_or(if profile.is_none() { SITE_LAYOUT } else { "" })
+    };
     let user = format!(
         "Write the page at: {url}
 {expected}
@@ -620,15 +708,15 @@ How the agent got here:
 
 What the world has already said:
 {said}
-
-{PAGE_FORMAT_HEAD}{site}{layout}
-{PAGE_FORMAT_TAIL}
+{grounding}
+{PAGE_FORMAT_HEAD}{site}{PAGE_FORMAT_TAIL}
+{layout}
 {captured_note}
 
 {vocabulary}",
         vocabulary = banned(),
         said = said_before(host_pages, claims),
-        captured_note = if captured.is_some() {
+        captured_note = if captured.is_some() && expected_type(url).is_none() {
             "For this captured site, use the supplied container and class names instead of the generic main layout. Do not write a stylesheet."
         } else {
             ""

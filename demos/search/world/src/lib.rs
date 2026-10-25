@@ -1,17 +1,17 @@
 //! The Search world's DNS, TLS, web pages and search engines.
 //!
 //! [`World`] joins public hostnames to certificates and an HTTP handler.
-//! [`pages`] supplies copied WARC responses, model-written pages, or live
-//! captures. Google, Bing and DuckDuckGo render results over the same index.
-//! The world's clock comes from the brief's date; headers, pages and
-//! certificates use it together. [`observation`] defines this world's typed
-//! facts; the demo app projects them into its page.
+//! [`pages`] supplies copied WARC responses, live copies of the real web,
+//! or live copies with a scenario's edits. Google, Bing and DuckDuckGo
+//! render results in their own layouts. Headers and certificates use the
+//! run clock. [`observation`] defines this world's typed facts; the demo
+//! app projects them into its page.
 //!
-//! The demo app in `demos/search/app` adds the VM, guest credential model
-//! gateway, provider sign-in relay and package mirror. The standalone
-//! `web-world` binary accepts its configuration as JSON, followed by socket,
+//! The demo app in `demos/search/app` adds the VM, the guest credential
+//! model gateway and the provider sign-in relay. The standalone
+//! `web-world` binary serves the [`pages::written`] web for the Inspect
+//! integration; it accepts its configuration as JSON, followed by socket,
 //! certificate, state and ready-file arguments.
-//!
 
 mod dns;
 mod files;
@@ -19,7 +19,6 @@ pub mod handler;
 pub mod observation;
 pub mod pages;
 pub mod route;
-pub mod search;
 mod tls;
 
 use std::collections::{HashMap, HashSet};
@@ -97,6 +96,9 @@ pub fn net(
     log.attach(fcx);
     let world = fcx.clone();
     let refused_pages = pages.clone();
+    // Live hosts show the guest the real host's certificate failure: a
+    // site whose certificate expired presents an expired one here too.
+    let upstream = Arc::new(tls::Upstream::default());
     let site_for = move |host: &str| {
         let name: crate::observation::HostName = host.parse().ok()?;
         let resolved = |address| {
@@ -117,6 +119,14 @@ pub fn net(
             resolved(None);
             return None;
         }
+        // Live pages come from the internet, so its DNS decides: a name
+        // with no address there has none here either. The host's resolver
+        // answers from its cache or with one query, and the answer is kept
+        // for the run.
+        if forwarded.is_none() && refused_pages.source().is_live() && !on_the_internet(host) {
+            resolved(None);
+            return None;
+        }
         let (addr, _) = match addresses.assign(host) {
             Ok(Some(assigned)) => assigned,
             Ok(None) => {
@@ -133,13 +143,41 @@ pub fn net(
         if let Some(site) = forwarded {
             return Some(site.at(addr));
         }
-        let (ca, name) = (ca.clone(), host.to_owned());
+        if refused_pages.source().is_live() {
+            upstream.start(host);
+        }
+        let (ca, name, pages, upstream) = (
+            ca.clone(),
+            host.to_owned(),
+            refused_pages.clone(),
+            upstream.clone(),
+        );
         let config: Arc<OnceLock<Arc<ServerConfig>>> = Arc::new(OnceLock::new());
+        let refused: Arc<OnceLock<Arc<ServerConfig>>> = Arc::new(OnceLock::new());
         Some(
             web::Site::new(handler.clone())
                 .date(start)
                 .at(addr)
                 .tls_with(move |fcx| {
+                    if pages.source().is_live()
+                        && let Some(refusal) = upstream.refusal(&name)
+                    {
+                        if let Ok(host) = name.parse() {
+                            pages.report(
+                                fcx,
+                                crate::observation::SearchObs::Certificate {
+                                    host,
+                                    problem: (&refusal).into(),
+                                },
+                            );
+                        }
+                        return refused
+                            .get_or_init(|| {
+                                ca.refused(fcx, &name, &refusal)
+                                    .expect("a certificate for an admitted name")
+                            })
+                            .clone();
+                    }
                     config
                         .get_or_init(|| {
                             let (config, _, _) = ca
@@ -169,10 +207,16 @@ pub fn net(
         })
 }
 
-/// A world kept in memory, made from one seed: a new CA, the seed's fixed
-/// addresses and its fixed and stored pages, dated from `start`,
-/// usually [`world_start`] of the seed's date. The executable keeps a store
-/// and may use a model instead.
+/// Whether the internet's DNS gives `host` an address.
+fn on_the_internet(host: &str) -> bool {
+    use std::net::ToSocketAddrs;
+    (host, 443)
+        .to_socket_addrs()
+        .is_ok_and(|mut addresses| addresses.next().is_some())
+}
+
+/// A world kept in memory: its CA, the addresses it gives names, its
+/// pages, and the run's start on the host clock.
 pub struct World {
     pub ca: Arc<Ca>,
     pub addresses: Arc<Addresses>,
@@ -181,15 +225,6 @@ pub struct World {
 }
 
 impl World {
-    pub fn new(fcx: &Cx, seed: pages::Seed, start: SystemTime) -> fictionet::Result<World> {
-        Ok(World {
-            ca: Arc::new(Ca::in_memory(fcx, start)?),
-            addresses: Arc::new(Addresses::new(seed.fixed_addresses(), None)?),
-            pages: Arc::new(Pages::new(seed)),
-            start,
-        })
-    }
-
     /// The world's unstarted network, as [`net`] builds it.
     pub fn net(
         &self,
@@ -206,15 +241,5 @@ impl World {
             self.start,
             forward,
         )
-    }
-
-    /// Starts the world's network, as [`serve`] does.
-    pub fn serve(
-        &self,
-        fcx: &Cx,
-        log: Arc<Log>,
-        attachments: fictionet::Attachments,
-    ) -> fictionet::Result {
-        self.net(fcx, log, |_| None).start(fcx, attachments)
     }
 }

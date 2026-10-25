@@ -246,7 +246,9 @@ impl Backend {
                             return finished(status, bytes);
                         }
                     }
-                    Ok(n) => bytes.extend_from_slice(&chunk[..n]),
+                    Ok(n) => {
+                        bytes.extend_from_slice(&chunk[..n]);
+                    }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
                     Err(error) => return Err(error),
                 }

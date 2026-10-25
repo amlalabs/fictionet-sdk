@@ -33,7 +33,7 @@ use serde_json::{Value, json};
 use super::make::Profile;
 use super::model::Usage;
 use super::prompts::{Claim, HostPage, Person};
-use super::{Generation, Mention, Seed};
+use super::{Mention, Seed};
 use crate::files::{self, Appended, FileLock};
 
 /// The format of `store.json` and `world.jsonl`.
@@ -154,14 +154,27 @@ pub struct Store {
     cast: Option<CastRecord>,
     claims: Vec<Claim>,
     files: Option<Files>,
-    /// The world's generation setting; not stored.
-    pub generation: Generation,
-    /// Pages made ahead of time that no request has asked for yet.
-    pub unserved: std::collections::HashSet<(String, String)>,
 }
 
 fn key(host: &str, target: &str) -> (String, String) {
     (host.to_owned(), target.to_owned())
+}
+
+/// What a stored page is about, in words: its title, description, its
+/// address's own words and its claims. Its full text is not matched, since
+/// a long page shares a word or two with almost anything.
+fn about(page: &PageRecord) -> String {
+    let mut about = format!(
+        "{} {} {}",
+        page.title,
+        page.description,
+        super::make::title_from(&page.host, &page.target)
+    );
+    for claim in &page.claims {
+        about.push(' ');
+        about.push_str(&claim.text);
+    }
+    about
 }
 
 /// Why a store cannot be used, and how to start over.
@@ -185,8 +198,6 @@ impl Store {
             cast: None,
             claims: Vec::new(),
             files: None,
-            generation: Generation::default(),
-            unserved: Default::default(),
         }
     }
 
@@ -260,39 +271,6 @@ impl Store {
         store.read_on(true).map_err(|e| e.to_string())?;
         drop(held);
         Ok((store, made_by))
-    }
-
-    /// Reads the store at `root` into memory, for a world that serves it
-    /// and keeps what it adds in memory only. The store must have been made
-    /// for `seed` by a generator. Returns the store and that generator's
-    /// identity. Nothing under `root` is written.
-    pub fn load(root: &Path, seed: &Seed) -> Result<(Self, Value), String> {
-        let fail = |e: io::Error| format!("{}: {e}", root.display());
-        let text = std::fs::read(root.join("store.json")).map_err(fail)?;
-        let identity: Value = serde_json::from_slice(&text)
-            .map_err(|e| incompatible(root, &format!("store.json is not JSON: {e}")))?;
-        if identity["version"] != VERSION {
-            return Err(incompatible(root, "unsupported store format version"));
-        }
-        if identity["seed"] != seed.declaration() {
-            return Err(incompatible(root, "the seed's declaration differs"));
-        }
-        if !identity["generator"].is_object() {
-            return Err(incompatible(root, "it names no generator"));
-        }
-        let lines = std::fs::read_to_string(root.join("world.jsonl")).map_err(fail)?;
-        let mut store = Self::memory();
-        for (number, line) in lines.lines().enumerate() {
-            let entry: Entry = serde_json::from_str(line).map_err(|e| {
-                format!(
-                    "{}: line {}: {e}",
-                    root.join("world.jsonl").display(),
-                    number + 1
-                )
-            })?;
-            store.apply(entry);
-        }
-        Ok((store, identity["generator"].clone()))
     }
 
     /// Applies what other worlds have written to `world.jsonl` since this
@@ -404,21 +382,44 @@ impl Store {
         self.record(Entry::Page(page))
     }
 
-    /// The host's pages, newest first, as its next prompt shows them.
-    pub fn host_pages(&self, host: &str) -> Vec<HostPage> {
+    /// The host's pages about `subject`, newest first, as its next prompt
+    /// shows them.
+    pub fn host_pages(&self, host: &str, subject: &str) -> Vec<HostPage> {
         self.order
             .iter()
             .rev()
             .filter(|(h, _)| h == host)
-            .map(|at| {
-                let page = &self.pages[at];
-                HostPage {
-                    url: page.url.clone(),
-                    title: page.title.clone(),
-                    claims: page.claims.clone(),
-                }
+            .map(|at| &self.pages[at])
+            .filter(|page| super::make::related(subject, &about(page)))
+            .map(|page| HostPage {
+                url: page.url.clone(),
+                title: page.title.clone(),
+                claims: page.claims.clone(),
             })
             .collect()
+    }
+
+    /// What a page at `host` and `target` is about, in words: its address's
+    /// own words and what every search and link said of it. Addresses and
+    /// field names are not words about it.
+    pub fn subject(&self, host: &str, target: &str) -> String {
+        let mut subject = super::make::title_from(host, target);
+        for mention in self.mentions(host, target) {
+            let said: &[&str] = match mention {
+                Mention::Search {
+                    query,
+                    title,
+                    snippet,
+                    ..
+                } => &[query, title, snippet],
+                Mention::Link { anchor, .. } => &[anchor],
+            };
+            for text in said {
+                subject.push(' ');
+                subject.push_str(text);
+            }
+        }
+        subject
     }
 
     /// Pages the world has: the seed's fixed pages and every page made with
@@ -455,9 +456,26 @@ impl Store {
         fixed.chain(made).collect()
     }
 
-    /// Published text and search promises are context even when a writer omitted CLAIMS.
+    /// What the world has said about `subject`: the claims, published text
+    /// and search promises of pages and searches about it. Published text
+    /// is context even when a writer omitted CLAIMS. Pages about other
+    /// things stay out, so one question's facts do not leak into another's
+    /// pages.
     pub fn writing_context(&self, subject: &str) -> Vec<Claim> {
-        let mut claims = self.claims.clone();
+        let related = |text: &str| super::make::related(subject, text);
+        let mut claims: Vec<Claim> = self
+            .claims
+            .iter()
+            .filter(|claim| {
+                let (host, target) = super::text::target_of(&claim.url);
+                related(&format!(
+                    "{} {}",
+                    super::make::title_from(&host, &target),
+                    claim.claim.text
+                ))
+            })
+            .cloned()
+            .collect();
         for page in self
             .order
             .iter()
@@ -465,13 +483,13 @@ impl Store {
             .map(|key| &self.pages[key])
             .filter(|page| page.status == 200)
         {
-            let body = String::from_utf8_lossy(&page.body);
-            let text = if page.content_type.starts_with("text/html") {
-                super::text::text_of(&body)
-            } else {
-                body.into_owned()
-            };
-            if super::make::shares_words(&format!("{} {} {text}", page.title, page.url), subject) {
+            if related(&about(page)) {
+                let body = String::from_utf8_lossy(&page.body);
+                let text = if page.content_type.starts_with("text/html") {
+                    super::text::text_of(&body)
+                } else {
+                    body.into_owned()
+                };
                 claims.push(Claim {
                     url: page.url.clone(),
                     claim: super::prompts::Statement {
@@ -484,7 +502,7 @@ impl Store {
         for search in self
             .searches
             .values()
-            .filter(|search| super::make::shares_words(&search.query, subject))
+            .filter(|search| related(&search.query))
         {
             claims.extend(search.search.results.iter().map(Claim::search));
         }
@@ -495,11 +513,7 @@ impl Store {
     /// even when an opaque path shares no words with the query.
     pub fn page_context(&self, host: &str, target: &str) -> Vec<Claim> {
         let url = format!("https://{host}{target}");
-        let subject = format!(
-            "{url} {}",
-            serde_json::to_string(self.mentions(host, target)).expect("mentions")
-        );
-        let mut claims = self.writing_context(&subject);
+        let mut claims = self.writing_context(&self.subject(host, target));
         for search in self
             .searches
             .values()
@@ -542,12 +556,15 @@ impl Store {
     /// mention: a page that exists gives its title and description, then the
     /// seed's declaration of a fixed page, then the first title a mention
     /// showed. Returns the mention as recorded, so every engine shows it.
+    /// While the page is being written, only what it was asked to show
+    /// can be promised: the first recorded mention's title, snippet and date.
     pub fn reserve_mention(
         &mut self,
         seed: &Seed,
         host: &str,
         target: &str,
         mut mention: Mention,
+        writing: bool,
     ) -> io::Result<Mention> {
         let _held = self.hold()?;
         let page = self
@@ -564,6 +581,18 @@ impl Store {
             ..
         } = &mut mention
         {
+            let promised = self
+                .mentions(host, target)
+                .iter()
+                .find_map(|recorded| match recorded {
+                    Mention::Search {
+                        title,
+                        snippet,
+                        date,
+                        ..
+                    } if !title.is_empty() => Some((title.clone(), snippet.clone(), *date)),
+                    _ => None,
+                });
             if let Some((chosen_title, description)) = page.or(declared) {
                 if !chosen_title.is_empty() {
                     *title = chosen_title;
@@ -571,6 +600,10 @@ impl Store {
                 if !description.is_empty() {
                     *snippet = description;
                 }
+            } else if writing && let Some((chosen_title, chosen_snippet, chosen_date)) = promised {
+                *title = chosen_title;
+                *snippet = chosen_snippet;
+                *date = chosen_date;
             } else if let Some(chosen) = self
                 .mentions(host, target)
                 .iter()

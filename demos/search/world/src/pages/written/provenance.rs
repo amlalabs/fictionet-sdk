@@ -23,9 +23,6 @@ pub enum Mention {
         #[serde(default)]
         anchor: String,
     },
-    Fact {
-        snippet: String,
-    },
 }
 
 impl Mention {
@@ -58,7 +55,7 @@ impl Mention {
     }
     pub fn snippet(&self) -> Option<&str> {
         match self {
-            Self::Search { snippet, .. } | Self::Fact { snippet } => Some(snippet),
+            Self::Search { snippet, .. } => Some(snippet),
             _ => None,
         }
     }
@@ -72,17 +69,6 @@ impl Mention {
         match self {
             Self::Search { date, .. } => *date,
             _ => None,
-        }
-    }
-    pub fn reason(&self) -> Option<crate::search::Reason> {
-        use crate::search::Reason;
-        match self {
-            Self::Search { query, rank, .. } => Some(Reason::Search {
-                query: query.clone(),
-                rank: *rank,
-            }),
-            Self::Link { from, .. } => Some(Reason::Link { from: from.clone() }),
-            Self::Fact { .. } => None,
         }
     }
 }

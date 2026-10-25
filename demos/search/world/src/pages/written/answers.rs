@@ -86,7 +86,6 @@ pub fn read_search(text: &str) -> Result<Search, Unreadable> {
     search.results = results
         .into_iter()
         .filter(|r| r.url.starts_with("http") && !r.title.is_empty())
-        .take(10)
         .collect();
     if search.results.is_empty() {
         return Err(Unreadable::Format("no results in the search answer".into()));
@@ -126,9 +125,6 @@ pub fn read_search(text: &str) -> Result<Search, Unreadable> {
             ));
         }
     }
-    search.related.truncate(8);
-    search.questions.truncate(4);
-    search.ads.truncate(2);
     Ok(search)
 }
 
@@ -143,9 +139,17 @@ pub fn read_page(text: &str, expected: Option<&str>, referenced: bool) -> Result
     let text = FENCE
         .get_or_init(|| Regex::new(r"^```[a-z]*\s*\n").unwrap())
         .replace(text, "");
-    let Some((head, body)) = text.split_once("\nBODY:") else {
+    // The header ends at BODY:, or where HTML starts when a writer leaves
+    // that line out.
+    let markup = || {
+        text.match_indices('\n')
+            .map(|(at, _)| at)
+            .find(|&at| text[at + 1..].starts_with('<'))
+            .map(|at| (&text[..at], &text[at..]))
+    };
+    let Some((head, body)) = text.split_once("\nBODY:").or_else(markup) else {
         return Err(Unreadable::Format(
-            "no BODY: line in the page answer".into(),
+            "the answer has no BODY: line; after the header lines, write BODY: on its own line and then the page's main content".into(),
         ));
     };
     let body = body.trim_start_matches('\n').trim_end();
@@ -171,19 +175,14 @@ pub fn read_page(text: &str, expected: Option<&str>, referenced: bool) -> Result
         {
             let item = item.trim();
             if section == "claims" {
-                let (known_on, statement) = if let Some((date, statement)) = item.split_once(" | ")
-                {
-                    (
-                        Some(super::seed::parse_date(date).map_err(|_| {
-                            Unreadable::Format(
-                                "CLAIMS needs a known-on date in YYYY-MM-DD form".into(),
-                            )
-                        })?),
-                        statement,
-                    )
-                } else {
-                    (None, item)
-                };
+                // A line without a readable date is still the statement.
+                let (known_on, statement) =
+                    match item.split_once(" | ").and_then(|(date, statement)| {
+                        Some((super::seed::parse_date(date).ok()?, statement))
+                    }) {
+                        Some((date, statement)) => (Some(date), statement),
+                        None => (None, item),
+                    };
                 page.claims.push(super::prompts::Statement {
                     text: statement.into(),
                     known_on,
@@ -313,6 +312,8 @@ pub(super) fn dates(text: &str) -> Vec<time::Date> {
         .collect()
 }
 
+/// A page's DATE must be a calendar date no later than `latest`. What its
+/// CLAIMS say was known by then is settled by [`settle_claims`], not here.
 pub(super) fn chronology(page: &Page, latest: time::Date) -> Result<(), Unreadable> {
     let dateline = if page.date.is_empty() {
         latest
@@ -325,18 +326,18 @@ pub(super) fn chronology(page: &Page, latest: time::Date) -> Result<(), Unreadab
             "DATE must be on or before {latest}, when a referring page already links here. Write only what was known by then."
         )));
     }
-    if let Some(known_on) = page
-        .claims
-        .iter()
-        .filter_map(|claim| claim.known_on)
-        .filter(|date| *date > dateline)
-        .max()
-    {
-        return Err(Unreadable::Chronology(format!(
-            "The document is dated {dateline} but uses knowledge first available on {known_on}. Explicitly update DATE and its visible dateline, no later than {latest}, or omit that later knowledge."
-        )));
-    }
     Ok(())
+}
+
+/// A statement a page makes was known by the page's own date. A CLAIMS line
+/// dated later is a mislabelled line (a writer often dates timeless facts
+/// with the day it writes), so it takes the page's date. Whether the page's
+/// text reports later events is the chronology review's question.
+pub(super) fn settle_claims(page: &mut Page, latest: time::Date) {
+    let dateline = super::seed::parse_date(&page.date).unwrap_or(latest);
+    for claim in &mut page.claims {
+        claim.known_on = claim.known_on.map(|date| date.min(dateline));
+    }
 }
 
 /// Publication text that needs semantic review: dates alone cannot distinguish
@@ -348,7 +349,13 @@ pub(super) trait Publication {
 }
 impl Publication for Page {
     fn later_text(&self, latest: time::Date) -> Vec<(time::Date, String)> {
-        let dateline = super::seed::parse_date(&self.date).unwrap_or(latest);
+        // A real document can still not know what happens after the
+        // world's own date.
+        let dateline = if self.real {
+            latest
+        } else {
+            super::seed::parse_date(&self.date).unwrap_or(latest)
+        };
         let text = format!(
             "{}\n{}\n{}",
             self.title,

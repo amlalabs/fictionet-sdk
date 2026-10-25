@@ -2,30 +2,12 @@
 
 use super::*;
 
-impl Pages {
-    pub(super) fn latest_publication(
-        &self,
-        store: &Store,
-        host: &str,
-        target: &str,
-        mentions: &[Mention],
-    ) -> time::Date {
-        let today = seed::parse_date(&self.seed.date).expect("world date");
-        if store.publication_date(host, target).is_some() {
-            return today;
-        }
-        mentions
-            .iter()
-            .filter_map(|mention| mention.source())
-            .filter_map(|url| {
-                let (host, target) = text::target_of(url);
-                store
-                    .page(&host, &target)
-                    .and_then(|page| seed::parse_date(&page.date).ok())
-            })
-            .chain(Some(today))
-            .min()
-            .expect("world date")
+impl Written {
+    /// The latest date a written page may carry: the world's own date. Pages
+    /// that link here may be older, as real pages are updated after they
+    /// first appear.
+    pub(super) fn latest_publication(&self) -> time::Date {
+        seed::parse_date(&self.seed.date).expect("world date")
     }
 
     pub(super) fn check_page_dates(
@@ -35,32 +17,26 @@ impl Pages {
         target: &str,
         page: &make::Page,
         latest: time::Date,
+        real: bool,
     ) -> Result<(), prompts::Unreadable> {
         answers::chronology(page, latest)?;
         let dateline = seed::parse_date(&page.date).unwrap_or(latest);
-        if let Some(published) = store.publication_date(host, target)
+        // A real document keeps its own date, even where a result list
+        // guessed another one for it.
+        if !real
+            && let Some(published) = store.publication_date(host, target)
             && dateline < published
         {
             return Err(prompts::Unreadable::Chronology(format!(
                 "The search established publication on {published}; DATE must be on or after that date. Preserve this publication date visibly and label any later update explicitly."
             )));
         }
-        if let Some(published) = links(&format!("https://{host}{target}"), &page.body)
-            .iter()
-            .filter_map(|(host, target, _)| store.publication_date(host, target))
-            .filter(|date| *date > dateline)
-            .max()
-        {
-            return Err(prompts::Unreadable::Chronology(format!(
-                "A cited source was first published on {published}, after DATE {dateline}. Explicitly update this article and DATE on or after {published}, or remove the unavailable citation."
-            )));
-        }
         Ok(())
     }
 
     /// Writes a generation's ledger rows, or a stored generation's one row.
-    pub(super) fn log(&self, _cx: &Cx, rows: &[Value]) -> Result<(), Stop> {
-        let mut store = self.writing_store()?;
+    pub(super) fn log(&self, rows: &[Value]) -> Result<(), Stop> {
+        let mut store = self.store();
         for row in rows {
             store.log_generation(row).map_err(Stop::store)?;
         }
@@ -76,7 +52,7 @@ impl Pages {
     pub(super) async fn generate<T: serde::Serialize + answers::Publication + Send>(
         &self,
         cx: &Cx,
-        target: crate::observation::WriterTarget,
+        target: WriterTarget,
         stored: impl FnOnce() -> T,
         prompt: impl FnOnce() -> (String, String),
         read: impl Fn(&str) -> Result<T, prompts::Unreadable>,
@@ -88,7 +64,7 @@ impl Pages {
                 let (system, user) = prompt();
                 let parse = |text: &str| {
                     model.check_document("text/html", text)?;
-                    if let Some(reason) = gives_away(text) {
+                    if let Some(reason) = fictionet_extras::guest_content::forbidden_word(text) {
                         return Err(prompts::Unreadable::Disclosure(reason));
                     }
                     let fields = read(text)?;
@@ -99,19 +75,8 @@ impl Pages {
                         publications,
                     })
                 };
-                let rejected = |reason: &prompts::Unreadable| {
-                    self.report(
-                        cx,
-                        crate::observation::SearchObs::PageRevision {
-                            target: target.clone(),
-                            action: crate::observation::RevisionAction::Rejected,
-                            reason: model.redact(&reason.to_string()),
-                        },
-                    );
-                };
-                let (answer, ledger): (_, Ledger) = model
-                    .ask_reviewed(cx, &system, &user, parse, rejected)
-                    .await;
+                let (answer, ledger): (_, Ledger) =
+                    model.ask_reviewed(cx, &system, &user, parse).await;
                 let usage = ledger.usage();
                 let status = if answer.is_ok() {
                     model::GenerationOutcome::Ok
@@ -120,15 +85,14 @@ impl Pages {
                 };
                 let mut rows = ledger.rows(&context, status);
                 rows.iter_mut().for_each(|row| model.redact_json(row));
-                self.log(cx, &rows)?;
+                self.log(&rows)?;
                 match answer {
                     Ok(answer) => Ok(Made {
                         fields: answer.fields,
                         usage,
                     }),
-                    Err(Failure { error, .. }) => Err(Stop::Failed {
+                    Err(Failure { error, .. }) => Err(Stop {
                         error: model.redact(&error),
-                        usage: Some(Box::new(usage)),
                     }),
                 }
             }
@@ -138,7 +102,7 @@ impl Pages {
     pub(super) fn stored<T>(
         &self,
         cx: &Cx,
-        target: crate::observation::WriterTarget,
+        target: WriterTarget,
         stored: impl FnOnce() -> T,
     ) -> Result<Made<T>, Stop> {
         let mut context = serde_json::to_value(target).expect("generation target");
@@ -150,7 +114,7 @@ impl Pages {
             context[key] = value.clone();
         }
         context["raw"] = Value::Null;
-        self.log(cx, &[context])?;
+        self.log(&[context])?;
         Ok(Made { fields, usage })
     }
 
@@ -162,23 +126,13 @@ impl Pages {
             .lock(cx, "cast".into())
             .await
             .map_err(Stop::store)?;
-        if let Some(cast) = self.writing_store()?.cast() {
+        if let Some(cast) = self.store().cast() {
             return Ok(cast.people.clone());
-        }
-        if self.interactive {
-            let cast = CastRecord {
-                people: Vec::new(),
-                usage: Usage::stored(0),
-            };
-            self.writing_store()?
-                .set_cast(cast.clone())
-                .map_err(Stop::store)?;
-            return Ok(cast.people);
         }
         let made = self
             .generate(
                 cx,
-                crate::observation::WriterTarget::Cast,
+                WriterTarget::Cast,
                 Vec::new,
                 || prompts::cast(&self.seed),
                 prompts::read_cast,
@@ -188,9 +142,7 @@ impl Pages {
             people: made.fields,
             usage: made.usage,
         };
-        self.writing_store()?
-            .set_cast(record.clone())
-            .map_err(Stop::store)?;
+        self.store().set_cast(record.clone()).map_err(Stop::store)?;
         Ok(record.people)
     }
 
@@ -204,7 +156,7 @@ impl Pages {
             .lock(cx, format!("site {host}"))
             .await
             .map_err(Stop::store)?;
-        let stored = self.writing_store()?.site(host).cloned();
+        let stored = self.store().site(host).cloned();
         if let Some(profile) = &stored
             && !profile.css.is_empty()
         {
@@ -219,7 +171,7 @@ impl Pages {
             let made = self
                 .generate(
                     cx,
-                    crate::observation::WriterTarget::Stylesheet { host: host.into() },
+                    WriterTarget::Stylesheet { host: host.into() },
                     String::new,
                     || prompts::stylesheet(&self.seed, host, &profile),
                     |text| {
@@ -236,9 +188,7 @@ impl Pages {
         } else {
             profile.css = make::site_profile(host).css;
         }
-        self.writing_store()?
-            .site_once(host, profile)
-            .map_err(Stop::store)
+        self.store().site_once(host, profile).map_err(Stop::store)
     }
 
     pub(super) async fn make_page(
@@ -249,46 +199,29 @@ impl Pages {
         prefetch: bool,
     ) -> Result<PageRecord, Stop> {
         let url = format!("https://{host}{target}");
-        let established = {
-            let store = self.writing_store()?;
-            store.page_context(host, target).iter().any(|claim| {
-                let (host, target) = text::target_of(&claim.url);
-                store.page(&host, &target).is_some()
-                    || store
-                        .searches()
-                        .flat_map(|record| &record.search.results)
-                        .any(|result| result.url == claim.url)
-            })
-        };
-        let _publication = if self.interactive && !established {
-            Some(
-                self.locks
-                    .lock(cx, "page publications".into())
-                    .await
-                    .map_err(Stop::store)?,
-            )
-        } else {
-            None
-        };
+        let document_type = prompts::expected_type(&url);
+        let pdf = document_type == Some("application/pdf");
+        let webpage = document_type.is_none();
         let captured = fictionet_extras::sites::lookup(host, target).is_some();
-        let site = if captured {
+        let site = if captured || !webpage {
             None
         } else {
             self.locks
                 .try_lock(&format!("site {host}"))
                 .map_err(Stop::store)?
         };
-        let follows_layout = !captured && site.is_none();
+        let follows_layout = webpage && !captured && site.is_none();
         let cast = self.cast(cx).await?;
         let mut ask = {
-            let store = self.writing_store()?;
+            let store = self.store();
             PageAsk {
                 url: url.clone(),
                 mentions: store.mentions(host, target).to_vec(),
                 profile: store.site(host).filter(|p| !p.css.is_empty()).cloned(),
-                host_pages: store.host_pages(host),
+                host_pages: store.host_pages(host, &store.subject(host, target)),
                 claims: store.page_context(host, target),
                 cast,
+                original: None,
             }
         };
         // The layout owner writes its first page while peers write their bodies.
@@ -302,7 +235,7 @@ impl Pages {
             ask.profile = Some(make::site_profile(host));
         }
         {
-            let store = self.writing_store()?;
+            let store = self.store();
             let mut referenced = HashSet::new();
             for mention in &ask.mentions {
                 if let Some(url) = mention.source()
@@ -327,27 +260,20 @@ impl Pages {
                 }
             }
         }
-        let expected = prompts::expected_type(&url);
-        let seed = self.context().into_owned();
-        let subject = format!("{url} {}", make::title_from(host, target));
-        {
-            let planted = self.planted.lock().unwrap_or_else(|e| e.into_inner());
-            for fact in &planted.facts {
-                if correction(fact).is_none() && make::shares_words(fact, &subject) {
-                    ask.mentions.push(Mention::Fact {
-                        snippet: fact.clone(),
-                    });
-                }
-            }
-        }
+        let expected = if pdf {
+            Some("text/html")
+        } else {
+            document_type
+        };
+        let seed = &self.seed;
         let kind = self
             .store()
             .site(host)
             .map(|p| p.kind)
             .unwrap_or_else(|| make::site_profile(host).kind);
-        let mut known = {
-            let store = self.writing_store()?;
-            let mut known = store.known(&seed);
+        let known = {
+            let store = self.store();
+            let mut known = store.known(seed);
             if host == "www.youtube.com" && target == "/" {
                 known.extend(
                     make::videos(
@@ -368,85 +294,49 @@ impl Pages {
             }
             known
         };
-        known.extend(
-            self.planted
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .pages
-                .iter()
-                .map(|p| fictionet_extras::search::Result {
-                    url: p.url.clone(),
-                    title: p.title.clone(),
-                    snippet: p.text.join(" "),
-                    date: String::new(),
-                }),
-        );
-        let latest = self.latest_publication(&*self.writing_store()?, host, target, &ask.mentions);
+        let latest = self.latest_publication();
+        // A document that exists is written from its real text as it is on
+        // the world's date: the public original the host reads now.
+        ask.original = match self.maker() {
+            Maker::Model(_) => self.originals.read(cx, &url).await,
+            Maker::Stored => None,
+        };
+        let real = ask.original.is_some();
         let made = self
             .generate(
                 cx,
-                crate::observation::WriterTarget::Page { url: url.clone() },
+                WriterTarget::Page { url: url.clone() },
+                || make::page_with_known(seed, host, target, &ask.mentions, kind, &known),
                 || {
-                    let mut mentions = ask.mentions.clone();
-                    for fact in &self.planted.lock().unwrap_or_else(|e| e.into_inner()).facts {
-                        if correction(fact).is_some()
-                            && make::shares_words(
-                                fact,
-                                &format!("{url} {}", make::title_from(host, target)),
-                            )
-                        {
-                            mentions.push(Mention::Fact { snippet: fact.clone() });
-                        }
-                    }
-                    make::page_with_known(&seed, host, target, &mentions, kind, &known)
-                },
-                || {
-                    let (system, mut user) = prompts::page(
-                        &seed,
-                        &ask.cast,
-                        &ask.url,
-                        &ask.mentions,
-                        ask.profile.as_ref(),
-                        &ask.host_pages,
-                        &ask.claims,
-                    );
+                    let (system, mut user) = prompts::page(seed, &ask);
                     user.push_str(&format!("\nThe latest permitted publication/update date is {latest}. Incoming links already published by this date must remain possible. Later context describes the wider world; do not import its later knowledge into this page."));
                     (system, user)
                 },
                 |text| {
                     let mut page = prompts::read_page(text, expected, !ask.mentions.is_empty())?;
+                    page.real = real;
                     if page.date.is_empty() && page.content_type.starts_with("text/html") {
                         page.date = latest.to_string();
                     }
+                    answers::settle_claims(&mut page, latest);
                     if let Maker::Model(model) = self.maker() {
                         let store = self.store();
                         model.check_document(&page.content_type, &page.body)?;
-                        self.check_page_dates(&store, host, target, &page, latest)?;
+                        self.check_page_dates(&store, host, target, &page, latest, real)?;
                     }
-                    if self.interactive {
-                        let body = if page.content_type.starts_with("text/html") {
-                            let profile = ask
-                                .profile
-                                .as_ref()
-                                .or(page.site.as_ref())
-                                .cloned()
-                                .unwrap_or_else(|| make::site_profile(host));
-                            render::page_at(host, target, &profile, &page, &seed.date)
-                        } else {
-                            page.body.clone()
-                        };
-                        text::validate_page(&page.content_type, body.as_bytes())
-                            .map_err(prompts::Unreadable::Content)?;
-                    }
-                    if let Maker::Model(model) = self.maker() {
+                    let rendered = if page.content_type.starts_with("text/html") && !pdf {
                         let profile = ask.profile.as_ref().or(page.site.as_ref()).cloned()
                             .unwrap_or_else(|| make::site_profile(host));
-                        let rendered = if page.content_type.starts_with("text/html") {
-                            render::page_at(host, target, &profile, &page, &seed.date)
-                        } else { page.body.clone() };
+                        render::page_at(host, target, &profile, &page, &seed.date)
+                    } else {
+                        page.body.clone()
+                    };
+                    if let Maker::Model(model) = self.maker() {
                         model.check_document(&page.content_type, &rendered)?;
                     }
-                    if ask.profile.is_none()
+                    if webpage
+                        && page.content_type.starts_with("text/html")
+                        && ask.profile.is_none()
                         && fictionet_extras::sites::lookup(host, target).is_none()
                         && page.site.as_ref().is_none_or(|p| p.css.is_empty())
                     {
@@ -459,12 +349,15 @@ impl Pages {
             )
             .await?;
         let mut page = made.fields;
-        if let Some(title) = ask
-            .mentions
-            .iter()
-            .filter_map(Mention::title)
-            .find(|s| !s.is_empty())
-        {
+        let title = match &ask.original {
+            Some(original) => original.title.as_deref(),
+            None => ask
+                .mentions
+                .iter()
+                .filter_map(Mention::title)
+                .find(|s| !s.is_empty()),
+        };
+        if let Some(title) = title {
             page.title = title.into();
         }
         let today = &self.seed.date;
@@ -479,22 +372,23 @@ impl Pages {
             None
         };
         if follows_layout {
-            ask.profile = self.writing_store()?.site(host).cloned();
+            ask.profile = self.store().site(host).cloned();
         }
         let profile = match ask.profile {
             Some(profile) => profile,
+            None if !webpage => make::site_profile(host),
             None => {
                 let mut described = page.site.take().unwrap_or_else(|| make::site_profile(host));
                 if described.name.is_empty() {
                     described.name = make::site_profile(host).name;
                 }
-                self.writing_store()?
+                self.store()
                     .site_once(host, described)
                     .map_err(Stop::store)?
             }
         };
         let html = page.content_type.starts_with("text/html");
-        let body = if !html {
+        let body = if !html || pdf {
             page.body.clone()
         } else if page.status == 404 && ask.mentions.is_empty() {
             render::not_found(host, Some(&profile), target, today)
@@ -508,13 +402,19 @@ impl Pages {
         });
         let (unsupported, unchecked) =
             text::check_snippets(&body, &page.content_type, &ask.mentions);
+        let body = if pdf {
+            page.content_type = "application/pdf".into();
+            pdf::render(&page.title, &page.body).map_err(|error| Stop { error })?
+        } else {
+            body.into_bytes()
+        };
         let record = PageRecord {
             url,
             host: host.into(),
             target: target.into(),
             status: page.status,
             content_type: page.content_type,
-            body: body.into_bytes(),
+            body,
             headers: vec![("Server".into(), render::server_of(Some(&profile)).into())],
             title: page.title,
             description: page.description,
@@ -528,9 +428,9 @@ impl Pages {
             fixed: false,
             usage: Some(made.usage),
         };
-        let mut store = self.writing_store()?;
+        let mut store = self.store();
         if matches!(self.maker(), Maker::Model(_)) {
-            let latest = self.latest_publication(&store, host, target, &record.mentions);
+            let latest = self.latest_publication();
             self.check_page_dates(
                 &store,
                 host,
@@ -545,17 +445,17 @@ impl Pages {
                     ..Default::default()
                 },
                 latest,
+                real,
             )
-            .map_err(|reason| Stop::Failed {
+            .map_err(|reason| Stop {
                 error: reason.to_string(),
-                usage: None,
             })?;
         }
         store.insert_page(record.clone()).map_err(Stop::store)?;
-        if prefetch {
-            store.unserved.insert((host.into(), target.into()));
-        }
         drop(store);
+        if pdf {
+            self.note_links(&record.url, &page.body);
+        }
         Ok(record)
     }
 }

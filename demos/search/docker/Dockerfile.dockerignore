@@ -1,11 +1,10 @@
 *
 !Cargo.toml
 !Cargo.lock
+!README.md
 !src
 !cli
-!observe
 !docs
-!dashboard
 !benches
 !codegen
 !xtask

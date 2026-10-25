@@ -15,40 +15,6 @@ const STOP: &[&str] = &[
     "online", "news", "com", "www", "https", "http", "best", "example", "details", "safe",
     "owners", "version", "fixed", "fix", "latest",
 ];
-/// Bylines assigned to stored articles.
-pub(super) const AUTHORS: [&str; 16] = [
-    "Priya Raman",
-    "Tomasz Wierzbicki",
-    "Aoife Gallagher",
-    "Kwame Mensah",
-    "Lucía Ortega",
-    "Henrik Lindqvist",
-    "Mei Tanaka",
-    "Oluwaseun Adeyemi",
-    "Dmitri Volkov",
-    "Fatima Benali",
-    "Rhys Pritchard",
-    "Ingrid Solberg",
-    "Mateus Carvalho",
-    "Yusuf Demir",
-    "Chloé Marchand",
-    "Arjun Mehta",
-];
-/// Forum and Q&A user names.
-pub(super) const USERS: [&str; 12] = [
-    "netadmin_dk",
-    "ferrous_wheel",
-    "kb_ops",
-    "sysop42",
-    "lenkaP",
-    "grumpy_firewall",
-    "jbrandt",
-    "mikko_v",
-    "routerroot",
-    "tamsin.h",
-    "oldschool_ccna",
-    "pfeiffer_it",
-];
 /// Editorial layout selected while decoding a site description.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -164,6 +130,10 @@ pub struct Page {
     pub ad: String,
     /// How the generator describes the site, for a host's first page.
     pub site: Option<Profile>,
+    /// Written from the real document at its address, whose own text keeps
+    /// its own timeline: its later updates are not anachronisms.
+    #[serde(skip)]
+    pub real: bool,
 }
 
 /// Extracts lowercase search words, excluding common stop words.
@@ -179,10 +149,17 @@ pub(super) fn shares_words(a: &str, b: &str) -> bool {
     let a = words(a);
     words(b).iter().any(|w| w != "not" && a.contains(w))
 }
-/// A stable number for `text`, to vary dates, counts and names by URL.
-pub(super) fn hash(text: &str) -> usize {
-    text.bytes()
-        .fold(0usize, |n, b| n.wrapping_mul(31).wrapping_add(b as usize))
+
+/// Whether `text` is about `subject`: it has two of the subject's search
+/// words, or the only one a one-word subject has. One shared word such as
+/// a year or "error" does not make two pages about the same thing.
+pub(super) fn related(subject: &str, text: &str) -> bool {
+    let mut wanted = words(subject);
+    wanted.sort();
+    wanted.dedup();
+    let found = words(text);
+    let shared = wanted.iter().filter(|w| found.contains(w)).count();
+    shared > 0 && shared >= wanted.len().min(2)
 }
 /// Removes branding from a result title for headings and directory links.
 pub(super) fn heading(title: &str) -> &str {
@@ -279,35 +256,6 @@ pub(super) fn relevant(result: &Result, query: &str) -> bool {
                 .any(|label| label.trim_start_matches("the") == w)
     });
     named || (score > 0 && score >= asked.len().min(2) && score * 2 >= asked.len())
-}
-
-/// Text cut from a page as a snippet shows it: at most about 160
-/// characters, ending at a word with "...".
-pub fn excerpt(text: &str) -> String {
-    let text = normalize_space(text);
-    if text.chars().count() <= 160 {
-        return if text.ends_with(['.', '!', '?']) {
-            text
-        } else {
-            format!("{text}.")
-        };
-    }
-    let words: Vec<&str> = text.split(' ').collect();
-    let mut out = String::new();
-    for word in words {
-        if out.chars().count() + word.chars().count() + 5 > 160 {
-            out.push_str(" ...");
-            break;
-        }
-        if !out.is_empty() {
-            out.push(' ');
-        }
-        out.push_str(word);
-    }
-    if !out.ends_with(['.', '!', '?']) {
-        out.push('.');
-    }
-    out
 }
 
 pub(super) fn finish_listing(search: &mut Search) {

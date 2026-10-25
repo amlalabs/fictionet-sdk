@@ -1,5 +1,5 @@
-//! The web's world process. See the library ([`web_world`])
-//! for what it builds.
+//! The web's world process: the [`written`](web_world::pages::written) web
+//! for one seed, which the Inspect integration runs.
 //!
 //! The first argument is JSON with `seed` and optional `seeds`, `generator`,
 //! `model`, `reasoning`, `prefetch`, and `store`.
@@ -13,9 +13,11 @@ use std::time::SystemTime;
 use fictionet_extras::args::{Args, configuration, secs, unknown};
 use fictionet_extras::log::Log;
 use serde_json::json;
-use web_world::pages::model::{self, Model};
-use web_world::pages::store::Store;
-use web_world::pages::{GeneratorKind, Maker, Pages, Seed};
+use web_world::pages::Pages;
+use web_world::pages::Seed;
+use web_world::pages::written::model::{self, Model};
+use web_world::pages::written::store::Store;
+use web_world::pages::written::{GeneratorKind, Maker, Written};
 use web_world::{Addresses, Ca, GATEWAY, serve, world_start};
 
 fn main() {
@@ -142,58 +144,63 @@ fn real_main() -> fictionet::Result {
     let state_path = args.state_dir.join("state.json");
     let ready = args.ready.clone();
 
-    let options = fictionet::Seed::random();
-    let result = fictionet::block_on(fictionet::run(options, move |fcx| async move {
-        let maker = match (kind, key) {
-            (GeneratorKind::Stored, _) => Some(Maker::Stored),
-            (GeneratorKind::Model(provider), Some(key)) => {
-                let https = Arc::new(Https::new(&fcx, provider.into())?);
-                Some(Maker::Model(Model::new(
-                    provider, &model, &reasoning, key, https,
-                )))
+    let result = fictionet::block_on(fictionet::run(
+        fictionet::Seed::random(),
+        move |fcx| async move {
+            let maker = match (kind, key) {
+                (GeneratorKind::Stored, _) => Some(Maker::Stored),
+                (GeneratorKind::Model(provider), Some(key)) => {
+                    let https = Arc::new(Https::new(&fcx, provider.into())?);
+                    Some(Maker::Model(Model::new(
+                        provider, &model, &reasoning, key, https,
+                    )))
+                }
+                (GeneratorKind::Model(_), None) => unreachable!("a model's key is read above"),
+                (GeneratorKind::Replay, _) => None,
+            };
+            let written = Written::open(seed, store, maker, prefetch);
+            let seed = written.seed();
+            let fixed: std::collections::BTreeMap<_, _> = seed
+                .fixed_addresses()
+                .into_iter()
+                .map(|(host, (addr, why))| (host, json!({"addr": addr.to_string(), "why": why})))
+                .collect();
+            let state = json!({
+                "seed": seed.name,
+                "date": seed.date,
+                "generator": written.generator_kind(),
+                "model": written.model(),
+                "prefetch": written.prefetch(),
+                "store": store_path,
+                "addresses": fixed,
+                "fixed": seed.fixed.iter().map(|f| f.url.clone()).collect::<Vec<_>>(),
+                "dns": GATEWAY.to_string(),
+                "world_start": secs(start),
+                "started": secs(started),
+            });
+            let seed_name = seed.name.clone();
+            let pages = Arc::new(Pages::from_written(written));
+            let ca = Arc::new(Ca::new(&fcx, start, start)?);
+            std::fs::create_dir_all(&args.ca_dir)?;
+            std::fs::write(args.ca_dir.join("ca.pem"), ca.cert_pem())?;
+            serve(&fcx, addresses, ca, pages, log, start, attachments)?;
+            // The fixed addresses answer from the start, also for an agent
+            // that connects by address without DNS.
+            let _listening =
+                fictionet::listen(fictionet::WorldSocket::UnixSocket(socket.into()), attacher)?;
+
+            std::fs::write(&state_path, serde_json::to_string_pretty(&state)?)?;
+            if let Some(dir) = ready.parent() {
+                std::fs::create_dir_all(dir)?;
             }
-            (GeneratorKind::Model(_), None) => unreachable!("a model's key is read above"),
-            (GeneratorKind::Replay, _) => None,
-        };
-        let pages = Arc::new(Pages::open(seed, store, maker, prefetch));
-        let seed = pages.seed();
-        let fixed: std::collections::BTreeMap<_, _> = seed
-            .fixed_addresses()
-            .into_iter()
-            .map(|(host, (addr, why))| (host, json!({"addr": addr.to_string(), "why": why})))
-            .collect();
-        let state = json!({
-            "seed": seed.name,
-            "date": seed.date,
-            "generator": pages.generator_kind(),
-            "model": pages.model(),
-            "prefetch": pages.prefetch(),
-            "store": store_path,
-            "addresses": fixed,
-            "fixed": seed.fixed.iter().map(|f| f.url.clone()).collect::<Vec<_>>(),
-            "dns": GATEWAY.to_string(),
-            "world_start": secs(start),
-            "started": secs(started),
-        });
-        let seed_name = seed.name.clone();
-        let ca = Arc::new(Ca::new(&fcx, &args.ca_dir, start)?);
-        serve(&fcx, addresses, ca, pages, log, start, attachments)?;
-        // The fixed addresses answer from the start, also for an agent
-        // that connects by address without DNS.
-        let _listening =
-            fictionet::listen(fictionet::WorldSocket::UnixSocket(socket.into()), attacher)?;
+            std::fs::write(&ready, seed_name.as_bytes())?;
+            println!("fictionet world up: seed={seed_name}");
 
-        std::fs::write(&state_path, serde_json::to_string_pretty(&state)?)?;
-        if let Some(dir) = ready.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        std::fs::write(&ready, seed_name.as_bytes())?;
-        println!("fictionet world up: seed={seed_name}");
-
-        // The network serves every sandbox from here on. The listener
-        // lives as long as the world.
-        shutdown.wait(&fcx).await
-    }));
+            // The network serves every sandbox from here on. The listener
+            // lives as long as the world.
+            shutdown.wait(&fcx).await
+        },
+    ));
     finalization.acknowledge(result)?;
     // Keep the container available for the harness to read the finalized files.
     loop {

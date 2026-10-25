@@ -27,6 +27,9 @@ use vhost_user_backend::{VhostUserBackendMut, VhostUserDaemon, VringRwLock, Vrin
 use virtio_queue::QueueT;
 use vm_memory::{Bytes, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryMmap};
 use vmm_sys_util::epoll::EventSet;
+use vmm_sys_util::event::{
+    EventConsumer, EventFlag, EventNotifier, new_event_consumer_and_notifier,
+};
 use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
 
 /// The guest's virtio-net header is 12 bytes under VIRTIO_F_VERSION_1.
@@ -84,7 +87,7 @@ struct NetBackend {
     mac: [u8; 6],
     to_world: Sender<Vec<u8>>,
     rx: RxQueue,
-    exit: EventFd,
+    exit: (EventConsumer, EventNotifier),
 }
 
 impl VhostUserBackendMut for NetBackend {
@@ -130,8 +133,8 @@ impl VhostUserBackendMut for NetBackend {
         Ok(())
     }
 
-    fn exit_event(&self, _thread: usize) -> Option<EventFd> {
-        self.exit.try_clone().ok()
+    fn exit_event(&self, _thread: usize) -> Option<(EventConsumer, EventNotifier)> {
+        Some((self.exit.0.try_clone().ok()?, self.exit.1.try_clone().ok()?))
     }
 
     fn handle_event(
@@ -260,8 +263,8 @@ pub fn start(
     rx: RxQueue,
 ) -> std::io::Result<Backend> {
     let mem: Mem = GuestMemoryAtomic::new(GuestMemoryMmap::new());
-    let exit = EventFd::new(EFD_NONBLOCK)?;
-    let stop = exit.try_clone()?;
+    let exit = new_event_consumer_and_notifier(EventFlag::NONBLOCK)?;
+    let stop = exit.1.try_clone()?;
     let backend = Arc::new(RwLock::new(NetBackend {
         mem: None,
         mac,
@@ -277,12 +280,13 @@ pub fn start(
             .register_listener(rx.notify.as_raw_fd(), EventSet::IN, RX_NOTIFY as u64)
             .map_err(|e| std::io::Error::other(format!("register rx listener: {e}")))?;
     }
-    let listener = vhost::vhost_user::Listener::new(socket, true).map_err(std::io::Error::other)?;
+    let mut listener =
+        vhost::vhost_user::Listener::new(socket, true).map_err(std::io::Error::other)?;
     let socket = socket.to_path_buf();
     let thread = thread::Builder::new()
         .name("fictionet-net".to_string())
         .spawn(move || {
-            let result = daemon.start(listener).and_then(|()| daemon.wait());
+            let result = daemon.start(&mut listener).and_then(|()| daemon.wait());
             match result {
                 Ok(())
                 | Err(vhost_user_backend::Error::HandleRequest(
@@ -303,14 +307,14 @@ pub fn start(
 pub struct Backend {
     socket: std::path::PathBuf,
     thread: Option<thread::JoinHandle<()>>,
-    stop: EventFd,
+    stop: EventNotifier,
 }
 
 impl Drop for Backend {
     fn drop(&mut self) {
         // Wake accept when boot failed before the VMM connected.
         let _ = std::os::unix::net::UnixStream::connect(&self.socket);
-        let _ = self.stop.write(1);
+        let _ = self.stop.notify();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -338,7 +342,7 @@ mod tests {
                 mac: [0; 6],
                 to_world: tx,
                 rx: RxQueue::new().unwrap(),
-                exit: EventFd::new(EFD_NONBLOCK).unwrap(),
+                exit: new_event_consumer_and_notifier(EventFlag::NONBLOCK).unwrap(),
             };
             for (index, len) in lengths.iter().enumerate() {
                 let mut desc = Vec::new();

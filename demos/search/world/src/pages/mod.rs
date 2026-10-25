@@ -1,147 +1,91 @@
-//! Copied pages, model-written pages and live search share one response path.
-//! Each engine renders the active source in its own result format.
+//! The world's pages: copied captures, live copies of the real web, and
+//! live copies edited for a scenario share one response path. Each search
+//! engine renders the active source's results in its own format. The
+//! standalone `web-world` serves the [`written`] web instead.
 
-mod answers;
-mod branding;
 mod copied;
-mod edits;
-mod generate;
-mod layout;
+mod edit;
 mod listing;
-mod normalize;
-mod page;
-pub mod provenance;
+mod live;
+pub mod model;
+pub mod seed;
 mod serve;
 mod settings;
+pub mod snapshot;
+pub(crate) mod text;
 mod tools;
-
-use edits::*;
-mod live;
-pub mod make;
-pub mod meta;
-pub mod model;
-pub mod prompts;
-pub mod render;
-pub mod seed;
-pub mod store;
-pub mod text;
+pub mod written;
 
 pub use copied::PageBody;
-pub use meta::Meta;
+pub use edit::{Edit, Readiness, Scenario};
 pub use seed::Seed;
+pub use serve::HeldResource;
+pub use settings::{Applied, Command, Rejected};
+pub use tools::ToolResults;
 
-use crate::files::FileLock;
-use crate::route::{Route, query_key, route};
-use crate::search::{Cache, Reason};
+use crate::route::Route;
 use fictionet::Cx;
 use fictionet_extras::search::{self, Engine};
-use meta::{Listing, Shown};
-use model::{Failure, Ledger, Model, Provider, Usage};
-use prompts::{Claim, HostPage, Person};
-use provenance::Mention;
-use regex::Regex;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
-use store::{CastRecord, PageRecord, SearchRecord, Store};
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 
-tokio::task_local! {
-    static WRITING: tokio::sync::watch::Receiver<bool>;
-}
-
-/// A change to the world: its generation setting, what answers, or a
-/// planted fact or page. Each carries the settings revision it expects.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "command", rename_all = "snake_case")]
-pub enum Command {
-    /// Make new result lists and pages, or serve only stored ones.
-    SetGeneration {
-        generate: bool,
-        expected_revision: u64,
-    },
-    /// Choose what answers and whether new pages are made.
-    SetNewPages {
-        new_pages: NewPages,
-        expected_revision: u64,
-    },
-    /// Add a fact to what is made from now on.
-    PlantFact {
-        text: String,
-        expected_revision: u64,
-    },
-    /// Serve a page at `url`. The first line of `text` is its title when
-    /// there is more than one line; the rest is its text.
-    PlantPage {
-        url: String,
-        text: String,
-        expected_revision: u64,
-    },
-    /// Forget model-written pages and planted facts, and return to copied pages.
-    Restart { expected_revision: u64 },
-}
-
-impl Command {
-    fn expected_revision(&self) -> u64 {
-        match self {
-            Self::SetGeneration {
-                expected_revision, ..
-            }
-            | Self::SetNewPages {
-                expected_revision, ..
-            }
-            | Self::PlantFact {
-                expected_revision, ..
-            }
-            | Self::PlantPage {
-                expected_revision, ..
-            }
-            | Self::Restart { expected_revision } => *expected_revision,
-        }
-    }
-}
-
-/// The source of pages for new requests. Other worlds can pause generation.
+/// What answers the guest's requests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum NewPages {
+pub enum Source {
+    /// The copied web: captured pages and the offline search index.
     Copied,
-    ModelWritten,
-    LiveSearch,
-    Off,
+    /// The real web, copied from the host when asked for, with real search.
+    Live,
+    /// The real web as Live serves it, with the scenario's edits.
+    Edited,
 }
 
-/// The settings revision after an accepted command.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Applied {
-    pub revision: u64,
-    /// Run time when the command was applied, in milliseconds.
-    pub at_ms: u64,
-}
-
-/// A command that did not change the settings.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "reason", rename_all = "snake_case")]
-pub enum Rejected {
-    /// The caller's revision differs from the current settings revision.
-    Stale { current: u64 },
-    /// The command cannot apply, and why.
-    Invalid { message: String },
-}
-
-/// The current generation setting and its revision.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Generation {
-    pub generate: bool,
-    pub revision: u64,
-}
-impl Default for Generation {
-    fn default() -> Self {
-        Self {
-            generate: true,
-            revision: 0,
-        }
+impl Source {
+    /// Whether pages come from the real web.
+    pub fn is_live(self) -> bool {
+        matches!(self, Self::Live | Self::Edited)
     }
+}
+
+/// What the log records about an answer.
+#[derive(Clone, Debug)]
+pub enum Meta {
+    /// A search engine's home page.
+    SearchHome,
+    /// A redirect to `location`.
+    Redirect { location: String },
+    /// A stylesheet, script, image, font or other file.
+    Asset,
+    /// A result list.
+    Search(Box<Listing>),
+    /// A page, with its own title.
+    Document { title: String },
+    /// No page at this address.
+    Missing,
+    /// The page could not be copied. The diagnostic says why.
+    Error { error: String },
+}
+
+/// A result list.
+#[derive(Clone, Debug)]
+pub struct Listing {
+    pub engine: Engine,
+    /// The search text.
+    pub search: String,
+    /// Each result's URL and title, in rank order.
+    pub listed: Vec<(String, String)>,
+    /// The scenario's edits to the list's titles and snippets.
+    pub edits: Vec<Edit>,
+}
+
+/// A real page served with the scenario's edits.
+#[derive(Clone, Debug)]
+pub struct Edited {
+    pub edits: Vec<Edit>,
+    /// The host's copy of the page, with each change marked.
+    pub marked: Arc<str>,
 }
 
 /// An answer, with what the log records about it in `meta`.
@@ -159,10 +103,10 @@ pub struct Response {
     pub stored_headers: Option<http::HeaderMap>,
     /// What the log records about the answer.
     pub meta: Meta,
-    /// How long a routed request took on the run's clock, in milliseconds.
-    pub serve_ms: Option<u64>,
-    pub carries: u64,
+    /// The scenario's edits, when the page was edited.
+    pub edited: Option<Edited>,
 }
+
 impl Response {
     pub(crate) fn new(
         status: u16,
@@ -178,8 +122,7 @@ impl Response {
             headers,
             stored_headers: None,
             meta,
-            serve_ms: None,
-            carries: 0,
+            edited: None,
         }
     }
 
@@ -188,295 +131,35 @@ impl Response {
         let body = body.into().into_bytes();
         Self::new(status, "text/html; charset=utf-8", body, headers, meta)
     }
-}
 
-/// What makes new pages, as `--generator` names it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GeneratorKind {
-    /// Pages and results built from stored records ([`make`]).
-    #[default]
-    Stored,
-    /// Nothing new: the world serves what its store holds.
-    Replay,
-    /// A model, named by its provider.
-    #[serde(untagged)]
-    Model(Provider),
-}
-
-impl GeneratorKind {
-    /// The spelling used by configuration and the command line.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Stored => "stored",
-            Self::Replay => "replay",
-            Self::Model(Provider::Anthropic) => "anthropic",
-            Self::Model(Provider::OpenRouter) => "openrouter",
-        }
-    }
-
-    /// Every kind.
-    pub const ALL: [Self; 4] = [
-        Self::Stored,
-        Self::Model(Provider::OpenRouter),
-        Self::Model(Provider::Anthropic),
-        Self::Replay,
-    ];
-}
-
-/// What makes new result lists and pages.
-pub enum Maker {
-    /// Pages and results built from stored records ([`make`]).
-    Stored,
-    /// A model ([`model`]).
-    Model(Model),
-}
-
-impl Maker {
-    /// What a store made with this generator records.
-    pub fn identity(&self) -> Value {
-        match self {
-            Self::Stored => json!({"provider": "stored", "model": "stored"}),
-            Self::Model(model) => model.identity(),
-        }
+    fn not_found() -> Self {
+        Self::new(
+            404,
+            "text/plain; charset=utf-8",
+            "Not Found\n",
+            vec![],
+            Meta::Missing,
+        )
     }
 }
 
-/// A generation's result: what was made and what it cost.
-struct Made<T> {
-    fields: T,
-    usage: Usage,
+/// The source in use and its revision, which every accepted command advances.
+struct Settings {
+    source: Source,
+    revision: u64,
 }
 
-/// Why nothing was made: the generator or the store failed.
-enum Stop {
-    Failed {
-        error: String,
-        usage: Option<Box<Usage>>,
-    },
-}
-
-impl Stop {
-    fn store(error: std::io::Error) -> Self {
-        Self::Failed {
-            error: format!("cannot record what the world made: {error}"),
-            usage: None,
-        }
-    }
-    /// The answer for a stopped search or page: the plain 503 page a busy
-    /// server shows. The log keeps why.
-    fn response(self) -> Response {
-        let Self::Failed { error, usage } = self;
-        let meta = Meta::Error { error, usage };
-        let headers = vec![("Server".into(), "nginx".into())];
-        Response::new(503, "text/html", UNAVAILABLE, headers, meta)
-    }
-}
-
-const UNAVAILABLE: &[u8] = b"<html><head><title>503 Service Temporarily Unavailable</title></head>\
-<body><center><h1>503 Service Temporarily Unavailable</h1></center><hr><center>nginx</center>\
-</body></html>";
-
-/// One lock per key, made on first use. A URL's lock covers choosing its
-/// title and making its page; a query's lock covers making its list. Within
-/// the world it is an async lock; for a store kept in a directory it is
-/// also a file in the store's `locks/`, which other worlds on the store
-/// take too.
-struct Locks {
-    local: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    dir: Option<std::path::PathBuf>,
-}
-
-/// A key's lock, held until dropped.
-struct KeyLock {
-    _local: tokio::sync::OwnedMutexGuard<()>,
-    _file: Option<FileLock>,
-}
-
-impl Locks {
-    fn local(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
-        self.local
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(key.into())
-            .or_default()
-            .clone()
-    }
-
-    fn file(&self, key: &str) -> std::io::Result<Option<std::fs::File>> {
-        let Some(dir) = &self.dir else {
-            return Ok(None);
-        };
-        std::fs::create_dir_all(dir)?;
-        let name: String = key
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .take(200)
-            .collect();
-        std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(dir.join(name))
-            .map(Some)
-    }
-
-    fn try_lock(&self, key: &str) -> std::io::Result<Option<KeyLock>> {
-        let Ok(local) = self.local(key).try_lock_owned() else {
-            return Ok(None);
-        };
-        let file = match self.file(key)? {
-            Some(file) => match FileLock::try_take(&file)? {
-                Some(held) => Some(held),
-                None => return Ok(None),
-            },
-            None => None,
-        };
-        Ok(Some(KeyLock {
-            _local: local,
-            _file: file,
-        }))
-    }
-
-    async fn lock(&self, cx: &Cx, key: String) -> std::io::Result<KeyLock> {
-        let local = self.local(&key).lock_owned().await;
-        let Some(file) = self.file(&key)? else {
-            return Ok(KeyLock {
-                _local: local,
-                _file: None,
-            });
-        };
-        loop {
-            if let Some(held) = FileLock::try_take(&file)? {
-                return Ok(KeyLock {
-                    _local: local,
-                    _file: Some(held),
-                });
-            }
-            if cx
-                .sleep(std::time::Duration::from_millis(50))
-                .await
-                .is_err()
-            {
-                return Err(std::io::Error::other("the world stopped"));
-            }
-        }
-    }
-}
-
-fn page_key(host: &str, target: &str) -> String {
-    format!("page {host}{target}")
-}
-
-/// Returns host, target and anchor of every link on a page, resolved
-/// against its URL, in source order: http(s) links with a host that is not
-/// a search engine, with anchor text.
-pub fn links(url: &str, markup: &str) -> Vec<(String, String, String)> {
-    static LINK: OnceLock<Regex> = OnceLock::new();
-    let link = LINK.get_or_init(|| {
-        Regex::new(r#"(?is)<a\b[^>]*\bhref\s*=\s*["']([^"'#]+)[^"']*["'][^>]*>(.*?)</a>"#).unwrap()
-    });
-    link.captures_iter(markup)
-        .filter_map(|c| {
-            let absolute = text::join(url, &text::unescape(c[1].trim()))?;
-            if !absolute.starts_with("http://") && !absolute.starts_with("https://") {
-                return None;
-            }
-            let (host, target) = text::target_of(&absolute);
-            if host.is_empty() || crate::route::SEARCH_HOSTS.contains(&host.as_str()) {
-                return None;
-            }
-            let anchor = text::text_of(&c[2]);
-            (!anchor.is_empty()).then_some((host, target, anchor))
-        })
-        .collect()
-}
-
-/// What a page is made from.
-struct PageAsk {
-    url: String,
-    mentions: Vec<Mention>,
-    profile: Option<make::Profile>,
-    host_pages: Vec<HostPage>,
-    claims: Vec<Claim>,
-    cast: Vec<Person>,
-}
-
-/// A page planted during the run.
-#[derive(Clone, Debug)]
-struct PlantedPage {
-    url: String,
-    host: String,
-    target: String,
-    title: String,
-    /// Its paragraphs.
-    text: Vec<String>,
-}
-
-/// What the run has planted.
-#[derive(Default)]
-struct Planted {
-    facts: Vec<String>,
-    /// Old and new values from facts that correct one.
-    corrections: Vec<(String, String)>,
-    pages: Vec<PlantedPage>,
-}
-
-/// The world's pages: its seed, its store and what makes new pages.
+/// The world's pages: its seed, its copied web, the live web and the editor.
 pub struct Pages {
     pub(crate) observation:
         Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<crate::observation::Observation>>>>,
     seed: Seed,
-    maker: Option<Maker>,
-    prefetch: usize,
-    /// An in-memory world driven interactively from the demo page.
-    interactive: bool,
-    store: Mutex<Store>,
-    writing: Mutex<tokio::sync::watch::Sender<bool>>,
+    settings: Mutex<Settings>,
     copied: Option<Arc<copied::Corpus>>,
-    copied_active: std::sync::atomic::AtomicBool,
     live: Option<Arc<live::Live>>,
-    live_active: std::sync::atomic::AtomicBool,
-    planted: Mutex<Planted>,
-    /// The id of the next search, shared by every way a search arrives.
-    queries: std::sync::atomic::AtomicU64,
-    locks: Locks,
+    editor: Option<Arc<edit::Editor>>,
+    /// Single requests from the host: package files the copied web lacks.
+    fetcher: live::Fetcher,
+    /// The written web, which answers every page and search when present.
+    written: Option<Arc<written::Written>>,
 }
-
-/// Planted text with its whitespace joined.
-/// Scripts, images and fonts are never made: they get a small
-/// fixed answer, so a browser costs no generations. `robots.txt` allows
-/// everything.
-fn static_asset(path: &str) -> Option<Response> {
-    const PIXEL: &[u8] = b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff!\xf9\x04\
-        \x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;";
-    let (ctype, body): (&str, &[u8]) = if path == "/robots.txt" {
-        ("text/plain; charset=utf-8", b"User-agent: *\nAllow: /\n")
-    } else if path == "/search.css" {
-        (
-            "text/css; charset=utf-8",
-            fictionet_extras::search::CSS.as_bytes(),
-        )
-    } else {
-        let (base, ext) = path.rsplit_once('.')?;
-        if ext.contains('/') || base.is_empty() {
-            return None;
-        }
-        match ext.to_lowercase().as_str() {
-            "js" => ("application/javascript", b"/* site scripts */\n"),
-            "gif" | "png" | "jpg" | "jpeg" | "webp" | "svg" | "ico" => ("image/gif", PIXEL),
-            "woff" => ("font/woff", b""),
-            "woff2" => ("font/woff2", b""),
-            _ => return None,
-        }
-    };
-    Some(Response::new(200, ctype, body, vec![], Meta::Asset))
-}
-
-pub(crate) use make::misspelled_host;

@@ -53,9 +53,9 @@ key and placeholder Claude credential before SSH and the desktop start. The real
 Claude token stays on the host. `claude` opens ready to work. Each launch writes
 to a fresh disk overlay; the prepared image stays unchanged. All demo flows use
 this workstation. The terminal uses ghostty-web and a persistent tmux session;
-Screen shows Firefox. Terminal text starts at 19 px on a dark background in both
-page themes; the text controls adjust its size and the expand control widens the
-agent pane. Pass `preview` instead of the downloads folder to run without a VM.
+Screen shows Firefox. Terminal text starts at 15 px on a dark background in both
+page themes, using the bundled JetBrains Mono font. The page source switch stays
+visible and can change Copied, Live and Edited during a session.
 
 On the workstation, a before-and-after run reached full readiness in 63.384 s
 with boot-time installation and 7.213 s with the prepared image. Desktop readiness
@@ -66,11 +66,6 @@ were 0.468 s before and 0.532 s after, with no indexing changes. The image build
 took 98 s using the existing verified Ubuntu downloads and produced a standalone
 4.0 GiB disk. These are single-run wall-clock measurements, excluding compilation.
 
-`preview` needs no downloads or API keys. It uses the world's corpus when
-available, otherwise a small embedded sky.org capture. Its labeled client makes
-real requests inside the world. Model calls appear when an agent uses the
-gateway; preview does not invent provider traffic.
-
 [app/src/main.rs](app/src/main.rs) assembles the workstation and its owned page.
 [app/src/network.rs](app/src/network.rs) connects the model gateway and local
 startup services. Search explicitly reports typed facts from its request and
@@ -78,56 +73,67 @@ tool handlers, its name resolver and the typed no-route callback on its network.
 
 [app/src/page/](app/src/page/) projects those facts into the map, site details,
 model calls and recent activity. Selecting a site or gateway keeps the map
-above its details while the agent remains visible. The scrubber replays the
-retained observation history; the agent stays live. The World menu chooses the page source or restarts world pages.
-The last 1024 observations are kept for rewind. Observed internet destinations
-and sign-in policy survive activity expiry and page restarts. Each launch writes its facts to a separate
+above its details while the agent remains visible. The page always shows the
+live run. The visible source switch changes modes during a session; the World
+menu restarts pages. Observed internet destinations
+and sign-in policy survive page restarts. Each launch writes its facts to a separate
 `<downloads>/search/run-<uuid>.jsonl` with RFC 3339 wall-clock timestamps and
-owner-only permissions. Preview records are under `demos/downloads/search-preview/`.
-Request credentials are redacted before entering the observation channel; request
+owner-only permissions. Request credentials are redacted before entering the observation channel; request
 bodies are not retained. Header details show only values retained by recording.
 The map draws internet
-routes from upstream facts, including host page-writer calls, rather than from
+routes from upstream facts, including the editor's model calls, rather than from
 model call activity. Local and rejected model requests therefore leave the
 internet wire dark. The activity feed updates one row per upstream attempt;
 the run record retains each transport phase.
 
-Page and search request bodies are limited to one MiB, including chunked requests; larger
-bodies receive 413 before routing. The observation queue holds at most 256 facts,
-including one reserved failure notification. A burst or a fact larger than 256
-KiB fails recording explicitly; the app stops instead of silently losing facts.
-
-The page prints a loopback URL with its run token. Browser libraries are served
+The page binds to localhost with no authentication. Browser libraries are served
 locally. Recorded page previews are inert and cannot run scripts or contact
 sites. Capture dates are shown only when the archive records them.
 
 ## Page sources
 
-- **Copied** replays WARC responses at their real URLs. A crawler builds one
-  BM25 index from their titles and text. Google, Bing and DuckDuckGo render that
-  index in their own layouts. Results rank by distinct query-term coverage,
-  then BM25 score. A result must cover a majority of the terms; unrelated
-  searches have no results. Counts come from the index before pagination.
-  Missing URLs on captured hosts return 404. Uncaptured hosts return NXDOMAIN,
-  apart from the caller's declared model and sign-in services.
-- **Model-written** writes pages from a prose brief, prior mentions and stored
-  claims. The app chooses the host-held Claude token first, then
-  `OPENROUTER_API_KEY`, then `ANTHROPIC_API_KEY`. The page writer uses its own
-  host-side model client; it does not send its credential through the guest.
-  Failed calls do not invent fallback articles.
-- **Live** uses `EXA_API_KEY` for [Exa search](https://github.com/exa-labs/openapi-spec/blob/master/exa-openapi-spec.yaml).
-  Results retain their order, titles, URLs and snippets in each engine's skin.
-  The World menu shows why a source is unavailable: missing captures, a page
-  writer or a search key. Other sources remain usable.
+- **Copied** serves offline English Wikipedia, Python, Rust, MDN and GitHub documentation, recipes,
+  and the captured security sources at their original URLs. A prepared Tantivy
+  index ranks partial matches by BM25 with extra title weight and the same English
+  word stemming for documents and queries. Google, Bing,
+  DuckDuckGo and Claude's search tool share that index, each engine in its own
+  layout. Result counts come from the index before pagination. An unmatched query
+  returns an empty list. Missing pages use captured site responses; unknown hosts
+  return NXDOMAIN.
+- **Live** is selected by default when `EXA_API_KEY` is present. [Exa search](https://github.com/exa-labs/openapi-spec/blob/master/exa-openapi-spec.yaml)
+  supplies results, which keep their order, titles, URLs and snippets in each
+  engine's skin. The host copies any public URL the guest or Claude requests,
+  including URLs that never appeared in search. Each page, stylesheet or image
+  is copied when requested and retained at its original URL. A copied page also
+  brings its stylesheets, CSS imports, fonts, images and scripts, including
+  cross-host assets and redirects at their real URLs. Separate downloads
+  can progress together. Actual host requests appear in the
+  page's internet activity. Interrupted downloads retry until completion; upstream
+  status codes, including real missing pages, are preserved. A host whose real
+  certificate fails verification (expired, issued for other names, or from an
+  untrusted issuer) presents a certificate that fails the same way.
+- **Edited** serves the real web as Live does, with the changes a scenario calls
+  for. The scenario is a short instruction set in the World menu, such as "The
+  Fed raised rates by 0.5 points on Oct 22". A model reads each page or result
+  list with the scenario, today's date and what readers have already been shown,
+  and returns only edits: an exact passage and its replacement. The world makes
+  them in the real bytes and serves everything else unchanged, then asks again
+  until nothing is left to change. Text that names nothing the scenario is about
+  is served without a model call. Real 404s, PDFs and other files stay real.
+  The host-held Claude token takes priority, followed by `OPENROUTER_API_KEY` and
+  `ANTHROPIC_API_KEY`; the editor is Claude Haiku 5.5 and never sends its
+  credential through the guest. The feed and the reading view mark each change;
+  the guest sees none of this. With no scenario, Edited behaves like Live.
 
-Live downloads result pages and requisites, following navigation to depth five
-within each result's site. Redirects and cross-host assets are retained at their
-real URLs. Live search and capture use a separate host HTTP transport, outside
-the guest model gateway; selecting Live permits public-web downloads. Search
-queries and served pages are logged and displayed. The crawler ignores
-robots.txt and limits requests per host. Unknown URLs do not start downloads.
-The page reports the source that answered each request. Keep Copied selected
-for the bounded security research and offline package flows.
+The source switch shows why a source is unavailable: missing captures, a model
+key or a search key. Other sources remain usable. The page source can change
+during a session, and the page reports the source that answered each request.
+Copied mode has no public-web fallback. Its day is the Wikipedia snapshot's: the
+workstation clock, HTTP dates and the World menu move back to it while Copied
+answers, and return to the run day when another source is chosen. Live supplies current
+material. Live search and capture use a separate host HTTP transport, outside
+the guest model gateway. Search queries and served pages are logged and
+displayed. The crawler ignores robots.txt.
 
 The content audit applies to text the world writes. Replayed WARC responses carry
 capture provenance and are outside that scope; their words are not allowlisted.
@@ -152,7 +158,7 @@ request occurred.
 
 The world's observations report sign-in policy and upstream attempts, responses
 and failures. An attempt means the request entered the host transport, not that
-a connection succeeded. Model gateway and page-writer requests share this
+a connection succeeded. Model gateway and editor requests share this
 observed provider transport. Local startup responses and rejected requests do
 not produce an upstream attempt. Live's host search and capture transport is
 separate from this provider boundary.
@@ -163,9 +169,17 @@ with unsupported features. Inline data and client tool arguments containing URLs
 remain usable. Provider-native search and fetch become client functions answered
 from the world's pages; they do not reach the provider as native web tools.
 
-## Briefs
+## Standalone world
 
-A file in [seeds/](seeds) has a world date and free-text instructions:
+The `web-world` binary runs the same network for the Inspect integration
+(`python/inspect_fictionet`), under Docker Compose ([compose.yaml](compose.yaml)).
+It writes its pages for a brief instead of copying them: the `stored` generator
+builds them from what the world already holds, `openrouter` and `anthropic`
+have a model write them, and `replay` serves only what a store holds. Every
+page and result list is kept in a store directory, so a later world on the
+same directory serves the same web.
+
+A brief in [seeds/](seeds) has a world date and free-text instructions:
 
 ```toml
 +++
@@ -176,36 +190,56 @@ date = "2026-10-21"
 Write the world's full brief after the closing marker: what is true, what the
 sites contain and which sources matter. Optional `[[fixed]]` entries retain
 `url`, `file`, `title`, `description` and `content_type`; their files are served
-verbatim. For the VM demo, the brief's date is replaced by the run day. The guest
-inherits the host clock; HTTP dates and certificates use the run clock. The
-standalone world can still run against a brief's historical date.
-Search ranking receives the prose without special treatment for named sites.
-Eval questions live in the Python task's `QUESTIONS` mapping.
+verbatim.
 
 ## Corpus
 
-The default world is [security](seeds/security.md). Its `[corpus]` front matter
-chooses the capture directory under `demos/downloads/` and the starting URLs.
-The app opens that declaration; it does not choose a topic or URL list itself.
-The capture contains MITRE ATT&CK techniques, CISA advisories, NIST guidance,
-and researcher and vendor analyses of tj-actions, Shai-Hulud, SolarWinds,
-XZ, 3CX, Codecov and PyTorch nightly. It is a bounded
-collection; links beyond the captures have no public-web fallback.
-
-WARCs are stored in `demos/downloads/security/`, outside git, with their wget
-logs. Capture the URLs in the seed with:
+The [seed](seeds/security.md) selects the security captures and the broad
+reference web under the shared downloads directory. Prepare the reference web
+once before starting the demo:
 
 ```sh
-wget --page-requisites --span-hosts --compression=auto --delete-after \
-  --inet4-only --no-http-keep-alive --wait=0.3 --timeout=30 --tries=2 \
-  --warc-file=<directory>/<name> <URLs>
+rustup run 1.99.0 cargo xtask search-web /path/to/demos/downloads
 ```
 
-Use a separate WARC name for each batch. Keep original URLs, redirects, HTTP
-headers and response bodies; do not rewrite links or unpack the archives.
+This downloads the English Wikipedia ZIM without images and crawls English
+documentation and recipe sites, then publishes an immutable disk index. Startup
+loads the prepared index and archive locations instead of parsing the sources again. `--documents` runs
+only capture; `--index` runs only indexing. Preparation leaves at least 60 GiB of
+free disk space. Downloads and indexes stay outside git.
+
+WARCs are stored in `demos/downloads/security/`, outside git. Capture the seed
+pages, references and their requisites with:
+
+```sh
+rustup run 1.99.0 cargo xtask search-capture /path/to/demos/downloads --research
+```
+
+Each batch gets a separate archive. Captures keep original URLs, redirects, HTTP
+headers and response bodies.
 Microsoft's site required a browser User-Agent. Referenced NIST PDFs are also
 captured. Some upstream optional images and fonts return errors in the original
 sites and retain those errors in replay.
+
+Capture follows stylesheets, CSS imports, fonts, images and scripts across hosts.
+Chromium refreshes page HTML and discovers dependencies requested by JavaScript
+at a desktop viewport. Successful refreshed pages become new records; a failed
+refresh retains a previous successful response and reports the upstream failure.
+Its requests use the same host transport with the browser's request
+headers; the browser itself has no Internet route.
+
+Complete requisites for every page in an existing corpus with:
+
+```sh
+rustup run 1.99.0 cargo xtask search-requisites demos/downloads/security
+```
+
+Append URLs to that command to capture or repair individual pages. Cached pages
+are traversed too. New WARC batches are flushed and linked into place atomically;
+the original archives and URLs remain intact. Upstream HTTP errors are retained
+at their original URLs, and transport failures are reported in the capture output.
+Batches published after the offline index was prepared are served at startup
+without reindexing.
 
 The previous astronomy captures remain in `demos/downloads/astronomy/`.
 
@@ -213,9 +247,9 @@ The previous astronomy captures remain in `demos/downloads/astronomy/`.
 
 The corpus's `packages/` directory holds separate WARCs for PyPI indexes,
 wheel metadata and distributions, and GitHub source archives. These sites
-always replay locally, including in Model-written mode. There is no upstream
-transport. Missing distributions return 404, and a missing project cannot
-fall through to a generated page. Captured site 404 pages and their assets
+replay their captures in every mode. A file the capture lacks is copied from
+its real host when first asked for and kept for the run, so installs work for
+any package; a package that does not exist stays a 404. Captured site 404 pages and their assets
 also supply missing-page responses for the research sources.
 
 Capture the research sources and packages with Python 3.12 and pip available
@@ -235,10 +269,12 @@ Other versions and platforms require their own captures.
 
 ## Code
 
-The world's page modules separate routing, generation, listings, stored pages,
-corrections and model tools. Prompt construction and answer parsing are separate.
+The world's page modules separate the copied web, Live copies, the editor and
+the text it edits, listings and model tools. The standalone world's written
+web, its generators and its store live in `pages/written`.
 The WARC reader, crawler, BM25 index, model gateway and credential transport live in
 `fictionet-extras`. The shared demo kit supplies VM lifetime, prepared images
 and SSH console sockets. Search owns its HTML, styles and JavaScript, including copies of the
-terminal and screen pieces. ghostty-web 0.4.0 and noVNC 1.7.0, with their
+terminal and screen pieces. Vendored upstream ghostty-web with wheel reporting
+and noVNC 1.7.0, with their
 licenses, live in `demos/kit/assets`.

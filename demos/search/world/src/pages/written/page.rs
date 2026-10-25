@@ -2,8 +2,8 @@
 
 use super::*;
 
-impl Pages {
-    pub(super) fn listed_video(&self, host: &str, target: &str) -> Option<PageRecord> {
+impl Written {
+    fn listed_video(&self, host: &str, target: &str) -> Option<PageRecord> {
         if host != "www.youtube.com" || !target.starts_with("/watch?v=") {
             return None;
         }
@@ -58,21 +58,61 @@ impl Pages {
         target: &str,
         prefetch: bool,
     ) -> Response {
-        let lock = match self.locks.lock(cx, page_key(host, target)).await {
-            Ok(lock) => lock,
-            Err(error) => return Stop::store(error).response(),
+        // The page is found or made in the world's own task, so a client
+        // that stops waiting does not stop it: its next request finds the
+        // page made, or waits on the same writing.
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let pages = self.clone();
+        let (host, target) = (host.to_owned(), target.to_owned());
+        cx.spawn(move |cx| async move {
+            let _ = send.send(pages.found(&cx, &host, &target, prefetch).await);
+            Ok(())
+        });
+        let (record, made) = match receive.await {
+            Ok(Ok(found)) => found,
+            Ok(Err(response)) => return *response,
+            Err(_) => {
+                return Stop::store(std::io::Error::other("the world stopped")).response();
+            }
         };
+        if made && record.content_type.starts_with("text/html") {
+            self.note_links(&record.url, &String::from_utf8_lossy(&record.body));
+        }
+        let meta = Meta::Document {
+            title: record.title,
+        };
+        Response::new(
+            record.status,
+            record.content_type,
+            record.body,
+            record.headers,
+            meta,
+        )
+    }
+
+    /// The stored page at `host` and `target`, or one made now, laid out
+    /// for today, and whether it was made now; the answer instead when
+    /// there is none.
+    async fn found(
+        &self,
+        cx: &Cx,
+        host: &str,
+        target: &str,
+        prefetch: bool,
+    ) -> Result<(PageRecord, bool), Box<Response>> {
+        let _lock = self
+            .locks
+            .lock(cx, page_key(host, target))
+            .await
+            .map_err(|error| Box::new(Stop::store(error).response()))?;
         let stored = self.store().page(host, target).cloned();
         let stored = stored.or_else(|| self.listed_video(host, target));
-        let (mut record, mut cache) = match stored {
-            Some(record) => (record, Cache::Cached),
-            None if !self.generating() => {
-                drop(lock);
-                return self.missing(host, target);
-            }
+        let (mut record, made) = match stored {
+            Some(record) => (record, false),
+            None if !self.generating() => return Err(Box::new(self.missing(host, target))),
             None => match self.make_page(cx, host, target, prefetch).await {
-                Ok(record) => (record, Cache::Generated),
-                Err(stop) => return stop.response(),
+                Ok(record) => (record, true),
+                Err(stop) => return Err(Box::new(stop.response())),
             },
         };
         if record.content_type.starts_with("text/html")
@@ -87,67 +127,14 @@ impl Pages {
         {
             record.body = html.into_bytes();
         }
-        drop(lock);
-        if cache == Cache::Generated && record.content_type.starts_with("text/html") {
-            self.note_links(&record.url, &String::from_utf8_lossy(&record.body));
-        }
-        if !prefetch
-            && record.prefetched
-            && self
-                .store()
-                .unserved
-                .remove(&(record.host.clone(), record.target.clone()))
-        {
-            cache = Cache::Prefetched;
-        }
-        // A page asked for before anything mentioned it came direct.
-        let reason = record
-            .mentions
-            .iter()
-            .find_map(Mention::reason)
-            .unwrap_or(Reason::Direct);
-        let visible = String::from_utf8_lossy(&record.body);
-        let visible = normalize(&if record.content_type.starts_with("text/html") {
-            text::text_of(&visible)
-        } else {
-            visible.into_owned()
-        });
-        let carries = record
-            .mentions
-            .iter()
-            .filter(|mention| matches!(mention, Mention::Fact { snippet } if visible.contains(&normalize(snippet))))
-            .count() as u64;
-        let shown = Shown {
-            cache,
-            title: record.title,
-            prefetched: record.prefetched,
-            claims: record.claims.iter().map(ToString::to_string).collect(),
-            mentions: record.mentions.len(),
-            unsupported_snippets: record.unsupported_snippets,
-            unchecked_snippets: record.unchecked_snippets,
-            tells: record.tells,
-            reason,
-            usage: record.usage,
-        };
-        let meta = Meta::Page(Box::new(shown));
-        let mut response = Response::new(
-            record.status,
-            record.content_type,
-            record.body,
-            record.headers,
-            meta,
-        );
-        response.carries = carries;
-        response
+        Ok((record, made))
     }
 
     /// Records the links of a page just made as mentions of the pages
     /// behind them, unless those pages are stored. A later request has this
     /// context even without a Referer.
     pub(super) fn note_links(&self, url: &str, markup: &str) {
-        let Ok(mut store) = self.writing_store() else {
-            return;
-        };
+        let mut store = self.store();
         for (host, target, anchor) in links(url, markup) {
             if store.page(&host, &target).is_none() {
                 let mention = Mention::Link {

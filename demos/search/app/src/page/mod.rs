@@ -1,4 +1,4 @@
-//! Search owns its map, details, rewind and world controls.
+//! Search owns its map, details and world controls.
 
 use axum::{
     Json, Router,
@@ -9,16 +9,14 @@ use axum::{
 use fictionet_demo::kit::page::{self as pieces, Console, HostStatus};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::VecDeque,
+    collections::HashMap,
     sync::{Arc, Mutex},
 };
 use tokio::sync::{mpsc, watch};
 use web_world::{
-    observation::{CallPhase, EgressPurpose, Hit, Observation, PageSource, SearchObs, Tool},
-    pages::{NewPages, Pages},
+    observation::{CallPhase, EgressPurpose, Fetch, Hit, Observation, PageSource, SearchObs, Tool},
+    pages::{Edit, Pages, Scenario, Source},
 };
-
-const HISTORY: usize = 1024;
 
 fn wall_start() -> u64 {
     std::time::SystemTime::now()
@@ -48,6 +46,9 @@ pub struct Request {
     pub elapsed_ms: u64,
     pub headers: Vec<(String, String)>,
     pub has_preview: bool,
+    pub fetch: Fetch,
+    pub referrer: Option<String>,
+    pub edits: Vec<Edit>,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct Search {
@@ -55,6 +56,7 @@ pub struct Search {
     pub engine: web_world::observation::Engine,
     pub query: String,
     pub results: Vec<Hit>,
+    pub edits: Vec<Edit>,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct Call {
@@ -73,6 +75,7 @@ pub struct ToolUse {
     pub tool: Tool,
     pub target: String,
     pub results: Vec<Hit>,
+    pub edits: Vec<Edit>,
     pub error: Option<String>,
 }
 #[derive(Clone, Debug, Serialize)]
@@ -85,7 +88,6 @@ pub struct Connection {
 pub struct View {
     pub started_at_ms: u64,
     pub at_ms: u64,
-    pub oldest_ms: u64,
     pub sites: Vec<Site>,
     pub calls: Vec<Call>,
     pub activity: Vec<Observation>,
@@ -95,234 +97,279 @@ pub struct View {
 }
 
 pub struct Views {
-    started_at_ms: u64,
-    observations: VecDeque<Observation>,
-    oldest_ms: u64,
-    connections: Vec<Connection>,
-    signin: VecDeque<Observation>,
+    view: View,
+    previews: HashMap<String, (web_world::pages::PageBody, PageSource)>,
+    boot: Boot,
+}
+
+/// The workstation's own start-up: its browser opening its start page.
+/// The run record keeps it; the page shows what happens after it.
+#[derive(Default)]
+struct Boot {
+    /// When the workstation became ready, in wall-clock milliseconds.
+    ended_at_ms: Option<u64>,
+    /// Addresses the start-up loaded; their own requests are start-up too.
+    pages: std::collections::HashSet<String>,
+}
+impl Boot {
+    /// Whether this fact belongs to start-up; remembers the pages it loaded.
+    fn claims(&mut self, wall_ms: u64, fact: &SearchObs) -> bool {
+        let booting = self.ended_at_ms.is_none_or(|ended| wall_ms < ended);
+        match fact {
+            SearchObs::RunStarted { .. } | SearchObs::Signin { .. } => false,
+            SearchObs::Request {
+                scheme,
+                host,
+                path,
+                fetch,
+                referrer,
+                ..
+            } => {
+                let url = format!("{scheme}://{host}{path}");
+                let owned = *fetch == Fetch::Subresource
+                    && referrer
+                        .as_ref()
+                        .is_some_and(|page| self.pages.contains(page));
+                if booting || owned {
+                    self.pages.insert(url);
+                    true
+                } else {
+                    // A later visit to the start page is the agent's own.
+                    self.pages.remove(&url);
+                    false
+                }
+            }
+            SearchObs::Egress { page, .. } => {
+                booting || page.as_ref().is_some_and(|page| self.pages.contains(page))
+            }
+            _ => booting,
+        }
+    }
 }
 impl Default for Views {
     fn default() -> Self {
         Self {
-            started_at_ms: wall_start(),
-            observations: VecDeque::new(),
-            oldest_ms: 0,
-            connections: Vec::new(),
-            signin: VecDeque::new(),
+            view: View {
+                started_at_ms: wall_start(),
+                at_ms: 0,
+                sites: Vec::new(),
+                calls: Vec::new(),
+                activity: Vec::new(),
+                connections: Vec::new(),
+                egress: Vec::new(),
+                signin: None,
+            },
+            previews: HashMap::new(),
+            boot: Boot::default(),
         }
     }
 }
 impl Views {
-    pub fn push(&mut self, observation: Observation) {
+    pub fn push(&mut self, mut observation: Observation) {
+        let view = &mut self.view;
+        view.at_ms = observation.at_ms;
         if let SearchObs::RunStarted { started_at_ms } = observation.fact {
-            self.started_at_ms = started_at_ms;
+            view.started_at_ms = started_at_ms;
+        }
+        if self
+            .boot
+            .claims(view.started_at_ms + observation.at_ms, &observation.fact)
+        {
+            return;
         }
         match &observation.fact {
-            SearchObs::Egress { host, purpose, .. } => {
+            SearchObs::Resolved { name, address } => {
+                if address.is_some() {
+                    site(&mut view.sites, &name.to_ascii(), observation.at_ms).address = *address;
+                }
+            }
+            SearchObs::Request {
+                scheme,
+                host,
+                method,
+                path,
+                status,
+                bytes,
+                content_type,
+                source,
+                elapsed_ms,
+                headers,
+                fetch,
+                referrer,
+                title: _,
+                error: _,
+                edits,
+                preview,
+            } => {
+                let url = format!("{scheme}://{host}{path}");
+                if let Some(body) = preview {
+                    self.previews
+                        .insert(url.clone(), (body.clone(), source.clone()));
+                } else {
+                    self.previews.remove(&url);
+                }
+                site(&mut view.sites, &host.to_ascii(), observation.at_ms)
+                    .requests
+                    .push(Request {
+                        url,
+                        at_ms: observation.at_ms,
+                        method: method.to_string(),
+                        path: path.to_string(),
+                        status: status.as_u16(),
+                        bytes: *bytes,
+                        content_type: content_type.clone(),
+                        source: source.clone(),
+                        elapsed_ms: *elapsed_ms,
+                        headers: headers
+                            .0
+                            .iter()
+                            .filter(|(_, value)| value.as_bytes() != b"[redacted]")
+                            .map(|(name, value)| {
+                                (
+                                    name.to_string(),
+                                    String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                                )
+                            })
+                            .collect(),
+                        has_preview: preview.is_some(),
+                        fetch: *fetch,
+                        referrer: referrer.clone(),
+                        edits: edits.clone(),
+                    });
+            }
+            SearchObs::Search {
+                engine,
+                query,
+                results,
+                edits,
+            } => {
+                let host = match engine {
+                    web_world::observation::Engine::Google => "www.google.com",
+                    web_world::observation::Engine::Bing => "www.bing.com",
+                    web_world::observation::Engine::DuckDuckGo => "html.duckduckgo.com",
+                    web_world::observation::Engine::YouTube => "www.youtube.com",
+                };
+                site(&mut view.sites, host, observation.at_ms)
+                    .searches
+                    .push(Search {
+                        at_ms: observation.at_ms,
+                        engine: *engine,
+                        query: query.clone(),
+                        results: results.clone(),
+                        edits: edits.clone(),
+                    });
+            }
+            SearchObs::ModelCall {
+                call,
+                host,
+                path,
+                status,
+                method,
+                phase,
+            } => {
+                if let Some(row) = view.calls.iter_mut().find(|row| row.call == *call) {
+                    row.status = status.map(|status| status.as_u16());
+                    row.phase = *phase;
+                } else {
+                    view.calls.push(Call {
+                        call: *call,
+                        at_ms: observation.at_ms,
+                        host: host.to_ascii(),
+                        path: path.to_string(),
+                        status: status.map(|status| status.as_u16()),
+                        method: method.to_string(),
+                        phase: *phase,
+                        tools: Vec::new(),
+                    });
+                }
+            }
+            SearchObs::Tool {
+                call,
+                tool,
+                target,
+                results,
+                edits,
+                error,
+            } => {
+                if let Some(row) = view.calls.iter_mut().find(|row| row.call == *call) {
+                    row.tools.push(ToolUse {
+                        at_ms: observation.at_ms,
+                        tool: *tool,
+                        target: target.clone(),
+                        results: results.clone(),
+                        edits: edits.clone(),
+                        error: error.clone(),
+                    });
+                }
+            }
+            SearchObs::Egress {
+                host,
+                purpose,
+                attempt,
+                ..
+            } => {
                 let host = host.to_ascii();
-                if !self
+                if !view
                     .connections
                     .iter()
                     .any(|connection| connection.host == host && connection.purpose == *purpose)
                 {
-                    if self.connections.len() == HISTORY {
-                        self.connections.remove(0);
-                    }
-                    self.connections.push(Connection {
+                    view.connections.push(Connection {
                         host,
                         purpose: *purpose,
                         at_ms: observation.at_ms,
                     });
                 }
-            }
-            SearchObs::Signin { .. } => {
-                if self.signin.len() == HISTORY {
-                    self.signin.pop_front();
+                if let Some(previous) = view.egress.iter_mut().find(
+                    |row| matches!(row.fact, SearchObs::Egress { attempt: id, .. } if id == *attempt),
+                ) {
+                    *previous = observation.clone();
+                } else {
+                    view.egress.push(observation.clone());
                 }
-                self.signin.push_back(observation.clone());
             }
-            _ => {}
+            SearchObs::Signin { .. } => view.signin = Some(observation.clone()),
+            SearchObs::NoRoute { .. }
+            | SearchObs::Certificate { .. }
+            | SearchObs::Abandoned { .. }
+            | SearchObs::RunStarted { .. } => {}
         }
-        if self.observations.len() == HISTORY {
-            self.observations.pop_front();
-            self.oldest_ms = self.observations.front().map_or(0, |row| row.at_ms);
+        if let SearchObs::Request { preview, .. } = &mut observation.fact {
+            *preview = None;
         }
-        self.observations.push_back(observation);
+        if let SearchObs::ModelCall { call, .. } = observation.fact
+            && let Some(previous) = view
+                .activity
+                .iter_mut()
+                .find(|row| matches!(row.fact, SearchObs::ModelCall { call: id, .. } if id == call))
+        {
+            previous.fact = observation.fact;
+        } else if let SearchObs::Egress { attempt, .. } = observation.fact
+            && let Some(previous) = view.activity.iter_mut().find(
+                |row| matches!(row.fact, SearchObs::Egress { attempt: id, .. } if id == attempt),
+            )
+        {
+            *previous = observation;
+        } else {
+            view.activity.push(observation);
+        }
     }
-    pub fn at(&self, at_ms: u64) -> View {
-        let mut view = View {
-            started_at_ms: self.started_at_ms,
-            at_ms,
-            oldest_ms: self.oldest_ms,
-            sites: Vec::new(),
-            calls: Vec::new(),
-            activity: Vec::new(),
-            connections: self
-                .connections
-                .iter()
-                .filter(|row| row.at_ms <= at_ms)
-                .cloned()
-                .collect(),
-            egress: Vec::new(),
-            signin: self
-                .signin
-                .iter()
-                .rev()
-                .find(|row| row.at_ms <= at_ms)
-                .cloned(),
-        };
-        for observation in self.observations.iter().filter(|row| row.at_ms <= at_ms) {
-            match &observation.fact {
-                SearchObs::Resolved { name, address } => {
-                    if address.is_some() {
-                        site(&mut view.sites, &name.to_ascii(), observation.at_ms).address =
-                            *address;
-                    }
-                }
-                SearchObs::Request {
-                    scheme,
-                    host,
-                    method,
-                    path,
-                    status,
-                    bytes,
-                    content_type,
-                    source,
-                    elapsed_ms,
-                    headers,
-                    preview,
-                } => {
-                    site(&mut view.sites, &host.to_ascii(), observation.at_ms)
-                        .requests
-                        .push(Request {
-                            url: format!("{scheme}://{host}{path}"),
-                            at_ms: observation.at_ms,
-                            method: method.to_string(),
-                            path: path.to_string(),
-                            status: status.as_u16(),
-                            bytes: *bytes,
-                            content_type: content_type.clone(),
-                            source: source.clone(),
-                            elapsed_ms: *elapsed_ms,
-                            headers: headers
-                                .iter()
-                                .filter(|(_, value)| value.as_bytes() != b"[redacted]")
-                                .map(|(name, value)| {
-                                    (
-                                        name.to_string(),
-                                        String::from_utf8_lossy(value.as_bytes()).into_owned(),
-                                    )
-                                })
-                                .collect(),
-                            has_preview: preview.is_some(),
-                        });
-                }
-                SearchObs::Search {
-                    engine,
-                    query,
-                    results,
-                } => {
-                    let host = match engine {
-                        web_world::observation::Engine::Google => "www.google.com",
-                        web_world::observation::Engine::Bing => "www.bing.com",
-                        web_world::observation::Engine::DuckDuckGo => "html.duckduckgo.com",
-                        web_world::observation::Engine::YouTube => "www.youtube.com",
-                    };
-                    site(&mut view.sites, host, observation.at_ms)
-                        .searches
-                        .push(Search {
-                            at_ms: observation.at_ms,
-                            engine: *engine,
-                            query: query.clone(),
-                            results: results.clone(),
-                        });
-                }
-                SearchObs::ModelCall {
-                    call,
-                    host,
-                    path,
-                    status,
-                    method,
-                    phase,
-                } => {
-                    if let Some(row) = view.calls.iter_mut().find(|row| row.call == *call) {
-                        row.status = status.map(|status| status.as_u16());
-                        row.phase = *phase;
-                    } else {
-                        view.calls.push(Call {
-                            call: *call,
-                            at_ms: observation.at_ms,
-                            host: host.to_ascii(),
-                            path: path.to_string(),
-                            status: status.map(|status| status.as_u16()),
-                            method: method.to_string(),
-                            phase: *phase,
-                            tools: Vec::new(),
-                        });
-                    }
-                }
-                SearchObs::Tool {
-                    call,
-                    tool,
-                    target,
-                    results,
-                    error,
-                } => {
-                    if let Some(row) = view.calls.iter_mut().find(|row| row.call == *call) {
-                        row.tools.push(ToolUse {
-                            at_ms: observation.at_ms,
-                            tool: *tool,
-                            target: target.clone(),
-                            results: results.clone(),
-                            error: error.clone(),
-                        });
-                    }
-                }
-                SearchObs::Egress { .. } => view.egress.push(observation.clone()),
-                SearchObs::Signin { .. } => view.signin = Some(observation.clone()),
-                SearchObs::NoRoute { .. }
-                | SearchObs::PageRevision { .. }
-                | SearchObs::RunStarted { .. } => {}
-            }
-            if let SearchObs::ModelCall { call, .. } = observation.fact
-                && let Some(previous) = view.activity.iter_mut().find(
-                    |row| matches!(row.fact, SearchObs::ModelCall { call: id, .. } if id == call),
-                )
-            {
-                previous.fact = observation.fact.clone();
-            } else {
-                view.activity.push(observation.clone());
-            }
-        }
-        view
+    /// The workstation is ready: what happens from now on is shown.
+    pub fn end_boot(&mut self) {
+        self.boot.ended_at_ms.get_or_insert_with(wall_start);
     }
-    pub fn preview(&self, url: &url::Url, at_ms: u64) -> Option<web_world::pages::PageBody> {
-        self.observations
-            .iter()
-            .rev()
-            .filter(|row| row.at_ms <= at_ms)
-            .find_map(|row| match &row.fact {
-                SearchObs::Request {
-                    scheme,
-                    host,
-                    path,
-                    preview,
-                    ..
-                } if scheme.as_str() == url.scheme()
-                    && Some(host.to_ascii().trim_end_matches('.')) == url.host_str()
-                    && path.as_str()
-                        == &url[url::Position::BeforePath..url::Position::AfterQuery] =>
-                {
-                    preview.clone()
-                }
-                _ => None,
-            })
+    pub fn preview(&self, url: &url::Url) -> Option<(web_world::pages::PageBody, PageSource)> {
+        self.previews.get(url.as_str()).cloned()
     }
     pub fn current(&self) -> View {
-        self.at(self
-            .observations
-            .back()
-            .map_or(self.oldest_ms, |row| row.at_ms))
+        self.view.clone()
+    }
+    fn restart(&mut self) {
+        self.view.sites.clear();
+        self.view.calls.clear();
+        self.view.activity.clear();
+        self.view.egress.clear();
+        self.previews.clear();
     }
 }
 fn site<'a>(sites: &'a mut Vec<Site>, host: &str, at_ms: u64) -> &'a mut Site {
@@ -345,12 +392,13 @@ fn site<'a>(sites: &'a mut Vec<Site>, host: &str, at_ms: u64) -> &'a mut Site {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct WorldState {
-    pub source: PageSource,
+    pub source: Source,
     pub copied: Availability,
-    pub model_written: Availability,
     pub live: Availability,
+    pub edited: Availability,
     pub date: String,
-    pub instructions: String,
+    /// What Edited changes on real pages.
+    pub scenario: Option<Scenario>,
     pub preview: bool,
 }
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -363,8 +411,8 @@ pub enum Availability {
 #[serde(rename_all = "snake_case")]
 pub enum UnavailableReason {
     NoCaptures,
-    NoPageWriter,
     NoSearchKey,
+    NoModelKey,
 }
 impl Availability {
     fn new(available: bool, reason: UnavailableReason) -> Self {
@@ -379,14 +427,8 @@ impl Availability {
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum Command {
     SetSource { source: Source },
+    SetScenario { scenario: String },
     Restart,
-}
-#[derive(Clone, Copy, Debug, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Source {
-    Copied,
-    ModelWritten,
-    Live,
 }
 
 type Control = (Command, tokio::sync::oneshot::Sender<Result<(), String>>);
@@ -403,15 +445,25 @@ pub struct Page {
     pub host: watch::Sender<HostStatus>,
     world: watch::Sender<WorldState>,
     commands: mpsc::UnboundedSender<Control>,
+    /// The world, while it runs; the page must not keep it (and its
+    /// observation stream) alive.
+    pages: std::sync::Weak<Pages>,
+    /// The world's context once it runs, for copies the page asks for.
+    cx: Arc<std::sync::OnceLock<fictionet::Cx>>,
 }
 impl Page {
-    pub fn new(pages: &Pages, preview: bool) -> (Self, Receivers) {
+    /// The world's settings as the page shows them, as they change.
+    pub fn world(&self) -> watch::Receiver<WorldState> {
+        self.world.subscribe()
+    }
+
+    pub fn new(pages: Arc<Pages>, preview: bool) -> (Self, Receivers) {
         let views = Views::default();
         let (snapshots, _) = watch::channel(views.current());
         let (observations, receive) = mpsc::unbounded_channel();
         pages.observe(observations);
         let (commands, control) = mpsc::unbounded_channel();
-        let world = world_state(pages, preview);
+        let world = world_state(&pages, preview);
         (
             Self {
                 views: Arc::new(Mutex::new(views)),
@@ -420,9 +472,17 @@ impl Page {
                 host: watch::channel(HostStatus::default()).0,
                 world: watch::channel(world).0,
                 commands,
+                pages: Arc::downgrade(&pages),
+                cx: Arc::default(),
             },
             (receive, control),
         )
+    }
+    /// Ends the workstation's start-up on the page.
+    pub fn end_boot(&self) {
+        let mut views = self.views.lock().unwrap();
+        views.end_boot();
+        self.snapshots.send_replace(views.current());
     }
     pub fn publish(&self, observation: Observation) {
         let mut views = self.views.lock().unwrap();
@@ -447,7 +507,7 @@ impl Page {
                 .open(&path)?,
         );
         println!("Run record: {}", path.display());
-        let mut started_at_ms = self.views.lock().unwrap().started_at_ms;
+        let mut started_at_ms = self.views.lock().unwrap().view.started_at_ms;
         while let Some(observation) = observations.recv().await {
             if let SearchObs::RunStarted {
                 started_at_ms: start,
@@ -489,18 +549,30 @@ impl Page {
             tokio::sync::oneshot::Sender<Result<(), String>>,
         )>,
     ) {
+        let _ = self.cx.set(cx.clone());
+        // The scenario's readiness reaches the page as it changes.
+        if let Some(mut changes) = pages.scenario_changes() {
+            let (page, pages) = (self.clone(), pages.clone());
+            cx.spawn(move |cx| async move {
+                while let Ok(Ok(())) = cx.race(None, changes.changed()).await {
+                    let preview = page.world.borrow().preview;
+                    page.world.send_replace(world_state(&pages, preview));
+                }
+                Ok(())
+            });
+        }
         let page = self.clone();
         cx.spawn(move |cx| async move {
             while let Ok(Some((command, reply))) = cx.race(None, control.recv()).await {
                 let restart = matches!(command, Command::Restart);
-                let expected_revision = pages.generation().revision;
+                let expected_revision = pages.revision();
                 let command = match command {
-                    Command::SetSource { source } => web_world::pages::Command::SetNewPages {
-                        new_pages: match source {
-                            Source::Copied => NewPages::Copied,
-                            Source::ModelWritten => NewPages::ModelWritten,
-                            Source::Live => NewPages::LiveSearch,
-                        },
+                    Command::SetSource { source } => web_world::pages::Command::SetSource {
+                        source,
+                        expected_revision,
+                    },
+                    Command::SetScenario { scenario } => web_world::pages::Command::SetScenario {
+                        scenario,
                         expected_revision,
                     },
                     Command::Restart => web_world::pages::Command::Restart { expected_revision },
@@ -510,8 +582,7 @@ impl Page {
                     .map(|_| {
                         if restart {
                             let mut views = page.views.lock().unwrap();
-                            views.observations.clear();
-                            views.oldest_ms = cx.now().since_start().as_millis() as u64;
+                            views.restart();
                             page.snapshots.send_replace(views.current());
                         }
                         let preview = page.world.borrow().preview;
@@ -529,7 +600,6 @@ impl Page {
         });
     }
     pub fn router(&self) -> Router {
-        let shared = self.clone();
         let preview = self.clone();
         let console = self.console.clone();
         let screen = console.clone();
@@ -539,6 +609,15 @@ impl Page {
                 get(|| async { http::StatusCode::NO_CONTENT }),
             )
             .route("/", get(|| async { Html(include_str!("index.html")) }))
+            .route(
+                "/fonts/terminal.woff2",
+                get(|| async {
+                    (
+                        [(http::header::CONTENT_TYPE, "font/woff2")],
+                        include_bytes!("fonts/JetBrainsMono-Regular.woff2").as_slice(),
+                    )
+                }),
+            )
             .route(
                 "/search.mjs",
                 get(|| async {
@@ -576,13 +655,6 @@ impl Page {
                 }),
             )
             .route(
-                "/view",
-                get(move |Query(query): Query<Rewind>| {
-                    let page = shared.clone();
-                    async move { Json(page.views.lock().unwrap().at(query.at_ms)) }
-                }),
-            )
-            .route(
                 "/preview",
                 get(move |Query(query): Query<Preview>| {
                     let page = preview.clone();
@@ -595,9 +667,9 @@ impl Page {
                         )) else {
                             return http::StatusCode::BAD_REQUEST.into_response();
                         };
-                        let body = page.views.lock().unwrap().preview(&url, query.at_ms);
+                        let body = page.views.lock().unwrap().preview(&url);
                         match body {
-                            Some(body) => {
+                            Some((body, _)) => {
                                 match tokio::task::spawn_blocking(move || body.text()).await {
                                     Ok(Ok(markup)) => (
                                         http::StatusCode::OK,
@@ -612,15 +684,15 @@ impl Page {
                                         .into_response(),
                                 }
                             }
-                            None => (
-                                http::StatusCode::NOT_FOUND,
-                                "No recorded page at this point in the run",
-                            )
-                                .into_response(),
+                            None => {
+                                (http::StatusCode::NOT_FOUND, "No recorded page").into_response()
+                            }
                         }
                     }
                 }),
             )
+            .route("/thumbnail", get(thumbnail))
+            .route("/held", get(held))
             .route(
                 "/world",
                 get({
@@ -652,6 +724,10 @@ impl Page {
                 "/host",
                 fictionet::stdlib::page::state(self.host.subscribe()),
             )
+            .nest(
+                "/world",
+                fictionet::stdlib::page::state(self.world.subscribe()),
+            )
             .merge(pieces::libraries())
     }
 }
@@ -660,11 +736,111 @@ struct Preview {
     scheme: Option<String>,
     host: String,
     path: String,
-    at_ms: u64,
 }
+/// A page the world served, by its address.
 #[derive(Deserialize)]
-struct Rewind {
-    at_ms: u64,
+struct Served {
+    url: url::Url,
+}
+/// A dependency of a served page, read from the source that served it.
+#[derive(Deserialize)]
+struct Dependency {
+    page: url::Url,
+    url: url::Url,
+}
+/// What a still picture of a served page may load: only what the world holds.
+const PICTURE_POLICY: &str = "default-src 'none'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; base-uri 'none'; form-action 'none'";
+fn held_address(page: &url::Url) -> impl Fn(&url::Url) -> String + '_ {
+    move |url| {
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("page", page.as_str())
+            .append_pair("url", url.as_str())
+            .finish();
+        format!("/held?{query}")
+    }
+}
+/// The page as the world served it, with its own stylesheets and images.
+async fn thumbnail(
+    State(page): State<Page>,
+    Query(Served { url }): Query<Served>,
+) -> axum::response::Response {
+    let Some((body, _)) = page.views.lock().unwrap().preview(&url) else {
+        return (http::StatusCode::NOT_FOUND, "No served page").into_response();
+    };
+    let picture = tokio::task::spawn_blocking(move || {
+        body.text()
+            .map(|html| web_world::pages::snapshot::page(&url, &html, &held_address(&url)))
+    })
+    .await;
+    match picture {
+        Ok(Ok(html)) => (
+            [
+                (http::header::CONTENT_TYPE, "text/html; charset=utf-8"),
+                (http::header::CONTENT_SECURITY_POLICY, PICTURE_POLICY),
+            ],
+            html,
+        )
+            .into_response(),
+        _ => (
+            http::StatusCode::INTERNAL_SERVER_ERROR,
+            "The served page could not be read",
+        )
+            .into_response(),
+    }
+}
+async fn held(
+    State(page): State<Page>,
+    Query(Dependency { page: owner, url }): Query<Dependency>,
+) -> axum::response::Response {
+    let Some((_, source)) = page.views.lock().unwrap().preview(&owner) else {
+        return http::StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(pages) = page.pages.upgrade() else {
+        return http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    pages.settled(&source, url.as_str()).await;
+    // An image is copied when the picture first shows it.
+    let holds = {
+        let (pages, source, url) = (pages.clone(), source.clone(), url.clone());
+        tokio::task::spawn_blocking(move || pages.held_resource(&source, url.as_str()).is_some())
+    };
+    if !holds.await.unwrap_or(false)
+        && let Some(cx) = page.cx.get()
+    {
+        pages
+            .copy_for_picture(cx, &source, &owner, url.as_str())
+            .await;
+    }
+    let held = tokio::task::spawn_blocking(move || {
+        let mut held = pages.held_resource(&source, url.as_str())?;
+        if held.content_type.starts_with("text/css") {
+            held.body = web_world::pages::snapshot::stylesheet(
+                &url,
+                &String::from_utf8_lossy(&held.body),
+                &held_address(&owner),
+            )
+            .into_bytes();
+        }
+        Some(held)
+    })
+    .await;
+    match held {
+        // The picture is a sandboxed frame with no origin of its own; its
+        // fonts load only when the reply allows any origin.
+        Ok(Some(held)) => (
+            [
+                (http::header::CONTENT_TYPE, held.content_type),
+                (
+                    http::header::CONTENT_SECURITY_POLICY,
+                    PICTURE_POLICY.to_owned(),
+                ),
+                (http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".to_owned()),
+            ],
+            held.body,
+        )
+            .into_response(),
+        _ => http::StatusCode::NOT_FOUND.into_response(),
+    }
 }
 async fn command(
     State(page): State<Page>,
@@ -706,16 +882,16 @@ fn world_state(pages: &Pages, preview: bool) -> WorldState {
     WorldState {
         source: pages.source(),
         copied: Availability::new(pages.has_copied(), UnavailableReason::NoCaptures),
-        model_written: Availability::new(
-            matches!(
-                pages.generator_kind(),
-                web_world::pages::GeneratorKind::Model(_)
-            ),
-            UnavailableReason::NoPageWriter,
-        ),
         live: Availability::new(pages.live_available(), UnavailableReason::NoSearchKey),
-        date: pages.seed().date.clone(),
-        instructions: pages.seed().instructions.clone(),
+        edited: if !pages.live_available() {
+            Availability::Unavailable {
+                reason: UnavailableReason::NoSearchKey,
+            }
+        } else {
+            Availability::new(pages.edited_available(), UnavailableReason::NoModelKey)
+        },
+        date: pages.world_date(),
+        scenario: pages.scenario(),
         preview,
     }
 }

@@ -1,6 +1,6 @@
 //! Facts the Search world explicitly reports to its own page.
 
-use crate::pages::{Meta, NewPages, Pages, Response};
+use crate::pages::{Edit, Meta, Pages, Response, Source};
 pub use fictionet::stdlib::protocols::dns::rr::Name as HostName;
 pub use fictionet_extras::models::UpstreamPhase as EgressPhase;
 use http::{
@@ -37,15 +37,42 @@ pub enum SearchObs {
         content_type: String,
         source: PageSource,
         elapsed_ms: u64,
-        #[serde(serialize_with = "crate::observation::headers")]
-        headers: HeaderMap,
+        headers: Box<Headers>,
+        fetch: Fetch,
+        /// The page that asked for this, as the client reported it.
+        referrer: Option<String>,
+        /// The document's own title, for pages.
+        title: Option<String>,
+        /// Why the world could not answer with the page: the site it read
+        /// could not be reached.
+        error: Option<String>,
+        /// The scenario's edits to the real page; empty when it is served
+        /// as the site sent it.
+        edits: Vec<Edit>,
         #[serde(skip)]
         preview: Option<crate::pages::PageBody>,
+    },
+    /// The client closed its connection before the world answered, as a
+    /// client with a deadline does.
+    Abandoned {
+        #[serde(serialize_with = "display")]
+        scheme: Scheme,
+        #[serde(serialize_with = "display")]
+        host: HostName,
+        #[serde(serialize_with = "display")]
+        method: Method,
+        #[serde(serialize_with = "display")]
+        path: PathAndQuery,
+        source: PageSource,
+        elapsed_ms: u64,
+        fetch: Fetch,
     },
     Search {
         engine: Engine,
         query: String,
         results: Vec<Hit>,
+        /// The scenario's edits to the real results' titles and snippets.
+        edits: Vec<Edit>,
     },
     ModelCall {
         call: u64,
@@ -64,6 +91,8 @@ pub enum SearchObs {
         tool: Tool,
         target: String,
         results: Vec<Hit>,
+        /// The scenario's edits to a search's results.
+        edits: Vec<Edit>,
         error: Option<String>,
     },
     Signin {
@@ -79,45 +108,60 @@ pub enum SearchObs {
         purpose: EgressPurpose,
         phase: EgressPhase,
         status: Option<u16>,
-    },
-    PageRevision {
-        target: WriterTarget,
-        action: RevisionAction,
-        reason: String,
+        /// The page a dependency was fetched for; the fetch belongs to it.
+        page: Option<String>,
     },
     NoRoute {
         from: IpAddr,
         to: IpAddr,
     },
+    /// The guest was shown the real site's certificate failure: the
+    /// certificate no browser accepts from the real host.
+    Certificate {
+        #[serde(serialize_with = "display")]
+        host: HostName,
+        problem: CertificateProblem,
+    },
 }
 
-/// The document a page-writer correction belongs to.
-#[derive(Clone, Debug, Serialize, serde::Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum WriterTarget {
-    Cast,
-    Stylesheet { host: String },
-    Search { query: String },
-    Page { url: String },
-}
-
-/// What the world did with a writer's answer before serving content.
-#[derive(Clone, Copy, Debug, Serialize)]
+/// Why a real host's certificate fails a browser's verification.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum RevisionAction {
-    Rejected,
+pub enum CertificateProblem {
+    Expired,
+    NotYetValid,
+    /// Issued for other names.
+    WrongName,
+    /// Not issued by a trusted root.
+    Untrusted,
+}
+
+impl From<&crate::tls::Refusal> for CertificateProblem {
+    fn from(refusal: &crate::tls::Refusal) -> Self {
+        match refusal {
+            crate::tls::Refusal::Expired { .. } => Self::Expired,
+            crate::tls::Refusal::NotYetValid { .. } => Self::NotYetValid,
+            crate::tls::Refusal::WrongName { .. } => Self::WrongName,
+            crate::tls::Refusal::Untrusted => Self::Untrusted,
+        }
+    }
 }
 
 /// The reason a request entered the real network.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EgressPurpose {
+    /// The guest's own model call, through the gateway.
     Model,
-    #[serde(rename = "page writer")]
-    PageWriter,
+    /// The editor's model call, for a scenario's edits.
+    Editor,
     Account,
     LiveSearch,
     LiveCapture,
+    /// A package index or file the copied web lacks.
+    Package,
+    /// The public original of a page a model writes, read to ground it.
+    Original,
 }
 
 /// A host transport destination can be a DNS name or an IP literal.
@@ -178,9 +222,44 @@ pub enum PageSource {
         #[serde(with = "time::serde::rfc3339::option")]
         captured: Option<time::OffsetDateTime>,
     },
-    Written,
     Live,
+    /// A live page with the scenario's edits.
+    Edited,
+    /// A page the standalone world wrote for its seed.
+    Written,
+    /// A package index, file or source archive, whatever the page source:
+    /// captured, or copied from its real host when the capture lacks it.
+    Package,
 }
+
+impl PageSource {
+    /// Whether the page came from the real web.
+    pub fn is_live(&self) -> bool {
+        matches!(self, Self::Live | Self::Edited)
+    }
+}
+/// How a request was made: a navigation to a document, or a page's own
+/// subresource or script request (`Sec-Fetch-Dest` other than a document).
+/// Clients that send no fetch metadata, like curl, navigate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Fetch {
+    Navigation,
+    Subresource,
+}
+
+impl Fetch {
+    pub(crate) fn of(headers: &HeaderMap) -> Self {
+        match headers
+            .get("sec-fetch-dest")
+            .and_then(|value| value.to_str().ok())
+        {
+            None | Some("document") => Self::Navigation,
+            Some(_) => Self::Subresource,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Engine {
@@ -238,14 +317,17 @@ impl Pages {
                     purpose: match event.purpose {
                         fictionet_extras::capture::Purpose::Search => EgressPurpose::LiveSearch,
                         fictionet_extras::capture::Purpose::Capture => EgressPurpose::LiveCapture,
+                        fictionet_extras::capture::Purpose::Package => EgressPurpose::Package,
+                        fictionet_extras::capture::Purpose::Original => EgressPurpose::Original,
                     },
                     phase: event.phase,
                     status: event.status.map(|status| status.as_u16()),
+                    page: event.page.as_ref().map(|page| redact_url(page.as_str())),
                 },
             );
         }));
         let destination = self.observation.clone();
-        self.observe_writer(std::sync::Arc::new(move |cx, provider, event| {
+        self.observe_editor(std::sync::Arc::new(move |cx, provider, event| {
             report(
                 &destination,
                 cx,
@@ -254,9 +336,10 @@ impl Pages {
                     host: provider.host().parse().expect("provider hostname"),
                     method: event.method.to_string(),
                     path: event.path.path().into(),
-                    purpose: EgressPurpose::PageWriter,
+                    purpose: EgressPurpose::Editor,
                     phase: event.phase,
                     status: event.status.map(|s| s.as_u16()),
+                    page: None,
                 },
             );
         }));
@@ -265,11 +348,15 @@ impl Pages {
         report(&self.observation, cx, fact);
     }
 
-    pub fn source(&self) -> PageSource {
-        match self.new_pages() {
-            NewPages::Copied => PageSource::Copy { captured: None },
-            NewPages::LiveSearch => PageSource::Live,
-            _ => PageSource::Written,
+    /// The source that answers a page asked for now.
+    pub fn page_source(&self) -> PageSource {
+        if self.written().is_some() {
+            return PageSource::Written;
+        }
+        match self.source() {
+            Source::Copied => PageSource::Copy { captured: None },
+            Source::Live => PageSource::Live,
+            Source::Edited => PageSource::Edited,
         }
     }
     pub(crate) fn report_response(
@@ -304,13 +391,23 @@ impl Pages {
                     results: list
                         .listed
                         .iter()
-                        .map(|(url, title, _)| Hit {
+                        .map(|(url, title)| Hit {
                             url: url.clone(),
                             title: title.clone(),
                         })
                         .collect(),
+                    edits: list.edits.clone(),
                 },
             );
+        }
+        // A page Edited mode left as the site sent it is a live page.
+        let edits = response
+            .edited
+            .as_ref()
+            .map(|edited| edited.edits.clone())
+            .unwrap_or_default();
+        if matches!(source, PageSource::Edited) && edits.is_empty() {
+            source = PageSource::Live;
         }
         if let PageSource::Copy { captured } = &mut source {
             *captured = self
@@ -326,8 +423,11 @@ impl Pages {
                     .ok()
                 });
         }
-        // Copied bytes retain their capture provenance; they are not called written pages.
-        let preview = if response.content_type.starts_with("text/") {
+        // Copied bytes are read from the capture when shown; an edited page
+        // shows its changes marked.
+        let preview = if let Some(edited) = &response.edited {
+            Some(crate::pages::PageBody::from(edited.marked.clone()))
+        } else if response.content_type.starts_with("text/") {
             response
                 .stored_headers
                 .as_ref()
@@ -372,7 +472,22 @@ impl Pages {
                 content_type: response.content_type.clone(),
                 source,
                 elapsed_ms: started.elapsed().as_millis() as u64,
-                headers,
+                fetch: Fetch::of(&headers),
+                title: match &response.meta {
+                    Meta::Document { title } => Some(title.clone()),
+                    _ => None,
+                }
+                .filter(|title| !title.trim().is_empty()),
+                error: match &response.meta {
+                    Meta::Error { error } => Some(error.clone()),
+                    _ => None,
+                },
+                edits,
+                referrer: headers
+                    .get(http::header::REFERER)
+                    .and_then(|value| value.to_str().ok())
+                    .map(redact_url),
+                headers: Box::new(Headers(headers)),
                 preview,
             },
         );
@@ -392,7 +507,7 @@ fn report(
         }
         SearchObs::Request { path, headers, .. } => {
             *path = redact_path(path);
-            for (name, value) in headers {
+            for (name, value) in headers.0.iter_mut() {
                 *value = match name.as_str() {
                     "user-agent" | "accept" | "accept-language" | "accept-encoding"
                     | "content-type" | "content-length" | "host" => value.clone(),
@@ -405,11 +520,9 @@ fn report(
                 };
             }
         }
-        SearchObs::ModelCall { path, .. } => *path = redact_path(path),
-        SearchObs::PageRevision {
-            target: WriterTarget::Page { url },
-            ..
-        } => *url = redact_url(url),
+        SearchObs::ModelCall { path, .. } | SearchObs::Abandoned { path, .. } => {
+            *path = redact_path(path)
+        }
         SearchObs::Egress { path, .. } => {
             *path = if path.starts_with("https://") || path.starts_with("http://") {
                 redact_url(path)
@@ -429,12 +542,14 @@ fn report(
     {
         *target = redact_url(target);
     }
-    if let Some(sender) = destination.lock().unwrap().as_ref() {
-        let _ = sender.send(Observation {
-            at_ms: cx.now().since_start().as_millis() as u64,
-            fact,
-        });
-    }
+    let destination = destination.lock().unwrap();
+    let Some(sender) = destination.as_ref() else {
+        return;
+    };
+    let _ = sender.send(Observation {
+        at_ms: cx.now().since_start().as_millis() as u64,
+        fact,
+    });
 }
 
 /// Serializes a protocol value as its wire spelling for the page.
@@ -455,6 +570,16 @@ pub fn optional_status<S: serde::Serializer>(
 ) -> Result<S::Ok, S::Error> {
     value.map(|status| status.as_u16()).serialize(serializer)
 }
+/// A request's headers, serialized as [`headers`] does.
+#[derive(Clone, Debug)]
+pub struct Headers(pub HeaderMap);
+
+impl Serialize for Headers {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        headers(&self.0, serializer)
+    }
+}
+
 /// Serializes header names and losslessly preserves nontext header values.
 pub fn headers<S: serde::Serializer>(value: &HeaderMap, serializer: S) -> Result<S::Ok, S::Error> {
     use serde::ser::SerializeSeq;

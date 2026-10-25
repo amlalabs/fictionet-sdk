@@ -2,6 +2,7 @@
 
 mod capture;
 mod image;
+mod web;
 mod workstation;
 
 use std::path::PathBuf;
@@ -15,10 +16,32 @@ async fn main() -> Result {
         .next()
         .ok_or("expected search-image or search-capture")?;
     let downloads = PathBuf::from(args.next().ok_or("missing downloads directory")?);
+    if task == "search-web" {
+        let step = match args.next().as_deref() {
+            None => web::Step::All,
+            Some("--documents") => web::Step::Documents,
+            Some("--index") => web::Step::Index,
+            _ => return Err("expected --documents or --index".into()),
+        };
+        if args.next().is_some() {
+            return Err("unexpected argument".into());
+        }
+        return web::build(&downloads, step).await;
+    }
+    if task == "search-requisites" {
+        return capture::requisites(&downloads, &args.collect::<Vec<_>>()).await;
+    }
     if task == "search-capture" {
         let selection = args
             .next()
             .ok_or("expected --research or Python with pip (Python 3.12)")?;
+        if selection == "--urls" {
+            let urls = args.collect::<Vec<_>>();
+            if urls.is_empty() {
+                return Err("missing capture URLs".into());
+            }
+            return capture::urls(&downloads, &urls).await;
+        }
         let python = (selection != "--research").then(|| PathBuf::from(selection));
         if args.next().is_some() {
             return Err("unexpected argument".into());

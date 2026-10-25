@@ -16,7 +16,8 @@ pub trait Engine: Send + Sync {
     ) -> Answer<Vec<crate::search::Result>>;
     /// Reads a page through the world's handler, without a host internet request.
     fn fetch(self: Arc<Self>, cx: Cx, url: String) -> Answer<Page>;
-    /// Whether the world serves a hostname.
+    /// Whether the world permits fetching from a hostname. Missing pages are
+    /// answered by the fetch handler, independently of domain admission.
     fn serves(&self, host: &str) -> bool;
 }
 
@@ -44,7 +45,7 @@ pub(super) fn host(url: &str) -> Option<String> {
         .map(|host| host.strip_suffix('.').unwrap_or(host).to_owned())
 }
 /// Domain restrictions on a world's search and fetch results.
-#[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Domains {
     /// Permitted domains and their subdomains; absent means unrestricted.

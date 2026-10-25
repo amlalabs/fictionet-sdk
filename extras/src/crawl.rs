@@ -5,6 +5,9 @@ use kuchiki::traits::TendrilSink;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 
+mod disk;
+pub use disk::{DiskIndex, DiskWriter};
+
 /// A page's searchable representation.
 #[derive(Debug, Serialize, Deserialize)]
 struct Document {
@@ -58,6 +61,13 @@ fn search_key(value: &str) -> String {
 }
 
 impl Index {
+    /// Copy the crawled documents into a persistent index.
+    pub fn write_to(&self, writer: &DiskWriter) -> std::io::Result<()> {
+        for document in &self.documents {
+            writer.add(&document.url, &document.title, &document.text)?;
+        }
+        Ok(())
+    }
     /// Follow links from the starting URLs, fetching only URLs in the corpus.
     /// `fetch` must be the same response handler used to serve copied sites.
     pub fn crawl(
@@ -74,7 +84,14 @@ impl Index {
             if !contains(&url) || !seen.insert(url.clone()) {
                 continue;
             }
-            let Some(response) = fetch(&url)? else {
+            let response = match fetch(&url) {
+                Ok(response) => response,
+                Err(error) => {
+                    eprintln!("Cannot index {url}: {error}");
+                    continue;
+                }
+            };
+            let Some(response) = response else {
                 continue;
             };
             let base = url::Url::parse(&url).expect("canonical HTTP URL");
@@ -143,14 +160,7 @@ impl Index {
             if excluded {
                 continue;
             }
-            let canonical = dom
-                .select_first("link[rel=canonical][href]")
-                .ok()
-                .and_then(|node| base.join(node.attributes.borrow().get("href")?).ok())
-                .filter(|canonical| canonical.origin() == base.origin())
-                .map(|canonical| canonical.to_string())
-                .unwrap_or_else(|| url.clone());
-            let identity = search_key(&canonical);
+            let identity = search_key(&url);
             let title = dom
                 .select_first("title")
                 .ok()
@@ -236,10 +246,19 @@ impl Index {
         self.documents.is_empty()
     }
 
-    /// Rank by BM25, using query coverage and URL order to break ties.
-    /// A majority of the distinct terms must match so a shared word cannot
-    /// fill a result page for an unrelated query.
+    /// Rank all partial matches by BM25, with URL order breaking ties.
     pub fn search(&self, query: &str, start: usize, limit: usize) -> search::Search {
+        self.search_in(query, start, limit, |_| true)
+    }
+
+    /// Restrict the eligible documents before ranking and pagination.
+    pub fn search_in(
+        &self,
+        query: &str,
+        start: usize,
+        limit: usize,
+        eligible: impl Fn(&str) -> bool,
+    ) -> search::Search {
         if self.is_empty() {
             return search::Search {
                 total: Some(0),
@@ -268,9 +287,8 @@ impl Index {
         }
         let mut ranked: Vec<_> = scores
             .into_iter()
-            .filter_map(|(id, (score, covered))| {
-                (covered > words.len() / 2).then_some((id, covered, score))
-            })
+            .filter(|(id, _)| eligible(&self.documents[*id].url))
+            .map(|(id, (score, covered))| (id, covered, score))
             .collect();
         ranked.sort_by(|(a, ac, x), (b, bc, y)| {
             y.total_cmp(x)

@@ -7,13 +7,8 @@ use super::{
 
 pub(crate) use super::normalize::*;
 
-pub(crate) use super::layout::{cookie_host, cookie_words, counted, hero, nav, question_body};
+pub(crate) use super::layout::{cookie_host, cookie_words, counted, nav, question_body};
 pub use super::layout::{favicon, server_of};
-
-/// Wraps HTML content in the site's layout.
-pub fn page(host: &str, profile: &Profile, record: &Page, today: &str) -> String {
-    page_at(host, "/", profile, record, today)
-}
 
 /// Renders a page using the captured section layout when available.
 pub fn page_at(host: &str, target: &str, profile: &Profile, record: &Page, today: &str) -> String {
@@ -24,31 +19,6 @@ pub fn page_at(host: &str, target: &str, profile: &Profile, record: &Page, today
         ..record.clone()
     };
     let record = &adjusted;
-    let mut illustrated;
-    let record = if [SiteKind::News, SiteKind::Howto, SiteKind::Recipe].contains(&profile.kind)
-        && !record.body.contains("article-hero")
-    {
-        illustrated = record.clone();
-        let picture = hero(&record.title, &profile.name);
-        use kuchiki::traits::TendrilSink;
-        let dom = kuchiki::parse_html().one(record.body.as_str());
-        let first = dom.select("p:not(.byline):not(.author)").unwrap().next();
-        if let Some(first) = first {
-            let fragment = kuchiki::parse_html().one(picture);
-            let figure = fragment.select_first("figure").unwrap();
-            first.as_node().insert_before(figure.as_node().clone());
-            illustrated.body = dom
-                .select_first("body")
-                .unwrap()
-                .as_node()
-                .children()
-                .map(|n| n.to_string())
-                .collect();
-        }
-        &illustrated
-    } else {
-        record
-    };
     let question;
     let record = if profile.kind == SiteKind::Qa {
         question = Page {

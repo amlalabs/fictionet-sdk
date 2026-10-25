@@ -1,12 +1,6 @@
-//! The Search demo: an Ubuntu desktop with Firefox and Claude Code on the
-//! security corpus, with optional model-written pages.
-//!
-//! - `search <downloads>` is the app: it boots, opens the page and stays up
-//!   until Ctrl-C. Copied pages answer searches and fetches without a model.
-//! - `search preview` shows the page with an in-world client and no VM.
+//! An Ubuntu research workstation connected to the Search world.
 
 mod guest;
-mod preview;
 use fictionet_search_demo::{network, page};
 
 use fictionet_demo::kit;
@@ -19,32 +13,16 @@ use web_world::{
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-/// The world's brief chooses both the copied corpus and model-written topics.
+/// The seed that chooses the copied web.
 const SEED: &str = "security";
 
-/// The app with its downloads folder, or the preview without a VM.
-#[derive(Debug, PartialEq)]
-enum Mode {
-    App { downloads: PathBuf },
-    Preview,
-}
-
-fn arguments(mut args: impl Iterator<Item = String>) -> Result<Mode> {
-    const USAGE: &str = "usage: search <downloads> or search preview";
-    let first = args.next().ok_or(USAGE)?;
-    let second = args.next();
-    if args.next().is_some() {
-        return Err(USAGE.into());
+fn downloads() -> Result<PathBuf> {
+    let mut args = std::env::args().skip(1);
+    let folder = args.next().ok_or("usage: search <downloads>")?;
+    if folder.starts_with('-') || args.next().is_some() {
+        return Err("usage: search <downloads>".into());
     }
-    match (first.as_str(), second.as_deref()) {
-        ("preview", None) => Ok(Mode::Preview),
-        ("preview", _) => Err(USAGE.into()),
-        (folder, _) if folder.starts_with('-') => Err(USAGE.into()),
-        (folder, None) => Ok(Mode::App {
-            downloads: folder.into(),
-        }),
-        _ => Err(USAGE.into()),
-    }
+    Ok(folder.into())
 }
 
 fn app_pages(
@@ -62,27 +40,23 @@ fn app_pages(
     } else {
         None
     };
-    let pages = Pages::from_corpus(
+    let mut pages = Pages::from_corpus(
         seed,
         downloads.parent().ok_or("downloads folder has no parent")?,
-        model,
     )?;
-    Ok(
-        if std::env::var("EXA_API_KEY").is_ok_and(|key| !key.is_empty()) {
-            pages.with_live_search(downloads)?
-        } else {
-            pages
-        },
-    )
+    if let Some(model) = model {
+        pages = pages.with_editor(model);
+    }
+    if std::env::var("EXA_API_KEY").is_ok_and(|key| !key.is_empty()) {
+        pages = pages.with_live_search(downloads)?;
+    }
+    Ok(pages)
 }
 
 #[tokio::main]
 async fn main() -> Result {
     let total = Instant::now();
-    let downloads = match arguments(std::env::args().skip(1))? {
-        Mode::Preview => return preview::run().await,
-        Mode::App { downloads } => downloads,
-    };
+    let downloads = downloads()?;
     let (claude_token, claude_key) =
         if let Some(path) = std::env::var_os("CLAUDE_CODE_OAUTH_TOKEN_FILE") {
             let value = std::fs::read_to_string(path)
@@ -107,10 +81,12 @@ async fn main() -> Result {
     let pages = Arc::new(app_pages(seed.clone(), &downloads, claude_key)?);
     let output = downloads.join("search");
     std::fs::create_dir_all(&output)?;
-    let (page, (observations, commands)) = page::Page::new(&pages, false);
+    let (page, (observations, commands)) = page::Page::new(pages.clone(), false);
     let server = page::serve(page.router(), kit::PAGE_PORT).await?;
     let _access = kit::PageAccess::new(&server.url)?;
     let observe_page = page.clone();
+    let ready_page = page.clone();
+    let (world_day, copied_lag) = (page.world(), pages.copied_lag());
     let mut observation_task =
         tokio::spawn(async move { observe_page.record(observations, &output).await });
     let log = Arc::new(Log::new(Box::new(std::io::sink()), &[], |s| s));
@@ -139,8 +115,11 @@ async fn main() -> Result {
         },
         move |cx, mut run| async move {
             let start = std::time::SystemTime::now();
+            // Copied mode sets the workstation's clock back to the day its
+            // pages were copied; certificates hold from then too.
+            let earliest = start - pages.copied_lag().unwrap_or_default();
             let web = World {
-                ca: Arc::new(Ca::in_memory(&cx, start)?),
+                ca: Arc::new(Ca::new(&cx, earliest, start)?),
                 addresses: Arc::new(Addresses::new(seed.fixed_addresses(), None)?),
                 pages: pages.clone(),
                 start,
@@ -158,13 +137,14 @@ async fn main() -> Result {
         _ = interrupt.recv() => { server.shutdown().await; observation_task.abort(); return Ok(()); },
         result = &mut observation_task => return Err(recording_error(result).into()),
     };
+    guest::follow_world_day(run.guest(guest::HOST).ssh().clone(), world_day, copied_lag);
     let mut readiness = Box::pin(run.app_ready(guest::HOST));
     let mut ready = false;
     let mut recording_ended = false;
     let result = loop {
         tokio::select! {
             result = &mut readiness, if !ready => match result {
-                Ok(()) => { ready = true; println!("The Search page stays open until Ctrl-C."); },
+                Ok(()) => { ready = true; ready_page.end_boot(); println!("The Search page stays open until Ctrl-C."); },
                 Err(error) => break Err(error),
             },
             result = &mut observation_task => { recording_ended = true; break Err(recording_error(result)); },

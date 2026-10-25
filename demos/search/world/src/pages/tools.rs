@@ -2,6 +2,33 @@
 
 use super::*;
 
+/// What a model's search tool is answered with: the results, and the
+/// scenario's edits to their titles and snippets.
+pub struct ToolResults {
+    pub results: Vec<search::Result>,
+    pub edits: Vec<Edit>,
+}
+
+impl Pages {
+    /// Answers a model's search tool from the active source.
+    pub async fn tool_search(
+        &self,
+        cx: &Cx,
+        query: &str,
+        domains: &fictionet_extras::models::tools::Domains,
+    ) -> Result<ToolResults, String> {
+        let mut found = self.listing(cx, query, 0, domains).await?;
+        found
+            .search
+            .results
+            .retain(|r| fictionet_extras::models::tools::allowed(domains, &r.url));
+        Ok(ToolResults {
+            results: found.search.results,
+            edits: found.edits,
+        })
+    }
+}
+
 impl fictionet_extras::models::Engine for Pages {
     fn search(
         self: Arc<Self>,
@@ -10,14 +37,10 @@ impl fictionet_extras::models::Engine for Pages {
         settings: fictionet_extras::models::tools::Domains,
     ) -> fictionet_extras::models::tools::Answer<Vec<fictionet_extras::search::Result>> {
         Box::pin(async move {
-            let Ok((mut search, _, _, _)) = self.listing(&cx, Engine::Google, &query, 0).await
-            else {
-                return Err(fictionet::Error::msg("Search is unavailable"));
-            };
-            search
-                .results
-                .retain(|r| fictionet_extras::models::tools::allowed(&settings, &r.url));
-            Ok(search.results)
+            self.tool_search(&cx, &query, &settings)
+                .await
+                .map(|found| found.results)
+                .map_err(|_| fictionet::Error::msg("Search is unavailable"))
         })
     }
     fn fetch(
@@ -31,19 +54,9 @@ impl fictionet_extras::models::Engine for Pages {
                 let started = std::time::Instant::now();
                 let parsed = url::Url::parse(&url)?;
                 let (host, target) = text::target_of(&url);
-                let package = self.package_url(&url);
-                let page_source = package.as_ref().map_or_else(
-                    || self.source(),
-                    |_| crate::observation::PageSource::Copy { captured: None },
-                );
-                let response = if let Some(package) = package {
-                    package
-                } else if self.live_only() {
-                    self.live_url(&cx, &url).await
-                } else if self.copied_only() {
-                    self.copied_url(&url)
-                } else {
-                    self.handle(&cx, "GET", &host, &target, None).await
+                let (response, source) = match self.package(&cx, &url).await {
+                    Some(package) => (package, crate::observation::PageSource::Package),
+                    None => (self.page(&cx, &url, None, None).await, self.page_source()),
                 };
                 self.report_response(
                     &cx,
@@ -53,7 +66,7 @@ impl fictionet_extras::models::Engine for Pages {
                         host: &host.parse()?,
                         method: &http::Method::GET,
                         path: &target.parse()?,
-                        source: page_source,
+                        source,
                         headers: http::HeaderMap::new(),
                     },
                     &response,
@@ -68,8 +81,7 @@ impl fictionet_extras::models::Engine for Pages {
                 break response;
             };
             let title = match response.meta {
-                Meta::Page(p) => p.title,
-                Meta::Fixed { title } => title,
+                Meta::Document { title } => title,
                 _ => url,
             };
             Ok(fictionet_extras::models::tools::Page {
@@ -88,6 +100,6 @@ impl fictionet_extras::models::Engine for Pages {
         })
     }
     fn serves(&self, host: &str) -> bool {
-        self.serves_host(host)
+        crate::admit(host).is_ok()
     }
 }

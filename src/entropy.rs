@@ -1,7 +1,7 @@
 use fictionet::sync::Mutex;
 
 use rand_chacha::ChaCha20Rng;
-use rand_chacha::rand_core::{RngCore, SeedableRng};
+use rand_chacha::rand_core::{Rng, SeedableRng};
 
 /// The 32 bytes that initialize a run's ChaCha20 random stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

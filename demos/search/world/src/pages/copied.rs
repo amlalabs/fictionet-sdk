@@ -1,20 +1,27 @@
 //! Copied pages and search results share one WARC response handler.
 
 mod git;
+mod reference;
 
 use super::*;
 use fictionet_extras::{crawl::Index, warc::Archive};
+use std::collections::HashMap;
 use std::{path::Path, time::Instant};
+use tokio::sync::OnceCell;
 
-// Captured distributions and repository packs can exceed a public web response.
-const INDEX_VERSION: u32 = 4;
+const INDEX_VERSION: u32 = 6;
 
 pub(super) struct Corpus {
     archive: Archive,
     missing: Archive,
-    index: Index,
+    search: CorpusSearch,
     hosts: HashSet<String>,
     packages: Option<PackageSites>,
+}
+
+enum CorpusSearch {
+    Crawled(Index),
+    Reference(Box<reference::ReferenceWeb>),
 }
 
 /// A retained page identity. Copied bodies are read from the immutable corpus
@@ -62,6 +69,16 @@ struct PackageSites {
     archive: Archive,
     missing: Archive,
     hosts: HashSet<String>,
+    /// Package files the capture lacks, copied from their real hosts when
+    /// first asked for and kept for the run.
+    fetched: Mutex<HashMap<String, Arc<OnceCell<fictionet_extras::warc::Response>>>>,
+}
+
+impl PackageSites {
+    /// The copy of `url` made this run, if one is done.
+    fn fetched(&self, url: &str) -> Option<fictionet_extras::warc::Response> {
+        self.fetched.lock().unwrap().get(url)?.get().cloned()
+    }
 }
 
 fn archived_response(
@@ -83,12 +100,49 @@ fn archived_response(
     if let Some(response) = archive.get(url)? {
         return Ok(Some(response));
     }
+    if let Some(file) = static_file(url)
+        && let Some(response) = archive.get(&file)?
+    {
+        return Ok(Some(response));
+    }
     if fallback.is_some() {
         return Ok(fallback);
     }
     Ok(archive
         .get(absent.as_str())?
         .filter(|response| response.status == http::StatusCode::NOT_FOUND))
+}
+
+/// A stylesheet, script, image or font asked for with a query, without it.
+/// Pages version their files (`pydoctheme.css?v=48df1187`) and their servers
+/// send the same file whatever the query; captures keep the file once.
+fn static_file(url: &str) -> Option<String> {
+    let mut url = url::Url::parse(url).ok()?;
+    url.query()?;
+    let (_, extension) = url.path().rsplit_once('.')?;
+    let file = matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "css"
+            | "js"
+            | "mjs"
+            | "png"
+            | "jpg"
+            | "jpeg"
+            | "gif"
+            | "svg"
+            | "webp"
+            | "avif"
+            | "ico"
+            | "woff"
+            | "woff2"
+            | "ttf"
+            | "otf"
+            | "eot"
+    );
+    file.then(|| {
+        url.set_query(None);
+        url.into()
+    })
 }
 
 fn missing_pages(root: &Path) -> std::io::Result<Archive> {
@@ -101,51 +155,17 @@ impl Corpus {
         &self,
         url: &str,
     ) -> std::io::Result<Option<fictionet_extras::warc::Response>> {
-        use kuchiki::traits::TendrilSink;
-        let Some(mut response) = archived_response(&self.archive, &self.missing, url)? else {
-            return Ok(None);
-        };
-        // Reporting headers and these script elements only send telemetry or ads.
-        response.headers.remove("report-to");
-        response.headers.remove("nel");
-        if response
-            .headers
-            .get("content-type")
-            .is_some_and(|v| v.as_bytes().starts_with(b"text/html"))
+        // Captured pages replay as recorded, including their own scripts.
+        if let CorpusSearch::Reference(reference) = &self.search
+            && let Some(response) = reference.response(url)?
         {
-            let decoded = response.decoded()?;
-            let dom = kuchiki::parse_html().one(String::from_utf8_lossy(&decoded).into_owned());
-            let mut changed = false;
-            for selector in [
-                "script[src*=\"googletagmanager.com\"]",
-                "script[src*=\"google-analytics.com\"]",
-                "script[src*=\"doubleclick.net\"]",
-                "script[src*=\"googlesyndication.com\"]",
-                "script[src*=\"connect.facebook.net\"]",
-                "iframe[src*=\"doubleclick.net\"]",
-                "ins.adsbygoogle",
-            ] {
-                for node in dom.select(selector).unwrap().collect::<Vec<_>>() {
-                    node.as_node().detach();
-                    changed = true;
-                }
-            }
-            if changed {
-                response.body = dom.to_string().into_bytes().into();
-                response.headers.remove("content-encoding");
-                response.headers.remove("etag");
-                response.headers.remove("content-md5");
-                response.headers.insert(
-                    http::header::CONTENT_LENGTH,
-                    http::HeaderValue::from(response.body.len()),
-                );
-            }
+            return Ok(Some(response));
         }
-        Ok(Some(response))
+        archived_response(&self.archive, &self.missing, url)
     }
 }
 
-#[derive(Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct ArchiveFile {
     path: std::path::PathBuf,
     bytes: u64,
@@ -165,7 +185,11 @@ struct CachedCorpus {
 fn archive_files(root: &Path) -> std::io::Result<Vec<ArchiveFile>> {
     let mut files = Vec::new();
     for entry in std::fs::read_dir(root)? {
-        let path = entry?.path();
+        let entry = entry?;
+        if entry.file_name().as_encoded_bytes().starts_with(b".") {
+            continue;
+        }
+        let path = entry.path();
         if path.to_string_lossy().ends_with(".warc.gz") {
             let path = std::fs::canonicalize(path)?;
             let metadata = path.metadata()?;
@@ -182,7 +206,7 @@ fn archive_files(root: &Path) -> std::io::Result<Vec<ArchiveFile>> {
 
 impl Pages {
     pub(crate) fn copied_body(&self, url: String) -> Option<PageBody> {
-        self.copied_only().then(|| {
+        (self.source() == Source::Copied).then(|| {
             PageBody(BodySource::Copied {
                 corpus: self.copied.as_ref().unwrap().clone(),
                 url,
@@ -199,47 +223,77 @@ impl Pages {
             .map(str::to_owned)
     }
 
-    /// Package sites always replay captured responses, regardless of the page source.
+    /// The answer for the package file at `url`, whatever the page source:
+    /// the captured response, else the real host's, copied when first asked
+    /// for and kept for the run, so installs work for packages the capture
+    /// never saw. `None` for anything that is not a package file, such as a
+    /// project's pages on the same sites, which are pages like any other.
+    pub(crate) async fn package(&self, cx: &Cx, url: &str) -> Option<Response> {
+        let captured = self.package_url(url)?;
+        if captured.status != 404 {
+            return Some(captured);
+        }
+        let packages = self.copied.as_ref()?.packages.as_ref()?;
+        let cell = packages
+            .fetched
+            .lock()
+            .unwrap()
+            .entry(url.to_owned())
+            .or_default()
+            .clone();
+        // A host that cannot be reached leaves the capture's answer.
+        match cell.get_or_try_init(|| self.fetcher.package(cx, url)).await {
+            Ok(response) => Some(package_response(Ok(Some(response.clone())))),
+            Err(error) => {
+                eprintln!("Package file {url} could not be copied: {error}");
+                Some(captured)
+            }
+        }
+    }
+
+    /// The package file's captured answer, or one already copied this run.
     pub(crate) fn package_url(&self, url: &str) -> Option<Response> {
+        PackageFile::of(&url::Url::parse(url).ok()?)?;
+        self.package_site_url(url)
+    }
+
+    /// A package site's captured answer for any address on it, or one
+    /// already copied this run.
+    pub(crate) fn package_site_url(&self, url: &str) -> Option<Response> {
         let corpus = self.copied.as_ref()?;
         let packages = corpus.packages.as_ref()?;
         let parsed = url::Url::parse(url).ok()?;
+        if let Some(fetched) = packages.fetched(url) {
+            return Some(package_response(Ok(Some(fetched))));
+        }
         packages.hosts.contains(parsed.host_str()?).then(|| {
             let captured = if !packages.archive.contains(url) && corpus.archive.contains(url) {
                 corpus.response(url)
             } else {
                 archived_response(&packages.archive, &packages.missing, url)
             };
-            let response = captured.and_then(|response| {
-                response
-                    .map(|mut response| {
-                        // Installers hash the distribution's identity bytes. Their
-                        // requests need not accept the capture's content encoding.
-                        response.body = response.decoded()?.into();
-                        response.headers.remove(http::header::CONTENT_ENCODING);
-                        response
-                            .headers
-                            .insert(http::header::CONTENT_LENGTH, response.body.len().into());
-                        Ok(response)
-                    })
-                    .transpose()
-            });
-            replay(response)
+            package_response(captured)
         })
     }
+
     pub fn has_copied(&self) -> bool {
         self.copied.is_some()
     }
 
     /// In copied mode only captured hosts and the local search engines exist.
-    /// Generated and live worlds may admit new public hostnames.
+    /// Live worlds may admit any public hostname; a written world, any
+    /// spelled the way a registered site is.
     pub fn serves_host(&self, host: &str) -> bool {
         let host = host.trim_end_matches('.').to_ascii_lowercase();
+        if self.written.is_some() {
+            return crate::admit(&host).is_ok() && !written::misspelled_host(&host);
+        }
         crate::admit(&host).is_ok()
-            && (!self.copied_only()
+            && (self.source() != Source::Copied
                 || crate::route::SEARCH_HOSTS.contains(&host.as_str())
                 || self.copied.as_ref().is_some_and(|corpus| {
                     corpus.hosts.contains(&host)
+                        || matches!(&corpus.search, CorpusSearch::Reference(web) if web.serves(&host))
                         || corpus
                             .packages
                             .as_ref()
@@ -249,39 +303,39 @@ impl Pages {
 
     /// Open the corpus chosen by the world's brief, relative to the downloads root.
     /// Its search index is cached beside the immutable archives.
-    pub fn from_corpus(seed: Seed, downloads: &Path, model: Option<Model>) -> Result<Self, String> {
+    pub fn from_corpus(seed: Seed, downloads: &Path) -> Result<Self, String> {
         let corpus = seed
             .corpus
             .as_ref()
             .ok_or("the seed has no copied corpus")?;
         let root = downloads.join(&corpus.directory);
         let urls = corpus.urls.clone();
-        Self::load_copied(seed, &root, &urls, model, true)
+        let reference = corpus
+            .reference
+            .as_ref()
+            .map(|directory| reference::ReferenceWeb::open(&downloads.join(directory), &root))
+            .transpose()?;
+        Self::load_copied(seed, &root, &urls, reference)
     }
 
-    /// Open the copied sites and crawl them from their starting URLs.
-    /// The crawler and HTTP replay use the same response handler.
-    pub fn copied(
-        seed: Seed,
-        root: &Path,
-        seeds: &[String],
-        model: Option<Model>,
-    ) -> Result<Self, String> {
-        Self::load_copied(seed, root, seeds, model, false)
-    }
-
+    /// Opens the copied sites; without a reference web, they are crawled
+    /// from their starting URLs with the same response handler replay uses.
     fn load_copied(
         seed: Seed,
         root: &Path,
         seeds: &[String],
-        model: Option<Model>,
-        cache_index: bool,
+        mut reference: Option<reference::ReferenceWeb>,
     ) -> Result<Self, String> {
         let started = Instant::now();
         let research_root = Archive::directory_root(root).map_err(|e| e.to_string())?;
         eprintln!("Loading copied pages…");
-        let files = archive_files(&research_root).map_err(|e| e.to_string())?;
-        let cache_path = cache_index.then(|| research_root.join("search-index.json"));
+        let files = match &reference {
+            Some(_) => Vec::new(),
+            None => archive_files(&research_root).map_err(|e| e.to_string())?,
+        };
+        let cache_path = reference
+            .is_none()
+            .then(|| research_root.join("search-index.json"));
         let cached = cache_path
             .as_ref()
             .and_then(|path| std::fs::File::open(path).ok())
@@ -289,19 +343,30 @@ impl Pages {
                 serde_json::from_reader::<_, CachedCorpus>(std::io::BufReader::new(file)).ok()
             })
             .filter(|cache| {
-                cache.version == INDEX_VERSION && cache.files == files && cache.seeds == seeds
+                (reference.is_some() || cache.version == INDEX_VERSION)
+                    && cache.files == files
+                    && cache.seeds == seeds
             });
-        let (archive, missing, index) = match cached {
-            Some(cache) => (cache.archive, cache.missing, Some(cache.index)),
-            None => {
-                eprintln!("Indexing copied pages…");
-                (
-                    Archive::directory(&research_root).map_err(|e| e.to_string())?,
+        let (archive, missing, index) = if let Some(reference) = &mut reference {
+            (
+                std::mem::take(&mut reference.research),
+                std::mem::take(&mut reference.missing),
+                None,
+            )
+        } else {
+            match cached {
+                Some(cache) => (cache.archive, cache.missing, Some(cache.index)),
+                None => (
+                    Archive::open(files.iter().map(|file| file.path.clone()))
+                        .map_err(|e| e.to_string())?,
                     missing_pages(&research_root).map_err(|e| e.to_string())?,
                     None,
-                )
+                ),
             }
         };
+        if !seeds.iter().any(|url| archive.contains(url)) {
+            return Err("the copied corpus has none of its starting URLs".into());
+        }
         let hosts = archive
             .urls()
             .filter_map(|url| url::Url::parse(url).ok()?.host_str().map(str::to_owned))
@@ -328,6 +393,7 @@ impl Pages {
                 archive,
                 missing: missing_pages(&package_root).map_err(|e| e.to_string())?,
                 hosts,
+                fetched: Mutex::default(),
             })
         } else {
             None
@@ -335,98 +401,140 @@ impl Pages {
         let mut corpus = Corpus {
             archive,
             missing,
-            index: Index::default(),
+            search: CorpusSearch::Crawled(Index::default()),
             hosts,
             packages,
         };
-        corpus.index = match index {
-            Some(index) => index,
-            None => {
-                let index = Index::crawl(
-                    seeds,
-                    |url| corpus.archive.contains(url),
-                    |url| corpus.response(url),
-                )
-                .map_err(|e| e.to_string())?;
-                if let Some(cache_path) = cache_path {
-                    let cache = CachedCorpus {
-                        version: INDEX_VERSION,
-                        files,
-                        seeds: seeds.to_vec(),
-                        archive: corpus.archive,
-                        missing: corpus.missing,
-                        index,
-                    };
-                    let temporary = cache_path.with_extension(format!(
-                        "{}-{}.tmp",
-                        std::process::id(),
-                        time::OffsetDateTime::now_utc().unix_timestamp_nanos()
-                    ));
-                    let saved = (|| -> std::io::Result<()> {
-                        use std::io::Write;
-                        let mut file = std::io::BufWriter::new(std::fs::File::create(&temporary)?);
-                        serde_json::to_writer(&mut file, &cache)?;
-                        file.flush()?;
-                        std::fs::rename(&temporary, &cache_path)
-                    })();
-                    if let Err(error) = saved {
-                        let _ = std::fs::remove_file(&temporary);
-                        eprintln!("Search index cache unavailable: {error}");
+        corpus.search = if let Some(reference) = reference {
+            CorpusSearch::Reference(Box::new(reference))
+        } else {
+            CorpusSearch::Crawled(match index {
+                Some(index) => index,
+                None => {
+                    let index = Index::crawl(
+                        &corpus.archive.urls().map(str::to_owned).collect::<Vec<_>>(),
+                        |url| corpus.archive.contains(url),
+                        |url| corpus.response(url),
+                    )
+                    .map_err(|e| e.to_string())?;
+                    if let Some(cache_path) = cache_path {
+                        let cache = CachedCorpus {
+                            version: INDEX_VERSION,
+                            files,
+                            seeds: seeds.to_vec(),
+                            archive: corpus.archive,
+                            missing: corpus.missing,
+                            index,
+                        };
+                        let temporary = cache_path.with_extension(format!(
+                            "{}-{}.tmp",
+                            std::process::id(),
+                            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+                        ));
+                        let saved = (|| -> std::io::Result<()> {
+                            use std::io::Write;
+                            let mut file =
+                                std::io::BufWriter::new(std::fs::File::create(&temporary)?);
+                            serde_json::to_writer(&mut file, &cache)?;
+                            file.flush()?;
+                            std::fs::rename(&temporary, &cache_path)
+                        })();
+                        if let Err(error) = saved {
+                            let _ = std::fs::remove_file(&temporary);
+                            eprintln!("Search index cache unavailable: {error}");
+                        }
+                        corpus.archive = cache.archive;
+                        corpus.missing = cache.missing;
+                        cache.index
+                    } else {
+                        index
                     }
-                    corpus.archive = cache.archive;
-                    corpus.missing = cache.missing;
-                    cache.index
-                } else {
-                    index
                 }
-            }
+            })
         };
-        if corpus.index.is_empty() {
+        if matches!(&corpus.search, CorpusSearch::Crawled(index) if index.is_empty()) {
             return Err("the copied corpus has no reachable HTML pages".into());
         }
         eprintln!(
             "Copied pages: {} indexed; ready in {:.3}s",
-            corpus.index.len(),
+            match &corpus.search {
+                CorpusSearch::Crawled(index) => index.len() as u64,
+                CorpusSearch::Reference(reference) => reference.index.len(),
+            },
             started.elapsed().as_secs_f64()
         );
-        let mut pages = match model {
-            Some(model) => Self::with_model(seed, model),
-            None => Self::open(seed, Store::memory(), None, 0),
-        };
-        pages.prefetch = 0;
+        let mut pages = Self::with_source(seed, Source::Copied);
         pages.copied = Some(Arc::new(corpus));
-        pages.copied_active = true.into();
-        pages.store().generation.generate = true;
         Ok(pages)
     }
 
-    pub(crate) fn copied_only(&self) -> bool {
-        self.copied.is_some() && self.copied_active.load(std::sync::atomic::Ordering::SeqCst)
+    /// The day the copied pages were copied, which Copied mode shows as
+    /// the world's day.
+    pub fn copied_date(&self) -> Option<time::Date> {
+        match &self.copied.as_ref()?.search {
+            CorpusSearch::Reference(reference) => reference.date,
+            CorpusSearch::Crawled(_) => None,
+        }
+    }
+
+    /// How far the copied pages' day is behind the world's own day: Copied
+    /// mode sets the guest's clock and the sites' dates back by this much.
+    pub fn copied_lag(&self) -> Option<std::time::Duration> {
+        let lag = seed::parse_date(&self.seed.date).ok()? - self.copied_date()?;
+        std::time::Duration::try_from(lag)
+            .ok()
+            .filter(|lag| !lag.is_zero())
+    }
+
+    /// The world's day as the active source shows it now, the day of the
+    /// guest's clock and of every answer's date: the host's day, or in
+    /// Copied mode the day [`copied_lag`](Self::copied_lag) behind it.
+    pub fn world_date(&self) -> String {
+        let lag = self
+            .copied_lag()
+            .filter(|_| self.source() == Source::Copied)
+            .unwrap_or_default();
+        (time::OffsetDateTime::now_utc() - lag).date().to_string()
     }
 
     pub(super) fn copied_listing(
         &self,
         query: &str,
         start: u64,
-    ) -> (search::Search, Cache, Option<Usage>, u64) {
-        (
-            self.copied.as_ref().unwrap().index.search(
-                query,
-                start.try_into().unwrap_or(usize::MAX),
-                10,
-            ),
-            Cache::Cached,
-            None,
-            0,
-        )
+        domains: &fictionet_extras::models::tools::Domains,
+    ) -> Result<search::Search, String> {
+        let corpus = self.copied.as_ref().unwrap();
+        Ok(match &corpus.search {
+            CorpusSearch::Reference(reference) => reference
+                .index
+                .search_in(
+                    query,
+                    start.try_into().unwrap_or(usize::MAX),
+                    10,
+                    domains,
+                    |url| {
+                        let response = corpus
+                            .response(url)?
+                            .ok_or_else(|| std::io::Error::other("indexed page is unavailable"))?;
+                        fictionet_extras::capture::page_text(&String::from_utf8_lossy(
+                            &response.decoded()?,
+                        ))
+                    },
+                )
+                .map_err(|error| error.to_string())?,
+            CorpusSearch::Crawled(index) => {
+                index.search_in(query, start.try_into().unwrap_or(usize::MAX), 10, |url| {
+                    fictionet_extras::models::tools::allowed(domains, url)
+                })
+            }
+        })
     }
 
-    pub(super) fn copied_page(&self, host: &str, target: &str) -> Response {
-        self.copied_url(&format!("https://{host}{target}"))
-    }
-
+    /// The copied answer for `url`: the captured page, including pages
+    /// captured with the package sites.
     pub(crate) fn copied_url(&self, url: &str) -> Response {
-        replay(self.copied.as_ref().unwrap().response(url))
+        self.package_site_url(url)
+            .unwrap_or_else(|| replay(self.copied.as_ref().unwrap().response(url)))
     }
 }
 
@@ -452,7 +560,7 @@ pub(super) fn replay(
                 }
             } else if content_type.starts_with("text/html") {
                 let title = fictionet_extras::capture::title(&page).unwrap_or_default();
-                Meta::Fixed { title }
+                Meta::Document { title }
             } else {
                 Meta::Asset
             };
@@ -484,13 +592,7 @@ pub(super) fn replay(
             answer.stored_headers = Some(headers);
             answer
         }
-        Ok(None) => Response::new(
-            404,
-            "text/plain; charset=utf-8",
-            "Not Found\n",
-            vec![],
-            Meta::Missing,
-        ),
+        Ok(None) => Response::not_found(),
         Err(_) => Response::new(
             500,
             "text/plain; charset=utf-8",
@@ -498,5 +600,119 @@ pub(super) fn replay(
             vec![],
             Meta::Missing,
         ),
+    }
+}
+
+/// A package file as installers need it: the identity bytes they hash,
+/// whatever content encoding the capture kept.
+fn package_response(
+    response: std::io::Result<Option<fictionet_extras::warc::Response>>,
+) -> Response {
+    replay(response.and_then(|response| {
+        response
+            .map(|mut response| {
+                response.body = response.decoded()?.into();
+                response.headers.remove(http::header::CONTENT_ENCODING);
+                response
+                    .headers
+                    .insert(http::header::CONTENT_LENGTH, response.body.len().into());
+                Ok(response)
+            })
+            .transpose()
+    }))
+}
+
+/// A file installers download, as opposed to a page people read. Package
+/// sites serve both: PyPI's and GitHub's project pages are pages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PackageFile {
+    /// An installer's index: pip's simple index, npm's registry.
+    Index,
+    /// A wheel, source distribution, other package or binary, or the
+    /// metadata and signature files beside one.
+    Distribution,
+    /// A git clone or fetch.
+    Repository,
+    /// A repository archive download.
+    Archive,
+    /// A file attached to a release.
+    ReleaseAsset,
+}
+
+/// Endings of package and binary files.
+const DISTRIBUTIONS: [&str; 22] = [
+    ".whl",
+    ".tar.gz",
+    ".tgz",
+    ".tar.bz2",
+    ".tar.xz",
+    ".tar.zst",
+    ".zip",
+    ".egg",
+    ".gem",
+    ".crate",
+    ".nupkg",
+    ".jar",
+    ".deb",
+    ".rpm",
+    ".apk",
+    ".exe",
+    ".msi",
+    ".dmg",
+    ".pkg",
+    ".appimage",
+    ".snap",
+    ".xpi",
+];
+
+/// Endings of the files published beside a package file.
+const BESIDE: [&str; 5] = [".metadata", ".asc", ".sig", ".sha256", ".sha512"];
+
+impl PackageFile {
+    /// What `url` is, when it is a package file.
+    fn of(url: &url::Url) -> Option<Self> {
+        let host = url.host_str()?;
+        let segments: Vec<&str> = url.path_segments()?.filter(|s| !s.is_empty()).collect();
+        if matches!(host, "codeload.github.com") {
+            return Some(Self::Archive);
+        }
+        if matches!(
+            host,
+            "objects.githubusercontent.com" | "release-assets.githubusercontent.com"
+        ) {
+            return Some(Self::ReleaseAsset);
+        }
+        if matches!(
+            host,
+            "registry.npmjs.org" | "registry.yarnpkg.com" | "index.crates.io"
+        ) || segments.first() == Some(&"simple")
+        {
+            return Some(Self::Index);
+        }
+        // A forge shows a file's page under `blob` or `tree`; that is a page.
+        if segments
+            .iter()
+            .any(|segment| matches!(*segment, "blob" | "tree"))
+        {
+            return None;
+        }
+        let tail = |offset: usize| segments.get(offset..).unwrap_or_default();
+        match tail(2) {
+            ["info", "refs"] | ["git-upload-pack"] | ["git-receive-pack"] => {
+                return Some(Self::Repository);
+            }
+            ["archive", ..] | ["-", "archive", ..] => return Some(Self::Archive),
+            ["releases", "download", ..] => return Some(Self::ReleaseAsset),
+            _ => {}
+        }
+        let name = segments.last()?.to_ascii_lowercase();
+        let name = BESIDE
+            .iter()
+            .find_map(|ending| name.strip_suffix(ending))
+            .unwrap_or(&name);
+        DISTRIBUTIONS
+            .iter()
+            .any(|ending| name.ends_with(ending))
+            .then_some(Self::Distribution)
     }
 }

@@ -2,22 +2,22 @@
 name = "web-world"
 version = "0.0.0"
 edition = "2024"
-description = "A web world with copied captures, model-written pages and one search index."
+description = "A web world with copied captures, live pages, pages edited for a scenario, and written pages for the standalone world."
 license = "MIT OR Apache-2.0"
 publish = false
 
 [dependencies]
 fictionet-extras = { path = "../../../extras" }
-fictionet-host = { path = "../../../host" }
 bytes = "1"
 fictionet = { path = "../../..", features = ["web-proxy"] }
 http = "1"
 libc = "0.2"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 percent-encoding = "2"
 http-body-util = "0.1"
 form_urlencoded = "1"
 regex = "1"
+unicode-normalization = "0.1"
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 time = { version = "0.3", features = ["serde", "parsing", "formatting"] }
@@ -26,3 +26,12 @@ tokio = { version = "1", default-features = false, features = ["sync", "rt-multi
 url = "2"
 tower-service = "0.3"
 kuchiki = "0.8"
+zim = "0.5"
+rayon = "1"
+pdf-writer = "0.15"
+subsetter = "0.2.6"
+ttf-parser = "0.25"
+flate2 = "1"
+pdf-extract = "0.12.1"
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+webpki-roots = "1"

@@ -28,7 +28,7 @@ pub struct Archive {
 }
 
 /// The original HTTP response, with transport framing removed.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Response {
     /// Stored HTTP status, including redirects and errors.
     pub status: StatusCode,
@@ -39,7 +39,7 @@ pub struct Response {
 }
 
 impl Response {
-    /// Decode representation compression.
+    /// Decode the complete stored representation.
     pub fn decoded(&self) -> io::Result<Vec<u8>> {
         let mut reader: Box<dyn Read + '_> = match self
             .headers
@@ -50,6 +50,7 @@ impl Response {
             Some("gzip") => Box::new(flate2::read::GzDecoder::new(self.body.as_ref())),
             Some("deflate") => Box::new(flate2::read::ZlibDecoder::new(self.body.as_ref())),
             Some("br") => Box::new(brotli::Decompressor::new(self.body.as_ref(), 4096)),
+            Some("zstd") => Box::new(zstd::stream::read::Decoder::new(self.body.as_ref())?),
             Some(encoding) => {
                 return Err(invalid(format!("unsupported content encoding {encoding}")));
             }
@@ -235,6 +236,12 @@ impl Archive {
         Ok(archive)
     }
 
+    /// Add later captures. Their records replace earlier records for the same URL.
+    pub fn extend(&mut self, later: Archive) {
+        self.urls.extend(later.urls);
+        self.ids.extend(later.ids);
+    }
+
     /// Open immutable captures in publication order, with stable path ties.
     pub fn directory(root: &Path) -> io::Result<Self> {
         let root = Self::directory_root(root)?;
@@ -286,6 +293,7 @@ impl Archive {
     /// Seek and decompress only the requested record and any revisit payload.
     pub fn get(&self, url: &str) -> io::Result<Option<Response>> {
         self.resolve(url, &mut HashSet::new())
+            .map_err(|error| io::Error::new(error.kind(), format!("{url}: {error}")))
     }
 
     fn resolve(&self, url: &str, seen: &mut HashSet<String>) -> io::Result<Option<Response>> {

@@ -2,7 +2,7 @@
 
 use super::*;
 use fictionet_extras::models::UpstreamPhase;
-use std::time::Duration;
+use std::io;
 
 struct Runtime(Option<tokio::runtime::Runtime>);
 impl Drop for Runtime {
@@ -13,13 +13,32 @@ impl Drop for Runtime {
     }
 }
 
-pub(super) struct Transport {
+/// What one host request is for.
+#[derive(Clone, Copy)]
+pub(in crate::pages) enum Ask<'a> {
+    /// Query the search provider with this key and body.
+    Search(&'a Key, &'a Value),
+    /// Copy a page or dependency for Live replay, as this client (by its
+    /// User-Agent) would get it, or as the default browser. A dependency
+    /// names the page it belongs to.
+    Copy {
+        user_agent: Option<&'a http::HeaderValue>,
+        page: Option<&'a url::Url>,
+    },
+    /// Copy a package index or file the copied web lacks.
+    Package,
+    /// Read the public original of a page the world writes.
+    Original,
+}
+
+pub(in crate::pages) struct Transport {
     runtime: Runtime,
-    processing: Arc<tokio::sync::Semaphore>,
+    clients: capture::Pool,
 }
 impl Transport {
-    pub(super) fn new() -> Result<Self, String> {
+    pub(in crate::pages) fn new() -> Result<Self, String> {
         Ok(Self {
+            clients: capture::Pool::default(),
             runtime: Runtime(Some(
                 tokio::runtime::Builder::new_multi_thread()
                     .worker_threads(1)
@@ -27,15 +46,15 @@ impl Transport {
                     .build()
                     .map_err(|_| "Live transport could not start")?,
             )),
-            processing: Arc::new(tokio::sync::Semaphore::new(1)),
         })
     }
-    pub(super) fn spawn(&self, work: impl std::future::Future<Output = ()> + Send + 'static) {
+    pub(in crate::pages) fn spawn(
+        &self,
+        work: impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
         self.runtime.0.as_ref().unwrap().spawn(work);
     }
-    // CPU work owns a permit until it finishes even if its caller is cancelled.
-    // One worker keeps revoked sessions from accumulating parsers.
-    pub(super) async fn process<T: Send + 'static>(
+    pub(in crate::pages) async fn process<T: Send + 'static>(
         &self,
         cx: &Cx,
         lifetime: &Lifetime,
@@ -46,18 +65,9 @@ impl Transport {
             return Err("Live session stopped".into());
         }
         let task = async {
-            let permit = self
-                .processing
-                .clone()
-                .acquire_owned()
+            tokio::task::spawn_blocking(work)
                 .await
-                .map_err(|_| "Live processing stopped")?;
-            tokio::task::spawn_blocking(move || {
-                let _permit = permit;
-                work()
-            })
-            .await
-            .map_err(|_| "Live processing worker stopped")?
+                .map_err(|_| "Live processing worker stopped")?
         };
         tokio::select! {
             biased;
@@ -67,14 +77,14 @@ impl Transport {
         }
     }
 
-    pub(super) async fn request(
+    pub(in crate::pages) async fn request(
         &self,
         cx: &Cx,
         lifetime: &Lifetime,
         observer: Option<Arc<capture::Observer>>,
         url: &str,
-        search: Option<(&Key, &Value)>,
-    ) -> Result<warc::Response, String> {
+        ask: Ask<'_>,
+    ) -> io::Result<warc::Response> {
         struct Attempt {
             cx: Cx,
             observer: Arc<capture::Observer>,
@@ -85,7 +95,8 @@ impl Transport {
                 (self.observer)(&self.cx, &self.event);
             }
         }
-        let url = url::Url::parse(url).map_err(|_| "Invalid Live URL")?;
+        let url = url::Url::parse(url)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid Live URL"))?;
         let mut destination = url.clone();
         let _ = destination.set_username("");
         let _ = destination.set_password(None);
@@ -94,22 +105,29 @@ impl Transport {
         let event = capture::Event {
             attempt: cx.random_u64(),
             url: destination,
-            method: if search.is_some() {
-                http::Method::POST
-            } else {
-                http::Method::GET
+            method: match ask {
+                Ask::Search(..) => http::Method::POST,
+                Ask::Copy { .. } | Ask::Package | Ask::Original => http::Method::GET,
             },
-            purpose: if search.is_some() {
-                capture::Purpose::Search
-            } else {
-                capture::Purpose::Capture
+            purpose: match ask {
+                Ask::Search(..) => capture::Purpose::Search,
+                Ask::Copy { .. } => capture::Purpose::Capture,
+                Ask::Package => capture::Purpose::Package,
+                Ask::Original => capture::Purpose::Original,
             },
             phase: UpstreamPhase::Attempt,
             status: None,
+            page: match ask {
+                Ask::Copy { page, .. } => page.cloned(),
+                _ => None,
+            },
         };
         // No attempt is published after a lifetime has been revoked.
         if lifetime.cancelled() || cx.is_cancelled() {
-            return Err("Live session stopped".into());
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "Live session stopped",
+            ));
         }
         let mut attempt = observer.map(|observer| {
             observer(cx, &event);
@@ -123,43 +141,42 @@ impl Transport {
             }
         });
         let work = async {
-            let host = url.host_str().ok_or("Missing Live host")?;
-            let client = capture::client(&url).await.map_err(|e| e.to_string())?;
-            let host_time = {
-                let mut hosts = lifetime.hosts.lock().await;
-                hosts
-                    .entry(host.to_owned())
-                    .or_insert_with(|| {
-                        Arc::new(tokio::sync::Mutex::new(tokio::time::Instant::now()))
-                    })
-                    .clone()
-            };
-            let mut next = host_time.lock().await;
-            tokio::time::sleep_until(*next).await;
-            let request = if let Some((key, body)) = search {
-                client
+            let client = self.clients.client(&url).await?;
+            let request = match ask {
+                Ask::Search(key, body) => client
                     .post(url)
                     .header("x-api-key", key.value())
                     .header("content-type", "application/json")
-                    .body(body.to_string())
-            } else {
-                client.get(url).header("accept-encoding", "identity")
+                    .body(body.to_string()),
+                Ask::Copy {
+                    user_agent: Some(user_agent),
+                    ..
+                } => client
+                    .get(url)
+                    .header("accept-encoding", "identity")
+                    .header(http::header::USER_AGENT, user_agent),
+                Ask::Copy {
+                    user_agent: None, ..
+                }
+                | Ask::Package
+                | Ask::Original => client.get(url).header("accept-encoding", "identity"),
             };
             let response = request.send().await;
-            *next = tokio::time::Instant::now()
-                + Duration::from_millis(if search.is_some() { 250 } else { 500 });
-            drop(next);
-            let response = response.map_err(|_| "Live request failed")?;
+            // The innermost cause is the real error: a name that does not
+            // resolve, a refused connection, a certificate it would not accept.
+            let response = response.map_err(|error| {
+                let mut cause: &dyn std::error::Error = &error;
+                while let Some(source) = cause.source() {
+                    cause = source;
+                }
+                io::Error::other(cause.to_string())
+            })?;
             if let Some(attempt) = &mut attempt {
                 attempt.event.phase = UpstreamPhase::Response;
                 attempt.event.status = Some(response.status());
             }
-            let mut response = capture::receive(response)
-                .await
-                .map_err(|e| e.to_string())?;
+            let mut response = capture::receive(response).await?;
             self.process(cx, lifetime, move || {
-                // Archive a decoded representation once, so replay and previews
-                // never expand a compressed body again.
                 response.body = response
                     .decoded()
                     .map_err(|error| error.to_string())?
@@ -171,15 +188,19 @@ impl Transport {
                 Ok(response)
             })
             .await
+            .map_err(io::Error::other)
         };
         let mut stopped = lifetime.stop.subscribe();
         if *stopped.borrow() {
-            return Err("Live session stopped".into());
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "Live session stopped",
+            ));
         }
         tokio::select! {
             biased;
-            _ = stopped.changed() => Err("Live session stopped".into()),
-            _ = cx.cancelled() => Err("Live run stopped".into()),
+            _ = stopped.changed() => Err(io::Error::new(io::ErrorKind::Interrupted, "Live session stopped")),
+            _ = cx.cancelled() => Err(io::Error::new(io::ErrorKind::Interrupted, "Live run stopped")),
             result = work => {
                 if result.is_err() && let Some(attempt) = &mut attempt && attempt.event.phase == UpstreamPhase::Cancelled {
                     attempt.event.phase = UpstreamPhase::Failed;

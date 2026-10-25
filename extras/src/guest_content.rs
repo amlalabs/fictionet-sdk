@@ -544,8 +544,15 @@ impl Scan {
                     for index in 0..archive.len() {
                         match archive.by_index(index) {
                             Ok(mut file) => {
-                                let path = format!("{name}/{}", file.name());
-                                self.text(&path, file.name().as_bytes(), source);
+                                let filename = match file.name() {
+                                    Ok(name) => name,
+                                    Err(error) => {
+                                        self.fail(name, error);
+                                        continue;
+                                    }
+                                };
+                                let path = format!("{name}/{filename}");
+                                self.text(&path, filename.as_bytes(), source);
                                 let decoded = self.read(&path, &mut file, complete);
                                 self.content(&path, &decoded, "", source, complete, depth + 1);
                             }

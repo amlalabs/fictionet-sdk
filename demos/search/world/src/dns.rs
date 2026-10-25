@@ -54,9 +54,6 @@ pub fn admit(name: &str) -> Result<(), &'static str> {
     if NOT_ON_THE_INTERNET.contains(&tld) {
         return Err("reserved or private top-level domain");
     }
-    if pages::misspelled_host(&name.to_ascii_lowercase()) {
-        return Err("unregistered host spelling");
-    }
     Ok(())
 }
 

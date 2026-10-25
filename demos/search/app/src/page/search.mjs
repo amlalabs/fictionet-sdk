@@ -1,4 +1,5 @@
 const $ = (id) => document.getElementById(id);
+const SVG = 'http://www.w3.org/2000/svg';
 const element = (tag, text, className) => {
   const node = document.createElement(tag);
   if (text !== undefined) node.textContent = text;
@@ -11,18 +12,26 @@ const button = (text, action, className) => {
   node.addEventListener('click', action);
   return node;
 };
+const svgNode = (tag, attributes = {}) => {
+  const node = document.createElementNS(SVG, tag);
+  for (const [name, value] of Object.entries(attributes)) node.setAttribute(name, value);
+  return node;
+};
 const stamp = (ms) => new Date((shown.started_at_ms || Date.now()) + ms).toLocaleTimeString([], { hour12: false, timeZone: 'UTC' });
-const time = stamp;
 const size = (bytes) => bytes < 1000 ? `${bytes} B` : `${Math.round(bytes / 1000)} KB`;
-const sourceName = (source) => source.kind === 'copy' ? source.captured ? `Copied · ${source.captured.slice(0, 10)}` : 'Copied' : source.kind === 'live' ? 'live' : 'model-written';
+const quantity = (n, word, plural = `${word}s`) => `${n} ${n === 1 ? word : plural}`;
+const sourceName = (source) => source.kind === 'copy' ? source.captured ? `Copied ${source.captured.slice(0, 10)}` : 'Copied' : ({ edited: 'Edited', package: 'Package' })[source.kind] || 'Live';
+const changes = (edits) => edits?.length ? quantity(edits.length, 'change') : null;
+const hostName = (name) => name.replace(/\.$/, '');
 const hostOf = (url) => { try { return new URL(url).host; } catch { return url; } };
-let latest = { at_ms: 0, oldest_ms: 0, sites: [], calls: [], activity: [], connections: [], egress: [], signin: null };
-let shown = latest, selection = null, live = true, world = null;
-let rewindRequest, noticeTimer, activeConsole = 'terminal', hostStatus = null, fontSize = 19;
+const originOf = (url) => { try { return new URL(url).origin; } catch { return null; } };
+const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
+let shown = { at_ms: 0, sites: [], calls: [], activity: [], connections: [], egress: [], signin: null };
+let selection = null, world = null;
+let noticeTimer, activeConsole = 'terminal', hostStatus = null;
 const consoles = new Map();
 const mounting = new Set();
 const socketUrl = (path) => `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/${path}`;
-history.replaceState(null, '', '/');
 function notice(text) {
   $('notice').textContent = text;
   $('notice').hidden = false;
@@ -35,155 +44,438 @@ function select(key) {
   selection = key;
   $('details').hidden = !key;
   document.body.classList.toggle('details-open', !!key);
-  if (key) { $('agent').hidden = false; $('agent-toggle').setAttribute('aria-pressed', 'true'); }
+  if (key) showAgent(true);
   draw();
+  // Back on the feed, the newest rows are in view: they arrive at the top.
+  if (!key) $('activity').scrollTop = 0;
 }
 $('close-details').onclick = () => select(null);
-$('agent-size').onclick = () => {
-  const expanded = document.body.classList.toggle('agent-expanded');
-  $('agent-size').setAttribute('aria-pressed', String(expanded));
-  $('agent-size').setAttribute('aria-label', expanded ? 'Shrink agent' : 'Expand agent');
-};
-$('agent-toggle').onclick = () => {
-  $('agent').hidden = !$('agent').hidden;
-  $('agent-toggle').setAttribute('aria-pressed', String(!$('agent').hidden));
-};
-function svg(tag, attrs = {}, text) {
-  const node = document.createElementNS('http://www.w3.org/2000/svg', tag);
-  for (const [name, value] of Object.entries(attrs)) node.setAttribute(name, value);
-  if (text !== undefined) node.textContent = text;
-  return node;
+function showAgent(shown) {
+  $('agent').hidden = !shown;
+  document.body.classList.toggle('agent-hidden', !shown);
+  $('agent-toggle').setAttribute('aria-pressed', String(shown));
+  $('agent-toggle').textContent = shown ? 'Hide agent' : 'Show agent';
 }
+$('agent-toggle').onclick = () => showAgent($('agent').hidden);
+const UPSTREAM = ['model', 'account', 'editor'];
 function localSites() {
-  const upstream = new Set([...shown.connections.filter((row) => ['model', 'account', 'page writer'].includes(row.purpose)).map((row) => row.host), ...shown.calls.map((call) => call.host)]);
+  const upstream = new Set([...shown.connections.filter((row) => UPSTREAM.includes(row.purpose)).map((row) => row.host), ...shown.calls.map((call) => call.host)]);
   return shown.sites.filter((site) => !upstream.has(site.host));
 }
+const purposeName = (purpose) => ({ model: 'Model', editor: 'Editor', account: 'Sign-in', live_search: 'Search', live_capture: 'Page copy', package: 'Package' })[purpose];
+const phaseName = (phase) => ({ connecting: 'Connecting', receiving: 'Receiving', streaming: 'Streaming', complete: 'Complete', interrupted: 'Interrupted', attempt: 'Connecting', response: 'Received', failed: 'Failed' })[phase];
 
-const egressSource = (purpose) => ({ model: 'calls', 'page writer': 'sites', account: 'signin', live_search: 'search', live_capture: 'sites' })[purpose];
-
-function graph(upstream, newData) {
-  const map = $('map'), width = Math.min(map.clientWidth, 760), height = map.clientHeight;
-  map.replaceChildren();
-  if (!width || !height) return;
-  map.setAttribute('viewBox', `0 0 ${width} ${height}`);
-  const destinations = [...new Set(shown.connections.map((row) => row.host))];
-  const top = 76, internet = height - (destinations.length ? 106 : 80), bottom = internet - 12;
-  map.append(svg('rect', { x: 14, y: 10, width: 212, height: 56, rx: 14, class: 'vm-zone' }), svg('rect', { x: 14, y: top, width: width - 28, height: bottom - top, rx: 16, class: 'world-zone' }), svg('rect', { x: 14, y: internet, width: width - 28, height: height - internet - 12, rx: 14, class: 'internet-zone' }));
-  map.append(svg('text', { x: 24, y: 43, class: 'map-label' }, 'VM'), svg('text', { x: 26, y: top + 23, class: 'map-label world-label' }, 'THE WORLD'));
-  const wires = svg('g'); map.append(wires);
-  const wire = (path, kind = '', pulse = false) => {
-    wires.append(svg('path', { d: path, class: `wire ${kind}` }));
-    if (pulse && live) {
-      const dot = svg('circle', { r: 3, class: `packet ${kind}` });
-      dot.append(svg('animateMotion', { path, dur: '1.2s', repeatCount: '1', fill: 'freeze' }));
-      wires.append(dot);
-    }
-  };
-  const node = (id, x, y, w, h, title, address = '', outside = false) => {
-    const group = svg('g', { class: `node ${selection === id ? 'selected' : ''} ${outside ? 'outside' : ''}`, role: 'button', tabindex: '0', 'aria-label': title, 'aria-pressed': String(selection === id) });
-    group.append(svg('title', {}, [title, address].filter(Boolean).join(' · ')), svg('rect', { x, y, width: w, height: h, rx: 8 }));
-    const subtitle = h >= 36 && address;
-    const limit = Math.floor((w - 22) / 7.5);
-    const label = title.length > limit ? `${title.slice(0, limit - 1)}…` : title;
-    group.append(svg('text', { x: x + 10, y: y + (subtitle ? 16 : h / 2 + 4) }, label));
-    if (subtitle) group.append(svg('text', { x: x + 10, y: y + 31, class: 'address' }, address.length > limit ? `${address.slice(0, limit - 1)}…` : address));
-    group.onclick = () => select(id);
-    group.onkeydown = (event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); select(id); } };
-    map.append(group);
-  };
-  const sites = localSites().sort((a, b) => b.at_ms - a.at_ms);
-  const count = Math.max(0, Math.min(3, Math.floor((bottom - top - 34) / 44) - 5));
-  const visible = sites.slice(0, count);
-  const selectedHost = selection?.startsWith('site:') ? selection.slice(5) : selection?.startsWith('page:') ? hostOf(selection.slice(5)) : null;
-  const selected = sites.find((site) => site.host === selectedHost);
-  if (selected && !visible.includes(selected)) visible.splice(Math.max(0, count - 1), 1, selected);
-  const services = [{ id: 'dns', title: 'DNS', address: '10.0.0.1:53' }, { id: 'search', title: 'Search' }, ...visible.map((site) => ({ id: `site:${site.host}`, title: site.host, address: site.address || '' })), { id: 'sites', title: 'Sites ›' }, { id: 'calls', title: 'model gateway' }, { id: 'signin', title: 'sign-in', address: shown.signin ? shown.signin.fact.open ? 'Open' : 'Closed' : '' }];
-  const step = Math.min(48, (bottom - top - 34) / services.length), nodeHeight = step - 6;
-  const first = top + 30, routerY = (top + bottom) / 2 - 4;
-  wire(`M139 58 V${routerY + 20}`, shown.activity.length ? 'hot' : '');
-  node('workstation', 64, 18, 150, 40, 'workstation', hostStatus?.addresses[0] || '10.0.0.2');
-  node('router', 30, routerY, 110, 40, 'router', '10.0.0.1');
-  const last = shown.activity.at(-1), positions = new Map([['router', routerY + 20]]);
-  for (const [index, service] of services.entries()) {
-    const y = first + index * step, middle = y + nodeHeight / 2;
-    positions.set(service.id, middle);
-    const hot = last && ((service.id === 'calls' && ['model_call', 'tool'].includes(last.fact.kind)) || service.id === `site:${last.fact.host}` || (service.id === 'dns' && last.fact.kind === 'resolved'));
-    wire(`M140 ${routerY + 20} C153 ${routerY + 20},151 ${middle},164 ${middle}`, hot ? 'hot' : '', hot && newData);
-    node(service.id, 164, y, width - 204, nodeHeight, service.title, service.address);
+// The network map is built once; each state only changes its text, its
+// destinations and, when the layout moves, its wires. Each internet host
+// appears once, with a wire from every service that reached it.
+const SERVICES = [
+  { id: 'dns', title: 'DNS' },
+  { id: 'search', title: 'Search', purposes: ['live_search'] },
+  { id: 'sites', title: 'Sites', purposes: ['live_capture', 'package'] },
+  { id: 'calls', title: 'Model gateway', purposes: ['model'] },
+  { id: 'editor', title: 'Editor', purposes: ['editor'] },
+  { id: 'signin', title: 'Sign-in', purposes: ['account'] },
+  { id: 'router', title: 'Router' },
+];
+const map = { lanes: null, wires: null, pulses: null, vm: null, internet: null, services: new Map(), signature: '', destinations: '' };
+function buildMap() {
+  const root = $('map');
+  const lanes = element('div', undefined, 'traffic-lanes');
+  const world = button('', () => select('sites'), 'world-boundary');
+  world.append(element('span', 'World', 'region-label'));
+  const internet = button('', () => select('egress'), 'internet-boundary');
+  internet.append(element('span', 'Internet', 'region-label'));
+  map.wires = svgNode('svg', { class: 'traffic-wires', 'aria-hidden': 'true' });
+  map.pulses = svgNode('svg', { class: 'traffic-pulses', 'aria-hidden': 'true' });
+  map.vm = button('', () => select('workstation'), 'vm-node');
+  map.vm.append(element('strong', 'Workstation'), element('small', '10.0.0.2'));
+  const services = element('div', undefined, 'services');
+  map.internet = element('div', undefined, 'destinations');
+  lanes.append(world, internet, map.wires, map.vm, services, map.internet);
+  for (const service of SERVICES) {
+    const control = button('', () => select(service.id), 'service unused');
+    control.dataset.service = service.id;
+    const title = element('strong', service.title), detail = element('small', '');
+    control.append(title, detail);
+    services.append(control);
+    map.services.set(service.id, { ...service, control, detail });
   }
-  const visibleDestinations = destinations.slice(-2);
-  const selectedDestination = selection?.startsWith('egress:') ? selection.slice(7) : upstream?.host;
-  if (destinations.includes(selectedDestination) && !visibleDestinations.includes(selectedDestination)) visibleDestinations[0] = selectedDestination;
-  const internetLabel = svg('text', { x: 26, y: internet + (destinations.length ? 23 : 38), class: 'map-label internet-label', role: 'button', tabindex: '0', 'aria-label': 'Internet' }, 'INTERNET ›');
-  internetLabel.onclick = () => select('egress');
-  internetLabel.onkeydown = (event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); select('egress'); } };
-  map.append(internetLabel);
-  for (const [index, host] of visibleDestinations.entries()) {
-    const nodeWidth = (width - 52 - 12 * (visibleDestinations.length - 1)) / visibleDestinations.length;
-    const x = 26 + index * (nodeWidth + 12);
-    const purposes = [...new Set(shown.connections.filter((row) => row.host === host).map((row) => row.purpose))];
-    for (const source of new Set(purposes.map(egressSource))) {
-      const active = live && upstream?.host === host && purposes.includes(upstream.purpose) && egressSource(upstream.purpose) === source;
-      wire(`M${width - 40} ${positions.get(source)} H${width - 25} V${internet + 58} H${x + nodeWidth}`, active ? 'outside observed hot' : 'outside observed', active);
-    }
-    node(`egress:${host}`, x, internet + 36, nodeWidth, 44, host, purposes.join(' · '), true);
+  lanes.append(map.pulses);
+  root.replaceChildren(lanes);
+  map.lanes = lanes;
+}
+// Host fetches for a page's own files belong to that page.
+const pageFetches = (purpose) => shown.egress.filter((row) => row.fact.purpose === purpose && row.fact.phase !== 'attempt' && !row.fact.page);
+// The pages the workstation opened on the world's sites, each address once.
+// Package files count on their own row. Those that came from the internet
+// (Live and Edited) are the pages the host copied, so Sites and Page copies
+// count the same pages.
+const openedRequests = () => localSites().flatMap((site) => site.requests.filter((request) => !isSubresource(request) && !SEARCH_HOSTS.has(site.host) && request.source.kind !== 'package'));
+const openedPages = () => new Set(openedRequests().map((request) => request.url));
+const copiedPages = () => new Set(openedRequests().filter((request) => ['live', 'edited'].includes(request.source.kind)).map((request) => request.url));
+function graph() {
+  if (!map.lanes) buildMap();
+  map.vm.querySelector('small').textContent = hostStatus?.addresses[0] || '10.0.0.2';
+  map.vm.setAttribute('aria-pressed', String(selection === 'workstation'));
+  const sites = localSites();
+  const pages = openedPages().size;
+  const facts = shown.activity.map((row) => row.fact);
+  const searches = shown.sites.flatMap((site) => site.searches).length + shown.calls.flatMap((call) => call.tools.filter((tool) => tool.tool === 'web_search')).length;
+  const edits = editorCalls().length;
+  const refusedTo = facts.filter((fact) => fact.kind === 'no_route').at(-1)?.to;
+  const state = {
+    dns: { detail: '10.0.0.1', reached: facts.some((fact) => fact.kind === 'resolved') },
+    search: { detail: searches ? quantity(searches, 'search', 'searches') : '', reached: searches > 0 },
+    sites: { detail: pages ? quantity(pages, 'page') : '', reached: sites.some((site) => site.requests.length) },
+    calls: { detail: shown.calls.length ? quantity(shown.calls.length, 'call') : '', reached: shown.calls.length > 0 },
+    editor: { detail: edits ? quantity(edits, 'call') : '', reached: edits > 0 },
+    signin: { detail: shown.signin?.fact.open ? 'Open' : 'Closed', reached: false },
+    router: { detail: refusedTo ? `No route to ${refusedTo}` : '', reached: !!refusedTo, refused: !!refusedTo },
+  };
+  for (const service of map.services.values()) {
+    const { detail, reached, refused } = state[service.id];
+    const purposes = service.purposes || [];
+    const used = reached || shown.connections.some((row) => purposes.includes(row.purpose));
+    service.control.className = `service ${used ? 'used' : 'unused'}${refused ? ' refused' : ''}`;
+    service.control.dataset.reached = String(reached);
+    service.control.setAttribute('aria-pressed', String(selection === service.id));
+    if (service.detail.textContent !== detail) service.detail.textContent = detail;
   }
-  if (!destinations.length) map.append(svg('text', { x: 150, y: internet + 38, class: 'map-empty' }, 'No connections'));
-  const refusal = shown.activity.filter((row) => row.fact.kind === 'no_route').at(-1);
-  if (refusal) {
-    const y = bottom - 25;
-    wire(`M85 ${routerY + 40} V${y - 18}`, 'no-route');
-    map.append(svg('circle', { cx: 85, cy: y - 12, r: 7, class: 'refusal' }), svg('path', { d: `M82 ${y - 15} L88 ${y - 9} M88 ${y - 15} L82 ${y - 9}`, class: 'refusal-cross' }), svg('text', { x: 30, y: bottom - 8, class: 'map-refusal' }, refusal.fact.to));
+  const destinations = destinationsOf();
+  const signature = JSON.stringify(destinations.map(({ key, title, meta, from }) => [key, title, meta, from, selection]));
+  if (signature !== map.destinations) {
+    map.destinations = signature;
+    map.internet.replaceChildren(...destinations.map(({ key, title, meta, target, from }) => {
+      const node = button('', () => select(target), 'destination');
+      node.dataset.key = key;
+      node.dataset.from = from.join(' ');
+      node.setAttribute('aria-pressed', String(selection === target));
+      node.append(element('strong', title));
+      if (meta) node.append(element('small', meta));
+      return node;
+    }));
+  }
+  const layout = layoutSignature();
+  if (layout !== map.signature) drawWires();
+}
+// Wires follow where their ends are: a scrollbar or a font that arrives
+// late moves the boxes without resizing the map.
+function layoutSignature() {
+  const origin = map.lanes.getBoundingClientRect();
+  const at = (node) => { const rect = node.getBoundingClientRect(); return [Math.round(rect.left - origin.left), Math.round(rect.top - origin.top), Math.round(rect.width)]; };
+  return JSON.stringify([...map.services.values()].map((service) => [service.control.dataset.reached, at(service.control)]).concat([map.destinations, at(map.vm), [...map.internet.children].map(at), map.lanes.clientWidth, map.lanes.clientHeight]));
+}
+document.fonts?.ready.then(() => { if (map.lanes) { map.signature = ''; drawWires(); } });
+// One row per internet destination, in service order: a host the world
+// reached for a service, or the pages and package files it copied.
+const COPIES = { live_capture: { target: 'copies', title: 'Page copies', unit: 'page' }, package: { target: 'packages', title: 'Packages', unit: 'file' } };
+function destinationsOf() {
+  const rows = new Map();
+  for (const service of map.services.values()) {
+    for (const purpose of service.purposes || []) {
+      const hosts = [...new Set(shown.connections.filter((row) => row.purpose === purpose).map((row) => row.host))];
+      if (!hosts.length) continue;
+      const copies = COPIES[purpose];
+      if (copies) {
+        const copied = purpose === 'live_capture' ? copiedPages().size : new Set(pageFetches(purpose).map((row) => row.fact.path)).size;
+        rows.set(copies.target, { key: copies.target, target: copies.target, title: copies.title, meta: quantity(copied, copies.unit), from: [service.id] });
+      } else {
+        for (const host of hosts) {
+          const row = rows.get(host) || { key: host, target: `egress:${host}`, title: host, meta: '', from: [] };
+          if (!row.from.includes(service.id)) row.from.push(service.id);
+          rows.set(host, row);
+        }
+      }
+    }
+  }
+  return [...rows.values()];
+}
+// Every wire is one path from its start to its end, so a pulse can travel it.
+function drawWires() {
+  const lanes = map.lanes;
+  if (!lanes?.clientWidth) return;
+  map.signature = layoutSignature();
+  for (const svg of [map.wires, map.pulses]) { svg.setAttribute('width', lanes.clientWidth); svg.setAttribute('height', lanes.clientHeight); }
+  map.wires.replaceChildren();
+  const origin = lanes.getBoundingClientRect();
+  const point = (node, side) => {
+    const rect = node.getBoundingClientRect();
+    return { x: rect[side] - origin.left, y: rect.top - origin.top + rect.height / 2 };
+  };
+  const route = (from, to, mid) => {
+    if (Math.abs(from.y - to.y) < 1) return `M${from.x},${from.y} H${to.x}`;
+    const r = Math.min(6, Math.abs(to.y - from.y) / 2), down = to.y > from.y ? 1 : -1;
+    return `M${from.x},${from.y} H${mid - r} Q${mid},${from.y} ${mid},${from.y + down * r} V${to.y - down * r} Q${mid},${to.y} ${mid + r},${to.y} H${to.x}`;
+  };
+  const wire = (key, d, refused) => map.wires.append(svgNode('path', { d, 'data-edge': key, class: refused ? 'refused' : '' }));
+  const vm = point(map.vm, 'right');
+  for (const service of map.services.values()) {
+    if (service.control.dataset.reached !== 'true') continue;
+    const end = point(service.control, 'left');
+    const refused = service.control.classList.contains('refused');
+    wire(`vm>${service.id}`, route(vm, end, vm.x + (end.x - vm.x) / 2), refused);
+    map.wires.append(svgNode('circle', { cx: end.x, cy: end.y, r: 2.5, class: refused ? 'refused' : '' }));
+  }
+  const starts = new Set();
+  for (const node of map.internet.children) {
+    const end = point(node, 'left');
+    for (const id of node.dataset.from.split(' ')) {
+      const service = map.services.get(id);
+      if (!service) continue;
+      const start = point(service.control, 'right');
+      starts.add(service);
+      wire(`${id}>${node.dataset.key}`, route(start, { x: end.x + 4, y: end.y }, start.x + (end.x - start.x) / 2));
+    }
+  }
+  for (const service of starts) {
+    const start = point(service.control, 'right');
+    map.wires.append(svgNode('circle', { cx: start.x, cy: start.y, r: 2.5 }));
   }
 }
-new ResizeObserver(() => graph(null, false)).observe($('map').parentElement);
+new ResizeObserver(() => { map.signature = ''; drawWires(); }).observe($('map'));
+
+// A pulse runs along the wires a request actually took.
+const running = new Map();
+function pulse(...edges) {
+  const legs = edges.map((edge) => map.wires?.querySelector(`path[data-edge="${CSS.escape(edge)}"]`)).filter(Boolean);
+  if (!legs.length) return;
+  const key = edges.join(' ');
+  if (performance.now() - (running.get(key) || 0) < 240) return;
+  running.set(key, performance.now());
+  const refused = legs.some((leg) => leg.classList.contains('refused'));
+  if (reducedMotion.matches) {
+    for (const leg of legs) { leg.classList.add('lit'); setTimeout(() => leg.classList.remove('lit'), 700); }
+    return;
+  }
+  const dot = svgNode('circle', { r: 3, class: refused ? 'refused' : '' });
+  map.pulses.append(dot);
+  const total = legs.reduce((sum, leg) => sum + leg.getTotalLength(), 0);
+  const duration = 260 + total * 1.6;
+  const start = performance.now();
+  const frame = (now) => {
+    const t = Math.min(1, (now - start) / duration);
+    let along = (1 - (1 - t) ** 2) * total;
+    let leg = legs[0];
+    for (const candidate of legs) { leg = candidate; const length = candidate.getTotalLength(); if (along <= length) break; along -= length; }
+    if (!leg.isConnected) { dot.remove(); return; }
+    const at = leg.getPointAtLength(Math.min(along, leg.getTotalLength()));
+    dot.setAttribute('cx', at.x); dot.setAttribute('cy', at.y);
+    dot.style.opacity = t > 0.85 ? String((1 - t) / 0.15) : '1';
+    if (t < 1) requestAnimationFrame(frame); else dot.remove();
+  };
+  requestAnimationFrame(frame);
+}
+const SEARCH_HOSTS = new Set(['www.google.com', 'www.bing.com', 'html.duckduckgo.com', 'duckduckgo.com', 'www.youtube.com']);
+let pulsed = null;
+function pulses() {
+  const rows = shown.activity;
+  // What happened before this page opened has already travelled.
+  if (pulsed === null) pulsed = rows.length;
+  if (rows.length < pulsed) pulsed = 0;
+  for (const { fact } of rows.slice(pulsed)) {
+    switch (fact.kind) {
+      case 'resolved': pulse('vm>dns'); break;
+      case 'request': pulse(SEARCH_HOSTS.has(fact.host) ? 'vm>search' : 'vm>sites'); break;
+      case 'search': pulse('vm>search'); break;
+      case 'no_route': pulse('vm>router'); break;
+      case 'certificate': pulse('vm>sites'); break;
+      case 'model_call': pulse('vm>calls', `calls>${fact.host}`); break;
+      case 'egress':
+        if (fact.phase !== 'attempt') break;
+        if (fact.purpose === 'editor') pulse('vm>editor', `editor>${fact.host}`);
+        else if (fact.purpose === 'live_search') pulse(`search>${fact.host}`);
+        else if (fact.purpose === 'live_capture' && !fact.page) pulse('sites>copies');
+        else if (fact.purpose === 'package') pulse('sites>packages');
+        else if (fact.purpose === 'account') pulse(`signin>${fact.host}`);
+        break;
+    }
+  }
+  pulsed = rows.length;
+}
 
 const briefPath = (path) => path.split('?')[0];
-function activityText(row) {
+const isAsset = (request) => /^(image\/|font\/|audio\/|video\/|text\/css|(?:text|application)\/(?:x-)?javascript|application\/(?:font|x-font|vnd\.ms-fontobject))/.test(request.content_type)
+  || /\.(?:css|[cm]?js|map|ico|png|jpe?g|gif|svg|webp|avif|woff2?|ttf|otf|eot|mp[34]|webm)(?:\?|$)/i.test(request.path);
+const isSubresource = (fact) => fact.fetch === 'subresource' || isAsset(fact);
+const urlOf = (fact) => `${fact.scheme}://${fact.host}${fact.path}`;
+// A page's own requests (stylesheets, scripts, XHR, third-party calls)
+// belong to the page that asked for them, by the referrer it sent.
+function pageRequests() {
+  const groups = new Map(), pages = [];
+  for (const row of shown.activity) {
+    const fact = row.fact;
+    if (fact.kind !== 'request') continue;
+    if (!isSubresource(fact)) { pages.push(row); groups.set(row, []); continue; }
+    // A file no page in the feed asked for stays with its site.
+    if (!pages.length) continue;
+    const referrer = fact.referrer, origin = referrer && originOf(referrer);
+    const parent = [...pages].reverse().find((page) => referrer && urlOf(page.fact) === referrer)
+      || [...pages].reverse().find((page) => origin && originOf(urlOf(page.fact)) === origin)
+      || [...pages].reverse().find((page) => page.fact.host === fact.host)
+      || pages.at(-1);
+    groups.get(parent).push(row);
+  }
+  return groups;
+}
+function hitHosts(hits) {
+  const hosts = [...new Set(hits.map((hit) => hostOf(hit.url).replace(/^www\./, '')))];
+  return hosts.slice(0, 3).join(', ') + (hosts.length > 3 ? ', …' : '');
+}
+function activityItem(row) {
   const fact = row.fact;
   switch (fact.kind) {
-    case 'resolved': return [fact.name, 'DNS', `${fact.name} → ${fact.address || 'no answer'}`, `site:${fact.name}`];
-    case 'request': return [fact.host, fact.scheme.toUpperCase(), `${fact.method} ${briefPath(fact.path)} · ${fact.status}`, `site:${fact.host}`];
-    case 'search': return [{google:'www.google.com',bing:'www.bing.com',duck_duck_go:'html.duckduckgo.com',you_tube:'www.youtube.com'}[fact.engine] || 'Search', 'Search', fact.query, 'sites'];
-    case 'model_call': return [fact.host, 'HTTPS', `${fact.method} ${briefPath(fact.path)} · ${fact.status || 'connecting'}${fact.phase === 'streaming' ? ' · streaming' : ''}`, 'calls'];
-    case 'tool': return ['model gateway', 'Tool', `${fact.tool === 'fetch' ? 'Fetch' : 'web_search'} · ${fact.target}`, 'calls'];
-    case 'signin': return ['Sign-in', 'Policy', fact.open ? 'Open' : 'Closed', 'signin'];
-    case 'egress': return [fact.host, 'Upstream', `${fact.purpose} · ${fact.method} ${briefPath(fact.path)} · ${fact.status || fact.phase}`, `egress:${fact.host}`];
-    case 'page_revision': {
-      const target = fact.target.url ? new URL(fact.target.url).hostname : fact.target.host || 'Search';
-      return [target, 'Writer', 'Answer rejected', 'writer'];
+    case 'request': {
+      const url = urlOf(fact), hit = hitFor(url);
+      const where = `${fact.host}${briefPath(fact.path) === '/' ? '' : briefPath(fact.path)}`;
+      if (fact.status >= 400) {
+        const outcome = [404, 410].includes(fact.status) ? 'not found' : [502, 503, 504].includes(fact.status) ? 'unreachable' : 'failed';
+        return { title: `${outcome === 'unreachable' ? fact.host : where} ${outcome}`, meta: [fact.status, sourceName(fact.source), fact.error].filter(Boolean).join(' · '), target: `site:${fact.host}`, failed: true };
+      }
+      const document = /(?:text\/html|application\/pdf)/.test(fact.content_type);
+      // Package indexes and files are not pages: they get no picture.
+      const thumbnail = document && fact.status < 400 && /text\/html/.test(fact.content_type) && fact.source.kind !== 'package' ? url : null;
+      // A page that took a while says how long: a client with a deadline may have stopped waiting.
+      const took = fact.elapsed_ms >= 1000 ? `${Math.round(fact.elapsed_ms / 1000)} s` : null;
+      return { title: `${fact.status >= 400 ? 'Requested' : 'Opened'} ${fact.title || hit?.title || fact.host}`, meta: [where, fact.status, sourceName(fact.source), changes(fact.edits), took].filter(Boolean).join(' · '), target: document ? `page:${url}` : `site:${fact.host}`, thumbnail, edits: fact.edits };
     }
-    case 'no_route': return [fact.to, 'TCP', 'no route', 'router'];
-    default: return ['', '', '', 'router'];
+    case 'search': return { title: `Searched “${fact.query}”`, meta: fact.results.length ? [quantity(fact.results.length, 'result'), hitHosts(fact.results), changes(fact.edits)].filter(Boolean).join(' · ') : 'No results', target: 'search', edits: fact.edits };
+    case 'tool': return { title: `${fact.tool === 'fetch' ? 'Fetched' : 'Searched'} ${fact.tool === 'fetch' ? fact.target : `“${fact.target}”`}`, meta: fact.error || (fact.tool === 'fetch' ? 'Answered by the world' : fact.results.length ? [quantity(fact.results.length, 'result'), hitHosts(fact.results), changes(fact.edits)].filter(Boolean).join(' · ') : 'No results'), target: 'calls', edits: fact.edits };
+    case 'abandoned': {
+      const where = `${fact.host}${briefPath(fact.path) === '/' ? '' : briefPath(fact.path)}`;
+      return { title: `${where} timed out`, meta: `Agent stopped waiting after ${Math.round(fact.elapsed_ms / 1000)} s · ${sourceName(fact.source)}`, target: `site:${fact.host}`, failed: true };
+    }
+    case 'no_route': return { title: `Tried ${fact.to}`, meta: 'No route', target: 'router' };
+    case 'certificate': return { title: `${hostName(fact.host)} certificate ${CERTIFICATE[fact.problem]}`, meta: 'TLS · Live', target: `site:${hostName(fact.host)}`, failed: true };
+    case 'resolved': return { title: `${hostName(fact.name)} not found`, meta: 'No address', target: 'dns', failed: true };
   }
+}
+// How a real site's certificate fails, as the feed says it.
+const CERTIFICATE = { expired: 'expired', not_yet_valid: 'not yet valid', wrong_name: 'for another name', untrusted: 'not trusted' };
+// A change reads as the real words struck through, then the world's words.
+function changeList(edits, limit = edits.length) {
+  const list = element('div', undefined, 'changes');
+  for (const edit of edits.slice(0, limit)) {
+    const row = element('div', undefined, 'change');
+    row.append(element('del', edit.passage), element('ins', edit.replacement));
+    list.append(row);
+  }
+  if (edits.length > limit) list.append(element('div', `${edits.length - limit} more`, 'change-more'));
+  return list;
+}
+// Feed rows are keyed and kept, so a page's picture loads once.
+const feedRows = new Map();
+function feedRow(key, row, item, resources) {
+  const signature = JSON.stringify([item, row.at_ms, resources.length]);
+  const kept = feedRows.get(key);
+  if (kept?.signature === signature) return kept.node;
+  const node = element('div', undefined, `activity-row ${row.fact.kind}${item.failed ? ' failed' : ''}${item.retried ? ' retried' : ''}${item.edits?.length ? ' edited' : ''}`);
+  const open = button('', () => select(item.target), 'activity-open');
+  open.title = `${item.title} · ${item.meta}`;
+  open.append(element('span', stamp(row.at_ms), 'stamp'), element('span', item.title, 'activity-title'), element('span', item.meta, 'activity-meta'));
+  const text = element('div', undefined, 'activity-text');
+  text.append(open);
+  if (item.edits?.length) text.append(changeList(item.edits, 2));
+  node.append(text);
+  const picture = kept?.node.querySelector('.thumbnail');
+  if (item.thumbnail) {
+    if (picture?.dataset.url === item.thumbnail) node.append(picture);
+    else {
+      const frame = element('div', undefined, 'thumbnail');
+      frame.dataset.url = item.thumbnail;
+      const view = element('iframe');
+      // Scripts are allowed only so the frame loads images as they come into
+      // view: the picture has none, and its policy runs none.
+      view.setAttribute('sandbox', 'allow-scripts');
+      view.setAttribute('loading', 'lazy');
+      view.setAttribute('tabindex', '-1');
+      view.setAttribute('aria-hidden', 'true');
+      view.referrerPolicy = 'no-referrer';
+      view.src = `/thumbnail?${new URLSearchParams({ url: item.thumbnail })}`;
+      frame.append(view);
+      frame.addEventListener('click', () => select(item.target));
+      node.append(frame);
+    }
+  }
+  if (resources.length) {
+    const group = element('details', undefined, 'page-assets');
+    group.open = !!kept?.node.querySelector('details[open]');
+    group.append(element('summary', quantity(resources.length, 'request')));
+    for (const resource of resources) {
+      const fact = resource.fact;
+      const target = fact.host === row.fact.host ? fact.path : `${fact.host}${fact.path}`;
+      group.append(button(`${target} · ${fact.status}`, () => select(`site:${fact.host}`), 'asset-row'));
+    }
+    text.append(group);
+  }
+  feedRows.set(key, { signature, node });
+  return node;
+}
+// A client that stops waiting for a page and asks for it again makes one
+// page visit, not several: requests for one address that were waiting at
+// the same time, or that come next after one the client gave up on, share
+// a row. The row shows the whole wait and how many times the page was
+// asked for. A later visit to the same page, after other activity, is its
+// own row.
+function visits(rows, groups) {
+  const startOf = (row) => row.at_ms - (row.fact.elapsed_ms || 0);
+  const open = new Map(), shown = [];
+  for (const row of [...rows].sort((a, b) => startOf(a) - startOf(b))) {
+    const fact = row.fact;
+    if (!['request', 'abandoned'].includes(fact.kind)) { shown.push({ row, attempts: [row] }); continue; }
+    const key = `${fact.method} ${urlOf(fact)}`, visit = open.get(key);
+    const waiting = visit && startOf(row) < visit.end;
+    const askedAgain = visit?.gaveUp && shown.at(-1) === visit;
+    if (waiting || askedAgain) {
+      visit.attempts.push(row);
+      visit.end = Math.max(visit.end, row.at_ms);
+      visit.gaveUp = fact.kind === 'abandoned';
+      continue;
+    }
+    const fresh = { attempts: [row], end: row.at_ms, gaveUp: fact.kind === 'abandoned' };
+    open.set(key, fresh);
+    shown.push(fresh);
+  }
+  return shown.map(({ attempts }) => {
+    const [row] = attempts;
+    if (attempts.length === 1) return { row, attempts, resources: groups.get(row) || [] };
+    // The row reads as the page's last answer, or the last time the client gave up.
+    const answered = attempts.filter((attempt) => attempt.fact.kind === 'request').at(-1) || attempts.at(-1);
+    const first = Math.min(...attempts.map(startOf)), last = Math.max(...attempts.map((attempt) => attempt.at_ms));
+    return { row: { ...answered, at_ms: last }, attempts, waited: last - first, resources: attempts.flatMap((attempt) => groups.get(attempt) || []) };
+  }).sort((a, b) => a.row.at_ms - b.row.at_ms);
 }
 function feed() {
-  const scrollTop = $('activity').scrollTop;
-  $('activity').replaceChildren();
-  for (const row of activityRows().filter((r) => r.fact.kind !== 'run_started' && !(r.fact.kind === 'egress' && r.fact.purpose === 'model')).slice(-100).reverse()) {
-    const [target, protocol, text, selected] = activityText(row);
-    const item = button('', () => select(selected), `activity-row ${row.fact.kind}`);
-    item.append(element('span', stamp(row.at_ms), 'stamp'), element('span', target), element('span', protocol), element('span', text));
-    item.title = `${target} · ${text}${row.fact.kind === 'page_revision' ? ` · ${row.fact.reason}` : ''}`;
-    $('activity').append(item);
-  }
-  $('activity').scrollTop = scrollTop;
-  if (world?.preview) {
-    $('preview-output').textContent = latest.activity.filter((r) => r.fact.kind !== 'run_started').slice(-10).map((r) => { const [host, protocol, text] = activityText(r); return `${protocol}  ${host}\n  ${text}`; }).join('\n\n');
-  }
-}
-function activityRows() {
-  const upstream = new Map();
-  for (const row of shown.activity) if (row.fact.kind === 'egress') upstream.set(row.fact.attempt, row);
-  const attempts = new Map();
-  return shown.activity.filter((row) => {
-    if (row.fact.kind === 'egress') return upstream.get(row.fact.attempt) === row;
-    if (row.fact.kind !== 'no_route') return true;
-    const key = `${row.fact.from}:${row.fact.to}`, previous = attempts.get(key);
-    attempts.set(key, row.at_ms);
-    if (previous !== undefined && row.at_ms - previous <= 30000) return false;
-    return true;
+  const groups = pageRequests();
+  const rows = activityRows().filter((row) => ['request', 'abandoned', 'search', 'tool', 'no_route', 'resolved', 'certificate'].includes(row.fact.kind) && (row.fact.kind !== 'request' || groups.has(row)) && (row.fact.kind !== 'abandoned' || !isSubresource(row.fact)) && (row.fact.kind !== 'resolved' || !row.fact.address));
+  const keep = new Set();
+  const nodes = visits(rows, groups).reverse().map(({ row, attempts, waited, resources }) => {
+    const fact = attempts[0].fact, started = attempts[0].at_ms;
+    const key = fact.kind === 'no_route' ? `no_route:${fact.from}:${fact.to}` : fact.kind === 'resolved' ? `resolved:${fact.name}` : fact.kind === 'certificate' ? `certificate:${fact.host}` : `${fact.kind}:${started}:${fact.host || ''}${fact.path || ''}${fact.query || ''}${fact.target || ''}`;
+    keep.add(key);
+    const item = activityItem(row);
+    if (attempts.length > 1) {
+      // Each earlier request was given up on: the client asked again.
+      item.meta = [item.meta.replace(/ · \d+ s$/, ''), `asked ${attempts.length} times`, `waited ${Math.round(waited / 1000)} s`].join(' · ');
+      item.retried = !item.failed;
+    }
+    return feedRow(key, row, item, resources);
   });
+  for (const key of feedRows.keys()) if (!keep.has(key)) feedRows.delete(key);
+  const list = $('activity');
+  if (!nodes.length) {
+    if (!list.querySelector('.feed-empty')) list.replaceChildren(element('p', 'No activity yet', 'feed-empty'));
+    return;
+  }
+  list.querySelector('.feed-empty')?.remove();
+  nodes.forEach((node, index) => { if (list.children[index] !== node) list.insertBefore(node, list.children[index] || null); });
+  while (list.children.length > nodes.length) list.lastChild.remove();
+}
+// Repeated refusals and failed lookups of one name show once, at the latest.
+function activityRows() {
+  const keyOf = (fact) => fact.kind === 'no_route' ? `no_route:${fact.from}:${fact.to}` : fact.kind === 'resolved' && !fact.address ? `resolved:${fact.name}` : fact.kind === 'certificate' ? `certificate:${fact.host}` : null;
+  const latest = new Map();
+  for (const row of shown.activity) { const key = keyOf(row.fact); if (key) latest.set(key, row); }
+  return shown.activity.filter((row) => { const key = keyOf(row.fact); return !key || latest.get(key) === row; });
 }
 function detailRow(at, label, meta, content) {
   const row = element('div', undefined, 'detail-row');
@@ -201,40 +493,37 @@ function requestFor(url) {
     return [...(shown.sites.find((site) => site.host === target.host)?.requests || [])].reverse().find((request) => request.url === target.href && request.method === 'GET');
   } catch { return null; }
 }
+function hitFor(url) {
+  return shown.sites.flatMap((site) => site.searches.flatMap((search) => search.results)).concat(shown.calls.flatMap((call) => call.tools.flatMap((tool) => tool.results))).find((hit) => hit.url === url);
+}
 function results(hits) {
   const list = element('div');
   if (!hits.length) list.append(element('p', 'No results', 'world-answer'));
   for (const hit of hits) {
     const opened = requestFor(hit.url);
     const row = button('', () => select(`page:${hit.url}`), `result ${opened ? 'opened' : 'unopened'}`);
-    row.append(element('span', hit.title || hit.url, 'result-title'), element('small', hit.url), element('span', opened ? 'Opened' : 'Unopened', 'result-state'));
+    row.append(element('span', hit.title || hit.url, 'result-title'), element('small', hit.url), element('span', opened ? opened.status >= 400 ? 'Failed' : 'Opened' : '', 'result-state'));
+    if (opened?.status >= 400) row.classList.add('failed');
     list.append(row);
   }
   return list;
 }
-async function readPage(url, request, container) {
-  const target = new URL(url);
-  const query = new URLSearchParams({ scheme: target.protocol.slice(0, -1), host: target.host, path: `${target.pathname}${target.search}`, at_ms: request.at_ms });
-  const response = await fetch(`/preview?${query}`);
-  if (!response.ok) throw new Error(await response.text());
-  const doc = new DOMParser().parseFromString(await response.text(), 'text/html');
-  for (const node of doc.querySelectorAll('[hidden], [aria-hidden="true"]')) node.remove();
-  for (const node of doc.querySelectorAll('[style]')) {
-    if (node.style.display === 'none' || node.style.visibility === 'hidden') node.remove();
-  }
-  for (const node of doc.querySelectorAll('script,style,link,meta,iframe,object,embed,form,nav,header,footer,aside,svg,img,video,audio,source,template,noscript')) node.remove();
-  let content = doc.querySelector('main, article, [role="main"]');
-  if (!content) {
-    content = doc.querySelector('h1')?.parentElement || doc.body;
-    while (content !== doc.body && content.parentElement && content.querySelectorAll('p').length < 2) content = content.parentElement;
-  }
-  for (const node of [content, ...content.querySelectorAll('*')]) {
-    for (const attribute of [...node.attributes]) node.removeAttribute(attribute.name);
-  }
+// The page as the world served it, as the workstation's phone browser laid it
+// out: its own markup, styles and images, with no scripts.
+function servedPage(url) {
   const frame = element('iframe', undefined, 'recorded-page');
-  frame.setAttribute('sandbox', ''); frame.referrerPolicy = 'no-referrer'; frame.title = url;
-  frame.srcdoc = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'"><style>body{margin:24px;color:#243047;background:#fff;font:16px/1.7 system-ui}h1,h2,h3{line-height:1.25}a{color:#2c61bd}pre,table{white-space:pre-wrap;overflow-wrap:anywhere}*{max-width:100%;box-sizing:border-box}</style>${content.outerHTML}`;
-  container.replaceChildren(frame);
+  // As in the feed: scripts are allowed only for images that load in view.
+  frame.setAttribute('sandbox', 'allow-scripts');
+  frame.referrerPolicy = 'no-referrer';
+  frame.title = url;
+  frame.src = `/thumbnail?${new URLSearchParams({ url })}`;
+  return frame;
+}
+function egressRows(purpose) {
+  return activityRows().filter((row) => row.fact.kind === 'egress' && row.fact.purpose === purpose && row.fact.phase !== 'attempt');
+}
+function editorCalls() {
+  return egressRows('editor');
 }
 let detailSignature = '';
 
@@ -255,25 +544,28 @@ function details() {
       const content = element('details'); content.dataset.key = String(call.call);
       content.open = expanded.has(content.dataset.key) || call.tools.length > 0 || !['complete', 'interrupted'].includes(call.phase);
       const summary = element('summary');
-      summary.append(element('div', `${call.host} · ${call.method} ${call.path}`, 'label'), element('div', `${call.status || ''} ${call.phase}`, 'meta'));
+      summary.append(element('div', `${call.host} · ${call.method} ${call.path}`, 'label'), element('div', phaseName(call.phase), 'meta'));
       content.append(summary);
       for (const tool of call.tools) {
         content.append(element('p', tool.tool === 'fetch' ? 'Fetch' : 'Web search', 'meta'), element('p', tool.target, 'tool-query'));
+        if (tool.edits?.length) content.append(changeList(tool.edits));
         if (tool.error) content.append(element('p', tool.error, 'world-answer'));
         else if (tool.tool === 'web_search') content.append(results(tool.results));
-        else content.append(element('p', 'World answer', 'world-answer'));
+        else content.append(element('p', 'Answered by the world', 'world-answer'));
       }
       const row = element('div', undefined, 'detail-row'); row.append(element('span', stamp(call.at_ms), 'stamp'), content); body.append(row);
     }
   } else if (selection.startsWith('page:')) {
     const url = selection.slice(5), request = requestFor(url);
-    const hit = shown.sites.flatMap((site) => site.searches.flatMap((search) => search.results)).concat(shown.calls.flatMap((call) => call.tools.flatMap((tool) => tool.results))).find((hit) => hit.url === url);
-    heading(hit?.title || 'Page', url);
-    body.append(element('p', request ? `Opened · ${request.status} · ${sourceName(request.source)}` : 'Unopened', 'page-state'));
+    const hit = hitFor(url);
+    const served = shown.activity.findLast((row) => row.fact.kind === 'request' && urlOf(row.fact) === url)?.fact.title;
+    heading(served || hit?.title || 'Page', url);
+    body.append(element('p', request ? [request.status >= 400 ? 'Failed' : 'Opened', request.status, sourceName(request.source), changes(request.edits)].filter(Boolean).join(' · ') : 'Not opened', 'page-state'));
+    if (request?.edits.length) body.append(changeList(request.edits));
     if (request?.has_preview) {
-      const container = element('div', 'Loading page…', 'reading-view');
+      const container = element('div', undefined, 'reading-view');
+      container.append(servedPage(request.url));
       body.append(container);
-      readPage(url, request, container).catch((error) => { container.textContent = error.message; });
       const read = button(document.body.classList.contains('page-expanded') ? 'Shrink page' : 'Expand page', () => {
         const expanded = document.body.classList.toggle('page-expanded');
         read.textContent = expanded ? 'Shrink page' : 'Expand page';
@@ -286,22 +578,41 @@ function details() {
     heading(name, site?.address || '');
     for (const search of site?.searches || []) {
       const content = element('div'); content.append(element('p', search.query, 'tool-query'), results(search.results));
-      body.append(detailRow(search.at_ms, 'Search', `${search.results.length} results`, content));
+      body.append(detailRow(search.at_ms, 'Search', quantity(search.results.length, 'result'), content));
     }
     for (const request of site?.requests || []) {
       const content = element('details'), summary = element('summary'), data = element('dl');
       content.dataset.key = `${request.method}:${request.path}:${request.at_ms}`;
       content.open = expanded.has(content.dataset.key);
-      summary.append(element('div', `${request.method} ${request.path}`, 'label'), element('div', `${request.status} · ${size(request.bytes)} on the wire · ${sourceName(request.source)}`, 'meta'));
+      summary.append(element('div', `${request.method} ${request.path}`, 'label'), element('div', `${request.status} · ${size(request.bytes)} · ${sourceName(request.source)}`, 'meta'));
       for (const [key, value] of [...request.headers, ['content-type', request.content_type], ['elapsed', request.elapsed_ms ? `${request.elapsed_ms} ms` : '<1 ms']]) data.append(element('dt', key), element('dd', value));
       content.append(summary, data);
       if (request.has_preview) content.append(button('Page', () => select(`page:${request.url}`), 'more'));
       const row = element('div', undefined, 'detail-row'); row.append(element('span', stamp(request.at_ms), 'stamp'), content); body.append(row);
     }
-    if (!site?.requests.length && !site?.searches.length) body.append(element('p', 'Unopened', 'detail-empty'));
+    if (!site?.requests.length && !site?.searches.length) body.append(element('p', 'Not opened', 'detail-empty'));
+  } else if (selection === 'copies' || selection === 'packages') {
+    const purpose = selection === 'copies' ? 'live_capture' : 'package';
+    heading(selection === 'copies' ? 'Page copies' : 'Packages');
+    // Each page the host fetched, with the files it fetched for that page.
+    const files = new Map();
+    for (const row of egressRows(purpose)) if (row.fact.page) files.set(row.fact.page, [...(files.get(row.fact.page) || []), row]);
+    for (const row of egressRows(purpose).filter((row) => !row.fact.page)) {
+      const own = files.get(row.fact.path) || [];
+      let content;
+      if (own.length) {
+        content = element('details', undefined, 'page-files');
+        content.dataset.key = `files:${row.fact.path}`;
+        content.open = expanded.has(content.dataset.key);
+        content.append(element('summary', quantity(own.length, 'file')));
+        for (const file of own) content.append(element('div', `${file.fact.path.replace(/^https?:\/\//, '')} · ${file.fact.status || phaseName(file.fact.phase)}`, 'asset-row'));
+      }
+      body.append(detailRow(row.at_ms, row.fact.path, `${row.fact.method} · ${row.fact.status || phaseName(row.fact.phase)}`, content));
+    }
+    if (!body.childElementCount) body.append(element('p', 'No requests', 'detail-empty'));
   } else if (['egress', 'signin'].includes(selection) || selection.startsWith('egress:')) {
     const accepts = (row) => selection === 'signin' ? row.purpose === 'account' : selection.startsWith('egress:') ? row.host === selection.slice(7) : true;
-    const connections = shown.connections.filter(accepts), egress = shown.egress.filter((row) => accepts(row.fact) && row.fact.phase !== 'attempt');
+    const connections = shown.connections.filter(accepts), egress = shown.egress.filter((row) => accepts(row.fact) && row.fact.phase !== 'attempt' && !row.fact.page);
     heading(selection === 'signin' ? 'Sign-in' : selection.startsWith('egress:') ? selection.slice(7) : 'Internet');
     if (shown.signin && ['signin', 'egress'].includes(selection)) {
       body.append(detailRow(shown.signin.at_ms, shown.signin.fact.open ? 'Sign-in open' : 'Sign-in closed', ''));
@@ -313,24 +624,34 @@ function details() {
         body.append(exceptions);
       }
     }
-    for (const connection of connections.filter((connection) => !egress.some((row) => row.fact.host === connection.host && row.fact.purpose === connection.purpose))) body.append(detailRow(connection.at_ms, connection.host, connection.purpose));
-    for (const row of egress) body.append(detailRow(row.at_ms, row.fact.host, `${row.fact.purpose} · ${row.fact.method} ${row.fact.path} · ${row.fact.status || row.fact.phase}`));
+    for (const connection of connections.filter((connection) => !egress.some((row) => row.fact.host === connection.host && row.fact.purpose === connection.purpose))) body.append(detailRow(connection.at_ms, connection.host, purposeName(connection.purpose)));
+    for (const row of egress) body.append(detailRow(row.at_ms, row.fact.host, `${purposeName(row.fact.purpose)} · ${row.fact.method} ${row.fact.path} · ${row.fact.status || phaseName(row.fact.phase)}`));
     if (!connections.length && !egress.length) body.append(element('p', 'No connections', 'detail-empty'));
   } else if (selection === 'search') {
     heading('Search');
     const searches = [...shown.sites.flatMap((site) => site.searches), ...shown.calls.flatMap((call) => call.tools.filter((tool) => tool.tool === 'web_search').map((tool) => ({ ...tool, query: tool.target })))].sort((a, b) => b.at_ms - a.at_ms);
     for (const search of searches) {
-      const content = element('div'); content.append(element('p', search.query, 'tool-query'), search.error ? element('p', search.error, 'world-answer') : results(search.results));
-      body.append(detailRow(search.at_ms, 'Search', `${search.results.length} results`, content));
+      const content = element('div'); content.append(element('p', search.query, 'tool-query'));
+      if (search.edits?.length) content.append(changeList(search.edits));
+      content.append(search.error ? element('p', search.error, 'world-answer') : results(search.results));
+      body.append(detailRow(search.at_ms, 'Search', [quantity(search.results.length, 'result'), changes(search.edits)].filter(Boolean).join(' · '), content));
     }
     if (!searches.length) body.append(element('p', 'No searches', 'detail-empty'));
-  } else if (selection === 'writer') {
-    heading('Writer');
-    for (const row of shown.activity.filter((row) => row.fact.kind === 'page_revision')) {
-      const fact = row.fact;
-      const target = fact.target.url || fact.target.host || fact.target.query || 'Cast';
-      body.append(detailRow(row.at_ms, target, 'Answer rejected', element('p', fact.reason, 'writer-error')));
+  } else if (selection === 'editor') {
+    heading('Editor', world?.scenario?.text || '');
+    // Every real page and result list the scenario changed, newest first.
+    const edited = [
+      ...shown.sites.flatMap((site) => site.requests.filter((request) => request.edits.length).map((request) => ({ at_ms: request.at_ms, label: hitFor(request.url)?.title || request.url, meta: request.url, edits: request.edits, target: `page:${request.url}` }))),
+      ...shown.sites.flatMap((site) => site.searches.filter((search) => search.edits.length).map((search) => ({ at_ms: search.at_ms, label: `Results for “${search.query}”`, meta: '', edits: search.edits, target: 'search' }))),
+      ...shown.calls.flatMap((call) => call.tools.filter((tool) => tool.edits.length).map((tool) => ({ at_ms: tool.at_ms, label: `Results for “${tool.target}”`, meta: 'Search tool', edits: tool.edits, target: 'search' }))),
+    ].sort((a, b) => b.at_ms - a.at_ms);
+    for (const page of edited) {
+      const content = changeList(page.edits);
+      content.append(button('Open', () => select(page.target), 'more'));
+      body.append(detailRow(page.at_ms, page.label, page.meta, content));
     }
+    if (!edited.length) body.append(element('p', world?.scenario ? 'No pages changed yet' : 'No scenario', 'detail-empty'));
+    if (editorCalls().length) body.append(element('p', quantity(editorCalls().length, 'model call'), 'meta'));
   } else if (selection === 'sites') {
     heading('Sites');
     for (const site of localSites()) {
@@ -340,79 +661,66 @@ function details() {
   } else if (selection === 'dns') {
     heading('DNS', '10.0.0.1:53');
     for (const row of shown.activity.filter((row) => row.fact.kind === 'resolved')) body.append(detailRow(row.at_ms, row.fact.name, row.fact.address || 'No answer'));
+    if (!body.childElementCount) body.append(element('p', 'No lookups', 'detail-empty'));
   } else if (selection === 'router') {
     heading('Router', '10.0.0.1');
     for (const row of activityRows().filter((row) => row.fact.kind === 'no_route')) body.append(detailRow(row.at_ms, row.fact.to, 'No route'));
+    if (!body.childElementCount) body.append(element('p', 'Nothing refused', 'detail-empty'));
   } else {
     heading('Workstation', hostStatus?.addresses.join(' · ') || '10.0.0.2');
-    actions.append(button('Show agent', () => { select(null); $('agent').hidden = false; $('agent-toggle').setAttribute('aria-pressed', 'true'); }));
+    actions.append(button('Show agent', () => { select(null); showAgent(true); }));
   }
   body.scrollTop = scroll;
 }
 
-function draw(upstream = null, newData = false) {
-  graph(upstream, newData); feed(); details();
-  $('clock').textContent = time(latest.at_ms);
-  $('cursor-time').textContent = time(shown.at_ms);
-  $('end-time').textContent = time(latest.at_ms);
-  $('oldest').textContent = time(latest.oldest_ms);
-  $('scrubber').min = latest.oldest_ms;
-  $('scrubber').max = Math.max(latest.at_ms, latest.oldest_ms);
-  $('scrubber').value = shown.at_ms;
-  $('live').classList.toggle('active', live);
-  $('play').textContent = live ? 'Ⅱ' : '▶';
-  $('play').setAttribute('aria-label', live ? 'Pause observation' : 'Return to live observation');
-  $('rewind-label').hidden = live;
+// The run clock is the host's clock, read from its replies, and ticks.
+let hostOffset = 0;
+function tick() { $('clock').textContent = new Date(Date.now() + hostOffset).toLocaleTimeString([], { hour12: false, timeZone: 'UTC' }); }
+setInterval(tick, 1000);
+function draw() {
+  graph(); feed(); details();
+  tick();
 }
-async function rewind(at) {
-  live = false;
-  rewindRequest?.abort();
-  rewindRequest = new AbortController();
-  try {
-    const reply = await fetch(`/view?at_ms=${at}`, { signal: rewindRequest.signal });
-    if (!reply.ok) throw new Error('Could not load this point in the run');
-    shown = await reply.json(); draw();
-  } catch (error) { if (error.name !== 'AbortError') notice(error.message); }
-}
-$('scrubber').addEventListener('input', (event) => rewind(Number(event.target.value)));
-function goLive() { rewindRequest?.abort(); live = true; shown = latest; draw(); }
-$('live').onclick = goLive;
-$('play').onclick = () => live ? rewind(shown.at_ms) : goLive();
 const stream = new EventSource('/state');
-stream.onopen = () => { $('connection').classList.add('connected'); $('connection').title = 'Connected'; };
-stream.onerror = () => { $('connection').classList.remove('connected'); $('connection').title = 'Reconnecting'; };
+stream.onerror = () => { $('clock').title = 'Reconnecting'; };
+stream.onopen = () => { $('clock').title = ''; };
 stream.onmessage = (event) => {
-  const forwarded = (row) => ['attempt', 'response', 'failed'].includes(row.fact.phase);
-  const before = latest.egress.filter(forwarded).at(-1);
-  const connected = !!latest.started_at_ms;
-  latest = JSON.parse(event.data);
-  const after = latest.egress.filter(forwarded).at(-1);
-  const upstream = connected && JSON.stringify(before) !== JSON.stringify(after) ? after?.fact : null;
-  if (live || shown.at_ms < latest.oldest_ms) { shown = latest; live = true; }
-  draw(upstream, true);
+  shown = JSON.parse(event.data);
+  draw();
+  pulses();
 };
+// The world's settings as they change, such as the scenario becoming ready.
+const worldStream = new EventSource('/world/state');
+worldStream.onmessage = (event) => showWorld(JSON.parse(event.data));
 async function loadWorld() {
   const response = await fetch('/world');
   if (!response.ok) throw new Error('Could not read the world settings');
-  world = await response.json();
-  $('preview-label').hidden = !world.preview;
+  const date = Date.parse(response.headers.get('date'));
+  if (date) hostOffset = date + 500 - Date.now();
+  showWorld(await response.json());
+}
+// Whether the scenario's account is written yet, said briefly.
+const READINESS = { preparing: 'Preparing scenario', ready: 'Scenario ready', failed: 'Scenario failed. Set it again.' };
+function showWorld(next) {
+  world = next;
   $('world-date').textContent = world.date;
-  $('brief').textContent = world.instructions;
-  $('source').value = world.source.kind === 'copy' ? 'copied' : world.source.kind === 'live' ? 'live' : 'model_written';
-  for (const option of $('source').options) {
-    const availability = world[option.value];
-    option.disabled = availability.kind !== 'available';
-    const text = { copied: 'Copied pages', model_written: 'Model-written pages', live: 'Live search' }[option.value];
-    const reason = { no_captures: 'No captures', no_page_writer: 'No page writer', no_search_key: 'No search key' }[availability.reason];
-    option.textContent = reason ? `${text} · ${reason}` : text;
+  // The field keeps what is being typed; it shows the scenario in force otherwise.
+  if (document.activeElement !== $('scenario')) $('scenario').value = world.scenario?.text || '';
+  $('scenario-form').hidden = world.edited.kind !== 'available';
+  const readiness = world.scenario?.readiness;
+  for (const id of ['scenario-state', 'scenario-readiness']) {
+    const state = $(id);
+    state.hidden = !readiness || (id === 'scenario-state' && world.source !== 'edited');
+    state.dataset.kind = readiness?.kind || '';
+    state.textContent = readiness ? READINESS[readiness.kind] : '';
+    state.title = readiness?.error || '';
   }
-  if (world.preview) {
-    $('console-status').hidden = true;
-    $('terminal').hidden = true; $('screen').hidden = true;
-    $('preview-console').hidden = false;
-    $('terminal-tab').disabled = true; $('screen-tab').disabled = true;
-    $('host-status').textContent = 'Preview';
-    draw();
+  if (selection === 'editor') details();
+  for (const control of $('source').querySelectorAll('button')) {
+    const availability = world[control.dataset.source];
+    control.disabled = availability.kind !== 'available';
+    control.setAttribute('aria-pressed', String(control.dataset.source === world.source));
+    control.title = { no_captures: 'No captures', no_search_key: 'No search key', no_model_key: 'No model key' }[availability.reason] || '';
   }
 }
 $('world-toggle').onclick = () => { $('world-menu').hidden = !$('world-menu').hidden; $('world-toggle').setAttribute('aria-expanded', String(!$('world-menu').hidden)); };
@@ -424,23 +732,35 @@ async function command(command) {
   if (!response.ok) throw new Error(await response.text());
   await loadWorld();
 }
-$('source').onchange = async () => { $('source').disabled = true; try { await command({ command: 'set_source', source: $('source').value }); } catch (error) { $('world-error').textContent = error.message; await loadWorld(); } finally { $('source').disabled = false; } };
-$('restart').onclick = async () => { $('restart').disabled = true; try { await command({ command: 'restart' }); select(null); goLive(); } catch (error) { $('world-error').textContent = error.message; } finally { $('restart').disabled = false; } };
-$('story').onclick = async () => {
-  $('story').disabled = true;
-  try { const response = await fetch('/story', { method: 'POST' }); if (!response.ok) throw new Error(await response.text()); }
-  catch (error) { notice(error.message); }
-  finally { $('story').disabled = false; }
-};
+for (const control of $('source').querySelectorAll('button')) {
+  control.onclick = async () => {
+    if (control.getAttribute('aria-pressed') === 'true') return;
+    for (const control of $('source').querySelectorAll('button')) control.disabled = true;
+    try { await command({ command: 'set_source', source: control.dataset.source }); }
+    catch (error) { notice(error.message); await loadWorld(); }
+  };
+}
+async function setScenario(scenario) {
+  for (const control of $('scenario-form').querySelectorAll('button')) control.disabled = true;
+  try { await command({ command: 'set_scenario', scenario }); $('scenario').blur(); await loadWorld(); }
+  catch (error) { $('world-error').textContent = error.message; }
+  finally { for (const control of $('scenario-form').querySelectorAll('button')) control.disabled = false; }
+}
+$('scenario-form').onsubmit = (event) => { event.preventDefault(); setScenario($('scenario').value); };
+$('scenario').addEventListener('keydown', (event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); setScenario($('scenario').value); } });
+$('scenario-clear').onclick = () => { $('scenario').value = ''; setScenario(''); };
+$('restart').onclick = async () => { $('restart').disabled = true; try { await command({ command: 'restart' }); select(null); } catch (error) { $('world-error').textContent = error.message; } finally { $('restart').disabled = false; } };
 async function mountConsole() {
-  if (world?.preview || !hostStatus) return;
+  if (!hostStatus) return;
   const kind = activeConsole;
-  $('terminal').hidden = kind !== 'terminal'; $('screen').hidden = kind !== 'screen';
+  $('terminal').hidden = kind !== 'terminal'; $('screen').classList.toggle('off', kind !== 'screen');
+  // The workstation's screen is a phone: the pane takes its portrait shape.
+  $('agent').classList.toggle('phone', kind === 'screen');
   $('terminal-tab').setAttribute('aria-pressed', String(kind === 'terminal'));
   $('screen-tab').setAttribute('aria-pressed', String(kind === 'screen'));
   const ready = kind === 'screen' ? hostStatus.screen : hostStatus.terminal;
   $('console-status').hidden = ready;
-  $('console-status').textContent = hostStatus.state === 'failed' ? 'The workstation failed to start. See the process output.' : hostStatus.state === 'stopped' ? 'The workstation has stopped.' : 'Waiting for the workstation…';
+  $('console-status').textContent = hostStatus.state === 'failed' ? 'The workstation failed to start. See the process output.' : hostStatus.state === 'stopped' ? 'The workstation has stopped.' : 'Starting the workstation…';
   if (!ready || mounting.has(kind)) return;
   const existing = consoles.get(kind);
   if (existing && existing.socket.readyState <= 1) return;
@@ -451,8 +771,9 @@ async function mountConsole() {
     let create;
     if (kind === 'terminal') {
       const [library, component] = await Promise.all([import('/vendor/ghostty-web/dist/ghostty-web.js'), import('/terminal.mjs')]);
+      await document.fonts.load('15px "JetBrains Mono"');
       const ghostty = await library.Ghostty.load('/vendor/ghostty-web/dist/ghostty-vt.wasm');
-      create = (socket) => component.mount($('terminal'), library, socket, { ghostty, fontSize, fontFamily: 'monospace', theme: { background: '#0b0f18', foreground: '#d6dee8', cursor: '#9dbdf5' } });
+      create = (socket) => component.mount($('terminal'), library, socket, { ghostty, fontSize: 15, fontFamily: 'JetBrains Mono', theme: { background: '#151917', foreground: '#dce2dc', cursor: '#dce2dc' } });
     } else {
       const [{ default: RFB }, component] = await Promise.all([import('/vendor/novnc/core/rfb.js'), import('/screen.mjs')]);
       create = (socket) => component.mount($('screen'), RFB, socket);
@@ -466,12 +787,6 @@ async function mountConsole() {
   } catch (error) { socket?.close(); notice(`Console unavailable: ${error.message}`); }
   finally { mounting.delete(kind); }
 }
-for (const [id, change] of [['smaller-text', -1], ['larger-text', 1]]) {
-  $(id).onclick = () => {
-    fontSize = Math.max(16, Math.min(26, fontSize + change));
-    consoles.get('terminal')?.component.setFontSize(fontSize);
-  };
-}
 $('terminal-tab').onclick = () => { activeConsole = 'terminal'; mountConsole(); };
 $('screen-tab').onclick = () => { activeConsole = 'screen'; mountConsole(); };
 const status = new EventSource('/host/state');
@@ -479,8 +794,8 @@ status.onmessage = (event) => {
   const next = JSON.parse(event.data);
   const changed = JSON.stringify(next) !== JSON.stringify(hostStatus);
   hostStatus = next;
-  if (!world?.preview) { $('host-status').textContent = { booting: 'Booting', network_up: 'Network up', ssh_up: 'SSH ready', desktop_up: 'Desktop ready', stopped: 'Stopped', failed: 'Failed' }[next.state] || next.state; if (changed) mountConsole(); }
+  if (changed) mountConsole();
 };
-loadWorld().then(() => { if (!world.preview) mountConsole(); }).catch((error) => notice(error.message));
+loadWorld().then(() => mountConsole()).catch((error) => notice(error.message));
 draw();
-window.addEventListener('pagehide', () => { stream.close(); status.close(); for (const console of consoles.values()) { console.component.dispose(); console.socket.close(); } rewindRequest?.abort(); });
+window.addEventListener('pagehide', () => { stream.close(); status.close(); worldStream.close(); for (const console of consoles.values()) { console.component.dispose(); console.socket.close(); } });
