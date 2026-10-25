@@ -50,6 +50,7 @@ impl Pages {
             settings: Mutex::new(Settings {
                 source,
                 revision: 0,
+                lag: None,
             }),
             copied: None,
             live: None,
@@ -146,6 +147,7 @@ impl Pages {
             editor.new_session(fcx);
         }
         self.forget_packages();
+        settings.lag = Some(self.measure_lag());
         settings.source = source;
         settings.revision += 1;
         Ok(())

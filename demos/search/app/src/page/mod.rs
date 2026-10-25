@@ -57,6 +57,7 @@ pub struct Search {
     pub query: String,
     pub results: Vec<Hit>,
     pub edits: Vec<Edit>,
+    pub source: PageSource,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct Call {
@@ -77,6 +78,7 @@ pub struct ToolUse {
     pub results: Vec<Hit>,
     pub edits: Vec<Edit>,
     pub error: Option<String>,
+    pub source: PageSource,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct Connection {
@@ -247,6 +249,7 @@ impl Views {
                 query,
                 results,
                 edits,
+                source,
             } => {
                 let host = match engine {
                     web_world::observation::Engine::Google => "www.google.com",
@@ -262,6 +265,7 @@ impl Views {
                         query: query.clone(),
                         results: results.clone(),
                         edits: edits.clone(),
+                        source: source.clone(),
                     });
             }
             SearchObs::ModelCall {
@@ -295,6 +299,7 @@ impl Views {
                 results,
                 edits,
                 error,
+                source,
             } => {
                 if let Some(row) = view.calls.iter_mut().find(|row| row.call == *call) {
                     row.tools.push(ToolUse {
@@ -304,6 +309,7 @@ impl Views {
                         results: results.clone(),
                         edits: edits.clone(),
                         error: error.clone(),
+                        source: source.clone(),
                     });
                 }
             }

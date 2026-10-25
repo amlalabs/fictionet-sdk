@@ -92,6 +92,8 @@ async fn main() -> Result {
     let (page, (observations, commands)) = page::Page::new(pages.clone(), false);
     let server = page::serve(page.router(), kit::PAGE_PORT).await?;
     let _access = kit::PageAccess::new(&server.url)?;
+    // Stopping frees the page's address first, so a restart comes back on it.
+    let mut server = Some(server);
     let observe_page = page.clone();
     let mut observation_task =
         tokio::spawn(async move { observe_page.record(observations, &output).await });
@@ -176,6 +178,11 @@ async fn main() -> Result {
             }
         };
         drop(readiness);
+        if matches!(ended, Ok(Ended::Stopping) | Err(_))
+            && let Some(server) = server.take()
+        {
+            server.shutdown().await;
+        }
         let shutdown = run.shutdown().await.and_then(|()| log.finish());
         match (ended, shutdown) {
             (Ok(Ended::Chosen), Ok(())) => continue,
@@ -183,7 +190,9 @@ async fn main() -> Result {
             (Err(error), _) | (Ok(Ended::Chosen), Err(error)) => break Err(error),
         }
     };
-    server.shutdown().await;
+    if let Some(server) = server {
+        server.shutdown().await;
+    }
     observation_task.abort();
     println!("whole run: {} ms", total.elapsed().as_millis());
     result?;

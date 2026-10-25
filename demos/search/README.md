@@ -55,7 +55,9 @@ to a fresh disk overlay; the prepared image stays unchanged. All demo flows use
 this workstation. The terminal uses ghostty-web and a persistent tmux session;
 Screen shows Firefox. Terminal text starts at 15 px on a dark background in both
 page themes, using the bundled JetBrains Mono font. The page source switch stays
-visible and can change Copied, Live and Edited during a session.
+visible. Choosing Copied, Live, Live-Depth or Edited starts a new session: the
+workstation boots again from the prepared image on that mode's clock, and the
+terminal opens once the clock is set.
 
 On the workstation, a before-and-after run reached full readiness in 63.384 s
 with boot-time installation and 7.213 s with the prepared image. Desktop readiness
@@ -74,10 +76,9 @@ tool handlers, its name resolver and the typed no-route callback on its network.
 [app/src/page/](app/src/page/) projects those facts into the map, site details,
 model calls and recent activity. Selecting a site or gateway keeps the map
 above its details while the agent remains visible. The page always shows the
-live run. The visible source switch changes modes during a session; the World
-menu restarts pages. Observed internet destinations
-and sign-in policy survive page restarts. Each launch writes its facts to a separate
-`<downloads>/search/run-<uuid>.jsonl` with RFC 3339 wall-clock timestamps and
+live run. Each session is a run of its own: the world forgets what it copied,
+crawled, fetched and edited, the feed and map start empty, and its facts go to
+a separate `<downloads>/search/run-<uuid>.jsonl` with RFC 3339 wall-clock timestamps and
 owner-only permissions. Request credentials are redacted before entering the observation channel; request
 bodies are not retained. Header details show only values retained by recording.
 The map draws internet
@@ -111,7 +112,20 @@ sites. Capture dates are shown only when the archive records them.
   page's internet activity. Interrupted downloads retry until completion; upstream
   status codes, including real missing pages, are preserved. A host whose real
   certificate fails verification (expired, issued for other names, or from an
-  untrusted issuer) presents a certificate that fails the same way.
+  untrusted issuer) presents a certificate that fails the same way. A copy is
+  served dated when it is served.
+- **Live-Depth** answers searches as Live does, then crawls each result's site
+  five links deep, staying on the site, and collects the pages and their files
+  ahead of time through the host fetcher, one request at a time per host. The
+  guest can open only what the crawl reached; a page still in line moves to the
+  front and the client waits for it. Any other address gets the site's plain
+  404, and a host the crawl never reached gets NXDOMAIN; neither is fetched, so
+  nothing the guest types reaches the internet except its searches. A name
+  looked up before a crawl reaches its host stays NXDOMAIN for the session, as
+  the network keeps each answer. Package files come only from the capture. The
+  feed and map show the pages each search's crawl collected, and refused
+  addresses as rows. Searches share one crawl: an address is fetched once, and
+  a page reached again closer to a result is followed further from there.
 - **Edited** serves the real web as Live does, with the changes a scenario calls
   for. The scenario is a short instruction set in the World menu, such as "The
   Fed raised rates by 0.5 points on Oct 22". A model reads each page or result
@@ -126,11 +140,12 @@ sites. Capture dates are shown only when the archive records them.
   the guest sees none of this. With no scenario, Edited behaves like Live.
 
 The source switch shows why a source is unavailable: missing captures, a model
-key or a search key. Other sources remain usable. The page source can change
-during a session, and the page reports the source that answered each request.
-Copied mode has no public-web fallback. Its day is the Wikipedia snapshot's: the
-workstation clock, HTTP dates and the World menu move back to it while Copied
-answers, and return to the run day when another source is chosen. Live supplies current
+key or a search key. Other sources remain usable. The page reports the source
+that answered each request and search. Copied mode has no public-web fallback.
+Its day is the day its newest page was copied: the workstation clock, HTTP
+dates and the World menu are set back by as many whole days as have passed
+since then, so no page is dated after the guest's clock. A stored copy goes
+decoded to a client whose `Accept-Encoding` does not name its coding. Live supplies current
 material. Live search and capture use a separate host HTTP transport, outside
 the guest model gateway. Search queries and served pages are logged and
 displayed. The crawler ignores robots.txt.
@@ -247,8 +262,8 @@ The previous astronomy captures remain in `demos/downloads/astronomy/`.
 
 The corpus's `packages/` directory holds separate WARCs for PyPI indexes,
 wheel metadata and distributions, and GitHub source archives. These sites
-replay their captures in every mode. A file the capture lacks is copied from
-its real host when first asked for and kept for the run, so installs work for
+replay their captures in every mode. Except in Live-Depth, a file the capture lacks is copied from
+its real host when first asked for and kept for the session, so installs work for
 any package; a package that does not exist stays a 404. Captured site 404 pages and their assets
 also supply missing-page responses for the research sources.
 

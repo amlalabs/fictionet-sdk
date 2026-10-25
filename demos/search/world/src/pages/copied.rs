@@ -17,6 +17,44 @@ pub(super) struct Corpus {
     search: CorpusSearch,
     hosts: HashSet<String>,
     packages: Option<PackageSites>,
+    /// When the newest page Copied serves was copied, found when first
+    /// asked for.
+    newest: std::sync::OnceLock<Option<time::OffsetDateTime>>,
+}
+
+impl Corpus {
+    /// When the newest page this corpus serves was copied: the newest
+    /// capture, or the start of the Wikipedia copy's day if that is newer.
+    fn newest(&self) -> Option<time::OffsetDateTime> {
+        *self.newest.get_or_init(|| {
+            let parse = |text: &str| {
+                time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339)
+                    .ok()
+            };
+            let reference = match &self.search {
+                CorpusSearch::Reference(reference) => Some(reference),
+                CorpusSearch::Crawled(_) => None,
+            };
+            let captures = self
+                .archive
+                .capture_times()
+                .chain(
+                    self.packages
+                        .iter()
+                        .flat_map(|packages| packages.archive.capture_times()),
+                )
+                .chain(
+                    reference
+                        .into_iter()
+                        .flat_map(|reference| reference.capture_times()),
+                )
+                .filter_map(parse);
+            let dump = reference
+                .and_then(|reference| reference.date)
+                .map(|date| date.midnight().assume_utc());
+            captures.chain(dump).max()
+        })
+    }
 }
 
 enum CorpusSearch {
@@ -442,6 +480,7 @@ impl Pages {
             search: CorpusSearch::Crawled(Index::default()),
             hosts,
             packages,
+            newest: Default::default(),
         };
         corpus.search = if let Some(reference) = reference {
             CorpusSearch::Reference(Box::new(reference))
@@ -506,22 +545,27 @@ impl Pages {
         Ok(pages)
     }
 
-    /// The day the copied pages were copied, which Copied mode shows as
-    /// the world's day.
+    /// The day the newest page Copied serves was copied.
     pub fn copied_date(&self) -> Option<time::Date> {
-        match &self.copied.as_ref()?.search {
-            CorpusSearch::Reference(reference) => reference.date,
-            CorpusSearch::Crawled(_) => None,
-        }
+        Some(self.copied.as_ref()?.newest()?.date())
     }
 
-    /// How far the copied pages' day is behind the world's own day: Copied
-    /// mode sets the guest's clock and the sites' dates back by this much.
+    /// How far Copied's clock is behind the host's: as many whole days as
+    /// have passed since the newest page Copied serves was copied, so the
+    /// guest's clock and the sites' dates are on that page's day and no
+    /// page is dated after them. It is fixed for each session when the
+    /// session starts.
     pub fn copied_lag(&self) -> Option<std::time::Duration> {
-        let lag = seed::parse_date(&self.seed.date).ok()? - self.copied_date()?;
-        std::time::Duration::try_from(lag)
-            .ok()
-            .filter(|lag| !lag.is_zero())
+        if let Some(lag) = self.settings.lock().unwrap().lag {
+            return lag;
+        }
+        self.measure_lag()
+    }
+
+    /// [`copied_lag`](Self::copied_lag) as it is now.
+    pub(super) fn measure_lag(&self) -> Option<std::time::Duration> {
+        let days = (time::OffsetDateTime::now_utc() - self.copied.as_ref()?.newest()?).whole_days();
+        (days > 0).then(|| std::time::Duration::from_secs(days as u64 * 86_400))
     }
 
     /// The world's day as the active source shows it now, the day of the

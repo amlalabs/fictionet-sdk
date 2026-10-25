@@ -76,6 +76,8 @@ pub enum SearchObs {
         results: Vec<Hit>,
         /// The scenario's edits to the real results' titles and snippets.
         edits: Vec<Edit>,
+        /// The mode that answered.
+        source: PageSource,
     },
     /// Live-Depth's crawl around one search so far: reported as each page
     /// arrives and when nothing is left in line.
@@ -110,6 +112,8 @@ pub enum SearchObs {
         /// The scenario's edits to a search's results.
         edits: Vec<Edit>,
         error: Option<String>,
+        /// The mode that answered.
+        source: PageSource,
     },
     Signin {
         open: bool,
@@ -434,18 +438,15 @@ impl Pages {
                         })
                         .collect(),
                     edits: list.edits.clone(),
+                    source: source.clone(),
                 },
             );
         }
-        // A page Edited mode left as the site sent it is a live page.
         let edits = response
             .edited
             .as_ref()
             .map(|edited| edited.edits.clone())
             .unwrap_or_default();
-        if matches!(source, PageSource::Edited) && edits.is_empty() {
-            source = PageSource::Live;
-        }
         if let PageSource::Copy { captured } = &mut source {
             *captured = self
                 .capture_date(&format!(

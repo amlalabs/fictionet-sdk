@@ -224,6 +224,7 @@ impl fictionet_extras::models::Engine for Tools {
                         .as_ref()
                         .err()
                         .map(|_| "Search is unavailable".into()),
+                    source: self.pages.page_source(),
                 },
             );
             result
@@ -247,6 +248,7 @@ impl fictionet_extras::models::Engine for Tools {
                     results: Vec::new(),
                     edits: Vec::new(),
                     error: result.as_ref().err().map(|_| "Page is unavailable".into()),
+                    source: self.pages.page_source(),
                 },
             );
             result

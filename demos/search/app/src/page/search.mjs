@@ -347,8 +347,8 @@ function activityItem(row) {
       const took = fact.elapsed_ms >= 1000 ? `${Math.round(fact.elapsed_ms / 1000)} s` : null;
       return { title: `${fact.status >= 400 ? 'Requested' : 'Opened'} ${fact.title || hit?.title || fact.host}`, meta: [where, fact.status, sourceName(fact.source), changes(fact.edits), took].filter(Boolean).join(' · '), target: document ? `page:${url}` : `site:${fact.host}`, thumbnail, edits: fact.edits };
     }
-    case 'search': return { title: `Searched “${fact.query}”`, meta: fact.results.length ? [quantity(fact.results.length, 'result'), hitHosts(fact.results), changes(fact.edits)].filter(Boolean).join(' · ') : 'No results', target: 'search', edits: fact.edits };
-    case 'tool': return { title: `${fact.tool === 'fetch' ? 'Fetched' : 'Searched'} ${fact.tool === 'fetch' ? fact.target : `“${fact.target}”`}`, meta: fact.error || (fact.tool === 'fetch' ? 'Answered by the world' : fact.results.length ? [quantity(fact.results.length, 'result'), hitHosts(fact.results), changes(fact.edits)].filter(Boolean).join(' · ') : 'No results'), target: 'calls', edits: fact.edits };
+    case 'search': return { title: `Searched “${fact.query}”`, meta: [fact.results.length ? [quantity(fact.results.length, 'result'), hitHosts(fact.results)].join(' · ') : 'No results', sourceName(fact.source), changes(fact.edits)].filter(Boolean).join(' · '), target: 'search', edits: fact.edits };
+    case 'tool': return { title: `${fact.tool === 'fetch' ? 'Fetched' : 'Searched'} ${fact.tool === 'fetch' ? fact.target : `“${fact.target}”`}`, meta: [fact.error || (fact.tool === 'fetch' ? 'Answered by the world' : fact.results.length ? [quantity(fact.results.length, 'result'), hitHosts(fact.results)].join(' · ') : 'No results'), sourceName(fact.source), changes(fact.edits)].filter(Boolean).join(' · '), target: 'calls', edits: fact.edits };
     case 'abandoned': {
       const where = `${fact.host}${briefPath(fact.path) === '/' ? '' : briefPath(fact.path)}`;
       return { title: `${where} timed out`, meta: `Agent stopped waiting after ${Math.round(fact.elapsed_ms / 1000)} s · ${sourceName(fact.source)}`, target: `site:${fact.host}`, failed: true };
@@ -721,7 +721,7 @@ const waiting = new Map();
 function connect() {
   const socket = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/updates`);
   opened = new Promise((resolve) => socket.addEventListener('open', resolve, { once: true }));
-  socket.onopen = () => { $('clock').title = ''; };
+  socket.onopen = () => { $('link-state').hidden = true; };
   socket.onmessage = (event) => {
     const update = JSON.parse(event.data);
     // A busy run sends states faster than a screen shows them: each frame
@@ -736,7 +736,7 @@ function connect() {
     }
   };
   socket.onclose = () => {
-    $('clock').title = 'Reconnecting';
+    $('link-state').hidden = false;
     for (const reply of waiting.values()) reply.reject(new Error('The page lost its connection to the world. Try again.'));
     waiting.clear();
     if (updates === socket) setTimeout(connect, 1000);
@@ -850,7 +850,15 @@ async function mountConsole() {
       create = (socket) => component.mount($('screen'), RFB, socket);
     }
     socket = new WebSocket(socketUrl(kind));
-    socket.addEventListener('close', () => { if (activeConsole === kind && consoles.get(kind)?.socket === socket) { $('console-status').hidden = false; $('console-status').textContent = 'Console disconnected. Select Terminal or Screen to reconnect.'; } });
+    // A closed console leaves the pane, so its last output does not show
+    // under the status.
+    socket.addEventListener('close', () => {
+      if (consoles.get(kind)?.socket !== socket) return;
+      consoles.get(kind).component.dispose();
+      consoles.delete(kind);
+      $(kind).replaceChildren();
+      if (activeConsole === kind) { $('console-status').hidden = false; $('console-status').textContent = 'Console disconnected. Select Terminal or Screen to reconnect.'; }
+    });
     socket.addEventListener('error', () => notice('Could not connect to the workstation console'));
     $(kind).replaceChildren();
     const component = create(socket);

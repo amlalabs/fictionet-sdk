@@ -165,6 +165,9 @@ impl Response {
 struct Settings {
     source: Source,
     revision: u64,
+    /// Copied's lag behind the host's clock, fixed when a session starts;
+    /// `None` before the first session.
+    lag: Option<Option<std::time::Duration>>,
 }
 
 /// The world's pages: its seed, its copied web, the live web and the editor.

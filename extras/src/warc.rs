@@ -283,6 +283,13 @@ impl Archive {
         key(url).is_some_and(|key| self.urls.contains_key(&key))
     }
 
+    /// Every record's WARC capture time the archive supplied.
+    pub fn capture_times(&self) -> impl Iterator<Item = &str> {
+        self.urls
+            .values()
+            .filter_map(|record| record.captured.as_deref())
+    }
+
     /// The record's WARC capture time, when the archive supplied one.
     pub fn captured(&self, url: &str) -> Option<&str> {
         self.urls

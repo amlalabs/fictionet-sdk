@@ -145,6 +145,14 @@ impl ReferenceWeb {
             .map_err(io::Error::other)
     }
 
+    /// When each page this web copied besides Wikipedia's was copied
+    /// (RFC 3339).
+    pub fn capture_times(&self) -> impl Iterator<Item = &str> {
+        self.documents
+            .capture_times()
+            .chain(self.research.capture_times())
+    }
+
     /// When the copy this web answers `url` with was made (RFC 3339): the
     /// Wikipedia copy's day for its articles, the capture's time for other
     /// pages. `None` when this web does not answer it.
@@ -252,6 +260,7 @@ impl Pages {
             search: CorpusSearch::Crawled(Index::default()),
             hosts: HashSet::new(),
             packages: None,
+            newest: Default::default(),
         };
         let wikipedia = Zim::new(wiki_file(&root)).map_err(|e| e.to_string())?;
         let parent = root.join("index");
