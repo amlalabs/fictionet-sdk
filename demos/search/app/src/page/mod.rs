@@ -208,6 +208,7 @@ impl Views {
                 title: _,
                 error: _,
                 unlisted: _,
+                blocked: _,
                 depth: _,
                 edits,
                 preview,

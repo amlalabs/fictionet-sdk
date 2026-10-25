@@ -49,6 +49,9 @@ pub enum SearchObs {
         /// Live-Depth does not allow the address: the world answered as a
         /// site with no such page and fetched nothing.
         unlisted: bool,
+        /// Why Live-Depth's network policy blocked the address: the world
+        /// answered with a block page and fetched nothing.
+        blocked: Option<crate::pages::Blocked>,
         /// How many links from a search result a page Live-Depth allows
         /// is.
         depth: Option<u8>,
@@ -527,6 +530,10 @@ impl Pages {
                     _ => None,
                 },
                 unlisted: matches!(response.meta, Meta::Unlisted),
+                blocked: match response.meta {
+                    Meta::Blocked(blocked) => Some(blocked),
+                    _ => None,
+                },
                 depth,
                 edits,
                 referrer: headers

@@ -274,6 +274,11 @@ impl Pages {
     /// never saw. `None` for anything that is not a package file, such as a
     /// project's pages on the same sites, which are pages like any other.
     pub(crate) async fn package(&self, cx: &Cx, url: &str) -> Option<Response> {
+        if self.source() == Source::LiveDepth
+            && let Some(blocked) = Blocked::of(&url::Url::parse(url).ok()?)
+        {
+            return Some(Response::blocked(url, blocked));
+        }
         let captured = self.package_url(url)?;
         // Live-Depth reaches the internet only for searches and the pages it allows.
         if captured.status != 404 || self.source() == Source::LiveDepth {
@@ -339,8 +344,8 @@ impl Pages {
 
     /// In copied mode only captured hosts and the local search engines exist.
     /// Live and Edited may admit any public hostname. Live-Depth admits the
-    /// search engines, the hosts of the addresses it allows and the captured package
-    /// sites. A written world admits any name spelled the way a registered
+    /// search engines, the hosts of the addresses it allows, the package
+    /// registries it blocks and the captured package sites. A written world admits any name spelled the way a registered
     /// site is.
     pub fn serves_host(&self, host: &str) -> bool {
         let host = host.trim_end_matches('.').to_ascii_lowercase();
@@ -364,6 +369,7 @@ impl Pages {
                             .depth
                             .as_ref()
                             .is_some_and(|depth| depth.allows_host(&host))
+                        || REGISTRIES.contains(&host.as_str())
                         || packaged()
                 }
                 Source::Copied => {
@@ -746,6 +752,30 @@ const DISTRIBUTIONS: [&str; 22] = [
     ".snap",
     ".xpi",
 ];
+
+/// The package registries installers download from, which Live-Depth's
+/// network policy blocks.
+const REGISTRIES: [&str; 6] = [
+    "pypi.org",
+    "files.pythonhosted.org",
+    "registry.npmjs.org",
+    "registry.yarnpkg.com",
+    "index.crates.io",
+    "static.crates.io",
+];
+
+impl Blocked {
+    /// Why Live-Depth's network policy blocks `url`, if it does: a
+    /// registry's index or package file.
+    fn of(url: &url::Url) -> Option<Self> {
+        let registry = REGISTRIES.contains(&url.host_str()?);
+        let file = matches!(
+            PackageFile::of(url),
+            Some(PackageFile::Index | PackageFile::Distribution)
+        );
+        (registry && file).then_some(Self::Packages)
+    }
+}
 
 /// Endings of the files published beside a package file.
 const BESIDE: [&str; 5] = [".metadata", ".asc", ".sig", ".sha256", ".sha512"];
