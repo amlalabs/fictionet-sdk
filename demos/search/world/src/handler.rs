@@ -130,6 +130,7 @@ impl Handler {
             },
             &answer,
         );
+        let answer = negotiated(answer, parts.headers.get(http::header::ACCEPT_ENCODING));
         let mut response = Response::builder()
             .status(StatusCode::from_u16(answer.status)?)
             .header(CONTENT_TYPE, answer.content_type)
@@ -141,17 +142,24 @@ impl Handler {
                 response = response.header(name, value);
             }
         }
-        // Copied mode's day is the day its pages were copied, on the guest's
-        // clock and in every answer's date.
-        if self.pages.source() == crate::pages::Source::Copied
-            && let Some(lag) = self.pages.copied_lag()
-            && let Some(headers) = response.headers_mut()
+        // Every answer is dated when it is served, as a server dates it,
+        // whenever its copy was made. Copied mode's day is the day its
+        // newest page was copied, on the guest's clock and in every date.
+        let lag = self
+            .pages
+            .copied_lag()
+            .filter(|_| self.pages.source() == crate::pages::Source::Copied)
+            .unwrap_or_default();
+        if let Some(headers) = response.headers_mut()
             && let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
             && let Ok(date) = http::HeaderValue::from_str(&web::httpd::http_date(
                 now.saturating_sub(lag).as_secs(),
             ))
         {
             headers.insert(http::header::DATE, date);
+            // The age a cache in front of the site reported when it was
+            // copied is not this answer's.
+            headers.remove(http::header::AGE);
         }
         let body = if parts.method == http::Method::HEAD {
             Bytes::new()
@@ -161,6 +169,61 @@ impl Handler {
         let response = response.body(Full::new(body))?;
         Ok(response)
     }
+}
+
+/// `answer` in a content coding the client asked for: a copy stored in a
+/// coding its `Accept-Encoding` does not name goes decoded, as a server
+/// sends a client that names no coding the plain representation.
+fn negotiated(
+    mut answer: crate::pages::Response,
+    accept: Option<&http::HeaderValue>,
+) -> crate::pages::Response {
+    let Some(headers) = &answer.stored_headers else {
+        return answer;
+    };
+    let Some(coding) = headers
+        .get(http::header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|coding| !coding.is_empty() && coding != "identity")
+    else {
+        return answer;
+    };
+    let accepted = accept
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value.split(',').any(|item| {
+                let mut parts = item.split(';');
+                let name = parts.next().unwrap_or("").trim().to_ascii_lowercase();
+                let refused = parts.any(|parameter| {
+                    parameter
+                        .trim()
+                        .strip_prefix("q=")
+                        .and_then(|q| q.trim().parse::<f32>().ok())
+                        .is_some_and(|q| q == 0.0)
+                });
+                (name == coding || name == "*") && !refused
+            })
+        });
+    if accepted {
+        return answer;
+    }
+    let stored = fictionet_extras::warc::Response {
+        status: StatusCode::from_u16(answer.status).unwrap_or(StatusCode::OK),
+        headers: headers.clone(),
+        body: std::mem::take(&mut answer.body).into(),
+    };
+    match stored.decoded() {
+        Ok(body) => {
+            let mut headers = stored.headers;
+            headers.remove(http::header::CONTENT_ENCODING);
+            headers.insert(CONTENT_LENGTH, body.len().into());
+            answer.body = body;
+            answer.stored_headers = Some(headers);
+        }
+        Err(_) => answer.body = stored.body.to_vec(),
+    }
+    answer
 }
 
 /// A request the world has not answered yet. Dropped before then, its

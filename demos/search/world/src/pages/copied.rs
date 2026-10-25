@@ -17,6 +17,44 @@ pub(super) struct Corpus {
     search: CorpusSearch,
     hosts: HashSet<String>,
     packages: Option<PackageSites>,
+    /// When the newest page Copied serves was copied, found when first
+    /// asked for.
+    newest: std::sync::OnceLock<Option<time::OffsetDateTime>>,
+}
+
+impl Corpus {
+    /// When the newest page this corpus serves was copied: the newest
+    /// capture, or the start of the Wikipedia copy's day if that is newer.
+    fn newest(&self) -> Option<time::OffsetDateTime> {
+        *self.newest.get_or_init(|| {
+            let parse = |text: &str| {
+                time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339)
+                    .ok()
+            };
+            let reference = match &self.search {
+                CorpusSearch::Reference(reference) => Some(reference),
+                CorpusSearch::Crawled(_) => None,
+            };
+            let captures = self
+                .archive
+                .capture_times()
+                .chain(
+                    self.packages
+                        .iter()
+                        .flat_map(|packages| packages.archive.capture_times()),
+                )
+                .chain(
+                    reference
+                        .into_iter()
+                        .flat_map(|reference| reference.capture_times()),
+                )
+                .filter_map(parse);
+            let dump = reference
+                .and_then(|reference| reference.date)
+                .map(|date| date.midnight().assume_utc());
+            captures.chain(dump).max()
+        })
+    }
 }
 
 enum CorpusSearch {
@@ -237,7 +275,8 @@ impl Pages {
     /// project's pages on the same sites, which are pages like any other.
     pub(crate) async fn package(&self, cx: &Cx, url: &str) -> Option<Response> {
         let captured = self.package_url(url)?;
-        if captured.status != 404 {
+        // Live-Depth reaches the internet only for searches and the pages it allows.
+        if captured.status != 404 || self.source() == Source::LiveDepth {
             return Some(captured);
         }
         let packages = self.copied.as_ref()?.packages.as_ref()?;
@@ -287,25 +326,55 @@ impl Pages {
         self.copied.is_some()
     }
 
+    /// Forgets the package files copied from their real hosts.
+    pub(super) fn forget_packages(&self) {
+        if let Some(packages) = self
+            .copied
+            .as_ref()
+            .and_then(|corpus| corpus.packages.as_ref())
+        {
+            packages.fetched.lock().unwrap().clear();
+        }
+    }
+
     /// In copied mode only captured hosts and the local search engines exist.
-    /// Live worlds may admit any public hostname; a written world, any
-    /// spelled the way a registered site is.
+    /// Live and Edited may admit any public hostname. Live-Depth admits the
+    /// search engines, the hosts of the addresses it allows and the captured package
+    /// sites. A written world admits any name spelled the way a registered
+    /// site is.
     pub fn serves_host(&self, host: &str) -> bool {
         let host = host.trim_end_matches('.').to_ascii_lowercase();
         if self.written.is_some() {
             return crate::admit(&host).is_ok() && !written::misspelled_host(&host);
         }
+        let packaged = || {
+            self.copied.as_ref().is_some_and(|corpus| {
+                corpus
+                    .packages
+                    .as_ref()
+                    .is_some_and(|packages| packages.hosts.contains(&host))
+            })
+        };
         crate::admit(&host).is_ok()
-            && (self.source() != Source::Copied
-                || crate::route::SEARCH_HOSTS.contains(&host.as_str())
-                || self.copied.as_ref().is_some_and(|corpus| {
-                    corpus.hosts.contains(&host)
-                        || matches!(&corpus.search, CorpusSearch::Reference(web) if web.serves(&host))
-                        || corpus
-                            .packages
+            && match self.source() {
+                Source::Live | Source::Edited => true,
+                Source::LiveDepth => {
+                    crate::route::SEARCH_HOSTS.contains(&host.as_str())
+                        || self
+                            .depth
                             .as_ref()
-                            .is_some_and(|packages| packages.hosts.contains(&host))
-                }))
+                            .is_some_and(|depth| depth.allows_host(&host))
+                        || packaged()
+                }
+                Source::Copied => {
+                    crate::route::SEARCH_HOSTS.contains(&host.as_str())
+                        || packaged()
+                        || self.copied.as_ref().is_some_and(|corpus| {
+                            corpus.hosts.contains(&host)
+                                || matches!(&corpus.search, CorpusSearch::Reference(web) if web.serves(&host))
+                        })
+                }
+            }
     }
 
     /// Open the corpus chosen by the world's brief, relative to the downloads root.
@@ -411,6 +480,7 @@ impl Pages {
             search: CorpusSearch::Crawled(Index::default()),
             hosts,
             packages,
+            newest: Default::default(),
         };
         corpus.search = if let Some(reference) = reference {
             CorpusSearch::Reference(Box::new(reference))
@@ -475,22 +545,27 @@ impl Pages {
         Ok(pages)
     }
 
-    /// The day the copied pages were copied, which Copied mode shows as
-    /// the world's day.
+    /// The day the newest page Copied serves was copied.
     pub fn copied_date(&self) -> Option<time::Date> {
-        match &self.copied.as_ref()?.search {
-            CorpusSearch::Reference(reference) => reference.date,
-            CorpusSearch::Crawled(_) => None,
-        }
+        Some(self.copied.as_ref()?.newest()?.date())
     }
 
-    /// How far the copied pages' day is behind the world's own day: Copied
-    /// mode sets the guest's clock and the sites' dates back by this much.
+    /// How far Copied's clock is behind the host's: as many whole days as
+    /// have passed since the newest page Copied serves was copied, so the
+    /// guest's clock and the sites' dates are on that page's day and no
+    /// page is dated after them. It is fixed for each session when the
+    /// session starts.
     pub fn copied_lag(&self) -> Option<std::time::Duration> {
-        let lag = seed::parse_date(&self.seed.date).ok()? - self.copied_date()?;
-        std::time::Duration::try_from(lag)
-            .ok()
-            .filter(|lag| !lag.is_zero())
+        if let Some(lag) = self.settings.lock().unwrap().lag {
+            return lag;
+        }
+        self.measure_lag()
+    }
+
+    /// [`copied_lag`](Self::copied_lag) as it is now.
+    pub(super) fn measure_lag(&self) -> Option<std::time::Duration> {
+        let days = (time::OffsetDateTime::now_utc() - self.copied.as_ref()?.newest()?).whole_days();
+        (days > 0).then(|| std::time::Duration::from_secs(days as u64 * 86_400))
     }
 
     /// The world's day as the active source shows it now, the day of the

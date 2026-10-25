@@ -1,5 +1,7 @@
-//! Host search and on-demand public page copies with their dependencies,
-//! retained for replay.
+//! Host search and public page copies with their dependencies, retained
+//! for replay: copied when a client asks for them (Live and Edited), or,
+//! in Live-Depth, only when the address is on the allowlist that grows
+//! from search results through the links of the pages the guest opens.
 
 use super::*;
 use fictionet_extras::{
@@ -40,6 +42,20 @@ impl Drop for Lifetime {
     }
 }
 
+/// How a session reaches the real web.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Reach {
+    /// Live and Edited: any page a client asks for is copied when asked.
+    Asked,
+    /// Live-Depth: a page is copied when asked for only if it is on the
+    /// allowlist: a search result, or a link fewer than [`DEPTH`] links
+    /// from one on a page the guest opened, or a file of such a page.
+    Allowlist,
+}
+
+/// How many links from a search result Live-Depth allows.
+const DEPTH: u8 = 5;
+
 #[derive(Clone)]
 enum CaptureState {
     Pending,
@@ -48,21 +64,66 @@ enum CaptureState {
     Cancelled,
 }
 
+/// Why a copy of an address could not be served.
+pub(super) enum Unanswered {
+    /// Live-Depth's allowlist does not have it, so it was not fetched.
+    Unlisted,
+    /// The copy failed, or the session stopped, and why.
+    Failed(String),
+}
+
+impl From<String> for Unanswered {
+    fn from(error: String) -> Self {
+        Self::Failed(error)
+    }
+}
+
+impl From<&str> for Unanswered {
+    fn from(error: &str) -> Self {
+        Self::Failed(error.into())
+    }
+}
+
+/// Why Live-Depth allows an address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Allowed {
+    /// A search result (depth 0), or a link on an allowed page one deeper
+    /// than that page, at the fewest links it was reached by.
+    Page { depth: u8 },
+    /// A stylesheet, script, image or font an allowed page uses, or the
+    /// target of a file's redirect.
+    File,
+}
+
 #[derive(Default)]
 struct State {
     archive: Archive,
     lifetime: Arc<Lifetime>,
     epoch: usize,
     reached: HashMap<String, watch::Sender<CaptureState>>,
+    /// Live-Depth: every allowed address.
+    allowed: HashMap<String, Allowed>,
+    /// Live-Depth: the links of each page copied, so a page reached again
+    /// closer to a search result passes its new depth on.
+    links: HashMap<String, Vec<String>>,
+    /// Live-Depth: how many allowed addresses each host has, which the
+    /// world's DNS answers for.
+    hosts: HashMap<String, usize>,
 }
+
+type Observations =
+    Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<crate::observation::Observation>>>>;
 
 pub(super) struct Live {
     key: Key,
     endpoint: url::Url,
     path: PathBuf,
+    reach: Reach,
     state: Mutex<State>,
     fetcher: Transport,
     observer: Mutex<Option<Arc<capture::Observer>>>,
+    /// Where the allowlist's growth is reported.
+    observations: Observations,
 }
 
 impl Drop for Live {
@@ -72,23 +133,26 @@ impl Drop for Live {
 }
 
 impl Live {
-    fn new(root: &Path) -> Result<Arc<Self>, String> {
+    fn new(root: &Path, reach: Reach, observations: Observations) -> Result<Arc<Self>, String> {
         let key = Key::new("EXA_API_KEY", std::env::var("EXA_API_KEY").ok())?;
         std::fs::create_dir_all(root).map_err(|e| e.to_string())?;
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|e| e.to_string())?
             .as_nanos();
+        let name = match reach {
+            Reach::Asked => "live-search",
+            Reach::Allowlist => "live-depth",
+        };
         Ok(Arc::new(Self {
             key,
             endpoint: url::Url::parse("https://api.exa.ai/search").unwrap(),
-            path: root.join(format!(
-                "live-search-{}-{stamp}.warc.gz",
-                std::process::id()
-            )),
+            path: root.join(format!("{name}-{}-{stamp}.warc.gz", std::process::id())),
+            reach,
             state: Mutex::default(),
             fetcher: Transport::new()?,
             observer: Mutex::default(),
+            observations,
         }))
     }
 
@@ -134,6 +198,23 @@ impl Live {
                     return;
                 }
             };
+            // Live-Depth allows what an allowed copy links to and uses
+            // before the copy is ready, so its links resolve and answer by
+            // the time the client has it.
+            if live.reach == Reach::Allowlist {
+                let (page_url, copy) = (url.clone(), response.clone());
+                let redirect = response.status.is_redirection();
+                match live
+                    .fetcher
+                    .process(&cx, &lifetime, move || {
+                        capture::links(&page_url, &copy).map_err(|error| error.to_string())
+                    })
+                    .await
+                {
+                    Ok(links) => live.admit(&cx, &url, redirect, links),
+                    Err(error) => eprintln!("Live-Depth link discovery failed: {error}"),
+                }
+            }
             // A copied page brings what lays a still picture of it out: its
             // stylesheets, CSS imports, fonts and icons, including those of
             // pages already in the archive, so the host's picture of the page
@@ -211,6 +292,66 @@ impl Live {
                 .map_err(|error| error.to_string())?;
         }
         Ok(response)
+    }
+
+    /// Allows what the copy of `url` leads to: a redirect's target as `url`
+    /// itself is allowed; the files a page or stylesheet uses; and, for a
+    /// page fewer than [`DEPTH`] links from a search result, its links one
+    /// deeper.
+    fn admit(&self, cx: &Cx, url: &str, redirect: bool, links: capture::Links) {
+        let mut state = self.state();
+        let Some(from) = state.allowed.get(url).copied() else {
+            return;
+        };
+        if redirect {
+            for target in links.pages {
+                state.allow(target, from);
+            }
+        } else {
+            for file in links.assets {
+                state.allow(file, Allowed::File);
+            }
+            if let Allowed::Page { depth } = from {
+                state.links.insert(url.to_owned(), links.pages.clone());
+                if depth < DEPTH {
+                    for page in links.pages {
+                        state.allow(page, Allowed::Page { depth: depth + 1 });
+                    }
+                }
+            }
+        }
+        let links = state.allowed.len() as u64;
+        drop(state);
+        self.report_allowlist(cx, links);
+    }
+
+    /// Allows the results of a search at depth 0.
+    fn allow_results(&self, cx: &Cx, search: &search::Search) {
+        let mut state = self.state();
+        for result in &search.results {
+            state.allow(result.url.clone(), Allowed::Page { depth: 0 });
+        }
+        let links = state.allowed.len() as u64;
+        drop(state);
+        self.report_allowlist(cx, links);
+    }
+
+    fn report_allowlist(&self, cx: &Cx, links: u64) {
+        crate::observation::report(
+            &self.observations,
+            cx,
+            crate::observation::SearchObs::Allowlist { links },
+        );
+    }
+
+    /// Why Live-Depth allows `url`, if it does.
+    pub(super) fn allowed(&self, url: &str) -> Option<Allowed> {
+        self.state().allowed.get(&warc::key(url)?).copied()
+    }
+
+    /// Whether an address Live-Depth allows is on `host`.
+    pub(super) fn allows_host(&self, host: &str) -> bool {
+        self.state().hosts.contains_key(host)
     }
 
     async fn search(
@@ -299,6 +440,9 @@ impl Live {
         if lifetime.cancelled() || !Arc::ptr_eq(lifetime, &self.state().lifetime) {
             return Err("Live session stopped".into());
         }
+        if self.reach == Reach::Allowlist {
+            self.allow_results(cx, &search);
+        }
         Ok(search)
     }
 
@@ -310,8 +454,9 @@ impl Live {
         }
     }
 
-    pub(super) fn revoke(&self, reset: bool) {
-        let mut state = self.state();
+    /// Stops this session's copies.
+    fn revoke(&self) {
+        let state = self.state();
         state.lifetime.cancel();
         for (url, done) in &state.reached {
             done.send_replace(if state.archive.contains(url) {
@@ -320,16 +465,12 @@ impl Live {
                 CaptureState::Cancelled
             });
         }
-        if reset {
-            state.lifetime = Arc::default();
-            let completed: std::collections::HashSet<_> =
-                state.archive.urls().map(str::to_owned).collect();
-            state.reached.retain(|url, _| completed.contains(url));
-        }
     }
 
+    /// Starts a new session, forgetting everything the previous one
+    /// copied or allowed.
     pub(super) fn restart(&self) {
-        self.revoke(false);
+        self.revoke();
         let mut state = self.state();
         let epoch = state.epoch + 1;
         let old_path = self.archive_path(state.epoch);
@@ -360,8 +501,10 @@ impl Live {
         self.state().archive.get(&warc::key(url)?).ok()?
     }
 
-    /// The copy of `url`, made now if it is not made yet: a document as
-    /// the client by `user_agent` gets it, or a file of `page`.
+    /// The copy of `url`. Live and Edited make it now if it is not made
+    /// yet: a document as the client by `user_agent` gets it, or a file
+    /// of `page`. Live-Depth copies only what its allowlist has,
+    /// and refuses anything else without fetching it.
     pub(super) async fn response(
         self: &Arc<Self>,
         cx: &Cx,
@@ -369,9 +512,13 @@ impl Live {
         resource: capture::Resource,
         user_agent: Option<&http::HeaderValue>,
         page: Option<url::Url>,
-    ) -> Result<warc::Response, String> {
+    ) -> Result<warc::Response, Unanswered> {
         let url = warc::key(url).ok_or("Invalid Live URL")?;
         let lifetime = self.state().lifetime.clone();
+        // Live-Depth never fetches an address it does not allow.
+        if self.reach == Reach::Allowlist && !self.state().allowed.contains_key(&url) {
+            return Err(Unanswered::Unlisted);
+        }
         let mut waiting = self.capture(
             &lifetime,
             cx,
@@ -399,11 +546,53 @@ impl Live {
         if !Arc::ptr_eq(&lifetime, &state.lifetime) {
             return Err("Live session stopped".into());
         }
-        state
+        Ok(state
             .archive
             .get(&url)
             .map_err(|error| error.to_string())?
-            .ok_or_else(|| "Live capture is unavailable".into())
+            .ok_or("Live capture is unavailable")?)
+    }
+}
+
+impl State {
+    /// Allows `url` as `allowed`, unless it is allowed already as well:
+    /// a page beats a file, and fewer links beat more. A copied page
+    /// reached closer to a search result passes its new depth on to its
+    /// links.
+    fn allow(&mut self, url: String, allowed: Allowed) {
+        let mut work = vec![(url, allowed)];
+        while let Some((url, allowed)) = work.pop() {
+            let Some(url) = warc::key(&url) else {
+                continue;
+            };
+            let previous = self.allowed.get(&url).copied();
+            let better = match (previous, allowed) {
+                (None, _) | (Some(Allowed::File), Allowed::Page { .. }) => true,
+                (Some(Allowed::Page { depth: old }), Allowed::Page { depth }) => depth < old,
+                (Some(_), Allowed::File) => false,
+            };
+            if !better {
+                continue;
+            }
+            if previous.is_none()
+                && let Some(host) = url::Url::parse(&url)
+                    .ok()
+                    .and_then(|parsed| parsed.host_str().map(str::to_owned))
+            {
+                *self.hosts.entry(host).or_default() += 1;
+            }
+            self.allowed.insert(url.clone(), allowed);
+            if let Allowed::Page { depth } = allowed
+                && depth < DEPTH
+                && let Some(links) = self.links.get(&url)
+            {
+                work.extend(
+                    links
+                        .iter()
+                        .map(|link| (link.clone(), Allowed::Page { depth: depth + 1 })),
+                );
+            }
+        }
     }
 }
 
@@ -482,23 +671,67 @@ impl Fetcher {
 }
 
 impl Pages {
-    /// Observes every host request: Live copies and searches, and package files.
-    pub(crate) fn observe_live(&self, observer: Arc<capture::Observer>) {
+    /// Observes every host request: Live copies and searches and package
+    /// files with `observer`, Live-Depth's searches and copies with `allowed`.
+    pub(crate) fn observe_live(
+        &self,
+        observer: Arc<capture::Observer>,
+        allowed: Arc<capture::Observer>,
+    ) {
         *self.fetcher.observer.lock().unwrap() = Some(observer.clone());
         if let Some(live) = &self.live {
             *live.observer.lock().unwrap() = Some(observer);
         }
+        if let Some(depth) = &self.depth {
+            *depth.observer.lock().unwrap() = Some(allowed);
+        }
     }
 
-    /// Configure and select host search from environment credentials.
+    /// Configure host search from environment credentials, for Live,
+    /// Live-Depth and Edited, and select Live.
     pub fn with_live_search(mut self, downloads: &Path) -> Result<Self, String> {
-        self.live = Some(Live::new(downloads)?);
+        self.live = Some(Live::new(
+            downloads,
+            Reach::Asked,
+            self.observation.clone(),
+        )?);
+        self.depth = Some(Live::new(
+            downloads,
+            Reach::Allowlist,
+            self.observation.clone(),
+        )?);
         self.settings.get_mut().unwrap().source = Source::Live;
         Ok(self)
     }
 
-    /// Answers from a Live copy of `url`, with the scenario's edits in
-    /// Edited mode.
+    /// Why Live-Depth allows `url` this session, if it does.
+    pub fn allowed(&self, url: &str) -> Option<Allowed> {
+        self.depth.as_ref()?.allowed(url)
+    }
+
+    /// The real web the active source answers from: Live-Depth's copies,
+    /// or the copies Live and Edited make when asked.
+    fn real_web(&self) -> &Arc<Live> {
+        match self.source() {
+            Source::LiveDepth => self.depth.as_ref(),
+            _ => self.live.as_ref(),
+        }
+        .expect("a Live source")
+    }
+
+    /// The copies a page served from `source` was drawn from.
+    pub(super) fn copies_of(&self, source: &crate::observation::PageSource) -> Option<&Arc<Live>> {
+        match source {
+            crate::observation::PageSource::Live | crate::observation::PageSource::Edited => {
+                self.live.as_ref()
+            }
+            crate::observation::PageSource::LiveDepth => self.depth.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// Answers from a copy of `url` made by the active real-web source,
+    /// with the scenario's edits in Edited mode.
     pub(super) async fn live_url(
         &self,
         cx: &Cx,
@@ -506,14 +739,15 @@ impl Pages {
         user_agent: Option<&http::HeaderValue>,
         page: Option<url::Url>,
     ) -> Response {
-        let live = self.live.as_ref().expect("a Live source");
-        match live
+        match self
+            .real_web()
             .response(cx, url, capture::Resource::Document, user_agent, page)
             .await
         {
             Ok(response) if self.source() == Source::Edited => self.edited(cx, url, response).await,
             Ok(response) => copied::replay(Ok(Some(response))),
-            Err(error) => Response::new(
+            Err(Unanswered::Unlisted) => Response::unlisted(),
+            Err(Unanswered::Failed(error)) => Response::new(
                 502,
                 "text/plain; charset=utf-8",
                 "Bad Gateway\n",
@@ -578,10 +812,6 @@ impl Pages {
         start: u64,
         domains: &fictionet_extras::models::tools::Domains,
     ) -> Result<search::Search, String> {
-        self.live
-            .as_ref()
-            .expect("a Live source")
-            .search(cx, query, start, domains)
-            .await
+        self.real_web().search(cx, query, start, domains).await
     }
 }

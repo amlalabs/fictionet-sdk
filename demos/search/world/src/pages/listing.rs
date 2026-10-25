@@ -80,7 +80,7 @@ impl Pages {
                 search: self.copied_listing(query, start, domains)?,
                 edits: Vec::new(),
             }),
-            Source::Live => Ok(Found {
+            Source::Live | Source::LiveDepth => Ok(Found {
                 search: self.live_listing(cx, query, start, domains).await?,
                 edits: Vec::new(),
             }),

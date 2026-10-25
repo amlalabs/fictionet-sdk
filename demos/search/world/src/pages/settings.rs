@@ -6,31 +6,20 @@ use super::*;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum Command {
-    /// Answer new requests from `source`.
-    SetSource {
-        source: Source,
-        expected_revision: u64,
-    },
     /// Edit pages for `scenario` from now on; an empty one leaves pages as
     /// they are.
     SetScenario {
         scenario: String,
         expected_revision: u64,
     },
-    /// Forget the pages copied and the edits made.
-    Restart { expected_revision: u64 },
 }
 
 impl Command {
     fn expected_revision(&self) -> u64 {
         match self {
-            Self::SetSource {
+            Self::SetScenario {
                 expected_revision, ..
-            }
-            | Self::SetScenario {
-                expected_revision, ..
-            }
-            | Self::Restart { expected_revision } => *expected_revision,
+            } => *expected_revision,
         }
     }
 }
@@ -61,9 +50,11 @@ impl Pages {
             settings: Mutex::new(Settings {
                 source,
                 revision: 0,
+                lag: None,
             }),
             copied: None,
             live: None,
+            depth: None,
             editor: None,
             fetcher: Default::default(),
             written: None,
@@ -93,7 +84,7 @@ impl Pages {
         &self.seed
     }
 
-    /// What answers new requests.
+    /// What answers requests.
     pub fn source(&self) -> Source {
         self.settings.lock().unwrap().source
     }
@@ -103,7 +94,7 @@ impl Pages {
         self.settings.lock().unwrap().revision
     }
 
-    /// Whether the host has a search key for Live.
+    /// Whether the host has a search key for Live and Live-Depth.
     pub fn live_available(&self) -> bool {
         self.live.is_some()
     }
@@ -124,6 +115,44 @@ impl Pages {
         Some(self.editor.as_ref()?.changes())
     }
 
+    /// Why this world cannot answer from `source`, if it cannot.
+    pub fn unavailable(&self, source: Source) -> Option<&'static str> {
+        match source {
+            Source::Copied if self.copied.is_none() => Some("This world has no copied pages"),
+            Source::Live | Source::LiveDepth | Source::Edited if self.live.is_none() => {
+                Some("Live pages need EXA_API_KEY on the host")
+            }
+            Source::Edited if self.editor.is_none() => {
+                Some("Edited pages need a model key on the host")
+            }
+            _ => None,
+        }
+    }
+
+    /// Starts a session that answers from `source`, in the world `fcx`:
+    /// nothing a previous session copied, allowed, fetched or edited
+    /// carries over. A scenario stays, with the account already written
+    /// for it.
+    pub fn start_session(&self, fcx: &Cx, source: Source) -> Result<(), Rejected> {
+        if let Some(message) = self.unavailable(source) {
+            return Err(Rejected::Invalid {
+                message: message.into(),
+            });
+        }
+        let mut settings = self.settings.lock().unwrap();
+        for live in self.live.iter().chain(&self.depth) {
+            live.restart();
+        }
+        if let Some(editor) = &self.editor {
+            editor.new_session(fcx);
+        }
+        self.forget_packages();
+        settings.lag = Some(self.measure_lag());
+        settings.source = source;
+        settings.revision += 1;
+        Ok(())
+    }
+
     /// Applies a command against the current revision; every accepted
     /// command advances it.
     pub fn apply(&self, fcx: &Cx, command: Command) -> Result<Applied, Rejected> {
@@ -133,44 +162,15 @@ impl Pages {
                 current: settings.revision,
             });
         }
-        let invalid = |message: &str| Rejected::Invalid {
-            message: message.into(),
-        };
         match command {
-            Command::SetSource { source, .. } => {
-                match source {
-                    Source::Copied if self.copied.is_none() => {
-                        return Err(invalid("This world has no copied pages"));
-                    }
-                    Source::Live | Source::Edited if self.live.is_none() => {
-                        return Err(invalid("Live pages need EXA_API_KEY on the host"));
-                    }
-                    Source::Edited if self.editor.is_none() => {
-                        return Err(invalid("Edited pages need a model key on the host"));
-                    }
-                    _ => {}
-                }
-                if let Some(live) = &self.live
-                    && source.is_live() != settings.source.is_live()
-                {
-                    live.revoke(source.is_live());
-                }
-                settings.source = source;
-            }
             Command::SetScenario { scenario, .. } => {
                 let Some(editor) = &self.editor else {
-                    return Err(invalid("Edited pages need a model key on the host"));
+                    return Err(Rejected::Invalid {
+                        message: "Edited pages need a model key on the host".into(),
+                    });
                 };
                 let scenario = text::normalize_space(&scenario);
                 editor.set_scenario(fcx, (!scenario.is_empty()).then_some(scenario));
-            }
-            Command::Restart { .. } => {
-                if let Some(live) = &self.live {
-                    live.restart();
-                }
-                if let Some(editor) = &self.editor {
-                    editor.restart(fcx);
-                }
             }
         }
         settings.revision += 1;

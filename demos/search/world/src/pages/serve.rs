@@ -47,7 +47,9 @@ impl Pages {
         }
         match self.source() {
             Source::Copied => self.copied_url(url),
-            Source::Live | Source::Edited => self.live_url(cx, url, user_agent, page).await,
+            Source::Live | Source::LiveDepth | Source::Edited => {
+                self.live_url(cx, url, user_agent, page).await
+            }
         }
     }
 
@@ -83,17 +85,15 @@ impl Pages {
     /// Waits for a file of a page served from `source` that the world is
     /// still copying, so [`held_resource`](Self::held_resource) finds it.
     pub async fn settled(&self, source: &crate::observation::PageSource, url: &str) {
-        if source.is_live()
-            && let Some(live) = &self.live
-        {
+        if let Some(live) = self.copies_of(source) {
             live.settled(url).await;
         }
     }
 
     /// Copies a file the host's picture of `page`, served from `source`,
     /// asks for and the world does not hold yet: an image coming into
-    /// view. Only a live page's files are copied; the copied web holds all
-    /// it has.
+    /// view. A Live or Edited page's files are copied, and a Live-Depth
+    /// page's files it allows; the copied web holds all it has.
     pub async fn copy_for_picture(
         &self,
         cx: &Cx,
@@ -103,9 +103,8 @@ impl Pages {
     ) {
         let web = url::Url::parse(url).is_ok_and(|url| matches!(url.scheme(), "http" | "https"));
         if web
-            && source.is_live()
-            && let Some(live) = &self.live
-            && let Err(error) = live
+            && let Some(live) = self.copies_of(source)
+            && let Err(live::Unanswered::Failed(error)) = live
                 .response(
                     cx,
                     url,
@@ -155,10 +154,9 @@ impl Pages {
                 body: body.into(),
             });
         }
-        let response = if source.is_live() {
-            self.live.as_ref()?.held(url)?
-        } else {
-            self.copied.as_ref()?.response(url).ok()??
+        let response = match self.copies_of(source) {
+            Some(live) => live.held(url)?,
+            None => self.copied.as_ref()?.response(url).ok()??,
         };
         (response.status == http::StatusCode::OK).then_some(())?;
         Some(HeldResource {

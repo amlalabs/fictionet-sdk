@@ -1,5 +1,6 @@
-//! The world's pages: copied captures, live copies of the real web, and
-//! live copies edited for a scenario share one response path. Each search
+//! The world's pages: copied captures, live copies of the real web, live
+//! copies within links of each search, and live copies edited for a
+//! scenario share one response path. Each search
 //! engine renders the active source's results in its own format. The
 //! standalone `web-world` serves the [`written`] web instead.
 
@@ -18,6 +19,7 @@ pub mod written;
 
 pub use copied::PageBody;
 pub use edit::{Edit, Readiness, Scenario};
+pub use live::Allowed;
 pub use seed::Seed;
 pub use serve::HeldResource;
 pub use settings::{Applied, Command, Rejected};
@@ -38,12 +40,18 @@ pub enum Source {
     Copied,
     /// The real web, copied from the host when asked for, with real search.
     Live,
+    /// The real web within five links of the search results: copied when
+    /// asked for, as Live copies, only if a search listed the address or a
+    /// page the guest opened links to it or uses it, within five links of
+    /// a result. Nothing else exists.
+    LiveDepth,
     /// The real web as Live serves it, with the scenario's edits.
     Edited,
 }
 
 impl Source {
-    /// Whether pages come from the real web.
+    /// Whether any page the guest asks for is copied from the real web
+    /// when asked for.
     pub fn is_live(self) -> bool {
         matches!(self, Self::Live | Self::Edited)
     }
@@ -64,6 +72,9 @@ pub enum Meta {
     Document { title: String },
     /// No page at this address.
     Missing,
+    /// Live-Depth does not allow this address, so the world answered as a
+    /// site with no such page, without fetching it.
+    Unlisted,
     /// The page could not be copied. The diagnostic says why.
     Error { error: String },
 }
@@ -141,12 +152,24 @@ impl Response {
             Meta::Missing,
         )
     }
+
+    /// What a site with no page at an address answers: Live-Depth's
+    /// answer for an address it does not allow.
+    fn unlisted() -> Self {
+        Self {
+            meta: Meta::Unlisted,
+            ..Self::not_found()
+        }
+    }
 }
 
 /// The source in use and its revision, which every accepted command advances.
 struct Settings {
     source: Source,
     revision: u64,
+    /// Copied's lag behind the host's clock, fixed when a session starts;
+    /// `None` before the first session.
+    lag: Option<Option<std::time::Duration>>,
 }
 
 /// The world's pages: its seed, its copied web, the live web and the editor.
@@ -157,6 +180,8 @@ pub struct Pages {
     settings: Mutex<Settings>,
     copied: Option<Arc<copied::Corpus>>,
     live: Option<Arc<live::Live>>,
+    /// Live-Depth's copies of the addresses it allows.
+    depth: Option<Arc<live::Live>>,
     editor: Option<Arc<edit::Editor>>,
     /// Single requests from the host: package files the copied web lacks.
     fetcher: live::Fetcher,

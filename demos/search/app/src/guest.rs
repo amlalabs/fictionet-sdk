@@ -12,41 +12,19 @@ fn browser_shows_page() -> String {
     )
 }
 
-/// Keeps the workstation's clock on the world's day: while copied pages
-/// answer, the day they were copied (`lag` behind the host's), so pages
-/// and clock agree; otherwise the host's own time. Returns at once.
-pub fn follow_world_day(
-    ssh: std::sync::Arc<kit::ssh::Session>,
-    mut world: tokio::sync::watch::Receiver<fictionet_search_demo::page::WorldState>,
-    lag: Option<std::time::Duration>,
-) {
-    let Some(lag) = lag else {
-        return;
-    };
-    tokio::spawn(async move {
-        // The workstation boots on the host's clock.
-        let mut behind = false;
-        loop {
-            let copied = matches!(
-                world.borrow_and_update().source,
-                web_world::pages::Source::Copied
-            );
-            if copied != behind {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default();
-                let at = if copied { now.saturating_sub(lag) } else { now };
-                match ssh.run(&format!("sudo date -u -s @{}", at.as_secs())).await {
-                    Ok(output) if output.code == 0 => behind = copied,
-                    Ok(output) => eprintln!("The workstation clock was not set: {}", output.stderr),
-                    Err(error) => eprintln!("The workstation clock was not set: {error}"),
-                }
-            }
-            if world.changed().await.is_err() {
-                return;
-            }
-        }
-    });
+/// Sets the workstation's clock `lag` behind the host's, to the day the
+/// copied pages were copied, so a Copied session's pages and clock agree.
+/// The workstation boots on the host's clock.
+pub async fn set_clock_back(ssh: &kit::ssh::Session, lag: std::time::Duration) {
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .saturating_sub(lag);
+    match ssh.run(&format!("sudo date -u -s @{}", at.as_secs())).await {
+        Ok(output) if output.code == 0 => {}
+        Ok(output) => eprintln!("The workstation clock was not set: {}", output.stderr),
+        Err(error) => eprintln!("The workstation clock was not set: {error}"),
+    }
 }
 
 /// The workstation inherits the host clock from the hypervisor.
