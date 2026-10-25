@@ -5,12 +5,13 @@
 //! An HTML page's text is what a browser shows, with the page's summaries
 //! in `<meta>` tags (readers see them in search results and link
 //! previews) and the strings in its scripts' data, which a reader of the
-//! page's source sees. JSON is read as its string values, each under the
-//! keys that hold it; plain text line by line; XML and feeds as the text
-//! of their elements.
+//! page's source sees. JSON is read as its values (strings, numbers,
+//! `true` and `false`), each under the keys that hold it; plain text,
+//! Markdown and wikitext line by line; XML and feeds as the text of their
+//! elements.
 
 use super::Edit;
-use super::literal::{self, Code, Literal};
+use super::literal::{self, BARE, Code, Literal, Reading};
 use std::collections::HashMap;
 use std::ops::Range;
 use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
@@ -83,6 +84,10 @@ const SUMMARIES: [&str; 5] = [
     "twitter:description",
 ];
 
+/// A passage of at least this many words is one fact wherever a document
+/// shows it.
+const DISTINCTIVE_WORDS: usize = 5;
+
 /// A line repeated with at least this many words is one text shown twice
 /// (a page's data holding the paragraph it shows, say): it is read once and
 /// edited the same way everywhere.
@@ -120,7 +125,10 @@ impl Format {
             (_, subtype) if subtype.ends_with("+json") => Self::Json,
             ("text", "xml") | ("application", "xml") => Self::Xml,
             ("application", subtype) if subtype.ends_with("+xml") => Self::Xml,
-            ("text", "plain" | "markdown" | "x-markdown" | "csv" | "x-rst") => Self::Text,
+            (
+                "text",
+                "plain" | "markdown" | "x-markdown" | "csv" | "x-rst" | "x-wiki" | "x-mediawiki",
+            ) => Self::Text,
             _ => return None,
         })
     }
@@ -184,7 +192,8 @@ pub(super) struct Section {
 
 /// An edit to make, and the characters of the text it was asked about.
 /// It is made in every place its passage appears in `within`, or anywhere
-/// in the text when its passage is not in `within`.
+/// in the text when its passage is not in `within` or is
+/// [`distinctive`].
 pub(super) struct Scoped<'e> {
     pub edit: &'e Edit,
     pub within: Range<usize>,
@@ -284,7 +293,7 @@ impl<'a> Document<'a> {
     /// Reads JSON as its string values, one per line under its keys.
     fn json(source: &'a str) -> Self {
         let mut reader = Reader::default();
-        for value in literal::values(source, 0..source.len(), Code::Json) {
+        for value in literal::values(source, 0..source.len(), Code::Json, Reading::Scalars) {
             if readable(&value, Code::Json) {
                 reader.literal(&value, Holder::Data);
             }
@@ -454,7 +463,11 @@ impl<'a> Document<'a> {
                 })
                 .cloned()
                 .collect();
-            let found = if within.is_empty() { found } else { within };
+            let found = if within.is_empty() || distinctive(&edit.passage) {
+                found
+            } else {
+                within
+            };
             let pieces = found
                 .into_iter()
                 .flat_map(|place| self.lines_of(place, &replacement));
@@ -572,6 +585,7 @@ impl<'a> Document<'a> {
     fn written(&self, replacement: &str, field: Option<Field>) -> String {
         match field {
             Some(Field::Summary) => crate::pages::text::escape(replacement),
+            Some(Field::Literal { quote: BARE, .. }) => bare(replacement),
             Some(Field::Literal { quote, holder }) => {
                 let escaped = literal::escaped(replacement, quote, holder == Holder::Script);
                 match holder {
@@ -738,6 +752,27 @@ impl<'a> Document<'a> {
         }
         runs
     }
+}
+
+/// `replacement` written where a bare value of data (a number, `true` or
+/// `false`) was: as it is when it is one too, and as a string otherwise.
+fn bare(replacement: &str) -> String {
+    let scalar = matches!(replacement.trim(), "true" | "false")
+        || serde_json::from_str::<serde_json::Number>(replacement.trim()).is_ok();
+    if scalar {
+        replacement.trim().to_owned()
+    } else {
+        serde_json::Value::String(replacement.to_owned()).to_string()
+    }
+}
+
+/// Whether `passage` names one fact wherever it appears in a document: a
+/// passage over several lines (a table's row, cell by cell) or a long run
+/// of words. Such a passage is the same fact shown twice, as a table
+/// repeated for small screens is, and is edited everywhere it appears; a
+/// shorter one only in the part it was asked about.
+fn distinctive(passage: &str) -> bool {
+    passage.trim().contains('\n') || passage.split_whitespace().count() >= DISTINCTIVE_WORDS
 }
 
 /// Whether `line` is long enough that a repeat of it is the same text.
@@ -969,7 +1004,7 @@ impl Reader {
             Some(kind) if kind.ends_with("json") => Code::Json,
             Some(_) => return after,
         };
-        for value in literal::values(source, end..content_end, code) {
+        for value in literal::values(source, end..content_end, code, Reading::Strings) {
             if readable(&value, Code::Script) {
                 self.literal(&value, Holder::Script);
             }
@@ -1007,7 +1042,7 @@ impl Reader {
                 byte += length;
             }
             starts.resize(decoded.len() + 1, value.end);
-            for found in literal::values(&decoded, 0..decoded.len(), Code::Json) {
+            for found in literal::values(&decoded, 0..decoded.len(), Code::Json, Reading::Strings) {
                 let value = Literal {
                     content: starts[found.content.start]..starts[found.content.end],
                     quote: found.quote,
