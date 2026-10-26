@@ -12,24 +12,8 @@ pub fn build(
     claude_token: Option<fictionet_extras::models::Credential>,
 ) -> fictionet::Result<fictionet::stdlib::world::net::Net> {
     use fictionet::stdlib::web::Site;
-    world.pages.report(
-        cx,
-        SearchObs::RunStarted {
-            started_at_ms: world
-                .start
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_millis() as u64
-                - cx.now().since_start().as_millis() as u64,
-        },
-    );
     use fictionet_extras::models::{Model, Provider};
-    world.pages.report(
-        cx,
-        SearchObs::Signin {
-            open: false,
-            exceptions: vec![],
-        },
-    );
+    report_run(&world.pages, cx)?;
     let models = [Provider::Anthropic]
         .into_iter()
         .map(|provider| {
@@ -71,6 +55,26 @@ pub fn build(
         }
         None
     }))
+}
+
+/// Starts a new run in the world `cx`: the page and the run record show
+/// only what happens from here.
+pub fn report_run(pages: &web_world::pages::Pages, cx: &Cx) -> fictionet::Result {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+    pages.report(
+        cx,
+        SearchObs::RunStarted {
+            started_at_ms: now.saturating_sub(cx.now().since_start()).as_millis() as u64,
+        },
+    );
+    pages.report(
+        cx,
+        SearchObs::Signin {
+            open: false,
+            exceptions: vec![],
+        },
+    );
+    Ok(())
 }
 
 use fictionet::stdlib::web::{Body, httpd};
