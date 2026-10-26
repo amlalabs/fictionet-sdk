@@ -213,7 +213,13 @@ impl Model {
                     "model": model,
                     "max_tokens": OUTPUT_CEILING,
                     "messages": messages,
-                    "reasoning": {"enabled": care == Care::Careful},
+                    // OpenRouter's Claude 5.5 endpoints always think, so
+                    // a quick question asks them to think briefly.
+                    "reasoning": if care == Care::Careful {
+                        json!({"enabled": true})
+                    } else {
+                        json!({"effort": "low"})
+                    },
                     // The fastest provider that serves the model, not the cheapest.
                     "provider": {"sort": "throughput"},
                     "response_format": {"type": "json_schema", "json_schema": {"name": "answer", "strict": true, "schema": schema}},
