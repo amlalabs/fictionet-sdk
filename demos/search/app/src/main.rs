@@ -107,6 +107,7 @@ async fn main() -> Result {
     // world that starts empty, and runs until another mode is chosen.
     let result = loop {
         let source = *chosen.borrow_and_update();
+        let copied_lag = pages.measure_lag();
         page.begin_session(&pages, source);
         println!("Starting a {source:?} session");
         let log = Arc::new(Log::new(Box::new(std::io::sink()), &[], |s| s));
@@ -123,6 +124,11 @@ async fn main() -> Result {
             "search",
             vec![guest::guest(
                 claude_token.as_ref().map(|token| token.placeholder()),
+                if source == Source::Copied {
+                    copied_lag.unwrap_or_default()
+                } else {
+                    std::time::Duration::ZERO
+                },
             )],
             downloads.clone(),
             move |consoles| {
@@ -132,9 +138,9 @@ async fn main() -> Result {
                 let start = std::time::SystemTime::now();
                 // Copied mode sets the workstation's clock back to the day
                 // its pages were copied; certificates hold from then too.
-                let earliest = start - world_pages.copied_lag().unwrap_or_default();
+                let earliest = start - copied_lag.unwrap_or_default();
                 world_pages
-                    .start_session(&cx, source)
+                    .start_session(&cx, source, copied_lag)
                     .map_err(|error| fictionet::Error::msg(format!("{error:?}")))?;
                 world_page.attach_world(&cx, world_pages.clone());
                 let web = World {
@@ -159,13 +165,6 @@ async fn main() -> Result {
         let failure = match run {
             Err(error) => error,
             Ok(run) => {
-                // The terminal and screen open on the session's clock.
-                let ssh = run.guest(guest::HOST).ssh().clone();
-                if source == Source::Copied
-                    && let Some(lag) = pages.copied_lag()
-                {
-                    guest::set_clock_back(&ssh, lag).await;
-                }
                 if let Some(console) = console_slot.lock().unwrap().take() {
                     page.attach_console(&pages, console);
                 }

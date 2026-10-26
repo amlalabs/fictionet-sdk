@@ -42,6 +42,13 @@ impl Recipe {
 pub(super) fn seed<P: Software>(provision: &Provision<'_, P>) -> io::Result<Vec<u8>> {
     let guest = provision.guest;
     let mut script = String::from("set -eu\n");
+    if !guest.clock_lag.is_zero() {
+        script.push_str(&format!(
+            "clock=$(date -u --date '{}.{:09} seconds ago' +%s.%N)\ndate -u --set \"@$clock\" >/dev/null\n",
+            guest.clock_lag.as_secs(),
+            guest.clock_lag.subsec_nanos(),
+        ));
+    }
     script.push_str(&format!("hostname {}\n", ssh::quote(&guest.hostname)));
     write_file(
         &mut script,

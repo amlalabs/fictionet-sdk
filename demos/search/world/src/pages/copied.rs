@@ -564,8 +564,8 @@ impl Pages {
         self.measure_lag()
     }
 
-    /// [`copied_lag`](Self::copied_lag) as it is now.
-    pub(super) fn measure_lag(&self) -> Option<std::time::Duration> {
+    /// Measures the lag for the next session, independent of the current one.
+    pub fn measure_lag(&self) -> Option<std::time::Duration> {
         let days = (time::OffsetDateTime::now_utc() - self.copied.as_ref()?.newest()?).whole_days();
         (days > 0).then(|| std::time::Duration::from_secs(days as u64 * 86_400))
     }
