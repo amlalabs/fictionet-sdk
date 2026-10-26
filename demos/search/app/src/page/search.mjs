@@ -20,7 +20,9 @@ const svgNode = (tag, attributes = {}) => {
 const stamp = (ms) => new Date((shown.started_at_ms || Date.now()) + ms).toLocaleTimeString([], { hour12: false, timeZone: 'UTC' });
 const size = (bytes) => bytes < 1000 ? `${bytes} B` : `${Math.round(bytes / 1000)} KB`;
 const quantity = (n, word, plural = `${word}s`) => `${n} ${n === 1 ? word : plural}`;
-const sourceName = (source) => source.kind === 'copy' ? source.captured ? `Copied ${source.captured.slice(0, 10)}` : 'Copied' : ({ live_depth: 'Live-Depth', edited: 'Edited', package: 'Package' })[source.kind] || 'Live';
+// Each page source's label, one per PageSource variant.
+const SOURCES = { copy: (source) => source.captured ? `Copied ${source.captured.slice(0, 10)}` : 'Copied', live: () => 'Live', live_depth: () => 'Live-Depth', edited: () => 'Edited', package: () => 'Package' };
+const sourceName = (source) => SOURCES[source.kind](source);
 const changes = (edits) => edits?.length ? quantity(edits.length, 'change') : null;
 const hostName = (name) => name.replace(/\.$/, '');
 const hostOf = (url) => { try { return new URL(url).host; } catch { return url; } };
@@ -63,7 +65,8 @@ function localSites() {
   return shown.sites.filter((site) => !upstream.has(site.host));
 }
 const purposeName = (purpose) => ({ model: 'Model', editor: 'Editor', account: 'Sign-in', live_search: 'Search', live_capture: 'Page copy', live_depth: 'Allowed page', package: 'Package' })[purpose];
-const phaseName = (phase) => ({ connecting: 'Connecting', receiving: 'Receiving', streaming: 'Streaming', complete: 'Complete', interrupted: 'Interrupted', attempt: 'Connecting', response: 'Received', failed: 'Failed' })[phase];
+const callPhaseName = (phase) => ({ connecting: 'Connecting', receiving: 'Receiving', streaming: 'Streaming', complete: 'Complete', interrupted: 'Interrupted' })[phase];
+const egressPhaseName = (phase) => ({ attempt: 'Connecting', response: 'Received', failed: 'Failed', cancelled: 'Cancelled' })[phase];
 
 // The network map is built once; each state only changes its text, its
 // destinations and, when the layout moves, its wires. Each internet host
@@ -575,7 +578,7 @@ function details() {
       const content = element('details'); content.dataset.key = String(call.call);
       content.open = expanded.has(content.dataset.key) || call.tools.length > 0 || !['complete', 'interrupted'].includes(call.phase);
       const summary = element('summary');
-      summary.append(element('div', `${call.host} · ${call.method} ${call.path}`, 'label'), element('div', phaseName(call.phase), 'meta'));
+      summary.append(element('div', `${call.host} · ${call.method} ${call.path}`, 'label'), element('div', callPhaseName(call.phase), 'meta'));
       content.append(summary);
       for (const tool of call.tools) {
         content.append(element('p', tool.tool === 'fetch' ? 'Fetch' : 'Web search', 'meta'), element('p', tool.target, 'tool-query'));
@@ -636,9 +639,9 @@ function details() {
         content.dataset.key = `files:${row.fact.path}`;
         content.open = expanded.has(content.dataset.key);
         content.append(element('summary', quantity(own.length, 'file')));
-        for (const file of own) content.append(element('div', `${file.fact.path.replace(/^https?:\/\//, '')} · ${file.fact.status || phaseName(file.fact.phase)}`, 'asset-row'));
+        for (const file of own) content.append(element('div', `${file.fact.path.replace(/^https?:\/\//, '')} · ${file.fact.status || egressPhaseName(file.fact.phase)}`, 'asset-row'));
       }
-      body.append(detailRow(row.at_ms, row.fact.path, `${row.fact.method} · ${row.fact.status || phaseName(row.fact.phase)}`, content));
+      body.append(detailRow(row.at_ms, row.fact.path, `${row.fact.method} · ${row.fact.status || egressPhaseName(row.fact.phase)}`, content));
     }
     if (!body.childElementCount) body.append(element('p', 'No requests', 'detail-empty'));
   } else if (['egress', 'signin'].includes(selection) || selection.startsWith('egress:')) {
@@ -656,7 +659,7 @@ function details() {
       }
     }
     for (const connection of connections.filter((connection) => !egress.some((row) => row.fact.host === connection.host && row.fact.purpose === connection.purpose))) body.append(detailRow(connection.at_ms, connection.host, purposeName(connection.purpose)));
-    for (const row of egress) body.append(detailRow(row.at_ms, row.fact.host, `${purposeName(row.fact.purpose)} · ${row.fact.method} ${row.fact.path} · ${row.fact.status || phaseName(row.fact.phase)}`));
+    for (const row of egress) body.append(detailRow(row.at_ms, row.fact.host, `${purposeName(row.fact.purpose)} · ${row.fact.method} ${row.fact.path} · ${row.fact.status || egressPhaseName(row.fact.phase)}`));
     if (!connections.length && !egress.length) body.append(element('p', 'No connections', 'detail-empty'));
   } else if (selection === 'search') {
     heading('Search');
@@ -728,7 +731,7 @@ function details() {
         shownRow = detailRow(row.at_ms, `Looked up ${hostName(fact.name)}`, fact.address || 'No address');
         if (!fact.address) shownRow.classList.add('failed');
       } else if (fact.kind === 'model_call') {
-        shownRow = detailRow(row.at_ms, `Called ${fact.host}`, [`${fact.method} ${fact.path}`, fact.status, phaseName(fact.phase)].filter(Boolean).join(' · '));
+        shownRow = detailRow(row.at_ms, `Called ${fact.host}`, [`${fact.method} ${fact.path}`, fact.status, callPhaseName(fact.phase)].filter(Boolean).join(' · '));
         if (fact.phase === 'interrupted' || fact.status >= 400) shownRow.classList.add('failed');
       }
       if (shownRow) body.append(shownRow);
@@ -828,7 +831,8 @@ async function command(command) {
 }
 for (const control of $('source').querySelectorAll('button')) {
   control.onclick = async () => {
-    if (control.getAttribute('aria-pressed') === 'true') return;
+    // A failed session's mode can be chosen again.
+    if (control.getAttribute('aria-pressed') === 'true' && world?.session !== 'failed') return;
     for (const control of $('source').querySelectorAll('button')) control.disabled = true;
     try { await command({ command: 'set_source', source: control.dataset.source }); }
     catch (error) { notice(error.message); }
@@ -851,7 +855,7 @@ function consoleStatus() {
   const starting = world?.session === 'starting';
   const kind = activeConsole, ready = !starting && hostStatus && (kind === 'screen' ? hostStatus.screen : hostStatus.terminal);
   $('console-status').hidden = !!ready;
-  $('console-status').textContent = starting ? `Starting ${MODES[world.source]} session…` : hostStatus?.state === 'failed' ? 'The workstation failed to start. See the process output.' : hostStatus?.state === 'stopped' ? 'The workstation has stopped.' : 'Starting the workstation…';
+  $('console-status').textContent = starting ? `Starting ${MODES[world.source]} session…` : world?.session === 'failed' || hostStatus?.state === 'failed' ? 'The workstation failed to start. See the process output.' : hostStatus?.state === 'stopped' ? 'The workstation has stopped.' : 'Starting the workstation…';
   if (starting) for (const console of consoles.values()) { console.component.dispose(); console.socket.close(); }
   if (starting) { consoles.clear(); $('terminal').replaceChildren(); $('screen').replaceChildren(); }
   return ready;

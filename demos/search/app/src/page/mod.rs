@@ -427,6 +427,9 @@ pub enum Session {
     Starting,
     /// The workstation's terminal and screen are the session's.
     Running,
+    /// The workstation failed to start; the next mode chosen starts
+    /// another session.
+    Failed,
 }
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -578,6 +581,22 @@ impl Page {
         }));
         let source = self.world.borrow().source;
         self.refresh(pages, source, Session::Running);
+    }
+    /// The session's workstation failed to start: its console and world
+    /// leave the page, and the modes can be chosen again.
+    pub fn fail_session(&self, pages: &Pages) {
+        if let Some(following) = self.following.lock().unwrap().take() {
+            following.abort();
+        }
+        self.console.lock().unwrap().take();
+        self.cx.lock().unwrap().take();
+        self.host.send_modify(|status| {
+            status.state = fictionet_demo::kit::page::HostState::Failed;
+            status.screen = false;
+            status.terminal = false;
+        });
+        let source = self.world.borrow().source;
+        self.refresh(pages, source, Session::Failed);
     }
     /// Writes a separate, private record of each session, a run of its
     /// own, before publishing each fact.

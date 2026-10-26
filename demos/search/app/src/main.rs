@@ -57,6 +57,8 @@ fn app_pages(
 enum Ended {
     /// A mode was chosen: the next session runs in it.
     Chosen,
+    /// The workstation never became ready.
+    Failed(std::io::Error),
     /// The app is stopping.
     Stopping,
 }
@@ -148,46 +150,69 @@ async fn main() -> Result {
             },
         );
         let run = tokio::select! {
-            run = boot => run?,
+            run = boot => run,
             _ = terminate.recv() => break Ok(()),
             _ = interrupt.recv() => break Ok(()),
             result = &mut observation_task => break Err(recording_error(result)),
         };
-        // The terminal and screen open on the session's clock.
-        let ssh = run.guest(guest::HOST).ssh().clone();
-        if source == Source::Copied
-            && let Some(lag) = pages.copied_lag()
-        {
-            guest::set_clock_back(&ssh, lag).await;
-        }
-        if let Some(console) = console_slot.lock().unwrap().take() {
-            page.attach_console(&pages, console);
-        }
-        let mut readiness = Box::pin(run.app_ready(guest::HOST));
-        let mut ready = false;
-        let ended = loop {
-            tokio::select! {
-                result = &mut readiness, if !ready => match result {
-                    Ok(()) => { ready = true; page.end_boot(); println!("The Search page stays open until Ctrl-C."); },
-                    Err(error) => break Err(error),
-                },
-                Ok(()) = chosen.changed() => break Ok(Ended::Chosen),
-                result = &mut observation_task => break Err(recording_error(result)),
-                _ = interrupt.recv() => break Ok(Ended::Stopping),
-                _ = terminate.recv() => break Ok(Ended::Stopping),
+        // A boot that fails has shut its own run down.
+        let failure = match run {
+            Err(error) => error,
+            Ok(run) => {
+                // The terminal and screen open on the session's clock.
+                let ssh = run.guest(guest::HOST).ssh().clone();
+                if source == Source::Copied
+                    && let Some(lag) = pages.copied_lag()
+                {
+                    guest::set_clock_back(&ssh, lag).await;
+                }
+                if let Some(console) = console_slot.lock().unwrap().take() {
+                    page.attach_console(&pages, console);
+                }
+                let mut readiness = Box::pin(run.app_ready(guest::HOST));
+                let mut ready = false;
+                let ended = loop {
+                    tokio::select! {
+                        result = &mut readiness, if !ready => match result {
+                            Ok(()) => { ready = true; page.end_boot(); println!("The Search page stays open until Ctrl-C."); },
+                            Err(error) => break Ok(Ended::Failed(error)),
+                        },
+                        Ok(()) = chosen.changed() => break Ok(Ended::Chosen),
+                        result = &mut observation_task => break Err(recording_error(result)),
+                        _ = interrupt.recv() => break Ok(Ended::Stopping),
+                        _ = terminate.recv() => break Ok(Ended::Stopping),
+                    }
+                };
+                drop(readiness);
+                if matches!(ended, Ok(Ended::Stopping) | Err(_))
+                    && let Some(server) = server.take()
+                {
+                    server.shutdown().await;
+                }
+                let shutdown = run.shutdown().await.and_then(|()| log.finish());
+                match (ended, shutdown) {
+                    (Ok(Ended::Chosen), Ok(())) => continue,
+                    (Ok(Ended::Stopping), shutdown) => break shutdown,
+                    (Err(error), _) => break Err(error),
+                    (Ok(Ended::Failed(error)), shutdown) => {
+                        if let Err(shutdown) = shutdown {
+                            println!("The {source:?} session did not shut down: {shutdown}");
+                        }
+                        error
+                    }
+                    (Ok(Ended::Chosen), Err(error)) => error,
+                }
             }
         };
-        drop(readiness);
-        if matches!(ended, Ok(Ended::Stopping) | Err(_))
-            && let Some(server) = server.take()
-        {
-            server.shutdown().await;
-        }
-        let shutdown = run.shutdown().await.and_then(|()| log.finish());
-        match (ended, shutdown) {
-            (Ok(Ended::Chosen), Ok(())) => continue,
-            (Ok(Ended::Stopping), shutdown) => break shutdown,
-            (Err(error), _) | (Ok(Ended::Chosen), Err(error)) => break Err(error),
+        // A failed session leaves the page up: the next mode chosen
+        // starts another.
+        println!("The {source:?} session failed: {failure}");
+        page.fail_session(&pages);
+        tokio::select! {
+            Ok(()) = chosen.changed() => {}
+            result = &mut observation_task => break Err(recording_error(result)),
+            _ = interrupt.recv() => break Ok(()),
+            _ = terminate.recv() => break Ok(()),
         }
     };
     if let Some(server) = server {
