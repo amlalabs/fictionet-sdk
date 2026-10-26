@@ -121,7 +121,7 @@ async fn main() -> Result {
         let copied_lag = pages.measure_lag();
         let lag = clock_lag(source, copied_lag);
         page.begin_session(&pages, source);
-        println!("Starting a {source:?} session");
+        println!("Starting the {source:?} session");
         let log = Arc::new(Log::new(Box::new(std::io::sink()), &[], |s| s));
         let console_slot = Arc::new(std::sync::Mutex::new(None));
         let console = console_slot.clone();
@@ -199,7 +199,7 @@ async fn main() -> Result {
                             }
                             source = next;
                             page.switch_session(&pages, source);
-                            println!("Switched to a {source:?} session on the running workstation");
+                            println!("Switched the running workstation to the {source:?} session");
                         }
                         result = &mut observation_task => break Err(recording_error(result)),
                         _ = interrupt.recv() => break Ok(Ended::Stopping),
