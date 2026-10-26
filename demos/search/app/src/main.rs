@@ -4,7 +4,6 @@ mod guest;
 use fictionet_search_demo::{network, page};
 
 use fictionet_demo::kit;
-use fictionet_extras::log::Log;
 use std::{path::PathBuf, sync::Arc, time::Instant};
 use web_world::{
     Addresses, Ca, World,
@@ -93,7 +92,7 @@ async fn main() -> Result {
     let pages = Arc::new(app_pages(seed.clone(), &downloads)?);
     let output = downloads.join("search");
     std::fs::create_dir_all(&output)?;
-    let (page, (observations, commands)) = page::Page::new(pages.clone(), false);
+    let (page, (observations, commands)) = page::Page::new(pages.clone());
     let server = page::serve(page.router(), kit::PAGE_PORT).await?;
     let _access = kit::PageAccess::new(&server.url)?;
     // Stopping frees the page's address first, so a restart comes back on it.
@@ -115,14 +114,12 @@ async fn main() -> Result {
         let lag = clock_lag(source, copied_lag);
         page.begin_session(&pages, source);
         println!("Starting the {source:?} session");
-        let log = Arc::new(Log::new(Box::new(std::io::sink()), &[], |s| s));
         let console_slot = Arc::new(std::sync::Mutex::new(None));
         let console = console_slot.clone();
         let cx_slot = Arc::new(std::sync::Mutex::new(None));
-        let (world_page, world_pages, world_log, world_token, world_seed, world_roots, world_cx) = (
+        let (world_page, world_pages, world_token, world_seed, world_roots, world_cx) = (
             page.clone(),
             pages.clone(),
-            log.clone(),
             claude_token.clone(),
             seed.clone(),
             roots.clone(),
@@ -147,12 +144,12 @@ async fn main() -> Result {
                 *world_cx.lock().unwrap() = Some(cx.clone());
                 let web = World {
                     ca: Arc::new(Ca::new(&cx, &world_roots, earliest, start)?),
-                    addresses: Arc::new(Addresses::new(world_seed.fixed_addresses(), None)?),
+                    addresses: Arc::new(Addresses::new(world_seed.fixed_addresses())),
                     pages: world_pages,
                     start,
                 };
-                let net = network::build(&web, &cx, world_log, world_token)?
-                    .route(kit::JUMP, kit::jump_prefix());
+                let net =
+                    network::build(&web, &cx, world_token)?.route(kit::JUMP, kit::jump_prefix());
                 net.start(&cx, run.into_attachments())
             },
         );
@@ -207,7 +204,7 @@ async fn main() -> Result {
                 {
                     server.shutdown().await;
                 }
-                let shutdown = run.shutdown().await.and_then(|()| log.finish());
+                let shutdown = run.shutdown().await;
                 match (ended, shutdown) {
                     (Ok(Ended::Chosen), Ok(())) => continue,
                     (Ok(Ended::Stopping), shutdown) => break shutdown,

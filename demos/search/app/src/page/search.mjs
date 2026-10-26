@@ -28,7 +28,7 @@ const hostName = (name) => name.replace(/\.$/, '');
 const hostOf = (url) => { try { return new URL(url).host; } catch { return url; } };
 const originOf = (url) => { try { return new URL(url).origin; } catch { return null; } };
 const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
-let shown = { at_ms: 0, sites: [], calls: [], activity: [], connections: [], egress: [], signin: null };
+let shown = { at_ms: 0, sites: [], calls: [], activity: [], connections: [], egress: [] };
 let selection = null, world = null;
 let noticeTimer, activeConsole = 'terminal', hostStatus = null;
 const consoles = new Map();
@@ -132,7 +132,7 @@ function graph() {
     sites: { detail: pages ? quantity(pages, 'page') : '', reached: sites.some((site) => site.requests.length) },
     calls: { detail: shown.calls.length ? quantity(shown.calls.length, 'call') : '', reached: shown.calls.length > 0 },
     editor: { detail: edits ? quantity(edits, 'call') : '', reached: edits > 0 },
-    signin: { detail: shown.signin?.fact.open ? 'Open' : 'Closed', reached: false },
+    signin: { detail: '', reached: false },
     router: { detail: refusedTo ? `No route to ${refusedTo}` : '', reached: !!refusedTo, refused: !!refusedTo },
   };
   for (const service of map.services.values()) {
@@ -648,16 +648,6 @@ function details() {
     const accepts = (row) => selection === 'signin' ? row.purpose === 'account' : selection.startsWith('egress:') ? row.host === selection.slice(7) : true;
     const connections = shown.connections.filter(accepts), egress = shown.egress.filter((row) => accepts(row.fact) && row.fact.phase !== 'attempt' && !row.fact.page);
     heading(selection === 'signin' ? 'Sign-in' : selection.startsWith('egress:') ? selection.slice(7) : 'Internet');
-    if (shown.signin && ['signin', 'egress'].includes(selection)) {
-      body.append(detailRow(shown.signin.at_ms, shown.signin.fact.open ? 'Sign-in open' : 'Sign-in closed', ''));
-      if (shown.signin.fact.exceptions.length) {
-        const exceptions = element('details', undefined, 'exceptions');
-        exceptions.open = true;
-        exceptions.append(element('summary', 'Exceptions'));
-        for (const exception of shown.signin.fact.exceptions) exceptions.append(element('p', exception, 'meta'));
-        body.append(exceptions);
-      }
-    }
     for (const connection of connections.filter((connection) => !egress.some((row) => row.fact.host === connection.host && row.fact.purpose === connection.purpose))) body.append(detailRow(connection.at_ms, connection.host, purposeName(connection.purpose)));
     for (const row of egress) body.append(detailRow(row.at_ms, row.fact.host, `${purposeName(row.fact.purpose)} · ${row.fact.method} ${row.fact.path} · ${row.fact.status || egressPhaseName(row.fact.phase)}`));
     if (!connections.length && !egress.length) body.append(element('p', 'No connections', 'detail-empty'));

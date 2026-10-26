@@ -1,6 +1,5 @@
 //! Request routing: searches, the engines' redirects, and pages.
 
-use crate::pages::text::normalize_space;
 use fictionet_extras::search::Engine;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -35,15 +34,6 @@ pub enum Route {
     },
     /// Fetch a page or asset.
     Page,
-}
-
-/// Normalizes search text and adds offsets of ten or more to the shared key.
-pub fn query_key(query: &str, start: u64) -> String {
-    let mut key = normalize_space(&query.to_lowercase());
-    if start >= 10 {
-        key.push_str(&format!(" (from {start})"));
-    }
-    key
 }
 
 /// A result offset: decimal digits after an optional `+`, saturating at

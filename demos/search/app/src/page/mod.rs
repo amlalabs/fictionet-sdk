@@ -95,7 +95,6 @@ pub struct View {
     pub activity: Vec<Observation>,
     pub connections: Vec<Connection>,
     pub egress: Vec<Observation>,
-    pub signin: Option<Observation>,
     /// How many addresses Live-Depth allows, once it allows any.
     pub allowed: Option<u64>,
 }
@@ -120,7 +119,7 @@ impl Boot {
     fn claims(&mut self, wall_ms: u64, fact: &SearchObs) -> bool {
         let booting = self.ended_at_ms.is_none_or(|ended| wall_ms < ended);
         match fact {
-            SearchObs::RunStarted { .. } | SearchObs::Signin { .. } => false,
+            SearchObs::RunStarted { .. } => false,
             SearchObs::Request {
                 scheme,
                 host,
@@ -161,7 +160,6 @@ impl Default for Views {
                 activity: Vec::new(),
                 connections: Vec::new(),
                 egress: Vec::new(),
-                signin: None,
                 allowed: None,
             },
             previews: HashMap::new(),
@@ -351,7 +349,6 @@ impl Views {
                 view.allowed = Some(*links);
                 return true;
             }
-            SearchObs::Signin { .. } => view.signin = Some(observation.clone()),
             SearchObs::NoRoute { .. }
             | SearchObs::Certificate { .. }
             | SearchObs::Abandoned { .. }
@@ -424,7 +421,6 @@ pub struct WorldState {
     pub date: String,
     /// What Edited changes on real pages.
     pub scenario: Option<Scenario>,
-    pub preview: bool,
 }
 /// Where the session is: each mode chosen starts a new one. The
 /// workstation boots afresh only when the mode's clock differs.
@@ -502,13 +498,13 @@ impl Page {
         self.world.subscribe()
     }
 
-    pub fn new(pages: Arc<Pages>, preview: bool) -> (Self, Receivers) {
+    pub fn new(pages: Arc<Pages>) -> (Self, Receivers) {
         let views = Views::default();
         let (snapshots, _) = watch::channel(views.current());
         let (observations, receive) = mpsc::unbounded_channel();
         pages.observe(observations);
         let (commands, control) = mpsc::unbounded_channel();
-        let world = world_state(&pages, preview, pages.source(), Session::Starting);
+        let world = world_state(&pages, pages.source(), Session::Starting);
         (
             Self {
                 views: Arc::new(Mutex::new(views)),
@@ -538,9 +534,7 @@ impl Page {
     }
     /// Shows the world's settings again, for the session in `source`.
     fn refresh(&self, pages: &Pages, source: Source, session: Session) {
-        let preview = self.world.borrow().preview;
-        self.world
-            .send_replace(world_state(pages, preview, source, session));
+        self.world.send_replace(world_state(pages, source, session));
     }
     /// A session in `source` is starting on a workstation booted for it:
     /// the previous workstation's console and status leave the page.
@@ -1062,7 +1056,7 @@ async fn open_console(
     };
     pieces::upgrade(upgrade, console, screen).await
 }
-fn world_state(pages: &Pages, preview: bool, source: Source, session: Session) -> WorldState {
+fn world_state(pages: &Pages, source: Source, session: Session) -> WorldState {
     let live = Availability::new(pages.live_available(), UnavailableReason::NoSearchKey);
     // A Copied session's day is the day its pages were copied.
     let lag = pages
@@ -1084,7 +1078,6 @@ fn world_state(pages: &Pages, preview: bool, source: Source, session: Session) -
         },
         date: (time::OffsetDateTime::now_utc() - lag).date().to_string(),
         scenario: pages.scenario(),
-        preview,
     }
 }
 

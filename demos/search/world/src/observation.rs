@@ -115,10 +115,6 @@ pub enum SearchObs {
         /// The mode that answered.
         source: PageSource,
     },
-    Signin {
-        open: bool,
-        exceptions: Vec<SigninException>,
-    },
     Egress {
         attempt: u64,
         #[serde(serialize_with = "display")]
@@ -214,17 +210,6 @@ impl std::str::FromStr for EgressHost {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         url::Host::parse(value).map(Self)
     }
-}
-
-/// Operational account endpoints; interactive setup and refresh stay host-owned.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-pub enum SigninException {
-    #[serde(rename = "GET api.anthropic.com/api/oauth/profile and /api/oauth/roles")]
-    ClaudeAccount,
-    #[serde(
-        rename = "GET chatgpt.com/backend-api/codex/models, /backend-api/wham/accounts/check and /backend-api/wham/usage"
-    )]
-    CodexAccount,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]

@@ -11,7 +11,6 @@
 //! model gateway and the provider sign-in relay.
 
 mod dns;
-mod files;
 pub mod handler;
 mod ntp;
 pub mod observation;
@@ -20,64 +19,18 @@ pub mod route;
 mod tls;
 
 use std::collections::{HashMap, HashSet};
-use std::io;
 use std::net::Ipv4Addr;
-use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 
 use fictionet::Cx;
 use fictionet::stdlib::services::tls::ServerConfig;
 use fictionet::stdlib::web;
-use serde::{Deserialize, Serialize};
 
-use fictionet_extras::log::Log;
-use files::{Appended, FileLock};
 use pages::Pages;
-
-/// The gateway, where `Sites` runs DNS (its default subnet is 10.0.0.0/24).
-pub const GATEWAY: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
 
 pub use dns::{Addresses, admit};
 pub use tls::Ca;
-
-/// The world's date at the start of the run: the seed's day (`YYYY-MM-DD`,
-/// UTC) at the host's time of day, so the clock reads like an ordinary day.
-pub fn world_start(date: &str) -> fictionet::Result<SystemTime> {
-    let bad = |why: String| {
-        fictionet::Error::msg(format!(
-            "the seed's date {date:?} is not a YYYY-MM-DD date: {why}"
-        ))
-    };
-    let parts: Vec<&str> = date.split('-').collect();
-    let [y, m, d] = parts[..] else {
-        return Err(bad("it does not have three parts".into()));
-    };
-    let number = |p: &str| p.parse::<u16>().map_err(|e| bad(e.to_string()));
-    let byte = |p: &str| u8::try_from(number(p)?).map_err(|e| bad(e.to_string()));
-    let month = time::Month::try_from(byte(m)?).map_err(|e| bad(e.to_string()))?;
-    let day = time::Date::from_calendar_date(number(y)? as i32, month, byte(d)?)
-        .map_err(|e| bad(e.to_string()))?;
-    let now = time::OffsetDateTime::now_utc();
-    Ok(day.with_time(now.time()).assume_utc().into())
-}
-
-/// Builds the network: a site for every name [`admit`] lets in, at its
-/// address from `addresses`, with a certificate from `ca` made at its first
-/// handshake, every request answered by `pages` and logged, and every
-/// response dated from `start`, the world's date at the start of the run.
-/// Returns at once; the network runs in `fcx`'s region.
-pub fn serve(
-    fcx: &Cx,
-    addresses: Arc<Addresses>,
-    ca: Arc<Ca>,
-    pages: Arc<Pages>,
-    log: Arc<Log>,
-    start: SystemTime,
-    attachments: fictionet::Attachments,
-) -> fictionet::Result {
-    net(fcx, addresses, ca, pages, log, start, |_| None).start(fcx, attachments)
-}
 
 /// Builds an unstarted network, giving the caller first choice of each name.
 /// Claimed names use assigned addresses and site events with their own TLS.
@@ -86,12 +39,10 @@ pub fn net(
     addresses: Arc<Addresses>,
     ca: Arc<Ca>,
     pages: Arc<Pages>,
-    log: Arc<Log>,
     start: SystemTime,
     forward: impl Fn(&str) -> Option<fictionet::stdlib::world::net::Host> + Send + Sync + 'static,
 ) -> fictionet::stdlib::world::net::Net {
     let handler = handler::Handler::new(fcx, pages.clone());
-    log.attach(fcx);
     let world = fcx.clone();
     let refused_pages = pages.clone();
     // Live hosts show the guest the real host's certificate failure: a
@@ -129,17 +80,9 @@ pub fn net(
             resolved(None);
             return None;
         }
-        let (addr, _) = match addresses.assign(host) {
-            Ok(Some(assigned)) => assigned,
-            Ok(None) => {
-                resolved(None);
-                return None;
-            }
-            Err(error) => {
-                resolved(None);
-                log.fail(format!("cannot record the address: {error}"));
-                return None;
-            }
+        let Some((addr, _)) = addresses.assign(host) else {
+            resolved(None);
+            return None;
         };
         resolved(Some(addr.into()));
         if let Some(site) = forwarded {
@@ -240,7 +183,6 @@ impl World {
     pub fn net(
         &self,
         fcx: &Cx,
-        log: Arc<Log>,
         forward: impl Fn(&str) -> Option<fictionet::stdlib::world::net::Host> + Send + Sync + 'static,
     ) -> fictionet::stdlib::world::net::Net {
         net(
@@ -248,7 +190,6 @@ impl World {
             self.addresses.clone(),
             self.ca.clone(),
             self.pages.clone(),
-            log,
             self.start,
             forward,
         )

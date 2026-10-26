@@ -181,8 +181,7 @@ The gateway restricts operational account, catalog and usage reads to specific
 provider paths and methods; these exceptions are policy, not evidence that a
 request occurred.
 
-The world's observations report sign-in policy and upstream attempts, responses
-and failures. An attempt means the request entered the host transport, not that
+The world's observations report upstream attempts, responses and failures. An attempt means the request entered the host transport, not that
 a connection succeeded. Model gateway and editor requests share this
 observed provider transport. Local startup responses and rejected requests do
 not produce an upstream attempt. Live's host search and capture transport is

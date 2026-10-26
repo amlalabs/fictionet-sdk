@@ -642,7 +642,6 @@ impl GuestHandle {
 /// Owns every process, bridge, and temporary file of a run.
 pub struct Run {
     ownership: Option<vm::Ownership>,
-    audit: Arc<fictionet_extras::guest_content::Audit>,
     guests: Vec<GuestHandle>,
     fcx: Arc<Mutex<Option<Cx>>>,
     world: Option<JoinHandle<fictionet::Result>>,
@@ -732,13 +731,6 @@ impl Run {
                     failures.push("world did not stop within five seconds".into());
                 }
             }
-        }
-        match self.audit.check() {
-            Ok(report) => println!(
-                "guest content: {} items, {} bytes checked",
-                report.contents, report.bytes
-            ),
-            Err(error) => failures.push(error),
         }
         self.mirror.lock().unwrap().take();
         if let Some(dir) = self.dir.take()
@@ -883,10 +875,8 @@ fn prepare<P: Software + Into<Boot>>(
         }
     }
     let setup = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let audit = Arc::new(fictionet_extras::guest_content::Audit::default());
     let mut run = Run {
         ownership: None,
-        audit,
         guests: Vec::new(),
         setup: setup.clone(),
         mirror: Arc::default(),

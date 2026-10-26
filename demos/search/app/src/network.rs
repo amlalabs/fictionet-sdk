@@ -8,7 +8,6 @@ use std::sync::Arc;
 pub fn build(
     world: &web_world::World,
     cx: &Cx,
-    log: Arc<fictionet_extras::log::Log>,
     claude_token: Option<fictionet_extras::models::Credential>,
 ) -> fictionet::Result<fictionet::stdlib::world::net::Net> {
     use fictionet::stdlib::web::Site;
@@ -41,7 +40,7 @@ pub fn build(
         .collect::<fictionet::Result<Vec<_>>>()?;
     let world_ca = world.ca.clone();
     let world_cx = cx.clone();
-    Ok(world.net(cx, log, move |host| {
+    Ok(world.net(cx, move |host| {
         if let Some((_, (model, tls))) = models.iter().find(|(name, _)| *name == host) {
             return Some(
                 Site::handler(model.clone())
@@ -65,13 +64,6 @@ pub fn report_run(pages: &web_world::pages::Pages, cx: &Cx) -> fictionet::Result
         cx,
         SearchObs::RunStarted {
             started_at_ms: now.saturating_sub(cx.now().since_start()).as_millis() as u64,
-        },
-    );
-    pages.report(
-        cx,
-        SearchObs::Signin {
-            open: false,
-            exceptions: vec![],
         },
     );
     Ok(())
