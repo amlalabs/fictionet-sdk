@@ -12,24 +12,10 @@ fn browser_shows_page() -> String {
     )
 }
 
-/// Sets the workstation's clock `lag` behind the host's, to the day the
-/// copied pages were copied, so a Copied session's pages and clock agree.
-/// The workstation boots on the host's clock.
-pub async fn set_clock_back(ssh: &kit::ssh::Session, lag: std::time::Duration) {
-    let at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .saturating_sub(lag);
-    match ssh.run(&format!("sudo date -u -s @{}", at.as_secs())).await {
-        Ok(output) if output.code == 0 => {}
-        Ok(output) => eprintln!("The workstation clock was not set: {}", output.stderr),
-        Err(error) => eprintln!("The workstation clock was not set: {error}"),
-    }
-}
-
-/// The workstation inherits the host clock from the hypervisor.
-pub fn guest(token: Option<&str>) -> Guest<kit::PreparedImage> {
+/// The workstation applies the session's clock lag before its services start.
+pub fn guest(token: Option<&str>, clock_lag: std::time::Duration) -> Guest<kit::PreparedImage> {
     let mut guest = Guest::prepared(HOST, USER, "search-workstation.qcow2")
+        .clock_lag(clock_lag)
         .resources(4, 4096)
         .desktop(kit::desktop::VNC_PORT, browser_shows_page())
         .terminal("env COLORTERM=truecolor DISPLAY=:1 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus tmux new-session -A -s main");

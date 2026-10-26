@@ -132,8 +132,14 @@ impl Pages {
     /// Starts a session that answers from `source`, in the world `fcx`:
     /// nothing a previous session copied, allowed, fetched or edited
     /// carries over. A scenario stays, with the account already written
-    /// for it.
-    pub fn start_session(&self, fcx: &Cx, source: Source) -> Result<(), Rejected> {
+    /// for it. `copied_lag` is measured once before boot so the workstation
+    /// and the copied pages use the same clock.
+    pub fn start_session(
+        &self,
+        fcx: &Cx,
+        source: Source,
+        copied_lag: Option<std::time::Duration>,
+    ) -> Result<(), Rejected> {
         if let Some(message) = self.unavailable(source) {
             return Err(Rejected::Invalid {
                 message: message.into(),
@@ -147,7 +153,7 @@ impl Pages {
             editor.new_session(fcx);
         }
         self.forget_packages();
-        settings.lag = Some(self.measure_lag());
+        settings.lag = Some(copied_lag);
         settings.source = source;
         settings.revision += 1;
         Ok(())

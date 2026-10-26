@@ -118,6 +118,7 @@ pub struct Guest<P = Installation> {
     user: String,
     vcpus: u8,
     memory_mib: u32,
+    clock_lag: Duration,
     manufacturer: String,
     product: String,
     family: Family<Ipv4Addr>,
@@ -139,6 +140,7 @@ impl<P: Software> Guest<P> {
             user: user.into(),
             vcpus: 2,
             memory_mib: 2048,
+            clock_lag: Duration::ZERO,
             manufacturer: "LENOVO".into(),
             product: "20UES000-WS".into(),
             family: Family::FromWorld,
@@ -419,6 +421,12 @@ impl Guest<PreparedImage> {
     pub fn prepared(hostname: &str, user: &str, image: &str) -> Self {
         Self::base(hostname, user, PreparedImage(image.into()))
     }
+
+    /// Sets the workstation's clock behind the host's during boot setup.
+    pub fn clock_lag(mut self, lag: Duration) -> Self {
+        self.clock_lag = lag;
+        self
+    }
 }
 
 impl From<Installation> for Boot {
@@ -442,6 +450,7 @@ impl<P: Software + Into<Boot>> Guest<P> {
             user: self.user,
             vcpus: self.vcpus,
             memory_mib: self.memory_mib,
+            clock_lag: self.clock_lag,
             manufacturer: self.manufacturer,
             product: self.product,
             family: self.family,
@@ -1118,7 +1127,25 @@ impl Run {
                     guest.vm().console_tail()
                 ))
             })?;
-            self.connected(index, Arc::new(session));
+            let session = Arc::new(session);
+            if guest.guest.software.image().is_some() {
+                guest.ssh = Some(session.clone());
+                guest.wait_setup(Duration::from_secs(300)).await?;
+                guest.vm().remove_settings().await?;
+                // The API replies before the guest finishes ejecting the disk.
+                let output = session
+                    .run("udevadm wait --removed /sys/class/block/vdb /dev/disk/by-label/settings")
+                    .await?;
+                if output.code != 0 {
+                    return Err(io::Error::other(format!(
+                        "{}: settings disk removal failed: {}{}",
+                        guest.name(),
+                        output.stdout,
+                        output.stderr
+                    )));
+                }
+            }
+            self.connected(index, session);
         }
         Ok(())
     }
