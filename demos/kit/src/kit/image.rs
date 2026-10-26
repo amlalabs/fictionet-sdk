@@ -1,12 +1,15 @@
-//! Prepared workstations and their per-run settings disk.
+//! Prepared workstations: the installation recipe and the files its build
+//! leaves beside the image.
 
-use super::{Software, seed::Provision, ssh};
+use super::ssh;
 use std::io::{self, Cursor, Write};
+use std::path::{Path, PathBuf};
 
 /// A software recipe, separate from the identity used to boot an existing image.
 pub struct Recipe {
     pub(super) hostname: String,
     pub(super) user: String,
+    pub(super) admin_key: String,
     pub(super) files: Vec<super::File>,
     pub(super) packages: Vec<Package>,
     pub(super) steps: Vec<String>,
@@ -38,44 +41,60 @@ impl Recipe {
     }
 }
 
-/// Builds a settings disk without any package installation or network commands.
-pub(super) fn seed<P: Software>(provision: &Provision<'_, P>) -> io::Result<Vec<u8>> {
-    let guest = provision.guest;
-    let mut script = String::from("set -eu\n");
-    if !guest.clock_lag.is_zero() {
-        script.push_str(&format!(
-            "clock=$(date -u --date '{}.{:09} seconds ago' +%s.%N)\ndate -u --set \"@$clock\" >/dev/null\n",
-            guest.clock_lag.as_secs(),
-            guest.clock_lag.subsec_nanos(),
-        ));
-    }
-    script.push_str(&format!("hostname {}\n", ssh::quote(&guest.hostname)));
-    write_file(
-        &mut script,
-        &format!("/home/{}/.ssh/authorized_keys", guest.user),
-        0o600,
-        provision.authorized_key,
-    );
-    if let Some((name, pem)) = provision.ca {
-        write_file(
-            &mut script,
-            &format!("/usr/local/share/ca-certificates/{name}.crt"),
-            0o644,
-            pem,
-        );
-        script.push_str("update-ca-certificates >/dev/null\n");
-    }
-    for file in &guest.files {
-        write_file(&mut script, &file.path, file.mode, &file.content);
-    }
-    script.push_str(&format!(
-        "chown -R {0}:{0} /home/{0}\nssh-keygen -A\n",
-        guest.user
-    ));
-    disk("settings", "apply.sh", &script)
+/// A prepared image in the downloads folder, and the files its build
+/// leaves beside it, each readable only by its owner.
+pub struct Baked {
+    image: PathBuf,
 }
 
-/// A FAT disk used by image construction and by per-run provisioning.
+impl Baked {
+    /// The image file `image` in `downloads`.
+    pub fn new(downloads: &Path, image: &str) -> Self {
+        Self {
+            image: downloads.join(image),
+        }
+    }
+    /// The image itself.
+    pub fn image(&self) -> &Path {
+        &self.image
+    }
+    /// The private half of the key the image's admin account accepts.
+    pub fn admin_key(&self) -> PathBuf {
+        self.beside("key")
+    }
+    /// The key material of the certificate authority whose root the image trusts.
+    pub fn trust_root(&self) -> PathBuf {
+        self.beside("ca.pem")
+    }
+    /// The placeholder the image carries in place of a model credential.
+    pub fn placeholder(&self) -> PathBuf {
+        self.beside("token")
+    }
+    fn beside(&self, suffix: &str) -> PathBuf {
+        let stem = self.image.file_stem().unwrap_or_default().to_string_lossy();
+        self.image.with_file_name(format!("{stem}.{suffix}"))
+    }
+}
+
+/// Writes `content` to `path`, readable only by its owner, replacing any
+/// earlier file whole.
+pub fn write_private(path: &Path, content: &str) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut partial = path.as_os_str().to_owned();
+    partial.push(".part");
+    let partial = PathBuf::from(partial);
+    let _ = std::fs::remove_file(&partial);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&partial)?;
+    file.write_all(content.as_bytes())?;
+    file.sync_all()?;
+    std::fs::rename(partial, path)
+}
+
+/// A FAT disk used by image construction.
 pub fn disk(label: &str, name: &str, content: &str) -> io::Result<Vec<u8>> {
     let mut volume_label = [b' '; 11];
     if label.len() > volume_label.len() {
@@ -114,23 +133,34 @@ fn write_file(script: &mut String, path: &str, mode: u32, content: &str) {
     ));
 }
 
-/// Image construction has no access to host credentials or per-run trust roots.
+/// The image's installation script: the user, the admin account the host
+/// logs in as, the recipe's files, packages and steps, then cleanup.
 pub fn installation(recipe: &Recipe) -> String {
     let Recipe {
         hostname,
         user,
+        admin_key,
         files,
         packages,
         steps,
     } = recipe;
+    let admin = super::ADMIN;
     let mut script = format!(
-        "set -euxo pipefail\ntouch /etc/cloud/cloud-init.disabled\ngrowpart /dev/vda 1\nresize2fs /dev/vda1\nhostname {hostname}\nuseradd -m -s /bin/bash {user}\nusermod -aG sudo {user}\n"
+        "set -euxo pipefail\ntouch /etc/cloud/cloud-init.disabled\ngrowpart /dev/vda 1\nresize2fs /dev/vda1\nhostname {hostname}\necho {hostname} > /etc/hostname\necho '127.0.1.1 {hostname}' >> /etc/hosts\nuseradd -m -s /bin/bash {user}\nusermod -aG sudo {user}\nuseradd -m -s /bin/bash {admin}\n"
     );
+    for account in [user.as_str(), admin] {
+        write_file(
+            &mut script,
+            &format!("/etc/sudoers.d/{account}"),
+            0o440,
+            &format!("{account} ALL=(ALL) NOPASSWD:ALL\n"),
+        );
+    }
     write_file(
         &mut script,
-        &format!("/etc/sudoers.d/{user}"),
-        0o440,
-        &format!("{user} ALL=(ALL) NOPASSWD:ALL\n"),
+        &format!("/home/{admin}/.ssh/authorized_keys"),
+        0o600,
+        admin_key,
     );
     for file in files {
         write_file(&mut script, &file.path, file.mode, &file.content);
@@ -170,63 +200,14 @@ pub fn installation(recipe: &Recipe) -> String {
         script.push_str(step);
         script.push('\n');
     }
-    write_file(
-        &mut script,
-        "/etc/systemd/system/workstation-settings.service",
-        0o644,
-        "[Unit]\nDescription=Workstation settings\nDefaultDependencies=no\nRequires=dev-vdb.device\nAfter=local-fs.target dev-vdb.device\nBefore=ssh.service ssh.socket vnc.service\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/bash -euc 'mkdir -p /run/settings; mount -o ro /dev/disk/by-label/settings /run/settings; /bin/bash /run/settings/apply.sh; umount /run/settings'\n[Install]\nWantedBy=multi-user.target\n",
-    );
-    for unit in ["ssh.service", "ssh.socket", "vnc.service"] {
-        write_file(
-            &mut script,
-            &format!("/etc/systemd/system/{unit}.d/settings.conf"),
-            0o644,
-            "[Unit]\nRequires=workstation-settings.service\nAfter=workstation-settings.service\n",
-        );
-    }
-    script.push_str("systemctl enable workstation-settings.service systemd-networkd.service\n");
+    script.push_str(&format!(
+        "chown -R {user}:{user} /home/{user}\nchown -R {admin}:{admin} /home/{admin}\nssh-keygen -A\n"
+    ));
+    script.push_str("systemctl enable systemd-networkd.service\n");
     script.push_str("systemctl mask systemd-networkd-wait-online.service pollinate.service\n");
     let cache = ssh::quote(&format!("/home/{user}/.cache"));
     script.push_str(&format!(
-        "rm -f /opt/install-claude.sh /opt/install-codex.sh /opt/setup-desktop.sh\nrm -rf /var/lib/cloud /var/lib/apt/lists/* /var/cache/apt/archives/* /tmp/* /var/tmp/* {cache}\nsystemctl stop systemd-random-seed.service\nrm -f /etc/ssh/ssh_host_* /var/lib/systemd/random-seed /var/lib/dbus/machine-id\ntruncate -s 0 /etc/machine-id\nrm -rf /mnt/build\nfind /var/log -type f -exec truncate -s 0 {{}} +\nclaude --version\ncodex --version\npython3 --version\nsync\n"
+        "rm -f /opt/install-claude.sh /opt/install-codex.sh /opt/setup-desktop.sh\nrm -rf /var/lib/cloud /var/lib/apt/lists/* /var/cache/apt/archives/* /tmp/* /var/tmp/* {cache}\nsystemctl stop systemd-random-seed.service\nrm -f /var/lib/systemd/random-seed /var/lib/dbus/machine-id\ntruncate -s 0 /etc/machine-id\nrm -rf /mnt/build\nfind /var/log -type f -exec truncate -s 0 {{}} +\nclaude --version\ncodex --version\npython3 --version\nsync\n"
     ));
     script
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::kit::Guest;
-    use std::io::Read;
-
-    #[test]
-    fn prepared_settings_are_per_run_and_never_install_packages() {
-        let guest = Guest::prepared("station", "analyst", "desktop.qcow2")
-            .file("/home/analyst/.tmux.conf", 0o644, "set -g status off\n")
-            .file("/home/analyst/.claude/settings.json", 0o600, "placeholder");
-        let data = super::super::seed::build(&Provision {
-            guest: &guest,
-            authorized_key: "fresh-key",
-            ca: Some(("office", "fresh-ca")),
-        })
-        .unwrap();
-        let fs = fatfs::FileSystem::new(Cursor::new(data), fatfs::FsOptions::new()).unwrap();
-        let mut script = String::new();
-        fs.root_dir()
-            .open_file("apply.sh")
-            .unwrap()
-            .read_to_string(&mut script)
-            .unwrap();
-        for value in [
-            "fresh-key",
-            "fresh-ca",
-            "placeholder",
-            "set -g status off\n",
-        ] {
-            assert!(script.contains(&fictionet::stdlib::codec::base64::encode(value.as_bytes())));
-        }
-        assert!(script.contains(" > '/home/analyst/.tmux.conf'"));
-        assert!(!script.contains("apt-get"));
-        assert!(!script.contains("curl"));
-    }
 }

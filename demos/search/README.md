@@ -47,10 +47,12 @@ CLAUDE_CODE_OAUTH_TOKEN_FILE=/path/to/claude-oauth-token \
   demos/downloads/cloudimage
 ```
 
-The image contains no provider credentials, run CA, SSH identity or run clock.
-A read-only settings disk applies the run's root certificate, fresh SSH public
-key and placeholder Claude credential before SSH and the desktop start. The real
-Claude token stays on the host. `claude` opens ready to work. Each launch writes
+The image build makes the workstation's root certificate, the key of its `ops`
+admin account and a placeholder Claude credential once, bakes them into the
+image, and keeps the private halves beside `search-workstation.qcow2`, readable
+only by their owner. The host controls the workstation as `ops`; the user's
+tmux session starts at boot, and the page terminal joins it. The workstation
+takes its clock from network time. The real Claude token stays on the host. `claude` opens ready to work. Each launch writes
 to a fresh disk overlay; the prepared image stays unchanged. All demo flows use
 this workstation. The terminal uses ghostty-web and a persistent tmux session;
 Screen shows Firefox. Terminal text starts at 15 px on a dark background in both

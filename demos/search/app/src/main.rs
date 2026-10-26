@@ -8,7 +8,7 @@ use fictionet_extras::log::Log;
 use std::{path::PathBuf, sync::Arc, time::Instant};
 use web_world::{
     Addresses, Ca, World,
-    pages::{Pages, Seed, Source},
+    pages::{Pages, Seed},
 };
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -67,6 +67,18 @@ enum Ended {
 async fn main() -> Result {
     let total = Instant::now();
     let downloads = downloads()?;
+    let baked = kit::image::Baked::new(&downloads, guest::IMAGE);
+    let read_baked = |path: PathBuf| {
+        std::fs::read_to_string(&path).map_err(|error| {
+            format!(
+                "{}: {error}; build it with cargo xtask search-image <downloads>",
+                path.display()
+            )
+        })
+    };
+    let roots = Arc::new(fictionet_extras::zscaler::Roots::from_pem(&read_baked(
+        baked.trust_root(),
+    )?)?);
     let (claude_token, claude_key) =
         if let Some(path) = std::env::var_os("CLAUDE_CODE_OAUTH_TOKEN_FILE") {
             let value = std::fs::read_to_string(path)
@@ -74,14 +86,11 @@ async fn main() -> Result {
             let secret =
                 fictionet_extras::models::Secret::new("Claude OAuth token", value.trim().into())?;
             let key = fictionet_extras::models::Key::claude_token(secret.clone())?;
-            let (send, receive) = tokio::sync::oneshot::channel();
-            fictionet::run(fictionet::Seed::random(), |cx| async move {
-                let token = fictionet_extras::models::Credential::claude_token(&cx, secret)?;
-                let _ = send.send(token);
-                Ok(())
-            })
-            .await?;
-            (Some(receive.await?), Some(key))
+            let token = fictionet_extras::models::Credential::claude_token(
+                secret,
+                read_baked(baked.placeholder())?,
+            )?;
+            (Some(token), Some(key))
         } else {
             (None, None)
         };
@@ -113,28 +122,22 @@ async fn main() -> Result {
         let log = Arc::new(Log::new(Box::new(std::io::sink()), &[], |s| s));
         let console_slot = Arc::new(std::sync::Mutex::new(None));
         let console = console_slot.clone();
-        let (world_page, world_pages, world_log, world_token, world_seed) = (
+        let (world_page, world_pages, world_log, world_token, world_seed, world_roots) = (
             page.clone(),
             pages.clone(),
             log.clone(),
             claude_token.clone(),
             seed.clone(),
+            roots.clone(),
         );
         let boot = kit::boot(
             "search",
-            vec![guest::guest(
-                claude_token.as_ref().map(|token| token.placeholder()),
-                if source == Source::Copied {
-                    copied_lag.unwrap_or_default()
-                } else {
-                    std::time::Duration::ZERO
-                },
-            )],
+            vec![guest::guest()],
             downloads.clone(),
             move |consoles| {
                 *console.lock().unwrap() = consoles.into_iter().next();
             },
-            move |cx, mut run| async move {
+            move |cx, run| async move {
                 let start = std::time::SystemTime::now();
                 // Copied mode sets the workstation's clock back to the day
                 // its pages were copied; certificates hold from then too.
@@ -144,12 +147,11 @@ async fn main() -> Result {
                     .map_err(|error| fictionet::Error::msg(format!("{error:?}")))?;
                 world_page.attach_world(&cx, world_pages.clone());
                 let web = World {
-                    ca: Arc::new(Ca::new(&cx, earliest, start)?),
+                    ca: Arc::new(Ca::new(&cx, &world_roots, earliest, start)?),
                     addresses: Arc::new(Addresses::new(world_seed.fixed_addresses(), None)?),
                     pages: world_pages,
                     start,
                 };
-                run.trust("office", &web.ca.cert_pem())?;
                 let net = network::build(&web, &cx, world_log, world_token)?
                     .route(kit::JUMP, kit::jump_prefix());
                 net.start(&cx, run.into_attachments())

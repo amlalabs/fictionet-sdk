@@ -2,8 +2,10 @@
 //!
 //! The guest installs a local root. Each site presents a leaf, the
 //! short-lived issuing CA, and the long-lived intermediate CA.
-//! [`zscaler`] generates the CA keys from the run seed. Only the public
-//! field layout matches Zscaler. All keys and signatures are generated here.
+//! [`Roots`] holds the root and the long-lived intermediate, which an image
+//! keeps from its build; [`zscaler_since`] adds a run's issuing CA, and
+//! [`zscaler`] makes a whole chain from the run seed. Only the public field
+//! layout matches Zscaler. All keys and signatures are generated here.
 
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -12,7 +14,7 @@ use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::protocols::asn1::StringKind::{Ia5, Printable, Utf8};
 use fictionet::stdlib::protocols::asn1::{Oid, StringKind};
 use fictionet::stdlib::protocols::x509::{self, ExtensionValue, GeneralName, KeyUsage, oid};
-use fictionet::stdlib::services::ca::{KeyKind, Leaf, SigningKey};
+use fictionet::stdlib::services::ca::{Ca, KeyKind, Leaf, SigningKey};
 use fictionet::stdlib::services::tls;
 use fictionet::{Cx, Error, Result};
 use rustls::pki_types::CertificateDer;
@@ -45,112 +47,210 @@ pub struct Zscaler {
     intermediates: Vec<CertificateDer<'static>>,
 }
 
+/// The root and the long-lived intermediate CA. Only the intermediate's key
+/// is kept: it signs each run's issuing CA, and the root's key is not
+/// needed once the intermediate is signed.
+pub struct Roots {
+    root_pem: String,
+    intermediate: Ca,
+    intermediate_der: CertificateDer<'static>,
+    intermediate_subject: x509::Name,
+    intermediate_key_id: Vec<u8>,
+}
+
+impl Roots {
+    /// Builds the root and the long-lived intermediate for `cloud` (for
+    /// example [`DEFAULT_CLOUD`]), with fresh RSA 2048 keys from `fcx`.
+    pub fn generate(fcx: &Cx, cloud: &str) -> Result<Roots> {
+        // The root uses PrintableString except for its IA5String email.
+        let root_dn = dn(&[
+            (oid::COUNTRY, Printable, "US"),
+            (oid::STATE, Printable, "California"),
+            (oid::LOCALITY, Printable, "San Jose"),
+            (oid::ORGANIZATION, Printable, "Zscaler Inc."),
+            (oid::ORGANIZATIONAL_UNIT, Printable, "Zscaler Inc."),
+            (oid::COMMON_NAME, Printable, "Zscaler Root CA"),
+            (oid::EMAIL_ADDRESS, Ia5, "support@zscaler.com"),
+        ]);
+        // The intermediate has no locality and keeps the mailto: email prefix.
+        let int_dn = dn(&[
+            (oid::COUNTRY, Printable, "US"),
+            (oid::STATE, Printable, "California"),
+            (oid::ORGANIZATION, Printable, "Zscaler Inc."),
+            (oid::ORGANIZATIONAL_UNIT, Printable, "Zscaler Inc."),
+            (
+                oid::COMMON_NAME,
+                Printable,
+                &format!("Zscaler Intermediate Root CA ({cloud})"),
+            ),
+            (oid::EMAIL_ADDRESS, Ia5, "mailto:support@zscaler.com"),
+        ]);
+
+        let root_key = SigningKey::generate(fcx, KeyKind::Rsa2048);
+        let int_key = SigningKey::generate(fcx, KeyKind::Rsa2048);
+
+        let root_key_id = root_key.key_identifier();
+        let root_serial = serial(fcx, true);
+        let root = certificate(
+            &root_key,
+            &root_key,
+            root_dn.clone(),
+            root_dn.clone(),
+            validity(ROOT_NOT_BEFORE, ROOT_NOT_AFTER)?,
+            root_serial.clone(),
+            vec![
+                x509::SubjectKeyIdentifier(root_key_id.clone()).to_extension(false)?,
+                x509::BasicConstraints {
+                    ca: true,
+                    path_len: None,
+                }
+                .to_extension(true)?,
+                x509::AuthorityKeyIdentifier {
+                    key_id: Some(root_key_id.clone()),
+                    issuer: Some(vec![GeneralName::Directory(root_dn.clone())]),
+                    serial: Some(root_serial),
+                }
+                .to_extension(false)?,
+                KeyUsage(
+                    KeyUsage::DIGITAL_SIGNATURE | KeyUsage::KEY_CERT_SIGN | KeyUsage::CRL_SIGN,
+                )
+                .to_extension(true)?,
+            ],
+        )?;
+
+        let int = certificate(
+            &int_key,
+            &root_key,
+            int_dn,
+            root_dn,
+            validity(INT_NOT_BEFORE, INT_NOT_AFTER)?,
+            serial(fcx, false),
+            ca_extensions(&int_key.key_identifier(), &root_key_id)?,
+        )?;
+        let key_pem = String::from_utf8(
+            x509::PemBlock {
+                label: "PRIVATE KEY".into(),
+                data: int_key.private_key_der()?.secret_pkcs8_der().to_vec(),
+            }
+            .to_bytes()?,
+        )?;
+        Self::new(pem(&root)?, &pem(&int)?, &key_pem)
+    }
+
+    /// Reads what [`Roots::to_pem`] wrote: the root certificate, then the
+    /// intermediate's certificate and its PKCS#8 key.
+    pub fn from_pem(text: &str) -> Result<Roots> {
+        let blocks = x509::pem_decode(text.as_bytes())?;
+        let [root, intermediate, key] = blocks.as_slice() else {
+            return Err(Error::msg("expected a root, an intermediate and its key"));
+        };
+        if root.label != "CERTIFICATE"
+            || intermediate.label != "CERTIFICATE"
+            || key.label != "PRIVATE KEY"
+        {
+            return Err(Error::msg("expected a root, an intermediate and its key"));
+        }
+        let text = |block: &x509::PemBlock| -> Result<String> {
+            Ok(String::from_utf8(block.to_bytes()?)?)
+        };
+        Self::new(text(root)?, &text(intermediate)?, &text(key)?)
+    }
+
+    fn new(root_pem: String, intermediate_pem: &str, key_pem: &str) -> Result<Roots> {
+        let root = x509::Certificate::from_pem(root_pem.as_bytes())?;
+        let intermediate = Ca::from_pem(intermediate_pem, key_pem)?;
+        let parsed = x509::Certificate::from_pem(intermediate_pem.as_bytes())?;
+        if parsed.tbs.issuer != root.tbs.subject {
+            return Err(Error::msg("the intermediate was not issued by the root"));
+        }
+        let intermediate_key_id = parsed
+            .tbs
+            .get::<x509::SubjectKeyIdentifier>()?
+            .ok_or_else(|| Error::msg("the intermediate has no key identifier"))?
+            .0;
+        Ok(Roots {
+            root_pem,
+            intermediate_der: intermediate.cert_der(),
+            intermediate,
+            intermediate_subject: parsed.tbs.subject,
+            intermediate_key_id,
+        })
+    }
+
+    /// The root certificate, the intermediate certificate and the
+    /// intermediate's key, as PEM.
+    pub fn to_pem(&self) -> String {
+        format!(
+            "{}{}{}",
+            self.root_pem,
+            self.intermediate.cert_pem(),
+            self.intermediate.key_pem()
+        )
+    }
+
+    /// The root certificate as PEM, for the guest to install as its trust
+    /// anchor.
+    pub fn root_pem(&self) -> &str {
+        &self.root_pem
+    }
+}
+
 /// Builds the root, the long-lived intermediate and the short-lived "(t)"
 /// issuing CA for `cloud` (for example [`DEFAULT_CLOUD`]), with fresh RSA
 /// 2048 keys from `fcx`. `now_unix` is the run's wall-clock time in Unix
 /// seconds. The "(t)" CA's two-week window straddles it.
 pub fn zscaler(fcx: &Cx, cloud: &str, now_unix: i64) -> Result<Zscaler> {
-    zscaler_since(fcx, cloud, now_unix, now_unix)
+    zscaler_since(fcx, &Roots::generate(fcx, cloud)?, now_unix, now_unix)
 }
 
-/// [`zscaler`] for a run whose clock may also read as early as
-/// `earliest_unix`: the "(t)" CA's window opens three days before that.
-pub fn zscaler_since(fcx: &Cx, cloud: &str, earliest_unix: i64, now_unix: i64) -> Result<Zscaler> {
-    let root_validity = validity(ROOT_NOT_BEFORE, ROOT_NOT_AFTER)?;
-    let int_validity = validity(INT_NOT_BEFORE, INT_NOT_AFTER)?;
+/// Adds the short-lived "(t)" issuing CA, with a fresh RSA 2048 key from
+/// `fcx`, below `roots`' intermediate, for a run whose clock may read as
+/// early as `earliest_unix`: the "(t)" CA's window opens three days before
+/// that and closes eleven days after `now_unix`.
+pub fn zscaler_since(
+    fcx: &Cx,
+    roots: &Roots,
+    earliest_unix: i64,
+    now_unix: i64,
+) -> Result<Zscaler> {
     let issuing_validity = validity(
         earliest_unix.min(now_unix).saturating_sub(3 * DAY),
         now_unix.saturating_add(11 * DAY),
     )?;
-    // The root uses PrintableString except for its IA5String email.
-    let root_dn = dn(&[
-        (oid::COUNTRY, Printable, "US"),
-        (oid::STATE, Printable, "California"),
-        (oid::LOCALITY, Printable, "San Jose"),
-        (oid::ORGANIZATION, Printable, "Zscaler Inc."),
-        (oid::ORGANIZATIONAL_UNIT, Printable, "Zscaler Inc."),
-        (oid::COMMON_NAME, Printable, "Zscaler Root CA"),
-        (oid::EMAIL_ADDRESS, Ia5, "support@zscaler.com"),
-    ]);
-    // The intermediate has no locality and keeps the mailto: email prefix.
-    let int_cn = format!("Zscaler Intermediate Root CA ({cloud})");
-    let int_dn = dn(&[
-        (oid::COUNTRY, Printable, "US"),
-        (oid::STATE, Printable, "California"),
-        (oid::ORGANIZATION, Printable, "Zscaler Inc."),
-        (oid::ORGANIZATIONAL_UNIT, Printable, "Zscaler Inc."),
-        (oid::COMMON_NAME, Printable, &int_cn),
-        (oid::EMAIL_ADDRESS, Ia5, "mailto:support@zscaler.com"),
-    ]);
+    let int_cn = roots
+        .intermediate_subject
+        .common_name()
+        .ok_or_else(|| Error::msg("the intermediate has no common name"))?;
     // The issuing CA has no locality or email.
-    let issuing_cn = format!("{int_cn} (t)");
     let issuing_dn = dn(&[
         (oid::COUNTRY, Printable, "US"),
         (oid::STATE, Printable, "California"),
         (oid::ORGANIZATION, Printable, "Zscaler Inc."),
         (oid::ORGANIZATIONAL_UNIT, Printable, "Zscaler Inc."),
-        (oid::COMMON_NAME, Printable, &issuing_cn),
+        (oid::COMMON_NAME, Printable, &format!("{int_cn} (t)")),
     ]);
-
-    let root_key = SigningKey::generate(fcx, KeyKind::Rsa2048);
-    let int_key = SigningKey::generate(fcx, KeyKind::Rsa2048);
     let issuing_key = SigningKey::generate(fcx, KeyKind::Rsa2048);
-
-    let root_key_id = root_key.key_identifier();
-    let root_serial = serial(fcx, true);
-    let root = certificate(
-        &root_key,
-        &root_key,
-        root_dn.clone(),
-        root_dn.clone(),
-        root_validity,
-        root_serial.clone(),
-        vec![
-            x509::SubjectKeyIdentifier(root_key_id.clone()).to_extension(false)?,
-            x509::BasicConstraints {
-                ca: true,
-                path_len: None,
-            }
-            .to_extension(true)?,
-            x509::AuthorityKeyIdentifier {
-                key_id: Some(root_key_id.clone()),
-                issuer: Some(vec![GeneralName::Directory(root_dn.clone())]),
-                serial: Some(root_serial),
-            }
-            .to_extension(false)?,
-            KeyUsage(KeyUsage::DIGITAL_SIGNATURE | KeyUsage::KEY_CERT_SIGN | KeyUsage::CRL_SIGN)
-                .to_extension(true)?,
-        ],
-    )?;
-
-    let int_key_id = int_key.key_identifier();
-    let int = certificate(
-        &int_key,
-        &root_key,
-        int_dn.clone(),
-        root_dn,
-        int_validity,
-        serial(fcx, false),
-        ca_extensions(&int_key_id, &root_key_id)?,
-    )?;
-
     let issuing_key_id = issuing_key.key_identifier();
-    let issuing = certificate(
-        &issuing_key,
-        &int_key,
-        issuing_dn.clone(),
-        int_dn,
-        issuing_validity,
-        serial(fcx, false),
-        ca_extensions(&issuing_key_id, &int_key_id)?,
-    )?;
+    // The intermediate's CA sets the issuer and signature algorithm.
+    let issuing = roots.intermediate.sign(x509::TbsCertificate {
+        version: x509::Version::V3,
+        serial: serial(fcx, false),
+        signature: issuing_key.algorithm(),
+        issuer: roots.intermediate_subject.clone(),
+        validity: issuing_validity,
+        subject: issuing_dn.clone(),
+        public_key: issuing_key.public_key_info(),
+        issuer_unique_id: None,
+        subject_unique_id: None,
+        extensions: ca_extensions(&issuing_key_id, &roots.intermediate_key_id)?,
+    })?;
 
     Ok(Zscaler {
-        root_pem: pem(&root)?,
+        root_pem: roots.root_pem.clone(),
         issuing_key,
         issuing_subject: issuing_dn,
         issuing_key_id,
-        intermediates: vec![issuing.to_bytes()?.into(), int.to_bytes()?.into()],
+        intermediates: vec![issuing.to_bytes()?.into(), roots.intermediate_der.clone()],
     })
 }
 

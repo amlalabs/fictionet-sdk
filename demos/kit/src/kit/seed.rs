@@ -45,7 +45,21 @@ pub struct Provision<'a, P = Installation> {
     pub ca: Option<(&'a str, &'a str)>,
 }
 
-/// Builds the `cidata` FAT image bytes for `provision`.
+/// A cloud guest's clock comes from the host, so network time, which would
+/// request a name the world does not serve, stays off.
+const HOST_CLOCK: &[(&str, &str)] = &[
+    (
+        "/etc/systemd/timesyncd.conf",
+        "[Time]\nNTP=\nFallbackNTP=\n",
+    ),
+    (
+        "/etc/systemd/system/systemd-timesyncd.service.d/quiet.conf",
+        "[Unit]\nConditionPathExists=/etc/office-refresh-enabled\n",
+    ),
+];
+
+/// Builds the `cidata` FAT image bytes for `provision`. A prepared image
+/// takes no seed: everything it needs is in the image.
 pub fn build<P: Software>(provision: &Provision<P>) -> std::io::Result<Vec<u8>> {
     provision.guest.validate()?;
     if provision
@@ -55,7 +69,7 @@ pub fn build<P: Software>(provision: &Provision<P>) -> std::io::Result<Vec<u8>> 
         return Err(std::io::Error::other("invalid root certificate name"));
     }
     let Some(installation) = provision.guest.software.installation() else {
-        return super::image::seed(provision);
+        return Err(std::io::Error::other("a prepared image takes no seed"));
     };
     let user_data = cloud_data(provision, installation);
     let audit = fictionet_extras::guest_content::Audit::default();
@@ -157,8 +171,10 @@ fn cloud_data<P: Software>(p: &Provision<P>, installation: &Installation) -> Str
         .iter()
         .map(|(path, pem)| (path.as_str(), 0o644, *pem))
         .chain(shared.iter().map(|(p, c)| (*p, 0o644, c.as_str())))
+        .chain(HOST_CLOCK.iter().map(|(p, c)| (*p, 0o644, *c)))
         .chain(
-            g.files
+            installation
+                .files
                 .iter()
                 .map(|f| (f.path.as_str(), f.mode, f.content.as_str())),
         )
@@ -195,6 +211,7 @@ fn cloud_data<P: Software>(p: &Provision<P>, installation: &Installation) -> Str
                 .collect::<Vec<_>>()
                 .join(" ")
         ),
+        "if systemctl is-active --quiet systemd-timesyncd.service; then systemctl stop systemd-timesyncd.service; fi".into(),
     ];
     commands.extend(installation.steps.iter().cloned());
     // One shell stops provisioning on the first failed command.

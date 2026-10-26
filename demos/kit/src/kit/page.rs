@@ -78,8 +78,11 @@ impl GuestConsole {
         Self {
             features: guest.features,
             name: guest.hostname.clone(),
-            desktop: guest.desktop.clone(),
-            terminal: guest.terminal.clone(),
+            desktop: guest
+                .desktop
+                .as_ref()
+                .map(|(port, ready)| (*port, guest.as_user(ready))),
+            terminal: guest.terminal_command(),
             session: Arc::new(Mutex::new(SessionState::default())),
             status: watch::channel(HostStatus {
                 features: guest.features,

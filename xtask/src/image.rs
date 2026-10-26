@@ -1,6 +1,7 @@
 //! Construct and boot-check an image before publishing it.
 use crate::{Result, workstation};
-use fictionet_demo::kit::{RunDir, image, vm};
+use fictionet_demo::kit::{RunDir, image, ssh, vm};
+use fictionet_extras::zscaler::Roots;
 use std::{
     io::{self, Read},
     path::Path,
@@ -116,7 +117,25 @@ pub async fn build(downloads: &Path) -> Result {
     )
     .await?;
     checked(Command::new("qemu-img").arg("resize").arg(&disk).arg("10G")).await?;
-    let mut script = image::installation(&workstation::recipe()?);
+    // The keys, the trust root and the credential placeholder are made once
+    // here, baked into the image, and kept beside it for the host.
+    let admin = ssh::Identity::generate()?;
+    let placeholder = fictionet_extras::models::Credential::claude_token_placeholder()?;
+    let (send, receive) = tokio::sync::oneshot::channel();
+    fictionet::run(fictionet::Seed::random(), |cx| async move {
+        let _ = send.send(Roots::generate(
+            &cx,
+            fictionet_extras::zscaler::DEFAULT_CLOUD,
+        )?);
+        Ok(())
+    })
+    .await?;
+    let roots = receive.await?;
+    let mut script = image::installation(&workstation::recipe(
+        &admin,
+        roots.root_pem(),
+        &placeholder,
+    )?);
     script.push_str("systemctl disable image-build.service\nrm -f /root/build.sh /etc/systemd/system/image-build.service\nmkdir -p /mnt/build\nmount /dev/vdb /mnt/build\nprintf installed > /mnt/build/result\nsync\numount /mnt/build\nsystemctl poweroff\n");
     let seed = dir.path().join("build.img");
     std::fs::write(&seed, image::disk("build", "build.sh", &script)?)?;
@@ -129,25 +148,8 @@ pub async fn build(downloads: &Path) -> Result {
         "root=LABEL=cloudimg-rootfs rw console=ttyS0 net.ifnames=0 init=/bin/bash",
         "user,id=net",
     )?;
-    tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            if std::fs::read_to_string(&log_path)?.contains("root@(none):/#") {
-                break Ok::<(), io::Error>(());
-            }
-            if child.try_wait()?.is_some() {
-                return Err(io::Error::other("image VM exited before its setup shell"));
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await??;
     let bootstrap = "mount -t proc proc /proc; mount -t sysfs sysfs /sys; mkdir -p /mnt/build; mount /dev/vdb /mnt/build; touch /etc/cloud/cloud-init.disabled; mkdir -p /etc/systemd/network; printf '[Match]\\nName=eth0\\n[Network]\\nDHCP=ipv4\\n' > /etc/systemd/network/05-eth0.network; cp /mnt/build/build.sh /root/build.sh; umount /mnt/build; printf '[Unit]\\nAfter=network-online.target\\nWants=network-online.target\\n[Service]\\nType=oneshot\\nStandardOutput=journal+console\\nStandardError=journal+console\\nExecStart=/bin/bash -c \"/bin/bash /root/build.sh || { echo installation failed >/dev/ttyS0; systemctl poweroff; }\"\\n[Install]\\nWantedBy=multi-user.target\\n' > /etc/systemd/system/image-build.service; mkdir -p /etc/systemd/system/multi-user.target.wants; ln -s /etc/systemd/system/image-build.service /etc/systemd/system/multi-user.target.wants/image-build.service; exec /sbin/init\n";
-    child
-        .stdin
-        .take()
-        .ok_or_else(|| io::Error::other("missing VM input"))?
-        .write_all(bootstrap.as_bytes())
-        .await?;
+    bootstrap_shell(&mut child, &log_path, bootstrap).await?;
     println!("Building workstation; progress: {}", log_path.display());
     let built = finish(&mut child, Duration::from_secs(1800), &seed).await;
     publish_log(&log_path, &root, dir.path(), "search-image-build.log")?;
@@ -160,11 +162,8 @@ pub async fn build(downloads: &Path) -> Result {
     if installed != Completion::Installed {
         return Err("image installation did not complete".into());
     }
-    let settings = dir.path().join("settings.img");
-    std::fs::write(
-        &settings,
-        image::disk("settings", "apply.sh", &verification())?,
-    )?;
+    let check = dir.path().join("check.img");
+    std::fs::write(&check, image::disk("check", "check.sh", &verification())?)?;
     let verification_disk = dir.path().join("verify.qcow2");
     checked(
         Command::new("qemu-img")
@@ -177,13 +176,17 @@ pub async fn build(downloads: &Path) -> Result {
     let mut child = launch(
         &root,
         &verification_disk,
-        &settings,
+        &check,
         &check_log,
-        "root=LABEL=cloudimg-rootfs rw console=ttyS0 net.ifnames=0",
+        "root=LABEL=cloudimg-rootfs rw console=ttyS0 net.ifnames=0 init=/bin/bash",
         "user,id=net,restrict=on",
     )?;
+    // The check runs once the desktop is allowed to start. Its network has
+    // no time server, so the desktop does not wait for network time.
+    let bootstrap = "mount -t proc proc /proc; mount -t sysfs sysfs /sys; mkdir -p /mnt/check; mount /dev/vdb /mnt/check; cp /mnt/check/check.sh /root/image-check.sh; umount /mnt/check; printf '[Unit]\\nAfter=vnc.service\\n[Service]\\nType=oneshot\\nStandardOutput=journal+console\\nStandardError=journal+console\\nExecStart=/bin/bash /root/image-check.sh\\n[Install]\\nWantedBy=multi-user.target\\n' > /etc/systemd/system/image-check.service; mkdir -p /etc/systemd/system/multi-user.target.wants; ln -s /etc/systemd/system/image-check.service /etc/systemd/system/multi-user.target.wants/image-check.service; ln -sf /dev/null /etc/systemd/system/systemd-time-wait-sync.service; exec /sbin/init\n";
+    bootstrap_shell(&mut child, &check_log, bootstrap).await?;
     println!("Checking desktop; progress: {}", check_log.display());
-    let verified = finish(&mut child, Duration::from_secs(180), &settings).await;
+    let verified = finish(&mut child, Duration::from_secs(180), &check).await;
     publish_log(&check_log, &root, dir.path(), "search-image-verify.log")?;
     let verified = verified.map_err(|error| {
         format!(
@@ -195,7 +198,8 @@ pub async fn build(downloads: &Path) -> Result {
         return Err("desktop verification did not complete".into());
     };
     println!("Installed package set: {packages}");
-    let output = root.join(workstation::IMAGE);
+    let baked = image::Baked::new(&root, workstation::IMAGE);
+    let output = baked.image().to_owned();
     let compact = dir.path().join("compact.qcow2");
     checked(
         Command::new("qemu-img")
@@ -205,6 +209,9 @@ pub async fn build(downloads: &Path) -> Result {
     )
     .await?;
     checked(Command::new("qemu-img").arg("check").arg(&compact)).await?;
+    admin.write(&baked.admin_key())?;
+    image::write_private(&baked.trust_root(), &roots.to_pem())?;
+    image::write_private(&baked.placeholder(), &placeholder)?;
     std::fs::rename(compact, &output)?;
     println!(
         "Image: {} ({} seconds)",
@@ -261,6 +268,30 @@ fn launch(
     Ok(child)
 }
 
+/// Waits for the shell that `init=/bin/bash` opens on the serial console,
+/// then types `bootstrap` into it.
+async fn bootstrap_shell(child: &mut Child, log_path: &Path, bootstrap: &str) -> Result {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if std::fs::read_to_string(log_path)?.contains("root@(none):/#") {
+                break Ok::<(), io::Error>(());
+            }
+            if child.try_wait()?.is_some() {
+                return Err(io::Error::other("image VM exited before its setup shell"));
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("missing VM input"))?
+        .write_all(bootstrap.as_bytes())
+        .await?;
+    Ok(())
+}
+
 fn publish_log(source: &Path, root: &Path, staging: &Path, name: &str) -> io::Result<()> {
     let temporary = staging.join(name);
     std::fs::copy(source, &temporary)?;
@@ -309,18 +340,22 @@ async fn finish(child: &mut Child, timeout: Duration, seed: &Path) -> Result<Com
     result(seed)
 }
 
+/// The desktop, the user's terminal session, the admin account and the
+/// trust root are in place, and the tools run.
 fn verification() -> String {
     let ready = fictionet_demo::kit::desktop::BROWSER_READY;
-    let check = format!(
+    format!(
         r#"set -euo pipefail
 trap 'systemctl poweroff' EXIT
 timeout 90 bash -c 'until runuser -u analyst -- sh -c "{ready}"; do sleep 0.2; done'
-runuser -u analyst -- tmux -f /home/analyst/.tmux.conf new-session -d -s check
+runuser -u analyst -- tmux has-session -t main
 [ "$(runuser -u analyst -- tmux show-options -gv status)" = off ]
 [ "$(runuser -u analyst -- tmux show-options -gv mouse)" = on ]
-[ "$(runuser -u analyst -- tmux show-options -gv focus-events)" = on ]
+[ "$(runuser -u analyst -- tmux show-environment -g DISPLAY)" = DISPLAY=:1 ]
 [ -f /home/analyst/.hushlogin ]
-runuser -u analyst -- tmux kill-server
+[ -s /home/ops/.ssh/authorized_keys ]
+[ -f /etc/ssl/certs/office.pem ]
+[ "$(cat /etc/hostname)" = workstation ]
 python3 -m venv /var/tmp/check-venv
 /var/tmp/check-venv/bin/python -c 'import ssl; import pip'
 rm -rf /var/tmp/check-venv
@@ -329,29 +364,11 @@ codex --version
 firefox --version
 python3 --version
 packages=$(dpkg-query -W -f='${{binary:Package}} ${{Version}}\n' | LC_ALL=C sort | sha256sum | cut -d ' ' -f1)
-mount /dev/vdb /run/settings
-printf 'verified\n%s\n' "$packages" > /run/settings/result
+mkdir -p /mnt/check
+mount /dev/vdb /mnt/check
+printf 'verified\n%s\n' "$packages" > /mnt/check/result
 sync
-umount /run/settings
-"#
-    );
-    // The check runs after settings finish and the desktop is allowed to start.
-    format!(
-        r#"set -eu
-cat > /run/image-check.sh <<'CHECK'
-{check}
-CHECK
-cat > /run/systemd/system/image-check.service <<'UNIT'
-[Unit]
-After=workstation-settings.service vnc.service
-[Service]
-Type=oneshot
-StandardOutput=journal+console
-StandardError=journal+console
-ExecStart=/bin/bash /run/image-check.sh
-UNIT
-systemctl daemon-reload
-systemctl start --no-block image-check.service
+umount /mnt/check
 "#
     )
 }

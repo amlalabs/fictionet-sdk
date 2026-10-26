@@ -26,12 +26,14 @@ async fn two_guests_have_separate_resources_and_shared_trust() {
         )
     };
     let (run, mut prepared) = make_run().unwrap();
-    let key = ssh::Identity::generate().unwrap();
     let ca = "-----BEGIN CERTIFICATE-----\nc2hhcmVkIHJvb3Q=\n-----END CERTIFICATE-----\n";
-    let image = run.path().join("base.img");
-    std::fs::write(&image, []).unwrap();
-    run.provision(&image, &key.authorized_key, Some(("office", ca)))
-        .unwrap();
+    std::fs::write(
+        run.path().join("ubuntu-24.04-server-cloudimg-amd64.img"),
+        [],
+    )
+    .unwrap();
+    let identities = run.provision(run.path(), Some(("office", ca))).unwrap();
+    let key = &identities[0];
     assert!(
         run.path()
             .file_name()

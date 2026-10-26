@@ -26,6 +26,9 @@ use tokio::task::{JoinHandle, JoinSet};
 pub use util::{RunDir, random_uuid};
 /// The admin attachment and route.
 pub const JUMP: &str = "jump";
+/// The account a prepared image keeps for the host's own control: key login
+/// only, with sudo and no password.
+pub const ADMIN: &str = "ops";
 /// The largest IP packet a guest's card carries.
 const MTU: u16 = 1500;
 /// The route prefix for the admin jump host.
@@ -57,6 +60,7 @@ pub struct Features {
 /// Software installed while provisioning an Ubuntu cloud guest.
 #[derive(Clone, Default)]
 pub struct Installation {
+    files: Vec<File>,
     packages: Vec<String>,
     steps: Vec<String>,
 }
@@ -118,11 +122,9 @@ pub struct Guest<P = Installation> {
     user: String,
     vcpus: u8,
     memory_mib: u32,
-    clock_lag: Duration,
     manufacturer: String,
     product: String,
     family: Family<Ipv4Addr>,
-    files: Vec<File>,
     desktop: Option<(u16, String)>,
     terminal: Option<String>,
     forbidden: Vec<String>,
@@ -140,11 +142,9 @@ impl<P: Software> Guest<P> {
             user: user.into(),
             vcpus: 2,
             memory_mib: 2048,
-            clock_lag: Duration::ZERO,
             manufacturer: "LENOVO".into(),
             product: "20UES000-WS".into(),
             family: Family::FromWorld,
-            files: Vec::new(),
             desktop: None,
             terminal: None,
             forbidden: Vec::new(),
@@ -173,25 +173,42 @@ impl<P: Software> Guest<P> {
         self.family = family;
         self
     }
-    /// Adds a file with Unix permission bits and UTF-8 content to the seed.
-    pub fn file(mut self, path: &str, mode: u32, content: impl Into<String>) -> Self {
-        self.files.retain(|file| file.path != path);
-        self.files.push(File {
-            path: path.into(),
-            mode,
-            content: content.into(),
-        });
-        self
-    }
-    /// Declares a loopback VNC port and a command that exits zero when the desktop is ready.
+    /// Declares a loopback VNC port and a command, run as the guest's user,
+    /// that exits zero when the desktop is ready.
     pub fn desktop(mut self, port: u16, ready: impl Into<String>) -> Self {
         self.desktop = Some((port, ready.into()));
         self
     }
-    /// Runs a command on the page terminal's PTY instead of a login shell.
+    /// Runs a command as the guest's user on the page terminal's PTY instead
+    /// of a login shell.
     pub fn terminal(mut self, command: impl Into<String>) -> Self {
         self.terminal = Some(command.into());
         self
+    }
+    /// The account the host logs in as: a prepared image's admin, or a cloud
+    /// guest's own user.
+    fn login(&self) -> &str {
+        match self.software.image() {
+            Some(_) => ADMIN,
+            None => &self.user,
+        }
+    }
+    /// `command` as run by the guest's user from the host's login.
+    fn as_user(&self, command: &str) -> String {
+        if self.login() == self.user {
+            command.into()
+        } else {
+            format!("sudo -u {} sh -c {}", self.user, ssh::quote(command))
+        }
+    }
+    /// What the page terminal runs, as the guest's user: its declared
+    /// command, else the user's login shell.
+    fn terminal_command(&self) -> Option<String> {
+        match &self.terminal {
+            Some(command) => Some(self.as_user(command)),
+            None if self.login() == self.user => None,
+            None => Some(format!("sudo -u {} -i", self.user)),
+        }
     }
     /// Adds words that nothing in this guest may contain, beside the shared guest vocabulary.
     pub fn forbid(mut self, words: &[&str]) -> Self {
@@ -266,8 +283,10 @@ impl<P: Software> Guest<P> {
         ]
         .into_iter()
         .chain(
-            self.files
-                .iter()
+            self.software
+                .installation()
+                .into_iter()
+                .flat_map(|i| i.files.iter())
                 .flat_map(|f| [("file path", &f.path), ("file", &f.content)]),
         )
         .chain(
@@ -309,8 +328,9 @@ impl<P: Software> Guest<P> {
 }
 
 impl Guest<Installation> {
-    /// An Ubuntu cloud guest provisioned on its first boot, with background
-    /// refreshes and network time disabled.
+    /// An Ubuntu guest with background refreshes disabled: a cloud guest
+    /// provisioned on its first boot, or the recipe of a prepared image.
+    /// A cloud guest also keeps the host's clock (see [`seed::build`]).
     pub fn ubuntu(hostname: &str, user: &str) -> Self {
         let mut guest = Self::base(hostname, user, Installation::default());
         guest = guest
@@ -328,12 +348,6 @@ impl Guest<Installation> {
                 0o644,
                 "[DEFAULT]\nPrompt=never\n",
             )
-            // The clock comes from the host; network time would request another name.
-            .file(
-                "/etc/systemd/timesyncd.conf",
-                0o644,
-                "[Time]\nNTP=\nFallbackNTP=\n",
-            )
             // Stop unattended apt work after cloud-init's explicit package setup.
             .file(
                 "/etc/apt/apt.conf.d/99periodic",
@@ -344,7 +358,6 @@ impl Guest<Installation> {
             .file("/etc/default/motd-news", 0o644, "ENABLED=0\n");
         // Prevent later refresh starts when desktop setup reloads systemd.
         for unit in [
-            "systemd-timesyncd.service",
             "snapd.socket",
             "snapd.service",
             "snapd.seeded.service",
@@ -374,6 +387,31 @@ impl Guest<Installation> {
         guest
     }
 
+    /// Adds a file with Unix permission bits and UTF-8 content.
+    pub fn file(mut self, path: &str, mode: u32, content: impl Into<String>) -> Self {
+        self.software.files.retain(|file| file.path != path);
+        self.software.files.push(File {
+            path: path.into(),
+            mode,
+            content: content.into(),
+        });
+        self
+    }
+    /// Installs a named root certificate in an image's system trust store,
+    /// which Firefox reads through p11-kit. The name must contain only
+    /// neutral ASCII letters, digits, hyphens, or underscores.
+    pub fn trust(self, name: &str, pem: &str) -> io::Result<Self> {
+        if !valid_name(name) {
+            return Err(io::Error::other("invalid root certificate name"));
+        }
+        Ok(self
+            .file(
+                &format!("/usr/local/share/ca-certificates/{name}.crt"),
+                0o644,
+                pem,
+            )
+            .run("update-ca-certificates"))
+    }
     /// Adds packages to install after the shared trust store is ready.
     pub fn packages(mut self, packages: &[&str]) -> Self {
         self.software
@@ -393,13 +431,15 @@ impl Guest<Installation> {
         self
     }
 
-    /// Takes the installation recipe without runtime network or resource settings.
-    pub fn into_recipe(self) -> io::Result<image::Recipe> {
+    /// Takes the installation recipe without runtime network or resource
+    /// settings, with an [`ADMIN`] account that accepts `admin`.
+    pub fn into_recipe(self, admin: &ssh::Identity) -> io::Result<image::Recipe> {
         self.validate()?;
         Ok(image::Recipe {
             hostname: self.hostname,
             user: self.user,
-            files: self.files,
+            admin_key: admin.authorized_key.clone(),
+            files: self.software.files,
             packages: self
                 .software
                 .packages
@@ -412,7 +452,9 @@ impl Guest<Installation> {
 }
 
 impl Guest<PreparedImage> {
-    /// A guest whose software is already installed.
+    /// A guest whose software, settings and keys are already in its image,
+    /// built with [`Guest::into_recipe`]. The host logs in as [`ADMIN`] with
+    /// the key the build left beside the image.
     ///
     /// ```compile_fail
     /// use fictionet_demo::kit::Guest;
@@ -420,12 +462,6 @@ impl Guest<PreparedImage> {
     /// ```
     pub fn prepared(hostname: &str, user: &str, image: &str) -> Self {
         Self::base(hostname, user, PreparedImage(image.into()))
-    }
-
-    /// Sets the workstation's clock behind the host's during boot setup.
-    pub fn clock_lag(mut self, lag: Duration) -> Self {
-        self.clock_lag = lag;
-        self
     }
 }
 
@@ -450,11 +486,9 @@ impl<P: Software + Into<Boot>> Guest<P> {
             user: self.user,
             vcpus: self.vcpus,
             memory_mib: self.memory_mib,
-            clock_lag: self.clock_lag,
             manufacturer: self.manufacturer,
             product: self.product,
             family: self.family,
-            files: self.files,
             desktop: self.desktop,
             terminal: self.terminal,
             forbidden: self.forbidden,
@@ -496,7 +530,8 @@ impl World {
     pub fn now_unix(&self) -> i64 {
         self.now_unix
     }
-    /// Installs a named root certificate in each guest's system trust store.
+    /// Installs a named root certificate in each cloud guest's system trust
+    /// store; a prepared image trusts what its recipe did ([`Guest::trust`]).
     /// The name must contain only neutral ASCII letters, digits, hyphens, or underscores.
     pub fn trust(&mut self, name: &str, pem: &str) -> fictionet::Result {
         if !valid_name(name) {
@@ -728,9 +763,9 @@ impl Run {
 }
 
 impl Run {
-    /// Waits until `host` shows its desktop and every guest has finished
-    /// setting up. The package mirror stops forwarding setup traffic when
-    /// this returns, ready or not, or when it is dropped unfinished.
+    /// Waits until `host` shows its desktop and every cloud guest has
+    /// finished cloud-init. The package mirror stops forwarding setup traffic
+    /// when this returns, ready or not, or when it is dropped unfinished.
     pub async fn app_ready(&self, host: &str) -> io::Result<()> {
         struct CloseSetup<'a>(&'a std::sync::atomic::AtomicBool);
         impl Drop for CloseSetup<'_> {
@@ -745,8 +780,10 @@ impl Run {
             .await?;
         println!("desktop up: {} ms", desktop.as_millis());
         for guest in &self.guests {
-            let setup = guest.wait_setup(Duration::from_secs(300)).await?;
-            println!("{} ready: {} ms", guest.name(), setup.as_millis());
+            if guest.guest.software.installation().is_some() {
+                let setup = guest.wait_cloud_init(Duration::from_secs(300)).await?;
+                println!("{} ready: {} ms", guest.name(), setup.as_millis());
+            }
         }
         Ok(())
     }
@@ -811,15 +848,20 @@ fn check_downloads<P: Software>(downloads: &Path, guests: &[Guest<P>]) -> io::Re
         }
     }
     for guest in guests {
-        let file = guest
-            .software
-            .image()
-            .unwrap_or("ubuntu-24.04-server-cloudimg-amd64.img");
-        if !downloads.join(file).is_file() {
-            return Err(io::Error::other(format!(
-                "missing {}; build it with cargo xtask search-image <downloads>",
-                downloads.join(file).display()
-            )));
+        let files = match guest.software.image() {
+            Some(name) => {
+                let baked = image::Baked::new(downloads, name);
+                vec![baked.image().to_owned(), baked.admin_key()]
+            }
+            None => vec![downloads.join("ubuntu-24.04-server-cloudimg-amd64.img")],
+        };
+        for file in files {
+            if !file.is_file() {
+                return Err(io::Error::other(format!(
+                    "missing {}; build it with cargo xtask search-image <downloads>",
+                    file.display()
+                )));
+            }
         }
     }
     Ok(())
@@ -914,7 +956,6 @@ where
         .write(true)
         .open("/dev/kvm")
         .map_err(|error| io::Error::other(format!("/dev/kvm is not usable: {error}")))?;
-    let identity = Arc::new(ssh::Identity::generate()?);
     let (mut run, mut prepared) = prepare(name, guests)?;
     run.ownership = Some(ownership);
     ready(run.guests.iter().map(GuestHandle::console).collect());
@@ -922,10 +963,9 @@ where
     let result = async {
         let ca = run.start_world(start, prepared).await?;
         let ca = ca.as_ref().map(|(name, pem)| (name.as_str(), pem.as_str()));
-        let image = downloads.join("ubuntu-24.04-server-cloudimg-amd64.img");
-        run.provision(&image, &identity.authorized_key, ca)?;
+        let identities = run.provision(downloads, ca)?;
         run.start_guests(downloads, backends)?;
-        run.connect_guests(identity).await
+        run.connect_guests(identities).await
     }
     .await;
     match result {
@@ -1007,24 +1047,49 @@ impl Run {
         Ok(ca.lock().unwrap().clone())
     }
 
-    fn provision(&self, image: &Path, key: &str, ca: Option<(&str, &str)>) -> io::Result<()> {
+    /// Writes each guest's overlay, and a cloud guest's seed with a key made
+    /// for this run. Returns the identity the host logs in to each guest with.
+    fn provision(
+        &self,
+        downloads: &Path,
+        ca: Option<(&str, &str)>,
+    ) -> io::Result<Vec<Arc<ssh::Identity>>> {
+        let cloud = self
+            .guests
+            .iter()
+            .any(|guest| guest.guest.software.installation().is_some())
+            .then(ssh::Identity::generate)
+            .transpose()?
+            .map(Arc::new);
+        let mut identities = Vec::new();
         for guest in &self.guests {
-            let image = std::fs::canonicalize(match guest.guest.software.image() {
-                Some(name) => image.parent().unwrap().join(name),
-                None => image.to_path_buf(),
-            })?;
             let r = &guest.resources;
-            std::fs::write(
-                &r.seed,
-                seed::build(&seed::Provision {
-                    guest: &guest.guest,
-                    authorized_key: key,
-                    ca,
-                })?,
-            )?;
-            vm::disk::write_overlay(&r.overlay, &image, 10 << 30)?;
+            let (image, identity) = match guest.guest.software.image() {
+                Some(name) => {
+                    let baked = image::Baked::new(downloads, name);
+                    let identity = Arc::new(ssh::Identity::read(&baked.admin_key())?);
+                    (baked.image().to_owned(), identity)
+                }
+                None => {
+                    let identity = cloud.clone().expect("made for cloud guests");
+                    std::fs::write(
+                        &r.seed,
+                        seed::build(&seed::Provision {
+                            guest: &guest.guest,
+                            authorized_key: &identity.authorized_key,
+                            ca,
+                        })?,
+                    )?;
+                    (
+                        downloads.join("ubuntu-24.04-server-cloudimg-amd64.img"),
+                        identity,
+                    )
+                }
+            };
+            vm::disk::write_overlay(&r.overlay, &std::fs::canonicalize(image)?, 10 << 30)?;
+            identities.push(identity);
         }
-        Ok(())
+        Ok(identities)
     }
 
     fn start_guests(&mut self, downloads: &Path, backends: Vec<BackendInput>) -> io::Result<()> {
@@ -1039,7 +1104,11 @@ impl Run {
                 initrd: &downloads.join("ubuntu-24.04-server-cloudimg-amd64-initrd-generic"),
                 cmdline: "root=LABEL=cloudimg-rootfs ro console=ttyS0,115200n8 net.ifnames=0",
                 overlay: &r.overlay,
-                seed: &r.seed,
+                seed: guest
+                    .guest
+                    .software
+                    .installation()
+                    .map(|_| r.seed.as_path()),
                 net_socket: &r.socket,
                 mac: &mac,
                 vcpus: guest.guest.vcpus,
@@ -1055,13 +1124,12 @@ impl Run {
         Ok(())
     }
 
-    async fn connect_guests(&mut self, identity: Arc<ssh::Identity>) -> io::Result<()> {
+    async fn connect_guests(&mut self, identities: Vec<Arc<ssh::Identity>>) -> io::Result<()> {
         let mut sessions = JoinSet::new();
-        for (index, guest) in self.guests.iter().enumerate() {
+        for ((index, guest), identity) in self.guests.iter().enumerate().zip(identities) {
             let jump = self.jump.as_ref().expect("world started").clone();
-            let identity = identity.clone();
             let addr = guest.addr.clone();
-            let user = guest.guest.user.clone();
+            let user = guest.guest.login().to_owned();
             let console = guest.console.clone();
             let configured = guest.guest.initial_addr().is_some();
             let cx = self.fcx.lock().unwrap().as_ref().unwrap().clone();
@@ -1127,25 +1195,7 @@ impl Run {
                     guest.vm().console_tail()
                 ))
             })?;
-            let session = Arc::new(session);
-            if guest.guest.software.image().is_some() {
-                guest.ssh = Some(session.clone());
-                guest.wait_setup(Duration::from_secs(300)).await?;
-                guest.vm().remove_settings().await?;
-                // The API replies before the guest finishes ejecting the disk.
-                let output = session
-                    .run("udevadm wait --removed /sys/class/block/vdb /dev/disk/by-label/settings")
-                    .await?;
-                if output.code != 0 {
-                    return Err(io::Error::other(format!(
-                        "{}: settings disk removal failed: {}{}",
-                        guest.name(),
-                        output.stdout,
-                        output.stderr
-                    )));
-                }
-            }
-            self.connected(index, session);
+            self.connected(index, Arc::new(session));
         }
         Ok(())
     }
@@ -1163,26 +1213,6 @@ impl Run {
     }
 }
 impl GuestHandle {
-    async fn wait_setup(&self, timeout: Duration) -> io::Result<Duration> {
-        if self.guest.software.image().is_none() {
-            return self.wait_cloud_init(timeout).await;
-        }
-        let output = tokio::time::timeout(
-            timeout,
-            self.ssh()
-                .run_bounded("systemctl is-active workstation-settings.service", 64 << 10),
-        )
-        .await
-        .map_err(io::Error::other)??;
-        if output.code != 0 {
-            return Err(io::Error::other(format!(
-                "guest settings failed: {}{}",
-                output.stdout, output.stderr
-            )));
-        }
-        Ok(self.boot.elapsed())
-    }
-
     /// Waits for cloud-init and returns time since boot. Nonzero status fails
     /// with its report, bounded to 64 KiB.
     pub async fn wait_cloud_init(&self, timeout: Duration) -> io::Result<Duration> {
@@ -1223,10 +1253,16 @@ impl GuestHandle {
             None => out.push_str("No SSH session; only the console tail is available.\n"),
             Some(ssh) => {
                 let desktop = self.guest.desktop.is_some().then_some(DESKTOP_DIAGNOSTICS);
-                for command in DIAGNOSTICS.iter().chain(desktop.into_iter().flatten()) {
+                let commands = DIAGNOSTICS.iter().map(|command| command.to_string()).chain(
+                    desktop
+                        .into_iter()
+                        .flatten()
+                        .map(|command| self.guest.as_user(command)),
+                );
+                for command in commands {
                     let result = tokio::time::timeout(
                         DIAGNOSTIC_TIMEOUT,
-                        ssh.run_bounded(command, DIAGNOSTIC_BYTES),
+                        ssh.run_bounded(&command, DIAGNOSTIC_BYTES),
                     )
                     .await;
                     out.push_str(&match result {

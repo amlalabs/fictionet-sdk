@@ -178,6 +178,11 @@ impl fmt::Debug for Secret {
     }
 }
 
+/// What every Claude subscription token starts with.
+const CLAUDE_TOKEN_PREFIX: &str = "sk-ant-oat01-";
+/// A Claude subscription token's length, prefix included.
+const CLAUDE_TOKEN_LEN: usize = 108;
+
 /// An API key paired with the credential installed in the guest.
 #[derive(Clone)]
 pub struct Credential {
@@ -226,14 +231,42 @@ impl Credential {
             bearer: false,
         }
     }
-    /// A long-lived Claude subscription token, kept on the host with no refresh.
-    pub fn claude_token(cx: &Cx, real: Secret) -> fictionet::Result<Self> {
-        if !real.value.starts_with("sk-ant-oat01-") {
+    /// A long-lived Claude subscription token, kept on the host with no
+    /// refresh, paired with the `placeholder` an image was built with (see
+    /// [`Credential::claude_token_placeholder`]).
+    pub fn claude_token(real: Secret, placeholder: String) -> fictionet::Result<Self> {
+        if !real.value.starts_with(CLAUDE_TOKEN_PREFIX) {
             return Err(Error::msg("Claude OAuth token has an invalid prefix"));
         }
-        let mut credential = Self::api_key(cx, real);
-        credential.bearer = true;
-        Ok(credential)
+        if !placeholder.starts_with(CLAUDE_TOKEN_PREFIX)
+            || placeholder.len() <= CLAUDE_TOKEN_PREFIX.len()
+            || !placeholder
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            || placeholder == real.value
+        {
+            return Err(Error::msg("Claude OAuth token placeholder is invalid"));
+        }
+        Ok(Self {
+            real,
+            placeholder,
+            oauth: None,
+            bearer: true,
+        })
+    }
+    /// Mints a placeholder shaped like a Claude subscription token from the
+    /// system's randomness, for an image to carry in place of the real one.
+    pub fn claude_token_placeholder() -> std::io::Result<String> {
+        const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        let mut bytes = [0; CLAUDE_TOKEN_LEN - CLAUDE_TOKEN_PREFIX.len()];
+        fictionet::random_bytes(&mut bytes)?;
+        Ok(format!(
+            "{CLAUDE_TOKEN_PREFIX}{}",
+            bytes
+                .into_iter()
+                .map(|b| ALPHABET[b as usize % ALPHABET.len()] as char)
+                .collect::<String>()
+        ))
     }
     fn header(&self, provider: Provider) -> &'static str {
         if self.bearer {

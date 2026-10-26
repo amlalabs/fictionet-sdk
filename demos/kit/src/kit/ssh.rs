@@ -6,6 +6,7 @@
 
 use std::future::Future;
 use std::io;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,7 +24,8 @@ pub fn quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
 }
 
-/// A per-run SSH identity.
+/// An SSH identity: a cloud guest's per run, or a prepared image's admin key
+/// from its build.
 pub struct Identity {
     key: Arc<PrivateKey>,
     /// The public key as one `authorized_keys` line.
@@ -33,8 +35,32 @@ pub struct Identity {
 impl Identity {
     /// Generates a fresh ed25519 key from the operating system's randomness.
     pub fn generate() -> io::Result<Identity> {
-        let key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519)
-            .map_err(|e| io::Error::other(format!("ssh key generation: {e}")))?;
+        Self::new(
+            PrivateKey::random(&mut OsRng, Algorithm::Ed25519)
+                .map_err(|e| io::Error::other(format!("ssh key generation: {e}")))?,
+        )
+    }
+
+    /// Reads a private key that [`Identity::write`] wrote.
+    pub fn read(path: &Path) -> io::Result<Identity> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
+        Self::new(
+            PrivateKey::from_openssh(text)
+                .map_err(|e| io::Error::other(format!("{}: {e}", path.display())))?,
+        )
+    }
+
+    /// Writes the private key in OpenSSH format, readable only by its owner.
+    pub fn write(&self, path: &Path) -> io::Result<()> {
+        let text = self
+            .key
+            .to_openssh(russh::keys::ssh_key::LineEnding::LF)
+            .map_err(|e| io::Error::other(format!("ssh private key: {e}")))?;
+        super::image::write_private(path, &text)
+    }
+
+    fn new(key: PrivateKey) -> io::Result<Identity> {
         let authorized_key = key
             .public_key()
             .to_openssh()

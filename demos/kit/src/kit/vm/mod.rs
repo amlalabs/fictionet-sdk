@@ -1,6 +1,6 @@
 //! Cloud Hypervisor as a child process: it boots the unmodified image's
-//! kernel and initrd directly, attaches the per-run overlay and the
-//! cloud-init seed, and takes the guest's one network card from our
+//! kernel and initrd directly, attaches the per-run overlay and, for a cloud
+//! guest, the cloud-init seed, and takes the guest's one network card from our
 //! vhost-user backend. The guest has no vsock or other side channel: the
 //! host reaches it over that card, through the world.
 
@@ -12,7 +12,6 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 
 // `pub static CH_BIN: Option<&[u8]>`: Cloud Hypervisor's static binary when
@@ -31,8 +30,9 @@ pub struct Config<'a> {
     pub cmdline: &'a str,
     /// The writable disk backed by the unmodified cloud image.
     pub overlay: &'a Path,
-    /// The read-only NoCloud seed image.
-    pub seed: &'a Path,
+    /// The read-only NoCloud seed image of a cloud guest; a prepared image
+    /// boots from its overlay alone.
+    pub seed: Option<&'a Path>,
     /// The number of virtual CPUs.
     pub vcpus: u8,
     /// The memory size in MiB.
@@ -93,10 +93,11 @@ impl Vm {
                 "path={},image_type=qcow2,backing_files=on",
                 config.overlay.display()
             ))
-            .arg(format!(
-                "path={},readonly=on,image_type=raw,id=settings",
-                config.seed.display()
-            ))
+            .args(
+                config
+                    .seed
+                    .map(|seed| format!("path={},readonly=on,image_type=raw", seed.display())),
+            )
             .arg("--net")
             .arg(format!(
                 "vhost_user=true,socket={},mac={}",
@@ -132,27 +133,6 @@ impl Vm {
             stderr_log,
             _ch_memfd: ch_memfd,
         })
-    }
-
-    /// Requests unplugging after the guest has applied and unmounted its settings.
-    pub(super) async fn remove_settings(&self) -> io::Result<()> {
-        let socket = super::util::socket_path(&self._socket_dir, "api.sock");
-        let mut stream = tokio::net::UnixStream::connect(socket).await?;
-        let body = r#"{"id":"settings"}"#;
-        let request = format!(
-            "PUT /api/v1/vm.remove-device HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-            body.len()
-        );
-        stream.write_all(request.as_bytes()).await?;
-        let mut status = String::new();
-        BufReader::new(stream).read_line(&mut status).await?;
-        if !status.starts_with("HTTP/1.1 204 ") || !status.ends_with("\r\n") {
-            return Err(io::Error::other(format!(
-                "could not remove the settings disk: {}",
-                status.trim_end()
-            )));
-        }
-        Ok(())
     }
 
     /// The VM child's peak resident memory, in MiB.

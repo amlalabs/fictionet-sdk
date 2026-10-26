@@ -21,15 +21,21 @@ pub struct Ca {
 }
 
 impl Ca {
-    /// A seeded CA whose certificates hold from `earliest` as well as from
-    /// `start`, for a guest whose clock is set back to `earliest` during
-    /// the run.
-    pub fn new(fcx: &Cx, earliest: SystemTime, start: SystemTime) -> fictionet::Result<Ca> {
+    /// A CA under the kept `roots`, whose guest trusts their root, with a
+    /// seeded issuing CA and certificates that hold from `earliest` as well
+    /// as from `start`, for a guest whose clock reads `earliest` during the
+    /// run.
+    pub fn new(
+        fcx: &Cx,
+        roots: &fictionet_extras::zscaler::Roots,
+        earliest: SystemTime,
+        start: SystemTime,
+    ) -> fictionet::Result<Ca> {
         let unix = |at: SystemTime| time::OffsetDateTime::from(at).unix_timestamp();
         Ok(Ca {
             issuer: fictionet_extras::zscaler::zscaler_since(
                 fcx,
-                fictionet_extras::zscaler::DEFAULT_CLOUD,
+                roots,
                 unix(earliest),
                 unix(start),
             )?,
@@ -37,11 +43,6 @@ impl Ca {
             earliest,
             untrusted: OnceLock::new(),
         })
-    }
-
-    /// Returns the public root certificate in PEM format for a guest to trust.
-    pub fn cert_pem(&self) -> String {
-        self.issuer.root_pem().to_owned()
     }
 
     fn world_now(&self, fcx: &Cx) -> time::OffsetDateTime {
