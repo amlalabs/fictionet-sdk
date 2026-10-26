@@ -40,9 +40,14 @@ impl Service for TimeServer {
         pages: &Pages,
         driver: &mut Driver<'_, Collect<Packet>, ()>,
     ) -> Result<serve::Flow, Self::Error> {
-        let now = timestamp(pages.session_now());
+        let at = pages.session_now();
+        let now = timestamp(at);
+        // Answers as a stratum 2 pool server does: synced to an upstream
+        // server a minute ago.
         let server = ServerInfo {
-            reference: now,
+            stratum: 2,
+            reference_id: [194, 58, 204, 148],
+            reference: timestamp(at - std::time::Duration::from_secs(64)),
             ..ServerInfo::default()
         };
         // A packet that is not a request, such as a server's reply, gets

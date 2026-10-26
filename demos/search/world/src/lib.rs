@@ -122,8 +122,9 @@ pub fn net(
         }
         // Live pages come from the internet, so its DNS decides: a name
         // with no address there has none here either. The host's resolver
-        // answers from its cache or with one query, and the answer is kept
-        // for the run.
+        // answers from its cache or with one query. A found address is kept
+        // for the run; a miss is asked again, since a mode switch can change
+        // which names the world serves.
         if forwarded.is_none() && refused_pages.source().is_live() && !on_the_internet(host) {
             resolved(None);
             return None;
