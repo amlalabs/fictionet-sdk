@@ -8,7 +8,7 @@ use fictionet_extras::log::Log;
 use std::{path::PathBuf, sync::Arc, time::Instant};
 use web_world::{
     Addresses, Ca, World,
-    pages::{Pages, Seed},
+    pages::{Pages, Seed, Source},
 };
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
