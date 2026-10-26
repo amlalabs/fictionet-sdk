@@ -24,7 +24,7 @@
 //! let today = Date::from_calendar_date(2026, Month::October, 7).unwrap();
 //! let page = skin.render("Iterator tools", "<h2>Usage</h2><p>Combine values.</p>", today, today).unwrap();
 //! assert!(page.contains("#section-1"));
-//! // Serve search::CSS at /search.css and sites::asset at /_assets/ paths.
+//! // Serve sites::asset at /_assets/ paths.
 //! ```
 #![warn(missing_docs)]
 

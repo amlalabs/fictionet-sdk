@@ -62,15 +62,12 @@ impl Pages {
         let response = cx
             .race(None, backend(repository.join(endpoint), backend_request))
             .await;
+        // A backend that fails leaves the client unanswered, as a site that
+        // cannot be reached does; the log has why.
         Some(match response {
             Ok(Ok(response)) => replay(Ok(Some(response))),
-            _ => Response::new(
-                502,
-                "text/plain; charset=utf-8",
-                "Bad Gateway",
-                vec![],
-                Meta::Missing,
-            ),
+            Ok(Err(error)) => Response::unanswered(error.to_string()),
+            Err(stopped) => Response::unanswered(stopped.to_string()),
         })
     }
 }

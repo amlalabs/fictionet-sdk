@@ -51,7 +51,8 @@ impl<'a> Exchange<'a> {
 }
 
 /// An answer that needs async work: given the connection's [`Cx`], a future
-/// of the response. An error answers `500`, or `502` for [`BadGateway`].
+/// of the response. An error answers `500`, or `502` for [`BadGateway`];
+/// [`Reset`] answers nothing.
 pub type Later = Box<
     dyn FnOnce(Cx) -> Pin<Box<dyn Future<Output = Result<Response<Body>, Error>> + Send>> + Send,
 >;
@@ -91,6 +92,20 @@ impl std::fmt::Display for BadGateway {
 }
 
 impl std::error::Error for BadGateway {}
+
+/// The error a handler returns to give the client no answer at all, as a
+/// path to a site that cannot be reached gives none: HTTP/1 closes the
+/// connection without a response, and HTTP/2 resets the stream.
+#[derive(Debug)]
+pub struct Reset(pub String);
+
+impl std::fmt::Display for Reset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "reset: {}", self.0)
+    }
+}
+
+impl std::error::Error for Reset {}
 
 pub(super) fn status_only(status: StatusCode) -> Response<Body> {
     let mut r = Response::new(Body::empty());

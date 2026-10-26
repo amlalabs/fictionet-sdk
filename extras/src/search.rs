@@ -57,12 +57,23 @@ pub struct Search {
     /// Sponsored results.
     pub ads: Vec<Ad>,
 }
-/// Stylesheet for the built-in layouts and sponsored blocks. Captured pages
-/// keep their own: the DuckDuckGo capture has the built-in layout's body class,
-/// so its header (`.header--html`) keeps it out of scope.
-pub const CSS: &str = r#"
-@scope (html:has(> body.google), html:has(> body.bing), html:has(> body.body--html):not(:has(.header--html)), .uEierd, .b_ad) {
-* { box-sizing: border-box; }
+
+/// One engine's styles for its built-in layout and sponsored blocks,
+/// which its result page carries inline, as the real engines do.
+struct Style {
+    /// What the styles apply within. Captured pages keep their own: the
+    /// DuckDuckGo capture has the built-in layout's body class, so its
+    /// header (`.header--html`) keeps it out of scope.
+    scope: &'static str,
+    rules: &'static str,
+    /// Rules for narrow windows.
+    narrow: &'static str,
+    /// Rules outside the scope, for blocks put into captured pages.
+    unscoped: &'static str,
+}
+
+/// The rules every built-in layout has, within its engine's scope.
+const SHARED: &str = r#"* { box-sizing: border-box; }
 body { margin: 0; background: #fff; color: #202124; font: 14px/1.55 Arial, sans-serif; }
 a { color: #1a0dab; text-decoration: none; }
 a:hover { text-decoration: underline; }
@@ -74,7 +85,18 @@ input[type=submit], button { border: 0; background: transparent; padding: 0 20px
 h2 { font-size: 22px; font-weight: 400; }
 footer { padding: 20px 36px; background: #f2f2f2; color: #70757a; }
 footer a { color: inherit; }
-.google header { padding: 28px 36px 0; border-bottom: 1px solid #ebebeb; display: grid; grid-template-columns: 114px 1fr; gap: 0 28px; align-items: center; }
+"#;
+
+/// The narrow-window rules every built-in layout has.
+const SHARED_NARROW: &str = "  form[role=search], #sb_form, #search_form { width: 100%; }\n";
+
+/// The result icon, in every engine's built-in and captured layouts.
+const RESULT_ICON: &str =
+    ".result-icon { vertical-align: middle; margin-inline-end: 6px; border-radius: 50%; }\n";
+
+const GOOGLE: Style = Style {
+    scope: "html:has(> body.google), .uEierd",
+    rules: r#".google header { padding: 28px 36px 0; border-bottom: 1px solid #ebebeb; display: grid; grid-template-columns: 114px 1fr; gap: 0 28px; align-items: center; }
 #logo { font-size: 30px; letter-spacing: -2px; font-weight: 600; text-decoration: none; }
 #logo span:nth-child(1), #logo span:nth-child(4) { color: #4285f4; }
 #logo span:nth-child(2), #logo span:nth-child(6) { color: #ea4335; }
@@ -102,7 +124,26 @@ footer a { color: inherit; }
 #bres a { display: inline-block; padding: 8px 0; }
 #foot { padding: 24px 0; }
 .google footer { padding-left: 178px; margin-top: 24px; }
-.bing { font-family: "Segoe UI", Arial, sans-serif; color: #444; }
+"#,
+    narrow: r#"  #gb { float: none; justify-content: flex-end; }
+  .google header { padding: 18px 20px 0; grid-template-columns: 120px 1fr; gap: 0 16px; }
+  #res, #bres, #foot, #result-stats { margin-left: 24px; margin-right: 24px; }
+  .google footer { padding-left: 24px; }
+  #hdtb { grid-column: 1 / -1; overflow-x: auto; gap: 24px; }
+"#,
+    unscoped: r#".B6fmyf .csDOgf { display: none; }
+@media (max-width: 979.98px) { #gsr .logo { display: none; } }
+.uEierd { margin: 0 0 24px; font: 14px/1.58 Arial, sans-serif; color: #4d5156; }
+.uEierd + .MjjYud { padding-top: 0; margin-top: 0; }
+.uEierd a { color: #1a0dab; text-decoration: none; }
+.uEierd [role=heading] { font-size: 20px; line-height: 1.3; margin-bottom: 5px; }
+.uEierd .U3A9Ac { display: block; color: #202124; font-weight: 600; margin-bottom: 8px; }
+"#,
+};
+
+const BING: Style = Style {
+    scope: "html:has(> body.bing), .b_ad",
+    rules: r#".bing { font-family: "Segoe UI", Arial, sans-serif; color: #444; }
 #b_header { padding: 26px 36px 0; border-bottom: 1px solid #ececec; display: grid; grid-template-columns: 140px 1fr; gap: 0 24px; align-items: center; }
 .bing-brand { color: #444; font-size: 17px; letter-spacing: -.5px; white-space: nowrap; }
 .bing-brand b { color: #008c9d; font-size: 26px; vertical-align: middle; margin-right: 7px; }
@@ -124,7 +165,17 @@ footer a { color: inherit; }
 #b_context { border-top: 1px solid #eee; max-width: 648px; }
 #b_context ul { list-style: none; padding: 0; columns: 2; }
 #b_context li { margin: 10px 0; }
-.body--html { color: #333; }
+"#,
+    narrow: r#"  #b_header { padding: 18px 20px 0; grid-template-columns: 120px 1fr; gap: 0 16px; }
+  .bing main { margin-left: 24px; margin-right: 24px; }
+  #b_header nav { grid-column: 1 / -1; overflow-x: auto; gap: 24px; }
+"#,
+    unscoped: "",
+};
+
+const DUCKDUCKGO: Style = Style {
+    scope: "html:has(> body.body--html):not(:has(.header--html))",
+    rules: r#".body--html { color: #333; }
 .body--html .header { background: #fafafa; border-bottom: 1px solid #ddd; padding: 24px 32px 18px; display: flex; gap: 28px; align-items: flex-start; }
 .ddg-brand { display: flex; align-items: center; gap: 8px; color: #333; font-size: 18px; padding-top: 5px; white-space: nowrap; }
 .ddg-brand b { display: inline-grid; place-items: center; border-radius: 50%; background: #de5833; color: #fff; width: 38px; height: 38px; font: bold 27px Georgia, serif; }
@@ -144,26 +195,29 @@ footer a { color: inherit; }
 .nav-link .btn { background: #f5f5f5; color: #333; border: 1px solid #ccc; border-radius: 4px; padding: 10px 32px; }
 .feedback-btn { padding: 20px 32px; border-top: 1px solid #eee; }
 .feedback-btn a { color: #666; }
-@media (max-width: 900px) {
-  #gb { float: none; justify-content: flex-end; }
-  .google header, #b_header { padding: 18px 20px 0; grid-template-columns: 120px 1fr; gap: 0 16px; }
-  form[role=search], #sb_form, #search_form { width: 100%; }
-  #res, #bres, #foot, #result-stats, .serp__results, .bing main { margin-left: 24px; margin-right: 24px; }
-  .google footer { padding-left: 24px; }
-  #hdtb, #b_header nav { grid-column: 1 / -1; overflow-x: auto; gap: 24px; }
+"#,
+    narrow: r#"  .serp__results { margin-left: 24px; margin-right: 24px; }
   .body--html .header { flex-wrap: wrap; padding: 20px 24px; gap: 12px; }
+"#,
+    unscoped: ".body--html .result--ad .result__snippet { display: block; }\n",
+};
+
+/// The `<style>` element `engine`'s result page carries in its head.
+fn style(engine: Engine) -> String {
+    let Style {
+        scope,
+        rules,
+        narrow,
+        unscoped,
+    } = match engine {
+        Engine::Google | Engine::YouTube => GOOGLE,
+        Engine::Bing => BING,
+        Engine::DuckDuckGo => DUCKDUCKGO,
+    };
+    format!(
+        "<style>\n@scope ({scope}) {{\n{SHARED}{rules}@media (max-width: 900px) {{\n{SHARED_NARROW}{narrow}}}\n}}\n{unscoped}{RESULT_ICON}</style>"
+    )
 }
-}
-.body--html .result--ad .result__snippet { display: block; }
-.B6fmyf .csDOgf { display: none; }
-@media (max-width: 979.98px) { #gsr .logo { display: none; } }
-.uEierd { margin: 0 0 24px; font: 14px/1.58 Arial, sans-serif; color: #4d5156; }
-.uEierd + .MjjYud { padding-top: 0; margin-top: 0; }
-.result-icon { vertical-align: middle; margin-inline-end: 6px; border-radius: 50%; }
-.uEierd a { color: #1a0dab; text-decoration: none; }
-.uEierd [role=heading] { font-size: 20px; line-height: 1.3; margin-bottom: 5px; }
-.uEierd .U3A9Ac { display: block; color: #202124; font-weight: 600; margin-bottom: 8px; }
-"#;
 
 /// Formats a URL as a host and up to three decoded path segments.
 fn display_url(url: &str) -> String {
@@ -248,9 +302,10 @@ fn google(query: &str, record: &Search, start: u64) -> String {
     let q = e(query);
     let qp = quote_plus(query);
     let count = count_label(record);
+    let css = style(Engine::Google);
     let mut out = vec![format!(
         r#"<!DOCTYPE html><html lang="en-GB"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{q} - Google Search</title><link rel="stylesheet" href="/search.css"></head>
+<title>{q} - Google Search</title>{css}</head>
 <body class="google"><div id="gb"><a href="https://mail.google.com/mail/">Gmail</a> <a href="https://www.google.com/imghp">Images</a> <a href="https://accounts.google.com/ServiceLogin">Sign in</a></div>
 <header><a href="/" id="logo" aria-label="Google"><span>G</span><span>o</span><span>o</span><span>g</span><span>l</span><span>e</span></a><form action="/search" method="GET" role="search"><input name="q" value="{q}" aria-label="Search" type="text"><input type="submit" value="Search"></form>
 <div id="hdtb"><a href="/search?q={qp}">All</a> <a href="/search?q={qp}&amp;tbm=nws">News</a> <a href="/search?q={qp}&amp;tbm=isch">Images</a> <a href="/search?q={qp}&amp;tbm=vid">Videos</a> <a href="https://maps.google.com/maps?q={qp}">Maps</a> <span>More</span> <span>Tools</span></div></header>
@@ -461,10 +516,11 @@ fn ddg_link(url: &str) -> String {
 /// Renders DuckDuckGo results.
 fn duckduckgo(query: &str, record: &Search) -> String {
     let q = e(query);
+    let css = style(Engine::DuckDuckGo);
     let mut out = vec![format!(
         r#"<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
 <html xmlns="http://www.w3.org/1999/xhtml"><head><meta http-equiv="content-type" content="text/html; charset=UTF-8" /><meta name="referrer" content="origin" />
-<meta name="viewport" content="width=device-width, initial-scale=1" /><title>{q} at DuckDuckGo</title><link rel="stylesheet" href="/search.css" type="text/css" /></head>
+<meta name="viewport" content="width=device-width, initial-scale=1" /><title>{q} at DuckDuckGo</title>{css}</head>
 <body class="body--html"><div class="header"><a class="ddg-brand" href="/"><b>D</b>DuckDuckGo</a><form id="search_form" name="x" action="/html/" method="post" role="search"><input type="text" name="q" class="search__input" value="{q}" aria-label="Search" /><input type="submit" class="search__button" value="Search" /><select class="frm__select" name="kl" aria-label="Region"><option value="">All Regions</option><option value="uk-en">United Kingdom</option><option value="us-en">US (English)</option></select></form></div>
 <div class="serp__results"><div id="links" class="results">"#
     )];
@@ -525,8 +581,9 @@ fn bing(query: &str, record: &Search) -> String {
     let q = e(query);
     let qp = quote_plus(query);
     let count = count_label(record);
+    let css = style(Engine::Bing);
     let mut out = vec![format!(
-        r#"<!DOCTYPE html><html lang="en" dir="ltr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{q} - Search</title><link rel="stylesheet" href="/search.css"></head>
+        r#"<!DOCTYPE html><html lang="en" dir="ltr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{q} - Search</title>{css}</head>
 <body class="bing"><header id="b_header"><a class="bing-brand" href="/"><b>◇</b>Microsoft Bing</a><form action="/search" id="sb_form" role="search"><input id="sb_form_q" name="q" type="search" value="{q}" aria-label="Search"><button type="submit">Search</button></form>
 <nav><ul><li><a href="/search?q={qp}">All</a></li><li><a href="/images/search?q={qp}">Images</a></li><li><a href="/videos/search?q={qp}">Videos</a></li><li><a href="/news/search?q={qp}">News</a></li><li><a href="/maps?q={qp}">Maps</a></li></ul></nav></header>
 <main><span class="sb_count">{count}</span><ol id="b_results">"#
@@ -839,9 +896,7 @@ fn results(
             .append_pair("q", query);
         attrs.insert("href", url.to_string());
     }
-    Ok(dom.to_string().replacen(
-        "</head>",
-        "<link rel=\"stylesheet\" href=\"/search.css\"></head>",
-        1,
-    ))
+    Ok(dom
+        .to_string()
+        .replacen("</head>", &format!("{}</head>", style(engine)), 1))
 }

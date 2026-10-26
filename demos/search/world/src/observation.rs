@@ -44,7 +44,8 @@ pub enum SearchObs {
         /// The document's own title, for pages.
         title: Option<String>,
         /// Why the world could not answer with the page: the site it read
-        /// could not be reached.
+        /// could not be reached, and the client's connection was closed
+        /// unanswered, filed under `502`; or the search failed.
         error: Option<String>,
         /// Live-Depth does not allow the address: the world answered as a
         /// site with no such page and fetched nothing.
@@ -526,7 +527,7 @@ impl Pages {
                 }
                 .filter(|title| !title.trim().is_empty()),
                 error: match &response.meta {
-                    Meta::Error { error } => Some(error.clone()),
+                    Meta::Error { error } | Meta::Unanswered { error } => Some(error.clone()),
                     _ => None,
                 },
                 unlisted: matches!(response.meta, Meta::Unlisted),

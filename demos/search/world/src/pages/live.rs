@@ -319,7 +319,8 @@ impl Live {
             return Ok(response);
         }
         // One request, as a browser makes it: a host that cannot be reached
-        // fails with its real error, which the client and the log both get.
+        // fails with its real error, which the log gets. The client's
+        // connection is closed unanswered, as the real network leaves it.
         let observer = self.observer.lock().unwrap().clone();
         let response = self
             .fetcher
@@ -976,13 +977,7 @@ impl Pages {
                     ..copied::replay(Ok(Some(refusal)))
                 }
             }
-            Err(Unanswered::Failed(error)) => Response::new(
-                502,
-                "text/plain; charset=utf-8",
-                "Bad Gateway\n",
-                vec![],
-                Meta::Error { error },
-            ),
+            Err(Unanswered::Failed(error)) => Response::unanswered(error),
         }
     }
 

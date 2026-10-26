@@ -121,7 +121,7 @@ mod sites;
 
 pub use body::Body;
 pub use handlers::{
-    BadGateway, Exchange, Handler, Later, Reply, Tower, UpgradeHandler, text, tower,
+    BadGateway, Exchange, Handler, Later, Reply, Reset, Tower, UpgradeHandler, text, tower,
 };
 
 pub use http2::{Http2, Timer as Http2Timer};

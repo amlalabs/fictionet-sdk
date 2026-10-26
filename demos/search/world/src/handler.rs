@@ -6,8 +6,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use crate::pages::Pages;
-use crate::route::{Route, route};
+use crate::pages::{Asked, Meta, Pages};
 use bytes::Bytes;
 use fictionet::stdlib::web::{self, Body};
 use http::header::{CONTENT_LENGTH, CONTENT_TYPE};
@@ -48,33 +47,13 @@ impl Handler {
             .await
             .map_err(fictionet::Error::msg)?
             .to_bytes();
-        let form = (parts.method == http::Method::POST
-            && parts
-                .headers
-                .get(CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .is_some_and(|v| v.contains("form-urlencoded")))
-        .then_some(&body[..]);
-        let path = parts.uri.path_and_query().map_or("/", |p| p.as_str());
-        let action = route(&target.host, path, form);
-        let url = format!("{}://{}{path}", target.scheme, target.host);
-        let package = match self
-            .pages
-            .git_request(&self.fcx, &target.host, &parts, &body)
-            .await
-        {
-            Some(response) => Some(response),
-            None => self.pages.package(&self.fcx, &url).await,
+        let asked = Asked {
+            scheme: &target.scheme,
+            host: &target.host,
+            parts: &parts,
+            body: &body,
         };
-        let page_source = match package {
-            Some(_) => crate::observation::PageSource::Package,
-            None => self.pages.page_source(),
-        };
-        let request_path = parts
-            .uri
-            .path_and_query()
-            .cloned()
-            .unwrap_or_else(|| http::uri::PathAndQuery::from_static("/"));
+        let dispatch = self.pages.dispatch(&self.fcx, &asked).await;
         let mut waiting = Waiting {
             fcx: self.fcx.clone(),
             pages: self.pages.clone(),
@@ -83,53 +62,26 @@ impl Handler {
                 scheme: target.scheme.clone(),
                 host: target.host.parse()?,
                 method: parts.method.clone(),
-                path: request_path.clone(),
-                source: page_source.clone(),
+                path: parts
+                    .uri
+                    .path_and_query()
+                    .cloned()
+                    .unwrap_or_else(|| http::uri::PathAndQuery::from_static("/")),
+                source: dispatch.source.clone(),
                 elapsed_ms: 0,
                 fetch: crate::observation::Fetch::of(&parts.headers),
             }),
         };
-        let answer = if let Some(package) = package {
-            package
-        } else if let Some(asset) = Pages::search_asset(&target.host, path) {
-            asset
-        } else if let Some(written) = self.pages.written() {
-            written
-                .handle_route(&self.fcx, &parts.method, &target.host, path, action)
-                .await
-        } else if action == Route::Page {
-            // A page's own request belongs to the page that asked for it.
-            let page = (crate::observation::Fetch::of(&parts.headers)
-                == crate::observation::Fetch::Subresource)
-                .then(|| parts.headers.get(http::header::REFERER))
-                .flatten()
-                .and_then(|referrer| referrer.to_str().ok())
-                .and_then(|referrer| url::Url::parse(referrer).ok());
-            self.pages
-                .page(
-                    &self.fcx,
-                    &url,
-                    parts.headers.get(http::header::USER_AGENT),
-                    page,
-                )
-                .await
-        } else {
-            self.pages.handle_route(&self.fcx, action).await
-        };
+        let answer = self
+            .pages
+            .answer(&self.fcx, &asked, dispatch, started)
+            .await?;
         waiting.fact = None;
-        self.pages.report_response(
-            &self.fcx,
-            crate::observation::RequestContext {
-                started,
-                scheme: &target.scheme,
-                host: &target.host.parse()?,
-                method: &parts.method,
-                path: &request_path,
-                source: page_source,
-                headers: parts.headers.clone(),
-            },
-            &answer,
-        );
+        // A site the world could not reach gives the guest no answer, as
+        // the real network gives none: its connection is closed.
+        if let Meta::Unanswered { error } = &answer.meta {
+            return Err(web::httpd::Reset(error.clone()).into());
+        }
         let answer = negotiated(answer, parts.headers.get(http::header::ACCEPT_ENCODING));
         let mut response = Response::builder()
             .status(StatusCode::from_u16(answer.status)?)
