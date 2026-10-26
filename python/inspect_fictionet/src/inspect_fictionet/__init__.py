@@ -1,8 +1,8 @@
 """Use a Fictionet world as an Inspect sandbox, in one line.
 
-    from inspect_fictionet import fictionet_sandbox, WEB_WORLD_IMAGE
+    from inspect_fictionet import CargoExample, fictionet_sandbox
 
-    Task(..., sandbox=fictionet_sandbox(WEB_WORLD_IMAGE, world_args=[...]))
+    Task(..., sandbox=fictionet_sandbox(CargoExample("my_world"), world_args=[...]))
 """
 
 from ._chart import chart_path
@@ -10,7 +10,6 @@ from ._config import (
     AGENT_LIMITS,
     ATTACH_IMAGE,
     ATTACH_LIMITS,
-    WEB_WORLD_IMAGE,
     WORLD_LIMITS,
     WORLD_SOCKET,
     Build,
@@ -24,7 +23,6 @@ __all__ = [
     "AGENT_LIMITS",
     "ATTACH_IMAGE",
     "ATTACH_LIMITS",
-    "WEB_WORLD_IMAGE",
     "WORLD_LIMITS",
     "WORLD_SOCKET",
     "Build",

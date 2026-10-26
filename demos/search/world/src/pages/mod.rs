@@ -1,8 +1,7 @@
 //! The world's pages: copied captures, live copies of the real web, live
 //! copies within links of each search, and live copies edited for a
 //! scenario share one response path. Each search
-//! engine renders the active source's results in its own format. The
-//! standalone `web-world` serves the [`written`] web instead.
+//! engine renders the active source's results in its own format.
 
 mod copied;
 mod edit;
@@ -15,7 +14,6 @@ mod settings;
 pub mod snapshot;
 pub(crate) mod text;
 mod tools;
-pub mod written;
 
 pub use copied::PageBody;
 pub use edit::{Edit, Readiness, Scenario};
@@ -208,6 +206,4 @@ pub struct Pages {
     editor: Option<Arc<edit::Editor>>,
     /// Single requests from the host: package files the copied web lacks.
     fetcher: live::Fetcher,
-    /// The written web, which answers every page and search when present.
-    written: Option<Arc<written::Written>>,
 }

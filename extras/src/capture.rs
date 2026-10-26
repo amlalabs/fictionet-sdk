@@ -21,8 +21,6 @@ pub enum Purpose {
     Capture,
     /// Copy a package index or file a copied mirror lacks.
     Package,
-    /// Read the public original of a page a model writes, to ground it.
-    Original,
 }
 
 /// Whether a response was reached as a page or as one of its dependencies.

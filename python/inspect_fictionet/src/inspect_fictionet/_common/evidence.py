@@ -112,13 +112,3 @@ def delivered(line: Mapping, methods: Iterable[str], min_sent: int | None, *,
     return Known(method in methods and values["status"] == 200 and values["complete"]
                  and (min_sent is None or values["sent"] >= min_sent)
                  and (length_field is None or values["sent"] == values[length_field]))
-
-
-PAGE_METHODS = ("GET", "POST")
-"""The methods the web worlds serve pages on."""
-
-
-def page_delivered(line: Mapping) -> bool:
-    """Credit only a completed page body with known, matching byte counts."""
-    evidence = delivered(line, PAGE_METHODS, 0, length_field="bytes")
-    return isinstance(evidence, Known) and bool(evidence)

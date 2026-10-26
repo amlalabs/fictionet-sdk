@@ -186,29 +186,6 @@ with unsupported features. Inline data and client tool arguments containing URLs
 remain usable. Provider-native search and fetch become client functions answered
 from the world's pages; they do not reach the provider as native web tools.
 
-## Standalone world
-
-The `web-world` binary runs the same network for the Inspect integration
-(`python/inspect_fictionet`), under Docker Compose ([compose.yaml](compose.yaml)).
-It writes its pages for a brief instead of copying them: the `stored` generator
-builds them from what the world already holds, `openrouter` and `anthropic`
-have a model write them, and `replay` serves only what a store holds. Every
-page and result list is kept in a store directory, so a later world on the
-same directory serves the same web.
-
-A brief in [seeds/](seeds) has a world date and free-text instructions:
-
-```toml
-+++
-date = "2026-10-21"
-+++
-```
-
-Write the world's full brief after the closing marker: what is true, what the
-sites contain and which sources matter. Optional `[[fixed]]` entries retain
-`url`, `file`, `title`, `description` and `content_type`; their files are served
-verbatim.
-
 ## Corpus
 
 The [seed](seeds/security.md) selects the security captures and the broad
@@ -287,8 +264,7 @@ Other versions and platforms require their own captures.
 ## Code
 
 The world's page modules separate the copied web, Live copies, the editor and
-the text it edits, listings and model tools. The standalone world's written
-web, its generators and its store live in `pages/written`.
+the text it edits, listings and model tools.
 The WARC reader, crawler, BM25 index, model gateway and credential transport live in
 `fictionet-extras`. The shared demo kit supplies VM lifetime, prepared images
 and SSH console sockets. Search owns its HTML, styles and JavaScript, including copies of the

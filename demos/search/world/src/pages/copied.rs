@@ -345,13 +345,9 @@ impl Pages {
     /// In copied mode only captured hosts and the local search engines exist.
     /// Live and Edited may admit any public hostname. Live-Depth admits the
     /// search engines, the hosts of the addresses it allows, the package
-    /// registries it blocks and the captured package sites. A written world admits any name spelled the way a registered
-    /// site is.
+    /// registries it blocks and the captured package sites.
     pub fn serves_host(&self, host: &str) -> bool {
         let host = host.trim_end_matches('.').to_ascii_lowercase();
-        if self.written.is_some() {
-            return crate::admit(&host).is_ok() && !written::misspelled_host(&host);
-        }
         let packaged = || {
             self.copied.as_ref().is_some_and(|corpus| {
                 corpus
