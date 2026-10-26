@@ -39,6 +39,10 @@ fn definition(root_pem: &str, placeholder: &str) -> io::Result<Guest> {
     .file("/etc/systemd/system/vnc.service.d/time.conf", 0o644,
         "[Unit]\nWants=time-sync.target\nAfter=time-sync.target\n")
     .run("systemctl enable systemd-time-wait-sync.service")
+    // timesyncd starts before the resolver, so its first lookup fails; by
+    // default it then waits 30 s before asking again.
+    .file("/etc/systemd/timesyncd.conf.d/retry.conf", 0o644,
+        "[Time]\nConnectionRetrySec=2\n")
     .file(&format!("/home/{USER}/.hushlogin"), 0o644, "")
     // Firefox is a phone browser: sites see a mobile browser and lay out for
     // the portrait screen the page gives it. Links opened from the terminal
