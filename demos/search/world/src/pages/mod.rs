@@ -19,6 +19,7 @@ pub use copied::PageBody;
 pub use edit::{Edit, Readiness, Scenario};
 pub use live::Allowed;
 pub use seed::Seed;
+pub(crate) use serve::Asked;
 pub use serve::HeldResource;
 pub use settings::{Applied, Command, Rejected};
 pub use tools::ToolResults;
@@ -85,8 +86,12 @@ pub enum Meta {
     /// Live-Depth's network policy blocks this address, so the world
     /// answered with a block page, without fetching it.
     Blocked(Blocked),
-    /// The page could not be copied. The diagnostic says why.
+    /// The search could not be answered. The diagnostic says why.
     Error { error: String },
+    /// The site could not be reached, or the world could not read its
+    /// copy, so the client gets no answer: its connection is closed, as
+    /// the real network closes it. The diagnostic says why.
+    Unanswered { error: String },
 }
 
 /// A result list.
@@ -171,6 +176,12 @@ impl Response {
             vec![],
             Meta::Blocked(blocked),
         )
+    }
+
+    /// No answer, for `error`. The log files it under `502 Bad Gateway`;
+    /// the client gets nothing.
+    fn unanswered(error: String) -> Self {
+        Self::new(502, "", Vec::new(), vec![], Meta::Unanswered { error })
     }
 
     fn not_found() -> Self {

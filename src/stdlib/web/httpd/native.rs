@@ -25,7 +25,7 @@ use super::response::{
 };
 use super::sites::no_host;
 use super::{
-    Body, Exchange, Handler, Later, Limits, PIECE, Reply, UpgradeHandler,
+    Body, Exchange, Handler, Later, Limits, PIECE, Reply, Reset, UpgradeHandler,
     date_header,
 };
 
@@ -608,6 +608,8 @@ impl Pending for Streaming {
                 let response = match making.as_mut().poll(cx) {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(Ok(r)) => r,
+                    // An error on the connection's work closes it unanswered.
+                    Poll::Ready(Err(e)) if e.is::<Reset>() => return Poll::Ready(Some(Err(e))),
                     Poll::Ready(Err(e)) => {
                         error_response(&e)
                     }

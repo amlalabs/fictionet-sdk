@@ -677,13 +677,7 @@ pub(super) fn replay(
             answer
         }
         Ok(None) => Response::not_found(),
-        Err(_) => Response::new(
-            500,
-            "text/plain; charset=utf-8",
-            "Internal Server Error\n",
-            vec![],
-            Meta::Missing,
-        ),
+        Err(error) => Response::unanswered(error.to_string()),
     }
 }
 

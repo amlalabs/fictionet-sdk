@@ -26,7 +26,7 @@ use fictionet::{Cx, Error};
 use super::response::{
     Asked, ResponsePolicy, error_response, request_held,
 };
-use super::{Body, Exchange, Handler, Later, Limits, Received, Reply, text};
+use super::{Body, Exchange, Handler, Later, Limits, Received, Reply, Reset, text};
 
 /// HTTP/2 stream deadline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1168,6 +1168,10 @@ impl Pending for Sending {
             let response = match making.as_mut().poll(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Ok(response)) => response,
+                // An error on the stream's work resets it unanswered.
+                Poll::Ready(Err(error)) if error.is::<Reset>() => {
+                    return Poll::Ready(Some(Err(error)));
+                }
                 Poll::Ready(Err(error)) => {
                     error_response(&error)
                 }

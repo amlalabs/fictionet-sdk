@@ -8,21 +8,123 @@ pub struct HeldResource {
     pub body: Vec<u8>,
 }
 
+/// A request the world answers: the guest's own, or a model's fetch
+/// tool's, which gets the same answer.
+pub(crate) struct Asked<'a> {
+    pub scheme: &'a http::uri::Scheme,
+    /// The host, in lowercase, without a port.
+    pub host: &'a str,
+    pub parts: &'a http::request::Parts,
+    pub body: &'a [u8],
+}
+
+impl Asked<'_> {
+    fn target(&self) -> &str {
+        self.parts.uri.path_and_query().map_or("/", |p| p.as_str())
+    }
+
+    fn url(&self) -> String {
+        format!("{}://{}{}", self.scheme, self.host, self.target())
+    }
+}
+
+/// Where a request's answer comes from, known before the answer is.
+pub(crate) struct Dispatch {
+    pub source: crate::observation::PageSource,
+    /// The answer from a package site or a git repository, when the
+    /// request is for one.
+    package: Option<Response>,
+}
+
 impl Pages {
+    /// Finds where the answer to `asked` comes from: a package site or a
+    /// git repository the world holds, or the active source.
+    pub(crate) async fn dispatch(&self, cx: &Cx, asked: &Asked<'_>) -> Dispatch {
+        let package = match self
+            .git_request(cx, asked.host, asked.parts, asked.body)
+            .await
+        {
+            Some(response) => Some(response),
+            None => self.package(cx, &asked.url()).await,
+        };
+        Dispatch {
+            source: match package {
+                Some(_) => crate::observation::PageSource::Package,
+                None => self.page_source(),
+            },
+            package,
+        }
+    }
+
+    /// Answers `asked` from where `dispatch` found, as any client asking
+    /// gets it: a package file, a search engine's file, a search, an
+    /// engine's redirect or a page. Reports the answer, timed from
+    /// `started`.
+    pub(crate) async fn answer(
+        &self,
+        cx: &Cx,
+        asked: &Asked<'_>,
+        dispatch: Dispatch,
+        started: std::time::Instant,
+    ) -> Result<Response, fictionet::Error> {
+        let Asked {
+            scheme,
+            host,
+            parts,
+            body,
+        } = asked;
+        let target = asked.target();
+        let form = (parts.method == http::Method::POST
+            && parts
+                .headers
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.contains("form-urlencoded")))
+        .then_some(*body);
+        let action = crate::route::route(host, target, form);
+        let answer = if let Some(package) = dispatch.package {
+            package
+        } else if let Some(asset) = Self::search_asset(host, target) {
+            asset
+        } else if action == Route::Page {
+            // A page's own request belongs to the page that asked for it.
+            let page = (crate::observation::Fetch::of(&parts.headers)
+                == crate::observation::Fetch::Subresource)
+                .then(|| parts.headers.get(http::header::REFERER))
+                .flatten()
+                .and_then(|referrer| referrer.to_str().ok())
+                .and_then(|referrer| url::Url::parse(referrer).ok());
+            self.page(
+                cx,
+                &asked.url(),
+                parts.headers.get(http::header::USER_AGENT),
+                page,
+            )
+            .await
+        } else {
+            self.handle_route(cx, action).await
+        };
+        self.report_response(
+            cx,
+            crate::observation::RequestContext {
+                started,
+                scheme,
+                host: &host.parse()?,
+                method: &parts.method,
+                path: &target.parse()?,
+                source: dispatch.source,
+                headers: parts.headers.clone(),
+            },
+            &answer,
+        );
+        Ok(answer)
+    }
+
     pub(crate) fn search_asset(host: &str, target: &str) -> Option<Response> {
         if !crate::route::SEARCH_HOSTS.contains(&host) && host != "www.youtube.com" {
             return None;
         }
         let path = target.split('?').next().unwrap_or(target);
-        if path == "/search.css" {
-            return Some(Response::new(
-                200,
-                "text/css; charset=utf-8",
-                fictionet_extras::search::CSS,
-                vec![],
-                Meta::Asset,
-            ));
-        }
         fictionet_extras::sites::asset(host, path)
             .map(|(mime, bytes)| Response::new(200, mime, bytes, vec![], Meta::Asset))
     }

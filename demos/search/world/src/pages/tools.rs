@@ -50,27 +50,25 @@ impl fictionet_extras::models::Engine for Pages {
     ) -> fictionet_extras::models::tools::Answer<fictionet_extras::models::tools::Page> {
         Box::pin(async move {
             let mut url = url;
+            // The addresses this fetch has asked for: a redirect back to one
+            // is a loop, which a real client gives up on.
+            let mut visited = std::collections::HashSet::new();
             let response = loop {
+                if !visited.insert(url.clone()) {
+                    return Err(fictionet::Error::msg("Page redirects in a loop"));
+                }
                 let started = std::time::Instant::now();
                 let parsed = url::Url::parse(&url)?;
                 let (host, target) = text::target_of(&url);
-                let (response, source) = match self.package(&cx, &url).await {
-                    Some(package) => (package, crate::observation::PageSource::Package),
-                    None => (self.page(&cx, &url, None, None).await, self.page_source()),
+                let (parts, ()) = http::Request::get(target).body(())?.into_parts();
+                let asked = Asked {
+                    scheme: &parsed.scheme().parse()?,
+                    host: &host,
+                    parts: &parts,
+                    body: &[],
                 };
-                self.report_response(
-                    &cx,
-                    crate::observation::RequestContext {
-                        started,
-                        scheme: &parsed.scheme().parse()?,
-                        host: &host.parse()?,
-                        method: &http::Method::GET,
-                        path: &target.parse()?,
-                        source,
-                        headers: http::HeaderMap::new(),
-                    },
-                    &response,
-                );
+                let dispatch = self.dispatch(&cx, &asked).await;
+                let response = self.answer(&cx, &asked, dispatch, started).await?;
                 if let Meta::Redirect { location } = &response.meta {
                     url = parsed.join(location)?.into();
                     continue;
