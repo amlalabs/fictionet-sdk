@@ -13,6 +13,7 @@
 mod dns;
 mod files;
 pub mod handler;
+mod ntp;
 pub mod observation;
 pub mod pages;
 pub mod route;
@@ -111,7 +112,10 @@ pub fn net(
             resolved(None);
             return None;
         }
-        let forwarded = forward(host);
+        // The workstation sets its clock from Ubuntu's time server, which
+        // the world plays in every mode.
+        let forwarded =
+            forward(host).or_else(|| (host == ntp::HOST).then(|| ntp::host(refused_pages.clone())));
         if forwarded.is_none() && !refused_pages.serves_host(host) {
             resolved(None);
             return None;
@@ -193,11 +197,15 @@ pub fn net(
         )
     };
     let report_cx = fcx.clone();
-    let report_pages = pages.clone();
-    let net = fictionet::stdlib::world::net::Net::new()
+    let report_pages = pages;
+    // Live-Depth's names come into being as pages bring links to them, and
+    // a session can switch modes in the running world: a name refused
+    // before resolves once the mode in use serves it.
+    fictionet::stdlib::world::net::Net::new()
         .ipv4_only()
         .drop_unrouted()
         .resolve(site_for)
+        .resolve_misses_again()
         .on_unreachable(move |unreachable| {
             report_pages.report(
                 &report_cx,
@@ -206,14 +214,7 @@ pub fn net(
                     to: unreachable.to,
                 },
             );
-        });
-    // Live-Depth's names come into being as pages bring links to them: a
-    // name refused before its first link resolves once one appears.
-    if pages.source() == crate::pages::Source::LiveDepth {
-        net.resolve_misses_again()
-    } else {
-        net
-    }
+        })
 }
 
 /// Whether the internet's DNS gives `host` an address.

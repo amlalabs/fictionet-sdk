@@ -269,10 +269,11 @@ impl Pages {
     }
 
     /// The answer for the package file at `url`, whatever the page source:
-    /// the captured response, else the real host's, copied when first asked
-    /// for and kept for the run, so installs work for packages the capture
-    /// never saw. `None` for anything that is not a package file, such as a
-    /// project's pages on the same sites, which are pages like any other.
+    /// the captured response. Live and Edited copy a file the capture lacks
+    /// from its real host when first asked for and keep it for the run, so
+    /// installs work for packages the capture never saw. `None` for
+    /// anything that is not a package file, such as a project's pages on
+    /// the same sites, which are pages like any other.
     pub(crate) async fn package(&self, cx: &Cx, url: &str) -> Option<Response> {
         if self.source() == Source::LiveDepth
             && let Some(blocked) = Blocked::of(&url::Url::parse(url).ok()?)
@@ -280,8 +281,10 @@ impl Pages {
             return Some(Response::blocked(url, blocked));
         }
         let captured = self.package_url(url)?;
-        // Live-Depth reaches the internet only for searches and the pages it allows.
-        if captured.status != 404 || self.source() == Source::LiveDepth {
+        // Copied never reaches the internet, and Live-Depth only for
+        // searches and the pages it allows: a file the capture lacks gets
+        // the registry's own not-found answer.
+        if captured.status != 404 || !self.source().is_live() {
             return Some(captured);
         }
         let packages = self.copied.as_ref()?.packages.as_ref()?;
@@ -574,11 +577,20 @@ impl Pages {
     /// guest's clock and of every answer's date: the host's day, or in
     /// Copied mode the day [`copied_lag`](Self::copied_lag) behind it.
     pub fn world_date(&self) -> String {
+        time::OffsetDateTime::from(self.session_now())
+            .date()
+            .to_string()
+    }
+
+    /// The time now on the session's clock: the host's, or in Copied mode
+    /// [`copied_lag`](Self::copied_lag) behind it. The guest's time server
+    /// and every answer's date read it.
+    pub fn session_now(&self) -> std::time::SystemTime {
         let lag = self
             .copied_lag()
             .filter(|_| self.source() == Source::Copied)
             .unwrap_or_default();
-        (time::OffsetDateTime::now_utc() - lag).date().to_string()
+        std::time::SystemTime::now() - lag
     }
 
     pub(super) fn copied_listing(

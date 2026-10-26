@@ -173,9 +173,12 @@ impl Views {
     /// Adds `observation` to what the page shows; `false` when the page
     /// shows nothing new.
     pub fn push(&mut self, mut observation: Observation) -> bool {
-        // Each session is a new run: the page shows only its own.
+        // Each session is a new run: the page shows only its own. A session
+        // on a workstation that is already up has no start-up of its own.
         if let SearchObs::RunStarted { started_at_ms } = observation.fact {
+            let ended_at_ms = self.boot.ended_at_ms;
             *self = Self::default();
+            self.boot.ended_at_ms = ended_at_ms;
             self.view.started_at_ms = started_at_ms;
         }
         let view = &mut self.view;
@@ -375,6 +378,11 @@ impl Views {
         }
         true
     }
+    /// A workstation is booting: what happens until it is ready is its
+    /// start-up.
+    fn begin_boot(&mut self) {
+        self.boot = Boot::default();
+    }
     /// The workstation is ready: what happens from now on is shown.
     pub fn end_boot(&mut self) {
         self.boot.ended_at_ms.get_or_insert_with(wall_start);
@@ -418,8 +426,8 @@ pub struct WorldState {
     pub scenario: Option<Scenario>,
     pub preview: bool,
 }
-/// Where the session is: each mode chosen starts a new one, with a
-/// workstation booted afresh.
+/// Where the session is: each mode chosen starts a new one. The
+/// workstation boots afresh only when the mode's clock differs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Session {
@@ -534,12 +542,13 @@ impl Page {
         self.world
             .send_replace(world_state(pages, preview, source, session));
     }
-    /// A session in `source` is starting: the previous workstation's
-    /// console and status leave the page.
+    /// A session in `source` is starting on a workstation booted for it:
+    /// the previous workstation's console and status leave the page.
     pub fn begin_session(&self, pages: &Pages, source: Source) {
         if let Some(following) = self.following.lock().unwrap().take() {
             following.abort();
         }
+        self.views.lock().unwrap().begin_boot();
         self.console.lock().unwrap().take();
         self.cx.lock().unwrap().take();
         self.host.send_modify(|status| {
@@ -580,6 +589,11 @@ impl Page {
             }
         }));
         let source = self.world.borrow().source;
+        self.refresh(pages, source, Session::Running);
+    }
+    /// A session in `source` started on the workstation already running:
+    /// its console and world stay.
+    pub fn switch_session(&self, pages: &Pages, source: Source) {
         self.refresh(pages, source, Session::Running);
     }
     /// The session's workstation failed to start: its console and world

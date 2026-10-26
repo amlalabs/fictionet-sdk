@@ -97,16 +97,12 @@ impl Handler {
         // Every answer is dated when it is served, as a server dates it,
         // whenever its copy was made. Copied mode's day is the day its
         // newest page was copied, on the guest's clock and in every date.
-        let lag = self
-            .pages
-            .copied_lag()
-            .filter(|_| self.pages.source() == crate::pages::Source::Copied)
-            .unwrap_or_default();
         if let Some(headers) = response.headers_mut()
-            && let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-            && let Ok(date) = http::HeaderValue::from_str(&web::httpd::http_date(
-                now.saturating_sub(lag).as_secs(),
-            ))
+            && let Ok(now) = self
+                .pages
+                .session_now()
+                .duration_since(std::time::UNIX_EPOCH)
+            && let Ok(date) = http::HeaderValue::from_str(&web::httpd::http_date(now.as_secs()))
         {
             headers.insert(http::header::DATE, date);
             // The age a cache in front of the site reported when it was

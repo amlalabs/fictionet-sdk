@@ -55,9 +55,12 @@ to a fresh disk overlay; the prepared image stays unchanged. All demo flows use
 this workstation. The terminal uses ghostty-web and a persistent tmux session;
 Screen shows Firefox. Terminal text starts at 15 px on a dark background in both
 page themes, using the bundled JetBrains Mono font. The page source switch stays
-visible. Choosing Copied, Live, Live-Depth or Edited starts a new session: the
-workstation boots again from the prepared image on that mode's clock, and the
-terminal opens once the clock is set.
+visible. Choosing Copied, Live, Live-Depth or Edited starts a new session, with
+a new run record and an empty activity view. A mode on the same clock (Live,
+Live-Depth and Edited, or Copied again on the same day) keeps the running
+workstation and world. Switching into or out of Copied boots the workstation
+again from the prepared image on that mode's clock, and the terminal opens once
+the clock is set.
 
 On the workstation, a before-and-after run reached full readiness in 63.384 s
 with boot-time installation and 7.213 s with the prepared image. Desktop readiness
@@ -146,7 +149,9 @@ key or a search key. Other sources remain usable. The page reports the source
 that answered each request and search. Copied mode has no public-web fallback.
 Its day is the day its newest page was copied: the workstation clock, HTTP
 dates and the World menu are set back by as many whole days as have passed
-since then, so no page is dated after the guest's clock. A stored copy goes
+since then, so no page is dated after the guest's clock. The workstation sets
+its clock from Ubuntu's default time server, `ntp.ubuntu.com`, which the world
+serves in every mode with the session's time. A stored copy goes
 decoded to a client whose `Accept-Encoding` does not name its coding. Live supplies current
 material. Live search and capture use a separate host HTTP transport, outside
 the guest model gateway. Search queries and served pages are logged and
@@ -241,9 +246,10 @@ The previous astronomy captures remain in `demos/downloads/astronomy/`.
 
 The corpus's `packages/` directory holds separate WARCs for PyPI indexes,
 wheel metadata and distributions, and GitHub source archives. These sites
-replay their captures in every mode. Except in Live-Depth, a file the capture lacks is copied from
+replay their captures in every mode. In Live and Edited, a file the capture lacks is copied from
 its real host when first asked for and kept for the session, so installs work for
-any package; a package that does not exist stays a 404. Captured site 404 pages and their assets
+any package; a package that does not exist stays a 404. In Copied and Live-Depth, a file
+the capture lacks gets the registry's own not-found answer and is never fetched. Captured site 404 pages and their assets
 also supply missing-page responses for the research sources.
 
 Capture the research sources and packages with Python 3.12 and pip available
