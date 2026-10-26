@@ -151,11 +151,6 @@ impl Model {
         ))
     }
 
-    /// Uses the same host-held Claude subscription credential as the guest gateway.
-    pub fn claude_token(key: Key) -> Self {
-        Self::new(Provider::Anthropic, key)
-    }
-
     fn new(provider: Provider, key: Key) -> Self {
         Self {
             provider,
@@ -196,14 +191,6 @@ impl Model {
         };
         match self.provider {
             Provider::Anthropic => {
-                let system = if self.transport.is_claude_token() {
-                    json!([
-                        {"type":"text", "text":"You are Claude Code, Anthropic's official CLI for Claude."},
-                        {"type":"text", "text":system, "cache_control":{"type":"ephemeral"}}
-                    ])
-                } else {
-                    json!(system)
-                };
                 let thinking = match care {
                     Care::Fast => json!({"type": "disabled"}),
                     // Sonnet 5.5 turns thinking off this way.

@@ -8,10 +8,10 @@ rustup run 1.99.0 cargo xtask search-image demos/downloads/cloudimage
 ```
 
 The command verifies the pinned Ubuntu cloud disk, kernel and initrd and Cloud
-Hypervisor, then installs Xfce, Firefox, Claude Code, Codex, Python and the guest
+Hypervisor, then installs Xfce, Firefox, Claude Code, Python and the guest
 settings in a private build VM. Ubuntu packages come from the fixed
 `20261023T000000Z` [archive snapshot](https://snapshot.ubuntu.com/). Firefox's
-Debian archive and the Claude and Codex releases are pinned and checksum-checked.
+Debian archive and the Claude Code release are pinned and checksum-checked.
 
 Before publishing, the candidate boots normally with upstream networking blocked.
 The builder checks Xfce, the Firefox window, the terminal settings and a Python
@@ -58,11 +58,12 @@ this workstation. The terminal uses ghostty-web and a persistent tmux session;
 Screen shows Firefox. Terminal text starts at 15 px on a dark background in both
 page themes, using the bundled JetBrains Mono font. The page source switch stays
 visible. Choosing Copied, Live, Live-Depth or Edited starts a new session, with
-a new run record and an empty activity view. A mode on the same clock (Live,
-Live-Depth and Edited, or Copied again on the same day) keeps the running
-workstation and world. Switching into or out of Copied boots the workstation
-again from the prepared image on that mode's clock, and the terminal opens once
-the clock is set.
+a new run record and an empty activity view. Live and Edited, from
+any mode but Copied, keep the running workstation and world, and so does
+Copied again on the same day. Switching into Live-Depth, or into or out of
+Copied, boots the workstation again from the prepared image on that mode's
+clock, so the world starts with no names, and the terminal opens once the clock
+is set.
 
 On the workstation, a before-and-after run reached full readiness in 63.384 s
 with boot-time installation and 7.213 s with the prepared image. Desktop readiness
@@ -141,8 +142,8 @@ sites. Capture dates are shown only when the archive records them.
   them in the real bytes and serves everything else unchanged, then asks again
   until nothing is left to change. Text that names nothing the scenario is about
   is served without a model call. Real 404s, PDFs and other files stay real.
-  The host-held Claude token takes priority, followed by `OPENROUTER_API_KEY` and
-  `ANTHROPIC_API_KEY`; the editor is Claude Haiku 5.5 and never sends its
+  The editor uses `OPENROUTER_API_KEY`, or else `ANTHROPIC_API_KEY`, never
+  the guest's Claude token; it is Claude Haiku 5.5 and never sends its
   credential through the guest. The feed and the reading view mark each change;
   the guest sees none of this. With no scenario, Edited behaves like Live.
 
@@ -168,7 +169,7 @@ Every world-served HTTPS host uses the Zscaler look-alike chain from
 `fictionet-extras`, with its root installed in the guest. The prepared image
 contains the software; boot has no installation window or download forwarding.
 Interactive provider sign-in, guest token refresh and API key creation stay
-closed throughout the run. This app provides no Codex sign-in or tokenless
+closed throughout the run. This app provides no tokenless
 Claude sign-in flow.
 
 The host reads `CLAUDE_CODE_OAUTH_TOKEN_FILE` at startup. The guest receives a

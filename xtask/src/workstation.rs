@@ -20,11 +20,11 @@ fn definition(root_pem: &str, placeholder: &str) -> io::Result<Guest> {
             format!("/home/{USER}"): {"hasTrustDialogAccepted": true}
         }
     });
-    desktop::codex(desktop::claude_code(desktop::browser_image(
+    desktop::claude_code(desktop::browser_image(
         "workstation",
         USER,
         "https://www.google.com/",
-    )))
+    ))
     .packages(&["xclip", "nmap", "tmux", "python3", "python3-pip", "python3-venv"])
     // An attach copies nothing from the attaching client into the session.
     .file(&format!("/home/{USER}/.tmux.conf"), 0o644,

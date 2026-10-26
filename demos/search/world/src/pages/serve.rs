@@ -86,6 +86,12 @@ impl Pages {
             package
         } else if let Some(asset) = Self::search_asset(host, target) {
             asset
+        } else if action == Route::Page
+            && !matches!(parts.method, http::Method::GET | http::Method::HEAD)
+        {
+            // A page source holds copies of what a site shows, so it has
+            // no answer for a request that sends something.
+            Response::unanswered(format!("{} to a page source", parts.method))
         } else if action == Route::Page {
             // A page's own request belongs to the page that asked for it.
             let page = (crate::observation::Fetch::of(&parts.headers)
@@ -182,34 +188,6 @@ impl Pages {
     pub async fn settled(&self, source: &crate::observation::PageSource, url: &str) {
         if let Some(live) = self.copies_of(source) {
             live.settled(url).await;
-        }
-    }
-
-    /// Copies a file the host's picture of `page`, served from `source`,
-    /// asks for and the world does not hold yet: an image coming into
-    /// view. A Live or Edited page's files are copied, and a Live-Depth
-    /// page's files it allows; the copied web holds all it has.
-    pub async fn copy_for_picture(
-        &self,
-        cx: &Cx,
-        source: &crate::observation::PageSource,
-        page: &url::Url,
-        url: &str,
-    ) {
-        let web = url::Url::parse(url).is_ok_and(|url| matches!(url.scheme(), "http" | "https"));
-        if web
-            && let Some(live) = self.copies_of(source)
-            && let Err(live::Unanswered::Failed(error)) = live
-                .response(
-                    cx,
-                    url,
-                    fictionet_extras::capture::Resource::Requisite,
-                    None,
-                    Some(page.clone()),
-                )
-                .await
-        {
-            eprintln!("{url} could not be copied for the picture of {page}: {error}");
         }
     }
 

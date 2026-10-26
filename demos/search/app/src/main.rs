@@ -25,15 +25,9 @@ fn downloads() -> Result<PathBuf> {
     Ok(folder.into())
 }
 
-fn app_pages(
-    seed: Seed,
-    downloads: &std::path::Path,
-    claude_key: Option<fictionet_extras::models::Key>,
-) -> Result<Pages> {
+fn app_pages(seed: Seed, downloads: &std::path::Path) -> Result<Pages> {
     use web_world::pages::model::Model;
-    let model = if let Some(key) = claude_key {
-        Some(Model::claude_token(key))
-    } else if std::env::var("OPENROUTER_API_KEY").is_ok_and(|key| !key.is_empty()) {
+    let model = if std::env::var("OPENROUTER_API_KEY").is_ok_and(|key| !key.is_empty()) {
         Some(Model::openrouter()?)
     } else if std::env::var("ANTHROPIC_API_KEY").is_ok_and(|key| !key.is_empty()) {
         Some(Model::anthropic()?)
@@ -79,25 +73,24 @@ async fn main() -> Result {
     let roots = Arc::new(fictionet_extras::zscaler::Roots::from_pem(&read_baked(
         baked.trust_root(),
     )?)?);
-    let (claude_token, claude_key) =
-        if let Some(path) = std::env::var_os("CLAUDE_CODE_OAUTH_TOKEN_FILE") {
-            let value = std::fs::read_to_string(path)
-                .map_err(|_| "Cannot read the host Claude OAuth token file")?;
-            let secret =
-                fictionet_extras::models::Secret::new("Claude OAuth token", value.trim().into())?;
-            let key = fictionet_extras::models::Key::claude_token(secret.clone())?;
-            let token = fictionet_extras::models::Credential::claude_token(
-                secret,
-                read_baked(baked.placeholder())?,
-            )?;
-            (Some(token), Some(key))
-        } else {
-            (None, None)
-        };
+    // The guest's Claude Code reaches Anthropic with this token through the
+    // gateway; the editor uses an API key of its own.
+    let claude_token = if let Some(path) = std::env::var_os("CLAUDE_CODE_OAUTH_TOKEN_FILE") {
+        let value = std::fs::read_to_string(path)
+            .map_err(|_| "Cannot read the host Claude OAuth token file")?;
+        let secret =
+            fictionet_extras::models::Secret::new("Claude OAuth token", value.trim().into())?;
+        Some(fictionet_extras::models::Credential::claude_token(
+            secret,
+            read_baked(baked.placeholder())?,
+        )?)
+    } else {
+        None
+    };
     let mut seed = Seed::builtin(SEED)?;
     let today = time::OffsetDateTime::now_utc().date();
     seed.date = today.to_string();
-    let pages = Arc::new(app_pages(seed.clone(), &downloads, claude_key)?);
+    let pages = Arc::new(app_pages(seed.clone(), &downloads)?);
     let output = downloads.join("search");
     std::fs::create_dir_all(&output)?;
     let (page, (observations, commands)) = page::Page::new(pages.clone(), false);
@@ -113,9 +106,9 @@ async fn main() -> Result {
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     // Each session runs until another mode is chosen. A mode on the same
-    // clock starts its session in the running world, on the same
-    // workstation; a mode on another clock boots a fresh workstation, with
-    // a world that starts empty.
+    // clock that can use the names the world already answers starts its
+    // session in the running world, on the same workstation; any other
+    // boots a fresh workstation, with a world that starts empty.
     let result = loop {
         let mut source = *chosen.borrow_and_update();
         let copied_lag = pages.measure_lag();
@@ -188,7 +181,9 @@ async fn main() -> Result {
                             let next = *chosen.borrow_and_update();
                             let next_lag = pages.measure_lag();
                             let cx = cx_slot.lock().unwrap().clone();
-                            let Some(cx) = cx.filter(|_| clock_lag(next, next_lag) == lag) else {
+                            let Some(cx) = cx.filter(|_| {
+                                clock_lag(next, next_lag) == lag && keeps_names(source, next)
+                            }) else {
                                 break Ok(Ended::Chosen);
                             };
                             if let Err(error) = pages.start_session(&cx, next, next_lag) {
@@ -254,6 +249,18 @@ fn clock_lag(source: Source, copied_lag: Option<std::time::Duration>) -> std::ti
         copied_lag.unwrap_or_default()
     } else {
         std::time::Duration::ZERO
+    }
+}
+
+/// Whether a session in `next` can use the names the world answered in
+/// `source`: the world keeps every name it has resolved. Live and Edited
+/// answer every real name, and Copied always the same captured ones;
+/// Live-Depth's names start from its searches, so it starts a new world.
+fn keeps_names(source: Source, next: Source) -> bool {
+    match next {
+        Source::Live | Source::Edited => true,
+        Source::Copied => source == Source::Copied,
+        Source::LiveDepth => false,
     }
 }
 

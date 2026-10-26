@@ -259,8 +259,8 @@ impl Live {
             // A copied page brings what lays a still picture of it out: its
             // stylesheets, CSS imports, fonts and icons, including those of
             // pages already in the archive, so the host's picture of the page
-            // is drawn from what the world holds. Its images come as the
-            // picture or a client asks for them, the way a browser loads
+            // is drawn from what the world holds. Its images come as a
+            // client asks for them, the way a browser loads
             // them as they come into view, so a page with hundreds of images
             // does not send hundreds of requests to its site at once.
             // Scripts, preloads and an image's other sizes come only when a

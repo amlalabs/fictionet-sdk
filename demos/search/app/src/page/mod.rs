@@ -938,20 +938,7 @@ async fn held(
         return http::StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     pages.settled(&source, url.as_str()).await;
-    // An image is copied when the page opened to read first shows it.
-    let holds = {
-        let (pages, source, url) = (pages.clone(), source.clone(), url.clone());
-        tokio::task::spawn_blocking(move || pages.held_resource(&source, url.as_str()).is_some())
-    };
-    let cx = page.cx.lock().unwrap().clone();
-    if matches!(picture, Picture::Reading)
-        && !holds.await.unwrap_or(false)
-        && let Some(cx) = cx
-    {
-        pages
-            .copy_for_picture(&cx, &source, &owner, url.as_str())
-            .await;
-    }
+    // The picture shows only what the world holds: it fetches nothing.
     let held = tokio::task::spawn_blocking(move || {
         let mut held = pages.held_resource(&source, url.as_str())?;
         if held.content_type.starts_with("text/css") {

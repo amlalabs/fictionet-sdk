@@ -25,7 +25,7 @@ pub fn guest() -> Guest<kit::PreparedImage> {
         .terminal("tmux attach -t main");
     guest.features = kit::Features {
         claude_code: true,
-        codex: true,
+        codex: false,
         firefox: true,
     };
     guest

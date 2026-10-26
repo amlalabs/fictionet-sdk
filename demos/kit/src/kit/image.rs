@@ -214,7 +214,7 @@ pub fn installation(recipe: &Recipe) -> String {
     script.push_str("systemctl mask systemd-networkd-wait-online.service pollinate.service\n");
     let cache = ssh::quote(&format!("/home/{user}/.cache"));
     script.push_str(&format!(
-        "rm -f /opt/install-claude.sh /opt/install-codex.sh /opt/setup-desktop.sh\nrm -rf /var/lib/cloud /var/lib/apt/lists/* /var/cache/apt/archives/* /tmp/* /var/tmp/* {cache}\nsystemctl stop systemd-random-seed.service\nrm -f /var/lib/systemd/random-seed /var/lib/systemd/timesync/clock /var/lib/dbus/machine-id\ntruncate -s 0 /etc/machine-id\nrm -rf /mnt/build\nfind /var/log -type f -exec truncate -s 0 {{}} +\nclaude --version\ncodex --version\npython3 --version\nsync\n"
+        "rm -f /opt/install-claude.sh /opt/install-codex.sh /opt/setup-desktop.sh\nrm -rf /var/lib/cloud /var/lib/apt/lists/* /var/cache/apt/archives/* /tmp/* /var/tmp/* {cache}\nsystemctl stop systemd-random-seed.service\nrm -f /var/lib/systemd/random-seed /var/lib/systemd/timesync/clock /var/lib/dbus/machine-id\ntruncate -s 0 /etc/machine-id\nrm -rf /mnt/build\nfind /var/log -type f -exec truncate -s 0 {{}} +\nclaude --version\npython3 --version\nsync\n"
     ));
     script
 }

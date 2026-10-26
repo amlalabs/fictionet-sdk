@@ -360,7 +360,6 @@ python3 -m venv /var/tmp/check-venv
 /var/tmp/check-venv/bin/python -c 'import ssl; import pip'
 rm -rf /var/tmp/check-venv
 claude --version
-codex --version
 firefox --version
 python3 --version
 packages=$(dpkg-query -W -f='${{binary:Package}} ${{Version}}\n' | LC_ALL=C sort | sha256sum | cut -d ' ' -f1)
