@@ -1,22 +1,20 @@
 """World tasks preserve their network and private data configuration."""
 
-import importlib
 from pathlib import Path
 
 import pytest
 import yaml
 
 from inspect_fictionet import fictionet_sandbox
+from inspect_fictionet.worlds.artifactory.tasks import artifactory
 
 
-@pytest.mark.parametrize("name", ["web", "artifactory"])
-def test_tasks_use_isolated_shared_sandbox(name, monkeypatch, tmp_path):
+def test_tasks_use_isolated_shared_sandbox(monkeypatch, tmp_path):
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
-    tasks = importlib.import_module(f"inspect_fictionet.worlds.{name}.tasks")
-    task = getattr(tasks, name)()
+    task = artifactory()
     config = yaml.safe_load(Path(task.sandbox.config).read_text())
     world, attach, agent = (config["services"][key] for key in ("world", "attach", "default"))
-    assert world["network_mode"] == ("bridge" if name == "web" else "none")
+    assert world["network_mode"] == "none"
     assert attach["network_mode"] == "none"
     assert agent["network_mode"] == "service:attach"
     assert "NET_RAW" in agent["cap_drop"]
@@ -24,24 +22,6 @@ def test_tasks_use_isolated_shared_sandbox(name, monkeypatch, tmp_path):
     assert "unix:/run/relay/relay.sock" in attach["command"]
     assert not any(mount["target"] in ("/run/relay", "/var/lib/fictionet") for mount in agent.get("volumes", []))
     assert task.dataset
-
-
-def test_web_model_access_and_store_are_world_only(monkeypatch, tmp_path):
-    from inspect_fictionet.worlds.web.world import world_sandbox
-
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
-    monkeypatch.setenv("OPENROUTER_API_KEY", "private-key")
-    spec = world_sandbox(generator="openrouter", store_dir=tmp_path / "pages")
-    text = Path(spec.config).read_text()
-    config = yaml.safe_load(text)["services"]
-    assert "private-key" not in text
-    assert config["world"]["network_mode"] == "bridge"
-    assert config["world"]["environment"]["OPENROUTER_API_KEY"] == "${OPENROUTER_API_KEY:-}"
-    assert {"type": "bind", "source": str(tmp_path / "pages"), "target": "/var/lib/web"} in config["world"]["volumes"]
-    assert config["attach"]["network_mode"] == "none"
-    assert config["default"]["network_mode"] == "service:attach"
-    assert "OPENROUTER_API_KEY" not in config["default"]["environment"]
-    assert all(mount["type"] == "volume" and mount["read_only"] for mount in config["default"]["volumes"])
 
 
 @pytest.mark.parametrize("options", [

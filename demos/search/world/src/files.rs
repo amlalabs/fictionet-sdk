@@ -28,16 +28,6 @@ impl FileLock {
         file.lock()?;
         Ok(Self(file))
     }
-
-    /// `file`'s lock, or `None` while someone else holds it.
-    pub(crate) fn try_take(file: &File) -> io::Result<Option<Self>> {
-        let file = file.try_clone()?;
-        match file.try_lock() {
-            Ok(()) => Ok(Some(Self(file))),
-            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
-            Err(std::fs::TryLockError::Error(e)) => Err(e),
-        }
-    }
 }
 
 impl Drop for FileLock {

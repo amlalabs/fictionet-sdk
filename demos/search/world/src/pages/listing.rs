@@ -69,12 +69,6 @@ impl Pages {
                 edits: Vec::new(),
             });
         }
-        if let Some(written) = &self.written {
-            return Ok(Found {
-                search: written.results(cx, query, start).await?,
-                edits: Vec::new(),
-            });
-        }
         match self.source() {
             Source::Copied => Ok(Found {
                 search: self.copied_listing(query, start, domains)?,

@@ -27,8 +27,6 @@ pub(in crate::pages) enum Ask<'a> {
     },
     /// Copy a package index or file the copied web lacks.
     Package,
-    /// Read the public original of a page the world writes.
-    Original,
 }
 
 pub(in crate::pages) struct Transport {
@@ -107,13 +105,12 @@ impl Transport {
             url: destination,
             method: match ask {
                 Ask::Search(..) => http::Method::POST,
-                Ask::Copy { .. } | Ask::Package | Ask::Original => http::Method::GET,
+                Ask::Copy { .. } | Ask::Package => http::Method::GET,
             },
             purpose: match ask {
                 Ask::Search(..) => capture::Purpose::Search,
                 Ask::Copy { .. } => capture::Purpose::Capture,
                 Ask::Package => capture::Purpose::Package,
-                Ask::Original => capture::Purpose::Original,
             },
             phase: UpstreamPhase::Attempt,
             status: None,
@@ -158,8 +155,7 @@ impl Transport {
                 Ask::Copy {
                     user_agent: None, ..
                 }
-                | Ask::Package
-                | Ask::Original => client.get(url).header("accept-encoding", "identity"),
+                | Ask::Package => client.get(url).header("accept-encoding", "identity"),
             };
             let response = request.send().await;
             // The innermost cause is the real error: a name that does not

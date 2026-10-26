@@ -13,9 +13,6 @@ from typing import Any, Literal
 #: The `fictionet attach` image. It holds the static binary at `/fictionet`.
 ATTACH_IMAGE = "ghcr.io/amlalabs/fictionet-attach:4903de4"
 
-#: The `web_world` example as an image: a small world of websites.
-WEB_WORLD_IMAGE = "ghcr.io/amlalabs/fictionet-web-world:4903de4"
-
 #: Where the world must listen. The directory is shared with attach only.
 #: On Kubernetes the agent shares the pod's network namespace, so it can
 #: list the world's socket in /proc/net/unix. The path names nothing.

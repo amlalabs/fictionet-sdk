@@ -8,10 +8,7 @@
 //! app projects them into its page.
 //!
 //! The demo app in `demos/search/app` adds the VM, the guest credential
-//! model gateway and the provider sign-in relay. The standalone
-//! `web-world` binary serves the [`pages::written`] web for the Inspect
-//! integration; it accepts its configuration as JSON, followed by socket,
-//! certificate, state and ready-file arguments.
+//! model gateway and the provider sign-in relay.
 
 mod dns;
 mod files;
