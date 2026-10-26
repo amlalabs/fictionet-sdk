@@ -153,7 +153,14 @@ pub fn installation(recipe: &Recipe) -> String {
             &mut script,
             &format!("/etc/sudoers.d/{account}"),
             0o440,
-            &format!("{account} ALL=(ALL) NOPASSWD:ALL\n"),
+            &if account == admin {
+                // The host's own polls stay out of the guest's logs.
+                format!(
+                    "Defaults:{account} !syslog, !pam_session\n{account} ALL=(ALL) NOPASSWD:ALL\n"
+                )
+            } else {
+                format!("{account} ALL=(ALL) NOPASSWD:ALL\n")
+            },
         );
     }
     write_file(
@@ -207,7 +214,7 @@ pub fn installation(recipe: &Recipe) -> String {
     script.push_str("systemctl mask systemd-networkd-wait-online.service pollinate.service\n");
     let cache = ssh::quote(&format!("/home/{user}/.cache"));
     script.push_str(&format!(
-        "rm -f /opt/install-claude.sh /opt/install-codex.sh /opt/setup-desktop.sh\nrm -rf /var/lib/cloud /var/lib/apt/lists/* /var/cache/apt/archives/* /tmp/* /var/tmp/* {cache}\nsystemctl stop systemd-random-seed.service\nrm -f /var/lib/systemd/random-seed /var/lib/dbus/machine-id\ntruncate -s 0 /etc/machine-id\nrm -rf /mnt/build\nfind /var/log -type f -exec truncate -s 0 {{}} +\nclaude --version\ncodex --version\npython3 --version\nsync\n"
+        "rm -f /opt/install-claude.sh /opt/install-codex.sh /opt/setup-desktop.sh\nrm -rf /var/lib/cloud /var/lib/apt/lists/* /var/cache/apt/archives/* /tmp/* /var/tmp/* {cache}\nsystemctl stop systemd-random-seed.service\nrm -f /var/lib/systemd/random-seed /var/lib/systemd/timesync/clock /var/lib/dbus/machine-id\ntruncate -s 0 /etc/machine-id\nrm -rf /mnt/build\nfind /var/log -type f -exec truncate -s 0 {{}} +\nclaude --version\ncodex --version\npython3 --version\nsync\n"
     ));
     script
 }
