@@ -54,8 +54,12 @@ pub fn page(url: &url::Url, html: &str, held: &dyn Fn(&url::Url) -> String) -> S
             .keys()
             .map(|name| name.local.to_string())
             .collect();
+        // An `integrity` hash names the file as the site served it; the
+        // picture loads a copy with its addresses renamed, which the hash
+        // would refuse, leaving the page unstyled.
         for name in names {
-            if name.starts_with("on") || name == "srcset" || name == "action" {
+            if name.starts_with("on") || name == "srcset" || name == "action" || name == "integrity"
+            {
                 attributes.remove(name.as_str());
             }
         }
