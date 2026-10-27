@@ -215,6 +215,10 @@ pub(super) enum Outcome {
     /// The replacement would turn one value of data, or a summary, into
     /// several lines.
     Lines,
+    /// The passage runs over several blocks of a page and the replacement
+    /// has another number of lines: a page's text cannot gain or lose
+    /// blocks, so it would all land in the first one.
+    Blocks,
 }
 
 /// One place an edit is made: its characters and the words that replace
@@ -469,10 +473,14 @@ impl<'a> Document<'a> {
                     } else {
                         within
                     };
-                    found
-                        .into_iter()
-                        .flat_map(|place| self.lines_of(place, &replacement))
-                        .collect()
+                    let mut pieces = Vec::new();
+                    for place in found {
+                        match self.lines_of(place, &replacement) {
+                            Some(lines) => pieces.extend(lines),
+                            None => outcomes[index] = Outcome::Blocks,
+                        }
+                    }
+                    pieces
                 }
                 // A passage over several lines that the text does not hold
                 // together (lines copied side by side that stand apart, as
@@ -647,8 +655,13 @@ impl<'a> Document<'a> {
     /// A place that runs over several lines (table cells, values of data)
     /// with a replacement of as many lines, as one edit per line that
     /// changes, so each line keeps its own place; otherwise the place as
-    /// it is.
-    fn lines_of(&self, place: Range<usize>, replacement: &str) -> Vec<(Range<usize>, String)> {
+    /// it is. `None` when the lines are a page's blocks and the replacement
+    /// has another number of lines.
+    fn lines_of(
+        &self,
+        place: Range<usize>,
+        replacement: &str,
+    ) -> Option<Vec<(Range<usize>, String)>> {
         let breaks: Vec<usize> = place
             .clone()
             .zip(self.text.chars().skip(place.start))
@@ -656,20 +669,26 @@ impl<'a> Document<'a> {
             .map(|(index, _)| index)
             .collect();
         let lines: Vec<&str> = replacement.split('\n').collect();
-        if breaks.is_empty() || lines.len() != breaks.len() + 1 {
-            return vec![(place, replacement.to_owned())];
+        if breaks.is_empty() {
+            return Some(vec![(place, replacement.to_owned())]);
+        }
+        if lines.len() != breaks.len() + 1 {
+            return (!matches!(self.format, Format::Html | Format::Xml))
+                .then(|| vec![(place, replacement.to_owned())]);
         }
         let starts = std::iter::once(place.start).chain(breaks.iter().map(|at| at + 1));
         let ends = breaks.iter().copied().chain(std::iter::once(place.end));
-        starts
-            .zip(ends)
-            .zip(lines)
-            .filter(|((start, end), line)| {
-                let real: String = self.text.chars().skip(*start).take(end - start).collect();
-                normalized(&real) != normalized(line)
-            })
-            .map(|((start, end), line)| (start..end, line.to_owned()))
-            .collect()
+        Some(
+            starts
+                .zip(ends)
+                .zip(lines)
+                .filter(|((start, end), line)| {
+                    let real: String = self.text.chars().skip(*start).take(end - start).collect();
+                    normalized(&real) != normalized(line)
+                })
+                .map(|((start, end), line)| (start..end, line.to_owned()))
+                .collect(),
+        )
     }
 
     /// `place` without the key names it starts with, and `replacement`

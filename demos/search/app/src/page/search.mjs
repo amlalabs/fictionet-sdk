@@ -424,7 +424,7 @@ function feedRow(key, row, item, resources) {
       view.setAttribute('tabindex', '-1');
       view.setAttribute('aria-hidden', 'true');
       view.referrerPolicy = 'no-referrer';
-      view.src = `/thumbnail?${new URLSearchParams({ url: item.thumbnail, picture: 'feed' })}`;
+      view.src = `/thumbnail?${new URLSearchParams({ url: item.thumbnail })}`;
       frame.append(view);
       frame.addEventListener('click', () => select(item.target));
       node.append(frame);
@@ -550,7 +550,7 @@ function servedPage(url) {
   frame.setAttribute('sandbox', 'allow-scripts');
   frame.referrerPolicy = 'no-referrer';
   frame.title = url;
-  frame.src = `/thumbnail?${new URLSearchParams({ url, picture: 'reading' })}`;
+  frame.src = `/thumbnail?${new URLSearchParams({ url })}`;
   return frame;
 }
 function egressRows(purpose) {

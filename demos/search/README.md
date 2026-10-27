@@ -108,8 +108,9 @@ sites. Capture dates are shown only when the archive records them.
   returns an empty list. Missing pages use captured site responses; unknown hosts
   return NXDOMAIN.
 - **Live** is selected by default when `EXA_API_KEY` is present. [Exa search](https://github.com/exa-labs/openapi-spec/blob/master/exa-openapi-spec.yaml)
-  supplies results, which keep their order, titles, URLs and snippets in each
-  engine's skin. The host copies any public URL the guest or Claude requests,
+  supplies results, which keep their order, titles and URLs in each engine's
+  skin; snippets are Exa's highlights as plain text, and Exa's own pages are
+  left out. The host copies any public URL the guest or Claude requests,
   including URLs that never appeared in search. Each page, stylesheet or image
   is copied when requested and retained at its original URL. A copied page also
   brings its stylesheets, CSS imports, fonts, images and scripts, including

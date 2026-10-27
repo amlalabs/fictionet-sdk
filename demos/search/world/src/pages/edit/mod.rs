@@ -379,6 +379,8 @@ that very thing.
 - Use only values the account gives. Never make up a value it does not give (a version \
 number, a date, a figure, a name), and never add an item carrying one (a release, a version in \
 a list, a row); when a statement would need one, write it without that value.
+- Web addresses, paths and link targets stay exactly as they are, wherever they appear: a \
+reader who follows one gets the real page at that address.
 - References and citations record other works: a cited work's title or headline, author, \
 publisher, publication date, archive date and access date never change unless the account \
 changes that work itself. A title in quotation marks or italics in a reference, a citation \
@@ -1063,7 +1065,7 @@ fn report_unmade(url: &str, scoped: &[Scoped<'_>], outcomes: &[Outcome]) {
     for (scoped, outcome) in scoped.iter().zip(outcomes) {
         match outcome {
             Outcome::Made | Outcome::Unchanged | Outcome::EmptyPassage => {}
-            Outcome::NotFound | Outcome::Covered | Outcome::Lines => {
+            Outcome::NotFound | Outcome::Covered | Outcome::Lines | Outcome::Blocks => {
                 eprintln!(
                     "{url}: edit not made ({outcome:?}): {:?}",
                     scoped.edit.passage

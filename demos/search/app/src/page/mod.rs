@@ -851,39 +851,23 @@ struct Preview {
 #[derive(Deserialize)]
 struct Served {
     url: url::Url,
-    picture: Picture,
 }
 /// A dependency of a served page, read from the source that served it.
 #[derive(Deserialize)]
 struct Dependency {
     page: url::Url,
     url: url::Url,
-    picture: Picture,
-}
-/// Where a picture of a served page is shown, which decides whether it may
-/// copy what the world does not hold yet.
-#[derive(Clone, Copy, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum Picture {
-    /// A small picture in the feed: drawn from what the world holds, so a
-    /// feed of many pages sends no requests to their sites.
-    Feed,
-    /// The page opened to read: its images are copied as they come into
-    /// view, as a browser loads them.
-    Reading,
 }
 /// What a still picture of a served page may load: only what the world holds.
 const PICTURE_POLICY: &str = "default-src 'none'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; base-uri 'none'; form-action 'none'";
-fn held_address(page: &url::Url, picture: Picture) -> impl Fn(&url::Url) -> String + '_ {
+/// What a picture shows for an image the world does not hold: nothing, so
+/// the page keeps its layout with no broken-image marks.
+const BLANK: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"/>"#;
+fn held_address(page: &url::Url) -> impl Fn(&url::Url) -> String + '_ {
     move |url| {
-        let picture = match picture {
-            Picture::Feed => "feed",
-            Picture::Reading => "reading",
-        };
         let query = url::form_urlencoded::Serializer::new(String::new())
             .append_pair("page", page.as_str())
             .append_pair("url", url.as_str())
-            .append_pair("picture", picture)
             .finish();
         format!("/held?{query}")
     }
@@ -891,14 +875,14 @@ fn held_address(page: &url::Url, picture: Picture) -> impl Fn(&url::Url) -> Stri
 /// The page as the world served it, with its own stylesheets and images.
 async fn thumbnail(
     State(page): State<Page>,
-    Query(Served { url, picture }): Query<Served>,
+    Query(Served { url }): Query<Served>,
 ) -> axum::response::Response {
     let Some((body, _)) = page.views.lock().unwrap().preview(&url) else {
         return (http::StatusCode::NOT_FOUND, "No served page").into_response();
     };
     let picture = tokio::task::spawn_blocking(move || {
         body.text()
-            .map(|html| web_world::pages::snapshot::page(&url, &html, &held_address(&url, picture)))
+            .map(|html| web_world::pages::snapshot::page(&url, &html, &held_address(&url)))
     })
     .await;
     match picture {
@@ -919,11 +903,8 @@ async fn thumbnail(
 }
 async fn held(
     State(page): State<Page>,
-    Query(Dependency {
-        page: owner,
-        url,
-        picture,
-    }): Query<Dependency>,
+    asked: http::HeaderMap,
+    Query(Dependency { page: owner, url }): Query<Dependency>,
 ) -> axum::response::Response {
     let Some((_, source)) = page.views.lock().unwrap().preview(&owner) else {
         return http::StatusCode::NOT_FOUND.into_response();
@@ -939,30 +920,36 @@ async fn held(
             held.body = web_world::pages::snapshot::stylesheet(
                 &url,
                 &String::from_utf8_lossy(&held.body),
-                &held_address(&owner, picture),
+                &held_address(&owner),
             )
             .into_bytes();
         }
         Some(held)
     })
     .await;
-    match held {
-        // The picture is a sandboxed frame with no origin of its own; its
-        // fonts load only when the reply allows any origin.
-        Ok(Some(held)) => (
-            [
-                (http::header::CONTENT_TYPE, held.content_type),
-                (
-                    http::header::CONTENT_SECURITY_POLICY,
-                    PICTURE_POLICY.to_owned(),
-                ),
-                (http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".to_owned()),
-            ],
-            held.body,
-        )
-            .into_response(),
-        _ => http::StatusCode::NOT_FOUND.into_response(),
-    }
+    let image = asked
+        .get(http::header::ACCEPT)
+        .and_then(|accept| accept.to_str().ok())
+        .is_some_and(|accept| accept.starts_with("image/"));
+    let (content_type, body) = match held {
+        Ok(Some(held)) => (held.content_type, held.body),
+        _ if image => ("image/svg+xml".to_owned(), BLANK.as_bytes().to_vec()),
+        _ => return http::StatusCode::NOT_FOUND.into_response(),
+    };
+    // The picture is a sandboxed frame with no origin of its own; its fonts
+    // and CSS images load only when the reply allows any origin.
+    (
+        [
+            (http::header::CONTENT_TYPE, content_type),
+            (
+                http::header::CONTENT_SECURITY_POLICY,
+                PICTURE_POLICY.to_owned(),
+            ),
+            (http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".to_owned()),
+        ],
+        body,
+    )
+        .into_response()
 }
 /// What the page's socket sends: each stream's latest state as it changes,
 /// and the reply to each command the page sent on it.

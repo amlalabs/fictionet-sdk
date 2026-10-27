@@ -564,9 +564,11 @@ impl Live {
             }
             request["includeDomains"] = json!(allowed);
         }
-        if let Some(blocked) = &domains.blocked_domains {
-            request["excludeDomains"] = json!(blocked);
-        }
+        // Exa's own pages (its library of weather, company and people pages)
+        // would show which engine answers.
+        let mut blocked = domains.blocked_domains.clone().unwrap_or_default();
+        blocked.push("exa.ai".to_owned());
+        request["excludeDomains"] = json!(blocked);
         let response = self
             .fetcher
             .request(
@@ -844,11 +846,13 @@ fn parse_search(value: &Value, key: Option<&Key>) -> Result<search::Search, Stri
             return Err("Exa returned a credential-bearing destination".into());
         }
         let url = warc::key(&item.url).ok_or("Invalid Exa result URL")?;
-        let snippet = item
-            .highlights
-            .map(|parts| parts.join(" "))
-            .or(item.text)
-            .unwrap_or_default();
+        let snippet = plain(
+            &item
+                .highlights
+                .map(|parts| parts.join(" "))
+                .or(item.text)
+                .unwrap_or_default(),
+        );
         search.results.push(search::Result {
             url,
             title: scrub(&item.title),
@@ -857,6 +861,25 @@ fn parse_search(value: &Value, key: Option<&Key>) -> Result<search::Search, Stri
         });
     }
     Ok(search)
+}
+
+/// Exa's highlights as a search engine shows a snippet: plain text, with
+/// no Markdown marks and no link addresses.
+fn plain(markdown: &str) -> String {
+    static IMAGE: OnceLock<regex::Regex> = OnceLock::new();
+    static LINK: OnceLock<regex::Regex> = OnceLock::new();
+    static MARK: OnceLock<regex::Regex> = OnceLock::new();
+    let image = IMAGE.get_or_init(|| regex::Regex::new(r"!\[[^\]]*\]\([^)]*\)").unwrap());
+    let link = LINK.get_or_init(|| regex::Regex::new(r"\[([^\]]*)\]\([^)]*\)").unwrap());
+    // Quote and list marks that start a line, heading marks after a space
+    // (never the one in `C#`), bold marks and code ticks.
+    let mark = MARK.get_or_init(|| {
+        regex::Regex::new(r"(?m)^\s*(?:>|[-*+]|\d+\.)\s+|(?:^|\s)#{1,6}\s+|\*\*|`").unwrap()
+    });
+    let text = image.replace_all(markdown, "");
+    let text = link.replace_all(&text, "$1");
+    let text = mark.replace_all(&text, " ");
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Single requests from the host outside a Live session: package files
