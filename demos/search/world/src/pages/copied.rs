@@ -273,10 +273,14 @@ impl Pages {
     /// from its real host when first asked for and keep it for the run, so
     /// installs work for packages the capture never saw. `None` for
     /// anything that is not a package file, such as a project's pages on
-    /// the same sites, which are pages like any other.
-    pub(crate) async fn package(&self, cx: &Cx, url: &str) -> Option<Response> {
+    /// the same sites, which are pages like any other. A git clone of a
+    /// repository the capture lacks goes to the real host request by
+    /// request, since each answer depends on what the client sent.
+    pub(crate) async fn package(&self, cx: &Cx, asked: &serve::Asked<'_>) -> Option<Response> {
+        let url = &asked.url();
+        let parsed = url::Url::parse(url).ok()?;
         if self.source() == Source::LiveDepth
-            && let Some(blocked) = Blocked::of(&url::Url::parse(url).ok()?)
+            && let Some(blocked) = Blocked::of(&parsed)
         {
             return Some(Response::blocked(url, blocked));
         }
@@ -287,6 +291,16 @@ impl Pages {
         if captured.status != 404 || !self.source().is_live() {
             return Some(captured);
         }
+        if PackageFile::of(&parsed) == Some(PackageFile::Repository) {
+            let git = live::GitRequest::of(asked.parts, asked.body);
+            return Some(match self.fetcher.package(cx, url, Some(git)).await {
+                Ok(response) => package_response(Ok(Some(response))),
+                Err(error) => {
+                    eprintln!("Git request {url} could not be sent: {error}");
+                    captured
+                }
+            });
+        }
         let packages = self.copied.as_ref()?.packages.as_ref()?;
         let cell = packages
             .fetched
@@ -296,7 +310,10 @@ impl Pages {
             .or_default()
             .clone();
         // A host that cannot be reached leaves the capture's answer.
-        match cell.get_or_try_init(|| self.fetcher.package(cx, url)).await {
+        match cell
+            .get_or_try_init(|| self.fetcher.package(cx, url, None))
+            .await
+        {
             Ok(response) => Some(package_response(Ok(Some(response.clone())))),
             Err(error) => {
                 eprintln!("Package file {url} could not be copied: {error}");

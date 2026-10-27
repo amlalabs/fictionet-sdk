@@ -16,6 +16,7 @@ use std::sync::{MutexGuard, OnceLock};
 use tokio::sync::{oneshot, watch};
 
 pub(super) mod transport;
+pub(super) use transport::GitRequest;
 use transport::{Ask, Transport};
 
 pub(super) struct Lifetime {
@@ -912,8 +913,14 @@ pub(super) struct Fetcher {
 
 impl Fetcher {
     /// The real host's response for the package file at `url`, without
-    /// following redirects.
-    pub(super) async fn package(&self, cx: &Cx, url: &str) -> Result<warc::Response, String> {
+    /// following redirects: a copy, or the answer to a git client's
+    /// request when `git` is one.
+    pub(super) async fn package(
+        &self,
+        cx: &Cx,
+        url: &str,
+        git: Option<GitRequest>,
+    ) -> Result<warc::Response, String> {
         let transport = self
             .transport
             .get_or_init(|| Transport::new().map(Arc::new))
@@ -923,8 +930,12 @@ impl Fetcher {
         let observer = self.observer.lock().unwrap().clone();
         let (thread, url) = (cx.clone(), url.to_owned());
         transport.clone().spawn(async move {
+            let ask = match &git {
+                Some(git) => Ask::Git(git),
+                None => Ask::Package,
+            };
             let response = transport
-                .request(&thread, &lifetime, observer, &url, Ask::Package)
+                .request(&thread, &lifetime, observer, &url, ask)
                 .await
                 .map_err(|error| error.to_string());
             let _ = send.send(response);

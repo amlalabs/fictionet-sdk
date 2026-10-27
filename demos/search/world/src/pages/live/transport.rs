@@ -27,6 +27,40 @@ pub(in crate::pages) enum Ask<'a> {
     },
     /// Copy a package index or file the copied web lacks.
     Package,
+    /// Send a git client's request to its real host as it was made.
+    Git(&'a GitRequest),
+}
+
+/// A git client's request to a repository the copied web lacks. Its answer
+/// depends on the method, the body and the protocol headers, so it is sent
+/// each time, never kept.
+pub(in crate::pages) struct GitRequest {
+    pub method: http::Method,
+    pub headers: http::HeaderMap,
+    pub body: Vec<u8>,
+}
+
+impl GitRequest {
+    /// The request as the guest's git client made it, with the headers the
+    /// smart HTTP protocol reads.
+    pub(in crate::pages) fn of(parts: &http::request::Parts, body: &[u8]) -> Self {
+        let mut headers = http::HeaderMap::new();
+        for name in [
+            http::header::CONTENT_TYPE,
+            http::header::ACCEPT,
+            http::header::CONTENT_ENCODING,
+            http::header::HeaderName::from_static("git-protocol"),
+        ] {
+            if let Some(value) = parts.headers.get(&name) {
+                headers.insert(name, value.clone());
+            }
+        }
+        Self {
+            method: parts.method.clone(),
+            headers,
+            body: body.to_vec(),
+        }
+    }
 }
 
 pub(in crate::pages) struct Transport {
@@ -106,11 +140,12 @@ impl Transport {
             method: match ask {
                 Ask::Search(..) => http::Method::POST,
                 Ask::Copy { .. } | Ask::Package => http::Method::GET,
+                Ask::Git(git) => git.method.clone(),
             },
             purpose: match ask {
                 Ask::Search(..) => capture::Purpose::Search,
                 Ask::Copy { .. } => capture::Purpose::Capture,
-                Ask::Package => capture::Purpose::Package,
+                Ask::Package | Ask::Git(_) => capture::Purpose::Package,
             },
             phase: UpstreamPhase::Attempt,
             status: None,
@@ -156,6 +191,11 @@ impl Transport {
                     user_agent: None, ..
                 }
                 | Ask::Package => client.get(url).header("accept-encoding", "identity"),
+                Ask::Git(git) => client
+                    .request(git.method.clone(), url)
+                    .headers(git.headers.clone())
+                    .header("accept-encoding", "identity")
+                    .body(git.body.clone()),
             };
             let response = request.send().await;
             // The innermost cause is the real error: a name that does not

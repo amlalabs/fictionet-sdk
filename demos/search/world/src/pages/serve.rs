@@ -23,7 +23,7 @@ impl Asked<'_> {
         self.parts.uri.path_and_query().map_or("/", |p| p.as_str())
     }
 
-    fn url(&self) -> String {
+    pub(super) fn url(&self) -> String {
         format!("{}://{}{}", self.scheme, self.host, self.target())
     }
 }
@@ -45,7 +45,7 @@ impl Pages {
             .await
         {
             Some(response) => Some(response),
-            None => self.package(cx, &asked.url()).await,
+            None => self.package(cx, asked).await,
         };
         Dispatch {
             source: match package {
