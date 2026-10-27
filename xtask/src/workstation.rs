@@ -26,6 +26,9 @@ fn definition(root_pem: &str, placeholder: &str) -> io::Result<Guest> {
         "https://www.google.com/",
     ))
     .packages(&["xclip", "nmap", "tmux", "python3", "python3-pip", "python3-venv"])
+    // Pages and search results in Chinese, Japanese or Korean, and emoji,
+    // show their glyphs instead of empty boxes.
+    .packages(&["fonts-noto-cjk", "fonts-noto-color-emoji"])
     // An attach copies nothing from the attaching client into the session.
     .file(&format!("/home/{USER}/.tmux.conf"), 0o644,
         "set -g status off\nset -g mouse on\nset -g default-terminal tmux-256color\nset -as terminal-features ',xterm-256color:RGB'\nset -g update-environment \"\"\n")

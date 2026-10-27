@@ -82,6 +82,16 @@ pub struct Output {
     pub stderr: String,
 }
 
+/// Opens a new SSH session with one guest. Each viewer's terminal and
+/// screen gets a session of its own: russh delivers every channel of a
+/// session from one loop, so a viewer that stops reading would stall the
+/// others.
+pub type Dialer = Arc<
+    dyn Fn() -> std::pin::Pin<Box<dyn Future<Output = io::Result<Arc<Session>>> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// An SSH session with the guest: the commands the demo runs, and the
 /// tunnels the viewer uses.
 pub struct Session {

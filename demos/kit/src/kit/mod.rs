@@ -1149,14 +1149,23 @@ impl Run {
                         }
                     }
                 }
-                let session = ssh::Session::connect(
-                    || jump.connect_addr(addr.clone(), 22, Duration::from_secs(10)),
-                    &identity,
-                    &user,
-                    Duration::from_secs(300),
-                )
-                .await;
-                (index, session)
+                // Viewers' sessions are made the same way as the demo's own.
+                let dial: ssh::Dialer = Arc::new(move || {
+                    let (jump, addr, identity, user) =
+                        (jump.clone(), addr.clone(), identity.clone(), user.clone());
+                    Box::pin(async move {
+                        ssh::Session::connect(
+                            || jump.connect_addr(addr.clone(), 22, Duration::from_secs(10)),
+                            &identity,
+                            &user,
+                            Duration::from_secs(300),
+                        )
+                        .await
+                        .map(Arc::new)
+                    })
+                });
+                let session = dial().await;
+                (index, session.map(|session| (session, dial)))
             });
         }
         let mut exited = tokio::time::interval(Duration::from_millis(50));
@@ -1177,7 +1186,7 @@ impl Run {
             };
             let (index, result) = result.map_err(io::Error::other)?;
             let guest = &mut self.guests[index];
-            let session = result.map_err(|e| {
+            let (session, dial) = result.map_err(|e| {
                 io::Error::other(format!(
                     "{}: {e}\n--- cloud-hypervisor stderr ---\n{}\n--- guest console tail ---\n{}",
                     guest.name(),
@@ -1185,12 +1194,12 @@ impl Run {
                     guest.vm().console_tail()
                 ))
             })?;
-            self.connected(index, Arc::new(session));
+            self.connected(index, session, dial);
         }
         Ok(())
     }
 
-    fn connected(&mut self, index: usize, session: Arc<ssh::Session>) {
+    fn connected(&mut self, index: usize, session: Arc<ssh::Session>, dial: ssh::Dialer) {
         let guest = &mut self.guests[index];
         guest.ssh = Some(session);
         guest.boot = self.boot;
@@ -1199,7 +1208,7 @@ impl Run {
         let session = guest.ssh().clone();
         guest
             .console
-            .connected(&cx, session.clone(), guest.addr().unwrap(), self.boot);
+            .connected(&cx, session.clone(), dial, guest.addr().unwrap(), self.boot);
     }
 }
 impl GuestHandle {

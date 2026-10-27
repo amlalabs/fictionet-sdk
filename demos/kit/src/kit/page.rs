@@ -61,6 +61,7 @@ pub struct GuestConsole {
 #[derive(Default)]
 struct SessionState {
     session: Option<Arc<ssh::Session>>,
+    dial: Option<ssh::Dialer>,
     stopped: bool,
     address: Option<std::net::Ipv4Addr>,
 }
@@ -96,17 +97,21 @@ impl GuestConsole {
         }
     }
 
-    fn session(&self) -> io::Result<Arc<ssh::Session>> {
-        let state = self.session.lock().unwrap();
-        if state.stopped {
-            return Err(io::Error::other(format!("{} has stopped", self.name)));
-        }
-        state.session.clone().ok_or_else(|| {
-            io::Error::other(format!(
-                "{} is still booting; its SSH session is not up yet",
-                self.name
-            ))
-        })
+    /// A new session for one viewer's terminal or screen.
+    async fn viewer_session(&self) -> io::Result<Arc<ssh::Session>> {
+        let dial = {
+            let state = self.session.lock().unwrap();
+            if state.stopped {
+                return Err(io::Error::other(format!("{} has stopped", self.name)));
+            }
+            state.dial.clone().ok_or_else(|| {
+                io::Error::other(format!(
+                    "{} is still booting; its SSH session is not up yet",
+                    self.name
+                ))
+            })?
+        };
+        dial().await
     }
 
     pub(super) fn booting(&self, cx: &Cx, configured: Option<std::net::Ipv4Addr>) {
@@ -123,6 +128,7 @@ impl GuestConsole {
         let mut state = self.session.lock().unwrap();
         state.stopped = true;
         state.session.take();
+        state.dial.take();
         self.ready.send_replace(Readiness::Failed(message.into()));
         self.publish(cx, HostState::Failed, vec![], false, false);
     }
@@ -163,6 +169,7 @@ impl GuestConsole {
         &self,
         cx: &Cx,
         session: Arc<ssh::Session>,
+        dial: ssh::Dialer,
         addr: std::net::Ipv4Addr,
         boot: Instant,
     ) {
@@ -171,6 +178,7 @@ impl GuestConsole {
             return;
         }
         state.session = Some(session.clone());
+        state.dial = Some(dial);
         self.publish(cx, HostState::SshUp, vec![addr.to_string()], false, true);
         if let Some((_, command)) = self.desktop.clone() {
             let this = self.clone();
@@ -230,6 +238,7 @@ impl GuestConsole {
         }
         state.stopped = true;
         state.session.take();
+        state.dial.take();
         self.publish(cx, HostState::Stopped, vec![], false, false);
         self.ready.send_replace(Readiness::Stopped);
     }
@@ -286,8 +295,12 @@ impl Console for GuestConsole {
         let port = self.desktop.as_ref()?.0;
         let this = self.clone();
         Some(Box::pin(async move {
-            let session = this.session()?;
-            Ok(Box::new(session.forward("127.0.0.1", port, 0).await?) as Box<dyn Duplex>)
+            let session = this.viewer_session().await?;
+            let channel = session.forward("127.0.0.1", port, 0).await?;
+            Ok(Box::new(Own {
+                channel,
+                _session: session,
+            }) as Box<dyn Duplex>)
         }))
     }
     fn terminal(
@@ -297,18 +310,74 @@ impl Console for GuestConsole {
     ) -> Option<BoxFuture<'static, io::Result<Box<dyn Pty>>>> {
         let this = self.clone();
         Some(Box::pin(async move {
-            let session = this.session()?;
-            Ok(Box::new(
-                session
-                    .pty(
-                        "xterm-256color",
-                        cols.into(),
-                        rows.into(),
-                        this.terminal.as_deref(),
-                    )
-                    .await?,
-            ) as Box<dyn Pty>)
+            let session = this.viewer_session().await?;
+            let channel = session
+                .pty(
+                    "xterm-256color",
+                    cols.into(),
+                    rows.into(),
+                    this.terminal.as_deref(),
+                )
+                .await?;
+            Ok(Box::new(Own {
+                channel,
+                _session: session,
+            }) as Box<dyn Pty>)
         }))
+    }
+}
+
+/// A viewer's channel with the session opened for it alone, which ends
+/// when the viewer leaves.
+struct Own<T> {
+    channel: T,
+    _session: Arc<ssh::Session>,
+}
+
+impl Pty for Own<ssh::Pty> {
+    fn read(&mut self) -> BoxFuture<'_, io::Result<Option<Vec<u8>>>> {
+        Box::pin(self.channel.read())
+    }
+    fn write<'a>(&'a self, bytes: &'a [u8]) -> BoxFuture<'a, io::Result<()>> {
+        Box::pin(self.channel.write(bytes))
+    }
+    fn resize(&self, cols: u16, rows: u16) -> BoxFuture<'_, io::Result<()>> {
+        Box::pin(self.channel.resize(cols.into(), rows.into()))
+    }
+    fn close(&self) -> BoxFuture<'_, io::Result<()>> {
+        Box::pin(self.channel.close())
+    }
+}
+
+impl<T: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Own<T> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().channel).poll_read(cx, buf)
+    }
+}
+
+impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Own<T> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().channel).poll_write(cx, buf)
+    }
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().channel).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().channel).poll_shutdown(cx)
     }
 }
 

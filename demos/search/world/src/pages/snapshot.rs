@@ -35,9 +35,14 @@ pub fn page(url: &url::Url, html: &str, held: &dyn Fn(&url::Url) -> String) -> S
             node.as_node().detach();
         }
     }
-    // A `data:` address carries its file and stays as it is.
+    // A `data:` address carries its file and stays as it is; a bare `#id`
+    // names no file at all.
     let resolve = |value: &str| {
-        base.join(value.trim()).ok().map(|url| match url.scheme() {
+        let value = value.trim();
+        if value.starts_with('#') {
+            return None;
+        }
+        base.join(value).ok().map(|url| match url.scheme() {
             "data" => url.to_string(),
             _ => held(&url),
         })
@@ -84,6 +89,14 @@ pub fn page(url: &url::Url, html: &str, held: &dyn Fn(&url::Url) -> String) -> S
         {
             attributes.insert("src", address);
         }
+        // An icon drawn from another file's sprite: the sandboxed picture
+        // may not load another document's symbols, and Chrome asks again on
+        // every repaint, so only a symbol of the page itself stays.
+        if element == "use" {
+            attributes.map.retain(|name, attribute| {
+                name.local.as_ref() != "href" || attribute.value.trim_start().starts_with('#')
+            });
+        }
         // An image loads as it comes into view, so a picture of the top of
         // a page asks only for the images there.
         if element == "img" {
@@ -129,7 +142,10 @@ const PICTURE_STYLE: &str = "html{overflow-x:hidden}body *{scrollbar-width:none}
 const DESKTOP_ZOOM: &str = "0.398";
 
 /// A stylesheet served at `base` with its `url()` and `@import` addresses
-/// renamed by `held`.
+/// renamed by `held`. A `url(#id)` names an element of the page itself (an
+/// SVG filter, clip path or gradient) and stays as it is: as a `held`
+/// address the sandboxed picture may not load it, and Chrome asks again on
+/// every repaint.
 pub fn stylesheet(base: &url::Url, css: &str, held: &dyn Fn(&url::Url) -> String) -> String {
     static ADDRESS: OnceLock<Regex> = OnceLock::new();
     let address = ADDRESS.get_or_init(|| {
@@ -147,7 +163,7 @@ pub fn stylesheet(base: &url::Url, css: &str, held: &dyn Fn(&url::Url) -> String
                 .or(found.get(3))
                 .or(import)
                 .map_or("", |m| m.as_str());
-            if value.starts_with("data:") || value.is_empty() {
+            if value.starts_with("data:") || value.starts_with('#') || value.is_empty() {
                 return found[0].to_owned();
             }
             let renamed = base.join(value).map(|url| held(&url)).unwrap_or_default();

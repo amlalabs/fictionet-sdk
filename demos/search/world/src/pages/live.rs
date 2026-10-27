@@ -857,10 +857,29 @@ fn parse_search(value: &Value, key: Option<&Key>) -> Result<search::Search, Stri
             url,
             title: scrub(&item.title),
             snippet: scrub(&snippet),
-            date: scrub(&item.date.unwrap_or_default()),
+            date: item.date.as_deref().map(shown_date).unwrap_or_default(),
         });
     }
     Ok(search)
+}
+
+/// Exa's ISO publication time as a search engine shows the date:
+/// "Oct 10, 2025". Anything else shows no date.
+fn shown_date(published: &str) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let mut parts = published.get(..10).unwrap_or_default().split('-');
+    match (
+        parts.next().and_then(|year| year.parse::<u16>().ok()),
+        parts.next().and_then(|month| month.parse::<usize>().ok()),
+        parts.next().and_then(|day| day.parse::<u8>().ok()),
+    ) {
+        (Some(year), Some(month @ 1..=12), Some(day @ 1..=31)) => {
+            format!("{} {day}, {year}", MONTHS[month - 1])
+        }
+        _ => String::new(),
+    }
 }
 
 /// Exa's highlights as a search engine shows a snippet: plain text, with

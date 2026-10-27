@@ -322,10 +322,16 @@ async fn page_terminal_executes_the_declared_command_on_a_pty() {
         Guest::ubuntu("workstation", "analyst").terminal("tmux attach -r -t main; exec bash -l");
     guest.validate().unwrap();
     let console = page::GuestConsole::new(&guest);
+    let session = peer.session.clone();
+    let dial: ssh::Dialer = Arc::new(move || {
+        let session = session.clone();
+        Box::pin(async move { Ok(session) })
+    });
     fictionet::block_on(fictionet::lab(Seed::from_u64(1), |cx| {
         console.connected(
             &cx,
             peer.session.clone(),
+            dial,
             "10.0.0.2".parse().unwrap(),
             Instant::now(),
         );
