@@ -1065,7 +1065,7 @@ fn report_unmade(url: &str, scoped: &[Scoped<'_>], outcomes: &[Outcome]) {
     for (scoped, outcome) in scoped.iter().zip(outcomes) {
         match outcome {
             Outcome::Made | Outcome::Unchanged | Outcome::EmptyPassage => {}
-            Outcome::NotFound | Outcome::Covered | Outcome::Lines | Outcome::Blocks => {
+            Outcome::NotFound | Outcome::Covered | Outcome::Lines => {
                 eprintln!(
                     "{url}: edit not made ({outcome:?}): {:?}",
                     scoped.edit.passage

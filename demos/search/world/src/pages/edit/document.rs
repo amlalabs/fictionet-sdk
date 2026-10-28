@@ -226,10 +226,6 @@ pub(super) enum Outcome {
     /// The replacement would turn one value of data, or a summary, into
     /// several lines.
     Lines,
-    /// The passage runs over several blocks of a page and the replacement
-    /// has another number of lines: a page's text cannot gain or lose
-    /// blocks, so it would all land in the first one.
-    Blocks,
 }
 
 /// One place an edit is made: its characters and the words that replace
@@ -487,10 +483,7 @@ impl<'a> Document<'a> {
                     };
                     let mut pieces = Vec::new();
                     for place in found {
-                        match self.lines_of(place, &replacement) {
-                            Some(lines) => pieces.extend(lines),
-                            None => outcomes[index] = Outcome::Blocks,
-                        }
+                        pieces.extend(self.lines_of(place, &replacement));
                     }
                     pieces
                 }
@@ -647,8 +640,10 @@ impl<'a> Document<'a> {
                 }
             }
             Some(Field::CData) => replacement.replace("]]>", "]]]]><![CDATA[>"),
+            // A page's text breaks a line the way a browser shows one.
             None => match self.format {
-                Format::Html | Format::Xml => crate::pages::text::escape(replacement),
+                Format::Html => crate::pages::text::escape(replacement).replace('\n', "<br>"),
+                Format::Xml => crate::pages::text::escape(replacement),
                 Format::Json | Format::Text | Format::Line => replacement.to_owned(),
             },
         }
@@ -673,43 +668,107 @@ impl<'a> Document<'a> {
         (range.contains(&byte) || range.start == byte).then_some(found)
     }
 
-    /// A place that runs over several lines (table cells, values of data)
-    /// with a replacement of as many lines, as one edit per line that
-    /// changes, so each line keeps its own place; otherwise the place as
-    /// it is. `None` when the lines are a page's blocks and the replacement
-    /// has another number of lines.
-    fn lines_of(
-        &self,
-        place: Range<usize>,
-        replacement: &str,
-    ) -> Option<Vec<(Range<usize>, String)>> {
+    /// A place that runs over several lines (table cells, values of data,
+    /// the lines of an address) as one edit per line that changes, so each
+    /// line keeps its own place. A page's lines are its blocks, which an
+    /// edit cannot add or remove: when the replacement has another number
+    /// of lines, the lines both keep stay, the changed lines between them
+    /// pair up in order, an old line left over is emptied, and a new line
+    /// left over goes in the block before it, on a line of its own (a
+    /// `<br>` on a page). Other text with another number
+    /// of lines is the place as it is.
+    fn lines_of(&self, place: Range<usize>, replacement: &str) -> Vec<(Range<usize>, String)> {
         let breaks: Vec<usize> = place
             .clone()
             .zip(self.text.chars().skip(place.start))
             .filter(|(_, character)| *character == '\n')
             .map(|(index, _)| index)
             .collect();
-        let lines: Vec<&str> = replacement.split('\n').collect();
-        if breaks.is_empty() {
-            return Some(vec![(place, replacement.to_owned())]);
-        }
-        if lines.len() != breaks.len() + 1 {
-            return (!matches!(self.format, Format::Html | Format::Xml))
-                .then(|| vec![(place, replacement.to_owned())]);
+        let new: Vec<&str> = replacement.split('\n').collect();
+        if breaks.is_empty()
+            || (new.len() != breaks.len() + 1 && !matches!(self.format, Format::Html | Format::Xml))
+        {
+            return vec![(place, replacement.to_owned())];
         }
         let starts = std::iter::once(place.start).chain(breaks.iter().map(|at| at + 1));
         let ends = breaks.iter().copied().chain(std::iter::once(place.end));
-        Some(
-            starts
-                .zip(ends)
-                .zip(lines)
-                .filter(|((start, end), line)| {
-                    let real: String = self.text.chars().skip(*start).take(end - start).collect();
-                    normalized(&real) != normalized(line)
-                })
-                .map(|((start, end), line)| (start..end, line.to_owned()))
-                .collect(),
-        )
+        let old: Vec<(Range<usize>, String)> = starts
+            .zip(ends)
+            .map(|(start, end)| {
+                (
+                    start..end,
+                    self.text.chars().skip(start).take(end - start).collect(),
+                )
+            })
+            .collect();
+        let same = |i: usize, j: usize| normalized(&old[i].1) == normalized(new[j]);
+        // The longest run of lines both keep, in order.
+        let mut kept = vec![vec![0u32; new.len() + 1]; old.len() + 1];
+        for i in (0..old.len()).rev() {
+            for j in (0..new.len()).rev() {
+                kept[i][j] = if same(i, j) {
+                    kept[i + 1][j + 1] + 1
+                } else {
+                    kept[i + 1][j].max(kept[i][j + 1])
+                };
+            }
+        }
+        let mut pieces: Vec<(Range<usize>, String)> = Vec::new();
+        let (mut i, mut j) = (0, 0);
+        while i < old.len() || j < new.len() {
+            if i < old.len() && j < new.len() && same(i, j) && kept[i][j] == kept[i + 1][j + 1] + 1
+            {
+                i += 1;
+                j += 1;
+                continue;
+            }
+            let (from, to) = (i, j);
+            while (i < old.len() || j < new.len())
+                && !(i < old.len()
+                    && j < new.len()
+                    && same(i, j)
+                    && kept[i][j] == kept[i + 1][j + 1] + 1)
+            {
+                if j >= new.len() || (i < old.len() && kept[i + 1][j] >= kept[i][j + 1]) {
+                    i += 1;
+                } else {
+                    j += 1;
+                }
+            }
+            let (gone, added) = (&old[from..i], &new[to..j]);
+            if gone.is_empty() {
+                // Lines only added: they join the line before, or the one after.
+                let words = added.join("\n");
+                if from > 0 {
+                    let (range, text) = &old[from - 1];
+                    match pieces.last_mut().filter(|(last, _)| last == range) {
+                        Some((_, written)) => *written = format!("{written}\n{words}"),
+                        None => pieces.push((range.clone(), format!("{text}\n{words}"))),
+                    }
+                } else if let Some((range, text)) = old.get(i) {
+                    pieces.push((range.clone(), format!("{words}\n{text}")));
+                }
+                continue;
+            }
+            for (index, (range, _)) in gone.iter().enumerate() {
+                let line = match added.len() {
+                    count if index + 1 < count.min(gone.len()) => added[index].to_owned(),
+                    count if index + 1 == count.min(gone.len()) => added[index..].join("\n"),
+                    _ => String::new(),
+                };
+                pieces.push((range.clone(), line));
+            }
+        }
+        pieces.retain(|(range, line)| {
+            let real: String = self
+                .text
+                .chars()
+                .skip(range.start)
+                .take(range.len())
+                .collect();
+            normalized(&real) != normalized(line)
+        });
+        pieces
     }
 
     /// `place` without the key names it starts with, and `replacement`
