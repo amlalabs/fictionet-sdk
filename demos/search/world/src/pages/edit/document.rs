@@ -182,6 +182,17 @@ pub(super) struct Document<'a> {
     /// Characters that name the keys a value sits under (`events.fixed: `):
     /// read with the value, never edited.
     labels: Vec<Range<usize>>,
+    /// The page's links, so a link whose words an edit replaces can name
+    /// what they name now.
+    links: Vec<Link>,
+}
+
+/// A link on a page: the characters of its text, and the source bytes of
+/// its address and title.
+struct Link {
+    text: Range<usize>,
+    href: Option<Range<usize>>,
+    title: Option<Range<usize>>,
 }
 
 /// A run of the text read on its own: its character range and its text.
@@ -342,6 +353,7 @@ impl<'a> Document<'a> {
             title: reader.title,
             fields,
             labels: reader.labels,
+            links: reader.links,
         }
     }
 
@@ -535,6 +547,9 @@ impl<'a> Document<'a> {
         });
         let mut taken: Vec<Range<usize>> = Vec::new();
         let mut splices = Vec::new();
+        // The words of the page's text each change replaced, and what
+        // replaced them, for the links they sit in.
+        let mut renamed: Vec<(Range<usize>, String)> = Vec::new();
         let mut changes = Vec::new();
         for place in places {
             if taken
@@ -560,22 +575,28 @@ impl<'a> Document<'a> {
                 replacement: place.replacement.clone(),
             };
             changes.push((field.is_some(), place.edit, place.chars.start, change));
-            let written = self.written(&place.replacement, field);
             let marked = self.format == Format::Html
                 && field.is_none()
                 && !self
                     .title
                     .as_ref()
                     .is_some_and(|title| title.contains(&first));
-            for (run, bytes) in self.runs(place.chars.clone()).into_iter().enumerate() {
-                splices.push(Splice {
-                    bytes,
-                    written: (run == 0).then(|| written.clone()),
-                    marked,
-                });
+            for (chars, replacement) in self.hunks(&place.chars, &place.replacement, field) {
+                let written = self.written(&replacement, field);
+                for (run, bytes) in self.runs(chars.clone()).into_iter().enumerate() {
+                    splices.push(Splice {
+                        bytes,
+                        written: (run == 0).then(|| written.clone()),
+                        marked,
+                    });
+                }
+                if field.is_none() {
+                    renamed.push((chars, replacement));
+                }
             }
             taken.push(place.chars);
         }
+        splices.extend(self.relinked(&renamed));
         splices.sort_by_key(|splice| splice.bytes.start);
         let mut served = String::with_capacity(self.source.len());
         let mut marked = String::with_capacity(self.source.len());
@@ -795,6 +816,217 @@ impl<'a> Document<'a> {
         }
         runs
     }
+
+    /// The runs of `place` that `replacement` changes, word by word, each
+    /// with the words that replace it: the words it keeps stay as the site
+    /// sent them, with the tags around them, so a link on a name the edit
+    /// keeps stays on that name. Words the replacement adds go in front of
+    /// the next word or mark it keeps, or after the last one. A bare value
+    /// of data is one value, replaced whole.
+    fn hunks(
+        &self,
+        place: &Range<usize>,
+        replacement: &str,
+        field: Option<Field>,
+    ) -> Vec<(Range<usize>, String)> {
+        if matches!(field, Some(Field::Literal { quote: BARE, .. })) {
+            return vec![(place.clone(), replacement.to_owned())];
+        }
+        let old: Vec<char> = self
+            .text
+            .chars()
+            .skip(place.start)
+            .take(place.len())
+            .collect();
+        let new: Vec<char> = replacement.chars().collect();
+        let (before, after) = (tokens(&old), tokens(&new));
+        let same = |i: usize, j: usize| old[before[i].clone()] == new[after[j].clone()];
+        // The longest run of tokens both keep, in order.
+        let mut kept = vec![vec![0u32; after.len() + 1]; before.len() + 1];
+        for i in (0..before.len()).rev() {
+            for j in (0..after.len()).rev() {
+                kept[i][j] = if same(i, j) {
+                    kept[i + 1][j + 1] + 1
+                } else {
+                    kept[i + 1][j].max(kept[i][j + 1])
+                };
+            }
+        }
+        // Each change as the tokens it replaces and the tokens replacing
+        // them; `None` marks a token both keep.
+        let mut changes: Vec<Option<(Range<usize>, Range<usize>)>> = Vec::new();
+        let (mut i, mut j) = (0, 0);
+        while i < before.len() || j < after.len() {
+            if i < before.len()
+                && j < after.len()
+                && same(i, j)
+                && kept[i][j] == kept[i + 1][j + 1] + 1
+            {
+                changes.push(None);
+                i += 1;
+                j += 1;
+                continue;
+            }
+            let (from, to) = (i, j);
+            while (i < before.len() || j < after.len())
+                && !(i < before.len()
+                    && j < after.len()
+                    && same(i, j)
+                    && kept[i][j] == kept[i + 1][j + 1] + 1)
+            {
+                if j >= after.len() || (i < before.len() && kept[i + 1][j] >= kept[i][j + 1]) {
+                    i += 1;
+                } else {
+                    j += 1;
+                }
+            }
+            changes.push(Some((from..i, to..j)));
+        }
+        // A change that only adds words takes the next kept token with it,
+        // or the one before when it comes last.
+        let mut hunks: Vec<(Range<usize>, Range<usize>)> = Vec::new();
+        let mut index = 0;
+        while index < changes.len() {
+            match changes[index].clone() {
+                None => index += 1,
+                Some((gone, added)) if gone.is_empty() => {
+                    if matches!(changes.get(index + 1), Some(None)) {
+                        hunks.push((gone.start..gone.start + 1, added.start..added.end + 1));
+                        index += 2;
+                        continue;
+                    }
+                    match hunks.last_mut() {
+                        Some(last) if last.0.end == gone.start => last.1.end = added.end,
+                        _ if gone.start > 0 => {
+                            hunks.push((gone.start - 1..gone.start, added.start - 1..added.end))
+                        }
+                        _ => return vec![(place.clone(), replacement.to_owned())],
+                    }
+                    index += 1;
+                }
+                Some(change) => {
+                    hunks.push(change);
+                    index += 1;
+                }
+            }
+        }
+        hunks
+            .into_iter()
+            .map(|(gone, added)| {
+                let chars =
+                    place.start + before[gone.start].start..place.start + before[gone.end - 1].end;
+                let words: String = if added.is_empty() {
+                    String::new()
+                } else {
+                    new[after[added.start].start..after[added.end - 1].end]
+                        .iter()
+                        .collect()
+                };
+                (chars, words)
+            })
+            .collect()
+    }
+
+    /// Splices that keep each link naming what its text now says: where
+    /// words a change replaced in a link's text also appear in its
+    /// address's last part (a wiki's `/wiki/Manchester`,
+    /// `Category:Companies_based_in_Manchester`) or its title, they are
+    /// replaced there too.
+    fn relinked(&self, renamed: &[(Range<usize>, String)]) -> Vec<Splice> {
+        let mut splices = Vec::new();
+        for link in &self.links {
+            let changes: Vec<(String, String)> = renamed
+                .iter()
+                .filter(|(chars, _)| link.text.start <= chars.start && chars.end <= link.text.end)
+                .map(|(chars, replacement)| {
+                    let old: String = self
+                        .text
+                        .chars()
+                        .skip(chars.start)
+                        .take(chars.len())
+                        .collect();
+                    (old.trim().to_owned(), replacement.trim().to_owned())
+                })
+                .filter(|(old, _)| old.chars().any(char::is_alphanumeric))
+                .collect();
+            if changes.is_empty() {
+                continue;
+            }
+            let renamed = |text: &str| {
+                changes
+                    .iter()
+                    .fold(text.to_owned(), |text, (old, new)| text.replace(old, new))
+            };
+            if let Some(href) = &link.href {
+                let address = &self.source[href.clone()];
+                let path_end = address.find(['?', '#']).unwrap_or(address.len());
+                let segment_start = address[..path_end].rfind('/').map_or(0, |slash| slash + 1);
+                let segment = decoded(&address[segment_start..path_end]).replace('_', " ");
+                let named = renamed(&segment);
+                if named != segment {
+                    let written = named.replace(' ', "_").replace(['?', '#', '%'], "");
+                    splices.push(Splice {
+                        bytes: href.start + segment_start..href.start + path_end,
+                        written: Some(crate::pages::text::escape(&written)),
+                        marked: false,
+                    });
+                }
+            }
+            if let Some(title) = &link.title {
+                let shown = unescaped(&self.source[title.clone()])
+                    .unwrap_or_else(|| self.source[title.clone()].to_owned());
+                let named = renamed(&shown);
+                if named != shown {
+                    splices.push(Splice {
+                        bytes: title.clone(),
+                        written: Some(crate::pages::text::escape(&named)),
+                        marked: false,
+                    });
+                }
+            }
+        }
+        splices
+    }
+}
+
+/// `characters` as tokens: each run of letters and digits is one, and so
+/// is every other character.
+fn tokens(characters: &[char]) -> Vec<Range<usize>> {
+    let mut tokens: Vec<Range<usize>> = Vec::new();
+    for (index, character) in characters.iter().enumerate() {
+        match tokens.last_mut() {
+            Some(last)
+                if character.is_alphanumeric()
+                    && characters[last.end - 1].is_alphanumeric()
+                    && last.end == index =>
+            {
+                last.end = index + 1
+            }
+            _ => tokens.push(index..index + 1),
+        }
+    }
+    tokens
+}
+
+/// `text` with its percent escapes decoded.
+fn decoded(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] == b'%'
+            && let Some(byte) = text
+                .get(at + 1..at + 3)
+                .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+        {
+            out.push(byte);
+            at += 3;
+            continue;
+        }
+        out.push(bytes[at]);
+        at += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// `replacement` written where a bare value of data (a number, `true` or
@@ -881,6 +1113,9 @@ struct Reader {
     /// Strings in tags' `data-` attributes, read after the page's text so
     /// they never break a sentence that runs past a tag.
     deferred: Vec<Literal>,
+    links: Vec<Link>,
+    /// The open `<a>`: where its text starts, and its address and title.
+    link: Option<Link>,
 }
 
 impl Reader {
@@ -1009,6 +1244,26 @@ impl Reader {
         }
         if !closing {
             self.data(source, name_start + name.len(), end);
+        }
+        if name == "a" {
+            if let Some(mut link) = self.link.take() {
+                link.text.end = self.spans.len();
+                self.links.push(link);
+            }
+            if !closing {
+                let attributes = attributes(source, name_start + name.len(), end);
+                let value = |wanted: &str| {
+                    attributes
+                        .iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case(wanted))
+                        .map(|(_, value)| value.clone())
+                };
+                self.link = Some(Link {
+                    text: self.spans.len()..self.spans.len(),
+                    href: value("href"),
+                    title: value("title"),
+                });
+            }
         }
         if name == "title" {
             if closing {
