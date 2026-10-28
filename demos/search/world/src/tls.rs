@@ -3,7 +3,7 @@
 use fictionet::{Cx, stdlib::services::tls::ServerConfig};
 use std::{
     collections::HashMap,
-    sync::{Arc, Condvar, Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
     time::SystemTime,
 };
 
@@ -131,14 +131,11 @@ pub enum Refusal {
 /// What the real hosts' TLS handshakes showed, one check per host.
 #[derive(Default)]
 pub struct Upstream {
-    checks: Mutex<HashMap<String, Arc<Check>>>,
+    checks: Mutex<HashMap<String, Check>>,
 }
 
-#[derive(Default)]
-struct Check {
-    verdict: Mutex<Option<Option<Refusal>>>,
-    done: Condvar,
-}
+/// One host's check: its verdict once the handshake ends.
+type Check = tokio::sync::watch::Receiver<Option<Option<Refusal>>>;
 
 impl Upstream {
     /// Starts checking `host`'s real certificate, unless a check started.
@@ -146,31 +143,28 @@ impl Upstream {
         self.check(host);
     }
 
-    fn check(&self, host: &str) -> Arc<Check> {
+    fn check(&self, host: &str) -> Check {
         let mut checks = self.checks.lock().unwrap();
         if let Some(check) = checks.get(host) {
             return check.clone();
         }
-        let check = Arc::new(Check::default());
+        let (verdict, check) = tokio::sync::watch::channel(None);
         checks.insert(host.to_owned(), check.clone());
-        let (running, host) = (check.clone(), host.to_owned());
+        let host = host.to_owned();
         std::thread::spawn(move || {
-            let verdict = verify(&host);
-            *running.verdict.lock().unwrap() = Some(verdict);
-            running.done.notify_all();
+            let _ = verdict.send(Some(verify(&host)));
         });
         check
     }
 
     /// How `host`'s real certificate fails verification, once its check
-    /// ends; `None` when it verifies or the host cannot be reached.
-    pub fn refusal(&self, host: &str) -> Option<Refusal> {
-        let check = self.check(host);
-        let mut verdict = check.verdict.lock().unwrap();
-        while verdict.is_none() {
-            verdict = check.done.wait(verdict).unwrap();
-        }
-        verdict.clone().flatten()
+    /// ends; `None` when it verifies or the host cannot be reached. Only
+    /// the caller waits: a host that never answers holds up its own
+    /// handshakes, never the world.
+    pub async fn refusal(&self, host: &str) -> Option<Refusal> {
+        let mut check = self.check(host);
+        let verdict = check.wait_for(Option::is_some).await;
+        verdict.ok().and_then(|verdict| verdict.clone().flatten())
     }
 }
 

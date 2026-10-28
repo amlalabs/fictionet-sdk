@@ -5,7 +5,7 @@ use fictionet::stdlib::codec::Decode;
 use fictionet::stdlib::network::route::{Prefix, Router};
 use fictionet::stdlib::network::{ConnError, Connection, icmp, ip, tcp, udp};
 use fictionet::stdlib::services::serve::ConnInfo;
-use fictionet::stdlib::services::serve::{self, Budget, ServeOptions, Service, TlsSelect};
+use fictionet::stdlib::services::serve::{self, Budget, ServeOptions, Service};
 use fictionet::stdlib::services::tls::ServerConfig;
 use fictionet::sync::Mutex;
 use fictionet::time::Instant;
@@ -41,8 +41,13 @@ enum Family {
     V6,
 }
 
+/// The TLS config for one handshake, once it is picked.
+pub type ConfigFuture = Pin<Box<dyn Future<Output = Arc<ServerConfig>> + Send>>;
+
 /// Picks the TLS config for one handshake, with randomness from the `Cx`.
-pub type ConfigFor = Arc<dyn Fn(&Cx) -> Arc<ServerConfig> + Send + Sync>;
+/// Picking may take time (a check of the real host, say): only that
+/// handshake waits, up to its deadline, while the world goes on.
+pub type ConfigFor = Arc<dyn Fn(&Cx) -> ConfigFuture + Send + Sync>;
 
 /// One connection, accepted on a port of a machine, as a [`PortServer`] gets
 /// it.
@@ -346,15 +351,35 @@ impl Host {
     /// Serves TCP `port` with TLS for the names `sni` gives, with the
     /// config `config_for` returns for each handshake, then `accept`.
     pub fn tls_accept(
-        mut self,
+        self,
         port: u16,
         sni: impl Into<Sni>,
         config_for: impl Fn(&Cx) -> Arc<ServerConfig> + Send + Sync + 'static,
         accept: impl PortServer,
     ) -> Host {
+        self.tls_accept_when(
+            port,
+            sni,
+            move |fcx| std::future::ready(config_for(fcx)),
+            accept,
+        )
+    }
+
+    /// [`tls_accept`](Self::tls_accept) with a config that may take time
+    /// to pick: each handshake waits for its own, up to its deadline.
+    pub fn tls_accept_when<F>(
+        mut self,
+        port: u16,
+        sni: impl Into<Sni>,
+        config_for: impl Fn(&Cx) -> F + Send + Sync + 'static,
+        accept: impl PortServer,
+    ) -> Host
+    where
+        F: Future<Output = Arc<ServerConfig>> + Send + 'static,
+    {
         let spec = PortSpec::Tls {
             sni: sni.into(),
-            config: Arc::new(config_for),
+            config: Arc::new(move |fcx| Box::pin(config_for(fcx)) as ConfigFuture),
             accept: Arc::new(accept),
         };
         self.ports.push((port, spec));
@@ -841,8 +866,8 @@ struct TlsName {
 }
 
 impl TlsName {
-    fn config(&self, fcx: &Cx) -> Arc<ServerConfig> {
-        let given = (self.config)(fcx);
+    async fn config(&self, fcx: &Cx) -> Arc<ServerConfig> {
+        let given = (self.config)(fcx).await;
         if self.alpn.is_empty() {
             return given;
         }
@@ -1289,19 +1314,24 @@ async fn connection(
     let names = port.clone();
     let chosen: Arc<Mutex<Option<Arc<TlsName>>>> = Arc::default();
     let pick = chosen.clone();
-    let select: TlsSelect = Arc::new(move |sni, fcx| {
-        let tls = names.tls.read().unwrap_or_else(|e| e.into_inner());
-        let name = sni
-            .and_then(|n| tls.by_name.get(n))
-            .or_else(|| tls.by_name.get(""))?
-            .clone();
-        let config = name.config(fcx);
-        *pick.lock() = Some(name);
-        Some(config)
-    });
+    let select = move |sni: Option<&str>, fcx: &Cx| {
+        let name = {
+            let tls = names.tls.read().unwrap_or_else(|e| e.into_inner());
+            sni.and_then(|n| tls.by_name.get(n))
+                .or_else(|| tls.by_name.get(""))
+                .cloned()
+        };
+        let fcx = fcx.clone();
+        async move {
+            let name = name?;
+            let config = name.config(&fcx).await;
+            *pick.lock() = Some(name);
+            Some(config)
+        }
+    };
     let detached = || sandbox_id.is_some_and(|id| !hooks.is_attached(id));
     let deadline = accepted + handshake;
-    let Ok((tls, info)) = serve::accept_tls(&fcx, conn, &info, &select, deadline, detached).await
+    let Ok((tls, info)) = serve::accept_tls(&fcx, conn, &info, select, deadline, detached).await
     else {
         return;
     };

@@ -141,7 +141,7 @@ use dns::start_dns;
 use hosts::{
     Admission, Installation, Known, Lookup, LookupContext, Machines, Peers, World, host_prefix,
 };
-pub use hosts::{Arrival, ConfigFor, Host, PortServer, PreparedShare, Sni};
+pub use hosts::{Arrival, ConfigFor, ConfigFuture, Host, PortServer, PreparedShare, Sni};
 pub use names::normalize;
 
 const PROTO_TCP: u8 = 6;

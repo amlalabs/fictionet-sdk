@@ -12,7 +12,9 @@ use http::{Request, StatusCode};
 
 use fictionet::Cx;
 use fictionet::stdlib::services::tls::ServerConfig;
-use fictionet::stdlib::world::net::{Arrival, ConfigFor, Host, PortServer, PreparedShare, Sni};
+use fictionet::stdlib::world::net::{
+    Arrival, ConfigFor, ConfigFuture, Host, PortServer, PreparedShare, Sni,
+};
 
 use super::{
     Body, Exchange, Handler, HttpOptions, Limits, Reply, serve_connection, text,
@@ -331,11 +333,21 @@ impl Server {
     /// Serves HTTPS on 443 with a config selected for each handshake.
     /// Port 80 redirects to HTTPS unless [`plain_http`](Self::plain_http) was selected.
     pub fn tls_with(
-        mut self,
+        self,
         config_for: impl Fn(&Cx) -> Arc<ServerConfig> + Send + Sync + 'static,
     ) -> Server {
+        self.tls_when(move |fcx| std::future::ready(config_for(fcx)))
+    }
+
+    /// [`tls_with`](Self::tls_with) with a config that may take time to
+    /// select: each handshake waits for its own, up to its deadline, while
+    /// the world goes on.
+    pub fn tls_when<F>(mut self, config_for: impl Fn(&Cx) -> F + Send + Sync + 'static) -> Server
+    where
+        F: Future<Output = Arc<ServerConfig>> + Send + 'static,
+    {
         self.vhost.https = true;
-        self.tls = Some(Arc::new(config_for));
+        self.tls = Some(Arc::new(move |fcx| Box::pin(config_for(fcx)) as ConfigFuture));
         self
     }
 
@@ -355,7 +367,7 @@ impl Server {
         match secure {
             None => host,
             Some((config, server)) => {
-                host.tls_accept(443, Sni::Names, move |fcx| config(fcx), server)
+                host.tls_accept_when(443, Sni::Names, move |fcx| config(fcx), server)
             }
         }
     }

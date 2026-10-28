@@ -2104,15 +2104,19 @@ where
     let mut conn: Box<dyn Connection> = Box::new(conn);
     let mut info = info;
     if let Some(select) = &opts.tls {
-        let (tls, i) =
-            match accept_tls(fcx, conn, &info, select, fcx.now() + opts.handshake, || {
-                false
-            })
-            .await
-            {
-                Ok(done) => done,
-                Err(e) => return tls_failed(e),
-            };
+        let (tls, i) = match accept_tls(
+            fcx,
+            conn,
+            &info,
+            |sni, fcx| std::future::ready(select(sni, fcx)),
+            fcx.now() + opts.handshake,
+            || false,
+        )
+        .await
+        {
+            Ok(done) => done,
+            Err(e) => return tls_failed(e),
+        };
         conn = Box::new(tls);
         info = i;
     }
@@ -2139,7 +2143,8 @@ where
             return Ok(Served::Closed(Ended::Failed));
         };
         let deadline = fcx.now() + opts.handshake;
-        let (tls, i) = match accept_tls(fcx, rest, &info, select, deadline, || false).await {
+        let ready = |sni: Option<&str>, fcx: &Cx| std::future::ready(select(sni, fcx));
+        let (tls, i) = match accept_tls(fcx, rest, &info, ready, deadline, || false).await {
             Ok(done) => done,
             Err(e) => return tls_failed(e),
         };
@@ -2309,18 +2314,20 @@ where
 // TLS
 
 /// Shakes hands as a TLS server on `conn`, with the config `select` picks
-/// for the client's SNI, by `deadline`.
+/// for the client's SNI, by `deadline`. The config may take time to pick
+/// (a world that checks the real host first, say): only this handshake
+/// waits for it, and the wait counts toward `deadline`.
 ///
 /// Returns the TLS connection and `info` with its SNI and ALPN, or how the
 /// handshake failed: [`HandshakeError::Rejected`] when `select` has no
 /// config for the name, [`HandshakeError::TimedOut`] past `deadline`, and
 /// [`HandshakeError::Cancelled`] if `fcx`'s [region](fictionet::Cx#regions)
 /// is cancelled.
-pub async fn accept_tls<C: Connection>(
+pub async fn accept_tls<C: Connection, F: Future<Output = Option<Arc<ServerConfig>>>>(
     fcx: &Cx,
     conn: C,
     info: &ConnInfo,
-    select: &TlsSelect,
+    select: impl FnOnce(Option<&str>, &Cx) -> F,
     deadline: Instant,
     _detached: impl Fn() -> bool,
 ) -> Result<(TlsConnection<C>, ConnInfo), HandshakeError> {
@@ -2330,7 +2337,7 @@ pub async fn accept_tls<C: Connection>(
         sni = hello
             .server_name()
             .map(|n| n.trim_end_matches('.').to_ascii_lowercase());
-        let Some(config) = select(sni.as_deref(), fcx) else {
+        let Some(config) = select(sni.as_deref(), fcx).await else {
             let _ = hello.reject(fcx).await;
             return Err(HandshakeError::Rejected);
         };

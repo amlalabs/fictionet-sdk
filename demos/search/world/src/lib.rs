@@ -103,39 +103,49 @@ pub fn net(
             web::Site::new(handler.clone())
                 .date(start)
                 .at(addr)
-                .tls_with(move |fcx| {
-                    if pages.source().is_live()
-                        && let Some(refusal) = upstream.refusal(&name)
-                    {
-                        if let Ok(host) = name.parse() {
-                            pages.report(
-                                fcx,
-                                crate::observation::SearchObs::Certificate {
-                                    host,
-                                    problem: (&refusal).into(),
-                                    source: if pages.source() == crate::pages::Source::Edited {
-                                        crate::observation::PageSource::Edited
-                                    } else {
-                                        crate::observation::PageSource::Live
+                .tls_when(move |fcx| {
+                    let (fcx, ca, name, pages, upstream) = (
+                        fcx.clone(),
+                        ca.clone(),
+                        name.clone(),
+                        pages.clone(),
+                        upstream.clone(),
+                    );
+                    let (config, refused) = (config.clone(), refused.clone());
+                    async move {
+                        if pages.source().is_live()
+                            && let Some(refusal) = upstream.refusal(&name).await
+                        {
+                            if let Ok(host) = name.parse() {
+                                pages.report(
+                                    &fcx,
+                                    crate::observation::SearchObs::Certificate {
+                                        host,
+                                        problem: (&refusal).into(),
+                                        source: if pages.source() == crate::pages::Source::Edited {
+                                            crate::observation::PageSource::Edited
+                                        } else {
+                                            crate::observation::PageSource::Live
+                                        },
                                     },
-                                },
-                            );
+                                );
+                            }
+                            return refused
+                                .get_or_init(|| {
+                                    ca.refused(&fcx, &name, &refusal)
+                                        .expect("a certificate for an admitted name")
+                                })
+                                .clone();
                         }
-                        return refused
+                        config
                             .get_or_init(|| {
-                                ca.refused(fcx, &name, &refusal)
-                                    .expect("a certificate for an admitted name")
+                                let (config, _, _) = ca
+                                    .config(&fcx, &name)
+                                    .expect("a certificate for an admitted name");
+                                config
                             })
-                            .clone();
+                            .clone()
                     }
-                    config
-                        .get_or_init(|| {
-                            let (config, _, _) = ca
-                                .config(fcx, &name)
-                                .expect("a certificate for an admitted name");
-                            config
-                        })
-                        .clone()
                 })
                 .into_host(host),
         )

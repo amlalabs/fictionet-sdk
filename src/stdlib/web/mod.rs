@@ -774,6 +774,20 @@ impl Site {
         }
     }
 
+    /// [`tls_with`](Self::tls_with) with a config that may take time to
+    /// choose (a check of the real host, say): each handshake waits for its
+    /// own, up to its deadline, while the world goes on.
+    pub fn tls_when<F, R>(self, config_for: F) -> Site
+    where
+        F: Fn(&Cx) -> R + Send + Sync + 'static,
+        R: std::future::Future<Output = Arc<ServerConfig>> + Send + 'static,
+    {
+        Site {
+            server: self.server.tls_when(config_for),
+            ..self
+        }
+    }
+
     /// Serves a site with [`tls`](Site::tls) over plain HTTP on port 80
     /// as well. Its handler answers those requests, instead of the 301
     /// redirect to https that a TLS site gets by default.
