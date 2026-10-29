@@ -30,6 +30,14 @@ fn app_pages(seed: Seed, downloads: &std::path::Path) -> Result<Pages> {
         Some(Model::openrouter()?)
     } else if std::env::var("ANTHROPIC_API_KEY").is_ok_and(|key| !key.is_empty()) {
         Some(Model::anthropic()?)
+    } else if let Some(path) = std::env::var_os("CLAUDE_CODE_OAUTH_TOKEN_FILE") {
+        let value = std::fs::read_to_string(path)
+            .map_err(|_| "Cannot read the host Claude OAuth token file")?;
+        let secret =
+            fictionet_extras::models::Secret::new("Claude OAuth token", value.trim().into())?;
+        Some(Model::claude_token(
+            fictionet_extras::models::Key::claude_token(secret)?,
+        ))
     } else {
         None
     };

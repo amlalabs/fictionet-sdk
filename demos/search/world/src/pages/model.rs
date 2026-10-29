@@ -128,8 +128,14 @@ impl Conversation {
 pub struct Model {
     provider: Provider,
     model: String,
+    /// Whether requests go out on a Claude subscription token, which
+    /// Anthropic's API accepts only with Claude Code's system line first.
+    claude_token: bool,
     transport: fictionet_extras::models::Authenticated,
 }
+
+/// The system line a Claude subscription token must send first.
+const CLAUDE_CODE_SYSTEM: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 
 mod transport;
 use transport::ProviderTransport;
@@ -151,10 +157,16 @@ impl Model {
         ))
     }
 
+    /// A model on Anthropic's API, with the host's Claude subscription token.
+    pub fn claude_token(key: Key) -> Self {
+        Self::new(Provider::Anthropic, key)
+    }
+
     fn new(provider: Provider, key: Key) -> Self {
         Self {
             provider,
             model: provider.default_model().into(),
+            claude_token: key.is_claude_token(),
             transport: fictionet_extras::models::Authenticated::new(
                 provider.into(),
                 key,
@@ -196,6 +208,14 @@ impl Model {
                     // Sonnet 5.5 turns thinking off this way.
                     Care::Exact => json!({"type": "between_tools"}),
                     Care::Careful => json!({"type": "adaptive"}),
+                };
+                let system = if self.claude_token {
+                    json!([
+                        {"type": "text", "text": CLAUDE_CODE_SYSTEM},
+                        {"type": "text", "text": system},
+                    ])
+                } else {
+                    json!(system)
                 };
                 json!({
                     "model": model,

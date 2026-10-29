@@ -32,7 +32,10 @@ pub(super) fn scrub(values: &mut [Value], secret: &Secret, end: bool) -> usize {
         }
         let joined: String = pieces.iter().map(|(_, _, text)| text.as_str()).collect();
         if matches!(channel, Channel::Tool(_, _)) {
-            if !end {
+            // Tool input streams like text. Only input that could spell the
+            // credential with a JSON escape waits for the whole answer, so a
+            // long write is not held back until the response ends.
+            if !end && escaped(&joined, secret) {
                 ready = ready.min(pieces[0].0);
                 continue;
             }
@@ -99,6 +102,16 @@ pub(super) fn scrub(values: &mut [Value], secret: &Secret, end: bool) -> usize {
         scrub_json(value, secret);
     }
     ready
+}
+
+/// Whether JSON `text` holds an escape that could stand for one of the
+/// credential's characters: any `\u` escape, or the short escape of a quote,
+/// backslash or slash the credential contains.
+fn escaped(text: &str, secret: &Secret) -> bool {
+    text.contains("\\u")
+        || [('"', "\\\""), ('\\', "\\\\"), ('/', "\\/")]
+            .iter()
+            .any(|(c, escape)| secret.value.contains(*c) && text.contains(escape))
 }
 
 /// Tool arguments re-encoded without the credential, when their decoded
