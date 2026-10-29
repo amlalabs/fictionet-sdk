@@ -28,7 +28,7 @@ pub(super) use document::Format;
 use document::{Document, Outcome, Scoped};
 use fictionet::Cx;
 use fictionet_extras::search;
-use regex::Regex;
+use regex::RegexSet;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -139,10 +139,13 @@ struct Account {
     subjects: Subjects,
 }
 
-/// The names that mark text as being about a scenario, as one pattern,
-/// and how data files and addresses write them.
+/// The names that mark text as being about a scenario, and how data files
+/// and addresses write them. Text names a subject when it names every
+/// name in one of its groups.
 struct Subjects {
-    names: Option<Regex>,
+    names: RegexSet,
+    /// Each group as indexes into `names`.
+    groups: Vec<Vec<usize>>,
     data: DataNames,
 }
 
@@ -193,49 +196,76 @@ fn whole_word(text: &str, name: &str) -> bool {
 }
 
 impl Subjects {
-    fn new(names: &[String], data: DataNames) -> Result<Self, String> {
+    fn new(groups: &[Vec<String>], data: DataNames) -> Result<Self, String> {
         let word = |character: Option<char>| character.is_some_and(|c| c.is_alphanumeric());
-        let mut alternatives: Vec<String> = names
+        let mut patterns: Vec<String> = Vec::new();
+        let mut indexed: Vec<Vec<usize>> = groups
             .iter()
-            .map(|name| name.trim())
-            .filter(|name| !name.is_empty())
-            .map(|name| {
-                // A name is a whole word where it starts or ends with one.
-                let open = if word(name.chars().next()) { r"\b" } else { "" };
-                let close = if word(name.chars().last()) { r"\b" } else { "" };
-                let spaced = regex::escape(name).replace(' ', r"\s+");
-                format!("{open}{spaced}{close}")
+            .map(|group| {
+                let mut members: Vec<usize> = group
+                    .iter()
+                    .map(|name| name.trim())
+                    .filter(|name| !name.is_empty())
+                    .map(|name| {
+                        // A name is a whole word where it starts or ends with one.
+                        let open = if word(name.chars().next()) { r"\b" } else { "" };
+                        let close = if word(name.chars().last()) { r"\b" } else { "" };
+                        let spaced = regex::escape(name).replace(' ', r"\s+");
+                        let pattern = format!("(?i){open}{spaced}{close}");
+                        patterns
+                            .iter()
+                            .position(|p| *p == pattern)
+                            .unwrap_or_else(|| {
+                                patterns.push(pattern);
+                                patterns.len() - 1
+                            })
+                    })
+                    .collect();
+                members.sort_unstable();
+                members.dedup();
+                members
             })
+            .filter(|members| !members.is_empty())
             .collect();
-        alternatives.sort();
-        alternatives.dedup();
-        let names = if alternatives.is_empty() {
-            None
-        } else {
-            let pattern = Regex::new(&format!("(?i)(?:{})", alternatives.join("|")))
-                .map_err(|error| error.to_string())?;
-            Some(pattern)
-        };
-        Ok(Self { names, data })
+        indexed.sort();
+        indexed.dedup();
+        let names = RegexSet::new(&patterns).map_err(|error| error.to_string())?;
+        Ok(Self {
+            names,
+            groups: indexed,
+            data,
+        })
     }
 
     /// Whether `text`, the text of the document at `address` (with its
-    /// format) if it has one, is about the subjects: a page names one, and
-    /// a data file names one or names them the way data does.
+    /// format) if it has one, is about the subjects: a page names every name
+    /// of one group, and a data file does that or names them the way data
+    /// does.
     fn named_in(&self, text: &str, address: Option<(&str, Format)>) -> bool {
-        self.names
-            .as_ref()
-            .is_some_and(|pattern| pattern.is_match(text))
+        let found = self.names.matches(text);
+        self.groups
+            .iter()
+            .any(|group| group.iter().all(|&name| found.matched(name)))
             || address.is_some_and(|(url, format)| {
                 format != Format::Html && self.data.named_in(&format!("{url}\n{text}"))
             })
     }
 }
 
-/// The model's subjects for a scenario.
+/// Subjects as the log shows them: each group's names joined by " + ".
+fn shown(groups: &[Vec<String>]) -> String {
+    groups
+        .iter()
+        .map(|group| group.join(" + "))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The model's subjects for a scenario: groups of names that must appear
+/// together.
 #[derive(Deserialize)]
 struct SubjectsAnswer {
-    subjects: Vec<String>,
+    subjects: Vec<Vec<String>>,
     projects: Vec<String>,
     items: Vec<String>,
 }
@@ -246,7 +276,28 @@ struct AccountAnswer {
     changes: Vec<Change>,
     conflicts: Vec<Conflict>,
     unchanged: Vec<String>,
-    subjects: Vec<String>,
+    subjects: Vec<Vec<String>>,
+}
+
+/// A scenario's subjects and account, written once and kept, so setting
+/// that exact scenario asks the model nothing.
+#[derive(Deserialize)]
+struct Prepared {
+    scenario: String,
+    subjects: SubjectsAnswer,
+    account: AccountAnswer,
+}
+
+/// The prepared scenarios.
+const PREPARED: &[&str] = &[include_str!("prepared/cambridge-e-scooters.json")];
+
+/// The prepared answers for `scenario`, if it is one of the prepared
+/// scenarios word for word.
+fn prepared(scenario: &str) -> Option<Prepared> {
+    PREPARED
+        .iter()
+        .map(|text| serde_json::from_str::<Prepared>(text).expect("prepared scenarios parse"))
+        .find(|prepared| prepared.scenario.trim() == scenario.trim())
 }
 
 #[derive(Deserialize)]
@@ -270,12 +321,17 @@ struct EditList {
 }
 
 /// How subjects are chosen, for both questions that name them.
-const SUBJECT_RULES: &str = "subjects: the names of what the scenario is about, so that any \
-page naming one may state a fact it changes: the event, competition, product, project, release, \
-document, building or identifier. Give the broader name as well as the narrow one (the \
-tournament as well as its final, the project as well as its release), in every spelling, \
-abbreviation and language pages use. Never list a country, place, person, team, company, \
-common word or number on its own, since unrelated pages name those too.";
+const SUBJECT_RULES: &str = "subjects: what the scenario is about, as real pages name it \
+today, before the scenario, so that any page naming one may state a fact it changes. Each \
+subject is a group of names a page must all contain. Use one name when it is distinctive on its \
+own: the event, competition, product, project, release, document, building or identifier. \
+Pair a country, place, person, team, company or common word with the topic when it would \
+match unrelated pages alone ([\"Cambridge\", \"e-scooter\"], [\"Voi\", \"Cambridge\"]). Give \
+the broader subject as well as the narrow one (the tournament as well as its final, the \
+project as well as its release), in every spelling, plural, abbreviation and language pages \
+use. Name only what real pages already contain: never a name for what the scenario itself \
+newly makes happen (a ban, renaming, closure or result that is not real), since no real page \
+names it.";
 
 const SUBJECTS: &str = "A scenario changes facts on real web pages and data files. Before \
 anything else, the world needs to know which pages and files may be about it. List the \
@@ -424,7 +480,7 @@ from. Copy each passage from the snippet, never from the address.";
 
 fn schema_subjects() -> Value {
     json!({"type":"object","properties":{
-        "subjects":{"type":"array","items":{"type":"string"}},
+        "subjects":{"type":"array","items":{"type":"array","items":{"type":"string"}}},
         "projects":{"type":"array","items":{"type":"string"}},
         "items":{"type":"array","items":{"type":"string"}}
     },"required":["subjects","projects","items"],"additionalProperties":false})
@@ -435,7 +491,7 @@ fn schema_account() -> Value {
         "changes":{"type":"array","items":{"type":"object","properties":{"real":{"type":"string"},"scenario":{"type":"string"}},"required":["real","scenario"],"additionalProperties":false}},
         "conflicts":{"type":"array","items":{"type":"object","properties":{"fixed":{"type":"string"},"pages_say":{"type":"string"}},"required":["fixed","pages_say"],"additionalProperties":false}},
         "unchanged":{"type":"array","items":{"type":"string"}},
-        "subjects":{"type":"array","items":{"type":"string"}}
+        "subjects":{"type":"array","items":{"type":"array","items":{"type":"string"}}}
     },"required":["changes","conflicts","unchanged","subjects"],"additionalProperties":false})
 }
 
@@ -816,21 +872,27 @@ impl Editor {
     async fn subjects(&self, cx: &Cx, run: &Run, scenario: &str) -> Result<Arc<Subjects>, String> {
         run.subjects
             .get_or_try_init(|| async {
-                let mut conversation =
-                    Conversation::new(format!("TODAY\n{}\n\nSCENARIO\n{scenario}", self.today));
-                let answer: SubjectsAnswer = self
-                    .model
-                    .json(
-                        cx,
-                        Care::Exact,
-                        &format!("{SUBJECTS}\n\n- {SUBJECT_RULES}\n{DATA_NAMES}"),
-                        &mut conversation,
-                        &schema_subjects(),
-                    )
-                    .await?;
+                let answer: SubjectsAnswer = match prepared(scenario) {
+                    Some(prepared) => prepared.subjects,
+                    None => {
+                        let mut conversation = Conversation::new(format!(
+                            "TODAY\n{}\n\nSCENARIO\n{scenario}",
+                            self.today
+                        ));
+                        self.model
+                            .json(
+                                cx,
+                                Care::Exact,
+                                &format!("{SUBJECTS}\n\n- {SUBJECT_RULES}\n{DATA_NAMES}"),
+                                &mut conversation,
+                                &schema_subjects(),
+                            )
+                            .await?
+                    }
+                };
                 eprintln!(
                     "Scenario subjects: {}; in data: {} with {}",
-                    answer.subjects.join(", "),
+                    shown(&answer.subjects),
                     answer.projects.join(", "),
                     answer.items.join(", ")
                 );
@@ -844,20 +906,26 @@ impl Editor {
     async fn account(&self, cx: &Cx, run: &Run, scenario: &str) -> Result<Arc<Account>, String> {
         run.account
             .get_or_try_init(|| async {
-                let mut conversation =
-                    Conversation::new(format!("TODAY\n{}\n\nSCENARIO\n{scenario}", self.today));
                 // Asked once per scenario, before pages need it, and every
                 // edit follows it: worth the stronger model.
-                let answer: AccountAnswer = self
-                    .model
-                    .json(
-                        cx,
-                        Care::Careful,
-                        &format!("{ACCOUNT}{SUBJECT_RULES}{TIMING}"),
-                        &mut conversation,
-                        &schema_account(),
-                    )
-                    .await?;
+                let answer: AccountAnswer = match prepared(scenario) {
+                    Some(prepared) => prepared.account,
+                    None => {
+                        let mut conversation = Conversation::new(format!(
+                            "TODAY\n{}\n\nSCENARIO\n{scenario}",
+                            self.today
+                        ));
+                        self.model
+                            .json(
+                                cx,
+                                Care::Careful,
+                                &format!("{ACCOUNT}{SUBJECT_RULES}{TIMING}"),
+                                &mut conversation,
+                                &schema_account(),
+                            )
+                            .await?
+                    }
+                };
                 let mut text = String::from("WHAT CHANGES\n");
                 for change in &answer.changes {
                     text.push_str(&format!(
@@ -884,7 +952,7 @@ impl Editor {
                 }
                 eprintln!(
                     "Scenario account, with subjects: {}\n{text}",
-                    answer.subjects.join(", ")
+                    shown(&answer.subjects)
                 );
                 Ok::<_, String>(Arc::new(Account {
                     text,

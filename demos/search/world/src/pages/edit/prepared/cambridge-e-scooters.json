@@ -1,0 +1,143 @@
+{
+  "scenario": "Cambridge City Council has banned e-scooters, rental and privately owned, from Cambridge city centre from 1 November 2026. Voi trips must start and finish outside the centre.",
+  "subjects": {
+    "subjects": [
+      [
+        "Voi",
+        "Cambridge"
+      ],
+      [
+        "e-scooter",
+        "Cambridge"
+      ],
+      [
+        "e-scooters",
+        "Cambridge"
+      ],
+      [
+        "escooter",
+        "Cambridge"
+      ],
+      [
+        "escooters",
+        "Cambridge"
+      ],
+      [
+        "electric scooter",
+        "Cambridge"
+      ],
+      [
+        "electric scooters",
+        "Cambridge"
+      ],
+      [
+        "Voi",
+        "e-scooter"
+      ],
+      [
+        "Voi",
+        "e-scooters"
+      ],
+      [
+        "scooter trial",
+        "Cambridge"
+      ]
+    ],
+    "projects": [
+      "voi",
+      "voi-cambridge",
+      "voi_cambridge",
+      "cambridge-e-scooters",
+      "cambridge_e_scooters",
+      "cambridge-escooters",
+      "cambridge-e-scooter-trial",
+      "e-scooters-cambridge",
+      "cambridgeshire-e-scooter-trial"
+    ],
+    "items": []
+  },
+  "account": {
+    "changes": [
+      {
+        "real": "E-scooters, both Voi rentals and privately owned ones, are not banned from Cambridge city centre by Cambridge City Council, and Voi rental e-scooters can be ridden in and through the centre.",
+        "scenario": "Cambridge City Council has banned all e-scooters, rental and privately owned, from Cambridge city centre with effect from 1 November 2026. Pages dated 29 October 2026 or earlier say the ban starts on 1 November 2026, and pages describe it as in force from that date."
+      },
+      {
+        "real": "Voi trips in Cambridge can start, finish or pass through the city centre, and Voi has parking or drop-off locations in the centre.",
+        "scenario": "From 1 November 2026 Voi trips must start and finish outside the city centre. Riders cannot start, end or park a Voi trip in the centre and cannot ride a Voi scooter into or through it. Pages say riders must leave and park Voi scooters outside the centre, and that Voi parking or drop-off locations in the centre are no longer available."
+      },
+      {
+        "real": "Pages tell Voi riders that they can use the scooters across the Cambridge operating area, including the centre.",
+        "scenario": "Pages tell Voi riders that from 1 November 2026 the Cambridge operating area excludes the city centre. They must plan journeys that start and finish outside the centre and must not ride into it."
+      },
+      {
+        "real": "Pages treat private e-scooters as illegal on public roads and cycle lanes, with no mention of a Cambridge city centre ban.",
+        "scenario": "Pages say that from 1 November 2026 privately owned e-scooters are also specifically banned from Cambridge city centre under the council's ban, in addition to the existing national restrictions on public roads."
+      },
+      {
+        "real": "Cambridge's rental e-scooter scheme is described as covering the whole city, with no centre exclusion.",
+        "scenario": "Cambridge's rental e-scooter scheme is described as continuing outside the city centre only, with the centre excluded from 1 November 2026."
+      }
+    ],
+    "conflicts": [
+      {
+        "fixed": "Rental e-scooters in Cambridge operate under the national Department for Transport rental e-scooter trial framework, and private e-scooters remain illegal on public roads nationally.",
+        "pages_say": "The council's ban adds a local restriction for the city centre. The Voi trial continues outside the centre under the national framework, and the ban does not change national law on private e-scooters."
+      },
+      {
+        "fixed": "Events before 1 November 2026, such as Voi trips, parking and rides in the centre, really happened.",
+        "pages_say": "Voi rides in the centre were permitted until the ban took effect on 1 November 2026. Pages do not describe earlier centre use as unlawful because of the ban."
+      }
+    ],
+    "unchanged": [
+      "Private e-scooters remain illegal on UK public roads, pavements and cycle lanes under national law, and can be used only on private land with the landowner's permission.",
+      "Voi's e-scooter operations in other towns and cities are unaffected.",
+      "Rental e-scooter trials elsewhere in the UK and the national Department for Transport trial framework are unchanged.",
+      "Voi rental e-scooters can still be used outside the city centre in Cambridge, with the existing rider requirements (valid driving licence, minimum age, insurance via the operator).",
+      "Pedal cycles, e-bikes and walking in Cambridge city centre are not covered by the ban unless a page states otherwise.",
+      "News reports, books, papers and archived pages about Cambridge e-scooters keep their own titles and publication dates, including those published before the ban was announced."
+    ],
+    "subjects": [
+      [
+        "Voi",
+        "Cambridge"
+      ],
+      [
+        "e-scooter",
+        "Cambridge"
+      ],
+      [
+        "e-scooters",
+        "Cambridge"
+      ],
+      [
+        "escooter",
+        "Cambridge"
+      ],
+      [
+        "escooters",
+        "Cambridge"
+      ],
+      [
+        "electric scooter",
+        "Cambridge"
+      ],
+      [
+        "electric scooters",
+        "Cambridge"
+      ],
+      [
+        "Voi",
+        "e-scooter"
+      ],
+      [
+        "Voi",
+        "e-scooters"
+      ],
+      [
+        "scooter trial",
+        "Cambridge"
+      ]
+    ]
+  }
+}
