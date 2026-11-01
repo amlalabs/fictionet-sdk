@@ -12,6 +12,7 @@ use fictionet_test_support::{Done, timeout};
 
 mod driver;
 mod network;
+mod program;
 mod tls;
 
 use echo_service::{Echo, Ticker};
