@@ -13,6 +13,7 @@ mod core;
 mod datagrams_codec;
 mod db_codec;
 mod determinism;
+mod dns;
 mod e2e;
 mod entropy;
 mod fd_limit;
