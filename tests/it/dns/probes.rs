@@ -70,9 +70,11 @@ where
         Net::new()
             .hosts(internet.hosts())
             .hosts(internet::public_resolvers(
-                |resolver| {
-                    Recursive::new(resolver.config(&at).anchors(anchors.clone()), clock)
-                        .per_sandbox()
+                |resolver, host| {
+                    host.program(
+                        Recursive::new(resolver.config(&at).anchors(anchors.clone()), clock)
+                            .per_sandbox(),
+                    )
                 },
                 &at,
             ))

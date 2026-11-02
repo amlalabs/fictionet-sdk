@@ -5,6 +5,7 @@
 //! for the client that asked, from the pieces its resolution found.
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use fictionet::stdlib::protocols::dns::dnssec::Validation;
 use fictionet::stdlib::protocols::dns::dnssec::rdata::DNSSECRData;
@@ -21,7 +22,7 @@ use fictionet::time::Instant;
 use super::super::authority::{ChaosAnswer, bare_reply};
 use super::super::event::{Event, ReplyFlags};
 use super::super::exchange::Client;
-use super::cache::{Entry, Negative};
+use super::cache::{Entry, Negative, ttl_left};
 use super::resolution::{Outcome, with_ttl};
 use super::{Asker, Piece, Resolver, worse};
 use fictionet::stdlib::protocols::dns::dnssec::Verify;
@@ -205,18 +206,15 @@ impl<V: Verify> Resolver<V> {
         message.add_query(request.question.clone());
         let mut edes = Vec::new();
         for piece in pieces {
-            let elapsed = self
-                .now
-                .since_start()
-                .saturating_sub(piece.at.since_start());
-            let elapsed = u32::try_from(elapsed.as_secs()).unwrap_or(u32::MAX);
             // Fresh data has its TTL as the server sent it; the client sees
-            // it within the cache's limit, as it would from the cache.
+            // it within the cache's limit and counted down from when it
+            // arrived, as it would from the cache.
             let ttl = |set: &RecordSet| {
                 let ttl = if piece.stale {
                     stale_ttl
                 } else {
-                    set.ttl().min(max_ttl).saturating_sub(elapsed)
+                    let ttl = Duration::from_secs(u64::from(set.ttl().min(max_ttl)));
+                    ttl_left(piece.at + ttl, self.now)
                 };
                 with_ttl(set, ttl)
             };
@@ -294,16 +292,9 @@ impl<V: Verify> Resolver<V> {
         let Some((ns, expires)) = ns else {
             return self.servfail(request, &[]);
         };
-        let left = |expires: Instant| {
-            let secs = expires
-                .since_start()
-                .saturating_sub(self.now.since_start())
-                .as_secs();
-            u32::try_from(secs).unwrap_or(u32::MAX)
-        };
         push(
             &mut message.authorities,
-            &with_ttl(&ns, left(expires)),
+            &with_ttl(&ns, ttl_left(expires, self.now)),
             dnssec_ok,
         );
         let mut required = 0;
@@ -316,7 +307,7 @@ impl<V: Verify> Resolver<V> {
                 if let Some(Entry::Positive { set, expires, .. }) = self.cache.get(&key, self.now) {
                     push(
                         &mut message.additionals,
-                        &with_ttl(set, left(*expires)),
+                        &with_ttl(set, ttl_left(*expires, self.now)),
                         false,
                     );
                     required += 1;

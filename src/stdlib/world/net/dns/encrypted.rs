@@ -1,4 +1,4 @@
-//! DNS over TLS and DNS over HTTPS in front of a running [`Recursive`]:
+//! DNS over TLS and DNS over HTTPS in front of a running [`Recursive`](super::Recursive):
 //! the same engines and caches answer, whichever way a query arrives.
 //!
 //! [`Fronts`] puts a resolver's [`ResolverHandle`] behind two more ports of
@@ -284,12 +284,13 @@ impl PortServer for Dot {
             next: 0,
         };
         // The connection's buffers and the queries it waits on are charged
-        // to its sandbox. It closes once it has been quiet for ten seconds
-        // with no query waiting, which is also the network's default idle
-        // time for DNS over TCP (RFC 7766 §6.2.3, RFC 7858 §3.4).
+        // to its sandbox. It closes once it has been quiet for the network's
+        // idle time for DNS over TCP with no query waiting (RFC 7766
+        // §6.2.3, RFC 7858 §3.4).
         let opts = ServeOptions {
             budget: arrival.budget,
-            handshake: arrival.handshake,
+            handshake: arrival.limits.handshake,
+            idle: Some(arrival.limits.dns_tcp_idle),
             ..ServeOptions::default()
         };
         Box::pin(async move {

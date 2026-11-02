@@ -551,7 +551,10 @@ fn whoami_names_are_answered_from_the_egress_and_never_relayed() {
         let net = Net::new().ipv4_only();
         let mirror = Mirror::new(hierarchy.clone(), net.handle(), &at);
         net.hosts(internet::root_servers(|s| mirror.relay(s), &at))
-            .hosts(internet::public_resolvers(|r| r.recursive(&at, clock), &at))
+            .hosts(internet::public_resolvers(
+                |r, h| h.program(r.recursive(&at, clock)),
+                &at,
+            ))
             .start(&fcx, attachments)?;
         let m = machine(&fcx, attacher.attach("client")?, ME);
 
@@ -616,9 +619,9 @@ fn public_resolvers_keep_one_cache_per_sandbox() {
         let mirror = Mirror::new(hierarchy.clone(), net.handle(), &at);
         net.hosts(internet::root_servers(|s| mirror.relay(s), &at))
             .hosts(internet::public_resolvers(
-                |r| {
+                |r, h| {
                     let record = record.clone();
-                    r.recursive(&at, clock).on_event(move |event| record(event))
+                    h.program(r.recursive(&at, clock).on_event(move |event| record(event)))
                 },
                 &at,
             ))

@@ -440,26 +440,19 @@ impl Cache {
             if let Some((zone, entry)) = self.nsec.get_key_value(&at)
                 && now < entry.soa_expires
             {
-                let left = |expires: Instant| {
-                    let secs = expires
-                        .since_start()
-                        .saturating_sub(now.since_start())
-                        .as_secs();
-                    u32::try_from(secs).unwrap_or(u32::MAX)
-                };
                 let sets: Vec<RecordSet> = entry
                     .sets
                     .values()
                     .filter(|(_, expires)| now < *expires)
                     .map(|(set, expires)| {
                         let mut set = set.clone();
-                        set.set_ttl(left(*expires));
+                        set.set_ttl(ttl_left(*expires, now));
                         set
                     })
                     .collect();
                 if !sets.is_empty() {
                     let mut soa = entry.soa.clone();
-                    soa.set_ttl(left(entry.soa_expires));
+                    soa.set_ttl(ttl_left(entry.soa_expires, now));
                     return Some((zone, soa, sets));
                 }
             }
@@ -581,6 +574,18 @@ impl Cache {
             }
         }
     }
+}
+
+/// The TTL a client sees at `now` for data that expires at `expires`. The
+/// count is on a clock of whole seconds, as Unbound keeps it: data shows
+/// its full TTL for the rest of the second it arrived in, and every answer
+/// of one second, fresh or cached, shows the same TTL.
+pub(super) fn ttl_left(expires: Instant, now: Instant) -> u32 {
+    let left = expires
+        .since_start()
+        .as_secs()
+        .saturating_sub(now.since_start().as_secs());
+    u32::try_from(left).unwrap_or(u32::MAX)
 }
 
 /// A TTL as a duration. A TTL with the top bit set reads as 0
