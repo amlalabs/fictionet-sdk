@@ -86,6 +86,7 @@
 
 pub use hickory_proto::*;
 
+pub mod dnssec;
 mod fit;
 mod framing;
 mod options;

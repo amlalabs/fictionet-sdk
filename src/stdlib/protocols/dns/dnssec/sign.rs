@@ -1,0 +1,175 @@
+//! Signing one RRset: the RRSIG record of RFC 4034 §3.
+//!
+//! The bytes signed are hickory's to-be-signed form (RFC 4034 §3.1.8.1):
+//! the RRSIG fields without the signature, then each record of the set in
+//! canonical form and order. The signature comes from a [`Sign`], which
+//! for a [`ZoneKey`](super::ZoneKey) draws no randomness, so the same set,
+//! key, and window always give the same record.
+
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use super::keys::{Sign, key_tag};
+use super::rdata::{DNSSECRData, RRSIG, SigInput};
+use crate::stdlib::protocols::dns::ProtoError;
+use crate::stdlib::protocols::dns::rr::{Name, RData, Record, RecordSet, SerialNumber};
+use hickory_proto::dnssec::{PublicKey, TBS};
+
+/// When a signature is valid: from `inception` to `expiration`, both
+/// included (RFC 4034 §3.1.5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Window {
+    /// The first second the signature is valid.
+    pub inception: SystemTime,
+    /// The last second the signature is valid.
+    pub expiration: SystemTime,
+}
+
+/// One RRSIG over `set` by `key`, for the zone `signer`.
+///
+/// The RRSIG has the set's owner, class, and TTL, which is also its
+/// original TTL. Its labels field leaves out a leading `*`, so a wildcard
+/// set signs as RFC 4035 §5.3.4 expects. Any RRSIGs already in `set` are
+/// not covered. The error is hickory's, for a record whose data does not
+/// encode.
+pub fn sign(
+    key: &dyn Sign,
+    set: &RecordSet,
+    signer: &Name,
+    window: Window,
+) -> Result<Record, ProtoError> {
+    let dnskey = key.dnskey();
+    let input = SigInput {
+        type_covered: set.record_type(),
+        algorithm: dnskey.public_key().algorithm(),
+        num_labels: set.name().num_labels(),
+        original_ttl: set.ttl(),
+        sig_expiration: serial(window.expiration),
+        sig_inception: serial(window.inception),
+        key_tag: key_tag(&dnskey),
+        // RFC 6840 §5.1: the signer's name in canonical, lowercase form.
+        signer_name: signer.to_lowercase(),
+    };
+    let tbs = TBS::from_input(
+        set.name(),
+        set.dns_class(),
+        &input,
+        set.records_without_rrsigs(),
+    )?;
+    let signature = key.sign(tbs.as_ref());
+    let mut record = Record::from_rdata(
+        set.name().clone(),
+        set.ttl(),
+        RData::DNSSEC(DNSSECRData::RRSIG(RRSIG::from_sig(input, signature))),
+    );
+    record.dns_class = set.dns_class();
+    Ok(record)
+}
+
+/// A time as an RRSIG field: seconds since 1970 modulo 2^32, compared with
+/// serial number arithmetic (RFC 4034 §3.1.5, RFC 1982). Times before 1970
+/// read as 0.
+pub(crate) fn serial(time: SystemTime) -> SerialNumber {
+    let seconds = time
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    SerialNumber::new(seconds as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stdlib::protocols::dns::dnssec::{Algorithm, KeyFlags, Ring, Verify, ZoneKey};
+    use crate::stdlib::protocols::dns::rr::RecordType;
+    use crate::stdlib::protocols::dns::rr::rdata::A;
+    use fictionet::{Seed, SeededEntropy};
+    use std::time::Duration;
+
+    fn window() -> Window {
+        Window {
+            inception: UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+            expiration: UNIX_EPOCH + Duration::from_secs(1_800_000_000),
+        }
+    }
+
+    fn a_set(owner: &str) -> RecordSet {
+        let name = Name::from_ascii(owner).unwrap();
+        let mut set = RecordSet::with_ttl(name.clone(), RecordType::A, 300);
+        for last in [1, 2] {
+            let rdata = RData::A(A::new(192, 0, 2, last));
+            set.insert(Record::from_rdata(name.clone(), 300, rdata), 0);
+        }
+        set
+    }
+
+    fn verifies(key: &ZoneKey, set: &RecordSet, rrsig: &Record) -> bool {
+        let RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) = &rrsig.data else {
+            panic!("an RRSIG");
+        };
+        let tbs = TBS::from_input(
+            set.name(),
+            set.dns_class(),
+            rrsig.input(),
+            set.records_without_rrsigs(),
+        )
+        .unwrap();
+        Ring.verify(&key.dnskey(), tbs.as_ref(), rrsig.sig())
+    }
+
+    #[test]
+    fn every_algorithm_signs_deterministically_and_ring_verifies() {
+        let entropy = SeededEntropy::new(Seed::from_u64(7));
+        let rsa = ZoneKey::generate(&entropy, Algorithm::RsaSha256, KeyFlags::KSK).to_pkcs8();
+        let keys = Algorithm::ALL.map(|algorithm| match algorithm {
+            // One RSA modulus serves both RSA algorithms; generating it is
+            // the slow part.
+            Algorithm::RsaSha256 | Algorithm::RsaSha512 => {
+                ZoneKey::from_pkcs8(&rsa, algorithm, KeyFlags::KSK).unwrap()
+            }
+            _ => ZoneKey::generate(&entropy, algorithm, KeyFlags::ZSK),
+        });
+        let set = a_set("www.Example.");
+        let signer = Name::from_ascii("Example.").unwrap();
+        for key in &keys {
+            let rrsig = sign(key, &set, &signer, window()).unwrap();
+            assert_eq!(
+                sign(key, &set, &signer, window()).unwrap(),
+                rrsig,
+                "{:?} signs deterministically",
+                key.algorithm()
+            );
+            assert!(verifies(key, &set, &rrsig), "{:?}", key.algorithm());
+            let RData::DNSSEC(DNSSECRData::RRSIG(fields)) = &rrsig.data else {
+                panic!("an RRSIG");
+            };
+            assert_eq!(u8::from(fields.input().algorithm), key.algorithm().number());
+            assert_eq!(fields.input().signer_name.to_string(), "example.");
+            assert_eq!(fields.input().num_labels, 2);
+            assert_eq!(rrsig.ttl, 300);
+
+            // Another record set does not verify under this signature.
+            assert!(!verifies(key, &a_set("ftp.example."), &rrsig));
+        }
+    }
+
+    #[test]
+    fn wildcard_owners_leave_the_star_out_of_the_label_count() {
+        let key = ZoneKey::generate(
+            &SeededEntropy::new(Seed::from_u64(1)),
+            Algorithm::Ed25519,
+            KeyFlags::ZSK,
+        );
+        let set = a_set("*.example.");
+        let rrsig = sign(&key, &set, &Name::from_ascii("example.").unwrap(), window()).unwrap();
+        let RData::DNSSEC(DNSSECRData::RRSIG(fields)) = &rrsig.data else {
+            panic!("an RRSIG");
+        };
+        assert_eq!(fields.input().num_labels, 1);
+    }
+
+    #[test]
+    fn window_times_are_seconds_modulo_two_to_the_32() {
+        let past = UNIX_EPOCH + Duration::from_secs((1 << 32) + 5);
+        assert_eq!(serial(past).get(), 5);
+        assert_eq!(serial(UNIX_EPOCH - Duration::from_secs(1)).get(), 0);
+    }
+}
