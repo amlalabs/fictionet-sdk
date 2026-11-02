@@ -44,6 +44,37 @@
 //! world of websites, whose hosts appear as their names are looked up
 //! ([`Net::resolve`]).
 //!
+//! # Programs and hosts placed later
+//!
+//! A host can also run code of its own on its machines, as a resolver, a
+//! mail relay or a bot would: [`Host::program`] runs a [`Program`] with the
+//! machine's [`Endpoints`], whose TCP and UDP endpoints send from the
+//! machine's address through the router. [`Host::delay`] puts a fixed
+//! delay on the link between a host's machines and the network, so the
+//! host feels far away. [`Net::handle`] gives a [`NetHandle`] whose
+//! [`add_host`](NetHandle::add_host) places a host while the network
+//! runs, by the same rules as the hosts given before [`Net::start`]:
+//!
+//! ```
+//! # use fictionet::{Attachments, Cx, Result};
+//! # use fictionet::stdlib::world::net::{Endpoints, Host, Net};
+//! # async fn world(fcx: Cx, attachments: Attachments) -> Result {
+//! let net = Net::new();
+//! let handle = net.handle();
+//! let net = net.host("spawner", |h| {
+//!     h.program(move |_fcx: Cx, _machine: Endpoints| {
+//!         let handle = handle.clone();
+//!         async move {
+//!             handle.add_host(Host::new("later").dns_name("later.test"))?;
+//!             Ok(())
+//!         }
+//!     })
+//! });
+//! net.start(&fcx, attachments)?;
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! # What `start` builds
 //!
 //! - **The sandboxes' side.** Every sandbox that attaches, now or later,
@@ -105,7 +136,9 @@
 //!   adds no machine, route, listener, task, TLS name or virtual host, and
 //!   consumes no automatic address. Existing hosts remain unchanged. Hosts
 //!   returned by the resolver follow the same rule; their failed lookups
-//!   record `net.error` and answer NXDOMAIN.
+//!   record `net.error` and answer NXDOMAIN. A host given to
+//!   [`NetHandle::add_host`] follows it too, and the call returns the
+//!   error.
 //!
 //! The limits and rules are those [`web::Sites`](fictionet::stdlib::web::Sites)
 //! documents in detail, which runs on this.
@@ -113,8 +146,8 @@
 use fictionet::sync::Mutex;
 use std::collections::{BTreeMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
 use fictionet::stdlib::network::route::{self, Prefix, Router};
@@ -132,13 +165,17 @@ mod dns;
 mod hosts;
 mod names;
 
+pub use addresses::Placed;
 use addresses::{Leases, Subnet, Subnet6, check_pools};
+pub use attachments::connection_limit;
 use attachments::{Hooks, filter, udp_packet};
 use dns::start_dns;
 use hosts::{
     Admission, Installation, Known, Lookup, LookupContext, Machines, Peers, World, host_prefix,
 };
-pub use hosts::{Arrival, ConfigFor, ConfigFuture, Host, PortServer, PreparedShare, Sni};
+pub use hosts::{
+    Arrival, ConfigFor, ConfigFuture, Endpoints, Host, PortServer, PreparedShare, Program, Sni,
+};
 pub use names::normalize;
 
 const PROTO_UDP: u8 = 17;
@@ -287,6 +324,7 @@ pub struct Net {
     limits: Limits,
     lans: Vec<Lan>,
     members: Vec<(String, Lan, IpAddr)>,
+    handle: NetHandle,
 }
 
 impl Net {
@@ -314,6 +352,7 @@ impl Net {
             limits: Limits::default(),
             lans: Vec::new(),
             members: Vec::new(),
+            handle: NetHandle::default(),
         }
     }
 
@@ -352,6 +391,21 @@ impl Net {
     pub fn add_host(mut self, host: Host) -> Net {
         self.hosts.push(host);
         self
+    }
+
+    /// Adds several hosts built on their own, such as the ones a preset
+    /// returns.
+    pub fn hosts(mut self, hosts: impl IntoIterator<Item = Host>) -> Net {
+        self.hosts.extend(hosts);
+        self
+    }
+
+    /// A handle to this network, for world code that places hosts while
+    /// it runs. It can be taken before [`start`](Net::start), to give to
+    /// the programs and callbacks the network will run, and works once
+    /// `start` has returned.
+    pub fn handle(&self) -> NetHandle {
+        self.handle.clone()
     }
 
     /// Asks `resolve` for a host the first time a name that no host has is
@@ -547,17 +601,11 @@ impl Net {
         {
             let mut world = shared.world.lock();
             for host in self.hosts {
-                let names = host.names.clone();
-                let label = host.label.clone();
-                let placed = shared
-                    .installation()
-                    .place(&mut world, host)
-                    .map_err(|e| fictionet::Error::msg(format!("host {label}: {e}")))?;
-                for name in names {
-                    world.names.insert(name, Known::Host(placed));
-                }
+                shared.place(&mut world, host)?;
             }
         }
+        // A network starts once, so the handle has no network yet.
+        let _ = self.handle.0.set(Arc::downgrade(&shared));
 
         let members = self.members;
         let context = shared.attachments();
@@ -588,6 +636,49 @@ impl Net {
             }
         });
         Ok(net)
+    }
+}
+
+/// Places hosts in a running network: see [`Net::handle`].
+///
+/// A handle holds the network weakly, so it does not keep a network alive
+/// after its region is cancelled.
+#[derive(Clone, Default)]
+pub struct NetHandle(Arc<OnceLock<Weak<Shared>>>);
+
+impl NetHandle {
+    /// Places `host` while the network runs, by the same rules as the
+    /// hosts given before [`start`](Net::start): never on the sandboxes'
+    /// subnet or at an address a host cannot have, on a LAN only with
+    /// [`Host::on`], and with no service on a port another host at that
+    /// address already serves. Its names answer with its addresses from
+    /// then on, and its programs start. A rejected host leaves nothing
+    /// behind.
+    ///
+    /// Fails before the network has started, after it has stopped, and for
+    /// a host that cannot be placed. The network's DNS lookups hold the
+    /// lock this takes, so a [`Net::resolve`] callback must not call it.
+    pub fn add_host(&self, host: Host) -> Result<Placed, Error> {
+        let shared = self.shared()?;
+        let mut world = shared.world.lock();
+        shared.place(&mut world, host)
+    }
+
+    /// Whether a host's machine is at `addr`. Before the network has
+    /// started, none is.
+    pub fn has_machine(&self, addr: IpAddr) -> bool {
+        self.shared()
+            .is_ok_and(|shared| shared.world.lock().machines.contains_key(&addr))
+    }
+
+    fn shared(&self) -> Result<Arc<Shared>, Error> {
+        let network = self
+            .0
+            .get()
+            .ok_or_else(|| Error::msg("the network has not started"))?;
+        network
+            .upgrade()
+            .ok_or_else(|| Error::msg("the network has stopped"))
     }
 }
 
@@ -631,6 +722,21 @@ impl Shared {
             admission: self.admission(),
             handshake: self.limits.handshake,
         }
+    }
+
+    /// Places `host` and records its names, which then answer with its
+    /// addresses.
+    fn place(&self, world: &mut World, host: Host) -> Result<Placed, Error> {
+        let names = host.names.clone();
+        let label = host.label.clone();
+        let placed = self
+            .installation()
+            .place(world, host)
+            .map_err(|e| fictionet::Error::msg(format!("host {label}: {e}")))?;
+        for name in names {
+            world.names.insert(name, Known::Host(placed));
+        }
+        Ok(placed)
     }
 
     fn lookup(&self, name: &str) -> Lookup {

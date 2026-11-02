@@ -223,8 +223,8 @@ pub(super) enum PortSpec {
     Udp(UdpStart),
 }
 
-/// One host: its addresses, DNS names and services. See [`Net::host`] and
-/// [`Net::resolve`].
+/// One host: its addresses, DNS names, services and programs. See
+/// [`Net::host`] and [`Net::resolve`].
 #[derive(Clone)]
 pub struct Host {
     pub(super) label: String,
@@ -235,6 +235,8 @@ pub struct Host {
     pub(super) ports: Vec<(u16, PortSpec)>,
     lan: Option<super::Lan>,
     tcp_options: tcp::Options,
+    programs: Vec<Arc<dyn Program>>,
+    delay: Option<Duration>,
 }
 
 impl Host {
@@ -249,6 +251,8 @@ impl Host {
             ports: Vec::new(),
             lan: None,
             tcp_options: tcp::Options::default(),
+            programs: Vec::new(),
+            delay: None,
         }
     }
 
@@ -474,6 +478,109 @@ impl Host {
         });
         self.ports.push((port, PortSpec::Udp(start)));
         self
+    }
+
+    /// Runs `program` on each of this host's machines once the host is
+    /// placed, with that machine's [`Endpoints`]. A host with an IPv4 and
+    /// an IPv6 address has two machines, so the program runs twice. On a
+    /// machine that another host made first, the program starts at once
+    /// and shares the machine's endpoints with every other program there.
+    ///
+    /// An error from the program fails the network's region, as an error
+    /// from any of the world's tasks does. A program that may fail without
+    /// ending the world handles its own errors and returns `Ok(())`.
+    pub fn program(mut self, program: impl Program) -> Host {
+        self.programs.push(Arc::new(program));
+        self
+    }
+
+    /// Delays every packet between each of this host's machines and the
+    /// network by `by`, in each direction ([`delay`](fictionet::stdlib::network::delay)),
+    /// so a round trip to the host takes `2 * by` longer. The delay is
+    /// set when a machine is made: a host placed at an address that
+    /// already has a machine keeps that machine's link as it is.
+    pub fn delay(self, by: Duration) -> Host {
+        Host {
+            delay: Some(by),
+            ..self
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Programs
+
+/// A machine's side of the network, for a [`Program`] that runs on it.
+///
+/// The endpoints are the machine's own: a connection from
+/// [`tcp::Endpoint::connect`] or a datagram from a socket of
+/// [`udp::Endpoint::bind`] leaves from [`addr`](Self::addr) through the
+/// network's router, as a packet from any host does. Listeners and sockets
+/// a program opens share the machine's ports with the host's services, so
+/// a port either has is taken for the other.
+#[derive(Clone)]
+pub struct Endpoints {
+    /// The machine's address.
+    pub addr: IpAddr,
+    /// The machine's TCP endpoint.
+    pub tcp: tcp::Endpoint,
+    /// The machine's UDP endpoint.
+    pub udp: udp::Endpoint,
+    admission: Admission,
+}
+
+impl Endpoints {
+    /// The sandbox that `peer` belongs to, as [`ServeOptions::sandbox`]
+    /// reports it: a peer that no sandbox has is reported with id 0, an
+    /// empty name, and `peer` as its address.
+    pub fn sandbox_of(&self, peer: IpAddr) -> Option<serve::Sandbox> {
+        Some(self.admission.hooks.sandbox_at(peer))
+    }
+
+    /// Applies the network's per-peer connection limit
+    /// ([`Limits::connections_per_peer`]) to a connection the program
+    /// accepted, as the host's services have it applied for them. Returns
+    /// the connection, counted until it is gone, or `None` after resetting
+    /// it when its peer already has as many open as it may.
+    pub fn admit(&self, conn: tcp::TcpConnection) -> Option<tcp::TcpConnection> {
+        self.admission.peers.admit(conn)
+    }
+}
+
+/// Code that runs on a machine, as a resolver, a mail relay or a bot would
+/// on a real one. [`Host::program`] runs it. Any
+/// `Fn(Cx, Endpoints) -> impl Future<Output = fictionet::Result>` is one:
+///
+/// ```
+/// # use fictionet::stdlib::world::net::{Endpoints, Host};
+/// # use fictionet::Cx;
+/// let greeter = Host::new("greeter").program(|_fcx: Cx, machine: Endpoints| async move {
+///     let mut socket = machine.udp.bind(0)?;
+///     socket.send_to(b"hello", "203.0.113.7:7".parse()?);
+///     Ok(())
+/// });
+/// ```
+pub trait Program: Send + Sync + 'static {
+    /// Runs the program on the machine whose endpoints are `machine`, in
+    /// the network's region.
+    fn run(
+        &self,
+        fcx: Cx,
+        machine: Endpoints,
+    ) -> Pin<Box<dyn Future<Output = fictionet::Result> + Send>>;
+}
+
+impl<F, Fut> Program for F
+where
+    F: Fn(Cx, Endpoints) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = fictionet::Result> + Send + 'static,
+{
+    fn run(
+        &self,
+        fcx: Cx,
+        machine: Endpoints,
+    ) -> Pin<Box<dyn Future<Output = fictionet::Result> + Send>> {
+        Box::pin(self(fcx, machine))
     }
 }
 
@@ -736,11 +843,20 @@ impl Installation<'_> {
         for (mut machine, ports) in prepared {
             if let Some(side) = machine.route.take() {
                 self.router
-                    .add(host_prefix(machine.machine.addr), Box::new(side));
+                    .add(host_prefix(machine.machine.addr), self.wire(side, &host));
             }
-            machine.commit(world, ports);
+            machine.commit(world, ports, &host.programs);
         }
         Ok(placed)
+    }
+
+    /// The network's end of a new machine's link, through the host's delay
+    /// if it has one.
+    fn wire(&self, side: End, host: &Host) -> Box<dyn Interface> {
+        match host.delay {
+            Some(by) => Box::new(fictionet::stdlib::network::delay(self.fcx, by, side)),
+            None => Box::new(side),
+        }
     }
 
     /// Places `host` on the LAN `name`, at its `at` address of the LAN's
@@ -789,13 +905,14 @@ impl Installation<'_> {
             host.tcp_options,
         );
         let ports = machine.machine.prepare(host)?;
-        // Joining is the last fallible step. No service or task has started.
+        // Joining is the last fallible step. No service or program has
+        // started. A delay's task ends when a failed join drops its link.
         if let Some(side) = machine.route.take() {
             seg.lan
-                .add(addr, Box::new(side))
+                .add(addr, self.wire(side, host))
                 .map_err(|e| e.to_string())?;
         }
-        machine.commit(world, ports);
+        machine.commit(world, ports, &host.programs);
         Ok(match addr {
             IpAddr::V4(a) => Placed {
                 v4: Some(a),
@@ -844,12 +961,7 @@ pub(super) struct Admission {
 
 impl Admission {
     pub(super) fn admit(&self, _fcx: &Cx, conn: tcp::TcpConnection) -> Option<tcp::TcpConnection> {
-        let Some(guard) = self.peers.enter(conn.peer_addr().ip()) else {
-            conn.reset();
-            return None;
-        };
-        conn.hold_until_gone(Box::new(guard));
-        Some(conn)
+        self.peers.admit(conn)
     }
 
     pub(super) fn sandbox(&self) -> serve::SandboxOf {
@@ -877,6 +989,17 @@ impl Peers {
     #[cfg(test)]
     pub(super) fn peers(&self) -> usize {
         self.open.lock().len()
+    }
+
+    /// Counts `conn` against its peer until it is gone, or resets it if
+    /// its peer already has as many open as it may.
+    fn admit(self: &Arc<Self>, conn: tcp::TcpConnection) -> Option<tcp::TcpConnection> {
+        let Some(guard) = self.enter(conn.peer_addr().ip()) else {
+            conn.reset();
+            return None;
+        };
+        conn.hold_until_gone(Box::new(guard));
+        Some(conn)
     }
 
     pub(super) fn enter(self: &Arc<Self>, peer: IpAddr) -> Option<PeerGuard> {
@@ -1007,7 +1130,9 @@ struct PreparedMachine {
 }
 
 impl PreparedMachine {
-    fn commit(self, world: &mut World, ports: Vec<PreparedPort>) {
+    /// Starts a new machine's tasks, adds the services, then starts the
+    /// programs. A machine that already ran starts only the programs.
+    fn commit(self, world: &mut World, ports: Vec<PreparedPort>, programs: &[Arc<dyn Program>]) {
         if let Some(start) = self.start {
             start();
             world
@@ -1015,6 +1140,7 @@ impl PreparedMachine {
                 .insert(self.machine.addr, self.machine.clone());
         }
         self.machine.add(ports);
+        self.machine.run(programs);
     }
 }
 
@@ -1291,6 +1417,30 @@ impl Machine {
                 }
             }
         }
+    }
+
+    /// Starts each program on this machine, with its endpoints.
+    fn run(&self, programs: &[Arc<dyn Program>]) {
+        for program in programs {
+            let program = program.clone();
+            let machine = Endpoints {
+                addr: self.addr,
+                tcp: self.tcp.clone(),
+                udp: self.udp.clone(),
+                admission: self.admission.clone(),
+            };
+            self.fcx.spawn(move |fcx| program.run(fcx, machine));
+        }
+    }
+
+    /// Whether TCP `port` is open here.
+    pub(super) fn serves_tcp(&self, port: u16) -> bool {
+        self.ports.lock().contains_key(&port)
+    }
+
+    /// Whether UDP `port` is open here.
+    pub(super) fn serves_udp(&self, port: u16) -> bool {
+        self.udp_ports.lock().contains(&port)
     }
 }
 
