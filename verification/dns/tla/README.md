@@ -1,18 +1,18 @@
 # DNS in TLA+
 
-Four specs model the DNS engines of the design (`final-design.md`, section
-18.1): the recursive resolver, the step contract every engine keeps, the
-authority engine with its sources and providers, and the DNSSEC validator
-with the resolver's rendering of its result. Each spec has flags that remove
-one rule of the design, so one spec gives both the proof of the rule and the
-counterexample that shows why it is there.
+Four specs model the DNS engines of `services::dns` and
+`protocols::dns::dnssec`: the recursive resolver, the step contract every
+engine keeps, the authority engine with its sources and providers, and the
+DNSSEC validator with the resolver's rendering of its result. Each spec has
+flags that remove one rule the engines follow, so one spec gives both the
+proof of the rule and the counterexample that shows why it is there.
 
 | Spec | What it models | Rust |
 |---|---|---|
-| `Resolution.tla` | The resolver against zones `.`, `tld`, `sld.tld`, and `alt.tld`, each with one good and one lame server; an address, a CNAME, an empty non-terminal, a missing name, a glued nameserver, a CNAME loop across two zones, and a wildcard; a rogue server adding a record outside its bailiwick; two clients; a network that loses and truncates; one world edit; TTLs of 1 and 2 | `services/dns/resolver/{mod,cache,resolution,front}.rs` (design sections 9.1 to 9.7) |
-| `Exchanges.tla` | The step contract of section 6.2: tokens with a generation and an exchange identity, matching on the token and the tuple, duplicate, late, and spoofed replies, `Gone`, `Advance`, one resolution shared by two clients | `services/dns/exchange.rs` (`Token`, `Generation`, `Input`, `Action`, `Engine`), kept by `AuthorityEngine` and `Resolver` |
-| `Authority.tla` | `AuthorityEngine` at a root, a TLD, and an edited zone's address: `Relay` through an `Only` policy and a source that delays and fails, `Overlay` with its DS ask, `Lazy` over a `Provider` whose facts are present, absent, or unknown and change as the world runs | `services/dns/authority/{mod,engine,relay,overlay}.rs`, `services/dns/zone/{data,lazy}.rs`, `world/net/dns/source.rs` (sections 5.4, 7, 11.3) |
-| `Validation.tla` | The validator on a path root, tld, sld, with the data free per config (signer, parent proof, window, algorithm, changes after signing), clock skew, unreachable zones, the AD/CD rendering, `check_chain`, and two validators fed the same records from different providers and signers | `protocols/dns/dnssec/{validate,policy,proof}.rs`, `services/dns/zone/chain.rs`, `services/dns/resolver/front.rs` (sections 8.5 to 8.7, 9.5, 9.7) |
+| `Resolution.tla` | The resolver against zones `.`, `tld`, `sld.tld`, and `alt.tld`, each with one good and one lame server; an address, a CNAME, an empty non-terminal, a missing name, a glued nameserver, a CNAME loop across two zones, and a wildcard; a rogue server adding a record outside its bailiwick; two clients; a network that loses and truncates; one world edit; TTLs of 1 and 2 | `services/dns/resolver/{mod,cache,resolution,front}.rs` |
+| `Exchanges.tla` | The step contract of `Engine`: tokens with a generation and an exchange identity, matching on the token and the tuple, duplicate, late, and spoofed replies, `Gone`, `Advance`, one resolution shared by two clients | `services/dns/exchange.rs` (`Token`, `Generation`, `Input`, `Action`, `Engine`), kept by `AuthorityEngine` and `Resolver` |
+| `Authority.tla` | `AuthorityEngine` at a root, a TLD, and an edited zone's address: `Relay` through an `Only` policy and a source that delays and fails, `Overlay` reading the edited zone's apex NS RRset and its target's addresses and then asking for its DS, `Lazy` over a `Provider` whose facts are present, absent, or unknown and change as the world runs | `services/dns/authority/{mod,engine,relay,overlay}.rs`, `services/dns/zone/{data,lazy}.rs`, `world/net/dns/source.rs` |
+| `Validation.tla` | The validator on a path root, tld, sld, with the data free per config (signer, parent proof, window, algorithm, changes after signing), clock skew, unreachable zones, the AD/CD rendering, `check_chain`, and two validators fed the same records from different providers and signers | `protocols/dns/dnssec/{validate,policy,proof}.rs`, `services/dns/zone/chain.rs`, `services/dns/resolver/front.rs` |
 
 ## Properties
 
@@ -39,7 +39,7 @@ counterexample that shows why it is there.
 | | `PolicyHolds` | invariant | no ask the policy refuses reaches the source, root and TLD asks included |
 | | `UnknownNeverNegative` | invariant | no NXDOMAIN or NODATA rests on an unknown fact |
 | | `CoherentRevision` | invariant | every reply from the lazy zone agrees with one revision of it |
-| | `RespondMonotone` | invariant | more observations never turn a reply into a `Need` |
+| | `RespondMonotone` | invariant | more observations never turn a reply into a `Need`: a request that knows what its ask observed never needs another |
 | | `OneAskPerNeed` | invariant | a request sends at most one ask per `Need`, and one `Need` per generation |
 | | `NoLockAcrossAsk` | invariant | a request parked on an ask holds no part of a view |
 | | `EveryParkedAnswered` | liveness | every request that waits on an ask is answered or silently dropped |
@@ -63,7 +63,7 @@ java -XX:+UseParallelGC -Xmx6g -cp tla2tools.jar tlc2.TLC -workers 8 \
     -config Resolution_base.cfg Resolution.tla
 ```
 
-`cargo xtask dns-verify tlc` (design section 18.4) runs TLC once per
+`cargo xtask dns-verify tlc` runs TLC once per
 property per config and writes its output to `target/dns-verify/tlc/`. A
 config whose first lines read `\* expect violation: <Property>` is expected
 to fail exactly that property, in a run that checks that property alone;
@@ -80,7 +80,8 @@ Configs:
 * **Exchanges:** `_base`, `_advance`, `_cancel`. Ablations: `_idonly`,
   `_flushonly`, `_cancelshared`.
 * **Authority:** `_base`, `_fail`, `_lazy`, `_advance`. Ablations:
-  `_nopolicy`, `_rootexempt`, `_unknownasabsent`, `_mixedrevision`.
+  `_nopolicy`, `_rootexempt`, `_unknownasabsent`, `_mixedrevision`,
+  `_reask`, `_parkinview`.
 * **Validation:** `_paths`, `_skew`, `_unreachable`, `_policy`,
   `_providers`, and `_witnesses` (every reachability witness, each expected
   to fail). Ablations: `_trustupstreamad`, `_nopolicy`,
@@ -139,19 +140,21 @@ in `_concurrent` explores twice the states of the invariants there.
 | Exchanges_idonly | `MatchRequiresTuple` | violated | 64 | 5 | 1 s | Query, Send, Spoof, Deliver |
 | Exchanges_flushonly | `ObsoleteNeverPopulates` | violated | 282 | 6 | 0 s | Query, Send, Serve, Advance, Deliver |
 | Exchanges_cancelshared | `CancelPreservesWaiters` | violated | 13 | 4 | 1 s | Query, Query, Gone |
-| Authority_base | the 7 invariants, `EveryParkedAnswered` | pass | 1424 | 15 | 0-1 s | |
-| Authority_fail | the 7 invariants, `EveryParkedAnswered` | pass | 5072 | 15 | 0-1 s | |
-| Authority_lazy | the 7 invariants, `EveryParkedAnswered` | pass | 364 | 10 | 0-1 s | |
-| Authority_advance | the 7 invariants, `EveryParkedAnswered` | pass | 21356 | 16 | 0-1 s | |
+| Authority_base | the 7 invariants, `EveryParkedAnswered` | pass | 1528 | 15 | 0-1 s | |
+| Authority_fail | the 7 invariants, `EveryParkedAnswered` | pass | 5272 | 15 | 0-1 s | |
+| Authority_lazy | the 7 invariants, `EveryParkedAnswered` | pass | 404 | 10 | 0-1 s | |
+| Authority_advance | the 7 invariants, `EveryParkedAnswered` | pass | 21522 | 16 | 0-1 s | |
 | Authority_nopolicy | `PolicyHolds` | violated | 4 | 2 | 0 s | Step: the root server relays leak.evil to the source |
 | Authority_rootexempt | `PolicyHolds` | violated | 4 | 2 | 1 s | Step: the same ask, exempt because it goes to a root server |
 | Authority_unknownasabsent | `UnknownNeverNegative` | violated | 2 | 2 | 0 s | View: b.fict is unknown and the wildcard absent, so NXDOMAIN |
-| Authority_mixedrevision | `CoherentRevision` | violated | 45 | 4 | 1 s | ReadName (a.fict absent), WorldChange, ReadRest (the wildcard present): a wildcard answer no revision gives |
-| Validation_paths | the 10 invariants | pass | 559872 | 1 | 1-3 s | |
-| Validation_skew | the 10 invariants | pass | 5184 | 1 | 0-1 s | |
-| Validation_unreachable | the 10 invariants | pass | 9216 | 1 | 0-1 s | |
-| Validation_policy | the 10 invariants | pass | 1728 | 1 | 0-1 s | |
-| Validation_providers | the 10 invariants | pass | 36864 | 1 | 0-1 s | |
+| Authority_mixedrevision | `CoherentRevision` | violated | 46 | 4 | 1 s | ReadName (a.fict absent), WorldChange, ReadRest (the wildcard present): a wildcard answer no revision gives |
+| Authority_reask | `RespondMonotone` | violated | 21 | 3 | 0 s | Step (the policy refuses leak.evil, a timeout), Observe: the request knows its observation and needs again |
+| Authority_parkinview | `NoLockAcrossAsk` | violated | 2 | 2 | 0 s | Step: the overlay parks on its DS ask while it holds its read of the lazy zone |
+| Validation_paths | the 10 invariants | pass | 1119744 | 1 | 1-3 s | |
+| Validation_skew | the 10 invariants | pass | 10368 | 1 | 0-1 s | |
+| Validation_unreachable | the 10 invariants | pass | 18432 | 1 | 0-1 s | |
+| Validation_policy | the 10 invariants | pass | 3456 | 1 | 0-1 s | |
+| Validation_providers | the 10 invariants | pass | 73728 | 1 | 0-1 s | |
 | Validation_witnesses | each of the 7 `Never...` forms, alone | violated (reachable) | 1 | 1 | 0-1 s | an initial state of each scenario |
 | Validation_trustupstreamad | `AdOnlySecure` | violated | 1 | 1 | 0 s | no anchors configured (NotPerformed), the upstream reply has AD, the client gets AD |
 | Validation_nopolicy | `Sha1Insecure` | violated | 1 | 1 | 1 s | a chain of key A where sld's DS names algorithm 5: Secure |
@@ -199,15 +202,16 @@ Resolution:
   glue, so stale glue is reachable.
 * `MaxWork` counts upstream queries, TCP retries included; `MaxChain`
   counts CNAME restarts. In `_loop` and `_nobound` `MaxWork` is 6, not the
-  4 of section 18.1: following the loop once takes five queries (root, tld,
+  4 of the other configs: following the loop once takes five queries (root, tld,
   sld, tld again for alt, alt), so with 4 the work bound always ends the
   loop before the chain bound is ever reached, and the chain bound would go
   unchecked.
 * A chain whose link expires while the chase goes on is followed again from
   the question, keeping the work done. The first run found this case:
   without it the resolver answered a CNAME whose TTL had already run out
-  (`TtlSound`). The Rust resolver renders TTLs counted down at answer time
-  (section 9.7), so it must do the same, or re-resolve the expired link.
+  (`TtlSound`). The Rust resolver does the same: when a record of an answer
+  ran out while the rest was resolved, `Resolver` follows the chain again
+  from the question, its work so far still counted.
 * A failure (every server tried, or the work bound reached) is cached for
   `failure_ttl` (1 s) at the name the chain had reached; a chain that is too
   long answers SERVFAIL without caching, so the cached CNAME stays.
@@ -242,7 +246,15 @@ Authority:
 
 * Each request needs at most one ask: the relayed question, or the
   overlay's `<apex> DS`. `RespondMonotone` is checked on the model's
-  `respond` for every request and every observation.
+  `respond` for every request once it knows its observation; `_reask`,
+  where a timeout makes `respond` ask again, breaks it.
+* The root server runs `Relay` and the TLD server `Overlay`, as a world
+  puts the overlay on the `com` servers. Before its DS ask, the overlay
+  reads the edited zone's apex NS RRset and the addresses of its target
+  `ns.fict` from the lazy zone, as `Overlay::respond` asks the inner
+  authority for `<apex> NS`, and a fact it does not know makes the
+  referral SERVFAIL. The referral rests on those facts, so
+  `UnknownNeverNegative` and `CoherentRevision` cover it.
 * `Lazy::view` takes the zone's lock once, so the view is one atomic step.
   `MixedRevision` splits it into two steps, reading the name and then the
   wildcard, and the world may change between them.
@@ -256,9 +268,9 @@ Authority:
   only the ID and the question's case.
 * `Advance` restarts parked requests with nothing known; observations for
   old tokens are ignored when they arrive.
-* `NoLockAcrossAsk` holds by construction, because a view never waits. It
-  is stated so that a change parking a request in the middle of a view
-  breaks it.
+* `NoLockAcrossAsk` holds because a view never waits and the overlay reads
+  the lazy zone before it asks. `_parkinview`, where the overlay sends its
+  DS ask while it holds its read, breaks it.
 
 Validation:
 
@@ -277,25 +289,26 @@ Validation:
 * An unreachable zone is one whose DNSKEY or DS set cannot be fetched. If
   `sld` is unreachable the answer itself is missing, so the client gets
   SERVFAIL even with CD.
-* The resolver validates under CD=1 too and passes Bogus data with AD=0
-  (section 9.7).
+* With CD=1 the client checks signatures itself, so `Resolver` does not
+  validate a fresh answer: it is NotPerformed and gets AD=0. An answer from
+  the cache keeps what an earlier query without CD established (`cached`),
+  so Secure data can still carry AD, and Bogus data passes with AD=0.
 * Providers and signer implementations publish the same records, by the
   contract Lean proves (`lazy_agrees_complete`, `signer_agnostic`). The
   check here is that the validator reads nothing else; `SignerPeek` lets it
   skip the signature check for signer A's records.
-* `check_chain` needs a fifth problem. Section 8.7 lists `DsMismatch`,
-  `NoDsProofMissing`, `WindowClosed`, and `UnsupportedAlgorithm`. A zone
+* `check_chain` reports five problems: `DsMismatch`, `NoDsProofMissing`,
+  `WindowClosed`, `UnsupportedAlgorithm`, and `SignatureInvalid`. A zone
   whose RRset changed after signing (a `Zone::with` after `Zone::signed`)
-  has none of those, yet validates Bogus. With only the four,
+  has none of the first four, yet validates Bogus; with only those,
   `CheckChainAgrees` fails in `_providers` on a tree signed with key A
-  whose answer RRset changed after signing. The model adds
-  `SignatureInvalid` for a signed zone with a changed RRset, and
-  `check_chain` should report it (for example `ChainProblem::BadSignature
-  { owner, rtype }`).
+  whose answer RRset changed after signing. `ChainProblem::SignatureInvalid
+  { apex, owner, rtype }` is the fifth, for an RRset with no RRSIG that
+  verifies under its zone's keys.
 
 ## How the models map to the Rust types
 
-Resolution (sections 9.1 to 9.7):
+Resolution:
 
 | Model | Rust |
 |---|---|
@@ -305,15 +318,15 @@ Resolution (sections 9.1 to 9.7):
 | entry `t` = `"fail"` | `Entry::Failure { why: FailureKind, until }`, kept for `Config::failure_ttl` |
 | entry `rank` | `Rank::AuthAnswer` and `Rank::Glue` (two of the five ranks) |
 | entry `readAt + ttl` | `expires: Instant` |
-| `known` | the cached cuts the resolution starts from (section 9.4 step 2) |
+| `known` | the cached cuts the resolution starts from |
 | `res[q]` | one resolution in `resolver/resolution.rs`: `qn` the name the chain has reached, `zone` the closest cut, `tried` the addresses tried per transport (RFC 9520 section 3.1), `work` and `chain` against `Config::work` (`Work { queries, depth }`) |
-| `waiting[q]` | the client queries waiting on one resolution (section 6.2 rule 6) |
-| `ans[c][q]` | `Action::Answer`, rendered for its client (section 9.7) |
-| `Receive` | section 9.4 step 5: TC retries over TCP, answers stored in bailiwick only, referrals strictly below the cut, glue at glue rank |
+| `waiting[q]` | the client queries waiting on one resolution, which they share |
+| `ans[c][q]` | `Action::Answer`, rendered for its client |
+| `Receive` | taking a reply: TC retries over TCP, answers stored in bailiwick only, referrals strictly below the cut, glue at glue rank |
 | `Timeout` | `Input::Tick` at the exchange's deadline |
 | `CheckBailiwick`, `CacheTc`, `CheckExpiry`, `FailureAsNegative`, `BoundWork` | the bailiwick check, "truncated replies are not cached", the `expires` check, `Entry::Failure` as its own variant, and `Config::work` |
 
-Exchanges (section 6):
+Exchanges:
 
 | Model | Rust |
 |---|---|
@@ -322,12 +335,12 @@ Exchanges (section 6):
 | `Send` | `Action::Send(Transmit)` with a fresh token |
 | `Deliver` | `Engine::handle(Input::Reply { token, from, transport, bytes })`; an ignored reply is `Event::Ignored` |
 | `Timeout` | `Input::Tick` at `next_deadline()`, with `Action::Abandon(token)` |
-| `GiveUp` | the SERVFAIL rule 7 guarantees |
+| `GiveUp` | the SERVFAIL every waiter gets when no server is left |
 | `Gone(c)` | `Input::Gone(Client)` |
 | `Advance` | `Engine::advance(Session)`, driven by `world::net::dns::Namespace` |
 | `cache`, `waiters` | the resolver's cache and waiters, or the authority engine's parked requests |
 
-Authority (sections 5.4, 7, 11.3):
+Authority:
 
 | Model | Rust |
 |---|---|
@@ -340,10 +353,10 @@ Authority (sections 5.4, 7, 11.3):
 | `Provider(w, n)` | `Provider::lookup -> Fact<Vec<RecordSet>>` |
 | `ins`, `history`, `rev` | the lazy zone's `Mutex<Zone>` and its `Revision`s |
 | `ViewReply` with `"unknown"` | `Answered::Unknown`, answered SERVFAIL by `Zones` |
-| `Cross` | `Overlay::below` asking `<apex> DS` before composing a referral |
+| `Crosses(r)` | `Overlay::below` reading the inner authority's `<apex> NS` and asking `<apex> DS` before composing a referral |
 | a relayed reply | `Relay`, with `restore` |
 
-Validation (sections 8.5 to 8.7, 9.5, 9.7):
+Validation:
 
 | Model | Rust |
 |---|---|
@@ -353,6 +366,6 @@ Validation (sections 8.5 to 8.7, 9.5, 9.7):
 | `clock` | `WallClock::at(now)`, the `Session` clock |
 | `Walk`, `Validate` | `validate_rrset` and `validate_denial` |
 | result kinds | `Validation::{NotPerformed, Secure, Insecure(Insecure), Bogus(EdeCode), Indeterminate}`; reasons `Insecure::{ProvenNoDs, OptOutCovered, NoAnchor, UnsupportedAlgorithm}` and EDE codes 5, 6, 7, 8, 9, 12 |
-| `Rendered` | the resolver front: AD, CD, SERVFAIL (section 9.7) |
+| `Established`, `Rendered` | what `Resolver` established (NotPerformed for a fresh answer under CD) and its front: AD, CD, SERVFAIL |
 | `ChainProblems` | `check_chain -> Vec<ChainProblem>` |
 | `provider1`, `impl1` | `Zone`, `Lazy`, or `Relay`; two `Sign` implementations |

@@ -1,16 +1,19 @@
 ------------------------------ MODULE Authority ------------------------------
 (***************************************************************************)
-(* The authority engine of design section 7 serving three addresses of one *)
-(* world: a root server, a TLD server, and the server of an edited zone    *)
-(* "fict".                                                                 *)
+(* The authority engine of `services::dns::authority` serving three        *)
+(* addresses of one world: a root server, a TLD server, and the server of  *)
+(* an edited zone "fict".                                                  *)
 (*                                                                         *)
-(* The root and TLD servers run Overlay(Relay).below("fict", Lazy): a      *)
-(* question for an unedited name is relayed to the real server at that     *)
-(* address through a source; a question for a name below "fict" asked at   *)
-(* the TLD server gets a referral composed from the edited zone, after the *)
-(* overlay asks the real TLD server for "fict DS" (DO=1). The fict server  *)
-(* answers from a Lazy zone whose Provider says, per name, Present,        *)
-(* Absent, or Unknown, and whose answers change as the world runs.         *)
+(* The root server runs Relay: every question is relayed to the real      *)
+(* server at that address through a source. The TLD server runs           *)
+(* Overlay(Relay).below("fict", Lazy): a question for an unedited name is  *)
+(* relayed the same way; a question at or below "fict" gets a referral     *)
+(* composed from the edited zone's apex NS RRset and the addresses of its  *)
+(* target "ns.fict", read from the lazy zone, after the overlay asks the   *)
+(* real TLD server for "fict DS" (DO=1). A fact of that read the zone does *)
+(* not know makes the referral SERVFAIL. The fict server answers from a   *)
+(* Lazy zone whose Provider says, per name, Present, Absent, or Unknown,   *)
+(* and whose answers change as the world runs.                             *)
 (*                                                                         *)
 (* Every ask passes the world's Only policy before the source sees it; a   *)
 (* refused ask is a Timeout. The source answers after any delay, may fail  *)
@@ -25,7 +28,9 @@
 (* Ablation flags: NoPolicy (no Only), RootExempt (asks to root and TLD    *)
 (* servers skip the policy), UnknownAsAbsent (the view reads Unknown as    *)
 (* Absent), MixedRevision (the view reads the name and the wildcard under  *)
-(* two lock acquisitions, so a revision can grow in between).              *)
+(* two lock acquisitions, so a revision can grow in between), ReaskTimeout *)
+(* (respond asks again after a timeout), ParkInView (the overlay sends its *)
+(* DS ask while it still holds its read of the lazy zone).                 *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets, TLC
 
@@ -39,12 +44,16 @@ CONSTANTS
     RootExempt,      \* ablation: asks to the root and TLD servers skip the policy
     UnknownAsAbsent, \* ablation: Unknown is read as Absent
     MixedRevision,   \* ablation: the view reads under two lock acquisitions
+    ReaskTimeout,    \* ablation: respond asks again after a timeout
+    ParkInView,      \* ablation: the overlay asks while holding its read of the lazy zone
     None
 
 Apex == "fict"
+\* The target of the apex NS RRset, whose addresses a referral carries.
+NsTarget == "ns.fict"
 Wildcard == "*.fict"
 \* Names at or below the edited apex. Everything else is unedited.
-Edited == {"fict", "a.fict", "b.fict", "c.fict", "*.fict"}
+Edited == {"fict", "ns.fict", "a.fict", "b.fict", "c.fict", "*.fict"}
 
 \* The world's predicate for asks: the guest-chosen name "leak.evil" must never
 \* reach a real server, whichever server it is addressed to.
@@ -58,6 +67,7 @@ PolicyPasses(ask) ==
 \* What the provider says about n while the world is at w.
 Provider(w, n) ==
     CASE n = Apex     -> "present"
+      [] n = NsTarget -> IF w = 0 THEN "present" ELSE "unknown"
       [] n = "a.fict" -> IF w = 0 THEN "absent" ELSE "present"
       [] n = "b.fict" -> "unknown"
       [] n = "c.fict" -> "absent"
@@ -66,10 +76,13 @@ Provider(w, n) ==
 \* The real server's reply to an ask while the real data is at v.
 RealReply(ask, v) == <<ask.srv, ask.q, v>>
 
+\* A question the overlay at the TLD server answers with a referral.
+Crosses(r) == r.q \in Edited /\ r.srv = "tld"
+
 \* The ask a request needs: the overlay's DS ask for a question that crosses
 \* the apex at the TLD server, the relayed question otherwise.
 AskOf(r) ==
-    IF r.q \in Edited /\ r.srv = "tld" THEN [srv |-> "tld", q |-> "fict DS"]
+    IF Crosses(r) THEN [srv |-> "tld", q |-> "fict DS"]
     ELSE [srv |-> r.srv, q |-> r.q]
 
 \* The fict server answers from the lazy zone with no ask.
@@ -93,6 +106,7 @@ ReqsAdvance == {Real, Cross}
 Respond(r, k) ==
     IF k = None THEN "need"
     ELSE IF k.obs = "reply" THEN "reply"
+    ELSE IF ReaskTimeout /\ k.obs = "timeout" THEN "need"
     ELSE "silent"
 
 VARIABLES
@@ -205,9 +219,22 @@ Step(r) ==
     /\ ~FromView(r)
     /\ LET a == AskOf(r)
            tok == <<gen, r.id>>
-       IN  CASE Respond(r, known[r]) = "need" ->
+           \* An overlay first reads the edited zone's apex NS RRset and the
+           \* addresses of its target, under one view of the lazy zone.
+           fa == Fact(Apex)
+           fn == Fact(NsTarget)
+           read == IF Crosses(r) THEN {<<Apex, fa>>, <<NsTarget, fn>>} ELSE {}
+           unknown == Crosses(r) /\ "unknown" \in {Read(fa), Read(fn)}
+       IN  /\ IF Crosses(r) THEN Grow(IF fn = "present" THEN {NsTarget} ELSE {})
+              ELSE UNCHANGED <<ins, history, rev>>
+           /\ CASE unknown ->
+                  /\ reply' = [reply EXCEPT ![r] = Reply("SERVFAIL", None, read, None)]
+                  /\ st' = [st EXCEPT ![r] = "done"]
+                  /\ UNCHANGED <<nAsks, atSource, obsq, reached, partial>>
+                [] Respond(r, known[r]) = "need" ->
                   /\ st' = [st EXCEPT ![r] = "parked"]
                   /\ nAsks' = [nAsks EXCEPT ![r] = @ + 1]
+                  /\ partial' = IF ParkInView /\ Crosses(r) THEN [partial EXCEPT ![r] = read] ELSE partial
                   /\ IF PolicyPasses(a)
                      THEN /\ atSource' = atSource \cup {[token |-> tok, ask |-> a]}
                           /\ reached' = reached \cup {a}
@@ -215,16 +242,15 @@ Step(r) ==
                      ELSE /\ obsq' = obsq \cup {[token |-> tok, ask |-> a, obs |-> "timeout", v |-> None]}
                           /\ UNCHANGED <<atSource, reached>>
                   /\ UNCHANGED reply
-             [] Respond(r, known[r]) = "reply" ->
-                  /\ reply' = [reply EXCEPT ![r] = Reply("NOERROR", known[r].val,
-                                    IF r.q \in Edited THEN {<<Apex, "present">>} ELSE {}, known[r].v)]
+                [] Respond(r, known[r]) = "reply" ->
+                  /\ reply' = [reply EXCEPT ![r] = Reply("NOERROR", known[r].val, read, known[r].v)]
                   /\ st' = [st EXCEPT ![r] = "done"]
-                  /\ UNCHANGED <<nAsks, atSource, obsq, reached>>
-             [] Respond(r, known[r]) = "silent" ->
+                  /\ UNCHANGED <<nAsks, atSource, obsq, reached, partial>>
+                [] Respond(r, known[r]) = "silent" ->
                   /\ reply' = [reply EXCEPT ![r] = Reply("SILENT", None, {}, None)]
                   /\ st' = [st EXCEPT ![r] = "done"]
-                  /\ UNCHANGED <<nAsks, atSource, obsq, reached>>
-    /\ UNCHANGED <<world, ins, history, rev, real, realSeen, gen, known, partial>>
+                  /\ UNCHANGED <<nAsks, atSource, obsq, reached, partial>>
+    /\ UNCHANGED <<world, real, realSeen, gen, known>>
 
 (* The source finishes an ask: the real server's reply as it is now, or a  *)
 (* failure.                                                               *)
@@ -325,16 +351,18 @@ CoherentRevision ==
         \E s \in history : \A f \in reply[r].facts : FactAt(s, f[1]) = f[2]
 
 (* More observations never turn a reply into a Need (Lean: respond_monotone). *)
+(* Each request here needs one ask, so once it knows what that ask observed, *)
+(* whatever that was, it never needs another.                              *)
 RespondMonotone ==
-    \A r \in Reqs : \A o \in Observations :
-        Respond(r, None) # "need" => Respond(r, [obs |-> o]) # "need"
+    \A r \in Reqs : known[r] # None => Respond(r, known[r]) # "need"
 
 (* A request sends at most one ask per Need, and one Need per generation. *)
 OneAskPerNeed ==
     \A r \in Reqs : nAsks[r] <= 1
 
 (* A request parked on an ask holds no part of a view: the zone's lock is   *)
-(* taken only inside view, which never waits on an ask.                   *)
+(* taken only inside view, which never waits on an ask, and the overlay    *)
+(* reads the lazy zone before it asks, not across the ask.                 *)
 NoLockAcrossAsk ==
     \A r \in Reqs : st[r] = "parked" => partial[r] = None
 

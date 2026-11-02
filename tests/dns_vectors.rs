@@ -1759,7 +1759,7 @@ fn final_name(qname: &Name, qtype: RecordType, answers: &[Record]) -> Name {
 /// validations, or `unknown`.
 fn signed_case(
     case: &Value,
-    keys: &mut impl Keys,
+    maker: &mut impl Keys,
     verify: &impl Verify,
     tally: &mut Tally,
     compare_lines: bool,
@@ -1768,7 +1768,7 @@ fn signed_case(
     let expected = field(case, "expected");
     let zone = vector_zone(field(input, "zone"))?;
     let specs = key_specs(input);
-    let keys = key_set(&specs, keys);
+    let keys = key_set(&specs, maker);
     let tags = tag_names(&specs, &keys);
     let window = vector_window(field(input, "window"));
     let signed = zone
@@ -1790,17 +1790,20 @@ fn signed_case(
     };
     let message = &response.message;
     let qtype = req.question.query_type();
-    // The Lean model answers QTYPE ANY without the NSEC and NSEC3PARAM
-    // RRsets a signed node holds, so they are left out of what Rust
+    // The Lean model answers QTYPE ANY without the NSEC, NSEC3PARAM, and
+    // DNSKEY RRsets a signed node holds, so they are left out of what Rust
     // answers before the two are compared.
     let (answers, lean_lacks): (Vec<Record>, Vec<Record>) =
         message.answers.iter().cloned().partition(|r| {
             qtype != RecordType::ANY
-                || !matches!(covered_type(r), RecordType::NSEC | RecordType::NSEC3PARAM)
+                || !matches!(
+                    covered_type(r),
+                    RecordType::NSEC | RecordType::NSEC3PARAM | RecordType::DNSKEY
+                )
         });
     if !lean_lacks.is_empty() {
         tally.note(
-            "answers to ANY with NSEC or NSEC3PARAM, which Lean leaves out (compared without)",
+            "answers to ANY with NSEC, NSEC3PARAM, or DNSKEY, which Lean leaves out (compared without)",
         );
     }
     let form = Form::Zone(&tags);
@@ -1891,13 +1894,28 @@ fn signed_case(
         tally.note("NSEC3 bitmaps naming NSEC3PARAM, which Lean lacks (compared without)");
     }
 
-    let anchors = Anchors::of(vec![keys.anchor(&apex)]);
-    let chain = Chain {
-        links: vec![Link {
-            zone: apex,
-            ds: Fetched::Failed,
-            dnskey: Fetched::Answer(dnskeys),
-        }],
+    // A zone below a signed parent validates from the parent's anchor,
+    // down the delegation the parent serves; any other from its own.
+    let (anchors, chain) = match input.get("parent").filter(|parent| !parent.is_null()) {
+        Some(parent) => parent_chain(
+            parent,
+            &apex,
+            dnskeys,
+            window,
+            maker,
+            expected,
+            compare_lines,
+        )?,
+        None => (
+            Anchors::of(vec![keys.anchor(&apex)]),
+            Chain {
+                links: vec![Link {
+                    zone: apex,
+                    ds: Fetched::Failed,
+                    dnskey: Fetched::Answer(dnskeys),
+                }],
+            },
+        ),
     };
     let policy = vector_policy(field(input, "policy"));
     let at = time(number(input, "time"));
@@ -1911,20 +1929,6 @@ fn signed_case(
             set, &authority, &chain, &anchors, &policy, at, verify,
         ));
         if *lean == rust {
-            continue;
-        }
-        // RFC 5155 §8.8 has a wildcard answer prove that the next closer
-        // name does not exist; an NSEC3 with Opt-Out covering it cannot
-        // (§6), so Rust, like Unbound, finds the answer Insecure. The Lean
-        // model takes any covering NSEC3.
-        let wildcard = set.rrsigs().iter().any(|r| match &r.data {
-            RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) => {
-                rrsig.input().num_labels < set.name().num_labels()
-            }
-            _ => false,
-        });
-        if lean == "secure" && rust == "insecure opt_out_covered" && wildcard {
-            tally.note("wildcard answers under an Opt-Out NSEC3, Secure in Lean, Insecure in Rust");
             continue;
         }
         return Err(format!(
@@ -1951,22 +1955,6 @@ fn signed_case(
     if lean_denial == rust_denial {
         return Ok(());
     }
-    // The NODATA of a name a wildcard answered proves the name's next
-    // closer name absent (RFC 5155 §7.2.5); an NSEC3 with Opt-Out covering
-    // it cannot (§6), so Rust, like Unbound, finds the denial Insecure. The
-    // Lean model takes any covering NSEC3.
-    let wildcard_nodata = rcode == ResponseCode::NoError
-        && signed.node(&LowerName::new(&qname)).is_none()
-        && texts(expected, "denial")
-            .iter()
-            .any(|l| l.contains(" NSEC3 1 1 "));
-    if lean_denial.as_deref() == Some("secure")
-        && rust_denial.as_deref() == Some("insecure opt_out_covered")
-        && wildcard_nodata
-    {
-        tally.note("wildcard NODATA under an Opt-Out NSEC3, Secure in Lean, Insecure in Rust");
-        return Ok(());
-    }
     // Rust checks the signed SOA RRset of a negative answer (RFC 4035
     // §3.1.1) before its denial records, and reports why the SOA failed.
     // The Lean model checks only the denial records.
@@ -1989,9 +1977,102 @@ fn signed_case(
     same("denial validation", lean_denial, rust_denial)
 }
 
+/// The anchors and chain for a zone at `apex`, with DNSKEY RRset
+/// `dnskeys`, below the signed parent `parent` gives. The parent is built
+/// from its records, its DS records for the zone made real for `maker`'s
+/// keys, signed with its own keys, and asked for the zone's DS RRset with
+/// DO, as a resolver asks it. The validation then walks from the parent's
+/// anchor across the delegation, as Lean's does.
+fn parent_chain(
+    parent: &Value,
+    apex: &Name,
+    dnskeys: RecordSet,
+    window: Window,
+    maker: &mut impl Keys,
+    expected: &Value,
+    compare_lines: bool,
+) -> Result<(Anchors, Chain), String> {
+    let records: Vec<String> = texts(field(parent, "zone"), "records")
+        .iter()
+        .map(|line| real_ds_line(line, maker).0)
+        .collect();
+    let zone = Zone::from_master(&records.join("\n"), None)
+        .map_err(|e| format!("the parent does not build: {e}"))?;
+    let specs = key_specs(parent);
+    let keys = key_set(&specs, maker);
+    let signed = zone
+        .signed(&keys, window, vector_denial(field(parent, "denial")))
+        .map_err(|e| format!("signing the parent failed: {e}"))?;
+    let papex = Name::from(signed.apex());
+    let parent_keys = match signed.node(signed.apex()) {
+        Some(Node::Data(sets)) => sets.get(&RecordType::DNSKEY).cloned(),
+        _ => None,
+    }
+    .ok_or("the signed parent has no DNSKEY RRset")?;
+    let reply = match answer(
+        &signed,
+        &request(apex, RecordType::DS, true),
+        AnyResponse::All,
+    ) {
+        Answered::Response(response) => response.message,
+        Answered::Unknown { name } => return Err(format!("the parent does not know {name}")),
+    };
+    let ds_set = record_sets(&reply.answers)
+        .into_iter()
+        .find(|set| set.record_type() == RecordType::DS);
+    if compare_lines {
+        let tags = tag_names(&specs, &keys);
+        let form = Form::Zone(&tags);
+        let lines = |records: &mut dyn Iterator<Item = &Record>| -> Vec<String> {
+            records
+                .map(|r| line(r, form).replace(NSEC3PARAM_BIT, ""))
+                .collect()
+        };
+        same(
+            "parent dnskey",
+            section(&texts(expected, "parent_dnskey")),
+            section(&lines(&mut parent_keys.records(true))),
+        )?;
+        // The parent's DS records hold real digests here and symbolic ones
+        // in Lean, so a DS RRset is compared by its presence and a denial
+        // record by record.
+        let lean = texts(expected, "delegation");
+        let lean_ds = lean.iter().any(|l| tokens(l)[3] == "DS");
+        same("delegation by a DS RRset", lean_ds, ds_set.is_some())?;
+        if !lean_ds {
+            let lean: BTreeSet<String> = lean.into_iter().collect();
+            let rust: BTreeSet<String> =
+                lines(&mut reply.authorities.iter().filter(|r| is_denial(r)))
+                    .into_iter()
+                    .collect();
+            same("delegation", lean, rust)?;
+        }
+    }
+    let ds = match ds_set {
+        Some(set) => Fetched::Answer(set),
+        None => Fetched::Denied(record_sets(&reply.authorities)),
+    };
+    let anchors = Anchors::of(vec![keys.anchor(&papex)]);
+    let chain = Chain {
+        links: vec![
+            Link {
+                zone: papex,
+                ds: Fetched::Failed,
+                dnskey: Fetched::Answer(parent_keys),
+            },
+            Link {
+                zone: apex.clone(),
+                ds,
+                dnskey: Fetched::Answer(dnskeys),
+            },
+        ],
+    };
+    Ok((anchors, chain))
+}
+
 /// `signed.json` with the symbolic signer and the oracle verifier: the
 /// signed zone's answer with DO=1 and its validation under the zone's own
-/// anchor.
+/// anchor, or its parent's.
 #[test]
 fn signed_symbolic() {
     each_case("signed", |case, tally| {
@@ -2136,7 +2217,7 @@ fn symbolic_digest(owner: &Name, digest: &[u8]) -> Option<(bool, u8, Vec<u8>)> {
 /// line's digest type, and the algorithm it names. Lines whose digest
 /// names no key, or whose digest type has no real digest here, stay as
 /// they are; a validator cannot use them either way.
-fn real_ds_line(line: &str, keys: &mut RealKeys) -> (String, Option<u8>) {
+fn real_ds_line(line: &str, keys: &mut impl Keys) -> (String, Option<u8>) {
     let fields = tokens(line);
     if fields[3] != "DS" {
         return (line.to_string(), None);
@@ -2231,6 +2312,9 @@ fn chain() {
                     ChainProblem::UnsupportedAlgorithm { apex, algorithm } => {
                         format!("unsupported_algorithm {} {algorithm}", n(&apex))
                     }
+                    ChainProblem::SignatureInvalid { apex, owner, rtype } => {
+                        format!("signature_invalid {} {} {rtype}", n(&apex), n(&owner))
+                    }
                 }
             })
             .collect();
@@ -2268,14 +2352,16 @@ fn chain() {
         // `check_sound` assumes honest signers: the Lean check reads no
         // signature, so the breaks a corrupted key makes are not its to
         // report. Rust's check verifies signatures and reports them as a
-        // DS that selects no key signing the child's DNSKEY RRset, or a
-        // no-DS proof that does not verify; it reports everything else
-        // Lean does.
+        // DS that selects no key signing the child's DNSKEY RRset, a
+        // no-DS proof that does not verify, or an RRset whose RRSIGs do
+        // not verify; it reports everything else Lean does.
         if corrupt {
             let extra: Vec<&String> = rust.difference(&lean).collect();
-            let signature_breaks = extra
-                .iter()
-                .all(|p| p.starts_with("ds_mismatch ") || p.starts_with("no_ds_proof_missing "));
+            let signature_breaks = extra.iter().all(|p| {
+                p.starts_with("ds_mismatch ")
+                    || p.starts_with("no_ds_proof_missing ")
+                    || p.starts_with("signature_invalid ")
+            });
             if lean.is_subset(&rust) && signature_breaks {
                 if !extra.is_empty() {
                     tally

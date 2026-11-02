@@ -1,5 +1,5 @@
 /-
-  Views that may not know every fact (§5.1, §5.4): the answer over a view, its soundness against every
+  Views that may not know every fact: the answer over a view, its soundness against every
   complete zone that agrees with the view, and `Lazy` zones that grow from a provider and answer from one
   revision.
 
@@ -496,7 +496,7 @@ theorem unknown_never_negative (v : View) (req : Request) (any : AnyResponse) (h
   · unfold step; rw [h2 hu]
   · unfold step; rw [h3 l p he hne ha]; simp [get, hw]
 
-/-! ## Lazy zones (§5.4) -/
+/-! ## Lazy zones -/
 
 /-- Decides names as they are asked: their RRsets, nothing at or below them, or not known. -/
 abbrev Provider := Name → Fact (List RRset)

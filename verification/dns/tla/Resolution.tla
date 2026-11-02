@@ -1,6 +1,7 @@
 ----------------------------- MODULE Resolution -----------------------------
 (***************************************************************************)
-(* The recursive resolver of design section 9 against a small hierarchy.   *)
+(* The recursive resolver of `services::dns::resolver` against a small     *)
+(* hierarchy.                                                              *)
 (*                                                                         *)
 (* Zones: the root, "tld", and two zones below it, "sld.tld" and           *)
 (* "alt.tld". Each zone has two servers. Server 1 answers from the data;   *)
@@ -337,7 +338,7 @@ ReceiveOne(m) ==
               /\ UNCHANGED <<cache, known>>
          [] b.kind = "referral" ->
               \* A referral must lead strictly below the current cut and to a zone
-              \* at or above the name; anything else is lame (design section 9.4).
+              \* at or above the name; anything else is lame.
               IF StrictlyBelow(b.to, r.zone) /\ AtOrBelow(r.qn, b.to)
               THEN /\ known' = known \cup {b.to}
                    /\ cache' = CacheAll(cache, b.extra, "glue", m.srv[1])

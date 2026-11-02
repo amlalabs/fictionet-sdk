@@ -1,10 +1,10 @@
 /-
-  The recursive resolver (§9.4) as `step : State → Event → State × List Out`, over correct servers that answer
+  The recursive resolver as `step : State → Event → State × List Out`, over correct servers that answer
   with `Zone.answer`.
 
   A resolution starts from a cached answer, or from the deepest cached cut at or above the name (the root hints
   when there is none), asks that cut's servers one at a time, follows referrals that go strictly down toward
-  the name (§9.4 step 5), tries the next server when a query is lost or a referral is bizarre, and gives up with
+  the name, tries the next server when a query is lost or a referral is bizarre, and gives up with
   SERVFAIL when no server is left (RFC 9520 §3.1) or the work bound is spent (RFC 1034 §5.3.3). Referral NS
   sets are cached at rank non-authoritative authority and their glue at rank glue; final answers at rank
   authoritative answer (RFC 2181 §5.4.1).
@@ -46,7 +46,7 @@ def cutOf (r : Response) : Option RRset :=
   | [ns] => if r.rcode = .noerror ∧ r.aa = false ∧ r.answer = [] ∧ ns.rtype = 2 then some ns else none
   | _ => none
 
-/-- A referral the resolver follows from the cut `c`: strictly below it, at or above the name (§9.4 step 5),
+/-- A referral the resolver follows from the cut `c`: strictly below it, at or above the name,
 and naming servers. -/
 def descends (c : Name) (q : Request) (ns : RRset) : Bool :=
   strictly ns.owner c && under q.qname ns.owner && !(targets ns).isEmpty
@@ -149,8 +149,7 @@ which its parent answers (RFC 4035 §3.1.4.1). -/
 def startsAt (q : Request) (ns : RRset) : Bool :=
   under q.qname ns.owner && !(ns.owner == q.qname && q.qtype == 43)
 
-/-- The deepest cached cut a resolution may start from, with its servers; the root hints when there is none
-(§9.4 step 2). -/
+/-- The deepest cached cut a resolution may start from, with its servers; the root hints when there is none. -/
 def closestCut (cfg : Config) (cache : List Stored) (q : Request) : Name × List Name :=
   cache.foldl (fun best st =>
     match st.item with

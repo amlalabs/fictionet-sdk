@@ -1,5 +1,5 @@
 /-
-  RRset-aware truncation (§4.4): header, question, and OPT first; answer and authority RRsets whole; then
+  RRset-aware truncation: header, question, and OPT first; answer and authority RRsets whole; then
   the required additional RRsets (in-domain glue, RFC 9471 §3.1); then the optional ones. TC is set only
   when something required does not fit (RFC 2181 §9); optional additional data that does not fit is dropped
   without TC. The OPT record is always kept (RFC 6891 §7).

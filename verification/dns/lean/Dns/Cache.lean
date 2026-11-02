@@ -1,8 +1,8 @@
 /-
-  The resolver's cache (§9.6): entries with a rank, an expiry, a validation, and the generation that wrote
+  The resolver's cache: entries with a rank, an expiry, a validation, and the generation that wrote
   them; failures cached apart from negatives (RFC 9520).
 
-  Times are seconds on one clock, the run's `Instant` (§14). An RRSIG's expiration reaches the cache already
+  Times are seconds on one clock, the run's `Instant`. An RRSIG's expiration reaches the cache already
   converted to that clock by the resolver's `WallClock`. Names are lowercase and the class is IN, so a key is
   a name and a type.
 
@@ -32,7 +32,6 @@ deriving DecidableEq, Repr
 
 inductive FailureKind where
   | noReachableAuthority
-  | bogus (ede : Ede)
   | workExceeded
   | unknown
 deriving DecidableEq, Repr
@@ -89,8 +88,8 @@ def Offer.key : Offer → Key
   | .negative k _ _ _ _ _ => k
   | .failure k _ => k
 
-/-- The rank an entry holds its key at. A negative answer is an authoritative answer; a failure ranks below all
-data, so it never displaces live data. -/
+/-- The rank an entry holds its key at. A negative answer is an authoritative answer; a failure ranks with glue,
+so it never displaces live data that answers clients. -/
 def Body.rank : Body → Rank
   | .positive _ r _ => r
   | .negative _ _ _ => .authAnswer
@@ -101,8 +100,9 @@ def readTtl (ttl : Nat) : Nat := if 2147483648 ≤ ttl then 0 else ttl
 
 /-- The entry an offer makes at `now`, or none when the offer may not be cached: truncated replies
 (RFC 2181 §9), TTL zero (RFC 1035 §7.4), negatives without an SOA (RFC 2308 §5). TTLs are capped at
-`maxTtl` (RFC 8767 §4); a Secure RRset lives no longer than its RRSIG (RFC 4035 §5.3.3); a proven negative
-uses min(SOA TTL, MINIMUM, NSEC TTL) (RFC 9077 §3); a failure lives `failureTtl` (RFC 9520 §3.2). -/
+`maxTtl` (RFC 8767 §4); a Secure RRset lives no longer than its RRSIG (RFC 4035 §5.3.3), and one validated
+Bogus or Indeterminate no longer than `failureTtl`; a proven negative uses min(SOA TTL, MINIMUM, NSEC TTL)
+(RFC 9077 §3); a failure lives `failureTtl` (RFC 9520 §3.2). -/
 def entryFor (now : Nat) (lim : Limits) (g : Nat) : Offer → Option Entry
   | .positive s r v sig tc =>
     let ttl := min (readTtl s.ttl) lim.maxTtl
@@ -110,6 +110,7 @@ def entryFor (now : Nat) (lim : Limits) (g : Nat) : Offer → Option Entry
     else
       let exp := match v, sig with
         | .secure, some x => min (now + ttl) x
+        | .bogus _, some _ | .indeterminate, some _ => min (now + ttl) (now + lim.failureTtl)
         | _, _ => now + ttl
       some ⟨⟨s.owner, s.rtype⟩, .positive s r v, now, exp, s.ttl, g⟩
   | .negative k kind soa nsec v tc =>
@@ -138,7 +139,7 @@ def insert (now : Nat) (lim : Limits) (c : Cache) (o : Offer) : Cache :=
         else ⟨c.generation, e :: c.entries.filter (·.key != e.key)⟩
     | none => ⟨c.generation, e :: c.entries.filter (·.key != e.key)⟩
 
-/-- A session change: a new generation, and nothing of the old one survives (§6.2 rule 5). -/
+/-- A session change: a new generation, and nothing of the old one survives. -/
 def advance (c : Cache) : Cache := ⟨c.generation + 1, []⟩
 
 /-- What the cache serves for a key, with TTLs counted down (RFC 2308 §6). -/

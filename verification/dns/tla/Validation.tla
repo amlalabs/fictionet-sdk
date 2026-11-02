@@ -1,8 +1,8 @@
 ----------------------------- MODULE Validation -----------------------------
 (***************************************************************************)
-(* The DNSSEC validator of design section 8.6 and the resolver's rendering *)
-(* of its result (section 9.7), over a path root, tld, sld, where the      *)
-(* answer is an RRset in sld.                                              *)
+(* The DNSSEC validator of `protocols::dns::dnssec` and the resolver's     *)
+(* rendering of its result, over a path root, tld, sld, where the answer   *)
+(* is an RRset in sld.                                                     *)
 (*                                                                         *)
 (* The validator is a function of records, anchors, a policy, a time, and  *)
 (* a verifier. So the model has no steps: every behavior is one initial    *)
@@ -23,6 +23,8 @@
 (*   changed[z] whether an RRset of z changed after it was signed          *)
 (*   clock      the validator's clock: now, or skewed to past or future    *)
 (*   reach[z]   whether z's DNSKEY and DS sets can be fetched              *)
+(*   cached     whether the answer comes from the resolver's cache, with   *)
+(*              the validation an earlier query without CD made            *)
 (*                                                                         *)
 (* The provider (Complete, Lazy, Relayed) and the signer implementation    *)
 (* (A or B) produce the same records by contract; the validator must not   *)
@@ -53,10 +55,11 @@ Pos(w) == CHOOSE i \in 1..3 : Windows[i] = w
 VARIABLES
     anchor, signer, proof, window, alg, changed, clock, reach,
     do, adq, cd, upstreamAd,       \* the query's DO, AD, and CD bits; the upstream reply's AD bit
+    cached,                        \* the answer comes from the cache, validated by an earlier query
     provider1, impl1, provider2, impl2
 
 vars == <<anchor, signer, proof, window, alg, changed, clock, reach, do, adq, cd, upstreamAd,
-          provider1, impl1, provider2, impl2>>
+          cached, provider1, impl1, provider2, impl2>>
 
 Init ==
     /\ anchor \in AnchorChoices
@@ -68,6 +71,7 @@ Init ==
     /\ clock \in ClockChoices
     /\ reach \in [Zones -> ReachChoices]
     /\ do \in BOOLEAN /\ adq \in BOOLEAN /\ cd \in BOOLEAN /\ upstreamAd \in BOOLEAN
+    /\ cached \in BOOLEAN
     /\ provider1 \in ProviderChoices /\ impl1 \in ImplChoices
     /\ provider2 \in ProviderChoices /\ impl2 \in ImplChoices
 
@@ -76,9 +80,9 @@ Spec == Init /\ [][Next]_vars
 
 -----------------------------------------------------------------------------
 (* Published records. Every provider and signer publishes the same records *)
-(* for the same zone data (design section 18.5; Lean: lazy_agrees_complete *)
-(* and signer_agnostic); the faults are what the validator's fetches and   *)
-(* clock see.                                                             *)
+(* for the same zone data (Lean: lazy_agrees_complete and                  *)
+(* signer_agnostic); the faults are what the validator's fetches and clock *)
+(* see.                                                                    *)
 
 Records(provider, impl) ==
     [anchor |-> anchor, signer |-> signer, proof |-> proof, window |-> window, alg |-> alg,
@@ -89,10 +93,10 @@ V(kind, why) == [kind |-> kind, why |-> why]
 \* The key a DS proof names, or "none" for any other proof.
 DsKey(p) == CASE p = "DsA" -> "A" [] p = "DsB" -> "B" [] OTHER -> "none"
 
-(* The validator, walking down from the anchor (design section 8.6). At    *)
-(* zone i it holds the key the link above names. The algorithm comes from  *)
-(* the DS or anchor, so an unsupported one makes the zone Insecure before  *)
-(* any fetch (RFC 4035 section 5.2, RFC 9905 section 2).                  *)
+(* The validator, walking down from the anchor. At zone i it holds the key *)
+(* the link above names. The algorithm comes from the DS or anchor, so an  *)
+(* unsupported one makes the zone Insecure before any fetch (RFC 4035      *)
+(* section 5.2, RFC 9905 section 2).                                       *)
 RECURSIVE Walk(_, _, _, _)
 Walk(r, impl, i, expect) ==
     LET z == Path[i] IN
@@ -119,12 +123,18 @@ Validate(r, impl) ==
 Result == Validate(Records(provider1, impl1), impl1)
 Result2 == Validate(Records(provider2, impl2), impl2)
 
-(* The resolver's answer to the client (design section 9.7). *)
+(* What the resolver established for the answer it renders. With CD the    *)
+(* client checks signatures itself, so the resolver does not validate a    *)
+(* fresh answer (NotPerformed); an answer from the cache keeps what an     *)
+(* earlier query without CD established.                                  *)
+Established == IF cd /\ ~cached THEN V("NotPerformed", "none") ELSE Result
+
+(* The resolver's answer to the client. *)
 Rendered ==
     LET bad == Result.kind \in {"Bogus", "Indeterminate"} IN
     [rcode |-> IF ~reach["sld"] \/ (bad /\ ~cd) THEN "SERVFAIL" ELSE "NOERROR",
      data  |-> reach["sld"] /\ (~bad \/ cd),
-     ad    |-> (Result.kind = "Secure" /\ (do \/ adq)) \/ (TrustUpstreamAd /\ upstreamAd)]
+     ad    |-> (Established.kind = "Secure" /\ (do \/ adq)) \/ (TrustUpstreamAd /\ upstreamAd)]
 
 -----------------------------------------------------------------------------
 (* The chain stated without the walk. *)
@@ -190,8 +200,8 @@ Sha1Insecure ==
 RecordsOnly ==
     Records(provider1, impl1) = Records(provider2, impl2) => Result = Result2
 
-(* check_chain over complete zones at build time (design section 8.7). An  *)
-(* RRset changed after signing is a problem too; see the README.           *)
+(* check_chain over complete zones at build time, with each problem it      *)
+(* reports. An RRset changed after signing is SignatureInvalid.            *)
 ChainProblems ==
     { <<"DsMismatch", c>> : c \in {c \in Children : proof[c] \in {"DsA", "DsB"} /\ signer[c] # DsKey(proof[c])} }
     \cup { <<"NoDsProofMissing", c>> : c \in {c \in Children : proof[c] \in {"Nsec", "Nothing"}} }

@@ -1,5 +1,5 @@
 /-
-  Authorities (§7.1, §7.4): `respond : Req → Known → Step`, the engine's loop that asks for each `Need` and
+  Authorities: `respond : Req → Known → Step`, the engine's loop that asks for each `Need` and
   calls `respond` again with the observation, `Relay`, and `Overlay`.
 
   An authority is written as a tree of asks: finished (a reply or silence), or ask one server and go on with

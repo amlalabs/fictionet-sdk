@@ -3,7 +3,7 @@
   decoder, the encoder, the relay's `restore`, and the server front's request check and reply header.
 
   Rust: hickory's `BinEncoder` and `BinDecoder` under `protocols::dns`, `protocols::dns::relay::restore`
-  (§4.5), and `protocols::dns::request::Request::parse` (§4.3).
+ , and `protocols::dns::request::Request::parse`.
 -/
 import Dns.Name
 
@@ -865,7 +865,7 @@ theorem unknown_rdata_verbatim (msg : Bytes) (t start len : Nat) (rd : RData) (c
     subst hd
     simp [encRData]
 
-/-! ## Relay restore (§4.5)
+/-! ## Relay restore
 
 The relay's reply carries the real server's ID and question case. `restore` writes the client's ID and the
 client's question octets into it in place and touches nothing else. -/
@@ -1006,7 +1006,7 @@ theorem restore_changes_only_id_and_case (reply query out : Bytes) (h : restore 
     · cases h
   · cases h
 
-/-! ## The server front: the request check and the reply header (§4.3, §7.3) -/
+/-! ## The server front: the request check and the reply header -/
 
 /-- The header of a reply to `q`: QR set; ID, OPCODE, RD, and CD copied; RA, Z, and AD zero (RFC 1035
 §4.1.1, RFC 6895 §2). -/
@@ -1056,7 +1056,7 @@ decreasing_by simp; omega
 
 def optRR (r : RR) : Bool := r.rtype == 41
 
-/-- `Request::parse`'s fixed order (§4.3). `udp` says whether the query came over UDP. -/
+/-- `Request::parse`'s fixed order. `udp` says whether the query came over UDP. -/
 def parse (bytes : Bytes) (udp : Bool) : Parsed :=
   match rd16 bytes 0, rd16 bytes 2 with
   | some id, some fl =>
