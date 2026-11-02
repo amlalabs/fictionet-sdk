@@ -384,7 +384,7 @@ impl PortServer for Server {
         let handler: Arc<dyn Handler> = Arc::new(vhosts.unwrap_or_default());
         let opts = HttpOptions {
             limits: self.limits,
-            first_bytes: (!arrival.info.tls).then_some(arrival.handshake),
+            first_bytes: (!arrival.info.tls).then_some(arrival.limits.handshake),
             budget: arrival.budget,
             date: self.date,
         };

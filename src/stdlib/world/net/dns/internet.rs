@@ -23,7 +23,7 @@
 //! let root = Arc::new(internet::root_zone(root)?);
 //! Net::new()
 //!     .hosts(internet::root_servers(|s| Authoritative::new(Zones::new(vec![root.clone()]), s), &at))
-//!     .hosts(internet::public_resolvers(|r| r.recursive(&at, clock), &at))
+//!     .hosts(internet::public_resolvers(|r, h| h.program(r.recursive(&at, clock)), &at))
 //!     .start(&fcx, attachments)?;
 //! # Ok(())
 //! # }
@@ -1074,25 +1074,25 @@ pub fn gtld_servers<P: Program>(program: impl Fn(ServerConfig) -> P, at: &Locati
         .collect()
 }
 
-/// One host per address pair of each of [`PUBLIC_RESOLVERS`], running the
-/// resolver `program` returns for it, behind [`Host::delay`] with half its
-/// round trip from `at`. `program` is called once per host; each host's
-/// resolver keeps its own caches.
-pub fn public_resolvers(
-    program: impl Fn(&PublicResolver) -> Recursive,
-    at: &Location,
-) -> Vec<Host> {
+/// One host per address pair of each of [`PUBLIC_RESOLVERS`], at both
+/// addresses and behind [`Host::delay`] with half its round trip from
+/// `at`, finished by `build`. `build` is called once per host and gives it
+/// its resolver, usually [`PublicResolver::recursive`], and any other
+/// ports, such as the [`encrypted`](super::encrypted) fronts in front of
+/// that resolver's [`handle`](Recursive::handle). Each host's resolver
+/// keeps its own caches.
+pub fn public_resolvers(build: impl Fn(&PublicResolver, Host) -> Host, at: &Location) -> Vec<Host> {
     PUBLIC_RESOLVERS
         .iter()
         .flat_map(|resolver| {
             let site = at.resolver(IpAddr::V4(resolver.addresses[0].v4));
-            let program = &program;
+            let build = &build;
             resolver.addresses.iter().map(move |address| {
-                Host::new(address.ptr.trim_end_matches('.'))
+                let host = Host::new(address.ptr.trim_end_matches('.'))
                     .at(address.v4)
                     .at(address.v6)
-                    .delay(site.rtt / 2)
-                    .program(program(resolver))
+                    .delay(site.rtt / 2);
+                build(resolver, host)
             })
         })
         .collect()

@@ -64,9 +64,10 @@ pub struct Arrival {
     /// The budget of the sandbox it came from. `None` if it came from no
     /// attached sandbox, such as a route ([`Net::route`]).
     pub budget: Option<Budget>,
-    /// [`Limits::handshake`]: how long a client has to send its first
-    /// bytes.
-    pub handshake: Duration,
+    /// The network's limits and timers ([`Net::limits`]), such as
+    /// [`Limits::handshake`], how long a client has to send its first
+    /// bytes, and [`Limits::dns_tcp_idle`] for a port that serves DNS.
+    pub limits: Limits,
 }
 
 /// Serves connections on one port of a host. [`Host::tcp`] and
@@ -183,7 +184,7 @@ where
         if opts.budget.is_none() {
             opts.budget = arrival.budget;
         }
-        opts.handshake = arrival.handshake;
+        opts.handshake = arrival.limits.handshake;
         let (conn, info) = (arrival.conn, arrival.info);
         Box::pin(async move {
             let _ = serve::connection(&fcx, conn, info, &mut service, &state, &opts).await;
@@ -1607,12 +1608,12 @@ async fn accept(
                         .from_sandbox(sandbox);
                 info.handshake = conn.handshake().cloned();
                 let accepted = fcx.now();
-                let handshake = machine.limits.handshake;
+                let limits = machine.limits;
                 let port = port.clone();
                 fcx.spawn(move |fcx| async move {
                     let _ = fcx
                         .region(move |fcx| async move {
-                            connection(fcx, conn, info, accepted, port, admission, handshake).await;
+                            connection(fcx, conn, info, accepted, port, admission, limits).await;
                             Ok(())
                         })
                         .await;
@@ -1634,7 +1635,7 @@ async fn connection(
     accepted: Instant,
     port: Arc<Port>,
     admission: Admission,
-    handshake: Duration,
+    limits: Limits,
 ) {
     let hooks = admission.hooks;
     let socket = conn.gone_watch();
@@ -1645,7 +1646,7 @@ async fn connection(
         info,
         socket: socket.clone(),
         budget: budget.clone(),
-        handshake,
+        limits,
     };
     let has_tls = !port
         .tls
@@ -1680,7 +1681,7 @@ async fn connection(
             Some(config)
         }
     };
-    let deadline = accepted + handshake;
+    let deadline = accepted + limits.handshake;
     let Ok((tls, info)) = serve::accept_tls(&fcx, conn, &info, select, deadline).await else {
         return;
     };

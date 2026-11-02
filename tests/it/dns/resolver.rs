@@ -887,6 +887,24 @@ fn ttls_are_capped_at_max_ttl_fresh_and_cached() {
 }
 
 #[test]
+fn ttls_count_down_on_a_clock_of_whole_seconds() {
+    let (mut net, _) = internet(false);
+    let mut resolver = resolver(config(None));
+    let mut ask_at = |millis: u64| {
+        let query = query(client(1), "www.example.com.", RecordType::A, |_| {});
+        let now = Instant::from_since_start(Duration::from_millis(millis));
+        let answers = drive(&mut resolver, &mut net, vec![query], now, &entropy());
+        Message::from_vec(&answers[0].bytes).unwrap().answers[0].ttl
+    };
+    // Fetched 0.6 seconds into second 0, then asked 5.2 seconds later, in
+    // second 5: five seconds have passed on the clock, as Unbound counts.
+    assert_eq!(ask_at(600), 300);
+    assert_eq!(ask_at(5_800), 295);
+    assert_eq!(ask_at(5_999), 295);
+    assert_eq!(ask_at(6_000), 294);
+}
+
+#[test]
 fn an_alias_is_followed_inside_the_zone_and_across_zones() {
     let (mut net, _) = internet(false);
     let mut resolver = resolver(config(None));

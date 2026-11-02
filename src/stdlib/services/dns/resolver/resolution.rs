@@ -42,7 +42,7 @@ use super::super::event::{Event, Unmatched, UpstreamOutcome};
 use super::super::exchange::{Action, ExchangeFailure, Token, Transmit};
 use super::super::zone::dname_target;
 use super::Resolver;
-use super::cache::{Entry, FailureKind, Key, Negative, Offer, Rank, normalized};
+use super::cache::{Entry, FailureKind, Key, Negative, Offer, Rank, normalized, ttl_left};
 
 /// Something that waits in the graph.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -470,7 +470,7 @@ impl<V: Verify> Resolver<V> {
         let remaining = if stale {
             0
         } else {
-            remaining(*expires, self.now)
+            ttl_left(*expires, self.now)
         };
         let set = with_ttl(set, remaining);
         let zone = self.zone_of(&set);
@@ -514,7 +514,7 @@ impl<V: Verify> Resolver<V> {
         else {
             return None;
         };
-        let remaining = remaining(*expires, self.now);
+        let remaining = ttl_left(*expires, self.now);
         let soa = with_ttl(soa, remaining);
         let zone = soa.name().clone();
         let outcome = Outcome::Negative {
@@ -1977,12 +1977,6 @@ fn address(record: &Record) -> Option<IpAddr> {
         RData::AAAA(aaaa) => Some(IpAddr::V6(aaaa.0)),
         _ => None,
     }
-}
-
-/// Whole seconds from `now` until `expires`.
-fn remaining(expires: Instant, now: Instant) -> u32 {
-    let left = expires.since_start().saturating_sub(now.since_start());
-    u32::try_from(left.as_secs()).unwrap_or(u32::MAX)
 }
 
 /// `set` with its TTL, and every record's and RRSIG's, set to `ttl`.
