@@ -20,6 +20,7 @@
 //! | --- | --- |
 //! | [`Queries`] | Frames messages, one per datagram or after a two-octet length on a stream (RFC 1035 §4.2.2). |
 //! | [`Request::parse`] | Checks a query in one fixed order and gives a request, a rejection to send, or silence. |
+//! | [`read_message`] | Reads a message as hickory does, and also with records whose RDATA is empty (RFC 3597 §4). |
 //! | [`fit`] | Writes a reply within the requestor's size: whole RRsets, needed data first, TC only when that data does not fit. |
 //! | [`restore`] | Gives a relayed reply the client's ID and question case and changes nothing else. |
 //! | [`Ede`], [`Nsid`], [`Padding`] | EDNS options hickory carries as raw bytes or its own type (RFC 8914, 5001, 7830). |
@@ -96,4 +97,4 @@ pub use fit::{Fitted, Limit, Response, fit};
 pub use framing::{Framing, Queries, stream_framed};
 pub use options::{Ede, EdeCode, Nsid, Padding};
 pub use relay::{RelayError, restore};
-pub use request::{EdnsIn, Parsed, Request};
+pub use request::{EdnsIn, Parsed, Request, read_message};

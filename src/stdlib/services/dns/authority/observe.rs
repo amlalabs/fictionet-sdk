@@ -2,7 +2,7 @@
 
 use std::net::SocketAddr;
 
-use fictionet::stdlib::protocols::dns::op::Message;
+use fictionet::stdlib::protocols::dns::read_message;
 use fictionet::stdlib::protocols::dns::{Request, Response};
 
 use super::super::exchange::Client;
@@ -51,7 +51,7 @@ impl<A: Authority> Authority for Observe<A> {
         match &step {
             Step::Reply(response) => (self.observer)(req, client, response),
             Step::Verbatim(bytes) => {
-                if let Ok(message) = Message::from_vec(bytes) {
+                if let Ok(message) = read_message(bytes) {
                     let response = Response {
                         message,
                         required_additional: 0,

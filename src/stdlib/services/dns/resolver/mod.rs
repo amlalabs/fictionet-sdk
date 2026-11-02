@@ -343,9 +343,21 @@ impl<V: Verify> Resolver<V> {
                 break;
             }
             if asker.cache_only {
+                // A query with RD clear may not start the lookups a
+                // validation needs, so data no check has validated is
+                // answered as if the cache did not hold it, never handed
+                // to a client that asked for validation (RFC 4035 §4.7).
+                let validate = asker.validate;
+                let unchecked = |found: &resolution::Found| {
+                    validate
+                        && found
+                            .checks
+                            .iter()
+                            .any(|(_, validation)| *validation == Validation::NotPerformed)
+                };
                 match self.cached(&key) {
-                    Some(found) => self.push_found(id, found),
-                    None => return self.answer_referral(id),
+                    Some(found) if !unchecked(&found) => self.push_found(id, found),
+                    _ => return self.answer_referral(id),
                 }
                 continue;
             }

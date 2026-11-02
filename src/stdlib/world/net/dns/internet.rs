@@ -46,6 +46,7 @@ use fictionet::stdlib::protocols::dns::dnssec::rdata::DNSSECRData;
 use fictionet::stdlib::protocols::dns::op::{
     Edns, Message, MessageType, OpCode, Query, ResponseCode,
 };
+use fictionet::stdlib::protocols::dns::read_message;
 use fictionet::stdlib::protocols::dns::rr::rdata::TXT;
 use fictionet::stdlib::protocols::dns::rr::{
     DNSClass, LowerName, Name, RData, Record, RecordSet, RecordType,
@@ -1160,7 +1161,7 @@ async fn exchange(
     let observed = fcx.race(Some(deadline), source.ask(fcx, ask)).await.ok()?;
     let took = fcx.now().since_start().saturating_sub(sent.since_start());
     match observed {
-        Observed::Reply(bytes) => Some((took, Message::from_vec(&bytes).ok()?)),
+        Observed::Reply(bytes) => Some((took, read_message(&bytes).ok()?)),
         Observed::Unreachable | Observed::Timeout => None,
     }
 }
@@ -1280,7 +1281,10 @@ async fn resolver_egress(
     let name = Name::from_ascii("whoami.akamai.net.").expect("a valid name");
     let query = probe_query(fcx, &name, RecordType::A, DNSClass::IN, true);
     let (_, reply) = exchange(fcx, source, resolver, query, deadline).await?;
-    reply.answers.iter().find_map(address)
+    reply
+        .answers
+        .iter()
+        .find_map(|record| record.data.ip_addr())
 }
 
 /// One of the questions [`Location::measured`] waits on together.
@@ -1592,7 +1596,11 @@ impl Inner {
     fn place(self: &Arc<Self>, req: &Request, reply: &Message) {
         let qname = LowerName::new(req.question.name());
         let asks_address = matches!(req.question.query_type(), RecordType::A | RecordType::AAAA);
-        let answered: Vec<IpAddr> = reply.answers.iter().filter_map(address).collect();
+        let answered: Vec<IpAddr> = reply
+            .answers
+            .iter()
+            .filter_map(|record| record.data.ip_addr())
+            .collect();
         let mut relays: Vec<(IpAddr, Name)> = Vec::new();
         let mut fronts: Vec<(IpAddr, &Arc<Front>)> = Vec::new();
         let targets: HashSet<LowerName> = reply
@@ -1605,7 +1613,7 @@ impl Inner {
             })
             .collect();
         for record in &reply.additionals {
-            if let Some(addr) = address(record)
+            if let Some(addr) = record.data.ip_addr()
                 && targets.contains(&LowerName::new(&record.name))
             {
                 relays.push((addr, record.name.clone()));
@@ -1625,7 +1633,7 @@ impl Inner {
             }
             named.targets.extend(targets);
             for record in &reply.answers {
-                if let Some(addr) = address(record) {
+                if let Some(addr) = record.data.ip_addr() {
                     let known = named
                         .addresses
                         .entry(LowerName::new(&record.name))
@@ -1700,15 +1708,6 @@ fn only_at(label: &str, addr: IpAddr) -> Host {
     }
 }
 
-/// The address an A or AAAA record holds.
-fn address(record: &Record) -> Option<IpAddr> {
-    match &record.data {
-        RData::A(a) => Some(IpAddr::V4(a.0)),
-        RData::AAAA(aaaa) => Some(IpAddr::V6(aaaa.0)),
-        _ => None,
-    }
-}
-
 /// A [`Relay`] whose replies place the relays they name, then go to the
 /// mirror's observers.
 struct Mirrored(Arc<Inner>);
@@ -1726,7 +1725,7 @@ impl Authority for Mirrored {
         let Step::Verbatim(bytes) = step else {
             return step;
         };
-        let Ok(mut message) = Message::from_vec(&bytes) else {
+        let Ok(mut message) = read_message(&bytes) else {
             return Step::Verbatim(bytes);
         };
         let bytes = match self.0.seen_by(client) {

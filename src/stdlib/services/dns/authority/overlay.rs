@@ -1,12 +1,13 @@
 //! Invented zones on top of another authority, delegated to as a parent
 //! would.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 
 use fictionet::stdlib::protocols::dns::dnssec::rdata::DNSSECRData;
 use fictionet::stdlib::protocols::dns::op::{
     Edns, Message, MessageType, OpCode, Query, ResponseCode,
 };
+use fictionet::stdlib::protocols::dns::read_message;
 use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RData, Record, RecordType};
 use fictionet::stdlib::protocols::dns::{Parsed, Request, Response};
 
@@ -127,13 +128,13 @@ impl<B: Authority> Authority for Overlay<B> {
         let glue: Vec<Record> = delegation
             .additionals
             .iter()
-            .filter(|record| address(record).is_some() && targets.contains(&&record.name))
+            .filter(|record| record.data.ip_addr().is_some() && targets.contains(&&record.name))
             .cloned()
             .collect();
 
         if glue
             .iter()
-            .any(|record| address(record) == Some(local.ip()))
+            .any(|record| record.data.ip_addr() == Some(local.ip()))
         {
             return inner.respond(req, local, server, client, known);
         }
@@ -168,7 +169,7 @@ enum Decoded {
 fn decoded(step: Step) -> Decoded {
     match step {
         Step::Reply(response) => Decoded::Message(response.message),
-        Step::Verbatim(bytes) => match Message::from_vec(&bytes) {
+        Step::Verbatim(bytes) => match read_message(&bytes) {
             Ok(message) => Decoded::Message(message),
             Err(_) => Decoded::Step(Step::Silent),
         },
@@ -209,7 +210,7 @@ fn question(req: &Request, name: &Name, rtype: RecordType, dnssec_ok: bool) -> R
 fn unsigned_delegation(req: &Request, step: Step) -> Step {
     let reply = match &step {
         Step::Reply(response) => Some(response.message.clone()),
-        Step::Verbatim(bytes) => Message::from_vec(bytes).ok(),
+        Step::Verbatim(bytes) => read_message(bytes).ok(),
         Step::Need(_) | Step::Silent => None,
     };
     match reply {
@@ -245,14 +246,5 @@ fn referral(req: &Request, authority: Vec<Record>, glue: Vec<Record>) -> Respons
     Response {
         message,
         required_additional,
-    }
-}
-
-/// The address in an A or AAAA record.
-fn address(record: &Record) -> Option<IpAddr> {
-    match &record.data {
-        RData::A(a) => Some(IpAddr::V4(a.0)),
-        RData::AAAA(aaaa) => Some(IpAddr::V6(aaaa.0)),
-        _ => None,
     }
 }

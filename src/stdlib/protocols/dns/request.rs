@@ -149,6 +149,42 @@ impl Request {
     }
 }
 
+/// Reads a whole message as [`Message::from_vec`] does, and also when it
+/// holds records whose RDATA is empty. RFC 3597 §4 lets a record of any
+/// type have empty RDATA (`\# 0` in a master file), but hickory takes such
+/// a record only in an UPDATE message (RFC 2136 §2.5), where it reads as
+/// [`RData::Update0`](super::rr::RData::Update0), and refuses any other
+/// message that holds one. A resolver reads its replies with this, so a
+/// zone that holds such a record can still be resolved.
+pub fn read_message(bytes: &[u8]) -> Result<Message, DecodeError> {
+    let mut decoder = BinDecoder::new(bytes);
+    let Header {
+        mut metadata,
+        counts,
+    } = Header::read(&mut decoder)?;
+    let queries = (0..counts.queries)
+        .map(|_| Query::read(&mut decoder))
+        .collect::<Result<Vec<_>, _>>()?;
+    // UPDATE is the one opcode under which hickory reads empty RDATA.
+    let mut records = |count: u16, additional: bool| {
+        Message::read_records(&mut decoder, usize::from(count), additional, OpCode::Update)
+    };
+    let (answers, _, _) = records(counts.answers, false)?;
+    let (authorities, _, _) = records(counts.authorities, false)?;
+    let (additionals, edns, _) = records(counts.additionals, true)?;
+    if let Some(edns) = &edns {
+        metadata.merge_response_code(edns.rcode_high());
+    }
+    let mut message = Message::new(metadata.id, metadata.message_type, metadata.op_code);
+    message.metadata = metadata;
+    message.queries = queries;
+    message.answers = answers;
+    message.authorities = authorities;
+    message.additionals = additionals;
+    message.edns = edns;
+    Ok(message)
+}
+
 /// QTYPE MAILB, mailbox records (RFC 1035 §3.2.3).
 const MAILB: u16 = 253;
 /// QTYPE MAILA, mail agent records, obsolete (RFC 1035 §3.2.3).

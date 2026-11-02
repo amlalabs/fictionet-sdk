@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use fictionet::stdlib::protocols::dns::dnssec::Validation;
 use fictionet::stdlib::protocols::dns::op::{Header, Message, ResponseCode};
+use fictionet::stdlib::protocols::dns::read_message;
 use fictionet::stdlib::protocols::dns::rr::{
     DNSClass, LowerName, RData, Record, RecordSet, RecordType,
 };
@@ -79,7 +80,8 @@ impl<V: Verify> Resolver<V> {
     ///   (RFC 6840 §5.7, §5.8), never for answers not validated, and never
     ///   because a server said so.
     /// - The answer section holds each alias, after the DNAME it was
-    ///   synthesized from, then the data. A negative's SOA goes in the
+    ///   synthesized from, then the data, after the DNAME a CNAME asked
+    ///   for was synthesized from. A negative's SOA goes in the
     ///   authority section with its TTL counted down (RFC 2308 §6); with
     ///   DO, so do the denial records, and the NSEC or NSEC3 records that
     ///   show a wildcard answer had no closer match (RFC 4035 §3.1.3.3).
@@ -142,14 +144,20 @@ impl<V: Verify> Resolver<V> {
         let mut edes = Vec::new();
         for piece in pieces {
             // Fresh data has its TTL as the server sent it; the client sees
-            // it within the cache's limit and counted down from when it
-            // arrived, as it would from the cache.
+            // it within the cache's limit, counted down from when it
+            // arrived, and, when it is Secure, no longer than its RRSIGs
+            // allow (RFC 4035 §5.3.3), as it would from the cache.
+            let secure = !piece.checks.is_empty() && piece.validation() == Validation::Secure;
             let ttl = |set: &RecordSet| {
                 let ttl = if piece.stale {
                     stale_ttl
                 } else {
                     let ttl = Duration::from_secs(u64::from(set.ttl().min(max_ttl)));
-                    ttl_left(piece.at + ttl, self.now)
+                    let mut expires = piece.at + ttl;
+                    if secure && let Some(until) = self.secure_until(set, piece.at) {
+                        expires = expires.min(until);
+                    }
+                    ttl_left(expires, self.now)
                 };
                 with_ttl(set, ttl)
             };
@@ -172,7 +180,8 @@ impl<V: Verify> Resolver<V> {
                     prove(proof, &mut message);
                 }
                 Outcome::Data { sets, proof, .. } => {
-                    for set in sets.iter().filter(|set| keep(set)) {
+                    let dname = proof.iter().filter(|set| is_dname(set));
+                    for set in dname.chain(sets.iter().filter(|set| keep(set))) {
                         push(&mut message.answers, &ttl(set), dnssec_ok);
                     }
                     prove(proof, &mut message);
@@ -325,7 +334,7 @@ pub(super) fn reply_event(
 ) -> Event {
     let server: SocketAddr = client.local;
     let size = u16::try_from(bytes.len()).expect("a reply fits a DNS message's 65535 octets");
-    let (question, rcode, flags, answers, ede) = match Message::from_vec(bytes) {
+    let (question, rcode, flags, answers, ede) = match read_message(bytes) {
         Ok(message) => {
             let ede = message.edns.as_ref().and_then(|edns| {
                 edns.options()
