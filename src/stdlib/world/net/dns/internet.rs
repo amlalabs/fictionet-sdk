@@ -555,18 +555,16 @@ fn cloudflare(site: &ResolverSite, egress: &Egress) -> Config {
     Config::cloudflare(site.identity.clone().answer(whoami_cloudflare(), whoami))
 }
 
-/// Quad9, which answers `localhost` itself: `localhost A` gave 127.0.0.1
-/// and `localhost AAAA` gave ::1 on 2026-11-01.
+/// Quad9, as its preset is.
 fn quad9(site: &ResolverSite, _egress: &Egress) -> Config {
-    Config::quad9(site.identity.clone()).local(Arc::new(special::localhost()))
+    Config::quad9(site.identity.clone())
 }
 
 /// OpenDNS, as seen on 2026-11-01: a 1410-octet payload; validation, with
 /// Extended DNS Errors; RD clear answered from its cache; `localhost` and
 /// `test` answered locally, with AA clear as on its `localhost` answers;
-/// and six SVCB
-/// records at `_dns.resolver.arpa` with TTL 300. It refuses every CHAOS
-/// name. What it does not show, such as QNAME minimisation, takes
+/// and six SVCB records at `_dns.resolver.arpa` with TTL 300. It refuses
+/// every CHAOS name. What it does not show, such as QNAME minimisation, takes
 /// Unbound's values.
 fn opendns(site: &ResolverSite, _egress: &Egress) -> Config {
     type Param = (SvcParamKey, SvcParamValue);
@@ -747,8 +745,8 @@ impl Location {
     /// every root letter, `gtld-servers.net` server, and public resolver
     /// answered there on 2026-11-01: the median of five round trips to
     /// each, the instance names it gave for `id.server`, `hostname.bind`,
-    /// `version.bind`, and `version.server`, its NSID, and the RCODE it
-    /// gave for other CHAOS names. Instances are the ones anycast picked
+    /// `version.bind`, and `version.server` and their TTL, its NSID, and
+    /// the RCODE it gave for other CHAOS names. Instances are the ones anycast picked
     /// there that day, so some sit far away: k.root answered from London.
     /// Other authorities took 20 ms, the median over six of them.
     pub fn san_francisco_bay_area(egress: Egress) -> Location {
@@ -765,9 +763,9 @@ impl Location {
                 chaos::version_server(),
             ];
             let mut identity = Identity {
-                chaos: BTreeMap::new(),
                 unlisted,
                 nsid: Some(nsid.as_bytes().to_vec()),
+                ..Identity::none()
             };
             for (name, answer) in names.into_iter().zip(answers) {
                 identity = identity.answer(name, answer);
@@ -841,7 +839,8 @@ impl Location {
                         txt("2026.10.4"),
                         no(NotImp),
                     ],
-                ),
+                )
+                .ttl(60),
             ),
             (
                 9,
@@ -854,7 +853,8 @@ impl Location {
                         txt("2026.10.4"),
                         no(NotImp),
                     ],
-                ),
+                )
+                .ttl(60),
             ),
             (
                 48,

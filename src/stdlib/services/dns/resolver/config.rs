@@ -314,10 +314,11 @@ impl Config {
     }
 
     /// Quad9's 9.9.9.9, as observed on 2026-11-01, with the site's
-    /// `identity`: no local zones but `resolver.arpa`, three SVCB records
-    /// for `dns.quad9.net` (DoH, DoT, and DoQ) with address hints, AA
-    /// clear, and TTL 60; a 512-octet payload; RD clear REFUSED; Extended
-    /// DNS Errors; and validation. The site's identity answers `id.server`
+    /// `identity`: `localhost` answered locally with AA clear (A 127.0.0.1
+    /// and AAAA ::1); three SVCB records at `resolver.arpa` for
+    /// `dns.quad9.net` (DoH, DoT, and DoQ) with address hints, AA clear,
+    /// and TTL 60; a 512-octet payload; RD clear REFUSED; Extended DNS
+    /// Errors; and validation. The site's identity answers `id.server`
     /// with the instance and `version.bind` with Quad9's build.
     pub fn quad9(identity: Identity) -> Config {
         let host = name("dns.quad9.net.");
@@ -332,7 +333,7 @@ impl Config {
             Ipv6Addr::new(0x2620, 0xfe, 0, 0, 0, 0, 0xfe, 0x9),
         ]);
         Config {
-            local: Vec::new(),
+            local: vec![Arc::new(special::localhost())],
             local_aa: false,
             payload: 512,
             policy: AlgorithmPolicy::iana(),

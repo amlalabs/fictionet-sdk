@@ -12,7 +12,7 @@
 
 mod dns;
 pub mod handler;
-mod ntp;
+pub mod ntp;
 pub mod observation;
 pub mod pages;
 pub mod route;

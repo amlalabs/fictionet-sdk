@@ -95,8 +95,8 @@ impl<V: Verify> Resolver<V> {
 
     /// The reply to a CHAOS-class question, from the resolver's
     /// [`identity`](super::Config::identity) alone: a name with text gets
-    /// it as one TXT record with TTL 0 and AA set, for QTYPE TXT or ANY,
-    /// and an empty NOERROR for other types.
+    /// it as one TXT record with the identity's TTL and AA set, for QTYPE
+    /// TXT or ANY, and an empty NOERROR for other types.
     pub(super) fn render_chaos(&self, request: &Request) -> Vec<u8> {
         let identity = &self.config.identity;
         let qname = LowerName::new(request.question.name());
@@ -118,7 +118,7 @@ impl<V: Verify> Resolver<V> {
             RecordType::TXT | RecordType::ANY
         ) {
             let txt = RData::TXT(TXT::new(vec![text.clone()]));
-            let mut record = Record::from_rdata(request.question.name().clone(), 0, txt);
+            let mut record = Record::from_rdata(request.question.name().clone(), identity.ttl, txt);
             record.dns_class = DNSClass::CH;
             response.message.answers.push(record);
         }

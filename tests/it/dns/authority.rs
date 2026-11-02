@@ -498,7 +498,8 @@ fn chaos_questions_are_answered_by_name_from_the_identity() {
     .answer(
         chaos::version_bind(),
         ChaosAnswer::Rcode(ResponseCode::Refused),
-    );
+    )
+    .ttl(60);
     let mut engine = AuthorityEngine::new(Counting(calls.clone()), server, local());
     let chaos_query = |qname: &str, qtype: RecordType| {
         query(qname, qtype, |m| {
@@ -517,7 +518,7 @@ fn chaos_questions_are_answered_by_name_from_the_identity() {
     let record = &reply.answers[0];
     assert_eq!(record.name.to_string(), "ID.Server.");
     assert_eq!(record.dns_class, DNSClass::CH);
-    assert_eq!(record.ttl, 0);
+    assert_eq!(record.ttl, 60);
     assert_eq!(record.data, RData::TXT(TXT::new(vec!["sjc07".to_string()])));
 
     let reply = the_answer(&ask_with(

@@ -139,8 +139,9 @@ impl ServerConfig {
     }
 
     /// The reply to a CHAOS-class question, from [`identity`](ServerConfig::identity)
-    /// alone. A name with text gets it as one TXT record with TTL 0 and
-    /// AA set, for QTYPE TXT or ANY, and an empty NOERROR for other types.
+    /// alone. A name with text gets it as one TXT record with the
+    /// identity's TTL and AA set, for QTYPE TXT or ANY, and an empty
+    /// NOERROR for other types.
     pub(super) fn chaos(&self, req: &Request) -> Response {
         let qname = LowerName::new(req.question.name());
         let text = match self.identity.chaos.get(&qname) {
@@ -152,7 +153,8 @@ impl ServerConfig {
         response.message.metadata.authoritative = true;
         if matches!(req.question.query_type(), RecordType::TXT | RecordType::ANY) {
             let txt = RData::TXT(TXT::new(vec![text.clone()]));
-            let mut record = Record::from_rdata(req.question.name().clone(), 0, txt);
+            let mut record =
+                Record::from_rdata(req.question.name().clone(), self.identity.ttl, txt);
             record.dns_class = DNSClass::CH;
             response.message.answers.push(record);
         }
@@ -286,6 +288,9 @@ pub struct Identity {
     /// The name server identifier sent to a query that asks for one
     /// (RFC 5001).
     pub nsid: Option<Vec<u8>>,
+    /// The TTL of its TXT answers. Most servers give 0; e.root and f.root
+    /// gave 60 on 2026-11-01.
+    pub ttl: u32,
 }
 
 impl Identity {
@@ -296,12 +301,19 @@ impl Identity {
             chaos: BTreeMap::new(),
             unlisted: ResponseCode::Refused,
             nsid: None,
+            ttl: 0,
         }
     }
 
     /// This identity with `answer` for `name`.
     pub fn answer(mut self, name: LowerName, answer: ChaosAnswer) -> Identity {
         self.chaos.insert(name, answer);
+        self
+    }
+
+    /// This identity giving its TXT answers TTL `ttl`.
+    pub fn ttl(mut self, ttl: u32) -> Identity {
+        self.ttl = ttl;
         self
     }
 }
