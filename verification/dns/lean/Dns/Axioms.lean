@@ -434,7 +434,7 @@ theorem www_secure : validateRrset (some [signedZone.anchor 2]) Policy.iana 150 
     (signedZone.sigsFor wwwTxt) [] = .secure :=
   signed_answers_validate signedZone Policy.iana 150 2 signedZone_well (by decide) ⟨ksk, by simp [signedZone], rfl⟩
     zone_wf [] (nd := .data [wwwTxt]) (by decide +kernel) (by intro _ _ _ h; cases h)
-    ⟨wwwTxt, by simp [nodeSets], rfl, rfl⟩ (by decide) (by decide)
+    ⟨wwwTxt, by simp [nodeSets], rfl, rfl⟩ (by decide)
 
 #print axioms secure_sound
 /-- So the TXT records were signed with the private key of a key vouched for from the anchor. -/
@@ -444,13 +444,20 @@ example : ∃ apex k p r x, Vouched [signedZone.anchor 2] [signedZone.link] apex
   have ⟨apex, k, p, r, x, hv, hp, hr, _, _, hx, _, hd, hs⟩ := secure_sound www_secure
   ⟨apex, k, p, r, x, hv, hp, hr, hx, hd, hs⟩
 
+/-- `x.example.com. TXT` is expanded from `*.example.com.`; the NSEC that proves no closer name exists comes with
+it, and the answer validates Secure. -/
+example : (signedZone.answerDo ⟨[LX, EX, COM], 16⟩ .all).2.map (fun sa =>
+    (validateAnswer (some [signedZone.anchor 2]) Policy.iana 150 [signedZone.link] ⟨[LX, EX, COM], 16⟩ sa).1) =
+    some [.secure] := by
+  decide +kernel
+
 #print axioms secure_complete
 example : validateRrset (some [signedZone.anchor 2]) Policy.iana 150 [signedZone.link] wwwTxt
     (signedZone.signSet wwwTxt).sigs [] = .secure :=
   secure_complete ⟨signedZone.link, [], signedZone.keys, signedZone.apex, signedZone.keys,
     ⟨_, anchorFor_zone signedZone 2 (by decide), rfl, rfl,
       anchor_keys signedZone_well (by decide) (s0 := ksk) (by simp [signedZone]) rfl⟩,
-    .nil, signSet_final signedZone_well (by simp [signedZone]) [] rfl rfl rfl (by decide)⟩
+    .nil, signSet_final signedZone_well (by simp [signedZone]) [] rfl rfl rfl⟩
 
 /-- An anchor whose only DS names an RSASHA1 key (algorithm 5), and a chain whose DNSKEY fetch failed. -/
 def sha1Anchor : Anchor := ⟨apex, [⟨5, 2, [1, 2, 3]⟩]⟩
@@ -569,7 +576,8 @@ example : lazyAnswer (zoneProvider orgZone) orgLazy ⟨[MAIL, EX, ORG], 15⟩ .a
   lazy_agrees_complete orgLazy_holds orgLazy_describable (zoneProvider_agrees _ _) _ _
 
 example : answer orgZone ⟨[MAIL, EX, ORG], 15⟩ .all = .response ⟨.noerror, true,
-    [⟨[MAIL, EX, ORG], 15, 300, [.mx 10 [NS, EX, ORG]]⟩], [], [⟨[NS, EX, ORG], 1, 3600, [.a [192, 0, 2, 7]]⟩], 0⟩ := by
+    [⟨[MAIL, EX, ORG], 15, 300, [.mx 10 [NS, EX, ORG]]⟩], [],
+    [⟨[NS, EX, ORG], 1, 3600, [.a [192, 0, 2, 7]]⟩], 0⟩ := by
   decide +kernel
 
 /-- A second implementation of `Sign`: a bare private key with its algorithm and SEP bit. -/
@@ -597,7 +605,8 @@ example : validatePublished (some []) Policy.iana 150 [] none orgLazy.apex ⟨[M
       (publish (S := Sch) [ksk, zsk] (onDemand (zoneProvider orgZone) orgLazy) orgLazy.apex orgLazy.soa .all .nsec
         ⟨100, 200⟩ ⟨[MAIL, EX, ORG], 15⟩) =
     validatePublished (some []) Policy.iana 150 [] none orgZone.apex ⟨[MAIL, EX, ORG], 15⟩
-      (publish (S := Sch) rawKeys orgZone.look orgZone.apex orgZone.soa .all .nsec ⟨100, 200⟩ ⟨[MAIL, EX, ORG], 15⟩) :=
+      (publish (S := Sch) rawKeys orgZone.look orgZone.apex orgZone.soa .all .nsec ⟨100, 200⟩
+        ⟨[MAIL, EX, ORG], 15⟩) :=
   validate_records_only orgLazy_holds orgLazy_describable (zoneProvider_agrees _ _) keys_agnostic _ _ _ _ _ _ _ _ _
 
 end Records
@@ -616,7 +625,8 @@ def subApex : Name := [SUB, EX, COM]
 def subDs : Zone.RData := .ds 0 13 2 (Sch.digest subApex childKsk.dnskey)
 
 /-- `example.com.` with a DS record at its `sub` delegation, and `sub.example.com.` itself. -/
-def parentSpec : Spec := { spec with delegations := [⟨subApex, 86400, [[NS1, SUB, EX, COM]], subGlue, some (86400, [subDs])⟩] }
+def parentSpec : Spec :=
+  { spec with delegations := [⟨subApex, 86400, [[NS1, SUB, EX, COM]], subGlue, some (86400, [subDs])⟩] }
 def childSpec : Spec := ⟨subApex, 3600, .soa [NS1, SUB, EX, COM] [HOST, SUB, EX, COM] 1 7200 3600 1209600 300, [
     ⟨subApex, 2, 3600, [.ns [NS1, SUB, EX, COM]]⟩,
     ⟨[NS1, SUB, EX, COM], 1, 3600, [.a [192, 0, 2, 53]]⟩,
@@ -630,7 +640,7 @@ def wwwSub : RRset := ⟨[WWW, SUB, EX, COM], 1, 300, [.a [192, 0, 2, 80]]⟩
 theorem tree_check : check tree Policy.iana 150 = [] := by decide +kernel
 
 theorem tree_wf : WellFormed tree := by
-  refine ⟨fun z hz s hs => ?_, dsSets_of (by decide +kernel), by decide +kernel⟩
+  refine ⟨fun z hz s hs => ?_, dsSets_of (by decide +kernel)⟩
   simp only [tree, List.mem_cons, List.mem_nil_iff, or_false] at hz
   rcases hz with rfl | rfl <;>
     (simp only [parentZone, childZone, List.mem_cons, List.mem_nil_iff, or_false] at hs
@@ -650,7 +660,7 @@ example : validateRrset (some [parentZone.anchor 2]) Policy.iana 150 (chainOf pa
       (childZone.sigsFor wwwSub) [] = .insecure w :=
   check_sound tree_check tree_wf (by decide) (by simp [tree]) ⟨ksk, by simp [parentZone], rfl⟩ tree_path child_wf []
     (nd := .data [wwwSub]) (by decide +kernel) (by intro _ _ _ h; cases h) ⟨wwwSub, by simp [nodeSets], rfl, rfl⟩
-    (by decide) (by decide)
+    (by decide)
 
 /-- And it is in fact Secure. -/
 example : validateRrset (some [parentZone.anchor 2]) Policy.iana 150 (chainOf parentZone [childZone]) wwwSub
@@ -699,7 +709,8 @@ def cache2 : Cache := insert 100 limits ⟨0, []⟩ (.failure wwwKey .noReachabl
 
 #print axioms failure_never_negative
 example : ∀ kind soa v, serve 110 cache2 wwwKey ≠ some (.negative kind soa v) :=
-  (failure_never_negative (insert_unique (c := ⟨0, []⟩) (by simp [Unique])) (e := ⟨wwwKey, .failure .noReachableAuthority, 100, 130, 30, 0⟩)
+  (failure_never_negative (insert_unique (c := ⟨0, []⟩) (by simp [Unique]))
+    (e := ⟨wwwKey, .failure .noReachableAuthority, 100, 130, 30, 0⟩)
     (by decide) rfl rfl).1
 
 #print axioms rank_monotone

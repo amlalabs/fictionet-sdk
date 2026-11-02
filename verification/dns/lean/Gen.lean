@@ -8,7 +8,12 @@
   * `fit.json`: `Fit.plan` and `Fit.fit`;
   * `respond.json`: `Wire.parse` and `Wire.respondHeader`;
   * `zone.json`: `Zone.build` and `Zone.answer`;
-  * `partial.json`: `Zone.answerPartial` over a zone with some facts made unknown.
+  * `partial.json`: `Zone.answerPartial` over a zone with some facts made unknown;
+  * `signed.json`: `Dnssec.SignedZone.answerDo` and `Dnssec.validateAnswer`;
+  * `policy.json`: `Dnssec.AlgorithmPolicy.treat`, over `Policy.iana` and other policies;
+  * `chain.json`: `Chain.check`;
+  * `cache.json`: `Cache.insert`, `Cache.advance`, and `Cache.serve`;
+  * `resolver.json`: `Resolver.runAll` over a hierarchy of zones with scripted losses.
 
   Usage: `lake exe gen <dir> <seed>`. The output depends only on the seed.
 
@@ -20,6 +25,11 @@ import Dns.Wire
 import Dns.Fit
 import Dns.Zone
 import Dns.Partial
+import Dns.Dnssec
+import Dns.Policy
+import Dns.Chain
+import Dns.Cache
+import Dns.Resolver
 
 open Dns
 
@@ -549,13 +559,428 @@ def partialCase : G String := do
 
 end Zones
 
+/-! ## DNSSEC records in presentation form
+
+Keys and signatures are symbolic (§18.3). A key is a number below 256; its DNSKEY's public key field is the
+base64 of that one octet, and its key tag is the number. A signature made with private key `p` has key tag
+`p mod 1000` and signature field the base64 of `p` as two octets; it verifies exactly when `p` is the key
+tag, that is below 1000, and covers the records shown. A corrupted key signs with `p = key + 1000`. A DS digest
+is the hex of the identity encoding of the owner and key (`Dnssec.Symbolic.scheme.digest`). NSEC3 hashes are
+real SHA-1 with an empty salt and no extra iterations, written in base32hex. -/
+
+section DnssecText
+open Zone Dnssec
+
+abbrev Sch := Symbolic.scheme
+
+def b64ch (i : Nat) : Char :=
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".toList[i % 64]!
+
+def b64go : List Nat → List Char
+  | a :: b :: c :: rest =>
+    let n := a * 65536 + b * 256 + c
+    [b64ch (n / 262144), b64ch (n / 4096), b64ch (n / 64), b64ch n] ++ b64go rest
+  | [a, b] => let n := a * 65536 + b * 256; [b64ch (n / 262144), b64ch (n / 4096), b64ch (n / 64), '=']
+  | [a] => let n := a * 65536; [b64ch (n / 262144), b64ch (n / 4096), '=', '=']
+  | [] => []
+
+/-- Base64 (RFC 4648 §4). -/
+def base64 (bs : List Nat) : String := String.ofList (b64go bs)
+
+/-- A 160-bit NSEC3 hash in base32hex (RFC 4648 §7), lowercase. -/
+def b32hex (n : Nat) : String :=
+  String.ofList ((List.range 32).map fun i => "0123456789abcdefghijklmnopqrstuv".toList[n / 2 ^ (155 - 5 * i) % 32]!)
+
+def dnssecTypeStr : Nat → String
+  | 46 => "RRSIG" | 47 => "NSEC" | 48 => "DNSKEY" | 50 => "NSEC3"
+  | t => typeStr t
+
+def bitmapStr (ts : List Nat) : String := " ".intercalate ((sortBy (· < ·) ts).map dnssecTypeStr)
+
+def nsec3Owner (r : Nsec3) : Name := toBytes (b32hex r.hash) :: r.zone
+
+def payloadOwner : Payload → Name
+  | .rrset s => s.owner
+  | .keys o _ => o
+  | .nsec r => r.owner
+  | .nsec3 r => nsec3Owner r
+
+def covered : Payload → Nat
+  | .rrset s => s.rtype
+  | .keys _ _ => 48
+  | .nsec _ => 47
+  | .nsec3 _ => 50
+
+def keyLine (o : Name) (ttl : Nat) (k : Key) : String :=
+  s!"{nameStr o} {ttl} IN DNSKEY {if k.sep then 257 else 256} 3 {k.alg} {base64 k.pub}"
+
+def payloadLines (ttl : Nat) : Payload → List String
+  | .rrset s => rrsetLines s
+  | .keys o ks => ks.map (keyLine o ttl)
+  | .nsec r => [s!"{nameStr r.owner} {ttl} IN NSEC {nameStr r.next} {bitmapStr r.types}"]
+  | .nsec3 r =>
+    [s!"{nameStr (nsec3Owner r)} {ttl} IN NSEC3 1 {if r.optOut then 1 else 0} {r.iterations} - {b32hex r.next}" ++
+      (if r.types.isEmpty then "" else " " ++ bitmapStr r.types)]
+
+def rrsigLine (owner : Name) (ttl cov : Nat) (r : Rrsig Sch) : String :=
+  let p := (r.sig : Nat × Tbs).1
+  s!"{nameStr owner} {ttl} IN RRSIG {dnssecTypeStr cov} {r.hdr.alg} {r.hdr.labels} {r.hdr.ttl} " ++
+    s!"{r.hdr.expiration} {r.hdr.inception} {p % 1000} {nameStr r.hdr.signer} {base64 [p / 256 % 256, p % 256]}"
+
+/-- The lines of records and the RRSIGs over them; RRSIGs take the TTL of the records they cover. -/
+def signedLines (ttl : Nat) (d : Signed Sch) : List String :=
+  payloadLines ttl d.data ++ d.sigs.map (rrsigLine (payloadOwner d.data) ttl (covered d.data))
+
+def setWithSigsLines (p : RRset × List (Rrsig Sch)) : List String :=
+  rrsetLines p.1 ++ p.2.map (rrsigLine p.1.owner p.1.ttl p.1.rtype)
+
+def insecureStr : Insecure → String
+  | .provenNoDs => "proven_no_ds" | .optOutCovered => "opt_out_covered" | .noAnchor => "no_anchor"
+  | .unsupportedAlgorithm => "unsupported_algorithm" | .unsupportedDigest => "unsupported_digest"
+  | .nsec3Iterations => "nsec3_iterations"
+
+def validationJson : Validation → String
+  | .notPerformed => jobj [("result", jstr "not_performed")]
+  | .secure => jobj [("result", jstr "secure")]
+  | .insecure w => jobj [("result", jstr "insecure"), ("why", jstr (insecureStr w))]
+  | .bogus e => jobj [("result", jstr "bogus"), ("ede", jnat e.code)]
+  | .indeterminate => jobj [("result", jstr "indeterminate")]
+
+def denialJson : Denial → String
+  | .nsec => jobj [("kind", jstr "nsec")]
+  | .nsec3 o => jobj [("kind", jstr "nsec3"), ("opt_out", jbool o)]
+
+def windowJson (w : Window) : String := jobj [("inception", jnat w.inception), ("expiration", jnat w.expiration)]
+
+def policyJson (P : AlgorithmPolicy) : String :=
+  jobj [("validate", jarr (P.validate.map jnat)), ("digests", jarr (P.digests.map jnat)),
+    ("max_nsec3_iterations", jnat P.maxIterations)]
+
+end DnssecText
+
+/-! ## Signed zones -/
+
+section Signed
+open Zone Dnssec
+
+/-- A symbolic key as the vectors give it. A corrupted key's signatures do not verify. -/
+structure KeySpec where
+  id : Nat
+  alg : Nat
+  sep : Bool
+  corrupt : Bool
+
+def KeySpec.signer (k : KeySpec) : Signer Sch :=
+  if k.corrupt then ⟨⟨Sch.pub k.id, k.alg, k.sep⟩, fun m => ((k.id + 1000 : Nat), m)⟩
+  else Signer.ofPriv (S := Sch) k.id k.alg k.sep
+
+def keysJson (ks : List KeySpec) : String :=
+  jarr (ks.map fun k =>
+    jobj [("id", jnat k.id), ("alg", jnat k.alg), ("sep", jbool k.sep), ("corrupt", jbool k.corrupt)])
+
+/-- A KSK and, often, a ZSK, with algorithms the policy validates and sometimes RSASHA1. -/
+def rKeys : G (List KeySpec) := do
+  let id1 ← rRange 1 127
+  let alg ← pick #[13, 13, 8, 15, 14, 5]
+  let k1 : KeySpec := ⟨id1, alg, true, ← chance 8⟩
+  if ← chance 3 then return [k1]
+  let k2 : KeySpec := ⟨id1 + 128, alg, false, ← chance 8⟩
+  return [k1, k2]
+
+/-- A zone the builder accepts, without DNAME: a CNAME a DNAME synthesizes has no RRSIG, and its validation
+goes through the DNAME, which this model does not do. -/
+def rSignedZone : G (Spec × Zone) := do
+  let mut tries := 0
+  while tries < 1000 do
+    tries := tries + 1
+    let sp ← rSpec
+    let sp := { sp with sets := sp.sets.filter (·.rtype != 39) }
+    match build sp with
+    | .ok z => return (sp, z)
+    | .error _ => pure ()
+  rZone
+
+instance : Inhabited Denial := ⟨.nsec⟩
+
+def rDenial : G Denial := pick #[.nsec, .nsec, .nsec3 false, .nsec3 true]
+
+def signedCase : G String := do
+  let (sp, z) ← rSignedZone
+  let keys ← rKeys
+  let denial ← rDenial
+  let w : Window := ⟨100, ← pick #[200, 200, 150, 300]⟩
+  let t ← pick #[50, 100, 150, 150, 199, 200, 250]
+  let q : Request := ⟨← rQname z, ← rQtype⟩
+  let sz : SignedZone Sch := ⟨z, keys.map (·.signer), w, denial⟩
+  let anchors := [sz.anchor 2]
+  let expected := match sz.answerDo q .all with
+    | (.response _, some sa) =>
+      let (vs, dv) := validateAnswer (some anchors) Policy.iana t [sz.link] q sa
+      jobj [("rcode", jstr (rcodeStr sa.rcode)), ("aa", jbool sa.aa),
+        ("answer", jarr ((sa.answer.flatMap setWithSigsLines).map jstr)),
+        ("authority", jarr ((sa.authority.flatMap setWithSigsLines).map jstr)),
+        ("additional", setsJson sa.additional),
+        ("denial", jarr ((sa.denial.flatMap (signedLines sz.denialTtl)).map jstr)),
+        ("dnskey", jarr ((signedLines z.soa.ttl sz.keySet).map jstr)),
+        ("validation", jobj [("answer", jarr (vs.map validationJson)),
+          ("denial", (dv.map validationJson).getD "null")])]
+    | (.unknown n, _) => jobj [("unknown", jstr (nameStr n))]
+    | (.response _, none) => "null"
+  return jobj [("input", jobj [("zone", specJson sp), ("keys", keysJson keys), ("window", windowJson w),
+      ("denial", denialJson denial), ("request", jobj [("qname", jstr (nameStr q.qname)),
+        ("qtype", jstr (typeStr q.qtype))]), ("time", jnat t), ("policy", policyJson Policy.iana),
+      ("anchor_digest_type", jnat 2)]),
+    ("expected", expected)]
+
+end Signed
+
+/-! ## The algorithm policy -/
+
+section PolicyVectors
+open Dnssec
+
+def treatmentStr : Treatment → String
+  | .supported => "supported" | .unsupportedAlgorithm => "unsupported_algorithm"
+  | .unsupportedDigest => "unsupported_digest"
+
+def rSubset (xs : List Nat) : G (List Nat) := do
+  let mut out := []
+  for x in xs do
+    if ← chance 2 then out := out ++ [x]
+  return out
+
+def policyCase : G String := do
+  let P ← if ← chance 2 then pure Policy.iana
+    else do
+      let v ← rSubset [5, 7, 8, 10, 13, 14, 15, 16]
+      let d ← rSubset [1, 2, 3, 4]
+      pure ({ validate := v, digests := d, sign := [], delegate := [], maxIterations := 100 } : AlgorithmPolicy)
+  let alg ← pick #[1, 3, 5, 6, 7, 8, 10, 12, 13, 14, 15, 16, 17, 23, 253]
+  let dt ← pick #[0, 1, 2, 3, 4, 5, 6]
+  return jobj [("input", jobj [("algorithm", jnat alg), ("digest", jnat dt), ("policy", policyJson P)]),
+    ("expected", jobj [("treatment", jstr (treatmentStr (P.treat alg dt)))])]
+
+end PolicyVectors
+
+/-! ## Chains -/
+
+section ChainVectors
+open Zone Dnssec Chain
+
+def problemJson : Problem → String
+  | .dsMismatch p c => jobj [("kind", jstr "ds_mismatch"), ("parent", jstr (nameStr p)), ("child", jstr (nameStr c))]
+  | .noDsProofMissing p c =>
+    jobj [("kind", jstr "no_ds_proof_missing"), ("parent", jstr (nameStr p)), ("child", jstr (nameStr c))]
+  | .windowClosed a t => jobj [("kind", jstr "window_closed"), ("apex", jstr (nameStr a)), ("time", jnat t)]
+  | .unsupportedAlgorithm a alg =>
+    jobj [("kind", jstr "unsupported_algorithm"), ("apex", jstr (nameStr a)), ("algorithm", jnat alg)]
+
+/-- A parent with a delegation to `sub` and the child zone: the parent's DS set at the cut names the child's
+KSK, names it with a wrong digest or an unsupported algorithm or digest type, or is absent. -/
+def chainCase : G String := do
+  let apex : Name := [lb "example", lb "com"]
+  let child : Name := lb "sub" :: apex
+  let parentKeys ← rKeys
+  let childKeys ← do if ← chance 4 then pure [] else rKeys
+  let choice ← rNat 5
+  let kskAlg := ((childKeys.find? (·.sep)).map (·.alg)).getD 13
+  let kskKey : Key :=
+    ((childKeys.find? (·.sep)).map fun k => (⟨Sch.pub k.id, k.alg, true⟩ : Key)).getD ⟨[0], 13, true⟩
+  let ds : Option (Nat × List Zone.RData) := match choice with
+    | 0 => none
+    | 1 => some (86400, [.ds 0 kskAlg 2 (Sch.digest child kskKey)])
+    | 2 => some (86400, [.ds 0 kskAlg 2 [1, 2, 3, 4]])
+    | 3 => some (86400, [.ds 0 5 2 (Sch.digest child { kskKey with alg := 5 })])
+    | _ => some (86400, [.ds 0 kskAlg 3 (Sch.digest child kskKey)])
+  let soa (a : Name) : Zone.RData := .soa (lb "ns1" :: a) (lb "hostmaster" :: a) 1 7200 3600 1209600 300
+  let parentSpec : Spec := ⟨apex, 3600, soa apex, [⟨apex, 2, 3600, [.ns (lb "ns1" :: apex)]⟩,
+      ⟨lb "ns1" :: apex, 1, 3600, [.a [192, 0, 2, 1]]⟩, ⟨lb "www" :: apex, 1, 300, [.a [192, 0, 2, 2]]⟩],
+    [⟨child, 86400, [lb "ns" :: child], [⟨lb "ns" :: child, 1, 86400, [.a [192, 0, 2, 53]]⟩], ds⟩]⟩
+  let childSpec : Spec := ⟨child, 3600, soa child, [⟨child, 2, 3600, [.ns (lb "ns" :: child)]⟩,
+      ⟨lb "ns" :: child, 1, 3600, [.a [192, 0, 2, 53]]⟩, ⟨lb "www" :: child, 1, 300, [.a [192, 0, 2, 80]]⟩], []⟩
+  let pw : Window := ⟨100, ← pick #[200, 200, 120]⟩
+  let cw : Window := ⟨100, ← pick #[200, 200, 120]⟩
+  let pd ← rDenial
+  let cd ← rDenial
+  let t ← pick #[150, 150, 110, 250]
+  let pz : SignedZone Sch := ⟨parentSpec.assemble, parentKeys.map (·.signer), pw, pd⟩
+  let cz : SignedZone Sch := ⟨childSpec.assemble, childKeys.map (·.signer), cw, cd⟩
+  let zoneIn (sp : Spec) (ks : List KeySpec) (w : Window) (d : Denial) : String :=
+    jobj [("zone", specJson sp), ("keys", keysJson ks), ("window", windowJson w), ("denial", denialJson d)]
+  return jobj [("input", jobj [("tree", jarr [zoneIn parentSpec parentKeys pw pd, zoneIn childSpec childKeys cw cd]),
+      ("time", jnat t), ("policy", policyJson Policy.iana)]),
+    ("expected", jobj [("problems", jarr ((check [pz, cz] Policy.iana t).map problemJson))])]
+
+end ChainVectors
+
+/-! ## The cache -/
+
+section CacheVectors
+open Zone Dnssec Cache
+
+def rankStr : Rank → String
+  | .glue => "glue" | .nonAuthAuthority => "non_auth_authority" | .nonAuthAnswer => "non_auth_answer"
+  | .authAuthority => "auth_authority" | .authAnswer => "auth_answer"
+
+def negativeStr : Negative → String
+  | .nxDomain => "nxdomain" | .noData => "nodata"
+
+def failureJson : FailureKind → String
+  | .noReachableAuthority => jobj [("kind", jstr "no_reachable_authority")]
+  | .bogus e => jobj [("kind", jstr "bogus"), ("ede", jnat e.code)]
+  | .workExceeded => jobj [("kind", jstr "work_exceeded")]
+  | .unknown => jobj [("kind", jstr "unknown")]
+
+def keyJson (k : Cache.Key) : String := jobj [("name", jstr (nameStr k.name)), ("type", jstr (typeStr k.rtype))]
+
+def optNat : Option Nat → String
+  | some n => jnat n
+  | none => "null"
+
+def offerJson : Offer → String
+  | .positive s r v sig tc =>
+    jobj [("kind", jstr "positive"), ("set", setsJson [s]), ("rank", jstr (rankStr r)),
+      ("validation", validationJson v), ("sig_expires", optNat sig), ("truncated", jbool tc)]
+  | .negative k kind soa nsec v tc =>
+    jobj [("kind", jstr "negative"), ("key", keyJson k), ("negative", jstr (negativeStr kind)),
+      ("soa", (soa.map fun s => setsJson [s]).getD "null"), ("denial_ttl", optNat nsec),
+      ("validation", validationJson v), ("truncated", jbool tc)]
+  | .failure k why => jobj [("kind", jstr "failure"), ("key", keyJson k), ("why", failureJson why)]
+
+def servedJson : Option Served → String
+  | none => "null"
+  | some (.positive s v) => jobj [("positive", setsJson [s]), ("validation", validationJson v)]
+  | some (.negative kind soa v) =>
+    jobj [("negative", jstr (negativeStr kind)), ("soa", setsJson [soa]), ("validation", validationJson v)]
+  | some (.failure why) => jobj [("failure", failureJson why)]
+
+instance : Inhabited Rank := ⟨.glue⟩
+instance : Inhabited Validation := ⟨.notPerformed⟩
+instance : Inhabited Cache.Key := ⟨⟨[], 1⟩⟩
+
+def cacheKeys : Array Cache.Key := #[⟨[lb "www", lb "example"], 1⟩, ⟨[lb "mail", lb "example"], 15⟩,
+  ⟨[lb "nope", lb "example"], 1⟩]
+
+instance : Inhabited Negative := ⟨.nxDomain⟩
+instance : Inhabited FailureKind := ⟨.unknown⟩
+
+def rOption {α : Type} (g : G α) : G (Option α) := do
+  if ← chance 2 then return some (← g) else return none
+
+def rOffer : G Offer := do
+  let k ← pick cacheKeys
+  let ttl ← pick #[0, 60, 300, 300, 86400, 2147483653, 1000000]
+  let v ← pick #[Validation.secure, .secure, .notPerformed, .insecure .provenNoDs, .bogus .expired]
+  match ← rNat 5 with
+  | 0 | 1 =>
+    let octet ← rNat 256
+    let rd : Zone.RData := if k.rtype == 15 then .mx 10 [lb "mx", lb "example"] else .a [192, 0, 2, octet]
+    let rank ← pick #[.authAnswer, .nonAuthAnswer, .glue, .authAuthority]
+    let sig ← rOption (pick #[150, 500, 2000])
+    return .positive ⟨k.name, k.rtype, ttl, [rd]⟩ rank v sig (← chance 8)
+  | 2 | 3 =>
+    let minimum ← pick #[30, 300, 3600]
+    let soa : RRset :=
+      ⟨[lb "example"], 6, ttl, [.soa [lb "ns", lb "example"] [lb "h", lb "example"] 1 2 3 4 minimum]⟩
+    let kind ← pick #[.nxDomain, .noData]
+    let soa? := if ← chance 6 then none else some soa
+    let denialTtl ← rOption (pick #[10, 100, 7200])
+    return .negative k kind soa? denialTtl v (← chance 8)
+  | _ => return .failure k (← pick #[.noReachableAuthority, .workExceeded, .unknown, .bogus .rrsigsMissing])
+
+def cacheCase : G String := do
+  let lim : Limits := ⟨← pick #[3600, 604800], ← pick #[5, 30, 300]⟩
+  let n ← rRange 3 12
+  let mut c : Cache := ⟨0, []⟩
+  let mut now := 0
+  let mut ops : Array String := #[]
+  let mut results : Array String := #[]
+  for _ in [0:n] do
+    now := now + (← pick #[0, 1, 10, 100, 1000])
+    match ← rNat 6 with
+    | 0 | 1 | 2 =>
+      let o ← rOffer
+      c := insert now lim c o
+      ops := ops.push (jobj [("op", jstr "offer"), ("time", jnat now), ("offer", offerJson o)])
+    | 3 =>
+      c := advance c
+      ops := ops.push (jobj [("op", jstr "advance"), ("time", jnat now)])
+    | _ =>
+      let k ← pick cacheKeys
+      ops := ops.push (jobj [("op", jstr "serve"), ("time", jnat now), ("key", keyJson k)])
+      results := results.push (servedJson (serve now c k))
+  return jobj [("input", jobj [("limits", jobj [("max_ttl", jnat lim.maxTtl), ("failure_ttl", jnat lim.failureTtl)]),
+      ("ops", jarr ops.toList)]),
+    ("expected", jobj [("served", jarr results.toList)])]
+
+end CacheVectors
+
+/-! ## The resolver -/
+
+section ResolverVectors
+open Zone Resolver
+
+def itemJson (st : Stored) : String :=
+  match st.item with
+  | .cut ns => jobj [("rank", jstr (rankStr st.rank)), ("cut", setsJson [ns])]
+  | .glue s => jobj [("rank", jstr (rankStr st.rank)), ("glue", setsJson [s])]
+  | .answer q r => jobj [("rank", jstr (rankStr st.rank)), ("question", jobj [("qname", jstr (nameStr q.qname)),
+      ("qtype", jstr (typeStr q.qtype))]), ("response", responseJson r)]
+
+instance : Inhabited Request := ⟨⟨[], 1⟩⟩
+
+/-- A root zone delegating `test.` and `example.`; `example.` delegating `sub.example.`; each zone with a few
+names. Some zones may have no servers, and the root may have one or two. -/
+def resolverCase : G String := do
+  let test : Name := [lb "test"]
+  let ex : Name := [lb "example"]
+  let sub : Name := lb "sub" :: ex
+  let soa (a : Name) : Zone.RData := .soa (lb "ns1" :: a) (lb "hostmaster" :: a) 1 7200 3600 1209600 300
+  let rootNs : List Name := if ← chance 2 then [[lb "a"]] else [[lb "a"], [lb "b"]]
+  let testNs : List Name := if ← chance 2 then [lb "ns1" :: test] else [lb "ns1" :: test, lb "ns2" :: test]
+  let glueFor (ns : List Name) : List RRset := ns.map fun n => ⟨n, 1, 86400, [.a [192, 0, 2, n.length]]⟩
+  let rootSpec : Spec := ⟨[], 86400, soa [], ⟨[], 2, 518400, rootNs.map .ns⟩ ::
+      rootNs.map (fun n => ⟨n, 1, 518400, [.a [198, 41, 0, 4]]⟩),
+    [⟨test, 172800, testNs, glueFor testNs, none⟩, ⟨ex, 172800, [lb "ns1" :: ex], glueFor [lb "ns1" :: ex], none⟩]⟩
+  let testSpec : Spec := ⟨test, 3600, soa test, ⟨test, 2, 3600, testNs.map .ns⟩ :: glueFor testNs ++
+      [⟨lb "www" :: test, 1, 300, [.a [192, 0, 2, 10]]⟩, ⟨lb "mail" :: test, 15, 300, [.mx 10 (lb "www" :: test)]⟩,
+       ⟨lb "alias" :: test, 5, 300, [.cname (lb "www" :: test)]⟩], []⟩
+  let exSpec : Spec := ⟨ex, 3600, soa ex, [⟨ex, 2, 3600, [.ns (lb "ns1" :: ex)]⟩] ++ glueFor [lb "ns1" :: ex] ++
+      [⟨lb "www" :: ex, 1, 300, [.a [192, 0, 2, 20]]⟩],
+    [⟨sub, 86400, [lb "ns" :: sub], glueFor [lb "ns" :: sub],
+      if ← chance 2 then some (86400, [.ds 1 13 2 [7]]) else none⟩]⟩
+  let subSpec : Spec := ⟨sub, 3600, soa sub, [⟨sub, 2, 3600, [.ns (lb "ns" :: sub)]⟩] ++ glueFor [lb "ns" :: sub] ++
+      [⟨lb "www" :: sub, 1, 300, [.a [192, 0, 2, 30]]⟩], []⟩
+  let mut specs : List Spec := [rootSpec, testSpec]
+  if !(← chance 5) then specs := specs ++ [exSpec]
+  if !(← chance 4) then specs := specs ++ [subSpec]
+  let net : Net := specs.map Spec.assemble
+  let pool : Array Request := #[⟨lb "www" :: test, 1⟩, ⟨lb "mail" :: test, 15⟩, ⟨lb "nope" :: test, 1⟩,
+    ⟨lb "alias" :: test, 1⟩, ⟨test, 2⟩, ⟨lb "www" :: ex, 1⟩, ⟨lb "www" :: sub, 1⟩, ⟨sub, 43⟩,
+    ⟨lb "x" :: sub, 16⟩, ⟨[lb "nowhere"], 1⟩, ⟨lb "www" :: test, 28⟩]
+  let qs ← rList (← rRange 1 4) (pick pool)
+  let losses ← rList (← rRange 0 6) (chance 3)
+  let cfg : Config := ⟨rootNs, ← pick #[2, 3, 5, 8]⟩
+  let (answers, final) := runAll net .all cfg ⟨[], none⟩ qs losses
+  return jobj [("input", jobj [("zones", jarr (specs.map specJson)), ("hints", jarr (rootNs.map (jstr ∘ nameStr))),
+      ("work", jnat cfg.work), ("any", jstr "all"),
+      ("questions", jarr (qs.map fun q =>
+        jobj [("qname", jstr (nameStr q.qname)), ("qtype", jstr (typeStr q.qtype))])),
+      ("losses", jarr (losses.map jbool))]),
+    ("expected", jobj [("answers", jarr (answers.map fun a => (a.map responseJson).getD "null")),
+      ("cache", jarr (final.cache.map itemJson))])]
+
+end ResolverVectors
+
 /-! ## Output -/
 
 def cases (n : Nat) (g : G String) : G (List String) := rList n g
 
 def kinds : List (String × Nat × G String) :=
   [("names", 400, namesCase), ("wire", 400, wireCase), ("restore", 300, restoreCase), ("fit", 300, fitCase),
-    ("respond", 400, respondCase), ("zone", 400, zoneCase), ("partial", 300, partialCase)]
+    ("respond", 400, respondCase), ("zone", 400, zoneCase), ("partial", 300, partialCase),
+    ("signed", 300, signedCase), ("policy", 200, policyCase), ("chain", 200, chainCase), ("cache", 200, cacheCase),
+    ("resolver", 200, resolverCase)]
 
 def main (args : List String) : IO UInt32 := do
   match args with

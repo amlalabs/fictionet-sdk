@@ -239,12 +239,17 @@ def nsec3s (ps : List Payload) : List Nsec3 := ps.filterMap fun
 /-- The validity window holds at `t` (RFC 4034 §3.1.5, RFC 4035 §5.3.1). -/
 def windowOk (t : Nat) (h : Header) : Bool := h.inception ≤ t && t ≤ h.expiration
 
+/-- The labels an RRSIG over records owned by `o` counts: a leading `*` is not counted (RFC 4034 §3.1.3). -/
+def labelsOf : Name → Nat
+  | [42] :: rest => rest.length
+  | o => o.length
+
 /-- The RRset an RRSIG with this header covers for `set`, in canonical form: the set with the original TTL,
-and, when the RRSIG counts fewer labels than the owner has, the wildcard it was expanded from
-(RFC 4035 §5.3.2). -/
+and, when the RRSIG counts fewer labels than the owner has (not counting a leading `*`), the wildcard it was
+expanded from (RFC 4035 §5.3.2). -/
 def expanded (h : Header) (set : RRset) : Option RRset :=
-  if h.labels = set.owner.length then some { set with ttl := h.ttl }
-  else if h.labels < set.owner.length then
+  if h.labels = labelsOf set.owner then some { set with ttl := h.ttl }
+  else if h.labels < labelsOf set.owner then
     some { set with owner := [42] :: set.owner.drop (set.owner.length - h.labels), ttl := h.ttl }
   else none
 
@@ -253,7 +258,7 @@ def rrsetCover (set : RRset) (h : Header) : Option Payload := (expanded h set).m
 
 /-- The same, with no wildcard expansion: what an RRSIG over a DS set covers. -/
 def exactCover (set : RRset) (h : Header) : Option Payload :=
-  if h.labels = set.owner.length then some (.rrset { set with ttl := h.ttl }) else none
+  if h.labels = labelsOf set.owner then some (.rrset { set with ttl := h.ttl }) else none
 
 /-- An RRSIG the validator considers: by this zone, with an algorithm the policy validates that one of the
 zone's trusted keys uses (RFC 4035 §5.3.1, RFC 6840 §5.11). -/
@@ -509,8 +514,8 @@ expansion, when the denial records prove no closer name exists. -/
 def rrsetResult (P : AlgorithmPolicy) (t : Nat) (apex : Name) (keys : List Key) (set : RRset)
     (sigs : List (Rrsig S)) (ds : List (Signed S)) : Validation :=
   let ok := verifies P t apex keys (rrsetCover set)
-  if sigs.any (fun r => ok r && !(r.hdr.labels < set.owner.length)) then .secure
-  else if sigs.any (fun r => ok r && r.hdr.labels < set.owner.length &&
+  if sigs.any (fun r => ok r && !(r.hdr.labels < labelsOf set.owner)) then .secure
+  else if sigs.any (fun r => ok r && r.hdr.labels < labelsOf set.owner &&
       wildcardProof (S := S) (verified P t apex keys ds) set.owner r.hdr.labels) then .secure
   else if sigs.any ok then .bogus .nsecMissing
   else .bogus (failure t (sigs.filter (usable P apex keys)))
@@ -1156,8 +1161,8 @@ theorem walk_stop_ne_secure {A : List Anchor} {P : AlgorithmPolicy} {t : Nat} {o
 comes with the proof that no closer name exists. -/
 def FinalSigned (P : AlgorithmPolicy) (t : Nat) (apex : Name) (keys : List Key) (set : RRset)
     (sigs : List (Rrsig S)) (ds : List (Signed S)) : Prop :=
-  (∃ r ∈ sigs, SigBy P t apex keys (rrsetCover set) r ∧ ¬ r.hdr.labels < set.owner.length) ∨
-    ∃ r ∈ sigs, SigBy P t apex keys (rrsetCover set) r ∧ r.hdr.labels < set.owner.length ∧
+  (∃ r ∈ sigs, SigBy P t apex keys (rrsetCover set) r ∧ ¬ r.hdr.labels < labelsOf set.owner) ∨
+    ∃ r ∈ sigs, SigBy P t apex keys (rrsetCover set) r ∧ r.hdr.labels < labelsOf set.owner ∧
       wildcardProof (S := S) (verified P t apex keys ds) set.owner r.hdr.labels = true
 
 theorem rrsetResult_secure {P : AlgorithmPolicy} {t : Nat} {apex : Name} {keys : List Key} {set : RRset}
@@ -1166,25 +1171,25 @@ theorem rrsetResult_secure {P : AlgorithmPolicy} {t : Nat} {apex : Name} {keys :
   unfold rrsetResult FinalSigned
   simp only
   by_cases h1 : (sigs.any fun r => verifies P t apex keys (rrsetCover set) r &&
-      !decide (r.hdr.labels < set.owner.length)) = true
+      !decide (r.hdr.labels < labelsOf set.owner)) = true
   · simp only [h1, ↓reduceIte, true_iff]
     obtain ⟨r, hr, h⟩ := List.any_eq_true.mp h1
     simp only [Bool.and_eq_true, Bool.not_eq_true', decide_eq_false_iff_not] at h
     exact Or.inl ⟨r, hr, verifies_iff.mp h.1, h.2⟩
   · simp only [h1, Bool.false_eq_true, ↓reduceIte]
-    have n1 : ¬ ∃ r ∈ sigs, SigBy P t apex keys (rrsetCover set) r ∧ ¬ r.hdr.labels < set.owner.length := by
+    have n1 : ¬ ∃ r ∈ sigs, SigBy P t apex keys (rrsetCover set) r ∧ ¬ r.hdr.labels < labelsOf set.owner := by
       rintro ⟨r, hr, h, h'⟩
       exact h1 (List.any_eq_true.mpr ⟨r, hr, by simp [verifies_iff.mpr h, h']⟩)
     simp only [n1, false_or]
     by_cases h2 : (sigs.any fun r => verifies P t apex keys (rrsetCover set) r &&
-        decide (r.hdr.labels < set.owner.length) &&
+        decide (r.hdr.labels < labelsOf set.owner) &&
         wildcardProof (S := S) (verified P t apex keys ds) set.owner r.hdr.labels) = true
     · simp only [h2, ↓reduceIte, true_iff]
       obtain ⟨r, hr, h⟩ := List.any_eq_true.mp h2
       simp only [Bool.and_eq_true, decide_eq_true_eq] at h
       exact ⟨r, hr, verifies_iff.mp h.1.1, h.1.2, h.2⟩
     · simp only [h2, Bool.false_eq_true, ↓reduceIte]
-      have n2 : ¬ ∃ r ∈ sigs, SigBy P t apex keys (rrsetCover set) r ∧ r.hdr.labels < set.owner.length ∧
+      have n2 : ¬ ∃ r ∈ sigs, SigBy P t apex keys (rrsetCover set) r ∧ r.hdr.labels < labelsOf set.owner ∧
           wildcardProof (S := S) (verified P t apex keys ds) set.owner r.hdr.labels = true := by
         rintro ⟨r, hr, h, h', h''⟩
         exact h2 (List.any_eq_true.mpr ⟨r, hr, by simp [verifies_iff.mpr h, h', h'']⟩)
@@ -1357,11 +1362,6 @@ inductive Denial where
   | nsec
   | nsec3 (optOut : Bool)
 deriving DecidableEq, Repr
-
-/-- The labels an RRSIG over records owned by `o` counts: a leading `*` is not counted (RFC 4034 §3.1.3). -/
-def labelsOf : Name → Nat
-  | [42] :: rest => rest.length
-  | o => o.length
 
 /-- One RRSIG by each signer over `d`, whose owner has `labels` labels and whose TTL is `ttl`. -/
 def sigsBy (ss : List (Signer S)) (apex : Name) (w : Window) (labels ttl : Nat) (d : Payload) :
@@ -1569,12 +1569,13 @@ def denialFor (q : Request) (r : Response) : List (Signed S) :=
       | .nsec, some _, _ => sz.nsecWith (·.owner == f)
       | .nsec, none, true => sz.nsecWith fun x => covers x.owner x.next f && under x.next f
       | .nsec, none, false => sz.nsecWith (nsecNone · f) ++ sz.nsecWith (·.owner == wild ce)
-      | .nsec3 _, _, true => sz.nsec3Matching f
+      | .nsec3 _, _, true =>
+        -- a DS question at a delegation an opt-out chain leaves out gets the opt-out proof (RFC 5155 §7.2.4)
+        if sz.nsec3Chain.any (·.hash == S.hash f) then sz.nsec3Matching f else sz.noDsRecords f
       | .nsec3 _, _, false =>
         sz.nsec3Matching ce ++ sz.nsec3Covering (nextCloser f ce) ++ sz.nsec3Matching (wild ce)
   let wilds : List (Signed S) :=
-    if negativeAnswer r then []
-    else r.answer.flatMap fun s =>
+    r.answer.flatMap fun s =>
       if (z.node s.owner).isSome then []
       else match sz.denial with
         | .nsec => sz.nsecWith fun x => covers x.owner x.next s.owner
@@ -2128,7 +2129,7 @@ theorem keySet_signed {sz : SignedZone S} {P : AlgorithmPolicy} {t : Nat} (hw : 
 /-- An RRset a zone signed, offered at its own owner with any TTL, passes the zone's own check. -/
 theorem signSet_final {sz : SignedZone S} {P : AlgorithmPolicy} {t : Nat} (hw : SignsWell sz P t)
     (hne : sz.signers ≠ []) {set x : RRset} (ds : List (Signed S)) (hown : x.owner = set.owner)
-    (htype : x.rtype = set.rtype) (hdata : x.rdata = set.rdata) (hlab : labelsOf x.owner = x.owner.length) :
+    (htype : x.rtype = set.rtype) (hdata : x.rdata = set.rdata) :
     FinalSigned P t sz.apex sz.keys set (sz.signSet x).sigs ds := by
   obtain ⟨s1, hs1⟩ := dataSigners_nonempty hne
   have hs1' := mem_dataSigners hs1
@@ -2136,10 +2137,10 @@ theorem signSet_final {sz : SignedZone S} {P : AlgorithmPolicy} {t : Nat} (hw : 
     List.mem_map.mpr ⟨s1, hs1', rfl⟩, rfl, honest_verifies (hw.honest s1 hs1') _ _⟩, ?_⟩
   · simp only [usable, beq_self_eq_true, hw.alg s1 hs1', Bool.and_self, Bool.true_and, List.any_eq_true, beq_iff_eq]
     exact ⟨s1.dnskey, List.mem_map.mpr ⟨s1, hs1', rfl⟩, rfl⟩
-  · simp only [rrsetCover, expanded, hown]
+  · simp only [rrsetCover, expanded, hown, ↓reduceIte, Option.map_some]
     cases x; cases set; simp_all
-  · show ¬ labelsOf x.owner < set.owner.length
-    rw [hlab, hown]; exact Nat.lt_irrefl _
+  · show ¬ labelsOf x.owner < labelsOf set.owner
+    rw [hown]; exact Nat.lt_irrefl _
 
 /-- The RRSIGs a zone serves with an RRset of one of its own nodes are its signatures over that node's RRset. -/
 theorem sigsFor_own (sz : SignedZone S) (hwf : sz.zone.WF) {s : RRset} {nd : Node}
@@ -2193,12 +2194,12 @@ bit. -/
 theorem signed_sets_validate (sz : SignedZone S) (P : AlgorithmPolicy) (t dt : Nat) (hw : SignsWell sz P t)
     (hdt : P.digests.contains dt = true) (hsep : ∃ s ∈ sz.signers, s.dnskey.sep = true) {set x : RRset}
     (ds : List (Signed S)) (hown : x.owner = set.owner) (htype : x.rtype = set.rtype) (hdata : x.rdata = set.rdata)
-    (hlab : labelsOf x.owner = x.owner.length) (hin : under set.owner sz.apex = true) :
+    (hin : under set.owner sz.apex = true) :
     validateRrset (some [sz.anchor dt]) P t [sz.link] set (sz.signSet x).sigs ds = .secure := by
   obtain ⟨s0, hs0, hsep0⟩ := hsep
   exact secure_complete ⟨sz.link, [], sz.keys, sz.apex, sz.keys,
     ⟨sz.anchor dt, anchorFor_zone sz dt hin, rfl, rfl, anchor_keys hw hdt hs0 hsep0⟩, .nil,
-    signSet_final hw (List.ne_nil_of_mem hs0) ds hown htype hdata hlab⟩
+    signSet_final hw (List.ne_nil_of_mem hs0) ds hown htype hdata⟩
 
 /-- The RRsets a signed zone serves from its own nodes, with the RRSIGs it serves for them, validate Secure
 under the zone's own anchor. The TTL may be lower than the stored one, as for the SOA of a negative answer. -/
@@ -2206,11 +2207,11 @@ theorem signed_answers_validate (sz : SignedZone S) (P : AlgorithmPolicy) (t dt 
     (hdt : P.digests.contains dt = true) (hsep : ∃ s ∈ sz.signers, s.dnskey.sep = true) (hwf : sz.zone.WF)
     {s : RRset} {nd : Node} (ds : List (Signed S)) (hnode : sz.zone.node s.owner = some nd)
     (hcut : ∀ ns d g, nd ≠ .cut ns d g) (hheld : ∃ x ∈ nodeSets nd, x.rtype = s.rtype ∧ x.rdata = s.rdata)
-    (hlab : labelsOf s.owner = s.owner.length) (hin : under s.owner sz.apex = true) :
+    (hin : under s.owner sz.apex = true) :
     validateRrset (some [sz.anchor dt]) P t [sz.link] s (sz.sigsFor s) ds = .secure := by
   obtain ⟨x, hsig, hxo, hxt, hxd⟩ := sigsFor_own sz hwf hnode hcut hheld
   rw [hsig]
-  exact signed_sets_validate sz P t dt hw hdt hsep ds hxo hxt hxd (by rw [hxo]; exact hlab) hin
+  exact signed_sets_validate sz P t dt hw hdt hsep ds hxo hxt hxd hin
 
 /-! ## A concrete scheme
 
