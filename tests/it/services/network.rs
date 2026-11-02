@@ -1338,6 +1338,72 @@ fn small_root(server: Ipv4Addr) -> Zone {
         .unwrap()
 }
 
+/// The declared names in front of iteration, as Unbound serves
+/// `local-data` with no `local-zone`: a declared name answers, and the
+/// names above it, its top-level domain's apex among them, are asked of
+/// the servers, which know them.
+#[test]
+fn transparent_declared_names_leave_the_names_above_them_to_iteration() {
+    world(Duration::from_secs(60), |fcx| async move {
+        let root = Ipv4Addr::new(203, 0, 113, 53);
+        let clock = WallClock {
+            start: std::time::SystemTime::UNIX_EPOCH,
+        };
+        let server = Authoritative::new(
+            Zones::new(vec![Arc::new(small_root(root))]),
+            ServerConfig::generic(),
+        );
+        let (attacher, attachments) = fictionet::attachments();
+        Net::new()
+            .ipv4_only()
+            .host("root", |h| h.at(root).program(server))
+            .host("api", |h| h.at(PLC_ADDR).dns_name("api.www.example"))
+            .gateway(move |h, declared| {
+                let config = Config {
+                    anchors: None,
+                    local: Vec::new(),
+                    ..Config::gateway()
+                }
+                .hints(&[(Name::from_ascii("ns.").unwrap(), IpAddr::V4(root))])
+                .local(Arc::new(declared.transparent()));
+                h.program(Recursive::new(config, clock))
+            })
+            .start(&fcx, attachments)?;
+        let m = machine(&fcx, attacher.attach("client")?, ME);
+        let gateway = SocketAddr::new(GATEWAY.into(), 53);
+        let resolve = |id, name: &'static str, rtype| {
+            let (fcx, m) = (fcx.clone(), &m);
+            async move {
+                let query = dns_query(id, name, rtype, false);
+                ask(&fcx, m, gateway, &query).await.expect("an answer")
+            }
+        };
+
+        let api = resolve(1, "api.www.example.", RecordType::A).await;
+        assert_eq!(api.answers[0].data, RData::A(PLC_ADDR.into()));
+        // The name above the declared one is the root server's.
+        let www = resolve(2, "www.example.", RecordType::A).await;
+        assert_eq!(www.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(
+            www.answers
+                .iter()
+                .map(|r| r.data.clone())
+                .collect::<Vec<_>>(),
+            vec![RData::A(Ipv4Addr::new(203, 0, 113, 80).into())]
+        );
+        // The top-level domain's apex has no made-up NS: the root server
+        // says `example.` has no NS RRset.
+        let apex = resolve(3, "example.", RecordType::NS).await;
+        assert_eq!(apex.metadata.response_code, ResponseCode::NoError);
+        assert!(apex.answers.is_empty(), "{:?}", apex.answers);
+        let RData::SOA(soa) = &apex.authorities[0].data else {
+            panic!("an SOA");
+        };
+        assert_eq!(soa.mname, Name::from_ascii("ns.").unwrap());
+        Ok(())
+    });
+}
+
 /// Advancing a namespace reaches a running resolver: it empties its cache
 /// and asks again.
 #[test]

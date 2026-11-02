@@ -193,10 +193,11 @@ fn dns_answers_aaaa_for_each_family_a_site_has() {
                 );
             }
         }
-        // The callback ran for `test` and then the name on each lookup no
-        // placed site answered: once for each of the four sites, and on
-        // every lookup of the two names it turned down, which are not kept.
-        assert_eq!(env.calls.load(Ordering::SeqCst), 4 * 2 + 4 * 2);
+        // The callback ran for the name of each lookup no placed site
+        // answered, and never for `test` above it: once for each of the
+        // four sites, and on every lookup of the two names it turned down,
+        // which are not kept.
+        assert_eq!(env.calls.load(Ordering::SeqCst), 4 + 4);
 
         // DNS also answers at the gateway's IPv6 address, over UDP and TCP.
         let m6 = machine(&fcx, attacher.attach("b").unwrap(), ME6);

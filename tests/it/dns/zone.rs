@@ -1404,10 +1404,12 @@ fn transparent_turns_absence_into_unknown() {
     let reply = ask(&*view, "www.example.", RecordType::AAAA);
     assert!(reply.answers.is_empty());
     assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
-    // An absent name is unknown, so a resolver goes on to iterate.
+    // An absent name is unknown, so a resolver goes on to iterate. Each
+    // question gets its own view: a transparent view holds the facts of
+    // its question.
     assert_eq!(
         answer(
-            &*view,
+            &*view_of(&transparent, "nope.example.", RecordType::A),
             &request("nope.example.", RecordType::A, false),
             AnyResponse::All
         ),
@@ -1418,7 +1420,7 @@ fn transparent_turns_absence_into_unknown() {
     // So is a name that only an absent wildcard would deny.
     assert_eq!(
         answer(
-            &*view,
+            &*view_of(&transparent, "x.e.w.example.", RecordType::A),
             &request("x.e.w.example.", RecordType::A, false),
             AnyResponse::All
         ),
@@ -1693,6 +1695,34 @@ fn transparent_over_lazy_lets_absent_names_through() {
             name: lower("other.lazy.")
         }
     );
+}
+
+/// A transparent zone answers only where it has RRsets, as Unbound's
+/// does: a name with nothing of its own but a name below it is unknown,
+/// while the names above a name with RRsets still lead down to it.
+#[test]
+fn transparent_leaves_empty_non_terminals_unknown() {
+    let (book, asked) = (Book::default(), Asked::default());
+    let zone = Transparent(lazy(&book, &asked));
+    put(
+        &book,
+        "a.b.lazy.",
+        Fact::Present(vec![rrset("a.b.lazy.", 60, vec![a("10.0.0.9")])]),
+    );
+    assert_eq!(
+        addresses(&lazy_reply(&zone, "a.b.lazy.", RecordType::A).answers),
+        vec!["10.0.0.9"]
+    );
+    assert_eq!(
+        lazy_ask(&zone, "b.lazy.", RecordType::A),
+        Answered::Unknown {
+            name: lower("b.lazy.")
+        }
+    );
+    // A name with RRsets, without the asked type, is NODATA.
+    let reply = lazy_reply(&zone, "a.b.lazy.", RecordType::TXT);
+    assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+    assert!(reply.answers.is_empty());
 }
 
 // Locally served zones.

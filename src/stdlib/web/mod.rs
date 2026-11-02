@@ -79,13 +79,15 @@
 //! - `None`: no site has that name. DNS answers NXDOMAIN, unless a name
 //!   below it has a site.
 //!
-//! A lookup asks about every name on its path from the root down: looking
-//! up `www.example.com` runs the callback for `com`, then `example.com`,
-//! then `www.example.com`, whatever it returned for the names above. A
-//! name the callback turned down still exists once a name below it has a
-//! site, as an empty name that answers NODATA (RFC 8020 §2), so `None`
-//! for `example.com` does not hide `www.example.com`. The root is never
-//! asked about, nor a name whose first label is `*`.
+//! A lookup asks about its own name only: looking up `www.example.com`
+//! runs the callback for `www.example.com`, and never for `example.com`
+//! or `com`, so one lookup places at most one site. A name the callback
+//! turned down still exists once a name below it has a site, as an empty
+//! name that answers NODATA (RFC 8020 §2), and looking it up runs the
+//! callback again, which may now give it a site. The root is never asked
+//! about, nor a name whose first label is `*`. Names other hosts of the
+//! network declare answer with their hosts' addresses, without the
+//! callback.
 //!
 //! A site exists only once its name has been looked up. Connecting straight
 //! to an IP address, without a lookup, works only if a site already lives
@@ -548,7 +550,7 @@ use fictionet::stdlib::network::route::Prefix;
 use fictionet::stdlib::protocols::dns::rr::{LowerName, Name};
 use fictionet::stdlib::services::dns::WallClock;
 use fictionet::stdlib::services::dns::resolver::Config;
-use fictionet::stdlib::services::dns::zone::{Transparent, ZoneData};
+use fictionet::stdlib::services::dns::zone::ZoneData;
 use fictionet::stdlib::services::tls::ServerConfig;
 use fictionet::stdlib::world::net::dns::{self, Recursive};
 use fictionet::stdlib::world::net::{Host, Net};
@@ -617,9 +619,9 @@ impl Sites {
     /// with other services next to the websites.
     ///
     /// Its gateway runs the network's default resolver, like Unbound with
-    /// no route to the internet ([`Net::gateway`]), whose local zones are
-    /// the names the network's hosts declare and, after them, a root zone
-    /// that asks the callback ([`dns::placing`]). The callback decides
+    /// no route to the internet ([`Net::gateway`]), whose local zone is a
+    /// root zone of the names the network's hosts declare that asks the
+    /// callback about the others ([`dns::placing`]). The callback decides
     /// every name but `localhost`, so the resolver's other default zones,
     /// such as `test`, `home.arpa`, and the reverse zones of private
     /// addresses, give way to it.
@@ -637,16 +639,11 @@ impl Sites {
                 site.into_host(name)
             })
         }));
-        self.net.gateway(move |host, declared| {
+        self.net.gateway(move |host, _declared| {
             let localhost = LowerName::from(Name::from_ascii("localhost.").expect("a valid name"));
             let mut config = Config::gateway();
             config.local.retain(|zone| *zone.apex() == localhost);
-            // Local zones of equal depth answer last added first, so the
-            // declared names answer before the callback is asked.
-            let config = config
-                .local(sites.clone())
-                .local(Arc::new(Transparent(declared)));
-            host.program(Recursive::new(config, clock))
+            host.program(Recursive::new(config.local(sites.clone()), clock))
         })
     }
 

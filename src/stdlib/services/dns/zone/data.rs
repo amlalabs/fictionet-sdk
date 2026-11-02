@@ -115,11 +115,16 @@ where
     }
 }
 
-/// Unbound's `transparent` local zone: what `D` holds answers, and what `D`
-/// says is absent is unknown, so a resolver goes on to iterate for it.
+/// Unbound's `transparent` local zone: a name with RRsets in `D` answers
+/// from them, and every other name is unknown, so a resolver goes on to
+/// its next local zone or iterates for it.
 ///
-/// A name `D` holds without the asked type still answers NODATA, as
-/// Unbound's transparent zones do. Only absence becomes unknown.
+/// A name `D` holds RRsets at, without the asked type, still answers
+/// NODATA, as Unbound's transparent zones do. A name `D` says is absent,
+/// and a name with nothing of its own but names below it, are unknown:
+/// Unbound answers from a transparent zone only where it has data
+/// (`local_zones_zone_answer`). The names above the question's name stay
+/// as `D` has them, so the answer can walk down to it.
 pub struct Transparent<D: ZoneData>(pub D);
 
 impl<D: ZoneData> ZoneData for Transparent<D> {
@@ -128,38 +133,47 @@ impl<D: ZoneData> ZoneData for Transparent<D> {
     }
 
     fn view(&self, question: &Query) -> Arc<dyn View + Send + Sync> {
-        Arc::new(TransparentView(self.0.view(question)))
+        Arc::new(TransparentView {
+            view: self.0.view(question),
+            qname: LowerName::new(question.name()),
+        })
     }
 }
 
-/// A view whose absent nodes read as unknown.
-struct TransparentView(Arc<dyn View + Send + Sync>);
+/// A view whose absent nodes, and empty non-terminals not above the
+/// question's name, read as unknown.
+struct TransparentView {
+    view: Arc<dyn View + Send + Sync>,
+    qname: LowerName,
+}
 
 impl View for TransparentView {
     fn apex(&self) -> &LowerName {
-        self.0.apex()
+        self.view.apex()
     }
 
     fn revision(&self) -> Revision {
-        self.0.revision()
+        self.view.revision()
     }
 
     fn soa(&self) -> &RecordSet {
-        self.0.soa()
+        self.view.soa()
     }
 
     fn node(&self, name: &LowerName) -> Fact<&Node> {
-        match self.0.node(name) {
+        let above = *name != self.qname && name.zone_of(&self.qname);
+        match self.view.node(name) {
             Fact::Absent => Fact::Unknown,
+            Fact::Present(Node::Empty) if !above => Fact::Unknown,
             fact => fact,
         }
     }
 
     fn denial(&self, name: &LowerName, kind: Denied) -> Fact<Vec<RecordSet>> {
-        self.0.denial(name, kind)
+        self.view.denial(name, kind)
     }
 
     fn sign(&self, set: &RecordSet) -> Option<RecordSet> {
-        self.0.sign(set)
+        self.view.sign(set)
     }
 }
