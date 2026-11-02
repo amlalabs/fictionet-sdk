@@ -44,7 +44,7 @@
 //!
 //! [`web::Sites`](fictionet::stdlib::web::Sites) is a preset on `Net` for a
 //! world of websites, whose hosts appear as their names are looked up
-//! ([`Net::resolve`]).
+//! ([`dns::placing`]).
 //!
 //! # Programs and hosts placed later
 //!
@@ -95,9 +95,16 @@
 //!   subnet other than the gateway is dropped. [`Net::route`] attaches a
 //!   trusted sandbox, such as a real container playing a host, at a fixed
 //!   prefix outside that subnet, with no filter.
-//! - **DNS** at the gateway, over UDP and TCP. It answers A and AAAA for
-//!   each host's names, NODATA for other types, NXDOMAIN for every other
-//!   name.
+//! - **DNS** at the gateway, over UDP and TCP: a recursive resolver like
+//!   Unbound ([`Config::gateway`](fictionet::stdlib::services::dns::resolver::Config::gateway)),
+//!   with no route to the internet. It answers each host's names with the
+//!   host's addresses, and other types with NODATA. Another name under a
+//!   top-level domain that a host's name uses gets NXDOMAIN, and a name
+//!   under any other top-level domain gets SERVFAIL with Extended DNS Error
+//!   22, No Reachable Authority, as a resolver on a network with no
+//!   internet answers ([`Declared`]). Answers come with RA set, an SOA in
+//!   negative answers, TTLs that count down, and the EDNS a resolver sends.
+//!   [`Net::gateway`] runs something else there.
 //! - **Addresses.** A host with [`Host::at`] uses that address; otherwise
 //!   it gets a free one from `104.18.0.0/15` (IPv4) and `2606:4700:100::/48`
 //!   (IPv6). Hosts with the same address share one machine.
@@ -134,11 +141,9 @@
 //!   TLS and one without count as two), or a port
 //!   that cannot be listened on, makes [`Net::start`] fail. A rejected host
 //!   adds no machine, route, listener, task, TLS name or virtual host, and
-//!   consumes no automatic address. Existing hosts remain unchanged. Hosts
-//!   returned by the resolver follow the same rule; their failed lookups
-//!   record `net.error` and answer NXDOMAIN. A host given to
-//!   [`NetHandle::add_host`] follows it too, and the call returns the
-//!   error.
+//!   consumes no automatic address. Existing hosts remain unchanged. A
+//!   host given to [`NetHandle::add_host`] follows the same rule, and the
+//!   call returns the error.
 //!
 //! The limits and rules are those [`web::Sites`](fictionet::stdlib::web::Sites)
 //! documents in detail, which runs on this.
@@ -148,10 +153,12 @@ use std::collections::{BTreeMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, OnceLock, Weak};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use fictionet::stdlib::network::route::{self, Prefix, Router};
 use fictionet::stdlib::network::{icmp, tcp};
+use fictionet::stdlib::services::dns::WallClock;
+use fictionet::stdlib::services::dns::resolver::Config;
 #[cfg(doc)]
 use fictionet::stdlib::services::serve::{Budget, ServeOptions, Service};
 use fictionet::{Attachments, Cx, End, Error, Interface, InterfaceExt};
@@ -163,7 +170,7 @@ use fictionet::stdlib::web::httpd;
 
 mod addresses;
 mod attachments;
-mod dns;
+pub mod dns;
 mod hosts;
 mod names;
 
@@ -171,12 +178,11 @@ pub use addresses::Placed;
 use addresses::{AUTO, AUTO6, Leases, Subnet, Subnet6};
 pub use attachments::connection_limit;
 use attachments::{Hooks, filter, udp_packet};
-use dns::start_dns;
-use hosts::{
-    Admission, Installation, Known, Lookup, LookupContext, Machines, Peers, World, host_prefix,
-};
+use dns::Recursive;
+use hosts::{Admission, Installation, Machines, Peers, World, host_prefix};
 pub use hosts::{
-    Arrival, ConfigFor, ConfigFuture, Endpoints, Host, PortServer, PreparedShare, Program, Sni,
+    Arrival, ConfigFor, ConfigFuture, Declared, Endpoints, Host, PortServer, PreparedShare,
+    Program, Sni,
 };
 pub use names::normalize;
 
@@ -186,10 +192,6 @@ const PROTO_UDP: u8 = 17;
 /// Each link inside the network holds at most this many bytes of packets
 /// each way.
 const LINK_QUEUE: usize = 4 << 20;
-
-/// How many names may have a host made by [`Net::resolve`], unless the
-/// world sets another limit.
-pub const MAX_HOSTS: usize = 20_000;
 
 fn link() -> (End, End) {
     fictionet::pair_with_limit(LINK_QUEUE)
@@ -233,8 +235,8 @@ impl Default for Limits {
 // ---------------------------------------------------------------------------
 // The network
 
-/// Turns a name into a host, or `None`. Runs once per name.
-type Resolver = dyn Fn(&str) -> Option<Host> + Send + Sync;
+/// Builds what runs at a gateway address: see [`Net::gateway`].
+type Gateway = dyn Fn(Host, Declared) -> Host + Send + Sync;
 
 /// A LAN definition shared by a network, its hosts and attached members.
 ///
@@ -269,11 +271,9 @@ pub struct Net {
     subnet_v6: Prefix,
     ipv6: bool,
     hosts: Vec<Host>,
-    resolver: Option<Arc<Resolver>>,
+    gateway: Arc<Gateway>,
     unreachable: Option<Arc<dyn Fn(Unreachable) + Send + Sync>>,
     drop_unrouted: bool,
-    keep_misses: bool,
-    max_hosts: usize,
     routes: Vec<(String, Prefix)>,
     limits: Limits,
     lans: Vec<Lan>,
@@ -301,11 +301,9 @@ impl Net {
             },
             ipv6: true,
             hosts: Vec::new(),
-            resolver: None,
+            gateway: Arc::new(default_gateway),
             unreachable: None,
             drop_unrouted: false,
-            keep_misses: true,
-            max_hosts: MAX_HOSTS,
             routes: Vec::new(),
             limits: Limits::default(),
             lans: Vec::new(),
@@ -366,14 +364,26 @@ impl Net {
         self.handle.clone()
     }
 
-    /// Asks `resolve` for a host the first time a name that no host has is
-    /// looked up. `Some(host)` creates it then, with that name as a DNS
-    /// name; `None` gives NXDOMAIN. The answer is kept for the run.
-    /// `resolve` must return quickly: it runs inside the DNS task. A host
-    /// that cannot be served gets NXDOMAIN.
-    pub fn resolve(self, resolve: impl Fn(&str) -> Option<Host> + Send + Sync + 'static) -> Net {
+    /// Sets what runs at each gateway address: the sandboxes' gateway of
+    /// each family and each LAN's DNS address. `build` gets a host and the
+    /// names the network's hosts declare, as zone data ([`Declared`]), and
+    /// returns the host with the programs and services the gateway runs.
+    /// Only those are used; the gateway keeps its own address and answers
+    /// pings. It is called once per gateway address, so each address has
+    /// its own programs, and a resolver its own cache.
+    ///
+    /// The default runs a recursive resolver like Unbound with no route to
+    /// the internet, answering the declared names:
+    /// `h.program(Recursive::new(declared.over(config), clock))`, where
+    /// `config` is [`Config::gateway`](fictionet::stdlib::services::dns::resolver::Config::gateway)
+    /// with [`ede`](fictionet::stdlib::services::dns::resolver::Config::ede)
+    /// on, and `clock` starts at the Unix epoch, since a resolver that asks
+    /// no other server checks no signature. A world whose resolver
+    /// iterates to root servers of its own gives it root hints
+    /// ([`Config::hints`](fictionet::stdlib::services::dns::resolver::Config::hints)).
+    pub fn gateway(self, build: impl Fn(Host, Declared) -> Host + Send + Sync + 'static) -> Net {
         Net {
-            resolver: Some(Arc::new(resolve)),
+            gateway: Arc::new(build),
             ..self
         }
     }
@@ -390,21 +400,6 @@ impl Net {
     pub fn drop_unrouted(mut self) -> Self {
         self.drop_unrouted = true;
         self
-    }
-
-    /// Asks [`resolve`](Net::resolve) again each time a name it gave no
-    /// host is looked up, instead of keeping NXDOMAIN for the run: for a
-    /// world whose names come into being as it runs. A name that gets a
-    /// host keeps it.
-    pub fn resolve_misses_again(mut self) -> Self {
-        self.keep_misses = false;
-        self
-    }
-
-    /// Sets how many names may get a host from [`resolve`](Net::resolve).
-    /// Default [`MAX_HOSTS`]. Past it, a new name gets SERVFAIL.
-    pub fn max_hosts(self, max_hosts: usize) -> Net {
-        Net { max_hosts, ..self }
     }
 
     /// Wires the sandbox called `name` straight to the router at `prefix`,
@@ -516,17 +511,10 @@ impl Net {
         let routes: Vec<(String, Prefix)> = self.routes;
         let shared = Arc::new(Shared {
             fcx: fcx.clone(),
-            resolver: self.resolver,
             subnet,
             subnet6,
             router,
-            world: Arc::new(Mutex::new({
-                let mut world = World::new(self.max_hosts);
-                if !self.keep_misses {
-                    world.max_unknown = 0;
-                }
-                world
-            })),
+            world: Arc::new(Mutex::new(World::new())),
             leases: Arc::new(Mutex::new(Leases::default())),
             gateway_tcp: Arc::new(Mutex::new(Vec::new())),
             hooks,
@@ -535,7 +523,7 @@ impl Net {
             limits: self.limits,
             lans,
         });
-        start_gateway(&shared)?;
+        start_gateway(&shared, &*self.gateway)?;
         {
             let mut world = shared.world.lock();
             for host in self.hosts {
@@ -584,13 +572,14 @@ impl NetHandle {
     /// hosts given before [`start`](Net::start): never on the sandboxes'
     /// subnet or at an address a host cannot have, on a LAN only with
     /// [`Host::on`], and with no service on a port another host at that
-    /// address already serves. Its names answer with its addresses from
-    /// then on, and its programs start. A rejected host leaves nothing
-    /// behind.
+    /// address already serves. Its names are declared from then on
+    /// ([`Declared`]), and its programs start. A rejected host leaves
+    /// nothing behind.
     ///
     /// Fails before the network has started, after it has stopped, and for
-    /// a host that cannot be placed. The network's DNS lookups hold the
-    /// lock this takes, so a [`Net::resolve`] callback must not call it.
+    /// a host that cannot be placed. A zone provider may call it while a
+    /// resolver waits on the provider ([`dns::placing`]); it takes the
+    /// network's lock, which no code holds while it calls into a resolver.
     pub fn add_host(&self, host: Host) -> Result<Placed, Error> {
         let shared = self.shared()?;
         let mut world = shared.world.lock();
@@ -622,7 +611,6 @@ impl NetHandle {
 struct Shared {
     peers: Arc<Peers>,
     fcx: Cx,
-    resolver: Option<Arc<Resolver>>,
     subnet: Subnet,
     subnet6: Option<Subnet6>,
     router: Router<Box<dyn Interface>>,
@@ -653,11 +641,11 @@ impl Shared {
             router: &self.router,
             lans: &self.lans,
             admission: self.admission(),
-            handshake: self.limits.handshake,
+            limits: self.limits,
         }
     }
 
-    /// Places `host` and records its names, which then answer with its
+    /// Places `host` and declares its names, which then answer with its
     /// addresses.
     fn place(&self, world: &mut World, host: Host) -> Result<Placed, Error> {
         let names = host.names.clone();
@@ -666,30 +654,8 @@ impl Shared {
             .installation()
             .place(world, host)
             .map_err(|e| fictionet::Error::msg(format!("host {label}: {e}")))?;
-        for name in names {
-            world.names.insert(name, Known::Host(placed));
-        }
+        world.declare(&names, placed);
         Ok(placed)
-    }
-
-    fn lookup(&self, name: &str) -> Lookup {
-        LookupContext {
-            world: &self.world,
-            resolver: self.resolver.as_deref(),
-            installation: self.installation(),
-        }
-        .lookup(name)
-    }
-
-    fn dns(self: &Arc<Self>) -> dns::Context {
-        let shared = self.clone();
-        dns::Context {
-            state: dns::State {
-                lookup: Arc::new(move |name| shared.lookup(name)),
-                tcp_idle: self.limits.dns_tcp_idle,
-            },
-            admission: self.admission(),
-        }
     }
 
     fn attachments(&self) -> Arc<attachments::Context> {
@@ -823,26 +789,55 @@ fn make_lans(
     Ok(made)
 }
 
-/// The gateway, at its IPv4 address and, with IPv6, at its IPv6 address:
-/// DNS over UDP and TCP on port 53, and ping replies. DHCP is answered in
-/// each sandbox's filter, which knows which sandbox asked. LAN DNS
-/// services start after these gateways, in ascending LAN name order.
-fn start_gateway(shared: &Arc<Shared>) -> Result<(), Error> {
+/// What runs at a gateway address unless [`Net::gateway`] says otherwise.
+fn default_gateway(host: Host, declared: Declared) -> Host {
+    let clock = WallClock {
+        start: SystemTime::UNIX_EPOCH,
+    };
+    host.program(Recursive::new(declared.over(gateway_config()), clock))
+}
+
+/// [`Config::gateway`] with Extended DNS Errors on, as Unbound with
+/// `ede: yes`, so a name with no reachable server says why: SERVFAIL with
+/// Extended DNS Error 22, No Reachable Authority (RFC 8914 §4.23).
+pub(crate) fn gateway_config() -> Config {
+    Config {
+        ede: true,
+        ..Config::gateway()
+    }
+}
+
+/// The gateway: a machine at its IPv4 address and, with IPv6, at its IPv6
+/// address, running what `build` gives it, DNS on port 53 by default, and
+/// answering pings. DHCP is answered in each sandbox's filter, which knows
+/// which sandbox asked. The LANs' DNS machines start after these gateways,
+/// in ascending LAN name order. Each gateway's TCP endpoint is kept, so
+/// its connections count toward the per-peer limit and end when their
+/// sandbox detaches.
+fn start_gateway(shared: &Arc<Shared>, build: &Gateway) -> Result<(), Error> {
+    let declared = Declared::new(shared.world.clone());
+    let installation = shared.installation();
+    let failed =
+        |addr: IpAddr| move |e: String| fictionet::Error::msg(format!("gateway {addr}: {e}"));
     let gateways = std::iter::once(IpAddr::V4(shared.subnet.gateway))
         .chain(shared.subnet6.map(|s| IpAddr::V6(s.gateway)));
-    let fcx = &shared.fcx.clone();
     for gateway in gateways {
-        let (router_side, side) = link();
-        shared
-            .router
-            .add(host_prefix(gateway), Box::new(router_side));
-        let tcp = start_dns(shared.dns(), fcx, side, gateway)?;
+        let host = build(Host::new("gateway"), declared.clone());
+        let attach = |side| {
+            shared.router.add(host_prefix(gateway), side);
+            Ok(())
+        };
+        let tcp = installation
+            .gateway(gateway, &host, attach)
+            .map_err(failed(gateway))?;
         shared.gateway_tcp.lock().push(tcp);
     }
     for seg in shared.lans.values() {
-        let (lan_side, side) = link();
-        seg.lan.add(seg.dns, Box::new(lan_side))?;
-        let tcp = start_dns(shared.dns(), &shared.fcx.clone(), side, seg.dns)?;
+        let host = build(Host::new("gateway"), declared.clone());
+        let attach = |side| seg.lan.add(seg.dns, side).map_err(|e| e.to_string());
+        let tcp = installation
+            .gateway(seg.dns, &host, attach)
+            .map_err(failed(seg.dns))?;
         shared.gateway_tcp.lock().push(tcp);
     }
     Ok(())
@@ -933,11 +928,10 @@ mod tests {
                 )?;
                 let shared = Arc::new(Shared {
                     fcx: fcx.clone(),
-                    resolver: None,
                     subnet,
                     subnet6: None,
                     router,
-                    world: Arc::new(Mutex::new(World::new(MAX_HOSTS))),
+                    world: Arc::new(Mutex::new(World::new())),
                     leases: Arc::default(),
                     gateway_tcp: Arc::default(),
                     hooks,
@@ -946,7 +940,7 @@ mod tests {
                     limits: Limits::default(),
                     lans,
                 });
-                start_gateway(&shared)?;
+                start_gateway(&shared, &default_gateway)?;
                 let addresses: Vec<_> = shared
                     .gateway_tcp
                     .lock()

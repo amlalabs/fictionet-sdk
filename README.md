@@ -57,7 +57,8 @@ proxy instead.
 The standard library covers IPv4 and IPv6, TCP, UDP, ICMP, routing, whole
 networks of websites with `stdlib::web`, and codecs (no I/O) for about a hundred
 protocols and data formats, listed in [the stdlib docs](src/stdlib/mod.rs).
-HTTP has a ready server, `Net` serves DNS and DHCP, and TLS is built in.
+HTTP has a ready server, `Net` serves DHCP and runs a DNS resolver, and TLS is
+built in.
 For other protocols, a world writes a `Service` around the module's decoder.
 The crate is not on crates.io, so build it from this repository.
 

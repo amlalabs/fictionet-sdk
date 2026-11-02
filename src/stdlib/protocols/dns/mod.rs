@@ -4,13 +4,12 @@
 //! Use this module to read and answer DNS queries in a world that runs its
 //! own DNS server. If the world is a set of websites,
 //! [`web::Sites`](fictionet::stdlib::web::Sites) already runs one for you.
-//! [`net::Net`](fictionet::stdlib::world::net::Net) serves DNS over UDP and TCP on
-//! port 53 at each gateway. It answers A and AAAA queries from declared hosts
-//! and hosts created by [`Net::resolve`](fictionet::stdlib::world::net::Net::resolve).
-//! Unknown names get NXDOMAIN, and new names past
-//! [`Net::max_hosts`](fictionet::stdlib::world::net::Net::max_hosts) get SERVFAIL.
-//! A known host without the requested address family gets an empty answer.
-//! Answers have a 60-second TTL.
+//! [`net::Net`](fictionet::stdlib::world::net::Net) runs a recursive resolver
+//! like Unbound at each gateway, on UDP and TCP port 53, which answers the
+//! names the network's hosts declare and has no route to the internet. Its
+//! engines are in [`services::dns`](fictionet::stdlib::services::dns), and
+//! the programs that run them on a host, authoritative servers among them,
+//! are in [`net::dns`](fictionet::stdlib::world::net::dns).
 //!
 //! A DNS message is plain data: a [`Message`](op::Message) with public
 //! `queries` and `answers` lists. hickory's `dnssec-ring` feature is on, so

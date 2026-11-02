@@ -1,9 +1,14 @@
 use super::addresses::{Allocator, Placed, Subnet, Subnet6, may_serve_v4, may_serve_v6};
 use super::attachments::answered_closed;
-use super::{Hooks, LanSeg, PROTO_TCP, Resolver, connection_limit, link, normalize};
+use super::dns::{HOST_TTL, local_zone};
+use super::{Hooks, LanSeg, Limits, PROTO_TCP, connection_limit, link, normalize};
 use fictionet::stdlib::codec::Decode;
 use fictionet::stdlib::network::route::{Prefix, Router};
 use fictionet::stdlib::network::{ConnError, Connection, icmp, ip, tcp, udp};
+use fictionet::stdlib::protocols::dns::op::Query;
+use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RecordSet, RecordType};
+use fictionet::stdlib::services::dns::resolver::Config;
+use fictionet::stdlib::services::dns::zone::{Denied, Fact, Node, Revision, View, ZoneData};
 use fictionet::stdlib::services::serve::ConnInfo;
 use fictionet::stdlib::services::serve::{self, Budget, ServeOptions, Service};
 use fictionet::stdlib::services::tls::ServerConfig;
@@ -20,15 +25,12 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 #[cfg(doc)]
-use super::{Limits, Net};
+use super::{Net, NetHandle};
 
 fictionet::cfg_std! {
 #[cfg(doc)]
 use fictionet::stdlib::web::httpd;
 }
-
-/// At most this many names that have no host are remembered (about 35 MB).
-const MAX_UNKNOWN_NAMES: usize = 100_000;
 
 // ---------------------------------------------------------------------------
 // Hosts
@@ -207,7 +209,7 @@ pub(super) enum PortSpec {
 }
 
 /// One host: its addresses, DNS names, services and programs. See
-/// [`Net::host`] and [`Net::resolve`].
+/// [`Net::host`] and [`NetHandle::add_host`].
 #[derive(Clone)]
 pub struct Host {
     pub(super) label: String,
@@ -244,8 +246,7 @@ impl Host {
     /// The address must be one a host can have, outside the sandboxes'
     /// subnet: not unspecified, broadcast, multicast or loopback, and for
     /// IPv6 not link-local or IPv4-mapped. If it is not, [`Net::start`]
-    /// fails; a host made by [`Net::resolve`] is not served, and its name
-    /// gets NXDOMAIN.
+    /// fails, and so does [`NetHandle::add_host`].
     pub fn at(self, addr: impl Into<IpAddr>) -> Host {
         match addr.into() {
             IpAddr::V4(a) => Host {
@@ -286,9 +287,10 @@ impl Host {
         }
     }
 
-    /// Makes the gateway's DNS answer `name` with the host's addresses. A
-    /// host can have many names; its HTTP sites and TLS services for
-    /// [`Sni::Names`] are served under each.
+    /// Declares `name` for the host: the gateway's resolver answers it with
+    /// the host's addresses (see [`Declared`]). A host can have many names;
+    /// its HTTP sites and TLS services for [`Sni::Names`] are served under
+    /// each.
     pub fn dns_name(mut self, name: &str) -> Host {
         self.names.push(normalize(name));
         self
@@ -478,14 +480,32 @@ pub struct Endpoints {
     /// The machine's UDP endpoint.
     pub udp: udp::Endpoint,
     admission: Admission,
+    limits: Limits,
 }
 
 impl Endpoints {
+    /// The network's limits and timers ([`Net::limits`]), for a program
+    /// that serves what the network's own services serve, such as DNS over
+    /// TCP with [`Limits::dns_tcp_idle`].
+    pub fn limits(&self) -> Limits {
+        self.limits
+    }
+
     /// The sandbox that `peer` belongs to, as [`ServeOptions::sandbox`]
     /// reports it: a peer that no sandbox has is reported with id 0, an
     /// empty name, and `peer` as its address.
     pub fn sandbox_of(&self, peer: IpAddr) -> Option<serve::Sandbox> {
         Some(self.admission.hooks.sandbox_at(peer))
+    }
+
+    /// The service budget of the sandbox that `peer` belongs to
+    /// ([`Limits::sandbox_budget`]), for a program that charges what it
+    /// holds for that sandbox's connections, as [`Arrival::budget`] is for
+    /// a port's server. `None` for a peer that is no attached sandbox, or
+    /// a trusted one.
+    pub fn budget_of(&self, peer: IpAddr) -> Option<Budget> {
+        let hooks = &self.admission.hooks;
+        hooks.budget(hooks.sandbox_at(peer).id)
     }
 
     /// Applies the network's per-peer connection limit
@@ -535,88 +555,25 @@ where
     }
 }
 
-/// What a name is known as.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Known {
-    Host(Placed),
-    NoHost,
-}
+// ---------------------------------------------------------------------------
+// Names and machines
 
-/// What a lookup found.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Lookup {
-    Host(Placed),
-    NoHost,
-    /// No host has the name, but hosts have names below it.
-    Parent,
-    /// The resolver gave a host, but the network has as many as it may.
-    Full,
-}
-
-/// Every name looked up or declared, and the parents of host names.
-#[derive(Default)]
-pub(super) struct Names {
-    known: HashMap<String, Known>,
-    /// Names with a host name below them, the root ("") among them. Names
-    /// are never removed, so neither are parents.
-    parents: HashSet<String>,
-}
-
-impl Names {
-    pub(super) fn get(&self, name: &str) -> Option<&Known> {
-        self.known.get(name)
-    }
-
-    pub(super) fn insert(&mut self, name: String, known: Known) {
-        if let Known::Host(_) = known {
-            let mut rest = name.as_str();
-            while !rest.is_empty() {
-                let parent = rest.split_once('.').map_or("", |(_, parent)| parent);
-                if !self.parents.insert(parent.to_owned()) {
-                    break;
-                }
-                rest = parent;
-            }
-        }
-        self.known.insert(name, known);
-    }
-
-    /// Whether a host name lies below `name`.
-    pub(super) fn is_parent(&self, name: &str) -> bool {
-        self.parents.contains(name)
-    }
-
-    #[cfg(test)]
-    pub(super) fn len(&self) -> usize {
-        self.known.len()
-    }
-
-    #[cfg(test)]
-    pub(super) fn is_empty(&self) -> bool {
-        self.known.is_empty()
-    }
-}
-
-/// Names and machines.
+/// Machines, their addresses, and the names hosts declare.
 pub(super) struct World {
-    pub(super) names: Names,
-    unknown: usize,
-    pub(super) max_unknown: usize,
-    pub(super) resolved: usize,
-    max_hosts: usize,
+    /// Each declared name, with the addresses of the host that has it.
+    pub(super) declared: BTreeMap<LowerName, Placed>,
+    /// Counts the changes to `declared`: the revision of its zones.
+    revision: u64,
     /// Machines in address order for aborting a detached peer.
     pub(super) machines: BTreeMap<IpAddr, Arc<Machine>>,
     pub(super) addresses: Allocator,
 }
 
 impl World {
-    pub(super) fn new(max_hosts: usize) -> World {
+    pub(super) fn new() -> World {
         World {
-            names: Names::default(),
-            unknown: 0,
-            max_unknown: MAX_UNKNOWN_NAMES,
-            resolved: 0,
-            max_hosts,
+            declared: BTreeMap::new(),
+            revision: 0,
             machines: BTreeMap::new(),
             addresses: Allocator::default(),
         }
@@ -630,78 +587,227 @@ impl World {
         self.addresses.free_auto6(subnet, &self.machines)
     }
 
-    /// Keeps the answer for a resolved `name`, unless it has no host and too
-    /// many of those are kept already, or it is longer than a host name
-    /// can be.
-    fn remember(&mut self, name: &str, known: Known) {
-        match known {
-            Known::NoHost if self.unknown >= self.max_unknown || name.len() > 253 => return,
-            Known::NoHost => self.unknown += 1,
-            Known::Host(_) => self.resolved += 1,
-        }
-        self.names.insert(name.to_owned(), known);
-    }
-}
-
-/// Resolves names and publishes hosts through the installation boundary.
-pub(super) struct LookupContext<'a> {
-    pub(super) world: &'a Mutex<World>,
-    pub(super) resolver: Option<&'a Resolver>,
-    pub(super) installation: Installation<'a>,
-}
-
-impl LookupContext<'_> {
-    /// What `name` is. The first lookup of a name no host has runs the
-    /// resolver and, for a host, starts its machines. A name without a host
-    /// is a parent while a host has a name below it.
-    pub(super) fn lookup(&self, name: &str) -> Lookup {
-        match self.find(name) {
-            Lookup::NoHost if self.world.lock().names.is_parent(name) => Lookup::Parent,
-            found => found,
-        }
-    }
-
-    fn find(&self, name: &str) -> Lookup {
-        let mut world = self.world.lock();
-        if let Some(known) = world.names.get(name) {
-            return match known {
-                Known::Host(p) => Lookup::Host(*p),
-                Known::NoHost => Lookup::NoHost,
+    /// Declares `names` for a host placed at `placed`. A name declared
+    /// before now answers with these addresses. A name that is not a DNS
+    /// name, or is the root, cannot be asked for and is left out.
+    pub(super) fn declare(&mut self, names: &[String], placed: Placed) {
+        for name in names {
+            let Ok(name) = Name::from_ascii(format!("{name}.")) else {
+                continue;
             };
-        }
-        // The root is no host's name.
-        let Some(resolver) = self.resolver.filter(|_| !name.is_empty()) else {
-            return Lookup::NoHost;
-        };
-        let known = match resolver(name) {
-            Some(_) if world.resolved >= world.max_hosts => return Lookup::Full,
-            Some(mut host) => {
-                if !host.names.iter().any(|n| n == name) {
-                    host.names.insert(0, name.to_owned());
-                }
-                let names = host.names.clone();
-                match self.installation.place(&mut world, host) {
-                    Ok(p) => {
-                        // The host answers to each of its names. A name
-                        // already known keeps its answer.
-                        for other in names {
-                            if other != name && world.names.get(&other).is_none() {
-                                world.names.insert(other, Known::Host(p));
-                            }
-                        }
-                        Known::Host(p)
-                    }
-                    Err(_) => Known::NoHost,
-                }
+            if !name.is_root() {
+                self.declared.insert(LowerName::new(&name), placed);
             }
-            None => Known::NoHost,
-        };
-        world.remember(name, known);
-        drop(world);
-        match known {
-            Known::Host(p) => Lookup::Host(p),
-            Known::NoHost => Lookup::NoHost,
         }
+        self.revision += 1;
+    }
+
+    /// Whether a declared name is at or below `name`.
+    fn declares_below(&self, name: &LowerName) -> bool {
+        // The names below a name follow it directly in canonical order.
+        self.declared
+            .range(name.clone()..)
+            .next()
+            .is_some_and(|(other, _)| name.zone_of(other))
+    }
+
+    /// What the declared zone at `apex` holds at `name`.
+    fn fact(&self, apex: &LowerName, name: &LowerName) -> Fact<Node> {
+        let owner = Name::from(name.clone());
+        let mut sets = BTreeMap::new();
+        if name == apex {
+            let (soa, ns) = local_zone(&owner);
+            sets.insert(RecordType::SOA, soa);
+            sets.insert(RecordType::NS, ns);
+        }
+        if let Some(placed) = self.declared.get(name) {
+            for set in placed.rrsets(&owner, HOST_TTL) {
+                sets.insert(set.record_type(), set);
+            }
+        }
+        if !sets.is_empty() {
+            Fact::Present(Node::Data(sets))
+        } else if self.declares_below(name) {
+            Fact::Present(Node::Empty)
+        } else {
+            Fact::Absent
+        }
+    }
+}
+
+/// The names the network's hosts declare with [`Host::dns_name`], or that
+/// hosts placed with [`NetHandle::add_host`] declare, as zone data for a
+/// resolver's local zones.
+///
+/// It is one static local zone per top-level domain those names use, as
+/// Unbound serves a `local-zone` of type `static` with its `local-data`:
+/// each declared name has its host's A and AAAA records, a name with
+/// declared names below it is an empty non-terminal, and every other name
+/// under that top-level domain does not exist. Each zone has the SOA and NS
+/// records Unbound gives its own local zones (RFC 6303 §3). Under a
+/// top-level domain no declared name uses, it knows nothing, so a resolver
+/// goes on to its other zones and to iteration. The zones grow as hosts
+/// are placed.
+///
+/// A static zone denies every undeclared name under its top-level domain.
+/// A world whose resolver also iterates to real servers, and whose hosts
+/// declare names under real top-level domains, passes it wrapped in
+/// [`Transparent`](fictionet::stdlib::services::dns::zone::Transparent),
+/// so the declared names answer and the rest are asked of the internet.
+/// [`Net::gateway`] hands it to the code that builds the gateway.
+#[derive(Clone)]
+pub struct Declared {
+    world: Arc<Mutex<World>>,
+    root: LowerName,
+}
+
+impl Declared {
+    pub(super) fn new(world: Arc<Mutex<World>>) -> Declared {
+        Declared {
+            world,
+            root: LowerName::new(&Name::root()),
+        }
+    }
+
+    /// `config` with the declared names served before anything else at
+    /// their top-level domains: these zones are added as a local zone, and
+    /// each of `config`'s local zones at a top-level domain a declared name
+    /// uses gives way to them, as a default local zone of Unbound gives way
+    /// to a zone of the same name the operator configures. So a world that
+    /// declares `dc01.corp.test` gets its address, where Unbound's default
+    /// `test` zone (RFC 6761 §6.2) would deny it. Deeper local zones, such
+    /// as the reverse zones of RFC 6303, still answer first.
+    pub fn over(&self, mut config: Config) -> Config {
+        config.local = config
+            .local
+            .into_iter()
+            .map(|zone| {
+                if zone.apex().num_labels() == 1 {
+                    Arc::new(GivesWay {
+                        zone,
+                        declared: self.clone(),
+                    }) as Arc<dyn ZoneData>
+                } else {
+                    zone
+                }
+            })
+            .collect();
+        config.local(Arc::new(self.clone()))
+    }
+
+    /// Whether a declared name is at or below `apex`.
+    fn declares_below(&self, apex: &LowerName) -> bool {
+        self.world.lock().declares_below(apex)
+    }
+}
+
+impl ZoneData for Declared {
+    /// The root: the zones cover every top-level domain a declared name
+    /// will ever use. Each view's apex is its question's top-level domain.
+    fn apex(&self) -> &LowerName {
+        &self.root
+    }
+
+    fn view(&self, question: &Query) -> Arc<dyn View + Send + Sync> {
+        let qname = LowerName::new(question.name());
+        if qname.is_root() {
+            return Arc::new(Facts::unknown(self.root.clone()));
+        }
+        let tld = LowerName::new(&qname.trim_to(1));
+        let world = self.world.lock();
+        if !world.declares_below(&tld) {
+            return Arc::new(Facts::unknown(tld));
+        }
+        // The facts an answer reads: each name from the question's name up
+        // to the apex, and the wildcard below each.
+        let mut facts = BTreeMap::new();
+        let mut name = qname;
+        loop {
+            facts.insert(name.clone(), world.fact(&tld, &name));
+            if let Ok(wildcard) = name.prepend_label("*") {
+                let wildcard = LowerName::new(&wildcard);
+                facts.insert(wildcard.clone(), world.fact(&tld, &wildcard));
+            }
+            if name == tld {
+                break;
+            }
+            name = name.base_name();
+        }
+        Arc::new(Facts {
+            soa: local_zone(&Name::from(tld.clone())).0,
+            apex: tld,
+            revision: Revision(world.revision),
+            facts,
+        })
+    }
+}
+
+/// A local zone that gives way to the declared zones when a declared name
+/// uses its apex: its views then know nothing, so the resolver asks the
+/// next local zone, the declared ones.
+struct GivesWay {
+    zone: Arc<dyn ZoneData>,
+    declared: Declared,
+}
+
+impl ZoneData for GivesWay {
+    fn apex(&self) -> &LowerName {
+        self.zone.apex()
+    }
+
+    fn view(&self, question: &Query) -> Arc<dyn View + Send + Sync> {
+        if self.declared.declares_below(self.zone.apex()) {
+            return Arc::new(Facts::unknown(self.zone.apex().clone()));
+        }
+        self.zone.view(question)
+    }
+}
+
+/// The facts of a declared zone that one question reads, at one revision.
+/// Every other name is unknown.
+struct Facts {
+    apex: LowerName,
+    soa: RecordSet,
+    revision: Revision,
+    facts: BTreeMap<LowerName, Fact<Node>>,
+}
+
+impl Facts {
+    /// A view of the zone at `apex` that knows nothing.
+    fn unknown(apex: LowerName) -> Facts {
+        Facts {
+            soa: local_zone(&Name::from(apex.clone())).0,
+            apex,
+            revision: Revision(0),
+            facts: BTreeMap::new(),
+        }
+    }
+}
+
+impl View for Facts {
+    fn apex(&self) -> &LowerName {
+        &self.apex
+    }
+
+    fn revision(&self) -> Revision {
+        self.revision
+    }
+
+    fn soa(&self) -> &RecordSet {
+        &self.soa
+    }
+
+    fn node(&self, name: &LowerName) -> Fact<&Node> {
+        match self.facts.get(name) {
+            Some(Fact::Present(node)) => Fact::Present(node),
+            Some(Fact::Absent) => Fact::Absent,
+            Some(Fact::Unknown) | None => Fact::Unknown,
+        }
+    }
+
+    /// Declared zones are unsigned.
+    fn denial(&self, _name: &LowerName, _kind: Denied) -> Fact<Vec<RecordSet>> {
+        Fact::Present(Vec::new())
     }
 }
 
@@ -713,7 +819,7 @@ pub(super) struct Installation<'a> {
     pub(super) router: &'a Router<Box<dyn Interface>>,
     pub(super) lans: &'a BTreeMap<String, LanSeg>,
     pub(super) admission: Admission,
-    pub(super) handshake: Duration,
+    pub(super) limits: Limits,
 }
 
 impl Installation<'_> {
@@ -862,6 +968,31 @@ impl Installation<'_> {
                 v6: Some(a),
             },
         })
+    }
+
+    /// Makes the machine at the gateway address `addr`, with `host`'s
+    /// services and programs. Its address, names and LAN are the
+    /// gateway's, whatever `host` says. A gateway is not one of the hosts'
+    /// machines, which the network classifies apart from it, so it is not
+    /// recorded in the world. `attach` wires its link into the network.
+    /// Returns its TCP endpoint.
+    pub(super) fn gateway(
+        &self,
+        addr: IpAddr,
+        host: &Host,
+        attach: impl FnOnce(Box<dyn Interface>) -> Result<(), String>,
+    ) -> Result<tcp::Endpoint, String> {
+        let mut machine = Machine::stage(self, addr, &host.label, None);
+        let ports = machine.machine.prepare(host)?;
+        if let Some(side) = machine.route.take() {
+            attach(self.wire(side, host))?;
+        }
+        if let Some(start) = machine.start.take() {
+            start();
+        }
+        machine.machine.add(ports);
+        machine.machine.run(&host.programs);
+        Ok(machine.machine.tcp.clone())
     }
 }
 
@@ -1099,7 +1230,7 @@ pub(super) struct Machine {
     ports: Mutex<HashMap<u16, Arc<Port>>>,
     udp_ports: Mutex<HashSet<u16>>,
     admission: Admission,
-    handshake: Duration,
+    limits: Limits,
 }
 
 impl Machine {
@@ -1130,7 +1261,7 @@ impl Machine {
             ports: Mutex::new(HashMap::new()),
             udp_ports: Mutex::new(HashSet::new()),
             admission: installation.admission.clone(),
-            handshake: installation.handshake,
+            limits: installation.limits,
         });
         PreparedMachine {
             machine,
@@ -1352,6 +1483,7 @@ impl Machine {
                 tcp: self.tcp.clone(),
                 udp: self.udp.clone(),
                 admission: self.admission.clone(),
+                limits: self.limits,
             };
             self.fcx.spawn(move |fcx| program.run(fcx, machine));
         }
@@ -1396,7 +1528,7 @@ async fn accept(
                 let info = ConnInfo::new(hooks.next_conn(), conn.local_addr(), conn.peer_addr())
                     .from_sandbox(sandbox);
                 let accepted = fcx.now();
-                let handshake = machine.handshake;
+                let handshake = machine.limits.handshake;
                 let port = port.clone();
                 fcx.spawn(move |fcx| async move {
                     let _ = fcx
@@ -1502,7 +1634,7 @@ fictionet::cfg_std! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::{MAX_HOSTS, Net};
+    use super::super::Net;
 
     #[test]
     fn tls_sharing_uses_the_first_installed_accept() {
@@ -1551,30 +1683,6 @@ mod tests {
             },
         ))
         .unwrap();
-    }
-
-    #[test]
-    fn names_without_a_host_are_remembered_up_to_a_limit() {
-        let mut w = World::new(MAX_HOSTS);
-        assert_eq!(w.max_unknown, 100_000);
-        w.max_unknown = 3;
-        for i in 0..10 {
-            w.remember(&format!("n{i}.test"), Known::NoHost);
-        }
-        assert_eq!((w.names.len(), w.unknown), (3, 3));
-        for i in 0..10 {
-            w.remember(
-                &format!("s{i}.test"),
-                Known::Host(Placed {
-                    v4: Some(Ipv4Addr::new(104, 18, 0, i + 1)),
-                    v6: None,
-                }),
-            );
-        }
-        assert_eq!((w.names.len(), w.resolved), (13, 10));
-        let mut w = World::new(MAX_HOSTS);
-        w.remember(&"\\255".repeat(64), Known::NoHost);
-        assert!(w.names.is_empty());
     }
 }
 }
