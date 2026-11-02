@@ -32,5 +32,9 @@ fictionet::cfg_std! {
 }
 
 fictionet::cfg_std! {
+    pub mod dns;
+}
+
+fictionet::cfg_std! {
     pub use response::{handler, async_handler, reply_handler, EchoSocket};
 }
