@@ -25,4 +25,6 @@ pub mod bench;
 
 pub mod web_fixture;
 
+pub mod dns;
+
 pub use response::{EchoSocket, async_handler, handler, reply_handler};
