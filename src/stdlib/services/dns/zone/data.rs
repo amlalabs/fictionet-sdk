@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use fictionet::stdlib::protocols::dns::op::Query;
-use fictionet::stdlib::protocols::dns::rr::{LowerName, RecordSet, RecordType};
+use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RecordSet, RecordType};
 
 use super::zone::Node;
 
@@ -137,6 +137,62 @@ impl<D: ZoneData> ZoneData for Transparent<D> {
             view: self.0.view(question),
             qname: LowerName::new(question.name()),
         })
+    }
+}
+
+/// Unbound's `redirect` local zone: every name below the apex answers with
+/// the apex's RRsets, owned by the name asked, as Unbound serves
+/// `localhost.` (`local_data_answer`). `foo.localhost. NS` gets
+/// `foo.localhost. NS localhost.`.
+pub struct Redirect<D: ZoneData>(pub D);
+
+impl<D: ZoneData> ZoneData for Redirect<D> {
+    fn apex(&self) -> &LowerName {
+        self.0.apex()
+    }
+
+    fn view(&self, question: &Query) -> Arc<dyn View + Send + Sync> {
+        let mut at_apex = question.clone();
+        at_apex.set_name(Name::from(self.0.apex().clone()));
+        Arc::new(RedirectView(self.0.view(&at_apex)))
+    }
+}
+
+/// A view whose names below the apex read as the apex.
+struct RedirectView(Arc<dyn View + Send + Sync>);
+
+impl RedirectView {
+    /// The name whose facts stand for `name`: the apex for every name
+    /// below it.
+    fn standing_for<'a>(&'a self, name: &'a LowerName) -> &'a LowerName {
+        let apex = self.0.apex();
+        if apex.zone_of(name) { apex } else { name }
+    }
+}
+
+impl View for RedirectView {
+    fn apex(&self) -> &LowerName {
+        self.0.apex()
+    }
+
+    fn revision(&self) -> Revision {
+        self.0.revision()
+    }
+
+    fn soa(&self) -> &RecordSet {
+        self.0.soa()
+    }
+
+    fn node(&self, name: &LowerName) -> Fact<&Node> {
+        self.0.node(self.standing_for(name))
+    }
+
+    fn denial(&self, name: &LowerName, kind: Denied) -> Fact<Vec<RecordSet>> {
+        self.0.denial(self.standing_for(name), kind)
+    }
+
+    fn sign(&self, set: &RecordSet) -> Option<RecordSet> {
+        self.0.sign(set)
     }
 }
 

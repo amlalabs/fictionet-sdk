@@ -302,6 +302,16 @@ fn every_zone_rule_is_checked() {
         }
     );
     assert_eq!(
+        fail(builder("example.").rrset(rrset(
+            "d.example.",
+            60,
+            vec![dname(&name("one.test.")), dname(&name("two.test."))]
+        ))),
+        ZoneError::TwoDnames {
+            owner: lower("d.example.")
+        }
+    );
+    assert_eq!(
         fail(
             builder("example.")
                 .rrset(rrset("sub.example.", 60, vec![ns("ns.elsewhere.test.")]))
@@ -1730,19 +1740,34 @@ fn transparent_leaves_empty_non_terminals_unknown() {
 #[test]
 fn localhost_points_every_name_at_loopback() {
     let zone = special::localhost();
+    let ask = |qname: &str, qtype| ask(&*view_of(&zone, qname, qtype), qname, qtype);
     assert_eq!(
-        addresses(&ask(&zone, "localhost.", RecordType::A).answers),
+        addresses(&ask("localhost.", RecordType::A).answers),
         vec!["127.0.0.1"]
     );
     assert_eq!(
-        addresses(&ask(&zone, "localhost.", RecordType::AAAA).answers),
+        addresses(&ask("localhost.", RecordType::AAAA).answers),
         vec!["::1"]
     );
-    let reply = ask(&zone, "anything.below.localhost.", RecordType::A);
+    let reply = ask("anything.below.localhost.", RecordType::A);
     assert_eq!(addresses(&reply.answers), vec!["127.0.0.1"]);
     // The apex is its own name server (`localhost. NS localhost.`).
-    let reply = ask(&zone, "localhost.", RecordType::NS);
+    let reply = ask("localhost.", RecordType::NS);
     assert_eq!(reply.answers[0].data, ns("localhost."));
+    // A name below answers with the apex's RRsets, as Unbound's redirect
+    // zone does, owned by the name asked.
+    for qtype in [RecordType::NS, RecordType::SOA] {
+        let reply = ask("foo.localhost.", qtype);
+        assert_eq!(rows(&reply.answers), vec![row("foo.localhost.", qtype)]);
+        assert!(reply.metadata.authoritative);
+    }
+    let reply = ask("foo.localhost.", RecordType::MX);
+    assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+    assert!(reply.answers.is_empty());
+    assert_eq!(
+        rows(&reply.authorities),
+        vec![row("localhost.", RecordType::SOA)]
+    );
 }
 
 #[test]

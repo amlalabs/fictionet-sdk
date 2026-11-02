@@ -124,6 +124,12 @@ pub enum ZoneError {
     /// A CNAME at the apex, where the SOA and NS RRsets must be
     /// (RFC 1912 §2.4).
     CnameAtApex,
+    /// More than one DNAME record at one owner. DNAME is a singleton
+    /// type (RFC 6672 §2.4).
+    TwoDnames {
+        /// The DNAME's owner.
+        owner: LowerName,
+    },
     /// Data or a delegation below a DNAME's owner (RFC 6672 §2.4).
     DataBelowDname {
         /// The owner below the DNAME.
@@ -185,6 +191,7 @@ impl fmt::Display for ZoneError {
                 write!(f, "the CNAME at {owner} is not alone")
             }
             ZoneError::CnameAtApex => f.write_str("a CNAME is at the apex"),
+            ZoneError::TwoDnames { owner } => write!(f, "{owner} has more than one DNAME"),
             ZoneError::DataBelowDname { owner } => write!(f, "{owner} is below a DNAME"),
             ZoneError::DataBelowCut { owner, cut } => {
                 write!(f, "{owner} is below the zone cut at {cut}")
@@ -537,13 +544,22 @@ impl Parts {
             }
         }
 
-        // Below a DNAME (RFC 6672 §2.4).
+        // One DNAME at an owner, and nothing below it (RFC 6672 §2.4).
         let dnames: BTreeSet<&LowerName> = self
             .sets
             .keys()
             .filter(|(_, rtype)| *rtype == RecordType::DNAME)
             .map(|(owner, _)| owner)
             .collect();
+        let two = self
+            .sets
+            .iter()
+            .find(|((_, rtype), set)| *rtype == RecordType::DNAME && set.records_count() > 1);
+        if let Some(((owner, _), _)) = two {
+            return Err(ZoneError::TwoDnames {
+                owner: owner.clone(),
+            });
+        }
         let below_dname = |name: &LowerName| {
             dnames
                 .iter()

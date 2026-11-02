@@ -11,6 +11,7 @@
 //! | --- | --- |
 //! | [`Zone`] | Everything: a complete zone, built with [`Zone::builder`] or read with [`Zone::from_master`]. Nothing is unknown. |
 //! | [`Lazy`] | The names a [`Provider`] gives when they are first asked. What the provider does not know stays unknown. |
+//! | [`Redirect`] | The apex of the zone it wraps, for every name below it too. |
 //! | [`Transparent`] | The names with RRsets in the zone it wraps. Every other name is unknown, so a resolver goes on to iterate. |
 //! | [`special`] | The zones a resolver serves itself: `localhost`, the RFC 6303 reverse zones, `home.arpa`, `resolver.arpa`, `service.arpa`, `onion`, `test`, and `invalid`. |
 //!
@@ -45,7 +46,7 @@ pub use answer::{Answered, AnyResponse, answer};
 pub use chain::{ChainProblem, check_chain};
 pub use cover::cover;
 pub(crate) use cover::negative_ttl;
-pub use data::{Denied, Fact, Provider, Revision, Transparent, View, ZoneData};
+pub use data::{Denied, Fact, Provider, Redirect, Revision, Transparent, View, ZoneData};
 pub use lazy::Lazy;
 pub use master::MasterError;
 pub use signed::{Denial, Signed};
