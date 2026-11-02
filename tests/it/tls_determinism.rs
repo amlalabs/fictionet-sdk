@@ -490,7 +490,7 @@ fn rsa_signature_schemes_and_key_encodings() {
 
 #[test]
 fn ecdsa_sec1_keys_match_pkcs8_and_sign_without_entropy() {
-    use rsa::pkcs8::DecodePrivateKey;
+    use p256::pkcs8::DecodePrivateKey;
     let p256 = p256::SecretKey::from_pkcs8_der(P256.key)
         .unwrap()
         .to_sec1_der()
