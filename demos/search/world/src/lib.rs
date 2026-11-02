@@ -24,7 +24,7 @@ pub mod route;
 mod tls;
 
 use std::collections::{HashMap, HashSet};
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
 
@@ -35,7 +35,8 @@ use fictionet::stdlib::services::dns::Event;
 use fictionet::stdlib::services::dns::resolver::Config;
 use fictionet::stdlib::services::tls::ServerConfig;
 use fictionet::stdlib::web;
-use fictionet::stdlib::world::net::dns::internet::{self, Egress, Location, Mirror};
+use fictionet::stdlib::world::net::dns::encrypted::Fronts;
+use fictionet::stdlib::world::net::dns::internet::{self, Location, Mirror, PUBLIC_RESOLVERS};
 use fictionet::stdlib::world::net::dns::{Only, PerSession, Recursive};
 use fictionet::stdlib::world::net::{Host, Net, NetHandle};
 use fictionet::sync::Mutex;
@@ -66,14 +67,15 @@ pub use tls::Ca;
 /// `forwarded` host given for that name, such as the model gateway, or a
 /// site whose pages come from [`Pages`]. So the guest connects to the
 /// address the real DNS gave, and the world changes the machine there,
-/// never the DNS. `egress` is the host's public address, when known,
-/// which the public resolvers' whoami names answer with.
+/// never the DNS. `location` is where the host is ([`Pages::location`]),
+/// with its public address, when known, which the public resolvers'
+/// whoami names answer with.
 pub fn net(
     fcx: &Cx,
     ca: Arc<Ca>,
     pages: Arc<Pages>,
     start: SystemTime,
-    egress: Option<Egress>,
+    location: Location,
     forwarded: impl IntoIterator<Item = (Name, Host)>,
 ) -> Net {
     let mut forwarded: HashMap<LowerName, Host> = forwarded
@@ -88,12 +90,12 @@ pub fn net(
     );
     let namespace = pages.namespace().clone();
     let clock = namespace.current().clock;
-    let location = Location::san_francisco_bay_area(egress);
     let net = Net::new().ipv4_only().drop_unrouted();
     let handle = net.handle();
 
     let outbound = Outbound::new(pages.clone(), forwarded.keys().cloned());
     let source = SessionSource::new(pages.clone(), forwarded.keys().cloned());
+    let resolver_ca = ca.clone();
     let sites = Arc::new(Sites {
         handle: handle.clone(),
         outbound: outbound.clone(),
@@ -108,10 +110,25 @@ pub fn net(
         refusing: Mutex::default(),
         addresses: PerSession::new(),
     });
-    let mirror = Mirror::new(Only::new(outbound.policy(), source), handle, &location)
+    let mut mirror = Mirror::new(Only::new(outbound.policy(), source), handle, &location)
         .namespace(&namespace)
         .observe(outbound.observer())
         .observe(move |_request, _client, reply| sites.place(reply));
+    // Each public resolver's DNS over HTTPS names, such as
+    // `cloudflare-dns.com`, have addresses of their own, where the mirror
+    // places a front that puts queries to the resolver's primary address.
+    let doh: Arc<Mutex<HashMap<&'static str, Fronts>>> = Arc::default();
+    for resolver in &PUBLIC_RESOLVERS {
+        for name in resolver.doh {
+            let doh = doh.clone();
+            let service = resolver.service;
+            let name = Name::from_ascii(name).expect("a public resolver's name is valid");
+            mirror = mirror.front(name, move |host| match doh.lock().get(service) {
+                Some(fronts) => fronts.doh(host),
+                None => host,
+            });
+        }
+    }
 
     let observe = {
         let (fcx, pages) = (fcx.clone(), pages.clone());
@@ -134,12 +151,33 @@ pub fn net(
     ))
     .hosts(internet::public_resolvers(
         |resolver, host| {
-            host.program(
-                resolver
-                    .recursive(&location, clock)
-                    .namespace(&namespace)
-                    .on_event(observe.clone()),
-            )
+            let recursive = resolver
+                .recursive(&location, clock)
+                .namespace(&namespace)
+                .on_event(observe.clone());
+            let (ca, served) = (resolver_ca.clone(), *resolver);
+            let config = OnceLock::new();
+            let tls = move |fcx: &Cx| {
+                config
+                    .get_or_init(|| {
+                        ca.resolver_config(fcx, &served)
+                            .expect("a certificate for a public resolver")
+                    })
+                    .clone()
+            };
+            let fronts =
+                Fronts::new(recursive.handle(), tls)
+                    .names(resolver.doh.iter().map(|name| {
+                        Name::from_ascii(name).expect("a public resolver's name is valid")
+                    }))
+                    .date(start);
+            // The primary address comes first, and its fronts serve the
+            // resolver's DNS over HTTPS names elsewhere.
+            let primary = IpAddr::V4(resolver.addresses[0].v4);
+            doh.lock()
+                .entry(resolver.service)
+                .or_insert_with(|| fronts.clone().resolver_at(primary));
+            fronts.doh(fronts.dot(host.program(recursive)))
         },
         &location,
     ))
@@ -352,12 +390,12 @@ impl Sites {
 }
 
 /// A world kept in memory: its CA, its pages, the run's start on the host
-/// clock, and the host's public address when it is known.
+/// clock, and where the host is on the internet.
 pub struct World {
     pub ca: Arc<Ca>,
     pub pages: Arc<Pages>,
     pub start: SystemTime,
-    pub egress: Option<Egress>,
+    pub location: Location,
 }
 
 impl World {
@@ -368,7 +406,7 @@ impl World {
             self.ca.clone(),
             self.pages.clone(),
             self.start,
-            self.egress,
+            self.location.clone(),
             forwarded,
         )
     }

@@ -34,24 +34,32 @@
 //! the servers themselves, asked from the San Francisco Bay Area.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::future::Future;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use fictionet::Cx;
 use fictionet::stdlib::network::route::Prefix;
-use fictionet::stdlib::protocols::dns::Request;
-use fictionet::stdlib::protocols::dns::op::{Message, ResponseCode};
+use fictionet::stdlib::protocols::dns::dnssec::rdata::DNSSECRData;
+use fictionet::stdlib::protocols::dns::op::{
+    Edns, Message, MessageType, OpCode, Query, ResponseCode,
+};
 use fictionet::stdlib::protocols::dns::rr::rdata::TXT;
 use fictionet::stdlib::protocols::dns::rr::{
-    LowerName, Name, RData, Record, RecordSet, RecordType,
+    DNSClass, LowerName, Name, RData, Record, RecordSet, RecordType,
 };
+use fictionet::stdlib::protocols::dns::{Nsid, Request};
 use fictionet::stdlib::services::dns::authority::{
-    Authority, ChaosAnswer, Identity, Known, Relay, ServerConfig, Step, chaos,
+    Ask, Authority, ChaosAnswer, Identity, Known, Observed, Relay, ServerConfig, Step, chaos,
 };
 use fictionet::stdlib::services::dns::resolver::Config;
 use fictionet::stdlib::services::dns::zone::{AnyResponse, Zone, ZoneError, special};
 use fictionet::stdlib::services::dns::{Client, Generation, WallClock};
+use fictionet::stdlib::services::serve::Transport;
 use fictionet::sync::Mutex;
+use fictionet::time::Instant;
 
 pub use fictionet::stdlib::services::dns::resolver::root_hints;
 
@@ -966,6 +974,236 @@ impl Location {
             egress,
         }
     }
+
+    /// The location of the host that `source` asks from, measured there,
+    /// so what the servers say about themselves agrees with the host's
+    /// `egress` wherever the host is.
+    ///
+    /// Each root letter, `gtld-servers.net` server, and public resolver is
+    /// asked about itself as an agent with `dig` asks it: `id.server`,
+    /// `hostname.bind`, `version.bind`, `version.server`, and
+    /// `authors.bind` in the CHAOS class, each with an NSID request
+    /// (RFC 5001), and `invalid.` for what it gives a name it does not
+    /// know. Its shortest exchange is its round trip. Each public resolver
+    /// is also asked `whoami.akamai.net` A, which Akamai's servers answer
+    /// with the address the question reached them from: the resolver's
+    /// egress. A server that answers nothing within `wait` is left out,
+    /// and [`site`](Self::site) and [`resolver`](Self::resolver) give it
+    /// no identity. Any other authoritative server is as far as the median
+    /// of the measured ones, or no farther than the host when none
+    /// answered.
+    pub async fn measured(
+        fcx: &Cx,
+        source: &dyn Source,
+        egress: Option<Egress>,
+        wait: Duration,
+    ) -> Location {
+        let deadline = fcx.now() + wait;
+        let servers: Vec<IpAddr> = ROOT_LETTERS
+            .iter()
+            .map(|letter| &letter.server)
+            .chain(&GTLD_SERVERS)
+            .map(|server| IpAddr::V4(server.v4))
+            .collect();
+        let resolvers: Vec<IpAddr> = PUBLIC_RESOLVERS
+            .iter()
+            .map(|resolver| IpAddr::V4(resolver.addresses[0].v4))
+            .collect();
+        let probes = servers
+            .iter()
+            .chain(&resolvers)
+            .map(|server| Box::pin(probe(fcx, source, *server, deadline)) as Probe<'_, _>);
+        let sites: Vec<Option<Site>> = join_all(probes.collect()).await;
+        let (server_sites, resolver_sites) = sites.split_at(servers.len());
+        let whoami = resolvers.iter().map(|resolver| {
+            Box::pin(resolver_egress(fcx, source, *resolver, deadline)) as Probe<'_, _>
+        });
+        let egresses: Vec<Option<IpAddr>> = join_all(whoami.collect()).await;
+
+        let servers: BTreeMap<IpAddr, Site> = servers
+            .into_iter()
+            .zip(server_sites.iter().cloned())
+            .filter_map(|(server, site)| Some((server, site?)))
+            .collect();
+        let mut rtts: Vec<Duration> = servers.values().map(|site| site.rtt).collect();
+        rtts.sort();
+        let authority_rtt = rtts.get(rtts.len() / 2).copied().unwrap_or_default();
+        let resolvers = resolvers
+            .into_iter()
+            .zip(resolver_sites.iter().cloned())
+            .zip(egresses)
+            .filter_map(|((resolver, site), egress)| {
+                let site = site?;
+                let site = ResolverSite {
+                    rtt: site.rtt,
+                    identity: site.identity,
+                    egress: egress.unwrap_or(resolver),
+                };
+                Some((resolver, site))
+            })
+            .collect();
+        Location {
+            servers,
+            resolvers,
+            authority_rtt,
+            egress,
+        }
+    }
+}
+
+/// The CHAOS-class names [`Location::measured`] asks each server.
+fn identity_names() -> [LowerName; 5] {
+    [
+        chaos::id_server(),
+        chaos::hostname_bind(),
+        chaos::version_bind(),
+        chaos::version_server(),
+        chaos::authors_bind(),
+    ]
+}
+
+/// One query of `name`, `rtype`, and `class`, with an OPT record that asks
+/// for the NSID, and RD as given.
+fn probe_query(fcx: &Cx, name: &Name, rtype: RecordType, class: DNSClass, rd: bool) -> Vec<u8> {
+    let mut id = [0; 2];
+    fcx.fill_random(&mut id);
+    let mut message = Message::new(u16::from_be_bytes(id), MessageType::Query, OpCode::Query);
+    message.metadata.recursion_desired = rd;
+    let mut question = Query::query(name.clone(), rtype);
+    question.set_query_class(class);
+    message.add_query(question);
+    let mut edns = Edns::new();
+    edns.set_max_payload(1232);
+    edns.options_mut().insert(Nsid(Vec::new()).to_option());
+    message.set_edns(edns);
+    message
+        .to_vec()
+        .expect("a query with one question and an OPT record writes")
+}
+
+/// What `server` replies to `query` over UDP before `deadline`, and how
+/// long it took.
+async fn exchange(
+    fcx: &Cx,
+    source: &dyn Source,
+    server: IpAddr,
+    query: Vec<u8>,
+    deadline: Instant,
+) -> Option<(Duration, Message)> {
+    let ask = Ask {
+        server: SocketAddr::new(server, 53),
+        transport: Transport::Udp,
+        query,
+    };
+    let sent = fcx.now();
+    let observed = fcx.race(Some(deadline), source.ask(fcx, ask)).await.ok()?;
+    let took = fcx.now().since_start().saturating_sub(sent.since_start());
+    match observed {
+        Observed::Reply(bytes) => Some((took, Message::from_vec(&bytes).ok()?)),
+        Observed::Unreachable | Observed::Timeout => None,
+    }
+}
+
+/// How `server` looks from where `source` asks: its answers about itself
+/// and its round trip, or `None` when it answered nothing.
+async fn probe(fcx: &Cx, source: &dyn Source, server: IpAddr, deadline: Instant) -> Option<Site> {
+    let mut names: Vec<LowerName> = identity_names().into();
+    names.push(LowerName::new(
+        &Name::from_ascii("invalid.").expect("a valid name"),
+    ));
+    let asks = names.iter().map(|name| {
+        let query = probe_query(fcx, &Name::from(name), RecordType::TXT, DNSClass::CH, false);
+        Box::pin(exchange(fcx, source, server, query, deadline)) as Probe<'_, _>
+    });
+    let mut replies: Vec<Option<(Duration, Message)>> = join_all(asks.collect()).await;
+    let unlisted = replies
+        .pop()
+        .flatten()
+        .map_or(ResponseCode::Refused, |(_, reply)| {
+            reply.metadata.response_code
+        });
+    let rtt = replies.iter().flatten().map(|(took, _)| *took).min()?;
+    let mut identity = Identity {
+        unlisted,
+        ..Identity::none()
+    };
+    for (name, reply) in names.into_iter().zip(replies) {
+        let Some((_, reply)) = reply else {
+            continue;
+        };
+        if identity.nsid.is_none() {
+            identity.nsid = reply
+                .edns
+                .iter()
+                .flat_map(|edns| edns.options().as_ref().iter())
+                .find_map(|(_, option)| Nsid::from_option(option))
+                .map(|nsid| nsid.0);
+        }
+        let text = reply.answers.iter().find_map(|record| match &record.data {
+            RData::TXT(txt) => {
+                let text: Vec<u8> = txt
+                    .txt_data
+                    .iter()
+                    .flat_map(|s| s.iter().copied())
+                    .collect();
+                Some((record.ttl, text))
+            }
+            _ => None,
+        });
+        let answer = match text {
+            Some((ttl, text)) => {
+                identity.ttl = ttl;
+                ChaosAnswer::Txt(String::from_utf8_lossy(&text).into_owned())
+            }
+            None if reply.metadata.response_code == unlisted => continue,
+            None => ChaosAnswer::Rcode(reply.metadata.response_code),
+        };
+        identity.chaos.insert(name, answer);
+    }
+    Some(Site { rtt, identity })
+}
+
+/// The address the public resolver at `resolver` asks authorities from,
+/// as `whoami.akamai.net` A gives it.
+async fn resolver_egress(
+    fcx: &Cx,
+    source: &dyn Source,
+    resolver: IpAddr,
+    deadline: Instant,
+) -> Option<IpAddr> {
+    let name = Name::from_ascii("whoami.akamai.net.").expect("a valid name");
+    let query = probe_query(fcx, &name, RecordType::A, DNSClass::IN, true);
+    let (_, reply) = exchange(fcx, source, resolver, query, deadline).await?;
+    reply.answers.iter().find_map(address)
+}
+
+/// One of the questions [`Location::measured`] waits on together.
+type Probe<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Waits for every one of `futures` and gives their outputs in order.
+async fn join_all<T>(mut futures: Vec<Probe<'_, T>>) -> Vec<T> {
+    let mut outputs: Vec<Option<T>> = futures.iter().map(|_| None).collect();
+    std::future::poll_fn(|cx| {
+        let mut pending = false;
+        for (future, output) in futures.iter_mut().zip(outputs.iter_mut()) {
+            if output.is_none() {
+                match future.as_mut().poll(cx) {
+                    std::task::Poll::Ready(value) => *output = Some(value),
+                    std::task::Poll::Pending => pending = true,
+                }
+            }
+        }
+        if pending {
+            std::task::Poll::Pending
+        } else {
+            std::task::Poll::Ready(())
+        }
+    })
+    .await;
+    outputs
+        .into_iter()
+        .map(|output| output.expect("every future finished"))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1089,6 +1327,14 @@ type Front = dyn Fn(Host) -> Host + Send + Sync;
 /// still reaches the client as it was, and the address stays unreachable.
 /// The public resolvers' addresses get no relay either: a world runs the
 /// resolvers there.
+///
+/// The source asks every real server from one address, the location's
+/// [`egress`](Location::egress). A real server that echoes the address a
+/// question came from, as the whoami names of Akamai do, would see a
+/// public resolver's own egress instead
+/// ([`ResolverSite::egress`]), so a reply to a public resolver's question
+/// carries that address in place of the location's, in an unsigned A
+/// record when it is IPv4 and in a TXT string.
 #[derive(Clone)]
 pub struct Mirror {
     inner: Arc<Inner>,
@@ -1105,6 +1351,12 @@ struct Inner {
     fronts: Vec<(LowerName, Arc<Front>)>,
     named: Arc<PerSession<Named>>,
     placed: Arc<Mutex<Placed>>,
+    /// The address the source asks the real servers from, when it is
+    /// known.
+    egress: Option<Egress>,
+    /// The address each public resolver's questions leave from, by each
+    /// of the resolver's own addresses.
+    resolvers: HashMap<IpAddr, IpAddr>,
 }
 
 /// What relayed replies named this session.
@@ -1132,6 +1384,16 @@ impl Mirror {
     /// relays with `handle`, behind the round trip `at` gives other
     /// authorities.
     pub fn new(source: impl Source, handle: NetHandle, at: &Location) -> Mirror {
+        let resolvers = PUBLIC_RESOLVERS
+            .iter()
+            .flat_map(|resolver| {
+                let egress = at.resolver(IpAddr::V4(resolver.addresses[0].v4)).egress;
+                resolver
+                    .addresses
+                    .iter()
+                    .flat_map(move |a| [(IpAddr::V4(a.v4), egress), (IpAddr::V6(a.v6), egress)])
+            })
+            .collect();
         Mirror {
             inner: Arc::new(Inner {
                 source: Arc::new(source),
@@ -1143,6 +1405,8 @@ impl Mirror {
                 fronts: Vec::new(),
                 named: Arc::default(),
                 placed: Arc::default(),
+                egress: at.egress,
+                resolvers,
             }),
         }
     }
@@ -1353,16 +1617,79 @@ impl Authority for Mirrored {
         known: &dyn Known,
     ) -> Step {
         let step = Relay::new().respond(req, local, server, client, known);
-        if let Step::Verbatim(bytes) = &step
-            && let Ok(message) = Message::from_vec(bytes)
-        {
-            self.0.place(req, &message);
-            for observer in &self.0.observers {
-                observer(req, client, &message);
+        let Step::Verbatim(bytes) = step else {
+            return step;
+        };
+        let Ok(mut message) = Message::from_vec(&bytes) else {
+            return Step::Verbatim(bytes);
+        };
+        let bytes = match self.0.seen_by(client) {
+            Some((egress, seen)) if echo(&mut message, egress, seen) => {
+                message.to_vec().unwrap_or(bytes)
             }
+            _ => bytes,
+        };
+        self.0.place(req, &message);
+        for observer in &self.0.observers {
+            observer(req, client, &message);
         }
-        step
+        Step::Verbatim(bytes)
     }
+}
+
+impl Inner {
+    /// The address the source asks from and the one the real server would
+    /// see instead, when `client` is a public resolver: its questions
+    /// leave from its own egress, not from the source's.
+    fn seen_by(&self, client: &Client) -> Option<(Ipv4Addr, IpAddr)> {
+        let egress = self.egress?.0;
+        let seen = *self.resolvers.get(&client.peer.ip())?;
+        (seen != IpAddr::V4(egress)).then_some((egress, seen))
+    }
+}
+
+/// Puts `seen` in place of `egress` where `message`'s answer echoes the
+/// address a question came from, as `whoami.akamai.net` A or
+/// `whoami.ds.akahelp.net` TXT do: an A record holding `egress`, which
+/// takes `seen` when it is IPv4, and a TXT string that is `egress`. An
+/// RRset its RRSIGs cover is left as it is. Whether anything changed.
+fn echo(message: &mut Message, egress: Ipv4Addr, seen: IpAddr) -> bool {
+    let signed: Vec<(Name, RecordType)> = message
+        .answers
+        .iter()
+        .filter_map(|record| match &record.data {
+            RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) => {
+                Some((record.name.clone(), rrsig.input().type_covered))
+            }
+            _ => None,
+        })
+        .collect();
+    let text = egress.to_string();
+    let mut changed = false;
+    for record in &mut message.answers {
+        if signed.contains(&(record.name.clone(), record.record_type())) {
+            continue;
+        }
+        match (&mut record.data, seen) {
+            (RData::A(a), IpAddr::V4(seen)) if a.0 == egress => {
+                a.0 = seen;
+                changed = true;
+            }
+            (RData::TXT(txt), _) if txt.txt_data.iter().any(|s| **s == *text.as_bytes()) => {
+                let strings = txt.txt_data.iter().map(|s| {
+                    if **s == *text.as_bytes() {
+                        seen.to_string()
+                    } else {
+                        String::from_utf8_lossy(s).into_owned()
+                    }
+                });
+                *txt = TXT::new(strings.collect());
+                changed = true;
+            }
+            _ => {}
+        }
+    }
+    changed
 }
 
 // ---------------------------------------------------------------------------

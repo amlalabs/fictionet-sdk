@@ -1,5 +1,6 @@
 //! Issue host certificates using the world clock and its certificate authority.
 
+use fictionet::stdlib::world::net::dns::internet::PublicResolver;
 use fictionet::{Cx, stdlib::services::tls::ServerConfig};
 use std::{
     collections::HashMap,
@@ -72,6 +73,36 @@ impl Ca {
             day(earliest - time::Duration::days(1)),
             day(world_now + time::Duration::days(395)),
         ))
+    }
+
+    /// The chain of the DNS over TLS and HTTPS fronts of `resolver`: its
+    /// DNS over HTTPS names, and its addresses as IP SANs (RFC 5280
+    /// §4.2.1.6), so a client that connects to `1.1.1.1` checks the
+    /// address as it would a name.
+    pub fn resolver_config(
+        &self,
+        fcx: &Cx,
+        resolver: &PublicResolver,
+    ) -> fictionet::Result<Arc<ServerConfig>> {
+        let world_now = self.world_now(fcx);
+        let earliest = time::OffsetDateTime::from(self.earliest).min(world_now);
+        let names = resolver
+            .doh
+            .iter()
+            .map(|name| name.trim_end_matches('.').to_owned());
+        let addresses = resolver
+            .addresses
+            .iter()
+            .flat_map(|address| [address.v4.to_string(), address.v6.to_string()]);
+        let sans: Vec<String> = names.chain(addresses).collect();
+        let sans: Vec<&str> = sans.iter().map(String::as_str).collect();
+        let leaf = self.issuer.issue_since(
+            fcx,
+            &sans,
+            earliest.unix_timestamp(),
+            world_now.unix_timestamp(),
+        )?;
+        leaf.server_config(fcx, self.start)
     }
 
     /// A chain for `host` that fails verification the way the real host's
