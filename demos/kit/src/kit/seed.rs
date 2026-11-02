@@ -2,6 +2,7 @@
 use super::{Guest, Installation, Software};
 use fatfs::{FatType, FileSystem, FormatVolumeOptions, FsOptions};
 use fictionet::stdlib::codec::base64;
+use fictionet::stdlib::protocols::dns::dnssec::TrustAnchor;
 use std::collections::BTreeMap;
 use std::io::{Cursor, Write};
 
@@ -33,6 +34,36 @@ pub(super) fn trust_files() -> Vec<(&'static str, String)> {
                 .collect(),
         ),
     ]
+}
+
+/// The directory systemd-resolved reads trust anchors from when it starts
+/// (dnssec-trust-anchors.d(5)).
+const RESOLVED_ANCHORS: &str = "/etc/dnssec-trust-anchors.d";
+
+/// The files a guest's resolvers read a root trust anchor from, for a
+/// world that serves and signs a root zone of its own:
+/// systemd-resolved's positive anchor, which replaces its built-in root
+/// anchor; the dns-root-data copy that Unbound's packaging installs from;
+/// and BIND's `bind.keys`, which `delv` reads. A world adds each with
+/// [`Guest::file`](super::Guest::file), and a guest that installs Unbound
+/// adds [`unbound_root_anchor`] too. A cloud guest restarts
+/// systemd-resolved once the files are written, before it installs
+/// packages; a prepared image reads them when it boots.
+pub fn root_anchor_files(anchor: &TrustAnchor) -> [(&'static str, String); 3] {
+    [
+        (
+            "/etc/dnssec-trust-anchors.d/root.positive",
+            anchor.resolved_positive(),
+        ),
+        ("/usr/share/dns/root.key", anchor.root_key()),
+        ("/etc/bind/bind.keys", anchor.bind_keys()),
+    ]
+}
+
+/// Unbound's own root trust anchor file, which it reads and keeps up to
+/// date, for a guest that installs Unbound.
+pub fn unbound_root_anchor(anchor: &TrustAnchor) -> (&'static str, String) {
+    ("/var/lib/unbound/root.key", anchor.root_key())
 }
 
 /// The guest configuration and credentials for one seed.
@@ -201,6 +232,17 @@ fn cloud_data<P: Software>(p: &Provision<P>, installation: &Installation) -> Str
             assignments.join(" ")
         ),
         "systemctl daemon-reexec".into(),
+    ];
+    // systemd-resolved started before the files were written, and reads
+    // trust anchors only when it starts.
+    if installation
+        .files
+        .iter()
+        .any(|f| std::path::Path::new(&f.path).starts_with(RESOLVED_ANCHORS))
+    {
+        commands.push("systemctl try-restart systemd-resolved.service".into());
+    }
+    commands.extend([
         "apt-get update".into(),
         format!(
             "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates {}",
@@ -212,7 +254,7 @@ fn cloud_data<P: Software>(p: &Provision<P>, installation: &Installation) -> Str
                 .join(" ")
         ),
         "if systemctl is-active --quiet systemd-timesyncd.service; then systemctl stop systemd-timesyncd.service; fi".into(),
-    ];
+    ]);
     commands.extend(installation.steps.iter().cloned());
     // One shell stops provisioning on the first failed command.
     out.push_str(&format!(
@@ -220,4 +262,66 @@ fn cloud_data<P: Software>(p: &Provision<P>, installation: &Installation) -> Str
         quote(&commands.join("\n"))
     ));
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fictionet::stdlib::protocols::dns::dnssec::{Algorithm, KeyFlags, KeySet, ZoneKey};
+    use fictionet::stdlib::protocols::dns::rr::Name;
+    use fictionet::{Seed, SeededEntropy};
+    use std::sync::Arc;
+
+    fn anchor() -> TrustAnchor {
+        let entropy = SeededEntropy::new(Seed::from_u64(1));
+        let key = ZoneKey::generate(&entropy, Algorithm::Ed25519, KeyFlags::KSK);
+        KeySet {
+            keys: vec![Arc::new(key)],
+        }
+        .anchor(&Name::root())
+    }
+
+    fn user_data(guest: &Guest<Installation>) -> String {
+        super::user_data(&Provision {
+            guest,
+            authorized_key: "ssh-ed25519 key",
+            ca: None,
+        })
+    }
+
+    #[test]
+    fn a_root_anchor_reaches_every_resolver_and_restarts_resolved_before_apt() {
+        let anchor = anchor();
+        let mut guest = Guest::ubuntu("station", "analyst").packages(&["unbound"]);
+        for (path, content) in root_anchor_files(&anchor) {
+            guest = guest.file(path, 0o644, content);
+        }
+        let (path, content) = unbound_root_anchor(&anchor);
+        let data = user_data(&guest.file(path, 0o644, content));
+        let files = files(&data).unwrap();
+        let ds = anchor.resolved_positive();
+        assert!(ds.starts_with(". IN DS "));
+        assert_eq!(files["/etc/dnssec-trust-anchors.d/root.positive"], ds);
+        assert_eq!(files["/usr/share/dns/root.key"], ds);
+        assert_eq!(files["/var/lib/unbound/root.key"], ds);
+        assert_eq!(files["/etc/bind/bind.keys"], anchor.bind_keys());
+        let restart = data
+            .find("systemctl try-restart systemd-resolved.service")
+            .unwrap();
+        assert!(data.find("daemon-reexec").unwrap() < restart);
+        assert!(restart < data.find("apt-get update").unwrap());
+        assert_eq!(data.matches("systemd-resolved").count(), 1);
+    }
+
+    #[test]
+    fn a_guest_without_an_anchor_does_not_restart_resolved() {
+        let data = user_data(&Guest::ubuntu("station", "analyst"));
+        assert!(!data.contains("systemd-resolved"));
+        assert!(
+            !files(&data)
+                .unwrap()
+                .keys()
+                .any(|path| path.contains("dnssec"))
+        );
+    }
 }
