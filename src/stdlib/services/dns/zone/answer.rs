@@ -36,9 +36,13 @@ pub enum AnyResponse {
     /// whose keys the view does not hold, sends one RRset of the name
     /// instead.
     Hinfo,
-    /// One RRset of the name, as BIND's `minimal-any` does (RFC 8482 §4.1).
-    OneRrset,
-    /// Every RRset of the name, as servers did before RFC 8482.
+    /// One RRset of the name, as BIND's `minimal-any` does (RFC 8482 §4.1):
+    /// the RRset of this type, or the name's first RRset in type order when
+    /// it has none of this type.
+    OneRrset(RecordType),
+    /// Every RRset of the name, as servers did before RFC 8482, with the
+    /// NSEC RRset and the RRSIGs even without DO: such servers count ANY as
+    /// asking for them (RFC 4035 §3.2.1).
     All,
 }
 
@@ -79,7 +83,8 @@ pub enum AnyResponse {
 /// 7. With DO, every RRset brings its RRSIGs, and every negative and
 ///    wildcard answer brings the view's denial records for its case
 ///    (RFC 4035 §3.1.3). Without DO, RRSIG, NSEC, and NSEC3 records are
-///    left out unless the question asks for their type (RFC 4035 §3.2.1).
+///    left out unless the question asks for their type, or asks ANY of a
+///    server that answers with every RRset (RFC 4035 §3.2.1).
 ///
 /// The reply's header has the request's ID, opcode, RD, and CD, AA and
 /// the RCODE; its question is the request's. Owners in the answer section
@@ -463,21 +468,35 @@ impl<'v> Walk<'v> {
         };
 
         if self.qtype == RecordType::ANY {
+            // Without DO, only `All` sends the DNSSEC RRsets.
             let sets: Vec<&RecordSet> = sets
                 .iter()
                 .copied()
-                .filter(|set| self.dnssec_ok || !is_dnssec(set.record_type()))
+                .filter(|set| {
+                    self.dnssec_ok || self.any == AnyResponse::All || !is_dnssec(set.record_type())
+                })
                 .collect();
-            if sets.is_empty() {
+            let Some(first) = sets.first() else {
                 return self.nodata(name, encloser);
-            }
+            };
             let answer = match self.any {
-                AnyResponse::Hinfo => match self.hinfo(&owner, smallest_ttl(&sets)) {
-                    Some(hinfo) => vec![hinfo],
-                    None => vec![owned(sets[0], &owner)],
-                },
-                AnyResponse::OneRrset => vec![owned(sets[0], &owner)],
-                AnyResponse::All => sets.iter().map(|set| owned(set, &owner)).collect(),
+                AnyResponse::Hinfo => vec![
+                    self.hinfo(&owner, smallest_ttl(&sets))
+                        .unwrap_or_else(|| owned(first, &owner)),
+                ],
+                AnyResponse::OneRrset(rtype) => {
+                    let set = sets.iter().find(|set| set.record_type() == rtype);
+                    vec![owned(set.unwrap_or(first), &owner)]
+                }
+                AnyResponse::All => {
+                    let mut answer: Vec<RecordSet> =
+                        sets.iter().map(|set| owned(set, &owner)).collect();
+                    // With DO the RRSIGs go out inside their RRsets.
+                    if !self.dnssec_ok {
+                        answer.extend(rrsigs_of(&sets, &owner));
+                    }
+                    answer
+                }
             };
             return Ok(Out::Done(positive(answer, proof)));
         }
@@ -485,13 +504,10 @@ impl<'v> Walk<'v> {
         if self.qtype == RecordType::RRSIG {
             // RRSIGs travel inside the RRsets they cover, so an RRSIG
             // question gathers them.
-            let rrsigs: Vec<Record> = sets.iter().flat_map(|set| set.rrsigs()).cloned().collect();
-            if rrsigs.is_empty() {
-                return self.nodata(name, encloser);
-            }
-            let mut set = RecordSet::with_ttl(owner.clone(), RecordType::RRSIG, rrsigs[0].ttl);
-            set.set_records(rrsigs);
-            return Ok(Out::Done(positive(vec![owned(&set, &owner)], proof)));
+            return Ok(Out::Done(match rrsigs_of(sets, &owner) {
+                Some(set) => positive(vec![set], proof),
+                None => return self.nodata(name, encloser),
+            }));
         }
 
         if let Some(set) = sets.iter().find(|set| set.record_type() == self.qtype) {
@@ -611,6 +627,16 @@ fn owned(set: &RecordSet, owner: &Name) -> RecordSet {
     renamed.set_records(set.records_without_rrsigs().map(rename).collect());
     renamed.set_rrsigs(set.rrsigs().iter().map(rename).collect());
     renamed
+}
+
+/// The RRSIGs of `sets` as one RRSIG RRset owned by `owner`, or `None`
+/// when none of them is signed.
+fn rrsigs_of(sets: &[&RecordSet], owner: &Name) -> Option<RecordSet> {
+    let rrsigs: Vec<Record> = sets.iter().flat_map(|set| set.rrsigs()).cloned().collect();
+    let ttl = rrsigs.first()?.ttl;
+    let mut set = RecordSet::with_ttl(owner.clone(), RecordType::RRSIG, ttl);
+    set.set_records(rrsigs);
+    Some(owned(&set, owner))
 }
 
 /// The address RRsets of `target` among a cut's glue.
