@@ -13,16 +13,23 @@
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::net::Ipv4Addr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use fictionet::Cx;
-use fictionet::stdlib::protocols::dns::op::Message;
-use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RData, Record};
+use fictionet::stdlib::protocols::dns::op::{Message, Query};
+use fictionet::stdlib::protocols::dns::rr::rdata::A;
+use fictionet::stdlib::protocols::dns::rr::{
+    LowerName, Name, RData, Record, RecordSet, RecordType,
+};
 use fictionet::stdlib::protocols::dns::{Parsed, Request};
 use fictionet::stdlib::services::dns::Client;
 use fictionet::stdlib::services::dns::authority::{Ask, Observed};
+use fictionet::stdlib::services::dns::zone::{
+    Denied, Fact, Node, Revision, View, ZoneData, special,
+};
 use fictionet::stdlib::world::net::dns::internet::{Egress, Location};
 use fictionet::stdlib::world::net::dns::{PerSession, Source};
 use fictionet::sync::Mutex;
@@ -462,6 +469,112 @@ impl Source for Copied {
             }
             observed
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Copied hosts the capture has no address for
+
+/// The hosts a Copied session serves whose DNS capture gives them no IPv4
+/// address, as a local zone of the world's own resolver: a host that
+/// went away, or kept only IPv6 addresses, after its pages were copied,
+/// on a network with no IPv6. The resolver answers such a host from here,
+/// with the address of a machine `place` puts for it, so its copied pages
+/// can still be reached. Every other name, and every name in the other
+/// modes, is left to the real hierarchy.
+pub(crate) struct Uncaptured {
+    root: LowerName,
+    soa: RecordSet,
+    pages: Arc<Pages>,
+    place: Box<dyn Fn(&LowerName) -> Option<Ipv4Addr> + Send + Sync>,
+}
+
+impl Uncaptured {
+    /// The zone for the sessions of `pages`, with `place` putting a
+    /// machine for a host and giving its address.
+    pub(crate) fn new(
+        pages: Arc<Pages>,
+        place: impl Fn(&LowerName) -> Option<Ipv4Addr> + Send + Sync + 'static,
+    ) -> Uncaptured {
+        let root = Name::root();
+        Uncaptured {
+            soa: special::local_apex(&root, special::LOCAL_TTL).0,
+            root: LowerName::new(&root),
+            pages,
+            place: Box::new(place),
+        }
+    }
+
+    /// Whether the session now serves `name` from its copy while its
+    /// capture gives it no IPv4 address.
+    fn uncaptured(&self, name: &LowerName) -> bool {
+        matches!(self.pages.source(), Mode::Copied)
+            && self.pages.serves_host(&host(name))
+            && self
+                .pages
+                .copied_dns()
+                .is_some_and(|replay| !replay.resolves(name))
+    }
+}
+
+impl ZoneData for Uncaptured {
+    fn apex(&self) -> &LowerName {
+        &self.root
+    }
+
+    fn view(&self, question: &Query) -> Arc<dyn View + Send + Sync> {
+        let name = LowerName::new(question.name());
+        let address = self
+            .uncaptured(&name)
+            .then(|| (self.place)(&name))
+            .flatten();
+        let Some(address) = address else {
+            return Arc::new(Unknown {
+                apex: self.root.clone(),
+                soa: self.soa.clone(),
+            });
+        };
+        // A zone of the host's own, holding its address.
+        let owner = Name::from(name);
+        let mut a = RecordSet::with_ttl(owner.clone(), RecordType::A, special::LOCAL_TTL);
+        a.set_records(vec![Record::from_rdata(
+            owner.clone(),
+            special::LOCAL_TTL,
+            RData::A(A(address)),
+        )]);
+        let zone = special::local_zone(&owner, special::LOCAL_TTL)
+            .rrset(a)
+            .build()
+            .expect("a zone of one host's address is well formed");
+        Arc::new(zone)
+    }
+}
+
+/// A view that knows nothing, so the resolver asks the real hierarchy.
+struct Unknown {
+    apex: LowerName,
+    soa: RecordSet,
+}
+
+impl View for Unknown {
+    fn apex(&self) -> &LowerName {
+        &self.apex
+    }
+
+    fn revision(&self) -> Revision {
+        Revision(0)
+    }
+
+    fn soa(&self) -> &RecordSet {
+        &self.soa
+    }
+
+    fn node(&self, _name: &LowerName) -> Fact<&Node> {
+        Fact::Unknown
+    }
+
+    fn denial(&self, _name: &LowerName, _kind: Denied) -> Fact<Vec<RecordSet>> {
+        Fact::Unknown
     }
 }
 

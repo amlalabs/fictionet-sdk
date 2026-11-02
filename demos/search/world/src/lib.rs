@@ -44,7 +44,7 @@ use fictionet::sync::Mutex;
 use observation::SearchObs;
 use pages::Pages;
 
-use dns::{Outbound, SessionSource};
+use dns::{Outbound, SessionSource, Uncaptured};
 
 pub use dns::admit;
 pub use tls::Ca;
@@ -59,8 +59,9 @@ pub use tls::Ca;
 /// (`dns::Outbound`). The
 /// public resolvers run at their real addresses, and the gateway runs a
 /// recursive resolver like Unbound with the root hints, holding no data of
-/// its own. Every DNS reply either kind of resolver gives a client is
-/// reported as [`SearchObs::Resolved`].
+/// its own but the addresses of the Copied hosts their capture gives none
+/// (`dns::Uncaptured`). Every DNS reply either kind of resolver gives a
+/// client is reported as [`SearchObs::Resolved`].
 ///
 /// Each A record a relayed reply gives for a name the session lets out
 /// gets a machine at that address, before the reply leaves: the
@@ -108,8 +109,15 @@ pub fn net(
         built: Mutex::default(),
         placed: Mutex::default(),
         refusing: Mutex::default(),
+        uncaptured: Mutex::default(),
         addresses: PerSession::new(),
     });
+    let uncaptured = {
+        let sites = sites.clone();
+        Arc::new(Uncaptured::new(pages.clone(), move |name| {
+            sites.place_uncaptured(name)
+        }))
+    };
     let mut mirror = Mirror::new(Only::new(outbound.policy(), source), handle, &location)
         .namespace(&namespace)
         .observe(outbound.observer())
@@ -184,9 +192,13 @@ pub fn net(
     .gateway(move |host, _declared| {
         // No declared data: every site the world places declares its
         // name, and every name it serves is real, so the real
-        // hierarchy answers for all of them.
+        // hierarchy answers for all of them. Only a Copied host its
+        // capture gives no address answers here.
+        let config = Config::unbound()
+            .hints(&internet::root_hints())
+            .local(uncaptured.clone());
         host.program(
-            Recursive::new(Config::unbound().hints(&internet::root_hints()), clock)
+            Recursive::new(config, clock)
                 .namespace(&gateway_namespace)
                 .on_event(gateway_observe.clone()),
         )
@@ -224,6 +236,9 @@ struct Sites {
     /// Addresses given a machine with no services, for names a session
     /// resolves but does not serve, so connections to them are refused.
     refusing: Mutex<HashSet<Ipv4Addr>>,
+    /// The address of each Copied host its capture gives none, which the
+    /// world's own resolver answers with (`dns::Uncaptured`).
+    uncaptured: Mutex<HashMap<LowerName, Ipv4Addr>>,
     /// The session's relayed IPv4 addresses of each name, its own or those
     /// at the end of its CNAME chain.
     addresses: PerSession<HashMap<LowerName, HashSet<Ipv4Addr>>>,
@@ -299,6 +314,19 @@ impl Sites {
         for (name, addr) in placing {
             let _ = self.handle.add_host(self.host(&name).at(addr));
         }
+    }
+
+    /// The address of the machine for `name`, a Copied host its capture
+    /// gives no address: one the network picks, the first time it is
+    /// asked. `None` when the network cannot place it.
+    fn place_uncaptured(&self, name: &LowerName) -> Option<Ipv4Addr> {
+        let mut uncaptured = self.uncaptured.lock();
+        if let Some(address) = uncaptured.get(name) {
+            return Some(*address);
+        }
+        let address = self.handle.add_host(self.host(name)).ok()?.v4?;
+        uncaptured.insert(name.clone(), address);
+        Some(address)
     }
 
     /// Whether the session serves pages for `name`: a forwarded host's
