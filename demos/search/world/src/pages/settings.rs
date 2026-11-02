@@ -1,6 +1,8 @@
 //! Page sources and world controls.
 
 use super::*;
+use fictionet::stdlib::services::dns::WallClock;
+use fictionet::stdlib::world::net::dns::Namespace;
 
 /// A change to the world. Each carries the settings revision it expects.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,7 +59,25 @@ impl Pages {
             depth: None,
             editor: None,
             fetcher: Default::default(),
+            // Every session advances it with its own clock before the
+            // world's DNS answers, so this first clock is never read.
+            namespace: Namespace::new(WallClock {
+                start: std::time::UNIX_EPOCH,
+            }),
+            live_dns: Default::default(),
         }
+    }
+
+    /// The session the world's DNS answers for.
+    pub(crate) fn namespace(&self) -> &Namespace {
+        &self.namespace
+    }
+
+    /// The internet's DNS servers, asked from the host.
+    pub(crate) fn live_dns(&self) -> Arc<fictionet_host::dns::Live> {
+        self.live_dns
+            .get_or_init(|| Arc::new(fictionet_host::dns::Live::new()))
+            .clone()
     }
 
     /// Edits pages with `model` in Edited mode.
@@ -117,10 +137,12 @@ impl Pages {
     }
 
     /// Starts a session that answers from `source`, in the world `fcx`:
-    /// nothing a previous session copied, allowed, fetched or edited
-    /// carries over. A scenario stays, with the account already written
-    /// for it. `copied_lag` is measured once before boot so the workstation
-    /// and the copied pages use the same clock.
+    /// nothing a previous session copied, allowed, fetched, edited or
+    /// resolved carries over. A scenario stays, with the account already
+    /// written for it. `copied_lag` is measured once before boot so the
+    /// workstation, the copied pages, and the world's DNS use the same
+    /// clock: the world's resolvers check signatures against it, so the
+    /// captured signatures of a Copied session are inside their windows.
     pub fn start_session(
         &self,
         fcx: &Cx,
@@ -143,6 +165,13 @@ impl Pages {
         settings.lag = Some(copied_lag);
         settings.source = source;
         settings.revision += 1;
+        // The DNS session starts after the mode is set, so the world's DNS
+        // sources choose for the new mode when they see it.
+        let lag = copied_lag
+            .filter(|_| source == Source::Copied)
+            .unwrap_or_default();
+        let start = std::time::SystemTime::now() - fcx.now().since_start() - lag;
+        self.namespace.advance(WallClock { start });
         Ok(())
     }
 

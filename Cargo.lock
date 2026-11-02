@@ -5680,6 +5680,7 @@ dependencies = [
  "bytes",
  "fictionet",
  "fictionet-extras",
+ "fictionet-host",
  "form_urlencoded",
  "futures-util",
  "http",

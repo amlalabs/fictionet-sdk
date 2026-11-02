@@ -6,7 +6,7 @@ use fictionet_search_demo::{network, page};
 use fictionet_demo::kit;
 use std::{path::PathBuf, sync::Arc, time::Instant};
 use web_world::{
-    Addresses, Ca, World,
+    Ca, World,
     pages::{Pages, Seed, Source},
 };
 
@@ -125,11 +125,10 @@ async fn main() -> Result {
         let console_slot = Arc::new(std::sync::Mutex::new(None));
         let console = console_slot.clone();
         let cx_slot = Arc::new(std::sync::Mutex::new(None));
-        let (world_page, world_pages, world_token, world_seed, world_roots, world_cx) = (
+        let (world_page, world_pages, world_token, world_roots, world_cx) = (
             page.clone(),
             pages.clone(),
             claude_token.clone(),
-            seed.clone(),
             roots.clone(),
             cx_slot.clone(),
         );
@@ -150,11 +149,12 @@ async fn main() -> Result {
                     .map_err(|error| fictionet::Error::msg(format!("{error:?}")))?;
                 world_page.attach_world(&cx, world_pages.clone());
                 *world_cx.lock().unwrap() = Some(cx.clone());
+                let egress = world_pages.egress(&cx).await?;
                 let web = World {
                     ca: Arc::new(Ca::new(&cx, &world_roots, earliest, start)?),
-                    addresses: Arc::new(Addresses::new(world_seed.fixed_addresses())),
                     pages: world_pages,
                     start,
+                    egress,
                 };
                 let net =
                     network::build(&web, &cx, world_token)?.route(kit::JUMP, kit::jump_prefix());
