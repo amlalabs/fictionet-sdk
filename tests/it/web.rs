@@ -14,6 +14,7 @@ use fictionet_test_support::{Done, timeout};
 
 mod admission;
 mod dns_dhcp;
+mod encrypted;
 mod fixture;
 mod http_serving;
 mod ipv6;

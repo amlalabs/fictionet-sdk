@@ -28,6 +28,9 @@
 //! [`Mirror`](internet::Mirror) that relays the real hierarchy. A world
 //! that adds none of them has no internet.
 //!
+//! [`encrypted`] puts DNS over TLS and DNS over HTTPS in front of a
+//! resolver: the same engines and caches answer them as answer port 53.
+//!
 //! A gateway that knows a few names and has no internet:
 //!
 //! ```
@@ -56,6 +59,7 @@
 //! | [`Namespace`] | The session a world's DNS programs answer for; advancing it starts a new one everywhere. |
 //! | [`placing`] | A root zone that places a host for a name the first time the name is asked. |
 //! | [`internet`] | The root, `gtld-servers.net`, and public resolver hosts, and a mirror of the real hierarchy. |
+//! | [`encrypted`] | DNS over TLS on port 853 and DNS over HTTPS on port 443 for a running [`Recursive`]. |
 
 use fictionet::stdlib::protocols::dns::rr::rdata::{NS, SOA};
 use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RData, Record, RecordSet};
@@ -63,6 +67,7 @@ use fictionet::stdlib::services::dns::zone::{Fact, Lazy, Provider};
 
 use super::{Host, NetHandle, normalize};
 
+pub mod encrypted;
 pub mod internet;
 mod program;
 mod source;
