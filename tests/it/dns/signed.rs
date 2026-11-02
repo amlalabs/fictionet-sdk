@@ -7,8 +7,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fictionet::stdlib::protocols::dns::dnssec::rdata::DNSSECRData;
 use fictionet::stdlib::protocols::dns::dnssec::{
-    Algorithm, AlgorithmPolicy, Anchors, Chain, Fetched, KeyFlags, KeySet, Link, Ring, Sign,
-    Validation, Window, ZoneKey, validate_denial, validate_rrset,
+    Algorithm, AlgorithmPolicy, Anchors, Chain, DigestType, Fetched, KeyFlags, KeySet, Link, Ring,
+    Sign, Validation, Window, ZoneKey, ds, validate_denial, validate_rrset,
 };
 use fictionet::stdlib::protocols::dns::op::{Edns, Message, MessageType, OpCode, Query};
 use fictionet::stdlib::protocols::dns::rr::rdata::{A, NS, SOA};
@@ -260,6 +260,128 @@ fn check_chain_reports_an_rrset_changed_after_signing() {
             apex: LowerName::new(&name("example.")),
             owner: LowerName::new(&name("new.example.")),
             rtype: RecordType::A,
+        }]
+    );
+}
+
+/// The algorithms of the RRSIGs among `records`.
+fn rrsig_algorithms(records: &[Record]) -> Vec<u8> {
+    let mut algorithms: Vec<u8> = records
+        .iter()
+        .filter_map(|record| match &record.data {
+            RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) => Some(u8::from(rrsig.input().algorithm)),
+            _ => None,
+        })
+        .collect();
+    algorithms.sort();
+    algorithms.dedup();
+    algorithms
+}
+
+#[test]
+fn a_ksk_and_zsk_of_two_algorithms_sign_every_rrset_with_both() {
+    // Ed25519 (15) and ECDSA P-256 (13): RFC 4035 §2.2 wants an RRSIG of
+    // each algorithm in the DNSKEY RRset on every RRset.
+    let signed = zone().signed(&keys(), window(), Denial::Nsec).unwrap();
+    for (qname, qtype) in [
+        ("ns1.example.", RecordType::A),
+        ("example.", RecordType::DNSKEY),
+        ("example.", RecordType::SOA),
+    ] {
+        let reply = ask(&signed, qname, qtype, AnyResponse::All);
+        assert_eq!(
+            rrsig_algorithms(&reply.answers),
+            [13, 15],
+            "{qname} {qtype}"
+        );
+    }
+}
+
+#[test]
+fn check_chain_reports_a_wrong_sha256_ds_beside_a_right_sha1_one() {
+    // A validator ignores SHA-1 DS records next to a stronger digest
+    // (RFC 4509 §3), so the right SHA-1 record cannot save the child.
+    let child_keys = keys();
+    let soa = SOA::new(
+        name("ns1.child.example."),
+        name("hostmaster.child.example."),
+        1,
+        7200,
+        3600,
+        1209600,
+        300,
+    );
+    let child = Zone::builder(name("child.example."), soa, 3600)
+        .rrset(rrset(
+            "child.example.",
+            vec![RData::NS(NS(name("ns1.child.example.")))],
+        ))
+        .rrset(rrset(
+            "ns1.child.example.",
+            vec![RData::A(A::new(192, 0, 2, 2))],
+        ))
+        .build()
+        .unwrap()
+        .signed(&child_keys, window(), Denial::Nsec)
+        .unwrap();
+    let ksk = child_keys.keys[0].dnskey();
+    let other = ZoneKey::generate(
+        &SeededEntropy::new(Seed::from_u64(9)),
+        Algorithm::Ed25519,
+        KeyFlags::KSK,
+    )
+    .dnskey();
+    let owner = name("child.example.");
+    let ds_records = [
+        ds(&owner, &ksk, DigestType::Sha1),
+        ds(&owner, &other, DigestType::Sha256),
+    ]
+    .map(|record| Record::from_rdata(owner.clone(), 3600, RData::DNSSEC(DNSSECRData::DS(record))));
+    let mut ds_set = RecordSet::with_ttl(owner.clone(), RecordType::DS, 3600);
+    ds_set.set_records(ds_records.to_vec());
+    let parent_keys = KeySet {
+        keys: vec![Arc::new(ZoneKey::generate(
+            &SeededEntropy::new(Seed::from_u64(10)),
+            Algorithm::Ed25519,
+            KeyFlags::KSK,
+        ))],
+    };
+    let parent = Zone::builder(
+        name("example."),
+        SOA::new(
+            name("ns1.example."),
+            name("hostmaster.example."),
+            1,
+            7200,
+            3600,
+            1209600,
+            300,
+        ),
+        3600,
+    )
+    .rrset(rrset("example.", vec![RData::NS(NS(name("ns1.example.")))]))
+    .rrset(rrset("ns1.example.", vec![RData::A(A::new(192, 0, 2, 1))]))
+    .delegate(
+        owner.clone(),
+        rrset(
+            "child.example.",
+            vec![RData::NS(NS(name("ns1.child.example.")))],
+        ),
+        vec![rrset(
+            "ns1.child.example.",
+            vec![RData::A(A::new(192, 0, 2, 2))],
+        )],
+        Some(ds_set),
+    )
+    .build()
+    .unwrap()
+    .signed(&parent_keys, window(), Denial::Nsec)
+    .unwrap();
+    assert_eq!(
+        check_chain(&[&parent, &child], &AlgorithmPolicy::iana(), now()),
+        [ChainProblem::DsMismatch {
+            parent: LowerName::new(&name("example.")),
+            child: LowerName::new(&owner),
         }]
     );
 }

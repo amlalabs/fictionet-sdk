@@ -255,10 +255,12 @@ impl fmt::Debug for ZoneKey {
 /// Every key of one zone.
 #[derive(Clone, Default)]
 pub struct KeySet {
-    /// The keys. When the set holds keys with the Secure Entry Point flag
-    /// and keys without it, the zone signer uses the first to sign only the
-    /// DNSKEY, CDS, and CDNSKEY RRsets and the second to sign the rest.
-    /// Otherwise every key signs every RRset of the zone.
+    /// The keys. The zone signer takes them one algorithm at a time, so
+    /// every RRset is signed with each algorithm in the DNSKEY RRset
+    /// (RFC 4035 §2.2). When an algorithm has keys with the Secure Entry
+    /// Point flag and keys without it, the first sign only the DNSKEY,
+    /// CDS, and CDNSKEY RRsets and the second sign the rest. Otherwise
+    /// every key of that algorithm signs every RRset of the zone.
     pub keys: Vec<Arc<dyn Sign>>,
 }
 

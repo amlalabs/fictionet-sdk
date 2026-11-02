@@ -21,7 +21,7 @@ use std::sync::Arc;
 use fictionet::stdlib::protocols::dns::ProtoError;
 use fictionet::stdlib::protocols::dns::dnssec::rdata::{DNSKEY, DNSSECRData, NSEC3PARAM};
 use fictionet::stdlib::protocols::dns::dnssec::{
-    KeyFlags, KeySet, Nsec3HashAlgorithm, Sign, Window, sign,
+    KeyFlags, KeySet, Nsec3HashAlgorithm, PublicKey, Sign, Window, sign,
 };
 use fictionet::stdlib::protocols::dns::op::Query;
 use fictionet::stdlib::protocols::dns::rr::{
@@ -304,17 +304,37 @@ struct Signing {
 }
 
 impl Signing {
+    /// The keys are split per algorithm, since every RRset needs an RRSIG
+    /// from a key of each algorithm in the DNSKEY RRset (RFC 4035 §2.2).
+    /// Within one algorithm, keys with the Secure Entry Point flag sign
+    /// the DNSKEY, CDS, and CDNSKEY RRsets and the others sign the rest;
+    /// when all of its keys or none have the flag, they all sign
+    /// everything.
     fn new(apex: &LowerName, keys: KeySet, window: Window, denial: Denial) -> Signing {
-        let (entry, data): (Vec<_>, Vec<_>) = keys
-            .keys
-            .iter()
-            .cloned()
-            .partition(|key| KeyFlags(key.dnskey().flags()).secure_entry_point());
-        let (entry, data) = if entry.is_empty() || data.is_empty() {
-            (keys.keys.clone(), keys.keys.clone())
-        } else {
-            (entry, data)
-        };
+        let algorithm = |key: &Arc<dyn Sign>| u8::from(key.dnskey().public_key().algorithm());
+        let mut algorithms: Vec<u8> = Vec::new();
+        for key in &keys.keys {
+            if !algorithms.contains(&algorithm(key)) {
+                algorithms.push(algorithm(key));
+            }
+        }
+        let (mut entry, mut data) = (Vec::new(), Vec::new());
+        for each in algorithms {
+            let (sep, other): (Vec<_>, Vec<_>) = keys
+                .keys
+                .iter()
+                .filter(|key| algorithm(key) == each)
+                .cloned()
+                .partition(|key| KeyFlags(key.dnskey().flags()).secure_entry_point());
+            if sep.is_empty() || other.is_empty() {
+                let all: Vec<_> = sep.into_iter().chain(other).collect();
+                entry.extend(all.iter().cloned());
+                data.extend(all);
+            } else {
+                entry.extend(sep);
+                data.extend(other);
+            }
+        }
         Signing {
             apex: Name::from(apex),
             lower_apex: apex.clone(),
@@ -598,12 +618,13 @@ pub(super) mod tests {
         Arc::new(ZoneKey::generate(&entropy, algorithm, flags))
     }
 
-    /// A key-signing and a zone-signing key, drawn from `seed`.
+    /// A key-signing and a zone-signing key of one algorithm, Ed25519,
+    /// drawn from `seed`.
     pub(in super::super) fn keys(seed: u64) -> KeySet {
         KeySet {
             keys: vec![
                 key(seed, Algorithm::Ed25519, KeyFlags::KSK),
-                key(seed + 1, Algorithm::EcdsaP256Sha256, KeyFlags::ZSK),
+                key(seed + 1, Algorithm::Ed25519, KeyFlags::ZSK),
             ],
         }
     }
@@ -629,37 +650,7 @@ pub(super) mod tests {
     /// Records gathered back into RRsets, each RRSIG with the RRset it
     /// covers.
     pub(in super::super) fn sets(records: &[Record]) -> Vec<RecordSet> {
-        let mut sets: Vec<RecordSet> = Vec::new();
-        for record in records {
-            if record.record_type() == RecordType::RRSIG {
-                continue;
-            }
-            let found = sets.iter_mut().find(|set| {
-                *set.name() == record.name && set.record_type() == record.record_type()
-            });
-            match found {
-                Some(set) => {
-                    set.insert(record.clone(), 0);
-                }
-                None => {
-                    let mut set =
-                        RecordSet::with_ttl(record.name.clone(), record.record_type(), record.ttl);
-                    set.insert(record.clone(), 0);
-                    sets.push(set);
-                }
-            }
-        }
-        for record in records {
-            if let RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) = &record.data {
-                let covered = rrsig.input().type_covered;
-                let set = sets
-                    .iter_mut()
-                    .find(|set| *set.name() == record.name && set.record_type() == covered)
-                    .expect("an RRSIG covers an RRset in the same section");
-                set.insert_rrsig(record.clone());
-            }
-        }
-        sets
+        crate::stdlib::services::dns::records::rrsets(records)
     }
 
     /// What the validator needs besides the records.

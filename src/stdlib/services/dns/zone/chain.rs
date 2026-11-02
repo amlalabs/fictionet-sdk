@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use fictionet::stdlib::protocols::dns::dnssec::proof::{self, Proof};
 use fictionet::stdlib::protocols::dns::dnssec::rdata::{DNSKEY, DNSSECRData, DS, RRSIG};
 use fictionet::stdlib::protocols::dns::dnssec::{
-    AlgorithmPolicy, DigestType, KeyFlags, PublicKey, Ring, TBS, Verify, ds, key_tag,
+    AlgorithmPolicy, KeyFlags, PublicKey, Ring, TBS, Verify, ds, key_tag,
 };
 use fictionet::stdlib::protocols::dns::rr::{
     LowerName, Name, RData, Record, RecordSet, RecordType, SerialNumber,
@@ -233,13 +233,7 @@ fn delegation(
             algorithm,
         })
         .collect();
-    let usable: Vec<(&DS, DigestType)> = records
-        .iter()
-        .copied()
-        .filter(|ds| policy.validates(u8::from(ds.algorithm())))
-        .filter(|ds| policy.accepts_digest(u8::from(ds.digest_type())))
-        .filter_map(|ds| Some((ds, DigestType::from_number(u8::from(ds.digest_type()))?)))
-        .collect();
+    let usable = policy.usable_ds(records.iter().copied());
     let Some(below) = below else {
         return problems;
     };
@@ -398,9 +392,10 @@ fn verifies_one(set: &RecordSet, rrsig: &RRSIG, keys: &[DNSKEY]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stdlib::protocols::dns::dnssec::Algorithm;
     use crate::stdlib::services::dns::zone::signed::tests::{
-        NOW, a, builder, keys, lower, name, ns, parent, parent_with_ds_for, rrset, secure_child,
-        time, window,
+        NOW, a, builder, key, keys, lower, name, ns, parent, parent_with_ds_for, rrset,
+        secure_child, time, window,
     };
     use crate::stdlib::services::dns::zone::{Denial, Zone};
 
@@ -510,8 +505,8 @@ mod tests {
     fn algorithms_the_policy_does_not_validate_are_reported() {
         let (child, _) = secure_child();
         let example = parent().signed(&keys(10), window(), Denial::Nsec).unwrap();
-        // The key-signing keys use Ed25519, algorithm 15, which the DS
-        // records name too, so the child is Insecure under this policy.
+        // The keys use Ed25519, algorithm 15, which the DS records name
+        // too, so the child is Insecure under this policy.
         let mut policy = AlgorithmPolicy::iana();
         policy.validate.remove(&15);
         assert_eq!(
@@ -528,39 +523,35 @@ mod tests {
             ]
         );
 
-        // The zone-signing keys use ECDSA P-256, algorithm 13. Without it
-        // the parent's NSEC records do not verify, so the unsigned
-        // delegation loses its proof as well.
+        // Signed with ECDSA P-256, algorithm 13, as well, every RRset of
+        // the parent carries an RRSIG of each algorithm (RFC 4035 §2.2).
+        // Without 13, the Ed25519 ones still verify, so only the keys are
+        // reported and the unsigned delegation keeps its proof.
+        let mut both = keys(10);
+        both.keys
+            .push(key(30, Algorithm::EcdsaP256Sha256, KeyFlags::KSK));
+        both.keys
+            .push(key(31, Algorithm::EcdsaP256Sha256, KeyFlags::ZSK));
+        let example = parent().signed(&both, window(), Denial::Nsec).unwrap();
         let mut policy = AlgorithmPolicy::iana();
         policy.validate.remove(&13);
         assert_eq!(
             check_chain(&[&example, &child, &plain()], &policy, time(NOW)),
-            [
-                ChainProblem::UnsupportedAlgorithm {
-                    apex: lower("example."),
-                    algorithm: 13,
-                },
-                ChainProblem::NoDsProofMissing {
-                    parent: lower("example."),
-                    child: lower("plain.example."),
-                },
-                ChainProblem::UnsupportedAlgorithm {
-                    apex: lower("secure.example."),
-                    algorithm: 13,
-                },
-            ]
+            [ChainProblem::UnsupportedAlgorithm {
+                apex: lower("example."),
+                algorithm: 13,
+            }]
         );
     }
 
     #[test]
     fn a_parent_no_validator_can_use_needs_no_proof() {
         let example = parent().signed(&keys(10), window(), Denial::Nsec).unwrap();
-        // With neither of the parent's algorithms validated, the parent is
-        // Insecure to a validator, so its unsigned delegation to
-        // plain.example breaks no chain. Its keys are reported, and the DS
-        // records naming Ed25519 for secure.example.
+        // With the parent's algorithm not validated, the parent is Insecure
+        // to a validator, so its unsigned delegation to plain.example
+        // breaks no chain. Its keys are reported, and the DS records
+        // naming Ed25519 for secure.example.
         let mut policy = AlgorithmPolicy::iana();
-        policy.validate.remove(&13);
         policy.validate.remove(&15);
         assert_eq!(
             check_chain(&[&example, &plain()], &policy, time(NOW)),
@@ -568,10 +559,6 @@ mod tests {
                 ChainProblem::UnsupportedAlgorithm {
                     apex: lower("example."),
                     algorithm: 15,
-                },
-                ChainProblem::UnsupportedAlgorithm {
-                    apex: lower("example."),
-                    algorithm: 13,
                 },
                 ChainProblem::UnsupportedAlgorithm {
                     apex: lower("secure.example."),
