@@ -3,7 +3,7 @@ name = "fictionet-host"
 version.workspace = true
 edition = "2024"
 rust-version.workspace = true
-description = "Host HTTP transport for Fictionet proxies."
+description = "Host HTTP and DNS transports for Fictionet worlds."
 license = "MIT OR Apache-2.0"
 publish = false
 
@@ -23,7 +23,7 @@ http-body-util = "0.1"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 webpki-roots = "1"
 tower-service = "0.3"
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "time", "io-util"] }
 tokio-util = { version = "0.7", default-features = false }
 
 [dev-dependencies]

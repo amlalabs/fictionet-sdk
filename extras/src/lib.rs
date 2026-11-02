@@ -3,6 +3,8 @@
 //! [`search`] renders search engines; [`sites`] supplies reusable site skins and
 //! their local assets. Neither module performs network requests.
 //! [`models`] serves provider APIs through the standard library's host client.
+//! [`warc`] reads and writes captured pages, and [`dns`] the DNS exchanges
+//! captured beside them.
 //!
 //! ```
 //! use fictionet_extras::{search, sites};
@@ -55,6 +57,9 @@ pub mod crawl;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod warc;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod dns;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod guest_content;
