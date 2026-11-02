@@ -50,15 +50,38 @@ use super::cache::{Entry, FailureKind, Key, Negative, Offer, Rank, normalized, t
 /// most three).
 const TRIES: u8 = 3;
 
+/// A client query the resolver is answering.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(super) struct AskerId(u64);
+
+/// A lookup: one question being resolved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(super) struct LookupId(u64);
+
+/// A check: one validation being made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(super) struct CheckId(u64);
+
+/// The work one client question costs, over everything it needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(super) struct TreeId(u64);
+
+impl TreeId {
+    /// The tree of `asker`: a client question is its own tree.
+    pub(super) fn of(asker: AskerId) -> TreeId {
+        TreeId(asker.0)
+    }
+}
+
 /// Something that waits in the graph.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) enum Node {
     /// A client query.
-    Asker(u64),
+    Asker(AskerId),
     /// A lookup.
-    Lookup(u64),
+    Lookup(LookupId),
     /// A check.
-    Check(u64),
+    Check(CheckId),
     /// A lookup kept going after its client was answered with stale data,
     /// so that the cache is refreshed (RFC 8767 §5).
     Refresh,
@@ -187,7 +210,7 @@ pub(super) enum Dep {
     /// The cache had it.
     Ready(Box<Found>),
     /// This lookup is finding it.
-    Waiting(u64),
+    Waiting(LookupId),
     /// It cannot be had: the lookup would wait on itself.
     Cycle,
     /// It cannot be had by this tree: the dependency is deeper than the
@@ -198,14 +221,14 @@ pub(super) enum Dep {
 /// What starting a check gave.
 pub(super) enum CheckStart {
     Done(Validation),
-    Waiting(u64),
+    Waiting(CheckId),
 }
 
 /// Something that became ready for a node waiting on it.
 pub(super) enum Ready {
     Looked {
         to: Node,
-        lookup: u64,
+        lookup: LookupId,
         key: Key,
         found: Box<Found>,
         /// Whether the work bound stopped the lookup.
@@ -213,7 +236,7 @@ pub(super) enum Ready {
     },
     Checked {
         to: Node,
-        check: u64,
+        check: CheckId,
         subject: Subject,
         validation: Validation,
     },
@@ -223,12 +246,12 @@ pub(super) enum Ready {
 #[derive(Default)]
 pub(super) struct Graph {
     next: u64,
-    lookups: BTreeMap<u64, Lookup>,
-    by_key: BTreeMap<Key, u64>,
-    checks: BTreeMap<u64, Check>,
-    by_subject: BTreeMap<Subject, u64>,
+    lookups: BTreeMap<LookupId, Lookup>,
+    by_key: BTreeMap<Key, LookupId>,
+    checks: BTreeMap<CheckId, Check>,
+    by_subject: BTreeMap<Subject, CheckId>,
     exchanges: BTreeMap<Token, Exchange>,
-    trees: BTreeMap<u64, Tree>,
+    trees: BTreeMap<TreeId, Tree>,
     pub(super) ready: VecDeque<Ready>,
 }
 
@@ -242,7 +265,7 @@ struct Tree {
 /// One question being resolved.
 struct Lookup {
     key: Key,
-    tree: u64,
+    tree: TreeId,
     depth: u8,
     dependents: Vec<Node>,
     /// Server addresses given up on over each transport: they failed, or
@@ -288,7 +311,7 @@ struct Minimising {
 enum LookupWait {
     Nothing,
     Exchange(Token),
-    Lookups(BTreeSet<u64>),
+    Lookups(BTreeSet<LookupId>),
 }
 
 /// One query a lookup is about to send: what it asks, of which server,
@@ -309,7 +332,7 @@ struct Asking {
 
 /// One query sent to a server.
 struct Exchange {
-    lookup: u64,
+    lookup: LookupId,
     to: SocketAddr,
     transport: Transport,
     id: u16,
@@ -330,7 +353,7 @@ struct Exchange {
 struct Check {
     subject: Subject,
     material: Material,
-    tree: u64,
+    tree: TreeId,
     depth: u8,
     /// The trust anchor the chain starts at.
     anchor: Name,
@@ -340,7 +363,7 @@ struct Check {
     links: BTreeMap<LowerName, (Name, Option<Fetched>, Option<Fetched>)>,
     /// The lookups the check waits for, with the zone and the part each
     /// fetches.
-    wait: BTreeMap<u64, (LowerName, Part)>,
+    wait: BTreeMap<LookupId, (LowerName, Part)>,
     /// Whether the check looked for zone cuts between `zone` and an
     /// unsigned RRset's owner.
     probed: bool,
@@ -372,13 +395,26 @@ enum Material {
 
 impl Graph {
     /// A number no node has had.
-    pub(super) fn issue(&mut self) -> u64 {
+    fn issue(&mut self) -> u64 {
         self.next += 1;
         self.next
     }
 
+    /// A name for a new client query.
+    pub(super) fn asker(&mut self) -> AskerId {
+        AskerId(self.issue())
+    }
+
+    fn lookup_id(&mut self) -> LookupId {
+        LookupId(self.issue())
+    }
+
+    fn check_id(&mut self) -> CheckId {
+        CheckId(self.issue())
+    }
+
     /// Notes one more node of `tree`.
-    pub(super) fn hold(&mut self, tree: u64) {
+    pub(super) fn hold(&mut self, tree: TreeId) {
         self.trees
             .entry(tree)
             .or_insert(Tree {
@@ -389,7 +425,7 @@ impl Graph {
     }
 
     /// Notes one node fewer of `tree`, forgetting it after the last.
-    pub(super) fn release(&mut self, tree: u64) {
+    pub(super) fn release(&mut self, tree: TreeId) {
         if let Some(entry) = self.trees.get_mut(&tree) {
             entry.holders -= 1;
             if entry.holders == 0 {
@@ -399,7 +435,7 @@ impl Graph {
     }
 
     /// Counts one query against `tree`. Whether the tree may send it.
-    fn charge(&mut self, tree: u64, limit: u16) -> bool {
+    fn charge(&mut self, tree: TreeId, limit: u16) -> bool {
         match self.trees.get_mut(&tree) {
             Some(entry) => {
                 entry.sent = entry.sent.saturating_add(1);
@@ -410,13 +446,13 @@ impl Graph {
     }
 
     /// The question lookup `id` resolves, if it is running.
-    pub(super) fn lookup_key(&self, id: u64) -> Option<Key> {
+    pub(super) fn lookup_key(&self, id: LookupId) -> Option<Key> {
         self.lookups.get(&id).map(|lookup| lookup.key.clone())
     }
 
     /// Keeps lookup `id` going for the cache once `node` no longer waits
     /// on it.
-    pub(super) fn refresh(&mut self, id: u64, node: Node) {
+    pub(super) fn refresh(&mut self, id: LookupId, node: Node) {
         if let Some(lookup) = self.lookups.get_mut(&id) {
             lookup.dependents.retain(|dependent| *dependent != node);
             if !lookup.dependents.contains(&Node::Refresh) {
@@ -733,7 +769,7 @@ impl<V: Verify> Resolver<V> {
         &mut self,
         from: Node,
         key: Key,
-        tree: u64,
+        tree: TreeId,
         depth: u8,
         entropy: &dyn Entropy,
     ) -> Dep {
@@ -752,7 +788,7 @@ impl<V: Verify> Resolver<V> {
         if depth > self.config.work.depth {
             return Dep::TooDeep;
         }
-        let id = self.graph.issue();
+        let id = self.graph.lookup_id();
         self.graph.hold(tree);
         self.graph.by_key.insert(key.clone(), id);
         self.graph.lookups.insert(
@@ -781,7 +817,7 @@ impl<V: Verify> Resolver<V> {
     /// Decides lookup `id`'s next step from what the cache holds now: an
     /// answer, a query to a server of the deepest zone cut it knows, the
     /// lookups that step needs first, or failure.
-    fn plan(&mut self, id: u64, entropy: &dyn Entropy) {
+    fn plan(&mut self, id: LookupId, entropy: &dyn Entropy) {
         let Some(lookup) = self.graph.lookups.get(&id) else {
             return;
         };
@@ -919,14 +955,14 @@ impl<V: Verify> Resolver<V> {
             .collect()
     }
 
-    fn wait_lookups(&mut self, id: u64, waiting: BTreeSet<u64>) {
+    fn wait_lookups(&mut self, id: LookupId, waiting: BTreeSet<LookupId>) {
         if let Some(lookup) = self.graph.lookups.get_mut(&id) {
             lookup.wait = LookupWait::Lookups(waiting);
         }
     }
 
     /// Notes the addresses `outcome` holds for name server `target`.
-    fn learn(&mut self, id: u64, target: &LowerName, outcome: &Outcome) {
+    fn learn(&mut self, id: LookupId, target: &LowerName, outcome: &Outcome) {
         let Outcome::Data { sets, .. } = outcome else {
             return;
         };
@@ -950,8 +986,8 @@ impl<V: Verify> Resolver<V> {
     /// work bound stopped it.
     pub(super) fn lookup_looked(
         &mut self,
-        id: u64,
-        dep: u64,
+        id: LookupId,
+        dep: LookupId,
         key: &Key,
         found: Found,
         bounded: bool,
@@ -985,7 +1021,7 @@ impl<V: Verify> Resolver<V> {
 
     /// Ends lookup `id` with no server left to ask, caching the failure
     /// (RFC 9520 §3.2) unless the work bound caused it.
-    fn fail(&mut self, id: u64) {
+    fn fail(&mut self, id: LookupId) {
         let Some(lookup) = self.graph.lookups.get(&id) else {
             return;
         };
@@ -1003,14 +1039,14 @@ impl<V: Verify> Resolver<V> {
 
     /// Notes that the work bound stopped lookup `id` or something it
     /// needed.
-    fn bound(&mut self, id: u64) {
+    fn bound(&mut self, id: LookupId) {
         if let Some(lookup) = self.graph.lookups.get_mut(&id) {
             lookup.bounded = true;
         }
     }
 
     /// Ends lookup `id` with `found`, for every node that waited on it.
-    fn finish(&mut self, id: u64, found: Found) {
+    fn finish(&mut self, id: LookupId, found: Found) {
         let Some(lookup) = self.graph.lookups.remove(&id) else {
             return;
         };
@@ -1034,7 +1070,7 @@ impl<V: Verify> Resolver<V> {
     /// random, as an authority for `zone`.
     fn ask_one(
         &mut self,
-        id: u64,
+        id: LookupId,
         zone: LowerName,
         servers: Vec<SocketAddr>,
         entropy: &dyn Entropy,
@@ -1062,7 +1098,7 @@ impl<V: Verify> Resolver<V> {
     /// what is known, with QTYPE A (RFC 9156 §2.3).
     fn next_question(
         &mut self,
-        id: u64,
+        id: LookupId,
         zone: &LowerName,
         forwarded: bool,
     ) -> Option<(Name, RecordType, bool)> {
@@ -1103,7 +1139,7 @@ impl<V: Verify> Resolver<V> {
     }
 
     /// Sends one query for lookup `id` and waits for it.
-    fn send(&mut self, id: u64, asking: Asking, entropy: &dyn Entropy) {
+    fn send(&mut self, id: LookupId, asking: Asking, entropy: &dyn Entropy) {
         let Asking {
             zone,
             to,
@@ -1569,7 +1605,7 @@ impl<V: Verify> Resolver<V> {
 
     /// Notes that `name`, a minimised question's name, is no zone cut, and
     /// goes on one step deeper.
-    fn through(&mut self, id: u64, name: &Name, entropy: &dyn Entropy) {
+    fn through(&mut self, id: LookupId, name: &Name, entropy: &dyn Entropy) {
         if let Some(lookup) = self.graph.lookups.get_mut(&id) {
             lookup.minimise.through = Some(LowerName::new(name));
         }
@@ -1579,7 +1615,7 @@ impl<V: Verify> Resolver<V> {
     /// Ends lookup `id` with a negative answer, offered to the cache.
     fn negative(
         &mut self,
-        id: u64,
+        id: LookupId,
         key: &Key,
         kind: Negative,
         soa: Option<RecordSet>,
@@ -1772,7 +1808,7 @@ impl<V: Verify> Resolver<V> {
         from: Node,
         subject: Subject,
         outcome: &Outcome,
-        tree: u64,
+        tree: TreeId,
         depth: u8,
         entropy: &dyn Entropy,
     ) -> CheckStart {
@@ -1799,7 +1835,7 @@ impl<V: Verify> Resolver<V> {
             self.validated(&subject, &material, validation);
             return CheckStart::Done(validation);
         };
-        let id = self.graph.issue();
+        let id = self.graph.check_id();
         self.graph.hold(tree);
         self.graph.by_subject.insert(subject.clone(), id);
         self.graph.checks.insert(
@@ -1830,7 +1866,7 @@ impl<V: Verify> Resolver<V> {
 
     /// Adds the zone at `zone` to check `id`'s chain: its DNSKEY RRset,
     /// and its DS RRset unless it is the anchor's zone.
-    fn link(&mut self, id: u64, zone: Name, entropy: &dyn Entropy) {
+    fn link(&mut self, id: CheckId, zone: Name, entropy: &dyn Entropy) {
         let Some(check) = self.graph.checks.get_mut(&id) else {
             return;
         };
@@ -1852,7 +1888,7 @@ impl<V: Verify> Resolver<V> {
 
     /// Starts the lookup of `part` at `name` for check `id`, or takes what
     /// the cache has for it at once.
-    fn fetch(&mut self, id: u64, name: LowerName, part: Part, entropy: &dyn Entropy) {
+    fn fetch(&mut self, id: CheckId, name: LowerName, part: Part, entropy: &dyn Entropy) {
         let Some(check) = self.graph.checks.get(&id) else {
             return;
         };
@@ -1882,7 +1918,7 @@ impl<V: Verify> Resolver<V> {
     /// way is asked of the parent's side, as Unbound does, and a name the
     /// parent proves to be a delegation without DS joins the chain, so the
     /// RRset is Insecure there (RFC 4035 §4.3, §5.2).
-    fn probe(&mut self, id: u64, entropy: &dyn Entropy) {
+    fn probe(&mut self, id: CheckId, entropy: &dyn Entropy) {
         let Some(check) = self.graph.checks.get_mut(&id) else {
             return;
         };
@@ -1914,7 +1950,13 @@ impl<V: Verify> Resolver<V> {
     /// its keys. A NODATA whose records the parent signs to show a
     /// delegation without DS makes it an unsigned cut. Anything else says
     /// `name` is no cut.
-    fn cut_found(&mut self, id: u64, name: &LowerName, outcome: &Outcome, entropy: &dyn Entropy) {
+    fn cut_found(
+        &mut self,
+        id: CheckId,
+        name: &LowerName,
+        outcome: &Outcome,
+        entropy: &dyn Entropy,
+    ) {
         let max = self.config.policy.max_nsec3_iterations;
         match outcome {
             Outcome::Data { .. } => self.link(id, Name::from(name), entropy),
@@ -1950,7 +1992,7 @@ impl<V: Verify> Resolver<V> {
     /// [`cut_found`](Resolver::cut_found).
     fn fetched(
         &mut self,
-        id: u64,
+        id: CheckId,
         zone: &LowerName,
         part: Part,
         outcome: &Outcome,
@@ -2001,8 +2043,8 @@ impl<V: Verify> Resolver<V> {
     /// What a lookup that check `id` waited for found.
     pub(super) fn check_looked(
         &mut self,
-        id: u64,
-        lookup: u64,
+        id: CheckId,
+        lookup: LookupId,
         found: Found,
         entropy: &dyn Entropy,
     ) {
@@ -2029,7 +2071,7 @@ impl<V: Verify> Resolver<V> {
     /// An unsigned RRset that is Bogus with the chain so far may sit below
     /// a cut the resolution never saw, so the check first probes for one,
     /// once. `None` while the probe waits.
-    fn conclude(&mut self, id: u64, entropy: &dyn Entropy) -> Option<Validation> {
+    fn conclude(&mut self, id: CheckId, entropy: &dyn Entropy) -> Option<Validation> {
         let check = self.graph.checks.get(&id)?;
         let links = check
             .links

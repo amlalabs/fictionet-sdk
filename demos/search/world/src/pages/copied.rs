@@ -111,24 +111,6 @@ impl Corpus {
     }
 }
 
-/// The DNS exchanges captured beside the pages in `root`: the
-/// `zz-dns-<time>.warc.gz` archives `cargo xtask search-capture` writes,
-/// oldest first, so a later capture's reply replaces an earlier one. Only
-/// those archives are read, since the pages' archives hold no DNS.
-fn captured_dns(root: &Path) -> std::io::Result<fictionet_extras::dns::Replay> {
-    let mut files = Vec::new();
-    for entry in std::fs::read_dir(root)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name.starts_with("zz-dns-") && name.ends_with(".warc.gz") {
-            files.push(entry.path());
-        }
-    }
-    files.sort_by_key(|path| path.file_name().map(std::ffi::OsStr::to_os_string));
-    fictionet_extras::dns::Replay::open(files)
-}
-
 enum CorpusSearch {
     Crawled(Index),
     Reference(Box<reference::ReferenceWeb>),
@@ -596,7 +578,9 @@ impl Pages {
         } else {
             None
         };
-        let dns = captured_dns(&research_root).map_err(|e| e.to_string())?;
+        // The DNS `cargo xtask search-capture` captured beside the pages.
+        let dns =
+            fictionet_extras::dns::Replay::directory(&research_root).map_err(|e| e.to_string())?;
         let mut corpus = Corpus {
             archive,
             missing,

@@ -512,6 +512,38 @@ fn a_cached_reply_answers_only_the_same_question_with_the_same_edns() {
     });
 }
 
+/// `Cached` keeps its replies for one session of its namespace: a new
+/// session asks the source again.
+#[test]
+fn a_cached_reply_stays_in_its_session() {
+    world(Duration::from_secs(60), |fcx| async move {
+        let hierarchy = Hierarchy::new();
+        let namespace = dns::Namespace::new(WallClock {
+            start: SystemTime::UNIX_EPOCH,
+        });
+        let cached = Cached::new(hierarchy.clone()).namespace(&namespace);
+        let a_root = SocketAddr::new(IpAddr::V4(ROOT_LETTERS[0].server.v4), 53);
+        let ask = || Ask {
+            server: a_root,
+            transport: Transport::Udp,
+            query: query(1, ".", RecordType::NS, false).to_vec().unwrap(),
+        };
+        cached.ask(&fcx, ask()).await;
+        cached.ask(&fcx, ask()).await;
+        assert_eq!(hierarchy.asked_for(".", RecordType::NS).len(), 1, "kept");
+        namespace.advance(WallClock {
+            start: SystemTime::UNIX_EPOCH,
+        });
+        cached.ask(&fcx, ask()).await;
+        assert_eq!(
+            hierarchy.asked_for(".", RecordType::NS).len(),
+            2,
+            "asked again in the new session"
+        );
+        Ok(())
+    });
+}
+
 /// The NSID in `reply`, if it has one.
 fn nsid(reply: &Message) -> Option<Vec<u8>> {
     reply

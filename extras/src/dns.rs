@@ -210,6 +210,13 @@ fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
+/// How the name of a DNS capture's archive in a corpus directory starts
+/// ([`Replay::capture_file`]).
+const CAPTURE_PREFIX: &str = "zz-dns-";
+
+/// How the name of a DNS capture's archive ends.
+const CAPTURE_SUFFIX: &str = ".warc.gz";
+
 /// A source that answers from DNS exchanges recorded by [`Capture`].
 ///
 /// A question gets the reply recorded for the same question (its name,
@@ -310,11 +317,29 @@ impl Replay {
         Ok(replay)
     }
 
-    /// The DNS exchanges in the archives of the capture directory `root`,
-    /// in the order [`Archive::directory`](crate::warc::Archive::directory)
-    /// reads them.
+    /// The DNS captured into the corpus directory `root`: its
+    /// [`capture_file`](Replay::capture_file) archives, oldest first, so a
+    /// later capture's reply replaces an earlier one. The pages' archives
+    /// hold no DNS and are not read.
     pub fn directory(root: &Path) -> io::Result<Replay> {
-        Replay::open(warc::archive_files(&warc::Archive::directory_root(root)?)?)
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(root)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(CAPTURE_PREFIX) && name.ends_with(CAPTURE_SUFFIX) {
+                files.push(entry.path());
+            }
+        }
+        files.sort_by_key(|path| path.file_name().map(std::ffi::OsStr::to_os_string));
+        Replay::open(files)
+    }
+
+    /// Where a DNS capture made at `stamp`, in nanoseconds since the Unix
+    /// epoch, goes in the corpus directory `root`:
+    /// `zz-dns-<stamp>.warc.gz`, which sorts after the pages' archives.
+    pub fn capture_file(root: &Path, stamp: u128) -> PathBuf {
+        root.join(format!("{CAPTURE_PREFIX}{stamp}{CAPTURE_SUFFIX}"))
     }
 
     /// The `WARC-Date` of every recorded reply.

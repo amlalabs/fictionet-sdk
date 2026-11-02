@@ -89,7 +89,11 @@ pub enum Event {
         /// What came of it.
         observed: ObservedKind,
     },
-    /// A completion that changed nothing (the contract's rule 4).
+    /// A completion that changed nothing: its token was not outstanding or
+    /// was of an older generation, or the reply came from another address
+    /// or over another transport than the query went, or did not carry the
+    /// query's ID and question (RFC 5452 §9.1), as rule 4 of the
+    /// [`Engine`](super::Engine) contract says.
     Ignored {
         /// When it arrived.
         at: Instant,

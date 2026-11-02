@@ -69,7 +69,7 @@ mod servers;
 pub use cache::{Cache, Entry, FailureKind, Key, Limits, Negative, Offer, Rank};
 pub use config::{Config, Minimise, Stale, Work, root_hints};
 
-use resolution::{Graph, Outcome, Subject};
+use resolution::{AskerId, CheckId, Graph, LookupId, Outcome, Subject, TreeId};
 use servers::Servers;
 
 /// A recursive resolver, as an engine.
@@ -100,9 +100,9 @@ pub struct Resolver<V: Verify = Ring> {
     /// The round trips of the servers it asked.
     servers: Servers,
     graph: Graph,
-    askers: BTreeMap<u64, Asker>,
+    askers: BTreeMap<AskerId, Asker>,
     /// Client queries a new session restarts, on the next input.
-    restart: Vec<u64>,
+    restart: Vec<AskerId>,
     queue: VecDeque<Action>,
     now: Instant,
 }
@@ -131,8 +131,8 @@ struct Asker {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum AskerWait {
     Nothing,
-    Lookup(u64),
-    Checks(BTreeSet<u64>),
+    Lookup(LookupId),
+    Checks(BTreeSet<CheckId>),
 }
 
 /// One step of an answer: an alias, or what the question finally found.
@@ -269,7 +269,7 @@ impl<V: Verify> Resolver<V> {
             return self.send_answer(client, bytes, Validation::NotPerformed, false);
         }
 
-        let id = self.graph.issue();
+        let id = self.graph.asker();
         let asker = Asker {
             validate: self.config.anchors.is_some() && !request.cd,
             cache_only: !request.rd,
@@ -281,7 +281,7 @@ impl<V: Verify> Resolver<V> {
             stale_tried: false,
         };
         self.askers.insert(id, asker);
-        self.graph.hold(id);
+        self.graph.hold(TreeId::of(id));
         self.step_asker(id, entropy);
     }
 
@@ -306,7 +306,7 @@ impl<V: Verify> Resolver<V> {
 
     /// Moves the client query `id` on as far as it can go now: along its
     /// aliases, then through validation, then to its answer.
-    fn step_asker(&mut self, id: u64, entropy: &dyn Entropy) {
+    fn step_asker(&mut self, id: AskerId, entropy: &dyn Entropy) {
         loop {
             let Some(asker) = self.askers.get(&id) else {
                 return;
@@ -345,7 +345,13 @@ impl<V: Verify> Resolver<V> {
                 }
                 continue;
             }
-            match self.depend(resolution::Node::Asker(id), key, id, depth, entropy) {
+            match self.depend(
+                resolution::Node::Asker(id),
+                key,
+                TreeId::of(id),
+                depth,
+                entropy,
+            ) {
                 resolution::Dep::Ready(found) => self.push_found(id, *found),
                 resolution::Dep::Waiting(lookup) => {
                     if let Some(asker) = self.askers.get_mut(&id) {
@@ -362,7 +368,7 @@ impl<V: Verify> Resolver<V> {
         self.validate_asker(id, entropy);
     }
 
-    fn push_found(&mut self, id: u64, found: resolution::Found) {
+    fn push_found(&mut self, id: AskerId, found: resolution::Found) {
         let Some(asker) = self.askers.get_mut(&id) else {
             return;
         };
@@ -375,7 +381,7 @@ impl<V: Verify> Resolver<V> {
         });
     }
 
-    fn push_piece(&mut self, id: u64, outcome: Outcome, cached: bool) {
+    fn push_piece(&mut self, id: AskerId, outcome: Outcome, cached: bool) {
         let checks = resolution::subjects(&outcome)
             .into_iter()
             .map(|subject| (subject, Validation::NotPerformed))
@@ -393,7 +399,7 @@ impl<V: Verify> Resolver<V> {
     /// Replaces a failed last piece with expired data for its question,
     /// when the configuration serves stale data and the cache still holds
     /// some (RFC 8767 §4).
-    fn serve_stale_on_failure(&mut self, id: u64) {
+    fn serve_stale_on_failure(&mut self, id: AskerId) {
         if self.config.serve_stale.is_none() {
             return;
         }
@@ -438,7 +444,7 @@ impl<V: Verify> Resolver<V> {
 
     /// Starts the validations the answer of client query `id` still needs,
     /// and answers it once there are none.
-    fn validate_asker(&mut self, id: u64, entropy: &dyn Entropy) {
+    fn validate_asker(&mut self, id: AskerId, entropy: &dyn Entropy) {
         let Some(asker) = self.askers.get(&id) else {
             return;
         };
@@ -466,7 +472,7 @@ impl<V: Verify> Resolver<V> {
                     resolution::Node::Asker(id),
                     subject,
                     &outcome,
-                    id,
+                    TreeId::of(id),
                     depth,
                     entropy,
                 ) {
@@ -491,8 +497,8 @@ impl<V: Verify> Resolver<V> {
     /// What a lookup the client query `id` waited for found.
     fn asker_looked(
         &mut self,
-        id: u64,
-        lookup: u64,
+        id: AskerId,
+        lookup: LookupId,
         found: resolution::Found,
         entropy: &dyn Entropy,
     ) {
@@ -510,8 +516,8 @@ impl<V: Verify> Resolver<V> {
     /// What a validation the client query `id` waited for established.
     fn asker_checked(
         &mut self,
-        id: u64,
-        check: u64,
+        id: AskerId,
+        check: CheckId,
         subject: &Subject,
         validation: Validation,
         entropy: &dyn Entropy,
@@ -544,7 +550,7 @@ impl<V: Verify> Resolver<V> {
     /// past its TTL, so the chain is then followed again from the
     /// question, as the cache has it now. The work spent so far stays
     /// counted against the question.
-    fn answer_asker(&mut self, id: u64, entropy: &dyn Entropy) {
+    fn answer_asker(&mut self, id: AskerId, entropy: &dyn Entropy) {
         if self.ran_out(id) {
             if let Some(asker) = self.askers.get_mut(&id) {
                 asker.pieces.clear();
@@ -559,7 +565,7 @@ impl<V: Verify> Resolver<V> {
     /// has ended by now. Data with TTL 0 serves the answer it came in
     /// (RFC 1035 §7.4), and stale data is served past its TTL on purpose
     /// (RFC 8767), so neither counts.
-    fn ran_out(&self, id: u64) -> bool {
+    fn ran_out(&self, id: AskerId) -> bool {
         let Some(asker) = self.askers.get(&id) else {
             return false;
         };
@@ -578,11 +584,11 @@ impl<V: Verify> Resolver<V> {
 
     /// Answers client query `id` from its pieces as they are, and forgets
     /// it.
-    fn send_pieces(&mut self, id: u64) {
+    fn send_pieces(&mut self, id: AskerId) {
         let Some(asker) = self.askers.remove(&id) else {
             return;
         };
-        self.graph.release(id);
+        self.graph.release(TreeId::of(id));
         let (bytes, validation, cached) = self.render_pieces(&asker);
         self.send_answer(asker.client, bytes, validation, cached);
     }
@@ -590,11 +596,11 @@ impl<V: Verify> Resolver<V> {
     /// Answers client query `id`, whose RD was clear and whose question
     /// the cache cannot answer, with the closest delegation the cache
     /// holds, as a server answering from its cache does.
-    fn answer_referral(&mut self, id: u64) {
+    fn answer_referral(&mut self, id: AskerId) {
         let Some(asker) = self.askers.remove(&id) else {
             return;
         };
-        self.graph.release(id);
+        self.graph.release(TreeId::of(id));
         let bytes = self.render_referral(&asker.request);
         self.send_answer(asker.client, bytes, Validation::NotPerformed, true);
     }
@@ -605,7 +611,7 @@ impl<V: Verify> Resolver<V> {
         let Some(stale) = self.config.serve_stale else {
             return;
         };
-        let due: Vec<(u64, u64)> = self
+        let due: Vec<(AskerId, LookupId)> = self
             .askers
             .iter()
             .filter(|(_, asker)| {
@@ -645,7 +651,7 @@ impl<V: Verify> Resolver<V> {
 
     /// Drops the client queries of `client` and what only they needed.
     fn gone(&mut self, client: &Client) {
-        let ids: Vec<u64> = self
+        let ids: Vec<AskerId> = self
             .askers
             .iter()
             .filter(|(_, asker)| asker.client == *client)
@@ -653,7 +659,7 @@ impl<V: Verify> Resolver<V> {
             .collect();
         for id in ids {
             self.askers.remove(&id);
-            self.graph.release(id);
+            self.graph.release(TreeId::of(id));
             self.forget(resolution::Node::Asker(id));
         }
     }
@@ -709,7 +715,7 @@ impl<V: Verify> Engine for Resolver<V> {
     fn handle(&mut self, input: Input, now: Instant, entropy: &dyn Entropy) {
         self.now = now;
         for id in std::mem::take(&mut self.restart) {
-            self.graph.hold(id);
+            self.graph.hold(TreeId::of(id));
             self.step_asker(id, entropy);
         }
         match input {
@@ -764,7 +770,7 @@ impl<V: Verify> Engine for Resolver<V> {
         }
         self.cache.advance(session.generation);
         self.servers.clear();
-        let ids: Vec<u64> = self.askers.keys().copied().collect();
+        let ids: Vec<AskerId> = self.askers.keys().copied().collect();
         for id in &ids {
             if let Some(asker) = self.askers.get_mut(id) {
                 asker.pieces.clear();

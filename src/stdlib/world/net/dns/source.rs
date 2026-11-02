@@ -13,7 +13,9 @@ use fictionet::stdlib::protocols::dns::op::Message;
 use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, RecordType};
 use fictionet::stdlib::protocols::dns::{Parsed, Request, restore};
 use fictionet::stdlib::services::dns::authority::{Ask, Observed};
-use fictionet::stdlib::services::dns::{Generation, Session, WallClock};
+use fictionet::stdlib::services::dns::{
+    ExchangeFailure, Generation, Input, Session, Transmit, WallClock,
+};
 use fictionet::stdlib::services::serve::Transport;
 use fictionet::sync::Mutex;
 use fictionet::time::Instant;
@@ -42,6 +44,32 @@ pub trait Source: Send + Sync + 'static {
         fcx: &'a Cx,
         ask: Ask,
     ) -> Pin<Box<dyn Future<Output = Observed> + Send + 'a>>;
+}
+
+/// What `transmit`, a query an engine sends, brings back from `source` as
+/// the engine's next input: the reply, from the address and over the
+/// transport the query went to, or a failure for a server that cannot be
+/// reached. `None` when nothing came back, since the engine's own
+/// deadline then decides.
+pub async fn carry<S: Source + ?Sized>(source: &S, fcx: &Cx, transmit: Transmit) -> Option<Input> {
+    let ask = Ask {
+        server: transmit.to,
+        transport: transmit.transport,
+        query: transmit.bytes,
+    };
+    match source.ask(fcx, ask).await {
+        Observed::Reply(bytes) => Some(Input::Reply {
+            token: transmit.token,
+            from: transmit.to,
+            transport: transmit.transport,
+            bytes,
+        }),
+        Observed::Unreachable => Some(Input::Failed {
+            token: transmit.token,
+            failure: ExchangeFailure::Unreachable,
+        }),
+        Observed::Timeout => None,
+    }
 }
 
 impl<S: Source + ?Sized> Source for Arc<S> {
@@ -134,9 +162,34 @@ impl Question {
 /// server's engine fits it to each asker's size. The resolvers of a world
 /// already cache, so a world adds this only when the same question
 /// reaches its source from many of them.
+///
+/// With a [`namespace`](Cached::namespace), the replies kept belong to one
+/// session: a new session starts with none, and a reply that comes back
+/// after its session ended is not kept. Replies past their TTL are swept
+/// as new ones come in.
 pub struct Cached<S> {
     source: S,
-    replies: Mutex<HashMap<Kept, (Vec<u8>, Instant)>>,
+    namespace: Option<Namespace>,
+    replies: Mutex<Replies>,
+}
+
+/// The replies [`Cached`] keeps for one session.
+struct Replies {
+    generation: Generation,
+    kept: HashMap<Kept, (Vec<u8>, Instant)>,
+    /// How many replies were kept after the last sweep of expired ones.
+    swept: usize,
+}
+
+impl Replies {
+    /// None yet, for session `generation`.
+    fn new(generation: Generation) -> Replies {
+        Replies {
+            generation,
+            kept: HashMap::new(),
+            swept: 0,
+        }
+    }
 }
 
 /// What makes two asks the same for [`Cached`].
@@ -154,8 +207,25 @@ impl<S: Source> Cached<S> {
     pub fn new(source: S) -> Cached<S> {
         Cached {
             source,
-            replies: Mutex::new(HashMap::new()),
+            namespace: None,
+            replies: Mutex::new(Replies::new(Generation(0))),
         }
+    }
+
+    /// Keeps replies for the sessions of `namespace`, one session at a
+    /// time.
+    pub fn namespace(self, namespace: &Namespace) -> Cached<S> {
+        Cached {
+            namespace: Some(namespace.clone()),
+            ..self
+        }
+    }
+
+    /// The session asks belong to now.
+    fn generation(&self) -> Generation {
+        self.namespace
+            .as_ref()
+            .map_or(Generation(0), |namespace| namespace.current().generation)
     }
 }
 
@@ -177,18 +247,17 @@ impl<S: Source> Source for Cached<S> {
                 cd: request.cd,
             };
             let now = fcx.now();
+            let generation = self.generation();
             {
                 let mut replies = self.replies.lock();
-                match replies.get(&question) {
-                    Some((reply, until)) if *until > now => {
-                        if let Ok(bytes) = restore(reply, &request) {
-                            return Observed::Reply(bytes);
-                        }
-                    }
-                    Some(_) => {
-                        replies.remove(&question);
-                    }
-                    None => {}
+                if replies.generation != generation {
+                    *replies = Replies::new(generation);
+                }
+                if let Some((reply, until)) = replies.kept.get(&question)
+                    && *until > now
+                    && let Ok(bytes) = restore(reply, &request)
+                {
+                    return Observed::Reply(bytes);
                 }
             }
             let observed = self.source.ask(fcx, ask).await;
@@ -197,7 +266,14 @@ impl<S: Source> Source for Cached<S> {
                 && ttl > 0
             {
                 let until = now + Duration::from_secs(u64::from(ttl));
-                self.replies.lock().insert(question, (bytes.clone(), until));
+                let mut replies = self.replies.lock();
+                if replies.generation == generation {
+                    replies.kept.insert(question, (bytes.clone(), until));
+                    if replies.kept.len() >= 2 * replies.swept.max(64) {
+                        replies.kept.retain(|_, (_, until)| *until > now);
+                        replies.swept = replies.kept.len();
+                    }
+                }
             }
             observed
         })
