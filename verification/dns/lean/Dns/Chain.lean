@@ -316,12 +316,11 @@ theorem descends_under {tr : Tree S} {p : SignedZone S} {cs : List (SignedZone S
 
 /-! ## Soundness -/
 
-/-- What the soundness of the check rests on besides the check: honest signers, DS sets that are DS RRsets
-owned by the child, and apexes that are not wildcards. -/
+/-- What the soundness of the check rests on besides the check: honest signers, and DS sets that are DS
+RRsets owned by the child. -/
 structure WellFormed (tr : Tree S) : Prop where
   honest : ∀ z ∈ tr, ∀ s ∈ z.signers, s.Honest
   dsSets : ∀ z ∈ tr, ∀ n ns set g, z.zone.node n = some (.cut ns (some set) g) → set.owner = n ∧ set.rtype = 43
-  apexes : ∀ z ∈ tr, labelsOf z.apex = z.apex.length
 
 /-- The DS-set condition of `WellFormed` as a check over the zones' nodes. -/
 def dsSetsB (tr : Tree S) : Bool :=
@@ -449,8 +448,7 @@ theorem link_step {tr : Tree S} {P : AlgorithmPolicy} {t : Nat} (hc : check tr P
         obtain ⟨hown, htype⟩ := hwf.dsSets p hp c.apex ns set g hn
         have hv : (p.signSet set).sigs.any (verifies P t p.apex p.keys (exactCover set)) = true := by
           refine sigsBy_verifies hpw hpne _ _ _ _ fun h hl ht => ?_
-          have hlab : h.labels = set.owner.length := by rw [hl, hown, hwf.apexes c hcm]
-          simp only [exactCover, hlab, ↓reduceIte, ht]
+          simp only [exactCover, hl, ↓reduceIte, ht]
         have hds : dsStep P t p.apex p.keys c.apex (p.signSet set) = .ok (dsOf set) := by
           unfold dsStep
           simp only [SignedZone.signSet, hown] at hv ⊢
@@ -498,7 +496,7 @@ theorem check_sound {tr : Tree S} {P : AlgorithmPolicy} {t dt : Nat} (hc : check
     (h0 : z0 ∈ tr) (hsep : ∃ s ∈ z0.signers, s.dnskey.sep = true) (hpath : Descends tr z0 rest zn)
     (hzwf : zn.zone.WF) {s : RRset} {nd : Node} (ds : List (Signed S)) (hnode : zn.zone.node s.owner = some nd)
     (hcut : ∀ ns d g, nd ≠ .cut ns d g) (hheld : ∃ x ∈ nodeSets nd, x.rtype = s.rtype ∧ x.rdata = s.rdata)
-    (hlab : labelsOf s.owner = s.owner.length) (hin : under s.owner zn.apex = true) :
+    (hin : under s.owner zn.apex = true) :
     validateRrset (some [z0.anchor dt]) P t (chainOf z0 rest) s (zn.sigsFor s) ds = .secure ∨
       ∃ w, validateRrset (some [z0.anchor dt]) P t (chainOf z0 rest) s (zn.sigsFor s) ds = .insecure w := by
   obtain ⟨s0, hs0, hsep0⟩ := hsep
@@ -516,7 +514,7 @@ theorem check_sound {tr : Tree S} {P : AlgorithmPolicy} {t dt : Nat} (hc : check
     obtain ⟨x, hsig, hxo, hxt, hxd⟩ := sigsFor_own zn hzwf hnode hcut hheld
     have hwn := zone_signsWell hc hwf (descends_last_mem hpath h0) hnen
     simp only [validateRrset, hwalk, hd, hsig]
-    exact rrsetResult_secure.mpr (signSet_final hwn hnen ds hxo hxt hxd (by rw [hxo]; exact hlab))
+    exact rrsetResult_secure.mpr (signSet_final hwn hnen ds hxo hxt hxd)
   · right
     exact ⟨w, by simp [validateRrset, hwalk, hd]⟩
 
