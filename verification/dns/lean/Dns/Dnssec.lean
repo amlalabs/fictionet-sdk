@@ -17,7 +17,6 @@
   `services::dns::zone::{signed, cover}`.
 -/
 import Dns.Zone
-import Dns.Partial
 
 namespace Dns.Dnssec
 open Zone
@@ -80,13 +79,6 @@ structure Tbs where
   hdr : Header
   data : Payload
 deriving DecidableEq, Repr
-
-namespace RType
-def NSEC := 47
-def RRSIG := 46
-def DNSKEY := 48
-def NSEC3 := 50
-end RType
 
 /-! ## The signature scheme -/
 
