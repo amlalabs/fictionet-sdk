@@ -910,7 +910,9 @@ fn rcode_text(rcode: ResponseCode) -> String {
 fn any_response(text: &str) -> AnyResponse {
     match text {
         "hinfo" => AnyResponse::Hinfo,
-        "one_rrset" => AnyResponse::OneRrset,
+        // The model sends the name's first RRset; the preferred type only
+        // decides which one Rust sends (see `compare_answer`).
+        "one_rrset" => AnyResponse::OneRrset(RecordType::SOA),
         "all" => AnyResponse::All,
         _ => panic!("unknown ANY response {text}"),
     }
@@ -1402,7 +1404,7 @@ fn zone_answers() {
 /// RFC 8482 §4.1 lets a server answer QTYPE ANY with any one RRset of the
 /// name. The Lean model takes the first RRset in the order the zone lists
 /// them, which a master file does not carry into a zone; Rust takes the
-/// RRset of the lowest type. When the two pick different RRsets, Rust's
+/// RRset of the type it prefers, or else the RRset of the lowest type. When the two pick different RRsets, Rust's
 /// answer is still one RRset with the additional data Lean's has (none,
 /// for an answer to ANY), and asked for the type of Lean's RRset, Rust must
 /// answer with Lean's RCODE, AA, answer, and authority.
@@ -1417,7 +1419,8 @@ fn compare_answer(
     let exact = compare_response(expected, response);
     let lean_answer = texts(expected, "answer");
     let lean_sets = rrsets_of(&lean_answer);
-    let one_rrset = any == AnyResponse::OneRrset && req.question.query_type() == RecordType::ANY;
+    let one_rrset =
+        matches!(any, AnyResponse::OneRrset(_)) && req.question.query_type() == RecordType::ANY;
     if exact.is_ok() || !one_rrset || lean_sets.len() != 1 {
         return exact;
     }

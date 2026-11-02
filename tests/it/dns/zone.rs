@@ -953,7 +953,13 @@ fn any_follows_rfc_8482() {
             row("www.example.", RecordType::TXT)
         ]
     );
-    let one = any(AnyResponse::OneRrset);
+    let one = any(AnyResponse::OneRrset(RecordType::TXT));
+    assert_eq!(
+        rows(&one.answers),
+        vec![row("www.example.", RecordType::TXT)]
+    );
+    // Without an RRset of the type it prefers, the first in type order.
+    let one = any(AnyResponse::OneRrset(RecordType::MX));
     assert_eq!(rows(&one.answers), vec![row("www.example.", RecordType::A)]);
     let hinfo = any(AnyResponse::Hinfo);
     assert_eq!(
@@ -1038,9 +1044,38 @@ fn rrsigs_travel_only_with_do() {
         ]
     );
 
-    // ANY without DO leaves NSEC and RRSIG out (RFC 4035 §3.2.1).
+    // A server that answers ANY with every RRset sends NSEC and RRSIG
+    // without DO, as the root servers do: it counts ANY as asking for
+    // them (RFC 4035 §3.2.1).
     let any = ask(&zone, "www.signed.", RecordType::ANY);
-    assert_eq!(rows(&any.answers), vec![row("www.signed.", RecordType::A)]);
+    assert_eq!(
+        rows(&any.answers),
+        vec![
+            row("www.signed.", RecordType::A),
+            row("www.signed.", RecordType::NSEC),
+            row("www.signed.", RecordType::RRSIG),
+            row("www.signed.", RecordType::RRSIG)
+        ]
+    );
+    // One that sends one RRset leaves them out.
+    let one = |qname: &str, rtype| match answer(
+        &zone,
+        &request(qname, RecordType::ANY, false),
+        AnyResponse::OneRrset(rtype),
+    ) {
+        Answered::Response(response) => rows(&response.message.answers),
+        Answered::Unknown { name } => panic!("unknown at {name}"),
+    };
+    assert_eq!(
+        one("www.signed.", RecordType::NSEC),
+        vec![row("www.signed.", RecordType::A)]
+    );
+    // It sends the RRset of the type it prefers: the SOA at the apex,
+    // though NS comes first in type order.
+    assert_eq!(
+        one("signed.", RecordType::SOA),
+        vec![row("signed.", RecordType::SOA)]
+    );
     let any = ask_do(&zone, "www.signed.", RecordType::ANY);
     let types: BTreeSet<RecordType> = any.answers.iter().map(|r| r.record_type()).collect();
     assert_eq!(

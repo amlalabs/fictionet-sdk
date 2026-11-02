@@ -153,7 +153,7 @@ pub const ROOT_LETTERS: [Letter; 13] = [
         Ipv6Addr::new(0x2801, 0x1b8, 0x10, 0, 0, 0, 0, 0xb),
         "USC-ISI",
         1232,
-        AnyResponse::OneRrset,
+        AnyResponse::OneRrset(RecordType::NS),
     ),
     letter(
         "c.root-servers.net.",
@@ -201,7 +201,7 @@ pub const ROOT_LETTERS: [Letter; 13] = [
         Ipv6Addr::new(0x2001, 0x500, 0x1, 0, 0, 0, 0, 0x53),
         "US Army (ARL)",
         1232,
-        AnyResponse::OneRrset,
+        AnyResponse::OneRrset(RecordType::SOA),
     ),
     letter(
         "i.root-servers.net.",
@@ -217,7 +217,7 @@ pub const ROOT_LETTERS: [Letter; 13] = [
         Ipv6Addr::new(0x2001, 0x503, 0xc27, 0, 0, 0, 0x2, 0x30),
         "Verisign",
         1472,
-        AnyResponse::OneRrset,
+        AnyResponse::OneRrset(RecordType::NS),
     ),
     letter(
         "k.root-servers.net.",
@@ -225,7 +225,7 @@ pub const ROOT_LETTERS: [Letter; 13] = [
         Ipv6Addr::new(0x2001, 0x7fd, 0, 0, 0, 0, 0, 0x1),
         "RIPE NCC",
         1232,
-        AnyResponse::OneRrset,
+        AnyResponse::OneRrset(RecordType::NS),
     ),
     letter(
         "l.root-servers.net.",
@@ -233,7 +233,7 @@ pub const ROOT_LETTERS: [Letter; 13] = [
         Ipv6Addr::new(0x2001, 0x500, 0x9f, 0, 0, 0, 0, 0x42),
         "ICANN",
         4096,
-        AnyResponse::OneRrset,
+        AnyResponse::OneRrset(RecordType::SOA),
     ),
     letter(
         "m.root-servers.net.",
