@@ -31,8 +31,8 @@ use std::time::SystemTime;
 use fictionet::Cx;
 use fictionet::stdlib::protocols::dns::Response;
 use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RData};
-use fictionet::stdlib::services::dns::Event;
 use fictionet::stdlib::services::dns::resolver::Config;
+use fictionet::stdlib::services::dns::{Event, Generation};
 use fictionet::stdlib::services::tls::ServerConfig;
 use fictionet::stdlib::web;
 use fictionet::stdlib::world::net::dns::internet::{self, Egress, Location, Mirror};
@@ -86,11 +86,6 @@ pub fn net(
         LowerName::new(&Name::from_ascii(ntp::HOST).expect("a valid name")),
         ntp::host(pages.clone()),
     );
-    // The search engines are the world's own in every mode; a Copied
-    // capture need not hold their DNS.
-    let search_engines = route::SEARCH_HOSTS
-        .iter()
-        .map(|host| LowerName::new(&Name::from_ascii(host).expect("a valid name")));
     let namespace = pages.namespace().clone();
     let clock = namespace.current().clock;
     let location = Location::san_francisco_bay_area(egress);
@@ -98,10 +93,7 @@ pub fn net(
     let handle = net.handle();
 
     let outbound = Outbound::new(pages.clone(), forwarded.keys().cloned());
-    let source = SessionSource::new(
-        pages.clone(),
-        forwarded.keys().cloned().chain(search_engines),
-    );
+    let source = SessionSource::new(pages.clone(), forwarded.keys().cloned());
     let sites = Arc::new(Sites {
         handle: handle.clone(),
         outbound: outbound.clone(),
@@ -113,6 +105,7 @@ pub fn net(
         forwarded,
         built: Mutex::default(),
         placed: Mutex::default(),
+        addresses: Mutex::new((namespace.current().generation, HashMap::new())),
     });
     let mirror = Mirror::new(Only::new(outbound.policy(), source), handle, &location)
         .namespace(&namespace)
@@ -189,35 +182,66 @@ struct Sites {
     built: Mutex<HashMap<LowerName, Host>>,
     /// Each name and address given a machine, or found unable to take one.
     placed: Mutex<HashSet<(LowerName, Ipv4Addr)>>,
+    /// The session's relayed IPv4 addresses of each name, its own or those
+    /// at the end of its CNAME chain, for the session they belong to.
+    addresses: Mutex<(Generation, HashMap<LowerName, HashSet<Ipv4Addr>>)>,
 }
 
 impl Sites {
     /// Places a machine at each IPv4 address `reply`, a relayed reply,
     /// gives in an A record, for the record's name and every name a
     /// relayed CNAME made an alias of it, as long as the session lets the
-    /// name out. A name is placed at an address once: several names at one
-    /// address share its machine, and TLS tells them apart by SNI, as at a
-    /// CDN's address.
+    /// name out. A CNAME whose target's addresses an earlier reply gave
+    /// places its owner there too, since a resolver that has the target's
+    /// addresses cached does not ask for them again. A name is placed at
+    /// an address once: several names at one address share its machine,
+    /// and TLS tells them apart by SNI, as at a CDN's address.
     ///
     /// The network has no IPv6, so AAAA records place nothing. An address
     /// the network refuses, such as one on the sandboxes' subnet, or one
     /// whose port 443 already serves the world's infrastructure, keeps no
     /// machine for the name.
     fn place(&self, reply: &Response) {
+        let mut found: Vec<(LowerName, Ipv4Addr)> = reply
+            .message
+            .answers
+            .iter()
+            .filter_map(|record| match &record.data {
+                RData::A(a) if internet::globally_reachable(a.0.into()) => {
+                    Some((LowerName::new(&record.name), a.0))
+                }
+                _ => None,
+            })
+            .collect();
+        let mut addresses = self.addresses.lock();
+        let generation = self.pages.namespace().current().generation;
+        if addresses.0 != generation {
+            *addresses = (generation, HashMap::new());
+        }
+        for (name, addr) in &found {
+            addresses.1.entry(name.clone()).or_default().insert(*addr);
+        }
         for record in &reply.message.answers {
-            let RData::A(a) = &record.data else {
-                continue;
-            };
-            if !routable(a.0) {
-                continue;
+            if let RData::CNAME(cname) = &record.data
+                && let Some(known) = addresses.1.get(&LowerName::new(&cname.0))
+            {
+                let owner = LowerName::new(&record.name);
+                found.extend(known.iter().map(|addr| (owner.clone(), *addr)));
             }
-            let owner = LowerName::new(&record.name);
-            let aliases = self.outbound.aliases(&owner);
-            for name in std::iter::once(owner).chain(aliases) {
-                if self.outbound.admits(&name) && self.placed.lock().insert((name.clone(), a.0)) {
-                    let _ = self.handle.add_host(self.host(&name).at(a.0));
+        }
+        let mut placing = Vec::new();
+        for (name, addr) in found {
+            let aliases = self.outbound.aliases(&name);
+            for name in std::iter::once(name).chain(aliases) {
+                addresses.1.entry(name.clone()).or_default().insert(addr);
+                if self.outbound.admits(&name) && self.placed.lock().insert((name.clone(), addr)) {
+                    placing.push((name, addr));
                 }
             }
+        }
+        drop(addresses);
+        for (name, addr) in placing {
+            let _ = self.handle.add_host(self.host(&name).at(addr));
         }
     }
 
@@ -297,22 +321,6 @@ impl Sites {
             })
             .into_host(&host)
     }
-}
-
-/// Whether `addr` is an address a host on the internet can have, by the
-/// IANA special-purpose registry (RFC 6890): not private, loopback,
-/// link-local, shared (RFC 6598), documentation, multicast, broadcast, or
-/// unspecified. A real name with such an address gets no machine there.
-fn routable(addr: Ipv4Addr) -> bool {
-    let shared = addr.octets()[0] == 100 && (addr.octets()[1] & 0xc0) == 64;
-    !(addr.is_private()
-        || addr.is_loopback()
-        || addr.is_link_local()
-        || addr.is_documentation()
-        || addr.is_multicast()
-        || addr.is_broadcast()
-        || addr.is_unspecified()
-        || shared)
 }
 
 /// A world kept in memory: its CA, its pages, the run's start on the host

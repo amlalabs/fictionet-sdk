@@ -1492,8 +1492,11 @@ const SPECIAL_PURPOSE: [(Prefix, bool); 50] = [
     (v6([0x8000, 0, 0, 0, 0, 0, 0, 0], 1), false),
 ];
 
-/// Whether `addr` is one a host on the internet can have.
-fn globally_reachable(addr: IpAddr) -> bool {
+/// Whether `addr` is one a host on the internet can have, by the IANA
+/// special-purpose registries (RFC 6890). The mirror places no relay or
+/// front at another address, and a world placing its own machines at
+/// relayed addresses can skip the same ones.
+pub fn globally_reachable(addr: IpAddr) -> bool {
     SPECIAL_PURPOSE
         .iter()
         .filter(|(block, _)| block.contains(addr))

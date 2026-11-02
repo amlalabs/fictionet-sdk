@@ -376,7 +376,7 @@ fn reverse(name: &LowerName) -> bool {
 /// A Copied session answers a question its capture lacks with silence, so
 /// a resolver caches a failure, not a negative answer. The exception is a
 /// question about a name the world serves in every session (the model
-/// gateway's, the time server's, and the search engines'), a name above
+/// gateway's and the time server's), a name above
 /// one, or a name server or alias target the hierarchy named while
 /// answering one: those go to the internet, or the agent would lose its
 /// model and its clock.
