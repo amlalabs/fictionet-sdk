@@ -127,39 +127,80 @@ pub(crate) const RESERVED_RANGES: [super::route::Prefix; 8] = [
     },
 ];
 
-pub(crate) const LOCAL_RANGES: [super::route::Prefix; 8] = [
+const fn block4(a: u8, b: u8, c: u8, d: u8, len: u8) -> super::route::Prefix {
     super::route::Prefix {
-        addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)),
-        len: 8,
-    },
+        addr: IpAddr::V4(Ipv4Addr::new(a, b, c, d)),
+        len,
+    }
+}
+
+const fn block6(segments: [u16; 8], len: u8) -> super::route::Prefix {
+    let [a, b, c, d, e, f, g, h] = segments;
     super::route::Prefix {
-        addr: IpAddr::V4(Ipv4Addr::new(172, 16, 0, 0)),
-        len: 12,
-    },
-    super::route::Prefix {
-        addr: IpAddr::V4(Ipv4Addr::new(192, 168, 0, 0)),
-        len: 16,
-    },
-    super::route::Prefix {
-        addr: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 0)),
-        len: 8,
-    },
-    super::route::Prefix {
-        addr: IpAddr::V6(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0)),
-        len: 7,
-    },
-    super::route::Prefix {
-        addr: IpAddr::V4(Ipv4Addr::new(169, 254, 0, 0)),
-        len: 16,
-    },
-    super::route::Prefix {
-        addr: IpAddr::V6(Ipv6Addr::LOCALHOST),
-        len: 128,
-    },
-    super::route::Prefix {
-        addr: IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0)),
-        len: 10,
-    },
+        addr: IpAddr::V6(Ipv6Addr::new(a, b, c, d, e, f, g, h)),
+        len,
+    }
+}
+
+/// The IANA IPv4 and IPv6 Special-Purpose Address Registries (RFC 6890),
+/// read on 2026-11-01: each block and whether its addresses are globally
+/// reachable. The most specific block holding an address decides. Blocks
+/// the registry gives no answer for (Teredo, 6to4, and the deprecated
+/// 6to4 relay and ORCHID blocks) count as not reachable.
+pub(crate) const SPECIAL_PURPOSE: [(super::route::Prefix, bool); 50] = [
+    (block4(0, 0, 0, 0, 8), false),
+    (block4(10, 0, 0, 0, 8), false),
+    (block4(100, 64, 0, 0, 10), false),
+    (block4(127, 0, 0, 0, 8), false),
+    (block4(169, 254, 0, 0, 16), false),
+    (block4(172, 16, 0, 0, 12), false),
+    (block4(192, 0, 0, 0, 24), false),
+    (block4(192, 0, 0, 9, 32), true),
+    (block4(192, 0, 0, 10, 32), true),
+    (block4(192, 0, 2, 0, 24), false),
+    (block4(192, 31, 196, 0, 24), true),
+    (block4(192, 52, 193, 0, 24), true),
+    (block4(192, 88, 99, 0, 24), false),
+    (block4(192, 168, 0, 0, 16), false),
+    (block4(192, 175, 48, 0, 24), true),
+    (block4(198, 18, 0, 0, 15), false),
+    (block4(198, 51, 100, 0, 24), false),
+    (block4(203, 0, 113, 0, 24), false),
+    (block4(240, 0, 0, 0, 4), false),
+    (block4(255, 255, 255, 255, 32), false),
+    (block6([0, 0, 0, 0, 0, 0, 0, 1], 128), false),
+    (block6([0, 0, 0, 0, 0, 0, 0, 0], 128), false),
+    (block6([0, 0, 0, 0, 0, 0xffff, 0, 0], 96), false),
+    (block6([0x64, 0xff9b, 0, 0, 0, 0, 0, 0], 96), true),
+    (block6([0x64, 0xff9b, 1, 0, 0, 0, 0, 0], 48), false),
+    (block6([0x100, 0, 0, 0, 0, 0, 0, 0], 64), false),
+    (block6([0x100, 0, 0, 1, 0, 0, 0, 0], 64), false),
+    (block6([0x2001, 0, 0, 0, 0, 0, 0, 0], 23), false),
+    (block6([0x2001, 0, 0, 0, 0, 0, 0, 0], 32), false),
+    (block6([0x2001, 1, 0, 0, 0, 0, 0, 1], 128), true),
+    (block6([0x2001, 1, 0, 0, 0, 0, 0, 2], 128), true),
+    (block6([0x2001, 1, 0, 0, 0, 0, 0, 3], 128), true),
+    (block6([0x2001, 2, 0, 0, 0, 0, 0, 0], 48), false),
+    (block6([0x2001, 3, 0, 0, 0, 0, 0, 0], 32), true),
+    (block6([0x2001, 4, 0x112, 0, 0, 0, 0, 0], 48), true),
+    (block6([0x2001, 0x10, 0, 0, 0, 0, 0, 0], 28), false),
+    (block6([0x2001, 0x20, 0, 0, 0, 0, 0, 0], 28), true),
+    (block6([0x2001, 0x30, 0, 0, 0, 0, 0, 0], 28), true),
+    (block6([0x2001, 0xdb8, 0, 0, 0, 0, 0, 0], 32), false),
+    (block6([0x2002, 0, 0, 0, 0, 0, 0, 0], 16), false),
+    (block6([0x2620, 0x4f, 0x8000, 0, 0, 0, 0, 0], 48), true),
+    (block6([0x3fff, 0, 0, 0, 0, 0, 0, 0], 20), false),
+    (block6([0x5f00, 0, 0, 0, 0, 0, 0, 0], 16), false),
+    (block6([0xfc00, 0, 0, 0, 0, 0, 0, 0], 7), false),
+    (block6([0xfe80, 0, 0, 0, 0, 0, 0, 0], 10), false),
+    // Not in the registries, and no host's unicast address: multicast
+    // (RFC 5771, RFC 4291 §2.7) and the rest of the IPv6 space outside
+    // global unicast (RFC 4291 §2.4).
+    (block4(224, 0, 0, 0, 4), false),
+    (block6([0xff00, 0, 0, 0, 0, 0, 0, 0], 8), false),
+    (block6([0, 0, 0, 0, 0, 0, 0, 0], 3), false),
+    (block6([0x4000, 0, 0, 0, 0, 0, 0, 0], 2), false),
+    (block6([0x8000, 0, 0, 0, 0, 0, 0, 0], 1), false),
 ];
 
 /// Whether an address is in benchmarking, documentation, shared address
@@ -172,13 +213,19 @@ pub fn reserved_address(address: IpAddr) -> bool {
     RESERVED_RANGES.iter().any(|range| range.contains(address))
 }
 
-/// Whether an address is unsuitable for a public internet host: the ranges
-/// in [`reserved_address`] plus private, loopback, link-local and unique
-/// local space. IPv4-mapped addresses use IPv4 rules.
-/// This covers these ranges, rather than every IANA special-purpose range.
+/// Whether an address is one no host on the public internet can have, by
+/// the IANA special-purpose registries (RFC 6890): the most specific block
+/// holding it is not globally reachable. That takes in the ranges of
+/// [`reserved_address`], private, loopback, link-local and unique local
+/// space, multicast, and IPv6 outside global unicast. IPv4-mapped
+/// addresses use IPv4 rules.
 pub fn non_public_address(address: IpAddr) -> bool {
     let address = unmapped(address);
-    reserved_address(address) || LOCAL_RANGES.iter().any(|range| range.contains(address))
+    SPECIAL_PURPOSE
+        .iter()
+        .filter(|(block, _)| block.contains(address))
+        .max_by_key(|(block, _)| block.len)
+        .is_some_and(|(_, reachable)| !reachable)
 }
 
 fn unmapped(address: IpAddr) -> IpAddr {
@@ -1748,24 +1795,43 @@ mod tests {
 
     #[test]
     fn address_rules_distinguish_local_and_reserved_space() {
-        for (ranges, reserved) in [(&RESERVED_RANGES[..], true), (&LOCAL_RANGES[..], false)] {
-            for range in ranges {
-                for address in [range.addr, range.last()] {
-                    assert_eq!(reserved_address(address), reserved, "{address}");
+        let unreachable = SPECIAL_PURPOSE
+            .iter()
+            .filter(|(_, reachable)| !reachable)
+            .map(|(block, _)| *block);
+        let reserved = RESERVED_RANGES.iter().copied();
+        for (range, is_reserved) in reserved.map(|r| (r, true)).chain(unreachable.map(|r| (r, false))) {
+            for address in [range.addr, range.last()] {
+                if !is_reserved {
                     assert!(non_public_address(address), "{address}");
-                    if let IpAddr::V4(address) = address {
-                        let mapped = address.to_ipv6_mapped().into();
-                        assert_eq!(reserved_address(mapped), reserved, "{mapped}");
-                        assert!(non_public_address(mapped), "{mapped}");
-                    }
+                    continue;
+                }
+                assert!(reserved_address(address), "{address}");
+                assert!(non_public_address(address), "{address}");
+                if let IpAddr::V4(address) = address {
+                    let mapped = address.to_ipv6_mapped().into();
+                    assert!(reserved_address(mapped), "{mapped}");
+                    assert!(non_public_address(mapped), "{mapped}");
                 }
             }
+        }
+        // Private, loopback, link-local and unique local space, multicast,
+        // and IPv6 outside global unicast are no public host's, but are not
+        // reserved.
+        for address in [
+            "10.0.0.1", "172.31.255.255", "192.168.1.1", "127.0.0.1", "169.254.0.1",
+            "::ffff:10.0.0.1", "fc00::1", "fdff::1", "::1", "fe80::1", "224.0.0.1",
+            "0.0.0.1", "ff02::1", "fe7f:ffff::1", "fec0::1", "fbff::1", "fe00::1",
+        ] {
+            let address = address.parse().unwrap();
+            assert!(!reserved_address(address), "{address}");
+            assert!(non_public_address(address), "{address}");
         }
         for address in [
             "104.18.0.1", "104.19.255.254", "2606:4700:100::1",
             "172.15.255.255", "172.32.0.0", "100.63.255.255", "100.128.0.0",
-            "169.253.255.255", "169.255.0.0", "fe7f:ffff::1", "fec0::1",
-            "fbff::1", "fe00::1", "::ffff:104.18.0.1",
+            "169.253.255.255", "169.255.0.0", "192.0.0.9", "2001:4:112::1",
+            "::ffff:104.18.0.1",
         ] {
             let address = address.parse().unwrap();
             assert!(!reserved_address(address), "{address}");

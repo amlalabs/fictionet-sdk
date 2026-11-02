@@ -729,17 +729,17 @@ impl<V: Verify> Resolver<V> {
         if !self.config.aggressive_nsec {
             return None;
         }
-        let (zone, soa, records) = self.cache.secure_nsec(&key.name, self.now)?;
+        let (zone, soa, cached) = self.cache.secure_nsec(&key.name, self.now)?;
         let name = Name::from(&key.name);
         let zone_name = Name::from(zone);
-        let max = self.config.policy.max_nsec3_iterations;
-        let kind = if proof::nxdomain(&name, &zone_name, &records, max) == proof::Proof::Proven {
-            Negative::NxDomain
-        } else if proof::nodata(&name, key.rtype, &zone_name, &records, max) == proof::Proof::Proven
-        {
-            Negative::NoData
-        } else {
-            return None;
+        // The answer carries the records that prove it, and lives as long
+        // as they do (RFC 8198 §5.4).
+        let (kind, records) = match proof::nxdomain_nsecs(&name, &zone_name, &cached) {
+            Some(records) => (Negative::NxDomain, records),
+            None => (
+                Negative::NoData,
+                proof::nodata_nsecs(&name, key.rtype, &zone_name, &cached)?,
+            ),
         };
         let ttl = records
             .iter()
@@ -755,7 +755,13 @@ impl<V: Verify> Resolver<V> {
             denial: records.iter().map(|set| with_ttl(set, ttl)).collect(),
             zone: zone_name,
         };
-        let checks = subjects(&outcome)
+        let subjects = subjects(&outcome);
+        // Below a negative trust anchor nothing is validated (RFC 7646
+        // §2), so validated NSEC records prove nothing there.
+        if subjects.iter().any(|subject| self.negative_anchor(subject)) {
+            return None;
+        }
+        let checks = subjects
             .into_iter()
             .map(|subject| (subject, Validation::Secure))
             .collect();
@@ -842,9 +848,9 @@ impl<V: Verify> Resolver<V> {
     ///
     /// With `relay_cd`, the lookup forwards a client's CD bit, as a
     /// forwarder that does not validate relays the client's header: it
-    /// shares no lookup with questions asked without CD, and a failure the
-    /// cache holds does not answer it, since a server that validates may
-    /// have failed only the question without CD.
+    /// shares no lookup with questions asked without CD, caches nothing it
+    /// learns, and a failure the cache holds does not answer it, since a
+    /// server that validates may have failed only the question without CD.
     pub(super) fn depend(
         &mut self,
         from: Node,
@@ -1603,6 +1609,10 @@ impl<V: Verify> Resolver<V> {
         } else {
             Rank::AuthAnswer
         };
+        // What a lookup that relays a client's CD bit learns may be data a
+        // validating upstream fails for every client without CD (RFC 4035
+        // §3.2.2), so it serves that lookup alone and is never cached.
+        let rank = (!lookup.relay_cd).then_some(rank);
 
         if rcode == ResponseCode::YXDomain {
             // RFC 6672 §2.2: the DNAME above the name would make it longer
@@ -1629,7 +1639,9 @@ impl<V: Verify> Resolver<V> {
             else {
                 return self.give_up(exchange, true, entropy);
             };
-            self.store_glue(&answers, &additional, &zone);
+            if rank.is_some() {
+                self.store_glue(&answers, &additional, &zone);
+            }
             if exchange.minimised {
                 return self.through(id, &sname, entropy);
             }
@@ -1660,8 +1672,10 @@ impl<V: Verify> Resolver<V> {
         {
             let cut = ns.name().to_lowercase();
             // RFC 1034 §5.3.3: a referral moves strictly closer to the
-            // name. Anything else is a broken server.
-            if !cut.zone_of(&sname) {
+            // name. Anything else is a broken server. A forwarder was asked
+            // to recurse (RFC 1034 §4.3.1), so a referral from it is no
+            // step closer: it does not recurse.
+            if exchange.forwarded || !cut.zone_of(&sname) {
                 return self.give_up(exchange, true, entropy);
             }
             self.cache.insert(
@@ -1716,7 +1730,8 @@ impl<V: Verify> Resolver<V> {
         self.plan(id, entropy);
     }
 
-    /// Ends lookup `id` with a negative answer, offered to the cache.
+    /// Ends lookup `id` with a negative answer, offered to the cache
+    /// unless the lookup relays a client's CD bit.
     fn negative(
         &mut self,
         id: LookupId,
@@ -1726,17 +1741,24 @@ impl<V: Verify> Resolver<V> {
         denial: Vec<RecordSet>,
         zone: Name,
     ) {
-        self.cache.insert(
-            self.now,
-            Offer::Negative {
-                key: key.clone(),
-                kind,
-                soa: soa.clone(),
-                denial: denial.clone(),
-                validation: Validation::NotPerformed,
-                truncated: false,
-            },
-        );
+        if self
+            .graph
+            .lookups
+            .get(&id)
+            .is_some_and(|lookup| !lookup.relay_cd)
+        {
+            self.cache.insert(
+                self.now,
+                Offer::Negative {
+                    key: key.clone(),
+                    kind,
+                    soa: soa.clone(),
+                    denial: denial.clone(),
+                    validation: Validation::NotPerformed,
+                    truncated: false,
+                },
+            );
+        }
         let zone = soa.as_ref().map_or(zone, |soa| soa.name().to_lowercase());
         // The client sees the SOA at the negative TTL, as from the cache.
         let soa = soa.map(|soa| {
@@ -1755,19 +1777,19 @@ impl<V: Verify> Resolver<V> {
     }
 
     /// Offers the answer section's chain for `sname` and `stype` to the
-    /// cache: the RRsets of the asked type at the name, or the CNAMEs from
-    /// it and what they lead to inside the zone. When the chain ends in the
-    /// zone without data, the reply's RCODE and SOA are the last name's
-    /// (RFC 6604 §2), and that negative is offered too. Returns what the
-    /// answer says about `sname` itself, or `None` when it holds nothing
-    /// for it.
+    /// cache at `rank`, or to nothing when `rank` is `None`: the RRsets of
+    /// the asked type at the name, or the CNAMEs from it and what they lead
+    /// to inside the zone. When the chain ends in the zone without data,
+    /// the reply's RCODE and SOA are the last name's (RFC 6604 §2), and
+    /// that negative is offered too. Returns what the answer says about
+    /// `sname` itself, or `None` when it holds nothing for it.
     #[allow(clippy::too_many_arguments)]
     fn store_chain(
         &mut self,
         answers: &[RecordSet],
         sname: &Name,
         stype: RecordType,
-        rank: Rank,
+        rank: Option<Rank>,
         denial: &[RecordSet],
         rcode: ResponseCode,
         soa: &Option<RecordSet>,
@@ -1835,7 +1857,7 @@ impl<V: Verify> Resolver<V> {
             at = target;
         }
         // The chain ended inside the zone without data for the type.
-        if first.is_some() && soa.is_some() {
+        if first.is_some() && soa.is_some() && rank.is_some() {
             let kind = match rcode {
                 ResponseCode::NXDomain => Negative::NxDomain,
                 _ => Negative::NoData,
@@ -1855,7 +1877,12 @@ impl<V: Verify> Resolver<V> {
         first
     }
 
-    fn offer(&mut self, set: &RecordSet, rank: Rank, proof: Vec<RecordSet>) {
+    /// Offers `set` to the cache at `rank`, or nothing when `rank` is
+    /// `None`.
+    fn offer(&mut self, set: &RecordSet, rank: Option<Rank>, proof: Vec<RecordSet>) {
+        let Some(rank) = rank else {
+            return;
+        };
         self.cache.insert(
             self.now,
             Offer::Positive {

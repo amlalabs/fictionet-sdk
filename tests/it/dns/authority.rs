@@ -424,6 +424,28 @@ fn outside_every_zone_is_refused_with_ede_20() {
     assert!(reply.edns.is_some());
 }
 
+/// An answer to QCLASS * can never be authoritative (RFC 1034 §3.7.1):
+/// zones answer it FORMERR without AA, as BIND 9.20 does, for a name
+/// that exists and one that does not.
+#[test]
+fn qclass_any_gets_formerr_without_aa() {
+    let mut engine = AuthorityEngine::new(zones(vec![example()]), ServerConfig::generic(), local());
+    for qname in ["www.example.test.", "nx.example.test."] {
+        let any = query(qname, RecordType::A, |m| {
+            m.queries[0].set_query_class(DNSClass::ANY);
+        });
+        let reply = the_answer(&ask_with(&mut engine, &any, Transport::Udp));
+        assert_eq!(
+            reply.metadata.response_code,
+            ResponseCode::FormErr,
+            "{qname}"
+        );
+        assert!(!reply.metadata.authoritative, "{qname}");
+        assert!(reply.answers.is_empty(), "{qname}");
+        assert!(reply.authorities.is_empty(), "{qname}");
+    }
+}
+
 #[test]
 fn ds_at_a_hosted_child_is_answered_from_the_parent() {
     let key = ZoneKey::generate(&entropy(), Algorithm::Ed25519, KeyFlags::KSK);
@@ -527,7 +549,6 @@ fn chaos_questions_are_answered_by_name_from_the_identity() {
     let identity = Identity {
         unlisted: ChaosReply::rcode(ResponseCode::ServFail),
         aa: true,
-        other_types: None,
         ..Identity::none()
     }
     .answer(chaos::id_server(), ChaosAnswer::Txt("sjc07".to_string()))
@@ -573,23 +594,6 @@ fn chaos_questions_are_answered_by_name_from_the_identity() {
     ));
     assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
 
-    // A listed name with another type is a zone without that type, as
-    // BIND serves it: NODATA with AA and the name's own SOA.
-    let reply = the_answer(&ask_with(
-        &mut engine,
-        &chaos_query("id.server.", RecordType::A),
-        Transport::Udp,
-    ));
-    assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
-    assert!(reply.metadata.authoritative);
-    assert!(reply.answers.is_empty());
-    let RData::SOA(soa) = &reply.authorities[0].data else {
-        panic!("an SOA");
-    };
-    assert_eq!(soa.mname.to_string(), "id.server.");
-    assert_eq!(soa.rname.to_string(), "hostmaster.id.server.");
-    assert_eq!(reply.authorities[0].dns_class, DNSClass::CH);
-
     // The IN lookup never sees a CHAOS question.
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 
@@ -604,7 +608,7 @@ fn chaos_questions_are_answered_by_name_from_the_identity() {
         (
             Identity {
                 aa: false,
-                other_types: Some(ChaosReply::rcode(ResponseCode::Refused)),
+                other_types: ChaosReply::rcode(ResponseCode::Refused),
                 ..identity.clone()
             },
             false,
@@ -614,10 +618,10 @@ fn chaos_questions_are_answered_by_name_from_the_identity() {
         ),
         (
             Identity {
-                other_types: Some(ChaosReply {
+                other_types: ChaosReply {
                     edns: false,
                     ..ChaosReply::rcode(ResponseCode::NotImp)
-                }),
+                },
                 ..identity.clone()
             },
             true,
@@ -627,10 +631,10 @@ fn chaos_questions_are_answered_by_name_from_the_identity() {
         ),
         (
             Identity {
-                other_types: Some(ChaosReply {
+                other_types: ChaosReply {
                     ede: Some(not_supported.clone()),
                     ..ChaosReply::rcode(ResponseCode::NotImp)
-                }),
+                },
                 payload: Some(512),
                 ..identity
             },
@@ -668,6 +672,159 @@ fn chaos_questions_are_answered_by_name_from_the_identity() {
             ede
         );
     }
+}
+
+/// Each CHAOS name of a BIND server is a zone of its own, as c.root,
+/// g.root, and a local BIND 9.20 answered on 2026-11-02.
+#[test]
+fn bind_serves_each_chaos_name_as_a_zone() {
+    let identity = Identity::none()
+        .answer(
+            chaos::hostname_bind(),
+            ChaosAnswer::Zone(Some("lax1a".to_string())),
+        )
+        .answer(chaos::authors_bind(), ChaosAnswer::Zone(None))
+        .answer(
+            chaos::version_server(),
+            ChaosAnswer::Reply(ChaosReply::rcode(ResponseCode::Refused)),
+        );
+    let server = ServerConfig {
+        identity: Some(identity),
+        ..ServerConfig::generic()
+    };
+    let mut engine = AuthorityEngine::new(zones(vec![example()]), server, local());
+    let mut ask = |qname: &str, qtype: RecordType, rd: bool| {
+        let message = query(qname, qtype, |m| {
+            m.queries[0].set_query_class(DNSClass::CH);
+            m.metadata.recursion_desired = rd;
+        });
+        the_answer(&ask_with(&mut engine, &message, Transport::Udp))
+    };
+    let section = |records: &[Record]| -> Vec<(String, RecordType, u32)> {
+        records
+            .iter()
+            .map(|record| (record.name.to_string(), record.record_type(), record.ttl))
+            .collect()
+    };
+    let host = |kind: RecordType, ttl: u32| ("hostname.bind.".to_string(), kind, ttl);
+    use RecordType::{A, ANY, NS as Ns, SOA as Soa, TXT as Txt};
+
+    // (question, RD, RCODE, answer section, authority section)
+    let cases = [
+        // The text, with the zone's NS when RD is clear.
+        (
+            ("hostname.bind.", Txt),
+            false,
+            ResponseCode::NoError,
+            vec![host(Txt, 0)],
+            vec![host(Ns, 0)],
+        ),
+        (
+            ("hostname.bind.", Txt),
+            true,
+            ResponseCode::NoError,
+            vec![host(Txt, 0)],
+            vec![],
+        ),
+        // The zone's own SOA and NS are answers.
+        (
+            ("hostname.bind.", Soa),
+            false,
+            ResponseCode::NoError,
+            vec![host(Soa, 86400)],
+            vec![host(Ns, 0)],
+        ),
+        (
+            ("hostname.bind.", Ns),
+            false,
+            ResponseCode::NoError,
+            vec![host(Ns, 0)],
+            vec![],
+        ),
+        (
+            ("hostname.bind.", ANY),
+            false,
+            ResponseCode::NoError,
+            vec![host(Txt, 0), host(Soa, 86400), host(Ns, 0)],
+            vec![],
+        ),
+        // Another type is NODATA with the SOA.
+        (
+            ("hostname.bind.", A),
+            false,
+            ResponseCode::NoError,
+            vec![],
+            vec![host(Soa, 86400)],
+        ),
+        // Below the zone is NXDOMAIN with the SOA, TTL 0 for an SOA question.
+        (
+            ("foo.hostname.bind.", Txt),
+            false,
+            ResponseCode::NXDomain,
+            vec![],
+            vec![host(Soa, 86400)],
+        ),
+        (
+            ("foo.hostname.bind.", Soa),
+            false,
+            ResponseCode::NXDomain,
+            vec![],
+            vec![host(Soa, 0)],
+        ),
+        // A zone with no text.
+        (
+            ("authors.bind.", Txt),
+            false,
+            ResponseCode::NoError,
+            vec![],
+            vec![("authors.bind.".to_string(), Soa, 86400)],
+        ),
+        // A name that is not a zone, and what is below it.
+        (
+            ("version.server.", Txt),
+            false,
+            ResponseCode::Refused,
+            vec![],
+            vec![],
+        ),
+        (
+            ("foo.version.server.", Txt),
+            false,
+            ResponseCode::Refused,
+            vec![],
+            vec![],
+        ),
+    ];
+    for ((qname, qtype), rd, rcode, answers, authorities) in cases {
+        let reply = ask(qname, qtype, rd);
+        let case = format!("{qname} {qtype} rd={rd}: {reply}");
+        assert_eq!(reply.metadata.response_code, rcode, "{case}");
+        assert_eq!(
+            reply.metadata.authoritative,
+            rcode != ResponseCode::Refused,
+            "{case}"
+        );
+        assert_eq!(section(&reply.answers), answers, "{case}");
+        assert_eq!(section(&reply.authorities), authorities, "{case}");
+        assert!(
+            reply
+                .answers
+                .iter()
+                .chain(&reply.authorities)
+                .all(|r| r.dns_class == DNSClass::CH),
+            "{case}"
+        );
+    }
+    let reply = ask("hostname.bind.", Soa, false);
+    let RData::SOA(soa) = &reply.answers[0].data else {
+        panic!("an SOA");
+    };
+    assert_eq!(soa.mname.to_string(), "hostname.bind.");
+    assert_eq!(soa.rname.to_string(), "hostmaster.hostname.bind.");
+    assert_eq!(
+        (soa.serial, soa.refresh, soa.retry, soa.expire, soa.minimum),
+        (0, 28800, 7200, 604800, 86400)
+    );
 }
 
 #[test]

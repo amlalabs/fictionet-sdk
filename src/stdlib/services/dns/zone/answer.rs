@@ -327,6 +327,7 @@ impl<'v> Walk<'v> {
                 self.referral(&cut, ns, ds, glue)
             }
             Loc::Dname(owner, dname) => self.substitute(name, &owner, dname),
+            Loc::Node(Node::Empty) if !self.view.answers_empty() => Err(name.clone()),
             Loc::Node(node) => self.exact(name, &node.rrsets(), None),
             Loc::Absent(encloser) => {
                 let wild = wildcard(&encloser);
@@ -340,6 +341,7 @@ impl<'v> Walk<'v> {
                         }))
                     }
                     Some(Node::Cut { ns, ds, glue }) => self.referral(&wild, ns, ds.as_ref(), glue),
+                    Some(Node::Empty) if !self.view.answers_empty() => Err(wild),
                     Some(node) => self.exact(name, &node.rrsets(), Some(&encloser)),
                 }
             }

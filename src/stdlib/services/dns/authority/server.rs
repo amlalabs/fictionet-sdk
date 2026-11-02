@@ -8,7 +8,7 @@ use std::time::Duration;
 use fictionet::stdlib::protocols::dns::op::{Edns, Header, Message, MessageType, ResponseCode};
 use fictionet::stdlib::protocols::dns::read_message;
 use fictionet::stdlib::protocols::dns::rr::rdata::opt::EdnsCode;
-use fictionet::stdlib::protocols::dns::rr::rdata::{SOA, TXT};
+use fictionet::stdlib::protocols::dns::rr::rdata::{NS, SOA, TXT};
 use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, Name, RData, Record, RecordType};
 use fictionet::stdlib::protocols::dns::serialize::binary::{BinDecodable, BinDecoder};
 use fictionet::stdlib::protocols::dns::{
@@ -334,17 +334,15 @@ pub struct Identity {
     /// Answers by name. Real servers answer the names of [`chaos`] and
     /// more of their own.
     pub chaos: BTreeMap<LowerName, ChaosAnswer>,
-    /// The reply for a CHAOS-class name not in [`chaos`](Identity::chaos).
+    /// The reply for a CHAOS-class name not in [`chaos`](Identity::chaos)
+    /// and not below one of its [zones](ChaosAnswer::Zone).
     pub unlisted: ChaosReply,
     /// The reply to a question of a type other than TXT or ANY, for every
-    /// name. `None` when each name with text is a zone of its own, as BIND
-    /// serves its CHAOS names (c, g, i, and m at the root on 2026-11-02):
-    /// such a name answers NODATA with AA and its own SOA,
-    /// `<name> SOA <name> hostmaster.<name> 0 28800 7200 604800 86400`
-    /// with TTL 86400, and the other names give their own replies.
-    pub other_types: Option<ChaosReply>,
-    /// Whether its TXT answers set AA. BIND and some Verisign instances
-    /// set it; NSD, Knot, and the public resolvers leave it clear.
+    /// name that is not a [zone](ChaosAnswer::Zone) or below one.
+    pub other_types: ChaosReply,
+    /// Whether its [`Txt`](ChaosAnswer::Txt) answers set AA. Some Verisign
+    /// instances set it; NSD, Knot, and the public resolvers leave it
+    /// clear.
     pub aa: bool,
     /// The name server identifier sent to a query that asks for one
     /// (RFC 5001).
@@ -364,7 +362,7 @@ impl Identity {
         Identity {
             chaos: BTreeMap::new(),
             unlisted: ChaosReply::rcode(ResponseCode::Refused),
-            other_types: Some(ChaosReply::rcode(ResponseCode::Refused)),
+            other_types: ChaosReply::rcode(ResponseCode::Refused),
             aa: false,
             nsid: None,
             ttl: 0,
@@ -388,14 +386,27 @@ impl Identity {
     /// adds its header details and EDNS, and whether it has an OPT record
     /// when the query had one:
     ///
-    /// - A name with text, asked for TXT or ANY, gets it as one TXT record
-    ///   with the identity's TTL, and AA as [`aa`](Identity::aa) says.
-    /// - Any other type gets [`other_types`](Identity::other_types), or,
-    ///   without it, NODATA from the name's own zone, as BIND gives.
+    /// - A name at or below a [zone](ChaosAnswer::Zone) gets the zone's
+    ///   answer.
+    /// - Any other name asked for a type other than TXT or ANY gets
+    ///   [`other_types`](Identity::other_types).
+    /// - A [`Txt`](ChaosAnswer::Txt) name, asked for TXT or ANY, gets its
+    ///   text as one TXT record with the identity's TTL, and AA as
+    ///   [`aa`](Identity::aa) says.
     /// - A name with a reply of its own gets it, and an unlisted name gets
     ///   [`unlisted`](Identity::unlisted).
     pub fn reply(&self, req: &Request) -> (Response, bool) {
         let qname = LowerName::new(req.question.name());
+        let zone = self.chaos.iter().find_map(|(name, answer)| match answer {
+            ChaosAnswer::Zone(text) if name.zone_of(&qname) => Some((name, text)),
+            _ => None,
+        });
+        if let Some((apex, text)) = zone {
+            return (
+                self.zone_reply(req, &Name::from(apex), text.as_deref()),
+                true,
+            );
+        }
         let other = !matches!(req.question.query_type(), RecordType::TXT | RecordType::ANY);
         let empty = |reply: &ChaosReply| {
             (
@@ -403,29 +414,67 @@ impl Identity {
                 reply.edns,
             )
         };
-        match (self.chaos.get(&qname), other, &self.other_types) {
-            (_, true, Some(reply)) => empty(reply),
-            (Some(ChaosAnswer::Txt(text)), false, _) => {
+        match self.chaos.get(&qname) {
+            _ if other => empty(&self.other_types),
+            Some(ChaosAnswer::Txt(text)) => {
                 let mut response = bare_reply(req, ResponseCode::NoError, None);
                 response.message.metadata.authoritative = self.aa;
-                let txt = RData::TXT(TXT::new(vec![text.clone()]));
-                let mut record = Record::from_rdata(req.question.name().clone(), self.ttl, txt);
-                record.dns_class = DNSClass::CH;
-                response.message.answers.push(record);
-                (response, true)
-            }
-            (Some(ChaosAnswer::Txt(_)), true, None) => {
-                let mut response = bare_reply(req, ResponseCode::NoError, None);
-                response.message.metadata.authoritative = true;
                 response
                     .message
-                    .authorities
-                    .push(zone_soa(req.question.name()));
+                    .answers
+                    .push(self.txt(req.question.name(), text));
                 (response, true)
             }
-            (Some(ChaosAnswer::Reply(reply)), _, _) => empty(reply),
-            (None, _, _) => empty(&self.unlisted),
+            Some(ChaosAnswer::Reply(reply)) => empty(reply),
+            Some(ChaosAnswer::Zone(_)) | None => empty(&self.unlisted),
         }
+    }
+
+    /// The reply to `req` from the CHAOS zone at `apex`, with TXT `text`
+    /// there if any, as BIND gives it: AA always; the zone's records of
+    /// the type asked, and its NS in the authority section when RD is
+    /// clear and the answer lacks it, as BIND's default
+    /// `minimal-responses no-auth-recursive` does; NODATA with the SOA
+    /// for any other type; and NXDOMAIN with the SOA below the apex, the
+    /// SOA's TTL 0 when the question is for an SOA.
+    fn zone_reply(&self, req: &Request, apex: &Name, text: Option<&str>) -> Response {
+        let qtype = req.question.query_type();
+        let mut response = bare_reply(req, ResponseCode::NoError, None);
+        response.message.metadata.authoritative = true;
+        let mut soa = zone_soa(apex);
+        if req.question.name() != apex {
+            if qtype == RecordType::SOA {
+                soa.ttl = 0;
+            }
+            response.message.metadata.response_code = ResponseCode::NXDomain;
+            response.message.authorities.push(soa);
+            return response;
+        }
+        let ns = zone_ns(apex);
+        let txt = text.map(|text| self.txt(apex, text));
+        let answers: Vec<Record> = match qtype {
+            RecordType::TXT => txt.into_iter().collect(),
+            RecordType::SOA => vec![soa.clone()],
+            RecordType::NS => vec![ns.clone()],
+            RecordType::ANY => txt.into_iter().chain([soa.clone(), ns.clone()]).collect(),
+            _ => Vec::new(),
+        };
+        if answers.is_empty() {
+            response.message.authorities.push(soa);
+        } else if !req.rd && !answers.contains(&ns) {
+            response.message.authorities.push(ns);
+        }
+        response.message.answers = answers;
+        response
+    }
+
+    /// `text` at `name` as one CHAOS-class TXT record with the identity's
+    /// TTL.
+    fn txt(&self, name: &Name, text: &str) -> Record {
+        let txt = RData::TXT(TXT::new(vec![text.to_string()]));
+        let mut record = Record::from_rdata(name.clone(), self.ttl, txt);
+        record.dns_class = DNSClass::CH;
+        record
     }
 }
 
@@ -440,11 +489,26 @@ fn zone_soa(name: &Name) -> Record {
     record
 }
 
+/// The NS BIND gives the CHAOS zone at `name`: the name itself, TTL 0.
+fn zone_ns(name: &Name) -> Record {
+    let mut record = Record::from_rdata(name.clone(), 0, RData::NS(NS(name.clone())));
+    record.dns_class = DNSClass::CH;
+    record
+}
+
 /// A server's answer to a CHAOS-class question for one name.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ChaosAnswer {
-    /// One TXT string, at most 255 octets (RFC 1035 §3.3).
+    /// One TXT string, at most 255 octets (RFC 1035 §3.3), served without
+    /// a zone, as NSD, Knot, and Verisign's servers serve their CHAOS
+    /// names.
     Txt(String),
+    /// A zone of its own at the name, with this TXT string there if any,
+    /// as BIND serves each of its CHAOS names (c, g, i, and m at the root
+    /// on 2026-11-02): SOA
+    /// `<name> hostmaster.<name> 0 28800 7200 604800 86400` with TTL
+    /// 86400, and NS `<name>` with TTL 0.
+    Zone(Option<String>),
     /// No data, with this reply, as servers that refuse to say.
     Reply(ChaosReply),
 }

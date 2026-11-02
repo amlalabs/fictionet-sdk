@@ -515,6 +515,25 @@ fn master_file_faults_name_their_line() {
     assert_eq!(fault(" A 192.0.2.1\n"), (1, MasterError::NoOwner));
     assert_eq!(fault("www.example. A 192.0.2.1\n"), (1, MasterError::NoTtl));
     assert_eq!(fault("www A 192.0.2.1\n"), (1, MasterError::BadName));
+    // A relative name in the RDATA needs an origin as much as an owner does.
+    let soa = "example. 60 SOA ns1.example. hostmaster.example. 1 2 3 4 5\n\
+               example. 60 NS ns1.example.\n";
+    for line in [
+        "example. 60 SOA ns h 1 2 3 4 5",
+        "example. 60 NS ns1",
+        "www.example. 60 CNAME target",
+        "www.example. 60 MX 10 mail",
+    ] {
+        let text = if line.contains("SOA") {
+            format!("{line}\n")
+        } else {
+            format!("{soa}{line}\n")
+        };
+        let at = text.lines().count();
+        assert_eq!(fault(&text), (at, MasterError::BadName), "{line}");
+    }
+    let absolute = format!("{soa}www.example. 60 CNAME target.example.\n");
+    assert_eq!(Zone::from_master(&absolute, None).map(|_| ()), Ok(()));
     assert_eq!(
         fault("www.example. 60 A 192.0.2.1\n\n"),
         (2, MasterError::NoSoa)
@@ -1475,6 +1494,43 @@ fn transparent_turns_absence_into_unknown() {
     );
 }
 
+/// A transparent zone walks past an empty non-terminal on the way to a
+/// CNAME's target, and an answer that ends at one stays unknown, whether
+/// asked for or reached through a CNAME.
+#[test]
+fn transparent_walks_past_empty_non_terminals_to_a_cname_target() {
+    let zone = Zone::builder(name("example."), soa("example.", 300), 3600)
+        .rrset(rrset("example.", 3600, vec![ns("ns.example.")]))
+        .rrset(rrset("ns.example.", 3600, vec![a("192.0.2.1")]))
+        .rrset(rrset("www.example.", 3600, vec![cname("a.b.example.")]))
+        .rrset(rrset("a.b.example.", 3600, vec![a("192.0.2.3")]))
+        .rrset(rrset("ent.example.", 3600, vec![cname("b.example.")]))
+        .build()
+        .unwrap();
+    let transparent = Transparent(zone);
+    let reply = ask(
+        &*view_of(&transparent, "www.example.", RecordType::A),
+        "www.example.",
+        RecordType::A,
+    );
+    assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(reply.answers[0].record_type(), RecordType::CNAME);
+    assert_eq!(addresses(&reply.answers), vec!["192.0.2.3"]);
+    for qname in ["b.example.", "ent.example."] {
+        assert_eq!(
+            answer(
+                &*view_of(&transparent, qname, RecordType::A),
+                &request(qname, RecordType::A, false),
+                AnyResponse::All
+            ),
+            Answered::Unknown {
+                name: lower("b.example.")
+            },
+            "{qname}"
+        );
+    }
+}
+
 /// Shown data answers only the types it holds at its one name: an A RRset
 /// says nothing about AAAA, SOA, or NS there, nor about any name below,
 /// so those stay unknown and never become NODATA or a made-up apex.
@@ -1526,6 +1582,27 @@ fn shown_data_knows_only_its_own_rrsets() {
     assert_eq!(
         rows(&reply.answers),
         vec![row("www.example.", RecordType::CNAME)]
+    );
+    let reply = ask(
+        &*view_of(&alias, "www.example.", RecordType::ANY),
+        "www.example.",
+        RecordType::ANY,
+    );
+    assert_eq!(
+        rows(&reply.answers),
+        vec![row("www.example.", RecordType::CNAME)]
+    );
+    // It carries no RRSIGs, so which RRSIGs the name has is unknown, never
+    // NODATA under a made-up SOA.
+    assert_eq!(
+        answer(
+            &*view_of(&alias, "www.example.", RecordType::RRSIG),
+            &request("www.example.", RecordType::RRSIG, false),
+            AnyResponse::All
+        ),
+        Answered::Unknown {
+            name: lower("www.example.")
+        }
     );
 
     // Shown data holds one name's RRsets.

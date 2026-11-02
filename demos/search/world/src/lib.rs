@@ -29,6 +29,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
 
 use fictionet::Cx;
+use fictionet::stdlib::network::ip::non_public_address;
 use fictionet::stdlib::protocols::dns::op::Message;
 use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RData};
 use fictionet::stdlib::services::dns::Event;
@@ -110,9 +111,19 @@ pub fn net(
         built: Mutex::default(),
         placed: Mutex::default(),
         refusing: Mutex::default(),
+        refused: Mutex::default(),
         uncaptured: Mutex::default(),
         addresses: PerSession::new(),
     });
+    // A host refused once is served as soon as the session serves it.
+    {
+        let sites = Arc::downgrade(&sites);
+        pages.on_hosts_served(move || {
+            if let Some(sites) = sites.upgrade() {
+                sites.place_refused();
+            }
+        });
+    }
     let uncaptured = {
         let sites = sites.clone();
         Arc::new(Uncaptured::new(pages.clone(), move |name| {
@@ -164,9 +175,8 @@ pub fn net(
                 negative_anchors: Some(negative_anchors.clone()),
                 ..resolver.config(&location)
             };
-            // One engine and cache per sandbox, as `PublicResolver::recursive`.
-            let recursive = Recursive::new(config, clock)
-                .per_sandbox()
+            let recursive = resolver
+                .recursive(config, clock)
                 .namespace(&namespace)
                 .on_event(observe.clone());
             let (ca, served) = (resolver_ca.clone(), *resolver);
@@ -184,6 +194,7 @@ pub fn net(
                     .names(resolver.doh.iter().map(|name| {
                         Name::from_ascii(name).expect("a public resolver's name is valid")
                     }))
+                    .operator(resolver.doh_operator)
                     .date(start);
             // The primary address comes first, and its fronts serve the
             // resolver's DNS over HTTPS names elsewhere.
@@ -245,6 +256,10 @@ struct Sites {
     /// Addresses given a machine with no services, for names a session
     /// resolves but does not serve, so connections to them are refused.
     refusing: Mutex<HashSet<Ipv4Addr>>,
+    /// The addresses of each name refused that way, where its site goes
+    /// once a session serves it: a guest that resolved the name keeps
+    /// the address for the record's TTL.
+    refused: Mutex<HashMap<LowerName, HashSet<Ipv4Addr>>>,
     /// The address of each Copied host its capture gives none, which the
     /// world's own resolver answers with (`dns::Uncaptured`).
     uncaptured: Mutex<HashMap<LowerName, Ipv4Addr>>,
@@ -274,7 +289,7 @@ impl Sites {
             .answers
             .iter()
             .filter_map(|record| match &record.data {
-                RData::A(a) if internet::globally_reachable(a.0.into()) => {
+                RData::A(a) if !non_public_address(a.0.into()) => {
                     Some((LowerName::new(&record.name), a.0))
                 }
                 _ => None,
@@ -305,6 +320,11 @@ impl Sites {
                         // Live-Depth: the DNS is real, but the name is
                         // outside the depth. Its own machine refuses TCP,
                         // and a shared one has no site for its SNI.
+                        self.refused
+                            .lock()
+                            .entry(name.clone())
+                            .or_default()
+                            .insert(addr);
                         if self.refusing.lock().insert(addr)
                             && !self.handle.has_machine(addr.into())
                         {
@@ -322,6 +342,29 @@ impl Sites {
         });
         for (name, addr) in placing {
             let _ = self.handle.add_host(self.host(&name).at(addr));
+        }
+    }
+
+    /// Places the site of each name refused before that the session now
+    /// serves, at the addresses it was refused at, beside the machine with
+    /// no services there.
+    fn place_refused(&self) {
+        let refused: Vec<(LowerName, HashSet<Ipv4Addr>)> = self
+            .refused
+            .lock()
+            .iter()
+            .map(|(name, addrs)| (name.clone(), addrs.clone()))
+            .collect();
+        for (name, addrs) in refused {
+            if !self.outbound.admits(&name) || !self.serves(&name) {
+                continue;
+            }
+            self.refused.lock().remove(&name);
+            for addr in addrs {
+                if self.placed.lock().insert((name.clone(), addr)) {
+                    let _ = self.handle.add_host(self.host(&name).at(addr));
+                }
+            }
         }
     }
 

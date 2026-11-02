@@ -12,11 +12,16 @@
 //!   `application/dns-message`, answered in the same media type with a
 //!   `Cache-Control` freshness no longer than the answer's smallest TTL
 //!   (RFC 8484 §5.1);
-//! - `GET /resolve?name=...&type=...`, Google's JSON API, which answers
-//!   `application/json` unless `ct=application/dns-message` asks for the
-//!   message itself;
-//! - `GET /dns-query?name=...&type=...` with `Accept: application/dns-json`,
-//!   Cloudflare's form of the same JSON.
+//! - when its [`Operator`] serves it, `GET /resolve?name=...&type=...`,
+//!   Google's JSON API, which answers `application/json` unless
+//!   `ct=application/dns-message` asks for the message itself;
+//! - when its [`Operator`] serves it, `GET /dns-query?name=...&type=...`
+//!   with `Accept: application/dns-json`, Cloudflare's form of the same
+//!   JSON.
+//!
+//! What else a request gets, a path the server does not serve or a GET
+//! with no query, is the operator's own answer, so the fronts of a world's
+//! public resolvers answer as each real operator does.
 //!
 //! A query from either front reaches the resolver as a stream client
 //! ([`Transport::Tcp`]) from the connection's peer and sandbox, so a
@@ -57,6 +62,7 @@
 //! ```
 
 use std::convert::Infallible;
+use std::fmt;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
@@ -118,6 +124,49 @@ const MAX_MESSAGE: usize = u16::MAX as usize;
 /// What a TLS port's handshake gets its config from.
 type TlsFor = Arc<dyn Fn(&Cx) -> Arc<ServerConfig> + Send + Sync>;
 
+/// How one operator's DNS over HTTPS server answers past RFC 8484's
+/// `application/dns-message`: the JSON API it serves, if any, and its own
+/// answers to what it does not serve. A world plays a real operator with
+/// that operator's, as `internet::PUBLIC_RESOLVERS` gives them.
+pub trait Operator: Send + Sync + fmt::Debug {
+    /// Whether `GET /resolve` answers Google's JSON API.
+    fn resolve_json(&self) -> bool {
+        false
+    }
+
+    /// Whether `GET /dns-query` answers Cloudflare's JSON, as
+    /// `application/dns-json`, to a request that accepts it or asks for it
+    /// with `ct`.
+    fn dns_json(&self) -> bool {
+        false
+    }
+
+    /// The answer to `request`, for a path the server does not serve.
+    fn not_found(&self, request: &Request<Body>) -> Response<Body>;
+
+    /// The answer to `request`, a GET of `/dns-query` with no `dns`
+    /// parameter that the server takes no JSON question from.
+    fn no_query(&self, request: &Request<Body>) -> Response<Body>;
+}
+
+/// RFC 8484 alone, with plain text for what it does not serve: the fronts'
+/// operator unless [`Fronts::operator`] gives another.
+#[derive(Debug)]
+struct Rfc8484;
+
+impl Operator for Rfc8484 {
+    fn not_found(&self, _request: &Request<Body>) -> Response<Body> {
+        httpd::text(StatusCode::NOT_FOUND, "Not found.\n")
+    }
+
+    fn no_query(&self, _request: &Request<Body>) -> Response<Body> {
+        httpd::text(
+            StatusCode::BAD_REQUEST,
+            "The request has no dns parameter.\n",
+        )
+    }
+}
+
 /// DNS over TLS and over HTTPS in front of a [`Recursive`](super::Recursive),
 /// added to a host with [`dot`](Self::dot) and [`doh`](Self::doh). See the
 /// [module docs](self).
@@ -128,6 +177,7 @@ pub struct Fronts {
     names: Vec<LowerName>,
     at: Option<IpAddr>,
     date: Option<SystemTime>,
+    operator: &'static dyn Operator,
 }
 
 impl Fronts {
@@ -143,7 +193,15 @@ impl Fronts {
             names: Vec::new(),
             at: None,
             date: None,
+            operator: &Rfc8484,
         }
+    }
+
+    /// Answers DNS over HTTPS as `operator` does past RFC 8484, such as a
+    /// public resolver's [`doh_operator`](super::internet::PublicResolver::doh_operator).
+    /// Without it, the fronts serve RFC 8484 alone.
+    pub fn operator(self, operator: &'static dyn Operator) -> Fronts {
+        Fronts { operator, ..self }
     }
 
     /// The names DNS over HTTPS answers to, such as `cloudflare-dns.com`
@@ -204,6 +262,7 @@ impl Fronts {
         let mut server = httpd::Server::new(Doh {
             front: self.front(),
             names: self.names.clone(),
+            operator: self.operator,
         })
         .https()
         .default_host();
@@ -403,6 +462,7 @@ impl Pending for Answering {
 struct Doh {
     front: Arc<Front>,
     names: Vec<LowerName>,
+    operator: &'static dyn Operator,
 }
 
 /// What a request asks the resolver, and how its answer goes back.
@@ -449,7 +509,7 @@ impl Handler for Doh {
             );
             return Reply::Now(refusal.response());
         };
-        let asked = match ask(&request, ex) {
+        let asked = match ask(&request, self.operator, ex) {
             Ok(asked) => asked,
             Err(refusal) => return Reply::Now(refusal.response()),
         };
@@ -476,6 +536,8 @@ enum Refusal {
     /// A JSON API request refused with `400 Bad Request` and the reason
     /// in JSON, as Cloudflare refuses one.
     Json(String),
+    /// The operator's own answer.
+    Operator(Box<Response<Body>>),
 }
 
 impl Refusal {
@@ -499,6 +561,7 @@ impl Refusal {
                     .insert(CONTENT_TYPE, HeaderValue::from_static(JSON));
                 response
             }
+            Refusal::Operator(response) => *response,
         }
     }
 }
@@ -529,14 +592,19 @@ fn fqdn(host: &str) -> Option<LowerName> {
     Some(LowerName::new(&name))
 }
 
-/// The query `request` asks, or why it is refused.
-fn ask(request: &Request<Body>, ex: &mut Exchange<'_>) -> Result<Asked, Refusal> {
+/// The query `request` asks, or why it is refused, as `operator` refuses
+/// it where RFC 8484 does not say.
+fn ask(
+    request: &Request<Body>,
+    operator: &dyn Operator,
+    ex: &mut Exchange<'_>,
+) -> Result<Asked, Refusal> {
     let path = request.uri().path();
     let method = request.method();
     let allowed = match path {
         DNS_QUERY => "GET, POST",
-        RESOLVE => "GET",
-        _ => return Err(Refusal::Text(StatusCode::NOT_FOUND, "Not found.\n")),
+        RESOLVE if operator.resolve_json() => "GET",
+        _ => return Err(Refusal::Operator(Box::new(operator.not_found(request)))),
     };
     if *method == Method::POST && path == DNS_QUERY {
         return posted(request);
@@ -575,13 +643,10 @@ fn ask(request: &Request<Body>, ex: &mut Exchange<'_>) -> Result<Asked, Refusal>
         .iter()
         .filter_map(|value| value.to_str().ok())
         .any(|value| value.to_ascii_lowercase().contains(DNS_JSON));
-    if accepts_json || param("ct") == Some(DNS_JSON) {
+    if operator.dns_json() && (accepts_json || param("ct") == Some(DNS_JSON)) {
         return json_query(&form.pairs, Format::DnsJson, ex);
     }
-    Err(Refusal::Text(
-        StatusCode::BAD_REQUEST,
-        "The request has no dns parameter.\n",
-    ))
+    Err(Refusal::Operator(Box::new(operator.no_query(request))))
 }
 
 /// The DNS message a POST carries as its body (RFC 8484 §4.1).

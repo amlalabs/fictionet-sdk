@@ -259,6 +259,7 @@ impl<D: ZoneData> ZoneData for Signed<D> {
             revision: inner.revision(),
             soa: signing.sign_or_leave(soa),
             facts,
+            answers_empty: inner.answers_empty(),
             signing: self.signing.clone(),
         })
     }
@@ -477,6 +478,7 @@ struct SignedView {
     revision: Revision,
     soa: RecordSet,
     facts: BTreeMap<LowerName, Fact<Node>>,
+    answers_empty: bool,
     signing: Arc<Signing>,
 }
 
@@ -510,6 +512,10 @@ impl View for SignedView {
                 .map(|set| self.signing.sign_or_leave(set))
                 .collect()
         })
+    }
+
+    fn answers_empty(&self) -> bool {
+        self.answers_empty
     }
 
     fn sign(&self, set: &RecordSet) -> Option<RecordSet> {

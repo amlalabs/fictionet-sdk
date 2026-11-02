@@ -495,12 +495,12 @@ mod tests {
 
     #[test]
     fn default_pools_avoid_non_public_ranges() {
-        use fictionet::stdlib::network::ip::{LOCAL_RANGES, RESERVED_RANGES, non_public_address};
+        use fictionet::stdlib::network::ip::{SPECIAL_PURPOSE, non_public_address};
         for pool in [AUTO, AUTO6] {
             assert!(!non_public_address(pool.addr));
             assert!(!non_public_address(pool.last()));
-            for reserved in RESERVED_RANGES.into_iter().chain(LOCAL_RANGES) {
-                assert!(!pool.overlaps(reserved), "{pool:?} overlaps {reserved:?}");
+            for (block, _) in SPECIAL_PURPOSE.iter().filter(|(_, reachable)| !reachable) {
+                assert!(!pool.overlaps(*block), "{pool:?} overlaps {block:?}");
             }
         }
     }

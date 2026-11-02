@@ -28,7 +28,8 @@ use fictionet::stdlib::services::dns::resolver::Config;
 use fictionet::stdlib::services::dns::zone::{Denial, Zone, ZoneData};
 use fictionet::stdlib::services::dns::{Event, WallClock};
 use fictionet::stdlib::services::serve::Transport;
-use fictionet::stdlib::world::net::dns::encrypted::{Fronts, certificate};
+use fictionet::stdlib::web::httpd::{self, Body};
+use fictionet::stdlib::world::net::dns::encrypted::{Fronts, Operator, certificate};
 use fictionet::stdlib::world::net::dns::internet::PUBLIC_RESOLVERS;
 use fictionet::stdlib::world::net::dns::{Authoritative, Recursive};
 use fictionet::stdlib::world::net::{Host, Net};
@@ -37,7 +38,7 @@ use fictionet_extras::hyper_io::{Exec, Io};
 use fictionet_test_support::certs;
 use fictionet_test_support::sandbox::{Machine, TlsClient, client_config, machine};
 use fictionet_test_support::timeout;
-use http::{HeaderMap, Method, Request, StatusCode};
+use http::{HeaderMap, Method, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
 use rustls::RootCertStore;
 
@@ -200,6 +201,29 @@ fn recursive(anchors: Anchors, sent: &Arc<Mutex<Vec<Sent>>>) -> Recursive {
         })
 }
 
+/// An operator serving both JSON APIs, so each form of question answers
+/// from the one cache.
+#[derive(Debug)]
+struct BothJson;
+
+impl Operator for BothJson {
+    fn resolve_json(&self) -> bool {
+        true
+    }
+
+    fn dns_json(&self) -> bool {
+        true
+    }
+
+    fn not_found(&self, _request: &Request<Body>) -> Response<Body> {
+        httpd::text(StatusCode::NOT_FOUND, "Not found.\n")
+    }
+
+    fn no_query(&self, _request: &Request<Body>) -> Response<Body> {
+        httpd::text(StatusCode::BAD_REQUEST, "No query.\n")
+    }
+}
+
 /// The world: the hierarchy's servers, and at `RESOLVER` a validating
 /// resolver with one cache per sandbox and both encrypted fronts, whose
 /// certificate the world's CA issued for `dns.example` and the address.
@@ -213,6 +237,7 @@ fn start(fcx: &Cx, attachments: fictionet::Attachments) -> fictionet::Result<Env
     let resolver = recursive(anchors, &sent);
     let fronts = Fronts::new(resolver.handle(), move |_| tls.clone())
         .names([name("dns.example.")])
+        .operator(&BothJson)
         .date(date(NOW));
     Net::new()
         .ipv4_only()
@@ -863,6 +888,119 @@ fn a_front_on_another_host_answers_from_the_resolvers_cache() {
             sent.iter()
                 .all(|sent| sent.validation == Validation::Secure)
         );
+        Ok(())
+    });
+}
+
+/// Each public resolver's DNS over HTTPS answers as its operator's does,
+/// as seen on 2026-11-02: Google's JSON API at `/resolve` only at
+/// `dns.google`, Cloudflare's JSON at `/dns-query` only at
+/// `cloudflare-dns.com`, and each operator's own errors elsewhere.
+#[test]
+fn each_public_resolver_answers_dns_over_https_as_its_operator() {
+    world(Duration::from_secs(60), |fcx| async move {
+        let (attacher, attachments) = fictionet::attachments();
+        let (hosts, anchors) = authorities();
+        let names: Vec<&str> = PUBLIC_RESOLVERS
+            .iter()
+            .map(|resolver| resolver.doh[0].trim_end_matches('.'))
+            .collect();
+        let (ca, leaf) = certs::issue(&fcx, "World CA", &names)?;
+        let config = leaf.server_config(&fcx, date(NOW))?;
+        let mut roots = RootCertStore::empty();
+        roots.add(ca.cert_der())?;
+        let roots = Arc::new(roots);
+        let sent: Arc<Mutex<Vec<Sent>>> = Arc::default();
+        let resolver = recursive(anchors, &sent);
+        let address = |n: usize| Ipv4Addr::new(45, 33, 10, 1 + n as u8);
+        let fronts: Vec<Host> = PUBLIC_RESOLVERS
+            .iter()
+            .enumerate()
+            .map(|(n, public)| {
+                let config = config.clone();
+                Fronts::new(resolver.handle(), move |_| config.clone())
+                    .names(public.doh.iter().map(|doh| name(doh)))
+                    .operator(public.doh_operator)
+                    .resolver_at(IpAddr::V4(RESOLVER))
+                    .doh(Host::new(names[n]).at(address(n)))
+            })
+            .collect();
+        Net::new()
+            .ipv4_only()
+            .hosts(hosts)
+            .hosts([Host::new("resolver").at(RESOLVER).program(resolver)])
+            .hosts(fronts)
+            .start(&fcx, attachments)?;
+        let m = machine(&fcx, attacher.attach("agent")?, ME);
+
+        type Headers = &'static [(&'static str, &'static str)];
+        // The status and media type at Google, Cloudflare, Quad9, and
+        // OpenDNS.
+        type PerOperator = [(u16, &'static str); 4];
+        let dns_json: Headers = &[("accept", "application/dns-json")];
+        let html = "text/html";
+        let google_html = "text/html; charset=UTF-8";
+        let text = "text/plain; charset=utf-8";
+        let cases: [(&str, Headers, PerOperator); 3] = [
+            (
+                "/resolve?name=www.example",
+                &[],
+                [
+                    (200, "application/json; charset=UTF-8"),
+                    (301, google_html),
+                    (404, text),
+                    (404, html),
+                ],
+            ),
+            (
+                "/dns-query?name=www.example",
+                dns_json,
+                [
+                    (400, google_html),
+                    (200, "application/dns-json"),
+                    (400, text),
+                    (400, html),
+                ],
+            ),
+            (
+                "/nope",
+                &[],
+                [
+                    (404, google_html),
+                    (301, google_html),
+                    (404, text),
+                    (404, html),
+                ],
+            ),
+        ];
+        for (path, headers, expected) in cases {
+            for (n, (status, media)) in expected.into_iter().enumerate() {
+                let to = at(address(n), 443);
+                let conn = tls(&fcx, &m, &roots, to, names[n], &[b"http/1.1"]).await;
+                let got = http(&fcx, conn, false, get(false, names[n], path, headers)).await;
+                let what = format!("{} {path}", names[n]);
+                assert_eq!(got.status.as_u16(), status, "{what}");
+                assert_eq!(got.header("content-type"), Some(media), "{what}");
+                if status == 301 {
+                    assert_eq!(
+                        got.header("location"),
+                        Some(format!("https://one.one.one.one{path}").as_str()),
+                        "{what}"
+                    );
+                }
+            }
+        }
+        // Google's page names the path it did not find.
+        let to = at(address(0), 443);
+        let conn = tls(&fcx, &m, &roots, to, names[0], &[b"http/1.1"]).await;
+        let got = http(&fcx, conn, false, get(false, names[0], "/nope", &[])).await;
+        let body = String::from_utf8_lossy(&got.body);
+        assert!(
+            body.contains("The requested URL <code>/nope</code> was not found"),
+            "{body}"
+        );
+        // Only the two JSON answers reached the resolver.
+        assert_eq!(sent.lock().unwrap().len(), 2);
         Ok(())
     });
 }

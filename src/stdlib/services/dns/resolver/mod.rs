@@ -655,8 +655,10 @@ impl<V: Verify> Resolver<V> {
     /// Serves stale data to client queries that waited longer than the
     /// client timeout of RFC 8767 §5, and lets their resolutions go on.
     /// As on failure, data no check has validated is not served to a
-    /// client that asked for validation.
-    fn stale_timeouts(&mut self) {
+    /// client that asked for validation: stale data must already be
+    /// validated, and the aliases the query followed to it are validated
+    /// before the answer goes out.
+    fn stale_timeouts(&mut self, entropy: &dyn Entropy) {
         let Some(stale) = self.config.serve_stale else {
             return;
         };
@@ -698,7 +700,7 @@ impl<V: Verify> Resolver<V> {
                     at: now,
                 });
             }
-            self.send_pieces(id);
+            self.validate_asker(id, entropy);
         }
     }
 
@@ -783,7 +785,7 @@ impl<V: Verify> Engine for Resolver<V> {
             Input::Gone(client) => self.gone(&client),
             Input::Tick => {
                 self.expire(entropy);
-                self.stale_timeouts();
+                self.stale_timeouts(entropy);
             }
         }
         self.run(entropy);

@@ -64,6 +64,41 @@ pub fn nodata(
     )
 }
 
+/// The NSEC RRsets among `records` that prove `name` does not exist in
+/// `zone`, the ones a reply carries for the claim (RFC 4035 §3.1.3.2), or
+/// `None` when NSEC records do not prove it.
+pub fn nxdomain_nsecs(name: &Name, zone: &Name, records: &[RecordSet]) -> Option<Vec<RecordSet>> {
+    let name = fqdn(name);
+    let owners = Denial::new(zone, records).nsec.nxdomain_owners(&name)?;
+    Some(nsecs_of(records, &owners))
+}
+
+/// The NSEC RRsets among `records` that prove `name` in `zone` has no
+/// records of type `qtype`, the ones a reply carries for the claim
+/// (RFC 4035 §3.1.3.1 and §3.1.3.4), or `None` when NSEC records do not
+/// prove it.
+pub fn nodata_nsecs(
+    name: &Name,
+    qtype: RecordType,
+    zone: &Name,
+    records: &[RecordSet],
+) -> Option<Vec<RecordSet>> {
+    let name = fqdn(name);
+    let owners = Denial::new(zone, records)
+        .nsec
+        .nodata_owners(&name, qtype)?;
+    Some(nsecs_of(records, &owners))
+}
+
+/// The NSEC RRsets among `records` owned by one of `owners`.
+fn nsecs_of(records: &[RecordSet], owners: &[&Name]) -> Vec<RecordSet> {
+    records
+        .iter()
+        .filter(|set| set.record_type() == RecordType::NSEC && owners.contains(&set.name()))
+        .cloned()
+        .collect()
+}
+
 /// Whether `records` from the parent `zone` prove that `name` is a
 /// delegation without DS records: an insecure delegation (RFC 4035 §5.2,
 /// RFC 5155 §8.9).
@@ -238,26 +273,41 @@ impl<'a> Nsecs<'a> {
     }
 
     fn nxdomain(&self, name: &Name) -> bool {
+        self.nxdomain_owners(name).is_some()
+    }
+
+    /// The owners of the records that prove `name` does not exist: the one
+    /// covering it and the one covering the wildcard at its closest
+    /// encloser.
+    fn nxdomain_owners(&self, name: &Name) -> Option<Vec<&'a Name>> {
         if self.matching(name).is_some() {
-            return false;
+            return None;
         }
-        let Some((owner, rdata)) = self.covering(name) else {
-            return false;
-        };
+        let (owner, rdata) = self.covering(name)?;
         // A next name below `name` makes `name` an empty non-terminal,
         // which exists.
         if is_below(rdata.next_domain_name(), name) {
-            return false;
+            return None;
         }
         let encloser = Nsecs::closest_encloser(name, owner, rdata);
-        let Ok(wildcard) = encloser.prepend_label("*") else {
-            return false;
-        };
-        self.matching(&wildcard).is_none() && self.covering(&wildcard).is_some()
+        let wildcard = encloser.prepend_label("*").ok()?;
+        if self.matching(&wildcard).is_some() {
+            return None;
+        }
+        let (wildcard_owner, _) = self.covering(&wildcard)?;
+        Some(vec![owner, wildcard_owner])
     }
 
     fn nodata(&self, name: &Name, qtype: RecordType) -> bool {
-        if let Some(rdata) = self.matching(name) {
+        self.nodata_owners(name, qtype).is_some()
+    }
+
+    /// The owners of the records that prove `name` has no `qtype`: the one
+    /// matching it, the one covering it as an empty non-terminal, or the
+    /// one covering it and the one matching the wildcard that has no
+    /// `qtype`.
+    fn nodata_owners(&self, name: &Name, qtype: RecordType) -> Option<Vec<&'a Name>> {
+        if let Some((owner, rdata)) = self.0.iter().find(|(owner, _)| *owner == name) {
             let types = rdata.type_set();
             let usable = if qtype == RecordType::DS && !name.is_root() {
                 // A child apex's NSEC cannot deny the DS its parent holds.
@@ -269,23 +319,20 @@ impl<'a> Nsecs<'a> {
                 // not for types at it (RFC 6840 §4.1).
                 !(types.contains(RecordType::NS) && !types.contains(RecordType::SOA))
             };
-            return usable && !types.contains(qtype) && !types.contains(RecordType::CNAME);
+            let denied = usable && !types.contains(qtype) && !types.contains(RecordType::CNAME);
+            return denied.then(|| vec![*owner]);
         }
-        let Some((owner, rdata)) = self.covering(name) else {
-            return false;
-        };
+        let (owner, rdata) = self.covering(name)?;
         // An empty non-terminal: a name below it exists, it has no records.
         if is_below(rdata.next_domain_name(), name) {
-            return true;
+            return Some(vec![owner]);
         }
         let encloser = Nsecs::closest_encloser(name, owner, rdata);
-        let Ok(wildcard) = encloser.prepend_label("*") else {
-            return false;
-        };
-        self.matching(&wildcard).is_some_and(|rdata| {
-            let types = rdata.type_set();
-            !types.contains(qtype) && !types.contains(RecordType::CNAME)
-        })
+        let wildcard = encloser.prepend_label("*").ok()?;
+        let (wildcard_owner, rdata) = self.0.iter().find(|(owner, _)| **owner == wildcard)?;
+        let types = rdata.type_set();
+        (!types.contains(qtype) && !types.contains(RecordType::CNAME))
+            .then(|| vec![owner, *wildcard_owner])
     }
 
     fn no_ds(&self, name: &Name) -> bool {

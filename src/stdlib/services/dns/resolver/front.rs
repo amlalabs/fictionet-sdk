@@ -31,7 +31,7 @@ impl<V: Verify> Resolver<V> {
     ///
     /// - The ID, opcode, RD, and CD are the query's (RFC 1035 §4.1.1,
     ///   RFC 4035 §3.2.2). RA is set, AA is clear, and Z is zero. TC is
-    ///   set only when [`fit`] must.
+    ///   set only when [`fit`](fictionet::stdlib::protocols::dns::fit) must.
     /// - The question is the query's, in its case, and so is every owner in
     ///   the answer equal to QNAME (RFC 4343 §4.1).
     /// - A query without OPT gets a reply without one (RFC 6891 §7). With

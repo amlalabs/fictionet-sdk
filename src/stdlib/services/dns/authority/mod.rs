@@ -130,8 +130,9 @@ impl<A: Authority + ?Sized> Authority for Arc<A> {
 /// negative. A QNAME no hosted zone contains gets REFUSED, with Extended
 /// DNS Error 20, Not Authoritative, when the front sends them (RFC 8914
 /// §4.21). Zone transfers are refused: zone data makes views for
-/// questions, not listings of a whole zone. Zones never ask another
-/// server.
+/// questions, not listings of a whole zone. Zones hold class IN only:
+/// QCLASS * gets FORMERR, as from BIND, and any other class REFUSED.
+/// Zones never ask another server.
 pub struct Zones {
     zones: Vec<Arc<dyn ZoneData>>,
 }
@@ -174,10 +175,17 @@ impl Authority for Zones {
         if matches!(qtype, RecordType::AXFR | RecordType::IXFR) {
             return Step::Reply(bare_reply(req, ResponseCode::Refused, None));
         }
-        // Zones hold class IN data only.
-        if !matches!(req.question.query_class(), DNSClass::IN | DNSClass::ANY) {
-            let ede = server.ede.then_some(EdeCode::NOT_AUTHORITATIVE);
-            return Step::Reply(bare_reply(req, ResponseCode::Refused, ede));
+        match req.question.query_class() {
+            DNSClass::IN => {}
+            // A zone answers from its data with AA, and an answer to QCLASS
+            // * can never be authoritative (RFC 1034 §3.7.1). BIND 9.20
+            // answers FORMERR, as here.
+            DNSClass::ANY => return Step::Reply(bare_reply(req, ResponseCode::FormErr, None)),
+            // Zones hold class IN data only.
+            _ => {
+                let ede = server.ede.then_some(EdeCode::NOT_AUTHORITATIVE);
+                return Step::Reply(bare_reply(req, ResponseCode::Refused, ede));
+            }
         }
         let Some(zone) = self.find(&qname, qtype) else {
             let ede = server.ede.then_some(EdeCode::NOT_AUTHORITATIVE);

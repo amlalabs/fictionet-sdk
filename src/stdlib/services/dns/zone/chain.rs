@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use fictionet::stdlib::protocols::dns::dnssec::proof::{self, Proof};
 use fictionet::stdlib::protocols::dns::dnssec::rdata::{DNSKEY, DNSSECRData, DS, RRSIG};
 use fictionet::stdlib::protocols::dns::dnssec::{
-    AlgorithmPolicy, KeyFlags, PublicKey, Ring, TBS, Verify, ds, key_tag,
+    AlgorithmPolicy, KeyFlags, PublicKey, Ring, Verify, ds, key_tag, signed_data,
 };
 use fictionet::stdlib::protocols::dns::rr::{
     LowerName, Name, RData, Record, RecordSet, RecordType, SerialNumber,
@@ -45,9 +45,10 @@ pub enum ChainProblem {
         /// The time checked.
         at: SystemTime,
     },
-    /// The zone at `apex` is signed, or its parent's DS records point, with
-    /// a DNSKEY algorithm the policy does not validate, so validators find
-    /// it Insecure (RFC 4035 §5.2, RFC 9905 §2).
+    /// The zone at `apex` is signed, or its parent's DS records point, only
+    /// with DNSKEY algorithms the policy does not validate, `algorithm`
+    /// among them, so validators find it Insecure (RFC 4035 §5.2, RFC 6840
+    /// §5.11, RFC 9905 §2).
     UnsupportedAlgorithm {
         /// The zone's apex.
         apex: LowerName,
@@ -112,11 +113,12 @@ impl fmt::Display for ChainProblem {
 /// select a key of the child that signs the child's DNSKEY RRset, and a
 /// signed parent without one must prove there is none, unless none of its
 /// keys uses an algorithm the policy validates. Every zone's
-/// signatures must be valid at `at`, and its keys must use algorithms the
-/// policy validates. In a signed zone, every RRset the zone is
+/// signatures must be valid at `at`. One algorithm the policy validates
+/// is enough for a path (RFC 6840 §5.11): among a signed zone's keys, and
+/// among the DS records for it. In a signed zone, every RRset the zone is
 /// authoritative for must carry an RRSIG that verifies under the zone's
-/// keys; an RRSIG with an algorithm the policy does not validate counts,
-/// since that is reported as such.
+/// keys with such an algorithm; when the zone has none, any RRSIG of its
+/// own counts, since the algorithms are reported instead.
 ///
 /// The check is advisory. A world that wants a broken chain, to play a
 /// zone like `dnssec-failed.org`, leaves the problem in, and resolvers
@@ -127,16 +129,22 @@ pub fn check_chain(zones: &[&Zone], policy: &AlgorithmPolicy, at: SystemTime) ->
     for zone in zones {
         let apex = zone.apex();
         let keys = dnskeys(zone);
-        for algorithm in keys
+        let algorithms: Vec<u8> = keys
             .iter()
             .map(|key| u8::from(key.public_key().algorithm()))
-        {
-            if !policy.validates(algorithm) {
-                problems.push(ChainProblem::UnsupportedAlgorithm {
+            .collect();
+        // A validator finds the zone Secure through any key it validates,
+        // and Insecure when there is none.
+        let validated = algorithms
+            .iter()
+            .any(|algorithm| policy.validates(*algorithm));
+        if !validated {
+            problems.extend(algorithms.into_iter().map(|algorithm| {
+                ChainProblem::UnsupportedAlgorithm {
                     apex: apex.clone(),
                     algorithm,
-                });
-            }
+                }
+            }));
         }
         if signatures(zone).iter().any(|rrsig| !inside(rrsig, at)) {
             problems.push(ChainProblem::WindowClosed {
@@ -148,7 +156,12 @@ pub fn check_chain(zones: &[&Zone], policy: &AlgorithmPolicy, at: SystemTime) ->
             let signer = Name::from(apex);
             for (owner, node) in zone.nodes() {
                 for set in authoritative(node) {
-                    if !signed_by(set, &signer, &keys, policy) {
+                    let signed = if validated {
+                        verifies(set, &signer, &keys, policy)
+                    } else {
+                        signed_by(set, &signer, &keys, policy)
+                    };
+                    if !signed {
                         problems.push(ChainProblem::SignatureInvalid {
                             apex: apex.clone(),
                             owner: owner.clone(),
@@ -166,9 +179,6 @@ pub fn check_chain(zones: &[&Zone], policy: &AlgorithmPolicy, at: SystemTime) ->
             // A parent whose keys all use algorithms the policy does not
             // validate is Insecure to a validator itself, so its unsigned
             // delegations need no proof; its keys are already reported.
-            let validated = keys
-                .iter()
-                .any(|key| policy.validates(u8::from(key.public_key().algorithm())));
             match ds {
                 Some(ds) => problems.extend(delegation(apex, child, ds, below, policy)),
                 None if validated => {
@@ -224,15 +234,21 @@ fn delegation(
             _ => None,
         })
         .collect();
-    let mut problems: Vec<ChainProblem> = records
+    // One DS record with an algorithm the policy validates is enough for
+    // a path (RFC 6840 §5.11).
+    let algorithms: Vec<u8> = records.iter().map(|ds| u8::from(ds.algorithm())).collect();
+    let mut problems: Vec<ChainProblem> = Vec::new();
+    if !algorithms
         .iter()
-        .map(|ds| u8::from(ds.algorithm()))
-        .filter(|algorithm| !policy.validates(*algorithm))
-        .map(|algorithm| ChainProblem::UnsupportedAlgorithm {
-            apex: child.clone(),
-            algorithm,
-        })
-        .collect();
+        .any(|algorithm| policy.validates(*algorithm))
+    {
+        problems.extend(algorithms.into_iter().map(|algorithm| {
+            ChainProblem::UnsupportedAlgorithm {
+                apex: child.clone(),
+                algorithm,
+            }
+        }));
+    }
     let usable = policy.usable_ds(records.iter().copied());
     let Some(below) = below else {
         return problems;
@@ -375,12 +391,7 @@ fn by_signer<'r>(set: &RecordSet, record: &'r Record, signer: &Name) -> Option<&
 /// Whether `rrsig` over `set` verifies under one of `keys`.
 fn verifies_one(set: &RecordSet, rrsig: &RRSIG, keys: &[DNSKEY]) -> bool {
     let input = rrsig.input();
-    let Ok(tbs) = TBS::from_input(
-        set.name(),
-        set.dns_class(),
-        input,
-        set.records_without_rrsigs(),
-    ) else {
+    let Ok(tbs) = signed_data(set, input) else {
         return false;
     };
     keys.iter()
@@ -525,8 +536,10 @@ mod tests {
 
         // Signed with ECDSA P-256, algorithm 13, as well, every RRset of
         // the parent carries an RRSIG of each algorithm (RFC 4035 §2.2).
-        // Without 13, the Ed25519 ones still verify, so only the keys are
-        // reported and the unsigned delegation keeps its proof.
+        // Without 13, the Ed25519 keys and signatures still give a path,
+        // which is enough (RFC 6840 §5.11): validators find the parent
+        // Secure, so nothing is reported, and the unsigned delegation
+        // keeps its proof.
         let mut both = keys(10);
         both.keys
             .push(key(30, Algorithm::EcdsaP256Sha256, KeyFlags::KSK));
@@ -537,10 +550,7 @@ mod tests {
         policy.validate.remove(&13);
         assert_eq!(
             check_chain(&[&example, &child, &plain()], &policy, time(NOW)),
-            [ChainProblem::UnsupportedAlgorithm {
-                apex: lower("example."),
-                algorithm: 13,
-            }]
+            []
         );
     }
 
