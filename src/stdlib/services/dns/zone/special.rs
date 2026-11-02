@@ -16,6 +16,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use fictionet::stdlib::protocols::dns::rr::rdata::{A, AAAA, NS, PTR, SOA, SVCB};
 use fictionet::stdlib::protocols::dns::rr::{Name, RData, Record, RecordSet};
 
+use super::data::Redirect;
 use super::zone::{Zone, ZoneBuilder};
 
 /// The TTL of the records of the zones a resolver serves itself, and the
@@ -23,18 +24,15 @@ use super::zone::{Zone, ZoneBuilder};
 pub const LOCAL_TTL: u32 = 10800;
 
 /// `localhost`, whose names all point at the loopback addresses
-/// (RFC 6761 §6.3): A 127.0.0.1 and AAAA ::1 at the apex and, through a
-/// wildcard, at every name below it.
-pub fn localhost() -> Zone {
+/// (RFC 6761 §6.3): A 127.0.0.1 and AAAA ::1 at the apex. Unbound serves
+/// it as a `redirect` zone, so every name below the apex answers with
+/// the apex's RRsets, its SOA and NS among them.
+pub fn localhost() -> Redirect<Zone> {
     let apex = name("localhost.");
-    let wildcard = name("*.localhost.");
-    let mut zone = builder(&apex);
-    for owner in [&apex, &wildcard] {
-        zone = zone
-            .rrset(rrset(owner, RData::A(A(Ipv4Addr::LOCALHOST))))
-            .rrset(rrset(owner, RData::AAAA(AAAA(Ipv6Addr::LOCALHOST))));
-    }
-    built(zone)
+    let zone = builder(&apex)
+        .rrset(rrset(&apex, RData::A(A(Ipv4Addr::LOCALHOST))))
+        .rrset(rrset(&apex, RData::AAAA(AAAA(Ipv6Addr::LOCALHOST))));
+    Redirect(built(zone))
 }
 
 /// The empty zones of RFC 6303 §4, for the reverse names of private and
