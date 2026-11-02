@@ -1262,7 +1262,8 @@ inductive Vouched (A : List Anchor) (C : Chain S) : Name → Key → Prop
   | delegation {z : Name} {k : Key} {p : S.Priv} {l : Link S} {sd : Signed S} {s : RRset} {r : Rrsig S} {d : Ds}
       {k' : Key} :
       Vouched A C z k → l ∈ C → l.parent = some (.ds sd) → sd.data = .rrset s → s.owner = l.apex →
-      r ∈ sd.sigs → r.hdr.signer = z → S.pub p = k.pub → r.sig = S.sign p ⟨r.hdr, .rrset { s with ttl := r.hdr.ttl }⟩ →
+      r ∈ sd.sigs → r.hdr.signer = z → S.pub p = k.pub →
+      r.sig = S.sign p ⟨r.hdr, .rrset { s with ttl := r.hdr.ttl }⟩ →
       d ∈ dsOf s → d.digest = S.digest l.apex k' → Vouched A C l.apex k'
 
 theorem keys_vouched {A : List Anchor} {C : Chain S} {P : AlgorithmPolicy} {t : Nat} {l : Link S} {dss : List Ds}
@@ -2226,7 +2227,8 @@ def wire (n : Name) : List Nat := (n.flatMap fun l => l.length :: l) ++ [0]
 
 def rotl (x : UInt32) (k : UInt32) : UInt32 := (x <<< k) ||| (x >>> (32 - k))
 
-def be32 (a b c d : Nat) : UInt32 := (a.toUInt32 <<< 24) ||| (b.toUInt32 <<< 16) ||| (c.toUInt32 <<< 8) ||| d.toUInt32
+def be32 (a b c d : Nat) : UInt32 :=
+  (a.toUInt32 <<< 24) ||| (b.toUInt32 <<< 16) ||| (c.toUInt32 <<< 8) ||| d.toUInt32
 
 /-- The SHA-1 message schedule of one 64-octet block (FIPS 180-4 §6.1.2). -/
 def schedule (blk : List Nat) : Array UInt32 := Id.run do

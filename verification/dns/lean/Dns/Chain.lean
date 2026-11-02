@@ -51,14 +51,16 @@ def dsAt (p : SignedZone S) (c : Name) : Option RRset :=
 An unsigned zone has neither. -/
 def zoneProblems (P : AlgorithmPolicy) (t : Nat) (z : SignedZone S) : List Problem :=
   (if z.signers ≠ [] ∧ ¬ (z.window.inception ≤ t ∧ t ≤ z.window.expiration) then [.windowClosed z.apex t] else []) ++
-    (z.signers.filter fun s => !P.validate.contains s.dnskey.alg).map fun s => .unsupportedAlgorithm z.apex s.dnskey.alg
+    (z.signers.filter fun s => !P.validate.contains s.dnskey.alg).map fun s =>
+      .unsupportedAlgorithm z.apex s.dnskey.alg
 
 /-- The parent's DS set for `c` is empty, or the policy supports some of it and none of it names a SEP key of
 `c`. -/
 def dsMismatchB (P : AlgorithmPolicy) (p c : SignedZone S) : Bool :=
   match dsAt p c.apex with
   | some set =>
-    dsOf set == [] || (supported P (dsOf set) != [] && anchored (S := S) c.apex (supported P (dsOf set)) c.keys == [])
+    dsOf set == [] ||
+      (supported P (dsOf set) != [] && anchored (S := S) c.apex (supported P (dsOf set)) c.keys == [])
   | none => false
 
 /-- The parent delegates to `c` without DS and its referral proves nothing about DS, or it does not delegate
@@ -339,7 +341,8 @@ theorem zone_signsWell {tr : Tree S} {P : AlgorithmPolicy} {t : Nat} (hc : check
 theorem sigsBy_verifies {sz : SignedZone S} {P : AlgorithmPolicy} {t : Nat} (hw : SignsWell sz P t)
     (hne : sz.signers ≠ []) (lbl ttl : Nat) (d : Payload) (cover : Header → Option Payload)
     (hcov : ∀ h : Header, h.labels = lbl → h.ttl = ttl → cover h = some d) :
-    (sigsBy (dataSigners sz.signers) sz.apex sz.window lbl ttl d).any (verifies P t sz.apex sz.keys cover) = true := by
+    (sigsBy (dataSigners sz.signers) sz.apex sz.window lbl ttl d).any (verifies P t sz.apex sz.keys cover) =
+      true := by
   obtain ⟨s1, hs1⟩ := dataSigners_nonempty hne
   have hs1' := mem_dataSigners hs1
   refine any_verifies_iff.mpr ⟨_, List.mem_map.mpr ⟨s1, hs1, rfl⟩, ?_, hw.windowOk _ _ _ _, d, hcov _ rfl rfl,
@@ -347,14 +350,17 @@ theorem sigsBy_verifies {sz : SignedZone S} {P : AlgorithmPolicy} {t : Nat} (hw 
   simp only [usable, beq_self_eq_true, hw.alg s1 hs1', Bool.and_self, Bool.true_and, List.any_eq_true, beq_iff_eq]
   exact ⟨s1.dnskey, List.mem_map.mpr ⟨s1, hs1', rfl⟩, rfl⟩
 
-theorem noDsRecords_form (sz : SignedZone S) (m : Name) :
-    ∀ d ∈ sz.noDsRecords m, ∃ lbl ttl, d.sigs = sigsBy (dataSigners sz.signers) sz.apex sz.window lbl ttl d.data := by
-  have h1 : ∀ f d, d ∈ sz.nsecWith f → ∃ lbl ttl, d.sigs = sigsBy (dataSigners sz.signers) sz.apex sz.window lbl ttl d.data := by
+/-- The records made by the zone's data signers. -/
+def ByData (sz : SignedZone S) (d : Signed S) : Prop :=
+  ∃ lbl ttl, d.sigs = sigsBy (dataSigners sz.signers) sz.apex sz.window lbl ttl d.data
+
+theorem noDsRecords_form (sz : SignedZone S) (m : Name) : ∀ d ∈ sz.noDsRecords m, ByData sz d := by
+  have h1 : ∀ f d, d ∈ sz.nsecWith f → ByData sz d := by
     intro f d hd
     simp only [SignedZone.nsecWith, Option.mem_toList, Option.map_eq_some_iff] at hd
     obtain ⟨r, _, rfl⟩ := hd
     exact ⟨_, _, rfl⟩
-  have h3 : ∀ f d, d ∈ sz.nsec3With f → ∃ lbl ttl, d.sigs = sigsBy (dataSigners sz.signers) sz.apex sz.window lbl ttl d.data := by
+  have h3 : ∀ f d, d ∈ sz.nsec3With f → ByData sz d := by
     intro f d hd
     simp only [SignedZone.nsec3With, Option.mem_toList, Option.map_eq_some_iff] at hd
     obtain ⟨r, _, rfl⟩ := hd
@@ -438,7 +444,8 @@ theorem link_step {tr : Tree S} {P : AlgorithmPolicy} {t : Nat} (hc : check tr P
           simp only [htype, ne_eq, not_true_eq_false, or_self, ↓reduceIte, hv]
         rw [hds]
         simp only
-        simp only [Bool.or_eq_false_iff, beq_eq_false_iff_ne, ne_eq, Bool.and_eq_false_iff, bne_eq_false_iff_eq] at hnm
+        simp only [Bool.or_eq_false_iff, beq_eq_false_iff_ne, ne_eq, Bool.and_eq_false_iff,
+          bne_eq_false_iff_eq] at hnm
         obtain ⟨hne, hsup⟩ := hnm
         rcases hsup with hsup | hanc
         · right

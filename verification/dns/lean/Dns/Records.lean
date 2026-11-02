@@ -193,7 +193,8 @@ def publishWith (v : List (Key × (Tbs → S.Sig))) (look : Name → Fact Node) 
     (any : AnyResponse) (denial : Denial) (w : Window) (q : Request) : Published S :=
   let keyset : Signed S :=
     ⟨.keys apex (v.map (·.1)), signedBy (keyOnes v) apex w apex.length soa.ttl (.keys apex (v.map (·.1)))⟩
-  let signSet (s : RRset) : RRset × List (Rrsig S) := (s, signedBy (dataOnes v) apex w s.owner.length s.ttl (.rrset s))
+  let signSet (s : RRset) : RRset × List (Rrsig S) :=
+    (s, signedBy (dataOnes v) apex w s.owner.length s.ttl (.rrset s))
   match answerWith look apex soa any q with
   | .response r =>
     let f := finalName q r
@@ -223,7 +224,8 @@ theorem signerView_eq {σ τ : Type} [Sign σ S] [Sign τ S] {xs : List σ} {ys 
 /-- Two signers that agree on DNSKEY and signatures publish the same records, whatever they are inside. -/
 theorem signer_agnostic {σ τ : Type} [Sign σ S] [Sign τ S] {xs : List σ} {ys : List τ} (h : Agnostic (S := S) xs ys)
     (look : Name → Fact Node) (apex : Name) (soa : RRset) (any : AnyResponse) (denial : Denial) (w : Window)
-    (q : Request) : publish (S := S) xs look apex soa any denial w q = publish (S := S) ys look apex soa any denial w q := by
+    (q : Request) :
+    publish (S := S) xs look apex soa any denial w q = publish (S := S) ys look apex soa any denial w q := by
   unfold publish
   rw [signerView_eq h]
 
@@ -269,8 +271,10 @@ theorem validate_providers_agree {σ τ : Type} [Sign σ S] [Sign τ S] {p₁ p�
     {xs : List σ} {ys : List τ} (hxy : Agnostic (S := S) xs ys) (A : Option (List Anchor)) (P : AlgorithmPolicy)
     (t : Nat) (pre : Chain S) (parent : Option (Delegation S)) (any : AnyResponse) (denial : Denial) (w : Window)
     (q : Request) :
-    validatePublished A P t pre parent s₁.apex q (publish (S := S) xs (onDemand p₁ s₁) s₁.apex s₁.soa any denial w q) =
-      validatePublished A P t pre parent s₂.apex q (publish (S := S) ys (onDemand p₂ s₂) s₂.apex s₂.soa any denial w q) := by
+    validatePublished A P t pre parent s₁.apex q
+        (publish (S := S) xs (onDemand p₁ s₁) s₁.apex s₁.soa any denial w q) =
+      validatePublished A P t pre parent s₂.apex q
+        (publish (S := S) ys (onDemand p₂ s₂) s₂.apex s₂.soa any denial w q) := by
   rw [validate_records_only hs₁ hd₁ hp₁ hxy, ← validate_records_only hs₂ hd₂ hp₂ (Agnostic.refl ys)]
 where
   Agnostic.refl {ρ : Type} [Sign ρ S] : ∀ (l : List ρ), Agnostic (S := S) l l
