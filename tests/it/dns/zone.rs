@@ -7,6 +7,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
+use fictionet::stdlib::protocols::dns::dnssec::Nsec3HashAlgorithm;
+use fictionet::stdlib::protocols::dns::dnssec::rdata::{DNSSECRData, NSEC3};
 use fictionet::stdlib::protocols::dns::op::{
     Edns, Message, MessageType, OpCode, Query, ResponseCode,
 };
@@ -22,8 +24,6 @@ use fictionet::stdlib::services::dns::zone::{
 };
 use fictionet::stdlib::services::serve::Transport;
 use fictionet::time::Instant;
-use hickory_proto::dnssec::Nsec3HashAlgorithm;
-use hickory_proto::dnssec::rdata::{DNSSECRData, NSEC3};
 
 fn name(text: &str) -> Name {
     Name::from_ascii(text).unwrap()
