@@ -95,6 +95,20 @@ doc = false
 bench = false
 
 [[bin]]
+name = "dns_request"
+path = "fuzz_targets/dns_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dns_fit"
+path = "fuzz_targets/dns_fit.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "proxy_http"
 path = "fuzz_targets/proxy_http.rs"
 test = false

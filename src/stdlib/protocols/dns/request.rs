@@ -1,0 +1,468 @@
+//! A DNS query as a server receives it, checked in one fixed order.
+//!
+//! [`Request::parse`] turns the bytes of one query into exactly one of
+//! three outcomes: a [`Request`] to answer, a [`Reject`](Parsed::Reject)
+//! reply to send as it is, or [`Silent`](Parsed::Silent) for bytes that
+//! get no reply at all. A server that wants to bend one rule, such as
+//! answering EDNS versions above 0 the way Cloudflare's resolver does,
+//! wraps `parse` and changes the outcome.
+
+use super::op::{
+    DEFAULT_MAX_PAYLOAD_LEN, Edns, Header, Message, MessageType, Metadata, OpCode, Query,
+    ResponseCode,
+};
+use super::rr::rdata::opt::EdnsCode;
+use super::rr::{Name, Record, RecordType};
+use super::serialize::binary::{BinDecodable, BinDecoder, DecodeError};
+use fictionet::stdlib::services::serve::Transport;
+
+/// A query that passed every check of [`Request::parse`]: a QUERY with
+/// one question a server can answer.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Request {
+    /// The whole message as parsed.
+    pub message: Message,
+    /// The one question.
+    pub question: Query,
+    /// The question's octets as received, which a reply echoes byte for
+    /// byte so the name keeps the sender's case (RFC 4343 §4.1).
+    pub question_bytes: Vec<u8>,
+    /// How the query arrived.
+    pub transport: Transport,
+    /// The query's EDNS, if it had an OPT record.
+    pub edns: Option<EdnsIn>,
+    /// Recursion desired (RFC 1035 §4.1.1).
+    pub rd: bool,
+    /// Checking disabled (RFC 4035 §3.2.2).
+    pub cd: bool,
+    /// Authentic data, which in a query asks for the AD bit in the reply
+    /// (RFC 6840 §5.7).
+    pub ad: bool,
+}
+
+/// What a query's OPT record asked for (RFC 6891 §6.1.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EdnsIn {
+    /// The largest UDP reply the requestor can take, at least 512.
+    pub payload: u16,
+    /// The EDNS version, always 0 in a request, since `parse` rejects any
+    /// other.
+    pub version: u8,
+    /// DNSSEC OK: the requestor wants DNSSEC records (RFC 3225).
+    pub dnssec_ok: bool,
+    /// The query carried an NSID option, which asks for the server's
+    /// identifier (RFC 5001 §2.1).
+    pub nsid: bool,
+}
+
+/// The outcome of [`Request::parse`].
+#[derive(Clone, Debug, PartialEq)]
+pub enum Parsed {
+    /// A query to answer.
+    Request(Request),
+    /// A query refused with this reply.
+    Reject(Message),
+    /// Bytes that get no reply: too short for a header, or a response.
+    Silent,
+}
+
+/// The length of a DNS header (RFC 1035 §4.1.1).
+const HEADER: usize = 12;
+
+impl Request {
+    /// Checks one query in this order, and stops at the first that fails:
+    ///
+    /// 1. Fewer than 12 octets, or QR set: [`Silent`](Parsed::Silent).
+    /// 2. A message that does not parse: FORMERR, with an OPT record when
+    ///    the fault is in the query's OPT record (RFC 6891 §7).
+    /// 3. More than one OPT record: FORMERR with an OPT (RFC 6891 §6.1.1).
+    /// 4. An EDNS version above 0: BADVERS with an OPT of version 0
+    ///    (RFC 6891 §6.1.3).
+    /// 5. An opcode other than QUERY: NOTIMP.
+    /// 6. A question count other than 1: FORMERR (RFC 9619).
+    /// 7. QTYPE OPT, which only appears as a record: FORMERR (RFC 6891 §6.1.1).
+    /// 8. AXFR or IXFR over UDP, which they are not defined for: FORMERR
+    ///    (RFC 5936 §4.2, RFC 1995 §2).
+    /// 9. QTYPE MAILA or MAILB: NOTIMP (RFC 1035 §3.2.3).
+    ///
+    /// A rejection copies the query's ID, opcode, RD, and CD. It echoes
+    /// the question when the query is a QUERY with one question, and it
+    /// carries an OPT record of version 0 when the query had a readable
+    /// one, with the query's DO bit (RFC 3225 §3). A server may change its
+    /// OPT before sending, such as to set its own payload size.
+    pub fn parse(bytes: &[u8], transport: Transport) -> Parsed {
+        if bytes.len() < HEADER || bytes[2] & 0x80 != 0 {
+            return Parsed::Silent;
+        }
+        let message = match Message::from_vec(bytes) {
+            Ok(message) => message,
+            Err(error) => {
+                let opt = matches!(error, DecodeError::DuplicateEdns) || fault_in_opt(bytes);
+                return Parsed::Reject(unparsed(bytes, opt));
+            }
+        };
+        let metadata = message.metadata;
+        let one_question = metadata.op_code == OpCode::Query && message.queries.len() == 1;
+        let reject = |code| {
+            let edns = message.edns.as_ref().map(|edns| edns.flags().dnssec_ok);
+            let question = one_question.then(|| message.queries[0].clone());
+            Parsed::Reject(rejection(&metadata, code, question, edns))
+        };
+
+        if message.edns.as_ref().is_some_and(|edns| edns.version() > 0) {
+            return reject(ResponseCode::BADVERS);
+        }
+        if metadata.op_code != OpCode::Query {
+            return reject(ResponseCode::NotImp);
+        }
+        if message.queries.len() != 1 {
+            return reject(ResponseCode::FormErr);
+        }
+        let question = message.queries[0].clone();
+        match question.query_type() {
+            RecordType::OPT => return reject(ResponseCode::FormErr),
+            RecordType::AXFR | RecordType::IXFR if transport == Transport::Udp => {
+                return reject(ResponseCode::FormErr);
+            }
+            kind if matches!(u16::from(kind), MAILB | MAILA) => {
+                return reject(ResponseCode::NotImp);
+            }
+            _ => {}
+        }
+
+        let edns = message.edns.as_ref().map(|edns| EdnsIn {
+            payload: edns.max_payload(),
+            version: edns.version(),
+            dnssec_ok: edns.flags().dnssec_ok,
+            nsid: edns.option(EdnsCode::NSID).is_some(),
+        });
+        Parsed::Request(Request {
+            question_bytes: question_bytes(bytes).expect("a parsed message's question reads again"),
+            question,
+            transport,
+            edns,
+            rd: metadata.recursion_desired,
+            cd: metadata.checking_disabled,
+            ad: metadata.authentic_data,
+            message,
+        })
+    }
+}
+
+/// QTYPE MAILB, mailbox records (RFC 1035 §3.2.3).
+const MAILB: u16 = 253;
+/// QTYPE MAILA, mail agent records, obsolete (RFC 1035 §3.2.3).
+const MAILA: u16 = 254;
+
+/// The octets of the first question of a message that parsed.
+fn question_bytes(bytes: &[u8]) -> Result<Vec<u8>, DecodeError> {
+    let mut decoder = BinDecoder::new(bytes);
+    Header::read(&mut decoder)?;
+    Query::read(&mut decoder)?;
+    Ok(bytes[HEADER..decoder.index()].to_vec())
+}
+
+/// Whether the record that stops a message from parsing is an OPT record:
+/// one whose options do not decode, or one outside the additional section.
+fn fault_in_opt(bytes: &[u8]) -> bool {
+    let mut decoder = BinDecoder::new(bytes);
+    let Ok(header) = Header::read(&mut decoder) else {
+        return false;
+    };
+    for _ in 0..header.counts.queries {
+        if Query::read(&mut decoder).is_err() {
+            return false;
+        }
+    }
+    let outside = u32::from(header.counts.answers) + u32::from(header.counts.authorities);
+    let records = outside + u32::from(header.counts.additionals);
+    for index in 0..records {
+        let start = decoder.index();
+        let opt = record_type_at(bytes, start) == Some(RecordType::OPT);
+        if Record::read(&mut decoder).is_err() || (opt && index < outside) {
+            return opt;
+        }
+    }
+    false
+}
+
+/// The type of the record that starts at `start`, read from its owner name
+/// and type alone.
+fn record_type_at(bytes: &[u8], start: usize) -> Option<RecordType> {
+    let mut decoder = BinDecoder::new(bytes).clone(u16::try_from(start).ok()?);
+    Name::read(&mut decoder).ok()?;
+    RecordType::read(&mut decoder).ok()
+}
+
+/// The FORMERR reply to a query that does not parse, built from its header
+/// octets alone.
+fn unparsed(bytes: &[u8], opt: bool) -> Message {
+    let mut metadata = Metadata::new(
+        u16::from_be_bytes([bytes[0], bytes[1]]),
+        MessageType::Query,
+        OpCode::from_u8((bytes[2] >> 3) & 0x0f),
+    );
+    metadata.recursion_desired = bytes[2] & 0x01 != 0;
+    metadata.checking_disabled = bytes[3] & 0x10 != 0;
+    rejection(&metadata, ResponseCode::FormErr, None, opt.then_some(false))
+}
+
+/// A reply refusing a query with `code`. `dnssec_ok` is `Some` when the
+/// reply carries an OPT record, with the DO bit to set in it.
+fn rejection(
+    query: &Metadata,
+    code: ResponseCode,
+    question: Option<Query>,
+    dnssec_ok: Option<bool>,
+) -> Message {
+    let mut reply = Message::error_msg(query.id, query.op_code, code);
+    reply.metadata.recursion_desired = query.recursion_desired;
+    reply.metadata.checking_disabled = query.checking_disabled;
+    reply.queries.extend(question);
+    if let Some(dnssec_ok) = dnssec_ok {
+        let mut edns = Edns::new();
+        edns.set_max_payload(DEFAULT_MAX_PAYLOAD_LEN)
+            .set_dnssec_ok(dnssec_ok);
+        reply.set_edns(edns);
+    }
+    reply
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::options::Nsid;
+    use super::*;
+
+    fn name(text: &str) -> Name {
+        Name::from_ascii(text).unwrap()
+    }
+
+    /// A query for `www.Example.test.` A with ID 77, changed by `change`.
+    fn query(change: impl FnOnce(&mut Message)) -> Vec<u8> {
+        let mut message = Message::new(77, MessageType::Query, OpCode::Query);
+        message.add_query(Query::query(name("www.Example.test."), RecordType::A));
+        change(&mut message);
+        message.to_vec().unwrap()
+    }
+
+    fn edns(version: u8, dnssec_ok: bool) -> Edns {
+        let mut edns = Edns::new();
+        edns.set_max_payload(4096)
+            .set_version(version)
+            .set_dnssec_ok(dnssec_ok);
+        edns
+    }
+
+    fn rejected(bytes: &[u8], transport: Transport) -> Message {
+        match Request::parse(bytes, transport) {
+            Parsed::Reject(reply) => {
+                // The rejection is what goes on the wire, and reads back.
+                Message::from_vec(&reply.to_vec().unwrap()).unwrap()
+            }
+            other => panic!("expected a rejection, got {other:?}"),
+        }
+    }
+
+    fn accepted(bytes: &[u8], transport: Transport) -> Request {
+        match Request::parse(bytes, transport) {
+            Parsed::Request(request) => request,
+            other => panic!("expected a request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn short_messages_and_responses_get_silence() {
+        let good = query(|_| {});
+        assert_eq!(Request::parse(&good[..11], Transport::Udp), Parsed::Silent);
+        assert_eq!(Request::parse(&[], Transport::Tcp), Parsed::Silent);
+        let mut response = good.clone();
+        response[2] |= 0x80;
+        assert_eq!(Request::parse(&response, Transport::Udp), Parsed::Silent);
+        // A response that does not even parse is still silent.
+        assert_eq!(
+            Request::parse(&response[..15], Transport::Udp),
+            Parsed::Silent
+        );
+    }
+
+    #[test]
+    fn an_unparseable_query_gets_formerr_without_opt() {
+        let mut bytes = query(|m| {
+            m.metadata.recursion_desired = true;
+            m.metadata.checking_disabled = true;
+        });
+        bytes.truncate(bytes.len() - 2);
+        let reply = rejected(&bytes, Transport::Udp);
+        assert_eq!(reply.metadata.id, 77);
+        assert_eq!(reply.metadata.message_type, MessageType::Response);
+        assert_eq!(reply.metadata.response_code, ResponseCode::FormErr);
+        assert!(reply.metadata.recursion_desired);
+        assert!(reply.metadata.checking_disabled);
+        assert!(reply.queries.is_empty());
+        assert!(reply.edns.is_none());
+    }
+
+    #[test]
+    fn a_fault_in_the_opt_record_gets_formerr_with_opt() {
+        // An OPT whose RDATA length runs past the end of the message.
+        let mut bytes = query(|m| {
+            m.set_edns(edns(0, true));
+        });
+        let rdlength = bytes.len() - 2;
+        bytes[rdlength..].copy_from_slice(&[0, 16]);
+        bytes.extend_from_slice(&[0, 8, 0, 4]);
+        let reply = rejected(&bytes, Transport::Udp);
+        assert_eq!(reply.metadata.response_code, ResponseCode::FormErr);
+        let opt = reply.edns.unwrap();
+        assert_eq!(opt.version(), 0);
+        assert!(!opt.flags().dnssec_ok);
+
+        // An OPT in the answer section.
+        let bytes = query(|m| {
+            m.add_answer(Record::from(&edns(0, false)));
+        });
+        let reply = rejected(&bytes, Transport::Udp);
+        assert_eq!(reply.metadata.response_code, ResponseCode::FormErr);
+        assert!(reply.edns.is_some());
+    }
+
+    #[test]
+    fn two_opt_records_get_formerr_with_opt() {
+        let bytes = query(|m| {
+            m.add_additional(Record::from(&edns(0, false)));
+            m.set_edns(edns(0, false));
+        });
+        let reply = rejected(&bytes, Transport::Udp);
+        assert_eq!(reply.metadata.response_code, ResponseCode::FormErr);
+        assert!(reply.edns.is_some());
+        assert!(reply.queries.is_empty());
+    }
+
+    #[test]
+    fn an_edns_version_above_0_gets_badvers_with_version_0() {
+        let bytes = query(|m| {
+            m.set_edns(edns(1, true));
+        });
+        let reply = rejected(&bytes, Transport::Udp);
+        // BADVERS shares 16 with BADSIG (RFC 6891 §9), which hickory reads.
+        assert_eq!(u16::from(reply.metadata.response_code), 16);
+        let opt = reply.edns.unwrap();
+        assert_eq!(opt.version(), 0);
+        assert!(opt.flags().dnssec_ok);
+        assert_eq!(reply.queries[0].name().to_ascii(), "www.Example.test.");
+
+        // The version is checked before the opcode.
+        let bytes = query(|m| {
+            m.metadata.op_code = OpCode::Notify;
+            m.set_edns(edns(1, false));
+        });
+        assert_eq!(
+            u16::from(rejected(&bytes, Transport::Udp).metadata.response_code),
+            16
+        );
+    }
+
+    #[test]
+    fn other_opcodes_get_notimp() {
+        for op_code in [
+            OpCode::Status,
+            OpCode::Notify,
+            OpCode::Update,
+            OpCode::Unknown(3),
+        ] {
+            let bytes = query(|m| m.metadata.op_code = op_code);
+            let reply = rejected(&bytes, Transport::Udp);
+            assert_eq!(reply.metadata.response_code, ResponseCode::NotImp);
+            assert_eq!(reply.metadata.op_code, op_code);
+            assert!(reply.queries.is_empty());
+            assert!(reply.edns.is_none());
+        }
+    }
+
+    #[test]
+    fn a_question_count_other_than_1_gets_formerr() {
+        let none = query(|m| m.queries.clear());
+        assert_eq!(
+            rejected(&none, Transport::Udp).metadata.response_code,
+            ResponseCode::FormErr
+        );
+        let two = query(|m| {
+            m.add_query(Query::query(name("b.test."), RecordType::A));
+            m.set_edns(edns(0, true));
+        });
+        let reply = rejected(&two, Transport::Udp);
+        assert_eq!(reply.metadata.response_code, ResponseCode::FormErr);
+        assert!(reply.queries.is_empty());
+        assert!(reply.edns.unwrap().flags().dnssec_ok);
+    }
+
+    #[test]
+    fn qtype_opt_gets_formerr() {
+        let bytes = query(|m| {
+            m.queries[0].set_query_type(RecordType::OPT);
+        });
+        let reply = rejected(&bytes, Transport::Tcp);
+        assert_eq!(reply.metadata.response_code, ResponseCode::FormErr);
+        assert_eq!(reply.queries[0].query_type(), RecordType::OPT);
+    }
+
+    #[test]
+    fn zone_transfers_over_udp_get_formerr() {
+        for kind in [RecordType::AXFR, RecordType::IXFR] {
+            let bytes = query(|m| {
+                m.queries[0].set_query_type(kind);
+            });
+            assert_eq!(
+                rejected(&bytes, Transport::Udp).metadata.response_code,
+                ResponseCode::FormErr
+            );
+            assert_eq!(accepted(&bytes, Transport::Tcp).question.query_type(), kind);
+        }
+    }
+
+    #[test]
+    fn maila_and_mailb_get_notimp() {
+        for kind in [253, 254] {
+            let bytes = query(|m| {
+                m.queries[0].set_query_type(RecordType::from(kind));
+            });
+            let reply = rejected(&bytes, Transport::Udp);
+            assert_eq!(reply.metadata.response_code, ResponseCode::NotImp);
+            assert_eq!(u16::from(reply.queries[0].query_type()), kind);
+        }
+    }
+
+    #[test]
+    fn a_good_query_is_a_request() {
+        let bytes = query(|m| {
+            m.metadata.recursion_desired = true;
+            m.metadata.authentic_data = true;
+            let mut edns = edns(0, true);
+            edns.options_mut().insert(Nsid(Vec::new()).to_option());
+            m.set_edns(edns);
+        });
+        let request = accepted(&bytes, Transport::Udp);
+        assert_eq!(request.message.metadata.id, 77);
+        assert_eq!(request.question.name().to_ascii(), "www.Example.test.");
+        assert_eq!(request.question.query_type(), RecordType::A);
+        assert_eq!(request.question_bytes, bytes[12..12 + 22]);
+        assert_eq!(&request.question_bytes[..4], b"\x03www");
+        assert_eq!(&request.question_bytes[4..12], b"\x07Example");
+        assert_eq!(request.transport, Transport::Udp);
+        assert!(request.rd && request.ad && !request.cd);
+        assert_eq!(
+            request.edns,
+            Some(EdnsIn {
+                payload: 4096,
+                version: 0,
+                dnssec_ok: true,
+                nsid: true,
+            })
+        );
+
+        let plain = accepted(&query(|_| {}), Transport::Tcp);
+        assert_eq!(plain.edns, None);
+        assert!(!plain.rd && !plain.ad && !plain.cd);
+        assert_eq!(plain.transport, Transport::Tcp);
+    }
+}
