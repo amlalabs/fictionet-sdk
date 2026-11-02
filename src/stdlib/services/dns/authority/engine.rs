@@ -7,10 +7,8 @@ use std::net::SocketAddr;
 
 use fictionet::Entropy;
 use fictionet::stdlib::protocols::dns::dnssec::Validation;
-use fictionet::stdlib::protocols::dns::dnssec::rdata::DNSSECRData;
 use fictionet::stdlib::protocols::dns::op::{Header, Message, MessageType, Query, ResponseCode};
-use fictionet::stdlib::protocols::dns::rr::RData;
-use fictionet::stdlib::protocols::dns::rr::{DNSClass, Record, RecordSet, RecordType};
+use fictionet::stdlib::protocols::dns::rr::{DNSClass, RecordType};
 use fictionet::stdlib::protocols::dns::serialize::binary::{BinDecodable, BinDecoder};
 use fictionet::stdlib::protocols::dns::{Ede, EdeCode, Parsed, Request};
 use fictionet::stdlib::services::serve::Transport;
@@ -21,6 +19,7 @@ use super::super::exchange::{
     Action, Answer, Client, ClientQuery, Engine, ExchangeFailure, Generation, Input, Session,
     Token, Tokens, Transmit,
 };
+use super::super::records::rrsets;
 use super::{Ask, Authority, Known, Observed, ServerConfig, Step, bare_reply};
 
 /// Runs the authoritative server at one address.
@@ -452,35 +451,4 @@ fn reply_event(at: Instant, server: SocketAddr, client: Client, bytes: &[u8]) ->
         cached: false,
         size,
     }
-}
-
-/// `records` gathered into RRsets in order of first appearance, each
-/// RRSIG with the RRset it covers.
-fn rrsets(records: &[Record]) -> Vec<RecordSet> {
-    let mut sets: Vec<RecordSet> = Vec::new();
-    for record in records {
-        let covered = match &record.data {
-            RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) => Some(rrsig.input().type_covered),
-            _ => None,
-        };
-        let rtype = covered.unwrap_or(record.record_type());
-        let index = sets.iter().position(|set| {
-            set.name() == &record.name
-                && set.record_type() == rtype
-                && set.dns_class() == record.dns_class
-        });
-        let index = index.unwrap_or_else(|| {
-            let mut set = RecordSet::with_ttl(record.name.clone(), rtype, record.ttl);
-            set.set_dns_class(record.dns_class);
-            sets.push(set);
-            sets.len() - 1
-        });
-        match covered {
-            Some(_) => sets[index].insert_rrsig(record.clone()),
-            None => {
-                sets[index].insert(record.clone(), 0);
-            }
-        }
-    }
-    sets
 }

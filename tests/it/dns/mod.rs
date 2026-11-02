@@ -4,6 +4,7 @@
 //! recordings, and probe it the way an agent with `dig` would.
 
 mod authority;
+mod cache;
 mod internet;
 mod memory;
 mod probes;

@@ -2606,7 +2606,7 @@ fn offer(cache: &mut Cache, offer: &Value, now: Instant, limits: Limits) {
             if let Some(expires) = field(offer, "sig_expires").as_u64()
                 && stored
             {
-                cache.validated(&key, validation, Some(at(expires)), now);
+                cache.validated(&key, validation, Some(at(expires)), None, now);
             }
         }
         "negative" => {

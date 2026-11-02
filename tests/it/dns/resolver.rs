@@ -2055,3 +2055,198 @@ fn a_cname_that_runs_out_while_its_target_is_chased_is_fetched_again() {
         .count();
     assert_eq!(cnames, 2, "the CNAME is fetched again after it ran out");
 }
+
+#[test]
+fn the_root_answers_its_own_ds_question() {
+    // The root has no parent, so `. DS` goes to the root's servers, which
+    // answer NODATA.
+    for signed in [false, true] {
+        let (mut net, anchors) = internet(signed);
+        let mut resolver = resolver(config(anchors));
+        let reply = ask(
+            &mut resolver,
+            &mut net,
+            0,
+            query(client(1), ".", RecordType::DS, dnssec_ok),
+        );
+        assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+        assert!(reply.answers.is_empty());
+        assert_eq!(reply.metadata.authentic_data, signed);
+    }
+}
+
+#[test]
+fn a_cached_cname_answers_a_question_for_cname_itself() {
+    let mut net = delegated(
+        |zone| {
+            zone.rrset(rrset(
+                "dangle.example.com.",
+                600,
+                vec![RData::CNAME(CNAME(name("nope.example.com.")))],
+            ))
+        },
+        3600,
+        3600,
+    );
+    let mut resolver = resolver(config(None));
+    let first = ask(
+        &mut resolver,
+        &mut net,
+        0,
+        query(client(1), "dangle.example.com.", RecordType::A, |_| {}),
+    );
+    assert_eq!(first.metadata.response_code, ResponseCode::NXDomain);
+    for seconds in [2, 3] {
+        let reply = ask(
+            &mut resolver,
+            &mut net,
+            seconds,
+            query(client(1), "dangle.example.com.", RecordType::CNAME, |_| {}),
+        );
+        assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(reply.answers.len(), 1);
+        assert_eq!(reply.answers[0].record_type(), RecordType::CNAME);
+        assert!(reply.authorities.is_empty());
+    }
+    let chased = asked(&net)
+        .iter()
+        .any(|(_, qname, qtype, _)| qname == "nope.example.com." && *qtype == RecordType::CNAME);
+    assert!(!chased, "the target is never asked for a CNAME");
+}
+
+#[test]
+fn a_question_for_rrsig_gets_the_signatures() {
+    let (mut net, anchors) = internet(true);
+    let mut resolver = resolver(config(anchors));
+    for seconds in [0, 1] {
+        let reply = ask(
+            &mut resolver,
+            &mut net,
+            seconds,
+            query(client(1), "www.example.com.", RecordType::RRSIG, dnssec_ok),
+        );
+        assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+        assert!(!reply.answers.is_empty());
+        assert!(
+            reply
+                .answers
+                .iter()
+                .all(|record| record.record_type() == RecordType::RRSIG)
+        );
+    }
+}
+
+#[test]
+fn a_silent_root_is_asked_at_most_three_times_per_hint_and_the_failure_is_cached() {
+    let (mut net, _) = internet(false);
+    net.lose(|_| true);
+    let mut resolver = resolver(config(None));
+    let reply = ask(
+        &mut resolver,
+        &mut net,
+        0,
+        query(client(1), "www.example.com.", RecordType::A, |_| {}),
+    );
+    assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
+    assert_eq!(edes(&reply), [EdeCode::NO_REACHABLE_AUTHORITY]);
+    let sent = net.recording().exchanges().len();
+    assert_eq!(sent, 3, "the one hint, three times (RFC 9520 §3.1)");
+    let again = ask(
+        &mut resolver,
+        &mut net,
+        1,
+        query(client(2), "www.example.com.", RecordType::A, |_| {}),
+    );
+    assert_eq!(again.metadata.response_code, ResponseCode::ServFail);
+    assert_eq!(net.recording().exchanges().len(), sent, "from the cache");
+}
+
+/// Resolves `query` at time zero through `net`, with every reply arriving
+/// `delay` after its query was sent.
+fn ask_slowly(
+    resolver: &mut Resolver,
+    net: &mut MemoryNet,
+    query: ClientQuery,
+    delay: Duration,
+) -> Message {
+    let entropy = entropy();
+    let mut now = Instant::ZERO;
+    let mut due: Vec<(Instant, Input)> = Vec::new();
+    resolver.handle(Input::Query(query), now, &entropy);
+    loop {
+        while let Some(action) = resolver.poll() {
+            match action {
+                Action::Send(transmit) => {
+                    for input in net.exchange(&transmit, now, &entropy) {
+                        due.push((now + delay, input));
+                    }
+                }
+                Action::Answer(answer) => return Message::from_vec(&answer.bytes).unwrap(),
+                Action::Abandon(_) | Action::Event(_) => {}
+            }
+        }
+        let next_reply = due.iter().map(|(when, _)| *when).min();
+        let deadline = resolver.next_deadline();
+        match next_reply {
+            Some(reply) if deadline.is_none_or(|deadline| reply < deadline) => {
+                now = reply;
+                let index = due.iter().position(|(when, _)| *when == reply).unwrap();
+                let (_, input) = due.remove(index);
+                resolver.handle(input, now, &entropy);
+            }
+            _ => {
+                now = deadline.expect("the resolver stopped without an answer");
+                resolver.handle(Input::Tick, now, &entropy);
+            }
+        }
+    }
+}
+
+#[test]
+fn servers_slower_than_the_first_wait_are_asked_again_and_answer() {
+    // Every server takes 450 ms, past the 376 ms the resolver first waits
+    // for a server it does not know. It asks again, waiting longer, and
+    // learns how long each server takes.
+    let (mut net, _) = internet(false);
+    let mut resolver = resolver(config(None));
+    let reply = ask_slowly(
+        &mut resolver,
+        &mut net,
+        query(client(1), "www.example.com.", RecordType::A, |_| {}),
+        Duration::from_millis(450),
+    );
+    assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(addresses(&reply), ["192.0.2.80"]);
+    // A second question for a server it now knows costs no timeout.
+    let before = net.recording().exchanges().len();
+    let reply = ask_slowly(
+        &mut resolver,
+        &mut net,
+        query(client(1), "x.y.example.com.", RecordType::A, |_| {}),
+        Duration::from_millis(450),
+    );
+    assert_eq!(addresses(&reply), ["192.0.2.81"]);
+    let questions = asked(&net)[before..].to_vec();
+    let names: Vec<&str> = questions.iter().map(|(_, n, _, _)| n.as_str()).collect();
+    let mut unique = names.clone();
+    unique.dedup();
+    assert_eq!(names, unique, "no question is sent twice: {questions:?}");
+}
+
+#[test]
+fn truncated_answers_from_a_slow_server_are_fetched_over_tcp() {
+    // Each exchange takes 450 ms, over TCP too, past the 376 ms the
+    // resolver first waits for a server it does not know.
+    let (mut net, _) = internet(false);
+    let mut resolver = resolver(config(None));
+    let mut tcp = client(1);
+    tcp.transport = Transport::Tcp;
+    let reply = ask_slowly(
+        &mut resolver,
+        &mut net,
+        query(tcp, "big.example.com.", RecordType::TXT, |_| {}),
+        Duration::from_millis(450),
+    );
+    assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(reply.answers.len(), 8);
+}

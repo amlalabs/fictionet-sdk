@@ -226,6 +226,8 @@ struct Stored {
     /// zone's servers are, or expired data that may still be served
     /// stale.
     under: Option<Entry>,
+    /// When the entry was stored.
+    at: Instant,
     generation: Generation,
 }
 
@@ -248,7 +250,9 @@ struct Stored {
 ///   data that validated Bogus or Indeterminate.
 /// - An entry replaces a live entry for its key only at equal or higher
 ///   [`Rank`] (RFC 2181 §5.4.1). A failure laid over glue keeps the glue
-///   beneath it, for finding servers.
+///   beneath it, for finding servers. Data or NODATA at a name ends a
+///   live NXDOMAIN at that name or above it at no higher rank, since the
+///   name exists after all (RFC 8020 §2).
 /// - Every entry records the generation that wrote it, and a new
 ///   generation starts empty.
 #[derive(Clone, Debug)]
@@ -305,11 +309,25 @@ impl Cache {
             Entry::Failure { .. } => self.stale(&key, now).cloned(),
             _ => None,
         };
+        // Data at a name, or NODATA for it, shows that the name and every
+        // name above it exist, so it ends an NXDOMAIN cached for any of
+        // them at no higher rank, as newer data for a key replaces older.
+        if matches!(
+            entry,
+            Entry::Positive { .. }
+                | Entry::Negative {
+                    kind: Negative::NoData,
+                    ..
+                }
+        ) {
+            self.exists(&key, entry.rank(), now);
+        }
         self.entries.insert(
             key,
             Stored {
                 entry,
                 under,
+                at: now,
                 generation: self.generation,
             },
         );
@@ -391,16 +409,19 @@ impl Cache {
 
     /// Records what validation established about the live RRset at `key`.
     /// A Secure RRset then lives no longer than `signatures_expire`, the
-    /// first expiration of the RRSIGs that proved it (RFC 4035 §5.3.3). A
-    /// Bogus or Indeterminate one lives no longer than
-    /// [`Limits::failure_ttl`]: the result is a failure, so it is answered
-    /// as one for that long and then fetched and validated again
-    /// (RFC 9520 §3.2, RFC 4035 §4.7).
+    /// first expiration of the RRSIGs that proved it, nor longer than
+    /// `original_ttl`, the smallest Original TTL in those RRSIGs, from when
+    /// it was stored (RFC 4035 §5.3.3). The RRSIGs' own TTLs already
+    /// count toward the RRset's TTL. A Bogus or Indeterminate RRset lives
+    /// no longer than [`Limits::failure_ttl`]: the result is a failure, so
+    /// it is answered as one for that long and then fetched and validated
+    /// again (RFC 9520 §3.2, RFC 4035 §4.7).
     pub fn validated(
         &mut self,
         key: &Key,
         result: Validation,
         signatures_expire: Option<Instant>,
+        original_ttl: Option<u32>,
         now: Instant,
     ) {
         let generation = self.generation;
@@ -410,6 +431,11 @@ impl Cache {
         if stored.generation != generation || now >= stored.entry.expires() {
             return;
         }
+        let original = original_ttl.map(|ttl| stored.at + seconds(ttl));
+        let signatures_expire = match (signatures_expire, original) {
+            (Some(expire), Some(original)) => Some(expire.min(original)),
+            (expire, original) => expire.or(original),
+        };
         match &mut stored.entry {
             Entry::Positive {
                 validation,
@@ -526,6 +552,29 @@ impl Cache {
             .filter(|entry| now < entry.expires())
     }
 
+    /// Drops each live NXDOMAIN at `key`'s name or above it whose rank is
+    /// at most `rank`.
+    fn exists(&mut self, key: &Key, rank: Rank, now: Instant) {
+        let mut at = key.name.clone();
+        loop {
+            let nxdomain = Key::new(at.clone(), RecordType::ANY, key.class);
+            if let Some(
+                entry @ Entry::Negative {
+                    kind: Negative::NxDomain,
+                    ..
+                },
+            ) = self.live(&nxdomain, now)
+                && entry.rank() <= rank
+            {
+                self.entries.remove(&nxdomain);
+            }
+            if at.is_root() {
+                return;
+            }
+            at = at.base_name();
+        }
+    }
+
     /// Drops entries past any use: expired, and past the stale window.
     fn sweep(&mut self, now: Instant) {
         let stale = self.limits.stale;
@@ -632,12 +681,14 @@ fn seconds(ttl: u32) -> Duration {
 }
 
 /// `set` with its owner and every record's owner in lowercase, every
-/// record at the lowest TTL among them (RFC 2181 §5.2), duplicates
-/// collapsed (RFC 2181 §5), and its RRSIGs kept.
+/// record and RRSIG at the lowest TTL among them (RFC 2181 §5.2, and
+/// RFC 4035 §5.3.3 for the RRSIGs), duplicates collapsed (RFC 2181 §5),
+/// and its RRSIGs kept.
 pub(super) fn normalized(set: &RecordSet) -> RecordSet {
     let owner = set.name().to_lowercase();
     let ttl = set
         .records_without_rrsigs()
+        .chain(set.rrsigs())
         .map(|record| record.ttl)
         .chain(std::iter::once(set.ttl()))
         .map(|ttl| if ttl & 0x8000_0000 != 0 { 0 } else { ttl })

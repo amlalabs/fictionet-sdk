@@ -91,11 +91,17 @@ pub struct Config {
     /// What local zones send for QTYPE ANY (RFC 8482 §4). A question for
     /// ANY that leaves the resolver gets what the authority sends.
     pub any: AnyResponse,
-    /// How long the resolver waits for one server before it asks the
-    /// next. Each server address is asked at most once per transport in
-    /// one resolution (RFC 9520 §3.1), so the wait is not followed by a
-    /// second try at the same server.
+    /// How long the resolver waits for a server it knows nothing of.
+    /// After a server's first reply it waits what that server's round
+    /// trips teach it (RFC 6298 §2), and each timeout doubles the wait.
+    /// A query over TCP waits twice as long, for the connection's
+    /// handshake. A query that times out is asked again, of the same
+    /// server or another, and each server address gets the query at most
+    /// three times per transport in one resolution (RFC 9520 §3.1).
     pub retransmit: Duration,
+    /// How long the resolver remembers a server's round trips after it
+    /// last asked it.
+    pub server_ttl: Duration,
 }
 
 /// The bounds of QNAME minimisation (RFC 9156 §2.3).
@@ -169,7 +175,7 @@ impl Config {
     /// - `max-global-quota: 200` queries for one client question, and
     ///   `max-query-restarts: 11` aliases.
     /// - `unknown-server-time-limit: 376` milliseconds for a server it
-    ///   has no round-trip time for.
+    ///   has no round-trip time for, and `infra-host-ttl: 900` seconds.
     /// - `hide-identity: no` and `hide-version: no`: `id.server` and
     ///   `hostname.bind` give the host name, which this preset leaves as
     ///   `localhost` for a world to set; `version.server` and
@@ -230,6 +236,7 @@ impl Config {
             ddr_ttl: 3600,
             any: AnyResponse::All,
             retransmit: Duration::from_millis(376),
+            server_ttl: Duration::from_secs(900),
         }
     }
 

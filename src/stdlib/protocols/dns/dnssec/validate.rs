@@ -149,7 +149,8 @@ pub fn validate_rrset(
         verify,
     };
     let name = set.name();
-    let ds = set.record_type() == RecordType::DS;
+    // A DS RRset is the parent's, except at the root, which has no parent.
+    let ds = set.record_type() == RecordType::DS && !name.is_root();
     let (zone, keys) = match check.zone_keys(chain, anchors, name, ds) {
         Ok(found) => found,
         Err(result) => return result,
@@ -191,7 +192,7 @@ pub fn validate_denial(
     };
     let name = query.name();
     let qtype = query.query_type();
-    let ds = qtype == RecordType::DS;
+    let ds = qtype == RecordType::DS && !name.is_root();
     let (zone, keys) = match check.zone_keys(chain, anchors, name, ds) {
         Ok(found) => found,
         Err(result) => return result,

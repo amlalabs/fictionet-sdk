@@ -8,7 +8,6 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use fictionet::stdlib::protocols::dns::dnssec::Validation;
-use fictionet::stdlib::protocols::dns::dnssec::rdata::DNSSECRData;
 use fictionet::stdlib::protocols::dns::op::{Header, Message, ResponseCode};
 use fictionet::stdlib::protocols::dns::rr::rdata::TXT;
 use fictionet::stdlib::protocols::dns::rr::{
@@ -22,6 +21,7 @@ use fictionet::time::Instant;
 use super::super::authority::{ChaosAnswer, bare_reply};
 use super::super::event::{Event, ReplyFlags};
 use super::super::exchange::Client;
+use super::super::records::rrsets;
 use super::cache::{Entry, Negative, ttl_left};
 use super::resolution::{Outcome, is_dname, with_ttl};
 use super::{Asker, Piece, Resolver, worse};
@@ -406,7 +406,7 @@ pub(super) fn reply_event(
                 message.queries.first().cloned(),
                 message.metadata.response_code,
                 ReplyFlags::of(&message.metadata),
-                answer_sets(&message.answers),
+                rrsets(&message.answers),
                 ede,
             )
         }
@@ -435,35 +435,4 @@ pub(super) fn reply_event(
         cached,
         size,
     }
-}
-
-/// The answer section's records gathered into RRsets in order, each RRSIG
-/// with the RRset it covers.
-fn answer_sets(records: &[Record]) -> Vec<RecordSet> {
-    let mut sets: Vec<RecordSet> = Vec::new();
-    for record in records {
-        let covered = match &record.data {
-            RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) => Some(rrsig.input().type_covered),
-            _ => None,
-        };
-        let rtype = covered.unwrap_or(record.record_type());
-        let index = sets.iter().position(|set| {
-            set.name() == &record.name
-                && set.record_type() == rtype
-                && set.dns_class() == record.dns_class
-        });
-        let index = index.unwrap_or_else(|| {
-            let mut set = RecordSet::with_ttl(record.name.clone(), rtype, record.ttl);
-            set.set_dns_class(record.dns_class);
-            sets.push(set);
-            sets.len() - 1
-        });
-        match covered {
-            Some(_) => sets[index].insert_rrsig(record.clone()),
-            None => {
-                sets[index].insert(record.clone(), 0);
-            }
-        }
-    }
-    sets
 }

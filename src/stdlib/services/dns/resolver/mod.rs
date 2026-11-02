@@ -42,7 +42,7 @@
 //! | RFC 8914 | Extended DNS Errors |
 //! | RFC 9156 | QNAME minimisation |
 //! | RFC 9462 | `resolver.arpa` from the resolver's encrypted endpoints |
-//! | RFC 9520 | Failures cached apart from negatives; each server tried once per transport |
+//! | RFC 9520 | Failures cached apart from negatives; each server asked at most three times per transport |
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
@@ -64,11 +64,13 @@ mod cache;
 mod config;
 mod front;
 mod resolution;
+mod servers;
 
 pub use cache::{Cache, Entry, FailureKind, Key, Limits, Negative, Offer, Rank};
 pub use config::{Config, Minimise, Stale, Work, root_hints};
 
 use resolution::{Graph, Outcome, Subject};
+use servers::Servers;
 
 /// A recursive resolver, as an engine.
 ///
@@ -95,6 +97,8 @@ pub struct Resolver<V: Verify = Ring> {
     clock: WallClock,
     tokens: Tokens,
     cache: Cache,
+    /// The round trips of the servers it asked.
+    servers: Servers,
     graph: Graph,
     askers: BTreeMap<u64, Asker>,
     /// Client queries a new session restarts, on the next input.
@@ -188,6 +192,7 @@ impl<V: Verify> Resolver<V> {
             let zone = special::resolver_arpa(config.ddr.clone(), config.ddr_ttl);
             local.push(Arc::new(zone));
         }
+        let servers = Servers::new(config.retransmit, config.server_ttl);
         let limits = Limits {
             max_ttl: config.max_ttl,
             max_negative_ttl: config.max_negative_ttl,
@@ -204,6 +209,7 @@ impl<V: Verify> Resolver<V> {
             clock,
             tokens: Tokens::new(),
             cache: Cache::new(limits),
+            servers,
             graph: Graph::default(),
             askers: BTreeMap::new(),
             restart: Vec::new(),
@@ -757,6 +763,7 @@ impl<V: Verify> Engine for Resolver<V> {
             self.queue.push_back(Action::Abandon(token));
         }
         self.cache.advance(session.generation);
+        self.servers.clear();
         let ids: Vec<u64> = self.askers.keys().copied().collect();
         for id in &ids {
             if let Some(asker) = self.askers.get_mut(id) {

@@ -1,0 +1,189 @@
+//! The resolver's cache on its own: what newer data displaces, and how
+//! long a validated RRset lives.
+
+use std::time::Duration;
+
+use fictionet::stdlib::protocols::dns::dnssec::{
+    Algorithm, KeyFlags, Validation, Window, ZoneKey, sign,
+};
+use fictionet::stdlib::protocols::dns::rr::rdata::SOA;
+use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, RData, RecordSet, RecordType};
+use fictionet::stdlib::services::dns::resolver::{
+    Cache, Entry, Key, Limits, Negative, Offer, Rank,
+};
+use fictionet::time::Instant;
+use fictionet::{Seed, SeededEntropy};
+
+use super::resolver::{a, at, date, name, rrset};
+
+fn cache() -> Cache {
+    Cache::new(Limits {
+        max_ttl: Duration::from_secs(86400),
+        max_negative_ttl: Duration::from_secs(3600),
+        failure_ttl: Duration::from_secs(5),
+        stale: Duration::ZERO,
+    })
+}
+
+fn key(owner: &str, rtype: RecordType) -> Key {
+    Key::new(LowerName::new(&name(owner)), rtype, DNSClass::IN)
+}
+
+fn soa() -> RecordSet {
+    rrset(
+        "example.",
+        300,
+        vec![RData::SOA(SOA::new(
+            name("ns.example."),
+            name("hostmaster.example."),
+            1,
+            7200,
+            3600,
+            1209600,
+            300,
+        ))],
+    )
+}
+
+fn nxdomain(owner: &str) -> Offer {
+    Offer::Negative {
+        key: key(owner, RecordType::A),
+        kind: Negative::NxDomain,
+        soa: Some(soa()),
+        denial: Vec::new(),
+        validation: Validation::NotPerformed,
+        truncated: false,
+    }
+}
+
+fn positive(set: RecordSet) -> Offer {
+    Offer::Positive {
+        set,
+        rank: Rank::AuthAnswer,
+        validation: Validation::NotPerformed,
+        proof: Vec::new(),
+        truncated: false,
+    }
+}
+
+#[test]
+fn newer_data_at_a_name_ends_its_nxdomain() {
+    let mut cache = cache();
+    cache.insert(at(100), nxdomain("nope.example."));
+    cache.insert(
+        at(201),
+        positive(rrset("nope.example.", 300, vec![a("192.0.2.14")])),
+    );
+    let now = at(201);
+    assert!(
+        cache
+            .nxdomain_above(&LowerName::new(&name("nope.example.")), DNSClass::IN, now)
+            .is_none()
+    );
+    assert!(matches!(
+        cache.get(&key("nope.example.", RecordType::A), now),
+        Some(Entry::Positive { .. })
+    ));
+}
+
+#[test]
+fn newer_nodata_at_a_name_ends_its_nxdomain() {
+    let mut cache = cache();
+    cache.insert(at(100), nxdomain("www.example."));
+    cache.insert(
+        at(110),
+        Offer::Negative {
+            key: key("www.example.", RecordType::A),
+            kind: Negative::NoData,
+            soa: Some(soa()),
+            denial: Vec::new(),
+            validation: Validation::NotPerformed,
+            truncated: false,
+        },
+    );
+    let now = at(111);
+    assert!(
+        cache
+            .nxdomain_above(&LowerName::new(&name("www.example.")), DNSClass::IN, now)
+            .is_none()
+    );
+}
+
+#[test]
+fn glue_does_not_end_an_nxdomain() {
+    let mut cache = cache();
+    cache.insert(at(100), nxdomain("nope.example."));
+    cache.insert(
+        at(101),
+        Offer::Positive {
+            set: rrset("nope.example.", 300, vec![a("192.0.2.14")]),
+            rank: Rank::Glue,
+            validation: Validation::NotPerformed,
+            proof: Vec::new(),
+            truncated: false,
+        },
+    );
+    let now = at(102);
+    assert!(
+        cache
+            .nxdomain_above(&LowerName::new(&name("nope.example.")), DNSClass::IN, now)
+            .is_some()
+    );
+}
+
+/// `set` with an RRSIG whose own TTL is `ttl` and whose Original TTL is
+/// `original`.
+fn signed(mut set: RecordSet, ttl: u32, original: u32) -> RecordSet {
+    let entropy = SeededEntropy::new(Seed::from_u64(1));
+    let key = ZoneKey::generate(&entropy, Algorithm::Ed25519, KeyFlags::ZSK);
+    let mut as_signed = set.clone();
+    as_signed.set_ttl(original);
+    let window = Window {
+        inception: date(1_700_000_000),
+        expiration: date(1_800_000_000),
+    };
+    let mut rrsig = sign(&key, &as_signed, &name("example."), window).unwrap();
+    rrsig.ttl = ttl;
+    set.insert_rrsig(rrsig);
+    set
+}
+
+fn expires(cache: &Cache, key: &Key, now: Instant) -> Instant {
+    match cache.get(key, now) {
+        Some(entry @ Entry::Positive { .. }) => entry.expires(),
+        other => panic!("expected an RRset, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_secure_rrset_lives_no_longer_than_its_rrsigs_original_ttl() {
+    let mut cache = cache();
+    let www = key("www.example.", RecordType::A);
+    let set = signed(
+        rrset("www.example.", 86400, vec![a("192.0.2.1")]),
+        86400,
+        300,
+    );
+    cache.insert(at(0), positive(set));
+    cache.validated(
+        &www,
+        Validation::Secure,
+        Some(at(2_000_000)),
+        Some(300),
+        at(1),
+    );
+    assert_eq!(expires(&cache, &www, at(1)), at(300));
+}
+
+#[test]
+fn an_rrsets_ttl_is_no_longer_than_its_rrsigs_ttl() {
+    let mut cache = cache();
+    let www = key("www.example.", RecordType::A);
+    let set = signed(
+        rrset("www.example.", 86400, vec![a("192.0.2.1")]),
+        600,
+        86400,
+    );
+    cache.insert(at(0), positive(set));
+    assert_eq!(expires(&cache, &www, at(0)), at(600));
+}
