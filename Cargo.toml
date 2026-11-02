@@ -156,6 +156,12 @@ debug = 1
 name = "host"
 test = false
 
+# The differential test against the Lean model reads vectors that
+# `cargo xtask dns-verify vectors` writes, so it runs when named.
+[[test]]
+name = "dns_vectors"
+test = false
+
 # h2spec downloads its binary from GitHub, so it runs when named.
 [[test]]
 name = "h2spec"

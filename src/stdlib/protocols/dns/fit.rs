@@ -80,8 +80,10 @@ pub struct Fitted {
 ///    [`required_additional`](Response::required_additional) RRsets of the
 ///    additional section. At the first of these that does not fit, the
 ///    reply stops and TC is set (RFC 2181 §9).
-/// 3. The rest of the additional section, each RRset that fits. One that
-///    does not is left out without TC (RFC 2181 §9).
+/// 3. The rest of the additional section, in order, while each RRset
+///    fits. The first that does not ends the section without TC
+///    (RFC 2181 §9), so every section is written up to some RRset and
+///    nothing after it.
 ///
 /// The records of an RRset are written together where the RRset first
 /// appears in its section, so an RRset whose records are spread through a
@@ -144,9 +146,10 @@ pub fn fit(response: &Response, limit: Limit) -> Result<Fitted, ProtoError> {
     }
     if !truncated {
         for set in &additional[required..] {
-            if write(&mut encoder, set)? {
-                counts.additionals += records(set.len());
+            if !write(&mut encoder, set)? {
+                break;
             }
+            counts.additionals += records(set.len());
         }
     }
 
@@ -372,12 +375,14 @@ mod tests {
         assert!(!fitted.truncated);
         let back = parse(&fitted);
         assert!(!back.metadata.truncation);
+        // The optional TXT RRset does not fit, so it ends the section: the
+        // A RRset after it, which would fit, is left out too.
         let owners: Vec<String> = back
             .additionals
             .iter()
             .map(|r| r.name.to_string())
             .collect();
-        assert_eq!(owners, ["ns1.example.test.", "third.test."]);
+        assert_eq!(owners, ["ns1.example.test."]);
 
         let required = Response {
             message,

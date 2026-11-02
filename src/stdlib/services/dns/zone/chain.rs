@@ -92,7 +92,8 @@ impl fmt::Display for ChainProblem {
 /// the other's apex. Each delegation is checked from the parent's side,
 /// and from the child's when the child is in `zones` too: a DS RRset must
 /// select a key of the child that signs the child's DNSKEY RRset, and a
-/// signed parent without one must prove there is none. Every zone's
+/// signed parent without one must prove there is none, unless none of its
+/// keys uses an algorithm the policy validates. Every zone's
 /// signatures must be valid at `at`, and its keys must use algorithms the
 /// policy validates.
 ///
@@ -127,9 +128,15 @@ pub fn check_chain(zones: &[&Zone], policy: &AlgorithmPolicy, at: SystemTime) ->
                 continue;
             };
             let below = zones.iter().find(|other| other.apex() == child);
+            // A parent whose keys all use algorithms the policy does not
+            // validate is Insecure to a validator itself, so its unsigned
+            // delegations need no proof; its keys are already reported.
+            let validated = keys
+                .iter()
+                .any(|key| policy.validates(u8::from(key.public_key().algorithm())));
             match ds {
                 Some(ds) => problems.extend(delegation(apex, child, ds, below, policy)),
-                None if !keys.is_empty() => {
+                None if validated => {
                     let records = match zone.denial(child, Denied::Type(RecordType::DS)) {
                         Fact::Present(records) => records,
                         Fact::Absent | Fact::Unknown => Vec::new(),
@@ -468,6 +475,35 @@ mod tests {
                 ChainProblem::UnsupportedAlgorithm {
                     apex: lower("secure.example."),
                     algorithm: 13,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_parent_no_validator_can_use_needs_no_proof() {
+        let example = parent().signed(&keys(10), window(), Denial::Nsec).unwrap();
+        // With neither of the parent's algorithms validated, the parent is
+        // Insecure to a validator, so its unsigned delegation to
+        // plain.example breaks no chain. Its keys are reported, and the DS
+        // records naming Ed25519 for secure.example.
+        let mut policy = AlgorithmPolicy::iana();
+        policy.validate.remove(&13);
+        policy.validate.remove(&15);
+        assert_eq!(
+            check_chain(&[&example, &plain()], &policy, time(NOW)),
+            [
+                ChainProblem::UnsupportedAlgorithm {
+                    apex: lower("example."),
+                    algorithm: 15,
+                },
+                ChainProblem::UnsupportedAlgorithm {
+                    apex: lower("example."),
+                    algorithm: 13,
+                },
+                ChainProblem::UnsupportedAlgorithm {
+                    apex: lower("secure.example."),
+                    algorithm: 15,
                 },
             ]
         );
