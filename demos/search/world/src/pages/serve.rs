@@ -82,7 +82,12 @@ impl Pages {
                 .is_some_and(|v| v.contains("form-urlencoded")))
         .then_some(*body);
         let action = crate::route::route(host, target, form);
-        let answer = if let Some(package) = dispatch.package {
+        // A site's machine stands at its real address whenever the real
+        // DNS gives one, so Live-Depth's limit holds here: a host outside
+        // it gets no answer, as an unreachable site gives none.
+        let answer = if !self.serves_host(host) {
+            Response::unanswered(format!("{host} is not served in this session"))
+        } else if let Some(package) = dispatch.package {
             package
         } else if let Some(asset) = Self::search_asset(host, target) {
             asset

@@ -43,6 +43,10 @@ pub enum Event {
         server: SocketAddr,
         /// Who it went to.
         client: Client,
+        /// The question it answers, as its question section carries it.
+        /// `None` for a reply with no question, such as FORMERR for a query
+        /// that did not parse.
+        question: Option<Query>,
         /// Its RCODE, with the OPT record's high bits.
         rcode: ResponseCode,
         /// Its header flags.

@@ -77,7 +77,18 @@ took 98 s using the existing verified Ubuntu downloads and produced a standalone
 [app/src/main.rs](app/src/main.rs) assembles the workstation and its owned page.
 [app/src/network.rs](app/src/network.rs) connects the model gateway and local
 startup services. Search explicitly reports typed facts from its request and
-tool handlers, its name resolver and the typed no-route callback on its network.
+tool handlers, its resolvers and the typed no-route callback on its network.
+
+The world's DNS is the real hierarchy, relayed. The gateway runs a resolver
+like Unbound with the root hints. The root servers, the `gtld-servers.net`
+servers, and Google, Cloudflare, Quad9, and OpenDNS answer at their real
+addresses. Every name server a reply names gets a relay at its address. So
+`dig`, `dig +trace`, `dig @8.8.8.8`, and `delv` see real addresses and real
+signatures, and each site's machine stands at the address the real DNS gives
+it. Only questions the world's policy allows reach real servers. It allows
+the names the session serves, the names above them that a resolver asks on the
+way, underscore names under them, reverse names, and names the real servers
+named in their replies.
 
 [app/src/page/](app/src/page/) projects those facts into the map, site details,
 model calls and recent activity. Selecting a site or gateway keeps the map
@@ -105,8 +116,10 @@ sites. Capture dates are shown only when the archive records them.
   word stemming for documents and queries. Google, Bing,
   DuckDuckGo and Claude's search tool share that index, each engine in its own
   layout. Result counts come from the index before pagination. An unmatched query
-  returns an empty list. Missing pages use captured site responses; unknown hosts
-  return NXDOMAIN.
+  returns an empty list. Missing pages use captured site responses. Names resolve from
+  the DNS captured with the pages, and a name the capture lacks gets SERVFAIL.
+  The model gateway's, the time server's, and the search engines' names are
+  asked of the real servers when the capture lacks them.
 - **Live** is selected by default when `EXA_API_KEY` is present. [Exa search](https://github.com/exa-labs/openapi-spec/blob/master/exa-openapi-spec.yaml)
   supplies results, which keep their order, titles and URLs in each engine's
   skin; snippets are Exa's highlights as plain text, and Exa's own pages are
@@ -127,11 +140,12 @@ sites. Capture dates are shown only when the archive records them.
   the host copies it as Live does, and its links, on any site, are allowed one
   deeper, up to depth 5, at the fewest links they were reached by. A PDF's
   links count as a page's. The files the page uses are allowed too and copied
-  when asked for. Any other address gets the site's own 404, and a name no
-  allowed address uses gets NXDOMAIN; neither is fetched, so nothing the guest
-  types reaches the internet except its searches. The site's 404 is learned
+  when asked for. Any other address gets the site's own 404, and a host no
+  allowed address uses closes the connection unanswered; neither is fetched, so
+  nothing the guest types reaches the internet except its searches and its DNS
+  questions, which the real name servers answer as in Live. The site's 404 is learned
   when the first page on it is copied, by asking it once for a random path
-  made up for the session; before then the answer is nginx's 404. A name refused once resolves as soon as a link to it is
+  made up for the session; before then the answer is nginx's 404. A host refused once is served as soon as a link to it is
   allowed. Package files come only from the capture. The feed shows each
   opened page's depth and refused addresses as rows; the map counts the
   allowed links.

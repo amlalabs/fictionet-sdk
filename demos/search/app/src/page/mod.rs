@@ -6,6 +6,7 @@ use axum::{
     response::{Html, IntoResponse},
     routing::get,
 };
+use fictionet::stdlib::protocols::dns::rr::RecordType;
 use fictionet_demo::kit::page::{self as pieces, Console, HostStatus};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -188,11 +189,15 @@ impl Views {
             return false;
         }
         match &observation.fact {
-            SearchObs::Resolved { name, address } => {
-                if address.is_some() {
-                    site(&mut view.sites, &name.to_ascii(), observation.at_ms).address = *address;
-                }
+            SearchObs::Resolved {
+                name,
+                qtype: RecordType::A,
+                address: Some(address),
+                ..
+            } => {
+                site(&mut view.sites, &name.to_ascii(), observation.at_ms).address = Some(*address);
             }
+            SearchObs::Resolved { .. } => {}
             SearchObs::Request {
                 scheme,
                 host,
