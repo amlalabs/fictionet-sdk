@@ -1197,11 +1197,7 @@ pub fn gtld_servers<P: Program>(program: impl Fn(ServerConfig) -> P, at: &Locati
         .iter()
         .map(|server| {
             let site = at.site(IpAddr::V4(server.v4));
-            server_host(
-                &server,
-                program(ServerConfig::gtld(site.identity)),
-                site.rtt,
-            )
+            server_host(server, program(ServerConfig::gtld(site.identity)), site.rtt)
         })
         .collect()
 }

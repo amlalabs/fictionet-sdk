@@ -486,8 +486,11 @@ pub(crate) struct Uncaptured {
     root: LowerName,
     soa: RecordSet,
     pages: Arc<Pages>,
-    place: Box<dyn Fn(&LowerName) -> Option<Ipv4Addr> + Send + Sync>,
+    place: Box<Place>,
 }
+
+/// What puts a machine for a host and gives its address.
+type Place = dyn Fn(&LowerName) -> Option<Ipv4Addr> + Send + Sync;
 
 impl Uncaptured {
     /// The zone for the sessions of `pages`, with `place` putting a

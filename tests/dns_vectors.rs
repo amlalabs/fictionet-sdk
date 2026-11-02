@@ -30,7 +30,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fictionet::stdlib::codec::Wire;
@@ -2304,6 +2304,7 @@ fn chain() {
             .iter()
             .any(|member| key_specs(member).iter().any(|k| k.corrupt));
         let mut zones = Vec::new();
+        let policy = vector_policy(field(input, "policy"));
         // The problem Rust reports for each DS algorithm the policy does
         // not validate, written as Lean writes problems.
         let mut ds_problems = BTreeSet::new();
@@ -2311,7 +2312,7 @@ fn chain() {
             let mut records = Vec::new();
             for line in texts(field(member, "zone"), "records") {
                 let (real, algorithm) = real_ds_line(&line, &mut keys);
-                if let Some(algorithm) = algorithm {
+                if let Some(algorithm) = algorithm.filter(|a| !policy.validates(*a)) {
                     let owner = &tokens(&line)[0];
                     ds_problems.insert(format!("unsupported_algorithm {owner} {algorithm}"));
                 }
@@ -2332,7 +2333,6 @@ fn chain() {
             };
             zones.push(zone);
         }
-        let policy = vector_policy(field(input, "policy"));
         let at = time(number(input, "time"));
         let refs: Vec<&Zone> = zones.iter().collect();
         let mut rust: BTreeSet<String> = check_chain(&refs, &policy, at)
@@ -3120,6 +3120,54 @@ fn resolver() {
             same(
                 "answer with dead servers",
                 lean_resolver_answer(lean, false),
+                resolver_answer(&message, false),
+            )?;
+        }
+
+        // The case's loss script, with work to spare. Lean gives up on a
+        // server at its first lost query and Rust after RFC 9520's three
+        // tries, and they pick servers in different orders, so a script of
+        // lost sends means different servers to each. What carries over is
+        // which servers each question lost: those stay silent for that
+        // question in Rust, and the answers must be the same, SERVFAILs
+        // included.
+        let silent: Arc<Mutex<BTreeSet<IpAddr>>> = Arc::default();
+        let mut net = hierarchy(&zones);
+        let quiet = silent.clone();
+        net.lose(move |transmit| quiet.lock().unwrap().contains(&transmit.to.ip()));
+        let mut lossy = vector_resolver(input, &zones, 200);
+        for (index, (question, lean)) in questions
+            .iter()
+            .zip(list(expected, "lossy_answers"))
+            .enumerate()
+        {
+            if lean.is_null() {
+                return Err("Lean gave no answer under the loss script".to_string());
+            }
+            *silent.lock().unwrap() = texts(lean, "gone")
+                .iter()
+                .flat_map(|server| {
+                    addresses
+                        .get(&LowerName::new(&name(server)))
+                        .into_iter()
+                        .flatten()
+                        .copied()
+                })
+                .collect();
+            // As with dead servers, each question starts after the last
+            // one's failure has left the cache.
+            let start = at(600 * index as u64);
+            let answers = drive(
+                &mut lossy,
+                &mut net,
+                vec![client_query(question)],
+                start,
+                &entropy,
+            );
+            let message = Message::from_vec(&answers[0].bytes).map_err(|e| e.to_string())?;
+            same(
+                "answer under the loss script",
+                lean_resolver_answer(field(lean, "response"), false),
                 resolver_answer(&message, false),
             )?;
         }
