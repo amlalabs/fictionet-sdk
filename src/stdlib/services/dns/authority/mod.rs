@@ -24,7 +24,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use fictionet::stdlib::protocols::dns::op::ResponseCode;
-use fictionet::stdlib::protocols::dns::rr::{LowerName, RecordType};
+use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, RecordType};
 use fictionet::stdlib::protocols::dns::{EdeCode, Request, Response};
 use fictionet::stdlib::services::serve::Transport;
 
@@ -173,6 +173,11 @@ impl Authority for Zones {
         let qtype = req.question.query_type();
         if matches!(qtype, RecordType::AXFR | RecordType::IXFR) {
             return Step::Reply(bare_reply(req, ResponseCode::Refused, None));
+        }
+        // Zones hold class IN data only.
+        if !matches!(req.question.query_class(), DNSClass::IN | DNSClass::ANY) {
+            let ede = server.ede.then_some(EdeCode::NOT_AUTHORITATIVE);
+            return Step::Reply(bare_reply(req, ResponseCode::Refused, ede));
         }
         let Some(zone) = self.find(&qname, qtype) else {
             let ede = server.ede.then_some(EdeCode::NOT_AUTHORITATIVE);

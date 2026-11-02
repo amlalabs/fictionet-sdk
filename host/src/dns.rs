@@ -19,7 +19,7 @@ use tokio::task::AbortHandle;
 use fictionet::Cx;
 use fictionet::stdlib::protocols::dns::op::{Message, MessageType, OpCode, Query};
 use fictionet::stdlib::protocols::dns::rr::{Name, RData, RecordType};
-use fictionet::stdlib::protocols::dns::{Parsed, Request, restore};
+use fictionet::stdlib::protocols::dns::{Parsed, Request, restore, stream_framed};
 use fictionet::stdlib::services::dns::authority::{Ask, Observed};
 use fictionet::stdlib::services::serve::Transport;
 use fictionet::stdlib::world::net::dns::Source;
@@ -223,9 +223,10 @@ impl Exchange {
         let Ok(mut stream) = TcpStream::connect(self.server).await else {
             return Observed::Unreachable;
         };
-        let mut frame = Vec::with_capacity(2 + self.query.len());
-        frame.extend_from_slice(&(self.query.len() as u16).to_be_bytes());
-        frame.extend_from_slice(&self.query);
+        // A query no stream can carry reaches no server.
+        let Some(frame) = stream_framed(&self.query) else {
+            return Observed::Unreachable;
+        };
         if stream.write_all(&frame).await.is_err() {
             return Observed::Timeout;
         }

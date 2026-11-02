@@ -35,7 +35,6 @@ use fictionet::sync::Mutex;
 use fictionet::{Cx, RaceError, Seed};
 use fictionet_extras::dns::Capture;
 use fictionet_extras::models::{Provider, oauth::Login};
-use fictionet_extras::warc::Archive;
 use fictionet_host::dns::Live;
 
 use crate::Result;
@@ -49,17 +48,12 @@ const TYPES: [RecordType; 3] = [RecordType::A, RecordType::AAAA, RecordType::HTT
 /// not asked to hold a socket for every question of a large corpus.
 const WINDOW: usize = 64;
 
-/// Records the DNS of every host captured in `root`, and of the names the
-/// world needs in every session (the model providers', their login
-/// servers', the NTP server's, and the search engines'), into a new archive
-/// in `root`. Fails if one of those required names does not resolve.
-pub async fn record(root: &Path) -> Result {
-    let mut hosts = BTreeSet::new();
-    for url in Archive::directory(root)?.urls() {
-        if let Some(host) = url::Url::parse(url)?.domain() {
-            hosts.insert(host.to_ascii_lowercase());
-        }
-    }
+/// Records the DNS of `hosts`, every host the corpus serves, and of the
+/// names the world needs in every session (the model providers', their
+/// login servers', the NTP server's, and the search engines'), into a new
+/// archive in `root`. Fails if one of those required names does not
+/// resolve.
+pub async fn record(root: &Path, hosts: &[String]) -> Result {
     let required = [
         Provider::Anthropic,
         Provider::OpenAi,

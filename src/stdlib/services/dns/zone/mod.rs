@@ -44,6 +44,7 @@ mod zone;
 pub use answer::{Answered, AnyResponse, answer};
 pub use chain::{ChainProblem, check_chain};
 pub use cover::cover;
+pub(crate) use cover::negative_ttl;
 pub use data::{Denied, Fact, Provider, Revision, Transparent, View, ZoneData};
 pub use lazy::Lazy;
 pub use master::MasterError;

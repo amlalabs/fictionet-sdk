@@ -35,7 +35,7 @@
 //! | RFC 5452 §9 | Random IDs; replies accepted only from the address asked with the ID and question sent |
 //! | RFC 6891 | EDNS toward servers and clients |
 //! | RFC 7766 | TCP after a truncated reply |
-//! | RFC 8020 | Nothing exists below a cached NXDOMAIN |
+//! | RFC 8020 | Nothing exists below a cached Secure NXDOMAIN |
 //! | RFC 8109 | Priming from root hints |
 //! | RFC 8198 | Negative answers synthesized from validated NSEC records |
 //! | RFC 8767 | Serving stale data |
@@ -176,7 +176,7 @@ impl<V: Verify> Resolver<V> {
     /// against dates from `clock`, in generation 0.
     pub fn new(config: Config, verify: V, clock: WallClock) -> Resolver<V> {
         let server = ServerConfig {
-            identity: config.identity.clone(),
+            identity: Some(config.identity.clone()),
             payload: config.payload,
             ede: config.ede,
             any: config.any,
@@ -347,7 +347,7 @@ impl<V: Verify> Resolver<V> {
                     }
                     return;
                 }
-                resolution::Dep::Refused => {
+                resolution::Dep::Cycle | resolution::Dep::TooDeep => {
                     self.push_piece(id, Outcome::Failure(FailureKind::WorkExceeded), false);
                 }
             }
@@ -476,7 +476,7 @@ impl<V: Verify> Resolver<V> {
             }
         }
         if waiting.is_empty() {
-            self.answer_asker(id);
+            self.answer_asker(id, entropy);
         } else if let Some(asker) = self.askers.get_mut(&id) {
             asker.wait = AskerWait::Checks(waiting);
         }
@@ -502,7 +502,14 @@ impl<V: Verify> Resolver<V> {
     }
 
     /// What a validation the client query `id` waited for established.
-    fn asker_checked(&mut self, id: u64, check: u64, subject: &Subject, validation: Validation) {
+    fn asker_checked(
+        &mut self,
+        id: u64,
+        check: u64,
+        subject: &Subject,
+        validation: Validation,
+        entropy: &dyn Entropy,
+    ) {
         let Some(asker) = self.askers.get_mut(&id) else {
             return;
         };
@@ -521,12 +528,51 @@ impl<V: Verify> Resolver<V> {
         }
         if waiting.is_empty() {
             asker.wait = AskerWait::Nothing;
-            self.answer_asker(id);
+            self.answer_asker(id, entropy);
         }
     }
 
-    /// Answers client query `id` from its pieces and forgets it.
-    fn answer_asker(&mut self, id: u64) {
+    /// Answers client query `id` from its pieces, unless a record in them
+    /// ran out while the rest was resolved, such as a CNAME whose TTL
+    /// ended while its target was chased. An answer never carries a record
+    /// past its TTL, so the chain is then followed again from the
+    /// question, as the cache has it now. The work spent so far stays
+    /// counted against the question.
+    fn answer_asker(&mut self, id: u64, entropy: &dyn Entropy) {
+        if self.ran_out(id) {
+            if let Some(asker) = self.askers.get_mut(&id) {
+                asker.pieces.clear();
+                asker.wait = AskerWait::Nothing;
+            }
+            return self.step_asker(id, entropy);
+        }
+        self.send_pieces(id);
+    }
+
+    /// Whether a fresh piece of client query `id` holds a record whose TTL
+    /// has ended by now. Data with TTL 0 serves the answer it came in
+    /// (RFC 1035 §7.4), and stale data is served past its TTL on purpose
+    /// (RFC 8767), so neither counts.
+    fn ran_out(&self, id: u64) -> bool {
+        let Some(asker) = self.askers.get(&id) else {
+            return false;
+        };
+        let max_ttl = self.config.max_ttl;
+        asker
+            .pieces
+            .iter()
+            .filter(|piece| !piece.stale)
+            .any(|piece| {
+                piece.outcome.records().iter().any(|set| {
+                    let ttl = std::time::Duration::from_secs(u64::from(set.ttl())).min(max_ttl);
+                    !ttl.is_zero() && piece.at + ttl <= self.now
+                })
+            })
+    }
+
+    /// Answers client query `id` from its pieces as they are, and forgets
+    /// it.
+    fn send_pieces(&mut self, id: u64) {
         let Some(asker) = self.askers.remove(&id) else {
             return;
         };
@@ -587,7 +633,7 @@ impl<V: Verify> Resolver<V> {
                     at: now,
                 });
             }
-            self.answer_asker(id);
+            self.send_pieces(id);
         }
     }
 
@@ -629,10 +675,11 @@ impl<V: Verify> Resolver<V> {
                     lookup,
                     key,
                     found,
+                    bounded,
                 } => match to {
                     resolution::Node::Asker(id) => self.asker_looked(id, lookup, *found, entropy),
                     resolution::Node::Lookup(id) => {
-                        self.lookup_looked(id, lookup, &key, *found, entropy)
+                        self.lookup_looked(id, lookup, &key, *found, bounded, entropy)
                     }
                     resolution::Node::Check(id) => self.check_looked(id, lookup, *found, entropy),
                     resolution::Node::Refresh => {}
@@ -644,7 +691,7 @@ impl<V: Verify> Resolver<V> {
                     validation,
                 } => {
                     if let resolution::Node::Asker(id) = to {
-                        self.asker_checked(id, check, &subject, validation);
+                        self.asker_checked(id, check, &subject, validation, entropy);
                     }
                 }
             }

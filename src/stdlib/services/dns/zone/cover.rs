@@ -13,6 +13,7 @@
 //! SERVFAIL rather than a signed negative.
 
 use fictionet::stdlib::protocols::dns::dnssec::Nsec3HashAlgorithm;
+use fictionet::stdlib::protocols::dns::dnssec::proof::base32hex_encode;
 use fictionet::stdlib::protocols::dns::dnssec::rdata::{DNSSECRData, NSEC, NSEC3};
 use fictionet::stdlib::protocols::dns::rr::{
     LowerName, Name, RData, Record, RecordSet, RecordType,
@@ -256,7 +257,7 @@ pub(super) fn node_types(node: &Node) -> (Vec<RecordType>, bool) {
 
 /// The TTL of denial records: the lesser of the SOA RRset's TTL and its
 /// MINIMUM field (RFC 9077 §3, updating RFC 4035 §2.3 and RFC 5155 §3).
-pub(super) fn negative_ttl(soa: &RecordSet) -> u32 {
+pub(crate) fn negative_ttl(soa: &RecordSet) -> u32 {
     let minimum = soa
         .records_without_rrsigs()
         .find_map(|record| match &record.data {
@@ -389,10 +390,16 @@ pub(super) fn nsec3_set(
         next,
         types,
     );
-    let owner = Name::from_labels([base32hex(owner).as_bytes()])
-        .and_then(|label| label.append_domain(apex))
-        .expect("a hash label fits under the apex");
+    let owner = hashed_owner(owner, apex);
     one_record(&owner, RData::DNSSEC(DNSSECRData::NSEC3(rdata)), params.ttl)
+}
+
+/// The owner of the NSEC3 record for `hash` in the zone at `apex`: the
+/// hash in base32hex as one label under the apex (RFC 5155 §3.3).
+pub(super) fn hashed_owner(hash: &[u8], apex: &Name) -> Name {
+    Name::from_labels([base32hex_encode(hash).as_bytes()])
+        .and_then(|label| label.append_domain(apex))
+        .expect("a hash label fits under the apex")
 }
 
 /// The NSEC3 hash of `name` with `salt` and zero iterations (RFC 5155 §5,
@@ -424,27 +431,6 @@ fn step(hash: &[u8], up: bool) -> Vec<u8> {
         if !carry {
             break;
         }
-    }
-    out
-}
-
-/// Base32 with the extended hex alphabet, in lowercase and unpadded, as
-/// NSEC3 owner labels are written (RFC 4648 §7, RFC 5155 §3.3).
-fn base32hex(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 32] = b"0123456789abcdefghijklmnopqrstuv";
-    let mut out = String::new();
-    let mut buffer = 0u32;
-    let mut bits = 0;
-    for &byte in bytes {
-        buffer = (buffer << 8) | u32::from(byte);
-        bits += 8;
-        while bits >= 5 {
-            bits -= 5;
-            out.push(ALPHABET[((buffer >> bits) & 31) as usize] as char);
-        }
-    }
-    if bits > 0 {
-        out.push(ALPHABET[((buffer << (5 - bits)) & 31) as usize] as char);
     }
     out
 }

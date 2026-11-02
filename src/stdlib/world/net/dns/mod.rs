@@ -73,7 +73,7 @@ mod program;
 mod source;
 
 pub use program::{Authoritative, Recursive, ResolverHandle};
-pub use source::{Cached, Namespace, Only, Source};
+pub use source::{Cached, Namespace, Only, PerSession, Question, Source};
 
 /// The TTL of a locally served zone's SOA and NS records (RFC 6303 §3).
 const LOCAL_TTL: u32 = 10800;
@@ -114,15 +114,17 @@ pub(super) fn local_zone(apex: &Name) -> (RecordSet, RecordSet) {
 /// local zone.
 ///
 /// `host_for` gets a name in lowercase without the trailing dot
-/// (`en.wikipedia.org`) and returns the host for it, or `None` if nothing
-/// exists at that name or below it (RFC 8020). The host answers to the
-/// name, which is added to its names if it lacks it. The zone keeps each
-/// placed host's A and AAAA records for the run; a name given no host is
-/// asked again the next time, so names may come into being as the world
-/// runs. A name is asked about only after each name above it, so `com`
-/// and `example.com` are asked before `www.example.com`: a name exists
-/// only if its parent does. The root is never asked, nor is a name whose
-/// first label is `*`, which is no host name: the zone has no wildcards.
+/// (`en.wikipedia.org`) and returns the host for it, or `None` if no host
+/// has that name. The host answers to the name, which is added to its
+/// names if it lacks it. The zone keeps each placed host's A and AAAA
+/// records for the run; a name given no host is asked again the next
+/// time, so names may come into being as the world runs. A question asks
+/// about every name on its path from the root down, so `com` and
+/// `example.com` are asked before `www.example.com`, and a host placed
+/// for a name makes each name above it exist as an empty non-terminal,
+/// which answers NODATA, whatever `host_for` said about it. A name is
+/// NXDOMAIN only while neither it nor a name below it has a host. The root is never asked, nor is a name whose first label is
+/// `*`, which is no host name: the zone has no wildcards.
 /// A host that cannot be placed counts as `None`. Negative answers carry
 /// an SOA whose TTL and minimum are 60 seconds, so resolvers, the guest's
 /// among them, keep a name given no host only briefly.

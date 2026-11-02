@@ -18,7 +18,7 @@
 //! # use fictionet::stdlib::world::net::dns::Authoritative;
 //! # use fictionet::stdlib::world::net::dns::internet::{self, Egress, Location};
 //! # async fn world(fcx: Cx, attachments: Attachments, root: &str) -> Result {
-//! let at = Location::san_francisco_bay_area(Egress(Ipv4Addr::new(198, 51, 100, 7)));
+//! let at = Location::san_francisco_bay_area(Some(Egress(Ipv4Addr::new(198, 51, 100, 7))));
 //! let clock = WallClock { start: SystemTime::now() };
 //! let root = Arc::new(internet::root_zone(root)?);
 //! Net::new()
@@ -33,12 +33,13 @@
 //! 2026-11-01: the root servers from IANA's `named.root`, the rest from
 //! the servers themselves, asked from the San Francisco Bay Area.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::Duration;
 
 use fictionet::stdlib::network::route::Prefix;
+use fictionet::stdlib::protocols::dns::Request;
 use fictionet::stdlib::protocols::dns::op::{Message, ResponseCode};
 use fictionet::stdlib::protocols::dns::rr::rdata::svcb::{
     Alpn, IpHint, SvcParamKey, SvcParamValue, Unknown,
@@ -47,7 +48,6 @@ use fictionet::stdlib::protocols::dns::rr::rdata::{A, AAAA, NS, SOA, SVCB, TXT};
 use fictionet::stdlib::protocols::dns::rr::{
     LowerName, Name, RData, Record, RecordSet, RecordType,
 };
-use fictionet::stdlib::protocols::dns::{Request, Response};
 use fictionet::stdlib::services::dns::authority::{
     Authority, ChaosAnswer, Identity, Known, Relay, ServerConfig, Step, chaos,
 };
@@ -59,7 +59,7 @@ use fictionet::sync::Mutex;
 pub use fictionet::stdlib::services::dns::resolver::root_hints;
 
 use super::super::{Host, NetHandle, Program};
-use super::{Authoritative, Namespace, Recursive, Source};
+use super::{Authoritative, Namespace, PerSession, Recursive, Source};
 
 // ---------------------------------------------------------------------------
 // Servers and their addresses
@@ -442,7 +442,7 @@ pub struct PublicResolver {
     /// the real hierarchy gives for them are where a world puts the
     /// resolver's DoH front ([`Mirror::front`]).
     pub doh: &'static [&'static str],
-    config: fn(&ResolverSite, &Egress) -> Config,
+    config: fn(&ResolverSite, Option<&Egress>) -> Config,
 }
 
 impl PublicResolver {
@@ -451,7 +451,7 @@ impl PublicResolver {
     /// to its whoami names among them.
     pub fn config(&self, at: &Location) -> Config {
         let primary = IpAddr::V4(self.addresses[0].v4);
-        (self.config)(&at.resolver(primary), &at.egress)
+        (self.config)(&at.resolver(primary), at.egress.as_ref())
     }
 
     /// A resolver program with [`config`](Self::config), one engine and
@@ -544,19 +544,32 @@ fn whoami_cloudflare() -> LowerName {
 /// Google Public DNS, with `o-o.myaddr.l.google.com` answered as the
 /// real one is: Google's authority there sees Google's own egress address
 /// and the client's subnet (RFC 7871), so a relay could never give it.
-fn google(site: &ResolverSite, egress: &Egress) -> Config {
-    Config::google(site.identity.clone()).local(Arc::new(myaddr(site.egress, egress)))
+/// With the egress unknown, the name is asked of the real hierarchy like
+/// any other.
+fn google(site: &ResolverSite, egress: Option<&Egress>) -> Config {
+    let config = Config::google(site.identity.clone());
+    match egress {
+        Some(egress) => config.local(Arc::new(myaddr(site.egress, egress))),
+        None => config,
+    }
 }
 
 /// Cloudflare's 1.1.1.1, answering `whoami.cloudflare` CH TXT with the
-/// world's egress address, the address the real one would see.
-fn cloudflare(site: &ResolverSite, egress: &Egress) -> Config {
-    let whoami = ChaosAnswer::Txt(egress.0.to_string());
-    Config::cloudflare(site.identity.clone().answer(whoami_cloudflare(), whoami))
+/// world's egress address, the address the real one would see. With the
+/// egress unknown, it does not answer the name.
+fn cloudflare(site: &ResolverSite, egress: Option<&Egress>) -> Config {
+    let identity = match egress {
+        Some(egress) => {
+            let whoami = ChaosAnswer::Txt(egress.0.to_string());
+            site.identity.clone().answer(whoami_cloudflare(), whoami)
+        }
+        None => site.identity.clone(),
+    };
+    Config::cloudflare(identity)
 }
 
 /// Quad9, as its preset is.
-fn quad9(site: &ResolverSite, _egress: &Egress) -> Config {
+fn quad9(site: &ResolverSite, _egress: Option<&Egress>) -> Config {
     Config::quad9(site.identity.clone())
 }
 
@@ -566,7 +579,7 @@ fn quad9(site: &ResolverSite, _egress: &Egress) -> Config {
 /// and six SVCB records at `_dns.resolver.arpa` with TTL 300. It refuses
 /// every CHAOS name. What it does not show, such as QNAME minimisation, takes
 /// Unbound's values.
-fn opendns(site: &ResolverSite, _egress: &Egress) -> Config {
+fn opendns(site: &ResolverSite, _egress: Option<&Egress>) -> Config {
     type Param = (SvcParamKey, SvcParamValue);
     let hints = |v4: &[Ipv4Addr], v6: &[Ipv6Addr]| -> [Param; 2] {
         [
@@ -713,8 +726,10 @@ pub struct Location {
     /// The round trip to any other authoritative server, such as one a
     /// [`Mirror`] places.
     pub authority_rtt: Duration,
-    /// The address the network reaches the internet from.
-    pub egress: Egress,
+    /// The address the network reaches the internet from, when it is
+    /// known. Without it the whoami names the public resolver presets
+    /// answer themselves are left to the real hierarchy.
+    pub egress: Option<Egress>,
 }
 
 impl Location {
@@ -741,15 +756,16 @@ impl Location {
             })
     }
 
-    /// The San Francisco Bay Area, reaching the internet from `egress`, as
-    /// every root letter, `gtld-servers.net` server, and public resolver
-    /// answered there on 2026-11-01: the median of five round trips to
-    /// each, the instance names it gave for `id.server`, `hostname.bind`,
-    /// `version.bind`, and `version.server` and their TTL, its NSID, and
-    /// the RCODE it gave for other CHAOS names. Instances are the ones anycast picked
-    /// there that day, so some sit far away: k.root answered from London.
-    /// Other authorities took 20 ms, the median over six of them.
-    pub fn san_francisco_bay_area(egress: Egress) -> Location {
+    /// The San Francisco Bay Area, reaching the internet from `egress` when
+    /// it is known, as every root letter, `gtld-servers.net` server, and
+    /// public resolver answered there on 2026-11-01: the median of five
+    /// round trips to each, the instance names it gave for `id.server`,
+    /// `hostname.bind`, `version.bind`, and `version.server` and their TTL,
+    /// its NSID, and the RCODE it gave for other CHAOS names. Instances are
+    /// the ones anycast picked there that day, so some sit far away: k.root
+    /// answered from London. Other authorities took 20 ms, the median over
+    /// six of them.
+    pub fn san_francisco_bay_area(egress: Option<Egress>) -> Location {
         use ResponseCode::{NoError, NotImp, Refused, ServFail};
         let txt = |text: &str| ChaosAnswer::Txt(text.to_string());
         let no = ChaosAnswer::Rcode;
@@ -1118,7 +1134,7 @@ pub fn root_zone(text: &str) -> Result<Zone, ZoneError> {
 // Mirror
 
 /// A callback that sees each relayed reply.
-type Observer = dyn Fn(&Request, &Client, &Response) + Send + Sync;
+type Observer = dyn Fn(&Request, &Client, &Message) + Send + Sync;
 
 /// What a world puts around each relay's authority.
 type Wrap = dyn Fn(Arc<dyn Authority>) -> Arc<dyn Authority> + Send + Sync;
@@ -1138,10 +1154,10 @@ type Front = dyn Fn(Host) -> Host + Send + Sync;
 ///
 /// - at each address a reply gives as glue for a name server it names
 ///   (RFC 9471), and
-/// - at each address answering an A or AAAA question for a name that a
-///   relayed NS RRset named this session, for a delegation without glue,
-///   such as a `.com` zone served from `awsdns-NN.org` or
-///   `8.in-addr.arpa` served from `arin.net`.
+/// - at each address an A or AAAA answer gives this session for a name
+///   that a relayed NS RRset names this session, whichever came first,
+///   for a delegation without glue, such as a `.com` zone served from
+///   `awsdns-NN.org` or `8.in-addr.arpa` served from `arin.net`.
 ///
 /// Each relay is placed before the reply that names it leaves, behind
 /// [`Host::delay`] with half the location's
@@ -1150,7 +1166,8 @@ type Front = dyn Fn(Host) -> Host + Send + Sync;
 /// relay or a preset's server already answers, nothing more is placed.
 /// A relay joining a machine takes its port 53, so a world puts no DNS
 /// server of its own at an address the real hierarchy names. The names of
-/// name servers are forgotten when the namespace advances.
+/// name servers and the addresses answers gave are forgotten when the
+/// namespace advances.
 ///
 /// Addresses on the sandboxes' subnet or a LAN, and addresses no
 /// internet host can have (those the IANA special-purpose registries of
@@ -1172,15 +1189,24 @@ struct Inner {
     observers: Vec<Arc<Observer>>,
     wrap: Option<Arc<Wrap>>,
     fronts: Vec<(LowerName, Arc<Front>)>,
-    seen: Arc<Mutex<Seen>>,
+    named: Arc<PerSession<Named>>,
+    placed: Arc<Mutex<Placed>>,
 }
 
-/// What a mirror has seen of the hierarchy.
-struct Seen {
-    /// The session `targets` belong to.
-    generation: Generation,
-    /// The name server names relayed replies gave this session.
+/// What relayed replies named this session.
+#[derive(Default)]
+struct Named {
+    /// The name servers NS RRsets named.
     targets: HashSet<LowerName>,
+    /// The addresses A and AAAA answers gave, by owner, so a name server
+    /// whose address came before any NS RRset named it still gets its
+    /// relay.
+    addresses: HashMap<LowerName, Vec<IpAddr>>,
+}
+
+/// Where a mirror placed something, in every session.
+#[derive(Default)]
+struct Placed {
     /// Addresses given a relay, or found unable to take one.
     relays: HashSet<IpAddr>,
     /// Addresses given a front.
@@ -1201,12 +1227,8 @@ impl Mirror {
                 observers: Vec::new(),
                 wrap: None,
                 fronts: Vec::new(),
-                seen: Arc::new(Mutex::new(Seen {
-                    generation: Generation(0),
-                    targets: HashSet::new(),
-                    relays: HashSet::new(),
-                    fronts: HashSet::new(),
-                })),
+                named: Arc::default(),
+                placed: Arc::default(),
             }),
         }
     }
@@ -1232,7 +1254,7 @@ impl Mirror {
     /// relays it names are placed. Observers run in the order given.
     pub fn observe(
         self,
-        f: impl Fn(&Request, &Client, &Response) + Send + Sync + 'static,
+        f: impl Fn(&Request, &Client, &Message) + Send + Sync + 'static,
     ) -> Mirror {
         self.with(|inner| inner.observers.push(Arc::new(f)))
     }
@@ -1289,52 +1311,74 @@ impl Inner {
         let answered: Vec<IpAddr> = reply.answers.iter().filter_map(address).collect();
         let mut relays: Vec<(IpAddr, Name)> = Vec::new();
         let mut fronts: Vec<(IpAddr, &Arc<Front>)> = Vec::new();
-        {
-            let mut seen = self.seen.lock();
-            if let Some(namespace) = &self.namespace {
-                let generation = namespace.current().generation;
-                if generation != seen.generation {
-                    seen.generation = generation;
-                    seen.targets.clear();
-                }
+        let targets: HashSet<LowerName> = reply
+            .answers
+            .iter()
+            .chain(&reply.authorities)
+            .filter_map(|record| match &record.data {
+                RData::NS(ns) => Some(LowerName::new(&ns.0)),
+                _ => None,
+            })
+            .collect();
+        for record in &reply.additionals {
+            if let Some(addr) = address(record)
+                && targets.contains(&LowerName::new(&record.name))
+            {
+                relays.push((addr, record.name.clone()));
             }
-            let named: HashSet<LowerName> = reply
-                .answers
-                .iter()
-                .chain(&reply.authorities)
-                .filter_map(|record| match &record.data {
-                    RData::NS(ns) => Some(LowerName::new(&ns.0)),
-                    _ => None,
-                })
-                .collect();
-            for record in &reply.additionals {
-                if let Some(addr) = address(record)
-                    && named.contains(&LowerName::new(&record.name))
-                {
-                    relays.push((addr, record.name.clone()));
-                }
+        }
+        let generation = self
+            .namespace
+            .as_ref()
+            .map_or(Generation(0), |namespace| namespace.current().generation);
+        self.named.with(generation, |named| {
+            // A name server whose address an earlier answer gave, before
+            // this NS RRset named it: a resolver has its address cached
+            // and asks it next.
+            for target in &targets {
+                let known = named.addresses.get(target).into_iter().flatten();
+                relays.extend(known.map(|addr| (*addr, Name::from(target))));
             }
-            seen.targets.extend(named);
-            if asks_address && seen.targets.contains(&qname) {
-                let name = req.question.name().clone();
-                relays.extend(answered.iter().map(|addr| (*addr, name.clone())));
-            }
-            if asks_address {
-                for (name, front) in &self.fronts {
-                    if *name == qname {
-                        fronts.extend(answered.iter().map(|addr| (*addr, front)));
+            named.targets.extend(targets);
+            for record in &reply.answers {
+                if let Some(addr) = address(record) {
+                    let known = named
+                        .addresses
+                        .entry(LowerName::new(&record.name))
+                        .or_default();
+                    if !known.contains(&addr) {
+                        known.push(addr);
                     }
                 }
             }
-            relays.retain(|(addr, _)| self.may_relay(*addr) && seen.relays.insert(*addr));
-            fronts.retain(|(addr, _)| globally_reachable(*addr) && seen.fronts.insert(*addr));
+            if asks_address && named.targets.contains(&qname) {
+                let name = req.question.name().clone();
+                relays.extend(answered.iter().map(|addr| (*addr, name.clone())));
+            }
+        });
+        if asks_address {
+            for (name, front) in &self.fronts {
+                if *name == qname {
+                    fronts.extend(answered.iter().map(|addr| (*addr, front)));
+                }
+            }
+        }
+        {
+            let mut placed = self.placed.lock();
+            relays.retain(|(addr, _)| self.may_relay(*addr) && placed.relays.insert(*addr));
+            fronts.retain(|(addr, _)| globally_reachable(*addr) && placed.fronts.insert(*addr));
         }
         // The network refuses an address on the sandboxes' subnet or a
-        // LAN; such an address stays without a relay.
+        // LAN; such an address stays without a relay. The real server
+        // speaks for itself: its CHAOS answers and NSID are relayed.
+        let front = ServerConfig {
+            identity: None,
+            ..ServerConfig::generic()
+        };
         for (addr, name) in relays {
             let host = only_at(&name.to_string(), addr)
                 .delay(self.delay)
-                .program(self.relay(ServerConfig::generic()));
+                .program(self.relay(front.clone()));
             let _ = self.handle.add_host(host);
         }
         for (addr, build) in fronts {
@@ -1399,14 +1443,8 @@ impl Authority for Mirrored {
             && let Ok(message) = Message::from_vec(bytes)
         {
             self.0.place(req, &message);
-            if !self.0.observers.is_empty() {
-                let response = Response {
-                    message,
-                    required_additional: 0,
-                };
-                for observer in &self.0.observers {
-                    observer(req, client, &response);
-                }
+            for observer in &self.0.observers {
+                observer(req, client, &message);
             }
         }
         step

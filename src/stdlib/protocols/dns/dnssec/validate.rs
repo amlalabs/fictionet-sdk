@@ -134,7 +134,6 @@ pub struct Chain {
 /// it. `authority` is the authority section of the same reply, which
 /// holds the NSEC or NSEC3 records a wildcard answer needs to show that
 /// no closer name matched (RFC 4035 §5.3.4).
-#[allow(clippy::too_many_arguments)]
 pub fn validate_rrset(
     set: &RecordSet,
     authority: &[RecordSet],

@@ -75,10 +75,15 @@ pub(super) enum Outcome {
     Alias {
         cname: RecordSet,
         target: Name,
-        /// The DNAME the CNAME was synthesized from, if it was.
+        /// The DNAME the CNAME was synthesized from, if it was, and the
+        /// NSEC or NSEC3 records that show a wildcard CNAME had no closer
+        /// match.
         proof: Vec<RecordSet>,
         zone: Name,
     },
+    /// A DNAME above the name whose substitution would pass 255 octets:
+    /// the server answered YXDOMAIN with it (RFC 6672 §2.2).
+    TooLong { dname: RecordSet, zone: Name },
     /// A negative answer.
     Negative {
         kind: Negative,
@@ -93,20 +98,27 @@ pub(super) enum Outcome {
     Failure(FailureKind),
 }
 
+impl Outcome {
+    /// The RRsets an answer from this outcome carries, with the TTLs they
+    /// had when found.
+    pub(super) fn records(&self) -> Vec<&RecordSet> {
+        match self {
+            Outcome::Data { sets, proof, .. } => sets.iter().chain(proof).collect(),
+            Outcome::Alias { cname, proof, .. } => std::iter::once(cname).chain(proof).collect(),
+            Outcome::Negative { soa, denial, .. } => soa.iter().chain(denial).collect(),
+            Outcome::TooLong { dname, .. } => vec![dname],
+            Outcome::Failure(_) => Vec::new(),
+        }
+    }
+}
+
 /// One thing a check validates.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) enum Subject {
     /// The RRset at a key.
     Rrset(Key),
     /// A negative answer for a key.
-    Denial(Key, NegativeKind),
-}
-
-/// [`Negative`] with an order, for keys.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(super) enum NegativeKind {
-    NxDomain,
-    NoData,
+    Denial(Key, Negative),
 }
 
 /// The subjects `outcome` holds, in the order a client sees them.
@@ -121,15 +133,16 @@ pub(super) fn subjects(outcome: &Outcome) -> Vec<Subject> {
     match outcome {
         Outcome::Data { sets, .. } => sets.iter().map(|set| Subject::Rrset(key(set))).collect(),
         Outcome::Alias { cname, .. } => vec![Subject::Rrset(key(cname))],
+        Outcome::TooLong { dname, .. } => vec![Subject::Rrset(key(dname))],
         Outcome::Negative {
             kind, name, qtype, ..
         } => {
-            let (rtype, kind) = match kind {
-                Negative::NxDomain => (RecordType::ANY, NegativeKind::NxDomain),
-                Negative::NoData => (*qtype, NegativeKind::NoData),
+            let rtype = match kind {
+                Negative::NxDomain => RecordType::ANY,
+                Negative::NoData => *qtype,
             };
             let key = Key::new(LowerName::new(name), rtype, DNSClass::IN);
-            vec![Subject::Denial(key, kind)]
+            vec![Subject::Denial(key, *kind)]
         }
         Outcome::Failure(_) => Vec::new(),
     }
@@ -163,9 +176,11 @@ pub(super) enum Dep {
     Ready(Box<Found>),
     /// This lookup is finding it.
     Waiting(u64),
-    /// It cannot be had: the lookup would wait on itself, or the
-    /// dependency is deeper than the work bound allows.
-    Refused,
+    /// It cannot be had: the lookup would wait on itself.
+    Cycle,
+    /// It cannot be had by this tree: the dependency is deeper than the
+    /// work bound allows.
+    TooDeep,
 }
 
 /// What starting a check gave.
@@ -181,6 +196,8 @@ pub(super) enum Ready {
         lookup: u64,
         key: Key,
         found: Box<Found>,
+        /// Whether the work bound stopped the lookup.
+        bounded: bool,
     },
     Checked {
         to: Node,
@@ -228,6 +245,16 @@ struct Lookup {
     learned: BTreeMap<LowerName, Vec<IpAddr>>,
     /// Name servers whose addresses this lookup asked for.
     asked: BTreeSet<LowerName>,
+    /// The last referral this lookup followed: the cut and its NS
+    /// targets. Data with TTL 0 is not cached but serves the resolution in
+    /// progress (RFC 1035 §7.4), so the referral moves the lookup down
+    /// even when the cache kept nothing of it.
+    delegation: Option<(LowerName, Vec<Name>)>,
+    /// Whether the work bound stopped this lookup, or a lookup it waited
+    /// on. Its failure then says how far one client question's budget
+    /// went, not what the servers did, so it is not cached for other
+    /// clients (RFC 9520 §3.2).
+    bounded: bool,
     wait: LookupWait,
 }
 
@@ -247,6 +274,22 @@ enum LookupWait {
     Nothing,
     Exchange(Token),
     Lookups(BTreeSet<u64>),
+}
+
+/// One query a lookup is about to send: what it asks, of which server,
+/// and how.
+struct Asking {
+    /// The zone the server is asked as an authority for.
+    zone: LowerName,
+    to: SocketAddr,
+    transport: Transport,
+    /// The question. Its case is randomised when it is sent, with
+    /// [`case_randomise`](super::Config::case_randomise).
+    question: Query,
+    /// Whether the question is a minimised one.
+    minimised: bool,
+    /// Whether it asks with RD set, as to a forwarder.
+    forwarded: bool,
 }
 
 /// One query sent to a server.
@@ -274,11 +317,16 @@ struct Check {
     depth: u8,
     /// The trust anchor the chain starts at.
     anchor: Name,
+    /// The zone the material came from, as far as the resolution knew.
+    zone: Name,
     /// What the chain has gathered, per zone.
     links: BTreeMap<LowerName, (Name, Option<Fetched>, Option<Fetched>)>,
     /// The lookups the check waits for, with the zone and the part each
     /// fetches.
     wait: BTreeMap<u64, (LowerName, Part)>,
+    /// Whether the check looked for zone cuts between `zone` and an
+    /// unsigned RRset's owner.
+    probed: bool,
     dependents: Vec<Node>,
 }
 
@@ -286,6 +334,9 @@ struct Check {
 enum Part {
     Ds,
     Dnskey,
+    /// The DS RRset at a name between the zone and the owner of an
+    /// unsigned RRset, asked to find a zone cut the resolution never saw.
+    Cut,
 }
 
 /// The records one check validates.
@@ -401,10 +452,11 @@ impl Graph {
 
 impl<V: Verify> Resolver<V> {
     /// What the cache answers for `key` now, with TTLs counted down: an
-    /// NXDOMAIN at or above the name (RFC 8020), what validated NSEC
-    /// records prove (RFC 8198), the RRset, the negative or failure, or a
-    /// CNAME at the name. Data below [`Rank::NonAuthAnswer`] never
-    /// answers (RFC 2181 §5.4.1), and QTYPE ANY is always asked again.
+    /// NXDOMAIN at the name or a Secure one above it (RFC 8020), what
+    /// validated NSEC records prove (RFC 8198), the RRset, the negative or
+    /// failure, or a CNAME at the name. Data below [`Rank::NonAuthAnswer`]
+    /// never answers (RFC 2181 §5.4.1), and QTYPE ANY is always asked
+    /// again.
     pub(super) fn cached(&self, key: &Key) -> Option<Found> {
         let now = self.now;
         if key.rtype == RecordType::ANY {
@@ -479,16 +531,17 @@ impl<V: Verify> Resolver<V> {
             set.record_type(),
             set.dns_class(),
         );
+        let proof = proof.iter().map(|p| with_ttl(p, remaining)).collect();
         let outcome = match (set.record_type(), cname_target(&set)) {
             (RecordType::CNAME, Some(target)) => Outcome::Alias {
                 target,
-                proof: proof.iter().map(|p| with_ttl(p, remaining)).collect(),
+                proof,
                 cname: set,
                 zone,
             },
             _ => Outcome::Data {
                 sets: vec![set],
-                proof: proof.clone(),
+                proof,
                 zone,
             },
         };
@@ -615,7 +668,10 @@ impl<V: Verify> Resolver<V> {
         }
         loop {
             let key = Key::new(at.clone(), RecordType::NS, DNSClass::IN);
-            if matches!(self.cache.get(&key, self.now), Some(Entry::Positive { .. })) {
+            if matches!(
+                self.cache.data(&key, self.now),
+                Some(Entry::Positive { .. })
+            ) {
                 return Some(at);
             }
             if at.is_root() {
@@ -628,7 +684,7 @@ impl<V: Verify> Resolver<V> {
     /// The NS targets of the zone cut at `zone` in the cache.
     fn targets(&self, zone: &LowerName) -> Vec<Name> {
         let key = Key::new(zone.clone(), RecordType::NS, DNSClass::IN);
-        match self.cache.get(&key, self.now) {
+        match self.cache.data(&key, self.now) {
             Some(Entry::Positive { set, .. }) => set
                 .records_without_rrsigs()
                 .filter_map(|record| match &record.data {
@@ -645,7 +701,7 @@ impl<V: Verify> Resolver<V> {
         let mut out = Vec::new();
         for rtype in [RecordType::A, RecordType::AAAA] {
             let key = Key::new(LowerName::new(target), rtype, DNSClass::IN);
-            if let Some(Entry::Positive { set, .. }) = self.cache.get(&key, self.now) {
+            if let Some(Entry::Positive { set, .. }) = self.cache.data(&key, self.now) {
                 out.extend(set.records_without_rrsigs().filter_map(address));
             }
         }
@@ -667,7 +723,7 @@ impl<V: Verify> Resolver<V> {
         }
         if let Some(&id) = self.graph.by_key.get(&key) {
             if self.graph.reaches(from, Node::Lookup(id)) {
-                return Dep::Refused;
+                return Dep::Cycle;
             }
             if let Some(lookup) = self.graph.lookups.get_mut(&id) {
                 lookup.dependents.push(from);
@@ -675,7 +731,7 @@ impl<V: Verify> Resolver<V> {
             return Dep::Waiting(id);
         }
         if depth > self.config.work.depth {
-            return Dep::Refused;
+            return Dep::TooDeep;
         }
         let id = self.graph.issue();
         self.graph.hold(tree);
@@ -693,6 +749,8 @@ impl<V: Verify> Resolver<V> {
                 minimise: Minimising::default(),
                 learned: BTreeMap::new(),
                 asked: BTreeSet::new(),
+                delegation: None,
+                bounded: false,
                 wait: LookupWait::Nothing,
             },
         );
@@ -737,15 +795,31 @@ impl<V: Verify> Resolver<V> {
                 }
                 // Root NS that the cache did not keep, such as with TTL 0,
                 // cannot be iterated from.
-                Dep::Ready(_) | Dep::Refused => self.fail(id),
+                Dep::Ready(_) | Dep::Cycle => self.fail(id),
+                Dep::TooDeep => {
+                    self.bound(id);
+                    self.fail(id)
+                }
             };
         }
 
         let strictly = key.rtype == RecordType::DS;
-        let zone = self
+        let cached = self
             .cut(&key.name, strictly)
             .expect("the root's NS RRset is cached");
-        let targets = self.targets(&zone);
+        let (zone, targets) = match &lookup.delegation {
+            Some((cut, targets))
+                if cut.num_labels() > cached.num_labels()
+                    && cut.zone_of(&key.name)
+                    && !(strictly && *cut == key.name) =>
+            {
+                (cut.clone(), targets.clone())
+            }
+            _ => {
+                let targets = self.targets(&cached);
+                (cached, targets)
+            }
+        };
         let mut servers: Vec<SocketAddr> = Vec::new();
         for target in &targets {
             let lower = LowerName::new(target);
@@ -775,6 +849,7 @@ impl<V: Verify> Resolver<V> {
         let glueless: Vec<Name> = targets
             .iter()
             .filter(|target| !lookup.asked.contains(&LowerName::new(target)))
+            .filter(|target| !lookup.learned.contains_key(&LowerName::new(target)))
             .filter(|target| self.addresses(target).is_empty())
             .cloned()
             .collect();
@@ -791,7 +866,8 @@ impl<V: Verify> Resolver<V> {
                         waiting.insert(dep);
                     }
                     Dep::Ready(found) => self.learn(id, &lower, &found.outcome),
-                    Dep::Refused => {}
+                    Dep::Cycle => {}
+                    Dep::TooDeep => self.bound(id),
                 }
             }
             if !waiting.is_empty() {
@@ -844,13 +920,15 @@ impl<V: Verify> Resolver<V> {
         }
     }
 
-    /// What a lookup that lookup `id` waited for found.
+    /// What a lookup that lookup `id` waited for found, and whether the
+    /// work bound stopped it.
     pub(super) fn lookup_looked(
         &mut self,
         id: u64,
         dep: u64,
         key: &Key,
         found: Found,
+        bounded: bool,
         entropy: &dyn Entropy,
     ) {
         let Some(lookup) = self.graph.lookups.get_mut(&id) else {
@@ -862,6 +940,7 @@ impl<V: Verify> Resolver<V> {
         if !waiting.remove(&dep) {
             return;
         }
+        lookup.bounded |= bounded;
         let done = waiting.is_empty();
         if key.rtype == RecordType::NS && key.name.is_root() {
             if let Outcome::Failure(why) = found.outcome {
@@ -879,7 +958,7 @@ impl<V: Verify> Resolver<V> {
     }
 
     /// Ends lookup `id` with no server left to ask, caching the failure
-    /// (RFC 9520 §3.2).
+    /// (RFC 9520 §3.2) unless the work bound caused it.
     fn fail(&mut self, id: u64) {
         let Some(lookup) = self.graph.lookups.get(&id) else {
             return;
@@ -889,9 +968,19 @@ impl<V: Verify> Resolver<V> {
         } else {
             FailureKind::NoReachableAuthority
         };
-        let key = lookup.key.clone();
-        self.cache.insert(self.now, Offer::Failure { key, why });
+        if !lookup.bounded {
+            let key = lookup.key.clone();
+            self.cache.insert(self.now, Offer::Failure { key, why });
+        }
         self.finish(id, Found::fresh(Outcome::Failure(why)));
+    }
+
+    /// Notes that the work bound stopped lookup `id` or something it
+    /// needed.
+    fn bound(&mut self, id: u64) {
+        if let Some(lookup) = self.graph.lookups.get_mut(&id) {
+            lookup.bounded = true;
+        }
     }
 
     /// Ends lookup `id` with `found`, for every node that waited on it.
@@ -910,6 +999,7 @@ impl<V: Verify> Resolver<V> {
                 lookup: id,
                 key: lookup.key.clone(),
                 found: Box::new(found.clone()),
+                bounded: lookup.bounded,
             });
         }
     }
@@ -929,17 +1019,15 @@ impl<V: Verify> Resolver<V> {
         let Some((name, rtype, minimised)) = self.next_question(id, &zone, forwarded) else {
             return;
         };
-        self.send(
-            id,
+        let asking = Asking {
             zone,
             to,
-            Transport::Udp,
-            name,
-            rtype,
+            transport: Transport::Udp,
+            question: Query::query(name, rtype),
             minimised,
             forwarded,
-            entropy,
-        );
+        };
+        self.send(id, asking, entropy);
     }
 
     /// The question lookup `id` asks a server of `zone` next: the whole
@@ -988,42 +1076,39 @@ impl<V: Verify> Resolver<V> {
     }
 
     /// Sends one query for lookup `id` and waits for it.
-    #[allow(clippy::too_many_arguments)]
-    fn send(
-        &mut self,
-        id: u64,
-        zone: LowerName,
-        to: SocketAddr,
-        transport: Transport,
-        name: Name,
-        rtype: RecordType,
-        minimised: bool,
-        forwarded: bool,
-        entropy: &dyn Entropy,
-    ) {
+    fn send(&mut self, id: u64, asking: Asking, entropy: &dyn Entropy) {
+        let Asking {
+            zone,
+            to,
+            transport,
+            question,
+            minimised,
+            forwarded,
+        } = asking;
         let Some(lookup) = self.graph.lookups.get(&id) else {
             return;
         };
-        let (tree, replied, key) = (lookup.tree, lookup.replied, lookup.key.clone());
+        let (tree, replied) = (lookup.tree, lookup.replied);
         if !self.graph.charge(tree, self.config.work.queries) {
             // RFC 1034 §5.3.3: past the bound, the question fails. When no
             // server ever replied, every server failed (RFC 8914 §4.23).
+            // The bound is one tree's, so the failure is not cached.
             let why = if replied {
                 FailureKind::WorkExceeded
             } else {
                 FailureKind::NoReachableAuthority
             };
-            self.cache.insert(self.now, Offer::Failure { key, why });
+            self.bound(id);
             return self.finish(id, Found::fresh(Outcome::Failure(why)));
         }
-        let mut name = name;
+        let mut name = question.name().clone();
         if self.config.case_randomise {
             name = randomise_case(&name, entropy);
         }
         let mut bytes = [0u8; 2];
         entropy.fill_random(&mut bytes);
         let message_id = u16::from_be_bytes(bytes);
-        let question = Query::query(name, rtype);
+        let question = Query::query(name, question.query_type());
         let mut message = Message::new(message_id, MessageType::Query, OpCode::Query);
         message.metadata.recursion_desired = forwarded;
         // RFC 6840 §5.9: a validating resolver sets CD, so it gets the
@@ -1229,32 +1314,32 @@ impl<V: Verify> Resolver<V> {
             // TCP, of the same server. Over TCP it is a broken server.
             return match exchange.transport {
                 Transport::Udp => {
-                    let name = exchange.question.name().clone();
-                    let rtype = exchange.question.query_type();
                     let Exchange {
                         zone,
                         to,
+                        question,
                         minimised,
                         forwarded,
                         ..
                     } = exchange;
-                    self.send(
-                        id,
+                    let asking = Asking {
                         zone,
                         to,
-                        Transport::Tcp,
-                        name,
-                        rtype,
+                        transport: Transport::Tcp,
+                        question,
                         minimised,
                         forwarded,
-                        entropy,
-                    )
+                    };
+                    self.send(id, asking, entropy)
                 }
                 Transport::Tcp => self.give_up(exchange, true, entropy),
             };
         }
         let rcode = message.metadata.response_code;
-        if !matches!(rcode, ResponseCode::NoError | ResponseCode::NXDomain) {
+        if !matches!(
+            rcode,
+            ResponseCode::NoError | ResponseCode::NXDomain | ResponseCode::YXDomain
+        ) {
             return self.give_up(exchange, true, entropy);
         }
 
@@ -1286,6 +1371,22 @@ impl<V: Verify> Resolver<V> {
         } else {
             Rank::AuthAnswer
         };
+
+        if rcode == ResponseCode::YXDomain {
+            // RFC 6672 §2.2: the DNAME above the name would make it longer
+            // than a name may be. With the DNAME, that is the answer.
+            let dname = answers
+                .iter()
+                .find(|set| is_dname(set) && set.name().zone_of(&sname) && *set.name() != sname)
+                .cloned();
+            return match dname {
+                Some(dname) if authoritative => {
+                    self.offer(&dname, rank, Vec::new());
+                    self.finish(id, Found::fresh(Outcome::TooLong { dname, zone }));
+                }
+                _ => self.give_up(exchange, true, entropy),
+            };
+        }
 
         if !answers.is_empty() {
             if !authoritative {
@@ -1341,7 +1442,25 @@ impl<V: Verify> Resolver<V> {
                     truncated,
                 },
             );
-            self.store_glue(std::slice::from_ref(ns), &additional, &zone);
+            let glue = self.store_glue(std::slice::from_ref(ns), &additional, &zone);
+            let targets: Vec<Name> = ns
+                .records_without_rrsigs()
+                .filter_map(|record| match &record.data {
+                    RData::NS(ns) => Some(ns.0.to_lowercase()),
+                    _ => None,
+                })
+                .collect();
+            if let Some(lookup) = self.graph.lookups.get_mut(&id) {
+                lookup.delegation = Some((LowerName::new(&cut), targets));
+                for set in glue {
+                    let addresses = set.records_without_rrsigs().filter_map(address);
+                    lookup
+                        .learned
+                        .entry(LowerName::new(set.name()))
+                        .or_default()
+                        .extend(addresses);
+                }
+            }
             return self.plan(id, entropy);
         }
 
@@ -1452,21 +1571,24 @@ impl<V: Verify> Resolver<V> {
             };
             let target = cname_target(cname)?;
             // A CNAME synthesized from a DNAME has no RRSIG of its own;
-            // the DNAME above it vouches for it (RFC 6672 §3.4).
+            // the DNAME above it vouches for it (RFC 6672 §3.4). One
+            // expanded from a wildcard needs the denial records that show
+            // no closer name matched (RFC 4035 §5.3.4).
             let dname: Vec<RecordSet> = answers
                 .iter()
-                .filter(|set| set.record_type() == RecordType::Unknown(39))
+                .filter(|set| is_dname(set))
                 .filter(|set| set.name().zone_of(&at) && *set.name() != at)
                 .cloned()
                 .collect();
             for set in &dname {
                 self.offer(set, rank, Vec::new());
             }
-            self.offer(cname, rank, dname.clone());
+            let proof: Vec<RecordSet> = dname.iter().chain(denial).cloned().collect();
+            self.offer(cname, rank, proof.clone());
             first.get_or_insert(Outcome::Alias {
                 cname: cname.clone(),
                 target: target.clone(),
-                proof: dname,
+                proof,
                 zone: zone.clone(),
             });
             if !zone.zone_of(&target) {
@@ -1510,8 +1632,15 @@ impl<V: Verify> Resolver<V> {
 
     /// Offers, at glue rank, the addresses in `additional` of the NS
     /// targets in `sets` that lie inside `zone`, the zone whose server
-    /// sent them. Addresses outside it could be anything (RFC 2181 §5.4.1).
-    fn store_glue(&mut self, sets: &[RecordSet], additional: &[RecordSet], zone: &Name) {
+    /// sent them, and returns them. Addresses outside it could be anything
+    /// (RFC 2181 §5.4.1).
+    fn store_glue(
+        &mut self,
+        sets: &[RecordSet],
+        additional: &[RecordSet],
+        zone: &Name,
+    ) -> Vec<RecordSet> {
+        let mut kept = Vec::new();
         let targets: Vec<Name> = sets
             .iter()
             .filter(|set| set.record_type() == RecordType::NS)
@@ -1536,8 +1665,10 @@ impl<V: Verify> Resolver<V> {
                         truncated: false,
                     },
                 );
+                kept.push(set.clone());
             }
         }
+        kept
     }
 
     /// Validates `subject` of `outcome` for `from`: at once when nothing
@@ -1585,17 +1716,19 @@ impl<V: Verify> Resolver<V> {
                 tree,
                 depth,
                 anchor,
+                zone: zone.clone(),
                 links: BTreeMap::new(),
                 wait: BTreeMap::new(),
+                probed: false,
                 dependents: vec![from],
             },
         );
         self.link(id, zone, entropy);
         match self.graph.checks.get(&id) {
-            Some(check) if check.wait.is_empty() => {
-                let validation = self.conclude(id);
-                CheckStart::Done(validation)
-            }
+            Some(check) if check.wait.is_empty() => match self.conclude(id, entropy) {
+                Some(validation) => CheckStart::Done(validation),
+                None => CheckStart::Waiting(id),
+            },
             Some(_) => CheckStart::Waiting(id),
             None => CheckStart::Done(Validation::Indeterminate),
         }
@@ -1618,35 +1751,109 @@ impl<V: Verify> Resolver<V> {
         if zone != check.anchor {
             parts.push(Part::Ds);
         }
-        let (tree, depth) = (check.tree, check.depth);
         for part in parts {
-            let rtype = match part {
-                Part::Ds => RecordType::DS,
-                Part::Dnskey => RecordType::DNSKEY,
-            };
-            let key = Key::new(lower.clone(), rtype, DNSClass::IN);
-            match self.depend(Node::Check(id), key, tree, depth + 1, entropy) {
-                Dep::Ready(found) => self.fetched(id, &lower, part, &found.outcome, entropy),
-                Dep::Waiting(lookup) => {
-                    if let Some(check) = self.graph.checks.get_mut(&id) {
-                        check.wait.insert(lookup, (lower.clone(), part));
-                    }
+            self.fetch(id, lower.clone(), part, entropy);
+        }
+    }
+
+    /// Starts the lookup of `part` at `name` for check `id`, or takes what
+    /// the cache has for it at once.
+    fn fetch(&mut self, id: u64, name: LowerName, part: Part, entropy: &dyn Entropy) {
+        let Some(check) = self.graph.checks.get(&id) else {
+            return;
+        };
+        let (tree, depth) = (check.tree, check.depth);
+        let rtype = match part {
+            Part::Ds | Part::Cut => RecordType::DS,
+            Part::Dnskey => RecordType::DNSKEY,
+        };
+        let key = Key::new(name.clone(), rtype, DNSClass::IN);
+        let outcome = match self.depend(Node::Check(id), key, tree, depth + 1, entropy) {
+            Dep::Ready(found) => found.outcome,
+            Dep::Waiting(lookup) => {
+                if let Some(check) = self.graph.checks.get_mut(&id) {
+                    check.wait.insert(lookup, (name, part));
                 }
-                Dep::Refused => self.fetched(
-                    id,
-                    &lower,
-                    part,
-                    &Outcome::Failure(FailureKind::WorkExceeded),
-                    entropy,
-                ),
+                return;
             }
+            Dep::Cycle | Dep::TooDeep => Outcome::Failure(FailureKind::WorkExceeded),
+        };
+        self.fetched(id, &name, part, &outcome, entropy);
+    }
+
+    /// Looks for the zone cuts between check `id`'s zone and the owner of
+    /// its unsigned RRset, which the resolution may never have seen: a
+    /// server that hosts a zone and its unsigned child answers for the
+    /// child itself, without a referral. The DS RRset of each name on the
+    /// way is asked of the parent's side, as Unbound does, and a name the
+    /// parent proves to be a delegation without DS joins the chain, so the
+    /// RRset is Insecure there (RFC 4035 §4.3, §5.2).
+    fn probe(&mut self, id: u64, entropy: &dyn Entropy) {
+        let Some(check) = self.graph.checks.get_mut(&id) else {
+            return;
+        };
+        check.probed = true;
+        let Material::Rrset { set, .. } = &check.material else {
+            return;
+        };
+        let owner = set.name().to_lowercase();
+        let zone = check.zone.clone();
+        // A DS RRset belongs to the parent's side of its own name.
+        let last = if set.record_type() == RecordType::DS {
+            owner.base_name()
+        } else {
+            owner
+        };
+        let mut names = Vec::new();
+        let mut name = last;
+        while name.num_labels() > zone.num_labels() && zone.zone_of(&name) {
+            names.push(LowerName::new(&name));
+            name = name.base_name();
+        }
+        for name in names.into_iter().rev() {
+            self.fetch(id, name, Part::Cut, entropy);
+        }
+    }
+
+    /// Records what the DS lookup at `name` that check `id`'s probe made
+    /// found. A DS RRset makes `name` a signed cut, and the chain takes in
+    /// its keys. A NODATA whose records the parent signs to show a
+    /// delegation without DS makes it an unsigned cut. Anything else says
+    /// `name` is no cut.
+    fn cut_found(&mut self, id: u64, name: &LowerName, outcome: &Outcome, entropy: &dyn Entropy) {
+        let max = self.config.policy.max_nsec3_iterations;
+        match outcome {
+            Outcome::Data { .. } => self.link(id, Name::from(name), entropy),
+            Outcome::Negative {
+                kind: Negative::NoData,
+                soa,
+                denial,
+                zone,
+                ..
+            } => {
+                let parent = soa.as_ref().map_or(zone.clone(), |soa| soa.name().clone());
+                let proof = proof::no_ds(&Name::from(name), &parent, denial, max);
+                if proof == proof::Proof::Unproven {
+                    return;
+                }
+                let Some(check) = self.graph.checks.get_mut(&id) else {
+                    return;
+                };
+                check
+                    .links
+                    .entry(name.clone())
+                    .or_insert_with(|| (Name::from(name), None, None));
+                self.fetched(id, name, Part::Ds, outcome, entropy);
+            }
+            _ => {}
         }
     }
 
     /// Records what a lookup for check `id`'s chain found for `part` of the
     /// zone at `zone`. A DS RRset or its denial names the parent zone, by
     /// the signer of its RRSIGs or the owner of its SOA, and the chain goes
-    /// on up to it.
+    /// on up to it. What a probe for a cut found goes to
+    /// [`cut_found`](Resolver::cut_found).
     fn fetched(
         &mut self,
         id: u64,
@@ -1655,6 +1862,9 @@ impl<V: Verify> Resolver<V> {
         outcome: &Outcome,
         entropy: &dyn Entropy,
     ) {
+        if part == Part::Cut {
+            return self.cut_found(id, zone, outcome, entropy);
+        }
         let (fetched, parent) = match outcome {
             Outcome::Data { sets, zone, .. } => {
                 let set = sets[0].clone();
@@ -1668,7 +1878,7 @@ impl<V: Verify> Resolver<V> {
                 let records = soa.iter().cloned().chain(denial.iter().cloned()).collect();
                 (Fetched::Denied(records), Some(parent))
             }
-            Outcome::Alias { .. } => (Fetched::Denied(Vec::new()), None),
+            Outcome::Alias { .. } | Outcome::TooLong { .. } => (Fetched::Denied(Vec::new()), None),
             Outcome::Failure(_) => (Fetched::Failed, None),
         };
         let Some(check) = self.graph.checks.get_mut(&id) else {
@@ -1679,6 +1889,7 @@ impl<V: Verify> Resolver<V> {
             match part {
                 Part::Ds => link.1 = Some(fetched),
                 Part::Dnskey => link.2 = Some(fetched),
+                Part::Cut => {}
             }
         }
         if part == Part::Ds
@@ -1714,29 +1925,49 @@ impl<V: Verify> Resolver<V> {
             .get(&id)
             .is_some_and(|check| check.wait.is_empty())
         {
-            self.conclude(id);
+            self.conclude(id, entropy);
         }
     }
 
     /// Validates check `id`'s material with the chain it gathered, records
     /// the result in the cache, and hands it to every node that waited.
-    fn conclude(&mut self, id: u64) -> Validation {
-        let Some(check) = self.graph.checks.remove(&id) else {
-            return Validation::Indeterminate;
-        };
-        self.graph.by_subject.remove(&check.subject);
-        self.graph.release(check.tree);
+    ///
+    /// An unsigned RRset that is Bogus with the chain so far may sit below
+    /// a cut the resolution never saw, so the check first probes for one,
+    /// once. `None` while the probe waits.
+    fn conclude(&mut self, id: u64, entropy: &dyn Entropy) -> Option<Validation> {
+        let check = self.graph.checks.get(&id)?;
         let links = check
             .links
-            .into_values()
+            .values()
             .map(|(zone, ds, dnskey)| Link {
-                zone,
-                ds: ds.unwrap_or(Fetched::Failed),
-                dnskey: dnskey.unwrap_or(Fetched::Failed),
+                zone: zone.clone(),
+                ds: ds.clone().unwrap_or(Fetched::Failed),
+                dnskey: dnskey.clone().unwrap_or(Fetched::Failed),
             })
             .collect();
         let chain = Chain { links };
         let validation = self.validate(&check.material, &chain);
+        let unsigned = match &check.material {
+            Material::Rrset { set, .. } => set.rrsigs().is_empty(),
+            Material::Denial { .. } => false,
+        };
+        if unsigned && !check.probed && matches!(validation, Validation::Bogus(_)) {
+            self.probe(id, entropy);
+            let waiting = self
+                .graph
+                .checks
+                .get(&id)
+                .is_some_and(|check| !check.wait.is_empty());
+            return if waiting {
+                None
+            } else {
+                self.conclude(id, entropy)
+            };
+        }
+        let check = self.graph.checks.remove(&id)?;
+        self.graph.by_subject.remove(&check.subject);
+        self.graph.release(check.tree);
         self.validated(&check.subject, &check.material, validation);
         for to in check.dependents {
             self.graph.ready.push_back(Ready::Checked {
@@ -1746,7 +1977,7 @@ impl<V: Verify> Resolver<V> {
                 validation,
             });
         }
-        validation
+        Some(validation)
     }
 
     fn validate(&self, material: &Material, chain: &Chain) -> Validation {
@@ -1891,14 +2122,20 @@ fn material(subject: &Subject, outcome: &Outcome) -> Option<(Material, Name)> {
             },
         ) => {
             // A synthesized CNAME is as good as the DNAME it came from.
-            let set = match (signer(cname), proof.first()) {
+            let dname = proof.iter().find(|set| is_dname(set));
+            let set = match (signer(cname), dname) {
                 (None, Some(dname)) if dname_matches(dname, cname) => dname.clone(),
                 _ => cname.clone(),
             };
             let zone = signer(&set).unwrap_or_else(|| zone.clone());
+            let authority = proof.iter().filter(|set| !is_dname(set)).cloned().collect();
+            Some((Material::Rrset { set, authority }, zone))
+        }
+        (Subject::Rrset(_), Outcome::TooLong { dname, zone }) => {
+            let zone = signer(dname).unwrap_or_else(|| zone.clone());
             Some((
                 Material::Rrset {
-                    set,
+                    set: dname.clone(),
                     authority: Vec::new(),
                 },
                 zone,
@@ -1953,6 +2190,11 @@ fn dname_matches(dname: &RecordSet, cname: &RecordSet) -> bool {
     Name::from_labels(prefix)
         .and_then(|prefix| prefix.append_domain(&target))
         .is_ok_and(|expected| expected == alias)
+}
+
+/// Whether `set` is a DNAME RRset (RFC 6672).
+pub(super) fn is_dname(set: &RecordSet) -> bool {
+    set.record_type() == RecordType::DNAME
 }
 
 /// The signer named in `set`'s RRSIGs.

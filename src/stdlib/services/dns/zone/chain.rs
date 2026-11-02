@@ -5,7 +5,7 @@ use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fictionet::stdlib::protocols::dns::dnssec::proof::{self, Proof};
-use fictionet::stdlib::protocols::dns::dnssec::rdata::{DNSKEY, DNSSECRData, DS};
+use fictionet::stdlib::protocols::dns::dnssec::rdata::{DNSKEY, DNSSECRData, DS, RRSIG};
 use fictionet::stdlib::protocols::dns::dnssec::{
     AlgorithmPolicy, DigestType, KeyFlags, PublicKey, Ring, TBS, Verify, ds, key_tag,
 };
@@ -54,6 +54,18 @@ pub enum ChainProblem {
         /// The registry number of the algorithm.
         algorithm: u8,
     },
+    /// The RRset of type `rtype` at `owner` in the signed zone at `apex`
+    /// has no RRSIG that verifies under the zone's keys, such as an RRset
+    /// added or changed with [`Zone::with`] after [`Zone::signed`], so
+    /// validators find it Bogus (RFC 4035 §5.3).
+    SignatureInvalid {
+        /// The zone's apex.
+        apex: LowerName,
+        /// The RRset's owner.
+        owner: LowerName,
+        /// The RRset's type.
+        rtype: RecordType,
+    },
 }
 
 impl fmt::Display for ChainProblem {
@@ -81,6 +93,12 @@ impl fmt::Display for ChainProblem {
                     "{apex} uses DNSKEY algorithm {algorithm}, which the policy does not validate"
                 )
             }
+            ChainProblem::SignatureInvalid { apex, owner, rtype } => {
+                write!(
+                    f,
+                    "the {rtype} RRset at {owner} has no signature that verifies under the keys of {apex}"
+                )
+            }
         }
     }
 }
@@ -95,7 +113,10 @@ impl fmt::Display for ChainProblem {
 /// signed parent without one must prove there is none, unless none of its
 /// keys uses an algorithm the policy validates. Every zone's
 /// signatures must be valid at `at`, and its keys must use algorithms the
-/// policy validates.
+/// policy validates. In a signed zone, every RRset the zone is
+/// authoritative for must carry an RRSIG that verifies under the zone's
+/// keys; an RRSIG with an algorithm the policy does not validate counts,
+/// since that is reported as such.
 ///
 /// The check is advisory. A world that wants a broken chain, to play a
 /// zone like `dnssec-failed.org`, leaves the problem in, and resolvers
@@ -122,6 +143,20 @@ pub fn check_chain(zones: &[&Zone], policy: &AlgorithmPolicy, at: SystemTime) ->
                 apex: apex.clone(),
                 at,
             });
+        }
+        if !keys.is_empty() {
+            let signer = Name::from(apex);
+            for (owner, node) in zone.nodes() {
+                for set in authoritative(node) {
+                    if !signed_by(set, &signer, &keys, policy) {
+                        problems.push(ChainProblem::SignatureInvalid {
+                            apex: apex.clone(),
+                            owner: owner.clone(),
+                            rtype: set.record_type(),
+                        });
+                    }
+                }
+            }
         }
         for (child, node) in zone.nodes() {
             let Node::Cut { ds, .. } = node else {
@@ -293,34 +328,71 @@ fn inside(rrsig: &Record, at: SystemTime) -> bool {
         && matches!(at.partial_cmp(&input.sig_inception), Some(Greater | Equal))
 }
 
+/// The RRsets at `node` the zone is authoritative for, and so signs: all
+/// of a node's own, and a cut's DS, but not a cut's NS or glue
+/// (RFC 4035 §2.2).
+fn authoritative(node: &Node) -> Vec<&RecordSet> {
+    match node {
+        Node::Data(_) | Node::Dname(..) => node.rrsets(),
+        Node::Cut { ds, .. } => ds.iter().collect(),
+        Node::Empty => Vec::new(),
+    }
+}
+
 /// Whether one of `set`'s RRSIGs by the zone at `signer` verifies under
 /// one of `keys` with an algorithm the policy validates. Times are left
 /// to [`inside`].
 fn verifies(set: &RecordSet, signer: &Name, keys: &[DNSKEY], policy: &AlgorithmPolicy) -> bool {
-    set.rrsigs().iter().any(|record| {
-        let RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) = &record.data else {
-            return false;
-        };
-        let input = rrsig.input();
-        if input.type_covered != set.record_type()
-            || input.signer_name != *signer
-            || !policy.validates(u8::from(input.algorithm))
-        {
-            return false;
-        }
-        let Ok(tbs) = TBS::from_input(
-            set.name(),
-            set.dns_class(),
-            input,
-            set.records_without_rrsigs(),
-        ) else {
-            return false;
-        };
-        keys.iter()
-            .filter(|key| key.public_key().algorithm() == input.algorithm)
-            .filter(|key| key_tag(key) == input.key_tag)
-            .any(|key| Ring.verify(key, tbs.as_ref(), rrsig.sig()))
-    })
+    set.rrsigs()
+        .iter()
+        .any(|record| match by_signer(set, record, signer) {
+            Some(rrsig) => {
+                policy.validates(u8::from(rrsig.input().algorithm))
+                    && verifies_one(set, rrsig, keys)
+            }
+            None => false,
+        })
+}
+
+/// Whether `set` carries an RRSIG by the zone at `signer` that verifies
+/// under one of `keys`, or one with an algorithm the policy does not
+/// validate, which [`ChainProblem::UnsupportedAlgorithm`] reports instead.
+fn signed_by(set: &RecordSet, signer: &Name, keys: &[DNSKEY], policy: &AlgorithmPolicy) -> bool {
+    set.rrsigs()
+        .iter()
+        .any(|record| match by_signer(set, record, signer) {
+            Some(rrsig) => {
+                !policy.validates(u8::from(rrsig.input().algorithm))
+                    || verifies_one(set, rrsig, keys)
+            }
+            None => false,
+        })
+}
+
+/// `record` as an RRSIG over `set` by the zone at `signer`, if it is one.
+fn by_signer<'r>(set: &RecordSet, record: &'r Record, signer: &Name) -> Option<&'r RRSIG> {
+    let RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) = &record.data else {
+        return None;
+    };
+    let input = rrsig.input();
+    (input.type_covered == set.record_type() && input.signer_name == *signer).then_some(rrsig)
+}
+
+/// Whether `rrsig` over `set` verifies under one of `keys`.
+fn verifies_one(set: &RecordSet, rrsig: &RRSIG, keys: &[DNSKEY]) -> bool {
+    let input = rrsig.input();
+    let Ok(tbs) = TBS::from_input(
+        set.name(),
+        set.dns_class(),
+        input,
+        set.records_without_rrsigs(),
+    ) else {
+        return false;
+    };
+    keys.iter()
+        .filter(|key| key.public_key().algorithm() == input.algorithm)
+        .filter(|key| key_tag(key) == input.key_tag)
+        .any(|key| Ring.verify(key, tbs.as_ref(), rrsig.sig()))
 }
 
 #[cfg(test)]

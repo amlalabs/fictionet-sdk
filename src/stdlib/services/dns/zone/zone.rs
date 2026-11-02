@@ -18,6 +18,7 @@ use fictionet::stdlib::protocols::dns::rr::{
 };
 use fictionet::stdlib::protocols::dns::serialize::binary::{BinDecodable, BinDecoder};
 
+use super::cover::hashed_owner;
 use super::data::{Denied, Fact, Revision, View, ZoneData};
 use super::master::MasterError;
 
@@ -911,9 +912,8 @@ impl Inner {
         unique(proof.into_iter().flatten())
     }
 
-    /// The hash algorithm, salt, and iterations every NSEC3 record of the
-    /// zone shares (RFC 5155 §7.1).
-    fn nsec3_params(&self) -> Option<(Nsec3HashAlgorithm, Vec<u8>, u16)> {
+    /// How every NSEC3 record of the zone hashes names (RFC 5155 §7.1).
+    fn nsec3_params(&self) -> Option<Hashing> {
         let record = self
             .nsec3
             .values()
@@ -921,28 +921,32 @@ impl Inner {
             .records_without_rrsigs()
             .next()?;
         match &record.data {
-            RData::DNSSEC(DNSSECRData::NSEC3(nsec3)) => Some((
-                nsec3.hash_algorithm(),
-                nsec3.salt().to_vec(),
-                nsec3.iterations(),
-            )),
+            RData::DNSSEC(DNSSECRData::NSEC3(nsec3)) => Some(Hashing {
+                algorithm: nsec3.hash_algorithm(),
+                salt: nsec3.salt().to_vec(),
+                iterations: nsec3.iterations(),
+            }),
             _ => None,
         }
     }
 
     /// `name`'s hashed owner: its NSEC3 hash in base32hex, under the apex
     /// (RFC 5155 §3.3).
-    fn hashed(&self, name: &LowerName, params: &(Nsec3HashAlgorithm, Vec<u8>, u16)) -> LowerName {
-        let (algorithm, salt, iterations) = params;
-        let hash = algorithm
-            .hash(salt, &Name::from(name), *iterations)
+    fn hashed(&self, name: &LowerName, hashing: &Hashing) -> LowerName {
+        let hash = hashing
+            .algorithm
+            .hash(&hashing.salt, &Name::from(name), hashing.iterations)
             .expect("a name always encodes");
-        let label = base32hex(hash.as_ref());
-        let name = Name::from_ascii(&label)
-            .and_then(|label| label.append_domain(&Name::from(&self.apex)))
-            .expect("a hash label fits under the apex");
-        LowerName::new(&name)
+        LowerName::new(&hashed_owner(hash.as_ref(), &Name::from(&self.apex)))
     }
+}
+
+/// The parameters every NSEC3 record of one zone hashes names with
+/// (RFC 5155 §5).
+struct Hashing {
+    algorithm: Nsec3HashAlgorithm,
+    salt: Vec<u8>,
+    iterations: u16,
 }
 
 /// The wildcard at `encloser`: `*.<encloser>` (RFC 4592 §2.1.1).
@@ -968,25 +972,4 @@ pub(super) fn unique(sets: impl Iterator<Item = RecordSet>) -> Vec<RecordSet> {
     let mut seen = BTreeSet::new();
     sets.filter(|set| seen.insert((LowerName::new(set.name()), set.record_type())))
         .collect()
-}
-
-/// Base32 with the extended hex alphabet, in lowercase and unpadded, as
-/// NSEC3 owner labels are written (RFC 4648 §7, RFC 5155 §3.3).
-fn base32hex(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 32] = b"0123456789abcdefghijklmnopqrstuv";
-    let mut out = String::new();
-    let mut buffer = 0u32;
-    let mut bits = 0;
-    for &byte in bytes {
-        buffer = (buffer << 8) | u32::from(byte);
-        bits += 8;
-        while bits >= 5 {
-            bits -= 5;
-            out.push(ALPHABET[((buffer >> bits) & 31) as usize] as char);
-        }
-    }
-    if bits > 0 {
-        out.push(ALPHABET[((buffer << (5 - bits)) & 31) as usize] as char);
-    }
-    out
 }

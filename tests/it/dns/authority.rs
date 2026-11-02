@@ -332,7 +332,10 @@ fn the_front_sets_the_header_and_echoes_the_question_case() {
 #[test]
 fn the_front_zeroes_unknown_edns_flags_and_copies_do() {
     let mut server = ServerConfig::generic();
-    server.identity.nsid = Some(b"sjc05".to_vec());
+    server.identity = Some(Identity {
+        nsid: Some(b"sjc05".to_vec()),
+        ..Identity::none()
+    });
     let mut engine = AuthorityEngine::new(zones(vec![example()]), server, local());
     for dnssec_ok in [false, true] {
         let message = query("www.example.test.", RecordType::A, |m| {
@@ -359,7 +362,10 @@ fn the_front_zeroes_unknown_edns_flags_and_copies_do() {
 #[test]
 fn nsid_goes_out_only_when_asked() {
     let mut server = ServerConfig::generic();
-    server.identity.nsid = Some(b"sjc05".to_vec());
+    server.identity = Some(Identity {
+        nsid: Some(b"sjc05".to_vec()),
+        ..Identity::none()
+    });
     let mut engine = AuthorityEngine::new(zones(vec![example()]), server, local());
 
     let plain = query("www.example.test.", RecordType::A, |m| {
@@ -461,6 +467,34 @@ fn ds_at_a_hosted_child_is_answered_from_the_parent() {
 }
 
 #[test]
+fn a_referral_carries_the_address_its_zone_holds_for_a_name_server() {
+    // RFC 1034 §4.3.2 step 3b: the addresses available go in the
+    // additional section, the zone's own data as well as glue.
+    let zone = Zone::builder(name("example."), soa("example."), 3600)
+        .rrset(rrset("example.", 3600, vec![ns("ns.example.")]))
+        .rrset(rrset("ns.example.", 3600, vec![a("192.0.2.1")]))
+        .delegate(
+            name("child.example."),
+            rrset("child.example.", 3600, vec![ns("ns.example.")]),
+            vec![],
+            None,
+        )
+        .build()
+        .unwrap();
+    let mut engine = AuthorityEngine::new(zones(vec![zone]), ServerConfig::generic(), local());
+    let reply = the_answer(&ask_with(
+        &mut engine,
+        &query("www.child.example.", RecordType::A, |_| {}),
+        Transport::Udp,
+    ));
+    assert!(!reply.metadata.authoritative);
+    assert_eq!(reply.authorities[0].record_type(), RecordType::NS);
+    assert_eq!(reply.additionals.len(), 1, "{reply}");
+    assert_eq!(reply.additionals[0].name, name("ns.example."));
+    assert_eq!(reply.additionals[0].data, a("192.0.2.1"));
+}
+
+#[test]
 fn an_unknown_fact_gives_servfail_never_a_negative() {
     let unknown = Lazy::new(
         name("lazy.test."),
@@ -490,7 +524,7 @@ fn an_unknown_fact_gives_servfail_never_a_negative() {
 fn chaos_questions_are_answered_by_name_from_the_identity() {
     let calls = Arc::new(AtomicUsize::new(0));
     let mut server = ServerConfig::generic();
-    server.identity = Identity {
+    let identity = Identity {
         unlisted: ResponseCode::ServFail,
         ..Identity::none()
     }
@@ -500,6 +534,7 @@ fn chaos_questions_are_answered_by_name_from_the_identity() {
         ChaosAnswer::Rcode(ResponseCode::Refused),
     )
     .ttl(60);
+    server.identity = Some(identity);
     let mut engine = AuthorityEngine::new(Counting(calls.clone()), server, local());
     let chaos_query = |qname: &str, qtype: RecordType| {
         query(qname, qtype, |m| {

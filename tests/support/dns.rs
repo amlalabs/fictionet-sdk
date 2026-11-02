@@ -289,7 +289,7 @@ impl TestInternet {
             gtld: Arc::new(gtld),
             servers,
             anchor: keys.root.anchor(&Name::root()),
-            location: Location::san_francisco_bay_area(Egress(EGRESS)),
+            location: Location::san_francisco_bay_area(Some(Egress(EGRESS))),
         }
     }
 

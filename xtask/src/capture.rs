@@ -191,9 +191,10 @@ async fn download(root: &Path, name: &str, urls: &[(String, Resource)]) -> Resul
     Ok(())
 }
 
-pub async fn requisites(root: &Path, urls: &[String]) -> Result {
-    std::fs::create_dir_all(root)?;
-    let root = Archive::directory_root(root)?;
+pub async fn requisites(corpus: &Path, urls: &[String]) -> Result {
+    std::fs::create_dir_all(corpus)?;
+    let corpus = std::fs::canonicalize(corpus)?;
+    let root = Archive::directory_root(&corpus)?;
     let lock = std::fs::File::open(&root)?;
     lock.try_lock()?;
     let mut urls = if urls.is_empty() {
@@ -245,7 +246,11 @@ pub async fn requisites(root: &Path, urls: &[String]) -> Result {
     };
     urls.sort_by(|a, b| a.0.cmp(&b.0));
     println!("Completing requisites for {} captured URLs", urls.len());
-    complete(&root, "requisites", &urls).await
+    complete(&root, "requisites", &urls).await?;
+    let downloads = corpus
+        .parent()
+        .ok_or("the corpus has no downloads directory")?;
+    record_dns(downloads).await
 }
 
 fn captured_at(archive: &Archive, url: &str) -> Result<(String, fictionet_extras::warc::Response)> {
@@ -630,7 +635,6 @@ pub async fn run(downloads: &Path, python: Option<&Path>) -> Result {
         verify(&archive, url)?;
     }
     research(&staged_corpus, &corpus.urls).await?;
-    dns::record(&staged_corpus).await?;
     if root.join("packages").is_dir() {
         std::os::unix::fs::symlink(root.join("packages"), staged_corpus.join("packages"))?;
     }
@@ -642,6 +646,7 @@ pub async fn run(downloads: &Path, python: Option<&Path>) -> Result {
     }
     publication.commit()?;
     let Some(python) = python else {
+        record_dns(downloads).await?;
         println!("Captured research sources in {}", root.display());
         return Ok(());
     };
@@ -770,6 +775,7 @@ pub async fn run(downloads: &Path, python: Option<&Path>) -> Result {
         return Err("offline package installation and clone validation failed".into());
     }
     publish(&packages, &root.join("packages"))?;
+    record_dns(downloads).await?;
     println!(
         "Captured research sources and package distributions in {}",
         root.display()
@@ -777,7 +783,23 @@ pub async fn run(downloads: &Path, python: Option<&Path>) -> Result {
     Ok(())
 }
 
-/// Capture requested source pages and their static dependencies.
+/// Capture requested source pages and their static dependencies, and the
+/// DNS of every host the corpus then serves.
 pub async fn urls(downloads: &Path, urls: &[String]) -> Result {
-    capture_cached(&downloads.join("security"), "zz-pages", urls).await
+    capture_cached(&downloads.join("security"), "zz-pages", urls).await?;
+    record_dns(downloads).await
+}
+
+/// Records the DNS of every host the corpus in `downloads` serves in a
+/// Copied session, read the way the world reads the corpus: its research
+/// and package sites, its reference web, and the search engines. Each
+/// capture that adds pages records it again, so the corpus's newest DNS
+/// is never older than its pages, and a Copied session, whose clock
+/// starts at that capture, finds its signatures valid.
+pub async fn record_dns(downloads: &Path) -> Result {
+    let seed = web_world::pages::Seed::builtin("security")?;
+    let corpus = seed.corpus.clone().ok_or("missing corpus declaration")?;
+    let root = Archive::directory_root(&downloads.join(&corpus.directory))?;
+    let pages = web_world::pages::Pages::from_corpus(seed, downloads)?;
+    dns::record(&root, &pages.copied_hosts()).await
 }

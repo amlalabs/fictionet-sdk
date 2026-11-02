@@ -8,5 +8,6 @@ mod internet;
 mod memory;
 mod probes;
 mod resolver;
+mod signed;
 mod slices;
 mod zone;

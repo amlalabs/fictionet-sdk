@@ -72,7 +72,7 @@ use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::codec::base64::{self, Padding};
 use fictionet::stdlib::protocols::dns::op::{Edns, Message, MessageType, OpCode, Query};
 use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RData, Record, RecordType};
-use fictionet::stdlib::protocols::dns::{Framing, Queries};
+use fictionet::stdlib::protocols::dns::{Framing, Queries, stream_framed};
 use fictionet::stdlib::protocols::json::Value;
 use fictionet::stdlib::protocols::urlencoded_form::{self, Form};
 use fictionet::stdlib::protocols::x509::Validity;
@@ -384,11 +384,8 @@ impl Pending for Answering {
         self.held = 0;
         Poll::Ready(answer.map(|answer| {
             // The resolver fits stream answers to 65535 octets.
-            let len = u16::try_from(answer.len())
-                .map_err(|_| Error::msg("a DNS answer longer than a stream carries"))?;
-            let mut framed = len.to_be_bytes().to_vec();
-            framed.extend_from_slice(&answer);
-            Ok(framed)
+            stream_framed(&answer)
+                .ok_or_else(|| Error::msg("a DNS answer longer than a stream carries"))
         }))
     }
 

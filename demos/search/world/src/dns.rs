@@ -20,12 +20,12 @@ use std::time::Duration;
 use fictionet::Cx;
 use fictionet::stdlib::protocols::dns::op::Message;
 use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RData, Record};
-use fictionet::stdlib::protocols::dns::{Parsed, Request, Response};
+use fictionet::stdlib::protocols::dns::{Parsed, Request};
+use fictionet::stdlib::services::dns::Client;
 use fictionet::stdlib::services::dns::authority::{Ask, Observed};
-use fictionet::stdlib::services::dns::{Client, Generation};
-use fictionet::stdlib::world::net::dns::Source;
 use fictionet::stdlib::world::net::dns::internet::Egress;
-use fictionet::sync::{Mutex, MutexGuard};
+use fictionet::stdlib::world::net::dns::{PerSession, Source};
+use fictionet::sync::Mutex;
 use fictionet_extras::dns::Replay;
 use fictionet_host::dns::Live;
 
@@ -67,17 +67,8 @@ pub fn admit(name: &str) -> Result<(), &'static str> {
         return Err("too long");
     }
     let labels: Vec<&str> = name.split('.').collect();
-    for label in &labels {
-        let ok = !label.is_empty()
-            && label.len() <= 63
-            && label
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-            && !label.starts_with('-')
-            && !label.ends_with('-');
-        if !ok {
-            return Err("not a host name");
-        }
+    if !labels.iter().all(|label| host_label(label)) {
+        return Err("not a host name");
     }
     let tld = labels[labels.len() - 1];
     if !(tld.starts_with("xn--")
@@ -89,6 +80,18 @@ pub fn admit(name: &str) -> Result<(), &'static str> {
         return Err("reserved or private top-level domain");
     }
     Ok(())
+}
+
+/// Whether `label` may be part of a host name: 1 to 63 letters, digits,
+/// or hyphens, not starting or ending with a hyphen (RFC 1123 §2.1).
+fn host_label(label: &str) -> bool {
+    !label.is_empty()
+        && label.len() <= 63
+        && label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        && !label.starts_with('-')
+        && !label.ends_with('-')
 }
 
 /// `name` as a host name: lowercase, without the trailing dot.
@@ -116,6 +119,11 @@ fn and_above(name: &LowerName) -> impl Iterator<Item = LowerName> {
     (0..=labels(&name))
         .rev()
         .map(move |labels| LowerName::new(&name.trim_to(labels)))
+}
+
+/// The NS and CNAME targets `message` names, and every name above one.
+fn named_and_above(message: &Message) -> impl Iterator<Item = LowerName> + '_ {
+    targets(message).flat_map(|(target, _)| and_above(&target).collect::<Vec<_>>())
 }
 
 /// The targets of the NS and CNAME records in a reply's answer and
@@ -154,8 +162,9 @@ fn targets(message: &Message) -> impl Iterator<Item = (LowerName, Option<LowerNa
 ///    server's). Live-Depth uses Live's boundary here: DNS stays real,
 ///    and the site's machine refuses names outside the depth;
 /// 2. it is above a name rule 1 lets out: the root and every single label,
-///    which the root servers answer, and in the live modes any name with
-///    a host name below it, or in Copied the names above captured hosts.
+///    which the root servers answer, and in the live modes any name whose
+///    labels are letters, digits, and hyphens, whatever its top-level
+///    domain, or in Copied the names above captured hosts.
 ///    Priming, referrals, minimised questions, and the DS and DNSKEY sets
 ///    of a chain of trust need these;
 /// 3. it is one or more underscore labels (RFC 8552), such as `_dmarc` or
@@ -184,13 +193,12 @@ struct OutboundInner {
     pages: Arc<Pages>,
     /// The names the world serves in every session.
     always: HashSet<LowerName>,
-    named: Mutex<Named>,
+    named: PerSession<Named>,
 }
 
 /// What the real hierarchy named this session.
+#[derive(Default)]
 struct Named {
-    /// The session these names belong to.
-    generation: Generation,
     /// Every NS and CNAME target relayed replies gave, and every name
     /// above one.
     below: HashSet<LowerName>,
@@ -202,16 +210,11 @@ impl Outbound {
     /// The policy for the sessions of `pages`, with `always` the names the
     /// world serves in every session.
     pub fn new(pages: Arc<Pages>, always: impl IntoIterator<Item = LowerName>) -> Outbound {
-        let generation = pages.namespace().current().generation;
         Outbound {
             inner: Arc::new(OutboundInner {
                 pages,
                 always: always.into_iter().collect(),
-                named: Mutex::new(Named {
-                    generation,
-                    below: HashSet::new(),
-                    aliases: HashMap::new(),
-                }),
+                named: PerSession::new(),
             }),
         }
     }
@@ -226,9 +229,9 @@ impl Outbound {
 
     /// The observer for [`Mirror::observe`](fictionet::stdlib::world::net::dns::internet::Mirror::observe):
     /// learns the NS and CNAME targets of each relayed reply.
-    pub fn observer(&self) -> impl Fn(&Request, &Client, &Response) + Send + Sync + 'static {
+    pub fn observer(&self) -> impl Fn(&Request, &Client, &Message) + Send + Sync + 'static {
         let outbound = self.clone();
-        move |_request, _client, response| outbound.learn(&response.message)
+        move |_request, _client, reply| outbound.learn(reply)
     }
 
     /// Whether the session lets `name` out by rule 1: the names it gives
@@ -249,18 +252,19 @@ impl Outbound {
     /// The names relayed replies gave as aliases of `target` this session,
     /// through any number of CNAME records.
     pub fn aliases(&self, target: &LowerName) -> Vec<LowerName> {
-        let named = self.named();
-        let mut found: Vec<LowerName> = Vec::new();
-        let mut pending = vec![target.clone()];
-        while let Some(name) = pending.pop() {
-            for owner in named.aliases.get(&name).into_iter().flatten() {
-                if owner != target && !found.contains(owner) {
-                    found.push(owner.clone());
-                    pending.push(owner.clone());
+        self.named(|named| {
+            let mut found: Vec<LowerName> = Vec::new();
+            let mut pending = vec![target.clone()];
+            while let Some(name) = pending.pop() {
+                for owner in named.aliases.get(&name).into_iter().flatten() {
+                    if owner != target && !found.contains(owner) {
+                        found.push(owner.clone());
+                        pending.push(owner.clone());
+                    }
                 }
             }
-        }
-        found
+            found
+        })
     }
 
     /// Whether a question for `name` may reach a real server.
@@ -269,7 +273,7 @@ impl Outbound {
             || self.above_admitted(name)
             || self.underscored(name)
             || reverse(name)
-            || self.named().below.contains(name)
+            || self.named(|named| named.below.contains(name))
     }
 
     /// Rule 2: whether `name` is above a name rule 1 lets out.
@@ -283,10 +287,12 @@ impl Outbound {
                 inner.pages.serves_below(&host(name))
                     || inner.always.iter().any(|always| name.zone_of(always))
             }
-            // A name is above a host name exactly when one more label
-            // makes it one.
+            // Any name of host name labels, under any top-level domain:
+            // the root servers answer for reserved ones too, NXDOMAIN
+            // for `internal` or `example` included.
             Mode::Live | Mode::LiveDepth | Mode::Edited => {
-                admit(&format!("a.{}", host(name))).is_ok()
+                let text = host(name);
+                text.len() <= 253 && text.split('.').all(host_label)
             }
         }
     }
@@ -306,30 +312,20 @@ impl Outbound {
 
     /// Notes the targets `message`, a relayed reply, names.
     fn learn(&self, message: &Message) {
-        let mut named = self.named();
-        for (target, owner) in targets(message) {
-            if let Some(owner) = owner {
-                named
-                    .aliases
-                    .entry(target.clone())
-                    .or_default()
-                    .insert(owner);
+        self.named(|named| {
+            for (target, owner) in targets(message) {
+                if let Some(owner) = owner {
+                    named.aliases.entry(target).or_default().insert(owner);
+                }
             }
-            named.below.extend(and_above(&target));
-        }
+            named.below.extend(named_and_above(message));
+        })
     }
 
-    /// What the hierarchy named this session, emptied first if the
-    /// session changed.
-    fn named(&self) -> MutexGuard<'_, Named> {
+    /// `f` with what the hierarchy named this session.
+    fn named<R>(&self, f: impl FnOnce(&mut Named) -> R) -> R {
         let generation = self.inner.pages.namespace().current().generation;
-        let mut named = self.inner.named.lock();
-        if named.generation != generation {
-            named.generation = generation;
-            named.below.clear();
-            named.aliases.clear();
-        }
-        named
+        self.inner.named.with(generation, f)
     }
 }
 
@@ -386,31 +382,29 @@ fn reverse(name: &LowerName) -> bool {
 pub struct SessionSource {
     pages: Arc<Pages>,
     needed: Arc<[LowerName]>,
-    current: Mutex<(Generation, Arc<dyn Source>)>,
+    /// The source the session uses, chosen when it first asks.
+    current: PerSession<Option<Arc<dyn Source>>>,
 }
 
 impl SessionSource {
     /// The source for the sessions of `pages`, with `needed` the names
     /// that resolve in every session.
     pub fn new(pages: Arc<Pages>, needed: impl IntoIterator<Item = LowerName>) -> SessionSource {
-        let needed: Arc<[LowerName]> = needed.into_iter().collect();
-        let generation = pages.namespace().current().generation;
-        let source = session(&pages, &needed);
         SessionSource {
             pages,
-            needed,
-            current: Mutex::new((generation, source)),
+            needed: needed.into_iter().collect(),
+            current: PerSession::new(),
         }
     }
 
     /// The source for the session now.
     fn current(&self) -> Arc<dyn Source> {
         let generation = self.pages.namespace().current().generation;
-        let mut current = self.current.lock();
-        if current.0 != generation {
-            *current = (generation, session(&self.pages, &self.needed));
-        }
-        current.1.clone()
+        self.current.with(generation, |current| {
+            current
+                .get_or_insert_with(|| session(&self.pages, &self.needed))
+                .clone()
+        })
     }
 }
 
@@ -465,10 +459,7 @@ impl Source for Copied {
                 && let Observed::Reply(bytes) = &observed
                 && let Ok(message) = Message::from_vec(bytes)
             {
-                let mut names = self.needed.lock();
-                for (target, _) in targets(&message) {
-                    names.extend(and_above(&target));
-                }
+                self.needed.lock().extend(named_and_above(&message));
             }
             observed
         })
@@ -479,16 +470,22 @@ impl Pages {
     /// The host's public IPv4 address, as the real authorities see the
     /// world's questions: what `ns1.google.com` says the address of a
     /// question from this host is. The world's whoami answers give it.
-    pub async fn egress(&self, fcx: &Cx) -> fictionet::Result<Egress> {
+    /// `None` when the host cannot ask, as on a network that lets DNS
+    /// reach only its own resolver or has no IPv4: the world runs all the
+    /// same, and leaves those names to the real hierarchy.
+    pub async fn egress(&self, fcx: &Cx) -> Option<Egress> {
         let live = self.live_dns();
         let found = fcx
             .race(Some(fcx.now() + EGRESS_WAIT), live.egress(fcx))
             .await;
         match found {
-            Ok(Some(std::net::IpAddr::V4(address))) => Ok(Egress(address)),
-            Ok(Some(std::net::IpAddr::V6(_))) | Ok(None) | Err(_) => Err(fictionet::Error::msg(
-                "The host's public IPv4 address is unknown: ns1.google.com did not tell it",
-            )),
+            Ok(Some(std::net::IpAddr::V4(address))) => Some(Egress(address)),
+            Ok(Some(std::net::IpAddr::V6(_))) | Ok(None) | Err(_) => {
+                eprintln!(
+                    "The host's public IPv4 address is unknown: ns1.google.com did not tell it"
+                );
+                None
+            }
         }
     }
 }

@@ -7,6 +7,7 @@ use fictionet::stdlib::protocols::dns::rr::{
 };
 use fictionet::stdlib::protocols::dns::{Request, Response};
 
+use super::cover::negative_ttl;
 use super::data::{Denied, Fact, View};
 use super::zone::{Node, dname_target, targets, unique, wildcard};
 
@@ -28,7 +29,10 @@ pub enum Answered {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AnyResponse {
     /// One synthesized HINFO record with CPU "RFC8482" and an empty OS, as
-    /// Cloudflare's servers do (RFC 8482 §4.2).
+    /// Cloudflare's servers do (RFC 8482 §4.2). With DO, a signed zone
+    /// signs it as Cloudflare's online signer does; a zone signed once,
+    /// whose keys the view does not hold, sends one RRset of the name
+    /// instead.
     Hinfo,
     /// One RRset of the name, as BIND's `minimal-any` does (RFC 8482 §4.1).
     OneRrset,
@@ -48,8 +52,9 @@ pub enum AnyResponse {
 ///    referral with AA clear: the NS RRset in the authority section; with
 ///    DO, the DS RRset or the proof that there is none (RFC 4035 §3.1.4);
 ///    the glue for NS targets at or below the cut as required additional
-///    data, then addresses this zone holds under other cuts for the other
-///    targets as optional additional data (RFC 9471 §3 and §3.2). QTYPE DS
+///    data, then the addresses this zone holds for the other targets, as
+///    its own data or as glue under other cuts, as optional additional
+///    data (RFC 1034 §4.3.2 step 3b, RFC 9471 §3 and §3.2). QTYPE DS
 ///    at the cut is answered from the parent's side (RFC 4035 §3.1.4.1).
 /// 3. A DNAME above QNAME: the DNAME and a CNAME synthesized with the
 ///    DNAME's TTL, and the walk goes on at the new name inside the zone;
@@ -342,7 +347,6 @@ impl<'v> Walk<'v> {
         ds: Option<&RecordSet>,
         glue: &[RecordSet],
     ) -> Result<Out, LowerName> {
-        let apex = self.view.apex();
         let targets = targets(ns);
         let in_domain: Vec<RecordSet> = glue
             .iter()
@@ -354,8 +358,8 @@ impl<'v> Walk<'v> {
             .collect();
         let mut additional = in_domain.clone();
         for target in &targets {
-            if apex.zone_of(target) && !cut.zone_of(target) {
-                additional.extend(self.glue_of(target)?);
+            if !cut.zone_of(target) {
+                additional.extend(self.addresses_of(target)?);
             }
         }
         let mut authority = vec![ns.clone()];
@@ -371,15 +375,6 @@ impl<'v> Walk<'v> {
             additional: unique(additional.into_iter()),
             ..Found::new(ResponseCode::NoError, false)
         }))
-    }
-
-    /// The address RRsets of `target` held as glue under the cut above it,
-    /// such as the root's `gtld-servers.net` addresses under `net`.
-    fn glue_of(&self, target: &LowerName) -> Result<Vec<RecordSet>, LowerName> {
-        Ok(match self.locate(target)? {
-            Loc::Cut { glue, .. } => glue_for(glue, target),
-            _ => Vec::new(),
-        })
     }
 
     /// The address RRsets of a target in this zone: at its own node, or
@@ -475,7 +470,10 @@ impl<'v> Walk<'v> {
                 return self.nodata(name, encloser);
             }
             let answer = match self.any {
-                AnyResponse::Hinfo => vec![hinfo(&owner, sets[0].ttl())],
+                AnyResponse::Hinfo => match self.hinfo(&owner, sets[0].ttl()) {
+                    Some(hinfo) => vec![hinfo],
+                    None => vec![owned(sets[0], &owner)],
+                },
                 AnyResponse::OneRrset => vec![owned(sets[0], &owner)],
                 AnyResponse::All => sets.iter().map(|set| owned(set, &owner)).collect(),
             };
@@ -547,17 +545,27 @@ impl<'v> Walk<'v> {
         }))
     }
 
+    /// The synthesized HINFO answer to QTYPE ANY at `owner` (RFC 8482
+    /// §4.2). With DO, in a signed zone, it is signed, since a validator
+    /// rejects an unsigned RRset there. A view that cannot sign gives
+    /// `None`, and the answer is one RRset of the name with its RRSIGs
+    /// instead (RFC 8482 §4.1). Without DO no RRSIG goes out, so the
+    /// HINFO goes out as it is.
+    fn hinfo(&self, owner: &Name, ttl: u32) -> Option<RecordSet> {
+        let rdata = RData::HINFO(HINFO::new("RFC8482".to_string(), String::new()));
+        let mut set = RecordSet::with_ttl(owner.clone(), RecordType::HINFO, ttl);
+        set.set_records(vec![Record::from_rdata(owner.clone(), ttl, rdata)]);
+        if !self.dnssec_ok || self.view.soa().rrsigs().is_empty() {
+            return Some(set);
+        }
+        self.view.sign(&set)
+    }
+
     /// The SOA RRset for a negative answer, with TTL min(SOA TTL, MINIMUM)
     /// (RFC 2308 §3). Its RRSIGs take the same TTL.
     fn negative_soa(&self) -> RecordSet {
         let soa = self.view.soa();
-        let minimum = soa
-            .records_without_rrsigs()
-            .find_map(|record| match &record.data {
-                RData::SOA(soa) => Some(soa.minimum),
-                _ => None,
-            });
-        let ttl = minimum.map_or(soa.ttl(), |minimum| soa.ttl().min(minimum));
+        let ttl = negative_ttl(soa);
         let retimed = |records: &mut dyn Iterator<Item = &Record>| -> Vec<Record> {
             records
                 .map(|record| {
@@ -596,14 +604,6 @@ fn owned(set: &RecordSet, owner: &Name) -> RecordSet {
     renamed.set_records(set.records_without_rrsigs().map(rename).collect());
     renamed.set_rrsigs(set.rrsigs().iter().map(rename).collect());
     renamed
-}
-
-/// The synthesized HINFO answer to QTYPE ANY (RFC 8482 §4.2).
-fn hinfo(owner: &Name, ttl: u32) -> RecordSet {
-    let rdata = RData::HINFO(HINFO::new("RFC8482".to_string(), String::new()));
-    let mut set = RecordSet::with_ttl(owner.clone(), RecordType::HINFO, ttl);
-    set.set_records(vec![Record::from_rdata(owner.clone(), ttl, rdata)]);
-    set
 }
 
 /// The address RRsets of `target` among a cut's glue.

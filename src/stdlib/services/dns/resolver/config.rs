@@ -153,7 +153,8 @@ impl Config {
     ///
     /// - The IANA root hints, which Unbound has built in.
     /// - Its default local zones: `localhost`, the reverse zones of
-    ///   RFC 6303 (Unbound's default AS112 and RFC 1918 zones),
+    ///   RFC 6303 and RFC 6598 (Unbound's default AS112, RFC 1918, and
+    ///   Shared Address Space zones),
     ///   `home.arpa`, `resolver.arpa`, `service.arpa`, `onion`, `test`,
     ///   and `invalid`. With `ede: no` and no DDR endpoints,
     ///   `resolver.arpa` is an empty zone (RFC 9462 §6.4).

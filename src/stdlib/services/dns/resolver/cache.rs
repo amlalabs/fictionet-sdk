@@ -6,11 +6,11 @@ use std::time::Duration;
 
 use fictionet::stdlib::protocols::dns::EdeCode;
 use fictionet::stdlib::protocols::dns::dnssec::Validation;
-use fictionet::stdlib::protocols::dns::rr::rdata::SOA;
-use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, RData, RecordSet, RecordType};
+use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, RecordSet, RecordType};
 use fictionet::time::Instant;
 
 use super::super::exchange::Generation;
+use super::super::zone::negative_ttl;
 
 /// What the cache holds an entry under: an owner name, a type, and a
 /// class. Names are lowercase, so the key ignores case.
@@ -53,7 +53,7 @@ pub enum Rank {
 }
 
 /// Which negative answer a server gave.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Negative {
     /// The name does not exist (RFC 2308 §2.1).
     NxDomain,
@@ -67,12 +67,6 @@ pub enum FailureKind {
     /// No server for the zone answered: each timed out or could not be
     /// reached (RFC 8914 §4.23).
     NoReachableAuthority,
-    /// Validation found the answer Bogus, with this Extended DNS Error.
-    /// The engine keeps bogus data as an RRset or negative with its
-    /// validation, so that clients that set CD still get it
-    /// (RFC 4035 §3.2.2); this kind is for code that caches the failure
-    /// alone.
-    Bogus(EdeCode),
     /// The resolution sent all the queries [`Work`](super::Work) allows.
     WorkExceeded,
     /// Servers answered, but none with data for the question: each replied
@@ -88,7 +82,6 @@ impl FailureKind {
             FailureKind::NoReachableAuthority | FailureKind::Unknown => {
                 EdeCode::NO_REACHABLE_AUTHORITY
             }
-            FailureKind::Bogus(code) => code,
             FailureKind::WorkExceeded => EdeCode::OTHER,
         }
     }
@@ -147,8 +140,9 @@ impl Entry {
     }
 
     /// The rank the entry holds its key at. A negative answer is an
-    /// authoritative answer; a failure ranks below all data, so it never
-    /// displaces live data.
+    /// authoritative answer. A failure ranks with glue, so it never
+    /// displaces live data that answers clients; laid over glue, it keeps
+    /// the glue beneath it for [`Cache::data`].
     pub fn rank(&self) -> Rank {
         match self {
             Entry::Positive { rank, .. } => *rank,
@@ -227,8 +221,11 @@ struct SecureNsec {
 #[derive(Clone, Debug)]
 struct Stored {
     entry: Entry,
-    /// The data a failure replaced, while it may still be served stale.
-    stale: Option<Entry>,
+    /// The data a failure was laid over: live data below
+    /// [`Rank::NonAuthAnswer`], such as glue, which still says where a
+    /// zone's servers are, or expired data that may still be served
+    /// stale.
+    under: Option<Entry>,
     generation: Generation,
 }
 
@@ -247,9 +244,11 @@ struct Stored {
 /// - A negative answer lives min(SOA TTL, MINIMUM) (RFC 2308 §5), and no
 ///   longer than the NSEC or NSEC3 records that prove it (RFC 9077 §3).
 /// - A Secure RRset lives no longer than its RRSIGs (RFC 4035 §5.3.3).
-/// - A failure lives [`Limits::failure_ttl`] (RFC 9520 §3.2).
+/// - A failure lives [`Limits::failure_ttl`] (RFC 9520 §3.2), and so does
+///   data that validated Bogus or Indeterminate.
 /// - An entry replaces a live entry for its key only at equal or higher
-///   [`Rank`] (RFC 2181 §5.4.1).
+///   [`Rank`] (RFC 2181 §5.4.1). A failure laid over glue keeps the glue
+///   beneath it, for finding servers.
 /// - Every entry records the generation that wrote it, and a new
 ///   generation starts empty.
 #[derive(Clone, Debug)]
@@ -299,17 +298,18 @@ impl Cache {
         {
             return;
         }
-        // A failure does not take away expired data that may still be
-        // served stale (RFC 8767 §4): it is kept beside the failure.
-        let stale = match (&entry, self.stale(&key, now)) {
-            (Entry::Failure { .. }, Some(data)) => Some(data.clone()),
+        // A failure is no data (RFC 9520 §3), so it takes away neither
+        // live glue nor expired data that may still be served stale
+        // (RFC 8767 §4): they are kept beside the failure.
+        let under = match &entry {
+            Entry::Failure { .. } => self.stale(&key, now).cloned(),
             _ => None,
         };
         self.entries.insert(
             key,
             Stored {
                 entry,
-                stale,
+                under,
                 generation: self.generation,
             },
         );
@@ -323,24 +323,44 @@ impl Cache {
         self.live(key, now)
     }
 
+    /// The live data for `key` at `now`, looking past a failure cached
+    /// over it. A failed lookup takes away nothing the cache knew, such as
+    /// the glue that says where a zone's servers are (RFC 9520 §3), so
+    /// this is what finding servers reads.
+    pub fn data(&self, key: &Key, now: Instant) -> Option<&Entry> {
+        self.stored_data(key).filter(|entry| now < entry.expires())
+    }
+
     /// An entry for `key` that expired at most [`Limits::stale`] before
-    /// `now`, for serving stale (RFC 8767 §4). Failures are never stale
-    /// data.
+    /// `now`, or is still live, for serving stale (RFC 8767 §4). Failures
+    /// are never stale data.
     pub fn stale(&self, key: &Key, now: Instant) -> Option<&Entry> {
+        self.stored_data(key)
+            .filter(|entry| now < entry.expires() + self.limits.stale)
+    }
+
+    /// The data stored for `key` in this generation, live or not: the
+    /// entry, or what a failure was laid over.
+    fn stored_data(&self, key: &Key) -> Option<&Entry> {
         let stored = self.entries.get(key)?;
         if stored.generation != self.generation {
             return None;
         }
-        let entry = match &stored.entry {
-            Entry::Failure { .. } => stored.stale.as_ref()?,
-            entry => entry,
-        };
-        (now < entry.expires() + self.limits.stale).then_some(entry)
+        match &stored.entry {
+            Entry::Failure { .. } => stored.under.as_ref(),
+            entry => Some(entry),
+        }
     }
 
-    /// A live NXDOMAIN cached for `name` or a name above it, with the name
-    /// it is cached at: nothing exists below a name that does not exist
-    /// (RFC 8020 §2).
+    /// A live NXDOMAIN cached for `name`, or a Secure one cached for a
+    /// name above it, with the name it is cached at: nothing exists below
+    /// a name that does not exist (RFC 8020 §2).
+    ///
+    /// Only a Secure NXDOMAIN denies the names below it, as Unbound's
+    /// `harden-below-nxdomain` uses it. An NXDOMAIN that did not validate,
+    /// or that an NSEC3 opt-out span only covers, may come from a server
+    /// that denies empty non-terminals or the apex of a zone it does not
+    /// know is delegated, and the names below it may well exist.
     pub fn nxdomain_above(
         &self,
         name: &LowerName,
@@ -353,9 +373,11 @@ impl Cache {
             if let Some(
                 entry @ Entry::Negative {
                     kind: Negative::NxDomain,
+                    validation,
                     ..
                 },
             ) = self.live(&key, now)
+                && (at == *name || *validation == Validation::Secure)
             {
                 let (key, _) = self.entries.get_key_value(&key)?;
                 return Some((&key.name, entry));
@@ -369,7 +391,11 @@ impl Cache {
 
     /// Records what validation established about the live RRset at `key`.
     /// A Secure RRset then lives no longer than `signatures_expire`, the
-    /// first expiration of the RRSIGs that proved it (RFC 4035 §5.3.3).
+    /// first expiration of the RRSIGs that proved it (RFC 4035 §5.3.3). A
+    /// Bogus or Indeterminate one lives no longer than
+    /// [`Limits::failure_ttl`]: the result is a failure, so it is answered
+    /// as one for that long and then fetched and validated again
+    /// (RFC 9520 §3.2, RFC 4035 §4.7).
     pub fn validated(
         &mut self,
         key: &Key,
@@ -396,7 +422,14 @@ impl Cache {
                 ..
             } => {
                 *validation = result;
-                if let (Validation::Secure, Some(cap)) = (result, signatures_expire) {
+                let cap = match result {
+                    Validation::Secure => signatures_expire,
+                    Validation::Bogus(_) | Validation::Indeterminate => {
+                        Some(now + self.limits.failure_ttl)
+                    }
+                    Validation::Insecure(_) | Validation::NotPerformed => None,
+                };
+                if let Some(cap) = cap {
                     *expires = (*expires).min(cap);
                 }
             }
@@ -470,7 +503,7 @@ impl Cache {
         denial
             .iter()
             .map(|set| seconds(set.ttl()))
-            .fold(negative_ttl(soa), Duration::min)
+            .fold(seconds(negative_ttl(soa)), Duration::min)
             .min(self.limits.max_ttl)
             .min(self.limits.max_negative_ttl)
     }
@@ -499,7 +532,7 @@ impl Cache {
         let generation = self.generation;
         self.entries.retain(|_, stored| {
             let last = stored
-                .stale
+                .under
                 .as_ref()
                 .map_or(stored.entry.expires(), |data| {
                     data.expires().max(stored.entry.expires())
@@ -596,23 +629,6 @@ fn seconds(ttl: u32) -> Duration {
     } else {
         Duration::from_secs(u64::from(ttl))
     }
-}
-
-/// The negative TTL an SOA RRset gives: min(SOA TTL, MINIMUM)
-/// (RFC 2308 §5).
-fn negative_ttl(soa: &RecordSet) -> Duration {
-    let minimum = soa
-        .records_without_rrsigs()
-        .find_map(|record| match &record.data {
-            RData::SOA(soa) => Some(soa_minimum(soa)),
-            _ => None,
-        })
-        .unwrap_or(0);
-    seconds(soa.ttl()).min(seconds(minimum))
-}
-
-fn soa_minimum(soa: &SOA) -> u32 {
-    soa.minimum
 }
 
 /// `set` with its owner and every record's owner in lowercase, every

@@ -231,7 +231,10 @@ impl<'a> Nsecs<'a> {
                 // A child apex's NSEC cannot deny the DS its parent holds.
                 !types.contains(RecordType::SOA)
             } else {
-                !rdata.is_ancestor_delegation()
+                // A parent's NSEC at a cut cannot deny the child's types. A
+                // DNAME bit stops proofs for names below the owner only,
+                // not for types at it (RFC 6840 §4.1).
+                !(types.contains(RecordType::NS) && !types.contains(RecordType::SOA))
             };
             return usable && !types.contains(qtype) && !types.contains(RecordType::CNAME);
         }
@@ -358,7 +361,8 @@ impl<'a> Nsec3s<'a> {
             let usable = if qtype == RecordType::DS {
                 !types.contains(RecordType::SOA)
             } else {
-                !rdata.is_ancestor_delegation()
+                // As for NSEC: a cut stops the proof, a DNAME does not.
+                !(types.contains(RecordType::NS) && !types.contains(RecordType::SOA))
             };
             let denied = usable && !types.contains(qtype) && !types.contains(RecordType::CNAME);
             return if denied {
@@ -436,9 +440,10 @@ fn is_below(name: &Name, ancestor: &Name) -> bool {
     ancestor.zone_of(name) && name.num_labels() > ancestor.num_labels()
 }
 
-/// A base32hex label (RFC 4648 §7) decoded, ignoring case. Bits past the
-/// last whole octet are dropped.
-fn base32hex(label: &[u8]) -> Option<Vec<u8>> {
+/// A base32hex label (RFC 4648 §7) decoded, ignoring case, as NSEC3
+/// owners and next hashed owners are written (RFC 5155 §3.3). Bits past
+/// the last whole octet are dropped.
+pub(crate) fn base32hex(label: &[u8]) -> Option<Vec<u8>> {
     let mut bits = 0u64;
     let mut count = 0;
     let mut out = Vec::with_capacity(label.len() * 5 / 8);
@@ -458,8 +463,10 @@ fn base32hex(label: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-#[cfg(test)]
-pub(super) fn base32hex_encode(bytes: &[u8]) -> String {
+/// `bytes` in base32 with the extended hex alphabet, in lowercase and
+/// unpadded, as NSEC3 owner labels are written (RFC 4648 §7, RFC 5155
+/// §3.3).
+pub(crate) fn base32hex_encode(bytes: &[u8]) -> String {
     const ALPHABET: &[u8] = b"0123456789abcdefghijklmnopqrstuv";
     let mut bits = 0u64;
     let mut count = 0;

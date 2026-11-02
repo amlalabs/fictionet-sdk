@@ -11,18 +11,20 @@ use std::time::{Duration, SystemTime};
 
 use fictionet::Cx;
 use fictionet::stdlib::network::route::Prefix;
-use fictionet::stdlib::protocols::dns::op::{Edns, Message, Query, ResponseCode};
-use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, Name, RData, RecordType};
-use fictionet::stdlib::protocols::dns::{Parsed, Request};
-use fictionet::stdlib::services::dns::authority::{Ask, Observed, ServerConfig};
+use fictionet::stdlib::protocols::dns::op::{Edns, Message, OpCode, Query, ResponseCode};
+use fictionet::stdlib::protocols::dns::rr::rdata::TXT;
+use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, Name, RData, Record, RecordType};
+use fictionet::stdlib::protocols::dns::{Nsid, Parsed, Request, Response};
+use fictionet::stdlib::services::dns::authority::{Ask, Identity, Observed, ServerConfig};
 use fictionet::stdlib::services::dns::resolver::Config;
 use fictionet::stdlib::services::dns::zone::{Answered, AnyResponse, Zone, ZoneData, answer};
 use fictionet::stdlib::services::dns::{Event, WallClock};
-use fictionet::stdlib::world::net::Net;
+use fictionet::stdlib::services::serve::Transport;
 use fictionet::stdlib::world::net::dns::internet::{
     self, Egress, GTLD_SERVERS, Location, Mirror, PUBLIC_RESOLVERS, ROOT_LETTERS,
 };
-use fictionet::stdlib::world::net::dns::{Recursive, Source};
+use fictionet::stdlib::world::net::dns::{self, Cached, Recursive, Source};
+use fictionet::stdlib::world::net::{Host, Net};
 use fictionet_test_support::sandbox::{Machine, machine};
 use fictionet_test_support::timeout;
 
@@ -170,24 +172,53 @@ impl Source for Hierarchy {
         let Some((_, zone)) = zone else {
             return Box::pin(ready(Observed::Unreachable));
         };
-        let Answered::Response(response) =
-            answer(&*zone.view(&req.question), &req, AnyResponse::All)
-        else {
-            panic!("a complete zone knows every fact");
+        // Every real server here is the instance `REAL`, by CHAOS name and
+        // by NSID.
+        let front = ServerConfig {
+            identity: Some(Identity {
+                nsid: Some(REAL.as_bytes().to_vec()),
+                ..Identity::none()
+            }),
+            ..ServerConfig::generic()
         };
-        let reply = ServerConfig::generic().front(&req, response);
+        let response = if req.question.query_class() == DNSClass::CH {
+            let mut message = Message::response(req.message.metadata.id, OpCode::Query);
+            message.add_query(req.question.clone());
+            let mut record = Record::from_rdata(
+                req.question.name().clone(),
+                0,
+                RData::TXT(TXT::new(vec![REAL.to_string()])),
+            );
+            record.dns_class = DNSClass::CH;
+            message.add_answer(record);
+            Response {
+                message,
+                required_additional: 0,
+            }
+        } else {
+            let Answered::Response(response) =
+                answer(&*zone.view(&req.question), &req, AnyResponse::All)
+            else {
+                panic!("a complete zone knows every fact");
+            };
+            response
+        };
+        let reply = front.front(&req, response);
         Box::pin(ready(Observed::Reply(
             reply.message.to_vec().expect("a reply"),
         )))
     }
 }
 
+/// The instance every real server of [`Hierarchy`] is.
+const REAL: &str = "real-uklon";
+
 fn lower(name: &str) -> LowerName {
     LowerName::new(&Name::from_ascii(name).unwrap())
 }
 
 fn location() -> Location {
-    Location::san_francisco_bay_area(Egress(EGRESS))
+    Location::san_francisco_bay_area(Some(Egress(EGRESS)))
 }
 
 /// A query for `name` of type `kind`, with RD as given and an OPT record.
@@ -341,6 +372,154 @@ fn a_root_letter_answers_the_root_ns_as_dig_sees_it() {
     });
 }
 
+/// The NSID and the CHAOS names of one address name one instance: a root
+/// letter's preset site for both, never the real instance's NSID next to
+/// the preset's CHAOS names, and a relay the mirror placed the real
+/// instance for both.
+#[test]
+fn a_relayed_server_names_one_instance_by_chaos_and_by_nsid() {
+    world(Duration::from_secs(60), |fcx| async move {
+        let hierarchy = Hierarchy::new();
+        let at = location();
+        let (attacher, attachments) = fictionet::attachments();
+        let net = Net::new().ipv4_only();
+        let mirror = Mirror::new(hierarchy.clone(), net.handle(), &at);
+        net.hosts(internet::root_servers(|s| mirror.relay(s), &at))
+            .start(&fcx, attachments)?;
+        let m = machine(&fcx, attacher.attach("client")?, ME);
+        let a_root = ROOT_LETTERS[0].server.v4;
+        let site = at.site(IpAddr::V4(a_root)).identity;
+        assert!(site.nsid.is_some());
+
+        let mut soa = query(1, ".", RecordType::SOA, false);
+        soa.edns
+            .as_mut()
+            .unwrap()
+            .options_mut()
+            .insert(Nsid(Vec::new()).to_option());
+        let reply = ask(&fcx, &m, a_root, &soa).await.expect("an answer");
+        assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(nsid(&reply), site.nsid, "the preset site's NSID");
+        let reply = ask(&fcx, &m, a_root, &chaos(2, "hostname.bind."))
+            .await
+            .expect("an answer");
+        assert_ne!(texts(&reply), vec![REAL.to_string()]);
+
+        // The referral to `direct.` places a relay at its glue, which
+        // passes the real instance's own answers on.
+        let ns = v4(45, 33, 5, 53);
+        ask(
+            &fcx,
+            &m,
+            a_root,
+            &query(3, "www.direct.", RecordType::A, false),
+        )
+        .await
+        .expect("a referral");
+        let reply = ask(&fcx, &m, ns, &chaos(4, "hostname.bind."))
+            .await
+            .expect("an answer from the real instance");
+        assert_eq!(texts(&reply), vec![REAL.to_string()]);
+        let mut www = query(5, "www.direct.", RecordType::A, false);
+        www.edns
+            .as_mut()
+            .unwrap()
+            .options_mut()
+            .insert(Nsid(Vec::new()).to_option());
+        let reply = ask(&fcx, &m, ns, &www).await.expect("an answer");
+        assert_eq!(nsid(&reply), Some(REAL.as_bytes().to_vec()));
+        Ok(())
+    });
+}
+
+/// A host `placing` places for a name makes every name above it exist,
+/// whatever the callback said about those names: they answer NODATA, and
+/// names with nothing at or below them stay NXDOMAIN.
+#[test]
+fn a_placed_host_makes_the_names_above_it_exist() {
+    world(Duration::from_secs(60), |fcx| async move {
+        let (_attacher, attachments) = fictionet::attachments();
+        let net = Net::new().ipv4_only();
+        let handle = net.handle();
+        net.start(&fcx, attachments)?;
+        let zone = dns::placing(handle, |name| {
+            (name == "www.example.com").then(|| Host::new("www").at(Ipv4Addr::new(45, 33, 20, 80)))
+        });
+        let ask = |qname: &str| {
+            let message = query(1, qname, RecordType::A, false);
+            let Parsed::Request(request) =
+                Request::parse(&message.to_vec().unwrap(), Transport::Udp)
+            else {
+                panic!("a query parses");
+            };
+            match answer(&*zone.view(&request.question), &request, AnyResponse::All) {
+                Answered::Response(response) => response.message,
+                Answered::Unknown { name } => panic!("{name} is unknown"),
+            }
+        };
+        let www = ask("www.example.com.");
+        assert_eq!(addresses(&www), vec![v4(45, 33, 20, 80)]);
+        for above in ["example.com.", "com."] {
+            let reply = ask(above);
+            assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+            assert!(reply.answers.is_empty(), "{above} is an empty non-terminal");
+        }
+        let elsewhere = ask("www.example.org.");
+        assert_eq!(elsewhere.metadata.response_code, ResponseCode::NXDomain);
+        Ok(())
+    });
+}
+
+/// `Cached` answers an ask from a kept reply only when the reply fits it:
+/// the same question with the same EDNS, so a query without an OPT record
+/// never gets a reply with one (RFC 6891 §7).
+#[test]
+fn a_cached_reply_answers_only_the_same_question_with_the_same_edns() {
+    world(Duration::from_secs(60), |fcx| async move {
+        let hierarchy = Hierarchy::new();
+        let cached = Cached::new(hierarchy.clone());
+        let a_root = SocketAddr::new(IpAddr::V4(ROOT_LETTERS[0].server.v4), 53);
+        let ask = |message: Message| Ask {
+            server: a_root,
+            transport: Transport::Udp,
+            query: message.to_vec().unwrap(),
+        };
+        let reply = |observed: Observed| match observed {
+            Observed::Reply(bytes) => Message::from_vec(&bytes).unwrap(),
+            other => panic!("expected a reply, got {other:?}"),
+        };
+        let with_opt = query(1, ".", RecordType::NS, false);
+        let mut without_opt = with_opt.clone();
+        without_opt.metadata.id = 2;
+        without_opt.edns = None;
+
+        let first = reply(cached.ask(&fcx, ask(with_opt.clone())).await);
+        assert!(first.edns.is_some());
+        let again = reply(cached.ask(&fcx, ask(with_opt)).await);
+        assert_eq!(again.answers, first.answers);
+        assert_eq!(hierarchy.asked_for(".", RecordType::NS).len(), 1, "kept");
+
+        let plain = reply(cached.ask(&fcx, ask(without_opt)).await);
+        assert_eq!(plain.metadata.id, 2);
+        assert!(
+            plain.edns.is_none(),
+            "no OPT record for a query without one"
+        );
+        assert_eq!(hierarchy.asked_for(".", RecordType::NS).len(), 2);
+        Ok(())
+    });
+}
+
+/// The NSID in `reply`, if it has one.
+fn nsid(reply: &Message) -> Option<Vec<u8>> {
+    reply
+        .edns
+        .iter()
+        .flat_map(|edns| edns.options().as_ref().iter())
+        .find_map(|(_, option)| Nsid::from_option(option))
+        .map(|nsid| nsid.0)
+}
+
 /// A referral with glue places a relay at the glue address before the
 /// referral reaches the client, so the client's next question to that
 /// address is answered. An answer for a name no relayed NS RRset named
@@ -443,6 +622,58 @@ fn a_glueless_delegation_resolves_through_the_answer_for_its_name_server() {
             hierarchy.asked_for("www.example.", RecordType::A),
             vec![v4(45, 33, 3, 53)]
         );
+        Ok(())
+    });
+}
+
+/// A name server whose address a resolver learned before any NS RRset
+/// named it still gets its relay once one does: the resolver has the
+/// address cached and asks it, without asking for the address again.
+#[test]
+fn a_glueless_name_server_known_before_its_delegation_gets_a_relay() {
+    world(Duration::from_secs(60), |fcx| async move {
+        let hierarchy = Hierarchy::new();
+        let at = location();
+        let clock = WallClock {
+            start: SystemTime::UNIX_EPOCH,
+        };
+        let config = Config {
+            anchors: None,
+            ..Config::unbound()
+        }
+        .hints(&internet::root_hints());
+        let (attacher, attachments) = fictionet::attachments();
+        let net = Net::new().ipv4_only();
+        let handle = net.handle();
+        let mirror = Mirror::new(hierarchy.clone(), handle.clone(), &at);
+        net.hosts(internet::root_servers(|s| mirror.relay(s), &at))
+            .gateway(move |h, _| h.program(Recursive::new(config.clone(), clock)))
+            .start(&fcx, attachments)?;
+        let m = machine(&fcx, attacher.attach("client")?, ME);
+        let server = v4(45, 33, 3, 53);
+
+        let reply = ask(
+            &fcx,
+            &m,
+            GATEWAY,
+            &query(1, "ns.provider.org.", RecordType::A, true),
+        )
+        .await
+        .expect("an answer");
+        assert_eq!(addresses(&reply), vec![server]);
+        assert!(!handle.has_machine(server), "no NS RRset named it yet");
+
+        let reply = ask(
+            &fcx,
+            &m,
+            GATEWAY,
+            &query(2, "www.example.", RecordType::A, true),
+        )
+        .await
+        .expect("an answer");
+        assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(addresses(&reply), vec![v4(45, 33, 4, 80)]);
+        assert!(handle.has_machine(server));
         Ok(())
     });
 }

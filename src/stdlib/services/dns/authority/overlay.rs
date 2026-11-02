@@ -26,7 +26,10 @@ use super::{Authority, Known, ServerConfig, Step, bare_reply};
 /// - Elsewhere the overlay answers as the parent: a referral composed from
 ///   the invented zone's apex NS RRset and glue, with AA clear. A DS
 ///   question at the apex goes to the base, since the parent's side
-///   answers DS (RFC 4035 §3.1.4.1).
+///   answers DS (RFC 4035 §3.1.4.1). Where the base says the apex does
+///   not exist, the overlay answers NODATA with the same records instead,
+///   as a parent answers for an unsigned delegation, so the parent never
+///   both refers to the zone and denies it.
 ///
 /// With DO, the referral needs the parent's word on the DS RRset
 /// (RFC 4035 §3.1.4). The overlay asks its base the question
@@ -117,7 +120,8 @@ impl<B: Authority> Authority for Overlay<B> {
             return inner.respond(req, local, server, client, known);
         }
         if *req.question.name() == apex && req.question.query_type() == RecordType::DS {
-            return self.base.respond(req, local, server, client, known);
+            let step = self.base.respond(req, local, server, client, known);
+            return unsigned_delegation(req, step);
         }
 
         let mut authority = ns;
@@ -171,6 +175,33 @@ fn question(req: &Request, name: &Name, rtype: RecordType, dnssec_ok: bool) -> R
     match Request::parse(&bytes, req.transport) {
         Parsed::Request(request) => request,
         _ => unreachable!("a QUERY for NS or DS with one question passes every check"),
+    }
+}
+
+/// The parent's answer to `<apex> DS`, `req`, given the base's `step`.
+///
+/// The base knows nothing of the invented zone, so it may deny that the
+/// apex exists at all. A parent that delegates a name never says that:
+/// for an unsigned delegation it answers NODATA, with its SOA and the
+/// records that prove there is no DS (RFC 4035 §3.1.4.1, RFC 5155
+/// §7.2.4). An NXDOMAIN from the base therefore goes out as NOERROR with
+/// the same authority section, whose closest encloser proof and opt-out
+/// span are what real `com` sends for an unsigned delegation. Any other
+/// reply goes out as the base gave it.
+fn unsigned_delegation(req: &Request, step: Step) -> Step {
+    let reply = match &step {
+        Step::Reply(response) => Some(response.message.clone()),
+        Step::Verbatim(bytes) => Message::from_vec(bytes).ok(),
+        Step::Need(_) | Step::Silent => None,
+    };
+    match reply {
+        Some(reply) if reply.metadata.response_code == ResponseCode::NXDomain => {
+            let mut response = bare_reply(req, ResponseCode::NoError, None);
+            response.message.metadata.authoritative = reply.metadata.authoritative;
+            response.message.authorities = reply.authorities;
+            Step::Reply(response)
+        }
+        _ => step,
     }
 }
 

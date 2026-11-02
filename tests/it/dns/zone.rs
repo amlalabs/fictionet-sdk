@@ -1718,7 +1718,9 @@ fn localhost_points_every_name_at_loopback() {
 #[test]
 fn special_use_zones_are_empty_with_the_rfc_6303_soa() {
     let zones = special::rfc6303();
-    assert_eq!(zones.len(), 33);
+    // 33 zones of RFC 6303 and the 64 of the Shared Address Space
+    // (RFC 6598 §7), as Unbound serves them.
+    assert_eq!(zones.len(), 97);
     let find = |apex: &str| {
         zones
             .iter()
@@ -1730,6 +1732,8 @@ fn special_use_zones_are_empty_with_the_rfc_6303_soa() {
         "31.172.in-addr.arpa.",
         "168.192.in-addr.arpa.",
         "8.b.d.0.1.0.0.2.ip6.arpa.",
+        "64.100.in-addr.arpa.",
+        "127.100.in-addr.arpa.",
     ] {
         let zone = find(apex);
         let reply = ask(zone, &format!("5.{apex}"), RecordType::PTR);

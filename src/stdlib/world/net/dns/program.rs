@@ -26,7 +26,7 @@ use std::time::SystemTime;
 use fictionet::stdlib::codec::{Decode, Step};
 use fictionet::stdlib::network::{ConnError, ConnectionExt, tcp, udp};
 use fictionet::stdlib::protocols::dns::dnssec::Ring;
-use fictionet::stdlib::protocols::dns::{Framing, Parsed, Queries, Request};
+use fictionet::stdlib::protocols::dns::{Framing, Parsed, Queries, Request, stream_framed};
 use fictionet::stdlib::services::dns::authority::{
     Ask, Authority, AuthorityEngine, Observed, ServerConfig,
 };
@@ -492,9 +492,7 @@ async fn exchange_tcp(
     transmit: &Transmit,
 ) -> Result<Vec<u8>, ConnError> {
     let mut conn = machine.tcp.connect(fcx, transmit.to).await?;
-    let len = u16::try_from(transmit.bytes.len()).map_err(|_| ConnError::Broken)?;
-    let mut framed = len.to_be_bytes().to_vec();
-    framed.extend_from_slice(&transmit.bytes);
+    let framed = stream_framed(&transmit.bytes).ok_or(ConnError::Broken)?;
     conn.write_all(fcx, &framed).await?;
     let mut len = [0; 2];
     read_exact(fcx, &mut conn, &mut len).await?;
@@ -958,9 +956,7 @@ async fn write_framed(
 ) -> Result<(), ConnError> {
     for message in messages {
         // Engines fit stream answers to 65535 octets (RFC 1035 §4.2.2).
-        let len = u16::try_from(message.len()).map_err(|_| ConnError::Broken)?;
-        let mut framed = len.to_be_bytes().to_vec();
-        framed.extend_from_slice(&message);
+        let framed = stream_framed(&message).ok_or(ConnError::Broken)?;
         conn.write_all(fcx, &framed).await?;
     }
     Ok(())
