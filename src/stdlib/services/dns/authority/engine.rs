@@ -31,9 +31,10 @@ use super::{Ask, Authority, Known, Observed, ServerConfig, Step, bare_reply};
 ///    none; a rejected query gets the rejection.
 /// 2. Queues [`Event::Query`].
 /// 3. Answers a CHAOS-class question from the server's
-///    [`identity`](ServerConfig::identity), never from the authority. A
-///    class other than IN, CH, and ANY gets REFUSED, and so does a zone
-///    transfer when the server does not offer them.
+///    [`identity`](ServerConfig::identity), or from the authority when
+///    the server has none. A class other than IN, CH, and ANY gets
+///    REFUSED, and so does a zone transfer when the server does not
+///    offer them.
 /// 4. Asks the authority. For [`Step::Need`] it sends the question under a
 ///    fresh token, waits up to [`ask_timeout`](ServerConfig::ask_timeout),
 ///    records what came of it, and asks the authority again. Requests
@@ -130,7 +131,7 @@ impl<A: Authority> AuthorityEngine<A> {
             RecordType::AXFR | RecordType::IXFR
         );
         let response = match req.question.query_class() {
-            DNSClass::CH => Some(self.server.chaos(&req)),
+            DNSClass::CH => self.server.chaos(&req),
             DNSClass::IN | DNSClass::ANY if transfer && !self.server.transfer => {
                 Some(bare_reply(&req, ResponseCode::Refused, None))
             }

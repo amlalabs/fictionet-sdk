@@ -2326,9 +2326,7 @@ fn failure_kind(value: &Value) -> FailureKind {
         "no_reachable_authority" => FailureKind::NoReachableAuthority,
         "work_exceeded" => FailureKind::WorkExceeded,
         "unknown" => FailureKind::Unknown,
-        _ => FailureKind::Bogus(fictionet::stdlib::protocols::dns::EdeCode(
-            number(value, "ede") as u16,
-        )),
+        other => panic!("no failure kind {other}"),
     }
 }
 
@@ -2337,7 +2335,6 @@ fn failure_text(kind: FailureKind) -> String {
         FailureKind::NoReachableAuthority => "no_reachable_authority".to_string(),
         FailureKind::WorkExceeded => "work_exceeded".to_string(),
         FailureKind::Unknown => "unknown".to_string(),
-        FailureKind::Bogus(ede) => format!("bogus {}", ede.0),
     }
 }
 

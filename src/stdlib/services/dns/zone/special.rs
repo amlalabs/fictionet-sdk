@@ -36,12 +36,15 @@ pub fn localhost() -> Zone {
 }
 
 /// The empty zones of RFC 6303 §4, for the reverse names of private and
-/// special-use addresses, so their questions never leave the resolver.
+/// special-use addresses, so their questions never leave the resolver,
+/// with the reverse zones of the Shared Address Space, 100.64.0.0/10,
+/// that RFC 6598 §7 added to the same registry and Unbound serves too.
 /// `1.0.0.127.in-addr.arpa` and the reverse name of `::1` point back at
 /// `localhost.`, as in Unbound.
 pub fn rfc6303() -> Vec<Zone> {
     let mut apexes: Vec<String> = vec!["10.in-addr.arpa.".to_string()];
     apexes.extend((16..=31).map(|octet| format!("{octet}.172.in-addr.arpa.")));
+    apexes.extend((64..=127).map(|octet| format!("{octet}.100.in-addr.arpa.")));
     apexes.extend(
         [
             "168.192.in-addr.arpa.",

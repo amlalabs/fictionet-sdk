@@ -75,6 +75,14 @@ pub trait View {
     /// with its RRSIGs), which a reply carries when the query set DO. An
     /// unsigned zone returns `Present(vec![])`.
     fn denial(&self, name: &LowerName, kind: Denied) -> Fact<Vec<RecordSet>>;
+    /// `set`, an RRset the answer makes up rather than reads, such as the
+    /// HINFO of RFC 8482 §4.2, with RRSIGs from the zone's keys. `None`
+    /// when the view cannot sign: the zone is unsigned, or was signed once
+    /// with keys it does not hold.
+    fn sign(&self, set: &RecordSet) -> Option<RecordSet> {
+        let _ = set;
+        None
+    }
 }
 
 /// Zone data: something that makes views.
@@ -149,5 +157,9 @@ impl View for TransparentView {
 
     fn denial(&self, name: &LowerName, kind: Denied) -> Fact<Vec<RecordSet>> {
         self.0.denial(name, kind)
+    }
+
+    fn sign(&self, set: &RecordSet) -> Option<RecordSet> {
+        self.0.sign(set)
     }
 }

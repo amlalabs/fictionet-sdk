@@ -88,33 +88,63 @@ impl<S: Source, P: Fn(&Ask) -> bool + Send + Sync + 'static> Source for Only<S, 
     }
 }
 
+/// What makes two queries one question for a source that answers from
+/// replies it holds: the name, ignoring case, the type, the class, and
+/// what the reply must carry because of the query's EDNS. A query with an
+/// OPT record gets one back and a query without gets none (RFC 6891 §7),
+/// and only DO brings DNSSEC records (RFC 3225 §3).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Question {
+    /// The name, in lowercase.
+    pub name: LowerName,
+    /// The type.
+    pub qtype: RecordType,
+    /// The class.
+    pub qclass: DNSClass,
+    /// Whether the query had an OPT record.
+    pub edns: bool,
+    /// Whether it set DO.
+    pub dnssec_ok: bool,
+}
+
+impl Question {
+    /// The question `request` asks.
+    pub fn of(request: &Request) -> Question {
+        Question {
+            name: LowerName::new(request.question.name()),
+            qtype: request.question.query_type(),
+            qclass: request.question.query_class(),
+            edns: request.edns.is_some(),
+            dnssec_ok: request.edns.is_some_and(|edns| edns.dnssec_ok),
+        }
+    }
+}
+
 /// A source that keeps each reply for the smallest TTL among its records,
 /// and answers the same question to the same server from it until then,
 /// with the asker's ID and question case put back
 /// ([`restore`]).
 ///
-/// The question is the same when its name (ignoring case), type, class,
-/// RD, CD, and DO bits are, sent to the same server over the same
-/// transport. A reply with no records, or one truncated (RFC 2181 §9), is
-/// not kept. A kept reply goes out as it arrived, its TTLs as they were.
-/// The resolvers of a world already cache, so a world adds this only when
-/// the same question reaches its source from many of them.
+/// Two asks are the same when they are the same [`Question`] with the
+/// same RD and CD bits, sent to the same server over the same transport.
+/// A reply with no records, or one truncated (RFC 2181 §9), is not kept.
+/// A kept reply goes out as it arrived, its TTLs as they were, and the
+/// server's engine fits it to each asker's size. The resolvers of a world
+/// already cache, so a world adds this only when the same question
+/// reaches its source from many of them.
 pub struct Cached<S> {
     source: S,
-    replies: Mutex<HashMap<Question, (Vec<u8>, Instant)>>,
+    replies: Mutex<HashMap<Kept, (Vec<u8>, Instant)>>,
 }
 
-/// What makes two asks the same question for [`Cached`].
+/// What makes two asks the same for [`Cached`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct Question {
+struct Kept {
     server: SocketAddr,
     transport: Transport,
-    name: LowerName,
-    qtype: RecordType,
-    qclass: DNSClass,
+    question: Question,
     rd: bool,
     cd: bool,
-    dnssec_ok: bool,
 }
 
 impl<S: Source> Cached<S> {
@@ -137,15 +167,12 @@ impl<S: Source> Source for Cached<S> {
             let Parsed::Request(request) = Request::parse(&ask.query, ask.transport) else {
                 return self.source.ask(fcx, ask).await;
             };
-            let question = Question {
+            let question = Kept {
                 server: ask.server,
                 transport: ask.transport,
-                name: LowerName::new(request.question.name()),
-                qtype: request.question.query_type(),
-                qclass: request.question.query_class(),
+                question: Question::of(&request),
                 rd: request.rd,
                 cd: request.cd,
-                dnssec_ok: request.edns.is_some_and(|edns| edns.dnssec_ok),
             };
             let now = fcx.now();
             {
@@ -231,5 +258,37 @@ impl Namespace {
     /// The current session.
     pub fn current(&self) -> Session {
         *self.session.lock()
+    }
+}
+
+/// State that belongs to one session, such as what relayed replies named
+/// in it: it starts afresh when a later session uses it, so nothing one
+/// session learned reaches the next.
+pub struct PerSession<T> {
+    state: Mutex<(Generation, T)>,
+}
+
+impl<T: Default> PerSession<T> {
+    /// Fresh state for generation 0.
+    pub fn new() -> PerSession<T> {
+        PerSession {
+            state: Mutex::new((Generation(0), T::default())),
+        }
+    }
+
+    /// `f` with the state of session `generation`, made afresh first when
+    /// the state belongs to an earlier session.
+    pub fn with<R>(&self, generation: Generation, f: impl FnOnce(&mut T) -> R) -> R {
+        let mut state = self.state.lock();
+        if state.0 != generation {
+            *state = (generation, T::default());
+        }
+        f(&mut state.1)
+    }
+}
+
+impl<T: Default> Default for PerSession<T> {
+    fn default() -> PerSession<T> {
+        PerSession::new()
     }
 }

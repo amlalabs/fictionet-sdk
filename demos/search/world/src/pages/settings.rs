@@ -143,6 +143,8 @@ impl Pages {
     /// workstation, the copied pages, and the world's DNS use the same
     /// clock: the world's resolvers check signatures against it, so the
     /// captured signatures of a Copied session are inside their windows.
+    /// A corpus with no DNS captured answers every question from the
+    /// internet, signed now, so its resolvers keep the host's clock.
     pub fn start_session(
         &self,
         fcx: &Cx,
@@ -168,7 +170,7 @@ impl Pages {
         // The DNS session starts after the mode is set, so the world's DNS
         // sources choose for the new mode when they see it.
         let lag = copied_lag
-            .filter(|_| source == Source::Copied)
+            .filter(|_| source == Source::Copied && self.has_copied_dns())
             .unwrap_or_default();
         let start = std::time::SystemTime::now() - fcx.now().since_start() - lag;
         self.namespace.advance(WallClock { start });

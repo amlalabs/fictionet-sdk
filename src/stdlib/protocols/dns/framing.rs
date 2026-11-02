@@ -13,6 +13,17 @@ pub enum Framing {
     Stream,
 }
 
+/// `message` after its length as two octets in network order, as a stream
+/// carries it (RFC 1035 §4.2.2). `None` for a message longer than the
+/// 65535 octets the length counts.
+pub fn stream_framed(message: &[u8]) -> Option<Vec<u8>> {
+    let len = u16::try_from(message.len()).ok()?;
+    let mut framed = Vec::with_capacity(2 + message.len());
+    framed.extend_from_slice(&len.to_be_bytes());
+    framed.extend_from_slice(message);
+    Some(framed)
+}
+
 /// DNS messages framed as one per datagram, or with the two-octet length
 /// prefix over a stream (RFC 1035 §4.2.2). Each item is one message's
 /// bytes, unparsed.
@@ -85,5 +96,18 @@ mod tests {
             Step::Item(Vec::new(), 2)
         );
         assert_eq!(queries.capacity(), 65537);
+    }
+
+    #[test]
+    fn a_framed_message_reads_back_and_one_too_long_is_refused() {
+        let framed = stream_framed(b"abc").unwrap();
+        assert_eq!(framed, [0, 3, b'a', b'b', b'c']);
+        let mut queries = Queries::new(Framing::Stream);
+        assert_eq!(
+            queries.decode(&framed, false).unwrap(),
+            Step::Item(b"abc".to_vec(), 5)
+        );
+        assert!(stream_framed(&vec![0; 65535]).is_some());
+        assert_eq!(stream_framed(&vec![0; 65536]), None);
     }
 }

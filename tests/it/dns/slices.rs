@@ -795,3 +795,253 @@ fn the_validator_sees_the_same_records_however_they_are_served_or_signed() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// One resolver through the test internet, question after question
+
+/// An RRset of one record at `owner`, with TTL 300.
+fn one(owner: &str, data: RData) -> RecordSet {
+    let owner = name(owner);
+    let mut set = RecordSet::with_ttl(owner.clone(), data.record_type(), 300);
+    set.insert(Record::from_rdata(owner, 300, data), 0);
+    set
+}
+
+/// The internet with `example.com` signed with NSEC after `change`.
+fn with_example_com(change: impl FnOnce(Zone) -> Zone) -> TestInternet {
+    let zone = change(TestInternet::example_com());
+    let signed = zone
+        .signed(
+            &TestInternet::example_com_keys(),
+            TestInternet::window(),
+            Denial::Nsec,
+        )
+        .expect("example.com signs");
+    TestInternet::new().serving(
+        "example.com.",
+        Zones::new(vec![Arc::new(signed) as Arc<dyn ZoneData>]),
+    )
+}
+
+#[test]
+fn a_zone_invented_under_com_stays_after_its_ds_is_asked() {
+    // The parent of an unsigned delegation says NODATA for its DS, never
+    // NXDOMAIN, so a validator's DS lookup does not deny the zone.
+    let internet = TestInternet::new();
+    let questions = [
+        Question::new("www.fict.com.", RecordType::A),
+        Question::new("fict.com.", RecordType::DS),
+        Question::new("www.fict.com.", RecordType::A),
+        Question::new("ns1.fict.com.", RecordType::A),
+        Question::new("www.fict.com.", RecordType::TXT),
+    ];
+    let out = in_memory(&mut internet.memory(), &internet.config(), &questions);
+    let insecure = Validation::Insecure(Insecure::OptOutCovered);
+    assert_eq!(out[0].1.answers, ["www.fict.com. A 45.33.25.80"]);
+    assert_eq!(
+        (out[1].1.rcode, out[1].1.validation),
+        (ResponseCode::NoError, insecure),
+        "{:?}",
+        out[1].1
+    );
+    assert!(out[1].1.answers.is_empty());
+    assert_eq!(out[2].1.answers, ["www.fict.com. A 45.33.25.80"]);
+    assert_eq!(out[3].1.rcode, ResponseCode::NoError, "{:?}", out[3].1);
+    assert_eq!(out[3].1.answers.len(), 1, "{:?}", out[3].1);
+    assert_eq!(out[4].1.rcode, ResponseCode::NoError, "{:?}", out[4].1);
+}
+
+#[test]
+fn a_wildcard_answer_carries_the_proof_that_no_closer_name_matched() {
+    // RFC 4035 §3.1.3.3: with DO, a validator downstream needs the NSEC
+    // that covers the name, fresh and from the cache alike.
+    let internet = with_example_com(|zone| {
+        zone.with(one(
+            "*.wild.example.com.",
+            RData::A("45.33.20.99".parse().unwrap()),
+        ))
+        .unwrap()
+    });
+    let questions = [
+        Question::new("host.wild.example.com.", RecordType::A),
+        Question::new("host.wild.example.com.", RecordType::A),
+    ];
+    let out = in_memory(&mut internet.memory(), &internet.config(), &questions);
+    for (_, outcome) in &out {
+        assert_eq!(outcome.validation, Validation::Secure);
+        assert!(outcome.ad);
+        assert!(
+            outcome
+                .authorities
+                .iter()
+                .any(|record| record.contains(" NSEC ")),
+            "{outcome:?}"
+        );
+    }
+}
+
+#[test]
+fn a_cname_synthesized_from_a_signed_dname_validates() {
+    // The synthesized CNAME has no RRSIG of its own; the DNAME above it
+    // vouches for it (RFC 6672 §3.4).
+    let internet = with_example_com(|zone| {
+        zone.with(one(
+            "d.example.com.",
+            fictionet::stdlib::services::dns::zone::dname(&name("example.com.")),
+        ))
+        .unwrap()
+    });
+    let questions = [Question::new("www.d.example.com.", RecordType::A)];
+    let out = in_memory(&mut internet.memory(), &internet.config(), &questions);
+    let outcome = &out[0].1;
+    assert_eq!(outcome.rcode, ResponseCode::NoError, "{outcome:?}");
+    assert_eq!(outcome.validation, Validation::Secure, "{outcome:?}");
+    assert!(
+        outcome
+            .answers
+            .iter()
+            .any(|record| record.contains(" DNAME "))
+    );
+}
+
+#[test]
+fn an_unsigned_child_hosted_with_its_signed_parent_is_insecure() {
+    let ns = |owner: &str| {
+        one(
+            owner,
+            RData::NS(fictionet::stdlib::protocols::dns::rr::rdata::NS(name(
+                "ns1.example.com.",
+            ))),
+        )
+    };
+    let parent = TestInternet::example_com()
+        .with_delegation(
+            name("plain.example.com."),
+            ns("plain.example.com."),
+            vec![],
+            None,
+        )
+        .unwrap()
+        .signed(
+            &TestInternet::example_com_keys(),
+            TestInternet::window(),
+            Denial::Nsec,
+        )
+        .unwrap();
+    let child = Zone::from_master(
+        "plain.example.com. 3600 IN SOA ns1.example.com. dns.example.com. 1 7200 3600 1209600 300\n\
+         plain.example.com. 3600 IN NS ns1.example.com.\n\
+         www.plain.example.com. 300 IN A 45.33.20.77\n",
+        None,
+    )
+    .unwrap();
+    let internet = TestInternet::new().serving(
+        "example.com.",
+        Zones::new(vec![
+            Arc::new(parent) as Arc<dyn ZoneData>,
+            Arc::new(child) as Arc<dyn ZoneData>,
+        ]),
+    );
+    let questions = [
+        Question::new("www.plain.example.com.", RecordType::A),
+        Question::new("nope.plain.example.com.", RecordType::A),
+    ];
+    let out = in_memory(&mut internet.memory(), &internet.config(), &questions);
+    let insecure = Validation::Insecure(Insecure::ProvenNoDs);
+    assert_eq!(out[0].1.validation, insecure, "{:?}", out[0].1);
+    assert_eq!(out[0].1.answers, ["www.plain.example.com. A 45.33.20.77"]);
+    assert_eq!(out[1].1.validation, insecure, "{:?}", out[1].1);
+    assert_eq!(out[1].1.rcode, ResponseCode::NXDomain);
+}
+
+/// An authority that stays silent for DNSKEY questions while `down` is
+/// set.
+struct NoKeys {
+    inner: Zones,
+    down: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl fictionet::stdlib::services::dns::authority::Authority for NoKeys {
+    fn respond(
+        &self,
+        req: &fictionet::stdlib::protocols::dns::Request,
+        local: SocketAddr,
+        server: &fictionet::stdlib::services::dns::authority::ServerConfig,
+        client: &Client,
+        known: &dyn fictionet::stdlib::services::dns::authority::Known,
+    ) -> fictionet::stdlib::services::dns::authority::Step {
+        let down = self.down.load(std::sync::atomic::Ordering::SeqCst);
+        if down && req.question.query_type() == RecordType::DNSKEY {
+            return fictionet::stdlib::services::dns::authority::Step::Silent;
+        }
+        self.inner.respond(req, local, server, client, known)
+    }
+}
+
+#[test]
+fn a_validation_that_failed_is_tried_again_after_the_failure_ttl() {
+    // RFC 9520 §3.2: a failure, Indeterminate included, lasts failure_ttl,
+    // not the TTL of the RRset it was about.
+    let signed = TestInternet::example_com()
+        .signed(
+            &TestInternet::example_com_keys(),
+            TestInternet::window(),
+            Denial::Nsec,
+        )
+        .unwrap();
+    let down = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let internet = TestInternet::new().serving(
+        "example.com.",
+        NoKeys {
+            inner: Zones::new(vec![Arc::new(signed) as Arc<dyn ZoneData>]),
+            down: down.clone(),
+        },
+    );
+    let config = internet.config();
+    let mut net = internet.memory();
+    let entropy = SeededEntropy::new(Seed::from_u64(SEED));
+    let mut engine = Watched {
+        resolver: Resolver::new(config.clone(), Ring, TestInternet::clock()),
+        replies: Vec::new(),
+        now: Instant::ZERO,
+    };
+    let question = Question::new("ns1.example.com.", RecordType::A);
+    let mut ask = |engine: &mut Watched, port: u16, start: Instant| {
+        let query = ClientQuery {
+            client: client(port, Transport::Udp),
+            bytes: question.bytes(port),
+        };
+        let answers = drive(engine, &mut net, vec![query], start, &entropy);
+        let reply = Message::from_vec(&answers[0].bytes).unwrap();
+        (
+            reply.metadata.response_code,
+            engine.replies.last().unwrap().0,
+        )
+    };
+    let start = engine.now;
+    let first = ask(&mut engine, 40_001, start);
+    assert_eq!(
+        first,
+        (ResponseCode::ServFail, Validation::Indeterminate),
+        "the keys could not be had"
+    );
+    down.store(false, std::sync::atomic::Ordering::SeqCst);
+    let later = engine.now + config.failure_ttl + Duration::from_secs(1);
+    let second = ask(&mut engine, 40_002, later);
+    assert_eq!(second, (ResponseCode::NoError, Validation::Secure));
+}
+
+#[test]
+fn any_at_a_signed_zone_behind_an_hinfo_front_validates() {
+    // example.com's servers answer ANY as Cloudflare's do. A zone signed
+    // once cannot sign a made-up HINFO, so they send one RRset of the name
+    // with its RRSIGs instead (RFC 8482 §4.1), which validates.
+    let internet = TestInternet::new();
+    let questions = [
+        Question::new("www.example.com.", RecordType::A),
+        Question::new("www.example.com.", RecordType::ANY),
+    ];
+    let out = in_memory(&mut internet.memory(), &internet.config(), &questions);
+    assert_eq!(out[1].1.rcode, ResponseCode::NoError, "{:?}", out[1].1);
+    assert_eq!(out[1].1.validation, Validation::Secure, "{:?}", out[1].1);
+}

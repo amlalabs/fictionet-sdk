@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use fictionet::stdlib::protocols::dns::op::{Edns, Header, Message, MessageType, ResponseCode};
 use fictionet::stdlib::protocols::dns::rr::rdata::TXT;
+use fictionet::stdlib::protocols::dns::rr::rdata::opt::EdnsCode;
 use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, Name, RData, Record, RecordType};
 use fictionet::stdlib::protocols::dns::serialize::binary::{BinDecodable, BinDecoder};
 use fictionet::stdlib::protocols::dns::{
@@ -23,8 +24,12 @@ use super::super::zone::AnyResponse;
 /// §6.1.2), as the root servers and the large public resolvers do.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServerConfig {
-    /// What the server says about itself.
-    pub identity: Identity,
+    /// What the server says about itself: its CHAOS answers and its NSID.
+    /// `None` when the authority behind the front speaks for the server,
+    /// as a relay of a real server passes on that server's own CHAOS
+    /// answers and NSID. Either way both come from one source, so they
+    /// describe the same instance.
+    pub identity: Option<Identity>,
     /// The largest UDP reply the server sends and advertises
     /// (RFC 6891 §6.2.5).
     pub payload: u16,
@@ -44,10 +49,10 @@ impl ServerConfig {
     /// An ordinary authoritative server: a 1232-octet payload, the size
     /// the DNS Flag Day 2020 settled on; Extended DNS Errors; the RFC 8482
     /// HINFO answer to ANY, as Cloudflare's servers send; no transfers; and
-    /// no identity.
+    /// an identity with no names and no NSID.
     pub fn generic() -> ServerConfig {
         ServerConfig {
-            identity: Identity::none(),
+            identity: Some(Identity::none()),
             payload: 1232,
             ede: true,
             any: AnyResponse::Hinfo,
@@ -61,7 +66,7 @@ impl ServerConfig {
     /// 4096-octet payload, and every RRset of the name for ANY.
     pub fn root(identity: Identity) -> ServerConfig {
         ServerConfig {
-            identity,
+            identity: Some(identity),
             payload: 4096,
             any: AnyResponse::All,
             ..ServerConfig::generic()
@@ -90,7 +95,9 @@ impl ServerConfig {
     /// - Options from the query are never echoed (RFC 6891 §6.1.2). The
     ///   reply carries the server's NSID only when the query asked for it
     ///   (RFC 5001 §2.1), and the authority's own options, Extended DNS
-    ///   Errors only when [`ede`](ServerConfig::ede) is on.
+    ///   Errors only when [`ede`](ServerConfig::ede) is on. With an
+    ///   [`identity`](ServerConfig::identity) the NSID is the identity's;
+    ///   without one it is the authority's.
     pub fn front(&self, req: &Request, response: Response) -> Response {
         let Response {
             mut message,
@@ -123,11 +130,18 @@ impl ServerConfig {
             let own = authority.iter().flat_map(|edns| edns.options().as_ref());
             for (_, option) in own {
                 let ede = Ede::from_option(option).is_some();
-                if Nsid::from_option(option).is_none() && (self.ede || !ede) {
+                let nsid = Nsid::from_option(option).is_some();
+                let keep = if nsid {
+                    asked.nsid && self.identity.is_none()
+                } else {
+                    self.ede || !ede
+                };
+                if keep {
                     edns.options_mut().insert(option.clone());
                 }
             }
-            if let (true, Some(nsid)) = (asked.nsid, &self.identity.nsid) {
+            let nsid = self.identity.as_ref().and_then(|id| id.nsid.as_ref());
+            if let (true, Some(nsid)) = (asked.nsid, nsid) {
                 edns.options_mut().insert(Nsid(nsid.clone()).to_option());
             }
             edns
@@ -141,24 +155,25 @@ impl ServerConfig {
     /// The reply to a CHAOS-class question, from [`identity`](ServerConfig::identity)
     /// alone. A name with text gets it as one TXT record with the
     /// identity's TTL and AA set, for QTYPE TXT or ANY, and an empty
-    /// NOERROR for other types.
-    pub(super) fn chaos(&self, req: &Request) -> Response {
+    /// NOERROR for other types. `None` without an identity: the authority
+    /// answers.
+    pub(super) fn chaos(&self, req: &Request) -> Option<Response> {
+        let identity = self.identity.as_ref()?;
         let qname = LowerName::new(req.question.name());
-        let text = match self.identity.chaos.get(&qname) {
-            None => return bare_reply(req, self.identity.unlisted, None),
-            Some(ChaosAnswer::Rcode(code)) => return bare_reply(req, *code, None),
+        let text = match identity.chaos.get(&qname) {
+            None => return Some(bare_reply(req, identity.unlisted, None)),
+            Some(ChaosAnswer::Rcode(code)) => return Some(bare_reply(req, *code, None)),
             Some(ChaosAnswer::Txt(text)) => text,
         };
         let mut response = bare_reply(req, ResponseCode::NoError, None);
         response.message.metadata.authoritative = true;
         if matches!(req.question.query_type(), RecordType::TXT | RecordType::ANY) {
             let txt = RData::TXT(TXT::new(vec![text.clone()]));
-            let mut record =
-                Record::from_rdata(req.question.name().clone(), self.identity.ttl, txt);
+            let mut record = Record::from_rdata(req.question.name().clone(), identity.ttl, txt);
             record.dns_class = DNSClass::CH;
             response.message.answers.push(record);
         }
-        response
+        Some(response)
     }
 
     /// The octets of `response` for `req`, through the front and fitted to
@@ -199,18 +214,35 @@ impl ServerConfig {
     /// client's size. A larger reply, such as one a source fetched over
     /// TCP for a client that asked over UDP, is decoded and written again
     /// with [`fit`], which keeps whole RRsets, the glue a referral needs,
-    /// and sets TC (RFC 2181 §9, RFC 9471 §3.1). `None` for octets that
-    /// are not a response, and for a reply too large that does not decode.
+    /// and sets TC (RFC 2181 §9, RFC 9471 §3.1). A query that asked for
+    /// the NSID of a server with an [`identity`](ServerConfig::identity)
+    /// gets the identity's, written into the reply the same way, so the
+    /// NSID names the instance the CHAOS answers name. `None` for octets
+    /// that are not a response, and for a reply too large that does not
+    /// decode.
     pub(super) fn verbatim(&self, req: &Request, bytes: Vec<u8>) -> Option<Vec<u8>> {
         let header = Header::read(&mut BinDecoder::new(&bytes)).ok()?;
         if header.metadata.message_type != MessageType::Response {
             return None;
         }
         let limit = Limit::for_request(req, self.payload);
-        if bytes.len() <= limit.octets() {
+        let nsid = self
+            .identity
+            .as_ref()
+            .and_then(|identity| identity.nsid.as_ref())
+            .filter(|_| req.edns.is_some_and(|edns| edns.nsid));
+        if bytes.len() <= limit.octets() && nsid.is_none() {
             return Some(bytes);
         }
-        let mut message = Message::from_vec(&bytes).ok()?;
+        let mut message = match Message::from_vec(&bytes) {
+            Ok(message) => message,
+            Err(_) if bytes.len() <= limit.octets() => return Some(bytes),
+            Err(_) => return None,
+        };
+        if let (Some(nsid), Some(edns)) = (nsid, &mut message.edns) {
+            edns.options_mut().remove(EdnsCode::NSID);
+            edns.options_mut().insert(Nsid(nsid.clone()).to_option());
+        }
         let required_additional = glue_first(&mut message);
         let response = Response {
             message,

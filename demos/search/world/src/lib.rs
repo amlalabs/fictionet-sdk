@@ -29,14 +29,14 @@ use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
 
 use fictionet::Cx;
-use fictionet::stdlib::protocols::dns::Response;
+use fictionet::stdlib::protocols::dns::op::Message;
 use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RData};
+use fictionet::stdlib::services::dns::Event;
 use fictionet::stdlib::services::dns::resolver::Config;
-use fictionet::stdlib::services::dns::{Event, Generation};
 use fictionet::stdlib::services::tls::ServerConfig;
 use fictionet::stdlib::web;
 use fictionet::stdlib::world::net::dns::internet::{self, Egress, Location, Mirror};
-use fictionet::stdlib::world::net::dns::{Only, Recursive};
+use fictionet::stdlib::world::net::dns::{Only, PerSession, Recursive};
 use fictionet::stdlib::world::net::{Host, Net, NetHandle};
 use fictionet::sync::Mutex;
 
@@ -66,14 +66,14 @@ pub use tls::Ca;
 /// `forwarded` host given for that name, such as the model gateway, or a
 /// site whose pages come from [`Pages`]. So the guest connects to the
 /// address the real DNS gave, and the world changes the machine there,
-/// never the DNS. `egress` is the host's public address, which the
-/// public resolvers' whoami names answer with.
+/// never the DNS. `egress` is the host's public address, when known,
+/// which the public resolvers' whoami names answer with.
 pub fn net(
     fcx: &Cx,
     ca: Arc<Ca>,
     pages: Arc<Pages>,
     start: SystemTime,
-    egress: Egress,
+    egress: Option<Egress>,
     forwarded: impl IntoIterator<Item = (Name, Host)>,
 ) -> Net {
     let mut forwarded: HashMap<LowerName, Host> = forwarded
@@ -105,7 +105,8 @@ pub fn net(
         forwarded,
         built: Mutex::default(),
         placed: Mutex::default(),
-        addresses: Mutex::new((namespace.current().generation, HashMap::new())),
+        refusing: Mutex::default(),
+        addresses: PerSession::new(),
     });
     let mirror = Mirror::new(Only::new(outbound.policy(), source), handle, &location)
         .namespace(&namespace)
@@ -182,9 +183,12 @@ struct Sites {
     built: Mutex<HashMap<LowerName, Host>>,
     /// Each name and address given a machine, or found unable to take one.
     placed: Mutex<HashSet<(LowerName, Ipv4Addr)>>,
+    /// Addresses given a machine with no services, for names a session
+    /// resolves but does not serve, so connections to them are refused.
+    refusing: Mutex<HashSet<Ipv4Addr>>,
     /// The session's relayed IPv4 addresses of each name, its own or those
-    /// at the end of its CNAME chain, for the session they belong to.
-    addresses: Mutex<(Generation, HashMap<LowerName, HashSet<Ipv4Addr>>)>,
+    /// at the end of its CNAME chain.
+    addresses: PerSession<HashMap<LowerName, HashSet<Ipv4Addr>>>,
 }
 
 impl Sites {
@@ -200,10 +204,11 @@ impl Sites {
     /// The network has no IPv6, so AAAA records place nothing. An address
     /// the network refuses, such as one on the sandboxes' subnet, or one
     /// whose port 443 already serves the world's infrastructure, keeps no
-    /// machine for the name.
-    fn place(&self, reply: &Response) {
+    /// machine for the name. A name the session resolves but does not
+    /// serve, outside Live-Depth's depth, gets no site: a machine there
+    /// with no services refuses connections at TCP.
+    fn place(&self, reply: &Message) {
         let mut found: Vec<(LowerName, Ipv4Addr)> = reply
-            .message
             .answers
             .iter()
             .filter_map(|record| match &record.data {
@@ -213,36 +218,59 @@ impl Sites {
                 _ => None,
             })
             .collect();
-        let mut addresses = self.addresses.lock();
         let generation = self.pages.namespace().current().generation;
-        if addresses.0 != generation {
-            *addresses = (generation, HashMap::new());
-        }
-        for (name, addr) in &found {
-            addresses.1.entry(name.clone()).or_default().insert(*addr);
-        }
-        for record in &reply.message.answers {
-            if let RData::CNAME(cname) = &record.data
-                && let Some(known) = addresses.1.get(&LowerName::new(&cname.0))
-            {
-                let owner = LowerName::new(&record.name);
-                found.extend(known.iter().map(|addr| (owner.clone(), *addr)));
+        let placing = self.addresses.with(generation, |addresses| {
+            for (name, addr) in &found {
+                addresses.entry(name.clone()).or_default().insert(*addr);
             }
-        }
-        let mut placing = Vec::new();
-        for (name, addr) in found {
-            let aliases = self.outbound.aliases(&name);
-            for name in std::iter::once(name).chain(aliases) {
-                addresses.1.entry(name.clone()).or_default().insert(addr);
-                if self.outbound.admits(&name) && self.placed.lock().insert((name.clone(), addr)) {
-                    placing.push((name, addr));
+            for record in &reply.answers {
+                if let RData::CNAME(cname) = &record.data
+                    && let Some(known) = addresses.get(&LowerName::new(&cname.0))
+                {
+                    let owner = LowerName::new(&record.name);
+                    found.extend(known.iter().map(|addr| (owner.clone(), *addr)));
                 }
             }
-        }
-        drop(addresses);
+            let mut placing = Vec::new();
+            for (name, addr) in found {
+                let aliases = self.outbound.aliases(&name);
+                for name in std::iter::once(name).chain(aliases) {
+                    addresses.entry(name.clone()).or_default().insert(addr);
+                    if !self.outbound.admits(&name) {
+                        continue;
+                    }
+                    if !self.serves(&name) {
+                        // Live-Depth: the DNS is real, but the name is
+                        // outside the depth. Its own machine refuses TCP,
+                        // and a shared one has no site for its SNI.
+                        if self.refusing.lock().insert(addr)
+                            && !self.handle.has_machine(addr.into())
+                        {
+                            let refuser = Host::new(&name.to_string()).at(addr).ipv4_only();
+                            let _ = self.handle.add_host(refuser);
+                        }
+                        continue;
+                    }
+                    if self.placed.lock().insert((name.clone(), addr)) {
+                        placing.push((name, addr));
+                    }
+                }
+            }
+            placing
+        });
         for (name, addr) in placing {
             let _ = self.handle.add_host(self.host(&name).at(addr));
         }
+    }
+
+    /// Whether the session serves pages for `name`: a forwarded host's
+    /// name always, and other names as [`Pages::serves_host`] says, which
+    /// in Live-Depth keeps to the depth.
+    fn serves(&self, name: &LowerName) -> bool {
+        self.forwarded.contains_key(name)
+            || self
+                .pages
+                .serves_host(name.to_string().trim_end_matches('.'))
     }
 
     /// The host the world puts at `name`'s addresses.
@@ -324,12 +352,12 @@ impl Sites {
 }
 
 /// A world kept in memory: its CA, its pages, the run's start on the host
-/// clock, and the host's public address.
+/// clock, and the host's public address when it is known.
 pub struct World {
     pub ca: Arc<Ca>,
     pub pages: Arc<Pages>,
     pub start: SystemTime,
-    pub egress: Egress,
+    pub egress: Option<Egress>,
 }
 
 impl World {

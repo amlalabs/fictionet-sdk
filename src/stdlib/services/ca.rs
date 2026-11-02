@@ -385,11 +385,11 @@ impl Leaf {
 mod tests {
     use super::*;
 
-    /// A seed's CA keys and root stay byte for byte what they were when
-    /// this module generated its own keys. The values are SHA-256 digests
-    /// of the PKCS#8 keys and the root certificate that seed 29 made then.
+    /// Seed 29 always makes the same CA keys and root certificate, byte
+    /// for byte: the values are SHA-256 digests of its PKCS#8 keys and its
+    /// root certificate.
     #[test]
-    fn seeded_keys_match_the_keys_made_before_they_moved() {
+    fn a_seed_always_makes_the_same_keys_and_root() {
         fn sha256(bytes: &[u8]) -> String {
             ring::digest::digest(&ring::digest::SHA256, bytes)
                 .as_ref()

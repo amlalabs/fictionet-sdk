@@ -93,7 +93,7 @@ mod relay;
 mod request;
 
 pub use fit::{Fitted, Limit, Response, fit};
-pub use framing::{Framing, Queries};
+pub use framing::{Framing, Queries, stream_framed};
 pub use options::{Ede, EdeCode, Nsid, Padding};
 pub use relay::{RelayError, restore};
 pub use request::{EdnsIn, Parsed, Request};

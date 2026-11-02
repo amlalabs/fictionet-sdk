@@ -119,7 +119,11 @@ sites. Capture dates are shown only when the archive records them.
   returns an empty list. Missing pages use captured site responses. Names resolve from
   the DNS captured with the pages, and a name the capture lacks gets SERVFAIL.
   The model gateway's and the time server's names are asked of the real
-  servers when the capture lacks them.
+  servers when the capture lacks them. Every capture command records the DNS
+  of every host the corpus then serves, research, package, and reference sites
+  alike, and the session's clock starts at that capture so its signatures are
+  valid. A corpus captured before DNS was recorded gets it with
+  `cargo xtask search-capture /path/to/demos/downloads --dns`.
 - **Live** is selected by default when `EXA_API_KEY` is present. [Exa search](https://github.com/exa-labs/openapi-spec/blob/master/exa-openapi-spec.yaml)
   supplies results, which keep their order, titles and URLs in each engine's
   skin; snippets are Exa's highlights as plain text, and Exa's own pages are

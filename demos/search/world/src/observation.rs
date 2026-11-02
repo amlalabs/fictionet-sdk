@@ -162,7 +162,9 @@ pub enum SearchObs {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Dnssec {
-    /// The resolver did not validate: the client set CD.
+    /// The resolver did not validate: the client set CD, or the answer
+    /// came from the resolver itself, from a local zone or its CHAOS
+    /// names, or was a refusal or a format error.
     NotPerformed,
     Secure,
     Insecure,

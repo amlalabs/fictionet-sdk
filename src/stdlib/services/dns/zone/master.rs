@@ -17,6 +17,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;
 
+use fictionet::stdlib::protocols::dns::dnssec::proof::base32hex;
 use fictionet::stdlib::protocols::dns::dnssec::rdata::DNSSECRData;
 use fictionet::stdlib::protocols::dns::rr::{
     LowerName, Name, RData, Record, RecordSet, RecordType,
@@ -493,7 +494,7 @@ fn rdata(
             wire.push(u8::try_from(salt.len()).map_err(|_| bad())?);
             wire.extend(salt);
             if u16::from(rtype) == 50 {
-                let next = base32hex(fields.next().ok_or_else(bad)?).ok_or_else(bad)?;
+                let next = base32hex(fields.next().ok_or_else(bad)?.as_bytes()).ok_or_else(bad)?;
                 wire.push(u8::try_from(next.len()).map_err(|_| bad())?);
                 wire.extend(next);
                 wire.extend(type_bitmap(fields.rest()).ok_or_else(bad)?);
@@ -683,24 +684,6 @@ fn base64(tokens: &[String]) -> Option<Vec<u8>> {
         };
         buffer = (buffer << 6 | u32::from(value)) & 0xffff;
         bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            bytes.push((buffer >> bits) as u8);
-        }
-    }
-    Some(bytes)
-}
-
-/// Bytes from base32 with the extended hex alphabet, unpadded, either case
-/// (RFC 4648 §7), as NSEC3 writes the next hashed owner.
-fn base32hex(token: &str) -> Option<Vec<u8>> {
-    let mut bytes = Vec::new();
-    let mut buffer = 0u32;
-    let mut bits = 0;
-    for c in token.bytes() {
-        let value = char::from(c).to_digit(32)?;
-        buffer = (buffer << 5 | value) & 0xffff;
-        bits += 5;
         if bits >= 8 {
             bits -= 8;
             bytes.push((buffer >> bits) as u8);

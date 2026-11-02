@@ -27,7 +27,7 @@ use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, Name, RData, Re
 use fictionet::stdlib::protocols::dns::{Parsed, Request, restore};
 use fictionet::stdlib::services::dns::authority::{Ask, Observed};
 use fictionet::stdlib::services::serve::Transport;
-use fictionet::stdlib::world::net::dns::Source;
+use fictionet::stdlib::world::net::dns::{Question, Source};
 use fictionet::sync::Mutex;
 
 use crate::warc;
@@ -217,7 +217,10 @@ fn invalid(message: &str) -> io::Error {
 /// DO bit) sent to the same server, with the asker's ID and question case
 /// put back ([`restore`]) and its RD and CD bits copied in, as the
 /// authority would have copied them (RFC 1035 §4.1.1, RFC 4035 §3.1.6).
-/// Every other byte is the recorded server's.
+/// Every other byte is the recorded server's. A question without DO, as
+/// `dig` asks by default, that the capture holds only with DO gets the
+/// recorded reply without its DNSSEC records, and without its OPT record
+/// when the query had none, as the server would have sent it.
 ///
 /// The servers named in one NS RRset serve the same zone, so for a
 /// question at or below that zone a reply recorded from one of them
@@ -234,28 +237,6 @@ pub struct Replay {
     /// The zones each server address serves, by the capture's NS records.
     zones: HashMap<IpAddr, Vec<LowerName>>,
     captured: Vec<String>,
-}
-
-/// What makes two queries the same question for [`Replay`].
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct Question {
-    name: LowerName,
-    qtype: RecordType,
-    qclass: DNSClass,
-    edns: bool,
-    dnssec_ok: bool,
-}
-
-impl Question {
-    fn of(request: &Request) -> Question {
-        Question {
-            name: LowerName::new(request.question.name()),
-            qtype: request.question.query_type(),
-            qclass: request.question.query_class(),
-            edns: request.edns.is_some(),
-            dnssec_ok: request.edns.is_some_and(|edns| edns.dnssec_ok),
-        }
-    }
 }
 
 impl Replay {
@@ -341,21 +322,64 @@ impl Replay {
         self.captured.iter().map(String::as_str)
     }
 
-    /// The recorded reply for `request` sent to `server`: the one from
+    /// The reply for `request` sent to `server`: the recorded reply to the
+    /// same question, or for a query without DO the reply recorded for
+    /// the same question with DO, with what DO brought taken out. The
+    /// capture asks every question with DO, as the world's resolvers do,
+    /// and a real server answers a query without it with the same records
+    /// less the DNSSEC ones (RFC 4035 §3.2.1) and, for a query with no OPT
+    /// record, no OPT record either (RFC 6891 §7).
+    fn reply_to(&self, server: SocketAddr, request: &Request) -> Option<Vec<u8>> {
+        let question = Question::of(request);
+        if let Some(reply) = self.reply(server, &question) {
+            return Some(reply.to_vec());
+        }
+        if question.dnssec_ok {
+            return None;
+        }
+        let signed = Question {
+            edns: true,
+            dnssec_ok: true,
+            ..question
+        };
+        let mut message = Message::from_vec(self.reply(server, &signed)?).ok()?;
+        let asked = request.question.query_type();
+        let keep = |record: &fictionet::stdlib::protocols::dns::rr::Record| {
+            let rtype = record.record_type();
+            rtype == asked
+                || !matches!(
+                    rtype,
+                    RecordType::RRSIG | RecordType::NSEC | RecordType::NSEC3
+                )
+        };
+        message.answers.retain(keep);
+        message.authorities.retain(keep);
+        message.additionals.retain(keep);
+        match (&request.edns, &mut message.edns) {
+            (None, edns) => *edns = None,
+            (Some(_), Some(edns)) => {
+                edns.set_dnssec_ok(false);
+            }
+            (Some(_), None) => {}
+        }
+        message.to_vec().ok()
+    }
+
+    /// The recorded reply to `question` sent to `server`: the one from
     /// that server, or else the one from the server sharing the deepest
     /// zone with it that holds the question's name.
-    fn reply(&self, server: SocketAddr, request: &Request) -> Option<&[u8]> {
-        let replies = self.replies.get(&Question::of(request))?;
+    fn reply(&self, server: SocketAddr, question: &Question) -> Option<&[u8]> {
+        let replies = self.replies.get(question)?;
         if let Some((_, reply)) = replies.iter().find(|(from, _)| *from == server) {
             return Some(reply);
         }
-        let name = LowerName::new(request.question.name());
+        let name = &question.name;
         let serving = |address: IpAddr| {
             self.zones
                 .get(&address)
                 .into_iter()
                 .flatten()
-                .filter(|zone| zone.zone_of(&name))
+                .filter(|zone| zone.zone_of(name))
         };
         let mut best: Option<(u8, &[u8])> = None;
         for (from, reply) in replies {
@@ -417,8 +441,8 @@ impl Source for Replay {
             return Box::pin(ready(Observed::Timeout));
         };
         let observed = self
-            .reply(ask.server, &request)
-            .and_then(|reply| restore(reply, &request).ok())
+            .reply_to(ask.server, &request)
+            .and_then(|reply| restore(&reply, &request).ok())
             .map_or(Observed::Timeout, |mut bytes| {
                 // RD is the low bit of the third header octet, CD bit 4 of
                 // the fourth (RFC 1035 §4.1.1, RFC 4035 §3.1.6). `restore`
@@ -619,17 +643,40 @@ mod tests {
                     query(1, "www.example.com.", RecordType::AAAA, Some(true)),
                 ),
                 ask(
-                    COM,
-                    query(1, "www.example.com.", RecordType::A, Some(false)),
-                ),
-                ask(COM, query(1, "www.example.com.", RecordType::A, None)),
-                ask(
                     A_ROOT,
                     query(1, "www.example.com.", RecordType::A, Some(true)),
                 ),
             ] {
                 assert_eq!(replay.ask(&fcx, other).await, Observed::Timeout);
             }
+
+            // The same question without DO, as `dig` asks, gets the reply
+            // the server sends without DO: DO clear in its OPT record, and
+            // no OPT record for a query that had none.
+            let plain = reply(
+                replay
+                    .ask(
+                        &fcx,
+                        ask(
+                            COM,
+                            query(2, "www.example.com.", RecordType::A, Some(false)),
+                        ),
+                    )
+                    .await,
+            );
+            assert_eq!(plain.metadata.id, 2);
+            assert_eq!(plain.answers[0].data, RData::A(A::new(192, 0, 2, 80)));
+            assert!(!plain.edns.unwrap().flags().dnssec_ok);
+            let bare = reply(
+                replay
+                    .ask(
+                        &fcx,
+                        ask(COM, query(3, "www.example.com.", RecordType::A, None)),
+                    )
+                    .await,
+            );
+            assert_eq!(bare.answers[0].data, RData::A(A::new(192, 0, 2, 80)));
+            assert!(bare.edns.is_none());
         });
     }
 

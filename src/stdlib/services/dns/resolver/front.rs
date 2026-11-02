@@ -23,7 +23,7 @@ use super::super::authority::{ChaosAnswer, bare_reply};
 use super::super::event::{Event, ReplyFlags};
 use super::super::exchange::Client;
 use super::cache::{Entry, Negative, ttl_left};
-use super::resolution::{Outcome, with_ttl};
+use super::resolution::{Outcome, is_dname, with_ttl};
 use super::{Asker, Piece, Resolver, worse};
 use fictionet::stdlib::protocols::dns::dnssec::Verify;
 
@@ -149,7 +149,10 @@ impl<V: Verify> Resolver<V> {
     /// - The answer section holds each alias, after the DNAME it was
     ///   synthesized from, then the data. A negative's SOA goes in the
     ///   authority section with its TTL counted down (RFC 2308 §6); with
-    ///   DO, so do the denial records.
+    ///   DO, so do the denial records, and the NSEC or NSEC3 records that
+    ///   show a wildcard answer had no closer match (RFC 4035 §3.1.3.3).
+    /// - A DNAME whose substitution would pass 255 octets gives YXDOMAIN
+    ///   with the DNAME (RFC 6672 §2.2).
     /// - Without DO, RRSIG, NSEC, and NSEC3 records are left out unless
     ///   the question asks for their type (RFC 4035 §3.2.1).
     /// - Stale data carries the TTL of [`Stale::reply_ttl`](super::Stale::reply_ttl)
@@ -218,16 +221,33 @@ impl<V: Verify> Resolver<V> {
                 };
                 with_ttl(set, ttl)
             };
-            match &piece.outcome {
-                Outcome::Alias { cname, proof, .. } => {
-                    for set in proof.iter().chain(std::iter::once(cname)) {
-                        push(&mut message.answers, &ttl(set), dnssec_ok);
+            // With DO, a wildcard answer carries the NSEC or NSEC3 records
+            // that show no closer name matched (RFC 4035 §3.1.3.3), so a
+            // validator downstream can check it too.
+            let prove = |proof: &[RecordSet], message: &mut Message| {
+                if dnssec_ok {
+                    for set in proof.iter().filter(|set| !is_dname(set)) {
+                        push_once(&mut message.authorities, &ttl(set), dnssec_ok);
                     }
                 }
-                Outcome::Data { sets, .. } => {
+            };
+            match &piece.outcome {
+                Outcome::Alias { cname, proof, .. } => {
+                    let dname = proof.iter().filter(|set| is_dname(set));
+                    for set in dname.chain(std::iter::once(cname)) {
+                        push(&mut message.answers, &ttl(set), dnssec_ok);
+                    }
+                    prove(proof, &mut message);
+                }
+                Outcome::Data { sets, proof, .. } => {
                     for set in sets.iter().filter(|set| keep(set)) {
                         push(&mut message.answers, &ttl(set), dnssec_ok);
                     }
+                    prove(proof, &mut message);
+                }
+                Outcome::TooLong { dname, .. } => {
+                    message.metadata.response_code = ResponseCode::YXDomain;
+                    push(&mut message.answers, &ttl(dname), dnssec_ok);
                 }
                 Outcome::Negative {
                     kind, soa, denial, ..
@@ -281,7 +301,7 @@ impl<V: Verify> Resolver<V> {
         let mut at = LowerName::new(request.question.name());
         let ns = loop {
             let key = super::Key::new(at.clone(), RecordType::NS, DNSClass::IN);
-            if let Some(Entry::Positive { set, expires, .. }) = self.cache.get(&key, self.now) {
+            if let Some(Entry::Positive { set, expires, .. }) = self.cache.data(&key, self.now) {
                 break Some((set.clone(), *expires));
             }
             if at.is_root() {
@@ -304,7 +324,8 @@ impl<V: Verify> Resolver<V> {
             };
             for rtype in [RecordType::A, RecordType::AAAA] {
                 let key = super::Key::new(LowerName::new(&target.0), rtype, DNSClass::IN);
-                if let Some(Entry::Positive { set, expires, .. }) = self.cache.get(&key, self.now) {
+                if let Some(Entry::Positive { set, expires, .. }) = self.cache.data(&key, self.now)
+                {
                     push(
                         &mut message.additionals,
                         &with_ttl(set, ttl_left(*expires, self.now)),
@@ -334,6 +355,17 @@ fn push(section: &mut Vec<Record>, set: &RecordSet, dnssec_ok: bool) {
     section.extend(set.records_without_rrsigs().cloned());
     if dnssec_ok {
         section.extend(set.rrsigs().iter().cloned());
+    }
+}
+
+/// [`push`], unless `section` already holds records of `set`'s owner and
+/// type, as when two aliases of one chain carry the same proof.
+fn push_once(section: &mut Vec<Record>, set: &RecordSet, dnssec_ok: bool) {
+    let held = section
+        .iter()
+        .any(|record| record.name == *set.name() && record.record_type() == set.record_type());
+    if !held {
+        push(section, set, dnssec_ok);
     }
 }
 

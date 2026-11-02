@@ -25,7 +25,9 @@ use fictionet::stdlib::services::dns::authority::{
 };
 use fictionet::stdlib::services::dns::memory::{Exchanges, MemoryNet, drive};
 use fictionet::stdlib::services::dns::resolver::{Config, Entry, FailureKind, Key, Resolver, Work};
-use fictionet::stdlib::services::dns::zone::{Denial, Fact, Lazy, Transparent, Zone, ZoneData};
+use fictionet::stdlib::services::dns::zone::{
+    Denial, Fact, Lazy, Transparent, Zone, ZoneBuilder, ZoneData, dname,
+};
 use fictionet::stdlib::services::dns::{
     Action, Answer, Client, ClientQuery, Engine, Event, Generation, Input, Session, Unmatched,
     WallClock,
@@ -801,23 +803,29 @@ fn a_failure_is_cached_and_answered_with_ede_13_never_as_a_negative() {
 }
 
 #[test]
-fn nothing_exists_below_a_cached_nxdomain() {
-    let (mut net, _) = internet(false);
-    let mut resolver = resolver(config(None));
+fn nothing_exists_below_a_cached_secure_nxdomain() {
+    let (mut net, anchors) = internet(true);
+    let mut resolver = resolver(config(anchors));
     let reply = ask(
         &mut resolver,
         &mut net,
         0,
-        query(client(1), "nx.example.com.", RecordType::A, |_| {}),
+        query(client(1), "nx.example.com.", RecordType::A, dnssec_ok),
     );
     assert_eq!(reply.metadata.response_code, ResponseCode::NXDomain);
+    assert!(reply.metadata.authentic_data);
     assert_eq!(reply.authorities[0].record_type(), RecordType::SOA);
     let before = net.recording().exchanges().len();
     let reply = ask(
         &mut resolver,
         &mut net,
         1,
-        query(client(1), "deeper.nx.example.com.", RecordType::MX, |_| {}),
+        query(
+            client(1),
+            "deeper.nx.example.com.",
+            RecordType::MX,
+            dnssec_ok,
+        ),
     );
     assert_eq!(reply.metadata.response_code, ResponseCode::NXDomain);
     assert_eq!(reply.authorities[0].record_type(), RecordType::SOA);
@@ -825,6 +833,42 @@ fn nothing_exists_below_a_cached_nxdomain() {
         net.recording().exchanges().len(),
         before,
         "RFC 8020: no new question"
+    );
+}
+
+#[test]
+fn an_nxdomain_that_did_not_validate_denies_only_its_own_name() {
+    // Unbound uses only Secure NXDOMAINs for the names below them, since
+    // a server may deny an empty non-terminal or a name it does not know
+    // is delegated.
+    let (mut net, _) = internet(false);
+    let mut resolver = resolver(config(None));
+    let reply = ask(
+        &mut resolver,
+        &mut net,
+        1,
+        query(client(1), "nx.example.com.", RecordType::A, |_| {}),
+    );
+    assert_eq!(reply.metadata.response_code, ResponseCode::NXDomain);
+    let before = net.recording().exchanges().len();
+    let reply = ask(
+        &mut resolver,
+        &mut net,
+        2,
+        query(client(1), "nx.example.com.", RecordType::MX, |_| {}),
+    );
+    assert_eq!(reply.metadata.response_code, ResponseCode::NXDomain);
+    assert_eq!(net.recording().exchanges().len(), before, "its own name");
+    let reply = ask(
+        &mut resolver,
+        &mut net,
+        3,
+        query(client(1), "deeper.nx.example.com.", RecordType::MX, |_| {}),
+    );
+    assert_eq!(reply.metadata.response_code, ResponseCode::NXDomain);
+    assert!(
+        net.recording().exchanges().len() > before,
+        "a name below an unvalidated NXDOMAIN is asked again"
     );
 }
 
@@ -1631,4 +1675,382 @@ fn expired_data_answers_a_client_kept_waiting_while_the_resolution_goes_on() {
             ..
         })
     ));
+}
+
+/// Serves `zones` at `address` in `net`.
+fn serve_at(net: &mut MemoryNet, address: &str, zones: Vec<Zone>) {
+    let local = SocketAddr::new(ip(address), 53);
+    let zones = zones
+        .into_iter()
+        .map(|zone| Arc::new(zone) as Arc<dyn ZoneData>)
+        .collect();
+    net.serve(
+        ip(address),
+        AuthorityEngine::new(Zones::new(zones), ServerConfig::generic(), local),
+    );
+}
+
+/// The root, `com`, and `example.com`, unsigned, with `example.com`
+/// changed by `example` and delegated from `com` with its NS RRset at
+/// `ns_ttl` and its glue at `glue_ttl`.
+fn delegated(
+    example: impl FnOnce(ZoneBuilder) -> ZoneBuilder,
+    ns_ttl: u32,
+    glue_ttl: u32,
+) -> MemoryNet {
+    let root = delegation(
+        builder(".", "a.root-servers.net.").rrset(rrset(
+            "a.root-servers.net.",
+            3600,
+            vec![a(ROOT)],
+        )),
+        "com.",
+        "ns.nic.com.",
+        Some(COM),
+        None,
+    )
+    .build()
+    .unwrap();
+    let com = builder("com.", "ns.nic.com.")
+        .rrset(rrset("ns.nic.com.", 3600, vec![a(COM)]))
+        .delegate(
+            name("example.com."),
+            rrset("example.com.", ns_ttl, vec![ns("ns1.example.com.")]),
+            vec![rrset("ns1.example.com.", glue_ttl, vec![a(EXAMPLE)])],
+            None,
+        )
+        .build()
+        .unwrap();
+    let example = example(
+        builder("example.com.", "ns1.example.com.")
+            .rrset(rrset("ns1.example.com.", 3600, vec![a(EXAMPLE)]))
+            .rrset(rrset("www.example.com.", 300, vec![a("192.0.2.80")])),
+    )
+    .build()
+    .unwrap();
+    let mut net = MemoryNet::new();
+    serve_at(&mut net, ROOT, vec![root]);
+    serve_at(&mut net, COM, vec![com]);
+    serve_at(&mut net, EXAMPLE, vec![example]);
+    net
+}
+
+#[test]
+fn a_yxdomain_from_a_dname_is_passed_on_with_the_dname() {
+    // The DNAME's substitution passes 255 octets, so the authority answers
+    // YXDOMAIN (RFC 6672 §2.2), and that is the answer.
+    let target = format!(
+        "{}.{}.{}.example.org.",
+        "t".repeat(60),
+        "u".repeat(60),
+        "v".repeat(60)
+    );
+    let mut net = delegated(
+        |zone| zone.rrset(rrset("long.example.com.", 300, vec![dname(&name(&target))])),
+        3600,
+        3600,
+    );
+    let mut resolver = resolver(config(None));
+    let qname = format!("{}.long.example.com.", "y".repeat(60));
+    let reply = ask(
+        &mut resolver,
+        &mut net,
+        0,
+        query(client(1), &qname, RecordType::A, |_| {}),
+    );
+    assert_eq!(
+        reply.metadata.response_code,
+        ResponseCode::YXDomain,
+        "{:?}",
+        edes(&reply)
+    );
+    assert_eq!(reply.answers.len(), 1);
+    assert_eq!(reply.answers[0].name, name("long.example.com."));
+    assert_eq!(reply.answers[0].record_type(), RecordType::DNAME);
+}
+
+#[test]
+fn glue_with_ttl_0_serves_the_resolution_it_came_in() {
+    // RFC 1035 §7.4: data with TTL 0 is not cached, but is used for the
+    // transaction in progress.
+    let mut net = delegated(|zone| zone, 3600, 0);
+    let mut resolver = resolver(config(None));
+    let reply = ask(
+        &mut resolver,
+        &mut net,
+        0,
+        query(client(1), "www.example.com.", RecordType::A, |_| {}),
+    );
+    assert_eq!(addresses(&reply), ["192.0.2.80"]);
+}
+
+#[test]
+fn a_referral_with_ttl_0_moves_the_resolution_down() {
+    let mut net = delegated(|zone| zone, 0, 3600);
+    let mut resolver = resolver(config(None));
+    let reply = ask(
+        &mut resolver,
+        &mut net,
+        0,
+        query(client(1), "www.example.com.", RecordType::A, |_| {}),
+    );
+    assert_eq!(addresses(&reply), ["192.0.2.80"]);
+    assert!(net.recording().exchanges().len() < 10);
+}
+
+#[test]
+fn a_failure_the_work_bound_caused_is_not_cached_for_other_clients() {
+    // The bound is one question's. A lookup it cut short says nothing
+    // about the servers, so another client's question that fits the bound
+    // resolves.
+    for queries in 1..14u16 {
+        let (mut net, _) = internet(false);
+        let mut resolver = resolver(Config {
+            work: Work { queries, depth: 11 },
+            ..config(None)
+        });
+        ask(
+            &mut resolver,
+            &mut net,
+            0,
+            query(client(1), "away.example.com.", RecordType::A, |_| {}),
+        );
+        let failures: Vec<String> = resolver
+            .cache()
+            .entries(at(0))
+            .filter(|(_, entry)| {
+                matches!(
+                    entry,
+                    Entry::Failure {
+                        why: FailureKind::WorkExceeded,
+                        ..
+                    }
+                )
+            })
+            .map(|(key, _)| key.name.to_string())
+            .collect();
+        assert_eq!(failures, Vec::<String>::new(), "{queries} queries");
+    }
+    let (mut net, _) = internet(false);
+    let mut resolver = resolver(Config {
+        work: Work {
+            queries: 6,
+            depth: 11,
+        },
+        ..config(None)
+    });
+    let first = ask(
+        &mut resolver,
+        &mut net,
+        0,
+        query(client(1), "away.example.com.", RecordType::A, |_| {}),
+    );
+    assert_eq!(first.metadata.response_code, ResponseCode::ServFail);
+    let second = ask(
+        &mut resolver,
+        &mut net,
+        1,
+        query(client(2), "www.example.org.", RecordType::A, |_| {}),
+    );
+    assert_eq!(addresses(&second), ["192.0.2.90"]);
+}
+
+#[test]
+fn a_failed_lookup_keeps_the_glue_it_lays_over() {
+    // A failure is no data (RFC 9520 §3): the glue that says where the
+    // servers of `example.com` are outlives a failed lookup of their
+    // names, so the zone resolves again once they are back.
+    let (mut net, _) = internet(false);
+    let mut resolver = resolver(config(None));
+    let first = ask(
+        &mut resolver,
+        &mut net,
+        0,
+        query(client(1), "www.example.com.", RecordType::A, |_| {}),
+    );
+    assert_eq!(addresses(&first), ["192.0.2.80"]);
+    net.lose(|transmit| {
+        let to = transmit.to.ip();
+        to == ip(EXAMPLE) || to == ip(EXAMPLE_TOO)
+    });
+    let lost = ask(
+        &mut resolver,
+        &mut net,
+        10,
+        query(client(2), "ns1.example.com.", RecordType::A, |_| {}),
+    );
+    assert_eq!(lost.metadata.response_code, ResponseCode::ServFail);
+    net.lose(|_| false);
+    let after = ask(
+        &mut resolver,
+        &mut net,
+        60,
+        query(client(3), "x.y.example.com.", RecordType::A, |_| {}),
+    );
+    assert_eq!(addresses(&after), ["192.0.2.81"]);
+}
+
+#[test]
+fn an_unsigned_child_its_signed_parents_server_also_serves_is_insecure() {
+    // The server answers for the child itself, so no referral shows the
+    // cut. The parent's proof that the child has no DS makes the unsigned
+    // answer Insecure (RFC 4035 §5.2).
+    let root_keys = keys(10);
+    let com_keys = keys(20);
+    let example_keys = keys(40);
+    let root = delegation(
+        builder(".", "a.root-servers.net.").rrset(rrset(
+            "a.root-servers.net.",
+            3600,
+            vec![a(ROOT)],
+        )),
+        "com.",
+        "ns.nic.com.",
+        Some(COM),
+        Some(ds(&com_keys, "com.")),
+    )
+    .build()
+    .unwrap()
+    .signed(&root_keys, window(), Denial::Nsec)
+    .unwrap();
+    let com = delegation(
+        builder("com.", "ns.nic.com.").rrset(rrset("ns.nic.com.", 3600, vec![a(COM)])),
+        "example.com.",
+        "ns1.example.com.",
+        Some(EXAMPLE),
+        Some(ds(&example_keys, "example.com.")),
+    )
+    .build()
+    .unwrap()
+    .signed(&com_keys, window(), Denial::Nsec)
+    .unwrap();
+    let example = delegation(
+        builder("example.com.", "ns1.example.com.").rrset(rrset(
+            "ns1.example.com.",
+            3600,
+            vec![a(EXAMPLE)],
+        )),
+        "sub.example.com.",
+        "ns1.example.com.",
+        None,
+        None,
+    )
+    .build()
+    .unwrap()
+    .signed(&example_keys, window(), Denial::Nsec)
+    .unwrap();
+    let sub = builder("sub.example.com.", "ns1.example.com.")
+        .rrset(rrset("www.sub.example.com.", 300, vec![a("192.0.2.77")]))
+        .build()
+        .unwrap();
+    let mut net = MemoryNet::new();
+    serve_at(&mut net, ROOT, vec![root]);
+    serve_at(&mut net, COM, vec![com]);
+    serve_at(&mut net, EXAMPLE, vec![example, sub]);
+    let anchors = Anchors::of(vec![root_keys.anchor(&Name::root())]);
+    let mut resolver = resolver(config(Some(anchors)));
+    let reply = ask(
+        &mut resolver,
+        &mut net,
+        0,
+        query(client(1), "www.sub.example.com.", RecordType::A, dnssec_ok),
+    );
+    assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(addresses(&reply), ["192.0.2.77"]);
+    assert!(!reply.metadata.authentic_data);
+    let key = Key::new(
+        LowerName::new(&name("www.sub.example.com.")),
+        RecordType::A,
+        fictionet::stdlib::protocols::dns::rr::DNSClass::IN,
+    );
+    assert!(matches!(
+        resolver.cache().get(&key, at(0)),
+        Some(Entry::Positive {
+            validation: Validation::Insecure(_),
+            ..
+        })
+    ));
+}
+
+#[test]
+fn a_cname_that_runs_out_while_its_target_is_chased_is_fetched_again() {
+    // An answer never carries a record past its TTL: the chain is followed
+    // again from the question.
+    let root = Zone::from_master(
+        ". 86400 IN SOA a.root. h.root. 1 7200 3600 1209600 300\n\
+         . 518400 IN NS a.root.\n\
+         a.root. 518400 IN A 198.41.0.4\n\
+         alpha. 172800 IN NS ns1.alpha.\n\
+         ns1.alpha. 172800 IN A 192.0.2.1\n\
+         beta. 172800 IN NS ns1.beta.\n\
+         beta. 172800 IN NS ns2.beta.\n\
+         beta. 172800 IN NS ns3.beta.\n\
+         beta. 172800 IN NS ns4.beta.\n\
+         ns1.beta. 172800 IN A 192.0.2.11\n\
+         ns2.beta. 172800 IN A 192.0.2.12\n\
+         ns3.beta. 172800 IN A 192.0.2.13\n\
+         ns4.beta. 172800 IN A 192.0.2.14\n",
+        None,
+    )
+    .unwrap();
+    let alpha = Zone::from_master(
+        "alpha. 3600 IN SOA ns1.alpha. h.alpha. 1 7200 3600 1209600 300\n\
+         alpha. 3600 IN NS ns1.alpha.\n\
+         ns1.alpha. 3600 IN A 192.0.2.1\n\
+         alias.alpha. 1 IN CNAME www.beta.\n",
+        None,
+    )
+    .unwrap();
+    let beta = Zone::from_master(
+        "beta. 3600 IN SOA ns1.beta. h.beta. 1 7200 3600 1209600 300\n\
+         beta. 3600 IN NS ns1.beta.\n\
+         beta. 3600 IN NS ns2.beta.\n\
+         beta. 3600 IN NS ns3.beta.\n\
+         beta. 3600 IN NS ns4.beta.\n\
+         ns1.beta. 3600 IN A 192.0.2.11\n\
+         ns2.beta. 3600 IN A 192.0.2.12\n\
+         ns3.beta. 3600 IN A 192.0.2.13\n\
+         ns4.beta. 3600 IN A 192.0.2.14\n\
+         www.beta. 300 IN A 192.0.2.80\n",
+        None,
+    )
+    .unwrap();
+    let mut net = MemoryNet::new();
+    serve_at(&mut net, "198.41.0.4", vec![root]);
+    serve_at(&mut net, "192.0.2.1", vec![alpha]);
+    for address in ["192.0.2.11", "192.0.2.12", "192.0.2.13", "192.0.2.14"] {
+        serve_at(&mut net, address, vec![beta.clone()]);
+    }
+    // The first three queries to the beta servers are lost, so the target
+    // takes longer than the CNAME's one second.
+    let mut lost = 0;
+    net.lose(move |transmit| {
+        let beta = ["192.0.2.11", "192.0.2.12", "192.0.2.13", "192.0.2.14"]
+            .iter()
+            .any(|address| transmit.to.ip() == ip(address));
+        let lose = beta && lost < 3;
+        lost += usize::from(lose);
+        lose
+    });
+    let mut resolver = resolver(Config {
+        hints: vec![(name("a.root."), ip("198.41.0.4"))],
+        minimise: None,
+        ..config(None)
+    });
+    let reply = ask(
+        &mut resolver,
+        &mut net,
+        0,
+        query(client(1), "alias.alpha.", RecordType::A, |_| {}),
+    );
+    assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(addresses(&reply), ["192.0.2.80"]);
+    for record in &reply.answers {
+        assert!(record.ttl > 0, "{record} is past its TTL");
+    }
+    let cnames = asked(&net)
+        .iter()
+        .filter(|(server, qname, _, _)| *server == ip("192.0.2.1") && qname == "alias.alpha.")
+        .count();
+    assert_eq!(cnames, 2, "the CNAME is fetched again after it ran out");
 }

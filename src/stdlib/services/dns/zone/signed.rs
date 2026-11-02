@@ -491,6 +491,10 @@ impl View for SignedView {
                 .collect()
         })
     }
+
+    fn sign(&self, set: &RecordSet) -> Option<RecordSet> {
+        self.signing.sign(set).ok()
+    }
 }
 
 #[cfg(test)]
