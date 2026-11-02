@@ -9,7 +9,7 @@ where to send them.
 | Module | What it gives |
 |---|---|
 | `serve` | The `Service` trait and the driver that runs it over a connection (`connection`, `listen`), a `Harness` for tests, and `DatagramService` with its runner for a UDP socket (`datagram`) |
-| `net` | `Net`: the sandboxes' subnet, DNS, routing, one machine per address, and each `Host`'s services |
+| `net` | `Net`: the sandboxes' subnet, a resolver at the gateway, routing, one machine per address, and each `Host`'s services |
 | `httpd` | HTTP as a service: `Handler`, the `tower` adapter for axum, `VirtualHosts`, `Http1` |
 | `web` | `Sites`, a preset on `Net` for a world of websites |
 
@@ -477,14 +477,27 @@ cannot have, two services on one port, or a port that cannot be opened.
 Each host is prepared at all its addresses before any of it is published.
 A rejected host leaves no new machine, route, listener, task, TLS name or
 HTTP virtual host, and consumes no automatic address. Existing hosts keep
-serving unchanged. A rejected resolver result records `net.error` and its
-DNS lookup answers NXDOMAIN. Hosts already installed by `start` remain
-installed if a later host fails.
+serving unchanged. Hosts already installed by `start` remain installed if
+a later host fails. `NetHandle::add_host`, from `Net::handle`, places a
+host while the network runs by the same rules, and returns the error.
 
 Every sandbox that attaches joins `10.0.0.0/24` (and `2001:db8::/64`),
 gets its address by DHCP or by its first packet, and asks the gateway at
 `10.0.0.1` for names. It reaches every host and no other sandbox. An
 address with no host answers "host unreachable", and a closed port a RST.
+
+The gateway runs a recursive resolver like Unbound with no route to the
+internet (`net::dns::Recursive` over `resolver::Config::gateway()`). It
+answers the names hosts declare with their addresses, with RA set and
+Unbound's one-hour TTL for local data. Another name under a top-level
+domain a declared name uses gets NXDOMAIN with an SOA, and a name under
+any other top-level domain gets SERVFAIL with Extended DNS Error 22, No
+Reachable Authority. `Net::gateway` runs something else there: a resolver
+with root hints that iterates through authoritative servers on the
+world's hosts (`net::dns::Authoritative`), or any program and services.
+DNS programs run on any host with `Host::program`, their own questions go
+to a `net::dns::Source` (with `Only` for the world's policy), and a
+`net::dns::Namespace` starts a new session in all of them at once.
 
 DHCP checks the UDP length and checksum before reading a request. It drops
 lengths below eight bytes or beyond the IP payload, and incorrect nonzero
@@ -607,8 +620,9 @@ Net::new(Pools::NONE)
 
 `Net::route(name, prefix)` wires a trusted sandbox, such as a real
 container that plays one of the hosts, straight to the router at a fixed
-prefix. `Net::resolve` makes a host the first time a name is looked up,
-which is how `web::Sites` works.
+prefix. `net::dns::placing` is a root zone for the gateway's resolver that
+places a host the first time a name is looked up, which is how `web::Sites`
+works.
 
 Lab clients can use `sandbox::TlsClient` over a simulated connection. Its
 writes report plaintext taken only after the connection underneath has taken

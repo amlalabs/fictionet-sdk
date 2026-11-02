@@ -24,6 +24,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 
 use fictionet::Cx;
+use fictionet::stdlib::services::dns::WallClock;
+use fictionet::stdlib::services::dns::resolver::Config;
+use fictionet::stdlib::services::dns::zone::{Transparent, ZoneData};
 use fictionet::stdlib::services::tls::ServerConfig;
 use fictionet::stdlib::web;
 
@@ -49,6 +52,11 @@ pub fn net(
     // site whose certificate expired presents an expired one here too.
     let upstream = Arc::new(tls::Upstream::default());
     let site_for = move |host: &str| {
+        // The gateway asks about each name above a looked-up name first,
+        // top-level domains among them, which are never sites.
+        if !host.contains('.') {
+            return None;
+        }
         let name: crate::observation::HostName = host.parse().ok()?;
         let resolved = |address| {
             refused_pages.report(
@@ -154,21 +162,37 @@ pub fn net(
     let report_pages = pages;
     // Live-Depth's names come into being as pages bring links to them, and
     // a session can switch modes in the running world: a name refused
-    // before resolves once the mode in use serves it.
-    fictionet::stdlib::world::net::Net::new(fictionet_extras::network::cdn_pools())
+    // before resolves once the mode in use serves it, since the gateway
+    // asks `site_for` again about each name it turned down.
+    let net = fictionet::stdlib::world::net::Net::new(fictionet_extras::network::cdn_pools())
         .ipv4_only()
-        .drop_unrouted()
-        .resolve(site_for)
-        .resolve_misses_again()
-        .on_unreachable(move |unreachable| {
-            report_pages.report(
-                &report_cx,
-                crate::observation::SearchObs::NoRoute {
-                    from: unreachable.from,
-                    to: unreachable.to,
-                },
-            );
-        })
+        .drop_unrouted();
+    let sites: Arc<dyn ZoneData> = Arc::new(fictionet::stdlib::world::net::dns::placing(
+        net.handle(),
+        site_for,
+    ));
+    let clock = WallClock { start };
+    net.gateway(move |host, declared| {
+        // The declared names answer first, then `site_for` decides.
+        let config = Config {
+            ede: true,
+            ..Config::gateway()
+        }
+        .local(sites.clone())
+        .local(Arc::new(Transparent(declared)));
+        host.program(fictionet::stdlib::world::net::dns::Recursive::new(
+            config, clock,
+        ))
+    })
+    .on_unreachable(move |unreachable| {
+        report_pages.report(
+            &report_cx,
+            crate::observation::SearchObs::NoRoute {
+                from: unreachable.from,
+                to: unreachable.to,
+            },
+        );
+    })
 }
 
 /// Whether the internet's DNS gives `host` an address.

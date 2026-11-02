@@ -161,8 +161,9 @@
 //!   fault plans.
 //! - [`stdlib::world::net`]: a [`Net`](stdlib::world::net::Net) builds the
 //!   network around the [`Host`](stdlib::world::net::Host)s it is given: the
-//!   sandboxes' subnet with DHCP, DNS for every host's names, a router, one
-//!   machine per address, and each host's services on their ports.
+//!   sandboxes' subnet with DHCP, a resolver at the gateway that answers
+//!   every host's names, a router, one machine per address, and each host's
+//!   services on their ports.
 //!
 //! HTTP is a service too ([`stdlib::web::httpd`]): a router whose handlers get
 //! byte bodies, or any tower service such as an axum `Router`. Here a web
@@ -218,7 +219,8 @@
 //! data formats, listed in the [module table](stdlib#modules). Their message
 //! types parse and write bytes ([`Wire`](stdlib::codec::Wire)), and their
 //! decoders cut items out of input ([`Decode`](stdlib::codec::Decode)).
-//! HTTP has a ready server, [`stdlib::world::net::Net`] serves DNS and DHCP, and
+//! HTTP has a ready server, [`stdlib::world::net::Net`] serves DHCP and runs a
+//! DNS resolver ([`stdlib::services::dns`]), and
 //! TLS is built in. For other protocols, a world writes a
 //! [`Service`](stdlib::services::serve::Service) around the module's decoder.
 //! The codecs also work in unit tests and fuzz targets. The

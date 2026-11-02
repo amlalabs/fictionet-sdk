@@ -211,9 +211,9 @@ fn one_sandbox_flooding_everything_stays_bounded_and_others_are_served() {
             let start = rss();
             let mut report = Vec::new();
 
-            // 1. Names: 150,000 made up, past the 100,000 kept; 5,000 under
-            //    the wildcard, past the 1,000 sites this world allows.
-            for i in 0..155_000u32 {
+            // 1. Names: 150,000 made up, none of which is kept; 1,000 under
+            //    the wildcard, each of which gets a site.
+            for i in 0..151_000u32 {
                 let name = if i < 150_000 {
                     format!("n{i}.made-up.test")
                 } else {
@@ -335,11 +335,10 @@ fn one_sandbox_flooding_everything_stays_bounded_and_others_are_served() {
             }
             let grew = last.saturating_sub(start);
             eprintln!("in all: +{:.1} MiB", mib(grew));
-            // The names turned down cost about 35 MB at most. Sites are
-            // capped at 1,000 here, each with two machines (IPv4 and IPv6) of
-            // about 11 KiB, so about 22 MiB; the other 4,000 wildcard names
-            // get SERVFAIL. Fragments and sockets are capped too. Measured:
-            // names +31 MiB, fragments +7 MiB, connections +136 MiB.
+            // The names turned down are not kept. The 1,000 sites each have
+            // two machines (IPv4 and IPv6) of about 11 KiB, so about 22 MiB.
+            // Fragments and sockets are capped. Measured: names +25 MiB,
+            // fragments +6 MiB, connections +140 MiB.
             assert!(grew < 200 << 20, "the world grew by {:.1} MiB", mib(grew));
             Err::<(), fictionet::Error>(fictionet::Error::msg("done"))
         }));
