@@ -186,6 +186,7 @@ impl<V: Verify> Resolver<V> {
             any: config.any,
             transfer: false,
             ask_timeout: config.retransmit,
+            recursion_available: true,
         };
         let mut local = config.local.clone();
         if !config.ddr.is_empty() {
@@ -228,7 +229,7 @@ impl<V: Verify> Resolver<V> {
         let request = match Request::parse(&bytes, client.transport) {
             Parsed::Silent => return,
             Parsed::Reject(reject) => {
-                let bytes = self.render_reject(reject, client.transport);
+                let bytes = self.server.render_reject(reject, client.transport);
                 return self.send_answer(client, bytes, Validation::NotPerformed, false);
             }
             Parsed::Request(request) => request,
@@ -249,7 +250,10 @@ impl<V: Verify> Resolver<V> {
         let qtype = request.question.query_type();
         match request.question.query_class() {
             DNSClass::CH => {
-                let bytes = self.render_chaos(&request);
+                let bytes = self
+                    .server
+                    .render_chaos(&request)
+                    .expect("a resolver's server front has its identity");
                 return self.send_answer(client, bytes, Validation::NotPerformed, false);
             }
             DNSClass::IN if !matches!(qtype, RecordType::AXFR | RecordType::IXFR) => {}

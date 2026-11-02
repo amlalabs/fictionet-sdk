@@ -754,8 +754,8 @@ fn p_nxcut() {
 fn identity_answer(identity: &Identity, name: LowerName) -> (ResponseCode, Vec<String>) {
     match identity.chaos.get(&name) {
         Some(ChaosAnswer::Txt(text)) => (ResponseCode::NoError, vec![text.clone()]),
-        Some(ChaosAnswer::Rcode(rcode)) => (*rcode, Vec::new()),
-        None => (identity.unlisted, Vec::new()),
+        Some(ChaosAnswer::Reply(reply)) => (reply.rcode, Vec::new()),
+        None => (identity.unlisted.rcode, Vec::new()),
     }
 }
 

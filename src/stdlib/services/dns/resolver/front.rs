@@ -9,16 +9,14 @@ use std::time::Duration;
 
 use fictionet::stdlib::protocols::dns::dnssec::Validation;
 use fictionet::stdlib::protocols::dns::op::{Header, Message, ResponseCode};
-use fictionet::stdlib::protocols::dns::rr::rdata::TXT;
 use fictionet::stdlib::protocols::dns::rr::{
     DNSClass, LowerName, RData, Record, RecordSet, RecordType,
 };
 use fictionet::stdlib::protocols::dns::serialize::binary::{BinDecodable, BinDecoder};
-use fictionet::stdlib::protocols::dns::{Ede, EdeCode, Limit, Request, Response, fit};
-use fictionet::stdlib::services::serve::Transport;
+use fictionet::stdlib::protocols::dns::{Ede, EdeCode, Request, Response};
 use fictionet::time::Instant;
 
-use super::super::authority::{ChaosAnswer, bare_reply};
+use super::super::authority::bare_reply;
 use super::super::event::{Event, ReplyFlags};
 use super::super::exchange::Client;
 use super::super::records::rrsets;
@@ -50,80 +48,14 @@ impl<V: Verify> Resolver<V> {
     fn render_with(
         &self,
         request: &Request,
-        response: Response,
+        mut response: Response,
         authentic: bool,
         keep_aa: bool,
     ) -> Vec<u8> {
-        let aa = response.message.metadata.authoritative;
-        let mut response = self.server.front(request, response);
         let metadata = &mut response.message.metadata;
-        metadata.recursion_available = true;
-        metadata.authoritative = keep_aa && aa;
+        metadata.authoritative &= keep_aa;
         metadata.authentic_data = authentic;
-        let limit = Limit::for_request(request, self.config.payload);
-        match fit(&response, limit) {
-            Ok(fitted) => fitted.bytes,
-            Err(_) => {
-                let failed = bare_reply(request, ResponseCode::ServFail, None);
-                let mut failed = self.server.front(request, failed);
-                failed.message.metadata.recursion_available = true;
-                fit(&failed, limit)
-                    .expect("a reply with only a question and an OPT record writes")
-                    .bytes
-            }
-        }
-    }
-
-    /// The octets of a reply [`Request::parse`] rejected the query with,
-    /// carrying the resolver's payload in its OPT record.
-    pub(super) fn render_reject(&self, mut reject: Message, transport: Transport) -> Vec<u8> {
-        if let Some(edns) = &mut reject.edns {
-            edns.set_max_payload(self.config.payload.max(512));
-        }
-        reject.metadata.recursion_available = true;
-        let limit = match transport {
-            Transport::Tcp => Limit::Stream,
-            Transport::Udp => Limit::Udp512,
-        };
-        let response = Response {
-            message: reject,
-            required_additional: 0,
-        };
-        fit(&response, limit)
-            .expect("a rejection holds only a question and an OPT record")
-            .bytes
-    }
-
-    /// The reply to a CHAOS-class question, from the resolver's
-    /// [`identity`](super::Config::identity) alone: a name with text gets
-    /// it as one TXT record with the identity's TTL and AA set, for QTYPE
-    /// TXT or ANY, and an empty NOERROR for other types.
-    pub(super) fn render_chaos(&self, request: &Request) -> Vec<u8> {
-        let identity = &self.config.identity;
-        let qname = LowerName::new(request.question.name());
-        let text = match identity.chaos.get(&qname) {
-            None => {
-                let reply = bare_reply(request, identity.unlisted, None);
-                return self.render_response(request, reply);
-            }
-            Some(ChaosAnswer::Rcode(code)) => {
-                let reply = bare_reply(request, *code, None);
-                return self.render_response(request, reply);
-            }
-            Some(ChaosAnswer::Txt(text)) => text,
-        };
-        let mut response = bare_reply(request, ResponseCode::NoError, None);
-        response.message.metadata.authoritative = true;
-        if matches!(
-            request.question.query_type(),
-            RecordType::TXT | RecordType::ANY
-        ) {
-            let txt = RData::TXT(TXT::new(vec![text.clone()]));
-            let mut record = Record::from_rdata(request.question.name().clone(), identity.ttl, txt);
-            record.dns_class = DNSClass::CH;
-            response.message.answers.push(record);
-        }
-        self.render_with(request, response, false, true)
+        self.server.render(request, response)
     }
 
     /// The octets of a local zone's `response`, which keeps its AA bit only
