@@ -137,11 +137,13 @@ impl Subnet6 {
     }
 }
 
-/// A host's addresses. A name with a host has at least one.
+/// A placed host's addresses. A placed host has at least one.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(super) struct Placed {
-    pub(super) v4: Option<Ipv4Addr>,
-    pub(super) v6: Option<Ipv6Addr>,
+pub struct Placed {
+    /// Its IPv4 address, if it has one.
+    pub v4: Option<Ipv4Addr>,
+    /// Its IPv6 address, if it has one.
+    pub v6: Option<Ipv6Addr>,
 }
 
 pub(super) fn may_serve_v4(a: Ipv4Addr, subnet: &Subnet) -> bool {
