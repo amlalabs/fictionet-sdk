@@ -1,0 +1,647 @@
+//! What a resolver remembers between questions: RRsets, negative answers,
+//! and failures, each until its TTL runs out.
+
+use std::collections::BTreeMap;
+use std::time::Duration;
+
+use fictionet::stdlib::protocols::dns::EdeCode;
+use fictionet::stdlib::protocols::dns::dnssec::Validation;
+use fictionet::stdlib::protocols::dns::rr::rdata::SOA;
+use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, RData, RecordSet, RecordType};
+use fictionet::time::Instant;
+
+use super::super::exchange::Generation;
+
+/// What the cache holds an entry under: an owner name, a type, and a
+/// class. Names are lowercase, so the key ignores case.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Key {
+    /// The owner name.
+    pub name: LowerName,
+    /// The type.
+    pub rtype: RecordType,
+    /// The class.
+    pub class: DNSClass,
+}
+
+impl Key {
+    /// The key of `name`, `rtype`, and `class`.
+    pub fn new(name: LowerName, rtype: RecordType, class: DNSClass) -> Key {
+        Key { name, rtype, class }
+    }
+}
+
+/// How far cached data is trusted, lowest first (RFC 2181 §5.4.1).
+///
+/// Data replaces data for the same key only at equal or higher rank, so a
+/// referral's glue never overwrites what an authoritative server said.
+/// Data below [`Rank::NonAuthAnswer`] is used to find servers and is never
+/// an answer to a client.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Rank {
+    /// Addresses from the additional section, such as a referral's glue.
+    Glue,
+    /// The authority section of a reply without AA, such as a referral's
+    /// NS RRset.
+    NonAuthAuthority,
+    /// The answer section of a reply without AA, as a forwarder sends.
+    NonAuthAnswer,
+    /// The authority section of an authoritative reply.
+    AuthAuthority,
+    /// The answer section of an authoritative reply.
+    AuthAnswer,
+}
+
+/// Which negative answer a server gave.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Negative {
+    /// The name does not exist (RFC 2308 §2.1).
+    NxDomain,
+    /// The name exists without records of the type (RFC 2308 §2.2).
+    NoData,
+}
+
+/// Why a resolution failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FailureKind {
+    /// No server for the zone answered: each timed out or could not be
+    /// reached (RFC 8914 §4.23).
+    NoReachableAuthority,
+    /// Validation found the answer Bogus, with this Extended DNS Error.
+    /// The engine keeps bogus data as an RRset or negative with its
+    /// validation, so that clients that set CD still get it
+    /// (RFC 4035 §3.2.2); this kind is for code that caches the failure
+    /// alone.
+    Bogus(EdeCode),
+    /// The resolution sent all the queries [`Work`](super::Work) allows.
+    WorkExceeded,
+    /// Servers answered, but none with data for the question: each replied
+    /// SERVFAIL, REFUSED, or something that did not fit what it was asked.
+    Unknown,
+}
+
+impl FailureKind {
+    /// The Extended DNS Error a resolver sends with this failure
+    /// (RFC 8914 §4).
+    pub fn ede(self) -> EdeCode {
+        match self {
+            FailureKind::NoReachableAuthority | FailureKind::Unknown => {
+                EdeCode::NO_REACHABLE_AUTHORITY
+            }
+            FailureKind::Bogus(code) => code,
+            FailureKind::WorkExceeded => EdeCode::OTHER,
+        }
+    }
+}
+
+/// One cached entry.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Entry {
+    /// An RRset, with its RRSIGs.
+    Positive {
+        /// The RRset, owners in lowercase and every record at the RRset's
+        /// TTL.
+        set: RecordSet,
+        /// Where it came from.
+        rank: Rank,
+        /// When it stops being served.
+        expires: Instant,
+        /// What validation established about it. An RRset not yet checked
+        /// is [`Validation::NotPerformed`].
+        validation: Validation,
+        /// Records that support it: the NSEC or NSEC3 records that show a
+        /// wildcard answer had no closer match (RFC 4035 §5.3.4), or the
+        /// DNAME a CNAME was synthesized from (RFC 6672 §3.4).
+        proof: Vec<RecordSet>,
+    },
+    /// A negative answer.
+    Negative {
+        /// Which negative.
+        kind: Negative,
+        /// The zone's SOA RRset, at the negative TTL.
+        soa: RecordSet,
+        /// The NSEC or NSEC3 records that prove it, with their RRSIGs.
+        denial: Vec<RecordSet>,
+        /// When it stops being served.
+        expires: Instant,
+        /// What validation established about it.
+        validation: Validation,
+    },
+    /// A resolution that failed. It answers SERVFAIL until `until`, and
+    /// never as a negative (RFC 9520 §3).
+    Failure {
+        /// Why.
+        why: FailureKind,
+        /// When it stops being served.
+        until: Instant,
+    },
+}
+
+impl Entry {
+    /// When the entry stops being served.
+    pub fn expires(&self) -> Instant {
+        match self {
+            Entry::Positive { expires, .. } | Entry::Negative { expires, .. } => *expires,
+            Entry::Failure { until, .. } => *until,
+        }
+    }
+
+    /// The rank the entry holds its key at. A negative answer is an
+    /// authoritative answer; a failure ranks below all data, so it never
+    /// displaces live data.
+    pub fn rank(&self) -> Rank {
+        match self {
+            Entry::Positive { rank, .. } => *rank,
+            Entry::Negative { .. } => Rank::AuthAnswer,
+            Entry::Failure { .. } => Rank::Glue,
+        }
+    }
+}
+
+/// What a resolution offers the cache.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Offer {
+    /// An RRset.
+    Positive {
+        /// The RRset with its RRSIGs, as it arrived.
+        set: RecordSet,
+        /// Where it came from.
+        rank: Rank,
+        /// What validation established about it.
+        validation: Validation,
+        /// Records that support it, as in [`Entry::Positive`].
+        proof: Vec<RecordSet>,
+        /// Whether the reply had TC set.
+        truncated: bool,
+    },
+    /// A negative answer for `key`. NXDOMAIN applies to every type at the
+    /// name, so it is stored under type ANY whatever type was asked, and
+    /// found again through [`Cache::nxdomain_above`].
+    Negative {
+        /// What it answers.
+        key: Key,
+        /// Which negative.
+        kind: Negative,
+        /// The zone's SOA RRset from the authority section, if it had one.
+        soa: Option<RecordSet>,
+        /// The NSEC or NSEC3 records from the authority section.
+        denial: Vec<RecordSet>,
+        /// What validation established about it.
+        validation: Validation,
+        /// Whether the reply had TC set.
+        truncated: bool,
+    },
+    /// A failed resolution of `key`.
+    Failure {
+        /// What failed.
+        key: Key,
+        /// Why.
+        why: FailureKind,
+    },
+}
+
+/// The limits on what the cache keeps, from the resolver's
+/// [`Config`](super::Config).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    /// The longest any data is kept (RFC 8767 §4: at most 604800 seconds).
+    pub max_ttl: Duration,
+    /// The longest a negative answer is kept, below `max_ttl`.
+    pub max_negative_ttl: Duration,
+    /// How long a failure is kept (RFC 9520 §3.2: 1 to 300 seconds).
+    pub failure_ttl: Duration,
+    /// How long expired data is kept past its TTL for serving stale
+    /// (RFC 8767 §4), or zero to keep none.
+    pub stale: Duration,
+}
+
+/// The validated NSEC records of one zone.
+#[derive(Clone, Debug)]
+struct SecureNsec {
+    soa: RecordSet,
+    soa_expires: Instant,
+    sets: BTreeMap<LowerName, (RecordSet, Instant)>,
+}
+
+/// A stored entry and the generation that wrote it.
+#[derive(Clone, Debug)]
+struct Stored {
+    entry: Entry,
+    /// The data a failure replaced, while it may still be served stale.
+    stale: Option<Entry>,
+    generation: Generation,
+}
+
+/// A resolver's cache, by owner name, type, and class.
+///
+/// The rules of RFC 1035, RFC 2181, RFC 2308, RFC 4035, RFC 8767,
+/// RFC 9077, and RFC 9520, applied when data is offered:
+///
+/// - Data with TTL 0 is used for the answer it came in and not stored
+///   (RFC 1035 §7.4). A TTL with the top bit set reads as 0 (RFC 2181 §8).
+///   TTLs are capped at [`Limits::max_ttl`].
+/// - An RRset whose records have different TTLs takes the lowest
+///   (RFC 2181 §5.2), and duplicate records collapse to one (RFC 2181 §5).
+/// - Truncated replies are not stored (RFC 2181 §9), and neither are
+///   negative answers without an SOA (RFC 2308 §5).
+/// - A negative answer lives min(SOA TTL, MINIMUM) (RFC 2308 §5), and no
+///   longer than the NSEC or NSEC3 records that prove it (RFC 9077 §3).
+/// - A Secure RRset lives no longer than its RRSIGs (RFC 4035 §5.3.3).
+/// - A failure lives [`Limits::failure_ttl`] (RFC 9520 §3.2).
+/// - An entry replaces a live entry for its key only at equal or higher
+///   [`Rank`] (RFC 2181 §5.4.1).
+/// - Every entry records the generation that wrote it, and a new
+///   generation starts empty.
+#[derive(Clone, Debug)]
+pub struct Cache {
+    limits: Limits,
+    generation: Generation,
+    entries: BTreeMap<Key, Stored>,
+    /// Validated NSEC records by zone, for synthesizing negative answers
+    /// (RFC 8198).
+    nsec: BTreeMap<LowerName, SecureNsec>,
+    /// How many entries there were after the last sweep of dead ones.
+    swept: usize,
+}
+
+impl Cache {
+    /// An empty cache in generation 0.
+    pub fn new(limits: Limits) -> Cache {
+        Cache {
+            limits,
+            generation: Generation(0),
+            entries: BTreeMap::new(),
+            nsec: BTreeMap::new(),
+            swept: 0,
+        }
+    }
+
+    /// The generation the cache serves.
+    pub fn generation(&self) -> Generation {
+        self.generation
+    }
+
+    /// Starts `generation`: nothing of the old one is served again.
+    pub fn advance(&mut self, generation: Generation) {
+        self.generation = generation;
+        self.entries.clear();
+        self.nsec.clear();
+        self.swept = 0;
+    }
+
+    /// Offers `offer` at `now`, under the rules of [`Cache`].
+    pub fn insert(&mut self, now: Instant, offer: Offer) {
+        let Some((key, entry)) = self.entry_for(now, offer) else {
+            return;
+        };
+        if let Some(old) = self.live(&key, now)
+            && entry.rank() < old.rank()
+        {
+            return;
+        }
+        // A failure does not take away expired data that may still be
+        // served stale (RFC 8767 §4): it is kept beside the failure.
+        let stale = match (&entry, self.stale(&key, now)) {
+            (Entry::Failure { .. }, Some(data)) => Some(data.clone()),
+            _ => None,
+        };
+        self.entries.insert(
+            key,
+            Stored {
+                entry,
+                stale,
+                generation: self.generation,
+            },
+        );
+        if self.entries.len() >= 2 * self.swept.max(64) {
+            self.sweep(now);
+        }
+    }
+
+    /// The live entry for `key` at `now`, if any.
+    pub fn get(&self, key: &Key, now: Instant) -> Option<&Entry> {
+        self.live(key, now)
+    }
+
+    /// An entry for `key` that expired at most [`Limits::stale`] before
+    /// `now`, for serving stale (RFC 8767 §4). Failures are never stale
+    /// data.
+    pub fn stale(&self, key: &Key, now: Instant) -> Option<&Entry> {
+        let stored = self.entries.get(key)?;
+        if stored.generation != self.generation {
+            return None;
+        }
+        let entry = match &stored.entry {
+            Entry::Failure { .. } => stored.stale.as_ref()?,
+            entry => entry,
+        };
+        (now < entry.expires() + self.limits.stale).then_some(entry)
+    }
+
+    /// A live NXDOMAIN cached for `name` or a name above it, with the name
+    /// it is cached at: nothing exists below a name that does not exist
+    /// (RFC 8020 §2).
+    pub fn nxdomain_above(
+        &self,
+        name: &LowerName,
+        class: DNSClass,
+        now: Instant,
+    ) -> Option<(&LowerName, &Entry)> {
+        let mut at = name.clone();
+        loop {
+            let key = Key::new(at.clone(), RecordType::ANY, class);
+            if let Some(
+                entry @ Entry::Negative {
+                    kind: Negative::NxDomain,
+                    ..
+                },
+            ) = self.live(&key, now)
+            {
+                let (key, _) = self.entries.get_key_value(&key)?;
+                return Some((&key.name, entry));
+            }
+            if at.is_root() {
+                return None;
+            }
+            at = at.base_name();
+        }
+    }
+
+    /// Records what validation established about the live RRset at `key`.
+    /// A Secure RRset then lives no longer than `signatures_expire`, the
+    /// first expiration of the RRSIGs that proved it (RFC 4035 §5.3.3).
+    pub fn validated(
+        &mut self,
+        key: &Key,
+        result: Validation,
+        signatures_expire: Option<Instant>,
+        now: Instant,
+    ) {
+        let generation = self.generation;
+        let Some(stored) = self.entries.get_mut(key) else {
+            return;
+        };
+        if stored.generation != generation || now >= stored.entry.expires() {
+            return;
+        }
+        match &mut stored.entry {
+            Entry::Positive {
+                validation,
+                expires,
+                ..
+            }
+            | Entry::Negative {
+                validation,
+                expires,
+                ..
+            } => {
+                *validation = result;
+                if let (Validation::Secure, Some(cap)) = (result, signatures_expire) {
+                    *expires = (*expires).min(cap);
+                }
+            }
+            Entry::Failure { .. } => {}
+        }
+    }
+
+    /// Keeps `nsec`, NSEC RRsets that validated Secure with the zone's
+    /// `soa`, until their TTL runs out, so that names they cover are denied
+    /// without asking (RFC 8198 §5.1).
+    pub fn add_secure_nsec(&mut self, soa: &RecordSet, nsec: &[RecordSet], now: Instant) {
+        let zone = LowerName::new(soa.name());
+        let soa = normalized(soa);
+        let soa_expires = now + seconds(soa.ttl()).min(self.limits.max_negative_ttl);
+        let entry = self.nsec.entry(zone).or_insert_with(|| SecureNsec {
+            soa: soa.clone(),
+            soa_expires,
+            sets: BTreeMap::new(),
+        });
+        entry.soa = soa;
+        entry.soa_expires = soa_expires;
+        for set in nsec {
+            let set = normalized(set);
+            let expires = now + seconds(set.ttl()).min(self.limits.max_negative_ttl);
+            entry
+                .sets
+                .insert(LowerName::new(set.name()), (set, expires));
+        }
+    }
+
+    /// The deepest zone holding `name` with validated NSEC records live at
+    /// `now`: its apex, its SOA RRset with the TTL left, and those records
+    /// with theirs.
+    pub fn secure_nsec(
+        &self,
+        name: &LowerName,
+        now: Instant,
+    ) -> Option<(&LowerName, RecordSet, Vec<RecordSet>)> {
+        let mut at = name.clone();
+        loop {
+            if let Some((zone, entry)) = self.nsec.get_key_value(&at)
+                && now < entry.soa_expires
+            {
+                let left = |expires: Instant| {
+                    let secs = expires
+                        .since_start()
+                        .saturating_sub(now.since_start())
+                        .as_secs();
+                    u32::try_from(secs).unwrap_or(u32::MAX)
+                };
+                let sets: Vec<RecordSet> = entry
+                    .sets
+                    .values()
+                    .filter(|(_, expires)| now < *expires)
+                    .map(|(set, expires)| {
+                        let mut set = set.clone();
+                        set.set_ttl(left(*expires));
+                        set
+                    })
+                    .collect();
+                if !sets.is_empty() {
+                    let mut soa = entry.soa.clone();
+                    soa.set_ttl(left(entry.soa_expires));
+                    return Some((zone, soa, sets));
+                }
+            }
+            if at.is_root() {
+                return None;
+            }
+            at = at.base_name();
+        }
+    }
+
+    /// How long a negative answer with `soa` and `denial` lives:
+    /// min(SOA TTL, MINIMUM) (RFC 2308 §5), no longer than the denial
+    /// records (RFC 9077 §3), and within the limits.
+    pub fn negative_ttl(&self, soa: &RecordSet, denial: &[RecordSet]) -> Duration {
+        denial
+            .iter()
+            .map(|set| seconds(set.ttl()))
+            .fold(negative_ttl(soa), Duration::min)
+            .min(self.limits.max_ttl)
+            .min(self.limits.max_negative_ttl)
+    }
+
+    /// Every live entry at `now`, in key order.
+    pub fn entries(&self, now: Instant) -> impl Iterator<Item = (&Key, &Entry)> {
+        self.entries
+            .iter()
+            .filter(move |(_, stored)| {
+                stored.generation == self.generation && now < stored.entry.expires()
+            })
+            .map(|(key, stored)| (key, &stored.entry))
+    }
+
+    fn live(&self, key: &Key, now: Instant) -> Option<&Entry> {
+        self.entries
+            .get(key)
+            .filter(|stored| stored.generation == self.generation)
+            .map(|stored| &stored.entry)
+            .filter(|entry| now < entry.expires())
+    }
+
+    /// Drops entries past any use: expired, and past the stale window.
+    fn sweep(&mut self, now: Instant) {
+        let stale = self.limits.stale;
+        let generation = self.generation;
+        self.entries.retain(|_, stored| {
+            let last = stored
+                .stale
+                .as_ref()
+                .map_or(stored.entry.expires(), |data| {
+                    data.expires().max(stored.entry.expires())
+                });
+            stored.generation == generation && now < last + stale
+        });
+        self.swept = self.entries.len();
+    }
+
+    /// The entry an offer makes at `now`, or `None` when it may not be
+    /// stored.
+    fn entry_for(&self, now: Instant, offer: Offer) -> Option<(Key, Entry)> {
+        match offer {
+            Offer::Positive {
+                set,
+                rank,
+                validation,
+                proof,
+                truncated,
+            } => {
+                let set = normalized(&set);
+                let ttl = seconds(set.ttl()).min(self.limits.max_ttl);
+                if truncated || ttl.is_zero() {
+                    return None;
+                }
+                let key = Key::new(
+                    LowerName::new(set.name()),
+                    set.record_type(),
+                    set.dns_class(),
+                );
+                let entry = Entry::Positive {
+                    set,
+                    rank,
+                    expires: now + ttl,
+                    validation,
+                    proof,
+                };
+                Some((key, entry))
+            }
+            Offer::Negative {
+                key,
+                kind,
+                soa,
+                denial,
+                validation,
+                truncated,
+            } => {
+                let soa = normalized(&soa?);
+                let ttl = self.negative_ttl(&soa, &denial);
+                if truncated || ttl.is_zero() {
+                    return None;
+                }
+                let mut soa = soa;
+                soa.set_ttl(u32::try_from(ttl.as_secs()).unwrap_or(u32::MAX));
+                let denial = denial.iter().map(normalized).collect();
+                let key = match kind {
+                    Negative::NxDomain => Key::new(key.name, RecordType::ANY, key.class),
+                    Negative::NoData => key,
+                };
+                let entry = Entry::Negative {
+                    kind,
+                    soa,
+                    denial,
+                    expires: now + ttl,
+                    validation,
+                };
+                Some((key, entry))
+            }
+            Offer::Failure { key, why } => {
+                let until = now + self.limits.failure_ttl;
+                Some((key, Entry::Failure { why, until }))
+            }
+        }
+    }
+}
+
+/// A TTL as a duration. A TTL with the top bit set reads as 0
+/// (RFC 2181 §8).
+fn seconds(ttl: u32) -> Duration {
+    if ttl & 0x8000_0000 != 0 {
+        Duration::ZERO
+    } else {
+        Duration::from_secs(u64::from(ttl))
+    }
+}
+
+/// The negative TTL an SOA RRset gives: min(SOA TTL, MINIMUM)
+/// (RFC 2308 §5).
+fn negative_ttl(soa: &RecordSet) -> Duration {
+    let minimum = soa
+        .records_without_rrsigs()
+        .find_map(|record| match &record.data {
+            RData::SOA(soa) => Some(soa_minimum(soa)),
+            _ => None,
+        })
+        .unwrap_or(0);
+    seconds(soa.ttl()).min(seconds(minimum))
+}
+
+fn soa_minimum(soa: &SOA) -> u32 {
+    soa.minimum
+}
+
+/// `set` with its owner and every record's owner in lowercase, every
+/// record at the lowest TTL among them (RFC 2181 §5.2), duplicates
+/// collapsed (RFC 2181 §5), and its RRSIGs kept.
+pub(super) fn normalized(set: &RecordSet) -> RecordSet {
+    let owner = set.name().to_lowercase();
+    let ttl = set
+        .records_without_rrsigs()
+        .map(|record| record.ttl)
+        .chain(std::iter::once(set.ttl()))
+        .map(|ttl| if ttl & 0x8000_0000 != 0 { 0 } else { ttl })
+        .min()
+        .unwrap_or(0);
+    let mut out = RecordSet::with_ttl(owner.clone(), set.record_type(), ttl);
+    out.set_dns_class(set.dns_class());
+    let mut records = Vec::new();
+    for record in set.records_without_rrsigs() {
+        if records
+            .iter()
+            .all(|kept: &fictionet::stdlib::protocols::dns::rr::Record| kept.data != record.data)
+        {
+            let mut record = record.clone();
+            record.name = owner.clone();
+            record.ttl = ttl;
+            records.push(record);
+        }
+    }
+    out.set_records(records);
+    for rrsig in set.rrsigs() {
+        let mut rrsig = rrsig.clone();
+        rrsig.name = owner.clone();
+        rrsig.ttl = ttl;
+        out.insert_rrsig(rrsig);
+    }
+    out
+}
