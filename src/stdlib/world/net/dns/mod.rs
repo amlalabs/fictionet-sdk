@@ -56,7 +56,10 @@
 //! | [`Source`] | What a real client sees when it asks a server a question: a world's own answers, recorded exchanges, or the internet. |
 //! | [`Only`] | A source that asks only what the world's policy allows, and times out on the rest. |
 //! | [`Cached`] | A source that keeps replies for their smallest TTL. |
+//! | [`Question`] | What makes two queries one question for a source that answers from replies it holds. |
+//! | [`carry`] | Takes a query an engine sends to a source and gives back the engine's next input. |
 //! | [`Namespace`] | The session a world's DNS programs answer for; advancing it starts a new one everywhere. |
+//! | [`PerSession`] | State that belongs to one session and starts afresh in the next. |
 //! | [`placing`] | A root zone that places a host for a name the first time the name is asked. |
 //! | [`internet`] | The root, `gtld-servers.net`, and public resolver hosts, and a mirror of the real hierarchy. |
 //! | [`encrypted`] | DNS over TLS on port 853 and DNS over HTTPS on port 443 for a running [`Recursive`]. |

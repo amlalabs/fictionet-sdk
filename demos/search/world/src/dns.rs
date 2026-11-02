@@ -24,7 +24,7 @@ use fictionet::stdlib::protocols::dns::rr::rdata::A;
 use fictionet::stdlib::protocols::dns::rr::{
     LowerName, Name, RData, Record, RecordSet, RecordType,
 };
-use fictionet::stdlib::protocols::dns::{Parsed, Request};
+use fictionet::stdlib::protocols::dns::{Parsed, Request, Response};
 use fictionet::stdlib::services::dns::Client;
 use fictionet::stdlib::services::dns::authority::{Ask, Observed};
 use fictionet::stdlib::services::dns::zone::{
@@ -237,9 +237,9 @@ impl Outbound {
 
     /// The observer for [`Mirror::observe`](fictionet::stdlib::world::net::dns::internet::Mirror::observe):
     /// learns the NS and CNAME targets of each relayed reply.
-    pub fn observer(&self) -> impl Fn(&Request, &Client, &Message) + Send + Sync + 'static {
+    pub fn observer(&self) -> impl Fn(&Request, &Client, &Response) + Send + Sync + 'static {
         let outbound = self.clone();
-        move |_request, _client, reply| outbound.learn(reply)
+        move |_request, _client, reply| outbound.learn(&reply.message)
     }
 
     /// Whether the session lets `name` out by rule 1: the names it gives

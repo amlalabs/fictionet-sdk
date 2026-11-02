@@ -456,83 +456,105 @@ impl Config {
     }
 }
 
+/// A name server and its two addresses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NameServer {
+    /// Its name, fully qualified, as the zone that names it writes it.
+    pub host: &'static str,
+    /// Its IPv4 address.
+    pub v4: Ipv4Addr,
+    /// Its IPv6 address.
+    pub v6: Ipv6Addr,
+}
+
+impl NameServer {
+    /// Its name.
+    pub fn name(&self) -> Name {
+        name(self.host)
+    }
+
+    /// Both of its addresses, IPv4 first.
+    pub fn addresses(&self) -> [IpAddr; 2] {
+        [IpAddr::V4(self.v4), IpAddr::V6(self.v6)]
+    }
+}
+
 /// The root servers in IANA's `named.root`, "last update: October 28,
-/// 2026", both addresses of each letter. These are the hints Unbound and
-/// every other resolver build in (RFC 8109).
+/// 2026", in letter order, with both addresses of each letter.
+pub const ROOT_SERVERS: [NameServer; 13] = [
+    NameServer {
+        host: "a.root-servers.net.",
+        v4: Ipv4Addr::new(198, 41, 0, 4),
+        v6: Ipv6Addr::new(0x2001, 0x503, 0xba3e, 0, 0, 0, 0x2, 0x30),
+    },
+    NameServer {
+        host: "b.root-servers.net.",
+        v4: Ipv4Addr::new(170, 247, 170, 2),
+        v6: Ipv6Addr::new(0x2801, 0x1b8, 0x10, 0, 0, 0, 0, 0xb),
+    },
+    NameServer {
+        host: "c.root-servers.net.",
+        v4: Ipv4Addr::new(192, 33, 4, 12),
+        v6: Ipv6Addr::new(0x2001, 0x500, 0x2, 0, 0, 0, 0, 0xc),
+    },
+    NameServer {
+        host: "d.root-servers.net.",
+        v4: Ipv4Addr::new(199, 7, 91, 13),
+        v6: Ipv6Addr::new(0x2001, 0x500, 0x2d, 0, 0, 0, 0, 0xd),
+    },
+    NameServer {
+        host: "e.root-servers.net.",
+        v4: Ipv4Addr::new(192, 203, 230, 10),
+        v6: Ipv6Addr::new(0x2001, 0x500, 0xa8, 0, 0, 0, 0, 0xe),
+    },
+    NameServer {
+        host: "f.root-servers.net.",
+        v4: Ipv4Addr::new(192, 5, 5, 241),
+        v6: Ipv6Addr::new(0x2001, 0x500, 0x2f, 0, 0, 0, 0, 0xf),
+    },
+    NameServer {
+        host: "g.root-servers.net.",
+        v4: Ipv4Addr::new(192, 112, 36, 4),
+        v6: Ipv6Addr::new(0x2001, 0x500, 0x12, 0, 0, 0, 0, 0xd0d),
+    },
+    NameServer {
+        host: "h.root-servers.net.",
+        v4: Ipv4Addr::new(198, 97, 190, 53),
+        v6: Ipv6Addr::new(0x2001, 0x500, 0x1, 0, 0, 0, 0, 0x53),
+    },
+    NameServer {
+        host: "i.root-servers.net.",
+        v4: Ipv4Addr::new(192, 36, 148, 17),
+        v6: Ipv6Addr::new(0x2001, 0x7fe, 0, 0, 0, 0, 0, 0x53),
+    },
+    NameServer {
+        host: "j.root-servers.net.",
+        v4: Ipv4Addr::new(192, 58, 128, 30),
+        v6: Ipv6Addr::new(0x2001, 0x503, 0xc27, 0, 0, 0, 0x2, 0x30),
+    },
+    NameServer {
+        host: "k.root-servers.net.",
+        v4: Ipv4Addr::new(193, 0, 14, 129),
+        v6: Ipv6Addr::new(0x2001, 0x7fd, 0, 0, 0, 0, 0, 0x1),
+    },
+    NameServer {
+        host: "l.root-servers.net.",
+        v4: Ipv4Addr::new(199, 7, 83, 42),
+        v6: Ipv6Addr::new(0x2001, 0x500, 0x9f, 0, 0, 0, 0, 0x42),
+    },
+    NameServer {
+        host: "m.root-servers.net.",
+        v4: Ipv4Addr::new(202, 12, 27, 33),
+        v6: Ipv6Addr::new(0x2001, 0xdc3, 0, 0, 0, 0, 0, 0x35),
+    },
+];
+
+/// [`ROOT_SERVERS`] as resolver hints, both addresses of each letter: the
+/// hints Unbound and every other resolver build in (RFC 8109).
 pub fn root_hints() -> Vec<(Name, IpAddr)> {
-    const ROOTS: [(&str, Ipv4Addr, Ipv6Addr); 13] = [
-        (
-            "a",
-            Ipv4Addr::new(198, 41, 0, 4),
-            Ipv6Addr::new(0x2001, 0x503, 0xba3e, 0, 0, 0, 0x2, 0x30),
-        ),
-        (
-            "b",
-            Ipv4Addr::new(170, 247, 170, 2),
-            Ipv6Addr::new(0x2801, 0x1b8, 0x10, 0, 0, 0, 0, 0xb),
-        ),
-        (
-            "c",
-            Ipv4Addr::new(192, 33, 4, 12),
-            Ipv6Addr::new(0x2001, 0x500, 0x2, 0, 0, 0, 0, 0xc),
-        ),
-        (
-            "d",
-            Ipv4Addr::new(199, 7, 91, 13),
-            Ipv6Addr::new(0x2001, 0x500, 0x2d, 0, 0, 0, 0, 0xd),
-        ),
-        (
-            "e",
-            Ipv4Addr::new(192, 203, 230, 10),
-            Ipv6Addr::new(0x2001, 0x500, 0xa8, 0, 0, 0, 0, 0xe),
-        ),
-        (
-            "f",
-            Ipv4Addr::new(192, 5, 5, 241),
-            Ipv6Addr::new(0x2001, 0x500, 0x2f, 0, 0, 0, 0, 0xf),
-        ),
-        (
-            "g",
-            Ipv4Addr::new(192, 112, 36, 4),
-            Ipv6Addr::new(0x2001, 0x500, 0x12, 0, 0, 0, 0, 0xd0d),
-        ),
-        (
-            "h",
-            Ipv4Addr::new(198, 97, 190, 53),
-            Ipv6Addr::new(0x2001, 0x500, 0x1, 0, 0, 0, 0, 0x53),
-        ),
-        (
-            "i",
-            Ipv4Addr::new(192, 36, 148, 17),
-            Ipv6Addr::new(0x2001, 0x7fe, 0, 0, 0, 0, 0, 0x53),
-        ),
-        (
-            "j",
-            Ipv4Addr::new(192, 58, 128, 30),
-            Ipv6Addr::new(0x2001, 0x503, 0xc27, 0, 0, 0, 0x2, 0x30),
-        ),
-        (
-            "k",
-            Ipv4Addr::new(193, 0, 14, 129),
-            Ipv6Addr::new(0x2001, 0x7fd, 0, 0, 0, 0, 0, 0x1),
-        ),
-        (
-            "l",
-            Ipv4Addr::new(199, 7, 83, 42),
-            Ipv6Addr::new(0x2001, 0x500, 0x9f, 0, 0, 0, 0, 0x42),
-        ),
-        (
-            "m",
-            Ipv4Addr::new(202, 12, 27, 33),
-            Ipv6Addr::new(0x2001, 0xdc3, 0, 0, 0, 0, 0, 0x35),
-        ),
-    ];
-    ROOTS
+    ROOT_SERVERS
         .iter()
-        .flat_map(|(letter, v4, v6)| {
-            let server = name(&format!("{letter}.root-servers.net."));
-            [(server.clone(), IpAddr::V4(*v4)), (server, IpAddr::V6(*v6))]
-        })
+        .flat_map(|server| server.addresses().map(|address| (server.name(), address)))
         .collect()
 }
 

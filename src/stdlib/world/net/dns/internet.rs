@@ -51,10 +51,10 @@ use fictionet::stdlib::protocols::dns::rr::rdata::TXT;
 use fictionet::stdlib::protocols::dns::rr::{
     DNSClass, LowerName, Name, RData, Record, RecordSet, RecordType,
 };
-use fictionet::stdlib::protocols::dns::{Ede, EdeCode, Nsid, Request};
+use fictionet::stdlib::protocols::dns::{Ede, EdeCode, Nsid, Request, Response};
 use fictionet::stdlib::services::dns::authority::{
-    Ask, Authority, ChaosAnswer, ChaosReply, Identity, Known, Observed, Relay, ServerConfig, Step,
-    chaos,
+    Ask, Authority, ChaosAnswer, ChaosReply, Identity, Known, Observe, Observed, Relay,
+    ServerConfig, Step, chaos,
 };
 use fictionet::stdlib::services::dns::resolver::Config;
 use fictionet::stdlib::services::dns::zone::{AnyResponse, Zone, ZoneError, special};
@@ -63,7 +63,7 @@ use fictionet::stdlib::services::serve::Transport;
 use fictionet::sync::Mutex;
 use fictionet::time::Instant;
 
-pub use fictionet::stdlib::services::dns::resolver::root_hints;
+pub use fictionet::stdlib::services::dns::resolver::{NameServer, ROOT_SERVERS, root_hints};
 
 use super::super::{Host, NetHandle, Program};
 use super::{Authoritative, Namespace, PerSession, Recursive, Source};
@@ -71,37 +71,14 @@ use super::{Authoritative, Namespace, PerSession, Recursive, Source};
 // ---------------------------------------------------------------------------
 // Servers and their addresses
 
-/// A name server and its two addresses.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct NameServer {
-    /// Its name, fully qualified, as the zone that names it writes it.
-    pub host: &'static str,
-    /// Its IPv4 address.
-    pub v4: Ipv4Addr,
-    /// Its IPv6 address.
-    pub v6: Ipv6Addr,
-}
-
-impl NameServer {
-    /// Its name.
-    pub fn name(&self) -> Name {
-        name(self.host)
-    }
-
-    /// Both of its addresses, IPv4 first.
-    pub fn addresses(&self) -> [IpAddr; 2] {
-        [IpAddr::V4(self.v4), IpAddr::V6(self.v6)]
-    }
-
-    /// A host at both addresses running `program`, with a round trip from
-    /// the network `rtt` longer.
-    fn host(&self, program: impl Program, rtt: Duration) -> Host {
-        Host::new(self.host.trim_end_matches('.'))
-            .at(self.v4)
-            .at(self.v6)
-            .delay(rtt / 2)
-            .program(program)
-    }
+/// A host at both of `server`'s addresses running `program`, with a round
+/// trip from the network `rtt` longer.
+fn server_host(server: &NameServer, program: impl Program, rtt: Duration) -> Host {
+    Host::new(server.host.trim_end_matches('.'))
+        .at(server.v4)
+        .at(server.v6)
+        .delay(rtt / 2)
+        .program(program)
 }
 
 /// One of the thirteen root server letters, with what its operator's
@@ -118,133 +95,42 @@ pub struct Letter {
     pub any: AnyResponse,
 }
 
-const fn letter(
-    host: &'static str,
-    v4: Ipv4Addr,
-    v6: Ipv6Addr,
-    operator: &'static str,
-    payload: u16,
-    any: AnyResponse,
-) -> Letter {
+/// The root letter `index` of [`ROOT_SERVERS`], with what its operator's
+/// software does.
+const fn letter(index: usize, operator: &'static str, payload: u16, any: AnyResponse) -> Letter {
     Letter {
-        server: NameServer { host, v4, v6 },
+        server: ROOT_SERVERS[index],
         operator,
         payload,
         any,
     }
 }
 
-/// The root servers, in letter order. Addresses from IANA's `named.root`,
-/// "last update: October 28, 2026"; operators from root-servers.org. The
-/// payload sizes and ANY answers were seen at each letter on 2026-11-01:
-/// b, j, and k answer `. ANY` with the NS RRset alone, h and l with the
-/// SOA alone, and the others with every RRset. [`root_hints`] gives the
-/// same addresses as resolver hints.
+/// The root servers, in letter order, at the addresses of
+/// [`ROOT_SERVERS`]; operators from root-servers.org. The payload sizes
+/// and ANY answers were seen at each letter on 2026-11-01: b, j, and k
+/// answer `. ANY` with the NS RRset alone, h and l with the SOA alone, and
+/// the others with every RRset. [`root_hints`] gives the same addresses
+/// as resolver hints.
 pub const ROOT_LETTERS: [Letter; 13] = [
+    letter(0, "Verisign", 4096, AnyResponse::All),
+    letter(1, "USC-ISI", 1232, AnyResponse::OneRrset(RecordType::NS)),
+    letter(2, "Cogent", 1232, AnyResponse::All),
+    letter(3, "University of Maryland", 1450, AnyResponse::All),
+    letter(4, "NASA Ames", 1472, AnyResponse::All),
+    letter(5, "ISC", 1472, AnyResponse::All),
+    letter(6, "US DoD (DISA)", 1232, AnyResponse::All),
     letter(
-        "a.root-servers.net.",
-        Ipv4Addr::new(198, 41, 0, 4),
-        Ipv6Addr::new(0x2001, 0x503, 0xba3e, 0, 0, 0, 0x2, 0x30),
-        "Verisign",
-        4096,
-        AnyResponse::All,
-    ),
-    letter(
-        "b.root-servers.net.",
-        Ipv4Addr::new(170, 247, 170, 2),
-        Ipv6Addr::new(0x2801, 0x1b8, 0x10, 0, 0, 0, 0, 0xb),
-        "USC-ISI",
-        1232,
-        AnyResponse::OneRrset(RecordType::NS),
-    ),
-    letter(
-        "c.root-servers.net.",
-        Ipv4Addr::new(192, 33, 4, 12),
-        Ipv6Addr::new(0x2001, 0x500, 0x2, 0, 0, 0, 0, 0xc),
-        "Cogent",
-        1232,
-        AnyResponse::All,
-    ),
-    letter(
-        "d.root-servers.net.",
-        Ipv4Addr::new(199, 7, 91, 13),
-        Ipv6Addr::new(0x2001, 0x500, 0x2d, 0, 0, 0, 0, 0xd),
-        "University of Maryland",
-        1450,
-        AnyResponse::All,
-    ),
-    letter(
-        "e.root-servers.net.",
-        Ipv4Addr::new(192, 203, 230, 10),
-        Ipv6Addr::new(0x2001, 0x500, 0xa8, 0, 0, 0, 0, 0xe),
-        "NASA Ames",
-        1472,
-        AnyResponse::All,
-    ),
-    letter(
-        "f.root-servers.net.",
-        Ipv4Addr::new(192, 5, 5, 241),
-        Ipv6Addr::new(0x2001, 0x500, 0x2f, 0, 0, 0, 0, 0xf),
-        "ISC",
-        1472,
-        AnyResponse::All,
-    ),
-    letter(
-        "g.root-servers.net.",
-        Ipv4Addr::new(192, 112, 36, 4),
-        Ipv6Addr::new(0x2001, 0x500, 0x12, 0, 0, 0, 0, 0xd0d),
-        "US DoD (DISA)",
-        1232,
-        AnyResponse::All,
-    ),
-    letter(
-        "h.root-servers.net.",
-        Ipv4Addr::new(198, 97, 190, 53),
-        Ipv6Addr::new(0x2001, 0x500, 0x1, 0, 0, 0, 0, 0x53),
+        7,
         "US Army (ARL)",
         1232,
         AnyResponse::OneRrset(RecordType::SOA),
     ),
-    letter(
-        "i.root-servers.net.",
-        Ipv4Addr::new(192, 36, 148, 17),
-        Ipv6Addr::new(0x2001, 0x7fe, 0, 0, 0, 0, 0, 0x53),
-        "Netnod",
-        1232,
-        AnyResponse::All,
-    ),
-    letter(
-        "j.root-servers.net.",
-        Ipv4Addr::new(192, 58, 128, 30),
-        Ipv6Addr::new(0x2001, 0x503, 0xc27, 0, 0, 0, 0x2, 0x30),
-        "Verisign",
-        1472,
-        AnyResponse::OneRrset(RecordType::NS),
-    ),
-    letter(
-        "k.root-servers.net.",
-        Ipv4Addr::new(193, 0, 14, 129),
-        Ipv6Addr::new(0x2001, 0x7fd, 0, 0, 0, 0, 0, 0x1),
-        "RIPE NCC",
-        1232,
-        AnyResponse::OneRrset(RecordType::NS),
-    ),
-    letter(
-        "l.root-servers.net.",
-        Ipv4Addr::new(199, 7, 83, 42),
-        Ipv6Addr::new(0x2001, 0x500, 0x9f, 0, 0, 0, 0, 0x42),
-        "ICANN",
-        4096,
-        AnyResponse::OneRrset(RecordType::SOA),
-    ),
-    letter(
-        "m.root-servers.net.",
-        Ipv4Addr::new(202, 12, 27, 33),
-        Ipv6Addr::new(0x2001, 0xdc3, 0, 0, 0, 0, 0, 0x35),
-        "WIDE",
-        1232,
-        AnyResponse::All,
-    ),
+    letter(8, "Netnod", 1232, AnyResponse::All),
+    letter(9, "Verisign", 1472, AnyResponse::OneRrset(RecordType::NS)),
+    letter(10, "RIPE NCC", 1232, AnyResponse::OneRrset(RecordType::NS)),
+    letter(11, "ICANN", 4096, AnyResponse::OneRrset(RecordType::SOA)),
+    letter(12, "WIDE", 1232, AnyResponse::All),
 ];
 
 /// `<letter>.ns.arpa.` on the root letter `index` of [`ROOT_LETTERS`].
@@ -312,42 +198,6 @@ pub const IN_ADDR_SERVERS: [NameServer; 6] = [
         "f.in-addr-servers.arpa.",
         Ipv4Addr::new(193, 0, 9, 1),
         Ipv6Addr::new(0x2a13, 0x27c0, 0x30, 0, 0, 0, 0, 0x1),
-    ),
-];
-
-/// The servers of `ip6.arpa`, the reverse names of IPv6 addresses, under
-/// `ip6-servers.arpa` (RFC 5855). Addresses from the glue of the `arpa`
-/// zone, asked of a.ns.arpa on 2026-11-01.
-pub const IP6_SERVERS: [NameServer; 6] = [
-    server(
-        "a.ip6-servers.arpa.",
-        Ipv4Addr::new(199, 180, 182, 53),
-        Ipv6Addr::new(0x2620, 0x37, 0xe000, 0, 0, 0, 0, 0x53),
-    ),
-    server(
-        "b.ip6-servers.arpa.",
-        Ipv4Addr::new(199, 253, 182, 182),
-        Ipv6Addr::new(0x2001, 0x500, 0x86, 0, 0, 0, 0, 0x86),
-    ),
-    server(
-        "c.ip6-servers.arpa.",
-        Ipv4Addr::new(196, 216, 169, 11),
-        Ipv6Addr::new(0x2001, 0x43f8, 0x110, 0, 0, 0, 0, 0x11),
-    ),
-    server(
-        "d.ip6-servers.arpa.",
-        Ipv4Addr::new(200, 7, 86, 53),
-        Ipv6Addr::new(0x2001, 0x13c7, 0x7012, 0, 0, 0, 0, 0x53),
-    ),
-    server(
-        "e.ip6-servers.arpa.",
-        Ipv4Addr::new(203, 119, 86, 101),
-        Ipv6Addr::new(0x2001, 0xdd8, 0x6, 0, 0, 0, 0, 0x101),
-    ),
-    server(
-        "f.ip6-servers.arpa.",
-        Ipv4Addr::new(193, 0, 9, 2),
-        Ipv6Addr::new(0x2a13, 0x27c0, 0x30, 0, 0, 0, 0, 0x2),
     ),
 ];
 
@@ -1334,7 +1184,7 @@ pub fn root_servers<P: Program>(program: impl Fn(ServerConfig) -> P, at: &Locati
                 any: letter.any,
                 ..ServerConfig::root(site.identity)
             };
-            letter.server.host(program(server), site.rtt)
+            server_host(&letter.server, program(server), site.rtt)
         })
         .collect()
 }
@@ -1347,7 +1197,11 @@ pub fn gtld_servers<P: Program>(program: impl Fn(ServerConfig) -> P, at: &Locati
         .iter()
         .map(|server| {
             let site = at.site(IpAddr::V4(server.v4));
-            server.host(program(ServerConfig::gtld(site.identity)), site.rtt)
+            server_host(
+                &server,
+                program(ServerConfig::gtld(site.identity)),
+                site.rtt,
+            )
         })
         .collect()
 }
@@ -1395,8 +1249,8 @@ pub fn root_zone(text: &str) -> Result<Zone, ZoneError> {
 // ---------------------------------------------------------------------------
 // Mirror
 
-/// A callback that sees each relayed reply.
-type Observer = dyn Fn(&Request, &Client, &Message) + Send + Sync;
+/// A callback that sees each reply a relay gives.
+type Observer = dyn Fn(&Request, &Client, &Response) + Send + Sync;
 
 /// What a world puts around each relay's authority.
 type Wrap = dyn Fn(Arc<dyn Authority>) -> Arc<dyn Authority> + Send + Sync;
@@ -1538,11 +1392,13 @@ impl Mirror {
         self.with(|inner| inner.namespace = Some(namespace.clone()))
     }
 
-    /// Calls `f` with each relayed reply, before it leaves and after the
-    /// relays it names are placed. Observers run in the order given.
+    /// Calls `f` with each reply a relay gives, before it leaves and after
+    /// the relays it names are placed, through an [`Observe`] around the
+    /// relay's authority, and around its [`wrap`](Mirror::wrap) when it
+    /// has one. Observers run in the order given.
     pub fn observe(
         self,
-        f: impl Fn(&Request, &Client, &Message) + Send + Sync + 'static,
+        f: impl Fn(&Request, &Client, &Response) + Send + Sync + 'static,
     ) -> Mirror {
         self.with(|inner| inner.observers.push(Arc::new(f)))
     }
@@ -1580,10 +1436,18 @@ impl Mirror {
 impl Inner {
     fn relay(self: &Arc<Self>, server: ServerConfig) -> Authoritative<Arc<dyn Authority>> {
         let mirrored: Arc<dyn Authority> = Arc::new(Mirrored(self.clone()));
-        let authority = match &self.wrap {
+        let mut authority = match &self.wrap {
             Some(wrap) => wrap(mirrored),
             None => mirrored,
         };
+        if !self.observers.is_empty() {
+            let observers = self.observers.clone();
+            authority = Arc::new(Observe::new(authority, move |req, client, response| {
+                for observer in &observers {
+                    observer(req, client, response);
+                }
+            }));
+        }
         let program = Authoritative::new(authority, server).source(self.source.clone());
         match &self.namespace {
             Some(namespace) => program.namespace(namespace),
@@ -1708,8 +1572,7 @@ fn only_at(label: &str, addr: IpAddr) -> Host {
     }
 }
 
-/// A [`Relay`] whose replies place the relays they name, then go to the
-/// mirror's observers.
+/// A [`Relay`] whose replies place the relays they name.
 struct Mirrored(Arc<Inner>);
 
 impl Authority for Mirrored {
@@ -1735,9 +1598,6 @@ impl Authority for Mirrored {
             _ => bytes,
         };
         self.0.place(req, &message);
-        for observer in &self.0.observers {
-            observer(req, client, &message);
-        }
         Step::Verbatim(bytes)
     }
 }
