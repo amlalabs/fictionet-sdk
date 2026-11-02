@@ -122,7 +122,7 @@ impl Anchors {
         self.0
             .iter()
             .filter(|anchor| !anchor.ds.is_empty() && anchor.owner.zone_of(name))
-            .filter(|anchor| !strictly_above || anchor.owner.num_labels() < name.num_labels())
+            .filter(|anchor| !strictly_above || anchor.owner != *name)
             .max_by_key(|anchor| anchor.owner.num_labels())
     }
 }

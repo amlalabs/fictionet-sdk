@@ -248,7 +248,9 @@ fn deeper_signer(sets: &[RecordSet], zone: &Name, name: &Name, ds: bool) -> bool
 /// Whether the zone at `apex` holds `name`, strictly below the apex when
 /// `ds`, since a DS RRset belongs to the parent side of its cut.
 fn holds(apex: &Name, name: &Name, ds: bool) -> bool {
-    apex.zone_of(name) && (!ds || apex.num_labels() < name.num_labels())
+    // A name's label count leaves out a leading `*`, so a wildcard owner
+    // is told from its parent by the names, not by their counts.
+    apex.zone_of(name) && (!ds || apex != name)
 }
 
 /// Why one RRSIG failed, from least to most telling, so the most telling

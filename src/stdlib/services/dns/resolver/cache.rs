@@ -169,8 +169,8 @@ pub enum Offer {
         truncated: bool,
     },
     /// A negative answer for `key`. NXDOMAIN applies to every type at the
-    /// name, so it is stored under type ANY whatever type was asked, and
-    /// found again through [`Cache::nxdomain_above`].
+    /// name, so it is stored under type ANY, found again through
+    /// [`Cache::nxdomain_above`], and under the type asked as well.
     Negative {
         /// What it answers.
         key: Key,
@@ -252,7 +252,8 @@ struct Stored {
 ///   [`Rank`] (RFC 2181 §5.4.1). A failure laid over glue keeps the glue
 ///   beneath it, for finding servers. Data or NODATA at a name ends a
 ///   live NXDOMAIN at that name or above it at no higher rank, since the
-///   name exists after all (RFC 8020 §2).
+///   name exists after all (RFC 8020 §2). An NXDOMAIN replaces the entry
+///   of the type it answered.
 /// - Every entry records the generation that wrote it, and a new
 ///   generation starts empty.
 #[derive(Clone, Debug)]
@@ -294,6 +295,16 @@ impl Cache {
 
     /// Offers `offer` at `now`, under the rules of [`Cache`].
     pub fn insert(&mut self, now: Instant, offer: Offer) {
+        // An NXDOMAIN is kept under type ANY, for every type at the name,
+        // and under the type it answered, whose entry it replaces.
+        let asked = match &offer {
+            Offer::Negative {
+                key,
+                kind: Negative::NxDomain,
+                ..
+            } if key.rtype != RecordType::ANY => Some(key.clone()),
+            _ => None,
+        };
         let Some((key, entry)) = self.entry_for(now, offer) else {
             return;
         };
@@ -321,6 +332,15 @@ impl Cache {
                 }
         ) {
             self.exists(&key, entry.rank(), now);
+        }
+        if let Some(asked) = asked {
+            let stored = Stored {
+                entry: entry.clone(),
+                under: None,
+                at: now,
+                generation: self.generation,
+            };
+            self.entries.insert(asked, stored);
         }
         self.entries.insert(
             key,

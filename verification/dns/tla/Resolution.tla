@@ -174,6 +174,11 @@ Closest(n) == CHOOSE z \in known : AtOrBelow(n, z)
 NewRes(q) == [qn |-> q, zone |-> Closest(q), tried |-> {}, out |-> None,
               work |-> 0, chain |-> 0, recs |-> {}]
 
+\* The work and chain counters count every query and restart, with or
+\* without the bounds kept, and stop one past their bound, which is enough
+\* to see a resolution go past it and keeps the state space finite.
+Min(a, b) == IF a < b THEN a ELSE b
+
 \* What an answer to a client records about each entry it used.
 Used(n, e) == [n |-> n, t |-> e.t, val |-> e.val, ttl |-> e.ttl, readAt |-> e.readAt,
                rank |-> e.rank, failure |-> e.failure]
@@ -271,7 +276,7 @@ Advance(q) ==
                   /\ UNCHANGED <<cache, net>>
              ELSE /\ res' = [res EXCEPT ![q] = [qn |-> e.val, zone |-> Closest(e.val), tried |-> {},
                                               out |-> None, work |-> r.work,
-                                              chain |-> IF BoundWork THEN r.chain + 1 ELSE 0,
+                                              chain |-> Min(r.chain + 1, MaxChain + 1),
                                               recs |-> r.recs \cup {Used(r.qn, e)}]]
                   /\ UNCHANGED <<cache, waiting, ans, net>>
        \/ /\ ~Usable(e)
@@ -282,7 +287,7 @@ Advance(q) ==
              ELSE \E s \in ServersOf(r.zone) :
                     /\ <<s, FALSE>> \notin r.tried
                     /\ res' = [res EXCEPT ![q].out = <<s, FALSE>>,
-                                          ![q].work = IF BoundWork THEN @ + 1 ELSE 0]
+                                          ![q].work = Min(@ + 1, MaxWork + 1)]
                     /\ net' = net \cup {Msg("q", q, r.qn, s, FALSE, FALSE, None)}
                     /\ UNCHANGED <<cache, waiting, ans>>
     /\ UNCHANGED <<now, ver, editAt, known, asked, lost, tcs>>
@@ -329,7 +334,7 @@ ReceiveOne(m) ==
                  THEN /\ res' = [res EXCEPT ![q].out = None, ![q].tried = tried]
                       /\ net' = net \ {m}
                  ELSE /\ res' = [res EXCEPT ![q].out = <<m.srv, TRUE>>, ![q].tried = tried,
-                                            ![q].work = IF BoundWork THEN @ + 1 ELSE 0]
+                                            ![q].work = Min(@ + 1, MaxWork + 1)]
                       /\ net' = (net \ {m}) \cup {Msg("q", q, r.qn, m.srv, TRUE, FALSE, None)}
               /\ UNCHANGED known
          [] b.kind = "refused" ->

@@ -25,13 +25,13 @@ cargo xtask dns-verify all
 |---|---|
 | `cargo xtask dns-verify tlc [spec] [config]` | TLC once per property of each config, or of one spec's configs (`Resolution`), or of one config (`Resolution_base` or `base`) |
 | `cargo xtask dns-verify lean` | `lake build`, then the axioms of every headline theorem |
-| `cargo xtask dns-verify vectors [seed]` | `lake exe gen` into the vectors directory, from `seed` (1 when left out) |
-| `cargo xtask dns-verify diff [seed]` | the vectors, then `cargo test --test dns_vectors` against them |
+| `cargo xtask dns-verify vectors [seed]` | `lake exe gen` into the vectors directory, from `seed`, or from each of seeds 1 to 8 when left out |
+| `cargo xtask dns-verify diff [seed]` | the vectors, then `cargo test --test dns_vectors` against them, for each seed |
 | `cargo xtask dns-verify all` | all of the above, with a summary |
 
 Everything goes under `dns-verify/` in Cargo's target directory
 (`CARGO_TARGET_DIR`, or `target/`): `tlc/` holds each TLC run's config and
-output, `lean/` the output of `lake`, `vectors/` the vectors, `diff.out` the
+output, `lean/` the output of `lake`, `vectors/<seed>/` the vectors of each seed, `diff-<seed>.out` the
 differential test's output, and `SUMMARY.txt` the summary of `all`. The
 vectors are made again on every run and never committed; the same seed
 always gives the same files.
@@ -50,7 +50,7 @@ The differential test is declared with `test = false`, so a plain
 `DNS_VECTORS`:
 
 ```sh
-DNS_VECTORS=target/dns-verify/vectors cargo test --test dns_vectors -- --nocapture
+DNS_VECTORS=target/dns-verify/vectors/1 cargo test --test dns_vectors -- --nocapture
 ```
 
 ## What the differential test compares
@@ -64,7 +64,7 @@ not compare whole, with why.
 | `names` | `LowerName`, `Name` | canonical order (RFC 4034 §6.1), equality ignoring case, folding, wire length |
 | `wire` | hickory's decoder and encoder | whether the message decodes; header, questions, and every record; the uncompressed encoding |
 | `restore` | `protocols::dns::restore` | the restored octets, or the error |
-| `respond` | `Request::parse` | silence, the rejection's RCODE, header bits, and OPT version, or the request's flags, question, and EDNS |
+| `respond` | `Request::parse` and the server front (`ServerConfig::front`) | silence, the rejection's RCODE, header bits, and OPT version, or the request's flags, question, and EDNS, and the header and OPT of an authoritative answer to it |
 | `fit` | `protocols::dns::fit` | the size, TC, and the RRsets kept in each section |
 | `zone` | `zone::answer` over `Zone::from_master` | RCODE, AA, every section, and the required additional RRsets |
 | `partial` | `zone::answer` over a view with unknown facts | the unknown name, or the response |
@@ -72,7 +72,7 @@ not compare whole, with why.
 | `policy` | `AlgorithmPolicy` | the treatment of a DS record's algorithm and digest type |
 | `chain` | `check_chain` | the problems reported, as a set |
 | `cache` | `resolver::Cache` | what each lookup serves, with TTLs counted down |
-| `resolver` | `Resolver` driven by `memory::drive` over `AuthorityEngine`s of the zones | each answer, the final cache, and the answers after scripted losses |
+| `resolver` | `Resolver` driven by `memory::drive` over `AuthorityEngine`s of the zones | each answer, the answers under the work bound with nothing lost, the final cache, and the answers with some servers dead |
 
 Signatures in `signed.json` and `chain.json` are symbolic (Lean's
 `Dnssec.Symbolic.scheme`): a key is a number, and a signature is the private
@@ -89,16 +89,21 @@ names.
 
 `resolver` compares what the Lean resolver and the Rust one share. The Lean
 model has no priming, no retransmission, and no failure cache, so a loss
-script does not line up query for query. The test therefore checks three
-things. With nothing lost and work to spare, every Rust answer is the
-hierarchy's answer (Lean's `Resolver.spec`, computed from `zone::answer`
-over the zones), and equals every Lean answer that is not SERVFAIL, which
-`resolve_correct` says is the hierarchy's answer too. Every NS RRset, glue
-RRset, and answer RRset in Lean's final cache is in the Rust cache at the
-same rank or higher. With the vector's losses applied to Rust's queries in
-order, every answer is the hierarchy's answer or SERVFAIL. AA and the
-additional section are left out of answers: a resolver clears AA and, like
-Unbound with `minimal-responses: yes`, sends no additional data.
+script does not line up query for query. Every server has an address of its
+own. The test checks four things. With work to spare, every Rust answer is
+the hierarchy's answer (Lean's `Resolver.spec`, computed from
+`zone::answer` over the zones), and equals every Lean answer that is not
+SERVFAIL, which `resolve_correct` says is the hierarchy's answer too. With
+nothing lost, under the vector's work bound, the Rust resolver, primed
+first since Lean starts from the hints, gives every Lean answer, SERVFAILs
+included. Every NS RRset, glue RRset, and answer RRset in Lean's final
+cache is in the Rust cache at the same rank or higher. With the vector's
+`dead` servers never answering and work to spare, the Rust answers equal
+Lean's `dead_answers`, SERVFAILs included: Lean drops a server at its first
+loss and Rust after three tries (RFC 9520 §3.1), so both answer exactly
+when every zone on the way has a server left. AA and the additional section
+are left out of answers: a resolver clears AA and, like Unbound with
+`minimal-responses: yes`, sends no additional data.
 
 ## Where the Lean model and Rust differ
 

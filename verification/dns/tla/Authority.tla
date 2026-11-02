@@ -117,9 +117,9 @@ VARIABLES
     real,      \* the real servers' data version
     realSeen,  \* real versions that have existed
     gen,       \* the engine's generation
-    st,        \* [Reqs -> "new" | "reading" | "parked" | "done"]
+    st,        \* [Reqs -> "new" | "reading" | "overlay" | "parked" | "done"]
     known,     \* [Reqs -> None or [obs, v]]: the request's Known
-    partial,   \* [Reqs -> None or facts read so far]: only with MixedRevision
+    partial,   \* [Reqs -> None or facts read so far under the lazy zone's lock]
     reply,     \* [Reqs -> None or the reply sent]
     nAsks,     \* [Reqs -> asks sent for the request in this generation]
     atSource,  \* asks the source is working on: [token, ask]
@@ -211,30 +211,43 @@ ReadRest(r) ==
     /\ st' = [st EXCEPT ![r] = "done"]
     /\ UNCHANGED <<world, real, realSeen, gen, known, nAsks, atSource, obsq, reached>>
 
-(* The engine calls respond. A Need parks the request under a token and   *)
-(* sends its ask through the policy: a refused ask comes back as Timeout   *)
-(* without reaching the source.                                           *)
-Step(r) ==
+(* The engine calls respond. An overlay first reads the edited zone's apex *)
+(* NS RRset and the address of its target under one view of the lazy      *)
+(* zone, holding the zone's lock while it reads. The engine runs one       *)
+(* respond at a time, so nothing else moves until the step below ends it.  *)
+ReadOverlay(r) ==
     /\ st[r] = "new"
+    /\ ~FromView(r)
+    /\ Crosses(r)
+    /\ LET fa == Fact(Apex)
+           fn == Fact(NsTarget)
+       IN  /\ partial' = [partial EXCEPT ![r] = {<<Apex, fa>>, <<NsTarget, fn>>}]
+           /\ Grow(IF fn = "present" THEN {NsTarget} ELSE {})
+    /\ st' = [st EXCEPT ![r] = "overlay"]
+    /\ UNCHANGED <<world, real, realSeen, gen, known, reply, nAsks, atSource, obsq, reached>>
+
+(* A Need parks the request under a token and sends its ask through the    *)
+(* policy: a refused ask comes back as Timeout without reaching the        *)
+(* source. An overlay lets go of what it read from the lazy zone first.    *)
+Step(r) ==
+    /\ \/ st[r] = "new" /\ ~Crosses(r)
+       \/ st[r] = "overlay"
     /\ ~FromView(r)
     /\ LET a == AskOf(r)
            tok == <<gen, r.id>>
-           \* An overlay first reads the edited zone's apex NS RRset and the
-           \* addresses of its target, under one view of the lazy zone.
-           fa == Fact(Apex)
-           fn == Fact(NsTarget)
-           read == IF Crosses(r) THEN {<<Apex, fa>>, <<NsTarget, fn>>} ELSE {}
-           unknown == Crosses(r) /\ "unknown" \in {Read(fa), Read(fn)}
-       IN  /\ IF Crosses(r) THEN Grow(IF fn = "present" THEN {NsTarget} ELSE {})
-              ELSE UNCHANGED <<ins, history, rev>>
+           read == IF Crosses(r) THEN partial[r] ELSE {}
+           unknown == \E f \in read : Read(f[2]) = "unknown"
+           released == [partial EXCEPT ![r] = None]
+       IN  /\ UNCHANGED <<ins, history, rev>>
            /\ CASE unknown ->
                   /\ reply' = [reply EXCEPT ![r] = Reply("SERVFAIL", None, read, None)]
                   /\ st' = [st EXCEPT ![r] = "done"]
-                  /\ UNCHANGED <<nAsks, atSource, obsq, reached, partial>>
+                  /\ partial' = released
+                  /\ UNCHANGED <<nAsks, atSource, obsq, reached>>
                 [] Respond(r, known[r]) = "need" ->
                   /\ st' = [st EXCEPT ![r] = "parked"]
                   /\ nAsks' = [nAsks EXCEPT ![r] = @ + 1]
-                  /\ partial' = IF ParkInView /\ Crosses(r) THEN [partial EXCEPT ![r] = read] ELSE partial
+                  /\ partial' = IF ParkInView THEN partial ELSE released
                   /\ IF PolicyPasses(a)
                      THEN /\ atSource' = atSource \cup {[token |-> tok, ask |-> a]}
                           /\ reached' = reached \cup {a}
@@ -245,11 +258,13 @@ Step(r) ==
                 [] Respond(r, known[r]) = "reply" ->
                   /\ reply' = [reply EXCEPT ![r] = Reply("NOERROR", known[r].val, read, known[r].v)]
                   /\ st' = [st EXCEPT ![r] = "done"]
-                  /\ UNCHANGED <<nAsks, atSource, obsq, reached, partial>>
+                  /\ partial' = released
+                  /\ UNCHANGED <<nAsks, atSource, obsq, reached>>
                 [] Respond(r, known[r]) = "silent" ->
                   /\ reply' = [reply EXCEPT ![r] = Reply("SILENT", None, {}, None)]
                   /\ st' = [st EXCEPT ![r] = "done"]
-                  /\ UNCHANGED <<nAsks, atSource, obsq, reached, partial>>
+                  /\ partial' = released
+                  /\ UNCHANGED <<nAsks, atSource, obsq, reached>>
     /\ UNCHANGED <<world, real, realSeen, gen, known>>
 
 (* The source finishes an ask: the real server's reply as it is now, or a  *)
@@ -304,23 +319,30 @@ Advance ==
 Source == \E x \in atSource : SourceOne(x)
 Observe == \E o \in obsq : ObserveOne(o)
 
+\* No respond is half done: no overlay has read the lazy zone and not yet
+\* stepped. `A` runs only then.
+Quiet(A) == (\A r \in Reqs : st[r] # "overlay") /\ A
+
 Next ==
-    \/ \E r \in Reqs : View(r)
-    \/ \E r \in Reqs : ReadName(r)
-    \/ \E r \in Reqs : ReadRest(r)
+    \/ \E r \in Reqs : Quiet(View(r))
+    \/ \E r \in Reqs : Quiet(ReadName(r))
+    \/ \E r \in Reqs : Quiet(ReadRest(r))
+    \/ \E r \in Reqs : Quiet(ReadOverlay(r))
     \/ \E r \in Reqs : Step(r)
-    \/ Source
-    \/ Observe
-    \/ WorldChange
-    \/ RealChange
-    \/ Advance
+    \/ Quiet(Source)
+    \/ Quiet(Observe)
+    \/ Quiet(WorldChange)
+    \/ Quiet(RealChange)
+    \/ Quiet(Advance)
 
 (* The engine works and the source answers eventually; its delay is any   *)
 (* number of steps. The world, the real data, and sessions change freely.  *)
 Fairness ==
-    /\ \A r \in Reqs : WF_vars(View(r)) /\ WF_vars(ReadName(r)) /\ WF_vars(ReadRest(r)) /\ WF_vars(Step(r))
-    /\ WF_vars(Source)
-    /\ WF_vars(Observe)
+    /\ \A r \in Reqs : /\ WF_vars(Quiet(View(r))) /\ WF_vars(Quiet(ReadName(r)))
+                       /\ WF_vars(Quiet(ReadRest(r))) /\ WF_vars(Quiet(ReadOverlay(r)))
+                       /\ WF_vars(Step(r))
+    /\ WF_vars(Quiet(Source))
+    /\ WF_vars(Quiet(Observe))
 
 Spec == Init /\ [][Next]_vars
 FairSpec == Spec /\ Fairness

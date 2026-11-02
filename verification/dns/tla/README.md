@@ -12,7 +12,7 @@ proof of the rule and the counterexample that shows why it is there.
 | `Resolution.tla` | The resolver against zones `.`, `tld`, `sld.tld`, and `alt.tld`, each with one good and one lame server; an address, a CNAME, an empty non-terminal, a missing name, a glued nameserver, a CNAME loop across two zones, and a wildcard; a rogue server adding a record outside its bailiwick; two clients; a network that loses and truncates; one world edit; TTLs of 1 and 2 | `services/dns/resolver/{mod,cache,resolution,front}.rs` |
 | `Exchanges.tla` | The step contract of `Engine`: tokens with a generation and an exchange identity, matching on the token and the tuple, duplicate, late, and spoofed replies, `Gone`, `Advance`, one resolution shared by two clients | `services/dns/exchange.rs` (`Token`, `Generation`, `Input`, `Action`, `Engine`), kept by `AuthorityEngine` and `Resolver` |
 | `Authority.tla` | `AuthorityEngine` at a root, a TLD, and an edited zone's address: `Relay` through an `Only` policy and a source that delays and fails, `Overlay` reading the edited zone's apex NS RRset and its target's addresses and then asking for its DS, `Lazy` over a `Provider` whose facts are present, absent, or unknown and change as the world runs | `services/dns/authority/{mod,engine,relay,overlay}.rs`, `services/dns/zone/{data,lazy}.rs`, `world/net/dns/source.rs` |
-| `Validation.tla` | The validator on a path root, tld, sld, with the data free per config (signer, parent proof, window, algorithm, changes after signing), clock skew, unreachable zones, the AD/CD rendering, `check_chain`, and two validators fed the same records from different providers and signers | `protocols/dns/dnssec/{validate,policy,proof}.rs`, `services/dns/zone/chain.rs`, `services/dns/resolver/front.rs` |
+| `Validation.tla` | The validator on a path root, tld, sld, with the data free per config (signer, parent proof, window, algorithm, changes after signing), clock skew, unreachable zones, the AD/CD rendering, `check_chain`, and two validators with providers, signers, and records of their own | `protocols/dns/dnssec/{validate,policy,proof}.rs`, `services/dns/zone/chain.rs`, `services/dns/resolver/front.rs` |
 
 ## Properties
 
@@ -51,7 +51,7 @@ proof of the rule and the counterexample that shows why it is there.
 | | `BogusServfails` | invariant | Bogus with CD=0 is SERVFAIL |
 | | `CdPassesData` | invariant | with CD=1 the data reaches the client whatever the validation found |
 | | `Sha1Insecure` | invariant | under the default policy a zone whose DS names algorithm 5 or 7 below a validated chain is Insecure, never Secure (RFC 9905 section 2) |
-| | `RecordsOnly` | invariant | two validators fed equal records from different providers and signers reach the same result |
+| | `RecordsOnly` | invariant | two validators, each with its own provider, signer, and records, reach the same result whenever their records are equal |
 | | `CheckChainAgrees` | invariant | a tree `check_chain` passes validates Secure or Insecure everywhere |
 | | `RelayedUneditedSecure`, `EditedUnderRealAnchorBogus`, `InventedUnderOptOutInsecure`, `InventedTldUnderNsecBogus`, `WorldRootAllSecure`, `UnsignedWithIanaAnchorBogus`, `NoAnchorsNotPerformed` | reachability | each scenario happens; its `Never...` form must fail |
 
@@ -93,9 +93,10 @@ actions, never by a `CONSTRAINT`, so the liveness checks are sound:
 * **Resolution:** the clock by `MaxTime` 4; `MaxWork` 4 upstream queries
   and `MaxChain` 3 CNAME restarts per resolution (`MaxWork` 6 in `_loop`
   and `_nobound`; see the modelling choices); one loss, one truncation, one
-  edit; each client asks a fixed script, one question at a time. In
-  `_nobound` the work and chain counters are not tracked at all, so the
-  loop repeats a state and TLC reports the liveness violation as a lasso.
+  edit; each client asks a fixed script, one question at a time. The work
+  and chain counters count with or without the bounds and stop one past
+  them, so in `_nobound` `WorkBounded` fails, and the loop repeats a state
+  and TLC reports the liveness violation as a lasso.
 * **Exchanges:** the clock by `MaxTime` 3, exchange identities by
   `MaxExchanges` 4, generations by `MaxGeneration` 2 (1 in `_base` and
   `_cancel`); one duplicate, one spoofed reply, one `Gone`.
@@ -127,7 +128,8 @@ in `_concurrent` explores twice the states of the invariants there.
 | Resolution_edit | the 9 invariants, `ReferralsDescend` | pass | 330272 | 44 | 1-2 s | |
 | Resolution_edit | `EveryQueryAnswered` | pass | 330272 | 44 | 11 s | |
 | Resolution_nobailiwick | `NoPoison` | violated | 312 | 11 | 1 s | Ask, Advance, Serve, Receive (root's referral), Advance, Serve, Receive (tld's referral), Advance, Serve, Receive: alt.tld's answer for x.w.alt.tld carries www.sld.tld, which is cached |
-| Resolution_nobound | `EveryQueryAnswered` | violated | 15623 | lasso of 27 | 1 s | Tick, Tick, Tick, Ask, Advance, Tick, Serve, Truncate, Receive (TCP retry), Serve, Receive, ... down to sld.tld and over to alt.tld, then Advance, Advance back to state 26: the chain follows loop.sld.tld and loop.alt.tld from the cache forever |
+| Resolution_nobound | `WorkBounded` | violated | 5465 | 21 | 0 s | the loop's CNAME chase restarts past `MaxChain` |
+| Resolution_nobound | `EveryQueryAnswered` | violated | 31258 | lasso | 2 s | down to sld.tld and over to alt.tld, then round a lasso: the chain follows loop.sld.tld and loop.alt.tld from the cache forever, its counter stopped one past `MaxChain` |
 | Resolution_cachetc | `TcNotCached` | violated | 33 | 6 | 1 s | Ask, Advance, Serve, Truncate, Receive |
 | Resolution_noexpiry | `TtlSound` | violated | 2337 | 17 | 1 s | Ask cn.sld.tld; Advance, Serve, Receive three times down to sld.tld; Advance follows the CNAME; Advance, Serve, Receive for www.sld.tld; Tick, Advance: the answer carries the CNAME after its one-second TTL ran out |
 | Resolution_failureasnegative | `FailureNeverNegative` | violated | 173 | 9 | 0 s | Ask, Advance, Lose, Timeout, Advance, Serve, Receive, Advance: the query to one root server is lost and times out, the other refuses, and the cached failure answers NXDOMAIN |
@@ -140,21 +142,21 @@ in `_concurrent` explores twice the states of the invariants there.
 | Exchanges_idonly | `MatchRequiresTuple` | violated | 64 | 5 | 1 s | Query, Send, Spoof, Deliver |
 | Exchanges_flushonly | `ObsoleteNeverPopulates` | violated | 282 | 6 | 0 s | Query, Send, Serve, Advance, Deliver |
 | Exchanges_cancelshared | `CancelPreservesWaiters` | violated | 13 | 4 | 1 s | Query, Query, Gone |
-| Authority_base | the 7 invariants, `EveryParkedAnswered` | pass | 1528 | 15 | 0-1 s | |
-| Authority_fail | the 7 invariants, `EveryParkedAnswered` | pass | 5272 | 15 | 0-1 s | |
-| Authority_lazy | the 7 invariants, `EveryParkedAnswered` | pass | 404 | 10 | 0-1 s | |
-| Authority_advance | the 7 invariants, `EveryParkedAnswered` | pass | 21522 | 16 | 0-1 s | |
+| Authority_base | the 7 invariants, `EveryParkedAnswered` | pass | 2072 | 17 | 0-1 s | |
+| Authority_fail | the 7 invariants, `EveryParkedAnswered` | pass | 7096 | 17 | 0-1 s | |
+| Authority_lazy | the 7 invariants, `EveryParkedAnswered` | pass | 544 | 12 | 0-1 s | |
+| Authority_advance | the 7 invariants, `EveryParkedAnswered` | pass | 29372 | 19 | 0-1 s | |
 | Authority_nopolicy | `PolicyHolds` | violated | 4 | 2 | 0 s | Step: the root server relays leak.evil to the source |
 | Authority_rootexempt | `PolicyHolds` | violated | 4 | 2 | 1 s | Step: the same ask, exempt because it goes to a root server |
 | Authority_unknownasabsent | `UnknownNeverNegative` | violated | 2 | 2 | 0 s | View: b.fict is unknown and the wildcard absent, so NXDOMAIN |
-| Authority_mixedrevision | `CoherentRevision` | violated | 46 | 4 | 1 s | ReadName (a.fict absent), WorldChange, ReadRest (the wildcard present): a wildcard answer no revision gives |
-| Authority_reask | `RespondMonotone` | violated | 21 | 3 | 0 s | Step (the policy refuses leak.evil, a timeout), Observe: the request knows its observation and needs again |
-| Authority_parkinview | `NoLockAcrossAsk` | violated | 2 | 2 | 0 s | Step: the overlay parks on its DS ask while it holds its read of the lazy zone |
+| Authority_mixedrevision | `CoherentRevision` | violated | 43 | 4 | 1 s | ReadName (a.fict absent), WorldChange, ReadRest (the wildcard present): a wildcard answer no revision gives |
+| Authority_reask | `RespondMonotone` | violated | 17 | 3 | 0 s | Step (the policy refuses leak.evil, a timeout), Observe: the request knows its observation and needs again |
+| Authority_parkinview | `NoLockAcrossAsk` | violated | 6 | 3 | 0 s | ReadOverlay, Step: the overlay reads the lazy zone, then parks on its DS ask while it still holds that read |
 | Validation_paths | the 10 invariants | pass | 1119744 | 1 | 1-3 s | |
 | Validation_skew | the 10 invariants | pass | 10368 | 1 | 0-1 s | |
 | Validation_unreachable | the 10 invariants | pass | 18432 | 1 | 0-1 s | |
 | Validation_policy | the 10 invariants | pass | 3456 | 1 | 0-1 s | |
-| Validation_providers | the 10 invariants | pass | 73728 | 1 | 0-1 s | |
+| Validation_providers | the 10 invariants | pass | 589824 | 1 | 1-2 s | |
 | Validation_witnesses | each of the 7 `Never...` forms, alone | violated (reachable) | 1 | 1 | 0-1 s | an initial state of each scenario |
 | Validation_trustupstreamad | `AdOnlySecure` | violated | 1 | 1 | 0 s | no anchors configured (NotPerformed), the upstream reply has AD, the client gets AD |
 | Validation_nopolicy | `Sha1Insecure` | violated | 1 | 1 | 1 s | a chain of key A where sld's DS names algorithm 5: Secure |
@@ -268,9 +270,12 @@ Authority:
   only the ID and the question's case.
 * `Advance` restarts parked requests with nothing known; observations for
   old tokens are ignored when they arrive.
-* `NoLockAcrossAsk` holds because a view never waits and the overlay reads
-  the lazy zone before it asks. `_parkinview`, where the overlay sends its
-  DS ask while it holds its read, breaks it.
+* `NoLockAcrossAsk` holds because a view never waits and the overlay lets
+  go of what it read from the lazy zone before it asks. The overlay's read
+  is a step of its own (`ReadOverlay`), after which nothing but that
+  request's `Step` runs, as one call of `respond` would, so the read is
+  held in reachable states of every config. `_parkinview`, where the
+  overlay sends its DS ask while it holds its read, breaks it.
 
 Validation:
 

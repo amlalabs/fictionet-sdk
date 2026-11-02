@@ -279,9 +279,9 @@ def referral (look : Name → Fact Node) (apex m : Name) (ns : RRset) (glue : Li
   | .ok sib => .ok (.done .noerror false [] [ns] (inDomain ++ sib) inDomain.length)
   | .error e => .error e
 
-/-- The synthesized HINFO answer to QTYPE ANY (RFC 8482 §4.2). -/
+/-- The synthesized HINFO answer to QTYPE ANY (RFC 8482 §4.2), with the smallest TTL among the name's RRsets. -/
 def hinfoAnswer (q : Name) (sets : List RRset) : RRset :=
-  ⟨q, 13, (sets.head?.map (·.ttl)).getD 0, [.hinfo [82, 70, 67, 56, 52, 56, 50] []]⟩
+  ⟨q, 13, ((sets.map (·.ttl)).min?).getD 0, [.hinfo [82, 70, 67, 56, 52, 56, 50] []]⟩
 
 def anySets (any : AnyResponse) (q : Name) (sets : List RRset) : List RRset :=
   match any with

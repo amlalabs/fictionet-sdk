@@ -1056,6 +1056,29 @@ decreasing_by simp; omega
 
 def optRR (r : RR) : Bool := r.rtype == 41
 
+/-- From the record at `pos`, the `i`-th of the message, over `k` more records: whether the record that stops
+the message from decoding is an OPT record, one whose octets do not read or one among the first `outside`
+records, outside the additional section. -/
+def optFault (msg : Bytes) (outside : Nat) : Nat → Nat → Nat → Bool
+  | 0, _, _ => false
+  | k + 1, i, pos =>
+    let opt := match name msg msg.length pos with
+      | .ok (_, e) => rd16 msg e == some 41
+      | .error _ => false
+    match readRR msg pos with
+    | .error _ => opt
+    | .ok (_, e) => if opt && i < outside then true else optFault msg outside k (i + 1) e
+
+/-- Whether a message that does not decode fails at an OPT record, so its FORMERR carries an OPT (RFC 6891
+§7), as `fault_in_opt` decides. -/
+def faultInOpt (msg : Bytes) : Bool :=
+  match rd16 msg 4, rd16 msg 6, rd16 msg 8, rd16 msg 10 with
+  | some qd, some an, some ns, some ar =>
+    match readList (readQuestion msg) qd 12 with
+    | .ok (_, p) => optFault msg (an + ns) (an + ns + ar) 0 p
+    | .error _ => false
+  | _, _, _, _ => false
+
 /-- `Request::parse`'s fixed order. `udp` says whether the query came over UDP. -/
 def parse (bytes : Bytes) (udp : Bool) : Parsed :=
   match rd16 bytes 0, rd16 bytes 2 with
@@ -1064,8 +1087,10 @@ def parse (bytes : Bytes) (udp : Bool) : Parsed :=
     if bytes.length < 12 || h.qr then .silent else
     let rej (rc : Nat) (opt : Option Nat) : Parsed := .reject ⟨rc, respondHeader h (rc % 16) false false, opt⟩
     match decode bytes with
-    | .error _ => rej 1 none
+    | .error _ => rej 1 (if faultInOpt bytes then some 0 else none)
     | .ok m =>
+      -- an OPT record belongs in the additional section alone (RFC 6891 §6.1.1)
+      if (m.answer ++ m.authority).any optRR then rej 1 (some 0) else
       match m.additional.filter optRR with
       | _ :: _ :: _ => rej 1 (some 0)
       | os =>

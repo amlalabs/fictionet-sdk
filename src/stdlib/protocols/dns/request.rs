@@ -11,8 +11,8 @@ use super::op::{
     DEFAULT_MAX_PAYLOAD_LEN, Edns, Header, Message, MessageType, Metadata, OpCode, Query,
     ResponseCode,
 };
+use super::rr::RecordType;
 use super::rr::rdata::opt::EdnsCode;
-use super::rr::{Name, Record, RecordType};
 use super::serialize::binary::{BinDecodable, BinDecoder, DecodeError};
 use fictionet::stdlib::services::serve::Transport;
 
@@ -74,7 +74,10 @@ impl Request {
     ///
     /// 1. Fewer than 12 octets, or QR set: [`Silent`](Parsed::Silent).
     /// 2. A message that does not parse: FORMERR, with an OPT record when
-    ///    the fault is in the query's OPT record (RFC 6891 §7).
+    ///    the fault is in the query's OPT record (RFC 6891 §7). A record
+    ///    of a type whose RDATA hickory reads by stricter rules, or with
+    ///    empty RDATA, is carried as octets (RFC 3597 §4), so only a
+    ///    message whose records do not read even as octets fails here.
     /// 3. More than one OPT record: FORMERR with an OPT (RFC 6891 §6.1.1).
     /// 4. An EDNS version above 0: BADVERS with an OPT of version 0
     ///    (RFC 6891 §6.1.3).
@@ -94,12 +97,9 @@ impl Request {
         if bytes.len() < HEADER || bytes[2] & 0x80 != 0 {
             return Parsed::Silent;
         }
-        let message = match Message::from_vec(bytes) {
-            Ok(message) => message,
-            Err(error) => {
-                let opt = matches!(error, DecodeError::DuplicateEdns) || fault_in_opt(bytes);
-                return Parsed::Reject(unparsed(bytes, opt));
-            }
+        let message = match Message::from_vec(bytes).map_err(|_| opaque(bytes)) {
+            Ok(message) | Err(Ok(message)) => message,
+            Err(Err(Fault { in_opt })) => return Parsed::Reject(unparsed(bytes, in_opt)),
         };
         let metadata = message.metadata;
         let one_question = metadata.op_code == OpCode::Query && message.queries.len() == 1;
@@ -162,36 +162,140 @@ fn question_bytes(bytes: &[u8]) -> Result<Vec<u8>, DecodeError> {
     Ok(bytes[HEADER..decoder.index()].to_vec())
 }
 
-/// Whether the record that stops a message from parsing is an OPT record:
-/// one whose options do not decode, or one outside the additional section.
-fn fault_in_opt(bytes: &[u8]) -> bool {
-    let mut decoder = BinDecoder::new(bytes);
-    let Ok(header) = Header::read(&mut decoder) else {
-        return false;
-    };
-    for _ in 0..header.counts.queries {
-        if Query::read(&mut decoder).is_err() {
-            return false;
-        }
-    }
-    let outside = u32::from(header.counts.answers) + u32::from(header.counts.authorities);
-    let records = outside + u32::from(header.counts.additionals);
-    for index in 0..records {
-        let start = decoder.index();
-        let opt = record_type_at(bytes, start) == Some(RecordType::OPT);
-        if Record::read(&mut decoder).is_err() || (opt && index < outside) {
-            return opt;
-        }
-    }
-    false
+/// Why a query does not read even with its RDATA as octets.
+struct Fault {
+    /// Whether the fault is in an OPT record: one that does not read, one
+    /// outside the additional section, one whose options do not decode,
+    /// or one of several. The FORMERR then carries an OPT (RFC 6891 §7).
+    in_opt: bool,
 }
 
-/// The type of the record that starts at `start`, read from its owner name
-/// and type alone.
-fn record_type_at(bytes: &[u8], start: usize) -> Option<RecordType> {
-    let mut decoder = BinDecoder::new(bytes).clone(u16::try_from(start).ok()?);
-    Name::read(&mut decoder).ok()?;
-    RecordType::read(&mut decoder).ok()
+/// A query hickory does not read, read as RFC 3597 §4 asks: each record's
+/// RDATA as octets, except the names inside the RDATA of the RFC 1035
+/// types that may hold compressed names, which must read inside it. The
+/// message has the query's header, its questions, and the OPT record of
+/// its additional section, and none of its other records, which a server
+/// does not use.
+fn opaque(bytes: &[u8]) -> Result<Message, Fault> {
+    let mut decoder = BinDecoder::new(bytes);
+    let header = Header::read(&mut decoder).map_err(|_| Fault { in_opt: false })?;
+    for _ in 0..header.counts.queries {
+        Query::read(&mut decoder).map_err(|_| Fault { in_opt: false })?;
+    }
+    let questions = decoder.index();
+    let outside = u32::from(header.counts.answers) + u32::from(header.counts.authorities);
+    let records = outside + u32::from(header.counts.additionals);
+    let (mut at, mut opts) = (questions, Vec::new());
+    for index in 0..records {
+        let (rtype, end) = record(bytes, at).map_err(|rtype| Fault {
+            in_opt: rtype == Some(OPT),
+        })?;
+        if rtype == OPT {
+            if index < outside {
+                return Err(Fault { in_opt: true });
+            }
+            opts.push(at..end);
+        }
+        at = end;
+    }
+    let mut reduced = bytes[..questions].to_vec();
+    reduced[6..10].fill(0);
+    let count = u16::try_from(opts.len()).map_err(|_| Fault { in_opt: true })?;
+    reduced[10..12].copy_from_slice(&count.to_be_bytes());
+    for opt in opts {
+        reduced.extend_from_slice(&bytes[opt]);
+    }
+    Message::from_vec(&reduced).map_err(|_| Fault { in_opt: true })
+}
+
+/// The record type OPT (RFC 6891 §6.1.1).
+const OPT: u16 = 41;
+
+/// The type of the record at `start` and where it ends, read with its
+/// RDATA as octets, as [`opaque`] reads it. A record that does not read
+/// gives its type, when that much reads.
+fn record(bytes: &[u8], start: usize) -> Result<(u16, usize), Option<u16>> {
+    let fixed = name_end(bytes, start, bytes.len()).ok_or(None)?;
+    let field = |offset: usize| {
+        let octets = bytes.get(fixed + offset..fixed + offset + 2)?;
+        Some(u16::from_be_bytes([octets[0], octets[1]]))
+    };
+    let rtype = field(0).ok_or(None)?;
+    let length = field(8).ok_or(Some(rtype))?;
+    let rdata = fixed + 10;
+    let end = rdata + usize::from(length);
+    if end > bytes.len() {
+        return Err(Some(rtype));
+    }
+    if let Some((before, names, after)) = compressible(rtype) {
+        let mut name = rdata + before;
+        if name > end {
+            return Err(Some(rtype));
+        }
+        for _ in 0..names {
+            name = name_end(bytes, name, end).ok_or(Some(rtype))?;
+        }
+        if name + after != end {
+            return Err(Some(rtype));
+        }
+    }
+    Ok((rtype, end))
+}
+
+/// The layout of the RDATA of an RFC 1035 type whose names may be
+/// compressed (RFC 3597 §4): the octets before its names, how many names,
+/// and the octets after them. NS, MD, MF, CNAME, MB, MG, MR, and PTR hold
+/// one name; SOA two names and 20 octets; MINFO two names; MX a
+/// preference and one name.
+fn compressible(rtype: u16) -> Option<(usize, usize, usize)> {
+    match rtype {
+        2 | 3 | 4 | 5 | 7 | 8 | 9 | 12 => Some((0, 1, 0)),
+        6 => Some((0, 2, 20)),
+        14 => Some((0, 2, 0)),
+        15 => Some((2, 1, 0)),
+        _ => None,
+    }
+}
+
+/// Where the name at `start` ends, reading no octet at or past `limit`.
+/// Each compression pointer must point before itself, and the name it
+/// points to is read with the pointer's position as the new limit
+/// (RFC 1035 §4.1.4). `None` for a name that does not read, or one longer
+/// than 255 octets (RFC 1035 §2.3.4).
+fn name_end(bytes: &[u8], start: usize, limit: usize) -> Option<usize> {
+    let (mut at, mut limit) = (start, limit);
+    let mut end = None;
+    let mut length = 1;
+    loop {
+        if at >= limit {
+            return None;
+        }
+        let octet = *bytes.get(at)?;
+        match octet {
+            0 => return (length <= 255).then_some(end.unwrap_or(at + 1)),
+            1..=63 => {
+                let label = usize::from(octet);
+                if at + 1 + label > limit {
+                    return None;
+                }
+                length += 1 + label;
+                at += 1 + label;
+            }
+            0xc0..=0xff => {
+                if at + 1 >= limit {
+                    return None;
+                }
+                let target = usize::from(octet & 0x3f) << 8 | usize::from(bytes[at + 1]);
+                if target >= at {
+                    return None;
+                }
+                end.get_or_insert(at + 2);
+                limit = at;
+                at = target;
+            }
+            _ => return None,
+        }
+    }
 }
 
 /// The FORMERR reply to a query that does not parse, built from its header
@@ -231,6 +335,7 @@ fn rejection(
 #[cfg(test)]
 mod tests {
     use super::super::options::Nsid;
+    use super::super::rr::{Name, Record};
     use super::*;
 
     fn name(text: &str) -> Name {

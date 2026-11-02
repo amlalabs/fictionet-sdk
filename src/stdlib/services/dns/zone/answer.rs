@@ -29,7 +29,9 @@ pub enum Answered {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AnyResponse {
     /// One synthesized HINFO record with CPU "RFC8482" and an empty OS, as
-    /// Cloudflare's servers do (RFC 8482 §4.2). With DO, a signed zone
+    /// Cloudflare's servers send (RFC 8482 §4.2), with the smallest TTL
+    /// among the name's RRsets, which leaves the TTL to the responder.
+    /// With DO, a signed zone
     /// signs it as Cloudflare's online signer does; a zone signed once,
     /// whose keys the view does not hold, sends one RRset of the name
     /// instead.
@@ -470,7 +472,7 @@ impl<'v> Walk<'v> {
                 return self.nodata(name, encloser);
             }
             let answer = match self.any {
-                AnyResponse::Hinfo => match self.hinfo(&owner, sets[0].ttl()) {
+                AnyResponse::Hinfo => match self.hinfo(&owner, smallest_ttl(&sets)) {
                     Some(hinfo) => vec![hinfo],
                     None => vec![owned(sets[0], &owner)],
                 },
@@ -590,6 +592,11 @@ fn positive(answer: Vec<RecordSet>, authority: Vec<RecordSet>) -> Found {
         authority,
         ..Found::new(ResponseCode::NoError, true)
     }
+}
+
+/// The smallest TTL among `sets`, or 0 when there are none.
+fn smallest_ttl(sets: &[&RecordSet]) -> u32 {
+    sets.iter().map(|set| set.ttl()).min().unwrap_or(0)
 }
 
 /// `set` with `owner` as the owner of every record and RRSIG.

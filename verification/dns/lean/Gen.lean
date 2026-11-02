@@ -13,7 +13,7 @@
   * `policy.json`: `Dnssec.AlgorithmPolicy.treat`, over `Policy.iana` and other policies;
   * `chain.json`: `Chain.check`;
   * `cache.json`: `Cache.insert`, `Cache.advance`, and `Cache.serve`;
-  * `resolver.json`: `Resolver.runAll` over a hierarchy of zones with scripted losses.
+  * `resolver.json`: `Resolver.runAll` over a hierarchy of zones with scripted losses, and with some servers dead.
 
   Usage: `lake exe gen <dir> <seed>`. The output depends only on the seed.
 
@@ -426,6 +426,11 @@ def respondCase : G String := do
         ("edns", match q.edns with
           | some e => jobj [("payload", jnat e.payload), ("version", jnat e.version), ("do", jbool e.dnssecOk),
               ("nsid", jbool e.nsid)]
+          | none => "null"),
+        -- the header and OPT of an authoritative NOERROR answer to it, through the server front
+        ("answer", flagsJson (respondHeader q.header 0 true false)),
+        ("answer_opt", match q.edns with
+          | some e => jobj [("version", jnat 0), ("do", jbool e.dnssecOk)]
           | none => "null")]
   return jobj [("input", jobj [("bytes", jstr (hex bytes)), ("transport", jstr (if udp then "udp" else "tcp"))]),
     ("expected", expected)]
@@ -971,6 +976,33 @@ def itemJson (st : Stored) : String :=
 
 instance : Inhabited Request := ⟨⟨[], 1⟩⟩
 
+/-- Each server name of the resolver vectors at an address of its own, so a server lost or dead is one
+address in Rust too. -/
+def addrOf (n : Name) : List Nat :=
+  match nameStr n with
+  | "a." => [198, 41, 0, 4]
+  | "b." => [170, 247, 170, 2]
+  | "ns1.test." => [192, 0, 2, 11]
+  | "ns2.test." => [192, 0, 2, 12]
+  | "ns1.example." => [192, 0, 2, 21]
+  | "ns.sub.example." => [192, 0, 2, 31]
+  | _ => [192, 0, 2, 99]
+
+/-- Feeds the resolver's sends to the network, where the servers in `dead` never answer and every other server
+answers, until it answers. -/
+def driveDead (net : Net) (dead : List Name) : Nat → State × List Resolver.Out → Option (Response × State)
+  | _, (st, [.answer r]) => some (r, st)
+  | fuel + 1, (st, [.send s c q]) => driveDead net dead fuel (step st (deliver net .all c q (dead.contains s)))
+  | _, _ => none
+
+/-- Several questions in turn, sharing the cache, with the servers in `dead` never answering. -/
+def runDead (net : Net) (cfg : Config) (dead : List Name) : State → List Request → List (Option Response)
+  | _, [] => []
+  | st, q :: qs =>
+    match driveDead net dead (cfg.work + 1) (start cfg st q) with
+    | some (r, st') => some r :: runDead net cfg dead st' qs
+    | none => [none]
+
 /-- A root zone delegating `test.` and `example.`; `example.` delegating `sub.example.`; each zone with a few
 names. Some zones may have no servers, and the root may have one or two. -/
 def resolverCase : G String := do
@@ -980,9 +1012,9 @@ def resolverCase : G String := do
   let soa (a : Name) : Zone.RData := .soa (lb "ns1" :: a) (lb "hostmaster" :: a) 1 7200 3600 1209600 300
   let rootNs : List Name := if ← chance 2 then [[lb "a"]] else [[lb "a"], [lb "b"]]
   let testNs : List Name := if ← chance 2 then [lb "ns1" :: test] else [lb "ns1" :: test, lb "ns2" :: test]
-  let glueFor (ns : List Name) : List RRset := ns.map fun n => ⟨n, 1, 86400, [.a [192, 0, 2, n.length]]⟩
+  let glueFor (ns : List Name) : List RRset := ns.map fun n => ⟨n, 1, 86400, [.a (addrOf n)]⟩
   let rootSpec : Spec := ⟨[], 86400, soa [], ⟨[], 2, 518400, rootNs.map .ns⟩ ::
-      rootNs.map (fun n => ⟨n, 1, 518400, [.a [198, 41, 0, 4]]⟩),
+      rootNs.map (fun n => ⟨n, 1, 518400, [.a (addrOf n)]⟩),
     [⟨test, 172800, testNs, glueFor testNs, none⟩, ⟨ex, 172800, [lb "ns1" :: ex], glueFor [lb "ns1" :: ex], none⟩]⟩
   let testSpec : Spec := ⟨test, 3600, soa test, ⟨test, 2, 3600, testNs.map .ns⟩ :: glueFor testNs ++
       [⟨lb "www" :: test, 1, 300, [.a [192, 0, 2, 10]]⟩, ⟨lb "mail" :: test, 15, 300, [.mx 10 (lb "www" :: test)]⟩,
@@ -1004,12 +1036,17 @@ def resolverCase : G String := do
   let losses ← rList (← rRange 0 6) (chance 3)
   let cfg : Config := ⟨rootNs, ← pick #[2, 3, 5, 8]⟩
   let (answers, final) := runAll net .all cfg ⟨[], none⟩ qs losses
+  -- Servers that never answer, and the answers with them dead and work to spare.
+  let servers : List Name := rootNs ++ testNs ++ [lb "ns1" :: ex, lb "ns" :: sub]
+  let dead ← servers.filterM fun _ => chance 3
+  let deadAnswers := runDead net ⟨rootNs, 64⟩ dead ⟨[], none⟩ qs
   return jobj [("input", jobj [("zones", jarr (specs.map specJson)), ("hints", jarr (rootNs.map (jstr ∘ nameStr))),
       ("work", jnat cfg.work), ("any", jstr "all"),
       ("questions", jarr (qs.map fun q =>
         jobj [("qname", jstr (nameStr q.qname)), ("qtype", jstr (typeStr q.qtype))])),
-      ("losses", jarr (losses.map jbool))]),
+      ("losses", jarr (losses.map jbool)), ("dead", jarr (dead.map (jstr ∘ nameStr)))]),
     ("expected", jobj [("answers", jarr (answers.map fun a => (a.map responseJson).getD "null")),
+      ("dead_answers", jarr (deadAnswers.map fun a => (a.map responseJson).getD "null")),
       ("cache", jarr (final.cache.map itemJson))])]
 
 end ResolverVectors

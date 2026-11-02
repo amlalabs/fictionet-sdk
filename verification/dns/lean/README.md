@@ -18,7 +18,7 @@ lake exe gen <dir> <seed>        # writes <dir>/{names,wire,restore,fit,respond,
 `lake build` prints the axioms of every headline theorem from `Dns/Axioms.lean`. Each line must list only
 `propext`, `Quot.sound`, and `Classical.choice`, or a subset of them. A `sorryAx` would mean an unfinished
 proof; there is none. `cargo xtask dns-verify` runs this check and writes the vectors
-into `target/dns-verify/vectors/`. Vectors are regenerated, not committed. The same seed always
+into `target/dns-verify/vectors/<seed>/`. Vectors are regenerated, not committed. The same seed always
 gives the same files.
 
 ## Theorems
@@ -142,14 +142,14 @@ form `\# <length> <hex>`. Octets are lowercase hex.
 | `wire.json` | `bytes`: an encoded message, sometimes truncated, altered, given a bad pointer, or padded | `ok`; then `message` (header, question, answer, authority, additional) and `canonical` (the uncompressed encoding), or `error` |
 | `restore.json` | `reply`, `query` | `restored`, or `error`: `question_mismatch` or `malformed` |
 | `fit.json` | `response` (header, question, RRsets per section, `required_additional`, `opt`), `limit` (`udp512`, `udp_edns` with `size`, or `stream`) | `size_le`, `fits`, `length`, `tc`, and `kept`: the number of RRsets kept per section |
-| `respond.json` | `bytes`, `transport` (`udp` or `tcp`) | `parsed`: `silent`; `reject` with `rcode` (extended), `flags`, and `opt` (its version, or null); or `request` with `rd`, `cd`, `ad`, `question`, and `edns` |
+| `respond.json` | `bytes`, `transport` (`udp` or `tcp`) | `parsed`: `silent`; `reject` with `rcode` (extended), `flags`, and `opt` (its version, or null); or `request` with `rd`, `cd`, `ad`, `question`, `edns`, and the `answer` flags and `answer_opt` of an authoritative NOERROR answer to it through the server front |
 | `zone.json` | `zone` (`apex`, `records`), `any` (`hinfo`, `one_rrset`, `all`), `request` (`qname`, `qtype`) | `rcode`, `aa`, `answer`, `authority`, `additional`, `required_additional` |
 | `partial.json` | as `zone.json`, plus `unknown`: names whose facts are unknown | `unknown` (a name), or `response` |
 | `signed.json` | `zone` (no DNAME), `keys` (`id`, `alg`, `sep`, `corrupt`), `window`, `denial` (`nsec`, or `nsec3` with `opt_out`), `request`, `time`, `policy`, `anchor_digest_type`, and for about a third of the cases a signed `parent` (`zone`, `keys`, `denial`) at the name above the apex, delegating to the zone with a DS set for its KSK, a wrong digest, RSASHA1, or no DS | `rcode`, `aa`, and with DO=1 the `answer` and `authority` lines each followed by its RRSIG lines, `additional`, `denial` (NSEC or NSEC3 lines with RRSIGs), `dnskey` (the DNSKEY set and its RRSIGs), and `validation`: one result per answer RRset and one for the denial of a negative answer, under the zone's own anchor (a DS of digest type 2 for each SEP key) and the one-link chain, or with a `parent` under the parent's anchor and the chain down the delegation, with `parent_dnskey` and `delegation` (the parent's DS set or no-DS proof, with RRSIGs); or `unknown` |
 | `policy.json` | `algorithm`, `digest`, `policy` (`validate`, `digests`, `max_nsec3_iterations`): `iana` or a random one | `treatment`: `supported`, `unsupported_algorithm`, or `unsupported_digest` |
 | `chain.json` | `tree`: the parent and the child `sub`, each with `zone`, `keys`, `window`, `denial`; `time`; `policy` | `problems`: `ds_mismatch`, `no_ds_proof_missing` (with `parent`, `child`), `window_closed` (`apex`, `time`), `unsupported_algorithm` (`apex`, `algorithm`) |
 | `cache.json` | `limits` (`max_ttl`, `failure_ttl`); `ops`: `offer` (positive, negative, or failure, with time), `advance`, `serve` (key and time) | `served`: for each `serve` in order, `null` or the served positive RRset with its TTL counted down and its validation, the negative with its SOA, or the failure |
-| `resolver.json` | `zones` (a root and some of `test.`, `example.`, `sub.example.`), `hints`, `work`, `any`, `questions`, `losses` (one per query sent, in order; `true` is lost) | `answers` (a response per question; a question past the script uses no loss) and the final `cache` (each item with its rank: a cut's NS set, glue, or a question and its answer) |
+| `resolver.json` | `zones` (a root and some of `test.`, `example.`, `sub.example.`, each server at an address of its own), `hints`, `work`, `any`, `questions`, `losses` (one per query sent, in order; `true` is lost), `dead` (servers that never answer) | `answers` (a response per question; a question past the script uses no loss), `dead_answers` (a response per question with the `dead` servers never answering and work to spare), and the final `cache` (each item with its rank: a cut's NS set, glue, or a question and its answer) |
 
 Symbolic keys and signatures in `signed.json` and `chain.json`. A key is a number below 256. Its DNSKEY's
 public key field is the base64 of that one octet, and its key tag is the number. A signature made with
@@ -175,7 +175,8 @@ extra iterations, in base32hex. RRSIG times are decimal. Validation results are 
 - **The decoder** gives each name `length² + length + 256` steps and proves that is enough. Octets after the
   last record are ignored. A name that reads past the end of its RDATA is rejected.
 - **`parse`** answers FORMERR without an OPT when the message does not decode, and FORMERR with an OPT when the
-  fault is in the OPT record (a second OPT, an owner other than the root, or options that do not split).
+  fault is in an OPT record (one that does not read, one outside the additional section, a second OPT, an owner
+  other than the root, or options that do not split).
   Header fields and the question are not echoed in the model; `respond.json` checks the RCODE, flags, and the
   OPT's presence and version.
 - **Fit** treats each RRset as a list of records with the same owner and type, and measures candidates by
@@ -183,7 +184,7 @@ extra iterations, in base32hex. RRSIG times are decimal. Validation results are 
 - **Zones** hold nodes by name. An empty non-terminal is not stored: a name with no node of its own but nodes
   below it is reported as `Empty`. A wildcard that is itself a cut gives a referral to that cut. DNAME at the
   question name is ordinary data; DNAME above it substitutes. The synthesized HINFO answer to QTYPE ANY
-  (RFC 8482 §4.2) takes the TTL of the node's first RRset.
+  (RFC 8482 §4.2) takes the smallest TTL among the node's RRsets.
 - **DO=1 is outside the zone files.** RRSIGs and denial records belong to `Dns/Dnssec.lean`, which adds them to
   `Zone.answer`'s response (`SignedZone.answerDo`); the answers of `Zone.answer` are the DO=0 answers.
 - **The CNAME chase** stops at the first repeated name, at a name outside the zone, or at YXDOMAIN. The
@@ -228,7 +229,9 @@ extra iterations, in base32hex. RRSIG times are decimal. Validation results are 
   NSEC or NSEC3 for the next closer name (RFC 4035 §5.3.4); when only an opt-out NSEC3 covers it, an
   unsigned delegation may sit there, so the answer is Insecure, and so is a NODATA whose next closer name
   only an opt-out NSEC3 covers (RFC 5155 §6, its erratum 3441). A denial for a DS question is checked
-  along the chain of the name above, since the parent zone holds DS (RFC 4035 §2.4). NSEC3 iterations
+  along the chain of the name above, since the parent zone holds DS (RFC 4035 §2.4), through the links whose
+  zones hold that name; the root, which has no parent, answers its own DS question. A denial that proves
+  nothing is Bogus for why its first unverified record failed, or for the missing denial. NSEC3 iterations
   above the policy's limit make a denial Insecure once its signature verifies (RFC 9276 §3.2); `iana` uses
   100, which RFC 9276 Appendix A found interoperable. A DNAME's synthesized CNAME is not validated through its DNAME, so `signed.json` zones
   have no DNAME.
