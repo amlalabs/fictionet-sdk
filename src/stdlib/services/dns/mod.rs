@@ -11,6 +11,10 @@
 //! known absent, or unknown, and the authoritative answer over them.
 //! [`authority`] holds what a server at an address answers, and the
 //! [`AuthorityEngine`](authority::AuthorityEngine) that runs one.
+//! [`resolver`] holds the recursive [`Resolver`](resolver::Resolver),
+//! which answers clients from local zones, its cache, and the servers it
+//! asks, and validates what it learns. [`memory`] drives engines with no
+//! runtime: servers in memory, recorded exchanges, and a virtual clock.
 //!
 //! Every engine has the shape of [`Engine`]: a driver hands it
 //! [inputs](Input) with the time, and takes [actions](Action) and
@@ -47,11 +51,15 @@
 //! | RFC 8914 §4.21 | REFUSED with Extended DNS Error 20 outside the hosted zones |
 //! | RFC 8976 | ZONEMD records in master files |
 //! | RFC 9471 §3 | Glue in referrals |
+//!
+//! The resolver follows more; [`resolver`] lists them.
 
 pub mod authority;
 mod clock;
 mod event;
 mod exchange;
+pub mod memory;
+pub mod resolver;
 pub mod zone;
 
 pub use clock::WallClock;
