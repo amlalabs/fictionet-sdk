@@ -4,6 +4,7 @@
 //! The [module table](super#service-modules) lists the modules.
 
 pub mod ca;
+pub mod dns;
 pub mod keys;
 pub mod serve;
 pub mod tls;
