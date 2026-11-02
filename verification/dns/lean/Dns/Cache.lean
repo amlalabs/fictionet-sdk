@@ -252,6 +252,11 @@ theorem insert_wellTimed {now : Nat} {lim : Limits} {c : Cache} {o : Offer} {t :
     · obtain ⟨h1, h2, h3⟩ := h x (List.mem_filter.mp hx).1
       exact ⟨h1, Nat.le_trans h2 ht, h3⟩
 
+theorem wellTimed_mono {c : Cache} {t t' : Nat} (h : WellTimed c t) (ht : t ≤ t') : WellTimed c t' := by
+  intro e he
+  obtain ⟨h1, h2, h3⟩ := h e he
+  exact ⟨h1, Nat.le_trans h2 ht, h3⟩
+
 /-- A session change leaves nothing to serve. -/
 theorem advance_clears (c : Cache) (now : Nat) (k : Key) :
     serve now (advance c) k = none ∧ Unique (advance c) ∧ ∀ t, WellTimed (advance c) t :=

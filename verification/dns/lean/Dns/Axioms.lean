@@ -3,7 +3,8 @@
 
   Expected: every `#print axioms` line lists only `propext`, `Quot.sound`, and `Classical.choice`, Lean's
   standard axioms, or a subset of them. `sorryAx` would mean an unfinished proof. Facts about concrete inputs
-  are checked by the kernel (`decide +kernel`), which adds no axiom.
+  are checked by the kernel (`decide +kernel`), which adds no axiom. The DNSSEC examples use the concrete
+  signature scheme `Dnssec.Symbolic.scheme`.
 -/
 import Dns.Name
 import Dns.Wire
@@ -12,6 +13,12 @@ import Dns.Zone
 import Dns.Partial
 import Dns.Authority
 import Dns.Exchange
+import Dns.Dnssec
+import Dns.Policy
+import Dns.Records
+import Dns.Chain
+import Dns.Cache
+import Dns.Resolver
 
 namespace Dns.Examples
 open Dns
@@ -396,5 +403,377 @@ example : (advance st 3).1.pending = [] ∧ (advance st 3).1.cache = [] ∧ (adv
   ⟨h.2.1, h.2.2.1, h.2.2.2.2.1⟩
 
 end Exchange
+
+/-! ## `Dns/Dnssec.lean` -/
+
+section Dnssec
+open Zone Dnssec
+
+abbrev Sch := Symbolic.scheme
+
+/-- A KSK and a ZSK with ECDSA P-256 (algorithm 13), holding private keys 7 and 8. -/
+def ksk : Signer Sch := Signer.ofPriv (S := Sch) (7 : Nat) 13 true
+def zsk : Signer Sch := Signer.ofPriv (S := Sch) (8 : Nat) 13 false
+
+/-- The example zone signed with NSEC, its signatures valid from 100 to 200. -/
+def signedZone : SignedZone Sch := ⟨zone, [ksk, zsk], ⟨100, 200⟩, .nsec⟩
+
+theorem honest_ofPriv (p alg : Nat) (sep : Bool) : (Signer.ofPriv (S := Sch) p alg sep).Honest :=
+  ⟨p, rfl, fun _ => rfl⟩
+
+theorem signedZone_well : SignsWell signedZone Policy.iana 150 := by
+  refine ⟨fun s hs => ?_, fun s hs => ?_, by decide⟩
+  · simp only [signedZone, List.mem_cons, List.mem_nil_iff, or_false] at hs
+    rcases hs with rfl | rfl <;> exact honest_ofPriv _ _ _
+  · simp only [signedZone, List.mem_cons, List.mem_nil_iff, or_false] at hs
+    rcases hs with rfl | rfl <;> decide
+
+#print axioms signed_answers_validate
+/-- `www.example.com. TXT`, with the RRSIGs the signed zone serves, validates Secure under its anchor. -/
+theorem www_secure : validateRrset (some [signedZone.anchor 2]) Policy.iana 150 [signedZone.link] wwwTxt
+    (signedZone.sigsFor wwwTxt) [] = .secure :=
+  signed_answers_validate signedZone Policy.iana 150 2 signedZone_well (by decide) ⟨ksk, by simp [signedZone], rfl⟩
+    zone_wf [] (nd := .data [wwwTxt]) (by decide +kernel) (by intro _ _ _ h; cases h)
+    ⟨wwwTxt, by simp [nodeSets], rfl, rfl⟩ (by decide) (by decide)
+
+#print axioms secure_sound
+/-- So the TXT records were signed with the private key of a key vouched for from the anchor. -/
+example : ∃ apex k p r x, Vouched [signedZone.anchor 2] [signedZone.link] apex k ∧ Sch.pub p = k.pub ∧
+    r ∈ signedZone.sigsFor wwwTxt ∧ expanded r.hdr wwwTxt = some x ∧ x.rdata = wwwTxt.rdata ∧
+    r.sig = Sch.sign p ⟨r.hdr, .rrset x⟩ :=
+  have ⟨apex, k, p, r, x, hv, hp, hr, _, _, hx, _, hd, hs⟩ := secure_sound www_secure
+  ⟨apex, k, p, r, x, hv, hp, hr, hx, hd, hs⟩
+
+#print axioms secure_complete
+example : validateRrset (some [signedZone.anchor 2]) Policy.iana 150 [signedZone.link] wwwTxt
+    (signedZone.signSet wwwTxt).sigs [] = .secure :=
+  secure_complete ⟨signedZone.link, [], signedZone.keys, signedZone.apex, signedZone.keys,
+    ⟨_, anchorFor_zone signedZone 2 (by decide), rfl, rfl,
+      anchor_keys signedZone_well (by decide) (s0 := ksk) (by simp [signedZone]) rfl⟩,
+    .nil, signSet_final signedZone_well (by simp [signedZone]) [] rfl rfl rfl (by decide)⟩
+
+/-- An anchor whose only DS names an RSASHA1 key (algorithm 5), and a chain whose DNSKEY fetch failed. -/
+def sha1Anchor : Anchor := ⟨apex, [⟨5, 2, [1, 2, 3]⟩]⟩
+def brokenChain : Chain Sch := [⟨apex, none, none⟩]
+
+#print axioms insecure_needs_proof
+/-- Insecure, and the reason is the unsupported DS set, although the DNSKEY set is missing. -/
+example : InsecureCase [sha1Anchor] Policy.iana 150 wwwTxt.owner brokenChain .unsupportedAlgorithm :=
+  insecure_needs_proof (set := wwwTxt) (sigs := []) (ds := [])
+    (Policy.sha1_ds_insecure (a := sha1Anchor) (l0 := ⟨apex, none, none⟩) (ls0 := []) (by decide) rfl rfl (by decide)
+      (by decide))
+
+#print axioms insecure_complete
+/-- With no anchor at or above the name, the answer is Insecure. -/
+example : ∃ w, validateRrset (some []) Policy.iana 150 brokenChain wwwTxt [] ([] : List (Signed Sch)) =
+    .insecure w :=
+  insecure_complete (Or.inl ⟨rfl, rfl⟩)
+
+/-- The zone signed with NSEC3 and opt-out, and a denial made of one opt-out NSEC3. -/
+def optOutZone : SignedZone Sch := ⟨zone, [ksk, zsk], ⟨100, 200⟩, .nsec3 true⟩
+def optOutRecord : Nsec3 := ⟨apex, 5, 9, [], true, 0⟩
+def optOutDenial : List (Signed Sch) := [optOutZone.signNsec3 optOutRecord]
+
+#print axioms optout_never_secure_denial
+example : validateDenial (some [optOutZone.anchor 2]) Policy.iana 150 [optOutZone.link] ⟨[LX, EX, COM], 1⟩
+    .nxdomain optOutDenial ≠ .secure := by
+  have hw : walk [optOutZone.anchor 2] Policy.iana 150 [LX, EX, COM] [optOutZone.link] =
+      .trusted apex optOutZone.keys := by decide +kernel
+  have hn : nsecs (verified Policy.iana 150 apex optOutZone.keys optOutDenial) = [] := by decide +kernel
+  have h3 : nsec3s (verified Policy.iana 150 apex optOutZone.keys optOutDenial) = [optOutRecord] := by
+    decide +kernel
+  refine optout_never_secure_denial hw (by rw [hn]; rfl) fun _ _ r hr _ => ?_
+  rw [h3, List.mem_singleton] at hr
+  rw [hr]; rfl
+
+#print axioms nsec_cover_sound
+/-- An NSEC of the complete chain covers `x.b.example.com.`, so nothing is at or below it. -/
+example : zone.presentB [LX, LB, EX, COM] = false := by
+  obtain ⟨r, hr, hc⟩ : ∃ r ∈ signedZone.nsecChain, nsecNone r [LX, LB, EX, COM] = true := by decide +kernel
+  exact nsec_cover_sound signedZone hr hc
+
+#print axioms white_lie_covers_only_qname
+example {x : Nat} (hx : x < Sch.hashSpace)
+    (h : covers3 (whiteLie (S := Sch) apex true [WWW, EX, COM]).hash
+      (whiteLie (S := Sch) apex true [WWW, EX, COM]).next x = true) : x = Sch.hash [WWW, EX, COM] :=
+  white_lie_covers_only_qname apex true _ hx h
+
+/-- A view that knows only the apex. -/
+def apexView (n : Name) : Fact Node := if n = apex then .present apexNode else .unknown
+
+#print axioms cover_unknown_is_unknown
+example : cover (S := Sch) apexView apex .nsec [WWW, EX, COM] .name = .unknown :=
+  (cover_unknown_is_unknown apexView apex .nsec [WWW, EX, COM] .name).1 (by decide)
+
+end Dnssec
+
+/-! ## `Dns/Policy.lean` -/
+
+section Policy
+open Zone Dnssec
+
+/-- An RSASHA1 key (algorithm 5), and the zone signed only with it. -/
+def rsaSha1 : Signer Sch := Signer.ofPriv (S := Sch) (9 : Nat) 5 true
+def sha1Zone : SignedZone Sch := ⟨zone, [rsaSha1], ⟨100, 200⟩, .nsec⟩
+
+#print axioms Policy.iana_matches_registry
+#print axioms Policy.sha1_never_secure
+example : validateRrset (some [sha1Zone.anchor 1]) Policy.iana 150 [sha1Zone.link] wwwTxt
+    (sha1Zone.signSet wwwTxt).sigs [] ≠ .secure :=
+  Policy.sha1_never_secure (by decide +kernel)
+
+#print axioms Policy.unsupported_is_insecure_not_bogus
+example : validateRrset (some [sha1Anchor]) Policy.iana 150 brokenChain wwwTxt [] [] =
+    .insecure (unsupportedWhy Policy.iana sha1Anchor.ds) :=
+  Policy.unsupported_is_insecure_not_bogus (by decide) rfl rfl (by decide) (by decide)
+
+#print axioms Policy.not_performed_never_ad
+example : adBit (validateRrset none Policy.iana 150 [signedZone.link] wwwTxt (signedZone.sigsFor wwwTxt) [])
+    true false = false := by
+  have h := Policy.not_performed_never_ad Policy.iana 150 [signedZone.link] wwwTxt (signedZone.sigsFor wwwTxt) []
+    ⟨apex, 1⟩ .noerror true false
+  rw [h.1]; exact h.2.2.1
+
+end Policy
+
+/-! ## `Dns/Records.lean` -/
+
+section Records
+open Zone Dnssec Records
+
+def ORG : Label := [111, 114, 103]
+def orgApex : Name := [EX, ORG]
+
+/-- `example.org.`: an apex NS with an address, `www` A, and an MX whose target has an address. -/
+def orgSpec : Spec := ⟨orgApex, 3600, .soa [NS, EX, ORG] [HOST, EX, ORG] 1 7200 3600 1209600 300, [
+    ⟨orgApex, 2, 3600, [.ns [NS, EX, ORG]]⟩,
+    ⟨[NS, EX, ORG], 1, 3600, [.a [192, 0, 2, 7]]⟩,
+    ⟨[WWW, EX, ORG], 1, 300, [.a [192, 0, 2, 8]]⟩,
+    ⟨[MAIL, EX, ORG], 15, 300, [.mx 10 [NS, EX, ORG]]⟩], []⟩
+
+def orgZone : Zone := orgSpec.assemble
+def orgApexNode : Node := nodeAt (mergeSets (orgSpec.soaSet :: orgSpec.sets.filter (·.owner == orgApex)))
+
+/-- A lazy zone that starts with only the apex node and asks its provider for the rest. -/
+def orgLazy : Lazy := ⟨orgZone.apex, orgZone.soa, [(orgZone.apex, orgApexNode)], 0⟩
+
+theorem orgLazy_holds : HoldsPart orgLazy orgZone :=
+  holdsPart_apex orgZone orgApexNode 0 (by decide +kernel) (by decide +kernel)
+
+theorem orgLazy_describable : Describable orgLazy orgZone := describable_of _ _ (by decide +kernel)
+
+#print axioms lazy_agrees_complete
+/-- The MX question reads the MX target's address, which the lazy zone gets from its provider. -/
+example : lazyAnswer (zoneProvider orgZone) orgLazy ⟨[MAIL, EX, ORG], 15⟩ .all =
+    answer orgZone ⟨[MAIL, EX, ORG], 15⟩ .all :=
+  lazy_agrees_complete orgLazy_holds orgLazy_describable (zoneProvider_agrees _ _) _ _
+
+example : answer orgZone ⟨[MAIL, EX, ORG], 15⟩ .all = .response ⟨.noerror, true,
+    [⟨[MAIL, EX, ORG], 15, 300, [.mx 10 [NS, EX, ORG]]⟩], [], [⟨[NS, EX, ORG], 1, 3600, [.a [192, 0, 2, 7]]⟩], 0⟩ := by
+  decide +kernel
+
+/-- A second implementation of `Sign`: a bare private key with its algorithm and SEP bit. -/
+structure RawKey where
+  priv : Nat
+  alg : Nat
+  sep : Bool
+
+instance : Sign RawKey Sch := ⟨fun k => ⟨Sch.pub k.priv, k.alg, k.sep⟩, fun k => Sch.sign k.priv⟩
+
+def rawKeys : List RawKey := [⟨7, 13, true⟩, ⟨8, 13, false⟩]
+
+theorem keys_agnostic : Agnostic (S := Sch) [ksk, zsk] rawKeys :=
+  .cons rfl (fun _ => rfl) (.cons rfl (fun _ => rfl) .nil)
+
+#print axioms signer_agnostic
+example : publish (S := Sch) [ksk, zsk] orgZone.look orgApex orgZone.soa .all .nsec ⟨100, 200⟩ ⟨[WWW, EX, ORG], 1⟩ =
+    publish (S := Sch) rawKeys orgZone.look orgApex orgZone.soa .all .nsec ⟨100, 200⟩ ⟨[WWW, EX, ORG], 1⟩ :=
+  signer_agnostic keys_agnostic _ _ _ _ _ _ _
+
+#print axioms validate_records_only
+/-- The lazy zone signed by the `Signer`s and the complete zone signed by the raw keys lead the validator to the
+same result. -/
+example : validatePublished (some []) Policy.iana 150 [] none orgLazy.apex ⟨[MAIL, EX, ORG], 15⟩
+      (publish (S := Sch) [ksk, zsk] (onDemand (zoneProvider orgZone) orgLazy) orgLazy.apex orgLazy.soa .all .nsec
+        ⟨100, 200⟩ ⟨[MAIL, EX, ORG], 15⟩) =
+    validatePublished (some []) Policy.iana 150 [] none orgZone.apex ⟨[MAIL, EX, ORG], 15⟩
+      (publish (S := Sch) rawKeys orgZone.look orgZone.apex orgZone.soa .all .nsec ⟨100, 200⟩ ⟨[MAIL, EX, ORG], 15⟩) :=
+  validate_records_only orgLazy_holds orgLazy_describable (zoneProvider_agrees _ _) keys_agnostic _ _ _ _ _ _ _ _ _
+
+end Records
+
+/-! ## `Dns/Chain.lean` -/
+
+section Chain
+open Zone Dnssec Chain
+
+/-- A KSK and a ZSK for `sub.example.com.`, holding private keys 17 and 18. -/
+def childKsk : Signer Sch := Signer.ofPriv (S := Sch) (17 : Nat) 13 true
+def childZsk : Signer Sch := Signer.ofPriv (S := Sch) (18 : Nat) 13 false
+def subApex : Name := [SUB, EX, COM]
+
+/-- The parent's DS record for the child's KSK: digest type 2 and the symbolic digest. -/
+def subDs : Zone.RData := .ds 0 13 2 (Sch.digest subApex childKsk.dnskey)
+
+/-- `example.com.` with a DS record at its `sub` delegation, and `sub.example.com.` itself. -/
+def parentSpec : Spec := { spec with delegations := [⟨subApex, 86400, [[NS1, SUB, EX, COM]], subGlue, some (86400, [subDs])⟩] }
+def childSpec : Spec := ⟨subApex, 3600, .soa [NS1, SUB, EX, COM] [HOST, SUB, EX, COM] 1 7200 3600 1209600 300, [
+    ⟨subApex, 2, 3600, [.ns [NS1, SUB, EX, COM]]⟩,
+    ⟨[NS1, SUB, EX, COM], 1, 3600, [.a [192, 0, 2, 53]]⟩,
+    ⟨[WWW, SUB, EX, COM], 1, 300, [.a [192, 0, 2, 80]]⟩], []⟩
+
+def parentZone : SignedZone Sch := ⟨parentSpec.assemble, [ksk, zsk], ⟨100, 200⟩, .nsec⟩
+def childZone : SignedZone Sch := ⟨childSpec.assemble, [childKsk, childZsk], ⟨100, 200⟩, .nsec⟩
+def tree : Tree Sch := [parentZone, childZone]
+def wwwSub : RRset := ⟨[WWW, SUB, EX, COM], 1, 300, [.a [192, 0, 2, 80]]⟩
+
+theorem tree_check : check tree Policy.iana 150 = [] := by decide +kernel
+
+theorem tree_wf : WellFormed tree := by
+  refine ⟨fun z hz s hs => ?_, dsSets_of (by decide +kernel), by decide +kernel⟩
+  simp only [tree, List.mem_cons, List.mem_nil_iff, or_false] at hz
+  rcases hz with rfl | rfl <;>
+    (simp only [parentZone, childZone, List.mem_cons, List.mem_nil_iff, or_false] at hs
+     rcases hs with rfl | rfl <;> exact honest_ofPriv _ _ _)
+
+theorem childSpec_ok : childSpec.okAll = true := by decide +kernel
+theorem child_wf : childZone.zone.WF := build_wf childSpec _ (by simp [build, childSpec_ok]; rfl)
+
+theorem tree_path : Descends tree parentZone [childZone] childZone :=
+  .cons (by simp [tree]) rfl .nil
+
+#print axioms check_sound
+/-- With no problem reported, `www.sub.example.com. A` validates Secure or Insecure down the chain. -/
+example : validateRrset (some [parentZone.anchor 2]) Policy.iana 150 (chainOf parentZone [childZone]) wwwSub
+      (childZone.sigsFor wwwSub) [] = .secure ∨
+    ∃ w, validateRrset (some [parentZone.anchor 2]) Policy.iana 150 (chainOf parentZone [childZone]) wwwSub
+      (childZone.sigsFor wwwSub) [] = .insecure w :=
+  check_sound tree_check tree_wf (by decide) (by simp [tree]) ⟨ksk, by simp [parentZone], rfl⟩ tree_path child_wf []
+    (nd := .data [wwwSub]) (by decide +kernel) (by intro _ _ _ h; cases h) ⟨wwwSub, by simp [nodeSets], rfl, rfl⟩
+    (by decide) (by decide)
+
+/-- And it is in fact Secure. -/
+example : validateRrset (some [parentZone.anchor 2]) Policy.iana 150 (chainOf parentZone [childZone]) wwwSub
+    (childZone.sigsFor wwwSub) [] = .secure := by
+  decide +kernel
+
+#print axioms check_complete
+/-- At time 300 the parent's signatures have expired, and the check says so. -/
+example : Problem.windowClosed apex 300 ∈ check [parentZone] Policy.iana 300 :=
+  check_complete ⟨parentZone, List.mem_singleton_self _, rfl, rfl, by simp [parentZone], by decide⟩
+
+end Chain
+
+/-! ## `Dns/Cache.lean` -/
+
+section Cache
+open Zone Dnssec Cache
+
+def limits : Limits := ⟨604800, 30⟩
+def wwwKey : Cache.Key := ⟨[WWW, EX, COM], 16⟩
+
+/-- `www.example.com. TXT`, validated Secure with an RRSIG that expires at 400, cached at time 100. -/
+def cache1 : Cache := insert 100 limits ⟨0, []⟩ (.positive wwwTxt .authAnswer .secure (some 400) false)
+
+theorem cache1_timed : WellTimed cache1 150 :=
+  wellTimed_mono (insert_wellTimed (t := 0) (fun _ h => by cases h) (by decide)) (by decide)
+
+theorem cache1_unique : Unique cache1 := insert_unique (c := ⟨0, []⟩) (by simp [Unique])
+
+#print axioms served_ttl_le_original
+example : ∃ e ∈ cache1.entries, ∃ s₀ r, e.key = wwwKey ∧ e.body = .positive s₀ r .secure ∧
+    250 ≤ s₀.ttl ∧ [WWW, EX, COM] = s₀.owner ∧ 16 = s₀.rtype ∧ [.txt [[104, 105]]] = s₀.rdata :=
+  served_ttl_le_original (s := { wwwTxt with ttl := 250 }) cache1_timed (by decide +kernel)
+
+#print axioms expired_never_served
+example : ∃ e ∈ cache1.entries, e.key = wwwKey ∧ e.generation = cache1.generation ∧ 150 < e.expires :=
+  expired_never_served (s := .positive { wwwTxt with ttl := 250 } .secure) (by decide +kernel)
+
+#print axioms rrsig_caps_ttl
+example : ∀ e, entryFor 100 limits 0 (.positive wwwTxt .authAnswer .secure (some 400) false) = some e →
+    e.expires ≤ 400 :=
+  fun _ h => rrsig_caps_ttl h
+
+/-- A failure cached for the key. -/
+def cache2 : Cache := insert 100 limits ⟨0, []⟩ (.failure wwwKey .noReachableAuthority)
+
+#print axioms failure_never_negative
+example : ∀ kind soa v, serve 110 cache2 wwwKey ≠ some (.negative kind soa v) :=
+  (failure_never_negative (insert_unique (c := ⟨0, []⟩) (by simp [Unique])) (e := ⟨wwwKey, .failure .noReachableAuthority, 100, 130, 30, 0⟩)
+    (by decide) rfl rfl).1
+
+#print axioms rank_monotone
+/-- The same TXT records offered as glue at time 120 change nothing. -/
+example : insert 120 limits cache1 (.positive wwwTxt .glue .notPerformed none false) = cache1 :=
+  rank_monotone cache1_unique (e := ⟨wwwKey, .positive wwwTxt .authAnswer .secure, 100, 400, 300, 0⟩)
+    (by decide +kernel) rfl (by decide)
+    (fun e h => by
+      simp only [entryFor] at h
+      split at h
+      · cases h
+      · cases h; decide)
+
+end Cache
+
+/-! ## `Dns/Resolver.lean` -/
+
+section Resolver
+open Zone Resolver
+
+def TEST : Label := [116, 101, 115, 116]
+
+/-- The root zone, served by `a.`, delegating `test.` to `ns.test.` with glue; and the `test.` zone. -/
+def rootSpec : Spec := ⟨[], 86400, .soa [LA] [HOST] 1 1800 900 604800 86400, [
+    ⟨[], 2, 518400, [.ns [LA]]⟩, ⟨[LA], 1, 518400, [.a [198, 41, 0, 4]]⟩],
+  [⟨[TEST], 172800, [[NS, TEST]], [⟨[NS, TEST], 1, 172800, [.a [192, 0, 2, 9]]⟩], none⟩]⟩
+def testSpec : Spec := ⟨[TEST], 3600, .soa [NS, TEST] [HOST, TEST] 1 7200 3600 1209600 300, [
+    ⟨[TEST], 2, 3600, [.ns [NS, TEST]]⟩, ⟨[NS, TEST], 1, 3600, [.a [192, 0, 2, 9]]⟩,
+    ⟨[WWW, TEST], 1, 300, [.a [192, 0, 2, 10]]⟩], []⟩
+
+def net : Net := [rootSpec.assemble, testSpec.assemble]
+def config : Config := ⟨[[LA]], 8⟩
+def state0 : State := ⟨[], none⟩
+def qWww : Request := ⟨[WWW, TEST], 1⟩
+
+theorem rootSpec_ok : rootSpec.okAll = true := by decide +kernel
+theorem testSpec_ok : testSpec.okAll = true := by decide +kernel
+
+theorem net_wf : ∀ z ∈ net, z.WF := by
+  intro z hz
+  simp only [net, List.mem_cons, List.mem_nil_iff, or_false] at hz
+  rcases hz with rfl | rfl
+  · exact build_wf rootSpec _ (by simp [build, rootSpec_ok])
+  · exact build_wf testSpec _ (by simp [build, testSpec_ok])
+
+theorem cache0_ok : CacheOk net .all state0.cache := fun _ h => by cases h
+
+#print axioms resolve_correct
+/-- With nothing lost, the resolver answers what the hierarchy answers. -/
+example : ∃ st' ls', run net .all config state0 qWww [false, false] = some (Resolver.spec net .all qWww, st', ls') :=
+  (resolve_correct (cfg := config) (q := qWww) net_wf cache0_ok).2 (by decide) (by decide) _ (by decide)
+
+/-- That answer is `www.test.`'s A record, after a referral from the root. -/
+example : (run net .all config state0 qWww []).map (·.1) =
+    some ⟨.noerror, true, [⟨[WWW, TEST], 1, 300, [.a [192, 0, 2, 10]]⟩], [], [], 0⟩ := by
+  decide +kernel
+
+/-- With the only root server's reply lost, it is SERVFAIL. -/
+example : (run net .all config state0 qWww [true]).map (·.1) = some servfail := by
+  decide +kernel
+
+#print axioms measure_decreases
+example : measure (Resolver.step ⟨[], some ⟨qWww, [], [[LA]], 3⟩⟩ .lost).1 < 4 :=
+  (measure_decreases (res := ⟨qWww, [], [[LA]], 3⟩) rfl .lost).1
+
+#print axioms resolve_terminates
+example : ∃ r st' ls', run net .all config state0 qWww [true, false, true] = some (r, st', ls') :=
+  resolve_terminates _ _ _ _ _ _
+
+#print axioms glue_never_served
+example : ∀ r st' ls', run net .all config state0 qWww [false, true] = some (r, st', ls') →
+    ∀ s ∈ r.answer, ∃ z ∈ net, ∃ resp, answer z qWww .all = .response resp ∧ s ∈ resp.answer :=
+  fun _ _ _ h => glue_never_served net_wf cache0_ok h
+
+end Resolver
 
 end Dns.Examples

@@ -323,6 +323,19 @@ structure WellFormed (tr : Tree S) : Prop where
   dsSets : ∀ z ∈ tr, ∀ n ns set g, z.zone.node n = some (.cut ns (some set) g) → set.owner = n ∧ set.rtype = 43
   apexes : ∀ z ∈ tr, labelsOf z.apex = z.apex.length
 
+/-- The DS-set condition of `WellFormed` as a check over the zones' nodes. -/
+def dsSetsB (tr : Tree S) : Bool :=
+  tr.all fun z => z.zone.nodes.all fun e =>
+    match e.2 with
+    | .cut _ (some set) _ => set.owner == e.1 && set.rtype == 43
+    | _ => true
+
+theorem dsSets_of {tr : Tree S} (h : dsSetsB tr = true) :
+    ∀ z ∈ tr, ∀ n ns set g, z.zone.node n = some (.cut ns (some set) g) → set.owner = n ∧ set.rtype = 43 := by
+  intro z hz n ns set g hn
+  have := (List.all_eq_true.mp ((List.all_eq_true.mp h) z hz)) (n, .cut ns (some set) g) (lookup_mem hn)
+  simpa using this
+
 theorem zone_signsWell {tr : Tree S} {P : AlgorithmPolicy} {t : Nat} (hc : check tr P t = []) (hwf : WellFormed tr)
     {z : SignedZone S} (hz : z ∈ tr) (hne : z.signers ≠ []) : SignsWell z P t := by
   refine ⟨hwf.honest z hz, fun s hs => ?_, ?_⟩

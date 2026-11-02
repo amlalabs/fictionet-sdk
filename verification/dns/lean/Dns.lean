@@ -5,4 +5,10 @@ import Dns.Zone
 import Dns.Partial
 import Dns.Authority
 import Dns.Exchange
+import Dns.Dnssec
+import Dns.Policy
+import Dns.Records
+import Dns.Chain
+import Dns.Cache
+import Dns.Resolver
 import Dns.Axioms
