@@ -19,9 +19,9 @@ use fictionet::stdlib::protocols::dns::rr::rdata::{A, CNAME, NS, SOA, TXT};
 use fictionet::stdlib::protocols::dns::rr::{
     LowerName, Name, RData, Record, RecordSet, RecordType,
 };
-use fictionet::stdlib::protocols::dns::{Ede, EdeCode, Request, Response};
+use fictionet::stdlib::protocols::dns::{Ede, EdeCode, Request, Response, read_message};
 use fictionet::stdlib::services::dns::authority::{
-    Authority, AuthorityEngine, Known, ServerConfig, Step, Zones,
+    Authority, AuthorityEngine, Identity, Known, ServerConfig, Step, Zones,
 };
 use fictionet::stdlib::services::dns::memory::{Exchanges, MemoryNet, drive};
 use fictionet::stdlib::services::dns::resolver::{Config, Entry, FailureKind, Key, Resolver, Work};
@@ -2248,4 +2248,390 @@ fn truncated_answers_from_a_slow_server_are_fetched_over_tcp() {
     );
     assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
     assert_eq!(reply.answers.len(), 8);
+}
+
+#[test]
+fn a_record_with_empty_rdata_resolves() {
+    const TEST: &str = "192.0.2.77";
+    let root = delegation(
+        builder(".", "a.root-servers.net.").rrset(rrset(
+            "a.root-servers.net.",
+            3600,
+            vec![a(ROOT)],
+        )),
+        "test.",
+        "ns.test.",
+        Some(TEST),
+        None,
+    )
+    .build()
+    .unwrap();
+    // RFC 3597 §5: a record of an unknown type with no RDATA.
+    let test = Zone::from_master(
+        &format!(
+            "$ORIGIN test.
+$TTL 3600
+@   SOA ns hostmaster 1 7200 3600 1209600 900
+@   NS  ns
+ns  A   {TEST}
+e   TYPE65281 \\# 0
+e   A   192.0.2.5
+"
+        ),
+        None,
+    )
+    .unwrap();
+    let mut net = MemoryNet::new();
+    serve_at(&mut net, ROOT, vec![root]);
+    serve_at(&mut net, TEST, vec![test]);
+    let mut resolver = resolver(config(None));
+    let empty = RecordType::Unknown(65281);
+    let answers = drive(
+        &mut resolver,
+        &mut net,
+        vec![query(client(1), "e.test.", empty, |_| {})],
+        at(0),
+        &entropy(),
+    );
+    let reply = read_message(&answers[0].bytes).unwrap();
+    assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(rows(&reply.answers), [("e.test.".to_string(), empty)]);
+    let RData::Update0(rtype) = reply.answers[0].data else {
+        panic!("empty RDATA: {:?}", reply.answers[0].data);
+    };
+    assert_eq!(rtype, empty);
+}
+
+/// The owner and type of each record.
+fn rows(records: &[Record]) -> Vec<(String, RecordType)> {
+    records
+        .iter()
+        .map(|record| (record.name.to_string(), record.record_type()))
+        .collect()
+}
+
+#[test]
+fn a_cname_asked_for_below_a_dname_is_vouched_for_by_the_dname() {
+    let root_keys = keys(10);
+    let example_keys = keys(40);
+    let root = delegation(
+        builder(".", "a.root-servers.net.").rrset(rrset(
+            "a.root-servers.net.",
+            3600,
+            vec![a(ROOT)],
+        )),
+        "example.",
+        "ns1.example.",
+        Some(EXAMPLE),
+        Some(ds(&example_keys, "example.")),
+    )
+    .build()
+    .unwrap()
+    .signed(&root_keys, window(), Denial::Nsec)
+    .unwrap();
+    let example = builder("example.", "ns1.example.")
+        .rrset(rrset("ns1.example.", 3600, vec![a(EXAMPLE)]))
+        .rrset(rrset("d.example.", 300, vec![dname(&name("t.example."))]))
+        .rrset(rrset("x.t.example.", 300, vec![a("192.0.2.77")]))
+        .build()
+        .unwrap()
+        .signed(&example_keys, window(), Denial::Nsec)
+        .unwrap();
+    let mut net = MemoryNet::new();
+    serve_at(&mut net, ROOT, vec![root]);
+    serve_at(&mut net, EXAMPLE, vec![example]);
+    let anchors = Anchors::of(vec![root_keys.anchor(&Name::root())]);
+    for (qtype, last) in [
+        (RecordType::A, RecordType::A),
+        (RecordType::CNAME, RecordType::CNAME),
+    ] {
+        let mut resolver = resolver(config(Some(anchors.clone())));
+        let reply = ask(
+            &mut resolver,
+            &mut net,
+            0,
+            query(client(1), "x.d.example.", qtype, dnssec_ok),
+        );
+        assert_eq!(
+            reply.metadata.response_code,
+            ResponseCode::NoError,
+            "{qtype}"
+        );
+        assert!(reply.metadata.authentic_data, "{qtype}");
+        let types: Vec<RecordType> = reply
+            .answers
+            .iter()
+            .map(Record::record_type)
+            .filter(|rtype| *rtype != RecordType::RRSIG)
+            .collect();
+        assert_eq!(
+            types[..2],
+            [RecordType::DNAME, RecordType::CNAME],
+            "{qtype}"
+        );
+        assert_eq!(types.last(), Some(&last), "{qtype}");
+    }
+}
+
+#[test]
+fn a_bogus_nxdomain_is_fetched_again_after_the_failure_ttl() {
+    let (mut net, anchors) = internet(true);
+    let mut resolver = resolver(config(anchors));
+    let nx = || query(client(1), "nx.bad.com.", RecordType::A, dnssec_ok);
+    let reply = ask(&mut resolver, &mut net, 0, nx());
+    assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
+    // Past the 5 seconds a Bogus result lives, the server is asked again.
+    let before = asked(&net).len();
+    let reply = ask(&mut resolver, &mut net, 10, nx());
+    assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
+    let again: Vec<String> = asked(&net)[before..]
+        .iter()
+        .map(|(_, name, _, _)| name.clone())
+        .collect();
+    assert!(again.contains(&"nx.bad.com.".to_string()), "{again:?}");
+}
+
+#[test]
+fn a_fresh_secure_answer_lives_no_longer_than_its_signatures() {
+    let (mut net, anchors) = internet(true);
+    // The signatures expire 60 seconds after the run starts.
+    let mut resolver = Resolver::new(
+        config(anchors),
+        Ring,
+        WallClock {
+            start: date(1_800_000_000 - 60),
+        },
+    );
+    for (seconds, port) in [(0, 1), (1, 2)] {
+        let reply = ask(
+            &mut resolver,
+            &mut net,
+            seconds,
+            query(client(port), "www.example.com.", RecordType::A, dnssec_ok),
+        );
+        assert!(reply.metadata.authentic_data);
+        let limit = 61 - seconds as u32;
+        for record in &reply.answers {
+            assert!(record.ttl <= limit, "{seconds}: {record}");
+        }
+    }
+}
+
+#[test]
+fn root_ns_with_ttl_0_serve_the_question_they_were_primed_for() {
+    let root = Zone::builder(name("."), soa("."), 3600)
+        .rrset(rrset(".", 0, vec![ns("a.root-servers.net.")]))
+        .rrset(rrset("a.root-servers.net.", 3600, vec![a(ROOT)]));
+    let root = delegation(root, "com.", "ns.nic.com.", Some(COM), None)
+        .build()
+        .unwrap();
+    let com = delegation(
+        builder("com.", "ns.nic.com.").rrset(rrset("ns.nic.com.", 3600, vec![a(COM)])),
+        "example.com.",
+        "ns1.example.com.",
+        Some(EXAMPLE),
+        None,
+    )
+    .build()
+    .unwrap();
+    let example = builder("example.com.", "ns1.example.com.")
+        .rrset(rrset("ns1.example.com.", 3600, vec![a(EXAMPLE)]))
+        .rrset(rrset("www.example.com.", 300, vec![a("192.0.2.80")]))
+        .build()
+        .unwrap();
+    let mut net = MemoryNet::new();
+    serve_at(&mut net, ROOT, vec![root]);
+    serve_at(&mut net, COM, vec![com]);
+    serve_at(&mut net, EXAMPLE, vec![example]);
+    let mut resolver = resolver(config(None));
+    let reply = ask(
+        &mut resolver,
+        &mut net,
+        0,
+        query(client(1), "www.example.com.", RecordType::A, |_| {}),
+    );
+    assert_eq!(addresses(&reply), ["192.0.2.80"]);
+    let priming = asked(&net)
+        .into_iter()
+        .filter(|(_, name, rtype, _)| name == "." && *rtype == RecordType::NS)
+        .count();
+    assert_eq!(priming, 1);
+}
+
+#[test]
+fn the_work_bound_says_no_reachable_authority_only_when_no_server_replied() {
+    // Every server in this hierarchy replies, wherever the bound cuts the
+    // question off.
+    for queries in 1..14u16 {
+        let (mut net, _) = internet(false);
+        let mut resolver = resolver(Config {
+            work: Work { queries, depth: 11 },
+            ..config(None)
+        });
+        let reply = ask(
+            &mut resolver,
+            &mut net,
+            0,
+            query(client(1), "away.example.com.", RecordType::A, |_| {}),
+        );
+        if reply.metadata.response_code == ResponseCode::ServFail {
+            assert_eq!(edes(&reply), [EdeCode::OTHER], "{queries} queries");
+        }
+    }
+}
+
+#[test]
+fn priming_offers_room_for_the_roots_ns_rrset_and_glue() {
+    // Google's resolver advertises 512 octets to its clients.
+    let mut google = Resolver::new(
+        Config {
+            hints: vec![(name("a.root-servers.net."), ip(ROOT))],
+            ..Config::google(Identity::none())
+        },
+        Ring,
+        clock(),
+    );
+    let www = query(client(1), "www.example.com.", RecordType::A, |_| {});
+    google.handle(Input::Query(www), at(0), &entropy());
+    let sent = std::iter::from_fn(|| google.poll())
+        .find_map(|action| match action {
+            Action::Send(transmit) => Some(transmit),
+            _ => None,
+        })
+        .expect("a query to the root");
+    let priming = Message::from_vec(&sent.bytes).unwrap();
+    assert_eq!(priming.queries[0].name(), &Name::root());
+    assert_eq!(priming.queries[0].query_type(), RecordType::NS);
+    assert_eq!(priming.edns.unwrap().max_payload(), 1232);
+}
+
+/// Answers as the authority it wraps does, but never answers a DS
+/// question.
+struct NoDs<A>(A);
+
+impl<A: Authority> Authority for NoDs<A> {
+    fn respond(
+        &self,
+        req: &Request,
+        local: SocketAddr,
+        server: &ServerConfig,
+        client: &Client,
+        known: &dyn Known,
+    ) -> Step {
+        if req.question.query_type() == RecordType::DS {
+            return Step::Silent;
+        }
+        self.0.respond(req, local, server, client, known)
+    }
+}
+
+#[test]
+fn an_insecure_delegation_above_a_server_silent_for_ds_makes_the_answer_insecure() {
+    const SUB: &str = "192.0.2.31";
+    let root_keys = keys(10);
+    let org_keys = keys(30);
+    let root = delegation(
+        builder(".", "a.root-servers.net.").rrset(rrset(
+            "a.root-servers.net.",
+            3600,
+            vec![a(ROOT)],
+        )),
+        "org.",
+        "ns.nic.org.",
+        Some(ORG),
+        Some(ds(&org_keys, "org.")),
+    )
+    .build()
+    .unwrap()
+    .signed(&root_keys, window(), Denial::Nsec)
+    .unwrap();
+    // `example.org` is delegated without DS, as org's NSEC proves.
+    let org = delegation(
+        builder("org.", "ns.nic.org.").rrset(rrset("ns.nic.org.", 3600, vec![a(ORG)])),
+        "example.org.",
+        "ns1.example.org.",
+        Some(EXAMPLE_ORG),
+        None,
+    )
+    .build()
+    .unwrap()
+    .signed(&org_keys, window(), Denial::Nsec)
+    .unwrap();
+    let example = delegation(
+        builder("example.org.", "ns1.example.org.").rrset(rrset(
+            "ns1.example.org.",
+            3600,
+            vec![a(EXAMPLE_ORG)],
+        )),
+        "sub.example.org.",
+        "ns.sub.example.org.",
+        Some(SUB),
+        None,
+    )
+    .build()
+    .unwrap();
+    let sub = builder("sub.example.org.", "ns.sub.example.org.")
+        .rrset(rrset("ns.sub.example.org.", 3600, vec![a(SUB)]))
+        .rrset(rrset("www.sub.example.org.", 300, vec![a("192.0.2.77")]))
+        .build()
+        .unwrap();
+    let mut net = MemoryNet::new();
+    serve_at(&mut net, ROOT, vec![root]);
+    serve_at(&mut net, ORG, vec![org]);
+    serve_at(&mut net, SUB, vec![sub]);
+    // The server of `example.org` never answers the DS question for
+    // `sub.example.org`, which the validation does not need.
+    let zones = Zones::new(vec![Arc::new(example) as Arc<dyn ZoneData>]);
+    let local = SocketAddr::new(ip(EXAMPLE_ORG), 53);
+    net.serve(
+        ip(EXAMPLE_ORG),
+        AuthorityEngine::new(NoDs(zones), ServerConfig::generic(), local),
+    );
+    let anchors = Anchors::of(vec![root_keys.anchor(&Name::root())]);
+    let mut resolver = resolver(config(Some(anchors)));
+    let reply = ask(
+        &mut resolver,
+        &mut net,
+        0,
+        query(client(1), "www.sub.example.org.", RecordType::A, dnssec_ok),
+    );
+    assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(addresses(&reply), ["192.0.2.77"]);
+    assert!(!reply.metadata.authentic_data);
+}
+
+#[test]
+fn a_query_with_rd_clear_never_gets_data_no_check_validated() {
+    let (mut net, anchors) = internet(true);
+    let mut google = resolver(Config {
+        rd0_from_cache: true,
+        ..config(anchors)
+    });
+    // Validating `www.bad.com` fetches and caches `bad.com`'s DNSKEY set,
+    // which no check validates.
+    let reply = ask(
+        &mut google,
+        &mut net,
+        0,
+        query(client(1), "www.bad.com.", RecordType::A, dnssec_ok),
+    );
+    assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
+    let norec = |message: &mut Message| {
+        message.metadata.recursion_desired = false;
+        dnssec_ok(message);
+    };
+    let reply = ask(
+        &mut google,
+        &mut net,
+        1,
+        query(client(1), "bad.com.", RecordType::DNSKEY, norec),
+    );
+    assert!(reply.answers.is_empty(), "{:?}", reply.answers);
+    // It gets the referral a server answering from its cache gives.
+    assert!(
+        reply
+            .authorities
+            .iter()
+            .any(|record| record.record_type() == RecordType::NS)
+    );
 }

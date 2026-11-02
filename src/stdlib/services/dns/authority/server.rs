@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use fictionet::stdlib::protocols::dns::op::{Edns, Header, Message, MessageType, ResponseCode};
+use fictionet::stdlib::protocols::dns::read_message;
 use fictionet::stdlib::protocols::dns::rr::rdata::opt::EdnsCode;
 use fictionet::stdlib::protocols::dns::rr::rdata::{SOA, TXT};
 use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, Name, RData, Record, RecordType};
@@ -247,7 +248,7 @@ impl ServerConfig {
         if bytes.len() <= limit.octets() && nsid.is_none() {
             return Some(bytes);
         }
-        let mut message = match Message::from_vec(&bytes) {
+        let mut message = match read_message(&bytes) {
             Ok(message) => message,
             Err(_) if bytes.len() <= limit.octets() => return Some(bytes),
             Err(_) => return None,

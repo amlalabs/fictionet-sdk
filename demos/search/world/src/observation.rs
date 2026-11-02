@@ -4,7 +4,7 @@ use crate::pages::{Edit, Meta, Pages, Response, Source};
 use fictionet::stdlib::protocols::dns::dnssec::Validation;
 use fictionet::stdlib::protocols::dns::op::ResponseCode;
 pub use fictionet::stdlib::protocols::dns::rr::Name as HostName;
-use fictionet::stdlib::protocols::dns::rr::{RData, RecordType};
+use fictionet::stdlib::protocols::dns::rr::RecordType;
 use fictionet::stdlib::services::dns::Event;
 pub use fictionet_extras::models::UpstreamPhase as EgressPhase;
 use http::{
@@ -204,11 +204,7 @@ impl SearchObs {
         let address = answers
             .iter()
             .flat_map(|set| set.records_without_rrsigs())
-            .find_map(|record| match &record.data {
-                RData::A(a) => Some(IpAddr::V4(a.0)),
-                RData::AAAA(aaaa) => Some(IpAddr::V6(aaaa.0)),
-                _ => None,
-            });
+            .find_map(|record| record.data.ip_addr());
         Some(SearchObs::Resolved {
             server: server.ip(),
             name,

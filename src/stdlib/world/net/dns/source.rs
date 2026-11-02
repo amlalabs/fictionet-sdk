@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fictionet::Cx;
-use fictionet::stdlib::protocols::dns::op::Message;
+use fictionet::stdlib::protocols::dns::read_message;
 use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, RecordType};
 use fictionet::stdlib::protocols::dns::{Parsed, Request, restore};
 use fictionet::stdlib::services::dns::authority::{Ask, Observed};
@@ -284,7 +284,7 @@ impl<S: Source> Source for Cached<S> {
 /// `None` for a reply that does not parse, is truncated, or has no
 /// records.
 fn smallest_ttl(reply: &[u8]) -> Option<u32> {
-    let message = Message::from_vec(reply).ok()?;
+    let message = read_message(reply).ok()?;
     if message.metadata.truncation {
         return None;
     }

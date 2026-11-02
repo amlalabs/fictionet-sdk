@@ -3,14 +3,17 @@
 //! servers, and the tokens and generations that tie each completion to
 //! the exchange and the session it belongs to.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 
 use fictionet::Entropy;
+use fictionet::stdlib::protocols::dns::op::{Message, MessageType, Query};
+use fictionet::stdlib::protocols::dns::read_message;
 use fictionet::stdlib::services::serve::{Sandbox, Transport};
 use fictionet::time::Instant;
 
 use super::clock::WallClock;
-use super::event::Event;
+use super::event::{Event, Unmatched};
 
 /// A session of a namespace. Generations only grow: a world advances its
 /// namespace when a session changes, and the engines it drives follow.
@@ -184,6 +187,86 @@ pub enum Action {
     Abandon(Token),
     /// Something the world may want to see.
     Event(Event),
+}
+
+/// What a reply must repeat of the query an engine sent, for item 4 of
+/// the [`Engine`] contract.
+pub(super) struct Sent<'a> {
+    /// The server the query went to.
+    pub(super) to: SocketAddr,
+    /// How it went.
+    pub(super) transport: Transport,
+    /// The query's ID and question. `None` when the query did not decode,
+    /// so no reply can match it.
+    pub(super) asked: Option<(u16, &'a Query)>,
+    /// Whether the QNAME must come back in the exact case it was sent, as
+    /// when its case was randomised (draft-vixie-dnsext-dns0x20).
+    pub(super) exact_case: bool,
+}
+
+/// The exchange `token` names among `exchanges`, if it is outstanding in
+/// the current generation of `tokens`.
+pub(super) fn outstanding<'a, X>(
+    tokens: &Tokens,
+    exchanges: &'a BTreeMap<Token, X>,
+    token: Token,
+) -> Result<&'a X, Unmatched> {
+    if token.generation() < tokens.generation() {
+        return Err(Unmatched::OldGeneration);
+    }
+    exchanges.get(&token).ok_or(Unmatched::NotOutstanding)
+}
+
+/// The reply `bytes`, if it answers the query `sent` describes: it came
+/// from the server the query went to, over the same transport, and is a
+/// response with the query's ID and its one question (RFC 5452 §9.1).
+/// Otherwise why it does not, checked in that order.
+pub(super) fn matching(
+    sent: &Sent<'_>,
+    from: SocketAddr,
+    transport: Transport,
+    bytes: &[u8],
+) -> Result<Message, Unmatched> {
+    if from != sent.to || transport != sent.transport {
+        return Err(Unmatched::WrongPeer);
+    }
+    let reply = read_message(bytes).map_err(|_| Unmatched::Malformed)?;
+    if reply.metadata.message_type != MessageType::Response {
+        return Err(Unmatched::Malformed);
+    }
+    let Some((id, asked)) = sent.asked else {
+        return Err(Unmatched::WrongQuestion);
+    };
+    if reply.metadata.id != id {
+        return Err(Unmatched::WrongId);
+    }
+    let same = |got: &Query| {
+        let name = if sent.exact_case {
+            got.name().eq_case(asked.name())
+        } else {
+            got.name() == asked.name()
+        };
+        name && got.query_type() == asked.query_type() && got.query_class() == asked.query_class()
+    };
+    match reply.queries.as_slice() {
+        [got] if same(got) => Ok(reply),
+        _ => Err(Unmatched::WrongQuestion),
+    }
+}
+
+/// The event for a completion that changed nothing, and why.
+pub(super) fn ignored(
+    at: Instant,
+    token: Token,
+    from: Option<SocketAddr>,
+    why: Unmatched,
+) -> Action {
+    Action::Event(Event::Ignored {
+        at,
+        token,
+        from,
+        why,
+    })
 }
 
 /// A session of a namespace: its generation and the wall clock its

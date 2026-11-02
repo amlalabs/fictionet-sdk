@@ -71,6 +71,7 @@ use http::{HeaderValue, Method, Request, Response, StatusCode};
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::codec::base64::{self, Padding};
 use fictionet::stdlib::protocols::dns::op::{Edns, Message, MessageType, OpCode, Query};
+use fictionet::stdlib::protocols::dns::read_message;
 use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RData, Record, RecordType};
 use fictionet::stdlib::protocols::dns::{Framing, Queries, stream_framed};
 use fictionet::stdlib::protocols::json::Value;
@@ -669,7 +670,7 @@ fn record_type(text: &str) -> Option<RecordType> {
 /// type `json`, or as the message itself when that is `None`. Every DNS
 /// answer, SERVFAIL and NXDOMAIN included, is `200 OK` (RFC 8484 §4.2.1).
 fn answered(answer: Vec<u8>, json: Option<&'static str>) -> Response<Body> {
-    let message = Message::from_vec(&answer).ok();
+    let message = read_message(&answer).ok();
     let freshness = message.as_ref().and_then(freshness);
     let (body, media) = match (json, &message) {
         (Some(media), Some(message)) => (Body::from(to_json(message)), media),

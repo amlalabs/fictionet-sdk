@@ -435,8 +435,44 @@ impl Cache {
     /// count toward the RRset's TTL. A Bogus or Indeterminate RRset lives
     /// no longer than [`Limits::failure_ttl`]: the result is a failure, so
     /// it is answered as one for that long and then fetched and validated
-    /// again (RFC 9520 §3.2, RFC 4035 §4.7).
+    /// again (RFC 9520 §3.2, RFC 4035 §4.7). The result of an NXDOMAIN,
+    /// kept under type ANY, holds for its copies under the types it
+    /// answered too.
     pub fn validated(
+        &mut self,
+        key: &Key,
+        result: Validation,
+        signatures_expire: Option<Instant>,
+        original_ttl: Option<u32>,
+        now: Instant,
+    ) {
+        let mut keys = vec![key.clone()];
+        if key.rtype == RecordType::ANY {
+            let copies = self
+                .entries
+                .range(Key::new(key.name.clone(), RecordType::from(0), key.class)..)
+                .take_while(|(other, _)| other.name == key.name)
+                .filter(|(other, stored)| {
+                    other.class == key.class
+                        && other.rtype != RecordType::ANY
+                        && matches!(
+                            stored.entry,
+                            Entry::Negative {
+                                kind: Negative::NxDomain,
+                                ..
+                            }
+                        )
+                })
+                .map(|(other, _)| other.clone());
+            keys.extend(copies);
+        }
+        for key in keys {
+            self.validated_one(&key, result, signatures_expire, original_ttl, now);
+        }
+    }
+
+    /// [`validated`](Cache::validated) for the entry at `key` alone.
+    fn validated_one(
         &mut self,
         key: &Key,
         result: Validation,

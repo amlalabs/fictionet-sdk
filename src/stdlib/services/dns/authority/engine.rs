@@ -7,7 +7,8 @@ use std::net::SocketAddr;
 
 use fictionet::Entropy;
 use fictionet::stdlib::protocols::dns::dnssec::Validation;
-use fictionet::stdlib::protocols::dns::op::{Header, Message, MessageType, Query, ResponseCode};
+use fictionet::stdlib::protocols::dns::op::{Header, Message, Query, ResponseCode};
+use fictionet::stdlib::protocols::dns::read_message;
 use fictionet::stdlib::protocols::dns::rr::{DNSClass, RecordType};
 use fictionet::stdlib::protocols::dns::serialize::binary::{BinDecodable, BinDecoder};
 use fictionet::stdlib::protocols::dns::{Ede, EdeCode, Parsed, Request};
@@ -16,8 +17,8 @@ use fictionet::time::Instant;
 
 use super::super::event::{Event, ObservedKind, QueryFlags, ReplyFlags, Unmatched};
 use super::super::exchange::{
-    Action, Answer, Client, ClientQuery, Engine, ExchangeFailure, Generation, Input, Session,
-    Token, Tokens, Transmit,
+    Action, Answer, Client, ClientQuery, Engine, ExchangeFailure, Generation, Input, Sent, Session,
+    Token, Tokens, Transmit, ignored, matching, outstanding,
 };
 use super::super::records::rrsets;
 use super::{Ask, Authority, Known, Observed, ServerConfig, Step, bare_reply};
@@ -232,10 +233,7 @@ impl<A: Authority> AuthorityEngine<A> {
     /// The exchange `token` names, if it is outstanding in the current
     /// generation.
     fn outstanding(&self, token: Token) -> Result<&Exchange, Unmatched> {
-        if token.generation() < self.tokens.generation() {
-            return Err(Unmatched::OldGeneration);
-        }
-        self.exchanges.get(&token).ok_or(Unmatched::NotOutstanding)
+        outstanding(&self.tokens, &self.exchanges, token)
     }
 
     /// The RCODE of a reply that answers `token`'s exchange, or why it
@@ -248,37 +246,20 @@ impl<A: Authority> AuthorityEngine<A> {
         bytes: &[u8],
     ) -> Result<ResponseCode, Unmatched> {
         let exchange = self.outstanding(token)?;
-        if from != exchange.ask.server || transport != exchange.ask.transport {
-            return Err(Unmatched::WrongPeer);
-        }
-        let reply = Message::from_vec(bytes).map_err(|_| Unmatched::Malformed)?;
-        if reply.metadata.message_type != MessageType::Response {
-            return Err(Unmatched::Malformed);
-        }
-        let Some((id, question)) = &exchange.asked else {
-            return Err(Unmatched::WrongQuestion);
+        let sent = Sent {
+            to: exchange.ask.server,
+            transport: exchange.ask.transport,
+            asked: exchange
+                .asked
+                .as_ref()
+                .map(|(id, question)| (*id, question)),
+            exact_case: false,
         };
-        if reply.metadata.id != *id {
-            return Err(Unmatched::WrongId);
-        }
-        let same = |asked: &Query| {
-            asked.name() == question.name()
-                && asked.query_type() == question.query_type()
-                && asked.query_class() == question.query_class()
-        };
-        match reply.queries.as_slice() {
-            [asked] if same(asked) => Ok(reply.metadata.response_code),
-            _ => Err(Unmatched::WrongQuestion),
-        }
+        matching(&sent, from, transport, bytes).map(|reply| reply.metadata.response_code)
     }
 
     fn ignore(&mut self, token: Token, from: Option<SocketAddr>, why: Unmatched) {
-        self.queue.push_back(Action::Event(Event::Ignored {
-            at: self.now,
-            token,
-            from,
-            why,
-        }));
+        self.queue.push_back(ignored(self.now, token, from, why));
     }
 
     /// Ends `token`'s exchange with `observed`, and asks the authority
@@ -413,7 +394,7 @@ impl<A: Authority> Engine for AuthorityEngine<A> {
 /// The event for a reply of `bytes` sent to `client`.
 fn reply_event(at: Instant, server: SocketAddr, client: Client, bytes: &[u8]) -> Event {
     let size = u16::try_from(bytes.len()).expect("a reply fits a DNS message's 65535 octets");
-    let (question, rcode, flags, answers, ede) = match Message::from_vec(bytes) {
+    let (question, rcode, flags, answers, ede) = match read_message(bytes) {
         Ok(message) => {
             let ede = message.edns.as_ref().and_then(|edns| {
                 edns.options()
