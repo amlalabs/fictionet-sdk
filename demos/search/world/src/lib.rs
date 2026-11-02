@@ -45,7 +45,7 @@ use fictionet::sync::Mutex;
 use observation::SearchObs;
 use pages::Pages;
 
-use dns::{Outbound, SessionSource, Uncaptured};
+use dns::{Outbound, SessionSource};
 
 pub use dns::admit;
 pub use tls::Ca;
@@ -60,9 +60,8 @@ pub use tls::Ca;
 /// (`dns::Outbound`). The
 /// public resolvers run at their real addresses, and the gateway runs a
 /// recursive resolver like Unbound with the root hints, holding no data of
-/// its own but the addresses of the Copied hosts their capture gives none
-/// (`dns::Uncaptured`). Every DNS reply either kind of resolver gives a
-/// client is reported as [`SearchObs::Resolved`].
+/// its own. Every DNS reply either kind of resolver gives a client is
+/// reported as [`SearchObs::Resolved`].
 ///
 /// Each A record a relayed reply gives for a name the session lets out
 /// gets a machine at that address, before the reply leaves: the
@@ -112,7 +111,6 @@ pub fn net(
         placed: Mutex::default(),
         refusing: Mutex::default(),
         refused: Mutex::default(),
-        uncaptured: Mutex::default(),
         addresses: PerSession::new(),
     });
     // A host refused once is served as soon as the session serves it.
@@ -124,12 +122,6 @@ pub fn net(
             }
         });
     }
-    let uncaptured = {
-        let sites = sites.clone();
-        Arc::new(Uncaptured::new(pages.clone(), move |name| {
-            sites.place_uncaptured(name)
-        }))
-    };
     let mut mirror = Mirror::new(Only::new(outbound.policy(), source), handle, &location)
         .namespace(&namespace)
         .observe(outbound.observer())
@@ -209,14 +201,12 @@ pub fn net(
     .gateway(move |host, _declared| {
         // No declared data: every site the world places declares its
         // name, and every name it serves is real, so the real
-        // hierarchy answers for all of them. Only a Copied host its
-        // capture gives no address answers here.
+        // hierarchy answers for all of them.
         let config = Config {
             negative_anchors: Some(negative_anchors.clone()),
             ..Config::unbound()
         }
-        .hints(&internet::root_hints())
-        .local(uncaptured.clone());
+        .hints(&internet::root_hints());
         host.program(
             Recursive::new(config, clock)
                 .namespace(&gateway_namespace)
@@ -260,9 +250,6 @@ struct Sites {
     /// once a session serves it: a guest that resolved the name keeps
     /// the address for the record's TTL.
     refused: Mutex<HashMap<LowerName, HashSet<Ipv4Addr>>>,
-    /// The address of each Copied host its capture gives none, which the
-    /// world's own resolver answers with (`dns::Uncaptured`).
-    uncaptured: Mutex<HashMap<LowerName, Ipv4Addr>>,
     /// The session's relayed IPv4 addresses of each name, its own or those
     /// at the end of its CNAME chain.
     addresses: PerSession<HashMap<LowerName, HashSet<Ipv4Addr>>>,
@@ -366,19 +353,6 @@ impl Sites {
                 }
             }
         }
-    }
-
-    /// The address of the machine for `name`, a Copied host its capture
-    /// gives no address: one the network picks, the first time it is
-    /// asked. `None` when the network cannot place it.
-    fn place_uncaptured(&self, name: &LowerName) -> Option<Ipv4Addr> {
-        let mut uncaptured = self.uncaptured.lock();
-        if let Some(address) = uncaptured.get(name) {
-            return Some(*address);
-        }
-        let address = self.handle.add_host(self.host(name)).ok()?.v4?;
-        uncaptured.insert(name.clone(), address);
-        Some(address)
     }
 
     /// Whether the session serves pages for `name`: a forwarded host's

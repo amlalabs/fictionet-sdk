@@ -1728,9 +1728,11 @@ impl Inner {
         }
         // The network refuses an address on the sandboxes' subnet or a
         // LAN; such an address stays without a relay. The real server
-        // speaks for itself: its CHAOS answers and NSID are relayed.
+        // speaks for itself: its CHAOS answers and NSID are relayed, and
+        // a zone transfer goes to it, which gives or refuses the zone.
         let front = ServerConfig {
             identity: None,
+            transfer: true,
             ..ServerConfig::generic()
         };
         for (addr, name) in relays {

@@ -146,7 +146,8 @@ sites. Capture dates are shown only when the archive records them.
   deeper, up to depth 5, at the fewest links they were reached by. A PDF's
   links count as a page's. The files the page uses are allowed too and copied
   when asked for. Any other address gets the site's own 404, and a host no
-  allowed address uses closes the connection unanswered; neither is fetched, so
+  allowed address uses refuses the connection, or closes it unanswered when it
+  shares its address with an allowed host; neither is fetched, so
   nothing the guest types reaches the internet except its searches and its DNS
   questions, which the real name servers answer as in Live. The site's 404 is learned
   when the first page on it is copied, by asking it once for a random path

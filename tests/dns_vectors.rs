@@ -2,11 +2,13 @@
 //! model writes (`verification/dns/lean/Gen.lean`).
 //!
 //! It runs when named, with the directory of the vectors in `DNS_VECTORS`.
-//! `cargo xtask dns-verify diff` writes the vectors and then runs it:
+//! `cargo xtask dns-verify diff` writes each seed's vectors to
+//! `target/dns-verify/vectors/<seed>` and runs it on each; the second line
+//! runs it again on the first seed's:
 //!
 //! ```text
 //! cargo xtask dns-verify diff
-//! DNS_VECTORS=target/dns-verify/vectors cargo test --test dns_vectors -- --nocapture
+//! DNS_VECTORS=target/dns-verify/vectors/1 cargo test --test dns_vectors -- --nocapture
 //! ```
 //!
 //! Each test reads one kind of vector, runs the Rust code on every case,
@@ -50,7 +52,7 @@ use fictionet::stdlib::protocols::dns::serialize::binary::{
     BinDecodable, BinDecoder, BinEncodable, BinEncoder, NameEncoding,
 };
 use fictionet::stdlib::protocols::dns::{
-    Limit, Parsed, RelayError, Request, Response, fit, restore,
+    Limit, Parsed, RelayError, Request, Response, fit, read_message, restore,
 };
 use fictionet::stdlib::protocols::json::Value;
 use fictionet::stdlib::services::dns::authority::{
@@ -496,11 +498,9 @@ fn record(line: &str) -> Record {
 }
 
 /// Whether hickory refuses the record of `line` inside a message: one it
-/// cannot read alone, or one with empty RDATA, which hickory reads only
-/// in UPDATE messages (RFC 2136 §2.4), though RFC 3597 allows it for
-/// any type without a defined format.
+/// cannot read alone.
 fn refused_in_messages(line: &str) -> bool {
-    try_record(line).is_err() || line.ends_with(" \\# 0")
+    try_record(line).is_err()
 }
 
 /// The name at `start` in a whole message, following compression pointers
@@ -1060,7 +1060,9 @@ fn wire() {
     each_case("wire", |case, tally| {
         let bytes = unhex(text(field(case, "input"), "bytes"));
         let expected = field(case, "expected");
-        let decoded = Message::from_vec(&bytes);
+        // The decoder the engines read replies with, which takes empty
+        // RDATA of any type (RFC 3597 §4).
+        let decoded = read_message(&bytes);
         match (flag(expected, "ok"), decoded) {
             (true, Ok(message)) => {
                 let lean = field(expected, "message");
@@ -1101,10 +1103,9 @@ fn wire() {
             (false, Err(_)) => Ok(()),
             (true, Err(error)) => {
                 // hickory reads the RDATA of every type it knows by that
-                // type's rules, and empty RDATA only in UPDATE messages;
-                // the Lean codec carries every type but the RFC 1035 name
-                // types as octets (RFC 3597). Such a message agrees when
-                // one of its records is one hickory refuses.
+                // type's rules; the Lean codec carries every type but the
+                // RFC 1035 name types as octets (RFC 3597). Such a message
+                // agrees when one of its records is one hickory refuses.
                 let lean = field(expected, "message");
                 let rejected = ["answer", "authority", "additional"]
                     .iter()
@@ -2041,7 +2042,7 @@ fn parent_chain(
 ) -> Result<(Anchors, Chain), String> {
     let records: Vec<String> = texts(field(parent, "zone"), "records")
         .iter()
-        .map(|line| real_ds_line(line, maker).0)
+        .map(|line| real_ds_line(line, maker))
         .collect();
     let zone = Zone::from_master(&records.join("\n"), None)
         .map_err(|e| format!("the parent does not build: {e}"))?;
@@ -2261,19 +2262,18 @@ fn symbolic_digest(owner: &Name, digest: &[u8]) -> Option<(bool, u8, Vec<u8>)> {
 
 /// A DS line with a symbolic digest, rewritten as the real DS record of
 /// the real key standing for the symbolic key the digest names, with the
-/// line's digest type, and the algorithm it names. Lines whose digest
-/// names no key, or whose digest type has no real digest here, stay as
-/// they are; a validator cannot use them either way.
-fn real_ds_line(line: &str, keys: &mut impl Keys) -> (String, Option<u8>) {
+/// line's digest type. Lines whose digest names no key, or whose digest
+/// type has no real digest here, stay as they are; a validator cannot use
+/// them either way.
+fn real_ds_line(line: &str, keys: &mut impl Keys) -> String {
     let fields = tokens(line);
     if fields[3] != "DS" {
-        return (line.to_string(), None);
+        return line.to_string();
     }
     let owner = name(&fields[0]);
-    let algorithm = fields[5].parse().expect("an algorithm");
     let digest_type = fields[6].parse().expect("a digest type");
     let named = symbolic_digest(&owner, &unhex(&fields[7]));
-    let line = match (named, DigestType::from_number(digest_type)) {
+    match (named, DigestType::from_number(digest_type)) {
         (Some((sep, algorithm, public)), Some(digest)) if public.len() == 1 => {
             let spec = KeySpec {
                 id: public[0],
@@ -2291,8 +2291,7 @@ fn real_ds_line(line: &str, keys: &mut impl Keys) -> (String, Option<u8>) {
             )
         }
         _ => line.to_string(),
-    };
-    (line, Some(algorithm))
+    }
 }
 
 /// `chain.json` with real keys standing for the symbolic ones, since
@@ -2309,19 +2308,11 @@ fn chain() {
             .any(|member| key_specs(member).iter().any(|k| k.corrupt));
         let mut zones = Vec::new();
         let policy = vector_policy(field(input, "policy"));
-        // The problem Rust reports for each DS algorithm the policy does
-        // not validate, written as Lean writes problems.
-        let mut ds_problems = BTreeSet::new();
         for member in list(input, "tree") {
-            let mut records = Vec::new();
-            for line in texts(field(member, "zone"), "records") {
-                let (real, algorithm) = real_ds_line(&line, &mut keys);
-                if let Some(algorithm) = algorithm.filter(|a| !policy.validates(*a)) {
-                    let owner = &tokens(&line)[0];
-                    ds_problems.insert(format!("unsupported_algorithm {owner} {algorithm}"));
-                }
-                records.push(real);
-            }
+            let records: Vec<String> = texts(field(member, "zone"), "records")
+                .iter()
+                .map(|line| real_ds_line(line, &mut keys))
+                .collect();
             let zone = Zone::from_master(&records.join("\n"), None)
                 .map_err(|e| format!("the zone does not build: {e}"))?;
             let specs = key_specs(member);
@@ -2339,7 +2330,7 @@ fn chain() {
         }
         let at = time(number(input, "time"));
         let refs: Vec<&Zone> = zones.iter().collect();
-        let mut rust: BTreeSet<String> = check_chain(&refs, &policy, at)
+        let rust: BTreeSet<String> = check_chain(&refs, &policy, at)
             .into_iter()
             .map(|problem| {
                 use fictionet::stdlib::services::dns::zone::ChainProblem;
@@ -2381,21 +2372,6 @@ fn chain() {
                 kind => format!("{kind} {} {}", text(p, "parent"), text(p, "child")),
             })
             .collect();
-        // Rust also reports a parent's DS records when none of them names
-        // an algorithm the policy validates, which leaves the child
-        // Insecure (RFC 9905 §2). The Lean check reports only the
-        // algorithms of a zone's own keys.
-        let ds_only: Vec<String> = rust
-            .iter()
-            .filter(|p| !lean.contains(*p) && ds_problems.contains(*p))
-            .cloned()
-            .collect();
-        if !ds_only.is_empty() {
-            tally.note("DS records with an unvalidated algorithm, which only Rust reports");
-            for problem in ds_only {
-                rust.remove(&problem);
-            }
-        }
         // `check_sound` assumes honest signers: the Lean check reads no
         // signature, so the breaks a corrupted key makes are not its to
         // report. Rust's check verifies signatures and reports them as a

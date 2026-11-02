@@ -143,6 +143,13 @@ pub enum ZoneError {
         /// The cut it is below.
         cut: LowerName,
     },
+    /// A DS RRset at a name that is not a zone cut below the apex. DS
+    /// RRsets appear only at delegation points, where the parent holds
+    /// them (RFC 4034 §5, RFC 4035 §2.4).
+    DsNotAtCut {
+        /// The DS RRset's owner.
+        owner: LowerName,
+    },
     /// An NS target at or below its own cut with no address in the glue,
     /// so the delegation cannot be followed (RFC 9471 §3.1).
     MissingInDomainGlue {
@@ -195,6 +202,9 @@ impl fmt::Display for ZoneError {
             ZoneError::DataBelowDname { owner } => write!(f, "{owner} is below a DNAME"),
             ZoneError::DataBelowCut { owner, cut } => {
                 write!(f, "{owner} is below the zone cut at {cut}")
+            }
+            ZoneError::DsNotAtCut { owner } => {
+                write!(f, "the DS RRset at {owner} is not at a zone cut")
             }
             ZoneError::MissingInDomainGlue { child, ns } => {
                 write!(f, "the delegation of {child} has no glue for {ns}")
@@ -594,6 +604,14 @@ impl Parts {
                     cut: child.clone(),
                 });
             }
+        }
+
+        // DS only at a cut (RFC 4035 §2.4). A DS RRset at a cut is the
+        // cut's, so one among the data is elsewhere.
+        if let Some((owner, _)) = self.sets.keys().find(|(_, rtype)| *rtype == RecordType::DS) {
+            return Err(ZoneError::DsNotAtCut {
+                owner: owner.clone(),
+            });
         }
 
         // In-domain glue (RFC 9471 §3.1).

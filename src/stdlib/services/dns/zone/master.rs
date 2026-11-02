@@ -2,12 +2,14 @@
 //! real root zone as IANA publishes it.
 //!
 //! The text is split into entries here, with parentheses, quotes,
-//! escapes, comments, and the `$ORIGIN` and `$TTL` directives. RDATA of
-//! the types hickory reads from text goes through hickory's own parser.
-//! DNSSEC types (DNSKEY, DS, RRSIG, NSEC, NSEC3, NSEC3PARAM, and their
-//! CDS and CDNSKEY forms), DNAME, ZONEMD (RFC 8976), and the generic
-//! `\# <length> <hex>` form of RFC 3597 are written to wire format here
-//! and decoded by hickory.
+//! escapes, comments, and the `$ORIGIN` and `$TTL` directives. Names are
+//! read here, as BIND reads them: `@`, `\DDD` and `\X` escapes, and any
+//! octets in a label. The types whose RDATA is names and numbers (NS,
+//! CNAME, PTR, DNAME, MX, SRV, SOA), the DNSSEC types (DNSKEY, DS, RRSIG,
+//! NSEC, NSEC3, NSEC3PARAM, and their CDS and CDNSKEY forms), ZONEMD
+//! (RFC 8976), and the generic `\# <length> <hex>` form of RFC 3597 are
+//! written to wire format here and decoded by hickory. RDATA of the other
+//! types hickory reads from text goes through hickory's own parser.
 
 // A zone error names the owners it is about. It comes once per read,
 // never on a path that answers questions, so its size costs nothing.
@@ -19,6 +21,7 @@ use std::str::FromStr;
 
 use fictionet::stdlib::protocols::dns::dnssec::proof::base32hex;
 use fictionet::stdlib::protocols::dns::dnssec::rdata::DNSSECRData;
+use fictionet::stdlib::protocols::dns::rr::rdata::HTTPS;
 use fictionet::stdlib::protocols::dns::rr::{
     LowerName, Name, RData, Record, RecordSet, RecordType,
 };
@@ -309,7 +312,7 @@ impl Reader {
                 .or(self.last_ttl)
                 .ok_or(MasterError::NoTtl)?,
         };
-        let data = rdata(rtype, rest, self.origin.as_ref(), &owner)?;
+        let data = rdata(rtype, rest, self.origin.as_ref())?;
         Ok(Some(Record::from_rdata(owner, ttl, data)))
     }
 }
@@ -377,15 +380,81 @@ fn rrset(records: Vec<Record>) -> RecordSet {
     set
 }
 
-/// `token` as an absolute name: `@` is the origin, and a name without a
-/// final dot is relative to it (RFC 1035 §5.1).
+/// The name `token` in RDATA, as [`absolute`] reads it. A relative name
+/// with no origin is [`MasterError::BadName`], as it is for an owner
+/// (RFC 1035 §5.1); a name that does not read is `bad`.
+fn rdata_name(
+    token: &str,
+    origin: Option<&Name>,
+    bad: impl Fn() -> MasterError,
+) -> Result<Name, MasterError> {
+    match absolute(token, origin) {
+        Some(name) => Ok(name),
+        None if origin.is_none() && absolute(token, Some(&Name::root())).is_some() => {
+            Err(MasterError::BadName)
+        }
+        None => Err(bad()),
+    }
+}
+
+/// `token` as an absolute name (RFC 1035 §5.1): `@` is the origin, and a
+/// name without a final dot is relative to it. Inside a label, `\DDD` is
+/// the octet with that decimal value and `\X` is X itself, such as an
+/// escaped dot, and every other character stands for its own octets, so
+/// a label may be any octet string (RFC 2181 §11), as BIND reads it. The
+/// case is kept.
 fn absolute(token: &str, origin: Option<&Name>) -> Option<Name> {
     if token == "@" {
         return origin.cloned();
     }
-    Name::parse(token, origin)
-        .ok()
-        .filter(|name| name.is_fqdn())
+    if token == "." {
+        return Some(Name::root());
+    }
+    let mut labels: Vec<Vec<u8>> = Vec::new();
+    let mut label = Vec::new();
+    // Whether the last character read was a dot that ends a label.
+    let mut dotted = false;
+    let mut bytes = token.bytes();
+    while let Some(byte) = bytes.next() {
+        dotted = false;
+        match byte {
+            b'.' => {
+                if label.is_empty() {
+                    return None;
+                }
+                labels.push(std::mem::take(&mut label));
+                dotted = true;
+            }
+            b'\\' => {
+                let escaped = bytes.next()?;
+                if escaped.is_ascii_digit() {
+                    let digits = [escaped, bytes.next()?, bytes.next()?];
+                    if !digits.iter().all(u8::is_ascii_digit) {
+                        return None;
+                    }
+                    let value = digits
+                        .iter()
+                        .fold(0u16, |value, digit| value * 10 + u16::from(digit - b'0'));
+                    label.push(u8::try_from(value).ok()?);
+                } else {
+                    label.push(escaped);
+                }
+            }
+            _ => label.push(byte),
+        }
+    }
+    if !label.is_empty() {
+        labels.push(label);
+    }
+    let name = Name::from_labels(labels.iter().map(Vec::as_slice)).ok()?;
+    let name = if dotted {
+        name
+    } else {
+        name.append_name(origin?).ok()?
+    };
+    // A name takes at most 255 octets on the wire (RFC 1035 §2.3.4).
+    let length: usize = name.iter().map(|label| label.len() + 1).sum::<usize>() + 1;
+    (length <= 255).then_some(name)
 }
 
 /// Whether `token` names the IN class, `None` when it names no class.
@@ -422,7 +491,6 @@ fn rdata(
     rtype: RecordType,
     tokens: &[String],
     origin: Option<&Name>,
-    owner: &Name,
 ) -> Result<RData, MasterError> {
     let bad = || MasterError::Rdata { rtype };
     let mut fields = Fields { tokens, at: 0 };
@@ -472,13 +540,13 @@ fn rdata(
                     .to_be_bytes(),
             );
             wire.extend(fields.number::<u16>().ok_or_else(bad)?.to_be_bytes());
-            let signer = absolute(fields.next().ok_or_else(bad)?, origin).ok_or_else(bad)?;
+            let signer = rdata_name(fields.next().ok_or_else(bad)?, origin, bad)?;
             write_name(&mut wire, &signer);
             wire.extend(base64(fields.rest()).ok_or_else(bad)?);
         }
         // NSEC (RFC 4034 §4.2)
         47 => {
-            let next = absolute(fields.next().ok_or_else(bad)?, origin).ok_or_else(bad)?;
+            let next = rdata_name(fields.next().ok_or_else(bad)?, origin, bad)?;
             write_name(&mut wire, &next);
             wire.extend(type_bitmap(fields.rest()).ok_or_else(bad)?);
         }
@@ -500,10 +568,38 @@ fn rdata(
                 wire.extend(type_bitmap(fields.rest()).ok_or_else(bad)?);
             }
         }
-        // DNAME (RFC 6672 §2.1)
-        39 => {
-            let target = absolute(fields.next().ok_or_else(bad)?, origin).ok_or_else(bad)?;
+        // NS, CNAME, PTR (RFC 1035 §3.3.11, §3.3.1, §3.3.12) and DNAME
+        // (RFC 6672 §2.1): one name.
+        2 | 5 | 12 | 39 => {
+            let target = rdata_name(fields.next().ok_or_else(bad)?, origin, bad)?;
             write_name(&mut wire, &target);
+        }
+        // MX (RFC 1035 §3.3.9): a preference and an exchange.
+        15 => {
+            wire.extend(fields.number::<u16>().ok_or_else(bad)?.to_be_bytes());
+            let exchange = rdata_name(fields.next().ok_or_else(bad)?, origin, bad)?;
+            write_name(&mut wire, &exchange);
+        }
+        // SRV (RFC 2782): a priority, a weight, a port, and a target.
+        33 => {
+            for _ in 0..3 {
+                wire.extend(fields.number::<u16>().ok_or_else(bad)?.to_be_bytes());
+            }
+            let target = rdata_name(fields.next().ok_or_else(bad)?, origin, bad)?;
+            write_name(&mut wire, &target);
+        }
+        // SOA (RFC 1035 §3.3.13): two names, the serial, and four times,
+        // which may be written as TTLs are, such as `1h` (RFC 2308 §4).
+        6 => {
+            for _ in 0..2 {
+                let name = rdata_name(fields.next().ok_or_else(bad)?, origin, bad)?;
+                write_name(&mut wire, &name);
+            }
+            wire.extend(fields.number::<u32>().ok_or_else(bad)?.to_be_bytes());
+            for _ in 0..4 {
+                let time = parse_ttl(fields.next().ok_or_else(bad)?).map_err(|_| bad())?;
+                wire.extend(time.to_be_bytes());
+            }
         }
         // ZONEMD (RFC 8976 §2.3)
         ZONEMD => {
@@ -512,7 +608,7 @@ fn rdata(
             wire.push(fields.number::<u8>().ok_or_else(bad)?);
             wire.extend(hex(fields.rest()).ok_or_else(bad)?);
         }
-        _ => return hickory_text(rtype, tokens, origin, owner),
+        _ => return hickory_text(rtype, tokens, origin),
     }
     if !fields.rest().is_empty() {
         return Err(bad());
@@ -521,11 +617,39 @@ fn rdata(
 }
 
 /// RDATA read by hickory's own master file parser, one record at a time.
+///
+/// hickory reads names in RDATA without `@` and through IDNA, which
+/// refuses legal labels such as `a_b`. So the one name SVCB, HTTPS, and
+/// NAPTR RDATA holds is read here with [`absolute`], and hickory reads the
+/// rest with the root name in its place.
 fn hickory_text(
     rtype: RecordType,
     tokens: &[String],
     origin: Option<&Name>,
-    owner: &Name,
+) -> Result<RData, MasterError> {
+    let bad = || MasterError::Rdata { rtype };
+    let name_at = match rtype {
+        RecordType::SVCB | RecordType::HTTPS => 1,
+        RecordType::NAPTR => 5,
+        _ => return hickory_line(rtype, tokens, origin),
+    };
+    let name = rdata_name(tokens.get(name_at).ok_or_else(bad)?, origin, bad)?;
+    let mut around = tokens.to_vec();
+    around[name_at] = ".".to_string();
+    let mut data = hickory_line(rtype, &around, origin)?;
+    match &mut data {
+        RData::SVCB(svcb) | RData::HTTPS(HTTPS(svcb)) => svcb.target_name = name,
+        RData::NAPTR(naptr) => naptr.replacement = name,
+        _ => return Err(bad()),
+    }
+    Ok(data)
+}
+
+/// RDATA of `rtype` that hickory's parser reads from `tokens`.
+fn hickory_line(
+    rtype: RecordType,
+    tokens: &[String],
+    origin: Option<&Name>,
 ) -> Result<RData, MasterError> {
     let bad = || MasterError::Rdata { rtype };
     // Every other type hickory does not read from text needs the generic
@@ -539,7 +663,9 @@ fn hickory_text(
     if tokens.iter().any(|token| token.contains(['\n', '\r'])) {
         return Err(bad());
     }
-    let line = format!("{owner} 0 IN {rtype} {}\n", tokens.join(" "));
+    // The owner is the root, since only the RDATA is kept, and hickory
+    // reads an owner as it reads names.
+    let line = format!(". 0 IN {rtype} {}\n", tokens.join(" "));
     let read = |origin: Name| {
         let (_, sets) = Parser::new(line.clone(), None, Some(origin))
             .parse()

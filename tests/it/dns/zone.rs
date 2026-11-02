@@ -587,6 +587,131 @@ deep A 192.0.2.2
     assert_eq!(*zone.apex(), lower("given."));
 }
 
+/// Names are read as BIND reads them: `@` anywhere a name goes, any
+/// octets in a label, and `\DDD` and `\X` escapes (RFC 1035 §5.1,
+/// RFC 2181 §11). A UTF-8 label keeps its octets.
+#[test]
+fn master_file_names_take_at_signs_escapes_and_any_octets() {
+    let head = "$TTL 300\n@ IN SOA @ h 1 2 3 4 5\n@ IN NS ns\nns IN A 192.0.2.1\n";
+    let read = |line: &str| {
+        Zone::from_master(&format!("{head}{line}\n"), Some(name("t.")))
+            .unwrap_or_else(|e| panic!("{line}: {e}"))
+    };
+    let data = |zone: &Zone, owner: &[u8], rtype: RecordType| -> RData {
+        let owner = LowerName::new(&Name::from_labels(owner.split(|b| *b == b'.')).unwrap());
+        let Some(Node::Data(sets)) = zone.node(&owner) else {
+            panic!("no data at {owner}");
+        };
+        sets[&rtype]
+            .records_without_rrsigs()
+            .next()
+            .unwrap()
+            .data
+            .clone()
+    };
+    let t = name("t.");
+    let www = read("www IN CNAME @");
+    assert_eq!(
+        data(&www, b"www.t", RecordType::CNAME),
+        RData::CNAME(CNAME(t.clone()))
+    );
+    let x = read("x IN MX 10 @");
+    assert_eq!(
+        data(&x, b"x.t", RecordType::MX),
+        RData::MX(MX::new(10, t.clone()))
+    );
+    let x = read("x IN PTR @");
+    assert_eq!(
+        data(&x, b"x.t", RecordType::PTR),
+        RData::PTR(PTR(t.clone()))
+    );
+    for line in ["x IN NS @", "x IN SRV 0 0 80 @"] {
+        read(line);
+    }
+    // The SOA's own names may be the origin too.
+    let Some(Node::Data(apex)) = www.node(&lower("t.")) else {
+        panic!("apex");
+    };
+    let RData::SOA(soa) = &apex[&RecordType::SOA]
+        .records_without_rrsigs()
+        .next()
+        .unwrap()
+        .data
+    else {
+        panic!("SOA");
+    };
+    assert_eq!(&soa.mname, &t);
+
+    // Labels BIND loads, with check-names warnings at most.
+    let underscores = read("xa_b.t. 300 IN A 192.0.2.41");
+    assert!(underscores.node(&lower("xa_b.t.")).is_some());
+    for (line, owner) in [
+        ("a_.t. 300 IN A 192.0.2.1", &b"a_.t"[..]),
+        ("\\200.t. 300 IN A 192.0.2.1", b"\xc8.t"),
+        ("\\001.t. 300 IN A 192.0.2.1", b"\x01.t"),
+        ("a\\032b.t. 300 IN A 192.0.2.1", b"a b.t"),
+        ("a\\ b.t. 300 IN A 192.0.2.1", b"a b.t"),
+        ("a*b.t. 300 IN A 192.0.2.1", b"a*b.t"),
+        ("a@b.t. 300 IN A 192.0.2.1", b"a@b.t"),
+        ("a\\.b.t. 300 IN A 192.0.2.1", b"a.b.t"),
+    ] {
+        let zone = read(line);
+        let label = &owner[..owner.len() - 2];
+        let wanted = LowerName::new(&Name::from_labels([label, &b"t"[..]]).unwrap());
+        assert!(zone.node(&wanted).is_some(), "{line}");
+    }
+    let x = read("x.t. 300 IN CNAME a_b.t.");
+    assert_eq!(
+        data(&x, b"x.t", RecordType::CNAME),
+        RData::CNAME(CNAME(Name::from_labels([&b"a_b"[..], b"t"]).unwrap()))
+    );
+    read("n.t. 300 IN NS ns_1.example.");
+    let x = read("x.t. 300 IN MX 1 \\200.t.");
+    assert_eq!(
+        data(&x, b"x.t", RecordType::MX),
+        RData::MX(MX::new(1, Name::from_labels([&b"\xc8"[..], b"t"]).unwrap()))
+    );
+    let svcb = read("_dns.t. 300 IN SVCB 1 dns_1.t. alpn=dot");
+    let RData::SVCB(record) = data(&svcb, b"_dns.t", RecordType::SVCB) else {
+        panic!("SVCB");
+    };
+    assert_eq!(
+        record.target_name,
+        Name::from_labels([&b"dns_1"[..], b"t"]).unwrap()
+    );
+
+    // A UTF-8 label is its octets, never punycode.
+    let utf8 = read("é.t. 300 IN A 1.2.3.4");
+    let octets = Name::from_labels(["é".as_bytes(), b"t"]).unwrap();
+    assert!(utf8.node(&LowerName::new(&octets)).is_some());
+    assert!(utf8.node(&lower("xn--9ca.t.")).is_none());
+}
+
+/// A DS RRset belongs at a zone cut, where the parent holds it, and BIND
+/// refuses a zone with one anywhere else (RFC 4035 §2.4).
+#[test]
+fn a_ds_rrset_away_from_a_cut_is_refused() {
+    let ds = "1 13 2 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF";
+    let head = "t. 300 IN SOA ns.t. h.t. 1 2 3 4 5\nt. 300 IN NS ns.t.\nns.t. 300 IN A 192.0.2.1\n";
+    for owner in ["n.t.", "t."] {
+        let text = format!("{head}{owner} 300 IN DS {ds}\n");
+        assert_eq!(
+            Zone::from_master(&text, None).err(),
+            Some(ZoneError::DsNotAtCut {
+                owner: lower(owner)
+            }),
+            "{owner}"
+        );
+    }
+    // At a cut it is the cut's.
+    let text = format!("{head}n.t. 300 IN NS ns.elsewhere.\nn.t. 300 IN DS {ds}\n");
+    let zone = Zone::from_master(&text, None).unwrap();
+    assert!(matches!(
+        zone.node(&lower("n.t.")),
+        Some(Node::Cut { ds: Some(_), .. })
+    ));
+}
+
 #[test]
 fn with_and_with_delegation_make_new_revisions() {
     let zone = example();
@@ -840,6 +965,46 @@ fn a_dname_substitutes_and_overflow_is_yxdomain() {
     let reply = ask(&zone, "d.example.", RecordType::A);
     assert!(reply.answers.is_empty());
     assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+}
+
+/// A chain that passes one DNAME twice sends it once, as BIND does: two
+/// records with the same owner, class, type, and data are one
+/// (RFC 2181 §5).
+#[test]
+fn a_dname_a_chain_passes_twice_goes_out_once() {
+    let zone = builder("example.")
+        .rrset(rrset("d.example.", 300, vec![dname(&name("t.example."))]))
+        .rrset(rrset("x.t.example.", 300, vec![cname("y.d.example.")]))
+        .rrset(rrset("y.t.example.", 300, vec![a("192.0.2.9")]))
+        .rrset(rrset(
+            "loopd.example.",
+            300,
+            vec![dname(&name("e.loopd.example."))],
+        ))
+        .build()
+        .unwrap();
+    let reply = ask(&zone, "x.d.example.", RecordType::A);
+    assert_eq!(
+        rows(&reply.answers),
+        vec![
+            row("d.example.", RecordType::DNAME),
+            row("x.d.example.", RecordType::CNAME),
+            row("x.t.example.", RecordType::CNAME),
+            row("y.d.example.", RecordType::CNAME),
+            row("y.t.example.", RecordType::A),
+        ]
+    );
+
+    // A DNAME whose target is below its owner repeats until the name
+    // passes 255 octets, and still goes out once.
+    let reply = ask(&zone, "a.loopd.example.", RecordType::A);
+    assert_eq!(reply.metadata.response_code, ResponseCode::YXDomain);
+    let dnames = reply
+        .answers
+        .iter()
+        .filter(|record| record.record_type() == RecordType::DNAME)
+        .count();
+    assert_eq!(dnames, 1);
 }
 
 #[test]
@@ -1924,6 +2089,70 @@ fn transparent_leaves_empty_non_terminals_unknown() {
     let reply = lazy_reply(&zone, "a.b.lazy.", RecordType::TXT);
     assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
     assert!(reply.answers.is_empty());
+}
+
+/// A name the provider does not know stays unknown, whatever was asked
+/// below it before: it is never an empty non-terminal, so never NODATA.
+#[test]
+fn a_lazy_name_the_provider_does_not_know_stays_unknown_after_a_name_below_it() {
+    let (book, asked) = (Book::default(), Asked::default());
+    let zone = lazy(&book, &asked);
+    put(&book, "a.lazy.", Fact::Unknown);
+    put(
+        &book,
+        "www.a.lazy.",
+        Fact::Present(vec![rrset("www.a.lazy.", 60, vec![a("10.0.0.1")])]),
+    );
+    let unknown = Answered::Unknown {
+        name: lower("a.lazy."),
+    };
+    assert_eq!(lazy_ask(&zone, "a.lazy.", RecordType::A), unknown);
+    // The walk down to the name below passes the unknown one.
+    assert_eq!(lazy_ask(&zone, "www.a.lazy.", RecordType::A), unknown);
+    assert_eq!(lazy_ask(&zone, "a.lazy.", RecordType::A), unknown);
+    // Once the provider calls it absent, it is an empty non-terminal.
+    put(&book, "a.lazy.", Fact::Absent);
+    let reply = lazy_reply(&zone, "a.lazy.", RecordType::A);
+    assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+    assert!(reply.answers.is_empty());
+    assert_eq!(
+        addresses(&lazy_reply(&zone, "www.a.lazy.", RecordType::A).answers),
+        vec!["10.0.0.1"]
+    );
+}
+
+/// A cut whose in-domain glue the provider does not know yet is unknown,
+/// and gets its glue once the provider knows it (RFC 9471 §3.1).
+#[test]
+fn a_lazy_cut_waits_for_its_in_domain_glue() {
+    let (book, asked) = (Book::default(), Asked::default());
+    let zone = lazy(&book, &asked);
+    put(
+        &book,
+        "sub.lazy.",
+        Fact::Present(vec![rrset("sub.lazy.", 60, vec![ns("ns.sub.lazy.")])]),
+    );
+    put(&book, "ns.sub.lazy.", Fact::Unknown);
+    assert_eq!(
+        lazy_ask(&zone, "www.sub.lazy.", RecordType::A),
+        Answered::Unknown {
+            name: lower("sub.lazy.")
+        }
+    );
+    put(
+        &book,
+        "ns.sub.lazy.",
+        Fact::Present(vec![rrset("ns.sub.lazy.", 60, vec![a("10.0.0.53")])]),
+    );
+    let view = view_of(&zone, "www.sub.lazy.", RecordType::A);
+    let reply = response(&*view, "www.sub.lazy.", RecordType::A, false);
+    assert!(!reply.message.metadata.authoritative);
+    assert_eq!(
+        rows(&reply.message.authorities),
+        vec![row("sub.lazy.", RecordType::NS)]
+    );
+    assert_eq!(addresses(&reply.message.additionals), vec!["10.0.0.53"]);
+    assert_eq!(reply.required_additional, 1);
 }
 
 // Locally served zones.

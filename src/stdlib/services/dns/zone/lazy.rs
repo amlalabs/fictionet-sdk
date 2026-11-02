@@ -35,9 +35,12 @@ use super::zone::{Node, targets, union};
 ///
 /// RRsets with NS below the apex make a zone cut. The provider is then
 /// asked about the cut's NS targets at or below it, and their address
-/// RRsets become the cut's glue. RRsets with a DNAME make a DNAME node.
-/// Names the provider gives RRsets to make their ancestors empty
-/// non-terminals, so a question for a parent gets NODATA.
+/// RRsets become the cut's glue; while one of those targets is unknown,
+/// so is the cut. RRsets with a DNAME make a DNAME node. Names the
+/// provider gives RRsets to make the ancestors it calls absent empty
+/// non-terminals, so a question for such a parent gets NODATA. An
+/// ancestor it does not know stays unknown, and so do the names below
+/// it.
 pub struct Lazy<P: Provider> {
     apex: LowerName,
     soa: RecordSet,
@@ -70,11 +73,17 @@ impl<P: Provider> Lazy<P> {
         }
     }
 
-    /// Asks the provider about `name` and keeps what is present.
+    /// Asks the provider about `name` and keeps what is present. A zone
+    /// cut whose glue for an NS target at or below it is unknown is not
+    /// kept: it stays unknown until the provider knows the glue.
     fn ask(&self, held: &mut Held, said: &mut BTreeMap<LowerName, Fact<()>>, name: LowerName) {
-        match self.provider.lookup(&name) {
-            Fact::Present(sets) => {
-                let node = self.node_of(&name, sets);
+        let node = match self.provider.lookup(&name) {
+            Fact::Present(sets) => self.node_of(&name, sets),
+            Fact::Absent => Fact::Absent,
+            Fact::Unknown => Fact::Unknown,
+        };
+        match node {
+            Fact::Present(node) => {
                 held.nodes.insert(name, node);
                 held.revision = Revision(held.revision.0 + 1);
             }
@@ -87,8 +96,11 @@ impl<P: Provider> Lazy<P> {
         }
     }
 
-    /// The node the provider's RRsets for `name` make.
-    fn node_of(&self, name: &LowerName, sets: Vec<RecordSet>) -> Node {
+    /// The node the provider's RRsets for `name` make, or `Unknown` for a
+    /// zone cut whose glue the provider does not know: a referral without
+    /// the glue for an NS target at or below the cut cannot be followed
+    /// (RFC 9471 §3.1).
+    fn node_of(&self, name: &LowerName, sets: Vec<RecordSet>) -> Fact<Node> {
         let mut by_type: BTreeMap<RecordType, RecordSet> = BTreeMap::new();
         for set in sets.into_iter().filter(|set| !set.is_empty()) {
             // The provider is trusted, so records of one RRset with
@@ -103,18 +115,20 @@ impl<P: Provider> Lazy<P> {
             let ds = by_type.remove(&RecordType::DS);
             let mut glue = Vec::new();
             for target in targets(&ns).into_iter().filter(|t| name.zone_of(t)) {
-                if let Fact::Present(sets) = self.provider.lookup(&target) {
-                    glue.extend(sets.into_iter().filter(|set| {
+                match self.provider.lookup(&target) {
+                    Fact::Present(sets) => glue.extend(sets.into_iter().filter(|set| {
                         matches!(set.record_type(), RecordType::A | RecordType::AAAA)
-                    }));
+                    })),
+                    Fact::Absent => {}
+                    Fact::Unknown => return Fact::Unknown,
                 }
             }
-            return Node::Cut { ns, ds, glue };
+            return Fact::Present(Node::Cut { ns, ds, glue });
         }
-        match by_type.remove(&RecordType::DNAME) {
+        Fact::Present(match by_type.remove(&RecordType::DNAME) {
             Some(dname) => Node::Dname(dname, by_type),
             None => Node::Data(by_type),
-        }
+        })
     }
 }
 
@@ -201,18 +215,23 @@ impl<P: Provider> Probe<'_, P> {
         if let Some(node) = self.held.nodes.get(name) {
             return Fact::Present(node);
         }
-        // Names below `name` follow it directly in canonical order.
-        let below = self
-            .held
-            .nodes
-            .range(name.clone()..)
-            .next()
-            .is_some_and(|(other, _)| name.zone_of(other));
-        if below {
-            return Fact::Present(&EMPTY);
-        }
+        // What the provider said comes first: a name it does not know
+        // stays unknown whatever is below it.
         match self.said.get(name) {
-            Some(Fact::Absent) => Fact::Absent,
+            Some(Fact::Absent) => {
+                // Names below `name` follow it directly in canonical order.
+                let below = self
+                    .held
+                    .nodes
+                    .range(name.clone()..)
+                    .next()
+                    .is_some_and(|(other, _)| name.zone_of(other));
+                if below {
+                    Fact::Present(&EMPTY)
+                } else {
+                    Fact::Absent
+                }
+            }
             Some(_) => Fact::Unknown,
             None => {
                 self.wanted.borrow_mut().insert(name.clone());

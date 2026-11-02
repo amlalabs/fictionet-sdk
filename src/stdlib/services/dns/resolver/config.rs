@@ -161,8 +161,11 @@ pub struct Stale {
 pub struct Work {
     /// The most queries sent to servers.
     pub queries: u16,
-    /// The deepest dependency: how many aliases one answer follows, and
-    /// how deeply lookups for name server addresses may nest.
+    /// The deepest dependency, counted apart for each, as Unbound counts
+    /// CNAME restarts apart from target fetches: how many aliases one
+    /// answer follows, and how deeply the lookups one alias's name needs,
+    /// for name server addresses and for the DS and DNSKEY sets a
+    /// validation fetches, may nest.
     pub depth: u8,
 }
 

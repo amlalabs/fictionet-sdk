@@ -1494,19 +1494,84 @@ fn an_overlay_sends_the_unsigned_delegation_proof_without_the_wildcard_cover() {
     }
 }
 
+/// Without DO the referral carries only the NS RRset, once the base's
+/// authoritative answer for `<apex> DS` shows it serves the parent.
 #[test]
-fn an_overlay_refers_without_asking_when_do_is_clear() {
+fn an_overlay_refers_without_do_once_the_base_answers_for_the_parent() {
     let mut engine = AuthorityEngine::new(overlay(), ServerConfig::generic(), local());
     let actions = ask_with(
         &mut engine,
         &query("www.fict.com.", RecordType::A, |_| {}),
         Transport::Udp,
     );
-    assert!(sends(&actions).is_empty());
+    let transmit = sends(&actions)[0].clone();
+    let asked = Message::from_vec(&transmit.bytes).unwrap();
+    assert_eq!(asked.queries[0].name(), &name("fict.com."));
+    assert_eq!(asked.queries[0].query_type(), RecordType::DS);
+    let (nxdomain, _) = com_nxdomain();
+    let real = real_reply(&transmit, |m| {
+        m.metadata.response_code = ResponseCode::NXDomain;
+        for record in &nxdomain {
+            m.add_authority(record.clone());
+        }
+    });
+    let actions = run(&mut engine, reply_to(&transmit, real), Instant::ZERO);
     let reply = the_answer(&actions);
     assert!(!reply.metadata.authoritative);
     assert_eq!(reply.authorities.len(), 1);
     assert_eq!(reply.authorities[0].record_type(), RecordType::NS);
+}
+
+/// An overlay on a server that does not serve the parent, such as a root
+/// server, answers as its base: the root refers to `com`, never straight
+/// to a zone invented below it (RFC 1034 §4.2.1).
+#[test]
+fn an_overlay_on_a_server_of_another_zone_answers_as_its_base() {
+    let root_soa = SOA::new(
+        name("a.root-servers.net."),
+        name("nstld.verisign-grs.com."),
+        1,
+        1800,
+        900,
+        604800,
+        86400,
+    );
+    let root = Zone::builder(name("."), root_soa, 86400)
+        .rrset(rrset(".", 3600, vec![ns("a.root-servers.net.")]))
+        .rrset(rrset("a.root-servers.net.", 3600, vec![a("198.41.0.4")]))
+        .delegate(
+            name("com."),
+            rrset("com.", 172800, vec![ns("a.gtld-servers.net.")]),
+            Vec::new(),
+            None,
+        )
+        .build()
+        .unwrap();
+    let overlay =
+        Overlay::new(zones(vec![root]), name("com.")).below(name("fict.com."), zones(vec![fict()]));
+    let at = "198.41.0.4:53".parse().unwrap();
+    let mut engine = AuthorityEngine::new(overlay, ServerConfig::generic(), at);
+    for dnssec_ok in [false, true] {
+        let message = query("www.fict.com.", RecordType::A, |m| {
+            m.set_edns(edns(1232, dnssec_ok));
+        });
+        let reply = the_answer(&ask_with(&mut engine, &message, Transport::Udp));
+        assert!(!reply.metadata.authoritative);
+        let ns: Vec<&Record> = reply
+            .authorities
+            .iter()
+            .filter(|record| record.record_type() == RecordType::NS)
+            .collect();
+        assert_eq!(ns.len(), 1, "DO {dnssec_ok}");
+        assert_eq!(ns[0].name, name("com."), "DO {dnssec_ok}");
+        assert!(
+            reply
+                .additionals
+                .iter()
+                .all(|record| record.name != name("ns1.fict.com.")),
+            "DO {dnssec_ok}"
+        );
+    }
 }
 
 #[test]

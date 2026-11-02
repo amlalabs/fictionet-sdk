@@ -78,13 +78,19 @@ use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::codec::base64::{self, Padding};
 use fictionet::stdlib::protocols::dns::op::{Edns, Message, MessageType, OpCode, Query};
 use fictionet::stdlib::protocols::dns::read_message;
+use fictionet::stdlib::protocols::dns::rr::rdata::HTTPS;
+use fictionet::stdlib::protocols::dns::rr::rdata::svcb::{
+    Alpn, EchConfigList, IpHint, Mandatory, SVCB, SvcParamKey, SvcParamValue, Unknown,
+};
 use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RData, Record, RecordType};
+use fictionet::stdlib::protocols::dns::serialize::binary::BinEncodable;
 use fictionet::stdlib::protocols::dns::{Framing, Queries, stream_framed};
 use fictionet::stdlib::protocols::json::Value;
 use fictionet::stdlib::protocols::urlencoded_form::{self, Form};
 use fictionet::stdlib::protocols::x509::Validity;
 use fictionet::stdlib::services::ca::{Ca, Leaf};
 use fictionet::stdlib::services::dns::Client;
+use fictionet::stdlib::services::dns::zone::dname_target;
 use fictionet::stdlib::services::serve::{
     self, ConnInfo, Driver, Flow, Pending, PendingDriver, ServeOptions, Service, Transport,
 };
@@ -842,12 +848,7 @@ fn to_json(message: &Message) -> Vec<u8> {
 
 /// One record of a JSON answer.
 fn record_json(record: &Record) -> Value {
-    let data = match &record.data {
-        // Every character-string quoted, with no space between them, as
-        // Google gives TXT and SPF data.
-        RData::TXT(txt) => txt.txt_data.iter().map(|part| quoted(part)).collect(),
-        data => data.to_string(),
-    };
+    let data = presentation(&record.data);
     Value::Object(vec![
         ("name".to_owned(), Value::from(record.name.to_string())),
         (
@@ -857,6 +858,131 @@ fn record_json(record: &Record) -> Value {
         ("TTL".to_owned(), Value::from(record.ttl)),
         ("data".to_owned(), Value::from(data)),
     ])
+}
+
+/// RDATA in presentation format, as a master file holds it and BIND reads
+/// it back.
+///
+/// TXT data is every character-string quoted, with no space between them,
+/// as Google gives TXT and SPF data. HINFO, CAA, and NAPTR strings are
+/// quoted and escaped (RFC 1035 §5.1), SVCB and HTTPS parameters are
+/// written as RFC 9460 §2.1 and Appendix A give them, and a DNAME gives
+/// its target. Types whose own text hickory writes in presentation format
+/// use it. Any other type, NULL and types hickory does not know among
+/// them, takes the generic `\# <length> <hex>` form (RFC 3597 §5).
+fn presentation(data: &RData) -> String {
+    match data {
+        RData::TXT(txt) => txt.txt_data.iter().map(|part| quoted(part)).collect(),
+        RData::HINFO(hinfo) => format!("{} {}", quoted(&hinfo.cpu), quoted(&hinfo.os)),
+        RData::CAA(caa) => format!("{} {} {}", caa.flags(), caa.tag, quoted(&caa.value)),
+        RData::NAPTR(naptr) => format!(
+            "{} {} {} {} {} {}",
+            naptr.order,
+            naptr.preference,
+            quoted(&naptr.flags),
+            quoted(&naptr.services),
+            quoted(&naptr.regexp),
+            naptr.replacement
+        ),
+        RData::SVCB(svcb) | RData::HTTPS(HTTPS(svcb)) => service_binding(svcb),
+        RData::A(_)
+        | RData::AAAA(_)
+        | RData::NS(_)
+        | RData::CNAME(_)
+        | RData::PTR(_)
+        | RData::MX(_)
+        | RData::SOA(_)
+        | RData::SRV(_)
+        | RData::SSHFP(_)
+        | RData::TLSA(_)
+        | RData::OPENPGPKEY(_)
+        | RData::DNSSEC(_) => data.to_string(),
+        _ => match dname_target(data) {
+            Some(target) => target.to_string(),
+            None => generic(data),
+        },
+    }
+}
+
+/// SVCB or HTTPS RDATA in presentation format (RFC 9460 §2.1): the
+/// priority, the target, and each parameter as `key=value`, a key without
+/// a value for `no-default-alpn` and empty values.
+fn service_binding(svcb: &SVCB) -> String {
+    let mut out = format!("{} {}", svcb.svc_priority, svcb.target_name);
+    for (key, value) in &svcb.svc_params {
+        let key = match key {
+            SvcParamKey::Mandatory => "mandatory".to_string(),
+            SvcParamKey::Alpn => "alpn".to_string(),
+            SvcParamKey::NoDefaultAlpn => "no-default-alpn".to_string(),
+            SvcParamKey::Port => "port".to_string(),
+            SvcParamKey::Ipv4Hint => "ipv4hint".to_string(),
+            SvcParamKey::EchConfigList => "ech".to_string(),
+            SvcParamKey::Ipv6Hint => "ipv6hint".to_string(),
+            other => format!("key{}", u16::from(*other)),
+        };
+        let value: Vec<u8> = match value {
+            SvcParamValue::Mandatory(Mandatory(keys)) => keys
+                .iter()
+                .map(|key| key.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+                .into_bytes(),
+            // A comma or a backslash inside one ALPN ID is escaped, so the
+            // list splits where it should (RFC 9460 Appendix A.1).
+            SvcParamValue::Alpn(Alpn(ids)) => ids
+                .iter()
+                .map(|id| id.replace('\\', "\\\\").replace(',', "\\,"))
+                .collect::<Vec<_>>()
+                .join(",")
+                .into_bytes(),
+            SvcParamValue::NoDefaultAlpn => Vec::new(),
+            SvcParamValue::Port(port) => port.to_string().into_bytes(),
+            SvcParamValue::Ipv4Hint(IpHint(addresses)) => addresses
+                .iter()
+                .map(|address| address.0.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+                .into_bytes(),
+            SvcParamValue::Ipv6Hint(IpHint(addresses)) => addresses
+                .iter()
+                .map(|address| address.0.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+                .into_bytes(),
+            SvcParamValue::EchConfigList(EchConfigList(list)) => base64::encode(list).into_bytes(),
+            SvcParamValue::Unknown(Unknown(bytes)) => bytes.clone(),
+        };
+        out.push(' ');
+        out.push_str(&key);
+        if !value.is_empty() {
+            out.push('=');
+            // A value with nothing a master file would read otherwise
+            // goes out as it is; any other is a quoted character-string.
+            let plain = value.iter().all(|byte| {
+                byte.is_ascii_graphic() && !matches!(byte, b'"' | b'\\' | b';' | b'(' | b')')
+            });
+            if plain {
+                out.push_str(&String::from_utf8_lossy(&value));
+            } else {
+                out.push_str(&quoted(&value));
+            }
+        }
+    }
+    out
+}
+
+/// RDATA in the generic form of RFC 3597 §5: `\#`, the length, and the
+/// octets in hexadecimal.
+fn generic(data: &RData) -> String {
+    let octets = data.to_bytes().unwrap_or_default();
+    let mut out = format!("\\# {}", octets.len());
+    if !octets.is_empty() {
+        out.push(' ');
+        for byte in octets {
+            out.push_str(&format!("{byte:02X}"));
+        }
+    }
+    out
 }
 
 /// A character-string in presentation format (RFC 1035 §5.1): in quotes,

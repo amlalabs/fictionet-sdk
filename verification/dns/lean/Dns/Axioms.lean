@@ -422,17 +422,16 @@ theorem honest_ofPriv (p alg : Nat) (sep : Bool) : (Signer.ofPriv (S := Sch) p a
   ⟨p, rfl, fun _ => rfl⟩
 
 theorem signedZone_well : SignsWell signedZone Policy.iana 150 := by
-  refine ⟨fun s hs => ?_, fun s hs => ?_, by decide⟩
-  · simp only [signedZone, List.mem_cons, List.mem_nil_iff, or_false] at hs
-    rcases hs with rfl | rfl <;> exact honest_ofPriv _ _ _
-  · simp only [signedZone, List.mem_cons, List.mem_nil_iff, or_false] at hs
-    rcases hs with rfl | rfl <;> decide
+  refine ⟨fun s hs => ?_, ⟨zsk, by simp [signedZone, dataSigners, ksk, zsk, Signer.ofPriv], by decide⟩, by decide⟩
+  simp only [signedZone, List.mem_cons, List.mem_nil_iff, or_false] at hs
+  rcases hs with rfl | rfl <;> exact honest_ofPriv _ _ _
 
 #print axioms signed_answers_validate
 /-- `www.example.com. TXT`, with the RRSIGs the signed zone serves, validates Secure under its anchor. -/
 theorem www_secure : validateRrset (some [signedZone.anchor 2]) Policy.iana 150 [signedZone.link] wwwTxt
     (signedZone.sigsFor wwwTxt) [] = .secure :=
-  signed_answers_validate signedZone Policy.iana 150 2 signedZone_well (by decide) ⟨ksk, by simp [signedZone], rfl⟩
+  signed_answers_validate signedZone Policy.iana 150 2 signedZone_well (by decide)
+    ⟨ksk, by simp [signedZone], rfl, by decide⟩
     zone_wf [] (nd := .data [wwwTxt]) (by decide +kernel) (by intro _ _ _ h; cases h)
     ⟨wwwTxt, by simp [nodeSets], rfl, rfl⟩ (by decide)
 
@@ -456,8 +455,8 @@ example : validateRrset (some [signedZone.anchor 2]) Policy.iana 150 [signedZone
     (signedZone.signSet wwwTxt).sigs [] = .secure :=
   secure_complete ⟨signedZone.link, [], signedZone.keys, signedZone.apex, signedZone.keys,
     ⟨_, anchorFor_zone signedZone 2 (by decide), rfl, rfl,
-      anchor_keys signedZone_well (by decide) (s0 := ksk) (by simp [signedZone]) rfl⟩,
-    .nil, signSet_final signedZone_well (by simp [signedZone]) [] rfl rfl rfl⟩
+      anchor_keys signedZone_well (by decide) (s0 := ksk) (by simp [signedZone]) rfl (by decide)⟩,
+    .nil, signSet_final signedZone_well [] rfl rfl rfl⟩
 
 /-- An anchor whose only DS names an RSASHA1 key (algorithm 5), and a chain whose DNSKEY fetch failed. -/
 def sha1Anchor : Anchor := ⟨apex, [⟨5, 2, [1, 2, 3]⟩]⟩
@@ -652,13 +651,22 @@ theorem child_wf : childZone.zone.WF := build_wf childSpec _ (by simp [build, ch
 theorem tree_path : Descends tree parentZone [childZone] childZone :=
   .cons (by simp [tree]) rfl .nil
 
+/-- Each zone's ZSK, which signs its data, uses algorithm 13. -/
+theorem tree_data : DataAlgorithms tree Policy.iana := by
+  intro z hz _
+  simp only [tree, List.mem_cons, List.mem_nil_iff, or_false] at hz
+  rcases hz with rfl | rfl
+  · exact ⟨zsk, by simp [parentZone, dataSigners, ksk, zsk, Signer.ofPriv], by decide⟩
+  · exact ⟨childZsk, by simp [childZone, dataSigners, childKsk, childZsk, Signer.ofPriv], by decide⟩
+
 #print axioms check_sound
 /-- With no problem reported, `www.sub.example.com. A` validates Secure or Insecure down the chain. -/
 example : validateRrset (some [parentZone.anchor 2]) Policy.iana 150 (chainOf parentZone [childZone]) wwwSub
       (childZone.sigsFor wwwSub) [] = .secure ∨
     ∃ w, validateRrset (some [parentZone.anchor 2]) Policy.iana 150 (chainOf parentZone [childZone]) wwwSub
       (childZone.sigsFor wwwSub) [] = .insecure w :=
-  check_sound tree_check tree_wf (by decide) (by simp [tree]) ⟨ksk, by simp [parentZone], rfl⟩ tree_path child_wf []
+  check_sound tree_check tree_wf tree_data (by decide) (by simp [tree])
+    ⟨ksk, by simp [parentZone], rfl, by decide⟩ tree_path child_wf []
     (nd := .data [wwwSub]) (by decide +kernel) (by intro _ _ _ h; cases h) ⟨wwwSub, by simp [nodeSets], rfl, rfl⟩
     (by decide)
 
