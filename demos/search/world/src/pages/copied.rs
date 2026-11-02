@@ -704,8 +704,8 @@ impl Pages {
         (seconds > 0).then(|| std::time::Duration::from_secs(seconds as u64))
     }
 
-    /// Whether DNS was captured beside the copied pages. Without it every
-    /// answer a Copied session gives comes from the internet, signed now.
+    /// Whether DNS was captured beside the copied pages. Without it a
+    /// Copied session cannot start ([`unavailable`](Self::unavailable)).
     pub(crate) fn has_copied_dns(&self) -> bool {
         self.copied
             .as_ref()

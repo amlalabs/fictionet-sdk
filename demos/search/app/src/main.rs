@@ -150,11 +150,12 @@ async fn main() -> Result {
                 world_page.attach_world(&cx, world_pages.clone());
                 *world_cx.lock().unwrap() = Some(cx.clone());
                 let egress = world_pages.egress(&cx).await;
+                let location = world_pages.location(&cx, egress).await;
                 let web = World {
                     ca: Arc::new(Ca::new(&cx, &world_roots, earliest, start)?),
                     pages: world_pages,
                     start,
-                    egress,
+                    location,
                 };
                 let net =
                     network::build(&web, &cx, world_token)?.route(kit::JUMP, kit::jump_prefix());

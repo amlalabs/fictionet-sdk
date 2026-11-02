@@ -122,7 +122,8 @@ sites. Capture dates are shown only when the archive records them.
   servers when the capture lacks them. Every capture command records the DNS
   of every host the corpus then serves, research, package, and reference sites
   alike, and the session's clock starts at that capture so its signatures are
-  valid. A corpus captured before DNS was recorded gets it with
+  valid. A corpus captured before DNS was recorded cannot start a Copied
+  session until it gets its DNS with
   `cargo xtask search-capture /path/to/demos/downloads --dns`.
 - **Live** is selected by default when `EXA_API_KEY` is present. [Exa search](https://github.com/exa-labs/openapi-spec/blob/master/exa-openapi-spec.yaml)
   supplies results, which keep their order, titles and URLs in each engine's

@@ -23,7 +23,7 @@ use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RData, Record};
 use fictionet::stdlib::protocols::dns::{Parsed, Request};
 use fictionet::stdlib::services::dns::Client;
 use fictionet::stdlib::services::dns::authority::{Ask, Observed};
-use fictionet::stdlib::world::net::dns::internet::Egress;
+use fictionet::stdlib::world::net::dns::internet::{Egress, Location};
 use fictionet::stdlib::world::net::dns::{PerSession, Source};
 use fictionet::sync::Mutex;
 use fictionet_extras::dns::Replay;
@@ -167,8 +167,9 @@ fn targets(message: &Message) -> impl Iterator<Item = (LowerName, Option<LowerNa
 ///    domain, or in Copied the names above captured hosts.
 ///    Priming, referrals, minimised questions, and the DS and DNSKEY sets
 ///    of a chain of trust need these;
-/// 3. it is one or more underscore labels (RFC 8552), such as `_dmarc` or
-///    `_25._tcp`, above a name rule 1 lets out;
+/// 3. it has an underscore label (RFC 8552), and any labels below that
+///    one, above a name rule 1 lets out: `_dmarc`, `_25._tcp`, a DKIM
+///    selector's `google._domainkey`, or a BIMI `default._bimi`;
 /// 4. it is a reverse name under `in-addr.arpa` (at most four decimal
 ///    labels, RFC 1035 §3.5) or `ip6.arpa` (at most 32 nibble labels,
 ///    RFC 3596 §2.5), or a name above one, `arpa` included;
@@ -297,17 +298,15 @@ impl Outbound {
         }
     }
 
-    /// Rule 3: whether `name` is underscore labels above a name rule 1
-    /// lets out.
+    /// Rule 3: whether `name` has an underscore label, with any labels
+    /// below it, above a name rule 1 lets out.
     fn underscored(&self, name: &LowerName) -> bool {
-        let count = labels(name);
-        let underscored = name
-            .iter()
-            .take_while(|label| label.first() == Some(&b'_'))
-            .count();
-        underscored > 0
-            && underscored < count
-            && self.admits(&LowerName::new(&name.trim_to(count - underscored)))
+        let all: Vec<&[u8]> = name.iter().collect();
+        let Some(leaf) = all.iter().rposition(|label| label.first() == Some(&b'_')) else {
+            return false;
+        };
+        let above = all.len() - leaf - 1;
+        above > 0 && self.admits(&LowerName::new(&name.trim_to(above)))
     }
 
     /// Notes the targets `message`, a relayed reply, names.
@@ -487,5 +486,13 @@ impl Pages {
                 None
             }
         }
+    }
+
+    /// Where the host is on the internet, as the root, `gtld-servers.net`,
+    /// and public resolver servers it reaches describe themselves, so
+    /// their answers agree with `egress` wherever the host runs.
+    pub async fn location(&self, fcx: &Cx, egress: Option<Egress>) -> Location {
+        let live = self.live_dns();
+        Location::measured(fcx, &*live, egress, EGRESS_WAIT).await
     }
 }

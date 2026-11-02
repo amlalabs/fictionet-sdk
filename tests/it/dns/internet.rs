@@ -105,6 +105,8 @@ direct. 900 IN SOA ns.direct. hostmaster.direct. 1 1800 900 604800 900
 direct. 3600 IN NS ns.direct.
 ns.direct. 3600 IN A 45.33.5.53
 www.direct. 300 IN A 45.33.5.80
+whoami.direct. 300 IN A 45.70.0.9
+whoami.direct. 300 IN TXT \"45.70.0.9\"
 ";
 
 /// What the real hierarchy answers, played from fixed zones: each server
@@ -819,6 +821,89 @@ fn whoami_names_are_answered_from_the_egress_and_never_relayed() {
 
         let asked = hierarchy.asked.lock().unwrap().clone();
         assert!(asked.is_empty(), "the resolvers asked {asked:?}");
+        Ok(())
+    });
+}
+
+/// A measured location holds what each server that answered says about
+/// itself, and leaves out the ones that did not.
+#[test]
+fn a_measured_location_holds_what_the_servers_say_about_themselves() {
+    world(Duration::from_secs(60), |fcx| async move {
+        let hierarchy = Hierarchy::new();
+        let at = Location::measured(
+            &fcx,
+            &hierarchy,
+            Some(Egress(EGRESS)),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert_eq!(at.egress, Some(Egress(EGRESS)));
+        // Only the root letters answer in the test hierarchy.
+        assert_eq!(at.servers.len(), ROOT_LETTERS.len());
+        assert!(at.resolvers.is_empty());
+        let a_root = at.site(IpAddr::V4(ROOT_LETTERS[0].server.v4));
+        assert_eq!(a_root.identity.nsid, Some(REAL.as_bytes().to_vec()));
+        assert_eq!(
+            a_root.identity.chaos.get(&lower("id.server.")),
+            Some(&fictionet::stdlib::services::dns::authority::ChaosAnswer::Txt(REAL.to_string()))
+        );
+        let unknown = at.site(IpAddr::V4(GTLD_SERVERS[0].v4));
+        assert_eq!(unknown.identity, Identity::none());
+        Ok(())
+    });
+}
+
+/// A real server that echoes the address a question came from would see
+/// a public resolver's own egress, not the world's: `whoami.direct` plays
+/// such a server, answering with the address the source asks from.
+#[test]
+fn an_echoed_address_is_the_public_resolvers_egress() {
+    world(Duration::from_secs(60), |fcx| async move {
+        let hierarchy = Hierarchy::new();
+        let at = location();
+        let clock = WallClock {
+            start: SystemTime::UNIX_EPOCH,
+        };
+        let (attacher, attachments) = fictionet::attachments();
+        let net = Net::new().ipv4_only();
+        let mirror = Mirror::new(hierarchy.clone(), net.handle(), &at);
+        // The test root is unsigned, so the resolvers do not validate.
+        net.hosts(internet::root_servers(|s| mirror.relay(s), &at))
+            .hosts(internet::public_resolvers(
+                |r, h| {
+                    let config = Config {
+                        anchors: None,
+                        ..r.config(&at)
+                    };
+                    h.program(Recursive::new(config, clock))
+                },
+                &at,
+            ))
+            .start(&fcx, attachments)?;
+        let m = machine(&fcx, attacher.attach("client")?, ME);
+        let cloudflare = PUBLIC_RESOLVERS[1].addresses[0].v4;
+        let seen = v4(172, 69, 133, 100);
+
+        let reply = ask(
+            &fcx,
+            &m,
+            cloudflare,
+            &query(1, "whoami.direct.", RecordType::A, true),
+        )
+        .await
+        .expect("an answer");
+        assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(addresses(&reply), vec![seen]);
+        let reply = ask(
+            &fcx,
+            &m,
+            cloudflare,
+            &query(2, "whoami.direct.", RecordType::TXT, true),
+        )
+        .await
+        .expect("an answer");
+        assert_eq!(texts(&reply), vec![seen.to_string()]);
         Ok(())
     });
 }

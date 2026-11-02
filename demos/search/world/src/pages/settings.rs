@@ -126,6 +126,9 @@ impl Pages {
     pub fn unavailable(&self, source: Source) -> Option<&'static str> {
         match source {
             Source::Copied if self.copied.is_none() => Some("This world has no copied pages"),
+            Source::Copied if !self.has_copied_dns() => Some(
+                "The copied pages have no DNS: run cargo xtask search-capture <downloads> --dns",
+            ),
             Source::Live | Source::LiveDepth | Source::Edited if self.live.is_none() => {
                 Some("Live pages need EXA_API_KEY on the host")
             }
@@ -143,8 +146,8 @@ impl Pages {
     /// workstation, the copied pages, and the world's DNS use the same
     /// clock: the world's resolvers check signatures against it, so the
     /// captured signatures of a Copied session are inside their windows.
-    /// A corpus with no DNS captured answers every question from the
-    /// internet, signed now, so its resolvers keep the host's clock.
+    /// A corpus with no DNS captured cannot start a Copied session, since
+    /// its names would not resolve.
     pub fn start_session(
         &self,
         fcx: &Cx,
@@ -170,7 +173,7 @@ impl Pages {
         // The DNS session starts after the mode is set, so the world's DNS
         // sources choose for the new mode when they see it.
         let lag = copied_lag
-            .filter(|_| source == Source::Copied && self.has_copied_dns())
+            .filter(|_| source == Source::Copied)
             .unwrap_or_default();
         let start = std::time::SystemTime::now() - fcx.now().since_start() - lag;
         self.namespace.advance(WallClock { start });
