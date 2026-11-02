@@ -41,7 +41,7 @@ pub use engine::AuthorityEngine;
 pub use observe::Observe;
 pub use overlay::Overlay;
 pub use relay::Relay;
-pub use server::{ChaosAnswer, Identity, ServerConfig, bare_reply, chaos};
+pub use server::{ChaosAnswer, ChaosReply, Identity, ServerConfig, bare_reply, chaos};
 
 /// A question, as bytes, that a server sends to another server.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]

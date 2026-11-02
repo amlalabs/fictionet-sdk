@@ -50,9 +50,10 @@ use fictionet::stdlib::protocols::dns::rr::rdata::TXT;
 use fictionet::stdlib::protocols::dns::rr::{
     DNSClass, LowerName, Name, RData, Record, RecordSet, RecordType,
 };
-use fictionet::stdlib::protocols::dns::{Nsid, Request};
+use fictionet::stdlib::protocols::dns::{Ede, EdeCode, Nsid, Request};
 use fictionet::stdlib::services::dns::authority::{
-    Ask, Authority, ChaosAnswer, Identity, Known, Observed, Relay, ServerConfig, Step, chaos,
+    Ask, Authority, ChaosAnswer, ChaosReply, Identity, Known, Observed, Relay, ServerConfig, Step,
+    chaos,
 };
 use fictionet::stdlib::services::dns::resolver::Config;
 use fictionet::stdlib::services::dns::zone::{AnyResponse, Zone, ZoneError, special};
@@ -683,16 +684,19 @@ impl Location {
     /// public resolver answered there on 2026-11-01: the median of five
     /// round trips to each, the instance names it gave for `id.server`,
     /// `hostname.bind`, `version.bind`, and `version.server` and their TTL,
-    /// its NSID, and the RCODE it gave for other CHAOS names. Instances are
-    /// the ones anycast picked there that day, so some sit far away: k.root
-    /// answered from London. Other authorities took 20 ms, the median over
-    /// six of them.
+    /// its NSID, and the RCODE it gave for other CHAOS names. What each
+    /// gives `id.server` CH A, whether its TXT answers set AA, and the
+    /// payload of its CHAOS replies are as seen there on 2026-11-02.
+    /// Instances are the ones anycast picked there that day, so some sit
+    /// far away: k.root answered from London. Other authorities took
+    /// 20 ms, the median over six of them.
     pub fn san_francisco_bay_area(egress: Option<Egress>) -> Location {
         use ResponseCode::{NoError, NotImp, Refused, ServFail};
         let txt = |text: &str| ChaosAnswer::Txt(text.to_string());
-        let no = ChaosAnswer::Rcode;
+        let no = |rcode| ChaosAnswer::Reply(ChaosReply::rcode(rcode));
         // The names below, in order: id.server, hostname.bind,
-        // version.bind, version.server.
+        // version.bind, version.server. Other types get REFUSED, and TXT
+        // answers leave AA clear, as NSD and Knot do.
         let identity = |nsid: &str, unlisted: ResponseCode, answers: [ChaosAnswer; 4]| {
             let names = [
                 chaos::id_server(),
@@ -701,7 +705,7 @@ impl Location {
                 chaos::version_server(),
             ];
             let mut identity = Identity {
-                unlisted,
+                unlisted: ChaosReply::rcode(unlisted),
                 nsid: Some(nsid.as_bytes().to_vec()),
                 ..Identity::none()
             };
@@ -711,21 +715,54 @@ impl Location {
             identity
         };
         let ms = Duration::from_millis;
-        // C, I, and M run BIND, whose `authors.bind` is a name with no TXT.
-        let bind = |identity: Identity| identity.answer(chaos::authors_bind(), no(NoError));
+        // BIND serves each of its names as a zone, with AA, and G runs it
+        // too.
+        let zones = |identity: Identity| Identity {
+            aa: true,
+            other_types: None,
+            ..identity
+        };
+        // C, I, and M also answer `authors.bind`, a name with no TXT.
+        let bind = |identity: Identity| zones(identity).answer(chaos::authors_bind(), no(NoError));
+        // Verisign's servers answer other types with NOTIMP and no OPT
+        // record. Its root letter sets AA; its gTLD servers do not.
+        let verisign = |identity: Identity| Identity {
+            other_types: Some(ChaosReply {
+                edns: false,
+                ..ChaosReply::rcode(NotImp)
+            }),
+            ..identity
+        };
+        // E and F answer other types with NOTIMP and EDE 21, and advertise
+        // 512 octets.
+        let not_supported = |identity: Identity| Identity {
+            aa: true,
+            other_types: Some(ChaosReply {
+                ede: Some(Ede {
+                    code: EdeCode::NOT_SUPPORTED,
+                    text: Some("Unsupported DNS Type for Class CHAOS".to_string()),
+                }),
+                ..ChaosReply::rcode(NotImp)
+            }),
+            payload: Some(512),
+            ..identity
+        };
         let letters = [
             (
                 32,
-                identity(
-                    "a.r.ussea-4c",
-                    NoError,
-                    [
-                        txt("nnn1-ussea-4c"),
-                        txt("nnn1-ussea-4c"),
-                        txt("ATLAS"),
-                        txt("ATLAS"),
-                    ],
-                ),
+                Identity {
+                    aa: true,
+                    ..verisign(identity(
+                        "a.r.ussea-4c",
+                        NoError,
+                        [
+                            txt("nnn1-ussea-4c"),
+                            txt("nnn1-ussea-4c"),
+                            txt("ATLAS"),
+                            txt("ATLAS"),
+                        ],
+                    ))
+                },
             ),
             (
                 72,
@@ -768,7 +805,7 @@ impl Location {
             ),
             (
                 24,
-                identity(
+                not_supported(identity(
                     "c01.SEA.eroot",
                     NotImp,
                     [
@@ -777,12 +814,12 @@ impl Location {
                         txt("2026.10.4"),
                         no(NotImp),
                     ],
-                )
+                ))
                 .ttl(60),
             ),
             (
                 9,
-                identity(
+                not_supported(identity(
                     "SJC.cf.f.root-servers.org",
                     NotImp,
                     [
@@ -791,29 +828,36 @@ impl Location {
                         txt("2026.10.4"),
                         no(NotImp),
                     ],
-                )
+                ))
                 .ttl(60),
             ),
             (
                 48,
-                identity(
+                zones(identity(
                     "groot-con2-3",
                     Refused,
                     [no(Refused), txt("groot-con2-2"), no(Refused), no(Refused)],
-                ),
+                )),
             ),
             (
                 21,
-                identity(
-                    "001.nzy.h.root-servers.org",
-                    Refused,
-                    [
-                        txt("001.nzy.h.root-servers.org"),
-                        txt("001.nzy.h.root-servers.org"),
-                        txt("NSD 4.x"),
-                        txt("NSD 4.x"),
-                    ],
-                ),
+                // H adds EDE 21 to its REFUSED.
+                Identity {
+                    other_types: Some(ChaosReply {
+                        ede: Some(Ede::new(EdeCode::NOT_SUPPORTED)),
+                        ..ChaosReply::rcode(Refused)
+                    }),
+                    ..identity(
+                        "001.nzy.h.root-servers.org",
+                        Refused,
+                        [
+                            txt("001.nzy.h.root-servers.org"),
+                            txt("001.nzy.h.root-servers.org"),
+                            txt("NSD 4.x"),
+                            txt("NSD 4.x"),
+                        ],
+                    )
+                },
             ),
             (
                 7,
@@ -878,11 +922,11 @@ impl Location {
         ];
         // Every gtld-servers.net server answers "ATLAS" for its version.
         let atlas = |nsid: &str, id: &str, hostname: &str| {
-            identity(
+            verisign(identity(
                 nsid,
                 Refused,
                 [txt(id), txt(hostname), txt("ATLAS"), txt("ATLAS")],
-            )
+            ))
         };
         let gtld = [
             (6, atlas("nnn1-ussjc-3", "nnn1-ussjc-3", "nnn1-ussjc-3")),
@@ -920,45 +964,62 @@ impl Location {
         let resolvers = [
             resolver(
                 7,
-                // Every CHAOS name gets SERVFAIL.
-                identity(
-                    "gpdns-sfo",
-                    ServFail,
-                    [no(ServFail), no(ServFail), no(ServFail), no(ServFail)],
-                ),
+                // Every CHAOS question gets SERVFAIL.
+                Identity {
+                    other_types: Some(ChaosReply::rcode(ServFail)),
+                    ..identity(
+                        "gpdns-sfo",
+                        ServFail,
+                        [no(ServFail), no(ServFail), no(ServFail), no(ServFail)],
+                    )
+                },
                 IpAddr::V4(Ipv4Addr::new(172, 253, 1, 21)),
             ),
             resolver(
                 8,
-                identity(
-                    "sjc01",
-                    Refused,
-                    [txt("sjc10"), no(Refused), no(Refused), txt("2026.10.11")],
-                ),
+                Identity {
+                    other_types: Some(ChaosReply::rcode(NotImp)),
+                    ..identity(
+                        "sjc01",
+                        Refused,
+                        [txt("sjc10"), no(Refused), no(Refused), txt("2026.10.11")],
+                    )
+                },
                 IpAddr::V4(Ipv4Addr::new(172, 69, 133, 100)),
             ),
             resolver(
                 7,
-                identity(
-                    "res130.pao",
-                    Refused,
-                    [
-                        txt("res711.pao"),
-                        no(ServFail),
-                        txt("Q9-P-2026080500"),
-                        no(ServFail),
-                    ],
-                )
-                .answer(chaos::authors_bind(), no(ServFail)),
+                Identity {
+                    other_types: Some(ChaosReply::rcode(NoError)),
+                    ..identity(
+                        "res130.pao",
+                        Refused,
+                        [
+                            txt("res711.pao"),
+                            no(ServFail),
+                            txt("Q9-P-2026080500"),
+                            no(ServFail),
+                        ],
+                    )
+                    .answer(chaos::authors_bind(), no(ServFail))
+                },
                 IpAddr::V6(Ipv6Addr::new(0x2620, 0x171, 0xf0, 0xf0, 0, 0, 0, 0x227)),
             ),
             resolver(
                 17,
-                identity(
-                    "r3003.lax",
-                    Refused,
-                    [no(Refused), no(Refused), no(Refused), no(Refused)],
-                ),
+                // Every CHAOS question gets REFUSED with no OPT record.
+                {
+                    let refused = ChaosReply {
+                        edns: false,
+                        ..ChaosReply::rcode(Refused)
+                    };
+                    let no = || ChaosAnswer::Reply(refused.clone());
+                    Identity {
+                        unlisted: refused.clone(),
+                        other_types: Some(refused.clone()),
+                        ..identity("r3003.lax", Refused, [no(), no(), no(), no()])
+                    }
+                },
                 IpAddr::V6(Ipv6Addr::new(0x2620, 0, 0xcc8, 0, 0, 0, 0, 0x36)),
             ),
         ];
@@ -1111,26 +1172,55 @@ async fn probe(fcx: &Cx, source: &dyn Source, server: IpAddr, deadline: Instant)
     names.push(LowerName::new(
         &Name::from_ascii("invalid.").expect("a valid name"),
     ));
-    let asks = names.iter().map(|name| {
-        let query = probe_query(fcx, &Name::from(name), RecordType::TXT, DNSClass::CH, false);
-        Box::pin(exchange(fcx, source, server, query, deadline)) as Probe<'_, _>
-    });
+    let asks = names
+        .iter()
+        .map(|name| (name, RecordType::TXT))
+        // What a name it answers gives for another type.
+        .chain(std::iter::once((&names[0], RecordType::A)))
+        .map(|(name, rtype)| {
+            let query = probe_query(fcx, &Name::from(name), rtype, DNSClass::CH, false);
+            Box::pin(exchange(fcx, source, server, query, deadline)) as Probe<'_, _>
+        });
     let mut replies: Vec<Option<(Duration, Message)>> = join_all(asks.collect()).await;
+    let other_type = replies.pop().flatten();
     let unlisted = replies
         .pop()
         .flatten()
-        .map_or(ResponseCode::Refused, |(_, reply)| {
-            reply.metadata.response_code
+        .map_or(ChaosReply::rcode(ResponseCode::Refused), |(_, reply)| {
+            chaos_reply(&reply)
         });
-    let rtt = replies.iter().flatten().map(|(took, _)| *took).min()?;
+    let rtt = replies
+        .iter()
+        .chain([&other_type])
+        .flatten()
+        .map(|(took, _)| *took)
+        .min()?;
     let mut identity = Identity {
-        unlisted,
+        other_types: match &other_type {
+            // BIND's NODATA from the name's own zone.
+            Some((_, reply))
+                if reply.metadata.authoritative
+                    && reply.metadata.response_code == ResponseCode::NoError
+                    && reply
+                        .authorities
+                        .iter()
+                        .any(|record| record.record_type() == RecordType::SOA) =>
+            {
+                None
+            }
+            Some((_, reply)) => Some(chaos_reply(reply)),
+            None => Identity::none().other_types,
+        },
+        unlisted: unlisted.clone(),
         ..Identity::none()
     };
     for (name, reply) in names.into_iter().zip(replies) {
         let Some((_, reply)) = reply else {
             continue;
         };
+        if let Some(edns) = &reply.edns {
+            identity.payload = Some(edns.max_payload());
+        }
         if identity.nsid.is_none() {
             identity.nsid = reply
                 .edns
@@ -1153,14 +1243,30 @@ async fn probe(fcx: &Cx, source: &dyn Source, server: IpAddr, deadline: Instant)
         let answer = match text {
             Some((ttl, text)) => {
                 identity.ttl = ttl;
+                identity.aa = reply.metadata.authoritative;
                 ChaosAnswer::Txt(String::from_utf8_lossy(&text).into_owned())
             }
-            None if reply.metadata.response_code == unlisted => continue,
-            None => ChaosAnswer::Rcode(reply.metadata.response_code),
+            None if chaos_reply(&reply) == unlisted => continue,
+            None => ChaosAnswer::Reply(chaos_reply(&reply)),
         };
         identity.chaos.insert(name, answer);
     }
     Some(Site { rtt, identity })
+}
+
+/// `reply`, a CHAOS-class reply without data, as an identity keeps it.
+fn chaos_reply(reply: &Message) -> ChaosReply {
+    let ede = reply.edns.as_ref().and_then(|edns| {
+        edns.options()
+            .as_ref()
+            .iter()
+            .find_map(|(_, option)| Ede::from_option(option))
+    });
+    ChaosReply {
+        rcode: reply.metadata.response_code,
+        ede,
+        edns: reply.edns.is_some(),
+    }
 }
 
 /// The address the public resolver at `resolver` asks authorities from,

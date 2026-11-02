@@ -6,8 +6,8 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use fictionet::stdlib::protocols::dns::op::{Edns, Header, Message, MessageType, ResponseCode};
-use fictionet::stdlib::protocols::dns::rr::rdata::TXT;
 use fictionet::stdlib::protocols::dns::rr::rdata::opt::EdnsCode;
+use fictionet::stdlib::protocols::dns::rr::rdata::{SOA, TXT};
 use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, Name, RData, Record, RecordType};
 use fictionet::stdlib::protocols::dns::serialize::binary::{BinDecodable, BinDecoder};
 use fictionet::stdlib::protocols::dns::{
@@ -43,6 +43,11 @@ pub struct ServerConfig {
     /// How long the server waits for another server it asks before it
     /// counts the question as unanswered.
     pub ask_timeout: Duration,
+    /// Whether the server offers recursion. Its replies then set RA
+    /// (RFC 1035 §4.1.1) and keep the AD bit the engine behind it gave, as
+    /// a validating resolver's do (RFC 4035 §3.2.3). An authoritative
+    /// server's replies clear both.
+    pub recursion_available: bool,
 }
 
 impl ServerConfig {
@@ -58,6 +63,7 @@ impl ServerConfig {
             any: AnyResponse::Hinfo,
             transfer: false,
             ask_timeout: ASK_TIMEOUT,
+            recursion_available: false,
         }
     }
 
@@ -82,7 +88,8 @@ impl ServerConfig {
     /// `response` with the header and EDNS details of this server, for
     /// `req`:
     ///
-    /// - The ID, opcode, RD, and CD are the query's; RA, AD, and TC are
+    /// - The ID, opcode, RD, and CD are the query's. RA and AD follow
+    ///   [`recursion_available`](ServerConfig::recursion_available). TC is
     ///   clear, and [`fit`] sets TC when it must. AA is the authority's.
     /// - The question is the query's, in the query's case, and every owner
     ///   in the answer section equal to QNAME takes that case
@@ -110,8 +117,8 @@ impl ServerConfig {
         metadata.op_code = query.op_code;
         metadata.recursion_desired = req.rd;
         metadata.checking_disabled = req.cd;
-        metadata.recursion_available = false;
-        metadata.authentic_data = false;
+        metadata.recursion_available = self.recursion_available;
+        metadata.authentic_data &= self.recursion_available;
         metadata.truncation = false;
 
         let qname = req.question.name();
@@ -152,35 +159,36 @@ impl ServerConfig {
         }
     }
 
-    /// The reply to a CHAOS-class question, from [`identity`](ServerConfig::identity)
-    /// alone. A name with text gets it as one TXT record with the
-    /// identity's TTL and AA set, for QTYPE TXT or ANY, and an empty
-    /// NOERROR for other types. `None` without an identity: the authority
-    /// answers.
-    pub(super) fn chaos(&self, req: &Request) -> Option<Response> {
+    /// The octets of the reply to a CHAOS-class question, from
+    /// [`identity`](ServerConfig::identity) alone ([`Identity::reply`]),
+    /// through the front and fitted to the client's size, with the
+    /// identity's payload and OPT record. `None` without an identity: the
+    /// authority answers.
+    pub(in super::super) fn render_chaos(&self, req: &Request) -> Option<Vec<u8>> {
         let identity = self.identity.as_ref()?;
-        let qname = LowerName::new(req.question.name());
-        let text = match identity.chaos.get(&qname) {
-            None => return Some(bare_reply(req, identity.unlisted, None)),
-            Some(ChaosAnswer::Rcode(code)) => return Some(bare_reply(req, *code, None)),
-            Some(ChaosAnswer::Txt(text)) => text,
-        };
-        let mut response = bare_reply(req, ResponseCode::NoError, None);
-        response.message.metadata.authoritative = true;
-        if matches!(req.question.query_type(), RecordType::TXT | RecordType::ANY) {
-            let txt = RData::TXT(TXT::new(vec![text.clone()]));
-            let mut record = Record::from_rdata(req.question.name().clone(), identity.ttl, txt);
-            record.dns_class = DNSClass::CH;
-            response.message.answers.push(record);
+        let (response, edns) = identity.reply(req);
+        let mut response = self.front(req, response);
+        if !edns {
+            response.message.edns = None;
         }
-        Some(response)
+        let payload = identity.payload.unwrap_or(self.payload);
+        if let Some(edns) = &mut response.message.edns {
+            edns.set_max_payload(payload.max(512));
+        }
+        Some(self.write(req, response, Limit::for_request(req, payload)))
     }
 
     /// The octets of `response` for `req`, through the front and fitted to
     /// the client's size. A reply hickory cannot write becomes SERVFAIL.
-    pub(super) fn render(&self, req: &Request, response: Response) -> Vec<u8> {
-        let limit = Limit::for_request(req, self.payload);
-        match fit(&self.front(req, response), limit) {
+    pub(in super::super) fn render(&self, req: &Request, response: Response) -> Vec<u8> {
+        let response = self.front(req, response);
+        self.write(req, response, Limit::for_request(req, self.payload))
+    }
+
+    /// The octets of `response`, which has been through the front, fitted
+    /// to `limit`, or of SERVFAIL when hickory cannot write it.
+    fn write(&self, req: &Request, response: Response, limit: Limit) -> Vec<u8> {
+        match fit(&response, limit) {
             Ok(Fitted { bytes, .. }) => bytes,
             Err(_) => {
                 let failed = self.front(req, bare_reply(req, ResponseCode::ServFail, None));
@@ -193,10 +201,15 @@ impl ServerConfig {
 
     /// The octets of a reply [`Request::parse`] rejected the query with,
     /// carrying this server's payload in its OPT record.
-    pub(super) fn render_reject(&self, mut reject: Message, transport: Transport) -> Vec<u8> {
+    pub(in super::super) fn render_reject(
+        &self,
+        mut reject: Message,
+        transport: Transport,
+    ) -> Vec<u8> {
         if let Some(edns) = &mut reject.edns {
             edns.set_max_payload(self.payload.max(512));
         }
+        reject.metadata.recursion_available = self.recursion_available;
         let limit = match transport {
             Transport::Tcp => Limit::Stream,
             Transport::Udp => Limit::Udp512,
@@ -294,12 +307,17 @@ pub(super) fn glue_first(message: &mut Message) -> usize {
 /// with Extended DNS Error `ede` when given. The server front adds the
 /// rest.
 pub fn bare_reply(req: &Request, rcode: ResponseCode, ede: Option<EdeCode>) -> Response {
+    bare_reply_with(req, rcode, ede.map(Ede::new))
+}
+
+/// [`bare_reply`] with an Extended DNS Error that may carry text.
+fn bare_reply_with(req: &Request, rcode: ResponseCode, ede: Option<Ede>) -> Response {
     let query = &req.message.metadata;
     let mut message = Message::error_msg(query.id, query.op_code, rcode);
     message.add_query(req.question.clone());
-    if let Some(code) = ede {
+    if let Some(ede) = ede {
         let mut edns = Edns::new();
-        edns.options_mut().insert(Ede::new(code).to_option());
+        edns.options_mut().insert(ede.to_option());
         message.set_edns(edns);
     }
     Response {
@@ -308,21 +326,34 @@ pub fn bare_reply(req: &Request, rcode: ResponseCode, ede: Option<EdeCode>) -> R
     }
 }
 
-/// What a server says about itself: its answers to CHAOS-class TXT
-/// questions by name, and its NSID.
+/// What a server says about itself: its answers to CHAOS-class questions
+/// by name, how those replies look, and its NSID.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Identity {
     /// Answers by name. Real servers answer the names of [`chaos`] and
     /// more of their own.
     pub chaos: BTreeMap<LowerName, ChaosAnswer>,
-    /// The RCODE for a CHAOS-class name not in [`chaos`](Identity::chaos).
-    pub unlisted: ResponseCode,
+    /// The reply for a CHAOS-class name not in [`chaos`](Identity::chaos).
+    pub unlisted: ChaosReply,
+    /// The reply to a question of a type other than TXT or ANY, for every
+    /// name. `None` when each name with text is a zone of its own, as BIND
+    /// serves its CHAOS names (c, g, i, and m at the root on 2026-11-02):
+    /// such a name answers NODATA with AA and its own SOA,
+    /// `<name> SOA <name> hostmaster.<name> 0 28800 7200 604800 86400`
+    /// with TTL 86400, and the other names give their own replies.
+    pub other_types: Option<ChaosReply>,
+    /// Whether its TXT answers set AA. BIND and some Verisign instances
+    /// set it; NSD, Knot, and the public resolvers leave it clear.
+    pub aa: bool,
     /// The name server identifier sent to a query that asks for one
     /// (RFC 5001).
     pub nsid: Option<Vec<u8>>,
     /// The TTL of its TXT answers. Most servers give 0; e.root and f.root
     /// gave 60 on 2026-11-01.
     pub ttl: u32,
+    /// The EDNS payload size its CHAOS replies advertise, when it is not
+    /// the server's own: e.root and f.root advertise 512 there.
+    pub payload: Option<u16>,
 }
 
 impl Identity {
@@ -331,9 +362,12 @@ impl Identity {
     pub fn none() -> Identity {
         Identity {
             chaos: BTreeMap::new(),
-            unlisted: ResponseCode::Refused,
+            unlisted: ChaosReply::rcode(ResponseCode::Refused),
+            other_types: Some(ChaosReply::rcode(ResponseCode::Refused)),
+            aa: false,
             nsid: None,
             ttl: 0,
+            payload: None,
         }
     }
 
@@ -348,6 +382,61 @@ impl Identity {
         self.ttl = ttl;
         self
     }
+
+    /// The reply to the CHAOS-class question `req`, before a server front
+    /// adds its header details and EDNS, and whether it has an OPT record
+    /// when the query had one:
+    ///
+    /// - A name with text, asked for TXT or ANY, gets it as one TXT record
+    ///   with the identity's TTL, and AA as [`aa`](Identity::aa) says.
+    /// - Any other type gets [`other_types`](Identity::other_types), or,
+    ///   without it, NODATA from the name's own zone, as BIND gives.
+    /// - A name with a reply of its own gets it, and an unlisted name gets
+    ///   [`unlisted`](Identity::unlisted).
+    pub fn reply(&self, req: &Request) -> (Response, bool) {
+        let qname = LowerName::new(req.question.name());
+        let other = !matches!(req.question.query_type(), RecordType::TXT | RecordType::ANY);
+        let empty = |reply: &ChaosReply| {
+            (
+                bare_reply_with(req, reply.rcode, reply.ede.clone()),
+                reply.edns,
+            )
+        };
+        match (self.chaos.get(&qname), other, &self.other_types) {
+            (_, true, Some(reply)) => empty(reply),
+            (Some(ChaosAnswer::Txt(text)), false, _) => {
+                let mut response = bare_reply(req, ResponseCode::NoError, None);
+                response.message.metadata.authoritative = self.aa;
+                let txt = RData::TXT(TXT::new(vec![text.clone()]));
+                let mut record = Record::from_rdata(req.question.name().clone(), self.ttl, txt);
+                record.dns_class = DNSClass::CH;
+                response.message.answers.push(record);
+                (response, true)
+            }
+            (Some(ChaosAnswer::Txt(_)), true, None) => {
+                let mut response = bare_reply(req, ResponseCode::NoError, None);
+                response.message.metadata.authoritative = true;
+                response
+                    .message
+                    .authorities
+                    .push(zone_soa(req.question.name()));
+                (response, true)
+            }
+            (Some(ChaosAnswer::Reply(reply)), _, _) => empty(reply),
+            (None, _, _) => empty(&self.unlisted),
+        }
+    }
+}
+
+/// The SOA BIND gives the CHAOS zone at `name`.
+fn zone_soa(name: &Name) -> Record {
+    let hostmaster = Name::from_ascii("hostmaster")
+        .and_then(|label| label.append_name(name))
+        .unwrap_or_else(|_| name.clone());
+    let soa = SOA::new(name.clone(), hostmaster, 0, 28800, 7200, 604800, 86400);
+    let mut record = Record::from_rdata(name.clone(), 86400, RData::SOA(soa));
+    record.dns_class = DNSClass::CH;
+    record
 }
 
 /// A server's answer to a CHAOS-class question for one name.
@@ -355,8 +444,32 @@ impl Identity {
 pub enum ChaosAnswer {
     /// One TXT string, at most 255 octets (RFC 1035 §3.3).
     Txt(String),
-    /// No data, with this RCODE, as servers that refuse to say.
-    Rcode(ResponseCode),
+    /// No data, with this reply, as servers that refuse to say.
+    Reply(ChaosReply),
+}
+
+/// A CHAOS-class reply without data.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChaosReply {
+    /// Its RCODE.
+    pub rcode: ResponseCode,
+    /// The Extended DNS Error it carries (RFC 8914), if any.
+    pub ede: Option<Ede>,
+    /// Whether it has an OPT record when the query had one. OpenDNS's
+    /// replies, and the NOTIMP replies of Verisign's servers, have none.
+    pub edns: bool,
+}
+
+impl ChaosReply {
+    /// A reply with `rcode`, no Extended DNS Error, and an OPT record when
+    /// the query had one.
+    pub fn rcode(rcode: ResponseCode) -> ChaosReply {
+        ChaosReply {
+            rcode,
+            ede: None,
+            edns: true,
+        }
+    }
 }
 
 /// The CHAOS-class names servers answer about themselves.

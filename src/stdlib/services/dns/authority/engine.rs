@@ -129,8 +129,13 @@ impl<A: Authority> AuthorityEngine<A> {
             req.question.query_type(),
             RecordType::AXFR | RecordType::IXFR
         );
+        if req.question.query_class() == DNSClass::CH
+            && let Some(bytes) = self.server.render_chaos(&req)
+        {
+            return self.answer(client, bytes);
+        }
         let response = match req.question.query_class() {
-            DNSClass::CH => self.server.chaos(&req),
+            DNSClass::CH => None,
             DNSClass::IN | DNSClass::ANY if transfer && !self.server.transfer => {
                 Some(bare_reply(&req, ResponseCode::Refused, None))
             }

@@ -23,8 +23,8 @@ use fictionet::stdlib::protocols::dns::rr::{
 };
 use fictionet::stdlib::protocols::dns::{Ede, EdeCode, Nsid, Request, Response};
 use fictionet::stdlib::services::dns::authority::{
-    Ask, Authority, AuthorityEngine, ChaosAnswer, Identity, Known, Observe, Overlay, Relay,
-    ServerConfig, Step, Zones, bare_reply, chaos,
+    Ask, Authority, AuthorityEngine, ChaosAnswer, ChaosReply, Identity, Known, Observe, Overlay,
+    Relay, ServerConfig, Step, Zones, bare_reply, chaos,
 };
 use fictionet::stdlib::services::dns::zone::{Fact, Lazy, Zone, ZoneData};
 use fictionet::stdlib::services::dns::{
@@ -525,16 +525,18 @@ fn chaos_questions_are_answered_by_name_from_the_identity() {
     let calls = Arc::new(AtomicUsize::new(0));
     let mut server = ServerConfig::generic();
     let identity = Identity {
-        unlisted: ResponseCode::ServFail,
+        unlisted: ChaosReply::rcode(ResponseCode::ServFail),
+        aa: true,
+        other_types: None,
         ..Identity::none()
     }
     .answer(chaos::id_server(), ChaosAnswer::Txt("sjc07".to_string()))
     .answer(
         chaos::version_bind(),
-        ChaosAnswer::Rcode(ResponseCode::Refused),
+        ChaosAnswer::Reply(ChaosReply::rcode(ResponseCode::Refused)),
     )
     .ttl(60);
-    server.identity = Some(identity);
+    server.identity = Some(identity.clone());
     let mut engine = AuthorityEngine::new(Counting(calls.clone()), server, local());
     let chaos_query = |qname: &str, qtype: RecordType| {
         query(qname, qtype, |m| {
@@ -571,17 +573,101 @@ fn chaos_questions_are_answered_by_name_from_the_identity() {
     ));
     assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
 
-    // A listed name with another type exists without that type.
+    // A listed name with another type is a zone without that type, as
+    // BIND serves it: NODATA with AA and the name's own SOA.
     let reply = the_answer(&ask_with(
         &mut engine,
         &chaos_query("id.server.", RecordType::A),
         Transport::Udp,
     ));
     assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+    assert!(reply.metadata.authoritative);
     assert!(reply.answers.is_empty());
+    let RData::SOA(soa) = &reply.authorities[0].data else {
+        panic!("an SOA");
+    };
+    assert_eq!(soa.mname.to_string(), "id.server.");
+    assert_eq!(soa.rname.to_string(), "hostmaster.id.server.");
+    assert_eq!(reply.authorities[0].dns_class, DNSClass::CH);
 
     // The IN lookup never sees a CHAOS question.
     assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    // NSD leaves AA clear and refuses other types; Verisign answers them
+    // with NOTIMP and no OPT record; e.root and f.root with NOTIMP and EDE
+    // 21, advertising 512 octets.
+    let not_supported = Ede {
+        code: EdeCode::NOT_SUPPORTED,
+        text: Some("Unsupported DNS Type for Class CHAOS".to_string()),
+    };
+    let fronts = [
+        (
+            Identity {
+                aa: false,
+                other_types: Some(ChaosReply::rcode(ResponseCode::Refused)),
+                ..identity.clone()
+            },
+            false,
+            ResponseCode::Refused,
+            Some(1232),
+            None,
+        ),
+        (
+            Identity {
+                other_types: Some(ChaosReply {
+                    edns: false,
+                    ..ChaosReply::rcode(ResponseCode::NotImp)
+                }),
+                ..identity.clone()
+            },
+            true,
+            ResponseCode::NotImp,
+            None,
+            None,
+        ),
+        (
+            Identity {
+                other_types: Some(ChaosReply {
+                    ede: Some(not_supported.clone()),
+                    ..ChaosReply::rcode(ResponseCode::NotImp)
+                }),
+                payload: Some(512),
+                ..identity
+            },
+            true,
+            ResponseCode::NotImp,
+            Some(512),
+            Some(not_supported),
+        ),
+    ];
+    for (identity, aa, rcode, payload, ede) in fronts {
+        let server = ServerConfig {
+            identity: Some(identity),
+            ..ServerConfig::generic()
+        };
+        let mut engine = AuthorityEngine::new(Counting(calls.clone()), server, local());
+        let mut txt = chaos_query("id.server.", RecordType::TXT);
+        txt.set_edns(Edns::new());
+        let reply = the_answer(&ask_with(&mut engine, &txt, Transport::Udp));
+        assert_eq!(reply.metadata.authoritative, aa);
+        assert_eq!(reply.answers.len(), 1);
+        let mut a = chaos_query("id.server.", RecordType::A);
+        a.set_edns(Edns::new());
+        let reply = the_answer(&ask_with(&mut engine, &a, Transport::Udp));
+        assert_eq!(reply.metadata.response_code, rcode);
+        assert!(!reply.metadata.authoritative);
+        assert!(reply.authorities.is_empty());
+        assert_eq!(reply.edns.as_ref().map(|edns| edns.max_payload()), payload);
+        let sent = reply
+            .edns
+            .iter()
+            .flat_map(|edns| edns.options().as_ref().iter());
+        assert_eq!(
+            sent.filter_map(|(_, option)| Ede::from_option(option))
+                .next(),
+            ede
+        );
+    }
 }
 
 #[test]
