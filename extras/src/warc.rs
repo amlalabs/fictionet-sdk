@@ -83,6 +83,9 @@ fn parse(bytes: &[u8]) -> io::Result<&[u8]> {
     Ok(block)
 }
 
+/// A record's named fields, by lowercase name.
+pub(crate) type Fields = HashMap<String, String>;
+
 fn fields(head: &[u8]) -> io::Result<HashMap<String, String>> {
     let head = std::str::from_utf8(head).map_err(invalid)?;
     if !head.starts_with("WARC/1.") {
@@ -104,7 +107,12 @@ fn block_length(fields: &HashMap<String, String>) -> io::Result<usize> {
         .map_err(invalid)
 }
 
-fn scan(reader: impl Read) -> io::Result<HashMap<String, String>> {
+/// Reads the one record of a gzip member: its header fields, by lowercase
+/// name, and its block when `keep` wants it after seeing the fields.
+fn read_record(
+    reader: impl Read,
+    keep: impl FnOnce(&Fields) -> bool,
+) -> io::Result<(Fields, Option<Vec<u8>>)> {
     let mut reader = BufReader::new(reader);
     let mut head = Vec::new();
     loop {
@@ -118,11 +126,145 @@ fn scan(reader: impl Read) -> io::Result<HashMap<String, String>> {
     }
     let fields = fields(&head[..head.len() - 4])?;
     let length = block_length(&fields)?;
-    let remaining = io::copy(&mut reader, &mut io::sink())? as usize;
-    if remaining < length {
-        return Err(invalid("truncated WARC block"));
+    let block = if keep(&fields) {
+        let mut block = vec![0; length];
+        reader
+            .read_exact(&mut block)
+            .map_err(|_| invalid("truncated WARC block"))?;
+        io::copy(&mut reader, &mut io::sink())?;
+        Some(block)
+    } else {
+        let remaining = io::copy(&mut reader, &mut io::sink())? as usize;
+        if remaining < length {
+            return Err(invalid("truncated WARC block"));
+        }
+        None
+    };
+    Ok((fields, block))
+}
+
+/// One record of an archive file, as [`each_record`] reads it.
+pub(crate) struct Stored {
+    /// The header fields, by lowercase name.
+    pub(crate) fields: Fields,
+    /// The block, when the reader asked for it.
+    pub(crate) block: Option<Vec<u8>>,
+    /// Where the record's gzip member starts in the file.
+    pub(crate) offset: u64,
+    /// The member's compressed length.
+    pub(crate) length: u64,
+}
+
+/// Reads every record of the record-at-a-time compressed archive `file`
+/// in order, with the blocks `keep` asks for.
+pub(crate) fn each_record(
+    file: &Path,
+    keep: impl Fn(&Fields) -> bool,
+    mut visit: impl FnMut(Stored) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut reader = BufReader::new(File::open(file)?);
+    while !reader.fill_buf()?.is_empty() {
+        let offset = reader.stream_position()?;
+        let (fields, block) = read_record(GzDecoder::new(&mut reader), &keep)?;
+        let length = reader.stream_position()? - offset;
+        visit(Stored {
+            fields,
+            block,
+            offset,
+            length,
+        })?;
     }
-    Ok(fields)
+    Ok(())
+}
+
+/// A `WARC-Date` value for `at`: UTC, to the second (WARC 1.1 §5.4).
+pub(crate) fn date(at: time::OffsetDateTime) -> String {
+    let at = at.to_offset(time::UtcOffset::UTC);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        at.year(),
+        at.month() as u8,
+        at.day(),
+        at.hour(),
+        at.minute(),
+        at.second()
+    )
+}
+
+/// Where [`append_record`] put a record.
+pub(crate) struct Appended {
+    /// The record's `WARC-Record-ID`.
+    pub(crate) id: String,
+    /// Where its gzip member starts in the file.
+    pub(crate) offset: u64,
+    /// The member's compressed length.
+    pub(crate) length: u64,
+}
+
+/// Appends one record to the archive at `path` as a gzip member of its
+/// own, the way record-at-a-time compressed archives hold records (WARC
+/// 1.1 Annex D). `fields` are the named fields after the version line;
+/// this adds `WARC-Record-ID` and `Content-Length`. A failed write is cut
+/// off again, so the file never ends in half a record. Callers serialize
+/// writes to each file.
+pub(crate) fn append_record(
+    path: &Path,
+    fields: &[(&str, &str)],
+    block: &[u8],
+) -> io::Result<Appended> {
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    let offset = file.metadata()?.len();
+    let id = format!(
+        "<urn:fictionet:{}:{}:{offset}>",
+        std::process::id(),
+        time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+    );
+    let written = (|| {
+        let mut member = flate2::write::GzEncoder::new(&mut file, flate2::Compression::default());
+        member.write_all(b"WARC/1.1\r\n")?;
+        for (name, value) in fields {
+            write!(member, "{name}: {value}\r\n")?;
+        }
+        write!(
+            member,
+            "WARC-Record-ID: {id}\r\nContent-Length: {}\r\n\r\n",
+            block.len()
+        )?;
+        member.write_all(block)?;
+        member.write_all(b"\r\n\r\n")?;
+        member.finish()?.flush()
+    })();
+    if let Err(error) = written {
+        file.set_len(offset)?;
+        return Err(error);
+    }
+    Ok(Appended {
+        id,
+        offset,
+        length: file.metadata()?.len() - offset,
+    })
+}
+
+/// The archive files in `root`, oldest first by modification time, with
+/// ties broken by path, so a later capture replaces an earlier one.
+pub(crate) fn archive_files(root: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut files = std::fs::read_dir(root)?
+        .map(|entry| entry.map(|e| e.path()))
+        .collect::<io::Result<Vec<_>>>()?;
+    files.retain(|p| p.to_string_lossy().ends_with(".warc.gz"));
+    let mut files = files
+        .into_iter()
+        .map(|path| {
+            let path = std::fs::canonicalize(path)?;
+            let modified = path.metadata()?.modified()?;
+            Ok((modified, path))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    files.sort();
+    Ok(files.into_iter().map(|(_, path)| path).collect())
 }
 
 /// Canonical URL key: fragments never go to an HTTP server.
@@ -150,45 +292,23 @@ impl Archive {
         }
         write!(block, "Content-Length: {}\r\n\r\n", response.body.len())?;
         block.extend_from_slice(&response.body);
-        let now = time::OffsetDateTime::now_utc();
-        let date = format!(
-            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-            now.year(),
-            now.month() as u8,
-            now.day(),
-            now.hour(),
-            now.minute(),
-            now.second()
-        );
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
-        let offset = file.metadata()?.len();
-        let written = (|| {
-            let mut member =
-                flate2::write::GzEncoder::new(&mut file, flate2::Compression::default());
-            write!(
-                member,
-                "WARC/1.1\r\nWARC-Type: response\r\nWARC-Target-URI: {url}\r\nWARC-Date: {date}\r\nWARC-Record-ID: <urn:fictionet:{}:{}:{offset}>\r\nContent-Type: application/http; msgtype=response\r\nContent-Length: {}\r\n\r\n",
-                std::process::id(),
-                now.unix_timestamp_nanos(),
-                block.len()
-            )?;
-            member.write_all(&block)?;
-            member.write_all(b"\r\n\r\n")?;
-            member.finish()?.flush()
-        })();
-        if let Err(error) = written {
-            file.set_len(offset)?;
-            return Err(error);
-        }
+        let date = date(time::OffsetDateTime::now_utc());
+        let appended = append_record(
+            path,
+            &[
+                ("WARC-Type", "response"),
+                ("WARC-Target-URI", &url),
+                ("WARC-Date", &date),
+                ("Content-Type", "application/http; msgtype=response"),
+            ],
+            &block,
+        )?;
         self.urls.insert(
             url,
             Record {
                 file: std::fs::canonicalize(path)?,
-                offset,
-                length: file.metadata()?.len() - offset,
+                offset: appended.offset,
+                length: appended.length,
                 refers: None,
                 captured: Some(date),
             },
@@ -198,40 +318,47 @@ impl Archive {
 
     /// Scan every gzip member once, retaining only URL and record locations.
     /// Revisit references are resolved after all archives have been scanned.
+    /// DNS records (`dns:` target URIs) in the same files are left to
+    /// [`dns::Replay`](crate::dns::Replay).
     pub fn open(files: impl IntoIterator<Item = PathBuf>) -> io::Result<Self> {
         let mut archive = Self::default();
         for file in files {
             let file = std::fs::canonicalize(file)?;
-            let mut reader = BufReader::new(File::open(&file)?);
-            while !reader.fill_buf()?.is_empty() {
-                let offset = reader.stream_position()?;
-                let fields = scan(GzDecoder::new(&mut reader))?;
-                let length = reader.stream_position()? - offset;
-                if !matches!(
-                    fields.get("warc-type").map(String::as_str),
-                    Some("response" | "revisit")
-                ) {
-                    continue;
-                }
-                let url = fields
-                    .get("warc-target-uri")
-                    .and_then(|url| key(url))
-                    .ok_or_else(|| invalid("response without HTTP target URI"))?;
-                let record = Record {
-                    file: file.clone(),
-                    offset,
-                    length,
-                    captured: fields.get("warc-date").cloned(),
-                    refers: fields
-                        .get("warc-refers-to")
-                        .or_else(|| fields.get("warc-refers-to-target-uri"))
-                        .cloned(),
-                };
-                if let Some(id) = fields.get("warc-record-id") {
-                    archive.ids.insert(id.clone(), record.clone());
-                }
-                archive.urls.insert(url, record);
-            }
+            each_record(
+                &file,
+                |_| false,
+                |stored| {
+                    let fields = stored.fields;
+                    if !matches!(
+                        fields.get("warc-type").map(String::as_str),
+                        Some("response" | "revisit")
+                    ) {
+                        return Ok(());
+                    }
+                    let target = fields.get("warc-target-uri");
+                    if target.is_some_and(|uri| crate::dns::is_dns_uri(uri)) {
+                        return Ok(());
+                    }
+                    let url = target
+                        .and_then(|url| key(url))
+                        .ok_or_else(|| invalid("response without HTTP target URI"))?;
+                    let record = Record {
+                        file: file.clone(),
+                        offset: stored.offset,
+                        length: stored.length,
+                        captured: fields.get("warc-date").cloned(),
+                        refers: fields
+                            .get("warc-refers-to")
+                            .or_else(|| fields.get("warc-refers-to-target-uri"))
+                            .cloned(),
+                    };
+                    if let Some(id) = fields.get("warc-record-id") {
+                        archive.ids.insert(id.clone(), record.clone());
+                    }
+                    archive.urls.insert(url, record);
+                    Ok(())
+                },
+            )?;
         }
         Ok(archive)
     }
@@ -244,24 +371,11 @@ impl Archive {
 
     /// Open immutable captures in publication order, with stable path ties.
     pub fn directory(root: &Path) -> io::Result<Self> {
-        let root = Self::directory_root(root)?;
-        let mut files = std::fs::read_dir(&root)?
-            .map(|entry| entry.map(|e| e.path()))
-            .collect::<io::Result<Vec<_>>>()?;
-        files.retain(|p| p.to_string_lossy().ends_with(".warc.gz"));
-        let mut files = files
-            .into_iter()
-            .map(|path| {
-                let path = std::fs::canonicalize(path)?;
-                let modified = path.metadata()?.modified()?;
-                Ok((modified, path))
-            })
-            .collect::<io::Result<Vec<_>>>()?;
-        files.sort();
+        let files = archive_files(&Self::directory_root(root)?)?;
         if files.is_empty() {
             return Err(invalid("no WARC archives"));
         }
-        Self::open(files.into_iter().map(|(_, path)| path))
+        Self::open(files)
     }
 
     /// Resolve a published corpus once so its immutable paths stay stable.

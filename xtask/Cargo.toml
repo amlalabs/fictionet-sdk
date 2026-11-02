@@ -9,6 +9,7 @@ publish = false
 fictionet = { path = ".." }
 fictionet-demo = { path = "../demos/kit" }
 fictionet-extras = { path = "../extras" }
+fictionet-host = { path = "../host" }
 http = "1"
 libc = "0.2"
 web-world = { path = "../demos/search/world" }

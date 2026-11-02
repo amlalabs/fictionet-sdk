@@ -1,5 +1,7 @@
-//! Capture the research web and Python distributions at their original URLs.
+//! Capture the research web and Python distributions at their original URLs,
+//! and the DNS that resolves the captured hosts.
 
+mod dns;
 mod render;
 
 use crate::Result;
@@ -628,6 +630,7 @@ pub async fn run(downloads: &Path, python: Option<&Path>) -> Result {
         verify(&archive, url)?;
     }
     research(&staged_corpus, &corpus.urls).await?;
+    dns::record(&staged_corpus).await?;
     if root.join("packages").is_dir() {
         std::os::unix::fs::symlink(root.join("packages"), staged_corpus.join("packages"))?;
     }

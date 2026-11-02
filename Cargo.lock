@@ -6030,6 +6030,7 @@ dependencies = [
  "fictionet",
  "fictionet-demo",
  "fictionet-extras",
+ "fictionet-host",
  "http",
  "libc",
  "mime_guess",
