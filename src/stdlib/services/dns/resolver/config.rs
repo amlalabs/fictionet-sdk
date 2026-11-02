@@ -6,14 +6,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fictionet::stdlib::protocols::dns::dnssec::{AlgorithmPolicy, Anchors};
+use fictionet::stdlib::protocols::dns::rr::Name;
 use fictionet::stdlib::protocols::dns::rr::rdata::svcb::{
     Alpn, IpHint, SvcParamKey, SvcParamValue, Unknown,
 };
-use fictionet::stdlib::protocols::dns::rr::rdata::{A, AAAA, NS, SOA, SVCB};
-use fictionet::stdlib::protocols::dns::rr::{Name, RData, Record, RecordSet, RecordType};
+use fictionet::stdlib::protocols::dns::rr::rdata::{A, AAAA, SVCB};
 
 use super::super::authority::{ChaosAnswer, Identity, chaos};
-use super::super::zone::{AnyResponse, Zone, ZoneData, special};
+use super::super::zone::{AnyResponse, ZoneData, special};
 
 /// How a recursive resolver behaves.
 ///
@@ -190,7 +190,7 @@ impl Config {
         }
         local.push(Arc::new(special::home_arpa()));
         local.push(Arc::new(special::resolver_arpa(Vec::new(), 3600)));
-        local.push(Arc::new(service_arpa()));
+        local.push(Arc::new(special::service_arpa()));
         local.push(Arc::new(special::onion()));
         local.push(Arc::new(special::test()));
         local.push(Arc::new(special::invalid()));
@@ -358,6 +358,56 @@ impl Config {
         }
     }
 
+    /// OpenDNS at 208.67.222.222, as observed on 2026-11-01, with the
+    /// site's `identity`: a 1410-octet payload; validation, with Extended
+    /// DNS Errors; RD clear answered from its cache; `localhost` and
+    /// `test` answered locally, with AA clear as on its `localhost`
+    /// answers; and six SVCB records at `_dns.resolver.arpa` with TTL 300.
+    /// What it does not show, such as QNAME minimisation, takes Unbound's
+    /// values.
+    pub fn opendns(identity: Identity) -> Config {
+        let anycast = [
+            hints_v4(&[
+                Ipv4Addr::new(208, 67, 220, 220),
+                Ipv4Addr::new(208, 67, 222, 222),
+            ]),
+            hints_v6(&[
+                Ipv6Addr::new(0x2620, 0x119, 0x35, 0, 0, 0, 0, 0x35),
+                Ipv6Addr::new(0x2620, 0x119, 0x53, 0, 0, 0, 0, 0x53),
+            ]),
+        ];
+        let doh = [
+            hints_v4(&[Ipv4Addr::new(146, 112, 41, 2)]),
+            hints_v6(&[Ipv6Addr::new(0x2620, 0x119, 0xfc, 0, 0, 0, 0, 0x2)]),
+        ];
+        let dot = [alpn(&["dot"]), port(853)];
+        let https = |hints: &[(SvcParamKey, SvcParamValue)]| {
+            [&[alpn(&["h2"])], hints, &[dohpath()]].concat()
+        };
+        let endpoints = [
+            (5, "dns.opendns.com.", [&dot[..], &anycast].concat()),
+            (5, "dns.umbrella.com.", [&dot[..], &anycast].concat()),
+            (10, "dns.opendns.com.", https(&anycast)),
+            (10, "dns.umbrella.com.", https(&anycast)),
+            (20, "doh.opendns.com.", https(&doh)),
+            (20, "doh.umbrella.com.", https(&doh)),
+        ];
+        Config {
+            local: vec![Arc::new(special::localhost()), Arc::new(special::test())],
+            local_aa: false,
+            payload: 1410,
+            rd0_from_cache: true,
+            ede: true,
+            identity,
+            ddr: endpoints
+                .into_iter()
+                .map(|(priority, host, params)| SVCB::new(priority, name(host), params))
+                .collect(),
+            ddr_ttl: 300,
+            ..Config::unbound()
+        }
+    }
+
     /// dnsmasq forwarding to `forward`, as a home router runs it: no root
     /// hints, no local zones, no validation, and no QNAME minimisation; a
     /// 1232-octet payload; and TTLs capped only by RFC 8767 §4. It answers
@@ -477,32 +527,6 @@ pub fn root_hints() -> Vec<(Name, IpAddr)> {
             [(server.clone(), IpAddr::V4(*v4)), (server, IpAddr::V6(*v6))]
         })
         .collect()
-}
-
-/// `service.arpa`, for names of services inside a home network, which
-/// Unbound serves as an empty static zone (RFC 9665), with the SOA and
-/// NS of the other locally served zones (RFC 6303 §3).
-fn service_arpa() -> Zone {
-    let apex = name("service.arpa.");
-    let soa = SOA::new(
-        apex.clone(),
-        name("nobody.invalid."),
-        1,
-        3600,
-        1200,
-        604800,
-        10800,
-    );
-    let mut ns = RecordSet::with_ttl(apex.clone(), RecordType::NS, 10800);
-    ns.set_records(vec![Record::from_rdata(
-        apex.clone(),
-        10800,
-        RData::NS(NS(apex.clone())),
-    )]);
-    Zone::builder(apex, soa, 10800)
-        .rrset(ns)
-        .build()
-        .expect("service.arpa is a well-formed zone")
 }
 
 fn name(text: &str) -> Name {

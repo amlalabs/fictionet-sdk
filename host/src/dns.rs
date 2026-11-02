@@ -44,9 +44,9 @@ const WHOAMI: &str = "o-o.myaddr.l.google.com.";
 /// real server sees (RFC 5452 §9.2). A datagram that does not carry that
 /// ID and the question back is not the reply and is ignored, as RFC 5452
 /// §9.1 requires; a UDP reply with TC set is asked again over TCP
-/// (RFC 7766 §5). The reply comes back as it arrived, with the fresh ID,
-/// for the relay to put the asker's back. A refused or unreachable server
-/// is [`Observed::Unreachable`].
+/// (RFC 7766 §5). The reply comes back as it arrived, with the asker's ID
+/// put back in place of the fresh one, so the engine that asked can match
+/// it. A refused or unreachable server is [`Observed::Unreachable`].
 ///
 /// A question waits until its reply comes. The engine that asked decides
 /// how long to wait, and its driver drops the question when it gives up,
@@ -173,7 +173,8 @@ struct Exchange {
     id: u16,
     /// The question's octets, with that ID.
     query: Vec<u8>,
-    /// The question as asked, to tell its reply from other datagrams.
+    /// The question as asked, with the asker's ID, to tell its reply from
+    /// other datagrams and to put that ID back.
     request: Request,
 }
 
@@ -209,9 +210,8 @@ impl Exchange {
         let mut buffer = vec![0; MAX_MESSAGE];
         loop {
             let length = socket.recv(&mut buffer).await?;
-            if self.answers(&buffer[..length]) {
-                buffer.truncate(length);
-                return Ok(buffer);
+            if let Some(reply) = self.answer(&buffer[..length]) {
+                return Ok(reply);
             }
         }
     }
@@ -239,18 +239,20 @@ impl Exchange {
             if stream.read_exact(&mut reply).await.is_err() {
                 return Observed::Timeout;
             }
-            if self.answers(&reply) {
+            if let Some(reply) = self.answer(&reply) {
                 return Observed::Reply(reply);
             }
         }
     }
 
-    /// Whether `reply` is the server's reply to this question: the same
-    /// ID, QR set, and the question back (RFC 5452 §9.1).
-    fn answers(&self, reply: &[u8]) -> bool {
-        reply.len() >= 2
-            && u16::from_be_bytes([reply[0], reply[1]]) == self.id
-            && restore(reply, &self.request).is_ok()
+    /// `reply` with the asker's ID back in place of the fresh one, if it
+    /// is the server's reply to this question: the fresh ID, QR set, and
+    /// the question back (RFC 5452 §9.1).
+    fn answer(&self, reply: &[u8]) -> Option<Vec<u8>> {
+        if reply.len() < 2 || u16::from_be_bytes([reply[0], reply[1]]) != self.id {
+            return None;
+        }
+        restore(reply, &self.request).ok()
     }
 }
 
@@ -381,7 +383,82 @@ mod tests {
             assert_ne!(over_udp[..2], asked[..2]);
             assert_eq!(over_udp, over_tcp);
             assert_eq!(over_udp[2..], asked[2..]);
-            assert_eq!(bytes[..2], over_udp[..2], "the reply as received");
+            assert_eq!(bytes[..2], asked[..2], "the asker's ID is put back");
+        });
+        server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn a_relay_answers_with_what_live_brings_back() {
+        use fictionet::stdlib::services::dns::authority::{AuthorityEngine, Relay, ServerConfig};
+        use fictionet::stdlib::services::dns::{Action, Client, ClientQuery, Engine, Input};
+        use fictionet::time::Instant;
+        use fictionet::{Entropy, SeededEntropy};
+
+        let (udp, _tcp) = sockets();
+        let server = udp.local_addr().unwrap();
+        let answer = Record::from_rdata(
+            Name::from_ascii("www.example.test.").unwrap(),
+            300,
+            RData::A(A::new(192, 0, 2, 1)),
+        );
+        let record = answer.clone();
+        let server_thread = thread::spawn(move || {
+            let mut buffer = [0; 512];
+            let (length, client) = udp.recv_from(&mut buffer).unwrap();
+            udp.send_to(&reply_to(&buffer[..length], vec![record], false), client)
+                .unwrap();
+        });
+        run(async move |fcx| {
+            let entropy: &dyn Entropy = &SeededEntropy::new(Seed::from_u64(1));
+            let config = ServerConfig {
+                identity: None,
+                ..ServerConfig::generic()
+            };
+            let mut engine = AuthorityEngine::new(Relay::new(), config, server);
+            let client = Client {
+                peer: "10.0.0.2:5353".parse().unwrap(),
+                local: server,
+                transport: Transport::Udp,
+                connection: None,
+                sandbox: None,
+            };
+            let asked = query(0x1234, "www.example.test.", RecordType::A);
+            let query = ClientQuery {
+                client,
+                bytes: asked.clone(),
+            };
+            engine.handle(Input::Query(query), Instant::ZERO, entropy);
+            let transmit = std::iter::from_fn(|| engine.poll())
+                .find_map(|action| match action {
+                    Action::Send(transmit) => Some(transmit),
+                    _ => None,
+                })
+                .expect("the relay asks the real server");
+            let ask = Ask {
+                server: transmit.to,
+                transport: transmit.transport,
+                query: transmit.bytes,
+            };
+            let Observed::Reply(bytes) = Live::new().ask(&fcx, ask).await else {
+                panic!("the server replies");
+            };
+            let reply = Input::Reply {
+                token: transmit.token,
+                from: transmit.to,
+                transport: transmit.transport,
+                bytes,
+            };
+            engine.handle(reply, Instant::ZERO, entropy);
+            let answered = std::iter::from_fn(|| engine.poll())
+                .find_map(|action| match action {
+                    Action::Answer(answered) => Some(answered.bytes),
+                    _ => None,
+                })
+                .expect("the client gets an answer");
+            let message = Message::from_vec(&answered).unwrap();
+            assert_eq!(message.metadata.id, 0x1234);
+            assert_eq!(message.answers, vec![answer]);
         });
         server_thread.join().unwrap();
     }
