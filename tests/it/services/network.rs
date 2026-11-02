@@ -1,5 +1,17 @@
 use super::*;
+use fictionet::stdlib::protocols::dns::op::{Edns, ResponseCode};
+use fictionet::stdlib::protocols::dns::rr::rdata::{NS, SOA};
+use fictionet::stdlib::protocols::dns::rr::{LowerName, Record, RecordSet};
+use fictionet::stdlib::protocols::dns::{Ede, EdeCode};
+use fictionet::stdlib::services::dns::authority::{Ask, Observed, Relay, ServerConfig, Zones};
+use fictionet::stdlib::services::dns::resolver::Config;
+use fictionet::stdlib::services::dns::zone::Zone;
+use fictionet::stdlib::services::dns::{Client, Event, WallClock};
+use fictionet::stdlib::services::serve::Transport;
 use fictionet::stdlib::world::net::{Lan, Pools};
+use fictionet::stdlib::world::net::dns::{
+    Authoritative, Namespace, Only, Recursive, ResolverHandle, Source,
+};
 use fictionet_test_support::ended_with_done;
 
 // ---------------------------------------------------------------------------
@@ -95,14 +107,9 @@ fn rejected_port_sharing_discards_preparations_at_every_endpoint() {
             let first = host("first.test");
             let (bad, good) = (host("bad.test"), host("good.test"));
             let (attacher, attachments) = fictionet::attachments();
-            Net::new(fictionet_extras::network::cdn_pools())
-                .add_host(first)
-                .resolve(move |name| match name {
-                    "bad.test" => Some(bad.clone()),
-                    "good.test" => Some(good.clone()),
-                    _ => None,
-                })
-                .start(&fcx, attachments)?;
+            let net = Net::new(fictionet_extras::network::cdn_pools()).add_host(first);
+            let handle = net.handle();
+            net.start(&fcx, attachments)?;
             let endpoints = [
                 SocketAddr::new(v4.into(), 7),
                 SocketAddr::new(v4.into(), 8),
@@ -115,8 +122,10 @@ fn rejected_port_sharing_discards_preparations_at_every_endpoint() {
                 .collect();
             assert_eq!(*server.installed.lock().unwrap(), expected);
             let m = machine(&fcx, attacher.attach("client")?, ME);
+            assert!(handle.add_host(bad).is_err());
             assert_eq!(lookup(&fcx, &m, "bad.test").await, None);
             assert_eq!(*server.installed.lock().unwrap(), expected);
+            handle.add_host(good)?;
             assert_eq!(lookup(&fcx, &m, "good.test").await, Some(v4));
             let good: Vec<_> = endpoints
                 .into_iter()
@@ -172,22 +181,19 @@ fn failed_host_binding_leaves_no_route_service_or_registration() {
                     .tls_accept(443, Sni::Any, config, Spy::default()),
                 _ => unreachable!(),
             };
+            let good = Host::new("good")
+                .dns_name("good.test")
+                .ipv4_only()
+                .at(addr)
+                .tcp(80, Arc::new(()), || Echo)
+                .udp(9, Arc::new(()), || EchoDatagrams)
+                .udp(49152, Arc::new(()), || EchoDatagrams);
             let (attacher, attachments) = fictionet::attachments();
-            Net::new(fictionet_extras::network::cdn_pools())
-                .resolve(move |name| match name {
-                    "bad.test" => Some(bad.clone()),
-                    "good.test" => Some(
-                        Host::new("good")
-                            .ipv4_only()
-                            .at(addr)
-                            .tcp(80, Arc::new(()), || Echo)
-                            .udp(9, Arc::new(()), || EchoDatagrams)
-                            .udp(49152, Arc::new(()), || EchoDatagrams),
-                    ),
-                    _ => None,
-                })
-                .start(&fcx, attachments)?;
+            let net = Net::new(fictionet_extras::network::cdn_pools());
+            let handle = net.handle();
+            net.start(&fcx, attachments)?;
             let m = machine(&fcx, attacher.attach("client")?, ME);
+            assert!(handle.add_host(bad.dns_name("bad.test")).is_err());
             assert_eq!(lookup(&fcx, &m, "bad.test").await, None);
             assert_eq!(started.load(Ordering::SeqCst), 0);
             assert!(server.installed.lock().unwrap().is_empty());
@@ -195,6 +201,7 @@ fn failed_host_binding_leaves_no_route_service_or_registration() {
                 m.tcp.connect(&fcx, SocketAddr::new(addr.into(), 80)).await,
                 Err(ConnError::Unreachable(_))
             ));
+            handle.add_host(good)?;
             assert_eq!(lookup(&fcx, &m, "good.test").await, Some(addr));
             let mut conn = m
                 .tcp
@@ -280,12 +287,8 @@ fn a_second_family_bind_failure_preserves_existing_services() {
                 .tcp(81, Arc::new(()), || Echo)
                 .udp(9, Arc::new(()), || EchoDatagrams);
             let (attacher, attachments) = fictionet::attachments();
-            net.resolve(move |name| match name {
-                "bad.test" => Some(bad.clone()),
-                "good.test" => Some(good.clone()),
-                _ => None,
-            })
-            .start(&fcx, attachments)?;
+            let handle = net.handle();
+            net.start(&fcx, attachments)?;
             let before = server.installed.lock().unwrap().clone();
             let m = machine(&fcx, attacher.attach("client")?, ME);
             let mut existing = if existing_v4 {
@@ -293,6 +296,7 @@ fn a_second_family_bind_failure_preserves_existing_services() {
             } else {
                 None
             };
+            assert!(handle.add_host(bad.dns_name("bad.test")).is_err());
             assert_eq!(lookup(&fcx, &m, "bad.test").await, None);
             assert_eq!(*server.installed.lock().unwrap(), before);
             let closed = m.tcp.connect(&fcx, SocketAddr::new(v4.into(), 81)).await;
@@ -303,6 +307,7 @@ fn a_second_family_bind_failure_preserves_existing_services() {
             } else {
                 assert!(matches!(closed, Err(ConnError::Unreachable(_))));
             }
+            handle.add_host(good.dns_name("good.test"))?;
             assert_eq!(lookup(&fcx, &m, "good.test").await, Some(v4));
             let mut conn = m.tcp.connect(&fcx, SocketAddr::new(v4.into(), 81)).await?;
             assert_eq!(read_some(&fcx, &mut conn, 6).await, b"hello\n");
@@ -336,11 +341,11 @@ fn a_rejected_host_does_not_install_http_names_or_a_default() {
             .port_server(80, server().default_host())
             .port_server(81, Spy::default());
         let (attacher, attachments) = fictionet::attachments();
-        Net::new(fictionet_extras::network::cdn_pools())
-            .add_host(first)
-            .resolve(move |_| Some(bad.clone()))
-            .start(&fcx, attachments)?;
+        let net = Net::new(fictionet_extras::network::cdn_pools()).add_host(first);
+        let handle = net.handle();
+        net.start(&fcx, attachments)?;
         let m = machine(&fcx, attacher.attach("client")?, ME);
+        assert!(handle.add_host(bad).is_err());
         assert_eq!(lookup(&fcx, &m, "bad.test").await, None);
         let mut conn = m
             .tcp
@@ -1209,6 +1214,349 @@ fn udp_ephemeral_ports_skip_bound_ports_and_reuse_released_ports() {
         assert!(endpoint.bind(49152).is_err());
         drop(reserved);
         assert_eq!(endpoint.bind(0)?.local_addr().port(), 49152);
+        Ok(())
+    });
+}
+
+// ---------------------------------------------------------------------------
+// The gateway's resolver and DNS programs on hosts
+
+/// A query for `name` of type `kind` with RD set, with an OPT record when
+/// `edns`.
+fn dns_query(id: u16, name: &str, kind: RecordType, edns: bool) -> Message {
+    let mut query = Message::query();
+    query.metadata.id = id;
+    query.metadata.recursion_desired = true;
+    query.add_query(Query::query(Name::from_ascii(name).unwrap(), kind));
+    if edns {
+        query.set_edns(Edns::new());
+    }
+    query
+}
+
+/// What `server` answers `query` over UDP, if it answers within two
+/// seconds.
+async fn ask(fcx: &Cx, m: &Machine, server: SocketAddr, query: &Message) -> Option<Message> {
+    let mut socket = m.udp.bind(0).ok()?;
+    socket.send_to(&query.to_vec().ok()?, server);
+    let (bytes, _) = timeout(fcx, Duration::from_secs(2), socket.recv(fcx))
+        .await?
+        .ok()?;
+    Message::from_vec(&bytes).ok()
+}
+
+/// The Extended DNS Error codes a reply carries.
+fn edes(reply: &Message) -> Vec<EdeCode> {
+    reply.edns.as_ref().map_or_else(Vec::new, |edns| {
+        edns.options()
+            .as_ref()
+            .iter()
+            .filter_map(|(_, option)| Ede::from_option(option))
+            .map(|ede| ede.code)
+            .collect()
+    })
+}
+
+fn lower(name: &str) -> LowerName {
+    LowerName::new(&Name::from_ascii(name).unwrap())
+}
+
+/// The gateway answers as a resolver with no internet: the names hosts
+/// declare, with RA set; NXDOMAIN with an SOA for other names under a
+/// top-level domain a declared name uses; and SERVFAIL with Extended DNS
+/// Error 22 for every other name. Before, it answered as an authority,
+/// with AA set, NXDOMAIN without an SOA for every unknown name, and a
+/// 60-second TTL.
+#[test]
+fn the_gateway_answers_declared_names_as_a_resolver_with_no_internet() {
+    world(Duration::from_secs(60), |fcx| async move {
+        let (attacher, attachments) = fictionet::attachments();
+        Net::new()
+            .ipv4_only()
+            .host("plc", |h| h.at(PLC_ADDR).dns_name("plc1.plant.test"))
+            .start(&fcx, attachments)?;
+        let m = machine(&fcx, attacher.attach("client")?, ME);
+        let gateway = SocketAddr::new(GATEWAY.into(), 53);
+
+        // A declared name: its address, from a resolver (RA), with AA as
+        // Unbound sets it on local data, and Unbound's local-data TTL.
+        let query = dns_query(1, "plc1.plant.test.", RecordType::A, false);
+        let reply = ask(&fcx, &m, gateway, &query).await.expect("an answer");
+        assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+        assert!(reply.metadata.recursion_available);
+        assert!(reply.metadata.authoritative);
+        assert_eq!(reply.answers.len(), 1);
+        assert_eq!(reply.answers[0].data, RData::A(PLC_ADDR.into()));
+        assert_eq!(reply.answers[0].ttl, 3600);
+        // A query without OPT gets a reply without one (RFC 6891 §7).
+        assert!(reply.edns.is_none());
+
+        // Another name under `test`: NXDOMAIN with the zone's SOA, which a
+        // resolver needs to cache the negative answer (RFC 2308 §3).
+        let query = dns_query(2, "nope.plant.test.", RecordType::A, false);
+        let reply = ask(&fcx, &m, gateway, &query).await.expect("an answer");
+        assert_eq!(reply.metadata.response_code, ResponseCode::NXDomain);
+        assert!(reply.metadata.recursion_available);
+        let soa: Vec<_> = reply
+            .authorities
+            .iter()
+            .filter(|record| record.record_type() == RecordType::SOA)
+            .collect();
+        assert_eq!(soa.len(), 1, "{:?}", reply.authorities);
+        assert_eq!(LowerName::new(&soa[0].name), lower("test."));
+
+        // The name above a declared one exists, with no data (RFC 8020).
+        let query = dns_query(3, "plant.test.", RecordType::A, false);
+        let reply = ask(&fcx, &m, gateway, &query).await.expect("an answer");
+        assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+        assert!(reply.answers.is_empty());
+
+        // A name under another top-level domain has no server to ask.
+        let query = dns_query(4, "example.com.", RecordType::A, true);
+        let reply = ask(&fcx, &m, gateway, &query).await.expect("an answer");
+        assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
+        assert!(reply.metadata.recursion_available);
+        assert!(
+            edes(&reply).contains(&EdeCode::NO_REACHABLE_AUTHORITY),
+            "{:?}",
+            edes(&reply)
+        );
+        Ok(())
+    });
+}
+
+/// A source that answers every question with one A record, and counts
+/// the questions it was asked.
+struct Answers {
+    asked: Arc<AtomicUsize>,
+}
+
+impl Source for Answers {
+    fn ask<'a>(
+        &'a self,
+        _fcx: &'a Cx,
+        ask: Ask,
+    ) -> Pin<Box<dyn Future<Output = Observed> + Send + 'a>> {
+        self.asked.fetch_add(1, Ordering::SeqCst);
+        let query = Message::from_vec(&ask.query).expect("a query");
+        let question = query.queries[0].clone();
+        let mut reply = Message::response(query.metadata.id, query.metadata.op_code);
+        reply.metadata.authoritative = true;
+        reply.add_answer(Record::from_rdata(
+            question.name().clone(),
+            300,
+            RData::A(Ipv4Addr::new(203, 0, 113, 80).into()),
+        ));
+        reply.add_query(question);
+        Box::pin(std::future::ready(Observed::Reply(
+            reply.to_vec().expect("a reply"),
+        )))
+    }
+}
+
+/// `Only` asks its source only what the policy allows. A relay whose ask
+/// was refused stays silent, as a server that never replies.
+#[test]
+fn only_asks_what_its_policy_allows() {
+    world(Duration::from_secs(60), |fcx| async move {
+        let relay = Ipv4Addr::new(203, 0, 113, 53);
+        let asked = Arc::new(AtomicUsize::new(0));
+        let allowed = lower("allowed.test.");
+        let policy = move |ask: &Ask| {
+            Message::from_vec(&ask.query)
+                .ok()
+                .and_then(|query| query.queries.first().map(|q| LowerName::new(q.name())))
+                .is_some_and(|name| allowed.zone_of(&name))
+        };
+        let source = Only::new(
+            policy,
+            Answers {
+                asked: asked.clone(),
+            },
+        );
+        let (attacher, attachments) = fictionet::attachments();
+        Net::new()
+            .ipv4_only()
+            .host("relay", |h| {
+                h.at(relay).program(
+                    Authoritative::new(Relay::new(), ServerConfig::generic()).source(source),
+                )
+            })
+            .start(&fcx, attachments)?;
+        let m = machine(&fcx, attacher.attach("client")?, ME);
+        let server = SocketAddr::new(relay.into(), 53);
+
+        let query = dns_query(1, "www.allowed.test.", RecordType::A, false);
+        let reply = ask(&fcx, &m, server, &query).await.expect("an answer");
+        assert_eq!(reply.metadata.id, 1);
+        assert_eq!(
+            reply.answers[0].data,
+            RData::A(Ipv4Addr::new(203, 0, 113, 80).into())
+        );
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+
+        let query = dns_query(2, "www.other.test.", RecordType::A, false);
+        assert!(ask(&fcx, &m, server, &query).await.is_none());
+        assert_eq!(asked.load(Ordering::SeqCst), 1, "the source was not asked");
+        Ok(())
+    });
+}
+
+/// A root zone at `ns.` holding `www.example.` directly, with no
+/// delegations.
+fn small_root(server: Ipv4Addr) -> Zone {
+    let rrset = |owner: &str, rdata: RData| {
+        let owner = Name::from_ascii(owner).unwrap();
+        let mut set = RecordSet::with_ttl(owner.clone(), rdata.record_type(), 3600);
+        set.set_records(vec![Record::from_rdata(owner, 3600, rdata)]);
+        set
+    };
+    let ns = Name::from_ascii("ns.").unwrap();
+    let soa = SOA::new(
+        ns.clone(),
+        Name::from_ascii("hostmaster.ns.").unwrap(),
+        1,
+        3600,
+        600,
+        86400,
+        300,
+    );
+    Zone::builder(Name::root(), soa, 3600)
+        .rrset(rrset(".", RData::NS(NS(ns))))
+        .rrset(rrset("ns.", RData::A(server.into())))
+        .rrset(rrset(
+            "www.example.",
+            RData::A(Ipv4Addr::new(203, 0, 113, 80).into()),
+        ))
+        .build()
+        .unwrap()
+}
+
+/// Advancing a namespace reaches a running resolver: it empties its cache
+/// and asks again.
+#[test]
+fn advancing_a_namespace_reaches_a_running_resolver() {
+    world(Duration::from_secs(60), |fcx| async move {
+        let root = Ipv4Addr::new(203, 0, 113, 53);
+        let clock = WallClock {
+            start: std::time::SystemTime::UNIX_EPOCH,
+        };
+        let namespace = Namespace::new(clock);
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counted = asked.clone();
+        let www = lower("www.example.");
+        let server = Authoritative::new(
+            Zones::new(vec![Arc::new(small_root(root))]),
+            ServerConfig::generic(),
+        )
+        .on_event(move |event| {
+            if let Event::Query { question, .. } = event
+                && LowerName::new(question.name()) == www
+            {
+                counted.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        // The resolver iterates from this root, which is unsigned.
+        let config = Config {
+            anchors: None,
+            ..Config::gateway()
+        }
+        .hints(&[(Name::from_ascii("ns.")?, IpAddr::V4(root))]);
+        let resolvers = namespace.clone();
+        let (attacher, attachments) = fictionet::attachments();
+        Net::new()
+            .ipv4_only()
+            .host("root", |h| h.at(root).program(server))
+            .gateway(move |h, _| {
+                h.program(Recursive::new(config.clone(), clock).namespace(&resolvers))
+            })
+            .start(&fcx, attachments)?;
+        let m = machine(&fcx, attacher.attach("client")?, ME);
+        let gateway = SocketAddr::new(GATEWAY.into(), 53);
+        let resolve = |id| {
+            let (fcx, m) = (fcx.clone(), &m);
+            async move {
+                let query = dns_query(id, "www.example.", RecordType::A, false);
+                let reply = ask(&fcx, m, gateway, &query).await.expect("an answer");
+                assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+                assert_eq!(
+                    reply.answers[0].data,
+                    RData::A(Ipv4Addr::new(203, 0, 113, 80).into())
+                );
+            }
+        };
+        resolve(1).await;
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+        // From the cache.
+        resolve(2).await;
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+        // A new session: the cache is gone, so the root is asked again.
+        namespace.advance(clock);
+        resolve(3).await;
+        assert_eq!(asked.load(Ordering::SeqCst), 2);
+        Ok(())
+    });
+}
+
+/// A query through a resolver's handle, as DNS over TLS would put it, gets
+/// the answer a query over UDP gets.
+#[test]
+fn a_resolver_handle_answers_as_udp_does() {
+    world(Duration::from_secs(60), |fcx| async move {
+        let handles: Arc<Mutex<Vec<ResolverHandle>>> = Arc::default();
+        let kept = handles.clone();
+        let (attacher, attachments) = fictionet::attachments();
+        Net::new()
+            .ipv4_only()
+            .host("plc", |h| h.at(PLC_ADDR).dns_name("plc1.plant.test"))
+            .gateway(move |h, declared| {
+                let clock = WallClock {
+                    start: std::time::SystemTime::UNIX_EPOCH,
+                };
+                let resolver = Recursive::new(declared.over(Config::gateway()), clock);
+                kept.lock().unwrap().push(resolver.handle());
+                h.program(resolver)
+            })
+            .start(&fcx, attachments)?;
+        let m = machine(&fcx, attacher.attach("client")?, ME);
+        let handle = handles.lock().unwrap()[0].clone();
+        for (id, name) in [(1, "plc1.plant.test."), (2, "nope.plant.test.")] {
+            let query = dns_query(id, name, RecordType::A, true);
+            let udp = ask(&fcx, &m, SocketAddr::new(GATEWAY.into(), 53), &query)
+                .await
+                .expect("an answer over UDP");
+            let client = Client {
+                peer: SocketAddr::new(ME.into(), 40000),
+                local: SocketAddr::new(GATEWAY.into(), 853),
+                transport: Transport::Tcp,
+                connection: None,
+                sandbox: None,
+            };
+            let bytes = handle
+                .query(&fcx, client, query.to_vec()?)
+                .await
+                .expect("an answer through the handle");
+            let handled = Message::from_vec(&bytes)?;
+            assert_eq!(handled.metadata, udp.metadata);
+            assert_eq!(handled.queries, udp.queries);
+            assert_eq!(handled.answers, udp.answers);
+            assert_eq!(handled.authorities, udp.authorities);
+        }
+        // An address the resolver does not run at.
+        let elsewhere = Client {
+            peer: SocketAddr::new(ME.into(), 40000),
+            local: SocketAddr::new(PLC_ADDR.into(), 853),
+            transport: Transport::Tcp,
+            connection: None,
+            sandbox: None,
+        };
+        let query = dns_query(3, "plc1.plant.test.", RecordType::A, false);
+        assert!(
+            handle
+                .query(&fcx, elsewhere, query.to_vec()?)
+                .await
+                .is_none()
+        );
         Ok(())
     });
 }

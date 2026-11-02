@@ -38,9 +38,9 @@
 //!   listener. HTTP is one ([`httpd`](web::httpd)). Worlds report typed facts
 //!   through their own service state.
 //! - **Networks.** [`net::Net`](world::net::Net) builds all of the above for
-//!   you: the sandboxes' subnet, DNS, addresses, a router, one machine per
-//!   address, and each host's services. [`web::Sites`] is a preset on it for a
-//!   world of websites. Start there.
+//!   you: the sandboxes' subnet, a resolver at the gateway, addresses, a
+//!   router, one machine per address, and each host's services.
+//!   [`web::Sites`] is a preset on it for a world of websites. Start there.
 //!
 //! Every piece is ordinary code built from the same public items, so you
 //! can wire a network by hand when `Net` does not fit. To put a link in
@@ -369,6 +369,7 @@
 //! | Module | Description |
 //! | --- | --- |
 //! | [`services::ca`] | Seeded certificate authorities and server certificates. |
+//! | [`services::dns`] | DNS engines with no I/O: zones, authoritative servers, and a validating recursive resolver. |
 //! | [`services::keys`] | Seeded private keys: P-256, P-384, RSA, and Ed25519. |
 //! | [`services::serve`] | Service drivers, listeners, transcripts and fault plans. |
 //! | [`services::tls`] | Simulated TLS servers using rustls. |
@@ -385,6 +386,7 @@
 //! | Module | Description |
 //! | --- | --- |
 //! | [`world::net`] | Networks of hosts, DNS names, addresses, routes and services. |
+//! | [`world::net::dns`] | DNS servers and resolvers as programs on hosts, their sources, and namespaces. |
 
 pub mod codec;
 pub mod network;

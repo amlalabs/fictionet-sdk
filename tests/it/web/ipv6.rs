@@ -193,8 +193,10 @@ fn dns_answers_aaaa_for_each_family_a_site_has() {
                 );
             }
         }
-        // The callback ran once per name.
-        assert_eq!(env.calls.load(Ordering::SeqCst), 6);
+        // The callback ran for `test` and then the name on each lookup no
+        // placed site answered: once for each of the four sites, and on
+        // every lookup of the two names it turned down, which are not kept.
+        assert_eq!(env.calls.load(Ordering::SeqCst), 4 * 2 + 4 * 2);
 
         // DNS also answers at the gateway's IPv6 address, over UDP and TCP.
         let m6 = machine(&fcx, attacher.attach("b").unwrap(), ME6);
@@ -431,19 +433,14 @@ fn late_host_failure_keeps_http_defaults_names_and_tls_unchanged() {
             .udp(49152, Arc::new(()), || Quiet);
         let good = site("good", false).served_by(Host::new("good").at(v4).at(v6));
         let (attacher, attachments) = fictionet::attachments();
-        Net::new(fictionet_extras::network::cdn_pools())
-            .add_host(first)
-            .add_host(occupied)
-            .resolve(move |name| match name {
-                "bad.test" => Some(bad.clone()),
-                "good.test" => Some(good.clone()),
-                _ => None,
-            })
-            .start(&fcx, attachments)?;
+        let net = Net::new(fictionet_extras::network::cdn_pools()).add_host(first).add_host(occupied);
+        let handle = net.handle();
+        net.start(&fcx, attachments)?;
         let m4 = default_machine(&fcx, &attacher);
         let m6 = machine(&fcx, attacher.attach("b")?, ME6);
         let mut existing = plain_client(&fcx, &m4, v4, false).await;
         assert_eq!(existing.get("http", "first.test", "/").await.body, "first");
+        assert!(handle.add_host(bad.dns_name("bad.test")).is_err());
         assert_eq!(
             dns(&fcx, &m4, "bad.test", RecordType::A).await.0,
             ResponseCode::NXDomain
@@ -474,6 +471,7 @@ fn late_host_failure_keeps_http_defaults_names_and_tls_unchanged() {
             let mut conn = TlsClient::new(&fcx, tcp, &roots, "bad.test", &[b"http/1.1"], date)?;
             assert!(conn.handshake(&fcx).await.is_err());
         }
+        handle.add_host(good.dns_name("good.test"))?;
         assert_eq!(lookup(&fcx, &m4, "good.test").await, v4);
         assert_eq!(existing.get("http", "good.test", "/").await.body, "good");
         Ok(())
@@ -1247,7 +1245,6 @@ fn dns_makes_no_more_sites_than_the_limit() {
         Ok(())
     });
 }
-
 /// An atomic fragment (offset 0, no more) that holds `inner`, itself a
 /// fragment.
 fn nested6(outer_id: u32, inner: &Packet) -> Packet {

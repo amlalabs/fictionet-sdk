@@ -76,7 +76,13 @@
 //!
 //! - `Some(site)`: the site gets an address, a machine and a route, and DNS
 //!   answers with that address.
-//! - `None`: DNS answers NXDOMAIN.
+//! - `None`: the name does not exist, nor anything below it (RFC 8020), and
+//!   DNS answers NXDOMAIN.
+//!
+//! A name exists only if its parent does, so before a name is decided its
+//! parents are: looking up `www.example.com` runs the callback for `com`,
+//! then `example.com`, then `www.example.com`, each until one gets a site.
+//! The root is never asked about, nor a name whose first label is `*`.
 //!
 //! A site exists only once its name has been looked up. Connecting straight
 //! to an IP address, without a lookup, works only if a site already lives
@@ -89,27 +95,16 @@
 //! [`default_host`](Site::default_host), which answers such requests). The
 //! callback is not run for names seen there.
 //!
-//! The answer is kept for the whole run. The callback runs once per name, so
-//! a site keeps its state between requests, and the agent always sees the
-//! same address for a name. A site that should change over time does so
-//! inside its handler.
+//! A site is kept for the whole run: the callback runs once for a name it
+//! gives a site, so the site keeps its state between requests, and the
+//! agent always sees the same address for the name. A site that should
+//! change over time does so inside its handler. A name turned down is not
+//! kept, so looking it up again runs the callback again, and a name may
+//! come into being as the world runs.
 //!
-//! The agent chooses which names to look up, so two limits keep a flood of
-//! made-up names from growing the world's memory without end:
-//!
-//! - **Names turned down.** 100,000 names the callback turned down (`None`)
-//!   are remembered, which costs about 35 MB at most. Past that, a name
-//!   turned down is not kept, and looking it up again runs the callback
-//!   again.
-//! - **Sites.** 20,000 names may have a site, unless the world sets
-//!   another limit with [`Sites::max_sites`]. This matters for a callback
-//!   that opens a whole domain, such as every name under `github.com`: each
-//!   such name the agent tries gets a site, and a machine (about 11 KiB) for
-//!   each of its addresses, so the default limit holds them to about
-//!   430 MiB. Past the limit, a new name that the callback
-//!   gives a site is answered with SERVFAIL, and its site is dropped before
-//!   it gets an address or a machine. The name is not kept, so looking it
-//!   up again runs the callback again.
+//! A callback that opens a whole domain, such as every name under
+//! `github.com`, gives a site, and a machine (about 11 KiB) for each of its
+//! addresses, to every such name the agent tries.
 //!
 //! A world can report typed facts from its name-resolution callback.
 //!
@@ -323,9 +318,11 @@
 //!   wait in each filter. A filter's fragments end with it, so a fragment a
 //!   sandbox sent before it detached can never complete a packet for the
 //!   next sandbox to take its address.
-//! - **DNS** at the gateway, at both of its addresses. It answers A and
+//! - **DNS** at the gateway, at both of its addresses: a recursive
+//!   resolver like Unbound with no route to the internet. It answers A and
 //!   AAAA records for sites, NODATA for other record types of their names,
-//!   and NXDOMAIN for names the callback turned down.
+//!   and NXDOMAIN for names the callback turned down, with an SOA for the
+//!   sandbox's resolver to cache. Answers set RA, as a resolver's do.
 //! - **Addresses.** Every site has an IPv4 and an IPv6 address, unless it
 //!   is made [`ipv4_only`](Site::ipv4_only) or
 //!   [`ipv6_only`](Site::ipv6_only). A site with [`at`](Site::at) uses the
@@ -459,7 +456,9 @@
 //!
 //! - **Names.** The callback gets each name in lowercase, without the
 //!   trailing dot. Lookups of `Example.COM.` and `example.com` are the same
-//!   lookup. Answers have a TTL of 60 seconds.
+//!   lookup. Addresses have a TTL of an hour, as Unbound's local data
+//!   does. A name turned down may be cached for a minute, the negative TTL
+//!   of its SOA, since the callback may give it a site later.
 //! - **Automatic addresses** are handed out in order from each pool's
 //!   second address. Addresses inside the sandboxes' subnets are skipped, so a
 //!   subnet inside a pool works too. A family with no pool, or whose pool a
@@ -541,8 +540,12 @@ use std::sync::Arc;
 use http::{Request, Response};
 
 use fictionet::stdlib::network::route::Prefix;
+use fictionet::stdlib::protocols::dns::rr::{LowerName, Name};
+use fictionet::stdlib::services::dns::WallClock;
+use fictionet::stdlib::services::dns::zone::{Transparent, ZoneData};
 use fictionet::stdlib::services::tls::ServerConfig;
-use fictionet::stdlib::world::net::{Host, Net, Pools};
+use fictionet::stdlib::world::net::dns::{self, Recursive};
+use fictionet::stdlib::world::net::{Host, Net, Pools, gateway_config};
 use fictionet::{Attachments, Cx, Error};
 pub use httpd::{Body, Routing, Target};
 use httpd::{Handler, Server};
@@ -560,15 +563,16 @@ type SiteFor = dyn Fn(&str) -> Option<Site> + Send + Sync;
 
 impl Sites {
     /// Sites decided by `site_for`, which gets a hostname and returns the
-    /// site for it, or `None` if it does not exist. It runs once per name.
-    /// Sites without [`Site::at`] get addresses from `pools`
-    /// ([`Net::new`]).
+    /// site for it, or `None` if nothing exists at that name or below it.
+    /// It runs once for a name it gives a site, and again each time a name
+    /// it turned down is looked up. See [the callback](fictionet::stdlib::web#the-callback).
     ///
     /// The name is in lowercase, without a trailing dot: `en.wikipedia.org`.
     ///
-    /// `site_for` must return quickly and must not block. It runs inside the
-    /// DNS task, and every sandbox's lookups wait while it runs. It decides.
-    /// It does not fetch. Slow work belongs in the site's handler.
+    /// `site_for` must return quickly and must not block. It runs while the
+    /// gateway's resolver waits, and every sandbox's lookups wait while it
+    /// runs. It decides. It does not fetch. Slow work belongs in the site's
+    /// handler.
     pub fn new<F>(pools: Pools, site_for: F) -> Sites
     where
         F: Fn(&str) -> Option<Site> + Send + Sync + 'static,
@@ -603,30 +607,41 @@ impl Sites {
         self
     }
 
-    /// Sets how many names may have a site. The default is 20,000.
-    ///
-    /// Each name the callback gives a site is kept for the whole run, with
-    /// its machines. At the limit, a new name still runs the callback. If it
-    /// returns a site, that site is dropped before it gets an address or a
-    /// machine, and DNS answers SERVFAIL. The name is not kept, so looking it up again
-    /// runs the callback again.
-    pub fn max_sites(mut self, max_sites: usize) -> Sites {
-        self.net = self.net.max_hosts(max_sites);
-        self
-    }
-
     /// The network these sites run on, before it starts: to add hosts
     /// with other services next to the websites.
+    ///
+    /// Its gateway runs the network's default resolver, like Unbound with
+    /// no route to the internet ([`Net::gateway`]), whose local zones are
+    /// the names the network's hosts declare and, after them, a root zone
+    /// that asks the callback ([`dns::placing`]). The callback decides
+    /// every name but `localhost`, so the resolver's default zones for
+    /// `test`, `invalid`, and `onion` give way to it.
     pub fn into_net(self) -> Net {
         let site_for = self.site_for;
         let date = self.date;
-        self.net.resolve(move |name| {
+        let clock = WallClock {
+            start: date.unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+        };
+        let sites: Arc<dyn ZoneData> = Arc::new(dns::placing(self.net.handle(), move |name| {
             site_for(name).map(|mut site| {
                 if let Some(date) = date {
                     site = site.date(date);
                 }
                 site.into_host(name)
             })
+        }));
+        self.net.gateway(move |host, declared| {
+            let localhost = LowerName::from(Name::from_ascii("localhost.").expect("a valid name"));
+            let mut config = gateway_config();
+            config
+                .local
+                .retain(|zone| zone.apex().num_labels() != 1 || *zone.apex() == localhost);
+            // Local zones of equal depth answer last added first, so the
+            // declared names answer before the callback is asked.
+            let config = config
+                .local(sites.clone())
+                .local(Arc::new(Transparent(declared)));
+            host.program(Recursive::new(config, clock))
         })
     }
 
