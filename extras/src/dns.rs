@@ -24,7 +24,7 @@ use std::pin::Pin;
 use fictionet::Cx;
 use fictionet::stdlib::protocols::dns::op::Message;
 use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, Name, RData, RecordType};
-use fictionet::stdlib::protocols::dns::{Parsed, Request, restore};
+use fictionet::stdlib::protocols::dns::{Parsed, Request, read_message, restore};
 use fictionet::stdlib::services::dns::authority::{Ask, Observed};
 use fictionet::stdlib::services::serve::Transport;
 use fictionet::stdlib::world::net::dns::{Question, Source};
@@ -236,13 +236,24 @@ const CAPTURE_SUFFIX: &str = ".warc.gz";
 /// recorded reply. The capture's own NS records and addresses say which
 /// servers those are.
 ///
+/// A corpus holds several captures, and a world's clock stands at the
+/// newest one, so the reply comes from the newest capture that holds one
+/// for the server or a server of its zone: an older capture's RRSIGs may
+/// have expired by that clock. Within one capture, the server's own reply
+/// comes first, then the reply of the server sharing the deepest zone.
+///
 /// Anything else gets [`Observed::Timeout`], as from a server that never
 /// replies.
 #[derive(Debug, Default)]
 pub struct Replay {
-    replies: HashMap<Question, Vec<(SocketAddr, Vec<u8>)>>,
+    /// The replies to each question: the server that sent each, the
+    /// reply, and the capture it came from, counted in the order the
+    /// archives were read.
+    replies: HashMap<Question, Vec<(SocketAddr, Vec<u8>, usize)>>,
     /// The zones each server address serves, by the capture's NS records.
     zones: HashMap<IpAddr, Vec<LowerName>>,
+    /// The names a recorded reply to an A question gave an IPv4 address.
+    resolved: HashSet<LowerName>,
     captured: Vec<String>,
 }
 
@@ -255,7 +266,7 @@ impl Replay {
         let mut replay = Replay::default();
         let mut ns = HashSet::new();
         let mut addresses: HashMap<LowerName, Vec<IpAddr>> = HashMap::new();
-        for file in files {
+        for (capture, file) in files.into_iter().enumerate() {
             let mut queries: HashMap<String, Vec<u8>> = HashMap::new();
             let mut responses = Vec::new();
             warc::each_record(
@@ -295,15 +306,24 @@ impl Replay {
                 let Parsed::Request(request) = Request::parse(query, Transport::Tcp) else {
                     return Err(invalid("a recorded DNS query that does not parse"));
                 };
-                if let Ok(message) = Message::from_vec(&reply) {
+                if let Ok(message) = read_message(&reply) {
                     learn(&message, &mut ns, &mut addresses);
+                    let addressed = message
+                        .answers
+                        .iter()
+                        .any(|record| matches!(record.data, RData::A(_)));
+                    if request.question.query_type() == RecordType::A && addressed {
+                        replay
+                            .resolved
+                            .insert(LowerName::new(request.question.name()));
+                    }
                 }
                 if let Some(date) = fields.get("warc-date") {
                     replay.captured.push(date.clone());
                 }
                 let replies = replay.replies.entry(Question::of(&request)).or_default();
-                replies.retain(|(recorded, _)| *recorded != server);
-                replies.push((server, reply));
+                replies.retain(|(recorded, _, _)| *recorded != server);
+                replies.push((server, reply, capture));
             }
         }
         for (zone, target) in ns {
@@ -342,6 +362,12 @@ impl Replay {
         root.join(format!("{CAPTURE_PREFIX}{stamp}{CAPTURE_SUFFIX}"))
     }
 
+    /// Whether a recorded reply to an A question for `name` gives an IPv4
+    /// address, the name's own or one at the end of its CNAME chain.
+    pub fn resolves(&self, name: &LowerName) -> bool {
+        self.resolved.contains(name)
+    }
+
     /// The `WARC-Date` of every recorded reply.
     pub fn capture_times(&self) -> impl Iterator<Item = &str> {
         self.captured.iter().map(String::as_str)
@@ -352,8 +378,9 @@ impl Replay {
     /// the same question with DO, with what DO brought taken out. The
     /// capture asks every question with DO, as the world's resolvers do,
     /// and a real server answers a query without it with the same records
-    /// less the DNSSEC ones (RFC 4035 §3.2.1) and, for a query with no OPT
-    /// record, no OPT record either (RFC 6891 §7).
+    /// less the DNSSEC ones (RFC 4035 §3.2.1), a referral's DS RRset among
+    /// them (RFC 4035 §3.1.4.1), and, for a query with no OPT record, no
+    /// OPT record either (RFC 6891 §7).
     fn reply_to(&self, server: SocketAddr, request: &Request) -> Option<Vec<u8>> {
         let question = Question::of(request);
         if let Some(reply) = self.reply(server, &question) {
@@ -367,14 +394,16 @@ impl Replay {
             dnssec_ok: true,
             ..question
         };
-        let mut message = Message::from_vec(self.reply(server, &signed)?).ok()?;
+        let mut message = read_message(self.reply(server, &signed)?).ok()?;
         let asked = request.question.query_type();
+        // A referral carries the child's DS RRset only for DO
+        // (RFC 4035 §3.1.4.1).
         let keep = |record: &fictionet::stdlib::protocols::dns::rr::Record| {
             let rtype = record.record_type();
             rtype == asked
                 || !matches!(
                     rtype,
-                    RecordType::RRSIG | RecordType::NSEC | RecordType::NSEC3
+                    RecordType::RRSIG | RecordType::NSEC | RecordType::NSEC3 | RecordType::DS
                 )
         };
         message.answers.retain(keep);
@@ -390,14 +419,12 @@ impl Replay {
         message.to_vec().ok()
     }
 
-    /// The recorded reply to `question` sent to `server`: the one from
-    /// that server, or else the one from the server sharing the deepest
-    /// zone with it that holds the question's name.
+    /// The recorded reply to `question` sent to `server`, from the newest
+    /// capture that holds one from that server or from a server sharing a
+    /// zone with it that holds the question's name: in that capture, the
+    /// server's own, or else the one from the server sharing the deepest
+    /// such zone.
     fn reply(&self, server: SocketAddr, question: &Question) -> Option<&[u8]> {
-        let replies = self.replies.get(question)?;
-        if let Some((_, reply)) = replies.iter().find(|(from, _)| *from == server) {
-            return Some(reply);
-        }
         let name = &question.name;
         let serving = |address: IpAddr| {
             self.zones
@@ -406,22 +433,25 @@ impl Replay {
                 .flatten()
                 .filter(|zone| zone.zone_of(name))
         };
-        let mut best: Option<(u8, &[u8])> = None;
-        for (from, reply) in replies {
-            if from.port() != server.port() {
-                continue;
+        // Within a capture the server's own reply ranks above any other.
+        let rank = |from: &SocketAddr| {
+            if *from == server {
+                return Some(u8::MAX);
             }
-            let shared = serving(server.ip())
+            if from.port() != server.port() {
+                return None;
+            }
+            serving(server.ip())
                 .filter(|zone| serving(from.ip()).any(|other| other == *zone))
                 .map(|zone| zone.num_labels())
-                .max();
-            if let Some(depth) = shared
-                && best.is_none_or(|(deepest, _)| depth > deepest)
-            {
-                best = Some((depth, reply));
-            }
-        }
-        best.map(|(_, reply)| reply)
+                .max()
+        };
+        self.replies
+            .get(question)?
+            .iter()
+            .filter_map(|(from, reply, capture)| Some(((*capture, rank(from)?), reply)))
+            .max_by_key(|(key, _)| *key)
+            .map(|(_, reply)| reply.as_slice())
     }
 }
 
@@ -484,6 +514,10 @@ impl Source for Replay {
 mod tests {
     use super::*;
     use fictionet::Seed;
+    use fictionet::stdlib::protocols::dns::dnssec::rdata::DNSSECRData;
+    use fictionet::stdlib::protocols::dns::dnssec::{
+        self, Algorithm, DigestType, KeyFlags, Sign, ZoneKey,
+    };
     use fictionet::stdlib::protocols::dns::op::{Edns, MessageType, OpCode, Query};
     use fictionet::stdlib::protocols::dns::rr::Record;
     use fictionet::stdlib::protocols::dns::rr::rdata::{A, NS};
@@ -645,6 +679,8 @@ mod tests {
             let www = query(7, "www.example.com.", RecordType::A, Some(true));
             capture(&fcx, &path, vec![ask(COM, www)]).await;
             let replay = Replay::open([path.clone()]).unwrap();
+            assert!(replay.resolves(&LowerName::new(&name("www.example.com."))));
+            assert!(!replay.resolves(&LowerName::new(&name("mail.example.com."))));
 
             let mut asked = query(0x4242, "WwW.ExAmPlE.CoM.", RecordType::A, Some(true));
             asked[2] |= 0x01; // RD
@@ -807,5 +843,141 @@ mod tests {
         );
         assert_eq!(uri_server("DNS://198.41.0.4/.?type=NS"), Some(A_ROOT));
         assert_eq!(uri_server("dns:www.example.com?type=A"), None);
+    }
+
+    const C_ROOT: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 33, 4, 12)), 53);
+
+    /// Three root servers that answer every name but the root with
+    /// `address`, and with DO refer `com` with a DS RRset.
+    struct Roots(Ipv4Addr);
+
+    impl Source for Roots {
+        fn ask<'a>(
+            &'a self,
+            _fcx: &'a Cx,
+            ask: Ask,
+        ) -> Pin<Box<dyn Future<Output = Observed> + Send + 'a>> {
+            let Parsed::Request(request) = Request::parse(&ask.query, ask.transport) else {
+                return Box::pin(ready(Observed::Timeout));
+            };
+            let dnssec_ok = request.edns.is_some_and(|edns| edns.dnssec_ok);
+            let mut reply = Message::response(request.message.metadata.id, OpCode::Query);
+            reply.add_query(request.question.clone());
+            let qname = request.question.name().clone();
+            if qname.is_root() {
+                reply.metadata.authoritative = true;
+                for (letter, address) in [("a", A_ROOT), ("b", B_ROOT), ("c", C_ROOT)] {
+                    let server = name(&format!("{letter}.root-servers.net."));
+                    reply.add_answer(Record::from_rdata(
+                        Name::root(),
+                        518400,
+                        RData::NS(NS(server.clone())),
+                    ));
+                    let IpAddr::V4(ip) = address.ip() else {
+                        unreachable!("the root servers here have IPv4 addresses")
+                    };
+                    reply.add_additional(Record::from_rdata(server, 518400, RData::A(A(ip))));
+                }
+            } else if qname == name("example.com.") {
+                let com = name("com.");
+                let server = name("a.gtld-servers.net.");
+                reply.add_authority(Record::from_rdata(
+                    com.clone(),
+                    172800,
+                    RData::NS(NS(server.clone())),
+                ));
+                if dnssec_ok {
+                    let entropy = fictionet::SeededEntropy::new(Seed::from_u64(3));
+                    let key = ZoneKey::generate(&entropy, Algorithm::Ed25519, KeyFlags::KSK);
+                    let ds = dnssec::ds(&com, &key.dnskey(), DigestType::Sha256);
+                    reply.add_authority(Record::from_rdata(
+                        com,
+                        86400,
+                        RData::DNSSEC(DNSSECRData::DS(ds)),
+                    ));
+                }
+                reply.add_additional(Record::from_rdata(
+                    server,
+                    172800,
+                    RData::A(A::new(192, 5, 6, 30)),
+                ));
+            } else {
+                reply.metadata.authoritative = true;
+                reply.add_answer(Record::from_rdata(qname, 300, RData::A(A(self.0))));
+            }
+            if let Some(edns) = &request.edns {
+                let mut out = Edns::new();
+                out.set_max_payload(1232);
+                out.set_dnssec_ok(edns.dnssec_ok);
+                reply.set_edns(out);
+            }
+            Box::pin(ready(Observed::Reply(reply.to_vec().unwrap())))
+        }
+    }
+
+    /// Captures `asks` through `Roots(address)` into `path`.
+    async fn capture_roots(fcx: &Cx, path: &Path, address: Ipv4Addr, asks: Vec<Ask>) {
+        let capture = Capture::new(Roots(address));
+        for ask in asks {
+            capture.ask(fcx, ask).await;
+        }
+        capture.write(path).unwrap();
+    }
+
+    #[test]
+    fn the_newest_capture_answers_for_every_server_of_a_zone() {
+        let old = archive("older");
+        let new = archive("newer");
+        let (older, newer) = (old.clone(), new.clone());
+        run(async move |fcx| {
+            let asks = |server| {
+                vec![
+                    ask(server, query(1, ".", RecordType::NS, Some(true))),
+                    ask(server, query(2, "probe.test.", RecordType::A, Some(true))),
+                ]
+            };
+            capture_roots(&fcx, &older, Ipv4Addr::new(192, 0, 2, 1), asks(B_ROOT)).await;
+            capture_roots(&fcx, &newer, Ipv4Addr::new(192, 0, 2, 2), asks(A_ROOT)).await;
+            let replay = Replay::open([older, newer]).unwrap();
+            // b.root was asked only by the older capture, but a.root, of
+            // the same zone, by the newer one, whose RRSIGs the world's
+            // clock still finds valid.
+            for server in [A_ROOT, B_ROOT, C_ROOT] {
+                let probe = ask(server, query(9, "probe.test.", RecordType::A, Some(true)));
+                let answer = reply(replay.ask(&fcx, probe).await);
+                assert_eq!(
+                    answer.answers[0].data,
+                    RData::A(A::new(192, 0, 2, 2)),
+                    "{server}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn a_referral_without_do_leaves_out_the_ds_rrset() {
+        let path = archive("ds");
+        run(async move |fcx| {
+            let referral = ask(A_ROOT, query(1, "example.com.", RecordType::A, Some(true)));
+            capture_roots(&fcx, &path, Ipv4Addr::new(192, 0, 2, 1), vec![referral]).await;
+            let replay = Replay::open([path.clone()]).unwrap();
+            let plain = ask(A_ROOT, query(2, "example.com.", RecordType::A, Some(false)));
+            let referral = reply(replay.ask(&fcx, plain).await);
+            let types: Vec<RecordType> = referral
+                .authorities
+                .iter()
+                .map(Record::record_type)
+                .collect();
+            assert_eq!(types, [RecordType::NS]);
+            // Asked for with DO, it keeps it.
+            let signed = ask(A_ROOT, query(3, "example.com.", RecordType::A, Some(true)));
+            let referral = reply(replay.ask(&fcx, signed).await);
+            assert!(
+                referral
+                    .authorities
+                    .iter()
+                    .any(|record| record.record_type() == RecordType::DS)
+            );
+        });
     }
 }
