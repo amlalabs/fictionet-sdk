@@ -1314,11 +1314,7 @@ fn local_zones_answer_deepest_first_and_the_last_added_first_at_equal_depth() {
 #[test]
 fn a_resolver_with_no_hints_answers_servfail_with_ede_22() {
     let (mut net, _) = internet(false);
-    let config = Config {
-        ede: true,
-        ..Config::gateway()
-    };
-    let mut resolver = resolver(config);
+    let mut resolver = resolver(Config::gateway());
     let reply = ask(
         &mut resolver,
         &mut net,

@@ -174,12 +174,9 @@ pub fn net(
     let clock = WallClock { start };
     net.gateway(move |host, declared| {
         // The declared names answer first, then `site_for` decides.
-        let config = Config {
-            ede: true,
-            ..Config::gateway()
-        }
-        .local(sites.clone())
-        .local(Arc::new(Transparent(declared)));
+        let config = Config::gateway()
+            .local(sites.clone())
+            .local(Arc::new(Transparent(declared)));
         host.program(fictionet::stdlib::world::net::dns::Recursive::new(
             config, clock,
         ))

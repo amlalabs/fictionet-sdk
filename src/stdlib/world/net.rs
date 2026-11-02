@@ -416,10 +416,9 @@ impl Net {
     ///
     /// The default runs a recursive resolver like Unbound with no route to
     /// the internet, answering the declared names:
-    /// `h.program(Recursive::new(declared.over(config), clock))`, where
-    /// `config` is [`Config::gateway`](fictionet::stdlib::services::dns::resolver::Config::gateway)
-    /// with [`ede`](fictionet::stdlib::services::dns::resolver::Config::ede)
-    /// on, and `clock` starts at the Unix epoch, since a resolver that asks
+    /// `h.program(Recursive::new(declared.over(Config::gateway()), clock))`,
+    /// with [`Config::gateway`](fictionet::stdlib::services::dns::resolver::Config::gateway)
+    /// and a `clock` that starts at the Unix epoch, since a resolver that asks
     /// no other server checks no signature. A world whose resolver
     /// iterates to root servers of its own gives it root hints
     /// ([`Config::hints`](fictionet::stdlib::services::dns::resolver::Config::hints)).
@@ -863,17 +862,7 @@ fn default_gateway(host: Host, declared: Declared) -> Host {
     let clock = WallClock {
         start: SystemTime::UNIX_EPOCH,
     };
-    host.program(Recursive::new(declared.over(gateway_config()), clock))
-}
-
-/// [`Config::gateway`] with Extended DNS Errors on, as Unbound with
-/// `ede: yes`, so a name with no reachable server says why: SERVFAIL with
-/// Extended DNS Error 22, No Reachable Authority (RFC 8914 §4.23).
-pub(crate) fn gateway_config() -> Config {
-    Config {
-        ede: true,
-        ..Config::gateway()
-    }
+    host.program(Recursive::new(declared.over(Config::gateway()), clock))
 }
 
 /// The gateway: a machine at its IPv4 address and, with IPv6, at its IPv6
