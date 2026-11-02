@@ -406,12 +406,33 @@ struct Doh {
 }
 
 /// What a request asks the resolver, and how its answer goes back.
-enum Asked {
-    /// A DNS message, answered with the resolver's message.
-    Message(Vec<u8>),
-    /// The JSON API's question, answered in JSON of this media type, or
-    /// as a message when that is `None`.
-    Json(Vec<u8>, Option<&'static str>),
+struct Asked {
+    /// The query, as a DNS message.
+    query: Vec<u8>,
+    /// How the answer goes back.
+    format: Format,
+}
+
+/// How the answer to a request goes back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Format {
+    /// The resolver's DNS message (RFC 8484 §4.2).
+    Message,
+    /// Google's JSON API answer, as `application/json`.
+    GoogleJson,
+    /// Cloudflare's JSON answer, as `application/dns-json`.
+    DnsJson,
+}
+
+impl Format {
+    /// The media type of an answer in this format.
+    fn media(self) -> &'static str {
+        match self {
+            Format::Message => DNS_MESSAGE,
+            Format::GoogleJson => JSON,
+            Format::DnsJson => DNS_JSON,
+        }
+    }
 }
 
 impl Handler for Doh {
@@ -435,16 +456,12 @@ impl Handler for Doh {
         let resolver = self.front.resolver.clone();
         Reply::Later(Box::new(move |fcx| {
             Box::pin(async move {
-                let (query, json) = match asked {
-                    Asked::Message(query) => (query, None),
-                    Asked::Json(query, json) => (query, json),
-                };
-                let Some(answer) = resolver.query(&fcx, client, query).await else {
+                let Some(answer) = resolver.query(&fcx, client, asked.query).await else {
                     let refusal =
                         Refusal::Text(StatusCode::BAD_REQUEST, "The query is not a DNS query.\n");
                     return Ok(refusal.response());
                 };
-                Ok(answered(answer, json))
+                Ok(answered(answer, asked.format))
             })
         }))
     }
@@ -536,14 +553,18 @@ fn ask(request: &Request<Body>, ex: &mut Exchange<'_>) -> Result<Asked, Refusal>
     };
     let param = |name: &str| urlencoded_form::first(&form.pairs, name);
     if path == RESOLVE {
-        let json = match param("ct") {
-            Some(DNS_MESSAGE) => None,
-            _ => Some(JSON),
+        let format = match param("ct") {
+            Some(DNS_MESSAGE) => Format::Message,
+            _ => Format::GoogleJson,
         };
-        return json_query(&form.pairs, json, ex);
+        return json_query(&form.pairs, format, ex);
     }
     if let Some(dns) = param("dns") {
-        return base64url(dns).map(Asked::Message).ok_or(Refusal::Text(
+        let message = |query| Asked {
+            query,
+            format: Format::Message,
+        };
+        return base64url(dns).map(message).ok_or(Refusal::Text(
             StatusCode::BAD_REQUEST,
             "The dns parameter is not a DNS message in base64url.\n",
         ));
@@ -555,7 +576,7 @@ fn ask(request: &Request<Body>, ex: &mut Exchange<'_>) -> Result<Asked, Refusal>
         .filter_map(|value| value.to_str().ok())
         .any(|value| value.to_ascii_lowercase().contains(DNS_JSON));
     if accepts_json || param("ct") == Some(DNS_JSON) {
-        return json_query(&form.pairs, Some(DNS_JSON), ex);
+        return json_query(&form.pairs, Format::DnsJson, ex);
     }
     Err(Refusal::Text(
         StatusCode::BAD_REQUEST,
@@ -589,7 +610,10 @@ fn posted(request: &Request<Body>) -> Result<Asked, Refusal> {
             "A DNS message is at most 65535 octets.\n",
         ));
     }
-    Ok(Asked::Message(body.to_vec()))
+    Ok(Asked {
+        query: body.to_vec(),
+        format: Format::Message,
+    })
 }
 
 /// The `dns` parameter of a GET: base64url (RFC 4648 §5), which RFC 8484
@@ -608,14 +632,14 @@ fn base64url(text: &str) -> Option<Vec<u8>> {
     (message.len() <= MAX_MESSAGE).then_some(message)
 }
 
-/// The query the JSON API's parameters ask, answered in `json`: `name`
+/// The query the JSON API's parameters ask, answered in `format`: `name`
 /// (required, RFC 4343 escapes allowed), `type` (a number from 1 to 65535
 /// or a mnemonic, default A), `cd`, and `do`. Other parameters, such as
 /// `edns_client_subnet` and `random_padding`, are ignored. The first of
 /// duplicate parameters counts.
 fn json_query(
     pairs: &[(String, String)],
-    json: Option<&'static str>,
+    format: Format,
     ex: &mut Exchange<'_>,
 ) -> Result<Asked, Refusal> {
     let param = |name: &str| urlencoded_form::first(pairs, name);
@@ -653,7 +677,7 @@ fn json_query(
     let query = message
         .to_vec()
         .map_err(|error| Refusal::Json(format!("Cannot ask that: {error}.")))?;
-    Ok(Asked::Json(query, json))
+    Ok(Asked { query, format })
 }
 
 /// A record type as the JSON API takes it: a number from 1 to 65535, or a
@@ -666,14 +690,16 @@ fn record_type(text: &str) -> Option<RecordType> {
     }
 }
 
-/// The response carrying the resolver's `answer`: as JSON of the media
-/// type `json`, or as the message itself when that is `None`. Every DNS
-/// answer, SERVFAIL and NXDOMAIN included, is `200 OK` (RFC 8484 §4.2.1).
-fn answered(answer: Vec<u8>, json: Option<&'static str>) -> Response<Body> {
+/// The response carrying the resolver's `answer` in `format`. An answer
+/// that does not parse goes back as the message itself. Every DNS answer,
+/// SERVFAIL and NXDOMAIN included, is `200 OK` (RFC 8484 §4.2.1).
+fn answered(answer: Vec<u8>, format: Format) -> Response<Body> {
     let message = read_message(&answer).ok();
     let freshness = message.as_ref().and_then(freshness);
-    let (body, media) = match (json, &message) {
-        (Some(media), Some(message)) => (Body::from(to_json(message)), media),
+    let (body, media) = match (format, &message) {
+        (Format::GoogleJson | Format::DnsJson, Some(message)) => {
+            (Body::from(to_json(message)), format.media())
+        }
         _ => (Body::from(answer), DNS_MESSAGE),
     };
     let mut response = Response::new(body);

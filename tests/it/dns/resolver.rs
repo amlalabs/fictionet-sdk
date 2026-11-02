@@ -1614,6 +1614,42 @@ fn validated_nsec_records_deny_other_names_they_cover_without_asking() {
     assert!(net.recording().exchanges().len() > before);
 }
 
+/// Below a negative trust anchor nothing is validated (RFC 7646): data
+/// whose signatures fail answers without AD, while names outside the
+/// anchor validate as before, and the anchor's own DS is the parent's.
+#[test]
+fn a_negative_trust_anchor_stops_validation_below_it() {
+    let (mut net, anchors) = internet(true);
+    let bad = LowerName::new(&name("bad.com."));
+    let mut resolver = resolver(Config {
+        negative_anchors: Some(Arc::new(move |name: &LowerName| *name == bad)),
+        ..config(anchors)
+    });
+    let reply = ask(
+        &mut resolver,
+        &mut net,
+        0,
+        query(client(1), "www.bad.com.", RecordType::A, dnssec_ok),
+    );
+    assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(addresses(&reply), ["192.0.2.98"]);
+    assert!(!reply.metadata.authentic_data);
+    let reply = ask(
+        &mut resolver,
+        &mut net,
+        0,
+        query(client(1), "www.example.com.", RecordType::A, dnssec_ok),
+    );
+    assert!(reply.metadata.authentic_data);
+    let reply = ask(
+        &mut resolver,
+        &mut net,
+        0,
+        query(client(1), "bad.com.", RecordType::DS, dnssec_ok),
+    );
+    assert!(reply.metadata.authentic_data, "com validates its DS RRset");
+}
+
 /// An NSEC record that does not verify never makes a denial Secure and
 /// is never kept to deny other names: here every NXDOMAIN of
 /// `example.com` carries an unsigned NSEC that would cover `www`, which

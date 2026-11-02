@@ -99,26 +99,37 @@ V(kind, why) == [kind |-> kind, why |-> why]
 DsKey(p) == CASE p = "DsA" -> "A" [] p = "DsB" -> "B" [] OTHER -> "none"
 
 (* The validator, walking down from the anchor. At zone i it holds the key *)
-(* the link above names. The algorithm comes from the DS or anchor, so an  *)
-(* unsupported one makes the zone Insecure before any fetch (RFC 4035      *)
-(* section 5.2, RFC 9905 section 2).                                       *)
+(* the link above names. Below the anchor's zone, the DS set the parent    *)
+(* serves is fetched first, so an unreachable zone there is Indeterminate  *)
+(* before its algorithm is read (Check::delegation). The algorithm comes   *)
+(* from that DS set or the anchor, so an unsupported one makes the zone    *)
+(* Insecure before its DNSKEY set is fetched (RFC 4035 section 5.2,        *)
+(* RFC 9905 section 2).                                                    *)
+Unreachable == IF MissingAsInsecure THEN V("Insecure", "Missing") ELSE V("Indeterminate", "ede5")
+
 RECURSIVE Walk(_, _, _, _)
 Walk(r, impl, i, expect) ==
     LET z == Path[i] IN
-    IF r.alg[z] \notin PolicyAlgs THEN V("Insecure", "UnsupportedAlgorithm")
-    ELSE IF ~r.reach[z] THEN (IF MissingAsInsecure THEN V("Insecure", "Missing") ELSE V("Indeterminate", "ede5"))
+    IF i > 1 /\ ~r.reach[z] THEN Unreachable
+    ELSE IF r.alg[z] \notin PolicyAlgs THEN V("Insecure", "UnsupportedAlgorithm")
+    ELSE IF ~r.reach[z] THEN Unreachable
     ELSE IF r.signer[z] = "none" THEN V("Bogus", "ede9")
     ELSE IF r.signer[z] # expect THEN V("Bogus", "ede9")
     ELSE IF Pos(r.window[z]) < Pos(r.clock) THEN V("Bogus", "ede7")
     ELSE IF Pos(r.window[z]) > Pos(r.clock) THEN V("Bogus", "ede8")
     ELSE IF r.changed[z] /\ ~(SignerPeek /\ impl = "A") THEN V("Bogus", "ede6")
     ELSE IF i = Len(Path) THEN V("Secure", "none")
-    ELSE LET p == r.proof[Path[i + 1]] IN
-         CASE p \in {"DsA", "DsB"} -> Walk(r, impl, i + 1, DsKey(p))
-           [] p = "NoDs"           -> V("Insecure", "ProvenNoDs")
-           [] p = "OptOutCover"    -> V("Insecure", "OptOutCovered")
-           [] p = "Nsec"           -> V("Bogus", "ede6")    \* the proof denies the delegation itself
-           [] p = "Nothing"        -> V("Bogus", "ede12")   \* no DS and no denial
+    ELSE LET c == Path[i + 1]
+             p == r.proof[c] IN
+         \* Every kind of proof below needs the child's DS set or its denial.
+         IF ~r.reach[c] THEN Unreachable
+         ELSE CASE p \in {"DsA", "DsB"} -> Walk(r, impl, i + 1, DsKey(p))
+                [] p = "NoDs"           -> V("Insecure", "ProvenNoDs")
+                [] p = "OptOutCover"    -> V("Insecure", "OptOutCovered")
+                \* A covering NSEC proves no delegation, so the proof stays
+                \* unproven (Nsecs::no_ds, from_proof).
+                [] p = "Nsec"           -> V("Bogus", "ede12")
+                [] p = "Nothing"        -> V("Bogus", "ede12")   \* no DS and no denial
 
 Validate(r, impl) ==
     IF r.anchor = "none" THEN V("NotPerformed", "none")
@@ -168,14 +179,24 @@ SecureImpliesChain == Result.kind = "Secure" => ChainHolds
 
 (* Insecure needs a proof: no anchor covers the name, or below a validated  *)
 (* chain there is a signed no-DS proof, an opt-out cover, or a DS link      *)
-(* whose algorithm the policy does not admit.                             *)
+(* whose algorithm the policy does not admit. Below the anchor's zone the   *)
+(* proof is the parent's word on the DS set, so that set must have been     *)
+(* fetched.                                                                *)
 InsecureNeedsProof ==
     Result.kind = "Insecure" =>
         \/ anchor = "elsewhere"
         \/ \E i \in 1..Len(Path) :
               /\ SecureTo(i)
+              /\ i = 1 \/ reach[Path[i]]
               /\ \/ alg[Path[i]] \notin PolicyAlgs
                  \/ i > 1 /\ proof[Path[i]] \in {"NoDs", "OptOutCover"}
+
+(* A zone below a validated chain whose DS set cannot be fetched leaves the *)
+(* answer Indeterminate, whatever that set or its denial would have said.  *)
+UnreachableLinkIndeterminate ==
+    ~MissingAsInsecure =>
+        \A i \in 2..Len(Path) :
+            SecureTo(i) /\ ~reach[Path[i]] => Result.kind = "Indeterminate"
 
 (* A valid chain is never reported as anything but Secure. *)
 NoDowngrade == ChainHolds => Result.kind = "Secure"
@@ -197,7 +218,8 @@ CdPassesData == cd /\ reach["sld"] => Rendered.rcode = "NOERROR" /\ Rendered.dat
 (* validated chain is Insecure, never Secure (RFC 9905 section 2).         *)
 Sha1Insecure ==
     \A i \in 1..Len(Path) :
-        (SecureTo(i) /\ alg[Path[i]] = "sha1" /\ (i = 1 \/ proof[Path[i]] \in {"DsA", "DsB"}))
+        (SecureTo(i) /\ alg[Path[i]] = "sha1"
+         /\ (i = 1 \/ (proof[Path[i]] \in {"DsA", "DsB"} /\ reach[Path[i]])))
         => Result.kind = "Insecure"
 
 (* Two validators fed equal records from different providers and signers   *)

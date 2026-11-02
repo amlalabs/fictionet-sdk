@@ -138,6 +138,9 @@ impl Shown {
     /// The RRsets `sets` of `owner`. An RRset of another owner is
     /// [`ZoneError::OutOfZone`], and a CNAME beside other data is
     /// [`ZoneError::CnameWithOtherData`].
+    // `ZoneError` is large; this returns it as `Zone::builder` does, once
+    // per build and never on a path that answers questions.
+    #[allow(clippy::result_large_err)]
     pub fn new(
         owner: &Name,
         sets: impl IntoIterator<Item = RecordSet>,

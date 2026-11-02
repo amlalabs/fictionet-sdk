@@ -546,7 +546,7 @@ use http::{Request, Response};
 
 use fictionet::stdlib::network::route::Prefix;
 use fictionet::stdlib::protocols::dns::rr::{LowerName, Name};
-use fictionet::stdlib::services::dns::WallClock;
+use fictionet::stdlib::services::dns::{Event, WallClock};
 use fictionet::stdlib::services::dns::resolver::Config;
 use fictionet::stdlib::services::dns::zone::ZoneData;
 use fictionet::stdlib::services::tls::ServerConfig;
@@ -562,10 +562,14 @@ pub struct Sites {
     site_for: Arc<SiteFor>,
     net: Net,
     date: Option<std::time::SystemTime>,
+    on_dns_event: Option<Arc<OnDnsEvent>>,
 }
 
 /// The callback given to [`Sites::new`].
 type SiteFor = dyn Fn(&str) -> Option<Site> + Send + Sync;
+
+/// The callback given to [`Sites::on_dns_event`].
+type OnDnsEvent = dyn Fn(&Event) + Send + Sync;
 
 impl Sites {
     /// Sites decided by `site_for`, which gets a hostname and returns the
@@ -587,6 +591,18 @@ impl Sites {
             site_for: Arc::new(site_for),
             net: Net::new(pools),
             date: None,
+            on_dns_event: None,
+        }
+    }
+
+    /// Calls `f` with each event the gateway's resolver reports, in order:
+    /// each query a sandbox puts to it ([`Event::Query`]) and each reply it
+    /// sends ([`Event::Reply`]) among them, as [`Recursive::on_event`]
+    /// does. It runs while the resolver waits, so it must return quickly.
+    pub fn on_dns_event(self, f: impl Fn(&Event) + Send + Sync + 'static) -> Sites {
+        Sites {
+            on_dns_event: Some(Arc::new(f)),
+            ..self
         }
     }
 
@@ -626,6 +642,7 @@ impl Sites {
     pub fn into_net(self) -> Net {
         let site_for = self.site_for;
         let date = self.date;
+        let on_dns_event = self.on_dns_event;
         let clock = WallClock {
             start: date.unwrap_or(std::time::SystemTime::UNIX_EPOCH),
         };
@@ -641,7 +658,14 @@ impl Sites {
             let localhost = LowerName::from(Name::from_ascii("localhost.").expect("a valid name"));
             let mut config = Config::gateway();
             config.local.retain(|zone| *zone.apex() == localhost);
-            host.program(Recursive::new(config.local(sites.clone()), clock))
+            let resolver = Recursive::new(config.local(sites.clone()), clock);
+            host.program(match &on_dns_event {
+                Some(f) => {
+                    let f = f.clone();
+                    resolver.on_event(move |event| f(event))
+                }
+                None => resolver,
+            })
         })
     }
 

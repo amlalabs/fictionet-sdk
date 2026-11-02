@@ -661,6 +661,10 @@ def policyJson (P : AlgorithmPolicy) : String :=
   jobj [("validate", jarr (P.validate.map jnat)), ("digests", jarr (P.digests.map jnat)),
     ("max_nsec3_iterations", jnat P.maxIterations)]
 
+/-- `Policy.iana` by name, so the test runs Rust's own `AlgorithmPolicy::iana` against it rather than a copy of
+its lists. -/
+def ianaJson : String := jstr "iana"
+
 end DnssecText
 
 /-! ## Signed zones -/
@@ -776,7 +780,7 @@ def signedCase : G String := do
     | none => []
   return jobj [("input", jobj ([("zone", specJson sp), ("keys", keysJson keys), ("window", windowJson w),
       ("denial", denialJson denial), ("request", jobj [("qname", jstr (nameStr q.qname)),
-        ("qtype", jstr (typeStr q.qtype))]), ("time", jnat t), ("policy", policyJson Policy.iana),
+        ("qtype", jstr (typeStr q.qtype))]), ("time", jnat t), ("policy", ianaJson),
       ("anchor_digest_type", jnat 2)] ++ parentIn)),
     ("expected", expected)]
 
@@ -798,14 +802,15 @@ def rSubset (xs : List Nat) : G (List Nat) := do
   return out
 
 def policyCase : G String := do
-  let P ← if ← chance 2 then pure Policy.iana
+  let (P, named) ← if ← chance 2 then pure (Policy.iana, ianaJson)
     else do
       let v ← rSubset [5, 7, 8, 10, 13, 14, 15, 16]
       let d ← rSubset [1, 2, 3, 4]
-      pure ({ validate := v, digests := d, sign := [], delegate := [], maxIterations := 100 } : AlgorithmPolicy)
+      let P : AlgorithmPolicy := { validate := v, digests := d, sign := [], delegate := [], maxIterations := 100 }
+      pure (P, policyJson P)
   let alg ← pick #[1, 3, 5, 6, 7, 8, 10, 12, 13, 14, 15, 16, 17, 23, 253]
   let dt ← pick #[0, 1, 2, 3, 4, 5, 6]
-  return jobj [("input", jobj [("algorithm", jnat alg), ("digest", jnat dt), ("policy", policyJson P)]),
+  return jobj [("input", jobj [("algorithm", jnat alg), ("digest", jnat dt), ("policy", named)]),
     ("expected", jobj [("treatment", jstr (treatmentStr (P.treat alg dt)))])]
 
 end PolicyVectors
@@ -856,7 +861,7 @@ def chainCase : G String := do
   let zoneIn (sp : Spec) (ks : List KeySpec) (w : Window) (d : Denial) : String :=
     jobj [("zone", specJson sp), ("keys", keysJson ks), ("window", windowJson w), ("denial", denialJson d)]
   return jobj [("input", jobj [("tree", jarr [zoneIn parentSpec parentKeys pw pd, zoneIn childSpec childKeys cw cd]),
-      ("time", jnat t), ("policy", policyJson Policy.iana)]),
+      ("time", jnat t), ("policy", ianaJson)]),
     ("expected", jobj [("problems", jarr ((check [pz, cz] Policy.iana t).map problemJson))])]
 
 end ChainVectors

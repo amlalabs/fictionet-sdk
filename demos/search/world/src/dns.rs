@@ -383,11 +383,29 @@ fn reverse(name: &LowerName) -> bool {
 ///
 /// The source is chosen again each time the world's namespace advances,
 /// for the mode the new session runs in.
+///
+/// The world's resolvers check signatures against a Copied session's
+/// clock, which stands at the capture, so the internet's answers for the
+/// names that resolve in every session, signed today, would fail that
+/// check. Those names, and the alias targets the hierarchy named for
+/// them, are the resolvers' negative trust anchors in a Copied session
+/// ([`negative_anchors`](SessionSource::negative_anchors)): they are not
+/// validated. The model gateway's and the time server's zones are
+/// unsigned, so for those names the guest gets the answers it would get
+/// anyway; an alias target in a signed zone answers without AD.
 pub struct SessionSource {
     pages: Arc<Pages>,
     needed: Arc<[LowerName]>,
     /// The source the session uses, chosen when it first asks.
-    current: PerSession<Option<Arc<dyn Source>>>,
+    current: PerSession<Option<Chosen>>,
+}
+
+/// The source a session uses, and its Copied source when it runs from a
+/// capture.
+#[derive(Clone)]
+struct Chosen {
+    source: Arc<dyn Source>,
+    copied: Option<Arc<Copied>>,
 }
 
 impl SessionSource {
@@ -402,13 +420,28 @@ impl SessionSource {
     }
 
     /// The source for the session now.
-    fn current(&self) -> Arc<dyn Source> {
+    fn current(&self) -> Chosen {
         let generation = self.pages.namespace().current().generation;
         self.current.with(generation, |current| {
             current
                 .get_or_insert_with(|| session(&self.pages, &self.needed))
                 .clone()
         })
+    }
+
+    /// The predicate for [`Config::negative_anchors`](fictionet::stdlib::services::dns::resolver::Config::negative_anchors):
+    /// in a Copied session, the names whose answers may come from the
+    /// internet, signed today; in the other modes, none.
+    pub fn negative_anchors(
+        self: &Arc<Self>,
+    ) -> impl Fn(&LowerName) -> bool + Send + Sync + 'static {
+        let sessions = self.clone();
+        move |name| {
+            sessions
+                .current()
+                .copied
+                .is_some_and(|copied| copied.fresh.lock().contains(name))
+        }
     }
 }
 
@@ -418,21 +451,31 @@ impl Source for SessionSource {
         fcx: &'a Cx,
         ask: Ask,
     ) -> Pin<Box<dyn Future<Output = Observed> + Send + 'a>> {
-        let source = self.current();
+        let source = self.current().source;
         Box::pin(async move { source.ask(fcx, ask).await })
     }
 }
 
 /// The source for a session of `pages` in the mode it runs in now.
-fn session(pages: &Pages, needed: &Arc<[LowerName]>) -> Arc<dyn Source> {
+fn session(pages: &Pages, needed: &Arc<[LowerName]>) -> Chosen {
     let live = pages.live_dns();
     match (pages.source(), pages.copied_dns()) {
-        (Mode::Copied, Some(replay)) => Arc::new(Copied {
-            replay,
-            live,
-            needed: Mutex::new(needed.iter().flat_map(and_above).collect()),
-        }),
-        _ => live,
+        (Mode::Copied, Some(replay)) => {
+            let copied = Arc::new(Copied {
+                replay,
+                live,
+                needed: Mutex::new(needed.iter().flat_map(and_above).collect()),
+                fresh: Mutex::new(needed.iter().cloned().collect()),
+            });
+            Chosen {
+                source: copied.clone(),
+                copied: Some(copied),
+            }
+        }
+        _ => Chosen {
+            source: live,
+            copied: None,
+        },
     }
 }
 
@@ -445,6 +488,9 @@ struct Copied {
     /// alias targets the hierarchy named for them, and every name above
     /// one of those.
     needed: Mutex<HashSet<LowerName>>,
+    /// The names that resolve in every session and the alias targets the
+    /// hierarchy named for them, whose answers may come from the internet.
+    fresh: Mutex<HashSet<LowerName>>,
 }
 
 impl Source for Copied {
@@ -464,6 +510,12 @@ impl Source for Copied {
                 && let Ok(message) = Message::from_vec(bytes)
             {
                 self.needed.lock().extend(named_and_above(&message));
+                let mut fresh = self.fresh.lock();
+                for (target, owner) in targets(&message) {
+                    if owner.is_some_and(|owner| fresh.contains(&owner)) {
+                        fresh.insert(target);
+                    }
+                }
             }
             observed
         })
