@@ -25,7 +25,7 @@ use super::policy::AlgorithmPolicy;
 use super::proof::{self, Proof};
 use super::rdata::{DNSKEY, DNSSECRData, DS};
 use super::sign::serial;
-use super::{Anchors, DigestType, TrustAnchor, Verify};
+use super::{Anchors, TrustAnchor, Verify};
 use crate::stdlib::protocols::dns::EdeCode;
 use crate::stdlib::protocols::dns::op::{Query, ResponseCode};
 use crate::stdlib::protocols::dns::rr::{Name, RData, RecordSet, RecordType, SerialNumber};
@@ -367,12 +367,7 @@ impl<V: Verify> Check<'_, V> {
     /// The keys of `link`'s zone: its DNSKEY RRset, signed by a key one of
     /// the trusted `ds` records selects.
     fn dnskeys(&self, link: &Link, ds: &[DS]) -> Result<Vec<DNSKEY>, Validation> {
-        let mut usable: Vec<(&DS, DigestType)> = ds
-            .iter()
-            .filter(|ds| self.policy.validates(u8::from(ds.algorithm())))
-            .filter(|ds| self.policy.accepts_digest(u8::from(ds.digest_type())))
-            .filter_map(|ds| Some((ds, DigestType::from_number(u8::from(ds.digest_type()))?)))
-            .collect();
+        let usable = self.policy.usable_ds(ds);
         if usable.is_empty() {
             let algorithm = ds
                 .iter()
@@ -382,10 +377,6 @@ impl<V: Verify> Check<'_, V> {
             } else {
                 Insecure::UnsupportedAlgorithm
             }));
-        }
-        // RFC 4509 §3: SHA-1 DS records are ignored next to stronger ones.
-        if usable.iter().any(|(_, digest)| *digest != DigestType::Sha1) {
-            usable.retain(|(_, digest)| *digest != DigestType::Sha1);
         }
 
         let set = match &link.dnskey {
@@ -563,7 +554,7 @@ mod tests {
     use crate::stdlib::protocols::dns::dnssec::proof::base32hex_encode;
     use crate::stdlib::protocols::dns::dnssec::rdata::{NSEC, NSEC3};
     use crate::stdlib::protocols::dns::dnssec::{
-        Algorithm, KeySet, Nsec3HashAlgorithm, Ring, Sign, Window, ZoneKey, ds, sign,
+        Algorithm, DigestType, KeySet, Nsec3HashAlgorithm, Ring, Sign, Window, ZoneKey, ds, sign,
     };
     use crate::stdlib::protocols::dns::rr::Record;
     use crate::stdlib::protocols::dns::rr::rdata::{A, SOA};

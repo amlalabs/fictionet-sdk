@@ -14,6 +14,9 @@
 
 use std::collections::BTreeSet;
 
+use super::DigestType;
+use super::rdata::DS;
+
 /// The registry numbers a world signs, delegates, and validates with.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AlgorithmPolicy {
@@ -81,6 +84,26 @@ impl AlgorithmPolicy {
     /// Whether this world may create DS records with digest type `digest`.
     pub fn delegates(&self, digest: u8) -> bool {
         self.delegate.contains(&digest)
+    }
+
+    /// The DS records among `records` a validator uses to select a child's
+    /// keys, each with its digest type: those whose algorithm and digest
+    /// type the policy accepts, without the SHA-1 ones when a stronger
+    /// digest is among them (RFC 4509 §3).
+    pub fn usable_ds<'a>(
+        &self,
+        records: impl IntoIterator<Item = &'a DS>,
+    ) -> Vec<(&'a DS, DigestType)> {
+        let mut usable: Vec<(&DS, DigestType)> = records
+            .into_iter()
+            .filter(|ds| self.validates(u8::from(ds.algorithm())))
+            .filter(|ds| self.accepts_digest(u8::from(ds.digest_type())))
+            .filter_map(|ds| Some((ds, DigestType::from_number(u8::from(ds.digest_type()))?)))
+            .collect();
+        if usable.iter().any(|(_, digest)| *digest != DigestType::Sha1) {
+            usable.retain(|(_, digest)| *digest != DigestType::Sha1);
+        }
+        usable
     }
 }
 
