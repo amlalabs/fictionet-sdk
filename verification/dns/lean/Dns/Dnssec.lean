@@ -1521,6 +1521,16 @@ def nsec3Covering (n : Name) : List (Signed S) := sz.nsec3With fun r => covers3 
 def chainEncloser (n : Name) : Name :=
   ((ancestors n).find? fun a => sz.nsec3Chain.any (·.hash == S.hash a)).getD sz.apex
 
+/-- The proof a referral to the cut `m` carries when the child has no DS: the NSEC at the cut, the NSEC3 that
+matches it, or, for a delegation an opt-out chain leaves out, the closest encloser's NSEC3 and the opt-out
+NSEC3 that covers the next closer name (RFC 4035 §3.1.4, RFC 5155 §7.2.7). -/
+def noDsRecords (m : Name) : List (Signed S) :=
+  match sz.denial with
+  | .nsec => sz.nsecWith (·.owner == m)
+  | .nsec3 _ =>
+    if sz.nsec3Chain.any (·.hash == S.hash m) then sz.nsec3Matching m
+    else sz.nsec3Matching (sz.chainEncloser m) ++ sz.nsec3Covering (nextCloser m (sz.chainEncloser m))
+
 /-- The RRSIGs a signed zone serves with an RRset of a response: those over the RRset at its own node, or over
 the wildcard it was expanded from. A cut's NS set is not authoritative and has none; neither has a CNAME a
 DNAME synthesized (RFC 6672 §5.3.1). -/
@@ -1543,12 +1553,7 @@ def denialFor (q : Request) (r : Response) : List (Signed S) :=
     match referralCut r with
     | some m =>
       match z.node m with
-      | some (.cut _ none _) =>
-        match sz.denial with
-        | .nsec => sz.nsecWith (·.owner == m)
-        | .nsec3 _ =>
-          if sz.nsec3Chain.any (·.hash == S.hash m) then sz.nsec3Matching m
-          else sz.nsec3Matching (sz.chainEncloser m) ++ sz.nsec3Covering (nextCloser m (sz.chainEncloser m))
+      | some (.cut _ none _) => sz.noDsRecords m
       | _ => []
     | none => []
   let neg : List (Signed S) :=
@@ -2095,58 +2100,50 @@ theorem sep_keySigner {ss : List (Signer S)} {s : Signer S} (hs : s ∈ ss) (hse
   simp only [this, ↓reduceIte]
   exact List.mem_filter.mpr ⟨hs, hsep⟩
 
-/-- Every RRset a signed zone signs validates Secure under the zone's own anchor, while the signature window
-holds, when every signer is honest and uses an algorithm the policy validates and some signer has the SEP
-bit. -/
-theorem signed_sets_validate (sz : SignedZone S) (P : AlgorithmPolicy) (t dt : Nat)
-    (hh : ∀ s ∈ sz.signers, s.Honest) (halg : ∀ s ∈ sz.signers, P.validate.contains s.dnskey.alg = true)
-    (hdt : P.digests.contains dt = true) (hsep : ∃ s ∈ sz.signers, s.dnskey.sep = true)
-    (hwin : sz.window.inception ≤ t ∧ t ≤ sz.window.expiration) {set x : RRset} (ds : List (Signed S))
-    (hown : x.owner = set.owner) (htype : x.rtype = set.rtype) (hdata : x.rdata = set.rdata)
-    (hlab : labelsOf x.owner = x.owner.length) (hin : under set.owner sz.apex = true) :
-    validateRrset (some [sz.anchor dt]) P t [sz.link] set (sz.signSet x).sigs ds = .secure := by
-  obtain ⟨s0, hs0, hsep0⟩ := hsep
-  have hwin' : ∀ (a : Nat) (sg : Name) (lb tt : Nat),
-      windowOk t ⟨a, sg, lb, tt, sz.window.inception, sz.window.expiration⟩ = true := by
-    intro _ _ _ _; simp [windowOk, hwin.1, hwin.2]
-  have htreat : ∀ s ∈ sz.signers, P.treat s.dnskey.alg dt = .supported := by
-    intro s hs
-    simp only [AlgorithmPolicy.treat, halg s hs, hdt, Bool.not_true, Bool.false_eq_true, ↓reduceIte]
-  apply secure_complete
-  refine ⟨sz.link, [], sz.keys, sz.apex, sz.keys, ⟨sz.anchor dt, ?_, rfl, rfl, ?_⟩, .nil, Or.inl ?_⟩
-  · simp [anchorFor, anchorStep, SignedZone.anchor, hin]
-  · -- the SEP key `s0` is named by the anchor and signed the DNSKEY set
-    refine ⟨sz.keySet, rfl, rfl, s0.dnskey, List.mem_map.mpr ⟨s0, hs0, rfl⟩, hsep0, ?_, ?_⟩
-    · refine ⟨⟨s0.dnskey.alg, dt, S.digest sz.apex s0.dnskey⟩, ?_, htreat s0 hs0, rfl, rfl⟩
-      exact List.mem_filterMap.mpr ⟨s0, sep_keySigner hs0 hsep0, by simp [hsep0]⟩
-    · refine ⟨_, List.mem_map.mpr ⟨s0, sep_keySigner hs0 hsep0, rfl⟩, ?_, hwin' _ _ _ _, _, rfl, s0.dnskey,
-        List.mem_singleton_self _, rfl, honest_verifies (hh s0 hs0) _ _⟩
-      simp only [usable, SignedZone.link, beq_self_eq_true, halg s0 hs0, Bool.and_self, List.any_cons,
-        List.any_nil, Bool.or_false]
-  · -- a data signer signed `x`, which is `set` in canonical form
-    have hne : sz.signers ≠ [] := List.ne_nil_of_mem hs0
-    obtain ⟨s1, hs1⟩ := dataSigners_nonempty hne
-    have hs1' := mem_dataSigners hs1
-    refine ⟨_, List.mem_map.mpr ⟨s1, hs1, rfl⟩, ⟨?_, hwin' _ _ _ _, .rrset x, ?_, s1.dnskey,
-      List.mem_map.mpr ⟨s1, hs1', rfl⟩, rfl, honest_verifies (hh s1 hs1') _ _⟩, ?_⟩
-    · simp only [usable, beq_self_eq_true, halg s1 hs1', Bool.and_self, Bool.true_and, List.any_eq_true,
-        beq_iff_eq]
-      exact ⟨s1.dnskey, List.mem_map.mpr ⟨s1, hs1', rfl⟩, rfl⟩
-    · simp only [rrsetCover, expanded, hown]
-      cases x; cases set; simp_all
-    · show ¬ labelsOf x.owner < set.owner.length
-      rw [hlab, hown]; exact Nat.lt_irrefl _
+/-- What makes a signed zone's own signatures verify at `t`: honest signers, algorithms the policy validates,
+and an open window. -/
+structure SignsWell (sz : SignedZone S) (P : AlgorithmPolicy) (t : Nat) : Prop where
+  honest : ∀ s ∈ sz.signers, s.Honest
+  alg : ∀ s ∈ sz.signers, P.validate.contains s.dnskey.alg = true
+  window : sz.window.inception ≤ t ∧ t ≤ sz.window.expiration
 
-/-- The RRsets a signed zone serves from its own nodes, with the RRSIGs it serves for them, validate Secure
-under the zone's own anchor. The TTL may be lower than the stored one, as for the SOA of a negative answer. -/
-theorem signed_answers_validate (sz : SignedZone S) (P : AlgorithmPolicy) (t dt : Nat)
-    (hh : ∀ s ∈ sz.signers, s.Honest) (halg : ∀ s ∈ sz.signers, P.validate.contains s.dnskey.alg = true)
-    (hdt : P.digests.contains dt = true) (hsep : ∃ s ∈ sz.signers, s.dnskey.sep = true)
-    (hwin : sz.window.inception ≤ t ∧ t ≤ sz.window.expiration) (hwf : sz.zone.WF) {s : RRset} {nd : Node}
-    (ds : List (Signed S)) (hnode : sz.zone.node s.owner = some nd) (hcut : ∀ ns d g, nd ≠ .cut ns d g)
-    (hheld : ∃ x ∈ nodeSets nd, x.rtype = s.rtype ∧ x.rdata = s.rdata)
-    (hlab : labelsOf s.owner = s.owner.length) (hin : under s.owner sz.apex = true) :
-    validateRrset (some [sz.anchor dt]) P t [sz.link] s (sz.sigsFor s) ds = .secure := by
+theorem SignsWell.windowOk {sz : SignedZone S} {P : AlgorithmPolicy} {t : Nat} (hw : SignsWell sz P t)
+    (a : Nat) (sg : Name) (lb tt : Nat) :
+    windowOk t ⟨a, sg, lb, tt, sz.window.inception, sz.window.expiration⟩ = true := by
+  simp [Dnssec.windowOk, hw.window.1, hw.window.2]
+
+/-- A signed zone's SEP keys sign its DNSKEY set, so a supported DS record that names one makes the whole set
+trusted. -/
+theorem keySet_signed {sz : SignedZone S} {P : AlgorithmPolicy} {t : Nat} (hw : SignsWell sz P t) {dss : List Ds}
+    {s0 : Signer S} (hs0 : s0 ∈ sz.signers) (hsep0 : s0.dnskey.sep = true) {d : Ds} (hd : d ∈ dss)
+    (hdt : P.treat d.keyAlg d.dtype = .supported) (hda : d.keyAlg = s0.dnskey.alg)
+    (hdd : d.digest = S.digest sz.apex s0.dnskey) : KeysSigned P t sz.apex dss (some sz.keySet) sz.keys := by
+  refine ⟨sz.keySet, rfl, rfl, s0.dnskey, List.mem_map.mpr ⟨s0, hs0, rfl⟩, hsep0, ⟨d, hd, hdt, hda, hdd⟩, ?_⟩
+  refine ⟨_, List.mem_map.mpr ⟨s0, sep_keySigner hs0 hsep0, rfl⟩, ?_, hw.windowOk _ _ _ _, _, rfl, s0.dnskey,
+    List.mem_singleton_self _, rfl, honest_verifies (hw.honest s0 hs0) _ _⟩
+  simp only [usable, beq_self_eq_true, hw.alg s0 hs0, Bool.and_self, List.any_cons, List.any_nil, Bool.or_false]
+
+/-- An RRset a zone signed, offered at its own owner with any TTL, passes the zone's own check. -/
+theorem signSet_final {sz : SignedZone S} {P : AlgorithmPolicy} {t : Nat} (hw : SignsWell sz P t)
+    (hne : sz.signers ≠ []) {set x : RRset} (ds : List (Signed S)) (hown : x.owner = set.owner)
+    (htype : x.rtype = set.rtype) (hdata : x.rdata = set.rdata) (hlab : labelsOf x.owner = x.owner.length) :
+    FinalSigned P t sz.apex sz.keys set (sz.signSet x).sigs ds := by
+  obtain ⟨s1, hs1⟩ := dataSigners_nonempty hne
+  have hs1' := mem_dataSigners hs1
+  refine Or.inl ⟨_, List.mem_map.mpr ⟨s1, hs1, rfl⟩, ⟨?_, hw.windowOk _ _ _ _, .rrset x, ?_, s1.dnskey,
+    List.mem_map.mpr ⟨s1, hs1', rfl⟩, rfl, honest_verifies (hw.honest s1 hs1') _ _⟩, ?_⟩
+  · simp only [usable, beq_self_eq_true, hw.alg s1 hs1', Bool.and_self, Bool.true_and, List.any_eq_true, beq_iff_eq]
+    exact ⟨s1.dnskey, List.mem_map.mpr ⟨s1, hs1', rfl⟩, rfl⟩
+  · simp only [rrsetCover, expanded, hown]
+    cases x; cases set; simp_all
+  · show ¬ labelsOf x.owner < set.owner.length
+    rw [hlab, hown]; exact Nat.lt_irrefl _
+
+/-- The RRSIGs a zone serves with an RRset of one of its own nodes are its signatures over that node's RRset. -/
+theorem sigsFor_own (sz : SignedZone S) (hwf : sz.zone.WF) {s : RRset} {nd : Node}
+    (hnode : sz.zone.node s.owner = some nd) (hcut : ∀ ns d g, nd ≠ .cut ns d g)
+    (hheld : ∃ x ∈ nodeSets nd, x.rtype = s.rtype ∧ x.rdata = s.rdata) :
+    ∃ x, sz.sigsFor s = (sz.signSet x).sigs ∧ x.owner = s.owner ∧ x.rtype = s.rtype ∧ x.rdata = s.rdata := by
   have hfind : ∃ x, (nodeSets nd).find? (fun x => x.rtype == s.rtype && x.rdata == s.rdata) = some x := by
     obtain ⟨x, hx, h1, h2⟩ := hheld
     cases hf : (nodeSets nd).find? (fun x => x.rtype == s.rtype && x.rdata == s.rdata) with
@@ -2167,16 +2164,51 @@ theorem signed_answers_validate (sz : SignedZone S) (P : AlgorithmPolicy) (t dt 
       · exact hw.2 x hxm
     | cut ns d g => exact absurd rfl (hcut ns d g)
     | empty => simp [nodeSets] at hxm
-  have hsig : sz.sigsFor s = (sz.signSet x).sigs := by
-    unfold SignedZone.sigsFor
-    rw [hnode]
-    cases nd with
-    | cut ns d g => exact absurd rfl (hcut ns d g)
-    | data sets => simp only [Option.bind_some, heldIn, hx]
-    | dname d sets => simp only [Option.bind_some, heldIn, hx]
-    | empty => simp only [Option.bind_some, heldIn, hx]
+  refine ⟨x, ?_, hxo, hxp.1, hxp.2⟩
+  unfold SignedZone.sigsFor
+  rw [hnode]
+  cases nd with
+  | cut ns d g => exact absurd rfl (hcut ns d g)
+  | data sets => simp only [Option.bind_some, heldIn, hx]
+  | dname d sets => simp only [Option.bind_some, heldIn, hx]
+  | empty => simp only [Option.bind_some, heldIn, hx]
+
+theorem anchorFor_zone (sz : SignedZone S) (dt : Nat) {n : Name} (hin : under n sz.apex = true) :
+    anchorFor [sz.anchor dt] n = some (sz.anchor dt) := by
+  simp [anchorFor, anchorStep, SignedZone.anchor, hin]
+
+/-- A signed zone's anchor names each of its SEP keys. -/
+theorem anchor_keys {sz : SignedZone S} {P : AlgorithmPolicy} {t dt : Nat} (hw : SignsWell sz P t)
+    (hdt : P.digests.contains dt = true) {s0 : Signer S} (hs0 : s0 ∈ sz.signers) (hsep0 : s0.dnskey.sep = true) :
+    KeysSigned P t sz.apex (sz.anchor dt).ds (some sz.keySet) sz.keys := by
+  refine keySet_signed hw hs0 hsep0 (d := ⟨s0.dnskey.alg, dt, S.digest sz.apex s0.dnskey⟩) ?_ ?_ rfl rfl
+  · exact List.mem_filterMap.mpr ⟨s0, sep_keySigner hs0 hsep0, by simp [hsep0]⟩
+  · simp only [AlgorithmPolicy.treat, hw.alg s0 hs0, hdt, Bool.not_true, Bool.false_eq_true, ↓reduceIte]
+
+/-- Every RRset a signed zone signs validates Secure under the zone's own anchor, while the signature window
+holds, when every signer is honest and uses an algorithm the policy validates and some signer has the SEP
+bit. -/
+theorem signed_sets_validate (sz : SignedZone S) (P : AlgorithmPolicy) (t dt : Nat) (hw : SignsWell sz P t)
+    (hdt : P.digests.contains dt = true) (hsep : ∃ s ∈ sz.signers, s.dnskey.sep = true) {set x : RRset}
+    (ds : List (Signed S)) (hown : x.owner = set.owner) (htype : x.rtype = set.rtype) (hdata : x.rdata = set.rdata)
+    (hlab : labelsOf x.owner = x.owner.length) (hin : under set.owner sz.apex = true) :
+    validateRrset (some [sz.anchor dt]) P t [sz.link] set (sz.signSet x).sigs ds = .secure := by
+  obtain ⟨s0, hs0, hsep0⟩ := hsep
+  exact secure_complete ⟨sz.link, [], sz.keys, sz.apex, sz.keys,
+    ⟨sz.anchor dt, anchorFor_zone sz dt hin, rfl, rfl, anchor_keys hw hdt hs0 hsep0⟩, .nil,
+    signSet_final hw (List.ne_nil_of_mem hs0) ds hown htype hdata hlab⟩
+
+/-- The RRsets a signed zone serves from its own nodes, with the RRSIGs it serves for them, validate Secure
+under the zone's own anchor. The TTL may be lower than the stored one, as for the SOA of a negative answer. -/
+theorem signed_answers_validate (sz : SignedZone S) (P : AlgorithmPolicy) (t dt : Nat) (hw : SignsWell sz P t)
+    (hdt : P.digests.contains dt = true) (hsep : ∃ s ∈ sz.signers, s.dnskey.sep = true) (hwf : sz.zone.WF)
+    {s : RRset} {nd : Node} (ds : List (Signed S)) (hnode : sz.zone.node s.owner = some nd)
+    (hcut : ∀ ns d g, nd ≠ .cut ns d g) (hheld : ∃ x ∈ nodeSets nd, x.rtype = s.rtype ∧ x.rdata = s.rdata)
+    (hlab : labelsOf s.owner = s.owner.length) (hin : under s.owner sz.apex = true) :
+    validateRrset (some [sz.anchor dt]) P t [sz.link] s (sz.sigsFor s) ds = .secure := by
+  obtain ⟨x, hsig, hxo, hxt, hxd⟩ := sigsFor_own sz hwf hnode hcut hheld
   rw [hsig]
-  exact signed_sets_validate sz P t dt hh halg hdt hsep hwin ds hxo hxp.1 hxp.2 (by rw [hxo]; exact hlab) hin
+  exact signed_sets_validate sz P t dt hw hdt hsep ds hxo hxt hxd (by rw [hxo]; exact hlab) hin
 
 /-! ## A concrete scheme
 
