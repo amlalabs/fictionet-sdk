@@ -479,6 +479,7 @@ def linkStep (P : AlgorithmPolicy) (t : Nat) (owner papex : Name) (pkeys : List 
 inductive Walk where
   | trusted (apex : Name) (keys : List Key)
   | stop (v : Validation)
+deriving DecidableEq, Repr
 
 def descend (P : AlgorithmPolicy) (t : Nat) (owner : Name) : Name → List Key → Chain S → Walk
   | apex, keys, [] => .trusted apex keys
