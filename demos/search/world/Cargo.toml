@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 fictionet-extras = { path = "../../../extras" }
+fictionet-host = { path = "../../../host" }
 bytes = "1"
 fictionet = { path = "../../..", features = ["web-proxy"] }
 http = "1"

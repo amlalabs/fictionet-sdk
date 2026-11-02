@@ -38,22 +38,25 @@ pub fn build(
             ))
         })
         .collect::<fictionet::Result<Vec<_>>>()?;
-    let world_ca = world.ca.clone();
-    let world_cx = cx.clone();
-    Ok(world.net(cx, move |host| {
-        if let Some((_, (model, tls))) = models.iter().find(|(name, _)| *name == host) {
-            return Some(
-                Site::handler(model.clone())
-                    .tls(tls.clone())
-                    .into_host(host),
-            );
-        }
-        if host == "platform.claude.com" {
-            let tls = world_ca.config(&world_cx, host).ok()?.0;
-            return Some(Site::handler(Startup).tls(tls).into_host(host));
-        }
-        None
-    }))
+    // The guest reaches these at their real addresses; the world puts its
+    // own machines there.
+    let mut forwarded = models
+        .into_iter()
+        .map(|(host, (model, tls))| {
+            Ok((
+                Name::from_ascii(host)?,
+                Site::handler(model).tls(tls).into_host(host),
+            ))
+        })
+        .collect::<fictionet::Result<Vec<_>>>()?;
+    let startup = "platform.claude.com";
+    forwarded.push((
+        Name::from_ascii(startup)?,
+        Site::handler(Startup)
+            .tls(world.ca.config(cx, startup)?.0)
+            .into_host(startup),
+    ));
+    Ok(world.net(cx, forwarded))
 }
 
 /// Starts a new run in the world `cx`: the page and the run record show
@@ -69,6 +72,7 @@ pub fn report_run(pages: &web_world::pages::Pages, cx: &Cx) -> fictionet::Result
     Ok(())
 }
 
+use fictionet::stdlib::protocols::dns::rr::Name;
 use fictionet::stdlib::web::{Body, httpd};
 use fictionet_extras::models::CallPhase as ModelPhase;
 use web_world::observation::{CallPhase, EgressPurpose, Hit, SearchObs, Tool};

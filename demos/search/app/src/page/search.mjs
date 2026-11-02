@@ -25,6 +25,8 @@ const SOURCES = { copy: (source) => source.captured ? `Copied ${source.captured.
 const sourceName = (source) => SOURCES[source.kind](source);
 const changes = (edits) => edits?.length ? quantity(edits.length, 'change') : null;
 const hostName = (name) => name.replace(/\.$/, '');
+// A DNS reply that gave no answer: a name that does not exist, or a lookup that failed.
+const unresolved = (fact) => fact.kind === 'resolved' && fact.rcode !== 'NOERROR';
 const hostOf = (url) => { try { return new URL(url).host; } catch { return url; } };
 const originOf = (url) => { try { return new URL(url).origin; } catch { return null; } };
 const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
@@ -378,7 +380,7 @@ function activityItem(row) {
     }
     case 'no_route': return { title: `Tried ${fact.to}`, meta: 'No route', target: 'router' };
     case 'certificate': return { title: `${hostName(fact.host)} certificate ${CERTIFICATE[fact.problem]}`, meta: `TLS · ${sourceName(fact.source)}`, target: `site:${hostName(fact.host)}`, failed: true };
-    case 'resolved': return { title: `${hostName(fact.name)} not found`, meta: 'No address', target: 'dns', failed: true };
+    case 'resolved': return { title: fact.rcode === 'NXDOMAIN' ? `${hostName(fact.name)} not found` : `${hostName(fact.name)} did not resolve`, meta: `${fact.qtype} · ${fact.rcode}`, target: 'dns', failed: true };
   }
 }
 // How a real site's certificate fails, as the feed says it.
@@ -480,11 +482,11 @@ function visits(rows, groups) {
 }
 function feed() {
   const groups = pageRequests();
-  const rows = activityRows().filter((row) => ['request', 'abandoned', 'search', 'tool', 'no_route', 'resolved', 'certificate'].includes(row.fact.kind) && (row.fact.kind !== 'request' || groups.has(row)) && (row.fact.kind !== 'abandoned' || !isSubresource(row.fact)) && (row.fact.kind !== 'resolved' || !row.fact.address));
+  const rows = activityRows().filter((row) => ['request', 'abandoned', 'search', 'tool', 'no_route', 'resolved', 'certificate'].includes(row.fact.kind) && (row.fact.kind !== 'request' || groups.has(row)) && (row.fact.kind !== 'abandoned' || !isSubresource(row.fact)) && (row.fact.kind !== 'resolved' || unresolved(row.fact)));
   const keep = new Set();
   const nodes = visits(rows, groups).reverse().map(({ row, attempts, waited, resources }) => {
     const fact = attempts[0].fact, started = attempts[0].at_ms;
-    const key = fact.kind === 'no_route' ? `no_route:${fact.from}:${fact.to}` : fact.kind === 'resolved' ? `resolved:${fact.name}` : fact.kind === 'certificate' ? `certificate:${fact.host}` : `${fact.kind}:${started}:${fact.host || ''}${fact.path || ''}${fact.query || ''}${fact.target || ''}${fact.search || ''}`;
+    const key = fact.kind === 'no_route' ? `no_route:${fact.from}:${fact.to}` : fact.kind === 'resolved' ? `resolved:${fact.name}:${fact.qtype}` : fact.kind === 'certificate' ? `certificate:${fact.host}` : `${fact.kind}:${started}:${fact.host || ''}${fact.path || ''}${fact.query || ''}${fact.target || ''}${fact.search || ''}`;
     keep.add(key);
     const item = activityItem(row);
     if (attempts.length > 1) {
@@ -506,7 +508,7 @@ function feed() {
 }
 // Repeated refusals and failed lookups of one name show once, at the latest.
 function activityRows() {
-  const keyOf = (fact) => fact.kind === 'no_route' ? `no_route:${fact.from}:${fact.to}` : fact.kind === 'resolved' && !fact.address ? `resolved:${fact.name}` : fact.kind === 'certificate' ? `certificate:${fact.host}` : null;
+  const keyOf = (fact) => fact.kind === 'no_route' ? `no_route:${fact.from}:${fact.to}` : unresolved(fact) ? `resolved:${fact.name}:${fact.qtype}` : fact.kind === 'certificate' ? `certificate:${fact.host}` : null;
   const latest = new Map();
   for (const row of shown.activity) { const key = keyOf(row.fact); if (key) latest.set(key, row); }
   return shown.activity.filter((row) => { const key = keyOf(row.fact); return !key || latest.get(key) === row; });
@@ -684,7 +686,7 @@ function details() {
     if (!localSites().length) body.append(element('p', 'No sites', 'detail-empty'));
   } else if (selection === 'dns') {
     heading('DNS', '10.0.0.1:53');
-    for (const row of shown.activity.filter((row) => row.fact.kind === 'resolved')) body.append(detailRow(row.at_ms, row.fact.name, row.fact.address || 'No answer'));
+    for (const row of shown.activity.filter((row) => row.fact.kind === 'resolved')) body.append(detailRow(row.at_ms, `${hostName(row.fact.name)} ${row.fact.qtype}`, row.fact.address || row.fact.rcode));
     if (!body.childElementCount) body.append(element('p', 'No lookups', 'detail-empty'));
   } else if (selection === 'router') {
     heading('Router', '10.0.0.1');
@@ -697,7 +699,7 @@ function details() {
     for (const row of activityRows()) {
       const fact = row.fact;
       const opened = fact.kind === 'request' && fact.source.kind === 'live_depth' && !isSubresource(fact);
-      const refused = fact.kind === 'resolved' && !fact.address;
+      const refused = unresolved(fact);
       if (!opened && !refused) continue;
       const item = activityItem(row);
       const shownRow = detailRow(row.at_ms, item.title, item.meta);
@@ -718,8 +720,8 @@ function details() {
         shownRow = detailRow(row.at_ms, item.title, item.meta, item.target.startsWith('page:') && requestFor(item.target.slice(5))?.has_preview ? button('Page', () => select(item.target), 'more') : null);
         if (item.failed) shownRow.classList.add('failed');
       } else if (fact.kind === 'resolved') {
-        shownRow = detailRow(row.at_ms, `Looked up ${hostName(fact.name)}`, fact.address || 'No address');
-        if (!fact.address) shownRow.classList.add('failed');
+        shownRow = detailRow(row.at_ms, `Looked up ${hostName(fact.name)} ${fact.qtype}`, fact.address || fact.rcode);
+        if (unresolved(fact)) shownRow.classList.add('failed');
       } else if (fact.kind === 'model_call') {
         shownRow = detailRow(row.at_ms, `Called ${fact.host}`, [`${fact.method} ${fact.path}`, fact.status, callPhaseName(fact.phase)].filter(Boolean).join(' · '));
         if (fact.phase === 'interrupted' || fact.status >= 400) shownRow.classList.add('failed');
