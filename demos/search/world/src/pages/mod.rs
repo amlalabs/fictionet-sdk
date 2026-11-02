@@ -217,4 +217,10 @@ pub struct Pages {
     editor: Option<Arc<edit::Editor>>,
     /// Single requests from the host: package files the copied web lacks.
     fetcher: live::Fetcher,
+    /// The session the world's DNS answers for, advanced by each
+    /// [`start_session`](Self::start_session).
+    namespace: fictionet::stdlib::world::net::dns::Namespace,
+    /// The internet's DNS servers, asked from the host: made when first
+    /// needed, and shared by every session.
+    live_dns: std::sync::OnceLock<Arc<fictionet_host::dns::Live>>,
 }

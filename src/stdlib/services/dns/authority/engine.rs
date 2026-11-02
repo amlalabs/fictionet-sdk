@@ -408,7 +408,7 @@ impl<A: Authority> Engine for AuthorityEngine<A> {
 /// The event for a reply of `bytes` sent to `client`.
 fn reply_event(at: Instant, server: SocketAddr, client: Client, bytes: &[u8]) -> Event {
     let size = u16::try_from(bytes.len()).expect("a reply fits a DNS message's 65535 octets");
-    let (rcode, flags, answers, ede) = match Message::from_vec(bytes) {
+    let (question, rcode, flags, answers, ede) = match Message::from_vec(bytes) {
         Ok(message) => {
             let ede = message.edns.as_ref().and_then(|edns| {
                 edns.options()
@@ -418,6 +418,7 @@ fn reply_event(at: Instant, server: SocketAddr, client: Client, bytes: &[u8]) ->
                     .map(|ede| ede.code)
             });
             (
+                message.queries.first().cloned(),
                 message.metadata.response_code,
                 ReplyFlags::of(&message.metadata),
                 rrsets(&message.answers),
@@ -429,6 +430,7 @@ fn reply_event(at: Instant, server: SocketAddr, client: Client, bytes: &[u8]) ->
             let header = Header::read(&mut BinDecoder::new(bytes))
                 .expect("every reply the engine sends has a header");
             (
+                None,
                 header.metadata.response_code,
                 ReplyFlags::of(&header.metadata),
                 Vec::new(),
@@ -440,6 +442,7 @@ fn reply_event(at: Instant, server: SocketAddr, client: Client, bytes: &[u8]) ->
         at,
         server,
         client,
+        question,
         rcode,
         flags,
         answers,

@@ -20,6 +20,11 @@ pub(super) struct Corpus {
     /// When the newest page Copied serves was copied, found when first
     /// asked for.
     newest: std::sync::OnceLock<Option<time::OffsetDateTime>>,
+    /// The DNS exchanges captured beside the pages.
+    dns: Arc<fictionet_extras::dns::Replay>,
+    /// Every host Copied serves and every name above one, found when
+    /// first asked for.
+    above: std::sync::OnceLock<HashSet<String>>,
 }
 
 impl Corpus {
@@ -55,6 +60,57 @@ impl Corpus {
             captures.chain(dump).max()
         })
     }
+
+    /// Every host Copied serves, and every name above one.
+    fn above(&self) -> &HashSet<String> {
+        self.above.get_or_init(|| {
+            let reference = match &self.search {
+                CorpusSearch::Reference(reference) => Some(reference),
+                CorpusSearch::Crawled(_) => None,
+            };
+            let served = crate::route::SEARCH_HOSTS
+                .into_iter()
+                .chain(self.hosts.iter().map(String::as_str))
+                .chain(
+                    self.packages
+                        .iter()
+                        .flat_map(|packages| packages.hosts.iter().map(String::as_str)),
+                )
+                .chain(
+                    reference
+                        .into_iter()
+                        .flat_map(|reference| reference.hosts()),
+                );
+            let mut above = HashSet::new();
+            for host in served {
+                let mut name = host;
+                above.insert(name.to_owned());
+                while let Some((_, parent)) = name.split_once('.') {
+                    above.insert(parent.to_owned());
+                    name = parent;
+                }
+            }
+            above
+        })
+    }
+}
+
+/// The DNS exchanges captured beside the pages in `root`: the
+/// `zz-dns-<time>.warc.gz` archives `cargo xtask search-capture` writes,
+/// oldest first, so a later capture's reply replaces an earlier one. Only
+/// those archives are read, since the pages' archives hold no DNS.
+fn captured_dns(root: &Path) -> std::io::Result<fictionet_extras::dns::Replay> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("zz-dns-") && name.ends_with(".warc.gz") {
+            files.push(entry.path());
+        }
+    }
+    files.sort_by_key(|path| path.file_name().map(std::ffi::OsStr::to_os_string));
+    fictionet_extras::dns::Replay::open(files)
 }
 
 enum CorpusSearch {
@@ -399,6 +455,20 @@ impl Pages {
             }
     }
 
+    /// Whether Copied serves `host` or a host below it, whatever mode is in
+    /// use.
+    pub(crate) fn serves_below(&self, host: &str) -> bool {
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
+        self.copied
+            .as_ref()
+            .is_some_and(|corpus| corpus.above().contains(&host))
+    }
+
+    /// The DNS exchanges captured beside the copied pages.
+    pub(crate) fn copied_dns(&self) -> Option<Arc<fictionet_extras::dns::Replay>> {
+        Some(self.copied.as_ref()?.dns.clone())
+    }
+
     /// Open the corpus chosen by the world's brief, relative to the downloads root.
     /// Its search index is cached beside the immutable archives.
     pub fn from_corpus(seed: Seed, downloads: &Path) -> Result<Self, String> {
@@ -496,6 +566,7 @@ impl Pages {
         } else {
             None
         };
+        let dns = captured_dns(&research_root).map_err(|e| e.to_string())?;
         let mut corpus = Corpus {
             archive,
             missing,
@@ -503,6 +574,8 @@ impl Pages {
             hosts,
             packages,
             newest: Default::default(),
+            dns: Arc::new(dns),
+            above: Default::default(),
         };
         corpus.search = if let Some(reference) = reference {
             CorpusSearch::Reference(Box::new(reference))

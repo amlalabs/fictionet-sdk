@@ -1,7 +1,11 @@
 //! Facts the Search world explicitly reports to its own page.
 
 use crate::pages::{Edit, Meta, Pages, Response, Source};
+use fictionet::stdlib::protocols::dns::dnssec::Validation;
+use fictionet::stdlib::protocols::dns::op::ResponseCode;
 pub use fictionet::stdlib::protocols::dns::rr::Name as HostName;
+use fictionet::stdlib::protocols::dns::rr::{RData, RecordType};
+use fictionet::stdlib::services::dns::Event;
 pub use fictionet_extras::models::UpstreamPhase as EgressPhase;
 use http::{
     HeaderMap, Method, StatusCode,
@@ -17,9 +21,20 @@ pub enum SearchObs {
     RunStarted {
         started_at_ms: u64,
     },
+    /// A DNS reply went to a client from the gateway's resolver or a
+    /// public resolver.
     Resolved {
+        /// The resolver that answered.
+        server: IpAddr,
+        /// The name asked about, in lowercase, without the trailing dot.
         #[serde(serialize_with = "display")]
         name: HostName,
+        #[serde(serialize_with = "display")]
+        qtype: RecordType,
+        #[serde(serialize_with = "rcode_name")]
+        rcode: ResponseCode,
+        dnssec: Dnssec,
+        /// The first address in the answer, for an A or AAAA question.
         address: Option<IpAddr>,
     },
     Request {
@@ -140,6 +155,67 @@ pub enum SearchObs {
         /// Live or Edited: where the guest's pages were coming from.
         source: PageSource,
     },
+}
+
+/// What a resolver established about an answer's DNSSEC signatures
+/// (RFC 4035 §4.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Dnssec {
+    /// The resolver did not validate: the client set CD.
+    NotPerformed,
+    Secure,
+    Insecure,
+    Bogus,
+    Indeterminate,
+}
+
+impl From<Validation> for Dnssec {
+    fn from(validation: Validation) -> Self {
+        match validation {
+            Validation::NotPerformed => Self::NotPerformed,
+            Validation::Secure => Self::Secure,
+            Validation::Insecure(_) => Self::Insecure,
+            Validation::Bogus(_) => Self::Bogus,
+            Validation::Indeterminate => Self::Indeterminate,
+        }
+    }
+}
+
+impl SearchObs {
+    /// The fact a resolver's [`Event::Reply`] gives the page; `None` for
+    /// other events and for a reply that carries no question.
+    pub fn resolved(event: &Event) -> Option<SearchObs> {
+        let Event::Reply {
+            server,
+            question: Some(question),
+            rcode,
+            answers,
+            validation,
+            ..
+        } = event
+        else {
+            return None;
+        };
+        let mut name = question.name().to_lowercase();
+        name.set_fqdn(false);
+        let address = answers
+            .iter()
+            .flat_map(|set| set.records_without_rrsigs())
+            .find_map(|record| match &record.data {
+                RData::A(a) => Some(IpAddr::V4(a.0)),
+                RData::AAAA(aaaa) => Some(IpAddr::V6(aaaa.0)),
+                _ => None,
+            });
+        Some(SearchObs::Resolved {
+            server: server.ip(),
+            name,
+            qtype: question.query_type(),
+            rcode: *rcode,
+            dnssec: (*validation).into(),
+            address,
+        })
+    }
 }
 
 /// Why a real host's certificate fails a browser's verification.
@@ -587,6 +663,30 @@ pub fn display<T: std::fmt::Display, S: serde::Serializer>(
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
     serializer.collect_str(value)
+}
+/// Serializes a DNS RCODE as its IANA name, as dig prints it: `NOERROR`,
+/// `NXDOMAIN`, `SERVFAIL`.
+pub fn rcode_name<S: serde::Serializer>(
+    value: &ResponseCode,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    let code = u16::from(*value);
+    let name = match code {
+        0 => "NOERROR",
+        1 => "FORMERR",
+        2 => "SERVFAIL",
+        3 => "NXDOMAIN",
+        4 => "NOTIMP",
+        5 => "REFUSED",
+        6 => "YXDOMAIN",
+        7 => "YXRRSET",
+        8 => "NXRRSET",
+        9 => "NOTAUTH",
+        10 => "NOTZONE",
+        16 => "BADVERS",
+        _ => return serializer.collect_str(&format_args!("RCODE{code}")),
+    };
+    serializer.serialize_str(name)
 }
 /// Serializes an HTTP status as its numeric code.
 pub fn status<S: serde::Serializer>(value: &StatusCode, serializer: S) -> Result<S::Ok, S::Error> {

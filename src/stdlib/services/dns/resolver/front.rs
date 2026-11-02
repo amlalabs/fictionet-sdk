@@ -361,7 +361,7 @@ pub(super) fn reply_event(
 ) -> Event {
     let server: SocketAddr = client.local;
     let size = u16::try_from(bytes.len()).expect("a reply fits a DNS message's 65535 octets");
-    let (rcode, flags, answers, ede) = match Message::from_vec(bytes) {
+    let (question, rcode, flags, answers, ede) = match Message::from_vec(bytes) {
         Ok(message) => {
             let ede = message.edns.as_ref().and_then(|edns| {
                 edns.options()
@@ -371,6 +371,7 @@ pub(super) fn reply_event(
                     .map(|ede| ede.code)
             });
             (
+                message.queries.first().cloned(),
                 message.metadata.response_code,
                 ReplyFlags::of(&message.metadata),
                 answer_sets(&message.answers),
@@ -381,6 +382,7 @@ pub(super) fn reply_event(
             let header = Header::read(&mut BinDecoder::new(bytes))
                 .expect("every reply the engine sends has a header");
             (
+                None,
                 header.metadata.response_code,
                 ReplyFlags::of(&header.metadata),
                 Vec::new(),
@@ -392,6 +394,7 @@ pub(super) fn reply_event(
         at,
         server,
         client,
+        question,
         rcode,
         flags,
         answers,

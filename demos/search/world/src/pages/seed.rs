@@ -1,15 +1,13 @@
 //! Seeds, embedded in the executable.
 
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, io, net::Ipv4Addr};
+use std::io;
 
-/// A world date, hostname assignments and the copied web.
+/// A world date and the copied web.
 #[derive(Clone, Debug)]
 pub struct Seed {
     /// World date in year-month-day form.
     pub date: String,
-    /// Explicit hostname assignments from the seed.
-    pub addresses: HashMap<String, Ipv4Addr>,
     /// The copied web selected by this world.
     pub corpus: Option<Corpus>,
 }
@@ -28,7 +26,6 @@ pub struct Corpus {
 #[serde(default, deny_unknown_fields)]
 struct Front {
     date: Option<toml::Value>,
-    addresses: HashMap<String, String>,
     corpus: Option<Corpus>,
 }
 
@@ -56,14 +53,8 @@ impl Seed {
             _ => return Err(invalid("date must be an ISO date")),
         };
         parse_date(&date)?;
-        let addresses = front
-            .addresses
-            .into_iter()
-            .map(|(h, a)| Ok((h.to_lowercase(), a.parse().map_err(invalid)?)))
-            .collect::<io::Result<_>>()?;
         Ok(Self {
             date,
-            addresses,
             corpus: front.corpus,
         })
     }
@@ -75,28 +66,6 @@ impl Seed {
             _ => return Err(invalid(format!("no seed named {name:?}"))),
         };
         Self::parse(text)
-    }
-
-    /// Addresses in the same shape as the world's `fixed_addresses` function.
-    pub fn fixed_addresses(&self) -> HashMap<String, (Ipv4Addr, &'static str)> {
-        let mut out: HashMap<_, _> = [
-            ("www.google.com", "142.250.180.4"),
-            ("google.com", "142.250.180.14"),
-            ("html.duckduckgo.com", "52.142.124.215"),
-            ("duckduckgo.com", "52.142.124.215"),
-            ("lite.duckduckgo.com", "52.142.124.215"),
-            ("www.bing.com", "150.171.27.10"),
-            ("bing.com", "150.171.28.10"),
-        ]
-        .into_iter()
-        .map(|(h, a)| (h.into(), (a.parse().unwrap(), "search engine")))
-        .collect();
-        out.extend(
-            self.addresses
-                .iter()
-                .map(|(h, a)| (h.clone(), (*a, "seed"))),
-        );
-        out
     }
 }
 
