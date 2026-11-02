@@ -232,13 +232,15 @@ impl Config {
         }
     }
 
-    /// [`Config::unbound`] with no root hints: a resolver with no route to
-    /// the roots, as on a network with no internet. It answers from its
-    /// local zones and gives SERVFAIL with Extended DNS Error 22 for
-    /// everything else.
+    /// [`Config::unbound`] with no root hints and `ede: yes`: a resolver
+    /// with no route to the roots, as on a network with no internet. It
+    /// answers from its local zones and gives SERVFAIL with Extended DNS
+    /// Error 22, No Reachable Authority (RFC 8914 §4.23), for everything
+    /// else, so a client can tell why.
     pub fn gateway() -> Config {
         Config {
             hints: Vec::new(),
+            ede: true,
             ..Config::unbound()
         }
     }

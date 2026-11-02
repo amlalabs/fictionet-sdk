@@ -544,10 +544,11 @@ use http::{Request, Response};
 use fictionet::stdlib::network::route::Prefix;
 use fictionet::stdlib::protocols::dns::rr::{LowerName, Name};
 use fictionet::stdlib::services::dns::WallClock;
+use fictionet::stdlib::services::dns::resolver::Config;
 use fictionet::stdlib::services::dns::zone::{Transparent, ZoneData};
 use fictionet::stdlib::services::tls::ServerConfig;
 use fictionet::stdlib::world::net::dns::{self, Recursive};
-use fictionet::stdlib::world::net::{Host, Net, gateway_config};
+use fictionet::stdlib::world::net::{Host, Net};
 use fictionet::{Attachments, Cx, Error};
 pub use httpd::{Body, Routing, Target};
 use httpd::{Handler, Server};
@@ -634,7 +635,7 @@ impl Sites {
         }));
         self.net.gateway(move |host, declared| {
             let localhost = LowerName::from(Name::from_ascii("localhost.").expect("a valid name"));
-            let mut config = gateway_config();
+            let mut config = Config::gateway();
             config
                 .local
                 .retain(|zone| zone.apex().num_labels() != 1 || *zone.apex() == localhost);
