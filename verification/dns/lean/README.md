@@ -236,7 +236,9 @@ extra iterations, in base32hex. RRSIG times are decimal. Validation results are 
   100, which RFC 9276 Appendix A found interoperable. A DNAME's synthesized CNAME is not validated through its DNAME, so `signed.json` zones
   have no DNAME.
 - **Offline signing** signs the DNSKEY set with the SEP keys and everything else with the other keys (all
-  keys when every key or no key has the bit). The NSEC chain runs over the names that hold nodes, in
+  keys when every key or no key has the bit). `Gen.lean` gives each zone keys of one algorithm; with keys of
+  several, Rust makes that split within each algorithm, so every RRset is signed with each one (RFC 4035
+  §2.2). The NSEC chain runs over the names that hold nodes, in
   canonical order. The NSEC3 chain also covers empty non-terminals; with opt-out it leaves out unsigned
   delegations and the empty non-terminals only they need. Records and denial carry the zone's negative TTL
   (RFC 9077 §3); the DNSKEY set carries the SOA's TTL.
