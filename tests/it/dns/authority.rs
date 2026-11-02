@@ -989,7 +989,16 @@ fn fict() -> Zone {
 }
 
 fn overlay() -> Overlay<Relay> {
-    Overlay::new(Relay::new()).below(name("fict.com."), zones(vec![fict()]))
+    Overlay::new(Relay::new(), name("com.")).below(name("fict.com."), zones(vec![fict()]))
+}
+
+/// The names between `com` and a deeper invented apex are the base's, so
+/// `com` could deny `nonexistent.com` and refer names under it.
+#[test]
+#[should_panic(expected = "not a child of com.")]
+fn an_invented_zone_must_be_a_child_of_the_overlays_zone() {
+    let _ = Overlay::new(Relay::new(), name("com."))
+        .below(name("shop.nonexistent.com."), zones(vec![fict()]));
 }
 
 /// The NSEC3 record and its RRSIG that `com` sends to deny `fict.com DS`

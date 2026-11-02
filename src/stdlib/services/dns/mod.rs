@@ -59,6 +59,7 @@ mod clock;
 mod event;
 mod exchange;
 pub mod memory;
+mod records;
 pub mod resolver;
 pub mod zone;
 

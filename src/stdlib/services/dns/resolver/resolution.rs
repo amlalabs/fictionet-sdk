@@ -40,9 +40,15 @@ use fictionet::time::Instant;
 
 use super::super::event::{Event, Unmatched, UpstreamOutcome};
 use super::super::exchange::{Action, ExchangeFailure, Token, Transmit};
+use super::super::records::{rrsets, signatures};
 use super::super::zone::dname_target;
 use super::Resolver;
 use super::cache::{Entry, FailureKind, Key, Negative, Offer, Rank, normalized, ttl_left};
+
+/// How many times one resolution sends a query to one server address over
+/// one transport before it gives up on that address (RFC 9520 §3.1: at
+/// most three).
+const TRIES: u8 = 3;
 
 /// Something that waits in the graph.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -131,7 +137,13 @@ pub(super) fn subjects(outcome: &Outcome) -> Vec<Subject> {
         )
     };
     match outcome {
-        Outcome::Data { sets, .. } => sets.iter().map(|set| Subject::Rrset(key(set))).collect(),
+        // RRSIG records are not signed themselves (RFC 4035 §2.2), so an
+        // answer of them has nothing to validate.
+        Outcome::Data { sets, .. } => sets
+            .iter()
+            .filter(|set| set.record_type() != RecordType::RRSIG)
+            .map(|set| Subject::Rrset(key(set)))
+            .collect(),
         Outcome::Alias { cname, .. } => vec![Subject::Rrset(key(cname))],
         Outcome::TooLong { dname, .. } => vec![Subject::Rrset(key(dname))],
         Outcome::Negative {
@@ -233,9 +245,12 @@ struct Lookup {
     tree: u64,
     depth: u8,
     dependents: Vec<Node>,
-    /// Server addresses that failed over each transport. Each is asked at
-    /// most once per transport in one resolution (RFC 9520 §3.1).
+    /// Server addresses given up on over each transport: they failed, or
+    /// timed out [`TRIES`] times.
     tried: Vec<(SocketAddr, Transport)>,
+    /// How many queries to each server address over each transport timed
+    /// out.
+    timeouts: Vec<(SocketAddr, Transport, u8)>,
     /// Whether any server sent a matching reply.
     replied: bool,
     /// Whether a server sent a reply the lookup could not use.
@@ -306,6 +321,8 @@ struct Exchange {
     minimised: bool,
     /// Whether it asked with RD set, as to a forwarder.
     forwarded: bool,
+    /// When the query went out, to time the server's round trip.
+    sent: Instant,
     deadline: Instant,
 }
 
@@ -470,7 +487,7 @@ impl<V: Verify> Resolver<V> {
         }
         match self.cache.get(key, now) {
             Some(entry @ Entry::Positive { rank, .. }) if *rank >= Rank::NonAuthAnswer => {
-                return Some(self.found_positive(entry, false));
+                return Some(self.found_positive(entry, key.rtype, false));
             }
             Some(entry @ Entry::Negative { .. }) => {
                 return self.found_negative(key, &key.name, entry);
@@ -489,7 +506,7 @@ impl<V: Verify> Resolver<V> {
             if let Some(entry @ Entry::Positive { rank, .. }) = self.cache.get(&alias, now)
                 && *rank >= Rank::NonAuthAnswer
             {
-                return Some(self.found_positive(entry, false));
+                return Some(self.found_positive(entry, key.rtype, false));
             }
         }
         self.aggressive(key)
@@ -499,16 +516,17 @@ impl<V: Verify> Resolver<V> {
     pub(super) fn stale_found(&self, key: &Key) -> Option<Found> {
         match self.cache.stale(key, self.now)? {
             entry @ Entry::Positive { rank, .. } if *rank >= Rank::NonAuthAnswer => {
-                Some(self.found_positive(entry, true))
+                Some(self.found_positive(entry, key.rtype, true))
             }
             entry @ Entry::Negative { .. } => self.found_negative(key, &key.name, entry),
             _ => None,
         }
     }
 
-    /// A cached RRset as an outcome, its TTL counted down to now, or set to
-    /// zero for `stale` data, whose TTL the front sets.
-    fn found_positive(&self, entry: &Entry, stale: bool) -> Found {
+    /// A cached RRset as the outcome for a question of type `asked`, its
+    /// TTL counted down to now, or set to zero for `stale` data, whose TTL
+    /// the front sets.
+    fn found_positive(&self, entry: &Entry, asked: RecordType, stale: bool) -> Found {
         let Entry::Positive {
             set,
             validation,
@@ -526,14 +544,11 @@ impl<V: Verify> Resolver<V> {
         };
         let set = with_ttl(set, remaining);
         let zone = self.zone_of(&set);
-        let key = Key::new(
-            LowerName::new(set.name()),
-            set.record_type(),
-            set.dns_class(),
-        );
         let proof = proof.iter().map(|p| with_ttl(p, remaining)).collect();
+        // A CNAME is the answer to a question for CNAME itself, and an
+        // alias to follow for any other type (RFC 1034 §4.3.2 step 3a).
         let outcome = match (set.record_type(), cname_target(&set)) {
-            (RecordType::CNAME, Some(target)) => Outcome::Alias {
+            (RecordType::CNAME, Some(target)) if asked != RecordType::CNAME => Outcome::Alias {
                 target,
                 proof,
                 cname: set,
@@ -545,9 +560,13 @@ impl<V: Verify> Resolver<V> {
                 zone,
             },
         };
+        let checks = subjects(&outcome)
+            .into_iter()
+            .map(|subject| (subject, *validation))
+            .collect();
         Found {
             outcome,
-            checks: vec![(Subject::Rrset(key), *validation)],
+            checks,
             cached: true,
         }
     }
@@ -744,6 +763,7 @@ impl<V: Verify> Resolver<V> {
                 depth,
                 dependents: vec![from],
                 tried: Vec::new(),
+                timeouts: Vec::new(),
                 replied: false,
                 errors: false,
                 minimise: Minimising::default(),
@@ -784,7 +804,11 @@ impl<V: Verify> Resolver<V> {
         let priming = Key::new(root.clone(), RecordType::NS, DNSClass::IN);
         if self.cut(&root, false).is_none() {
             if key == priming {
-                let hints = self.hint_servers();
+                let mut hints = self.hint_servers();
+                hints.retain(|server| !lookup.tried.contains(&(*server, Transport::Udp)));
+                if hints.is_empty() {
+                    return self.fail(id);
+                }
                 return self.ask_one(id, root, hints, entropy);
             }
             let (tree, depth) = (lookup.tree, lookup.depth);
@@ -803,7 +827,9 @@ impl<V: Verify> Resolver<V> {
             };
         }
 
-        let strictly = key.rtype == RecordType::DS;
+        // The parent holds a DS RRset, so it is asked of the cut above the
+        // name. The root has no parent: its own servers answer `. DS`.
+        let strictly = key.rtype == RecordType::DS && !key.name.is_root();
         let cached = self
             .cut(&key.name, strictly)
             .expect("the root's NS RRset is cached");
@@ -1013,6 +1039,7 @@ impl<V: Verify> Resolver<V> {
         servers: Vec<SocketAddr>,
         entropy: &dyn Entropy,
     ) {
+        let servers = self.servers.band(&servers, self.now);
         let index = entropy.random_below(servers.len() as u64) as usize;
         let to = servers[index];
         let forwarded = !self.config.forward.is_empty();
@@ -1124,6 +1151,11 @@ impl<V: Verify> Resolver<V> {
             .to_vec()
             .expect("a query with one question and an OPT record writes");
         let token = self.tokens.issue();
+        // A query over TCP waits one round trip more, for the handshake.
+        let wait = match transport {
+            Transport::Udp => self.servers.timeout(to.ip(), self.now),
+            Transport::Tcp => self.servers.timeout(to.ip(), self.now) * 2,
+        };
         self.graph.exchanges.insert(
             token,
             Exchange {
@@ -1135,7 +1167,8 @@ impl<V: Verify> Resolver<V> {
                 zone,
                 minimised,
                 forwarded,
-                deadline: self.now + self.config.retransmit,
+                sent: self.now,
+                deadline: self.now + wait,
             },
         );
         if let Some(lookup) = self.graph.lookups.get_mut(&id) {
@@ -1244,6 +1277,8 @@ impl<V: Verify> Resolver<V> {
             size,
         };
         self.upstream(token, &exchange, outcome);
+        self.servers
+            .replied(exchange.to.ip(), rtt(exchange.sent, self.now), self.now);
         if let Some(lookup) = self.graph.lookups.get_mut(&exchange.lookup) {
             lookup.replied = true;
             lookup.wait = LookupWait::Nothing;
@@ -1280,7 +1315,55 @@ impl<V: Verify> Resolver<V> {
             };
             self.queue.push_back(Action::Abandon(token));
             self.upstream(token, &exchange, UpstreamOutcome::Timeout);
-            self.give_up(exchange, false, entropy);
+            self.timed_out(exchange, entropy);
+        }
+    }
+
+    /// Asks `exchange`'s question again after it timed out: over TCP of
+    /// the same server, which already sent a truncated reply, and over UDP
+    /// of whichever server the lookup picks next. A server address that
+    /// timed out [`TRIES`] times over a transport is given up on.
+    fn timed_out(&mut self, exchange: Exchange, entropy: &dyn Entropy) {
+        self.servers.lost(exchange.to.ip(), self.now);
+        let Some(lookup) = self.graph.lookups.get_mut(&exchange.lookup) else {
+            return;
+        };
+        let index = lookup
+            .timeouts
+            .iter()
+            .position(|(to, transport, _)| (*to, *transport) == (exchange.to, exchange.transport))
+            .unwrap_or_else(|| {
+                lookup.timeouts.push((exchange.to, exchange.transport, 0));
+                lookup.timeouts.len() - 1
+            });
+        let timeouts = &mut lookup.timeouts[index].2;
+        *timeouts += 1;
+        if *timeouts >= TRIES {
+            return self.give_up(exchange, false, entropy);
+        }
+        lookup.wait = LookupWait::Nothing;
+        match exchange.transport {
+            Transport::Tcp => {
+                let Exchange {
+                    lookup,
+                    zone,
+                    to,
+                    question,
+                    minimised,
+                    forwarded,
+                    ..
+                } = exchange;
+                let asking = Asking {
+                    zone,
+                    to,
+                    transport: Transport::Tcp,
+                    question,
+                    minimised,
+                    forwarded,
+                };
+                self.send(lookup, asking, entropy);
+            }
+            Transport::Udp => self.plan(exchange.lookup, entropy),
         }
     }
 
@@ -1348,15 +1431,26 @@ impl<V: Verify> Resolver<V> {
         let sname = exchange.question.name().to_lowercase();
         let stype = exchange.question.query_type();
         let authoritative = message.metadata.authoritative || exchange.forwarded;
-        let answers: Vec<RecordSet> = rrsets(&message.answers)
-            .into_iter()
+        // A question for RRSIG gets the signatures themselves as its
+        // answer; for any other type they go with the RRsets they cover.
+        let answers = match stype {
+            RecordType::RRSIG => signatures(&message.answers),
+            _ => rrsets(&message.answers),
+        };
+        let answers: Vec<RecordSet> = answers
+            .iter()
             .filter(|set| inside(set.name()))
+            .map(normalized)
             .collect();
         let authority: Vec<RecordSet> = rrsets(&message.authorities)
-            .into_iter()
+            .iter()
             .filter(|set| inside(set.name()))
+            .map(normalized)
             .collect();
-        let additional = rrsets(&message.additionals);
+        let additional: Vec<RecordSet> = rrsets(&message.additionals)
+            .iter()
+            .map(normalized)
+            .collect();
         let denial: Vec<RecordSet> = authority
             .iter()
             .filter(|set| matches!(set.record_type(), RecordType::NSEC | RecordType::NSEC3))
@@ -2017,7 +2111,9 @@ impl<V: Verify> Resolver<V> {
             _ => return,
         };
         let expires = set.and_then(|set| self.signatures_expire(set));
-        self.cache.validated(key, validation, expires, now);
+        let original_ttl = set.and_then(original_ttl);
+        self.cache
+            .validated(key, validation, expires, original_ttl, now);
         if let (Validation::Secure, Material::Denial { authority, .. }) = (validation, material)
             && self.config.aggressive_nsec
         {
@@ -2221,6 +2317,22 @@ fn address(record: &Record) -> Option<IpAddr> {
     }
 }
 
+/// The smallest Original TTL among `set`'s RRSIGs (RFC 4034 §3.1.4).
+fn original_ttl(set: &RecordSet) -> Option<u32> {
+    set.rrsigs()
+        .iter()
+        .filter_map(|record| match &record.data {
+            RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) => Some(rrsig.input().original_ttl),
+            _ => None,
+        })
+        .min()
+}
+
+/// The time from `sent` to `now`.
+fn rtt(sent: Instant, now: Instant) -> std::time::Duration {
+    now.since_start().saturating_sub(sent.since_start())
+}
+
 /// `set` with its TTL, and every record's and RRSIG's, set to `ttl`.
 pub(super) fn with_ttl(set: &RecordSet, ttl: u32) -> RecordSet {
     let mut out = set.clone();
@@ -2282,43 +2394,4 @@ fn randomise_case(name: &Name, entropy: &dyn Entropy) -> Name {
     let mut out = Name::from_labels(labels).expect("a name keeps its length when its case changes");
     out.set_fqdn(true);
     out
-}
-
-/// `records` gathered into RRsets in order of first appearance, each
-/// RRSIG with the RRset it covers, normalized as the cache keeps them.
-fn rrsets(records: &[Record]) -> Vec<RecordSet> {
-    let mut sets: Vec<RecordSet> = Vec::new();
-    for record in records {
-        let covered = match &record.data {
-            RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) => Some(rrsig.input().type_covered),
-            _ => None,
-        };
-        let rtype = covered.unwrap_or(record.record_type());
-        if rtype == RecordType::OPT {
-            continue;
-        }
-        let index = sets.iter().position(|set| {
-            set.name() == &record.name
-                && set.record_type() == rtype
-                && set.dns_class() == record.dns_class
-        });
-        let index = index.unwrap_or_else(|| {
-            let mut set = RecordSet::with_ttl(record.name.clone(), rtype, record.ttl);
-            set.set_dns_class(record.dns_class);
-            sets.push(set);
-            sets.len() - 1
-        });
-        let set = &mut sets[index];
-        match covered {
-            Some(_) => set.insert_rrsig(record.clone()),
-            None => {
-                let ttl = set.ttl().min(record.ttl);
-                let mut record = record.clone();
-                record.name = set.name().clone();
-                set.insert(record, 0);
-                set.set_ttl(ttl);
-            }
-        }
-    }
-    sets.iter().map(normalized).collect()
 }

@@ -17,8 +17,8 @@ use super::{Authority, Known, ServerConfig, Step, bare_reply};
 /// Answers as its base does, except for zones invented below it.
 ///
 /// An overlay sits on the servers of a zone's parent, such as a relay of
-/// the `com` servers, with each invented zone added by
-/// [`below`](Overlay::below). For a question at or below an invented
+/// the `com` servers, with each invented zone, a child of that parent,
+/// added by [`below`](Overlay::below). For a question at or below an invented
 /// zone's apex:
 ///
 /// - At one of the invented zone's own name servers (an address its apex
@@ -45,22 +45,40 @@ use super::{Authority, Known, ServerConfig, Step, bare_reply};
 /// base stays silent for the DS question, so does the overlay.
 pub struct Overlay<B: Authority> {
     base: B,
+    /// The zone the base serves, whose children the overlay invents.
+    zone: LowerName,
     zones: Vec<(LowerName, Box<dyn Authority>)>,
 }
 
 impl<B: Authority> Overlay<B> {
-    /// `base`, with no zones invented below it yet.
-    pub fn new(base: B) -> Overlay<B> {
+    /// `base`, the servers of `zone`, with no zones invented below it yet.
+    pub fn new(base: B, zone: Name) -> Overlay<B> {
         Overlay {
             base,
+            zone: LowerName::new(&zone),
             zones: Vec::new(),
         }
     }
 
     /// This overlay with the zone at `apex` answered by `inner`, whose
     /// replies to `<apex> NS` give the zone's name servers and their glue.
+    ///
+    /// # Panics
+    ///
+    /// If `apex` is not a child of the overlay's zone. The names between
+    /// the zone and a deeper apex are the base's, which may deny them or
+    /// refer them elsewhere while the overlay refers names below them.
+    /// The parent would then deny a name and answer for names under it,
+    /// which RFC 8020 §2 rules out, and a resolver that minimises its
+    /// questions would never reach the invented zone.
     pub fn below(mut self, apex: Name, inner: impl Authority) -> Overlay<B> {
-        self.zones.push((LowerName::new(&apex), Box::new(inner)));
+        let apex = LowerName::new(&apex);
+        assert!(
+            !apex.is_root() && apex.base_name() == self.zone,
+            "an invented zone at {apex} is not a child of {}",
+            self.zone
+        );
+        self.zones.push((apex, Box::new(inner)));
         self
     }
 }

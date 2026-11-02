@@ -227,8 +227,9 @@ impl<'a> Nsecs<'a> {
     fn nodata(&self, name: &Name, qtype: RecordType) -> bool {
         if let Some(rdata) = self.matching(name) {
             let types = rdata.type_set();
-            let usable = if qtype == RecordType::DS {
+            let usable = if qtype == RecordType::DS && !name.is_root() {
                 // A child apex's NSEC cannot deny the DS its parent holds.
+                // The root has no parent, so its own apex NSEC denies it.
                 !types.contains(RecordType::SOA)
             } else {
                 // A parent's NSEC at a cut cannot deny the child's types. A
@@ -358,7 +359,7 @@ impl<'a> Nsec3s<'a> {
     fn nodata(&self, name: &Name, qtype: RecordType) -> Proof {
         if let Some(rdata) = self.matching(name) {
             let types = rdata.type_set();
-            let usable = if qtype == RecordType::DS {
+            let usable = if qtype == RecordType::DS && !name.is_root() {
                 !types.contains(RecordType::SOA)
             } else {
                 // As for NSEC: a cut stops the proof, a DNAME does not.
