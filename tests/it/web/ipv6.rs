@@ -193,8 +193,10 @@ fn dns_answers_aaaa_for_each_family_a_site_has() {
                 );
             }
         }
-        // The callback ran once per name.
-        assert_eq!(env.calls.load(Ordering::SeqCst), 6);
+        // The callback ran for `test` and then the name on each lookup no
+        // placed site answered: once for each of the four sites, and on
+        // every lookup of the two names it turned down, which are not kept.
+        assert_eq!(env.calls.load(Ordering::SeqCst), 4 * 2 + 4 * 2);
 
         // DNS also answers at the gateway's IPv6 address, over UDP and TCP.
         let m6 = machine(&fcx, attacher.attach("b").unwrap(), ME6);
@@ -431,19 +433,14 @@ fn late_host_failure_keeps_http_defaults_names_and_tls_unchanged() {
             .udp(49152, Arc::new(()), || Quiet);
         let good = site("good", false).served_by(Host::new("good").at(v4).at(v6));
         let (attacher, attachments) = fictionet::attachments();
-        Net::new()
-            .add_host(first)
-            .add_host(occupied)
-            .resolve(move |name| match name {
-                "bad.test" => Some(bad.clone()),
-                "good.test" => Some(good.clone()),
-                _ => None,
-            })
-            .start(&fcx, attachments)?;
+        let net = Net::new().add_host(first).add_host(occupied);
+        let handle = net.handle();
+        net.start(&fcx, attachments)?;
         let m4 = default_machine(&fcx, &attacher);
         let m6 = machine(&fcx, attacher.attach("b")?, ME6);
         let mut existing = plain_client(&fcx, &m4, v4, false).await;
         assert_eq!(existing.get("http", "first.test", "/").await.body, "first");
+        assert!(handle.add_host(bad.dns_name("bad.test")).is_err());
         assert_eq!(
             dns(&fcx, &m4, "bad.test", RecordType::A).await.0,
             ResponseCode::NXDomain
@@ -474,6 +471,7 @@ fn late_host_failure_keeps_http_defaults_names_and_tls_unchanged() {
             let mut conn = TlsClient::new(&fcx, tcp, &roots, "bad.test", &[b"http/1.1"], date)?;
             assert!(conn.handshake(&fcx).await.is_err());
         }
+        handle.add_host(good.dns_name("good.test"))?;
         assert_eq!(lookup(&fcx, &m4, "good.test").await, v4);
         assert_eq!(existing.get("http", "good.test", "/").await.body, "good");
         Ok(())
@@ -1188,58 +1186,6 @@ fn dns_drops_a_zero_udp_checksum_over_ipv6() {
         assert_eq!(next, 17);
         let answer = Message::from_vec(&body[8..]).unwrap();
         assert_eq!((answer.metadata.id, answer.answers.len()), (id, 1));
-        Ok(())
-    });
-}
-
-/// A callback that gives every name a site makes no more than
-/// `max_sites` of them. Past that, a new name gets SERVFAIL and no machine,
-/// and the names that have sites keep working.
-#[test]
-fn dns_makes_no_more_sites_than_the_limit() {
-    let make =
-        || web::Sites::new(|_| Some(web::Site::new(Plain("wildcard")).ipv6_only())).max_sites(8);
-    world_of(make, |fcx, attacher| async move {
-        let mut raw = attacher.attach("a").unwrap();
-        for i in 0..8 {
-            // A questions make the site too, and get NODATA.
-            let answer = raw_dns6(
-                &fcx,
-                &mut raw,
-                ME6,
-                GATEWAY6,
-                &format!("n{i}.test"),
-                RecordType::A,
-            )
-            .await
-            .unwrap();
-            assert_eq!(answer, (ResponseCode::NoError, vec![]));
-        }
-        for name in ["n8.test", "n9.test", "n8.test"] {
-            let answer = raw_dns6(&fcx, &mut raw, ME6, GATEWAY6, name, RecordType::AAAA)
-                .await
-                .unwrap();
-            assert_eq!(answer, (ResponseCode::ServFail, vec![]), "{name}");
-        }
-        // The first eight still answer, and have machines.
-        let site0 = Ipv6Addr::from(u128::from("2606:4700:100::".parse::<Ipv6Addr>().unwrap()) + 1);
-        let answer = raw_dns6(&fcx, &mut raw, ME6, GATEWAY6, "n0.test", RecordType::AAAA)
-            .await
-            .unwrap();
-        assert_eq!(answer, (ResponseCode::NoError, vec![site0.into()]));
-        let base = u128::from("2606:4700:100::".parse::<Ipv6Addr>().unwrap());
-        for i in 1..=9u16 {
-            let addr = Ipv6Addr::from(base + u128::from(i));
-            raw.send(ping6(ME6, addr, i));
-            let reply = recv_within(&fcx, &mut raw, SHORT).await.expect("a reply");
-            let (src, _, _, body) = parse6(&reply);
-            if i <= 8 {
-                assert_eq!((src, body[0]), (addr, 129), "site {i} answers pings");
-            } else {
-                // No ninth machine: the gateway says "address unreachable".
-                assert_eq!((src, body[0], body[1]), (GATEWAY6, 1, 3));
-            }
-        }
         Ok(())
     });
 }

@@ -1,4 +1,5 @@
 use super::*;
+use fictionet::stdlib::world::net::Limits;
 
 // ---------------------------------------------------------------------------
 // Tests: DNS
@@ -41,8 +42,11 @@ fn dns_answers_sites_nodata_and_nxdomain() {
             (ResponseCode::NXDomain, vec![])
         );
 
-        // The callback ran once per name: secure, plain, broken, nope, inside.
-        assert_eq!(env.calls.load(Ordering::SeqCst), 5);
+        // The callback ran for `test` and then the name on each lookup no
+        // placed site answered: once for each of secure, plain, and broken,
+        // and on every lookup of nope (twice) and inside, which it turned
+        // down or which could not be placed, and which are not kept.
+        assert_eq!(env.calls.load(Ordering::SeqCst), 3 * 2 + 3 * 2);
 
         // DNS over TCP, two queries on one connection.
         let mut conn = m
@@ -68,7 +72,110 @@ fn dns_answers_sites_nodata_and_nxdomain() {
                 assert_eq!(got, (ResponseCode::NXDomain, vec![]));
             }
         }
-        assert_eq!(env.calls.load(Ordering::SeqCst), 5);
+        // secure.test has its site; nope.test is asked about again.
+        assert_eq!(env.calls.load(Ordering::SeqCst), 12 + 2);
+        Ok(())
+    });
+}
+
+/// A site is placed the first time its name is looked up, and a second
+/// name under a top-level domain a placed site already uses still reaches
+/// the callback.
+#[test]
+fn sites_are_placed_on_first_lookup_even_under_a_used_top_level_domain() {
+    run_world::world(Duration::from_secs(60), |fcx| async move {
+        let asked: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let record = asked.clone();
+        let net = web::Sites::new(move |host| {
+            record.lock().unwrap().push(host.to_owned());
+            match host {
+                "a.test" => Some(web::Site::new(Plain("a"))),
+                "b.test" => Some(web::Site::new(Plain("b"))),
+                _ => None,
+            }
+        })
+        .into_net();
+        let handle = net.handle();
+        let (attacher, attachments) = fictionet::attachments();
+        net.start(&fcx, attachments)?;
+        let m = default_machine(&fcx, &attacher);
+        let first = Ipv4Addr::new(104, 18, 0, 1);
+        assert!(!handle.has_machine(first.into()), "no site before a lookup");
+
+        assert_eq!(lookup(&fcx, &m, "a.test").await, first);
+        assert!(handle.has_machine(first.into()));
+        let b = lookup(&fcx, &m, "b.test").await;
+        assert_ne!(b, first);
+        assert!(handle.has_machine(b.into()));
+        let page = plain_client(&fcx, &m, b, false)
+            .await
+            .get("http", "b.test", "/")
+            .await
+            .body;
+        assert!(page.starts_with("b "), "{page}");
+
+        // `test` is asked about before each name below it, and a placed
+        // site's name is answered without asking again.
+        assert_eq!(lookup(&fcx, &m, "a.test").await, first);
+        assert_eq!(*asked.lock().unwrap(), ["test", "a.test", "test", "b.test"]);
+        Ok(())
+    });
+}
+
+/// The gateway answers pings, and its DNS connections count toward the
+/// connections a peer may have open across the network.
+#[test]
+fn the_gateway_answers_pings_and_counts_toward_the_peer_limit() {
+    run_world::world(Duration::from_secs(60), |fcx| async move {
+        let net = web::Sites::new(|host| (host == "a.test").then(|| web::Site::new(Plain("a"))))
+            .into_net()
+            .limits(Limits {
+                connections_per_peer: 2,
+                ..Limits::default()
+            });
+        let (attacher, attachments) = fictionet::attachments();
+        net.start(&fcx, attachments)?;
+        let pinger = Ipv4Addr::new(10, 0, 0, 3);
+        let mut raw = attacher.attach("pinger")?;
+        raw.send(ping(pinger, GATEWAY, 1));
+        let reply = recv_within(&fcx, &mut raw, SHORT)
+            .await
+            .expect("a ping reply");
+        let (src, dst, protocol, body) = parse(&reply);
+        assert_eq!((src, dst, protocol, body[0]), (GATEWAY, pinger, 1, 0));
+
+        let m = default_machine(&fcx, &attacher);
+        let site = lookup(&fcx, &m, "a.test").await;
+        // Two DNS connections to the gateway, each answering a query.
+        let mut connections = Vec::new();
+        for id in [1u16, 2] {
+            let mut conn = m
+                .tcp
+                .connect(&fcx, SocketAddr::new(GATEWAY.into(), 53))
+                .await?;
+            let mut q = Message::new(id, MessageType::Query, OpCode::Query);
+            q.add_query(Query::query(Name::from_ascii("a.test")?, RecordType::A));
+            let bytes = q.to_vec()?;
+            let mut framed = (bytes.len() as u16).to_be_bytes().to_vec();
+            framed.extend_from_slice(&bytes);
+            conn.write_all(&fcx, &framed).await?;
+            let mut len = [0u8; 2];
+            read_exact(&fcx, &mut conn, &mut len).await;
+            let mut reply = vec![0u8; u16::from_be_bytes(len) as usize];
+            read_exact(&fcx, &mut conn, &mut reply).await;
+            assert_eq!(parse_dns(&reply, id), (ResponseCode::NoError, vec![site]));
+            connections.push(conn);
+        }
+        // They are the peer's two: a third connection, to the site, is
+        // reset.
+        let mut third = m
+            .tcp
+            .connect(&fcx, SocketAddr::new(site.into(), 80))
+            .await?;
+        let read = timeout(&fcx, Duration::from_secs(2), third.read(&fcx, &mut [0; 1]))
+            .await
+            .expect("an answer");
+        assert!(matches!(read, Err(ConnError::Reset) | Ok(0)), "{read:?}");
         Ok(())
     });
 }
