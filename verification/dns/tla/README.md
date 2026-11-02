@@ -45,7 +45,8 @@ proof of the rule and the counterexample that shows why it is there.
 | | `NoLockAcrossAsk` | invariant | a request parked on an ask holds no part of a view |
 | | `EveryParkedAnswered` | liveness | every request that waits on an ask is answered or silently dropped |
 | Validation | `SecureImpliesChain` | invariant | Secure only with a valid chain from a configured anchor to the answer |
-| | `InsecureNeedsProof` | invariant | Insecure only with no covering anchor, or below a validated chain a signed no-DS proof, an opt-out cover, or a DS whose algorithm the policy does not admit |
+| | `InsecureNeedsProof` | invariant | Insecure only with no covering anchor, or below a validated chain a signed no-DS proof, an opt-out cover, or a DS whose algorithm the policy does not admit, each from a DS set that was fetched |
+| | `UnreachableLinkIndeterminate` | invariant | a zone below a validated chain whose DS set cannot be fetched is Indeterminate, whatever that set would have said, as `Check::delegation` fetches it first |
 | | `NoDowngrade` | invariant | a valid chain is always Secure |
 | | `IndeterminateOnlyUnreachable` | invariant | Indeterminate only when a zone could not be fetched |
 | | `AdOnlySecure` | invariant | AD only for Secure data with DO or AD in the query; never for NotPerformed, never because an upstream set it |
@@ -153,11 +154,11 @@ in `_concurrent` explores the same states as the invariants there.
 | Authority_mixedrevision | `CoherentRevision` | violated | 43 | 4 | 1 s | ReadName (a.fict absent), WorldChange, ReadRest (the wildcard present): a wildcard answer no revision gives |
 | Authority_reask | `RespondMonotone` | violated | 17 | 3 | 0 s | Step (the policy refuses leak.evil, a timeout), Observe: the request knows its observation and needs again |
 | Authority_parkinview | `NoLockAcrossAsk` | violated | 6 | 3 | 0 s | ReadOverlay, Step: the overlay reads the lazy zone, then parks on its DS ask while it still holds that read |
-| Validation_paths | the 10 invariants | pass | 1119744 | 1 | 1-3 s | |
-| Validation_skew | the 10 invariants | pass | 10368 | 1 | 0-1 s | |
-| Validation_unreachable | the 10 invariants | pass | 18432 | 1 | 0-1 s | |
-| Validation_policy | the 10 invariants | pass | 3456 | 1 | 0-1 s | |
-| Validation_providers | the 10 invariants | pass | 589824 | 1 | 1-2 s | |
+| Validation_paths | the 11 invariants | pass | 1119744 | 1 | 1-3 s | |
+| Validation_skew | the 11 invariants | pass | 10368 | 1 | 0-1 s | |
+| Validation_unreachable | the 11 invariants | pass | 147456 | 1 | 0-1 s | |
+| Validation_policy | the 11 invariants | pass | 3456 | 1 | 0-1 s | |
+| Validation_providers | the 11 invariants | pass | 589824 | 1 | 1-2 s | |
 | Validation_witnesses | each of the 7 `Never...` forms, alone | violated (reachable) | 1 | 1 | 0-1 s | an initial state of each scenario |
 | Validation_trustupstreamad | `AdOnlySecure` | violated | 1 | 1 | 0 s | no anchors configured (NotPerformed), the upstream reply has AD, the client gets AD |
 | Validation_nopolicy | `Sha1Insecure` | violated | 1 | 1 | 1 s | a chain of key A where sld's DS names algorithm 5: Secure |

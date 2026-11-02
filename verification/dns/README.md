@@ -69,7 +69,7 @@ not compare whole, with why.
 | `zone` | `zone::answer` over `Zone::from_master` | RCODE, AA, every section, and the required additional RRsets |
 | `partial` | `zone::answer` over a view with unknown facts | the unknown name, or the response |
 | `signed` | `Zone::signed`, `answer` with DO=1, `validate_rrset`, `validate_denial` | the answer's records and RRSIGs, its denial records, the DNSKEY RRset, and the validation of each answer RRset and of the denial, under the zone's own anchor or, for a zone below a signed parent, along the chain from the parent's anchor across the delegation, with the parent's DNSKEY RRset and its denial of the DS RRset compared too |
-| `policy` | `AlgorithmPolicy` | the treatment of a DS record's algorithm and digest type |
+| `policy` | `AlgorithmPolicy::treat`, under `AlgorithmPolicy::iana` where the vector names `iana` | the treatment of a DS record's algorithm and digest type, so the policy Rust ships is held to the one the Lean theorems are about |
 | `chain` | `check_chain` | the problems reported, as a set |
 | `cache` | `resolver::Cache` | what each lookup serves, with TTLs counted down |
 | `resolver` | `Resolver` driven by `memory::drive` over `AuthorityEngine`s of the zones | each answer, the answers under the work bound with nothing lost, the final cache, and the answers with some servers dead |

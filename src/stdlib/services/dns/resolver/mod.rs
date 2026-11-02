@@ -67,7 +67,9 @@ mod resolution;
 mod servers;
 
 pub use cache::{Cache, Checked, Entry, FailureKind, Key, Limits, Negative, Offer, Rank};
-pub use config::{Config, Minimise, NameServer, ROOT_SERVERS, Stale, Work, root_hints};
+pub use config::{
+    Config, Minimise, NameServer, NegativeAnchors, ROOT_SERVERS, Stale, Work, root_hints,
+};
 
 use resolution::{AskerId, CheckId, Graph, LookupId, Outcome, Subject, TreeId};
 use servers::Servers;
@@ -91,9 +93,8 @@ pub struct Resolver<V: Verify = Ring> {
     /// The front's view of `config`, for the header and EDNS rules
     /// authoritative servers and resolvers share.
     server: ServerConfig,
-    /// The local zones, in the order they were added, each with whether
-    /// its answers keep their AA bit.
-    local: Vec<(Arc<dyn ZoneData>, bool)>,
+    /// The local zones, in the order they were added.
+    local: Vec<LocalZone>,
     verify: V,
     clock: WallClock,
     tokens: Tokens,
@@ -106,6 +107,13 @@ pub struct Resolver<V: Verify = Ring> {
     restart: Vec<AskerId>,
     queue: VecDeque<Action>,
     now: Instant,
+}
+
+/// One of a resolver's local zones.
+struct LocalZone {
+    data: Arc<dyn ZoneData>,
+    /// Whether its answers keep the AA bit the zone gives them.
+    keep_aa: bool,
 }
 
 /// One client query being answered.
@@ -189,14 +197,20 @@ impl<V: Verify> Resolver<V> {
             ask_timeout: config.retransmit,
             recursion_available: true,
         };
-        let mut local: Vec<(Arc<dyn ZoneData>, bool)> = config
+        let mut local: Vec<LocalZone> = config
             .local
             .iter()
-            .map(|zone| (zone.clone(), config.local_aa))
+            .map(|zone| LocalZone {
+                data: zone.clone(),
+                keep_aa: config.local_aa,
+            })
             .collect();
         if !config.ddr.is_empty() {
             let zone = special::resolver_arpa(config.ddr.clone(), config.ddr_ttl);
-            local.push((Arc::new(zone), config.ddr_aa));
+            local.push(LocalZone {
+                data: Arc::new(zone),
+                keep_aa: config.ddr_aa,
+            });
         }
         let servers = Servers::new(config.retransmit, config.server_ttl);
         let limits = Limits {
@@ -298,19 +312,23 @@ impl<V: Verify> Resolver<V> {
     /// deepest zone first, and at equal depth the zone added last.
     fn answer_locally(&self, request: &Request) -> Option<Vec<u8>> {
         let qname = LowerName::new(request.question.name());
-        let mut zones: Vec<(usize, &(Arc<dyn ZoneData>, bool))> = self
+        let mut zones: Vec<(usize, &LocalZone)> = self
             .local
             .iter()
             .enumerate()
-            .filter(|(_, (zone, _))| zone.apex().zone_of(&qname))
+            .filter(|(_, zone)| zone.data.apex().zone_of(&qname))
             .collect();
-        zones.sort_by_key(|(index, (zone, _))| {
-            std::cmp::Reverse((zone.apex().num_labels(), *index))
+        zones.sort_by_key(|(index, zone)| {
+            std::cmp::Reverse((zone.data.apex().num_labels(), *index))
         });
-        zones.into_iter().find_map(|(_, (zone, keep_aa))| {
-            match answer(&*zone.view(&request.question), request, self.config.any) {
+        zones.into_iter().find_map(|(_, zone)| {
+            match answer(
+                &*zone.data.view(&request.question),
+                request,
+                self.config.any,
+            ) {
                 Answered::Response(response) => {
-                    Some(self.render_local(request, response, *keep_aa))
+                    Some(self.render_local(request, response, zone.keep_aa))
                 }
                 Answered::Unknown { .. } => None,
             }

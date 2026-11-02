@@ -39,6 +39,18 @@ pub struct AlgorithmPolicy {
     pub max_nsec3_iterations: u16,
 }
 
+/// How a policy treats one DS record ([`AlgorithmPolicy::treat`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Treatment {
+    /// The record may select the child's keys.
+    Supported,
+    /// The policy does not validate the record's DNSKEY algorithm.
+    UnsupportedAlgorithm,
+    /// The policy validates the algorithm but does not accept the
+    /// record's digest type.
+    UnsupportedDigest,
+}
+
 impl AlgorithmPolicy {
     /// The IANA registry columns as RFC 9904 and RFC 9905 set them.
     ///
@@ -86,9 +98,23 @@ impl AlgorithmPolicy {
         self.delegate.contains(&digest)
     }
 
+    /// How a validator treats a DS record of DNSKEY algorithm `algorithm`
+    /// and digest type `digest`: usable when the policy validates the one
+    /// and accepts the other, and otherwise unsupported for its algorithm
+    /// first, then for its digest (RFC 4035 §5.2, RFC 9905 §2).
+    pub fn treat(&self, algorithm: u8, digest: u8) -> Treatment {
+        if !self.validates(algorithm) {
+            Treatment::UnsupportedAlgorithm
+        } else if !self.accepts_digest(digest) {
+            Treatment::UnsupportedDigest
+        } else {
+            Treatment::Supported
+        }
+    }
+
     /// The DS records among `records` a validator uses to select a child's
-    /// keys, each with its digest type: those whose algorithm and digest
-    /// type the policy accepts, without the SHA-1 ones when a stronger
+    /// keys, each with its digest type: those the policy treats as
+    /// [`Treatment::Supported`], without the SHA-1 ones when a stronger
     /// digest is among them (RFC 4509 §3).
     pub fn usable_ds<'a>(
         &self,
@@ -96,8 +122,10 @@ impl AlgorithmPolicy {
     ) -> Vec<(&'a DS, DigestType)> {
         let mut usable: Vec<(&DS, DigestType)> = records
             .into_iter()
-            .filter(|ds| self.validates(u8::from(ds.algorithm())))
-            .filter(|ds| self.accepts_digest(u8::from(ds.digest_type())))
+            .filter(|ds| {
+                self.treat(u8::from(ds.algorithm()), u8::from(ds.digest_type()))
+                    == Treatment::Supported
+            })
             .filter_map(|ds| Some((ds, DigestType::from_number(u8::from(ds.digest_type()))?)))
             .collect();
         if usable.iter().any(|(_, digest)| *digest != DigestType::Sha1) {

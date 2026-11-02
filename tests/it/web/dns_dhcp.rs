@@ -246,6 +246,53 @@ fn the_callback_decides_names_under_home_arpa() {
     });
 }
 
+/// A Sites world sees its gateway's DNS events: each query a sandbox puts
+/// to it and each reply, typed as the resolver reports them.
+#[test]
+fn a_sites_world_sees_its_gateways_dns_events() {
+    use fictionet::stdlib::services::dns::Event;
+    run_world::world(Duration::from_secs(60), |fcx| async move {
+        // Each event as `query <name>` or `reply <name> <rcode>`.
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let log = seen.clone();
+        let net = web::Sites::new(|host| (host == "a.test").then(|| web::Site::new(Plain("a"))))
+            .on_dns_event(move |event| {
+                let entry = match event {
+                    Event::Query { question, .. } => format!("query {}", question.name()),
+                    Event::Reply {
+                        question: Some(question),
+                        rcode,
+                        ..
+                    } => format!("reply {} {rcode:?}", question.name()),
+                    _ => return,
+                };
+                log.lock().unwrap().push(entry.to_ascii_lowercase());
+            })
+            .into_net();
+        let (attacher, attachments) = fictionet::attachments();
+        net.start(&fcx, attachments)?;
+        let m = default_machine(&fcx, &attacher);
+        lookup(&fcx, &m, "a.test").await;
+        assert_eq!(
+            dns(&fcx, &m, "nope.test", RecordType::A).await,
+            (ResponseCode::NXDomain, vec![])
+        );
+        let seen = seen.lock().unwrap().clone();
+        for wanted in [
+            "query a.test.",
+            "reply a.test. noerror",
+            "query nope.test.",
+            "reply nope.test. nxdomain",
+        ] {
+            assert!(
+                seen.iter().any(|entry| entry == wanted),
+                "no {wanted} in {seen:?}"
+            );
+        }
+        Ok(())
+    });
+}
+
 /// The gateway answers pings, and its DNS connections count toward the
 /// connections a peer may have open across the network.
 #[test]

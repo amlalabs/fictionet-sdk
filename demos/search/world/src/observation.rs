@@ -166,9 +166,14 @@ pub enum Dnssec {
     /// came from the resolver itself, from a local zone or its CHAOS
     /// names, or was a refusal or a format error.
     NotPerformed,
+    /// A chain of signatures from a trust anchor proved the answer.
     Secure,
+    /// The answer is provably outside any secure chain.
     Insecure,
+    /// The answer should have been secure, but its signatures or proofs
+    /// failed.
     Bogus,
+    /// Records the validation needed could not be fetched.
     Indeterminate,
 }
 
@@ -668,21 +673,32 @@ pub fn rcode_name<S: serde::Serializer>(
     value: &ResponseCode,
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
-    let code = u16::from(*value);
-    let name = match code {
-        0 => "NOERROR",
-        1 => "FORMERR",
-        2 => "SERVFAIL",
-        3 => "NXDOMAIN",
-        4 => "NOTIMP",
-        5 => "REFUSED",
-        6 => "YXDOMAIN",
-        7 => "YXRRSET",
-        8 => "NXRRSET",
-        9 => "NOTAUTH",
-        10 => "NOTZONE",
-        16 => "BADVERS",
-        _ => return serializer.collect_str(&format_args!("RCODE{code}")),
+    let name = match value {
+        ResponseCode::NoError => "NOERROR",
+        ResponseCode::FormErr => "FORMERR",
+        ResponseCode::ServFail => "SERVFAIL",
+        ResponseCode::NXDomain => "NXDOMAIN",
+        ResponseCode::NotImp => "NOTIMP",
+        ResponseCode::Refused => "REFUSED",
+        ResponseCode::YXDomain => "YXDOMAIN",
+        ResponseCode::YXRRSet => "YXRRSET",
+        ResponseCode::NXRRSet => "NXRRSET",
+        ResponseCode::NotAuth => "NOTAUTH",
+        ResponseCode::NotZone => "NOTZONE",
+        // RCODE 16 is BADVERS in an OPT record and BADSIG in a TSIG
+        // record (RFC 6891 §9, RFC 8945 §5.3); a resolver's reply means
+        // the first.
+        ResponseCode::BADVERS | ResponseCode::BADSIG => "BADVERS",
+        ResponseCode::BADKEY => "BADKEY",
+        ResponseCode::BADTIME => "BADTIME",
+        ResponseCode::BADMODE => "BADMODE",
+        ResponseCode::BADNAME => "BADNAME",
+        ResponseCode::BADALG => "BADALG",
+        ResponseCode::BADTRUNC => "BADTRUNC",
+        ResponseCode::BADCOOKIE => "BADCOOKIE",
+        ResponseCode::Unknown(code) => {
+            return serializer.collect_str(&format_args!("RCODE{code}"));
+        }
     };
     serializer.serialize_str(name)
 }

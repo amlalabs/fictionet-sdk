@@ -6,14 +6,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fictionet::stdlib::protocols::dns::dnssec::{AlgorithmPolicy, Anchors};
-use fictionet::stdlib::protocols::dns::rr::Name;
 use fictionet::stdlib::protocols::dns::rr::rdata::svcb::{
     Alpn, IpHint, SvcParamKey, SvcParamValue, Unknown,
 };
 use fictionet::stdlib::protocols::dns::rr::rdata::{A, AAAA, SVCB};
+use fictionet::stdlib::protocols::dns::rr::{LowerName, Name};
 
 use super::super::authority::{ChaosAnswer, Identity, chaos};
 use super::super::zone::{AnyResponse, ZoneData, special};
+
+/// Whether a name is a negative trust anchor ([`Config::negative_anchors`]).
+pub type NegativeAnchors = Arc<dyn Fn(&LowerName) -> bool + Send + Sync>;
 
 /// How a recursive resolver behaves.
 ///
@@ -54,6 +57,13 @@ pub struct Config {
     ///
     /// [`Validation::NotPerformed`]: fictionet::stdlib::protocols::dns::dnssec::Validation::NotPerformed
     pub anchors: Option<Anchors>,
+    /// Negative trust anchors (RFC 7646), as Unbound's `domain-insecure`
+    /// sets them: `true` for a name at and below which no answer is
+    /// validated, so each is Insecure as though no trust anchor covered
+    /// it. World code: the resolver asks it about an answer's owner and
+    /// every name above, while it works, so it must return quickly, and
+    /// its answers may change as the world runs. `None` for none.
+    pub negative_anchors: Option<NegativeAnchors>,
     /// Which algorithms and digests may make an answer Secure (RFC 9904,
     /// RFC 9905).
     pub policy: AlgorithmPolicy,
@@ -219,6 +229,7 @@ impl Config {
             minimise: Some(Minimise::rfc9156()),
             case_randomise: false,
             anchors: Some(Anchors::iana_root()),
+            negative_anchors: None,
             policy: AlgorithmPolicy {
                 max_nsec3_iterations: 150,
                 ..AlgorithmPolicy::iana()

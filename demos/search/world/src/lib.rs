@@ -32,7 +32,7 @@ use fictionet::Cx;
 use fictionet::stdlib::protocols::dns::op::Message;
 use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RData};
 use fictionet::stdlib::services::dns::Event;
-use fictionet::stdlib::services::dns::resolver::Config;
+use fictionet::stdlib::services::dns::resolver::{Config, NegativeAnchors};
 use fictionet::stdlib::services::tls::ServerConfig;
 use fictionet::stdlib::web;
 use fictionet::stdlib::world::net::dns::encrypted::Fronts;
@@ -95,7 +95,8 @@ pub fn net(
     let handle = net.handle();
 
     let outbound = Outbound::new(pages.clone(), forwarded.keys().cloned());
-    let source = SessionSource::new(pages.clone(), forwarded.keys().cloned());
+    let source = Arc::new(SessionSource::new(pages.clone(), forwarded.keys().cloned()));
+    let negative_anchors: NegativeAnchors = Arc::new(source.negative_anchors());
     let resolver_ca = ca.clone();
     let sites = Arc::new(Sites {
         handle: handle.clone(),
@@ -159,8 +160,13 @@ pub fn net(
     ))
     .hosts(internet::public_resolvers(
         |resolver, host| {
-            let recursive = resolver
-                .recursive(&location, clock)
+            let config = Config {
+                negative_anchors: Some(negative_anchors.clone()),
+                ..resolver.config(&location)
+            };
+            // One engine and cache per sandbox, as `PublicResolver::recursive`.
+            let recursive = Recursive::new(config, clock)
+                .per_sandbox()
                 .namespace(&namespace)
                 .on_event(observe.clone());
             let (ca, served) = (resolver_ca.clone(), *resolver);
@@ -194,9 +200,12 @@ pub fn net(
         // name, and every name it serves is real, so the real
         // hierarchy answers for all of them. Only a Copied host its
         // capture gives no address answers here.
-        let config = Config::unbound()
-            .hints(&internet::root_hints())
-            .local(uncaptured.clone());
+        let config = Config {
+            negative_anchors: Some(negative_anchors.clone()),
+            ..Config::unbound()
+        }
+        .hints(&internet::root_hints())
+        .local(uncaptured.clone());
         host.program(
             Recursive::new(config, clock)
                 .namespace(&gateway_namespace)

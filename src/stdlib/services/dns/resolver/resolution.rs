@@ -26,7 +26,7 @@ use std::net::{IpAddr, SocketAddr};
 use fictionet::Entropy;
 use fictionet::stdlib::protocols::dns::dnssec::rdata::DNSSECRData;
 use fictionet::stdlib::protocols::dns::dnssec::{
-    Chain, Fetched, Link, Validation, Verify, proof, validate_denial, validate_rrset,
+    Chain, Fetched, Insecure, Link, Validation, Verify, proof, validate_denial, validate_rrset,
 };
 use fictionet::stdlib::protocols::dns::op::{
     Edns, Message, MessageType, OpCode, Query, ResponseCode,
@@ -1928,6 +1928,13 @@ impl<V: Verify> Resolver<V> {
         else {
             return CheckStart::Done(Validation::Indeterminate);
         };
+        if self.negative_anchor(&subject) {
+            // RFC 7646 §1.1: below a negative trust anchor nothing is
+            // validated, as though no trust anchor covered the name.
+            let validation = Validation::Insecure(Insecure::NoAnchor);
+            self.validated(&subject, &checked, &material, validation);
+            return CheckStart::Done(validation);
+        }
         // A check under way for the same subject is joined only when it
         // validates the same data: the same key may hold other records by
         // now, and the result of one says nothing of the other.
@@ -1986,6 +1993,34 @@ impl<V: Verify> Resolver<V> {
             },
             Some(_) => CheckStart::Waiting(id),
             None => CheckStart::Done(Validation::Indeterminate),
+        }
+    }
+
+    /// Whether a negative trust anchor covers `subject`: its name or a
+    /// name above it is one. A DS RRset belongs to the parent's side of
+    /// its name, so for DS the names from the parent up count.
+    fn negative_anchor(&self, subject: &Subject) -> bool {
+        let Some(anchors) = &self.config.negative_anchors else {
+            return false;
+        };
+        let key = match subject {
+            Subject::Rrset(key) | Subject::Denial(key, _) => key,
+        };
+        let mut name = key.name.clone();
+        if key.rtype == RecordType::DS {
+            if name.is_root() {
+                return false;
+            }
+            name = name.base_name();
+        }
+        loop {
+            if anchors(&name) {
+                return true;
+            }
+            if name.is_root() {
+                return false;
+            }
+            name = name.base_name();
         }
     }
 

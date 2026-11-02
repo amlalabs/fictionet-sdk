@@ -42,7 +42,7 @@ mod verify;
 pub use algorithm::{Algorithm, DigestType};
 pub use anchor::{Anchors, TrustAnchor};
 pub use keys::{KeyError, KeyFlags, KeySet, Sign, ZoneKey, ds, key_tag};
-pub use policy::AlgorithmPolicy;
+pub use policy::{AlgorithmPolicy, Treatment};
 pub use proof::Proof;
 pub use sign::{Window, sign};
 pub use validate::{

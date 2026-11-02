@@ -37,8 +37,8 @@ use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::protocols::dns::dnssec::rdata::{DNSKEY, DNSSECRData, DS};
 use fictionet::stdlib::protocols::dns::dnssec::{
     AlgorithmPolicy, Anchors, Chain, DigestType, Fetched, Insecure, KeyFlags, KeySet, Link,
-    PublicKey, PublicKeyBuf, Ring, Sign, Validation, Verify, Window, ZoneKey, ds, key_tag,
-    validate_denial, validate_rrset,
+    PublicKey, PublicKeyBuf, Ring, Sign, Treatment, Validation, Verify, Window, ZoneKey, ds,
+    key_tag, validate_denial, validate_rrset,
 };
 use fictionet::stdlib::protocols::dns::op::{
     Edns, Header, Message, MessageType, OpCode, Query, ResponseCode,
@@ -1530,7 +1530,14 @@ fn partial_answers() {
 // policy.json: AlgorithmPolicy
 // ---------------------------------------------------------------------
 
+/// The policy a vector names: `"iana"` for the Lean model's `Policy.iana`,
+/// which is Rust's [`AlgorithmPolicy::iana`], so every case under it holds
+/// the policy Rust ships to the one the theorems are about; otherwise the
+/// lists it gives.
 fn vector_policy(value: &Value) -> AlgorithmPolicy {
+    if value.as_str() == Some("iana") {
+        return AlgorithmPolicy::iana();
+    }
     let set = |key: &str| -> BTreeSet<u8> {
         list(value, key)
             .iter()
@@ -1552,16 +1559,10 @@ fn policy() {
         let algorithm = number(input, "algorithm") as u8;
         let digest = number(input, "digest") as u8;
         let policy = vector_policy(field(input, "policy"));
-        // A DS record of this algorithm and digest type is usable exactly
-        // when the policy validates the one and accepts the other; one
-        // that is not counts as unsupported for its algorithm first
-        // (RFC 4035 §5.2, RFC 9905 §2).
-        let rust = if !policy.validates(algorithm) {
-            "unsupported_algorithm"
-        } else if !policy.accepts_digest(digest) {
-            "unsupported_digest"
-        } else {
-            "supported"
+        let rust = match policy.treat(algorithm, digest) {
+            Treatment::Supported => "supported",
+            Treatment::UnsupportedAlgorithm => "unsupported_algorithm",
+            Treatment::UnsupportedDigest => "unsupported_digest",
         };
         same(
             "treatment",

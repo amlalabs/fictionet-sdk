@@ -21,7 +21,7 @@
 use std::time::SystemTime;
 
 use super::keys::{KeyFlags, digest_of, key_tag};
-use super::policy::AlgorithmPolicy;
+use super::policy::{AlgorithmPolicy, Treatment};
 use super::proof::{self, Proof};
 use super::rdata::{DNSKEY, DNSSECRData, DS};
 use super::sign::serial;
@@ -396,10 +396,14 @@ impl<V: Verify> Check<'_, V> {
     fn dnskeys(&self, link: &Link, ds: &[DS]) -> Result<Vec<DNSKEY>, Validation> {
         let usable = self.policy.usable_ds(ds);
         if usable.is_empty() {
-            let algorithm = ds
-                .iter()
-                .any(|ds| self.policy.validates(u8::from(ds.algorithm())));
-            return Err(Validation::Insecure(if algorithm {
+            // Every record is unsupported: for its digest when any has an
+            // algorithm the policy validates, else for its algorithm.
+            let digest = ds.iter().any(|ds| {
+                self.policy
+                    .treat(u8::from(ds.algorithm()), u8::from(ds.digest_type()))
+                    == Treatment::UnsupportedDigest
+            });
+            return Err(Validation::Insecure(if digest {
                 Insecure::UnsupportedDigest
             } else {
                 Insecure::UnsupportedAlgorithm
