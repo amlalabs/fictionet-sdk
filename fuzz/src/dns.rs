@@ -1,6 +1,131 @@
-//! Value comparisons for hickory's DNS writer and parser.
+//! Value comparisons for hickory's DNS writer and parser, and the checks
+//! of `Request::parse` and `fit`.
 
+use fictionet::stdlib::protocols::dns::dnssec::rdata::DNSSECRData;
+use fictionet::stdlib::protocols::dns::op::{MessageType, OpCode, ResponseCode};
+use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, RData, Record, RecordType};
+use fictionet::stdlib::protocols::dns::{Limit, Parsed, Request, Response, fit};
 use fictionet::stdlib::protocols::dns::{ProtoError, op::Message};
+use fictionet::stdlib::services::serve::Transport;
+
+/// Parses `data` as a query over UDP and over TCP. Each gives exactly one
+/// outcome, and the outcome agrees with the bytes: silence only for a
+/// short message or a response, a rejection that is a response with the
+/// query's ID and an error code and that writes and reads back, or a
+/// QUERY request with one question whose octets are the ones received.
+pub fn parse_request(data: &[u8]) {
+    let query = data.len() >= 12 && data[2] & 0x80 == 0;
+    for transport in [Transport::Udp, Transport::Tcp] {
+        match Request::parse(data, transport) {
+            Parsed::Silent => assert!(!query, "a query got silence"),
+            Parsed::Reject(reply) => {
+                assert!(query, "a short message or a response got a reply");
+                assert_eq!(reply.metadata.id, u16::from_be_bytes([data[0], data[1]]));
+                assert_eq!(reply.metadata.message_type, MessageType::Response);
+                assert_ne!(reply.metadata.response_code, ResponseCode::NoError);
+                let bytes = reply.to_vec().expect("a rejection writes");
+                Message::from_vec(&bytes).expect("a written rejection parses");
+            }
+            Parsed::Request(request) => {
+                assert!(query, "a short message or a response became a request");
+                assert_eq!(request.transport, transport);
+                assert_eq!(request.message.metadata.op_code, OpCode::Query);
+                assert_eq!(request.message.queries, [request.question.clone()]);
+                let end = 12 + request.question_bytes.len();
+                assert_eq!(data[12..end], request.question_bytes);
+                assert!(request.edns.is_none_or(|edns| edns.version == 0));
+            }
+        }
+    }
+}
+
+/// Writes the message in `data[4..]`, if it parses, with `fit`. The first
+/// byte picks the limit, the next two an EDNS payload, and the fourth how
+/// many additional RRsets are required. The output stays within the
+/// limit, parses back, keeps every RRset whole, and holds everything
+/// required unless it is truncated.
+pub fn fit_reply(data: &[u8]) {
+    let Some((&[kind, high, low, required], rest)) = data.split_first_chunk::<4>() else {
+        return;
+    };
+    let Ok(message) = Message::from_vec(rest) else {
+        return;
+    };
+    let limit = match kind % 3 {
+        0 => Limit::Udp512,
+        1 => Limit::UdpEdns(u16::from_be_bytes([high, low])),
+        _ => Limit::Stream,
+    };
+    let response = Response {
+        message,
+        required_additional: usize::from(required),
+    };
+    let fitted = fit(&response, limit).expect("hickory writes every record it parsed");
+    assert!(
+        fitted.bytes.len() <= limit.octets(),
+        "fit exceeded its limit"
+    );
+    let back = Message::from_vec(&fitted.bytes).expect("a fitted reply parses");
+    let message = &response.message;
+    assert_eq!(back.metadata.id, message.metadata.id);
+    assert_eq!(
+        back.metadata.truncation,
+        fitted.truncated || message.metadata.truncation
+    );
+    assert_eq!(
+        back.edns.is_some(),
+        message.edns.is_some(),
+        "the OPT record was lost"
+    );
+    for (written, original) in [
+        (&back.answers, &message.answers),
+        (&back.authorities, &message.authorities),
+        (&back.additionals, &message.additionals),
+    ] {
+        for (at, record) in written.iter().enumerate() {
+            let key = rrset(record);
+            let count = written.iter().filter(|r| rrset(r) == key).count();
+            assert_eq!(
+                count,
+                original.iter().filter(|r| rrset(r) == key).count(),
+                "an RRset was split"
+            );
+            let first = written.iter().position(|r| rrset(r) == key).unwrap();
+            if at == first {
+                assert!(
+                    written[at..at + count].iter().all(|r| rrset(r) == key),
+                    "an RRset's records are not together"
+                );
+            }
+        }
+    }
+    if !fitted.truncated {
+        assert_eq!(back.queries, message.queries);
+        for (written, original) in [
+            (&back.answers, &message.answers),
+            (&back.authorities, &message.authorities),
+        ] {
+            assert_eq!(written.len(), original.len(), "a record was lost");
+            for record in original {
+                assert_eq!(
+                    written.iter().filter(|r| *r == record).count(),
+                    original.iter().filter(|r| *r == record).count(),
+                    "a record changed"
+                );
+            }
+        }
+    }
+}
+
+/// The RRset a record belongs to: its owner, its class, and its type, or
+/// for an RRSIG the type it covers.
+fn rrset(record: &Record) -> (LowerName, DNSClass, RecordType) {
+    let kind = match &record.data {
+        RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) => rrsig.input().type_covered,
+        _ => record.record_type(),
+    };
+    (LowerName::new(&record.name), record.dns_class, kind)
+}
 
 /// Checks a parsed message's write/reparse using hickory's value equality.
 /// Only questions exceeding the DNS size limit may prevent serialization.
