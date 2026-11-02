@@ -1,4 +1,5 @@
-//! Host HTTP transport and optional guest-only raw Ethernet I/O.
+//! Host HTTP and DNS transports and optional guest-only raw Ethernet I/O.
+//! [`dns::Live`] puts a world's DNS questions to real servers.
 //!
 //! The `virtio-net` feature adds a polling VFIO driver for a dedicated modern
 //! virtio network device in an explicitly opted-in QEMU guest.
@@ -17,3 +18,6 @@ fictionet::cfg_web_proxy! {
     mod client;
     pub use client::Client;
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod dns;
