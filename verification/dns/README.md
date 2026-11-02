@@ -90,7 +90,7 @@ names.
 `resolver` compares what the Lean resolver and the Rust one share. The Lean
 model has no priming, no retransmission, and no failure cache, so a loss
 script does not line up query for query. Every server has an address of its
-own. The test checks four things. With work to spare, every Rust answer is
+own. The test checks five things. With work to spare, every Rust answer is
 the hierarchy's answer (Lean's `Resolver.spec`, computed from
 `zone::answer` over the zones), and equals every Lean answer that is not
 SERVFAIL, which `resolve_correct` says is the hierarchy's answer too. With
@@ -101,7 +101,11 @@ cache is in the Rust cache at the same rank or higher. With the vector's
 `dead` servers never answering and work to spare, the Rust answers equal
 Lean's `dead_answers`, SERVFAILs included: Lean drops a server at its first
 loss and Rust after three tries (RFC 9520 §3.1), so both answer exactly
-when every zone on the way has a server left. AA and the additional section
+when every zone on the way has a server left. Under the vector's loss script
+with work to spare, Lean's `lossy_answers` say, for each question, the answer
+and the servers its losses made it give up on; with those servers silent for
+that question, the Rust answers equal Lean's, SERVFAILs included, for the
+same reason. AA and the additional section
 are left out of answers: a resolver clears AA and, like Unbound with
 `minimal-responses: yes`, sends no additional data.
 

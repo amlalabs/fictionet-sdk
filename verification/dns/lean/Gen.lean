@@ -1003,6 +1003,25 @@ def runDead (net : Net) (cfg : Config) (dead : List Name) : State → List Reque
     | some (r, st') => some r :: runDead net cfg dead st' qs
     | none => [none]
 
+/-- Feeds the resolver's sends to the network, one loss decision each from the script, until it answers, and
+gathers the servers it gave up on because a query to them was lost. -/
+def driveLossy (net : Net) :
+    Nat → State × List Resolver.Out → List Bool → List Name → Option (Response × State × List Bool × List Name)
+  | _, (st, [.answer r]), ls, gone => some (r, st, ls, gone)
+  | fuel + 1, (st, [.send s c q]), ls, gone =>
+    let lost := ls.headD false
+    driveLossy net fuel (step st (deliver net .all c q lost)) ls.tail (if lost then s :: gone else gone)
+  | _, _, _, _ => none
+
+/-- Several questions in turn, sharing the cache and one loss script, each with its answer and the servers the
+script's losses made it give up on. -/
+def runLossy (net : Net) (cfg : Config) : State → List Request → List Bool → List (Option (Response × List Name))
+  | _, [], _ => []
+  | st, q :: qs, ls =>
+    match driveLossy net (cfg.work + 1) (start cfg st q) ls [] with
+    | some (r, st', ls', gone) => some (r, gone) :: runLossy net cfg st' qs ls'
+    | none => [none]
+
 /-- A root zone delegating `test.` and `example.`; `example.` delegating `sub.example.`; each zone with a few
 names. Some zones may have no servers, and the root may have one or two. -/
 def resolverCase : G String := do
@@ -1040,6 +1059,11 @@ def resolverCase : G String := do
   let servers : List Name := rootNs ++ testNs ++ [lb "ns1" :: ex, lb "ns" :: sub]
   let dead ← servers.filterM fun _ => chance 3
   let deadAnswers := runDead net ⟨rootNs, 64⟩ dead ⟨[], none⟩ qs
+  -- The loss script with work to spare: each answer, and the servers its losses made the question give up on.
+  let lossy := runLossy net ⟨rootNs, 64⟩ ⟨[], none⟩ qs losses
+  let lossyJson : Option (Response × List Name) → String
+    | some (r, gone) => jobj [("response", responseJson r), ("gone", jarr (gone.map (jstr ∘ nameStr)))]
+    | none => "null"
   return jobj [("input", jobj [("zones", jarr (specs.map specJson)), ("hints", jarr (rootNs.map (jstr ∘ nameStr))),
       ("work", jnat cfg.work), ("any", jstr "all"),
       ("questions", jarr (qs.map fun q =>
@@ -1047,6 +1071,7 @@ def resolverCase : G String := do
       ("losses", jarr (losses.map jbool)), ("dead", jarr (dead.map (jstr ∘ nameStr)))]),
     ("expected", jobj [("answers", jarr (answers.map fun a => (a.map responseJson).getD "null")),
       ("dead_answers", jarr (deadAnswers.map fun a => (a.map responseJson).getD "null")),
+      ("lossy_answers", jarr (lossy.map lossyJson)),
       ("cache", jarr (final.cache.map itemJson))])]
 
 end ResolverVectors

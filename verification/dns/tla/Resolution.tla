@@ -29,9 +29,10 @@
 (* it does not advance while a reply is in flight, since simulated round   *)
 (* trips are far shorter than a TTL second.                                *)
 (*                                                                         *)
-(* Ablation flags: CheckBailiwick, BoundWork, CacheTc, CheckExpiry, and    *)
-(* FailureAsNegative. Each is the rule as the design states it when TRUE   *)
-(* (FALSE for CacheTc and FailureAsNegative).                              *)
+(* Ablation flags: CheckBailiwick, BoundWork, CacheTc, CheckExpiry,        *)
+(* FailureAsNegative, and CacheBounded. Each is the rule as the design     *)
+(* states it when TRUE (FALSE for CacheTc, FailureAsNegative, and          *)
+(* CacheBounded).                                                          *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets, Sequences, TLC
 
@@ -50,6 +51,7 @@ CONSTANTS
     CacheTc,           \* ablation: a truncated reply is cached
     CheckExpiry,       \* entries are never used at or after their expiry
     FailureAsNegative, \* ablation: a failure is cached as NXDOMAIN
+    CacheBounded,      \* ablation: a failure the work bound caused is cached
     None               \* a model value for "nothing here"
 
 -----------------------------------------------------------------------------
@@ -157,10 +159,11 @@ vars == <<now, ver, editAt, cache, known, res, waiting, asked, ans, net, lost, t
 
 \* A cache entry. rank is "auth" or "glue" (RFC 2181 section 5.4.1); from is
 \* the zone of the server that sent it; tc says it came from a truncated
-\* reply; failure says it was written for a failed resolution.
+\* reply; failure says it was written for a failed resolution, and bounded
+\* that the work bound caused the failure.
 Entry(t, val, ttl, rank, from, tc, failure) ==
     [t |-> t, val |-> val, ttl |-> ttl, readAt |-> now, rank |-> rank, from |-> from,
-     tc |-> tc, failure |-> failure]
+     tc |-> tc, failure |-> failure, bounded |-> FALSE]
 
 Usable(e) ==
     /\ e # None
@@ -238,14 +241,24 @@ Finish(q, rcode, recs) ==
     /\ res' = [res EXCEPT ![q] = None]
     /\ waiting' = [waiting EXCEPT ![q] = {}]
 
-(* The resolution fails: every server was tried, or the work bound was    *)
-(* reached. The failure is cached for failure_ttl (RFC 9520).             *)
+(* The resolution fails: every server was tried. The failure is cached for  *)
+(* failure_ttl (RFC 9520).                                                 *)
 Fail(q) ==
     LET r == res[q]
         e == Entry(IF FailureAsNegative THEN "nx" ELSE "fail", None, FailureTtl, "auth",
                    r.zone, FALSE, TRUE)
     IN  /\ cache' = [cache EXCEPT ![r.qn] = e]
         /\ Finish(q, Rcode(e.t), {Used(r.qn, e)})
+
+(* The resolution reached the work bound: SERVFAIL. The bound is one        *)
+(* question's budget and says nothing of the servers, so the failure is not *)
+(* cached for other clients, as Resolution::send leaves it out of the cache  *)
+(* (RFC 9520 section 3.2).                                                 *)
+FailBounded(q) ==
+    LET r == res[q]
+        e == [Entry("fail", None, FailureTtl, "auth", r.zone, FALSE, TRUE) EXCEPT !.bounded = TRUE]
+    IN  /\ cache' = IF CacheBounded THEN [cache EXCEPT ![r.qn] = e] ELSE cache
+        /\ Finish(q, "SERVFAIL", {})
 
 \* A record is live while its TTL has not run out.
 Live(u) == now < u.readAt + u.ttl
@@ -281,7 +294,7 @@ Advance(q) ==
                   /\ UNCHANGED <<cache, waiting, ans, net>>
        \/ /\ ~Usable(e)
           /\ IF BoundWork /\ r.work >= MaxWork
-             THEN Fail(q) /\ UNCHANGED net
+             THEN FailBounded(q) /\ UNCHANGED net
              ELSE IF \A s \in ServersOf(r.zone) : <<s, FALSE>> \in r.tried
              THEN Fail(q) /\ UNCHANGED net
              ELSE \E s \in ServersOf(r.zone) :
@@ -483,6 +496,11 @@ TcNotCached ==
 (* A failure never answers NXDOMAIN or NODATA (RFC 9520). *)
 FailureNeverNegative ==
     \A a \in Answers : a.rcode \in {"NXDOMAIN", "NODATA"} => \A u \in a.recs : ~u.failure
+
+(* A failure the work bound caused is never cached, so one question's       *)
+(* spent budget never answers SERVFAIL to another client.                   *)
+BoundedNotCached ==
+    \A n \in CacheNames : cache[n] # None => ~cache[n].bounded
 
 (* Each resolution stays within its work and chain bounds. *)
 WorkBounded ==
