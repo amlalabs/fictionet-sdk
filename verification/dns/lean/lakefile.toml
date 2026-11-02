@@ -1,0 +1,10 @@
+name = "dns_verification"
+version = "0.1.0"
+defaultTargets = ["Dns", "gen"]
+
+[[lean_lib]]
+name = "Dns"
+
+[[lean_exe]]
+name = "gen"
+root = "Gen"
