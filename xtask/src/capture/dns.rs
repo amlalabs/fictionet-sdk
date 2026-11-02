@@ -45,10 +45,6 @@ use crate::Result;
 /// (RFC 9460).
 const TYPES: [RecordType; 3] = [RecordType::A, RecordType::AAAA, RecordType::HTTPS];
 
-/// The NTP server Search's guests set their clocks from
-/// (`demos/search/world/src/ntp.rs`).
-const NTP: &str = "ntp.ubuntu.com";
-
 /// How many client questions the walk keeps open at once, so the host is
 /// not asked to hold a socket for every question of a large corpus.
 const WINDOW: usize = 64;
@@ -74,7 +70,7 @@ pub async fn record(root: &Path) -> Result {
     .map(Provider::host)
     .into_iter()
     .chain([Login::Claude, Login::Codex].map(Login::host))
-    .chain([NTP])
+    .chain([web_world::ntp::HOST])
     .map(fqdn)
     .collect::<Result<BTreeSet<_>>>()?;
     let mut names = hosts

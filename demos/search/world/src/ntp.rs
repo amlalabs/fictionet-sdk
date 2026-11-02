@@ -11,7 +11,7 @@ use fictionet::stdlib::world::net::Host;
 use crate::pages::Pages;
 
 /// The name Ubuntu's clock asks for the time.
-pub(crate) const HOST: &str = "ntp.ubuntu.com";
+pub const HOST: &str = "ntp.ubuntu.com";
 
 /// The time server, answering on UDP port 123 with the time
 /// [`Pages::session_now`] gives.
