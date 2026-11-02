@@ -29,7 +29,9 @@
 (* The provider (Complete, Lazy, Relayed) and the signer implementation    *)
 (* (A or B) produce the same records by contract; the validator must not   *)
 (* see them. RecordsOnly is checked by self-composition: two copies of the *)
-(* validator get equal records from different providers and signers.       *)
+(* validator, each with its own provider and signer, get records of their  *)
+(* own, which differ where the second copy's changed2 differs, and must    *)
+(* agree whenever their records are equal.                                 *)
 (*                                                                         *)
 (* Ablation flags: PolicyAlgs is the policy value (adding "sha1" accepts   *)
 (* algorithm 5), TrustUpstreamAd copies an upstream AD bit,                *)
@@ -56,10 +58,11 @@ VARIABLES
     anchor, signer, proof, window, alg, changed, clock, reach,
     do, adq, cd, upstreamAd,       \* the query's DO, AD, and CD bits; the upstream reply's AD bit
     cached,                        \* the answer comes from the cache, validated by an earlier query
-    provider1, impl1, provider2, impl2
+    provider1, impl1, provider2, impl2,
+    changed2                       \* what changed after signing in the second copy's records
 
 vars == <<anchor, signer, proof, window, alg, changed, clock, reach, do, adq, cd, upstreamAd,
-          cached, provider1, impl1, provider2, impl2>>
+          cached, provider1, impl1, provider2, impl2, changed2>>
 
 Init ==
     /\ anchor \in AnchorChoices
@@ -74,6 +77,7 @@ Init ==
     /\ cached \in BOOLEAN
     /\ provider1 \in ProviderChoices /\ impl1 \in ImplChoices
     /\ provider2 \in ProviderChoices /\ impl2 \in ImplChoices
+    /\ changed2 \in [Zones -> ChangedChoices]
 
 Next == UNCHANGED vars
 Spec == Init /\ [][Next]_vars
@@ -84,9 +88,10 @@ Spec == Init /\ [][Next]_vars
 (* signer_agnostic); the faults are what the validator's fetches and clock *)
 (* see.                                                                    *)
 
-Records(provider, impl) ==
+\* The records copy `run` of the validator gets.
+Records(run) ==
     [anchor |-> anchor, signer |-> signer, proof |-> proof, window |-> window, alg |-> alg,
-     changed |-> changed, clock |-> clock, reach |-> reach]
+     changed |-> IF run = 1 THEN changed ELSE changed2, clock |-> clock, reach |-> reach]
 
 V(kind, why) == [kind |-> kind, why |-> why]
 
@@ -120,8 +125,8 @@ Validate(r, impl) ==
     ELSE IF r.anchor = "elsewhere" THEN V("Insecure", "NoAnchor")
     ELSE Walk(r, impl, 1, r.anchor)
 
-Result == Validate(Records(provider1, impl1), impl1)
-Result2 == Validate(Records(provider2, impl2), impl2)
+Result == Validate(Records(1), impl1)
+Result2 == Validate(Records(2), impl2)
 
 (* What the resolver established for the answer it renders. With CD the    *)
 (* client checks signatures itself, so the resolver does not validate a    *)
@@ -198,7 +203,7 @@ Sha1Insecure ==
 (* Two validators fed equal records from different providers and signers   *)
 (* reach the same result.                                                 *)
 RecordsOnly ==
-    Records(provider1, impl1) = Records(provider2, impl2) => Result = Result2
+    Records(1) = Records(2) => Result = Result2
 
 (* check_chain over complete zones at build time, with each problem it      *)
 (* reports. An RRset changed after signing is SignatureInvalid.            *)

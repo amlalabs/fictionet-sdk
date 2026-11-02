@@ -364,8 +364,16 @@ def noDsProof (P : AlgorithmPolicy) (c : Name) (ps : List Payload) : Option Inse
   else if optOut3 (S := S) (nsec3s ps) c then some .optOutCovered
   else none
 
-/-- What verified denial records prove for a negative answer to `q`. -/
-def denialResult (P : AlgorithmPolicy) (q : Request) (rc : Rcode) (ps : List Payload) : Validation :=
+/-- Why the first denial record whose RRSIGs do not verify under the zone's keys fails, when one does not. -/
+def denialFailure (P : AlgorithmPolicy) (t : Nat) (apex : Name) (keys : List Key) (ds : List (Signed S)) :
+    Option Ede :=
+  (ds.find? fun d => !d.sigs.any (verifies P t apex keys fun _ => some d.data)).map fun d =>
+    failure t (d.sigs.filter (usable P apex keys))
+
+/-- What verified denial records prove for a negative answer to `q`. A proof that fails is Bogus for why a denial
+record failed, `fail`, or for the missing denial when every record verified. -/
+def denialResult (P : AlgorithmPolicy) (q : Request) (rc : Rcode) (ps : List Payload) (fail : Option Ede) :
+    Validation :=
   let rs := nsecs ps
   let rs3 := nsec3s ps
   if rc = .nxdomain then
@@ -374,14 +382,14 @@ def denialResult (P : AlgorithmPolicy) (q : Request) (rc : Rcode) (ps : List Pay
     else match nx3 (S := S) rs3 q.qname with
       | some false => .secure
       | some true => .insecure .optOutCovered
-      | none => .bogus .nsecMissing
+      | none => .bogus (fail.getD .nsecMissing)
   else
     if nodata rs q.qname q.qtype then .secure
     else if rs3.any (fun r => P.maxIterations < r.iterations) then .insecure .nsec3Iterations
     else match nodata3 (S := S) rs3 q.qname q.qtype with
       | some false => .secure
       | some true => .insecure .optOutCovered
-      | none => .bogus .nsecMissing
+      | none => .bogus (fail.getD .nsecMissing)
 
 /-- What the denial records prove about a wildcard expansion of `owner` from an RRSIG with `labels` labels.
 `some false`: no closer name exists, by an NSEC covering `owner` or an ordinary NSEC3 covering the next closer
@@ -476,7 +484,7 @@ def linkStep (P : AlgorithmPolicy) (t : Nat) (owner papex : Name) (pkeys : List 
     | some (.noDs ds) =>
       match noDsProof (S := S) P l.apex (verified P t papex pkeys ds) with
       | some why => .error (.insecure why)
-      | none => .error (.bogus .nsecMissing)
+      | none => .error (.bogus ((denialFailure P t papex pkeys ds).getD .nsecMissing))
     | some (.ds sd) =>
       match dsStep P t papex pkeys l.apex sd with
       | .ok dss => keyStep P t l.apex dss l.keys
@@ -538,9 +546,14 @@ def validateRrset (A : Option (List Anchor)) (P : AlgorithmPolicy) (t : Nat) (C 
     | .trusted apex keys => rrsetResult P t apex keys set sigs ds
 
 /-- The name whose chain proves an answer about `q`: the name itself, or for a DS question, whose answer the
-parent zone holds, the name above it (RFC 4035 §2.4). `none` for the root's DS, which no zone holds. -/
+parent zone holds, the name above it (RFC 4035 §2.4). The root has no parent, so the root zone answers its own
+DS question. -/
 def chainName (q : Request) : Option Name :=
-  if q.qtype = 43 then (if q.qname = [] then none else some (q.qname.drop 1)) else some q.qname
+  if q.qtype = 43 ∧ q.qname ≠ [] then some (q.qname.drop 1) else some q.qname
+
+/-- The links of `C` whose zone holds `n`, at or above it. The chain of a DS question reaches the child below the
+name its answer is about too, and the child proves nothing about it. -/
+def holding (n : Name) (C : Chain S) : Chain S := C.filter fun l => under n l.apex
 
 /-- `validate_denial`: a negative answer to `q` with RCODE `rc` and the denial records of its authority
 section. -/
@@ -552,9 +565,10 @@ def validateDenial (A : Option (List Anchor)) (P : AlgorithmPolicy) (t : Nat) (C
     match chainName q with
     | none => .insecure .noAnchor
     | some n =>
-      match walk A P t n C with
+      match walk A P t n (holding n C) with
       | .stop v => v
-      | .trusted apex keys => denialResult (S := S) P q rc (verified P t apex keys ds)
+      | .trusted apex keys =>
+        denialResult (S := S) P q rc (verified P t apex keys ds) (denialFailure P t apex keys ds)
 
 /-! ## The canonical order -/
 
@@ -2067,7 +2081,7 @@ theorem cover_knows {look : Name → Fact Node} {apex : Name} {denial : Denial} 
 
 theorem denial_secure_nx {A : List Anchor} {P : AlgorithmPolicy} {t : Nat} {C : Chain S} {q : Request}
     {ds : List (Signed S)} (h : validateDenial (some A) P t C q .nxdomain ds = .secure) :
-    ∃ n apex keys, chainName q = some n ∧ walk A P t n C = .trusted apex keys ∧
+    ∃ n apex keys, chainName q = some n ∧ walk A P t n (holding n C) = .trusted apex keys ∧
       (nx (nsecs (verified P t apex keys ds)) q.qname = true ∨
         ∃ ce, closest3 (S := S) (nsec3s (verified P t apex keys ds)) q.qname = some ce ∧
           ∃ r ∈ nsec3s (verified P t apex keys ds),
@@ -2112,7 +2126,7 @@ theorem denial_secure_nx {A : List Anchor} {P : AlgorithmPolicy} {t : Nat} {C : 
 unsigned delegation may exist there (RFC 5155 §6, §9.2). -/
 theorem optout_never_secure_denial {A : List Anchor} {P : AlgorithmPolicy} {t : Nat} {C : Chain S} {q : Request}
     {ds : List (Signed S)} {n apex : Name} {keys : List Key} (hc : chainName q = some n)
-    (hw : walk A P t n C = .trusted apex keys)
+    (hw : walk A P t n (holding n C) = .trusted apex keys)
     (hn : nx (nsecs (verified P t apex keys ds)) q.qname = false)
     (ho : ∀ ce, closest3 (S := S) (nsec3s (verified P t apex keys ds)) q.qname = some ce →
       ∀ r ∈ nsec3s (verified P t apex keys ds), covers3 r.hash r.next (S.hash (nextCloser q.qname ce)) = true →

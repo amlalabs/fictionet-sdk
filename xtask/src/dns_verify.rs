@@ -6,15 +6,15 @@
 //! | --- | --- |
 //! | `dns-verify tlc [spec] [config]` | TLC once per property of each config, checking that each ablation fails with exactly the violation its config expects |
 //! | `dns-verify lean` | `lake build`, then the axioms of every headline theorem |
-//! | `dns-verify vectors [seed]` | the Lean model's test vectors, from `seed` (1 when left out) |
-//! | `dns-verify diff [seed]` | the vectors, then `tests/dns_vectors.rs` against them |
+//! | `dns-verify vectors [seed]` | the Lean model's test vectors, from `seed`, or from each of seeds 1 to 8 when left out |
+//! | `dns-verify diff [seed]` | the vectors, then `tests/dns_vectors.rs` against them, for each seed |
 //! | `dns-verify all` | all four, with a summary in `SUMMARY.txt` |
 //!
 //! Everything is written under `dns-verify/` in Cargo's target directory
 //! (`CARGO_TARGET_DIR`, or `target/`): TLC's output in `tlc/`, Lean's in
-//! `lean/`, the vectors in `vectors/`, and the differential test's output
-//! in `diff.out`. The vectors are made again on every run and never
-//! committed.
+//! `lean/`, the vectors of each seed in `vectors/<seed>/`, and the
+//! differential test's output in `diff-<seed>.out`. The vectors are made
+//! again on every run and never committed.
 //!
 //! TLC runs as `$JAVA -Xmx6g -cp $TLA2TOOLS tlc2.TLC`. `TLA2TOOLS` names
 //! `tla2tools.jar`, and `JAVA` a Java 11 or later (`java` when unset). Lake
@@ -31,8 +31,10 @@ use crate::Result;
 /// The axioms a headline theorem may rest on: Lean's own, and no `sorryAx`.
 const STANDARD_AXIOMS: [&str; 3] = ["propext", "Quot.sound", "Classical.choice"];
 
-/// The seed of the vectors when none is given.
-const DEFAULT_SEED: u64 = 1;
+/// The seeds of the vectors when none is given. The generator draws other
+/// zones, messages, and caches from each seed, so several seeds reach
+/// cases one seed misses.
+const SEEDS: std::ops::RangeInclusive<u64> = 1..=8;
 
 /// Runs `dns-verify` with the arguments after it.
 pub fn run(args: &[String]) -> Result {
@@ -50,12 +52,15 @@ pub fn run(args: &[String]) -> Result {
             report.result()
         }
         ["vectors", seed @ ..] if seed.len() <= 1 => {
-            let report = vectors(&paths, seed_of(seed)?)?;
+            let mut report = Report::new("vectors");
+            for seed in seeds_of(seed)? {
+                report.absorb(vectors(&paths, seed)?);
+            }
             report.print();
             report.result()
         }
         ["diff", seed @ ..] if seed.len() <= 1 => {
-            let report = diff(&paths, seed_of(seed)?)?;
+            let report = diff(&paths, &seeds_of(seed)?)?;
             report.print();
             report.result()
         }
@@ -67,12 +72,15 @@ pub fn run(args: &[String]) -> Result {
     }
 }
 
-fn seed_of(args: &[&str]) -> Result<u64> {
+/// The seed given, or [`SEEDS`].
+fn seeds_of(args: &[&str]) -> Result<Vec<u64>> {
     match args.first() {
-        Some(seed) => Ok(seed
-            .parse()
-            .map_err(|_| format!("the seed must be a number, not {seed}"))?),
-        None => Ok(DEFAULT_SEED),
+        Some(seed) => {
+            Ok(vec![seed.parse().map_err(|_| {
+                format!("the seed must be a number, not {seed}")
+            })?])
+        }
+        None => Ok(SEEDS.collect()),
     }
 }
 
@@ -152,6 +160,13 @@ impl Report {
             println!("{line}");
         }
         println!("{}", self.heading());
+    }
+
+    /// Takes in the lines and failures of `other`, another run of the
+    /// same step.
+    fn absorb(&mut self, other: Report) {
+        self.lines.extend(other.lines);
+        self.failures += other.failures;
     }
 
     fn result(&self) -> Result {
@@ -514,70 +529,80 @@ fn lean(paths: &Paths) -> Result<Report> {
 // Vectors and the differential test
 // ---------------------------------------------------------------------
 
-fn vectors_dir(paths: &Paths) -> PathBuf {
-    paths.out.join("vectors")
+fn vectors_dir(paths: &Paths, seed: u64) -> PathBuf {
+    paths.out.join("vectors").join(seed.to_string())
 }
 
-/// `lake exe gen` into `vectors/`, emptied first so no file of an older
-/// run is left.
+/// `lake exe gen` into `vectors/<seed>/`, emptied first so no file of an
+/// older run is left.
 fn vectors(paths: &Paths, seed: u64) -> Result<Report> {
-    let dir = vectors_dir(paths);
+    let dir = vectors_dir(paths, seed);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
     let mut report = Report::new("vectors");
+    let log = format!("gen-{seed}.out");
     let (text, made) = logged(
         lake()
             .args(["exe", "gen"])
             .arg(&dir)
             .arg(seed.to_string())
             .current_dir(&paths.lean),
-        &paths.out.join("lean").join("gen.out"),
+        &paths.out.join("lean").join(&log),
     )?;
     if made {
         let files: Vec<&str> = text.lines().filter(|l| l.contains(".json")).collect();
         report.pass(format!("seed {seed}: {}", files.join(", ")));
     } else {
-        report.fail("lake exe gen; see lean/gen.out".to_string());
+        report.fail(format!("seed {seed}: lake exe gen; see lean/{log}"));
     }
     Ok(report)
 }
 
-/// The vectors, then `cargo test --test dns_vectors` with `DNS_VECTORS`
-/// naming them. Each kind's line of the test's output goes in the report.
-fn diff(paths: &Paths, seed: u64) -> Result<Report> {
-    let made = vectors(paths, seed)?;
+/// For each of `seeds`, the vectors, then `cargo test --test dns_vectors`
+/// with `DNS_VECTORS` naming them. Each kind's line of the test's output
+/// goes in the report, after its seed.
+fn diff(paths: &Paths, seeds: &[u64]) -> Result<Report> {
     let mut report = Report::new("diff");
-    for line in made.lines {
-        report.lines.push(format!("vectors: {line}"));
-    }
-    if made.failures > 0 {
-        report.failures += made.failures;
-        return Ok(report);
-    }
-    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let (text, passed) = logged(
-        Command::new(cargo)
-            .args(["test", "--test", "dns_vectors", "--", "--nocapture"])
-            .env("DNS_VECTORS", vectors_dir(paths))
-            .current_dir(&paths.root),
-        &paths.out.join("diff.out"),
-    )?;
-    let kinds: Vec<&str> = text
-        .lines()
-        .filter(|line| line.contains(" cases, ") && line.contains(" disagree"))
-        .collect();
-    for line in &kinds {
-        if line.contains(", 0 disagree") {
-            report.pass(line.to_string());
-        } else {
-            report.fail(line.to_string());
+    for &seed in seeds {
+        let made = vectors(paths, seed)?;
+        for line in made.lines {
+            report.lines.push(format!("vectors: {line}"));
         }
-    }
-    if !passed && report.failures == 0 {
-        report.fail("cargo test --test dns_vectors; see diff.out".to_string());
-    }
-    if kinds.is_empty() && passed {
-        report.fail("the differential test ran no kind; see diff.out".to_string());
+        if made.failures > 0 {
+            report.failures += made.failures;
+            continue;
+        }
+        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        let log = format!("diff-{seed}.out");
+        let (text, passed) = logged(
+            Command::new(cargo)
+                .args(["test", "--test", "dns_vectors", "--", "--nocapture"])
+                .env("DNS_VECTORS", vectors_dir(paths, seed))
+                .current_dir(&paths.root),
+            &paths.out.join(&log),
+        )?;
+        let kinds: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains(" cases, ") && line.contains(" disagree"))
+            .collect();
+        for line in &kinds {
+            if line.contains(", 0 disagree") {
+                report.pass(format!("seed {seed}: {line}"));
+            } else {
+                report.fail(format!("seed {seed}: {line}"));
+            }
+        }
+        let failed = kinds.iter().any(|line| !line.contains(", 0 disagree"));
+        if !passed && !failed {
+            report.fail(format!(
+                "seed {seed}: cargo test --test dns_vectors; see {log}"
+            ));
+        }
+        if kinds.is_empty() && passed {
+            report.fail(format!(
+                "seed {seed}: the differential test ran no kind; see {log}"
+            ));
+        }
     }
     Ok(report)
 }
@@ -590,7 +615,7 @@ fn all(paths: &Paths) -> Result {
     let steps: [(&'static str, Step); 3] = [
         ("tlc", |paths| tlc(paths, None, None)),
         ("lean", lean),
-        ("diff", |paths| diff(paths, DEFAULT_SEED)),
+        ("diff", |paths| diff(paths, &SEEDS.collect::<Vec<_>>())),
     ];
     let mut reports = Vec::new();
     for (step, run) in steps {

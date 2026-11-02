@@ -53,7 +53,9 @@ use fictionet::stdlib::protocols::dns::{
     Limit, Parsed, RelayError, Request, Response, fit, restore,
 };
 use fictionet::stdlib::protocols::json::Value;
-use fictionet::stdlib::services::dns::authority::{AuthorityEngine, ServerConfig, Zones};
+use fictionet::stdlib::services::dns::authority::{
+    AuthorityEngine, ServerConfig, Zones, bare_reply,
+};
 use fictionet::stdlib::services::dns::memory::{MemoryNet, drive};
 use fictionet::stdlib::services::dns::resolver::{
     Cache, Config, Entry, FailureKind, Key, Limits, Negative, Offer, Rank, Resolver, Work,
@@ -1154,7 +1156,7 @@ fn restore_vectors() {
 }
 
 // ---------------------------------------------------------------------
-// respond.json: Request::parse and the rejection header
+// respond.json: Request::parse, the rejection header, and the server front
 // ---------------------------------------------------------------------
 
 #[test]
@@ -1223,7 +1225,45 @@ fn respond() {
                 let rust = request
                     .edns
                     .map(|e| (e.payload, e.version, e.dnssec_ok, e.nsid));
-                same("EDNS", lean, rust)
+                same("EDNS", lean, rust)?;
+
+                // An authoritative NOERROR answer through the server front.
+                let mut answer = bare_reply(&request, ResponseCode::NoError, None);
+                answer.message.metadata.authoritative = true;
+                let reply = ServerConfig::generic().front(&request, answer).message;
+                let flags = field(expected, "answer");
+                let m = &reply.metadata;
+                let rust = [
+                    ("qr", m.message_type == MessageType::Response),
+                    ("aa", m.authoritative),
+                    ("tc", m.truncation),
+                    ("rd", m.recursion_desired),
+                    ("ra", m.recursion_available),
+                    ("ad", m.authentic_data),
+                    ("cd", m.checking_disabled),
+                ];
+                for (bit, value) in rust {
+                    same(&format!("answer {bit}"), flag(flags, bit), value)?;
+                }
+                same(
+                    "answer opcode",
+                    number(flags, "opcode") as u8,
+                    u8::from(m.op_code),
+                )?;
+                same(
+                    "answer rcode",
+                    number(flags, "rcode") as u16,
+                    u16::from(m.response_code.low()),
+                )?;
+                same("answer id", request.message.metadata.id, m.id)?;
+                let opt = field(expected, "answer_opt");
+                let lean =
+                    (!opt.is_null()).then(|| (number(opt, "version") as u8, flag(opt, "do")));
+                let rust = reply
+                    .edns
+                    .as_ref()
+                    .map(|edns| (edns.version(), edns.flags().dnssec_ok));
+                same("answer OPT", lean, rust)
             }
             (lean, rust) => Err(format!("Lean {lean}, Rust {rust:?}")),
         }
@@ -2658,10 +2698,9 @@ fn offer(cache: &mut Cache, offer: &Value, now: Instant, limits: Limits) {
 // resolver.json: the Resolver engine through MemoryNet
 // ---------------------------------------------------------------------
 
-/// The hierarchy of a `resolver.json` case in a [`MemoryNet`]: each
-/// address the zones' glue gives a name server serves every zone that
-/// names that server, as one authoritative engine.
-fn hierarchy(zones: &[Zone]) -> MemoryNet {
+/// The addresses the zones of a `resolver.json` case give each name, in
+/// their data and in their glue.
+fn server_addresses(zones: &[Zone]) -> BTreeMap<LowerName, BTreeSet<IpAddr>> {
     let mut addresses: BTreeMap<LowerName, BTreeSet<IpAddr>> = BTreeMap::new();
     for zone in zones {
         for (_, node) in zone.nodes() {
@@ -2679,6 +2718,14 @@ fn hierarchy(zones: &[Zone]) -> MemoryNet {
             }
         }
     }
+    addresses
+}
+
+/// The hierarchy of a `resolver.json` case in a [`MemoryNet`]: each
+/// address the zones' glue gives a name server serves every zone that
+/// names that server, as one authoritative engine.
+fn hierarchy(zones: &[Zone]) -> MemoryNet {
+    let addresses = server_addresses(zones);
     let mut served: BTreeMap<IpAddr, Vec<Arc<dyn ZoneData>>> = BTreeMap::new();
     for zone in zones {
         let Some(Node::Data(sets)) = zone.node(zone.apex()) else {
@@ -2730,12 +2777,17 @@ fn client() -> Client {
 
 /// A client's query for `question`, with RD and no EDNS.
 fn client_query(question: &Value) -> ClientQuery {
-    let mut message = Message::new(4242, MessageType::Query, OpCode::Query);
-    message.metadata.recursion_desired = true;
-    message.add_query(Query::query(
+    query_for(
         name(text(question, "qname")),
         RecordType::from(type_code(text(question, "qtype"))),
-    ));
+    )
+}
+
+/// A client's query for `qname` `qtype`, with RD and no EDNS.
+fn query_for(qname: Name, qtype: RecordType) -> ClientQuery {
+    let mut message = Message::new(4242, MessageType::Query, OpCode::Query);
+    message.metadata.recursion_desired = true;
+    message.add_query(Query::query(qname, qtype));
     ClientQuery {
         client: client(),
         bytes: message.to_vec().unwrap(),
@@ -2882,7 +2934,7 @@ fn vector_resolver(input: &Value, zones: &[Zone], queries: u16) -> Resolver {
 
 #[test]
 fn resolver() {
-    each_case("resolver", |case, tally| {
+    each_case("resolver", |case, _| {
         let input = field(case, "input");
         let expected = field(case, "expected");
         let zones = list(input, "zones")
@@ -2903,8 +2955,7 @@ fn resolver() {
             .iter()
             .map(|b| b.as_bool().unwrap())
             .collect();
-        let lossless = losses.iter().all(|lost| !lost) && number(input, "work") >= 3;
-        let mut spec = Vec::new();
+        let lossless = losses.iter().all(|lost| !lost);
         for (question, lean) in questions.iter().zip(lean_answers) {
             let answers = drive(
                 &mut whole,
@@ -2924,12 +2975,43 @@ fn resolver() {
             if lean.is_null() {
                 return Err("Lean gave no answer".to_string());
             }
-            if text(lean, "rcode") != "SERVFAIL" || lossless {
+            // A Lean answer other than SERVFAIL is the hierarchy's
+            // (`resolve_correct`), whatever was lost and whatever work it
+            // had; its SERVFAILs are compared under the same bound below.
+            if text(lean, "rcode") != "SERVFAIL" {
                 same("answer", lean_resolver_answer(lean, true), rust)?;
-            } else {
-                tally.note("Lean SERVFAILs after a loss, checked against the hierarchy alone");
             }
-            spec.push(message);
+        }
+
+        // Nothing lost, under Lean's work bound: the same answers,
+        // SERVFAILs included. Lean starts from the hints; the Rust
+        // resolver first primes the root (RFC 8109), a query Lean does not
+        // send, so it is primed before the questions.
+        if lossless {
+            let mut net = hierarchy(&zones);
+            let mut bounded = vector_resolver(input, &zones, number(input, "work") as u16);
+            drive(
+                &mut bounded,
+                &mut net,
+                vec![query_for(Name::root(), RecordType::NS)],
+                Instant::ZERO,
+                &entropy,
+            );
+            for (question, lean) in questions.iter().zip(lean_answers) {
+                let answers = drive(
+                    &mut bounded,
+                    &mut net,
+                    vec![client_query(question)],
+                    Instant::ZERO,
+                    &entropy,
+                );
+                let message = Message::from_vec(&answers[0].bytes).map_err(|e| e.to_string())?;
+                same(
+                    "answer under the work bound",
+                    lean_resolver_answer(lean, true),
+                    resolver_answer(&message, true),
+                )?;
+            }
         }
 
         // What Lean cached is in the Rust cache at the same or a higher
@@ -2994,16 +3076,36 @@ fn resolver() {
             }
         }
 
-        // With the losses: one decision per query sent, in order. Every
-        // answer is the hierarchy's answer or SERVFAIL (`resolve_correct`).
+        // With the case's dead servers never answering, and work to spare:
+        // the same answers as Lean's, SERVFAILs included. Lean drops a
+        // server at its first loss and Rust after RFC 9520's three tries,
+        // in either order, so both answer exactly when every zone on the
+        // way has a server left.
+        let addresses = server_addresses(&zones);
+        let dead: BTreeSet<IpAddr> = texts(input, "dead")
+            .iter()
+            .flat_map(|server| {
+                addresses
+                    .get(&LowerName::new(&name(server)))
+                    .into_iter()
+                    .flatten()
+                    .copied()
+            })
+            .collect();
         let mut net = hierarchy(&zones);
-        let mut script = losses.into_iter();
-        net.lose(move |_| script.next().unwrap_or(false));
-        let mut lossy = vector_resolver(input, &zones, number(input, "work") as u16);
-        for (index, (question, spec)) in questions.iter().zip(&spec).enumerate() {
-            // A lost query makes the resolver wait for the server; each
-            // question starts after the last one's waits are over.
-            let start = at(60 * index as u64);
+        net.lose(move |transmit| dead.contains(&transmit.to.ip()));
+        let mut lossy = vector_resolver(input, &zones, 200);
+        for (index, (question, lean)) in questions
+            .iter()
+            .zip(list(expected, "dead_answers"))
+            .enumerate()
+        {
+            if lean.is_null() {
+                return Err("Lean gave no answer with the dead servers".to_string());
+            }
+            // A dead server makes the resolver wait; each question starts
+            // after the last one's waits are over, so TTLs are not compared.
+            let start = at(600 * index as u64);
             let answers = drive(
                 &mut lossy,
                 &mut net,
@@ -3012,13 +3114,11 @@ fn resolver() {
                 &entropy,
             );
             let message = Message::from_vec(&answers[0].bytes).map_err(|e| e.to_string())?;
-            if message.metadata.response_code != ResponseCode::ServFail {
-                same(
-                    "answer after losses",
-                    resolver_answer(spec, false),
-                    resolver_answer(&message, false),
-                )?;
-            }
+            same(
+                "answer with dead servers",
+                lean_resolver_answer(lean, false),
+                resolver_answer(&message, false),
+            )?;
         }
         Ok(())
     });
