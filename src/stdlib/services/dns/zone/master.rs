@@ -17,12 +17,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;
 
+use fictionet::stdlib::protocols::dns::dnssec::rdata::DNSSECRData;
 use fictionet::stdlib::protocols::dns::rr::{
     LowerName, Name, RData, Record, RecordSet, RecordType,
 };
 use fictionet::stdlib::protocols::dns::serialize::binary::{BinDecoder, Restrict};
 use fictionet::stdlib::protocols::dns::serialize::txt::{Parser, parse_ttl};
-use hickory_proto::dnssec::rdata::DNSSECRData;
 
 use super::zone::{Zone, ZoneBuilder, ZoneError};
 

@@ -9,14 +9,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
 
+use fictionet::stdlib::protocols::dns::dnssec::Nsec3HashAlgorithm;
+use fictionet::stdlib::protocols::dns::dnssec::rdata::DNSSECRData;
 use fictionet::stdlib::protocols::dns::op::Query;
 use fictionet::stdlib::protocols::dns::rr::rdata::{NULL, SOA};
 use fictionet::stdlib::protocols::dns::rr::{
     LowerName, Name, RData, Record, RecordSet, RecordType,
 };
 use fictionet::stdlib::protocols::dns::serialize::binary::{BinDecodable, BinDecoder};
-use hickory_proto::dnssec::Nsec3HashAlgorithm;
-use hickory_proto::dnssec::rdata::DNSSECRData;
 
 use super::data::{Denied, Fact, Revision, View, ZoneData};
 use super::master::MasterError;
