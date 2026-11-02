@@ -65,7 +65,15 @@ impl Pages {
                 start: std::time::UNIX_EPOCH,
             }),
             live_dns: Default::default(),
+            served: Default::default(),
         }
+    }
+
+    /// Runs `served` each time the session comes to serve hosts it did not
+    /// serve before: when Live-Depth allows an address on a new host, and
+    /// when a session starts. It replaces what an earlier network set.
+    pub(crate) fn on_hosts_served(&self, served: impl Fn() + Send + Sync + 'static) {
+        *self.served.0.lock().unwrap() = Some(Arc::new(served));
     }
 
     /// The session the world's DNS answers for.
@@ -177,6 +185,8 @@ impl Pages {
             .unwrap_or_default();
         let start = std::time::SystemTime::now() - fcx.now().since_start() - lag;
         self.namespace.advance(WallClock { start });
+        drop(settings);
+        self.served.run();
         Ok(())
     }
 

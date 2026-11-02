@@ -23,7 +23,7 @@
 //! let root = Arc::new(internet::root_zone(root)?);
 //! Net::new()
 //!     .hosts(internet::root_servers(|s| Authoritative::new(Zones::new(vec![root.clone()]), s), &at))
-//!     .hosts(internet::public_resolvers(|r, h| h.program(r.recursive(&at, clock)), &at))
+//!     .hosts(internet::public_resolvers(|r, h| h.program(r.recursive(r.config(&at), clock)), &at))
 //!     .start(&fcx, attachments)?;
 //! # Ok(())
 //! # }
@@ -41,7 +41,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fictionet::Cx;
-use fictionet::stdlib::network::route::Prefix;
+use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::network::ip::non_public_address;
 use fictionet::stdlib::protocols::dns::dnssec::rdata::DNSSECRData;
 use fictionet::stdlib::protocols::dns::op::{
     Edns, Message, MessageType, OpCode, Query, ResponseCode,
@@ -52,6 +53,7 @@ use fictionet::stdlib::protocols::dns::rr::{
     DNSClass, LowerName, Name, RData, Record, RecordSet, RecordType,
 };
 use fictionet::stdlib::protocols::dns::{Ede, EdeCode, Nsid, Request, Response};
+use fictionet::stdlib::protocols::urlencoded_form::{self, Form};
 use fictionet::stdlib::services::dns::authority::{
     Ask, Authority, ChaosAnswer, ChaosReply, Identity, Known, Observe, Observed, Relay,
     ServerConfig, Step, chaos,
@@ -60,12 +62,16 @@ use fictionet::stdlib::services::dns::resolver::Config;
 use fictionet::stdlib::services::dns::zone::{AnyResponse, Shown, Zone, ZoneError};
 use fictionet::stdlib::services::dns::{Client, Generation, WallClock};
 use fictionet::stdlib::services::serve::Transport;
+use fictionet::stdlib::web::httpd::{self, Body, request_host};
 use fictionet::sync::Mutex;
 use fictionet::time::Instant;
+use http::header::{CONTENT_TYPE, LOCATION};
+use http::{HeaderValue, Request as HttpRequest, Response as HttpResponse, StatusCode};
 
 pub use fictionet::stdlib::services::dns::resolver::{NameServer, ROOT_SERVERS, root_hints};
 
 use super::super::{Host, NetHandle, Program};
+use super::encrypted::Operator;
 use super::{Authoritative, Namespace, PerSession, Recursive, Source};
 
 // ---------------------------------------------------------------------------
@@ -299,6 +305,9 @@ pub struct PublicResolver {
     /// the real hierarchy gives for them are where a world puts the
     /// resolver's DoH front ([`Mirror::front`]).
     pub doh: &'static [&'static str],
+    /// How its DNS over HTTPS service answers past RFC 8484, as seen on
+    /// 2026-11-02 ([`Fronts::operator`](super::encrypted::Fronts::operator)).
+    pub doh_operator: &'static dyn Operator,
     config: fn(&ResolverSite, Option<&Egress>) -> Config,
 }
 
@@ -311,11 +320,13 @@ impl PublicResolver {
         (self.config)(&at.resolver(primary), at.egress.as_ref())
     }
 
-    /// A resolver program with [`config`](Self::config), one engine and
-    /// cache per sandbox ([`Recursive::per_sandbox`]), so sandboxes can
-    /// neither warm nor probe each other's caches.
-    pub fn recursive(&self, at: &Location, clock: WallClock) -> Recursive {
-        Recursive::new(self.config(at), clock).per_sandbox()
+    /// The resolver's program running `config`, usually its
+    /// [`config`](Self::config) from where the world is, or that with a
+    /// change a world needs: one engine and cache per sandbox
+    /// ([`Recursive::per_sandbox`]), so sandboxes can neither warm nor
+    /// probe each other's caches.
+    pub fn recursive(&self, config: Config, clock: WallClock) -> Recursive {
+        Recursive::new(config, clock).per_sandbox()
     }
 }
 
@@ -337,6 +348,7 @@ pub const PUBLIC_RESOLVERS: [PublicResolver; 4] = [
             },
         ],
         doh: &["dns.google."],
+        doh_operator: &Google,
         config: google,
     },
     PublicResolver {
@@ -354,6 +366,7 @@ pub const PUBLIC_RESOLVERS: [PublicResolver; 4] = [
             },
         ],
         doh: &["cloudflare-dns.com.", "one.one.one.one."],
+        doh_operator: &Cloudflare,
         config: cloudflare,
     },
     PublicResolver {
@@ -371,6 +384,7 @@ pub const PUBLIC_RESOLVERS: [PublicResolver; 4] = [
             },
         ],
         doh: &["dns.quad9.net."],
+        doh_operator: &Quad9,
         config: quad9,
     },
     PublicResolver {
@@ -388,9 +402,180 @@ pub const PUBLIC_RESOLVERS: [PublicResolver; 4] = [
             },
         ],
         doh: &["doh.opendns.com.", "dns.opendns.com."],
+        doh_operator: &OpenDns,
         config: opendns,
     },
 ];
+
+/// A response with `status`, `body`, and its media type when it has one.
+fn http_reply(status: StatusCode, media: Option<&'static str>, body: String) -> HttpResponse<Body> {
+    let mut response = HttpResponse::new(Body::from(body));
+    *response.status_mut() = status;
+    if let Some(media) = media {
+        response
+            .headers_mut()
+            .insert(CONTENT_TYPE, HeaderValue::from_static(media));
+    }
+    response
+}
+
+/// `dns.google`: Google's JSON API at `/resolve`, and Google's HTML error
+/// pages.
+#[derive(Debug)]
+struct Google;
+
+impl Google {
+    /// Google's error page for `status`, saying `message`.
+    fn error(status: StatusCode, message: &str) -> HttpResponse<Body> {
+        let code = status.as_u16();
+        let reason = status.canonical_reason().unwrap_or_default();
+        let body = format!(
+            "<!DOCTYPE html>\n<html lang=en>\n  <meta charset=utf-8>\n  \
+             <meta name=viewport content=\"initial-scale=1, minimum-scale=1, width=device-width\">\n  \
+             <title>Error {code} ({reason})!!1</title>\n  <style>\n    {GOOGLE_ERROR_STYLE}\n  </style>\n  \
+             <a href=//www.google.com/><span id=logo aria-label=Google></span></a>\n  \
+             <p><b>{code}.</b> <ins>That\u{2019}s an error.</ins>\n  \
+             <p>{message} <ins>That\u{2019}s all we know.</ins>\n"
+        );
+        http_reply(status, Some("text/html; charset=UTF-8"), body)
+    }
+}
+
+/// The style of Google's error pages.
+const GOOGLE_ERROR_STYLE: &str = "*{margin:0;padding:0}html,code{font:15px/22px arial,sans-serif}html{background:#fff;color:#222;padding:15px}body{margin:7% auto 0;max-width:390px;min-height:180px;padding:30px 0 15px}* > body{background:url(//www.google.com/images/errors/robot.png) 100% 5px no-repeat;padding-right:205px}p{margin:11px 0 22px;overflow:hidden}ins{color:#777;text-decoration:none}a img{border:0}@media screen and (max-width:772px){body{background:none;margin-top:0;max-width:none;padding-right:0}}#logo{background:url(//www.google.com/images/branding/googlelogo/1x/googlelogo_color_150x54dp.png) no-repeat;margin-left:-5px}@media only screen and (min-resolution:192dpi){#logo{background:url(//www.google.com/images/branding/googlelogo/2x/googlelogo_color_150x54dp.png) no-repeat 0% 0%/100% 100%;-moz-border-image:url(//www.google.com/images/branding/googlelogo/2x/googlelogo_color_150x54dp.png) 0}}@media only screen and (-webkit-min-device-pixel-ratio:2){#logo{background:url(//www.google.com/images/branding/googlelogo/2x/googlelogo_color_150x54dp.png) no-repeat;-webkit-background-size:100% 100%}}#logo{display:inline-block;height:54px;width:150px}";
+
+impl Operator for Google {
+    fn resolve_json(&self) -> bool {
+        true
+    }
+
+    fn not_found(&self, request: &HttpRequest<Body>) -> HttpResponse<Body> {
+        let path = request
+            .uri()
+            .path()
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;");
+        let message =
+            format!("The requested URL <code>{path}</code> was not found on this server. ");
+        Google::error(StatusCode::NOT_FOUND, &message)
+    }
+
+    fn no_query(&self, request: &HttpRequest<Body>) -> HttpResponse<Body> {
+        let named = request
+            .uri()
+            .query()
+            .and_then(|query| Form::parse(query.as_bytes()).ok())
+            .is_some_and(|form| urlencoded_form::first(&form.pairs, "name").is_some());
+        let detail = if named {
+            "RFC8484 handler at /dns-query received parameter &#39;name&#39;, which it does not \
+             accept.  Did you intend to pass the &#39;dns&#39; parameter, or call the JSON handler \
+             at /resolve?  See https://developers.google.com/speed/public-dns/docs/doh"
+        } else {
+            "Query must have a valid \u{2018}dns\u{2019} parameter.."
+        };
+        let message = format!("Your client has issued a malformed or illegal request. {detail}");
+        Google::error(StatusCode::BAD_REQUEST, &message)
+    }
+}
+
+/// `cloudflare-dns.com` and `one.one.one.one`: Cloudflare's JSON at
+/// `/dns-query`, an empty `400` to a GET with no question, and a
+/// redirect from `cloudflare-dns.com` to the same path on
+/// `one.one.one.one`, whose website the world does not serve.
+#[derive(Debug)]
+struct Cloudflare;
+
+impl Operator for Cloudflare {
+    fn dns_json(&self) -> bool {
+        true
+    }
+
+    fn not_found(&self, request: &HttpRequest<Body>) -> HttpResponse<Body> {
+        let redirects = request_host(request).is_some_and(|host| {
+            host.trim_end_matches('.')
+                .eq_ignore_ascii_case("cloudflare-dns.com")
+        });
+        if !redirects {
+            return http_reply(
+                StatusCode::NOT_FOUND,
+                Some("text/html; charset=utf-8"),
+                String::new(),
+            );
+        }
+        let target = match request.uri().path_and_query().map(|p| p.as_str()) {
+            None | Some("/") => "/dns/",
+            Some(target) => target,
+        };
+        let body = "<html>\r\n<head><title>301 Moved Permanently</title></head>\r\n<body>\r\n\
+                    <center><h1>301 Moved Permanently</h1></center>\r\n\
+                    <hr><center>cloudflare</center>\r\n</body>\r\n</html>\r\n";
+        let mut response = http_reply(
+            StatusCode::MOVED_PERMANENTLY,
+            Some("text/html; charset=UTF-8"),
+            body.to_owned(),
+        );
+        if let Ok(location) = HeaderValue::from_str(&format!("https://one.one.one.one{target}")) {
+            response.headers_mut().insert(LOCATION, location);
+        }
+        response
+    }
+
+    fn no_query(&self, _request: &HttpRequest<Body>) -> HttpResponse<Body> {
+        http_reply(StatusCode::BAD_REQUEST, None, String::new())
+    }
+}
+
+/// `dns.quad9.net`: RFC 8484 alone, with Quad9's plain text errors.
+#[derive(Debug)]
+struct Quad9;
+
+impl Operator for Quad9 {
+    fn not_found(&self, _request: &HttpRequest<Body>) -> HttpResponse<Body> {
+        httpd::text(
+            StatusCode::NOT_FOUND,
+            "there is no endpoint configured for this path",
+        )
+    }
+
+    fn no_query(&self, request: &HttpRequest<Body>) -> HttpResponse<Body> {
+        let text = match request.uri().query() {
+            None | Some("") => "DoH non-compliant query",
+            Some(_) => "DoH unable to decode BASE64-URL",
+        };
+        httpd::text(StatusCode::BAD_REQUEST, text)
+    }
+}
+
+/// `doh.opendns.com`: RFC 8484 alone, with OpenDNS's HTML errors.
+#[derive(Debug)]
+struct OpenDns;
+
+impl OpenDns {
+    /// OpenDNS's error page for `status`, saying `message`.
+    fn error(status: StatusCode, message: &str) -> HttpResponse<Body> {
+        let code = status.as_u16();
+        let reason = status.canonical_reason().unwrap_or_default();
+        let body = format!(
+            "<html>\r\n<head><title>{code} {reason}</title></head>\r\n<body>\r\n\
+             <center><h1>{message}</h1></center>\r\n</body>\r\n</html>\r\n"
+        );
+        http_reply(status, Some("text/html"), body)
+    }
+}
+
+impl Operator for OpenDns {
+    fn not_found(&self, _request: &HttpRequest<Body>) -> HttpResponse<Body> {
+        OpenDns::error(
+            StatusCode::NOT_FOUND,
+            "The request was directed to a path other than the configured endpoint",
+        )
+    }
+
+    fn no_query(&self, _request: &HttpRequest<Body>) -> HttpResponse<Body> {
+        OpenDns::error(StatusCode::BAD_REQUEST, "No valid query received")
+    }
+}
 
 /// `whoami.cloudflare.`, which 1.1.1.1 answers in the CHAOS class with the
 /// address the question came from.
@@ -566,35 +751,43 @@ impl Location {
             identity
         };
         let ms = Duration::from_millis;
-        // BIND serves each of its names as a zone, with AA, and G runs it
+        // BIND serves each of its names with text as a zone, and G runs it
         // too.
         let zones = |identity: Identity| Identity {
-            aa: true,
-            other_types: None,
+            chaos: identity
+                .chaos
+                .into_iter()
+                .map(|(name, answer)| match answer {
+                    ChaosAnswer::Txt(text) => (name, ChaosAnswer::Zone(Some(text))),
+                    answer => (name, answer),
+                })
+                .collect(),
             ..identity
         };
-        // C, I, and M also answer `authors.bind`, a name with no TXT.
-        let bind = |identity: Identity| zones(identity).answer(chaos::authors_bind(), no(NoError));
+        // C, I, and M also serve `authors.bind`, a zone with no TXT.
+        let bind = |identity: Identity| {
+            zones(identity).answer(chaos::authors_bind(), ChaosAnswer::Zone(None))
+        };
         // Verisign's servers answer other types with NOTIMP and no OPT
         // record. Its root letter sets AA; its gTLD servers do not.
         let verisign = |identity: Identity| Identity {
-            other_types: Some(ChaosReply {
+            other_types: ChaosReply {
                 edns: false,
                 ..ChaosReply::rcode(NotImp)
-            }),
+            },
             ..identity
         };
         // E and F answer other types with NOTIMP and EDE 21, and advertise
         // 512 octets.
         let not_supported = |identity: Identity| Identity {
             aa: true,
-            other_types: Some(ChaosReply {
+            other_types: ChaosReply {
                 ede: Some(Ede {
                     code: EdeCode::NOT_SUPPORTED,
                     text: Some("Unsupported DNS Type for Class CHAOS".to_string()),
                 }),
                 ..ChaosReply::rcode(NotImp)
-            }),
+            },
             payload: Some(512),
             ..identity
         };
@@ -694,10 +887,10 @@ impl Location {
                 21,
                 // H adds EDE 21 to its REFUSED.
                 Identity {
-                    other_types: Some(ChaosReply {
+                    other_types: ChaosReply {
                         ede: Some(Ede::new(EdeCode::NOT_SUPPORTED)),
                         ..ChaosReply::rcode(Refused)
-                    }),
+                    },
                     ..identity(
                         "001.nzy.h.root-servers.org",
                         Refused,
@@ -817,7 +1010,7 @@ impl Location {
                 7,
                 // Every CHAOS question gets SERVFAIL.
                 Identity {
-                    other_types: Some(ChaosReply::rcode(ServFail)),
+                    other_types: ChaosReply::rcode(ServFail),
                     ..identity(
                         "gpdns-sfo",
                         ServFail,
@@ -829,7 +1022,7 @@ impl Location {
             resolver(
                 8,
                 Identity {
-                    other_types: Some(ChaosReply::rcode(NotImp)),
+                    other_types: ChaosReply::rcode(NotImp),
                     ..identity(
                         "sjc01",
                         Refused,
@@ -841,7 +1034,7 @@ impl Location {
             resolver(
                 7,
                 Identity {
-                    other_types: Some(ChaosReply::rcode(NoError)),
+                    other_types: ChaosReply::rcode(NoError),
                     ..identity(
                         "res130.pao",
                         Refused,
@@ -867,7 +1060,7 @@ impl Location {
                     let no = || ChaosAnswer::Reply(refused.clone());
                     Identity {
                         unlisted: refused.clone(),
-                        other_types: Some(refused.clone()),
+                        other_types: refused.clone(),
                         ..identity("r3003.lax", Refused, [no(), no(), no(), no()])
                     }
                 },
@@ -1023,17 +1216,37 @@ async fn probe(fcx: &Cx, source: &dyn Source, server: IpAddr, deadline: Instant)
     names.push(LowerName::new(
         &Name::from_ascii("invalid.").expect("a valid name"),
     ));
-    let asks = names
+    let ask = |name: &LowerName, rtype: RecordType| {
+        let query = probe_query(fcx, &Name::from(name), rtype, DNSClass::CH, false);
+        Box::pin(exchange(fcx, source, server, query, deadline)) as Probe<'_, _>
+    };
+    let mut replies: Vec<Option<(Duration, Message)>> = join_all(
+        names
+            .iter()
+            .map(|name| ask(name, RecordType::TXT))
+            .collect(),
+    )
+    .await;
+    // A BIND server serves each name it answers as a zone of its own,
+    // which shows in its TXT reply, asked without RD: the zone's NS
+    // beside the text, or its SOA when the zone has none.
+    let zone = |name: &LowerName, reply: &Option<(Duration, Message)>| {
+        reply.as_ref().is_some_and(|(_, reply)| {
+            reply.metadata.authoritative
+                && reply.authorities.iter().any(|record| {
+                    LowerName::new(&record.name) == *name
+                        && matches!(record.record_type(), RecordType::SOA | RecordType::NS)
+                })
+        })
+    };
+    // What a name that is not a zone gives for another type, asked of the
+    // first such name, `invalid.` at the latest.
+    let sample = names
         .iter()
-        .map(|name| (name, RecordType::TXT))
-        // What a name it answers gives for another type.
-        .chain(std::iter::once((&names[0], RecordType::A)))
-        .map(|(name, rtype)| {
-            let query = probe_query(fcx, &Name::from(name), rtype, DNSClass::CH, false);
-            Box::pin(exchange(fcx, source, server, query, deadline)) as Probe<'_, _>
-        });
-    let mut replies: Vec<Option<(Duration, Message)>> = join_all(asks.collect()).await;
-    let other_type = replies.pop().flatten();
+        .zip(&replies)
+        .find(|(name, reply)| !zone(name, reply))
+        .map_or(&names[names.len() - 1], |(name, _)| name);
+    let other_type = ask(sample, RecordType::A).await;
     let unlisted = replies
         .pop()
         .flatten()
@@ -1047,25 +1260,14 @@ async fn probe(fcx: &Cx, source: &dyn Source, server: IpAddr, deadline: Instant)
         .map(|(took, _)| *took)
         .min()?;
     let mut identity = Identity {
-        other_types: match &other_type {
-            // BIND's NODATA from the name's own zone.
-            Some((_, reply))
-                if reply.metadata.authoritative
-                    && reply.metadata.response_code == ResponseCode::NoError
-                    && reply
-                        .authorities
-                        .iter()
-                        .any(|record| record.record_type() == RecordType::SOA) =>
-            {
-                None
-            }
-            Some((_, reply)) => Some(chaos_reply(reply)),
-            None => Identity::none().other_types,
-        },
+        other_types: other_type.map_or(Identity::none().other_types, |(_, reply)| {
+            chaos_reply(&reply)
+        }),
         unlisted: unlisted.clone(),
         ..Identity::none()
     };
     for (name, reply) in names.into_iter().zip(replies) {
+        let zone = zone(&name, &reply);
         let Some((_, reply)) = reply else {
             continue;
         };
@@ -1091,11 +1293,15 @@ async fn probe(fcx: &Cx, source: &dyn Source, server: IpAddr, deadline: Instant)
             }
             _ => None,
         });
+        let text = text.map(|(ttl, text)| {
+            identity.ttl = ttl;
+            String::from_utf8_lossy(&text).into_owned()
+        });
         let answer = match text {
-            Some((ttl, text)) => {
-                identity.ttl = ttl;
+            _ if zone => ChaosAnswer::Zone(text),
+            Some(text) => {
                 identity.aa = reply.metadata.authoritative;
-                ChaosAnswer::Txt(String::from_utf8_lossy(&text).into_owned())
+                ChaosAnswer::Txt(text)
             }
             None if chaos_reply(&reply) == unlisted => continue,
             None => ChaosAnswer::Reply(chaos_reply(&reply)),
@@ -1518,7 +1724,7 @@ impl Inner {
         {
             let mut placed = self.placed.lock();
             relays.retain(|(addr, _)| self.may_relay(*addr) && placed.relays.insert(*addr));
-            fronts.retain(|(addr, _)| globally_reachable(*addr) && placed.fronts.insert(*addr));
+            fronts.retain(|(addr, _)| !non_public_address(*addr) && placed.fronts.insert(*addr));
         }
         // The network refuses an address on the sandboxes' subnet or a
         // LAN; such an address stays without a relay. The real server
@@ -1563,7 +1769,7 @@ impl Inner {
             .map(|letter| &letter.server)
             .chain(&GTLD_SERVERS)
             .any(|server| server.addresses().contains(&addr));
-        globally_reachable(addr) && !resolver && !(preset && self.handle.has_machine(addr))
+        !non_public_address(addr) && !resolver && !(preset && self.handle.has_machine(addr))
     }
 }
 
@@ -1659,97 +1865,6 @@ fn echo(message: &mut Message, egress: Ipv4Addr, seen: IpAddr) -> bool {
         }
     }
     changed
-}
-
-// ---------------------------------------------------------------------------
-// Addresses an internet host can have
-
-const fn v4(a: u8, b: u8, c: u8, d: u8, len: u8) -> Prefix {
-    Prefix {
-        addr: IpAddr::V4(Ipv4Addr::new(a, b, c, d)),
-        len,
-    }
-}
-
-const fn v6(segments: [u16; 8], len: u8) -> Prefix {
-    let [a, b, c, d, e, f, g, h] = segments;
-    Prefix {
-        addr: IpAddr::V6(Ipv6Addr::new(a, b, c, d, e, f, g, h)),
-        len,
-    }
-}
-
-/// The IANA IPv4 and IPv6 Special-Purpose Address Registries (RFC 6890),
-/// read on 2026-11-01: each block and whether its addresses are globally
-/// reachable. The most specific block holding an address decides. Blocks
-/// the registry gives no answer for (Teredo, 6to4, and the deprecated
-/// 6to4 relay and ORCHID blocks) count as not reachable.
-const SPECIAL_PURPOSE: [(Prefix, bool); 50] = [
-    (v4(0, 0, 0, 0, 8), false),
-    (v4(10, 0, 0, 0, 8), false),
-    (v4(100, 64, 0, 0, 10), false),
-    (v4(127, 0, 0, 0, 8), false),
-    (v4(169, 254, 0, 0, 16), false),
-    (v4(172, 16, 0, 0, 12), false),
-    (v4(192, 0, 0, 0, 24), false),
-    (v4(192, 0, 0, 9, 32), true),
-    (v4(192, 0, 0, 10, 32), true),
-    (v4(192, 0, 2, 0, 24), false),
-    (v4(192, 31, 196, 0, 24), true),
-    (v4(192, 52, 193, 0, 24), true),
-    (v4(192, 88, 99, 0, 24), false),
-    (v4(192, 168, 0, 0, 16), false),
-    (v4(192, 175, 48, 0, 24), true),
-    (v4(198, 18, 0, 0, 15), false),
-    (v4(198, 51, 100, 0, 24), false),
-    (v4(203, 0, 113, 0, 24), false),
-    (v4(240, 0, 0, 0, 4), false),
-    (v4(255, 255, 255, 255, 32), false),
-    (v6([0, 0, 0, 0, 0, 0, 0, 1], 128), false),
-    (v6([0, 0, 0, 0, 0, 0, 0, 0], 128), false),
-    (v6([0, 0, 0, 0, 0, 0xffff, 0, 0], 96), false),
-    (v6([0x64, 0xff9b, 0, 0, 0, 0, 0, 0], 96), true),
-    (v6([0x64, 0xff9b, 1, 0, 0, 0, 0, 0], 48), false),
-    (v6([0x100, 0, 0, 0, 0, 0, 0, 0], 64), false),
-    (v6([0x100, 0, 0, 1, 0, 0, 0, 0], 64), false),
-    (v6([0x2001, 0, 0, 0, 0, 0, 0, 0], 23), false),
-    (v6([0x2001, 0, 0, 0, 0, 0, 0, 0], 32), false),
-    (v6([0x2001, 1, 0, 0, 0, 0, 0, 1], 128), true),
-    (v6([0x2001, 1, 0, 0, 0, 0, 0, 2], 128), true),
-    (v6([0x2001, 1, 0, 0, 0, 0, 0, 3], 128), true),
-    (v6([0x2001, 2, 0, 0, 0, 0, 0, 0], 48), false),
-    (v6([0x2001, 3, 0, 0, 0, 0, 0, 0], 32), true),
-    (v6([0x2001, 4, 0x112, 0, 0, 0, 0, 0], 48), true),
-    (v6([0x2001, 0x10, 0, 0, 0, 0, 0, 0], 28), false),
-    (v6([0x2001, 0x20, 0, 0, 0, 0, 0, 0], 28), true),
-    (v6([0x2001, 0x30, 0, 0, 0, 0, 0, 0], 28), true),
-    (v6([0x2001, 0xdb8, 0, 0, 0, 0, 0, 0], 32), false),
-    (v6([0x2002, 0, 0, 0, 0, 0, 0, 0], 16), false),
-    (v6([0x2620, 0x4f, 0x8000, 0, 0, 0, 0, 0], 48), true),
-    (v6([0x3fff, 0, 0, 0, 0, 0, 0, 0], 20), false),
-    (v6([0x5f00, 0, 0, 0, 0, 0, 0, 0], 16), false),
-    (v6([0xfc00, 0, 0, 0, 0, 0, 0, 0], 7), false),
-    (v6([0xfe80, 0, 0, 0, 0, 0, 0, 0], 10), false),
-    // Not in the registries, and no host's unicast address: multicast
-    // (RFC 5771, RFC 4291 §2.7) and the rest of the IPv6 space outside
-    // global unicast (RFC 4291 §2.4).
-    (v4(224, 0, 0, 0, 4), false),
-    (v6([0xff00, 0, 0, 0, 0, 0, 0, 0], 8), false),
-    (v6([0, 0, 0, 0, 0, 0, 0, 0], 3), false),
-    (v6([0x4000, 0, 0, 0, 0, 0, 0, 0], 2), false),
-    (v6([0x8000, 0, 0, 0, 0, 0, 0, 0], 1), false),
-];
-
-/// Whether `addr` is one a host on the internet can have, by the IANA
-/// special-purpose registries (RFC 6890). The mirror places no relay or
-/// front at another address, and a world placing its own machines at
-/// relayed addresses can skip the same ones.
-pub fn globally_reachable(addr: IpAddr) -> bool {
-    SPECIAL_PURPOSE
-        .iter()
-        .filter(|(block, _)| block.contains(addr))
-        .max_by_key(|(block, _)| block.len)
-        .is_none_or(|(_, reachable)| *reachable)
 }
 
 fn name(text: &str) -> Name {

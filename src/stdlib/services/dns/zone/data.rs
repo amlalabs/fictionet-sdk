@@ -77,6 +77,12 @@ pub trait View {
     /// with its RRSIGs), which a reply carries when the query set DO. An
     /// unsigned zone returns `Present(vec![])`.
     fn denial(&self, name: &LowerName, kind: Denied) -> Fact<Vec<RecordSet>>;
+    /// Whether a name with nothing of its own but names below it answers
+    /// NODATA when the answer ends there, rather than being unknown. Such
+    /// a name on the way down to another one is a step all the same.
+    fn answers_empty(&self) -> bool {
+        true
+    }
     /// `set`, an RRset the answer makes up rather than reads, such as the
     /// HINFO of RFC 8482 §4.2, with RRSIGs from the zone's keys. `None`
     /// when the view cannot sign: the zone is unsigned, or was signed once
@@ -123,7 +129,8 @@ where
 ///
 /// A question for the name and the type of an RRset it holds answers from
 /// that RRset. So does every question at the name when it holds a CNAME,
-/// which leaves no room for other data there (RFC 1034 §3.6.2). Every
+/// which leaves no room for other data there (RFC 1034 §3.6.2), except a
+/// question for RRSIGs when the CNAME carries none. Every
 /// other fact is unknown: a capture holding `www.example A` says nothing
 /// about `www.example AAAA`, nor about the zone's SOA or NS RRsets. A
 /// resolver then goes on to its next local zone or iterates, and a server
@@ -174,12 +181,13 @@ impl ZoneData for Shown {
     }
 
     fn view(&self, question: &Query) -> Arc<dyn View + Send + Sync> {
+        let cname = self.sets.get(&RecordType::CNAME);
         let asked = match question.query_type() {
-            RecordType::ANY => None,
-            qtype => self
-                .sets
-                .get(&qtype)
-                .or_else(|| self.sets.get(&RecordType::CNAME)),
+            RecordType::ANY => cname,
+            // RRSIGs travel inside the RRsets they cover, so a CNAME
+            // answers for them only when it carries some.
+            RecordType::RRSIG => cname.filter(|set| !set.rrsigs().is_empty()),
+            qtype => self.sets.get(&qtype).or(cname),
         };
         Arc::new(ShownView {
             apex: self.apex.clone(),
@@ -234,10 +242,11 @@ impl View for ShownView {
 ///
 /// A name `D` holds RRsets at, without the asked type, still answers
 /// NODATA, as Unbound's transparent zones do. A name `D` says is absent,
-/// and a name with nothing of its own but names below it, are unknown:
-/// Unbound answers from a transparent zone only where it has data
-/// (`local_zones_zone_answer`). The names above the question's name stay
-/// as `D` has them, so the answer can walk down to it.
+/// and an answer that ends at a name with nothing of its own but names
+/// below it, are unknown: Unbound answers from a transparent zone only
+/// where it has data (`local_zones_zone_answer`). Such a name on the way
+/// down to another one, such as a CNAME's target, stays as `D` has it,
+/// so the answer can walk past it.
 pub struct Transparent<D: ZoneData>(pub D);
 
 impl<D: ZoneData> ZoneData for Transparent<D> {
@@ -246,10 +255,7 @@ impl<D: ZoneData> ZoneData for Transparent<D> {
     }
 
     fn view(&self, question: &Query) -> Arc<dyn View + Send + Sync> {
-        Arc::new(TransparentView {
-            view: self.0.view(question),
-            qname: LowerName::new(question.name()),
-        })
+        Arc::new(TransparentView(self.0.view(question)))
     }
 }
 
@@ -304,45 +310,48 @@ impl View for RedirectView {
         self.0.denial(self.standing_for(name), kind)
     }
 
+    fn answers_empty(&self) -> bool {
+        self.0.answers_empty()
+    }
+
     fn sign(&self, set: &RecordSet) -> Option<RecordSet> {
         self.0.sign(set)
     }
 }
 
-/// A view whose absent nodes, and empty non-terminals not above the
-/// question's name, read as unknown.
-struct TransparentView {
-    view: Arc<dyn View + Send + Sync>,
-    qname: LowerName,
-}
+/// A view whose absent nodes read as unknown, and whose empty
+/// non-terminals answer nothing.
+struct TransparentView(Arc<dyn View + Send + Sync>);
 
 impl View for TransparentView {
     fn apex(&self) -> &LowerName {
-        self.view.apex()
+        self.0.apex()
     }
 
     fn revision(&self) -> Revision {
-        self.view.revision()
+        self.0.revision()
     }
 
     fn soa(&self) -> &RecordSet {
-        self.view.soa()
+        self.0.soa()
     }
 
     fn node(&self, name: &LowerName) -> Fact<&Node> {
-        let above = *name != self.qname && name.zone_of(&self.qname);
-        match self.view.node(name) {
+        match self.0.node(name) {
             Fact::Absent => Fact::Unknown,
-            Fact::Present(Node::Empty) if !above => Fact::Unknown,
             fact => fact,
         }
     }
 
     fn denial(&self, name: &LowerName, kind: Denied) -> Fact<Vec<RecordSet>> {
-        self.view.denial(name, kind)
+        self.0.denial(name, kind)
+    }
+
+    fn answers_empty(&self) -> bool {
+        false
     }
 
     fn sign(&self, set: &RecordSet) -> Option<RecordSet> {
-        self.view.sign(set)
+        self.0.sign(set)
     }
 }

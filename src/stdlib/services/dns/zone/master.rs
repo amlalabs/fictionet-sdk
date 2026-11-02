@@ -540,14 +540,29 @@ fn hickory_text(
         return Err(bad());
     }
     let line = format!("{owner} 0 IN {rtype} {}\n", tokens.join(" "));
-    let origin = origin.cloned().unwrap_or_else(Name::root);
-    let (_, sets) = Parser::new(line, None, Some(origin))
-        .parse()
-        .map_err(|_| bad())?;
-    sets.into_values()
-        .next()
-        .and_then(|set| set.records_without_rrsigs().next().map(|r| r.data.clone()))
-        .ok_or_else(bad)
+    let read = |origin: Name| {
+        let (_, sets) = Parser::new(line.clone(), None, Some(origin))
+            .parse()
+            .map_err(|_| bad())?;
+        sets.into_values()
+            .next()
+            .and_then(|set| set.records_without_rrsigs().next().map(|r| r.data.clone()))
+            .ok_or_else(bad)
+    };
+    match origin {
+        Some(origin) => read(origin.clone()),
+        None => {
+            // hickory reads a relative name against whatever origin it is
+            // given, so RDATA that reads differently under two origins
+            // holds a relative name, which needs an origin (RFC 1035 §5.1).
+            let data = read(Name::root())?;
+            let elsewhere = Name::from_ascii("origin.invalid.").expect("a valid name");
+            if read(elsewhere)? != data {
+                return Err(MasterError::BadName);
+            }
+            Ok(data)
+        }
+    }
 }
 
 /// RDATA of `rtype` from its wire form.

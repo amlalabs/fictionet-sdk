@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use super::keys::{Sign, key_tag};
 use super::rdata::{DNSSECRData, RRSIG, SigInput};
 use crate::stdlib::protocols::dns::ProtoError;
-use crate::stdlib::protocols::dns::rr::{Name, RData, Record, RecordSet, SerialNumber};
+use crate::stdlib::protocols::dns::rr::{Name, RData, Record, RecordSet, RecordType, SerialNumber};
 use hickory_proto::dnssec::{PublicKey, TBS};
 
 /// When a signature is valid: from `inception` to `expiration`, both
@@ -49,12 +49,7 @@ pub fn sign(
         // RFC 6840 §5.1: the signer's name in canonical, lowercase form.
         signer_name: signer.to_lowercase(),
     };
-    let tbs = TBS::from_input(
-        set.name(),
-        set.dns_class(),
-        &input,
-        set.records_without_rrsigs(),
-    )?;
+    let tbs = signed_data(set, &input)?;
     let signature = key.sign(tbs.as_ref());
     let mut record = Record::from_rdata(
         set.name().clone(),
@@ -63,6 +58,31 @@ pub fn sign(
     );
     record.dns_class = set.dns_class();
     Ok(record)
+}
+
+/// The bytes an RRSIG with `input` signs over `set`: hickory's
+/// to-be-signed form, with the names in each record's RDATA in canonical,
+/// lowercase form (RFC 4034 §6.2 item 3). hickory lowercases those of the
+/// types it knows; DNAME, which it carries as unknown RDATA, is lowercased
+/// here. The error is hickory's, for a record whose data does not encode.
+pub fn signed_data(set: &RecordSet, input: &SigInput) -> Result<TBS, ProtoError> {
+    let records: Vec<Record> = set
+        .records_without_rrsigs()
+        .map(|record| {
+            let mut record = record.clone();
+            if let RData::Unknown {
+                code: RecordType::DNAME,
+                rdata,
+            } = &mut record.data
+            {
+                // The target, an uncompressed name (RFC 6672 §2.5). Its
+                // length octets are at most 63, below every ASCII letter.
+                rdata.anything.make_ascii_lowercase();
+            }
+            record
+        })
+        .collect();
+    TBS::from_input(set.name(), set.dns_class(), input, records.iter())
 }
 
 /// A time as an RRSIG field: seconds since 1970 modulo 2^32, compared with
@@ -105,13 +125,7 @@ mod tests {
         let RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) = &rrsig.data else {
             panic!("an RRSIG");
         };
-        let tbs = TBS::from_input(
-            set.name(),
-            set.dns_class(),
-            rrsig.input(),
-            set.records_without_rrsigs(),
-        )
-        .unwrap();
+        let tbs = signed_data(set, rrsig.input()).unwrap();
         Ring.verify(&key.dnskey(), tbs.as_ref(), rrsig.sig())
     }
 

@@ -2381,10 +2381,10 @@ fn chain() {
                 kind => format!("{kind} {} {}", text(p, "parent"), text(p, "child")),
             })
             .collect();
-        // Rust also reports a parent's DS records that name an algorithm
-        // the policy does not validate, which leaves the child Insecure
-        // (RFC 9905 §2). The Lean check reports only the algorithms of a
-        // zone's own keys.
+        // Rust also reports a parent's DS records when none of them names
+        // an algorithm the policy validates, which leaves the child
+        // Insecure (RFC 9905 §2). The Lean check reports only the
+        // algorithms of a zone's own keys.
         let ds_only: Vec<String> = rust
             .iter()
             .filter(|p| !lean.contains(*p) && ds_problems.contains(*p))

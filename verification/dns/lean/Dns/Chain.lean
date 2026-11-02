@@ -10,7 +10,10 @@
 
   The tree is a list of signed zones; a zone's parent is the zone whose apex is its deepest strict ancestor.
 
-  Rust: `services::dns::zone::chain::{check_chain, ChainProblem}`.
+  Rust: `services::dns::zone::chain::{check_chain, ChainProblem}`. Rust reports a zone's key algorithms only
+  when none of them is one the policy validates, since one is enough for a path (RFC 6840 §5.11), and reports
+  an RRset left without a signature in such an algorithm as a problem of its own. For a zone signed with one
+  algorithm, as every zone of the vectors is, the two checks report the same.
 -/
 import Dns.Dnssec
 

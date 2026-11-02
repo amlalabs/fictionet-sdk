@@ -1,7 +1,7 @@
 //! EDNS options hickory carries without a type of its own: Extended DNS
 //! Errors (RFC 8914) and Padding (RFC 7830), plus the server identifier
 //! NSID (RFC 5001), which hickory types as
-//! [`EdnsOption::NSID`](super::rr::rdata::opt::EdnsOption::NSID).
+//! [`EdnsOption::NSID`].
 //!
 //! Each type converts to and from one [`EdnsOption`] in an OPT record.
 //! A message may carry several Extended DNS Errors (RFC 8914 §3).

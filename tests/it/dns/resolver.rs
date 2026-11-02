@@ -145,7 +145,8 @@ fn ds(keys: &KeySet, apex: &str) -> RecordSet {
 /// - `.` at 198.41.0.4, `a.root-servers.net`, delegating `com` and `org`.
 /// - `com` at 192.0.2.10, delegating `example.com` (glue 192.0.2.20),
 ///   `glueless.com` (served by `ns.provider.org`, no glue), `bad.com`
-///   (signed, with a DS for other keys), `odd.com` (a broken server), and
+///   (signed, with a DS for other keys, and `alias.bad.com` a CNAME to
+///   `www.example.com`), `odd.com` (a broken server), and
 ///   `a.com` and `b.com`, each served from a name in the other.
 /// - `example.com` at 192.0.2.20 and 192.0.2.21.
 /// - `org` at 192.0.2.12, delegating `example.org` (unsigned) and
@@ -279,6 +280,11 @@ fn internet_appending(signed: bool, appended: Option<Record>) -> (MemoryNet, Opt
     let bad = builder("bad.com.", "ns.bad.com.")
         .rrset(rrset("ns.bad.com.", 3600, vec![a(BAD)]))
         .rrset(rrset("www.bad.com.", 300, vec![a("192.0.2.98")]))
+        .rrset(rrset(
+            "alias.bad.com.",
+            300,
+            vec![RData::CNAME(CNAME(name("www.example.com.")))],
+        ))
         .build()
         .unwrap();
     let bad = sign(bad, &bad_keys);
@@ -1650,6 +1656,85 @@ fn a_negative_trust_anchor_stops_validation_below_it() {
     assert!(reply.metadata.authentic_data, "com validates its DS RRset");
 }
 
+/// Validated NSEC records deny nothing below a negative trust anchor
+/// (RFC 7646 §2, RFC 8198 §5): a name there is asked, and its answer has
+/// no AD, as on a cold cache.
+#[test]
+fn validated_nsec_records_deny_nothing_below_a_negative_trust_anchor() {
+    let (mut net, anchors) = internet(true);
+    let anchor = LowerName::new(&name("nz.example.com."));
+    let mut resolver = resolver(Config {
+        negative_anchors: Some(Arc::new(move |name: &LowerName| *name == anchor)),
+        ..config(anchors)
+    });
+    let reply = ask(
+        &mut resolver,
+        &mut net,
+        0,
+        query(client(1), "nx.example.com.", RecordType::A, dnssec_ok),
+    );
+    assert!(reply.metadata.authentic_data);
+    let before = net.recording().exchanges().len();
+    // The NSEC that denied `nx` covers `nz` too.
+    let reply = ask(
+        &mut resolver,
+        &mut net,
+        1,
+        query(client(1), "nz.example.com.", RecordType::A, dnssec_ok),
+    );
+    assert_eq!(reply.metadata.response_code, ResponseCode::NXDomain);
+    assert!(!reply.metadata.authentic_data);
+    assert!(
+        net.recording().exchanges().len() > before,
+        "the name is asked"
+    );
+}
+
+/// A denial made from validated NSEC records carries the records that
+/// prove it, however many others the cache holds for the zone (RFC 8198
+/// §5.1): the one covering the name and the one covering the wildcard.
+#[test]
+fn a_denial_from_validated_nsec_records_carries_only_its_proof() {
+    let (mut net, anchors) = internet(true);
+    let mut resolver = resolver(config(anchors));
+    for (n, label) in ["aaa", "ba", "bz", "nx", "wz", "zz", "xa"]
+        .iter()
+        .enumerate()
+    {
+        ask(
+            &mut resolver,
+            &mut net,
+            n as u64,
+            query(
+                client(1),
+                &format!("{label}.example.com."),
+                RecordType::A,
+                dnssec_ok,
+            ),
+        );
+    }
+    let before = net.recording().exchanges().len();
+    let reply = ask(
+        &mut resolver,
+        &mut net,
+        20,
+        query(client(1), "nz.example.com.", RecordType::A, dnssec_ok),
+    );
+    assert_eq!(net.recording().exchanges().len(), before, "from the cache");
+    assert_eq!(reply.metadata.response_code, ResponseCode::NXDomain);
+    assert!(reply.metadata.authentic_data);
+    assert!(!reply.metadata.truncation);
+    let mut owners: Vec<String> = reply
+        .authorities
+        .iter()
+        .filter(|record| record.record_type() == RecordType::NSEC)
+        .map(|record| record.name.to_string())
+        .collect();
+    owners.sort();
+    // `ns1` covers `nz`; the apex covers `*.example.com`.
+    assert_eq!(owners, ["example.com.", "ns1.example.com."]);
+}
+
 /// An NSEC record that does not verify never makes a denial Secure and
 /// is never kept to deny other names: here every NXDOMAIN of
 /// `example.com` carries an unsigned NSEC that would cover `www`, which
@@ -1798,6 +1883,68 @@ fn a_forwarder_that_does_not_validate_passes_cd_on() {
         })
         .collect();
     assert_eq!(cd, [false, true]);
+}
+
+/// What a client with CD set gets through dnsmasq without DNSSEC never
+/// answers a later client without CD: that question goes upstream without
+/// CD, and gets the validating upstream's SERVFAIL.
+#[test]
+fn a_forwarder_never_answers_a_client_without_cd_from_a_cd_answer() {
+    let upstream = SocketAddr::new(ip(EXAMPLE), 53);
+    let mut net = MemoryNet::new();
+    net.serve(
+        ip(EXAMPLE),
+        AuthorityEngine::new(Validating, ServerConfig::generic(), upstream),
+    );
+    let mut dnsmasq = resolver(Config::dnsmasq(vec![upstream]));
+    let checking_disabled = |message: &mut Message| {
+        message.metadata.checking_disabled = true;
+        dnssec_ok(message);
+    };
+    let reply = ask(
+        &mut dnsmasq,
+        &mut net,
+        0,
+        query(client(1), "www.bad.com.", RecordType::A, checking_disabled),
+    );
+    assert_eq!(addresses(&reply), ["192.0.2.98"]);
+    let reply = ask(
+        &mut dnsmasq,
+        &mut net,
+        1,
+        query(client(2), "www.bad.com.", RecordType::A, dnssec_ok),
+    );
+    assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
+    assert!(addresses(&reply).is_empty());
+    let cd: Vec<bool> = net
+        .recording()
+        .exchanges()
+        .iter()
+        .map(|(ask, _)| {
+            Message::from_vec(&ask.query)
+                .unwrap()
+                .metadata
+                .checking_disabled
+        })
+        .collect();
+    assert_eq!(cd, [true, false]);
+}
+
+/// A forwarder that answers with a referral does not recurse, so the
+/// referral is no step closer: the question fails after one query, never
+/// asking the same forwarder again until the work bound runs out.
+#[test]
+fn a_referral_from_a_forwarder_fails_the_question() {
+    let (mut net, _) = internet(false);
+    let mut dnsmasq = resolver(Config::dnsmasq(vec![SocketAddr::new(ip(ROOT), 53)]));
+    let reply = ask(
+        &mut dnsmasq,
+        &mut net,
+        0,
+        query(client(1), "www.example.com.", RecordType::A, |_| {}),
+    );
+    assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
+    assert_eq!(net.recording().exchanges().len(), 1);
 }
 
 #[test]
@@ -1988,6 +2135,65 @@ fn stale_data_no_check_validated_never_reaches_a_validating_client() {
             "{client_timeout:?}: {reply:?}"
         );
         assert!(addresses(&reply).is_empty());
+    }
+}
+
+/// On the client timeout, the aliases a validating client's question
+/// followed to stale data are validated before the answer goes out: a
+/// Bogus CNAME to a name whose servers stopped answering fails, as it
+/// does when they answer.
+#[test]
+fn stale_data_on_the_client_timeout_never_brings_an_unchecked_alias() {
+    for lose in [true, false] {
+        let (mut net, anchors) = internet(true);
+        let mut resolver = resolver(Config {
+            anchors,
+            ede: true,
+            ..stale_config(Duration::from_secs(1))
+        });
+        let reply = ask(
+            &mut resolver,
+            &mut net,
+            0,
+            query(client(1), "www.example.com.", RecordType::A, dnssec_ok),
+        );
+        assert!(reply.metadata.authentic_data);
+        // Both addresses of the zone's server are cached, so a lost
+        // resolution waits a second for each, past the client timeout.
+        ask(
+            &mut resolver,
+            &mut net,
+            0,
+            query(client(1), "ns1.example.com.", RecordType::A, |_| {}),
+        );
+        if lose {
+            lose_example(&mut net);
+        }
+        let entropy = entropy();
+        resolver.handle(
+            Input::Query(query(client(2), "alias.bad.com.", RecordType::A, dnssec_ok)),
+            at(400),
+            &entropy,
+        );
+        let mut answers = pump(&mut resolver, &mut net, at(400), Vec::new());
+        while answers.is_empty() {
+            let now = resolver.next_deadline().expect("the resolution goes on");
+            resolver.handle(Input::Tick, now, &entropy);
+            answers = pump(&mut resolver, &mut net, now, Vec::new());
+        }
+        let reply = Message::from_vec(&answers[0].bytes).unwrap();
+        assert_eq!(
+            reply.metadata.response_code,
+            ResponseCode::ServFail,
+            "servers lost: {lose}: {reply:?}"
+        );
+        assert!(reply.answers.is_empty(), "servers lost: {lose}: {reply:?}");
+        // No DNSKEY in `bad.com` matches the DS.
+        assert_eq!(
+            edes(&reply),
+            [EdeCode::DNSKEY_MISSING],
+            "servers lost: {lose}"
+        );
     }
 }
 

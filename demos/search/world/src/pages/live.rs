@@ -150,6 +150,8 @@ pub(super) struct Live {
     observer: Mutex<Option<Arc<capture::Observer>>>,
     /// Where the allowlist's growth is reported.
     observations: Observations,
+    /// What runs when the allowlist reaches a new host.
+    served: Served,
 }
 
 impl Drop for Live {
@@ -159,7 +161,12 @@ impl Drop for Live {
 }
 
 impl Live {
-    fn new(root: &Path, reach: Reach, observations: Observations) -> Result<Arc<Self>, String> {
+    fn new(
+        root: &Path,
+        reach: Reach,
+        observations: Observations,
+        served: Served,
+    ) -> Result<Arc<Self>, String> {
         let key = Key::new("EXA_API_KEY", std::env::var("EXA_API_KEY").ok())?;
         std::fs::create_dir_all(root).map_err(|e| e.to_string())?;
         let stamp = std::time::SystemTime::now()
@@ -179,6 +186,7 @@ impl Live {
             fetcher: Transport::new()?,
             observer: Mutex::default(),
             observations,
+            served,
         }))
     }
 
@@ -351,6 +359,7 @@ impl Live {
         let Some(from) = state.allowed.get(url).copied() else {
             return;
         };
+        let hosts = state.hosts.len();
         if redirect {
             for target in links.pages {
                 state.allow(target, from);
@@ -369,8 +378,12 @@ impl Live {
             }
         }
         let links = state.allowed.len() as u64;
+        let grew = state.hosts.len() > hosts;
         drop(state);
         self.report_allowlist(cx, links);
+        if grew {
+            self.served.run();
+        }
     }
 
     /// Asks the host of `url`, a page Live-Depth copied, once a session
@@ -491,12 +504,17 @@ impl Live {
     /// Allows the results of a search at depth 0.
     fn allow_results(&self, cx: &Cx, search: &search::Search) {
         let mut state = self.state();
+        let hosts = state.hosts.len();
         for result in &search.results {
             state.allow(result.url.clone(), Allowed::Page { depth: 0 });
         }
         let links = state.allowed.len() as u64;
+        let grew = state.hosts.len() > hosts;
         drop(state);
         self.report_allowlist(cx, links);
+        if grew {
+            self.served.run();
+        }
     }
 
     fn report_allowlist(&self, cx: &Cx, links: u64) {
@@ -971,11 +989,13 @@ impl Pages {
             downloads,
             Reach::Asked,
             self.observation.clone(),
+            self.served.clone(),
         )?);
         self.depth = Some(Live::new(
             downloads,
             Reach::Allowlist,
             self.observation.clone(),
+            self.served.clone(),
         )?);
         self.settings.get_mut().unwrap().source = Source::Live;
         Ok(self)

@@ -290,6 +290,28 @@ fn v4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
     IpAddr::V4(Ipv4Addr::new(a, b, c, d))
 }
 
+/// One rule says which addresses a public internet host can have, the
+/// IANA special-purpose registries' (RFC 6890), for the network and the
+/// mirror alike: multicast and `0.0.0.0/8` are no host's, as private
+/// space is not.
+#[test]
+fn no_public_host_has_a_special_purpose_address() {
+    use fictionet::stdlib::network::ip::non_public_address;
+    for address in [
+        "224.0.0.1",
+        "0.0.0.1",
+        "10.0.0.1",
+        "192.0.2.1",
+        "ff02::1",
+        "fec0::1",
+    ] {
+        assert!(non_public_address(address.parse().unwrap()), "{address}");
+    }
+    for address in ["45.33.4.80", "192.0.0.9", "2606:4700:4700::1111"] {
+        assert!(!non_public_address(address.parse().unwrap()), "{address}");
+    }
+}
+
 /// The resolver hints and the root letter presets name the same servers
 /// at the same addresses.
 #[test]
@@ -920,7 +942,7 @@ fn whoami_names_are_answered_from_the_egress_and_never_relayed() {
         let mirror = Mirror::new(hierarchy.clone(), net.handle(), &at);
         net.hosts(internet::root_servers(|s| mirror.relay(s), &at))
             .hosts(internet::public_resolvers(
-                |r, h| h.program(r.recursive(&at, clock)),
+                |r, h| h.program(r.recursive(r.config(&at), clock)),
                 &at,
             ))
             .start(&fcx, attachments)?;
@@ -1032,6 +1054,95 @@ fn a_measured_location_holds_what_the_servers_say_about_themselves() {
     });
 }
 
+/// Real servers that answer CHAOS questions as the San Francisco preset
+/// says each root letter does, and nothing else.
+struct Letters(Location);
+
+impl Source for Letters {
+    fn ask<'a>(
+        &'a self,
+        _fcx: &'a Cx,
+        ask: Ask,
+    ) -> Pin<Box<dyn Future<Output = Observed> + Send + 'a>> {
+        let Parsed::Request(req) = Request::parse(&ask.query, ask.transport) else {
+            panic!("the probe asked something that is not a query");
+        };
+        let server = ask.server.ip();
+        let letter = ROOT_LETTERS
+            .iter()
+            .any(|l| IpAddr::V4(l.server.v4) == server);
+        if !letter || req.question.query_class() != DNSClass::CH {
+            return Box::pin(ready(Observed::Unreachable));
+        }
+        let identity = self.0.site(server).identity;
+        let (response, edns) = identity.reply(&req);
+        let mut reply = ServerConfig::root(identity).front(&req, response);
+        if !edns {
+            reply.message.edns = None;
+        }
+        Box::pin(ready(Observed::Reply(
+            reply.message.to_vec().expect("a reply"),
+        )))
+    }
+}
+
+/// A server measured in Live answers each CHAOS question as the real one
+/// does, here as the preset plays it: a BIND server serves the names it
+/// answers as zones, whatever it says to `id.server`.
+#[test]
+fn a_measured_bind_server_serves_its_chaos_names_as_zones() {
+    world(Duration::from_secs(60), |fcx| async move {
+        let real = location();
+        let at =
+            Location::measured(&fcx, &Letters(real.clone()), None, Duration::from_secs(2)).await;
+        // c.root answers id.server; g.root refuses it.
+        for server in [v4(192, 33, 4, 12), v4(192, 112, 36, 4)] {
+            let (real, measured) = (real.site(server).identity, at.site(server).identity);
+            for qname in [
+                "id.server.",
+                "hostname.bind.",
+                "version.bind.",
+                "version.server.",
+                "authors.bind.",
+                "foo.hostname.bind.",
+                "invalid.",
+            ] {
+                for qtype in [
+                    RecordType::TXT,
+                    RecordType::A,
+                    RecordType::SOA,
+                    RecordType::NS,
+                    RecordType::ANY,
+                ] {
+                    let mut message = Message::query();
+                    let mut question = Query::query(Name::from_ascii(qname).unwrap(), qtype);
+                    question.set_query_class(DNSClass::CH);
+                    message.add_query(question);
+                    let Parsed::Request(req) =
+                        Request::parse(&message.to_vec().unwrap(), Transport::Udp)
+                    else {
+                        panic!("a query");
+                    };
+                    let (want, _) = real.reply(&req);
+                    let (got, _) = measured.reply(&req);
+                    let case = format!("{server} {qname} {qtype}: {got:?}");
+                    assert_eq!(
+                        got.message.metadata.response_code, want.message.metadata.response_code,
+                        "{case}"
+                    );
+                    assert_eq!(
+                        got.message.metadata.authoritative, want.message.metadata.authoritative,
+                        "{case}"
+                    );
+                    assert_eq!(got.message.answers, want.message.answers, "{case}");
+                    assert_eq!(got.message.authorities, want.message.authorities, "{case}");
+                }
+            }
+        }
+        Ok(())
+    });
+}
+
 /// A real server that echoes the address a question came from would see
 /// a public resolver's own egress, not the world's: `whoami.direct` plays
 /// such a server, answering with the address the source asks from.
@@ -1115,7 +1226,10 @@ fn public_resolvers_keep_one_cache_per_sandbox() {
             .hosts(internet::public_resolvers(
                 |r, h| {
                     let record = record.clone();
-                    h.program(r.recursive(&at, clock).on_event(move |event| record(event)))
+                    h.program(
+                        r.recursive(r.config(&at), clock)
+                            .on_event(move |event| record(event)),
+                    )
                 },
                 &at,
             ))

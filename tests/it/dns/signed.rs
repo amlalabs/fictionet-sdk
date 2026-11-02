@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use fictionet::stdlib::protocols::dns::dnssec::rdata::DNSSECRData;
 use fictionet::stdlib::protocols::dns::dnssec::{
     Algorithm, AlgorithmPolicy, Anchors, Chain, DigestType, Fetched, KeyFlags, KeySet, Link, Ring,
-    Sign, Validation, Window, ZoneKey, ds, validate_denial, validate_rrset,
+    Sign, TBS, Validation, Verify, Window, ZoneKey, ds, validate_denial, validate_rrset,
 };
 use fictionet::stdlib::protocols::dns::op::{Edns, Message, MessageType, OpCode, Query};
 use fictionet::stdlib::protocols::dns::rr::rdata::{A, NS, SOA};
@@ -385,4 +385,112 @@ fn check_chain_reports_a_wrong_sha256_ds_beside_a_right_sha1_one() {
             child: LowerName::new(&owner),
         }]
     );
+}
+
+/// One algorithm the policy validates is enough for a path (RFC 6840
+/// §5.11): a zone with a KSK and a ZSK of Ed25519 and of ECDSA P-256 is
+/// Secure, and has no problem, under a policy that drops either one.
+#[test]
+fn check_chain_finds_a_zone_of_two_algorithms_whole_with_either() {
+    let key = |seed: u64, algorithm, flags| -> Arc<dyn Sign> {
+        Arc::new(ZoneKey::generate(
+            &SeededEntropy::new(Seed::from_u64(seed)),
+            algorithm,
+            flags,
+        ))
+    };
+    let both = KeySet {
+        keys: vec![
+            key(1, Algorithm::Ed25519, KeyFlags::KSK),
+            key(2, Algorithm::Ed25519, KeyFlags::ZSK),
+            key(3, Algorithm::EcdsaP256Sha256, KeyFlags::KSK),
+            key(4, Algorithm::EcdsaP256Sha256, KeyFlags::ZSK),
+        ],
+    };
+    let signed = zone().signed(&both, window(), Denial::Nsec).unwrap();
+    let served = sets(&ask(&signed, "ns1.example.", RecordType::A, AnyResponse::All).answers);
+    let dnskey =
+        sets(&ask(&signed, "example.", RecordType::DNSKEY, AnyResponse::All).answers).remove(0);
+    let chain = Chain {
+        links: vec![Link {
+            zone: name("example."),
+            ds: Fetched::Failed,
+            dnskey: Fetched::Answer(dnskey),
+        }],
+    };
+    let anchors = Anchors::of(vec![both.anchor(&name("example."))]);
+    for dropped in [13, 15] {
+        let mut policy = AlgorithmPolicy::iana();
+        policy.validate.remove(&dropped);
+        assert_eq!(
+            check_chain(&[&signed], &policy, now()),
+            [],
+            "without {dropped}"
+        );
+        let validation = validate_rrset(&served[0], &[], &chain, &anchors, &policy, now(), &Ring);
+        assert_eq!(validation, Validation::Secure, "without {dropped}");
+    }
+    // Without both, validators find the zone Insecure.
+    let mut policy = AlgorithmPolicy::iana();
+    policy.validate.remove(&13);
+    policy.validate.remove(&15);
+    let apex = LowerName::new(&name("example."));
+    assert_eq!(
+        check_chain(&[&signed], &policy, now()),
+        [
+            ChainProblem::UnsupportedAlgorithm {
+                apex: apex.clone(),
+                algorithm: 15,
+            },
+            ChainProblem::UnsupportedAlgorithm {
+                apex,
+                algorithm: 13,
+            },
+        ]
+    );
+}
+
+/// A DNAME's target is signed in canonical, lowercase form (RFC 4034
+/// §6.2 item 3), as other validators check it, whatever its case in the
+/// zone, and validates as served.
+#[test]
+fn a_dname_target_is_signed_in_lowercase() {
+    let soa = SOA::new(
+        name("ns1.example."),
+        name("hostmaster.example."),
+        1,
+        7200,
+        3600,
+        1209600,
+        300,
+    );
+    let zone = Zone::builder(name("example."), soa, 3600)
+        .rrset(rrset("example.", vec![RData::NS(NS(name("ns1.example.")))]))
+        .rrset(rrset("ns1.example.", vec![RData::A(A::new(192, 0, 2, 1))]))
+        .rrset(rrset("d.example.", vec![dname(&name("Target.TEST."))]))
+        .build()
+        .unwrap();
+    let signed = zone.signed(&keys(), window(), Denial::Nsec).unwrap();
+    let served = sets(&ask(&signed, "d.example.", RecordType::DNAME, AnyResponse::All).answers);
+    assert_eq!(validate(&signed, &served[0]), Validation::Secure);
+    // The bytes another validator checks: the target in lowercase.
+    let lowercase = rrset("d.example.", vec![dname(&name("target.test."))]);
+    let keys: Vec<_> = keys().keys.iter().map(|key| key.dnskey()).collect();
+    assert_eq!(served[0].rrsigs().len(), 2);
+    for record in served[0].rrsigs() {
+        let RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) = &record.data else {
+            panic!("an RRSIG");
+        };
+        let tbs = TBS::from_input(
+            lowercase.name(),
+            lowercase.dns_class(),
+            rrsig.input(),
+            lowercase.records_without_rrsigs(),
+        )
+        .unwrap();
+        let verified = keys
+            .iter()
+            .any(|key| Ring.verify(key, tbs.as_ref(), rrsig.sig()));
+        assert!(verified, "the {:?} RRSIG", rrsig.input().algorithm);
+    }
 }

@@ -24,12 +24,12 @@ use super::keys::{KeyFlags, digest_of, key_tag};
 use super::policy::{AlgorithmPolicy, Treatment};
 use super::proof::{self, Proof};
 use super::rdata::{DNSKEY, DNSSECRData, DS};
-use super::sign::serial;
+use super::sign::{serial, signed_data};
 use super::{Anchors, TrustAnchor, Verify};
 use crate::stdlib::protocols::dns::EdeCode;
 use crate::stdlib::protocols::dns::op::{Query, ResponseCode};
 use crate::stdlib::protocols::dns::rr::{Name, RData, RecordSet, RecordType, SerialNumber};
-use hickory_proto::dnssec::{PublicKey, TBS};
+use hickory_proto::dnssec::PublicKey;
 
 /// What a validator established for one answer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -554,13 +554,7 @@ impl<V: Verify> Check<'_, V> {
         if candidates.is_empty() {
             return Err(Failure::NoKey);
         }
-        let tbs = TBS::from_input(
-            set.name(),
-            set.dns_class(),
-            input,
-            set.records_without_rrsigs(),
-        )
-        .map_err(|_| Failure::BadSignature)?;
+        let tbs = signed_data(set, input).map_err(|_| Failure::BadSignature)?;
         if candidates
             .iter()
             .any(|key| self.verify.verify(key, tbs.as_ref(), signature))
