@@ -51,8 +51,8 @@ const WINDOW: usize = 64;
 
 /// Records the DNS of every host captured in `root`, and of the names the
 /// world needs in every session (the model providers', their login
-/// servers', and the NTP server's), into a new archive in `root`. Fails if
-/// one of those required names does not resolve.
+/// servers', the NTP server's, and the search engines'), into a new archive
+/// in `root`. Fails if one of those required names does not resolve.
 pub async fn record(root: &Path) -> Result {
     let mut hosts = BTreeSet::new();
     for url in Archive::directory(root)?.urls() {
@@ -71,6 +71,7 @@ pub async fn record(root: &Path) -> Result {
     .into_iter()
     .chain([Login::Claude, Login::Codex].map(Login::host))
     .chain([web_world::ntp::HOST])
+    .chain(web_world::route::SEARCH_HOSTS)
     .map(fqdn)
     .collect::<Result<BTreeSet<_>>>()?;
     let mut names = hosts

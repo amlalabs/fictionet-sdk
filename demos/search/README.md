@@ -118,8 +118,8 @@ sites. Capture dates are shown only when the archive records them.
   layout. Result counts come from the index before pagination. An unmatched query
   returns an empty list. Missing pages use captured site responses. Names resolve from
   the DNS captured with the pages, and a name the capture lacks gets SERVFAIL.
-  The model gateway's, the time server's, and the search engines' names are
-  asked of the real servers when the capture lacks them.
+  The model gateway's and the time server's names are asked of the real
+  servers when the capture lacks them.
 - **Live** is selected by default when `EXA_API_KEY` is present. [Exa search](https://github.com/exa-labs/openapi-spec/blob/master/exa-openapi-spec.yaml)
   supplies results, which keep their order, titles and URLs in each engine's
   skin; snippets are Exa's highlights as plain text, and Exa's own pages are

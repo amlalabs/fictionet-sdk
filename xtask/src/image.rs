@@ -210,7 +210,7 @@ pub async fn build(downloads: &Path) -> Result {
     .await?;
     checked(Command::new("qemu-img").arg("check").arg(&compact)).await?;
     admin.write(&baked.admin_key())?;
-    image::write_private(&baked.trust_root(), &roots.to_pem())?;
+    image::write_private(&baked.trust_root(), roots.to_pem())?;
     image::write_private(&baked.placeholder(), &placeholder)?;
     std::fs::rename(compact, &output)?;
     println!(
