@@ -258,7 +258,7 @@
 //! | [`protocols::dhcpv6`] | DHCPv6 client, server and relay messages. |
 //! | [`protocols::diameter`] | Diameter messages and attribute-value pairs. |
 //! | [`protocols::dnp3`] | DNP3 link frames, transport segments and application headers. |
-//! | [`protocols::dns`] | DNS messages from the re-exported `hickory-proto` crate. |
+//! | [`protocols::dns`] | DNS messages from the re-exported `hickory-proto` crate, with query checks, truncation, and relay restore. |
 //! | [`protocols::dtls`] | DTLS records and handshake reassembly without cryptography. |
 //! | [`protocols::enip`] | EtherNet/IP encapsulation and CIP messages. |
 //! | [`protocols::fast`] | FAST 1.1 templates, dictionaries, encoding and decoding. |
@@ -364,6 +364,7 @@
 //! | Module | Description |
 //! | --- | --- |
 //! | [`services::ca`] | Seeded certificate authorities and server certificates. |
+//! | [`services::keys`] | Seeded private keys: P-256, P-384, RSA, and Ed25519. |
 //! | [`services::serve`] | Service drivers, listeners, transcripts and fault plans. |
 //! | [`services::tls`] | Simulated TLS servers using rustls. |
 //!
