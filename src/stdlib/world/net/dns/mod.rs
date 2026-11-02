@@ -23,6 +23,11 @@
 //! are hosts placed when a name is first asked, for worlds whose hosts
 //! come into being as they are looked up.
 //!
+//! [`internet`] has the internet's servers as presets that return hosts:
+//! the root and `gtld-servers.net` servers, the public resolvers, and a
+//! [`Mirror`](internet::Mirror) that relays the real hierarchy. A world
+//! that adds none of them has no internet.
+//!
 //! A gateway that knows a few names and has no internet:
 //!
 //! ```
@@ -50,6 +55,7 @@
 //! | [`Cached`] | A source that keeps replies for their smallest TTL. |
 //! | [`Namespace`] | The session a world's DNS programs answer for; advancing it starts a new one everywhere. |
 //! | [`placing`] | A root zone that places a host for a name the first time the name is asked. |
+//! | [`internet`] | The root, `gtld-servers.net`, and public resolver hosts, and a mirror of the real hierarchy. |
 
 use fictionet::stdlib::protocols::dns::rr::rdata::{NS, SOA};
 use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RData, Record, RecordSet};
@@ -57,6 +63,7 @@ use fictionet::stdlib::services::dns::zone::{Fact, Lazy, Provider};
 
 use super::{Host, NetHandle, normalize};
 
+pub mod internet;
 mod program;
 mod source;
 
