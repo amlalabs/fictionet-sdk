@@ -85,6 +85,25 @@ fn port_sharing_prepares_without_mutation_and_defaults_to_identity() {
     assert_eq!(*server.installed.lock().unwrap(), [(local, names)]);
 }
 
+/// A name declared inside one of the gateway's default zones, such as
+/// `home.arpa`, answers, as Unbound puts the operator's data into its
+/// default zone; the zone's other names still do not exist.
+#[test]
+fn a_name_declared_under_home_arpa_answers() {
+    world(Duration::from_secs(60), move |fcx| async move {
+        let nas = Ipv4Addr::new(10, 30, 0, 5);
+        let (attacher, attachments) = fictionet::attachments();
+        Net::new()
+            .ipv4_only()
+            .host("nas", |h| h.at(nas).dns_name("nas.home.arpa"))
+            .start(&fcx, attachments)?;
+        let m = machine(&fcx, attacher.attach("client")?, ME);
+        assert_eq!(lookup(&fcx, &m, "nas.home.arpa").await, Some(nas));
+        assert_eq!(lookup(&fcx, &m, "printer.home.arpa").await, None);
+        Ok(())
+    });
+}
+
 #[test]
 fn rejected_port_sharing_discards_preparations_at_every_endpoint() {
     for reject in ["203.0.113.8:8", "[2001:db8:1::8]:7"] {

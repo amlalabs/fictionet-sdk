@@ -32,7 +32,9 @@ use fictionet::time::Instant;
 /// policy in front with [`Only`].
 pub trait Source: Send + Sync + 'static {
     /// What a client of `ask.server` sees when it sends `ask.query`: the
-    /// reply as it arrived, an unreachable server, or nothing in time. The
+    /// reply as it arrived, an unreachable server, or nothing in time. A
+    /// reply carries the ID of `ask.query`, as the client would see it,
+    /// whatever ID the source used on its own way to a server. The
     /// future may finish on a host thread that waits for the internet;
     /// only its waker crosses back.
     fn ask<'a>(

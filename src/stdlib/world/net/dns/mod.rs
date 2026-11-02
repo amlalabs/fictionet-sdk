@@ -61,9 +61,8 @@
 //! | [`internet`] | The root, `gtld-servers.net`, and public resolver hosts, and a mirror of the real hierarchy. |
 //! | [`encrypted`] | DNS over TLS on port 853 and DNS over HTTPS on port 443 for a running [`Recursive`]. |
 
-use fictionet::stdlib::protocols::dns::rr::rdata::{NS, SOA};
-use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RData, Record, RecordSet};
-use fictionet::stdlib::services::dns::zone::{Fact, Lazy, Provider};
+use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RecordSet};
+use fictionet::stdlib::services::dns::zone::{Fact, Lazy, Provider, special};
 
 use super::{Host, NetHandle, normalize};
 
@@ -75,9 +74,6 @@ mod source;
 pub use program::{Authoritative, Recursive, ResolverHandle};
 pub use source::{Cached, Namespace, Only, PerSession, Question, Source};
 
-/// The TTL of a locally served zone's SOA and NS records (RFC 6303 §3).
-const LOCAL_TTL: u32 = 10800;
-
 /// How long resolvers may keep the addresses of a host placed by
 /// [`placing`], in seconds: Unbound's default TTL for `local-data`.
 pub(super) const HOST_TTL: u32 = 3600;
@@ -86,27 +82,10 @@ pub(super) const HOST_TTL: u32 = 3600;
 /// no host may get one later, so a negative answer is kept only briefly.
 const PLACING_NEGATIVE_TTL: u32 = 60;
 
-/// The SOA of a zone a resolver serves itself at `apex`, as Unbound gives
-/// its own (RFC 6303 §3): the apex as MNAME, `nobody.invalid.` as RNAME,
-/// serial 1, refresh 3600, retry 1200, expire 604800, and `minimum`.
-fn local_soa(apex: &Name, minimum: u32) -> SOA {
-    let rname = Name::from_ascii("nobody.invalid.").expect("a valid name");
-    SOA::new(apex.clone(), rname, 1, 3600, 1200, 604800, minimum)
-}
-
-/// The SOA and NS RRsets of a zone a resolver serves itself at `apex`,
-/// with the TTL and minimum of RFC 6303 §3. The NS target is the apex, as
-/// in Unbound's `localhost.` zone.
+/// The SOA and NS RRsets of a zone a resolver serves itself at `apex`, as
+/// Unbound gives them to its own local zones ([`special::local_apex`]).
 pub(super) fn local_zone(apex: &Name) -> (RecordSet, RecordSet) {
-    let rrset = |rdata: RData| {
-        let mut set = RecordSet::with_ttl(apex.clone(), rdata.record_type(), LOCAL_TTL);
-        set.set_records(vec![Record::from_rdata(apex.clone(), LOCAL_TTL, rdata)]);
-        set
-    };
-    (
-        rrset(RData::SOA(local_soa(apex, LOCAL_TTL))),
-        rrset(RData::NS(NS(apex.clone()))),
-    )
+    special::local_apex(apex, special::LOCAL_TTL)
 }
 
 /// A root zone whose names are hosts, each placed with
@@ -156,6 +135,6 @@ where
             Err(_) => Fact::Absent,
         }
     };
-    let soa = local_soa(&root, PLACING_NEGATIVE_TTL);
+    let soa = special::local_soa(PLACING_NEGATIVE_TTL);
     Lazy::new(root, soa, ns, PLACING_NEGATIVE_TTL, provider)
 }

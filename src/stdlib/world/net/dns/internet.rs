@@ -41,10 +41,7 @@ use std::time::Duration;
 use fictionet::stdlib::network::route::Prefix;
 use fictionet::stdlib::protocols::dns::Request;
 use fictionet::stdlib::protocols::dns::op::{Message, ResponseCode};
-use fictionet::stdlib::protocols::dns::rr::rdata::svcb::{
-    Alpn, IpHint, SvcParamKey, SvcParamValue, Unknown,
-};
-use fictionet::stdlib::protocols::dns::rr::rdata::{A, AAAA, NS, SOA, SVCB, TXT};
+use fictionet::stdlib::protocols::dns::rr::rdata::TXT;
 use fictionet::stdlib::protocols::dns::rr::{
     LowerName, Name, RData, Record, RecordSet, RecordType,
 };
@@ -573,76 +570,9 @@ fn quad9(site: &ResolverSite, _egress: Option<&Egress>) -> Config {
     Config::quad9(site.identity.clone())
 }
 
-/// OpenDNS, as seen on 2026-11-01: a 1410-octet payload; validation, with
-/// Extended DNS Errors; RD clear answered from its cache; `localhost` and
-/// `test` answered locally, with AA clear as on its `localhost` answers;
-/// and six SVCB records at `_dns.resolver.arpa` with TTL 300. It refuses
-/// every CHAOS name. What it does not show, such as QNAME minimisation, takes
-/// Unbound's values.
+/// OpenDNS, as its preset is. It refuses every CHAOS name.
 fn opendns(site: &ResolverSite, _egress: Option<&Egress>) -> Config {
-    type Param = (SvcParamKey, SvcParamValue);
-    let hints = |v4: &[Ipv4Addr], v6: &[Ipv6Addr]| -> [Param; 2] {
-        [
-            (
-                SvcParamKey::Ipv4Hint,
-                SvcParamValue::Ipv4Hint(IpHint(v4.iter().map(|a| A(*a)).collect())),
-            ),
-            (
-                SvcParamKey::Ipv6Hint,
-                SvcParamValue::Ipv6Hint(IpHint(v6.iter().map(|a| AAAA(*a)).collect())),
-            ),
-        ]
-    };
-    let anycast = hints(
-        &[
-            Ipv4Addr::new(208, 67, 220, 220),
-            Ipv4Addr::new(208, 67, 222, 222),
-        ],
-        &[
-            Ipv6Addr::new(0x2620, 0x119, 0x35, 0, 0, 0, 0, 0x35),
-            Ipv6Addr::new(0x2620, 0x119, 0x53, 0, 0, 0, 0, 0x53),
-        ],
-    );
-    let doh = hints(
-        &[Ipv4Addr::new(146, 112, 41, 2)],
-        &[Ipv6Addr::new(0x2620, 0x119, 0xfc, 0, 0, 0, 0, 0x2)],
-    );
-    let alpn = |protocol: &str| -> Param {
-        (
-            SvcParamKey::Alpn,
-            SvcParamValue::Alpn(Alpn(vec![protocol.to_string()])),
-        )
-    };
-    // The DoH URI template, SvcParamKey 7 (RFC 9461 §5).
-    let dohpath: Param = (
-        SvcParamKey::Unknown(7),
-        SvcParamValue::Unknown(Unknown(b"/dns-query{?dns}".to_vec())),
-    );
-    let dot = [alpn("dot"), (SvcParamKey::Port, SvcParamValue::Port(853))];
-    let https = |hints: &[Param]| [&[alpn("h2")], hints, std::slice::from_ref(&dohpath)].concat();
-    let endpoints: [(u16, &str, Vec<Param>); 6] = [
-        (5, "dns.opendns.com.", [&dot[..], &anycast].concat()),
-        (5, "dns.umbrella.com.", [&dot[..], &anycast].concat()),
-        (10, "dns.opendns.com.", https(&anycast)),
-        (10, "dns.umbrella.com.", https(&anycast)),
-        (20, "doh.opendns.com.", https(&doh)),
-        (20, "doh.umbrella.com.", https(&doh)),
-    ];
-    let ddr = endpoints
-        .into_iter()
-        .map(|(priority, host, params)| SVCB::new(priority, name(host), params))
-        .collect();
-    Config {
-        local: vec![Arc::new(special::localhost()), Arc::new(special::test())],
-        local_aa: false,
-        payload: 1410,
-        rd0_from_cache: true,
-        ede: true,
-        identity: site.identity.clone(),
-        ddr,
-        ddr_ttl: 300,
-        ..Config::unbound()
-    }
+    Config::opendns(site.identity.clone())
 }
 
 /// `o-o.myaddr.l.google.com` as Google's resolver answers it for a client
@@ -652,31 +582,15 @@ fn myaddr(google: IpAddr, egress: &Egress) -> Zone {
     const TTL: u32 = 60;
     let apex = name("o-o.myaddr.l.google.com.");
     let subnet = Ipv4Addr::from(u32::from(egress.0) & 0xffff_ff00);
-    let rrset = |rdata: Vec<RData>| {
-        let mut set = RecordSet::with_ttl(apex.clone(), rdata[0].record_type(), TTL);
-        let records = rdata
-            .into_iter()
-            .map(|data| Record::from_rdata(apex.clone(), TTL, data))
-            .collect();
-        set.set_records(records);
-        set
-    };
-    let txt = |text: String| RData::TXT(TXT::new(vec![text]));
-    let soa = SOA::new(
-        apex.clone(),
-        name("nobody.invalid."),
-        1,
-        3600,
-        1200,
-        604800,
-        TTL,
-    );
-    Zone::builder(apex.clone(), soa, TTL)
-        .rrset(rrset(vec![RData::NS(NS(apex.clone()))]))
-        .rrset(rrset(vec![
-            txt(format!("edns0-client-subnet {subnet}/24")),
-            txt(google.to_string()),
-        ]))
+    let records = [
+        format!("edns0-client-subnet {subnet}/24"),
+        google.to_string(),
+    ]
+    .map(|text| Record::from_rdata(apex.clone(), TTL, RData::TXT(TXT::new(vec![text]))));
+    let mut txt = RecordSet::with_ttl(apex.clone(), RecordType::TXT, TTL);
+    txt.set_records(records.to_vec());
+    special::local_zone(&apex, TTL)
+        .rrset(txt)
         .build()
         .expect("o-o.myaddr.l.google.com is a well-formed zone")
 }

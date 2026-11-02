@@ -1,14 +1,15 @@
 //! Zones a resolver serves itself instead of asking the internet: the
 //! special-use names of RFC 6761 and RFC 7686, the reverse zones of
-//! private and special addresses (RFC 6303), `home.arpa` (RFC 8375), and
-//! `resolver.arpa` (RFC 9462).
+//! private and special addresses (RFC 6303), `home.arpa` (RFC 8375),
+//! `resolver.arpa` (RFC 9462), and `service.arpa` (RFC 9665).
 //!
-//! Each zone uses its apex as its NS target, as Unbound's `localhost.`
-//! zone does (`localhost. NS localhost.`), and the SOA of RFC 6303 §3:
-//! the apex as MNAME, `nobody.invalid.` as RNAME, serial 1, refresh 3600,
-//! retry 1200, expire 604800, and minimum 10800, with TTL 10800. A
-//! resolver's configuration holds the ones it serves. Unbound serves them;
-//! Google's and Cloudflare's public resolvers do not.
+//! Each zone has the apex records Unbound gives all of these zones in
+//! `add_empty_default` (`services/localzone.c`): `localhost.` as the NS
+//! target and as the SOA's MNAME, `nobody.invalid.` as RNAME, serial 1,
+//! and the refresh 3600, retry 1200, expire 604800, and minimum 10800 of
+//! RFC 6303 §3, with TTL 10800. A resolver's configuration holds the ones
+//! it serves. Unbound serves them; Google's and Cloudflare's public
+//! resolvers do not.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -17,8 +18,9 @@ use fictionet::stdlib::protocols::dns::rr::{Name, RData, Record, RecordSet};
 
 use super::zone::{Zone, ZoneBuilder};
 
-/// The TTL of every record here (RFC 6303 §3).
-const TTL: u32 = 10800;
+/// The TTL of the records of the zones a resolver serves itself, and the
+/// minimum of their SOA (RFC 6303 §3).
+pub const LOCAL_TTL: u32 = 10800;
 
 /// `localhost`, whose names all point at the loopback addresses
 /// (RFC 6761 §6.3): A 127.0.0.1 and AAAA ::1 at the apex and, through a
@@ -133,23 +135,56 @@ pub fn invalid() -> Zone {
     built(builder(&name("invalid.")))
 }
 
-/// A zone at `apex` with the SOA and NS RRsets of RFC 6303 §3.
-fn builder(apex: &Name) -> ZoneBuilder {
-    let soa = SOA::new(
-        apex.clone(),
+/// `service.arpa`, for names of services inside a home network, which
+/// Unbound serves as an empty zone (RFC 9665).
+pub fn service_arpa() -> Zone {
+    built(builder(&name("service.arpa.")))
+}
+
+/// The SOA Unbound gives a zone it serves itself: `localhost.` as MNAME,
+/// `nobody.invalid.` as RNAME, serial 1, the refresh, retry, and expire
+/// of RFC 6303 §3, and `minimum`.
+pub fn local_soa(minimum: u32) -> SOA {
+    SOA::new(
+        name("localhost."),
         name("nobody.invalid."),
         1,
         3600,
         1200,
         604800,
-        10800,
-    );
-    Zone::builder(apex.clone(), soa, TTL).rrset(rrset(apex, RData::NS(NS(apex.clone()))))
+        minimum,
+    )
+}
+
+/// The SOA and NS RRsets Unbound gives a zone it serves itself at
+/// `apex`, with `ttl` as their TTL and as the SOA's minimum: the SOA of
+/// [`local_soa`] and `NS localhost.`.
+pub fn local_apex(apex: &Name, ttl: u32) -> (RecordSet, RecordSet) {
+    (
+        rrset_with(apex, RData::SOA(local_soa(ttl)), ttl),
+        rrset_with(apex, RData::NS(NS(name("localhost."))), ttl),
+    )
+}
+
+/// A zone at `apex` that holds the RRsets of [`local_apex`], for the
+/// records added after them.
+pub fn local_zone(apex: &Name, ttl: u32) -> ZoneBuilder {
+    let (_, ns) = local_apex(apex, ttl);
+    Zone::builder(apex.clone(), local_soa(ttl), ttl).rrset(ns)
+}
+
+/// A zone at `apex` with the apex records of every zone here.
+fn builder(apex: &Name) -> ZoneBuilder {
+    local_zone(apex, LOCAL_TTL)
 }
 
 fn rrset(owner: &Name, rdata: RData) -> RecordSet {
-    let mut set = RecordSet::with_ttl(owner.clone(), rdata.record_type(), TTL);
-    set.set_records(vec![Record::from_rdata(owner.clone(), TTL, rdata)]);
+    rrset_with(owner, rdata, LOCAL_TTL)
+}
+
+fn rrset_with(owner: &Name, rdata: RData, ttl: u32) -> RecordSet {
+    let mut set = RecordSet::with_ttl(owner.clone(), rdata.record_type(), ttl);
+    set.set_records(vec![Record::from_rdata(owner.clone(), ttl, rdata)]);
     set
 }
 

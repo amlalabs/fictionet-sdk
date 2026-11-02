@@ -76,13 +76,16 @@
 //!
 //! - `Some(site)`: the site gets an address, a machine and a route, and DNS
 //!   answers with that address.
-//! - `None`: the name does not exist, nor anything below it (RFC 8020), and
-//!   DNS answers NXDOMAIN.
+//! - `None`: no site has that name. DNS answers NXDOMAIN, unless a name
+//!   below it has a site.
 //!
-//! A name exists only if its parent does, so before a name is decided its
-//! parents are: looking up `www.example.com` runs the callback for `com`,
-//! then `example.com`, then `www.example.com`, each until one gets a site.
-//! The root is never asked about, nor a name whose first label is `*`.
+//! A lookup asks about every name on its path from the root down: looking
+//! up `www.example.com` runs the callback for `com`, then `example.com`,
+//! then `www.example.com`, whatever it returned for the names above. A
+//! name the callback turned down still exists once a name below it has a
+//! site, as an empty name that answers NODATA (RFC 8020 §2), so `None`
+//! for `example.com` does not hide `www.example.com`. The root is never
+//! asked about, nor a name whose first label is `*`.
 //!
 //! A site exists only once its name has been looked up. Connecting straight
 //! to an IP address, without a lookup, works only if a site already lives
@@ -564,7 +567,7 @@ type SiteFor = dyn Fn(&str) -> Option<Site> + Send + Sync;
 
 impl Sites {
     /// Sites decided by `site_for`, which gets a hostname and returns the
-    /// site for it, or `None` if nothing exists at that name or below it.
+    /// site for it, or `None` if no site has that name.
     /// It runs once for a name it gives a site, and again each time a name
     /// it turned down is looked up. See [the callback](fictionet::stdlib::web#the-callback).
     ///
@@ -615,8 +618,9 @@ impl Sites {
     /// no route to the internet ([`Net::gateway`]), whose local zones are
     /// the names the network's hosts declare and, after them, a root zone
     /// that asks the callback ([`dns::placing`]). The callback decides
-    /// every name but `localhost`, so the resolver's default zones for
-    /// `test`, `invalid`, and `onion` give way to it.
+    /// every name but `localhost`, so the resolver's other default zones,
+    /// such as `test`, `home.arpa`, and the reverse zones of private
+    /// addresses, give way to it.
     pub fn into_net(self) -> Net {
         let site_for = self.site_for;
         let date = self.date;
@@ -634,9 +638,7 @@ impl Sites {
         self.net.gateway(move |host, declared| {
             let localhost = LowerName::from(Name::from_ascii("localhost.").expect("a valid name"));
             let mut config = Config::gateway();
-            config
-                .local
-                .retain(|zone| zone.apex().num_labels() != 1 || *zone.apex() == localhost);
+            config.local.retain(|zone| *zone.apex() == localhost);
             // Local zones of equal depth answer last added first, so the
             // declared names answer before the callback is asked.
             let config = config

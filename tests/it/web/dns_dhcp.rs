@@ -122,6 +122,27 @@ fn sites_are_placed_on_first_lookup_even_under_a_used_top_level_domain() {
     });
 }
 
+/// The callback decides names under the resolver's default zones too,
+/// such as `home.arpa`.
+#[test]
+fn the_callback_decides_names_under_home_arpa() {
+    run_world::world(Duration::from_secs(60), |fcx| async move {
+        let asked: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let record = asked.clone();
+        let net = web::Sites::new(move |host| {
+            record.lock().unwrap().push(host.to_owned());
+            (host == "nas.home.arpa").then(|| web::Site::new(Plain("nas")))
+        })
+        .into_net();
+        let (attacher, attachments) = fictionet::attachments();
+        net.start(&fcx, attachments)?;
+        let m = default_machine(&fcx, &attacher);
+        lookup(&fcx, &m, "nas.home.arpa").await;
+        assert!(asked.lock().unwrap().contains(&"nas.home.arpa".to_owned()));
+        Ok(())
+    });
+}
+
 /// The gateway answers pings, and its DNS connections count toward the
 /// connections a peer may have open across the network.
 #[test]

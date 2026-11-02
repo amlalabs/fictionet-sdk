@@ -694,11 +694,12 @@ impl World {
 /// Unbound serves a `local-zone` of type `static` with its `local-data`:
 /// each declared name has its host's A and AAAA records, a name with
 /// declared names below it is an empty non-terminal, and every other name
-/// under that top-level domain does not exist. Each zone has the SOA and NS
-/// records Unbound gives its own local zones (RFC 6303 §3). Under a
-/// top-level domain no declared name uses, it knows nothing, so a resolver
-/// goes on to its other zones and to iteration. The zones grow as hosts
-/// are placed.
+/// under that top-level domain does not exist. A name inside one of the
+/// resolver's other local zones, such as `home.arpa`, is in a zone at that
+/// zone's apex instead ([`Declared::over`]). Each zone has the SOA and NS
+/// records Unbound gives its own local zones. Under a top-level domain no
+/// declared name uses, it knows nothing, so a resolver goes on to its
+/// other zones and to iteration. The zones grow as hosts are placed.
 ///
 /// A static zone denies every undeclared name under its top-level domain.
 /// A world whose resolver also iterates to real servers, and whose hosts
@@ -710,6 +711,9 @@ impl World {
 pub struct Declared {
     world: Arc<Mutex<World>>,
     root: LowerName,
+    /// The apexes of the resolver's other local zones, which
+    /// [`over`](Declared::over) makes give way to the declared names.
+    zones: Arc<[LowerName]>,
 }
 
 impl Declared {
@@ -717,33 +721,45 @@ impl Declared {
         Declared {
             world,
             root: LowerName::new(&Name::root()),
+            zones: Arc::new([]),
         }
     }
 
-    /// `config` with the declared names served before anything else at
-    /// their top-level domains: these zones are added as a local zone, and
-    /// each of `config`'s local zones at a top-level domain a declared name
-    /// uses gives way to them, as a default local zone of Unbound gives way
-    /// to a zone of the same name the operator configures. So a world that
-    /// declares `dc01.corp.test` gets its address, where Unbound's default
-    /// `test` zone (RFC 6761 §6.2) would deny it. Deeper local zones, such
-    /// as the reverse zones of RFC 6303, still answer first.
+    /// `config` with the declared names served before anything else: these
+    /// zones are added as a local zone, and each of `config`'s local zones
+    /// with a declared name at or below its apex gives way to them. The
+    /// declared names then answer inside a zone at that apex, with the SOA
+    /// and NS records Unbound gives its own, as Unbound puts the operator's
+    /// `local-data` into a default local zone of the same name. So a world
+    /// that declares `dc01.corp.test` or `nas.home.arpa` gets its address,
+    /// where Unbound's default `test` zone (RFC 6761 §6.2) or `home.arpa`
+    /// zone (RFC 8375) would deny it, and the other names in that zone
+    /// still do not exist.
     pub fn over(&self, mut config: Config) -> Config {
+        let declared = Declared {
+            zones: config
+                .local
+                .iter()
+                .map(|zone| zone.apex().clone())
+                .filter(|apex| !apex.is_root())
+                .collect(),
+            ..self.clone()
+        };
         config.local = config
             .local
             .into_iter()
             .map(|zone| {
-                if zone.apex().num_labels() == 1 {
+                if zone.apex().is_root() {
+                    zone
+                } else {
                     Arc::new(GivesWay {
                         zone,
-                        declared: self.clone(),
+                        declared: declared.clone(),
                     }) as Arc<dyn ZoneData>
-                } else {
-                    zone
                 }
             })
             .collect();
-        config.local(Arc::new(self.clone()))
+        config.local(Arc::new(declared))
     }
 
     /// Whether a declared name is at or below `apex`.
@@ -754,7 +770,9 @@ impl Declared {
 
 impl ZoneData for Declared {
     /// The root: the zones cover every top-level domain a declared name
-    /// will ever use. Each view's apex is its question's top-level domain.
+    /// will ever use. Each view's apex is the deepest of the local zones
+    /// that gave way above its question's name, or else the name's
+    /// top-level domain.
     fn apex(&self) -> &LowerName {
         &self.root
     }
@@ -764,29 +782,35 @@ impl ZoneData for Declared {
         if qname.is_root() {
             return Arc::new(Facts::unknown(self.root.clone()));
         }
-        let tld = LowerName::new(&qname.trim_to(1));
         let world = self.world.lock();
-        if !world.declares_below(&tld) {
-            return Arc::new(Facts::unknown(tld));
+        let apex = self
+            .zones
+            .iter()
+            .filter(|zone| zone.zone_of(&qname) && world.declares_below(zone))
+            .max_by_key(|zone| zone.num_labels())
+            .cloned()
+            .unwrap_or_else(|| LowerName::new(&qname.trim_to(1)));
+        if !world.declares_below(&apex) {
+            return Arc::new(Facts::unknown(apex));
         }
         // The facts an answer reads: each name from the question's name up
         // to the apex, and the wildcard below each.
         let mut facts = BTreeMap::new();
         let mut name = qname;
         loop {
-            facts.insert(name.clone(), world.fact(&tld, &name));
+            facts.insert(name.clone(), world.fact(&apex, &name));
             if let Ok(wildcard) = name.prepend_label("*") {
                 let wildcard = LowerName::new(&wildcard);
-                facts.insert(wildcard.clone(), world.fact(&tld, &wildcard));
+                facts.insert(wildcard.clone(), world.fact(&apex, &wildcard));
             }
-            if name == tld {
+            if name == apex {
                 break;
             }
             name = name.base_name();
         }
         Arc::new(Facts {
-            soa: local_zone(&Name::from(tld.clone())).0,
-            apex: tld,
+            soa: local_zone(&Name::from(apex.clone())).0,
+            apex,
             revision: Revision(world.revision),
             facts,
         })

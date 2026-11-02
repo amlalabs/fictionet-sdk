@@ -1716,7 +1716,7 @@ fn localhost_points_every_name_at_loopback() {
 }
 
 #[test]
-fn special_use_zones_are_empty_with_the_rfc_6303_soa() {
+fn special_use_zones_are_empty_with_unbounds_soa_and_ns() {
     let zones = special::rfc6303();
     // 33 zones of RFC 6303 and the 64 of the Shared Address Space
     // (RFC 6598 §7), as Unbound serves them.
@@ -1741,7 +1741,7 @@ fn special_use_zones_are_empty_with_the_rfc_6303_soa() {
         let RData::SOA(soa) = &reply.authorities[0].data else {
             panic!("SOA");
         };
-        assert_eq!(soa.mname, name(apex));
+        assert_eq!(soa.mname, name("localhost."), "Unbound names localhost.");
         assert_eq!(soa.rname, name("nobody.invalid."));
         assert_eq!(
             (soa.serial, soa.refresh, soa.retry, soa.expire, soa.minimum),
@@ -1756,11 +1756,16 @@ fn special_use_zones_are_empty_with_the_rfc_6303_soa() {
     );
     assert_eq!(reply.answers[0].data, RData::PTR(PTR(name("localhost."))));
 
+    // Every zone Unbound serves by default names `localhost.` as its name
+    // server and as its SOA's MNAME (`add_empty_default`).
     for zone in [
         special::onion(),
         special::test(),
         special::invalid(),
         special::home_arpa(),
+        special::service_arpa(),
+        special::resolver_arpa(vec![], 3600),
+        find("10.in-addr.arpa.").clone(),
     ] {
         let apex = zone.apex().to_string();
         let reply = ask(&zone, &format!("anything.{apex}"), RecordType::A);
@@ -1769,8 +1774,12 @@ fn special_use_zones_are_empty_with_the_rfc_6303_soa() {
             ResponseCode::NXDomain,
             "{apex}"
         );
+        let RData::SOA(soa) = &reply.authorities[0].data else {
+            panic!("SOA");
+        };
+        assert_eq!(soa.mname, name("localhost."), "{apex}");
         let reply = ask(&zone, &apex, RecordType::NS);
-        assert_eq!(reply.answers[0].data, ns(&apex));
+        assert_eq!(reply.answers[0].data, ns("localhost."), "{apex}");
     }
 }
 
