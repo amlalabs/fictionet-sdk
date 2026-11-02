@@ -57,7 +57,7 @@ use fictionet::stdlib::services::dns::authority::{
     ServerConfig, Step, chaos,
 };
 use fictionet::stdlib::services::dns::resolver::Config;
-use fictionet::stdlib::services::dns::zone::{AnyResponse, Zone, ZoneError, special};
+use fictionet::stdlib::services::dns::zone::{AnyResponse, Shown, Zone, ZoneError};
 use fictionet::stdlib::services::dns::{Client, Generation, WallClock};
 use fictionet::stdlib::services::serve::Transport;
 use fictionet::sync::Mutex;
@@ -435,24 +435,24 @@ fn opendns(site: &ResolverSite, _egress: Option<&Egress>) -> Config {
     Config::opendns(site.identity.clone())
 }
 
-/// `o-o.myaddr.l.google.com` as Google's resolver answers it for a client
-/// behind `egress`: TXT records with the client's /24 as Google sends it
-/// in EDNS Client Subnet, and the address Google asked from, with TTL 60.
-fn myaddr(google: IpAddr, egress: &Egress) -> Zone {
+/// `o-o.myaddr.l.google.com` TXT as Google's resolver answers it for a
+/// client behind `egress`: TXT records with the client's /24 as Google
+/// sends it in EDNS Client Subnet, and the address Google asked from, with
+/// TTL 60. The preset knows nothing else there, so every other type and
+/// every name below is asked of the real hierarchy, as the real resolver
+/// does, and the TXT answer leaves without AA, as the real one does.
+fn myaddr(google: IpAddr, egress: &Egress) -> Shown {
     const TTL: u32 = 60;
-    let apex = name("o-o.myaddr.l.google.com.");
+    let owner = name("o-o.myaddr.l.google.com.");
     let subnet = Ipv4Addr::from(u32::from(egress.0) & 0xffff_ff00);
     let records = [
         format!("edns0-client-subnet {subnet}/24"),
         google.to_string(),
     ]
-    .map(|text| Record::from_rdata(apex.clone(), TTL, RData::TXT(TXT::new(vec![text]))));
-    let mut txt = RecordSet::with_ttl(apex.clone(), RecordType::TXT, TTL);
+    .map(|text| Record::from_rdata(owner.clone(), TTL, RData::TXT(TXT::new(vec![text]))));
+    let mut txt = RecordSet::with_ttl(owner.clone(), RecordType::TXT, TTL);
     txt.set_records(records.to_vec());
-    special::local_zone(&apex, TTL)
-        .rrset(txt)
-        .build()
-        .expect("o-o.myaddr.l.google.com is a well-formed zone")
+    Shown::new(&owner, [txt]).expect("the TXT RRset is owned by o-o.myaddr.l.google.com")
 }
 
 // ---------------------------------------------------------------------------
@@ -1541,9 +1541,17 @@ impl Inner {
     }
 
     /// Whether a relay may go at `addr`: an address an internet host can
-    /// have, where no public resolver is and no preset's server already
-    /// answers.
+    /// have, other than the egress the source asks from, where no public
+    /// resolver is and no preset's server already answers. A relay at the
+    /// egress would send its questions from the host to the host's own
+    /// network edge.
     fn may_relay(&self, addr: IpAddr) -> bool {
+        if self
+            .egress
+            .is_some_and(|egress| addr == IpAddr::V4(egress.0))
+        {
+            return false;
+        }
         let resolver = PUBLIC_RESOLVERS.iter().any(|resolver| {
             resolver
                 .addresses

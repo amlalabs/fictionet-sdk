@@ -9,7 +9,7 @@ use fictionet::stdlib::protocols::dns::dnssec::{
 use fictionet::stdlib::protocols::dns::rr::rdata::SOA;
 use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, RData, RecordSet, RecordType};
 use fictionet::stdlib::services::dns::resolver::{
-    Cache, Entry, Key, Limits, Negative, Offer, Rank,
+    Cache, Checked, Entry, Key, Limits, Negative, Offer, Rank,
 };
 use fictionet::time::Instant;
 use fictionet::{Seed, SeededEntropy};
@@ -164,15 +164,52 @@ fn a_secure_rrset_lives_no_longer_than_its_rrsigs_original_ttl() {
         86400,
         300,
     );
-    cache.insert(at(0), positive(set));
+    cache.insert(at(0), positive(set.clone()));
     cache.validated(
         &www,
+        &Checked::Rrset(set),
         Validation::Secure,
         Some(at(2_000_000)),
         Some(300),
         at(1),
     );
     assert_eq!(expires(&cache, &www, at(1)), at(300));
+}
+
+/// A validation's result lands only on the data it checked: an RRset
+/// stored at the key while the validation waited keeps what it had.
+#[test]
+fn a_result_applies_only_to_the_data_it_checked() {
+    let mut cache = cache();
+    let www = key("www.example.", RecordType::A);
+    let signed = signed(rrset("www.example.", 600, vec![a("192.0.2.80")]), 600, 600);
+    let replaced = rrset("www.example.", 600, vec![a("203.0.113.66")]);
+    cache.insert(at(0), positive(replaced.clone()));
+    cache.validated(
+        &www,
+        &Checked::Rrset(signed),
+        Validation::Secure,
+        None,
+        None,
+        at(1),
+    );
+    let validation = |cache: &Cache| match cache.get(&www, at(1)) {
+        Some(Entry::Positive { validation, .. }) => *validation,
+        other => panic!("expected an RRset, got {other:?}"),
+    };
+    assert_eq!(validation(&cache), Validation::NotPerformed);
+    // The same records, with other TTLs and owner case, are the data.
+    let mut same = rrset("WWW.Example.", 60, vec![a("203.0.113.66")]);
+    same.set_ttl(60);
+    cache.validated(
+        &www,
+        &Checked::Rrset(same),
+        Validation::Insecure(fictionet::stdlib::protocols::dns::dnssec::Insecure::NoAnchor),
+        None,
+        None,
+        at(1),
+    );
+    assert!(matches!(validation(&cache), Validation::Insecure(_)));
 }
 
 #[test]

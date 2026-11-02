@@ -199,7 +199,8 @@ fn nodata_at_a_dname_owner_validates() {
                 &AlgorithmPolicy::iana(),
                 now(),
                 &Ring,
-            );
+            )
+            .validation;
             assert_eq!(validation, Validation::Secure, "{denial:?} {how}");
         }
     }

@@ -9,7 +9,7 @@ use fictionet::stdlib::protocols::dns::op::Query;
 use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RecordSet};
 use fictionet::stdlib::services::dns::resolver::Config;
 use fictionet::stdlib::services::dns::zone::{
-    Denied, Fact, Node, Revision, Transparent, View, ZoneData,
+    Denied, Fact, Node, Revision, Transparent, View, ZoneData, targets,
 };
 use fictionet::stdlib::services::serve::ConnInfo;
 use fictionet::stdlib::services::serve::{
@@ -689,7 +689,8 @@ impl World {
     /// A view of the declared names as a zone at `apex` with the SOA
     /// `soa` and the RRsets `apex_sets` at its apex, holding the facts an
     /// answer for `qname` reads: each name from `qname` up to the apex,
-    /// and the wildcard below each.
+    /// the wildcard below each, and each name from an NS, MX, or SRV
+    /// target in the zone up to the apex, for the additional section.
     pub(super) fn view(
         &self,
         apex: LowerName,
@@ -710,6 +711,25 @@ impl World {
                 break;
             }
             name = name.base_name();
+        }
+        let wanted: Vec<LowerName> = facts
+            .values()
+            .filter_map(|fact| match fact {
+                Fact::Present(Node::Data(sets)) => Some(sets.values()),
+                _ => None,
+            })
+            .flatten()
+            .flat_map(targets)
+            .filter(|target| apex.zone_of(target))
+            .collect();
+        for mut name in wanted {
+            while !facts.contains_key(&name) {
+                facts.insert(name.clone(), self.fact(&apex, apex_sets, &name));
+                if name == apex {
+                    break;
+                }
+                name = name.base_name();
+            }
         }
         Facts {
             apex,

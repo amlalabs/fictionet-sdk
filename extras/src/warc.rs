@@ -191,6 +191,39 @@ pub(crate) fn date(at: time::OffsetDateTime) -> String {
     )
 }
 
+/// The instant a `WARC-Date` value names, in any of the W3C-ISO8601 forms
+/// WARC 1.1 §5.4 allows (W3CDTF): a time with seconds, with or without a
+/// fraction, or with minutes only, each with its time zone; or a day, a
+/// month, or a year alone, which stands for its first instant in UTC.
+/// `None` for anything else.
+pub(crate) fn parse_date(text: &str) -> Option<time::OffsetDateTime> {
+    use time::format_description::well_known::Rfc3339;
+    if let Some((day, clock)) = text.split_once('T') {
+        let zone = clock.find(['Z', '+', '-'])?;
+        let (minutes, offset) = clock.split_at(zone);
+        let text = match minutes.len() {
+            5 => format!("{day}T{minutes}:00{offset}"),
+            _ => text.to_string(),
+        };
+        return time::OffsetDateTime::parse(&text, &Rfc3339).ok();
+    }
+    let digits = |part: &str, len: usize| -> Option<u16> {
+        let all = part.len() == len && part.bytes().all(|b| b.is_ascii_digit());
+        all.then(|| part.parse().ok())?
+    };
+    let mut parts = text.split('-');
+    let year = digits(parts.next()?, 4)?;
+    let month = parts.next().map_or(Some(1), |part| digits(part, 2))?;
+    let day = parts.next().map_or(Some(1), |part| digits(part, 2))?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let month = time::Month::try_from(u8::try_from(month).ok()?).ok()?;
+    let date =
+        time::Date::from_calendar_date(i32::from(year), month, u8::try_from(day).ok()?).ok()?;
+    Some(date.midnight().assume_utc())
+}
+
 /// Where [`append_record`] put a record.
 pub(crate) struct Appended {
     /// The record's `WARC-Record-ID`.

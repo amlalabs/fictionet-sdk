@@ -34,9 +34,9 @@ pub struct Config {
     /// zone does not know passes the question on to the next, and after
     /// the last to the cache and iteration.
     pub local: Vec<Arc<dyn ZoneData>>,
-    /// Whether answers from local zones keep the AA bit the zone gives
-    /// them, as Google's resolver does for `resolver.arpa`. Otherwise
-    /// every answer has AA clear.
+    /// Whether answers from the zones in [`local`](Config::local) keep the
+    /// AA bit the zone gives them, as Unbound does for its local zones.
+    /// Otherwise every such answer has AA clear.
     pub local_aa: bool,
     /// The EDNS payload size offered to servers and advertised to clients
     /// (RFC 6891 §6.2.5).
@@ -88,6 +88,9 @@ pub struct Config {
     pub ddr: Vec<SVCB>,
     /// The TTL of the [`ddr`](Config::ddr) records.
     pub ddr_ttl: u32,
+    /// Whether answers from the [`ddr`](Config::ddr) records carry AA, as
+    /// Google's resolver sets it there and on no other answer.
+    pub ddr_aa: bool,
     /// What local zones send for QTYPE ANY (RFC 8482 §4). A question for
     /// ANY that leaves the resolver gets what the authority sends.
     pub any: AnyResponse,
@@ -232,6 +235,7 @@ impl Config {
             identity,
             ddr: Vec::new(),
             ddr_ttl: 3600,
+            ddr_aa: true,
             any: AnyResponse::All,
             retransmit: Duration::from_millis(376),
             server_ttl: Duration::from_secs(900),
@@ -263,7 +267,7 @@ impl Config {
         let google = name("dns.google.");
         Config {
             local: Vec::new(),
-            local_aa: true,
+            local_aa: false,
             payload: 512,
             case_randomise: true,
             policy: AlgorithmPolicy::iana(),
@@ -275,6 +279,7 @@ impl Config {
                 SVCB::new(2, google, vec![alpn(&["h2", "h3"]), dohpath()]),
             ],
             ddr_ttl: 86400,
+            ddr_aa: true,
             ..Config::unbound()
         }
     }
@@ -314,6 +319,7 @@ impl Config {
                 SVCB::new(2, host, vec![alpn(&["dot"]), port(853), v4, v6]),
             ],
             ddr_ttl: 300,
+            ddr_aa: false,
             ..Config::unbound()
         }
     }
@@ -358,6 +364,7 @@ impl Config {
                 SVCB::new(3, host, vec![alpn(&["doq"]), v4, v6]),
             ],
             ddr_ttl: 60,
+            ddr_aa: false,
             ..Config::unbound()
         }
     }
@@ -408,6 +415,7 @@ impl Config {
                 .map(|(priority, host, params)| SVCB::new(priority, name(host), params))
                 .collect(),
             ddr_ttl: 300,
+            ddr_aa: false,
             ..Config::unbound()
         }
     }

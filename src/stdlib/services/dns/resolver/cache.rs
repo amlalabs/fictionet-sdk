@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use fictionet::stdlib::protocols::dns::EdeCode;
 use fictionet::stdlib::protocols::dns::dnssec::Validation;
-use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, RecordSet, RecordType};
+use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, Record, RecordSet, RecordType};
 use fictionet::time::Instant;
 
 use super::super::exchange::Generation;
@@ -192,6 +192,97 @@ pub enum Offer {
         /// Why.
         why: FailureKind,
     },
+}
+
+/// The data a validation was made over. Its result applies to an entry
+/// only while the entry still holds that data: an RRset that expired and
+/// was fetched again while the validation waited may hold other data,
+/// which nothing has checked (RFC 4035 §4.3).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Checked {
+    /// An RRset, with its RRSIGs.
+    Rrset(RecordSet),
+    /// A negative answer's SOA RRset and the denial records that prove
+    /// it, each with its RRSIGs.
+    Denial {
+        /// The zone's SOA RRset, if the answer had one.
+        soa: Option<RecordSet>,
+        /// The NSEC or NSEC3 records.
+        denial: Vec<RecordSet>,
+    },
+}
+
+impl Checked {
+    /// Whether `entry` holds this data, whatever the TTLs and the case of
+    /// the owners.
+    pub fn held_by(&self, entry: &Entry) -> bool {
+        match (self, entry) {
+            (Checked::Rrset(checked), Entry::Positive { set, .. }) => same_rrset(checked, set),
+            (
+                Checked::Denial {
+                    soa: checked_soa,
+                    denial: checked_denial,
+                },
+                Entry::Negative { soa, denial, .. },
+            ) => {
+                checked_soa
+                    .as_ref()
+                    .is_some_and(|checked| same_rrset(checked, soa))
+                    && same_rrsets(checked_denial, denial)
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether `other` is the same data, whatever the TTLs and the case of
+    /// the owners.
+    pub fn same(&self, other: &Checked) -> bool {
+        match (self, other) {
+            (Checked::Rrset(a), Checked::Rrset(b)) => same_rrset(a, b),
+            (
+                Checked::Denial {
+                    soa: a_soa,
+                    denial: a_denial,
+                },
+                Checked::Denial {
+                    soa: b_soa,
+                    denial: b_denial,
+                },
+            ) => {
+                let soa = match (a_soa, b_soa) {
+                    (Some(a), Some(b)) => same_rrset(a, b),
+                    (None, None) => true,
+                    _ => false,
+                };
+                soa && same_rrsets(a_denial, b_denial)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Whether `a` and `b` are the same RRset with the same RRSIGs, whatever
+/// the TTLs, the order of the records, and the case of the owners.
+pub(super) fn same_rrset(a: &RecordSet, b: &RecordSet) -> bool {
+    let same = |a: Vec<&Record>, b: Vec<&Record>| {
+        a.iter().all(|x| b.iter().any(|y| x.data == y.data))
+            && b.iter().all(|y| a.iter().any(|x| x.data == y.data))
+    };
+    LowerName::new(a.name()) == LowerName::new(b.name())
+        && a.record_type() == b.record_type()
+        && a.dns_class() == b.dns_class()
+        && same(
+            a.records_without_rrsigs().collect(),
+            b.records_without_rrsigs().collect(),
+        )
+        && same(a.rrsigs().iter().collect(), b.rrsigs().iter().collect())
+}
+
+/// Whether `a` and `b` hold the same RRsets, in any order, by
+/// [`same_rrset`].
+pub(super) fn same_rrsets(a: &[RecordSet], b: &[RecordSet]) -> bool {
+    a.iter().all(|x| b.iter().any(|y| same_rrset(x, y)))
+        && b.iter().all(|y| a.iter().any(|x| same_rrset(x, y)))
 }
 
 /// The limits on what the cache keeps, from the resolver's
@@ -427,7 +518,11 @@ impl Cache {
         }
     }
 
-    /// Records what validation established about the live RRset at `key`.
+    /// Records what validation established about `checked`, the data the
+    /// validation was made over, at `key`. The result applies only while
+    /// the live entry there still holds that data: data stored at the key
+    /// meanwhile has not been checked, and keeps what it had.
+    ///
     /// A Secure RRset then lives no longer than `signatures_expire`, the
     /// first expiration of the RRSIGs that proved it, nor longer than
     /// `original_ttl`, the smallest Original TTL in those RRSIGs, from when
@@ -441,6 +536,7 @@ impl Cache {
     pub fn validated(
         &mut self,
         key: &Key,
+        checked: &Checked,
         result: Validation,
         signatures_expire: Option<Instant>,
         original_ttl: Option<u32>,
@@ -467,7 +563,7 @@ impl Cache {
             keys.extend(copies);
         }
         for key in keys {
-            self.validated_one(&key, result, signatures_expire, original_ttl, now);
+            self.validated_one(&key, checked, result, signatures_expire, original_ttl, now);
         }
     }
 
@@ -475,6 +571,7 @@ impl Cache {
     fn validated_one(
         &mut self,
         key: &Key,
+        checked: &Checked,
         result: Validation,
         signatures_expire: Option<Instant>,
         original_ttl: Option<u32>,
@@ -484,7 +581,10 @@ impl Cache {
         let Some(stored) = self.entries.get_mut(key) else {
             return;
         };
-        if stored.generation != generation || now >= stored.entry.expires() {
+        if stored.generation != generation
+            || now >= stored.entry.expires()
+            || !checked.held_by(&stored.entry)
+        {
             return;
         }
         let original = original_ttl.map(|ttl| stored.at + seconds(ttl));
@@ -754,10 +854,7 @@ pub(super) fn normalized(set: &RecordSet) -> RecordSet {
     out.set_dns_class(set.dns_class());
     let mut records = Vec::new();
     for record in set.records_without_rrsigs() {
-        if records
-            .iter()
-            .all(|kept: &fictionet::stdlib::protocols::dns::rr::Record| kept.data != record.data)
-        {
+        if records.iter().all(|kept: &Record| kept.data != record.data) {
             let mut record = record.clone();
             record.name = owner.clone();
             record.ttl = ttl;

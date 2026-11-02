@@ -3,6 +3,7 @@
 
 use std::net::SocketAddr;
 
+use fictionet::stdlib::protocols::dns::dnssec::proof::delegation_proof;
 use fictionet::stdlib::protocols::dns::dnssec::rdata::DNSSECRData;
 use fictionet::stdlib::protocols::dns::op::{
     Edns, Message, MessageType, OpCode, Query, ResponseCode,
@@ -12,6 +13,7 @@ use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RData, Record, Reco
 use fictionet::stdlib::protocols::dns::{Parsed, Request, Response};
 
 use super::super::exchange::Client;
+use super::super::records::rrsets;
 use super::server::glue_first;
 use super::{Authority, Known, ServerConfig, Step, bare_reply};
 
@@ -34,8 +36,11 @@ use super::{Authority, Known, ServerConfig, Step, bare_reply};
 ///
 /// With DO, the referral needs the parent's word on the DS RRset
 /// (RFC 4035 §3.1.4). The overlay asks its base the question
-/// `<apex> DS` and puts the NSEC and NSEC3 records of that reply, with
-/// their RRSIGs, into the referral's authority section. The records are
+/// `<apex> DS` and puts the NSEC and NSEC3 records of that reply that
+/// speak to a delegation at the apex, with their RRSIGs, into the
+/// referral's authority section, leaving out a record that shows only
+/// that no wildcard matched, which a parent never sends with a
+/// delegation (RFC 5155 §7.2.7). The records are
 /// decoded from the base's reply and encoded again, never copied as
 /// octets. The overlay does not judge them: a validator checks them for
 /// this name. Under an opt-out NSEC3 parent, as `com`, `net`, and `org`
@@ -138,9 +143,10 @@ impl<B: Authority> Authority for Overlay<B> {
         {
             return inner.respond(req, local, server, client, known);
         }
+        let zone = Name::from(&self.zone);
         if *req.question.name() == apex && req.question.query_type() == RecordType::DS {
             let step = self.base.respond(req, local, server, client, known);
-            return unsigned_delegation(req, step);
+            return unsigned_delegation(req, &apex, &zone, step);
         }
 
         let mut authority = ns;
@@ -150,7 +156,9 @@ impl<B: Authority> Authority for Overlay<B> {
                 self.base
                     .respond(&ds_question, local, server, client, known),
             ) {
-                Decoded::Message(reply) => authority.extend(denial(reply.authorities)),
+                Decoded::Message(reply) => {
+                    authority.extend(denial(&apex, &zone, &reply.authorities));
+                }
                 Decoded::Step(step) => return step,
             }
         }
@@ -197,17 +205,20 @@ fn question(req: &Request, name: &Name, rtype: RecordType, dnssec_ok: bool) -> R
     }
 }
 
-/// The parent's answer to `<apex> DS`, `req`, given the base's `step`.
+/// The parent's answer to `<apex> DS`, `req`, given the base's `step`,
+/// where the base serves `zone`.
 ///
 /// The base knows nothing of the invented zone, so it may deny that the
 /// apex exists at all. A parent that delegates a name never says that:
 /// for an unsigned delegation it answers NODATA, with its SOA and the
 /// records that prove there is no DS (RFC 4035 §3.1.4.1, RFC 5155
 /// §7.2.4). An NXDOMAIN from the base therefore goes out as NOERROR with
-/// the same authority section, whose closest encloser proof and opt-out
-/// span are what real `com` sends for an unsigned delegation. Any other
-/// reply goes out as the base gave it.
-fn unsigned_delegation(req: &Request, step: Step) -> Step {
+/// its SOA and the part of its denial that such a proof needs: under an
+/// opt-out NSEC3 parent, the closest encloser's NSEC3 and the opt-out
+/// span over the apex, as real `com` sends for an unsigned delegation,
+/// without the NXDOMAIN's proof that no wildcard matched. Any other reply
+/// goes out as the base gave it.
+fn unsigned_delegation(req: &Request, apex: &Name, zone: &Name, step: Step) -> Step {
     let reply = match &step {
         Step::Reply(response) => Some(response.message.clone()),
         Step::Verbatim(bytes) => read_message(bytes).ok(),
@@ -217,23 +228,42 @@ fn unsigned_delegation(req: &Request, step: Step) -> Step {
         Some(reply) if reply.metadata.response_code == ResponseCode::NXDomain => {
             let mut response = bare_reply(req, ResponseCode::NoError, None);
             response.message.metadata.authoritative = reply.metadata.authoritative;
-            response.message.authorities = reply.authorities;
+            let soa = reply
+                .authorities
+                .iter()
+                .filter(|record| covered(record) == RecordType::SOA)
+                .cloned();
+            let proof = denial(apex, zone, &reply.authorities);
+            response.message.authorities = soa.chain(proof).collect();
             Step::Reply(response)
         }
         _ => step,
     }
 }
 
-/// The NSEC and NSEC3 records in `records`, with the RRSIGs that cover
-/// them.
-fn denial(records: Vec<Record>) -> impl Iterator<Item = Record> {
-    records.into_iter().filter(|record| {
-        let rtype = match &record.data {
-            RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) => rrsig.input().type_covered,
-            _ => record.record_type(),
-        };
-        matches!(rtype, RecordType::NSEC | RecordType::NSEC3)
-    })
+/// The records of `authority`, the base's reply to `<apex> DS`, that a
+/// parent serving `zone` sends to show a delegation at `apex` has no DS
+/// ([`delegation_proof`]), with the RRSIGs that cover them.
+fn denial(apex: &Name, zone: &Name, authority: &[Record]) -> Vec<Record> {
+    let sets = rrsets(authority);
+    let kept = delegation_proof(apex, zone, &sets);
+    authority
+        .iter()
+        .filter(|record| {
+            kept.iter()
+                .any(|set| set.name() == &record.name && set.record_type() == covered(record))
+        })
+        .cloned()
+        .collect()
+}
+
+/// The type `record` belongs to: the type it covers for an RRSIG, its own
+/// otherwise.
+fn covered(record: &Record) -> RecordType {
+    match &record.data {
+        RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) => rrsig.input().type_covered,
+        _ => record.record_type(),
+    }
 }
 
 /// A referral to the zone at `apex`: `authority` and the glue, the glue at

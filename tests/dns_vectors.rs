@@ -58,7 +58,7 @@ use fictionet::stdlib::services::dns::authority::{
 };
 use fictionet::stdlib::services::dns::memory::{MemoryNet, drive};
 use fictionet::stdlib::services::dns::resolver::{
-    Cache, Config, Entry, FailureKind, Key, Limits, Negative, Offer, Rank, Resolver, Work,
+    Cache, Checked, Config, Entry, FailureKind, Key, Limits, Negative, Offer, Rank, Resolver, Work,
 };
 use fictionet::stdlib::services::dns::zone::{
     Answered, AnyResponse, Denial, Denied, Fact, Node, Revision, View, Zone, ZoneData, answer,
@@ -1989,9 +1989,12 @@ fn signed_case(
                 .any(|r| r.record_type() == RecordType::SOA));
     let rust_denial = negative.then(|| {
         let about = Query::query(final_name(&qname, qtype, &answers), qtype);
-        validation_text(validate_denial(
-            &about, rcode, &authority, &chain, &anchors, &policy, at, verify,
-        ))
+        validation_text(
+            validate_denial(
+                &about, rcode, &authority, &chain, &anchors, &policy, at, verify,
+            )
+            .validation,
+        )
     });
     let denial = field(lean, "denial");
     let lean_denial = (!denial.is_null()).then(|| lean_validation(denial));
@@ -2632,6 +2635,7 @@ fn offer(cache: &mut Cache, offer: &Value, now: Instant, limits: Limits) {
                 set.ttl()
             };
             let fresh = now + Duration::from_secs(u64::from(ttl)).min(limits.max_ttl);
+            let checked = Checked::Rrset(set.clone());
             cache.insert(
                 now,
                 Offer::Positive {
@@ -2649,7 +2653,7 @@ fn offer(cache: &mut Cache, offer: &Value, now: Instant, limits: Limits) {
             if let Some(expires) = field(offer, "sig_expires").as_u64()
                 && stored
             {
-                cache.validated(&key, validation, Some(at(expires)), None, now);
+                cache.validated(&key, &checked, validation, Some(at(expires)), None, now);
             }
         }
         "negative" => {

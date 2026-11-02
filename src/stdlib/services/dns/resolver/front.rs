@@ -60,10 +60,15 @@ impl<V: Verify> Resolver<V> {
     }
 
     /// The octets of a local zone's `response`, which keeps its AA bit only
-    /// when the configuration says so. Local data is never validated, so
-    /// AD stays clear.
-    pub(super) fn render_local(&self, request: &Request, response: Response) -> Vec<u8> {
-        self.render_with(request, response, false, self.config.local_aa)
+    /// when `keep_aa`, as the configuration says for that zone. Local data
+    /// is never validated, so AD stays clear.
+    pub(super) fn render_local(
+        &self,
+        request: &Request,
+        response: Response,
+        keep_aa: bool,
+    ) -> Vec<u8> {
+        self.render_with(request, response, false, keep_aa)
     }
 
     /// The answer of `asker` from its pieces, the validation of the whole,
@@ -231,15 +236,35 @@ impl<V: Verify> Resolver<V> {
         )
     }
 
-    /// A referral from the cache for `request`, whose RD was clear: the
-    /// deepest NS RRset the cache holds at or above QNAME, and the cached
-    /// addresses of its targets. With none, SERVFAIL.
-    pub(super) fn render_referral(&self, request: &Request) -> Vec<u8> {
+    /// A referral from the cache for `request`, whose RD was clear and
+    /// whose question the cache could follow as far as `name`, through the
+    /// aliases in `pieces`: those aliases in the answer section (RFC 1034
+    /// §4.3.2 step 3a), then the deepest NS RRset the cache holds at or
+    /// above `name`, and the cached addresses of its targets (step 4).
+    /// With no NS RRset, SERVFAIL.
+    pub(super) fn render_referral(
+        &self,
+        request: &Request,
+        pieces: &[Piece],
+        name: &LowerName,
+    ) -> Vec<u8> {
         let query = &request.message.metadata;
         let mut message = Message::response(query.id, query.op_code);
         message.add_query(request.question.clone());
         let dnssec_ok = request.edns.is_some_and(|edns| edns.dnssec_ok);
-        let mut at = LowerName::new(request.question.name());
+        let max_ttl = u32::try_from(self.config.max_ttl.as_secs()).unwrap_or(u32::MAX);
+        for piece in pieces {
+            let Outcome::Alias { cname, proof, .. } = &piece.outcome else {
+                continue;
+            };
+            let dname = proof.iter().filter(|set| is_dname(set));
+            for set in dname.chain(std::iter::once(cname)) {
+                let ttl = Duration::from_secs(u64::from(set.ttl().min(max_ttl)));
+                let left = ttl_left(piece.at + ttl, self.now);
+                push(&mut message.answers, &with_ttl(set, left), dnssec_ok);
+            }
+        }
+        let mut at = name.clone();
         let ns = loop {
             let key = super::Key::new(at.clone(), RecordType::NS, DNSClass::IN);
             if let Some(Entry::Positive { set, expires, .. }) = self.cache.data(&key, self.now) {

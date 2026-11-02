@@ -19,8 +19,8 @@ use fictionet::stdlib::protocols::dns::rr::{
 use fictionet::stdlib::protocols::dns::{Parsed, Request, Response};
 use fictionet::stdlib::services::dns::WallClock;
 use fictionet::stdlib::services::dns::zone::{
-    Answered, AnyResponse, Denied, Fact, Lazy, MasterError, Node, Revision, Transparent, View,
-    Zone, ZoneBuilder, ZoneData, ZoneError, answer, dname, dname_target, special,
+    Answered, AnyResponse, Denied, Fact, Lazy, MasterError, Node, Revision, Shown, Transparent,
+    View, Zone, ZoneBuilder, ZoneData, ZoneError, answer, dname, dname_target, special,
 };
 use fictionet::stdlib::services::serve::Transport;
 use fictionet::time::Instant;
@@ -1472,6 +1472,85 @@ fn transparent_turns_absence_into_unknown() {
         Answered::Unknown {
             name: lower("x.e.w.example.")
         }
+    );
+}
+
+/// Shown data answers only the types it holds at its one name: an A RRset
+/// says nothing about AAAA, SOA, or NS there, nor about any name below,
+/// so those stay unknown and never become NODATA or a made-up apex.
+#[test]
+fn shown_data_knows_only_its_own_rrsets() {
+    let shown = Shown::new(
+        &name("www.example."),
+        [rrset("www.example.", 300, vec![a("192.0.2.80")])],
+    )
+    .unwrap();
+    assert_eq!(*shown.apex(), lower("www.example."));
+    let reply = ask(
+        &*view_of(&shown, "www.example.", RecordType::A),
+        "www.example.",
+        RecordType::A,
+    );
+    assert_eq!(addresses(&reply.answers), vec!["192.0.2.80"]);
+    assert!(reply.authorities.is_empty());
+    for (qname, qtype) in [
+        ("www.example.", RecordType::AAAA),
+        ("www.example.", RecordType::SOA),
+        ("www.example.", RecordType::NS),
+        ("www.example.", RecordType::HTTPS),
+        ("www.example.", RecordType::ANY),
+        ("x.www.example.", RecordType::A),
+    ] {
+        let answered = answer(
+            &*view_of(&shown, qname, qtype),
+            &request(qname, qtype, false),
+            AnyResponse::All,
+        );
+        assert!(
+            matches!(answered, Answered::Unknown { .. }),
+            "{qname} {qtype}: {answered:?}"
+        );
+    }
+
+    // A CNAME answers every type at its name.
+    let alias = Shown::new(
+        &name("www.example."),
+        [rrset("www.example.", 300, vec![cname("edge.cdn.test.")])],
+    )
+    .unwrap();
+    let reply = ask(
+        &*view_of(&alias, "www.example.", RecordType::AAAA),
+        "www.example.",
+        RecordType::AAAA,
+    );
+    assert_eq!(
+        rows(&reply.answers),
+        vec![row("www.example.", RecordType::CNAME)]
+    );
+
+    // Shown data holds one name's RRsets.
+    assert_eq!(
+        Shown::new(
+            &name("www.example."),
+            [rrset("mail.example.", 300, vec![a("192.0.2.25")])]
+        )
+        .err(),
+        Some(ZoneError::OutOfZone {
+            owner: lower("mail.example.")
+        })
+    );
+    assert_eq!(
+        Shown::new(
+            &name("www.example."),
+            [
+                rrset("www.example.", 300, vec![cname("edge.cdn.test.")]),
+                rrset("www.example.", 300, vec![a("192.0.2.80")]),
+            ]
+        )
+        .err(),
+        Some(ZoneError::CnameWithOtherData {
+            owner: lower("www.example.")
+        })
     );
 }
 

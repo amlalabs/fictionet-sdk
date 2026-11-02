@@ -170,6 +170,28 @@ pub fn validate_rrset(
     }
 }
 
+/// What [`validate_denial`] established about a negative answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ValidatedDenial {
+    /// The result.
+    pub validation: Validation,
+    /// Why an NSEC or NSEC3 RRset of the authority section failed to
+    /// verify, if one did. The proof may still stand on the others, but
+    /// such a record is not authentic: a resolver may not use it to deny
+    /// other names (RFC 8198 §5.1), nor send it on as authentic data
+    /// (RFC 4035 §3.2.3).
+    pub unverified: Option<EdeCode>,
+}
+
+impl From<Validation> for ValidatedDenial {
+    fn from(validation: Validation) -> ValidatedDenial {
+        ValidatedDenial {
+            validation,
+            unverified: None,
+        }
+    }
+}
+
 /// Validates a negative answer to `query`: an NXDOMAIN, or a NOERROR with
 /// no records of the type asked for. `authority` is the reply's authority
 /// section. Other response codes deny nothing, and give
@@ -184,7 +206,7 @@ pub fn validate_denial(
     policy: &AlgorithmPolicy,
     at: SystemTime,
     verify: &impl Verify,
-) -> Validation {
+) -> ValidatedDenial {
     let check = Check {
         policy,
         at: serial(at),
@@ -195,17 +217,17 @@ pub fn validate_denial(
     let ds = qtype == RecordType::DS && !name.is_root();
     let (zone, keys) = match check.zone_keys(chain, anchors, name, ds) {
         Ok(found) => found,
-        Err(result) => return result,
+        Err(result) => return result.into(),
     };
     if deeper_signer(authority, &zone, name, ds) {
-        return Validation::Indeterminate;
+        return Validation::Indeterminate.into();
     }
     for soa in authority
         .iter()
         .filter(|set| set.record_type() == RecordType::SOA && *set.name() == zone)
     {
         if let Err(code) = check.rrset(soa, &zone, &keys) {
-            return Validation::Bogus(code);
+            return Validation::Bogus(code).into();
         }
     }
     let (proven, failure) = check.authenticate(authority, &zone, &keys);
@@ -213,9 +235,12 @@ pub fn validate_denial(
     let proof = match rcode {
         ResponseCode::NXDomain => proof::nxdomain(name, &zone, &proven, max),
         ResponseCode::NoError => proof::nodata(name, qtype, &zone, &proven, max),
-        _ => return Validation::Indeterminate,
+        _ => return Validation::Indeterminate.into(),
     };
-    from_proof(proof, failure)
+    ValidatedDenial {
+        validation: from_proof(proof, failure),
+        unverified: failure,
+    }
 }
 
 /// The result a denial proof gives. `failure` is why some denial records
@@ -759,6 +784,7 @@ mod tests {
                 time(NOW),
                 &Ring,
             )
+            .validation
         }
 
         /// `set` signed by `example.`'s zone-signing key.

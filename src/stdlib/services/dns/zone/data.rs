@@ -1,12 +1,14 @@
 //! What a zone knows: facts that are present, known absent, or unknown,
 //! and views that hold the facts one question needs at one revision.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use fictionet::stdlib::protocols::dns::op::Query;
 use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RecordSet, RecordType};
 
-use super::zone::Node;
+use super::special::{LOCAL_TTL, local_apex};
+use super::zone::{Node, ZoneError};
 
 /// What a zone knows about one fact.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -112,6 +114,114 @@ where
 {
     fn lookup(&self, name: &LowerName) -> Fact<Vec<RecordSet>> {
         self(name)
+    }
+}
+
+/// Zone data that holds some RRsets of one name and knows nothing else,
+/// such as what a capture showed for a host, or the one answer a resolver
+/// gives itself for a name it otherwise iterates for.
+///
+/// A question for the name and the type of an RRset it holds answers from
+/// that RRset. So does every question at the name when it holds a CNAME,
+/// which leaves no room for other data there (RFC 1034 §3.6.2). Every
+/// other fact is unknown: a capture holding `www.example A` says nothing
+/// about `www.example AAAA`, nor about the zone's SOA or NS RRsets. A
+/// resolver then goes on to its next local zone or iterates, and a server
+/// answers SERVFAIL.
+pub struct Shown {
+    apex: LowerName,
+    soa: RecordSet,
+    sets: BTreeMap<RecordType, RecordSet>,
+}
+
+impl Shown {
+    /// The RRsets `sets` of `owner`. An RRset of another owner is
+    /// [`ZoneError::OutOfZone`], and a CNAME beside other data is
+    /// [`ZoneError::CnameWithOtherData`].
+    pub fn new(
+        owner: &Name,
+        sets: impl IntoIterator<Item = RecordSet>,
+    ) -> Result<Shown, ZoneError> {
+        let apex = LowerName::new(owner);
+        let mut held = BTreeMap::new();
+        for set in sets {
+            if LowerName::new(set.name()) != apex {
+                return Err(ZoneError::OutOfZone {
+                    owner: LowerName::new(set.name()),
+                });
+            }
+            held.insert(set.record_type(), set);
+        }
+        if held.contains_key(&RecordType::CNAME) && held.len() > 1 {
+            return Err(ZoneError::CnameWithOtherData { owner: apex });
+        }
+        Ok(Shown {
+            // A view needs an SOA, but every answer this data gives is a
+            // positive one, which carries none.
+            soa: local_apex(owner, LOCAL_TTL).0,
+            apex,
+            sets: held,
+        })
+    }
+}
+
+impl ZoneData for Shown {
+    fn apex(&self) -> &LowerName {
+        &self.apex
+    }
+
+    fn view(&self, question: &Query) -> Arc<dyn View + Send + Sync> {
+        let asked = match question.query_type() {
+            RecordType::ANY => None,
+            qtype => self
+                .sets
+                .get(&qtype)
+                .or_else(|| self.sets.get(&RecordType::CNAME)),
+        };
+        Arc::new(ShownView {
+            apex: self.apex.clone(),
+            soa: self.soa.clone(),
+            node: match asked {
+                Some(set) => Fact::Present(Node::Data(BTreeMap::from([(
+                    set.record_type(),
+                    set.clone(),
+                )]))),
+                None => Fact::Unknown,
+            },
+        })
+    }
+}
+
+/// The view of [`Shown`] for one question: the node at the apex when an
+/// RRset it holds answers the question, and nothing else.
+struct ShownView {
+    apex: LowerName,
+    soa: RecordSet,
+    node: Fact<Node>,
+}
+
+impl View for ShownView {
+    fn apex(&self) -> &LowerName {
+        &self.apex
+    }
+
+    fn revision(&self) -> Revision {
+        Revision(0)
+    }
+
+    fn soa(&self) -> &RecordSet {
+        &self.soa
+    }
+
+    fn node(&self, name: &LowerName) -> Fact<&Node> {
+        match &self.node {
+            Fact::Present(node) if *name == self.apex => Fact::Present(node),
+            _ => Fact::Unknown,
+        }
+    }
+
+    fn denial(&self, _name: &LowerName, _kind: Denied) -> Fact<Vec<RecordSet>> {
+        Fact::Unknown
     }
 }
 

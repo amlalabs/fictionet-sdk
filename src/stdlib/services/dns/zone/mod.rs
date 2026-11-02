@@ -12,11 +12,11 @@
 //! | [`Zone`] | Everything: a complete zone, built with [`Zone::builder`] or read with [`Zone::from_master`]. Nothing is unknown. |
 //! | [`Lazy`] | The names a [`Provider`] gives when they are first asked. What the provider does not know stays unknown. |
 //! | [`Redirect`] | The apex of the zone it wraps, for every name below it too. |
+//! | [`Shown`] | Some RRsets of one name, each for its own type. Every other fact is unknown. |
 //! | [`Transparent`] | The names with RRsets in the zone it wraps. Every other name is unknown, so a resolver goes on to iterate. |
 //! | [`special`] | The zones a resolver serves itself: `localhost`, the RFC 6303 reverse zones, `home.arpa`, `resolver.arpa`, `service.arpa`, `onion`, `test`, and `invalid`. |
 //!
-//! A world writes its own [`ZoneData`] for anything else, such as a zone
-//! that holds only what a capture showed.
+//! A world writes its own [`ZoneData`] for anything else.
 //!
 //! Signing is data too. [`Zone::signed`] signs a complete zone once, with
 //! a complete NSEC or NSEC3 chain, as `dnssec-signzone` does. [`Signed`]
@@ -46,8 +46,9 @@ pub use answer::{Answered, AnyResponse, answer};
 pub use chain::{ChainProblem, check_chain};
 pub use cover::cover;
 pub(crate) use cover::negative_ttl;
-pub use data::{Denied, Fact, Provider, Redirect, Revision, Transparent, View, ZoneData};
+pub use data::{Denied, Fact, Provider, Redirect, Revision, Shown, Transparent, View, ZoneData};
 pub use lazy::Lazy;
 pub use master::MasterError;
 pub use signed::{Denial, Signed};
+pub(crate) use zone::targets;
 pub use zone::{Node, Zone, ZoneBuilder, ZoneError, dname, dname_target};

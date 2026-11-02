@@ -712,6 +712,7 @@ pub(super) mod tests {
                 time(NOW),
                 &Ring,
             )
+            .validation
         }
     }
 

@@ -45,7 +45,10 @@ use super::super::exchange::{
 use super::super::records::{rrsets, signatures};
 use super::super::zone::dname_target;
 use super::Resolver;
-use super::cache::{Entry, FailureKind, Key, Negative, Offer, Rank, normalized, ttl_left};
+use super::cache::{
+    Checked, Entry, FailureKind, Key, Negative, Offer, Rank, normalized, same_rrset, same_rrsets,
+    ttl_left,
+};
 
 /// How many times one resolution sends a query to one server address over
 /// one transport before it gives up on that address (RFC 9520 §3.1: at
@@ -255,9 +258,12 @@ pub(super) enum Ready {
 pub(super) struct Graph {
     next: u64,
     lookups: BTreeMap<LookupId, Lookup>,
-    by_key: BTreeMap<Key, LookupId>,
+    /// The lookup under way for each key, and whether it relays a client's
+    /// CD bit.
+    by_key: BTreeMap<(Key, bool), LookupId>,
     checks: BTreeMap<CheckId, Check>,
-    by_subject: BTreeMap<Subject, CheckId>,
+    /// The checks under way for each subject, each over its own data.
+    by_subject: BTreeMap<Subject, Vec<CheckId>>,
     exchanges: BTreeMap<Token, Exchange>,
     trees: BTreeMap<TreeId, Tree>,
     pub(super) ready: VecDeque<Ready>,
@@ -275,6 +281,9 @@ struct Tree {
 /// One question being resolved.
 struct Lookup {
     key: Key,
+    /// Whether its queries carry CD because a client's did, as a
+    /// forwarder that does not validate sends them.
+    relay_cd: bool,
     tree: TreeId,
     depth: u8,
     dependents: Vec<Node>,
@@ -360,6 +369,8 @@ struct Exchange {
 /// One validation being made.
 struct Check {
     subject: Subject,
+    /// The data at the subject's key the result is for.
+    checked: Checked,
     material: Material,
     tree: TreeId,
     depth: u8,
@@ -401,11 +412,55 @@ enum Material {
     },
 }
 
+impl Material {
+    /// Whether `other` is the same records, whatever the TTLs and the
+    /// case of the owners.
+    fn same(&self, other: &Material) -> bool {
+        match (self, other) {
+            (
+                Material::Rrset { set, authority },
+                Material::Rrset {
+                    set: other_set,
+                    authority: other_authority,
+                },
+            ) => same_rrset(set, other_set) && same_rrsets(authority, other_authority),
+            (
+                Material::Denial {
+                    query,
+                    rcode,
+                    authority,
+                },
+                Material::Denial {
+                    query: other_query,
+                    rcode: other_rcode,
+                    authority: other_authority,
+                },
+            ) => {
+                LowerName::new(query.name()) == LowerName::new(other_query.name())
+                    && query.query_type() == other_query.query_type()
+                    && rcode == other_rcode
+                    && same_rrsets(authority, other_authority)
+            }
+            _ => false,
+        }
+    }
+}
+
 impl Graph {
     /// A number no node has had.
     fn issue(&mut self) -> u64 {
         self.next += 1;
         self.next
+    }
+
+    /// Takes check `id` off the checks under way for `subject`.
+    fn unlist(&mut self, subject: &Subject, id: CheckId) {
+        if let Some(ids) = self.by_subject.get_mut(subject) {
+            ids.retain(|other| *other != id);
+            if ids.is_empty() {
+                self.by_subject.remove(subject);
+            }
+        }
     }
 
     /// A name for a new client query.
@@ -555,6 +610,13 @@ impl<V: Verify> Resolver<V> {
             }
         }
         self.aggressive(key)
+    }
+
+    /// [`cached`](Resolver::cached), less a cached failure for a lookup
+    /// that relays a client's CD bit.
+    fn cached_for(&self, key: &Key, relay_cd: bool) -> Option<Found> {
+        self.cached(key)
+            .filter(|found| !(relay_cd && matches!(found.outcome, Outcome::Failure(_))))
     }
 
     /// Expired data for `key`, for serving stale (RFC 8767 §4).
@@ -777,18 +839,26 @@ impl<V: Verify> Resolver<V> {
 
     /// Makes `from` wait on the lookup of `key`, starting it when none
     /// runs, unless the cache answers at once.
+    ///
+    /// With `relay_cd`, the lookup forwards a client's CD bit, as a
+    /// forwarder that does not validate relays the client's header: it
+    /// shares no lookup with questions asked without CD, and a failure the
+    /// cache holds does not answer it, since a server that validates may
+    /// have failed only the question without CD.
     pub(super) fn depend(
         &mut self,
         from: Node,
         key: Key,
+        relay_cd: bool,
         tree: TreeId,
         depth: u8,
         entropy: &dyn Entropy,
     ) -> Dep {
-        if let Some(found) = self.cached(&key) {
+        if let Some(found) = self.cached_for(&key, relay_cd) {
             return Dep::Ready(Box::new(found));
         }
-        if let Some(&id) = self.graph.by_key.get(&key) {
+        let shared = (key.clone(), relay_cd);
+        if let Some(&id) = self.graph.by_key.get(&shared) {
             if self.graph.reaches(from, Node::Lookup(id)) {
                 return Dep::Cycle;
             }
@@ -802,11 +872,12 @@ impl<V: Verify> Resolver<V> {
         }
         let id = self.graph.lookup_id();
         self.graph.hold(tree);
-        self.graph.by_key.insert(key.clone(), id);
+        self.graph.by_key.insert(shared, id);
         self.graph.lookups.insert(
             id,
             Lookup {
                 key,
+                relay_cd,
                 tree,
                 depth,
                 dependents: vec![from],
@@ -833,7 +904,7 @@ impl<V: Verify> Resolver<V> {
             return;
         };
         let key = lookup.key.clone();
-        if let Some(found) = self.cached(&key) {
+        if let Some(found) = self.cached_for(&key, lookup.relay_cd) {
             return self.finish(id, found);
         }
         if !self.config.forward.is_empty() {
@@ -862,7 +933,7 @@ impl<V: Verify> Resolver<V> {
                 return self.ask_one(id, root, hints, entropy);
             }
             let (tree, depth) = (lookup.tree, lookup.depth);
-            return match self.depend(Node::Lookup(id), priming, tree, depth + 1, entropy) {
+            return match self.depend(Node::Lookup(id), priming, false, tree, depth + 1, entropy) {
                 Dep::Waiting(prime) => self.wait_lookups(id, [prime].into()),
                 Dep::Ready(found) => self.primed(id, found.outcome, entropy),
                 Dep::Cycle => self.fail(id),
@@ -937,7 +1008,7 @@ impl<V: Verify> Resolver<V> {
             let mut waiting = BTreeSet::new();
             for rtype in [RecordType::A, RecordType::AAAA] {
                 let key = Key::new(lower.clone(), rtype, DNSClass::IN);
-                match self.depend(Node::Lookup(id), key, tree, depth + 1, entropy) {
+                match self.depend(Node::Lookup(id), key, false, tree, depth + 1, entropy) {
                     Dep::Waiting(dep) => {
                         waiting.insert(dep);
                     }
@@ -1097,7 +1168,9 @@ impl<V: Verify> Resolver<V> {
         let Some(lookup) = self.graph.lookups.remove(&id) else {
             return;
         };
-        self.graph.by_key.remove(&lookup.key);
+        self.graph
+            .by_key
+            .remove(&(lookup.key.clone(), lookup.relay_cd));
         self.graph.release(lookup.tree);
         if let LookupWait::Exchange(token) = lookup.wait {
             self.graph.exchanges.remove(&token);
@@ -1198,7 +1271,7 @@ impl<V: Verify> Resolver<V> {
         let Some(lookup) = self.graph.lookups.get(&id) else {
             return;
         };
-        let tree = lookup.tree;
+        let (tree, relay_cd) = (lookup.tree, lookup.relay_cd);
         if !self.graph.charge(tree, self.config.work.queries) {
             // RFC 1034 §5.3.3: past the bound, the question fails. When no
             // server replied to any of the question's queries, every server
@@ -1225,8 +1298,9 @@ impl<V: Verify> Resolver<V> {
         message.metadata.recursion_desired = forwarded;
         // RFC 6840 §5.9: a validating resolver sets CD, so it gets the
         // data even where the server would find it bogus, and judges it
-        // itself.
-        message.metadata.checking_disabled = self.config.anchors.is_some();
+        // itself. A forwarder that does not validate sets it as the
+        // client did (RFC 4035 §3.2.2).
+        message.metadata.checking_disabled = self.config.anchors.is_some() || relay_cd;
         message.add_query(question.clone());
         let priming = question.name().is_root() && question.query_type() == RecordType::NS;
         let payload = if priming {
@@ -1849,15 +1923,27 @@ impl<V: Verify> Resolver<V> {
         if self.config.anchors.is_none() {
             return CheckStart::Done(Validation::NotPerformed);
         }
-        if let Some(&id) = self.graph.by_subject.get(&subject) {
+        let (Some((material, zone)), Some(checked)) =
+            (material(&subject, outcome), checked(&subject, outcome))
+        else {
+            return CheckStart::Done(Validation::Indeterminate);
+        };
+        // A check under way for the same subject is joined only when it
+        // validates the same data: the same key may hold other records by
+        // now, and the result of one says nothing of the other.
+        let joined = self.graph.by_subject.get(&subject).and_then(|ids| {
+            ids.iter().copied().find(|id| {
+                self.graph.checks.get(id).is_some_and(|check| {
+                    check.checked.same(&checked) && check.material.same(&material)
+                })
+            })
+        });
+        if let Some(id) = joined {
             if let Some(check) = self.graph.checks.get_mut(&id) {
                 check.dependents.push(from);
             }
             return CheckStart::Waiting(id);
         }
-        let Some((material, zone)) = material(&subject, outcome) else {
-            return CheckStart::Done(Validation::Indeterminate);
-        };
         let anchor = {
             let anchors = self.config.anchors.as_ref().expect("anchors are set");
             anchors
@@ -1866,16 +1952,21 @@ impl<V: Verify> Resolver<V> {
         };
         let Some(anchor) = anchor else {
             let validation = self.validate(&material, &Chain::default());
-            self.validated(&subject, &material, validation);
+            self.validated(&subject, &checked, &material, validation);
             return CheckStart::Done(validation);
         };
         let id = self.graph.check_id();
         self.graph.hold(tree);
-        self.graph.by_subject.insert(subject.clone(), id);
+        self.graph
+            .by_subject
+            .entry(subject.clone())
+            .or_default()
+            .push(id);
         self.graph.checks.insert(
             id,
             Check {
                 subject,
+                checked,
                 material,
                 tree,
                 depth,
@@ -1932,7 +2023,7 @@ impl<V: Verify> Resolver<V> {
             Part::Dnskey => RecordType::DNSKEY,
         };
         let key = Key::new(name.clone(), rtype, DNSClass::IN);
-        let outcome = match self.depend(Node::Check(id), key, tree, depth + 1, entropy) {
+        let outcome = match self.depend(Node::Check(id), key, false, tree, depth + 1, entropy) {
             Dep::Ready(found) => found.outcome,
             Dep::Waiting(lookup) => {
                 if let Some(check) = self.graph.checks.get_mut(&id) {
@@ -2147,9 +2238,9 @@ impl<V: Verify> Resolver<V> {
             };
         }
         let check = self.graph.checks.remove(&id)?;
-        self.graph.by_subject.remove(&check.subject);
+        self.graph.unlist(&check.subject, id);
         self.graph.release(check.tree);
-        self.validated(&check.subject, &check.material, validation);
+        self.validated(&check.subject, &check.checked, &check.material, validation);
         for to in check.dependents {
             self.graph.ready.push_back(Ready::Checked {
                 to,
@@ -2161,6 +2252,13 @@ impl<V: Verify> Resolver<V> {
         Some(validation)
     }
 
+    /// What `material` validates to with `chain`.
+    ///
+    /// A negative answer is Secure only when every NSEC and NSEC3 RRset
+    /// in it verifies, as Unbound fails a reply with any authority RRset
+    /// that does not: a record that did not verify would otherwise reach
+    /// the client beside AD (RFC 4035 §3.2.3), and be kept to deny other
+    /// names (RFC 8198 §5.1).
     fn validate(&self, material: &Material, chain: &Chain) -> Validation {
         let anchors = self.config.anchors.as_ref().expect("anchors are set");
         let at = self.clock.at(self.now);
@@ -2173,24 +2271,38 @@ impl<V: Verify> Resolver<V> {
                 query,
                 rcode,
                 authority,
-            } => validate_denial(
-                query,
-                *rcode,
-                authority,
-                chain,
-                anchors,
-                policy,
-                at,
-                &self.verify,
-            ),
+            } => {
+                let denial = validate_denial(
+                    query,
+                    *rcode,
+                    authority,
+                    chain,
+                    anchors,
+                    policy,
+                    at,
+                    &self.verify,
+                );
+                match (denial.validation, denial.unverified) {
+                    (Validation::Secure, Some(code)) => Validation::Bogus(code),
+                    (validation, _) => validation,
+                }
+            }
         }
     }
 
-    /// Records `validation` of `subject` in the cache. A Secure RRset
-    /// lives no longer than the first of its RRSIGs to expire
-    /// (RFC 4035 §5.3.3), and validated NSEC records are kept for
+    /// Records `validation` of `subject`, made over `checked` with
+    /// `material`, in the cache, where the subject's entry still holds
+    /// `checked`. A Secure RRset lives no longer than the first of its
+    /// RRSIGs to expire (RFC 4035 §5.3.3), and the NSEC records of a
+    /// Secure negative answer, every one of which verified, are kept for
     /// synthesizing answers (RFC 8198).
-    fn validated(&mut self, subject: &Subject, material: &Material, validation: Validation) {
+    fn validated(
+        &mut self,
+        subject: &Subject,
+        checked: &Checked,
+        material: &Material,
+        validation: Validation,
+    ) {
         let now = self.now;
         let (key, set) = match (subject, material) {
             (Subject::Rrset(key), Material::Rrset { set, .. }) => (key, Some(set)),
@@ -2200,7 +2312,7 @@ impl<V: Verify> Resolver<V> {
         let expires = set.and_then(|set| self.signatures_expire(set));
         let original_ttl = set.and_then(original_ttl);
         self.cache
-            .validated(key, validation, expires, original_ttl, now);
+            .validated(key, checked, validation, expires, original_ttl, now);
         if let (Validation::Secure, Material::Denial { authority, .. }) = (validation, material)
             && self.config.aggressive_nsec
         {
@@ -2278,7 +2390,9 @@ impl<V: Verify> Resolver<V> {
             match node {
                 Node::Lookup(id) => {
                     if let Some(lookup) = self.graph.lookups.remove(&id) {
-                        self.graph.by_key.remove(&lookup.key);
+                        self.graph
+                            .by_key
+                            .remove(&(lookup.key.clone(), lookup.relay_cd));
                         self.graph.release(lookup.tree);
                         if let LookupWait::Exchange(token) = lookup.wait {
                             self.graph.exchanges.remove(&token);
@@ -2288,13 +2402,30 @@ impl<V: Verify> Resolver<V> {
                 }
                 Node::Check(id) => {
                     if let Some(check) = self.graph.checks.remove(&id) {
-                        self.graph.by_subject.remove(&check.subject);
+                        self.graph.unlist(&check.subject, id);
                         self.graph.release(check.tree);
                     }
                 }
                 Node::Asker(_) | Node::Refresh => {}
             }
         }
+    }
+}
+
+/// The data at `subject`'s key in `outcome` that a check's result is for.
+fn checked(subject: &Subject, outcome: &Outcome) -> Option<Checked> {
+    match (subject, outcome) {
+        (Subject::Rrset(key), Outcome::Data { sets, .. }) => sets
+            .iter()
+            .find(|set| set.record_type() == key.rtype)
+            .map(|set| Checked::Rrset(set.clone())),
+        (Subject::Rrset(_), Outcome::Alias { cname, .. }) => Some(Checked::Rrset(cname.clone())),
+        (Subject::Rrset(_), Outcome::TooLong { dname, .. }) => Some(Checked::Rrset(dname.clone())),
+        (Subject::Denial(..), Outcome::Negative { soa, denial, .. }) => Some(Checked::Denial {
+            soa: soa.clone(),
+            denial: denial.clone(),
+        }),
+        _ => None,
     }
 }
 

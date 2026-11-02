@@ -45,5 +45,7 @@ pub use keys::{KeyError, KeyFlags, KeySet, Sign, ZoneKey, ds, key_tag};
 pub use policy::AlgorithmPolicy;
 pub use proof::Proof;
 pub use sign::{Window, sign};
-pub use validate::{Chain, Fetched, Insecure, Link, Validation, validate_denial, validate_rrset};
+pub use validate::{
+    Chain, Fetched, Insecure, Link, ValidatedDenial, Validation, validate_denial, validate_rrset,
+};
 pub use verify::{Ring, Verify};

@@ -95,6 +95,38 @@ pub fn wildcard_answer(
     )
 }
 
+/// The RRsets among `records`, the NSEC or NSEC3 RRsets `zone` sent to
+/// deny `name`, that the parent of a delegation at `name` without DS
+/// sends with it (RFC 4035 §3.1.4.1, RFC 5155 §7.2.4 and §7.2.7): the
+/// record matching `name`, or else, with NSEC3, the closest encloser's
+/// record and the one covering the next closer name, or with NSEC the
+/// record covering `name`. A record that proves only that no wildcard
+/// matched says nothing of a delegation, and is left out.
+pub fn delegation_proof(name: &Name, zone: &Name, records: &[RecordSet]) -> Vec<RecordSet> {
+    let name = fqdn(name);
+    let denial = Denial::new(zone, records);
+    let nsec = denial
+        .nsec
+        .matching(&name)
+        .map(|_| &name)
+        .or_else(|| denial.nsec.covering(&name).map(|(owner, _)| owner));
+    let hashes = denial.nsec3.delegation_proof(&name);
+    records
+        .iter()
+        .filter(|set| match set.record_type() {
+            RecordType::NSEC => nsec.is_some_and(|owner| set.name() == owner),
+            RecordType::NSEC3 => set
+                .name()
+                .iter()
+                .next()
+                .and_then(base32hex)
+                .is_some_and(|hash| set.name().base_name() == *zone && hashes.contains(&hash)),
+            _ => false,
+        })
+        .cloned()
+        .collect()
+}
+
 fn fqdn(name: &Name) -> Name {
     let mut name = name.clone();
     name.set_fqdn(true);
@@ -290,28 +322,58 @@ impl<'a> Nsec3s<'a> {
     }
 
     fn matching(&self, name: &Name) -> Option<&'a NSEC3> {
+        self.matching_entry(name).map(|(_, rdata)| *rdata)
+    }
+
+    /// The NSEC3 matching `name`, with its owner's hash.
+    fn matching_entry(&self, name: &Name) -> Option<&(Vec<u8>, &'a NSEC3)> {
         self.records
             .iter()
             .find(|(owner, rdata)| Nsec3s::hash(name, rdata).as_ref() == Some(owner))
-            .map(|(_, rdata)| *rdata)
     }
 
     /// The NSEC3 whose span holds the hash of `name` strictly between its
     /// owner's hash and the next hash, wrapping at the end of the chain.
     fn covering(&self, name: &Name) -> Option<&'a NSEC3> {
-        self.records
-            .iter()
-            .find(|(owner, rdata)| {
-                let Some(hash) = Nsec3s::hash(name, rdata) else {
-                    return false;
-                };
-                let next = rdata.next_hashed_owner_name();
-                match owner.as_slice().cmp(next) {
-                    Ordering::Less => *owner < hash && hash.as_slice() < next,
-                    _ => *owner < hash || hash.as_slice() < next,
-                }
-            })
-            .map(|(_, rdata)| *rdata)
+        self.covering_entry(name).map(|(_, rdata)| *rdata)
+    }
+
+    /// [`covering`](Nsec3s::covering), with the owner's hash.
+    fn covering_entry(&self, name: &Name) -> Option<&(Vec<u8>, &'a NSEC3)> {
+        self.records.iter().find(|(owner, rdata)| {
+            let Some(hash) = Nsec3s::hash(name, rdata) else {
+                return false;
+            };
+            let next = rdata.next_hashed_owner_name();
+            match owner.as_slice().cmp(next) {
+                Ordering::Less => *owner < hash && hash.as_slice() < next,
+                _ => *owner < hash || hash.as_slice() < next,
+            }
+        })
+    }
+
+    /// The owner hashes of the NSEC3 records that show `name` is no
+    /// signed delegation: the record matching it, or else the closest
+    /// encloser's record and the one covering the next closer name.
+    fn delegation_proof(&self, name: &Name) -> Vec<Vec<u8>> {
+        if let Some((hash, _)) = self.matching_entry(name) {
+            return vec![hash.clone()];
+        }
+        let labels = name.iter().count();
+        let apex = self.zone.iter().count();
+        for count in (apex..labels).rev() {
+            let encloser = name.trim_to(count);
+            if let Some((hash, _)) = self.matching_entry(&encloser) {
+                let mut kept = vec![hash.clone()];
+                let next_closer = name.trim_to(count + 1);
+                kept.extend(
+                    self.covering_entry(&next_closer)
+                        .map(|(hash, _)| hash.clone()),
+                );
+                return kept;
+            }
+        }
+        Vec::new()
     }
 
     /// The closest encloser proof of RFC 5155 §8.3: the deepest ancestor
