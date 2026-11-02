@@ -392,8 +392,8 @@ mod tests {
 
     #[test]
     fn rrsigs_travel_with_the_rrset_they_cover() {
-        use super::super::dnssec::Algorithm;
         use super::super::dnssec::rdata::{RRSIG, SigInput};
+        use hickory_proto::dnssec::Algorithm;
         let rrsig = |covered: RecordType, len: usize| {
             let input = SigInput {
                 type_covered: covered,
