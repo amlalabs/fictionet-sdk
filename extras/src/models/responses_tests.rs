@@ -1,4 +1,4 @@
-use super::splice_tests::{Pages, receive};
+use super::splice_tests::{DONE, Pages, receive, write_trailer};
 use super::*;
 use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -27,7 +27,7 @@ fn reply(
     if let Some(tools) = request.get("tools") {
         response["tools"] = tools.clone();
     }
-    let (typ, body) = if stream {
+    let (typ, body, trailer) = if stream {
         let mut initial = response.clone();
         initial["output"] = json!([]);
         initial["status"] = json!("in_progress");
@@ -57,21 +57,22 @@ fn reply(
                     e["sequence_number"] = json!(index);
                     format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap())
                 })
-                .collect::<String>()
-                + "data: [DONE]\n\n",
+                .collect::<String>(),
+            DONE,
         )
     } else {
-        ("application/json", response.to_string())
+        ("application/json", response.to_string(), "")
     };
     write!(
         socket,
         "HTTP/1.1 200 OK\r\nContent-Type: {typ}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
+        body.len() + trailer.len()
     )
     .unwrap();
     for chunk in body.as_bytes().chunks(11) {
         socket.write_all(chunk).unwrap();
     }
+    write_trailer(socket, trailer, 11);
 }
 async fn collect(response: Response<Body>, stream: bool) -> Value {
     assert_eq!(response.status(), 200);

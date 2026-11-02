@@ -59,7 +59,7 @@ pub(super) fn exchange(socket: &mut std::net::TcpStream) -> (String, Value) {
 }
 fn response(socket: &mut std::net::TcpStream, content: Vec<Value>, stop: &str, stream: bool) {
     let mut message = json!({"type":"message","id":"msg_abc","role":"assistant","model":"claude","content":[],"usage":{"input_tokens":7,"output_tokens":2},"stop_reason":null,"stop_sequence":null});
-    let (typ, body) = if stream {
+    let (typ, body, trailer) = if stream {
         let mut events = vec![json!({"type":"message_start","message":message})];
         for (index, mut block) in content.into_iter().enumerate() {
             let input = if block["type"] == "tool_use" {
@@ -82,22 +82,42 @@ fn response(socket: &mut std::net::TcpStream, content: Vec<Value>, stop: &str, s
             events
                 .into_iter()
                 .map(|v| format!("event: {}\ndata: {v}\n\n", v["type"].as_str().unwrap()))
-                .collect::<String>()
-                + "data: [DONE]\n\n",
+                .collect::<String>(),
+            DONE,
         )
     } else {
         message["content"] = json!(content);
         message["stop_reason"] = json!(stop);
-        ("application/json", message.to_string())
+        ("application/json", message.to_string(), "")
     };
     write!(
         socket,
         "HTTP/1.1 200 OK\r\nContent-Type: {typ}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
+        body.len() + trailer.len()
     )
     .unwrap();
     for chunk in body.as_bytes().chunks(7) {
         socket.write_all(chunk).unwrap();
+    }
+    write_trailer(socket, trailer, 7);
+}
+/// The line that follows a stream's last event.
+pub(super) const DONE: &str = "data: [DONE]\n\n";
+/// Writes `trailer`, the bytes after a stream's last event, in `size`-byte
+/// pieces. A client may hang up once it has read the last event, so the
+/// socket may be closed here.
+pub(super) fn write_trailer(socket: &mut std::net::TcpStream, trailer: &str, size: usize) {
+    for chunk in trailer.as_bytes().chunks(size) {
+        if let Err(error) = socket.write_all(chunk) {
+            assert!(
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                ),
+                "{error}"
+            );
+            return;
+        }
     }
 }
 async fn collected(response: Response<Body>, stream: bool) -> Value {
