@@ -13,6 +13,7 @@
   Rust: `services::dns::zone::{Lazy, Provider, Signed}`, `protocols::dns::dnssec::Sign`, and the acceptance
   test's provider and signer combinations (§18.5).
 -/
+import Dns.Partial
 import Dns.Dnssec
 
 namespace Dns.Records

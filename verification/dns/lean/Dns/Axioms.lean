@@ -669,8 +669,12 @@ example : validateRrset (some [parentZone.anchor 2]) Policy.iana 150 (chainOf pa
 
 #print axioms check_complete
 /-- At time 300 the parent's signatures have expired, and the check says so. -/
-example : Problem.windowClosed apex 300 ∈ check [parentZone] Policy.iana 300 :=
+theorem window_reported : Problem.windowClosed apex 300 ∈ check [parentZone] Policy.iana 300 :=
   check_complete ⟨parentZone, List.mem_singleton_self _, rfl, rfl, by simp [parentZone], by decide⟩
+
+#print axioms check_reports_real
+/-- And what it reports is so: a zone of the tree has signers and a window that is closed at 300. -/
+example : Holds [parentZone] Policy.iana 300 (.windowClosed apex 300) := check_reports_real window_reported
 
 end Chain
 
