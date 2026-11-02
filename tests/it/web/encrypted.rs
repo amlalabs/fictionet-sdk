@@ -25,7 +25,7 @@ use fictionet::stdlib::protocols::x509::{Time, Validity};
 use fictionet::stdlib::services::ca::Ca;
 use fictionet::stdlib::services::dns::authority::{ServerConfig, Zones};
 use fictionet::stdlib::services::dns::resolver::Config;
-use fictionet::stdlib::services::dns::zone::{Denial, Zone, ZoneData};
+use fictionet::stdlib::services::dns::zone::{Denial, Node, Zone, ZoneData};
 use fictionet::stdlib::services::dns::{Event, WallClock};
 use fictionet::stdlib::services::serve::Transport;
 use fictionet::stdlib::web::httpd::{self, Body};
@@ -103,6 +103,33 @@ fn soa(mname: &str) -> SOA {
     )
 }
 
+/// Records at `kinds.example.` whose presentation hickory's own text gets
+/// wrong, each as its type number and its RDATA in presentation format,
+/// which is what the JSON API must give back.
+const KINDS: [(u16, &str); 5] = [
+    (65, "1 . alpn=h2,h3 ipv4hint=45.33.4.80,45.33.4.53"),
+    (13, "\"Intel Xeon\" \"\""),
+    (257, "0 issue \"a\\\"b; c\""),
+    (35, "1 1 \"s\" \"x\\\"y\" \"\" ."),
+    (65280, "\\# 2 ABCD"),
+];
+
+/// The RRset of type `number` at `kinds.example.` that a master file line
+/// with RDATA `data` holds.
+fn kind(number: u16, data: &str) -> RecordSet {
+    let rtype = RecordType::from(number);
+    let text = format!(
+        "kinds.example. 300 IN SOA ns.kinds.example. h.kinds.example. 1 2 3 4 5\n\
+         kinds.example. 300 IN NS ns.kinds.example.\n\
+         kinds.example. 300 IN TYPE{number} {data}\n"
+    );
+    let zone = Zone::from_master(&text, None).unwrap_or_else(|e| panic!("{data}: {e}"));
+    let Some(Node::Data(sets)) = zone.node(zone.apex()) else {
+        panic!("the apex holds data");
+    };
+    sets[&rtype].clone()
+}
+
 /// The signed root, delegating a signed `example.` to `ns.example.`, and
 /// the root's trust anchor.
 fn hierarchy() -> (Zone, Zone, Anchors) {
@@ -129,10 +156,15 @@ fn hierarchy() -> (Zone, Zone, Anchors) {
         .unwrap()
         .signed(&root_keys, window(), Denial::Nsec)
         .unwrap();
-    let example = Zone::builder(name("example."), soa("ns.example."), 3600)
-        .rrset(rrset("example.", 3600, RData::NS(NS(name("ns.example.")))))
-        .rrset(rrset("ns.example.", 3600, RData::A(A(EXAMPLE))))
-        .rrset(rrset("www.example.", TTL, RData::A(A(WWW))))
+    let example = KINDS
+        .iter()
+        .fold(
+            Zone::builder(name("example."), soa("ns.example."), 3600)
+                .rrset(rrset("example.", 3600, RData::NS(NS(name("ns.example.")))))
+                .rrset(rrset("ns.example.", 3600, RData::A(A(EXAMPLE))))
+                .rrset(rrset("www.example.", TTL, RData::A(A(WWW)))),
+            |zone, (number, data)| zone.rrset(kind(*number, data)),
+        )
         .build()
         .unwrap()
         .signed(&example_keys, window(), Denial::Nsec)
@@ -1001,6 +1033,50 @@ fn each_public_resolver_answers_dns_over_https_as_its_operator() {
         );
         // Only the two JSON answers reached the resolver.
         assert_eq!(sent.lock().unwrap().len(), 2);
+        Ok(())
+    });
+}
+
+/// The JSON API gives each record's data in presentation format, which
+/// reads back as the same RDATA: SVCB parameters as RFC 9460 writes them,
+/// quoted and escaped strings, and the generic form for a type it does
+/// not know (RFC 1035 §5.1, RFC 3597 §5).
+#[test]
+fn json_data_is_in_presentation_format() {
+    world(Duration::from_secs(60), |fcx| async move {
+        let (attacher, attachments) = fictionet::attachments();
+        let env = start(&fcx, attachments)?;
+        let m = machine(&fcx, attacher.attach("agent")?, ME);
+        for (number, data) in KINDS {
+            let conn = tls(&fcx, &m, &env.roots, at(RESOLVER, 443), DOH_NAME, &[b"h2"]).await;
+            let path = format!("/resolve?name=kinds.example&type={number}");
+            let got = http(&fcx, conn, true, get(true, DOH_NAME, &path, &[])).await;
+            assert_eq!(got.status, StatusCode::OK, "{number}");
+            let value = Value::parse(&got.body).unwrap();
+            let Some(Value::Array(answers)) = value.get("Answer") else {
+                panic!("{number}: no answer in {value:?}");
+            };
+            let given: Vec<&str> = answers
+                .iter()
+                .filter(|record| {
+                    record
+                        .get("type")
+                        .and_then(Value::as_number)
+                        .map(|n| n.as_f64())
+                        == Some(f64::from(number))
+                })
+                .filter_map(|record| record.get("data").and_then(Value::as_str))
+                .collect();
+            assert_eq!(given, [data], "{number}");
+            // Read back, the data is the record the zone holds.
+            let held = kind(number, data);
+            let back = kind(number, given[0]);
+            assert_eq!(
+                back.records_without_rrsigs().next().map(|r| &r.data),
+                held.records_without_rrsigs().next().map(|r| &r.data),
+                "{number}"
+            );
+        }
         Ok(())
     });
 }

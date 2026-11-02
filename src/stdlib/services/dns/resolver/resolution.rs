@@ -386,6 +386,10 @@ struct Check {
     /// Whether the check looked for zone cuts between `zone` and an
     /// unsigned RRset's owner.
     probed: bool,
+    /// Whether the work bound stopped a lookup the check needed. Its
+    /// result then says how far one client question's budget went, so it
+    /// is not cached for other clients (RFC 9520 §3.2).
+    bounded: bool,
     dependents: Vec<Node>,
 }
 
@@ -619,13 +623,25 @@ impl<V: Verify> Resolver<V> {
             .filter(|found| !(relay_cd && matches!(found.outcome, Outcome::Failure(_))))
     }
 
-    /// Expired data for `key`, for serving stale (RFC 8767 §4).
+    /// Expired data for `key`, for serving stale (RFC 8767 §4): the RRset
+    /// or the negative, or else a CNAME at the name, as
+    /// [`cached`](Resolver::cached) finds them.
     pub(super) fn stale_found(&self, key: &Key) -> Option<Found> {
-        match self.cache.stale(key, self.now)? {
+        let found = match self.cache.stale(key, self.now) {
+            Some(entry @ Entry::Positive { rank, .. }) if *rank >= Rank::NonAuthAnswer => {
+                return Some(self.found_positive(entry, key.rtype, true));
+            }
+            Some(entry @ Entry::Negative { .. }) => self.found_negative(key, &key.name, entry),
+            _ => None,
+        };
+        if found.is_some() || matches!(key.rtype, RecordType::CNAME | RecordType::ANY) {
+            return found;
+        }
+        let alias = Key::new(key.name.clone(), RecordType::CNAME, key.class);
+        match self.cache.stale(&alias, self.now)? {
             entry @ Entry::Positive { rank, .. } if *rank >= Rank::NonAuthAnswer => {
                 Some(self.found_positive(entry, key.rtype, true))
             }
-            entry @ Entry::Negative { .. } => self.found_negative(key, &key.name, entry),
             _ => None,
         }
     }
@@ -1149,7 +1165,9 @@ impl<V: Verify> Resolver<V> {
         let Some(lookup) = self.graph.lookups.get(&id) else {
             return;
         };
-        let why = if lookup.errors {
+        let why = if lookup.bounded {
+            self.bound_failure(lookup.tree)
+        } else if lookup.errors {
             FailureKind::Unknown
         } else {
             FailureKind::NoReachableAuthority
@@ -1159,6 +1177,18 @@ impl<V: Verify> Resolver<V> {
             self.cache.insert(self.now, Offer::Failure { key, why });
         }
         self.finish(id, Found::fresh(Outcome::Failure(why)));
+    }
+
+    /// Why a question of `tree` failed when the work bound stopped it
+    /// (RFC 1034 §5.3.3): the bound, unless no server replied to any of
+    /// the question's queries, when every server failed (RFC 8914
+    /// §4.23).
+    fn bound_failure(&self, tree: TreeId) -> FailureKind {
+        if self.graph.trees.get(&tree).is_some_and(|tree| tree.replied) {
+            FailureKind::WorkExceeded
+        } else {
+            FailureKind::NoReachableAuthority
+        }
     }
 
     /// Notes that the work bound stopped lookup `id` or something it
@@ -1279,16 +1309,9 @@ impl<V: Verify> Resolver<V> {
         };
         let (tree, relay_cd) = (lookup.tree, lookup.relay_cd);
         if !self.graph.charge(tree, self.config.work.queries) {
-            // RFC 1034 §5.3.3: past the bound, the question fails. When no
-            // server replied to any of the question's queries, every server
-            // failed (RFC 8914 §4.23). The bound is one tree's, so the
-            // failure is not cached.
-            let replied = self.graph.trees.get(&tree).is_some_and(|tree| tree.replied);
-            let why = if replied {
-                FailureKind::WorkExceeded
-            } else {
-                FailureKind::NoReachableAuthority
-            };
+            // Past the bound, the question fails. The bound is one tree's,
+            // so the failure is not cached.
+            let why = self.bound_failure(tree);
             self.bound(id);
             return self.finish(id, Found::fresh(Outcome::Failure(why)));
         }
@@ -2009,6 +2032,7 @@ impl<V: Verify> Resolver<V> {
                 links: BTreeMap::new(),
                 wait: BTreeMap::new(),
                 probed: false,
+                bounded: false,
                 dependents: vec![from],
             },
         );
@@ -2093,7 +2117,13 @@ impl<V: Verify> Resolver<V> {
                 }
                 return;
             }
-            Dep::Cycle | Dep::TooDeep => Outcome::Failure(FailureKind::WorkExceeded),
+            Dep::Cycle => Outcome::Failure(FailureKind::WorkExceeded),
+            Dep::TooDeep => {
+                if let Some(check) = self.graph.checks.get_mut(&id) {
+                    check.bounded = true;
+                }
+                Outcome::Failure(FailureKind::WorkExceeded)
+            }
         };
         self.fetched(id, &name, part, &outcome, entropy);
     }
@@ -2238,12 +2268,14 @@ impl<V: Verify> Resolver<V> {
         }
     }
 
-    /// What a lookup that check `id` waited for found.
+    /// What a lookup that check `id` waited for found, and whether the
+    /// work bound stopped it.
     pub(super) fn check_looked(
         &mut self,
         id: CheckId,
         lookup: LookupId,
         found: Found,
+        bounded: bool,
         entropy: &dyn Entropy,
     ) {
         let Some(check) = self.graph.checks.get_mut(&id) else {
@@ -2252,6 +2284,7 @@ impl<V: Verify> Resolver<V> {
         let Some((zone, part)) = check.wait.remove(&lookup) else {
             return;
         };
+        check.bounded |= bounded;
         self.fetched(id, &zone, part, &found.outcome, entropy);
         if self
             .graph
@@ -2264,7 +2297,8 @@ impl<V: Verify> Resolver<V> {
     }
 
     /// Validates check `id`'s material with the chain it gathered, records
-    /// the result in the cache, and hands it to every node that waited.
+    /// the result in the cache unless the work bound stopped a lookup the
+    /// check needed, and hands it to every node that waited.
     ///
     /// An unsigned RRset that is Bogus with the chain so far may sit below
     /// a cut the resolution never saw, so the check first probes for one,
@@ -2302,7 +2336,9 @@ impl<V: Verify> Resolver<V> {
         let check = self.graph.checks.remove(&id)?;
         self.graph.unlist(&check.subject, id);
         self.graph.release(check.tree);
-        self.validated(&check.subject, &check.checked, &check.material, validation);
+        if !check.bounded {
+            self.validated(&check.subject, &check.checked, &check.material, validation);
+        }
         for to in check.dependents {
             self.graph.ready.push_back(Ready::Checked {
                 to,
@@ -2355,9 +2391,11 @@ impl<V: Verify> Resolver<V> {
     /// Records `validation` of `subject`, made over `checked` with
     /// `material`, in the cache, where the subject's entry still holds
     /// `checked`. A Secure RRset lives no longer than the first of its
-    /// RRSIGs to expire (RFC 4035 §5.3.3), and the NSEC records of a
-    /// Secure negative answer, every one of which verified, are kept for
-    /// synthesizing answers (RFC 8198).
+    /// RRSIGs to expire (RFC 4035 §5.3.3), and a Secure negative answer no
+    /// longer than the first RRSIG of its SOA and denial records. The NSEC
+    /// records of a Secure negative answer, every one of which verified,
+    /// are kept for synthesizing answers while they and their SOA are
+    /// Secure (RFC 8198 §5.4).
     fn validated(
         &mut self,
         subject: &Subject,
@@ -2366,13 +2404,21 @@ impl<V: Verify> Resolver<V> {
         validation: Validation,
     ) {
         let now = self.now;
-        let (key, set) = match (subject, material) {
-            (Subject::Rrset(key), Material::Rrset { set, .. }) => (key, Some(set)),
-            (Subject::Denial(key, _), _) => (key, None),
+        // The records whose RRSIGs proved the result: the RRset, or a
+        // negative answer's SOA and NSEC or NSEC3 records, which together
+        // last only as long as each of them (RFC 8198 §5.4).
+        let (key, sets) = match (subject, material) {
+            (Subject::Rrset(key), Material::Rrset { set, .. }) => (key, std::slice::from_ref(set)),
+            (Subject::Denial(key, _), Material::Denial { authority, .. }) => {
+                (key, authority.as_slice())
+            }
             _ => return,
         };
-        let expires = set.and_then(|set| self.signatures_expire(set));
-        let original_ttl = set.and_then(original_ttl);
+        let expires = sets
+            .iter()
+            .filter_map(|set| self.signatures_expire(set))
+            .min();
+        let original_ttl = sets.iter().filter_map(original_ttl).min();
         self.cache
             .validated(key, checked, validation, expires, original_ttl, now);
         if let (Validation::Secure, Material::Denial { authority, .. }) = (validation, material)
@@ -2381,15 +2427,16 @@ impl<V: Verify> Resolver<V> {
             let soa = authority
                 .iter()
                 .find(|set| set.record_type() == RecordType::SOA);
-            let nsec: Vec<RecordSet> = authority
+            let nsec: Vec<(RecordSet, Option<Instant>)> = authority
                 .iter()
                 .filter(|set| set.record_type() == RecordType::NSEC)
-                .cloned()
+                .map(|set| (set.clone(), self.secure_until(set, now)))
                 .collect();
             if let Some(soa) = soa
                 && !nsec.is_empty()
             {
-                self.cache.add_secure_nsec(soa, &nsec, now);
+                let soa_until = self.secure_until(soa, now);
+                self.cache.add_secure_nsec(soa, soa_until, &nsec, now);
             }
         }
     }
@@ -2572,8 +2619,16 @@ fn dname_matches(dname: &RecordSet, cname: &RecordSet) -> bool {
     let Some(alias) = cname_target(cname) else {
         return false;
     };
+    // hickory's own label count leaves out a leading `*`, which a name
+    // below a DNAME may start with, so the labels are counted here.
     let owner = cname.name();
-    let keep = usize::from(owner.num_labels() - dname.name().num_labels());
+    let Some(keep) = owner
+        .iter()
+        .count()
+        .checked_sub(dname.name().iter().count())
+    else {
+        return false;
+    };
     let prefix: Vec<&[u8]> = owner.iter().take(keep).collect();
     Name::from_labels(prefix)
         .and_then(|prefix| prefix.append_domain(&target))

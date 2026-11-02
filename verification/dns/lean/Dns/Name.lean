@@ -6,7 +6,7 @@
   `www.example.com.` is `[www, example, com]`. Bytes are `Nat`s; the theorems that need them to be octets
   say so.
 
-  Rust: `LowerName` in hickory, with `Name::cmp_canonical`, `zone_of`, and `len`.
+  Rust: `LowerName` in hickory, with `impl Ord for Name` (the canonical order), `zone_of`, and `len`.
 -/
 namespace Dns
 

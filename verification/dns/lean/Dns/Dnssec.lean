@@ -2189,12 +2189,20 @@ theorem sep_keySigner {ss : List (Signer S)} {s : Signer S} (hs : s ∈ ss) (hse
   simp only [this, ↓reduceIte]
   exact List.mem_filter.mpr ⟨hs, hsep⟩
 
-/-- What makes a signed zone's own signatures verify at `t`: honest signers, algorithms the policy validates,
-and an open window. -/
+/-- What makes a signed zone's own signatures verify at `t`: honest signers, a signer of its data whose algorithm
+the policy validates, and an open window. One such algorithm is enough for a path (RFC 6840 §5.11). -/
 structure SignsWell (sz : SignedZone S) (P : AlgorithmPolicy) (t : Nat) : Prop where
   honest : ∀ s ∈ sz.signers, s.Honest
-  alg : ∀ s ∈ sz.signers, P.validate.contains s.dnskey.alg = true
+  dataAlg : ∃ s ∈ dataSigners sz.signers, P.validate.contains s.dnskey.alg = true
   window : sz.window.inception ≤ t ∧ t ≤ sz.window.expiration
+
+/-- A DS record the policy supports names an algorithm it validates. -/
+theorem validates_of_supported {P : AlgorithmPolicy} {alg dt : Nat} (h : P.treat alg dt = .supported) :
+    P.validate.contains alg = true := by
+  unfold AlgorithmPolicy.treat at h
+  by_cases hm : alg ∈ P.validate
+  · simpa using hm
+  · simp [hm] at h
 
 theorem SignsWell.windowOk {sz : SignedZone S} {P : AlgorithmPolicy} {t : Nat} (hw : SignsWell sz P t)
     (a : Nat) (sg : Name) (lb tt : Nat) :
@@ -2208,20 +2216,21 @@ theorem keySet_signed {sz : SignedZone S} {P : AlgorithmPolicy} {t : Nat} (hw : 
     (hdt : P.treat d.keyAlg d.dtype = .supported) (hda : d.keyAlg = s0.dnskey.alg)
     (hdd : d.digest = S.digest sz.apex s0.dnskey) : KeysSigned P t sz.apex dss (some sz.keySet) sz.keys := by
   refine ⟨sz.keySet, rfl, rfl, s0.dnskey, List.mem_map.mpr ⟨s0, hs0, rfl⟩, hsep0, ⟨d, hd, hdt, hda, hdd⟩, ?_⟩
+  have ha0 : P.validate.contains s0.dnskey.alg = true := hda ▸ validates_of_supported hdt
   refine ⟨_, List.mem_map.mpr ⟨s0, sep_keySigner hs0 hsep0, rfl⟩, ?_, hw.windowOk _ _ _ _, _, rfl, s0.dnskey,
     List.mem_singleton_self _, rfl, honest_verifies (hw.honest s0 hs0) _ _⟩
-  simp only [usable, beq_self_eq_true, hw.alg s0 hs0, Bool.and_self, List.any_cons, List.any_nil, Bool.or_false]
+  simp only [usable, beq_self_eq_true, ha0, Bool.and_self, List.any_cons, List.any_nil, Bool.or_false]
 
 /-- An RRset a zone signed, offered at its own owner with any TTL, passes the zone's own check. -/
 theorem signSet_final {sz : SignedZone S} {P : AlgorithmPolicy} {t : Nat} (hw : SignsWell sz P t)
-    (hne : sz.signers ≠ []) {set x : RRset} (ds : List (Signed S)) (hown : x.owner = set.owner)
+    {set x : RRset} (ds : List (Signed S)) (hown : x.owner = set.owner)
     (htype : x.rtype = set.rtype) (hdata : x.rdata = set.rdata) :
     FinalSigned P t sz.apex sz.keys set (sz.signSet x).sigs ds := by
-  obtain ⟨s1, hs1⟩ := dataSigners_nonempty hne
+  obtain ⟨s1, hs1, ha1⟩ := hw.dataAlg
   have hs1' := mem_dataSigners hs1
   refine Or.inl ⟨_, List.mem_map.mpr ⟨s1, hs1, rfl⟩, ⟨?_, hw.windowOk _ _ _ _, .rrset x, ?_, s1.dnskey,
     List.mem_map.mpr ⟨s1, hs1', rfl⟩, rfl, honest_verifies (hw.honest s1 hs1') _ _⟩, ?_⟩
-  · simp only [usable, beq_self_eq_true, hw.alg s1 hs1', Bool.and_self, Bool.true_and, List.any_eq_true, beq_iff_eq]
+  · simp only [usable, beq_self_eq_true, ha1, Bool.and_self, Bool.true_and, List.any_eq_true, beq_iff_eq]
     exact ⟨s1.dnskey, List.mem_map.mpr ⟨s1, hs1', rfl⟩, rfl⟩
   · simp only [rrsetCover, expanded, hown, ↓reduceIte, Option.map_some]
     cases x; cases set; simp_all
@@ -2266,31 +2275,35 @@ theorem anchorFor_zone (sz : SignedZone S) (dt : Nat) {n : Name} (hin : under n 
     anchorFor [sz.anchor dt] n = some (sz.anchor dt) := by
   simp [anchorFor, anchorStep, SignedZone.anchor, hin]
 
-/-- A signed zone's anchor names each of its SEP keys. -/
+/-- A signed zone's anchor names each of its SEP keys, and one in an algorithm the policy validates makes its
+DNSKEY set trusted. -/
 theorem anchor_keys {sz : SignedZone S} {P : AlgorithmPolicy} {t dt : Nat} (hw : SignsWell sz P t)
-    (hdt : P.digests.contains dt = true) {s0 : Signer S} (hs0 : s0 ∈ sz.signers) (hsep0 : s0.dnskey.sep = true) :
+    (hdt : P.digests.contains dt = true) {s0 : Signer S} (hs0 : s0 ∈ sz.signers) (hsep0 : s0.dnskey.sep = true)
+    (ha0 : P.validate.contains s0.dnskey.alg = true) :
     KeysSigned P t sz.apex (sz.anchor dt).ds (some sz.keySet) sz.keys := by
   refine keySet_signed hw hs0 hsep0 (d := ⟨s0.dnskey.alg, dt, S.digest sz.apex s0.dnskey⟩) ?_ ?_ rfl rfl
   · exact List.mem_filterMap.mpr ⟨s0, sep_keySigner hs0 hsep0, by simp [hsep0]⟩
-  · simp only [AlgorithmPolicy.treat, hw.alg s0 hs0, hdt, Bool.not_true, Bool.false_eq_true, ↓reduceIte]
+  · simp only [AlgorithmPolicy.treat, ha0, hdt, Bool.not_true, Bool.false_eq_true, ↓reduceIte]
 
 /-- Every RRset a signed zone signs validates Secure under the zone's own anchor, while the signature window
-holds, when every signer is honest and uses an algorithm the policy validates and some signer has the SEP
-bit. -/
+holds, when every signer is honest, some signer of its data uses an algorithm the policy validates, and so does
+some signer with the SEP bit. -/
 theorem signed_sets_validate (sz : SignedZone S) (P : AlgorithmPolicy) (t dt : Nat) (hw : SignsWell sz P t)
-    (hdt : P.digests.contains dt = true) (hsep : ∃ s ∈ sz.signers, s.dnskey.sep = true) {set x : RRset}
+    (hdt : P.digests.contains dt = true)
+    (hsep : ∃ s ∈ sz.signers, s.dnskey.sep = true ∧ P.validate.contains s.dnskey.alg = true) {set x : RRset}
     (ds : List (Signed S)) (hown : x.owner = set.owner) (htype : x.rtype = set.rtype) (hdata : x.rdata = set.rdata)
     (hin : under set.owner sz.apex = true) :
     validateRrset (some [sz.anchor dt]) P t [sz.link] set (sz.signSet x).sigs ds = .secure := by
-  obtain ⟨s0, hs0, hsep0⟩ := hsep
+  obtain ⟨s0, hs0, hsep0, ha0⟩ := hsep
   exact secure_complete ⟨sz.link, [], sz.keys, sz.apex, sz.keys,
-    ⟨sz.anchor dt, anchorFor_zone sz dt hin, rfl, rfl, anchor_keys hw hdt hs0 hsep0⟩, .nil,
-    signSet_final hw (List.ne_nil_of_mem hs0) ds hown htype hdata⟩
+    ⟨sz.anchor dt, anchorFor_zone sz dt hin, rfl, rfl, anchor_keys hw hdt hs0 hsep0 ha0⟩, .nil,
+    signSet_final hw ds hown htype hdata⟩
 
 /-- The RRsets a signed zone serves from its own nodes, with the RRSIGs it serves for them, validate Secure
 under the zone's own anchor. The TTL may be lower than the stored one, as for the SOA of a negative answer. -/
 theorem signed_answers_validate (sz : SignedZone S) (P : AlgorithmPolicy) (t dt : Nat) (hw : SignsWell sz P t)
-    (hdt : P.digests.contains dt = true) (hsep : ∃ s ∈ sz.signers, s.dnskey.sep = true) (hwf : sz.zone.WF)
+    (hdt : P.digests.contains dt = true)
+    (hsep : ∃ s ∈ sz.signers, s.dnskey.sep = true ∧ P.validate.contains s.dnskey.alg = true) (hwf : sz.zone.WF)
     {s : RRset} {nd : Node} (ds : List (Signed S)) (hnode : sz.zone.node s.owner = some nd)
     (hcut : ∀ ns d g, nd ≠ .cut ns d g) (hheld : ∃ x ∈ nodeSets nd, x.rtype = s.rtype ∧ x.rdata = s.rdata)
     (hin : under s.owner sz.apex = true) :

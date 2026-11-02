@@ -252,10 +252,6 @@ pub struct Replay {
     replies: HashMap<Question, Vec<(SocketAddr, Vec<u8>, usize)>>,
     /// The zones each server address serves, by the capture's NS records.
     zones: HashMap<IpAddr, Vec<LowerName>>,
-    /// The owners of the A records in the answers to recorded A questions.
-    addressed: HashSet<LowerName>,
-    /// The target of each CNAME record in a recorded answer, by owner.
-    aliases: HashMap<LowerName, LowerName>,
     /// When the newest recorded reply was captured.
     newest: Option<time::OffsetDateTime>,
 }
@@ -311,19 +307,6 @@ impl Replay {
                 };
                 if let Ok(message) = read_message(&reply) {
                     learn(&message, &mut ns, &mut addresses);
-                    let asks_address = request.question.query_type() == RecordType::A;
-                    for record in &message.answers {
-                        let owner = LowerName::new(&record.name);
-                        match &record.data {
-                            RData::A(_) if asks_address => {
-                                replay.addressed.insert(owner);
-                            }
-                            RData::CNAME(target) => {
-                                replay.aliases.insert(owner, LowerName::new(&target.0));
-                            }
-                            _ => {}
-                        }
-                    }
                 }
                 if let Some(text) = fields.get("warc-date") {
                     let date = warc::parse_date(text)
@@ -369,29 +352,6 @@ impl Replay {
     /// `zz-dns-<stamp>.warc.gz`, which sorts after the pages' archives.
     pub fn capture_file(root: &Path, stamp: u128) -> PathBuf {
         root.join(format!("{CAPTURE_PREFIX}{stamp}{CAPTURE_SUFFIX}"))
-    }
-
-    /// Whether the recorded replies give `name` an IPv4 address: an A
-    /// record of its own in the answer to an A question, or one at the end
-    /// of its CNAME chain. A chain that crosses zones is recorded as
-    /// several replies, each alias from its own zone's servers and the
-    /// address from the last one's, and is followed across them.
-    pub fn resolves(&self, name: &LowerName) -> bool {
-        let mut seen = HashSet::new();
-        let mut name = name;
-        loop {
-            if self.addressed.contains(name) {
-                return true;
-            }
-            // A chain that comes back to a name it passed has no end.
-            if !seen.insert(name) {
-                return false;
-            }
-            match self.aliases.get(name) {
-                Some(target) => name = target,
-                None => return false,
-            }
-        }
     }
 
     /// When the newest recorded reply was captured, by its `WARC-Date`, or
@@ -547,7 +507,7 @@ mod tests {
     };
     use fictionet::stdlib::protocols::dns::op::{Edns, MessageType, OpCode, Query};
     use fictionet::stdlib::protocols::dns::rr::Record;
-    use fictionet::stdlib::protocols::dns::rr::rdata::{A, CNAME, NS};
+    use fictionet::stdlib::protocols::dns::rr::rdata::{A, NS};
     use fictionet::stdlib::services::serve::Transport;
     use std::net::Ipv4Addr;
     use std::sync::Arc;
@@ -706,8 +666,6 @@ mod tests {
             let www = query(7, "www.example.com.", RecordType::A, Some(true));
             capture(&fcx, &path, vec![ask(COM, www)]).await;
             let replay = Replay::open([path.clone()]).unwrap();
-            assert!(replay.resolves(&LowerName::new(&name("www.example.com."))));
-            assert!(!replay.resolves(&LowerName::new(&name("mail.example.com."))));
 
             let mut asked = query(0x4242, "WwW.ExAmPlE.CoM.", RecordType::A, Some(true));
             asked[2] |= 0x01; // RD
@@ -831,60 +789,6 @@ mod tests {
         ] {
             assert_eq!(at(wrong), None, "{wrong}");
         }
-    }
-
-    /// Recorded answers to A questions, where a name's alias leads into
-    /// another zone and the address comes from that zone's servers in a
-    /// reply of its own.
-    struct Aliased;
-
-    impl Source for Aliased {
-        fn ask<'a>(
-            &'a self,
-            _fcx: &'a Cx,
-            ask: Ask,
-        ) -> Pin<Box<dyn Future<Output = Observed> + Send + 'a>> {
-            let Parsed::Request(request) = Request::parse(&ask.query, ask.transport) else {
-                return Box::pin(ready(Observed::Timeout));
-            };
-            let qname = request.question.name().clone();
-            let mut reply = Message::response(request.message.metadata.id, OpCode::Query);
-            reply.metadata.authoritative = true;
-            reply.add_query(request.question.clone());
-            let data = match qname.to_ascii().as_str() {
-                "www.example.com." => RData::CNAME(CNAME(name("edge.cdn.net."))),
-                "loop.example.com." => RData::CNAME(CNAME(name("back.example.com."))),
-                "back.example.com." => RData::CNAME(CNAME(name("loop.example.com."))),
-                _ => RData::A(A::new(192, 0, 2, 80)),
-            };
-            reply.add_answer(Record::from_rdata(qname, 300, data));
-            Box::pin(ready(Observed::Reply(reply.to_vec().unwrap())))
-        }
-    }
-
-    #[test]
-    fn a_name_resolves_through_an_alias_into_another_zone() {
-        let path = archive("cross-zone");
-        run(async move |fcx| {
-            let cdn = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 53)), 53);
-            let capture = Capture::new(Aliased);
-            for (server, qname) in [
-                (COM, "www.example.com."),
-                (cdn, "edge.cdn.net."),
-                (COM, "loop.example.com."),
-                (COM, "back.example.com."),
-            ] {
-                let asked = ask(server, query(1, qname, RecordType::A, Some(true)));
-                capture.ask(&fcx, asked).await;
-            }
-            capture.write(&path).unwrap();
-            let replay = Replay::open([path.clone()]).unwrap();
-            let resolves = |text: &str| replay.resolves(&LowerName::new(&name(text)));
-            assert!(resolves("www.example.com."));
-            assert!(resolves("edge.cdn.net."));
-            assert!(!resolves("loop.example.com."));
-            assert!(!resolves("mail.example.com."));
-        });
     }
 
     #[test]

@@ -13,21 +13,16 @@
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::net::Ipv4Addr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use fictionet::Cx;
-use fictionet::stdlib::protocols::dns::op::{Message, Query};
-use fictionet::stdlib::protocols::dns::rr::rdata::A;
-use fictionet::stdlib::protocols::dns::rr::{
-    LowerName, Name, RData, Record, RecordSet, RecordType,
-};
+use fictionet::stdlib::protocols::dns::op::Message;
+use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RData, Record};
 use fictionet::stdlib::protocols::dns::{Parsed, Request, Response};
 use fictionet::stdlib::services::dns::Client;
 use fictionet::stdlib::services::dns::authority::{Ask, Observed};
-use fictionet::stdlib::services::dns::zone::{Shown, View, ZoneData, special};
 use fictionet::stdlib::world::net::dns::internet::{Egress, Location};
 use fictionet::stdlib::world::net::dns::{PerSession, Source};
 use fictionet::sync::Mutex;
@@ -519,84 +514,6 @@ impl Source for Copied {
             }
             observed
         })
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Copied hosts the capture has no address for
-
-/// The hosts a Copied session serves whose DNS capture gives them no IPv4
-/// address, as a local zone of the world's own resolver: a host that
-/// went away, or kept only IPv6 addresses, after its pages were copied,
-/// on a network with no IPv6. The resolver answers an A question for such
-/// a host from here, with the address of a machine `place` puts for it,
-/// so its copied pages can still be reached. That address is all the zone
-/// knows: every other type at the host, every other name, and every name
-/// in the other modes, is left to the real hierarchy or the capture.
-pub(crate) struct Uncaptured {
-    root: Name,
-    apex: LowerName,
-    pages: Arc<Pages>,
-    place: Box<Place>,
-}
-
-/// What puts a machine for a host and gives its address.
-type Place = dyn Fn(&LowerName) -> Option<Ipv4Addr> + Send + Sync;
-
-impl Uncaptured {
-    /// The zone for the sessions of `pages`, with `place` putting a
-    /// machine for a host and giving its address.
-    pub(crate) fn new(
-        pages: Arc<Pages>,
-        place: impl Fn(&LowerName) -> Option<Ipv4Addr> + Send + Sync + 'static,
-    ) -> Uncaptured {
-        let root = Name::root();
-        Uncaptured {
-            apex: LowerName::new(&root),
-            root,
-            pages,
-            place: Box::new(place),
-        }
-    }
-
-    /// Whether the session now serves `name` from its copy while its
-    /// capture gives it no IPv4 address.
-    fn uncaptured(&self, name: &LowerName) -> bool {
-        matches!(self.pages.source(), Mode::Copied)
-            && self.pages.serves_host(&host(name))
-            && self
-                .pages
-                .copied_dns()
-                .is_some_and(|replay| !replay.resolves(name))
-    }
-}
-
-impl ZoneData for Uncaptured {
-    fn apex(&self) -> &LowerName {
-        &self.apex
-    }
-
-    fn view(&self, question: &Query) -> Arc<dyn View + Send + Sync> {
-        let name = LowerName::new(question.name());
-        let address = (question.query_type() == RecordType::A && self.uncaptured(&name))
-            .then(|| (self.place)(&name))
-            .flatten();
-        let shown = match address {
-            Some(address) => {
-                let owner = Name::from(name);
-                let mut a = RecordSet::with_ttl(owner.clone(), RecordType::A, special::LOCAL_TTL);
-                a.set_records(vec![Record::from_rdata(
-                    owner.clone(),
-                    special::LOCAL_TTL,
-                    RData::A(A(address)),
-                )]);
-                Shown::new(&owner, [a])
-            }
-            None => Shown::new(&self.root, []),
-        };
-        shown
-            .expect("the host's own A RRset belongs to it")
-            .view(question)
     }
 }
 

@@ -265,7 +265,7 @@ impl<'a> Nsecs<'a> {
     fn closest_encloser(name: &Name, owner: &Name, rdata: &NSEC) -> Name {
         let a = common_ancestor(name, owner);
         let b = common_ancestor(name, rdata.next_domain_name());
-        if a.num_labels() >= b.num_labels() {
+        if a.iter().count() >= b.iter().count() {
             a
         } else {
             b
@@ -545,9 +545,11 @@ fn common_ancestor(a: &Name, b: &Name) -> Name {
     a.trim_to(shared)
 }
 
-/// Whether `name` is strictly below `ancestor`.
+/// Whether `name` is strictly below `ancestor`. hickory's own label count
+/// leaves out a leading `*`, so `*.<ancestor>` would count as the
+/// ancestor itself; the labels are counted here.
 fn is_below(name: &Name, ancestor: &Name) -> bool {
-    ancestor.zone_of(name) && name.num_labels() > ancestor.num_labels()
+    ancestor.zone_of(name) && name.iter().count() > ancestor.iter().count()
 }
 
 /// A base32hex label (RFC 4648 §7) decoded, ignoring case, as NSEC3

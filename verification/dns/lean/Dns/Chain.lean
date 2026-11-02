@@ -1,8 +1,10 @@
 /-
   `check_chain`: an advisory check over the signed zones a world built. It reports a DS set that names
   none of the child's keys, a delegation without DS whose parent gives no proof of that, a signature window
-  closed at the check's time, and a key algorithm the policy does not validate. A world that wants a broken
-  chain on purpose leaves the problem in, and the resolver then does the standard thing.
+  closed at the check's time, the key algorithms of a zone none of whose keys uses an algorithm the policy
+  validates, and the algorithms of a DS set none of whose records does, since one such algorithm is enough
+  for a path (RFC 6840 §5.11). A world that wants a broken chain on purpose leaves the problem in, and the
+  resolver then does the standard thing.
 
   `check_sound`: when the check reports nothing, every RRset each zone serves validates Secure or Insecure
   along the chain from the anchor, never Bogus or Indeterminate. `check_complete`: every problem the tree
@@ -10,10 +12,9 @@
 
   The tree is a list of signed zones; a zone's parent is the zone whose apex is its deepest strict ancestor.
 
-  Rust: `services::dns::zone::chain::{check_chain, ChainProblem}`. Rust reports a zone's key algorithms only
-  when none of them is one the policy validates, since one is enough for a path (RFC 6840 §5.11), and reports
-  an RRset left without a signature in such an algorithm as a problem of its own. For a zone signed with one
-  algorithm, as every zone of the vectors is, the two checks report the same.
+  Rust: `services::dns::zone::chain::{check_chain, ChainProblem}`. Rust also verifies every signature, and
+  reports an RRset left without a signature in an algorithm the policy validates as a problem of its own. In
+  this model every data signer signs every RRset, so `check_sound` takes that as `DataAlgorithms`.
 -/
 import Dns.Dnssec
 
@@ -50,12 +51,24 @@ def dsAt (p : SignedZone S) (c : Name) : Option RRset :=
 
 /-! ## The check -/
 
-/-- Problems of one zone: its window is closed at `t`, or a key uses an algorithm the policy does not validate.
-An unsigned zone has neither. -/
+/-- Whether the policy validates some key algorithm among `keys`. -/
+def anyValidated (P : AlgorithmPolicy) (keys : List Key) : Bool := keys.any fun k => P.validate.contains k.alg
+
+/-- The algorithms of a DS set at the cut `n` when none of them is one the policy validates: one DS record with
+such an algorithm is enough for a path (RFC 6840 §5.11), and with none the child is Insecure (RFC 9905 §2). -/
+def dsProblems (P : AlgorithmPolicy) : Name × Node → List Problem
+  | (n, .cut _ (some set) _) =>
+    if (dsOf set).any (fun d => P.validate.contains d.keyAlg) then []
+    else (dsOf set).map fun d => .unsupportedAlgorithm n d.keyAlg
+  | _ => []
+
+/-- Problems of one zone: its window is closed at `t`; none of its keys uses an algorithm the policy validates,
+when each key's algorithm is reported (RFC 6840 §5.11); and the DS sets at its cuts whose algorithms the policy
+does not validate. An unsigned zone has no window and no key to report. -/
 def zoneProblems (P : AlgorithmPolicy) (t : Nat) (z : SignedZone S) : List Problem :=
   (if z.signers ≠ [] ∧ ¬ (z.window.inception ≤ t ∧ t ≤ z.window.expiration) then [.windowClosed z.apex t] else []) ++
-    (z.signers.filter fun s => !P.validate.contains s.dnskey.alg).map fun s =>
-      .unsupportedAlgorithm z.apex s.dnskey.alg
+    (if anyValidated P z.keys then [] else z.signers.map fun s => .unsupportedAlgorithm z.apex s.dnskey.alg) ++
+    z.zone.nodes.flatMap (dsProblems P)
 
 /-- The parent's DS set for `c` is empty, or the policy supports some of it and none of it names a SEP key of
 `c`. -/
@@ -92,7 +105,10 @@ def check (tr : Tree S) (P : AlgorithmPolicy) (t : Nat) : List Problem :=
 def Holds (tr : Tree S) (P : AlgorithmPolicy) (t : Nat) : Problem → Prop
   | .windowClosed a time =>
     ∃ z ∈ tr, z.apex = a ∧ time = t ∧ z.signers ≠ [] ∧ ¬ (z.window.inception ≤ t ∧ t ≤ z.window.expiration)
-  | .unsupportedAlgorithm a alg => ∃ z ∈ tr, z.apex = a ∧ ∃ s ∈ z.signers, s.dnskey.alg = alg ∧ alg ∉ P.validate
+  | .unsupportedAlgorithm a alg =>
+    (∃ z ∈ tr, z.apex = a ∧ (∃ s ∈ z.signers, s.dnskey.alg = alg) ∧ ∀ s ∈ z.signers, s.dnskey.alg ∉ P.validate) ∨
+      ∃ z ∈ tr, ∃ ns set g, (a, Node.cut ns (some set) g) ∈ z.zone.nodes ∧ (∃ d ∈ dsOf set, d.keyAlg = alg) ∧
+        ∀ d ∈ dsOf set, d.keyAlg ∉ P.validate
   | .dsMismatch pa ca =>
     ∃ c ∈ tr, ∃ p, parentOf tr c = some p ∧ p.apex = pa ∧ c.apex = ca ∧ ∃ set, dsAt p c.apex = some set ∧
       (dsOf set = [] ∨ ((∃ d ∈ dsOf set, P.treat d.keyAlg d.dtype = .supported) ∧
@@ -104,22 +120,68 @@ def Holds (tr : Tree S) (P : AlgorithmPolicy) (t : Nat) : Problem → Prop
           ∀ w, ¬ NoDsEvidence (S := S) P c.apex ((p.noDsRecords c.apex).map (·.data)) w) ∨
         ∀ ns ds g, p.zone.node c.apex ≠ some (.cut ns ds g))
 
+theorem anyValidated_false {P : AlgorithmPolicy} {z : SignedZone S} :
+    anyValidated P z.keys = false ↔ ∀ s ∈ z.signers, s.dnskey.alg ∉ P.validate := by
+  simp [anyValidated, SignedZone.keys]
+
+theorem mem_dsProblems {P : AlgorithmPolicy} {n : Name} {nd : Node} {prob : Problem} :
+    prob ∈ dsProblems P (n, nd) ↔ ∃ ns set g, nd = .cut ns (some set) g ∧
+      (∃ d ∈ dsOf set, prob = .unsupportedAlgorithm n d.keyAlg) ∧ ∀ d ∈ dsOf set, d.keyAlg ∉ P.validate := by
+  cases nd with
+  | cut ns ds g =>
+    cases ds with
+    | none => simp [dsProblems]
+    | some set =>
+      constructor
+      · intro h
+        simp only [dsProblems] at h
+        split at h
+        · cases h
+        · rename_i hv
+          obtain ⟨d, hd, rfl⟩ := List.mem_map.mp h
+          refine ⟨ns, set, g, rfl, ⟨d, hd, rfl⟩, fun d' hd' hm => hv ?_⟩
+          exact List.any_eq_true.mpr ⟨d', hd', by simpa using hm⟩
+      · rintro ⟨ns', set', g', heq, ⟨d, hd, rfl⟩, hall⟩
+        cases heq
+        simp only [dsProblems]
+        split
+        · rename_i hv
+          obtain ⟨d', hd', hc⟩ := List.any_eq_true.mp hv
+          exact absurd (by simpa using hc) (hall d' hd')
+        · exact List.mem_map.mpr ⟨d, hd, rfl⟩
+  | data _ => simp [dsProblems]
+  | dname _ _ => simp [dsProblems]
+  | empty => simp [dsProblems]
+
 theorem zoneProblems_iff {P : AlgorithmPolicy} {t : Nat} {z : SignedZone S} {prob : Problem} :
     prob ∈ zoneProblems P t z ↔
       (prob = .windowClosed z.apex t ∧ z.signers ≠ [] ∧ ¬ (z.window.inception ≤ t ∧ t ≤ z.window.expiration)) ∨
-        ∃ s ∈ z.signers, s.dnskey.alg ∉ P.validate ∧ prob = .unsupportedAlgorithm z.apex s.dnskey.alg := by
+        (∃ s ∈ z.signers, prob = .unsupportedAlgorithm z.apex s.dnskey.alg ∧
+          ∀ s' ∈ z.signers, s'.dnskey.alg ∉ P.validate) ∨
+        ∃ n ns set g, (n, Node.cut ns (some set) g) ∈ z.zone.nodes ∧
+          (∃ d ∈ dsOf set, prob = .unsupportedAlgorithm n d.keyAlg) ∧ ∀ d ∈ dsOf set, d.keyAlg ∉ P.validate := by
   unfold zoneProblems
-  simp only [List.mem_append, List.mem_map, List.mem_filter, Bool.not_eq_true', List.contains_eq_mem,
-    decide_eq_false_iff_not]
+  simp only [List.mem_append, List.mem_flatMap]
   constructor
-  · rintro (h | ⟨s, ⟨hs, ha⟩, rfl⟩)
+  · rintro ((h | h) | ⟨e, he, h⟩)
     · split at h
       · rename_i hc; exact Or.inl ⟨List.mem_singleton.mp h, hc⟩
       · cases h
-    · exact Or.inr ⟨s, hs, ha, rfl⟩
-  · rintro (⟨rfl, hc⟩ | ⟨s, hs, ha, rfl⟩)
-    · left; simp [hc]
-    · exact Or.inr ⟨s, ⟨hs, ha⟩, rfl⟩
+    · split at h
+      · cases h
+      · rename_i hv
+        obtain ⟨s, hs, rfl⟩ := List.mem_map.mp h
+        exact Or.inr (Or.inl ⟨s, hs, rfl, anyValidated_false.mp (by simpa using hv)⟩)
+    · obtain ⟨n, nd⟩ := e
+      obtain ⟨ns, set, g, rfl, hd, hall⟩ := mem_dsProblems.mp h
+      exact Or.inr (Or.inr ⟨n, ns, set, g, he, hd, hall⟩)
+  · rintro (⟨rfl, hc⟩ | ⟨s, hs, rfl, hall⟩ | ⟨n, ns, set, g, he, hd, hall⟩)
+    · left; left; simp [hc]
+    · left; right
+      rw [show anyValidated P z.keys = false from anyValidated_false.mpr hall]
+      exact List.mem_map.mpr ⟨s, hs, rfl⟩
+    · right
+      exact ⟨(n, .cut ns (some set) g), he, mem_dsProblems.mpr ⟨ns, set, g, rfl, hd, hall⟩⟩
 
 theorem dsMismatchB_iff {P : AlgorithmPolicy} {p c : SignedZone S} :
     dsMismatchB P p c = true ↔ ∃ set, dsAt p c.apex = some set ∧
@@ -226,8 +288,9 @@ theorem check_complete {tr : Tree S} {P : AlgorithmPolicy} {t : Nat} {prob : Pro
     obtain ⟨z, hz, rfl, rfl, hs, hw⟩ := h
     exact Or.inl ⟨z, hz, zoneProblems_iff.mpr (Or.inl ⟨rfl, hs, hw⟩)⟩
   | unsupportedAlgorithm a alg =>
-    obtain ⟨z, hz, rfl, s, hs, rfl, ha⟩ := h
-    exact Or.inl ⟨z, hz, zoneProblems_iff.mpr (Or.inr ⟨s, hs, ha, rfl⟩)⟩
+    rcases h with ⟨z, hz, rfl, ⟨s, hs, rfl⟩, hall⟩ | ⟨z, hz, ns, set, g, he, ⟨d, hd, rfl⟩, hall⟩
+    · exact Or.inl ⟨z, hz, zoneProblems_iff.mpr (Or.inr (Or.inl ⟨s, hs, rfl, hall⟩))⟩
+    · exact Or.inl ⟨z, hz, zoneProblems_iff.mpr (Or.inr (Or.inr ⟨a, ns, set, g, he, ⟨d, hd, rfl⟩, hall⟩))⟩
   | dsMismatch pa ca =>
     obtain ⟨c, hc, p, hp, rfl, rfl, h⟩ := h
     exact Or.inr ⟨c, hc, p, hp, edgeProblems_iff.mpr (Or.inl ⟨rfl, dsMismatchB_iff.mpr h⟩)⟩
@@ -239,9 +302,10 @@ theorem check_complete {tr : Tree S} {P : AlgorithmPolicy} {t : Nat} {prob : Pro
 theorem check_reports_real {tr : Tree S} {P : AlgorithmPolicy} {t : Nat} {prob : Problem}
     (h : prob ∈ check tr P t) : Holds tr P t prob := by
   rcases mem_check.mp h with ⟨z, hz, h⟩ | ⟨c, hc, p, hp, h⟩
-  · rcases zoneProblems_iff.mp h with ⟨rfl, hs, hw⟩ | ⟨s, hs, ha, rfl⟩
+  · rcases zoneProblems_iff.mp h with ⟨rfl, hs, hw⟩ | ⟨s, hs, rfl, hall⟩ | ⟨n, ns, set, g, he, ⟨d, hd, rfl⟩, hall⟩
     · exact ⟨z, hz, rfl, rfl, hs, hw⟩
-    · exact ⟨z, hz, rfl, s, hs, rfl, ha⟩
+    · exact Or.inl ⟨z, hz, rfl, ⟨s, hs, rfl⟩, hall⟩
+    · exact Or.inr ⟨z, hz, ns, set, g, he, ⟨d, hd, rfl⟩, hall⟩
   · rcases edgeProblems_iff.mp h with ⟨rfl, hm⟩ | ⟨rfl, hm⟩
     · exact ⟨c, hc, p, hp, rfl, rfl, dsMismatchB_iff.mp hm⟩
     · exact ⟨c, hc, p, hp, rfl, rfl, noDsMissingB_iff.mp hm⟩
@@ -338,15 +402,25 @@ theorem dsSets_of {tr : Tree S} (h : dsSetsB tr = true) :
   have := (List.all_eq_true.mp ((List.all_eq_true.mp h) z hz)) (n, .cut ns (some set) g) (lookup_mem hn)
   simpa using this
 
+/-- What Rust's check that every RRset carries a signature in an algorithm the policy validates adds to `check` in
+this model, where every data signer signs every RRset: when some key of a zone uses such an algorithm, a key that
+signs its data does too. Rust reports each RRset without one as a problem of its own. -/
+def DataAlgorithms (tr : Tree S) (P : AlgorithmPolicy) : Prop :=
+  ∀ z ∈ tr, (∃ s ∈ z.signers, P.validate.contains s.dnskey.alg = true) →
+    ∃ s ∈ dataSigners z.signers, P.validate.contains s.dnskey.alg = true
+
 theorem zone_signsWell {tr : Tree S} {P : AlgorithmPolicy} {t : Nat} (hc : check tr P t = []) (hwf : WellFormed tr)
-    {z : SignedZone S} (hz : z ∈ tr) (hne : z.signers ≠ []) : SignsWell z P t := by
-  refine ⟨hwf.honest z hz, fun s hs => ?_, ?_⟩
-  · cases ha : P.validate.contains s.dnskey.alg
-    · have : Problem.unsupportedAlgorithm z.apex s.dnskey.alg ∈ check tr P t := by
-        refine mem_check.mpr (Or.inl ⟨z, hz, zoneProblems_iff.mpr (Or.inr ⟨s, hs, ?_, rfl⟩)⟩)
-        simpa using ha
-      rw [hc] at this; cases this
-    · rfl
+    (hd : DataAlgorithms tr P) {z : SignedZone S} (hz : z ∈ tr) (hne : z.signers ≠ []) : SignsWell z P t := by
+  refine ⟨hwf.honest z hz, hd z hz ?_, ?_⟩
+  · apply Classical.byContradiction
+    intro hno
+    have hall : ∀ s ∈ z.signers, s.dnskey.alg ∉ P.validate := by
+      intro s hs ha
+      exact hno ⟨s, hs, by simpa using ha⟩
+    obtain ⟨s, hs⟩ := List.exists_mem_of_ne_nil _ hne
+    have : Problem.unsupportedAlgorithm z.apex s.dnskey.alg ∈ check tr P t :=
+      mem_check.mpr (Or.inl ⟨z, hz, zoneProblems_iff.mpr (Or.inr (Or.inl ⟨s, hs, rfl, hall⟩))⟩)
+    rw [hc] at this; cases this
   · apply Classical.byContradiction
     intro hw
     have : Problem.windowClosed z.apex t ∈ check tr P t :=
@@ -354,15 +428,15 @@ theorem zone_signsWell {tr : Tree S} {P : AlgorithmPolicy} {t : Nat} (hc : check
     rw [hc] at this; cases this
 
 theorem sigsBy_verifies {sz : SignedZone S} {P : AlgorithmPolicy} {t : Nat} (hw : SignsWell sz P t)
-    (hne : sz.signers ≠ []) (lbl ttl : Nat) (d : Payload) (cover : Header → Option Payload)
+    (lbl ttl : Nat) (d : Payload) (cover : Header → Option Payload)
     (hcov : ∀ h : Header, h.labels = lbl → h.ttl = ttl → cover h = some d) :
     (sigsBy (dataSigners sz.signers) sz.apex sz.window lbl ttl d).any (verifies P t sz.apex sz.keys cover) =
       true := by
-  obtain ⟨s1, hs1⟩ := dataSigners_nonempty hne
+  obtain ⟨s1, hs1, ha1⟩ := hw.dataAlg
   have hs1' := mem_dataSigners hs1
   refine any_verifies_iff.mpr ⟨_, List.mem_map.mpr ⟨s1, hs1, rfl⟩, ?_, hw.windowOk _ _ _ _, d, hcov _ rfl rfl,
     s1.dnskey, List.mem_map.mpr ⟨s1, hs1', rfl⟩, rfl, honest_verifies (hw.honest s1 hs1') _ _⟩
-  simp only [usable, beq_self_eq_true, hw.alg s1 hs1', Bool.and_self, Bool.true_and, List.any_eq_true, beq_iff_eq]
+  simp only [usable, beq_self_eq_true, ha1, Bool.and_self, Bool.true_and, List.any_eq_true, beq_iff_eq]
   exact ⟨s1.dnskey, List.mem_map.mpr ⟨s1, hs1', rfl⟩, rfl⟩
 
 /-- The records made by the zone's data signers. -/
@@ -390,24 +464,24 @@ theorem noDsRecords_form (sz : SignedZone S) (m : Name) : ∀ d ∈ sz.noDsRecor
       · exact h3 _ d hd
       · exact h3 _ d hd
 
-theorem verified_noDs {sz : SignedZone S} {P : AlgorithmPolicy} {t : Nat} (hw : SignsWell sz P t)
-    (hne : sz.signers ≠ []) (m : Name) :
+theorem verified_noDs {sz : SignedZone S} {P : AlgorithmPolicy} {t : Nat} (hw : SignsWell sz P t) (m : Name) :
     verified P t sz.apex sz.keys (sz.noDsRecords m) = (sz.noDsRecords m).map (·.data) := by
   unfold verified
   rw [List.filter_eq_self.mpr]
   intro d hd
   obtain ⟨lbl, ttl, hs⟩ := noDsRecords_form sz m d hd
   rw [hs]
-  exact sigsBy_verifies hw hne lbl ttl d.data _ fun _ _ _ => rfl
+  exact sigsBy_verifies hw lbl ttl d.data _ fun _ _ _ => rfl
 
 /-- One step down a path: from the trusted zone `p`, the link to its child `c` is trusted with `c`'s keys or
 stops Insecure. -/
 theorem link_step {tr : Tree S} {P : AlgorithmPolicy} {t : Nat} (hc : check tr P t = []) (hwf : WellFormed tr)
+    (hdata : DataAlgorithms tr P)
     {owner : Name} {p c : SignedZone S} (hp : p ∈ tr) (hpne : p.signers ≠ []) (hcm : c ∈ tr)
     (hpar : parentOf tr c = some p) (hu : under owner c.apex = true) :
     (linkStep P t owner p.apex p.keys (linkBelow p c) = .ok c.keys ∧ c.signers ≠ []) ∨
       ∃ w, linkStep P t owner p.apex p.keys (linkBelow p c) = .error (.insecure w) := by
-  have hpw := zone_signsWell hc hwf hp hpne
+  have hpw := zone_signsWell hc hwf hdata hp hpne
   have hedge : edgeProblems P p c = [] := by
     cases h : edgeProblems P p c with
     | nil => rfl
@@ -442,7 +516,7 @@ theorem link_step {tr : Tree S} {P : AlgorithmPolicy} {t : Nat} (hc : check tr P
       | none =>
         simp only at hnd ⊢
         right
-        rw [verified_noDs hpw hpne]
+        rw [verified_noDs hpw]
         cases hproof : noDsProof (S := S) P c.apex ((p.noDsRecords c.apex).map (·.data)) with
         | none => rw [hproof] at hnd; cases hnd
         | some w => exact ⟨w, rfl⟩
@@ -450,7 +524,7 @@ theorem link_step {tr : Tree S} {P : AlgorithmPolicy} {t : Nat} (hc : check tr P
         simp only at hnm ⊢
         obtain ⟨hown, htype⟩ := hwf.dsSets p hp c.apex ns set g hn
         have hv : (p.signSet set).sigs.any (verifies P t p.apex p.keys (exactCover set)) = true := by
-          refine sigsBy_verifies hpw hpne _ _ _ _ fun h hl ht => ?_
+          refine sigsBy_verifies hpw _ _ _ _ fun h hl ht => ?_
           simp only [exactCover, hl, ↓reduceIte, ht]
         have hds : dsStep P t p.apex p.keys c.apex (p.signSet set) = .ok (dsOf set) := by
           unfold dsStep
@@ -469,12 +543,13 @@ theorem link_step {tr : Tree S} {P : AlgorithmPolicy} {t : Nat} (hc : check tr P
           obtain ⟨hkk, hsep, d, hd, hda, hdd⟩ := mem_anchored.mp hk
           obtain ⟨s', hs', rfl⟩ := List.mem_map.mp hkk
           have hcne : c.signers ≠ [] := List.ne_nil_of_mem hs'
-          have hcw := zone_signsWell hc hwf hcm hcne
+          have hcw := zone_signsWell hc hwf hdata hcm hcne
           obtain ⟨hdm, hdt⟩ := mem_supported.mp hd
           exact ⟨keyStep_ok.mpr (keySet_signed hcw hs' hsep hdm hdt hda hdd), hcne⟩
 
 /-- Down a whole path from a trusted zone: trusted at the last zone, or Insecure on the way. -/
 theorem path_walk {tr : Tree S} {P : AlgorithmPolicy} {t : Nat} (hc : check tr P t = []) (hwf : WellFormed tr)
+    (hdata : DataAlgorithms tr P)
     {owner : Name} {p : SignedZone S} {cs : List (SignedZone S)} {last : SignedZone S} (h : Descends tr p cs last)
     (hp : p ∈ tr) (hpne : p.signers ≠ []) (hu : under owner last.apex = true) :
     (descend P t owner p.apex p.keys (pairs p cs) = .trusted last.apex last.keys ∧ last.signers ≠ []) ∨
@@ -483,7 +558,7 @@ theorem path_walk {tr : Tree S} {P : AlgorithmPolicy} {t : Nat} (hc : check tr P
   | nil => exact Or.inl ⟨rfl, hpne⟩
   | @cons p c cs last hcm hpar hrest ih =>
     have huc : under owner c.apex = true := under_trans hu (descends_under hrest)
-    rcases link_step hc hwf hp hpne hcm hpar huc with ⟨hl, hcne⟩ | ⟨w, hl⟩
+    rcases link_step hc hwf hdata hp hpne hcm hpar huc with ⟨hl, hcne⟩ | ⟨w, hl⟩
     · rcases ih hcm hcne hu with ⟨hd, hlast⟩ | ⟨w, hd⟩
       · left; exact ⟨by simp only [pairs, descend, hl, linkBelow_apex, hd], hlast⟩
       · right; exact ⟨w, by simp only [pairs, descend, hl, linkBelow_apex, hd]⟩
@@ -492,32 +567,34 @@ theorem path_walk {tr : Tree S} {P : AlgorithmPolicy} {t : Nat} (hc : check tr P
 theorem anchor_owner (sz : SignedZone S) (dt : Nat) : (sz.anchor dt).owner = sz.apex := rfl
 
 /-- When the check reports nothing, every RRset a zone of the tree serves from its own nodes validates Secure
-or Insecure along the chain from the anchored zone `z0` down a path of the tree, under `z0`'s own anchor.
-It is never Bogus and never Indeterminate. -/
+or Insecure along the chain from the anchored zone `z0` down a path of the tree, under `z0`'s own anchor, whose
+SEP keys include one in an algorithm the policy validates. It is never Bogus and never Indeterminate. -/
 theorem check_sound {tr : Tree S} {P : AlgorithmPolicy} {t dt : Nat} (hc : check tr P t = []) (hwf : WellFormed tr)
-    (hdt : P.digests.contains dt = true) {z0 : SignedZone S} {rest : List (SignedZone S)} {zn : SignedZone S}
-    (h0 : z0 ∈ tr) (hsep : ∃ s ∈ z0.signers, s.dnskey.sep = true) (hpath : Descends tr z0 rest zn)
+    (hdata : DataAlgorithms tr P) (hdt : P.digests.contains dt = true) {z0 : SignedZone S}
+    {rest : List (SignedZone S)} {zn : SignedZone S} (h0 : z0 ∈ tr)
+    (hsep : ∃ s ∈ z0.signers, s.dnskey.sep = true ∧ P.validate.contains s.dnskey.alg = true)
+    (hpath : Descends tr z0 rest zn)
     (hzwf : zn.zone.WF) {s : RRset} {nd : Node} (ds : List (Signed S)) (hnode : zn.zone.node s.owner = some nd)
     (hcut : ∀ ns d g, nd ≠ .cut ns d g) (hheld : ∃ x ∈ nodeSets nd, x.rtype = s.rtype ∧ x.rdata = s.rdata)
     (hin : under s.owner zn.apex = true) :
     validateRrset (some [z0.anchor dt]) P t (chainOf z0 rest) s (zn.sigsFor s) ds = .secure ∨
       ∃ w, validateRrset (some [z0.anchor dt]) P t (chainOf z0 rest) s (zn.sigsFor s) ds = .insecure w := by
-  obtain ⟨s0, hs0, hsep0⟩ := hsep
+  obtain ⟨s0, hs0, hsep0, ha0⟩ := hsep
   have hne0 : z0.signers ≠ [] := List.ne_nil_of_mem hs0
-  have hw0 := zone_signsWell hc hwf h0 hne0
+  have hw0 := zone_signsWell hc hwf hdata h0 hne0
   have hin0 : under s.owner z0.apex = true := under_trans hin (descends_under hpath)
   have hwalk : walk [z0.anchor dt] P t s.owner (chainOf z0 rest) =
       descend P t s.owner z0.apex z0.keys (pairs z0 rest) := by
     unfold walk chainOf
     rw [anchorFor_zone z0 dt hin0]
     simp only [SignedZone.link, anchor_owner, ne_eq, not_true_eq_false, ↓reduceIte]
-    rw [keyStep_ok.mpr (anchor_keys hw0 hdt hs0 hsep0)]
-  rcases path_walk hc hwf hpath h0 hne0 hin with ⟨hd, hnen⟩ | ⟨w, hd⟩
+    rw [keyStep_ok.mpr (anchor_keys hw0 hdt hs0 hsep0 ha0)]
+  rcases path_walk hc hwf hdata hpath h0 hne0 hin with ⟨hd, hnen⟩ | ⟨w, hd⟩
   · left
     obtain ⟨x, hsig, hxo, hxt, hxd⟩ := sigsFor_own zn hzwf hnode hcut hheld
-    have hwn := zone_signsWell hc hwf (descends_last_mem hpath h0) hnen
+    have hwn := zone_signsWell hc hwf hdata (descends_last_mem hpath h0) hnen
     simp only [validateRrset, hwalk, hd, hsig]
-    exact rrsetResult_secure.mpr (signSet_final hwn hnen ds hxo hxt hxd)
+    exact rrsetResult_secure.mpr (signSet_final hwn ds hxo hxt hxd)
   · right
     exact ⟨w, by simp [validateRrset, hwalk, hd]⟩
 

@@ -828,22 +828,38 @@ def problemJson : Problem → String
   | .unsupportedAlgorithm a alg =>
     jobj [("kind", jstr "unsupported_algorithm"), ("apex", jstr (nameStr a)), ("algorithm", jnat alg)]
 
+/-- The keys of a zone in a chain: those of `rKeys`, and half the time a second set of the same shape in another
+algorithm, so the zone is signed with two and one validated algorithm is enough for a path (RFC 6840 §5.11).
+With the same shape, each algorithm signs the zone's data, as `DataAlgorithms` asks. -/
+def rChainKeys : G (List KeySpec) := do
+  let keys ← rKeys
+  if ← chance 2 then return keys
+  let first := (keys.head?.map (·.alg)).getD 13
+  let alg ← pick (#[13, 8, 15, 14, 5].filter (· != first))
+  return keys ++ keys.map fun k => { k with alg := alg }
+
 /-- A parent with a delegation to `sub` and the child zone: the parent's DS set at the cut names the child's
-KSK, names it with a wrong digest or an unsupported algorithm or digest type, or is absent. -/
+KSK, names it with a wrong digest or an unsupported algorithm or digest type, names it beside a record of an
+algorithm the policy does not validate, names every KSK of the child, or is absent. -/
 def chainCase : G String := do
   let apex : Name := [lb "example", lb "com"]
   let child : Name := lb "sub" :: apex
-  let parentKeys ← rKeys
-  let childKeys ← do if ← chance 4 then pure [] else rKeys
-  let choice ← rNat 5
+  let parentKeys ← rChainKeys
+  let childKeys ← do if ← chance 4 then pure [] else rChainKeys
+  let choice ← rNat 7
   let kskAlg := ((childKeys.find? (·.sep)).map (·.alg)).getD 13
   let kskKey : Key :=
     ((childKeys.find? (·.sep)).map fun k => (⟨Sch.pub k.id, k.alg, true⟩ : Key)).getD ⟨[0], 13, true⟩
+  let named (k : KeySpec) : Zone.RData := .ds 0 k.alg 2 (Sch.digest child ⟨Sch.pub k.id, k.alg, true⟩)
+  let ksks := childKeys.filter (·.sep)
   let ds : Option (Nat × List Zone.RData) := match choice with
     | 0 => none
     | 1 => some (86400, [.ds 0 kskAlg 2 (Sch.digest child kskKey)])
     | 2 => some (86400, [.ds 0 kskAlg 2 [1, 2, 3, 4]])
     | 3 => some (86400, [.ds 0 5 2 (Sch.digest child { kskKey with alg := 5 })])
+    | 4 => some (86400, [.ds 0 kskAlg 2 (Sch.digest child kskKey),
+        .ds 0 5 2 (Sch.digest child { kskKey with alg := 5 })])
+    | 5 => some (86400, if ksks.isEmpty then [.ds 0 kskAlg 2 (Sch.digest child kskKey)] else ksks.map named)
     | _ => some (86400, [.ds 0 kskAlg 3 (Sch.digest child kskKey)])
   let soa (a : Name) : Zone.RData := .soa (lb "ns1" :: a) (lb "hostmaster" :: a) 1 7200 3600 1209600 300
   let parentSpec : Spec := ⟨apex, 3600, soa apex, [⟨apex, 2, 3600, [.ns (lb "ns1" :: apex)]⟩,

@@ -687,6 +687,50 @@ fn the_mirror_places_a_relay_at_referral_glue_before_the_reply_leaves() {
     });
 }
 
+/// A zone transfer asked of a relayed name server goes to the real server,
+/// which gives or refuses the zone: the relay never refuses it on its own.
+#[test]
+fn a_relayed_name_server_passes_a_zone_transfer_to_the_real_server() {
+    world(Duration::from_secs(60), |fcx| async move {
+        let hierarchy = Hierarchy::new();
+        let at = location();
+        let (attacher, attachments) = fictionet::attachments();
+        let net = Net::new().ipv4_only();
+        let mirror = Mirror::new(hierarchy.clone(), net.handle(), &at);
+        net.hosts(internet::root_servers(|s| mirror.relay(s), &at))
+            .start(&fcx, attachments)?;
+        let m = machine(&fcx, attacher.attach("client")?, ME);
+        let a_root = ROOT_LETTERS[0].server.v4;
+        let ns = v4(45, 33, 5, 53);
+        ask(
+            &fcx,
+            &m,
+            a_root,
+            &query(1, "www.direct.", RecordType::A, false),
+        )
+        .await
+        .expect("a referral that places the relay");
+
+        let mut transfer = Message::query();
+        transfer.metadata.id = 2;
+        transfer.add_query(Query::query(
+            Name::from_ascii("direct.").unwrap(),
+            RecordType::AXFR,
+        ));
+        let replies = super::slices::tcp(
+            &fcx,
+            &m,
+            SocketAddr::new(ns, 53),
+            &[transfer.to_vec().unwrap()],
+        )
+        .await;
+        let reply = Message::from_vec(&replies[0]).unwrap();
+        assert_ne!(reply.metadata.response_code, ResponseCode::Refused);
+        assert_eq!(hierarchy.asked_for("direct.", RecordType::AXFR), vec![ns]);
+        Ok(())
+    });
+}
+
 /// A referral whose glue is the location's own egress places no relay
 /// there, so no question is ever sent from the host to its own public
 /// address.

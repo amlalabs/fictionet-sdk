@@ -50,7 +50,7 @@ use std::sync::Arc;
 use fictionet::Entropy;
 use fictionet::stdlib::protocols::dns::dnssec::{Ring, Validation, Verify};
 use fictionet::stdlib::protocols::dns::op::ResponseCode;
-use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, RecordType};
+use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, Name, RecordType};
 use fictionet::stdlib::protocols::dns::{Parsed, Request};
 use fictionet::time::Instant;
 
@@ -357,13 +357,13 @@ impl<V: Verify> Resolver<V> {
                 break;
             };
             let qtype = asker.request.question.query_type();
-            let depth = u8::try_from(asker.pieces.len()).unwrap_or(u8::MAX);
+            let aliases = u8::try_from(asker.pieces.len()).unwrap_or(u8::MAX);
             let looped = asker.pieces.iter().any(|piece| match &piece.outcome {
                 Outcome::Alias { cname, .. } => *cname.name() == name,
                 _ => false,
             });
             let key = Key::new(LowerName::new(&name), qtype, DNSClass::IN);
-            if looped || depth > self.config.work.depth {
+            if looped || aliases > self.config.work.depth {
                 // An alias chain that comes back to a name it passed, or
                 // runs past the work bound, fails (RFC 1034 §5.3.3).
                 self.push_piece(id, Outcome::Failure(FailureKind::WorkExceeded), false);
@@ -385,12 +385,14 @@ impl<V: Verify> Resolver<V> {
             let relay_cd = asker.request.cd
                 && self.config.anchors.is_none()
                 && !self.config.forward.is_empty();
+            // The aliases followed are counted above, apart from how
+            // deeply this name's own lookups nest.
             match self.depend(
                 resolution::Node::Asker(id),
                 key,
                 relay_cd,
                 TreeId::of(id),
-                depth,
+                0,
                 entropy,
             ) {
                 resolution::Dep::Ready(found) => self.push_found(id, *found),
@@ -438,7 +440,8 @@ impl<V: Verify> Resolver<V> {
     }
 
     /// Replaces a failed last piece with expired data for its question,
-    /// when the configuration serves stale data and the cache still holds
+    /// or the expired aliases at its name and the data they lead to, when
+    /// the configuration serves stale data and the cache still holds
     /// some (RFC 8767 §4). Stale data is served only as fresh data would
     /// be: data no check has validated never reaches a client that asked
     /// for validation.
@@ -470,21 +473,58 @@ impl<V: Verify> Resolver<V> {
             asker.request.question.query_type(),
             DNSClass::IN,
         );
-        let validate = asker.validate;
-        if let Some(found) = self.stale_found(&key)
-            && !unchecked(validate, &found)
+        if let Some(chain) = self.stale_chain(id, key)
+            && let Some(asker) = self.askers.get_mut(&id)
         {
-            let now = self.now;
-            if let Some(asker) = self.askers.get_mut(&id) {
-                asker.pieces.pop();
-                asker.pieces.push(Piece {
-                    checks: found.checks,
-                    outcome: found.outcome,
-                    cached: true,
-                    stale: true,
-                    at: now,
-                });
+            asker.pieces.pop();
+            asker.pieces.extend(chain);
+        }
+    }
+
+    /// Expired data for `key`, the next name client query `id` asks
+    /// about, as the pieces of its answer: the data, or the aliases at
+    /// `key`'s name and after it that lead to the data (RFC 8767 §4).
+    /// `None` when the chain does not reach data the cache still holds,
+    /// comes back to a name, runs past the work bound, or holds data no
+    /// check has validated for a client that asked for validation.
+    fn stale_chain(&self, id: AskerId, mut key: Key) -> Option<Vec<Piece>> {
+        let asker = self.askers.get(&id)?;
+        let mut seen: Vec<Name> = asker
+            .pieces
+            .iter()
+            .filter_map(|piece| match &piece.outcome {
+                Outcome::Alias { cname, .. } => Some(cname.name().to_lowercase()),
+                _ => None,
+            })
+            .collect();
+        let mut aliases = seen.len();
+        let mut chain = Vec::new();
+        loop {
+            let found = self
+                .stale_found(&key)
+                .filter(|found| !unchecked(asker.validate, found))?;
+            let target = match &found.outcome {
+                Outcome::Alias { target, cname, .. } => {
+                    seen.push(cname.name().to_lowercase());
+                    Some(target.clone())
+                }
+                _ => None,
+            };
+            chain.push(Piece {
+                checks: found.checks,
+                outcome: found.outcome,
+                cached: true,
+                stale: true,
+                at: self.now,
+            });
+            let Some(target) = target else {
+                return Some(chain);
+            };
+            aliases += 1;
+            if seen.contains(&target) || aliases > usize::from(self.config.work.depth) {
+                return None;
             }
+            key = Key::new(LowerName::new(&target), key.rtype, key.class);
         }
     }
 
@@ -496,7 +536,7 @@ impl<V: Verify> Resolver<V> {
         };
         let mut waiting = BTreeSet::new();
         if asker.validate && !asker.cache_only {
-            let needed: Vec<(usize, usize, Subject, Outcome, u8)> = asker
+            let needed: Vec<(usize, usize, Subject, Outcome)> = asker
                 .pieces
                 .iter()
                 .enumerate()
@@ -508,18 +548,19 @@ impl<V: Verify> Resolver<V> {
                         .enumerate()
                         .filter(|(_, (_, validation))| *validation == Validation::NotPerformed)
                         .map(move |(at, (subject, _))| {
-                            let depth = u8::try_from(index).unwrap_or(u8::MAX);
-                            (index, at, subject.clone(), piece.outcome.clone(), depth)
+                            (index, at, subject.clone(), piece.outcome.clone())
                         })
                 })
                 .collect();
-            for (index, at, subject, outcome, depth) in needed {
+            for (index, at, subject, outcome) in needed {
+                // Like a piece's lookup, its check's lookups nest from 0,
+                // whatever number of aliases led to it.
                 match self.check(
                     resolution::Node::Asker(id),
                     subject,
                     &outcome,
                     TreeId::of(id),
-                    depth,
+                    0,
                     entropy,
                 ) {
                     resolution::CheckStart::Done(validation) => {
@@ -678,27 +719,16 @@ impl<V: Verify> Resolver<V> {
                 continue;
             };
             asker.stale_tried = true;
-            let validate = asker.validate;
             let Some(key) = self.graph.lookup_key(lookup) else {
                 continue;
             };
-            let Some(found) = self
-                .stale_found(&key)
-                .filter(|found| !unchecked(validate, found))
-            else {
+            let Some(chain) = self.stale_chain(id, key) else {
                 continue;
             };
             self.graph.refresh(lookup, resolution::Node::Asker(id));
-            let now = self.now;
             if let Some(asker) = self.askers.get_mut(&id) {
                 asker.wait = AskerWait::Nothing;
-                asker.pieces.push(Piece {
-                    checks: found.checks,
-                    outcome: found.outcome,
-                    cached: true,
-                    stale: true,
-                    at: now,
-                });
+                asker.pieces.extend(chain);
             }
             self.validate_asker(id, entropy);
         }
@@ -748,7 +778,9 @@ impl<V: Verify> Resolver<V> {
                     resolution::Node::Lookup(id) => {
                         self.lookup_looked(id, lookup, &key, *found, bounded, entropy)
                     }
-                    resolution::Node::Check(id) => self.check_looked(id, lookup, *found, entropy),
+                    resolution::Node::Check(id) => {
+                        self.check_looked(id, lookup, *found, bounded, entropy)
+                    }
                     resolution::Node::Refresh => {}
                 },
                 resolution::Ready::Checked {

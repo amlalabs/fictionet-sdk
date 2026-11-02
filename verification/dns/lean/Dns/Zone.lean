@@ -342,6 +342,26 @@ zone holds or a DNAME substitution of at most 255 octets, so a chain ends by rep
 zone, or YXDOMAIN long before this many steps. -/
 def chainFuel : Nat := 256 ^ 256
 
+/-- `acc` followed by the RRsets of `an` with an owner and type `acc` does not hold yet. Two records with the same
+owner, class, type, and data are one (RFC 2181 §5), so an RRset a chain reaches twice, such as a DNAME it passes
+again, goes out once. -/
+def addNew (acc an : List RRset) : List RRset :=
+  acc ++ an.filter fun s => !acc.any fun x => x.owner == s.owner && x.rtype == s.rtype
+
+@[simp] theorem addNew_nil (an : List RRset) : addNew [] an = an := by
+  simp [addNew]
+
+theorem mem_addNew {acc an : List RRset} {s : RRset} (h : s ∈ addNew acc an) : s ∈ acc ∨ s ∈ an := by
+  unfold addNew at h
+  rcases List.mem_append.mp h with h | h
+  · exact Or.inl h
+  · exact Or.inr (List.mem_filter.mp h).1
+
+theorem addNew_ne_nil {acc an : List RRset} (h : an ≠ []) : addNew acc an ≠ [] := by
+  cases acc with
+  | nil => simpa using h
+  | cons x xs => simp [addNew]
+
 /-- Follows CNAMEs inside the zone, stopping at the first repeated name (RFC 1034 §4.3.2 step 3a). The RCODE is the
 last name's (RFC 6604 §2). -/
 def chase (look : Name → Fact Node) (apex : Name) (soa : RRset) (any : AnyResponse) (qtype : Nat) :
@@ -350,10 +370,10 @@ def chase (look : Name → Fact Node) (apex : Name) (soa : RRset) (any : AnyResp
   | f + 1, seen, acc, q =>
     match step look apex soa any q qtype with
     | .error e => .error e
-    | .ok (.done rc aa an au ad req) => .ok ⟨rc, aa || !acc.isEmpty, acc ++ an, au, ad, req⟩
+    | .ok (.done rc aa an au ad req) => .ok ⟨rc, aa || !acc.isEmpty, addNew acc an, au, ad, req⟩
     | .ok (.restart an t) =>
-      if t ∈ q :: seen ∨ ¬ under t apex = true then .ok ⟨.noerror, true, acc ++ an, [], [], 0⟩
-      else chase look apex soa any qtype f (q :: seen) (acc ++ an) t
+      if t ∈ q :: seen ∨ ¬ under t apex = true then .ok ⟨.noerror, true, addNew acc an, [], [], 0⟩
+      else chase look apex soa any qtype f (q :: seen) (addNew acc an) t
 
 /-- RFC 1034 §4.3.2 over any `look`. -/
 def answerWith (look : Name → Fact Node) (apex : Name) (soa : RRset) (any : AnyResponse) (req : Request) :
@@ -947,7 +967,7 @@ or a name outside the zone, or running out of steps. -/
 theorem chase_cases {look : Name → Fact Node} {apex : Name} {soa : RRset} {any : AnyResponse} {qtype : Nat} :
     ∀ f seen acc q r, chase look apex soa any qtype f seen acc q = .ok r →
       (∃ q' rc aa an au ad req acc', step look apex soa any q' qtype = .ok (.done rc aa an au ad req) ∧
-        r = ⟨rc, aa || !acc'.isEmpty, acc' ++ an, au, ad, req⟩) ∨
+        r = ⟨rc, aa || !acc'.isEmpty, addNew acc' an, au, ad, req⟩) ∨
       (r.rcode = .noerror ∧ r.aa = true ∧ r.authority = [] ∧ r.answer ≠ []) ∨
       (r.rcode = .servfail ∧ r.authority = []) := by
   intro f
@@ -964,7 +984,7 @@ theorem chase_cases {look : Name → Fact Node} {apex : Name} {soa : RRset} {any
     · rename_i an t hs
       have hne := step_restart_ne hs
       split at h
-      · cases h; exact Or.inr (Or.inl ⟨rfl, rfl, rfl, by simp [hne]⟩)
+      · cases h; exact Or.inr (Or.inl ⟨rfl, rfl, rfl, addNew_ne_nil hne⟩)
       · exact ih _ _ _ _ h
 
 /-- The answer when the question's first step finishes. -/
@@ -1245,8 +1265,11 @@ theorem negative_has_soa (z : Zone) (q : Request) (any : AnyResponse) {r : Respo
       · obtain ⟨h1, h2⟩ := step_done_soa hs
         rcases hneg with hn | ⟨hn, ha, hb⟩
         · rw [h1 hn]; simp
-        · simp only [List.append_eq_nil_iff] at ha
-          obtain ⟨rfl, rfl⟩ := ha
+        · simp only [addNew, List.append_eq_nil_iff] at ha
+          obtain ⟨rfl, ha⟩ := ha
+          simp only [List.any_nil, Bool.not_false] at ha
+          rw [List.filter_eq_self.mpr (fun _ _ => rfl)] at ha
+          subst ha
           simp only [List.isEmpty_nil, Bool.not_true, Bool.or_false] at hb
           rw [h2 hn rfl hb]; simp
       · obtain ⟨h1, _, _, h4⟩ := h'
@@ -1512,12 +1535,14 @@ theorem Zone.chase_owners (z : Zone) (hwf : z.WF) (any : AnyResponse) (qtype : N
       intro s hs'
       simp only [List.append_assoc, List.mem_append] at hs'
       rcases hs' with hs' | hs'
-      · exact hacc s hs'
-      · exact this s (by simpa [List.mem_append] using hs')
+      · rcases mem_addNew hs' with h' | h'
+        · exact hacc s h'
+        · exact this s (by simp only [List.append_assoc, List.mem_append]; exact Or.inl h')
+      · exact this s (by simp only [List.append_assoc, List.mem_append]; exact Or.inr hs')
     · rename_i an t hs
       have hown := z.step_owners hwf any q qtype hq _ hs
-      have hacc' : OwnersIn z.apex (acc ++ an) := by
-        intro s hs'; rcases List.mem_append.mp hs' with h' | h'
+      have hacc' : OwnersIn z.apex (addNew acc an) := by
+        intro s hs'; rcases mem_addNew hs' with h' | h'
         · exact hacc s h'
         · exact hown s h'
       split at h
@@ -1571,6 +1596,8 @@ inductive ZoneError where
   | dataBelowDname (owner : Name)
   /-- Only glue lies below a cut. -/
   | dataBelowCut (owner cut : Name)
+  /-- RFC 4035 §2.4: DS RRsets appear only at delegation points, which a spec holds apart from its RRsets. -/
+  | dsNotAtCut (owner : Name)
   /-- RFC 9471 §3.1. -/
   | missingInDomainGlue (child ns : Name)
   /-- RFC 2181 §10.3. -/
@@ -1616,10 +1643,11 @@ def Spec.R9 (sp : Spec) : Prop :=
   sp.soaTtl < maxTtl ∧ (∀ s ∈ sp.sets, s.ttl < maxTtl) ∧
     ∀ d ∈ sp.delegations, d.nsTtl < maxTtl ∧ (∀ g ∈ d.glue, g.ttl < maxTtl) ∧ ∀ x ∈ d.ds, x.1 < maxTtl
 def Spec.R10 (sp : Spec) : Prop := ∃ s ∈ sp.sets, s.owner = sp.apex ∧ s.rtype = 2
+def Spec.R11 (sp : Spec) : Prop := ∀ s ∈ sp.sets, s.rtype ≠ 43
 
 /-- Every rule of `ZoneError` holds. -/
 def Spec.Valid (sp : Spec) : Prop :=
-  sp.R1 ∧ sp.R2 ∧ sp.R3 ∧ sp.R4 ∧ sp.R5 ∧ sp.R6 ∧ sp.R7 ∧ sp.R8 ∧ sp.R9 ∧ sp.R10
+  sp.R1 ∧ sp.R2 ∧ sp.R3 ∧ sp.R4 ∧ sp.R5 ∧ sp.R6 ∧ sp.R7 ∧ sp.R8 ∧ sp.R9 ∧ sp.R10 ∧ sp.R11
 
 /-! ### The checks, as an implementation computes them -/
 
@@ -1649,6 +1677,7 @@ def Spec.ok9 (sp : Spec) : Bool :=
     sp.delegations.all fun d => decide (d.nsTtl < maxTtl) && d.glue.all (fun g => decide (g.ttl < maxTtl)) &&
       d.ds.all fun x => decide (x.1 < maxTtl)
 def Spec.ok10 (sp : Spec) : Bool := sp.sets.any fun s => s.owner == sp.apex && s.rtype == 2
+def Spec.ok11 (sp : Spec) : Bool := sp.sets.all fun s => s.rtype != 43
 
 theorem Spec.ok1_iff (sp : Spec) : sp.ok1 = true ↔ sp.R1 := by
   simp [Spec.ok1, Spec.R1, under_iff]
@@ -1761,6 +1790,9 @@ theorem Spec.ok9_iff (sp : Spec) : sp.ok9 = true ↔ sp.R9 := by
 theorem Spec.ok10_iff (sp : Spec) : sp.ok10 = true ↔ sp.R10 := by
   simp [Spec.ok10, Spec.R10]
 
+theorem Spec.ok11_iff (sp : Spec) : sp.ok11 = true ↔ sp.R11 := by
+  simp [Spec.ok11, Spec.R11]
+
 /-! ### Assembling the nodes -/
 
 def unionR (a b : List RData) : List RData := b.foldl (fun acc r => if acc.contains r then acc else acc ++ [r]) a
@@ -1818,6 +1850,7 @@ def Spec.firstError (sp : Spec) : ZoneError :=
       | some d => .dataBelowCut ((sp.delegations.find? fun d' => d' != d && under d'.child d.child).map (·.child)
           |>.getD []) d.child
       | none => .dataBelowCut [] []
+  else if !sp.ok11 then .dsNotAtCut ((sp.sets.find? (·.rtype == 43)).map (·.owner) |>.getD [])
   else if !sp.ok6 then
     let missing (d : Delegation) (t : Name) := under t d.child && !(d.glue.any fun g => g.owner == t && isAddr g)
     match sp.delegations.find? fun d => d.targets.any (missing d) with
@@ -1846,7 +1879,7 @@ def Spec.firstError (sp : Spec) : ZoneError :=
   else .missingApexNs
 
 def Spec.okAll (sp : Spec) : Bool :=
-  sp.ok1 && sp.ok2 && sp.ok3 && sp.ok4 && sp.ok5 && sp.ok6 && sp.ok7 && sp.ok8 && sp.ok9 && sp.ok10
+  sp.ok1 && sp.ok2 && sp.ok3 && sp.ok4 && sp.ok5 && sp.ok6 && sp.ok7 && sp.ok8 && sp.ok9 && sp.ok10 && sp.ok11
 
 def build (sp : Spec) : Except ZoneError Zone :=
   if sp.okAll then .ok sp.assemble else .error sp.firstError
@@ -1855,7 +1888,8 @@ def build (sp : Spec) : Except ZoneError Zone :=
 theorem builder_rejects_iff (sp : Spec) : (∃ e, build sp = .error e) ↔ ¬ sp.Valid := by
   have hv : sp.okAll = true ↔ sp.Valid := by
     simp only [Spec.okAll, Bool.and_eq_true, Spec.ok1_iff, Spec.ok2_iff, Spec.ok3_iff, Spec.ok4_iff,
-      Spec.ok5_iff, Spec.ok6_iff, Spec.ok7_iff, Spec.ok8_iff, Spec.ok9_iff, Spec.ok10_iff, Spec.Valid, and_assoc]
+      Spec.ok5_iff, Spec.ok6_iff, Spec.ok7_iff, Spec.ok8_iff, Spec.ok9_iff, Spec.ok10_iff, Spec.ok11_iff,
+      Spec.Valid, and_assoc]
   unfold build
   constructor
   · rintro ⟨e, he⟩ hval

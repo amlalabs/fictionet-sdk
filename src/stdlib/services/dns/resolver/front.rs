@@ -213,13 +213,18 @@ impl<V: Verify> Resolver<V> {
                 Outcome::Failure(_) => {}
             }
             if piece.stale {
-                edes.push(match piece.outcome {
+                let ede = match piece.outcome {
                     Outcome::Negative {
                         kind: Negative::NxDomain,
                         ..
                     } => EdeCode::STALE_NXDOMAIN_ANSWER,
                     _ => EdeCode::STALE_ANSWER,
-                });
+                };
+                // An alias and its target served stale are one stale
+                // answer.
+                if !edes.contains(&ede) {
+                    edes.push(ede);
+                }
             }
         }
         edes.extend(validation.ede());

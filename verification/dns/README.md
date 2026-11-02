@@ -62,7 +62,7 @@ not compare whole, with why.
 | Kind | Rust code | Compared |
 |---|---|---|
 | `names` | `LowerName`, `Name` | canonical order (RFC 4034 §6.1), equality ignoring case, folding, wire length |
-| `wire` | hickory's decoder and encoder | whether the message decodes; header, questions, and every record; the uncompressed encoding |
+| `wire` | `read_message`, the decoder the engines read replies with, and hickory's encoder | whether the message decodes; header, questions, and every record; the uncompressed encoding |
 | `restore` | `protocols::dns::restore` | the restored octets, or the error |
 | `respond` | `Request::parse` and the server front (`ServerConfig::front`) | silence, the rejection's RCODE, header bits, and OPT version, or the request's flags, question, and EDNS, and the header and OPT of an authoritative answer to it |
 | `fit` | `protocols::dns::fit` | the size, TC, and the RRsets kept in each section |
@@ -117,7 +117,7 @@ standards and Rust do, or where a standard lets both answers stand.
 
 | Kind | Difference | Why Rust is kept |
 |---|---|---|
-| `wire` | hickory refuses messages holding a record it cannot read by its type's rules (an SRV without a target) or a record with empty RDATA outside UPDATE (RFC 2136 §2.4); the Lean codec carries such RDATA as octets (RFC 3597) | hickory's reading of typed RDATA; empty RDATA of unknown types is legal (RFC 3597), which hickory does not take |
+| `wire` | `read_message` refuses messages holding a record hickory cannot read by its type's rules, such as an SRV without a target; the Lean codec carries such RDATA as octets (RFC 3597) | hickory's reading of typed RDATA |
 | `restore` | queries that do not parse as a request are not compared | `restore` takes the query as the relay parsed it |
 | `fit` | `Gen.lean` sometimes splits one RRset (same owner and type) into two in a section, and the Lean `fit` keeps the two apart | RFC 2181 §5 makes them one RRset, which `fit` writes together |
 | `zone`, `partial` | for QTYPE ANY answered with one RRset, Lean takes the first RRset in the zone's listed order and Rust the RRset of the lowest type; the test then checks that Rust answers Lean's RRset when asked for its type | RFC 8482 §4.1 lets a server pick any one RRset; a master file's order does not survive into a zone |
@@ -125,7 +125,6 @@ standards and Rust do, or where a standard lets both answers stand.
 | `signed` | Lean's answers to ANY with DO=1 leave out the NSEC, NSEC3PARAM, and DNSKEY RRsets at the name | they are RRsets of the name, and ANY asks for every RRset |
 | `signed` | for a negative answer whose SOA RRSIG fails, Rust reports the SOA's failure and Lean the denial's (both Bogus) | the SOA a negative answer carries is signed (RFC 4035 §3.1.1), and Rust checks it |
 | `signed` | for NODATA at a name that is itself a wildcard, Rust also sends the NSEC3 matching the wildcard's parent | the extra record proves nothing false; RFC 5155 §7.2.3 needs only the matching NSEC3 |
-| `chain` | Rust also reports a parent's DS records that name an algorithm the policy does not validate | such a DS leaves the child Insecure (RFC 9905 §2), which a world signing the child would want to know |
 | `chain` | in a tree with a corrupted key, Rust also reports the breaks the bad signatures make, `SignatureInvalid` among them | the Lean check reads no signature and assumes honest signers (`check_sound`) |
 
 Two differences the test found were faults in Rust and are fixed there:

@@ -271,7 +271,9 @@ impl<'v> Walk<'v> {
 
     /// Follows CNAMEs inside the zone, stopping at the first repeated
     /// name or at a target outside the zone (RFC 1034 §4.3.2 step 3a).
-    /// The RCODE is the last name's (RFC 6604 §2).
+    /// The RCODE is the last name's (RFC 6604 §2). An RRset the chain
+    /// reaches twice, such as a DNAME it passes again, goes out once
+    /// (RFC 2181 §5).
     fn chase(&self, mut name: LowerName) -> Result<Found, LowerName> {
         let mut seen = Vec::new();
         let mut answer = Vec::new();
@@ -281,7 +283,7 @@ impl<'v> Walk<'v> {
                 Out::Done(mut found) => {
                     found.aa |= !answer.is_empty();
                     answer.append(&mut found.answer);
-                    found.answer = answer;
+                    found.answer = unique(answer.into_iter());
                     found.authority = unique(found.authority.into_iter().chain(proofs));
                     return Ok(found);
                 }
@@ -295,7 +297,7 @@ impl<'v> Walk<'v> {
                     let looped = target == name || seen.contains(&target);
                     if looped || !self.view.apex().zone_of(&target) {
                         return Ok(Found {
-                            answer,
+                            answer: unique(answer.into_iter()),
                             authority: unique(proofs.into_iter()),
                             ..Found::new(ResponseCode::NoError, true)
                         });

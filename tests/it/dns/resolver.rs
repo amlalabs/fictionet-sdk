@@ -3318,3 +3318,367 @@ fn a_check_result_lands_only_on_the_rrset_it_checked() {
     let reply = answer(3);
     assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
 }
+
+/// A negative answer for a name server's own name is no data about how
+/// its parent reaches it: the glue the parent gave keeps finding the
+/// zone's servers (RFC 2181 §5.4.1), as in Unbound.
+#[test]
+fn a_negative_for_a_name_servers_name_keeps_its_glue() {
+    let root = delegation(
+        builder(".", "a.root-servers.net.").rrset(rrset(
+            "a.root-servers.net.",
+            3600,
+            vec![a(ROOT)],
+        )),
+        "com.",
+        "ns.nic.com.",
+        Some(COM),
+        None,
+    )
+    .build()
+    .unwrap();
+    let com = delegation(
+        builder("com.", "ns.nic.com.").rrset(rrset("ns.nic.com.", 3600, vec![a(COM)])),
+        "example.com.",
+        "ns1.example.com.",
+        Some(EXAMPLE),
+        None,
+    )
+    .build()
+    .unwrap();
+    // The child holds no address for its own name server, so only the
+    // parent's glue gives one: the name is absent (NXDOMAIN), or holds
+    // only a TXT record (NODATA for A).
+    for (rcode, own) in [
+        (ResponseCode::NXDomain, None),
+        (
+            ResponseCode::NoError,
+            Some(rrset(
+                "ns1.example.com.",
+                300,
+                vec![RData::TXT(TXT::new(vec!["x".to_string()]))],
+            )),
+        ),
+    ] {
+        let mut example = builder("example.com.", "ns1.example.com.")
+            .rrset(rrset("www.example.com.", 300, vec![a("192.0.2.80")]))
+            .rrset(rrset("mail.example.com.", 300, vec![a("192.0.2.81")]));
+        if let Some(own) = own {
+            example = example.rrset(own);
+        }
+        let mut net = MemoryNet::new();
+        serve_at(&mut net, ROOT, vec![root.clone()]);
+        serve_at(&mut net, COM, vec![com.clone()]);
+        serve_at(&mut net, EXAMPLE, vec![example.build().unwrap()]);
+        let mut resolver = resolver(config(None));
+        let reply = ask(
+            &mut resolver,
+            &mut net,
+            0,
+            query(client(1), "www.example.com.", RecordType::A, |_| {}),
+        );
+        assert_eq!(addresses(&reply), ["192.0.2.80"]);
+        let reply = ask(
+            &mut resolver,
+            &mut net,
+            1,
+            query(client(1), "ns1.example.com.", RecordType::A, |_| {}),
+        );
+        assert_eq!(reply.metadata.response_code, rcode);
+        assert!(reply.answers.is_empty(), "{rcode}");
+        let reply = ask(
+            &mut resolver,
+            &mut net,
+            2,
+            query(client(2), "mail.example.com.", RecordType::A, |_| {}),
+        );
+        assert_eq!(
+            addresses(&reply),
+            ["192.0.2.81"],
+            "{rcode}: {:?}",
+            edes(&reply)
+        );
+    }
+}
+
+/// A validation the work bound cut short says how far one question's
+/// budget went, so its result is not cached for other clients
+/// (RFC 9520 §3.2): another client with the same budget and a warm cache
+/// gets the Secure answer at once.
+#[test]
+fn a_validation_the_work_bound_cut_short_is_not_cached_for_other_clients() {
+    let (mut net, anchors) = internet(true);
+    let mut resolver = resolver(Config {
+        work: Work {
+            queries: 6,
+            depth: 11,
+        },
+        ..config(anchors)
+    });
+    let first = ask(
+        &mut resolver,
+        &mut net,
+        0,
+        query(client(1), "www.example.com.", RecordType::A, dnssec_ok),
+    );
+    assert_eq!(first.metadata.response_code, ResponseCode::ServFail);
+    let second = ask(
+        &mut resolver,
+        &mut net,
+        1,
+        query(client(2), "www.example.com.", RecordType::A, dnssec_ok),
+    );
+    assert_eq!(addresses(&second), ["192.0.2.80"], "{:?}", edes(&second));
+    assert!(second.metadata.authentic_data);
+}
+
+/// Stale data answers for an alias too: once the CNAME at the name has
+/// expired and its servers stop answering, the expired CNAME and its
+/// target are served (RFC 8767 §4).
+#[test]
+fn an_expired_alias_and_its_target_answer_when_resolution_fails() {
+    let (mut net, _) = internet(false);
+    let mut resolver = resolver(stale_config(Duration::from_millis(376)));
+    let fresh = ask(
+        &mut resolver,
+        &mut net,
+        0,
+        query(client(1), "alias.example.com.", RecordType::A, |_| {}),
+    );
+    assert_eq!(addresses(&fresh), ["192.0.2.80"]);
+    lose_example(&mut net);
+    let reply = ask(
+        &mut resolver,
+        &mut net,
+        700,
+        query(client(1), "alias.example.com.", RecordType::A, |_| {}),
+    );
+    assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(
+        rows(&reply.answers),
+        [
+            ("alias.example.com.".to_string(), RecordType::CNAME),
+            ("www.example.com.".to_string(), RecordType::A),
+        ]
+    );
+    assert!(reply.answers.iter().all(|record| record.ttl == 30));
+    assert_eq!(edes(&reply), [EdeCode::STALE_ANSWER]);
+}
+
+/// The aliases an answer follows and the lookups for a name server's
+/// address nest apart, as Unbound counts CNAME restarts apart from target
+/// fetches: after the 11 aliases the preset allows, a zone whose server
+/// came without glue still resolves.
+#[test]
+fn aliases_and_glueless_lookups_count_against_the_depth_apart() {
+    const ALPHA: &str = "192.0.2.101";
+    const BETA: &str = "192.0.2.102";
+    const GAMMA: &str = "192.0.2.103";
+    const DELTA: &str = "192.0.2.104";
+    let mut root = builder(".", "a.root-servers.net.").rrset(rrset(
+        "a.root-servers.net.",
+        3600,
+        vec![a(ROOT)],
+    ));
+    root = delegation(root, "alpha.", "ns.alpha.", Some(ALPHA), None);
+    root = delegation(root, "beta.", "host.ns.gamma.", None, None);
+    root = delegation(root, "gamma.", "ns.gamma.", Some(GAMMA), None);
+    root = delegation(root, "delta.", "ns.delta.", Some(DELTA), None);
+    let mut alpha = builder("alpha.", "ns.alpha.").rrset(rrset("ns.alpha.", 3600, vec![a(ALPHA)]));
+    for (prefix, end) in [("c", "www.beta."), ("d", "www.delta.")] {
+        for n in 0..11 {
+            let target = if n == 10 {
+                end.to_string()
+            } else {
+                format!("{prefix}{}.alpha.", n + 1)
+            };
+            alpha = alpha.rrset(rrset(
+                &format!("{prefix}{n}.alpha."),
+                300,
+                vec![RData::CNAME(CNAME(name(&target)))],
+            ));
+        }
+    }
+    let beta = builder("beta.", "host.ns.gamma.")
+        .rrset(rrset("www.beta.", 300, vec![a("192.0.2.200")]))
+        .build()
+        .unwrap();
+    let gamma = builder("gamma.", "ns.gamma.")
+        .rrset(rrset("ns.gamma.", 3600, vec![a(GAMMA)]))
+        .rrset(rrset("host.ns.gamma.", 3600, vec![a(BETA)]))
+        .build()
+        .unwrap();
+    let delta = builder("delta.", "ns.delta.")
+        .rrset(rrset("ns.delta.", 3600, vec![a(DELTA)]))
+        .rrset(rrset("www.delta.", 300, vec![a("192.0.2.201")]))
+        .build()
+        .unwrap();
+    let mut net = MemoryNet::new();
+    serve_at(&mut net, ROOT, vec![root.build().unwrap()]);
+    serve_at(&mut net, ALPHA, vec![alpha.build().unwrap()]);
+    serve_at(&mut net, BETA, vec![beta]);
+    serve_at(&mut net, GAMMA, vec![gamma]);
+    serve_at(&mut net, DELTA, vec![delta]);
+    for (qname, address) in [("d0.alpha.", "192.0.2.201"), ("c0.alpha.", "192.0.2.200")] {
+        let mut resolver = resolver(config(None));
+        let reply = ask(
+            &mut resolver,
+            &mut net,
+            0,
+            query(client(1), qname, RecordType::A, |_| {}),
+        );
+        assert_eq!(addresses(&reply), [address], "{qname}: {:?}", edes(&reply));
+    }
+}
+
+/// A Secure negative answer lasts no longer than the RRSIGs of its SOA
+/// and NSEC records, cached and as the source of synthesized answers
+/// (RFC 4035 §5.3.3, RFC 8198 §5.4): past them it is fetched and
+/// validated again, as a positive answer is.
+#[test]
+fn a_secure_negative_lives_no_longer_than_its_signatures() {
+    let (mut net, anchors) = internet(true);
+    // The signatures expire 60 seconds after the run starts.
+    let mut resolver = Resolver::new(
+        config(anchors),
+        Ring,
+        WallClock {
+            start: date(1_800_000_000 - 60),
+        },
+    );
+    let reply = ask(
+        &mut resolver,
+        &mut net,
+        0,
+        query(client(1), "nx.example.com.", RecordType::A, dnssec_ok),
+    );
+    assert_eq!(reply.metadata.response_code, ResponseCode::NXDomain);
+    assert!(reply.metadata.authentic_data);
+    for (seconds, qname) in [(120, "nx.example.com."), (121, "nz.example.com.")] {
+        let before = asked(&net).len();
+        let reply = ask(
+            &mut resolver,
+            &mut net,
+            seconds,
+            query(client(1), qname, RecordType::A, dnssec_ok),
+        );
+        assert!(asked(&net).len() > before, "{qname}: asked again");
+        assert!(!reply.metadata.authentic_data, "{qname}: {reply:?}");
+        assert_eq!(edes(&reply), [EdeCode::SIGNATURE_EXPIRED], "{qname}");
+    }
+}
+
+/// A signed root and `com`, `com` holding `*.wild.com` and
+/// `host.wild.com`, so `wild.com` is an empty non-terminal, and
+/// `d.com DNAME secure.com.`, where `secure.com` is a signed child.
+fn wild_tree(denial: Denial) -> (MemoryNet, Anchors) {
+    const SECURE: &str = "192.0.2.70";
+    let root_keys = keys(10);
+    let com_keys = keys(20);
+    let secure_keys = keys(40);
+    let root = delegation(
+        builder(".", "a.root-servers.net.").rrset(rrset(
+            "a.root-servers.net.",
+            3600,
+            vec![a(ROOT)],
+        )),
+        "com.",
+        "ns.nic.com.",
+        Some(COM),
+        Some(ds(&com_keys, "com.")),
+    )
+    .build()
+    .unwrap()
+    .signed(&root_keys, window(), Denial::Nsec)
+    .unwrap();
+    let com = delegation(
+        builder("com.", "ns.nic.com.")
+            .rrset(rrset("ns.nic.com.", 3600, vec![a(COM)]))
+            .rrset(rrset("*.wild.com.", 300, vec![a("192.0.2.7")]))
+            .rrset(rrset("host.wild.com.", 300, vec![a("192.0.2.8")]))
+            .rrset(rrset("d.com.", 300, vec![dname(&name("secure.com."))])),
+        "secure.com.",
+        "ns.secure.com.",
+        Some(SECURE),
+        Some(ds(&secure_keys, "secure.com.")),
+    )
+    .build()
+    .unwrap()
+    .signed(&com_keys, window(), denial)
+    .unwrap();
+    let secure = builder("secure.com.", "ns.secure.com.")
+        .rrset(rrset("ns.secure.com.", 3600, vec![a(SECURE)]))
+        .rrset(rrset("www.secure.com.", 300, vec![a("192.0.2.71")]))
+        .build()
+        .unwrap()
+        .signed(&secure_keys, window(), Denial::Nsec)
+        .unwrap();
+    let mut net = MemoryNet::new();
+    serve_at(&mut net, ROOT, vec![root]);
+    serve_at(&mut net, COM, vec![com]);
+    serve_at(&mut net, SECURE, vec![secure]);
+    (net, Anchors::of(vec![root_keys.anchor(&Name::root())]))
+}
+
+fn denials() -> [Denial; 2] {
+    [
+        Denial::Nsec,
+        Denial::Nsec3 {
+            opt_out: false,
+            salt: Vec::new(),
+        },
+    ]
+}
+
+/// NODATA at an empty non-terminal is proven by the NSEC whose next name
+/// lies below it, a wildcard child among them (RFC 4035 §5.4,
+/// RFC 4592 §2.2.2).
+#[test]
+fn nodata_at_an_empty_non_terminal_above_a_wildcard_validates() {
+    for denial in denials() {
+        let (mut net, anchors) = wild_tree(denial.clone());
+        let mut resolver = resolver(config(Some(anchors)));
+        let reply = ask(
+            &mut resolver,
+            &mut net,
+            0,
+            query(client(1), "wild.com.", RecordType::A, dnssec_ok),
+        );
+        assert_eq!(
+            reply.metadata.response_code,
+            ResponseCode::NoError,
+            "{denial:?}: {:?}",
+            edes(&reply)
+        );
+        assert!(reply.answers.is_empty(), "{denial:?}");
+        assert!(reply.metadata.authentic_data, "{denial:?}");
+    }
+}
+
+/// The DNAME's signature vouches for the CNAME synthesized from it,
+/// for a name below it that starts with a literal `*` label too
+/// (RFC 6672 §5.3.3).
+#[test]
+fn a_dname_vouches_for_a_name_that_starts_with_a_star() {
+    for (qname, rcode) in [
+        ("www.d.com.", ResponseCode::NoError),
+        ("*.d.com.", ResponseCode::NXDomain),
+        ("*.a.d.com.", ResponseCode::NXDomain),
+    ] {
+        let (mut net, anchors) = wild_tree(Denial::Nsec);
+        let mut resolver = resolver(config(Some(anchors)));
+        let reply = ask(
+            &mut resolver,
+            &mut net,
+            0,
+            query(client(1), qname, RecordType::A, dnssec_ok),
+        );
+        assert_eq!(
+            reply.metadata.response_code,
+            rcode,
+            "{qname}: {:?}",
+            edes(&reply)
+        );
+        assert!(reply.metadata.authentic_data, "{qname}");
+    }
+}

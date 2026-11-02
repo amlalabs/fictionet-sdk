@@ -317,6 +317,11 @@ struct Stored {
     /// zone's servers are, or expired data that may still be served
     /// stale.
     under: Option<Entry>,
+    /// The live glue a failure or a negative answer was laid over. A
+    /// negative answer for a name server's own name is no data about how
+    /// its parent reaches it, so the glue still finds the zone's servers
+    /// (RFC 2181 §5.4.1, RFC 1034 §5.3.3).
+    glue: Option<Entry>,
     /// When the entry was stored.
     at: Instant,
     generation: Generation,
@@ -340,8 +345,8 @@ struct Stored {
 /// - A failure lives [`Limits::failure_ttl`] (RFC 9520 §3.2), and so does
 ///   data that validated Bogus or Indeterminate.
 /// - An entry replaces a live entry for its key only at equal or higher
-///   [`Rank`] (RFC 2181 §5.4.1). A failure laid over glue keeps the glue
-///   beneath it, for finding servers. Data or NODATA at a name ends a
+///   [`Rank`] (RFC 2181 §5.4.1). A failure or a negative answer laid over
+///   glue keeps the glue beneath it, for finding servers. Data or NODATA at a name ends a
 ///   live NXDOMAIN at that name or above it at no higher rank, since the
 ///   name exists after all (RFC 8020 §2). An NXDOMAIN replaces the entry
 ///   of the type it answered.
@@ -411,6 +416,12 @@ impl Cache {
             Entry::Failure { .. } => self.stale(&key, now).cloned(),
             _ => None,
         };
+        // Neither is a failure or a negative answer data about how a
+        // zone's servers are reached, so live glue stays beside them.
+        let glue = |cache: &Cache, key: &Key| match &entry {
+            Entry::Positive { .. } => None,
+            Entry::Negative { .. } | Entry::Failure { .. } => cache.glue(key, now).cloned(),
+        };
         // Data at a name, or NODATA for it, shows that the name and every
         // name above it exist, so it ends an NXDOMAIN cached for any of
         // them at no higher rank, as newer data for a key replaces older.
@@ -428,16 +439,19 @@ impl Cache {
             let stored = Stored {
                 entry: entry.clone(),
                 under: None,
+                glue: glue(self, &asked),
                 at: now,
                 generation: self.generation,
             };
             self.entries.insert(asked, stored);
         }
+        let glue = glue(self, &key);
         self.entries.insert(
             key,
             Stored {
                 entry,
                 under,
+                glue,
                 at: now,
                 generation: self.generation,
             },
@@ -452,12 +466,45 @@ impl Cache {
         self.live(key, now)
     }
 
-    /// The live data for `key` at `now`, looking past a failure cached
-    /// over it. A failed lookup takes away nothing the cache knew, such as
-    /// the glue that says where a zone's servers are (RFC 9520 §3), so
-    /// this is what finding servers reads.
+    /// The live RRset for `key` at `now`, looking past a failure or a
+    /// negative answer cached over it. A failed lookup takes away nothing
+    /// the cache knew (RFC 9520 §3), and a negative answer for a name
+    /// server's name does not take away the glue that says where the
+    /// server is (RFC 2181 §5.4.1), so this is what finding servers reads.
     pub fn data(&self, key: &Key, now: Instant) -> Option<&Entry> {
-        self.stored_data(key).filter(|entry| now < entry.expires())
+        let live = |entry: &&Entry| now < entry.expires();
+        let stored = self.stored(key)?;
+        let data = match &stored.entry {
+            Entry::Failure { .. } => stored.under.as_ref(),
+            entry => Some(entry),
+        };
+        data.filter(|entry| matches!(entry, Entry::Positive { .. }))
+            .filter(live)
+            .or_else(|| stored.glue.as_ref().filter(live))
+    }
+
+    /// The live glue stored for `key` at `now`: an RRset below
+    /// [`Rank::NonAuthAnswer`], as the entry or beneath it.
+    fn glue(&self, key: &Key, now: Instant) -> Option<&Entry> {
+        let stored = self.stored(key)?;
+        [
+            Some(&stored.entry),
+            stored.under.as_ref(),
+            stored.glue.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|entry| {
+            matches!(entry, Entry::Positive { rank, .. } if *rank < Rank::NonAuthAnswer)
+                && now < entry.expires()
+        })
+    }
+
+    /// What is stored for `key` in this generation.
+    fn stored(&self, key: &Key) -> Option<&Stored> {
+        self.entries
+            .get(key)
+            .filter(|stored| stored.generation == self.generation)
     }
 
     /// An entry for `key` that expired at most [`Limits::stale`] before
@@ -471,10 +518,7 @@ impl Cache {
     /// The data stored for `key` in this generation, live or not: the
     /// entry, or what a failure was laid over.
     fn stored_data(&self, key: &Key) -> Option<&Entry> {
-        let stored = self.entries.get(key)?;
-        if stored.generation != self.generation {
-            return None;
-        }
+        let stored = self.stored(key)?;
         match &stored.entry {
             Entry::Failure { .. } => stored.under.as_ref(),
             entry => Some(entry),
@@ -621,11 +665,24 @@ impl Cache {
 
     /// Keeps `nsec`, NSEC RRsets that validated Secure with the zone's
     /// `soa`, until their TTL runs out, so that names they cover are denied
-    /// without asking (RFC 8198 §5.1).
-    pub fn add_secure_nsec(&mut self, soa: &RecordSet, nsec: &[RecordSet], now: Instant) {
+    /// without asking (RFC 8198 §5.1). Each, and the SOA, is kept no
+    /// longer than the time given with it, when its RRSIGs stop making it
+    /// Secure (RFC 4035 §5.3.3, RFC 8198 §5.4).
+    pub fn add_secure_nsec(
+        &mut self,
+        soa: &RecordSet,
+        soa_until: Option<Instant>,
+        nsec: &[(RecordSet, Option<Instant>)],
+        now: Instant,
+    ) {
         let zone = LowerName::new(soa.name());
         let soa = normalized(soa);
-        let soa_expires = now + seconds(soa.ttl()).min(self.limits.max_negative_ttl);
+        let capped =
+            |expires: Instant, until: Option<Instant>| until.map_or(expires, |u| expires.min(u));
+        let soa_expires = capped(
+            now + seconds(soa.ttl()).min(self.limits.max_negative_ttl),
+            soa_until,
+        );
         let entry = self.nsec.entry(zone).or_insert_with(|| SecureNsec {
             soa: soa.clone(),
             soa_expires,
@@ -633,9 +690,12 @@ impl Cache {
         });
         entry.soa = soa;
         entry.soa_expires = soa_expires;
-        for set in nsec {
+        for (set, until) in nsec {
             let set = normalized(set);
-            let expires = now + seconds(set.ttl()).min(self.limits.max_negative_ttl);
+            let expires = capped(
+                now + seconds(set.ttl()).min(self.limits.max_negative_ttl),
+                *until,
+            );
             entry
                 .sets
                 .insert(LowerName::new(set.name()), (set, expires));
@@ -736,12 +796,11 @@ impl Cache {
         let stale = self.limits.stale;
         let generation = self.generation;
         self.entries.retain(|_, stored| {
-            let last = stored
-                .under
-                .as_ref()
-                .map_or(stored.entry.expires(), |data| {
-                    data.expires().max(stored.entry.expires())
-                });
+            let last = [stored.under.as_ref(), stored.glue.as_ref()]
+                .into_iter()
+                .flatten()
+                .map(Entry::expires)
+                .fold(stored.entry.expires(), Instant::max);
             stored.generation == generation && now < last + stale
         });
         self.swept = self.entries.len();

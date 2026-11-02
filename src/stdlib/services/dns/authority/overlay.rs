@@ -26,6 +26,13 @@ use super::{Authority, Known, ServerConfig, Step, bare_reply};
 ///
 /// - At one of the invented zone's own name servers (an address its apex
 ///   NS targets have in its glue), the zone's authority answers.
+/// - At a server that does not serve the parent, the overlay answers as
+///   its base does, since only the parent's servers refer to a child
+///   (RFC 1034 §4.2.1). The base serves the parent where its reply to
+///   `<apex> DS` has AA set and carries the parent's SOA or the DS
+///   RRset. So an overlay may wrap every relay a mirror
+///   places, and the root still refers only to the parent. When the base
+///   stays silent for that question, so does the overlay.
 /// - Elsewhere the overlay answers as the parent: a referral composed from
 ///   the invented zone's apex NS RRset and glue, with AA clear. A DS
 ///   question at the apex goes to the base, since the parent's side
@@ -35,9 +42,9 @@ use super::{Authority, Known, ServerConfig, Step, bare_reply};
 ///   both refers to the zone and denies it.
 ///
 /// With DO, the referral needs the parent's word on the DS RRset
-/// (RFC 4035 §3.1.4). The overlay asks its base the question
-/// `<apex> DS` and puts the NSEC and NSEC3 records of that reply that
-/// speak to a delegation at the apex, with their RRSIGs, into the
+/// (RFC 4035 §3.1.4). The overlay puts the NSEC and NSEC3 records of the
+/// base's reply to `<apex> DS` that speak to a delegation at the apex,
+/// with their RRSIGs, into the
 /// referral's authority section, leaving out a record that shows only
 /// that no wildcard matched, which a parent never sends with a
 /// delegation (RFC 5155 §7.2.7). The records are
@@ -47,8 +54,7 @@ use super::{Authority, Known, ServerConfig, Step, bare_reply};
 /// are, they prove the delegation insecure (RFC 5155 §8.9), so the
 /// invented zone resolves as an unsigned zone. Under an NSEC parent, as
 /// the root is, no record proves it, and validators call the delegation
-/// bogus. The invented zone is never passed off as a signed one. When the
-/// base stays silent for the DS question, so does the overlay.
+/// bogus. The invented zone is never passed off as a signed one.
 pub struct Overlay<B: Authority> {
     base: B,
     /// The zone the base serves, whose children the overlay invents.
@@ -148,19 +154,24 @@ impl<B: Authority> Authority for Overlay<B> {
             let step = self.base.respond(req, local, server, client, known);
             return unsigned_delegation(req, &apex, &zone, step);
         }
+        // Only the parent's servers refer to a child (RFC 1034 §4.2.1).
+        // Anywhere else, such as at a root server or a server of another
+        // zone, the overlay answers as its base does.
+        let ds_question = question(req, &apex, RecordType::DS, true);
+        let parent = match decoded(
+            self.base
+                .respond(&ds_question, local, server, client, known),
+        ) {
+            Decoded::Message(reply) => reply,
+            Decoded::Step(step) => return step,
+        };
+        if !serves(&parent, &apex, &zone) {
+            return self.base.respond(req, local, server, client, known);
+        }
 
         let mut authority = ns;
         if req.edns.is_some_and(|edns| edns.dnssec_ok) {
-            let ds_question = question(req, &apex, RecordType::DS, true);
-            match decoded(
-                self.base
-                    .respond(&ds_question, local, server, client, known),
-            ) {
-                Decoded::Message(reply) => {
-                    authority.extend(denial(&apex, &zone, &reply.authorities));
-                }
-                Decoded::Step(step) => return step,
-            }
+            authority.extend(denial(&apex, &zone, &parent.authorities));
         }
         Step::Reply(referral(req, authority, glue))
     }
@@ -205,14 +216,15 @@ fn question(req: &Request, name: &Name, rtype: RecordType, dnssec_ok: bool) -> R
     }
 }
 
-/// The parent's answer to `<apex> DS`, `req`, given the base's `step`,
-/// where the base serves `zone`.
+/// The answer to `<apex> DS`, `req`, given the base's `step`, where the
+/// base may serve `zone`, the parent.
 ///
 /// The base knows nothing of the invented zone, so it may deny that the
 /// apex exists at all. A parent that delegates a name never says that:
 /// for an unsigned delegation it answers NODATA, with its SOA and the
 /// records that prove there is no DS (RFC 4035 §3.1.4.1, RFC 5155
-/// §7.2.4). An NXDOMAIN from the base therefore goes out as NOERROR with
+/// §7.2.4). An NXDOMAIN from a server of the parent, with AA and the
+/// parent's SOA, therefore goes out as NOERROR with
 /// its SOA and the part of its denial that such a proof needs: under an
 /// opt-out NSEC3 parent, the closest encloser's NSEC3 and the opt-out
 /// span over the apex, as real `com` sends for an unsigned delegation,
@@ -225,7 +237,10 @@ fn unsigned_delegation(req: &Request, apex: &Name, zone: &Name, step: Step) -> S
         Step::Need(_) | Step::Silent => None,
     };
     match reply {
-        Some(reply) if reply.metadata.response_code == ResponseCode::NXDomain => {
+        Some(reply)
+            if reply.metadata.response_code == ResponseCode::NXDomain
+                && serves(&reply, apex, zone) =>
+        {
             let mut response = bare_reply(req, ResponseCode::NoError, None);
             response.message.metadata.authoritative = reply.metadata.authoritative;
             let soa = reply
@@ -239,6 +254,21 @@ fn unsigned_delegation(req: &Request, apex: &Name, zone: &Name, step: Step) -> S
         }
         _ => step,
     }
+}
+
+/// Whether `reply`, the base's reply to `<apex> DS`, comes from a server
+/// of `zone`, the parent: it has AA set, and gives the DS RRset or the
+/// zone's SOA.
+fn serves(reply: &Message, apex: &Name, zone: &Name) -> bool {
+    let ds = reply
+        .answers
+        .iter()
+        .any(|record| record.name == *apex && record.record_type() == RecordType::DS);
+    let soa = reply
+        .authorities
+        .iter()
+        .any(|record| record.name == *zone && record.record_type() == RecordType::SOA);
+    reply.metadata.authoritative && (ds || soa)
 }
 
 /// The records of `authority`, the base's reply to `<apex> DS`, that a

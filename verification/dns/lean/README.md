@@ -187,7 +187,8 @@ extra iterations, in base32hex. RRSIG times are decimal. Validation results are 
   (RFC 8482 §4.2) takes the smallest TTL among the node's RRsets.
 - **DO=1 is outside the zone files.** RRSIGs and denial records belong to `Dns/Dnssec.lean`, which adds them to
   `Zone.answer`'s response (`SignedZone.answerDo`); the answers of `Zone.answer` are the DO=0 answers.
-- **The CNAME chase** stops at the first repeated name, at a name outside the zone, or at YXDOMAIN. The
+- **The CNAME chase** stops at the first repeated name, at a name outside the zone, or at YXDOMAIN, and an
+  RRset it reaches twice, such as a DNAME it passes again, goes out once (RFC 2181 §5). The
   definition carries fuel of 256^256 steps only to be total. Each step visits a new name, a CNAME target the
   zone holds or a DNAME substitution of at most 255 octets, so a chain ends another way long before that;
   this is an argument, not a theorem.
@@ -257,7 +258,9 @@ extra iterations, in base32hex. RRSIG times are decimal. Validation results are 
   implementations.
 - **The chain check** runs over a list of signed zones; a zone's parent is the zone whose apex is its deepest
   strict ancestor. A parent that does not delegate to a zone it is the parent of reports the missing no-DS
-  proof. `check_sound` assumes honest signers and DS sets owned by the child (`WellFormed`); the check itself
+  proof. `check_sound` assumes honest signers and DS sets owned by the child (`WellFormed`), that a zone with a
+  key in an algorithm the policy validates signs its data with one (`DataAlgorithms`, which Rust checks as
+  each RRset's signatures), and an anchor key in such an algorithm; the check itself
   does not look at signature bytes.
 - **The cache** keeps one entry per key (name and type; the class is IN) and one TTL per RRset, so the rule that
   mixed TTLs in one RRset read as the lowest is the builder's (RFC 2181 §5.2). Times are seconds on the run's
@@ -276,7 +279,7 @@ extra iterations, in base32hex. RRSIG times are decimal. Validation results are 
 | Lean | Rust |
 |---|---|
 | `Name.fold`, `Name.eqCI` | `LowerName` construction and comparison (hickory) |
-| `Name.canonLt`, `Name.canonCmp` | `Name::cmp_canonical` (RFC 4034 §6.1) |
+| `Name.canonLt`, `Name.canonCmp` | `impl Ord for Name` in hickory, the canonical order (RFC 4034 §6.1), with `Name::cmp_case` for the case-sensitive form |
 | `Name.below` | `Name::zone_of` |
 | `Name.wireLen`, `Name.ofLabels?` | `Name::len` and the label checks of hickory's name decoder |
 | `Wire.decode`, `Wire.encode` | hickory's `BinDecoder` and `BinEncoder` under `protocols::dns` |
