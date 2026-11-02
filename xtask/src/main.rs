@@ -1,6 +1,8 @@
-//! Host tooling for demo images and offline web captures.
+//! Host tooling for demo images and offline web captures, and the
+//! verification of Fictionet's DNS.
 
 mod capture;
+mod dns_verify;
 mod image;
 mod mptcp_verify;
 mod rawnic;
@@ -19,6 +21,9 @@ async fn main() -> Result {
         .ok_or("expected search-image or search-capture")?;
     if task == "mptcp-verify" {
         return mptcp_verify::run(&args.collect::<Vec<_>>());
+    }
+    if task == "dns-verify" {
+        return dns_verify::run(&args.collect::<Vec<_>>());
     }
     let downloads = PathBuf::from(args.next().ok_or("missing downloads directory")?);
     if task == "rawnic" {
