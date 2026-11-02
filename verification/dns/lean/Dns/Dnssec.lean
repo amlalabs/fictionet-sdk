@@ -1,5 +1,5 @@
 /-
-  DNSSEC as data plus a separate policy (§8 of the design): keys, DS records, RRSIGs, NSEC and NSEC3 records,
+  DNSSEC as data plus a separate policy: keys, DS records, RRSIGs, NSEC and NSEC3 records,
   the validator, offline zone signing, and the covering records an online signer makes.
 
   The validator is a function of records, trust anchors, an algorithm policy, a time, and a signature
@@ -116,7 +116,7 @@ def dsOf (s : RRset) : List Ds :=
     | .ds _ alg dt dig => some ⟨alg, dt, dig⟩
     | _ => none
 
-/-! ## The algorithm policy (§8.5)
+/-! ## The algorithm policy
 
 The policy is a value of its own, separate from what the scheme can verify. The numbers are registry
 values, not an enum, so a new registry entry needs no change here. `Dns/Policy.lean` gives the IANA
@@ -148,7 +148,7 @@ def AlgorithmPolicy.treat (P : AlgorithmPolicy) (alg dtype : Nat) : Treatment :=
   else if !P.digests.contains dtype then .unsupportedDigest
   else .supported
 
-/-! ## Results (§8.6) -/
+/-! ## Results -/
 
 /-- Extended DNS Error codes for DNSSEC (RFC 8914 §4). -/
 inductive Ede where
@@ -330,15 +330,20 @@ def nodata (rs : List Nsec) (q : Name) (qt : Nat) : Bool :=
     | some ce => rs.any fun r' => r'.owner == wild ce && !hasType r'.types qt && !hasType r'.types 5
     | none => false)
 
-/-- `q` has no RRset of type `qt`, by NSEC3: a matching NSEC3 lacking the type and CNAME (RFC 5155 §8.5), or a
-closest encloser proof and a wildcard NSEC3 lacking them (RFC 5155 §8.7). -/
-def nodata3 (rs : List Nsec3) (q : Name) (qt : Nat) : Bool :=
-  (rs.any fun r => r.hash == S.hash q && !hasType r.types qt && !hasType r.types 5) ||
-  match closest3 (S := S) rs q with
+/-- `q` has no RRset of type `qt`, by NSEC3. `some false`: a matching NSEC3 lacking the type and CNAME
+(RFC 5155 §8.5), or a closest encloser proof whose next closer name an ordinary NSEC3 covers, and a wildcard
+NSEC3 lacking them (RFC 5155 §8.7). `some true`: only an opt-out NSEC3 covers the next closer name, so an
+unsigned delegation may sit there (RFC 5155 §8.6 for DS, its erratum 3441 for other types). `none`: neither. -/
+def nodata3 (rs : List Nsec3) (q : Name) (qt : Nat) : Option Bool :=
+  if rs.any (fun r => r.hash == S.hash q && !hasType r.types qt && !hasType r.types 5) then some false
+  else match closest3 (S := S) rs q with
   | some ce =>
-    rs.any (fun r => covers3 r.hash r.next (S.hash (nextCloser q ce))) &&
-      rs.any fun r => r.hash == S.hash (wild ce) && !hasType r.types qt && !hasType r.types 5
-  | none => false
+    if covered3 (S := S) rs (nextCloser q ce) false then
+      if rs.any (fun r => r.hash == S.hash (wild ce) && !hasType r.types qt && !hasType r.types 5) then some false
+      else none
+    else if covered3 (S := S) rs (nextCloser q ce) true then some true
+    else none
+  | none => none
 
 /-- An opt-out NSEC3 covers the next closer name of a closest provable encloser of `c`: an unsigned delegation
 may exist there (RFC 5155 §8.6, §6). -/
@@ -373,18 +378,23 @@ def denialResult (P : AlgorithmPolicy) (q : Request) (rc : Rcode) (ps : List Pay
   else
     if nodata rs q.qname q.qtype then .secure
     else if rs3.any (fun r => P.maxIterations < r.iterations) then .insecure .nsec3Iterations
-    else if nodata3 (S := S) rs3 q.qname q.qtype then .secure
-    else if q.qtype = 43 && optOut3 (S := S) rs3 q.qname then .insecure .optOutCovered
-    else .bogus .nsecMissing
+    else match nodata3 (S := S) rs3 q.qname q.qtype with
+      | some false => .secure
+      | some true => .insecure .optOutCovered
+      | none => .bogus .nsecMissing
 
-/-- A wildcard expansion of `owner` from an RRSIG with `labels` labels is backed by a proof that no closer
-name exists: an NSEC covering `owner`, or an NSEC3 covering the next closer name (RFC 4035 §5.3.4,
-RFC 5155 §8.8). -/
-def wildcardProof (ps : List Payload) (owner : Name) (labels : Nat) : Bool :=
-  (nsecs ps).any (fun r => covers r.owner r.next owner) ||
-  (nsec3s ps).any fun r => covers3 r.hash r.next (S.hash (owner.drop (owner.length - labels - 1)))
+/-- What the denial records prove about a wildcard expansion of `owner` from an RRSIG with `labels` labels.
+`some false`: no closer name exists, by an NSEC covering `owner` or an ordinary NSEC3 covering the next closer
+name (RFC 4035 §5.3.4, RFC 5155 §8.8). `some true`: only an opt-out NSEC3 covers the next closer name, where an
+unsigned delegation may sit, so the answer is Insecure (RFC 5155 §6). `none`: neither. -/
+def wildcardProof (ps : List Payload) (owner : Name) (labels : Nat) : Option Bool :=
+  let nc := owner.drop (owner.length - labels - 1)
+  if (nsecs ps).any (fun r => covers r.owner r.next owner) then some false
+  else if (nsec3s ps).any (fun r => covers3 r.hash r.next (S.hash nc) && !r.optOut) then some false
+  else if (nsec3s ps).any (fun r => covers3 r.hash r.next (S.hash nc) && r.optOut) then some true
+  else none
 
-/-! ## The chain (§8.6) -/
+/-! ## The chain -/
 
 /-- What a parent says about a child's DS set: the signed DS RRset, or signed denial records. -/
 inductive Delegation (S : SigScheme) where
@@ -502,13 +512,17 @@ def walk (A : List Anchor) (P : AlgorithmPolicy) (t : Nat) (owner : Name) (C : C
 /-! ## Validation -/
 
 /-- An RRset at the zone with trusted keys: Secure when an RRSIG over it verifies, and, for a wildcard
-expansion, when the denial records prove no closer name exists. -/
+expansion, when the denial records prove no closer name exists; Insecure for a wildcard expansion that only an
+opt-out NSEC3 backs. -/
 def rrsetResult (P : AlgorithmPolicy) (t : Nat) (apex : Name) (keys : List Key) (set : RRset)
     (sigs : List (Rrsig S)) (ds : List (Signed S)) : Validation :=
   let ok := verifies P t apex keys (rrsetCover set)
   if sigs.any (fun r => ok r && !(r.hdr.labels < labelsOf set.owner)) then .secure
   else if sigs.any (fun r => ok r && r.hdr.labels < labelsOf set.owner &&
-      wildcardProof (S := S) (verified P t apex keys ds) set.owner r.hdr.labels) then .secure
+      wildcardProof (S := S) (verified P t apex keys ds) set.owner r.hdr.labels == some false) then .secure
+  else if sigs.any (fun r => ok r && r.hdr.labels < labelsOf set.owner &&
+      wildcardProof (S := S) (verified P t apex keys ds) set.owner r.hdr.labels == some true) then
+    .insecure .optOutCovered
   else if sigs.any ok then .bogus .nsecMissing
   else .bogus (failure t (sigs.filter (usable P apex keys)))
 
@@ -523,6 +537,11 @@ def validateRrset (A : Option (List Anchor)) (P : AlgorithmPolicy) (t : Nat) (C 
     | .stop v => v
     | .trusted apex keys => rrsetResult P t apex keys set sigs ds
 
+/-- The name whose chain proves an answer about `q`: the name itself, or for a DS question, whose answer the
+parent zone holds, the name above it (RFC 4035 §2.4). `none` for the root's DS, which no zone holds. -/
+def chainName (q : Request) : Option Name :=
+  if q.qtype = 43 then (if q.qname = [] then none else some (q.qname.drop 1)) else some q.qname
+
 /-- `validate_denial`: a negative answer to `q` with RCODE `rc` and the denial records of its authority
 section. -/
 def validateDenial (A : Option (List Anchor)) (P : AlgorithmPolicy) (t : Nat) (C : Chain S) (q : Request)
@@ -530,9 +549,12 @@ def validateDenial (A : Option (List Anchor)) (P : AlgorithmPolicy) (t : Nat) (C
   match A with
   | none => .notPerformed
   | some A =>
-    match walk A P t q.qname C with
-    | .stop v => v
-    | .trusted apex keys => denialResult (S := S) P q rc (verified P t apex keys ds)
+    match chainName q with
+    | none => .insecure .noAnchor
+    | some n =>
+      match walk A P t n C with
+      | .stop v => v
+      | .trusted apex keys => denialResult (S := S) P q rc (verified P t apex keys ds)
 
 /-! ## The canonical order -/
 
@@ -1155,7 +1177,7 @@ def FinalSigned (P : AlgorithmPolicy) (t : Nat) (apex : Name) (keys : List Key) 
     (sigs : List (Rrsig S)) (ds : List (Signed S)) : Prop :=
   (∃ r ∈ sigs, SigBy P t apex keys (rrsetCover set) r ∧ ¬ r.hdr.labels < labelsOf set.owner) ∨
     ∃ r ∈ sigs, SigBy P t apex keys (rrsetCover set) r ∧ r.hdr.labels < labelsOf set.owner ∧
-      wildcardProof (S := S) (verified P t apex keys ds) set.owner r.hdr.labels = true
+      wildcardProof (S := S) (verified P t apex keys ds) set.owner r.hdr.labels = some false
 
 theorem rrsetResult_secure {P : AlgorithmPolicy} {t : Nat} {apex : Name} {keys : List Key} {set : RRset}
     {sigs : List (Rrsig S)} {ds : List (Signed S)} :
@@ -1175,27 +1197,59 @@ theorem rrsetResult_secure {P : AlgorithmPolicy} {t : Nat} {apex : Name} {keys :
     simp only [n1, false_or]
     by_cases h2 : (sigs.any fun r => verifies P t apex keys (rrsetCover set) r &&
         decide (r.hdr.labels < labelsOf set.owner) &&
-        wildcardProof (S := S) (verified P t apex keys ds) set.owner r.hdr.labels) = true
+        (wildcardProof (S := S) (verified P t apex keys ds) set.owner r.hdr.labels == some false)) = true
     · simp only [h2, ↓reduceIte, true_iff]
       obtain ⟨r, hr, h⟩ := List.any_eq_true.mp h2
-      simp only [Bool.and_eq_true, decide_eq_true_eq] at h
+      simp only [Bool.and_eq_true, decide_eq_true_eq, beq_iff_eq] at h
       exact ⟨r, hr, verifies_iff.mp h.1.1, h.1.2, h.2⟩
     · simp only [h2, Bool.false_eq_true, ↓reduceIte]
       have n2 : ¬ ∃ r ∈ sigs, SigBy P t apex keys (rrsetCover set) r ∧ r.hdr.labels < labelsOf set.owner ∧
-          wildcardProof (S := S) (verified P t apex keys ds) set.owner r.hdr.labels = true := by
+          wildcardProof (S := S) (verified P t apex keys ds) set.owner r.hdr.labels = some false := by
         rintro ⟨r, hr, h, h', h''⟩
         exact h2 (List.any_eq_true.mpr ⟨r, hr, by simp [verifies_iff.mpr h, h', h'']⟩)
       simp only [n2, iff_false]
-      split <;> simp
+      repeat' split
+      all_goals simp
 
-theorem rrsetResult_ne_insecure {P : AlgorithmPolicy} {t : Nat} {apex : Name} {keys : List Key} {set : RRset}
+/-- The RRset's own check at the zone with trusted keys makes it Insecure: no RRSIG makes it Secure, and a
+verified RRSIG of a wildcard expansion has only an opt-out NSEC3 covering its next closer name, where an
+unsigned delegation may sit (RFC 5155 §6). -/
+def FinalOptOut (P : AlgorithmPolicy) (t : Nat) (apex : Name) (keys : List Key) (set : RRset)
+    (sigs : List (Rrsig S)) (ds : List (Signed S)) : Prop :=
+  ¬ FinalSigned P t apex keys set sigs ds ∧
+    ∃ r ∈ sigs, SigBy P t apex keys (rrsetCover set) r ∧ r.hdr.labels < labelsOf set.owner ∧
+      wildcardProof (S := S) (verified P t apex keys ds) set.owner r.hdr.labels = some true
+
+theorem rrsetResult_insecure {P : AlgorithmPolicy} {t : Nat} {apex : Name} {keys : List Key} {set : RRset}
     {sigs : List (Rrsig S)} {ds : List (Signed S)} {why : Insecure} :
-    rrsetResult P t apex keys set sigs ds ≠ .insecure why := by
-  unfold rrsetResult
-  simp only
-  split; · simp
-  split; · simp
-  split <;> simp
+    rrsetResult P t apex keys set sigs ds = .insecure why ↔
+      why = .optOutCovered ∧ FinalOptOut P t apex keys set sigs ds := by
+  constructor
+  · intro h
+    have hns : ¬ FinalSigned P t apex keys set sigs ds := fun hf => by
+      rw [rrsetResult_secure.mpr hf] at h; cases h
+    unfold rrsetResult at h
+    simp only at h
+    split at h; · cases h
+    split at h; · cases h
+    split at h
+    · rename_i h3; cases h
+      obtain ⟨r, hr, hr'⟩ := List.any_eq_true.mp h3
+      simp only [Bool.and_eq_true, decide_eq_true_eq, beq_iff_eq] at hr'
+      exact ⟨rfl, hns, r, hr, verifies_iff.mp hr'.1.1, hr'.1.2, hr'.2⟩
+    split at h <;> cases h
+  · rintro ⟨rfl, hns, r, hr, hsig, hlt, hp⟩
+    have hne : rrsetResult P t apex keys set sigs ds ≠ .secure := fun h => hns (rrsetResult_secure.mp h)
+    unfold rrsetResult at hne ⊢
+    simp only at hne ⊢
+    split
+    · rename_i h1; simp [h1] at hne
+    · split
+      · rename_i h2; simp [h2] at hne
+      · split
+        · rfl
+        · rename_i h3
+          exact absurd (List.any_eq_true.mpr ⟨r, hr, by simp [verifies_iff.mpr hsig, hlt, hp]⟩) h3
 
 /-- A properly signed chain for `set`: the anchored zone's DNSKEY set signed by a key the anchor names, each
 link below signed by the one above, and an RRSIG over `set` by the last zone's keys. -/
@@ -1226,17 +1280,28 @@ theorem secure_complete {A : List Anchor} {P : AlgorithmPolicy} {t : Nat} {C : C
     validateRrset (some A) P t C set sigs ds = .secure :=
   secure_iff.mpr h
 
+/-- A chain trusted down to the zone of `set`, where a wildcard expansion that only an opt-out NSEC3 backs
+signs it. -/
+def OptOutChain (A : List Anchor) (P : AlgorithmPolicy) (t : Nat) (C : Chain S) (set : RRset)
+    (sigs : List (Rrsig S)) (ds : List (Signed S)) : Prop :=
+  ∃ l0 ls0 ks0 apex keys, Anchored A P t set.owner C l0 ls0 ks0 ∧ Reaches P t set.owner l0.apex ks0 ls0 apex keys ∧
+    FinalOptOut P t apex keys set sigs ds
+
 /-- Insecure needs a proof: no anchor at or above the name, or a link reached through a secure chain whose
-parent proved it has no DS, or whose DS set the policy does not support. A missing record never makes an
-answer Insecure. -/
+parent proved it has no DS, or whose DS set the policy does not support; or a trusted chain to a wildcard
+expansion that only an opt-out NSEC3 backs. A missing record never makes an answer Insecure. -/
 theorem insecure_needs_proof {A : List Anchor} {P : AlgorithmPolicy} {t : Nat} {C : Chain S} {set : RRset}
     {sigs : List (Rrsig S)} {ds : List (Signed S)} {why : Insecure}
-    (h : validateRrset (some A) P t C set sigs ds = .insecure why) : InsecureCase A P t set.owner C why := by
+    (h : validateRrset (some A) P t C set sigs ds = .insecure why) :
+    InsecureCase A P t set.owner C why ∨ (why = .optOutCovered ∧ OptOutChain A P t C set sigs ds) := by
   unfold validateRrset at h
   simp only at h
   split at h
-  · rename_i v hw; subst h; exact walk_insecure hw
-  · exact absurd h rrsetResult_ne_insecure
+  · rename_i v hw; subst h; exact Or.inl (walk_insecure hw)
+  · rename_i apex keys hw
+    obtain ⟨hwhy, hfo⟩ := rrsetResult_insecure.mp h
+    obtain ⟨l0, ls0, ks0, ha, hr⟩ := walk_trusted.mp hw
+    exact Or.inr ⟨hwhy, l0, ls0, ks0, apex, keys, ha, hr, hfo⟩
 
 /-- And every such proof makes the answer Insecure. -/
 theorem insecure_complete {A : List Anchor} {P : AlgorithmPolicy} {t : Nat} {C : Chain S} {set : RRset}
@@ -1244,6 +1309,16 @@ theorem insecure_complete {A : List Anchor} {P : AlgorithmPolicy} {t : Nat} {C :
     ∃ w, validateRrset (some A) P t C set sigs ds = .insecure w := by
   obtain ⟨w, hw⟩ := walk_of_insecure h
   exact ⟨w, by simp [validateRrset, hw]⟩
+
+/-- A trusted chain to a wildcard expansion that only an opt-out NSEC3 backs makes the answer Insecure,
+never Secure. -/
+theorem optout_wildcard_insecure {A : List Anchor} {P : AlgorithmPolicy} {t : Nat} {C : Chain S} {set : RRset}
+    {sigs : List (Rrsig S)} {ds : List (Signed S)} (h : OptOutChain A P t C set sigs ds) :
+    validateRrset (some A) P t C set sigs ds = .insecure .optOutCovered := by
+  obtain ⟨l0, ls0, ks0, apex, keys, ha, hr, hfo⟩ := h
+  simp only [validateRrset]
+  rw [walk_trusted.mpr ⟨l0, ls0, ks0, ha, hr⟩]
+  exact rrsetResult_insecure.mpr ⟨rfl, hfo⟩
 
 /-! ## Authenticity -/
 
@@ -1334,7 +1409,7 @@ theorem secure_sound {A : List Anchor} {P : AlgorithmPolicy} {t : Nat} {C : Chai
         · cases hx
     exact ⟨apex, k, p, r, x, hv k hk, hp, hr', husable.1.1, hu (by rw [hl0]; exact hau), hx, hxs.1, hxs.2, hsig⟩
 
-/-! ## Signing (§8.2, §8.3) -/
+/-! ## Signing -/
 
 /-- What a signer offers: its DNSKEY and a deterministic signing function. Rust's `Sign` trait. -/
 structure Signer (S : SigScheme) where
@@ -1612,7 +1687,7 @@ def validateAnswer (A : Option (List Anchor)) (P : AlgorithmPolicy) (t : Nat) (C
     if negativeAnswer r then some (validateDenial A P t C ⟨finalName q r, q.qtype⟩ sa.rcode sa.denial)
     else none)
 
-/-! ## Covering records for zones that grow (§8.3)
+/-! ## Covering records for zones that grow
 
 An online signer cannot keep a complete chain over a zone that grows: an aggressive-NSEC client (RFC 8198)
 would deny names added later. It makes covering records for one question at a time, and only from what the
@@ -1992,7 +2067,7 @@ theorem cover_knows {look : Name → Fact Node} {apex : Name} {denial : Denial} 
 
 theorem denial_secure_nx {A : List Anchor} {P : AlgorithmPolicy} {t : Nat} {C : Chain S} {q : Request}
     {ds : List (Signed S)} (h : validateDenial (some A) P t C q .nxdomain ds = .secure) :
-    ∃ apex keys, walk A P t q.qname C = .trusted apex keys ∧
+    ∃ n apex keys, chainName q = some n ∧ walk A P t n C = .trusted apex keys ∧
       (nx (nsecs (verified P t apex keys ds)) q.qname = true ∨
         ∃ ce, closest3 (S := S) (nsec3s (verified P t apex keys ds)) q.qname = some ce ∧
           ∃ r ∈ nsec3s (verified P t apex keys ds),
@@ -2000,9 +2075,12 @@ theorem denial_secure_nx {A : List Anchor} {P : AlgorithmPolicy} {t : Nat} {C : 
   unfold validateDenial at h
   simp only at h
   split at h
+  · cases h
+  rename_i n hn
+  split at h
   · rename_i v hw; subst h; exact absurd rfl (walk_stop_ne_secure hw)
   · rename_i apex keys hw
-    refine ⟨apex, keys, hw, ?_⟩
+    refine ⟨n, apex, keys, hn, hw, ?_⟩
     unfold denialResult at h
     simp only [↓reduceIte] at h
     split at h
@@ -2033,14 +2111,16 @@ theorem denial_secure_nx {A : List Anchor} {P : AlgorithmPolicy} {t : Nat} {C : 
 /-- A denial whose only cover for the next closer name is an opt-out NSEC3 is never Secure: opt-out says an
 unsigned delegation may exist there (RFC 5155 §6, §9.2). -/
 theorem optout_never_secure_denial {A : List Anchor} {P : AlgorithmPolicy} {t : Nat} {C : Chain S} {q : Request}
-    {ds : List (Signed S)} {apex : Name} {keys : List Key} (hw : walk A P t q.qname C = .trusted apex keys)
+    {ds : List (Signed S)} {n apex : Name} {keys : List Key} (hc : chainName q = some n)
+    (hw : walk A P t n C = .trusted apex keys)
     (hn : nx (nsecs (verified P t apex keys ds)) q.qname = false)
     (ho : ∀ ce, closest3 (S := S) (nsec3s (verified P t apex keys ds)) q.qname = some ce →
       ∀ r ∈ nsec3s (verified P t apex keys ds), covers3 r.hash r.next (S.hash (nextCloser q.qname ce)) = true →
         r.optOut = true) :
     validateDenial (some A) P t C q .nxdomain ds ≠ .secure := by
   intro h
-  obtain ⟨apex', keys', hw', hp⟩ := denial_secure_nx h
+  obtain ⟨n', apex', keys', hc', hw', hp⟩ := denial_secure_nx h
+  rw [hc] at hc'; cases hc'
   rw [hw] at hw'; cases hw'
   rcases hp with hp | ⟨ce, hce, r, hr, hcov, hopt⟩
   · rw [hn] at hp; cases hp
@@ -2210,7 +2290,7 @@ theorem signed_answers_validate (sz : SignedZone S) (P : AlgorithmPolicy) (t dt 
 Private keys are numbers and the public key of `p` is the one octet string `[p]`. A signature is the pair
 of the private key and the message, so it verifies exactly when its key is the verifying key's and its
 message is the one asked about. A DS digest is the identity on an encoding of the owner and the key. These
-are symbolic, as in the vectors (§18.3): the differential test checks them with an oracle `Verify` and then
+are symbolic, as in the vectors: the differential test checks them with an oracle `Verify` and then
 ties them to real signatures. The NSEC3 hash is the real one, SHA-1 over the owner's canonical wire form with
 an empty salt and no extra iterations (RFC 5155 §5), so NSEC3 vectors agree with real proof code. -/
 

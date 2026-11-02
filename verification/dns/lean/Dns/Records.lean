@@ -1,5 +1,5 @@
 /-
-  Providers and signers as functions to published records (§18.2, §18.5).
+  Providers and signers as functions to published records.
 
   The validator reads published records only. Two things make records: the data (a complete zone, or a lazy
   zone that asks a provider) and the signers. `lazy_agrees_complete` says a lazy zone over a provider that
@@ -11,7 +11,7 @@
   two theorems it is built from.
 
   Rust: `services::dns::zone::{Lazy, Provider, Signed}`, `protocols::dns::dnssec::Sign`, and the acceptance
-  test's provider and signer combinations (§18.5).
+  test's provider and signer combinations.
 -/
 import Dns.Partial
 import Dns.Dnssec

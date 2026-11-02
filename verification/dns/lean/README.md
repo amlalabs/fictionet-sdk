@@ -3,8 +3,8 @@
 This directory holds machine-checked proofs about the pure parts of Fictionet's DNS: names, the wire format,
 truncation, zones and the answer algorithm, partial views, authorities, exchange matching, DNSSEC validation
 and signing, the algorithm policy, providers and signers, the chain check, the resolver's cache, and the
-resolver. It also holds an executable Lean reference that writes test vectors for the differential test
-(§18.3 and §18.4 of the design). It uses Lean core only, with no Mathlib. The toolchain is
+resolver. It also holds an executable Lean reference that writes test vectors for the differential test,
+`tests/dns_vectors.rs`. It uses Lean core only, with no Mathlib. The toolchain is
 `leanprover/lean4:v4.35.0` (see `lean-toolchain`). A clean build takes about ten seconds.
 
 ## Build and check
@@ -17,7 +17,7 @@ lake exe gen <dir> <seed>        # writes <dir>/{names,wire,restore,fit,respond,
 
 `lake build` prints the axioms of every headline theorem from `Dns/Axioms.lean`. Each line must list only
 `propext`, `Quot.sound`, and `Classical.choice`, or a subset of them. A `sorryAx` would mean an unfinished
-proof; there is none. The design's `cargo xtask dns-verify` (§18.4) runs this check and writes the vectors
+proof; there is none. `cargo xtask dns-verify` runs this check and writes the vectors
 into `target/dns-verify/vectors/`. Vectors are regenerated, not committed. The same seed always
 gives the same files.
 
@@ -31,8 +31,8 @@ gives the same files.
 | `Dns/Zone.lean` | nodes, cuts, glue, empty non-terminals, wildcards, CNAME, DNAME; `answer`; the builder | `nxdomain_iff`, `ent_is_nodata`, `referral_iff_below_cut`, `referral_aa_false`, `negative_has_soa`, `neg_ttl_min`, `answer_in_zone`, `wildcard_blocked_by_node`, `dname_yx_iff_long`, `builder_rejects_iff` |
 | `Dns/Partial.lean` | views with present, absent, and unknown facts; `answerPartial`; `Lazy` zones | `answer_partial_sound`, `agreeing_zone_exists`, `unknown_never_negative`, `lazy_view_one_revision` |
 | `Dns/Authority.lean` | `respond : Req → Known → Step`, the engine's ask loop, `Relay`, `Overlay` | `respond_monotone`, `loop_terminates`, `relay_never_guesses` |
-| `Dns/Exchange.lean` | tokens, generations, the matching rule of §6.2 | `obsolete_ignored`, `match_requires_tuple`, `advance_clears` |
-| `Dns/Dnssec.lean` | keys, DS, RRSIGs, NSEC and NSEC3 as records; `class SigScheme` and a concrete symbolic instance; the validator; offline signing with complete chains; online covering records | `secure_sound`, `secure_complete`, `insecure_needs_proof`, `insecure_complete`, `optout_never_secure_denial`, `nsec_cover_sound`, `white_lie_covers_only_qname`, `cover_unknown_is_unknown`, `signed_answers_validate` |
+| `Dns/Exchange.lean` | tokens, generations, the matching rule of the step contract | `obsolete_ignored`, `match_requires_tuple`, `advance_clears` |
+| `Dns/Dnssec.lean` | keys, DS, RRSIGs, NSEC and NSEC3 as records; `class SigScheme` and a concrete symbolic instance; the validator; offline signing with complete chains; online covering records | `secure_sound`, `secure_complete`, `insecure_needs_proof`, `insecure_complete`, `optout_wildcard_insecure`, `optout_never_secure_denial`, `nsec_cover_sound`, `white_lie_covers_only_qname`, `cover_unknown_is_unknown`, `signed_answers_validate` |
 | `Dns/Policy.lean` | the IANA registry rows RFC 9904 and RFC 9905 set; `iana` derived from them | `sha1_never_secure`, `unsupported_is_insecure_not_bogus`, `not_performed_never_ad`, `iana_matches_registry` |
 | `Dns/Records.lean` | providers and signers as functions to published records; `Signed<D>` over any facts | `lazy_agrees_complete`, `signer_agnostic`, `validate_records_only` |
 | `Dns/Chain.lean` | `check_chain` over a tree of signed zones; the problems as propositions | `check_sound`, `check_complete`, `check_reports_real` |
@@ -84,8 +84,9 @@ What each theorem says:
 | `advance_clears` | after a session change nothing is outstanding, the cache is empty, every old token is abandoned, and every old reply is ignored |
 | `secure_sound` | Secure means authentic: the RRset's type and records (with its original TTL, or as the wildcard it was expanded from) were signed with the private key of a key vouched for from an anchor, by the zone the RRset is in. `Vouched` walks the anchor's DS, the DNSKEY sets their keys signed, and the DS sets the parents signed, each signature in the chain made by a vouched key's holder |
 | `secure_complete` | every properly signed chain (`SecureChain`: the anchored DNSKEY set signed by a key the anchor names, each link's DS set signed by the zone above and naming a SEP key that signed the link's DNSKEY set, and an RRSIG over the RRset by the last zone) validates Secure; `secure_iff` is both directions |
-| `insecure_needs_proof` | Insecure only with a proof (`InsecureCase`): no anchor at or above the name; the anchor's DS set wholly unsupported; or, below a secure prefix, a link whose parent proved there is no DS (an NSEC or NSEC3 at the cut with NS and without DS and SOA, an opt-out cover of the next closer name of the closest provable encloser, or NSEC3 iterations above the limit) or signed a DS set the policy wholly does not support. A failed fetch never makes an answer Insecure |
+| `insecure_needs_proof` | Insecure only with a proof (`InsecureCase`): no anchor at or above the name; the anchor's DS set wholly unsupported; or, below a secure prefix, a link whose parent proved there is no DS (an NSEC or NSEC3 at the cut with NS and without DS and SOA, an opt-out cover of the next closer name of the closest provable encloser, or NSEC3 iterations above the limit) or signed a DS set the policy wholly does not support; or a trusted chain to the RRset's zone and a wildcard expansion that only an opt-out NSEC3 backs (`OptOutChain`). A failed fetch never makes an answer Insecure |
 | `insecure_complete` | every such proof makes the answer Insecure (for some reason: the priority among reasons is the validator's) |
+| `optout_wildcard_insecure` | a trusted chain to a wildcard expansion that only an opt-out NSEC3 backs (`OptOutChain`) validates Insecure, never Secure |
 | `optout_never_secure_denial` | when no NSEC proves a name away and every NSEC3 covering its next closer name has opt-out, NXDOMAIN is never Secure |
 | `nsec_cover_sound` | an NSEC of a complete chain that covers a name, with its next name not below it, is right: the zone holds no node at or below that name |
 | `white_lie_covers_only_qname` | an NSEC3 white lie covers only the hash of the name it was made for |
@@ -144,7 +145,7 @@ form `\# <length> <hex>`. Octets are lowercase hex.
 | `respond.json` | `bytes`, `transport` (`udp` or `tcp`) | `parsed`: `silent`; `reject` with `rcode` (extended), `flags`, and `opt` (its version, or null); or `request` with `rd`, `cd`, `ad`, `question`, and `edns` |
 | `zone.json` | `zone` (`apex`, `records`), `any` (`hinfo`, `one_rrset`, `all`), `request` (`qname`, `qtype`) | `rcode`, `aa`, `answer`, `authority`, `additional`, `required_additional` |
 | `partial.json` | as `zone.json`, plus `unknown`: names whose facts are unknown | `unknown` (a name), or `response` |
-| `signed.json` | `zone` (no DNAME), `keys` (`id`, `alg`, `sep`, `corrupt`), `window`, `denial` (`nsec`, or `nsec3` with `opt_out`), `request`, `time`, `policy`, `anchor_digest_type` | `rcode`, `aa`, and with DO=1 the `answer` and `authority` lines each followed by its RRSIG lines, `additional`, `denial` (NSEC or NSEC3 lines with RRSIGs), `dnskey` (the DNSKEY set and its RRSIGs), and `validation`: one result per answer RRset and one for the denial of a negative answer, under the zone's own anchor (a DS of digest type 2 for each SEP key) and the one-link chain; or `unknown` |
+| `signed.json` | `zone` (no DNAME), `keys` (`id`, `alg`, `sep`, `corrupt`), `window`, `denial` (`nsec`, or `nsec3` with `opt_out`), `request`, `time`, `policy`, `anchor_digest_type`, and for about a third of the cases a signed `parent` (`zone`, `keys`, `denial`) at the name above the apex, delegating to the zone with a DS set for its KSK, a wrong digest, RSASHA1, or no DS | `rcode`, `aa`, and with DO=1 the `answer` and `authority` lines each followed by its RRSIG lines, `additional`, `denial` (NSEC or NSEC3 lines with RRSIGs), `dnskey` (the DNSKEY set and its RRSIGs), and `validation`: one result per answer RRset and one for the denial of a negative answer, under the zone's own anchor (a DS of digest type 2 for each SEP key) and the one-link chain, or with a `parent` under the parent's anchor and the chain down the delegation, with `parent_dnskey` and `delegation` (the parent's DS set or no-DS proof, with RRSIGs); or `unknown` |
 | `policy.json` | `algorithm`, `digest`, `policy` (`validate`, `digests`, `max_nsec3_iterations`): `iana` or a random one | `treatment`: `supported`, `unsupported_algorithm`, or `unsupported_digest` |
 | `chain.json` | `tree`: the parent and the child `sub`, each with `zone`, `keys`, `window`, `denial`; `time`; `policy` | `problems`: `ds_mismatch`, `no_ds_proof_missing` (with `parent`, `child`), `window_closed` (`apex`, `time`), `unsupported_algorithm` (`apex`, `algorithm`) |
 | `cache.json` | `limits` (`max_ttl`, `failure_ttl`); `ops`: `offer` (positive, negative, or failure, with time), `advance`, `serve` (key and time) | `served`: for each `serve` in order, `null` or the served positive RRset with its TTL counted down and its validation, the negative with its SOA, or the failure |
@@ -164,7 +165,7 @@ extra iterations, in base32hex. RRSIG times are decimal. Validation results are 
 
 - **Octets** are `Nat`. Theorems that rebuild numbers from octets say what range they need.
 - **Names in zones are lowercase.** The zone, partial, and authority models take the question name as Rust's
-  `LowerName`; restoring the question's case in owners is the server front's job (§7.3), which `restore`
+  `LowerName`; restoring the question's case in owners is the server front's job, which `restore`
   covers for relays.
 - **Compression** points a name, or the rest of a name after some labels, at an earlier occurrence with
   exactly the same octets. hickory may choose differently, so `wire.json` gives the decoded sections and
@@ -201,7 +202,7 @@ extra iterations, in base32hex. RRSIG times are decimal. Validation results are 
   to the name and the wildcard below each name on it. Present answers are inserted as one new revision each;
   absent and unknown answers are not kept. The view reads every fact from the zone after the provider was
   asked, so it is one revision; a name with held names below it reads as `Empty` whatever the provider says,
-  which is "the zone answers what it holds" of §5.4.
+  which is "the zone answers what it holds" of `Lazy`.
 - **Authorities are trees of asks**: finished, or ask one server and continue with what a client of that
   server saw. A Rust `Authority` whose `respond` reads `known` only through `Known::get` and returns `Need`
   only for asks it has not seen is such a tree. `respond_monotone` therefore holds for every authority
@@ -213,7 +214,7 @@ extra iterations, in base32hex. RRSIG times are decimal. Validation results are 
   public key (`verify_sign`) and that one that verifies was made with a private key whose public key it is
   (`verify_sound`), which is what unforgeability means symbolically. The concrete scheme makes the signature
   the pair of private key and message. The differential test checks Rust with an oracle `Verify` of this
-  scheme and then ties it to real signatures (§18.4).
+  scheme and then ties it to real signatures.
 - **What is signed** is the RRSIG's algorithm, signer, labels, original TTL, and window, with the records. The
   type covered is the RRset's own. Key tags are not modelled: the validator tries every trusted key of the
   RRSIG's algorithm, which a key tag only narrows.
@@ -224,9 +225,12 @@ extra iterations, in base32hex. RRSIG times are decimal. Validation results are 
   (inverted 25, past 7, not yet 8) or a bad signature (6), or RRSIGs missing (10) when there is none. A DS
   set with no supported record makes the zone Insecure before the DNSKEY set is fetched. An RRSIG that counts
   fewer labels than the owner, not counting a leading `*`, is a wildcard expansion and needs a covering
-  NSEC or NSEC3 for the next closer name (RFC 4035 §5.3.4). NSEC3 iterations above the policy's limit make a
-  denial Insecure once its signature verifies (RFC 9276 §3.2); `iana` uses 100, which RFC 9276 Appendix A
-  found interoperable. A DNAME's synthesized CNAME is not validated through its DNAME, so `signed.json` zones
+  NSEC or NSEC3 for the next closer name (RFC 4035 §5.3.4); when only an opt-out NSEC3 covers it, an
+  unsigned delegation may sit there, so the answer is Insecure, and so is a NODATA whose next closer name
+  only an opt-out NSEC3 covers (RFC 5155 §6, its erratum 3441). A denial for a DS question is checked
+  along the chain of the name above, since the parent zone holds DS (RFC 4035 §2.4). NSEC3 iterations
+  above the policy's limit make a denial Insecure once its signature verifies (RFC 9276 §3.2); `iana` uses
+  100, which RFC 9276 Appendix A found interoperable. A DNAME's synthesized CNAME is not validated through its DNAME, so `signed.json` zones
   have no DNAME.
 - **Offline signing** signs the DNSKEY set with the SEP keys and everything else with the other keys (all
   keys when every key or no key has the bit). The NSEC chain runs over the names that hold nodes, in
@@ -264,40 +268,40 @@ extra iterations, in base32hex. RRSIG times are decimal. Validation results are 
 
 ## How the Lean definitions correspond to the Rust code
 
-| Lean | Rust (design section) |
+| Lean | Rust |
 |---|---|
 | `Name.fold`, `Name.eqCI` | `LowerName` construction and comparison (hickory) |
 | `Name.canonLt`, `Name.canonCmp` | `Name::cmp_canonical` (RFC 4034 §6.1) |
 | `Name.below` | `Name::zone_of` |
 | `Name.wireLen`, `Name.ofLabels?` | `Name::len` and the label checks of hickory's name decoder |
-| `Wire.decode`, `Wire.encode` | hickory's `BinDecoder` and `BinEncoder` under `protocols::dns` (§4) |
+| `Wire.decode`, `Wire.encode` | hickory's `BinDecoder` and `BinEncoder` under `protocols::dns` |
 | `Wire.compressible` | the record types hickory compresses names in (RFC 3597 §4) |
-| `Wire.restore` | `protocols::dns::relay::restore` (§4.5) |
-| `Wire.parse` | `protocols::dns::request::Request::parse` (§4.3) |
-| `Wire.respondHeader` | the reply header the server front writes (§7.3) |
-| `Fit.Resp`, `Fit.Limit`, `Fit.fit`, `Fit.Limit.forRequest` | `protocols::dns::fit::{Response, Limit, fit}`, `Limit::for_request` (§4.4) |
-| `Zone.Fact`, `Zone.Node`, `Zone.Zone` | `services::dns::zone::{Fact, Node, Zone}` (§5.1, §5.2) |
+| `Wire.restore` | `protocols::dns::relay::restore` |
+| `Wire.parse` | `protocols::dns::request::Request::parse` |
+| `Wire.respondHeader` | the reply header the server front writes |
+| `Fit.Resp`, `Fit.Limit`, `Fit.fit`, `Fit.Limit.forRequest` | `protocols::dns::fit::{Response, Limit, fit}`, `Limit::for_request` |
+| `Zone.Fact`, `Zone.Node`, `Zone.Zone` | `services::dns::zone::{Fact, Node, Zone}` |
 | `Zone.look` | `View::node` of a complete zone's view |
-| `Zone.answerWith`, `Zone.answer`, `Zone.Answered`, `Zone.AnyResponse` | `zone::answer`, `Answered`, `AnyResponse` (§5.3) |
-| `Zone.Spec`, `Zone.build`, `Zone.ZoneError` | `ZoneBuilder::{rrset, delegate, build}`, `ZoneError` (§5.2) |
-| `Zone.View`, `Zone.answerPartial` | `View` and `answer` over any view (§5.1) |
-| `Zone.Lazy`, `Zone.Provider`, `Zone.lazyView` | `Lazy`, `Provider`, `Lazy::view` (§5.4) |
-| `Authority.Ask`, `Observed`, `Known`, `Step`, `respond` | `services::dns::authority::{Ask, Observed, Known, Step, Authority::respond}` (§7.1) |
-| `Authority.loop` | `AuthorityEngine`'s handling of `Need`, `Reply`, and `Failed` for one request (§7.2) |
-| `Authority.relay`, `Authority.overlay`, `Authority.zones` | `Relay`, `Overlay`, `Zones` (§7.4) |
-| `Exchange.Token`, `send`, `onReply`, `advance` | `services::dns::exchange::{Token, Transmit, Input::Reply, Engine::advance}` (§6.1, §6.2) |
-| `Dnssec.Key`, `Ds`, `Rrsig`, `Nsec`, `Nsec3` | hickory's `DNSKEY`, `DS`, `RRSIG`, `NSEC`, `NSEC3` under `protocols::dns::dnssec` (§8.1) |
-| `Dnssec.SigScheme.verify`, `Symbolic.scheme` | `dnssec::Verify`; the differential test's oracle `Verify` (§8.6, §18.4) |
-| `Dnssec.Signer`, `Records.Sign` | `dnssec::{ZoneKey, Sign}` (§8.2) |
-| `Dnssec.AlgorithmPolicy`, `AlgorithmPolicy.treat`, `Policy.iana` | `dnssec::AlgorithmPolicy`, its DS treatment, `AlgorithmPolicy::iana` (§8.5) |
-| `Dnssec.Anchor`, `anchorFor` | `dnssec::{TrustAnchor, Anchors}` (§8.4) |
-| `Dnssec.Link`, `Chain`, `walk` | `dnssec::Chain` and the walk from the anchor down (§8.6) |
+| `Zone.answerWith`, `Zone.answer`, `Zone.Answered`, `Zone.AnyResponse` | `zone::answer`, `Answered`, `AnyResponse` |
+| `Zone.Spec`, `Zone.build`, `Zone.ZoneError` | `ZoneBuilder::{rrset, delegate, build}`, `ZoneError` |
+| `Zone.View`, `Zone.answerPartial` | `View` and `answer` over any view |
+| `Zone.Lazy`, `Zone.Provider`, `Zone.lazyView` | `Lazy`, `Provider`, `Lazy::view` |
+| `Authority.Ask`, `Observed`, `Known`, `Step`, `respond` | `services::dns::authority::{Ask, Observed, Known, Step, Authority::respond}` |
+| `Authority.loop` | `AuthorityEngine`'s handling of `Need`, `Reply`, and `Failed` for one request |
+| `Authority.relay`, `Authority.overlay`, `Authority.zones` | `Relay`, `Overlay`, `Zones` |
+| `Exchange.Token`, `send`, `onReply`, `advance` | `services::dns::exchange::{Token, Transmit, Input::Reply, Engine::advance}` |
+| `Dnssec.Key`, `Ds`, `Rrsig`, `Nsec`, `Nsec3` | hickory's `DNSKEY`, `DS`, `RRSIG`, `NSEC`, `NSEC3` under `protocols::dns::dnssec` |
+| `Dnssec.SigScheme.verify`, `Symbolic.scheme` | `dnssec::Verify`; the differential test's oracle `Verify` |
+| `Dnssec.Signer`, `Records.Sign` | `dnssec::{ZoneKey, Sign}` |
+| `Dnssec.AlgorithmPolicy`, `AlgorithmPolicy.treat`, `Policy.iana` | `dnssec::AlgorithmPolicy`, its DS treatment, `AlgorithmPolicy::iana` |
+| `Dnssec.Anchor`, `anchorFor` | `dnssec::{TrustAnchor, Anchors}` |
+| `Dnssec.Link`, `Chain`, `walk` | `dnssec::Chain` and the walk from the anchor down |
 | `Dnssec.noDsProof`, `denialResult`, `nx`, `nx3`, `nodata`, `nodata3` | `dnssec::proof` (RFC 4035 §5.4, RFC 5155 §8) |
-| `Dnssec.validateRrset`, `validateDenial`, `Validation`, `Insecure`, `Ede` | `dnssec::{validate_rrset, validate_denial, Validation, Insecure}`, `EdeCode` (§8.6) |
-| `Dnssec.SignedZone`, `nsecChain`, `nsec3Chain`, `answerDo` | `zone::Zone::signed` and the DO=1 answer (§8.3, §5.3 step 7) |
-| `Dnssec.cover`, `whiteLie`, `epsilonNsec` | `zone::cover` (§8.3) |
-| `Records.onDemand`, `lazyAnswer` | `Lazy::view` with `answer` (§5.4) |
-| `Records.publish` | `Signed<D>` serving one question (§8.3) |
-| `Chain.check`, `Chain.Problem` | `zone::chain::{check_chain, ChainProblem}` (§8.7) |
-| `Cache.Cache`, `Entry`, `Rank`, `insert`, `serve`, `advance` | `resolver::cache::{Cache, Entry, Rank}` and their store, lookup, and generation rules (§9.6) |
-| `Resolver.step`, `start`, `run`, `runAll` | `Resolver` as an `Engine`, driven by `memory::drive` over a `MemoryNet` with scripted losses (§9.1, §9.4, §10) |
+| `Dnssec.validateRrset`, `validateDenial`, `Validation`, `Insecure`, `Ede` | `dnssec::{validate_rrset, validate_denial, Validation, Insecure}`, `EdeCode` |
+| `Dnssec.SignedZone`, `nsecChain`, `nsec3Chain`, `answerDo` | `zone::Zone::signed` and the DO=1 answer |
+| `Dnssec.cover`, `whiteLie`, `epsilonNsec` | `zone::cover` |
+| `Records.onDemand`, `lazyAnswer` | `Lazy::view` with `answer` |
+| `Records.publish` | `Signed<D>` serving one question |
+| `Chain.check`, `Chain.Problem` | `zone::chain::{check_chain, ChainProblem}` |
+| `Cache.Cache`, `Entry`, `Rank`, `insert`, `serve`, `advance` | `resolver::cache::{Cache, Entry, Rank}` and their store, lookup, and generation rules |
+| `Resolver.step`, `start`, `run`, `runAll` | `Resolver` as an `Engine`, driven by `memory::drive` over a `MemoryNet` with scripted losses |

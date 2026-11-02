@@ -1,5 +1,5 @@
 /-
-  Exchanges, tokens, and generations (§6): the matching rule of the step contract (§6.2 rules 3 to 5).
+  Exchanges, tokens, and generations: the matching rule of the step contract.
 
   The engine issues a token for each outstanding exchange, made of the namespace generation and an exchange
   number. A reply changes state only if its token is outstanding and current, it came from where the

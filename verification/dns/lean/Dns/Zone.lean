@@ -1,5 +1,5 @@
 /-
-  Zones and the answer algorithm of RFC 1034 §4.3.2 (§5 of the design): nodes, cuts with in-domain and
+  Zones and the answer algorithm of RFC 1034 §4.3.2: nodes, cuts with in-domain and
   sibling glue, empty non-terminals, wildcards (RFC 4592), CNAME chains, DNAME (RFC 6672), negative answers
   (RFC 2308), and the builder's checks.
 
@@ -183,7 +183,7 @@ def child (look : Name → Fact Node) (q p : Name) : M Loc :=
   | .ok (some nd) => .ok (.node q nd)
   | .error e => .error e
 
-/-- Walks from the apex down to `q`, asking `look` at each name (steps 1 to 5 of §5.3, without the
+/-- Walks from the apex down to `q`, asking `look` at each name (the answer's steps 1 to 5, without the
 wildcard). -/
 def locate (look : Name → Fact Node) (apex : Name) : Name → M Loc
   | [] => if ([] : Name) = apex then atApex look apex else .ok .outside
@@ -272,7 +272,7 @@ deriving DecidableEq, Repr
 def nodata (soa : RRset) : Out := .done .noerror true [] [negSoa soa] [] 0
 
 /-- A referral to the cut at `m`: AA=0, the NS set in authority, in-domain glue as required additional data,
-and sibling glue after it as optional additional data (§5.3 step 2). -/
+and sibling glue after it as optional additional data (step 2 of the answer). -/
 def referral (look : Name → Fact Node) (apex m : Name) (ns : RRset) (glue : List RRset) : M Out :=
   let inDomain := glue.filter fun s => isAddr s && (targets ns).contains s.owner && under s.owner m
   match collect (siblingGlue look apex m) (targets ns) with
@@ -289,7 +289,7 @@ def anySets (any : AnyResponse) (q : Name) (sets : List RRset) : List RRset :=
   | .oneRrset => (sets.take 1).map (withOwner q)
   | .all => sets.map (withOwner q)
 
-/-- The answer from the RRsets matched at `q`, its own node's or a wildcard's (§5.3 steps 4 and 5). Owners are
+/-- The answer from the RRsets matched at `q`, its own node's or a wildcard's (steps 4 and 5 of the answer). Owners are
 `q`. A CNAME restarts the walk; no RRset of the type is NODATA. -/
 def exact (look : Name → Fact Node) (apex : Name) (soa : RRset) (any : AnyResponse) (q : Name) (qtype : Nat)
     (sets : List RRset) : M Out :=
@@ -309,7 +309,7 @@ def exact (look : Name → Fact Node) (apex : Name) (soa : RRset) (any : AnyResp
         | none => .ok (.done .noerror true [withOwner q c] [] [] 0)
       | none => .ok (nodata soa)
 
-/-- One pass of §5.3 for the name `q`. -/
+/-- One pass of the answer's steps for the name `q`. -/
 def step (look : Name → Fact Node) (apex : Name) (soa : RRset) (any : AnyResponse) (q : Name) (qtype : Nat) :
     M Out :=
   match locate look apex q with
@@ -342,7 +342,7 @@ zone holds or a DNAME substitution of at most 255 octets, so a chain ends by rep
 zone, or YXDOMAIN long before this many steps. -/
 def chainFuel : Nat := 256 ^ 256
 
-/-- Follows CNAMEs inside the zone, stopping at the first repeated name (§4.3.2 step 3a). The RCODE is the
+/-- Follows CNAMEs inside the zone, stopping at the first repeated name (RFC 1034 §4.3.2 step 3a). The RCODE is the
 last name's (RFC 6604 §2). -/
 def chase (look : Name → Fact Node) (apex : Name) (soa : RRset) (any : AnyResponse) (qtype : Nat) :
     Nat → List Name → List RRset → Name → M Response
@@ -1540,7 +1540,7 @@ theorem answer_in_zone (z : Zone) (hwf : z.WF) (q : Request) (any : AnyResponse)
         ((under_iff _ _).mp (by simpa using hu)) hc
     · cases h
 
-/-! ## The builder (§5.2)
+/-! ## The builder
 
 A zone is built from its RRsets and its delegations. `build` checks every rule and fails with the first one
 broken; `builder_rejects_iff` says it fails exactly when the rules, stated as propositions, do not all hold. -/

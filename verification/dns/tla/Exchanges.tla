@@ -1,7 +1,7 @@
 ------------------------------ MODULE Exchanges ------------------------------
 (***************************************************************************)
-(* The step contract of design section 6.2, which every DNS engine keeps:  *)
-(* tokens, matching, generations, sharing, and termination.                *)
+(* The step contract of `services::dns::exchange`, which every DNS engine  *)
+(* keeps: tokens, matching, generations, sharing, and termination.         *)
 (*                                                                         *)
 (* Two clients ask questions that need the same upstream work: one         *)
 (* resolution both wait on. The engine sends that work to one of two       *)

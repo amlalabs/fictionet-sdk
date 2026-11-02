@@ -466,9 +466,9 @@ def brokenChain : Chain Sch := [⟨apex, none, none⟩]
 #print axioms insecure_needs_proof
 /-- Insecure, and the reason is the unsupported DS set, although the DNSKEY set is missing. -/
 example : InsecureCase [sha1Anchor] Policy.iana 150 wwwTxt.owner brokenChain .unsupportedAlgorithm :=
-  insecure_needs_proof (set := wwwTxt) (sigs := []) (ds := [])
+  (insecure_needs_proof (set := wwwTxt) (sigs := []) (ds := [])
     (Policy.sha1_ds_insecure (a := sha1Anchor) (l0 := ⟨apex, none, none⟩) (ls0 := []) (by decide) rfl rfl (by decide)
-      (by decide))
+      (by decide))).resolve_right fun h => nomatch h.1
 
 #print axioms insecure_complete
 /-- With no anchor at or above the name, the answer is Insecure. -/
@@ -489,7 +489,7 @@ example : validateDenial (some [optOutZone.anchor 2]) Policy.iana 150 [optOutZon
   have hn : nsecs (verified Policy.iana 150 apex optOutZone.keys optOutDenial) = [] := by decide +kernel
   have h3 : nsec3s (verified Policy.iana 150 apex optOutZone.keys optOutDenial) = [optOutRecord] := by
     decide +kernel
-  refine optout_never_secure_denial hw (by rw [hn]; rfl) fun _ _ r hr _ => ?_
+  refine optout_never_secure_denial rfl hw (by rw [hn]; rfl) fun _ _ r hr _ => ?_
   rw [h3, List.mem_singleton] at hr
   rw [hr]; rfl
 

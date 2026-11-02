@@ -1,5 +1,5 @@
 /-
-  `check_chain` (§8.7): an advisory check over the signed zones a world built. It reports a DS set that names
+  `check_chain`: an advisory check over the signed zones a world built. It reports a DS set that names
   none of the child's keys, a delegation without DS whose parent gives no proof of that, a signature window
   closed at the check's time, and a key algorithm the policy does not validate. A world that wants a broken
   chain on purpose leaves the problem in, and the resolver then does the standard thing.

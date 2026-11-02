@@ -1,5 +1,5 @@
 /-
-  The algorithm policy (§8.5): the IANA registry columns that RFC 9904 and RFC 9905 set, the default policy
+  The algorithm policy: the IANA registry columns that RFC 9904 and RFC 9905 set, the default policy
   `iana` derived from them, and what the policy does to validation.
 
   RFC 9904 (November 2025) obsoletes RFC 8624 and moves the algorithm recommendations into IANA registry
@@ -80,7 +80,7 @@ def digests : List DigestRow :=
 /-- RSASHA1 and RSASHA1-NSEC3-SHA1, which validators must treat as unsupported (RFC 9905 §2). -/
 def rfc9905Unsupported : List Nat := [5, 7]
 
-/-- The algorithms the signer implements (§8.2) and the verifier can check: ring has no Ed448, so 16 is
+/-- The algorithms the signer implements and the verifier can check: ring has no Ed448, so 16 is
 neither. -/
 def implementedAlgorithms : List Nat := [8, 10, 13, 14, 15]
 

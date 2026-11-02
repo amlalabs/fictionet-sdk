@@ -68,7 +68,7 @@ not compare whole, with why.
 | `fit` | `protocols::dns::fit` | the size, TC, and the RRsets kept in each section |
 | `zone` | `zone::answer` over `Zone::from_master` | RCODE, AA, every section, and the required additional RRsets |
 | `partial` | `zone::answer` over a view with unknown facts | the unknown name, or the response |
-| `signed` | `Zone::signed`, `answer` with DO=1, `validate_rrset`, `validate_denial` | the answer's records and RRSIGs, its denial records, the DNSKEY RRset, and the validation of each answer RRset and of the denial |
+| `signed` | `Zone::signed`, `answer` with DO=1, `validate_rrset`, `validate_denial` | the answer's records and RRSIGs, its denial records, the DNSKEY RRset, and the validation of each answer RRset and of the denial, under the zone's own anchor or, for a zone below a signed parent, along the chain from the parent's anchor across the delegation, with the parent's DNSKEY RRset and its denial of the DS RRset compared too |
 | `policy` | `AlgorithmPolicy` | the treatment of a DS record's algorithm and digest type |
 | `chain` | `check_chain` | the problems reported, as a set |
 | `cache` | `resolver::Cache` | what each lookup serves, with TTLs counted down |
@@ -113,12 +113,11 @@ standards and Rust do, or where a standard lets both answers stand.
 | `fit` | `Gen.lean` sometimes splits one RRset (same owner and type) into two in a section, and the Lean `fit` keeps the two apart | RFC 2181 §5 makes them one RRset, which `fit` writes together |
 | `zone`, `partial` | for QTYPE ANY answered with one RRset, Lean takes the first RRset in the zone's listed order and Rust the RRset of the lowest type; the test then checks that Rust answers Lean's RRset when asked for its type | RFC 8482 §4.1 lets a server pick any one RRset; a master file's order does not survive into a zone |
 | `signed` | the Lean model signs NSEC3 zones without the NSEC3PARAM record, so its bitmaps never name it | RFC 5155 §7.1 puts NSEC3PARAM at the apex of an NSEC3 zone |
-| `signed` | Lean's answers to ANY with DO=1 leave out the NSEC and NSEC3PARAM RRsets at the name | they are RRsets of the name, and ANY asks for every RRset |
+| `signed` | Lean's answers to ANY with DO=1 leave out the NSEC, NSEC3PARAM, and DNSKEY RRsets at the name | they are RRsets of the name, and ANY asks for every RRset |
 | `signed` | for a negative answer whose SOA RRSIG fails, Rust reports the SOA's failure and Lean the denial's (both Bogus) | the SOA a negative answer carries is signed (RFC 4035 §3.1.1), and Rust checks it |
-| `signed` | a wildcard answer, or the NODATA of a name a wildcard answered, under an NSEC3 with Opt-Out covering the next closer name is Secure in Lean and Insecure in Rust | an Opt-Out span may hide an unsigned delegation (RFC 5155 §6), so the proofs of §8.7 and §8.8 cannot hold; Unbound returns Insecure too |
 | `signed` | for NODATA at a name that is itself a wildcard, Rust also sends the NSEC3 matching the wildcard's parent | the extra record proves nothing false; RFC 5155 §7.2.3 needs only the matching NSEC3 |
 | `chain` | Rust also reports a parent's DS records that name an algorithm the policy does not validate | such a DS leaves the child Insecure (RFC 9905 §2), which a world signing the child would want to know |
-| `chain` | in a tree with a corrupted key, Rust also reports the breaks the bad signatures make | the Lean check reads no signature and assumes honest signers (`check_sound`) |
+| `chain` | in a tree with a corrupted key, Rust also reports the breaks the bad signatures make, `SignatureInvalid` among them | the Lean check reads no signature and assumes honest signers (`check_sound`) |
 
 Two differences the test found were faults in Rust and are fixed there:
 `fit` now ends the additional section at the first optional RRset that does

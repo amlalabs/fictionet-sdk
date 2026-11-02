@@ -1,5 +1,5 @@
 /-
-  Test vectors for the differential test (§18.3). Every expected value is computed by the executable Lean
+  Test vectors for the differential test. Every expected value is computed by the executable Lean
   definitions whose properties `Dns/*.lean` proves:
 
   * `names.json`: `Name.canonCmp`, `Name.eqCI`, `Name.wireLen`;
@@ -561,7 +561,7 @@ end Zones
 
 /-! ## DNSSEC records in presentation form
 
-Keys and signatures are symbolic (§18.3). A key is a number below 256; its DNSKEY's public key field is the
+Keys and signatures are symbolic. A key is a number below 256; its DNSKEY's public key field is the
 base64 of that one octet, and its key tag is the number. A signature made with private key `p` has key tag
 `p mod 1000` and signature field the base64 of `p` as two octets; it verifies exactly when `p` is the key
 tag, that is below 1000, and covers the records shown. A corrupted key signs with `p = key + 1000`. A DS digest
@@ -704,6 +704,26 @@ instance : Inhabited Denial := ⟨.nsec⟩
 
 def rDenial : G Denial := pick #[.nsec, .nsec, .nsec3 false, .nsec3 true]
 
+/-- A signed parent of `z` at the name above its apex, delegating to it: the parent's DS set at the cut names
+`z`'s KSK (most often), names it with a wrong digest or with RSASHA1, or is absent, so the chain from the
+parent's anchor down to `z` is Secure, Bogus, or Insecure by the parent's proof. -/
+def rParent (z : Zone) (keys : List KeySpec) : G (Spec × List KeySpec × Denial) := do
+  let papex := z.apex.drop 1
+  let ksk := keys.find? (·.sep)
+  let kskAlg := (ksk.map (·.alg)).getD 13
+  let kskKey : Key := (ksk.map fun k => (⟨Sch.pub k.id, k.alg, true⟩ : Key)).getD ⟨[0], 13, true⟩
+  let ds : Option (Nat × List Zone.RData) := match ← rNat 5 with
+    | 0 => none
+    | 1 | 2 => some (86400, [.ds 0 kskAlg 2 (Sch.digest z.apex kskKey)])
+    | 3 => some (86400, [.ds 0 kskAlg 2 [1, 2, 3, 4]])
+    | _ => some (86400, [.ds 0 5 2 (Sch.digest z.apex { kskKey with alg := 5 })])
+  let soa : Zone.RData := .soa (lb "ns1" :: papex) (lb "hostmaster" :: papex) 1 7200 3600 1209600 300
+  let ns := lb "ns1" :: z.apex
+  let parent : Spec := ⟨papex, 3600, soa, [⟨papex, 2, 3600, [.ns (lb "ns1" :: papex)]⟩,
+      ⟨lb "ns1" :: papex, 1, 3600, [.a [192, 0, 2, 2]]⟩],
+    [⟨z.apex, 86400, [ns], [⟨ns, 1, 86400, [.a [192, 0, 2, 1]]⟩], ds⟩]⟩
+  return (parent, ← rKeys, ← rDenial)
+
 def signedCase : G String := do
   let (sp, z) ← rSignedZone
   let keys ← rKeys
@@ -712,24 +732,47 @@ def signedCase : G String := do
   let t ← pick #[50, 100, 150, 150, 199, 200, 250]
   let q : Request := ⟨← rQname z, ← rQtype⟩
   let sz : SignedZone Sch := ⟨z, keys.map (·.signer), w, denial⟩
-  let anchors := [sz.anchor 2]
+  -- Half the zones that can have a parent get one, so the validation walks down a delegation from the
+  -- parent's anchor; the rest are anchored at their own apex.
+  let parent : Option (Spec × List KeySpec × Denial) ←
+    if 2 ≤ z.apex.length && (← chance 2) then some <$> rParent z keys else pure none
+  let below := parent.map fun ((psp, pkeys, pd) : Spec × List KeySpec × Denial) =>
+    let pz : SignedZone Sch := ⟨psp.assemble, pkeys.map KeySpec.signer, w, pd⟩
+    (pz, Dns.Chain.linkBelow pz sz)
+  let (anchors, chain) := match below with
+    | some (pz, link) => ([pz.anchor 2], [pz.link, link])
+    | none => ([sz.anchor 2], [sz.link])
+  let delegation : List String := match below with
+    | some (pz, link) => match link.parent with
+      | some (.ds sd) => signedLines 86400 sd
+      | some (.noDs ds) => ds.flatMap (signedLines pz.denialTtl)
+      | none => []
+    | none => []
+  let parentOut : List (String × String) := match below with
+    | some (pz, _) => [("parent_dnskey", jarr ((signedLines pz.zone.soa.ttl pz.keySet).map jstr)),
+        ("delegation", jarr (delegation.map jstr))]
+    | none => []
   let expected := match sz.answerDo q .all with
     | (.response _, some sa) =>
-      let (vs, dv) := validateAnswer (some anchors) Policy.iana t [sz.link] q sa
-      jobj [("rcode", jstr (rcodeStr sa.rcode)), ("aa", jbool sa.aa),
+      let (vs, dv) := validateAnswer (some anchors) Policy.iana t chain q sa
+      jobj ([("rcode", jstr (rcodeStr sa.rcode)), ("aa", jbool sa.aa),
         ("answer", jarr ((sa.answer.flatMap setWithSigsLines).map jstr)),
         ("authority", jarr ((sa.authority.flatMap setWithSigsLines).map jstr)),
         ("additional", setsJson sa.additional),
         ("denial", jarr ((sa.denial.flatMap (signedLines sz.denialTtl)).map jstr)),
         ("dnskey", jarr ((signedLines z.soa.ttl sz.keySet).map jstr)),
         ("validation", jobj [("answer", jarr (vs.map validationJson)),
-          ("denial", (dv.map validationJson).getD "null")])]
+          ("denial", (dv.map validationJson).getD "null")])] ++ parentOut)
     | (.unknown n, _) => jobj [("unknown", jstr (nameStr n))]
     | (.response _, none) => "null"
-  return jobj [("input", jobj [("zone", specJson sp), ("keys", keysJson keys), ("window", windowJson w),
+  let parentIn : List (String × String) := match parent with
+    | some (psp, pkeys, pd) =>
+      [("parent", jobj [("zone", specJson psp), ("keys", keysJson pkeys), ("denial", denialJson pd)])]
+    | none => []
+  return jobj [("input", jobj ([("zone", specJson sp), ("keys", keysJson keys), ("window", windowJson w),
       ("denial", denialJson denial), ("request", jobj [("qname", jstr (nameStr q.qname)),
         ("qtype", jstr (typeStr q.qtype))]), ("time", jnat t), ("policy", policyJson Policy.iana),
-      ("anchor_digest_type", jnat 2)]),
+      ("anchor_digest_type", jnat 2)] ++ parentIn)),
     ("expected", expected)]
 
 end Signed
@@ -827,7 +870,6 @@ def negativeStr : Negative → String
 
 def failureJson : FailureKind → String
   | .noReachableAuthority => jobj [("kind", jstr "no_reachable_authority")]
-  | .bogus e => jobj [("kind", jstr "bogus"), ("ede", jnat e.code)]
   | .workExceeded => jobj [("kind", jstr "work_exceeded")]
   | .unknown => jobj [("kind", jstr "unknown")]
 
@@ -886,7 +928,7 @@ def rOffer : G Offer := do
     let soa? := if ← chance 6 then none else some soa
     let denialTtl ← rOption (pick #[10, 100, 7200])
     return .negative k kind soa? denialTtl v (← chance 8)
-  | _ => return .failure k (← pick #[.noReachableAuthority, .workExceeded, .unknown, .bogus .rrsigsMissing])
+  | _ => return .failure k (← pick #[.noReachableAuthority, .workExceeded, .unknown])
 
 def cacheCase : G String := do
   let lim : Limits := ⟨← pick #[3600, 604800], ← pick #[5, 30, 300]⟩
