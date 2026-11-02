@@ -11,7 +11,7 @@
 //! | --- | --- |
 //! | [`Zone`] | Everything: a complete zone, built with [`Zone::builder`] or read with [`Zone::from_master`]. Nothing is unknown. |
 //! | [`Lazy`] | The names a [`Provider`] gives when they are first asked. What the provider does not know stays unknown. |
-//! | [`Transparent`] | What the zone it wraps holds. Absence becomes unknown, so a resolver goes on to iterate. |
+//! | [`Transparent`] | The names with RRsets in the zone it wraps. Every other name is unknown, so a resolver goes on to iterate. |
 //! | [`special`] | The zones a resolver serves itself: `localhost`, the RFC 6303 reverse zones, `home.arpa`, `resolver.arpa`, `service.arpa`, `onion`, `test`, and `invalid`. |
 //!
 //! A world writes its own [`ZoneData`] for anything else, such as a zone

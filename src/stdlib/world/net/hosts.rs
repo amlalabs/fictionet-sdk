@@ -6,9 +6,11 @@ use fictionet::stdlib::codec::Decode;
 use fictionet::stdlib::network::route::{Prefix, Router};
 use fictionet::stdlib::network::{ConnError, Connection, icmp, ip, tcp, udp};
 use fictionet::stdlib::protocols::dns::op::Query;
-use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RecordSet, RecordType};
+use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RecordSet};
 use fictionet::stdlib::services::dns::resolver::Config;
-use fictionet::stdlib::services::dns::zone::{Denied, Fact, Node, Revision, View, ZoneData};
+use fictionet::stdlib::services::dns::zone::{
+    Denied, Fact, Node, Revision, Transparent, View, ZoneData,
+};
 use fictionet::stdlib::services::serve::ConnInfo;
 use fictionet::stdlib::services::serve::{
     self, Budget, Counted, DatagramOptions, DatagramService, ServeOptions, Service,
@@ -661,17 +663,17 @@ impl World {
             .is_some_and(|(other, _)| name.zone_of(other))
     }
 
-    /// What the declared zone at `apex` holds at `name`.
-    fn fact(&self, apex: &LowerName, name: &LowerName) -> Fact<Node> {
-        let owner = Name::from(name.clone());
+    /// What a zone of the declared names holds at `name`, with `apex_sets`
+    /// at `apex` beside them.
+    fn fact(&self, apex: &LowerName, apex_sets: &[RecordSet], name: &LowerName) -> Fact<Node> {
         let mut sets = BTreeMap::new();
         if name == apex {
-            let (soa, ns) = local_zone(&owner);
-            sets.insert(RecordType::SOA, soa);
-            sets.insert(RecordType::NS, ns);
+            for set in apex_sets {
+                sets.insert(set.record_type(), set.clone());
+            }
         }
         if let Some(placed) = self.declared.get(name) {
-            for set in placed.rrsets(&owner, HOST_TTL) {
+            for set in placed.rrsets(&Name::from(name.clone()), HOST_TTL) {
                 sets.insert(set.record_type(), set);
             }
         }
@@ -681,6 +683,39 @@ impl World {
             Fact::Present(Node::Empty)
         } else {
             Fact::Absent
+        }
+    }
+
+    /// A view of the declared names as a zone at `apex` with the SOA
+    /// `soa` and the RRsets `apex_sets` at its apex, holding the facts an
+    /// answer for `qname` reads: each name from `qname` up to the apex,
+    /// and the wildcard below each.
+    pub(super) fn view(
+        &self,
+        apex: LowerName,
+        soa: RecordSet,
+        apex_sets: &[RecordSet],
+        qname: &LowerName,
+    ) -> Facts {
+        let mut facts = BTreeMap::new();
+        let mut name = qname.clone();
+        loop {
+            facts.insert(name.clone(), self.fact(&apex, apex_sets, &name));
+            if let Ok(wildcard) = name.prepend_label("*") {
+                let wildcard = LowerName::new(&wildcard);
+                let fact = self.fact(&apex, apex_sets, &wildcard);
+                facts.insert(wildcard, fact);
+            }
+            if name == apex {
+                break;
+            }
+            name = name.base_name();
+        }
+        Facts {
+            apex,
+            soa,
+            revision: Revision(self.revision),
+            facts,
         }
     }
 }
@@ -702,10 +737,10 @@ impl World {
 ///
 /// A static zone denies every undeclared name under its top-level domain.
 /// A world whose resolver also iterates to real servers, and whose hosts
-/// declare names under real top-level domains, passes it wrapped in
-/// [`Transparent`](fictionet::stdlib::services::dns::zone::Transparent),
-/// so the declared names answer and the rest are asked of the internet.
-/// [`Net::gateway`] hands it to the code that builds the gateway.
+/// declare names under real top-level domains, passes
+/// [`Declared::transparent`] instead, so the declared names answer and the
+/// rest are asked of the internet. [`Net::gateway`] hands it to the code
+/// that builds the gateway.
 #[derive(Clone)]
 pub struct Declared {
     world: Arc<Mutex<World>>,
@@ -713,6 +748,10 @@ pub struct Declared {
     /// The apexes of the resolver's other local zones, which
     /// [`over`](Declared::over) makes give way to the declared names.
     zones: Arc<[LowerName]>,
+    /// Whether each zone has the SOA and NS records Unbound gives a static
+    /// local zone at its apex. The zones of [`Declared::transparent`] have
+    /// none.
+    apex_records: bool,
 }
 
 impl Declared {
@@ -721,7 +760,22 @@ impl Declared {
             world,
             root: LowerName::new(&Name::root()),
             zones: Arc::new([]),
+            apex_records: true,
         }
+    }
+
+    /// The declared names as Unbound serves `local-data` that no
+    /// `local-zone` contains: in an implicit transparent zone, with no SOA
+    /// or NS records of its own. A declared name answers with its host's
+    /// addresses, and NODATA for other types. Every other name, a
+    /// top-level domain's apex and a name above a declared name among
+    /// them, is unknown, so a resolver asks its next local zone or
+    /// iterates for it.
+    pub fn transparent(&self) -> Transparent<Declared> {
+        Transparent(Declared {
+            apex_records: false,
+            ..self.clone()
+        })
     }
 
     /// `config` with the declared names served before anything else: these
@@ -792,27 +846,13 @@ impl ZoneData for Declared {
         if !world.declares_below(&apex) {
             return Arc::new(Facts::unknown(apex));
         }
-        // The facts an answer reads: each name from the question's name up
-        // to the apex, and the wildcard below each.
-        let mut facts = BTreeMap::new();
-        let mut name = qname;
-        loop {
-            facts.insert(name.clone(), world.fact(&apex, &name));
-            if let Ok(wildcard) = name.prepend_label("*") {
-                let wildcard = LowerName::new(&wildcard);
-                facts.insert(wildcard.clone(), world.fact(&apex, &wildcard));
-            }
-            if name == apex {
-                break;
-            }
-            name = name.base_name();
-        }
-        Arc::new(Facts {
-            soa: local_zone(&Name::from(apex.clone())).0,
-            apex,
-            revision: Revision(world.revision),
-            facts,
-        })
+        let (soa, ns) = local_zone(&Name::from(apex.clone()));
+        let apex_sets = if self.apex_records {
+            vec![soa.clone(), ns]
+        } else {
+            Vec::new()
+        };
+        Arc::new(world.view(apex, soa, &apex_sets, &qname))
     }
 }
 
@@ -837,9 +877,9 @@ impl ZoneData for GivesWay {
     }
 }
 
-/// The facts of a declared zone that one question reads, at one revision.
-/// Every other name is unknown.
-struct Facts {
+/// The facts of a zone of the declared names that one question reads, at
+/// one revision. Every other name is unknown.
+pub(super) struct Facts {
     apex: LowerName,
     soa: RecordSet,
     revision: Revision,
@@ -848,7 +888,7 @@ struct Facts {
 
 impl Facts {
     /// A view of the zone at `apex` that knows nothing.
-    fn unknown(apex: LowerName) -> Facts {
+    pub(super) fn unknown(apex: LowerName) -> Facts {
         Facts {
             soa: local_zone(&Name::from(apex.clone())).0,
             apex,

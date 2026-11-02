@@ -61,9 +61,14 @@
 //! | [`internet`] | The root, `gtld-servers.net`, and public resolver hosts, and a mirror of the real hierarchy. |
 //! | [`encrypted`] | DNS over TLS on port 853 and DNS over HTTPS on port 443 for a running [`Recursive`]. |
 
-use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RecordSet};
-use fictionet::stdlib::services::dns::zone::{Fact, Lazy, Provider, special};
+use std::sync::Arc;
 
+use fictionet::stdlib::protocols::dns::op::Query;
+use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RecordSet};
+use fictionet::stdlib::services::dns::zone::{View, ZoneData, special};
+use fictionet::sync::Mutex;
+
+use super::hosts::Facts;
 use super::{Host, NetHandle, normalize};
 
 pub mod encrypted;
@@ -88,53 +93,91 @@ pub(super) fn local_zone(apex: &Name) -> (RecordSet, RecordSet) {
     special::local_apex(apex, special::LOCAL_TTL)
 }
 
-/// A root zone whose names are hosts, each placed with
-/// [`NetHandle::add_host`] the first time its name is asked, as a resolver's
-/// local zone.
+/// A root zone whose names are the network's hosts, where a host is placed
+/// with [`NetHandle::add_host`] the first time its name is asked, as a
+/// resolver's local zone.
 ///
 /// `host_for` gets a name in lowercase without the trailing dot
 /// (`en.wikipedia.org`) and returns the host for it, or `None` if no host
 /// has that name. The host answers to the name, which is added to its
-/// names if it lacks it. The zone keeps each placed host's A and AAAA
-/// records for the run; a name given no host is asked again the next
-/// time, so names may come into being as the world runs. A question asks
-/// about every name on its path from the root down, so `com` and
-/// `example.com` are asked before `www.example.com`, and a host placed
-/// for a name makes each name above it exist as an empty non-terminal,
-/// which answers NODATA, whatever `host_for` said about it. A name is
-/// NXDOMAIN only while neither it nor a name below it has a host. The root is never asked, nor is a name whose first label is
-/// `*`, which is no host name: the zone has no wildcards.
-/// A host that cannot be placed counts as `None`. Negative answers carry
-/// an SOA whose TTL and minimum are 60 seconds, so resolvers, the guest's
-/// among them, keep a name given no host only briefly.
+/// names if it lacks it. A question asks `host_for` about its own name
+/// only, and only when no host has declared that name yet, so one lookup
+/// places at most one host. A name given no host is asked again the next
+/// time, so names may come into being as the world runs.
+///
+/// The zone answers every name the network's hosts declare
+/// ([`Declared`](super::Declared)), whether `host_for` placed them or not.
+/// A name with a declared name below it exists as an empty non-terminal,
+/// which answers NODATA when `host_for` gives it no host. A name is
+/// NXDOMAIN only while neither it nor a name below it is declared. The
+/// root is never asked, nor is a name whose first label is `*`, which is
+/// no host name: the zone has no wildcards. A host that cannot be placed
+/// counts as `None`. Negative answers carry an SOA whose TTL and minimum
+/// are 60 seconds, so resolvers, the guest's among them, keep a name given
+/// no host only briefly.
 ///
 /// `host_for` is world code: it runs while the resolver that asked waits,
 /// and while the zone holds its own lock, so it must return quickly. It
 /// may place hosts of its own with the same handle.
-pub fn placing<F>(handle: NetHandle, host_for: F) -> Lazy<impl Provider>
+pub fn placing<F>(handle: NetHandle, host_for: F) -> impl ZoneData
 where
     F: Fn(&str) -> Option<Host> + Send + Sync + 'static,
 {
     let root = Name::root();
-    let (_, ns) = local_zone(&root);
-    let provider = move |name: &LowerName| {
+    let (soa, ns) = special::local_apex(&root, PLACING_NEGATIVE_TTL);
+    Placing {
+        root: LowerName::new(&root),
+        soa,
+        ns,
+        handle,
+        host_for,
+        placing: Mutex::new(()),
+    }
+}
+
+/// The zone [`placing`] returns.
+struct Placing<F> {
+    root: LowerName,
+    soa: RecordSet,
+    ns: RecordSet,
+    handle: NetHandle,
+    host_for: F,
+    /// Held while a question asks `host_for` and places its host, so two
+    /// questions for one name place one host.
+    placing: Mutex<()>,
+}
+
+impl<F> ZoneData for Placing<F>
+where
+    F: Fn(&str) -> Option<Host> + Send + Sync + 'static,
+{
+    fn apex(&self) -> &LowerName {
+        &self.root
+    }
+
+    fn view(&self, question: &Query) -> Arc<dyn View + Send + Sync> {
+        let qname = LowerName::new(question.name());
+        let Ok(shared) = self.handle.shared() else {
+            return Arc::new(Facts::unknown(self.root.clone()));
+        };
+        let _placing = self.placing.lock();
         // A `*` label is no host name (RFC 1123 §2.1), so the zone has no
         // wildcards (RFC 4592) and a name with no host stays NXDOMAIN.
-        if name.is_wildcard() {
-            return Fact::Absent;
+        let asks = !qname.is_root()
+            && !qname.is_wildcard()
+            && !shared.world.lock().declared.contains_key(&qname);
+        if asks {
+            let text = normalize(&qname.to_string());
+            if let Some(mut host) = (self.host_for)(&text) {
+                if !host.names.contains(&text) {
+                    host.names.insert(0, text);
+                }
+                // A host that cannot be placed counts as no host.
+                let _ = self.handle.add_host(host);
+            }
         }
-        let text = normalize(&name.to_string());
-        let Some(mut host) = host_for(&text) else {
-            return Fact::Absent;
-        };
-        if !host.names.contains(&text) {
-            host.names.insert(0, text);
-        }
-        match handle.add_host(host) {
-            Ok(placed) => Fact::Present(placed.rrsets(&Name::from(name.clone()), HOST_TTL)),
-            Err(_) => Fact::Absent,
-        }
-    };
-    let soa = special::local_soa(PLACING_NEGATIVE_TTL);
-    Lazy::new(root, soa, ns, PLACING_NEGATIVE_TTL, provider)
+        let apex_sets = [self.soa.clone(), self.ns.clone()];
+        let world = shared.world.lock();
+        Arc::new(world.view(self.root.clone(), self.soa.clone(), &apex_sets, &qname))
+    }
 }

@@ -643,8 +643,8 @@ impl NetHandle {
     /// nothing behind.
     ///
     /// Fails before the network has started, after it has stopped, and for
-    /// a host that cannot be placed. A zone provider may call it while a
-    /// resolver waits on the provider ([`dns::placing`]); it takes the
+    /// a host that cannot be placed. Zone data may call it while a
+    /// resolver waits for a view, as [`dns::placing`] does; it takes the
     /// network's lock, which no code holds while it calls into a resolver.
     pub fn add_host(&self, host: Host) -> Result<Placed, Error> {
         let shared = self.shared()?;

@@ -42,11 +42,12 @@ fn dns_answers_sites_nodata_and_nxdomain() {
             (ResponseCode::NXDomain, vec![])
         );
 
-        // The callback ran for `test` and then the name on each lookup no
-        // placed site answered: once for each of secure, plain, and broken,
-        // and on every lookup of nope (twice) and inside, which it turned
-        // down or which could not be placed, and which are not kept.
-        assert_eq!(env.calls.load(Ordering::SeqCst), 3 * 2 + 3 * 2);
+        // The callback ran for the name of each lookup no placed site
+        // answered, and never for `test` above it: once for each of
+        // secure, plain, and broken, and on every lookup of nope (twice)
+        // and inside, which it turned down or which could not be placed,
+        // and which are not kept.
+        assert_eq!(env.calls.load(Ordering::SeqCst), 3 + 3);
 
         // DNS over TCP, two queries on one connection.
         let mut conn = m
@@ -73,7 +74,7 @@ fn dns_answers_sites_nodata_and_nxdomain() {
             }
         }
         // secure.test has its site; nope.test is asked about again.
-        assert_eq!(env.calls.load(Ordering::SeqCst), 12 + 2);
+        assert_eq!(env.calls.load(Ordering::SeqCst), 6 + 1);
         Ok(())
     });
 }
@@ -114,10 +115,112 @@ fn sites_are_placed_on_first_lookup_even_under_a_used_top_level_domain() {
             .body;
         assert!(page.starts_with("b "), "{page}");
 
-        // `test` is asked about before each name below it, and a placed
-        // site's name is answered without asking again.
+        // Only the looked-up names are asked about, never `test` above
+        // them, and a placed site's name is answered without asking again.
         assert_eq!(lookup(&fcx, &m, "a.test").await, first);
-        assert_eq!(*asked.lock().unwrap(), ["test", "a.test", "test", "b.test"]);
+        assert_eq!(*asked.lock().unwrap(), ["a.test", "b.test"]);
+        Ok(())
+    });
+}
+
+/// One lookup places at most one site: a callback that opens a whole
+/// domain is asked about the looked-up name alone, and the names above
+/// it get no machine until they are looked up themselves.
+#[test]
+fn one_lookup_places_one_site() {
+    run_world::world(Duration::from_secs(60), |fcx| async move {
+        let asked: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let record = asked.clone();
+        let net = web::Sites::new(move |host| {
+            record.lock().unwrap().push(host.to_owned());
+            host.ends_with(".wild.test")
+                .then(|| web::Site::new(Plain("wild")))
+        })
+        .into_net();
+        let handle = net.handle();
+        let (attacher, attachments) = fictionet::attachments();
+        net.start(&fcx, attachments)?;
+        let m = default_machine(&fcx, &attacher);
+        let first = Ipv4Addr::new(104, 18, 0, 1);
+        assert_eq!(lookup(&fcx, &m, "a.b.c.wild.test").await, first);
+        assert_eq!(*asked.lock().unwrap(), ["a.b.c.wild.test"]);
+        assert!(!handle.has_machine(Ipv4Addr::new(104, 18, 0, 2).into()));
+
+        // A name above it exists, and gets its own site when looked up.
+        assert_eq!(
+            lookup(&fcx, &m, "c.wild.test").await,
+            Ipv4Addr::new(104, 18, 0, 2)
+        );
+        assert_eq!(*asked.lock().unwrap(), ["a.b.c.wild.test", "c.wild.test"]);
+        Ok(())
+    });
+}
+
+/// A name the callback turned down, with a site below it, is asked about
+/// again on each lookup, so it can come into being as the world runs.
+#[test]
+fn a_name_above_a_site_can_get_a_site_later() {
+    run_world::world(Duration::from_secs(60), |fcx| async move {
+        let asked: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let open = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (record, opened) = (asked.clone(), open.clone());
+        let net = web::Sites::new(move |host| {
+            record.lock().unwrap().push(host.to_owned());
+            match host {
+                "www.shop.test" => Some(web::Site::new(Plain("www"))),
+                "shop.test" if opened.load(Ordering::SeqCst) => Some(web::Site::new(Plain("shop"))),
+                _ => None,
+            }
+        })
+        .into_net();
+        let (attacher, attachments) = fictionet::attachments();
+        net.start(&fcx, attachments)?;
+        let m = default_machine(&fcx, &attacher);
+        lookup(&fcx, &m, "www.shop.test").await;
+        assert_eq!(
+            dns(&fcx, &m, "shop.test", RecordType::A).await,
+            (ResponseCode::NoError, vec![]),
+            "an empty non-terminal while the callback turns it down"
+        );
+        open.store(true, Ordering::SeqCst);
+        // A new case, so the resolver's own cache does not answer it.
+        assert_eq!(
+            lookup(&fcx, &m, "SHOP.test").await,
+            Ipv4Addr::new(104, 18, 0, 2)
+        );
+        assert_eq!(
+            *asked.lock().unwrap(),
+            ["www.shop.test", "shop.test", "shop.test"]
+        );
+        Ok(())
+    });
+}
+
+/// A name another host declares below a site's name hides neither the
+/// site nor the names above it.
+#[test]
+fn a_declared_name_below_a_site_leaves_the_site_to_the_callback() {
+    run_world::world(Duration::from_secs(60), |fcx| async move {
+        let asked: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let record = asked.clone();
+        let net = web::Sites::new(move |host| {
+            record.lock().unwrap().push(host.to_owned());
+            (host == "shop.test").then(|| web::Site::new(Plain("shop")))
+        })
+        .into_net()
+        .host("api", |h| h.dns_name("api.shop.test"));
+        let (attacher, attachments) = fictionet::attachments();
+        net.start(&fcx, attachments)?;
+        let m = default_machine(&fcx, &attacher);
+        let api = lookup(&fcx, &m, "api.shop.test").await;
+        let shop = lookup(&fcx, &m, "shop.test").await;
+        assert_ne!(api, shop);
+        // `test` has names below it, so it exists, without a site.
+        assert_eq!(
+            dns(&fcx, &m, "test", RecordType::NS).await,
+            (ResponseCode::NoError, vec![])
+        );
+        assert_eq!(*asked.lock().unwrap(), ["shop.test", "test"]);
         Ok(())
     });
 }
