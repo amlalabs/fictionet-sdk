@@ -67,7 +67,7 @@ mod resolution;
 mod servers;
 
 pub use cache::{Cache, Entry, FailureKind, Key, Limits, Negative, Offer, Rank};
-pub use config::{Config, Minimise, Stale, Work, root_hints};
+pub use config::{Config, Minimise, NameServer, ROOT_SERVERS, Stale, Work, root_hints};
 
 use resolution::{AskerId, CheckId, Graph, LookupId, Outcome, Subject, TreeId};
 use servers::Servers;

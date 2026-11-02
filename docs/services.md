@@ -495,8 +495,11 @@ any other top-level domain gets SERVFAIL with Extended DNS Error 22, No
 Reachable Authority. `Net::gateway` runs something else there: a resolver
 with root hints that iterates through authoritative servers on the
 world's hosts (`net::dns::Authoritative`), or any program and services.
-DNS programs run on any host with `Host::program`, their own questions go
-to a `net::dns::Source` (with `Only` for the world's policy), and a
+DNS programs run on any host with `Host::program`. A resolver's questions
+to other servers leave its machine as real packets, so they reach the
+world's hosts and any real server routed into the world. An authoritative
+server's own questions, such as a relay's, go to a `net::dns::Source`,
+with `Only` around it to keep them to the world's policy. A
 `net::dns::Namespace` starts a new session in all of them at once.
 
 DHCP checks the UDP length and checksum before reading a request. It drops

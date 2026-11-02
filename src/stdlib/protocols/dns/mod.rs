@@ -25,64 +25,52 @@
 //! | [`restore`] | Gives a relayed reply the client's ID and question case and changes nothing else. |
 //! | [`Ede`], [`Nsid`], [`Padding`] | EDNS options hickory carries as raw bytes or its own type (RFC 8914, 5001, 7830). |
 //!
-//! A DNS server is a loop on a UDP socket from
-//! [`udp::endpoint`](fictionet::stdlib::network::udp::endpoint). Which names exist, and
-//! whether answers are wrong, slow or missing, is all up to world code.
-//! This server knows one zone, `stripe.com`, with one name in it,
-//! `api.stripe.com`. Every other name in the zone gets NXDOMAIN with the
-//! zone's SOA in the authority section, which a resolver needs to cache
-//! the negative answer (RFC 2308 §3). A name outside the zone is refused:
+//! A world's DNS server is a zone and an authoritative server program on
+//! a host, which apply these rules on every reply: the engines in
+//! [`services::dns`](fictionet::stdlib::services::dns) answer, and
+//! [`Authoritative`](fictionet::stdlib::world::net::dns::Authoritative)
+//! runs them on UDP and TCP port 53. Which names exist, and whether
+//! answers are wrong, slow or missing, is all up to world code. This
+//! server knows one zone, `stripe.com`, with `api.stripe.com` in it.
+//! Every other name in the zone gets NXDOMAIN with the zone's SOA in the
+//! authority section, which a resolver needs to cache the negative answer
+//! (RFC 2308 §3), a name outside the zone is refused, and a query with
+//! EDNS gets EDNS back (RFC 6891 §7):
 //!
 //! ```no_run
-//! use fictionet::prelude::*;
-//! use fictionet::stdlib::protocols::dns::op::{Message, ResponseCode};
-//! use fictionet::stdlib::protocols::dns::rr::rdata::{A, SOA};
-//! use fictionet::stdlib::protocols::dns::rr::{Name, RData, Record};
-//! use fictionet::stdlib::protocols::dns::{Limit, Parsed, Request, Response, fit};
-//! use fictionet::stdlib::services::serve::Transport;
-//! use fictionet::{Cx, Result, stdlib::network::udp};
+//! use std::net::Ipv4Addr;
+//! use std::sync::Arc;
 //!
-//! async fn serve_dns(fcx: &Cx, socket: &mut udp::Socket) -> Result {
-//!     let zone = Name::from_ascii("stripe.com.")?;
-//!     let api = Name::from_ascii("api.stripe.com.")?;
-//!     let soa = SOA::new(
-//!         Name::from_ascii("ns1.stripe.com.")?,
-//!         Name::from_ascii("hostmaster.stripe.com.")?,
-//!         2026110101, 7200, 3600, 1209600, 300,
-//!     );
-//!     while let Ok((bytes, from)) = socket.recv(fcx).await {
-//!         let request = match Request::parse(&bytes, Transport::Udp) {
-//!             Parsed::Request(request) => request,
-//!             Parsed::Reject(reply) => {
-//!                 socket.send_to(&reply.to_vec()?, from);
-//!                 continue;
-//!             }
-//!             Parsed::Silent => continue,
-//!         };
+//! use fictionet::stdlib::services::dns::authority::{ServerConfig, Zones};
+//! use fictionet::stdlib::services::dns::zone::{Zone, ZoneData};
+//! use fictionet::stdlib::world::net::Net;
+//! use fictionet::stdlib::world::net::dns::Authoritative;
+//! use fictionet::{Attachments, Cx, Result};
 //!
-//!         let mut reply = Message::response(request.message.metadata.id, request.message.metadata.op_code);
-//!         reply.metadata.authoritative = true;
-//!         reply.metadata.recursion_desired = request.rd;
-//!         reply.add_query(request.question.clone());
-//!         let name = request.question.name();
-//!         if *name == api {
-//!             let ip = A("104.18.32.7".parse()?);
-//!             reply.add_answer(Record::from_rdata(name.clone(), 300, RData::A(ip)));
-//!         } else if zone.zone_of(name) {
-//!             reply.metadata.response_code = ResponseCode::NXDomain;
-//!             reply.add_authority(Record::from_rdata(zone.clone(), 300, RData::SOA(soa.clone())));
-//!         } else {
-//!             reply.metadata.authoritative = false;
-//!             reply.metadata.response_code = ResponseCode::Refused;
-//!         }
-//!
-//!         let limit = Limit::for_request(&request, 1232);
-//!         let response = Response { message: reply, required_additional: 0 };
-//!         socket.send_to(&fit(&response, limit)?.bytes, from);
-//!     }
+//! async fn world(fcx: Cx, attachments: Attachments) -> Result {
+//!     let zone = Zone::from_master(
+//!         "$ORIGIN stripe.com.
+//! $TTL 300
+//! @   SOA ns1 hostmaster 2026110101 7200 3600 1209600 300
+//! @   NS  ns1
+//! ns1 A   104.18.32.5
+//! api A   104.18.32.7
+//! ",
+//!         None,
+//!     )?;
+//!     let zones = Zones::new(vec![Arc::new(zone) as Arc<dyn ZoneData>]);
+//!     let server = Authoritative::new(zones, ServerConfig::generic());
+//!     Net::new()
+//!         .host("ns1", |h| h.at(Ipv4Addr::new(104, 18, 32, 5)).program(server))
+//!         .start(&fcx, attachments)?;
 //!     Ok(())
 //! }
 //! ```
+//!
+//! A server with rules of its own, such as one that answers EDNS versions
+//! above 0 the way Cloudflare's resolver does, writes an
+//! [`Authority`](fictionet::stdlib::services::dns::authority::Authority)
+//! or wraps one, and keeps the rules above through the same front.
 
 pub use hickory_proto::*;
 

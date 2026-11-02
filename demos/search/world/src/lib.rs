@@ -121,7 +121,7 @@ pub fn net(
     let mut mirror = Mirror::new(Only::new(outbound.policy(), source), handle, &location)
         .namespace(&namespace)
         .observe(outbound.observer())
-        .observe(move |_request, _client, reply| sites.place(reply));
+        .observe(move |_request, _client, reply| sites.place(&reply.message));
     // Each public resolver's DNS over HTTPS names, such as
     // `cloudflare-dns.com`, have addresses of their own, where the mirror
     // places a front that puts queries to the resolver's primary address.
