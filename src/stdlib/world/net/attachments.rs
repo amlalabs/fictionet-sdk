@@ -30,9 +30,17 @@ pub(super) struct Hooks {
 }
 
 impl Hooks {
+    /// The sandbox that last bound `addr`, if one did.
+    pub(super) fn sandbox_of(&self, addr: IpAddr) -> Option<Sandbox> {
+        self.by_addr.lock().get(&addr).cloned()
+    }
+
+    /// The sandbox at `addr` as [`ServeOptions::sandbox`](fictionet::stdlib::services::serve::ServeOptions::sandbox)
+    /// reports it: one no sandbox bound has id 0, an empty name, and
+    /// `addr` as its address.
     pub(super) fn sandbox_at(&self, addr: IpAddr) -> Sandbox {
-        if let Some(s) = self.by_addr.lock().get(&addr) {
-            return s.clone();
+        if let Some(s) = self.sandbox_of(addr) {
+            return s;
         }
         let (v4, v6) = match addr {
             IpAddr::V4(a) => (Some(a), None),

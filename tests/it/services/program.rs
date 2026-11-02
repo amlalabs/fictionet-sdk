@@ -68,6 +68,9 @@ fn a_program_receives_and_sends_udp() {
                     let tx = tx.clone();
                     async move {
                         let mut socket = machine.udp.bind(5000)?;
+                        // An address no sandbox has is no sandbox's.
+                        let elsewhere = "203.0.113.9".parse().expect("an address");
+                        assert_eq!(machine.sandbox_of(elsewhere), None);
                         let _ = tx.send(());
                         loop {
                             let (bytes, from) = socket.recv(&fcx).await?;

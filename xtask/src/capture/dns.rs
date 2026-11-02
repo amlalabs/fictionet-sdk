@@ -24,16 +24,15 @@ use std::time::SystemTime;
 use fictionet::stdlib::protocols::dns::dnssec::Ring;
 use fictionet::stdlib::protocols::dns::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use fictionet::stdlib::protocols::dns::rr::{Name, RecordType};
-use fictionet::stdlib::services::dns::authority::{Ask, Observed};
 use fictionet::stdlib::services::dns::resolver::{Config, Resolver};
 use fictionet::stdlib::services::dns::{
     Action, Client, ClientQuery, Engine, ExchangeFailure, Input, Token, Transmit, WallClock,
 };
 use fictionet::stdlib::services::serve::Transport;
-use fictionet::stdlib::world::net::dns::Source;
+use fictionet::stdlib::world::net::dns::{Source, carry};
 use fictionet::sync::Mutex;
 use fictionet::{Cx, RaceError, Seed};
-use fictionet_extras::dns::Capture;
+use fictionet_extras::dns::{Capture, Replay};
 use fictionet_extras::models::{Provider, oauth::Login};
 use fictionet_host::dns::Live;
 
@@ -77,7 +76,7 @@ pub async fn record(root: &Path, hosts: &[String]) -> Result {
     let stamp = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)?
         .as_nanos();
-    let path = root.join(format!("zz-dns-{stamp}.warc.gz"));
+    let path = Replay::capture_file(root, stamp);
     let names: Vec<Name> = names.into_iter().collect();
     let count = names.len();
     let failed = Arc::new(Mutex::new(Vec::new()));
@@ -115,9 +114,8 @@ fn fqdn(host: &str) -> Result<Name> {
 /// One exchange the resolver started, on its way through the source.
 struct Flight<'a> {
     token: Token,
-    to: SocketAddr,
-    transport: Transport,
-    reply: Pin<Box<dyn Future<Output = Observed> + Send + 'a>>,
+    /// What it brings back for the resolver ([`carry`]).
+    input: Pin<Box<dyn Future<Output = Option<Input>> + Send + 'a>>,
 }
 
 /// Resolves each of `names` for each of [`TYPES`] with Unbound's
@@ -202,16 +200,16 @@ async fn walk(
         }
         let landed = poll_fn(|cx| {
             for (index, flight) in flights.iter_mut().enumerate() {
-                if let Poll::Ready(observed) = flight.reply.as_mut().poll(cx) {
-                    return Poll::Ready((index, observed));
+                if let Poll::Ready(input) = flight.input.as_mut().poll(cx) {
+                    return Poll::Ready((index, input));
                 }
             }
             Poll::Pending
         });
         match fcx.race(deadline, landed).await {
-            Ok((index, observed)) => {
-                let flight = flights.swap_remove(index);
-                inputs.extend(completion(&flight, observed));
+            Ok((index, input)) => {
+                flights.swap_remove(index);
+                inputs.extend(input);
             }
             Err(RaceError::Deadline) => inputs.push(Input::Tick),
             Err(RaceError::Cancelled) => {
@@ -248,33 +246,8 @@ fn client_query(
 
 /// Starts carrying `transmit` through `source`.
 fn flight<'a>(fcx: &'a Cx, source: &'a impl Source, transmit: Transmit) -> Flight<'a> {
-    let ask = Ask {
-        server: transmit.to,
-        transport: transmit.transport,
-        query: transmit.bytes,
-    };
     Flight {
         token: transmit.token,
-        to: transmit.to,
-        transport: transmit.transport,
-        reply: source.ask(fcx, ask),
-    }
-}
-
-/// What `observed` tells the engine about `flight`. Silence tells it
-/// nothing: its own deadline decides.
-fn completion(flight: &Flight<'_>, observed: Observed) -> Option<Input> {
-    match observed {
-        Observed::Reply(bytes) => Some(Input::Reply {
-            token: flight.token,
-            from: flight.to,
-            transport: flight.transport,
-            bytes,
-        }),
-        Observed::Unreachable => Some(Input::Failed {
-            token: flight.token,
-            failure: ExchangeFailure::Unreachable,
-        }),
-        Observed::Timeout => None,
+        input: Box::pin(carry(source, fcx, transmit)),
     }
 }

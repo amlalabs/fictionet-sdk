@@ -27,9 +27,7 @@ use fictionet::stdlib::codec::{Decode, Step};
 use fictionet::stdlib::network::{ConnError, ConnectionExt, tcp, udp};
 use fictionet::stdlib::protocols::dns::dnssec::Ring;
 use fictionet::stdlib::protocols::dns::{Framing, Parsed, Queries, Request, stream_framed};
-use fictionet::stdlib::services::dns::authority::{
-    Ask, Authority, AuthorityEngine, Observed, ServerConfig,
-};
+use fictionet::stdlib::services::dns::authority::{Authority, AuthorityEngine, ServerConfig};
 use fictionet::stdlib::services::dns::resolver::{Config, Resolver};
 use fictionet::stdlib::services::dns::{
     Action, Client, Engine, Event, ExchangeFailure, Generation, Input, Session, Token, Transmit,
@@ -41,7 +39,7 @@ use fictionet::time::Instant;
 use fictionet::{Cx, Entropy, RaceError};
 
 use super::super::{Endpoints, Program};
-use super::source::{Namespace, Source};
+use super::source::{Namespace, Source, carry};
 
 /// The port DNS servers answer on (RFC 1035 §4.2).
 const PORT: u16 = 53;
@@ -545,24 +543,8 @@ impl Carrier for ToSource {
             let Some(source) = source else {
                 return;
             };
-            let ask = Ask {
-                server: transmit.to,
-                transport: transmit.transport,
-                query: transmit.bytes,
-            };
-            let token = transmit.token;
-            match source.ask(&fcx, ask).await {
-                Observed::Reply(bytes) => deliver(Input::Reply {
-                    token,
-                    from: transmit.to,
-                    transport: transmit.transport,
-                    bytes,
-                }),
-                Observed::Unreachable => deliver(Input::Failed {
-                    token,
-                    failure: ExchangeFailure::Unreachable,
-                }),
-                Observed::Timeout => {}
+            if let Some(input) = carry(&*source, &fcx, transmit).await {
+                deliver(input);
             }
         })
     }
@@ -659,11 +641,7 @@ impl<E: Engine + Send + 'static> Driver<E> {
             local,
             transport,
             connection,
-            // A peer no sandbox has is reported with id 0.
-            sandbox: self
-                .machine
-                .sandbox_of(peer.ip())
-                .filter(|sandbox| sandbox.id != 0),
+            sandbox: self.machine.sandbox_of(peer.ip()),
         }
     }
 

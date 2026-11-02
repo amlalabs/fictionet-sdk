@@ -72,7 +72,7 @@ mod program;
 mod source;
 
 pub use program::{Authoritative, Recursive, ResolverHandle};
-pub use source::{Cached, Namespace, Only, PerSession, Question, Source};
+pub use source::{Cached, Namespace, Only, PerSession, Question, Source, carry};
 
 /// How long resolvers may keep the addresses of a host placed by
 /// [`placing`], in seconds: Unbound's default TTL for `local-data`.

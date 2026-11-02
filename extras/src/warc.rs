@@ -250,7 +250,7 @@ pub(crate) fn append_record(
 
 /// The archive files in `root`, oldest first by modification time, with
 /// ties broken by path, so a later capture replaces an earlier one.
-pub(crate) fn archive_files(root: &Path) -> io::Result<Vec<PathBuf>> {
+fn archive_files(root: &Path) -> io::Result<Vec<PathBuf>> {
     let mut files = std::fs::read_dir(root)?
         .map(|entry| entry.map(|e| e.path()))
         .collect::<io::Result<Vec<_>>>()?;

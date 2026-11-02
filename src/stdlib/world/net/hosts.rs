@@ -492,11 +492,10 @@ impl Endpoints {
         self.limits
     }
 
-    /// The sandbox that `peer` belongs to, as [`ServeOptions::sandbox`]
-    /// reports it: a peer that no sandbox has is reported with id 0, an
-    /// empty name, and `peer` as its address.
+    /// The sandbox that `peer` belongs to, or `None` for a peer that is no
+    /// sandbox.
     pub fn sandbox_of(&self, peer: IpAddr) -> Option<serve::Sandbox> {
-        Some(self.admission.hooks.sandbox_at(peer))
+        self.admission.hooks.sandbox_of(peer)
     }
 
     /// The service budget of the sandbox that `peer` belongs to
