@@ -154,6 +154,12 @@ fn ds(keys: &KeySet, apex: &str) -> RecordSet {
 /// When `signed`, the root, `com`, `org`, `example.com`, and `bad.com` are
 /// signed, and the second value holds the root's anchor.
 pub(super) fn internet(signed: bool) -> (MemoryNet, Option<Anchors>) {
+    internet_appending(signed, None)
+}
+
+/// [`internet`], with `appended` added to the authority section of every
+/// NXDOMAIN reply from `example.com`'s servers.
+fn internet_appending(signed: bool, appended: Option<Record>) -> (MemoryNet, Option<Anchors>) {
     let root_keys = keys(10);
     let com_keys = keys(20);
     let org_keys = keys(30);
@@ -281,10 +287,20 @@ pub(super) fn internet(signed: bool) -> (MemoryNet, Option<Anchors>) {
     let mut serve = |address: &str, zone: Zone| {
         let local = SocketAddr::new(ip(address), 53);
         let zones = Zones::new(vec![Arc::new(zone) as Arc<dyn ZoneData>]);
-        net.serve(
-            ip(address),
-            AuthorityEngine::new(zones, ServerConfig::generic(), local),
-        );
+        match &appended {
+            Some(record) if address == EXAMPLE || address == EXAMPLE_TOO => net.serve(
+                ip(address),
+                AuthorityEngine::new(
+                    Appending(zones, record.clone()),
+                    ServerConfig::generic(),
+                    local,
+                ),
+            ),
+            _ => net.serve(
+                ip(address),
+                AuthorityEngine::new(zones, ServerConfig::generic(), local),
+            ),
+        }
     };
     serve(ROOT, root);
     serve(COM, com);
@@ -302,6 +318,31 @@ pub(super) fn internet(signed: bool) -> (MemoryNet, Option<Anchors>) {
     );
     let anchors = signed.then(|| Anchors::of(vec![root_keys.anchor(&Name::root())]));
     (net, anchors)
+}
+
+/// The zones' server, which adds a record to the authority section of
+/// every NXDOMAIN reply.
+struct Appending(Zones, Record);
+
+impl Authority for Appending {
+    fn respond(
+        &self,
+        req: &Request,
+        local: SocketAddr,
+        server: &ServerConfig,
+        client: &Client,
+        known: &dyn Known,
+    ) -> Step {
+        match self.0.respond(req, local, server, client, known) {
+            Step::Reply(mut response)
+                if response.message.metadata.response_code == ResponseCode::NXDomain =>
+            {
+                response.message.add_authority(self.1.clone());
+                Step::Reply(response)
+            }
+            step => step,
+        }
+    }
 }
 
 /// A broken server: it answers every question with a referral to `org`,
@@ -1459,6 +1500,52 @@ fn rd_clear_is_refused_or_answered_from_the_cache_alone() {
     assert_eq!(net.recording().exchanges().len(), before);
 }
 
+/// With RD clear, an alias the cache holds goes in the answer, and the
+/// referral is for its target, which the cache does not hold, as a server
+/// answering from its cache does (RFC 1034 §4.3.2 steps 3a and 4).
+#[test]
+fn rd_clear_follows_a_cached_alias_and_refers_for_its_target() {
+    let (mut net, _) = internet(false);
+    let norec = |m: &mut Message| m.metadata.recursion_desired = false;
+    let mut google = resolver(Config {
+        rd0_from_cache: true,
+        ..config(None)
+    });
+    // The cache holds the alias, not its target in `example.org`.
+    ask(
+        &mut google,
+        &mut net,
+        0,
+        query(client(1), "away.example.com.", RecordType::CNAME, |_| {}),
+    );
+    let before = net.recording().exchanges().len();
+    let reply = ask(
+        &mut google,
+        &mut net,
+        1,
+        query(client(1), "away.example.com.", RecordType::A, norec),
+    );
+    assert_eq!(net.recording().exchanges().len(), before);
+    assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+    let cnames: Vec<(String, u32)> = reply
+        .answers
+        .iter()
+        .filter(|record| record.record_type() == RecordType::CNAME)
+        .map(|record| (record.name.to_string(), record.ttl))
+        .collect();
+    assert_eq!(cnames, [("away.example.com.".to_string(), 599)]);
+    // The closest delegation for `www.example.org.` the cache holds is
+    // the root's, not `example.com`'s.
+    let ns: Vec<String> = reply
+        .authorities
+        .iter()
+        .filter(|record| record.record_type() == RecordType::NS)
+        .map(|record| record.name.to_string())
+        .collect();
+    assert!(!ns.is_empty());
+    assert!(ns.iter().all(|owner| owner == "."), "{ns:?}");
+}
+
 #[test]
 fn chaos_questions_are_answered_from_the_identity() {
     let (mut net, _) = internet(false);
@@ -1528,6 +1615,48 @@ fn validated_nsec_records_deny_other_names_they_cover_without_asking() {
     assert!(net.recording().exchanges().len() > before);
 }
 
+/// An NSEC record that does not verify never makes a denial Secure and
+/// is never kept to deny other names: here every NXDOMAIN of
+/// `example.com` carries an unsigned NSEC that would cover `www`, which
+/// exists.
+#[test]
+fn an_nsec_record_that_does_not_verify_denies_nothing() {
+    use fictionet::stdlib::protocols::dns::dnssec::rdata::{DNSSECRData, NSEC};
+    let forged = Record::from_rdata(
+        name("nz.example.com."),
+        300,
+        RData::DNSSEC(DNSSECRData::NSEC(NSEC::new_cover_self(
+            name("zzzz.example.com."),
+            [RecordType::A],
+        ))),
+    );
+    let (mut net, anchors) = internet_appending(true, Some(forged));
+    let mut resolver = resolver(config(anchors));
+    let reply = ask(
+        &mut resolver,
+        &mut net,
+        0,
+        query(client(1), "nx.example.com.", RecordType::A, dnssec_ok),
+    );
+    // Unbound fails a reply with any authority RRset that does not verify.
+    assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
+    assert!(!reply.metadata.authentic_data);
+    let before = net.recording().exchanges().len();
+    let reply = ask(
+        &mut resolver,
+        &mut net,
+        1,
+        query(client(1), "www.example.com.", RecordType::A, dnssec_ok),
+    );
+    assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(addresses(&reply), ["192.0.2.80"]);
+    assert!(reply.metadata.authentic_data);
+    assert!(
+        net.recording().exchanges().len() > before,
+        "asked, not denied"
+    );
+}
+
 #[test]
 fn a_forwarder_sends_the_whole_question_with_rd_and_takes_the_answer() {
     let (mut net, _) = internet(false);
@@ -1552,6 +1681,88 @@ fn a_forwarder_sends_the_whole_question_with_rd_and_takes_the_answer() {
     assert_eq!(message.queries[0].name(), &name("x.y.example.com."));
     // dnsmasq does not validate: CD is clear upstream.
     assert!(!message.metadata.checking_disabled);
+}
+
+/// An upstream that validates, playing a zone whose signatures fail: it
+/// answers SERVFAIL to a question without CD, and the data to one with
+/// CD (RFC 4035 §3.2.2).
+struct Validating;
+
+impl Authority for Validating {
+    fn respond(
+        &self,
+        req: &Request,
+        _local: SocketAddr,
+        _server: &ServerConfig,
+        _client: &Client,
+        _known: &dyn Known,
+    ) -> Step {
+        let query = &req.message.metadata;
+        let mut message = Message::response(query.id, query.op_code);
+        message.metadata.recursion_desired = req.rd;
+        message.metadata.checking_disabled = req.cd;
+        message.metadata.recursion_available = true;
+        message.add_query(req.question.clone());
+        if req.cd {
+            message.add_answer(Record::from_rdata(
+                req.question.name().clone(),
+                300,
+                a("192.0.2.98"),
+            ));
+        } else {
+            message.metadata.response_code = ResponseCode::ServFail;
+        }
+        Step::Reply(Response {
+            message,
+            required_additional: 0,
+        })
+    }
+}
+
+/// dnsmasq without DNSSEC passes a client's CD bit on, so a client that
+/// sets CD gets the data a validating upstream fails, even just after a
+/// client without CD got the upstream's SERVFAIL.
+#[test]
+fn a_forwarder_that_does_not_validate_passes_cd_on() {
+    let upstream = SocketAddr::new(ip(EXAMPLE), 53);
+    let mut net = MemoryNet::new();
+    net.serve(
+        ip(EXAMPLE),
+        AuthorityEngine::new(Validating, ServerConfig::generic(), upstream),
+    );
+    let mut dnsmasq = resolver(Config::dnsmasq(vec![upstream]));
+    let reply = ask(
+        &mut dnsmasq,
+        &mut net,
+        0,
+        query(client(1), "www.bad.com.", RecordType::A, dnssec_ok),
+    );
+    assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
+    let checking_disabled = |message: &mut Message| {
+        message.metadata.checking_disabled = true;
+        dnssec_ok(message);
+    };
+    let reply = ask(
+        &mut dnsmasq,
+        &mut net,
+        1,
+        query(client(2), "www.bad.com.", RecordType::A, checking_disabled),
+    );
+    assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(addresses(&reply), ["192.0.2.98"]);
+    assert!(!reply.metadata.authentic_data);
+    let cd: Vec<bool> = net
+        .recording()
+        .exchanges()
+        .iter()
+        .map(|(ask, _)| {
+            Message::from_vec(&ask.query)
+                .unwrap()
+                .metadata
+                .checking_disabled
+        })
+        .collect();
+    assert_eq!(cd, [false, true]);
 }
 
 #[test]
@@ -1676,6 +1887,73 @@ fn expired_data_answers_a_client_kept_waiting_while_the_resolution_goes_on() {
             ..
         })
     ));
+}
+
+/// Stale data is served only as fresh data would be: data a client with
+/// CD set fetched, which no check validated, never reaches a client that
+/// asked for validation once it expires, on failure or on the client
+/// timeout.
+#[test]
+fn stale_data_no_check_validated_never_reaches_a_validating_client() {
+    // The client timeout comes before the resolution fails, then after.
+    for client_timeout in [Duration::from_millis(1800), Duration::from_secs(60)] {
+        let (mut net, anchors) = internet(true);
+        let mut resolver = resolver(Config {
+            anchors,
+            serve_stale: Some(fictionet::stdlib::services::dns::resolver::Stale {
+                max_stale: Duration::from_secs(86400),
+                reply_ttl: Duration::from_secs(30),
+                client_timeout,
+            }),
+            ..config(None)
+        });
+        let checking_disabled = |message: &mut Message| {
+            message.metadata.checking_disabled = true;
+            dnssec_ok(message);
+        };
+        let reply = ask(
+            &mut resolver,
+            &mut net,
+            0,
+            query(client(1), "www.bad.com.", RecordType::A, checking_disabled),
+        );
+        assert_eq!(addresses(&reply), ["192.0.2.98"]);
+        let reply = ask(
+            &mut resolver,
+            &mut net,
+            1,
+            query(client(1), "www.bad.com.", RecordType::A, dnssec_ok),
+        );
+        assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
+        // After the Bogus result's failure TTL, a client with CD set
+        // fetches the data again, unchecked.
+        ask(
+            &mut resolver,
+            &mut net,
+            6,
+            query(client(1), "www.bad.com.", RecordType::A, checking_disabled),
+        );
+        net.lose(|transmit| transmit.to.ip() == ip(BAD));
+        let entropy = entropy();
+        resolver.handle(
+            Input::Query(query(client(2), "www.bad.com.", RecordType::A, dnssec_ok)),
+            at(400),
+            &entropy,
+        );
+        let mut answers = pump(&mut resolver, &mut net, at(400), Vec::new());
+        while answers.is_empty() {
+            let now = resolver.next_deadline().expect("the resolution goes on");
+            resolver.handle(Input::Tick, now, &entropy);
+            answers = pump(&mut resolver, &mut net, now, Vec::new());
+        }
+        let reply = Message::from_vec(&answers[0].bytes).unwrap();
+        assert_eq!(
+            reply.metadata.response_code,
+            ResponseCode::ServFail,
+            "{client_timeout:?}: {reply:?}"
+        );
+        assert!(addresses(&reply).is_empty());
+    }
 }
 
 /// Serves `zones` at `address` in `net`.
@@ -2635,4 +2913,166 @@ fn a_query_with_rd_clear_never_gets_data_no_check_validated() {
             .iter()
             .any(|record| record.record_type() == RecordType::NS)
     );
+}
+
+/// A check's result goes to the RRset it checked. Here the signed RRset
+/// expires while its check waits for a DS reply, and other, unsigned data
+/// is stored at the key by a client with CD set. The Secure result for
+/// the old data must not mark the new data Secure: under a signed
+/// delegation, unsigned data is Bogus.
+#[test]
+fn a_check_result_lands_only_on_the_rrset_it_checked() {
+    let (mut net, anchors) = internet(true);
+    let mut resolver = resolver(Config {
+        max_ttl: Duration::from_secs(1),
+        retransmit: Duration::from_secs(5),
+        server_ttl: Duration::from_nanos(1),
+        ..config(anchors)
+    });
+    let entropy = entropy();
+    let ms = |millis: u64| at(0) + Duration::from_millis(millis);
+    let checking_disabled = |message: &mut Message| {
+        message.metadata.checking_disabled = true;
+        dnssec_ok(message);
+    };
+    // Carries transmits through `net`, holding back the DS question to
+    // com when `hold`, and gathers the answers by client port.
+    let pump = |resolver: &mut Resolver,
+                net: &mut MemoryNet,
+                now: Instant,
+                hold: bool,
+                held: &mut Vec<fictionet::stdlib::services::dns::Transmit>,
+                answers: &mut Vec<(u16, Message)>| {
+        loop {
+            let mut acted = false;
+            while let Some(action) = resolver.poll() {
+                match action {
+                    Action::Send(transmit) => {
+                        acted = true;
+                        let sent = Message::from_vec(&transmit.bytes).unwrap();
+                        let ds = sent.queries[0].query_type() == RecordType::DS;
+                        if hold && transmit.to.ip() == ip(COM) && ds {
+                            held.push(transmit);
+                            continue;
+                        }
+                        for input in net.exchange(&transmit, now, &entropy) {
+                            resolver.handle(input, now, &entropy);
+                        }
+                    }
+                    Action::Answer(answer) => {
+                        acted = true;
+                        let message = Message::from_vec(&answer.bytes).unwrap();
+                        answers.push((answer.client.peer.port(), message));
+                    }
+                    Action::Abandon(_) | Action::Event(_) => {}
+                }
+            }
+            if !acted {
+                return;
+            }
+        }
+    };
+    let (mut held, mut answers) = (Vec::new(), Vec::new());
+    resolver.handle(
+        Input::Query(query(
+            client(1),
+            "www.example.com.",
+            RecordType::A,
+            dnssec_ok,
+        )),
+        ms(0),
+        &entropy,
+    );
+    pump(
+        &mut resolver,
+        &mut net,
+        ms(0),
+        true,
+        &mut held,
+        &mut answers,
+    );
+    assert!(answers.is_empty(), "the answer waits on the DS");
+    assert_eq!(held.len(), 1);
+
+    // The zone changes: `www` now has other data, unsigned.
+    let changed = builder("example.com.", "ns1.example.com.")
+        .rrset(rrset(
+            "ns1.example.com.",
+            3600,
+            vec![a(EXAMPLE), a(EXAMPLE_TOO)],
+        ))
+        .rrset(rrset("www.example.com.", 300, vec![a("203.0.113.66")]))
+        .build()
+        .unwrap();
+    serve_at(&mut net, EXAMPLE, vec![changed.clone()]);
+    serve_at(&mut net, EXAMPLE_TOO, vec![changed]);
+    resolver.handle(
+        Input::Query(query(
+            client(2),
+            "www.example.com.",
+            RecordType::A,
+            checking_disabled,
+        )),
+        ms(1500),
+        &entropy,
+    );
+    pump(
+        &mut resolver,
+        &mut net,
+        ms(1500),
+        false,
+        &mut held,
+        &mut answers,
+    );
+
+    // The held DS reply arrives inside its wait, and the check of the
+    // old data concludes.
+    let transmit = held.remove(0);
+    for input in net.exchange(&transmit, ms(2000), &entropy) {
+        resolver.handle(input, ms(2000), &entropy);
+    }
+    pump(
+        &mut resolver,
+        &mut net,
+        ms(2000),
+        false,
+        &mut held,
+        &mut answers,
+    );
+    resolver.handle(
+        Input::Query(query(
+            client(3),
+            "www.example.com.",
+            RecordType::A,
+            dnssec_ok,
+        )),
+        ms(2100),
+        &entropy,
+    );
+    pump(
+        &mut resolver,
+        &mut net,
+        ms(2100),
+        false,
+        &mut held,
+        &mut answers,
+    );
+
+    let answer = |port: u16| {
+        answers
+            .iter()
+            .find(|(from, _)| *from == port)
+            .map(|(_, message)| message)
+            .unwrap_or_else(|| panic!("client {port} was answered"))
+    };
+    assert_eq!(addresses(answer(2)), ["203.0.113.66"]);
+    for port in [1, 3] {
+        let reply = answer(port);
+        assert!(
+            !(reply.metadata.authentic_data && addresses(reply) == ["203.0.113.66"]),
+            "client {port}: unsigned data marked Secure: {reply:?}"
+        );
+    }
+    let reply = answer(3);
+    assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
 }

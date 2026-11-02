@@ -27,9 +27,7 @@ use fictionet::stdlib::protocols::dns::rr::{
 use fictionet::stdlib::protocols::dns::{Parsed, Request, Response};
 use fictionet::stdlib::services::dns::Client;
 use fictionet::stdlib::services::dns::authority::{Ask, Observed};
-use fictionet::stdlib::services::dns::zone::{
-    Denied, Fact, Node, Revision, View, ZoneData, special,
-};
+use fictionet::stdlib::services::dns::zone::{Shown, View, ZoneData, special};
 use fictionet::stdlib::world::net::dns::internet::{Egress, Location};
 use fictionet::stdlib::world::net::dns::{PerSession, Source};
 use fictionet::sync::Mutex;
@@ -478,13 +476,14 @@ impl Source for Copied {
 /// The hosts a Copied session serves whose DNS capture gives them no IPv4
 /// address, as a local zone of the world's own resolver: a host that
 /// went away, or kept only IPv6 addresses, after its pages were copied,
-/// on a network with no IPv6. The resolver answers such a host from here,
-/// with the address of a machine `place` puts for it, so its copied pages
-/// can still be reached. Every other name, and every name in the other
-/// modes, is left to the real hierarchy.
+/// on a network with no IPv6. The resolver answers an A question for such
+/// a host from here, with the address of a machine `place` puts for it,
+/// so its copied pages can still be reached. That address is all the zone
+/// knows: every other type at the host, every other name, and every name
+/// in the other modes, is left to the real hierarchy or the capture.
 pub(crate) struct Uncaptured {
-    root: LowerName,
-    soa: RecordSet,
+    root: Name,
+    apex: LowerName,
     pages: Arc<Pages>,
     place: Box<Place>,
 }
@@ -501,8 +500,8 @@ impl Uncaptured {
     ) -> Uncaptured {
         let root = Name::root();
         Uncaptured {
-            soa: special::local_apex(&root, special::LOCAL_TTL).0,
-            root: LowerName::new(&root),
+            apex: LowerName::new(&root),
+            root,
             pages,
             place: Box::new(place),
         }
@@ -522,62 +521,30 @@ impl Uncaptured {
 
 impl ZoneData for Uncaptured {
     fn apex(&self) -> &LowerName {
-        &self.root
+        &self.apex
     }
 
     fn view(&self, question: &Query) -> Arc<dyn View + Send + Sync> {
         let name = LowerName::new(question.name());
-        let address = self
-            .uncaptured(&name)
+        let address = (question.query_type() == RecordType::A && self.uncaptured(&name))
             .then(|| (self.place)(&name))
             .flatten();
-        let Some(address) = address else {
-            return Arc::new(Unknown {
-                apex: self.root.clone(),
-                soa: self.soa.clone(),
-            });
+        let shown = match address {
+            Some(address) => {
+                let owner = Name::from(name);
+                let mut a = RecordSet::with_ttl(owner.clone(), RecordType::A, special::LOCAL_TTL);
+                a.set_records(vec![Record::from_rdata(
+                    owner.clone(),
+                    special::LOCAL_TTL,
+                    RData::A(A(address)),
+                )]);
+                Shown::new(&owner, [a])
+            }
+            None => Shown::new(&self.root, []),
         };
-        // A zone of the host's own, holding its address.
-        let owner = Name::from(name);
-        let mut a = RecordSet::with_ttl(owner.clone(), RecordType::A, special::LOCAL_TTL);
-        a.set_records(vec![Record::from_rdata(
-            owner.clone(),
-            special::LOCAL_TTL,
-            RData::A(A(address)),
-        )]);
-        let zone = special::local_zone(&owner, special::LOCAL_TTL)
-            .rrset(a)
-            .build()
-            .expect("a zone of one host's address is well formed");
-        Arc::new(zone)
-    }
-}
-
-/// A view that knows nothing, so the resolver asks the real hierarchy.
-struct Unknown {
-    apex: LowerName,
-    soa: RecordSet,
-}
-
-impl View for Unknown {
-    fn apex(&self) -> &LowerName {
-        &self.apex
-    }
-
-    fn revision(&self) -> Revision {
-        Revision(0)
-    }
-
-    fn soa(&self) -> &RecordSet {
-        &self.soa
-    }
-
-    fn node(&self, _name: &LowerName) -> Fact<&Node> {
-        Fact::Unknown
-    }
-
-    fn denial(&self, _name: &LowerName, _kind: Denied) -> Fact<Vec<RecordSet>> {
-        Fact::Unknown
+        shown
+            .expect("the host's own A RRset belongs to it")
+            .view(question)
     }
 }
 

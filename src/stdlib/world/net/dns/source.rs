@@ -170,26 +170,15 @@ impl Question {
 pub struct Cached<S> {
     source: S,
     namespace: Option<Namespace>,
-    replies: Mutex<Replies>,
+    replies: PerSession<Replies>,
 }
 
 /// The replies [`Cached`] keeps for one session.
+#[derive(Default)]
 struct Replies {
-    generation: Generation,
     kept: HashMap<Kept, (Vec<u8>, Instant)>,
     /// How many replies were kept after the last sweep of expired ones.
     swept: usize,
-}
-
-impl Replies {
-    /// None yet, for session `generation`.
-    fn new(generation: Generation) -> Replies {
-        Replies {
-            generation,
-            kept: HashMap::new(),
-            swept: 0,
-        }
-    }
 }
 
 /// What makes two asks the same for [`Cached`].
@@ -208,7 +197,7 @@ impl<S: Source> Cached<S> {
         Cached {
             source,
             namespace: None,
-            replies: Mutex::new(Replies::new(Generation(0))),
+            replies: PerSession::new(),
         }
     }
 
@@ -248,17 +237,15 @@ impl<S: Source> Source for Cached<S> {
             };
             let now = fcx.now();
             let generation = self.generation();
-            {
-                let mut replies = self.replies.lock();
-                if replies.generation != generation {
-                    *replies = Replies::new(generation);
-                }
-                if let Some((reply, until)) = replies.kept.get(&question)
-                    && *until > now
-                    && let Ok(bytes) = restore(reply, &request)
-                {
-                    return Observed::Reply(bytes);
-                }
+            let kept = self.replies.with(generation, |replies| {
+                replies
+                    .kept
+                    .get(&question)
+                    .filter(|(_, until)| *until > now)
+                    .and_then(|(reply, _)| restore(reply, &request).ok())
+            });
+            if let Some(bytes) = kept {
+                return Observed::Reply(bytes);
             }
             let observed = self.source.ask(fcx, ask).await;
             if let Observed::Reply(bytes) = &observed
@@ -266,14 +253,13 @@ impl<S: Source> Source for Cached<S> {
                 && ttl > 0
             {
                 let until = now + Duration::from_secs(u64::from(ttl));
-                let mut replies = self.replies.lock();
-                if replies.generation == generation {
+                self.replies.with(generation, |replies| {
                     replies.kept.insert(question, (bytes.clone(), until));
                     if replies.kept.len() >= 2 * replies.swept.max(64) {
                         replies.kept.retain(|_, (_, until)| *until > now);
                         replies.swept = replies.kept.len();
                     }
-                }
+                });
             }
             observed
         })
@@ -356,9 +342,16 @@ impl<T: Default> PerSession<T> {
 
     /// `f` with the state of session `generation`, made afresh first when
     /// the state belongs to an earlier session.
+    ///
+    /// A caller still working for a session that has since ended gets
+    /// fresh state of its own, which is dropped afterwards, so nothing it
+    /// does reaches the later session's state.
     pub fn with<R>(&self, generation: Generation, f: impl FnOnce(&mut T) -> R) -> R {
         let mut state = self.state.lock();
-        if state.0 != generation {
+        if generation < state.0 {
+            return f(&mut T::default());
+        }
+        if generation > state.0 {
             *state = (generation, T::default());
         }
         f(&mut state.1)

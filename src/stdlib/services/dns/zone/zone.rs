@@ -763,7 +763,7 @@ pub(super) fn union(
 
 /// The names an NS, MX, or SRV RRset points at, whose addresses go in the
 /// additional section (RFC 1034 §4.3.2 step 6).
-pub(super) fn targets(set: &RecordSet) -> Vec<LowerName> {
+pub(crate) fn targets(set: &RecordSet) -> Vec<LowerName> {
     set.records_without_rrsigs()
         .filter_map(|record| match &record.data {
             RData::NS(ns) => Some(LowerName::new(&ns.0)),

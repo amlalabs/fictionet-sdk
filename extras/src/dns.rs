@@ -252,9 +252,12 @@ pub struct Replay {
     replies: HashMap<Question, Vec<(SocketAddr, Vec<u8>, usize)>>,
     /// The zones each server address serves, by the capture's NS records.
     zones: HashMap<IpAddr, Vec<LowerName>>,
-    /// The names a recorded reply to an A question gave an IPv4 address.
-    resolved: HashSet<LowerName>,
-    captured: Vec<String>,
+    /// The owners of the A records in the answers to recorded A questions.
+    addressed: HashSet<LowerName>,
+    /// The target of each CNAME record in a recorded answer, by owner.
+    aliases: HashMap<LowerName, LowerName>,
+    /// When the newest recorded reply was captured.
+    newest: Option<time::OffsetDateTime>,
 }
 
 impl Replay {
@@ -308,18 +311,24 @@ impl Replay {
                 };
                 if let Ok(message) = read_message(&reply) {
                     learn(&message, &mut ns, &mut addresses);
-                    let addressed = message
-                        .answers
-                        .iter()
-                        .any(|record| matches!(record.data, RData::A(_)));
-                    if request.question.query_type() == RecordType::A && addressed {
-                        replay
-                            .resolved
-                            .insert(LowerName::new(request.question.name()));
+                    let asks_address = request.question.query_type() == RecordType::A;
+                    for record in &message.answers {
+                        let owner = LowerName::new(&record.name);
+                        match &record.data {
+                            RData::A(_) if asks_address => {
+                                replay.addressed.insert(owner);
+                            }
+                            RData::CNAME(target) => {
+                                replay.aliases.insert(owner, LowerName::new(&target.0));
+                            }
+                            _ => {}
+                        }
                     }
                 }
-                if let Some(date) = fields.get("warc-date") {
-                    replay.captured.push(date.clone());
+                if let Some(text) = fields.get("warc-date") {
+                    let date = warc::parse_date(text)
+                        .ok_or_else(|| invalid("a DNS response whose WARC-Date is no date"))?;
+                    replay.newest = replay.newest.max(Some(date));
                 }
                 let replies = replay.replies.entry(Question::of(&request)).or_default();
                 replies.retain(|(recorded, _, _)| *recorded != server);
@@ -362,15 +371,33 @@ impl Replay {
         root.join(format!("{CAPTURE_PREFIX}{stamp}{CAPTURE_SUFFIX}"))
     }
 
-    /// Whether a recorded reply to an A question for `name` gives an IPv4
-    /// address, the name's own or one at the end of its CNAME chain.
+    /// Whether the recorded replies give `name` an IPv4 address: an A
+    /// record of its own in the answer to an A question, or one at the end
+    /// of its CNAME chain. A chain that crosses zones is recorded as
+    /// several replies, each alias from its own zone's servers and the
+    /// address from the last one's, and is followed across them.
     pub fn resolves(&self, name: &LowerName) -> bool {
-        self.resolved.contains(name)
+        let mut seen = HashSet::new();
+        let mut name = name;
+        loop {
+            if self.addressed.contains(name) {
+                return true;
+            }
+            // A chain that comes back to a name it passed has no end.
+            if !seen.insert(name) {
+                return false;
+            }
+            match self.aliases.get(name) {
+                Some(target) => name = target,
+                None => return false,
+            }
+        }
     }
 
-    /// The `WARC-Date` of every recorded reply.
-    pub fn capture_times(&self) -> impl Iterator<Item = &str> {
-        self.captured.iter().map(String::as_str)
+    /// When the newest recorded reply was captured, by its `WARC-Date`, or
+    /// `None` when the capture holds no reply.
+    pub fn newest_capture(&self) -> Option<time::OffsetDateTime> {
+        self.newest
     }
 
     /// The reply for `request` sent to `server`: the recorded reply to the
@@ -520,7 +547,7 @@ mod tests {
     };
     use fictionet::stdlib::protocols::dns::op::{Edns, MessageType, OpCode, Query};
     use fictionet::stdlib::protocols::dns::rr::Record;
-    use fictionet::stdlib::protocols::dns::rr::rdata::{A, NS};
+    use fictionet::stdlib::protocols::dns::rr::rdata::{A, CNAME, NS};
     use fictionet::stdlib::services::serve::Transport;
     use std::net::Ipv4Addr;
     use std::sync::Arc;
@@ -750,9 +777,14 @@ mod tests {
                 ask(A_ROOT, query(2, "com.", RecordType::NS, Some(false))),
                 ask(COM, query(3, "www.example.com.", RecordType::A, None)),
             ];
+            // WARC-Date has whole seconds.
+            let before = time::OffsetDateTime::now_utc()
+                .replace_nanosecond(0)
+                .unwrap();
             let observed = capture(&fcx, &path, asks.clone()).await;
             let replay = Replay::open([path.clone()]).unwrap();
-            assert_eq!(replay.capture_times().count(), 3);
+            let newest = replay.newest_capture().expect("a capture time");
+            assert!(before <= newest && newest <= time::OffsetDateTime::now_utc());
             for (ask, observed) in asks.into_iter().zip(observed) {
                 assert_eq!(replay.ask(&fcx, ask).await, observed);
             }
@@ -774,7 +806,84 @@ mod tests {
                 ["https://www.example.com/"]
             );
             let replay = Replay::open([path.clone()]).unwrap();
-            assert_eq!(replay.capture_times().count(), 3);
+            assert_eq!(replay.newest_capture(), Some(newest));
+        });
+    }
+
+    /// Every form of WARC-Date that WARC 1.1 allows names its instant, and
+    /// anything else names none.
+    #[test]
+    fn warc_dates_read_in_every_w3c_form() {
+        let at = |text: &str| warc::parse_date(text).map(|at| at.unix_timestamp());
+        assert_eq!(at("2026-11-02T16:06:07Z"), Some(1_793_635_567));
+        assert_eq!(at("2026-11-02T16:06:07.25Z"), Some(1_793_635_567));
+        assert_eq!(at("2026-11-02T17:06:07+01:00"), Some(1_793_635_567));
+        assert_eq!(at("2026-11-02T16:06Z"), Some(1_793_635_560));
+        assert_eq!(at("2026-11-02"), Some(1_793_577_600));
+        assert_eq!(at("2026-11"), Some(1_793_491_200));
+        assert_eq!(at("2026"), Some(1_767_225_600));
+        for wrong in [
+            "",
+            "yesterday",
+            "2026-13-01",
+            "2026-11-02T16:06:07",
+            "26-11-02",
+        ] {
+            assert_eq!(at(wrong), None, "{wrong}");
+        }
+    }
+
+    /// Recorded answers to A questions, where a name's alias leads into
+    /// another zone and the address comes from that zone's servers in a
+    /// reply of its own.
+    struct Aliased;
+
+    impl Source for Aliased {
+        fn ask<'a>(
+            &'a self,
+            _fcx: &'a Cx,
+            ask: Ask,
+        ) -> Pin<Box<dyn Future<Output = Observed> + Send + 'a>> {
+            let Parsed::Request(request) = Request::parse(&ask.query, ask.transport) else {
+                return Box::pin(ready(Observed::Timeout));
+            };
+            let qname = request.question.name().clone();
+            let mut reply = Message::response(request.message.metadata.id, OpCode::Query);
+            reply.metadata.authoritative = true;
+            reply.add_query(request.question.clone());
+            let data = match qname.to_ascii().as_str() {
+                "www.example.com." => RData::CNAME(CNAME(name("edge.cdn.net."))),
+                "loop.example.com." => RData::CNAME(CNAME(name("back.example.com."))),
+                "back.example.com." => RData::CNAME(CNAME(name("loop.example.com."))),
+                _ => RData::A(A::new(192, 0, 2, 80)),
+            };
+            reply.add_answer(Record::from_rdata(qname, 300, data));
+            Box::pin(ready(Observed::Reply(reply.to_vec().unwrap())))
+        }
+    }
+
+    #[test]
+    fn a_name_resolves_through_an_alias_into_another_zone() {
+        let path = archive("cross-zone");
+        run(async move |fcx| {
+            let cdn = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 53)), 53);
+            let capture = Capture::new(Aliased);
+            for (server, qname) in [
+                (COM, "www.example.com."),
+                (cdn, "edge.cdn.net."),
+                (COM, "loop.example.com."),
+                (COM, "back.example.com."),
+            ] {
+                let asked = ask(server, query(1, qname, RecordType::A, Some(true)));
+                capture.ask(&fcx, asked).await;
+            }
+            capture.write(&path).unwrap();
+            let replay = Replay::open([path.clone()]).unwrap();
+            let resolves = |text: &str| replay.resolves(&LowerName::new(&name(text)));
+            assert!(resolves("www.example.com."));
+            assert!(resolves("edge.cdn.net."));
+            assert!(!resolves("loop.example.com."));
+            assert!(!resolves("mail.example.com."));
         });
     }
 

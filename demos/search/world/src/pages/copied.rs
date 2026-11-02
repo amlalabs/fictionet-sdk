@@ -63,13 +63,7 @@ impl Corpus {
 
     /// When the DNS captured beside the pages was last recorded.
     fn dns_newest(&self) -> Option<time::OffsetDateTime> {
-        self.dns
-            .capture_times()
-            .filter_map(|text| {
-                time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339)
-                    .ok()
-            })
-            .max()
+        self.dns.newest_capture()
     }
 
     /// Every host Copied serves: the search engines, the captured research

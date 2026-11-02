@@ -66,7 +66,7 @@ mod front;
 mod resolution;
 mod servers;
 
-pub use cache::{Cache, Entry, FailureKind, Key, Limits, Negative, Offer, Rank};
+pub use cache::{Cache, Checked, Entry, FailureKind, Key, Limits, Negative, Offer, Rank};
 pub use config::{Config, Minimise, NameServer, ROOT_SERVERS, Stale, Work, root_hints};
 
 use resolution::{AskerId, CheckId, Graph, LookupId, Outcome, Subject, TreeId};
@@ -91,8 +91,9 @@ pub struct Resolver<V: Verify = Ring> {
     /// The front's view of `config`, for the header and EDNS rules
     /// authoritative servers and resolvers share.
     server: ServerConfig,
-    /// The local zones, in the order they were added.
-    local: Vec<Arc<dyn ZoneData>>,
+    /// The local zones, in the order they were added, each with whether
+    /// its answers keep their AA bit.
+    local: Vec<(Arc<dyn ZoneData>, bool)>,
     verify: V,
     clock: WallClock,
     tokens: Tokens,
@@ -188,10 +189,14 @@ impl<V: Verify> Resolver<V> {
             ask_timeout: config.retransmit,
             recursion_available: true,
         };
-        let mut local = config.local.clone();
+        let mut local: Vec<(Arc<dyn ZoneData>, bool)> = config
+            .local
+            .iter()
+            .map(|zone| (zone.clone(), config.local_aa))
+            .collect();
         if !config.ddr.is_empty() {
             let zone = special::resolver_arpa(config.ddr.clone(), config.ddr_ttl);
-            local.push(Arc::new(zone));
+            local.push((Arc::new(zone), config.ddr_aa));
         }
         let servers = Servers::new(config.retransmit, config.server_ttl);
         let limits = Limits {
@@ -293,16 +298,20 @@ impl<V: Verify> Resolver<V> {
     /// deepest zone first, and at equal depth the zone added last.
     fn answer_locally(&self, request: &Request) -> Option<Vec<u8>> {
         let qname = LowerName::new(request.question.name());
-        let mut zones: Vec<(usize, &Arc<dyn ZoneData>)> = self
+        let mut zones: Vec<(usize, &(Arc<dyn ZoneData>, bool))> = self
             .local
             .iter()
             .enumerate()
-            .filter(|(_, zone)| zone.apex().zone_of(&qname))
+            .filter(|(_, (zone, _))| zone.apex().zone_of(&qname))
             .collect();
-        zones.sort_by_key(|(index, zone)| std::cmp::Reverse((zone.apex().num_labels(), *index)));
-        zones.into_iter().find_map(|(_, zone)| {
+        zones.sort_by_key(|(index, (zone, _))| {
+            std::cmp::Reverse((zone.apex().num_labels(), *index))
+        });
+        zones.into_iter().find_map(|(_, (zone, keep_aa))| {
             match answer(&*zone.view(&request.question), request, self.config.any) {
-                Answered::Response(response) => Some(self.render_local(request, response)),
+                Answered::Response(response) => {
+                    Some(self.render_local(request, response, *keep_aa))
+                }
                 Answered::Unknown { .. } => None,
             }
         })
@@ -345,25 +354,23 @@ impl<V: Verify> Resolver<V> {
             if asker.cache_only {
                 // A query with RD clear may not start the lookups a
                 // validation needs, so data no check has validated is
-                // answered as if the cache did not hold it, never handed
-                // to a client that asked for validation (RFC 4035 §4.7).
+                // answered as if the cache did not hold it.
                 let validate = asker.validate;
-                let unchecked = |found: &resolution::Found| {
-                    validate
-                        && found
-                            .checks
-                            .iter()
-                            .any(|(_, validation)| *validation == Validation::NotPerformed)
-                };
                 match self.cached(&key) {
-                    Some(found) if !unchecked(&found) => self.push_found(id, found),
-                    _ => return self.answer_referral(id),
+                    Some(found) if !unchecked(validate, &found) => self.push_found(id, found),
+                    _ => return self.answer_referral(id, &key.name),
                 }
                 continue;
             }
+            // A forwarder that does not validate passes the client's CD
+            // bit on, as it relays the rest of the client's header.
+            let relay_cd = asker.request.cd
+                && self.config.anchors.is_none()
+                && !self.config.forward.is_empty();
             match self.depend(
                 resolution::Node::Asker(id),
                 key,
+                relay_cd,
                 TreeId::of(id),
                 depth,
                 entropy,
@@ -414,7 +421,9 @@ impl<V: Verify> Resolver<V> {
 
     /// Replaces a failed last piece with expired data for its question,
     /// when the configuration serves stale data and the cache still holds
-    /// some (RFC 8767 §4).
+    /// some (RFC 8767 §4). Stale data is served only as fresh data would
+    /// be: data no check has validated never reaches a client that asked
+    /// for validation.
     fn serve_stale_on_failure(&mut self, id: AskerId) {
         if self.config.serve_stale.is_none() {
             return;
@@ -443,7 +452,10 @@ impl<V: Verify> Resolver<V> {
             asker.request.question.query_type(),
             DNSClass::IN,
         );
-        if let Some(found) = self.stale_found(&key) {
+        let validate = asker.validate;
+        if let Some(found) = self.stale_found(&key)
+            && !unchecked(validate, &found)
+        {
             let now = self.now;
             if let Some(asker) = self.askers.get_mut(&id) {
                 asker.pieces.pop();
@@ -610,19 +622,22 @@ impl<V: Verify> Resolver<V> {
     }
 
     /// Answers client query `id`, whose RD was clear and whose question
-    /// the cache cannot answer, with the closest delegation the cache
-    /// holds, as a server answering from its cache does.
-    fn answer_referral(&mut self, id: AskerId) {
+    /// the cache cannot answer past `name`, with the aliases it followed
+    /// to `name` and the closest delegation the cache holds for it, as a
+    /// server answering from its cache does.
+    fn answer_referral(&mut self, id: AskerId, name: &LowerName) {
         let Some(asker) = self.askers.remove(&id) else {
             return;
         };
         self.graph.release(TreeId::of(id));
-        let bytes = self.render_referral(&asker.request);
+        let bytes = self.render_referral(&asker.request, &asker.pieces, name);
         self.send_answer(asker.client, bytes, Validation::NotPerformed, true);
     }
 
     /// Serves stale data to client queries that waited longer than the
     /// client timeout of RFC 8767 §5, and lets their resolutions go on.
+    /// As on failure, data no check has validated is not served to a
+    /// client that asked for validation.
     fn stale_timeouts(&mut self) {
         let Some(stale) = self.config.serve_stale else {
             return;
@@ -643,10 +658,14 @@ impl<V: Verify> Resolver<V> {
                 continue;
             };
             asker.stale_tried = true;
+            let validate = asker.validate;
             let Some(key) = self.graph.lookup_key(lookup) else {
                 continue;
             };
-            let Some(found) = self.stale_found(&key) else {
+            let Some(found) = self
+                .stale_found(&key)
+                .filter(|found| !unchecked(validate, found))
+            else {
                 continue;
             };
             self.graph.refresh(lookup, resolution::Node::Asker(id));
@@ -801,4 +820,16 @@ impl<V: Verify> Engine for Resolver<V> {
     fn generation(&self) -> Generation {
         self.tokens.generation()
     }
+}
+
+/// Whether `found` holds data no check has validated, for a client that
+/// asked for validation when `validate`. Such data is never handed to that
+/// client without a check (RFC 4035 §4.7), so where an answer cannot start
+/// one, as from the cache alone or from stale data, it is not used.
+fn unchecked(validate: bool, found: &resolution::Found) -> bool {
+    validate
+        && found
+            .checks
+            .iter()
+            .any(|(_, validation)| *validation == Validation::NotPerformed)
 }

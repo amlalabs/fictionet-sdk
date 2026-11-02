@@ -39,7 +39,7 @@ regex = "1"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "native-tls", "rustls", "http2"] }
 ring = "0.17"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "macros", "io-util"] }
-time = "0.3"
+time = { version = "0.3", features = ["parsing"] }
 tower-service = "0.3"
 url = "2"
 zstd = "0.14"

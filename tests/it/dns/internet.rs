@@ -18,7 +18,7 @@ use fictionet::stdlib::protocols::dns::{Nsid, Parsed, Request, Response};
 use fictionet::stdlib::services::dns::authority::{Ask, Identity, Observed, ServerConfig};
 use fictionet::stdlib::services::dns::resolver::Config;
 use fictionet::stdlib::services::dns::zone::{Answered, AnyResponse, Zone, ZoneData, answer};
-use fictionet::stdlib::services::dns::{Event, WallClock};
+use fictionet::stdlib::services::dns::{Event, Generation, WallClock};
 use fictionet::stdlib::services::serve::Transport;
 use fictionet::stdlib::world::net::dns::internet::{
     self, Egress, GTLD_SERVERS, Location, Mirror, PUBLIC_RESOLVERS, ROOT_LETTERS,
@@ -37,7 +37,8 @@ const EGRESS: Ipv4Addr = Ipv4Addr::new(45, 70, 0, 9);
 /// The root zone the source answers for at every root letter: the root
 /// servers, `example.` delegated without glue to a server under `org.`,
 /// `org.` and `direct.` with glue, `lan.` and `private.` with glue no
-/// internet host can be at, and two names with addresses.
+/// internet host can be at, `home.` with the egress as its glue, and two
+/// names with addresses.
 const ROOT: &str = "\
 . 86400 IN SOA a.root-servers.net. nstld.verisign-grs.com. 2026110101 1800 900 604800 86400
 . 518400 IN NS a.root-servers.net.
@@ -75,6 +76,8 @@ lan. 172800 IN NS ns.lan.
 ns.lan. 172800 IN A 45.60.0.77
 private. 172800 IN NS ns.private.
 ns.private. 172800 IN A 192.168.1.53
+home. 172800 IN NS ns.home.
+ns.home. 172800 IN A 45.70.0.9
 cloudflare-dns.com. 300 IN A 45.33.6.6
 plain. 300 IN A 45.33.7.7
 ";
@@ -472,6 +475,44 @@ fn a_placed_host_makes_the_names_above_it_exist() {
     });
 }
 
+/// The root zone of `placing` answers its own NS RRset, `localhost.`, as
+/// an Unbound static local zone at the root does: the view knows that no
+/// host has the name of the NS target, so nothing goes in the additional
+/// section.
+#[test]
+fn the_placing_root_answers_its_ns_set() {
+    world(Duration::from_secs(60), |fcx| async move {
+        let (_attacher, attachments) = fictionet::attachments();
+        let net = Net::new().ipv4_only();
+        let handle = net.handle();
+        net.start(&fcx, attachments)?;
+        let zone = dns::placing(handle, |_| None);
+        let message = query(1, ".", RecordType::NS, false);
+        let Parsed::Request(request) = Request::parse(&message.to_vec().unwrap(), Transport::Udp)
+        else {
+            panic!("a query parses");
+        };
+        let Answered::Response(response) =
+            answer(&*zone.view(&request.question), &request, AnyResponse::All)
+        else {
+            panic!("the root's NS set is known");
+        };
+        let reply = response.message;
+        assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+        let ns: Vec<String> = reply
+            .answers
+            .iter()
+            .filter_map(|record| match &record.data {
+                RData::NS(ns) => Some(ns.0.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ns, vec!["localhost.".to_string()]);
+        assert!(reply.additionals.is_empty());
+        Ok(())
+    });
+}
+
 /// `Cached` answers an ask from a kept reply only when the reply fits it:
 /// the same question with the same EDNS, so a query without an OPT record
 /// never gets a reply with one (RFC 6891 §7).
@@ -544,6 +585,22 @@ fn a_cached_reply_stays_in_its_session() {
     });
 }
 
+/// Per-session state moves only forward: a call still working for an
+/// ended session sees fresh state of its own and leaves the current
+/// session's state as it was.
+#[test]
+fn per_session_state_ignores_an_earlier_session() {
+    let state: dns::PerSession<Vec<u8>> = dns::PerSession::new();
+    state.with(Generation(2), |kept| kept.push(1));
+    let seen = state.with(Generation(1), |kept| {
+        kept.push(9);
+        kept.clone()
+    });
+    assert_eq!(seen, vec![9]);
+    assert_eq!(state.with(Generation(2), |kept| kept.clone()), vec![1]);
+    assert!(state.with(Generation(3), |kept| kept.is_empty()));
+}
+
 /// The NSID in `reply`, if it has one.
 fn nsid(reply: &Message) -> Option<Vec<u8>> {
     reply
@@ -604,6 +661,52 @@ fn the_mirror_places_a_relay_at_referral_glue_before_the_reply_leaves() {
             .expect("an answer");
         assert_eq!(addresses(&reply), vec![v4(45, 33, 7, 7)]);
         assert!(!handle.has_machine(v4(45, 33, 7, 7)));
+        Ok(())
+    });
+}
+
+/// A referral whose glue is the location's own egress places no relay
+/// there, so no question is ever sent from the host to its own public
+/// address.
+#[test]
+fn the_mirror_places_no_relay_at_the_egress() {
+    world(Duration::from_secs(60), |fcx| async move {
+        let hierarchy = Hierarchy::new();
+        let at = location();
+        let (attacher, attachments) = fictionet::attachments();
+        let net = Net::new().ipv4_only();
+        let handle = net.handle();
+        let mirror = Mirror::new(hierarchy.clone(), handle.clone(), &at);
+        net.hosts(internet::root_servers(|s| mirror.relay(s), &at))
+            .start(&fcx, attachments)?;
+        let m = machine(&fcx, attacher.attach("client")?, ME);
+        let a_root = ROOT_LETTERS[0].server.v4;
+        let egress = IpAddr::V4(EGRESS);
+
+        let reply = ask(&fcx, &m, a_root, &query(1, "x.home.", RecordType::A, false))
+            .await
+            .expect("a referral");
+        assert_eq!(
+            addresses(&reply),
+            vec![egress],
+            "the glue is relayed as it was"
+        );
+        assert!(!handle.has_machine(egress));
+        assert!(
+            ask(
+                &fcx,
+                &m,
+                egress,
+                &query(2, "printer.lan.", RecordType::A, false)
+            )
+            .await
+            .is_none()
+        );
+        assert!(
+            hierarchy
+                .asked_for("printer.lan.", RecordType::A)
+                .is_empty()
+        );
         Ok(())
     });
 }
@@ -850,9 +953,52 @@ fn whoami_names_are_answered_from_the_egress_and_never_relayed() {
             ]
         );
         assert_eq!(reply.answers[0].ttl, 60);
+        assert!(
+            !reply.metadata.authoritative,
+            "the real resolver's TXT answer has no AA"
+        );
+        let reply = ask(
+            &fcx,
+            &m,
+            google,
+            &query(3, "_dns.resolver.arpa.", RecordType::SVCB, true),
+        )
+        .await
+        .expect("an answer");
+        assert!(
+            reply.metadata.authoritative,
+            "Google sets AA on its DDR answer"
+        );
 
         let asked = hierarchy.asked.lock().unwrap().clone();
         assert!(asked.is_empty(), "the resolvers asked {asked:?}");
+
+        // The preset knows only the TXT RRset there. Other types are asked
+        // of the hierarchy, and no SOA or NS RRset is made up for the name.
+        for (id, kind) in [
+            (4, RecordType::A),
+            (5, RecordType::SOA),
+            (6, RecordType::NS),
+        ] {
+            let reply = ask(
+                &fcx,
+                &m,
+                google,
+                &query(id, "o-o.myaddr.l.google.com.", kind, true),
+            )
+            .await
+            .expect("an answer");
+            let made_up = reply
+                .answers
+                .iter()
+                .chain(&reply.authorities)
+                .any(|record| {
+                    LowerName::new(&record.name) == lower("o-o.myaddr.l.google.com.")
+                        && matches!(record.data, RData::SOA(_) | RData::NS(_))
+                });
+            assert!(!made_up, "{kind} got {reply:?}");
+        }
+        assert!(!hierarchy.asked.lock().unwrap().is_empty());
         Ok(())
     });
 }

@@ -1171,6 +1171,172 @@ fn an_overlay_refers_with_the_bases_denial_records_decoded() {
     assert_eq!(reply.additionals[0].name, name("ns1.fict.com."));
 }
 
+/// `bytes` in base32hex without padding (RFC 4648 §7), as NSEC3 owners
+/// write a hash.
+fn base32hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 32] = b"0123456789abcdefghijklmnopqrstuv";
+    let mut out = String::new();
+    let (mut buffer, mut bits) = (0u32, 0);
+    for byte in bytes {
+        buffer = (buffer << 8) | u32::from(*byte);
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            out.push(DIGITS[((buffer >> bits) & 31) as usize] as char);
+        }
+    }
+    if bits > 0 {
+        out.push(DIGITS[((buffer << (5 - bits)) & 31) as usize] as char);
+    }
+    out
+}
+
+/// `hash` moved one up (`up`) or down as a big-endian number, wrapping.
+fn step(hash: &[u8], up: bool) -> Vec<u8> {
+    let mut out = hash.to_vec();
+    for byte in out.iter_mut().rev() {
+        let (moved, carried) = if up {
+            byte.overflowing_add(1)
+        } else {
+            byte.overflowing_sub(1)
+        };
+        *byte = moved;
+        if !carried {
+            break;
+        }
+    }
+    out
+}
+
+/// What `com` sends to deny `fict.com DS` when the name does not exist:
+/// its SOA, the NSEC3 matching `com`, the opt-out NSEC3 covering
+/// `fict.com`, and the NSEC3 covering `*.com`, each signed. The second
+/// value names the records of the wildcard's cover.
+fn com_nxdomain() -> (Vec<Record>, Name) {
+    let hash = |text: &str| {
+        Nsec3HashAlgorithm::SHA1
+            .hash(&[], &name(text), 0)
+            .unwrap()
+            .as_ref()
+            .to_vec()
+    };
+    let key = ZoneKey::generate(&entropy(), Algorithm::Ed25519, KeyFlags::ZSK);
+    let window = Window {
+        inception: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+        expiration: SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000),
+    };
+    let soa = SOA::new(
+        name("a.gtld-servers.net."),
+        name("nstld.verisign-grs.com."),
+        1,
+        1800,
+        900,
+        604800,
+        900,
+    );
+    let mut records = vec![Record::from_rdata(name("com."), 900, RData::SOA(soa))];
+    let mut nsec3 = |owner: Vec<u8>, next: Vec<u8>, opt_out: bool, types: &[RecordType]| {
+        let rdata = NSEC3::new(
+            Nsec3HashAlgorithm::SHA1,
+            opt_out,
+            0,
+            vec![],
+            next,
+            types.iter().copied(),
+        );
+        let owner = format!("{}.com.", base32hex(&owner));
+        let set = rrset(
+            &owner,
+            86400,
+            vec![RData::DNSSEC(DNSSECRData::NSEC3(rdata))],
+        );
+        records.extend(set.records_without_rrsigs().cloned());
+        records.push(sign(&key, &set, &name("com."), window).unwrap());
+        name(&owner)
+    };
+    let apex = hash("com.");
+    nsec3(
+        apex.clone(),
+        step(&apex, true),
+        false,
+        &[RecordType::SOA, RecordType::NS, RecordType::DNSKEY],
+    );
+    let fict = hash("fict.com.");
+    nsec3(
+        step(&fict, false),
+        step(&fict, true),
+        true,
+        &[RecordType::NS],
+    );
+    let wildcard = hash("*.com.");
+    let cover = nsec3(
+        step(&wildcard, false),
+        step(&wildcard, true),
+        false,
+        &[RecordType::NS],
+    );
+    (records, cover)
+}
+
+/// For an invented name under an opt-out NSEC3 parent, the overlay sends
+/// what real `com` sends for an unsigned delegation: the closest
+/// encloser's NSEC3 and the opt-out span over the name, without the
+/// NXDOMAIN's proof that no wildcard matched, in a referral and in the
+/// NODATA for its DS.
+#[test]
+fn an_overlay_sends_the_unsigned_delegation_proof_without_the_wildcard_cover() {
+    let (nxdomain, wildcard_cover) = com_nxdomain();
+    let kept: Vec<Record> = nxdomain
+        .iter()
+        .filter(|record| record.record_type() != RecordType::SOA)
+        .filter(|record| record.name != wildcard_cover)
+        .cloned()
+        .collect();
+    assert_eq!(kept.len(), 4, "two NSEC3 records and their RRSIGs");
+    for (qname, qtype) in [
+        ("www.fict.com.", RecordType::A),
+        ("fict.com.", RecordType::DS),
+    ] {
+        let mut engine =
+            AuthorityEngine::new(overlay(), ServerConfig::gtld(Identity::none()), local());
+        let message = query(qname, qtype, |m| {
+            m.set_edns(edns(1232, true));
+        });
+        let actions = ask_with(&mut engine, &message, Transport::Udp);
+        let transmit = sends(&actions)[0].clone();
+        let real = real_reply(&transmit, |m| {
+            m.metadata.response_code = ResponseCode::NXDomain;
+            m.metadata.authoritative = true;
+            for record in &nxdomain {
+                m.add_authority(record.clone());
+            }
+        });
+        let actions = run(&mut engine, reply_to(&transmit, real), Instant::ZERO);
+        let reply = the_answer(&actions);
+        assert_eq!(
+            reply.metadata.response_code,
+            ResponseCode::NoError,
+            "{qtype}"
+        );
+        let denial: Vec<Record> = reply
+            .authorities
+            .iter()
+            .filter(|record| !matches!(record.record_type(), RecordType::NS | RecordType::SOA))
+            .cloned()
+            .collect();
+        assert_eq!(denial, kept, "{qtype}");
+        let soa = reply
+            .authorities
+            .iter()
+            .any(|record| record.record_type() == RecordType::SOA);
+        assert_eq!(
+            soa,
+            qtype == RecordType::DS,
+            "{qtype}: the SOA only in NODATA"
+        );
+    }
+}
+
 #[test]
 fn an_overlay_refers_without_asking_when_do_is_clear() {
     let mut engine = AuthorityEngine::new(overlay(), ServerConfig::generic(), local());
