@@ -538,12 +538,12 @@ fn a_message_at_the_size_limit_followed_by_a_ping_is_answered() {
 fn creates_queued_behind_a_running_response_are_bounded() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
+    let (arrived, arrival) = tokio::sync::oneshot::channel::<()>();
     let (release, released) = std::sync::mpsc::channel::<()>();
-    let (arrive, arrived) = tokio::sync::oneshot::channel::<()>();
     let upstream = std::thread::spawn(move || {
         let (mut socket, _) = listener.accept().unwrap();
         received(&mut socket);
-        arrive.send(()).unwrap();
+        arrived.send(()).unwrap();
         // Never answer: the first response stays running.
         let _ = released.recv();
     });
@@ -554,15 +554,21 @@ fn creates_queued_behind_a_running_response_are_bounded() {
             let mut client = Client::open(&cx, &model).await;
             let create =
                 json!({"type":"response.create","model":"small","input":"Count","store":false});
-            for _ in 0..1000 {
+            // One response runs and sixteen wait behind it without an error:
+            // the pong comes first.
+            for _ in 0..17 {
                 client.send(create.clone()).await;
             }
+            client.send_message(Message::Ping(b"held".to_vec())).await;
+            assert_eq!(client.next().await, Message::Pong(b"held".to_vec()));
             // The session refuses work it would otherwise hold without limit.
+            client.send(create).await;
             let refused = client.event().await;
             assert_eq!(refused["type"], "error");
-            // The refusal can come back before the first request has
-            // reached the upstream. Cancelling then would cut it off.
-            arrived.await.unwrap();
+            assert_eq!(refused["error"]["code"], "websocket_queue_limit_reached");
+            // The first response reaches the upstream before the world ends,
+            // so the upstream is not left waiting for it.
+            arrival.await.unwrap();
             release.send(()).unwrap();
             cx.cancel();
             Ok(())
