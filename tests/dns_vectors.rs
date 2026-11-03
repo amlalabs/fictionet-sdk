@@ -2020,9 +2020,9 @@ fn signed_case(
     let sets = record_sets(&answers);
     same("answer RRsets validated", lean_answers.len(), sets.len())?;
     for (set, lean) in sets.iter().zip(&lean_answers) {
-        let rust = validation_text(validate_rrset(
-            set, &authority, &chain, &anchors, &policy, at, verify,
-        ));
+        let rust = validation_text(
+            validate_rrset(set, &authority, &chain, &anchors, &policy, at, verify).validation,
+        );
         if *lean == rust {
             continue;
         }
@@ -2061,7 +2061,7 @@ fn signed_case(
         .filter(|set| set.record_type() == RecordType::SOA)
         .any(|set| {
             matches!(
-                validate_rrset(set, &[], &chain, &anchors, &policy, at, verify),
+                validate_rrset(set, &[], &chain, &anchors, &policy, at, verify).validation,
                 Validation::Bogus(_)
             )
         });

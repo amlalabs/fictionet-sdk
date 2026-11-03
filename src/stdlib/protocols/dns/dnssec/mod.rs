@@ -27,6 +27,7 @@
 //! | [`TrustAnchor`], [`Anchors`] | RFC 4035 §4.3, IANA root anchors |
 //! | [`proof`] | RFC 4035 §5.4, RFC 5155 §8, RFC 6840 §4.1 |
 //! | [`validate_rrset`], [`validate_denial`] | RFC 4035 §5, RFC 6840 §5, RFC 8914 |
+//! | [`Verified`] | RFC 4035 §5.3.3 |
 
 pub use hickory_proto::dnssec::{Nsec3HashAlgorithm, PublicKey, PublicKeyBuf, TBS, rdata};
 
@@ -46,6 +47,7 @@ pub use policy::{AlgorithmPolicy, Treatment};
 pub use proof::Proof;
 pub use sign::{Window, sign, signed_data};
 pub use validate::{
-    Chain, Fetched, Insecure, Link, ValidatedDenial, Validation, validate_denial, validate_rrset,
+    Chain, Fetched, Insecure, Link, ValidatedDenial, ValidatedRrset, Validation, Verified,
+    validate_denial, validate_rrset,
 };
 pub use verify::{Ring, Verify};

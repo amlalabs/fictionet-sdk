@@ -121,6 +121,46 @@ fn a_negative_ranks_as_the_answer_it_came_in() {
     }
 }
 
+/// An NXDOMAIN of lower rank than live data of the type it answered
+/// neither replaces that data nor hides the name behind it (RFC 2181
+/// §5.4.1): the data shows the name exists.
+#[test]
+fn a_lower_ranked_nxdomain_leaves_data_of_its_type() {
+    let mut cache = cache();
+    cache.insert(
+        at(100),
+        Offer::Positive {
+            set: rrset("x.example.", 3600, vec![a("192.0.2.88")]),
+            rank: Rank::AuthAuthority,
+            validation: Validation::NotPerformed,
+            proof: Vec::new(),
+            truncated: false,
+        },
+    );
+    cache.insert(
+        at(110),
+        Offer::Negative {
+            key: key("x.example.", RecordType::A),
+            kind: Negative::NxDomain,
+            soa: Some(soa()),
+            rank: Rank::NonAuthAnswer,
+            denial: Vec::new(),
+            validation: Validation::NotPerformed,
+            truncated: false,
+        },
+    );
+    let now = at(1000);
+    assert!(matches!(
+        cache.get(&key("x.example.", RecordType::A), now),
+        Some(Entry::Positive { .. })
+    ));
+    assert!(
+        cache
+            .nxdomain_above(&LowerName::new(&name("x.example.")), DNSClass::IN, at(111))
+            .is_none()
+    );
+}
+
 #[test]
 fn newer_nodata_at_a_name_ends_its_nxdomain() {
     let mut cache = cache();
