@@ -231,7 +231,9 @@ extra iterations, in base32hex. RRSIG times are decimal. Validation results are 
   `Dns/Zone.lean`, and a node filing carries no NODATA proof: that a signed copy sends the records it holds,
   for NODATA and wildcard answers too, is checked by `learned_signed.json` against `Dnssec.lean`'s signed
   answers. The engine looks up the client's question at the server's own address, as `Zones` does, so one
-  request makes at most one lookup. An overlay is a function of its base's steps for the question and for
+  request makes at most one lookup. When the response to the client's question was filed and the answer
+  still stops at a name a CNAME or DNAME chain reached, `Zones` looks that name up; only a real server that
+  stops a chain early, outside `Copied`, leaves it so, and this model leaves that lookup out. An overlay is a function of its base's steps for the question and for
   `<apex> DS`, with what it invents abstract: the theorems bound its lookups and keep its replies stable,
   and `Authority.tla` checks it with lookups shared between requests.
 - **Exchanges** model the state the matching rule touches: the generation, the next exchange number, the

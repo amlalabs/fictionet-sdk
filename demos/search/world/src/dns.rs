@@ -7,9 +7,9 @@
 //! real server there. So the guest sees each site's real address and real
 //! signatures, whether it asks the gateway, a public resolver, or a root
 //! server itself. [`Outbound`] is the world's policy for the lookups
-//! those servers make of the real servers, and [`SessionSource`] is where
-//! the lookups it allows go: the internet, or in a Copied session the
-//! DNS captured with the pages.
+//! those servers make of the real servers, and [`SessionUpstream`] is the
+//! upstream the lookups it allows go to: the internet, or in a Copied
+//! session the DNS captured with the pages.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -460,45 +460,45 @@ fn reverse(name: &LowerName) -> bool {
 /// named while answering one: those go to the internet, or the agent
 /// would lose its model and its clock.
 ///
-/// The source is chosen again each time the world's namespace advances,
-/// for the mode the new session runs in.
+/// The upstream is chosen again each time the world's namespace
+/// advances, for the mode the new session runs in.
 ///
 /// The world's resolvers check signatures against a Copied session's
 /// clock, which stands at the capture, so the internet's answers for the
 /// names that resolve in every session, signed today, would fail that
 /// check. Those names, and the alias targets the hierarchy named for
 /// them, are the resolvers' negative trust anchors in a Copied session
-/// ([`negative_anchors`](SessionSource::negative_anchors)): they are not
+/// ([`negative_anchors`](SessionUpstream::negative_anchors)): they are not
 /// validated. The model gateway's and the time server's zones are
 /// unsigned, so for those names the guest gets the answers it would get
 /// anyway; an alias target in a signed zone answers without AD.
-pub struct SessionSource {
+pub struct SessionUpstream {
     pages: Arc<Pages>,
     needed: Arc<[LowerName]>,
-    /// The source the session uses, chosen when it first asks.
+    /// The upstream the session uses, chosen when it first asks.
     current: PerSession<Option<Chosen>>,
 }
 
-/// The source a session uses, and its Copied source when it runs from a
-/// capture.
+/// The upstream a session uses, and its Copied upstream when it runs
+/// from a capture.
 #[derive(Clone)]
 struct Chosen {
-    source: Arc<dyn Upstream>,
+    upstream: Arc<dyn Upstream>,
     copied: Option<Arc<Copied>>,
 }
 
-impl SessionSource {
-    /// The source for the sessions of `pages`, with `needed` the names
+impl SessionUpstream {
+    /// The upstream for the sessions of `pages`, with `needed` the names
     /// that resolve in every session.
-    pub fn new(pages: Arc<Pages>, needed: impl IntoIterator<Item = LowerName>) -> SessionSource {
-        SessionSource {
+    pub fn new(pages: Arc<Pages>, needed: impl IntoIterator<Item = LowerName>) -> SessionUpstream {
+        SessionUpstream {
             pages,
             needed: needed.into_iter().collect(),
             current: PerSession::new(),
         }
     }
 
-    /// The source for the session now.
+    /// The upstream for the session now.
     fn current(&self) -> Chosen {
         let generation = self.pages.namespace().current().generation;
         self.current.with(generation, |current| {
@@ -524,18 +524,18 @@ impl SessionSource {
     }
 }
 
-impl Upstream for SessionSource {
+impl Upstream for SessionUpstream {
     fn lookup<'a>(
         &'a self,
         fcx: &'a Cx,
         lookup: Lookup,
     ) -> Pin<Box<dyn Future<Output = Looked> + Send + 'a>> {
-        let source = self.current().source;
-        Box::pin(async move { source.lookup(fcx, lookup).await })
+        let upstream = self.current().upstream;
+        Box::pin(async move { upstream.lookup(fcx, lookup).await })
     }
 }
 
-/// The source for a session of `pages` in the mode it runs in now.
+/// The upstream for a session of `pages` in the mode it runs in now.
 fn session(pages: &Pages, needed: &Arc<[LowerName]>) -> Chosen {
     let internet = pages.live_dns();
     match (pages.source(), pages.copied_dns()) {
@@ -547,18 +547,18 @@ fn session(pages: &Pages, needed: &Arc<[LowerName]>) -> Chosen {
                 fresh: Mutex::new(needed.iter().cloned().collect()),
             });
             Chosen {
-                source: copied.clone(),
+                upstream: copied.clone(),
                 copied: Some(copied),
             }
         }
         _ => Chosen {
-            source: internet,
+            upstream: internet,
             copied: None,
         },
     }
 }
 
-/// A Copied session's source: the capture, and the internet for the names
+/// A Copied session's upstream: the capture, and the internet for the names
 /// that resolve in every session.
 struct Copied {
     replay: Arc<Replay>,

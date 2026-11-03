@@ -351,10 +351,10 @@ fn the_front_sets_the_header_and_echoes_the_question_case() {
 #[test]
 fn the_front_zeroes_unknown_edns_flags_and_copies_do() {
     let mut server = ServerConfig::generic();
-    server.identity = Some(Identity {
+    server.identity = Identity {
         nsid: Some(b"sjc05".to_vec()),
         ..Identity::none()
-    });
+    };
     let mut engine = AuthorityEngine::new(zones(vec![example()]), server, local());
     for dnssec_ok in [false, true] {
         let message = query("www.example.test.", RecordType::A, |m| {
@@ -381,10 +381,10 @@ fn the_front_zeroes_unknown_edns_flags_and_copies_do() {
 #[test]
 fn nsid_goes_out_only_when_asked() {
     let mut server = ServerConfig::generic();
-    server.identity = Some(Identity {
+    server.identity = Identity {
         nsid: Some(b"sjc05".to_vec()),
         ..Identity::none()
-    });
+    };
     let mut engine = AuthorityEngine::new(zones(vec![example()]), server, local());
 
     let plain = query("www.example.test.", RecordType::A, |m| {
@@ -619,7 +619,7 @@ fn chaos_questions_are_answered_by_name_from_the_identity() {
         ChaosAnswer::Reply(ChaosReply::rcode(ResponseCode::Refused)),
     )
     .ttl(60);
-    server.identity = Some(identity.clone());
+    server.identity = identity.clone();
     let mut engine = AuthorityEngine::new(Counting(calls.clone()), server, local());
     let chaos_query = |qname: &str, qtype: RecordType| {
         query(qname, qtype, |m| {
@@ -708,7 +708,7 @@ fn chaos_questions_are_answered_by_name_from_the_identity() {
     ];
     for (identity, aa, rcode, payload, ede) in fronts {
         let server = ServerConfig {
-            identity: Some(identity),
+            identity,
             ..ServerConfig::generic()
         };
         let mut engine = AuthorityEngine::new(Counting(calls.clone()), server, local());
@@ -751,7 +751,7 @@ fn bind_serves_each_chaos_name_as_a_zone() {
             ChaosAnswer::Reply(ChaosReply::rcode(ResponseCode::Refused)),
         );
     let server = ServerConfig {
-        identity: Some(identity),
+        identity,
         ..ServerConfig::generic()
     };
     let mut engine = AuthorityEngine::new(zones(vec![example()]), server, local());
@@ -921,7 +921,7 @@ fn zone_transfers_reach_the_authority_only_when_offered() {
 fn a_chaos_zone_transfer_is_refused_when_transfers_are_not_offered() {
     let identity = Identity::none().answer(chaos::version_bind(), ChaosAnswer::Zone(None));
     let server = ServerConfig {
-        identity: Some(identity),
+        identity,
         ..ServerConfig::generic()
     };
     let mut engine = AuthorityEngine::new(zones(vec![example()]), server, local());

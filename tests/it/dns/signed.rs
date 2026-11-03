@@ -125,7 +125,7 @@ fn ask_with(
     };
     match answer(&*data.view(&request.question), &request, any) {
         Answered::Response(response) => response.message,
-        Answered::Unknown { name } => panic!("{name} is unknown"),
+        Answered::Unknown { name, .. } => panic!("{name} is unknown"),
     }
 }
 

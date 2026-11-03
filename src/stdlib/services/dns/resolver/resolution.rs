@@ -44,12 +44,12 @@ use super::super::event::{Event, Unmatched, UpstreamOutcome};
 use super::super::exchange::{
     Action, ExchangeFailure, Sent, Token, Transmit, ignored, matching, outstanding,
 };
-use super::super::records::{rrsets, signatures};
+use super::super::records::{expanded_from, rrsets, signatures};
 use super::super::zone::dname_target;
 use super::Resolver;
 use super::cache::{
     Checked, Entry, FailureKind, Key, Negative, Offer, Rank, normalized, same_rrset, same_rrsets,
-    ttl_left,
+    seconds, ttl_left,
 };
 
 /// How many times one resolution sends a query to one server address over
@@ -397,6 +397,9 @@ struct Check {
     /// The data at the subject's key the result is for.
     checked: Checked,
     material: Material,
+    /// When the TTLs in `material` were current: when it arrived, or when
+    /// it was read from the cache with its TTLs counted down.
+    at: Instant,
     tree: TreeId,
     depth: u8,
     /// The trust anchor the chain starts at.
@@ -1916,14 +1919,26 @@ impl<V: Verify> Resolver<V> {
             // the DNAME above it vouches for it (RFC 6672 §3.4), whether
             // the CNAME is followed or is itself the data asked for. One
             // expanded from a wildcard needs the denial records that show
-            // no closer name matched (RFC 4035 §5.3.4).
+            // no closer name matched (RFC 4035 §5.3.4), and any other
+            // RRset none: the denial records of the reply belong to the
+            // negative its chain ends in (RFC 4035 §3.1.3).
             let dname: Vec<RecordSet> = answers
                 .iter()
                 .filter(|set| is_dname(set))
                 .filter(|set| set.name().zone_of(&at) && *set.name() != at)
                 .cloned()
                 .collect();
-            let proof: Vec<RecordSet> = dname.iter().chain(denial).cloned().collect();
+            let proof_for = |sets: &[&RecordSet]| -> Vec<RecordSet> {
+                let mut proof = dname.clone();
+                for set in sets {
+                    for record in expansion_proof(set, zone, denial) {
+                        if !proof.contains(&record) {
+                            proof.push(record);
+                        }
+                    }
+                }
+                proof
+            };
             let here: Vec<RecordSet> = answers
                 .iter()
                 .filter(|set| *set.name() == at)
@@ -1935,11 +1950,11 @@ impl<V: Verify> Resolver<V> {
                     self.offer(set, rank, Vec::new());
                 }
                 for set in &here {
-                    self.offer(set, rank, proof.clone());
+                    self.offer(set, rank, proof_for(&[set]));
                 }
                 chain.push(Outcome::Data {
+                    proof: proof_for(&here.iter().collect::<Vec<_>>()),
                     sets: here,
-                    proof,
                     zone: zone.clone(),
                 });
                 return split(chain);
@@ -1954,6 +1969,7 @@ impl<V: Verify> Resolver<V> {
             for set in &dname {
                 self.offer(set, rank, Vec::new());
             }
+            let proof = proof_for(&[cname]);
             self.offer(cname, rank, proof.clone());
             chain.push(Outcome::Alias {
                 cname: cname.clone(),
@@ -2060,13 +2076,16 @@ impl<V: Verify> Resolver<V> {
         kept
     }
 
-    /// Validates `subject` of `outcome` for `from`: at once when nothing
-    /// needs fetching, or with a check that gathers the chain.
+    /// Validates `subject` of `outcome`, whose TTLs were current at `at`,
+    /// for `from`: at once when nothing needs fetching, or with a check
+    /// that gathers the chain.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn check(
         &mut self,
         from: Node,
         subject: Subject,
         outcome: &Outcome,
+        at: Instant,
         tree: TreeId,
         depth: u8,
         entropy: &dyn Entropy,
@@ -2084,7 +2103,7 @@ impl<V: Verify> Resolver<V> {
             // validated, as though no trust anchor covered the name, until
             // a trust anchor further down.
             let verdict = Verdict::from(Validation::Insecure(Insecure::NoAnchor));
-            self.validated(&subject, &checked, &material, &verdict);
+            self.validated(&subject, &checked, &material, &verdict, at);
             return CheckStart::Done(verdict);
         }
         // A check under way for the same subject is joined only when it
@@ -2111,7 +2130,7 @@ impl<V: Verify> Resolver<V> {
         };
         let Some(anchor) = anchor else {
             let verdict = self.validate(&material, &Chain::default());
-            self.validated(&subject, &checked, &material, &verdict);
+            self.validated(&subject, &checked, &material, &verdict, at);
             return CheckStart::Done(verdict);
         };
         let id = self.graph.check_id();
@@ -2127,6 +2146,7 @@ impl<V: Verify> Resolver<V> {
                 subject,
                 checked,
                 material,
+                at,
                 tree,
                 depth,
                 anchor,
@@ -2452,7 +2472,13 @@ impl<V: Verify> Resolver<V> {
         self.graph.unlist(&check.subject, id);
         self.graph.release(check.tree);
         if !check.bounded {
-            self.validated(&check.subject, &check.checked, &check.material, &verdict);
+            self.validated(
+                &check.subject,
+                &check.checked,
+                &check.material,
+                &verdict,
+                check.at,
+            );
         }
         for to in check.dependents {
             self.graph.ready.push_back(Ready::Checked {
@@ -2512,19 +2538,21 @@ impl<V: Verify> Resolver<V> {
     }
 
     /// Records `verdict` on `subject`, made over `checked` with
-    /// `material`, in the cache, where the subject's entry still holds
-    /// `checked`. A Secure RRset lives no longer than the RRSIG that
-    /// verified it allows (RFC 4035 §5.3.3), and a Secure negative answer
-    /// no longer than the RRSIGs that verified its SOA and denial records.
-    /// The NSEC records of a Secure negative answer, every one of which
-    /// verified, are kept for synthesizing answers while they and their
-    /// SOA are Secure (RFC 8198 §5.4).
+    /// `material`, whose TTLs were current at `at`, in the cache, where the
+    /// subject's entry still holds `checked`. A Secure RRset lives no
+    /// longer than the RRSIG that verified it allows (RFC 4035 §5.3.3),
+    /// and a Secure negative answer no longer than the RRSIGs that
+    /// verified its SOA and denial records. The NSEC records of a Secure
+    /// negative answer, every one of which verified, are kept for
+    /// synthesizing answers while they and their SOA are Secure
+    /// (RFC 8198 §5.4).
     fn validated(
         &mut self,
         subject: &Subject,
         checked: &Checked,
         material: &Material,
         verdict: &Verdict,
+        at: Instant,
     ) {
         let now = self.now;
         let validation = verdict.validation;
@@ -2536,14 +2564,16 @@ impl<V: Verify> Resolver<V> {
         // The RRSIGs that proved the result: the RRset's, or those of a
         // negative answer's SOA and NSEC or NSEC3 records, which together
         // last only as long as each of them (RFC 8198 §5.4).
-        let expires = verdict
+        let secure_until = verdict
             .verified
             .iter()
-            .map(|verified| self.signature_expires(verified))
+            .map(|verified| {
+                self.signature_expires(verified)
+                    .min(at + seconds(verified.ttl_bound()))
+            })
             .min();
-        let ttl = verdict.verified.iter().map(Verified::ttl_bound).min();
         self.cache
-            .validated(key, checked, validation, expires, ttl, now);
+            .validated(key, checked, validation, secure_until, now);
         if let (Validation::Secure, Material::Denial { authority, .. }) = (validation, material)
             && self.config.aggressive_nsec
         {
@@ -2553,13 +2583,13 @@ impl<V: Verify> Resolver<V> {
             let nsec: Vec<(RecordSet, Option<Instant>)> = authority
                 .iter()
                 .filter(|set| set.record_type() == RecordType::NSEC)
-                .map(|set| (set.clone(), self.secure_until(set, now, &verdict.verified)))
+                .map(|set| (set.clone(), self.secure_until(set, at, &verdict.verified)))
                 .collect();
             if let Some(soa) = soa
                 && !nsec.is_empty()
             {
-                let soa_until = self.secure_until(soa, now, &verdict.verified);
-                self.cache.add_secure_nsec(soa, soa_until, &nsec, now);
+                let soa_until = self.secure_until(soa, at, &verdict.verified);
+                self.cache.add_secure_nsec(soa, soa_until, &nsec, at);
             }
         }
     }
@@ -2580,7 +2610,7 @@ impl<V: Verify> Resolver<V> {
             .iter()
             .filter(|verified| verified.signs(set))
             .map(|verified| {
-                let ttl = at + std::time::Duration::from_secs(u64::from(verified.ttl_bound()));
+                let ttl = at + seconds(verified.ttl_bound());
                 self.signature_expires(verified).min(ttl)
             })
             .min()
@@ -2736,6 +2766,23 @@ fn vouched(set: &RecordSet, proof: &[RecordSet], zone: &Name) -> (Material, Name
     let zone = signer(&set).unwrap_or_else(|| zone.clone());
     let authority = proof.iter().filter(|set| !is_dname(set)).cloned().collect();
     (Material::Rrset { set, authority }, zone)
+}
+
+/// The NSEC or NSEC3 RRsets among `denial`, those of a reply from `zone`,
+/// that show no closer name matched when a wildcard made `set`
+/// (RFC 4035 §3.1.3.3, RFC 5155 §7.2.6): all of them when they hold no
+/// such proof, so that validation finds it missing, and none when no
+/// wildcard made `set`.
+fn expansion_proof(set: &RecordSet, zone: &Name, denial: &[RecordSet]) -> Vec<RecordSet> {
+    let Some(labels) = expanded_from(set) else {
+        return Vec::new();
+    };
+    let closest_encloser = set.name().trim_to(labels);
+    let claim = proof::Claim::Wildcard {
+        name: set.name(),
+        closest_encloser: &closest_encloser,
+    };
+    proof::proof_of(claim, zone, denial).unwrap_or_else(|| denial.to_vec())
 }
 
 /// Whether `cname` is what `dname` synthesizes for its owner (RFC 6672

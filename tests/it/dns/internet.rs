@@ -36,7 +36,7 @@ const ME: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
 const GATEWAY: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
 const EGRESS: Ipv4Addr = Ipv4Addr::new(45, 70, 0, 9);
 
-/// The root zone the source answers for at every root letter: the root
+/// The root zone the upstream answers for at every root letter: the root
 /// servers, `example.` delegated without glue to a server under `org.`,
 /// `org.` and `direct.` with glue, `lan.` and `private.` with glue no
 /// internet host can be at, `home.` with the egress as its glue, and two
@@ -183,10 +183,10 @@ impl Upstream for Hierarchy {
         // Every real server here is the instance `REAL`, by CHAOS name and
         // by NSID.
         let front = ServerConfig {
-            identity: Some(Identity {
+            identity: Identity {
                 nsid: Some(REAL.as_bytes().to_vec()),
                 ..Identity::none()
-            }),
+            },
             ..ServerConfig::generic()
         };
         let response = if req.question.query_class() == DNSClass::CH {
@@ -348,7 +348,7 @@ fn the_root_hints_are_the_root_letters() {
 /// `dig @198.41.0.4 . NS` at a root letter copying the hierarchy: the
 /// real server's answer, every root server with its address, after the
 /// round trip the location gives a.root, and `id.server` answered from
-/// the site that answers there without asking the source.
+/// the site that answers there without asking the upstream.
 #[test]
 fn a_root_letter_answers_the_root_ns_as_dig_sees_it() {
     world(Duration::from_secs(60), |fcx| async move {
@@ -510,7 +510,7 @@ fn a_placed_host_makes_the_names_above_it_exist() {
             };
             match answer(&*zone.view(&request.question), &request, AnyResponse::All) {
                 Answered::Response(response) => response.message,
-                Answered::Unknown { name } => panic!("{name} is unknown"),
+                Answered::Unknown { name, .. } => panic!("{name} is unknown"),
             }
         };
         let www = ask("www.example.com.");
@@ -1280,7 +1280,7 @@ fn a_measured_bind_server_serves_its_chaos_names_as_zones() {
 
 /// A real server that echoes the address a question came from would see
 /// a public resolver's own egress, not the world's: `whoami.direct` plays
-/// such a server, answering with the address the source asks from.
+/// such a server, answering with the address the upstream asks from.
 #[test]
 fn an_echoed_address_is_the_public_resolvers_egress() {
     world(Duration::from_secs(60), |fcx| async move {

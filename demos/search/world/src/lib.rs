@@ -45,7 +45,7 @@ use fictionet::sync::Mutex;
 use observation::SearchObs;
 use pages::Pages;
 
-use dns::{Outbound, SessionSource};
+use dns::{Outbound, SessionUpstream};
 
 pub use dns::admit;
 pub use tls::Ca;
@@ -95,8 +95,11 @@ pub fn net(
     let handle = net.handle();
 
     let outbound = Outbound::new(pages.clone(), forwarded.keys().cloned());
-    let source = Arc::new(SessionSource::new(pages.clone(), forwarded.keys().cloned()));
-    let negative_anchors: NegativeAnchors = Arc::new(source.negative_anchors());
+    let upstream = Arc::new(SessionUpstream::new(
+        pages.clone(),
+        forwarded.keys().cloned(),
+    ));
+    let negative_anchors: NegativeAnchors = Arc::new(upstream.negative_anchors());
     let resolver_ca = ca.clone();
     let sites = Arc::new(Sites {
         handle: handle.clone(),
@@ -122,7 +125,7 @@ pub fn net(
             }
         });
     }
-    let mut mirror = Mirror::new(Only::new(outbound.policy(), source), handle, &location)
+    let mut mirror = Mirror::new(Only::new(outbound.policy(), upstream), handle, &location)
         .namespace(&namespace)
         .observe(outbound.observer())
         .observe(move |filing| sites.place(filing));

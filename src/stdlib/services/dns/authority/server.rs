@@ -22,12 +22,10 @@ use super::super::zone::AnyResponse;
 /// §6.1.2), as the root servers and the large public resolvers do.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServerConfig {
-    /// What the server says about itself: its CHAOS answers and its NSID.
-    /// `None` when the authority behind the front speaks for the server:
-    /// it answers CHAOS-class questions, and gives the NSID with its own
-    /// options. Either way both come from one source, so they describe the
-    /// same instance.
-    pub identity: Option<Identity>,
+    /// What the server says about itself: its CHAOS answers and its NSID,
+    /// which come from this one source so that they describe the same
+    /// instance.
+    pub identity: Identity,
     /// The largest UDP reply the server sends and advertises
     /// (RFC 6891 §6.2.5).
     pub payload: u16,
@@ -55,7 +53,7 @@ impl ServerConfig {
     /// an identity with no names and no NSID.
     pub fn generic() -> ServerConfig {
         ServerConfig {
-            identity: Some(Identity::none()),
+            identity: Identity::none(),
             payload: 1232,
             ede: true,
             any: AnyResponse::Hinfo,
@@ -70,7 +68,7 @@ impl ServerConfig {
     /// 4096-octet payload, and every RRset of the name for ANY.
     pub fn root(identity: Identity) -> ServerConfig {
         ServerConfig {
-            identity: Some(identity),
+            identity,
             payload: 4096,
             any: AnyResponse::All,
             ..ServerConfig::generic()
@@ -99,10 +97,9 @@ impl ServerConfig {
     ///   (RFC 6891 §6.1.4).
     /// - Options from the query are never echoed (RFC 6891 §6.1.2). The
     ///   reply carries the server's NSID only when the query asked for it
-    ///   (RFC 5001 §2.1), and the authority's own options, Extended DNS
-    ///   Errors only when [`ede`](ServerConfig::ede) is on. With an
-    ///   [`identity`](ServerConfig::identity) the NSID is the identity's;
-    ///   without one it is the authority's.
+    ///   (RFC 5001 §2.1), and the authority's own options but an NSID,
+    ///   Extended DNS Errors only when [`ede`](ServerConfig::ede) is on.
+    ///   The NSID is the [`identity`](ServerConfig::identity)'s.
     pub fn front(&self, req: &Request, response: Response) -> Response {
         let Response {
             mut message,
@@ -136,17 +133,11 @@ impl ServerConfig {
             for (_, option) in own {
                 let ede = Ede::from_option(option).is_some();
                 let nsid = Nsid::from_option(option).is_some();
-                let keep = if nsid {
-                    asked.nsid && self.identity.is_none()
-                } else {
-                    self.ede || !ede
-                };
-                if keep {
+                if !nsid && (self.ede || !ede) {
                     edns.options_mut().insert(option.clone());
                 }
             }
-            let nsid = self.identity.as_ref().and_then(|id| id.nsid.as_ref());
-            if let (true, Some(nsid)) = (asked.nsid, nsid) {
+            if let (true, Some(nsid)) = (asked.nsid, &self.identity.nsid) {
                 edns.options_mut().insert(Nsid(nsid.clone()).to_option());
             }
             edns
@@ -160,10 +151,9 @@ impl ServerConfig {
     /// The octets of the reply to a CHAOS-class question, from
     /// [`identity`](ServerConfig::identity) alone ([`Identity::reply`]),
     /// through the front and fitted to the client's size, with the
-    /// identity's payload and OPT record. `None` without an identity: the
-    /// authority answers.
-    pub(in super::super) fn render_chaos(&self, req: &Request) -> Option<Vec<u8>> {
-        let identity = self.identity.as_ref()?;
+    /// identity's payload and OPT record.
+    pub(in super::super) fn render_chaos(&self, req: &Request) -> Vec<u8> {
+        let identity = &self.identity;
         let (response, edns) = identity.reply(req);
         let mut response = self.front(req, response);
         if !edns {
@@ -173,7 +163,7 @@ impl ServerConfig {
         if let Some(edns) = &mut response.message.edns {
             edns.set_max_payload(payload.max(512));
         }
-        Some(self.write(req, response, Limit::for_request(req, payload)))
+        self.write(req, response, Limit::for_request(req, payload))
     }
 
     /// The octets of `response` for `req`, through the front and fitted to

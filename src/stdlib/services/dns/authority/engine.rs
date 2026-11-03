@@ -32,8 +32,7 @@ use super::{Authority, ServerConfig, Step, bare_reply};
 /// 3. Answers REFUSED to a zone transfer when the server does not offer
 ///    them, whatever its class (RFC 5936 §2.2), and to a class other than
 ///    IN, CH, and ANY. Answers another CHAOS-class question from the
-///    server's [`identity`](ServerConfig::identity), or from the
-///    authority when the server has none.
+///    server's [`identity`](ServerConfig::identity).
 /// 4. Asks the authority. For [`Step::Need`] it queues [`Action::Lookup`]
 ///    under a fresh token and waits up to
 ///    [`ask_timeout`](ServerConfig::ask_timeout). When the lookup ends, it
@@ -120,10 +119,10 @@ impl<A: Authority> AuthorityEngine<A> {
             DNSClass::IN | DNSClass::ANY | DNSClass::CH if transfer && !self.server.transfer => {
                 Some(bare_reply(&req, ResponseCode::Refused, None))
             }
-            DNSClass::CH => match self.server.render_chaos(&req) {
-                Some(bytes) => return self.answer(client, bytes),
-                None => None,
-            },
+            DNSClass::CH => {
+                let bytes = self.server.render_chaos(&req);
+                return self.answer(client, bytes);
+            }
             DNSClass::IN | DNSClass::ANY => None,
             _ => {
                 let ede = self.server.ede.then_some(EdeCode::NOT_AUTHORITATIVE);

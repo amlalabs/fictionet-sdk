@@ -1,8 +1,9 @@
 //! Zones learned from their real servers: what a learned zone answers
 //! from the responses filed into it, that an unknown fact never becomes a
-//! negative, and, on a simulated network with a fake upstream, that a
-//! lookup the world's policy refuses leaves the server silent and that a
-//! namespace advance drops what was learned.
+//! negative, which zones copies find each address serves, and, on a
+//! simulated network with a fake upstream, that a lookup the world's
+//! policy refuses leaves the server silent and that a namespace advance
+//! drops what was learned.
 
 use std::future::{Future, ready};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -10,10 +11,16 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use fictionet::stdlib::protocols::dns::dnssec::{Algorithm, KeyFlags, KeySet, Sign, ZoneKey};
+use fictionet::stdlib::protocols::dns::dnssec::proof::nodata;
+use fictionet::stdlib::protocols::dns::dnssec::rdata::DNSSECRData;
+use fictionet::stdlib::protocols::dns::dnssec::{
+    Algorithm, KeyFlags, KeySet, Proof, Sign, ZoneKey,
+};
 use fictionet::stdlib::protocols::dns::op::{Edns, Message, MessageType, OpCode, Query};
 use fictionet::stdlib::protocols::dns::rr::rdata::A;
-use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RData, Record, RecordType};
+use fictionet::stdlib::protocols::dns::rr::{
+    LowerName, Name, RData, Record, RecordSet, RecordType,
+};
 use fictionet::stdlib::protocols::dns::{Parsed, Request};
 use fictionet::stdlib::services::dns::authority::{
     Authority, AuthorityEngine, Copies, ServerConfig, Step, Zones,
@@ -79,7 +86,7 @@ fn request(qname: &str, qtype: RecordType, dnssec_ok: bool) -> Request {
 fn real(zone: &Zone, request: &Request) -> Message {
     match answer(zone, request, AnyResponse::All) {
         Answered::Response(response) => response.message,
-        Answered::Unknown { name } => panic!("a complete zone knows {name}"),
+        Answered::Unknown { name, .. } => panic!("a complete zone knows {name}"),
     }
 }
 
@@ -946,4 +953,421 @@ fn a_namespace_advance_clears_learned_data() {
         assert_eq!(upstream.asked.lock().unwrap().len(), 2);
         Ok(())
     });
+}
+
+/// `EXAMPLE` with an alias to a name outside the zone, and a wildcard
+/// alias.
+fn edges() -> String {
+    format!(
+        "{EXAMPLE}\
+out.example. 300 IN CNAME www.other.
+*.cw.example. 300 IN CNAME www.example.
+"
+    )
+}
+
+/// The NSEC RRset may sit beside a CNAME, and the one at a cut is the
+/// parent's data (RFC 4035 §2.5, §2.6), so a copy answers an NSEC
+/// question there only from what the response to that question showed:
+/// the NSEC RRset, or the CNAME or referral the real server gave for it.
+/// What other questions filed never answers it, and every answer the copy
+/// gives is the real zone's.
+#[test]
+fn an_nsec_question_is_answered_from_its_own_response() {
+    let cases: [(&[(&str, RecordType)], &str); 4] = [
+        (&[("out.example.", RecordType::A)], "out.example."),
+        (
+            &[
+                ("alias.example.", RecordType::A),
+                ("www.example.", RecordType::NSEC),
+            ],
+            "alias.example.",
+        ),
+        (&[("www.child.example.", RecordType::A)], "child.example."),
+        (&[("a.cw.example.", RecordType::A)], "a.cw.example."),
+    ];
+    for (how, zone) in three_ways(&edges()) {
+        for (filed, qname) in cases {
+            let learned = Learned::new(&name("example."));
+            for (filed_name, filed_type) in filed {
+                let asked = request(filed_name, *filed_type, true);
+                learned.file(Generation(0), &asked.question, &real(&zone, &asked));
+            }
+            for dnssec_ok in [true, false] {
+                let request = request(qname, RecordType::NSEC, dnssec_ok);
+                let got = copied(&learned, &request);
+                assert!(
+                    got.is_none(),
+                    "{how} {qname} DO {dnssec_ok}: answered before its own response, {:?}",
+                    got.as_ref().map(shape)
+                );
+            }
+            let asked = request(qname, RecordType::NSEC, true);
+            learned.file(Generation(0), &asked.question, &real(&zone, &asked));
+            for dnssec_ok in [true, false] {
+                let request = request(qname, RecordType::NSEC, dnssec_ok);
+                let got = copied(&learned, &request)
+                    .unwrap_or_else(|| panic!("{how} {qname} DO {dnssec_ok}: unknown"));
+                assert_eq!(
+                    shape(&got),
+                    shape(&real(&zone, &request)),
+                    "{how} {qname} DO {dnssec_ok}"
+                );
+            }
+        }
+    }
+}
+
+/// `EXAMPLE` with an alias and a DNAME whose chains end below the cut at
+/// `child`.
+fn into_the_cut() -> String {
+    format!(
+        "{EXAMPLE}\
+c10.example. 300 IN CNAME host.child.example.
+dn.example. 300 IN DNAME child.example.
+"
+    )
+}
+
+/// A chain that ends below a cut ends in a referral: AA, the alias in the
+/// answer section, the cut's NS RRset in the authority section, and no
+/// SOA (RFC 1034 §4.3.2 step 3b, RFC 6672 §3.2). A copy files the cut
+/// from it and answers the question as the real zone does.
+#[test]
+fn a_chain_into_a_cut_is_answered_with_its_referral() {
+    for (how, zone) in three_ways(&into_the_cut()) {
+        for qname in ["c10.example.", "www.dn.example."] {
+            let learned = Learned::new(&name("example."));
+            let asked = request(qname, RecordType::A, true);
+            learned.file(Generation(0), &asked.question, &real(&zone, &asked));
+            for dnssec_ok in [true, false] {
+                let request = request(qname, RecordType::A, dnssec_ok);
+                let got = copied(&learned, &request)
+                    .unwrap_or_else(|| panic!("{how} {qname} DO {dnssec_ok}: unknown"));
+                assert_eq!(
+                    shape(&got),
+                    shape(&real(&zone, &request)),
+                    "{how} {qname} DO {dnssec_ok}"
+                );
+            }
+        }
+    }
+}
+
+/// A referral shows only that its server holds no zone at the name it
+/// referred, nor between it and the cut (RFC 1034 §4.3.2): the copy
+/// refers that name and the names above it, and looks up any other name
+/// below the cut, which the server may answer from a zone of its own.
+#[test]
+fn a_referral_refers_only_the_name_it_was_for() {
+    let zone = Zone::from_master(EXAMPLE, None).unwrap();
+    let learned = Learned::new(&name("example."));
+    let asked = request("www.child.example.", RecordType::A, true);
+    learned.file(Generation(0), &asked.question, &real(&zone, &asked));
+    for qname in ["www.child.example.", "child.example."] {
+        let request = request(qname, RecordType::A, false);
+        let got = copied(&learned, &request).unwrap_or_else(|| panic!("{qname}: unknown"));
+        assert_eq!(shape(&got), shape(&real(&zone, &request)), "{qname}");
+    }
+    for qname in ["other.child.example.", "a.www.child.example."] {
+        let got = copied(&learned, &request(qname, RecordType::A, false));
+        assert!(got.is_none(), "{qname}: got {:?}", got.as_ref().map(shape));
+    }
+}
+
+/// A Wildcard No Data response needs the NSEC3 records matching the
+/// closest encloser and the wildcard and the one covering the next closer
+/// name (RFC 5155 §7.2.5). The proof filed for a wildcard expanded to
+/// another type and the one filed for the wildcard's own name hold only
+/// some of them, so the copy looks the question up, and answers with the
+/// real server's whole proof once that is filed.
+#[test]
+fn a_wildcard_nodata_rests_on_its_own_proof() {
+    for opt_out in [false, true] {
+        let zone = signed(Denial::Nsec3 {
+            opt_out,
+            salt: Vec::new(),
+        });
+        let learned = Learned::new(&name("example."));
+        for (qname, qtype) in [
+            ("a.wild.example.", RecordType::A),
+            ("*.wild.example.", RecordType::MX),
+        ] {
+            let asked = request(qname, qtype, true);
+            learned.file(Generation(0), &asked.question, &real(&zone, &asked));
+        }
+        let asked = request("a.wild.example.", RecordType::MX, true);
+        let got = copied(&learned, &asked);
+        assert!(
+            got.is_none(),
+            "opt-out {opt_out}: answered from two partial proofs, {:?}",
+            got.as_ref().map(shape)
+        );
+        learned.file(Generation(0), &asked.question, &real(&zone, &asked));
+        let got = copied(&learned, &asked).expect("the NODATA was filed");
+        assert_eq!(
+            shape(&got),
+            shape(&real(&zone, &asked)),
+            "opt-out {opt_out}"
+        );
+        let authority = rrsets_of(&got.authorities);
+        let proof = nodata(
+            &name("a.wild.example."),
+            RecordType::MX,
+            &name("example."),
+            &authority,
+            150,
+        );
+        assert_ne!(proof, Proof::Unproven, "opt-out {opt_out}");
+    }
+}
+
+/// The records of a section as RRsets, each with its RRSIGs.
+fn rrsets_of(records: &[Record]) -> Vec<RecordSet> {
+    let mut sets: Vec<RecordSet> = Vec::new();
+    for record in records {
+        let covered = match &record.data {
+            RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) => rrsig.input().type_covered,
+            data => data.record_type(),
+        };
+        let index = sets
+            .iter()
+            .position(|set| set.name() == &record.name && set.record_type() == covered)
+            .unwrap_or_else(|| {
+                sets.push(RecordSet::with_ttl(
+                    record.name.clone(),
+                    covered,
+                    record.ttl,
+                ));
+                sets.len() - 1
+            });
+        if record.record_type() == RecordType::RRSIG {
+            sets[index].insert_rrsig(record.clone());
+        } else {
+            sets[index].insert(record.clone(), 0);
+        }
+    }
+    sets
+}
+
+/// What `real` gives each lookup of a copy at `local`.
+type Real<'a> = &'a dyn Fn(&Lookup) -> Message;
+
+/// What `authority` at `local` replies to `request`, with each lookup it
+/// needs answered by `real` and filed, and the lookups it made. It must
+/// never need a lookup it already made, which would leave it silent.
+fn through(
+    authority: &dyn Authority,
+    real: Real<'_>,
+    local: SocketAddr,
+    request: &Request,
+) -> (Message, Vec<Lookup>) {
+    let server = ServerConfig::generic();
+    let client = Client {
+        peer: "198.51.100.7:5353".parse().unwrap(),
+        local,
+        transport: Transport::Udp,
+        connection: None,
+        sandbox: None,
+    };
+    let mut looked = Vec::new();
+    loop {
+        match authority.respond(request, local, &server, &client) {
+            Step::Reply(response) => return (response.message, looked),
+            Step::Need(lookup) => {
+                assert!(
+                    !looked.contains(&lookup),
+                    "{request:?}: {lookup:?} again, so silent"
+                );
+                authority.file(&lookup, &Looked::Response(real(&lookup)), Generation(0));
+                looked.push(lookup);
+            }
+            Step::Silent => panic!("{request:?}: silent"),
+        }
+    }
+}
+
+/// What `zones` at a real server reply to `lookup`'s question, asked with
+/// DO.
+fn reply_of(zones: &Zones, lookup: &Lookup) -> Message {
+    let asked = request(
+        &lookup.question.name().to_ascii(),
+        lookup.question.query_type(),
+        true,
+    );
+    let local: SocketAddr = SocketAddr::new(lookup.server.ip(), 53);
+    let client = Client {
+        peer: "198.51.100.7:5353".parse().unwrap(),
+        local,
+        transport: Transport::Udp,
+        connection: None,
+        sandbox: None,
+    };
+    match zones.respond(&asked, local, &ServerConfig::generic(), &client) {
+        Step::Reply(response) => response.message,
+        step => panic!("the real server gave {step:?}"),
+    }
+}
+
+/// `srv.child.example`, a zone below the cut at `child.example` that the
+/// parent's servers also serve, as the root servers serve
+/// `root-servers.net` below `net`.
+const SRV: &str = "\
+srv.child.example. 3600 IN SOA ns.example. hostmaster.example. 1 7200 3600 1209600 300
+srv.child.example. 3600 IN NS ns.example.
+www.srv.child.example. 300 IN A 192.0.2.82
+";
+
+/// A copy that holds a cut still finds a zone below it that its real
+/// servers serve: the cut refers only names a referral was filed for, so
+/// any other name is looked up at the server asked. An authoritative
+/// answer from the zone below, which need not show the zone's apex, has
+/// the server asked for the SOA RRset at the name, whose response does
+/// (RFC 2308 §3), and the zone is noted at that address. Each address
+/// finds it for itself.
+#[test]
+fn copies_find_a_zone_below_a_cut_they_hold() {
+    let real = Zones::new(vec![
+        Arc::new(Zone::from_master(EXAMPLE, None).unwrap()) as Arc<dyn ZoneData>,
+        Arc::new(Zone::from_master(SRV, None).unwrap()) as Arc<dyn ZoneData>,
+    ]);
+    let answer = |lookup: &Lookup| reply_of(&real, lookup);
+    let first: SocketAddr = "192.0.2.53:53".parse().unwrap();
+    let second: SocketAddr = "192.0.2.153:53".parse().unwrap();
+    let copies = Copies::new();
+    for local in [first, second] {
+        copies.serves(local.ip(), &lower("example."));
+    }
+    let referral = request("x.child.example.", RecordType::A, false);
+    let (got, _) = through(&copies, &answer, first, &referral);
+    assert_eq!(shape(&got), shape(&reply_of(&real, &own(first, &referral))));
+    let below = request("www.srv.child.example.", RecordType::A, false);
+    for local in [first, second] {
+        let (got, looked) = through(&copies, &answer, local, &below);
+        assert_eq!(
+            shape(&got),
+            shape(&reply_of(&real, &own(local, &below))),
+            "at {local}"
+        );
+        assert!(got.metadata.authoritative, "at {local}");
+        // The question, the SOA RRset at its name, which shows the zone
+        // the answer came from, and the question in that zone, whose copy
+        // the second address shares.
+        let asked: Vec<(LowerName, RecordType)> = looked
+            .iter()
+            .map(|lookup| (lookup.zone.clone(), lookup.question.query_type()))
+            .collect();
+        let mut want = vec![
+            (lower("example."), RecordType::A),
+            (lower("example."), RecordType::SOA),
+        ];
+        if local == first {
+            want.push((lower("srv.child.example."), RecordType::A));
+        }
+        assert_eq!(asked, want, "at {local}");
+    }
+}
+
+/// The lookup of `request`'s question at `local`, in `example`.
+fn own(local: SocketAddr, request: &Request) -> Lookup {
+    Lookup::new(local, lower("example."), &request.question)
+}
+
+/// An address noted for a zone its real server does not serve, as a
+/// lame delegation names, answers as that server does once a lookup
+/// shows it: from the zones it does serve, with the referral the real
+/// server gives, or REFUSED when none holds the name (RFC 1034 §4.3.1,
+/// RFC 8906 §3.1.1). It never stays silent.
+#[test]
+fn copies_drop_a_zone_their_real_server_does_not_serve() {
+    // `lame` is delegated to the parent's own server, which does not
+    // serve it.
+    let text = format!(
+        "{EXAMPLE}\
+lame.example. 3600 IN NS ns.lame.example.
+ns.lame.example. 3600 IN A 192.0.2.53
+"
+    );
+    let real = Zones::new(vec![
+        Arc::new(Zone::from_master(&text, None).unwrap()) as Arc<dyn ZoneData>
+    ]);
+    let answer = |lookup: &Lookup| reply_of(&real, lookup);
+    let local: SocketAddr = "192.0.2.53:53".parse().unwrap();
+    let copies = Copies::new();
+    for zone in ["example.", "lame.example.", "elsewhere.test."] {
+        copies.serves(local.ip(), &lower(zone));
+    }
+    for qname in ["www.lame.example.", "www.elsewhere.test."] {
+        for round in 0..2 {
+            let request = request(qname, RecordType::A, false);
+            let (got, _) = through(&copies, &answer, local, &request);
+            let want = reply_of(&real, &own(local, &request));
+            assert_eq!(shape(&got), shape(&want), "{qname} round {round}");
+        }
+    }
+}
+
+/// A real server that stops a chain early, as BIND does at the CNAME a
+/// DNAME makes for a CNAME question, and as it answers NODATA for NSEC at
+/// a CNAME in an NSEC3 zone: the copy goes on where the chain leads, as
+/// RFC 1034 §4.3.2 and RFC 6672 §3.2 say, and looks up the name the chain
+/// reached, so it answers as the RFCs do and never stays silent.
+#[test]
+fn a_copy_looks_up_where_a_stopped_chain_leads() {
+    let text = format!(
+        "{EXAMPLE}\
+dn.example. 300 IN DNAME target.example.
+a.target.example. 300 IN A 192.0.2.41
+"
+    );
+    let zone = signed_master(
+        &text,
+        Denial::Nsec3 {
+            opt_out: false,
+            salt: Vec::new(),
+        },
+    );
+    let zones = Zones::new(vec![Arc::new(zone.clone()) as Arc<dyn ZoneData>]);
+    let soa: Vec<Record> = real(&zone, &request("example.", RecordType::SOA, true)).answers;
+    let stopping = |lookup: &Lookup| {
+        let mut message = reply_of(&zones, lookup);
+        let qtype = lookup.question.query_type();
+        let dname = message
+            .answers
+            .iter()
+            .any(|record| record.record_type() == RecordType::DNAME);
+        let cname = message
+            .answers
+            .first()
+            .is_some_and(|record| record.record_type() == RecordType::CNAME);
+        if qtype == RecordType::CNAME && dname {
+            // The DNAME and the CNAME made from it, with their RRSIGs,
+            // and no more.
+            message.answers.retain(|record| {
+                record.name == name("dn.example.") || record.name == *lookup.question.name()
+            });
+            message.authorities.clear();
+        } else if qtype == RecordType::NSEC && cname {
+            message.answers.clear();
+            message.authorities = soa.clone();
+        }
+        message
+    };
+    let local: SocketAddr = "192.0.2.53:53".parse().unwrap();
+    let copies = Copies::new();
+    copies.serves(local.ip(), &lower("example."));
+    let cname = request("a.dn.example.", RecordType::CNAME, true);
+    let (got, looked) = through(&copies, &stopping, local, &cname);
+    assert_eq!(shape(&got), shape(&real(&zone, &cname)));
+    let reached: Vec<String> = looked
+        .iter()
+        .map(|lookup| lookup.question.name().to_ascii())
+        .collect();
+    assert_eq!(reached, ["a.dn.example.", "a.target.example."]);
+
+    let alias = request("alias.example.", RecordType::A, true);
+    through(&copies, &stopping, local, &alias);
+    let nsec = request("alias.example.", RecordType::NSEC, true);
+    let (got, _) = through(&copies, &stopping, local, &nsec);
+    assert_eq!(shape(&got), shape(&real(&zone, &nsec)));
 }

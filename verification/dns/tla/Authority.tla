@@ -11,17 +11,21 @@
 (* not settle is looked up: the server returns Need with a lookup of the   *)
 (* client's question at its own address, the driver puts it to the         *)
 (* upstream, the engine files the response into the copy the lookup names  *)
-(* and asks the authority again. For a question at or below "fict" the     *)
-(* overlay reads the edited zone's apex NS RRset and the addresses of its  *)
-(* target "ns.fict" from the lazy zone, then asks its base for "fict DS".  *)
-(* The real TLD server serves fict's parent, so the TLD server refers: a   *)
-(* referral composed from what it read, or SERVFAIL when the target's      *)
-(* address is not there. The real root server does not: its response to    *)
-(* "fict DS" refers to the TLD, a cut the root's copy files, which settles *)
-(* every name below the TLD, so the root server answers the question from  *)
-(* its copy with no second lookup. The fict server answers from a Lazy     *)
-(* zone whose Provider says, per name, Present, Absent, or Unknown, and    *)
-(* whose answers change as the world runs.                                 *)
+(* and asks the authority again. Copies::keep files some responses into    *)
+(* another copy, and drops a zone an address turns out not to serve; this  *)
+(* spec models neither (see the README). For a question at or below "fict" *)
+(* the overlay reads the edited zone's apex NS RRset and the addresses of  *)
+(* its target "ns.fict" from the lazy zone, then asks its base for "fict   *)
+(* DS". The real TLD server serves fict's parent, so the TLD server        *)
+(* refers: a referral composed from what it read, or SERVFAIL when the     *)
+(* target's address is not there. The real root server does not: its       *)
+(* response to "fict DS" refers to the TLD, a cut the root's copy files. A *)
+(* cut refers only the name a referral was for and the names above it,     *)
+(* since the real server may serve a zone below the cut at another name,   *)
+(* so the root server looks the question a.fict up too, and answers from   *)
+(* its copy. The fict server answers from a Lazy zone whose Provider says, *)
+(* per name, Present, Absent, or Unknown, and whose answers change as the  *)
+(* world runs.                                                             *)
 (*                                                                         *)
 (* Every lookup passes the world's Only policy before the upstream sees    *)
 (* it; a refused lookup gives NoReply. The upstream answers after any      *)
@@ -114,10 +118,11 @@ Referral(r) == Crosses(r) /\ Serves(r.srv)
 
 \* The questions a response to x at server z settles in z's copy. The root's
 \* response to a question below the TLD is a referral to it, a cut that
-\* settles every question below the TLD; any other response settles its own
-\* question.
+\* refers the name it was for and the names above it: the referral for
+\* a.fict settles "fict DS" too, but the one for "fict DS" does not settle
+\* a.fict. Any other response settles its own question.
 BelowTld == {"fict DS", "a.fict"}
-Settles(z, x) == IF z = "root" /\ x \in BelowTld THEN BelowTld ELSE {x}
+Settles(z, x) == IF z = "root" /\ x = "a.fict" THEN BelowTld ELSE {x}
 
 DsLookup(r) == [srv |-> r.srv, q |-> "fict DS"]
 OwnLookup(r) == [srv |-> r.srv, q |-> r.q]
@@ -160,13 +165,13 @@ VARIABLES
     waiting,   \* [Reqs -> None or the token of the lookup it waits on]
     pending,   \* the engine's pending lookups: [token, lookup, by]
     copy,      \* [Copied -> [Questions -> None or the filed response [v, val]]]
-    atSource,  \* lookups the upstream is working on: [token, lookup]
+    atUpstream, \* lookups the upstream is working on: [token, lookup]
     obsq,      \* what lookups gave, on its way back: [token, lookup, obs, v]
     reached,   \* every lookup the upstream has received
     sent       \* every response the upstream sent: [lookup, v]
 
 vars == <<world, ins, history, rev, real, realSeen, gen, st, looked, partial, reply, nNeeds,
-          waiting, pending, copy, atSource, obsq, reached, sent>>
+          waiting, pending, copy, atUpstream, obsq, reached, sent>>
 
 FactAt(s, n) == IF n \in s.ins THEN "present" ELSE Provider(s.w, n)
 Fact(n) == FactAt([w |-> world, ins |-> ins], n)
@@ -192,7 +197,7 @@ Init ==
     /\ waiting = [r \in Reqs |-> None]
     /\ pending = {}
     /\ copy = [z \in Copied |-> EmptyCopy]
-    /\ atSource = {}
+    /\ atUpstream = {}
     /\ obsq = {}
     /\ reached = {}
     /\ sent = {}
@@ -244,7 +249,7 @@ View(r) ==
            /\ Grow(Inserted(r.q, fq, fw))
     /\ st' = [st EXCEPT ![r] = "done"]
     /\ UNCHANGED <<world, real, realSeen, gen, looked, partial, nNeeds, waiting, pending, copy,
-                   atSource, obsq, reached, sent>>
+                   atUpstream, obsq, reached, sent>>
 
 (* With MixedRevision the view reads the name under one lock acquisition... *)
 ReadName(r) ==
@@ -255,7 +260,7 @@ ReadName(r) ==
     /\ Grow(IF Fact(r.q) = "present" THEN {r.q} ELSE {})
     /\ st' = [st EXCEPT ![r] = "reading"]
     /\ UNCHANGED <<world, real, realSeen, gen, looked, reply, nNeeds, waiting, pending, copy,
-                   atSource, obsq, reached, sent>>
+                   atUpstream, obsq, reached, sent>>
 
 (* ...and the wildcard under another. *)
 ReadRest(r) ==
@@ -267,7 +272,7 @@ ReadRest(r) ==
     /\ partial' = [partial EXCEPT ![r] = None]
     /\ st' = [st EXCEPT ![r] = "done"]
     /\ UNCHANGED <<world, real, realSeen, gen, looked, nNeeds, waiting, pending, copy,
-                   atSource, obsq, reached, sent>>
+                   atUpstream, obsq, reached, sent>>
 
 (* The engine calls respond. An overlay first reads the edited zone's apex *)
 (* NS RRset and the address of its target under one view of the lazy      *)
@@ -283,7 +288,7 @@ ReadOverlay(r) ==
            /\ Grow(IF fn = "present" THEN {NsTarget} ELSE {})
     /\ st' = [st EXCEPT ![r] = "overlay"]
     /\ UNCHANGED <<world, real, realSeen, gen, looked, reply, nNeeds, waiting, pending, copy,
-                   atSource, obsq, reached, sent>>
+                   atUpstream, obsq, reached, sent>>
 
 \* The reply copy z gives for q from the response e that settles it.
 CopyReply(e, q) ==
@@ -333,12 +338,12 @@ Step(r) ==
               THEN /\ reply' = [reply EXCEPT ![r] = s.reply]
                    /\ st' = [st EXCEPT ![r] = "done"]
                    /\ partial' = released
-                   /\ UNCHANGED <<nNeeds, waiting, pending, atSource, obsq, reached>>
+                   /\ UNCHANGED <<nNeeds, waiting, pending, atUpstream, obsq, reached>>
               ELSE IF s.lookup \in looked[r] /\ ~Reask
               THEN /\ reply' = [reply EXCEPT ![r] = Reply("SILENT", None, {}, {})]
                    /\ st' = [st EXCEPT ![r] = "done"]
                    /\ partial' = released
-                   /\ UNCHANGED <<nNeeds, waiting, pending, atSource, obsq, reached>>
+                   /\ UNCHANGED <<nNeeds, waiting, pending, atUpstream, obsq, reached>>
               ELSE LET a == s.lookup
                        tok == <<gen, r.id, nNeeds[r]>>
                        shared == {p \in pending : p.lookup = a}
@@ -347,23 +352,23 @@ Step(r) ==
                        /\ partial' = IF ParkInView THEN partial ELSE released
                        /\ IF shared # {} /\ ~NoShare
                           THEN /\ waiting' = [waiting EXCEPT ![r] = (CHOOSE p \in shared : TRUE).token]
-                               /\ UNCHANGED <<pending, atSource, obsq, reached>>
+                               /\ UNCHANGED <<pending, atUpstream, obsq, reached>>
                           ELSE /\ waiting' = [waiting EXCEPT ![r] = tok]
                                /\ pending' = pending \cup {[token |-> tok, lookup |-> a, by |-> r]}
                                /\ IF PolicyPasses(a)
-                                  THEN /\ atSource' = atSource \cup {[token |-> tok, lookup |-> a]}
+                                  THEN /\ atUpstream' = atUpstream \cup {[token |-> tok, lookup |-> a]}
                                        /\ reached' = reached \cup {a}
                                        /\ UNCHANGED obsq
                                   ELSE /\ obsq' = obsq \cup {[token |-> tok, lookup |-> a, obs |-> "noreply",
                                                               v |-> None]}
-                                       /\ UNCHANGED <<atSource, reached>>
+                                       /\ UNCHANGED <<atUpstream, reached>>
                        /\ UNCHANGED reply
     /\ UNCHANGED <<world, real, realSeen, gen, looked, copy, sent>>
 
 (* The upstream finishes a lookup: the real server's response as it is now, *)
 (* or a failure.                                                           *)
-SourceOne(x) ==
-    /\ atSource' = atSource \ {x}
+UpstreamOne(x) ==
+    /\ atUpstream' = atUpstream \ {x}
     /\ \E o \in (IF Failures THEN Observations ELSE {"reply"}) :
          /\ obsq' = obsq \cup {[token |-> x.token, lookup |-> x.lookup, obs |-> o,
                                 v |-> IF o = "reply" THEN real ELSE None]}
@@ -376,8 +381,9 @@ SourceOne(x) ==
 FiledInto(l) == IF AnyZone THEN Copied ELSE {l.srv}
 
 (* What a lookup gave comes back. Only a pending token counts: the engine  *)
-(* files a response into the copy the lookup names, then asks the          *)
-(* authority again for every request that waited on the lookup.            *)
+(* files a response into the copy the lookup names, as Copies::keep does   *)
+(* for a response from the zone the lookup names, then asks the authority  *)
+(* again for every request that waited on the lookup.                      *)
 ObserveOne(o) ==
     /\ obsq' = obsq \ {o}
     /\ IF \E p \in pending : p.token = o.token
@@ -394,7 +400,7 @@ ObserveOne(o) ==
                 /\ looked' = [r \in Reqs |-> IF r \in woken THEN looked[r] \cup {o.lookup} ELSE looked[r]]
                 /\ waiting' = [r \in Reqs |-> IF r \in woken THEN None ELSE waiting[r]]
        ELSE UNCHANGED <<pending, copy, st, looked, waiting>>
-    /\ UNCHANGED <<world, ins, history, rev, real, realSeen, gen, partial, reply, nNeeds, atSource,
+    /\ UNCHANGED <<world, ins, history, rev, real, realSeen, gen, partial, reply, nNeeds, atUpstream,
                    reached, sent>>
 
 (* The world runs: the provider's answers change, a new revision. *)
@@ -405,14 +411,14 @@ WorldChange ==
     /\ history' = history \cup {[w |-> 1, ins |-> ins]}
     /\ rev' = rev + 1
     /\ UNCHANGED <<ins, real, realSeen, gen, st, looked, partial, reply, nNeeds, waiting, pending,
-                   copy, atSource, obsq, reached, sent>>
+                   copy, atUpstream, obsq, reached, sent>>
 
 RealChange ==
     /\ real < MaxRealChanges
     /\ real' = real + 1
     /\ realSeen' = realSeen \cup {real + 1}
     /\ UNCHANGED <<world, ins, history, rev, gen, st, looked, partial, reply, nNeeds, waiting,
-                   pending, copy, atSource, obsq, reached, sent>>
+                   pending, copy, atUpstream, obsq, reached, sent>>
 
 (* A new session: every copy drops what it learned, the pending lookups    *)
 (* are abandoned, and parked requests restart under the new generation     *)
@@ -426,10 +432,10 @@ Advance ==
     /\ looked' = [r \in Reqs |-> IF st[r] = "done" THEN looked[r] ELSE {}]
     /\ nNeeds' = [r \in Reqs |-> IF st[r] = "done" THEN nNeeds[r] ELSE 0]
     /\ waiting' = [r \in Reqs |-> None]
-    /\ UNCHANGED <<world, ins, history, rev, real, realSeen, partial, reply, atSource, obsq,
+    /\ UNCHANGED <<world, ins, history, rev, real, realSeen, partial, reply, atUpstream, obsq,
                    reached, sent>>
 
-Source == \E x \in atSource : SourceOne(x)
+Upstream == \E x \in atUpstream : UpstreamOne(x)
 Observe == \E o \in obsq : ObserveOne(o)
 
 \* No respond is half done: no overlay has read the lazy zone and not yet
@@ -442,7 +448,7 @@ Next ==
     \/ \E r \in Reqs : Quiet(ReadRest(r))
     \/ \E r \in Reqs : Quiet(ReadOverlay(r))
     \/ \E r \in Reqs : Step(r)
-    \/ Quiet(Source)
+    \/ Quiet(Upstream)
     \/ Quiet(Observe)
     \/ Quiet(WorldChange)
     \/ Quiet(RealChange)
@@ -454,7 +460,7 @@ Fairness ==
     /\ \A r \in Reqs : /\ WF_vars(Quiet(View(r))) /\ WF_vars(Quiet(ReadName(r)))
                        /\ WF_vars(Quiet(ReadRest(r))) /\ WF_vars(Quiet(ReadOverlay(r)))
                        /\ WF_vars(Step(r))
-    /\ WF_vars(Quiet(Source))
+    /\ WF_vars(Quiet(Upstream))
     /\ WF_vars(Quiet(Observe))
 
 Spec == Init /\ [][Next]_vars
@@ -489,12 +495,13 @@ CoherentRevision ==
     \A r \in Reqs : reply[r] # None =>
         \E s \in history : \A f \in reply[r].facts : FactAt(s, f[1]) = f[2]
 
-(* A request needs at most one lookup per generation: the question itself,  *)
-(* or for a crossing question the overlay's "fict DS", whose response       *)
-(* settles the question at the root. Requests that need the same lookup     *)
-(* wait on one: no two pending lookups are the same.                        *)
+(* A request needs at most one lookup per fact per generation: the         *)
+(* question itself, and for a crossing question the overlay's "fict DS"    *)
+(* first, whose response at the root refers fict but not a.fict. Requests  *)
+(* that need the same lookup wait on one: no two pending lookups are the   *)
+(* same.                                                                   *)
 OneAskPerNeed ==
-    /\ \A r \in Reqs : nNeeds[r] <= 1
+    /\ \A r \in Reqs : nNeeds[r] <= IF Crosses(r) THEN 2 ELSE 1
     /\ \A p1, p2 \in pending : p1.lookup = p2.lookup => p1 = p2
 
 (* No lookup goes out again for a request once it came back to it (the    *)

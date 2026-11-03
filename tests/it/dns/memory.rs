@@ -176,7 +176,7 @@ fn a_learned_server_in_memory_files_what_its_upstream_gives_and_is_silent_withou
         };
         match answer(&zone, &req, AnyResponse::All) {
             Answered::Response(response) => Looked::Response(response.message),
-            Answered::Unknown { name } => panic!("a complete zone knows {name}"),
+            Answered::Unknown { name, .. } => panic!("a complete zone knows {name}"),
         }
     });
     for id in [10, 11] {

@@ -325,8 +325,6 @@ struct Stored {
     /// its parent reaches it, so this still finds the zone's servers
     /// (RFC 2181 §5.4.1, RFC 1034 §5.3.3).
     glue: Option<Entry>,
-    /// When the entry was stored.
-    at: Instant,
     generation: Generation,
 }
 
@@ -469,7 +467,6 @@ impl Cache {
                 entry: entry.clone(),
                 under: None,
                 glue: glue(self, &asked),
-                at: now,
                 generation: self.generation,
             };
             self.entries.insert(asked, stored);
@@ -481,7 +478,6 @@ impl Cache {
                 entry,
                 under,
                 glue,
-                at: now,
                 generation: self.generation,
             },
         );
@@ -588,11 +584,12 @@ impl Cache {
     /// the live entry there still holds that data: data stored at the key
     /// meanwhile has not been checked, and keeps what it had.
     ///
-    /// A Secure RRset then lives no longer than `signatures_expire`, the
-    /// first expiration of the RRSIGs that proved it, nor longer than
-    /// `ttl`, the smallest own TTL or Original TTL among those RRSIGs, from
-    /// when it was stored (RFC 4035 §5.3.3). RRSIGs that did not prove it
-    /// bound nothing. A Bogus or Indeterminate RRset lives no longer than
+    /// A Secure RRset then lives no longer than `secure_until`, when the
+    /// RRSIGs that proved it stop making it Secure: the first of them
+    /// expires, or the smallest own TTL or Original TTL among them runs
+    /// out, counted from when the TTLs of the data that was checked were
+    /// current (RFC 4035 §5.3.3). RRSIGs that did not prove it bound
+    /// nothing. A Bogus or Indeterminate RRset lives no longer than
     /// [`Limits::failure_ttl`]: the result is a failure, so it is answered
     /// as one for that long and then fetched and validated again
     /// (RFC 9520 §3.2, RFC 4035 §4.7). The result of an NXDOMAIN,
@@ -603,8 +600,7 @@ impl Cache {
         key: &Key,
         checked: &Checked,
         result: Validation,
-        signatures_expire: Option<Instant>,
-        ttl: Option<u32>,
+        secure_until: Option<Instant>,
         now: Instant,
     ) {
         let mut keys = vec![key.clone()];
@@ -612,7 +608,7 @@ impl Cache {
             keys.extend(self.nxdomain_copies(key));
         }
         for key in keys {
-            self.validated_one(&key, checked, result, signatures_expire, ttl, now);
+            self.validated_one(&key, checked, result, secure_until, now);
         }
     }
 
@@ -643,8 +639,7 @@ impl Cache {
         key: &Key,
         checked: &Checked,
         result: Validation,
-        signatures_expire: Option<Instant>,
-        ttl: Option<u32>,
+        secure_until: Option<Instant>,
         now: Instant,
     ) {
         let generation = self.generation;
@@ -657,11 +652,6 @@ impl Cache {
         {
             return;
         }
-        let ttl = ttl.map(|ttl| stored.at + seconds(ttl));
-        let signatures_expire = match (signatures_expire, ttl) {
-            (Some(expire), Some(ttl)) => Some(expire.min(ttl)),
-            (expire, ttl) => expire.or(ttl),
-        };
         match &mut stored.entry {
             Entry::Positive {
                 validation,
@@ -675,7 +665,7 @@ impl Cache {
             } => {
                 *validation = result;
                 let cap = match result {
-                    Validation::Secure => signatures_expire,
+                    Validation::Secure => secure_until,
                     Validation::Bogus(_) | Validation::Indeterminate => {
                         Some(now + self.limits.failure_ttl)
                     }
@@ -690,23 +680,24 @@ impl Cache {
     }
 
     /// Keeps `nsec`, NSEC RRsets that validated Secure with the zone's
-    /// `soa`, until their TTL runs out, so that names they cover are denied
-    /// without asking (RFC 8198 §5.1). Each, and the SOA, is kept no
-    /// longer than the time given with it, when its RRSIGs stop making it
-    /// Secure (RFC 4035 §5.3.3, RFC 8198 §5.4).
+    /// `soa`, until their TTL runs out, counted from `at`, when their TTLs
+    /// were current, so that names they cover are denied without asking
+    /// (RFC 8198 §5.1). Each, and the SOA, is kept no longer than the time
+    /// given with it, when its RRSIGs stop making it Secure
+    /// (RFC 4035 §5.3.3, RFC 8198 §5.4).
     pub fn add_secure_nsec(
         &mut self,
         soa: &RecordSet,
         soa_until: Option<Instant>,
         nsec: &[(RecordSet, Option<Instant>)],
-        now: Instant,
+        at: Instant,
     ) {
         let zone = LowerName::new(soa.name());
         let soa = normalized(soa);
         let capped =
             |expires: Instant, until: Option<Instant>| until.map_or(expires, |u| expires.min(u));
         let soa_expires = capped(
-            now + seconds(soa.ttl()).min(self.limits.max_negative_ttl),
+            at + seconds(soa.ttl()).min(self.limits.max_negative_ttl),
             soa_until,
         );
         let entry = self.nsec.entry(zone).or_insert_with(|| SecureNsec {
@@ -719,7 +710,7 @@ impl Cache {
         for (set, until) in nsec {
             let set = normalized(set);
             let expires = capped(
-                now + seconds(set.ttl()).min(self.limits.max_negative_ttl),
+                at + seconds(set.ttl()).min(self.limits.max_negative_ttl),
                 *until,
             );
             entry
@@ -941,7 +932,7 @@ pub(super) fn ttl_left(expires: Instant, now: Instant) -> u32 {
 
 /// A TTL as a duration. A TTL with the top bit set reads as 0
 /// (RFC 2181 §8).
-fn seconds(ttl: u32) -> Duration {
+pub(super) fn seconds(ttl: u32) -> Duration {
     if ttl & 0x8000_0000 != 0 {
         Duration::ZERO
     } else {

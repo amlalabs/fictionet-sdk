@@ -22,7 +22,19 @@ pub enum Answered {
     Unknown {
         /// The name whose fact is unknown.
         name: LowerName,
+        /// The name the answer had reached: QNAME, or the target of the
+        /// last CNAME or DNAME the chain followed (RFC 1034 §4.3.2 step
+        /// 3a, RFC 6672 §3.2). A learned zone looks this name up with
+        /// QTYPE.
+        reached: LowerName,
     },
+}
+
+/// Where [`resolve`] stopped: the fact the view does not know, and the
+/// name the answer had reached.
+pub(super) struct Stopped {
+    name: LowerName,
+    reached: LowerName,
 }
 
 /// What a server sends for QTYPE ANY (RFC 8482 §4).
@@ -99,7 +111,10 @@ pub fn answer(view: &dyn View, req: &Request, any: AnyResponse) -> Answered {
     let dnssec_ok = req.edns.is_some_and(|edns| edns.dnssec_ok);
     match resolve(view, &qname, qtype, dnssec_ok, any) {
         Ok(found) => Answered::Response(found.response(req, dnssec_ok)),
-        Err(name) => Answered::Unknown { name },
+        Err(stopped) => {
+            let Stopped { name, reached } = *stopped;
+            Answered::Unknown { name, reached }
+        }
     }
 }
 
@@ -150,15 +165,15 @@ impl Found {
     }
 }
 
-/// The answer's sections, or the name whose fact the view does not know.
-/// `Lazy` runs this to learn which names an answer reads.
+/// The answer's sections, or where it stopped on a fact the view does not
+/// know. `Lazy` runs this to learn which names an answer reads.
 pub(super) fn resolve(
     view: &dyn View,
     qname: &LowerName,
     qtype: RecordType,
     dnssec_ok: bool,
     any: AnyResponse,
-) -> Result<Found, LowerName> {
+) -> Result<Found, Box<Stopped>> {
     let walk = Walk {
         view,
         qtype,
@@ -293,12 +308,18 @@ impl<'v> Walk<'v> {
     /// The RCODE is the last name's (RFC 6604 §2). An RRset the chain
     /// reaches twice, such as a DNAME it passes again, goes out once
     /// (RFC 2181 §5).
-    fn chase(&self, mut name: LowerName) -> Result<Found, LowerName> {
+    fn chase(&self, mut name: LowerName) -> Result<Found, Box<Stopped>> {
         let mut seen = Vec::new();
         let mut answer = Vec::new();
         let mut proofs = Vec::new();
         loop {
-            match self.step(&name)? {
+            let step = self.step(&name).map_err(|unknown| {
+                Box::new(Stopped {
+                    name: unknown,
+                    reached: name.clone(),
+                })
+            })?;
+            match step {
                 Out::Done(mut found) => {
                     found.aa |= !answer.is_empty();
                     answer.append(&mut found.answer);

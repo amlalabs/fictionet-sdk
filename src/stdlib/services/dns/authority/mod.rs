@@ -25,7 +25,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use fictionet::stdlib::protocols::dns::op::ResponseCode;
-use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, RecordType};
+use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, Name, RecordType};
 use fictionet::stdlib::protocols::dns::{EdeCode, Request, Response, label_count};
 
 use super::exchange::{Client, Generation};
@@ -63,9 +63,9 @@ pub enum Step {
 /// synchronously by the engine, so it must return quickly.
 ///
 /// `respond` depends on its arguments and on what the authority's zones
-/// hold. Filing only adds facts, so a request that needs a lookup it
-/// already made gets no reply from the engine, and each request ends
-/// within as many steps as it has distinct lookups.
+/// hold. A request that needs a lookup it already made gets no reply from
+/// the engine, since what that lookup gave did not settle the fact, so
+/// each request ends within as many steps as it has distinct lookups.
 pub trait Authority: Send + Sync + 'static {
     /// The step for `req`, which `client` sent to the server at `local`,
     /// whose front is `server`.
@@ -120,7 +120,9 @@ impl<A: Authority + ?Sized> Authority for Arc<A> {
 /// the zone at the apex answers NODATA. A view that does not know a fact
 /// the reply needs never gives a negative: a [learned](super::zone::Learned)
 /// zone looks the question up at the server's own address
-/// ([`Step::Need`]), and any other zone gives SERVFAIL. A QNAME no hosted
+/// ([`Step::Need`]), or, once the response to it was filed, the name a
+/// CNAME or DNAME chain led to where the answer still stops, and any
+/// other zone gives SERVFAIL. A QNAME no hosted
 /// zone contains gets REFUSED, with Extended DNS Error 20, Not
 /// Authoritative, when the front sends them (RFC 8914 §4.21). Zone
 /// transfers are refused: zone data makes views for questions, not
@@ -152,6 +154,14 @@ impl Zones {
 /// `zone`'s step for `req` at the server at `local`, whose front is
 /// `server`: its answer, a lookup of what a learned zone lacks, or
 /// SERVFAIL when another zone lacks a fact.
+///
+/// A learned zone looks the client's question up. A server that answers
+/// as RFC 1034 and RFC 6672 say carries the whole CNAME and DNAME chain
+/// in its response. When the response to the client's question was filed
+/// and the answer still stops at a name the chain led to in the zone, as
+/// when a server stops a chain early, the zone looks that name up with
+/// QTYPE instead, as the walk starts again there (RFC 1034 §4.3.2 step
+/// 3a, RFC 6672 §3.2).
 fn answer_from(
     zone: &dyn ZoneData,
     req: &Request,
@@ -160,8 +170,12 @@ fn answer_from(
 ) -> Step {
     match answer(&*zone.view(&req.question), req, server.any) {
         Answered::Response(response) => Step::Reply(response),
-        Answered::Unknown { .. } if zone.learned().is_some() => {
-            Step::Need(Lookup::new(local, zone.apex().clone(), &req.question))
+        Answered::Unknown { reached, .. } if let Some(learned) = zone.learned() => {
+            let mut question = req.question.clone();
+            if LowerName::new(question.name()) != reached && learned.answered(&req.question) {
+                question.set_name(Name::from(reached));
+            }
+            Step::Need(Lookup::new(local, zone.apex().clone(), &question))
         }
         Answered::Unknown { .. } => Step::Reply(bare_reply(req, ResponseCode::ServFail, None)),
     }

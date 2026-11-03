@@ -178,17 +178,22 @@ impl<V: Verify> Resolver<V> {
                     }
                 }
             };
+            // A chain that passes one DNAME twice sends it once
+            // (RFC 2181 §5).
+            let dnames = |proof: &[RecordSet], message: &mut Message| {
+                for set in proof.iter().filter(|set| is_dname(set)) {
+                    push_once(&mut message.answers, &ttl(set), dnssec_ok);
+                }
+            };
             match &piece.outcome {
                 Outcome::Alias { cname, proof, .. } => {
-                    let dname = proof.iter().filter(|set| is_dname(set));
-                    for set in dname.chain(std::iter::once(cname)) {
-                        push(&mut message.answers, &ttl(set), dnssec_ok);
-                    }
+                    dnames(proof, &mut message);
+                    push(&mut message.answers, &ttl(cname), dnssec_ok);
                     prove(proof, &mut message);
                 }
                 Outcome::Data { sets, proof, .. } => {
-                    let dname = proof.iter().filter(|set| is_dname(set));
-                    for set in dname.chain(sets.iter().filter(|set| keep(set))) {
+                    dnames(proof, &mut message);
+                    for set in sets.iter().filter(|set| keep(set)) {
                         push(&mut message.answers, &ttl(set), dnssec_ok);
                     }
                     prove(proof, &mut message);
@@ -206,9 +211,11 @@ impl<V: Verify> Resolver<V> {
                     for set in soa.iter() {
                         push(&mut message.authorities, &ttl(set), dnssec_ok);
                     }
+                    // A wildcard alias before it may have carried some of
+                    // the same records.
                     if dnssec_ok {
                         for set in denial {
-                            push(&mut message.authorities, &ttl(set), dnssec_ok);
+                            push_once(&mut message.authorities, &ttl(set), dnssec_ok);
                         }
                     }
                 }
@@ -264,12 +271,14 @@ impl<V: Verify> Resolver<V> {
             let Outcome::Alias { cname, proof, .. } = &piece.outcome else {
                 continue;
             };
-            let dname = proof.iter().filter(|set| is_dname(set));
-            for set in dname.chain(std::iter::once(cname)) {
+            let ttl = |set: &RecordSet| {
                 let ttl = Duration::from_secs(u64::from(set.ttl().min(max_ttl)));
-                let left = ttl_left(piece.at + ttl, self.now);
-                push(&mut message.answers, &with_ttl(set, left), dnssec_ok);
+                with_ttl(set, ttl_left(piece.at + ttl, self.now))
+            };
+            for dname in proof.iter().filter(|set| is_dname(set)) {
+                push_once(&mut message.answers, &ttl(dname), dnssec_ok);
             }
+            push(&mut message.answers, &ttl(cname), dnssec_ok);
         }
         let mut at = name.clone();
         let ns = loop {
