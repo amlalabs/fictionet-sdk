@@ -66,11 +66,14 @@ const BAD_REQUEST: &str = "<html>
 ";
 
 /// SSH: the identification line, then reads until the client goes or
-/// [`LOGIN_GRACE`] passes.
+/// [`LOGIN_GRACE`] passes. No keepalives: sshd asks for them, but on Linux
+/// the first comes after two hours idle (`tcp_keepalive_time`), long after
+/// the grace time ends the connection.
 pub struct Ssh;
 
 impl PortServer for Ssh {
     fn serve(&self, fcx: Cx, arrival: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        arrival.socket.set_keep_alive(None);
         let mut conn = arrival.conn;
         Box::pin(async move {
             let deadline = fcx.now() + LOGIN_GRACE;
@@ -85,7 +88,8 @@ impl PortServer for Ssh {
 
 /// HTTP: reads one request head and answers with nginx's default page,
 /// then closes. A head longer than [`HEADER_LIMIT`] gets a 400, and one
-/// that takes longer than [`HEADER_TIMEOUT`] gets nothing.
+/// that takes longer than [`HEADER_TIMEOUT`] gets nothing. No keepalives,
+/// as nginx asks for none.
 pub struct Http {
     /// The wall clock, for the `Date` header.
     pub clock: Clock,
@@ -93,6 +97,7 @@ pub struct Http {
 
 impl PortServer for Http {
     fn serve(&self, fcx: Cx, arrival: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        arrival.socket.set_keep_alive(None);
         let mut conn = arrival.conn;
         let clock = self.clock;
         Box::pin(async move {

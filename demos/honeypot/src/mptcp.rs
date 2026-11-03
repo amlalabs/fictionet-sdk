@@ -40,15 +40,24 @@
 //! (section 3.6). One that names a connection on another port gets
 //! "administratively prohibited", since the server announces no other
 //! port. Otherwise the SYN-ACK carries MP_JOIN, the server's truncated
-//! HMAC and a random number. The third ACK must carry the client's HMAC.
-//! When the HMAC is right and the connection has fewer than
-//! [`MAX_SUBFLOWS`] joined subflows, the subflow is taken. Otherwise it is
-//! refused with MP_TCPRST "administratively prohibited". A joined subflow
-//! carries nothing from the server: whatever the client sends on it is
-//! read, and logged by the observer, and the subflow closes when its
-//! connection is gone. A join whose SYN was answered with a SYN cookie
-//! cannot be checked, since nothing of its SYN was kept, and is refused
-//! at its third ACK.
+//! HMAC and a random number. The third ACK must carry the client's HMAC:
+//! one with no MP_JOIN is refused with MP_TCPRST "MPTCP-specific error",
+//! as Linux refuses a join it would have to fall back. When the HMAC is
+//! right and the connection has fewer than [`MAX_SUBFLOWS`] joined
+//! subflows, the subflow is taken. Otherwise it is refused with
+//! "administratively prohibited", and so is one whose connection has gone.
+//! A joined subflow carries nothing from the server: whatever the client
+//! sends on it is read, and logged by the observer, and the subflow closes
+//! when its connection is gone.
+//!
+//! A join SYN that gets a SYN cookie is refused with "administratively
+//! prohibited" when its connection is full. Otherwise what it carried is
+//! kept as Linux keeps it (subflow_init_req_cookie_join_save): in one of
+//! [`JOIN_COOKIE_SLOTS`] slots, picked by a keyed hash of its sequence
+//! number and ports, which a later join SYN may take. The ACK that returns
+//! the cookie with MP_JOIN takes it back, and is checked as any other.
+//! When the slot is empty or another join took it, or the connection has
+//! gone, that ACK is dropped with no answer (mptcp_subflow_init_cookie_req).
 //!
 //! [`Tokens`] holds the token, keys and port of each open connection that
 //! negotiated MPTCP, from when it is accepted until it is gone, with its
@@ -57,6 +66,8 @@
 
 use std::collections::HashMap;
 use std::future::{Future, poll_fn};
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::net::SocketAddr;
 use std::pin::{Pin, pin};
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
@@ -64,7 +75,7 @@ use std::task::{Context, Poll, Waker};
 use fictionet::Cx;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::network::tcp::{
-    AckAnswer, Answer, Handshake, Received, Segments, Sent, SynAnswer, TcpOption,
+    AckAnswer, Answer, Handshake, Kept, Received, Segments, Sent, Syn, SynAnswer, TcpOption,
 };
 use fictionet::stdlib::network::{Connection, ConnectionExt};
 use fictionet::stdlib::protocols::mptcp::{
@@ -242,6 +253,55 @@ impl Drop for Joined {
     }
 }
 
+/// How many joins answered with a SYN cookie Linux keeps at once
+/// (COOKIE_JOIN_SLOTS).
+pub const JOIN_COOKIE_SLOTS: usize = 1024;
+
+/// What a join SYN that got a SYN cookie carried, and the token it named.
+struct JoinCookie {
+    token: u32,
+    kept: Kept,
+}
+
+/// The joins answered with SYN cookies, as Linux keeps them: see the
+/// [module docs](self).
+struct JoinCookies {
+    /// The key of the hash that picks a slot.
+    secret: u64,
+    slots: Vec<Option<JoinCookie>>,
+}
+
+impl JoinCookies {
+    fn new(secret: u64) -> JoinCookies {
+        JoinCookies {
+            secret,
+            slots: (0..JOIN_COOKIE_SLOTS).map(|_| None).collect(),
+        }
+    }
+
+    /// The slot of the SYN with sequence number `seq` from port `from` to
+    /// port `to`.
+    fn slot(&self, seq: u32, from: u16, to: u16) -> usize {
+        let mut hasher = DefaultHasher::new();
+        (self.secret, seq, from, to).hash(&mut hasher);
+        (hasher.finish() % JOIN_COOKIE_SLOTS as u64) as usize
+    }
+
+    /// Keeps `cookie` for the SYN with sequence number `seq` from port
+    /// `from` to port `to`, in place of whatever its slot held.
+    fn save(&mut self, seq: u32, from: u16, to: u16, cookie: JoinCookie) {
+        let slot = self.slot(seq, from, to);
+        self.slots[slot] = Some(cookie);
+    }
+
+    /// Takes back what the slot of the SYN with sequence number `seq` from
+    /// port `from` to port `to` holds, and empties it.
+    fn take(&mut self, seq: u32, from: u16, to: u16) -> Option<JoinCookie> {
+        let slot = self.slot(seq, from, to);
+        self.slots[slot].take()
+    }
+}
+
 /// The MPTCP options in a list of TCP options, read with the stdlib
 /// codec. Options it cannot read are left out, as a host ignores them.
 pub fn mptcp_options(options: &[TcpOption]) -> impl Iterator<Item = MptcpOption> + '_ {
@@ -341,16 +401,15 @@ fn read_ack(options: &[TcpOption], payload: usize) -> (Option<AckCapable>, Optio
     (capable, hmac)
 }
 
-/// How a listener answers a SYN with `options` on `port`. `random` gives
-/// the key of a new MPTCP connection and the random number of a join's
-/// SYN-ACK.
+/// How a listener answers `syn` on `port`. `random` gives the key of a new
+/// MPTCP connection and the random number of a join's SYN-ACK.
 pub fn answer_syn(
-    options: &[TcpOption],
+    syn: &Syn<'_>,
     port: u16,
     tokens: &Tokens,
     mut random: impl FnMut() -> u64,
 ) -> SynAnswer {
-    let offer = SynOffer::read(options);
+    let offer = SynOffer::read(syn.options);
     match (offer.capable, offer.join) {
         (Some(checksums), None) => {
             // Linux draws again for a key of 0 or one whose token is open.
@@ -372,6 +431,11 @@ pub fn answer_syn(
         (None, Some((token, their_random))) => match tokens.keys(token) {
             None => SynAnswer::Refuse(vec![tcprst(reason::MPTCP_SPECIFIC)]),
             Some(_) if tokens.port(token) != Some(port) => {
+                SynAnswer::Refuse(vec![tcprst(reason::ADMINISTRATIVELY_PROHIBITED)])
+            }
+            // A SYN cookie's join is checked for room now, as nothing but
+            // what the cookie table keeps is left at its ACK.
+            Some(_) if syn.cookie && tokens.joined(token) >= MAX_SUBFLOWS => {
                 SynAnswer::Refuse(vec![tcprst(reason::ADMINISTRATIVELY_PROHIBITED)])
             }
             Some(keys) => {
@@ -429,18 +493,21 @@ pub enum Completion {
     /// An MPTCP connection.
     Mptcp(Negotiated),
     /// A subflow joining a connection. `None` when its SYN was answered
-    /// with a SYN cookie, so nothing of it is left to check the join by.
+    /// with a SYN cookie and the listener had nothing of it left to check
+    /// the join by: Linux drops its ACK.
     Join(Option<JoinAck>),
     /// An ACK Linux drops.
     Drop,
 }
 
 /// What `handshake` set up. The server's key is the one its SYN-ACK sent
-/// or, after a SYN cookie, the one the third ACK echoes.
+/// or, after a SYN cookie, the one the third ACK echoes. A join's SYN and
+/// SYN-ACK after a SYN cookie are what the listener kept of them, if
+/// anything.
 pub fn complete(handshake: &Handshake) -> Completion {
     let (capable, hmac) = read_ack(&handshake.ack, handshake.ack_payload);
     let Some(syn_ack) = &handshake.syn_ack else {
-        // A SYN cookie: the ACK says it all.
+        // A SYN cookie with nothing kept: the ACK says it all.
         return match (capable, hmac) {
             (Some(_), Some(_)) => Completion::Drop,
             (Some(c), None) if c.sender == 0 => Completion::Drop,
@@ -505,15 +572,19 @@ pub fn answer_ack(handshake: &Handshake, tokens: &Tokens) -> AckAnswer {
         Completion::Plain => AckAnswer::Accept,
         Completion::Mptcp(n) if n.cookie && tokens.knows(token(n.keys.local)) => AckAnswer::Drop,
         Completion::Mptcp(_) => AckAnswer::Accept,
-        Completion::Drop => AckAnswer::Drop,
-        Completion::Join(None) => prohibited(),
+        Completion::Drop | Completion::Join(None) => AckAnswer::Drop,
         Completion::Join(Some(join)) => {
+            // A join cannot fall back to TCP, so Linux refuses one whose
+            // ACK has no MP_JOIN it takes before it looks for the
+            // connection (subflow_syn_recv_sock).
+            let Some(hmac) = join.hmac else {
+                return AckAnswer::Refuse(vec![tcprst(reason::MPTCP_SPECIFIC)]);
+            };
             let Some(keys) = tokens.keys(join.token) else {
                 return prohibited();
             };
             let expected = join_hmac(keys.remote, keys.local, join.their_random, join.our_random);
-            let right = join.hmac.is_some_and(|hmac| hmac[..] == expected[..20]);
-            if right && tokens.joined(join.token) < MAX_SUBFLOWS {
+            if hmac[..] == expected[..20] && tokens.joined(join.token) < MAX_SUBFLOWS {
                 AckAnswer::Accept
             } else {
                 prohibited()
@@ -556,10 +627,10 @@ impl Segments for Dss {
             .unwrap_or_default()
     }
 
-    fn received(&mut self, segment: &Received<'_>) {
+    fn received(&mut self, segment: &Received<'_>) -> bool {
         let options = mptcp_options(segment.options);
         self.0
-            .received(segment.seq, segment.payload.len(), segment.fin, options);
+            .received(segment.seq, segment.payload.len(), segment.fin, options)
     }
 }
 
@@ -571,6 +642,7 @@ pub struct Listener<S> {
     inner: S,
     tokens: Arc<Tokens>,
     port: u16,
+    joins: Arc<Mutex<JoinCookies>>,
     fcx: Cx,
 }
 
@@ -582,6 +654,7 @@ impl<S> Listener<S> {
             inner,
             tokens,
             port,
+            joins: Arc::new(Mutex::new(JoinCookies::new(fcx.random_u64()))),
             fcx: fcx.clone(),
         }
     }
@@ -591,12 +664,39 @@ impl<S> Listener<S> {
 struct Answers {
     tokens: Arc<Tokens>,
     port: u16,
+    joins: Arc<Mutex<JoinCookies>>,
     fcx: Cx,
 }
 
 impl Answer for Answers {
-    fn syn(&self, syn: &[TcpOption]) -> SynAnswer {
-        answer_syn(syn, self.port, &self.tokens, || self.fcx.random_u64())
+    fn syn(&self, syn: &Syn<'_>) -> SynAnswer {
+        let answer = answer_syn(syn, self.port, &self.tokens, || self.fcx.random_u64());
+        let offer = SynOffer::read(syn.options);
+        if let (true, None, Some((token, _)), SynAnswer::Accept(added)) =
+            (syn.cookie, offer.capable, offer.join, &answer)
+        {
+            let kept = Kept {
+                syn: syn.options.into(),
+                syn_ack: added.as_slice().into(),
+            };
+            let cookie = JoinCookie { token, kept };
+            self.joins
+                .lock()
+                .save(syn.seq, syn.from.port(), self.port, cookie);
+        }
+        answer
+    }
+
+    fn cookie(&self, from: SocketAddr, handshake: &Handshake) -> Option<Kept> {
+        // Only an ACK with MP_JOIN alone looks for what a join kept.
+        let (None, Some(_)) = read_ack(&handshake.ack, handshake.ack_payload) else {
+            return None;
+        };
+        let cookie = self
+            .joins
+            .lock()
+            .take(handshake.irs, from.port(), self.port)?;
+        self.tokens.knows(cookie.token).then_some(cookie.kept)
     }
 
     fn ack(&self, handshake: &Handshake) -> AckAnswer {
@@ -648,7 +748,12 @@ impl<S: PortServer> PortServer for Listener<S> {
                 self.inner.serve(fcx, arrival)
             }
             Completion::Join(Some(join)) => match self.tokens.join(join.token) {
-                Some(joined) => Box::pin(hold(fcx, arrival.conn, joined)),
+                Some(joined) => {
+                    // Linux's first keepalive on a subflow comes no sooner
+                    // than its connection's, which ends long before.
+                    arrival.socket.set_keep_alive(None);
+                    Box::pin(hold(fcx, arrival.conn, joined))
+                }
                 None => {
                     arrival.socket.reset();
                     Box::pin(async {})
@@ -668,6 +773,7 @@ impl<S: PortServer> PortServer for Listener<S> {
         Some(Box::new(Answers {
             tokens: self.tokens.clone(),
             port: self.port,
+            joins: self.joins.clone(),
             fcx: self.fcx.clone(),
         }))
     }
@@ -705,9 +811,25 @@ mod tests {
 
     const PORT: u16 = 22;
 
+    /// The client the SYNs in these tests come from.
+    fn client() -> SocketAddr {
+        "198.51.100.1:40000".parse().unwrap()
+    }
+
+    /// A SYN with `options` from the client, with a SYN cookie if
+    /// `cookie`.
+    fn syn_of(options: &[TcpOption], cookie: bool) -> Syn<'_> {
+        Syn {
+            options,
+            from: client(),
+            seq: 1000,
+            cookie,
+        }
+    }
+
     /// The answer's key, with this `random`.
     fn answer(options: &[TcpOption], tokens: &Tokens, random: u64) -> SynAnswer {
-        answer_syn(options, PORT, tokens, || random)
+        answer_syn(&syn_of(options, false), PORT, tokens, || random)
     }
 
     fn plain() -> SynAnswer {
@@ -854,7 +976,7 @@ mod tests {
             SynAnswer::Refuse(vec![tcprst(reason::MPTCP_SPECIFIC)])
         );
         assert_eq!(
-            answer_syn(&syn(&[join(token(42))]), 80, &tokens, || 7),
+            answer_syn(&syn_of(&syn(&[join(token(42))]), false), 80, &tokens, || 7),
             SynAnswer::Refuse(vec![tcprst(reason::ADMINISTRATIVELY_PROHIBITED)])
         );
         drop(open);
@@ -887,7 +1009,10 @@ mod tests {
 
     /// A join is taken at its third ACK when its HMAC is the client's
     /// (RFC 8684 section 3.2) and the connection has room, as Linux takes
-    /// it; any other HMAC, none, or a full connection is refused.
+    /// it. Any other HMAC or a full connection is refused as
+    /// "administratively prohibited", and an ACK with no MP_JOIN as an
+    /// "MPTCP-specific error", as Linux refuses a join it would have to
+    /// fall back.
     #[test]
     fn joins_with_the_right_hmac_are_taken() {
         let tokens = Arc::new(Tokens::default());
@@ -905,7 +1030,10 @@ mod tests {
         let mut wrong = hmac_a;
         wrong[19] ^= 1;
         assert_eq!(answer_ack(&join_handshake(Some(wrong)), &tokens), refused);
-        assert_eq!(answer_ack(&join_handshake(None), &tokens), refused);
+        assert_eq!(
+            answer_ack(&join_handshake(None), &tokens),
+            AckAnswer::Refuse(vec![tcprst(reason::MPTCP_SPECIFIC)])
+        );
         // Two joined subflows fill the connection.
         let joined: Vec<_> = (0..MAX_SUBFLOWS)
             .map(|_| tokens.join(token(42)).unwrap())
@@ -918,19 +1046,138 @@ mod tests {
             answer_ack(&join_handshake(Some(hmac_a)), &tokens),
             AckAnswer::Accept
         );
-        // A join to a connection that has gone is refused too.
+        // A join to a connection that has gone is refused too, but an ACK
+        // with no MP_JOIN is still the MPTCP-specific error.
         drop(_open);
         assert_eq!(answer_ack(&join_handshake(Some(hmac_a)), &tokens), refused);
-        // After a SYN cookie nothing of the SYN is left to check by.
+        assert_eq!(
+            answer_ack(&join_handshake(None), &tokens),
+            AckAnswer::Refuse(vec![tcprst(reason::MPTCP_SPECIFIC)])
+        );
+        // After a SYN cookie with nothing of the SYN kept, Linux drops it.
         let cookie = Handshake {
             ack: vec![option(MptcpOption::Join(Join::Ack { hmac: hmac_a }))].into(),
             ..Handshake::default()
         };
-        assert_eq!(answer_ack(&cookie, &tokens), refused);
+        assert_eq!(answer_ack(&cookie, &tokens), AckAnswer::Drop);
         assert_eq!(
             answer_ack(&Handshake::default(), &tokens),
             AckAnswer::Accept
         );
+    }
+
+    /// A join SYN that gets a SYN cookie is kept in the table, as Linux
+    /// keeps it, and its ACK is checked as any other: taken with the right
+    /// HMAC, refused with a wrong one. An ACK whose slot is empty, or whose
+    /// connection has gone, is dropped with no answer. A full connection
+    /// refuses the SYN at once.
+    #[test]
+    fn a_cookie_join_is_kept_until_its_ack() {
+        fictionet::block_on(fictionet::lab(
+            fictionet::Seed::from_u64(1),
+            |fcx| async move {
+                let tokens = Arc::new(Tokens::default());
+                let keys = KeyPair {
+                    local: 42,
+                    remote: 0x1111,
+                };
+                let open = tokens.open(keys, PORT).unwrap();
+                let listener = Listener::new(&fcx, tokens.clone(), PORT, H2);
+                let answers = listener.answer().unwrap();
+                let options = syn(&[join(token(42))]);
+                // The SYN, past the backlog: the server's random number.
+                let syn_ack = || {
+                    let SynAnswer::Accept(added) = answers.syn(&syn_of(&options, true)) else {
+                        panic!("a SYN-ACK")
+                    };
+                    match mptcp_options(&added).collect::<Vec<_>>()[..] {
+                        [MptcpOption::Join(Join::SynAck { random, .. })] => random,
+                        _ => panic!("MP_JOIN: {added:?}"),
+                    }
+                };
+                // The ACK that returns the cookie with `ack`, as the
+                // endpoint completes it.
+                let ack = |ack: Vec<TcpOption>| {
+                    let mut handshake = Handshake {
+                        ack: ack.into(),
+                        irs: 1000,
+                        iss: 5000,
+                        ..Handshake::default()
+                    };
+                    if let Some(kept) = answers.cookie(client(), &handshake) {
+                        handshake.syn = Some(kept.syn);
+                        handshake.syn_ack = Some(kept.syn_ack);
+                    }
+                    handshake
+                };
+                // The client's MP_JOIN, with its HMAC for `our_random`.
+                let hmac = |our_random, flip: u8| {
+                    let mut hmac: [u8; 20] = join_hmac(0x1111, 42, 1, our_random)[..20]
+                        .try_into()
+                        .unwrap();
+                    hmac[0] ^= flip;
+                    option(MptcpOption::Join(Join::Ack { hmac }))
+                };
+                let prohibited =
+                    AckAnswer::Refuse(vec![tcprst(reason::ADMINISTRATIVELY_PROHIBITED)]);
+
+                // The right HMAC is taken, with the SYN as it came.
+                let random = syn_ack();
+                let taken = ack(vec![hmac(random, 0)]);
+                assert_eq!(taken.syn.as_deref(), Some(&options[..]));
+                assert_eq!(answers.ack(&taken), AckAnswer::Accept);
+                // That emptied the slot: the same ACK again is dropped.
+                let again = ack(vec![hmac(random, 0)]);
+                assert_eq!(again.syn, None);
+                assert_eq!(answers.ack(&again), AckAnswer::Drop);
+                // A wrong HMAC is refused.
+                let random = syn_ack();
+                assert_eq!(answers.ack(&ack(vec![hmac(random, 1)])), prohibited);
+                // An ACK with MP_CAPABLE too takes nothing back and is
+                // dropped. The slot stays for one with MP_JOIN alone.
+                let random = syn_ack();
+                let echo = capable_ack(
+                    1,
+                    0x01,
+                    Keys::Both {
+                        sender: 9,
+                        receiver: 7,
+                    },
+                );
+                let both = ack(vec![echo, hmac(random, 0)]);
+                assert_eq!(both.syn, None);
+                assert_eq!(answers.ack(&both), AckAnswer::Drop);
+                assert_eq!(answers.ack(&ack(vec![hmac(random, 0)])), AckAnswer::Accept);
+                // A later SYN with the same slot takes it from an earlier
+                // one, whose ACK then fails its check.
+                let first = syn_ack();
+                let second = syn_ack();
+                assert_ne!(first, second);
+                assert_eq!(answers.ack(&ack(vec![hmac(first, 0)])), prohibited);
+                // A connection gone before the ACK: the ACK is dropped.
+                let random = syn_ack();
+                drop(open);
+                let gone = ack(vec![hmac(random, 0)]);
+                assert_eq!(gone.syn, None);
+                assert_eq!(answers.ack(&gone), AckAnswer::Drop);
+                // A full connection refuses a SYN cookie's join at once,
+                // and one with no cookie at its ACK.
+                let _open = tokens.open(keys, PORT).unwrap();
+                let _joined: Vec<_> = (0..MAX_SUBFLOWS)
+                    .map(|_| tokens.join(token(42)).unwrap())
+                    .collect();
+                assert_eq!(
+                    answers.syn(&syn_of(&options, true)),
+                    SynAnswer::Refuse(vec![tcprst(reason::ADMINISTRATIVELY_PROHIBITED)])
+                );
+                assert!(matches!(
+                    answers.syn(&syn_of(&options, false)),
+                    SynAnswer::Accept(_)
+                ));
+                Ok(())
+            },
+        ))
+        .unwrap();
     }
 
     /// A joined subflow learns when its connection is gone.

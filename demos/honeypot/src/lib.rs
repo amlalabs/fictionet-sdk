@@ -22,8 +22,9 @@
 //! file, and a typed [`Observation`](observe::Observation) per SYN,
 //! payload, answer and burst goes to a JSON-lines log ([`observe`]). The
 //! observer sees each packet before the world's TCP does, once it is
-//! whole: the relay puts fragments together and the world takes the
-//! packet it made.
+//! whole: the relay puts fragments together and the world gets the
+//! packet it made. Neither file can stop the world: what one cannot take
+//! is counted, and the log says so once it can.
 //!
 //! Nothing here is a real kernel, and nothing runs what a client sends.
 //! The packets come from the internet, so the world treats every byte as
@@ -183,16 +184,17 @@ pub fn start(
 /// Passes packets between a sandbox and the network, writing each one
 /// first. With `only`, a packet from the sandbox goes on only when it is
 /// for that address: the internet reaches the server and nothing else in
-/// the world. Ends when either side closes. A write that fails ends the
-/// run: the honeypot does not run without its log.
+/// the world. Ends when either side closes. A write that fails does not
+/// end it: the observer counts what was lost ([`observe`]).
 ///
 /// Every packet goes to the packet log as it crossed. Fragments from the
 /// sandbox that go on are put back together here, as a host puts them
 /// together ([`Reassembly`]: at most 4 MiB waiting, for at most 30 seconds
 /// for IPv4 and 60 for IPv6), and the world gets the whole packet. So the
-/// observer logs each packet the world takes, once it is whole, and only
-/// those: fragments for addresses the world never sees are not put
-/// together, and cannot crowd out those it does.
+/// observer logs each packet once it is whole, as the world gets it.
+/// Fragments for addresses the world never sees are not put together, and
+/// cannot crowd out those it does: they are in the packet log only. A
+/// whole packet for such an address is logged, and dropped here.
 async fn relay(
     fcx: Cx,
     sandbox: Attachment,
@@ -208,7 +210,7 @@ async fn relay(
         match ports.next(&fcx, deadline, |_| Poll::Pending).await? {
             Event::Packet(0, packet) => {
                 let mut observer = observer.lock();
-                observer.crossed(&name, Direction::In, &packet.0, fcx.now())?;
+                observer.crossed(&name, Direction::In, &packet.0, fcx.now());
                 let goes_on = only.is_none_or(|only| ip::destination(&packet.0) == Some(only));
                 let fragment = ip::Header::parse_truncated(&packet.0)
                     .is_some_and(|h| h.fragment.is_some_and(|f| !f.is_atomic()));
@@ -222,15 +224,15 @@ async fn relay(
                     Intake::Whole(packet) | Intake::Refused { packet, .. } => packet,
                     Intake::Waiting => continue,
                 };
-                observer.whole(&name, Direction::In, &packet.0, fcx.now())?;
+                observer.whole(&name, Direction::In, &packet.0, fcx.now());
                 if goes_on {
                     ports.send(1, packet);
                 }
             }
             Event::Packet(_, packet) => {
                 let mut observer = observer.lock();
-                observer.crossed(&name, Direction::Out, &packet.0, fcx.now())?;
-                observer.whole(&name, Direction::Out, &packet.0, fcx.now())?;
+                observer.crossed(&name, Direction::Out, &packet.0, fcx.now());
+                observer.whole(&name, Direction::Out, &packet.0, fcx.now());
                 ports.send(0, packet);
             }
             Event::Timer => reassembly.expire(fcx.now()),

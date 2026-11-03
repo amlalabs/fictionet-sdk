@@ -24,13 +24,16 @@ And ways for anyone on the internet, sending to a world through a route, to:
 * crash or stall the world, or make it hold memory or other state without
   bound, with any packets, spoofed sources included;
 * send packets in the name of a sandbox or host inside the world;
-* open connections, or have the world log traffic, in the name of an address
-  that never sent the packets, such as by predicting sequence numbers or
-  forging SYN cookies;
-* keep a packet out of the honeypot's log while the world still takes it.
+* open connections in the name of an address that never sent the packets,
+  such as by predicting sequence numbers or forging SYN cookies, or have the
+  honeypot log a connection's segments in such a name (its `syn` and `burst`
+  lines name the source a SYN claims, which may be spoofed);
+* keep a packet out of the honeypot's log while the world still takes it, or
+  stop the world through its log or packet capture.
 
 A route keeps nothing per source address and drops packets whose source the
-world has elsewhere. Its TCP gives each connection an initial sequence number
+world has elsewhere, or that no router forwards (loopback, multicast or
+broadcast). Its TCP gives each connection an initial sequence number
 from a keyed hash (RFC 6528), answers SYNs past the backlog with SYN cookies
 keyed apart from that, and forgets handshakes and closing connections on
 fixed timers, as Linux does.

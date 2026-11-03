@@ -166,14 +166,30 @@ fn longest_route(routes: &[(Prefix, Sandbox)], addr: IpAddr) -> Option<&(Prefix,
         .max_by_key(|(p, _)| p.len)
 }
 
+/// Whether no router forwards from or to `addr`: an IPv4 address in
+/// 0.0.0.0/8, 127.0.0.0/8 or 240.0.0.0/4 (which holds the limited
+/// broadcast), or an IPv6 unspecified or loopback address, none of them
+/// forwardable (RFC 6890), or a multicast address, which is never a
+/// source (RFC 1122 section 3.2.1.3, RFC 4291 section 2.7).
+fn martian(addr: IpAddr) -> bool {
+    match addr {
+        IpAddr::V4(a) => {
+            let first = a.octets()[0];
+            first == 0 || first == 127 || first >= 224
+        }
+        IpAddr::V6(a) => a.is_unspecified() || a.is_loopback() || a.is_multicast(),
+    }
+}
+
 impl Context {
     /// Whether the network routes `addr` to the route at `prefix`: it is in
-    /// `prefix`, and no subnet, gateway, machine or route with a longer
-    /// prefix has it.
+    /// `prefix`, it is no martian, and no subnet, gateway, machine or route
+    /// with a longer prefix has it.
     fn routes_to(&self, prefix: Prefix, addr: IpAddr) -> bool {
         let bindings = &self.bindings;
         let destinations = &self.destinations;
         prefix.contains(addr)
+            && !martian(addr)
             && !bindings.subnet.prefix.contains(addr)
             && !bindings.subnet6.is_some_and(|s| s.prefix.contains(addr))
             && !destinations.is_gateway(addr)
@@ -192,8 +208,10 @@ impl Context {
 /// It passes on only packets from addresses the network routes back to
 /// it, as a router with strict reverse-path forwarding does (RFC 3704
 /// section 2.2). A route open to the internet carries packets with any
-/// source, and one that claims an address the network has elsewhere, such
-/// as a sandbox's or a host's, is dropped: answers to it would go there.
+/// source but a martian one, such as a loopback, multicast or broadcast
+/// address, which no router forwards. One that claims an address the
+/// network has elsewhere, such as a sandbox's or a host's, is dropped too:
+/// answers to it would go there.
 pub(super) struct Routed {
     sandbox: Attachment,
     context: Arc<Context>,

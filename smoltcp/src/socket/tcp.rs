@@ -550,6 +550,8 @@ pub struct Socket<'a> {
     segment_options: Option<SegmentOptionsBox>,
     /// The options it gave the segment being sent.
     segment_extra: Vec<u8>,
+    /// It asked for an ACK, which the next segment sent carries.
+    ack_asked: bool,
 
     rx_waker: WakerRegistration,
 
@@ -619,7 +621,10 @@ pub trait SegmentOptions: Send {
     fn sent(&mut self, segment: &Outgoing<'_>, out: &mut Vec<u8>);
 
     /// Sees a segment the socket took, before its data can be read.
-    fn received(&mut self, segment: &Incoming<'_>);
+    /// Returns whether the socket acknowledges it at once, though it may
+    /// carry no data, as an MPTCP host acknowledges a DATA_FIN (RFC 8684
+    /// section 3.3.3).
+    fn received(&mut self, segment: &Incoming<'_>) -> bool;
 }
 
 /// A boxed [`SegmentOptions`], so that the socket can print itself.
@@ -684,6 +689,7 @@ impl<'a> Socket<'a> {
             syn_options: Vec::new(),
             segment_options: None,
             segment_extra: Vec::new(),
+            ack_asked: false,
 
             rx_waker: WakerRegistration::new(),
 
@@ -984,6 +990,7 @@ impl<'a> Socket<'a> {
         self.congestion_controller = reno::Reno::new();
         self.syn_options = Vec::new();
         self.segment_options = None;
+        self.ack_asked = false;
 
         {
             self.rx_waker.wake();
@@ -1107,8 +1114,14 @@ impl<'a> Socket<'a> {
                 self.set_state(State::FinWait1);
                 self.closed_before_syn_ack = true;
             }
-            State::Established => self.set_state(State::FinWait1),
-            State::CloseWait => self.set_state(State::LastAck),
+            State::Established => {
+                self.start_talking();
+                self.set_state(State::FinWait1);
+            }
+            State::CloseWait => {
+                self.start_talking();
+                self.set_state(State::LastAck);
+            }
             // In the FIN-WAIT-1, FIN-WAIT-2, CLOSING, LAST-ACK, TIME-WAIT and CLOSED states,
             // the transmit half of the connection is already closed, and no further
             // action is needed.
@@ -1118,6 +1131,16 @@ impl<'a> Socket<'a> {
             | State::TimeWait
             | State::LastAck
             | State::Closed => (),
+        }
+    }
+
+    /// The local endpoint is about to send its FIN. On a socket with nothing
+    /// to send, which may have been quiet for long, the timeout then counts
+    /// from the FIN, as it counts from the first data queued on such a
+    /// socket, and not from the last packet received.
+    fn start_talking(&mut self) {
+        if self.tx_buffer.is_empty() {
+            self.remote_last_ts = None;
         }
     }
 
@@ -1824,7 +1847,7 @@ impl<'a> Socket<'a> {
         self.remote_last_ts = Some(cx.now());
 
         if let Some(segment_options) = self.segment_options.as_mut() {
-            segment_options.0.received(&Incoming {
+            self.ack_asked |= segment_options.0.received(&Incoming {
                 seq: repr.seq_number.0 as u32,
                 payload: repr.payload,
                 fin: control == TcpControl::Fin,
@@ -2025,9 +2048,31 @@ impl<'a> Socket<'a> {
             && (window == self.remote_win_len || sack && window != 0 && self.remote_win_len != 0)
     }
 
+    /// Whether the socket waits for the remote endpoint to answer what it
+    /// sent: its SYN or SYN-ACK, data, its FIN, or, with keep-alive on, a
+    /// keep-alive. Only then does the timeout run, as
+    /// [`set_timeout`](Socket::set_timeout) says. An idle connection
+    /// with neither waits for nothing, as on Linux.
+    fn waits_for_answer(&self) -> bool {
+        match self.state {
+            State::SynSent
+            | State::SynReceived
+            | State::FinWait1
+            | State::Closing
+            | State::LastAck => true,
+            State::Established | State::CloseWait => {
+                !self.tx_buffer.is_empty() || self.keep_alive.is_some()
+            }
+            State::FinWait2 => self.keep_alive.is_some(),
+            State::Listen | State::TimeWait | State::Closed => false,
+        }
+    }
+
     fn timed_out(&self, timestamp: Instant) -> bool {
         match (self.remote_last_ts, self.timeout) {
-            (Some(remote_last_ts), Some(timeout)) => timestamp >= remote_last_ts + timeout,
+            (Some(remote_last_ts), Some(timeout)) => {
+                self.waits_for_answer() && timestamp >= remote_last_ts + timeout
+            }
             (_, _) => false,
         }
     }
@@ -2238,6 +2283,7 @@ impl<'a> Socket<'a> {
         let should_send = self.seq_to_transmit(cx)
             || self.ack_to_transmit() && self.delayed_ack_expired(cx.now())
             || self.window_to_update()
+            || self.ack_asked
             || self.state == State::Closed
             || self.timer.should_keep_alive(cx.now())
             || self.timer.should_zero_window_probe(cx.now());
@@ -2438,6 +2484,7 @@ impl<'a> Socket<'a> {
         self.timer.rewind_keep_alive(cx.now(), self.keep_alive);
 
         self.ack_delay_timer = AckDelayTimer::Idle;
+        self.ack_asked = false;
 
         // Leave the rest of the state intact if sending a zero-window probe.
         if is_zero_window_probe {
@@ -2503,6 +2550,9 @@ impl<'a> Socket<'a> {
         } else if self.window_to_update() {
             // The receive window has been raised significantly.
             PollAt::Now
+        } else if self.ack_asked {
+            // The segment options asked for an ACK.
+            PollAt::Now
         } else {
             let want_ack = self.ack_to_transmit();
 
@@ -2514,9 +2564,11 @@ impl<'a> Socket<'a> {
             };
 
             let timeout_poll_at = match (self.remote_last_ts, self.timeout) {
-                // If we're transmitting or retransmitting data, we need to poll at the moment
+                // If we're waiting for an answer, we need to poll at the moment
                 // when the timeout would expire.
-                (Some(remote_last_ts), Some(timeout)) => PollAt::Time(remote_last_ts + timeout),
+                (Some(remote_last_ts), Some(timeout)) if self.waits_for_answer() => {
+                    PollAt::Time(remote_last_ts + timeout)
+                }
                 // Otherwise we have no timeout.
                 (_, _) => PollAt::Ingress,
             };
@@ -3534,14 +3586,70 @@ pub(crate) mod test {
             }
         }
 
-        fn received(&mut self, segment: &Incoming<'_>) {
+        fn received(&mut self, segment: &Incoming<'_>) -> bool {
             self.seen.lock().unwrap().received.push((
                 segment.seq,
                 segment.payload.to_vec(),
                 segment.fin,
                 segment.options.to_vec(),
             ));
+            false
         }
+    }
+
+    /// Asks for an ACK of each segment that carries an option of kind
+    /// 254, and adds an option of kind 253 to each segment sent.
+    struct AskOn254;
+
+    impl SegmentOptions for AskOn254 {
+        fn room(&self) -> usize {
+            4
+        }
+
+        fn sent(&mut self, _: &Outgoing<'_>, out: &mut Vec<u8>) {
+            out.extend_from_slice(&[253, 2]);
+        }
+
+        fn received(&mut self, segment: &Incoming<'_>) -> bool {
+            segment.options.first() == Some(&254)
+        }
+    }
+
+    /// A segment with no data whose options ask for an ACK gets one at
+    /// once, carrying the segment options; one that does not ask gets
+    /// none.
+    #[test]
+    fn test_segment_options_can_ask_for_an_ack() {
+        let mut s = socket_established();
+        s.set_segment_options(Box::new(AskOn254));
+        let ip_repr = IpReprIpvX(IpvXRepr {
+            src_addr: REMOTE_ADDR,
+            dst_addr: LOCAL_ADDR,
+            next_header: IpProtocol::Tcp,
+            payload_len: 0,
+            hop_limit: 64,
+        });
+        let take = |s: &mut TestSocket, options: &[u8]| {
+            let repr = TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                ..SEND_TEMPL
+            };
+            s.socket.process(&mut s.cx, &ip_repr, &repr, options)
+        };
+        assert_eq!(take(&mut s, &[1, 1, 1, 1]), None);
+        recv_nothing!(s);
+        assert_eq!(take(&mut s, &[254, 2, 1, 1]), None);
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                extra: &[253, 2],
+                ..RECV_TEMPL
+            }]
+        );
+        recv_nothing!(s);
     }
 
     fn stamped(s: &mut TestSocket, overflow: bool) -> std::sync::Arc<std::sync::Mutex<Seen>> {
@@ -9612,10 +9720,8 @@ pub(crate) mod test {
         let mut s = socket_established();
         s.set_timeout(Some(Duration::from_millis(2000)));
         recv_nothing!(s, time 250);
-        assert_eq!(
-            s.socket.poll_at(&mut s.cx),
-            PollAt::Time(Instant::from_millis(2250))
-        );
+        // Idle, with no keep-alive: it waits for nothing.
+        assert_eq!(s.socket.poll_at(&mut s.cx), PollAt::Ingress);
         s.send_slice(b"abcdef").unwrap();
         assert_eq!(s.socket.poll_at(&mut s.cx), PollAt::Now);
         recv!(s, time 255, Ok(TcpRepr {
@@ -9730,6 +9836,44 @@ pub(crate) mod test {
             ..RECV_TEMPL
         }));
         assert_eq!(s.state, State::Closed);
+    }
+
+    /// An idle connection with nothing to send and no keep-alive waits for
+    /// no answer, so it does not time out however long the peer is quiet,
+    /// as on Linux. With keep-alive on it does.
+    #[test]
+    fn test_idle_without_keep_alive_does_not_time_out() {
+        let mut s = socket_established();
+        s.set_timeout(Some(Duration::from_millis(1000)));
+        s.remote_last_ts = Some(Instant::from_millis(100));
+        recv_nothing!(s, time 60_000);
+        assert_eq!(s.state, State::Established);
+        s.set_keep_alive(Some(Duration::from_millis(500)));
+        recv!(s, time 60_000, Ok(TcpRepr {
+            control:    TcpControl::Rst,
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            ..RECV_TEMPL
+        }));
+        assert_eq!(s.state, State::Closed);
+    }
+
+    /// Closing a socket that was quiet for longer than its timeout sends a
+    /// FIN, not a RST: the timeout counts from the FIN.
+    #[test]
+    fn test_close_after_a_quiet_spell_sends_fin() {
+        let mut s = socket_established();
+        s.set_timeout(Some(Duration::from_millis(1000)));
+        s.remote_last_ts = Some(Instant::from_millis(100));
+        s.close();
+        recv!(s, time 5000, Ok(TcpRepr {
+            control:    TcpControl::Fin,
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            ..RECV_TEMPL
+        }));
+        assert_eq!(s.state, State::FinWait1);
+        assert_eq!(s.remote_last_ts, Some(Instant::from_millis(5000)));
     }
 
     #[test]

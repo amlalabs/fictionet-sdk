@@ -1465,7 +1465,7 @@ mod tests {
                 Box::pin(async {})
             }
             fn answer(&self) -> Option<Box<dyn tcp::Answer>> {
-                Some(Box::new(|_: &[tcp::TcpOption]| {
+                Some(Box::new(|_: &tcp::Syn<'_>| {
                     tcp::SynAnswer::Accept(Vec::new())
                 }))
             }

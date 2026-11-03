@@ -2,12 +2,16 @@
 //! typed [`Observation`] per event of interest as one JSON object per line.
 //!
 //! The [`Observer`] sees each packet as it crosses an attachment, before
-//! the world does, so a packet the world drops is still logged. The pcapng
-//! file gets each packet as it crossed ([`Observer::crossed`]). The
-//! observations are made from whole packets ([`Observer::whole`]): the
-//! relay puts fragments together, and the world takes the whole packet it
-//! made, so the log reads exactly the packets the world takes. For packets
-//! from the sandbox side it records:
+//! the world does. The pcapng file gets each packet as it crossed
+//! ([`Observer::crossed`]). The observations are made from whole packets
+//! ([`Observer::whole`]): the relay puts fragments together, and the world
+//! gets the whole packet it made. A packet from the sandbox side whose IPv4
+//! header or TCP checksum is wrong is in the capture only, as a host
+//! discards it unread. Every other one is logged as the world sees it,
+//! whether or not the world then takes it: one for an address the world
+//! does not reach, or with a source its route refuses, is logged and
+//! dropped, and its line names that address. For packets from the sandbox
+//! side it records:
 //!
 //! - every SYN ([`Observation::Syn`]): source and destination, all its TCP
 //!   options in order, why the options could not all be read, the MPTCP
@@ -18,8 +22,21 @@
 //! - a burst of SYNs, or of SYNs with MP_JOIN, from one source address
 //!   ([`Observation::Burst`]).
 //!
-//! For packets to the sandbox side it records each SYN-ACK and RST the
-//! world sends ([`Observation::Answer`]), with their options.
+//! A SYN carries the source address its sender wrote, which a sender can
+//! spoof, so the source of a `syn` or `burst` line is a claim. Only the
+//! segments of a connection whose handshake completed name an address
+//! that sent them: the world's initial sequence numbers and SYN cookies
+//! cannot be guessed.
+//!
+//! For packets to the sandbox side it records each RST the world sends,
+//! and the SYN-ACK that first answers a SYN still within the burst window
+//! ([`Observation::Answer`]), with their options. The world answers at
+//! once, so that is each SYN's. The SYN-ACKs the world sends again, until
+//! the handshake completes, are in the capture only.
+//!
+//! Neither file can stop the world. A record a file refuses, when the disk
+//! is full say, is lost, and the next line the log takes once both files
+//! take records again says how many were ([`Observation::Lost`]).
 //!
 //! Each option list is logged twice over: every option with its bytes, in
 //! order ([`Opt`]), and the MPTCP ones decoded with every field the stdlib
@@ -37,7 +54,8 @@
 //! part of a burst, so signatures written later can be run over the log.
 //!
 //! The observer keeps state for a source only while that source has a SYN
-//! within the burst window. Its memory is the SYNs of the last window, so a
+//! within the burst window, and for a SYN's answer only while the SYN is
+//! within the window. Its memory is the SYNs of the last window, so a
 //! flood from spoofed addresses cannot grow it past what one window holds.
 //! The time since a source's previous SYN is given when that SYN was within
 //! the window; each line's timestamp gives longer gaps.
@@ -132,7 +150,7 @@ pub enum Observation {
         /// Its payload.
         payload: Hex,
     },
-    /// A SYN-ACK or RST from the world.
+    /// A RST from the world, or the SYN-ACK that first answers a SYN.
     Answer {
         /// When it left.
         at_us: u64,
@@ -161,6 +179,16 @@ pub enum Observation {
         syns: usize,
         /// The window, in microseconds.
         window_us: u64,
+    },
+    /// What the files could not take since the last line, such as while
+    /// the disk was full: see the [module docs](self).
+    Lost {
+        /// When the log took lines again.
+        at_us: u64,
+        /// Packets left out of the capture.
+        packets: u64,
+        /// Observations left out of the log.
+        observations: u64,
     },
 }
 
@@ -634,6 +662,77 @@ pub struct Sinks {
     pub pcap: Box<dyn Write + Send>,
 }
 
+/// One file the observer writes, a record at a time: a pcapng block, or a
+/// line of the log. A record the file refuses is lost. One it takes only
+/// part of is finished before the next record, so the file never holds
+/// part of one record followed by another.
+struct Sink {
+    out: Box<dyn Write + Send>,
+    /// The rest of a record the file took only part of.
+    torn: Vec<u8>,
+}
+
+impl Sink {
+    fn new(out: Box<dyn Write + Send>) -> Sink {
+        Sink {
+            out,
+            torn: Vec::new(),
+        }
+    }
+
+    /// Writes `record`, after the rest of a torn one. Returns whether the
+    /// file took it: all of it, or a part whose rest comes first next time.
+    fn put(&mut self, record: &[u8]) -> bool {
+        if !self.torn.is_empty() {
+            let torn = std::mem::take(&mut self.torn);
+            let wrote = self.write(&torn);
+            if wrote < torn.len() {
+                self.torn = torn[wrote..].to_vec();
+                return false;
+            }
+        }
+        let wrote = self.write(record);
+        if wrote == 0 {
+            return false;
+        }
+        self.torn = record[wrote..].to_vec();
+        // A writer that keeps what it could not write yet, as a BufWriter
+        // does, writes it with a later record.
+        let _ = self.out.flush();
+        true
+    }
+
+    /// Writes as much of `bytes` as the file takes. Returns how much.
+    fn write(&mut self, bytes: &[u8]) -> usize {
+        let mut wrote = 0;
+        while wrote < bytes.len() {
+            match self.out.write(&bytes[wrote..]) {
+                Ok(0) => break,
+                Ok(n) => wrote += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+        wrote
+    }
+}
+
+/// What the files could not take since the log last said so.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Lost {
+    packets: u64,
+    observations: u64,
+}
+
+/// The answer a SYN awaits: from the address the SYN went to, to the one
+/// it came from, acknowledging its sequence number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct Awaited {
+    from: SocketAddr,
+    to: SocketAddr,
+    ack: u32,
+}
+
 /// One source address with a SYN in the burst window.
 struct Source {
     /// When its last SYN arrived.
@@ -648,14 +747,21 @@ struct Source {
 
 /// Writes the packet log and the observations. See the [module docs](self).
 pub struct Observer {
-    sinks: Sinks,
+    log: Sink,
+    pcap: Sink,
+    /// Whether the capture took the last packet.
+    capturing: bool,
+    lost: Lost,
     clock: Clock,
     burst: Burst,
     tokens: Arc<Tokens>,
-    /// The SYNs within the window, oldest first: when, from where, and
-    /// whether each carried MP_JOIN.
-    recent: VecDeque<(Instant, IpAddr, bool)>,
+    /// The SYNs within the window, oldest first: when, from where, whether
+    /// each carried MP_JOIN, and the answer it awaits.
+    recent: VecDeque<(Instant, IpAddr, bool, Awaited)>,
     sources: HashMap<IpAddr, Source>,
+    /// The answers SYNs within the window await, each with how many SYNs
+    /// await it.
+    awaited: HashMap<Awaited, usize>,
 }
 
 impl Observer {
@@ -672,12 +778,16 @@ impl Observer {
         sinks.pcap.write_all(&header)?;
         sinks.pcap.flush()?;
         Ok(Observer {
-            sinks,
+            log: Sink::new(sinks.log),
+            pcap: Sink::new(sinks.pcap),
+            capturing: true,
+            lost: Lost::default(),
             clock,
             burst,
             tokens,
             recent: VecDeque::new(),
             sources: HashMap::new(),
+            awaited: HashMap::new(),
         })
     }
 
@@ -694,7 +804,7 @@ impl Observer {
         direction: Direction,
         packet: &[u8],
         now: Instant,
-    ) -> io::Result<()> {
+    ) {
         let at_us = self.clock.micros(now);
         let mut block = Vec::with_capacity(packet.len() + 64);
         let way = match direction {
@@ -708,8 +818,10 @@ impl Observer {
             packet,
             Some(&format!("{attachment} {way}")),
         );
-        self.sinks.pcap.write_all(&block)?;
-        self.sinks.pcap.flush()
+        self.capturing = self.pcap.put(&block);
+        if !self.capturing {
+            self.lost.packets += 1;
+        }
     }
 
     /// Writes what `packet` shows: a whole packet, as the world takes it
@@ -720,12 +832,35 @@ impl Observer {
         direction: Direction,
         packet: &[u8],
         now: Instant,
-    ) -> io::Result<()> {
-        for observation in self.observe(attachment, direction, packet, now) {
-            serde_json::to_writer(&mut self.sinks.log, &observation)?;
-            self.sinks.log.write_all(b"\n")?;
+    ) {
+        let mut observations = self.observe(attachment, direction, packet, now);
+        if self.lost != Lost::default() && self.capturing {
+            let lost = Observation::Lost {
+                at_us: self.clock.micros(now),
+                packets: self.lost.packets,
+                observations: self.lost.observations,
+            };
+            observations.insert(0, lost);
+            self.lost = Lost::default();
         }
-        self.sinks.log.flush()
+        for observation in observations {
+            let mut line = serde_json::to_vec(&observation).expect("observations are plain data");
+            line.push(b'\n');
+            if !self.log.put(&line) {
+                match observation {
+                    // Still owed: it goes on the next line taken.
+                    Observation::Lost {
+                        packets,
+                        observations,
+                        ..
+                    } => {
+                        self.lost.packets += packets;
+                        self.lost.observations += observations;
+                    }
+                    _ => self.lost.observations += 1,
+                }
+            }
+        }
     }
 
     /// What `packet`, a whole one, shows.
@@ -744,6 +879,15 @@ impl Observer {
         }
         let t = header.payload(packet);
         if t.len() < 20 {
+            return Vec::new();
+        }
+        // A host discards a packet with a wrong checksum unread (RFC 1122
+        // sections 3.2.1.2 and 4.2.2.7).
+        let wrong = || {
+            (header.src.is_ipv4() && ip::checksum(&packet[..header.payload.start]) != 0)
+                || ip::transport_checksum(header.src, header.dst, protocol::TCP, t) != 0
+        };
+        if direction == Direction::In && wrong() {
             return Vec::new();
         }
         let at_us = self.clock.micros(now);
@@ -769,7 +913,18 @@ impl Observer {
         let options: Vec<Opt> = read.iter().map(Opt::from).collect();
         let attachment = attachment.clone();
         if direction == Direction::Out {
-            if flags & RST != 0 || flags & (SYN | ACK) == SYN | ACK {
+            let rst = flags & RST != 0;
+            let syn_ack = flags & (SYN | ACK) == SYN | ACK;
+            let ack = u32::from_be_bytes([t[8], t[9], t[10], t[11]]);
+            let awaited = Awaited {
+                from: src,
+                to: dst,
+                ack,
+            };
+            // A SYN-ACK that answers no SYN within the window is one sent
+            // again.
+            let first = (rst || syn_ack) && self.answered(awaited);
+            if rst || (syn_ack && first) {
                 return vec![Observation::Answer {
                     at_us,
                     attachment,
@@ -790,7 +945,12 @@ impl Observer {
             .to_vec());
         if flags & (SYN | RST | ACK) == SYN {
             let join = mptcp.iter().any(|m| matches!(m, Mptcp::MpJoinSyn { .. }));
-            let (gap_us, bursts) = self.syn(src.ip(), join, now);
+            let awaited = Awaited {
+                from: dst,
+                to: src,
+                ack: seq.wrapping_add(1),
+            };
+            let (gap_us, bursts) = self.syn(src.ip(), join, awaited, now);
             let mut out = vec![Observation::Syn {
                 at_us,
                 attachment,
@@ -829,20 +989,36 @@ impl Observer {
         }]
     }
 
-    /// Counts a SYN from `src`, with MP_JOIN if `join`. Returns the time
-    /// since its previous SYN within the window, and the bursts it starts.
+    /// Whether a SYN within the window awaits `answer`. It awaits it no
+    /// more.
+    fn answered(&mut self, answer: Awaited) -> bool {
+        let Some(waiting) = self.awaited.get_mut(&answer) else {
+            return false;
+        };
+        *waiting -= 1;
+        if *waiting == 0 {
+            self.awaited.remove(&answer);
+        }
+        true
+    }
+
+    /// Counts a SYN from `src`, with MP_JOIN if `join`, that awaits
+    /// `answer`. Returns the time since its previous SYN within the window,
+    /// and the bursts it starts.
     fn syn(
         &mut self,
         src: IpAddr,
         join: bool,
+        answer: Awaited,
         now: Instant,
     ) -> (Option<u64>, Vec<(BurstKind, usize)>) {
         let window = self.burst.window;
-        while let Some(&(at, from, joined)) = self.recent.front() {
+        while let Some(&(at, from, joined, awaited)) = self.recent.front() {
             if now.since_start().saturating_sub(at.since_start()) < window {
                 break;
             }
             self.recent.pop_front();
+            self.answered(awaited);
             if let Some(source) = self.sources.get_mut(&from) {
                 source.syns -= 1;
                 source.joins -= usize::from(joined);
@@ -851,7 +1027,8 @@ impl Observer {
                 }
             }
         }
-        self.recent.push_back((now, src, join));
+        self.recent.push_back((now, src, join, answer));
+        *self.awaited.entry(answer).or_default() += 1;
         let source = self.sources.entry(src).or_insert(Source {
             last: now,
             syns: 0,
@@ -1110,24 +1287,195 @@ mod tests {
         let at = |ms| Instant::from_since_start(Duration::from_millis(ms));
         let a: IpAddr = "192.0.2.1".parse().unwrap();
         let b: IpAddr = "192.0.2.2".parse().unwrap();
-        assert_eq!(observer.syn(a, false, at(0)), (None, vec![]));
-        assert_eq!(observer.syn(a, true, at(10)), (Some(10_000), vec![]));
-        assert_eq!(observer.syn(b, false, at(20)), (None, vec![]));
+        assert_eq!(observer.syn(a, false, awaits(), at(0)), (None, vec![]));
         assert_eq!(
-            observer.syn(a, true, at(30)),
+            observer.syn(a, true, awaits(), at(10)),
+            (Some(10_000), vec![])
+        );
+        assert_eq!(observer.syn(b, false, awaits(), at(20)), (None, vec![]));
+        assert_eq!(
+            observer.syn(a, true, awaits(), at(30)),
             (Some(20_000), vec![(BurstKind::Syns, 3)])
         );
         // Flagged once while it lasts.
         assert_eq!(
-            observer.syn(a, true, at(40)),
+            observer.syn(a, true, awaits(), at(40)),
             (Some(10_000), vec![(BurstKind::Joins, 3)])
         );
-        assert_eq!(observer.syn(a, false, at(50)), (Some(10_000), vec![]));
+        assert_eq!(
+            observer.syn(a, false, awaits(), at(50)),
+            (Some(10_000), vec![])
+        );
         assert_eq!(observer.sources(), 2);
         // A window later both have aged out; only the newest source is held,
         // and its SYN gives no gap: the one before was outside the window.
-        assert_eq!(observer.syn(b, false, at(500)), (None, vec![]));
+        assert_eq!(observer.syn(b, false, awaits(), at(500)), (None, vec![]));
         assert_eq!(observer.sources(), 1);
         assert_eq!(observer.recent.len(), 1);
+        assert_eq!(observer.awaited[&awaits()], 1, "the answers aged out too");
+    }
+
+    /// The answer the SYNs of `burst_state_lasts_one_window` await.
+    fn awaits() -> Awaited {
+        Awaited {
+            from: "203.0.113.10:22".parse().unwrap(),
+            to: "192.0.2.1:4000".parse().unwrap(),
+            ack: 2,
+        }
+    }
+
+    /// A SYN or segment whose IPv4 header or TCP checksum is wrong is not
+    /// logged, and counts toward no burst: a host discards it unread.
+    #[test]
+    fn packets_with_wrong_checksums_are_not_logged() {
+        let mut observer = observer();
+        for (at, bit) in [(26, 1u8), (36, 0x80), (10, 1)] {
+            for flags in [SYN, ACK | FIN] {
+                let mut packet = segment(flags, &[2, 4, 5, 0xb4], b"x");
+                packet[at] ^= bit;
+                let seen = observe(&mut observer, Direction::In, &packet);
+                assert!(seen.is_empty(), "byte {at}: {seen:?}");
+            }
+        }
+        assert_eq!(observer.sources(), 0);
+        let good = segment(SYN, &[2, 4, 5, 0xb4], b"x");
+        assert_eq!(observe(&mut observer, Direction::In, &good).len(), 1);
+    }
+
+    /// The world's packet answering `segment`'s SYN: from 203.0.113.10:22
+    /// to 192.0.2.1:4000, acknowledging sequence number 1.
+    fn answer(flags: u8) -> Vec<u8> {
+        let (src, dst): (IpAddr, IpAddr) = (
+            "203.0.113.10".parse().unwrap(),
+            "192.0.2.1".parse().unwrap(),
+        );
+        let mut t = vec![
+            0, 22, 0x0f, 0xa0, 0, 0, 0, 9, 0, 0, 0, 2, 0x50, flags, 0xff, 0xff,
+        ];
+        t.extend_from_slice(&[0, 0, 0, 0]);
+        let sum = transport_checksum(src, dst, 6, &t);
+        t[16..18].copy_from_slice(&sum.to_be_bytes());
+        packet_with(src, dst, 6, Fields::default(), &t).0
+    }
+
+    /// The SYN-ACK that first answers a SYN is logged, and the ones sent
+    /// again are not; every RST is.
+    #[test]
+    fn a_syn_s_first_answer_is_logged_once() {
+        let mut observer = observer();
+        let syn_ack = answer(SYN | ACK);
+        let answers = |observer: &mut Observer, packet: &[u8]| {
+            observe(observer, Direction::Out, packet)
+                .into_iter()
+                .filter(|o| matches!(o, Observation::Answer { .. }))
+                .count()
+        };
+        assert_eq!(answers(&mut observer, &syn_ack), 0, "no SYN yet");
+        observe(&mut observer, Direction::In, &segment(SYN, &[], b""));
+        assert_eq!(answers(&mut observer, &syn_ack), 1);
+        assert_eq!(answers(&mut observer, &syn_ack), 0, "sent again");
+        // The client sends its SYN again: the answer to that is logged.
+        observe(&mut observer, Direction::In, &segment(SYN, &[], b""));
+        assert_eq!(answers(&mut observer, &syn_ack), 1);
+        assert!(observer.awaited.is_empty());
+        let rst = answer(RST | ACK);
+        assert_eq!(answers(&mut observer, &rst), 1);
+        assert_eq!(answers(&mut observer, &rst), 1);
+    }
+
+    /// Takes the first `room` bytes written, then refuses all until
+    /// `room` grows.
+    #[derive(Clone, Default)]
+    struct Disk(Arc<std::sync::Mutex<(Vec<u8>, usize)>>);
+
+    impl Write for Disk {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let mut disk = self.0.lock().unwrap();
+            let free = disk.1 - disk.0.len();
+            if free == 0 {
+                return Err(io::ErrorKind::StorageFull.into());
+            }
+            let n = buf.len().min(free);
+            disk.0.extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A full disk loses records but stops nothing. A record cut short is
+    /// finished first once there is room, so the file holds whole records,
+    /// and the log then says how many packets and lines were lost.
+    #[test]
+    fn a_full_disk_loses_records_and_says_so() {
+        let (log, pcap) = (Disk::default(), Disk::default());
+        log.0.lock().unwrap().1 = usize::MAX;
+        pcap.0.lock().unwrap().1 = usize::MAX;
+        let mut observer = Observer::new(
+            Sinks {
+                log: Box::new(log.clone()),
+                pcap: Box::new(pcap.clone()),
+            },
+            Clock::at_unix_secs(0),
+            Burst {
+                window: Duration::from_millis(100),
+                syns: 100,
+            },
+            Arc::default(),
+        )
+        .unwrap();
+        let name = Arc::from("internet");
+        let at = Instant::from_since_start(Duration::from_secs(1));
+        let syn = segment(SYN, &[], b"");
+        // The capture has room for its header and half a packet.
+        let header = pcap.0.lock().unwrap().0.len();
+        pcap.0.lock().unwrap().1 = header + 20;
+        for _ in 0..3 {
+            observer.crossed(&name, Direction::In, &syn, at);
+            observer.whole(&name, Direction::In, &syn, at);
+        }
+        // The log has the three SYNs: nothing is owed yet, as the capture
+        // takes nothing.
+        let lines = |log: &Disk| {
+            String::from_utf8(log.0.lock().unwrap().0.clone())
+                .unwrap()
+                .lines()
+                .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(lines(&log).len(), 3);
+        // The log fills up too.
+        let full = log.0.lock().unwrap().0.len();
+        log.0.lock().unwrap().1 = full;
+        observer.crossed(&name, Direction::In, &syn, at);
+        observer.whole(&name, Direction::In, &syn, at);
+        // Room again: the cut packet is finished, and the log says what
+        // was lost.
+        pcap.0.lock().unwrap().1 = usize::MAX;
+        log.0.lock().unwrap().1 = usize::MAX;
+        observer.crossed(&name, Direction::In, &syn, at);
+        observer.whole(&name, Direction::In, &syn, at);
+        let lines = lines(&log);
+        assert_eq!(lines.len(), 5, "{lines:?}");
+        assert_eq!(
+            lines[3],
+            serde_json::json!({"event": "lost", "at_us": 1_000_000,
+                "packets": 3, "observations": 1})
+        );
+        assert_eq!(lines[4]["event"], "syn");
+        // The capture holds its header, then two whole blocks: the first
+        // packet and the last.
+        let capture = pcap.0.lock().unwrap().0.clone();
+        let mut rest = &capture[header..];
+        let mut blocks = 0;
+        while !rest.is_empty() {
+            let len = u32::from_le_bytes(rest[4..8].try_into().unwrap()) as usize;
+            assert_eq!(rest[len - 4..len], rest[4..8], "a whole block");
+            rest = &rest[len..];
+            blocks += 1;
+        }
+        assert_eq!(blocks, 2);
     }
 }

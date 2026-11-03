@@ -205,9 +205,9 @@ fn syn_options_reach_the_connection_and_the_syn_ack_answers_mptcp() {
         let mut listener = server.listen(80)?;
         let seen = Arc::new(Mutex::new(Vec::new()));
         let seen_by_answer = seen.clone();
-        listener.answer(Box::new(move |syn: &[TcpOption]| {
-            seen_by_answer.lock().unwrap().push(syn.to_vec());
-            answer_mp_capable(syn)
+        listener.answer(Box::new(move |syn: &tcp::Syn<'_>| {
+            seen_by_answer.lock().unwrap().push(syn.options.to_vec());
+            answer_mp_capable(syn.options)
         }));
 
         raw.send(segment(4000, 1000, 0, SYN, &LINUX_SYN));
@@ -427,7 +427,7 @@ fn an_answer_that_cannot_be_sent_resets_the_attempt() {
             let server = tcp::endpoint(&fcx, side, ip(SERVER));
             let mut listener = server.listen(80)?;
             let expected = answer.clone();
-            listener.answer(Box::new(move |_: &[TcpOption]| {
+            listener.answer(Box::new(move |_: &tcp::Syn<'_>| {
                 SynAnswer::Accept(answer.clone())
             }));
             raw.send(segment(4000, 1000, 0, SYN, &LINUX_SYN));
@@ -445,7 +445,7 @@ fn an_answer_that_cannot_be_sent_resets_the_attempt() {
             } else {
                 assert_syn_reset(t, &[]);
                 // The listener still answers the next attempt.
-                listener.answer(Box::new(|_: &[TcpOption]| SynAnswer::Accept(Vec::new())));
+                listener.answer(Box::new(|_: &tcp::Syn<'_>| SynAnswer::Accept(Vec::new())));
                 raw.send(segment(4001, 1000, 0, SYN, &LINUX_SYN));
                 let reply = next(&fcx, &mut raw).await.expect("a SYN-ACK");
                 assert_eq!(tcp_of(&reply)[13], SYN | ACK);
@@ -456,8 +456,8 @@ fn an_answer_that_cannot_be_sent_resets_the_attempt() {
 }
 
 /// Refuses every SYN that carries MP_JOIN with MP_TCPRST.
-fn refuse_joins(syn: &[TcpOption]) -> SynAnswer {
-    let join = syn.iter().any(|o| match o {
+fn refuse_joins(syn: &tcp::Syn<'_>) -> SynAnswer {
+    let join = syn.options.iter().any(|o| match o {
         TcpOption::Unknown { kind, data } if *kind == mptcp::KIND => {
             matches!(MptcpOption::parse(data), Ok(MptcpOption::Join(_)))
         }
@@ -549,7 +549,7 @@ fn every_refused_attempt_in_a_burst_gets_its_rst() {
 struct RefuseMarkedAcks;
 
 impl Answer for RefuseMarkedAcks {
-    fn syn(&self, _: &[TcpOption]) -> SynAnswer {
+    fn syn(&self, _: &tcp::Syn<'_>) -> SynAnswer {
         SynAnswer::Accept(Vec::new())
     }
 
@@ -640,13 +640,14 @@ impl tcp::Segments for Stamp {
         }]
     }
 
-    fn received(&mut self, segment: &tcp::Received<'_>) {
+    fn received(&mut self, segment: &tcp::Received<'_>) -> bool {
         self.0.lock().unwrap().push(segment.payload.len());
+        false
     }
 }
 
 impl Answer for DropOrStamp {
-    fn syn(&self, _: &[TcpOption]) -> SynAnswer {
+    fn syn(&self, _: &tcp::Syn<'_>) -> SynAnswer {
         SynAnswer::Accept(Vec::new())
     }
 
@@ -787,9 +788,9 @@ fn hostile_syn_options_get_well_formed_answers() {
         let mut listener = server.listen(80)?;
         let seen = Arc::new(Mutex::new(Vec::new()));
         let seen_by_answer = seen.clone();
-        listener.answer(Box::new(move |syn: &[TcpOption]| {
-            seen_by_answer.lock().unwrap().push(syn.to_vec());
-            answer_mp_capable(syn)
+        listener.answer(Box::new(move |syn: &tcp::Syn<'_>| {
+            seen_by_answer.lock().unwrap().push(syn.options.to_vec());
+            answer_mp_capable(syn.options)
         }));
         let mut state = 0x9e37_79b9_7f4a_7c15u64;
         let mut byte = move || {
@@ -858,7 +859,7 @@ fn syns_past_the_backlog_get_syn_cookies() {
             data: vec![9],
         };
         let answer = added.clone();
-        listener.answer(Box::new(move |_: &[TcpOption]| {
+        listener.answer(Box::new(move |_: &tcp::Syn<'_>| {
             SynAnswer::Accept(vec![answer.clone()])
         }));
         for port in 5000..5004 {

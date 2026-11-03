@@ -852,8 +852,12 @@ fn malformed_options_are_logged_and_survived() {
         for n in 0..good.0.len() {
             net.send(Packet(good.0[..n].to_vec()));
         }
+        // Its checksum is right, so the header length is its only fault.
         let mut long_header = good.0.clone();
         long_header[20 + 12] = 15 << 4;
+        long_header[20 + 16..20 + 18].copy_from_slice(&[0, 0]);
+        let sum = transport_checksum(from.ip(), server(22).ip(), 6, &long_header[20..]);
+        long_header[20 + 16..20 + 18].copy_from_slice(&sum.to_be_bytes());
         net.send(Packet(long_header));
         let mut state = 0x2545_f491_4f6c_dd1du64;
         for _ in 0..500 {
@@ -1328,4 +1332,406 @@ fn a_syn_s_payload_is_logged() {
         assert_eq!(syns[0]["payload"], hex(data));
         Ok(())
     });
+}
+
+/// A Linux client that speaks first maps its first bytes with MP_CAPABLE
+/// and data, after a third ACK with none (RFC 8684 section 3.1). The
+/// server takes that as a mapping, so the connection stays MPTCP and the
+/// answer carries DSS, with a Data ACK past the request.
+#[test]
+fn mp_capable_with_data_maps_a_client_s_first_bytes() {
+    honeypot(Config::default(), |mut net| async move {
+        let from = client(3, 41000);
+        let client_key = 0x5555_6666_7777_8888;
+        let (key, iss) = open_mptcp(&mut net, from, 80, client_key).await;
+        let request = b"GET / HTTP/1.1\r\nHost: 203.0.113.10\r\n\r\n";
+        let first = mptcp_bytes(MptcpOption::Capable(Capable {
+            keys: Keys::Data {
+                sender: client_key,
+                receiver: key,
+                data_level_length: request.len() as u16,
+                checksum: None,
+            },
+            ..match linux_capable() {
+                MptcpOption::Capable(c) => c,
+                _ => unreachable!(),
+            }
+        }));
+        net.send(segment(
+            from,
+            server(80),
+            5001,
+            iss + 1,
+            PSH | ACK,
+            &first,
+            request,
+        ));
+        let replies: Vec<Packet> = net
+            .drain()
+            .await
+            .into_iter()
+            .filter(|p| !payload_of(p).is_empty())
+            .collect();
+        assert!(
+            payload_of(&replies[0]).starts_with(b"HTTP/1.1 200 OK"),
+            "{replies:?}"
+        );
+        let past_request = mptcp::idsn(client_key).wrapping_add(1 + request.len() as u64);
+        for reply in &replies {
+            let dss = dss_of(reply).expect("DSS on the answer");
+            assert!(dss.mapping.is_some());
+            assert_eq!(dss.data_ack, Some(Sequence::Long(past_request)));
+        }
+        assert_eq!(net.honeypot.mptcp_connections(), 1);
+        Ok(())
+    });
+}
+
+/// A DATA_FIN on a segment with no data and no FIN, as a Linux client
+/// sends it when it closes, is acknowledged at once with a Data ACK past
+/// it (RFC 8684 section 3.3.3).
+#[test]
+fn a_data_fin_alone_is_acknowledged_at_once() {
+    honeypot(Config::default(), |mut net| async move {
+        let from = client(3, 41001);
+        let client_key = 0x1111_2222_3333_4444;
+        let (key, iss) = open_mptcp(&mut net, from, 22, client_key).await;
+        let banner = net.recv().await.expect("the banner");
+        assert_eq!(payload_of(&banner), SSH_BANNER);
+        let acked = iss + 1 + SSH_BANNER.len() as u32;
+        let data_fin = mptcp_bytes(MptcpOption::Dss(Dss {
+            data_ack: Some(Sequence::Long(
+                mptcp::idsn(key).wrapping_add(1 + SSH_BANNER.len() as u64),
+            )),
+            mapping: Some(Mapping {
+                data_sequence_number: Sequence::Long(mptcp::idsn(client_key).wrapping_add(1)),
+                subflow_sequence_number: 0,
+                data_level_length: 1,
+                checksum: None,
+            }),
+            data_fin: true,
+        }));
+        net.send(segment(from, server(22), 5001, acked, ACK, &data_fin, b""));
+        let ack = net.recv().await.expect("an ACK at once");
+        assert_eq!(flags(&ack) & (SYN | RST), 0);
+        assert_eq!(ack_of(&ack), 5001, "no subflow byte");
+        assert_eq!(
+            dss_of(&ack).unwrap().data_ack,
+            Some(Sequence::Long(mptcp::idsn(client_key).wrapping_add(2)))
+        );
+        Ok(())
+    });
+}
+
+/// Sends a join SYN for `key`'s connection from `joiner`, with random 99,
+/// and returns the server's random number and initial sequence number
+/// from its SYN-ACK. SYN-ACKs to others that come first are skipped.
+async fn join(net: &mut Internet, joiner: SocketAddr, key: u64) -> (u32, u32) {
+    let syn = with_mss(&mptcp_bytes(join_syn(token(key), 99)));
+    net.send(segment(joiner, server(22), 7000, 0, SYN, &syn, b""));
+    let syn_ack = loop {
+        let p = net.recv().await.expect("a SYN-ACK");
+        if dst_of(&p) == joiner {
+            break p;
+        }
+    };
+    assert_eq!(flags(&syn_ack), SYN | ACK);
+    let [MptcpOption::Join(Join::SynAck { random, .. })] = mptcp_of(&syn_ack)[..] else {
+        panic!("MP_JOIN: {:?}", mptcp_of(&syn_ack));
+    };
+    (random, seq_of(&syn_ack))
+}
+
+/// A join's third ACK with no MP_JOIN is refused as an MPTCP-specific
+/// error, as Linux refuses a join it would have to fall back.
+#[test]
+fn a_join_ack_without_mp_join_is_an_mptcp_error() {
+    honeypot(Config::default(), |mut net| async move {
+        let from = client(4, 42000);
+        let (key, _) = open_mptcp(&mut net, from, 22, 0x1111_2222_3333_4444).await;
+        net.drain().await;
+        let joiner = client(4, 42001);
+        let (_, join_iss) = join(&mut net, joiner, key).await;
+        net.send(segment(
+            joiner,
+            server(22),
+            7001,
+            join_iss + 1,
+            ACK,
+            &[],
+            b"",
+        ));
+        let refused = net.recv().await.expect("a RST");
+        assert_eq!(flags(&refused), RST);
+        assert_eq!(
+            mptcp_of(&refused),
+            [MptcpOption::TcpRst {
+                transient: false,
+                reason: reason::MPTCP_SPECIFIC
+            }]
+        );
+        Ok(())
+    });
+}
+
+/// While spoofed SYNs fill the backlog, a join SYN gets a SYN cookie, and
+/// the server keeps what it needs as Linux does: the third ACK with the
+/// right HMAC is taken. A cookie join whose connection is gone by its ACK
+/// is dropped with no answer.
+#[test]
+fn a_join_answered_with_a_syn_cookie_is_taken() {
+    honeypot(Config::default(), |mut net| async move {
+        let from = client(5, 43000);
+        let client_key = 0x1111_2222_3333_4444;
+        let (key, _) = open_mptcp(&mut net, from, 22, client_key).await;
+        net.drain().await;
+        let spoofed = |n: u32| SocketAddr::new(IpAddr::V4(Ipv4Addr::from(0x0b00_0000 + n)), 50000);
+        for n in 0..4096 {
+            net.send(segment(
+                spoofed(n),
+                server(22),
+                n,
+                0,
+                SYN,
+                &with_mss(&[]),
+                b"",
+            ));
+        }
+        let hmac = |our_random| {
+            let hmac: [u8; 20] = join_hmac(client_key, key, 99, our_random)[..20]
+                .try_into()
+                .unwrap();
+            mptcp_bytes(MptcpOption::Join(Join::Ack { hmac }))
+        };
+        let joiner = client(5, 43001);
+        let (random, join_iss) = join(&mut net, joiner, key).await;
+        net.send(segment(
+            joiner,
+            server(22),
+            7001,
+            join_iss + 1,
+            ACK,
+            &hmac(random),
+            b"",
+        ));
+        net.send(segment(
+            joiner,
+            server(22),
+            7001,
+            join_iss + 1,
+            PSH | ACK,
+            &[],
+            b"more",
+        ));
+        let answer = loop {
+            let p = net.recv().await.expect("an ACK");
+            if dst_of(&p) == joiner {
+                break p;
+            }
+        };
+        assert_eq!(flags(&answer), ACK, "the subflow is open");
+        assert_eq!(ack_of(&answer), 7005);
+
+        // Another join, whose connection the client ends before the ACK.
+        let late = client(5, 43002);
+        let (random, join_iss) = join(&mut net, late, key).await;
+        net.send(segment(from, server(22), 5001, 0, RST, &[], b""));
+        net.drain().await;
+        assert_eq!(
+            net.honeypot.mptcp_connections(),
+            0,
+            "the connection is gone"
+        );
+        net.send(segment(
+            late,
+            server(22),
+            7001,
+            join_iss + 1,
+            ACK,
+            &hmac(random),
+            b"",
+        ));
+        let fcx = net.fcx.clone();
+        let deadline = fcx.now() + Duration::from_millis(500);
+        while let Ok(p) = fcx.race(Some(deadline), net.end.recv(&fcx)).await {
+            let p = p?;
+            assert_ne!(
+                dst_of(&p),
+                late,
+                "nothing to the late join: {:x} {:?}",
+                flags(&p),
+                mptcp_of(&p)
+            );
+        }
+        Ok(())
+    });
+}
+
+/// SYNs from addresses no router forwards from, plain or with MP_JOIN,
+/// get nothing back.
+#[test]
+fn martian_sources_get_nothing() {
+    honeypot(Config::default(), |mut net| async move {
+        let martians = [
+            "0.0.0.0",
+            "127.0.0.1",
+            "224.0.0.1",
+            "239.1.2.3",
+            "240.0.0.1",
+            "255.255.255.255",
+        ];
+        for (n, src) in martians.iter().enumerate() {
+            let ip: IpAddr = src.parse().unwrap();
+            let plain = SocketAddr::new(ip, 40000 + n as u16);
+            net.send(segment(plain, server(22), 1, 0, SYN, &with_mss(&[]), b""));
+            let joining = SocketAddr::new(ip, 41000 + n as u16);
+            let join = with_mss(&mptcp_bytes(join_syn(0xdead_beef, 1)));
+            net.send(segment(joining, server(22), 1, 0, SYN, &join, b""));
+        }
+        let answers = net.drain().await;
+        assert!(answers.is_empty(), "{answers:?}");
+        Ok(())
+    });
+}
+
+/// An idle SSH connection gets no keepalive before sshd's login grace
+/// time ends it with a FIN, as on Linux, where the first comes after two
+/// hours.
+#[test]
+fn an_idle_ssh_connection_gets_no_keepalive() {
+    honeypot(Config::default(), |mut net| async move {
+        let from = client(6, 44000);
+        net.send(segment(from, server(22), 1000, 0, SYN, &with_mss(&[]), b""));
+        let syn_ack = net.recv().await.expect("a SYN-ACK");
+        let iss = seq_of(&syn_ack);
+        net.send(segment(from, server(22), 1001, iss + 1, ACK, &[], b""));
+        let banner = net.recv().await.expect("the banner");
+        assert_eq!(payload_of(&banner), SSH_BANNER);
+        let acked = iss + 1 + SSH_BANNER.len() as u32;
+        net.send(segment(from, server(22), 1001, acked, ACK, &[], b""));
+        let fcx = net.fcx.clone();
+        let quiet = fcx
+            .race(
+                Some(fcx.now() + Duration::from_secs(115)),
+                net.end.recv(&fcx),
+            )
+            .await;
+        assert!(quiet.is_err(), "a keepalive: {quiet:?}");
+        let fin = fcx
+            .race(
+                Some(fcx.now() + Duration::from_secs(10)),
+                net.end.recv(&fcx),
+            )
+            .await??;
+        assert_eq!(flags(&fin), ACK | 0x01, "sshd's FIN");
+        Ok(())
+    });
+}
+
+/// A SYN whose TCP checksum is wrong is not answered, as the world
+/// discards it, and not logged either, so it counts toward no burst. The
+/// capture has it.
+#[test]
+fn syns_with_a_wrong_checksum_are_in_the_capture_only() {
+    honeypot(Config::default(), |mut net| async move {
+        for port in 40001..=40008 {
+            let from = client(3, port);
+            let options = with_mss(&mptcp_bytes(linux_capable()));
+            let mut syn = segment(from, server(22), 1000, 0, SYN, &options, b"");
+            syn.0[20 + 16] ^= 0xff;
+            net.send(syn);
+        }
+        assert!(net.drain().await.is_empty(), "no answer");
+        assert!(net.events("syn").is_empty(), "{:?}", net.log());
+        assert!(net.events("burst").is_empty());
+        assert_eq!(net.pcap_blocks().len() - 2, 8);
+        Ok(())
+    });
+}
+
+/// A spoofed SYN's SYN-ACK is sent six times, as from Linux, and all six
+/// are in the capture, but the log has one answer line for it.
+#[test]
+fn a_syn_ack_sent_again_is_logged_once() {
+    honeypot(Config::default(), |mut net| async move {
+        let spoofed = client(77, 45000);
+        net.send(segment(spoofed, server(22), 1, 0, SYN, &with_mss(&[]), b""));
+        let fcx = net.fcx.clone();
+        let mut syn_acks = 0;
+        while let Ok(p) = fcx
+            .race(
+                Some(fcx.now() + Duration::from_secs(40)),
+                net.end.recv(&fcx),
+            )
+            .await
+        {
+            assert_eq!(flags(&p?), SYN | ACK);
+            syn_acks += 1;
+        }
+        assert_eq!(syn_acks, 6);
+        assert_eq!(net.pcap_blocks().len() - 2, 7, "the SYN and six SYN-ACKs");
+        let answers = net.events("answer");
+        assert_eq!(answers.len(), 1, "{answers:?}");
+        assert_eq!(answers[0]["dst"], spoofed.to_string());
+        Ok(())
+    });
+}
+
+/// Writes nothing after the first `room` bytes.
+#[derive(Clone)]
+struct Full(Arc<Mutex<usize>>);
+
+impl Write for Full {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut room = self.0.lock().unwrap();
+        if *room == 0 {
+            return Err(std::io::ErrorKind::StorageFull.into());
+        }
+        let n = buf.len().min(*room);
+        *room -= n;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A full disk does not stop the world: with neither file taking another
+/// byte, the server still answers and serves.
+#[test]
+fn a_full_disk_does_not_stop_the_world() {
+    fictionet::block_on(fictionet::lab(
+        fictionet::Seed::from_u64(7),
+        |fcx| async move {
+            let (attacher, attachments) = fictionet::attachments();
+            // Room for the capture's header and no more.
+            let mut header = Vec::new();
+            fictionet::stdlib::pcap::start(&mut header, &[]);
+            let sinks = Sinks {
+                log: Box::new(Full(Arc::new(Mutex::new(0)))),
+                pcap: Box::new(Full(Arc::new(Mutex::new(header.len())))),
+            };
+            honeypot_world::start(
+                &fcx,
+                &Config::default(),
+                Clock::at_unix_secs(EPOCH),
+                sinks,
+                attachments,
+            )?;
+            let mut internet = attacher.attach(honeypot_world::INTERNET)?;
+            let within = |fcx: &Cx| Some(fcx.now() + Duration::from_secs(2));
+            let from = client(9, 46000);
+            internet.send(segment(from, server(22), 1, 0, SYN, &with_mss(&[]), b""));
+            let syn_ack = fcx.race(within(&fcx), internet.recv(&fcx)).await??;
+            assert_eq!(flags(&syn_ack), SYN | ACK);
+            let iss = seq_of(&syn_ack);
+            internet.send(segment(from, server(22), 2, iss + 1, ACK, &[], b""));
+            let banner = fcx.race(within(&fcx), internet.recv(&fcx)).await??;
+            assert_eq!(payload_of(&banner), SSH_BANNER);
+            fcx.cancel();
+            Ok(())
+        },
+    ))
+    .unwrap();
 }

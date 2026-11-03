@@ -1074,8 +1074,8 @@ mod tests {
         }
 
         fn answer(&self) -> Option<Box<dyn tcp::Answer>> {
-            Some(Box::new(|syn: &[tcp::TcpOption]| {
-                if syn.contains(&tcp::TcpOption::Unknown { kind: 253, data: vec![1] }) {
+            Some(Box::new(|syn: &tcp::Syn<'_>| {
+                if syn.options.contains(&tcp::TcpOption::Unknown { kind: 253, data: vec![1] }) {
                     tcp::SynAnswer::Refuse(vec![tcp::TcpOption::Unknown {
                         kind: 253,
                         data: vec![0],
