@@ -29,7 +29,7 @@ use fictionet::stdlib::services::dns::zone::{Denial, Node, Zone, ZoneData};
 use fictionet::stdlib::services::dns::{Event, WallClock};
 use fictionet::stdlib::services::serve::Transport;
 use fictionet::stdlib::web::httpd::{self, Body};
-use fictionet::stdlib::world::net::dns::encrypted::{Fronts, Operator, certificate};
+use fictionet::stdlib::world::net::dns::encrypted::{Fronts, Operator};
 use fictionet::stdlib::world::net::dns::internet::PUBLIC_RESOLVERS;
 use fictionet::stdlib::world::net::dns::{Authoritative, Recursive};
 use fictionet::stdlib::world::net::{Host, Net};
@@ -107,8 +107,9 @@ fn soa(mname: &str) -> SOA {
 /// wrong, each as its type number and its RDATA in presentation format,
 /// which is what the JSON API must give back. Names stay in ASCII, an
 /// A-label as it is, with decimal escapes (RFC 1035 §5.1).
-const KINDS: [(u16, &str); 8] = [
+const KINDS: [(u16, &str); 9] = [
     (65, "1 . alpn=h2,h3 ipv4hint=45.33.4.80,45.33.4.53"),
+    (64, "1 . mandatory=key9999 key9999=/q"),
     (13, "\"Intel Xeon\" \"\""),
     (257, "0 issue \"a\\\"b; c\""),
     (35, "1 1 \"s\" \"x\\\"y\" \"\" ."),
@@ -875,8 +876,11 @@ fn a_front_on_another_host_answers_from_the_resolvers_cache() {
             not_before: Time::from_unix(946_684_800)?,
             not_after: Time::from_unix(4_102_444_800)?,
         };
-        let config =
-            certificate(&fcx, &ca, cloudflare, validity)?.server_config(&fcx, date(NOW))?;
+        let sans = cloudflare.sans();
+        let sans: Vec<&str> = sans.iter().map(String::as_str).collect();
+        let config = ca
+            .issue(&fcx, &sans, validity)?
+            .server_config(&fcx, date(NOW))?;
         let mut roots = RootCertStore::empty();
         roots.add(ca.cert_der())?;
         let roots = Arc::new(roots);
@@ -923,6 +927,64 @@ fn a_front_on_another_host_answers_from_the_resolvers_cache() {
         assert!(
             sent.iter()
                 .all(|sent| sent.validation == Validation::Secure)
+        );
+        Ok(())
+    });
+}
+
+/// The names a DNS over HTTPS front answers for are its own at its
+/// address: a site for one of them cannot be placed there, and requests
+/// for the name still reach the resolver.
+#[test]
+fn a_site_cannot_take_a_fronts_name_at_its_address() {
+    world(Duration::from_secs(60), |fcx| async move {
+        let (attacher, attachments) = fictionet::attachments();
+        let (hosts, anchors) = authorities();
+        let cloudflare = &PUBLIC_RESOLVERS[1];
+        let one = cloudflare.addresses[0].v4;
+        let elsewhere = Ipv4Addr::new(45, 33, 6, 6);
+        let ca = Ca::new(&fcx, "World CA")?;
+        let validity = Validity {
+            not_before: Time::from_unix(946_684_800)?,
+            not_after: Time::from_unix(4_102_444_800)?,
+        };
+        let sans = cloudflare.sans();
+        let sans: Vec<&str> = sans.iter().map(String::as_str).collect();
+        let config = ca
+            .issue(&fcx, &sans, validity)?
+            .server_config(&fcx, date(NOW))?;
+        let site_config = config.clone();
+        let mut roots = RootCertStore::empty();
+        roots.add(ca.cert_der())?;
+        let roots = Arc::new(roots);
+        let sent: Arc<Mutex<Vec<Sent>>> = Arc::default();
+        let resolver = recursive(anchors, &sent);
+        let fronts =
+            Fronts::new(resolver.handle(), move |_| config.clone()).names(cloudflare.doh());
+        let away = fronts.clone().resolver_at(IpAddr::V4(one));
+        let net = Net::new().ipv4_only().hosts(hosts).hosts([
+            fronts.dot(Host::new("one.one.one.one").at(one).program(resolver)),
+            away.doh(Host::new("cloudflare-dns.com").at(elsewhere)),
+        ]);
+        let handle = net.handle();
+        net.start(&fcx, attachments)?;
+        let doh = "cloudflare-dns.com";
+        let site = fictionet::stdlib::web::Site::new(super::Plain("site"))
+            .tls(site_config)
+            .into_host(doh)
+            .at(elsewhere);
+        assert!(handle.add_host(site).is_err());
+
+        let m = machine(&fcx, attacher.attach("agent")?, ME);
+        let conn = tls(&fcx, &m, &roots, at(elsewhere, 443), doh, &[b"h2"]).await;
+        let wire = base64url(&query(0, "www.example.", RecordType::A).to_vec().unwrap());
+        let path = format!("/dns-query?dns={wire}");
+        let got = http(&fcx, conn, true, get(true, doh, &path, &[])).await;
+        assert_eq!(got.status, StatusCode::OK);
+        assert_eq!(got.header("content-type"), Some("application/dns-message"));
+        assert_eq!(
+            answers(&Message::from_vec(&got.body).unwrap()),
+            vec![(WWW, TTL)]
         );
         Ok(())
     });

@@ -311,7 +311,7 @@ impl Sites {
                         if self.refusing.lock().insert(addr)
                             && !self.handle.has_machine(addr.into())
                         {
-                            let refuser = Host::new(&name.to_string()).at(addr).ipv4_only();
+                            let refuser = Host::new(&dns::host(&name)).at(addr).ipv4_only();
                             let _ = self.handle.add_host(refuser);
                         }
                         continue;
@@ -355,10 +355,7 @@ impl Sites {
     /// name always, and other names as [`Pages::serves_host`] says, which
     /// in Live-Depth keeps to the depth.
     fn serves(&self, name: &LowerName) -> bool {
-        self.forwarded.contains_key(name)
-            || self
-                .pages
-                .serves_host(name.to_string().trim_end_matches('.'))
+        self.forwarded.contains_key(name) || self.pages.serves_host(&dns::host(name))
     }
 
     /// The host the world puts at `name`'s addresses.
@@ -377,7 +374,7 @@ impl Sites {
     /// certificate from the world's CA, or in a live mode the one the real
     /// host's certificate failure calls for.
     fn site(&self, name: &LowerName) -> Host {
-        let host = name.to_string().trim_end_matches('.').to_owned();
+        let host = dns::host(name);
         if self.pages.source().is_live() {
             self.upstream.start(&host);
         }

@@ -60,24 +60,44 @@ pub fn sign(
     Ok(record)
 }
 
-/// The bytes an RRSIG with `input` signs over `set`: hickory's
-/// to-be-signed form, with the names in each record's RDATA in canonical,
-/// lowercase form (RFC 4034 §6.2 item 3, as RFC 6840 §5.1 amends it).
-/// hickory lowercases those of the types it knows; the types on that list
-/// it carries as unknown RDATA are lowercased here. The error is
-/// hickory's, for a record whose data does not encode.
+/// The bytes an RRSIG with `input` signs over `set` (RFC 4035 §5.3.2):
+/// the RRSIG's fields, then each record in canonical form and order.
+///
+/// hickory writes each record in canonical form, with the names in its
+/// RDATA in lowercase (RFC 4034 §6.2 item 3, as RFC 6840 §5.1 amends it)
+/// for the types it knows; those on that list it carries as unknown RDATA
+/// are lowercased here. hickory would order the records by their TTL and
+/// their RDATA as written, case and all, so each record is written alone
+/// and put in canonical order here: by its canonical RDATA, as a string of
+/// octets (RFC 4034 §6.3). The error is hickory's, for a record whose data
+/// does not encode.
 pub fn signed_data(set: &RecordSet, input: &SigInput) -> Result<TBS, ProtoError> {
-    let records: Vec<Record> = set
+    let fields = TBS::from_input(set.name(), set.dns_class(), input, std::iter::empty())?;
+    let fields = fields.as_ref();
+    let mut records = set
         .records_without_rrsigs()
         .map(|record| {
             let mut record = record.clone();
             if let RData::Unknown { code, rdata } = &mut record.data {
                 lowercase_names(*code, &mut rdata.anything);
             }
-            record
+            let alone =
+                TBS::from_input(set.name(), set.dns_class(), input, std::iter::once(&record))?;
+            Ok(alone.as_ref()[fields.len()..].to_vec())
         })
-        .collect();
-    TBS::from_input(set.name(), set.dns_class(), input, records.iter())
+        .collect::<Result<Vec<Vec<u8>>, ProtoError>>()?;
+    records.sort_by(|a, b| rdata(a).cmp(rdata(b)));
+    Ok(TBS::from(&[fields, &records.concat()].concat()[..]))
+}
+
+/// The RDATA of `record`, one record of the signed data: what follows its
+/// uncompressed owner name, type, class, TTL, and RDATA length.
+fn rdata(record: &[u8]) -> &[u8] {
+    let mut at = 0;
+    while let Some(&length) = record.get(at).filter(|length| **length != 0) {
+        at += 1 + usize::from(length);
+    }
+    record.get(at + 1 + 10..).unwrap_or_default()
 }
 
 /// Lowercases the uncompressed names in `rdata`, the RDATA of a type on

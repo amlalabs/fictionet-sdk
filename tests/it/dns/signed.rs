@@ -5,13 +5,16 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use fictionet::stdlib::protocols::dns::EdeCode;
 use fictionet::stdlib::protocols::dns::dnssec::rdata::DNSSECRData;
 use fictionet::stdlib::protocols::dns::dnssec::{
     Algorithm, AlgorithmPolicy, Anchors, Chain, DigestType, Fetched, KeyFlags, KeySet, Link, Ring,
     Sign, TBS, Validation, Verify, Window, ZoneKey, ds, validate_denial, validate_rrset,
 };
-use fictionet::stdlib::protocols::dns::op::{Edns, Message, MessageType, OpCode, Query};
-use fictionet::stdlib::protocols::dns::rr::rdata::{A, NS, NULL, SOA};
+use fictionet::stdlib::protocols::dns::op::{
+    Edns, Message, MessageType, OpCode, Query, ResponseCode,
+};
+use fictionet::stdlib::protocols::dns::rr::rdata::{A, CNAME, MX, NS, NULL, SOA};
 use fictionet::stdlib::protocols::dns::rr::{
     LowerName, Name, RData, Record, RecordSet, RecordType,
 };
@@ -100,10 +103,21 @@ fn denials() -> [Denial; 2] {
 
 /// `data`'s answer to `qname` `qtype`, asked with DO.
 fn ask(data: &dyn ZoneData, qname: &str, qtype: RecordType, any: AnyResponse) -> Message {
+    ask_with(data, qname, qtype, any, true)
+}
+
+/// `data`'s answer to `qname` `qtype`, asked with DO as `dnssec_ok` says.
+fn ask_with(
+    data: &dyn ZoneData,
+    qname: &str,
+    qtype: RecordType,
+    any: AnyResponse,
+    dnssec_ok: bool,
+) -> Message {
     let mut message = Message::new(7, MessageType::Query, OpCode::Query);
     message.add_query(Query::query(name(qname), qtype));
     let mut edns = Edns::new();
-    edns.set_max_payload(1232).set_dnssec_ok(true);
+    edns.set_max_payload(1232).set_dnssec_ok(dnssec_ok);
     message.set_edns(edns);
     let Parsed::Request(request) = Request::parse(&message.to_vec().unwrap(), Transport::Udp)
     else {
@@ -204,6 +218,93 @@ fn nodata_at_a_dname_owner_validates() {
             assert_eq!(validation, Validation::Secure, "{denial:?} {how}");
         }
     }
+}
+
+/// The signed NSEC at a wildcard owner, copied to another owner, still
+/// verifies, since its RRSIG's labels field rebuilds the wildcard. It
+/// proves nothing there (RFC 4035 §5.4): alone it leaves an NXDOMAIN
+/// unproven, and beside a real proof it is a record the resolver may not
+/// use to deny other names.
+#[test]
+fn an_nsec_moved_off_its_wildcard_owner_proves_nothing() {
+    let wild = Zone::builder(
+        name("example."),
+        SOA::new(
+            name("ns1.example."),
+            name("hostmaster.example."),
+            1,
+            7200,
+            3600,
+            1209600,
+            300,
+        ),
+        3600,
+    )
+    .rrset(rrset("example.", vec![RData::NS(NS(name("ns1.example.")))]))
+    .rrset(rrset("ns1.example.", vec![RData::A(A::new(192, 0, 2, 1))]))
+    .rrset(rrset("www.example.", vec![RData::A(A::new(192, 0, 2, 2))]))
+    .rrset(rrset("*.example.", vec![RData::A(A::new(192, 0, 2, 3))]))
+    .build()
+    .unwrap()
+    .signed(&keys(), window(), Denial::Nsec)
+    .unwrap();
+    let nsec =
+        sets(&ask(&wild, "*.example.", RecordType::NSEC, AnyResponse::All).answers).remove(0);
+    let renamed = {
+        let owner = name("v.example.");
+        let mut set = RecordSet::with_ttl(owner.clone(), RecordType::NSEC, nsec.ttl());
+        for record in nsec.records_without_rrsigs() {
+            set.insert(
+                Record::from_rdata(owner.clone(), record.ttl, record.data.clone()),
+                0,
+            );
+        }
+        for rrsig in nsec.rrsigs() {
+            set.insert_rrsig(Record::from_rdata(
+                owner.clone(),
+                rrsig.ttl,
+                rrsig.data.clone(),
+            ));
+        }
+        set
+    };
+    let (chain, anchors) = chain(&wild);
+    let deny = |qname: &str, authority: &[RecordSet]| {
+        validate_denial(
+            &Query::query(name(qname), RecordType::A),
+            ResponseCode::NXDomain,
+            authority,
+            &chain,
+            &anchors,
+            &AlgorithmPolicy::iana(),
+            now(),
+            &Ring,
+        )
+    };
+    // The real NXDOMAIN of a name the wildcard does not cover.
+    let reply = ask(&wild, "a.b.ns1.example.", RecordType::A, AnyResponse::All);
+    let proof = sets(&reply.authorities);
+    let soa: Vec<RecordSet> = proof
+        .iter()
+        .filter(|set| set.record_type() == RecordType::SOA)
+        .cloned()
+        .collect();
+    assert_eq!(soa.len(), 1);
+    assert_eq!(
+        deny("a.b.ns1.example.", &proof).validation,
+        Validation::Secure
+    );
+
+    // The moved record spans v.example. to ns1.example., past the end of
+    // the zone, so it would cover www.example. and the wildcard.
+    let forged = deny("www.example.", &[renamed.clone(), soa[0].clone()]);
+    assert_eq!(forged.validation, Validation::Bogus(EdeCode::NSEC_MISSING));
+
+    let beside = deny(
+        "a.b.ns1.example.",
+        &proof.iter().cloned().chain([renamed]).collect::<Vec<_>>(),
+    );
+    assert_eq!(beside.unverified, Some(EdeCode::NSEC_MISSING));
 }
 
 #[test]
@@ -558,4 +659,221 @@ fn names_in_unknown_rdata_are_signed_in_lowercase() {
             assert!(verified, "{owner}: the {:?} RRSIG", rrsig.input().algorithm);
         }
     }
+}
+
+/// The records of an RRset are signed in canonical order, by their RDATA
+/// with its names in lowercase (RFC 4034 §6.3), however the names are
+/// written: `Bob.example.` comes after `ann.example.`, though `B` comes
+/// before `a`. Both what this signer makes and what another signer made
+/// in that order validate.
+#[test]
+fn records_are_signed_in_canonical_order_whatever_the_case_of_their_names() {
+    let mx = |exchange: &str| RData::MX(MX::new(10, name(exchange)));
+    let written = rrset("mx.example.", vec![mx("Bob.example."), mx("ann.example.")]);
+    let canonical = rrset("mx.example.", vec![mx("ann.example."), mx("bob.example.")]);
+    let signed = Zone::builder(
+        name("example."),
+        SOA::new(
+            name("ns1.example."),
+            name("hostmaster.example."),
+            1,
+            7200,
+            3600,
+            1209600,
+            300,
+        ),
+        3600,
+    )
+    .rrset(rrset("example.", vec![RData::NS(NS(name("ns1.example.")))]))
+    .rrset(rrset("ns1.example.", vec![RData::A(A::new(192, 0, 2, 1))]))
+    .rrset(written.clone())
+    .build()
+    .unwrap()
+    .signed(&keys(), window(), Denial::Nsec)
+    .unwrap();
+    let served = sets(&ask(&signed, "mx.example.", RecordType::MX, AnyResponse::All).answers);
+    assert_eq!(validate(&signed, &served[0]), Validation::Secure);
+    // The bytes another validator checks: the records in canonical order.
+    let dnskeys: Vec<_> = keys().keys.iter().map(|key| key.dnskey()).collect();
+    for record in served[0].rrsigs() {
+        let RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) = &record.data else {
+            panic!("an RRSIG");
+        };
+        let tbs = TBS::from_input(
+            canonical.name(),
+            canonical.dns_class(),
+            rrsig.input(),
+            canonical.records_without_rrsigs(),
+        )
+        .unwrap();
+        let verified = dnskeys
+            .iter()
+            .any(|key| Ring.verify(key, tbs.as_ref(), rrsig.sig()));
+        assert!(verified, "the {:?} RRSIG", rrsig.input().algorithm);
+    }
+
+    // The RRSIGs another signer made over the canonical records validate
+    // the records as written.
+    let mut theirs = written;
+    for rrsig in sets(
+        &ask(
+            &zone()
+                .with(canonical.clone())
+                .unwrap()
+                .signed(&keys(), window(), Denial::Nsec)
+                .unwrap(),
+            "mx.example.",
+            RecordType::MX,
+            AnyResponse::All,
+        )
+        .answers,
+    )[0]
+    .rrsigs()
+    {
+        theirs.insert_rrsig(rrsig.clone());
+    }
+    assert_eq!(validate(&signed, &theirs), Validation::Secure);
+}
+
+/// `example.` with a CNAME, an empty non-terminal at `b.example.`, and an
+/// unsigned delegation of `sub.example.` with glue.
+fn branching() -> Zone {
+    let soa = SOA::new(
+        name("ns1.example."),
+        name("hostmaster.example."),
+        1,
+        7200,
+        3600,
+        1209600,
+        300,
+    );
+    Zone::builder(name("example."), soa, 3600)
+        .rrset(rrset("example.", vec![RData::NS(NS(name("ns1.example.")))]))
+        .rrset(rrset("ns1.example.", vec![RData::A(A::new(192, 0, 2, 1))]))
+        .rrset(rrset(
+            "alias.example.",
+            vec![RData::CNAME(CNAME(name("ns1.example.")))],
+        ))
+        .rrset(rrset("a.b.example.", vec![RData::A(A::new(192, 0, 2, 2))]))
+        .delegate(
+            name("sub.example."),
+            rrset("sub.example.", vec![RData::NS(NS(name("ns.sub.example.")))]),
+            vec![rrset(
+                "ns.sub.example.",
+                vec![RData::A(A::new(192, 0, 2, 53))],
+            )],
+            None,
+        )
+        .build()
+        .unwrap()
+}
+
+fn rtypes(records: &[Record]) -> Vec<(String, RecordType)> {
+    records
+        .iter()
+        .map(|record| (record.name.to_string(), record.record_type()))
+        .collect()
+}
+
+/// QTYPE NSEC at a zone cut of data signed as it is asked gets the NSEC
+/// the parent's side holds there when it denies with NSEC, and a referral
+/// when it denies with NSEC3, which holds none (RFC 4035 §2.6, §3.1.4).
+#[test]
+fn nsec_at_a_cut_of_data_signed_as_asked_is_the_parents_or_a_referral() {
+    for dnssec_ok in [false, true] {
+        let online = Signed::new(branching(), keys(), window(), Denial::Nsec);
+        let reply = ask_with(
+            &online,
+            "sub.example.",
+            RecordType::NSEC,
+            AnyResponse::All,
+            dnssec_ok,
+        );
+        assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+        assert!(reply.metadata.authoritative, "{dnssec_ok}");
+        let nsec = sets(&reply.answers);
+        assert_eq!(nsec.len(), 1);
+        assert_eq!(nsec[0].record_type(), RecordType::NSEC);
+        assert_eq!(*nsec[0].name(), name("sub.example."));
+        if dnssec_ok {
+            assert_eq!(validate(&online, &nsec[0]), Validation::Secure);
+        }
+
+        let denial = Denial::Nsec3 {
+            opt_out: false,
+            salt: Vec::new(),
+        };
+        let online = Signed::new(branching(), keys(), window(), denial);
+        let reply = ask_with(
+            &online,
+            "sub.example.",
+            RecordType::NSEC,
+            AnyResponse::All,
+            dnssec_ok,
+        );
+        assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+        assert!(!reply.metadata.authoritative);
+        assert!(reply.answers.is_empty());
+        assert!(rtypes(&reply.authorities).contains(&("sub.example.".to_string(), RecordType::NS)));
+        assert_eq!(
+            rtypes(&reply.additionals),
+            vec![("ns.sub.example.".to_string(), RecordType::A)]
+        );
+    }
+}
+
+/// QTYPE NSEC at a name that exists, empty non-terminals included, gets
+/// the NSEC the online signer makes for it when it denies with NSEC, so no
+/// NODATA proof lists the type it denies. With NSEC3 the zone holds no
+/// NSEC, and the NODATA validates.
+#[test]
+fn nsec_at_an_existing_name_of_data_signed_as_asked_validates() {
+    let online = Signed::new(branching(), keys(), window(), Denial::Nsec);
+    for qname in ["ns1.example.", "b.example.", "alias.example."] {
+        let reply = ask(&online, qname, RecordType::NSEC, AnyResponse::All);
+        let answer = sets(&reply.answers);
+        assert_eq!(answer.len(), 1, "{qname}");
+        assert_eq!(answer[0].record_type(), RecordType::NSEC, "{qname}");
+        assert_eq!(*answer[0].name(), name(qname));
+        assert_eq!(validate(&online, &answer[0]), Validation::Secure, "{qname}");
+    }
+
+    let denial = Denial::Nsec3 {
+        opt_out: false,
+        salt: Vec::new(),
+    };
+    let online = Signed::new(branching(), keys(), window(), denial);
+    for qname in ["ns1.example.", "b.example."] {
+        let reply = ask(&online, qname, RecordType::NSEC, AnyResponse::All);
+        assert!(reply.answers.is_empty(), "{qname}");
+        let (chain, anchors) = chain(&online);
+        let validation = validate_denial(
+            &Query::query(name(qname), RecordType::NSEC),
+            reply.metadata.response_code,
+            &sets(&reply.authorities),
+            &chain,
+            &anchors,
+            &AlgorithmPolicy::iana(),
+            now(),
+            &Ring,
+        );
+        assert_eq!(validation.validation, Validation::Secure, "{qname}");
+    }
+}
+
+/// ANY at a CNAME of a zone that answers with a made-up HINFO gets the
+/// signed CNAME, never a HINFO beside it (RFC 8482 §4.2).
+#[test]
+fn any_at_a_signed_cname_gets_the_cname() {
+    let online = Signed::new(branching(), keys(), window(), Denial::Nsec);
+    let reply = ask(
+        &online,
+        "alias.example.",
+        RecordType::ANY,
+        AnyResponse::Hinfo,
+    );
+    let answer = sets(&reply.answers);
+    assert_eq!(answer.len(), 1);
+    assert_eq!(answer[0].record_type(), RecordType::CNAME);
+    assert_eq!(validate(&online, &answer[0]), Validation::Secure);
 }

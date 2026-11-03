@@ -43,7 +43,7 @@ deriving DecidableEq, Repr
 
 inductive Body where
   | positive (set : RRset) (rank : Rank) (validation : Validation)
-  | negative (kind : Negative) (soa : RRset) (validation : Validation)
+  | negative (kind : Negative) (soa : RRset) (rank : Rank) (validation : Validation)
   | failure (why : FailureKind)
 deriving DecidableEq, Repr
 
@@ -77,24 +77,24 @@ inductive Offer where
   that validated it, and whether the reply was truncated. -/
   | positive (set : RRset) (rank : Rank) (validation : Validation) (sigExpires : Option Nat)
       (originalTtl : Option Nat) (truncated : Bool)
-  /-- A negative answer for a key, with the SOA it came with, the NSEC or NSEC3 TTL when the denial was proven,
-  its validation, the first expiration and the smallest Original TTL of the RRSIGs that validated it, and
-  whether the reply was truncated. -/
-  | negative (key : Key) (kind : Negative) (soa : Option RRset) (denialTtl : Option Nat) (validation : Validation)
-      (sigExpires : Option Nat) (originalTtl : Option Nat) (truncated : Bool)
+  /-- A negative answer for a key, with the SOA it came with, the rank of the answer it came in, the NSEC or
+  NSEC3 TTL when the denial was proven, its validation, the first expiration and the smallest Original TTL of
+  the RRSIGs that validated it, and whether the reply was truncated. -/
+  | negative (key : Key) (kind : Negative) (soa : Option RRset) (rank : Rank) (denialTtl : Option Nat)
+      (validation : Validation) (sigExpires : Option Nat) (originalTtl : Option Nat) (truncated : Bool)
   | failure (key : Key) (why : FailureKind)
 deriving DecidableEq, Repr
 
 def Offer.key : Offer → Key
   | .positive s _ _ _ _ _ => ⟨s.owner, s.rtype⟩
-  | .negative k _ _ _ _ _ _ _ => k
+  | .negative k _ _ _ _ _ _ _ _ => k
   | .failure k _ => k
 
-/-- The rank an entry holds its key at. A negative answer is an authoritative answer; a failure is no data and
-ranks lowest. -/
+/-- The rank an entry holds its key at. A negative answer ranks as the answer it came in; a failure is no data
+and ranks lowest. -/
 def Body.rank : Body → Rank
   | .positive _ r _ => r
-  | .negative _ _ _ => .authAnswer
+  | .negative _ _ r _ => r
   | .failure _ => .glue
 
 /-- Whether a new entry with body `new` takes the key from a live entry with body `old`: data at equal or higher
@@ -143,7 +143,7 @@ def entryFor (now : Nat) (lim : Limits) (g : Nat) : Offer → Option Entry
     let ttl := min (readTtl s.ttl) lim.maxTtl
     if tc || ttl == 0 then none
     else some ⟨⟨s.owner, s.rtype⟩, .positive s r v, now, validatedCap now lim v sig orig (now + ttl), s.ttl, g⟩
-  | .negative k kind soa nsec v sig orig tc =>
+  | .negative k kind soa r nsec v sig orig tc =>
     match soa with
     | none => none
     | some soa =>
@@ -152,7 +152,7 @@ def entryFor (now : Nat) (lim : Limits) (g : Nat) : Offer → Option Entry
         | some n => min base (readTtl n)
         | none => base) lim.maxTtl
       if tc || ttl == 0 then none
-      else some ⟨k, .negative kind soa v, now, validatedCap now lim v sig orig (now + ttl), soa.ttl, g⟩
+      else some ⟨k, .negative kind soa r v, now, validatedCap now lim v sig orig (now + ttl), soa.ttl, g⟩
   | .failure k why => some ⟨k, .failure why, now, now + lim.failureTtl, lim.failureTtl, g⟩
 
 /-- The entry lives at `now`: written in the current generation and not expired. -/
@@ -183,7 +183,7 @@ deriving DecidableEq, Repr
 def render (now : Nat) (e : Entry) : Served :=
   match e.body with
   | .positive s _ v => .positive { s with ttl := e.expires - now } v
-  | .negative kind soa v => .negative kind { soa with ttl := e.expires - now } v
+  | .negative kind soa _ v => .negative kind { soa with ttl := e.expires - now } v
   | .failure why => .failure why
 
 /-- `Cache.serve`: the live entry for the key, rendered for `now`. -/
@@ -218,7 +218,7 @@ theorem entryFor_spec {now : Nat} {lim : Limits} {g : Nat} {o : Offer} {e : Entr
       have := validatedCap_le now lim v sig orig (now + min (readTtl s.ttl) lim.maxTtl)
       simp only
       omega
-  | negative k kind soa nsec v sig orig tc =>
+  | negative k kind soa r nsec v sig orig tc =>
     simp only at h
     cases soa with
     | none => cases h
@@ -365,7 +365,7 @@ theorem served_ttl_le_original {now : Nat} {c : Cache} {k : Key} {s : RRset} {v 
     obtain ⟨rfl, rfl⟩ := hs
     have := h3 s₀ r _ hb
     exact ⟨e, he, s₀, r, hk, hb, by simp only; omega, rfl, rfl, rfl⟩
-  | negative _ _ _ => rw [hb] at hs; cases hs
+  | negative _ _ _ _ => rw [hb] at hs; cases hs
   | failure _ => rw [hb] at hs; cases hs
 
 /-- A cached failure never answers as a negative: it answers SERVFAIL (RFC 9520). -/

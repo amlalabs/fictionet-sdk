@@ -850,6 +850,113 @@ fn master_file_strings_parameters_and_algorithms_read_as_bind_reads_them() {
     assert!(read(&rrsig("NOSUCHALGORITHM")).is_err());
 }
 
+/// The standard types hickory has no mnemonic for read by name, and their
+/// RDATA is the wire form BIND 9.20 writes for the same line (from
+/// `dig +unknownformat` of the zone loaded in `named`). Lines BIND refuses
+/// are refused.
+#[test]
+fn master_file_reads_every_standard_type_bind_reads() {
+    let head = "$TTL 300\n@ IN SOA @ h 1 2 3 4 5\n@ IN NS ns\nns IN A 192.0.2.1\n";
+    let read = |line: &str| {
+        Zone::from_master(&format!("{head}x {line}\n"), Some(name("t."))).map_err(Box::new)
+    };
+    let wire = |line: &str| -> String {
+        let zone = read(line).unwrap_or_else(|e| panic!("{line}: {e}"));
+        let Some(Node::Data(sets)) = zone.node(&lower("x.t.")) else {
+            panic!("{line}: no data");
+        };
+        let data = &sets
+            .values()
+            .next()
+            .unwrap()
+            .records_without_rrsigs()
+            .next()
+            .unwrap()
+            .data;
+        data.to_bytes()
+            .unwrap()
+            .iter()
+            .map(|b| format!("{b:02X}"))
+            .collect()
+    };
+    for (line, bind) in [
+        ("SPF \"v=spf1 -all\"", "0B763D73706631202D616C6C"),
+        (
+            "RP mbox.example.com. txt.example.com.",
+            "046D626F78076578616D706C6503636F6D0003747874076578616D706C6503636F6D00",
+        ),
+        (
+            "AFSDB 1 AfsDb.Example.Com.",
+            "0001054166734462074578616D706C6503436F6D00",
+        ),
+        ("KX 10 Kx.Example.", "000A024B78074578616D706C6500"),
+        (
+            "MINFO Rm.Example. Em.Example.",
+            "02526D074578616D706C650002456D074578616D706C6500",
+        ),
+        (
+            "LOC 52 22 23.000 N 4 53 32.000 E -2.00m 0.00m 10000m 10m",
+            "000016138B3CF018810CBCE0009895B8",
+        ),
+        (
+            "LOC 42 21 54 N 71 06 18 W -24m 30m",
+            "0033161389172DD070BE15F000988D20",
+        ),
+        (
+            "LOC 60 S 120 W 15.5 1500m 7 0.25",
+            "0015722173201A006640340000989C8E",
+        ),
+        (
+            "LOC 90 0 0.000 S 180 W 42849672.95m 90000000m 9.99m 0.01",
+            "009992106CB0270059604E00FFFFFFFF",
+        ),
+        (
+            "URI 10 1 \"https://example.com/\"",
+            "000A000168747470733A2F2F6578616D706C652E636F6D2F",
+        ),
+        (
+            "APL 1:192.168.32.0/21 !1:192.168.38.0/28 2:2001:db8::/32 1:0.0.0.0/0",
+            "00011503C0A82000011C83C0A8260002200420010DB800010000",
+        ),
+        ("APL", ""),
+        (
+            "DHCID AAIBY2/AuCccgoJbsaxcQc9TUapptP69lOjxfNuVAA2kjEA=",
+            "000201636FC0B8271C82825BB1AC5C41CF5351AA69B4FEBD94E8F17CDB95000DA48C40",
+        ),
+        ("EUI48 00-00-5e-00-53-2a", "00005E00532A"),
+        ("EUI64 00-00-5E-EF-10-00-00-2a", "00005EEF1000002A"),
+        ("NID 10 0014:4fff:ff20:ee64", "000A00144FFFFF20EE64"),
+        ("NID 20 1:2:3:a", "0014000100020003000A"),
+        ("L32 10 10.1.2.0", "000A0A010200"),
+        ("L64 10 2001:0DB8:1140:1000", "000A20010DB811401000"),
+        (
+            "LP 10 l64-subnet1.example.com.",
+            "000A0B6C36342D7375626E657431076578616D706C6503636F6D00",
+        ),
+        (
+            "HTTPS 1 . alpn=h2 dohpath=/dns-query{?dns}",
+            "00010000010003026832000700102F646E732D71756572797B3F646E737D",
+        ),
+        (
+            "SVCB 1 . mandatory=dohpath dohpath=/q{?dns}",
+            "000100000000020007000700082F717B3F646E737D",
+        ),
+    ] {
+        assert_eq!(wire(line), bind, "{line}");
+    }
+    for line in [
+        "LOC 90 0 0.001 S 180 W 0",
+        "LOC 52 22 23.0005 N 4 E 0",
+        "LOC 52 60 N 4 E 0",
+        "LOC 52 22 23 n 4 e 0",
+        "LOC 52 22 23 N 4 E 0 90000001m",
+        "EUI48 0-00-5e-00-53-2a",
+        "URI 10 1 abc",
+    ] {
+        assert!(read(line).is_err(), "{line}");
+    }
+}
+
 /// A DS RRset belongs at a zone cut, where the parent holds it, and BIND
 /// refuses a zone with one anywhere else (RFC 4035 §2.4).
 #[test]
@@ -1329,6 +1436,28 @@ fn any_follows_rfc_8482() {
     );
 }
 
+/// No HINFO is made up for ANY at a CNAME (RFC 8482 §4.2): the CNAME
+/// answers, its own or a wildcard's.
+#[test]
+fn any_at_a_cname_gets_the_cname_rather_than_a_hinfo() {
+    let zone = example();
+    for (qname, owner) in [
+        ("alias.example.", "alias.example."),
+        ("x.cw.example.", "x.cw.example."),
+    ] {
+        let reply = match answer(
+            &zone,
+            &request(qname, RecordType::ANY, false),
+            AnyResponse::Hinfo,
+        ) {
+            Answered::Response(response) => response.message,
+            Answered::Unknown { name } => panic!("unknown at {name}"),
+        };
+        assert_eq!(rows(&reply.answers), vec![row(owner, RecordType::CNAME)]);
+        assert!(reply.metadata.authoritative);
+    }
+}
+
 // DNSSEC records in answers.
 
 /// A zone with RRSIGs and an NSEC chain. The signatures are not real;
@@ -1505,6 +1634,42 @@ fn negatives_bring_their_nsec_proofs_with_do() {
         rows(&reply.authorities),
         vec![row("child.signed.", RecordType::NS)]
     );
+}
+
+/// The NSEC at a cut is the parent's data, so the parent answers it with
+/// AA set, as it answers DS, rather than referring (RFC 4035 §2.6, §4.2).
+/// A zone with no NSEC at the cut refers.
+#[test]
+fn the_nsec_at_a_cut_is_answered_by_the_parent() {
+    let zone = signed();
+    for reply in [
+        ask_do(&zone, "child.signed.", RecordType::NSEC),
+        ask(&zone, "child.signed.", RecordType::NSEC),
+    ] {
+        assert!(reply.metadata.authoritative);
+        assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(
+            rows(&reply.answers)[0],
+            row("child.signed.", RecordType::NSEC)
+        );
+        assert!(
+            rows(&reply.authorities)
+                .iter()
+                .all(|(_, rtype)| *rtype != RecordType::NS)
+        );
+    }
+    assert_eq!(
+        rows(&ask_do(&zone, "child.signed.", RecordType::NSEC).answers),
+        vec![
+            row("child.signed.", RecordType::NSEC),
+            row("child.signed.", RecordType::RRSIG),
+        ]
+    );
+
+    let unsigned = example();
+    let reply = ask(&unsigned, "sub.example.", RecordType::NSEC);
+    assert!(!reply.metadata.authoritative);
+    assert!(reply.answers.is_empty());
 }
 
 #[test]

@@ -1,6 +1,6 @@
 use super::addresses::{Allocator, Placed, Subnet, Subnet6, may_serve_v4, may_serve_v6};
 use super::attachments::answered_closed;
-use super::dns::{HOST_TTL, local_zone};
+use super::dns::HOST_TTL;
 use super::{Hooks, LanSeg, Limits, PROTO_TCP, connection_limit, link, normalize};
 use fictionet::stdlib::codec::Decode;
 use fictionet::stdlib::network::route::{Prefix, Router};
@@ -10,7 +10,7 @@ use fictionet::stdlib::protocols::dns::op::Query;
 use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RecordSet};
 use fictionet::stdlib::services::dns::resolver::Config;
 use fictionet::stdlib::services::dns::zone::{
-    Denied, Fact, Node, Revision, Transparent, View, ZoneData, targets,
+    Denied, Fact, Node, Revision, Transparent, View, ZoneData, special, targets,
 };
 use fictionet::stdlib::services::serve::ConnInfo;
 use fictionet::stdlib::services::serve::{self, Budget, ServeOptions, Service};
@@ -836,7 +836,7 @@ impl ZoneData for Declared {
                 tld
             }
         };
-        let (soa, ns) = local_zone(&Name::from(apex.clone()));
+        let (soa, ns) = special::local_apex(&Name::from(apex.clone()), special::LOCAL_TTL);
         let apex_sets = if self.apex_records {
             vec![soa.clone(), ns]
         } else {
@@ -880,7 +880,7 @@ impl Facts {
     /// A view of the zone at `apex` that knows nothing.
     pub(super) fn unknown(apex: LowerName) -> Facts {
         Facts {
-            soa: local_zone(&Name::from(apex.clone())).0,
+            soa: special::local_apex(&Name::from(apex.clone()), special::LOCAL_TTL).0,
             apex,
             revision: Revision(0),
             facts: BTreeMap::new(),

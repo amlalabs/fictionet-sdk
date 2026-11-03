@@ -86,15 +86,7 @@ impl Ca {
     ) -> fictionet::Result<Arc<ServerConfig>> {
         let world_now = self.world_now(fcx);
         let earliest = time::OffsetDateTime::from(self.earliest).min(world_now);
-        let names = resolver
-            .doh()
-            .into_iter()
-            .map(|name| name.to_ascii().trim_end_matches('.').to_owned());
-        let addresses = resolver
-            .addresses
-            .iter()
-            .flat_map(|address| [address.v4.to_string(), address.v6.to_string()]);
-        let sans: Vec<String> = names.chain(addresses).collect();
+        let sans = resolver.sans();
         let sans: Vec<&str> = sans.iter().map(String::as_str).collect();
         let leaf = self.issuer.issue_since(
             fcx,

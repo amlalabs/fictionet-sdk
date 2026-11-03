@@ -26,8 +26,9 @@
 (* The network loses at most MaxLoss messages and truncates at most MaxTc  *)
 (* UDP replies. A lost message enables the timeout of its exchange; the    *)
 (* clock plays no part in timeouts. The clock only ages cache entries, and *)
-(* it does not advance while a reply is in flight, since simulated round   *)
-(* trips are far shorter than a TTL second.                                *)
+(* it does not advance while a reply is in flight or before the resolver   *)
+(* acts on it, since simulated round trips are far shorter than a TTL      *)
+(* second.                                                                 *)
 (*                                                                         *)
 (* Ablation flags: CheckBailiwick, BoundWork, CacheTc, CheckExpiry,        *)
 (* FailureAsNegative, and CacheBounded. Each is the rule as the design     *)
@@ -174,17 +175,20 @@ Usable(e) ==
 Closest(n) == CHOOSE z \in known : AtOrBelow(n, z)
                  /\ \A y \in known : AtOrBelow(n, y) => AtOrBelow(z, y)
 
+\* got is the entry the last reply brought for qn, which serves this
+\* resolution whether or not the cache keeps it (RFC 1035 section 7.4).
 NewRes(q) == [qn |-> q, zone |-> Closest(q), tried |-> {}, out |-> None,
-              work |-> 0, chain |-> 0, recs |-> {}]
+              work |-> 0, chain |-> 0, recs |-> {}, got |-> None]
 
 \* The work and chain counters count every query and restart, with or
 \* without the bounds kept, and stop one past their bound, which is enough
 \* to see a resolution go past it and keeps the state space finite.
 Min(a, b) == IF a < b THEN a ELSE b
 
-\* What an answer to a client records about each entry it used.
-Used(n, e) == [n |-> n, t |-> e.t, val |-> e.val, ttl |-> e.ttl, readAt |-> e.readAt,
-               rank |-> e.rank, failure |-> e.failure]
+\* What an answer to a client records about each entry it used. fresh says
+\* the entry came in a reply to this resolution rather than from the cache.
+Used(n, e, fresh) == [n |-> n, t |-> e.t, val |-> e.val, ttl |-> e.ttl, readAt |-> e.readAt,
+                      rank |-> e.rank, failure |-> e.failure, fresh |-> fresh]
 
 Rcode(t) == CASE t = "a" -> "NOERROR" [] t = "cname" -> "NOERROR"
               [] t = "nodata" -> "NODATA" [] t = "nx" -> "NXDOMAIN" [] t = "fail" -> "SERVFAIL"
@@ -248,7 +252,7 @@ Fail(q) ==
         e == Entry(IF FailureAsNegative THEN "nx" ELSE "fail", None, FailureTtl, "auth",
                    r.zone, FALSE, TRUE)
     IN  /\ cache' = [cache EXCEPT ![r.qn] = e]
-        /\ Finish(q, Rcode(e.t), {Used(r.qn, e)})
+        /\ Finish(q, Rcode(e.t), {Used(r.qn, e, FALSE)})
 
 (* The resolution reached the work bound: SERVFAIL. The bound is one        *)
 (* question's budget and says nothing of the servers, so the failure is not *)
@@ -264,24 +268,29 @@ FailBounded(q) ==
 Live(u) == now < u.readAt + u.ttl
 
 (* A resolution with no exchange outstanding takes its next step: from the  *)
-(* cache when it can, otherwise a query to a server of the closest cut.    *)
+(* reply it just got, or from the cache when it can, otherwise a query to a *)
+(* server of the closest cut.                                               *)
 Advance(q) ==
     /\ res[q] # None
     /\ res[q].out = None
     /\ LET r == res[q]
-           e == cache[r.qn]
+           fresh == r.got # None
+           e == IF fresh THEN r.got ELSE cache[r.qn]
+           have == fresh \/ Usable(e)
        IN
-       \/ /\ Usable(e)
+       \/ /\ have
           /\ e.t # "cname"
-          /\ LET recs == r.recs \cup {Used(r.qn, e)} IN
-             IF CheckExpiry /\ \E u \in recs : ~Live(u)
-             \* A link of the chain ran out while the chase went on: follow the
-             \* chain again from the question, keeping the work done so far.
+          /\ LET recs == r.recs \cup {Used(r.qn, e, fresh)} IN
+             IF CheckExpiry /\ \E u \in recs : ~u.fresh /\ ~Live(u)
+             \* A link the cache gave ran out while the chase went on: follow the
+             \* chain again from the question, keeping the work done so far. A
+             \* link that came for this resolution serves it with the TTL it has
+             \* left, even 0: following again could only fetch it again.
              THEN /\ res' = [res EXCEPT ![q] = [NewRes(q) EXCEPT !.work = r.work, !.chain = r.chain]]
                   /\ UNCHANGED <<waiting, ans>>
              ELSE Finish(q, Rcode(e.t), recs)
           /\ UNCHANGED <<cache, net>>
-       \/ /\ Usable(e)
+       \/ /\ have
           /\ e.t = "cname"
           /\ IF BoundWork /\ r.chain >= MaxChain
              \* The chain is too long: SERVFAIL, keeping the cached CNAME.
@@ -290,9 +299,10 @@ Advance(q) ==
              ELSE /\ res' = [res EXCEPT ![q] = [qn |-> e.val, zone |-> Closest(e.val), tried |-> {},
                                               out |-> None, work |-> r.work,
                                               chain |-> Min(r.chain + 1, MaxChain + 1),
-                                              recs |-> r.recs \cup {Used(r.qn, e)}]]
+                                              recs |-> r.recs \cup {Used(r.qn, e, fresh)},
+                                              got |-> None]]
                   /\ UNCHANGED <<cache, waiting, ans, net>>
-       \/ /\ ~Usable(e)
+       \/ /\ ~have
           /\ IF BoundWork /\ r.work >= MaxWork
              THEN FailBounded(q) /\ UNCHANGED net
              ELSE IF \A s \in ServersOf(r.zone) : <<s, FALSE>> \in r.tried
@@ -366,10 +376,9 @@ ReceiveOne(m) ==
                    /\ net' = net \ {m}
                    /\ UNCHANGED <<cache, known>>
          [] b.kind = "answer" ->
-              /\ cache' = CacheAll([cache EXCEPT ![r.qn] = Entry(b.rr.t, b.rr.val, b.rr.ttl, "auth",
-                                                                   m.srv[1], FALSE, FALSE)],
-                                   b.extra, "auth", m.srv[1])
-              /\ res' = [res EXCEPT ![q].out = None]
+              LET e == Entry(b.rr.t, b.rr.val, b.rr.ttl, "auth", m.srv[1], FALSE, FALSE) IN
+              /\ cache' = CacheAll([cache EXCEPT ![r.qn] = e], b.extra, "auth", m.srv[1])
+              /\ res' = [res EXCEPT ![q].out = None, ![q].got = e]
               /\ net' = net \ {m}
               /\ UNCHANGED known
     /\ UNCHANGED <<now, ver, editAt, waiting, asked, ans, lost, tcs>>
@@ -398,9 +407,12 @@ TruncateOne(m) ==
     /\ tcs' = tcs + 1
     /\ UNCHANGED <<now, ver, editAt, cache, known, res, waiting, asked, ans, lost>>
 
+\* The clock does not advance while a reply is in flight or before the
+\* resolver has acted on it.
 Tick ==
     /\ now < MaxTime
     /\ \A m \in net : m.k = "q"
+    /\ \A q \in Questions : IF res[q] = None THEN TRUE ELSE res[q].got = None
     /\ now' = now + 1
     \* An expired entry is gone: it can never be used again.
     /\ cache' = IF CheckExpiry
@@ -453,9 +465,12 @@ VersionsAt(s) == IF editAt = None THEN {ver}
                  ELSE IF s > editAt THEN {1}
                  ELSE {0, 1}
 
-\* Some second within the record's TTL before t at which the data said u.
+\* Some second within the record's TTL before t at which the data said u. A
+\* record that came for the resolution and ran out before t reached the
+\* client with TTL 0; its TTL counts back from its last second instead.
 TrueWithin(u, t) ==
-    \E s \in 0..MaxTime : s <= t /\ s > t - u.ttl /\
+    LET end == IF u.fresh THEN Min(t, u.readAt + u.ttl - 1) ELSE t IN
+    \E s \in 0..MaxTime : s <= end /\ s > end - u.ttl /\
         \E v \in VersionsAt(s) : LET l == Lookup(v, u.n) IN l.t = u.t /\ l.val = u.val
 
 Answers == {ans[c][q] : c \in Clients, q \in Questions} \ {None}
@@ -485,9 +500,11 @@ NoPoison ==
 GlueNeverAnswers ==
     \A a \in Answers : \A u \in a.recs : u.rank = "auth"
 
-(* No answer uses a record at or after its expiry. *)
+(* No answer uses a record from the cache at or after its expiry. A record  *)
+(* that came for the resolution serves it with the TTL it has left, even 0  *)
+(* (RFC 1035 section 7.4).                                                  *)
 TtlSound ==
-    \A a \in Answers : \A u \in a.recs : a.at < u.readAt + u.ttl
+    \A a \in Answers : \A u \in a.recs : ~u.fresh => a.at < u.readAt + u.ttl
 
 (* Nothing from a truncated reply is cached. *)
 TcNotCached ==

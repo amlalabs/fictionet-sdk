@@ -488,6 +488,49 @@ fn ds_at_a_hosted_child_is_answered_from_the_parent() {
     assert_eq!(reply.answers[0].record_type(), RecordType::NS);
 }
 
+/// A server for a zone and its grandparent, but not its parent, answers
+/// DS at the zone's apex with NODATA from the zone itself (RFC 4035
+/// §3.1.4.1), not with the grandparent's referral to the parent.
+#[test]
+fn ds_at_a_hosted_zone_whose_parent_is_not_hosted_is_nodata_from_the_zone() {
+    let grandparent = Zone::builder(name("test."), soa("test."), 3600)
+        .rrset(rrset("test.", 3600, vec![ns("ns1.test.")]))
+        .rrset(rrset("ns1.test.", 3600, vec![a("192.0.2.2")]))
+        .delegate(
+            name("sub.test."),
+            rrset("sub.test.", 3600, vec![ns("ns1.sub.test.")]),
+            vec![rrset("ns1.sub.test.", 3600, vec![a("192.0.2.3")])],
+            None,
+        )
+        .build()
+        .unwrap();
+    let child = Zone::builder(name("example.sub.test."), soa("example.sub.test."), 3600)
+        .rrset(rrset(
+            "example.sub.test.",
+            3600,
+            vec![ns("ns1.example.sub.test.")],
+        ))
+        .rrset(rrset("ns1.example.sub.test.", 3600, vec![a("192.0.2.1")]))
+        .build()
+        .unwrap();
+    let mut engine = AuthorityEngine::new(
+        zones(vec![grandparent, child]),
+        ServerConfig::generic(),
+        local(),
+    );
+    let reply = the_answer(&ask_with(
+        &mut engine,
+        &query("example.sub.test.", RecordType::DS, |_| {}),
+        Transport::Udp,
+    ));
+    assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+    assert!(reply.metadata.authoritative);
+    assert!(reply.answers.is_empty());
+    assert_eq!(reply.authorities.len(), 1);
+    assert_eq!(reply.authorities[0].record_type(), RecordType::SOA);
+    assert_eq!(reply.authorities[0].name, name("example.sub.test."));
+}
+
 #[test]
 fn a_referral_carries_the_address_its_zone_holds_for_a_name_server() {
     // RFC 1034 §4.3.2 step 3b: the addresses available go in the
@@ -851,6 +894,30 @@ fn zone_transfers_reach_the_authority_only_when_offered() {
     let mut engine = AuthorityEngine::new(zones(vec![example()]), offering, local());
     let reply = the_answer(&ask_with(&mut engine, &axfr, Transport::Tcp));
     assert_eq!(reply.metadata.response_code, ResponseCode::Refused);
+}
+
+/// A server that does not offer transfers refuses one of a CHAOS zone too
+/// (RFC 5936 §2.2), as BIND does, rather than answering it as a question.
+#[test]
+fn a_chaos_zone_transfer_is_refused_when_transfers_are_not_offered() {
+    let identity = Identity::none().answer(chaos::version_bind(), ChaosAnswer::Zone(None));
+    let server = ServerConfig {
+        identity: Some(identity),
+        ..ServerConfig::generic()
+    };
+    let mut engine = AuthorityEngine::new(zones(vec![example()]), server, local());
+    for qtype in [RecordType::AXFR, RecordType::IXFR] {
+        let message = query("version.bind.", qtype, |m| {
+            m.queries[0].set_query_class(DNSClass::CH);
+        });
+        let reply = the_answer(&ask_with(&mut engine, &message, Transport::Tcp));
+        assert_eq!(
+            reply.metadata.response_code,
+            ResponseCode::Refused,
+            "{qtype}"
+        );
+        assert!(reply.answers.is_empty() && reply.authorities.is_empty());
+    }
 }
 
 #[test]

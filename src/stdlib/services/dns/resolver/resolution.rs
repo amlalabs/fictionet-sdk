@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 
 use fictionet::Entropy;
-use fictionet::stdlib::protocols::dns::dnssec::rdata::DNSSECRData;
+use fictionet::stdlib::protocols::dns::dnssec::rdata::{DNSSECRData, SigInput};
 use fictionet::stdlib::protocols::dns::dnssec::{
     Anchors, Chain, Fetched, Insecure, Link, Validation, Verify, proof, validate_denial,
     validate_rrset,
@@ -34,7 +34,7 @@ use fictionet::stdlib::protocols::dns::op::{
 };
 use fictionet::stdlib::protocols::dns::rr::domain::Label;
 use fictionet::stdlib::protocols::dns::rr::{
-    DNSClass, LowerName, Name, RData, RecordSet, RecordType,
+    DNSClass, LowerName, Name, RData, RecordSet, RecordType, SerialNumber,
 };
 use fictionet::stdlib::protocols::dns::{dname_substitute, label_count};
 use fictionet::stdlib::services::serve::Transport;
@@ -202,6 +202,9 @@ pub(super) struct Found {
     pub(super) outcome: Outcome,
     pub(super) checks: Vec<(Subject, Validation)>,
     pub(super) cached: bool,
+    /// When `outcome` is an alias from a server's reply, what the same
+    /// reply said about each alias target after it, in turn.
+    pub(super) rest: Vec<Outcome>,
 }
 
 impl Found {
@@ -214,6 +217,7 @@ impl Found {
             outcome,
             checks,
             cached: false,
+            rest: Vec::new(),
         }
     }
 }
@@ -604,6 +608,7 @@ impl<V: Verify> Resolver<V> {
                     outcome: Outcome::Failure(*why),
                     checks: Vec::new(),
                     cached: true,
+                    rest: Vec::new(),
                 });
             }
             _ => {}
@@ -694,6 +699,7 @@ impl<V: Verify> Resolver<V> {
             outcome,
             checks,
             cached: true,
+            rest: Vec::new(),
         }
     }
 
@@ -708,6 +714,7 @@ impl<V: Verify> Resolver<V> {
             denial,
             expires,
             validation,
+            ..
         } = entry
         else {
             return None;
@@ -739,6 +746,7 @@ impl<V: Verify> Resolver<V> {
             outcome,
             checks,
             cached: true,
+            rest: Vec::new(),
         })
     }
 
@@ -788,6 +796,7 @@ impl<V: Verify> Resolver<V> {
             outcome,
             checks,
             cached: true,
+            rest: Vec::new(),
         })
     }
 
@@ -992,6 +1001,16 @@ impl<V: Verify> Resolver<V> {
             // holds no other.
             (_, None) => return self.fail(id),
         };
+        // A cut from the cache none of whose servers can be reached without
+        // the cut itself is of no use: each name server lies under it with
+        // no address known. The cut above it gives a fresh referral, with
+        // glue (RFC 1034 §5.3.3, as Unbound's `iter_dp_is_useless`). A cut
+        // this lookup was just referred to is used as it is: the cut above
+        // gave it, and asking there again gives it again.
+        let (zone, targets) = match &lookup.delegation {
+            Some((cut, _)) if *cut == zone => (zone, targets),
+            _ => self.usable_cut(&lookup.learned, zone, targets),
+        };
         let mut servers: Vec<SocketAddr> = Vec::new();
         for target in &targets {
             let lower = LowerName::new(target);
@@ -1055,6 +1074,35 @@ impl<V: Verify> Resolver<V> {
             }
         }
         self.fail(id)
+    }
+
+    /// `zone` and its name server `targets`, or the nearest cut above it
+    /// the cache holds when no target has an address, cached or `learned`,
+    /// and the cache would ask `zone` itself for every target's address.
+    fn usable_cut(
+        &self,
+        learned: &BTreeMap<LowerName, Vec<IpAddr>>,
+        mut zone: LowerName,
+        mut targets: Vec<Name>,
+    ) -> (LowerName, Vec<Name>) {
+        loop {
+            let useless = targets.iter().all(|target| {
+                let lower = LowerName::new(target);
+                !learned.contains_key(&lower)
+                    && self.addresses(target).is_empty()
+                    && self.cut(&lower, false).as_ref() == Some(&zone)
+            });
+            let parent = if useless && !targets.is_empty() {
+                self.cut(&zone, true)
+            } else {
+                None
+            };
+            let Some(parent) = parent else {
+                return (zone, targets);
+            };
+            targets = self.targets(&parent);
+            zone = parent;
+        }
     }
 
     fn hint_servers(&self) -> Vec<SocketAddr> {
@@ -1659,7 +1707,7 @@ impl<V: Verify> Resolver<V> {
             if !authoritative {
                 return self.give_up(exchange, true, entropy);
             }
-            let Some(outcome) =
+            let Some((outcome, rest)) =
                 self.store_chain(&answers, &sname, stype, rank, &denial, rcode, &soa, &zone)
             else {
                 return self.give_up(exchange, true, entropy);
@@ -1670,7 +1718,13 @@ impl<V: Verify> Resolver<V> {
             if exchange.minimised {
                 return self.through(id, &sname, entropy);
             }
-            return self.finish(id, Found::fresh(outcome));
+            return self.finish(
+                id,
+                Found {
+                    rest,
+                    ..Found::fresh(outcome)
+                },
+            );
         }
 
         if rcode == ResponseCode::NXDomain {
@@ -1686,7 +1740,7 @@ impl<V: Verify> Resolver<V> {
                 }
                 return self.plan(id, entropy);
             }
-            return self.negative(id, &key, Negative::NxDomain, soa, denial, zone);
+            return self.negative(id, &key, Negative::NxDomain, rank, soa, denial, zone);
         }
 
         let referral = authority
@@ -1744,7 +1798,7 @@ impl<V: Verify> Resolver<V> {
         if exchange.minimised {
             return self.through(id, &sname, entropy);
         }
-        self.negative(id, &key, Negative::NoData, soa, denial, zone)
+        self.negative(id, &key, Negative::NoData, rank, soa, denial, zone)
     }
 
     /// Notes that `name`, a minimised question's name, is no zone cut, and
@@ -1757,29 +1811,27 @@ impl<V: Verify> Resolver<V> {
         self.plan(id, entropy);
     }
 
-    /// Ends lookup `id` with a negative answer, offered to the cache
-    /// unless the lookup relays a client's CD bit.
+    /// Ends lookup `id` with a negative answer, offered to the cache at
+    /// `rank`, or to nothing when `rank` is `None`.
+    #[allow(clippy::too_many_arguments)]
     fn negative(
         &mut self,
         id: LookupId,
         key: &Key,
         kind: Negative,
+        rank: Option<Rank>,
         soa: Option<RecordSet>,
         denial: Vec<RecordSet>,
         zone: Name,
     ) {
-        if self
-            .graph
-            .lookups
-            .get(&id)
-            .is_some_and(|lookup| !lookup.relay_cd)
-        {
+        if let Some(rank) = rank {
             self.cache.insert(
                 self.now,
                 Offer::Negative {
                     key: key.clone(),
                     kind,
                     soa: soa.clone(),
+                    rank,
                     denial: denial.clone(),
                     validation: Validation::NotPerformed,
                     truncated: false,
@@ -1809,7 +1861,9 @@ impl<V: Verify> Resolver<V> {
     /// to inside the zone. When the chain ends in the zone without data,
     /// the reply's RCODE and SOA are the last name's (RFC 6604 §2), and
     /// that negative is offered too. Returns what the answer says about
-    /// `sname` itself, or `None` when it holds nothing for it.
+    /// `sname` itself, or `None` when it holds nothing for it, and then
+    /// what it says about each alias target in turn, which serves this
+    /// resolution whether or not the cache keeps it (RFC 1035 §7.4).
     #[allow(clippy::too_many_arguments)]
     fn store_chain(
         &mut self,
@@ -1821,13 +1875,13 @@ impl<V: Verify> Resolver<V> {
         rcode: ResponseCode,
         soa: &Option<RecordSet>,
         zone: &Name,
-    ) -> Option<Outcome> {
-        let mut first = None;
+    ) -> Option<(Outcome, Vec<Outcome>)> {
+        let mut chain = Vec::new();
         let mut at = sname.clone();
         let mut seen = Vec::new();
         loop {
             if seen.contains(&at) {
-                break;
+                return split(chain);
             }
             seen.push(at.clone());
             // A CNAME synthesized from a DNAME has no RRSIG of its own;
@@ -1855,11 +1909,12 @@ impl<V: Verify> Resolver<V> {
                 for set in &here {
                     self.offer(set, rank, proof.clone());
                 }
-                return Some(first.unwrap_or(Outcome::Data {
+                chain.push(Outcome::Data {
                     sets: here,
                     proof,
                     zone: zone.clone(),
-                }));
+                });
+                return split(chain);
             }
             let Some(cname) = answers
                 .iter()
@@ -1872,36 +1927,50 @@ impl<V: Verify> Resolver<V> {
                 self.offer(set, rank, Vec::new());
             }
             self.offer(cname, rank, proof.clone());
-            first.get_or_insert(Outcome::Alias {
+            chain.push(Outcome::Alias {
                 cname: cname.clone(),
                 target: target.clone(),
                 proof,
                 zone: zone.clone(),
             });
             if !zone.zone_of(&target) {
-                return first;
+                return split(chain);
             }
             at = target;
         }
         // The chain ended inside the zone without data for the type.
-        if first.is_some() && soa.is_some() && rank.is_some() {
+        if let (false, Some(soa)) = (chain.is_empty(), soa) {
             let kind = match rcode {
                 ResponseCode::NXDomain => Negative::NxDomain,
                 _ => Negative::NoData,
             };
-            self.cache.insert(
-                self.now,
-                Offer::Negative {
-                    key: Key::new(LowerName::new(&at), stype, DNSClass::IN),
-                    kind,
-                    soa: soa.clone(),
-                    denial: denial.to_vec(),
-                    validation: Validation::NotPerformed,
-                    truncated: false,
-                },
-            );
+            if let Some(rank) = rank {
+                self.cache.insert(
+                    self.now,
+                    Offer::Negative {
+                        key: Key::new(LowerName::new(&at), stype, DNSClass::IN),
+                        kind,
+                        soa: Some(soa.clone()),
+                        rank,
+                        denial: denial.to_vec(),
+                        validation: Validation::NotPerformed,
+                        truncated: false,
+                    },
+                );
+            }
+            // The client sees the SOA at the negative TTL, as from the
+            // cache.
+            let ttl = self.cache.negative_ttl(soa, denial).as_secs();
+            chain.push(Outcome::Negative {
+                kind,
+                name: at,
+                qtype: stype,
+                soa: Some(with_ttl(soa, u32::try_from(ttl).unwrap_or(u32::MAX))),
+                denial: denial.to_vec(),
+                zone: soa.name().to_lowercase(),
+            });
         }
-        first
+        split(chain)
     }
 
     /// Offers `set` to the cache at `rank`, or nothing when `rank` is
@@ -2436,7 +2505,7 @@ impl<V: Verify> Resolver<V> {
             .iter()
             .filter_map(|set| self.signatures_expire(set))
             .min();
-        let original_ttl = sets.iter().filter_map(original_ttl).min();
+        let original_ttl = sets.iter().filter_map(|set| self.original_ttl(set)).min();
         self.cache
             .validated(key, checked, validation, expires, original_ttl, now);
         if let (Validation::Secure, Material::Denial { authority, .. }) = (validation, material)
@@ -2463,38 +2532,78 @@ impl<V: Verify> Resolver<V> {
     /// the first of its RRSIGs to expire, or its smallest Original TTL
     /// past `at`, whichever comes first (RFC 4035 §5.3.3).
     pub(super) fn secure_until(&self, set: &RecordSet, at: Instant) -> Option<Instant> {
-        let original =
-            original_ttl(set).map(|ttl| at + std::time::Duration::from_secs(u64::from(ttl)));
+        let original = self
+            .original_ttl(set)
+            .map(|ttl| at + std::time::Duration::from_secs(u64::from(ttl)));
         [self.signatures_expire(set), original]
             .into_iter()
             .flatten()
             .min()
     }
 
-    /// The first time one of `set`'s RRSIGs expires, on the run's clock.
-    fn signatures_expire(&self, set: &RecordSet) -> Option<Instant> {
-        let date = self.clock.at(self.now);
-        let today = date.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+    /// The RRSIGs of `set` the validator reads: of its type, by an
+    /// algorithm the policy validates, and with whether each is inside
+    /// its validity window on the run's clock (RFC 4034 §3.1.5). Only the
+    /// current ones bound how long a Secure RRset lasts (RFC 4035
+    /// §5.3.3): an RRSIG that has expired, or that the validator skips,
+    /// proved nothing.
+    fn rrsigs_now<'s>(&self, set: &'s RecordSet) -> impl Iterator<Item = (&'s SigInput, bool)> {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+        let now = self.serial_now();
+        let policy = &self.config.policy;
         set.rrsigs()
             .iter()
             .filter_map(|record| match &record.data {
-                RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) => {
-                    Some(u64::from(rrsig.input().sig_expiration.get()))
-                }
+                RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) => Some(rrsig.input()),
                 _ => None,
             })
-            .map(|expiration| {
-                // Serial arithmetic (RFC 1982): the expiration is within
-                // 2^31 seconds of today.
-                let today32 = today as u32;
-                let ahead = (expiration as u32).wrapping_sub(today32);
-                if ahead < 0x8000_0000 {
-                    self.now + std::time::Duration::from_secs(u64::from(ahead) + 1)
-                } else {
-                    self.now
-                }
+            .filter(move |input| {
+                input.type_covered == set.record_type()
+                    && policy.validates(u8::from(input.algorithm))
             })
+            .map(move |input| {
+                let current =
+                    matches!(now.partial_cmp(&input.sig_inception), Some(Greater | Equal))
+                        && matches!(now.partial_cmp(&input.sig_expiration), Some(Less | Equal));
+                (input, current)
+            })
+    }
+
+    /// The first time one of `set`'s current RRSIGs expires, on the run's
+    /// clock, or now when it has RRSIGs and none is current.
+    fn signatures_expire(&self, set: &RecordSet) -> Option<Instant> {
+        let now = self.serial_now();
+        let mut signed = false;
+        let first = self
+            .rrsigs_now(set)
+            .filter_map(|(input, current)| {
+                signed = true;
+                // A current RRSIG expires within 2^31 seconds (RFC 1982),
+                // and is valid through its last second.
+                let ahead = input.sig_expiration.get().wrapping_sub(now.get());
+                current.then(|| self.now + std::time::Duration::from_secs(u64::from(ahead) + 1))
+            })
+            .min();
+        first.or(signed.then_some(self.now))
+    }
+
+    /// The smallest Original TTL among `set`'s current RRSIGs (RFC 4034
+    /// §3.1.4).
+    fn original_ttl(&self, set: &RecordSet) -> Option<u32> {
+        self.rrsigs_now(set)
+            .filter(|(_, current)| *current)
+            .map(|(input, _)| input.original_ttl)
             .min()
+    }
+
+    /// The run's clock as an RRSIG time field: seconds since 1970 modulo
+    /// 2^32 (RFC 4034 §3.1.5).
+    fn serial_now(&self) -> SerialNumber {
+        let date = self.clock.at(self.now);
+        let seconds = date
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs());
+        SerialNumber::new(seconds as u32)
     }
 
     /// Drops `node` from everything it waits on, and cancels what then
@@ -2661,20 +2770,18 @@ fn cname_target(set: &RecordSet) -> Option<Name> {
         })
 }
 
-/// The smallest Original TTL among `set`'s RRSIGs (RFC 4034 §3.1.4).
-fn original_ttl(set: &RecordSet) -> Option<u32> {
-    set.rrsigs()
-        .iter()
-        .filter_map(|record| match &record.data {
-            RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) => Some(rrsig.input().original_ttl),
-            _ => None,
-        })
-        .min()
-}
-
 /// The time from `sent` to `now`.
 fn rtt(sent: Instant, now: Instant) -> std::time::Duration {
     now.since_start().saturating_sub(sent.since_start())
+}
+
+/// The first outcome of `chain` and the rest, or `None` when it is empty.
+fn split(mut chain: Vec<Outcome>) -> Option<(Outcome, Vec<Outcome>)> {
+    if chain.is_empty() {
+        return None;
+    }
+    let first = chain.remove(0);
+    Some((first, chain))
 }
 
 /// `set` with its TTL, and every record's and RRSIG's, set to `ttl`.

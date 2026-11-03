@@ -11,8 +11,10 @@ use super::op::{
     DEFAULT_MAX_PAYLOAD_LEN, Edns, Header, Message, MessageType, Metadata, OpCode, Query,
     ResponseCode,
 };
-use super::rr::RecordType;
+use super::rr::rdata::TSIG;
 use super::rr::rdata::opt::EdnsCode;
+use super::rr::rdata::tsig::TsigError;
+use super::rr::{DNSClass, RData, Record, RecordType};
 use super::serialize::binary::{BinDecodable, BinDecoder, DecodeError};
 use fictionet::stdlib::services::serve::Transport;
 
@@ -77,16 +79,20 @@ impl Request {
     ///    the fault is in the query's OPT record (RFC 6891 §7). A record
     ///    of a type whose RDATA hickory reads by stricter rules, or with
     ///    empty RDATA, is carried as octets (RFC 3597 §4), so only a
-    ///    message whose records do not read even as octets fails here.
+    ///    message whose records do not read even as octets fails here, and
+    ///    so does a TSIG record that is not the last record of the message,
+    ///    or is one of several (RFC 8945 §5.2).
     /// 3. More than one OPT record: FORMERR with an OPT (RFC 6891 §6.1.1).
     /// 4. An EDNS version above 0: BADVERS with an OPT of version 0
     ///    (RFC 6891 §6.1.3).
-    /// 5. An opcode other than QUERY: NOTIMP.
-    /// 6. A question count other than 1: FORMERR (RFC 9619).
-    /// 7. QTYPE OPT, which only appears as a record: FORMERR (RFC 6891 §6.1.1).
-    /// 8. AXFR or IXFR over UDP, which they are not defined for: FORMERR
+    /// 5. A TSIG record: NOTAUTH with a TSIG record of error BADKEY, since
+    ///    a server here holds no keys (RFC 8945 §5.2.1).
+    /// 6. An opcode other than QUERY: NOTIMP.
+    /// 7. A question count other than 1: FORMERR (RFC 9619).
+    /// 8. QTYPE OPT, which only appears as a record: FORMERR (RFC 6891 §6.1.1).
+    /// 9. AXFR or IXFR over UDP, which they are not defined for: FORMERR
     ///    (RFC 5936 §4.2, RFC 1995 §2).
-    /// 9. QTYPE MAILA or MAILB: NOTIMP (RFC 1035 §3.2.3).
+    /// 10. QTYPE MAILA or MAILB: NOTIMP (RFC 1035 §3.2.3).
     ///
     /// A rejection copies the query's ID, opcode, RD, and CD. It echoes
     /// the question when the query is a QUERY with one question, and it
@@ -103,14 +109,18 @@ impl Request {
         };
         let metadata = message.metadata;
         let one_question = metadata.op_code == OpCode::Query && message.queries.len() == 1;
-        let reject = |code| {
+        let reply = |code| {
             let edns = message.edns.as_ref().map(|edns| edns.flags().dnssec_ok);
             let question = one_question.then(|| message.queries[0].clone());
-            Parsed::Reject(rejection(&metadata, code, question, edns))
+            rejection(&metadata, code, question, edns)
         };
+        let reject = |code| Parsed::Reject(reply(code));
 
         if message.edns.as_ref().is_some_and(|edns| edns.version() > 0) {
             return reject(ResponseCode::BADVERS);
+        }
+        if let Some(tsig) = message.signature() {
+            return Parsed::Reject(bad_key(reply(ResponseCode::NotAuth), tsig));
         }
         if metadata.op_code != OpCode::Query {
             return reject(ResponseCode::NotImp);
@@ -209,9 +219,10 @@ struct Fault {
 /// A query hickory does not read, read as RFC 3597 §4 asks: each record's
 /// RDATA as octets, except the names inside the RDATA of the RFC 1035
 /// types that may hold compressed names, which must read inside it. The
-/// message has the query's header, its questions, and the OPT record of
-/// its additional section, and none of its other records, which a server
-/// does not use.
+/// message has the query's header, its questions, the OPT record of its
+/// additional section, and its TSIG record, and none of its other records,
+/// which a server does not use. A TSIG record that is not the last record
+/// of the message, or does not read, is a fault (RFC 8945 §5.2).
 fn opaque(bytes: &[u8]) -> Result<Message, Fault> {
     let mut decoder = BinDecoder::new(bytes);
     let header = Header::read(&mut decoder).map_err(|_| Fault { in_opt: false })?;
@@ -221,7 +232,7 @@ fn opaque(bytes: &[u8]) -> Result<Message, Fault> {
     let questions = decoder.index();
     let outside = u32::from(header.counts.answers) + u32::from(header.counts.authorities);
     let records = outside + u32::from(header.counts.additionals);
-    let (mut at, mut opts) = (questions, Vec::new());
+    let (mut at, mut opts, mut tsig) = (questions, Vec::new(), None);
     for index in 0..records {
         let (rtype, end) = record(bytes, at).map_err(|rtype| Fault {
             in_opt: rtype == Some(OPT),
@@ -232,6 +243,12 @@ fn opaque(bytes: &[u8]) -> Result<Message, Fault> {
             }
             opts.push(at..end);
         }
+        if rtype == u16::from(RecordType::TSIG) {
+            if index + 1 != records {
+                return Err(Fault { in_opt: false });
+            }
+            tsig = Some(at);
+        }
         at = end;
     }
     let mut reduced = bytes[..questions].to_vec();
@@ -241,7 +258,45 @@ fn opaque(bytes: &[u8]) -> Result<Message, Fault> {
     for opt in opts {
         reduced.extend_from_slice(&bytes[opt]);
     }
-    Message::from_vec(&reduced).map_err(|_| Fault { in_opt: true })
+    let mut message = Message::from_vec(&reduced).map_err(|_| Fault { in_opt: true })?;
+    if let Some(start) = tsig {
+        // Read where it lies, so a name compressed against an earlier
+        // record still reads.
+        let fault = |_| Fault { in_opt: false };
+        let mut decoder = BinDecoder::new(bytes);
+        decoder.read_slice(start).map_err(fault)?;
+        let signature = Record::read(&mut decoder)
+            .map_err(fault)?
+            .map(|data| match data {
+                RData::TSIG(tsig) => Some(tsig),
+                _ => None,
+            })
+            .ok_or(Fault { in_opt: false })?;
+        message.signature = Some(Box::new(signature));
+    }
+    Ok(message)
+}
+
+/// The NOTAUTH reply to a query signed with `tsig`, from a server that
+/// holds no TSIG keys: the key is unknown to it, so the reply carries a
+/// TSIG record with error BADKEY and no MAC, and is itself unsigned
+/// (RFC 8945 §5.2.1, §5.3.2). The record names the query's key and
+/// algorithm and keeps its time signed, fudge, and original ID.
+fn bad_key(mut reply: Message, tsig: &Record<TSIG>) -> Message {
+    let query = &tsig.data;
+    let data = TSIG::new(
+        query.algorithm.clone(),
+        query.time,
+        query.fudge,
+        Vec::new(),
+        query.oid,
+        Some(TsigError::BadKey),
+        Vec::new(),
+    );
+    let mut record = Record::from_rdata(tsig.name.clone(), 0, data);
+    record.dns_class = DNSClass::ANY;
+    reply.signature = Some(Box::new(record));
+    reply
 }
 
 /// The record type OPT (RFC 6891 §6.1.1).

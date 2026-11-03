@@ -936,9 +936,10 @@ def offerJson : Offer → String
     jobj [("kind", jstr "positive"), ("set", setsJson [s]), ("rank", jstr (rankStr r)),
       ("validation", validationJson v), ("sig_expires", optNat sig), ("original_ttl", optNat orig),
       ("truncated", jbool tc)]
-  | .negative k kind soa nsec v sig orig tc =>
+  | .negative k kind soa r nsec v sig orig tc =>
     jobj [("kind", jstr "negative"), ("key", keyJson k), ("negative", jstr (negativeStr kind)),
-      ("soa", (soa.map fun s => setsJson [s]).getD "null"), ("denial_ttl", optNat nsec),
+      ("soa", (soa.map fun s => setsJson [s]).getD "null"), ("rank", jstr (rankStr r)),
+      ("denial_ttl", optNat nsec),
       ("validation", validationJson v), ("sig_expires", optNat sig), ("original_ttl", optNat orig),
       ("truncated", jbool tc)]
   | .failure k why => jobj [("kind", jstr "failure"), ("key", keyJson k), ("why", failureJson why)]
@@ -984,7 +985,9 @@ def rOffer : G Offer := do
     let kind ← pick #[.nxDomain, .noData]
     let soa? := if ← chance 6 then none else some soa
     let denialTtl ← rOption (pick #[10, 100, 7200])
-    return .negative k kind soa? denialTtl v sig orig (← chance 8)
+    -- An authoritative server's negative, or a forwarder's.
+    let rank ← pick #[.authAnswer, .nonAuthAnswer]
+    return .negative k kind soa? rank denialTtl v sig orig (← chance 8)
   | _ => return .failure k (← pick #[.noReachableAuthority, .workExceeded, .unknown])
 
 def cacheCase : G String := do

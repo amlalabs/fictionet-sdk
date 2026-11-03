@@ -113,6 +113,9 @@ pub enum Entry {
         kind: Negative,
         /// The zone's SOA RRset, at the negative TTL.
         soa: RecordSet,
+        /// Where it came from: an authoritative server's answer, or a
+        /// forwarder's.
+        rank: Rank,
         /// The NSEC or NSEC3 records that prove it, with their RRSIGs.
         denial: Vec<RecordSet>,
         /// When it stops being served.
@@ -139,13 +142,12 @@ impl Entry {
         }
     }
 
-    /// The rank the entry holds its key at. A negative answer is an
-    /// authoritative answer. A failure is no data and ranks lowest, so
+    /// The rank the entry holds its key at. A negative answer ranks as
+    /// the answer it came in. A failure is no data and ranks lowest, so
     /// any data replaces it.
     pub fn rank(&self) -> Rank {
         match self {
-            Entry::Positive { rank, .. } => *rank,
-            Entry::Negative { .. } => Rank::AuthAnswer,
+            Entry::Positive { rank, .. } | Entry::Negative { rank, .. } => *rank,
             Entry::Failure { .. } => Rank::Glue,
         }
     }
@@ -177,6 +179,8 @@ pub enum Offer {
         kind: Negative,
         /// The zone's SOA RRset from the authority section, if it had one.
         soa: Option<RecordSet>,
+        /// Where it came from, as in [`Entry::Negative`].
+        rank: Rank,
         /// The NSEC or NSEC3 records from the authority section.
         denial: Vec<RecordSet>,
         /// What validation established about it.
@@ -854,6 +858,7 @@ impl Cache {
                 key,
                 kind,
                 soa,
+                rank,
                 denial,
                 validation,
                 truncated,
@@ -873,6 +878,7 @@ impl Cache {
                 let entry = Entry::Negative {
                     kind,
                     soa,
+                    rank,
                     denial,
                     expires: now + ttl,
                     validation,

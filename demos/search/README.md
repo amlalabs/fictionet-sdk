@@ -85,10 +85,11 @@ servers, and Google, Cloudflare, Quad9, and OpenDNS answer at their real
 addresses. Every name server a reply names gets a relay at its address. So
 `dig`, `dig +trace`, `dig @8.8.8.8`, and `delv` see real addresses and real
 signatures, and each site's machine stands at the address the real DNS gives
-it. Only questions the world's policy allows reach real servers. It allows
-the names the session serves, the names above them that a resolver asks on the
-way, underscore names under them, reverse names, and names the real servers
-named in their replies.
+it. Only questions the world's policy allows reach real servers. In Live,
+Live-Depth, and Edited it allows any name. In Copied it allows the names the
+session serves, the names above them that a resolver asks on the way,
+underscore names under them, reverse names, and names the real servers named
+in their replies.
 
 [app/src/page/](app/src/page/) projects those facts into the map, site details,
 model calls and recent activity. Selecting a site or gateway keeps the map

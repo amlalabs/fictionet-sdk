@@ -2733,6 +2733,7 @@ fn offer(cache: &mut Cache, offer: &Value, now: Instant, limits: Limits) {
                 "nxdomain" => Negative::NxDomain,
                 _ => Negative::NoData,
             };
+            let rank = rank(text(offer, "rank"));
             // An NXDOMAIN is kept under type ANY, and its result holds for
             // its copy under the type asked too.
             let stored_key = match kind {
@@ -2752,6 +2753,7 @@ fn offer(cache: &mut Cache, offer: &Value, now: Instant, limits: Limits) {
                     key,
                     kind,
                     soa,
+                    rank,
                     denial,
                     validation,
                     truncated,
@@ -2760,7 +2762,7 @@ fn offer(cache: &mut Cache, offer: &Value, now: Instant, limits: Limits) {
             let stored = !truncated
                 && matches!(
                     cache.get(&stored_key, now),
-                    Some(Entry::Negative { expires, .. }) if Some(*expires) == fresh
+                    Some(Entry::Negative { expires, rank: r, .. }) if Some(*expires) == fresh && *r == rank
                 );
             if stored {
                 cache.validated(

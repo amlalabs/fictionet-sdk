@@ -90,12 +90,6 @@ pub(super) const HOST_TTL: u32 = 3600;
 /// no host may get one later, so a negative answer is kept only briefly.
 const PLACING_NEGATIVE_TTL: u32 = 60;
 
-/// The SOA and NS RRsets of a zone a resolver serves itself at `apex`, as
-/// Unbound gives them to its own local zones ([`special::local_apex`]).
-pub(super) fn local_zone(apex: &Name) -> (RecordSet, RecordSet) {
-    special::local_apex(apex, special::LOCAL_TTL)
-}
-
 /// A root zone whose names are the network's hosts, where a host is placed
 /// with [`NetHandle::add_host`] the first time its name is asked, as a
 /// resolver's local zone.
@@ -170,7 +164,7 @@ where
             && !qname.is_wildcard()
             && !shared.world.lock().declared.contains_key(&qname);
         if asks {
-            let text = normalize(&qname.to_string());
+            let text = normalize(&qname.to_ascii());
             if let Some(mut host) = (self.host_for)(&text) {
                 if !host.names.contains(&text) {
                     host.names.insert(0, text);

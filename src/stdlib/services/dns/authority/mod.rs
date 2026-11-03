@@ -125,7 +125,9 @@ impl<A: Authority + ?Sized> Authority for Arc<A> {
 ///
 /// The deepest zone whose apex is at or above QNAME answers, except that
 /// a DS question at a zone's apex goes to the zone above it when that zone
-/// is hosted too, since the parent holds DS (RFC 4035 §3.1.4.1). A view
+/// is hosted too and holds the cut, since the parent holds DS (RFC 4035
+/// §3.1.4.1). When that zone refers the question to a zone between them,
+/// the zone at the apex answers NODATA. A view
 /// that does not know a fact the reply needs gives SERVFAIL, never a
 /// negative. A QNAME no hosted zone contains gets REFUSED, with Extended
 /// DNS Error 20, Not Authoritative, when the front sends them (RFC 8914
@@ -143,22 +145,32 @@ impl Zones {
         Zones { zones }
     }
 
-    /// The zone that answers a question for `qname` of type `qtype`.
-    fn find(&self, qname: &LowerName, qtype: RecordType) -> Option<&dyn ZoneData> {
+    /// The deepest hosted zone that contains `qname`, or with
+    /// `strictly_above`, the deepest whose apex is not `qname`.
+    fn deepest(&self, qname: &LowerName, strictly_above: bool) -> Option<&dyn ZoneData> {
         // `max_by_key` keeps the last of equal keys: the zone given last.
-        let deepest = |strictly_above: bool| {
-            self.zones
-                .iter()
-                .filter(|zone| zone.apex().zone_of(qname))
-                .filter(|zone| !strictly_above || zone.apex() != qname)
-                .max_by_key(|zone| label_count(zone.apex()))
-        };
-        let zone = match qtype {
-            RecordType::DS => deepest(true).or_else(|| deepest(false)),
-            _ => deepest(false),
-        };
-        zone.map(|zone| &**zone)
+        self.zones
+            .iter()
+            .filter(|zone| zone.apex().zone_of(qname))
+            .filter(|zone| !strictly_above || zone.apex() != qname)
+            .max_by_key(|zone| label_count(zone.apex()))
+            .map(|zone| &**zone)
     }
+}
+
+/// `zone`'s answer to `req`, from the server front `server`.
+fn answer_from(zone: &dyn ZoneData, req: &Request, server: &ServerConfig) -> Response {
+    match answer(&*zone.view(&req.question), req, server.any) {
+        Answered::Response(response) => response,
+        Answered::Unknown { .. } => bare_reply(req, ResponseCode::ServFail, None),
+    }
+}
+
+/// Whether `response` is a referral: NOERROR with AA clear, which a zone
+/// gives only at a zone cut.
+fn is_referral(response: &Response) -> bool {
+    let metadata = &response.message.metadata;
+    !metadata.authoritative && metadata.response_code == ResponseCode::NoError
 }
 
 impl Authority for Zones {
@@ -187,13 +199,22 @@ impl Authority for Zones {
                 return Step::Reply(bare_reply(req, ResponseCode::Refused, ede));
             }
         }
-        let Some(zone) = self.find(&qname, qtype) else {
+        let Some(zone) = self.deepest(&qname, false) else {
             let ede = server.ede.then_some(EdeCode::NOT_AUTHORITATIVE);
             return Step::Reply(bare_reply(req, ResponseCode::Refused, ede));
         };
-        match answer(&*zone.view(&req.question), req, server.any) {
-            Answered::Response(response) => Step::Reply(response),
-            Answered::Unknown { .. } => Step::Reply(bare_reply(req, ResponseCode::ServFail, None)),
+        if qtype == RecordType::DS
+            && zone.apex() == &qname
+            && let Some(above) = self.deepest(&qname, true)
+        {
+            // A zone above that refers the question on is not the parent,
+            // so the zone itself answers NODATA from its apex (RFC 4035
+            // §3.1.4.1), as BIND does.
+            let response = answer_from(above, req, server);
+            if !is_referral(&response) {
+                return Step::Reply(response);
+            }
         }
+        Step::Reply(answer_from(zone, req, server))
     }
 }

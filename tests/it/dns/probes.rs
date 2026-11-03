@@ -20,7 +20,9 @@ use fictionet::stdlib::protocols::dns::Nsid;
 use fictionet::stdlib::protocols::dns::op::{
     Edns, Message, MessageType, OpCode, Query, ResponseCode,
 };
+use fictionet::stdlib::protocols::dns::rr::rdata::TSIG;
 use fictionet::stdlib::protocols::dns::rr::rdata::opt::EdnsOption;
+use fictionet::stdlib::protocols::dns::rr::rdata::tsig::{TsigAlgorithm, TsigError};
 use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, Name, RData, Record, RecordType};
 use fictionet::stdlib::services::dns::Event;
 use fictionet::stdlib::services::dns::authority::{ChaosAnswer, Identity, chaos};
@@ -1005,6 +1007,67 @@ fn p_rd0() {
         )
         .await;
         assert_eq!(reply.metadata.response_code, ResponseCode::Refused);
+        Ok(())
+    });
+}
+
+/// P-TSIG: a query signed with a key the server does not hold, at a root
+/// letter and at the gateway, gets NOTAUTH with an unsigned TSIG record of
+/// error BADKEY that names the key (RFC 8945 §5.2.1, §5.3.2), as BIND
+/// answers it. A TSIG record that is not the last record gets FORMERR
+/// (§5.2).
+#[test]
+fn p_tsig() {
+    probe(|fcx, p| async move {
+        let key = Name::from_ascii("nokey.").unwrap();
+        let tsig = || {
+            let data = TSIG::new(
+                TsigAlgorithm::HmacSha256,
+                1_700_000_000,
+                300,
+                vec![0x2a; 32],
+                7,
+                None,
+                Vec::new(),
+            );
+            let mut record = Record::from_rdata(key.clone(), 0, data);
+            record.dns_class = DNSClass::ANY;
+            record
+        };
+        for server in [A_ROOT, GATEWAY] {
+            let mut signed = dig(7, "example.com.", RecordType::NS);
+            signed.set_signature(Box::new(tsig()));
+            let reply = send(&fcx, &p.m, server, &signed).await;
+            assert_eq!(
+                reply.metadata.response_code,
+                ResponseCode::NotAuth,
+                "{server}"
+            );
+            assert!(reply.answers.is_empty(), "{server}");
+            let answer = reply.signature().expect("a TSIG record");
+            assert_eq!(answer.name, key);
+            assert_eq!(answer.dns_class, DNSClass::ANY);
+            assert_eq!(answer.data.algorithm, TsigAlgorithm::HmacSha256);
+            assert_eq!(answer.data.error, Some(TsigError::BadKey));
+            assert!(answer.data.mac.is_empty(), "{server}: unsigned");
+            assert_eq!(answer.data.oid, 7);
+
+            let mut misplaced = dig(8, "example.com.", RecordType::NS);
+            let record = tsig().map(|data| Some(RData::TSIG(data))).unwrap();
+            misplaced.add_additional(record);
+            misplaced.add_additional(Record::from_rdata(
+                Name::from_ascii("x.").unwrap(),
+                0,
+                RData::A(Ipv4Addr::LOCALHOST.into()),
+            ));
+            let reply = send(&fcx, &p.m, server, &misplaced).await;
+            assert_eq!(
+                reply.metadata.response_code,
+                ResponseCode::FormErr,
+                "{server}"
+            );
+            assert!(reply.signature().is_none());
+        }
         Ok(())
     });
 }

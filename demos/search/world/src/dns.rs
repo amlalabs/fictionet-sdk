@@ -95,8 +95,8 @@ fn host_label(label: &str) -> bool {
 }
 
 /// `name` as a host name: lowercase, without the trailing dot.
-fn host(name: &LowerName) -> String {
-    name.to_string().trim_end_matches('.').to_owned()
+pub(crate) fn host(name: &LowerName) -> String {
+    name.to_ascii().trim_end_matches('.').to_owned()
 }
 
 /// The question name of `ask`, or `None` for bytes that are no question.
@@ -141,9 +141,10 @@ fn targets(message: &Message) -> impl Iterator<Item = (LowerName, Option<LowerNa
 // ---------------------------------------------------------------------------
 // The outbound policy
 
-/// The world's policy for questions to the real servers: Live's boundary
-/// (`admit` and [`Pages::serves_host`]) and the names a resolver must ask
-/// on the way to a name inside it.
+/// The world's policy for questions to the real servers: in the live
+/// modes any name; in Copied the captured hosts (`admit` and
+/// [`Pages::serves_host`]) and the names a resolver must ask on the way to
+/// them.
 ///
 /// [`policy`](Self::policy) sees every question a relay would put to a
 /// real server: the gateway's, the public resolvers', and a guest's own to
@@ -266,15 +267,16 @@ impl Outbound {
     /// Whether a question for `name` may reach a real server.
     fn allows(&self, name: &LowerName) -> bool {
         self.admits(name)
-            || self.above_admitted(name)
+            || self.on_the_way(name)
             || self.underscored(name)
             || reverse(name)
             || self.named(|named| named.below.contains(name))
     }
 
-    /// Rule 2: whether `name` is the root or a single label, any name in
-    /// the live modes, or above a captured host in Copied.
-    fn above_admitted(&self, name: &LowerName) -> bool {
+    /// Rule 2: whether a resolver may ask `name` on its way down the
+    /// hierarchy: the root or a single label, any name in the live modes,
+    /// or a name above a captured host in Copied.
+    fn on_the_way(&self, name: &LowerName) -> bool {
         if label_count(name) <= 1 {
             return true;
         }

@@ -156,6 +156,32 @@ fn one_lookup_places_one_site() {
     });
 }
 
+/// An internationalized name reaches the callback as its A-labels, the
+/// form on the wire, and its site is placed once and answered.
+#[test]
+fn an_internationalized_name_is_asked_about_in_ascii() {
+    run_world::world(Duration::from_secs(60), |fcx| async move {
+        let asked: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let record = asked.clone();
+        let net = web::Sites::new(move |host| {
+            record.lock().unwrap().push(host.to_owned());
+            host.ends_with(".test")
+                .then(|| web::Site::new(Plain("idn")))
+        })
+        .into_net();
+        let handle = net.handle();
+        let (attacher, attachments) = fictionet::attachments();
+        net.start(&fcx, attachments)?;
+        let m = default_machine(&fcx, &attacher);
+        let first = Ipv4Addr::new(104, 18, 0, 1);
+        assert_eq!(lookup(&fcx, &m, "xn--bcher-kva.test").await, first);
+        assert_eq!(lookup(&fcx, &m, "xn--bcher-kva.test").await, first);
+        assert_eq!(*asked.lock().unwrap(), ["xn--bcher-kva.test"]);
+        assert!(!handle.has_machine(Ipv4Addr::new(104, 18, 0, 2).into()));
+        Ok(())
+    });
+}
+
 /// A name the callback turned down, with a site below it, is asked about
 /// again on each lookup, so it can come into being as the world runs.
 #[test]

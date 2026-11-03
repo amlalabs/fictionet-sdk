@@ -215,12 +215,15 @@ fn place<'v>(view: &'v dyn View, name: &LowerName) -> Fact<Place<'v>> {
 }
 
 /// Whether `node` has no RRset of `rtype` that a denial could deny. At a
-/// zone cut only DS can be denied, from the parent's side (RFC 6840 §4.1).
+/// zone cut only the parent's side can be denied: DS (RFC 6840 §4.1), and
+/// NSEC, which no node holds (RFC 4035 §2.6).
 fn lacks(node: &Node, rtype: RecordType) -> bool {
     match node {
         Node::Data(sets) => !sets.contains_key(&rtype),
         Node::Dname(_, sets) => rtype != RecordType::DNAME && !sets.contains_key(&rtype),
-        Node::Cut { ds, .. } => rtype == RecordType::DS && ds.is_none(),
+        Node::Cut { ds, .. } => {
+            rtype == RecordType::NSEC || (rtype == RecordType::DS && ds.is_none())
+        }
         Node::Empty => true,
     }
 }

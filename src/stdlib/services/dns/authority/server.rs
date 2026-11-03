@@ -220,7 +220,7 @@ impl ServerConfig {
             required_additional: 0,
         };
         fit(&response, limit)
-            .expect("a rejection holds only a question and an OPT record")
+            .expect("a rejection holds only a question, an OPT record, and a TSIG record")
             .bytes
     }
 

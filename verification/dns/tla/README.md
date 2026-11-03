@@ -18,11 +18,11 @@ proof of the rule and the counterexample that shows why it is there.
 
 | Spec | Property | Kind | Meaning |
 |---|---|---|---|
-| Resolution | `AnswersTrueWithinTtl` | invariant | every record of a NOERROR answer was in the data at some second within its TTL before the reply |
+| Resolution | `AnswersTrueWithinTtl` | invariant | every record of a NOERROR answer was in the data at some second within its TTL before the reply, or, for a record that came for the resolution and ran out before the reply, within its TTL before it ran out |
 | | `NegativeTrue` | invariant | NXDOMAIN only for a name with no node at or below it and no wildcard; NODATA only for a node without the type; each held within the negative TTL |
 | | `NoPoison` | invariant | every cached record came from a server for a zone at or above its name |
 | | `GlueNeverAnswers` | invariant | no answer to a client rests on glue |
-| | `TtlSound` | invariant | no answer uses a record at or after its expiry |
+| | `TtlSound` | invariant | no answer uses a record from the cache at or after its expiry; a record that came for the resolution serves it with the TTL it has left, even 0 (RFC 1035 section 7.4) |
 | | `TcNotCached` | invariant | nothing from a truncated reply is cached (RFC 2181 section 9) |
 | | `FailureNeverNegative` | invariant | a cached failure never answers NXDOMAIN or NODATA (RFC 9520) |
 | | `BoundedNotCached` | invariant | a failure the work bound caused is never cached, so one question's spent budget never answers another client |
@@ -40,7 +40,7 @@ proof of the rule and the counterexample that shows why it is there.
 | | `PolicyHolds` | invariant | no ask the policy refuses reaches the source, root and TLD asks included |
 | | `UnknownNeverNegative` | invariant | no NXDOMAIN or NODATA rests on an unknown fact |
 | | `CoherentRevision` | invariant | every reply from the lazy zone agrees with one revision of it |
-| | `RespondMonotone` | invariant | more observations never turn a reply into a `Need`: a request that knows what its ask observed never needs another |
+| | `RespondMonotone` | invariant | more observations never turn a reply into a `Need` nor change it: for every pair of Knowns a request can hold, reached or not, when `respond` replies or stays silent with the smaller it does the same with the larger (Lean `respond_monotone`) |
 | | `OneAskPerNeed` | invariant | a request sends at most one ask per `Need`, and one `Need` per generation |
 | | `NoLockAcrossAsk` | invariant | a request parked on an ask holds no part of a view |
 | | `EveryParkedAnswered` | liveness | every request that waits on an ask is answered or silently dropped |
@@ -120,21 +120,21 @@ in `_concurrent` explores the same states as the invariants there.
 
 | Config | Properties | Result | Distinct states | Depth | Time | Counterexample |
 |---|---|---|---|---|---|---|
-| Resolution_base | the 10 invariants, `ReferralsDescend` | pass | 540040 | 68 | 2 s | |
-| Resolution_base | `EveryQueryAnswered` | pass | 540040 | 68 | 18 s | |
-| Resolution_concurrent | the 10 invariants, `ReferralsDescend` (symmetry) | pass | 3832718 | 60 | 10-11 s | |
-| Resolution_concurrent_live | `EveryQueryAnswered` | pass | 7646409 | 60 | 326 s | |
-| Resolution_loop | the 10 invariants, `ReferralsDescend`, `EveryQueryAnswered` | pass | 12779 | 30 | 0-1 s | |
-| Resolution_rogue | the 10 invariants, `ReferralsDescend`, `EveryQueryAnswered` | pass | 28297 | 33 | 0-1 s | |
-| Resolution_edit | the 10 invariants, `ReferralsDescend` | pass | 411683 | 48 | 1-2 s | |
-| Resolution_edit | `EveryQueryAnswered` | pass | 411683 | 48 | 13 s | |
+| Resolution_base | the 10 invariants, `ReferralsDescend` | pass | 358212 | 56 | 2 s | |
+| Resolution_base | `EveryQueryAnswered` | pass | 358212 | 56 | 13 s | |
+| Resolution_concurrent | the 10 invariants, `ReferralsDescend` (symmetry) | pass | 2510543 | 55 | 8 s | |
+| Resolution_concurrent_live | `EveryQueryAnswered` | pass | 5003240 | 55 | 225 s | |
+| Resolution_loop | the 10 invariants, `ReferralsDescend`, `EveryQueryAnswered` | pass | 12292 | 30 | 0-1 s | |
+| Resolution_rogue | the 10 invariants, `ReferralsDescend`, `EveryQueryAnswered` | pass | 26093 | 33 | 0-1 s | |
+| Resolution_edit | the 10 invariants, `ReferralsDescend` | pass | 190961 | 41-42 | 1-2 s | |
+| Resolution_edit | `EveryQueryAnswered` | pass | 190961 | 41 | 6 s | |
 | Resolution_nobailiwick | `NoPoison` | violated | 312 | 11 | 1 s | Ask, Advance, Serve, Receive (root's referral), Advance, Serve, Receive (tld's referral), Advance, Serve, Receive: alt.tld's answer for x.w.alt.tld carries www.sld.tld, which is cached |
-| Resolution_nobound | `WorkBounded` | violated | 5465 | 21 | 0 s | the loop's CNAME chase restarts past `MaxChain` |
-| Resolution_nobound | `EveryQueryAnswered` | violated | 31258 | lasso | 2 s | down to sld.tld and over to alt.tld, then round a lasso: the chain follows loop.sld.tld and loop.alt.tld from the cache forever, its counter stopped one past `MaxChain` |
+| Resolution_nobound | `WorkBounded` | violated | 5302 | 21 | 0 s | the loop's CNAME chase restarts past `MaxChain` |
+| Resolution_nobound | `EveryQueryAnswered` | violated | 38142 | lasso | 2 s | down to sld.tld and over to alt.tld, then round a lasso: the chain follows loop.sld.tld and loop.alt.tld from the cache forever, its counter stopped one past `MaxChain` |
 | Resolution_cachetc | `TcNotCached` | violated | 33 | 6 | 1 s | Ask, Advance, Serve, Truncate, Receive |
-| Resolution_noexpiry | `TtlSound` | violated | 2345 | 17 | 0 s | Ask cn.sld.tld; Advance, Serve, Receive three times down to sld.tld; Advance follows the CNAME; Advance, Serve, Receive for www.sld.tld; Tick, Advance: the answer carries the CNAME after its one-second TTL ran out |
+| Resolution_noexpiry | `TtlSound` | violated | 4751 | 20 | 0 s | Ask cn.sld.tld; Advance, Serve, Receive three times down to sld.tld; Advance follows the CNAME; Advance, Serve, Receive, Advance for www.sld.tld; Ask www.sld.tld; Tick, Tick, Advance: the cache answers www.sld.tld after its two-second TTL ran out |
 | Resolution_failureasnegative | `FailureNeverNegative` | violated | 173 | 9 | 0 s | Ask, Advance, Lose, Timeout, Advance, Serve, Receive, Advance: the query to one root server is lost and times out, the other refuses, and the cached failure answers NXDOMAIN |
-| Resolution_cachebounded | `BoundedNotCached` | violated | 1279 | 15 | 0 s | Ask, then Advance, Serve, Receive twice down to sld.tld; Advance, Serve, Truncate, Receive (the TCP retry is the fourth query); Lose, Timeout, Advance: the work bound ends the resolution and its failure is cached |
+| Resolution_cachebounded | `BoundedNotCached` | violated | 1265 | 15 | 0 s | Ask, then Advance, Serve, Receive twice down to sld.tld; Advance, Serve, Truncate, Receive (the TCP retry is the fourth query); Lose, Timeout, Advance: the work bound ends the resolution and its failure is cached |
 | Exchanges_base | the 3 invariants, `MatchRequiresTuple`, `DuplicateHarmless` | pass | 66914 | 19 | 1 s | |
 | Exchanges_base | `EveryAcceptedAnswered` | pass | 66914 | 19 | 3 s | |
 | Exchanges_advance | the 3 invariants, `MatchRequiresTuple`, `DuplicateHarmless` | pass | 4564834 | 28 | 10-12 s | |
@@ -144,15 +144,15 @@ in `_concurrent` explores the same states as the invariants there.
 | Exchanges_idonly | `MatchRequiresTuple` | violated | 64 | 5 | 1 s | Query, Send, Spoof, Deliver |
 | Exchanges_flushonly | `ObsoleteNeverPopulates` | violated | 282 | 6 | 0 s | Query, Send, Serve, Advance, Deliver |
 | Exchanges_cancelshared | `CancelPreservesWaiters` | violated | 13 | 4 | 1 s | Query, Query, Gone |
-| Authority_base | the 7 invariants, `EveryParkedAnswered` | pass | 2072 | 17 | 0-1 s | |
-| Authority_fail | the 7 invariants, `EveryParkedAnswered` | pass | 7096 | 17 | 0-1 s | |
-| Authority_lazy | the 7 invariants, `EveryParkedAnswered` | pass | 544 | 12 | 0-1 s | |
-| Authority_advance | the 7 invariants, `EveryParkedAnswered` | pass | 29372 | 19 | 0-1 s | |
-| Authority_nopolicy | `PolicyHolds` | violated | 4 | 2 | 0 s | Step: the root server relays leak.evil to the source |
-| Authority_rootexempt | `PolicyHolds` | violated | 4 | 2 | 1 s | Step: the same ask, exempt because it goes to a root server |
+| Authority_base | the 7 invariants, `EveryParkedAnswered` | pass | 53328 | 27 | 1-5 s | |
+| Authority_fail | the 7 invariants, `EveryParkedAnswered` | pass | 378816 | 27 | 2-31 s | |
+| Authority_lazy | the 7 invariants, `EveryParkedAnswered` | pass | 784 | 12 | 0 s | |
+| Authority_advance | the 7 invariants, `EveryParkedAnswered` | pass | 43477 | 19 | 0-2 s | |
+| Authority_nopolicy | `PolicyHolds` | violated | 5 | 2 | 0 s | Step: the root server relays leak.evil to the source |
+| Authority_rootexempt | `PolicyHolds` | violated | 5 | 2 | 0 s | Step: the same ask, exempt because it goes to a root server |
 | Authority_unknownasabsent | `UnknownNeverNegative` | violated | 2 | 2 | 0 s | View: b.fict is unknown and the wildcard absent, so NXDOMAIN |
 | Authority_mixedrevision | `CoherentRevision` | violated | 43 | 4 | 1 s | ReadName (a.fict absent), WorldChange, ReadRest (the wildcard present): a wildcard answer no revision gives |
-| Authority_reask | `RespondMonotone` | violated | 17 | 3 | 0 s | Step (the policy refuses leak.evil, a timeout), Observe: the request knows its observation and needs again |
+| Authority_reask | `OneAskPerNeed` | violated | 81 | 4 | 0 s | Step (the policy refuses leak.evil, a timeout), Observe, Step: the request knows its observation and asks again |
 | Authority_parkinview | `NoLockAcrossAsk` | violated | 6 | 3 | 0 s | ReadOverlay, Step: the overlay reads the lazy zone, then parks on its DS ask while it still holds that read |
 | Validation_paths | the 11 invariants | pass | 1119744 | 1 | 1-3 s | |
 | Validation_skew | the 11 invariants | pass | 10368 | 1 | 0-1 s | |
@@ -195,10 +195,10 @@ Resolution:
   lame server answers REFUSED). The resolver must reject the referral and
   try the other server.
 * A server reads the data when it gets the query and replies at once. The
-  clock does not advance while a reply is in flight, so a record's read
-  time is the second the resolver stores it: simulated round trips are far
-  shorter than a TTL second. A timeout is enabled by a lost message, not by
-  the clock.
+  clock does not advance while a reply is in flight, nor before the
+  resolver acts on it, so a record's read time is the second the resolver
+  stores it: simulated round trips are far shorter than a TTL second. A
+  timeout is enabled by a lost message, not by the clock.
 * The resolver starts with the root's servers known (priming is not
   modelled) and keeps every cut it learns: NS TTLs outlast `MaxTime`. Only
   `ns.sld.tld` is glued in the cache, which is the glue `GlueNeverAnswers`
@@ -210,12 +210,17 @@ Resolution:
   sld, tld again for alt, alt), so with 4 the work bound always ends the
   loop before the chain bound is ever reached, and the chain bound would go
   unchecked.
-* A chain whose link expires while the chase goes on is followed again from
-  the question, keeping the work done. The first run found this case:
-  without it the resolver answered a CNAME whose TTL had already run out
-  (`TtlSound`). The Rust resolver does the same: when a record of an answer
-  ran out while the rest was resolved, `Resolver` follows the chain again
-  from the question, its work so far still counted.
+* A record that came in a reply to the resolution serves it, whether or not
+  the cache keeps it, with the TTL it has left, even 0 (RFC 1035 section
+  7.4): following the chain again could only fetch it again. A chain whose
+  link from the cache expires while the chase goes on is followed again
+  from the question, keeping the work done. The first run found this case:
+  without it the resolver answered a cached CNAME whose TTL had already run
+  out (`TtlSound`). The Rust resolver does the same: `Resolver::ran_out`
+  looks at the cached pieces of an answer, and when one ran out while the
+  rest was resolved, the chain is followed again from the question, its
+  work so far still counted; a piece fetched for the question goes out
+  with TTL 0.
 * A failure after every server was tried is cached for `failure_ttl`
   (1 s) at the name the chain had reached. A resolution that reaches the
   work bound answers SERVFAIL without caching, as `Resolution::send` leaves
@@ -253,9 +258,11 @@ Authority:
 
 * A request needs the relayed question, or the overlay's `<apex> DS`
   and, at a server that does not serve the parent, the relayed question
-  after it. `RespondMonotone` checks that `respond` never needs an ask
-  whose observation it knows; `_reask`, where a timeout makes `respond`
-  ask again, breaks it.
+  after it. `RespondMonotone` checks, for every Known of a request's two
+  asks, that once `respond` replies or stays silent, more observations
+  change nothing, as the Lean theorem states for every authority.
+  `OneAskPerNeed` checks that a request asks each ask once per generation;
+  `_reask`, where a timeout makes `respond` ask again, breaks it.
 * The root and TLD servers both run `Overlay` over `Relay`, as
   `Mirror::wrap` puts an overlay on every relay. Before its DS ask, the
   overlay reads the edited zone's apex NS RRset and the addresses of its

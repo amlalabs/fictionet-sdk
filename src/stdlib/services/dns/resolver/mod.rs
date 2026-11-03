@@ -412,6 +412,7 @@ impl<V: Verify> Resolver<V> {
     }
 
     fn push_found(&mut self, id: AskerId, found: resolution::Found) {
+        let depth = usize::from(self.config.work.depth);
         let Some(asker) = self.askers.get_mut(&id) else {
             return;
         };
@@ -422,6 +423,39 @@ impl<V: Verify> Resolver<V> {
             stale: false,
             at: self.now,
         });
+        // The rest of a chain the same reply carried answers its targets,
+        // before any lookup of them, so the data that came for this
+        // question serves it even when the cache did not keep it
+        // (RFC 1035 §7.4). It stops where following the chain one name at
+        // a time would stop: at a name the chain passed, or past the work
+        // bound, which the next step then fails on.
+        for outcome in found.rest {
+            let Some(Piece {
+                outcome: Outcome::Alias { target, .. },
+                ..
+            }) = asker.pieces.last()
+            else {
+                break;
+            };
+            let looped = asker.pieces.iter().any(|piece| match &piece.outcome {
+                Outcome::Alias { cname, .. } => cname.name() == target,
+                _ => false,
+            });
+            if looped || asker.pieces.len() > depth {
+                break;
+            }
+            let checks = resolution::subjects(&outcome)
+                .into_iter()
+                .map(|subject| (subject, Validation::NotPerformed))
+                .collect();
+            asker.pieces.push(Piece {
+                checks,
+                outcome,
+                cached: false,
+                stale: false,
+                at: self.now,
+            });
+        }
     }
 
     fn push_piece(&mut self, id: AskerId, outcome: Outcome, cached: bool) {
@@ -435,6 +469,7 @@ impl<V: Verify> Resolver<V> {
                 outcome,
                 checks,
                 cached,
+                rest: Vec::new(),
             },
         );
     }
