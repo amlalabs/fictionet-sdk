@@ -55,6 +55,7 @@ pub mod mime_multipart;
 pub mod modbus;
 pub mod moldudp64;
 pub mod mongodb;
+pub mod mptcp;
 pub mod mqtt;
 pub mod mysql;
 pub mod nbdgm;

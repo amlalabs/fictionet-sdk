@@ -294,6 +294,7 @@
 //! | [`protocols::modbus`] | Modbus/TCP frames, requests and responses. |
 //! | [`protocols::moldudp64`] | MoldUDP64 packets, gap recovery and retransmission. |
 //! | [`protocols::mongodb`] | MongoDB BSON documents and wire messages. |
+//! | [`protocols::mptcp`] | Multipath TCP options, tokens and join HMACs. |
 //! | [`protocols::mqtt`] | MQTT 3.1.1 packets and topic matching. |
 //! | [`protocols::mysql`] | MySQL packets, handshakes, commands and result sets. |
 //! | [`protocols::nbdgm`] | NetBIOS datagrams and fragment reassembly. |
