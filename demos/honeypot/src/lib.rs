@@ -9,18 +9,21 @@
 //! The world is one host at a public address ([`Config::address`]) with
 //! MPTCP listeners on its open ports: SSH with an OpenSSH identification
 //! line and HTTP with nginx's default page ([`services`]). A SYN with
-//! MP_CAPABLE gets an RFC 8684 SYN-ACK with MP_CAPABLE and a key, and an
-//! MP_JOIN is answered and then refused with MP_TCPRST as Linux answers
-//! and refuses it ([`mptcp`]). The internet reaches the host through an
-//! attachment called [`INTERNET`] routed at [`Config::internet`] with
-//! `Net::route`, and reaches nothing else: its packets for any other
-//! address are logged and dropped. Sandboxes attached under any other name
-//! join the network as usual, and reach the host through its router.
+//! MP_CAPABLE gets an RFC 8684 SYN-ACK with MP_CAPABLE and a key, its data
+//! then carries DSS, and an MP_JOIN is answered, taken or refused as Linux
+//! answers, takes and refuses it ([`mptcp`]). The internet reaches the
+//! host through an attachment called [`INTERNET`] routed at
+//! [`Config::internet`] with `Net::route`, and reaches nothing else: its
+//! packets for any other address are logged and dropped. Sandboxes
+//! attached under any other name join the network as usual, and reach the
+//! host through its router.
 //!
 //! Every packet that crosses any attachment, both ways, goes to a pcapng
 //! file, and a typed [`Observation`](observe::Observation) per SYN,
 //! payload, answer and burst goes to a JSON-lines log ([`observe`]). The
-//! observer sees each packet before the world's TCP does.
+//! observer sees each packet before the world's TCP does, once it is
+//! whole: the relay puts fragments together and the world takes the
+//! packet it made.
 //!
 //! Nothing here is a real kernel, and nothing runs what a client sends.
 //! The packets come from the internet, so the world treats every byte as
@@ -39,7 +42,7 @@ use std::sync::Arc;
 use std::task::Poll;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use fictionet::stdlib::network::ip;
+use fictionet::stdlib::network::ip::{self, Intake, Reassembly};
 use fictionet::stdlib::network::ports::{Event, Ports};
 use fictionet::stdlib::world::net::{Host, Net};
 use fictionet::sync::Mutex;
@@ -107,11 +110,11 @@ pub fn network(fcx: &Cx, config: &Config, clock: Clock, tokens: &Arc<Tokens>) ->
         server = match port.service {
             Service::Ssh => server.port_server(
                 port.number,
-                Listener::new(fcx, tokens.clone(), services::Ssh),
+                Listener::new(fcx, tokens.clone(), port.number, services::Ssh),
             ),
             Service::Http => server.port_server(
                 port.number,
-                Listener::new(fcx, tokens.clone(), services::Http { clock }),
+                Listener::new(fcx, tokens.clone(), port.number, services::Http { clock }),
             ),
         };
     }
@@ -182,6 +185,14 @@ pub fn start(
 /// for that address: the internet reaches the server and nothing else in
 /// the world. Ends when either side closes. A write that fails ends the
 /// run: the honeypot does not run without its log.
+///
+/// Every packet goes to the packet log as it crossed. Fragments from the
+/// sandbox that go on are put back together here, as a host puts them
+/// together ([`Reassembly`]: at most 4 MiB waiting, for at most 30 seconds
+/// for IPv4 and 60 for IPv6), and the world gets the whole packet. So the
+/// observer logs each packet the world takes, once it is whole, and only
+/// those: fragments for addresses the world never sees are not put
+/// together, and cannot crowd out those it does.
 async fn relay(
     fcx: Cx,
     sandbox: Attachment,
@@ -191,28 +202,40 @@ async fn relay(
 ) -> fictionet::Result {
     let name: Arc<str> = sandbox.name().into();
     let mut ports = Ports::new(vec![Box::new(sandbox) as Box<dyn Interface>, Box::new(end)]);
+    let mut reassembly = Reassembly::default();
     loop {
-        match ports.next(&fcx, None, |_| Poll::Pending).await? {
-            Event::Packet(side, packet) => {
-                let direction = if side == 0 {
-                    Direction::In
-                } else {
-                    Direction::Out
+        let deadline = reassembly.next_expiry();
+        match ports.next(&fcx, deadline, |_| Poll::Pending).await? {
+            Event::Packet(0, packet) => {
+                let mut observer = observer.lock();
+                observer.crossed(&name, Direction::In, &packet.0, fcx.now())?;
+                let goes_on = only.is_none_or(|only| ip::destination(&packet.0) == Some(only));
+                let fragment = ip::Header::parse_truncated(&packet.0)
+                    .is_some_and(|h| h.fragment.is_some_and(|f| !f.is_atomic()));
+                if fragment && !goes_on {
+                    continue;
+                }
+                // A packet refused for its IPv6 extension headers goes on
+                // as it is, so the world refuses it and answers as a host
+                // does.
+                let packet = match reassembly.push(packet, fcx.now()) {
+                    Intake::Whole(packet) | Intake::Refused { packet, .. } => packet,
+                    Intake::Waiting => continue,
                 };
-                observer
-                    .lock()
-                    .packet(&name, direction, &packet.0, fcx.now())?;
-                let allowed = direction == Direction::Out
-                    || only.is_none_or(|only| ip::destination(&packet.0) == Some(only));
-                if allowed {
-                    ports.send(1 - side, packet);
+                observer.whole(&name, Direction::In, &packet.0, fcx.now())?;
+                if goes_on {
+                    ports.send(1, packet);
                 }
             }
-            Event::Timer | Event::Extra => {}
-            Event::Closed(_) => {
-                observer.lock().detached(&name);
-                return Ok(());
+            Event::Packet(_, packet) => {
+                let mut observer = observer.lock();
+                observer.crossed(&name, Direction::Out, &packet.0, fcx.now())?;
+                observer.whole(&name, Direction::Out, &packet.0, fcx.now())?;
+                ports.send(0, packet);
             }
+            Event::Timer => reassembly.expire(fcx.now()),
+            Event::Extra => {}
+            Event::Closed(_) => return Ok(()),
         }
     }
 }

@@ -21,24 +21,39 @@ open port:
 - **HTTP** (`--http`, 80 by default): nginx's default page for one request,
   then it closes.
 
-The MPTCP listener follows RFC 8684:
+The MPTCP listener follows RFC 8684, and reads MPTCP options as Linux does:
+an option Linux ignores counts for nothing, and of several that count the
+last one wins.
 
-- A SYN with MP_CAPABLE that offers HMAC-SHA256 gets a SYN-ACK with
+- A SYN with MP_CAPABLE that offers HMAC-SHA256 alone gets a SYN-ACK with
   MP_CAPABLE version 1 and a fresh random key. A SYN that offers a higher
   version gets version 1 back, as Linux answers it. The SYN-ACK asks for
   checksums only when the SYN did.
-- Linux ignores MP_CAPABLE of version 0, with a key, with flag B, or with no
-  HMAC-SHA256, and so does the honeypot: that connection is plain TCP. So is a
-  SYN with both MP_CAPABLE and MP_JOIN, and a connection whose third ACK does
-  not echo the keys.
-- After the handshake the server speaks plain TCP, as an MPTCP host does once
-  a connection has fallen back. It never takes a second subflow, but it
-  answers MP_JOIN as Linux does. When the token names one of the server's open
-  connections, the SYN gets a SYN-ACK with MP_JOIN, the server's HMAC and a
-  random number. The join is refused at its third ACK, which carries the
-  client's HMAC, with a RST that has MP_TCPRST "administratively prohibited".
-  When the token names none, the SYN gets that RST at once, with
-  "MPTCP-specific error".
+- Linux ignores MP_CAPABLE of version 0, with a key, with flag B, or with any
+  algorithm but HMAC-SHA256 alone, and so does the honeypot. A SYN with only
+  such options is plain TCP, and so is a SYN with both MP_CAPABLE and
+  MP_JOIN. On the third ACK, MP_CAPABLE counts only with version 1 and the
+  Length the segment calls for: 20 on a pure ACK, 22 or 24 with data. A
+  connection whose third ACK echoes no keys that count is plain TCP.
+- Once the third ACK echoes the keys, every segment the server sends carries
+  DSS: a mapping of its data, from its IDSN + 1, and a Data ACK of the
+  client's. When the client sends data that no mapping covers, the
+  connection falls back to plain TCP, and the server sends no more DSS.
+- MP_JOIN is answered as by a Linux listener with its default limits. When
+  the token names one of the server's open connections on the same port,
+  the SYN gets a SYN-ACK with MP_JOIN, the server's HMAC and a random number.
+  At the third ACK, a join with the client's right HMAC is taken, up to two
+  per connection; the server sends nothing on it, reads what the client
+  sends, and closes it when the connection is gone. A join with a wrong HMAC,
+  none, or past the two gets a RST with MP_TCPRST "administratively
+  prohibited", and so does a join SYN for a connection on another port. When
+  the token names none, the SYN gets a RST with "MPTCP-specific error".
+- After a SYN cookie, the server takes its key from the third ACK's echo,
+  as Linux does, and drops that ACK as Linux does: when it carries both
+  MP_CAPABLE and MP_JOIN, when the client's key is 0, or when the echoed
+  key's token names an open connection. A join whose SYN got a SYN cookie
+  cannot be checked, as nothing of its SYN was kept, and is refused at its
+  third ACK.
 - A RST that refuses a SYN or a third ACK has the fields Linux gives it: the
   sequence number the segment acknowledged, or else 0 and an ACK of the SYN,
   window 0, and MP_TCPRST as its only option.
@@ -73,9 +88,12 @@ within the burst window; the `at_us` of its lines gives longer gaps.
 
 The world writes each packet to the capture and the log before passing it on,
 so a packet the world drops is still logged. The capture has each packet as it
-crossed. The log reads whole packets: IP fragments are put together first, as
-the world puts them together. If either file cannot be written, the world
-stops.
+crossed. The log reads whole packets: the attachment puts IP fragments
+together, as a Linux host does (at most 4 MiB waiting, for at most 30
+seconds), and the world takes the whole packet it made, so the log has
+exactly the packets the world takes. Fragments for an address the internet
+does not reach are in the capture only. If either file cannot be written,
+the world stops.
 
 ### Bursts are a heuristic
 
@@ -100,7 +118,16 @@ Spoofed SYNs cannot shut real attackers out either. Each port holds 4,096
 handshakes. Past that, the server answers with SYN cookies, as Linux does, and
 keeps nothing until the ACK that returns one. A handshake whose last ACK never
 comes gets six SYN-ACKs, at 0, 1, 3, 7, 15 and 31 seconds, and is dropped at 63
-seconds without a RST, as on Linux.
+seconds without a RST, as on Linux. A closed connection whose client never
+closes its side is forgotten a minute after the client acknowledged the
+server's FIN, whatever the client sends meanwhile, as on Linux.
+
+A client cannot connect in another address's name. Each connection's initial
+sequence number is a keyed hash of its addresses and ports plus a clock, as
+Linux makes it (RFC 6528), so the numbers a client sees on its own
+connections tell it nothing about another's. The SYN cookies have a key of
+their own. So the log's sources are the addresses that completed the
+handshakes.
 
 The internet reaches the server and nothing else. Its packets for any other
 address are logged and dropped, and the network drops those whose source

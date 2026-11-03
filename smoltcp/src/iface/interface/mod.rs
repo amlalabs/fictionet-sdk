@@ -6,7 +6,6 @@ mod tests;
 
 use super::socket_set::SocketSet;
 use crate::phy::{Device, RxToken, TxToken};
-use crate::rand::Rand;
 use crate::socket::PollAt;
 use crate::time::Instant;
 use crate::wire::*;
@@ -24,33 +23,37 @@ pub struct Interface {
     pub(crate) inner: InterfaceInner,
 }
 
-/// Clock, addresses, MTU, and entropy shared by TCP sockets.
+/// Clock, addresses, MTU, and initial sequence numbers shared by TCP
+/// sockets.
 pub struct InterfaceInner {
     mtu: usize,
     now: Instant,
-    rand: Rand,
+    initial_seq: InitialSeq,
     ip_addr: IpAddress,
 }
+
+/// Picks the initial sequence number of a connection from its local and
+/// remote endpoints and the time, as RFC 6528 has it: a keyed hash of the
+/// endpoints plus a clock, so that what one connection shows of its
+/// number tells nothing of another's.
+pub type InitialSeq = Box<dyn Fn(IpEndpoint, IpEndpoint, Instant) -> u32 + Send + Sync>;
 
 /// Configuration for a simulated host's TCP interface.
 pub struct Config {
     /// The host address.
     pub ip_addr: IpAddress,
-    /// Seed for TCP initial sequence numbers.
-    pub random_seed: u64,
+    /// Each new connection's initial sequence number.
+    pub initial_seq: InitialSeq,
 }
 
 impl Interface {
     pub fn new(config: Config, device: &mut (impl Device + ?Sized), now: Instant) -> Self {
         assert!(config.ip_addr.is_unicast() || config.ip_addr.is_unspecified());
-        let mut rand = Rand::new(config.random_seed);
-        // Preserve the sequence of random values used by existing simulations.
-        while rand.rand_u16() == 0 {}
         Self {
             inner: InterfaceInner {
                 mtu: device.capabilities().max_transmission_unit,
                 now,
-                rand,
+                initial_seq: config.initial_seq,
                 ip_addr: config.ip_addr,
             },
         }
@@ -127,8 +130,10 @@ impl InterfaceInner {
     pub(crate) fn ip_mtu(&self) -> usize {
         self.mtu
     }
-    pub(crate) fn rand(&mut self) -> &mut Rand {
-        &mut self.rand
+    /// The initial sequence number of a connection from `local` to
+    /// `remote` that starts now.
+    pub(crate) fn initial_seq(&self, local: IpEndpoint, remote: IpEndpoint) -> TcpSeqNumber {
+        TcpSeqNumber((self.initial_seq)(local, remote, self.now) as i32)
     }
 
     #[cfg(test)]

@@ -12,8 +12,9 @@ pub(crate) fn setup<'a>() -> (Interface, SocketSet<'a>, TestingDevice) {
 }
 
 fn setup_with_device(device: &mut impl Device) -> Interface {
+    // The tests' sockets start every connection at the same number.
     let config = Config {
-        random_seed: 0,
+        initial_seq: Box::new(|_, _, _| crate::socket::tcp::test::LOCAL_SEQ.0 as u32),
         ip_addr: Ipv4Address::new(192, 168, 1, 1).into(),
     };
     Interface::new(config, device, Instant::ZERO)

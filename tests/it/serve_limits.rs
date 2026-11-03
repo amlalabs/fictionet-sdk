@@ -568,8 +568,10 @@ fn http2_has_the_limits_budget_and_seed_of_http1() {
             assert_eq!(status, 200);
             use fictionet::Entropy;
             let source = fictionet::SeededEntropy::new(fictionet::Seed::from_u64(7));
-            // Each of the two TCP endpoints takes its interface seed and port start.
-            source.fill_random(&mut [0; 32]);
+            // Each of the two TCP endpoints takes the 32-byte key of its
+            // initial sequence numbers, its port start, and the 32-byte key
+            // of its SYN cookies.
+            source.fill_random(&mut [0; 2 * (32 + 8 + 32)]);
             let expected = source.random_u64();
             assert_eq!(body, expected.to_string());
 

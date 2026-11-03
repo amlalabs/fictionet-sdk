@@ -23,7 +23,7 @@ pub(super) struct Hooks {
     /// sandbox detaches, until another binds the address, so packets and
     /// connections still on their way name the sandbox that sent them.
     pub(super) by_addr: Mutex<HashMap<IpAddr, Sandbox>>,
-    /// Each trusted route's prefix ([`Net::route`](super::Net::route)),
+    /// Each route's prefix ([`Net::route`](super::Net::route)),
     /// with the sandbox that attached there last, which every address in
     /// the prefix that no sandbox binds comes from. One entry per prefix,
     /// kept after its sandbox detaches as `by_addr` keeps its own. A route
@@ -94,7 +94,8 @@ pub(super) struct Destinations {
 }
 
 impl Context {
-    /// Attributes traffic from a trusted route without filtering its packets.
+    /// Attributes traffic from a route, and passes on only packets from
+    /// sources the network routes back to it: see [`Routed`].
     pub(super) fn routed(self: &Arc<Self>, sandbox: Attachment, prefix: Prefix) -> Routed {
         let owner = self.bindings.new_owner();
         self.hooks.attached.lock().insert(owner, None);
@@ -184,8 +185,9 @@ impl Context {
     }
 }
 
-/// A trusted sandbox wired to the router at its prefix. It passes packets
-/// as they are and keeps no state per source.
+/// A sandbox wired to the router at its prefix
+/// ([`Net::route`](super::Net::route)). It passes packets as they are and
+/// keeps no state per source.
 ///
 /// It passes on only packets from addresses the network routes back to
 /// it, as a router with strict reverse-path forwarding does (RFC 3704
@@ -581,7 +583,7 @@ impl Destinations {
         }
         match self.machines.closed(dst, p) {
             Some(closed) => closed.then_some(BlockedWhy::ClosedPort),
-            // A trusted sandbox's prefix, or a LAN, which reports its own
+            // A route's prefix, or a LAN, which reports its own
             // drops.
             None if self.trusted.iter().any(|p| p.contains(dst)) => None,
             None => Some(BlockedWhy::NoRoute),

@@ -62,8 +62,10 @@
 //!   is accepted. Dropped requests do not reserve or bind an address.
 //! - **Sandboxes cannot reach each other.** A packet to the sandboxes'
 //!   subnet other than the gateway is dropped. [`Net::route`] attaches a
-//!   trusted sandbox, such as a real container playing a host, at a fixed
-//!   prefix outside that subnet, with no filter.
+//!   sandbox at a fixed prefix outside that subnet, such as a real
+//!   container playing a host or the open internet, with no address
+//!   binding or DHCP. It drops only packets from sources the network does
+//!   not route back to it.
 //! - **DNS** at the gateway, over UDP and TCP. It answers A and AAAA for
 //!   each host's names, NODATA for other types, NXDOMAIN for every other
 //!   name.
@@ -95,7 +97,7 @@
 //!   HTTP/2 charges retained request heads and bodies (see [`httpd`]).
 //!   A [`PortServer`] of your own charges what it chooses. A sandbox has one
 //!   budget for both its addresses, from when it attaches until it
-//!   detaches. A trusted sandbox ([`Net::route`]) has none.
+//!   detaches. A route ([`Net::route`]) has none.
 //! - **Every link** inside the network holds at most 4 MiB of packets each
 //!   way; past that, packets are dropped, as on a congested link.
 //! - **Errors.** A host that cannot be served as declared, such as one at
@@ -355,17 +357,19 @@ impl Net {
     }
 
     /// Wires the sandbox called `name` straight to the router at `prefix`,
-    /// with no filter, no address binding and no DHCP: a trusted
-    /// participant, such as a real container that plays one of the hosts.
-    /// Packets for `prefix` go to it, and what it sends is routed as it is,
-    /// when its source address is one the network routes back to it: one
-    /// in `prefix` that no subnet, gateway, host or longer route has.
-    /// Others are dropped, as a router with strict reverse-path forwarding
-    /// drops them (RFC 3704 section 2.2), so a route open to the internet
-    /// cannot send packets in another sandbox's or host's name.
-    /// Connections from addresses in `prefix` that no other sandbox has
-    /// name this sandbox, and the network keeps nothing per source address,
-    /// so a route open to the internet can carry any number of them.
+    /// with no address binding and no DHCP: a real container that plays
+    /// one of the hosts, say, or the open internet coming in through a TUN
+    /// device. Packets for `prefix` go to it. What it sends is routed as it
+    /// is, fragments included, when its source address is one the network
+    /// routes back to it: one in `prefix` that no subnet, gateway, host or
+    /// longer route has. Packets from any other source are dropped, as a
+    /// router with strict reverse-path forwarding drops them (RFC 3704
+    /// section 2.2), so a route open to the internet cannot send packets in
+    /// another sandbox's or host's name. That is the only filter: unlike a
+    /// sandbox's, a route's packets are not otherwise checked. Connections
+    /// from addresses in `prefix` that no other sandbox has name this
+    /// sandbox, and the network keeps nothing per source address, so a
+    /// route open to the internet can carry any number of them.
     pub fn route(mut self, name: &str, prefix: Prefix) -> Net {
         self.routes.push((name.to_owned(), prefix));
         self
@@ -554,7 +558,7 @@ struct Shared {
     leases: Arc<Mutex<Leases>>,
     gateway_tcp: Arc<Mutex<Vec<tcp::Endpoint>>>,
     hooks: Arc<Hooks>,
-    /// Prefixes of trusted sandboxes ([`Net::route`]).
+    /// Prefixes of routes ([`Net::route`]).
     fixed: Vec<Prefix>,
     limits: Limits,
     /// The LANs, by name.

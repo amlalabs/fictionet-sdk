@@ -12,7 +12,8 @@ use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::network::ip::{Fields, packet_with, transport_checksum};
 use fictionet::stdlib::network::tcp::{self, TcpOption};
 use fictionet::stdlib::protocols::mptcp::{
-    self, Capable, Join, Keys, MptcpOption, algorithm, join_hmac, reason, token,
+    self, Capable, Dss, Join, Keys, Mapping, MptcpOption, Sequence, algorithm, join_hmac, reason,
+    token,
 };
 use fictionet::{Cx, End, Interface, InterfaceExt, Packet};
 use honeypot_world::config::{Burst, DEFAULT_ADDRESS};
@@ -395,103 +396,260 @@ fn a_plain_syn_gets_ssh() {
     });
 }
 
-/// An MP_CAPABLE SYN gets MP_CAPABLE back with a key. While that
-/// connection is open, an MP_JOIN with its token gets a SYN-ACK with
-/// MP_JOIN and the listener's HMAC, as from Linux, and is refused at its
-/// third ACK as "administratively prohibited"; once it is gone, a join is
-/// refused at its SYN as an unknown token.
+/// The DSS of a packet from the world, if it has one.
+fn dss_of(p: &Packet) -> Option<Dss> {
+    mptcp_of(p).into_iter().find_map(|o| match o {
+        MptcpOption::Dss(dss) => Some(dss),
+        _ => None,
+    })
+}
+
+/// Opens an MPTCP connection from `from` to the server's `port`: an
+/// MP_CAPABLE SYN, and a third ACK that echoes the keys with
+/// `client_key`. Returns the server's key and its initial sequence
+/// number.
+async fn open_mptcp(
+    net: &mut Internet,
+    from: SocketAddr,
+    port: u16,
+    client_key: u64,
+) -> (u64, u32) {
+    let syn_options = with_mss(&mptcp_bytes(linux_capable()));
+    net.send(segment(from, server(port), 5000, 0, SYN, &syn_options, b""));
+    let syn_ack = net.recv().await.expect("a SYN-ACK");
+    assert_eq!(flags(&syn_ack), SYN | ACK);
+    let [MptcpOption::Capable(answer)] = mptcp_of(&syn_ack)[..] else {
+        panic!("one MP_CAPABLE: {:?}", mptcp_of(&syn_ack));
+    };
+    let Keys::Sender(key) = answer.keys else {
+        panic!("a key: {answer:?}")
+    };
+    assert_eq!(
+        answer,
+        Capable {
+            version: 1,
+            checksum_required: false,
+            extensibility: false,
+            no_new_subflows: false,
+            algorithms: algorithm::HMAC_SHA256,
+            keys: Keys::Sender(key),
+        }
+    );
+    // The third ACK echoes both keys (RFC 8684 section 3.1).
+    let third = mptcp_bytes(MptcpOption::Capable(Capable {
+        keys: Keys::Both {
+            sender: client_key,
+            receiver: key,
+        },
+        ..answer
+    }));
+    let iss = seq_of(&syn_ack);
+    net.send(segment(from, server(port), 5001, iss + 1, ACK, &third, b""));
+    (key, iss)
+}
+
+/// An MP_CAPABLE SYN gets MP_CAPABLE back with a key, and once the third
+/// ACK echoes the keys the server's data carries DSS: a mapping from its
+/// IDSN + 1 and a Data ACK of the client's (RFC 8684 section 3.3), as a
+/// Linux server sends them. The client's data without a mapping makes the
+/// connection fall back, and the server sends no more DSS (section 3.7).
 #[test]
-fn mp_capable_gets_a_key_and_joins_are_refused() {
+fn an_mptcp_connection_speaks_dss_until_the_client_falls_back() {
     honeypot(Config::default(), |mut net| async move {
         let from = client(2, 40001);
-        let syn_options = with_mss(&mptcp_bytes(linux_capable()));
-        net.send(segment(from, server(80), 5000, 0, SYN, &syn_options, b""));
-        let syn_ack = net.recv().await.expect("a SYN-ACK");
-        assert_eq!(flags(&syn_ack), SYN | ACK);
-        let [MptcpOption::Capable(answer)] = mptcp_of(&syn_ack)[..] else {
-            panic!("one MP_CAPABLE: {:?}", mptcp_of(&syn_ack));
-        };
-        let Keys::Sender(key) = answer.keys else {
-            panic!("a key: {answer:?}")
-        };
-        assert_eq!(
-            answer,
-            Capable {
-                version: 1,
-                checksum_required: false,
-                extensibility: false,
-                no_new_subflows: false,
-                algorithms: algorithm::HMAC_SHA256,
-                keys: Keys::Sender(key),
-            }
-        );
-
-        // The third ACK echoes both keys (RFC 8684 section 3.1).
         let client_key = 0x1111_2222_3333_4444;
-        let third = mptcp_bytes(MptcpOption::Capable(Capable {
-            keys: Keys::Both {
-                sender: client_key,
-                receiver: key,
-            },
-            ..answer
+        let (key, iss) = open_mptcp(&mut net, from, 22, client_key).await;
+        let banner = net.recv().await.expect("the banner");
+        assert_eq!(payload_of(&banner), SSH_BANNER);
+        assert_eq!(net.honeypot.mptcp_connections(), 1);
+        assert_eq!(
+            dss_of(&banner),
+            Some(Dss {
+                data_ack: Some(Sequence::Short(mptcp::idsn(client_key) as u32 + 1)),
+                mapping: Some(Mapping {
+                    data_sequence_number: Sequence::Long(mptcp::idsn(key).wrapping_add(1)),
+                    subflow_sequence_number: 1,
+                    data_level_length: SSH_BANNER.len() as u16,
+                    checksum: None,
+                }),
+                data_fin: false,
+            })
+        );
+        let acked = iss + 1 + SSH_BANNER.len() as u32;
+        // Mapped data, with a 64-bit data sequence number, is acknowledged
+        // at the data level in 8 octets.
+        let hello = b"SSH-2.0-x\r\n";
+        let dss = mptcp_bytes(MptcpOption::Dss(Dss {
+            data_ack: Some(Sequence::Long(
+                mptcp::idsn(key).wrapping_add(1 + SSH_BANNER.len() as u64),
+            )),
+            mapping: Some(Mapping {
+                data_sequence_number: Sequence::Long(mptcp::idsn(client_key).wrapping_add(1)),
+                subflow_sequence_number: 1,
+                data_level_length: hello.len() as u16,
+                checksum: None,
+            }),
+            data_fin: false,
         }));
-        let iss = seq_of(&syn_ack);
-        net.send(segment(from, server(80), 5001, iss + 1, ACK, &third, b""));
+        net.send(segment(
+            from,
+            server(22),
+            5001,
+            acked,
+            PSH | ACK,
+            &dss,
+            hello,
+        ));
+        let ack = net.recv().await.expect("an ACK");
+        assert_eq!(ack_of(&ack), 5001 + hello.len() as u32);
+        let data_ack = mptcp::idsn(client_key).wrapping_add(1 + hello.len() as u64);
+        assert_eq!(
+            dss_of(&ack).unwrap().data_ack,
+            Some(Sequence::Long(data_ack))
+        );
+        // Data with no mapping: the connection falls back.
+        let seq = 5001 + hello.len() as u32;
+        net.send(segment(
+            from,
+            server(22),
+            seq,
+            acked,
+            PSH | ACK,
+            &[],
+            b"plain",
+        ));
+        let ack = net.recv().await.expect("an ACK");
+        assert_eq!(ack_of(&ack), seq + 5);
+        assert_eq!(dss_of(&ack), None, "no DSS after the fall back");
+        Ok(())
+    });
+}
+
+/// While an MPTCP connection is open, an MP_JOIN with its token gets a
+/// SYN-ACK with MP_JOIN and the listener's HMAC on the connection's port,
+/// and a RST that says "administratively prohibited" on another. At the
+/// third ACK, the client's HMAC decides, as on Linux: a wrong one gets
+/// that RST, the right one is taken, and the subflow stays open until the
+/// connection is gone. Then a join is refused at its SYN as an unknown
+/// token.
+#[test]
+fn joins_are_answered_taken_and_refused_as_on_linux() {
+    honeypot(Config::default(), |mut net| async move {
+        let from = client(2, 40001);
+        let client_key = 0x1111_2222_3333_4444;
+        let (key, iss) = open_mptcp(&mut net, from, 22, client_key).await;
+        let banner = net.recv().await.expect("the banner");
+        assert_eq!(payload_of(&banner), SSH_BANNER);
+        let acked = iss + 1 + SSH_BANNER.len() as u32;
+        net.send(segment(from, server(22), 5001, acked, ACK, &[], b""));
         net.drain().await;
         assert_eq!(net.honeypot.mptcp_connections(), 1);
 
-        let joiner = client(2, 40002);
+        // A join on another port.
         let join = with_mss(&mptcp_bytes(join_syn(token(key), 99)));
-        net.send(segment(joiner, server(80), 7000, 0, SYN, &join, b""));
-        let join_syn_ack = net.recv().await.expect("a SYN-ACK");
-        assert_eq!(flags(&join_syn_ack), SYN | ACK);
-        assert_eq!(ack_of(&join_syn_ack), 7001);
-        let [
-            MptcpOption::Join(Join::SynAck {
-                backup: false,
-                address_id: 0,
-                hmac,
-                random,
-            }),
-        ] = mptcp_of(&join_syn_ack)[..]
-        else {
-            panic!("one MP_JOIN: {:?}", mptcp_of(&join_syn_ack));
-        };
-        // HMAC-B: keyed with the listener's key then the client's, over
-        // the listener's random number then the client's.
-        assert_eq!(hmac[..], join_hmac(key, client_key, random, 99)[..8]);
-        let join_iss = seq_of(&join_syn_ack);
-        let hmac_a = join_hmac(client_key, key, 99, random);
-        let third = mptcp_bytes(MptcpOption::Join(Join::Ack {
-            hmac: hmac_a[..20].try_into().unwrap(),
-        }));
+        let elsewhere = client(2, 40002);
+        net.send(segment(elsewhere, server(80), 7000, 0, SYN, &join, b""));
+        let refused = net.recv().await.expect("a RST");
+        assert_eq!(flags(&refused) & RST, RST);
+        let prohibited = [MptcpOption::TcpRst {
+            transient: false,
+            reason: reason::ADMINISTRATIVELY_PROHIBITED,
+        }];
+        assert_eq!(mptcp_of(&refused), prohibited);
+
+        // A join on the connection's port, with a wrong HMAC, then with
+        // the right one.
+        let mut taken = None;
+        for (port, right) in [(40003, false), (40004, true)] {
+            let joiner = client(2, port);
+            net.send(segment(joiner, server(22), 7000, 0, SYN, &join, b""));
+            let join_syn_ack = net.recv().await.expect("a SYN-ACK");
+            assert_eq!(flags(&join_syn_ack), SYN | ACK);
+            assert_eq!(ack_of(&join_syn_ack), 7001);
+            let [
+                MptcpOption::Join(Join::SynAck {
+                    backup: false,
+                    address_id: 0,
+                    hmac,
+                    random,
+                }),
+            ] = mptcp_of(&join_syn_ack)[..]
+            else {
+                panic!("one MP_JOIN: {:?}", mptcp_of(&join_syn_ack));
+            };
+            // HMAC-B: keyed with the listener's key then the client's,
+            // over the listener's random number then the client's.
+            assert_eq!(hmac[..], join_hmac(key, client_key, random, 99)[..8]);
+            let join_iss = seq_of(&join_syn_ack);
+            let mut hmac_a: [u8; 20] = join_hmac(client_key, key, 99, random)[..20]
+                .try_into()
+                .unwrap();
+            if !right {
+                hmac_a[0] ^= 1;
+            }
+            let third = mptcp_bytes(MptcpOption::Join(Join::Ack { hmac: hmac_a }));
+            net.send(segment(
+                joiner,
+                server(22),
+                7001,
+                join_iss + 1,
+                ACK,
+                &third,
+                b"",
+            ));
+            if right {
+                net.send(segment(
+                    joiner,
+                    server(22),
+                    7001,
+                    join_iss + 1,
+                    PSH | ACK,
+                    &[],
+                    b"more",
+                ));
+                let answer = net.recv().await.expect("an ACK");
+                assert_eq!(flags(&answer), ACK, "the subflow is open");
+                assert_eq!(ack_of(&answer), 7005);
+                assert!(payload_of(&answer).is_empty(), "nothing from the server");
+                taken = Some(joiner);
+            } else {
+                let refused = net.recv().await.expect("a RST");
+                assert_eq!(flags(&refused), RST, "a RST in answer to the ACK");
+                assert_eq!(seq_of(&refused), join_iss + 1);
+                assert_eq!(mptcp_of(&refused), prohibited);
+            }
+        }
+        net.drain().await;
+        assert_eq!(
+            net.honeypot.mptcp_connections(),
+            1,
+            "a join is no connection"
+        );
+
+        // The client ends the connection with a RST: its token goes, and
+        // the joined subflow closes.
+        net.send(segment(from, server(22), 5001, 0, RST, &[], b""));
+        let joiner = taken.unwrap();
+        let fin = net
+            .drain()
+            .await
+            .into_iter()
+            .find(|p| dst_of(p) == joiner && flags(p) & 0x01 != 0)
+            .expect("a FIN on the joined subflow");
+        let fin_ack = seq_of(&fin) + 1;
         net.send(segment(
             joiner,
-            server(80),
-            7001,
-            join_iss + 1,
-            ACK,
-            &third,
+            server(22),
+            7005,
+            fin_ack,
+            ACK | 0x01,
+            &[],
             b"",
         ));
-        let refused = net.recv().await.expect("a RST");
-        assert_eq!(flags(&refused), RST, "a RST in answer to the ACK");
-        assert_eq!(seq_of(&refused), join_iss + 1);
-        assert_eq!(
-            mptcp_of(&refused),
-            [MptcpOption::TcpRst {
-                transient: false,
-                reason: reason::ADMINISTRATIVELY_PROHIBITED
-            }]
-        );
-        assert_eq!(net.honeypot.mptcp_connections(), 1, "the join took nothing");
-
-        // The client ends the first connection with a RST; its token goes.
-        net.send(segment(from, server(80), 5001, 0, RST, &[], b""));
         net.drain().await;
         assert_eq!(net.honeypot.mptcp_connections(), 0);
-        let joiner = client(2, 40003);
-        net.send(segment(joiner, server(80), 8000, 0, SYN, &join, b""));
+        let joiner = client(2, 40005);
+        net.send(segment(joiner, server(22), 8000, 0, SYN, &join, b""));
         let refused = net.recv().await.expect("a RST");
         assert_eq!(
             mptcp_of(&refused),
@@ -503,7 +661,7 @@ fn mp_capable_gets_a_key_and_joins_are_refused() {
         net.drain().await;
 
         let syns = net.events("syn");
-        assert_eq!(syns.len(), 3);
+        assert_eq!(syns.len(), 5);
         assert_eq!(
             syns[0]["mptcp"][0],
             serde_json::json!({
@@ -514,16 +672,15 @@ fn mp_capable_gets_a_key_and_joins_are_refused() {
         assert_eq!(syns[1]["mptcp"][0]["subtype"], "mp_join_syn");
         assert_eq!(syns[1]["mptcp"][0]["token"], format!("{:08x}", token(key)));
         assert_eq!(syns[1]["mptcp"][0]["token_known"], true);
-        assert_eq!(syns[2]["mptcp"][0]["token_known"], false);
+        assert_eq!(syns[4]["mptcp"][0]["token_known"], false);
         let answers = net.events("answer");
         assert_eq!(answers[0]["mptcp"][0]["sender_key"], format!("{key:016x}"));
-        let rsts: Vec<_> = answers
+        let reasons: Vec<_> = answers
             .iter()
             .filter(|a| a["mptcp"][0]["subtype"] == "mp_tcprst")
+            .map(|a| a["mptcp"][0]["reason"].clone())
             .collect();
-        assert_eq!(rsts.len(), 2);
-        assert_eq!(rsts[0]["mptcp"][0]["reason"], 3);
-        assert_eq!(rsts[1]["mptcp"][0]["reason"], 1);
+        assert_eq!(reasons, [3, 3, 1]);
         // The third ACK's keys are logged as a segment.
         let third = net
             .events("segment")
@@ -535,15 +692,18 @@ fn mp_capable_gets_a_key_and_joins_are_refused() {
             format!("{client_key:016x}")
         );
         assert_eq!(third["mptcp"][0]["receiver_key"], format!("{key:016x}"));
-        // So are the join's SYN-ACK and its third ACK, with their HMACs.
-        assert_eq!(answers[1]["mptcp"][0]["subtype"], "mp_join_syn_ack");
-        assert_eq!(answers[1]["mptcp"][0]["hmac"], hex(&hmac));
-        let join_ack = net
+        // So are the joins' third ACKs, and what came on the subflow.
+        let join_acks = net
             .events("segment")
             .into_iter()
-            .find(|s| s["mptcp"][0]["subtype"] == "mp_join_ack")
-            .expect("the join's third ACK");
-        assert_eq!(join_ack["mptcp"][0]["hmac"], hex(&hmac_a[..20]));
+            .filter(|s| s["mptcp"][0]["subtype"] == "mp_join_ack")
+            .count();
+        assert_eq!(join_acks, 2);
+        assert!(
+            net.events("segment")
+                .iter()
+                .any(|s| s["src"] == client(2, 40004).to_string() && s["payload"] == hex(b"more"))
+        );
         Ok(())
     });
 }
@@ -1076,6 +1236,80 @@ fn a_fragmented_syn_is_logged() {
         assert_eq!(syns.len(), 1, "{:?}", net.log());
         assert_eq!(syns[0]["src"], from.to_string());
         assert_eq!(syns[0]["mptcp"][0]["subtype"], "mp_capable");
+        Ok(())
+    });
+}
+
+/// An IPv4 fragment of `whole`, a packet with a 20-byte header: `data`
+/// at `offset`, with identification `id`.
+fn fragment(whole: &Packet, id: u16, offset: usize, more: bool, data: &[u8]) -> Packet {
+    let mut p = whole.0[..20].to_vec();
+    p.extend_from_slice(data);
+    let total = p.len() as u16;
+    p[2..4].copy_from_slice(&total.to_be_bytes());
+    p[4..6].copy_from_slice(&id.to_be_bytes());
+    let field = (offset / 8) as u16 | if more { 0x2000 } else { 0 };
+    p[6..8].copy_from_slice(&field.to_be_bytes());
+    p[10..12].copy_from_slice(&[0, 0]);
+    let sum = fictionet::stdlib::network::ip::checksum(&p[..20]);
+    p[10..12].copy_from_slice(&sum.to_be_bytes());
+    Packet(p)
+}
+
+/// More than 4 MiB of fragments for an address the internet does not
+/// reach cannot push a SYN's first fragment out: those fragments are never
+/// put together, so the SYN the world answers is in the log.
+#[test]
+fn fragments_for_elsewhere_cannot_hide_a_syn() {
+    honeypot(Config::default(), |mut net| async move {
+        let from = client(8, 47000);
+        let options = with_mss(&mptcp_bytes(linux_capable()));
+        let syn = segment(from, server(22), 1000, 0, SYN, &options, b"");
+        let tcp = syn.0[20..].to_vec();
+        net.send(fragment(&syn, 77, 0, true, &tcp[..8]));
+        let junk = segment(
+            client(66, 1),
+            "198.51.100.1:9".parse().unwrap(),
+            1,
+            0,
+            ACK,
+            &[],
+            &[0; 1400],
+        );
+        for id in 0..3200 {
+            net.send(fragment(&junk, id, 0, true, &junk.0[20..1420]));
+        }
+        net.send(fragment(&syn, 77, 8, false, &tcp[8..]));
+        let syn_acks = net
+            .drain()
+            .await
+            .into_iter()
+            .filter(|p| dst_of(p) == from && flags(p) == SYN | ACK)
+            .count();
+        assert_eq!(syn_acks, 1, "the world answers the SYN");
+        let syns = net.events("syn");
+        assert_eq!(syns.len(), 1, "and the log has it");
+        assert_eq!(syns[0]["src"], from.to_string());
+        Ok(())
+    });
+}
+
+/// A SYN whose last fragment comes 40 seconds after its first is neither
+/// answered nor logged: the first waited 30 seconds at most, as on Linux
+/// (ipfrag_time), and the log reads what the world takes.
+#[test]
+fn fragments_expire_for_the_log_as_for_the_world() {
+    honeypot(Config::default(), |mut net| async move {
+        let from = client(8, 47000);
+        let options = with_mss(&mptcp_bytes(linux_capable()));
+        let syn = segment(from, server(22), 1000, 0, SYN, &options, b"");
+        let tcp = syn.0[20..].to_vec();
+        net.send(fragment(&syn, 77, 0, true, &tcp[..8]));
+        net.fcx.sleep(Duration::from_secs(40)).await?;
+        net.send(fragment(&syn, 77, 8, false, &tcp[8..]));
+        let answers = net.drain().await;
+        assert!(answers.is_empty(), "{answers:?}");
+        assert!(net.events("syn").is_empty(), "{:?}", net.log());
         Ok(())
     });
 }

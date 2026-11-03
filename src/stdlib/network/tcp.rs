@@ -94,8 +94,8 @@ const TIMEOUT: Duration = Duration::from_secs(120);
 /// after the first, and waits 32 seconds after the last.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(63);
 /// A connection whose handle was dropped is given up when the peer sends
-/// nothing for this long, for example in FIN-WAIT-2 with a peer that never
-/// closes its side.
+/// nothing for this long, and forgotten this long after it enters
+/// FIN-WAIT-2, as when the peer never closes its side.
 const ORPHAN_TIMEOUT: Duration = Duration::from_secs(60);
 /// Idle connections send a keepalive this often, so a peer that is gone is
 /// noticed within `TIMEOUT`.
@@ -277,6 +277,14 @@ pub struct Handshake {
     /// The options of the ACK that completed the handshake, as `syn` reads
     /// them. Empty for a connection this side opened.
     pub ack: Arc<[TcpOption]>,
+    /// How many bytes of data that ACK carried.
+    pub ack_payload: usize,
+    /// The peer's initial sequence number, its SYN's. 0 for a connection
+    /// this side opened.
+    pub irs: u32,
+    /// This side's initial sequence number, its SYN-ACK's. 0 for a
+    /// connection this side opened.
+    pub iss: u32,
 }
 
 /// How a listener answers one connection attempt's SYN: what
@@ -303,18 +311,27 @@ pub enum AckAnswer {
     /// refuses a subflow at its third ACK with MP_TCPRST (RFC 8684 sections
     /// 3.2 and 3.6). The connection never reaches `accept`.
     Refuse(Vec<TcpOption>),
+    /// Drop the ACK and forget the connection without sending anything,
+    /// as Linux drops an ACK that returns a SYN cookie when it cannot set
+    /// up what the ACK asks for. The connection never reaches `accept`.
+    Drop,
 }
 
 /// A listener's say in its handshakes, set with [`Listener::answer`]: the
-/// options its SYN-ACKs carry, and which connections it refuses. A server
-/// for MPTCP (RFC 8684) answers MP_CAPABLE and MP_JOIN here.
+/// options its SYN-ACKs carry, which connections it refuses, and the
+/// options the connections it takes carry from then on. A server for
+/// MPTCP (RFC 8684) answers MP_CAPABLE and MP_JOIN here.
 ///
-/// Both run inside the endpoint with its lock held, so they must not use
-/// the endpoint or its connections. Any function from a SYN's options to a
+/// Each runs inside the endpoint with its lock held, so none may use the
+/// endpoint or its connections. Any function from a SYN's options to a
 /// [`SynAnswer`] is an `Answer` that takes every connection at its ACK.
 pub trait Answer: Send {
-    /// How to answer a SYN with these options, once per attempt: a copy
-    /// of the SYN does not ask again.
+    /// How to answer a SYN with these options. A socket keeps the attempt
+    /// while the backlog has room, and a copy of the SYN does not ask
+    /// again. Past the backlog the SYN gets a SYN cookie and nothing is
+    /// kept (see [`Options::backlog`]), so each copy of the SYN asks again,
+    /// and an answer that draws something new, such as a key, gives each
+    /// copy a different one.
     fn syn(&self, syn: &[TcpOption]) -> SynAnswer;
 
     /// Whether to take the connection whose handshake this is, when the
@@ -322,6 +339,103 @@ pub trait Answer: Send {
     fn ack(&self, handshake: &Handshake) -> AckAnswer {
         let _ = handshake;
         AckAnswer::Accept
+    }
+
+    /// What adds options to the segments of a connection this took, from
+    /// the ACK that completed its handshake on, such as an MPTCP host's
+    /// DSS (RFC 8684 section 3.3). The default adds none.
+    fn segments(&self, handshake: &Handshake) -> Option<Box<dyn Segments>> {
+        let _ = handshake;
+        None
+    }
+}
+
+/// A segment a connection sends, as [`Segments::sent`] sees it.
+#[derive(Clone, Copy, Debug)]
+pub struct Sent<'a> {
+    /// Its sequence number.
+    pub seq: u32,
+    /// Its data.
+    pub payload: &'a [u8],
+    /// Whether it carries a FIN.
+    pub fin: bool,
+    /// Its acknowledgment number.
+    pub ack: Option<u32>,
+}
+
+/// A segment a connection took, in its receive window, as
+/// [`Segments::received`] sees it.
+#[derive(Clone, Copy, Debug)]
+pub struct Received<'a> {
+    /// Its sequence number.
+    pub seq: u32,
+    /// Its data, all of it, as sent.
+    pub payload: &'a [u8],
+    /// Whether it carries a FIN.
+    pub fin: bool,
+    /// Its options, in order, up to the first malformed one.
+    pub options: &'a [TcpOption],
+}
+
+/// Options a connection carries on every segment after its handshake,
+/// beside the endpoint's own, from [`Answer::segments`]: what a protocol
+/// over TCP, such as Multipath TCP, puts on each segment.
+pub trait Segments: Send {
+    /// The most option bytes [`sent`](Segments::sent) gives one segment,
+    /// at most [`SEGMENT_OPTIONS_ROOM`]. Each segment with data leaves this
+    /// much room, so it carries that much less data.
+    fn room(&self) -> usize;
+
+    /// The options for `segment`, which is about to be sent: any segment
+    /// but a RST, retransmissions included. Options that take more than
+    /// [`room`](Segments::room) bytes, or would not read back as written,
+    /// are not sent.
+    fn sent(&mut self, segment: &Sent<'_>) -> Vec<TcpOption>;
+
+    /// Sees a segment the connection took, before its data can be read.
+    fn received(&mut self, segment: &Received<'_>);
+}
+
+/// The option bytes a [`Segments`] can add to one segment: what the 40
+/// bytes of option space leave beside timestamps.
+pub const SEGMENT_OPTIONS_ROOM: usize = stcp::SEGMENT_OPTIONS_ROOM;
+
+/// A [`Segments`] as smoltcp asks for it.
+struct SegmentsOnWire(Box<dyn Segments>);
+
+impl stcp::SegmentOptions for SegmentsOnWire {
+    fn room(&self) -> usize {
+        self.0.room()
+    }
+
+    fn sent(&mut self, segment: &stcp::Outgoing<'_>, out: &mut Vec<u8>) {
+        let options = self.0.sent(&Sent {
+            seq: segment.seq,
+            payload: segment.payload,
+            fin: segment.fin,
+            ack: segment.ack,
+        });
+        let wire: Option<Vec<_>> = options.iter().map(TcpOption::to_wire).collect();
+        let room = self.0.room().min(SEGMENT_OPTIONS_ROOM);
+        if let Some(bytes) = wire.and_then(|w| stcp::encode_options_within(&w, room).ok()) {
+            out.extend_from_slice(&bytes);
+        }
+    }
+
+    fn received(&mut self, segment: &stcp::Incoming<'_>) {
+        let mut options = Vec::new();
+        for option in smoltcp::wire::TcpOptions::new(segment.options) {
+            match option {
+                Ok(option) => options.extend(TcpOption::from_wire(option)),
+                Err(_) => break,
+            }
+        }
+        self.0.received(&Received {
+            seq: segment.seq,
+            payload: segment.payload,
+            fin: segment.fin,
+            options: &options,
+        });
     }
 }
 
@@ -343,6 +457,8 @@ struct Arrived {
     ack: Option<u32>,
     /// SEG.LEN: its payload bytes, plus one each for SYN and FIN.
     len: u32,
+    /// Its payload bytes.
+    payload: usize,
 }
 
 impl Arrived {
@@ -356,6 +472,7 @@ impl Arrived {
             seq: u32::from_be_bytes([t[4], t[5], t[6], t[7]]),
             ack: (flags & 0x10 != 0).then(|| u32::from_be_bytes([t[8], t[9], t[10], t[11]])),
             len: payload as u32 + u32::from(flags & 0x02 != 0) + u32::from(flags & 0x01 != 0),
+            payload,
         }
     }
 
@@ -406,19 +523,49 @@ fn segment(
 /// largest at most the peer's is kept. IPv4, then IPv6.
 const COOKIE_MSS: [[u16; 4]; 2] = [[536, 1300, 1440, 1460], [1220, 1420, 1440, 8940]];
 
-/// The key of an endpoint's SYN cookies.
+/// An HMAC-SHA256 key of 32 bytes from the run's random stream.
+fn secret(fcx: &Cx) -> ring::hmac::Key {
+    let mut key = [0; 32];
+    fcx.fill_random(&mut key);
+    ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &key)
+}
+
+/// Appends the address and port of each of `ends`.
+fn put_ends(message: &mut Vec<u8>, ends: [SocketAddr; 2]) {
+    for end in ends {
+        match end.ip() {
+            IpAddr::V4(a) => message.extend_from_slice(&a.octets()),
+            IpAddr::V6(a) => message.extend_from_slice(&a.octets()),
+        }
+        message.extend_from_slice(&end.port().to_be_bytes());
+    }
+}
+
+/// The key of an endpoint's initial sequence numbers.
+struct Sequences(ring::hmac::Key);
+
+impl Sequences {
+    /// The initial sequence number of a connection from `local` to
+    /// `remote` that starts at `now`, as RFC 6528 section 3 has it: the
+    /// first 32 bits of an HMAC-SHA256 of the endpoints, plus a clock that
+    /// ticks every 4 microseconds. A peer learns nothing from its own
+    /// connections' numbers about those of another address or port, and
+    /// a new connection on the same endpoints starts past the old one.
+    fn initial(&self, local: SocketAddr, remote: SocketAddr, now: smoltcp::time::Instant) -> u32 {
+        let mut message = Vec::with_capacity(36);
+        put_ends(&mut message, [local, remote]);
+        let tag = ring::hmac::sign(&self.0, &message);
+        let t = tag.as_ref();
+        let clock = (now.total_micros().max(0) as u64 / 4) as u32;
+        u32::from_be_bytes([t[0], t[1], t[2], t[3]]).wrapping_add(clock)
+    }
+}
+
+/// The key of an endpoint's SYN cookies, drawn apart from the key of its
+/// initial sequence numbers.
 struct Cookies(ring::hmac::Key);
 
 impl Cookies {
-    /// Keyed by a hash of `seed`, the endpoint's random seed, so a world's
-    /// seed gives the same draws with SYN cookies as without.
-    fn new(seed: u64) -> Cookies {
-        let mut material = b"syn cookies ".to_vec();
-        material.extend_from_slice(&seed.to_be_bytes());
-        let key = ring::digest::digest(&ring::digest::SHA256, &material);
-        Cookies(ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key.as_ref()))
-    }
-
     /// A cookie for a SYN from `remote` to `local` with sequence number
     /// `irs`, made in `minute` and keeping the peer's MSS as index `mss`
     /// of [`COOKIE_MSS`] (RFC 4987 section 3.6). Its low 2 bits hold `mss`,
@@ -426,13 +573,7 @@ impl Cookies {
     /// of all of these, so a peer cannot make one.
     fn make(&self, local: SocketAddr, remote: SocketAddr, irs: u32, minute: u64, mss: u8) -> u32 {
         let mut message = Vec::with_capacity(48);
-        for end in [local, remote] {
-            match end.ip() {
-                IpAddr::V4(a) => message.extend_from_slice(&a.octets()),
-                IpAddr::V6(a) => message.extend_from_slice(&a.octets()),
-            }
-            message.extend_from_slice(&end.port().to_be_bytes());
-        }
+        put_ends(&mut message, [local, remote]);
         message.extend_from_slice(&irs.to_be_bytes());
         message.extend_from_slice(&minute.to_be_bytes());
         message.push(mss);
@@ -503,7 +644,9 @@ fn cookie_minute(now: smoltcp::time::Instant) -> u64 {
 /// a SYN, data that is not acknowledged, or a keepalive (sent after 45
 /// seconds of quiet). A connection whose handle was dropped finishes
 /// closing in the background, and is given up when the peer has sent
-/// nothing for one minute, as when it never closes its side. ICMPv4
+/// nothing for one minute. Once the peer has acknowledged its FIN, it is
+/// forgotten one minute later, whatever the peer sends, as Linux forgets
+/// one in FIN-WAIT-2 (`tcp_fin_timeout`). ICMPv4
 /// destination-unreachable messages can fail a pending connect; see
 /// [`Endpoint::connect`]. Other ICMP messages are dropped. Established
 /// connections ignore ICMP, and there is no path MTU discovery.
@@ -659,9 +802,11 @@ pub fn prepare_endpoint(
     Prepared<impl Future<Output = fictionet::Result> + Send + 'static>,
 ) {
     let mut dev = Dev::default();
-    let random_seed = fcx.random_u64();
+    let sequences = Sequences(secret(fcx));
     let config = Config {
-        random_seed,
+        initial_seq: Box::new(move |local, remote, now| {
+            sequences.initial(local.into(), remote.into(), now)
+        }),
         ip_addr: addr.into(),
     };
     let iface = Iface::new(config, &mut dev, smol_now(fcx));
@@ -689,7 +834,7 @@ pub fn prepare_endpoint(
             driver: None,
             buffer: options.buffer,
             backlog: options.backlog,
-            cookies: Cookies::new(random_seed),
+            cookies: Cookies(secret(fcx)),
         }),
     });
     let driver = shared.clone();
@@ -880,7 +1025,8 @@ struct Conn {
     unreachable: Option<u8>,
     /// What the handshake carried, for a connection a listener took.
     handshake: Handshake,
-    /// When a handshake still waiting for its last ACK is dropped.
+    /// When a handshake still waiting for its last ACK is dropped, or when
+    /// an orphan in FIN-WAIT-2 is forgotten.
     gives_up: Option<smoltcp::time::Instant>,
     /// Kept until retirement or socket removal, after handle drop too: see
     /// [`TcpConnection::hold_until_gone`].
@@ -1212,9 +1358,9 @@ impl State {
             self.conns.get_mut(&h).unwrap().shut = true;
             self.close_if_drained(h);
         }
-        // A FIN-WAIT-2 orphan should not live on keepalives, and a peer
-        // that never closes its side keeps it only for a minute, as Linux
-        // does (tcp_fin_timeout).
+        // An orphan should not live on keepalives. A peer that never
+        // closes its side keeps it only for a minute, as Linux does
+        // (tcp_fin_timeout): see `expire_orphans`.
         let s = self.sock(h);
         s.set_keep_alive(None);
         s.set_timeout(Some(ORPHAN_TIMEOUT.into()));
@@ -1236,7 +1382,8 @@ impl State {
         }
     }
 
-    /// Records the outgoing SYN sequence number for ICMP checks.
+    /// Records the sequence number of an outgoing SYN, for ICMP checks, or
+    /// of a SYN-ACK, for the connection's [`Handshake`].
     fn sent(&mut self, packet: &[u8]) {
         let Some(ip) = Header::parse_whole(packet) else {
             return;
@@ -1249,9 +1396,13 @@ impl State {
         let remote = SocketAddr::new(ip.dst, u16::from_be_bytes([t[2], t[3]]));
         if let Some(h) = self.by_tuple.get(&(local, remote)) {
             let c = self.conns.get_mut(h).unwrap();
-            if c.side == Side::Client && t[13] & 0x12 == 0x02 {
-                c.iss
-                    .get_or_insert(u32::from_be_bytes([t[4], t[5], t[6], t[7]]));
+            let seq = u32::from_be_bytes([t[4], t[5], t[6], t[7]]);
+            match (c.side, t[13] & 0x12) {
+                (Side::Client, 0x02) => {
+                    c.iss.get_or_insert(seq);
+                }
+                (Side::Server, 0x12) => c.handshake.iss = seq,
+                _ => {}
             }
         }
     }
@@ -1457,6 +1608,7 @@ impl State {
                 let mut conn = Conn::new(local, remote, Side::Server);
                 conn.handshake.syn = Some(syn);
                 conn.handshake.syn_ack = Some(added.into());
+                conn.handshake.irs = arrived.seq;
                 conn.gives_up = Some(now + HANDSHAKE_TIMEOUT.into());
                 self.conns.insert(h, conn);
                 self.by_tuple.insert((local, remote), h);
@@ -1560,6 +1712,7 @@ impl State {
         *l.per_peer.entry(src.ip()).or_default() += 1;
         let mut conn = Conn::new(dst, src, Side::Server);
         conn.gives_up = Some(now + HANDSHAKE_TIMEOUT.into());
+        (conn.handshake.irs, conn.handshake.iss) = (irs, iss);
         self.conns.insert(h, conn);
         self.by_tuple.insert((dst, src), h);
         true
@@ -1573,26 +1726,37 @@ impl State {
     fn completed(&mut self, h: Id, arrived: Arrived, ack: Arc<[TcpOption]>) {
         let c = self.conns.get_mut(&h).expect("a connection");
         c.handshake.ack = ack;
+        c.handshake.ack_payload = arrived.payload;
         c.gives_up = None;
         let port = arrived.to.port();
         let l = self.listeners.get_mut(&port).expect("a listener");
-        let refusal = match l.answer.as_ref().map(|a| a.ack(&self.conns[&h].handshake)) {
-            None | Some(AckAnswer::Accept) => None,
-            Some(AckAnswer::Refuse(refusal)) => Some(refusal),
-        };
+        let handshake = &self.conns[&h].handshake;
+        let answer = l
+            .answer
+            .as_ref()
+            .map_or(AckAnswer::Accept, |a| a.ack(handshake));
         if let Some(i) = l.embryonic.iter().position(|&e| e == h) {
             l.embryonic.swap_remove(i);
         }
-        let Some(refusal) = refusal else {
-            l.ready.push_back(h);
-            if let Some(w) = l.waker.take() {
-                w.wake();
+        match answer {
+            AckAnswer::Accept => {
+                if let Some(segments) = l.answer.as_ref().and_then(|a| a.segments(handshake)) {
+                    let s = self.sockets.get_mut(self.handles[&h]);
+                    s.set_segment_options(Box::new(SegmentsOnWire(segments)));
+                }
+                l.ready.push_back(h);
+                if let Some(w) = l.waker.take() {
+                    w.wake();
+                }
+                return;
             }
-            return;
-        };
-        // Options that cannot be sent leave a plain RST.
-        let options = encode(&refusal).unwrap_or_default();
-        self.dev.tx.push(arrived.reset(&options));
+            AckAnswer::Refuse(refusal) => {
+                // Options that cannot be sent leave a plain RST.
+                let options = encode(&refusal).unwrap_or_default();
+                self.dev.tx.push(arrived.reset(&options));
+            }
+            AckAnswer::Drop => {}
+        }
         if let Some(c) = self.conns.remove(&h) {
             self.by_tuple.remove(&(c.local, c.remote));
             l.left(c.remote.ip());
@@ -1627,12 +1791,42 @@ impl State {
         }
     }
 
+    /// Forgets each orphan [`ORPHAN_TIMEOUT`] after it entered FIN-WAIT-2,
+    /// whatever its peer sends meanwhile, without a RST, as Linux forgets
+    /// one `tcp_fin_timeout` after (tcp_time_wait with TCP_FIN_WAIT2).
+    /// Later segments from the peer get a RST, as there is no connection.
+    /// Otherwise a peer that acknowledges the FIN and then sends an ACK
+    /// now and then would keep the connection forever.
+    fn expire_orphans(&mut self, now: smoltcp::time::Instant) {
+        let mut i = 0;
+        while i < self.orphans.len() {
+            let h = self.orphans[i];
+            let fin_wait_2 = self.get(h).state() == TcpState::FinWait2;
+            let Some(c) = self.conns.get_mut(&h) else {
+                i += 1;
+                continue;
+            };
+            match (fin_wait_2, c.gives_up) {
+                (true, Some(at)) if at <= now => {
+                    self.orphans.swap_remove(i);
+                    self.remove_conn(h);
+                    continue;
+                }
+                (true, None) => c.gives_up = Some(now + ORPHAN_TIMEOUT.into()),
+                (true, Some(_)) => {}
+                (false, _) => c.gives_up = None,
+            }
+            i += 1;
+        }
+    }
+
     /// When the next handshake waiting for its last ACK is due to be
-    /// dropped.
+    /// dropped, or the next orphan in FIN-WAIT-2 forgotten.
     fn next_expiry(&self) -> Option<smoltcp::time::Instant> {
         self.listeners
             .values()
             .flat_map(|l| &l.embryonic)
+            .chain(&self.orphans)
             .filter_map(|h| self.conns.get(h)?.gives_up)
             .min()
     }
@@ -1803,6 +1997,7 @@ async fn drive(fcx: &Cx, shared: &Shared, mut inner: impl Interface) {
             while st.iface.poll_egress(now, &mut st.dev, &mut st.sockets)
                 != smoltcp::iface::PollResult::None
             {}
+            st.expire_orphans(now);
             st.housekeeping();
             exhausted = st.dev.tx.len() >= EGRESS_PACKETS || !batch.is_empty();
             std::mem::swap(&mut out, &mut st.dev.tx);
@@ -2035,9 +2230,11 @@ impl Listener {
     /// cookie. [`SynAnswer::Refuse`] resets the attempt.
     ///
     /// [`Answer::ack`] sees the [`Handshake`] when the ACK that completes it
-    /// arrives, and [`AckAnswer::Refuse`] resets the connection then. The
-    /// accepted connection keeps its handshake
-    /// ([`TcpConnection::handshake`]).
+    /// arrives. [`AckAnswer::Refuse`] resets the connection then, and
+    /// [`AckAnswer::Drop`] forgets it without a word. An accepted
+    /// connection keeps its handshake ([`TcpConnection::handshake`]), and
+    /// from then on carries the options of [`Answer::segments`] on each
+    /// segment but a RST.
     ///
     /// A refusal's RST answers the segment refused, as RFC 9293 section
     /// 3.10.7.1 forms a reset, with window 0 and the refusal's options as
@@ -2866,7 +3063,19 @@ mod tests {
 
     /// A TCP segment from `src` to `dst` with no options.
     fn segment(src: SocketAddr, dst: SocketAddr, seq: u32, ack: u32, flags: u8) -> Packet {
+        data_segment(src, dst, seq, ack, flags, &[])
+    }
+
+    fn data_segment(
+        src: SocketAddr,
+        dst: SocketAddr,
+        seq: u32,
+        ack: u32,
+        flags: u8,
+        payload: &[u8],
+    ) -> Packet {
         let mut t = vec![0u8; 20];
+        t.extend_from_slice(payload);
         t[0..2].copy_from_slice(&src.port().to_be_bytes());
         t[2..4].copy_from_slice(&dst.port().to_be_bytes());
         t[4..8].copy_from_slice(&seq.to_be_bytes());
@@ -2900,10 +3109,15 @@ mod tests {
             let local: SocketAddr = "10.0.0.1:49152".parse().unwrap();
             let peer: SocketAddr = "10.0.0.2:80".parse().unwrap();
             let ep = endpoint(&fcx, side, local.ip());
-            let now = smol_now(&fcx);
             let mut st = ep.shared.state.lock();
             let mut previous = None;
-            for options in [false, true] {
+            for (attempt, options) in [false, true].into_iter().enumerate() {
+                // The second attempt comes a millisecond later. Its initial
+                // sequence number then differs from the first's, which on
+                // the same endpoints at the same instant it would not
+                // (RFC 6528).
+                let now = smol_now(&fcx) + smoltcp::time::Duration::from_millis(attempt as u64);
+                st.iface.poll_maintenance(now);
                 let mut socket = new_socket(MIN_BUFFER);
                 socket.0.connect(st.iface.context(), peer, local).unwrap();
                 let h = st.add_socket(socket);
@@ -4162,6 +4376,94 @@ mod tests {
             Err::<(), fictionet::Error>(fictionet::Error::msg("done"))
         }));
         assert_eq!(result.unwrap_err().to_string(), "done");
+    }
+
+    /// A dropped connection whose peer acknowledged its FIN is forgotten a
+    /// minute later, though the peer keeps sending ACKs: nothing the peer
+    /// sends keeps it in FIN-WAIT-2.
+    #[test]
+    fn an_orphan_in_fin_wait_2_goes_a_minute_after_whatever_the_peer_sends() {
+        let result = block_on(lab(Seed::from_u64(1), |fcx| async move {
+            let (mut raw, side) = pair();
+            let server = endpoint(&fcx, side, "10.0.0.1".parse().unwrap());
+            let mut listener = server.listen(80)?;
+            let to: SocketAddr = "10.0.0.1:80".parse().unwrap();
+            let peer: SocketAddr = "10.0.0.2:3000".parse().unwrap();
+            raw.send(segment(peer, to, 7, 0, 0x02));
+            let isn = syn_ack_isn(&mut raw, &fcx, 3000).await;
+            raw.send(segment(peer, to, 8, isn.wrapping_add(1), 0x10));
+            let conn = listener.accept(&fcx).await?;
+            drop(conn);
+            loop {
+                let p = raw.recv(&fcx).await?;
+                let t = Header::parse_whole(&p.0).unwrap().payload(&p.0).to_vec();
+                if t[13] & 0x01 != 0 {
+                    break;
+                }
+            }
+            let acked = isn.wrapping_add(2);
+            raw.send(segment(peer, to, 8, acked, 0x10));
+            fcx.sleep(Duration::from_millis(10)).await?;
+            let open = |server: &Endpoint| {
+                let st = server.shared.state.lock();
+                st.conns.values().any(|c| c.remote == peer)
+            };
+            assert!(open(&server), "FIN-WAIT-2 for now");
+            // A bare ACK every 50 seconds, for two and a half minutes.
+            for _ in 0..3 {
+                fcx.sleep(Duration::from_secs(50)).await?;
+                raw.send(segment(peer, to, 8, acked, 0x10));
+            }
+            fcx.sleep(Duration::from_millis(10)).await?;
+            assert!(!open(&server), "forgotten a minute after FIN-WAIT-2");
+            // Data now gets a RST: there is no connection.
+            raw.send(data_segment(peer, to, 8, acked, 0x18, b"x"));
+            let p = raw.recv(&fcx).await?;
+            let t = Header::parse_whole(&p.0).unwrap().payload(&p.0).to_vec();
+            assert_eq!(t[13] & 0x04, 0x04, "a RST");
+            Err::<(), fictionet::Error>(fictionet::Error::msg("done"))
+        }));
+        assert_eq!(result.unwrap_err().to_string(), "done");
+    }
+
+    /// The SYN-ACK a peer gets for one connection does not depend on what
+    /// other connections were opened before it, so the numbers a peer sees
+    /// on its own connections tell it nothing about another's. It depends
+    /// on the endpoints, the clock and the endpoint's secret.
+    #[test]
+    fn initial_sequence_numbers_tell_nothing_of_other_connections() {
+        let to: SocketAddr = "10.0.0.1:80".parse().unwrap();
+        let isn_of = |seed: u64, before: u16, at_secs: u64, peer: SocketAddr| {
+            let seen = Arc::new(Mutex::new(None));
+            let out = seen.clone();
+            let result = block_on(lab(Seed::from_u64(seed), move |fcx| async move {
+                let (mut raw, side) = pair();
+                let server = endpoint(&fcx, side, to.ip());
+                let _listener = server.listen(80)?;
+                for port in 0..before {
+                    let other = SocketAddr::new(peer.ip(), 40_000 + port);
+                    raw.send(segment(other, to, 7, 0, 0x02));
+                    syn_ack_isn(&mut raw, &fcx, other.port()).await;
+                }
+                fcx.sleep_until(Instant::from_since_start(Duration::from_secs(at_secs)))
+                    .await?;
+                raw.send(segment(peer, to, 7, 0, 0x02));
+                *seen.lock() = Some(syn_ack_isn(&mut raw, &fcx, peer.port()).await);
+                Err::<(), fictionet::Error>(fictionet::Error::msg("done"))
+            }));
+            assert_eq!(result.unwrap_err().to_string(), "done");
+            out.lock().expect("a SYN-ACK")
+        };
+        let peer: SocketAddr = "10.0.0.2:3000".parse().unwrap();
+        let alone = isn_of(1, 0, 5, peer);
+        assert_eq!(isn_of(1, 3, 5, peer), alone, "others' SYNs change nothing");
+        // The clock adds one every 4 microseconds.
+        assert_eq!(isn_of(1, 0, 6, peer), alone.wrapping_add(250_000));
+        // Another address, port or secret gets an unrelated number.
+        let other = "10.0.0.3:3000".parse().unwrap();
+        assert_ne!(isn_of(1, 0, 5, other), alone);
+        assert_ne!(isn_of(1, 0, 5, "10.0.0.2:3001".parse().unwrap()), alone);
+        assert_ne!(isn_of(2, 0, 5, peer), alone);
     }
 
     #[test]

@@ -60,7 +60,7 @@ pub struct Arrival {
     /// ([`tcp::GoneWatch::hold_until_gone`]) or to reset it.
     pub socket: tcp::GoneWatch,
     /// The budget of the sandbox it came from. `None` if it came from no
-    /// attached sandbox, such as a trusted one ([`Net::route`]).
+    /// attached sandbox, such as a route ([`Net::route`]).
     pub budget: Option<Budget>,
     /// [`Limits::handshake`]: how long a client has to send its first
     /// bytes.

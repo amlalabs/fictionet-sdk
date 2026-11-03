@@ -86,10 +86,12 @@ impl Display for RecvError {
 
 impl core::error::Error for RecvError {}
 
-/// Error returned by [`Socket::set_syn_options`] and [`encode_options`]
+/// Error returned by [`Socket::set_syn_options`], [`encode_options`] and
+/// [`encode_options_within`].
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum SynOptionsError {
-    /// They take more than [`SYN_OPTIONS_ROOM`] bytes.
+    /// They take more bytes than there is room for: [`SYN_OPTIONS_ROOM`]
+    /// for a SYN.
     TooLong,
     /// One would not read back as itself: End of Option List, an unknown
     /// kind 0 or 1, or the bytes of a known option written as unknown.
@@ -111,8 +113,17 @@ impl core::error::Error for SynOptionsError {}
 /// [`SYN_OPTIONS_ROOM`] and read back as themselves: whole options, with
 /// no End of Option List and no padding.
 pub fn encode_options(options: &[TcpOption]) -> Result<Vec<u8>, SynOptionsError> {
+    encode_options_within(options, SYN_OPTIONS_ROOM)
+}
+
+/// Encodes options as [`encode_options`] does, checking that they fit in
+/// `room` bytes, such as [`SEGMENT_OPTIONS_ROOM`].
+pub fn encode_options_within(
+    options: &[TcpOption],
+    room: usize,
+) -> Result<Vec<u8>, SynOptionsError> {
     let len: usize = options.iter().map(TcpOption::buffer_len).sum();
-    if len > SYN_OPTIONS_ROOM {
+    if len > room {
         return Err(SynOptionsError::TooLong);
     }
     let mut encoded = vec![0; len];
@@ -534,6 +545,12 @@ pub struct Socket<'a> {
     /// [`Socket::set_syn_options`].
     syn_options: Vec<u8>,
 
+    /// What adds options to this connection's other segments: see
+    /// [`Socket::set_segment_options`].
+    segment_options: Option<SegmentOptionsBox>,
+    /// The options it gave the segment being sent.
+    segment_extra: Vec<u8>,
+
     rx_waker: WakerRegistration,
 
     tx_waker: WakerRegistration,
@@ -546,9 +563,75 @@ const DEFAULT_MSS: usize = 536;
 /// or no payload once the TCP options length is subtracted from the effective MSS,
 /// stalling the connection in an endless stream of empty segments.
 ///
-/// Must exceed the maximum possible length of the TCP options (currently 12, for
-/// timestamps) so that every segment carries some payload.
+/// Must exceed the maximum possible length of the TCP options (12 for
+/// timestamps, plus at most [`SEGMENT_OPTIONS_ROOM`] from
+/// [`SegmentOptions`]) so that every segment carries some payload.
 const MIN_REMOTE_MSS: usize = 48;
+
+/// The most option bytes a [`SegmentOptions`] may add to one segment: what
+/// the 40 bytes of option space leave beside timestamps (10 bytes, padded
+/// to 12).
+pub const SEGMENT_OPTIONS_ROOM: usize = TCP_OPTIONS_MAX_LEN - 12;
+
+/// A segment a socket sends once its handshake is done, as
+/// [`SegmentOptions::sent`] sees it.
+#[derive(Debug, Clone, Copy)]
+pub struct Outgoing<'a> {
+    /// Its sequence number.
+    pub seq: u32,
+    /// Its data. A keep-alive's one garbage byte is not shown.
+    pub payload: &'a [u8],
+    /// Whether it carries a FIN.
+    pub fin: bool,
+    /// Its acknowledgment number.
+    pub ack: Option<u32>,
+}
+
+/// A segment a socket took once its handshake was done: one in the receive
+/// window, as [`SegmentOptions::received`] sees it.
+#[derive(Debug, Clone, Copy)]
+pub struct Incoming<'a> {
+    /// Its sequence number.
+    pub seq: u32,
+    /// Its data, all of it, as sent.
+    pub payload: &'a [u8],
+    /// Whether it carries a FIN.
+    pub fin: bool,
+    /// Its options, as they are on the wire.
+    pub options: &'a [u8],
+}
+
+/// Options a connection carries on every segment after its handshake,
+/// beside the socket's own, such as the DSS option of a Multipath TCP
+/// connection (RFC 8684 section 3.3). Set with
+/// [`Socket::set_segment_options`].
+pub trait SegmentOptions: Send {
+    /// The most bytes of options [`sent`](SegmentOptions::sent) writes for
+    /// one segment, at most [`SEGMENT_OPTIONS_ROOM`]. Every segment with
+    /// data leaves this much room.
+    fn room(&self) -> usize;
+
+    /// Writes the options for `segment`, which is about to be sent, into
+    /// `out`, which is empty: whole options with no End of Option List,
+    /// at most [`room`](SegmentOptions::room) bytes. More than that are
+    /// not sent. Called for every segment but a RST, retransmissions
+    /// included.
+    fn sent(&mut self, segment: &Outgoing<'_>, out: &mut Vec<u8>);
+
+    /// Sees a segment the socket took, before its data can be read.
+    fn received(&mut self, segment: &Incoming<'_>);
+}
+
+/// A boxed [`SegmentOptions`], so that the socket can print itself.
+struct SegmentOptionsBox(Box<dyn SegmentOptions>);
+
+impl fmt::Debug for SegmentOptionsBox {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("SegmentOptions")
+            .field("room", &self.0.room())
+            .finish()
+    }
+}
 
 impl<'a> Socket<'a> {
     /// Create a socket using the given buffers.
@@ -599,6 +682,8 @@ impl<'a> Socket<'a> {
             last_remote_tsval: 0,
             congestion_controller: reno::Reno::new(),
             syn_options: Vec::new(),
+            segment_options: None,
+            segment_extra: Vec::new(),
 
             rx_waker: WakerRegistration::new(),
 
@@ -627,6 +712,14 @@ impl<'a> Socket<'a> {
     pub fn set_syn_options(&mut self, options: &[TcpOption]) -> Result<(), SynOptionsError> {
         self.syn_options = encode_options(options)?;
         Ok(())
+    }
+
+    /// Has `options` add options to every segment this connection sends
+    /// from now on but its SYN and RSTs, and see every segment it takes.
+    /// Set it once the handshake is done. The socket drops it when it
+    /// forgets the connection.
+    pub fn set_segment_options(&mut self, options: Box<dyn SegmentOptions>) {
+        self.segment_options = Some(SegmentOptionsBox(options));
     }
 
     /// Takes up a handshake that a listener answered without keeping any
@@ -890,6 +983,7 @@ impl<'a> Socket<'a> {
         self.last_remote_tsval = 0;
         self.congestion_controller = reno::Reno::new();
         self.syn_options = Vec::new();
+        self.segment_options = None;
 
         {
             self.rx_waker.wake();
@@ -985,16 +1079,11 @@ impl<'a> Socket<'a> {
         });
         self.set_state(State::SynSent);
 
-        let seq = Self::random_seq_no(cx);
+        let seq = cx.initial_seq(local_endpoint, remote_endpoint);
         self.local_seq_no = seq;
         self.remote_last_seq = seq;
         self.local_seq_max = seq;
         Ok(())
-    }
-
-    // Initial sequence numbers come from the simulation entropy source.
-    fn random_seq_no(cx: &mut Context) -> TcpSeqNumber {
-        TcpSeqNumber(cx.rand().rand_u32() as i32)
     }
 
     /// Close the transmit half of the full-duplex connection.
@@ -1401,11 +1490,14 @@ impl<'a> Socket<'a> {
         }
     }
 
+    /// Takes a segment: `repr`, whose options are `options` as they
+    /// are on the wire.
     pub(crate) fn process(
         &mut self,
         cx: &mut Context,
         ip_repr: &IpRepr,
         repr: &TcpRepr,
+        options: &[u8],
     ) -> Option<(IpRepr, TcpRepr<'static>)> {
         debug_assert!(self.accepts(cx, ip_repr, repr));
 
@@ -1617,11 +1709,10 @@ impl<'a> Socket<'a> {
             (State::Listen, TcpControl::Syn) => {
                 self.negotiate_options(repr);
 
-                self.tuple = Some(Tuple {
-                    local: IpEndpoint::new(ip_repr.dst_addr(), repr.dst_port),
-                    remote: IpEndpoint::new(ip_repr.src_addr(), repr.src_port),
-                });
-                self.local_seq_no = Self::random_seq_no(cx);
+                let local = IpEndpoint::new(ip_repr.dst_addr(), repr.dst_port);
+                let remote = IpEndpoint::new(ip_repr.src_addr(), repr.src_port);
+                self.tuple = Some(Tuple { local, remote });
+                self.local_seq_no = cx.initial_seq(local, remote);
                 self.remote_seq_no = repr.seq_number + 1;
                 self.remote_last_seq = self.local_seq_no;
                 self.local_seq_max = self.local_seq_no;
@@ -1731,6 +1822,15 @@ impl<'a> Socket<'a> {
 
         // Update remote state.
         self.remote_last_ts = Some(cx.now());
+
+        if let Some(segment_options) = self.segment_options.as_mut() {
+            segment_options.0.received(&Incoming {
+                seq: repr.seq_number.0 as u32,
+                payload: repr.payload,
+                fin: control == TcpControl::Fin,
+                options,
+            });
+        }
 
         // RFC 1323: The window field (SEG.WND) in the header of every incoming segment, with the
         // exception of SYN segments, is left-shifted by Snd.Wind.Scale bits before updating SND.WND.
@@ -2214,7 +2314,11 @@ impl<'a> Socket<'a> {
                 // 2. MSS the remote is willing to accept, probably determined by their MTU
                 // 3. MSS we can send, determined by our MTU.
                 // 4. Our congestion window
-                let options_len = repr.header_len() - TCP_HEADER_LEN;
+                let room = self
+                    .segment_options
+                    .as_ref()
+                    .map_or(0, |o| o.0.room().min(SEGMENT_OPTIONS_ROOM));
+                let options_len = repr.header_len() - TCP_HEADER_LEN + room;
                 let local_mss = cx.ip_mtu() - ip_repr.header_len() - TCP_HEADER_LEN;
                 let effective_mss = local_mss.min(self.remote_mss).saturating_sub(options_len);
 
@@ -2304,6 +2408,22 @@ impl<'a> Socket<'a> {
             let max_segment_size = cx.ip_mtu() - ip_repr.header_len() - TCP_HEADER_LEN;
             repr.max_seg_size = Some(max_segment_size as u16);
             repr.extra = &self.syn_options;
+        } else if repr.control != TcpControl::Rst
+            && let Some(options) = self.segment_options.as_mut()
+        {
+            let segment = Outgoing {
+                seq: repr.seq_number.0 as u32,
+                payload: if is_keep_alive { &[] } else { repr.payload },
+                fin: repr.control == TcpControl::Fin,
+                ack: repr.ack_number.map(|a| a.0 as u32),
+            };
+            self.segment_extra.clear();
+            options.0.sent(&segment, &mut self.segment_extra);
+            let room = options.0.room().min(SEGMENT_OPTIONS_ROOM);
+            if self.segment_extra.len() > room {
+                self.segment_extra.clear();
+            }
+            repr.extra = &self.segment_extra;
         }
 
         // Advance send state only after the device accepts the packet.
@@ -2411,7 +2531,7 @@ impl<'a> Socket<'a> {
 }
 
 #[cfg(test)]
-mod test {
+pub(crate) mod test {
     use super::*;
     use crate::wire::IpRepr;
     use std::ops::{Deref, DerefMut};
@@ -2431,8 +2551,9 @@ mod test {
         local: LOCAL_END,
         remote: REMOTE_END,
     };
-    // The first ISN from the test interface's seeded generator.
-    const LOCAL_SEQ: TcpSeqNumber = TcpSeqNumber(-34801502);
+    // Every connection's initial sequence number in the tests: see
+    // `crate::tests::setup`.
+    pub(crate) const LOCAL_SEQ: TcpSeqNumber = TcpSeqNumber(-34801502);
     const REMOTE_SEQ: TcpSeqNumber = TcpSeqNumber(-10001);
 
     use crate::wire::Ipv4Address as IpvXAddress;
@@ -2534,7 +2655,7 @@ mod test {
 
         socket
             .socket
-            .process(&mut socket.cx, &ip_repr, repr)
+            .process(&mut socket.cx, &ip_repr, repr, &[])
             .map(|(_, repr)| repr)
     }
 
@@ -3376,6 +3497,201 @@ mod test {
             assert_eq!(repr.ack_number, Some(REMOTE_SEQ + 1));
             assert_eq!(repr.extra, &[]);
         });
+    }
+
+    /// What a [`SegmentOptions`] in a test was asked: each segment sent, as
+    /// (seq, payload, fin, ack), and each one taken, as (seq, payload,
+    /// fin, options).
+    #[derive(Default)]
+    struct Seen {
+        sent: Vec<(u32, Vec<u8>, bool, Option<u32>)>,
+        received: Vec<(u32, Vec<u8>, bool, Vec<u8>)>,
+    }
+
+    /// Adds an option of kind 253 holding the segment's sequence number,
+    /// and three bytes past its room when `overflow`.
+    struct Stamp {
+        seen: std::sync::Arc<std::sync::Mutex<Seen>>,
+        overflow: bool,
+    }
+
+    impl SegmentOptions for Stamp {
+        fn room(&self) -> usize {
+            8
+        }
+
+        fn sent(&mut self, segment: &Outgoing<'_>, out: &mut Vec<u8>) {
+            self.seen.lock().unwrap().sent.push((
+                segment.seq,
+                segment.payload.to_vec(),
+                segment.fin,
+                segment.ack,
+            ));
+            out.extend_from_slice(&[253, 6]);
+            out.extend_from_slice(&segment.seq.to_be_bytes());
+            if self.overflow {
+                out.extend_from_slice(&[1, 1, 1]);
+            }
+        }
+
+        fn received(&mut self, segment: &Incoming<'_>) {
+            self.seen.lock().unwrap().received.push((
+                segment.seq,
+                segment.payload.to_vec(),
+                segment.fin,
+                segment.options.to_vec(),
+            ));
+        }
+    }
+
+    fn stamped(s: &mut TestSocket, overflow: bool) -> std::sync::Arc<std::sync::Mutex<Seen>> {
+        let seen = std::sync::Arc::default();
+        s.set_segment_options(Box::new(Stamp {
+            seen: std::sync::Arc::clone(&seen),
+            overflow,
+        }));
+        seen
+    }
+
+    /// Segment options ride every segment after the handshake, data or
+    /// not, and each data segment leaves room for them.
+    #[test]
+    fn test_segment_options_ride_every_segment_and_take_room() {
+        let mut s = socket_established_with_buffer_sizes(256, 64);
+        s.remote_mss = 100;
+        let seen = stamped(&mut s, false);
+        s.send_slice(&[7; 150]).unwrap();
+        let stamp = |seq: TcpSeqNumber| {
+            let mut bytes = vec![253, 6];
+            bytes.extend_from_slice(&(seq.0 as u32).to_be_bytes());
+            bytes
+        };
+        let first = stamp(LOCAL_SEQ + 1);
+        let second = stamp(LOCAL_SEQ + 1 + 92);
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                extra: &first,
+                payload: &[7; 92],
+                ..RECV_TEMPL
+            }]
+        );
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1 + 92),
+                ..SEND_TEMPL
+            }
+        );
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1 + 92,
+                ack_number: Some(REMOTE_SEQ + 1),
+                extra: &second,
+                payload: &[7; 58],
+                ..RECV_TEMPL
+            }]
+        );
+        s.close();
+        let fin = stamp(LOCAL_SEQ + 1 + 150);
+        recv!(
+            s,
+            [TcpRepr {
+                control: TcpControl::Fin,
+                seq_number: LOCAL_SEQ + 1 + 150,
+                ack_number: Some(REMOTE_SEQ + 1),
+                extra: &fin,
+                ..RECV_TEMPL
+            }]
+        );
+        let seen = seen.lock().unwrap();
+        let ack = Some((REMOTE_SEQ + 1).0 as u32);
+        assert_eq!(
+            seen.sent,
+            [
+                ((LOCAL_SEQ + 1).0 as u32, vec![7; 92], false, ack),
+                ((LOCAL_SEQ + 1 + 92).0 as u32, vec![7; 58], false, ack),
+                ((LOCAL_SEQ + 1 + 150).0 as u32, vec![], true, ack),
+            ]
+        );
+    }
+
+    /// Options past the room are not sent, and a RST carries none.
+    #[test]
+    fn test_segment_options_past_their_room_are_dropped() {
+        let mut s = socket_established();
+        let seen = stamped(&mut s, true);
+        s.send_slice(b"abc").unwrap();
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: b"abc",
+                ..RECV_TEMPL
+            }]
+        );
+        s.abort();
+        recv!(
+            s,
+            [TcpRepr {
+                control: TcpControl::Rst,
+                seq_number: LOCAL_SEQ + 1 + 3,
+                ack_number: Some(REMOTE_SEQ + 1),
+                ..RECV_TEMPL
+            }]
+        );
+        assert_eq!(seen.lock().unwrap().sent.len(), 1);
+    }
+
+    /// Segment options see each segment the socket takes, with its wire
+    /// options, and none it refuses; the socket drops them with the
+    /// connection.
+    #[test]
+    fn test_segment_options_see_segments_taken() {
+        let mut s = socket_established();
+        let seen = stamped(&mut s, false);
+        let ip_repr = IpReprIpvX(IpvXRepr {
+            src_addr: REMOTE_ADDR,
+            dst_addr: LOCAL_ADDR,
+            next_header: IpProtocol::Tcp,
+            payload_len: 0,
+            hop_limit: 64,
+        });
+        let take = |s: &mut TestSocket, seq: TcpSeqNumber, control, payload: &[u8]| {
+            let repr = TcpRepr {
+                control,
+                seq_number: seq,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload,
+                ..SEND_TEMPL
+            };
+            s.socket
+                .process(&mut s.cx, &ip_repr, &repr, &[1, 1, 253, 4, 0xab, 0xcd])
+        };
+        take(&mut s, REMOTE_SEQ + 1, TcpControl::Psh, b"hi");
+        // Out of the window: refused with an ACK, and not seen.
+        take(&mut s, REMOTE_SEQ + 1 + 1000, TcpControl::None, b"no");
+        take(&mut s, REMOTE_SEQ + 1 + 2, TcpControl::Fin, b"");
+        let options = vec![1, 1, 253, 4, 0xab, 0xcd];
+        assert_eq!(
+            seen.lock().unwrap().received,
+            [
+                (
+                    (REMOTE_SEQ + 1).0 as u32,
+                    b"hi".to_vec(),
+                    false,
+                    options.clone()
+                ),
+                ((REMOTE_SEQ + 1 + 2).0 as u32, vec![], true, options),
+            ]
+        );
+        s.reset();
+        assert!(s.segment_options.is_none());
     }
 
     /// A handshake answered with a SYN cookie: the ACK that returns it
@@ -8733,10 +9049,10 @@ mod test {
         to.cx.set_now(now);
         from.cx.set_now(now);
         if to.socket.accepts(&mut to.cx, &ip, &tcp)
-            && let Some((ip, tcp)) = to.socket.process(&mut to.cx, &ip, &tcp)
+            && let Some((ip, tcp)) = to.socket.process(&mut to.cx, &ip, &tcp, &[])
             && from.socket.accepts(&mut from.cx, &ip, &tcp)
         {
-            from.socket.process(&mut from.cx, &ip, &tcp);
+            from.socket.process(&mut from.cx, &ip, &tcp, &[]);
         }
     }
 
@@ -8872,11 +9188,11 @@ mod test {
         assert_eq!((data_a.len(), data_b.len()), (2, 2));
         for (ip, tcp) in data_a {
             b.cx.set_now(now);
-            b.socket.process(&mut b.cx, &ip, &tcp);
+            b.socket.process(&mut b.cx, &ip, &tcp, &[]);
         }
         for (ip, tcp) in data_b {
             a.cx.set_now(now);
-            a.socket.process(&mut a.cx, &ip, &tcp);
+            a.socket.process(&mut a.cx, &ip, &tcp, &[]);
         }
         while sent_at(&mut a, now).is_some() {}
         while sent_at(&mut b, now).is_some() {}

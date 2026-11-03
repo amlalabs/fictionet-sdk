@@ -715,7 +715,8 @@ pub struct TcpOptions<'a> {
 }
 
 impl<'a> TcpOptions<'a> {
-    pub(crate) fn new(area: &'a [u8]) -> TcpOptions<'a> {
+    /// The options in `area`, a TCP header's option space.
+    pub fn new(area: &'a [u8]) -> TcpOptions<'a> {
         TcpOptions { rest: area }
     }
 }

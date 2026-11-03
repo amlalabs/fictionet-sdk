@@ -267,6 +267,9 @@ fn syn_options_reach_the_connection_and_the_syn_ack_answers_mptcp() {
                 },
             ]
             .into(),
+            ack_payload: 0,
+            irs: 1000,
+            iss,
         };
         assert_eq!(*conn.handshake(), handshake);
         assert_eq!(Accepted::handshake(&conn), handshake);
@@ -613,6 +616,102 @@ fn an_answer_refuses_a_connection_at_its_ack() {
             ]
         );
         assert_eq!(read_n(&fcx, &mut conn, 5).await?, b"hello");
+        Ok(())
+    });
+}
+
+/// Drops a connection at its ACK when the ACK carries option kind 253, and
+/// stamps every segment of the others with option kind 254 holding the
+/// segment's payload length, noting the length of each segment taken.
+struct DropOrStamp(Arc<Mutex<Vec<usize>>>);
+
+struct Stamp(Arc<Mutex<Vec<usize>>>);
+
+impl tcp::Segments for Stamp {
+    fn room(&self) -> usize {
+        4
+    }
+
+    fn sent(&mut self, segment: &tcp::Sent<'_>) -> Vec<TcpOption> {
+        let len = segment.payload.len() as u16;
+        vec![TcpOption::Unknown {
+            kind: 254,
+            data: len.to_be_bytes().to_vec(),
+        }]
+    }
+
+    fn received(&mut self, segment: &tcp::Received<'_>) {
+        self.0.lock().unwrap().push(segment.payload.len());
+    }
+}
+
+impl Answer for DropOrStamp {
+    fn syn(&self, _: &[TcpOption]) -> SynAnswer {
+        SynAnswer::Accept(Vec::new())
+    }
+
+    fn ack(&self, handshake: &Handshake) -> AckAnswer {
+        let marked = handshake
+            .ack
+            .iter()
+            .any(|o| matches!(o, TcpOption::Unknown { kind: 253, .. }));
+        if marked {
+            AckAnswer::Drop
+        } else {
+            AckAnswer::Accept
+        }
+    }
+
+    fn segments(&self, _: &Handshake) -> Option<Box<dyn tcp::Segments>> {
+        Some(Box::new(Stamp(self.0.clone())))
+    }
+}
+
+/// A connection dropped at its ACK gets nothing, not even a RST, and never
+/// reaches accept. One taken carries the answer's options on each segment
+/// from then on, and the answer sees each segment it takes.
+#[test]
+fn an_answer_drops_at_the_ack_or_stamps_the_segments() {
+    world(Duration::from_secs(10), |fcx| async move {
+        let (mut raw, side) = pair();
+        let server = tcp::endpoint(&fcx, side, ip(SERVER));
+        let mut listener = server.listen(80)?;
+        let taken = Arc::new(Mutex::new(Vec::new()));
+        listener.answer(Box::new(DropOrStamp(taken.clone())));
+        raw.send(segment(4000, 1000, 0, SYN, &LINUX_SYN));
+        let syn_ack = next(&fcx, &mut raw).await.expect("a SYN-ACK");
+        let iss = seq_of(tcp_of(&syn_ack));
+        raw.send(segment(
+            4000,
+            1001,
+            iss.wrapping_add(1),
+            ACK,
+            &[253, 2, 1, 1],
+        ));
+        assert!(next(&fcx, &mut raw).await.is_none(), "nothing at all");
+
+        raw.send(segment(4001, 1000, 0, SYN, &LINUX_SYN));
+        let syn_ack = next(&fcx, &mut raw).await.expect("a SYN-ACK");
+        let iss = seq_of(tcp_of(&syn_ack));
+        raw.send(segment(4001, 1001, iss.wrapping_add(1), ACK, &[]));
+        let mut conn = listener.accept(&fcx).await?;
+        assert_eq!(conn.peer_addr().port(), 4001, "the dropped one never came");
+        conn.write_all(&fcx, b"hi").await?;
+        let data = next(&fcx, &mut raw).await.expect("data");
+        let t = tcp_of(&data);
+        assert_eq!(options_of(t), [(254, vec![0, 2])]);
+        raw.send(segment_with(
+            4001,
+            1001,
+            iss.wrapping_add(3),
+            PSH | ACK,
+            &[],
+            b"hello",
+        ));
+        assert_eq!(read_n(&fcx, &mut conn, 5).await?, b"hello");
+        let ack = next(&fcx, &mut raw).await.expect("an ACK");
+        assert_eq!(options_of(tcp_of(&ack)), [(254, vec![0, 0])]);
+        assert_eq!(*taken.lock().unwrap(), [5]);
         Ok(())
     });
 }

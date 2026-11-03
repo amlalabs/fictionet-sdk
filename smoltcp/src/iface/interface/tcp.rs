@@ -15,7 +15,7 @@ impl InterfaceInner {
         let tcp = TcpRepr::parse(&packet, &src, &dst).ok()?;
         for (_, socket) in sockets.iter_mut() {
             if socket.accepts(self, &ip, &tcp) {
-                return socket.process(self, &ip, &tcp);
+                return socket.process(self, &ip, &tcp, packet.options());
             }
         }
         // A reset never answers another reset.

@@ -3,10 +3,11 @@
 //!
 //! The [`Observer`] sees each packet as it crosses an attachment, before
 //! the world does, so a packet the world drops is still logged. The pcapng
-//! file gets each packet as it crossed. The observations are made from
-//! whole packets: fragments wait until their packet is whole, as the
-//! world's own reassembly waits for them. For packets from the sandbox
-//! side it records:
+//! file gets each packet as it crossed ([`Observer::crossed`]). The
+//! observations are made from whole packets ([`Observer::whole`]): the
+//! relay puts fragments together, and the world takes the whole packet it
+//! made, so the log reads exactly the packets the world takes. For packets
+//! from the sandbox side it records:
 //!
 //! - every SYN ([`Observation::Syn`]): source and destination, all its TCP
 //!   options in order, why the options could not all be read, the MPTCP
@@ -39,18 +40,15 @@
 //! within the burst window. Its memory is the SYNs of the last window, so a
 //! flood from spoofed addresses cannot grow it past what one window holds.
 //! The time since a source's previous SYN is given when that SYN was within
-//! the window; each line's timestamp gives longer gaps. Fragments waiting
-//! for the rest of their packet are held per attachment, at most 4 MiB
-//! each, for at most a minute, and dropped when the attachment goes.
+//! the window; each line's timestamp gives longer gaps.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use fictionet::Packet;
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::network::ip::{self, Intake, Reassembly, protocol};
+use fictionet::stdlib::network::ip::{self, protocol};
 use fictionet::stdlib::network::tcp::{self, OptionsError, TcpOption};
 use fictionet::stdlib::pcap;
 use fictionet::stdlib::protocols::mptcp::{self, AddAddr, Capable, Dss, Join, Keys, Mapping};
@@ -658,8 +656,6 @@ pub struct Observer {
     /// whether each carried MP_JOIN.
     recent: VecDeque<(Instant, IpAddr, bool)>,
     sources: HashMap<IpAddr, Source>,
-    /// Fragments waiting for the rest of their packet, per attachment.
-    fragments: HashMap<Arc<str>, Reassembly>,
 }
 
 impl Observer {
@@ -682,7 +678,6 @@ impl Observer {
             tokens,
             recent: VecDeque::new(),
             sources: HashMap::new(),
-            fragments: HashMap::new(),
         })
     }
 
@@ -691,9 +686,9 @@ impl Observer {
         self.sources.len()
     }
 
-    /// Writes `packet`, which crossed `attachment` at `now`, and what it
-    /// shows. Any bytes may come here.
-    pub fn packet(
+    /// Writes `packet`, which crossed `attachment` at `now`, to the packet
+    /// log as it is. Any bytes may come here.
+    pub fn crossed(
         &mut self,
         attachment: &Arc<str>,
         direction: Direction,
@@ -714,36 +709,26 @@ impl Observer {
             Some(&format!("{attachment} {way}")),
         );
         self.sinks.pcap.write_all(&block)?;
-        let fragment = ip::Header::parse_truncated(packet).is_some_and(|h| h.fragment.is_some());
-        let whole = if fragment {
-            let reassembly = self.fragments.entry(attachment.clone()).or_default();
-            match reassembly.push(Packet(packet.to_vec()), now) {
-                Intake::Whole(whole) => Some(whole.0),
-                Intake::Waiting => None,
-                Intake::Refused { packet, .. } => Some(packet.0),
-            }
-        } else {
-            None
-        };
-        let observations = match (&whole, fragment) {
-            (Some(whole), _) => self.observe(attachment, direction, whole, now),
-            (None, true) => Vec::new(),
-            (None, false) => self.observe(attachment, direction, packet, now),
-        };
-        for observation in observations {
-            serde_json::to_writer(&mut self.sinks.log, &observation)?;
-            self.sinks.log.write_all(b"\n")?;
-        }
-        self.sinks.log.flush()?;
         self.sinks.pcap.flush()
     }
 
-    /// Forgets the fragments `attachment` left waiting: it is gone.
-    pub fn detached(&mut self, attachment: &Arc<str>) {
-        self.fragments.remove(attachment);
+    /// Writes what `packet` shows: a whole packet, as the world takes it
+    /// in, that crossed `attachment` at `now`. Any bytes may come here.
+    pub fn whole(
+        &mut self,
+        attachment: &Arc<str>,
+        direction: Direction,
+        packet: &[u8],
+        now: Instant,
+    ) -> io::Result<()> {
+        for observation in self.observe(attachment, direction, packet, now) {
+            serde_json::to_writer(&mut self.sinks.log, &observation)?;
+            self.sinks.log.write_all(b"\n")?;
+        }
+        self.sinks.log.flush()
     }
 
-    /// What `packet`, a whole one or one the world refused, shows.
+    /// What `packet`, a whole one, shows.
     fn observe(
         &mut self,
         attachment: &Arc<str>,
@@ -1117,65 +1102,6 @@ mod tests {
                 data: Hex(vec![0x80, 3])
             }]
         );
-    }
-
-    /// A SYN sent as two fragments is logged once it is whole, as the
-    /// world takes it, and counts toward bursts.
-    #[test]
-    fn a_fragmented_syn_is_logged_whole() {
-        let syn = segment(SYN, &[2, 4, 5, 0xb4, 30, 4, 0x01, 0x01], b"");
-        let (header, tcp) = syn.split_at(20);
-        let fragment = |offset: usize, more: bool, data: &[u8]| {
-            let mut p = header.to_vec();
-            p.extend_from_slice(data);
-            let total = p.len() as u16;
-            p[2..4].copy_from_slice(&total.to_be_bytes());
-            p[4..6].copy_from_slice(&77u16.to_be_bytes());
-            let field = (offset / 8) as u16 | if more { 0x2000 } else { 0 };
-            p[6..8].copy_from_slice(&field.to_be_bytes());
-            p[10..12].copy_from_slice(&[0, 0]);
-            let sum = ip::checksum(&p[..20]);
-            p[10..12].copy_from_slice(&sum.to_be_bytes());
-            p
-        };
-        /// The log, shared with the observer that writes it.
-        #[derive(Clone, Default)]
-        struct Log(Arc<std::sync::Mutex<Vec<u8>>>);
-        impl Write for Log {
-            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-        let log = Log::default();
-        let mut observer = observer();
-        observer.sinks.log = Box::new(log.clone());
-        let lines = || -> Vec<serde_json::Value> {
-            let log = log.0.lock().unwrap();
-            let text = std::str::from_utf8(&log).unwrap();
-            text.lines()
-                .map(|l| serde_json::from_str(l).unwrap())
-                .collect()
-        };
-        let name: Arc<str> = Arc::from("internet");
-        let at = Instant::from_since_start(Duration::from_secs(1));
-        observer
-            .packet(&name, Direction::In, &fragment(0, true, &tcp[..8]), at)
-            .unwrap();
-        assert!(lines().is_empty(), "half a SYN is not one yet");
-        observer
-            .packet(&name, Direction::In, &fragment(8, false, &tcp[8..]), at)
-            .unwrap();
-        let lines = lines();
-        assert_eq!(lines.len(), 1, "{lines:?}");
-        assert_eq!(lines[0]["event"], "syn");
-        assert_eq!(lines[0]["mptcp"][0]["subtype"], "mp_capable");
-        assert_eq!(observer.sources(), 1);
-        observer.detached(&name);
-        assert!(observer.fragments.is_empty());
     }
 
     #[test]

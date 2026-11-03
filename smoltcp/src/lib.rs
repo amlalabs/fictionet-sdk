@@ -4,11 +4,10 @@
 //! Fictionet's fork of smoltcp 0.14.0.
 //!
 //! TCP sockets, an in-memory IP interface, and IPv4/IPv6 packet handling.
-//! Fictionet supplies the device, simulation clock, and seeded entropy.
+//! Fictionet supplies the device, simulation clock, and initial sequence numbers.
 
 #[macro_use]
 mod macros;
-mod rand;
 
 pub mod iface;
 

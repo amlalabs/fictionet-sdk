@@ -1,10 +1,13 @@
-//! MPTCP: reading and writing the TCP options of Multipath TCP, and the
-//! keys, tokens and HMACs its handshakes use, with no I/O.
+//! MPTCP: reading and writing the TCP options of Multipath TCP, the keys,
+//! tokens and HMACs its handshakes use, and the data level of a connection
+//! with one subflow, with no I/O.
 //!
 //! [`MptcpOption`] reads and writes one option through `Wire`. [`token`],
-//! [`idsn`] and [`join_hmac`] compute what RFC 8684 derives from the keys.
-//! There is no connection or subflow state, data sequence reassembly, path
-//! manager, `Service`, or live transport.
+//! [`idsn`] and [`join_hmac`] compute what RFC 8684 derives from the keys,
+//! and [`dss_checksum`] the checksum of a mapping. [`DataLevel`] gives the
+//! DSS for each segment of a connection that has one subflow. There is no
+//! data sequence reassembly over several subflows, path manager,
+//! `Service`, or live transport.
 //!
 //! Multipath TCP lets one connection use several paths at once, such as
 //! Wi-Fi and a mobile network. The first TCP connection, the first
@@ -858,6 +861,201 @@ pub fn join_hmac(own_key: u64, peer_key: u64, own_random: u32, peer_random: u32)
     out
 }
 
+/// The DSS checksum of a mapping (RFC 8684 section 3.3.1): the Internet
+/// checksum of a pseudo-header, which holds the full 64-bit data sequence
+/// number, the relative subflow sequence number, the Data-Level Length and
+/// two zero bytes, followed by the bytes the mapping covers. A DATA_FIN
+/// with no data covers no bytes.
+///
+/// ```
+/// use fictionet::stdlib::protocols::mptcp::dss_checksum;
+/// let sum = dss_checksum(0x0102_0304_0506_0708, 1, 2, b"hi");
+/// assert_eq!(sum, 0x877f);
+/// ```
+pub fn dss_checksum(
+    data_sequence_number: u64,
+    subflow_sequence_number: u32,
+    data_level_length: u16,
+    data: &[u8],
+) -> u16 {
+    use fictionet::stdlib::network::ip;
+    let mut header = [0; 16];
+    header[..8].copy_from_slice(&data_sequence_number.to_be_bytes());
+    header[8..12].copy_from_slice(&subflow_sequence_number.to_be_bytes());
+    header[12..14].copy_from_slice(&data_level_length.to_be_bytes());
+    ip::fold(ip::sum(ip::sum(0, &header), data))
+}
+
+/// The data level of a Multipath TCP connection with one subflow, at one
+/// end, with no I/O (RFC 8684 section 3.3): the DSS each segment this end
+/// sends carries, and whether the connection has fallen back to plain TCP
+/// (section 3.7).
+///
+/// This end's bytes go in data sequence order as they go on the subflow:
+/// its first byte is its IDSN + 1, and DATA_FIN comes with its FIN. Each
+/// segment it sends maps its own bytes with a 64-bit data sequence number,
+/// and acknowledges what the peer has sent on the subflow so far. The Data
+/// ACK is 4 octets until the peer sends a 64-bit data sequence number, as
+/// Linux sends it.
+///
+/// The peer's data must come under a mapping. When data the peer sends is
+/// outside every mapping it sent, or the peer sends an infinite mapping,
+/// the connection falls back, and from then on carries no DSS.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DataLevel {
+    local_idsn: u64,
+    remote_idsn: u64,
+    /// This end's and the peer's initial subflow sequence numbers.
+    iss: u32,
+    irs: u32,
+    checksums: bool,
+    /// The peer has sent a 64-bit data sequence number.
+    long_ack: bool,
+    /// The subflow sequence number after the furthest byte the peer
+    /// mapped.
+    mapped_until: u32,
+    /// Where the peer's FIN was, when it came without DATA_FIN.
+    plain_fin: Option<u32>,
+    fallen_back: bool,
+}
+
+impl DataLevel {
+    /// The most option bytes [`sent`](DataLevel::sent) gives a segment: DSS
+    /// with a 64-bit Data ACK, a 64-bit data sequence number and a
+    /// checksum.
+    pub const ROOM: usize = 28;
+
+    /// A connection whose keys are `local_key` and `remote_key`, whose
+    /// subflow started at sequence numbers `iss` (this end's SYN) and `irs`
+    /// (the peer's), and which uses DSS checksums when `checksums`.
+    /// `first` is the Data-Level Length of the MP_CAPABLE with data that
+    /// mapped the peer's first bytes on the handshake's ACK, if one did
+    /// (section 3.1).
+    pub fn new(
+        local_key: u64,
+        remote_key: u64,
+        iss: u32,
+        irs: u32,
+        checksums: bool,
+        first: Option<u16>,
+    ) -> DataLevel {
+        DataLevel {
+            local_idsn: idsn(local_key),
+            remote_idsn: idsn(remote_key),
+            iss,
+            irs,
+            checksums,
+            long_ack: false,
+            mapped_until: irs
+                .wrapping_add(1)
+                .wrapping_add(u32::from(first.unwrap_or(0))),
+            plain_fin: None,
+            fallen_back: false,
+        }
+    }
+
+    /// Whether the connection has fallen back to plain TCP.
+    pub fn fallen_back(&self) -> bool {
+        self.fallen_back
+    }
+
+    /// Takes a segment from the peer in the subflow's receive window: its
+    /// sequence number, how many bytes of data it carries, whether it
+    /// carries a FIN, and its MPTCP options.
+    pub fn received(
+        &mut self,
+        seq: u32,
+        payload: usize,
+        fin: bool,
+        options: impl IntoIterator<Item = MptcpOption>,
+    ) {
+        if self.fallen_back {
+            return;
+        }
+        let mut data_fin = false;
+        for option in options {
+            let MptcpOption::Dss(dss) = option else {
+                continue;
+            };
+            data_fin |= dss.data_fin;
+            let Some(mapping) = dss.mapping else {
+                continue;
+            };
+            if mapping.data_level_length == 0 {
+                self.fallen_back = true;
+                return;
+            }
+            self.long_ack |= matches!(mapping.data_sequence_number, Sequence::Long(_));
+            if mapping.subflow_sequence_number != 0 {
+                let start = self.irs.wrapping_add(mapping.subflow_sequence_number);
+                let end = start.wrapping_add(u32::from(mapping.data_level_length));
+                if after(end, self.mapped_until) {
+                    self.mapped_until = end;
+                }
+            }
+        }
+        let end = seq.wrapping_add(payload as u32);
+        if payload > 0 && after(end, self.mapped_until) {
+            self.fallen_back = true;
+            return;
+        }
+        if fin && !data_fin {
+            self.plain_fin = Some(end);
+        }
+    }
+
+    /// The DSS for a segment this end sends: its sequence number, its
+    /// data, whether it carries a FIN, and its acknowledgment number.
+    /// `None` once the connection has fallen back.
+    pub fn sent(&self, seq: u32, payload: &[u8], fin: bool, ack: Option<u32>) -> Option<Dss> {
+        if self.fallen_back {
+            return None;
+        }
+        let data_ack = ack.map(|ack| {
+            let plain_fin = self.plain_fin.is_some_and(|at| after(ack, at));
+            let next = self
+                .remote_idsn
+                .wrapping_add(u64::from(ack.wrapping_sub(self.irs)))
+                .wrapping_sub(u64::from(plain_fin));
+            if self.long_ack {
+                Sequence::Long(next)
+            } else {
+                Sequence::Short(next as u32)
+            }
+        });
+        let length = u16::try_from(payload.len() + usize::from(fin)).ok()?;
+        let mapping = (length > 0).then(|| {
+            let offset = seq.wrapping_sub(self.iss);
+            let data_sequence_number = self.local_idsn.wrapping_add(u64::from(offset));
+            // A DATA_FIN on a segment with no data maps no subflow bytes.
+            let subflow_sequence_number = if payload.is_empty() { 0 } else { offset };
+            Mapping {
+                data_sequence_number: Sequence::Long(data_sequence_number),
+                subflow_sequence_number,
+                data_level_length: length,
+                checksum: self.checksums.then(|| {
+                    dss_checksum(
+                        data_sequence_number,
+                        subflow_sequence_number,
+                        length,
+                        payload,
+                    )
+                }),
+            }
+        });
+        (data_ack.is_some() || mapping.is_some()).then_some(Dss {
+            data_ack,
+            mapping,
+            data_fin: fin,
+        })
+    }
+}
+
+/// Whether sequence number `a` is after `b`, modulo 2^32.
+fn after(a: u32, b: u32) -> bool {
+    (a.wrapping_sub(b) as i32) > 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1520,5 +1718,140 @@ mod tests {
                 assert_eq!(bytes[0] >> 4, value.subtype());
             }
         }
+    }
+
+    /// The DSS checksum is the Internet checksum of the pseudo-header and
+    /// the data, added up here word by word.
+    #[test]
+    fn dss_checksum_covers_the_pseudo_header_and_the_data() {
+        let words = |bytes: &[u8]| -> u32 {
+            bytes
+                .chunks(2)
+                .map(|w| u32::from(w[0]) << 8 | u32::from(*w.get(1).unwrap_or(&0)))
+                .sum()
+        };
+        for (dsn, ssn, data) in [
+            (0x0102_0304_0506_0708u64, 1u32, &b"hi"[..]),
+            (u64::MAX, u32::MAX, &b"odd"[..]),
+            (7, 0, &b""[..]),
+        ] {
+            let len = data.len() as u16 + u16::from(data.is_empty());
+            let mut sum = words(&dsn.to_be_bytes()) + words(&ssn.to_be_bytes());
+            sum += u32::from(len) + words(data);
+            while sum > 0xffff {
+                sum = (sum & 0xffff) + (sum >> 16);
+            }
+            assert_eq!(dss_checksum(dsn, ssn, len, data), !(sum as u16));
+        }
+    }
+
+    const ISS: u32 = 0xffff_fff0;
+    const IRS: u32 = 1000;
+
+    fn mapping(dsn: Sequence, ssn: u32, len: u16) -> MptcpOption {
+        MptcpOption::Dss(Dss {
+            data_ack: None,
+            mapping: Some(Mapping {
+                data_sequence_number: dsn,
+                subflow_sequence_number: ssn,
+                data_level_length: len,
+                checksum: None,
+            }),
+            data_fin: false,
+        })
+    }
+
+    /// The listener's first bytes are IDSN + 1 on, mapped by the segment
+    /// that carries them, with the peer's data acknowledged at its IDSN +
+    /// 1 on, in 4 octets until the peer sends 8.
+    #[test]
+    fn a_data_level_maps_what_it_sends_and_acknowledges_what_it_got() {
+        let mut level = DataLevel::new(KEY_B, KEY_A, ISS, IRS, false, None);
+        let first = level.sent(ISS.wrapping_add(1), b"SSH-2.0", false, Some(IRS + 1));
+        assert_eq!(
+            first,
+            Some(Dss {
+                data_ack: Some(Sequence::Short(idsn(KEY_A).wrapping_add(1) as u32)),
+                mapping: Some(Mapping {
+                    data_sequence_number: Sequence::Long(idsn(KEY_B).wrapping_add(1)),
+                    subflow_sequence_number: 1,
+                    data_level_length: 7,
+                    checksum: None,
+                }),
+                data_fin: false,
+            })
+        );
+        let bytes = MptcpOption::Dss(first.unwrap()).to_bytes().unwrap();
+        assert!(bytes.len() + 2 <= DataLevel::ROOM);
+        // The peer maps 5 bytes with a 64-bit number: the ACK now has 8
+        // octets, and covers them.
+        let dsn = Sequence::Long(idsn(KEY_A).wrapping_add(1));
+        level.received(IRS + 1, 5, false, [mapping(dsn, 1, 5)]);
+        assert_eq!(
+            level.sent(ISS.wrapping_add(8), b"", false, Some(IRS + 6)),
+            Some(Dss {
+                data_ack: Some(Sequence::Long(idsn(KEY_A).wrapping_add(6))),
+                mapping: None,
+                data_fin: false,
+            })
+        );
+        // The FIN carries DATA_FIN, with no subflow bytes mapped.
+        assert_eq!(
+            level.sent(ISS.wrapping_add(8), b"", true, Some(IRS + 6)),
+            Some(Dss {
+                data_ack: Some(Sequence::Long(idsn(KEY_A).wrapping_add(6))),
+                mapping: Some(Mapping {
+                    data_sequence_number: Sequence::Long(idsn(KEY_B).wrapping_add(8)),
+                    subflow_sequence_number: 0,
+                    data_level_length: 1,
+                    checksum: None,
+                }),
+                data_fin: true,
+            })
+        );
+        // A FIN from the peer without DATA_FIN is not data.
+        level.received(IRS + 6, 0, true, []);
+        let dss = level.sent(ISS.wrapping_add(9), b"", false, Some(IRS + 7));
+        assert_eq!(
+            dss.unwrap().data_ack,
+            Some(Sequence::Long(idsn(KEY_A).wrapping_add(6)))
+        );
+        assert!(!level.fallen_back());
+    }
+
+    /// With checksums, each mapping carries the checksum of its bytes.
+    #[test]
+    fn a_data_level_with_checksums_sums_each_mapping() {
+        let level = DataLevel::new(KEY_B, KEY_A, ISS, IRS, true, None);
+        let dss = level
+            .sent(ISS.wrapping_add(3), b"abc", false, Some(IRS + 1))
+            .unwrap();
+        let dsn = idsn(KEY_B).wrapping_add(3);
+        let mapping = dss.mapping.unwrap();
+        assert_eq!(mapping.checksum, Some(dss_checksum(dsn, 3, 3, b"abc")));
+        let bytes = MptcpOption::Dss(dss).to_bytes().unwrap();
+        assert_eq!(bytes.len() + 2, 24, "a 4-octet Data ACK");
+    }
+
+    /// Data from the peer outside every mapping, or an infinite mapping,
+    /// makes the connection fall back: no more DSS.
+    #[test]
+    fn a_data_level_falls_back_on_unmapped_data() {
+        let dsn = Sequence::Short(idsn(KEY_A) as u32 + 1);
+        // Data the MP_CAPABLE on the third ACK mapped is fine.
+        let mut level = DataLevel::new(KEY_B, KEY_A, ISS, IRS, false, Some(10));
+        level.received(IRS + 1, 10, false, []);
+        assert!(!level.fallen_back());
+        level.received(IRS + 11, 4, false, [mapping(dsn, 11, 2)]);
+        assert!(level.fallen_back(), "two bytes past the mapping");
+        assert_eq!(level.sent(ISS + 1, b"x", false, Some(IRS + 15)), None);
+
+        let mut level = DataLevel::new(KEY_B, KEY_A, ISS, IRS, false, None);
+        level.received(IRS + 1, 1, false, []);
+        assert!(level.fallen_back(), "data with no mapping");
+
+        let mut level = DataLevel::new(KEY_B, KEY_A, ISS, IRS, false, None);
+        level.received(IRS + 1, 0, false, [mapping(dsn, 1, 0)]);
+        assert!(level.fallen_back(), "an infinite mapping");
     }
 }
