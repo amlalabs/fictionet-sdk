@@ -61,10 +61,12 @@ use fictionet::stdlib::services::dns::resolver::{
     Cache, Checked, Config, Entry, FailureKind, Key, Limits, Negative, Offer, Rank, Resolver, Work,
 };
 use fictionet::stdlib::services::dns::zone::{
-    Answered, AnyResponse, Denial, Denied, Fact, Node, Revision, View, Zone, ZoneData, ZoneError,
-    answer, check_chain,
+    Answered, AnyResponse, Denial, Denied, Fact, Learned, Node, Revision, View, Zone, ZoneData,
+    ZoneError, answer, check_chain,
 };
-use fictionet::stdlib::services::dns::{Client, ClientQuery, WallClock};
+use fictionet::stdlib::services::dns::{
+    Action, Client, ClientQuery, Engine, Input, Looked, Lookup, WallClock,
+};
 use fictionet::stdlib::services::serve::Transport;
 use fictionet::time::Instant;
 use fictionet::{Seed, SeededEntropy};
@@ -1543,6 +1545,234 @@ fn partial_answers() {
 }
 
 // ---------------------------------------------------------------------
+// learned.json: a server of a copy of a zone
+// ---------------------------------------------------------------------
+
+/// The address the server of a copy runs at, which is also the real
+/// server it looks facts up at.
+const COPY: &str = "192.0.2.53:53";
+
+/// A server at [`COPY`] behind `server`, answering as [`Zones`] over a
+/// copy of the zone at `apex` that holds nothing yet.
+fn copy_engine(apex: &Name, server: ServerConfig) -> AuthorityEngine<Zones> {
+    let zone: Arc<dyn ZoneData> = Arc::new(Learned::new(apex));
+    AuthorityEngine::new(Zones::new(vec![zone]), server, COPY.parse().unwrap())
+}
+
+/// A client's query for `qname` `qtype` over TCP, so that no reply is
+/// truncated, with DNSSEC records asked for when `dnssec_ok`.
+fn copy_query(qname: &Name, qtype: RecordType, dnssec_ok: bool) -> ClientQuery {
+    let mut message = Message::new(4660, MessageType::Query, OpCode::Query);
+    message.add_query(Query::query(qname.clone(), qtype));
+    if dnssec_ok {
+        let mut edns = Edns::new();
+        edns.set_max_payload(1232).set_dnssec_ok(true);
+        message.set_edns(edns);
+    }
+    ClientQuery {
+        client: Client {
+            transport: Transport::Tcp,
+            ..client()
+        },
+        bytes: message.to_vec().unwrap(),
+    }
+}
+
+/// What the server of a copy does with `query`: the replies it sends and
+/// the lookups it makes, each answered at once by `upstream`.
+fn ask_copy(
+    engine: &mut AuthorityEngine<Zones>,
+    query: ClientQuery,
+    upstream: &dyn Fn(&Lookup) -> Looked,
+) -> (Vec<Message>, Vec<Lookup>) {
+    let entropy = SeededEntropy::new(Seed::from_u64(1));
+    let mut inputs = vec![Input::Query(query)];
+    let mut replies = Vec::new();
+    let mut lookups = Vec::new();
+    while let Some(input) = inputs.pop() {
+        engine.handle(input, Instant::ZERO, &entropy);
+        while let Some(action) = engine.poll() {
+            match action {
+                Action::Answer(answer) => {
+                    replies.push(Message::from_vec(&answer.bytes).expect("a reply decodes"));
+                }
+                Action::Lookup { token, lookup } => {
+                    inputs.push(Input::Looked {
+                        token,
+                        looked: upstream(&lookup),
+                    });
+                    lookups.push(lookup);
+                }
+                Action::Send(_) | Action::Abandon(_) | Action::Event(_) => {}
+            }
+        }
+    }
+    (replies, lookups)
+}
+
+/// Checks that the server of a copy of the zone at `apex`, asked `qname`
+/// `qtype`, made at most one lookup (Lean's `serve_one_lookup`), and only
+/// of the client's question at its own address (`respond_need`).
+fn check_lookups(
+    lookups: &[Lookup],
+    apex: &Name,
+    qname: &Name,
+    qtype: RecordType,
+) -> Result<(), String> {
+    let own = Lookup::new(
+        COPY.parse().unwrap(),
+        LowerName::new(apex),
+        &Query::query(qname.clone(), qtype),
+    );
+    match lookups {
+        [] => Ok(()),
+        [lookup] if *lookup == own => Ok(()),
+        [lookup] => Err(format!(
+            "looked up {lookup:?}, not the question at its own address"
+        )),
+        more => Err(format!("{} lookups for one question", more.len())),
+    }
+}
+
+fn response_code(text: &str) -> ResponseCode {
+    match text {
+        "NOERROR" => ResponseCode::NoError,
+        "NXDOMAIN" => ResponseCode::NXDomain,
+        "YXDOMAIN" => ResponseCode::YXDomain,
+        "REFUSED" => ResponseCode::Refused,
+        "SERVFAIL" => ResponseCode::ServFail,
+        _ => panic!("unknown RCODE {text}"),
+    }
+}
+
+/// A real server's response to `lookup`, as `Gen.lean` writes it
+/// (`responseJson`): its RCODE, AA, and sections, nothing when the zone
+/// does not know the answer.
+fn vector_looked(lookup: &Lookup, value: &Value) -> Looked {
+    if value.get("unknown").is_some() {
+        return Looked::NoReply;
+    }
+    let mut message = Message::response(0x4242, OpCode::Query);
+    message.metadata.authoritative = flag(value, "aa");
+    message.metadata.response_code = response_code(text(value, "rcode"));
+    message.add_query(lookup.question.clone());
+    message.answers = texts(value, "answer").iter().map(|l| record(l)).collect();
+    message.authorities = texts(value, "authority")
+        .iter()
+        .map(|l| record(l))
+        .collect();
+    message.additionals = texts(value, "additional")
+        .iter()
+        .map(|l| record(l))
+        .collect();
+    Looked::Response(message)
+}
+
+/// Compares a copy's reply with Lean's (`responseJson`): the RCODE, AA,
+/// answer and authority sections, and the required additional RRsets.
+/// Any other additional RRset must be one the real zone sends in
+/// `upstream`, its response to the same question.
+fn compare_copy_reply(
+    lean: &Value,
+    upstream: &Value,
+    reply: &Message,
+    tally: &mut Tally,
+) -> Result<(), String> {
+    let lines = |records: &[Record]| -> Vec<String> { records.iter().map(zone_line).collect() };
+    same(
+        "rcode",
+        text(lean, "rcode").to_string(),
+        rcode_text(reply.metadata.response_code),
+    )?;
+    same("aa", flag(lean, "aa"), reply.metadata.authoritative)?;
+    same(
+        "answer",
+        section(&texts(lean, "answer")),
+        section(&lines(&reply.answers)),
+    )?;
+    same(
+        "authority",
+        section(&texts(lean, "authority")),
+        section(&lines(&reply.authorities)),
+    )?;
+    let required = number(lean, "required_additional") as usize;
+    let (needed, _) = additional(&texts(lean, "additional"), required);
+    let rust = section(&lines(&reply.additionals));
+    if !rust.is_superset(&needed) {
+        return Err(format!(
+            "additional: Lean requires {needed:?}, Rust sent {rust:?}"
+        ));
+    }
+    let real = section(&texts(upstream, "additional"));
+    if !rust.is_subset(&real) {
+        return Err(format!(
+            "additional: Rust sent {rust:?}, the real zone {real:?}"
+        ));
+    }
+    if rust != real {
+        tally.note("replies from a copy without optional additional data it does not hold");
+    }
+    Ok(())
+}
+
+/// The question of one step of a `learned.json` or `learned_signed.json`
+/// case.
+fn step_question(step: &Value) -> (Name, RecordType) {
+    let question = field(step, "request");
+    (
+        name(text(question, "qname")),
+        RecordType::from(type_code(text(question, "qtype"))),
+    )
+}
+
+/// Each `learned.json` zone copied by a server that holds nothing at
+/// first, asked the case's questions in turn through [`AuthorityEngine`],
+/// with each lookup answered by what the real zone answers (Lean's
+/// `answer`), against Lean's `Authority.serve` over its own copy. A reply
+/// must match Lean's ([`compare_copy_reply`]), so every negative is the
+/// real zone's (`serve_reply_upstream`), and silence must match silence.
+/// The two copies file at different grains, a whole node in Lean and an
+/// RRset in Rust, so which questions need a lookup is not compared, only
+/// that each lookup is the client's question at the server's own
+/// address, at most once ([`check_lookups`]).
+#[test]
+fn learned_copies() {
+    each_case("learned", |case, tally| {
+        let input = field(case, "input");
+        let apex = name(text(field(input, "zone"), "apex"));
+        let server = ServerConfig {
+            any: any_response(text(input, "any")),
+            ..ServerConfig::generic()
+        };
+        let mut engine = copy_engine(&apex, server);
+        for (index, step) in list(case, "steps").iter().enumerate() {
+            let (qname, qtype) = step_question(step);
+            let at =
+                |why: String| format!("question {index}, {} {qtype}: {why}", name_text(&qname));
+            let upstream = field(step, "upstream");
+            let real = |lookup: &Lookup| vector_looked(lookup, upstream);
+            let (replies, lookups) = ask_copy(&mut engine, copy_query(&qname, qtype, false), &real);
+            check_lookups(&lookups, &apex, &qname, qtype).map_err(at)?;
+            match (field(step, "expected").get("reply"), replies.as_slice()) {
+                (None, []) => {}
+                (Some(lean), [reply]) => {
+                    compare_copy_reply(lean, upstream, reply, tally).map_err(at)?
+                }
+                (None, [reply]) => {
+                    return Err(at(format!(
+                        "Lean is silent; Rust replied {}",
+                        rcode_text(reply.metadata.response_code)
+                    )));
+                }
+                (Some(_), []) => return Err(at("Lean replied; Rust is silent".to_string())),
+                (_, more) => return Err(at(format!("{} replies to one query", more.len()))),
+            }
+        }
+        Ok(())
+    });
+}
+
+// ---------------------------------------------------------------------
 // policy.json: AlgorithmPolicy
 // ---------------------------------------------------------------------
 
@@ -1898,6 +2128,110 @@ fn final_name(qname: &Name, qtype: RecordType, answers: &[Record]) -> Name {
     }
 }
 
+/// How much of Lean's additional section a signed answer must carry.
+#[derive(Clone, Copy)]
+enum Extra {
+    /// All of it, as a zone that holds every address does.
+    Exact,
+    /// Its first so many RRsets, the required ones, and any of the rest,
+    /// as a copy that may not hold every optional address does.
+    Required(usize),
+}
+
+/// Compares `message`, an answer to `qname` from the signed zone at
+/// `apex` or a copy of it, with the answer Lean writes for it
+/// (`signedAnswerFields`): the RCODE, AA, every section with its RRSIGs
+/// in `form`, and the denial records.
+fn compare_signed(
+    expected: &Value,
+    message: &Message,
+    qname: &Name,
+    apex: &Name,
+    form: Form<'_>,
+    extra: Extra,
+    tally: &mut Tally,
+) -> Result<(), String> {
+    let lines = |records: &mut dyn Iterator<Item = &Record>| -> Vec<String> {
+        records.map(|r| line(r, form)).collect()
+    };
+    same(
+        "rcode",
+        text(expected, "rcode").to_string(),
+        rcode_text(message.metadata.response_code),
+    )?;
+    same("aa", flag(expected, "aa"), message.metadata.authoritative)?;
+    same(
+        "answer",
+        section(&texts(expected, "answer")),
+        section(&lines(&mut message.answers.iter())),
+    )?;
+    same(
+        "authority",
+        section(&texts(expected, "authority")),
+        section(&lines(
+            &mut message.authorities.iter().filter(|r| !is_denial(r)),
+        )),
+    )?;
+    // Lean writes one record each time a proof needs it; a message
+    // holds each record once (RFC 2181 §5).
+    let lean_denial: BTreeSet<String> = texts(expected, "denial").into_iter().collect();
+    let mut rust_denial: BTreeSet<String> =
+        lines(&mut message.authorities.iter().filter(|r| is_denial(r)))
+            .into_iter()
+            .collect();
+    // For NODATA at a name that is itself a wildcard, RFC 5155 §7.2.3
+    // needs only the NSEC3 matching it. Rust also sends the one
+    // matching the wildcard's parent, which the NODATA of a name a
+    // wildcard answered needs (§7.2.5); the extra record proves
+    // nothing false.
+    if qname.is_wildcard() && rust_denial.is_superset(&lean_denial) {
+        let parent = nsec3_owner(&qname.base_name(), apex);
+        let extra: Vec<&String> = rust_denial.difference(&lean_denial).collect();
+        if !extra.is_empty() && extra.iter().all(|l| l.starts_with(&parent)) {
+            tally.note(
+                "NODATA at a wildcard name with its parent's NSEC3 too, which Lean leaves out",
+            );
+            rust_denial = lean_denial.clone();
+        }
+    }
+    same("denial", lean_denial, rust_denial)?;
+    // The Lean model's signed answers carry no RRSIGs in the
+    // additional section.
+    let rust_additional = lines(
+        &mut message
+            .additionals
+            .iter()
+            .filter(|r| r.record_type() != RecordType::RRSIG),
+    );
+    let lean_additional = texts(expected, "additional");
+    match extra {
+        Extra::Exact => same(
+            "additional",
+            section(&lean_additional),
+            section(&rust_additional),
+        ),
+        Extra::Required(required) => {
+            let (needed, optional) = additional(&lean_additional, required);
+            let rust = section(&rust_additional);
+            if !rust.is_superset(&needed) {
+                return Err(format!(
+                    "additional: Lean requires {needed:?}, Rust sent {rust:?}"
+                ));
+            }
+            let allowed: BTreeSet<BTreeSet<String>> = needed.union(&optional).cloned().collect();
+            if !rust.is_subset(&allowed) {
+                return Err(format!(
+                    "additional: Rust sent {rust:?}, Lean allows {allowed:?}"
+                ));
+            }
+            if rust != allowed {
+                tally.note("replies from a copy without optional additional data it does not hold");
+            }
+            Ok(())
+        }
+    }
+}
+
 /// Signs a `signed.json` zone with `keys`, answers its question with
 /// DO=1, and validates the answer with `verify`: the answer lines and the
 /// validations, or `unknown`.
@@ -1951,58 +2285,14 @@ fn signed_case(
     };
     let rcode = message.metadata.response_code;
     if compare_lines {
-        same(
-            "rcode",
-            text(expected, "rcode").to_string(),
-            rcode_text(rcode),
-        )?;
-        same("aa", flag(expected, "aa"), message.metadata.authoritative)?;
-        same(
-            "answer",
-            section(&texts(expected, "answer")),
-            section(&lines(&mut answers.iter())),
-        )?;
-        same(
-            "authority",
-            section(&texts(expected, "authority")),
-            section(&lines(
-                &mut message.authorities.iter().filter(|r| !is_denial(r)),
-            )),
-        )?;
-        // Lean writes one record each time a proof needs it; a message
-        // holds each record once (RFC 2181 §5).
-        let lean_denial: BTreeSet<String> = texts(expected, "denial").into_iter().collect();
-        let mut rust_denial: BTreeSet<String> =
-            lines(&mut message.authorities.iter().filter(|r| is_denial(r)))
-                .into_iter()
-                .collect();
-        // For NODATA at a name that is itself a wildcard, RFC 5155 §7.2.3
-        // needs only the NSEC3 matching it. Rust also sends the one
-        // matching the wildcard's parent, which the NODATA of a name a
-        // wildcard answered needs (§7.2.5); the extra record proves
-        // nothing false.
-        if req.question.name().is_wildcard() && rust_denial.is_superset(&lean_denial) {
-            let parent = nsec3_owner(&req.question.name().base_name(), &apex_of(&signed));
-            let extra: Vec<&String> = rust_denial.difference(&lean_denial).collect();
-            if !extra.is_empty() && extra.iter().all(|l| l.starts_with(&parent)) {
-                tally.note(
-                    "NODATA at a wildcard name with its parent's NSEC3 too, which Lean leaves out",
-                );
-                rust_denial = lean_denial.clone();
-            }
-        }
-        same("denial", lean_denial, rust_denial)?;
-        // The Lean model's signed answers carry no RRSIGs in the
-        // additional section.
-        same(
-            "additional",
-            section(&texts(expected, "additional")),
-            section(&lines(
-                &mut message
-                    .additionals
-                    .iter()
-                    .filter(|r| r.record_type() != RecordType::RRSIG),
-            )),
+        compare_signed(
+            expected,
+            message,
+            req.question.name(),
+            &apex_of(&signed),
+            form,
+            Extra::Exact,
+            tally,
         )?;
     }
     let apex = Name::from(signed.apex());
@@ -2198,6 +2488,73 @@ fn parent_chain(
 fn signed_symbolic() {
     each_case("signed", |case, tally| {
         signed_case(case, &mut SymbolicKeys, &Oracle, tally, true)
+    });
+}
+
+/// Each `learned_signed.json` zone, signed as `signed.json` signs it,
+/// copied by a server that holds nothing at first and asked the case's
+/// questions in turn with DO=1 through [`AuthorityEngine`], each lookup
+/// answered by the signed zone. Every reply must be Lean's answer of the
+/// signed zone (`SignedZone.answerDo`, compared as [`compare_signed`]
+/// does): the records with the RRSIGs the real servers sent, never signed
+/// again, and the NSEC or NSEC3 records of every negative and wildcard
+/// answer, which the Lean copy does not model. Each lookup is the
+/// client's question at the server's own address, at most once.
+#[test]
+fn learned_signed_copies() {
+    each_case("learned_signed", |case, tally| {
+        let input = field(case, "input");
+        let zone = vector_zone(field(input, "zone"))?;
+        let specs = key_specs(input);
+        let keys = key_set(&specs, &mut SymbolicKeys);
+        let tags = tag_names(&specs, &keys, &BTreeMap::new());
+        let window = vector_window(field(input, "window"));
+        let signed = zone
+            .signed(&keys, window, vector_denial(field(input, "denial")))
+            .map_err(|e| format!("signing failed: {e}"))?;
+        let apex = apex_of(&signed);
+        let real = |lookup: &Lookup| {
+            let question = &lookup.question;
+            let asked = request(question.name(), question.query_type(), true);
+            match answer(&signed, &asked, AnyResponse::All) {
+                Answered::Response(response) => Looked::Response(response.message),
+                Answered::Unknown { .. } => Looked::NoReply,
+            }
+        };
+        let server = ServerConfig {
+            any: AnyResponse::All,
+            ..ServerConfig::generic()
+        };
+        let mut engine = copy_engine(&apex, server);
+        for (index, step) in list(case, "steps").iter().enumerate() {
+            let (qname, qtype) = step_question(step);
+            let at =
+                |why: String| format!("question {index}, {} {qtype}: {why}", name_text(&qname));
+            let (replies, lookups) = ask_copy(&mut engine, copy_query(&qname, qtype, true), &real);
+            check_lookups(&lookups, &apex, &qname, qtype).map_err(at)?;
+            let expected = field(step, "expected");
+            if let Some(unknown) = expected.get("unknown") {
+                return Err(at(format!(
+                    "Lean's complete zone answered unknown at {unknown:?}"
+                )));
+            }
+            let extra = Extra::Required(number(expected, "required_additional") as usize);
+            match replies.as_slice() {
+                [reply] => compare_signed(
+                    expected,
+                    reply,
+                    &qname,
+                    &apex,
+                    Form::Zone(&tags),
+                    extra,
+                    tally,
+                )
+                .map_err(at)?,
+                [] => return Err(at("Rust is silent".to_string())),
+                more => return Err(at(format!("{} replies to one query", more.len()))),
+            }
+        }
+        Ok(())
     });
 }
 
