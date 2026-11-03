@@ -18,7 +18,7 @@ use fictionet::stdlib::protocols::dns::{Nsid, Parsed, Request, Response};
 use fictionet::stdlib::services::dns::authority::{Identity, Observe, ServerConfig};
 use fictionet::stdlib::services::dns::resolver::Config;
 use fictionet::stdlib::services::dns::zone::{
-    Answered, AnyResponse, Filing, Zone, ZoneData, answer,
+    Answered, AnyResponse, Filing, Section, Zone, ZoneData, answer,
 };
 use fictionet::stdlib::services::dns::{Client, Event, Generation, Looked, Lookup, WallClock};
 use fictionet::stdlib::services::serve::Transport;
@@ -82,6 +82,8 @@ home. 172800 IN NS ns.home.
 ns.home. 172800 IN A 45.70.0.9
 cloudflare-dns.com. 300 IN A 45.33.6.6
 alias-dns.com. 300 IN CNAME cloudflare-dns.com.
+renamed. 300 IN DNAME com.
+doh.com. 300 IN A 45.33.6.7
 plain. 300 IN A 45.33.7.7
 ";
 
@@ -954,9 +956,43 @@ fn a_front_for_an_alias_goes_at_its_targets_addresses() {
     });
 }
 
-/// A filing as a test compares it: its zone, and the owner and type of
-/// each RRset it kept.
-type Kept = (String, Vec<(String, RecordType)>);
+/// A front's name below a DNAME gets its front at the addresses filed
+/// for the name the DNAME substitutes for it (RFC 6672 §2.2), although
+/// the copy keeps the DNAME and not the CNAME synthesized from it.
+#[test]
+fn a_front_below_a_dname_goes_at_its_substitutes_addresses() {
+    world(Duration::from_secs(60), |fcx| async move {
+        let hierarchy = Hierarchy::new();
+        let at = location();
+        let (attacher, attachments) = fictionet::attachments();
+        let net = Net::new().ipv4_only();
+        let handle = net.handle();
+        let mirror = Mirror::new(hierarchy.clone(), handle.clone(), &at)
+            .front(Name::from_ascii("doh.renamed.")?, |host| host);
+        net.hosts(internet::root_servers(|s| mirror.server(s), &at))
+            .start(&fcx, attachments)?;
+        let m = machine(&fcx, attacher.attach("client")?, ME);
+        let a_root = ROOT_LETTERS[0].server.v4;
+        let front = v4(45, 33, 6, 7);
+
+        assert!(!handle.has_machine(front));
+        let reply = ask(
+            &fcx,
+            &m,
+            a_root,
+            &query(1, "doh.renamed.", RecordType::A, false),
+        )
+        .await
+        .expect("an answer");
+        assert_eq!(addresses(&reply), vec![front]);
+        assert!(handle.has_machine(front), "the front is placed");
+        Ok(())
+    });
+}
+
+/// A filing as a test compares it: its zone, and the section, owner, and
+/// type of each RRset it kept.
+type Kept = (String, Vec<(Section, String, RecordType)>);
 
 /// The mirror's observers see what each response gave a mirrored zone,
 /// as the zone keeps it, before the reply that needed it leaves: the
@@ -982,7 +1018,7 @@ fn observers_see_each_filing_before_the_reply_leaves() {
             let sets = filing
                 .sets
                 .iter()
-                .map(|set| (set.name().to_ascii(), set.record_type()))
+                .map(|(section, set)| (*section, set.name().to_ascii(), set.record_type()))
                 .collect();
             seen.lock().unwrap().push((filing.zone.to_ascii(), sets));
         });
@@ -1005,8 +1041,8 @@ fn observers_see_each_filing_before_the_reply_leaves() {
             vec![(
                 ".".to_string(),
                 vec![
-                    ("direct.".to_string(), RecordType::NS),
-                    ("ns.direct.".to_string(), RecordType::A),
+                    (Section::Authority, "direct.".to_string(), RecordType::NS),
+                    (Section::Additional, "ns.direct.".to_string(), RecordType::A),
                 ]
             )]
         );
@@ -1016,7 +1052,8 @@ fn observers_see_each_filing_before_the_reply_leaves() {
         let last = filings.lock().unwrap().last().cloned().expect("a filing");
         assert_eq!(last.0, "direct.");
         assert!(
-            last.1.contains(&("www.direct.".to_string(), RecordType::A)),
+            last.1
+                .contains(&(Section::Answer, "www.direct.".to_string(), RecordType::A)),
             "{last:?}"
         );
 

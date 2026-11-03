@@ -33,7 +33,7 @@ use fictionet::stdlib::network::ip::non_public_address;
 use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RData};
 use fictionet::stdlib::services::dns::Event;
 use fictionet::stdlib::services::dns::resolver::{Config, NegativeAnchors};
-use fictionet::stdlib::services::dns::zone::Filing;
+use fictionet::stdlib::services::dns::zone::{Filing, Section};
 use fictionet::stdlib::services::tls::ServerConfig;
 use fictionet::stdlib::web;
 use fictionet::stdlib::world::net::dns::encrypted::Fronts;
@@ -253,13 +253,17 @@ struct Sites {
 
 impl Sites {
     /// Places a machine at each IPv4 address `filing`, what a mirrored
-    /// zone filed, gives in an A record, for the record's name and every
-    /// name a CNAME made an alias of it, as long as the session lets the
-    /// name out. A filed CNAME whose target's addresses were filed before
-    /// places its owner there too, since a resolver that has the target's
-    /// addresses cached does not ask for them again. A name is placed at
-    /// an address once: several names at one address share its machine,
-    /// and TLS tells them apart by SNI, as at a CDN's address.
+    /// zone filed, gives in an A record of an answer section, for the
+    /// record's name and every name a CNAME or DNAME made an alias of
+    /// it, as long as the session lets the name out. Addresses from a
+    /// referral's glue or a response's additional data are a name
+    /// server's, which a guest reaches over DNS, so they place nothing.
+    /// A filed CNAME whose target's addresses were filed before places
+    /// its owner there too, and a filed DNAME the names it substitutes
+    /// those names for, since a resolver that has the target's addresses
+    /// cached does not ask for them again. A name is placed at an address
+    /// once: several names at one address share its machine, and TLS
+    /// tells them apart by SNI, as at a CDN's address.
     ///
     /// The network has no IPv6, so AAAA records place nothing. An address
     /// the network refuses, such as one on the sandboxes' subnet, or one
@@ -268,13 +272,14 @@ impl Sites {
     /// serve, outside Live-Depth's depth, gets no site: a machine there
     /// with no services refuses connections at TCP.
     fn place(&self, filing: &Filing) {
-        let records = || {
+        let answers = || {
             filing
                 .sets
                 .iter()
-                .flat_map(|set| set.records_without_rrsigs())
+                .filter(|(section, _)| *section == Section::Answer)
+                .flat_map(|(_, set)| set.records_without_rrsigs())
         };
-        let mut found: Vec<(LowerName, Ipv4Addr)> = records()
+        let mut found: Vec<(LowerName, Ipv4Addr)> = answers()
             .filter_map(|record| match &record.data {
                 RData::A(a) if !non_public_address(a.0.into()) => {
                     Some((LowerName::new(&record.name), a.0))
@@ -287,12 +292,25 @@ impl Sites {
             for (name, addr) in &found {
                 addresses.entry(name.clone()).or_default().insert(*addr);
             }
-            for record in records() {
+            for record in answers() {
                 if let RData::CNAME(cname) = &record.data
                     && let Some(known) = addresses.get(&LowerName::new(&cname.0))
                 {
                     let owner = LowerName::new(&record.name);
                     found.extend(known.iter().map(|addr| (owner.clone(), *addr)));
+                }
+            }
+            let filed: HashMap<LowerName, HashSet<LowerName>> =
+                dns::dnames(filing).fold(HashMap::new(), |mut filed, (owner, target)| {
+                    filed
+                        .entry(LowerName::new(&target))
+                        .or_default()
+                        .insert(owner);
+                    filed
+                });
+            for (name, known) in addresses.iter() {
+                for original in dns::substituted_for(&filed, name) {
+                    found.extend(known.iter().map(|addr| (original.clone(), *addr)));
                 }
             }
             let mut placing = Vec::new();

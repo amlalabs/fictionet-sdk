@@ -79,17 +79,20 @@ took 98 s using the existing verified Ubuntu downloads and produced a standalone
 startup services. Search explicitly reports typed facts from its request and
 tool handlers, its resolvers and the typed no-route callback on its network.
 
-The world's DNS is the real hierarchy, relayed. The gateway runs a resolver
+The world's DNS is a copy of the real hierarchy. The gateway runs a resolver
 like Unbound with the root hints. The root servers, the `gtld-servers.net`
 servers, and Google, Cloudflare, Quad9, and OpenDNS answer at their real
-addresses. Every name server a reply names gets a relay at its address. So
-`dig`, `dig +trace`, `dig @8.8.8.8`, and `delv` see real addresses and real
+addresses. The world's servers never pass a real server's reply on. Each one
+answers from records it copied from the real servers of its zone, and looks a
+question up at a real server only when its copy lacks the answer. Every name
+server the copied records name gets a server at its address. So `dig`,
+`dig +trace`, `dig @8.8.8.8`, and `delv` see real addresses and real
 signatures, and each site's machine stands at the address the real DNS gives
 it. Only questions the world's policy allows reach real servers. In Live,
 Live-Depth, and Edited it allows any name. In Copied it allows the names the
 session serves, the names above them that a resolver asks on the way,
-underscore names under them, reverse names, and names the real servers named
-in their replies.
+underscore names under them, reverse names, and names in the records the
+copies hold.
 
 [app/src/page/](app/src/page/) projects those facts into the map, site details,
 model calls and recent activity. Selecting a site or gateway keeps the map

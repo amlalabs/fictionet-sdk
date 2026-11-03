@@ -50,13 +50,15 @@ use fictionet::stdlib::protocols::dns::rr::rdata::TXT;
 use fictionet::stdlib::protocols::dns::rr::{
     DNSClass, LowerName, Name, RData, Record, RecordSet, RecordType,
 };
-use fictionet::stdlib::protocols::dns::{Ede, EdeCode, Nsid, Request};
+use fictionet::stdlib::protocols::dns::{Ede, EdeCode, Nsid, Request, dname_substitute};
 use fictionet::stdlib::protocols::urlencoded_form::{self, Form};
 use fictionet::stdlib::services::dns::authority::{
     Authority, ChaosAnswer, ChaosReply, Copies, Identity, ServerConfig, Step, chaos,
 };
 use fictionet::stdlib::services::dns::resolver::Config;
-use fictionet::stdlib::services::dns::zone::{AnyResponse, Filing, Shown, Zone, ZoneError};
+use fictionet::stdlib::services::dns::zone::{
+    AnyResponse, Filing, Shown, Zone, ZoneError, dname_target,
+};
 use fictionet::stdlib::services::dns::{Client, Generation, Looked, Lookup, WallClock};
 use fictionet::stdlib::web::httpd::{self, Body, request_host};
 use fictionet::sync::Mutex;
@@ -1579,22 +1581,42 @@ struct Named {
     /// The target of each filed CNAME, by owner, so a front's name that
     /// is an alias finds its addresses.
     aliases: HashMap<LowerName, LowerName>,
+    /// The target of each filed DNAME, by owner, so a front's name below
+    /// one finds the addresses of the name it substitutes.
+    dnames: HashMap<LowerName, Name>,
 }
 
 impl Named {
     /// The addresses filed for `name` or for the name at the end of its
-    /// CNAME chain.
+    /// CNAME and DNAME chain. A DNAME above a name redirects it before
+    /// any CNAME at it, since the DNAME's zone holds nothing below its
+    /// owner (RFC 6672 §2.3).
     fn addresses_of(&self, name: &LowerName) -> Vec<IpAddr> {
-        let mut name = name;
-        let mut seen = vec![name];
-        while let Some(target) = self.aliases.get(name) {
+        let mut name = name.clone();
+        let mut seen = vec![name.clone()];
+        while let Some(target) = self.alias_of(&name) {
             if seen.contains(&target) {
                 return Vec::new();
             }
-            seen.push(target);
+            seen.push(target.clone());
             name = target;
         }
-        self.addresses.get(name).cloned().unwrap_or_default()
+        self.addresses.get(&name).cloned().unwrap_or_default()
+    }
+
+    /// The name a filed DNAME above `name` substitutes for it, or else
+    /// the target of a filed CNAME at `name`.
+    fn alias_of(&self, name: &LowerName) -> Option<LowerName> {
+        let full = Name::from(name.clone());
+        let mut owner = name.clone();
+        while !owner.is_root() {
+            owner = owner.base_name();
+            if let Some(target) = self.dnames.get(&owner) {
+                return dname_substitute(&full, &Name::from(owner), target)
+                    .map(|substituted| LowerName::new(&substituted));
+            }
+        }
+        self.aliases.get(name).cloned()
     }
 }
 
@@ -1690,13 +1712,13 @@ impl Mirror {
     }
 
     /// Places `build(host)` at each address filed for `name` in an A or
-    /// AAAA RRset, or for the name at the end of its CNAME chain, the
-    /// first time it is filed, joining a machine that is there. `host` is
-    /// a host at that address only, and an address no internet host can
-    /// have gets none, as with servers. A
-    /// world uses it for a public resolver's DNS over HTTPS front at the
-    /// addresses of [`PublicResolver::doh`] names, such as
-    /// `cloudflare-dns.com`, which are not the resolver's own.
+    /// AAAA RRset, or for the name at the end of its CNAME and DNAME
+    /// chain, the first time it is filed, joining a machine that is
+    /// there. `host` is a host at that address only, and an address no
+    /// internet host can have gets none, as with servers. A world uses it
+    /// for a public resolver's DNS over HTTPS front at the addresses of
+    /// [`PublicResolver::doh`] names, such as `cloudflare-dns.com`, which
+    /// are not the resolver's own.
     pub fn front(self, name: Name, build: impl Fn(Host) -> Host + Send + Sync + 'static) -> Mirror {
         let name = LowerName::new(&name);
         self.with(|inner| inner.fronts.push((name, Arc::new(build))))
@@ -1732,7 +1754,8 @@ impl Inner {
         let mut targets: HashMap<LowerName, HashSet<LowerName>> = HashMap::new();
         let mut addresses: Vec<(LowerName, IpAddr)> = Vec::new();
         let mut aliases: Vec<(LowerName, LowerName)> = Vec::new();
-        for set in &filing.sets {
+        let mut dnames: Vec<(LowerName, Name)> = Vec::new();
+        for (_, set) in &filing.sets {
             let owner = LowerName::new(set.name());
             for record in set.records_without_rrsigs() {
                 match &record.data {
@@ -1743,7 +1766,10 @@ impl Inner {
                             .insert(owner.clone());
                     }
                     RData::CNAME(cname) => aliases.push((owner.clone(), LowerName::new(&cname.0))),
-                    data => addresses.extend(data.ip_addr().map(|addr| (owner.clone(), addr))),
+                    data => match dname_target(data) {
+                        Some(target) => dnames.push((owner.clone(), target)),
+                        None => addresses.extend(data.ip_addr().map(|addr| (owner.clone(), addr))),
+                    },
                 }
             }
         }
@@ -1757,6 +1783,7 @@ impl Inner {
                 }
             }
             named.aliases.extend(aliases);
+            named.dnames.extend(dnames);
             for (target, zones) in &targets {
                 named
                     .targets
