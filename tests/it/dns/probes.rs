@@ -28,8 +28,9 @@ use fictionet::stdlib::services::dns::Event;
 use fictionet::stdlib::services::dns::authority::{ChaosAnswer, Identity, chaos};
 use fictionet::stdlib::world::net::Net;
 use fictionet::stdlib::world::net::dns::Recursive;
-use fictionet::stdlib::world::net::dns::internet::{GTLD_SERVERS, ROOT_SERVERS};
+use fictionet::stdlib::world::net::dns::internet::ROOT_SERVERS;
 use fictionet_extras::dns::public::PUBLIC_RESOLVERS;
+use fictionet_extras::dns::roots::GTLD_SERVERS;
 use fictionet_test_support::dns::{
     ECH, EGRESS, EXAMPLE_COM, ROOT_SERIAL, TestInternet, WWW_EXAMPLE_COM,
 };

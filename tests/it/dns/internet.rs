@@ -22,14 +22,13 @@ use fictionet::stdlib::services::dns::zone::{
 };
 use fictionet::stdlib::services::dns::{Client, Event, Generation, Looked, Lookup, WallClock};
 use fictionet::stdlib::services::serve::Transport;
-use fictionet::stdlib::world::net::dns::internet::{
-    self, GTLD_SERVERS, Mirror, NameServer, ROOT_SERVERS,
-};
+use fictionet::stdlib::world::net::dns::internet::{self, Mirror, NameServer, ROOT_SERVERS};
 use fictionet::stdlib::world::net::dns::{self, Recursive, Upstream};
 use fictionet::stdlib::world::net::{Host, Net, NetHandle};
 use fictionet_extras::dns::place::{Place, ResolverSite};
 use fictionet_extras::dns::public::{PUBLIC_RESOLVERS, PublicResolver};
-use fictionet_extras::dns::{roots, unbound};
+use fictionet_extras::dns::roots::{self, GTLD_SERVERS};
+use fictionet_extras::dns::unbound;
 use fictionet_test_support::sandbox::{Machine, machine};
 use fictionet_test_support::timeout;
 
@@ -261,23 +260,12 @@ fn resolver_config(resolver: &PublicResolver, site: &ResolverSite) -> Config {
 fn mirror(upstream: impl Upstream, handle: NetHandle) -> Mirror {
     let at = place();
     let echo = at.echo(EGRESS);
-    let mut mirror = Mirror::new(upstream, handle)
-        .delay(at.authority_rtt / 2)
-        .egress(IpAddr::V4(EGRESS))
-        .wrap(move |authority| echo.over(authority));
-    for letter in &ROOT_SERVERS {
-        for addr in letter.addresses() {
-            mirror = mirror.serves(addr, &Name::root());
-        }
-    }
-    for server in &GTLD_SERVERS {
-        for addr in server.addresses() {
-            for zone in ["com.", "net."] {
-                mirror = mirror.serves(addr, &Name::from_ascii(zone).unwrap());
-            }
-        }
-    }
-    mirror
+    roots::seed(
+        Mirror::new(upstream, handle)
+            .delay(at.authority_rtt / 2)
+            .egress(IpAddr::V4(EGRESS))
+            .wrap(move |authority| echo.over(authority)),
+    )
 }
 
 /// A query for `name` of type `kind`, with RD as given and an OPT record.

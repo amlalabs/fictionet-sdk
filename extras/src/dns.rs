@@ -19,8 +19,9 @@
 //! SDK's primitives: [`public`] has the large public resolvers, [`doh`]
 //! what their DNS over HTTPS servers answer past RFC 8484, [`place`]
 //! how the root, `gtld-servers.net`, and public resolver servers look
-//! from one place, and [`roots`] what those servers' software does
-//! everywhere. [`unbound`] plays Unbound's configuration, and [`bind`]
+//! from one place, and [`roots`] the `gtld-servers.net` servers' addresses,
+//! what the root and `gtld-servers.net` servers' software does
+//! everywhere, and the zones a mirror serves at their addresses. [`unbound`] plays Unbound's configuration, and [`bind`]
 //! BIND's CHAOS-class zones.
 
 pub mod bind;

@@ -19,12 +19,12 @@ use fictionet::stdlib::services::dns::authority::{
     ChaosAnswer, ChaosReply, Identity, ServerConfig, chaos,
 };
 use fictionet::stdlib::services::dns::resolver::ROOT_SERVERS;
-use fictionet::stdlib::world::net::dns::internet::{self, Echo, GTLD_SERVERS};
+use fictionet::stdlib::world::net::dns::internet::{self, Echo};
 use fictionet::stdlib::world::net::{Host, Program};
 
 use super::bind;
 use super::public::{self, PUBLIC_RESOLVERS, PublicResolver};
-use super::roots;
+use super::roots::{self, GTLD_SERVERS};
 
 /// How one anycast server looks from a place: the round trip to the
 /// instance that answers there, and what that instance says about itself.
@@ -101,11 +101,11 @@ impl Place {
     }
 
     /// The `gtld-servers.net` servers as seen from here
-    /// ([`internet::gtld_servers`]): each host behind [`Host::delay`] with
+    /// ([`roots::gtld_servers`]): each host behind [`Host::delay`] with
     /// half its round trip, running `program` with the server's front and
     /// its identity here.
     pub fn gtld_servers<P: Program>(&self, program: impl Fn(ServerConfig) -> P) -> Vec<Host> {
-        internet::gtld_servers(|server, host| {
+        roots::gtld_servers(|server, host| {
             let site = self.site(IpAddr::V4(server.v4));
             host.delay(site.rtt / 2)
                 .program(program(roots::gtld_front(site.identity)))

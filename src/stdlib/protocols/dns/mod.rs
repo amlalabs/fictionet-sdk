@@ -4,9 +4,9 @@
 //! Use this module to read and answer DNS queries in a world that runs its
 //! own DNS server. If the world is a set of websites,
 //! [`web::Sites`](fictionet::stdlib::web::Sites) already runs one for you.
-//! [`net::Net`](fictionet::stdlib::world::net::Net) runs a recursive resolver
-//! like Unbound at each gateway, on UDP and TCP port 53, which answers the
-//! names the network's hosts declare and has no route to the internet. Its
+//! [`net::Net`](fictionet::stdlib::world::net::Net) runs a recursive resolver at
+//! each gateway, on UDP and TCP port 53, which answers the names the
+//! network's hosts declare and has no route to the internet. Its
 //! engines are in [`services::dns`](fictionet::stdlib::services::dns), and
 //! the programs that run them on a host, authoritative servers among them,
 //! are in [`net::dns`](fictionet::stdlib::world::net::dns).
@@ -68,7 +68,7 @@
 //! ```
 //!
 //! A server with rules of its own, such as one that answers EDNS versions
-//! above 0 the way Cloudflare's resolver does, writes an
+//! above 0 instead of sending BADVERS (RFC 6891 §6.1.3), writes an
 //! [`Authority`](fictionet::stdlib::services::dns::authority::Authority)
 //! or wraps one, and keeps the rules above through the same front.
 

@@ -32,18 +32,18 @@ use fictionet::Cx;
 use fictionet::stdlib::network::ip::non_public_address;
 use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RData};
 use fictionet::stdlib::services::dns::Event;
-use fictionet::stdlib::services::dns::resolver::{Config, NegativeAnchors, ROOT_SERVERS};
+use fictionet::stdlib::services::dns::resolver::{Config, NegativeAnchors};
 use fictionet::stdlib::services::dns::zone::{Filing, Section};
 use fictionet::stdlib::services::tls::ServerConfig;
 use fictionet::stdlib::web;
 use fictionet::stdlib::world::net::dns::encrypted::Fronts;
-use fictionet::stdlib::world::net::dns::internet::{GTLD_SERVERS, Mirror};
+use fictionet::stdlib::world::net::dns::internet::Mirror;
 use fictionet::stdlib::world::net::dns::{Only, PerSession, Recursive};
 use fictionet::stdlib::world::net::{Host, Net, NetHandle};
 use fictionet::sync::Mutex;
 use fictionet_extras::dns::place::Place;
 use fictionet_extras::dns::public::PUBLIC_RESOLVERS;
-use fictionet_extras::dns::unbound;
+use fictionet_extras::dns::{roots, unbound};
 
 use observation::SearchObs;
 use pages::Pages;
@@ -130,25 +130,13 @@ pub fn net(
             }
         });
     }
-    let mut mirror = Mirror::new(Only::new(outbound.policy(), upstream), handle)
-        .delay(place.authority_rtt / 2)
-        .namespace(&namespace)
-        .observe(outbound.observer())
-        .observe(move |filing| sites.place(filing));
-    // The root letters serve the root, and the `gtld-servers.net`
-    // servers `com` and `net`.
-    for server in &ROOT_SERVERS {
-        for addr in server.addresses() {
-            mirror = mirror.serves(addr, &Name::root());
-        }
-    }
-    for server in &GTLD_SERVERS {
-        for addr in server.addresses() {
-            for zone in ["com.", "net."] {
-                mirror = mirror.serves(addr, &Name::from_ascii(zone).expect("a valid name"));
-            }
-        }
-    }
+    let mut mirror = roots::seed(
+        Mirror::new(Only::new(outbound.policy(), upstream), handle)
+            .delay(place.authority_rtt / 2)
+            .namespace(&namespace)
+            .observe(outbound.observer())
+            .observe(move |filing| sites.place(filing)),
+    );
     // The host asks every real server itself, so a real server that
     // echoes the asker's address would show the host's. A public
     // resolver's reply shows the resolver's own egress instead.

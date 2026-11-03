@@ -47,11 +47,11 @@ use fictionet::stdlib::services::dns::resolver::{Config, NameServer, ROOT_SERVER
 use fictionet::stdlib::services::dns::zone::{AnyResponse, Denial, Zone, ZoneData};
 use fictionet::stdlib::world::net::Host;
 use fictionet::stdlib::world::net::dns::Authoritative;
-use fictionet::stdlib::world::net::dns::internet::GTLD_SERVERS;
 use fictionet::{Seed, SeededEntropy};
 use fictionet_extras::dns::place::Place;
 use fictionet_extras::dns::public::PUBLIC_RESOLVERS;
-use fictionet_extras::dns::{roots, unbound};
+use fictionet_extras::dns::roots::{self, GTLD_SERVERS};
+use fictionet_extras::dns::unbound;
 
 /// The date every test of this internet runs at: 2026-11-01 00:00:00 UTC.
 pub const START: u64 = 1_793_491_200;

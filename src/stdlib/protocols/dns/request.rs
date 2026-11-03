@@ -4,8 +4,8 @@
 //! three outcomes: a [`Request`] to answer, a [`Reject`](Parsed::Reject)
 //! reply to send as it is, or [`Silent`](Parsed::Silent) for bytes that
 //! get no reply at all. A server that wants to bend one rule, such as
-//! answering EDNS versions above 0 the way Cloudflare's resolver does,
-//! wraps `parse` and changes the outcome.
+//! answering EDNS versions above 0 instead of sending BADVERS
+//! (RFC 6891 §6.1.3), wraps `parse` and changes the outcome.
 
 use super::op::{
     DEFAULT_MAX_PAYLOAD_LEN, Edns, Header, Message, MessageType, Metadata, OpCode, Query,

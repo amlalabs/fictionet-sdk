@@ -1,13 +1,17 @@
-//! What the root letters' and `gtld-servers.net` servers' software does
-//! wherever they answer: the payload size each advertises and its answer
-//! to QTYPE ANY, as fronts for a world's servers at their addresses.
+//! The root letters and the `gtld-servers.net` servers as a world plays
+//! them: the `gtld-servers.net` servers' names and addresses, what each
+//! server's software does wherever it answers (the payload size it
+//! advertises and its answer to QTYPE ANY) as fronts for a world's
+//! servers at their addresses, and the zones a [`Mirror`] serves there.
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
-use fictionet::stdlib::protocols::dns::rr::RecordType;
+use fictionet::stdlib::protocols::dns::rr::{Name, RecordType};
 use fictionet::stdlib::services::dns::authority::{Identity, ServerConfig};
 use fictionet::stdlib::services::dns::resolver::{NameServer, ROOT_SERVERS};
 use fictionet::stdlib::services::dns::zone::AnyResponse;
+use fictionet::stdlib::world::net::Host;
+use fictionet::stdlib::world::net::dns::internet::{Mirror, server_host};
 
 /// One of the thirteen root server letters, with what its operator's
 /// software does wherever it answers.
@@ -74,4 +78,107 @@ pub fn letter_at(v4: Ipv4Addr) -> Option<&'static Letter> {
 /// they were not measured at the `gtld-servers.net` servers themselves.
 pub fn gtld_front(identity: Identity) -> ServerConfig {
     ROOT_LETTERS[0].front(identity)
+}
+
+const fn server(host: &'static str, v4: Ipv4Addr, v6: Ipv6Addr) -> NameServer {
+    NameServer { host, v4, v6 }
+}
+
+/// The servers of `com` and `net`, which serve both zones, as the root
+/// zone's glue gave them on 2026-11-01.
+pub const GTLD_SERVERS: [NameServer; 13] = [
+    server(
+        "a.gtld-servers.net.",
+        Ipv4Addr::new(192, 5, 6, 30),
+        Ipv6Addr::new(0x2001, 0x503, 0xa83e, 0, 0, 0, 0x2, 0x30),
+    ),
+    server(
+        "b.gtld-servers.net.",
+        Ipv4Addr::new(192, 33, 14, 30),
+        Ipv6Addr::new(0x2001, 0x503, 0x231d, 0, 0, 0, 0x2, 0x30),
+    ),
+    server(
+        "c.gtld-servers.net.",
+        Ipv4Addr::new(192, 26, 92, 30),
+        Ipv6Addr::new(0x2001, 0x503, 0x83eb, 0, 0, 0, 0, 0x30),
+    ),
+    server(
+        "d.gtld-servers.net.",
+        Ipv4Addr::new(192, 31, 80, 30),
+        Ipv6Addr::new(0x2001, 0x500, 0x856e, 0, 0, 0, 0, 0x30),
+    ),
+    server(
+        "e.gtld-servers.net.",
+        Ipv4Addr::new(192, 12, 94, 30),
+        Ipv6Addr::new(0x2001, 0x502, 0x1ca1, 0, 0, 0, 0, 0x30),
+    ),
+    server(
+        "f.gtld-servers.net.",
+        Ipv4Addr::new(192, 35, 51, 30),
+        Ipv6Addr::new(0x2001, 0x503, 0xd414, 0, 0, 0, 0, 0x30),
+    ),
+    server(
+        "g.gtld-servers.net.",
+        Ipv4Addr::new(192, 42, 93, 30),
+        Ipv6Addr::new(0x2001, 0x503, 0xeea3, 0, 0, 0, 0, 0x30),
+    ),
+    server(
+        "h.gtld-servers.net.",
+        Ipv4Addr::new(192, 54, 112, 30),
+        Ipv6Addr::new(0x2001, 0x502, 0x8cc, 0, 0, 0, 0, 0x30),
+    ),
+    server(
+        "i.gtld-servers.net.",
+        Ipv4Addr::new(192, 43, 172, 30),
+        Ipv6Addr::new(0x2001, 0x503, 0x39c1, 0, 0, 0, 0, 0x30),
+    ),
+    server(
+        "j.gtld-servers.net.",
+        Ipv4Addr::new(192, 48, 79, 30),
+        Ipv6Addr::new(0x2001, 0x502, 0x7094, 0, 0, 0, 0, 0x30),
+    ),
+    server(
+        "k.gtld-servers.net.",
+        Ipv4Addr::new(192, 52, 178, 30),
+        Ipv6Addr::new(0x2001, 0x503, 0xd2d, 0, 0, 0, 0, 0x30),
+    ),
+    server(
+        "l.gtld-servers.net.",
+        Ipv4Addr::new(192, 41, 162, 30),
+        Ipv6Addr::new(0x2001, 0x500, 0xd937, 0, 0, 0, 0, 0x30),
+    ),
+    server(
+        "m.gtld-servers.net.",
+        Ipv4Addr::new(192, 55, 83, 30),
+        Ipv6Addr::new(0x2001, 0x501, 0xb1f9, 0, 0, 0, 0, 0x30),
+    ),
+];
+
+/// One host per `gtld-servers.net` server, at both of its addresses,
+/// finished by `build` as
+/// [`root_servers`](fictionet::stdlib::world::net::dns::internet::root_servers)
+/// finishes a root letter's.
+pub fn gtld_servers(build: impl Fn(&NameServer, Host) -> Host) -> Vec<Host> {
+    GTLD_SERVERS
+        .iter()
+        .map(|server| build(server, server_host(server)))
+        .collect()
+}
+
+/// `mirror`, told what the real servers at these addresses serve: the
+/// root at every root letter's addresses, and `com` and `net` at every
+/// `gtld-servers.net` server's.
+pub fn seed(mirror: Mirror) -> Mirror {
+    let root = ROOT_SERVERS
+        .iter()
+        .flat_map(|server| server.addresses())
+        .map(|addr| (addr, Name::root()));
+    let gtld = GTLD_SERVERS
+        .iter()
+        .flat_map(|server| server.addresses())
+        .flat_map(|addr| {
+            ["com.", "net."].map(|zone| (addr, Name::from_ascii(zone).expect("a valid name")))
+        });
+    root.chain(gtld)
+        .fold(mirror, |mirror, (addr, zone)| mirror.serves(addr, &zone))
 }

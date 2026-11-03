@@ -1,10 +1,11 @@
-//! The internet's DNS servers as hosts: the root and `gtld-servers.net`
-//! servers at their real addresses, and a [`Mirror`] that copies the real
-//! hierarchy onto machines at the real servers' addresses.
+//! The internet's DNS servers as hosts: the root servers at their real
+//! addresses, and a [`Mirror`] that copies the real hierarchy onto
+//! machines at the real servers' addresses.
 //!
-//! [`root_servers`] and [`gtld_servers`] return hosts at the addresses
-//! real clients know, so a guest that asks `198.41.0.4` directly reaches
-//! one. What runs on them, and how far away they are, is the world's
+//! [`root_servers`] returns hosts at the addresses real clients know, so
+//! a guest that asks `198.41.0.4` directly reaches one, and
+//! [`server_host`] does the same for any other [`NameServer`]. What runs
+//! on them, and how far away they are, is the world's
 //! choice: a world with its own root serves zones, and a world that shows
 //! the real internet serves copies of its zones, answered by the world's
 //! own servers.
@@ -27,12 +28,9 @@
 //! # Ok(())
 //! # }
 //! ```
-//!
-//! The addresses and names here were read on 2026-11-01: the root servers
-//! from IANA's `named.root`, the rest from the servers themselves.
 
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -53,7 +51,7 @@ use super::super::{Host, NetHandle};
 use super::{Authoritative, Namespace, PerSession, Upstream};
 
 // ---------------------------------------------------------------------------
-// Servers and their addresses
+// Hosts
 
 /// A host at both of `server`'s addresses, named for it, with nothing on
 /// it yet.
@@ -63,98 +61,12 @@ pub fn server_host(server: &NameServer) -> Host {
         .at(server.v6)
 }
 
-const fn server(host: &'static str, v4: Ipv4Addr, v6: Ipv6Addr) -> NameServer {
-    NameServer { host, v4, v6 }
-}
-
-/// The servers of `com` and `net`, which serve both zones, as the root
-/// zone's glue gave them on 2026-11-01.
-pub const GTLD_SERVERS: [NameServer; 13] = [
-    server(
-        "a.gtld-servers.net.",
-        Ipv4Addr::new(192, 5, 6, 30),
-        Ipv6Addr::new(0x2001, 0x503, 0xa83e, 0, 0, 0, 0x2, 0x30),
-    ),
-    server(
-        "b.gtld-servers.net.",
-        Ipv4Addr::new(192, 33, 14, 30),
-        Ipv6Addr::new(0x2001, 0x503, 0x231d, 0, 0, 0, 0x2, 0x30),
-    ),
-    server(
-        "c.gtld-servers.net.",
-        Ipv4Addr::new(192, 26, 92, 30),
-        Ipv6Addr::new(0x2001, 0x503, 0x83eb, 0, 0, 0, 0, 0x30),
-    ),
-    server(
-        "d.gtld-servers.net.",
-        Ipv4Addr::new(192, 31, 80, 30),
-        Ipv6Addr::new(0x2001, 0x500, 0x856e, 0, 0, 0, 0, 0x30),
-    ),
-    server(
-        "e.gtld-servers.net.",
-        Ipv4Addr::new(192, 12, 94, 30),
-        Ipv6Addr::new(0x2001, 0x502, 0x1ca1, 0, 0, 0, 0, 0x30),
-    ),
-    server(
-        "f.gtld-servers.net.",
-        Ipv4Addr::new(192, 35, 51, 30),
-        Ipv6Addr::new(0x2001, 0x503, 0xd414, 0, 0, 0, 0, 0x30),
-    ),
-    server(
-        "g.gtld-servers.net.",
-        Ipv4Addr::new(192, 42, 93, 30),
-        Ipv6Addr::new(0x2001, 0x503, 0xeea3, 0, 0, 0, 0, 0x30),
-    ),
-    server(
-        "h.gtld-servers.net.",
-        Ipv4Addr::new(192, 54, 112, 30),
-        Ipv6Addr::new(0x2001, 0x502, 0x8cc, 0, 0, 0, 0, 0x30),
-    ),
-    server(
-        "i.gtld-servers.net.",
-        Ipv4Addr::new(192, 43, 172, 30),
-        Ipv6Addr::new(0x2001, 0x503, 0x39c1, 0, 0, 0, 0, 0x30),
-    ),
-    server(
-        "j.gtld-servers.net.",
-        Ipv4Addr::new(192, 48, 79, 30),
-        Ipv6Addr::new(0x2001, 0x502, 0x7094, 0, 0, 0, 0, 0x30),
-    ),
-    server(
-        "k.gtld-servers.net.",
-        Ipv4Addr::new(192, 52, 178, 30),
-        Ipv6Addr::new(0x2001, 0x503, 0xd2d, 0, 0, 0, 0, 0x30),
-    ),
-    server(
-        "l.gtld-servers.net.",
-        Ipv4Addr::new(192, 41, 162, 30),
-        Ipv6Addr::new(0x2001, 0x500, 0xd937, 0, 0, 0, 0, 0x30),
-    ),
-    server(
-        "m.gtld-servers.net.",
-        Ipv4Addr::new(192, 55, 83, 30),
-        Ipv6Addr::new(0x2001, 0x501, 0xb1f9, 0, 0, 0, 0, 0x30),
-    ),
-];
-
-// ---------------------------------------------------------------------------
-// Hosts
-
 /// One host per root letter of [`ROOT_SERVERS`], at both of its
 /// addresses, finished by `build`: the letter, and its [`server_host`].
 /// `build` gives it its program, usually an [`Authoritative`] with the
 /// front the world gives that letter, and any [`Host::delay`].
 pub fn root_servers(build: impl Fn(&NameServer, Host) -> Host) -> Vec<Host> {
     ROOT_SERVERS
-        .iter()
-        .map(|server| build(server, server_host(server)))
-        .collect()
-}
-
-/// One host per `gtld-servers.net` server, at both of its addresses,
-/// finished by `build` as [`root_servers`] finishes a letter's.
-pub fn gtld_servers(build: impl Fn(&NameServer, Host) -> Host) -> Vec<Host> {
-    GTLD_SERVERS
         .iter()
         .map(|server| build(server, server_host(server)))
         .collect()
@@ -204,7 +116,7 @@ type Front = dyn Fn(Host) -> Host + Send + Sync;
 /// servers through the mirror's upstream as the world's servers need
 /// facts, and answered from by the world's own [`Copies`]. No real
 /// server's message reaches a client. A world runs the program on hosts
-/// of its own, such as [`root_servers`] and [`gtld_servers`]. As the
+/// of its own, such as [`root_servers`]. As the
 /// copies file what the real servers answered ([`Filing`]), the mirror
 /// places more servers, so a resolver in the world can follow the
 /// hierarchy as far down as the upstream answers:

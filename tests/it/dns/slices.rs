@@ -40,11 +40,11 @@ use fictionet::stdlib::services::dns::{
 };
 use fictionet::stdlib::services::serve::Transport;
 use fictionet::stdlib::world::net::dns::Recursive;
-use fictionet::stdlib::world::net::dns::internet::{GTLD_SERVERS, ROOT_SERVERS};
+use fictionet::stdlib::world::net::dns::internet::ROOT_SERVERS;
 use fictionet::stdlib::world::net::{Host, Net};
 use fictionet::time::Instant;
 use fictionet::{Cx, Entropy, Seed, SeededEntropy};
-use fictionet_extras::dns::roots;
+use fictionet_extras::dns::roots::{self, GTLD_SERVERS};
 use fictionet_test_support::dns::{DNSSEC_FAILED, EXAMPLE_COM, TestInternet, v6};
 use fictionet_test_support::sandbox::{Machine, machine};
 use fictionet_test_support::timeout;

@@ -29,7 +29,6 @@ use std::time::SystemTime;
 use fictionet::stdlib::protocols::dns::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use fictionet::stdlib::protocols::dns::rr::{Name, RecordType};
 use fictionet::stdlib::services::dns::authority::Identity;
-use fictionet::stdlib::services::dns::resolver::ROOT_SERVERS;
 use fictionet::stdlib::services::dns::{Client, WallClock};
 use fictionet::stdlib::services::serve::Transport;
 use fictionet::stdlib::world::net::Net;
@@ -141,21 +140,7 @@ async fn walk(
         start: SystemTime::now() - fcx.now().since_start(),
     };
     let net = Net::new().ipv4_only().drop_unrouted();
-    // The root letters serve the root, and the `gtld-servers.net`
-    // servers `com` and `net`.
-    let mut mirror = Mirror::new(upstream, net.handle());
-    for server in &ROOT_SERVERS {
-        for addr in server.addresses() {
-            mirror = mirror.serves(addr, &Name::root());
-        }
-    }
-    for server in &internet::GTLD_SERVERS {
-        for addr in server.addresses() {
-            for zone in ["com.", "net."] {
-                mirror = mirror.serves(addr, &Name::from_ascii(zone)?);
-            }
-        }
-    }
+    let mirror = roots::seed(Mirror::new(upstream, net.handle()));
     let recursive = Recursive::new(unbound::config(), clock);
     let resolver = recursive.handle();
     let (_attacher, attachments) = fictionet::attachments();
@@ -164,7 +149,7 @@ async fn walk(
         let letter = roots::letter_at(server.v4).expect("a root letter");
         host.program(mirror.server(letter.front(Identity::none())))
     }))
-    .hosts(internet::gtld_servers(|_, host| {
+    .hosts(roots::gtld_servers(|_, host| {
         host.program(mirror.server(roots::gtld_front(Identity::none())))
     }))
     .host("resolver", |host| {
