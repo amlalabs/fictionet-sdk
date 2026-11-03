@@ -434,8 +434,8 @@ theorem sigsBy_verifies {sz : SignedZone S} {P : AlgorithmPolicy} {t : Nat} (hw 
       true := by
   obtain ⟨s1, hs1, ha1⟩ := hw.dataAlg
   have hs1' := mem_dataSigners hs1
-  refine any_verifies_iff.mpr ⟨_, List.mem_map.mpr ⟨s1, hs1, rfl⟩, ?_, hw.windowOk _ _ _ _, d, hcov _ rfl rfl,
-    s1.dnskey, List.mem_map.mpr ⟨s1, hs1', rfl⟩, rfl, honest_verifies (hw.honest s1 hs1') _ _⟩
+  refine any_verifies_iff.mpr ⟨_, List.mem_map.mpr ⟨s1, hs1, rfl⟩, ?_, hw.windowOk _ _ _ _ _, d, hcov _ rfl rfl,
+    s1.dnskey, List.mem_map.mpr ⟨s1, hs1', rfl⟩, rfl, rfl, honest_verifies (hw.honest s1 hs1') _ _⟩
   simp only [usable, beq_self_eq_true, ha1, Bool.and_self, Bool.true_and, List.any_eq_true, beq_iff_eq]
   exact ⟨s1.dnskey, List.mem_map.mpr ⟨s1, hs1', rfl⟩, rfl⟩
 

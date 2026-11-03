@@ -12,16 +12,28 @@
 (* (ent, with a.ent below it), a name that does not exist (nx), the        *)
 (* nameserver host of sld.tld with glue in tld (ns), a CNAME loop across   *)
 (* two zones (loop.sld to loop.alt and back), and a wildcard (x.w.alt      *)
-(* matches *.w.alt). One world edit changes www and ns and creates nx.     *)
+(* matches *.w.alt). Every record is of type A or CNAME, so a question of  *)
+(* type AAAA is answered NODATA, after any CNAME. One world edit changes   *)
+(* www and ns and creates nx.                                              *)
 (*                                                                         *)
 (* With Rogue, server 1 of alt.tld also sends a record for www.sld.tld,    *)
 (* outside its bailiwick: a real authority seen through a live source may  *)
 (* send anything.                                                          *)
 (*                                                                         *)
-(* Each client asks a fixed script of A questions, one at a time, as a stub *)
-(* resolver does; two clients asking the same question share one           *)
-(* resolution. The resolver starts with the root's servers as hints and    *)
-(* keeps every cut it learns (NS TTLs outlast MaxTime).                    *)
+(* Each client asks a fixed script of questions, each a name and a type    *)
+(* (A or AAAA), one at a time, as a stub resolver does; two clients asking *)
+(* the same question share one resolution. The resolver starts with the    *)
+(* root's servers as hints and keeps every cut it learns (NS TTLs outlast  *)
+(* MaxTime). The cache keeps answers by name and type.                     *)
+(*                                                                         *)
+(* Each query goes out from a port of Ports with a DNS ID of IDs, both     *)
+(* drawn for it, and the server's reply repeats them and the question      *)
+(* (RFC 5452). The resolver takes a reply only when it comes from the      *)
+(* server it asked, over the same transport, to that port, with that ID    *)
+(* and question. An off-path attacker sends at most MaxSpoof forged        *)
+(* replies with a poisoned answer, each to an exchange the resolver has    *)
+(* outstanding, from the server it asked, and guesses every field of the   *)
+(* exchange but one: the port, the ID, or the question's type.             *)
 (*                                                                         *)
 (* The network loses at most MaxLoss messages and truncates at most MaxTc  *)
 (* UDP replies. A lost message enables the timeout of its exchange; the    *)
@@ -31,21 +43,25 @@
 (* second.                                                                 *)
 (*                                                                         *)
 (* Ablation flags: CheckBailiwick, BoundWork, CacheTc, CheckExpiry,        *)
-(* FailureAsNegative, CacheBounded, and CountDown. Each is the rule as the *)
-(* design states it when TRUE (FALSE for CacheTc, FailureAsNegative, and   *)
-(* CacheBounded).                                                          *)
+(* FailureAsNegative, CacheBounded, CountDown, CheckId, CheckPort,         *)
+(* CheckType, and CacheByName. Each is the rule as the design states it    *)
+(* when TRUE (FALSE for CacheTc, FailureAsNegative, CacheBounded, and      *)
+(* CacheByName).                                                           *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets, Sequences, TLC
 
 CONSTANTS
     Clients,           \* clients of the resolver
-    Script,            \* the distinct A questions every client asks, in this order
+    Script,            \* the distinct questions every client asks, in this order
     MaxTime,           \* the clock runs 0..MaxTime
     MaxWork,           \* upstream queries per resolution (Config.work.queries)
     MaxChain,          \* CNAME restarts per resolution (Config.work.depth)
     MaxLoss,           \* messages the network may lose
     MaxTc,             \* UDP replies the network may truncate
     MaxEdits,          \* world edits (0 or 1)
+    MaxSpoof,          \* forged replies the attacker may send
+    Ports,             \* the ports a query may go out from
+    IDs,               \* the DNS IDs a query may carry
     Rogue,             \* server 1 of alt.tld adds an out-of-bailiwick record
     CheckBailiwick,    \* records outside the answering zone are dropped
     BoundWork,         \* the work and chain bounds are kept
@@ -54,6 +70,10 @@ CONSTANTS
     FailureAsNegative, \* ablation: a failure is cached as NXDOMAIN
     CacheBounded,      \* ablation: a failure the work bound caused is cached
     CountDown,         \* a fetched record goes out with the TTL it has left
+    CheckId,           \* a reply must carry the query's DNS ID
+    CheckPort,         \* a reply must come to the query's port
+    CheckType,         \* a reply's question must have the query's type
+    CacheByName,       \* ablation: the cache keeps answers by name alone
     None               \* a model value for "nothing here"
 
 -----------------------------------------------------------------------------
@@ -61,6 +81,7 @@ CONSTANTS
 
 Root == "."
 Zones == {".", "tld", "sld.tld", "alt.tld"}
+Types == {"A", "AAAA"}
 
 \* The parent of every name the model uses.
 Up == "tld" :> "." @@ "sld.tld" :> "tld" @@ "alt.tld" :> "tld"
@@ -109,45 +130,58 @@ Own(v, n) == {r \in Rrs(v) : r.o = n}
 \* The wildcard that synthesizes n: *.<parent of n>, when n has no node.
 Wild(v, n) == {r \in Rrs(v) : n # Root /\ r.o = "*." \o Up[n]}
 
-\* What the zone holds for "n A" at version v (RFC 1034 section 4.3.2, RFC 4592).
-Lookup(v, n) ==
+\* What the zone holds for "n qt" at version v (RFC 1034 section 4.3.2,
+\* RFC 4592): a CNAME, the record of type qt, NODATA at a node or a wildcard
+\* without one, or NXDOMAIN.
+Lookup(v, n, qt) ==
     LET own == Own(v, n)
         wild == Wild(v, n)
-    IN  IF \E r \in own : r.t = "CNAME" THEN [t |-> "cname", val |-> (CHOOSE r \in own : r.t = "CNAME").val,
-                                              ttl |-> (CHOOSE r \in own : r.t = "CNAME").ttl]
-        ELSE IF \E r \in own : r.t = "A" THEN [t |-> "a", val |-> (CHOOSE r \in own : r.t = "A").val,
-                                              ttl |-> (CHOOSE r \in own : r.t = "A").ttl]
+        One(rs) == CHOOSE r \in rs : TRUE
+    IN  IF \E r \in own : r.t = "CNAME"
+        THEN LET r == One({x \in own : x.t = "CNAME"}) IN [t |-> "cname", val |-> r.val, ttl |-> r.ttl]
+        ELSE IF \E r \in own : r.t = qt
+        THEN LET r == One({x \in own : x.t = qt}) IN [t |-> qt, val |-> r.val, ttl |-> r.ttl]
         ELSE IF NodeAtOrBelow(v, n) THEN [t |-> "nodata", val |-> None, ttl |-> NegTtl]
-        ELSE IF wild # {} THEN [t |-> "a", val |-> (CHOOSE r \in wild : TRUE).val,
-                                ttl |-> (CHOOSE r \in wild : TRUE).ttl]
+        ELSE IF \E r \in wild : r.t = qt
+        THEN LET r == One({x \in wild : x.t = qt}) IN [t |-> qt, val |-> r.val, ttl |-> r.ttl]
+        ELSE IF wild # {} THEN [t |-> "nodata", val |-> None, ttl |-> NegTtl]
         ELSE [t |-> "nx", val |-> None, ttl |-> NegTtl]
 
 \* Server <<z, 1>> answers from the data; server <<z, 2>> is lame.
 Servers == Zones \X {1, 2}
 ServersOf(z) == {z} \X {1, 2}
 
-\* The names whose answers the resolver may cache.
+\* The names whose answers the resolver may cache, and the cache's keys.
 CacheNames == {"www.sld.tld", "cn.sld.tld", "ent.sld.tld", "nx.sld.tld", "ns.sld.tld",
                "loop.sld.tld", "loop.alt.tld", "x.w.alt.tld"}
+CacheKeys == CacheNames \X Types
 
+\* Where the cache keeps the answer for n of type qt.
+Key(n, qt) == IF CacheByName THEN <<n, "A">> ELSE <<n, qt>>
+
+\* The record Rogue adds, and the answer a forged reply carries.
 Poison == [n |-> "www.sld.tld", val |-> "Poison", ttl |-> 2]
 
 Questions == {Script[i] : i \in 1..Len(Script)}
 
 \* The scripts the configs pick with "Script <- ...", since a config file
 \* cannot write a sequence.
-ScriptBase == <<"cn.sld.tld", "www.sld.tld", "ent.sld.tld", "nx.sld.tld", "x.w.alt.tld">>
-ScriptConcurrent == <<"cn.sld.tld", "www.sld.tld">>
-ScriptLoop == <<"loop.sld.tld">>
-ScriptRogue == <<"x.w.alt.tld", "www.sld.tld">>
-ScriptEdit == <<"www.sld.tld", "ns.sld.tld", "nx.sld.tld">>
+ScriptBase == << <<"cn.sld.tld", "A">>, <<"www.sld.tld", "A">>, <<"ent.sld.tld", "A">>,
+                 <<"nx.sld.tld", "A">>, <<"x.w.alt.tld", "A">> >>
+ScriptConcurrent == << <<"cn.sld.tld", "A">>, <<"www.sld.tld", "A">> >>
+ScriptLoop == << <<"loop.sld.tld", "A">> >>
+ScriptRogue == << <<"x.w.alt.tld", "A">>, <<"www.sld.tld", "A">> >>
+ScriptEdit == << <<"www.sld.tld", "A">>, <<"ns.sld.tld", "A">>, <<"nx.sld.tld", "A">> >>
+ScriptTypes == << <<"cn.sld.tld", "AAAA">>, <<"www.sld.tld", "A">>, <<"x.w.alt.tld", "AAAA">>,
+                  <<"x.w.alt.tld", "A">> >>
+ScriptSpoof == << <<"www.sld.tld", "A">> >>
 
 -----------------------------------------------------------------------------
 VARIABLES
     now,      \* the clock
     ver,      \* the data version the servers serve
     editAt,   \* when the edit happened (None before)
-    cache,    \* [CacheNames -> entry or None]
+    cache,    \* [CacheKeys -> entry or None]
     known,    \* the zones whose cut and server addresses the resolver holds
     res,      \* [Questions -> resolution or None]: one per question, shared by its clients
     waiting,  \* [Questions -> clients waiting on that resolution]
@@ -155,9 +189,10 @@ VARIABLES
     ans,      \* [Clients -> [Questions -> answer or None]]
     net,      \* messages in flight
     lost,     \* messages lost so far
-    tcs       \* replies truncated so far
+    tcs,      \* replies truncated so far
+    spoofs    \* forged replies sent so far
 
-vars == <<now, ver, editAt, cache, known, res, waiting, asked, ans, net, lost, tcs>>
+vars == <<now, ver, editAt, cache, known, res, waiting, asked, ans, net, lost, tcs, spoofs>>
 
 \* A cache entry. rank is "auth" or "glue" (RFC 2181 section 5.4.1); from is
 \* the zone of the server that sent it, or for a failure the zone whose
@@ -181,8 +216,9 @@ Closest(n) == CHOOSE z \in known : AtOrBelow(n, z)
                  /\ \A y \in known : AtOrBelow(n, y) => AtOrBelow(z, y)
 
 \* got is the entry the last reply brought for qn, which serves this
-\* resolution whether or not the cache keeps it (RFC 1035 section 7.4).
-NewRes(q) == [qn |-> q, zone |-> Closest(q), tried |-> {}, out |-> None,
+\* resolution whether or not the cache keeps it (RFC 1035 section 7.4). out
+\* is the exchange outstanding: [s, tcp, port, id].
+NewRes(q) == [qn |-> q[1], zone |-> Closest(q[1]), tried |-> {}, out |-> None,
               work |-> 0, chain |-> 0, recs |-> {}, got |-> None]
 
 \* The work and chain counters count every query and restart, with or
@@ -190,11 +226,12 @@ NewRes(q) == [qn |-> q, zone |-> Closest(q), tried |-> {}, out |-> None,
 \* to see a resolution go past it and keeps the state space finite.
 Min(a, b) == IF a < b THEN a ELSE b
 
-\* What a resolution records about each entry it uses: fetched says the
-\* entry came in a reply to this resolution, FALSE that it was read from
-\* the cache.
-Used(n, e, fetched) == [n |-> n, t |-> e.t, val |-> e.val, ttl |-> e.ttl, readAt |-> e.readAt,
-                        rank |-> e.rank, failure |-> e.failure, fetched |-> fetched]
+\* What a resolution records about each entry it uses: the name and type it
+\* was read for, and fetched, which says the entry came in a reply to this
+\* resolution, FALSE that it was read from the cache.
+Used(n, qt, e, fetched) == [n |-> n, qt |-> qt, t |-> e.t, val |-> e.val, ttl |-> e.ttl,
+                            readAt |-> e.readAt, rank |-> e.rank, failure |-> e.failure,
+                            fetched |-> fetched]
 
 \* The TTL a record has left now, as the client sees it: counted down from
 \* when it was read, and 0 once it has run out (cache::ttl_left). Without
@@ -204,18 +241,22 @@ TtlLeft(u) == IF ~CountDown /\ u.fetched THEN u.ttl
               ELSE IF now < u.readAt + u.ttl THEN u.readAt + u.ttl - now ELSE 0
 
 \* A used record as the answer renders it, with the TTL it goes out with.
-Rendered(u) == [n |-> u.n, t |-> u.t, val |-> u.val, ttl |-> u.ttl, readAt |-> u.readAt,
+Rendered(u) == [n |-> u.n, qt |-> u.qt, t |-> u.t, val |-> u.val, ttl |-> u.ttl, readAt |-> u.readAt,
                 rank |-> u.rank, failure |-> u.failure, fetched |-> u.fetched, left |-> TtlLeft(u)]
 
-Rcode(t) == CASE t = "a" -> "NOERROR" [] t = "cname" -> "NOERROR"
+Rcode(t) == CASE t \in {"A", "AAAA", "cname"} -> "NOERROR"
               [] t = "nodata" -> "NODATA" [] t = "nx" -> "NXDOMAIN" [] t = "fail" -> "SERVFAIL"
 
-Msg(k, q, qn, srv, tcp, tc, body) ==
-    [k |-> k, q |-> q, qn |-> qn, srv |-> srv, tcp |-> tcp, tc |-> tc, body |-> body]
+\* A message: a query, or a reply, to the exchange of resolution q, about
+\* "qn qt", to or from server srv, over TCP or UDP, from or to port, with the
+\* DNS ID id. spoof marks a forged reply; the resolver cannot see it.
+Msg(k, q, qn, qt, srv, tcp, port, id, tc, body) ==
+    [k |-> k, q |-> q, qn |-> qn, qt |-> qt, srv |-> srv, tcp |-> tcp, port |-> port, id |-> id,
+     tc |-> tc, body |-> body, spoof |-> FALSE]
 Body(kind, to, rr, extra) == [kind |-> kind, to |-> to, rr |-> rr, extra |-> extra]
 
-\* The reply server s sends for "n A" at the current version.
-Respond(s, n) ==
+\* The reply server s sends for "n qt" at the current version.
+Respond(s, n, qt) ==
     LET z == s[1] IN
     IF s[2] = 2
     THEN IF z = Root THEN Body("refused", None, None, {})
@@ -224,15 +265,28 @@ Respond(s, n) ==
     ELSE IF ZoneOf(n) # z
     THEN Body("referral", ChildToward(z, n), None,
               IF ChildToward(z, n) = "sld.tld" THEN {Glue} ELSE {})
-    ELSE Body("answer", None, Lookup(ver, n),
+    ELSE Body("answer", None, Lookup(ver, n, qt),
               IF Rogue /\ z = "alt.tld" THEN {Poison} ELSE {})
+
+\* Whether resolution r of question q takes reply m: from the server it
+\* asked, over the same transport, to its port, with its ID and question
+\* (RFC 5452 section 9.1).
+Matches(m, q, r) ==
+    /\ r # None
+    /\ r.out # None
+    /\ m.srv = r.out.s
+    /\ m.tcp = r.out.tcp
+    /\ CheckPort => m.port = r.out.port
+    /\ CheckId => m.id = r.out.id
+    /\ m.qn = r.qn
+    /\ CheckType => m.qt = q[2]
 
 -----------------------------------------------------------------------------
 Init ==
     /\ now = 0
     /\ ver = 0
     /\ editAt = None
-    /\ cache = [n \in CacheNames |-> None]
+    /\ cache = [k \in CacheKeys |-> None]
     /\ known = {Root}
     /\ res = [q \in Questions |-> None]
     /\ waiting = [q \in Questions |-> {}]
@@ -241,6 +295,7 @@ Init ==
     /\ net = {}
     /\ lost = 0
     /\ tcs = 0
+    /\ spoofs = 0
 
 (* A client asks the next question of the script once its last one is      *)
 (* answered, as a stub resolver does. It joins the resolution already       *)
@@ -252,7 +307,7 @@ Ask(c, q) ==
     /\ asked' = [asked EXCEPT ![c] = @ \cup {q}]
     /\ waiting' = [waiting EXCEPT ![q] = @ \cup {c}]
     /\ res' = IF res[q] = None THEN [res EXCEPT ![q] = NewRes(q)] ELSE res
-    /\ UNCHANGED <<now, ver, editAt, cache, known, ans, net, lost, tcs>>
+    /\ UNCHANGED <<now, ver, editAt, cache, known, ans, net, lost, tcs, spoofs>>
 
 \* Every waiter of q gets the answer, rendered now.
 Finish(q, rcode, recs) ==
@@ -268,8 +323,8 @@ Finish(q, rcode, recs) ==
 Fail(q) ==
     LET r == res[q]
         e == FailEntry(IF FailureAsNegative THEN "nx" ELSE "fail", r)
-    IN  /\ cache' = [cache EXCEPT ![r.qn] = e]
-        /\ Finish(q, Rcode(e.t), {Used(r.qn, e, FALSE)})
+    IN  /\ cache' = [cache EXCEPT ![Key(r.qn, q[2])] = e]
+        /\ Finish(q, Rcode(e.t), {Used(r.qn, q[2], e, FALSE)})
 
 (* The resolution reached the work bound: SERVFAIL. The bound is one        *)
 (* question's budget and says nothing of the servers, so the failure is not *)
@@ -278,7 +333,7 @@ Fail(q) ==
 FailBounded(q) ==
     LET r == res[q]
         e == FailEntry("fail", r)
-    IN  /\ cache' = IF CacheBounded THEN [cache EXCEPT ![r.qn] = e] ELSE cache
+    IN  /\ cache' = IF CacheBounded THEN [cache EXCEPT ![Key(r.qn, q[2])] = e] ELSE cache
         /\ Finish(q, "SERVFAIL", {})
 
 \* A record is live while its TTL has not run out.
@@ -286,18 +341,18 @@ Live(u) == now < u.readAt + u.ttl
 
 (* A resolution with no exchange outstanding takes its next step: from the  *)
 (* reply it just got, or from the cache when it can, otherwise a query to a *)
-(* server of the closest cut.                                               *)
+(* server of the closest cut, from a port and with an ID drawn for it.      *)
 Advance(q) ==
     /\ res[q] # None
     /\ res[q].out = None
     /\ LET r == res[q]
            fetched == r.got # None
-           e == IF fetched THEN r.got ELSE cache[r.qn]
+           e == IF fetched THEN r.got ELSE cache[Key(r.qn, q[2])]
            have == fetched \/ Usable(e)
        IN
        \/ /\ have
           /\ e.t # "cname"
-          /\ LET recs == r.recs \cup {Used(r.qn, e, fetched)} IN
+          /\ LET recs == r.recs \cup {Used(r.qn, q[2], e, fetched)} IN
              IF CheckExpiry /\ \E u \in recs : ~u.fetched /\ ~Live(u)
              \* A link the cache gave ran out while the chase went on: follow the
              \* chain again from the question, keeping the work done so far. A
@@ -316,7 +371,7 @@ Advance(q) ==
              ELSE /\ res' = [res EXCEPT ![q] = [qn |-> e.val, zone |-> Closest(e.val), tried |-> {},
                                               out |-> None, work |-> r.work,
                                               chain |-> Min(r.chain + 1, MaxChain + 1),
-                                              recs |-> r.recs \cup {Used(r.qn, e, fetched)},
+                                              recs |-> r.recs \cup {Used(r.qn, q[2], e, fetched)},
                                               got |-> None]]
                   /\ UNCHANGED <<cache, waiting, ans, net>>
        \/ /\ ~have
@@ -324,27 +379,31 @@ Advance(q) ==
              THEN FailBounded(q) /\ UNCHANGED net
              ELSE IF \A s \in ServersOf(r.zone) : <<s, FALSE>> \in r.tried
              THEN Fail(q) /\ UNCHANGED net
-             ELSE \E s \in ServersOf(r.zone) :
+             ELSE \E s \in ServersOf(r.zone), port \in Ports, id \in IDs :
                     /\ <<s, FALSE>> \notin r.tried
-                    /\ res' = [res EXCEPT ![q].out = <<s, FALSE>>,
+                    /\ res' = [res EXCEPT ![q].out = [s |-> s, tcp |-> FALSE, port |-> port, id |-> id],
                                           ![q].work = Min(@ + 1, MaxWork + 1)]
-                    /\ net' = net \cup {Msg("q", q, r.qn, s, FALSE, FALSE, None)}
+                    /\ net' = net \cup {Msg("q", q, r.qn, q[2], s, FALSE, port, id, FALSE, None)}
                     /\ UNCHANGED <<cache, waiting, ans>>
-    /\ UNCHANGED <<now, ver, editAt, known, asked, lost, tcs>>
+    /\ UNCHANGED <<now, ver, editAt, known, asked, lost, tcs, spoofs>>
 
-(* A server gets a query and replies at once from the data it serves now. *)
+(* A server gets a query and replies at once from the data it serves now,   *)
+(* repeating the query's port, ID, and question.                           *)
 ServeOne(m) ==
     /\ m \in net
     /\ m.k = "q"
-    /\ net' = (net \ {m}) \cup {Msg("r", m.q, m.qn, m.srv, m.tcp, FALSE, Respond(m.srv, m.qn))}
-    /\ UNCHANGED <<now, ver, editAt, cache, known, res, waiting, asked, ans, lost, tcs>>
+    /\ net' = (net \ {m}) \cup {Msg("r", m.q, m.qn, m.qt, m.srv, m.tcp, m.port, m.id, FALSE,
+                                    Respond(m.srv, m.qn, m.qt))}
+    /\ UNCHANGED <<now, ver, editAt, cache, known, res, waiting, asked, ans, lost, tcs, spoofs>>
 
 \* Caching rules for an extra record, glue included: an entry is replaced only
-\* by one of equal or higher rank (RFC 2181 section 5.4.1).
+\* by one of equal or higher rank (RFC 2181 section 5.4.1). Extra records are
+\* addresses, of type A.
 CacheExtra(c, x, rank, zone) ==
+    LET k == Key(x.n, "A") IN
     IF x.n \in CacheNames /\ (CheckBailiwick => AtOrBelow(x.n, zone))
-       /\ (c[x.n] = None \/ c[x.n].rank = "glue" \/ rank = "auth")
-    THEN [c EXCEPT ![x.n] = Entry("a", x.val, x.ttl, rank, zone)]
+       /\ (c[k] = None \/ c[k].rank = "glue" \/ rank = "auth")
+    THEN [c EXCEPT ![k] = Entry("A", x.val, x.ttl, rank, zone)]
     ELSE c
 
 RECURSIVE CacheAll(_, _, _, _)
@@ -356,25 +415,25 @@ CacheAll(c, xs, rank, zone) ==
 ReceiveOne(m) ==
     /\ m \in net
     /\ m.k = "r"
-    /\ res[m.q] # None
-    /\ res[m.q].out = <<m.srv, m.tcp>>
+    /\ Matches(m, m.q, res[m.q])
     /\ LET q == m.q
            r == res[q]
            b == m.body
-           tried == r.tried \cup {r.out}
+           tried == r.tried \cup {<<r.out.s, r.out.tcp>>}
        IN
        CASE m.tc ->
               \* RFC 7766: retry the same server over TCP. A truncated reply is
               \* never cached (RFC 2181 section 9).
               /\ cache' = IF CacheTc
-                          THEN [cache EXCEPT ![r.qn] = Entry("nodata", None, NegTtl, "auth", m.srv[1])]
+                          THEN [cache EXCEPT ![Key(r.qn, q[2])] = Entry("nodata", None, NegTtl, "auth", m.srv[1])]
                           ELSE cache
               /\ IF BoundWork /\ r.work >= MaxWork
                  THEN /\ res' = [res EXCEPT ![q].out = None, ![q].tried = tried]
                       /\ net' = net \ {m}
-                 ELSE /\ res' = [res EXCEPT ![q].out = <<m.srv, TRUE>>, ![q].tried = tried,
-                                            ![q].work = Min(@ + 1, MaxWork + 1)]
-                      /\ net' = (net \ {m}) \cup {Msg("q", q, r.qn, m.srv, TRUE, FALSE, None)}
+                 ELSE \E port \in Ports, id \in IDs :
+                      /\ res' = [res EXCEPT ![q].out = [s |-> m.srv, tcp |-> TRUE, port |-> port, id |-> id],
+                                            ![q].tried = tried, ![q].work = Min(@ + 1, MaxWork + 1)]
+                      /\ net' = (net \ {m}) \cup {Msg("q", q, r.qn, q[2], m.srv, TRUE, port, id, FALSE, None)}
               /\ UNCHANGED known
          [] b.kind = "refused" ->
               /\ res' = [res EXCEPT ![q].out = None, ![q].tried = tried]
@@ -393,35 +452,61 @@ ReceiveOne(m) ==
                    /\ UNCHANGED <<cache, known>>
          [] b.kind = "answer" ->
               LET e == Entry(b.rr.t, b.rr.val, b.rr.ttl, "auth", m.srv[1]) IN
-              /\ cache' = CacheAll([cache EXCEPT ![r.qn] = e], b.extra, "auth", m.srv[1])
+              /\ cache' = CacheAll([cache EXCEPT ![Key(r.qn, q[2])] = e], b.extra, "auth", m.srv[1])
               /\ res' = [res EXCEPT ![q].out = None, ![q].got = e]
               /\ net' = net \ {m}
               /\ UNCHANGED known
-    /\ UNCHANGED <<now, ver, editAt, waiting, asked, ans, lost, tcs>>
+    /\ UNCHANGED <<now, ver, editAt, waiting, asked, ans, lost, tcs, spoofs>>
 
-(* The exchange's message was lost, so its timeout fires. *)
+(* A reply no outstanding exchange takes changes nothing: it is dropped,   *)
+(* as `Event::Ignored`.                                                    *)
+IgnoreOne(m) ==
+    /\ m \in net
+    /\ m.k = "r"
+    /\ ~Matches(m, m.q, res[m.q])
+    /\ net' = net \ {m}
+    /\ UNCHANGED <<now, ver, editAt, cache, known, res, waiting, asked, ans, lost, tcs, spoofs>>
+
+(* The exchange's query or reply was lost, so its timeout fires. A forged   *)
+(* reply in flight does not stand for the real one.                        *)
 Timeout(q) ==
     /\ res[q] # None
     /\ res[q].out # None
-    /\ ~\E m \in net : m.q = q
-    /\ res' = [res EXCEPT ![q].tried = @ \cup {res[q].out}, ![q].out = None]
-    /\ UNCHANGED <<now, ver, editAt, cache, known, waiting, asked, ans, net, lost, tcs>>
+    /\ ~\E m \in net : m.q = q /\ ~m.spoof
+    /\ res' = [res EXCEPT ![q].tried = @ \cup {<<res[q].out.s, res[q].out.tcp>>}, ![q].out = None]
+    /\ UNCHANGED <<now, ver, editAt, cache, known, waiting, asked, ans, net, lost, tcs, spoofs>>
+
+(* The attacker forges a reply to an exchange of q the resolver has         *)
+(* outstanding, from the server it asked, over its transport, about the     *)
+(* name it asked, with a poisoned answer. It guesses every field but one:   *)
+(* the port, the ID, or the question's type is not the exchange's.          *)
+SpoofOne(q) ==
+    /\ spoofs < MaxSpoof
+    /\ res[q] # None
+    /\ res[q].out # None
+    /\ \E port \in Ports, id \in IDs, qt \in Types :
+         /\ ~(port = res[q].out.port /\ id = res[q].out.id /\ qt = q[2])
+         /\ net' = net \cup {[Msg("r", q, res[q].qn, qt, res[q].out.s, res[q].out.tcp, port, id, FALSE,
+                                  Body("answer", None, [t |-> qt, val |-> Poison.val, ttl |-> Poison.ttl], {}))
+                              EXCEPT !.spoof = TRUE]}
+    /\ spoofs' = spoofs + 1
+    /\ UNCHANGED <<now, ver, editAt, cache, known, res, waiting, asked, ans, lost, tcs>>
 
 LoseOne(m) ==
     /\ m \in net
     /\ lost < MaxLoss
     /\ net' = net \ {m}
     /\ lost' = lost + 1
-    /\ UNCHANGED <<now, ver, editAt, cache, known, res, waiting, asked, ans, tcs>>
+    /\ UNCHANGED <<now, ver, editAt, cache, known, res, waiting, asked, ans, tcs, spoofs>>
 
 (* A UDP reply too large for the path arrives with TC and no records. *)
 TruncateOne(m) ==
     /\ m \in net
-    /\ m.k = "r" /\ ~m.tcp /\ ~m.tc
+    /\ m.k = "r" /\ ~m.tcp /\ ~m.tc /\ ~m.spoof
     /\ tcs < MaxTc
     /\ net' = (net \ {m}) \cup {[m EXCEPT !.tc = TRUE, !.body = Body("empty", None, None, {})]}
     /\ tcs' = tcs + 1
-    /\ UNCHANGED <<now, ver, editAt, cache, known, res, waiting, asked, ans, lost>>
+    /\ UNCHANGED <<now, ver, editAt, cache, known, res, waiting, asked, ans, lost, spoofs>>
 
 \* The clock does not advance while a reply is in flight or before the
 \* resolver has acted on it.
@@ -432,22 +517,24 @@ Tick ==
     /\ now' = now + 1
     \* An expired entry is gone: it can never be used again.
     /\ cache' = IF CheckExpiry
-                THEN [n \in CacheNames |-> IF cache[n] # None /\ now + 1 >= cache[n].readAt + cache[n].ttl
-                                           THEN None ELSE cache[n]]
+                THEN [k \in CacheKeys |-> IF cache[k] # None /\ now + 1 >= cache[k].readAt + cache[k].ttl
+                                          THEN None ELSE cache[k]]
                 ELSE cache
-    /\ UNCHANGED <<ver, editAt, known, res, waiting, asked, ans, net, lost, tcs>>
+    /\ UNCHANGED <<ver, editAt, known, res, waiting, asked, ans, net, lost, tcs, spoofs>>
 
 WorldEdit ==
     /\ ver < MaxEdits
     /\ ver' = ver + 1
     /\ editAt' = now
-    /\ UNCHANGED <<now, cache, known, res, waiting, asked, ans, net, lost, tcs>>
+    /\ UNCHANGED <<now, cache, known, res, waiting, asked, ans, net, lost, tcs, spoofs>>
 
 \* Each network step on some message, named so traces show which one ran.
 Serve == \E m \in net : ServeOne(m)
 Receive == \E m \in net : ReceiveOne(m)
+Ignore == \E m \in net : IgnoreOne(m)
 Lose == \E m \in net : LoseOne(m)
 Truncate == \E m \in net : TruncateOne(m)
+Spoof == \E q \in Questions : SpoofOne(q)
 
 Next ==
     \/ \E c \in Clients, q \in Questions : Ask(c, q)
@@ -455,17 +542,20 @@ Next ==
     \/ \E q \in Questions : Timeout(q)
     \/ Serve
     \/ Receive
+    \/ Ignore
     \/ Lose
     \/ Truncate
+    \/ Spoof
     \/ Tick
     \/ WorldEdit
 
 (* The network delivers and the resolver works. Asking, losing, truncating,  *)
-(* the clock, and the edit are never forced.                                *)
+(* forging, the clock, and the edit are never forced.                       *)
 Fairness ==
     /\ \A q \in Questions : WF_vars(Advance(q)) /\ WF_vars(Timeout(q))
     /\ WF_vars(Serve)
     /\ WF_vars(Receive)
+    /\ WF_vars(Ignore)
 
 Spec == Init /\ [][Next]_vars
 FairSpec == Spec /\ Fairness
@@ -481,23 +571,30 @@ VersionsAt(s) == IF editAt = None THEN {ver}
                  ELSE IF s > editAt THEN {1}
                  ELSE {0, 1}
 
-\* Some second within the record's TTL before t at which the data said u. A
-\* record fetched for the resolution that ran out before t reached the
-\* client with TTL 0; its TTL counts back from its last second instead.
+\* Some second within the record's TTL before t at which the data said u for
+\* the name and type it was read for. A record fetched for the resolution
+\* that ran out before t reached the client with TTL 0; its TTL counts back
+\* from its last second instead.
 TrueWithin(u, t) ==
     LET end == IF u.fetched THEN Min(t, u.readAt + u.ttl - 1) ELSE t IN
     \E s \in 0..MaxTime : s <= end /\ s > end - u.ttl /\
-        \E v \in VersionsAt(s) : LET l == Lookup(v, u.n) IN l.t = u.t /\ l.val = u.val
+        \E v \in VersionsAt(s) : LET l == Lookup(v, u.n, u.qt) IN l.t = u.t /\ l.val = u.val
 
 Answers == {ans[c][q] : c \in Clients, q \in Questions} \ {None}
 
-(* Every record of a NOERROR answer was in the data at some second within   *)
-(* its TTL before the reply.                                                *)
+(* Every record of a NOERROR answer was in the data, for the name and type  *)
+(* it was read for, at some second within its TTL before the reply.         *)
 AnswersTrueWithinTtl ==
     \A a \in Answers : a.rcode = "NOERROR" => \A u \in a.recs : TrueWithin(u, a.at)
 
+\* The name holds no record of type qt and no CNAME, at its own node or, with
+\* nothing at or below it, at the wildcard that would answer for it.
+LacksType(v, n, qt) ==
+    \A r \in (IF NodeAtOrBelow(v, n) THEN Own(v, n) ELSE Wild(v, n)) : r.t \notin {qt, "CNAME"}
+
 (* NXDOMAIN only for a name with no node at or below it and no wildcard;     *)
-(* NODATA only for a node without the type. Both held within the TTL.       *)
+(* NODATA only for a name that exists, at a node or by a wildcard, without   *)
+(* the type asked. Both held within the TTL.                                *)
 NegativeTrue ==
     \A a \in Answers : \A u \in a.recs :
         /\ (a.rcode = "NXDOMAIN" /\ u.t = "nx") =>
@@ -505,12 +602,12 @@ NegativeTrue ==
                  \E v \in VersionsAt(s) : ~NodeAtOrBelow(v, u.n) /\ Wild(v, u.n) = {}
         /\ (a.rcode = "NODATA" /\ u.t = "nodata") =>
              \E s \in 0..MaxTime : s <= a.at /\ s > a.at - u.ttl /\
-                 \E v \in VersionsAt(s) : NodeAtOrBelow(v, u.n) /\
-                     ~\E r \in Own(v, u.n) : r.t \in {"A", "CNAME"}
+                 \E v \in VersionsAt(s) : (NodeAtOrBelow(v, u.n) \/ Wild(v, u.n) # {}) /\
+                     LacksType(v, u.n, u.qt)
 
 (* Every cached record came from a server for a zone at or above its name. *)
 NoPoison ==
-    \A n \in CacheNames : cache[n] # None => AtOrBelow(n, cache[n].from)
+    \A k \in CacheKeys : cache[k] # None => AtOrBelow(k[1], cache[k].from)
 
 (* No answer to a client rests on glue. *)
 GlueNeverAnswers ==
@@ -525,14 +622,14 @@ TtlSound ==
         /\ ~u.fetched => a.at < u.readAt + u.ttl
         /\ a.at + u.left <= u.readAt + u.ttl \/ u.left = 0
 
-(* Every cached NXDOMAIN or NODATA was true at some second within its TTL,  *)
-(* from when it was stored: so nothing a reply did not show, such as a       *)
-(* truncated reply's empty sections (RFC 2181 section 9), is cached as a     *)
-(* negative.                                                                *)
+(* Every cached NXDOMAIN or NODATA was true, for its name and type, at some *)
+(* second within its TTL from when it was stored: so nothing a reply did    *)
+(* not show, such as a truncated reply's empty sections (RFC 2181 section   *)
+(* 9), is cached as a negative.                                             *)
 CachedNegativeTrue ==
-    \A n \in CacheNames : (cache[n] # None /\ cache[n].t \in {"nx", "nodata"}) =>
-        \E s \in cache[n].readAt .. Min(now, cache[n].readAt + cache[n].ttl - 1) :
-            \E v \in VersionsAt(s) : Lookup(v, n).t = cache[n].t
+    \A k \in CacheKeys : (cache[k] # None /\ cache[k].t \in {"nx", "nodata"}) =>
+        \E s \in cache[k].readAt .. Min(now, cache[k].readAt + cache[k].ttl - 1) :
+            \E v \in VersionsAt(s) : Lookup(v, k[1], k[2]).t = cache[k].t
 
 (* A failure never answers NXDOMAIN or NODATA (RFC 9520). *)
 FailureNeverNegative ==
@@ -544,8 +641,8 @@ FailureNeverNegative ==
 (* the servers, is never cached, and one question's spent budget never      *)
 (* answers another client.                                                  *)
 CachedFailureTriedAll ==
-    \A n \in CacheNames : (cache[n] # None /\ cache[n].failure) =>
-        \A s \in ServersOf(cache[n].from) : <<s, FALSE>> \in cache[n].tried
+    \A k \in CacheKeys : (cache[k] # None /\ cache[k].failure) =>
+        \A s \in ServersOf(cache[k].from) : <<s, FALSE>> \in cache[k].tried
 
 (* Each resolution stays within its work and chain bounds. *)
 WorkBounded ==
@@ -562,8 +659,8 @@ ReferralsDescend ==
 
 (* The CNAME loop always ends in SERVFAIL. *)
 LoopServfails ==
-    \A c \in Clients : \A q \in Questions \cap {"loop.sld.tld", "loop.alt.tld"} :
-        ans[c][q] # None => ans[c][q].rcode = "SERVFAIL"
+    \A c \in Clients : \A q \in Questions :
+        (q[1] \in {"loop.sld.tld", "loop.alt.tld"} /\ ans[c][q] # None) => ans[c][q].rcode = "SERVFAIL"
 
 (* Every query asked is answered. *)
 EveryQueryAnswered ==

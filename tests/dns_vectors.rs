@@ -36,11 +36,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::protocols::dns::dnssec::rdata::{DNSKEY, DNSSECRData, DS};
+use fictionet::stdlib::protocols::dns::dnssec::rdata::{DNSKEY, DNSSECRData, DS, RRSIG};
 use fictionet::stdlib::protocols::dns::dnssec::{
     AlgorithmPolicy, Anchors, Chain, DigestType, Fetched, Insecure, KeyFlags, KeySet, Link,
     PublicKey, PublicKeyBuf, Ring, Sign, Treatment, Validation, Verify, Window, ZoneKey, ds,
-    key_tag, validate_denial, validate_rrset,
+    key_tag, signed_data, validate_denial, validate_rrset,
 };
 use fictionet::stdlib::protocols::dns::op::{
     Edns, Header, Message, MessageType, OpCode, Query, ResponseCode,
@@ -1599,6 +1599,7 @@ struct KeySpec {
     algorithm: u8,
     sep: bool,
     corrupt: bool,
+    mistag: bool,
 }
 
 fn key_specs(value: &Value) -> Vec<KeySpec> {
@@ -1609,6 +1610,7 @@ fn key_specs(value: &Value) -> Vec<KeySpec> {
             algorithm: number(k, "alg") as u8,
             sep: flag(k, "sep"),
             corrupt: flag(k, "corrupt"),
+            mistag: flag(k, "mistag"),
         })
         .collect()
 }
@@ -1673,12 +1675,99 @@ fn key_set(specs: &[KeySpec], keys: &mut impl Keys) -> KeySet {
 }
 
 /// The RRSIG key tags of `keys` mapped to the symbolic numbers Lean
-/// writes as tags.
-fn tag_names(specs: &[KeySpec], keys: &KeySet) -> BTreeMap<u16, u16> {
+/// writes as tags, the tags of `mistags` included.
+fn tag_names(
+    specs: &[KeySpec],
+    keys: &KeySet,
+    mistags: &BTreeMap<u16, Mistag>,
+) -> BTreeMap<u16, u16> {
     specs
         .iter()
         .zip(&keys.keys)
         .map(|(spec, key)| (key_tag(&key.dnskey()), u16::from(spec.id)))
+        .chain(mistags.values().map(|m| (m.wrong, m.symbolic)))
+        .collect()
+}
+
+/// How a mistagged key's RRSIGs reach the validator (`Gen.lean`'s
+/// `retag`): with a key tag no key of the zone has, signed over that tag
+/// by the same key, as a broken server may send them.
+struct Mistag {
+    /// The key tag they carry.
+    wrong: u16,
+    /// The tag Lean writes for it: the key's number plus 512.
+    symbolic: u16,
+    /// The key.
+    key: Arc<dyn Sign>,
+}
+
+/// The mistagged keys of `specs`, by their own key tags.
+fn mistags(specs: &[KeySpec], keys: &KeySet) -> BTreeMap<u16, Mistag> {
+    let tags: BTreeSet<u16> = keys.keys.iter().map(|key| key_tag(&key.dnskey())).collect();
+    let mut taken = tags.clone();
+    let mut out = BTreeMap::new();
+    for (spec, key) in specs.iter().zip(&keys.keys) {
+        if !spec.mistag {
+            continue;
+        }
+        let tag = key_tag(&key.dnskey());
+        let mut wrong = tag.wrapping_add(1);
+        while taken.contains(&wrong) {
+            wrong = wrong.wrapping_add(1);
+        }
+        taken.insert(wrong);
+        out.insert(
+            tag,
+            Mistag {
+                wrong,
+                symbolic: u16::from(spec.id) + 512,
+                key: key.clone(),
+            },
+        );
+    }
+    out
+}
+
+/// `set` with the RRSIGs of mistagged keys as they reach the validator.
+fn mistag_set(set: &RecordSet, mistags: &BTreeMap<u16, Mistag>) -> RecordSet {
+    let rrsigs = set
+        .rrsigs()
+        .iter()
+        .map(|record| {
+            let RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) = &record.data else {
+                return record.clone();
+            };
+            let Some(mistag) = mistags.get(&rrsig.input().key_tag) else {
+                return record.clone();
+            };
+            let mut input = rrsig.input().clone();
+            input.key_tag = mistag.wrong;
+            let tbs = signed_data(set, &input).expect("a signed RRset encodes");
+            let signature = mistag.key.sign(tbs.as_ref());
+            let mut record = record.clone();
+            record.data = RData::DNSSEC(DNSSECRData::RRSIG(RRSIG::from_sig(input, signature)));
+            record
+        })
+        .collect();
+    let mut set = set.clone();
+    set.set_rrsigs(rrsigs);
+    set
+}
+
+/// `records` with the RRSIGs of mistagged keys as they reach the
+/// validator, each RRset's records followed by its RRSIGs.
+fn mistag_records(records: &[Record], mistags: &BTreeMap<u16, Mistag>) -> Vec<Record> {
+    if mistags.is_empty() {
+        return records.to_vec();
+    }
+    record_sets(records)
+        .iter()
+        .flat_map(|set| {
+            let set = mistag_set(set, mistags);
+            let mut out: Vec<Record> = set.records_without_rrsigs().cloned().collect();
+            out.extend(set.rrsigs().iter().cloned());
+            out
+        })
         .collect()
 }
 
@@ -1791,11 +1880,6 @@ fn nsec3_owner(name: &Name, apex: &Name) -> String {
     )
 }
 
-/// The NSEC3PARAM type in an NSEC3 line's bitmap. The Lean model signs
-/// NSEC3 zones without the NSEC3PARAM record RFC 5155 §7.1 puts at the
-/// apex, so its bitmaps never name the type.
-const NSEC3PARAM_BIT: &str = " TYPE51";
-
 /// The name a negative answer is about: the target of the last CNAME in
 /// the answer, unless the question was for CNAME (Lean's `finalName`).
 fn final_name(qname: &Name, qtype: RecordType, answers: &[Record]) -> Name {
@@ -1829,7 +1913,8 @@ fn signed_case(
     let zone = vector_zone(field(input, "zone"))?;
     let specs = key_specs(input);
     let keys = key_set(&specs, maker);
-    let tags = tag_names(&specs, &keys);
+    let mistags = mistags(&specs, &keys);
+    let tags = tag_names(&specs, &keys, &mistags);
     let window = vector_window(field(input, "window"));
     let signed = zone
         .signed(&keys, window, vector_denial(field(input, "denial")))
@@ -1848,38 +1933,21 @@ fn signed_case(
             );
         }
     };
-    let message = &response.message;
-    let qtype = req.question.query_type();
-    // The Lean model answers QTYPE ANY without the NSEC, NSEC3PARAM, and
-    // DNSKEY RRsets a signed node holds, so they are left out of what Rust
-    // answers before the two are compared.
-    let (answers, lean_lacks): (Vec<Record>, Vec<Record>) =
-        message.answers.iter().cloned().partition(|r| {
-            qtype != RecordType::ANY
-                || !matches!(
-                    covered_type(r),
-                    RecordType::NSEC | RecordType::NSEC3PARAM | RecordType::DNSKEY
-                )
-        });
-    if !lean_lacks.is_empty() {
-        tally.note(
-            "answers to ANY with NSEC, NSEC3PARAM, or DNSKEY, which Lean leaves out (compared without)",
-        );
+    // The answer as it reaches the validator, mistagged RRSIGs and all.
+    let mut message = response.message.clone();
+    message.answers = mistag_records(&message.answers, &mistags);
+    message.authorities = mistag_records(&message.authorities, &mistags);
+    if flag(input, "strip_soa") {
+        message
+            .authorities
+            .retain(|r| r.record_type() != RecordType::RRSIG || covered_type(r) != RecordType::SOA);
     }
+    let message = &message;
+    let answers = &message.answers;
+    let qtype = req.question.query_type();
     let form = Form::Zone(&tags);
-    let mut nsec3param = false;
-    let mut lines = |records: &mut dyn Iterator<Item = &Record>| -> Vec<String> {
-        records
-            .map(|r| {
-                let text = line(r, form);
-                if r.record_type() == RecordType::NSEC3 && text.contains(NSEC3PARAM_BIT) {
-                    nsec3param = true;
-                    text.replace(NSEC3PARAM_BIT, "")
-                } else {
-                    text
-                }
-            })
-            .collect()
+    let lines = |records: &mut dyn Iterator<Item = &Record>| -> Vec<String> {
+        records.map(|r| line(r, form)).collect()
     };
     let rcode = message.metadata.response_code;
     if compare_lines {
@@ -1943,15 +2011,13 @@ fn signed_case(
         _ => None,
     }
     .ok_or("the signed zone has no DNSKEY RRset")?;
+    let dnskeys = mistag_set(&dnskeys, &mistags);
     if compare_lines {
         same(
             "dnskey",
             section(&texts(expected, "dnskey")),
             section(&lines(&mut dnskeys.records(true))),
         )?;
-    }
-    if nsec3param {
-        tally.note("NSEC3 bitmaps naming NSEC3PARAM, which Lean lacks (compared without)");
     }
 
     // A zone below a signed parent validates from the parent's anchor,
@@ -1982,9 +2048,25 @@ fn signed_case(
     let authority = record_sets(&message.authorities);
     let lean = field(expected, "validation");
     let lean_answers: Vec<String> = list(lean, "answer").iter().map(lean_validation).collect();
-    let sets = record_sets(&answers);
+    // Lean's results are in the order of its answer RRsets, which an
+    // answer to ANY may list in another order than Rust's.
+    let lean_sets: Vec<(String, String)> = rrsets_of(&texts(expected, "answer"))
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect();
+    same("answer RRsets", lean_sets.len(), lean_answers.len())?;
+    let sets = record_sets(answers);
     same("answer RRsets validated", lean_answers.len(), sets.len())?;
-    for (set, lean) in sets.iter().zip(&lean_answers) {
+    for set in &sets {
+        let key = (
+            name_text(set.name()).to_ascii_lowercase(),
+            type_text(u16::from(set.record_type())),
+        );
+        let lean = lean_sets
+            .iter()
+            .position(|lean| *lean == key)
+            .map(|i| &lean_answers[i])
+            .ok_or_else(|| format!("Lean validated no answer RRset {} {}", key.0, key.1))?;
         let rust = validation_text(
             validate_rrset(set, &authority, &chain, &anchors, &policy, at, verify).validation,
         );
@@ -2005,7 +2087,7 @@ fn signed_case(
                 .iter()
                 .any(|r| r.record_type() == RecordType::SOA));
     let rust_denial = negative.then(|| {
-        let about = Query::query(final_name(&qname, qtype, &answers), qtype);
+        let about = Query::query(final_name(&qname, qtype, answers), qtype);
         validation_text(
             validate_denial(
                 &about, rcode, &authority, &chain, &anchors, &policy, at, verify,
@@ -2015,28 +2097,6 @@ fn signed_case(
     });
     let denial = field(lean, "denial");
     let lean_denial = (!denial.is_null()).then(|| lean_validation(denial));
-    if lean_denial == rust_denial {
-        return Ok(());
-    }
-    // Rust checks the signed SOA RRset of a negative answer (RFC 4035
-    // §3.1.1) before its denial records, and reports why the SOA failed.
-    // The Lean model checks only the denial records.
-    let soa_fails = authority
-        .iter()
-        .filter(|set| set.record_type() == RecordType::SOA)
-        .any(|set| {
-            matches!(
-                validate_rrset(set, &[], &chain, &anchors, &policy, at, verify).validation,
-                Validation::Bogus(_)
-            )
-        });
-    let both_bogus = [&lean_denial, &rust_denial]
-        .iter()
-        .all(|v| v.as_deref().is_some_and(|v| v.starts_with("bogus")));
-    if soa_fails && both_bogus {
-        tally.note("negative answers whose SOA fails, which Lean does not check (both Bogus)");
-        return Ok(());
-    }
     same("denial validation", lean_denial, rust_denial)
 }
 
@@ -2084,12 +2144,10 @@ fn parent_chain(
         .into_iter()
         .find(|set| set.record_type() == RecordType::DS);
     if compare_lines {
-        let tags = tag_names(&specs, &keys);
+        let tags = tag_names(&specs, &keys, &BTreeMap::new());
         let form = Form::Zone(&tags);
         let lines = |records: &mut dyn Iterator<Item = &Record>| -> Vec<String> {
-            records
-                .map(|r| line(r, form).replace(NSEC3PARAM_BIT, ""))
-                .collect()
+            records.map(|r| line(r, form)).collect()
         };
         same(
             "parent dnskey",
@@ -2295,6 +2353,7 @@ fn real_ds_line(line: &str, keys: &mut impl Keys) -> String {
                 algorithm,
                 sep,
                 corrupt: false,
+                mistag: false,
             };
             let real: DS = ds(&owner, &keys.sign(spec).dnskey(), digest);
             format!(

@@ -4,7 +4,6 @@
 
   * `names.json`: `Name.canonCmp`, `Name.eqCI`, `Name.wireLen`;
   * `wire.json`: `Wire.decode`, and `Wire.encode false` for the canonical (uncompressed) octets;
-  * `restore.json`: `Wire.restore`;
   * `fit.json`: `Fit.plan` and `Fit.fit`;
   * `respond.json`: `Wire.parse` and `Wire.respondHeader`;
   * `zone.json`: `Zone.build` and `Zone.answer`;
@@ -315,28 +314,6 @@ def wireCase : G String := do
     | .error e => jobj [("ok", jbool false), ("error", jstr (errStr e))]
   return jobj [("input", jobj [("bytes", jstr (hex bytes))]), ("expected", expected)]
 
-/-! ## restore.json -/
-
-def restoreCase : G String := do
-  let qname ← rName 3 false
-  let qtype ← pick #[1, 28, 15, 16]
-  let qn ← qname.mapM mixCase
-  let query := encode true ⟨⟨← rNat 65536, 256⟩, [⟨qn, qtype, 1⟩], [], [], []⟩
-  let rn ← match ← rNat 6 with
-    | 0 => rName 3 false
-    | _ => qname.mapM mixCase
-  let rt ← if (← chance 8) then pick #[1, 28, 15, 16] else pure qtype
-  let rc ← if (← chance 10) then pure 3 else pure 1
-  let answers ← do let n ← rNat 3; rList n (rRR (some rn) (some rt))
-  let reply := encode true ⟨⟨← rNat 65536, 33152⟩, [⟨rn, rt, rc⟩], answers, [], []⟩
-  let reply ← if (← chance 8) then corrupt reply else pure reply
-  let query ← if (← chance 12) then corrupt query else pure query
-  let expected := match restore reply query with
-    | .ok out => jobj [("restored", jstr (hex out))]
-    | .error .questionMismatch => jobj [("error", jstr "question_mismatch")]
-    | .error .malformed => jobj [("error", jstr "malformed")]
-  return jobj [("input", jobj [("reply", jstr (hex reply)), ("query", jstr (hex query))]), ("expected", expected)]
-
 /-! ## fit.json -/
 
 def rRRset : G (List RR) := do
@@ -630,11 +607,12 @@ end Zones
 /-! ## DNSSEC records in presentation form
 
 Keys and signatures are symbolic. A key is a number below 256; its DNSKEY's public key field is the
-base64 of that one octet, and its key tag is the number. A signature made with private key `p` has key tag
-`p mod 1000` and signature field the base64 of `p` as two octets; it verifies exactly when `p` is the key
-tag, that is below 1000, and covers the records shown. A corrupted key signs with `p = key + 1000`. A DS digest
-is the hex of the identity encoding of the owner and key (`Dnssec.Symbolic.scheme.digest`). NSEC3 hashes are
-real SHA-1 with an empty salt and no extra iterations, written in base32hex. -/
+base64 of that one octet, and its key tag is the number. A signature made with private key `p` has the key
+tag of its RRSIG, and signature field the base64 of `p` as two octets; it verifies exactly when `p` is the
+key, below 256, and it covers the records shown, key tag included. A corrupted key signs with `p = key + 1000`.
+A mistagged key's RRSIGs carry key tag `key + 512`, which names no key. A DS digest is the hex of the identity
+encoding of the owner and key (`Dnssec.Symbolic.scheme.digest`). NSEC3 hashes are real SHA-1 with an empty
+salt and no extra iterations, written in base32hex. -/
 
 section DnssecText
 open Zone Dnssec
@@ -693,7 +671,7 @@ def payloadLines (ttl : Nat) : Payload → List String
 def rrsigLine (owner : Name) (ttl cov : Nat) (r : Rrsig Sch) : String :=
   let p := (r.sig : Nat × Tbs).1
   s!"{nameStr owner} {ttl} IN RRSIG {dnssecTypeStr cov} {r.hdr.alg} {r.hdr.labels} {r.hdr.ttl} " ++
-    s!"{r.hdr.expiration} {r.hdr.inception} {p % 1000} {nameStr r.hdr.signer} {base64 [p / 256 % 256, p % 256]}"
+    s!"{r.hdr.expiration} {r.hdr.inception} {r.hdr.tag} {nameStr r.hdr.signer} {base64 [p / 256 % 256, p % 256]}"
 
 /-- The lines of records and the RRSIGs over them; RRSIGs take the TTL of the records they cover. -/
 def signedLines (ttl : Nat) (d : Signed Sch) : List String :=
@@ -735,12 +713,15 @@ end DnssecText
 section Signed
 open Zone Dnssec
 
-/-- A symbolic key as the vectors give it. A corrupted key's signatures do not verify. -/
+/-- A symbolic key as the vectors give it. A corrupted key's signatures do not verify. A mistagged key's
+RRSIGs reach the validator with a key tag that names no key, as a broken server may send them, signed over
+that tag, so only the key tag check tells them apart. -/
 structure KeySpec where
   id : Nat
   alg : Nat
   sep : Bool
   corrupt : Bool
+  mistag : Bool
 
 def KeySpec.signer (k : KeySpec) : Signer Sch :=
   if k.corrupt then ⟨⟨Sch.pub k.id, k.alg, k.sep⟩, fun m => ((k.id + 1000 : Nat), m)⟩
@@ -748,16 +729,42 @@ def KeySpec.signer (k : KeySpec) : Signer Sch :=
 
 def keysJson (ks : List KeySpec) : String :=
   jarr (ks.map fun k =>
-    jobj [("id", jnat k.id), ("alg", jnat k.alg), ("sep", jbool k.sep), ("corrupt", jbool k.corrupt)])
+    jobj [("id", jnat k.id), ("alg", jnat k.alg), ("sep", jbool k.sep), ("corrupt", jbool k.corrupt),
+      ("mistag", jbool k.mistag)])
 
-/-- A KSK and, often, a ZSK, with algorithms the policy validates and sometimes RSASHA1. -/
-def rKeys : G (List KeySpec) := do
+/-- A KSK and, often, a ZSK, with algorithms the policy validates and sometimes RSASHA1. With `mistag`, a key
+is sometimes mistagged. -/
+def rKeys (mistag : Bool := false) : G (List KeySpec) := do
   let id1 ← rRange 1 127
   let alg ← pick #[13, 13, 8, 15, 14, 5]
-  let k1 : KeySpec := ⟨id1, alg, true, ← chance 8⟩
+  let k1 : KeySpec := ⟨id1, alg, true, ← chance 8, mistag && (← chance 8)⟩
   if ← chance 3 then return [k1]
-  let k2 : KeySpec := ⟨id1 + 128, alg, false, ← chance 8⟩
+  let k2 : KeySpec := ⟨id1 + 128, alg, false, ← chance 8, mistag && (← chance 8)⟩
   return [k1, k2]
+
+/-- An RRSIG as it reaches the validator: a mistagged key's carries key tag `key + 512`, and its signature is
+over that tag. -/
+def retag (ks : List KeySpec) (r : Rrsig Sch) : Rrsig Sch :=
+  let p := (r.sig : Nat × Tbs).1
+  if ks.any (fun k => k.mistag && k.id == p % 1000) then
+    let h := { r.hdr with tag := p % 1000 + 512 }
+    ⟨h, (p, { (r.sig : Nat × Tbs).2 with hdr := h })⟩
+  else r
+
+def retagSigned (ks : List KeySpec) (d : Signed Sch) : Signed Sch := { d with sigs := d.sigs.map (retag ks) }
+
+def retagAnswer (ks : List KeySpec) (sa : SignedAnswer Sch) : SignedAnswer Sch :=
+  let pair := fun (p : RRset × List (Rrsig Sch)) => (p.1, p.2.map (retag ks))
+  { sa with answer := sa.answer.map pair, anyExtra := sa.anyExtra.map (retagSigned ks),
+            authority := sa.authority.map pair, denial := sa.denial.map (retagSigned ks) }
+
+/-- The lines of a DNSSEC RRset an answer to ANY carries, owned by `owner`, with its RRSIGs. -/
+def extraLines (sz : SignedZone Sch) (owner : Name) (d : Signed Sch) : List String :=
+  let (data, ttl) : Payload × Nat := match d.data with
+    | .nsec r => (.nsec { r with owner := owner }, sz.denialTtl)
+    | .keys _ ks => (.keys owner ks, sz.zone.soa.ttl)
+    | p => (p, sz.denialTtl)
+  payloadLines ttl data ++ d.sigs.map (rrsigLine owner ttl (covered d.data))
 
 /-- A zone the builder accepts, without DNAME: a CNAME a DNAME synthesizes has no RRSIG, and its validation
 goes through the DNAME, which this model does not do. -/
@@ -798,22 +805,24 @@ def rParent (z : Zone) (keys : List KeySpec) : G (Spec × List KeySpec × Denial
 
 def signedCase : G String := do
   let (sp, z) ← rSignedZone
-  let keys ← rKeys
+  let keys ← rKeys true
   let denial ← rDenial
   let w : Window := ⟨100, ← pick #[200, 200, 150, 300]⟩
   let t ← pick #[50, 100, 150, 150, 199, 200, 250]
   let q : Request := ⟨← rQname z, ← rQtype⟩
-  let sz : SignedZone Sch := ⟨z, keys.map (·.signer), w, denial⟩
+  let sz : SignedZone Sch := SignedZone.make z (keys.map (·.signer)) w denial
+  -- The zone's DNSKEY set as it reaches the validator.
+  let keySet := retagSigned keys sz.keySet
   -- Half the zones that can have a parent get one, so the validation walks down a delegation from the
   -- parent's anchor; the rest are anchored at their own apex.
   let parent : Option (Spec × List KeySpec × Denial) ←
     if 2 ≤ z.apex.length && (← chance 2) then some <$> rParent z keys else pure none
   let below := parent.map fun ((psp, pkeys, pd) : Spec × List KeySpec × Denial) =>
-    let pz : SignedZone Sch := ⟨psp.assemble, pkeys.map KeySpec.signer, w, pd⟩
-    (pz, Dns.Chain.linkBelow pz sz)
+    let pz : SignedZone Sch := SignedZone.make psp.assemble (pkeys.map KeySpec.signer) w pd
+    (pz, { Dns.Chain.linkBelow pz sz with keys := some keySet })
   let (anchors, chain) := match below with
     | some (pz, link) => ([pz.anchor 2], [pz.link, link])
-    | none => ([sz.anchor 2], [sz.link])
+    | none => ([sz.anchor 2], [{ sz.link with keys := some keySet }])
   let delegation : List String := match below with
     | some (pz, link) => match link.parent with
       | some (.ds sd) => signedLines 86400 sd
@@ -824,15 +833,23 @@ def signedCase : G String := do
     | some (pz, _) => [("parent_dnskey", jarr ((signedLines pz.zone.soa.ttl pz.keySet).map jstr)),
         ("delegation", jarr (delegation.map jstr))]
     | none => []
+  -- Sometimes the SOA RRset of the answer reaches the validator without its RRSIGs, so a negative answer
+  -- whose denial records verify still fails on its SOA.
+  let stripSoa ← chance 6
   let expected := match sz.answerDo q .all with
     | (.response _, some sa) =>
+      let sa := retagAnswer keys sa
+      let sa := if stripSoa then
+        { sa with authority := sa.authority.map fun (s, sigs) => (s, if s.rtype == 6 then [] else sigs) }
+        else sa
       let (vs, dv) := validateAnswer (some anchors) Policy.iana t chain q sa
       jobj ([("rcode", jstr (rcodeStr sa.rcode)), ("aa", jbool sa.aa),
-        ("answer", jarr ((sa.answer.flatMap setWithSigsLines).map jstr)),
+        ("answer", jarr ((sa.answer.flatMap setWithSigsLines ++ sa.anyExtra.flatMap (extraLines sz q.qname)).map
+          jstr)),
         ("authority", jarr ((sa.authority.flatMap setWithSigsLines).map jstr)),
         ("additional", setsJson sa.additional),
         ("denial", jarr ((sa.denial.flatMap (signedLines sz.denialTtl)).map jstr)),
-        ("dnskey", jarr ((signedLines z.soa.ttl sz.keySet).map jstr)),
+        ("dnskey", jarr ((signedLines z.soa.ttl keySet).map jstr)),
         ("validation", jobj [("answer", jarr (vs.map validationJson)),
           ("denial", (dv.map validationJson).getD "null")])] ++ parentOut)
     | (.unknown n, _) => jobj [("unknown", jstr (nameStr n))]
@@ -844,7 +861,7 @@ def signedCase : G String := do
   return jobj [("input", jobj ([("zone", specJson sp), ("keys", keysJson keys), ("window", windowJson w),
       ("denial", denialJson denial), ("request", jobj [("qname", jstr (nameStr q.qname)),
         ("qtype", jstr (typeStr q.qtype))]), ("time", jnat t), ("policy", ianaJson),
-      ("anchor_digest_type", jnat 2)] ++ parentIn)),
+      ("anchor_digest_type", jnat 2), ("strip_soa", jbool stripSoa)] ++ parentIn)),
     ("expected", expected)]
 
 end Signed
@@ -1173,7 +1190,7 @@ end ResolverVectors
 def cases (n : Nat) (g : G String) : G (List String) := rList n g
 
 def kinds : List (String × Nat × G String) :=
-  [("names", 400, namesCase), ("wire", 400, wireCase), ("restore", 300, restoreCase), ("fit", 300, fitCase),
+  [("names", 400, namesCase), ("wire", 400, wireCase), ("fit", 300, fitCase),
     ("respond", 400, respondCase), ("zone", 400, zoneCase), ("partial", 300, partialCase),
     ("signed", 300, signedCase), ("policy", 200, policyCase), ("chain", 200, chainCase), ("cache", 200, cacheCase),
     ("resolver", 200, resolverCase)]
