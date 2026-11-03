@@ -28,7 +28,7 @@ use fictionet::stdlib::protocols::dns::rr::{
     LowerName, Name, RData, Record, RecordSet, RecordType,
 };
 use fictionet::stdlib::protocols::dns::{Ede, EdeCode, Nsid};
-use fictionet::stdlib::services::dns::authority::{AuthorityEngine, ServerConfig, Zones};
+use fictionet::stdlib::services::dns::authority::{AuthorityEngine, Copies, ServerConfig, Zones};
 use fictionet::stdlib::services::dns::memory::{Exchanges, MemoryNet, Recording, drive};
 use fictionet::stdlib::services::dns::resolver::{Config, Resolver};
 use fictionet::stdlib::services::dns::zone::{
@@ -836,54 +836,50 @@ fn looked_up(real: &mut MemoryNet, lookup: &Lookup) -> Looked {
     response.map_or(Looked::NoReply, Looked::Response)
 }
 
-/// Servers of learned copies of the zones at `apexes`.
-fn copies(apexes: &[&str]) -> Arc<Zones> {
-    Arc::new(Zones::new(
-        apexes
-            .iter()
-            .map(|apex| Arc::new(Learned::new(&name(apex))) as Arc<dyn ZoneData>)
-            .collect(),
-    ))
-}
-
 /// `world` with the root letters, the `gtld-servers.net` servers, and the
 /// servers of `example.com` and `dnssec-failed.com` answering from
-/// copies learned from `real`, behind the fronts `real` gives them.
+/// copies learned from `real`, behind the fronts `real` gives them. The
+/// addresses serve the zones a `Mirror` starts them with, the root at the
+/// root letters and `com` and `net` at `gtld-servers.net`, and the zones
+/// a `Mirror` would note from the referrals to them. `arpa`, which the
+/// real root letters serve too, is learned from their responses.
 fn copying(real: &TestInternet, world: TestInternet) -> MemoryNet {
     let mut net = world.memory();
-    let mut serve = |addresses: Vec<IpAddr>, front: ServerConfig, zones: &Arc<Zones>| {
+    let copies = Arc::new(Copies::new());
+    let mut serve = |addresses: Vec<IpAddr>, front: ServerConfig, apexes: &[&str]| {
         for address in addresses {
+            for apex in apexes {
+                copies.serves(address, &LowerName::new(&name(apex)));
+            }
             let local = SocketAddr::new(address, 53);
             net.serve(
                 address,
-                AuthorityEngine::new(zones.clone(), front.clone(), local),
+                AuthorityEngine::new(copies.clone(), front.clone(), local),
             );
         }
     };
-    let root = copies(&[".", "arpa."]);
     for letter in &ROOT_LETTERS {
         let front = real.letter_front(letter.server.v4);
-        serve(letter.server.addresses().to_vec(), front, &root);
+        serve(letter.server.addresses().to_vec(), front, &["."]);
     }
-    let gtld = copies(&["com.", "net."]);
     for server in &GTLD_SERVERS {
         let identity = real.location().site(IpAddr::V4(server.v4)).identity;
         serve(
             server.addresses().to_vec(),
             ServerConfig::gtld(identity),
-            &gtld,
+            &["com.", "net."],
         );
     }
     let cloudflare = ServerConfig {
         any: AnyResponse::Hinfo,
         ..ServerConfig::generic()
     };
-    serve(example_com(), cloudflare, &copies(&["example.com."]));
+    serve(example_com(), cloudflare, &["example.com."]);
     let failed = [IpAddr::V4(DNSSEC_FAILED), IpAddr::V6(v6(DNSSEC_FAILED))];
     serve(
         failed.to_vec(),
         ServerConfig::generic(),
-        &copies(&["dnssec-failed.com."]),
+        &["dnssec-failed.com."],
     );
     let mut upstream = real.memory();
     net.upstream(move |lookup| looked_up(&mut upstream, lookup));

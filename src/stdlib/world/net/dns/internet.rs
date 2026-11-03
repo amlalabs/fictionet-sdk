@@ -53,12 +53,10 @@ use fictionet::stdlib::protocols::dns::rr::{
 use fictionet::stdlib::protocols::dns::{Ede, EdeCode, Nsid, Request, Response};
 use fictionet::stdlib::protocols::urlencoded_form::{self, Form};
 use fictionet::stdlib::services::dns::authority::{
-    Authority, ChaosAnswer, ChaosReply, Identity, Observe, ServerConfig, Step, Zones, chaos,
+    Authority, ChaosAnswer, ChaosReply, Copies, Identity, Observe, ServerConfig, Step, chaos,
 };
 use fictionet::stdlib::services::dns::resolver::Config;
-use fictionet::stdlib::services::dns::zone::{
-    AnyResponse, Learned, Shown, Zone, ZoneData, ZoneError,
-};
+use fictionet::stdlib::services::dns::zone::{AnyResponse, Shown, Zone, ZoneError};
 use fictionet::stdlib::services::dns::{Client, Generation, Looked, Lookup, WallClock};
 use fictionet::stdlib::web::httpd::{self, Body, request_host};
 use fictionet::sync::Mutex;
@@ -149,7 +147,8 @@ const fn arpa(host: &'static str, index: usize) -> NameServer {
 /// The servers of `arpa`: every root letter but j, each at the same
 /// addresses as its letter, as IANA's root zone database lists them
 /// (`https://www.iana.org/domains/root/db/arpa.html`). The root servers
-/// answer for `arpa` themselves, so relays at the root addresses serve it.
+/// answer for `arpa` themselves, so a [`Mirror`] serves its copy at the
+/// root addresses once a root server answers from it.
 pub const ARPA_SERVERS: [NameServer; 12] = [
     arpa("a.ns.arpa.", 0),
     arpa("b.ns.arpa.", 1),
@@ -607,7 +606,8 @@ fn whoami_cloudflare() -> LowerName {
 
 /// Google Public DNS, with `o-o.myaddr.l.google.com` answered as the
 /// real one is: Google's authority there sees Google's own egress address
-/// and the client's subnet (RFC 7871), so a relay could never give it.
+/// and the client's subnet (RFC 7871), so a copy of its records could
+/// never give it.
 /// With the egress unknown, the name is asked of the real hierarchy like
 /// any other.
 fn google(site: &ResolverSite, egress: Option<&Egress>) -> Config {
@@ -1491,15 +1491,18 @@ type Front = dyn Fn(Host) -> Host + Send + Sync;
 /// below them that a reply names, each served at its real servers'
 /// addresses from records copied from those servers.
 ///
-/// [`relay`](Mirror::relay) is a program that answers, at its own
+/// [`server`](Mirror::server) is a program that answers, at its own
 /// address, for the zones the mirror knows that address serves: the root
 /// at the root letters' addresses, `com` and `net` at the
-/// `gtld-servers.net` addresses, and every zone a reply names that
-/// address a server of. Each zone's data is [`Learned`]: one per zone,
-/// shared by all of the zone's servers, filled from the real servers
-/// through the mirror's upstream as the world's servers need facts, and
-/// answered from with the world's own [`Zones`]. No real server's message
-/// reaches a client. A world runs the program on the root and
+/// `gtld-servers.net` addresses, every zone a reply names that address a
+/// server of, and every zone below one of those that the real server
+/// turns out to answer from, such as `arpa` at the root letters'
+/// addresses. Each zone's data is
+/// [`Learned`](fictionet::stdlib::services::dns::zone::Learned): one per
+/// zone, shared by all of the zone's servers, filled from the real
+/// servers through the mirror's upstream as the world's servers need
+/// facts, and answered from by the world's own [`Copies`]. No real
+/// server's message reaches a client. A world runs the program on the root and
 /// `gtld-servers.net` presets. As replies leave, the mirror places more
 /// servers, so a resolver in the world can follow the hierarchy as far
 /// down as the upstream answers:
@@ -1553,10 +1556,8 @@ struct Inner {
     fronts: Vec<(LowerName, Arc<Front>)>,
     named: Arc<PerSession<Named>>,
     placed: Arc<Mutex<Placed>>,
-    /// Each zone's copied data, by apex.
-    zones: Arc<Mutex<HashMap<LowerName, Arc<Learned>>>>,
-    /// The zones each address serves.
-    served: Arc<Mutex<HashMap<IpAddr, Vec<LowerName>>>>,
+    /// Each zone's copied data, and the zones each address serves.
+    copies: Arc<Copies>,
     /// The address the upstream asks the real servers from, when it is
     /// known.
     egress: Option<Egress>,
@@ -1600,19 +1601,17 @@ impl Mirror {
                     .flat_map(move |a| [(IpAddr::V4(a.v4), egress), (IpAddr::V6(a.v6), egress)])
             })
             .collect();
-        let mut served: HashMap<IpAddr, Vec<LowerName>> = HashMap::new();
+        let copies = Copies::new();
         for letter in &ROOT_LETTERS {
             for addr in letter.server.addresses() {
-                served
-                    .entry(addr)
-                    .or_default()
-                    .push(LowerName::from(Name::root()));
+                copies.serves(addr, &LowerName::from(Name::root()));
             }
         }
         for server in &GTLD_SERVERS {
             for addr in server.addresses() {
-                let zones = served.entry(addr).or_default();
-                zones.extend(["com.", "net."].map(|zone| LowerName::new(&name(zone))));
+                for zone in ["com.", "net."] {
+                    copies.serves(addr, &LowerName::new(&name(zone)));
+                }
             }
         }
         Mirror {
@@ -1626,8 +1625,7 @@ impl Mirror {
                 fronts: Vec::new(),
                 named: Arc::default(),
                 placed: Arc::default(),
-                zones: Arc::default(),
-                served: Arc::new(Mutex::new(served)),
+                copies: Arc::new(copies),
                 egress: at.egress,
                 resolvers,
             }),
@@ -1688,13 +1686,13 @@ impl Mirror {
     /// A program answering, at its own address, for the zones the mirror
     /// knows that address serves, with `server` as its front, the mirror's
     /// upstream and namespace, and its observers.
-    pub fn relay(&self, server: ServerConfig) -> Authoritative<Arc<dyn Authority>> {
-        self.inner.relay(server)
+    pub fn server(&self, server: ServerConfig) -> Authoritative<Arc<dyn Authority>> {
+        self.inner.server(server)
     }
 }
 
 impl Inner {
-    fn relay(self: &Arc<Self>, server: ServerConfig) -> Authoritative<Arc<dyn Authority>> {
+    fn server(self: &Arc<Self>, server: ServerConfig) -> Authoritative<Arc<dyn Authority>> {
         let mirrored: Arc<dyn Authority> = Arc::new(Mirrored(self.clone()));
         let mut authority = match &self.wrap {
             Some(wrap) => wrap(mirrored),
@@ -1712,30 +1710,6 @@ impl Inner {
         match &self.namespace {
             Some(namespace) => program.namespace(namespace),
             None => program,
-        }
-    }
-
-    /// The copied data of the zones `addr` serves.
-    fn zones_at(&self, addr: IpAddr) -> Vec<Arc<dyn ZoneData>> {
-        let apexes = self.served.lock().get(&addr).cloned().unwrap_or_default();
-        let mut zones = self.zones.lock();
-        apexes
-            .into_iter()
-            .map(|apex| {
-                let learned = zones
-                    .entry(apex.clone())
-                    .or_insert_with(|| Arc::new(Learned::new(&Name::from(apex))));
-                learned.clone() as Arc<dyn ZoneData>
-            })
-            .collect()
-    }
-
-    /// Notes that `addr` serves the zone at `zone`.
-    fn serves(&self, addr: IpAddr, zone: &LowerName) {
-        let mut served = self.served.lock();
-        let zones = served.entry(addr).or_default();
-        if !zones.contains(zone) {
-            zones.push(zone.clone());
         }
     }
 
@@ -1820,7 +1794,7 @@ impl Inner {
         }
         servers.retain(|(addr, _, _)| self.may_serve(*addr));
         for (addr, _, zone) in &servers {
-            self.serves(*addr, zone);
+            self.copies.serves(*addr, zone);
         }
         {
             let mut placed = self.placed.lock();
@@ -1832,7 +1806,7 @@ impl Inner {
         for (addr, name, _) in servers {
             let host = only_at(&name.to_ascii(), addr)
                 .delay(self.delay)
-                .program(self.relay(ServerConfig::generic()));
+                .program(self.server(ServerConfig::generic()));
             let _ = self.handle.add_host(host);
         }
         for (addr, build) in fronts {
@@ -1904,8 +1878,7 @@ impl Authority for Mirrored {
         server: &ServerConfig,
         client: &Client,
     ) -> Step {
-        let zones = Zones::new(self.0.zones_at(local.ip()));
-        match zones.respond(req, local, server, client) {
+        match self.0.copies.respond(req, local, server, client) {
             Step::Reply(mut response) => {
                 if let Some((egress, seen)) = self.0.seen_by(client) {
                     echo(&mut response.message, egress, seen);
@@ -1918,17 +1891,11 @@ impl Authority for Mirrored {
     }
 
     fn file(&self, lookup: &Lookup, looked: &Looked, generation: Generation) {
-        let learned = self.0.zones.lock().get(&lookup.zone).cloned();
-        if let (Some(learned), Looked::Response(response)) = (learned, looked) {
-            learned.file(generation, &lookup.question, response);
-        }
+        self.0.copies.file(lookup, looked, generation);
     }
 
     fn advance(&self, generation: Generation) {
-        let zones: Vec<Arc<Learned>> = self.0.zones.lock().values().cloned().collect();
-        for learned in zones {
-            learned.advance(generation);
-        }
+        self.0.copies.advance(generation);
     }
 }
 

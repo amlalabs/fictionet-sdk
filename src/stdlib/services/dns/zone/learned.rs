@@ -32,14 +32,18 @@ use super::zone::{Node, dname_target, targets, wildcard};
 ///   section that are in the zone and not below a cut it holds, each with
 ///   its RRSIGs; the zone's apex NS RRset from its authority section; and
 ///   the A and AAAA RRsets of its additional section, which never replace
-///   an RRset an answer section gave (RFC 2181 §5.4.1). A DNAME is kept,
+///   an RRset an answer section gave or stand against a filed NODATA, and
+///   which are served only as additional data, never as an answer
+///   (RFC 2181 §5.4.1): such an RRset may be glue below a cut the zone
+///   does not hold yet, or sent without its RRSIGs. A DNAME is kept,
 ///   and the CNAME synthesized from it is not (RFC 6672 §3.4). An RRset
-///   whose RRSIGs show a wildcard expansion (a Labels field below the
-///   owner's label count, RFC 4035 §5.3.4) is kept at the wildcard that
-///   made it, the name one label below the wildcard's parent toward the
+///   of the answer section whose RRSIGs show a wildcard expansion (a
+///   Labels field below the owner's label count, RFC 4035 §5.3.4) is kept
+///   at the wildcard that made it, the name one label below the wildcard's parent toward the
 ///   owner is kept as absent, and the NSEC and NSEC3 records of the
 ///   authority section are kept as the proof for the expansion
-///   (RFC 4035 §3.1.3.3, RFC 5155 §7.2.6).
+///   (RFC 4035 §3.1.3.3, RFC 5155 §7.2.6). An answer to ANY or RRSIG
+///   expanded from a wildcard is kept the same way.
 /// - Where the answer's CNAME and DNAME chain ends inside the zone
 ///   without an RRset of the type asked, the answer is negative there.
 ///   With the zone's SOA in its authority section (RFC 2308 §5), NXDOMAIN
@@ -53,7 +57,8 @@ use super::zone::{Node, dname_target, targets, wildcard};
 ///   above the question's name) gives a zone cut: the NS RRset, the glue
 ///   for its targets at or below the cut (RFC 9471 §3.1), and the DS
 ///   RRset, or else the NSEC and NSEC3 records sent beside it as the proof
-///   that the cut has none (RFC 4035 §3.1.4).
+///   that the cut has none, which the copy's referrals carry
+///   (RFC 4035 §3.1.4).
 /// - Any other response, such as REFUSED, SERVFAIL, or an answer without
 ///   AA, gives nothing.
 ///
@@ -66,8 +71,9 @@ use super::zone::{Node, dname_target, targets, wildcard};
 /// name, a target of the CNAME and DNAME chain from it, or a wildcard
 /// that could answer for one) is present with its RRsets only when the
 /// data holds the fact the question's type needs there: an RRset of that
-/// type, a CNAME, or the type known absent. Such a name the data holds,
-/// or holds names below, is otherwise an empty node that answers nothing
+/// type or a CNAME from an answer or authority section, or the type known
+/// absent. Such a name the data holds, or holds names below, is
+/// otherwise an empty node that answers nothing
 /// ([`View::answers_empty`] is false), so the answer ends unknown there
 /// and the server looks the question up. Any other name the data holds
 /// is present as it is, since the answer only passes it on the way down
@@ -75,8 +81,16 @@ use super::zone::{Node, dname_target, targets, wildcard};
 /// filed negative said so, and [`View::denial`] gives only the proof that
 /// came with it. Questions for ANY and for RRSIG are answered from the
 /// response to that same question alone, since a server may answer ANY
-/// with a subset or a made-up HINFO (RFC 8482 §4). An unknown fact never
+/// with a subset or a made-up HINFO (RFC 8482 §4). A DS question at a cut
+/// a referral showed without DS is answered NODATA only from a filed
+/// NODATA for it: a referral carries no SOA, and may come from a zone
+/// below this one that the server also serves. An unknown fact never
 /// becomes NXDOMAIN or NODATA.
+///
+/// A real server that also serves a zone below this one answers for that
+/// zone's names from the child's data. [`child_answering`](Learned::child_answering)
+/// tells such a response apart, so that it is filed into the child's copy
+/// instead ([`Copies`](super::super::authority::Copies) does).
 ///
 /// Facts belong to a session ([`Generation`]): [`advance`](Learned::advance)
 /// to a newer one drops them all, and a response to a lookup made in an
@@ -176,6 +190,34 @@ impl Learned {
         }
     }
 
+    /// The apex of the zone strictly below this one that `response`, a
+    /// real server of the zone's response to `question`, answers from,
+    /// when it is authoritative and its authority section shows one: an
+    /// SOA RRset, which a negative answer carries for the zone it comes
+    /// from (RFC 2308 §3), or else an NS RRset, which an authoritative
+    /// answer carries only at its zone's apex, owned strictly below this
+    /// zone's apex and at or above the question's name. A server that
+    /// also serves a child zone answers that way for the child's names,
+    /// and never with a referral to it.
+    pub fn child_answering(&self, question: &Query, response: &Message) -> Option<LowerName> {
+        if !response.metadata.authoritative {
+            return None;
+        }
+        let qname = LowerName::new(question.name());
+        let owner = |rtype: RecordType| {
+            response.authorities.iter().find_map(|record| {
+                let owner = LowerName::new(&record.name);
+                (record.record_type() == rtype
+                    && record.dns_class == DNSClass::IN
+                    && owner != self.apex
+                    && self.apex.zone_of(&owner)
+                    && owner.zone_of(&qname))
+                .then_some(owner)
+            })
+        };
+        owner(RecordType::SOA).or_else(|| owner(RecordType::NS))
+    }
+
     /// Starts session `generation`, if it is newer than the current one,
     /// dropping every fact filed before.
     pub fn advance(&self, generation: Generation) {
@@ -202,8 +244,9 @@ impl ZoneData for Learned {
             .and_then(|known| known.sets.get(&RecordType::SOA))
             .map(|(_, set)| set.clone())
             .or_else(|| facts.negative_soa.clone())
-            // No negative answer comes without a filed SOA, and no
-            // positive one reads it.
+            // Every negative the view gives rests on a filed NXDOMAIN or
+            // NODATA, which came with the SOA, and no positive answer
+            // reads it.
             .unwrap_or_else(|| RecordSet::new(Name::from(&self.apex), RecordType::SOA, 0));
         Arc::new(LearnedView {
             apex: self.apex.clone(),
@@ -318,7 +361,9 @@ impl Facts {
                 && apex.zone_of(&owner)
                 && !self.below_cut(&owner, set.record_type())
             {
-                self.put_expanded(apex, set, Rank::Additional, filed.denial);
+                // At its owner even when a wildcard made it: the answer's
+                // proofs are not the proof for it.
+                self.put(apex, set.clone(), Rank::Additional);
             }
         }
 
@@ -335,11 +380,7 @@ impl Facts {
             .filter(|set| LowerName::new(set.name()) == end)
             .collect();
         if whole && filed.rcode == ResponseCode::NoError && !at_end.is_empty() {
-            let sets = at_end
-                .into_iter()
-                .map(|set| (set.record_type(), set.clone()))
-                .collect();
-            self.whole.insert((end, filed.qtype), Node::Data(sets));
+            self.put_whole(apex, &end, filed, &at_end);
             return;
         }
         let positive = at_end.iter().any(|set| set.record_type() == filed.qtype);
@@ -366,6 +407,9 @@ impl Facts {
                 } else {
                     let known = self.names.entry(end.clone()).or_default();
                     known.absent.insert(filed.qtype);
+                    // Such as additional data filed before.
+                    known.sets.remove(&filed.qtype);
+                    self.rebuild(&end);
                 }
                 self.proofs
                     .insert((end, Denied::Type(filed.qtype)), filed.denial.to_vec());
@@ -443,35 +487,82 @@ impl Facts {
         let Some(labels) = expanded_from(set) else {
             return self.put(apex, set.clone(), rank);
         };
-        let owner = set.name();
-        let encloser = owner.trim_to(labels);
-        let next_closer = LowerName::new(&owner.trim_to(labels + 1));
-        let encloser = LowerName::new(&encloser);
-        if !apex.zone_of(&encloser) {
+        let owner = LowerName::new(set.name());
+        let Some(at) = self.expansion(apex, &owner, labels, denial) else {
             return;
+        };
+        self.put(apex, renamed(set, &Name::from(&at)), rank);
+    }
+
+    /// Files `at_end`, the RRsets of an answer to ANY or RRSIG at `end`,
+    /// as that question's answer: at `end`, or at the wildcard that made
+    /// them, with the authority section's proof for the expansion.
+    fn put_whole(
+        &mut self,
+        apex: &LowerName,
+        end: &LowerName,
+        filed: &Filed<'_>,
+        at_end: &[&RecordSet],
+    ) {
+        let (at, owner) = match at_end.iter().find_map(|set| expanded_from(set)) {
+            None => (end.clone(), Name::from(end)),
+            Some(labels) => {
+                let Some(at) = self.expansion(apex, end, labels, filed.denial) else {
+                    return;
+                };
+                let owner = Name::from(&at);
+                (at, owner)
+            }
+        };
+        let sets = at_end
+            .iter()
+            .map(|set| (set.record_type(), renamed(set, &owner)))
+            .collect();
+        self.whole.insert((at, filed.qtype), Node::Data(sets));
+    }
+
+    /// Notes that `owner` was answered by expanding the wildcard whose
+    /// parent has `labels` labels: the next closer name is absent, and
+    /// `denial` is the proof for the expansion (RFC 4035 §3.1.3.3, RFC 5155
+    /// §7.2.6). The wildcard, or `None` when its parent is outside the zone.
+    fn expansion(
+        &mut self,
+        apex: &LowerName,
+        owner: &LowerName,
+        labels: usize,
+        denial: &[RecordSet],
+    ) -> Option<LowerName> {
+        let name = Name::from(owner);
+        let encloser = LowerName::new(&name.trim_to(labels));
+        let next_closer = LowerName::new(&name.trim_to(labels + 1));
+        if !apex.zone_of(&encloser) {
+            return None;
         }
         let at = wildcard(&encloser);
-        self.put(apex, renamed(set, &Name::from(&at)), rank);
         self.mark_absent(&next_closer);
         self.proofs.insert(
             (
-                LowerName::new(owner),
+                owner.clone(),
                 Denied::Wildcard {
                     closest_encloser: encloser,
                 },
             ),
             denial.to_vec(),
         );
+        Some(at)
     }
 
     /// Keeps `set` at its owner, unless an RRset of the same type is held
-    /// from a section that outranks `rank`.
+    /// from a section that outranks `rank`, or `rank` is the additional
+    /// section's and a filed NODATA says the owner has no such RRset.
     fn put(&mut self, apex: &LowerName, set: RecordSet, rank: Rank) {
         let owner = LowerName::new(set.name());
         self.unabsent(apex, &owner);
         let known = self.names.entry(owner.clone()).or_default();
         let rtype = set.record_type();
-        if known.sets.get(&rtype).is_none_or(|(held, _)| *held <= rank) {
+        let replaces = known.sets.get(&rtype).is_none_or(|(held, _)| *held <= rank);
+        let denied = rank == Rank::Additional && known.absent.contains(&rtype);
+        if replaces && !denied {
             known.sets.insert(rtype, (rank, set));
             known.absent.remove(&rtype);
         }
@@ -724,26 +815,27 @@ static EMPTY: Node = Node::Empty;
 
 impl LearnedView {
     /// Whether `known` holds the fact an answer of the view's type reads
-    /// at its name: an RRset of that type, a CNAME, which answers every
-    /// type (RFC 1034 §3.6.2), or the type known absent. ANY and RRSIG
-    /// are answered from their own responses instead.
+    /// at its name: an RRset of that type, or a CNAME, which answers every
+    /// type (RFC 1034 §3.6.2), from an answer or authority section, or
+    /// the type known absent. Additional data never answers
+    /// (RFC 2181 §5.4.1). ANY and RRSIG are answered from their own
+    /// responses instead.
     fn knows(&self, known: &Known) -> bool {
         let qtype = self.qtype;
+        let answers = |rtype: RecordType| {
+            known
+                .sets
+                .get(&rtype)
+                .is_some_and(|(rank, _)| *rank > Rank::Additional)
+        };
         !matches!(qtype, RecordType::ANY | RecordType::RRSIG)
-            && (known.sets.contains_key(&qtype)
-                || known.sets.contains_key(&RecordType::CNAME)
-                || known.absent.contains(&qtype))
+            && (answers(qtype) || answers(RecordType::CNAME) || known.absent.contains(&qtype))
     }
 
-    /// Whether the zone knows whether the cut at `name` has a DS RRset:
-    /// it holds one, or a negative or referral that shows there is none.
-    fn ds_settled(&self, name: &LowerName, known: &Known) -> bool {
-        known.sets.contains_key(&RecordType::DS)
-            || known.absent.contains(&RecordType::DS)
-            || self
-                .facts
-                .proofs
-                .contains_key(&(name.clone(), Denied::Type(RecordType::DS)))
+    /// Whether the zone knows whether the cut `known` holds has a DS
+    /// RRset: it holds one, or a filed NODATA shows there is none.
+    fn ds_settled(known: &Known) -> bool {
+        known.sets.contains_key(&RecordType::DS) || known.absent.contains(&RecordType::DS)
     }
 }
 
@@ -772,7 +864,7 @@ impl View for LearnedView {
                 // a DS question there it stands only once its DS is
                 // settled.
                 Node::Cut { .. }
-                    if answers && self.qtype == RecordType::DS && !self.ds_settled(name, known) =>
+                    if answers && self.qtype == RecordType::DS && !Self::ds_settled(known) =>
                 {
                     return Fact::Unknown;
                 }

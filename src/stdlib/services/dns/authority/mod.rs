@@ -14,6 +14,7 @@
 //! | Authority | What it answers |
 //! | --- | --- |
 //! | [`Zones`] | From zone data, with the answer of RFC 1034 §4.3.2, looking up what a learned zone lacks. |
+//! | [`Copies`] | As [`Zones`], over learned copies of the zones each address serves, noting the child zones real servers turn out to serve. |
 //! | [`Overlay`] | What its base answers, except for invented zones below it. |
 //! | [`Observe`] | What the authority it wraps answers, shown to a callback first. |
 //!
@@ -31,11 +32,13 @@ use super::exchange::{Client, Generation};
 use super::lookup::{Looked, Lookup};
 use super::zone::{Answered, ZoneData, answer};
 
+mod copies;
 mod engine;
 mod observe;
 mod overlay;
 mod server;
 
+pub use copies::Copies;
 pub use engine::AuthorityEngine;
 pub use observe::Observe;
 pub use overlay::Overlay;
