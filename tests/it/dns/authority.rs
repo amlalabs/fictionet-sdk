@@ -1,7 +1,7 @@
 //! The authoritative engine driven directly with inputs: the server
-//! front's header and EDNS rules, CHAOS answers, refusals, relays,
-//! completions that must change nothing, sessions, overlays, unknown
-//! facts, and the order of events and actions.
+//! front's header and EDNS rules, CHAOS answers, refusals, learned zones
+//! and their lookups, completions that must change nothing, sessions,
+//! overlays, unknown facts, and the order of events and actions.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -23,13 +23,13 @@ use fictionet::stdlib::protocols::dns::rr::{
 };
 use fictionet::stdlib::protocols::dns::{Ede, EdeCode, Nsid, Request, Response};
 use fictionet::stdlib::services::dns::authority::{
-    Ask, Authority, AuthorityEngine, ChaosAnswer, ChaosReply, Identity, Known, Observe, Overlay,
-    Relay, ServerConfig, Step, Zones, bare_reply, chaos,
+    Authority, AuthorityEngine, ChaosAnswer, ChaosReply, Identity, Observe, Overlay, ServerConfig,
+    Step, Zones, bare_reply, chaos,
 };
-use fictionet::stdlib::services::dns::zone::{Fact, Lazy, Transparent, Zone, ZoneData};
+use fictionet::stdlib::services::dns::zone::{Fact, Lazy, Learned, Transparent, Zone, ZoneData};
 use fictionet::stdlib::services::dns::{
-    Action, Client, ClientQuery, Engine, Event, ExchangeFailure, Generation, Input, ObservedKind,
-    Session, Token, Transmit, Unmatched, WallClock,
+    Action, Client, ClientQuery, Engine, Event, ExchangeFailure, Generation, Input, Looked, Lookup,
+    LookupOutcome, Session, Token, Unmatched, WallClock,
 };
 use fictionet::stdlib::services::serve::Transport;
 use fictionet::time::Instant;
@@ -168,11 +168,12 @@ fn answer_bytes(actions: &[Action]) -> Vec<u8> {
     bytes[0].clone()
 }
 
-fn sends(actions: &[Action]) -> Vec<Transmit> {
+/// The lookups among `actions`, with their tokens.
+fn lookups(actions: &[Action]) -> Vec<(Token, Lookup)> {
     actions
         .iter()
         .filter_map(|action| match action {
-            Action::Send(transmit) => Some(transmit.clone()),
+            Action::Lookup { token, lookup } => Some((*token, lookup.clone())),
             _ => None,
         })
         .collect()
@@ -204,11 +205,12 @@ fn kinds(actions: &[Action]) -> Vec<&'static str> {
         .iter()
         .map(|action| match action {
             Action::Send(_) => "send",
+            Action::Lookup { .. } => "lookup",
             Action::Answer(_) => "answer",
             Action::Abandon(_) => "abandon",
             Action::Event(Event::Query { .. }) => "query",
             Action::Event(Event::Reply { .. }) => "reply",
-            Action::Event(Event::Asked { .. }) => "asked",
+            Action::Event(Event::Looked { .. }) => "looked",
             Action::Event(Event::Ignored { .. }) => "ignored",
             Action::Event(Event::Upstream { .. }) => "upstream",
         })
@@ -243,28 +245,20 @@ fn question_octets(bytes: &[u8]) -> &[u8] {
     &bytes[12..end + 5]
 }
 
-fn reply_to(transmit: &Transmit, bytes: Vec<u8>) -> Input {
-    Input::Reply {
-        token: transmit.token,
-        from: transmit.to,
-        transport: transmit.transport,
-        bytes,
-    }
+/// What a lookup gave, as the engine's input.
+fn looked(token: Token, looked: Looked) -> Input {
+    Input::Looked { token, looked }
 }
 
-/// What a real server answers to the query in `transmit`: its ID and
-/// question in lowercase, AA set, and the records `build` adds.
-fn real_reply(transmit: &Transmit, build: impl FnOnce(&mut Message)) -> Vec<u8> {
-    let query = Message::from_vec(&transmit.bytes).unwrap();
-    let asked = &query.queries[0];
-    let mut message = Message::response(query.metadata.id, OpCode::Query);
+/// What a real server of the zone answers to `lookup`: its question, AA
+/// set, an OPT record with DO, and the records `build` adds.
+fn real_response(lookup: &Lookup, build: impl FnOnce(&mut Message)) -> Looked {
+    let mut message = Message::response(0x4242, OpCode::Query);
     message.metadata.authoritative = true;
-    let mut lowered = asked.clone();
-    lowered.set_name(Name::from(LowerName::new(asked.name())));
-    message.add_query(lowered);
-    message.edns = query.edns.clone();
+    message.add_query(lookup.question.clone());
+    message.set_edns(edns(1232, true));
     build(&mut message);
-    message.to_vec().unwrap()
+    Looked::Response(message)
 }
 
 /// An authority that counts its calls and answers SERVFAIL.
@@ -277,15 +271,40 @@ impl Authority for Counting {
         _local: SocketAddr,
         _server: &ServerConfig,
         _client: &Client,
-        _known: &dyn Known,
     ) -> Step {
         self.0.fetch_add(1, Ordering::SeqCst);
         Step::Reply(bare_reply(req, ResponseCode::ServFail, None))
     }
 }
 
-fn relay_engine() -> AuthorityEngine<Relay> {
-    AuthorityEngine::new(Relay::new(), ServerConfig::generic(), local())
+/// A server of `example.test.` whose zone is learned from the real
+/// server at its own address.
+fn learned_engine() -> AuthorityEngine<Zones> {
+    AuthorityEngine::new(
+        learned(&["example.test."]),
+        ServerConfig::generic(),
+        local(),
+    )
+}
+
+/// Servers for learned zones at `apexes`.
+fn learned(apexes: &[&str]) -> Zones {
+    Zones::new(
+        apexes
+            .iter()
+            .map(|apex| Arc::new(Learned::new(&name(apex))) as Arc<dyn ZoneData>)
+            .collect(),
+    )
+}
+
+/// The lookup a learned server at [`LOCAL`] makes of `qname` and `qtype`
+/// for the zone at `zone`.
+fn lookup_of(zone: &str, qname: &str, qtype: RecordType) -> Lookup {
+    Lookup::new(
+        local(),
+        LowerName::new(&name(zone)),
+        &Query::query(name(qname), qtype),
+    )
 }
 
 fn session(generation: u64) -> Session {
@@ -947,30 +966,32 @@ fn malformed_queries_get_the_parse_outcome() {
     assert_eq!(opt.max_payload(), 1232);
 }
 
-// Relays.
+// Learned zones.
 
 #[test]
-fn a_relay_answers_with_the_real_reply_restored() {
-    let mut engine = relay_engine();
+fn a_learned_server_looks_up_what_it_lacks_and_answers_from_what_it_filed() {
+    let mut engine = learned_engine();
     let message = query("WwW.ExAmPlE.TeSt.", RecordType::A, |m| {
         m.metadata.recursion_desired = true;
         m.set_edns(edns(1232, true));
     });
     let sent = message.to_vec().unwrap();
     let actions = ask_with(&mut engine, &message, Transport::Udp);
-    assert_eq!(kinds(&actions), ["query", "send"]);
-    let transmit = &sends(&actions)[0];
-    assert_eq!(transmit.to, local());
-    assert_eq!(transmit.transport, Transport::Udp);
-    assert_eq!(Message::from_vec(&transmit.bytes).unwrap(), message);
+    assert_eq!(kinds(&actions), ["query", "lookup"]);
+    let (token, lookup) = lookups(&actions)[0].clone();
+    assert_eq!(
+        lookup,
+        lookup_of("example.test.", "www.example.test.", RecordType::A)
+    );
+    assert!(!lookup.recursion_desired);
     assert_eq!(
         engine.next_deadline(),
         Some(Instant::ZERO + Duration::from_secs(5))
     );
 
-    // The real server answers in lowercase, with a record of a type
-    // hickory does not know, which must pass as it is (RFC 3597).
-    let real = real_reply(transmit, |m| {
+    // The real server answers with the A RRset and a record of a type
+    // hickory does not know (RFC 3597), filed as an RRset of its own.
+    let real = real_response(&lookup, |m| {
         m.add_answer(Record::from_rdata(
             name("www.example.test."),
             60,
@@ -985,27 +1006,48 @@ fn a_relay_answers_with_the_real_reply_restored() {
             },
         ));
     });
-    let actions = run(&mut engine, reply_to(transmit, real.clone()), Instant::ZERO);
-    assert_eq!(kinds(&actions), ["asked", "reply", "answer"]);
+    let actions = run(&mut engine, looked(token, real), Instant::ZERO);
+    assert_eq!(kinds(&actions), ["looked", "reply", "answer"]);
+    assert!(matches!(
+        actions[0],
+        Action::Event(Event::Looked {
+            outcome: LookupOutcome::Response {
+                rcode: ResponseCode::NoError
+            },
+            ..
+        })
+    ));
     let bytes = answer_bytes(&actions);
-    assert_eq!(bytes.len(), real.len());
-    assert_eq!(question_octets(&bytes), question_octets(&sent));
-    let at = 12 + question_octets(&sent).len();
+    // The world's own reply: the client's ID and question case, AA from
+    // the zone, and only the RRset asked for.
     assert_eq!(&bytes[..2], &sent[..2]);
-    assert_eq!(&bytes[2..12], &real[2..12]);
-    assert_eq!(&bytes[at..], &real[at..]);
+    assert_eq!(question_octets(&bytes), question_octets(&sent));
+    let reply = Message::from_vec(&bytes).unwrap();
+    assert!(reply.metadata.authoritative);
+    assert_eq!(reply.answers.len(), 1);
+    assert_eq!(reply.answers[0].data, a("192.0.2.10"));
+    assert_eq!(reply.answers[0].name.to_string(), "WwW.ExAmPlE.TeSt.");
     assert_eq!(engine.next_deadline(), None);
+
+    // The fact is held now: the same question needs no lookup.
+    let actions = ask_with(&mut engine, &message, Transport::Udp);
+    assert_eq!(kinds(&actions), ["query", "reply", "answer"]);
+    // Another type at the name is not known, so it is looked up, never
+    // answered NODATA.
+    let other = query("www.example.test.", RecordType::AAAA, |_| {});
+    let actions = ask_with(&mut engine, &other, Transport::Udp);
+    assert_eq!(kinds(&actions), ["query", "lookup"]);
 }
 
 #[test]
-fn a_relay_is_silent_when_the_real_server_times_out() {
-    let mut engine = relay_engine();
+fn a_learned_server_is_silent_when_the_lookup_gets_no_reply() {
+    let mut engine = learned_engine();
     let actions = ask_with(
         &mut engine,
         &query("www.example.test.", RecordType::A, |_| {}),
         Transport::Udp,
     );
-    let transmit = sends(&actions)[0].clone();
+    let (token, _) = lookups(&actions)[0].clone();
     let deadline = engine.next_deadline().unwrap();
 
     // A tick before the deadline changes nothing.
@@ -1017,12 +1059,12 @@ fn a_relay_is_silent_when_the_real_server_times_out() {
     assert!(early.is_empty());
 
     let actions = run(&mut engine, Input::Tick, deadline);
-    assert_eq!(kinds(&actions), ["abandon", "asked"]);
-    assert_eq!(abandoned(&actions), [transmit.token]);
+    assert_eq!(kinds(&actions), ["abandon", "looked"]);
+    assert_eq!(abandoned(&actions), [token]);
     assert!(matches!(
         actions[1],
-        Action::Event(Event::Asked {
-            observed: ObservedKind::Timeout,
+        Action::Event(Event::Looked {
+            outcome: LookupOutcome::NoReply,
             ..
         })
     ));
@@ -1030,45 +1072,54 @@ fn a_relay_is_silent_when_the_real_server_times_out() {
 }
 
 #[test]
-fn a_relay_is_silent_when_the_real_server_is_unreachable() {
-    for failure in [
-        ExchangeFailure::Unreachable,
-        ExchangeFailure::Refused,
-        ExchangeFailure::Closed,
-    ] {
-        let mut engine = relay_engine();
+fn a_learned_server_is_silent_when_the_real_server_is_unreachable_or_says_nothing() {
+    let refused = |lookup: &Lookup| {
+        real_response(lookup, |m| {
+            m.metadata.authoritative = false;
+            m.metadata.response_code = ResponseCode::Refused;
+        })
+    };
+    let lame = |lookup: &Lookup| {
+        // An answer without AA is no authoritative data (RFC 2181 §5.4.1).
+        real_response(lookup, |m| {
+            m.metadata.authoritative = false;
+            m.add_answer(Record::from_rdata(
+                name("www.example.test."),
+                60,
+                a("192.0.2.10"),
+            ));
+        })
+    };
+    // What the upstream gives the lookup, in each case.
+    type Gives = fn(&Lookup) -> Looked;
+    let outcomes: [(&str, Gives); 4] = [
+        ("unreachable", |_| Looked::Unreachable),
+        ("no reply", |_| Looked::NoReply),
+        ("refused", refused),
+        ("lame", lame),
+    ];
+    for (what, outcome) in outcomes {
+        let mut engine = learned_engine();
         let actions = ask_with(
             &mut engine,
             &query("www.example.test.", RecordType::A, |_| {}),
             Transport::Tcp,
         );
-        let transmit = sends(&actions)[0].clone();
-        assert_eq!(transmit.transport, Transport::Tcp);
-        let failed = Input::Failed {
-            token: transmit.token,
-            failure,
-        };
-        let actions = run(&mut engine, failed, Instant::ZERO);
-        assert_eq!(kinds(&actions), ["asked"]);
-        assert!(matches!(
-            actions[0],
-            Action::Event(Event::Asked {
-                observed: ObservedKind::Unreachable,
-                ..
-            })
-        ));
-        assert_eq!(engine.next_deadline(), None);
+        let (token, lookup) = lookups(&actions)[0].clone();
+        let actions = run(&mut engine, looked(token, outcome(&lookup)), Instant::ZERO);
+        assert_eq!(kinds(&actions), ["looked"], "{what}");
+        assert_eq!(engine.next_deadline(), None, "{what}");
     }
 }
 
 #[test]
-fn a_relayed_reply_larger_than_the_client_takes_is_truncated() {
-    let mut engine = relay_engine();
+fn a_reply_larger_than_the_client_takes_is_truncated() {
+    let mut engine = learned_engine();
     let message = query("big.example.test.", RecordType::A, |_| {});
     let actions = ask_with(&mut engine, &message, Transport::Udp);
-    let transmit = sends(&actions)[0].clone();
-    // A reply a source fetched over TCP, far past 512 octets.
-    let real = real_reply(&transmit, |m| {
+    let (token, lookup) = lookups(&actions)[0].clone();
+    // A response the upstream fetched over TCP, far past 512 octets.
+    let real = real_response(&lookup, |m| {
         for host in 1..=60 {
             m.add_answer(Record::from_rdata(
                 name("big.example.test."),
@@ -1077,8 +1128,7 @@ fn a_relayed_reply_larger_than_the_client_takes_is_truncated() {
             ));
         }
     });
-    assert!(real.len() > 512);
-    let bytes = answer_bytes(&run(&mut engine, reply_to(&transmit, real), Instant::ZERO));
+    let bytes = answer_bytes(&run(&mut engine, looked(token, real), Instant::ZERO));
     assert!(bytes.len() <= 512);
     let reply = Message::from_vec(&bytes).unwrap();
     assert!(reply.metadata.truncation);
@@ -1088,16 +1138,16 @@ fn a_relayed_reply_larger_than_the_client_takes_is_truncated() {
 // Completions that change nothing.
 
 #[test]
-fn completions_from_the_wrong_place_or_for_the_wrong_question_are_ignored() {
-    let mut engine = relay_engine();
+fn completions_for_the_wrong_question_or_of_another_kind_are_ignored() {
+    let mut engine = learned_engine();
     let actions = ask_with(
         &mut engine,
         &query("www.example.test.", RecordType::A, |_| {}),
         Transport::Udp,
     );
-    let transmit = sends(&actions)[0].clone();
+    let (token, lookup) = lookups(&actions)[0].clone();
     let deadline = engine.next_deadline();
-    let good = real_reply(&transmit, |m| {
+    let good = real_response(&lookup, |m| {
         m.add_answer(Record::from_rdata(
             name("www.example.test."),
             60,
@@ -1105,58 +1155,42 @@ fn completions_from_the_wrong_place_or_for_the_wrong_question_are_ignored() {
         ));
     });
 
-    let elsewhere = Input::Reply {
-        token: transmit.token,
-        from: "192.0.2.99:53".parse().unwrap(),
-        transport: Transport::Udp,
-        bytes: good.clone(),
-    };
-    let over_tcp = Input::Reply {
-        token: transmit.token,
-        from: transmit.to,
-        transport: Transport::Tcp,
-        bytes: good.clone(),
-    };
-    let mut wrong_id = good.clone();
-    wrong_id[0] ^= 0xff;
-    let other_question = real_reply(&transmit, |m| {
+    let other_question = real_response(&lookup, |m| {
         m.queries[0].set_query_type(RecordType::AAAA);
     });
-    let not_a_response = transmit.bytes.clone();
+    let not_a_response = real_response(&lookup, |m| {
+        m.metadata.message_type = MessageType::Query;
+    });
+    let bytes = Input::Reply {
+        token,
+        from: local(),
+        transport: Transport::Udp,
+        bytes: vec![0; 12],
+    };
+    let failed = Input::Failed {
+        token,
+        failure: ExchangeFailure::Unreachable,
+    };
     let cases = [
-        (elsewhere, Unmatched::WrongPeer),
-        (over_tcp, Unmatched::WrongPeer),
-        (reply_to(&transmit, wrong_id), Unmatched::WrongId),
-        (
-            reply_to(&transmit, other_question),
-            Unmatched::WrongQuestion,
-        ),
-        (reply_to(&transmit, not_a_response), Unmatched::Malformed),
-        (reply_to(&transmit, vec![0; 7]), Unmatched::Malformed),
+        (looked(token, other_question), Unmatched::WrongQuestion),
+        (looked(token, not_a_response), Unmatched::WrongQuestion),
+        // The engine carries no bytes of its own.
+        (bytes, Unmatched::NotOutstanding),
+        (failed, Unmatched::NotOutstanding),
     ];
     for (input, why) in cases {
         let actions = run(&mut engine, input, Instant::ZERO);
         assert_eq!(ignored(&actions), [why]);
         assert_eq!(kinds(&actions), ["ignored"]);
-        // The exchange is still outstanding, with the same deadline.
+        // The lookup is still pending, with the same deadline.
         assert_eq!(engine.next_deadline(), deadline);
     }
 
-    let actions = run(
-        &mut engine,
-        reply_to(&transmit, good.clone()),
-        Instant::ZERO,
-    );
+    let actions = run(&mut engine, looked(token, good.clone()), Instant::ZERO);
     assert_eq!(answers(&actions).len(), 1);
 
-    // The same reply again, and a failure after it, are stale.
-    let actions = run(&mut engine, reply_to(&transmit, good), Instant::ZERO);
-    assert_eq!(ignored(&actions), [Unmatched::NotOutstanding]);
-    let late = Input::Failed {
-        token: transmit.token,
-        failure: ExchangeFailure::Unreachable,
-    };
-    let actions = run(&mut engine, late, Instant::ZERO);
+    // The same response again is stale.
+    let actions = run(&mut engine, looked(token, good), Instant::ZERO);
     assert_eq!(ignored(&actions), [Unmatched::NotOutstanding]);
     assert!(matches!(
         actions[0],
@@ -1165,8 +1199,8 @@ fn completions_from_the_wrong_place_or_for_the_wrong_question_are_ignored() {
 }
 
 #[test]
-fn advance_abandons_every_exchange_and_restarts_the_requests() {
-    let mut engine = relay_engine();
+fn advance_abandons_every_lookup_drops_what_was_learned_and_restarts_the_requests() {
+    let mut engine = learned_engine();
     let first = ask_with(
         &mut engine,
         &query("one.example.test.", RecordType::A, |_| {}),
@@ -1177,41 +1211,56 @@ fn advance_abandons_every_exchange_and_restarts_the_requests() {
         &query("two.example.test.", RecordType::A, |_| {}),
         Transport::Udp,
     );
-    let old: Vec<Transmit> = sends(&first).into_iter().chain(sends(&second)).collect();
+    let old: Vec<(Token, Lookup)> = lookups(&first)
+        .into_iter()
+        .chain(lookups(&second))
+        .collect();
     assert_eq!(old.len(), 2);
     assert_eq!(engine.generation(), Generation(0));
+
+    // `one` is answered and filed in session 0.
+    let one = real_response(&old[0].1, |m| {
+        m.add_answer(Record::from_rdata(
+            name("one.example.test."),
+            60,
+            a("192.0.2.1"),
+        ));
+    });
+    let actions = run(&mut engine, looked(old[0].0, one), Instant::ZERO);
+    assert_eq!(the_answer(&actions).answers[0].data, a("192.0.2.1"));
 
     engine.advance(session(1));
     let actions: Vec<Action> = std::iter::from_fn(|| engine.poll()).collect();
     assert_eq!(engine.generation(), Generation(1));
-    assert_eq!(kinds(&actions), ["abandon", "abandon", "send", "send"]);
-    let mut gone = abandoned(&actions);
-    gone.sort();
-    let mut tokens: Vec<Token> = old.iter().map(|transmit| transmit.token).collect();
-    tokens.sort();
-    assert_eq!(gone, tokens);
-    let new = sends(&actions);
-    for (old, new) in old.iter().zip(&new) {
-        assert_eq!(new.token.generation(), Generation(1));
-        assert!(!tokens.contains(&new.token));
-        assert_eq!(new.bytes, old.bytes);
-    }
+    assert_eq!(kinds(&actions), ["abandon", "lookup"]);
+    assert_eq!(abandoned(&actions), [old[1].0]);
+    let new = lookups(&actions);
+    assert_eq!(new[0].0.generation(), Generation(1));
+    assert_eq!(new[0].1, old[1].1);
 
     // A completion of the old session changes nothing.
-    let stale = real_reply(&old[0], |_| {});
-    let actions = run(&mut engine, reply_to(&old[0], stale), Instant::ZERO);
+    let stale = real_response(&old[1].1, |_| {});
+    let actions = run(&mut engine, looked(old[1].0, stale), Instant::ZERO);
     assert_eq!(ignored(&actions), [Unmatched::OldGeneration]);
 
+    // What session 0 learned is gone: `one` is looked up again.
+    let actions = ask_with(
+        &mut engine,
+        &query("one.example.test.", RecordType::A, |_| {}),
+        Transport::Udp,
+    );
+    assert_eq!(kinds(&actions), ["query", "lookup"]);
+
     // The restarted request is answered from the new session.
-    let fresh = real_reply(&new[0], |m| {
+    let fresh = real_response(&new[0].1, |m| {
         m.add_answer(Record::from_rdata(
-            name("one.example.test."),
+            name("two.example.test."),
             60,
-            a("192.0.2.11"),
+            a("192.0.2.12"),
         ));
     });
-    let actions = run(&mut engine, reply_to(&new[0], fresh), Instant::ZERO);
-    assert_eq!(the_answer(&actions).answers.len(), 1);
+    let actions = run(&mut engine, looked(new[0].0, fresh), Instant::ZERO);
+    assert_eq!(the_answer(&actions).answers[0].data, a("192.0.2.12"));
 
     // A session that is not newer changes nothing.
     engine.advance(session(1));
@@ -1221,8 +1270,8 @@ fn advance_abandons_every_exchange_and_restarts_the_requests() {
 }
 
 #[test]
-fn requests_asking_the_same_question_share_one_exchange() {
-    let mut engine = relay_engine();
+fn requests_needing_the_same_fact_share_one_lookup() {
+    let mut engine = learned_engine();
     let message = query("www.example.test.", RecordType::A, |_| {});
     let mut other = client(Transport::Udp);
     other.peer = "198.51.100.8:40000".parse().unwrap();
@@ -1235,15 +1284,18 @@ fn requests_asking_the_same_question_share_one_exchange() {
         }),
         Instant::ZERO,
     );
-    assert_eq!(sends(&first).len(), 1);
-    assert!(sends(&second).is_empty());
-    let transmit = sends(&first)[0].clone();
+    assert_eq!(lookups(&first).len(), 1);
+    assert!(lookups(&second).is_empty());
+    let (token, lookup) = lookups(&first)[0].clone();
 
-    let actions = run(
-        &mut engine,
-        reply_to(&transmit, real_reply(&transmit, |_| {})),
-        Instant::ZERO,
-    );
+    let real = real_response(&lookup, |m| {
+        m.add_answer(Record::from_rdata(
+            name("www.example.test."),
+            60,
+            a("192.0.2.10"),
+        ));
+    });
+    let actions = run(&mut engine, looked(token, real), Instant::ZERO);
     let clients: Vec<&Client> = actions
         .iter()
         .filter_map(|action| match action {
@@ -1256,7 +1308,7 @@ fn requests_asking_the_same_question_share_one_exchange() {
 
 #[test]
 fn gone_drops_only_that_clients_waits() {
-    let mut engine = relay_engine();
+    let mut engine = learned_engine();
     let message = query("www.example.test.", RecordType::A, |_| {});
     let mut other = client(Transport::Tcp);
     other.connection = Some(9);
@@ -1269,20 +1321,20 @@ fn gone_drops_only_that_clients_waits() {
         }),
         Instant::ZERO,
     );
-    let transmit = sends(&first)[0].clone();
+    let (token, _) = lookups(&first)[0].clone();
 
-    // One of two waiters leaves: the exchange goes on for the other.
+    // One of two waiters leaves: the lookup goes on for the other.
     let actions = run(&mut engine, Input::Gone(other), Instant::ZERO);
     assert!(actions.is_empty());
     assert!(engine.next_deadline().is_some());
 
-    // The last waiter leaves: the exchange is abandoned.
+    // The last waiter leaves: the lookup is abandoned.
     let actions = run(
         &mut engine,
         Input::Gone(client(Transport::Tcp)),
         Instant::ZERO,
     );
-    assert_eq!(abandoned(&actions), [transmit.token]);
+    assert_eq!(abandoned(&actions), [token]);
     assert_eq!(engine.next_deadline(), None);
 }
 
@@ -1298,8 +1350,10 @@ fn fict() -> Zone {
         .unwrap()
 }
 
-fn overlay() -> Overlay<Relay> {
-    Overlay::new(Relay::new(), name("com.")).below(name("fict.com."), zones(vec![fict()]))
+/// `fict.com.` invented below a server of `com.` learned from the real
+/// one at its address.
+fn overlay() -> Overlay<Zones> {
+    Overlay::new(learned(&["com."]), name("com.")).below(name("fict.com."), zones(vec![fict()]))
 }
 
 /// The names between `com` and a deeper invented apex are the base's, so
@@ -1307,8 +1361,22 @@ fn overlay() -> Overlay<Relay> {
 #[test]
 #[should_panic(expected = "not a child of com.")]
 fn an_invented_zone_must_be_a_child_of_the_overlays_zone() {
-    let _ = Overlay::new(Relay::new(), name("com."))
+    let _ = Overlay::new(learned(&["com."]), name("com."))
         .below(name("shop.nonexistent.com."), zones(vec![fict()]));
+}
+
+/// `com`'s SOA record.
+fn com_soa() -> Record {
+    let soa = SOA::new(
+        name("a.gtld-servers.net."),
+        name("nstld.verisign-grs.com."),
+        1,
+        1800,
+        900,
+        604800,
+        900,
+    );
+    Record::from_rdata(name("com."), 900, RData::SOA(soa))
 }
 
 /// The NSEC3 record and its RRSIG that `com` sends to deny `fict.com DS`
@@ -1341,38 +1409,26 @@ fn com_denial() -> Vec<Record> {
 }
 
 #[test]
-fn an_overlay_refers_with_the_bases_denial_records_decoded() {
+fn an_overlay_refers_with_the_denial_records_its_base_copied() {
     let mut engine = AuthorityEngine::new(overlay(), ServerConfig::gtld(Identity::none()), local());
     let message = query("www.fict.com.", RecordType::A, |m| {
         m.set_edns(edns(1232, true));
     });
     let actions = ask_with(&mut engine, &message, Transport::Udp);
-    assert_eq!(kinds(&actions), ["query", "send"]);
-    let transmit = sends(&actions)[0].clone();
-    let asked = Message::from_vec(&transmit.bytes).unwrap();
-    assert_eq!(asked.queries[0].name(), &name("fict.com."));
-    assert_eq!(asked.queries[0].query_type(), RecordType::DS);
-    assert!(asked.edns.as_ref().unwrap().flags().dnssec_ok);
+    assert_eq!(kinds(&actions), ["query", "lookup"]);
+    let (token, lookup) = lookups(&actions)[0].clone();
+    assert_eq!(lookup, lookup_of("com.", "fict.com.", RecordType::DS));
 
-    // `com` denies the DS RRset with an SOA and the opt-out NSEC3 record.
+    // `com` denies the name with its SOA and the opt-out NSEC3 record.
     let denial = com_denial();
-    let real = real_reply(&transmit, |m| {
+    let real = real_response(&lookup, |m| {
         m.metadata.response_code = ResponseCode::NXDomain;
-        let com_soa = SOA::new(
-            name("a.gtld-servers.net."),
-            name("nstld.verisign-grs.com."),
-            1,
-            1800,
-            900,
-            604800,
-            900,
-        );
-        m.add_authority(Record::from_rdata(name("com."), 900, RData::SOA(com_soa)));
+        m.add_authority(com_soa());
         for record in &denial {
             m.add_authority(record.clone());
         }
     });
-    let actions = run(&mut engine, reply_to(&transmit, real), Instant::ZERO);
+    let actions = run(&mut engine, looked(token, real), Instant::ZERO);
     let reply = the_answer(&actions);
     assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
     assert!(!reply.metadata.authoritative);
@@ -1449,16 +1505,7 @@ fn com_nxdomain() -> (Vec<Record>, Name) {
         inception: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
         expiration: SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000),
     };
-    let soa = SOA::new(
-        name("a.gtld-servers.net."),
-        name("nstld.verisign-grs.com."),
-        1,
-        1800,
-        900,
-        604800,
-        900,
-    );
-    let mut records = vec![Record::from_rdata(name("com."), 900, RData::SOA(soa))];
+    let mut records = vec![com_soa()];
     let mut nsec3 = |owner: Vec<u8>, next: Vec<u8>, opt_out: bool, types: &[RecordType]| {
         let rdata = NSEC3::new(
             Nsec3HashAlgorithm::SHA1,
@@ -1527,15 +1574,14 @@ fn an_overlay_sends_the_unsigned_delegation_proof_without_the_wildcard_cover() {
             m.set_edns(edns(1232, true));
         });
         let actions = ask_with(&mut engine, &message, Transport::Udp);
-        let transmit = sends(&actions)[0].clone();
-        let real = real_reply(&transmit, |m| {
+        let (token, lookup) = lookups(&actions)[0].clone();
+        let real = real_response(&lookup, |m| {
             m.metadata.response_code = ResponseCode::NXDomain;
-            m.metadata.authoritative = true;
             for record in &nxdomain {
                 m.add_authority(record.clone());
             }
         });
-        let actions = run(&mut engine, reply_to(&transmit, real), Instant::ZERO);
+        let actions = run(&mut engine, looked(token, real), Instant::ZERO);
         let reply = the_answer(&actions);
         assert_eq!(
             reply.metadata.response_code,
@@ -1571,18 +1617,16 @@ fn an_overlay_refers_without_do_once_the_base_answers_for_the_parent() {
         &query("www.fict.com.", RecordType::A, |_| {}),
         Transport::Udp,
     );
-    let transmit = sends(&actions)[0].clone();
-    let asked = Message::from_vec(&transmit.bytes).unwrap();
-    assert_eq!(asked.queries[0].name(), &name("fict.com."));
-    assert_eq!(asked.queries[0].query_type(), RecordType::DS);
+    let (token, lookup) = lookups(&actions)[0].clone();
+    assert_eq!(lookup, lookup_of("com.", "fict.com.", RecordType::DS));
     let (nxdomain, _) = com_nxdomain();
-    let real = real_reply(&transmit, |m| {
+    let real = real_response(&lookup, |m| {
         m.metadata.response_code = ResponseCode::NXDomain;
         for record in &nxdomain {
             m.add_authority(record.clone());
         }
     });
-    let actions = run(&mut engine, reply_to(&transmit, real), Instant::ZERO);
+    let actions = run(&mut engine, looked(token, real), Instant::ZERO);
     let reply = the_answer(&actions);
     assert!(!reply.metadata.authoritative);
     assert_eq!(reply.authorities.len(), 1);
@@ -1663,13 +1707,13 @@ fn an_overlay_without_the_glue_it_needs_answers_servfail() {
         &query("www.fict.com.", RecordType::A, |_| {}),
         Transport::Udp,
     );
-    assert!(sends(&actions).is_empty());
+    assert!(lookups(&actions).is_empty());
     let reply = the_answer(&actions);
     assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
 }
 
 #[test]
-fn an_overlay_is_silent_when_the_ds_question_times_out() {
+fn an_overlay_is_silent_when_the_ds_lookup_gets_no_reply() {
     let mut engine = AuthorityEngine::new(overlay(), ServerConfig::generic(), local());
     let message = query("www.fict.com.", RecordType::A, |m| {
         m.set_edns(edns(1232, true));
@@ -1677,7 +1721,7 @@ fn an_overlay_is_silent_when_the_ds_question_times_out() {
     ask_with(&mut engine, &message, Transport::Udp);
     let deadline = engine.next_deadline().unwrap();
     let actions = run(&mut engine, Input::Tick, deadline);
-    assert_eq!(kinds(&actions), ["abandon", "asked"]);
+    assert_eq!(kinds(&actions), ["abandon", "looked"]);
 }
 
 #[test]
@@ -1689,8 +1733,8 @@ fn an_overlay_leaves_other_names_and_apex_ds_to_the_base() {
     ] {
         let message = query(qname, qtype, |_| {});
         let actions = ask_with(&mut engine, &message, Transport::Udp);
-        let transmit = &sends(&actions)[0];
-        assert_eq!(Message::from_vec(&transmit.bytes).unwrap(), message);
+        let (_, lookup) = &lookups(&actions)[0];
+        assert_eq!(*lookup, lookup_of("com.", qname, qtype));
     }
 }
 
@@ -1716,7 +1760,7 @@ fn events_come_before_the_actions_they_explain() {
     let seen: Arc<Mutex<Vec<(String, ResponseCode)>>> = Arc::default();
     let log = seen.clone();
     let observed = Observe::new(
-        Relay::new(),
+        learned(&["example.test."]),
         move |req: &Request, _client: &Client, response: &Response| {
             log.lock().unwrap().push((
                 req.question.name().to_string(),
@@ -1730,7 +1774,7 @@ fn events_come_before_the_actions_they_explain() {
         &query("www.example.test.", RecordType::A, |_| {}),
         Transport::Udp,
     );
-    assert_eq!(kinds(&actions), ["query", "send"]);
+    assert_eq!(kinds(&actions), ["query", "lookup"]);
     assert!(matches!(
         &actions[0],
         Action::Event(Event::Query { server, question, .. })
@@ -1738,20 +1782,23 @@ fn events_come_before_the_actions_they_explain() {
     ));
     assert!(seen.lock().unwrap().is_empty());
 
-    let transmit = sends(&actions)[0].clone();
-    engine.handle(
-        reply_to(&transmit, real_reply(&transmit, |_| {})),
-        Instant::ZERO,
-        &entropy(),
-    );
-    // The callback ran while the engine handled the reply, before the
-    // answer could leave.
+    let (token, lookup) = lookups(&actions)[0].clone();
+    let real = real_response(&lookup, |m| {
+        m.add_answer(Record::from_rdata(
+            name("www.example.test."),
+            60,
+            a("192.0.2.10"),
+        ));
+    });
+    engine.handle(looked(token, real), Instant::ZERO, &entropy());
+    // The callback ran while the engine handled the lookup's end, before
+    // the answer could leave.
     assert_eq!(
         *seen.lock().unwrap(),
         [("www.example.test.".to_string(), ResponseCode::NoError)]
     );
     let actions: Vec<Action> = std::iter::from_fn(|| engine.poll()).collect();
-    assert_eq!(kinds(&actions), ["asked", "reply", "answer"]);
+    assert_eq!(kinds(&actions), ["looked", "reply", "answer"]);
     match &actions[1] {
         Action::Event(Event::Reply {
             server,
@@ -1774,37 +1821,45 @@ fn events_come_before_the_actions_they_explain() {
 }
 
 #[test]
-fn an_authority_that_asks_again_what_it_knows_fails() {
-    /// Asks the same question whatever it already knows.
+fn an_authority_that_needs_a_lookup_it_made_stays_silent() {
+    /// Needs the same lookup whatever its zones hold.
     struct Forgetful;
     impl Authority for Forgetful {
         fn respond(
             &self,
             _req: &Request,
-            local: SocketAddr,
+            _local: SocketAddr,
             _server: &ServerConfig,
             _client: &Client,
-            _known: &dyn Known,
         ) -> Step {
-            Step::Need(Ask {
-                server: local,
-                transport: Transport::Udp,
-                query: query("www.example.test.", RecordType::A, |_| {})
-                    .to_vec()
-                    .unwrap(),
-            })
+            Step::Need(lookup_of(
+                "example.test.",
+                "www.example.test.",
+                RecordType::A,
+            ))
         }
     }
-    let mut engine = AuthorityEngine::new(Forgetful, ServerConfig::generic(), local());
-    let actions = ask_with(
-        &mut engine,
-        &query("www.example.test.", RecordType::A, |_| {}),
-        Transport::Udp,
-    );
-    let transmit = sends(&actions)[0].clone();
-    let deadline = engine.next_deadline().unwrap();
-    let actions = run(&mut engine, Input::Tick, deadline);
-    let reply = the_answer(&actions);
-    assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
-    assert_eq!(abandoned(&actions), [transmit.token]);
+    for ends in ["deadline", "response"] {
+        let mut engine = AuthorityEngine::new(Forgetful, ServerConfig::generic(), local());
+        let actions = ask_with(
+            &mut engine,
+            &query("www.example.test.", RecordType::A, |_| {}),
+            Transport::Udp,
+        );
+        let (token, lookup) = lookups(&actions)[0].clone();
+        let actions = match ends {
+            "deadline" => {
+                let deadline = engine.next_deadline().unwrap();
+                run(&mut engine, Input::Tick, deadline)
+            }
+            _ => run(
+                &mut engine,
+                looked(token, real_response(&lookup, |_| {})),
+                Instant::ZERO,
+            ),
+        };
+        assert!(answers(&actions).is_empty(), "{ends}");
+        assert!(lookups(&actions).is_empty(), "{ends}");
+        assert_eq!(engine.next_deadline(), None, "{ends}");
+    }
 }

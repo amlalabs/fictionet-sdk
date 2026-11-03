@@ -1,5 +1,5 @@
 //! DNS: the `hickory-proto` crate, re-exported, and the wire rules a
-//! server or relay needs that hickory leaves out.
+//! server needs that hickory leaves out.
 //!
 //! Use this module to read and answer DNS queries in a world that runs its
 //! own DNS server. If the world is a set of websites,
@@ -22,7 +22,6 @@
 //! | [`Request::parse`] | Checks a query in one fixed order and gives a request, a rejection to send, or silence. |
 //! | [`read_message`] | Reads a message as hickory does, and also with records whose RDATA is empty (RFC 3597 §4). |
 //! | [`fit`] | Writes a reply within the requestor's size: whole RRsets, needed data first, TC only when that data does not fit. |
-//! | [`restore`] | Gives a relayed reply the client's ID and question case and changes nothing else. |
 //! | [`Ede`], [`Nsid`], [`Padding`] | EDNS options hickory carries as raw bytes or its own type (RFC 8914, 5001, 7830). |
 //! | [`label_count`], [`dname_substitute`] | Counts a name's labels with a leading `*`, and makes the name a DNAME substitutes (RFC 6672 §2.2). |
 //!
@@ -80,12 +79,10 @@ mod fit;
 mod framing;
 mod names;
 mod options;
-mod relay;
 mod request;
 
 pub use fit::{Fitted, Limit, Response, fit};
 pub use framing::{Framing, Queries, stream_framed};
 pub use names::{dname_substitute, label_count};
 pub use options::{Ede, EdeCode, Nsid, Padding};
-pub use relay::{RelayError, restore};
 pub use request::{EdnsIn, Parsed, Request, read_message};

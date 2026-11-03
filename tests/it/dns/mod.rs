@@ -6,6 +6,7 @@
 mod authority;
 mod cache;
 mod internet;
+mod learned;
 mod memory;
 mod probes;
 mod resolver;

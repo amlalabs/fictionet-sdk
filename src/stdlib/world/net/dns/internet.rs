@@ -1,11 +1,12 @@
 //! The internet's DNS as presets: the root and `gtld-servers.net` servers,
-//! the large public resolvers, and a [`Mirror`] that relays the real
-//! hierarchy through machines at the real servers' addresses.
+//! the large public resolvers, and a [`Mirror`] that copies the real
+//! hierarchy onto machines at the real servers' addresses.
 //!
 //! Each preset returns hosts at the addresses real clients know, so a
 //! guest that asks `198.41.0.4` or `8.8.8.8` directly reaches them. What
 //! runs on them is the world's choice: a world with its own root serves
-//! zones, and a world that shows the real internet relays it.
+//! zones, and a world that shows the real internet serves copies of its
+//! zones, answered by the world's own servers.
 //!
 //! ```
 //! # use std::time::SystemTime;
@@ -44,10 +45,7 @@ use fictionet::Cx;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::network::ip::non_public_address;
 use fictionet::stdlib::protocols::dns::dnssec::rdata::DNSSECRData;
-use fictionet::stdlib::protocols::dns::op::{
-    Edns, Message, MessageType, OpCode, Query, ResponseCode,
-};
-use fictionet::stdlib::protocols::dns::read_message;
+use fictionet::stdlib::protocols::dns::op::{Message, Query, ResponseCode};
 use fictionet::stdlib::protocols::dns::rr::rdata::TXT;
 use fictionet::stdlib::protocols::dns::rr::{
     DNSClass, LowerName, Name, RData, Record, RecordSet, RecordType,
@@ -55,13 +53,13 @@ use fictionet::stdlib::protocols::dns::rr::{
 use fictionet::stdlib::protocols::dns::{Ede, EdeCode, Nsid, Request, Response};
 use fictionet::stdlib::protocols::urlencoded_form::{self, Form};
 use fictionet::stdlib::services::dns::authority::{
-    Ask, Authority, ChaosAnswer, ChaosReply, Identity, Known, Observe, Observed, Relay,
-    ServerConfig, Step, chaos,
+    Authority, ChaosAnswer, ChaosReply, Identity, Observe, ServerConfig, Step, Zones, chaos,
 };
 use fictionet::stdlib::services::dns::resolver::Config;
-use fictionet::stdlib::services::dns::zone::{AnyResponse, Shown, Zone, ZoneError};
-use fictionet::stdlib::services::dns::{Client, Generation, WallClock};
-use fictionet::stdlib::services::serve::Transport;
+use fictionet::stdlib::services::dns::zone::{
+    AnyResponse, Learned, Shown, Zone, ZoneData, ZoneError,
+};
+use fictionet::stdlib::services::dns::{Client, Generation, Looked, Lookup, WallClock};
 use fictionet::stdlib::web::httpd::{self, Body, request_host};
 use fictionet::sync::Mutex;
 use fictionet::time::Instant;
@@ -72,7 +70,7 @@ pub use fictionet::stdlib::services::dns::resolver::{NameServer, ROOT_SERVERS, r
 
 use super::super::{Host, NetHandle, Program};
 use super::encrypted::Operator;
-use super::{Authoritative, Namespace, PerSession, Recursive, Source};
+use super::{Authoritative, Namespace, PerSession, Recursive, Upstream};
 
 // ---------------------------------------------------------------------------
 // Servers and their addresses
@@ -669,8 +667,8 @@ fn myaddr(google: IpAddr, egress: &Egress) -> Shown {
 
 /// The public IPv4 address the world's network reaches the internet from,
 /// as servers that echo a client's address see it. The whoami names of
-/// the public resolver presets answer with it. Under a live source it is
-/// the host's own public address.
+/// the public resolver presets answer with it. Under a live upstream it
+/// is the host's own public address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Egress(pub Ipv4Addr);
 
@@ -1104,17 +1102,17 @@ impl Location {
         }
     }
 
-    /// The location of the host that `source` asks from, measured there,
+    /// The location of the host that `upstream` asks from, measured there,
     /// so what the servers say about themselves agrees with the host's
     /// `egress` wherever the host is.
     ///
     /// Each root letter, `gtld-servers.net` server, and public resolver is
-    /// asked about itself as an agent with `dig` asks it: `id.server`,
+    /// looked up about itself as an agent with `dig` asks it: `id.server`,
     /// `hostname.bind`, `version.bind`, `version.server`, and
-    /// `authors.bind` in the CHAOS class, each with an NSID request
-    /// (RFC 5001), and `invalid.` for what it gives a name it does not
-    /// know. Its shortest exchange is its round trip. Each public resolver
-    /// is also asked `whoami.akamai.net` A, which Akamai's servers answer
+    /// `authors.bind` in the CHAOS class, each with the NSID request every
+    /// lookup carries (RFC 5001), and `invalid.` for what it gives a name
+    /// it does not know. Its shortest lookup is its round trip. Each public
+    /// resolver is also asked `whoami.akamai.net` A, with recursion, which Akamai's servers answer
     /// with the address the question reached them from: the resolver's
     /// egress. A server that answers nothing within `wait` is left out,
     /// and [`site`](Self::site) and [`resolver`](Self::resolver) give it
@@ -1123,7 +1121,7 @@ impl Location {
     /// answered.
     pub async fn measured(
         fcx: &Cx,
-        source: &dyn Source,
+        upstream: &dyn Upstream,
         egress: Option<Egress>,
         wait: Duration,
     ) -> Location {
@@ -1141,11 +1139,11 @@ impl Location {
         let probes = servers
             .iter()
             .chain(&resolvers)
-            .map(|server| Box::pin(probe(fcx, source, *server, deadline)) as Probe<'_, _>);
+            .map(|server| Box::pin(probe(fcx, upstream, *server, deadline)) as Probe<'_, _>);
         let sites: Vec<Option<Site>> = join_all(probes.collect()).await;
         let (server_sites, resolver_sites) = sites.split_at(servers.len());
         let whoami = resolvers.iter().map(|resolver| {
-            Box::pin(resolver_egress(fcx, source, *resolver, deadline)) as Probe<'_, _>
+            Box::pin(resolver_egress(fcx, upstream, *resolver, deadline)) as Probe<'_, _>
         });
         let egresses: Vec<Option<IpAddr>> = join_all(whoami.collect()).await;
 
@@ -1191,58 +1189,54 @@ fn identity_names() -> [LowerName; 5] {
     ]
 }
 
-/// One query of `name`, `rtype`, and `class`, with an OPT record that asks
-/// for the NSID, and RD as given.
-fn probe_query(fcx: &Cx, name: &Name, rtype: RecordType, class: DNSClass, rd: bool) -> Vec<u8> {
-    let mut id = [0; 2];
-    fcx.fill_random(&mut id);
-    let mut message = Message::new(u16::from_be_bytes(id), MessageType::Query, OpCode::Query);
-    message.metadata.recursion_desired = rd;
-    let mut question = Query::query(name.clone(), rtype);
-    question.set_query_class(class);
-    message.add_query(question);
-    let mut edns = Edns::new();
-    edns.set_max_payload(1232);
-    edns.options_mut().insert(Nsid(Vec::new()).to_option());
-    message.set_edns(edns);
-    message
-        .to_vec()
-        .expect("a query with one question and an OPT record writes")
-}
-
-/// What `server` replies to `query` over UDP before `deadline`, and how
-/// long it took.
+/// What `server` gives `upstream` for `name`, `rtype`, and `class` before
+/// `deadline`, and how long it took. The lookup is about the zone at
+/// `zone`, and asks for recursion when `recursion` is set.
 async fn exchange(
     fcx: &Cx,
-    source: &dyn Source,
+    upstream: &dyn Upstream,
     server: IpAddr,
-    query: Vec<u8>,
+    question: (&Name, RecordType, DNSClass),
+    zone: &Name,
+    recursion: bool,
     deadline: Instant,
 ) -> Option<(Duration, Message)> {
-    let ask = Ask {
-        server: SocketAddr::new(server, 53),
-        transport: Transport::Udp,
-        query,
-    };
+    let (name, rtype, class) = question;
+    let mut query = Query::query(name.clone(), rtype);
+    query.set_query_class(class);
+    let mut lookup = Lookup::new(SocketAddr::new(server, 53), LowerName::new(zone), &query);
+    lookup.recursion_desired = recursion;
     let sent = fcx.now();
-    let observed = fcx.race(Some(deadline), source.ask(fcx, ask)).await.ok()?;
+    let looked = fcx
+        .race(Some(deadline), upstream.lookup(fcx, lookup))
+        .await
+        .ok()?;
     let took = fcx.now().since_start().saturating_sub(sent.since_start());
-    match observed {
-        Observed::Reply(bytes) => Some((took, read_message(&bytes).ok()?)),
-        Observed::Unreachable | Observed::Timeout => None,
+    match looked {
+        Looked::Response(response) => Some((took, response)),
+        Looked::Unreachable | Looked::NoReply => None,
     }
 }
 
-/// How `server` looks from where `source` asks: its answers about itself
-/// and its round trip, or `None` when it answered nothing.
-async fn probe(fcx: &Cx, source: &dyn Source, server: IpAddr, deadline: Instant) -> Option<Site> {
+/// How `server` looks from where `upstream` asks: its answers about
+/// itself and its round trip, or `None` when it answered nothing.
+async fn probe(
+    fcx: &Cx,
+    upstream: &dyn Upstream,
+    server: IpAddr,
+    deadline: Instant,
+) -> Option<Site> {
     let mut names: Vec<LowerName> = identity_names().into();
     names.push(LowerName::new(
         &Name::from_ascii("invalid.").expect("a valid name"),
     ));
+    // Each CHAOS name is a zone of its own, as BIND serves it.
     let ask = |name: &LowerName, rtype: RecordType| {
-        let query = probe_query(fcx, &Name::from(name), rtype, DNSClass::CH, false);
-        Box::pin(exchange(fcx, source, server, query, deadline)) as Probe<'_, _>
+        let name = Name::from(name);
+        Box::pin(async move {
+            let question = (&name, rtype, DNSClass::CH);
+            exchange(fcx, upstream, server, question, &name, false, deadline).await
+        }) as Probe<'_, _>
     };
     let mut replies: Vec<Option<(Duration, Message)>> = join_all(
         names
@@ -1351,16 +1345,25 @@ fn chaos_reply(reply: &Message) -> ChaosReply {
 }
 
 /// The address the public resolver at `resolver` asks authorities from,
-/// as `whoami.akamai.net` A gives it.
+/// as `whoami.akamai.net` A, asked of it with recursion, gives it.
 async fn resolver_egress(
     fcx: &Cx,
-    source: &dyn Source,
+    upstream: &dyn Upstream,
     resolver: IpAddr,
     deadline: Instant,
 ) -> Option<IpAddr> {
     let name = Name::from_ascii("whoami.akamai.net.").expect("a valid name");
-    let query = probe_query(fcx, &name, RecordType::A, DNSClass::IN, true);
-    let (_, reply) = exchange(fcx, source, resolver, query, deadline).await?;
+    let question = (&name, RecordType::A, DNSClass::IN);
+    let (_, reply) = exchange(
+        fcx,
+        upstream,
+        resolver,
+        question,
+        &Name::root(),
+        true,
+        deadline,
+    )
+    .await?;
     reply
         .answers
         .iter()
@@ -1475,56 +1478,65 @@ pub fn root_zone(text: &str) -> Result<Zone, ZoneError> {
 // ---------------------------------------------------------------------------
 // Mirror
 
-/// A callback that sees each reply a relay gives.
+/// A callback that sees each reply a mirrored server gives.
 type Observer = dyn Fn(&Request, &Client, &Response) + Send + Sync;
 
-/// What a world puts around each relay's authority.
+/// What a world puts around each mirrored server's authority.
 type Wrap = dyn Fn(Arc<dyn Authority>) -> Arc<dyn Authority> + Send + Sync;
 
 /// What a world places at the addresses of one name.
 type Front = dyn Fn(Host) -> Host + Send + Sync;
 
-/// Relays for the real hierarchy: the root, `arpa`, `com`, `net`, and every
-/// server below them that a relayed reply names.
+/// Copies of the real hierarchy: the root, `com`, `net`, and every zone
+/// below them that a reply names, each served at its real servers'
+/// addresses from records copied from those servers.
 ///
-/// [`relay`](Mirror::relay) is a program that passes on what the real
-/// server at its own address answers, through the mirror's source, as
-/// [`Relay`] does. A world runs it on the root and `gtld-servers.net`
-/// presets. As replies pass, the mirror places more relays, so a resolver
-/// in the world can follow the hierarchy as far down as the source
-/// answers:
+/// [`relay`](Mirror::relay) is a program that answers, at its own
+/// address, for the zones the mirror knows that address serves: the root
+/// at the root letters' addresses, `com` and `net` at the
+/// `gtld-servers.net` addresses, and every zone a reply names that
+/// address a server of. Each zone's data is [`Learned`]: one per zone,
+/// shared by all of the zone's servers, filled from the real servers
+/// through the mirror's upstream as the world's servers need facts, and
+/// answered from with the world's own [`Zones`]. No real server's message
+/// reaches a client. A world runs the program on the root and
+/// `gtld-servers.net` presets. As replies leave, the mirror places more
+/// servers, so a resolver in the world can follow the hierarchy as far
+/// down as the upstream answers:
 ///
-/// - at each address a reply gives as glue for a name server it names
+/// - at each address a referral gives as glue for a name server it names
 ///   (RFC 9471), and
 /// - at each address an A or AAAA answer gives this session for a name
-///   that a relayed NS RRset names this session, whichever came first,
-///   for a delegation without glue, such as a `.com` zone served from
+///   that an NS RRset named this session, whichever came first, for a
+///   delegation without glue, such as a `.com` zone served from
 ///   `awsdns-NN.org` or `8.in-addr.arpa` served from `arin.net`.
 ///
-/// Each relay is placed before the reply that names it leaves, behind
+/// Each server is placed before the reply that names it leaves, behind
 /// [`Host::delay`] with half the location's
 /// [`authority_rtt`](Location::authority_rtt). Where a host's machine is
-/// already, such as a site placed first, the relay joins it; where a
-/// relay or a preset's server already answers, nothing more is placed.
-/// A relay joining a machine takes its port 53, so a world puts no DNS
-/// server of its own at an address the real hierarchy names. The names of
-/// name servers and the addresses answers gave are forgotten when the
-/// namespace advances.
+/// already, such as a site placed first, the server joins it; where a
+/// mirrored server or a preset's server already answers, nothing more is
+/// placed, and the address serves the new zone too. A server joining a
+/// machine takes its port 53, so a world puts no DNS server of its own at
+/// an address the real hierarchy names. The names of name servers and the
+/// addresses answers gave are forgotten when the namespace advances, and
+/// so is every zone's copied data.
 ///
 /// Addresses on the sandboxes' subnet or a LAN, and addresses no
 /// internet host can have (those the IANA special-purpose registries of
 /// RFC 6890 mark not globally reachable), are never placed: the reply
 /// still reaches the client as it was, and the address stays unreachable.
-/// The public resolvers' addresses get no relay either: a world runs the
+/// The public resolvers' addresses get no server either: a world runs the
 /// resolvers there.
 ///
-/// The source asks every real server from one address, the location's
+/// The upstream asks every real server from one address, the location's
 /// [`egress`](Location::egress). A real server that echoes the address a
 /// question came from, as the whoami names of Akamai do, would see a
-/// public resolver's own egress instead
-/// ([`ResolverSite::egress`]), so a reply to a public resolver's question
-/// carries that address in place of the location's, in an unsigned A
-/// record when it is IPv4 and in a TXT string.
+/// public resolver's own egress instead ([`ResolverSite::egress`]), so a
+/// reply to a public resolver's question carries that address in place
+/// of the location's, in an unsigned A record when it is IPv4 and in a
+/// TXT string. The copied record stays as the real server sent it; the
+/// address is put in as the reply leaves, since it depends on who asked.
 #[derive(Clone)]
 pub struct Mirror {
     inner: Arc<Inner>,
@@ -1532,7 +1544,7 @@ pub struct Mirror {
 
 #[derive(Clone)]
 struct Inner {
-    source: Arc<dyn Source>,
+    upstream: Arc<dyn Upstream>,
     handle: NetHandle,
     delay: Duration,
     namespace: Option<Namespace>,
@@ -1541,7 +1553,11 @@ struct Inner {
     fronts: Vec<(LowerName, Arc<Front>)>,
     named: Arc<PerSession<Named>>,
     placed: Arc<Mutex<Placed>>,
-    /// The address the source asks the real servers from, when it is
+    /// Each zone's copied data, by apex.
+    zones: Arc<Mutex<HashMap<LowerName, Arc<Learned>>>>,
+    /// The zones each address serves.
+    served: Arc<Mutex<HashMap<IpAddr, Vec<LowerName>>>>,
+    /// The address the upstream asks the real servers from, when it is
     /// known.
     egress: Option<Egress>,
     /// The address each public resolver's questions leave from, by each
@@ -1549,31 +1565,31 @@ struct Inner {
     resolvers: HashMap<IpAddr, IpAddr>,
 }
 
-/// What relayed replies named this session.
+/// What replies named this session.
 #[derive(Default)]
 struct Named {
-    /// The name servers NS RRsets named.
-    targets: HashSet<LowerName>,
+    /// The name servers NS RRsets named, with the zones they serve.
+    targets: HashMap<LowerName, HashSet<LowerName>>,
     /// The addresses A and AAAA answers gave, by owner, so a name server
     /// whose address came before any NS RRset named it still gets its
-    /// relay.
+    /// server.
     addresses: HashMap<LowerName, Vec<IpAddr>>,
 }
 
 /// Where a mirror placed something, in every session.
 #[derive(Default)]
 struct Placed {
-    /// Addresses given a relay, or found unable to take one.
-    relays: HashSet<IpAddr>,
+    /// Addresses given a server, or found unable to take one.
+    servers: HashSet<IpAddr>,
     /// Addresses given a front.
     fronts: HashSet<IpAddr>,
 }
 
 impl Mirror {
-    /// A mirror asking `source` what the real servers answer, placing
-    /// relays with `handle`, behind the round trip `at` gives other
-    /// authorities.
-    pub fn new(source: impl Source, handle: NetHandle, at: &Location) -> Mirror {
+    /// A mirror copying what `upstream` says the real servers answer,
+    /// placing servers with `handle`, behind the round trip `at` gives
+    /// other authorities.
+    pub fn new(upstream: impl Upstream, handle: NetHandle, at: &Location) -> Mirror {
         let resolvers = PUBLIC_RESOLVERS
             .iter()
             .flat_map(|resolver| {
@@ -1584,9 +1600,24 @@ impl Mirror {
                     .flat_map(move |a| [(IpAddr::V4(a.v4), egress), (IpAddr::V6(a.v6), egress)])
             })
             .collect();
+        let mut served: HashMap<IpAddr, Vec<LowerName>> = HashMap::new();
+        for letter in &ROOT_LETTERS {
+            for addr in letter.server.addresses() {
+                served
+                    .entry(addr)
+                    .or_default()
+                    .push(LowerName::from(Name::root()));
+            }
+        }
+        for server in &GTLD_SERVERS {
+            for addr in server.addresses() {
+                let zones = served.entry(addr).or_default();
+                zones.extend(["com.", "net."].map(|zone| LowerName::new(&name(zone))));
+            }
+        }
         Mirror {
             inner: Arc::new(Inner {
-                source: Arc::new(source),
+                upstream: Arc::new(upstream),
                 handle,
                 delay: at.authority_rtt / 2,
                 namespace: None,
@@ -1595,14 +1626,16 @@ impl Mirror {
                 fronts: Vec::new(),
                 named: Arc::default(),
                 placed: Arc::default(),
+                zones: Arc::default(),
+                served: Arc::new(Mutex::new(served)),
                 egress: at.egress,
                 resolvers,
             }),
         }
     }
 
-    /// The same mirror, changed by `change`. Relays made before keep what
-    /// they had.
+    /// The same mirror, changed by `change`. Servers made before keep
+    /// what they had.
     fn with(self, change: impl FnOnce(&mut Inner)) -> Mirror {
         let mut inner = Arc::unwrap_or_clone(self.inner);
         change(&mut inner);
@@ -1611,17 +1644,18 @@ impl Mirror {
         }
     }
 
-    /// Relays for the sessions of `namespace`: when it advances, every
-    /// relay abandons its questions, and the mirror forgets the name
-    /// servers it has seen named.
+    /// Servers for the sessions of `namespace`: when it advances, every
+    /// zone drops what it copied, every server abandons its lookups, and
+    /// the mirror forgets the name servers it has seen named.
     pub fn namespace(self, namespace: &Namespace) -> Mirror {
         self.with(|inner| inner.namespace = Some(namespace.clone()))
     }
 
-    /// Calls `f` with each reply a relay gives, before it leaves and after
-    /// the relays it names are placed, through an [`Observe`] around the
-    /// relay's authority, and around its [`wrap`](Mirror::wrap) when it
-    /// has one. Observers run in the order given.
+    /// Calls `f` with each reply a mirrored server gives, before it leaves
+    /// and after the servers it names are placed, through an [`Observe`]
+    /// around the server's authority, and around its
+    /// [`wrap`](Mirror::wrap) when it has one. Observers run in the order
+    /// given.
     pub fn observe(
         self,
         f: impl Fn(&Request, &Client, &Response) + Send + Sync + 'static,
@@ -1629,7 +1663,7 @@ impl Mirror {
         self.with(|inner| inner.observers.push(Arc::new(f)))
     }
 
-    /// Wraps the authority of every relay the mirror makes, such as with
+    /// Wraps the authority of every server the mirror makes, such as with
     /// an [`Overlay`](fictionet::stdlib::services::dns::authority::Overlay)
     /// for an invented zone.
     pub fn wrap(
@@ -1639,10 +1673,10 @@ impl Mirror {
         self.with(|inner| inner.wrap = Some(Arc::new(f)))
     }
 
-    /// Places `build(host)` at each address a relayed reply gives for
-    /// `name` in an A or AAAA answer, the first time it gives it, joining
-    /// a machine that is there. `host` is a host at that address only, and
-    /// an address no internet host can have gets none, as with relays. A
+    /// Places `build(host)` at each address a reply gives for `name` in an
+    /// A or AAAA answer, the first time it gives it, joining a machine
+    /// that is there. `host` is a host at that address only, and an
+    /// address no internet host can have gets none, as with servers. A
     /// world uses it for a public resolver's DNS over HTTPS front at the
     /// addresses of [`PublicResolver::doh`] names, such as
     /// `cloudflare-dns.com`, which are not the resolver's own.
@@ -1651,9 +1685,9 @@ impl Mirror {
         self.with(|inner| inner.fronts.push((name, Arc::new(build))))
     }
 
-    /// A program relaying to the real server at its own address, with
-    /// `server` as its front, the mirror's source and namespace, and its
-    /// observers.
+    /// A program answering, at its own address, for the zones the mirror
+    /// knows that address serves, with `server` as its front, the mirror's
+    /// upstream and namespace, and its observers.
     pub fn relay(&self, server: ServerConfig) -> Authoritative<Arc<dyn Authority>> {
         self.inner.relay(server)
     }
@@ -1674,15 +1708,39 @@ impl Inner {
                 }
             }));
         }
-        let program = Authoritative::new(authority, server).source(self.source.clone());
+        let program = Authoritative::new(authority, server).upstream(self.upstream.clone());
         match &self.namespace {
             Some(namespace) => program.namespace(namespace),
             None => program,
         }
     }
 
-    /// Places the relays and fronts `reply`, a relayed reply to `req`,
-    /// names.
+    /// The copied data of the zones `addr` serves.
+    fn zones_at(&self, addr: IpAddr) -> Vec<Arc<dyn ZoneData>> {
+        let apexes = self.served.lock().get(&addr).cloned().unwrap_or_default();
+        let mut zones = self.zones.lock();
+        apexes
+            .into_iter()
+            .map(|apex| {
+                let learned = zones
+                    .entry(apex.clone())
+                    .or_insert_with(|| Arc::new(Learned::new(&Name::from(apex))));
+                learned.clone() as Arc<dyn ZoneData>
+            })
+            .collect()
+    }
+
+    /// Notes that `addr` serves the zone at `zone`.
+    fn serves(&self, addr: IpAddr, zone: &LowerName) {
+        let mut served = self.served.lock();
+        let zones = served.entry(addr).or_default();
+        if !zones.contains(zone) {
+            zones.push(zone.clone());
+        }
+    }
+
+    /// Places the servers and fronts `reply`, a mirrored server's reply to
+    /// `req`, names, and notes the zones they serve.
     fn place(self: &Arc<Self>, req: &Request, reply: &Message) {
         let qname = LowerName::new(req.question.name());
         let asks_address = matches!(req.question.query_type(), RecordType::A | RecordType::AAAA);
@@ -1691,22 +1749,25 @@ impl Inner {
             .iter()
             .filter_map(|record| record.data.ip_addr())
             .collect();
-        let mut relays: Vec<(IpAddr, Name)> = Vec::new();
+        let mut servers: Vec<(IpAddr, Name, LowerName)> = Vec::new();
         let mut fronts: Vec<(IpAddr, &Arc<Front>)> = Vec::new();
-        let targets: HashSet<LowerName> = reply
-            .answers
-            .iter()
-            .chain(&reply.authorities)
-            .filter_map(|record| match &record.data {
-                RData::NS(ns) => Some(LowerName::new(&ns.0)),
-                _ => None,
-            })
-            .collect();
+        // Each name server an NS RRset names, with the zone it serves.
+        let mut targets: HashMap<LowerName, HashSet<LowerName>> = HashMap::new();
+        for record in reply.answers.iter().chain(&reply.authorities) {
+            if let RData::NS(ns) = &record.data {
+                targets
+                    .entry(LowerName::new(&ns.0))
+                    .or_default()
+                    .insert(LowerName::new(&record.name));
+            }
+        }
         for record in &reply.additionals {
             if let Some(addr) = record.data.ip_addr()
-                && targets.contains(&LowerName::new(&record.name))
+                && let Some(zones) = targets.get(&LowerName::new(&record.name))
             {
-                relays.push((addr, record.name.clone()));
+                for zone in zones {
+                    servers.push((addr, record.name.clone(), zone.clone()));
+                }
             }
         }
         let generation = self
@@ -1717,11 +1778,19 @@ impl Inner {
             // A name server whose address an earlier answer gave, before
             // this NS RRset named it: a resolver has its address cached
             // and asks it next.
-            for target in &targets {
+            for (target, zones) in &targets {
                 let known = named.addresses.get(target).into_iter().flatten();
-                relays.extend(known.map(|addr| (*addr, Name::from(target))));
+                for addr in known {
+                    for zone in zones {
+                        servers.push((*addr, Name::from(target), zone.clone()));
+                    }
+                }
+                named
+                    .targets
+                    .entry(target.clone())
+                    .or_default()
+                    .extend(zones.iter().cloned());
             }
-            named.targets.extend(targets);
             for record in &reply.answers {
                 if let Some(addr) = record.data.ip_addr() {
                     let known = named
@@ -1733,9 +1802,13 @@ impl Inner {
                     }
                 }
             }
-            if asks_address && named.targets.contains(&qname) {
+            if asks_address && let Some(zones) = named.targets.get(&qname) {
                 let name = req.question.name().clone();
-                relays.extend(answered.iter().map(|addr| (*addr, name.clone())));
+                for addr in &answered {
+                    for zone in zones {
+                        servers.push((*addr, name.clone(), zone.clone()));
+                    }
+                }
             }
         });
         if asks_address {
@@ -1745,24 +1818,21 @@ impl Inner {
                 }
             }
         }
+        servers.retain(|(addr, _, _)| self.may_serve(*addr));
+        for (addr, _, zone) in &servers {
+            self.serves(*addr, zone);
+        }
         {
             let mut placed = self.placed.lock();
-            relays.retain(|(addr, _)| self.may_relay(*addr) && placed.relays.insert(*addr));
+            servers.retain(|(addr, _, _)| !self.preset_runs(*addr) && placed.servers.insert(*addr));
             fronts.retain(|(addr, _)| !non_public_address(*addr) && placed.fronts.insert(*addr));
         }
         // The network refuses an address on the sandboxes' subnet or a
-        // LAN; such an address stays without a relay. The real server
-        // speaks for itself: its CHAOS answers and NSID are relayed, and
-        // a zone transfer goes to it, which gives or refuses the zone.
-        let front = ServerConfig {
-            identity: None,
-            transfer: true,
-            ..ServerConfig::generic()
-        };
-        for (addr, name) in relays {
+        // LAN; such an address stays without a server.
+        for (addr, name, _) in servers {
             let host = only_at(&name.to_ascii(), addr)
                 .delay(self.delay)
-                .program(self.relay(front.clone()));
+                .program(self.relay(ServerConfig::generic()));
             let _ = self.handle.add_host(host);
         }
         for (addr, build) in fronts {
@@ -1772,12 +1842,11 @@ impl Inner {
         }
     }
 
-    /// Whether a relay may go at `addr`: an address an internet host can
-    /// have, other than the egress the source asks from, where no public
-    /// resolver is and no preset's server already answers. A relay at the
-    /// egress would send its questions from the host to the host's own
-    /// network edge.
-    fn may_relay(&self, addr: IpAddr) -> bool {
+    /// Whether a mirrored server may answer at `addr`: an address an
+    /// internet host can have, other than the egress the upstream asks
+    /// from, where no public resolver is. A server at the egress would
+    /// send its lookups from the host to the host's own network edge.
+    fn may_serve(&self, addr: IpAddr) -> bool {
         if self
             .egress
             .is_some_and(|egress| addr == IpAddr::V4(egress.0))
@@ -1790,12 +1859,27 @@ impl Inner {
                 .iter()
                 .any(|a| addr == IpAddr::V4(a.v4) || addr == IpAddr::V6(a.v6))
         });
+        !non_public_address(addr) && !resolver
+    }
+
+    /// Whether a preset's server already runs at `addr`, which then
+    /// serves a new zone itself and gets no second server.
+    fn preset_runs(&self, addr: IpAddr) -> bool {
         let preset = ROOT_LETTERS
             .iter()
             .map(|letter| &letter.server)
             .chain(&GTLD_SERVERS)
             .any(|server| server.addresses().contains(&addr));
-        !non_public_address(addr) && !resolver && !(preset && self.handle.has_machine(addr))
+        preset && self.handle.has_machine(addr)
+    }
+
+    /// The address the upstream asks from and the one the real server
+    /// would see instead, when `client` is a public resolver: its
+    /// questions leave from its own egress, not from the upstream's.
+    fn seen_by(&self, client: &Client) -> Option<(Ipv4Addr, IpAddr)> {
+        let egress = self.egress?.0;
+        let seen = *self.resolvers.get(&client.peer.ip())?;
+        (seen != IpAddr::V4(egress)).then_some((egress, seen))
     }
 }
 
@@ -1808,44 +1892,43 @@ fn only_at(label: &str, addr: IpAddr) -> Host {
     }
 }
 
-/// A [`Relay`] whose replies place the relays they name.
+/// The zones a mirror knows an address serves, answered from their copied
+/// data, with the replies placing the servers they name.
 struct Mirrored(Arc<Inner>);
 
 impl Authority for Mirrored {
     fn respond(
         &self,
         req: &Request,
-        local: std::net::SocketAddr,
+        local: SocketAddr,
         server: &ServerConfig,
         client: &Client,
-        known: &dyn Known,
     ) -> Step {
-        let step = Relay::new().respond(req, local, server, client, known);
-        let Step::Verbatim(bytes) = step else {
-            return step;
-        };
-        let Ok(mut message) = read_message(&bytes) else {
-            return Step::Verbatim(bytes);
-        };
-        let bytes = match self.0.seen_by(client) {
-            Some((egress, seen)) if echo(&mut message, egress, seen) => {
-                message.to_vec().unwrap_or(bytes)
+        let zones = Zones::new(self.0.zones_at(local.ip()));
+        match zones.respond(req, local, server, client) {
+            Step::Reply(mut response) => {
+                if let Some((egress, seen)) = self.0.seen_by(client) {
+                    echo(&mut response.message, egress, seen);
+                }
+                self.0.place(req, &response.message);
+                Step::Reply(response)
             }
-            _ => bytes,
-        };
-        self.0.place(req, &message);
-        Step::Verbatim(bytes)
+            step => step,
+        }
     }
-}
 
-impl Inner {
-    /// The address the source asks from and the one the real server would
-    /// see instead, when `client` is a public resolver: its questions
-    /// leave from its own egress, not from the source's.
-    fn seen_by(&self, client: &Client) -> Option<(Ipv4Addr, IpAddr)> {
-        let egress = self.egress?.0;
-        let seen = *self.resolvers.get(&client.peer.ip())?;
-        (seen != IpAddr::V4(egress)).then_some((egress, seen))
+    fn file(&self, lookup: &Lookup, looked: &Looked, generation: Generation) {
+        let learned = self.0.zones.lock().get(&lookup.zone).cloned();
+        if let (Some(learned), Looked::Response(response)) = (learned, looked) {
+            learned.file(generation, &lookup.question, response);
+        }
+    }
+
+    fn advance(&self, generation: Generation) {
+        let zones: Vec<Arc<Learned>> = self.0.zones.lock().values().cloned().collect();
+        for learned in zones {
+            learned.advance(generation);
+        }
     }
 }
 
@@ -1853,8 +1936,8 @@ impl Inner {
 /// address a question came from, as `whoami.akamai.net` A or
 /// `whoami.ds.akahelp.net` TXT do: an A record holding `egress`, which
 /// takes `seen` when it is IPv4, and a TXT string that is `egress`. An
-/// RRset its RRSIGs cover is left as it is. Whether anything changed.
-fn echo(message: &mut Message, egress: Ipv4Addr, seen: IpAddr) -> bool {
+/// RRset its RRSIGs cover is left as it is.
+fn echo(message: &mut Message, egress: Ipv4Addr, seen: IpAddr) {
     let signed: Vec<(Name, RecordType)> = message
         .answers
         .iter()
@@ -1866,16 +1949,12 @@ fn echo(message: &mut Message, egress: Ipv4Addr, seen: IpAddr) -> bool {
         })
         .collect();
     let text = egress.to_string();
-    let mut changed = false;
     for record in &mut message.answers {
         if signed.contains(&(record.name.clone(), record.record_type())) {
             continue;
         }
         match (&mut record.data, seen) {
-            (RData::A(a), IpAddr::V4(seen)) if a.0 == egress => {
-                a.0 = seen;
-                changed = true;
-            }
+            (RData::A(a), IpAddr::V4(seen)) if a.0 == egress => a.0 = seen,
             (RData::TXT(txt), _) if txt.txt_data.iter().any(|s| **s == *text.as_bytes()) => {
                 let strings = txt.txt_data.iter().map(|s| {
                     if **s == *text.as_bytes() {
@@ -1885,12 +1964,10 @@ fn echo(message: &mut Message, egress: Ipv4Addr, seen: IpAddr) -> bool {
                     }
                 });
                 *txt = TXT::new(strings.collect());
-                changed = true;
             }
             _ => {}
         }
     }
-    changed
 }
 
 fn name(text: &str) -> Name {

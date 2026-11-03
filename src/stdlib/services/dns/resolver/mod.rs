@@ -866,6 +866,7 @@ impl<V: Verify> Engine for Resolver<V> {
                 bytes,
             } => self.reply(token, from, transport, &bytes, entropy),
             Input::Failed { token, failure } => self.failed(token, failure, entropy),
+            Input::Looked { token, .. } => self.looked(token),
             Input::Gone(client) => self.gone(&client),
             Input::Tick => {
                 self.expire(entropy);

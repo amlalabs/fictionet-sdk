@@ -1,7 +1,7 @@
-//! The internet presets on a simulated network: a root letter relaying a
-//! hierarchy, the mirror placing relays where replies name servers, and
-//! the public resolvers' whoami names and per-sandbox caches. The real
-//! hierarchy is played by a source that answers from fixed zones.
+//! The internet presets on a simulated network: a root letter copying a
+//! hierarchy, the mirror placing servers where replies name them, and the
+//! public resolvers' whoami names and per-sandbox caches. The real
+//! hierarchy is played by an upstream that answers from fixed zones.
 
 use std::future::{Future, ready};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -15,15 +15,15 @@ use fictionet::stdlib::protocols::dns::op::{Edns, Message, OpCode, Query, Respon
 use fictionet::stdlib::protocols::dns::rr::rdata::TXT;
 use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, Name, RData, Record, RecordType};
 use fictionet::stdlib::protocols::dns::{Nsid, Parsed, Request, Response};
-use fictionet::stdlib::services::dns::authority::{Ask, Identity, Observed, ServerConfig};
+use fictionet::stdlib::services::dns::authority::{Identity, ServerConfig};
 use fictionet::stdlib::services::dns::resolver::Config;
 use fictionet::stdlib::services::dns::zone::{Answered, AnyResponse, Zone, ZoneData, answer};
-use fictionet::stdlib::services::dns::{Event, Generation, WallClock};
+use fictionet::stdlib::services::dns::{Client, Event, Generation, Looked, Lookup, WallClock};
 use fictionet::stdlib::services::serve::Transport;
 use fictionet::stdlib::world::net::dns::internet::{
     self, Egress, GTLD_SERVERS, Location, Mirror, PUBLIC_RESOLVERS, ROOT_LETTERS,
 };
-use fictionet::stdlib::world::net::dns::{self, Cached, Recursive, Source};
+use fictionet::stdlib::world::net::dns::{self, Recursive, Upstream};
 use fictionet::stdlib::world::net::{Host, Net};
 use fictionet_test_support::sandbox::{Machine, machine};
 use fictionet_test_support::timeout;
@@ -155,16 +155,14 @@ impl Hierarchy {
     }
 }
 
-impl Source for Hierarchy {
-    fn ask<'a>(
+impl Upstream for Hierarchy {
+    fn lookup<'a>(
         &'a self,
         _fcx: &'a Cx,
-        ask: Ask,
-    ) -> Pin<Box<dyn Future<Output = Observed> + Send + 'a>> {
-        let Parsed::Request(req) = Request::parse(&ask.query, ask.transport) else {
-            panic!("a relay asked something that is not a query");
-        };
-        let server = ask.server.ip();
+        lookup: Lookup,
+    ) -> Pin<Box<dyn Future<Output = Looked> + Send + 'a>> {
+        let req = request(&lookup);
+        let server = lookup.server.ip();
         self.asked.lock().unwrap().push((
             server,
             LowerName::new(req.question.name()),
@@ -175,7 +173,7 @@ impl Source for Hierarchy {
             .iter()
             .find(|(addresses, _)| addresses.contains(&server));
         let Some((_, zone)) = zone else {
-            return Box::pin(ready(Observed::Unreachable));
+            return Box::pin(ready(Looked::Unreachable));
         };
         // Every real server here is the instance `REAL`, by CHAOS name and
         // by NSID.
@@ -209,10 +207,25 @@ impl Source for Hierarchy {
             response
         };
         let reply = front.front(&req, response);
-        Box::pin(ready(Observed::Reply(
-            reply.message.to_vec().expect("a reply"),
-        )))
+        Box::pin(ready(Looked::Response(reply.message)))
     }
+}
+
+/// The query an upstream sends for `lookup`: its question and RD bit, and
+/// an OPT record with DO and an NSID request.
+fn request(lookup: &Lookup) -> Request {
+    let mut message = Message::query();
+    message.metadata.id = 1;
+    message.metadata.recursion_desired = lookup.recursion_desired;
+    message.add_query(lookup.question.clone());
+    let mut edns = Edns::new();
+    edns.set_dnssec_ok(true);
+    edns.options_mut().insert(Nsid(Vec::new()).to_option());
+    message.set_edns(edns);
+    let Parsed::Request(req) = Request::parse(&message.to_vec().unwrap(), Transport::Udp) else {
+        panic!("a lookup's query parses");
+    };
+    req
 }
 
 /// The instance every real server of [`Hierarchy`] is.
@@ -327,7 +340,7 @@ fn the_root_hints_are_the_root_letters() {
     assert_eq!(Config::unbound().hints, letters);
 }
 
-/// `dig @198.41.0.4 . NS` at a root letter relaying the hierarchy: the
+/// `dig @198.41.0.4 . NS` at a root letter copying the hierarchy: the
 /// real server's answer, every root server with its address, after the
 /// round trip the location gives a.root, and `id.server` answered from
 /// the site that answers there without asking the source.
@@ -393,7 +406,7 @@ fn a_root_letter_answers_the_root_ns_as_dig_sees_it() {
         assert_eq!(
             hierarchy.asked.lock().unwrap().len(),
             1,
-            "CHAOS is never relayed"
+            "CHAOS is never looked up"
         );
         Ok(())
     });
@@ -401,10 +414,12 @@ fn a_root_letter_answers_the_root_ns_as_dig_sees_it() {
 
 /// The NSID and the CHAOS names of one address name one instance: a root
 /// letter's preset site for both, never the real instance's NSID next to
-/// the preset's CHAOS names, and a relay the mirror placed the real
-/// instance for both.
+/// the preset's CHAOS names. A server the mirror placed answers from
+/// copied records, so it speaks for no real instance: CHAOS questions get
+/// REFUSED from its front, a reply carries no NSID, and no CHAOS question
+/// is ever looked up.
 #[test]
-fn a_relayed_server_names_one_instance_by_chaos_and_by_nsid() {
+fn a_mirrored_server_names_one_instance_by_chaos_and_by_nsid() {
     world(Duration::from_secs(60), |fcx| async move {
         let hierarchy = Hierarchy::new();
         let at = location();
@@ -432,8 +447,8 @@ fn a_relayed_server_names_one_instance_by_chaos_and_by_nsid() {
             .expect("an answer");
         assert_ne!(texts(&reply), vec![REAL.to_string()]);
 
-        // The referral to `direct.` places a relay at its glue, which
-        // passes the real instance's own answers on.
+        // The referral to `direct.` places a server at its glue, which
+        // answers from what it copied and never as the real instance.
         let ns = v4(45, 33, 5, 53);
         ask(
             &fcx,
@@ -445,8 +460,9 @@ fn a_relayed_server_names_one_instance_by_chaos_and_by_nsid() {
         .expect("a referral");
         let reply = ask(&fcx, &m, ns, &chaos(4, "hostname.bind."))
             .await
-            .expect("an answer from the real instance");
-        assert_eq!(texts(&reply), vec![REAL.to_string()]);
+            .expect("an answer from the placed server");
+        assert_eq!(reply.metadata.response_code, ResponseCode::Refused);
+        assert!(texts(&reply).is_empty());
         let mut www = query(5, "www.direct.", RecordType::A, false);
         www.edns
             .as_mut()
@@ -454,7 +470,15 @@ fn a_relayed_server_names_one_instance_by_chaos_and_by_nsid() {
             .options_mut()
             .insert(Nsid(Vec::new()).to_option());
         let reply = ask(&fcx, &m, ns, &www).await.expect("an answer");
-        assert_eq!(nsid(&reply), Some(REAL.as_bytes().to_vec()));
+        assert_eq!(addresses(&reply), vec![v4(45, 33, 5, 80)]);
+        assert_eq!(nsid(&reply), None);
+        let chaos_looked_up = hierarchy
+            .asked
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, name, _)| *name == lower("hostname.bind."));
+        assert!(!chaos_looked_up);
         Ok(())
     });
 }
@@ -535,78 +559,6 @@ fn the_placing_root_answers_its_ns_set() {
     });
 }
 
-/// `Cached` answers an ask from a kept reply only when the reply fits it:
-/// the same question with the same EDNS, so a query without an OPT record
-/// never gets a reply with one (RFC 6891 §7).
-#[test]
-fn a_cached_reply_answers_only_the_same_question_with_the_same_edns() {
-    world(Duration::from_secs(60), |fcx| async move {
-        let hierarchy = Hierarchy::new();
-        let cached = Cached::new(hierarchy.clone());
-        let a_root = SocketAddr::new(IpAddr::V4(ROOT_LETTERS[0].server.v4), 53);
-        let ask = |message: Message| Ask {
-            server: a_root,
-            transport: Transport::Udp,
-            query: message.to_vec().unwrap(),
-        };
-        let reply = |observed: Observed| match observed {
-            Observed::Reply(bytes) => Message::from_vec(&bytes).unwrap(),
-            other => panic!("expected a reply, got {other:?}"),
-        };
-        let with_opt = query(1, ".", RecordType::NS, false);
-        let mut without_opt = with_opt.clone();
-        without_opt.metadata.id = 2;
-        without_opt.edns = None;
-
-        let first = reply(cached.ask(&fcx, ask(with_opt.clone())).await);
-        assert!(first.edns.is_some());
-        let again = reply(cached.ask(&fcx, ask(with_opt)).await);
-        assert_eq!(again.answers, first.answers);
-        assert_eq!(hierarchy.asked_for(".", RecordType::NS).len(), 1, "kept");
-
-        let plain = reply(cached.ask(&fcx, ask(without_opt)).await);
-        assert_eq!(plain.metadata.id, 2);
-        assert!(
-            plain.edns.is_none(),
-            "no OPT record for a query without one"
-        );
-        assert_eq!(hierarchy.asked_for(".", RecordType::NS).len(), 2);
-        Ok(())
-    });
-}
-
-/// `Cached` keeps its replies for one session of its namespace: a new
-/// session asks the source again.
-#[test]
-fn a_cached_reply_stays_in_its_session() {
-    world(Duration::from_secs(60), |fcx| async move {
-        let hierarchy = Hierarchy::new();
-        let namespace = dns::Namespace::new(WallClock {
-            start: SystemTime::UNIX_EPOCH,
-        });
-        let cached = Cached::new(hierarchy.clone()).namespace(&namespace);
-        let a_root = SocketAddr::new(IpAddr::V4(ROOT_LETTERS[0].server.v4), 53);
-        let ask = || Ask {
-            server: a_root,
-            transport: Transport::Udp,
-            query: query(1, ".", RecordType::NS, false).to_vec().unwrap(),
-        };
-        cached.ask(&fcx, ask()).await;
-        cached.ask(&fcx, ask()).await;
-        assert_eq!(hierarchy.asked_for(".", RecordType::NS).len(), 1, "kept");
-        namespace.advance(WallClock {
-            start: SystemTime::UNIX_EPOCH,
-        });
-        cached.ask(&fcx, ask()).await;
-        assert_eq!(
-            hierarchy.asked_for(".", RecordType::NS).len(),
-            2,
-            "asked again in the new session"
-        );
-        Ok(())
-    });
-}
-
 /// Per-session state moves only forward: a call still working for an
 /// ended session sees fresh state of its own and leaves the current
 /// session's state as it was.
@@ -633,12 +585,12 @@ fn nsid(reply: &Message) -> Option<Vec<u8>> {
         .map(|nsid| nsid.0)
 }
 
-/// A referral with glue places a relay at the glue address before the
+/// A referral with glue places a server at the glue address before the
 /// referral reaches the client, so the client's next question to that
-/// address is answered. An answer for a name no relayed NS RRset named
+/// address is answered. An answer for a name no NS RRset named
 /// places nothing.
 #[test]
-fn the_mirror_places_a_relay_at_referral_glue_before_the_reply_leaves() {
+fn the_mirror_places_a_server_at_referral_glue_before_the_reply_leaves() {
     world(Duration::from_secs(60), |fcx| async move {
         let hierarchy = Hierarchy::new();
         let at = location();
@@ -665,12 +617,12 @@ fn the_mirror_places_a_relay_at_referral_glue_before_the_reply_leaves() {
         assert_eq!(addresses(&reply), vec![ns]);
         assert!(
             handle.has_machine(ns),
-            "the relay is placed with the referral"
+            "the server is placed with the referral"
         );
 
         let reply = ask(&fcx, &m, ns, &query(2, "www.direct.", RecordType::A, false))
             .await
-            .expect("an answer from the placed relay");
+            .expect("an answer from the placed server");
         assert!(reply.metadata.authoritative);
         assert_eq!(addresses(&reply), vec![v4(45, 33, 5, 80)]);
         assert_eq!(
@@ -687,10 +639,11 @@ fn the_mirror_places_a_relay_at_referral_glue_before_the_reply_leaves() {
     });
 }
 
-/// A zone transfer asked of a relayed name server goes to the real server,
-/// which gives or refuses the zone: the relay never refuses it on its own.
+/// A zone transfer asked of a mirrored name server is refused: zone data
+/// makes answers to questions, never a listing of a whole zone, and no
+/// transfer is ever looked up at the real server.
 #[test]
-fn a_relayed_name_server_passes_a_zone_transfer_to_the_real_server() {
+fn a_mirrored_name_server_refuses_zone_transfers() {
     world(Duration::from_secs(60), |fcx| async move {
         let hierarchy = Hierarchy::new();
         let at = location();
@@ -709,7 +662,7 @@ fn a_relayed_name_server_passes_a_zone_transfer_to_the_real_server() {
             &query(1, "www.direct.", RecordType::A, false),
         )
         .await
-        .expect("a referral that places the relay");
+        .expect("a referral that places the server");
 
         let mut transfer = Message::query();
         transfer.metadata.id = 2;
@@ -725,17 +678,17 @@ fn a_relayed_name_server_passes_a_zone_transfer_to_the_real_server() {
         )
         .await;
         let reply = Message::from_vec(&replies[0]).unwrap();
-        assert_ne!(reply.metadata.response_code, ResponseCode::Refused);
-        assert_eq!(hierarchy.asked_for("direct.", RecordType::AXFR), vec![ns]);
+        assert_eq!(reply.metadata.response_code, ResponseCode::Refused);
+        assert!(hierarchy.asked_for("direct.", RecordType::AXFR).is_empty());
         Ok(())
     });
 }
 
-/// A referral whose glue is the location's own egress places no relay
+/// A referral whose glue is the location's own egress places no server
 /// there, so no question is ever sent from the host to its own public
 /// address.
 #[test]
-fn the_mirror_places_no_relay_at_the_egress() {
+fn the_mirror_places_no_server_at_the_egress() {
     world(Duration::from_secs(60), |fcx| async move {
         let hierarchy = Hierarchy::new();
         let at = location();
@@ -755,7 +708,7 @@ fn the_mirror_places_no_relay_at_the_egress() {
         assert_eq!(
             addresses(&reply),
             vec![egress],
-            "the glue is relayed as it was"
+            "the glue goes out as it was"
         );
         assert!(!handle.has_machine(egress));
         assert!(
@@ -778,7 +731,7 @@ fn the_mirror_places_no_relay_at_the_egress() {
 }
 
 /// A resolver follows a delegation whose name server has no glue: the
-/// mirror places relays at the glue of the referrals that lead to the
+/// mirror places servers at the glue of the referrals that lead to the
 /// name server's address, then at the address answered for it.
 #[test]
 fn a_glueless_delegation_resolves_through_the_answer_for_its_name_server() {
@@ -813,8 +766,8 @@ fn a_glueless_delegation_resolves_through_the_answer_for_its_name_server() {
         assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
         assert!(reply.metadata.recursion_available);
         assert_eq!(addresses(&reply), vec![v4(45, 33, 4, 80)]);
-        for relay in [v4(45, 33, 1, 53), v4(45, 33, 2, 53), v4(45, 33, 3, 53)] {
-            assert!(handle.has_machine(relay), "no relay at {relay}");
+        for server in [v4(45, 33, 1, 53), v4(45, 33, 2, 53), v4(45, 33, 3, 53)] {
+            assert!(handle.has_machine(server), "no server at {server}");
         }
         assert_eq!(
             hierarchy.asked_for("ns.provider.org.", RecordType::A),
@@ -829,10 +782,10 @@ fn a_glueless_delegation_resolves_through_the_answer_for_its_name_server() {
 }
 
 /// A name server whose address a resolver learned before any NS RRset
-/// named it still gets its relay once one does: the resolver has the
+/// named it still gets its server once one does: the resolver has the
 /// address cached and asks it, without asking for the address again.
 #[test]
-fn a_glueless_name_server_known_before_its_delegation_gets_a_relay() {
+fn a_glueless_name_server_known_before_its_delegation_gets_a_server() {
     world(Duration::from_secs(60), |fcx| async move {
         let hierarchy = Hierarchy::new();
         let at = location();
@@ -880,7 +833,7 @@ fn a_glueless_name_server_known_before_its_delegation_gets_a_relay() {
 }
 
 /// Glue on the sandboxes' subnet, or at an address no internet host can
-/// have, reaches the client as the real server sent it, and no relay is
+/// have, reaches the client as the real server sent it, and no server is
 /// placed there.
 #[test]
 fn addresses_on_the_sandbox_subnet_or_off_the_internet_are_never_placed() {
@@ -906,12 +859,8 @@ fn addresses_on_the_sandbox_subnet_or_off_the_internet_are_never_placed() {
             let reply = ask(&fcx, &m, a_root, &query(id, name, RecordType::A, false))
                 .await
                 .expect("a referral");
-            assert_eq!(
-                addresses(&reply),
-                vec![glue],
-                "the glue is relayed as it was"
-            );
-            assert!(!handle.has_machine(glue), "a relay at {glue}");
+            assert_eq!(addresses(&reply), vec![glue], "the glue goes out as it was");
+            assert!(!handle.has_machine(glue), "a server at {glue}");
             let reply = ask(&fcx, &m, glue, &query(id + 10, name, RecordType::A, false)).await;
             assert!(reply.is_none(), "{glue} answered");
         }
@@ -919,8 +868,8 @@ fn addresses_on_the_sandbox_subnet_or_off_the_internet_are_never_placed() {
     });
 }
 
-/// The addresses a relayed reply gives for a name with a front get that
-/// front, and no relay.
+/// The addresses a mirrored server's reply gives for a name with a front get that
+/// front, and no server.
 #[test]
 fn a_front_goes_at_the_addresses_answered_for_its_name() {
     world(Duration::from_secs(60), |fcx| async move {
@@ -964,7 +913,7 @@ fn a_front_goes_at_the_addresses_answered_for_its_name() {
             &query(3, "cloudflare-dns.com.", RecordType::A, false),
         )
         .await;
-        assert!(reply.is_none(), "a relay answered at the front's address");
+        assert!(reply.is_none(), "a server answered at the front's address");
         Ok(())
     });
 }
@@ -972,7 +921,7 @@ fn a_front_goes_at_the_addresses_answered_for_its_name() {
 /// The whoami names of the public resolvers answer from the world's egress
 /// and the resolver's own, before any question leaves the resolver.
 #[test]
-fn whoami_names_are_answered_from_the_egress_and_never_relayed() {
+fn whoami_names_are_answered_from_the_egress_and_never_looked_up() {
     world(Duration::from_secs(60), |fcx| async move {
         let hierarchy = Hierarchy::new();
         let at = location();
@@ -1100,21 +1049,19 @@ fn a_measured_location_holds_what_the_servers_say_about_themselves() {
 /// says each root letter does, and nothing else.
 struct Letters(Location);
 
-impl Source for Letters {
-    fn ask<'a>(
+impl Upstream for Letters {
+    fn lookup<'a>(
         &'a self,
         _fcx: &'a Cx,
-        ask: Ask,
-    ) -> Pin<Box<dyn Future<Output = Observed> + Send + 'a>> {
-        let Parsed::Request(req) = Request::parse(&ask.query, ask.transport) else {
-            panic!("the probe asked something that is not a query");
-        };
-        let server = ask.server.ip();
+        lookup: Lookup,
+    ) -> Pin<Box<dyn Future<Output = Looked> + Send + 'a>> {
+        let req = request(&lookup);
+        let server = lookup.server.ip();
         let letter = ROOT_LETTERS
             .iter()
             .any(|l| IpAddr::V4(l.server.v4) == server);
         if !letter || req.question.query_class() != DNSClass::CH {
-            return Box::pin(ready(Observed::Unreachable));
+            return Box::pin(ready(Looked::Unreachable));
         }
         let identity = self.0.site(server).identity;
         let (response, edns) = identity.reply(&req);
@@ -1122,9 +1069,7 @@ impl Source for Letters {
         if !edns {
             reply.message.edns = None;
         }
-        Box::pin(ready(Observed::Reply(
-            reply.message.to_vec().expect("a reply"),
-        )))
+        Box::pin(ready(Looked::Response(reply.message)))
     }
 }
 
@@ -1261,9 +1206,22 @@ fn public_resolvers_keep_one_cache_per_sandbox() {
                 kept.lock().unwrap().push((sandbox, *cached));
             }
         });
+        // The mirrored servers' replies to `www.direct. A`, by the server
+        // that gave each.
+        let served_www: Arc<Mutex<Vec<IpAddr>>> = Arc::default();
+        let served = served_www.clone();
         let (attacher, attachments) = fictionet::attachments();
         let net = Net::new().ipv4_only();
-        let mirror = Mirror::new(hierarchy.clone(), net.handle(), &at);
+        let mirror = Mirror::new(hierarchy.clone(), net.handle(), &at).observe(
+            move |req: &Request, client: &Client, reply: &Response| {
+                let www = Name::from_ascii("www.direct.").unwrap();
+                let asked =
+                    req.question.name() == &www && req.question.query_type() == RecordType::A;
+                if asked && reply.message.metadata.authoritative {
+                    served.lock().unwrap().push(client.local.ip());
+                }
+            },
+        );
         net.hosts(internet::root_servers(|s| mirror.relay(s), &at))
             .hosts(internet::public_resolvers(
                 |r, h| {
@@ -1297,8 +1255,12 @@ fn public_resolvers_keep_one_cache_per_sandbox() {
         assert_eq!(replies[0].0, replies[1].0);
         assert_ne!(replies[0].0, replies[2].0, "two sandboxes");
         let www = v4(45, 33, 5, 53);
+        let served = served_www.lock().unwrap().clone();
+        assert_eq!(served, vec![www, www], "resolved once per sandbox");
+        // Both resolutions read the one copy of `direct.`: the real server
+        // was asked once.
         let asked = hierarchy.asked_for("www.direct.", RecordType::A);
-        assert_eq!(asked, vec![www, www], "once per sandbox");
+        assert_eq!(asked, vec![www]);
         Ok(())
     });
 }

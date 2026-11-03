@@ -1,16 +1,16 @@
 use super::*;
-use fictionet::stdlib::protocols::dns::op::{Edns, ResponseCode};
+use fictionet::stdlib::protocols::dns::op::{Edns, OpCode, ResponseCode};
 use fictionet::stdlib::protocols::dns::rr::rdata::{NS, SOA};
 use fictionet::stdlib::protocols::dns::rr::{LowerName, Record, RecordSet};
 use fictionet::stdlib::protocols::dns::{Ede, EdeCode};
-use fictionet::stdlib::services::dns::authority::{Ask, Observed, Relay, ServerConfig, Zones};
+use fictionet::stdlib::services::dns::authority::{ServerConfig, Zones};
 use fictionet::stdlib::services::dns::resolver::Config;
-use fictionet::stdlib::services::dns::zone::Zone;
-use fictionet::stdlib::services::dns::{Client, Event, WallClock};
+use fictionet::stdlib::services::dns::zone::{Learned, Zone, ZoneData};
+use fictionet::stdlib::services::dns::{Client, Event, Looked, Lookup, WallClock};
 use fictionet::stdlib::services::serve::Transport;
 use fictionet::stdlib::world::net::{Lan, Pools};
 use fictionet::stdlib::world::net::dns::{
-    Authoritative, Namespace, Only, Recursive, ResolverHandle, Source,
+    Authoritative, Namespace, Only, Recursive, ResolverHandle, Upstream,
 };
 use fictionet_test_support::ended_with_done;
 
@@ -1362,22 +1362,21 @@ fn the_gateway_answers_declared_names_as_a_resolver_with_no_internet() {
     });
 }
 
-/// A source that answers every question with one A record, and counts
-/// the questions it was asked.
+/// An upstream that answers every lookup with one A record, authoritative
+/// for the name asked, and counts the lookups it was given.
 struct Answers {
     asked: Arc<AtomicUsize>,
 }
 
-impl Source for Answers {
-    fn ask<'a>(
+impl Upstream for Answers {
+    fn lookup<'a>(
         &'a self,
         _fcx: &'a Cx,
-        ask: Ask,
-    ) -> Pin<Box<dyn Future<Output = Observed> + Send + 'a>> {
+        lookup: Lookup,
+    ) -> Pin<Box<dyn Future<Output = Looked> + Send + 'a>> {
         self.asked.fetch_add(1, Ordering::SeqCst);
-        let query = Message::from_vec(&ask.query).expect("a query");
-        let question = query.queries[0].clone();
-        let mut reply = Message::response(query.metadata.id, query.metadata.op_code);
+        let question = lookup.question.clone();
+        let mut reply = Message::response(1, OpCode::Query);
         reply.metadata.authoritative = true;
         reply.add_answer(Record::from_rdata(
             question.name().clone(),
@@ -1385,43 +1384,39 @@ impl Source for Answers {
             RData::A(Ipv4Addr::new(203, 0, 113, 80).into()),
         ));
         reply.add_query(question);
-        Box::pin(std::future::ready(Observed::Reply(
-            reply.to_vec().expect("a reply"),
-        )))
+        Box::pin(std::future::ready(Looked::Response(reply)))
     }
 }
 
-/// `Only` asks its source only what the policy allows. A relay whose ask
-/// was refused stays silent, as a server that never replies.
+/// `Only` puts to its upstream only the lookups the policy allows. A
+/// server whose lookup was refused stays silent, as a server that never
+/// replies.
 #[test]
-fn only_asks_what_its_policy_allows() {
+fn only_looks_up_what_its_policy_allows() {
     world(Duration::from_secs(60), |fcx| async move {
-        let relay = Ipv4Addr::new(203, 0, 113, 53);
+        let address = Ipv4Addr::new(203, 0, 113, 53);
         let asked = Arc::new(AtomicUsize::new(0));
         let allowed = lower("allowed.test.");
-        let policy = move |ask: &Ask| {
-            Message::from_vec(&ask.query)
-                .ok()
-                .and_then(|query| query.queries.first().map(|q| LowerName::new(q.name())))
-                .is_some_and(|name| allowed.zone_of(&name))
-        };
-        let source = Only::new(
+        let policy =
+            move |lookup: &Lookup| allowed.zone_of(&LowerName::new(lookup.question.name()));
+        let upstream = Only::new(
             policy,
             Answers {
                 asked: asked.clone(),
             },
         );
+        let learned = Learned::new(&Name::from_ascii("test.").unwrap());
+        let zones = Zones::new(vec![Arc::new(learned) as Arc<dyn ZoneData>]);
         let (attacher, attachments) = fictionet::attachments();
         Net::new()
             .ipv4_only()
-            .host("relay", |h| {
-                h.at(relay).program(
-                    Authoritative::new(Relay::new(), ServerConfig::generic()).source(source),
-                )
+            .host("copy", |h| {
+                h.at(address)
+                    .program(Authoritative::new(zones, ServerConfig::generic()).upstream(upstream))
             })
             .start(&fcx, attachments)?;
         let m = machine(&fcx, attacher.attach("client")?, ME);
-        let server = SocketAddr::new(relay.into(), 53);
+        let server = SocketAddr::new(address.into(), 53);
 
         let query = dns_query(1, "www.allowed.test.", RecordType::A, false);
         let reply = ask(&fcx, &m, server, &query).await.expect("an answer");
@@ -1434,7 +1429,11 @@ fn only_asks_what_its_policy_allows() {
 
         let query = dns_query(2, "www.other.test.", RecordType::A, false);
         assert!(ask(&fcx, &m, server, &query).await.is_none());
-        assert_eq!(asked.load(Ordering::SeqCst), 1, "the source was not asked");
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            1,
+            "the upstream was not asked"
+        );
         Ok(())
     });
 }

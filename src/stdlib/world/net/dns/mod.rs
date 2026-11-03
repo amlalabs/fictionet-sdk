@@ -1,6 +1,6 @@
 //! DNS servers as programs on the world's hosts: authoritative servers and
-//! recursive resolvers that answer over real packets, where their own
-//! questions go, and the namespace a world advances when its session
+//! recursive resolvers that answer over real packets, where their lookups
+//! of real servers go, and the namespace a world advances when its session
 //! changes.
 //!
 //! The engines in [`services::dns`](fictionet::stdlib::services::dns)
@@ -13,8 +13,10 @@
 //! other servers leave the machine as packets, so it resolves through
 //! authoritative programs on other hosts, or through a real server
 //! attached with [`Net::route`](super::Net::route), and the network's
-//! dissector sees each exchange. An authority's own questions, such as a
-//! relay's, go to a [`Source`].
+//! dissector sees each exchange. An authority's lookups, such as a learned
+//! zone's questions to the zone's real servers, go to an [`Upstream`],
+//! and what comes back is filed as records: no real server's message
+//! reaches a client. Raw UDP and TCP routes are the only pass-through.
 //!
 //! The network's gateway is such a host: [`Net::gateway`](super::Net::gateway)
 //! says what runs there, and by default it is a resolver with no route to
@@ -25,7 +27,7 @@
 //!
 //! [`internet`] has the internet's servers as presets that return hosts:
 //! the root and `gtld-servers.net` servers, the public resolvers, and a
-//! [`Mirror`](internet::Mirror) that relays the real hierarchy. A world
+//! [`Mirror`](internet::Mirror) that copies the real hierarchy. A world
 //! that adds none of them has no internet.
 //!
 //! [`encrypted`] puts DNS over TLS and DNS over HTTPS in front of a
@@ -50,18 +52,15 @@
 //!
 //! | Item | What it is |
 //! | --- | --- |
-//! | [`Authoritative`] | A program that runs an authority on port 53, with its questions to other servers going to a [`Source`]. |
+//! | [`Authoritative`] | A program that runs an authority on port 53, with its lookups going to an [`Upstream`]. |
 //! | [`Recursive`] | A program that runs a resolver on port 53, one engine per address or per what [`Recursive::partition`] picks. |
 //! | [`ResolverHandle`] | Puts queries from other fronts, such as DNS over TLS, to a running [`Recursive`]. |
-//! | [`Source`] | What a real client sees when it asks a server a question: a world's own answers, recorded exchanges, or the internet. |
-//! | [`Only`] | A source that asks only what the world's policy allows, and times out on the rest. |
-//! | [`Cached`] | A source that keeps replies for their smallest TTL. |
-//! | [`Question`] | What makes two queries one question for a source that answers from replies it holds. |
-//! | [`carry`] | Takes a query an engine sends to a source and gives back the engine's next input. |
+//! | [`Upstream`] | What real servers answer a world's lookups: the internet's servers, recorded responses, or a world's own answers. |
+//! | [`Only`] | An upstream that makes only the lookups the world's policy allows, and gives no reply for the rest. |
 //! | [`Namespace`] | The session a world's DNS programs answer for; advancing it starts a new one everywhere. |
 //! | [`PerSession`] | State that belongs to one session and starts afresh in the next. |
 //! | [`placing`] | A root zone that places a host for a name the first time the name is asked. |
-//! | [`internet`] | The root, `gtld-servers.net`, and public resolver hosts, and a mirror of the real hierarchy. |
+//! | [`internet`] | The root, `gtld-servers.net`, and public resolver hosts, and a mirror that copies the real hierarchy. |
 //! | [`encrypted`] | DNS over TLS on port 853 and DNS over HTTPS on port 443 for a running [`Recursive`]. |
 
 use std::sync::Arc;
@@ -77,10 +76,12 @@ use super::{Host, NetHandle, normalize};
 pub mod encrypted;
 pub mod internet;
 mod program;
-mod source;
+mod session;
+mod upstream;
 
 pub use program::{Authoritative, Recursive, ResolverHandle};
-pub use source::{Cached, Namespace, Only, PerSession, Question, Source, carry};
+pub use session::{Namespace, PerSession};
+pub use upstream::{Only, Upstream};
 
 /// How long resolvers may keep the addresses of a host placed by
 /// [`placing`], in seconds: Unbound's default TTL for `local-data`.

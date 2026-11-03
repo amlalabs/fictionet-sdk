@@ -7,7 +7,7 @@
 //! run clock. [`observation`] defines this world's typed facts; the demo
 //! app projects them into its page.
 //!
-//! The world's DNS is the real hierarchy, relayed ([`net`]): the guest's
+//! The world's DNS is the real hierarchy, copied ([`net`]): the guest's
 //! resolver, the public resolvers, and the root servers answer as the real
 //! ones do, with each site's real address and real signatures, and each
 //! site's machine stands at those addresses.
@@ -50,20 +50,20 @@ use dns::{Outbound, SessionSource};
 pub use dns::admit;
 pub use tls::Ca;
 
-/// Builds the world's unstarted network on the real DNS hierarchy, relayed.
+/// Builds the world's unstarted network on the real DNS hierarchy, copied.
 ///
-/// The root and `gtld-servers.net` servers relay what the real ones
-/// answer, from the internet or a Copied session's capture, and the mirror
-/// places a relay at each name server address their replies name, so
+/// The root and `gtld-servers.net` servers answer from records copied from
+/// the real ones, from the internet or a Copied session's capture, and the mirror
+/// places a server at each name server address their replies name, so
 /// every name the world serves resolves through the real hierarchy. Only
-/// the questions the world's outbound policy allows reach a real server
+/// the lookups the world's outbound policy allows reach a real server
 /// (`dns::Outbound`). The
 /// public resolvers run at their real addresses, and the gateway runs a
 /// recursive resolver like Unbound with the root hints, holding no data of
 /// its own. Every DNS reply either kind of resolver gives a client is
 /// reported as [`SearchObs::Resolved`].
 ///
-/// Each A record a relayed reply gives for a name the session lets out
+/// Each A record a mirrored server's reply gives for a name the session lets out
 /// gets a machine at that address, before the reply leaves: the
 /// `forwarded` host given for that name, such as the model gateway, or a
 /// site whose pages come from [`Pages`]. So the guest connects to the

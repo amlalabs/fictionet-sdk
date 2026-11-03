@@ -1,14 +1,14 @@
 //! Which DNS questions may leave the world for the real servers, and where
 //! they go in each session.
 //!
-//! The world relays the real hierarchy ([`net`](crate::net)): machines at
+//! The world copies the real hierarchy ([`net`](crate::net)): machines at
 //! the root and `gtld-servers.net` addresses, and at every name server
-//! address a relayed reply names, pass on what the real server there
-//! answers. So the guest sees each site's real address and real
+//! address a reply names, answer from records copied from the real server
+//! there. So the guest sees each site's real address and real
 //! signatures, whether it asks the gateway, a public resolver, or a root
-//! server itself. [`Outbound`] is the world's policy for the questions
-//! those relays put to the real servers, and [`SessionSource`] is where
-//! the questions it allows go: the internet, or in a Copied session the
+//! server itself. [`Outbound`] is the world's policy for the lookups
+//! those servers make of the real servers, and [`SessionSource`] is where
+//! the lookups it allows go: the internet, or in a Copied session the
 //! DNS captured with the pages.
 
 use std::collections::{HashMap, HashSet};
@@ -20,11 +20,10 @@ use std::time::Duration;
 use fictionet::Cx;
 use fictionet::stdlib::protocols::dns::op::Message;
 use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RData, Record};
-use fictionet::stdlib::protocols::dns::{Parsed, Request, Response, label_count};
-use fictionet::stdlib::services::dns::Client;
-use fictionet::stdlib::services::dns::authority::{Ask, Observed};
+use fictionet::stdlib::protocols::dns::{Request, Response, label_count};
+use fictionet::stdlib::services::dns::{Client, Looked, Lookup};
 use fictionet::stdlib::world::net::dns::internet::{Egress, Location};
-use fictionet::stdlib::world::net::dns::{PerSession, Source};
+use fictionet::stdlib::world::net::dns::{PerSession, Upstream};
 use fictionet::sync::Mutex;
 use fictionet_extras::dns::Replay;
 use fictionet_host::dns::Live;
@@ -99,14 +98,6 @@ pub(crate) fn host(name: &LowerName) -> String {
     name.to_ascii().trim_end_matches('.').to_owned()
 }
 
-/// The question name of `ask`, or `None` for bytes that are no question.
-fn question(ask: &Ask) -> Option<LowerName> {
-    match Request::parse(&ask.query, ask.transport) {
-        Parsed::Request(request) => Some(LowerName::new(request.question.name())),
-        Parsed::Reject(_) | Parsed::Silent => None,
-    }
-}
-
 /// `name` and every name above it, up to the root.
 fn and_above(name: &LowerName) -> impl Iterator<Item = LowerName> {
     let name = Name::from(name.clone());
@@ -146,7 +137,7 @@ fn targets(message: &Message) -> impl Iterator<Item = (LowerName, Option<LowerNa
 /// [`Pages::serves_host`]) and the names a resolver must ask on the way to
 /// them.
 ///
-/// [`policy`](Self::policy) sees every question a relay would put to a
+/// [`policy`](Self::policy) sees every lookup a mirrored server would make of a
 /// real server: the gateway's, the public resolvers', and a guest's own to
 /// a root or top-level domain server alike. It decides from the question
 /// and the session alone, never from what a guest asked before. A
@@ -168,7 +159,7 @@ fn targets(message: &Message) -> impl Iterator<Item = (LowerName, Option<LowerNa
 ///    labels, RFC 1035 §3.5) or `ip6.arpa` (at most 32 nibble labels,
 ///    RFC 3596 §2.5), or a name above one, `arpa` included;
 /// 5. the real hierarchy named it, or a name below it, while answering a
-///    question this session: an NS target, or a CNAME target, in a relayed
+///    question this session: an NS target, or a CNAME target, in a mirrored
 ///    reply.
 ///
 /// In the live modes every name `admit` takes passes rule 1, so any host
@@ -179,7 +170,7 @@ fn targets(message: &Message) -> impl Iterator<Item = (LowerName, Option<LowerNa
 /// guest could already ask about. Names under rule 5 were chosen by those
 /// operators, not by the guest.
 ///
-/// [`observer`](Self::observer) feeds rule 5 from the relays' replies. The
+/// [`observer`](Self::observer) feeds rule 5 from the mirrored servers' replies. The
 /// names it learned are forgotten when the session changes.
 #[derive(Clone)]
 pub struct Outbound {
@@ -196,10 +187,10 @@ struct OutboundInner {
 /// What the real hierarchy named this session.
 #[derive(Default)]
 struct Named {
-    /// Every NS and CNAME target relayed replies gave, and every name
+    /// Every NS and CNAME target the mirrored servers gave, and every name
     /// above one.
     below: HashSet<LowerName>,
-    /// The owners of the CNAME records relayed replies gave, by target.
+    /// The owners of the CNAME records the mirrored servers gave, by target.
     aliases: HashMap<LowerName, HashSet<LowerName>>,
 }
 
@@ -217,15 +208,14 @@ impl Outbound {
     }
 
     /// The predicate for [`Only`](fictionet::stdlib::world::net::dns::Only):
-    /// whether `ask` may reach a real server. A question that does not
-    /// parse names nothing and stays in the world.
-    pub fn policy(&self) -> impl Fn(&Ask) -> bool + Send + Sync + 'static {
+    /// whether `lookup` may reach a real server.
+    pub fn policy(&self) -> impl Fn(&Lookup) -> bool + Send + Sync + 'static {
         let outbound = self.clone();
-        move |ask| question(ask).is_some_and(|name| outbound.allows(&name))
+        move |lookup| outbound.allows(&LowerName::new(lookup.question.name()))
     }
 
     /// The observer for [`Mirror::observe`](fictionet::stdlib::world::net::dns::internet::Mirror::observe):
-    /// learns the NS and CNAME targets of each relayed reply.
+    /// learns the NS and CNAME targets of each mirrored server's reply.
     pub fn observer(&self) -> impl Fn(&Request, &Client, &Response) + Send + Sync + 'static {
         let outbound = self.clone();
         move |_request, _client, reply| outbound.learn(&reply.message)
@@ -246,7 +236,7 @@ impl Outbound {
             }
     }
 
-    /// The names relayed replies gave as aliases of `target` this session,
+    /// The names the mirrored servers gave as aliases of `target` this session,
     /// through any number of CNAME records.
     pub fn aliases(&self, target: &LowerName) -> Vec<LowerName> {
         self.named(|named| {
@@ -307,7 +297,7 @@ impl Outbound {
         above > 0 && self.admits(&LowerName::new(&name.trim_to(above)))
     }
 
-    /// Notes the targets `message`, a relayed reply, names.
+    /// Notes the targets `message`, a mirrored server's reply, names.
     fn learn(&self, message: &Message) {
         self.named(|named| {
             for (target, owner) in targets(message) {
@@ -361,14 +351,15 @@ fn reverse(name: &LowerName) -> bool {
 // ---------------------------------------------------------------------------
 // Where the questions go
 
-/// Where the relays' questions go in each session: the internet, asked
+/// Where the world's lookups go in each session: the internet, asked
 /// from the host, in Live, Live-Depth, and Edited; in Copied the DNS
 /// captured with the pages, so names resolve as they did when the pages
 /// were copied.
 ///
-/// A Copied session answers a question its capture lacks with silence, so
-/// a resolver caches a failure, not a negative answer. The exception is a
-/// question about a name the world serves in every session (the model
+/// A Copied session gives a lookup its capture lacks no reply, so the
+/// server that needed it stays silent and a resolver caches a failure,
+/// not a negative answer. The exception is a lookup of a name the world
+/// serves in every session (the model
 /// gateway's and the time server's), a name above
 /// one, or a name server or alias target the hierarchy named while
 /// answering one: those go to the internet, or the agent would lose its
@@ -397,7 +388,7 @@ pub struct SessionSource {
 /// capture.
 #[derive(Clone)]
 struct Chosen {
-    source: Arc<dyn Source>,
+    source: Arc<dyn Upstream>,
     copied: Option<Arc<Copied>>,
 }
 
@@ -438,14 +429,14 @@ impl SessionSource {
     }
 }
 
-impl Source for SessionSource {
-    fn ask<'a>(
+impl Upstream for SessionSource {
+    fn lookup<'a>(
         &'a self,
         fcx: &'a Cx,
-        ask: Ask,
-    ) -> Pin<Box<dyn Future<Output = Observed> + Send + 'a>> {
+        lookup: Lookup,
+    ) -> Pin<Box<dyn Future<Output = Looked> + Send + 'a>> {
         let source = self.current().source;
-        Box::pin(async move { source.ask(fcx, ask).await })
+        Box::pin(async move { source.lookup(fcx, lookup).await })
     }
 }
 
@@ -486,31 +477,29 @@ struct Copied {
     fresh: Mutex<HashSet<LowerName>>,
 }
 
-impl Source for Copied {
-    fn ask<'a>(
+impl Upstream for Copied {
+    fn lookup<'a>(
         &'a self,
         fcx: &'a Cx,
-        ask: Ask,
-    ) -> Pin<Box<dyn Future<Output = Observed> + Send + 'a>> {
+        lookup: Lookup,
+    ) -> Pin<Box<dyn Future<Output = Looked> + Send + 'a>> {
         Box::pin(async move {
-            let needed = question(&ask).is_some_and(|name| self.needed.lock().contains(&name));
-            let observed = match self.replay.ask(fcx, ask.clone()).await {
-                Observed::Timeout if needed => self.live.ask(fcx, ask).await,
-                observed => observed,
+            let name = LowerName::new(lookup.question.name());
+            let needed = self.needed.lock().contains(&name);
+            let looked = match self.replay.lookup(fcx, lookup.clone()).await {
+                Looked::NoReply if needed => self.live.lookup(fcx, lookup).await,
+                looked => looked,
             };
-            if needed
-                && let Observed::Reply(bytes) = &observed
-                && let Ok(message) = Message::from_vec(bytes)
-            {
-                self.needed.lock().extend(named_and_above(&message));
+            if needed && let Looked::Response(message) = &looked {
+                self.needed.lock().extend(named_and_above(message));
                 let mut fresh = self.fresh.lock();
-                for (target, owner) in targets(&message) {
+                for (target, owner) in targets(message) {
                     if owner.is_some_and(|owner| fresh.contains(&owner)) {
                         fresh.insert(target);
                     }
                 }
             }
-            observed
+            looked
         })
     }
 }

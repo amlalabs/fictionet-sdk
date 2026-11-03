@@ -13,8 +13,8 @@ use fictionet::stdlib::protocols::dns::{EdeCode, EdnsIn};
 use fictionet::stdlib::services::serve::Transport;
 use fictionet::time::Instant;
 
-use super::authority::Ask;
 use super::exchange::{Client, ExchangeFailure, Token};
+use super::lookup::Lookup;
 
 /// Something an engine did or saw.
 #[derive(Clone, Debug, PartialEq)]
@@ -79,15 +79,14 @@ pub enum Event {
         /// How it ended.
         outcome: UpstreamOutcome,
     },
-    /// An authority learned what its server's own question to another
-    /// server gave.
-    Asked {
-        /// When it learned it.
+    /// An authority's lookup ended, and what it gave was filed.
+    Looked {
+        /// When it ended.
         at: Instant,
-        /// The question.
-        ask: Ask,
+        /// The lookup.
+        lookup: Lookup,
         /// What came of it.
-        observed: ObservedKind,
+        outcome: LookupOutcome,
     },
     /// A completion that changed nothing: its token was not outstanding or
     /// was of an older generation, or the reply came from another address
@@ -167,18 +166,19 @@ pub enum UpstreamOutcome {
     Timeout,
 }
 
-/// What an authority's own question to another server gave.
+/// How an authority's lookup ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum ObservedKind {
-    /// A reply with this RCODE.
-    Reply {
+pub enum LookupOutcome {
+    /// A response with this RCODE.
+    Response {
         /// Its RCODE.
         rcode: ResponseCode,
     },
     /// The server could not be reached.
     Unreachable,
-    /// No reply came in time.
-    Timeout,
+    /// No response came: the server stayed silent, the world's policy
+    /// kept the question in, or the server's deadline passed.
+    NoReply,
 }
 
 /// Why a completion changed nothing.

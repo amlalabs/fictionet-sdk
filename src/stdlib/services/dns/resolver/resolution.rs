@@ -1535,6 +1535,16 @@ impl<V: Verify> Resolver<V> {
         self.give_up(exchange, false, entropy);
     }
 
+    /// Takes what a lookup gave. A resolver starts no lookups, so `token`
+    /// names none of its own and the input changes nothing.
+    pub(super) fn looked(&mut self, token: Token) {
+        let why = match self.outstanding(token) {
+            Err(Unmatched::OldGeneration) => Unmatched::OldGeneration,
+            Ok(_) | Err(_) => Unmatched::NotOutstanding,
+        };
+        self.ignore(token, None, why);
+    }
+
     /// Times out every exchange whose deadline has passed.
     pub(super) fn expire(&mut self, entropy: &dyn Entropy) {
         let expired: Vec<Token> = self

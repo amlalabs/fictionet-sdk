@@ -2,16 +2,19 @@
 //! they answered, and playing those recordings back to a resolver.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use fictionet::stdlib::protocols::dns::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use fictionet::stdlib::protocols::dns::rr::RecordType;
-use fictionet::stdlib::services::dns::authority::{
-    AuthorityEngine, Observed, Relay, ServerConfig, Zones,
+use fictionet::stdlib::protocols::dns::{Parsed, Request};
+use fictionet::stdlib::services::dns::authority::{AuthorityEngine, ServerConfig, Zones};
+use fictionet::stdlib::services::dns::memory::{Exchanges, MemoryNet, Outcome, drive};
+use fictionet::stdlib::services::dns::zone::{
+    Answered, AnyResponse, Learned, Zone, ZoneData, answer,
 };
-use fictionet::stdlib::services::dns::memory::{Exchanges, MemoryNet, Recording, drive};
-use fictionet::stdlib::services::dns::zone::{Zone, ZoneData};
-use fictionet::stdlib::services::dns::{ExchangeFailure, Input, Token, Tokens, Transmit};
+use fictionet::stdlib::services::dns::{
+    ExchangeFailure, Input, Looked, Lookup, Token, Tokens, Transmit,
+};
 use fictionet::stdlib::services::serve::Transport;
 
 use super::resolver::{
@@ -126,12 +129,16 @@ fn an_address_without_a_server_is_unreachable_and_a_lost_transmit_gets_nothing()
     let (lost, _) = transmit(EXAMPLE, "www.example.com.", RecordType::A, 2);
     assert!(net.exchange(&lost, at(0), &entropy()).is_empty());
     let recording = net.recording();
-    let observed: Vec<&Observed> = recording.exchanges().iter().map(|(_, o)| o).collect();
-    assert_eq!(observed, [&Observed::Unreachable, &Observed::Timeout]);
+    let outcomes: Vec<&Outcome> = recording
+        .exchanges()
+        .iter()
+        .map(|exchange| &exchange.outcome)
+        .collect();
+    assert_eq!(outcomes, [&Outcome::Unreachable, &Outcome::Timeout]);
 }
 
 #[test]
-fn a_relay_in_memory_asks_its_source_and_times_out_without_one() {
+fn a_learned_server_in_memory_files_what_its_upstream_gives_and_is_silent_without_it() {
     let zone = Zone::builder(name("example.com."), soa(), 3600)
         .rrset(rrset(
             "example.com.",
@@ -143,42 +150,58 @@ fn a_relay_in_memory_asks_its_source_and_times_out_without_one() {
         .build()
         .unwrap();
     let local = SocketAddr::new(ip(EXAMPLE), 53);
-    // What the real server answers, recorded from a zone in memory.
-    let mut real = MemoryNet::new();
-    let zones = Zones::new(vec![Arc::new(zone) as Arc<dyn ZoneData>]);
-    real.serve(
+    let learned = Learned::new(&name("example.com."));
+    let mut net = MemoryNet::new();
+    net.serve(
         ip(EXAMPLE),
-        AuthorityEngine::new(zones, ServerConfig::generic(), local),
+        AuthorityEngine::new(
+            Zones::new(vec![Arc::new(learned) as Arc<dyn ZoneData>]),
+            ServerConfig::generic(),
+            local,
+        ),
     );
-    let (asked, _) = transmit(EXAMPLE, "www.example.com.", RecordType::A, 9);
-    real.exchange(&asked, at(0), &entropy());
-    let source: Recording = real.recording();
+    // The real server answers `www` from its zone, and nothing else.
+    let looked_up: Arc<Mutex<Vec<Lookup>>> = Arc::default();
+    let seen = looked_up.clone();
+    net.upstream(move |lookup: &Lookup| {
+        seen.lock().unwrap().push(lookup.clone());
+        if lookup.question.name() != &name("www.example.com.") {
+            return Looked::NoReply;
+        }
+        let mut message = Message::new(1, MessageType::Query, OpCode::Query);
+        message.add_query(lookup.question.clone());
+        let Parsed::Request(req) = Request::parse(&message.to_vec().unwrap(), Transport::Udp)
+        else {
+            panic!("a lookup's question parses");
+        };
+        match answer(&zone, &req, AnyResponse::All) {
+            Answered::Response(response) => Looked::Response(response.message),
+            Answered::Unknown { name } => panic!("a complete zone knows {name}"),
+        }
+    });
+    for id in [10, 11] {
+        let (asked, _) = transmit(EXAMPLE, "www.example.com.", RecordType::A, id);
+        let inputs = net.exchange(&asked, at(0), &entropy());
+        let [Input::Reply { bytes, .. }] = inputs.as_slice() else {
+            panic!("the server answers, got {inputs:?}");
+        };
+        let reply = Message::from_vec(bytes).unwrap();
+        assert_eq!(reply.metadata.id, id);
+        assert_eq!(addresses(&reply), ["192.0.2.80"]);
+    }
+    // The second question was answered from what the first filed.
+    assert_eq!(looked_up.lock().unwrap().len(), 1);
 
-    let mut relayed = MemoryNet::new();
-    relayed.serve(
-        ip(EXAMPLE),
-        AuthorityEngine::new(Relay::new(), ServerConfig::generic(), local),
-    );
-    relayed.source(source);
-    let (asked, _) = transmit(EXAMPLE, "www.example.com.", RecordType::A, 10);
-    let inputs = relayed.exchange(&asked, at(0), &entropy());
-    let [Input::Reply { bytes, .. }] = inputs.as_slice() else {
-        panic!("the relay answers, got {inputs:?}");
-    };
-    let reply = Message::from_vec(bytes).unwrap();
-    assert_eq!(reply.metadata.id, 10);
-    assert_eq!(addresses(&reply), ["192.0.2.80"]);
-
-    // A question the source lacks: the relay stays silent.
-    let (unknown, _) = transmit(EXAMPLE, "mail.example.com.", RecordType::A, 11);
-    assert!(relayed.exchange(&unknown, at(0), &entropy()).is_empty());
-    let observed: Vec<Observed> = relayed
+    // A question the upstream gives nothing for: the server stays silent.
+    let (unknown, _) = transmit(EXAMPLE, "mail.example.com.", RecordType::A, 12);
+    assert!(net.exchange(&unknown, at(0), &entropy()).is_empty());
+    let outcomes: Vec<Outcome> = net
         .recording()
         .exchanges()
         .iter()
-        .map(|(_, o)| o.clone())
+        .map(|exchange| exchange.outcome.clone())
         .collect();
-    assert!(matches!(observed[1], Observed::Timeout));
+    assert!(matches!(outcomes[2], Outcome::Timeout));
 }
 
 fn soa() -> fictionet::stdlib::protocols::dns::rr::rdata::SOA {

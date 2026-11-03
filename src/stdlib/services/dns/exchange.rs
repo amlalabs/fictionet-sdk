@@ -1,7 +1,7 @@
 //! What passes between a DNS engine and the code that drives it: client
-//! queries and answers, the exchanges an engine starts with other
-//! servers, and the tokens and generations that tie each completion to
-//! the exchange and the session it belongs to.
+//! queries and answers, the exchanges and lookups an engine starts with
+//! other servers, and the tokens and generations that tie each completion
+//! to the exchange and the session it belongs to.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -14,6 +14,7 @@ use fictionet::time::Instant;
 
 use super::clock::WallClock;
 use super::event::{Event, Unmatched};
+use super::lookup::{Looked, Lookup};
 
 /// A session of a namespace. Generations only grow: a world advances its
 /// namespace when a session changes, and the engines it drives follow.
@@ -166,6 +167,13 @@ pub enum Input {
         /// How it ended.
         failure: ExchangeFailure,
     },
+    /// What a lookup gave.
+    Looked {
+        /// The lookup's token, as [`Action::Lookup`] carried it.
+        token: Token,
+        /// What came of it.
+        looked: Looked,
+    },
     /// The client's connection is gone: drop what only it was waiting for.
     Gone(Client),
     /// `now` reached a deadline the engine asked for.
@@ -180,6 +188,14 @@ pub enum Input {
 pub enum Action {
     /// Carry these bytes to a server.
     Send(Transmit),
+    /// Put this lookup to the upstream, and hand back what it gave as
+    /// [`Input::Looked`] with the token.
+    Lookup {
+        /// The lookup's token.
+        token: Token,
+        /// The lookup.
+        lookup: Lookup,
+    },
     /// Send this reply to a client.
     Answer(Answer),
     /// The engine no longer wants this exchange: stop carrying it. A
@@ -287,12 +303,13 @@ pub struct Session {
 ///    randomness except from the `entropy` argument.
 /// 2. Each `handle` call's `now` is at least the last one's. A driver calls
 ///    `handle(Input::Tick, now)` once `now` reaches [`next_deadline`].
-/// 3. Every [`Action::Send`] carries a token the engine never issued
-///    before, in its current generation.
+/// 3. Every [`Action::Send`] and [`Action::Lookup`] carries a token the
+///    engine never issued before, in its current generation.
 /// 4. A completion changes state only if its token is outstanding and of
 ///    the current generation, it came from the transmit's address over its
 ///    transport, and the reply's ID and question are the query's
-///    (RFC 5452 §9.1). Anything else changes nothing and emits
+///    (RFC 5452 §9.1); for a lookup, only if a response's question is the
+///    lookup's. Anything else changes nothing and emits
 ///    [`Event::Ignored`].
 /// 5. [`advance`] to a newer generation makes every outstanding exchange
 ///    obsolete: the engine abandons each, drops what the old generation

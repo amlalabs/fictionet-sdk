@@ -5,8 +5,8 @@
 //! The walk runs the same resolver engine the world runs, with Unbound's
 //! configuration and only IPv4, as Search's network has. The public
 //! resolver presets minimise and ask for DNSSEC records as that
-//! configuration does, so one walk holds what they ask too. Its questions go
-//! to the internet through [`Live`] and are kept by [`Capture`], so the
+//! configuration does, so one walk holds what they ask too. Its questions go,
+//! as lookups, to the internet through [`Live`] and are kept by [`Capture`], so the
 //! capture holds the priming, the referrals, the minimised steps, the DS
 //! and DNSKEY sets of each chain, and the addresses of name servers that
 //! referrals named without glue: what the world's resolvers ask when they
@@ -23,13 +23,15 @@ use std::time::SystemTime;
 
 use fictionet::stdlib::protocols::dns::dnssec::Ring;
 use fictionet::stdlib::protocols::dns::op::{Message, MessageType, OpCode, Query, ResponseCode};
-use fictionet::stdlib::protocols::dns::rr::{Name, RecordType};
+use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RecordType};
+use fictionet::stdlib::protocols::dns::{Parsed, Request};
 use fictionet::stdlib::services::dns::resolver::{Config, Resolver};
 use fictionet::stdlib::services::dns::{
-    Action, Client, ClientQuery, Engine, ExchangeFailure, Input, Token, Transmit, WallClock,
+    Action, Client, ClientQuery, Engine, ExchangeFailure, Input, Looked, Lookup, Token, Transmit,
+    WallClock,
 };
 use fictionet::stdlib::services::serve::Transport;
-use fictionet::stdlib::world::net::dns::{Source, carry};
+use fictionet::stdlib::world::net::dns::Upstream;
 use fictionet::sync::Mutex;
 use fictionet::{Cx, RaceError, Seed};
 use fictionet_extras::dns::{Capture, Replay};
@@ -111,20 +113,20 @@ fn fqdn(host: &str) -> Result<Name> {
     Ok(name)
 }
 
-/// One exchange the resolver started, on its way through the source.
+/// One exchange the resolver started, on its way through the upstream.
 struct Flight<'a> {
     token: Token,
-    /// What it brings back for the resolver ([`carry`]).
+    /// What it brings back for the resolver ([`flight`]).
     input: Pin<Box<dyn Future<Output = Option<Input>> + Send + 'a>>,
 }
 
 /// Resolves each of `names` for each of [`TYPES`] with Unbound's
-/// configuration, carrying the resolver's questions through `source` on
+/// configuration, carrying the resolver's questions through `upstream` on
 /// the run's real clock. Returns the questions that got an RCODE other
 /// than NOERROR.
 async fn walk(
     fcx: &Cx,
-    source: &impl Source,
+    upstream: &impl Upstream,
     names: &[Name],
 ) -> fictionet::Result<Vec<(Name, RecordType, ResponseCode)>> {
     let mut config = Config::unbound();
@@ -167,7 +169,7 @@ async fn walk(
                     token: transmit.token,
                     failure: ExchangeFailure::Unreachable,
                 }),
-                Action::Send(transmit) => flights.push(flight(fcx, source, transmit)),
+                Action::Send(transmit) => flights.push(flight(fcx, upstream, transmit)),
                 Action::Answer(answer) => {
                     open -= 1;
                     let rcode = Message::from_vec(&answer.bytes)
@@ -180,7 +182,7 @@ async fn walk(
                     }
                 }
                 Action::Abandon(token) => flights.retain(|flight| flight.token != token),
-                Action::Event(_) => {}
+                Action::Lookup { .. } | Action::Event(_) => {}
             }
         }
         if !inputs.is_empty() {
@@ -244,10 +246,47 @@ fn client_query(
     })
 }
 
-/// Starts carrying `transmit` through `source`.
-fn flight<'a>(fcx: &'a Cx, source: &'a impl Source, transmit: Transmit) -> Flight<'a> {
+/// Starts carrying `transmit` through `upstream`, as a lookup of its
+/// question at its server.
+///
+/// The walk's resolver does not say which zone it asks about, and a
+/// capture keeps only the server and the question, so each lookup names
+/// the root as its zone. The response goes back to the resolver written
+/// again with the query's ID and question, as the server's reply to it.
+/// A transmit that is no question gets nothing, and the resolver's
+/// deadline decides.
+fn flight<'a>(fcx: &'a Cx, upstream: &'a impl Upstream, transmit: Transmit) -> Flight<'a> {
+    let token = transmit.token;
+    let input = async move {
+        let Parsed::Request(request) = Request::parse(&transmit.bytes, transmit.transport) else {
+            return None;
+        };
+        let mut lookup = Lookup::new(
+            transmit.to,
+            LowerName::from(Name::root()),
+            &request.question,
+        );
+        lookup.recursion_desired = request.rd;
+        match upstream.lookup(fcx, lookup).await {
+            Looked::Response(mut response) => {
+                response.metadata.id = request.message.metadata.id;
+                response.queries = vec![request.question.clone()];
+                Some(Input::Reply {
+                    token,
+                    from: transmit.to,
+                    transport: transmit.transport,
+                    bytes: response.to_vec().ok()?,
+                })
+            }
+            Looked::Unreachable => Some(Input::Failed {
+                token,
+                failure: ExchangeFailure::Unreachable,
+            }),
+            Looked::NoReply => None,
+        }
+    };
     Flight {
-        token: transmit.token,
-        input: Box::pin(carry(source, fcx, transmit)),
+        token,
+        input: Box::pin(input),
     }
 }
