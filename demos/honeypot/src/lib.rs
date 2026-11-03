@@ -10,11 +10,12 @@
 //! MPTCP listeners on its open ports: SSH with an OpenSSH identification
 //! line and HTTP with nginx's default page ([`services`]). A SYN with
 //! MP_CAPABLE gets an RFC 8684 SYN-ACK with MP_CAPABLE and a key, and an
-//! MP_JOIN gets the RST with MP_TCPRST that RFC 8684 gives ([`mptcp`]).
-//! The internet reaches the host through an attachment called `internet`
-//! routed at [`Config::internet`] with `Net::route`. Sandboxes attached
-//! under any other name join the network as usual, and reach the host
-//! through its router.
+//! MP_JOIN is answered and then refused with MP_TCPRST as Linux answers
+//! and refuses it ([`mptcp`]). The internet reaches the host through an
+//! attachment called [`INTERNET`] routed at [`Config::internet`] with
+//! `Net::route`, and reaches nothing else: its packets for any other
+//! address are logged and dropped. Sandboxes attached under any other name
+//! join the network as usual, and reach the host through its router.
 //!
 //! Every packet that crosses any attachment, both ways, goes to a pcapng
 //! file, and a typed [`Observation`](observe::Observation) per SYN,
@@ -33,10 +34,12 @@
 //! | [`services`] | SSH and HTTP once a connection is open |
 //! | [`observe`] | The packet log and the observations |
 
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::task::Poll;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use fictionet::stdlib::network::ip;
 use fictionet::stdlib::network::ports::{Event, Ports};
 use fictionet::stdlib::world::net::{Host, Net};
 use fictionet::sync::Mutex;
@@ -112,10 +115,11 @@ pub fn network(fcx: &Cx, config: &Config, clock: Clock, tokens: &Arc<Tokens>) ->
             ),
         };
     }
-    Net::new()
-        .add_host(server)
-        .route("internet", config.internet)
+    Net::new().add_host(server).route(INTERNET, config.internet)
 }
+
+/// The name of the attachment the internet comes in by.
+pub const INTERNET: &str = "internet";
 
 /// A running honeypot, for looking at what it holds.
 #[derive(Clone)]
@@ -156,6 +160,7 @@ pub fn start(
     };
     let (attacher, inner) = fictionet::attachments();
     network(fcx, config, clock, &tokens).start(fcx, inner)?;
+    let address = config.address;
     fcx.spawn(move |fcx| async move {
         loop {
             let sandbox = attachments.next(&fcx).await?;
@@ -165,20 +170,24 @@ pub fn start(
                 continue;
             };
             let observer = observer.clone();
-            fcx.spawn(move |fcx| relay(fcx, sandbox, end, observer));
+            let only = (sandbox.name() == INTERNET).then_some(address);
+            fcx.spawn(move |fcx| relay(fcx, sandbox, end, observer, only));
         }
     });
     Ok(honeypot)
 }
 
 /// Passes packets between a sandbox and the network, writing each one
-/// first. Ends when either side closes. A write that fails ends the run:
-/// the honeypot does not run without its log.
+/// first. With `only`, a packet from the sandbox goes on only when it is
+/// for that address: the internet reaches the server and nothing else in
+/// the world. Ends when either side closes. A write that fails ends the
+/// run: the honeypot does not run without its log.
 async fn relay(
     fcx: Cx,
     sandbox: Attachment,
     end: End,
     observer: Arc<Mutex<Observer>>,
+    only: Option<IpAddr>,
 ) -> fictionet::Result {
     let name: Arc<str> = sandbox.name().into();
     let mut ports = Ports::new(vec![Box::new(sandbox) as Box<dyn Interface>, Box::new(end)]);
@@ -193,10 +202,17 @@ async fn relay(
                 observer
                     .lock()
                     .packet(&name, direction, &packet.0, fcx.now())?;
-                ports.send(1 - side, packet);
+                let allowed = direction == Direction::Out
+                    || only.is_none_or(|only| ip::destination(&packet.0) == Some(only));
+                if allowed {
+                    ports.send(1 - side, packet);
+                }
             }
             Event::Timer | Event::Extra => {}
-            Event::Closed(_) => return Ok(()),
+            Event::Closed(_) => {
+                observer.lock().detached(&name);
+                return Ok(());
+            }
         }
     }
 }

@@ -64,7 +64,7 @@ use fictionet::CancelWait;
 use fictionet::stdlib::network::ip::{
     Header, checksum,
     protocol::{ICMP, TCP},
-    strip_extension_headers,
+    strip_extension_headers, transport_checksum,
 };
 use fictionet::stdlib::network::{ConnError, Connection};
 use fictionet::time::{Duration, Instant};
@@ -88,6 +88,11 @@ const RELEASE_EVERY: Duration = Duration::from_secs(1);
 /// A connection whose peer sends nothing for this long while it waits for
 /// an answer (a SYN, unacknowledged data, a keepalive) is given up.
 const TIMEOUT: Duration = Duration::from_secs(120);
+/// A handshake whose last ACK has not come this long after its SYN is
+/// dropped without a RST, as Linux drops it: by default Linux resends the
+/// SYN-ACK five times (tcp_synack_retries), 1, 3, 7, 15 and 31 seconds
+/// after the first, and waits 32 seconds after the last.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(63);
 /// A connection whose handle was dropped is given up when the peer sends
 /// nothing for this long, for example in FIN-WAIT-2 with a peer that never
 /// closes its side.
@@ -97,7 +102,7 @@ const ORPHAN_TIMEOUT: Duration = Duration::from_secs(60);
 const KEEPALIVE: Duration = Duration::from_secs(45);
 /// Connections per port that have arrived but not been accepted yet,
 /// unless [`Options::backlog`] says otherwise. More connection attempts get
-/// a RST.
+/// SYN cookies.
 const BACKLOG: usize = 4096;
 /// The largest backlog [`Options::backlog`] allows.
 const MAX_BACKLOG: usize = 65_536;
@@ -111,14 +116,14 @@ const EPHEMERAL: u16 = 49152;
 /// seen in TIME-WAIT by housekeeping are forgotten first.
 const MAX_TIME_WAIT: usize = 1024;
 
-/// The option bytes [`Listener::answer_syn`] can add to a SYN-ACK: what
-/// the 40 bytes of option space leave beside the endpoint's own options.
+/// The option bytes a listener's [`Answer`] can add to a SYN-ACK or a RST:
+/// what the 40 bytes of option space leave beside the endpoint's own
+/// options.
 pub const SYN_OPTIONS_ROOM: usize = stcp::SYN_OPTIONS_ROOM;
 
-/// One option of a TCP header (RFC 9293 section 3.1): one a peer's SYN
-/// carried ([`TcpConnection::syn_options`]), or one a listener adds to
-/// its SYN-ACK ([`Listener::answer_syn`]). End of Option List is not one:
-/// the list just ends there.
+/// One option of a TCP header (RFC 9293 section 3.1): one a peer's SYN or
+/// ACK carried ([`Handshake`]), or one a listener adds to its SYN-ACK
+/// ([`Answer`]). End of Option List is not one: the list just ends there.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum TcpOption {
     /// No-Operation (kind 1), which pads the next option to a word.
@@ -139,8 +144,9 @@ pub enum TcpOption {
         /// TSecr, the TSval it echoes.
         tsecr: u32,
     },
-    /// Any other kind, such as MPTCP's 30 (RFC 8684), or Timestamps of a
-    /// length other than 10: the bytes after Kind and Length.
+    /// Any other kind, such as MPTCP's 30 (RFC 8684), or a known kind with
+    /// a Length its RFC does not define, which Linux ignores: the bytes
+    /// after Kind and Length.
     Unknown {
         /// The option's kind.
         kind: u8,
@@ -247,8 +253,34 @@ fn segment_options(segment: &[u8]) -> Arc<[TcpOption]> {
     }
 }
 
-/// How a listener answers one connection attempt: what
-/// [`Listener::answer_syn`] returns for its SYN.
+/// The options as they go on the wire, or `None` if they cannot be sent:
+/// more than [`SYN_OPTIONS_ROOM`] bytes, or one that would not read back
+/// as written.
+fn encode(options: &[TcpOption]) -> Option<Vec<u8>> {
+    let wire: Option<Vec<_>> = options.iter().map(TcpOption::to_wire).collect();
+    stcp::encode_options(&wire?).ok()
+}
+
+/// What a handshake carried, for a connection a listener accepted: what
+/// a listener's [`Answer::ack`] sees, and what the connection keeps
+/// ([`TcpConnection::handshake`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Handshake {
+    /// The options of the peer's SYN, in the order it sent them, up to the
+    /// first malformed one. `None` when the listener kept nothing of the
+    /// SYN, because its SYN-ACK was a SYN cookie (see [`Options::backlog`]),
+    /// and for a connection this side opened.
+    pub syn: Option<Arc<[TcpOption]>>,
+    /// The options the listener's [`Answer::syn`] added to its SYN-ACK, in
+    /// order. `None` as for `syn`.
+    pub syn_ack: Option<Arc<[TcpOption]>>,
+    /// The options of the ACK that completed the handshake, as `syn` reads
+    /// them. Empty for a connection this side opened.
+    pub ack: Arc<[TcpOption]>,
+}
+
+/// How a listener answers one connection attempt's SYN: what
+/// [`Answer::syn`] returns.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SynAnswer {
     /// Answer with a SYN-ACK that carries these options after the
@@ -256,13 +288,193 @@ pub enum SynAnswer {
     /// with no answer set.
     Accept(Vec<TcpOption>),
     /// Refuse with a RST that carries these options, as an MPTCP host
-    /// refuses a subflow with MP_TCPRST (RFC 8684 section 3.6). The
-    /// attempt never reaches `accept`.
+    /// refuses a subflow for a connection it does not know with MP_TCPRST
+    /// (RFC 8684 section 3.6). The attempt never reaches `accept`.
     Refuse(Vec<TcpOption>),
 }
 
-/// A function for [`Listener::answer_syn`], boxed.
-pub type AnswerSyn = Box<dyn Fn(&[TcpOption]) -> SynAnswer + Send>;
+/// How a listener answers the ACK that completes a handshake: what
+/// [`Answer::ack`] returns.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AckAnswer {
+    /// Take the connection: it goes to `accept`.
+    Accept,
+    /// Refuse it with a RST that carries these options, as an MPTCP host
+    /// refuses a subflow at its third ACK with MP_TCPRST (RFC 8684 sections
+    /// 3.2 and 3.6). The connection never reaches `accept`.
+    Refuse(Vec<TcpOption>),
+}
+
+/// A listener's say in its handshakes, set with [`Listener::answer`]: the
+/// options its SYN-ACKs carry, and which connections it refuses. A server
+/// for MPTCP (RFC 8684) answers MP_CAPABLE and MP_JOIN here.
+///
+/// Both run inside the endpoint with its lock held, so they must not use
+/// the endpoint or its connections. Any function from a SYN's options to a
+/// [`SynAnswer`] is an `Answer` that takes every connection at its ACK.
+pub trait Answer: Send {
+    /// How to answer a SYN with these options, once per attempt: a copy
+    /// of the SYN does not ask again.
+    fn syn(&self, syn: &[TcpOption]) -> SynAnswer;
+
+    /// Whether to take the connection whose handshake this is, when the
+    /// ACK that completes it arrives. The default takes every one.
+    fn ack(&self, handshake: &Handshake) -> AckAnswer {
+        let _ = handshake;
+        AckAnswer::Accept
+    }
+}
+
+impl<F: Fn(&[TcpOption]) -> SynAnswer + Send> Answer for F {
+    fn syn(&self, syn: &[TcpOption]) -> SynAnswer {
+        self(syn)
+    }
+}
+
+/// One arriving segment, as much as a reset in answer to it needs.
+#[derive(Clone, Copy)]
+struct Arrived {
+    /// Its source.
+    from: SocketAddr,
+    /// Its destination.
+    to: SocketAddr,
+    seq: u32,
+    /// Its acknowledgment number, when the ACK flag is set.
+    ack: Option<u32>,
+    /// SEG.LEN: its payload bytes, plus one each for SYN and FIN.
+    len: u32,
+}
+
+impl Arrived {
+    /// `t`, a segment from `from` to `to` that smoltcp parsed, with
+    /// `payload` bytes of data.
+    fn of(from: SocketAddr, to: SocketAddr, t: &[u8], payload: usize) -> Arrived {
+        let flags = t[13];
+        Arrived {
+            from,
+            to,
+            seq: u32::from_be_bytes([t[4], t[5], t[6], t[7]]),
+            ack: (flags & 0x10 != 0).then(|| u32::from_be_bytes([t[8], t[9], t[10], t[11]])),
+            len: payload as u32 + u32::from(flags & 0x02 != 0) + u32::from(flags & 0x01 != 0),
+        }
+    }
+
+    /// The RST that answers this segment when it may not open or join a
+    /// connection (RFC 9293 section 3.10.7.1): with the sequence number
+    /// the segment acknowledged, or with sequence number 0 and an ACK of
+    /// the segment when it had no ACK. It has window 0 and `options`, whole
+    /// options from [`encode`], as its only options, as a Linux host sends
+    /// one (tcp_v4_send_reset).
+    fn reset(&self, options: &[u8]) -> Vec<u8> {
+        let (seq, ack) = match self.ack {
+            Some(ack) => (ack, None),
+            None => (0, Some(self.seq.wrapping_add(self.len))),
+        };
+        segment(self.to, self.from, seq, ack, 0x04, 0, options)
+    }
+}
+
+/// A TCP segment with no payload from `from` to `to`, in an IP packet with
+/// the header [`packet`](fictionet::stdlib::network::ip::packet) writes.
+/// `flags` gets ACK added when there is an `ack`, and `options` are whole
+/// options, padded here with End of Option List.
+fn segment(
+    from: SocketAddr,
+    to: SocketAddr,
+    seq: u32,
+    ack: Option<u32>,
+    flags: u8,
+    window: u16,
+    options: &[u8],
+) -> Vec<u8> {
+    let area = options.len().div_ceil(4) * 4;
+    let mut t = vec![0; 20 + area];
+    t[0..2].copy_from_slice(&from.port().to_be_bytes());
+    t[2..4].copy_from_slice(&to.port().to_be_bytes());
+    t[4..8].copy_from_slice(&seq.to_be_bytes());
+    t[8..12].copy_from_slice(&ack.unwrap_or(0).to_be_bytes());
+    t[12] = ((20 + area) / 4) as u8 * 16;
+    t[13] = flags | if ack.is_some() { 0x10 } else { 0 };
+    t[14..16].copy_from_slice(&window.to_be_bytes());
+    t[20..20 + options.len()].copy_from_slice(options);
+    let sum = transport_checksum(from.ip(), to.ip(), TCP, &t);
+    t[16..18].copy_from_slice(&sum.to_be_bytes());
+    fictionet::stdlib::network::ip::packet(from.ip(), to.ip(), TCP, &t).0
+}
+
+/// The peer MSS values a SYN cookie can keep, as Linux's (msstab): the
+/// largest at most the peer's is kept. IPv4, then IPv6.
+const COOKIE_MSS: [[u16; 4]; 2] = [[536, 1300, 1440, 1460], [1220, 1420, 1440, 8940]];
+
+/// The key of an endpoint's SYN cookies.
+struct Cookies(ring::hmac::Key);
+
+impl Cookies {
+    /// Keyed by a hash of `seed`, the endpoint's random seed, so a world's
+    /// seed gives the same draws with SYN cookies as without.
+    fn new(seed: u64) -> Cookies {
+        let mut material = b"syn cookies ".to_vec();
+        material.extend_from_slice(&seed.to_be_bytes());
+        let key = ring::digest::digest(&ring::digest::SHA256, &material);
+        Cookies(ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key.as_ref()))
+    }
+
+    /// A cookie for a SYN from `remote` to `local` with sequence number
+    /// `irs`, made in `minute` and keeping the peer's MSS as index `mss`
+    /// of [`COOKIE_MSS`] (RFC 4987 section 3.6). Its low 2 bits hold `mss`,
+    /// the next 5 the low bits of `minute`, and the top 25 an HMAC-SHA256
+    /// of all of these, so a peer cannot make one.
+    fn make(&self, local: SocketAddr, remote: SocketAddr, irs: u32, minute: u64, mss: u8) -> u32 {
+        let mut message = Vec::with_capacity(48);
+        for end in [local, remote] {
+            match end.ip() {
+                IpAddr::V4(a) => message.extend_from_slice(&a.octets()),
+                IpAddr::V6(a) => message.extend_from_slice(&a.octets()),
+            }
+            message.extend_from_slice(&end.port().to_be_bytes());
+        }
+        message.extend_from_slice(&irs.to_be_bytes());
+        message.extend_from_slice(&minute.to_be_bytes());
+        message.push(mss);
+        let tag = ring::hmac::sign(&self.0, &message);
+        let t = tag.as_ref();
+        (u32::from_be_bytes([t[0], t[1], t[2], t[3]]) & !0x7f)
+            | ((minute as u32 & 0x1f) << 2)
+            | u32::from(mss)
+    }
+
+    /// The peer's MSS, if `cookie` is one [`make`](Cookies::make) gave for
+    /// this SYN in this minute or the one before, as Linux takes one up to
+    /// two minutes old (MAX_SYNCOOKIE_AGE).
+    fn check(
+        &self,
+        local: SocketAddr,
+        remote: SocketAddr,
+        irs: u32,
+        cookie: u32,
+        minute: u64,
+    ) -> Option<u16> {
+        let mss = (cookie & 3) as u8;
+        let made = [minute, minute.wrapping_sub(1)]
+            .into_iter()
+            .find(|m| (*m as u32 & 0x1f) == (cookie >> 2) & 0x1f)?;
+        (self.make(local, remote, irs, made, mss) == cookie)
+            .then(|| COOKIE_MSS[usize::from(local.is_ipv6())][usize::from(mss)])
+    }
+}
+
+/// The index in [`COOKIE_MSS`] of the largest MSS at most `mss`, the
+/// peer's: the smallest when it sent none or one below them all.
+fn cookie_mss(v6: bool, mss: Option<u16>) -> u8 {
+    let table = COOKIE_MSS[usize::from(v6)];
+    let mss = mss.unwrap_or(0);
+    table.iter().rposition(|&m| m <= mss).unwrap_or(0) as u8
+}
+
+/// The minute of the SYN cookie clock at `now`.
+fn cookie_minute(now: smoltcp::time::Instant) -> u64 {
+    now.total_micros().max(0) as u64 / 60_000_000
+}
 
 /// Starts TCP for a machine with address `addr`, on the TCP packets of
 /// `inner`.
@@ -279,9 +491,11 @@ pub type AnswerSyn = Box<dyn Fn(&[TcpOption]) -> SynAnswer + Send>;
 /// Each connection has 256 KiB buffers each way, a 1,500-byte MTU, no
 /// Nagle delay, and Reno congestion control. Each listening port holds up
 /// to the default [`backlog`](Options::backlog) of connections not yet
-/// accepted, including handshakes. [`endpoint_with`] takes other buffer
-/// sizes and backlogs, subject to the maximum and per-peer limits described
-/// in [`Options::backlog`]. Buffer memory is used only
+/// accepted, including handshakes, and answers further SYNs with SYN
+/// cookies. A handshake whose last ACK has not come 63 seconds after its
+/// SYN is dropped without a RST, as Linux drops it. [`endpoint_with`]
+/// takes other buffer sizes and backlogs, subject to the maximum and
+/// per-peer limits described in [`Options::backlog`]. Buffer memory is used only
 /// as data passes through: once a connection's buffers are empty, their
 /// pages go back to the system within about two seconds, though the
 /// connection stays open, and closing frees them. A connection gives up with
@@ -367,8 +581,18 @@ impl Options {
     /// limits. A separate limit allows at most 256 of these connections
     /// from one peer address, whatever the backlog. Further SYNs from that
     /// address are dropped until some of its connections are accepted or
-    /// give up. Otherwise, past the backlog, a connection attempt gets a
-    /// RST, as from a full listen queue.
+    /// give up.
+    ///
+    /// Past the backlog, a SYN gets a SYN cookie (RFC 4987 section 3.6), as
+    /// from Linux with a full SYN queue: a SYN-ACK whose sequence number
+    /// holds what the handshake needs, so the endpoint keeps nothing for
+    /// the attempt until the ACK that returns the cookie. The SYN-ACK
+    /// carries a Maximum Segment Size and what the listener's
+    /// [`Answer::syn`] adds, and nothing else. So such a connection has no
+    /// window scaling or SACK, and its [`Handshake`] has no SYN options.
+    /// When the connections waiting for `accept` alone fill the backlog,
+    /// SYNs and ACKs that return cookies are dropped, as Linux drops them
+    /// with a full accept queue.
     ///
     /// Each connection in the backlog has its buffers from its first SYN.
     /// Their pages cost memory only once data arrives, but each connection
@@ -435,8 +659,9 @@ pub fn prepare_endpoint(
     Prepared<impl Future<Output = fictionet::Result> + Send + 'static>,
 ) {
     let mut dev = Dev::default();
+    let random_seed = fcx.random_u64();
     let config = Config {
-        random_seed: fcx.random_u64(),
+        random_seed,
         ip_addr: addr.into(),
     };
     let iface = Iface::new(config, &mut dev, smol_now(fcx));
@@ -464,6 +689,7 @@ pub fn prepare_endpoint(
             driver: None,
             buffer: options.buffer,
             backlog: options.backlog,
+            cookies: Cookies::new(random_seed),
         }),
     });
     let driver = shared.clone();
@@ -580,6 +806,8 @@ struct State {
     buffer: usize,
     /// Connections per listening port not accepted yet: [`Options::backlog`].
     backlog: usize,
+    /// The key of this endpoint's SYN cookies.
+    cookies: Cookies,
 }
 
 /// One listening port.
@@ -594,8 +822,8 @@ struct Listen {
     /// How many of `embryonic` and `ready` each peer address has.
     per_peer: HashMap<IpAddr, usize>,
     waker: Option<Waker>,
-    /// Options for SYN-ACKs: [`Listener::answer_syn`].
-    answer: Option<AnswerSyn>,
+    /// Its say in its handshakes: [`Listener::answer`].
+    answer: Option<Box<dyn Answer>>,
 }
 
 impl Listen {
@@ -650,10 +878,10 @@ struct Conn {
     iss: Option<u32>,
     /// An ICMPv4 destination-unreachable code for this pending connect.
     unreachable: Option<u8>,
-    /// The options of the peer's SYN, for a connection a listener took.
-    syn: Arc<[TcpOption]>,
-    /// The options the listener's answer added to the SYN-ACK.
-    syn_ack: Arc<[TcpOption]>,
+    /// What the handshake carried, for a connection a listener took.
+    handshake: Handshake,
+    /// When a handshake still waiting for its last ACK is dropped.
+    gives_up: Option<smoltcp::time::Instant>,
     /// Kept until retirement or socket removal, after handle drop too: see
     /// [`TcpConnection::hold_until_gone`].
     held: Vec<Box<dyn std::any::Any + Send>>,
@@ -680,8 +908,8 @@ impl Conn {
             side,
             iss: None,
             unreachable: None,
-            syn: Arc::default(),
-            syn_ack: Arc::default(),
+            handshake: Handshake::default(),
+            gives_up: None,
             held: Vec::new(),
             gone: Vec::new(),
         }
@@ -1119,32 +1347,27 @@ impl State {
         let data = !repr.payload.is_empty();
         let src = SocketAddr::new(ip.src, u16::from_be_bytes([t[0], t[1]]));
         let dst = SocketAddr::new(ip.dst, u16::from_be_bytes([t[2], t[3]]));
+        let arrived = Arrived::of(src, dst, t, repr.payload.len());
         let flags = t[13];
         let (syn, rst, ack) = (flags & 6 == 2, flags & 4 != 0, flags & 16 != 0);
-        let mut listening = false;
-        let mut syn_options = Arc::default();
-        if syn
-            && !self.by_tuple.contains_key(&(dst, src))
-            && !ack
-            && let Some(l) = self.listeners.get(&dst.port())
-        {
-            if l.per_peer
-                .get(&src.ip())
-                .is_some_and(|&n| n >= BACKLOG_PER_PEER)
-            {
+        let new =
+            !self.by_tuple.contains_key(&(dst, src)) && self.listeners.contains_key(&dst.port());
+        // A SYN for a listener that smoltcp is to take: its options, and
+        // what the listener's answer adds to the SYN-ACK.
+        let mut attempt = None;
+        if new && syn && !ack {
+            let Some(taken) = self.attempt(arrived, t, now) else {
                 return false;
-            }
-            listening = true;
-            syn_options = segment_options(t);
-            if l.idle.is_empty() && l.embryonic.len() + l.ready.len() < self.backlog {
-                let mut s = new_socket(self.buffer);
-                s.0.listen(dst.port()).expect("a new socket can listen");
-                let h = self.add_socket(s);
-                self.listeners.get_mut(&dst.port()).unwrap().idle.push(h);
-            }
+            };
+            attempt = Some(taken);
+        }
+        if new && ack && !syn && !rst && !self.take_cookie(arrived, now) {
+            return false;
         }
         let handle = self.by_tuple.get(&(dst, src)).copied();
         let before = handle.map(|h| self.get(h).state());
+        // The options of an ACK that may complete a handshake.
+        let completing = (before == Some(TcpState::SynReceived)).then(|| segment_options(t));
         // A listening socket in an earlier slot must not take a SYN for
         // a tuple that already belongs to a connection.
         let mut idle = Vec::new();
@@ -1202,8 +1425,17 @@ impl State {
                     self.remove_socket(h);
                 }
             }
+            if let Some(ack) = completing
+                && !matches!(
+                    after,
+                    TcpState::SynReceived | TcpState::Listen | TcpState::Closed
+                )
+                && self.conns[&h].side == Side::Server
+            {
+                self.completed(h, arrived, ack);
+            }
         }
-        if listening {
+        if let Some((syn, added)) = attempt {
             // At most one idle socket took the SYN.
             let l = self.listeners.get_mut(&dst.port()).unwrap();
             let (sockets, handles) = (&self.sockets, &self.handles);
@@ -1218,35 +1450,191 @@ impl State {
                 let local = s.local_endpoint().map(SocketAddr::from).unwrap_or(dst);
                 let remote = s.remote_endpoint().map(SocketAddr::from).unwrap_or(src);
                 *l.per_peer.entry(remote.ip()).or_default() += 1;
-                let answer = l.answer.as_ref().map(|answer| answer(&syn_options));
+                let wire: Vec<_> = added.iter().filter_map(TcpOption::to_wire).collect();
+                self.sock(h)
+                    .set_syn_options(&wire)
+                    .expect("`attempt` checked that the answer can be sent");
                 let mut conn = Conn::new(local, remote, Side::Server);
-                conn.syn = syn_options;
-                if let Some(SynAnswer::Accept(options)) = &answer {
-                    conn.syn_ack = options.as_slice().into();
-                }
+                conn.handshake.syn = Some(syn);
+                conn.handshake.syn_ack = Some(added.into());
+                conn.gives_up = Some(now + HANDSHAKE_TIMEOUT.into());
                 self.conns.insert(h, conn);
                 self.by_tuple.insert((local, remote), h);
-                match answer {
-                    None => {}
-                    Some(SynAnswer::Accept(options)) => {
-                        let wire: Option<Vec<_>> = options.iter().map(TcpOption::to_wire).collect();
-                        let set = wire.map(|wire| self.sock(h).set_syn_options(&wire));
-                        if set != Some(Ok(())) {
-                            self.abort(h);
-                        }
-                    }
-                    Some(SynAnswer::Refuse(options)) => {
-                        // Options that cannot be sent leave a plain RST.
-                        let wire: Option<Vec<_>> = options.iter().map(TcpOption::to_wire).collect();
-                        if let Some(wire) = wire {
-                            let _ = self.sock(h).set_rst_options(&wire);
-                        }
-                        self.abort(h);
-                    }
-                }
             }
         }
         data
+    }
+
+    /// Answers a SYN for a listening port that no connection has. Returns
+    /// its options, and what the listener's [`Answer::syn`] adds to the
+    /// SYN-ACK, when smoltcp is to take it; a listening socket is ready to.
+    /// Otherwise the SYN has been dropped, refused with a RST, or answered
+    /// with a SYN cookie here, and smoltcp never sees it.
+    fn attempt(
+        &mut self,
+        arrived: Arrived,
+        t: &[u8],
+        now: smoltcp::time::Instant,
+    ) -> Option<(Arc<[TcpOption]>, Vec<TcpOption>)> {
+        let (src, dst) = (arrived.from, arrived.to);
+        let l = &self.listeners[&dst.port()];
+        if l.ready.len() >= self.backlog
+            || l.per_peer
+                .get(&src.ip())
+                .is_some_and(|&n| n >= BACKLOG_PER_PEER)
+        {
+            return None;
+        }
+        let syn = segment_options(t);
+        let added = match l.answer.as_ref().map(|answer| answer.syn(&syn)) {
+            None => Vec::new(),
+            Some(SynAnswer::Accept(added)) => added,
+            Some(SynAnswer::Refuse(refusal)) => {
+                // Options that cannot be sent leave a plain RST.
+                let options = encode(&refusal).unwrap_or_default();
+                self.dev.tx.push(arrived.reset(&options));
+                return None;
+            }
+        };
+        let Some(encoded) = encode(&added) else {
+            self.dev.tx.push(arrived.reset(&[]));
+            return None;
+        };
+        if l.embryonic.len() + l.ready.len() >= self.backlog {
+            let peer_mss = syn.iter().find_map(|o| match o {
+                TcpOption::MaxSegmentSize(mss) => Some(*mss),
+                _ => None,
+            });
+            let mss = cookie_mss(dst.is_ipv6(), peer_mss);
+            let iss = self
+                .cookies
+                .make(dst, src, arrived.seq, cookie_minute(now), mss);
+            let own_mss = MTU - if dst.is_ipv6() { 40 } else { 20 } - 20;
+            let mut options = vec![2, 4];
+            options.extend_from_slice(&(own_mss as u16).to_be_bytes());
+            options.extend_from_slice(&encoded);
+            let window = self.buffer.min(usize::from(u16::MAX)) as u16;
+            let ack = arrived.seq.wrapping_add(1);
+            self.dev
+                .tx
+                .push(segment(dst, src, iss, Some(ack), 0x02, window, &options));
+            return None;
+        }
+        if l.idle.is_empty() {
+            let mut s = new_socket(self.buffer);
+            s.0.listen(dst.port()).expect("a new socket can listen");
+            let h = self.add_socket(s);
+            self.listeners.get_mut(&dst.port()).unwrap().idle.push(h);
+        }
+        Some((syn, added))
+    }
+
+    /// Takes an ACK for a listening port that no connection has. When it
+    /// returns a SYN cookie this endpoint made, a connection opens for it in
+    /// SYN-RECEIVED, which the ACK then completes. Returns whether to go on
+    /// with the ACK: not when it returns a cookie but the connections
+    /// waiting for `accept` fill the backlog or its peer is at its limit.
+    fn take_cookie(&mut self, arrived: Arrived, now: smoltcp::time::Instant) -> bool {
+        let (src, dst) = (arrived.from, arrived.to);
+        let Some(ack) = arrived.ack else {
+            return true;
+        };
+        let (irs, iss) = (arrived.seq.wrapping_sub(1), ack.wrapping_sub(1));
+        let Some(mss) = self.cookies.check(dst, src, irs, iss, cookie_minute(now)) else {
+            return true;
+        };
+        let l = &self.listeners[&dst.port()];
+        if l.ready.len() >= self.backlog
+            || l.per_peer
+                .get(&src.ip())
+                .is_some_and(|&n| n >= BACKLOG_PER_PEER)
+        {
+            return false;
+        }
+        let mut s = new_socket(self.buffer);
+        s.0.listen(dst.port()).expect("a new socket can listen");
+        s.0.accept_syn_cookie(dst.into(), src.into(), irs, iss, mss, now);
+        let h = self.add_socket(s);
+        let l = self.listeners.get_mut(&dst.port()).unwrap();
+        l.embryonic.push(h);
+        *l.per_peer.entry(src.ip()).or_default() += 1;
+        let mut conn = Conn::new(dst, src, Side::Server);
+        conn.gives_up = Some(now + HANDSHAKE_TIMEOUT.into());
+        self.conns.insert(h, conn);
+        self.by_tuple.insert((dst, src), h);
+        true
+    }
+
+    /// The ACK `arrived`, with options `ack`, completed the handshake of
+    /// `h`, a connection a listener took. Its listener's [`Answer::ack`]
+    /// says whether it stays. One it takes waits for `accept` from now on,
+    /// so the next ACK that returns a SYN cookie counts it. One it refuses
+    /// gets a RST in answer to that ACK and is forgotten at once.
+    fn completed(&mut self, h: Id, arrived: Arrived, ack: Arc<[TcpOption]>) {
+        let c = self.conns.get_mut(&h).expect("a connection");
+        c.handshake.ack = ack;
+        c.gives_up = None;
+        let port = arrived.to.port();
+        let l = self.listeners.get_mut(&port).expect("a listener");
+        let refusal = match l.answer.as_ref().map(|a| a.ack(&self.conns[&h].handshake)) {
+            None | Some(AckAnswer::Accept) => None,
+            Some(AckAnswer::Refuse(refusal)) => Some(refusal),
+        };
+        if let Some(i) = l.embryonic.iter().position(|&e| e == h) {
+            l.embryonic.swap_remove(i);
+        }
+        let Some(refusal) = refusal else {
+            l.ready.push_back(h);
+            if let Some(w) = l.waker.take() {
+                w.wake();
+            }
+            return;
+        };
+        // Options that cannot be sent leave a plain RST.
+        let options = encode(&refusal).unwrap_or_default();
+        self.dev.tx.push(arrived.reset(&options));
+        if let Some(c) = self.conns.remove(&h) {
+            self.by_tuple.remove(&(c.local, c.remote));
+            l.left(c.remote.ip());
+        }
+        self.remove_socket(h);
+    }
+
+    /// Drops the handshakes still waiting for their last ACK
+    /// [`HANDSHAKE_TIMEOUT`] after their SYN, without a RST.
+    fn expire_handshakes(&mut self, now: smoltcp::time::Instant) {
+        let mut gone = Vec::new();
+        for l in self.listeners.values_mut() {
+            let mut i = 0;
+            while i < l.embryonic.len() {
+                let h = l.embryonic[i];
+                let gives_up = self.conns.get(&h).and_then(|c| c.gives_up);
+                let due = gives_up.is_some_and(|at| at <= now);
+                if !due || self.sockets.get(self.handles[&h]).state() != TcpState::SynReceived {
+                    i += 1;
+                    continue;
+                }
+                l.embryonic.swap_remove(i);
+                if let Some(c) = self.conns.remove(&h) {
+                    self.by_tuple.remove(&(c.local, c.remote));
+                    l.left(c.remote.ip());
+                }
+                gone.push(h);
+            }
+        }
+        for h in gone {
+            self.remove_socket(h);
+        }
+    }
+
+    /// When the next handshake waiting for its last ACK is due to be
+    /// dropped.
+    fn next_expiry(&self) -> Option<smoltcp::time::Instant> {
+        self.listeners
+            .values()
+            .flat_map(|l| &l.embryonic)
+            .filter_map(|h| self.conns.get(h)?.gives_up)
+            .min()
     }
 
     /// Moves finished handshakes to the accept queues and removes orphans
@@ -1260,8 +1648,13 @@ impl State {
             let mut moved = false;
             while i < l.embryonic.len() {
                 let h = l.embryonic[i];
-                match self.sockets.get(self.handles[&h]).state() {
+                let s = self.sockets.get(self.handles[&h]);
+                match s.state() {
                     TcpState::SynReceived => i += 1,
+                    // An aborted socket keeps its endpoint until smoltcp
+                    // sends its RST, which the output allowance may leave
+                    // for the next turn.
+                    TcpState::Closed if s.remote_endpoint().is_some() => i += 1,
                     // `ingress` takes back a socket a RST returns to LISTEN.
                     TcpState::Listen => {
                         l.embryonic.swap_remove(i);
@@ -1392,6 +1785,8 @@ async fn drive(fcx: &Cx, shared: &Shared, mut inner: impl Interface) {
             st.iface.poll_maintenance(now);
             received = batch.len();
             let st = &mut *st;
+            // Before egress, so a handshake given up sends nothing more.
+            st.expire_handshakes(now);
             // Stop consuming input when the output queue is full.
             while st.dev.tx.len() < EGRESS_PACKETS {
                 let Some(p) = batch.pop_front() else { break };
@@ -1428,7 +1823,10 @@ async fn drive(fcx: &Cx, shared: &Shared, mut inner: impl Interface) {
                 }
             }
             let at = st.iface.poll_at(now, &st.sockets);
-            [at, st.next_release].into_iter().flatten().min()
+            [at, st.next_release, st.next_expiry()]
+                .into_iter()
+                .flatten()
+                .min()
         };
         for p in out.drain(..) {
             inner.send(Packet(p));
@@ -1583,8 +1981,7 @@ impl Endpoint {
                 handle: h,
                 local,
                 remote: to,
-                syn_options: Arc::default(),
-                syn_ack_options: Arc::default(),
+                handshake: Handshake::default(),
                 read_wait: CancelWait::default(),
                 write_wait: CancelWait::default(),
             }
@@ -1629,30 +2026,33 @@ pub struct Listener {
 }
 
 impl Listener {
-    /// Answers each connection attempt from now on by the options of its
-    /// SYN. [`SynAnswer::Accept`] adds options to the SYN-ACK and its
-    /// retransmissions, after the endpoint's own (Maximum Segment Size, and
-    /// Window Scale and SACK-Permitted when the SYN offered them).
-    /// [`SynAnswer::Refuse`] resets the attempt with a RST that carries
-    /// options. A server for MPTCP (RFC 8684) answers an MP_CAPABLE option
-    /// with its own here, and refuses an MP_JOIN it will not take with
-    /// MP_TCPRST. `answer` runs once per attempt: a copy of the SYN does
-    /// not run it again. The accepted connection keeps what was added
-    /// ([`TcpConnection::syn_ack_options`]).
+    /// Answers each connection attempt from now on with `answer`.
     ///
-    /// `answer` runs inside the endpoint with its lock held, so it must not
-    /// use the endpoint or its connections. The options it returns must
-    /// fit in [`SYN_OPTIONS_ROOM`] bytes and read back as written: an
-    /// [`Unknown`](TcpOption::Unknown) option may not have kind 0 or 1 or
-    /// the bytes of a known option, and SACK has one to four blocks.
-    /// Otherwise an accepted attempt gets a RST, and a refused one a RST
+    /// [`Answer::syn`] sees each SYN's options. [`SynAnswer::Accept`] adds
+    /// options to the SYN-ACK and its retransmissions, after the endpoint's
+    /// own (Maximum Segment Size, and Window Scale and SACK-Permitted when
+    /// the SYN offered them), or after the Maximum Segment Size of a SYN
+    /// cookie. [`SynAnswer::Refuse`] resets the attempt.
+    ///
+    /// [`Answer::ack`] sees the [`Handshake`] when the ACK that completes it
+    /// arrives, and [`AckAnswer::Refuse`] resets the connection then. The
+    /// accepted connection keeps its handshake
+    /// ([`TcpConnection::handshake`]).
+    ///
+    /// A refusal's RST answers the segment refused, as RFC 9293 section
+    /// 3.10.7.1 forms a reset, with window 0 and the refusal's options as
+    /// its only options, as a Linux host sends one. The options either
+    /// returns must fit in [`SYN_OPTIONS_ROOM`] bytes and read back as
+    /// written: an [`Unknown`](TcpOption::Unknown) option may not have kind
+    /// 0 or 1 or the bytes of a known option, and SACK has one to four
+    /// blocks. Otherwise an accepted attempt gets a RST, and a refusal a RST
     /// without them.
-    pub fn answer_syn(&mut self, answer: impl Fn(&[TcpOption]) -> SynAnswer + Send + 'static) {
+    pub fn answer(&mut self, answer: Box<dyn Answer>) {
         let mut st = self.shared.state.lock();
         st.listeners
             .get_mut(&self.port)
             .expect("a listener has its port")
-            .answer = Some(Box::new(answer));
+            .answer = Some(answer);
     }
 
     /// Waits for the next connection.
@@ -1666,7 +2066,7 @@ impl Listener {
     /// [`Options::backlog`] for the default, maximum and separate per-peer
     /// limit. SYNs from a peer already at its limit are dropped until some
     /// of its connections are accepted or give up. Otherwise, past the
-    /// backlog, connection attempts get a RST.
+    /// backlog, connection attempts get SYN cookies.
     pub async fn accept(&mut self, fcx: &Cx) -> Result<TcpConnection, ConnError> {
         let port = self.port;
         let shared = &self.shared;
@@ -1687,7 +2087,7 @@ impl Listener {
                 if let Some(h) = l.ready.pop_front() {
                     let c = &st.conns[&h];
                     let (local, remote) = (c.local, c.remote);
-                    let (syn_options, syn_ack_options) = (c.syn.clone(), c.syn_ack.clone());
+                    let handshake = c.handshake.clone();
                     st.listeners
                         .get_mut(&port)
                         .expect("a listener has its port")
@@ -1697,8 +2097,7 @@ impl Listener {
                         handle: h,
                         local,
                         remote,
-                        syn_options,
-                        syn_ack_options,
+                        handshake,
                         read_wait: CancelWait::default(),
                         write_wait: CancelWait::default(),
                     }));
@@ -1734,12 +2133,8 @@ impl fictionet::stdlib::network::Accepted for TcpConnection {
         TcpConnection::peer_addr(self)
     }
 
-    fn syn_options(&self) -> Arc<[TcpOption]> {
-        TcpConnection::syn_options(self)
-    }
-
-    fn syn_ack_options(&self) -> Arc<[TcpOption]> {
-        TcpConnection::syn_ack_options(self)
+    fn handshake(&self) -> Handshake {
+        TcpConnection::handshake(self).clone()
     }
 
     fn reset(self) {
@@ -1777,8 +2172,7 @@ pub struct TcpConnection {
     handle: Id,
     local: SocketAddr,
     remote: SocketAddr,
-    syn_options: Arc<[TcpOption]>,
-    syn_ack_options: Arc<[TcpOption]>,
+    handshake: Handshake,
     read_wait: CancelWait,
     write_wait: CancelWait,
 }
@@ -1794,18 +2188,10 @@ impl TcpConnection {
         self.local
     }
 
-    /// The options of the SYN that opened the connection, in the order the
-    /// peer sent them, for one a listener accepted. Empty for one this side
-    /// opened.
-    pub fn syn_options(&self) -> Arc<[TcpOption]> {
-        self.syn_options.clone()
-    }
-
-    /// The options the listener's [answer](Listener::answer_syn) added to
-    /// the SYN-ACK, in order. Empty when it added none, and for a
-    /// connection this side opened.
-    pub fn syn_ack_options(&self) -> Arc<[TcpOption]> {
-        self.syn_ack_options.clone()
+    /// What the handshake that opened the connection carried, for one a
+    /// listener accepted. Empty for one this side opened.
+    pub fn handshake(&self) -> &Handshake {
+        &self.handshake
     }
 
     /// Closes the connection with a RST immediately and wakes disappearance
@@ -2682,7 +3068,11 @@ mod tests {
                 for fault in [
                     "empty_checksum", "checksum", "ack", "offset", "options", "flags", "ip", "none",
                 ] {
-                    if matches!(fault, "none" | "flags") && !established || fault == "ip" && local.is_ipv6() {
+                    // A SYN-ACK whose options end at a malformed one is
+                    // taken with those before it, as Linux takes it.
+                    if matches!(fault, "none" | "flags" | "options") && !established
+                        || fault == "ip" && local.is_ipv6()
+                    {
                         continue;
                     }
                     // This origin would put the receive edge at the first real byte.
@@ -2884,8 +3274,7 @@ mod tests {
                     handle: h,
                     local,
                     remote: peer,
-                    syn_options: Arc::default(),
-                    syn_ack_options: Arc::default(),
+                    handshake: Handshake::default(),
                     read_wait: CancelWait::default(),
                     write_wait: CancelWait::default(),
                 };
@@ -3528,9 +3917,11 @@ mod tests {
     }
 
     /// A listening port holds at most its backlog of connections not
-    /// accepted yet. Further SYNs get a RST.
+    /// accepted yet. Further SYNs get SYN cookies, until the connections
+    /// waiting for accept alone fill the backlog: then SYNs, and ACKs that
+    /// return cookies, are dropped until accept takes one.
     #[test]
-    fn syns_past_the_backlog_get_a_rst() {
+    fn syns_past_the_backlog_get_cookies_until_accept_falls_behind() {
         assert_eq!(Options::default().backlog, 4096);
         assert_eq!(
             (
@@ -3539,7 +3930,7 @@ mod tests {
             ),
             (1, MAX_BACKLOG)
         );
-        let result = block_on(run(fictionet::Seed::random(), |fcx| async move {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
             let (mut raw, side) = pair();
             let server = endpoint_with(
                 &fcx,
@@ -3547,31 +3938,51 @@ mod tests {
                 "10.0.0.1".parse().unwrap(),
                 Options::default().backlog(4),
             );
-            let _listener = server.listen(80)?;
+            let mut listener = server.listen(80)?;
             let to: SocketAddr = "10.0.0.1:80".parse().unwrap();
+            let from = |port| SocketAddr::new("10.0.0.2".parse().unwrap(), port);
             for port in 1000..1010u16 {
-                raw.send(segment(
-                    SocketAddr::new("10.0.0.2".parse().unwrap(), port),
-                    to,
-                    7,
-                    0,
-                    0x02,
-                ));
+                raw.send(segment(from(port), to, 7, 0, 0x02));
             }
-            let (mut syn_acks, mut rsts) = (0, 0);
-            while syn_acks + rsts < 10 {
+            let mut iss = BTreeMap::new();
+            while iss.len() < 10 {
                 let p = raw.recv(&fcx).await?;
                 let t = Header::parse_whole(&p.0).unwrap().payload(&p.0).to_vec();
-                match t[13] {
-                    0x12 => syn_acks += 1,
-                    f if f & 0x04 != 0 => rsts += 1,
-                    f => panic!("flags {f:#x}"),
-                }
+                assert_eq!(t[13], 0x12, "a SYN-ACK");
+                let port = u16::from_be_bytes([t[2], t[3]]);
+                iss.insert(port, u32::from_be_bytes([t[4], t[5], t[6], t[7]]));
             }
-            assert_eq!((syn_acks, rsts), (4, 6));
-            Err::<(), fictionet::Error>(fictionet::Error::msg("done"))
-        }));
-        assert_eq!(result.unwrap_err().to_string(), "done");
+            for (&port, &iss) in &iss {
+                raw.send(segment(from(port), to, 8, iss.wrapping_add(1), 0x10));
+            }
+            /// Whether a second passes with nothing from the endpoint.
+            async fn quiet(fcx: &Cx, raw: &mut crate::End) -> bool {
+                let deadline = fcx.now() + Duration::from_secs(1);
+                fcx.race(Some(deadline), raw.recv(fcx)).await.is_err()
+            }
+            assert!(
+                quiet(&fcx, &mut raw).await,
+                "cookie ACKs past a full queue are dropped"
+            );
+            assert_eq!(server.shared.state.lock().listeners[&80].ready.len(), 4);
+            raw.send(segment(from(2000), to, 7, 0, 0x02));
+            assert!(
+                quiet(&fcx, &mut raw).await,
+                "a SYN to a full queue is dropped"
+            );
+
+            let first = listener.accept(&fcx).await?;
+            assert_eq!(first.peer_addr().port(), 1000);
+            raw.send(segment(from(1009), to, 8, iss[&1009].wrapping_add(1), 0x10));
+            let mut ports = Vec::new();
+            for _ in 0..4 {
+                ports.push(listener.accept(&fcx).await?.peer_addr().port());
+            }
+            assert_eq!(ports, [1001, 1002, 1003, 1009]);
+            fcx.cancel();
+            Ok(())
+        }))
+        .unwrap();
     }
 
     /// A burst of handshakes that the peer resets in SYN-RECEIVED leaves

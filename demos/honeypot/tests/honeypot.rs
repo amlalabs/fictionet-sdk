@@ -12,7 +12,7 @@ use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::network::ip::{Fields, packet_with, transport_checksum};
 use fictionet::stdlib::network::tcp::{self, TcpOption};
 use fictionet::stdlib::protocols::mptcp::{
-    self, Capable, Join, Keys, MptcpOption, algorithm, reason, token,
+    self, Capable, Join, Keys, MptcpOption, algorithm, join_hmac, reason, token,
 };
 use fictionet::{Cx, End, Interface, InterfaceExt, Packet};
 use honeypot_world::config::{Burst, DEFAULT_ADDRESS};
@@ -396,8 +396,10 @@ fn a_plain_syn_gets_ssh() {
 }
 
 /// An MP_CAPABLE SYN gets MP_CAPABLE back with a key. While that
-/// connection is open, an MP_JOIN with its token is refused as
-/// "administratively prohibited"; once it is gone, as an unknown token.
+/// connection is open, an MP_JOIN with its token gets a SYN-ACK with
+/// MP_JOIN and the listener's HMAC, as from Linux, and is refused at its
+/// third ACK as "administratively prohibited"; once it is gone, a join is
+/// refused at its SYN as an unknown token.
 #[test]
 fn mp_capable_gets_a_key_and_joins_are_refused() {
     honeypot(Config::default(), |mut net| async move {
@@ -441,9 +443,40 @@ fn mp_capable_gets_a_key_and_joins_are_refused() {
         let joiner = client(2, 40002);
         let join = with_mss(&mptcp_bytes(join_syn(token(key), 99)));
         net.send(segment(joiner, server(80), 7000, 0, SYN, &join, b""));
+        let join_syn_ack = net.recv().await.expect("a SYN-ACK");
+        assert_eq!(flags(&join_syn_ack), SYN | ACK);
+        assert_eq!(ack_of(&join_syn_ack), 7001);
+        let [
+            MptcpOption::Join(Join::SynAck {
+                backup: false,
+                address_id: 0,
+                hmac,
+                random,
+            }),
+        ] = mptcp_of(&join_syn_ack)[..]
+        else {
+            panic!("one MP_JOIN: {:?}", mptcp_of(&join_syn_ack));
+        };
+        // HMAC-B: keyed with the listener's key then the client's, over
+        // the listener's random number then the client's.
+        assert_eq!(hmac[..], join_hmac(key, client_key, random, 99)[..8]);
+        let join_iss = seq_of(&join_syn_ack);
+        let hmac_a = join_hmac(client_key, key, 99, random);
+        let third = mptcp_bytes(MptcpOption::Join(Join::Ack {
+            hmac: hmac_a[..20].try_into().unwrap(),
+        }));
+        net.send(segment(
+            joiner,
+            server(80),
+            7001,
+            join_iss + 1,
+            ACK,
+            &third,
+            b"",
+        ));
         let refused = net.recv().await.expect("a RST");
-        assert_eq!(flags(&refused) & (SYN | RST), RST);
-        assert_eq!(ack_of(&refused), 7001);
+        assert_eq!(flags(&refused), RST, "a RST in answer to the ACK");
+        assert_eq!(seq_of(&refused), join_iss + 1);
         assert_eq!(
             mptcp_of(&refused),
             [MptcpOption::TcpRst {
@@ -451,6 +484,7 @@ fn mp_capable_gets_a_key_and_joins_are_refused() {
                 reason: reason::ADMINISTRATIVELY_PROHIBITED
             }]
         );
+        assert_eq!(net.honeypot.mptcp_connections(), 1, "the join took nothing");
 
         // The client ends the first connection with a RST; its token goes.
         net.send(segment(from, server(80), 5001, 0, RST, &[], b""));
@@ -501,6 +535,41 @@ fn mp_capable_gets_a_key_and_joins_are_refused() {
             format!("{client_key:016x}")
         );
         assert_eq!(third["mptcp"][0]["receiver_key"], format!("{key:016x}"));
+        // So are the join's SYN-ACK and its third ACK, with their HMACs.
+        assert_eq!(answers[1]["mptcp"][0]["subtype"], "mp_join_syn_ack");
+        assert_eq!(answers[1]["mptcp"][0]["hmac"], hex(&hmac));
+        let join_ack = net
+            .events("segment")
+            .into_iter()
+            .find(|s| s["mptcp"][0]["subtype"] == "mp_join_ack")
+            .expect("the join's third ACK");
+        assert_eq!(join_ack["mptcp"][0]["hmac"], hex(&hmac_a[..20]));
+        Ok(())
+    });
+}
+
+/// MP_CAPABLE of a version above 1 gets version 1 back, as Linux answers
+/// it.
+#[test]
+fn a_higher_mptcp_version_gets_version_1() {
+    honeypot(Config::default(), |mut net| async move {
+        let from = client(2, 40010);
+        let offer = [30, 4, 0x02, 0x01];
+        net.send(segment(
+            from,
+            server(80),
+            5000,
+            0,
+            SYN,
+            &with_mss(&offer),
+            b"",
+        ));
+        let syn_ack = net.recv().await.expect("a SYN-ACK");
+        let [MptcpOption::Capable(answer)] = mptcp_of(&syn_ack)[..] else {
+            panic!("one MP_CAPABLE: {:?}", mptcp_of(&syn_ack));
+        };
+        assert_eq!(answer.version, 1);
+        assert!(matches!(answer.keys, Keys::Sender(_)));
         Ok(())
     });
 }
@@ -548,6 +617,14 @@ fn a_burst_of_joins_is_flagged_once() {
         }
         net.drain().await;
         assert_eq!(net.events("burst").len(), 2);
+        // Its SYNs are further apart than the window, so none gives a gap.
+        let slow: Vec<_> = net
+            .events("syn")
+            .into_iter()
+            .filter(|s| s["src"].as_str().unwrap().starts_with("198.51.100.4:"))
+            .collect();
+        assert_eq!(slow.len(), 10);
+        assert!(slow.iter().all(|s| s.get("gap_us").is_none()), "{slow:?}");
         Ok(())
     });
 }
@@ -557,12 +634,28 @@ fn a_burst_of_joins_is_flagged_once() {
 #[test]
 fn malformed_options_are_logged_and_survived() {
     honeypot(Config::default(), |mut net| async move {
-        // An option whose Length runs past the header: the world's TCP
-        // drops the SYN, and the log keeps what read.
+        // An option whose Length runs past the header: as on Linux, the
+        // options end there and the SYN is answered, and the log keeps
+        // what read.
         let from = client(5, 43000);
         let runs_past = with_mss(&[30, 12, 0x01, 0x81]);
         net.send(segment(from, server(22), 1, 0, SYN, &runs_past, b""));
-        assert!(net.recv().await.is_none(), "a malformed SYN is dropped");
+        let syn_ack = net.recv().await.expect("a SYN-ACK");
+        assert_eq!(flags(&syn_ack), SYN | ACK);
+        assert!(mptcp_of(&syn_ack).is_empty());
+        // So is MSS of Length 3, which Linux ignores.
+        let odd_mss = [2, 3, 5, 0xb4];
+        net.send(segment(
+            client(5, 43005),
+            server(22),
+            1,
+            0,
+            SYN,
+            &odd_mss,
+            b"",
+        ));
+        let syn_ack = net.recv().await.expect("a SYN-ACK");
+        assert_eq!(flags(&syn_ack), SYN | ACK);
         // An MPTCP option with an unassigned subtype: plain TCP.
         let odd = with_mss(&[30, 4, 0x90, 0]);
         net.send(segment(client(5, 43001), server(22), 1, 0, SYN, &odd, b""));
@@ -627,16 +720,21 @@ fn malformed_options_are_logged_and_survived() {
             first["options"],
             serde_json::json!([{"kind": "mss", "value": 1460}])
         );
+        assert_eq!(syns[1]["options_fault"], "malformed");
         assert_eq!(
-            syns[1]["mptcp"][0],
+            syns[1]["options"],
+            serde_json::json!([{"kind": "other", "number": 2, "data": "05"}])
+        );
+        assert_eq!(
+            syns[2]["mptcp"][0],
             serde_json::json!({
                 "subtype": "malformed",
                 "fault": {"fault": "subtype", "subtype": 9},
                 "data": "9000"
             })
         );
-        assert_eq!(syns[2]["mptcp"][0]["fault"]["fault"], "length");
-        assert_eq!(syns[3]["mptcp"][0]["fault"]["fault"], "no_algorithm");
+        assert_eq!(syns[3]["mptcp"][0]["fault"]["fault"], "length");
+        assert_eq!(syns[4]["mptcp"][0]["fault"]["fault"], "no_algorithm");
         assert!(
             net.events("syn")
                 .iter()
@@ -734,4 +832,266 @@ fn an_attached_sandbox_is_logged_too() {
         },
     ))
     .unwrap();
+}
+
+/// Where a packet from the world goes.
+fn dst_of(p: &Packet) -> SocketAddr {
+    let ip: [u8; 4] = p.0[16..20].try_into().unwrap();
+    let port = u16::from_be_bytes(tcp_of(p)[2..4].try_into().unwrap());
+    SocketAddr::new(Ipv4Addr::from(ip).into(), port)
+}
+
+/// Spoofed SYNs that fill the backlog do not shut the real attacker out:
+/// past the backlog the server answers with SYN cookies, as Linux does, so
+/// a handshake that finishes still opens, with MPTCP, and is logged. Each
+/// spoofed attempt gets six SYN-ACKs, as from Linux, and is dropped
+/// without a RST.
+#[test]
+fn a_spoofed_syn_flood_leaves_room_for_the_real_attacker() {
+    honeypot(Config::default(), |mut net| async move {
+        let spoofed = |n: u32| SocketAddr::new(IpAddr::V4(Ipv4Addr::from(0x0b00_0000 + n)), 50000);
+        for n in 0..4096 {
+            net.send(segment(
+                spoofed(n),
+                server(22),
+                n,
+                0,
+                SYN,
+                &with_mss(&[]),
+                b"",
+            ));
+        }
+        net.fcx.sleep(Duration::from_secs(60)).await?;
+
+        // Window Scale and SACK-Permitted too, which a SYN-ACK that keeps
+        // state answers and a SYN cookie cannot.
+        let from = client(5, 43100);
+        let mut offer = with_mss(&[3, 3, 7, 4, 2]);
+        offer.extend_from_slice(&mptcp_bytes(linux_capable()));
+        net.send(segment(from, server(22), 1000, 0, SYN, &offer, b""));
+        let mut seen = Vec::new();
+        let syn_ack = loop {
+            let p = net.recv().await.expect("an answer");
+            seen.push(p.clone());
+            if dst_of(&p) == from {
+                break p;
+            }
+        };
+        assert_eq!(flags(&syn_ack), SYN | ACK);
+        let kinds: Vec<u8> = tcp::options(tcp_of(&syn_ack))
+            .unwrap()
+            .iter()
+            .map(|o| match o {
+                TcpOption::MaxSegmentSize(_) => 2,
+                TcpOption::Unknown { kind, .. } => *kind,
+                other => panic!("a SYN cookie has no {other:?}"),
+            })
+            .collect();
+        assert_eq!(kinds, [2, mptcp::KIND], "a SYN cookie");
+        let [MptcpOption::Capable(answer)] = mptcp_of(&syn_ack)[..] else {
+            panic!("MP_CAPABLE: {:?}", mptcp_of(&syn_ack));
+        };
+        let Keys::Sender(key) = answer.keys else {
+            panic!("a key")
+        };
+        let third = mptcp_bytes(MptcpOption::Capable(Capable {
+            keys: Keys::Both {
+                sender: 0x1111,
+                receiver: key,
+            },
+            ..answer
+        }));
+        let iss = seq_of(&syn_ack);
+        net.send(segment(from, server(22), 1001, iss + 1, ACK, &third, b""));
+        let banner = loop {
+            let p = net.recv().await.expect("the banner");
+            seen.push(p.clone());
+            if dst_of(&p) == from && !payload_of(&p).is_empty() {
+                break p;
+            }
+        };
+        assert_eq!(payload_of(&banner), SSH_BANNER);
+        assert_eq!(net.honeypot.mptcp_connections(), 1, "MPTCP after a cookie");
+        let hello = b"SSH-2.0-Go\r\n";
+        let acked = iss + 1 + SSH_BANNER.len() as u32;
+        net.send(segment(
+            from,
+            server(22),
+            1001,
+            acked,
+            PSH | ACK,
+            &[],
+            hello,
+        ));
+
+        // The rest of the spoofed SYN-ACKs, then quiet.
+        let fcx = net.fcx.clone();
+        while let Ok(p) = fcx
+            .race(
+                Some(fcx.now() + Duration::from_secs(40)),
+                net.end.recv(&fcx),
+            )
+            .await
+        {
+            seen.push(p?);
+        }
+        assert!(seen.iter().all(|p| flags(p) & RST == 0), "no RST");
+        for n in [0, 4095] {
+            let syn_acks = seen.iter().filter(|p| dst_of(p) == spoofed(n)).count();
+            assert_eq!(syn_acks, 6, "SYN-ACKs to spoofed source {n}");
+        }
+        let logged = net
+            .events("segment")
+            .into_iter()
+            .any(|s| s["src"] == from.to_string() && s["payload"] == hex(hello));
+        assert!(logged, "the attacker's bytes are logged");
+        Ok(())
+    });
+}
+
+/// The internet reaches the server and nothing else: not an attached
+/// sandbox by its address, not the network's DNS, and not any address
+/// beyond. What it sends is still logged.
+#[test]
+fn the_internet_reaches_only_the_server() {
+    fictionet::block_on(fictionet::lab(
+        fictionet::Seed::from_u64(9),
+        |fcx| async move {
+            let (attacher, attachments) = fictionet::attachments();
+            let log = Shared::default();
+            let sinks = Sinks {
+                log: Box::new(log.clone()),
+                pcap: Box::new(std::io::sink()),
+            };
+            honeypot_world::start(
+                &fcx,
+                &Config::default(),
+                Clock::at_unix_secs(EPOCH),
+                sinks,
+                attachments,
+            )?;
+            let mut agent = attacher.attach("agent")?;
+            let mut internet = attacher.attach(honeypot_world::INTERNET)?;
+            let within = |fcx: &Cx| Some(fcx.now() + Duration::from_secs(2));
+            let agent_addr = Ipv4Addr::new(10, 0, 0, 2);
+            let own = SocketAddr::new(agent_addr.into(), 45000);
+            agent.send(segment(own, server(22), 1, 0, SYN, &with_mss(&[]), b""));
+            let syn_ack = fcx.race(within(&fcx), agent.recv(&fcx)).await??;
+            assert_eq!(flags(&syn_ack), SYN | ACK);
+
+            let spoofed = SocketAddr::new(agent_addr.into(), 45001);
+            internet.send(segment(spoofed, server(22), 1, 0, SYN, &with_mss(&[]), b""));
+            // A DNS query for a.test to the network's resolver.
+            let (asker, resolver): (SocketAddr, SocketAddr) = (
+                "192.0.2.99:5353".parse().unwrap(),
+                "10.0.0.1:53".parse().unwrap(),
+            );
+            let query = [
+                0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, b'a', 4, b't', b'e', b's', b't', 0, 0,
+                1, 0, 1,
+            ];
+            let mut u = Vec::new();
+            u.extend_from_slice(&asker.port().to_be_bytes());
+            u.extend_from_slice(&resolver.port().to_be_bytes());
+            u.extend_from_slice(&(8 + query.len() as u16).to_be_bytes());
+            u.extend_from_slice(&[0, 0]);
+            u.extend_from_slice(&query);
+            let sum = transport_checksum(asker.ip(), resolver.ip(), 17, &u);
+            u[6..8].copy_from_slice(&sum.to_be_bytes());
+            internet.send(packet_with(
+                asker.ip(),
+                resolver.ip(),
+                17,
+                Fields::default(),
+                &u,
+            ));
+            let beyond: SocketAddr = "8.8.8.8:53".parse().unwrap();
+            let from = client(9, 40000);
+            internet.send(segment(from, beyond, 1, 0, SYN, &with_mss(&[]), b""));
+            assert!(
+                fcx.race(within(&fcx), internet.recv(&fcx)).await.is_err(),
+                "nothing comes back"
+            );
+            // The agent's own SYN-ACK may come again, and nothing else.
+            while let Ok(p) = fcx.race(within(&fcx), agent.recv(&fcx)).await {
+                assert_eq!(dst_of(&p?), own);
+            }
+
+            let from = client(9, 40001);
+            internet.send(segment(from, server(22), 1, 0, SYN, &with_mss(&[]), b""));
+            let syn_ack = fcx.race(within(&fcx), internet.recv(&fcx)).await??;
+            assert_eq!((flags(&syn_ack), dst_of(&syn_ack)), (SYN | ACK, from));
+
+            let log = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+            let syns: Vec<Value> = log
+                .lines()
+                .map(|l| serde_json::from_str::<Value>(l).unwrap())
+                .filter(|v| v["event"] == "syn" && v["attachment"] == "internet")
+                .collect();
+            let dsts: Vec<&str> = syns.iter().map(|s| s["dst"].as_str().unwrap()).collect();
+            assert_eq!(dsts, ["203.0.113.10:22", "8.8.8.8:53", "203.0.113.10:22"]);
+            fcx.cancel();
+            Ok(())
+        },
+    ))
+    .unwrap();
+}
+
+/// A SYN sent as two IP fragments is answered once whole, and logged
+/// whole, as the world takes it.
+#[test]
+fn a_fragmented_syn_is_logged() {
+    honeypot(Config::default(), |mut net| async move {
+        let from = client(8, 47000);
+        let syn = segment(
+            from,
+            server(22),
+            1000,
+            0,
+            SYN,
+            &with_mss(&mptcp_bytes(linux_capable())),
+            b"",
+        );
+        let (header, tcp) = syn.0.split_at(20);
+        let fragment = |offset: usize, more: bool, data: &[u8]| {
+            let mut p = header.to_vec();
+            p.extend_from_slice(data);
+            let total = p.len() as u16;
+            p[2..4].copy_from_slice(&total.to_be_bytes());
+            p[4..6].copy_from_slice(&77u16.to_be_bytes());
+            let field = (offset / 8) as u16 | if more { 0x2000 } else { 0 };
+            p[6..8].copy_from_slice(&field.to_be_bytes());
+            p[10..12].copy_from_slice(&[0, 0]);
+            let sum = fictionet::stdlib::network::ip::checksum(&p[..20]);
+            p[10..12].copy_from_slice(&sum.to_be_bytes());
+            Packet(p)
+        };
+        net.send(fragment(0, true, &tcp[..8]));
+        net.send(fragment(8, false, &tcp[8..]));
+        let syn_ack = net.recv().await.expect("a SYN-ACK");
+        assert_eq!(flags(&syn_ack), SYN | ACK);
+        assert!(matches!(mptcp_of(&syn_ack)[..], [MptcpOption::Capable(_)]));
+        net.drain().await;
+        let syns = net.events("syn");
+        assert_eq!(syns.len(), 1, "{:?}", net.log());
+        assert_eq!(syns[0]["src"], from.to_string());
+        assert_eq!(syns[0]["mptcp"][0]["subtype"], "mp_capable");
+        Ok(())
+    });
+}
+
+/// Data on a SYN is in its log line.
+#[test]
+fn a_syn_s_payload_is_logged() {
+    honeypot(Config::default(), |mut net| async move {
+        let from = client(9, 47001);
+        let options = with_mss(&mptcp_bytes(linux_capable()));
+        let data = b"PAYLOAD-IN-SYN";
+        net.send(segment(from, server(22), 1000, 0, SYN, &options, data));
+        net.drain().await;
+        let syns = net.events("syn");
+        assert_eq!(syns.len(), 1);
+        assert_eq!(syns[0]["payload"], hex(data));
+        Ok(())
+    });
 }

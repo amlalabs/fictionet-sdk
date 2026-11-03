@@ -2,19 +2,28 @@
 //! typed [`Observation`] per event of interest as one JSON object per line.
 //!
 //! The [`Observer`] sees each packet as it crosses an attachment, before
-//! the world's TCP does, so a packet the world drops is still logged. For
-//! packets from the sandbox side it records:
+//! the world does, so a packet the world drops is still logged. The pcapng
+//! file gets each packet as it crossed. The observations are made from
+//! whole packets: fragments wait until their packet is whole, as the
+//! world's own reassembly waits for them. For packets from the sandbox
+//! side it records:
 //!
 //! - every SYN ([`Observation::Syn`]): source and destination, all its TCP
 //!   options in order, why the options could not all be read, the MPTCP
-//!   options decoded, and the time since the same source's previous SYN;
-//! - every other segment with a payload or an MPTCP option
-//!   ([`Observation::Segment`]), with the payload bytes;
+//!   options decoded, its payload, and the time since the same source's
+//!   previous SYN when that SYN was within the burst window;
+//! - every other segment with a payload, a FIN or an MPTCP option
+//!   ([`Observation::Segment`]), with its options and payload;
 //! - a burst of SYNs, or of SYNs with MP_JOIN, from one source address
 //!   ([`Observation::Burst`]).
 //!
 //! For packets to the sandbox side it records each SYN-ACK and RST the
-//! world sends ([`Observation::Answer`]), with their MPTCP options.
+//! world sends ([`Observation::Answer`]), with their options.
+//!
+//! Each option list is logged twice over: every option with its bytes, in
+//! order ([`Opt`]), and the MPTCP ones decoded with every field the stdlib
+//! codec reads ([`Mptcp`]). So signatures written later can be run over
+//! either.
 //!
 //! # Bursts are a heuristic
 //!
@@ -30,18 +39,22 @@
 //! within the burst window. Its memory is the SYNs of the last window, so a
 //! flood from spoofed addresses cannot grow it past what one window holds.
 //! The time since a source's previous SYN is given when that SYN was within
-//! the window; each line's timestamp gives longer gaps.
+//! the window; each line's timestamp gives longer gaps. Fragments waiting
+//! for the rest of their packet are held per attachment, at most 4 MiB
+//! each, for at most a minute, and dropped when the attachment goes.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
+use fictionet::Packet;
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::network::ip::{self, protocol};
+use fictionet::stdlib::network::ip::{self, Intake, Reassembly, protocol};
 use fictionet::stdlib::network::tcp::{self, OptionsError, TcpOption};
 use fictionet::stdlib::pcap;
-use fictionet::stdlib::protocols::mptcp::{self, Join, MptcpOption, Sequence};
+use fictionet::stdlib::protocols::mptcp::{self, AddAddr, Capable, Dss, Join, Keys, Mapping};
+use fictionet::stdlib::protocols::mptcp::{MptcpOption, Sequence};
 use fictionet::time::Instant;
 use serde::{Serialize, Serializer};
 
@@ -88,12 +101,16 @@ pub enum Observation {
         options_fault: Option<OptionsFault>,
         /// Its MPTCP options, decoded.
         mptcp: Vec<Mptcp>,
+        /// Its payload, when it carried one.
+        #[serde(skip_serializing_if = "Hex::is_empty")]
+        payload: Hex,
         /// Microseconds since this source's previous SYN, if that was
         /// within the burst window.
         #[serde(skip_serializing_if = "Option::is_none")]
         gap_us: Option<u64>,
     },
-    /// Any other segment into the world with a payload or MPTCP options.
+    /// Any other segment into the world with a payload, a FIN or MPTCP
+    /// options.
     Segment {
         /// When it arrived.
         at_us: u64,
@@ -107,6 +124,11 @@ pub enum Observation {
         flags: Flags,
         /// Its sequence number.
         seq: u32,
+        /// Its TCP options, in order, up to the first malformed one.
+        options: Vec<Opt>,
+        /// Why its options could not all be read.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        options_fault: Option<OptionsFault>,
         /// Its MPTCP options, decoded.
         mptcp: Vec<Mptcp>,
         /// Its payload.
@@ -124,6 +146,8 @@ pub enum Observation {
         dst: SocketAddr,
         /// Its TCP flags.
         flags: Flags,
+        /// Its TCP options, in order.
+        options: Vec<Opt>,
         /// Its MPTCP options, decoded.
         mptcp: Vec<Mptcp>,
     },
@@ -192,8 +216,8 @@ pub enum Opt {
         /// TSecr.
         tsecr: u32,
     },
-    /// Any other kind, MPTCP's 30 included: the bytes after Kind and
-    /// Length.
+    /// Any other kind, MPTCP's 30 included, or a known kind of another
+    /// length: the bytes after Kind and Length.
     Other {
         /// The kind.
         number: u8,
@@ -224,11 +248,15 @@ impl From<&TcpOption> for Opt {
     }
 }
 
-/// One MPTCP option (RFC 8684), as logged. Keys and tokens are in hex.
+/// One MPTCP option (RFC 8684), as logged, with every field the stdlib
+/// codec reads. Keys, tokens and HMACs are in hex.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "subtype", rename_all = "snake_case")]
 pub enum Mptcp {
-    /// MP_CAPABLE.
+    /// MP_CAPABLE. Which of the keys and data parameters are there says
+    /// which form it has: none on a SYN, the sender's key on a SYN-ACK,
+    /// both keys on the third ACK, and the data parameters too on the first
+    /// data.
     MpCapable {
         /// The version.
         version: u8,
@@ -249,6 +277,9 @@ pub enum Mptcp {
         /// The first data's length, when it carries one.
         #[serde(skip_serializing_if = "Option::is_none")]
         data_level_length: Option<u16>,
+        /// The first data's DSS checksum, when it carries one.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        checksum: Option<u16>,
     },
     /// MP_JOIN on a SYN.
     MpJoinSyn {
@@ -281,18 +312,12 @@ pub enum Mptcp {
     },
     /// DSS.
     Dss {
-        /// The Data ACK.
+        /// The Data ACK, with its size.
         #[serde(skip_serializing_if = "Option::is_none")]
-        data_ack: Option<u64>,
-        /// The mapping's data sequence number.
+        data_ack: Option<Seq>,
+        /// The data sequence mapping.
         #[serde(skip_serializing_if = "Option::is_none")]
-        data_sequence_number: Option<u64>,
-        /// The mapping's subflow sequence number.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        subflow_sequence_number: Option<u32>,
-        /// The mapping's length.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        data_level_length: Option<u16>,
+        mapping: Option<DssMapping>,
         /// DATA_FIN.
         data_fin: bool,
     },
@@ -305,8 +330,9 @@ pub enum Mptcp {
         /// The port, if given.
         #[serde(skip_serializing_if = "Option::is_none")]
         port: Option<u16>,
-        /// Whether it is an echo (no HMAC).
-        echo: bool,
+        /// The truncated HMAC. None for an echo (flag E), which has none.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hmac: Option<Hex>,
     },
     /// REMOVE_ADDR.
     RemoveAddr {
@@ -342,6 +368,40 @@ pub enum Mptcp {
         /// The bytes after Kind and Length.
         data: Hex,
     },
+}
+
+/// A DSS sequence number with the size it was sent at: the stdlib codec's
+/// [`Sequence`], as logged, such as `{"short": 5}`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Seq {
+    /// 4 octets.
+    Short(u32),
+    /// 8 octets.
+    Long(u64),
+}
+
+impl From<Sequence> for Seq {
+    fn from(sequence: Sequence) -> Seq {
+        match sequence {
+            Sequence::Short(n) => Seq::Short(n),
+            Sequence::Long(n) => Seq::Long(n),
+        }
+    }
+}
+
+/// A DSS data sequence mapping, as logged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct DssMapping {
+    /// The data sequence number of the first byte, with its size.
+    pub data_sequence_number: Seq,
+    /// The subflow sequence number of the first byte.
+    pub subflow_sequence_number: u32,
+    /// How many bytes it covers.
+    pub data_level_length: u16,
+    /// The DSS checksum, when it has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checksum: Option<u16>,
 }
 
 /// Why an MPTCP option could not be read: the stdlib codec's
@@ -388,41 +448,53 @@ impl Mptcp {
     /// The option with this data, the bytes after Kind and Length.
     /// `known` says whether a token names an open connection.
     fn read(data: &[u8], known: impl Fn(u32) -> bool) -> Mptcp {
-        let option = match MptcpOption::parse(data) {
-            Ok(option) => option,
-            Err(error) => {
-                return Mptcp::Malformed {
-                    fault: error.into(),
-                    data: Hex(data.to_vec()),
-                };
-            }
-        };
-        let seq = |s: Sequence| match s {
-            Sequence::Short(n) => u64::from(n),
-            Sequence::Long(n) => n,
-        };
+        match MptcpOption::parse(data) {
+            Ok(option) => Mptcp::from_option(option, known),
+            Err(error) => Mptcp::Malformed {
+                fault: error.into(),
+                data: Hex(data.to_vec()),
+            },
+        }
+    }
+
+    /// `option` as logged. Every field is taken apart by name, so a field
+    /// the codec gains cannot be left out unseen.
+    fn from_option(option: MptcpOption, known: impl Fn(u32) -> bool) -> Mptcp {
         match option {
-            MptcpOption::Capable(c) => {
-                let (sender, receiver, length) = match c.keys {
-                    mptcp::Keys::Absent => (None, None, None),
-                    mptcp::Keys::Sender(k) => (Some(k), None, None),
-                    mptcp::Keys::Both { sender, receiver } => (Some(sender), Some(receiver), None),
-                    mptcp::Keys::Data {
+            MptcpOption::Capable(Capable {
+                version,
+                checksum_required,
+                extensibility,
+                no_new_subflows,
+                algorithms,
+                keys,
+            }) => {
+                let (sender, receiver, data_level_length, checksum) = match keys {
+                    Keys::Absent => (None, None, None, None),
+                    Keys::Sender(key) => (Some(key), None, None, None),
+                    Keys::Both { sender, receiver } => (Some(sender), Some(receiver), None, None),
+                    Keys::Data {
                         sender,
                         receiver,
                         data_level_length,
-                        ..
-                    } => (Some(sender), Some(receiver), Some(data_level_length)),
+                        checksum,
+                    } => (
+                        Some(sender),
+                        Some(receiver),
+                        Some(data_level_length),
+                        checksum,
+                    ),
                 };
                 Mptcp::MpCapable {
-                    version: c.version,
-                    checksum_required: c.checksum_required,
-                    extensibility: c.extensibility,
-                    no_new_subflows: c.no_new_subflows,
-                    algorithms: c.algorithms,
+                    version,
+                    checksum_required,
+                    extensibility,
+                    no_new_subflows,
+                    algorithms,
                     sender_key: sender.map(Key),
                     receiver_key: receiver.map(Key),
-                    data_level_length: length,
+                    data_level_length,
+                    checksum,
                 }
             }
             MptcpOption::Join(Join::Syn {
@@ -451,18 +523,37 @@ impl Mptcp {
             MptcpOption::Join(Join::Ack { hmac }) => Mptcp::MpJoinAck {
                 hmac: Hex(hmac.to_vec()),
             },
-            MptcpOption::Dss(dss) => Mptcp::Dss {
-                data_ack: dss.data_ack.map(seq),
-                data_sequence_number: dss.mapping.map(|m| seq(m.data_sequence_number)),
-                subflow_sequence_number: dss.mapping.map(|m| m.subflow_sequence_number),
-                data_level_length: dss.mapping.map(|m| m.data_level_length),
-                data_fin: dss.data_fin,
+            MptcpOption::Dss(Dss {
+                data_ack,
+                mapping,
+                data_fin,
+            }) => Mptcp::Dss {
+                data_ack: data_ack.map(Seq::from),
+                mapping: mapping.map(
+                    |Mapping {
+                         data_sequence_number,
+                         subflow_sequence_number,
+                         data_level_length,
+                         checksum,
+                     }| DssMapping {
+                        data_sequence_number: data_sequence_number.into(),
+                        subflow_sequence_number,
+                        data_level_length,
+                        checksum,
+                    },
+                ),
+                data_fin,
             },
-            MptcpOption::AddAddr(a) => Mptcp::AddAddr {
-                address_id: a.address_id,
-                address: a.address,
-                port: a.port,
-                echo: a.hmac.is_none(),
+            MptcpOption::AddAddr(AddAddr {
+                address_id,
+                address,
+                port,
+                hmac,
+            }) => Mptcp::AddAddr {
+                address_id,
+                address,
+                port,
+                hmac: hmac.map(|h| Hex(h.to_vec())),
             },
             MptcpOption::RemoveAddr { address_ids } => Mptcp::RemoveAddr { address_ids },
             MptcpOption::Prio { backup } => Mptcp::MpPrio { backup },
@@ -480,8 +571,15 @@ impl Mptcp {
 }
 
 /// Bytes, logged as lowercase hex.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Hex(pub Vec<u8>);
+
+impl Hex {
+    /// Whether there are no bytes.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
 
 impl Serialize for Hex {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
@@ -560,6 +658,8 @@ pub struct Observer {
     /// whether each carried MP_JOIN.
     recent: VecDeque<(Instant, IpAddr, bool)>,
     sources: HashMap<IpAddr, Source>,
+    /// Fragments waiting for the rest of their packet, per attachment.
+    fragments: HashMap<Arc<str>, Reassembly>,
 }
 
 impl Observer {
@@ -582,6 +682,7 @@ impl Observer {
             tokens,
             recent: VecDeque::new(),
             sources: HashMap::new(),
+            fragments: HashMap::new(),
         })
     }
 
@@ -613,7 +714,23 @@ impl Observer {
             Some(&format!("{attachment} {way}")),
         );
         self.sinks.pcap.write_all(&block)?;
-        for observation in self.observe(attachment, direction, packet, now) {
+        let fragment = ip::Header::parse_truncated(packet).is_some_and(|h| h.fragment.is_some());
+        let whole = if fragment {
+            let reassembly = self.fragments.entry(attachment.clone()).or_default();
+            match reassembly.push(Packet(packet.to_vec()), now) {
+                Intake::Whole(whole) => Some(whole.0),
+                Intake::Waiting => None,
+                Intake::Refused { packet, .. } => Some(packet.0),
+            }
+        } else {
+            None
+        };
+        let observations = match (&whole, fragment) {
+            (Some(whole), _) => self.observe(attachment, direction, whole, now),
+            (None, true) => Vec::new(),
+            (None, false) => self.observe(attachment, direction, packet, now),
+        };
+        for observation in observations {
             serde_json::to_writer(&mut self.sinks.log, &observation)?;
             self.sinks.log.write_all(b"\n")?;
         }
@@ -621,7 +738,12 @@ impl Observer {
         self.sinks.pcap.flush()
     }
 
-    /// What `packet` shows.
+    /// Forgets the fragments `attachment` left waiting: it is gone.
+    pub fn detached(&mut self, attachment: &Arc<str>) {
+        self.fragments.remove(attachment);
+    }
+
+    /// What `packet`, a whole one or one the world refused, shows.
     fn observe(
         &mut self,
         attachment: &Arc<str>,
@@ -644,13 +766,13 @@ impl Observer {
         let dst = SocketAddr::new(header.dst, u16::from_be_bytes([t[2], t[3]]));
         let seq = u32::from_be_bytes([t[4], t[5], t[6], t[7]]);
         let flags = t[13];
-        let (options, options_fault) = match tcp::options(t) {
+        let (read, options_fault) = match tcp::options(t) {
             Ok(options) => (options, None),
             Err(OptionsError::Malformed(read)) => (read, Some(OptionsFault::Malformed)),
             Err(OptionsError::Header) => (Vec::new(), Some(OptionsFault::Header)),
         };
         let tokens = &self.tokens;
-        let mptcp: Vec<Mptcp> = options
+        let mptcp: Vec<Mptcp> = read
             .iter()
             .filter_map(|o| match o {
                 TcpOption::Unknown { kind, data } if *kind == mptcp::KIND => {
@@ -659,6 +781,7 @@ impl Observer {
                 _ => None,
             })
             .collect();
+        let options: Vec<Opt> = read.iter().map(Opt::from).collect();
         let attachment = attachment.clone();
         if direction == Direction::Out {
             if flags & RST != 0 || flags & (SYN | ACK) == SYN | ACK {
@@ -668,11 +791,18 @@ impl Observer {
                     src,
                     dst,
                     flags: Flags(flags),
+                    options,
                     mptcp,
                 }];
             }
             return Vec::new();
         }
+        let offset = usize::from(t[12] >> 4) * 4;
+        let payload = Hex(t
+            .get(offset..)
+            .filter(|_| offset >= 20)
+            .unwrap_or_default()
+            .to_vec());
         if flags & (SYN | RST | ACK) == SYN {
             let join = mptcp.iter().any(|m| matches!(m, Mptcp::MpJoinSyn { .. }));
             let (gap_us, bursts) = self.syn(src.ip(), join, now);
@@ -682,9 +812,10 @@ impl Observer {
                 src,
                 dst,
                 seq,
-                options: options.iter().map(Opt::from).collect(),
+                options,
                 options_fault,
                 mptcp,
+                payload,
                 gap_us,
             }];
             out.extend(bursts.into_iter().map(|(kind, syns)| Observation::Burst {
@@ -696,8 +827,6 @@ impl Observer {
             }));
             return out;
         }
-        let offset = usize::from(t[12] >> 4) * 4;
-        let payload = t.get(offset..).filter(|_| offset >= 20).unwrap_or_default();
         if payload.is_empty() && mptcp.is_empty() && flags & FIN == 0 {
             return Vec::new();
         }
@@ -708,8 +837,10 @@ impl Observer {
             dst,
             flags: Flags(flags),
             seq,
+            options,
+            options_fault,
             mptcp,
-            payload: Hex(payload.to_vec()),
+            payload,
         }]
     }
 
@@ -767,6 +898,7 @@ impl Observer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fictionet::stdlib::network::ip::{Fields, packet_with, transport_checksum};
     use std::time::Duration;
 
     #[test]
@@ -832,9 +964,63 @@ mod tests {
         );
     }
 
+    /// Every field the codec reads is in the log: the HMAC of ADD_ADDR,
+    /// the checksums of DSS and of MP_CAPABLE's first data, and the size
+    /// of each DSS sequence number.
     #[test]
-    fn burst_state_lasts_one_window() {
-        let mut observer = Observer::new(
+    fn mptcp_options_are_logged_in_full() {
+        let logged = |option: MptcpOption| {
+            let data = option.to_bytes().unwrap();
+            serde_json::to_value(Mptcp::read(&data, |_| false)).unwrap()
+        };
+        let add_addr = logged(MptcpOption::AddAddr(AddAddr {
+            address_id: 3,
+            address: "192.0.2.7".parse().unwrap(),
+            port: None,
+            hmac: Some([1, 2, 3, 4, 5, 6, 7, 8]),
+        }));
+        assert_eq!(
+            add_addr,
+            serde_json::json!({"subtype": "add_addr", "address_id": 3,
+                "address": "192.0.2.7", "hmac": "0102030405060708"})
+        );
+        let dss = logged(MptcpOption::Dss(Dss {
+            data_ack: Some(Sequence::Short(5)),
+            mapping: Some(Mapping {
+                data_sequence_number: Sequence::Long(6),
+                subflow_sequence_number: 7,
+                data_level_length: 8,
+                checksum: Some(0xbeef),
+            }),
+            data_fin: false,
+        }));
+        assert_eq!(
+            dss,
+            serde_json::json!({"subtype": "dss", "data_ack": {"short": 5},
+                "mapping": {"data_sequence_number": {"long": 6},
+                    "subflow_sequence_number": 7, "data_level_length": 8,
+                    "checksum": 0xbeef},
+                "data_fin": false})
+        );
+        let first_data = logged(MptcpOption::Capable(Capable {
+            version: 1,
+            checksum_required: true,
+            extensibility: false,
+            no_new_subflows: false,
+            algorithms: 1,
+            keys: Keys::Data {
+                sender: 1,
+                receiver: 2,
+                data_level_length: 3,
+                checksum: Some(4),
+            },
+        }));
+        assert_eq!(first_data["checksum"], 4);
+        assert_eq!(first_data["data_level_length"], 3);
+    }
+
+    fn observer() -> Observer {
+        Observer::new(
             Sinks {
                 log: Box::new(io::sink()),
                 pcap: Box::new(io::sink()),
@@ -846,7 +1032,155 @@ mod tests {
             },
             Arc::default(),
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    /// A TCP segment from 192.0.2.1:4000 to 203.0.113.10:22.
+    fn segment(flags: u8, options: &[u8], payload: &[u8]) -> Vec<u8> {
+        let (src, dst): (IpAddr, IpAddr) = (
+            "192.0.2.1".parse().unwrap(),
+            "203.0.113.10".parse().unwrap(),
+        );
+        let mut t = vec![0x0f, 0xa0, 0, 22, 0, 0, 0, 1, 0, 0, 0, 0];
+        t.push(((20 + options.len()) / 4) as u8 * 16);
+        t.extend_from_slice(&[flags, 0xff, 0xff, 0, 0, 0, 0]);
+        t.extend_from_slice(options);
+        t.extend_from_slice(payload);
+        let sum = transport_checksum(src, dst, 6, &t);
+        t[16..18].copy_from_slice(&sum.to_be_bytes());
+        packet_with(src, dst, 6, Fields::default(), &t).0
+    }
+
+    fn observe(observer: &mut Observer, direction: Direction, packet: &[u8]) -> Vec<Observation> {
+        let at = Instant::from_since_start(Duration::from_secs(1));
+        observer.observe(&Arc::from("internet"), direction, packet, at)
+    }
+
+    /// A bare FIN is a segment line, as the docs say.
+    #[test]
+    fn a_bare_fin_is_logged() {
+        let fin = segment(FIN | ACK, &[], b"");
+        let [Observation::Segment { flags, payload, .. }] =
+            &observe(&mut observer(), Direction::In, &fin)[..]
+        else {
+            panic!("one segment line")
+        };
+        assert_eq!((flags.0, payload.is_empty()), (FIN | ACK, true));
+    }
+
+    /// Data on a SYN is in its line.
+    #[test]
+    fn a_syn_s_payload_is_logged() {
+        let syn = segment(SYN, &[2, 4, 5, 0xb4], b"PAYLOAD-IN-SYN");
+        let [Observation::Syn { payload, .. }] = &observe(&mut observer(), Direction::In, &syn)[..]
+        else {
+            panic!("one SYN line")
+        };
+        assert_eq!(payload.0, b"PAYLOAD-IN-SYN");
+        let line = serde_json::to_value(&observe(&mut observer(), Direction::In, &syn)[0]).unwrap();
+        assert_eq!(line["payload"], "5041594c4f41442d494e2d53594e");
+        // A SYN with none has no payload field.
+        let bare = segment(SYN, &[], b"");
+        let line =
+            serde_json::to_value(&observe(&mut observer(), Direction::In, &bare)[0]).unwrap();
+        assert!(line.get("payload").is_none(), "{line}");
+    }
+
+    /// Segments and answers keep every option's bytes, MPTCP or not.
+    #[test]
+    fn segments_and_answers_keep_their_options() {
+        let add_addr = [30, 16, 0x30, 3, 192, 0, 2, 7, 1, 2, 3, 4, 5, 6, 7, 8];
+        let ack = segment(ACK, &add_addr, b"");
+        let [Observation::Segment { options, mptcp, .. }] =
+            &observe(&mut observer(), Direction::In, &ack)[..]
+        else {
+            panic!("one segment line")
+        };
+        assert_eq!(
+            options,
+            &[Opt::Other {
+                number: 30,
+                data: Hex(add_addr[2..].to_vec())
+            }]
+        );
+        assert!(matches!(&mptcp[..], [Mptcp::AddAddr { hmac: Some(_), .. }]));
+        let rst = segment(RST | ACK, &[30, 4, 0x80, 3], b"");
+        let [Observation::Answer { options, .. }] =
+            &observe(&mut observer(), Direction::Out, &rst)[..]
+        else {
+            panic!("one answer line")
+        };
+        assert_eq!(
+            options,
+            &[Opt::Other {
+                number: 30,
+                data: Hex(vec![0x80, 3])
+            }]
+        );
+    }
+
+    /// A SYN sent as two fragments is logged once it is whole, as the
+    /// world takes it, and counts toward bursts.
+    #[test]
+    fn a_fragmented_syn_is_logged_whole() {
+        let syn = segment(SYN, &[2, 4, 5, 0xb4, 30, 4, 0x01, 0x01], b"");
+        let (header, tcp) = syn.split_at(20);
+        let fragment = |offset: usize, more: bool, data: &[u8]| {
+            let mut p = header.to_vec();
+            p.extend_from_slice(data);
+            let total = p.len() as u16;
+            p[2..4].copy_from_slice(&total.to_be_bytes());
+            p[4..6].copy_from_slice(&77u16.to_be_bytes());
+            let field = (offset / 8) as u16 | if more { 0x2000 } else { 0 };
+            p[6..8].copy_from_slice(&field.to_be_bytes());
+            p[10..12].copy_from_slice(&[0, 0]);
+            let sum = ip::checksum(&p[..20]);
+            p[10..12].copy_from_slice(&sum.to_be_bytes());
+            p
+        };
+        /// The log, shared with the observer that writes it.
+        #[derive(Clone, Default)]
+        struct Log(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl Write for Log {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let log = Log::default();
+        let mut observer = observer();
+        observer.sinks.log = Box::new(log.clone());
+        let lines = || -> Vec<serde_json::Value> {
+            let log = log.0.lock().unwrap();
+            let text = std::str::from_utf8(&log).unwrap();
+            text.lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect()
+        };
+        let name: Arc<str> = Arc::from("internet");
+        let at = Instant::from_since_start(Duration::from_secs(1));
+        observer
+            .packet(&name, Direction::In, &fragment(0, true, &tcp[..8]), at)
+            .unwrap();
+        assert!(lines().is_empty(), "half a SYN is not one yet");
+        observer
+            .packet(&name, Direction::In, &fragment(8, false, &tcp[8..]), at)
+            .unwrap();
+        let lines = lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0]["event"], "syn");
+        assert_eq!(lines[0]["mptcp"][0]["subtype"], "mp_capable");
+        assert_eq!(observer.sources(), 1);
+        observer.detached(&name);
+        assert!(observer.fragments.is_empty());
+    }
+
+    #[test]
+    fn burst_state_lasts_one_window() {
+        let mut observer = observer();
         let at = |ms| Instant::from_since_start(Duration::from_millis(ms));
         let a: IpAddr = "192.0.2.1".parse().unwrap();
         let b: IpAddr = "192.0.2.2".parse().unwrap();
@@ -864,7 +1198,8 @@ mod tests {
         );
         assert_eq!(observer.syn(a, false, at(50)), (Some(10_000), vec![]));
         assert_eq!(observer.sources(), 2);
-        // A window later both have aged out; only the newest source is held.
+        // A window later both have aged out; only the newest source is held,
+        // and its SYN gives no gap: the one before was outside the window.
         assert_eq!(observer.syn(b, false, at(500)), (None, vec![]));
         assert_eq!(observer.sources(), 1);
         assert_eq!(observer.recent.len(), 1);

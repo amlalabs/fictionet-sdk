@@ -357,7 +357,12 @@ impl Net {
     /// Wires the sandbox called `name` straight to the router at `prefix`,
     /// with no filter, no address binding and no DHCP: a trusted
     /// participant, such as a real container that plays one of the hosts.
-    /// Packets for `prefix` go to it, and what it sends is routed as it is.
+    /// Packets for `prefix` go to it, and what it sends is routed as it is,
+    /// when its source address is one the network routes back to it: one
+    /// in `prefix` that no subnet, gateway, host or longer route has.
+    /// Others are dropped, as a router with strict reverse-path forwarding
+    /// drops them (RFC 3704 section 2.2), so a route open to the internet
+    /// cannot send packets in another sandbox's or host's name.
     /// Connections from addresses in `prefix` that no other sandbox has
     /// name this sandbox, and the network keeps nothing per source address,
     /// so a route open to the internet can carry any number of them.
@@ -1064,7 +1069,7 @@ mod tests {
             Box::pin(async {})
         }
 
-        fn answer_syn(&self) -> Option<tcp::AnswerSyn> {
+        fn answer(&self) -> Option<Box<dyn tcp::Answer>> {
             Some(Box::new(|syn: &[tcp::TcpOption]| {
                 if syn.contains(&tcp::TcpOption::Unknown { kind: 253, data: vec![1] }) {
                     tcp::SynAnswer::Refuse(vec![tcp::TcpOption::Unknown {
@@ -1142,14 +1147,79 @@ mod tests {
                 assert_eq!(from.len(), 1, "the refused attempt is never served");
                 assert_eq!(from[0].peer, Some(SocketAddr::new(client.into(), 4000)));
                 assert_eq!(
-                    *from[0].syn_options,
-                    [tcp::TcpOption::Unknown { kind: 253, data: vec![2] }]
+                    from[0].handshake.syn.as_deref(),
+                    Some(&[tcp::TcpOption::Unknown { kind: 253, data: vec![2] }][..])
                 );
                 assert_eq!(
-                    *from[0].syn_ack_options,
-                    [tcp::TcpOption::Unknown { kind: 253, data: vec![9] }]
+                    from[0].handshake.syn_ack.as_deref(),
+                    Some(&[tcp::TcpOption::Unknown { kind: 253, data: vec![9] }][..])
                 );
                 drop(from);
+                fcx.cancel();
+                Ok(())
+            },
+        ))
+        .unwrap();
+    }
+
+    /// A route open to the whole internet passes on only packets from
+    /// addresses the network routes back to it. One that claims an
+    /// attached sandbox's address or a host's own is dropped, so neither
+    /// gets answers to what it never sent.
+    #[test]
+    fn a_route_drops_sources_the_network_has_elsewhere() {
+        fictionet::block_on(fictionet::lab(
+            fictionet::Seed::from_u64(1),
+            |fcx| async move {
+                let server = Ipv4Addr::new(10, 40, 0, 1);
+                let from = Arc::new(Mutex::new(Vec::new()));
+                let (attacher, attachments) = fictionet::attachments();
+                Net::new()
+                    .ipv4_only()
+                    .host("svc", |h| {
+                        h.at(server).port_server(
+                            22,
+                            Spy {
+                                from: from.clone(),
+                                hold: true,
+                                gone: Arc::default(),
+                            },
+                        )
+                    })
+                    .route("internet", "0.0.0.0/0".parse()?)
+                    .start(&fcx, attachments)?;
+                let mut internet = attacher.attach("internet")?;
+                let mut agent = attacher.attach("agent")?;
+                let syn = |src: Ipv4Addr, sport: u16| {
+                    let mut t = vec![0u8; 20];
+                    t[0..2].copy_from_slice(&sport.to_be_bytes());
+                    t[2..4].copy_from_slice(&22u16.to_be_bytes());
+                    t[12] = 5 << 4;
+                    t[13] = 0x02;
+                    t[14..16].copy_from_slice(&65535u16.to_be_bytes());
+                    let sum = ip::transport_checksum(src.into(), server.into(), PROTO_TCP, &t);
+                    t[16..18].copy_from_slice(&sum.to_be_bytes());
+                    ip::packet(src.into(), server.into(), PROTO_TCP, &t)
+                };
+                let within = |fcx: &Cx| Some(fcx.now() + Duration::from_secs(1));
+                let agent_addr = Ipv4Addr::new(10, 0, 0, 2);
+                agent.send(syn(agent_addr, 45000));
+                let syn_ack = fcx.race(within(&fcx), agent.recv(&fcx)).await??;
+                assert_eq!(syn_ack.0[20 + 13], 0x12, "the agent's own SYN is answered");
+
+                internet.send(syn(agent_addr, 45001));
+                internet.send(syn(server, 45002));
+                internet.send(syn(Ipv4Addr::new(10, 0, 0, 1), 45003));
+                internet.send(syn(Ipv4Addr::new(198, 51, 100, 7), 45004));
+                let syn_ack = fcx.race(within(&fcx), internet.recv(&fcx)).await??;
+                assert_eq!(&syn_ack.0[16..20], &[198, 51, 100, 7]);
+                assert!(fcx.race(within(&fcx), internet.recv(&fcx)).await.is_err());
+                // The agent's own SYN-ACK may come again, and nothing else.
+                while let Ok(p) = fcx.race(within(&fcx), agent.recv(&fcx)).await {
+                    let p = p?;
+                    assert_eq!(u16::from_be_bytes([p.0[22], p.0[23]]), 45000);
+                }
+                drop((internet, agent));
                 fcx.cancel();
                 Ok(())
             },

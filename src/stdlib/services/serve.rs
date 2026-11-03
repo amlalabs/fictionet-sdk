@@ -195,13 +195,10 @@ pub struct ConnInfo {
     pub local: Option<SocketAddr>,
     /// The other side.
     pub peer: Option<SocketAddr>,
-    /// The options of the peer's SYN, in the order it sent them, for a
-    /// TCP connection.
-    pub syn_options: Arc<[TcpOption]>,
-    /// The options the listener added to its SYN-ACK
-    /// ([`Listener::answer_syn`](crate::stdlib::network::tcp::Listener::answer_syn)),
-    /// in order, for a TCP connection.
-    pub syn_ack_options: Arc<[TcpOption]>,
+    /// What the TCP handshake carried, for a TCP connection: the options
+    /// of the peer's SYN, those the listener added to its SYN-ACK, and
+    /// those of the ACK that completed it.
+    pub handshake: Handshake,
     /// Whether the bytes arrived over TLS.
     pub tls: bool,
     /// The name the client sent in its TLS hello, in lowercase.
@@ -241,7 +238,7 @@ impl ConnInfo {
 }
 
 use fictionet::stdlib::codec::{Decode, Fail, Stream};
-use fictionet::stdlib::network::tcp::TcpOption;
+use fictionet::stdlib::network::tcp::Handshake;
 use fictionet::stdlib::network::{Accept, Accepted, DatagramSocket};
 use fictionet::stdlib::network::{ConnError, Connection, ConnectionExt};
 use fictionet::stdlib::services::tls::{self, HandshakeError, ServerConfig, TlsConnection};
@@ -2397,8 +2394,7 @@ where
                 Err(_) => continue,
             };
             let mut info = ConnInfo::new(ids + 1, conn.local_addr(), conn.peer_addr());
-            info.syn_options = conn.syn_options();
-            info.syn_ack_options = conn.syn_ack_options();
+            info.handshake = conn.handshake();
             info.sandbox = info
                 .peer
                 .and_then(|peer| opts.sandbox.as_ref().and_then(|f| f(peer.ip())));

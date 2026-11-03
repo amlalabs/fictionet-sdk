@@ -80,12 +80,13 @@ pub trait PortServer: Any + Send + Sync {
         Vec::new()
     }
 
-    /// How the port answers each connection attempt by the options of its
-    /// SYN ([`tcp::Listener::answer_syn`]), such as an MPTCP server with
-    /// MP_CAPABLE. Asked once, when the port's listener opens, so the
-    /// server that opens a port answers for every host that shares it.
-    /// Default `None`: the endpoint's plain SYN-ACK.
-    fn answer_syn(&self) -> Option<tcp::AnswerSyn> {
+    /// How the port answers each connection attempt's handshake
+    /// ([`tcp::Listener::answer`]), such as an MPTCP server with
+    /// MP_CAPABLE. Asked once, when the port's listener opens. A SYN comes
+    /// before anything that tells hosts apart, so a server that answers
+    /// cannot share its port with another host: placing one there fails.
+    /// Default `None`: the endpoint's plain handshake.
+    fn answer(&self) -> Option<Box<dyn tcp::Answer>> {
         None
     }
 
@@ -1072,8 +1073,8 @@ impl Machine {
                             PortSpec::Tcp(accept) | PortSpec::Tls { accept, .. } => accept,
                             PortSpec::Udp(_) => unreachable!(),
                         };
-                        if let Some(answer) = opener.answer_syn() {
-                            listener.answer_syn(answer);
+                        if let Some(answer) = opener.answer() {
+                            listener.answer(answer);
                         }
                         Some(listener)
                     } else {
@@ -1097,6 +1098,18 @@ impl Machine {
                 }
             };
             let tls = port.port.tls.read().unwrap_or_else(|e| e.into_inner());
+            let accept = match spec {
+                PortSpec::Tcp(accept) | PortSpec::Tls { accept, .. } => accept,
+                PortSpec::Udp(_) => unreachable!(),
+            };
+            if let Some(front) = port.plain.as_ref().or(port.first_tls.as_ref())
+                && !Arc::ptr_eq(front, accept)
+                && (front.answer().is_some() || accept.answer().is_some())
+            {
+                return Err(format!(
+                    "TCP port {number} at {addr} answers handshakes for one server, and cannot be shared"
+                ));
+            }
             let (service, share) = match spec {
                 PortSpec::Udp(_) => unreachable!(),
                 PortSpec::Tcp(accept) => {
@@ -1276,8 +1289,7 @@ async fn accept(
                 let mut info =
                     ConnInfo::new(hooks.next_conn(), conn.local_addr(), conn.peer_addr())
                         .from_sandbox(sandbox);
-                info.syn_options = conn.syn_options();
-                info.syn_ack_options = conn.syn_ack_options();
+                info.handshake = conn.handshake().clone();
                 let accepted = fcx.now();
                 let handshake = machine.handshake;
                 let port = port.clone();
@@ -1434,6 +1446,55 @@ mod tests {
             },
         ))
         .unwrap();
+    }
+
+    /// A server that answers handshakes cannot share its port with another
+    /// host's, whichever comes first: the SYN comes before the TLS hello
+    /// that would tell them apart.
+    #[test]
+    fn a_port_that_answers_handshakes_is_not_shared() {
+        struct Plain;
+        impl PortServer for Plain {
+            fn serve(&self, _: Cx, _: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+                Box::pin(async {})
+            }
+        }
+        struct Answering;
+        impl PortServer for Answering {
+            fn serve(&self, _: Cx, _: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+                Box::pin(async {})
+            }
+            fn answer(&self) -> Option<Box<dyn tcp::Answer>> {
+                Some(Box::new(|_: &[tcp::TcpOption]| {
+                    tcp::SynAnswer::Accept(Vec::new())
+                }))
+            }
+        }
+        let addr = Ipv4Addr::new(203, 0, 113, 8);
+        for answering_first in [true, false] {
+            fictionet::block_on(fictionet::run(
+                fictionet::Seed::random(),
+                move |fcx| async move {
+                    let mut net = Net::new().ipv4_only();
+                    for (name, answers) in [("a.test", answering_first), ("b.test", !answering_first)] {
+                        net = net.host(name, |h| {
+                            let h = h.at(addr);
+                            if answers {
+                                h.tls_accept(443, name, |_| panic!("no handshake"), Answering)
+                            } else {
+                                h.tls_accept(443, name, |_| panic!("no handshake"), Plain)
+                            }
+                        });
+                    }
+                    let (_attacher, attachments) = fictionet::attachments();
+                    let error = net.start(&fcx, attachments).unwrap_err().to_string();
+                    assert!(error.contains("cannot be shared"), "{error}");
+                    fcx.cancel();
+                    Ok(())
+                },
+            ))
+            .unwrap();
+        }
     }
 
     #[test]

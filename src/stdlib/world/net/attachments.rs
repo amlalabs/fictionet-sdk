@@ -165,8 +165,33 @@ fn longest_route(routes: &[(Prefix, Sandbox)], addr: IpAddr) -> Option<&(Prefix,
         .max_by_key(|(p, _)| p.len)
 }
 
+impl Context {
+    /// Whether the network routes `addr` to the route at `prefix`: it is in
+    /// `prefix`, and no subnet, gateway, machine or route with a longer
+    /// prefix has it.
+    fn routes_to(&self, prefix: Prefix, addr: IpAddr) -> bool {
+        let bindings = &self.bindings;
+        let destinations = &self.destinations;
+        prefix.contains(addr)
+            && !bindings.subnet.prefix.contains(addr)
+            && !bindings.subnet6.is_some_and(|s| s.prefix.contains(addr))
+            && !destinations.is_gateway(addr)
+            && !destinations
+                .trusted
+                .iter()
+                .any(|p| p.len > prefix.len && p.contains(addr))
+            && !destinations.machines.contains(addr)
+    }
+}
+
 /// A trusted sandbox wired to the router at its prefix. It passes packets
 /// as they are and keeps no state per source.
+///
+/// It passes on only packets from addresses the network routes back to
+/// it, as a router with strict reverse-path forwarding does (RFC 3704
+/// section 2.2). A route open to the internet carries packets with any
+/// source, and one that claims an address the network has elsewhere, such
+/// as a sandbox's or a host's, is dropped: answers to it would go there.
 pub(super) struct Routed {
     sandbox: Attachment,
     context: Arc<Context>,
@@ -180,7 +205,12 @@ impl Interface for Routed {
         fcx: &Cx,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Result<Packet, fictionet::RecvError>> {
-        self.sandbox.poll_recv(fcx, cx)
+        loop {
+            let packet = std::task::ready!(self.sandbox.poll_recv(fcx, cx))?;
+            if ip::source(&packet.0).is_some_and(|src| self.context.routes_to(self.prefix, src)) {
+                return Poll::Ready(Ok(packet));
+            }
+        }
     }
 
     fn send(&mut self, packet: Packet) {

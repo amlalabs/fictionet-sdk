@@ -86,8 +86,7 @@ impl Display for RecvError {
 
 impl core::error::Error for RecvError {}
 
-/// Error returned by [`Socket::set_syn_options`] and
-/// [`Socket::set_rst_options`]
+/// Error returned by [`Socket::set_syn_options`] and [`encode_options`]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum SynOptionsError {
     /// They take more than [`SYN_OPTIONS_ROOM`] bytes.
@@ -109,8 +108,9 @@ impl Display for SynOptionsError {
 impl core::error::Error for SynOptionsError {}
 
 /// Encodes options for a SYN, SYN-ACK or RST, checking that they fit in
-/// [`SYN_OPTIONS_ROOM`] and read back as themselves.
-fn encode_options(options: &[TcpOption]) -> Result<Vec<u8>, SynOptionsError> {
+/// [`SYN_OPTIONS_ROOM`] and read back as themselves: whole options, with
+/// no End of Option List and no padding.
+pub fn encode_options(options: &[TcpOption]) -> Result<Vec<u8>, SynOptionsError> {
     let len: usize = options.iter().map(TcpOption::buffer_len).sum();
     if len > SYN_OPTIONS_ROOM {
         return Err(SynOptionsError::TooLong);
@@ -534,10 +534,6 @@ pub struct Socket<'a> {
     /// [`Socket::set_syn_options`].
     syn_options: Vec<u8>,
 
-    /// Options added to the RST of an abort, encoded: see
-    /// [`Socket::set_rst_options`].
-    rst_options: Vec<u8>,
-
     rx_waker: WakerRegistration,
 
     tx_waker: WakerRegistration,
@@ -603,7 +599,6 @@ impl<'a> Socket<'a> {
             last_remote_tsval: 0,
             congestion_controller: reno::Reno::new(),
             syn_options: Vec::new(),
-            rst_options: Vec::new(),
 
             rx_waker: WakerRegistration::new(),
 
@@ -634,16 +629,41 @@ impl<'a> Socket<'a> {
         Ok(())
     }
 
-    /// Adds `options` to the RST this socket sends when it is next
-    /// [aborted](Socket::abort), as an MPTCP host puts MP_TCPRST on a RST
-    /// that refuses a subflow (RFC 8684 section 3.6). The socket drops them
-    /// once that RST is sent, or when it forgets the connection.
-    ///
-    /// Fails, changing nothing, as [`set_syn_options`](Socket::set_syn_options)
-    /// does: a RST has the same room.
-    pub fn set_rst_options(&mut self, options: &[TcpOption]) -> Result<(), SynOptionsError> {
-        self.rst_options = encode_options(options)?;
-        Ok(())
+    /// Takes up a handshake that a listener answered without keeping any
+    /// state: a SYN with sequence number `irs` from `remote` to `local`,
+    /// answered by a SYN-ACK with sequence number `iss` that echoed
+    /// nothing but a Maximum Segment Size, as a SYN cookie does (RFC 4987
+    /// section 3.6). `remote_mss` is the peer's MSS as the cookie kept it,
+    /// and `now` the time. The socket must be listening on `local`'s port.
+    /// It is left in SYN-RECEIVED as if it had sent that SYN-ACK, with no
+    /// window scaling, SACK or timestamps, so the ACK that returns the
+    /// cookie, processed next, establishes the connection. The window it
+    /// advertised is the receive buffer's capacity, at most 65,535.
+    pub fn accept_syn_cookie(
+        &mut self,
+        local: IpEndpoint,
+        remote: IpEndpoint,
+        irs: u32,
+        iss: u32,
+        remote_mss: u16,
+        now: Instant,
+    ) {
+        debug_assert_eq!(self.state, State::Listen);
+        let (irs, iss) = (TcpSeqNumber(irs as i32), TcpSeqNumber(iss as i32));
+        self.remote_mss = (remote_mss as usize).max(MIN_REMOTE_MSS);
+        self.congestion_controller.set_mss(self.remote_mss);
+        self.remote_has_sack = false;
+        self.remote_win_scale = None;
+        self.remote_win_shift = 0;
+        self.tsval_generator = None;
+        self.tuple = Some(Tuple { local, remote });
+        self.local_seq_no = iss;
+        self.remote_seq_no = irs + 1;
+        self.remote_last_seq = iss + 1;
+        self.local_seq_max = iss + 1;
+        self.remember_window(Some(irs + 1), self.scaled_window());
+        self.set_state(State::SynReceived);
+        self.timer.set_for_idle(now, self.keep_alive);
     }
 
     /// Register a waker for receive operations.
@@ -870,7 +890,6 @@ impl<'a> Socket<'a> {
         self.last_remote_tsval = 0;
         self.congestion_controller = reno::Reno::new();
         self.syn_options = Vec::new();
-        self.rst_options = Vec::new();
 
         {
             self.rx_waker.wake();
@@ -2167,7 +2186,6 @@ impl<'a> Socket<'a> {
             // with a specified endpoint, it means that the socket was aborted.
             State::Closed => {
                 repr.control = TcpControl::Rst;
-                repr.extra = &self.rst_options;
             }
 
             // We never transmit anything in the LISTEN state.
@@ -2337,7 +2355,6 @@ impl<'a> Socket<'a> {
         if self.state == State::Closed {
             // When aborting a connection, forget about it after sending a single RST packet.
             self.tuple = None;
-            self.rst_options = Vec::new();
 
             {
                 // Wake tx now so that async users can wait for the RST to be sent
@@ -3361,58 +3378,93 @@ mod test {
         });
     }
 
-    /// MP_TCPRST (RFC 8684 section 3.6): kind 30, length 4, subtype 8,
-    /// reason 3, "administratively prohibited".
-    const MP_TCPRST: TcpOption<'static> = TcpOption::Unknown {
-        kind: 30,
-        data: &[0x80, 0x03],
-    };
-
+    /// A handshake answered with a SYN cookie: the ACK that returns it
+    /// establishes the connection, with the MSS the cookie kept and none
+    /// of the options a SYN cookie cannot keep, and data on that ACK is
+    /// taken.
     #[test]
-    fn test_rst_options_ride_the_abort_rst_once() {
-        let mut s = socket_syn_received();
-        s.set_syn_options(&[MP_CAPABLE]).unwrap();
-        s.set_rst_options(&[MP_TCPRST]).unwrap();
-        s.abort();
-        recv(&mut s, Instant::from_millis(0), |repr| {
-            let repr = repr.unwrap();
-            assert_eq!(repr.control, TcpControl::Rst);
-            assert_eq!(repr.extra, &[30, 4, 0x80, 0x03]);
-        });
-        assert_eq!(s.tuple, None);
-        assert!(s.rst_options.is_empty());
+    fn test_accept_syn_cookie_then_its_ack_establishes() {
+        let mut s = socket_listen();
+        let iss = TcpSeqNumber(0x1234_5678);
+        s.socket.accept_syn_cookie(
+            LOCAL_END,
+            REMOTE_END,
+            REMOTE_SEQ.0 as u32,
+            iss.0 as u32,
+            1300,
+            Instant::ZERO,
+        );
+        assert_eq!(s.state, State::SynReceived);
+        assert_eq!(s.remote_mss, 1300);
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(iss + 1),
+                payload: &b"abcdef"[..],
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::Established);
+        assert_eq!(s.remote_win_scale, None);
+        assert!(!s.remote_has_sack);
+        assert_eq!(s.local_seq_no, iss + 1);
+        assert_eq!(s.recv_queue(), 6);
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: iss + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 6),
+                window_len: 58,
+                ..RECV_TEMPL
+            }]
+        );
+    }
 
-        // A later abort of another connection sends a plain RST.
-        let mut s = socket_established();
-        s.set_rst_options(&[MP_TCPRST]).unwrap();
-        s.reset();
-        assert!(s.rst_options.is_empty());
-        let mut s = socket_established();
-        s.abort();
-        recv(&mut s, Instant::from_millis(0), |repr| {
-            let repr = repr.unwrap();
-            assert_eq!(repr.control, TcpControl::Rst);
-            assert_eq!(repr.extra, &[]);
-        });
+    /// An ACK that does not acknowledge the cookie's SYN-ACK does not
+    /// establish the connection.
+    #[test]
+    fn test_accept_syn_cookie_wants_its_own_ack() {
+        let mut s = socket_listen();
+        let iss = TcpSeqNumber(0x1234_5678);
+        s.socket.accept_syn_cookie(
+            LOCAL_END,
+            REMOTE_END,
+            REMOTE_SEQ.0 as u32,
+            iss.0 as u32,
+            1460,
+            Instant::ZERO,
+        );
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(iss + 2),
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                control: TcpControl::Rst,
+                seq_number: iss + 2,
+                ack_number: None,
+                window_len: 0,
+                ..RECV_TEMPL
+            })
+        );
+        assert_ne!(s.state, State::Established);
     }
 
     #[test]
-    fn test_rst_options_that_cannot_be_sent_are_refused() {
-        let mut s = socket_syn_received();
-        s.set_rst_options(&[MP_TCPRST]).unwrap();
+    fn test_encode_options_checks_room_and_reading() {
+        assert_eq!(encode_options(&[MP_CAPABLE]).unwrap(), MP_CAPABLE_BYTES);
         let too_long = TcpOption::Unknown {
             kind: 253,
             data: &[0; SYN_OPTIONS_ROOM][..SYN_OPTIONS_ROOM - 1],
         };
+        assert_eq!(encode_options(&[too_long]), Err(SynOptionsError::TooLong));
         assert_eq!(
-            s.set_rst_options(&[too_long]),
-            Err(SynOptionsError::TooLong)
-        );
-        assert_eq!(
-            s.set_rst_options(&[TcpOption::EndOfList]),
+            encode_options(&[TcpOption::EndOfList]),
             Err(SynOptionsError::Unreadable)
         );
-        assert_eq!(s.rst_options, [30, 4, 0x80, 0x03]);
     }
 
     #[test]
@@ -3445,19 +3497,11 @@ mod test {
                 }][..],
                 SynOptionsError::Unreadable,
             ),
-            // These bytes read back as a Maximum Segment Size, and a
-            // three-byte one does not read at all.
+            // These bytes read back as a Maximum Segment Size.
             (
                 &[TcpOption::Unknown {
                     kind: 2,
                     data: &[5, 0xb4],
-                }][..],
-                SynOptionsError::Unreadable,
-            ),
-            (
-                &[TcpOption::Unknown {
-                    kind: 2,
-                    data: &[5, 0xb4, 0],
                 }][..],
                 SynOptionsError::Unreadable,
             ),
@@ -3475,6 +3519,13 @@ mod test {
             assert_eq!(s.set_syn_options(options), Err(error), "{options:?}");
             assert_eq!(s.syn_options, unchanged);
         }
+        // A known kind of another length reads back as itself, unknown.
+        let odd_mss = TcpOption::Unknown {
+            kind: 2,
+            data: &[5, 0xb4, 0],
+        };
+        s.set_syn_options(&[odd_mss]).unwrap();
+        assert_eq!(s.syn_options, [2, 5, 5, 0xb4, 0]);
     }
 
     /// A SYN-ACK with every option the socket adds and the most extra

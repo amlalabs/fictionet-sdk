@@ -23,18 +23,28 @@ open port:
 
 The MPTCP listener follows RFC 8684:
 
-- A SYN with MP_CAPABLE version 1 that offers HMAC-SHA256 gets a SYN-ACK with
-  MP_CAPABLE and a fresh random key. The SYN-ACK asks for checksums only when
-  the SYN did.
-- Linux ignores MP_CAPABLE with another version, a key, flag B, or no
+- A SYN with MP_CAPABLE that offers HMAC-SHA256 gets a SYN-ACK with
+  MP_CAPABLE version 1 and a fresh random key. A SYN that offers a higher
+  version gets version 1 back, as Linux answers it. The SYN-ACK asks for
+  checksums only when the SYN did.
+- Linux ignores MP_CAPABLE of version 0, with a key, with flag B, or with no
   HMAC-SHA256, and so does the honeypot: that connection is plain TCP. So is a
-  SYN with both MP_CAPABLE and MP_JOIN.
+  SYN with both MP_CAPABLE and MP_JOIN, and a connection whose third ACK does
+  not echo the keys.
 - After the handshake the server speaks plain TCP, as an MPTCP host does once
-  a connection has fallen back. It never takes a second subflow. An MP_JOIN SYN
-  gets a RST with MP_TCPRST. The reason is "administratively prohibited" when
-  the token names one of the server's open connections, as Linux answers a join
-  to a connection that has fallen back. It is "MPTCP-specific error" when the
-  token names none.
+  a connection has fallen back. It never takes a second subflow, but it
+  answers MP_JOIN as Linux does. When the token names one of the server's open
+  connections, the SYN gets a SYN-ACK with MP_JOIN, the server's HMAC and a
+  random number. The join is refused at its third ACK, which carries the
+  client's HMAC, with a RST that has MP_TCPRST "administratively prohibited".
+  When the token names none, the SYN gets that RST at once, with
+  "MPTCP-specific error".
+- A RST that refuses a SYN or a third ACK has the fields Linux gives it: the
+  sequence number the segment acknowledged, or else 0 and an ACK of the SYN,
+  window 0, and MP_TCPRST as its only option.
+- TCP options are read as Linux reads them: an option whose Length runs past
+  the header ends the list, a known kind of another length is ignored, and
+  the SYN is answered.
 
 ## What it logs
 
@@ -48,19 +58,24 @@ kind it is:
 
 | `event` | When | What it holds |
 | --- | --- | --- |
-| `syn` | A SYN into the world | Source and destination, the initial sequence number, every TCP option in order, `options_fault` if the options did not all read, each MPTCP option decoded, and `gap_us` since the same source's previous SYN |
-| `segment` | Any other segment in with a payload, a FIN or MPTCP options | Flags, sequence number, MPTCP options, and the payload in hex |
-| `answer` | A SYN-ACK or RST from the world | Flags and MPTCP options, such as the key the server issued |
+| `syn` | A SYN into the world | Source and destination, the initial sequence number, every TCP option in order, `options_fault` if the options did not all read, each MPTCP option decoded, the payload in hex when the SYN carried one, and `gap_us` since the same source's previous SYN when that SYN was within the burst window |
+| `segment` | Any other segment in with a payload, a FIN or MPTCP options | Flags, sequence number, every TCP option in order, `options_fault`, each MPTCP option decoded, and the payload in hex |
+| `answer` | A SYN-ACK or RST from the world | Flags, every TCP option in order, and each MPTCP option decoded, such as the key the server issued |
 | `burst` | A source's SYNs, or its SYNs with MP_JOIN, reach the burst threshold | Source address, which kind, how many, and the window |
 
-Times are `at_us`, microseconds since the Unix epoch. Keys and tokens are hex.
-An MP_JOIN SYN says whether its token names an open connection
-(`token_known`). An option of kind 30 that does not read as MPTCP is logged as
-`malformed`, with the reason and its bytes.
+Times are `at_us`, microseconds since the Unix epoch. Keys, tokens and HMACs
+are hex. Each MPTCP option is decoded with every field the codec reads, and
+its bytes are in `options` too, so signatures can be run over either. An
+MP_JOIN SYN says whether its token names an open connection (`token_known`).
+An option of kind 30 that does not read as MPTCP is logged as `malformed`,
+with the reason and its bytes. A SYN without `gap_us` is a source's first
+within the burst window; the `at_us` of its lines gives longer gaps.
 
 The world writes each packet to the capture and the log before passing it on,
-so a packet the world's TCP drops is still logged. If either file cannot be
-written, the world stops.
+so a packet the world drops is still logged. The capture has each packet as it
+crossed. The log reads whole packets: IP fragments are put together first, as
+the world puts them together. If either file cannot be written, the world
+stops.
 
 ### Bursts are a heuristic
 
@@ -80,6 +95,17 @@ The world keeps state for a source only while that source has a SYN within the
 burst window, and an MPTCP token only while its connection is open. A flood
 from spoofed addresses cannot grow either past what one window or the open
 connections hold.
+
+Spoofed SYNs cannot shut real attackers out either. Each port holds 4,096
+handshakes. Past that, the server answers with SYN cookies, as Linux does, and
+keeps nothing until the ACK that returns one. A handshake whose last ACK never
+comes gets six SYN-ACKs, at 0, 1, 3, 7, 15 and 31 seconds, and is dropped at 63
+seconds without a RST, as on Linux.
+
+The internet reaches the server and nothing else. Its packets for any other
+address are logged and dropped, and the network drops those whose source
+address it has elsewhere, such as an attached sandbox's, so a spoofed packet
+cannot draw answers to the sandbox.
 
 ## Running it locally
 

@@ -573,8 +573,9 @@ pub enum TcpOption<'a> {
     SackRange([Option<(u32, u32)>; 4]),
     /// Timestamps: kind 8 (RFC 7323).
     TimeStamp { tsval: u32, tsecr: u32 },
-    /// Any other kind, or Timestamps of another length: the bytes after
-    /// Kind and Length.
+    /// Any other kind, or a known kind with a Length its RFC does not
+    /// define: the bytes after Kind and Length. Linux ignores those
+    /// (tcp_parse_options), and so does [`Repr::parse`].
     Unknown { kind: u8, data: &'a [u8] },
 }
 
@@ -598,15 +599,9 @@ impl<'a> TcpOption<'a> {
                     (field::OPT_MSS, 4) => {
                         option = TcpOption::MaxSegmentSize(NetworkEndian::read_u16(data))
                     }
-                    (field::OPT_MSS, _) => return Err(Error),
                     (field::OPT_WS, 3) => option = TcpOption::WindowScale(data[0]),
-                    (field::OPT_WS, _) => return Err(Error),
                     (field::OPT_SACKPERM, 2) => option = TcpOption::SackPermitted,
-                    (field::OPT_SACKPERM, _) => return Err(Error),
-                    (field::OPT_SACKRNG, n) => {
-                        if n < 10 || (n - 2) % 8 != 0 {
-                            return Err(Error);
-                        }
+                    (field::OPT_SACKRNG, n) if n >= 10 && (n - 2) % 8 == 0 => {
                         // Four blocks fill the option space; Repr keeps the first three.
                         let mut sack_ranges: [Option<(u32, u32)>; 4] = [None; 4];
 
@@ -870,7 +865,12 @@ impl<'a> Repr<'a> {
         let mut sack_ranges = [None, None, None];
         let mut timestamp = None;
         while !options.is_empty() {
-            let (next_options, option) = TcpOption::parse(options)?;
+            // An option whose Length is under 2 or runs past the header
+            // ends the list, and the segment is taken with the options
+            // before it, as Linux takes it (tcp_parse_options).
+            let Ok((next_options, option)) = TcpOption::parse(options) else {
+                break;
+            };
             match option {
                 TcpOption::EndOfList => break,
                 TcpOption::NoOperation => (),
@@ -1252,8 +1252,59 @@ mod test {
         assert_eq!(TcpOption::parse(&[0xc]), Err(Error));
         assert_eq!(TcpOption::parse(&[0xc, 0x05, 0x01, 0x02]), Err(Error));
         assert_eq!(TcpOption::parse(&[0xc, 0x01]), Err(Error));
-        assert_eq!(TcpOption::parse(&[0x2, 0x02]), Err(Error));
-        assert_eq!(TcpOption::parse(&[0x3, 0x02]), Err(Error));
+        assert_eq!(TcpOption::parse(&[0x2, 0x00]), Err(Error));
+    }
+
+    /// A known kind with a Length its RFC does not define reads as
+    /// unknown, which Linux ignores: MSS other than 4, Window Scale other
+    /// than 3, SACK-Permitted other than 2, SACK that is not whole blocks,
+    /// and Timestamps other than 10.
+    #[test]
+    fn test_known_kinds_of_other_lengths_are_unknown() {
+        for bytes in [
+            &[2, 2][..],
+            &[2, 3, 5],
+            &[2, 5, 5, 0xb4, 0],
+            &[3, 2],
+            &[3, 4, 7, 0],
+            &[4, 3, 0],
+            &[5, 2],
+            &[5, 9, 0, 0, 0, 1, 0, 0, 0],
+            &[5, 11, 0, 0, 0, 1, 0, 0, 0, 2, 0],
+            &[8, 9, 0, 0, 0, 1, 0, 0, 0],
+        ] {
+            assert_eq!(
+                TcpOption::parse(bytes),
+                Ok((
+                    &[][..],
+                    TcpOption::Unknown {
+                        kind: bytes[0],
+                        data: &bytes[2..]
+                    }
+                )),
+                "{bytes:?}"
+            );
+        }
+    }
+
+    /// A SYN whose last option runs past the header is taken with the
+    /// options before it, as Linux takes it.
+    #[test]
+    fn test_repr_stops_at_a_malformed_option() {
+        let options = [2, 4, 5, 0xb4, 3, 2, 30, 12, 0x01, 0x81, 0, 0];
+        let mut bytes = vec![0; 20 + options.len()];
+        let mut packet = Packet::new_unchecked(&mut bytes);
+        packet.set_src_port(1);
+        packet.set_dst_port(2);
+        packet.set_header_len(20 + options.len() as u8);
+        packet.set_syn(true);
+        packet.options_mut().copy_from_slice(&options);
+        packet.fill_checksum(&SRC_ADDR.into(), &DST_ADDR.into());
+        let packet = Packet::new_unchecked(&bytes[..]);
+        let repr = Repr::parse(&packet, &SRC_ADDR.into(), &DST_ADDR.into()).unwrap();
+        assert_eq!(repr.control, Control::Syn);
+        assert_eq!(repr.max_seg_size, Some(1460));
+        assert_eq!(repr.window_scale, None);
     }
 
     #[test]
@@ -1325,8 +1376,8 @@ mod test {
     }
 
     /// The bytes of a header with every option area a peer can send: no
-    /// parse panics, and `Repr::parse` succeeds exactly when every option
-    /// reads.
+    /// parse panics, at most one option fails to read, and `Repr::parse`
+    /// takes the segment whatever its options.
     #[test]
     fn test_hostile_option_areas() {
         fn check(options: &[u8]) {
@@ -1341,7 +1392,7 @@ mod test {
             let packet = Packet::new_unchecked(&bytes[..]);
             let read: Vec<_> = packet.options_iter().unwrap().collect();
             let repr = Repr::parse(&packet, &SRC_ADDR.into(), &DST_ADDR.into());
-            assert_eq!(repr.is_ok(), read.iter().all(Result::is_ok), "{options:?}");
+            assert!(repr.is_ok(), "{options:?}");
             assert!(read.iter().filter(|o| o.is_err()).count() <= 1);
             let _ = packet.options_summary();
         }

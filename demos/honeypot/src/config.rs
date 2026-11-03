@@ -113,11 +113,11 @@ pub enum ArgsError {
     /// An argument that is no flag here.
     Unknown(String),
     /// A flag with no value after it.
-    Missing(&'static str),
+    Missing(Flag),
     /// A flag whose value does not parse.
     Bad {
         /// The flag.
-        flag: &'static str,
+        flag: Flag,
         /// What followed it.
         value: String,
     },
@@ -127,26 +127,71 @@ impl std::fmt::Display for ArgsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ArgsError::Unknown(arg) => write!(f, "unknown argument {arg:?}"),
-            ArgsError::Missing(flag) => write!(f, "{flag} needs a value"),
-            ArgsError::Bad { flag, value } => write!(f, "{flag}: cannot use {value:?}"),
+            ArgsError::Missing(flag) => write!(f, "{} needs a value", flag.name()),
+            ArgsError::Bad { flag, value } => write!(f, "{}: cannot use {value:?}", flag.name()),
         }
     }
 }
 
 impl std::error::Error for ArgsError {}
 
-/// The flags that take a value, as written.
-const FLAGS: [&str; 9] = [
-    "--world",
-    "--log",
-    "--pcap",
-    "--address",
-    "--internet",
-    "--ssh",
-    "--http",
-    "--burst-window-ms",
-    "--burst-syns",
-];
+/// A flag of the command line. Each takes a value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Flag {
+    /// `--world`: [`Args::world`].
+    World,
+    /// `--log`: [`Args::log`].
+    Log,
+    /// `--pcap`: [`Args::pcap`].
+    Pcap,
+    /// `--address`: [`Config::address`].
+    Address,
+    /// `--internet`: [`Config::internet`].
+    Internet,
+    /// `--ssh`: a port with [`Service::Ssh`].
+    Ssh,
+    /// `--http`: a port with [`Service::Http`].
+    Http,
+    /// `--burst-window-ms`: [`Burst::window`].
+    BurstWindowMs,
+    /// `--burst-syns`: [`Burst::syns`].
+    BurstSyns,
+}
+
+impl Flag {
+    /// Every flag.
+    pub const ALL: [Flag; 9] = [
+        Flag::World,
+        Flag::Log,
+        Flag::Pcap,
+        Flag::Address,
+        Flag::Internet,
+        Flag::Ssh,
+        Flag::Http,
+        Flag::BurstWindowMs,
+        Flag::BurstSyns,
+    ];
+
+    /// The flag as written.
+    pub fn name(self) -> &'static str {
+        match self {
+            Flag::World => "--world",
+            Flag::Log => "--log",
+            Flag::Pcap => "--pcap",
+            Flag::Address => "--address",
+            Flag::Internet => "--internet",
+            Flag::Ssh => "--ssh",
+            Flag::Http => "--http",
+            Flag::BurstWindowMs => "--burst-window-ms",
+            Flag::BurstSyns => "--burst-syns",
+        }
+    }
+
+    /// The flag written as `arg`.
+    pub fn parse(arg: &str) -> Option<Flag> {
+        Flag::ALL.into_iter().find(|flag| flag.name() == arg)
+    }
+}
 
 impl Args {
     /// Reads the arguments after the program name.
@@ -162,7 +207,7 @@ impl Args {
         };
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
-            let Some(flag) = FLAGS.into_iter().find(|f| *f == arg) else {
+            let Some(flag) = Flag::parse(&arg) else {
                 return Err(ArgsError::Unknown(arg));
             };
             let value = args.next().ok_or(ArgsError::Missing(flag))?;
@@ -172,27 +217,26 @@ impl Args {
             };
             let config = &mut parsed.config;
             match flag {
-                "--world" => parsed.world = value.parse().map_err(|_| bad())?,
-                "--log" => parsed.log = value.into(),
-                "--pcap" => parsed.pcap = value.into(),
-                "--address" => config.address = value.parse().map_err(|_| bad())?,
-                "--internet" => config.internet = value.parse().map_err(|_| bad())?,
-                "--ssh" | "--http" => config.ports.push(Port {
+                Flag::World => parsed.world = value.parse().map_err(|_| bad())?,
+                Flag::Log => parsed.log = value.into(),
+                Flag::Pcap => parsed.pcap = value.into(),
+                Flag::Address => config.address = value.parse().map_err(|_| bad())?,
+                Flag::Internet => config.internet = value.parse().map_err(|_| bad())?,
+                Flag::Ssh => config.ports.push(Port {
                     number: value.parse().map_err(|_| bad())?,
-                    service: if flag == "--ssh" {
-                        Service::Ssh
-                    } else {
-                        Service::Http
-                    },
+                    service: Service::Ssh,
                 }),
-                "--burst-window-ms" => {
+                Flag::Http => config.ports.push(Port {
+                    number: value.parse().map_err(|_| bad())?,
+                    service: Service::Http,
+                }),
+                Flag::BurstWindowMs => {
                     config.burst.window = Duration::from_millis(value.parse().map_err(|_| bad())?)
                 }
-                "--burst-syns" => match value.parse() {
+                Flag::BurstSyns => match value.parse() {
                     Ok(n) if n > 0 => config.burst.syns = n,
                     _ => return Err(bad()),
                 },
-                _ => unreachable!("every flag in FLAGS has a case"),
             }
         }
         if parsed.config.ports.is_empty() {
@@ -208,6 +252,25 @@ mod tests {
 
     fn args(line: &str) -> Result<Args, ArgsError> {
         Args::parse(line.split_whitespace().map(String::from))
+    }
+
+    /// Every flag reads back from its name, and each name is one flag's.
+    #[test]
+    fn flags_read_by_name() {
+        for flag in Flag::ALL {
+            assert_eq!(Flag::parse(flag.name()), Some(flag));
+            let value = match flag {
+                Flag::World => "unix:/tmp/w.sock",
+                Flag::Address => "192.0.2.1",
+                Flag::Internet => "0.0.0.0/0",
+                _ => "7",
+            };
+            assert!(
+                args(&format!("{} {value}", flag.name())).is_ok(),
+                "{flag:?}"
+            );
+        }
+        assert_eq!(Flag::parse("--world=unix:/x"), None);
     }
 
     #[test]
@@ -247,14 +310,18 @@ mod tests {
 
     #[test]
     fn bad_arguments_say_what_is_wrong() {
-        assert_eq!(args("--ssh"), Err(ArgsError::Missing("--ssh")));
+        assert_eq!(args("--ssh"), Err(ArgsError::Missing(Flag::Ssh)));
         assert_eq!(args("--port 22"), Err(ArgsError::Unknown("--port".into())));
         assert_eq!(
             args("--address example"),
             Err(ArgsError::Bad {
-                flag: "--address",
+                flag: Flag::Address,
                 value: "example".into()
             })
+        );
+        assert_eq!(
+            args("--burst-syns 0").unwrap_err().to_string(),
+            "--burst-syns: cannot use \"0\""
         );
         assert!(args("--burst-syns 0").is_err());
         assert!(args("--world /no/scheme").is_err());
