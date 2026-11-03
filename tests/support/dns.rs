@@ -48,10 +48,11 @@ use fictionet::stdlib::services::dns::zone::{AnyResponse, Denial, Zone, ZoneData
 use fictionet::stdlib::world::net::Host;
 use fictionet::stdlib::world::net::dns::Authoritative;
 use fictionet::stdlib::world::net::dns::internet::{
-    self, ARPA_SERVERS, Egress, GTLD_SERVERS, IN_ADDR_SERVERS, Location, PUBLIC_RESOLVERS,
-    ROOT_LETTERS,
+    self, ARPA_SERVERS, GTLD_SERVERS, IN_ADDR_SERVERS, ROOT_LETTERS,
 };
 use fictionet::{Seed, SeededEntropy};
+use fictionet_extras::dns::place::Place;
+use fictionet_extras::dns::public::PUBLIC_RESOLVERS;
 
 /// The date every test of this internet runs at: 2026-11-01 00:00:00 UTC.
 pub const START: u64 = 1_793_491_200;
@@ -111,7 +112,7 @@ pub struct TestInternet {
     /// Every other server.
     servers: Vec<Server>,
     anchor: TrustAnchor,
-    location: Location,
+    place: Place,
 }
 
 /// A server of one zone at its own addresses.
@@ -289,7 +290,7 @@ impl TestInternet {
             gtld: Arc::new(gtld),
             servers,
             anchor: keys.root.anchor(&Name::root()),
-            location: Location::san_francisco_bay_area(Some(Egress(EGRESS))),
+            place: Place::san_francisco_bay_area(),
         }
     }
 
@@ -347,8 +348,8 @@ impl TestInternet {
     }
 
     /// Where this internet is seen from.
-    pub fn location(&self) -> &Location {
-        &self.location
+    pub fn place(&self) -> &Place {
+        &self.place
     }
 
     /// An Unbound-like resolver for this internet: [`Config::gateway`],
@@ -382,7 +383,7 @@ impl TestInternet {
             );
         }
         for server in &GTLD_SERVERS {
-            let front = ServerConfig::gtld(self.location.site(IpAddr::V4(server.v4)).identity);
+            let front = ServerConfig::gtld(self.place.site(IpAddr::V4(server.v4)).identity);
             serve(&server.addresses(), &front, &self.gtld);
         }
         for server in &self.servers {
@@ -392,17 +393,13 @@ impl TestInternet {
     }
 
     /// Every server as a host running [`Authoritative`]: the root letters
-    /// and the `gtld-servers.net` servers from the
-    /// [`internet`](fictionet::stdlib::world::net::dns::internet) presets,
-    /// and every other server behind half the location's round trip to
-    /// an authority.
+    /// and the `gtld-servers.net` servers as the place sees them
+    /// ([`Place::root_servers`], [`Place::gtld_servers`]), and every
+    /// other server behind half the place's round trip to an authority.
     pub fn hosts(&self) -> Vec<Host> {
-        let at = &self.location;
-        let mut hosts = internet::root_servers(|s| Authoritative::new(self.root.clone(), s), at);
-        hosts.extend(internet::gtld_servers(
-            |s| Authoritative::new(self.gtld.clone(), s),
-            at,
-        ));
+        let at = &self.place;
+        let mut hosts = at.root_servers(|s| Authoritative::new(self.root.clone(), s));
+        hosts.extend(at.gtld_servers(|s| Authoritative::new(self.gtld.clone(), s)));
         for server in &self.servers {
             let host = server.addresses.iter().fold(
                 Host::new(server.name.trim_end_matches('.')),
@@ -415,7 +412,7 @@ impl TestInternet {
         hosts
     }
 
-    /// The front [`internet::root_servers`] gives the letter at `v4`.
+    /// The front [`Place::root_servers`] gives the letter at `v4`.
     pub fn letter_front(&self, v4: Ipv4Addr) -> ServerConfig {
         let letter = ROOT_LETTERS
             .iter()
@@ -424,7 +421,7 @@ impl TestInternet {
         ServerConfig {
             payload: letter.payload,
             any: letter.any,
-            ..ServerConfig::root(self.location.site(IpAddr::V4(v4)).identity)
+            ..ServerConfig::root(self.place.site(IpAddr::V4(v4)).identity)
         }
     }
 }

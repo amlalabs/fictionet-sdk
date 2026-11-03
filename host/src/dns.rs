@@ -7,9 +7,7 @@
 //! only waits for the outcome.
 
 use std::future::Future;
-use std::net::IpAddr;
 use std::pin::Pin;
-use std::str::FromStr;
 
 use futures_util::StreamExt;
 use hickory_net::DnsStreamHandle;
@@ -20,37 +18,22 @@ use tokio::runtime::Runtime;
 use tokio::task::AbortHandle;
 
 use fictionet::Cx;
-use fictionet::stdlib::protocols::dns::op::{
-    Edns, Message, MessageType, OpCode, Query, SerialMessage,
-};
-use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RData, RecordType};
-use fictionet::stdlib::protocols::dns::{Nsid, read_message};
+use fictionet::stdlib::protocols::dns::op::{Edns, Message, MessageType, OpCode, SerialMessage};
+use fictionet::stdlib::protocols::dns::read_message;
 use fictionet::stdlib::services::dns::{Looked, Lookup};
 use fictionet::stdlib::world::net::dns::Upstream;
-use fictionet::sync::Mutex;
 
 /// The UDP payload size a lookup advertises: the size the DNS Flag Day
 /// 2020 settled on (RFC 6891 §6.2.5).
 const PAYLOAD: u16 = 1232;
-
-/// `ns1.google.com`, which answers a TXT question for [`WHOAMI`] with the
-/// address the question came from.
-const WHOAMI_SERVER: std::net::SocketAddr =
-    std::net::SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(216, 239, 32, 10)), 53);
-
-/// Google's name for asking which address a question came from.
-const WHOAMI: &str = "o-o.myaddr.l.google.com.";
-
-/// The zone [`WHOAMI`] is in.
-const WHOAMI_ZONE: &str = "google.com.";
 
 /// The internet's DNS servers, asked from this host.
 ///
 /// Each lookup goes out as one query over UDP through hickory's
 /// `UdpStream`: a fresh ID drawn from the run's seeded random stream
 /// (RFC 5452 §9.2) from a source port hickory picks at random, the
-/// lookup's question and RD bit, and an OPT record with a 1232-octet
-/// payload, DO set (RFC 3225 §3), and an NSID request (RFC 5001). A
+/// lookup's question without recursion, and an OPT record with a
+/// 1232-octet payload and DO set (RFC 3225 §3). A
 /// datagram from another address or port, or without that ID and the
 /// question back, is ignored (RFC 5452 §9.1), and so is one that does not
 /// decode. A UDP response with TC set is asked again over one TCP
@@ -68,7 +51,6 @@ const WHOAMI_ZONE: &str = "google.com.";
 /// when it gives up, which stops it here too.
 pub struct Internet {
     runtime: Option<Runtime>,
-    egress: Mutex<Option<IpAddr>>,
 }
 
 impl Default for Internet {
@@ -88,43 +70,7 @@ impl Internet {
             .expect("create the DNS runtime");
         Internet {
             runtime: Some(runtime),
-            egress: Mutex::new(None),
         }
-    }
-
-    /// This host's public IPv4 address, as a real authority sees it: the
-    /// answer `ns1.google.com` gives for `o-o.myaddr.l.google.com` TXT.
-    /// The first answer is kept, so the internet is asked once. `None`
-    /// when the server cannot be reached or its answer holds no address.
-    pub async fn egress(&self, fcx: &Cx) -> Option<IpAddr> {
-        self.whoami(fcx, WHOAMI_SERVER).await
-    }
-
-    /// The address `server` says a whoami question came from.
-    async fn whoami(&self, fcx: &Cx, server: std::net::SocketAddr) -> Option<IpAddr> {
-        if let Some(address) = *self.egress.lock() {
-            return Some(address);
-        }
-        let question = Query::query(
-            Name::from_ascii(WHOAMI).expect("a valid name"),
-            RecordType::TXT,
-        );
-        let zone = LowerName::new(&Name::from_ascii(WHOAMI_ZONE).expect("a valid name"));
-        let lookup = Lookup::new(server, zone, &question);
-        let Looked::Response(response) = self.lookup(fcx, lookup).await else {
-            return None;
-        };
-        let address = response
-            .answers
-            .into_iter()
-            .find_map(|record| match record.data {
-                RData::TXT(txt) => txt
-                    .txt_data
-                    .iter()
-                    .find_map(|text| IpAddr::from_str(std::str::from_utf8(text).ok()?).ok()),
-                _ => None,
-            })?;
-        Some(*self.egress.lock().get_or_insert(address))
     }
 }
 
@@ -163,15 +109,13 @@ impl Upstream for Internet {
     }
 }
 
-/// The query for `lookup` with `id`: its question and RD bit, and an OPT
-/// record with DO set and an NSID request.
+/// The query for `lookup` with `id`: its question without recursion, and
+/// an OPT record with DO set.
 fn query(id: u16, lookup: &Lookup) -> Vec<u8> {
     let mut message = Message::new(id, MessageType::Query, OpCode::Query);
-    message.metadata.recursion_desired = lookup.recursion_desired;
     message.add_query(lookup.question.clone());
     let mut edns = Edns::new();
     edns.set_max_payload(PAYLOAD).set_dnssec_ok(true);
-    edns.options_mut().insert(Nsid(Vec::new()).to_option());
     message.set_edns(edns);
     message
         .to_vec()
@@ -247,10 +191,11 @@ impl Drop for Abort {
 mod tests {
     use super::*;
     use fictionet::Seed;
-    use fictionet::stdlib::protocols::dns::rr::Record;
-    use fictionet::stdlib::protocols::dns::rr::rdata::{A, TXT};
+    use fictionet::stdlib::protocols::dns::op::Query;
+    use fictionet::stdlib::protocols::dns::rr::rdata::A;
+    use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RData, Record, RecordType};
     use std::io::{Read, Write};
-    use std::net::{Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
+    use std::net::{SocketAddr, TcpListener, UdpSocket};
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
@@ -359,7 +304,7 @@ mod tests {
             let over_udp = queries.recv().unwrap();
             let over_tcp = queries.recv().unwrap();
             // The same query on both transports: the lookup's question,
-            // no recursion, and DO with an NSID request.
+            // no recursion, and DO with no options.
             assert_eq!(without_id(&over_udp), without_id(&over_tcp));
             let query = Message::from_vec(&over_udp).unwrap();
             assert!(!query.metadata.recursion_desired);
@@ -368,12 +313,7 @@ mod tests {
             let edns = query.edns.expect("an OPT record");
             assert!(edns.flags().dnssec_ok);
             assert_eq!(edns.max_payload(), PAYLOAD);
-            assert!(
-                edns.options()
-                    .as_ref()
-                    .iter()
-                    .any(|(_, option)| Nsid::from_option(option).is_some())
-            );
+            assert!(edns.options().as_ref().is_empty());
         });
         server_thread.join().unwrap();
     }
@@ -435,36 +375,6 @@ mod tests {
                 RecordType::Unknown(65281)
             );
             assert_eq!(response.answers[0].ttl, 300);
-        });
-        server_thread.join().unwrap();
-    }
-
-    #[test]
-    fn egress_is_the_address_in_the_whoami_answer_and_is_asked_once() {
-        let (udp, _tcp) = sockets();
-        let server = udp.local_addr().unwrap();
-        let server_thread = thread::spawn(move || {
-            let mut buffer = [0; 1232];
-            let (length, client) = udp.recv_from(&mut buffer).unwrap();
-            let asked = &buffer[..length];
-            let question = Message::from_vec(asked).unwrap();
-            assert_eq!(question.queries[0].name().to_ascii(), WHOAMI);
-            assert_eq!(question.queries[0].query_type(), RecordType::TXT);
-            let answer = Record::from_rdata(
-                Name::from_ascii(WHOAMI).unwrap(),
-                60,
-                RData::TXT(TXT::new(vec!["203.0.113.9".to_string()])),
-            );
-            udp.send_to(&reply_to(asked, vec![answer], false), client)
-                .unwrap();
-            // A second question would find no one answering.
-            drop(udp);
-        });
-        run(async move |fcx| {
-            let internet = Internet::new();
-            let expected = Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)));
-            assert_eq!(internet.whoami(&fcx, server).await, expected);
-            assert_eq!(internet.whoami(&fcx, server).await, expected);
         });
         server_thread.join().unwrap();
     }

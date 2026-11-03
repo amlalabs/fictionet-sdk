@@ -983,7 +983,6 @@ fn a_learned_server_looks_up_what_it_lacks_and_answers_from_what_it_filed() {
         lookup,
         lookup_of("example.test.", "www.example.test.", RecordType::A)
     );
-    assert!(!lookup.recursion_desired);
     assert_eq!(
         engine.next_deadline(),
         Some(Instant::ZERO + Duration::from_secs(5))

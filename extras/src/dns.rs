@@ -14,6 +14,16 @@
 //! A lookup the capture does not hold gets no reply: the world's server
 //! that needed it stays silent, and a resolver caches a failure for the
 //! name, not a negative answer.
+//!
+//! The real internet's DNS as a world plays it lives here too, beside the
+//! SDK's primitives: [`public`] has the large public resolvers, [`doh`]
+//! what their DNS over HTTPS servers answer past RFC 8484, and [`place`]
+//! how the root, `gtld-servers.net`, and public resolver servers look
+//! from one place.
+
+pub mod doh;
+pub mod place;
+pub mod public;
 
 use std::collections::{HashMap, HashSet};
 use std::future::{Future, ready};
@@ -79,8 +89,8 @@ impl<U: Upstream> Capture<U> {
 
     /// Appends the responses kept since the last write to the archive at
     /// `path`, and forgets them. Each becomes a `request` record with the
-    /// query the lookup stands for (its question and RD bit, with DO set,
-    /// as every lookup asks), then a `response` record with the response,
+    /// query the lookup stands for (its question, without recursion and
+    /// with DO set, as every lookup asks), then a `response` record with the response,
     /// which names the request in `WARC-Concurrent-To`. A lookup whose
     /// query or response does not write is left out.
     pub fn write(&self, path: &Path) -> io::Result<()> {
@@ -142,11 +152,10 @@ impl<U: Upstream> Upstream for Capture<U> {
     }
 }
 
-/// The query `lookup` stands for, with ID 0: its question and RD bit, and
-/// an OPT record with DO set.
+/// The query `lookup` stands for, with ID 0: its question, without
+/// recursion, and an OPT record with DO set.
 fn query(lookup: &Lookup) -> Message {
     let mut message = Message::new(0, MessageType::Query, OpCode::Query);
-    message.metadata.recursion_desired = lookup.recursion_desired;
     message.add_query(lookup.question.clone());
     let mut edns = Edns::new();
     edns.set_max_payload(PAYLOAD).set_dnssec_ok(true);

@@ -28,10 +28,11 @@ use fictionet::stdlib::services::dns::Event;
 use fictionet::stdlib::services::dns::authority::{ChaosAnswer, Identity, chaos};
 use fictionet::stdlib::world::net::Net;
 use fictionet::stdlib::world::net::dns::Recursive;
-use fictionet::stdlib::world::net::dns::internet::{
-    self, GTLD_SERVERS, PUBLIC_RESOLVERS, ROOT_LETTERS,
+use fictionet::stdlib::world::net::dns::internet::{GTLD_SERVERS, ROOT_LETTERS};
+use fictionet_extras::dns::public::PUBLIC_RESOLVERS;
+use fictionet_test_support::dns::{
+    ECH, EGRESS, EXAMPLE_COM, ROOT_SERIAL, TestInternet, WWW_EXAMPLE_COM,
 };
-use fictionet_test_support::dns::{ECH, EXAMPLE_COM, ROOT_SERIAL, TestInternet, WWW_EXAMPLE_COM};
 use fictionet_test_support::sandbox::{Machine, machine};
 
 use super::slices::{ME, edes, tcp, udp};
@@ -62,7 +63,7 @@ where
 {
     world(Duration::from_secs(300), move |fcx| async move {
         let internet = TestInternet::new();
-        let at = internet.location().clone();
+        let at = internet.place().clone();
         let clock = TestInternet::clock();
         let anchors = internet.anchors();
         let config = internet.config();
@@ -71,15 +72,13 @@ where
         let (attacher, attachments) = fictionet::attachments();
         Net::new()
             .hosts(internet.hosts())
-            .hosts(internet::public_resolvers(
-                |resolver, host| {
-                    host.program(
-                        Recursive::new(resolver.config(&at).anchors(anchors.clone()), clock)
-                            .per_sandbox(),
-                    )
-                },
-                &at,
-            ))
+            .hosts(at.public_resolvers(|resolver, site, host| {
+                let config = resolver.config(site.identity.clone());
+                let config = resolver
+                    .whoami(config, site, EGRESS)
+                    .anchors(anchors.clone());
+                host.program(Recursive::new(config, clock).per_sandbox())
+            }))
             .gateway(move |host, _declared| {
                 let seen = seen.clone();
                 host.program(
@@ -487,14 +486,14 @@ fn p_edns() {
             .map(|letter| letter.server.v4)
             .find(|v4| {
                 p.internet
-                    .location()
+                    .place()
                     .site(IpAddr::V4(*v4))
                     .identity
                     .nsid
                     .is_some()
             })
             .expect("a root letter with an NSID here");
-        let letter_nsid = p.internet.location().site(IpAddr::V4(letter)).identity.nsid;
+        let letter_nsid = p.internet.place().site(IpAddr::V4(letter)).identity.nsid;
         for (server, nsid_expected) in [(letter, letter_nsid), (GATEWAY, None)] {
             let mut plain = dig(1, "example.com.", RecordType::NS);
             plain.edns = None;
@@ -770,7 +769,7 @@ fn identity_answer(identity: &Identity, name: LowerName) -> (ResponseCode, Vec<S
 #[test]
 fn p_chaos() {
     probe(|fcx, p| async move {
-        let at = p.internet.location().clone();
+        let at = p.internet.place().clone();
         let k_root = ROOT_LETTERS[10].server.v4;
         let unbound = Identity::none().answer(
             chaos::version_bind(),

@@ -28,11 +28,12 @@ use std::time::SystemTime;
 
 use fictionet::stdlib::protocols::dns::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use fictionet::stdlib::protocols::dns::rr::{Name, RecordType};
+use fictionet::stdlib::services::dns::authority::{Identity, ServerConfig};
 use fictionet::stdlib::services::dns::resolver::Config;
 use fictionet::stdlib::services::dns::{Client, WallClock};
 use fictionet::stdlib::services::serve::Transport;
 use fictionet::stdlib::world::net::Net;
-use fictionet::stdlib::world::net::dns::internet::{self, Location, Mirror};
+use fictionet::stdlib::world::net::dns::internet::{self, Mirror};
 use fictionet::stdlib::world::net::dns::{Recursive, ResolverHandle, Upstream};
 use fictionet::sync::Mutex;
 use fictionet::{Cx, Seed};
@@ -139,20 +140,36 @@ async fn walk(
     let clock = WallClock {
         start: SystemTime::now() - fcx.now().since_start(),
     };
-    // Where the servers are only sets their identities and round trips,
-    // which the capture does not keep.
-    let location = Location::san_francisco_bay_area(None);
     let net = Net::new().ipv4_only().drop_unrouted();
-    let mirror = Mirror::new(upstream, net.handle(), &location);
+    // The root letters serve the root, and the `gtld-servers.net`
+    // servers `com` and `net`.
+    let mut mirror = Mirror::new(upstream, net.handle());
+    for letter in &internet::ROOT_LETTERS {
+        for addr in letter.server.addresses() {
+            mirror = mirror.serves(addr, &Name::root());
+        }
+    }
+    for server in &internet::GTLD_SERVERS {
+        for addr in server.addresses() {
+            for zone in ["com.", "net."] {
+                mirror = mirror.serves(addr, &Name::from_ascii(zone)?);
+            }
+        }
+    }
     let recursive = Recursive::new(Config::unbound(), clock);
     let resolver = recursive.handle();
     let (_attacher, attachments) = fictionet::attachments();
-    net.hosts(internet::root_servers(|s| mirror.server(s), &location))
-        .hosts(internet::gtld_servers(|s| mirror.server(s), &location))
-        .host("resolver", |host| {
-            host.at(RESOLVER).ipv4_only().program(recursive)
-        })
-        .start(fcx, attachments)?;
+    // What the servers say about themselves does not reach the capture.
+    net.hosts(internet::root_servers(|_, host| {
+        host.program(mirror.server(ServerConfig::root(Identity::none())))
+    }))
+    .hosts(internet::gtld_servers(|_, host| {
+        host.program(mirror.server(ServerConfig::gtld(Identity::none())))
+    }))
+    .host("resolver", |host| {
+        host.at(RESOLVER).ipv4_only().program(recursive)
+    })
+    .start(fcx, attachments)?;
     // Each program starts in a task of its own, and the resolver's handle
     // gives nothing until it runs. The walk waits for it with the question
     // the resolver asks first itself: the root's NS RRset (RFC 8109).

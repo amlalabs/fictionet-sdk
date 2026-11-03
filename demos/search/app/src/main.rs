@@ -4,6 +4,7 @@ mod guest;
 use fictionet_search_demo::{network, page};
 
 use fictionet_demo::kit;
+use fictionet_extras::dns::place::Place;
 use std::{path::PathBuf, sync::Arc, time::Instant};
 use web_world::{
     Ca, World,
@@ -150,12 +151,12 @@ async fn main() -> Result {
                 world_page.attach_world(&cx, world_pages.clone());
                 *world_cx.lock().unwrap() = Some(cx.clone());
                 let egress = world_pages.egress(&cx).await;
-                let location = world_pages.location(&cx, egress).await;
                 let web = World {
                     ca: Arc::new(Ca::new(&cx, &world_roots, earliest, start)?),
                     pages: world_pages,
                     start,
-                    location,
+                    place: Place::san_francisco_bay_area(),
+                    egress,
                 };
                 let net =
                     network::build(&web, &cx, world_token)?.route(kit::JUMP, kit::jump_prefix());

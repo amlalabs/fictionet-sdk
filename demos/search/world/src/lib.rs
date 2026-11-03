@@ -37,10 +37,12 @@ use fictionet::stdlib::services::dns::zone::{Filing, Section};
 use fictionet::stdlib::services::tls::ServerConfig;
 use fictionet::stdlib::web;
 use fictionet::stdlib::world::net::dns::encrypted::Fronts;
-use fictionet::stdlib::world::net::dns::internet::{self, Location, Mirror, PUBLIC_RESOLVERS};
+use fictionet::stdlib::world::net::dns::internet::{GTLD_SERVERS, Mirror, ROOT_LETTERS};
 use fictionet::stdlib::world::net::dns::{Only, PerSession, Recursive};
 use fictionet::stdlib::world::net::{Host, Net, NetHandle};
 use fictionet::sync::Mutex;
+use fictionet_extras::dns::place::Place;
+use fictionet_extras::dns::public::PUBLIC_RESOLVERS;
 
 use observation::SearchObs;
 use pages::Pages;
@@ -68,15 +70,17 @@ pub use tls::Ca;
 /// leaves: the `forwarded` host given for that name, such as the model
 /// gateway, or a site whose pages come from [`Pages`]. So the guest connects to the
 /// address the real DNS gave, and the world changes the machine there,
-/// never the DNS. `location` is where the host is ([`Pages::location`]),
-/// with its public address, when known, which the public resolvers'
-/// whoami names answer with.
+/// never the DNS. `place` is how far away the real servers are and which
+/// instance of each answers, and `egress` the host's public address
+/// ([`Pages::egress`]), when known, which the public resolvers' whoami
+/// names answer with.
 pub fn net(
     fcx: &Cx,
     ca: Arc<Ca>,
     pages: Arc<Pages>,
     start: SystemTime,
-    location: Location,
+    place: Place,
+    egress: Option<Ipv4Addr>,
     forwarded: impl IntoIterator<Item = (Name, Host)>,
 ) -> Net {
     let mut forwarded: HashMap<LowerName, Host> = forwarded
@@ -125,10 +129,34 @@ pub fn net(
             }
         });
     }
-    let mut mirror = Mirror::new(Only::new(outbound.policy(), upstream), handle, &location)
+    let mut mirror = Mirror::new(Only::new(outbound.policy(), upstream), handle)
+        .delay(place.authority_rtt / 2)
         .namespace(&namespace)
         .observe(outbound.observer())
         .observe(move |filing| sites.place(filing));
+    // The root letters serve the root, and the `gtld-servers.net`
+    // servers `com` and `net`.
+    for letter in &ROOT_LETTERS {
+        for addr in letter.server.addresses() {
+            mirror = mirror.serves(addr, &Name::root());
+        }
+    }
+    for server in &GTLD_SERVERS {
+        for addr in server.addresses() {
+            for zone in ["com.", "net."] {
+                mirror = mirror.serves(addr, &Name::from_ascii(zone).expect("a valid name"));
+            }
+        }
+    }
+    // The host asks every real server itself, so a real server that
+    // echoes the asker's address would show the host's. A public
+    // resolver's reply shows the resolver's own egress instead.
+    if let Some(egress) = egress {
+        let echo = place.echo(egress);
+        mirror = mirror
+            .egress(IpAddr::V4(egress))
+            .wrap(move |authority| echo.over(authority));
+    }
     // Each public resolver's DNS over HTTPS names, such as
     // `cloudflare-dns.com`, have addresses of their own, where the mirror
     // places a front that puts queries to the resolver's primary address.
@@ -156,22 +184,22 @@ pub fn net(
     let gateway_observe = observe.clone();
     let gateway_namespace = namespace.clone();
     let (report_cx, report_pages) = (fcx.clone(), pages);
-    net.hosts(internet::root_servers(
-        |server| mirror.server(server),
-        &location,
-    ))
-    .hosts(internet::gtld_servers(
-        |server| mirror.server(server),
-        &location,
-    ))
-    .hosts(internet::public_resolvers(
-        |resolver, host| {
+    net.hosts(place.root_servers(|server| mirror.server(server)))
+        .hosts(place.gtld_servers(|server| mirror.server(server)))
+        .hosts(place.public_resolvers(|resolver, site, host| {
+            let config = resolver.config(site.identity.clone());
+            let config = match egress {
+                Some(egress) => resolver.whoami(config, site, egress),
+                None => config,
+            };
             let config = Config {
                 negative_anchors: Some(negative_anchors.clone()),
-                ..resolver.config(&location)
+                ..config
             };
-            let recursive = resolver
-                .recursive(config, clock)
+            // One engine and cache per sandbox, so sandboxes can neither
+            // warm nor probe each other's caches.
+            let recursive = Recursive::new(config, clock)
+                .per_sandbox()
                 .namespace(&namespace)
                 .on_event(observe.clone());
             let (ca, served) = (resolver_ca.clone(), *resolver);
@@ -186,41 +214,39 @@ pub fn net(
             };
             let fronts = Fronts::new(recursive.handle(), tls)
                 .names(resolver.doh())
-                .operator(resolver.doh_operator)
                 .date(start);
             // The primary address comes first, and its fronts serve the
             // resolver's DNS over HTTPS names elsewhere.
             let primary = IpAddr::V4(resolver.addresses[0].v4);
             doh.lock()
                 .entry(primary)
-                .or_insert_with(|| fronts.clone().resolver_at(primary));
+                .or_insert_with(|| resolver.doh_fronts(fronts.clone().resolver_at(primary)));
+            let fronts = resolver.doh_fronts(fronts);
             fronts.doh(fronts.dot(host.program(recursive)))
-        },
-        &location,
-    ))
-    .gateway(move |host, _declared| {
-        // No declared data: every site the world places declares its
-        // name, and every name it serves is real, so the real
-        // hierarchy answers for all of them.
-        let config = Config {
-            negative_anchors: Some(negative_anchors.clone()),
-            ..Config::unbound()
-        };
-        host.program(
-            Recursive::new(config, clock)
-                .namespace(&gateway_namespace)
-                .on_event(gateway_observe.clone()),
-        )
-    })
-    .on_unreachable(move |unreachable| {
-        report_pages.report(
-            &report_cx,
-            SearchObs::NoRoute {
-                from: unreachable.from,
-                to: unreachable.to,
-            },
-        );
-    })
+        }))
+        .gateway(move |host, _declared| {
+            // No declared data: every site the world places declares its
+            // name, and every name it serves is real, so the real
+            // hierarchy answers for all of them.
+            let config = Config {
+                negative_anchors: Some(negative_anchors.clone()),
+                ..Config::unbound()
+            };
+            host.program(
+                Recursive::new(config, clock)
+                    .namespace(&gateway_namespace)
+                    .on_event(gateway_observe.clone()),
+            )
+        })
+        .on_unreachable(move |unreachable| {
+            report_pages.report(
+                &report_cx,
+                SearchObs::NoRoute {
+                    from: unreachable.from,
+                    to: unreachable.to,
+                },
+            );
+        })
 }
 
 /// What puts each served name's machine at the real addresses the
@@ -462,12 +488,14 @@ impl Sites {
 }
 
 /// A world kept in memory: its CA, its pages, the run's start on the host
-/// clock, and where the host is on the internet.
+/// clock, where the host is on the internet, and its public address when
+/// known.
 pub struct World {
     pub ca: Arc<Ca>,
     pub pages: Arc<Pages>,
     pub start: SystemTime,
-    pub location: Location,
+    pub place: Place,
+    pub egress: Option<Ipv4Addr>,
 }
 
 impl World {
@@ -478,7 +506,8 @@ impl World {
             self.ca.clone(),
             self.pages.clone(),
             self.start,
-            self.location.clone(),
+            self.place.clone(),
+            self.egress,
             forwarded,
         )
     }

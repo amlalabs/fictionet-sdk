@@ -1,7 +1,7 @@
 //! Issue host certificates using the world clock and its certificate authority.
 
-use fictionet::stdlib::world::net::dns::internet::PublicResolver;
 use fictionet::{Cx, stdlib::services::tls::ServerConfig};
+use fictionet_extras::dns::public::PublicResolver;
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, OnceLock},

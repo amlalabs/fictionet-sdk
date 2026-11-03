@@ -13,6 +13,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::net::{IpAddr, Ipv4Addr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,10 +24,9 @@ use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RData, Record};
 use fictionet::stdlib::protocols::dns::{dname_substitute, label_count};
 use fictionet::stdlib::services::dns::zone::{Filing, dname_target};
 use fictionet::stdlib::services::dns::{Looked, Lookup};
-use fictionet::stdlib::world::net::dns::internet::{Egress, Location};
 use fictionet::stdlib::world::net::dns::{PerSession, Upstream};
 use fictionet::sync::Mutex;
-use fictionet_extras::dns::Replay;
+use fictionet_extras::dns::{Replay, public};
 use fictionet_host::dns::Internet;
 
 use crate::pages::{Pages, Source as Mode};
@@ -608,27 +608,22 @@ impl Pages {
     /// `None` when the host cannot ask, as on a network that lets DNS
     /// reach only its own resolver or has no IPv4: the world runs all the
     /// same, and leaves those names to the real hierarchy.
-    pub async fn egress(&self, fcx: &Cx) -> Option<Egress> {
+    pub async fn egress(&self, fcx: &Cx) -> Option<Ipv4Addr> {
         let internet = self.live_dns();
         let found = fcx
-            .race(Some(fcx.now() + EGRESS_WAIT), internet.egress(fcx))
+            .race(
+                Some(fcx.now() + EGRESS_WAIT),
+                public::egress(fcx, &*internet),
+            )
             .await;
         match found {
-            Ok(Some(std::net::IpAddr::V4(address))) => Some(Egress(address)),
-            Ok(Some(std::net::IpAddr::V6(_))) | Ok(None) | Err(_) => {
+            Ok(Some(IpAddr::V4(address))) => Some(address),
+            Ok(Some(IpAddr::V6(_))) | Ok(None) | Err(_) => {
                 eprintln!(
                     "The host's public IPv4 address is unknown: ns1.google.com did not tell it"
                 );
                 None
             }
         }
-    }
-
-    /// Where the host is on the internet, as the root, `gtld-servers.net`,
-    /// and public resolver servers it reaches describe themselves, so
-    /// their answers agree with `egress` wherever the host runs.
-    pub async fn location(&self, fcx: &Cx, egress: Option<Egress>) -> Location {
-        let internet = self.live_dns();
-        Location::measured(fcx, &*internet, egress, EGRESS_WAIT).await
     }
 }

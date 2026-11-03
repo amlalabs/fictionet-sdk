@@ -28,17 +28,18 @@ use fictionet::stdlib::services::dns::resolver::Config;
 use fictionet::stdlib::services::dns::zone::{Denial, Node, Zone, ZoneData};
 use fictionet::stdlib::services::dns::{Event, WallClock};
 use fictionet::stdlib::services::serve::Transport;
-use fictionet::stdlib::web::httpd::{self, Body};
-use fictionet::stdlib::world::net::dns::encrypted::{Fronts, Operator};
-use fictionet::stdlib::world::net::dns::internet::PUBLIC_RESOLVERS;
+use fictionet::stdlib::web::httpd::{self, Body, Exchange, Handler, Reply};
+use fictionet::stdlib::world::net::dns::encrypted::Fronts;
 use fictionet::stdlib::world::net::dns::{Authoritative, Recursive};
 use fictionet::stdlib::world::net::{Host, Net};
 use fictionet::{Seed, SeededEntropy};
+use fictionet_extras::dns::doh;
+use fictionet_extras::dns::public::PUBLIC_RESOLVERS;
 use fictionet_extras::hyper_io::{Exec, Io};
 use fictionet_test_support::certs;
 use fictionet_test_support::sandbox::{Machine, TlsClient, client_config, machine};
 use fictionet_test_support::timeout;
-use http::{HeaderMap, Method, Request, Response, StatusCode};
+use http::{HeaderMap, Method, Request, StatusCode};
 use http_body_util::{BodyExt, Full};
 use rustls::RootCertStore;
 
@@ -238,26 +239,18 @@ fn recursive(anchors: Anchors, sent: &Arc<Mutex<Vec<Sent>>>) -> Recursive {
         })
 }
 
-/// An operator serving both JSON APIs, so each form of question answers
+/// A fallback serving both JSON APIs, so each form of question answers
 /// from the one cache.
-#[derive(Debug)]
-struct BothJson;
+struct BothJson(Fronts);
 
-impl Operator for BothJson {
-    fn resolve_json(&self) -> bool {
-        true
-    }
-
-    fn dns_json(&self) -> bool {
-        true
-    }
-
-    fn not_found(&self, _request: &Request<Body>) -> Response<Body> {
-        httpd::text(StatusCode::NOT_FOUND, "Not found.\n")
-    }
-
-    fn no_query(&self, _request: &Request<Body>) -> Response<Body> {
-        httpd::text(StatusCode::BAD_REQUEST, "No query.\n")
+impl Handler for BothJson {
+    fn call(&self, request: Request<Body>, ex: &mut Exchange<'_>) -> Reply {
+        match request.uri().path() {
+            "/resolve" => doh::resolve(&self.0, &request, ex),
+            "/dns-query" if doh::asks_dns_json(&request) => doh::dns_json(&self.0, &request, ex),
+            "/dns-query" => Reply::Now(httpd::text(StatusCode::BAD_REQUEST, "No query.\n")),
+            _ => Reply::Now(httpd::text(StatusCode::NOT_FOUND, "Not found.\n")),
+        }
     }
 }
 
@@ -274,8 +267,8 @@ fn start(fcx: &Cx, attachments: fictionet::Attachments) -> fictionet::Result<Env
     let resolver = recursive(anchors, &sent);
     let fronts = Fronts::new(resolver.handle(), move |_| tls.clone())
         .names([name("dns.example.")])
-        .operator(&BothJson)
         .date(date(NOW));
+    let fronts = fronts.clone().fallback(Arc::new(BothJson(fronts)));
     Net::new()
         .ipv4_only()
         .hosts(hosts)
@@ -1022,10 +1015,11 @@ fn each_public_resolver_answers_dns_over_https_as_its_operator() {
             .enumerate()
             .map(|(n, public)| {
                 let config = config.clone();
-                Fronts::new(resolver.handle(), move |_| config.clone())
+                let fronts = Fronts::new(resolver.handle(), move |_| config.clone())
                     .names(public.doh())
-                    .operator(public.doh_operator)
-                    .resolver_at(IpAddr::V4(RESOLVER))
+                    .resolver_at(IpAddr::V4(RESOLVER));
+                public
+                    .doh_fronts(fronts)
                     .doh(Host::new(names[n]).at(address(n)))
             })
             .collect();

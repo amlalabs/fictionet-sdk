@@ -36,6 +36,7 @@ use fictionet::stdlib::services::dns::{
 use fictionet::stdlib::services::serve::Transport;
 use fictionet::time::Instant;
 use fictionet::{Seed, SeededEntropy};
+use fictionet_extras::dns::public;
 
 pub(super) const ROOT: &str = "198.41.0.4";
 pub(super) const COM: &str = "192.0.2.10";
@@ -2113,7 +2114,7 @@ fn google_answers_resolver_arpa_from_its_ddr_records_with_aa() {
     let identity = fictionet::stdlib::services::dns::authority::Identity::none();
     let mut resolver = resolver(Config {
         hints: vec![(name("a.root-servers.net."), ip(ROOT))],
-        ..Config::google(identity)
+        ..public::google(identity)
     });
     let reply = ask(
         &mut resolver,
@@ -3223,7 +3224,7 @@ fn priming_offers_room_for_the_roots_ns_rrset_and_glue() {
     let mut google = Resolver::new(
         Config {
             hints: vec![(name("a.root-servers.net."), ip(ROOT))],
-            ..Config::google(Identity::none())
+            ..public::google(Identity::none())
         },
         Ring,
         clock(),
