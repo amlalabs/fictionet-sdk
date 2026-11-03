@@ -4175,27 +4175,70 @@ fn an_expired_rrsig_beside_a_valid_one_leaves_a_secure_answers_ttl_alone() {
 }
 
 /// An RRSIG inside its validity window whose signature does not verify
-/// proved nothing either: its small Original TTL does not shorten the
-/// Secure RRset beside it, fresh or from the cache (RFC 4035 §5.3.3).
+/// proved nothing either: neither its small Original TTL nor its small
+/// own TTL shortens the Secure RRset beside it, fresh or from the cache
+/// (RFC 4035 §5.3.3), whether it comes before the RRset or after it.
 #[test]
 fn a_current_rrsig_that_does_not_verify_leaves_a_secure_answers_ttl_alone() {
     // Made by the zone's own key over other records, so it names that key
     // and its window is current, but it does not verify over www's A
-    // RRset. Its Original TTL is 60; the record itself has www's TTL.
+    // RRset. Its Original TTL and its own TTL are both 60.
     let other = rrset("www.example.com.", 60, vec![a("192.0.2.81")]);
     let zsk = keys(40).keys[1].clone();
     let mut bad = sign(zsk.as_ref(), &other, &name("example.com."), window()).unwrap();
-    bad.ttl = 300;
-    let (mut net, anchors) = changed_example(move |req, message| {
-        if req.question.name() == &name("www.example.com.")
-            && req.question.query_type() == RecordType::A
-            && !message.answers.is_empty()
+    bad.ttl = 60;
+    for first in [false, true] {
+        let bad = bad.clone();
+        let (mut net, anchors) = changed_example(move |req, message| {
+            if req.question.name() == &name("www.example.com.")
+                && req.question.query_type() == RecordType::A
+                && !message.answers.is_empty()
+            {
+                if first {
+                    message.answers.insert(0, bad.clone());
+                } else {
+                    message.add_answer(bad.clone());
+                }
+            }
+        });
+        let mut resolver = resolver(config(anchors));
+        for (seconds, ttl) in [(0, 300), (100, 200)] {
+            let reply = ask(
+                &mut resolver,
+                &mut net,
+                seconds,
+                query(client(1), "www.example.com.", RecordType::A, dnssec_ok),
+            );
+            assert!(reply.metadata.authentic_data, "first: {first}");
+            let a = reply
+                .answers
+                .iter()
+                .find(|record| record.record_type() == RecordType::A)
+                .unwrap();
+            assert_eq!(a.ttl, ttl, "first: {first}, at {seconds} s");
+        }
+    }
+}
+
+/// The RRSIG that proved a Secure RRset bounds it by its own TTL too: a
+/// server that sends it with a TTL below the RRset's has the RRset go out
+/// with the RRSIG's, fresh and from the cache (RFC 4035 §5.3.3).
+#[test]
+fn the_verifying_rrsigs_own_ttl_bounds_a_secure_answer() {
+    let (mut net, anchors) = changed_example(|req, message| {
+        if req.question.name() != &name("www.example.com.")
+            || req.question.query_type() != RecordType::A
         {
-            message.add_answer(bad.clone());
+            return;
+        }
+        for record in &mut message.answers {
+            if record.record_type() == RecordType::RRSIG {
+                record.ttl = 60;
+            }
         }
     });
     let mut resolver = resolver(config(anchors));
-    for (seconds, ttl) in [(0, 300), (100, 200)] {
+    for (seconds, ttl) in [(0, 60), (30, 30)] {
         let reply = ask(
             &mut resolver,
             &mut net,

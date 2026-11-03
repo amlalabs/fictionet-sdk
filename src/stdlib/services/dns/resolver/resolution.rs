@@ -2531,13 +2531,9 @@ impl<V: Verify> Resolver<V> {
             .iter()
             .map(|verified| self.signature_expires(verified))
             .min();
-        let original_ttl = verdict
-            .verified
-            .iter()
-            .map(|verified| verified.original_ttl)
-            .min();
+        let ttl = verdict.verified.iter().map(Verified::ttl_bound).min();
         self.cache
-            .validated(key, checked, validation, expires, original_ttl, now);
+            .validated(key, checked, validation, expires, ttl, now);
         if let (Validation::Secure, Material::Denial { authority, .. }) = (validation, material)
             && self.config.aggressive_nsec
         {
@@ -2560,7 +2556,8 @@ impl<V: Verify> Resolver<V> {
 
     /// When `set`, Secure and current at `at`, may be served no longer:
     /// when the RRSIG among `verified` that verified it expires, or its
-    /// Original TTL past `at`, whichever comes first (RFC 4035 §5.3.3).
+    /// own TTL or Original TTL past `at`, whichever comes first
+    /// (RFC 4035 §5.3.3).
     /// `None` when no RRSIG verified `set`: RRSIGs that did not prove it
     /// bound nothing.
     pub(super) fn secure_until(
@@ -2573,9 +2570,8 @@ impl<V: Verify> Resolver<V> {
             .iter()
             .filter(|verified| verified.signs(set))
             .map(|verified| {
-                let original =
-                    at + std::time::Duration::from_secs(u64::from(verified.original_ttl));
-                self.signature_expires(verified).min(original)
+                let ttl = at + std::time::Duration::from_secs(u64::from(verified.ttl_bound()));
+                self.signature_expires(verified).min(ttl)
             })
             .min()
     }

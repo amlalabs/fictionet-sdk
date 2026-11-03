@@ -161,6 +161,53 @@ fn a_lower_ranked_nxdomain_leaves_data_of_its_type() {
     );
 }
 
+/// Live data of any type at a name, or at a name below it, shows that the
+/// name exists: an NXDOMAIN of lower rank for another type is not kept,
+/// and hides none of it (RFC 2181 §5.4.1, RFC 8020 §2).
+#[test]
+fn a_lower_ranked_nxdomain_leaves_data_of_any_type_at_or_below_its_name() {
+    for owner in ["x.example.", "y.x.example."] {
+        let mut cache = cache();
+        cache.insert(
+            at(100),
+            Offer::Positive {
+                set: rrset(owner, 3600, vec![a("192.0.2.88")]),
+                rank: Rank::AuthAuthority,
+                validation: Validation::NotPerformed,
+                proof: Vec::new(),
+                truncated: false,
+            },
+        );
+        cache.insert(
+            at(110),
+            Offer::Negative {
+                key: key("x.example.", RecordType::MX),
+                kind: Negative::NxDomain,
+                soa: Some(soa()),
+                rank: Rank::NonAuthAnswer,
+                denial: Vec::new(),
+                validation: Validation::NotPerformed,
+                truncated: false,
+            },
+        );
+        let now = at(111);
+        assert!(
+            cache
+                .nxdomain_above(&LowerName::new(&name("x.example.")), DNSClass::IN, now)
+                .is_none(),
+            "{owner}"
+        );
+        assert!(
+            cache.get(&key("x.example.", RecordType::MX), now).is_none(),
+            "{owner}"
+        );
+        assert!(matches!(
+            cache.get(&key(owner, RecordType::A), now),
+            Some(Entry::Positive { .. })
+        ));
+    }
+}
+
 #[test]
 fn newer_nodata_at_a_name_ends_its_nxdomain() {
     let mut cache = cache();
@@ -364,8 +411,11 @@ fn a_result_applies_only_to_the_data_it_checked() {
     assert!(matches!(validation(&cache), Validation::Insecure(_)));
 }
 
+/// The RRSIGs are an RRset of their own: their TTL does not shorten data
+/// that has not validated, and the TTL of the RRSIG that verified it
+/// bounds a Secure RRset (RFC 4035 §5.3.3).
 #[test]
-fn an_rrsets_ttl_is_no_longer_than_its_rrsigs_ttl() {
+fn only_the_verifying_rrsigs_ttl_bounds_an_rrset() {
     let mut cache = cache();
     let www = key("www.example.", RecordType::A);
     let set = signed(
@@ -373,6 +423,15 @@ fn an_rrsets_ttl_is_no_longer_than_its_rrsigs_ttl() {
         600,
         86400,
     );
-    cache.insert(at(0), positive(set));
-    assert_eq!(expires(&cache, &www, at(0)), at(600));
+    cache.insert(at(0), positive(set.clone()));
+    assert_eq!(expires(&cache, &www, at(0)), at(86400));
+    cache.validated(
+        &www,
+        &Checked::Rrset(set),
+        Validation::Secure,
+        Some(at(2_000_000)),
+        Some(600),
+        at(1),
+    );
+    assert_eq!(expires(&cache, &www, at(1)), at(600));
 }

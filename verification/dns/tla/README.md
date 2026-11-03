@@ -22,10 +22,10 @@ proof of the rule and the counterexample that shows why it is there.
 | | `NegativeTrue` | invariant | NXDOMAIN only for a name with no node at or below it and no wildcard; NODATA only for a node without the type; each held within the negative TTL |
 | | `NoPoison` | invariant | every cached record came from a server for a zone at or above its name |
 | | `GlueNeverAnswers` | invariant | no answer to a client rests on glue |
-| | `TtlSound` | invariant | no answer uses a record read from the cache at or after its expiry; a record fetched for the resolution that ran out before the reply goes out with TTL 0 (RFC 1035 section 7.4) |
+| | `TtlSound` | invariant | no answer uses a record read from the cache at or after its expiry; every record goes out with a TTL that ends by its own expiry, so a record fetched for the resolution that ran out before the reply goes out with TTL 0 (RFC 1035 section 7.4) |
 | | `CachedNegativeTrue` | invariant | every cached NXDOMAIN or NODATA was true at some second within its TTL since it was stored, so nothing a truncated reply left out is cached as a negative (RFC 2181 section 9) |
 | | `FailureNeverNegative` | invariant | a cached failure never answers NXDOMAIN or NODATA (RFC 9520) |
-| | `CachedFailureTriedAll` | invariant | the resolution that cached a failure tried every server of its zone (RFC 9520 section 3.1), so a failure the work bound caused is never cached and one question's spent budget never answers another client |
+| | `CachedFailureTriedAll` | invariant | the resolution that cached a failure tried every server of its zone (RFC 9520 section 3.1), so a failure the work bound caused before every server was tried is never cached and one question's spent budget never answers another client |
 | | `WorkBounded` | invariant | every resolution stays within `MaxWork` queries and `MaxChain` CNAME restarts |
 | | `ReferralsDescend` | invariant over steps (`PROPERTY`) | the cut a resolution works from always contains its name, and a referral is followed only strictly downward |
 | | `LoopServfails` | invariant | the CNAME loop always ends in SERVFAIL |
@@ -79,7 +79,7 @@ Configs:
 * **Resolution:** `_base`, `_concurrent` (safety, clients symmetric),
   `_concurrent_live` (the same model, liveness, no symmetry), `_loop`,
   `_rogue`, `_edit`. Ablations: `_nobailiwick`, `_nobound`, `_cachetc`,
-  `_noexpiry`, `_failureasnegative`, `_cachebounded`.
+  `_noexpiry`, `_failureasnegative`, `_cachebounded`, `_nocountdown`.
 * **Exchanges:** `_base`, `_advance`, `_cancel`. Ablations: `_idonly`,
   `_flushonly`, `_cancelshared`.
 * **Authority:** `_base`, `_fail`, `_lazy`, `_advance`. Ablations:
@@ -136,6 +136,7 @@ in `_concurrent` explores the same states as the invariants there.
 | Resolution_noexpiry | `TtlSound` | violated | 5031 | 20 | 0 s | Ask cn.sld.tld; Advance, Serve, Receive three times down to sld.tld; Advance follows the CNAME; Advance, Serve, Receive, Advance for www.sld.tld; Ask www.sld.tld; Tick, Tick, Advance: the cache answers www.sld.tld after its two-second TTL ran out |
 | Resolution_failureasnegative | `FailureNeverNegative` | violated | 173 | 9 | 0 s | Ask, Advance, Lose, Timeout, Advance, Serve, Receive, Advance: the query to one root server is lost and times out, the other refuses, and the cached failure answers NXDOMAIN |
 | Resolution_cachebounded | `CachedFailureTriedAll` | violated | 1279 | 15 | 0 s | Ask, then Advance, Serve, Receive twice down to sld.tld; Advance, Serve, Truncate, Receive (the TCP retry is the fourth query); Lose, Timeout, Advance: the work bound ends the resolution and its failure is cached, with one of sld.tld's servers never tried |
+| Resolution_nocountdown | `TtlSound` | violated | 2224 | 17 | 0 s | Ask cn.sld.tld; Advance, Serve, Receive three times down to sld.tld, fetching the CNAME with its one-second TTL at second 0; Advance follows it; Advance, Tick, Serve, Receive, Advance for www.sld.tld: the answer at second 1 carries the CNAME, which ran out at second 1, with TTL 1 |
 | Exchanges_base | the 3 invariants, `MatchRequiresTuple`, `DuplicateHarmless` | pass | 66914 | 19 | 1 s | |
 | Exchanges_base | `EveryAcceptedAnswered` | pass | 66914 | 19 | 3 s | |
 | Exchanges_advance | the 3 invariants, `MatchRequiresTuple`, `DuplicateHarmless` | pass | 4564834 | 28 | 10-12 s | |
@@ -225,12 +226,16 @@ Resolution:
   looks at the cached pieces of an answer, and when one ran out while the
   rest was resolved, the chain is followed again from the question, its
   work so far still counted; a piece fetched for the question goes out
-  with TTL 0.
+  with TTL 0. `_nocountdown`, where a fetched record keeps the TTL it came
+  with, shows that `TtlSound` checks this.
 * A failure after every server was tried is cached for `failure_ttl`
   (1 s) at the name the chain had reached. A resolution that reaches the
   work bound answers SERVFAIL without caching, as `Resolution::send` leaves
   a failure the bound caused out of the cache: the bound is one question's
-  budget and says nothing of the servers. A chain that is too long answers
+  budget and says nothing of the servers. When the bound is reached just
+  as the last server has been tried, the model, like Rust, answers SERVFAIL
+  without caching; `CachedFailureTriedAll` does not tell that case apart,
+  since such a failure would be true. A chain that is too long answers
   SERVFAIL without caching too, so the cached CNAME stays.
 * Wildcard synthesis is at the name's parent, which is all the data needs.
 * Each client asks its script one question at a time, as a stub resolver
@@ -355,7 +360,7 @@ Resolution:
 | `ans[c][q]` | `Action::Answer`, rendered for its client |
 | `Receive` | taking a reply: TC retries over TCP, answers stored in bailiwick only, referrals strictly below the cut, glue at glue rank |
 | `Timeout` | `Input::Tick` at the exchange's deadline |
-| `CheckBailiwick`, `CacheTc`, `CheckExpiry`, `FailureAsNegative`, `BoundWork` | the bailiwick check, "truncated replies are not cached", the `expires` check, `Entry::Failure` as its own variant, and `Config::work` |
+| `CheckBailiwick`, `CacheTc`, `CheckExpiry`, `FailureAsNegative`, `BoundWork`, `CountDown` | the bailiwick check, "truncated replies are not cached", the `expires` check, `Entry::Failure` as its own variant, `Config::work`, and `cache::ttl_left` rendering each piece's TTL |
 
 Exchanges:
 

@@ -32,8 +32,13 @@ pub(super) fn rrsets(records: &[Record]) -> Vec<RecordSet> {
         let set = &mut sets[index];
         match covered {
             Some(_) => set.insert_rrsig(record.clone()),
+            // An RRSIG that came first set no TTL for the data.
             None => {
-                let ttl = set.ttl().min(record.ttl);
+                let ttl = if set.is_empty() {
+                    record.ttl
+                } else {
+                    set.ttl().min(record.ttl)
+                };
                 let mut record = record.clone();
                 record.name = set.name().clone();
                 set.insert(record, 0);

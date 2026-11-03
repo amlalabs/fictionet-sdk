@@ -31,8 +31,8 @@
 (* second.                                                                 *)
 (*                                                                         *)
 (* Ablation flags: CheckBailiwick, BoundWork, CacheTc, CheckExpiry,        *)
-(* FailureAsNegative, and CacheBounded. Each is the rule as the design     *)
-(* states it when TRUE (FALSE for CacheTc, FailureAsNegative, and          *)
+(* FailureAsNegative, CacheBounded, and CountDown. Each is the rule as the *)
+(* design states it when TRUE (FALSE for CacheTc, FailureAsNegative, and   *)
 (* CacheBounded).                                                          *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets, Sequences, TLC
@@ -53,6 +53,7 @@ CONSTANTS
     CheckExpiry,       \* entries are never used at or after their expiry
     FailureAsNegative, \* ablation: a failure is cached as NXDOMAIN
     CacheBounded,      \* ablation: a failure the work bound caused is cached
+    CountDown,         \* a fetched record goes out with the TTL it has left
     None               \* a model value for "nothing here"
 
 -----------------------------------------------------------------------------
@@ -196,8 +197,11 @@ Used(n, e, fetched) == [n |-> n, t |-> e.t, val |-> e.val, ttl |-> e.ttl, readAt
                         rank |-> e.rank, failure |-> e.failure, fetched |-> fetched]
 
 \* The TTL a record has left now, as the client sees it: counted down from
-\* when it was read, and 0 once it has run out (cache::ttl_left).
-TtlLeft(u) == IF now < u.readAt + u.ttl THEN u.readAt + u.ttl - now ELSE 0
+\* when it was read, and 0 once it has run out (cache::ttl_left). Without
+\* CountDown, a record fetched for the resolution keeps the TTL it came
+\* with, as if the answer copied it from the reply.
+TtlLeft(u) == IF ~CountDown /\ u.fetched THEN u.ttl
+              ELSE IF now < u.readAt + u.ttl THEN u.readAt + u.ttl - now ELSE 0
 
 \* A used record as the answer renders it, with the TTL it goes out with.
 Rendered(u) == [n |-> u.n, t |-> u.t, val |-> u.val, ttl |-> u.ttl, readAt |-> u.readAt,
@@ -514,11 +518,12 @@ GlueNeverAnswers ==
 
 (* No answer uses a record read from the cache at or after its expiry. A    *)
 (* record fetched for the resolution serves it even after its TTL has run   *)
-(* out, and then goes out with TTL 0 (RFC 1035 section 7.4).                *)
+(* out (RFC 1035 section 7.4). Every record goes out with a TTL that ends   *)
+(* by its own expiry, so with TTL 0 once it has run out.                    *)
 TtlSound ==
     \A a \in Answers : \A u \in a.recs :
         /\ ~u.fetched => a.at < u.readAt + u.ttl
-        /\ (u.fetched /\ a.at >= u.readAt + u.ttl) => u.left = 0
+        /\ a.at + u.left <= u.readAt + u.ttl \/ u.left = 0
 
 (* Every cached NXDOMAIN or NODATA was true at some second within its TTL,  *)
 (* from when it was stored: so nothing a reply did not show, such as a       *)
@@ -535,8 +540,9 @@ FailureNeverNegative ==
 
 (* A cached failure says every server of its zone failed: the resolution   *)
 (* that wrote it tried each of them (RFC 9520 section 3.1). So a failure the *)
-(* work bound caused, which says nothing of the servers, is never cached,   *)
-(* and one question's spent budget never answers another client.            *)
+(* work bound caused before every server was tried, which says nothing of   *)
+(* the servers, is never cached, and one question's spent budget never      *)
+(* answers another client.                                                  *)
 CachedFailureTriedAll ==
     \A n \in CacheNames : (cache[n] # None /\ cache[n].failure) =>
         \A s \in ServersOf(cache[n].from) : <<s, FALSE>> \in cache[n].tried
