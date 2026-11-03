@@ -13,7 +13,7 @@ use fictionet::sync::Mutex;
 use super::super::exchange::{Client, Generation};
 use super::super::lookup::{Looked, Lookup};
 use super::super::zone::{Filing, Learned, ZoneData};
-use super::{Authority, ServerConfig, Step, respond_from};
+use super::{Authority, ServerConfig, Step, refuse_transfer, respond_from};
 
 /// The [learned](Learned) copies of real zones, one per apex, shared by
 /// every address that serves the zone, and the zones each address serves.
@@ -216,6 +216,9 @@ impl Authority for Copies {
         server: &ServerConfig,
         _client: &Client,
     ) -> Step {
+        if let Some(refused) = refuse_transfer(req) {
+            return refused;
+        }
         let qname = LowerName::new(req.question.name());
         let unplaced = self
             .seen

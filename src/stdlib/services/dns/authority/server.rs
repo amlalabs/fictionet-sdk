@@ -360,28 +360,48 @@ impl Identity {
     /// The reply to `req` from `zone`, the CHAOS zone at `apex`, with AA
     /// set: at the apex, the zone's records of the type asked, or NODATA
     /// with the SOA; below it, NXDOMAIN with the SOA (RFC 2308 §2.1,
-    /// §2.2).
+    /// §2.2), its TTL [`soa_question_ttl`](ChaosZone::soa_question_ttl)
+    /// when the question is for an SOA. A positive answer to a query with
+    /// RD clear also carries, in the authority section, the apex records
+    /// of each type in [`authority_without_rd`](ChaosZone::authority_without_rd)
+    /// that the answer lacks.
     fn zone_reply(&self, req: &Request, apex: &Name, zone: &ChaosZone) -> Response {
         let qtype = req.question.query_type();
         let mut response = bare_reply(req, ResponseCode::NoError, None);
         response.message.metadata.authoritative = true;
         let soa = chaos_record(apex, zone.soa_ttl, RData::SOA(zone.soa.clone()));
         if req.question.name() != apex {
+            let mut soa = soa;
+            if qtype == RecordType::SOA {
+                soa.ttl = zone.soa_question_ttl;
+            }
             response.message.metadata.response_code = ResponseCode::NXDomain;
             response.message.authorities.push(soa);
             return response;
         }
         let ns = chaos_record(apex, zone.ns_ttl, RData::NS(NS(zone.ns.clone())));
         let txt = zone.txt.as_deref().map(|text| self.txt(apex, text));
+        let apex_records: Vec<Record> = txt.into_iter().chain([soa.clone(), ns]).collect();
+        let of_type = |kind: RecordType| {
+            apex_records
+                .iter()
+                .filter(move |record| record.record_type() == kind)
+                .cloned()
+        };
         let answers: Vec<Record> = match qtype {
-            RecordType::TXT => txt.into_iter().collect(),
-            RecordType::SOA => vec![soa.clone()],
-            RecordType::NS => vec![ns],
-            RecordType::ANY => txt.into_iter().chain([soa.clone(), ns]).collect(),
-            _ => Vec::new(),
+            RecordType::ANY => apex_records.clone(),
+            _ => of_type(qtype).collect(),
         };
         if answers.is_empty() {
             response.message.authorities.push(soa);
+        } else if !req.rd {
+            let extra: Vec<Record> = zone
+                .authority_without_rd
+                .iter()
+                .flat_map(|&kind| of_type(kind))
+                .filter(|record| !answers.contains(record))
+                .collect();
+            response.message.authorities.extend(extra);
         }
         response.message.answers = answers;
         response
@@ -429,6 +449,14 @@ pub struct ChaosZone {
     pub ns_ttl: u32,
     /// The TXT string at the apex, with the identity's TTL.
     pub txt: Option<String>,
+    /// The apex record types a positive answer to a query with RD clear
+    /// also carries in its authority section, when the answer lacks them.
+    /// Empty for none.
+    pub authority_without_rd: Vec<RecordType>,
+    /// The TTL of the SOA in the NXDOMAIN reply to an SOA question below
+    /// the apex. Every other negative reply gives the SOA
+    /// [`soa_ttl`](ChaosZone::soa_ttl).
+    pub soa_question_ttl: u32,
 }
 
 /// A CHAOS-class reply without data.

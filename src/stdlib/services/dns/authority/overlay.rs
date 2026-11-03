@@ -16,7 +16,7 @@ use super::super::exchange::{Client, Generation};
 use super::super::lookup::{Looked, Lookup};
 use super::super::records::rrsets;
 use super::server::glue_first;
-use super::{Authority, ServerConfig, Step, bare_reply};
+use super::{Authority, ServerConfig, Step, bare_reply, refuse_transfer};
 
 /// Answers as its base does, except for zones invented below it.
 ///
@@ -111,13 +111,8 @@ impl<B: Authority> Authority for Overlay<B> {
         server: &ServerConfig,
         client: &Client,
     ) -> Step {
-        // A transfer lists a zone; a referral, or a parent's answer in
-        // place of one, is no listing (RFC 5936 §2.2).
-        if matches!(
-            req.question.query_type(),
-            RecordType::AXFR | RecordType::IXFR
-        ) {
-            return Step::Reply(bare_reply(req, ResponseCode::Refused, None));
+        if let Some(refused) = refuse_transfer(req) {
+            return refused;
         }
         let qname = LowerName::new(req.question.name());
         let invented = self

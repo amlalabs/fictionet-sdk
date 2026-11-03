@@ -777,13 +777,13 @@ fn a_chaos_zone_answers_from_its_records() {
 
     // (question, RD, RCODE, answer section, authority section)
     let cases = [
-        // The text, whatever RD says.
+        // The text, with the zone's NS when RD is clear.
         (
             ("hostname.bind.", Txt),
             false,
             ResponseCode::NoError,
             vec![host(Txt, 0)],
-            vec![],
+            vec![host(Ns, 0)],
         ),
         (
             ("hostname.bind.", Txt),
@@ -798,7 +798,7 @@ fn a_chaos_zone_answers_from_its_records() {
             false,
             ResponseCode::NoError,
             vec![host(Soa, 86400)],
-            vec![],
+            vec![host(Ns, 0)],
         ),
         (
             ("hostname.bind.", Ns),
@@ -822,7 +822,7 @@ fn a_chaos_zone_answers_from_its_records() {
             vec![],
             vec![host(Soa, 86400)],
         ),
-        // Below the zone is NXDOMAIN with the SOA.
+        // Below the zone is NXDOMAIN with the SOA, TTL 0 for an SOA question.
         (
             ("foo.hostname.bind.", Txt),
             false,
@@ -835,7 +835,7 @@ fn a_chaos_zone_answers_from_its_records() {
             false,
             ResponseCode::NXDomain,
             vec![],
-            vec![host(Soa, 86400)],
+            vec![host(Soa, 0)],
         ),
         // A zone with no text.
         (

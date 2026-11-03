@@ -155,6 +155,18 @@ fn deepest<'z>(
         .map(|zone| &**zone)
 }
 
+/// REFUSED when `req` asks for a zone transfer, before an authority looks
+/// at anything else. A transfer lists a zone, and these authorities list
+/// none; a referral, a lookup, or a parent's answer in place of one is no
+/// listing (RFC 5936 §2.2).
+fn refuse_transfer(req: &Request) -> Option<Step> {
+    matches!(
+        req.question.query_type(),
+        RecordType::AXFR | RecordType::IXFR
+    )
+    .then(|| Step::Reply(bare_reply(req, ResponseCode::Refused, None)))
+}
+
 /// What a server hosting `zones` does with `req`, with `server` as its
 /// front, as [`Zones`] describes. `unknown` gives the step when a zone's
 /// view does not know a fact the reply needs: it gets the zone and the
@@ -166,11 +178,11 @@ fn respond_from(
     server: &ServerConfig,
     unknown: &dyn Fn(&dyn ZoneData, LowerName) -> Step,
 ) -> Step {
+    if let Some(refused) = refuse_transfer(req) {
+        return refused;
+    }
     let qname = LowerName::new(req.question.name());
     let qtype = req.question.query_type();
-    if matches!(qtype, RecordType::AXFR | RecordType::IXFR) {
-        return Step::Reply(bare_reply(req, ResponseCode::Refused, None));
-    }
     match req.question.query_class() {
         DNSClass::IN => {}
         // A zone answers from its data with AA, and an answer to QCLASS

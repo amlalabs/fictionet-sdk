@@ -16,7 +16,9 @@ use fictionet::stdlib::protocols::dns::dnssec::rdata::DNSSECRData;
 use fictionet::stdlib::protocols::dns::dnssec::{
     Algorithm, KeyFlags, KeySet, Proof, Sign, ZoneKey,
 };
-use fictionet::stdlib::protocols::dns::op::{Edns, Message, MessageType, OpCode, Query};
+use fictionet::stdlib::protocols::dns::op::{
+    Edns, Message, MessageType, OpCode, Query, ResponseCode,
+};
 use fictionet::stdlib::protocols::dns::rr::rdata::A;
 use fictionet::stdlib::protocols::dns::rr::{
     LowerName, Name, RData, Record, RecordSet, RecordType,
@@ -1280,6 +1282,63 @@ fn copies_find_a_zone_below_a_cut_they_hold() {
 /// The lookup of `request`'s question at `local`, in `example`.
 fn own(local: SocketAddr, request: &Request) -> Lookup {
     Lookup::new(local, lower("example."), &request.question)
+}
+
+/// A transfer is refused before anything else, with no lookup, even of a
+/// name whose zone the address has yet to show: a transfer lists a zone,
+/// and a copy lists none (RFC 5936 §2.2).
+#[test]
+fn copies_refuse_a_transfer_of_a_name_not_yet_placed() {
+    let real = Zones::new(vec![
+        Arc::new(Zone::from_master(EXAMPLE, None).unwrap()) as Arc<dyn ZoneData>,
+        Arc::new(Zone::from_master(SRV, None).unwrap()) as Arc<dyn ZoneData>,
+    ]);
+    let answer = |lookup: &Lookup| reply_of(&real, lookup);
+    let local: SocketAddr = "192.0.2.53:53".parse().unwrap();
+    let copies = Copies::new();
+    copies.serves(local.ip(), &lower("example."));
+    let server = ServerConfig::generic();
+    let client = Client {
+        peer: "198.51.100.7:5353".parse().unwrap(),
+        local,
+        transport: Transport::Tcp,
+        connection: None,
+        sandbox: None,
+    };
+    // A referral files the cut, and an authoritative answer from the zone
+    // below it leaves `www.srv.child.example` unplaced at the address.
+    through(
+        &copies,
+        &answer,
+        local,
+        &request("x.child.example.", RecordType::A, false),
+    );
+    let below = request("www.srv.child.example.", RecordType::A, false);
+    let Step::Need(lookup) = copies.respond(&below, local, &server, &client) else {
+        panic!("the copy looks the question up");
+    };
+    copies.file(&lookup, &Looked::Response(answer(&lookup)), Generation(0));
+    // Any other question there now asks for the SOA RRset at the name.
+    match copies.respond(&below, local, &server, &client) {
+        Step::Need(lookup) => assert_eq!(lookup.question.query_type(), RecordType::SOA),
+        step => panic!("the name is unplaced, so the copy asks for its SOA: {step:?}"),
+    }
+    for qtype in [RecordType::AXFR, RecordType::IXFR] {
+        let mut message = Message::new(7, MessageType::Query, OpCode::Query);
+        message.add_query(Query::query(name("www.srv.child.example."), qtype));
+        let Parsed::Request(transfer) = Request::parse(&message.to_vec().unwrap(), Transport::Tcp)
+        else {
+            panic!("{qtype} over TCP parses");
+        };
+        match copies.respond(&transfer, local, &server, &client) {
+            Step::Reply(response) => assert_eq!(
+                response.message.metadata.response_code,
+                ResponseCode::Refused,
+                "{qtype}"
+            ),
+            step => panic!("{qtype}: {step:?}"),
+        }
+    }
 }
 
 /// An address noted for a zone its real server does not serve, as a
