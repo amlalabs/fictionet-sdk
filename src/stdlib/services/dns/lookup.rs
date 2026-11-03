@@ -25,17 +25,12 @@ pub struct Lookup {
     pub zone: LowerName,
     /// The question, its name in lowercase.
     pub question: Query,
-    /// Whether the question asks the server to recurse (RD,
-    /// RFC 1035 §4.1.1). An authority's lookups never do; only a question
-    /// to a resolver, such as the whoami question of
-    /// [`Location::measured`](fictionet::stdlib::world::net::dns::internet::Location::measured),
-    /// sets it.
-    pub recursion_desired: bool,
 }
 
 impl Lookup {
-    /// A lookup of `question` at `server` for the zone at `zone`, without
-    /// recursion. The question's name is put in lowercase.
+    /// A lookup of `question` at `server` for the zone at `zone`. It asks
+    /// without recursion, as an authority's question to another
+    /// authority does. The question's name is put in lowercase.
     pub fn new(server: SocketAddr, zone: LowerName, question: &Query) -> Lookup {
         let mut question = question.clone();
         question.set_name(question.name().to_lowercase());
@@ -43,7 +38,6 @@ impl Lookup {
             server,
             zone,
             question,
-            recursion_desired: false,
         }
     }
 

@@ -1,7 +1,10 @@
 //! Zones a resolver serves itself instead of asking the internet: the
 //! special-use names of RFC 6761 and RFC 7686, the reverse zones of
 //! private and special addresses (RFC 6303), `home.arpa` (RFC 8375),
-//! `resolver.arpa` (RFC 9462), and `service.arpa` (RFC 9665).
+//! `resolver.arpa` (RFC 9462), and `service.arpa` (RFC 9665). The SVCB
+//! parameters of a resolver's encrypted endpoints in `resolver.arpa` are
+//! here too: [`alpn`], [`port`], [`ipv4_hint`], [`ipv6_hint`], and
+//! [`dohpath`].
 //!
 //! Each zone has the apex records Unbound gives all of these zones in
 //! `add_empty_default` (`services/localzone.c`): `localhost.` as the NS
@@ -13,6 +16,9 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
+use fictionet::stdlib::protocols::dns::rr::rdata::svcb::{
+    Alpn, IpHint, SvcParamKey, SvcParamValue, Unknown,
+};
 use fictionet::stdlib::protocols::dns::rr::rdata::{A, AAAA, NS, PTR, SOA, SVCB};
 use fictionet::stdlib::protocols::dns::rr::{Name, RData, Record, RecordSet};
 
@@ -113,6 +119,49 @@ pub fn resolver_arpa(endpoints: Vec<SVCB>, ttl: u32) -> Zone {
         zone = zone.rrset(set);
     }
     built(zone)
+}
+
+/// The `alpn` parameter of an SVCB record, the ALPN IDs of `protocols`
+/// (RFC 9460 §7.1), such as `dot` for DNS over TLS or `h2` for DNS over
+/// HTTPS on HTTP/2 (RFC 9461 §4).
+pub fn alpn(protocols: &[&str]) -> (SvcParamKey, SvcParamValue) {
+    let protocols = protocols.iter().map(|p| p.to_string()).collect();
+    (SvcParamKey::Alpn, SvcParamValue::Alpn(Alpn(protocols)))
+}
+
+/// The `port` parameter of an SVCB record (RFC 9460 §7.2).
+pub fn port(port: u16) -> (SvcParamKey, SvcParamValue) {
+    (SvcParamKey::Port, SvcParamValue::Port(port))
+}
+
+/// The `ipv4hint` parameter of an SVCB record, holding `addresses`
+/// (RFC 9460 §7.3).
+pub fn ipv4_hint(addresses: &[Ipv4Addr]) -> (SvcParamKey, SvcParamValue) {
+    let hints = addresses.iter().map(|a| A(*a)).collect();
+    (
+        SvcParamKey::Ipv4Hint,
+        SvcParamValue::Ipv4Hint(IpHint(hints)),
+    )
+}
+
+/// The `ipv6hint` parameter of an SVCB record, holding `addresses`
+/// (RFC 9460 §7.3).
+pub fn ipv6_hint(addresses: &[Ipv6Addr]) -> (SvcParamKey, SvcParamValue) {
+    let hints = addresses.iter().map(|a| AAAA(*a)).collect();
+    (
+        SvcParamKey::Ipv6Hint,
+        SvcParamValue::Ipv6Hint(IpHint(hints)),
+    )
+}
+
+/// The `dohpath` parameter of an SVCB record (RFC 9461 §5), SvcParamKey
+/// 7, which hickory carries as an unknown key: the URI template
+/// `/dns-query{?dns}`, the path the world's DNS over HTTPS fronts serve.
+pub fn dohpath() -> (SvcParamKey, SvcParamValue) {
+    (
+        SvcParamKey::Unknown(7),
+        SvcParamValue::Unknown(Unknown(b"/dns-query{?dns}".to_vec())),
+    )
 }
 
 /// `onion`, whose names are reached through Tor and never through DNS:

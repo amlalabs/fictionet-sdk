@@ -1,88 +1,66 @@
-//! The internet's DNS as presets: the root and `gtld-servers.net` servers,
-//! the large public resolvers, and a [`Mirror`] that copies the real
+//! The internet's DNS servers as hosts: the root and `gtld-servers.net`
+//! servers at their real addresses, and a [`Mirror`] that copies the real
 //! hierarchy onto machines at the real servers' addresses.
 //!
-//! Each preset returns hosts at the addresses real clients know, so a
-//! guest that asks `198.41.0.4` or `8.8.8.8` directly reaches them. What
-//! runs on them is the world's choice: a world with its own root serves
-//! zones, and a world that shows the real internet serves copies of its
-//! zones, answered by the world's own servers.
+//! [`root_servers`] and [`gtld_servers`] return hosts at the addresses
+//! real clients know, so a guest that asks `198.41.0.4` directly reaches
+//! one. What runs on them, and how far away they are, is the world's
+//! choice: a world with its own root serves zones, and a world that shows
+//! the real internet serves copies of its zones, answered by the world's
+//! own servers.
 //!
 //! ```
-//! # use std::time::SystemTime;
-//! # use std::net::Ipv4Addr;
 //! # use std::sync::Arc;
 //! # use fictionet::{Attachments, Cx, Result};
-//! # use fictionet::stdlib::services::dns::WallClock;
-//! # use fictionet::stdlib::services::dns::authority::{Authority, Zones};
+//! # use fictionet::stdlib::services::dns::authority::{Identity, ServerConfig, Zones};
 //! # use fictionet::stdlib::world::net::Net;
 //! # use fictionet::stdlib::world::net::dns::Authoritative;
-//! # use fictionet::stdlib::world::net::dns::internet::{self, Egress, Location};
+//! # use fictionet::stdlib::world::net::dns::internet;
 //! # async fn world(fcx: Cx, attachments: Attachments, root: &str) -> Result {
-//! let at = Location::san_francisco_bay_area(Some(Egress(Ipv4Addr::new(198, 51, 100, 7))));
-//! let clock = WallClock { start: SystemTime::now() };
 //! let root = Arc::new(internet::root_zone(root)?);
 //! Net::new()
-//!     .hosts(internet::root_servers(|s| Authoritative::new(Zones::new(vec![root.clone()]), s), &at))
-//!     .hosts(internet::public_resolvers(|r, h| h.program(r.recursive(r.config(&at), clock)), &at))
+//!     .hosts(internet::root_servers(|_, host| {
+//!         let server = ServerConfig::root(Identity::none());
+//!         host.program(Authoritative::new(Zones::new(vec![root.clone()]), server))
+//!     }))
 //!     .start(&fcx, attachments)?;
 //! # Ok(())
 //! # }
 //! ```
 //!
-//! The addresses, names, and server identities here were read on
-//! 2026-11-01: the root servers from IANA's `named.root`, the rest from
-//! the servers themselves, asked from the San Francisco Bay Area.
+//! The addresses and names here were read on 2026-11-01: the root servers
+//! from IANA's `named.root`, the rest from the servers themselves.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::future::Future;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use fictionet::Cx;
-use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::network::ip::non_public_address;
 use fictionet::stdlib::protocols::dns::dnssec::rdata::DNSSECRData;
-use fictionet::stdlib::protocols::dns::op::{Message, Query, ResponseCode};
+use fictionet::stdlib::protocols::dns::op::Message;
 use fictionet::stdlib::protocols::dns::rr::rdata::TXT;
-use fictionet::stdlib::protocols::dns::rr::{
-    DNSClass, LowerName, Name, RData, Record, RecordSet, RecordType,
-};
-use fictionet::stdlib::protocols::dns::{Ede, EdeCode, Nsid, Request, dname_substitute};
-use fictionet::stdlib::protocols::urlencoded_form::{self, Form};
-use fictionet::stdlib::services::dns::authority::{
-    Authority, ChaosAnswer, ChaosReply, Copies, Identity, ServerConfig, Step, chaos,
-};
-use fictionet::stdlib::services::dns::resolver::Config;
-use fictionet::stdlib::services::dns::zone::{
-    AnyResponse, Filing, Shown, Zone, ZoneError, dname_target,
-};
-use fictionet::stdlib::services::dns::{Client, Generation, Looked, Lookup, WallClock};
-use fictionet::stdlib::web::httpd::{self, Body, request_host};
+use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RData, RecordType};
+use fictionet::stdlib::protocols::dns::{Request, dname_substitute};
+use fictionet::stdlib::services::dns::authority::{Authority, Copies, ServerConfig, Step};
+use fictionet::stdlib::services::dns::zone::{AnyResponse, Filing, Zone, ZoneError, dname_target};
+use fictionet::stdlib::services::dns::{Client, Generation, Looked, Lookup};
 use fictionet::sync::Mutex;
-use fictionet::time::Instant;
-use http::header::{CONTENT_TYPE, LOCATION};
-use http::{HeaderValue, Request as HttpRequest, Response as HttpResponse, StatusCode};
 
 pub use fictionet::stdlib::services::dns::resolver::{NameServer, ROOT_SERVERS, root_hints};
 
-use super::super::{Host, NetHandle, Program};
-use super::encrypted::Operator;
-use super::{Authoritative, Namespace, PerSession, Recursive, Upstream};
+use super::super::{Host, NetHandle};
+use super::{Authoritative, Namespace, PerSession, Upstream};
 
 // ---------------------------------------------------------------------------
 // Servers and their addresses
 
-/// A host at both of `server`'s addresses running `program`, with a round
-/// trip from the network `rtt` longer.
-fn server_host(server: &NameServer, program: impl Program, rtt: Duration) -> Host {
+/// A host at both of `server`'s addresses, named for it, with nothing on
+/// it yet.
+pub fn server_host(server: &NameServer) -> Host {
     Host::new(server.host.trim_end_matches('.'))
         .at(server.v4)
         .at(server.v6)
-        .delay(rtt / 2)
-        .program(program)
 }
 
 /// One of the thirteen root server letters, with what its operator's
@@ -277,1187 +255,26 @@ pub const GTLD_SERVERS: [NameServer; 13] = [
 ];
 
 // ---------------------------------------------------------------------------
-// Public resolvers
+// Hosts
 
-/// One address pair of a public resolver and the name its PTR records
-/// give.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ResolverAddress {
-    /// Its IPv4 address.
-    pub v4: Ipv4Addr,
-    /// Its IPv6 address.
-    pub v6: Ipv6Addr,
-    /// The name the reverse names of both addresses point at, the first
-    /// of them where they give several.
-    pub ptr: &'static str,
-}
-
-/// A public recursive resolver: its addresses, the names of its DNS over
-/// HTTPS service, and the configuration it runs with.
-#[derive(Clone, Copy, Debug)]
-pub struct PublicResolver {
-    /// The service's name.
-    pub service: &'static str,
-    /// Its primary and secondary addresses.
-    pub addresses: [ResolverAddress; 2],
-    /// The names of [`doh`](Self::doh), fully qualified.
-    doh: &'static [&'static str],
-    /// How its DNS over HTTPS service answers past RFC 8484, as seen on
-    /// 2026-11-02 ([`Fronts::operator`](super::encrypted::Fronts::operator)).
-    pub doh_operator: &'static dyn Operator,
-    config: fn(&ResolverSite, Option<&Egress>) -> Config,
-}
-
-impl PublicResolver {
-    /// The names its DNS over HTTPS service answers under. The addresses
-    /// the real hierarchy gives for them are where a world puts the
-    /// resolver's DoH front ([`Mirror::front`]).
-    pub fn doh(&self) -> Vec<Name> {
-        self.doh
-            .iter()
-            .map(|text| Name::from_ascii(text).expect("a public resolver's name is valid"))
-            .collect()
-    }
-
-    /// The subject alternative names of its DNS over TLS and HTTPS fronts'
-    /// certificate: its DNS over HTTPS names, then each of its addresses as
-    /// an IP SAN (RFC 5280 §4.2.1.6), so a client that connects to an
-    /// address checks it as it would a name.
-    pub fn sans(&self) -> Vec<String> {
-        let names = self
-            .doh()
-            .into_iter()
-            .map(|name| name.to_ascii().trim_end_matches('.').to_owned());
-        let addresses = self
-            .addresses
-            .iter()
-            .flat_map(|address| [address.v4.to_string(), address.v6.to_string()]);
-        names.chain(addresses).collect()
-    }
-
-    /// The resolver's configuration as seen from `at`: its identity at
-    /// the site that answers there, and its special names, the answers
-    /// to its whoami names among them.
-    pub fn config(&self, at: &Location) -> Config {
-        let primary = IpAddr::V4(self.addresses[0].v4);
-        (self.config)(&at.resolver(primary), at.egress.as_ref())
-    }
-
-    /// The resolver's program running `config`, usually its
-    /// [`config`](Self::config) from where the world is, or that with a
-    /// change a world needs: one engine and cache per sandbox
-    /// ([`Recursive::per_sandbox`]), so sandboxes can neither warm nor
-    /// probe each other's caches.
-    pub fn recursive(&self, config: Config, clock: WallClock) -> Recursive {
-        Recursive::new(config, clock).per_sandbox()
-    }
-}
-
-/// Google Public DNS, Cloudflare's 1.1.1.1, Quad9, and OpenDNS, with the
-/// addresses and PTR names each answered with on 2026-11-01.
-pub const PUBLIC_RESOLVERS: [PublicResolver; 4] = [
-    PublicResolver {
-        service: "Google Public DNS",
-        addresses: [
-            ResolverAddress {
-                v4: Ipv4Addr::new(8, 8, 8, 8),
-                v6: Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888),
-                ptr: "dns.google.",
-            },
-            ResolverAddress {
-                v4: Ipv4Addr::new(8, 8, 4, 4),
-                v6: Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8844),
-                ptr: "dns.google.",
-            },
-        ],
-        doh: &["dns.google."],
-        doh_operator: &Google,
-        config: google,
-    },
-    PublicResolver {
-        service: "Cloudflare 1.1.1.1",
-        addresses: [
-            ResolverAddress {
-                v4: Ipv4Addr::new(1, 1, 1, 1),
-                v6: Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111),
-                ptr: "one.one.one.one.",
-            },
-            ResolverAddress {
-                v4: Ipv4Addr::new(1, 0, 0, 1),
-                v6: Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1001),
-                ptr: "one.one.one.one.",
-            },
-        ],
-        doh: &["cloudflare-dns.com.", "one.one.one.one."],
-        doh_operator: &Cloudflare,
-        config: cloudflare,
-    },
-    PublicResolver {
-        service: "Quad9",
-        addresses: [
-            ResolverAddress {
-                v4: Ipv4Addr::new(9, 9, 9, 9),
-                v6: Ipv6Addr::new(0x2620, 0xfe, 0, 0, 0, 0, 0, 0x9),
-                ptr: "dns9.quad9.net.",
-            },
-            ResolverAddress {
-                v4: Ipv4Addr::new(149, 112, 112, 112),
-                v6: Ipv6Addr::new(0x2620, 0xfe, 0, 0, 0, 0, 0, 0xfe),
-                ptr: "dns.quad9.net.",
-            },
-        ],
-        doh: &["dns.quad9.net."],
-        doh_operator: &Quad9,
-        config: quad9,
-    },
-    PublicResolver {
-        service: "OpenDNS",
-        addresses: [
-            ResolverAddress {
-                v4: Ipv4Addr::new(208, 67, 222, 222),
-                v6: Ipv6Addr::new(0x2620, 0x119, 0x35, 0, 0, 0, 0, 0x35),
-                ptr: "resolver1.opendns.com.",
-            },
-            ResolverAddress {
-                v4: Ipv4Addr::new(208, 67, 220, 220),
-                v6: Ipv6Addr::new(0x2620, 0x119, 0x53, 0, 0, 0, 0, 0x53),
-                ptr: "resolver2.opendns.com.",
-            },
-        ],
-        doh: &["doh.opendns.com.", "dns.opendns.com."],
-        doh_operator: &OpenDns,
-        config: opendns,
-    },
-];
-
-/// A response with `status`, `body`, and its media type when it has one.
-fn http_reply(status: StatusCode, media: Option<&'static str>, body: String) -> HttpResponse<Body> {
-    let mut response = HttpResponse::new(Body::from(body));
-    *response.status_mut() = status;
-    if let Some(media) = media {
-        response
-            .headers_mut()
-            .insert(CONTENT_TYPE, HeaderValue::from_static(media));
-    }
-    response
-}
-
-/// `dns.google`: Google's JSON API at `/resolve`, and Google's HTML error
-/// pages.
-#[derive(Debug)]
-struct Google;
-
-impl Google {
-    /// Google's error page for `status`, saying `message`.
-    fn error(status: StatusCode, message: &str) -> HttpResponse<Body> {
-        let code = status.as_u16();
-        let reason = status.canonical_reason().unwrap_or_default();
-        let body = format!(
-            "<!DOCTYPE html>\n<html lang=en>\n  <meta charset=utf-8>\n  \
-             <meta name=viewport content=\"initial-scale=1, minimum-scale=1, width=device-width\">\n  \
-             <title>Error {code} ({reason})!!1</title>\n  <style>\n    {GOOGLE_ERROR_STYLE}\n  </style>\n  \
-             <a href=//www.google.com/><span id=logo aria-label=Google></span></a>\n  \
-             <p><b>{code}.</b> <ins>That\u{2019}s an error.</ins>\n  \
-             <p>{message} <ins>That\u{2019}s all we know.</ins>\n"
-        );
-        http_reply(status, Some("text/html; charset=UTF-8"), body)
-    }
-}
-
-/// The style of Google's error pages.
-const GOOGLE_ERROR_STYLE: &str = "*{margin:0;padding:0}html,code{font:15px/22px arial,sans-serif}html{background:#fff;color:#222;padding:15px}body{margin:7% auto 0;max-width:390px;min-height:180px;padding:30px 0 15px}* > body{background:url(//www.google.com/images/errors/robot.png) 100% 5px no-repeat;padding-right:205px}p{margin:11px 0 22px;overflow:hidden}ins{color:#777;text-decoration:none}a img{border:0}@media screen and (max-width:772px){body{background:none;margin-top:0;max-width:none;padding-right:0}}#logo{background:url(//www.google.com/images/branding/googlelogo/1x/googlelogo_color_150x54dp.png) no-repeat;margin-left:-5px}@media only screen and (min-resolution:192dpi){#logo{background:url(//www.google.com/images/branding/googlelogo/2x/googlelogo_color_150x54dp.png) no-repeat 0% 0%/100% 100%;-moz-border-image:url(//www.google.com/images/branding/googlelogo/2x/googlelogo_color_150x54dp.png) 0}}@media only screen and (-webkit-min-device-pixel-ratio:2){#logo{background:url(//www.google.com/images/branding/googlelogo/2x/googlelogo_color_150x54dp.png) no-repeat;-webkit-background-size:100% 100%}}#logo{display:inline-block;height:54px;width:150px}";
-
-impl Operator for Google {
-    fn resolve_json(&self) -> bool {
-        true
-    }
-
-    fn not_found(&self, request: &HttpRequest<Body>) -> HttpResponse<Body> {
-        let path = request
-            .uri()
-            .path()
-            .replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;");
-        let message =
-            format!("The requested URL <code>{path}</code> was not found on this server. ");
-        Google::error(StatusCode::NOT_FOUND, &message)
-    }
-
-    fn no_query(&self, request: &HttpRequest<Body>) -> HttpResponse<Body> {
-        let named = request
-            .uri()
-            .query()
-            .and_then(|query| Form::parse(query.as_bytes()).ok())
-            .is_some_and(|form| urlencoded_form::first(&form.pairs, "name").is_some());
-        let detail = if named {
-            "RFC8484 handler at /dns-query received parameter &#39;name&#39;, which it does not \
-             accept.  Did you intend to pass the &#39;dns&#39; parameter, or call the JSON handler \
-             at /resolve?  See https://developers.google.com/speed/public-dns/docs/doh"
-        } else {
-            "Query must have a valid \u{2018}dns\u{2019} parameter.."
-        };
-        let message = format!("Your client has issued a malformed or illegal request. {detail}");
-        Google::error(StatusCode::BAD_REQUEST, &message)
-    }
-}
-
-/// `cloudflare-dns.com` and `one.one.one.one`: Cloudflare's JSON at
-/// `/dns-query`, an empty `400` to a GET with no question, and a
-/// redirect from `cloudflare-dns.com` to the same path on
-/// `one.one.one.one`, whose website the world does not serve.
-#[derive(Debug)]
-struct Cloudflare;
-
-impl Operator for Cloudflare {
-    fn dns_json(&self) -> bool {
-        true
-    }
-
-    fn not_found(&self, request: &HttpRequest<Body>) -> HttpResponse<Body> {
-        let redirects = request_host(request).is_some_and(|host| {
-            host.trim_end_matches('.')
-                .eq_ignore_ascii_case("cloudflare-dns.com")
-        });
-        if !redirects {
-            return http_reply(
-                StatusCode::NOT_FOUND,
-                Some("text/html; charset=utf-8"),
-                String::new(),
-            );
-        }
-        let target = match request.uri().path_and_query().map(|p| p.as_str()) {
-            None | Some("/") => "/dns/",
-            Some(target) => target,
-        };
-        let body = "<html>\r\n<head><title>301 Moved Permanently</title></head>\r\n<body>\r\n\
-                    <center><h1>301 Moved Permanently</h1></center>\r\n\
-                    <hr><center>cloudflare</center>\r\n</body>\r\n</html>\r\n";
-        let mut response = http_reply(
-            StatusCode::MOVED_PERMANENTLY,
-            Some("text/html; charset=UTF-8"),
-            body.to_owned(),
-        );
-        if let Ok(location) = HeaderValue::from_str(&format!("https://one.one.one.one{target}")) {
-            response.headers_mut().insert(LOCATION, location);
-        }
-        response
-    }
-
-    fn no_query(&self, _request: &HttpRequest<Body>) -> HttpResponse<Body> {
-        http_reply(StatusCode::BAD_REQUEST, None, String::new())
-    }
-}
-
-/// `dns.quad9.net`: RFC 8484 alone, with Quad9's plain text errors.
-#[derive(Debug)]
-struct Quad9;
-
-impl Operator for Quad9 {
-    fn not_found(&self, _request: &HttpRequest<Body>) -> HttpResponse<Body> {
-        httpd::text(
-            StatusCode::NOT_FOUND,
-            "there is no endpoint configured for this path",
-        )
-    }
-
-    fn no_query(&self, request: &HttpRequest<Body>) -> HttpResponse<Body> {
-        let text = match request.uri().query() {
-            None | Some("") => "DoH non-compliant query",
-            Some(_) => "DoH unable to decode BASE64-URL",
-        };
-        httpd::text(StatusCode::BAD_REQUEST, text)
-    }
-}
-
-/// `doh.opendns.com`: RFC 8484 alone, with OpenDNS's HTML errors.
-#[derive(Debug)]
-struct OpenDns;
-
-impl OpenDns {
-    /// OpenDNS's error page for `status`, saying `message`.
-    fn error(status: StatusCode, message: &str) -> HttpResponse<Body> {
-        let code = status.as_u16();
-        let reason = status.canonical_reason().unwrap_or_default();
-        let body = format!(
-            "<html>\r\n<head><title>{code} {reason}</title></head>\r\n<body>\r\n\
-             <center><h1>{message}</h1></center>\r\n</body>\r\n</html>\r\n"
-        );
-        http_reply(status, Some("text/html"), body)
-    }
-}
-
-impl Operator for OpenDns {
-    fn not_found(&self, _request: &HttpRequest<Body>) -> HttpResponse<Body> {
-        OpenDns::error(
-            StatusCode::NOT_FOUND,
-            "The request was directed to a path other than the configured endpoint",
-        )
-    }
-
-    fn no_query(&self, _request: &HttpRequest<Body>) -> HttpResponse<Body> {
-        OpenDns::error(StatusCode::BAD_REQUEST, "No valid query received")
-    }
-}
-
-/// `whoami.cloudflare.`, which 1.1.1.1 answers in the CHAOS class with the
-/// address the question came from.
-fn whoami_cloudflare() -> LowerName {
-    LowerName::new(&name("whoami.cloudflare."))
-}
-
-/// Google Public DNS, with `o-o.myaddr.l.google.com` answered as the
-/// real one is: Google's authority there sees Google's own egress address
-/// and the client's subnet (RFC 7871), so a copy of its records could
-/// never give it.
-/// With the egress unknown, the name is asked of the real hierarchy like
-/// any other.
-fn google(site: &ResolverSite, egress: Option<&Egress>) -> Config {
-    let config = Config::google(site.identity.clone());
-    match egress {
-        Some(egress) => config.local(Arc::new(myaddr(site.egress, egress))),
-        None => config,
-    }
-}
-
-/// Cloudflare's 1.1.1.1, answering `whoami.cloudflare` CH TXT with the
-/// world's egress address, the address the real one would see. With the
-/// egress unknown, it does not answer the name.
-fn cloudflare(site: &ResolverSite, egress: Option<&Egress>) -> Config {
-    let identity = match egress {
-        Some(egress) => {
-            let whoami = ChaosAnswer::Txt(egress.0.to_string());
-            site.identity.clone().answer(whoami_cloudflare(), whoami)
-        }
-        None => site.identity.clone(),
-    };
-    Config::cloudflare(identity)
-}
-
-/// Quad9, as its preset is.
-fn quad9(site: &ResolverSite, _egress: Option<&Egress>) -> Config {
-    Config::quad9(site.identity.clone())
-}
-
-/// OpenDNS, as its preset is. It refuses every CHAOS name.
-fn opendns(site: &ResolverSite, _egress: Option<&Egress>) -> Config {
-    Config::opendns(site.identity.clone())
-}
-
-/// `o-o.myaddr.l.google.com` TXT as Google's resolver answers it for a
-/// client behind `egress`: TXT records with the client's /24 as Google
-/// sends it in EDNS Client Subnet, and the address Google asked from, with
-/// TTL 60. The preset knows nothing else there, so every other type and
-/// every name below is asked of the real hierarchy, as the real resolver
-/// does, and the TXT answer leaves without AA, as the real one does.
-fn myaddr(google: IpAddr, egress: &Egress) -> Shown {
-    const TTL: u32 = 60;
-    let owner = name("o-o.myaddr.l.google.com.");
-    let subnet = Ipv4Addr::from(u32::from(egress.0) & 0xffff_ff00);
-    let records = [
-        format!("edns0-client-subnet {subnet}/24"),
-        google.to_string(),
-    ]
-    .map(|text| Record::from_rdata(owner.clone(), TTL, RData::TXT(TXT::new(vec![text]))));
-    let mut txt = RecordSet::with_ttl(owner.clone(), RecordType::TXT, TTL);
-    txt.set_records(records.to_vec());
-    Shown::new(&owner, [txt]).expect("the TXT RRset is owned by o-o.myaddr.l.google.com")
-}
-
-// ---------------------------------------------------------------------------
-// Where the world is
-
-/// The public IPv4 address the world's network reaches the internet from,
-/// as servers that echo a client's address see it. The whoami names of
-/// the public resolver presets answer with it. Under a live upstream it
-/// is the host's own public address.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Egress(pub Ipv4Addr);
-
-/// How one anycast server looks from a location: the round trip to the
-/// instance that answers there, and what that instance says about itself.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Site {
-    /// The round trip from the network to the server.
-    pub rtt: Duration,
-    /// Its answers to CHAOS-class questions and its NSID (RFC 5001).
-    pub identity: Identity,
-}
-
-/// How a public resolver looks from a location.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ResolverSite {
-    /// The round trip from the network to the resolver.
-    pub rtt: Duration,
-    /// Its answers to CHAOS-class questions and its NSID.
-    pub identity: Identity,
-    /// The address its own questions to authorities leave from, which
-    /// Google's whoami answer shows.
-    pub egress: IpAddr,
-}
-
-/// Where a world's network is on the internet: the round trips to
-/// servers, and which anycast instance answers each server address there,
-/// which an agent can read with `dig +nsid` or `id.server` CH TXT. These
-/// must agree with the network's [`Egress`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Location {
-    /// Authoritative servers by IPv4 address.
-    pub servers: BTreeMap<IpAddr, Site>,
-    /// Public resolvers by their primary IPv4 address.
-    pub resolvers: BTreeMap<IpAddr, ResolverSite>,
-    /// The round trip to any other authoritative server, such as one a
-    /// [`Mirror`] places.
-    pub authority_rtt: Duration,
-    /// The address the network reaches the internet from, when it is
-    /// known. Without it the whoami names the public resolver presets
-    /// answer themselves are left to the real hierarchy.
-    pub egress: Option<Egress>,
-}
-
-impl Location {
-    /// The server at `addr` from here. A server not listed answers with no
-    /// identity after [`authority_rtt`](Self::authority_rtt).
-    pub fn site(&self, addr: IpAddr) -> Site {
-        self.servers.get(&addr).cloned().unwrap_or_else(|| Site {
-            rtt: self.authority_rtt,
-            identity: Identity::none(),
-        })
-    }
-
-    /// The resolver whose primary address is `addr` from here. One not
-    /// listed answers with no identity after
-    /// [`authority_rtt`](Self::authority_rtt), and asks from its own address.
-    pub fn resolver(&self, addr: IpAddr) -> ResolverSite {
-        self.resolvers
-            .get(&addr)
-            .cloned()
-            .unwrap_or_else(|| ResolverSite {
-                rtt: self.authority_rtt,
-                identity: Identity::none(),
-                egress: addr,
-            })
-    }
-
-    /// The San Francisco Bay Area, reaching the internet from `egress` when
-    /// it is known, as every root letter, `gtld-servers.net` server, and
-    /// public resolver answered there on 2026-11-01: the median of five
-    /// round trips to each, the instance names it gave for `id.server`,
-    /// `hostname.bind`, `version.bind`, and `version.server` and their TTL,
-    /// its NSID, and the RCODE it gave for other CHAOS names. What each
-    /// gives `id.server` CH A, whether its TXT answers set AA, and the
-    /// payload of its CHAOS replies are as seen there on 2026-11-02.
-    /// Instances are the ones anycast picked there that day, so some sit
-    /// far away: k.root answered from London. Other authorities took
-    /// 20 ms, the median over six of them.
-    pub fn san_francisco_bay_area(egress: Option<Egress>) -> Location {
-        use ResponseCode::{NoError, NotImp, Refused, ServFail};
-        let txt = |text: &str| ChaosAnswer::Txt(text.to_string());
-        let no = |rcode| ChaosAnswer::Reply(ChaosReply::rcode(rcode));
-        // The names below, in order: id.server, hostname.bind,
-        // version.bind, version.server. Other types get REFUSED, and TXT
-        // answers leave AA clear, as NSD and Knot do.
-        let identity = |nsid: &str, unlisted: ResponseCode, answers: [ChaosAnswer; 4]| {
-            let names = [
-                chaos::id_server(),
-                chaos::hostname_bind(),
-                chaos::version_bind(),
-                chaos::version_server(),
-            ];
-            let mut identity = Identity {
-                unlisted: ChaosReply::rcode(unlisted),
-                nsid: Some(nsid.as_bytes().to_vec()),
-                ..Identity::none()
-            };
-            for (name, answer) in names.into_iter().zip(answers) {
-                identity = identity.answer(name, answer);
-            }
-            identity
-        };
-        let ms = Duration::from_millis;
-        // BIND serves each of its names with text as a zone, and G runs it
-        // too.
-        let zones = |identity: Identity| Identity {
-            chaos: identity
-                .chaos
-                .into_iter()
-                .map(|(name, answer)| match answer {
-                    ChaosAnswer::Txt(text) => (name, ChaosAnswer::Zone(Some(text))),
-                    answer => (name, answer),
-                })
-                .collect(),
-            ..identity
-        };
-        // C, I, and M also serve `authors.bind`, a zone with no TXT.
-        let bind = |identity: Identity| {
-            zones(identity).answer(chaos::authors_bind(), ChaosAnswer::Zone(None))
-        };
-        // Verisign's servers answer other types with NOTIMP and no OPT
-        // record. Its root letter sets AA; its gTLD servers do not.
-        let verisign = |identity: Identity| Identity {
-            other_types: ChaosReply {
-                edns: false,
-                ..ChaosReply::rcode(NotImp)
-            },
-            ..identity
-        };
-        // E and F answer other types with NOTIMP and EDE 21, and advertise
-        // 512 octets.
-        let not_supported = |identity: Identity| Identity {
-            aa: true,
-            other_types: ChaosReply {
-                ede: Some(Ede {
-                    code: EdeCode::NOT_SUPPORTED,
-                    text: Some("Unsupported DNS Type for Class CHAOS".to_string()),
-                }),
-                ..ChaosReply::rcode(NotImp)
-            },
-            payload: Some(512),
-            ..identity
-        };
-        let letters = [
-            (
-                32,
-                Identity {
-                    aa: true,
-                    ..verisign(identity(
-                        "a.r.ussea-4c",
-                        NoError,
-                        [
-                            txt("nnn1-ussea-4c"),
-                            txt("nnn1-ussea-4c"),
-                            txt("ATLAS"),
-                            txt("ATLAS"),
-                        ],
-                    ))
-                },
-            ),
-            (
-                72,
-                identity(
-                    "b1-iad",
-                    Refused,
-                    [
-                        txt("b1-iad"),
-                        txt("b1-iad"),
-                        txt("knot 3.x"),
-                        txt("knot 3.x"),
-                    ],
-                ),
-            ),
-            (
-                15,
-                bind(identity(
-                    "lax1a.c.root-servers.org",
-                    Refused,
-                    [
-                        txt("lax1b.c.root-servers.org"),
-                        txt("lax1a.c.root-servers.org"),
-                        txt("c-root"),
-                        no(Refused),
-                    ],
-                )),
-            ),
-            (
-                8,
-                identity(
-                    "paca6.droot.maxgigapop.net",
-                    Refused,
-                    [
-                        txt("paca7.droot.maxgigapop.net"),
-                        txt("paca8.droot.maxgigapop.net"),
-                        txt("NSD 4"),
-                        txt("NSD 4"),
-                    ],
-                ),
-            ),
-            (
-                24,
-                not_supported(identity(
-                    "c01.SEA.eroot",
-                    NotImp,
-                    [
-                        txt("c01.SEA.eroot"),
-                        txt("c01.SEA.eroot"),
-                        txt("2026.10.4"),
-                        no(NotImp),
-                    ],
-                ))
-                .ttl(60),
-            ),
-            (
-                9,
-                not_supported(identity(
-                    "SJC.cf.f.root-servers.org",
-                    NotImp,
-                    [
-                        txt("SJC.cf.f.root-servers.org"),
-                        txt("SJC.cf.f.root-servers.org"),
-                        txt("2026.10.4"),
-                        no(NotImp),
-                    ],
-                ))
-                .ttl(60),
-            ),
-            (
-                48,
-                zones(identity(
-                    "groot-con2-3",
-                    Refused,
-                    [no(Refused), txt("groot-con2-2"), no(Refused), no(Refused)],
-                )),
-            ),
-            (
-                21,
-                // H adds EDE 21 to its REFUSED.
-                Identity {
-                    other_types: ChaosReply {
-                        ede: Some(Ede::new(EdeCode::NOT_SUPPORTED)),
-                        ..ChaosReply::rcode(Refused)
-                    },
-                    ..identity(
-                        "001.nzy.h.root-servers.org",
-                        Refused,
-                        [
-                            txt("001.nzy.h.root-servers.org"),
-                            txt("001.nzy.h.root-servers.org"),
-                            txt("NSD 4.x"),
-                            txt("NSD 4.x"),
-                        ],
-                    )
-                },
-            ),
-            (
-                7,
-                bind(identity(
-                    "s1.pix",
-                    Refused,
-                    [
-                        txt("s1.pix"),
-                        txt("s1.pix"),
-                        txt("contact info@netnod.se"),
-                        no(Refused),
-                    ],
-                )),
-            ),
-            (
-                5,
-                identity(
-                    "k.r.ussjc-3",
-                    Refused,
-                    [
-                        txt("rootns-ussjc-3"),
-                        txt("rootns-ussjc-3"),
-                        txt("KnotDNS"),
-                        txt("KnotDNS"),
-                    ],
-                ),
-            ),
-            (
-                150,
-                identity(
-                    "ns2.gb-lon.k.ripe.net",
-                    Refused,
-                    [
-                        txt("ns3.gb-lon.k.ripe.net"),
-                        txt("ns2.gb-lon.k.ripe.net"),
-                        txt("BIND"),
-                        no(Refused),
-                    ],
-                ),
-            ),
-            (
-                15,
-                identity(
-                    "us-lax-aa",
-                    Refused,
-                    [
-                        txt("us-lax-aa"),
-                        txt("us-lax-aa"),
-                        txt("NSD 4"),
-                        txt("NSD 4"),
-                    ],
-                ),
-            ),
-            (
-                13,
-                bind(identity(
-                    "M-SJC-4",
-                    Refused,
-                    [txt("M-SJC-4"), txt("M-SJC-4"), txt("9.16"), no(Refused)],
-                )),
-            ),
-        ];
-        // Every gtld-servers.net server answers "ATLAS" for its version.
-        let atlas = |nsid: &str, id: &str, hostname: &str| {
-            verisign(identity(
-                nsid,
-                Refused,
-                [txt(id), txt(hostname), txt("ATLAS"), txt("ATLAS")],
-            ))
-        };
-        let gtld = [
-            (6, atlas("nnn1-ussjc-3", "nnn1-ussjc-3", "nnn1-ussjc-3")),
-            (156, atlas("nnn1-ein2", "nnn1-ein4", "nnn1-ein1")),
-            (7, atlas("nnn1-ussjc-3", "nnn1-ussjc-3", "nnn1-ussjc-3")),
-            (7, atlas("nnn1-ussjc-3", "nnn1-ussjc-3", "nnn1-ussjc-3")),
-            (6, atlas("nnn1-ussjc-3", "nnn1-ussjc-3", "nnn1-ussjc-3")),
-            (53, atlas("nnn1-uschi-2c", "nnn1-uschi-2c", "nnn1-uschi-2a")),
-            (54, atlas("nnn1-uschi-2b", "nnn1-uschi-2c", "nnn1-uschi-2b")),
-            (53, atlas("nnn1-uschi-2b", "nnn1-uschi-2a", "nnn1-uschi-2b")),
-            (53, atlas("nnn1-uschi-2c", "nnn1-uschi-2b", "nnn1-uschi-2b")),
-            (47, atlas("nnn1-usdal-3b", "nnn1-usdal-3b", "nnn1-usdal-3b")),
-            (47, atlas("nnn1-usdal-3a", "nnn1-usdal-3a", "nnn1-usdal-3a")),
-            (47, atlas("nnn1-usdal-3a", "nnn1-usdal-3c", "nnn1-usdal-3a")),
-            (45, atlas("nnn1-usdal-3a", "nnn1-usdal-3c", "nnn1-usdal-3c")),
-        ];
-        let servers = ROOT_LETTERS
-            .iter()
-            .map(|letter| letter.server)
-            .zip(letters)
-            .chain(GTLD_SERVERS.into_iter().zip(gtld))
-            .map(|(server, (rtt, identity))| {
-                let site = Site {
-                    rtt: ms(rtt),
-                    identity,
-                };
-                (IpAddr::V4(server.v4), site)
-            })
-            .collect();
-        let resolver = |rtt: u64, identity: Identity, egress: IpAddr| ResolverSite {
-            rtt: ms(rtt),
-            identity,
-            egress,
-        };
-        let resolvers = [
-            resolver(
-                7,
-                // Every CHAOS question gets SERVFAIL.
-                Identity {
-                    other_types: ChaosReply::rcode(ServFail),
-                    ..identity(
-                        "gpdns-sfo",
-                        ServFail,
-                        [no(ServFail), no(ServFail), no(ServFail), no(ServFail)],
-                    )
-                },
-                IpAddr::V4(Ipv4Addr::new(172, 253, 1, 21)),
-            ),
-            resolver(
-                8,
-                Identity {
-                    other_types: ChaosReply::rcode(NotImp),
-                    ..identity(
-                        "sjc01",
-                        Refused,
-                        [txt("sjc10"), no(Refused), no(Refused), txt("2026.10.11")],
-                    )
-                },
-                IpAddr::V4(Ipv4Addr::new(172, 69, 133, 100)),
-            ),
-            resolver(
-                7,
-                Identity {
-                    other_types: ChaosReply::rcode(NoError),
-                    ..identity(
-                        "res130.pao",
-                        Refused,
-                        [
-                            txt("res711.pao"),
-                            no(ServFail),
-                            txt("Q9-P-2026080500"),
-                            no(ServFail),
-                        ],
-                    )
-                    .answer(chaos::authors_bind(), no(ServFail))
-                },
-                IpAddr::V6(Ipv6Addr::new(0x2620, 0x171, 0xf0, 0xf0, 0, 0, 0, 0x227)),
-            ),
-            resolver(
-                17,
-                // Every CHAOS question gets REFUSED with no OPT record.
-                {
-                    let refused = ChaosReply {
-                        edns: false,
-                        ..ChaosReply::rcode(Refused)
-                    };
-                    let no = || ChaosAnswer::Reply(refused.clone());
-                    Identity {
-                        unlisted: refused.clone(),
-                        other_types: refused.clone(),
-                        ..identity("r3003.lax", Refused, [no(), no(), no(), no()])
-                    }
-                },
-                IpAddr::V6(Ipv6Addr::new(0x2620, 0, 0xcc8, 0, 0, 0, 0, 0x36)),
-            ),
-        ];
-        let resolvers = PUBLIC_RESOLVERS
-            .iter()
-            .zip(resolvers)
-            .map(|(resolver, site)| (IpAddr::V4(resolver.addresses[0].v4), site))
-            .collect();
-        Location {
-            servers,
-            resolvers,
-            authority_rtt: ms(20),
-            egress,
-        }
-    }
-
-    /// The location of the host that `upstream` asks from, measured there,
-    /// so what the servers say about themselves agrees with the host's
-    /// `egress` wherever the host is.
-    ///
-    /// Each root letter, `gtld-servers.net` server, and public resolver is
-    /// looked up about itself as an agent with `dig` asks it: `id.server`,
-    /// `hostname.bind`, `version.bind`, `version.server`, and
-    /// `authors.bind` in the CHAOS class, each with the NSID request every
-    /// lookup carries (RFC 5001), and `invalid.` for what it gives a name
-    /// it does not know. Its shortest lookup is its round trip. Each public
-    /// resolver is also asked `whoami.akamai.net` A, with recursion, which Akamai's servers answer
-    /// with the address the question reached them from: the resolver's
-    /// egress. A server that answers nothing within `wait` is left out,
-    /// and [`site`](Self::site) and [`resolver`](Self::resolver) give it
-    /// no identity. Any other authoritative server is as far as the median
-    /// of the measured ones, or no farther than the host when none
-    /// answered.
-    pub async fn measured(
-        fcx: &Cx,
-        upstream: &dyn Upstream,
-        egress: Option<Egress>,
-        wait: Duration,
-    ) -> Location {
-        let deadline = fcx.now() + wait;
-        let servers: Vec<IpAddr> = ROOT_LETTERS
-            .iter()
-            .map(|letter| &letter.server)
-            .chain(&GTLD_SERVERS)
-            .map(|server| IpAddr::V4(server.v4))
-            .collect();
-        let resolvers: Vec<IpAddr> = PUBLIC_RESOLVERS
-            .iter()
-            .map(|resolver| IpAddr::V4(resolver.addresses[0].v4))
-            .collect();
-        let probes = servers
-            .iter()
-            .chain(&resolvers)
-            .map(|server| Box::pin(probe(fcx, upstream, *server, deadline)) as Probe<'_, _>);
-        let sites: Vec<Option<Site>> = join_all(probes.collect()).await;
-        let (server_sites, resolver_sites) = sites.split_at(servers.len());
-        let whoami = resolvers.iter().map(|resolver| {
-            Box::pin(resolver_egress(fcx, upstream, *resolver, deadline)) as Probe<'_, _>
-        });
-        let egresses: Vec<Option<IpAddr>> = join_all(whoami.collect()).await;
-
-        let servers: BTreeMap<IpAddr, Site> = servers
-            .into_iter()
-            .zip(server_sites.iter().cloned())
-            .filter_map(|(server, site)| Some((server, site?)))
-            .collect();
-        let mut rtts: Vec<Duration> = servers.values().map(|site| site.rtt).collect();
-        rtts.sort();
-        let authority_rtt = rtts.get(rtts.len() / 2).copied().unwrap_or_default();
-        let resolvers = resolvers
-            .into_iter()
-            .zip(resolver_sites.iter().cloned())
-            .zip(egresses)
-            .filter_map(|((resolver, site), egress)| {
-                let site = site?;
-                let site = ResolverSite {
-                    rtt: site.rtt,
-                    identity: site.identity,
-                    egress: egress.unwrap_or(resolver),
-                };
-                Some((resolver, site))
-            })
-            .collect();
-        Location {
-            servers,
-            resolvers,
-            authority_rtt,
-            egress,
-        }
-    }
-}
-
-/// The CHAOS-class names [`Location::measured`] asks each server.
-fn identity_names() -> [LowerName; 5] {
-    [
-        chaos::id_server(),
-        chaos::hostname_bind(),
-        chaos::version_bind(),
-        chaos::version_server(),
-        chaos::authors_bind(),
-    ]
-}
-
-/// What `server` gives `upstream` for `name`, `rtype`, and `class` before
-/// `deadline`, and how long it took. The lookup is about the zone at
-/// `zone`, and asks for recursion when `recursion` is set.
-async fn exchange(
-    fcx: &Cx,
-    upstream: &dyn Upstream,
-    server: IpAddr,
-    question: (&Name, RecordType, DNSClass),
-    zone: &Name,
-    recursion: bool,
-    deadline: Instant,
-) -> Option<(Duration, Message)> {
-    let (name, rtype, class) = question;
-    let mut query = Query::query(name.clone(), rtype);
-    query.set_query_class(class);
-    let mut lookup = Lookup::new(SocketAddr::new(server, 53), LowerName::new(zone), &query);
-    lookup.recursion_desired = recursion;
-    let sent = fcx.now();
-    let looked = fcx
-        .race(Some(deadline), upstream.lookup(fcx, lookup))
-        .await
-        .ok()?;
-    let took = fcx.now().since_start().saturating_sub(sent.since_start());
-    match looked {
-        Looked::Response(response) => Some((took, response)),
-        Looked::Unreachable | Looked::NoReply => None,
-    }
-}
-
-/// How `server` looks from where `upstream` asks: its answers about
-/// itself and its round trip, or `None` when it answered nothing.
-async fn probe(
-    fcx: &Cx,
-    upstream: &dyn Upstream,
-    server: IpAddr,
-    deadline: Instant,
-) -> Option<Site> {
-    let mut names: Vec<LowerName> = identity_names().into();
-    names.push(LowerName::new(
-        &Name::from_ascii("invalid.").expect("a valid name"),
-    ));
-    // Each CHAOS name is a zone of its own, as BIND serves it.
-    let ask = |name: &LowerName, rtype: RecordType| {
-        let name = Name::from(name);
-        Box::pin(async move {
-            let question = (&name, rtype, DNSClass::CH);
-            exchange(fcx, upstream, server, question, &name, false, deadline).await
-        }) as Probe<'_, _>
-    };
-    let mut replies: Vec<Option<(Duration, Message)>> = join_all(
-        names
-            .iter()
-            .map(|name| ask(name, RecordType::TXT))
-            .collect(),
-    )
-    .await;
-    // A BIND server serves each name it answers as a zone of its own,
-    // which shows in its TXT reply, asked without RD: the zone's NS
-    // beside the text, or its SOA when the zone has none.
-    let zone = |name: &LowerName, reply: &Option<(Duration, Message)>| {
-        reply.as_ref().is_some_and(|(_, reply)| {
-            reply.metadata.authoritative
-                && reply.authorities.iter().any(|record| {
-                    LowerName::new(&record.name) == *name
-                        && matches!(record.record_type(), RecordType::SOA | RecordType::NS)
-                })
-        })
-    };
-    // What a name that is not a zone gives for another type, asked of the
-    // first such name, `invalid.` at the latest.
-    let sample = names
-        .iter()
-        .zip(&replies)
-        .find(|(name, reply)| !zone(name, reply))
-        .map_or(&names[names.len() - 1], |(name, _)| name);
-    let other_type = ask(sample, RecordType::A).await;
-    let unlisted = replies
-        .pop()
-        .flatten()
-        .map_or(ChaosReply::rcode(ResponseCode::Refused), |(_, reply)| {
-            chaos_reply(&reply)
-        });
-    let rtt = replies
-        .iter()
-        .chain([&other_type])
-        .flatten()
-        .map(|(took, _)| *took)
-        .min()?;
-    let mut identity = Identity {
-        other_types: other_type.map_or(Identity::none().other_types, |(_, reply)| {
-            chaos_reply(&reply)
-        }),
-        unlisted: unlisted.clone(),
-        ..Identity::none()
-    };
-    for (name, reply) in names.into_iter().zip(replies) {
-        let zone = zone(&name, &reply);
-        let Some((_, reply)) = reply else {
-            continue;
-        };
-        if let Some(edns) = &reply.edns {
-            identity.payload = Some(edns.max_payload());
-        }
-        if identity.nsid.is_none() {
-            identity.nsid = reply
-                .edns
-                .iter()
-                .flat_map(|edns| edns.options().as_ref().iter())
-                .find_map(|(_, option)| Nsid::from_option(option))
-                .map(|nsid| nsid.0);
-        }
-        let text = reply.answers.iter().find_map(|record| match &record.data {
-            RData::TXT(txt) => {
-                let text: Vec<u8> = txt
-                    .txt_data
-                    .iter()
-                    .flat_map(|s| s.iter().copied())
-                    .collect();
-                Some((record.ttl, text))
-            }
-            _ => None,
-        });
-        let text = text.map(|(ttl, text)| {
-            identity.ttl = ttl;
-            String::from_utf8_lossy(&text).into_owned()
-        });
-        let answer = match text {
-            _ if zone => ChaosAnswer::Zone(text),
-            Some(text) => {
-                identity.aa = reply.metadata.authoritative;
-                ChaosAnswer::Txt(text)
-            }
-            None if chaos_reply(&reply) == unlisted => continue,
-            None => ChaosAnswer::Reply(chaos_reply(&reply)),
-        };
-        identity.chaos.insert(name, answer);
-    }
-    Some(Site { rtt, identity })
-}
-
-/// `reply`, a CHAOS-class reply without data, as an identity keeps it.
-fn chaos_reply(reply: &Message) -> ChaosReply {
-    let ede = reply.edns.as_ref().and_then(|edns| {
-        edns.options()
-            .as_ref()
-            .iter()
-            .find_map(|(_, option)| Ede::from_option(option))
-    });
-    ChaosReply {
-        rcode: reply.metadata.response_code,
-        ede,
-        edns: reply.edns.is_some(),
-    }
-}
-
-/// The address the public resolver at `resolver` asks authorities from,
-/// as `whoami.akamai.net` A, asked of it with recursion, gives it.
-async fn resolver_egress(
-    fcx: &Cx,
-    upstream: &dyn Upstream,
-    resolver: IpAddr,
-    deadline: Instant,
-) -> Option<IpAddr> {
-    let name = Name::from_ascii("whoami.akamai.net.").expect("a valid name");
-    let question = (&name, RecordType::A, DNSClass::IN);
-    let (_, reply) = exchange(
-        fcx,
-        upstream,
-        resolver,
-        question,
-        &Name::root(),
-        true,
-        deadline,
-    )
-    .await?;
-    reply
-        .answers
-        .iter()
-        .find_map(|record| record.data.ip_addr())
-}
-
-/// One of the questions [`Location::measured`] waits on together.
-type Probe<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
-
-/// Waits for every one of `futures` and gives their outputs in order.
-async fn join_all<T>(mut futures: Vec<Probe<'_, T>>) -> Vec<T> {
-    let mut outputs: Vec<Option<T>> = futures.iter().map(|_| None).collect();
-    std::future::poll_fn(|cx| {
-        let mut pending = false;
-        for (future, output) in futures.iter_mut().zip(outputs.iter_mut()) {
-            if output.is_none() {
-                match future.as_mut().poll(cx) {
-                    std::task::Poll::Ready(value) => *output = Some(value),
-                    std::task::Poll::Pending => pending = true,
-                }
-            }
-        }
-        if pending {
-            std::task::Poll::Pending
-        } else {
-            std::task::Poll::Ready(())
-        }
-    })
-    .await;
-    outputs
-        .into_iter()
-        .map(|output| output.expect("every future finished"))
-        .collect()
-}
-
-// ---------------------------------------------------------------------------
-// Presets that return hosts
-
-/// One host per root letter, at both of its addresses, each machine
-/// running `program` with the letter's server front: its identity at
-/// `at`, its payload size, and its answer to ANY. Each sits behind
-/// [`Host::delay`] with half its round trip from `at`, so a guest's
-/// `dig @198.41.0.4` and a resolver's own question take the same time.
-pub fn root_servers<P: Program>(program: impl Fn(ServerConfig) -> P, at: &Location) -> Vec<Host> {
+/// One host per root letter, at both of its addresses, finished by
+/// `build`: the letter, and its [`server_host`]. `build` gives it its
+/// program, usually an [`Authoritative`] with the letter's
+/// [`payload`](Letter::payload) and [`any`](Letter::any) in its front, and
+/// any [`Host::delay`].
+pub fn root_servers(build: impl Fn(&Letter, Host) -> Host) -> Vec<Host> {
     ROOT_LETTERS
         .iter()
-        .map(|letter| {
-            let site = at.site(IpAddr::V4(letter.server.v4));
-            let server = ServerConfig {
-                payload: letter.payload,
-                any: letter.any,
-                ..ServerConfig::root(site.identity)
-            };
-            server_host(&letter.server, program(server), site.rtt)
-        })
+        .map(|letter| build(letter, server_host(&letter.server)))
         .collect()
 }
 
-/// One host per `gtld-servers.net` server, at both of its addresses, each
-/// machine running `program` with the server's front at `at`, behind
-/// [`Host::delay`] with half its round trip.
-pub fn gtld_servers<P: Program>(program: impl Fn(ServerConfig) -> P, at: &Location) -> Vec<Host> {
+/// One host per `gtld-servers.net` server, at both of its addresses,
+/// finished by `build` as [`root_servers`] finishes a letter's.
+pub fn gtld_servers(build: impl Fn(&NameServer, Host) -> Host) -> Vec<Host> {
     GTLD_SERVERS
         .iter()
-        .map(|server| {
-            let site = at.site(IpAddr::V4(server.v4));
-            server_host(server, program(ServerConfig::gtld(site.identity)), site.rtt)
-        })
-        .collect()
-}
-
-/// One host per address pair of each of [`PUBLIC_RESOLVERS`], at both
-/// addresses and behind [`Host::delay`] with half its round trip from
-/// `at`, finished by `build`. `build` is called once per host and gives it
-/// its resolver, usually [`PublicResolver::recursive`], and any other
-/// ports, such as the [`encrypted`](super::encrypted) fronts in front of
-/// that resolver's [`handle`](Recursive::handle). Each host's resolver
-/// keeps its own caches.
-pub fn public_resolvers(build: impl Fn(&PublicResolver, Host) -> Host, at: &Location) -> Vec<Host> {
-    PUBLIC_RESOLVERS
-        .iter()
-        .flat_map(|resolver| {
-            let site = at.resolver(IpAddr::V4(resolver.addresses[0].v4));
-            let build = &build;
-            resolver.addresses.iter().map(move |address| {
-                let host = Host::new(address.ptr.trim_end_matches('.'))
-                    .at(address.v4)
-                    .at(address.v6)
-                    .delay(site.rtt / 2);
-                build(resolver, host)
-            })
-        })
+        .map(|server| build(server, server_host(server)))
         .collect()
 }
 
@@ -1489,26 +306,26 @@ type Wrap = dyn Fn(Arc<dyn Authority>) -> Arc<dyn Authority> + Send + Sync;
 /// What a world places at the addresses of one name.
 type Front = dyn Fn(Host) -> Host + Send + Sync;
 
-/// Copies of the real hierarchy: the root, `com`, `net`, and every zone
+/// Copies of the real hierarchy: the zones the world says its servers
+/// serve, such as the root at the root letters' addresses, and every zone
 /// below them that the copied records name, each served at its real
 /// servers' addresses from records copied from those servers.
 ///
 /// [`server`](Mirror::server) is a program that answers, at its own
-/// address, for the zones the mirror knows that address serves: the root
-/// at the root letters' addresses, `com` and `net` at the
-/// `gtld-servers.net` addresses, every zone whose copied records name
-/// that address a server of it, and every zone below one of those that
-/// the real server turns out to answer from, such as `arpa` at the root
-/// letters' addresses. Each zone's data is
+/// address, for the zones the mirror knows that address serves: those
+/// given with [`serves`](Mirror::serves), every zone whose copied records
+/// name that address a server of it, and every zone below one of those
+/// that the real server turns out to answer from, such as `arpa` at the
+/// root letters' addresses. Each zone's data is
 /// [`Learned`](fictionet::stdlib::services::dns::zone::Learned): one per
 /// zone, shared by all of the zone's servers, filled from the real
 /// servers through the mirror's upstream as the world's servers need
 /// facts, and answered from by the world's own [`Copies`]. No real
-/// server's message reaches a client. A world runs the program on the
-/// root and `gtld-servers.net` presets. As the copies file what the real
-/// servers answered ([`Filing`]), the mirror places more servers, so a
-/// resolver in the world can follow the hierarchy as far down as the
-/// upstream answers:
+/// server's message reaches a client. A world runs the program on hosts
+/// of its own, such as [`root_servers`] and [`gtld_servers`]. As the
+/// copies file what the real servers answered ([`Filing`]), the mirror
+/// places more servers, so a resolver in the world can follow the
+/// hierarchy as far down as the upstream answers:
 ///
 /// - at each address a filed referral gives as glue for a name server it
 ///   names (RFC 9471), and
@@ -1518,34 +335,23 @@ type Front = dyn Fn(Host) -> Host + Send + Sync;
 ///   `awsdns-NN.org` or `8.in-addr.arpa` served from `arin.net`.
 ///
 /// Each server is placed when the records that name it are filed, before
-/// the reply that needed them leaves, behind [`Host::delay`] with half
-/// the location's [`authority_rtt`](Location::authority_rtt). Where a
-/// host's machine is already, such as a site placed first, the server
-/// joins it; where a mirrored server or a preset's server already
-/// answers, nothing more is placed, and the address serves the new zone
-/// too. An address a filed NS RRset names whose real server turns out not
-/// to serve the zone, as at a lame delegation, answers for the rest of
-/// the session from the zones it does serve, as [`Copies`] says. A
-/// server joining a machine takes its port 53, so a world puts no
-/// DNS server of its own at an address the real hierarchy names. The
-/// names of name servers and the addresses filed for them are forgotten
-/// when the namespace advances, and so is every zone's copied data.
+/// the reply that needed them leaves, behind the mirror's
+/// [`delay`](Mirror::delay). An address where a host's machine already
+/// is gets no server: the world's own hosts there, such as its root
+/// servers or a resolver, answer as the world made them, and where one
+/// runs a mirrored server, that server answers for the new zone too. An
+/// address a filed NS RRset
+/// names whose real server turns out not to serve the zone, as at a lame
+/// delegation, answers for the rest of the session from the zones it does
+/// serve, as [`Copies`] says. The names of name servers and the addresses
+/// filed for them are forgotten when the namespace advances, and so is
+/// every zone's copied data.
 ///
-/// Addresses on the sandboxes' subnet or a LAN, and addresses no
-/// internet host can have (those the IANA special-purpose registries of
-/// RFC 6890 mark not globally reachable), are never placed: the reply
-/// still reaches the client as it was, and the address stays unreachable.
-/// The public resolvers' addresses get no server either: a world runs the
-/// resolvers there.
-///
-/// The upstream asks every real server from one address, the location's
-/// [`egress`](Location::egress). A real server that echoes the address a
-/// question came from, as the whoami names of Akamai do, would see a
-/// public resolver's own egress instead ([`ResolverSite::egress`]), so a
-/// reply to a public resolver's question carries that address in place
-/// of the location's, in an unsigned A record when it is IPv4 and in a
-/// TXT string. The copied record stays as the real server sent it; the
-/// address is put in as the reply leaves, since it depends on who asked.
+/// Addresses on the sandboxes' subnet or a LAN, addresses no internet
+/// host can have (those the IANA special-purpose registries of RFC 6890
+/// mark not globally reachable), and the [`egress`](Mirror::egress)
+/// addresses the upstream asks from are never placed: the reply still
+/// reaches the client as it was, and the address stays unreachable.
 #[derive(Clone)]
 pub struct Mirror {
     inner: Arc<Inner>,
@@ -1558,18 +364,14 @@ struct Inner {
     delay: Duration,
     namespace: Option<Namespace>,
     observers: Vec<Arc<Observer>>,
-    wrap: Option<Arc<Wrap>>,
+    wraps: Vec<Arc<Wrap>>,
     fronts: Vec<(LowerName, Arc<Front>)>,
     named: Arc<PerSession<Named>>,
     placed: Arc<Mutex<Placed>>,
     /// Each zone's copied data, and the zones each address serves.
     copies: Arc<Copies>,
-    /// The address the upstream asks the real servers from, when it is
-    /// known.
-    egress: Option<Egress>,
-    /// The address each public resolver's questions leave from, by each
-    /// of the resolver's own addresses.
-    resolvers: HashMap<IpAddr, IpAddr>,
+    /// The addresses the upstream asks the real servers from.
+    egress: Vec<IpAddr>,
 }
 
 /// What the copies filed this session.
@@ -1633,47 +435,23 @@ struct Placed {
 }
 
 impl Mirror {
-    /// A mirror copying what `upstream` says the real servers answer,
-    /// placing servers with `handle`, behind the round trip `at` gives
-    /// other authorities.
-    pub fn new(upstream: impl Upstream, handle: NetHandle, at: &Location) -> Mirror {
-        let resolvers = PUBLIC_RESOLVERS
-            .iter()
-            .flat_map(|resolver| {
-                let egress = at.resolver(IpAddr::V4(resolver.addresses[0].v4)).egress;
-                resolver
-                    .addresses
-                    .iter()
-                    .flat_map(move |a| [(IpAddr::V4(a.v4), egress), (IpAddr::V6(a.v6), egress)])
-            })
-            .collect();
-        let copies = Copies::new();
-        for letter in &ROOT_LETTERS {
-            for addr in letter.server.addresses() {
-                copies.serves(addr, &LowerName::from(Name::root()));
-            }
-        }
-        for server in &GTLD_SERVERS {
-            for addr in server.addresses() {
-                for zone in ["com.", "net."] {
-                    copies.serves(addr, &LowerName::new(&name(zone)));
-                }
-            }
-        }
+    /// A mirror copying what `upstream` says the real servers answer, and
+    /// placing servers with `handle`. It knows no server yet: a world
+    /// gives the zones its own hosts serve with [`serves`](Self::serves).
+    pub fn new(upstream: impl Upstream, handle: NetHandle) -> Mirror {
         Mirror {
             inner: Arc::new(Inner {
                 upstream: Arc::new(upstream),
                 handle,
-                delay: at.authority_rtt / 2,
+                delay: Duration::ZERO,
                 namespace: None,
                 observers: Vec::new(),
-                wrap: None,
+                wraps: Vec::new(),
                 fronts: Vec::new(),
                 named: Arc::default(),
                 placed: Arc::default(),
-                copies: Arc::new(copies),
-                egress: at.egress,
-                resolvers,
+                copies: Arc::new(Copies::new()),
+                egress: Vec::new(),
             }),
         }
     }
@@ -1686,6 +464,28 @@ impl Mirror {
         Mirror {
             inner: Arc::new(inner),
         }
+    }
+
+    /// Notes that the server at `addr` serves the zone at `zone`, such as
+    /// the root at each root letter's addresses, so a
+    /// [`server`](Self::server) there answers for it from the zone's copy.
+    pub fn serves(self, addr: IpAddr, zone: &Name) -> Mirror {
+        self.inner.copies.serves(addr, &LowerName::new(zone));
+        self
+    }
+
+    /// Notes `addr` as an address the upstream asks the real servers from,
+    /// where the mirror places no server: a server there would send its
+    /// lookups from the host to the host's own network edge.
+    pub fn egress(self, addr: IpAddr) -> Mirror {
+        self.with(|inner| inner.egress.push(addr))
+    }
+
+    /// Places each server behind [`Host::delay`] `delay`, the time a
+    /// packet takes each way between the network and the real server.
+    /// Without it, servers answer at once.
+    pub fn delay(self, delay: Duration) -> Mirror {
+        self.with(|inner| inner.delay = delay)
     }
 
     /// Servers for the sessions of `namespace`: when it advances, every
@@ -1706,12 +506,13 @@ impl Mirror {
 
     /// Wraps the authority of every server the mirror makes, such as with
     /// an [`Overlay`](fictionet::stdlib::services::dns::authority::Overlay)
-    /// for an invented zone.
+    /// for an invented zone or an [`Echo`]. Each wrap goes around the
+    /// ones given before it.
     pub fn wrap(
         self,
         f: impl Fn(Arc<dyn Authority>) -> Arc<dyn Authority> + Send + Sync + 'static,
     ) -> Mirror {
-        self.with(|inner| inner.wrap = Some(Arc::new(f)))
+        self.with(|inner| inner.wraps.push(Arc::new(f)))
     }
 
     /// Places `build(host)` at each address filed for `name` in an A or
@@ -1719,9 +520,8 @@ impl Mirror {
     /// chain, the first time it is filed, joining a machine that is
     /// there. `host` is a host at that address only, and an address no
     /// internet host can have gets none, as with servers. A world uses it
-    /// for a public resolver's DNS over HTTPS front at the addresses of
-    /// [`PublicResolver::doh`] names, such as `cloudflare-dns.com`, which
-    /// are not the resolver's own.
+    /// for a resolver's DNS over HTTPS front at the addresses of a name of
+    /// its own, which are not the resolver's.
     pub fn front(self, name: Name, build: impl Fn(Host) -> Host + Send + Sync + 'static) -> Mirror {
         let name = LowerName::new(&name);
         self.with(|inner| inner.fronts.push((name, Arc::new(build))))
@@ -1738,10 +538,10 @@ impl Mirror {
 impl Inner {
     fn server(self: &Arc<Self>, server: ServerConfig) -> Authoritative<Arc<dyn Authority>> {
         let mirrored: Arc<dyn Authority> = Arc::new(Mirrored(self.clone()));
-        let authority = match &self.wrap {
-            Some(wrap) => wrap(mirrored),
-            None => mirrored,
-        };
+        let authority = self
+            .wraps
+            .iter()
+            .fold(mirrored, |authority, wrap| wrap(authority));
         let program = Authoritative::new(authority, server).upstream(self.upstream.clone());
         match &self.namespace {
             Some(namespace) => program.namespace(namespace),
@@ -1818,13 +618,15 @@ impl Inner {
                 );
             }
         });
-        servers.retain(|(addr, _, _)| self.may_serve(*addr));
+        servers.retain(|(addr, _, _)| !non_public_address(*addr) && !self.egress.contains(addr));
         for (addr, _, zone) in &servers {
             self.copies.serves(*addr, zone);
         }
         {
             let mut placed = self.placed.lock();
-            servers.retain(|(addr, _, _)| !self.preset_runs(*addr) && placed.servers.insert(*addr));
+            servers.retain(|(addr, _, _)| {
+                !self.handle.has_machine(*addr) && placed.servers.insert(*addr)
+            });
             fronts.retain(|(addr, _, _)| !non_public_address(*addr) && placed.fronts.insert(*addr));
         }
         // The network refuses an address on the sandboxes' subnet or a
@@ -1841,46 +643,6 @@ impl Inner {
         for observer in &self.observers {
             observer(filing);
         }
-    }
-
-    /// Whether a mirrored server may answer at `addr`: an address an
-    /// internet host can have, other than the egress the upstream asks
-    /// from, where no public resolver is. A server at the egress would
-    /// send its lookups from the host to the host's own network edge.
-    fn may_serve(&self, addr: IpAddr) -> bool {
-        if self
-            .egress
-            .is_some_and(|egress| addr == IpAddr::V4(egress.0))
-        {
-            return false;
-        }
-        let resolver = PUBLIC_RESOLVERS.iter().any(|resolver| {
-            resolver
-                .addresses
-                .iter()
-                .any(|a| addr == IpAddr::V4(a.v4) || addr == IpAddr::V6(a.v6))
-        });
-        !non_public_address(addr) && !resolver
-    }
-
-    /// Whether a preset's server already runs at `addr`, which then
-    /// serves a new zone itself and gets no second server.
-    fn preset_runs(&self, addr: IpAddr) -> bool {
-        let preset = ROOT_LETTERS
-            .iter()
-            .map(|letter| &letter.server)
-            .chain(&GTLD_SERVERS)
-            .any(|server| server.addresses().contains(&addr));
-        preset && self.handle.has_machine(addr)
-    }
-
-    /// The address the upstream asks from and the one the real server
-    /// would see instead, when `client` is a public resolver: its
-    /// questions leave from its own egress, not from the upstream's.
-    fn seen_by(&self, client: &Client) -> Option<(Ipv4Addr, IpAddr)> {
-        let egress = self.egress?.0;
-        let seen = *self.resolvers.get(&client.peer.ip())?;
-        (seen != IpAddr::V4(egress)).then_some((egress, seen))
     }
 }
 
@@ -1905,15 +667,7 @@ impl Authority for Mirrored {
         server: &ServerConfig,
         client: &Client,
     ) -> Step {
-        match self.0.copies.respond(req, local, server, client) {
-            Step::Reply(mut response) => {
-                if let Some((egress, seen)) = self.0.seen_by(client) {
-                    echo(&mut response.message, egress, seen);
-                }
-                Step::Reply(response)
-            }
-            step => step,
-        }
+        self.0.copies.respond(req, local, server, client)
     }
 
     fn file(&self, lookup: &Lookup, looked: &Looked, generation: Generation) {
@@ -1926,6 +680,91 @@ impl Authority for Mirrored {
 
     fn advance(&self, generation: Generation) {
         self.0.copies.advance(generation);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Echo
+
+/// Replies that show each client the address its own questions to the
+/// real servers would leave from, for servers that echo the address a
+/// question came from, as the whoami names of Akamai do.
+///
+/// A [`Mirror`]'s upstream asks every real server from one address, the
+/// [`upstream`](Echo::new) address, and the copied records hold what the
+/// real server said to it. A resolver in the world whose real counterpart
+/// asks from another address, its egress, would be shown that address
+/// instead. So a reply to a client given with [`client`](Echo::client)
+/// carries its egress in place of the upstream's: in an unsigned A record
+/// when the egress is IPv4, and in a TXT string. The copied record stays
+/// as the real server sent it; the address is put in as the reply leaves,
+/// since it depends on who asked. A world adds it with [`Mirror::wrap`]
+/// and [`Echo::over`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Echo {
+    upstream: Ipv4Addr,
+    egress: HashMap<IpAddr, IpAddr>,
+}
+
+impl Echo {
+    /// Echoes for questions whose answers were asked from `upstream`. It
+    /// changes no reply until a [`client`](Self::client) is given.
+    pub fn new(upstream: Ipv4Addr) -> Echo {
+        Echo {
+            upstream,
+            egress: HashMap::new(),
+        }
+    }
+
+    /// Shows the client at `client` the address `egress` where a reply
+    /// echoes the upstream's.
+    pub fn client(mut self, client: IpAddr, egress: IpAddr) -> Echo {
+        self.egress.insert(client, egress);
+        self
+    }
+
+    /// `authority`, its replies echoing each client's egress.
+    pub fn over(&self, authority: Arc<dyn Authority>) -> Arc<dyn Authority> {
+        Arc::new(Echoed {
+            echo: self.clone(),
+            authority,
+        })
+    }
+}
+
+/// An authority whose replies [`Echo`] changes.
+struct Echoed {
+    echo: Echo,
+    authority: Arc<dyn Authority>,
+}
+
+impl Authority for Echoed {
+    fn respond(
+        &self,
+        req: &Request,
+        local: SocketAddr,
+        server: &ServerConfig,
+        client: &Client,
+    ) -> Step {
+        match self.authority.respond(req, local, server, client) {
+            Step::Reply(mut response) => {
+                if let Some(&seen) = self.echo.egress.get(&client.peer.ip())
+                    && seen != IpAddr::V4(self.echo.upstream)
+                {
+                    echo(&mut response.message, self.echo.upstream, seen);
+                }
+                Step::Reply(response)
+            }
+            step => step,
+        }
+    }
+
+    fn file(&self, lookup: &Lookup, looked: &Looked, generation: Generation) {
+        self.authority.file(lookup, looked, generation);
+    }
+
+    fn advance(&self, generation: Generation) {
+        self.authority.advance(generation);
     }
 }
 
@@ -1965,8 +804,4 @@ fn echo(message: &mut Message, egress: Ipv4Addr, seen: IpAddr) {
             _ => {}
         }
     }
-}
-
-fn name(text: &str) -> Name {
-    Name::from_ascii(text).expect("a preset's name is valid")
 }

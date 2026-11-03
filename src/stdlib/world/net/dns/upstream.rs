@@ -18,9 +18,9 @@ use fictionet::stdlib::services::dns::{Looked, Lookup};
 /// never answers a client: what it gives is data, and the world's own
 /// engines build every reply from it.
 ///
-/// An upstream asks every question with an OPT record that sets DO, so
-/// RRSIGs and NSEC and NSEC3 records come back (RFC 3225 §3), and that
-/// asks for the server's NSID (RFC 5001). It checks that a response
+/// An upstream asks every question without recursion, as one authority
+/// asks another, and with an OPT record that sets DO, so RRSIGs and NSEC
+/// and NSEC3 records come back (RFC 3225 §3). It checks that a response
 /// answers the question it sent (RFC 5452 §9.1), and gives it decoded.
 ///
 /// An upstream decides nothing about what may be asked: the agent in a

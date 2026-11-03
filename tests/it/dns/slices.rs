@@ -27,7 +27,7 @@ use fictionet::stdlib::protocols::dns::rr::rdata::SOA;
 use fictionet::stdlib::protocols::dns::rr::{
     LowerName, Name, RData, Record, RecordSet, RecordType,
 };
-use fictionet::stdlib::protocols::dns::{Ede, EdeCode, Nsid};
+use fictionet::stdlib::protocols::dns::{Ede, EdeCode};
 use fictionet::stdlib::services::dns::authority::{AuthorityEngine, Copies, ServerConfig, Zones};
 use fictionet::stdlib::services::dns::memory::{Exchanges, MemoryNet, Recording, drive};
 use fictionet::stdlib::services::dns::resolver::{Config, Resolver};
@@ -800,16 +800,14 @@ fn the_validator_sees_the_same_records_however_they_are_served_or_signed() {
 // A world that copies the hierarchy
 
 /// What the servers of `real` give `lookup`, as an upstream on the
-/// internet gives it: the query asked over UDP with DO and an NSID
-/// request, and again over TCP when the response comes back truncated.
+/// internet gives it: the query asked over UDP without recursion and
+/// with DO, and again over TCP when the response comes back truncated.
 fn looked_up(real: &mut MemoryNet, lookup: &Lookup) -> Looked {
     let entropy = SeededEntropy::new(Seed::from_u64(SEED));
     let mut message = Message::new(1, MessageType::Query, OpCode::Query);
-    message.metadata.recursion_desired = lookup.recursion_desired;
     message.add_query(lookup.question.clone());
     let mut edns = Edns::new();
     edns.set_max_payload(1232).set_dnssec_ok(true);
-    edns.options_mut().insert(Nsid(Vec::new()).to_option());
     message.set_edns(edns);
     let bytes = message.to_vec().expect("a lookup's query writes");
     let mut response = None;
@@ -863,7 +861,7 @@ fn copying(real: &TestInternet, world: TestInternet) -> MemoryNet {
         serve(letter.server.addresses().to_vec(), front, &["."]);
     }
     for server in &GTLD_SERVERS {
-        let identity = real.location().site(IpAddr::V4(server.v4)).identity;
+        let identity = real.place().site(IpAddr::V4(server.v4)).identity;
         serve(
             server.addresses().to_vec(),
             ServerConfig::gtld(identity),

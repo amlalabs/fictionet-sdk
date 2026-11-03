@@ -22,11 +22,11 @@ use fictionet::stdlib::services::dns::zone::{
 };
 use fictionet::stdlib::services::dns::{Client, Event, Generation, Looked, Lookup, WallClock};
 use fictionet::stdlib::services::serve::Transport;
-use fictionet::stdlib::world::net::dns::internet::{
-    self, Egress, GTLD_SERVERS, Location, Mirror, PUBLIC_RESOLVERS, ROOT_LETTERS,
-};
+use fictionet::stdlib::world::net::dns::internet::{self, GTLD_SERVERS, Mirror, ROOT_LETTERS};
 use fictionet::stdlib::world::net::dns::{self, Recursive, Upstream};
-use fictionet::stdlib::world::net::{Host, Net};
+use fictionet::stdlib::world::net::{Host, Net, NetHandle};
+use fictionet_extras::dns::place::{Place, ResolverSite};
+use fictionet_extras::dns::public::{PUBLIC_RESOLVERS, PublicResolver};
 use fictionet_test_support::sandbox::{Machine, machine};
 use fictionet_test_support::timeout;
 
@@ -216,16 +216,14 @@ impl Upstream for Hierarchy {
     }
 }
 
-/// The query an upstream sends for `lookup`: its question and RD bit, and
-/// an OPT record with DO and an NSID request.
+/// The query an upstream sends for `lookup`: its question without
+/// recursion, and an OPT record with DO.
 fn request(lookup: &Lookup) -> Request {
     let mut message = Message::query();
     message.metadata.id = 1;
-    message.metadata.recursion_desired = lookup.recursion_desired;
     message.add_query(lookup.question.clone());
     let mut edns = Edns::new();
     edns.set_dnssec_ok(true);
-    edns.options_mut().insert(Nsid(Vec::new()).to_option());
     message.set_edns(edns);
     let Parsed::Request(req) = Request::parse(&message.to_vec().unwrap(), Transport::Udp) else {
         panic!("a lookup's query parses");
@@ -240,8 +238,43 @@ fn lower(name: &str) -> LowerName {
     LowerName::new(&Name::from_ascii(name).unwrap())
 }
 
-fn location() -> Location {
-    Location::san_francisco_bay_area(Some(Egress(EGRESS)))
+/// Where the tests' network is: the San Francisco Bay Area.
+fn place() -> Place {
+    Place::san_francisco_bay_area()
+}
+
+/// The configuration `resolver` runs with at `site`, its whoami names
+/// answered for a network behind [`EGRESS`].
+fn resolver_config(resolver: &PublicResolver, site: &ResolverSite) -> Config {
+    resolver.whoami(resolver.config(site.identity.clone()), site, EGRESS)
+}
+
+/// A mirror of `upstream` placing servers with `handle`, as a world that
+/// shows the real internet from [`place`] through [`EGRESS`] makes it:
+/// the root at every root letter, `com` and `net` at every
+/// `gtld-servers.net` server, each placed server behind half the round
+/// trip to an authority, no server at the egress, and each public
+/// resolver shown its own egress where a real server echoes the asker.
+fn mirror(upstream: impl Upstream, handle: NetHandle) -> Mirror {
+    let at = place();
+    let echo = at.echo(EGRESS);
+    let mut mirror = Mirror::new(upstream, handle)
+        .delay(at.authority_rtt / 2)
+        .egress(IpAddr::V4(EGRESS))
+        .wrap(move |authority| echo.over(authority));
+    for letter in &ROOT_LETTERS {
+        for addr in letter.server.addresses() {
+            mirror = mirror.serves(addr, &Name::root());
+        }
+    }
+    for server in &GTLD_SERVERS {
+        for addr in server.addresses() {
+            for zone in ["com.", "net."] {
+                mirror = mirror.serves(addr, &Name::from_ascii(zone).unwrap());
+            }
+        }
+    }
+    mirror
 }
 
 /// A query for `name` of type `kind`, with RD as given and an OPT record.
@@ -353,12 +386,12 @@ fn the_root_hints_are_the_root_letters() {
 fn a_root_letter_answers_the_root_ns_as_dig_sees_it() {
     world(Duration::from_secs(60), |fcx| async move {
         let hierarchy = Hierarchy::new();
-        let at = location();
+        let at = place();
         let (attacher, attachments) = fictionet::attachments();
         let net = Net::new().ipv4_only();
-        let mirror = Mirror::new(hierarchy.clone(), net.handle(), &at);
-        net.hosts(internet::root_servers(|s| mirror.server(s), &at))
-            .hosts(internet::gtld_servers(|s| mirror.server(s), &at))
+        let mirror = mirror(hierarchy.clone(), net.handle());
+        net.hosts(at.root_servers(|s| mirror.server(s)))
+            .hosts(at.gtld_servers(|s| mirror.server(s)))
             .start(&fcx, attachments)?;
         let m = machine(&fcx, attacher.attach("client")?, ME);
         let a_root = ROOT_LETTERS[0].server.v4;
@@ -427,11 +460,11 @@ fn a_root_letter_answers_the_root_ns_as_dig_sees_it() {
 fn a_mirrored_server_names_one_instance_by_chaos_and_by_nsid() {
     world(Duration::from_secs(60), |fcx| async move {
         let hierarchy = Hierarchy::new();
-        let at = location();
+        let at = place();
         let (attacher, attachments) = fictionet::attachments();
         let net = Net::new().ipv4_only();
-        let mirror = Mirror::new(hierarchy.clone(), net.handle(), &at);
-        net.hosts(internet::root_servers(|s| mirror.server(s), &at))
+        let mirror = mirror(hierarchy.clone(), net.handle());
+        net.hosts(at.root_servers(|s| mirror.server(s)))
             .start(&fcx, attachments)?;
         let m = machine(&fcx, attacher.attach("client")?, ME);
         let a_root = ROOT_LETTERS[0].server.v4;
@@ -598,12 +631,12 @@ fn nsid(reply: &Message) -> Option<Vec<u8>> {
 fn the_mirror_places_a_server_at_referral_glue_before_the_reply_leaves() {
     world(Duration::from_secs(60), |fcx| async move {
         let hierarchy = Hierarchy::new();
-        let at = location();
+        let at = place();
         let (attacher, attachments) = fictionet::attachments();
         let net = Net::new().ipv4_only();
         let handle = net.handle();
-        let mirror = Mirror::new(hierarchy.clone(), handle.clone(), &at);
-        net.hosts(internet::root_servers(|s| mirror.server(s), &at))
+        let mirror = mirror(hierarchy.clone(), handle.clone());
+        net.hosts(at.root_servers(|s| mirror.server(s)))
             .start(&fcx, attachments)?;
         let m = machine(&fcx, attacher.attach("client")?, ME);
         let a_root = ROOT_LETTERS[0].server.v4;
@@ -651,11 +684,11 @@ fn the_mirror_places_a_server_at_referral_glue_before_the_reply_leaves() {
 fn a_mirrored_name_server_refuses_zone_transfers() {
     world(Duration::from_secs(60), |fcx| async move {
         let hierarchy = Hierarchy::new();
-        let at = location();
+        let at = place();
         let (attacher, attachments) = fictionet::attachments();
         let net = Net::new().ipv4_only();
-        let mirror = Mirror::new(hierarchy.clone(), net.handle(), &at);
-        net.hosts(internet::root_servers(|s| mirror.server(s), &at))
+        let mirror = mirror(hierarchy.clone(), net.handle());
+        net.hosts(at.root_servers(|s| mirror.server(s)))
             .start(&fcx, attachments)?;
         let m = machine(&fcx, attacher.attach("client")?, ME);
         let a_root = ROOT_LETTERS[0].server.v4;
@@ -696,12 +729,12 @@ fn a_mirrored_name_server_refuses_zone_transfers() {
 fn the_mirror_places_no_server_at_the_egress() {
     world(Duration::from_secs(60), |fcx| async move {
         let hierarchy = Hierarchy::new();
-        let at = location();
+        let at = place();
         let (attacher, attachments) = fictionet::attachments();
         let net = Net::new().ipv4_only();
         let handle = net.handle();
-        let mirror = Mirror::new(hierarchy.clone(), handle.clone(), &at);
-        net.hosts(internet::root_servers(|s| mirror.server(s), &at))
+        let mirror = mirror(hierarchy.clone(), handle.clone());
+        net.hosts(at.root_servers(|s| mirror.server(s)))
             .start(&fcx, attachments)?;
         let m = machine(&fcx, attacher.attach("client")?, ME);
         let a_root = ROOT_LETTERS[0].server.v4;
@@ -742,7 +775,7 @@ fn the_mirror_places_no_server_at_the_egress() {
 fn a_glueless_delegation_resolves_through_the_answer_for_its_name_server() {
     world(Duration::from_secs(60), |fcx| async move {
         let hierarchy = Hierarchy::new();
-        let at = location();
+        let at = place();
         let clock = WallClock {
             start: SystemTime::UNIX_EPOCH,
         };
@@ -754,8 +787,8 @@ fn a_glueless_delegation_resolves_through_the_answer_for_its_name_server() {
         let (attacher, attachments) = fictionet::attachments();
         let net = Net::new().ipv4_only();
         let handle = net.handle();
-        let mirror = Mirror::new(hierarchy.clone(), handle.clone(), &at);
-        net.hosts(internet::root_servers(|s| mirror.server(s), &at))
+        let mirror = mirror(hierarchy.clone(), handle.clone());
+        net.hosts(at.root_servers(|s| mirror.server(s)))
             .gateway(move |h, _| h.program(Recursive::new(config.clone(), clock)))
             .start(&fcx, attachments)?;
         let m = machine(&fcx, attacher.attach("client")?, ME);
@@ -793,7 +826,7 @@ fn a_glueless_delegation_resolves_through_the_answer_for_its_name_server() {
 fn a_glueless_name_server_known_before_its_delegation_gets_a_server() {
     world(Duration::from_secs(60), |fcx| async move {
         let hierarchy = Hierarchy::new();
-        let at = location();
+        let at = place();
         let clock = WallClock {
             start: SystemTime::UNIX_EPOCH,
         };
@@ -804,8 +837,8 @@ fn a_glueless_name_server_known_before_its_delegation_gets_a_server() {
         let (attacher, attachments) = fictionet::attachments();
         let net = Net::new().ipv4_only();
         let handle = net.handle();
-        let mirror = Mirror::new(hierarchy.clone(), handle.clone(), &at);
-        net.hosts(internet::root_servers(|s| mirror.server(s), &at))
+        let mirror = mirror(hierarchy.clone(), handle.clone());
+        net.hosts(at.root_servers(|s| mirror.server(s)))
             .gateway(move |h, _| h.program(Recursive::new(config.clone(), clock)))
             .start(&fcx, attachments)?;
         let m = machine(&fcx, attacher.attach("client")?, ME);
@@ -844,15 +877,15 @@ fn a_glueless_name_server_known_before_its_delegation_gets_a_server() {
 fn addresses_on_the_sandbox_subnet_or_off_the_internet_are_never_placed() {
     world(Duration::from_secs(60), |fcx| async move {
         let hierarchy = Hierarchy::new();
-        let at = location();
+        let at = place();
         let me = Ipv4Addr::new(45, 60, 0, 2);
         let (attacher, attachments) = fictionet::attachments();
         let net = Net::new()
             .ipv4_only()
             .subnet("45.60.0.0/24".parse::<Prefix>()?);
         let handle = net.handle();
-        let mirror = Mirror::new(hierarchy.clone(), handle.clone(), &at);
-        net.hosts(internet::root_servers(|s| mirror.server(s), &at))
+        let mirror = mirror(hierarchy.clone(), handle.clone());
+        net.hosts(at.root_servers(|s| mirror.server(s)))
             .start(&fcx, attachments)?;
         let m = machine(&fcx, attacher.attach("client")?, me);
         let a_root = ROOT_LETTERS[0].server.v4;
@@ -879,20 +912,20 @@ fn addresses_on_the_sandbox_subnet_or_off_the_internet_are_never_placed() {
 fn a_front_goes_at_the_addresses_answered_for_its_name() {
     world(Duration::from_secs(60), |fcx| async move {
         let hierarchy = Hierarchy::new();
-        let at = location();
+        let at = place();
         let (attacher, attachments) = fictionet::attachments();
         let net = Net::new().ipv4_only();
         let handle = net.handle();
         let fronted: Arc<Mutex<Vec<String>>> = Arc::default();
         let seen = fronted.clone();
-        let mirror = Mirror::new(hierarchy.clone(), handle.clone(), &at).front(
+        let mirror = mirror(hierarchy.clone(), handle.clone()).front(
             Name::from_ascii("cloudflare-dns.com.")?,
             move |host| {
                 seen.lock().unwrap().push("cloudflare-dns.com".to_string());
                 host
             },
         );
-        net.hosts(internet::root_servers(|s| mirror.server(s), &at))
+        net.hosts(at.root_servers(|s| mirror.server(s)))
             .start(&fcx, attachments)?;
         let m = machine(&fcx, attacher.attach("client")?, ME);
         let a_root = ROOT_LETTERS[0].server.v4;
@@ -929,13 +962,13 @@ fn a_front_goes_at_the_addresses_answered_for_its_name() {
 fn a_front_for_an_alias_goes_at_its_targets_addresses() {
     world(Duration::from_secs(60), |fcx| async move {
         let hierarchy = Hierarchy::new();
-        let at = location();
+        let at = place();
         let (attacher, attachments) = fictionet::attachments();
         let net = Net::new().ipv4_only();
         let handle = net.handle();
-        let mirror = Mirror::new(hierarchy.clone(), handle.clone(), &at)
+        let mirror = mirror(hierarchy.clone(), handle.clone())
             .front(Name::from_ascii("alias-dns.com.")?, |host| host);
-        net.hosts(internet::root_servers(|s| mirror.server(s), &at))
+        net.hosts(at.root_servers(|s| mirror.server(s)))
             .start(&fcx, attachments)?;
         let m = machine(&fcx, attacher.attach("client")?, ME);
         let a_root = ROOT_LETTERS[0].server.v4;
@@ -963,13 +996,13 @@ fn a_front_for_an_alias_goes_at_its_targets_addresses() {
 fn a_front_below_a_dname_goes_at_its_substitutes_addresses() {
     world(Duration::from_secs(60), |fcx| async move {
         let hierarchy = Hierarchy::new();
-        let at = location();
+        let at = place();
         let (attacher, attachments) = fictionet::attachments();
         let net = Net::new().ipv4_only();
         let handle = net.handle();
-        let mirror = Mirror::new(hierarchy.clone(), handle.clone(), &at)
+        let mirror = mirror(hierarchy.clone(), handle.clone())
             .front(Name::from_ascii("doh.renamed.")?, |host| host);
-        net.hosts(internet::root_servers(|s| mirror.server(s), &at))
+        net.hosts(at.root_servers(|s| mirror.server(s)))
             .start(&fcx, attachments)?;
         let m = machine(&fcx, attacher.attach("client")?, ME);
         let a_root = ROOT_LETTERS[0].server.v4;
@@ -1003,7 +1036,7 @@ type Kept = (String, Vec<(Section, String, RecordType)>);
 fn observers_see_each_filing_before_the_reply_leaves() {
     world(Duration::from_secs(60), |fcx| async move {
         let hierarchy = Hierarchy::new();
-        let at = location();
+        let at = place();
         let (attacher, attachments) = fictionet::attachments();
         let net = Net::new().ipv4_only();
         let handle = net.handle();
@@ -1014,7 +1047,7 @@ fn observers_see_each_filing_before_the_reply_leaves() {
             move |lookup: &Lookup| LowerName::new(lookup.question.name()) != refused,
             hierarchy.clone(),
         );
-        let mirror = Mirror::new(upstream, handle.clone(), &at).observe(move |filing: &Filing| {
+        let mirror = mirror(upstream, handle.clone()).observe(move |filing: &Filing| {
             let sets = filing
                 .sets
                 .iter()
@@ -1022,7 +1055,7 @@ fn observers_see_each_filing_before_the_reply_leaves() {
                 .collect();
             seen.lock().unwrap().push((filing.zone.to_ascii(), sets));
         });
-        net.hosts(internet::root_servers(|s| mirror.server(s), &at))
+        net.hosts(at.root_servers(|s| mirror.server(s)))
             .start(&fcx, attachments)?;
         let m = machine(&fcx, attacher.attach("client")?, ME);
         let a_root = ROOT_LETTERS[0].server.v4;
@@ -1072,18 +1105,17 @@ fn observers_see_each_filing_before_the_reply_leaves() {
 fn whoami_names_are_answered_from_the_egress_and_never_looked_up() {
     world(Duration::from_secs(60), |fcx| async move {
         let hierarchy = Hierarchy::new();
-        let at = location();
+        let at = place();
         let clock = WallClock {
             start: SystemTime::UNIX_EPOCH,
         };
         let (attacher, attachments) = fictionet::attachments();
         let net = Net::new().ipv4_only();
-        let mirror = Mirror::new(hierarchy.clone(), net.handle(), &at);
-        net.hosts(internet::root_servers(|s| mirror.server(s), &at))
-            .hosts(internet::public_resolvers(
-                |r, h| h.program(r.recursive(r.config(&at), clock)),
-                &at,
-            ))
+        let mirror = mirror(hierarchy.clone(), net.handle());
+        net.hosts(at.root_servers(|s| mirror.server(s)))
+            .hosts(at.public_resolvers(|r, site, h| {
+                h.program(Recursive::new(resolver_config(r, site), clock).per_sandbox())
+            }))
             .start(&fcx, attachments)?;
         let m = machine(&fcx, attacher.attach("client")?, ME);
 
@@ -1164,120 +1196,6 @@ fn whoami_names_are_answered_from_the_egress_and_never_looked_up() {
     });
 }
 
-/// A measured location holds what each server that answered says about
-/// itself, and leaves out the ones that did not.
-#[test]
-fn a_measured_location_holds_what_the_servers_say_about_themselves() {
-    world(Duration::from_secs(60), |fcx| async move {
-        let hierarchy = Hierarchy::new();
-        let at = Location::measured(
-            &fcx,
-            &hierarchy,
-            Some(Egress(EGRESS)),
-            Duration::from_secs(2),
-        )
-        .await;
-        assert_eq!(at.egress, Some(Egress(EGRESS)));
-        // Only the root letters answer in the test hierarchy.
-        assert_eq!(at.servers.len(), ROOT_LETTERS.len());
-        assert!(at.resolvers.is_empty());
-        let a_root = at.site(IpAddr::V4(ROOT_LETTERS[0].server.v4));
-        assert_eq!(a_root.identity.nsid, Some(REAL.as_bytes().to_vec()));
-        assert_eq!(
-            a_root.identity.chaos.get(&lower("id.server.")),
-            Some(&fictionet::stdlib::services::dns::authority::ChaosAnswer::Txt(REAL.to_string()))
-        );
-        let unknown = at.site(IpAddr::V4(GTLD_SERVERS[0].v4));
-        assert_eq!(unknown.identity, Identity::none());
-        Ok(())
-    });
-}
-
-/// Real servers that answer CHAOS questions as the San Francisco preset
-/// says each root letter does, and nothing else.
-struct Letters(Location);
-
-impl Upstream for Letters {
-    fn lookup<'a>(
-        &'a self,
-        _fcx: &'a Cx,
-        lookup: Lookup,
-    ) -> Pin<Box<dyn Future<Output = Looked> + Send + 'a>> {
-        let req = request(&lookup);
-        let server = lookup.server.ip();
-        let letter = ROOT_LETTERS
-            .iter()
-            .any(|l| IpAddr::V4(l.server.v4) == server);
-        if !letter || req.question.query_class() != DNSClass::CH {
-            return Box::pin(ready(Looked::Unreachable));
-        }
-        let identity = self.0.site(server).identity;
-        let (response, edns) = identity.reply(&req);
-        let mut reply = ServerConfig::root(identity).front(&req, response);
-        if !edns {
-            reply.message.edns = None;
-        }
-        Box::pin(ready(Looked::Response(reply.message)))
-    }
-}
-
-/// A server measured in Live answers each CHAOS question as the real one
-/// does, here as the preset plays it: a BIND server serves the names it
-/// answers as zones, whatever it says to `id.server`.
-#[test]
-fn a_measured_bind_server_serves_its_chaos_names_as_zones() {
-    world(Duration::from_secs(60), |fcx| async move {
-        let real = location();
-        let at =
-            Location::measured(&fcx, &Letters(real.clone()), None, Duration::from_secs(2)).await;
-        // c.root answers id.server; g.root refuses it.
-        for server in [v4(192, 33, 4, 12), v4(192, 112, 36, 4)] {
-            let (real, measured) = (real.site(server).identity, at.site(server).identity);
-            for qname in [
-                "id.server.",
-                "hostname.bind.",
-                "version.bind.",
-                "version.server.",
-                "authors.bind.",
-                "foo.hostname.bind.",
-                "invalid.",
-            ] {
-                for qtype in [
-                    RecordType::TXT,
-                    RecordType::A,
-                    RecordType::SOA,
-                    RecordType::NS,
-                    RecordType::ANY,
-                ] {
-                    let mut message = Message::query();
-                    let mut question = Query::query(Name::from_ascii(qname).unwrap(), qtype);
-                    question.set_query_class(DNSClass::CH);
-                    message.add_query(question);
-                    let Parsed::Request(req) =
-                        Request::parse(&message.to_vec().unwrap(), Transport::Udp)
-                    else {
-                        panic!("a query");
-                    };
-                    let (want, _) = real.reply(&req);
-                    let (got, _) = measured.reply(&req);
-                    let case = format!("{server} {qname} {qtype}: {got:?}");
-                    assert_eq!(
-                        got.message.metadata.response_code, want.message.metadata.response_code,
-                        "{case}"
-                    );
-                    assert_eq!(
-                        got.message.metadata.authoritative, want.message.metadata.authoritative,
-                        "{case}"
-                    );
-                    assert_eq!(got.message.answers, want.message.answers, "{case}");
-                    assert_eq!(got.message.authorities, want.message.authorities, "{case}");
-                }
-            }
-        }
-        Ok(())
-    });
-}
-
 /// A real server that echoes the address a question came from would see
 /// a public resolver's own egress, not the world's: `whoami.direct` plays
 /// such a server, answering with the address the upstream asks from.
@@ -1285,25 +1203,22 @@ fn a_measured_bind_server_serves_its_chaos_names_as_zones() {
 fn an_echoed_address_is_the_public_resolvers_egress() {
     world(Duration::from_secs(60), |fcx| async move {
         let hierarchy = Hierarchy::new();
-        let at = location();
+        let at = place();
         let clock = WallClock {
             start: SystemTime::UNIX_EPOCH,
         };
         let (attacher, attachments) = fictionet::attachments();
         let net = Net::new().ipv4_only();
-        let mirror = Mirror::new(hierarchy.clone(), net.handle(), &at);
+        let mirror = mirror(hierarchy.clone(), net.handle());
         // The test root is unsigned, so the resolvers do not validate.
-        net.hosts(internet::root_servers(|s| mirror.server(s), &at))
-            .hosts(internet::public_resolvers(
-                |r, h| {
-                    let config = Config {
-                        anchors: None,
-                        ..r.config(&at)
-                    };
-                    h.program(Recursive::new(config, clock))
-                },
-                &at,
-            ))
+        net.hosts(at.root_servers(|s| mirror.server(s)))
+            .hosts(at.public_resolvers(|r, site, h| {
+                let config = Config {
+                    anchors: None,
+                    ..resolver_config(r, site)
+                };
+                h.program(Recursive::new(config, clock))
+            }))
             .start(&fcx, attachments)?;
         let m = machine(&fcx, attacher.attach("client")?, ME);
         let cloudflare = PUBLIC_RESOLVERS[1].addresses[0].v4;
@@ -1342,7 +1257,7 @@ fn an_echoed_address_is_the_public_resolvers_egress() {
 fn public_resolvers_keep_one_cache_per_sandbox() {
     world(Duration::from_secs(60), |fcx| async move {
         let hierarchy = Hierarchy::new();
-        let at = location();
+        let at = place();
         let clock = WallClock {
             start: SystemTime::UNIX_EPOCH,
         };
@@ -1360,7 +1275,7 @@ fn public_resolvers_keep_one_cache_per_sandbox() {
         let served = served_www.clone();
         let (attacher, attachments) = fictionet::attachments();
         let net = Net::new().ipv4_only();
-        let mirror = Mirror::new(hierarchy.clone(), net.handle(), &at).wrap(move |authority| {
+        let mirror = mirror(hierarchy.clone(), net.handle()).wrap(move |authority| {
             let served = served.clone();
             Arc::new(Observe::new(
                 authority,
@@ -1374,17 +1289,15 @@ fn public_resolvers_keep_one_cache_per_sandbox() {
                 },
             ))
         });
-        net.hosts(internet::root_servers(|s| mirror.server(s), &at))
-            .hosts(internet::public_resolvers(
-                |r, h| {
-                    let record = record.clone();
-                    h.program(
-                        r.recursive(r.config(&at), clock)
-                            .on_event(move |event| record(event)),
-                    )
-                },
-                &at,
-            ))
+        net.hosts(at.root_servers(|s| mirror.server(s)))
+            .hosts(at.public_resolvers(|r, site, h| {
+                let record = record.clone();
+                h.program(
+                    Recursive::new(resolver_config(r, site), clock)
+                        .per_sandbox()
+                        .on_event(move |event| record(event)),
+                )
+            }))
             .start(&fcx, attachments)?;
         let a = machine(&fcx, attacher.attach("a")?, ME);
         let b = machine(&fcx, attacher.attach("b")?, Ipv4Addr::new(10, 0, 0, 3));
