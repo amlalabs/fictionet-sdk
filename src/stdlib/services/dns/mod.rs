@@ -15,6 +15,10 @@
 //! which answers clients from local zones, its cache, and the servers it
 //! asks, and validates what it learns. [`memory`] drives engines with no
 //! runtime: servers in memory, recorded exchanges, and a virtual clock.
+//! A server whose zone data is [learned](zone::Learned) from real servers
+//! asks one of them a typed [`Lookup`] for a fact it does not hold; its
+//! driver hands back what came of it ([`Looked`]), which is filed as
+//! records. No message from a real server reaches a client.
 //!
 //! Every engine has the shape of [`Engine`]: a driver hands it
 //! [inputs](Input) with the time, and takes [actions](Action) and
@@ -58,14 +62,16 @@ pub mod authority;
 mod clock;
 mod event;
 mod exchange;
+mod lookup;
 pub mod memory;
 mod records;
 pub mod resolver;
 pub mod zone;
 
 pub use clock::WallClock;
-pub use event::{Event, ObservedKind, QueryFlags, ReplyFlags, Unmatched, UpstreamOutcome};
+pub use event::{Event, LookupOutcome, QueryFlags, ReplyFlags, Unmatched, UpstreamOutcome};
 pub use exchange::{
     Action, Answer, Client, ClientQuery, Engine, ExchangeFailure, Generation, Input, Session,
     Token, Tokens, Transmit,
 };
+pub use lookup::{Looked, Lookup};

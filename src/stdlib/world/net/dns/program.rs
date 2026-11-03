@@ -11,8 +11,10 @@
 //!
 //! Locks are taken in one order: an engine's mutex, then a zone's own lock
 //! (a [`Lazy`](fictionet::stdlib::services::dns::zone::Lazy) zone asking its
-//! provider), then the network's lock (a provider placing a host). Nothing
-//! that holds the network's lock calls into an engine.
+//! provider, or a [`Learned`](fictionet::stdlib::services::dns::zone::Learned)
+//! zone filing a lookup's response), then the network's lock (a provider
+//! placing a host). Nothing that holds the network's lock calls into an
+//! engine. A lookup runs in a task of its own, with no lock held.
 
 use std::collections::HashMap;
 use std::future::{Future, poll_fn};
@@ -30,8 +32,8 @@ use fictionet::stdlib::protocols::dns::{Framing, Parsed, Queries, Request, strea
 use fictionet::stdlib::services::dns::authority::{Authority, AuthorityEngine, ServerConfig};
 use fictionet::stdlib::services::dns::resolver::{Config, Resolver};
 use fictionet::stdlib::services::dns::{
-    Action, Client, Engine, Event, ExchangeFailure, Generation, Input, Session, Token, Transmit,
-    WallClock,
+    Action, Client, Engine, Event, ExchangeFailure, Generation, Input, Lookup, Session, Token,
+    Transmit, WallClock,
 };
 use fictionet::stdlib::services::serve::Transport;
 use fictionet::sync::Mutex;
@@ -39,7 +41,8 @@ use fictionet::time::Instant;
 use fictionet::{Cx, Entropy, RaceError};
 
 use super::super::{Endpoints, Program};
-use super::source::{Namespace, Source, carry};
+use super::session::Namespace;
+use super::upstream::Upstream;
 
 /// The port DNS servers answer on (RFC 1035 §4.2).
 const PORT: u16 = 53;
@@ -62,9 +65,10 @@ type OnEvent = Arc<dyn Fn(&Event) + Send + Sync>;
 /// machine it runs on.
 ///
 /// Each machine has its own engine, for its own address. The authority's
-/// own questions, such as a relay's question to the real server, go to the
-/// [`source`](Self::source); without one, no answer comes and the engine
-/// gives up on them at its deadline. A TCP connection stays open after a
+/// lookups, such as a learned zone's question to a real server of the
+/// zone, go to the [`upstream`](Self::upstream), and the engine files what
+/// comes back; without one, no answer comes and the engine gives up on
+/// them at its deadline. A TCP connection stays open after a
 /// response until the client closes it or it is idle for
 /// [`Limits::dns_tcp_idle`](super::super::Limits::dns_tcp_idle)
 /// (RFC 7766 §6.2.3), and its queries may be pipelined. Its buffers are
@@ -74,7 +78,7 @@ type OnEvent = Arc<dyn Fn(&Event) + Send + Sync>;
 pub struct Authoritative<A: Authority> {
     authority: Arc<A>,
     server: ServerConfig,
-    source: Option<Arc<dyn Source>>,
+    upstream: Option<Arc<dyn Upstream>>,
     namespace: Option<Namespace>,
     on_event: Option<OnEvent>,
 }
@@ -85,22 +89,23 @@ impl<A: Authority> Authoritative<A> {
         Authoritative {
             authority: Arc::new(authority),
             server,
-            source: None,
+            upstream: None,
             namespace: None,
             on_event: None,
         }
     }
 
-    /// Sends the authority's own questions to `source`.
-    pub fn source(self, source: impl Source) -> Authoritative<A> {
+    /// Puts the authority's lookups to `upstream`.
+    pub fn upstream(self, upstream: impl Upstream) -> Authoritative<A> {
         Authoritative {
-            source: Some(Arc::new(source)),
+            upstream: Some(Arc::new(upstream)),
             ..self
         }
     }
 
     /// Answers for the sessions of `namespace`: when it advances, the
-    /// engine abandons its questions and asks again in the new session.
+    /// authority's learned zones drop what they copied, and the engine
+    /// abandons its lookups and asks again in the new session.
     pub fn namespace(self, namespace: &Namespace) -> Authoritative<A> {
         Authoritative {
             namespace: Some(namespace.clone()),
@@ -146,7 +151,7 @@ impl<A: Authority> Program for Authoritative<A> {
             },
             namespace: self.namespace.clone(),
             on_event: self.on_event.clone(),
-            carrier: Arc::new(ToSource(self.source.clone())),
+            carrier: Arc::new(ToUpstream(self.upstream.clone())),
             state: Mutex::new(State::new(Box::new(Whole))),
             kick: Mailbox::new(),
             datagrams: Mailbox::new(),
@@ -399,21 +404,39 @@ impl<K: Hash + Eq + Send> Partition for ByKey<K> {
 /// Hands an exchange's completion to the engine that started it.
 type Deliver = Arc<dyn Fn(Input) + Send + Sync>;
 
+/// What an engine asks its driver to carry.
+enum Outgoing {
+    /// Bytes for a server, as a resolver sends them.
+    Transmit(Transmit),
+    /// A lookup for the upstream, as an authority makes it.
+    Lookup { token: Token, lookup: Lookup },
+}
+
+impl Outgoing {
+    fn token(&self) -> Token {
+        match self {
+            Outgoing::Transmit(transmit) => transmit.token,
+            Outgoing::Lookup { token, .. } => *token,
+        }
+    }
+}
+
 /// How a program's exchanges travel.
 trait Carrier: Send + Sync + 'static {
-    /// Carries `transmit` from `machine` and delivers what comes back. The
-    /// future ends when nothing more will come; the driver drops it when
-    /// the engine abandons the exchange.
+    /// Carries `outgoing` from `machine` and delivers what comes back.
+    /// The future ends when nothing more will come; the driver drops it
+    /// when the engine abandons the exchange.
     fn carry(
         &self,
         fcx: Cx,
         machine: Endpoints,
-        transmit: Transmit,
+        outgoing: Outgoing,
         deliver: Deliver,
     ) -> Pin<Box<dyn Future<Output = ()> + Send>>;
 }
 
-/// A resolver's exchanges: real packets from the machine.
+/// A resolver's exchanges: real packets from the machine. A resolver makes
+/// no lookups.
 struct Packets;
 
 impl Carrier for Packets {
@@ -421,9 +444,12 @@ impl Carrier for Packets {
         &self,
         fcx: Cx,
         machine: Endpoints,
-        transmit: Transmit,
+        outgoing: Outgoing,
         deliver: Deliver,
     ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        let Outgoing::Transmit(transmit) = outgoing else {
+            return Box::pin(std::future::ready(()));
+        };
         Box::pin(async move {
             let token = transmit.token;
             let fail = |failure| deliver(Input::Failed { token, failure });
@@ -529,25 +555,26 @@ fn failure(error: ConnError) -> Option<ExchangeFailure> {
     }
 }
 
-/// An authority's exchanges: questions to its source, if it has one.
-struct ToSource(Option<Arc<dyn Source>>);
+/// An authority's lookups: put to its upstream, if it has one, and what
+/// came of each handed to the engine, which files it. An authority sends
+/// no bytes of its own.
+struct ToUpstream(Option<Arc<dyn Upstream>>);
 
-impl Carrier for ToSource {
+impl Carrier for ToUpstream {
     fn carry(
         &self,
         fcx: Cx,
         _machine: Endpoints,
-        transmit: Transmit,
+        outgoing: Outgoing,
         deliver: Deliver,
     ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-        let source = self.0.clone();
+        let upstream = self.0.clone();
         Box::pin(async move {
-            let Some(source) = source else {
+            let (Outgoing::Lookup { token, lookup }, Some(upstream)) = (outgoing, upstream) else {
                 return;
             };
-            if let Some(input) = carry(&*source, &fcx, transmit).await {
-                deliver(input);
-            }
+            let looked = upstream.lookup(&fcx, lookup).await;
+            deliver(Input::Looked { token, looked });
         })
     }
 }
@@ -728,7 +755,12 @@ impl<E: Engine + Send + 'static> Driver<E> {
     fn drain(self: &Arc<Self>, state: &mut State<E>, index: usize) {
         while let Some(action) = state.engines[index].poll() {
             match action {
-                Action::Send(transmit) => self.carry(state, index, transmit),
+                Action::Send(transmit) => {
+                    self.carry(state, index, Outgoing::Transmit(transmit));
+                }
+                Action::Lookup { token, lookup } => {
+                    self.carry(state, index, Outgoing::Lookup { token, lookup });
+                }
                 Action::Answer(answer) => match answer.client.connection {
                     Some(id) => {
                         if let Some(answers) = state.clients.get(&id) {
@@ -751,10 +783,10 @@ impl<E: Engine + Send + 'static> Driver<E> {
         }
     }
 
-    /// Starts carrying `transmit` for engine `index`, in a task of its own
+    /// Starts carrying `outgoing` for engine `index`, in a task of its own
     /// that ends when the exchange does or the engine abandons it.
-    fn carry(self: &Arc<Self>, state: &mut State<E>, index: usize, transmit: Transmit) {
-        let token = transmit.token;
+    fn carry(self: &Arc<Self>, state: &mut State<E>, index: usize, outgoing: Outgoing) {
+        let token = outgoing.token();
         let cancel = Arc::new(Mailbox::new());
         state.exchanges.insert((index, token), cancel.clone());
         let driver = self.clone();
@@ -766,7 +798,7 @@ impl<E: Engine + Send + 'static> Driver<E> {
             let mut carried =
                 driver
                     .carrier
-                    .carry(fcx.clone(), driver.machine.clone(), transmit, deliver);
+                    .carry(fcx.clone(), driver.machine.clone(), outgoing, deliver);
             let abandoned = poll_fn(|cx| {
                 if cancel.poll_take(cx).is_ready() {
                     return Poll::Ready(());

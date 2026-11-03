@@ -51,9 +51,7 @@ use fictionet::stdlib::protocols::dns::rr::{
 use fictionet::stdlib::protocols::dns::serialize::binary::{
     BinDecodable, BinDecoder, BinEncodable, BinEncoder, NameEncoding,
 };
-use fictionet::stdlib::protocols::dns::{
-    Limit, Parsed, RelayError, Request, Response, fit, read_message, restore,
-};
+use fictionet::stdlib::protocols::dns::{Limit, Parsed, Request, Response, fit, read_message};
 use fictionet::stdlib::protocols::json::Value;
 use fictionet::stdlib::services::dns::authority::{
     AuthorityEngine, ServerConfig, Zones, bare_reply,
@@ -1169,39 +1167,6 @@ fn wire() {
                 text(expected, "error")
             )),
         }
-    });
-}
-
-// ---------------------------------------------------------------------
-// restore.json: protocols::dns::restore
-// ---------------------------------------------------------------------
-
-#[test]
-fn restore_vectors() {
-    each_case("restore", |case, tally| {
-        let input = field(case, "input");
-        let expected = field(case, "expected");
-        let reply = unhex(text(input, "reply"));
-        let query = unhex(text(input, "query"));
-        // `restore` takes the query as the relay parsed it; bytes that
-        // are not a request never reach it.
-        let request = match Request::parse(&query, Transport::Udp) {
-            Parsed::Request(request) => request,
-            _ => {
-                tally.note("queries that do not parse as a request");
-                return Ok(());
-            }
-        };
-        let rust = match restore(&reply, &request) {
-            Ok(bytes) => format!("restored {}", hex(&bytes)),
-            Err(RelayError::QuestionMismatch) => "error question_mismatch".to_string(),
-            Err(RelayError::Malformed) => "error malformed".to_string(),
-        };
-        let lean = match expected.get("restored") {
-            Some(bytes) => format!("restored {}", bytes.as_str().unwrap()),
-            None => format!("error {}", text(expected, "error")),
-        };
-        same("restore", lean, rust)
     });
 }
 

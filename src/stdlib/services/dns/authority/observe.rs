@@ -2,11 +2,11 @@
 
 use std::net::SocketAddr;
 
-use fictionet::stdlib::protocols::dns::read_message;
 use fictionet::stdlib::protocols::dns::{Request, Response};
 
-use super::super::exchange::Client;
-use super::{Authority, Known, ServerConfig, Step};
+use super::super::exchange::{Client, Generation};
+use super::super::lookup::{Looked, Lookup};
+use super::{Authority, ServerConfig, Step};
 
 /// The callback [`Observe`] calls.
 type Observer = dyn Fn(&Request, &Client, &Response) + Send + Sync;
@@ -17,9 +17,8 @@ type Observer = dyn Fn(&Request, &Client, &Response) + Send + Sync;
 /// A world uses it to act on what its servers say, such as placing a site
 /// machine at an address the first time a reply gives it out, or to feed
 /// its own observation stream. The callback sees the authority's reply
-/// before the server front adds its header and EDNS details. A verbatim
-/// reply is decoded for it; one that does not decode is sent without the
-/// callback seeing it.
+/// before the server front adds its header and EDNS details. Lookups and
+/// filing go to `A` unseen.
 pub struct Observe<A: Authority> {
     authority: A,
     observer: Box<Observer>,
@@ -45,22 +44,19 @@ impl<A: Authority> Authority for Observe<A> {
         local: SocketAddr,
         server: &ServerConfig,
         client: &Client,
-        known: &dyn Known,
     ) -> Step {
-        let step = self.authority.respond(req, local, server, client, known);
-        match &step {
-            Step::Reply(response) => (self.observer)(req, client, response),
-            Step::Verbatim(bytes) => {
-                if let Ok(message) = read_message(bytes) {
-                    let response = Response {
-                        message,
-                        required_additional: 0,
-                    };
-                    (self.observer)(req, client, &response);
-                }
-            }
-            Step::Need(_) | Step::Silent => {}
+        let step = self.authority.respond(req, local, server, client);
+        if let Step::Reply(response) = &step {
+            (self.observer)(req, client, response);
         }
         step
+    }
+
+    fn file(&self, lookup: &Lookup, looked: &Looked, generation: Generation) {
+        self.authority.file(lookup, looked, generation);
+    }
+
+    fn advance(&self, generation: Generation) {
+        self.authority.advance(generation);
     }
 }

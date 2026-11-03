@@ -416,7 +416,7 @@ impl TestInternet {
     }
 
     /// The front [`internet::root_servers`] gives the letter at `v4`.
-    fn letter_front(&self, v4: Ipv4Addr) -> ServerConfig {
+    pub fn letter_front(&self, v4: Ipv4Addr) -> ServerConfig {
         let letter = ROOT_LETTERS
             .iter()
             .find(|letter| letter.server.v4 == v4)

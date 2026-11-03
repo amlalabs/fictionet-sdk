@@ -5,22 +5,25 @@ use std::net::SocketAddr;
 
 use fictionet::stdlib::protocols::dns::dnssec::proof::delegation_proof;
 use fictionet::stdlib::protocols::dns::dnssec::rdata::DNSSECRData;
+use fictionet::stdlib::protocols::dns::label_count;
 use fictionet::stdlib::protocols::dns::op::{
     Edns, Message, MessageType, OpCode, Query, ResponseCode,
 };
 use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RData, Record, RecordType};
 use fictionet::stdlib::protocols::dns::{Parsed, Request, Response};
-use fictionet::stdlib::protocols::dns::{label_count, read_message};
 
-use super::super::exchange::Client;
+use super::super::exchange::{Client, Generation};
+use super::super::lookup::{Looked, Lookup};
 use super::super::records::rrsets;
 use super::server::glue_first;
-use super::{Authority, Known, ServerConfig, Step, bare_reply};
+use super::{Authority, ServerConfig, Step, bare_reply};
 
 /// Answers as its base does, except for zones invented below it.
 ///
-/// An overlay sits on the servers of a zone's parent, such as a relay of
-/// the `com` servers, with each invented zone, a child of that parent,
+/// An overlay sits on the servers of a zone's parent, such as the `com`
+/// servers of a world that learns `com` from the real ones
+/// ([`Learned`](super::super::zone::Learned)), with each invented zone, a
+/// child of that parent,
 /// added by [`below`](Overlay::below). For a question at or below an invented
 /// zone's apex:
 ///
@@ -30,9 +33,10 @@ use super::{Authority, Known, ServerConfig, Step, bare_reply};
 ///   its base does, since only the parent's servers refer to a child
 ///   (RFC 1034 §4.2.1). The base serves the parent where its reply to
 ///   `<apex> DS` has AA set and carries the parent's SOA or the DS
-///   RRset. So an overlay may wrap every relay a mirror
-///   places, and the root still refers only to the parent. When the base
-///   stays silent for that question, so does the overlay.
+///   RRset. So an overlay may wrap every server a mirror places, and
+///   the root still refers only to the parent. When the base needs a
+///   lookup for that question, the overlay needs it too; when the base
+///   stays silent, so does the overlay.
 /// - Elsewhere the overlay answers as the parent: a referral composed from
 ///   the invented zone's apex NS RRset and glue, with AA clear. When the
 ///   invented zone gives no address for a name server at or below its
@@ -50,9 +54,10 @@ use super::{Authority, Known, ServerConfig, Step, bare_reply};
 /// with their RRSIGs, into the
 /// referral's authority section, leaving out a record that shows only
 /// that no wildcard matched, which a parent never sends with a
-/// delegation (RFC 5155 §7.2.7). The records are
-/// decoded from the base's reply and encoded again, never copied as
-/// octets. The overlay does not judge them: a validator checks them for
+/// delegation (RFC 5155 §7.2.7). The base's reply carries the denial its
+/// zone holds for the apex ([`View::denial`](super::super::zone::View::denial)),
+/// such as the NSEC3 records a learned zone copied from the real parent
+/// with their RRSIGs. The overlay does not judge them: a validator checks them for
 /// this name. Under an opt-out NSEC3 parent, as `com`, `net`, and `org`
 /// are, they prove the delegation insecure (RFC 5155 §8.9), so the
 /// invented zone resolves as an unsigned zone. Under an NSEC parent, as
@@ -105,7 +110,6 @@ impl<B: Authority> Authority for Overlay<B> {
         local: SocketAddr,
         server: &ServerConfig,
         client: &Client,
-        known: &dyn Known,
     ) -> Step {
         let qname = LowerName::new(req.question.name());
         let invented = self
@@ -114,12 +118,12 @@ impl<B: Authority> Authority for Overlay<B> {
             .filter(|(apex, _)| apex.zone_of(&qname))
             .max_by_key(|(apex, _)| label_count(apex));
         let Some((apex, inner)) = invented else {
-            return self.base.respond(req, local, server, client, known);
+            return self.base.respond(req, local, server, client);
         };
         let apex = Name::from(apex);
 
         let ns_question = question(req, &apex, RecordType::NS, false);
-        let delegation = match decoded(inner.respond(&ns_question, local, server, client, known)) {
+        let delegation = match decoded(inner.respond(&ns_question, local, server, client)) {
             Decoded::Message(message) => message,
             Decoded::Step(step) => return step,
         };
@@ -149,26 +153,23 @@ impl<B: Authority> Authority for Overlay<B> {
             .iter()
             .any(|record| record.data.ip_addr() == Some(local.ip()))
         {
-            return inner.respond(req, local, server, client, known);
+            return inner.respond(req, local, server, client);
         }
         let zone = Name::from(&self.zone);
         if *req.question.name() == apex && req.question.query_type() == RecordType::DS {
-            let step = self.base.respond(req, local, server, client, known);
+            let step = self.base.respond(req, local, server, client);
             return unsigned_delegation(req, &apex, &zone, step);
         }
         // Only the parent's servers refer to a child (RFC 1034 §4.2.1).
         // Anywhere else, such as at a root server or a server of another
         // zone, the overlay answers as its base does.
         let ds_question = question(req, &apex, RecordType::DS, true);
-        let parent = match decoded(
-            self.base
-                .respond(&ds_question, local, server, client, known),
-        ) {
+        let parent = match decoded(self.base.respond(&ds_question, local, server, client)) {
             Decoded::Message(reply) => reply,
             Decoded::Step(step) => return step,
         };
         if !serves(&parent, &apex, &zone) {
-            return self.base.respond(req, local, server, client, known);
+            return self.base.respond(req, local, server, client);
         }
 
         // A referral without the glue for a name server at or below the
@@ -187,6 +188,20 @@ impl<B: Authority> Authority for Overlay<B> {
         }
         Step::Reply(referral(req, authority, glue))
     }
+
+    fn file(&self, lookup: &Lookup, looked: &Looked, generation: Generation) {
+        self.base.file(lookup, looked, generation);
+        for (_, inner) in &self.zones {
+            inner.file(lookup, looked, generation);
+        }
+    }
+
+    fn advance(&self, generation: Generation) {
+        self.base.advance(generation);
+        for (_, inner) in &self.zones {
+            inner.advance(generation);
+        }
+    }
 }
 
 /// A step's reply as a message, or the step to return as it is.
@@ -195,15 +210,11 @@ enum Decoded {
     Step(Step),
 }
 
-/// The message in `step`'s reply. A step without one, or with octets that
-/// do not decode, is what the overlay returns in its place.
+/// The message in `step`'s reply. A step without one is what the overlay
+/// returns in its place.
 fn decoded(step: Step) -> Decoded {
     match step {
         Step::Reply(response) => Decoded::Message(response.message),
-        Step::Verbatim(bytes) => match read_message(&bytes) {
-            Ok(message) => Decoded::Message(message),
-            Err(_) => Decoded::Step(Step::Silent),
-        },
         step @ (Step::Need(_) | Step::Silent) => Decoded::Step(step),
     }
 }
@@ -245,7 +256,6 @@ fn question(req: &Request, name: &Name, rtype: RecordType, dnssec_ok: bool) -> R
 fn unsigned_delegation(req: &Request, apex: &Name, zone: &Name, step: Step) -> Step {
     let reply = match &step {
         Step::Reply(response) => Some(response.message.clone()),
-        Step::Verbatim(bytes) => read_message(bytes).ok(),
         Step::Need(_) | Step::Silent => None,
     };
     match reply {

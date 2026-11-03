@@ -1,27 +1,26 @@
 //! The engine that runs one authoritative server: it parses queries, asks
-//! the authority, carries the authority's own questions, and puts every
-//! reply through the server front.
+//! the authority, has the authority's lookups made and filed, and puts
+//! every reply through the server front.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
 
 use fictionet::Entropy;
 use fictionet::stdlib::protocols::dns::dnssec::Validation;
-use fictionet::stdlib::protocols::dns::op::{Header, Message, Query, ResponseCode};
+use fictionet::stdlib::protocols::dns::op::ResponseCode;
 use fictionet::stdlib::protocols::dns::read_message;
 use fictionet::stdlib::protocols::dns::rr::{DNSClass, RecordType};
-use fictionet::stdlib::protocols::dns::serialize::binary::{BinDecodable, BinDecoder};
 use fictionet::stdlib::protocols::dns::{Ede, EdeCode, Parsed, Request};
-use fictionet::stdlib::services::serve::Transport;
 use fictionet::time::Instant;
 
-use super::super::event::{Event, ObservedKind, QueryFlags, ReplyFlags, Unmatched};
+use super::super::event::{Event, LookupOutcome, QueryFlags, ReplyFlags, Unmatched};
 use super::super::exchange::{
-    Action, Answer, Client, ClientQuery, Engine, ExchangeFailure, Generation, Input, Sent, Session,
-    Token, Tokens, Transmit, ignored, matching, outstanding,
+    Action, Answer, Client, ClientQuery, Engine, Generation, Input, Session, Token, Tokens,
+    ignored, outstanding,
 };
+use super::super::lookup::{Looked, Lookup};
 use super::super::records::rrsets;
-use super::{Ask, Authority, Known, Observed, ServerConfig, Step, bare_reply};
+use super::{Authority, ServerConfig, Step, bare_reply};
 
 /// Runs the authoritative server at one address.
 ///
@@ -35,57 +34,44 @@ use super::{Ask, Authority, Known, Observed, ServerConfig, Step, bare_reply};
 ///    IN, CH, and ANY. Answers another CHAOS-class question from the
 ///    server's [`identity`](ServerConfig::identity), or from the
 ///    authority when the server has none.
-/// 4. Asks the authority. For [`Step::Need`] it sends the question under a
-///    fresh token, waits up to [`ask_timeout`](ServerConfig::ask_timeout),
-///    records what came of it, and asks the authority again. Requests
-///    that need the same question wait on one exchange.
+/// 4. Asks the authority. For [`Step::Need`] it queues [`Action::Lookup`]
+///    under a fresh token and waits up to
+///    [`ask_timeout`](ServerConfig::ask_timeout). When the lookup ends, it
+///    has the authority [file](Authority::file) what came of it, queues
+///    [`Event::Looked`], and asks the authority again. Requests that need
+///    the same lookup wait on one. A request that needs a lookup it
+///    already made gets no reply: what the upstream gave did not settle
+///    the fact, or the upstream gave nothing, and the server stays silent
+///    as a server that cannot answer does.
 /// 5. Sends the reply through the server front and [`fit`](fictionet::stdlib::protocols::dns::fit),
-///    or a verbatim reply as it is, after [`Event::Reply`].
+///    after [`Event::Reply`].
 ///
-/// The engine keeps the contract of [`Engine`]. A reply to an exchange
-/// counts only when its token is outstanding and current, it came from
-/// the address and over the transport the question went to, and its ID
-/// and question are the question's.
+/// The engine keeps the contract of [`Engine`]. What a lookup gave counts
+/// only when its token is outstanding and current, and a response only
+/// when its question is the lookup's.
 pub struct AuthorityEngine<A: Authority> {
     authority: A,
     server: ServerConfig,
     local: SocketAddr,
     tokens: Tokens,
-    exchanges: BTreeMap<Token, Exchange>,
+    lookups: BTreeMap<Token, Pending>,
     queue: VecDeque<Action>,
     now: Instant,
 }
 
-/// One question the engine asked another server, and the requests waiting
-/// on it.
-struct Exchange {
-    ask: Ask,
-    /// The ID and question of the ask's query, which a reply must repeat.
-    /// `None` when the authority's query does not decode, so no reply can
-    /// match.
-    asked: Option<(u16, Query)>,
+/// One lookup the engine is waiting on, and the requests waiting on it.
+struct Pending {
+    lookup: Lookup,
     deadline: Instant,
     waiters: Vec<Waiter>,
 }
 
-/// A request waiting for an exchange.
+/// A request waiting for a lookup.
 struct Waiter {
     request: Request,
     client: Client,
-    known: Observations,
-}
-
-/// What one request's asks gave so far.
-#[derive(Default)]
-struct Observations(Vec<(Ask, Observed)>);
-
-impl Known for Observations {
-    fn get(&self, ask: &Ask) -> Option<&Observed> {
-        self.0
-            .iter()
-            .find(|(asked, _)| asked == ask)
-            .map(|(_, observed)| observed)
-    }
+    /// The lookups made for this request so far.
+    looked: Vec<Lookup>,
 }
 
 impl<A: Authority> AuthorityEngine<A> {
@@ -97,7 +83,7 @@ impl<A: Authority> AuthorityEngine<A> {
             server,
             local,
             tokens: Tokens::new(),
-            exchanges: BTreeMap::new(),
+            lookups: BTreeMap::new(),
             queue: VecDeque::new(),
             now: Instant::ZERO,
         }
@@ -152,130 +138,91 @@ impl<A: Authority> AuthorityEngine<A> {
             None => self.step(Waiter {
                 request: req,
                 client,
-                known: Observations::default(),
+                looked: Vec::new(),
             }),
         }
     }
 
     /// Asks the authority about `waiter`'s request and acts on its step.
     fn step(&mut self, waiter: Waiter) {
-        let step = self.authority.respond(
-            &waiter.request,
-            self.local,
-            &self.server,
-            &waiter.client,
-            &waiter.known,
-        );
-        let Waiter {
-            request,
-            client,
-            known,
-        } = waiter;
-        let bytes = match step {
-            Step::Reply(response) => self.server.render(&request, response),
-            Step::Verbatim(bytes) => match self.server.verbatim(&request, bytes) {
-                Some(bytes) => bytes,
-                None => self.server_failure(&request),
-            },
-            // An authority that asks again for what it knows would never
-            // finish, so the request fails instead.
-            Step::Need(ask) if known.get(&ask).is_some() => self.server_failure(&request),
-            Step::Need(ask) => {
-                return self.park(
-                    ask,
-                    Waiter {
-                        request,
-                        client,
-                        known,
-                    },
-                );
+        let step =
+            self.authority
+                .respond(&waiter.request, self.local, &self.server, &waiter.client);
+        match step {
+            Step::Reply(response) => {
+                let bytes = self.server.render(&waiter.request, response);
+                self.answer(waiter.client, bytes);
             }
-            Step::Silent => return,
-        };
-        self.answer(client, bytes);
+            // The lookup already gave what it could, and the fact is still
+            // not held: the server cannot answer without guessing.
+            Step::Need(lookup) if waiter.looked.contains(&lookup) => {}
+            Step::Need(lookup) => self.park(lookup, waiter),
+            Step::Silent => {}
+        }
     }
 
-    fn server_failure(&self, request: &Request) -> Vec<u8> {
-        self.server
-            .render(request, bare_reply(request, ResponseCode::ServFail, None))
-    }
-
-    /// Makes `waiter` wait for `ask`: on the exchange already asking it,
-    /// or on a new one.
-    fn park(&mut self, ask: Ask, waiter: Waiter) {
-        if let Some(exchange) = self.exchanges.values_mut().find(|ex| ex.ask == ask) {
-            exchange.waiters.push(waiter);
+    /// Makes `waiter` wait for `lookup`: on the lookup already pending, or
+    /// on a new one.
+    fn park(&mut self, lookup: Lookup, waiter: Waiter) {
+        if let Some(pending) = self.lookups.values_mut().find(|p| p.lookup == lookup) {
+            pending.waiters.push(waiter);
             return;
         }
         let token = self.tokens.issue();
-        let asked = Message::from_vec(&ask.query)
-            .ok()
-            .and_then(|query| Some((query.metadata.id, query.queries.first()?.clone())));
-        self.queue.push_back(Action::Send(Transmit {
+        self.queue.push_back(Action::Lookup {
             token,
-            to: ask.server,
-            transport: ask.transport,
-            bytes: ask.query.clone(),
-        }));
-        self.exchanges.insert(
+            lookup: lookup.clone(),
+        });
+        self.lookups.insert(
             token,
-            Exchange {
-                ask,
-                asked,
+            Pending {
+                lookup,
                 deadline: self.now + self.server.ask_timeout,
                 waiters: vec![waiter],
             },
         );
     }
 
-    /// The exchange `token` names, if it is outstanding in the current
-    /// generation.
-    fn outstanding(&self, token: Token) -> Result<&Exchange, Unmatched> {
-        outstanding(&self.tokens, &self.exchanges, token)
-    }
-
-    /// The RCODE of a reply that answers `token`'s exchange, or why it
-    /// does not (RFC 5452 §9.1).
-    fn matching(
-        &self,
-        token: Token,
-        from: SocketAddr,
-        transport: Transport,
-        bytes: &[u8],
-    ) -> Result<ResponseCode, Unmatched> {
-        let exchange = self.outstanding(token)?;
-        let sent = Sent {
-            to: exchange.ask.server,
-            transport: exchange.ask.transport,
-            asked: exchange
-                .asked
-                .as_ref()
-                .map(|(id, question)| (*id, question)),
-            exact_case: false,
+    /// Why `looked` does not end `token`'s lookup, if it does not.
+    fn unmatched(&self, token: Token, looked: &Looked) -> Option<Unmatched> {
+        let pending = match outstanding(&self.tokens, &self.lookups, token) {
+            Ok(pending) => pending,
+            Err(why) => return Some(why),
         };
-        matching(&sent, from, transport, bytes).map(|reply| reply.metadata.response_code)
+        match looked {
+            Looked::Response(response) if !pending.lookup.answered_by(response) => {
+                Some(Unmatched::WrongQuestion)
+            }
+            Looked::Response(_) | Looked::Unreachable | Looked::NoReply => None,
+        }
     }
 
     fn ignore(&mut self, token: Token, from: Option<SocketAddr>, why: Unmatched) {
         self.queue.push_back(ignored(self.now, token, from, why));
     }
 
-    /// Ends `token`'s exchange with `observed`, and asks the authority
-    /// again for each request that waited on it.
-    fn complete(&mut self, token: Token, observed: Observed, kind: ObservedKind) {
-        let Some(exchange) = self.exchanges.remove(&token) else {
+    /// Ends `token`'s lookup with `looked`: has the authority file it,
+    /// then asks the authority again for each request that waited on it.
+    fn complete(&mut self, token: Token, looked: Looked) {
+        let Some(pending) = self.lookups.remove(&token) else {
             return;
         };
-        self.queue.push_back(Action::Event(Event::Asked {
+        self.authority
+            .file(&pending.lookup, &looked, token.generation());
+        let outcome = match &looked {
+            Looked::Response(response) => LookupOutcome::Response {
+                rcode: response.metadata.response_code,
+            },
+            Looked::Unreachable => LookupOutcome::Unreachable,
+            Looked::NoReply => LookupOutcome::NoReply,
+        };
+        self.queue.push_back(Action::Event(Event::Looked {
             at: self.now,
-            ask: exchange.ask.clone(),
-            observed: kind,
+            lookup: pending.lookup.clone(),
+            outcome,
         }));
-        for mut waiter in exchange.waiters {
-            waiter
-                .known
-                .0
-                .push((exchange.ask.clone(), observed.clone()));
+        for mut waiter in pending.waiters {
+            waiter.looked.push(pending.lookup.clone());
             self.step(waiter);
         }
     }
@@ -294,57 +241,47 @@ impl<A: Authority> Engine for AuthorityEngine<A> {
         self.now = now;
         match input {
             Input::Query(query) => self.query(query),
-            Input::Reply {
-                token,
-                from,
-                transport,
-                bytes,
-            } => match self.matching(token, from, transport, &bytes) {
-                Ok(rcode) => {
-                    let kind = ObservedKind::Reply { rcode };
-                    self.complete(token, Observed::Reply(bytes), kind);
-                }
-                Err(why) => self.ignore(token, Some(from), why),
+            Input::Looked { token, looked } => match self.unmatched(token, &looked) {
+                None => self.complete(token, looked),
+                Some(why) => self.ignore(token, None, why),
             },
-            Input::Failed { token, failure } => match self.outstanding(token) {
-                Ok(_) => {
-                    // A server that cannot be reached, refuses the
-                    // connection, or closes it unanswered is, to a client,
-                    // a server it cannot reach.
-                    let (observed, kind) = match failure {
-                        ExchangeFailure::Unreachable
-                        | ExchangeFailure::Refused
-                        | ExchangeFailure::Closed => {
-                            (Observed::Unreachable, ObservedKind::Unreachable)
-                        }
-                    };
-                    self.complete(token, observed, kind);
-                }
-                Err(why) => self.ignore(token, None, why),
-            },
+            // The engine starts no exchanges of bytes, so no token of one
+            // is its own.
+            Input::Reply { token, from, .. } => {
+                let why = outstanding(&self.tokens, &self.lookups, token)
+                    .err()
+                    .unwrap_or(Unmatched::NotOutstanding);
+                self.ignore(token, Some(from), why);
+            }
+            Input::Failed { token, .. } => {
+                let why = outstanding(&self.tokens, &self.lookups, token)
+                    .err()
+                    .unwrap_or(Unmatched::NotOutstanding);
+                self.ignore(token, None, why);
+            }
             Input::Gone(client) => {
                 let mut emptied = Vec::new();
-                for (token, exchange) in &mut self.exchanges {
-                    exchange.waiters.retain(|waiter| waiter.client != client);
-                    if exchange.waiters.is_empty() {
+                for (token, pending) in &mut self.lookups {
+                    pending.waiters.retain(|waiter| waiter.client != client);
+                    if pending.waiters.is_empty() {
                         emptied.push(*token);
                     }
                 }
                 for token in emptied {
-                    self.exchanges.remove(&token);
+                    self.lookups.remove(&token);
                     self.queue.push_back(Action::Abandon(token));
                 }
             }
             Input::Tick => {
                 let expired: Vec<Token> = self
-                    .exchanges
+                    .lookups
                     .iter()
-                    .filter(|(_, exchange)| exchange.deadline <= now)
+                    .filter(|(_, pending)| pending.deadline <= now)
                     .map(|(token, _)| *token)
                     .collect();
                 for token in expired {
                     self.queue.push_back(Action::Abandon(token));
-                    self.complete(token, Observed::Timeout, ObservedKind::Timeout);
+                    self.complete(token, Looked::NoReply);
                 }
             }
         }
@@ -355,29 +292,29 @@ impl<A: Authority> Engine for AuthorityEngine<A> {
     }
 
     fn next_deadline(&self) -> Option<Instant> {
-        self.exchanges
-            .values()
-            .map(|exchange| exchange.deadline)
-            .min()
+        self.lookups.values().map(|pending| pending.deadline).min()
     }
 
-    /// Abandons every outstanding exchange and asks the authority again,
-    /// knowing nothing, for each request that waited, so it is answered
-    /// from the new session. The deadlines of the exchanges this starts
-    /// count from the time of the last input. An authoritative server
-    /// checks no signatures, so the session's clock changes nothing here.
+    /// Starts the authority's new session, so its learned zones drop what
+    /// they learned; abandons every pending lookup; and asks the authority
+    /// again, with no lookups made, for each request that waited, so it
+    /// is answered from the new session. The deadlines of the lookups this
+    /// starts count from the time of the last input. An authoritative
+    /// server checks no signatures, so the session's clock changes nothing
+    /// here.
     fn advance(&mut self, session: Session) {
         if !self.tokens.advance(session.generation) {
             return;
         }
-        let exchanges = std::mem::take(&mut self.exchanges);
-        for token in exchanges.keys() {
+        self.authority.advance(session.generation);
+        let lookups = std::mem::take(&mut self.lookups);
+        for token in lookups.keys() {
             self.queue.push_back(Action::Abandon(*token));
         }
-        for exchange in exchanges.into_values() {
-            for waiter in exchange.waiters {
+        for pending in lookups.into_values() {
+            for waiter in pending.waiters {
                 self.step(Waiter {
-                    known: Observations::default(),
+                    looked: Vec::new(),
                     ..waiter
                 });
             }
@@ -392,44 +329,22 @@ impl<A: Authority> Engine for AuthorityEngine<A> {
 /// The event for a reply of `bytes` sent to `client`.
 fn reply_event(at: Instant, server: SocketAddr, client: Client, bytes: &[u8]) -> Event {
     let size = u16::try_from(bytes.len()).expect("a reply fits a DNS message's 65535 octets");
-    let (question, rcode, flags, answers, ede) = match read_message(bytes) {
-        Ok(message) => {
-            let ede = message.edns.as_ref().and_then(|edns| {
-                edns.options()
-                    .as_ref()
-                    .iter()
-                    .find_map(|(_, option)| Ede::from_option(option))
-                    .map(|ede| ede.code)
-            });
-            (
-                message.queries.first().cloned(),
-                message.metadata.response_code,
-                ReplyFlags::of(&message.metadata),
-                rrsets(&message.answers),
-                ede,
-            )
-        }
-        // A verbatim reply hickory cannot decode still has a header.
-        Err(_) => {
-            let header = Header::read(&mut BinDecoder::new(bytes))
-                .expect("every reply the engine sends has a header");
-            (
-                None,
-                header.metadata.response_code,
-                ReplyFlags::of(&header.metadata),
-                Vec::new(),
-                None,
-            )
-        }
-    };
+    let message = read_message(bytes).expect("every reply the engine sends decodes");
+    let ede = message.edns.as_ref().and_then(|edns| {
+        edns.options()
+            .as_ref()
+            .iter()
+            .find_map(|(_, option)| Ede::from_option(option))
+            .map(|ede| ede.code)
+    });
     Event::Reply {
         at,
         server,
         client,
-        question,
-        rcode,
-        flags,
-        answers,
+        question: message.queries.first().cloned(),
+        rcode: message.metadata.response_code,
+        flags: ReplyFlags::of(&message.metadata),
+        answers: rrsets(&message.answers),
         validation: Validation::NotPerformed,
         ede,
         cached: false,

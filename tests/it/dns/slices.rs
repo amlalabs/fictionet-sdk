@@ -7,7 +7,9 @@
 //! memory, through hosts on a simulated network, and through the exchanges
 //! the first way recorded, played back. Then the same records reach it
 //! from a complete zone, from zone data signed as it grows, and from a
-//! relay of a recording, signed by two implementations of `Sign`.
+//! copy of what a zone's servers answered, signed by two implementations
+//! of `Sign`, and a world that copies the signed hierarchy validates what
+//! it copied as the real hierarchy validates.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
@@ -25,22 +27,24 @@ use fictionet::stdlib::protocols::dns::rr::rdata::SOA;
 use fictionet::stdlib::protocols::dns::rr::{
     LowerName, Name, RData, Record, RecordSet, RecordType,
 };
-use fictionet::stdlib::protocols::dns::{Ede, EdeCode};
-use fictionet::stdlib::services::dns::authority::{Relay, Zones};
+use fictionet::stdlib::protocols::dns::{Ede, EdeCode, Nsid};
+use fictionet::stdlib::services::dns::authority::{AuthorityEngine, ServerConfig, Zones};
 use fictionet::stdlib::services::dns::memory::{Exchanges, MemoryNet, Recording, drive};
 use fictionet::stdlib::services::dns::resolver::{Config, Resolver};
 use fictionet::stdlib::services::dns::zone::{
-    Denial, Fact, Lazy, Node, Provider, Signed, Zone, ZoneBuilder, ZoneData,
+    AnyResponse, Denial, Fact, Lazy, Learned, Node, Provider, Signed, Zone, ZoneBuilder, ZoneData,
 };
 use fictionet::stdlib::services::dns::{
-    Action, Client, ClientQuery, Engine, Event, Generation, Input, Session,
+    Action, Client, ClientQuery, Engine, Event, Generation, Input, Looked, Lookup, Session, Tokens,
+    Transmit,
 };
 use fictionet::stdlib::services::serve::Transport;
 use fictionet::stdlib::world::net::dns::Recursive;
+use fictionet::stdlib::world::net::dns::internet::{GTLD_SERVERS, ROOT_LETTERS};
 use fictionet::stdlib::world::net::{Host, Net};
 use fictionet::time::Instant;
 use fictionet::{Cx, Entropy, Seed, SeededEntropy};
-use fictionet_test_support::dns::{EXAMPLE_COM, TestInternet, v6};
+use fictionet_test_support::dns::{DNSSEC_FAILED, EXAMPLE_COM, TestInternet, v6};
 use fictionet_test_support::sandbox::{Machine, machine};
 use fictionet_test_support::timeout;
 
@@ -408,8 +412,8 @@ fn one_resolver_answers_alike_in_memory_on_packets_and_from_a_recording() {
     let mut recording: Recording = net.recording();
     // The large TXT RRset came back truncated over UDP, and the resolver
     // asked again over TCP (RFC 7766), which the recording keeps too.
-    assert!(recording.exchanges().iter().any(|(ask, _)| {
-        ask.transport == Transport::Tcp && example_com().contains(&ask.server.ip())
+    assert!(recording.exchanges().iter().any(|exchange| {
+        exchange.transport == Transport::Tcp && example_com().contains(&exchange.server.ip())
     }));
     let recorded = in_memory(&mut recording, &config, &questions);
     let packets = on_packets(&internet, &config, &questions);
@@ -679,8 +683,8 @@ fn example_questions() -> Vec<Question> {
 
 /// The same records of `example.com`, signed by `ZoneKey` and by ring and
 /// served from a complete zone signed once, from a `Lazy` zone signed as
-/// it is asked, and from a relay answering from a recording of the
-/// complete zone, get the same validations, Extended DNS Errors, RCODEs,
+/// it is asked, and from a copy learned from what the complete zone's
+/// servers answer, get the same validations, Extended DNS Errors, RCODEs,
 /// and answers from one resolver configuration in all six ways. The
 /// validator sees records only.
 #[test]
@@ -708,10 +712,9 @@ fn the_validator_sees_the_same_records_however_they_are_served_or_signed() {
         let complete = Arc::new(complete) as Arc<dyn ZoneData>;
         let mut served = internet
             .clone()
-            .serving("example.com.", Zones::new(vec![complete]))
+            .serving("example.com.", Zones::new(vec![complete.clone()]))
             .memory();
         let outcomes = in_memory(&mut served, &config, &questions);
-        let seen = served.recording();
         runs.push((
             format!("a complete zone signed by {signer}"),
             outcomes.into_iter().map(|(_, o)| o).collect(),
@@ -728,25 +731,22 @@ fn the_validator_sees_the_same_records_however_they_are_served_or_signed() {
             outcomes.into_iter().map(|(_, o)| o).collect(),
         ));
 
-        // The relays at example.com's addresses answer from what the
-        // complete zone's servers answered; every other server answers
-        // from its zones as before.
-        let example = example_com();
-        let source = Recording::new(
-            seen.exchanges()
-                .iter()
-                .filter(|(ask, _)| example.contains(&ask.server.ip()))
-                .cloned()
-                .collect(),
-        );
+        // The servers at example.com's addresses answer from a copy of
+        // what the complete zone's servers answer them; every other
+        // server answers from its zones as before.
+        let learned = Arc::new(Learned::new(&apex)) as Arc<dyn ZoneData>;
         let mut served: MemoryNet = internet
             .clone()
-            .serving("example.com.", Relay::new())
+            .serving("example.com.", Zones::new(vec![learned]))
             .memory();
-        served.source(source);
+        let mut real = internet
+            .clone()
+            .serving("example.com.", Zones::new(vec![complete.clone()]))
+            .memory();
+        served.upstream(move |lookup| looked_up(&mut real, lookup));
         let outcomes = in_memory(&mut served, &config, &questions);
         runs.push((
-            format!("a relay of the zone signed by {signer}"),
+            format!("a copy of the zone signed by {signer}"),
             outcomes.into_iter().map(|(_, o)| o).collect(),
         ));
     }
@@ -794,6 +794,172 @@ fn the_validator_sees_the_same_records_however_they_are_served_or_signed() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// A world that copies the hierarchy
+
+/// What the servers of `real` give `lookup`, as an upstream on the
+/// internet gives it: the query asked over UDP with DO and an NSID
+/// request, and again over TCP when the response comes back truncated.
+fn looked_up(real: &mut MemoryNet, lookup: &Lookup) -> Looked {
+    let entropy = SeededEntropy::new(Seed::from_u64(SEED));
+    let mut message = Message::new(1, MessageType::Query, OpCode::Query);
+    message.metadata.recursion_desired = lookup.recursion_desired;
+    message.add_query(lookup.question.clone());
+    let mut edns = Edns::new();
+    edns.set_max_payload(1232).set_dnssec_ok(true);
+    edns.options_mut().insert(Nsid(Vec::new()).to_option());
+    message.set_edns(edns);
+    let bytes = message.to_vec().expect("a lookup's query writes");
+    let mut response = None;
+    for transport in [Transport::Udp, Transport::Tcp] {
+        let transmit = Transmit {
+            token: Tokens::new().issue(),
+            to: lookup.server,
+            transport,
+            bytes: bytes.clone(),
+        };
+        match real.exchange(&transmit, Instant::ZERO, &entropy).as_slice() {
+            [Input::Reply { bytes, .. }] => {
+                let reply = Message::from_vec(bytes).expect("a real server's reply parses");
+                let truncated = reply.metadata.truncation;
+                response = Some(reply);
+                if !truncated {
+                    break;
+                }
+            }
+            [Input::Failed { .. }] => return Looked::Unreachable,
+            _ => break,
+        }
+    }
+    response.map_or(Looked::NoReply, Looked::Response)
+}
+
+/// Servers of learned copies of the zones at `apexes`.
+fn copies(apexes: &[&str]) -> Arc<Zones> {
+    Arc::new(Zones::new(
+        apexes
+            .iter()
+            .map(|apex| Arc::new(Learned::new(&name(apex))) as Arc<dyn ZoneData>)
+            .collect(),
+    ))
+}
+
+/// `world` with the root letters, the `gtld-servers.net` servers, and the
+/// servers of `example.com` and `dnssec-failed.com` answering from
+/// copies learned from `real`, behind the fronts `real` gives them.
+fn copying(real: &TestInternet, world: TestInternet) -> MemoryNet {
+    let mut net = world.memory();
+    let mut serve = |addresses: Vec<IpAddr>, front: ServerConfig, zones: &Arc<Zones>| {
+        for address in addresses {
+            let local = SocketAddr::new(address, 53);
+            net.serve(
+                address,
+                AuthorityEngine::new(zones.clone(), front.clone(), local),
+            );
+        }
+    };
+    let root = copies(&[".", "arpa."]);
+    for letter in &ROOT_LETTERS {
+        let front = real.letter_front(letter.server.v4);
+        serve(letter.server.addresses().to_vec(), front, &root);
+    }
+    let gtld = copies(&["com.", "net."]);
+    for server in &GTLD_SERVERS {
+        let identity = real.location().site(IpAddr::V4(server.v4)).identity;
+        serve(
+            server.addresses().to_vec(),
+            ServerConfig::gtld(identity),
+            &gtld,
+        );
+    }
+    let cloudflare = ServerConfig {
+        any: AnyResponse::Hinfo,
+        ..ServerConfig::generic()
+    };
+    serve(example_com(), cloudflare, &copies(&["example.com."]));
+    let failed = [IpAddr::V4(DNSSEC_FAILED), IpAddr::V6(v6(DNSSEC_FAILED))];
+    serve(
+        failed.to_vec(),
+        ServerConfig::generic(),
+        &copies(&["dnssec-failed.com."]),
+    );
+    let mut upstream = real.memory();
+    net.upstream(move |lookup| looked_up(&mut upstream, lookup));
+    net
+}
+
+/// A world that copies the root, `com`, `net`, `example.com`, and
+/// `dnssec-failed.com` from their real servers, here with `example.com`
+/// signed with NSEC3, gives the resolver what the real hierarchy gives
+/// it: the same validations, Extended DNS Errors, RCODEs, and records.
+/// The copied RRSIGs verify, the copied NSEC3 records prove the
+/// NXDOMAIN and NODATA answers of `example.com`, the opt-out spans of
+/// `com` and `net` prove `fict.com` and `example.net` unsigned and a name
+/// under `com` insecurely denied, and the bogus DS of
+/// `dnssec-failed.com` stays bogus.
+#[test]
+fn a_world_that_copies_the_signed_hierarchy_validates_as_the_real_one() {
+    let nsec3 = TestInternet::example_com()
+        .signed(
+            &TestInternet::example_com_keys(),
+            TestInternet::window(),
+            Denial::Nsec3 {
+                opt_out: false,
+                salt: Vec::new(),
+            },
+        )
+        .expect("example.com signs with NSEC3");
+    let real = TestInternet::new().serving(
+        "example.com.",
+        Zones::new(vec![Arc::new(nsec3) as Arc<dyn ZoneData>]),
+    );
+    let config = real.config();
+    let questions = questions();
+
+    let mut direct = real.memory();
+    let want = in_memory(&mut direct, &config, &questions);
+    let mut copied = copying(&real, real.clone());
+    let got = in_memory(&mut copied, &config, &questions);
+    for (n, question) in questions.iter().enumerate() {
+        assert_eq!(got[n].1, want[n].1, "{question:?}");
+    }
+    let validation = |name: &str, rtype: RecordType| {
+        let n = questions
+            .iter()
+            .position(|question| question.name == name && question.rtype == rtype)
+            .expect("a question asked");
+        (got[n].1.rcode, got[n].1.validation)
+    };
+    for (name, rtype, rcode) in [
+        ("www.example.com.", RecordType::A, ResponseCode::NoError),
+        ("nx.example.com.", RecordType::A, ResponseCode::NXDomain),
+        ("www.example.com.", RecordType::TXT, ResponseCode::NoError),
+    ] {
+        assert_eq!(
+            validation(name, rtype),
+            (rcode, Validation::Secure),
+            "{name} {rtype}"
+        );
+    }
+    // The copied opt-out span over the name proves it insecure, as the
+    // real one does (RFC 5155 §9.2).
+    assert_eq!(
+        validation("nonexistent-xyz.com.", RecordType::A),
+        (
+            ResponseCode::NXDomain,
+            Validation::Insecure(Insecure::OptOutCovered)
+        )
+    );
+    assert!(matches!(
+        validation("www.example.net.", RecordType::A).1,
+        Validation::Insecure(_)
+    ));
+    assert_eq!(
+        validation("www.dnssec-failed.com.", RecordType::A).0,
+        ResponseCode::ServFail
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -968,13 +1134,12 @@ impl fictionet::stdlib::services::dns::authority::Authority for NoKeys {
         local: SocketAddr,
         server: &fictionet::stdlib::services::dns::authority::ServerConfig,
         client: &Client,
-        known: &dyn fictionet::stdlib::services::dns::authority::Known,
     ) -> fictionet::stdlib::services::dns::authority::Step {
         let down = self.down.load(std::sync::atomic::Ordering::SeqCst);
         if down && req.question.query_type() == RecordType::DNSKEY {
             return fictionet::stdlib::services::dns::authority::Step::Silent;
         }
-        self.inner.respond(req, local, server, client, known)
+        self.inner.respond(req, local, server, client)
     }
 }
 

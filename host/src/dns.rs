@@ -1,8 +1,8 @@
-//! DNS questions put to real servers on the internet, as a
-//! [`Source`] for a world's relays.
+//! A world's lookups put to real servers on the internet, as an
+//! [`Upstream`] for its learned zones.
 //!
-//! [`Live`] sends each question from the host, over UDP and then over
-//! TCP when the reply comes back truncated, on a Tokio runtime it owns.
+//! [`Live`] sends each lookup from the host, over UDP and then over TCP
+//! when the response comes back truncated, on a Tokio runtime it owns.
 //! The world's executor only waits for the outcome.
 
 use std::future::{Future, ready};
@@ -17,18 +17,21 @@ use tokio::runtime::Runtime;
 use tokio::task::AbortHandle;
 
 use fictionet::Cx;
-use fictionet::stdlib::protocols::dns::op::{Message, MessageType, OpCode, Query};
-use fictionet::stdlib::protocols::dns::rr::{Name, RData, RecordType};
-use fictionet::stdlib::protocols::dns::{Parsed, Request, restore, stream_framed};
-use fictionet::stdlib::services::dns::authority::{Ask, Observed};
-use fictionet::stdlib::services::serve::Transport;
-use fictionet::stdlib::world::net::dns::Source;
+use fictionet::stdlib::protocols::dns::op::{Edns, Message, MessageType, OpCode, Query};
+use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RData, RecordType};
+use fictionet::stdlib::protocols::dns::{Nsid, read_message, stream_framed};
+use fictionet::stdlib::services::dns::{Looked, Lookup};
+use fictionet::stdlib::world::net::dns::Upstream;
 use fictionet::sync::Mutex;
 
 /// The largest DNS message a UDP datagram or a TCP frame can carry: the
 /// length prefix on TCP is two octets (RFC 1035 §4.2.2), and EDNS lets a
 /// UDP reply be as large (RFC 6891 §6.2.5).
 const MAX_MESSAGE: usize = u16::MAX as usize;
+
+/// The UDP payload size a lookup advertises: the size the DNS Flag Day
+/// 2020 settled on (RFC 6891 §6.2.5).
+const PAYLOAD: u16 = 1232;
 
 /// `ns1.google.com`, which answers a TXT question for
 /// [`WHOAMI`] with the address the question came from.
@@ -37,20 +40,23 @@ const WHOAMI_SERVER: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(216, 
 /// Google's name for asking which address a question came from.
 const WHOAMI: &str = "o-o.myaddr.l.google.com.";
 
+/// The zone [`WHOAMI`] is in.
+const WHOAMI_ZONE: &str = "google.com.";
+
 /// The internet's DNS servers, asked from this host.
 ///
-/// Each question goes out as it came, with one change: a fresh ID drawn
-/// from the run's seeded random stream, so a guest never chooses the ID a
-/// real server sees (RFC 5452 §9.2). A datagram that does not carry that
-/// ID and the question back is not the reply and is ignored, as RFC 5452
-/// §9.1 requires; a UDP reply with TC set is asked again over TCP
-/// (RFC 7766 §5). The reply comes back as it arrived, with the asker's ID
-/// put back in place of the fresh one, so the engine that asked can match
-/// it. A refused or unreachable server is [`Observed::Unreachable`].
+/// Each lookup goes out as one query: a fresh ID drawn from the run's
+/// seeded random stream (RFC 5452 §9.2), the lookup's question and RD
+/// bit, and an OPT record with a 1232-octet payload, DO set (RFC 3225 §3),
+/// and an NSID request (RFC 5001). A datagram that does not carry that ID
+/// and the question back is not the response and is ignored, as RFC 5452
+/// §9.1 requires; a UDP response with TC set is asked again over TCP
+/// (RFC 7766 §5). The response comes back decoded. A refused or
+/// unreachable server is [`Looked::Unreachable`].
 ///
-/// A question waits until its reply comes. The engine that asked decides
-/// how long to wait, and its driver drops the question when it gives up,
-/// which stops it here too.
+/// A lookup waits until its response comes. The engine that made it
+/// decides how long to wait, and its driver drops the lookup when it
+/// gives up, which stops it here too.
 pub struct Live {
     runtime: Option<Runtime>,
     egress: Mutex<Option<IpAddr>>,
@@ -63,7 +69,7 @@ impl Default for Live {
 }
 
 impl Live {
-    /// A source that asks the internet from this host.
+    /// An upstream that asks the internet from this host.
     pub fn new() -> Live {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
@@ -90,21 +96,16 @@ impl Live {
         if let Some(address) = *self.egress.lock() {
             return Some(address);
         }
-        let mut question = Message::new(0, MessageType::Query, OpCode::Query);
-        question.add_query(Query::query(
+        let question = Query::query(
             Name::from_ascii(WHOAMI).expect("a valid name"),
             RecordType::TXT,
-        ));
-        let ask = Ask {
-            server,
-            transport: Transport::Udp,
-            query: question.to_vec().ok()?,
-        };
-        let Observed::Reply(reply) = self.ask(fcx, ask).await else {
+        );
+        let zone = LowerName::new(&Name::from_ascii(WHOAMI_ZONE).expect("a valid name"));
+        let lookup = Lookup::new(server, zone, &question);
+        let Looked::Response(response) = self.lookup(fcx, lookup).await else {
             return None;
         };
-        let address = Message::from_vec(&reply)
-            .ok()?
+        let address = response
             .answers
             .into_iter()
             .find_map(|record| match record.data {
@@ -127,24 +128,23 @@ impl Drop for Live {
     }
 }
 
-impl Source for Live {
-    fn ask<'a>(
+impl Upstream for Live {
+    fn lookup<'a>(
         &'a self,
         fcx: &'a Cx,
-        ask: Ask,
-    ) -> Pin<Box<dyn Future<Output = Observed> + Send + 'a>> {
-        let Parsed::Request(request) = Request::parse(&ask.query, ask.transport) else {
-            return Box::pin(ready(Observed::Timeout));
-        };
+        lookup: Lookup,
+    ) -> Pin<Box<dyn Future<Output = Looked> + Send + 'a>> {
         let mut id = [0; 2];
         fcx.fill_random(&mut id);
-        let mut query = ask.query;
-        query[..2].copy_from_slice(&id);
+        let id = u16::from_be_bytes(id);
+        let Ok(query) = query(id, &lookup).to_vec() else {
+            return Box::pin(ready(Looked::NoReply));
+        };
         let exchange = Exchange {
-            server: ask.server,
-            id: u16::from_be_bytes(id),
+            server: lookup.server,
+            id,
             query,
-            request,
+            lookup,
         };
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let runtime = self
@@ -152,52 +152,59 @@ impl Source for Live {
             .as_ref()
             .expect("the runtime lives as long as Live");
         let task = runtime.spawn(async move {
-            let observed = match ask.transport {
-                Transport::Udp => exchange.udp().await,
-                Transport::Tcp => exchange.tcp().await,
-            };
-            let _ = sender.send(observed);
+            let _ = sender.send(exchange.udp().await);
         });
         let abort = Abort(task.abort_handle());
         Box::pin(async move {
             let _abort = abort;
-            receiver.await.unwrap_or(Observed::Timeout)
+            receiver.await.unwrap_or(Looked::NoReply)
         })
     }
 }
 
-/// One question on its way to a real server.
+/// The query for `lookup` with `id`: its question and RD bit, and an OPT
+/// record with DO set and an NSID request.
+fn query(id: u16, lookup: &Lookup) -> Message {
+    let mut message = Message::new(id, MessageType::Query, OpCode::Query);
+    message.metadata.recursion_desired = lookup.recursion_desired;
+    message.add_query(lookup.question.clone());
+    let mut edns = Edns::new();
+    edns.set_max_payload(PAYLOAD).set_dnssec_ok(true);
+    edns.options_mut().insert(Nsid(Vec::new()).to_option());
+    message.set_edns(edns);
+    message
+}
+
+/// One lookup on its way to a real server.
 struct Exchange {
     server: SocketAddr,
-    /// The ID the question went out with.
+    /// The ID the query went out with.
     id: u16,
-    /// The question's octets, with that ID.
+    /// The query's octets.
     query: Vec<u8>,
-    /// The question as asked, with the asker's ID, to tell its reply from
-    /// other datagrams and to put that ID back.
-    request: Request,
+    /// The lookup, to tell its response from other datagrams.
+    lookup: Lookup,
 }
 
 impl Exchange {
-    /// Asks over UDP, and over TCP when the reply is truncated. If TCP
-    /// then brings nothing, the truncated reply is what the client saw.
-    async fn udp(&self) -> Observed {
-        let reply = match self.datagram().await {
-            Ok(reply) => reply,
-            Err(_) => return Observed::Unreachable,
+    /// Asks over UDP, and over TCP when the response is truncated. If TCP
+    /// then brings nothing, the truncated response is what came.
+    async fn udp(&self) -> Looked {
+        let response = match self.datagram().await {
+            Ok(response) => response,
+            Err(_) => return Looked::Unreachable,
         };
-        // TC is bit 1 of the third header octet (RFC 1035 §4.1.1).
-        if reply[2] & 0x02 == 0 {
-            return Observed::Reply(reply);
+        if !response.metadata.truncation {
+            return Looked::Response(response);
         }
         match self.tcp().await {
-            Observed::Reply(whole) => Observed::Reply(whole),
-            Observed::Unreachable | Observed::Timeout => Observed::Reply(reply),
+            Looked::Response(whole) => Looked::Response(whole),
+            Looked::Unreachable | Looked::NoReply => Looked::Response(response),
         }
     }
 
-    /// The first datagram from the server that answers the question.
-    async fn datagram(&self) -> io::Result<Vec<u8>> {
+    /// The first datagram from the server that answers the lookup.
+    async fn datagram(&self) -> io::Result<Message> {
         let local = match self.server {
             SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             SocketAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
@@ -210,49 +217,46 @@ impl Exchange {
         let mut buffer = vec![0; MAX_MESSAGE];
         loop {
             let length = socket.recv(&mut buffer).await?;
-            if let Some(reply) = self.answer(&buffer[..length]) {
-                return Ok(reply);
+            if let Some(response) = self.response(&buffer[..length]) {
+                return Ok(response);
             }
         }
     }
 
     /// Asks over one TCP connection (RFC 7766 §6.2.1). A connection that
-    /// cannot be made is unreachable; one that ends before the reply is a
-    /// timeout, since no reply came.
-    async fn tcp(&self) -> Observed {
+    /// cannot be made is unreachable; one that ends before the response
+    /// brought none.
+    async fn tcp(&self) -> Looked {
         let Ok(mut stream) = TcpStream::connect(self.server).await else {
-            return Observed::Unreachable;
+            return Looked::Unreachable;
         };
         // A query no stream can carry reaches no server.
         let Some(frame) = stream_framed(&self.query) else {
-            return Observed::Unreachable;
+            return Looked::Unreachable;
         };
         if stream.write_all(&frame).await.is_err() {
-            return Observed::Timeout;
+            return Looked::NoReply;
         }
         loop {
             let mut length = [0; 2];
             if stream.read_exact(&mut length).await.is_err() {
-                return Observed::Timeout;
+                return Looked::NoReply;
             }
             let mut reply = vec![0; usize::from(u16::from_be_bytes(length))];
             if stream.read_exact(&mut reply).await.is_err() {
-                return Observed::Timeout;
+                return Looked::NoReply;
             }
-            if let Some(reply) = self.answer(&reply) {
-                return Observed::Reply(reply);
+            if let Some(response) = self.response(&reply) {
+                return Looked::Response(response);
             }
         }
     }
 
-    /// `reply` with the asker's ID back in place of the fresh one, if it
-    /// is the server's reply to this question: the fresh ID, QR set, and
-    /// the question back (RFC 5452 §9.1).
-    fn answer(&self, reply: &[u8]) -> Option<Vec<u8>> {
-        if reply.len() < 2 || u16::from_be_bytes([reply[0], reply[1]]) != self.id {
-            return None;
-        }
-        restore(reply, &self.request).ok()
+    /// `reply` decoded, if it is the server's response to this lookup: the
+    /// query's ID, QR set, and the question back (RFC 5452 §9.1).
+    fn response(&self, reply: &[u8]) -> Option<Message> {
+        let response = read_message(reply).ok()?;
+        (response.metadata.id == self.id && self.lookup.answered_by(&response)).then_some(response)
     }
 }
 
@@ -287,10 +291,13 @@ mod tests {
         .unwrap();
     }
 
-    fn query(id: u16, name: &str, kind: RecordType) -> Vec<u8> {
-        let mut message = Message::new(id, MessageType::Query, OpCode::Query);
-        message.add_query(Query::query(Name::from_ascii(name).unwrap(), kind));
-        message.to_vec().unwrap()
+    fn lookup(server: SocketAddr, name: &str, kind: RecordType) -> Lookup {
+        let zone = LowerName::new(&Name::from_ascii("example.test.").unwrap());
+        Lookup::new(
+            server,
+            zone,
+            &Query::query(Name::from_ascii(name).unwrap(), kind),
+        )
     }
 
     /// A reply to `query` with `answers`, and TC set when `truncated`.
@@ -358,107 +365,31 @@ mod tests {
         });
         run(async move |fcx| {
             let live = Live::new();
-            let asked = query(0x1234, "www.example.test.", RecordType::A);
-            let observed = live
-                .ask(
-                    &fcx,
-                    Ask {
-                        server,
-                        transport: Transport::Udp,
-                        query: asked.clone(),
-                    },
-                )
+            let looked = live
+                .lookup(&fcx, lookup(server, "www.example.test.", RecordType::A))
                 .await;
-            let Observed::Reply(bytes) = observed else {
-                panic!("expected a reply, got {observed:?}");
+            let Looked::Response(response) = looked else {
+                panic!("expected a response, got {looked:?}");
             };
-            let reply = Message::from_vec(&bytes).unwrap();
-            assert!(!reply.metadata.truncation);
-            assert_eq!(reply.answers, vec![answer]);
+            assert!(!response.metadata.truncation);
+            assert_eq!(response.answers, vec![answer]);
 
             let over_udp = queries.recv().unwrap();
             let over_tcp = queries.recv().unwrap();
-            // The server saw a fresh ID, the same on both transports, and
-            // otherwise the question as it was asked.
-            assert_ne!(over_udp[..2], asked[..2]);
+            // The same query on both transports: the lookup's question,
+            // no recursion, and DO with an NSID request.
             assert_eq!(over_udp, over_tcp);
-            assert_eq!(over_udp[2..], asked[2..]);
-            assert_eq!(bytes[..2], asked[..2], "the asker's ID is put back");
-        });
-        server_thread.join().unwrap();
-    }
-
-    #[test]
-    fn a_relay_answers_with_what_live_brings_back() {
-        use fictionet::stdlib::services::dns::authority::{AuthorityEngine, Relay, ServerConfig};
-        use fictionet::stdlib::services::dns::{Action, Client, ClientQuery, Engine, Input};
-        use fictionet::time::Instant;
-        use fictionet::{Entropy, SeededEntropy};
-
-        let (udp, _tcp) = sockets();
-        let server = udp.local_addr().unwrap();
-        let answer = Record::from_rdata(
-            Name::from_ascii("www.example.test.").unwrap(),
-            300,
-            RData::A(A::new(192, 0, 2, 1)),
-        );
-        let record = answer.clone();
-        let server_thread = thread::spawn(move || {
-            let mut buffer = [0; 512];
-            let (length, client) = udp.recv_from(&mut buffer).unwrap();
-            udp.send_to(&reply_to(&buffer[..length], vec![record], false), client)
-                .unwrap();
-        });
-        run(async move |fcx| {
-            let entropy: &dyn Entropy = &SeededEntropy::new(Seed::from_u64(1));
-            let config = ServerConfig {
-                identity: None,
-                ..ServerConfig::generic()
-            };
-            let mut engine = AuthorityEngine::new(Relay::new(), config, server);
-            let client = Client {
-                peer: "10.0.0.2:5353".parse().unwrap(),
-                local: server,
-                transport: Transport::Udp,
-                connection: None,
-                sandbox: None,
-            };
-            let asked = query(0x1234, "www.example.test.", RecordType::A);
-            let query = ClientQuery {
-                client,
-                bytes: asked.clone(),
-            };
-            engine.handle(Input::Query(query), Instant::ZERO, entropy);
-            let transmit = std::iter::from_fn(|| engine.poll())
-                .find_map(|action| match action {
-                    Action::Send(transmit) => Some(transmit),
-                    _ => None,
-                })
-                .expect("the relay asks the real server");
-            let ask = Ask {
-                server: transmit.to,
-                transport: transmit.transport,
-                query: transmit.bytes,
-            };
-            let Observed::Reply(bytes) = Live::new().ask(&fcx, ask).await else {
-                panic!("the server replies");
-            };
-            let reply = Input::Reply {
-                token: transmit.token,
-                from: transmit.to,
-                transport: transmit.transport,
-                bytes,
-            };
-            engine.handle(reply, Instant::ZERO, entropy);
-            let answered = std::iter::from_fn(|| engine.poll())
-                .find_map(|action| match action {
-                    Action::Answer(answered) => Some(answered.bytes),
-                    _ => None,
-                })
-                .expect("the client gets an answer");
-            let message = Message::from_vec(&answered).unwrap();
-            assert_eq!(message.metadata.id, 0x1234);
-            assert_eq!(message.answers, vec![answer]);
+            let query = Message::from_vec(&over_udp).unwrap();
+            assert!(!query.metadata.recursion_desired);
+            assert_eq!(query.queries[0].name().to_ascii(), "www.example.test.");
+            let edns = query.edns.expect("an OPT record");
+            assert!(edns.flags().dnssec_ok);
+            assert!(
+                edns.options()
+                    .as_ref()
+                    .iter()
+                    .any(|(_, option)| Nsid::from_option(option).is_some())
+            );
         });
         server_thread.join().unwrap();
     }
@@ -470,14 +401,10 @@ mod tests {
         drop((udp, tcp));
         run(async move |fcx| {
             let live = Live::new();
-            for transport in [Transport::Udp, Transport::Tcp] {
-                let ask = Ask {
-                    server,
-                    transport,
-                    query: query(1, "www.example.test.", RecordType::A),
-                };
-                assert_eq!(live.ask(&fcx, ask).await, Observed::Unreachable);
-            }
+            let looked = live
+                .lookup(&fcx, lookup(server, "www.example.test.", RecordType::A))
+                .await;
+            assert_eq!(looked, Looked::Unreachable);
         });
     }
 

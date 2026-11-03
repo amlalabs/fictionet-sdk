@@ -22,7 +22,7 @@ use fictionet::stdlib::protocols::dns::rr::{
 };
 use fictionet::stdlib::protocols::dns::{Ede, EdeCode, Request, Response, read_message};
 use fictionet::stdlib::services::dns::authority::{
-    Authority, AuthorityEngine, Identity, Known, ServerConfig, Step, Zones,
+    Authority, AuthorityEngine, Identity, ServerConfig, Step, Zones,
 };
 use fictionet::stdlib::services::dns::memory::{Exchanges, MemoryNet, drive};
 use fictionet::stdlib::services::dns::resolver::{Config, Entry, FailureKind, Key, Resolver, Work};
@@ -338,9 +338,8 @@ impl Authority for Appending {
         local: SocketAddr,
         server: &ServerConfig,
         client: &Client,
-        known: &dyn Known,
     ) -> Step {
-        match self.0.respond(req, local, server, client, known) {
+        match self.0.respond(req, local, server, client) {
             Step::Reply(mut response)
                 if response.message.metadata.response_code == ResponseCode::NXDomain =>
             {
@@ -364,7 +363,6 @@ impl Authority for Bizarre {
         _local: SocketAddr,
         _server: &ServerConfig,
         _client: &Client,
-        _known: &dyn Known,
     ) -> Step {
         let query = &req.message.metadata;
         let mut message = Message::response(query.id, query.op_code);
@@ -484,7 +482,7 @@ fn asked(net: &MemoryNet) -> Vec<(IpAddr, String, RecordType, Transport)> {
     net.recording()
         .exchanges()
         .iter()
-        .map(|(ask, _)| {
+        .map(|ask| {
             let query = Message::from_vec(&ask.query).unwrap();
             let question = &query.queries[0];
             (
@@ -573,7 +571,7 @@ fn the_first_question_primes_the_root_from_a_hint() {
         query(client(1), "www.example.com.", RecordType::A, |_| {}),
     );
     let recording = net.recording();
-    let (first, _) = &recording.exchanges()[0];
+    let first = &recording.exchanges()[0];
     assert_eq!(first.server, SocketAddr::new(ip(ROOT), 53));
     let message = Message::from_vec(&first.query).unwrap();
     assert_eq!(message.queries[0].name(), &Name::root());
@@ -1315,7 +1313,7 @@ fn pump(
                     }
                 }
                 Action::Answer(answer) => answers.push(answer),
-                Action::Abandon(_) | Action::Event(_) => {}
+                Action::Lookup { .. } | Action::Abandon(_) | Action::Event(_) => {}
             }
         }
     }
@@ -1955,7 +1953,7 @@ fn a_forwarder_sends_the_whole_question_with_rd_and_takes_the_answer() {
     );
     assert_eq!(addresses(&reply), ["192.0.2.81"]);
     let recording = net.recording();
-    let [(asked, _)] = recording.exchanges() else {
+    let [asked] = recording.exchanges() else {
         panic!("one question to the forwarder");
     };
     assert_eq!(asked.server, SocketAddr::new(ip(EXAMPLE), 53));
@@ -1978,7 +1976,6 @@ impl Authority for Validating {
         _local: SocketAddr,
         _server: &ServerConfig,
         _client: &Client,
-        _known: &dyn Known,
     ) -> Step {
         let query = &req.message.metadata;
         let mut message = Message::response(query.id, query.op_code);
@@ -2038,7 +2035,7 @@ fn a_forwarder_that_does_not_validate_passes_cd_on() {
         .recording()
         .exchanges()
         .iter()
-        .map(|(ask, _)| {
+        .map(|ask| {
             Message::from_vec(&ask.query)
                 .unwrap()
                 .metadata
@@ -2083,7 +2080,7 @@ fn a_forwarder_never_answers_a_client_without_cd_from_a_cd_answer() {
         .recording()
         .exchanges()
         .iter()
-        .map(|(ask, _)| {
+        .map(|ask| {
             Message::from_vec(&ask.query)
                 .unwrap()
                 .metadata
@@ -2921,7 +2918,7 @@ fn ask_slowly(
                     }
                 }
                 Action::Answer(answer) => return Message::from_vec(&answer.bytes).unwrap(),
-                Action::Abandon(_) | Action::Event(_) => {}
+                Action::Lookup { .. } | Action::Abandon(_) | Action::Event(_) => {}
             }
         }
         let next_reply = due.iter().map(|(when, _)| *when).min();
@@ -3256,12 +3253,11 @@ impl<A: Authority> Authority for NoDs<A> {
         local: SocketAddr,
         server: &ServerConfig,
         client: &Client,
-        known: &dyn Known,
     ) -> Step {
         if req.question.query_type() == RecordType::DS {
             return Step::Silent;
         }
-        self.0.respond(req, local, server, client, known)
+        self.0.respond(req, local, server, client)
     }
 }
 
@@ -3425,7 +3421,7 @@ fn a_check_result_lands_only_on_the_rrset_it_checked() {
                         let message = Message::from_vec(&answer.bytes).unwrap();
                         answers.push((answer.client.peer.port(), message));
                     }
-                    Action::Abandon(_) | Action::Event(_) => {}
+                    Action::Lookup { .. } | Action::Abandon(_) | Action::Event(_) => {}
                 }
             }
             if !acted {
@@ -4025,12 +4021,11 @@ impl Authority for Flipping {
         local: SocketAddr,
         server: &ServerConfig,
         client: &Client,
-        known: &dyn Known,
     ) -> Step {
         if self.flipped.load(std::sync::atomic::Ordering::SeqCst) {
-            self.after.respond(req, local, server, client, known)
+            self.after.respond(req, local, server, client)
         } else {
-            self.before.respond(req, local, server, client, known)
+            self.before.respond(req, local, server, client)
         }
     }
 }
@@ -4091,9 +4086,8 @@ impl<F: Fn(&Request, &mut Message) + Send + Sync + 'static> Authority for Changi
         local: SocketAddr,
         server: &ServerConfig,
         client: &Client,
-        known: &dyn Known,
     ) -> Step {
-        match self.0.respond(req, local, server, client, known) {
+        match self.0.respond(req, local, server, client) {
             Step::Reply(mut response) => {
                 (self.1)(req, &mut response.message);
                 Step::Reply(response)

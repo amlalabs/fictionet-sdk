@@ -1,18 +1,19 @@
-//! DNS exchanges kept in WARC archives beside captured pages, and played
-//! back as a [`Source`].
+//! DNS lookups kept in WARC archives beside captured pages, and played
+//! back as an [`Upstream`].
 //!
-//! [`Capture`] records what another source, such as the host's live
-//! source, answers, and writes each exchange as two WARC records: a
-//! `request` holding the query and a `response` holding the reply, both as
-//! `application/dns-message` (RFC 8484 §6), with the server and the
-//! question in a `dns:` target URI (RFC 4501), for example
-//! `dns://192.5.6.30/example.com.?type=NS`. [`Replay`] reads those records
-//! back and answers the same questions to the same servers, so a world
-//! resolves names as it did when the pages were captured.
+//! [`Capture`] records what another upstream, such as the host's live
+//! one, gives for each lookup, and writes it as two WARC records: a
+//! `request` holding the query the lookup stands for and a `response`
+//! holding the server's response, both as `application/dns-message`
+//! (RFC 8484 §6), with the server and the question in a `dns:` target URI
+//! (RFC 4501), for example `dns://192.5.6.30/example.com.?type=NS`.
+//! [`Replay`] reads those records back and gives the same responses to
+//! the same lookups, so a world resolves names as it did when the pages
+//! were captured.
 //!
-//! A question the capture does not hold gets no reply: the simulated
-//! server stays silent, and a resolver caches a failure for the name, not
-//! a negative answer.
+//! A lookup the capture does not hold gets no reply: the world's server
+//! that needed it stays silent, and a resolver caches a failure for the
+//! name, not a negative answer.
 
 use std::collections::{HashMap, HashSet};
 use std::future::{Future, ready};
@@ -22,12 +23,12 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
 use fictionet::Cx;
-use fictionet::stdlib::protocols::dns::op::Message;
+use fictionet::stdlib::protocols::dns::op::{Edns, Message, MessageType, OpCode, Query};
 use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, Name, RData, RecordType};
-use fictionet::stdlib::protocols::dns::{Parsed, Request, label_count, read_message, restore};
-use fictionet::stdlib::services::dns::authority::{Ask, Observed};
+use fictionet::stdlib::protocols::dns::{Parsed, Request, label_count, read_message};
+use fictionet::stdlib::services::dns::{Looked, Lookup};
 use fictionet::stdlib::services::serve::Transport;
-use fictionet::stdlib::world::net::dns::{Question, Source};
+use fictionet::stdlib::world::net::dns::Upstream;
 use fictionet::sync::Mutex;
 
 use crate::warc;
@@ -38,6 +39,9 @@ const DNS_MESSAGE: &str = "application/dns-message";
 /// The port a `dns:` URI means when it names none (RFC 4501 §2).
 const DNS_PORT: u16 = 53;
 
+/// The UDP payload size the recorded query of a lookup advertises.
+const PAYLOAD: u16 = 1232;
+
 /// Whether `uri` is a `dns:` URI (RFC 4501), whose scheme name is
 /// case-insensitive (RFC 3986 §3.1).
 pub(crate) fn is_dns_uri(uri: &str) -> bool {
@@ -45,48 +49,51 @@ pub(crate) fn is_dns_uri(uri: &str) -> bool {
         .is_some_and(|scheme| scheme.eq_ignore_ascii_case("dns:"))
 }
 
-/// A source that keeps every reply another source gives, to write them to
-/// a WARC archive with [`Capture::write`].
+/// An upstream that keeps every response another upstream gives, to
+/// write them to a WARC archive with [`Capture::write`].
 ///
-/// It answers exactly as the source it wraps. Only replies are kept: a
-/// server that was unreachable or silent leaves nothing, and [`Replay`]
-/// answers such a question with silence, as it does any question the
+/// It gives exactly what the upstream it wraps gives. Only responses are
+/// kept: a server that was unreachable or silent leaves nothing, and
+/// [`Replay`] gives such a lookup no reply, as it does any lookup the
 /// capture lacks.
-pub struct Capture<S> {
-    source: S,
+pub struct Capture<U> {
+    upstream: U,
     exchanges: Mutex<Vec<Exchange>>,
 }
 
-/// One question and the reply it got.
+/// One lookup and the response it got.
 struct Exchange {
-    ask: Ask,
-    reply: Vec<u8>,
+    lookup: Lookup,
+    response: Message,
     at: time::OffsetDateTime,
 }
 
-impl<S: Source> Capture<S> {
-    /// `source`, with its replies kept.
-    pub fn new(source: S) -> Capture<S> {
+impl<U: Upstream> Capture<U> {
+    /// `upstream`, with its responses kept.
+    pub fn new(upstream: U) -> Capture<U> {
         Capture {
-            source,
+            upstream,
             exchanges: Mutex::new(Vec::new()),
         }
     }
 
-    /// Appends the replies kept since the last write to the archive at
+    /// Appends the responses kept since the last write to the archive at
     /// `path`, and forgets them. Each becomes a `request` record with the
-    /// query as it was sent, then a `response` record with the reply as it
-    /// arrived, which names the request in `WARC-Concurrent-To`. A query
-    /// that does not parse as a question names nothing [`Replay`] could
-    /// match, so its exchange is left out.
+    /// query the lookup stands for (its question and RD bit, with DO set,
+    /// as every lookup asks), then a `response` record with the response,
+    /// which names the request in `WARC-Concurrent-To`. A lookup whose
+    /// query or response does not write is left out.
     pub fn write(&self, path: &Path) -> io::Result<()> {
         let exchanges = std::mem::take(&mut *self.exchanges.lock());
         for exchange in exchanges {
-            let Some(target) = target_uri(&exchange.ask) else {
+            let (Ok(query), Ok(response)) =
+                (query(&exchange.lookup).to_vec(), exchange.response.to_vec())
+            else {
                 continue;
             };
+            let target = target_uri(&exchange.lookup);
             let date = warc::date(exchange.at);
-            let address = exchange.ask.server.ip().to_string();
+            let address = exchange.lookup.server.ip().to_string();
             let request = warc::append_record(
                 path,
                 &[
@@ -96,7 +103,7 @@ impl<S: Source> Capture<S> {
                     ("WARC-IP-Address", &address),
                     ("Content-Type", DNS_MESSAGE),
                 ],
-                &exchange.ask.query,
+                &query,
             )?;
             warc::append_record(
                 path,
@@ -108,48 +115,57 @@ impl<S: Source> Capture<S> {
                     ("WARC-Concurrent-To", &request.id),
                     ("Content-Type", DNS_MESSAGE),
                 ],
-                &exchange.reply,
+                &response,
             )?;
         }
         Ok(())
     }
 }
 
-impl<S: Source> Source for Capture<S> {
-    fn ask<'a>(
+impl<U: Upstream> Upstream for Capture<U> {
+    fn lookup<'a>(
         &'a self,
         fcx: &'a Cx,
-        ask: Ask,
-    ) -> Pin<Box<dyn Future<Output = Observed> + Send + 'a>> {
+        lookup: Lookup,
+    ) -> Pin<Box<dyn Future<Output = Looked> + Send + 'a>> {
         Box::pin(async move {
-            let observed = self.source.ask(fcx, ask.clone()).await;
-            if let Observed::Reply(reply) = &observed {
+            let looked = self.upstream.lookup(fcx, lookup.clone()).await;
+            if let Looked::Response(response) = &looked {
                 self.exchanges.lock().push(Exchange {
-                    ask,
-                    reply: reply.clone(),
+                    lookup,
+                    response: response.clone(),
                     at: time::OffsetDateTime::now_utc(),
                 });
             }
-            observed
+            looked
         })
     }
 }
 
-/// The `dns:` URI of `ask` (RFC 4501 §2): the server as the authority,
+/// The query `lookup` stands for, with ID 0: its question and RD bit, and
+/// an OPT record with DO set.
+fn query(lookup: &Lookup) -> Message {
+    let mut message = Message::new(0, MessageType::Query, OpCode::Query);
+    message.metadata.recursion_desired = lookup.recursion_desired;
+    message.add_query(lookup.question.clone());
+    let mut edns = Edns::new();
+    edns.set_max_payload(PAYLOAD).set_dnssec_ok(true);
+    message.set_edns(edns);
+    message
+}
+
+/// The `dns:` URI of `lookup` (RFC 4501 §2): the server as the authority,
 /// the question's name, and its type, with its class when that is not IN.
-fn target_uri(ask: &Ask) -> Option<String> {
-    let Parsed::Request(request) = Request::parse(&ask.query, ask.transport) else {
-        return None;
-    };
-    let server = if ask.server.port() == DNS_PORT {
-        match ask.server.ip() {
+fn target_uri(lookup: &Lookup) -> String {
+    let server = if lookup.server.port() == DNS_PORT {
+        match lookup.server.ip() {
             IpAddr::V4(ip) => ip.to_string(),
             IpAddr::V6(ip) => format!("[{ip}]"),
         }
     } else {
-        ask.server.to_string()
+        lookup.server.to_string()
     };
-    let question = &request.question;
+    let question = &lookup.question;
     let mut uri = format!(
         "dns://{server}/{}?type={}",
         uri_name(question.name()),
@@ -159,7 +175,7 @@ fn target_uri(ask: &Ask) -> Option<String> {
         uri.push_str(";class=");
         uri.push_str(&question.query_class().to_string());
     }
-    Some(uri)
+    uri
 }
 
 /// `name` as the `dnsname` of a `dns:` URI (RFC 4501 §2): labels joined
@@ -217,47 +233,63 @@ const CAPTURE_PREFIX: &str = "zz-dns-";
 /// How the name of a DNS capture's archive ends.
 const CAPTURE_SUFFIX: &str = ".warc.gz";
 
-/// A source that answers from DNS exchanges recorded by [`Capture`].
+/// What makes two lookups one question for [`Replay`]: the name, in
+/// lowercase, the type, and the class.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct Question {
+    name: LowerName,
+    qtype: RecordType,
+    qclass: DNSClass,
+}
+
+impl Question {
+    fn of(query: &Query) -> Question {
+        Question {
+            name: LowerName::new(query.name()),
+            qtype: query.query_type(),
+            qclass: query.query_class(),
+        }
+    }
+}
+
+/// An upstream that gives the responses [`Capture`] recorded.
 ///
-/// A question gets the reply recorded for the same question (its name,
-/// ignoring case, its type and class, and whether it carried EDNS and the
-/// DO bit) sent to the same server, with the asker's ID and question case
-/// put back ([`restore`]) and its RD and CD bits copied in, as the
-/// authority would have copied them (RFC 1035 §4.1.1, RFC 4035 §3.1.6).
-/// Every other byte is the recorded server's. A question without DO, as
-/// `dig` asks by default, that the capture holds only with DO gets the
-/// recorded reply without its DNSSEC records, and without its OPT record
-/// when the query had none, as the server would have sent it.
+/// A lookup gets the response recorded for the same question (its name,
+/// ignoring case, its type, and its class) sent to the same server.
+/// Every lookup asks with DO, so only exchanges whose recorded query set
+/// DO are kept: a response to a query without it lacks the DNSSEC records
+/// a lookup's response carries.
 ///
 /// The servers named in one NS RRset serve the same zone, so for a
-/// question at or below that zone a reply recorded from one of them
+/// question at or below that zone a response recorded from one of them
 /// answers for the others too: a resolver that picks another root letter
 /// than the capture did, or another of a domain's name servers, gets the
-/// recorded reply. The capture's own NS records and addresses say which
-/// servers those are.
+/// recorded response. The capture's own NS records and addresses say
+/// which servers those are.
 ///
 /// A corpus holds several captures, and a world's clock stands at the
-/// newest one, so the reply comes from the newest capture that holds one
-/// for the server or a server of its zone: an older capture's RRSIGs may
-/// have expired by that clock. Within one capture, the server's own reply
-/// comes first, then the reply of the server sharing the deepest zone.
+/// newest one, so the response comes from the newest capture that holds
+/// one for the server or a server of its zone: an older capture's RRSIGs
+/// may have expired by that clock. Within one capture, the server's own
+/// response comes first, then the response of the server sharing the
+/// deepest zone.
 ///
-/// Anything else gets [`Observed::Timeout`], as from a server that never
+/// Any other lookup gets [`Looked::NoReply`], as from a server that never
 /// replies.
 #[derive(Debug, Default)]
 pub struct Replay {
-    /// The replies to each question: the server that sent each, the
-    /// reply, and the capture it came from, counted in the order the
+    /// The responses to each question: the server that sent each, the
+    /// response, and the capture it came from, counted in the order the
     /// archives were read.
-    replies: HashMap<Question, Vec<(SocketAddr, Vec<u8>, usize)>>,
+    replies: HashMap<Question, Vec<(SocketAddr, Message, usize)>>,
     /// The zones each server address serves, by the capture's NS records.
     zones: HashMap<IpAddr, Vec<LowerName>>,
-    /// When the newest recorded reply was captured.
+    /// When the newest recorded response was captured.
     newest: Option<time::OffsetDateTime>,
 }
 
 impl Replay {
-    /// The DNS exchanges in the archives `files`, in order: a later reply
+    /// The DNS lookups in the archives `files`, in order: a later response
     /// to the same question from the same server replaces an earlier one.
     /// Records that are not DNS exchanges, such as captured pages, are
     /// skipped.
@@ -305,17 +337,24 @@ impl Replay {
                 let Parsed::Request(request) = Request::parse(query, Transport::Tcp) else {
                     return Err(invalid("a recorded DNS query that does not parse"));
                 };
-                if let Ok(message) = read_message(&reply) {
-                    learn(&message, &mut ns, &mut addresses);
-                }
+                let Ok(message) = read_message(&reply) else {
+                    continue;
+                };
+                learn(&message, &mut ns, &mut addresses);
                 if let Some(text) = fields.get("warc-date") {
                     let date = warc::parse_date(text)
                         .ok_or_else(|| invalid("a DNS response whose WARC-Date is no date"))?;
                     replay.newest = replay.newest.max(Some(date));
                 }
-                let replies = replay.replies.entry(Question::of(&request)).or_default();
+                if !request.edns.is_some_and(|edns| edns.dnssec_ok) {
+                    continue;
+                }
+                let replies = replay
+                    .replies
+                    .entry(Question::of(&request.question))
+                    .or_default();
                 replies.retain(|(recorded, _, _)| *recorded != server);
-                replies.push((server, reply, capture));
+                replies.push((server, message, capture));
             }
         }
         for (zone, target) in ns {
@@ -331,8 +370,8 @@ impl Replay {
 
     /// The DNS captured into the corpus directory `root`: its
     /// [`capture_file`](Replay::capture_file) archives, oldest first, so a
-    /// later capture's reply replaces an earlier one. The pages' archives
-    /// hold no DNS and are not read.
+    /// later capture's response replaces an earlier one. The pages'
+    /// archives hold no DNS and are not read.
     pub fn directory(root: &Path) -> io::Result<Replay> {
         let mut files = Vec::new();
         for entry in std::fs::read_dir(root)? {
@@ -354,64 +393,18 @@ impl Replay {
         root.join(format!("{CAPTURE_PREFIX}{stamp}{CAPTURE_SUFFIX}"))
     }
 
-    /// When the newest recorded reply was captured, by its `WARC-Date`, or
-    /// `None` when the capture holds no reply.
+    /// When the newest recorded response was captured, by its
+    /// `WARC-Date`, or `None` when the capture holds no response.
     pub fn newest_capture(&self) -> Option<time::OffsetDateTime> {
         self.newest
     }
 
-    /// The reply for `request` sent to `server`: the recorded reply to the
-    /// same question, or for a query without DO the reply recorded for
-    /// the same question with DO, with what DO brought taken out. The
-    /// capture asks every question with DO, as the world's resolvers do,
-    /// and a real server answers a query without it with the same records
-    /// less the DNSSEC ones (RFC 4035 §3.2.1), a referral's DS RRset among
-    /// them (RFC 4035 §3.1.4.1), and, for a query with no OPT record, no
-    /// OPT record either (RFC 6891 §7).
-    fn reply_to(&self, server: SocketAddr, request: &Request) -> Option<Vec<u8>> {
-        let question = Question::of(request);
-        if let Some(reply) = self.reply(server, &question) {
-            return Some(reply.to_vec());
-        }
-        if question.dnssec_ok {
-            return None;
-        }
-        let signed = Question {
-            edns: true,
-            dnssec_ok: true,
-            ..question
-        };
-        let mut message = read_message(self.reply(server, &signed)?).ok()?;
-        let asked = request.question.query_type();
-        // A referral carries the child's DS RRset only for DO
-        // (RFC 4035 §3.1.4.1).
-        let keep = |record: &fictionet::stdlib::protocols::dns::rr::Record| {
-            let rtype = record.record_type();
-            rtype == asked
-                || !matches!(
-                    rtype,
-                    RecordType::RRSIG | RecordType::NSEC | RecordType::NSEC3 | RecordType::DS
-                )
-        };
-        message.answers.retain(keep);
-        message.authorities.retain(keep);
-        message.additionals.retain(keep);
-        match (&request.edns, &mut message.edns) {
-            (None, edns) => *edns = None,
-            (Some(_), Some(edns)) => {
-                edns.set_dnssec_ok(false);
-            }
-            (Some(_), None) => {}
-        }
-        message.to_vec().ok()
-    }
-
-    /// The recorded reply to `question` sent to `server`, from the newest
-    /// capture that holds one from that server or from a server sharing a
-    /// zone with it that holds the question's name: in that capture, the
-    /// server's own, or else the one from the server sharing the deepest
-    /// such zone.
-    fn reply(&self, server: SocketAddr, question: &Question) -> Option<&[u8]> {
+    /// The recorded response to `question` sent to `server`, from the
+    /// newest capture that holds one from that server or from a server
+    /// sharing a zone with it that holds the question's name: in that
+    /// capture, the server's own, or else the one from the server sharing
+    /// the deepest such zone.
+    fn reply(&self, server: SocketAddr, question: &Question) -> Option<&Message> {
         let name = &question.name;
         let serving = |address: IpAddr| {
             self.zones
@@ -420,7 +413,8 @@ impl Replay {
                 .flatten()
                 .filter(|zone| zone.zone_of(name))
         };
-        // Within a capture the server's own reply ranks above any other.
+        // Within a capture the server's own response ranks above any
+        // other.
         let rank = |from: &SocketAddr| {
             if *from == server {
                 return Some(usize::MAX);
@@ -438,7 +432,7 @@ impl Replay {
             .iter()
             .filter_map(|(from, reply, capture)| Some(((*capture, rank(from)?), reply)))
             .max_by_key(|(key, _)| *key)
-            .map(|(_, reply)| reply.as_slice())
+            .map(|(_, reply)| reply)
     }
 }
 
@@ -473,27 +467,16 @@ fn note(addresses: &mut HashMap<LowerName, Vec<IpAddr>>, owner: LowerName, addre
     }
 }
 
-impl Source for Replay {
-    fn ask<'a>(
+impl Upstream for Replay {
+    fn lookup<'a>(
         &'a self,
         _fcx: &'a Cx,
-        ask: Ask,
-    ) -> Pin<Box<dyn Future<Output = Observed> + Send + 'a>> {
-        let Parsed::Request(request) = Request::parse(&ask.query, ask.transport) else {
-            return Box::pin(ready(Observed::Timeout));
-        };
-        let observed = self
-            .reply_to(ask.server, &request)
-            .and_then(|reply| restore(&reply, &request).ok())
-            .map_or(Observed::Timeout, |mut bytes| {
-                // RD is the low bit of the third header octet, CD bit 4 of
-                // the fourth (RFC 1035 §4.1.1, RFC 4035 §3.1.6). `restore`
-                // accepts only replies with a whole header.
-                bytes[2] = (bytes[2] & !0x01) | u8::from(request.rd);
-                bytes[3] = (bytes[3] & !0x10) | (u8::from(request.cd) << 4);
-                Observed::Reply(bytes)
-            });
-        Box::pin(ready(observed))
+        lookup: Lookup,
+    ) -> Pin<Box<dyn Future<Output = Looked> + Send + 'a>> {
+        let looked = self
+            .reply(lookup.server, &Question::of(&lookup.question))
+            .map_or(Looked::NoReply, |reply| Looked::Response(reply.clone()));
+        Box::pin(ready(looked))
     }
 }
 
@@ -505,10 +488,8 @@ mod tests {
     use fictionet::stdlib::protocols::dns::dnssec::{
         self, Algorithm, DigestType, KeyFlags, Sign, ZoneKey,
     };
-    use fictionet::stdlib::protocols::dns::op::{Edns, MessageType, OpCode, Query};
     use fictionet::stdlib::protocols::dns::rr::Record;
     use fictionet::stdlib::protocols::dns::rr::rdata::{A, NS};
-    use fictionet::stdlib::services::serve::Transport;
     use std::net::Ipv4Addr;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -521,46 +502,39 @@ mod tests {
         Name::from_ascii(text).unwrap()
     }
 
-    /// A query for `qname` and `kind` with `id`, RD clear, and EDNS with
-    /// DO set when `dnssec`.
-    fn query(id: u16, qname: &str, kind: RecordType, dnssec: Option<bool>) -> Vec<u8> {
-        let mut message = Message::new(id, MessageType::Query, OpCode::Query);
-        message.add_query(Query::query(name(qname), kind));
-        if let Some(dnssec_ok) = dnssec {
-            let mut edns = Edns::new();
-            edns.set_max_payload(1232);
-            edns.set_dnssec_ok(dnssec_ok);
-            message.set_edns(edns);
-        }
-        message.to_vec().unwrap()
-    }
-
-    fn ask(server: SocketAddr, query: Vec<u8>) -> Ask {
-        Ask {
+    /// A lookup of `qname` and `kind` at `server`.
+    fn lookup(server: SocketAddr, qname: &str, kind: RecordType) -> Lookup {
+        Lookup::new(
             server,
-            transport: Transport::Udp,
-            query,
-        }
+            LowerName::from(Name::root()),
+            &Query::query(name(qname), kind),
+        )
     }
 
-    /// A small hierarchy as a source: the root servers refer `com` to one
-    /// server, which answers `www.example.com A`. It counts the questions
-    /// it is asked.
+    /// A response to `lookup`, with its question, an OPT record with DO,
+    /// and nothing else yet.
+    fn response_to(lookup: &Lookup) -> Message {
+        let mut reply = Message::response(0, OpCode::Query);
+        reply.add_query(lookup.question.clone());
+        let mut edns = Edns::new();
+        edns.set_max_payload(1232).set_dnssec_ok(true);
+        reply.set_edns(edns);
+        reply
+    }
+
+    /// A small hierarchy as an upstream: the root servers refer `com` to
+    /// one server, which answers `www.example.com A`. It counts the
+    /// lookups it is given.
     #[derive(Default)]
     struct Hierarchy {
         asked: AtomicUsize,
     }
 
     impl Hierarchy {
-        fn answer(&self, ask: &Ask) -> Observed {
-            let Parsed::Request(request) = Request::parse(&ask.query, ask.transport) else {
-                return Observed::Timeout;
-            };
-            let mut reply = Message::response(request.message.metadata.id, OpCode::Query);
-            reply.metadata.recursion_desired = request.rd;
-            reply.add_query(request.question.clone());
-            let qname = request.question.name().clone();
-            if ask.server == A_ROOT || ask.server == B_ROOT {
+        fn answer(&self, lookup: &Lookup) -> Looked {
+            let mut reply = response_to(lookup);
+            let qname = lookup.question.name().clone();
+            if lookup.server == A_ROOT || lookup.server == B_ROOT {
                 if qname.is_root() {
                     reply.metadata.authoritative = true;
                     for (letter, address) in [("a", A_ROOT), ("b", B_ROOT)] {
@@ -588,7 +562,7 @@ mod tests {
                         RData::A(A::new(192, 5, 6, 30)),
                     ));
                 }
-            } else if ask.server == COM {
+            } else if lookup.server == COM {
                 reply.metadata.authoritative = true;
                 reply.add_answer(Record::from_rdata(
                     qname,
@@ -596,26 +570,20 @@ mod tests {
                     RData::A(A::new(192, 0, 2, 80)),
                 ));
             } else {
-                return Observed::Unreachable;
+                return Looked::Unreachable;
             }
-            if let Some(edns) = &request.edns {
-                let mut out = Edns::new();
-                out.set_max_payload(1232);
-                out.set_dnssec_ok(edns.dnssec_ok);
-                reply.set_edns(out);
-            }
-            Observed::Reply(reply.to_vec().unwrap())
+            Looked::Response(reply)
         }
     }
 
-    impl Source for Hierarchy {
-        fn ask<'a>(
+    impl Upstream for Hierarchy {
+        fn lookup<'a>(
             &'a self,
             _fcx: &'a Cx,
-            ask: Ask,
-        ) -> Pin<Box<dyn Future<Output = Observed> + Send + 'a>> {
+            lookup: Lookup,
+        ) -> Pin<Box<dyn Future<Output = Looked> + Send + 'a>> {
             self.asked.fetch_add(1, Ordering::Relaxed);
-            Box::pin(ready(self.answer(&ask)))
+            Box::pin(ready(self.answer(&lookup)))
         }
     }
 
@@ -641,38 +609,34 @@ mod tests {
         .unwrap();
     }
 
-    /// Captures `asks` through a [`Hierarchy`] into `path`.
-    async fn capture(fcx: &Cx, path: &Path, asks: Vec<Ask>) -> Vec<Observed> {
+    /// Captures `lookups` through a [`Hierarchy`] into `path`.
+    async fn capture(fcx: &Cx, path: &Path, lookups: Vec<Lookup>) -> Vec<Looked> {
         let capture = Capture::new(Hierarchy::default());
-        let mut observed = Vec::new();
-        for ask in asks {
-            observed.push(capture.ask(fcx, ask).await);
+        let mut looked = Vec::new();
+        for lookup in lookups {
+            looked.push(capture.lookup(fcx, lookup).await);
         }
         capture.write(path).unwrap();
-        observed
+        looked
     }
 
-    fn reply(observed: Observed) -> Message {
-        match observed {
-            Observed::Reply(bytes) => Message::from_vec(&bytes).unwrap(),
-            other => panic!("expected a reply, got {other:?}"),
+    fn reply(looked: Looked) -> Message {
+        match looked {
+            Looked::Response(response) => response,
+            other => panic!("expected a response, got {other:?}"),
         }
     }
 
     #[test]
-    fn replay_answers_captured_asks_with_the_asker_id_and_times_out_on_others() {
+    fn replay_gives_captured_responses_and_no_reply_to_other_lookups() {
         let path = archive("replay");
         run(async move |fcx| {
-            let www = query(7, "www.example.com.", RecordType::A, Some(true));
-            capture(&fcx, &path, vec![ask(COM, www)]).await;
+            let www = lookup(COM, "www.example.com.", RecordType::A);
+            capture(&fcx, &path, vec![www]).await;
             let replay = Replay::open([path.clone()]).unwrap();
 
-            let mut asked = query(0x4242, "WwW.ExAmPlE.CoM.", RecordType::A, Some(true));
-            asked[2] |= 0x01; // RD
-            let answer = reply(replay.ask(&fcx, ask(COM, asked)).await);
-            assert_eq!(answer.metadata.id, 0x4242);
-            assert!(answer.metadata.recursion_desired);
-            assert_eq!(answer.queries[0].name().to_ascii(), "WwW.ExAmPlE.CoM.");
+            let asked = lookup(COM, "WwW.ExAmPlE.CoM.", RecordType::A);
+            let answer = reply(replay.lookup(&fcx, asked).await);
             assert_eq!(
                 answer.answers[0].data,
                 RData::A(A::new(192, 0, 2, 80)),
@@ -680,71 +644,34 @@ mod tests {
             );
 
             for other in [
-                ask(
-                    COM,
-                    query(1, "mail.example.com.", RecordType::A, Some(true)),
-                ),
-                ask(
-                    COM,
-                    query(1, "www.example.com.", RecordType::AAAA, Some(true)),
-                ),
-                ask(
-                    A_ROOT,
-                    query(1, "www.example.com.", RecordType::A, Some(true)),
-                ),
+                lookup(COM, "mail.example.com.", RecordType::A),
+                lookup(COM, "www.example.com.", RecordType::AAAA),
+                lookup(A_ROOT, "www.example.com.", RecordType::A),
             ] {
-                assert_eq!(replay.ask(&fcx, other).await, Observed::Timeout);
+                assert_eq!(replay.lookup(&fcx, other).await, Looked::NoReply);
             }
-
-            // The same question without DO, as `dig` asks, gets the reply
-            // the server sends without DO: DO clear in its OPT record, and
-            // no OPT record for a query that had none.
-            let plain = reply(
-                replay
-                    .ask(
-                        &fcx,
-                        ask(
-                            COM,
-                            query(2, "www.example.com.", RecordType::A, Some(false)),
-                        ),
-                    )
-                    .await,
-            );
-            assert_eq!(plain.metadata.id, 2);
-            assert_eq!(plain.answers[0].data, RData::A(A::new(192, 0, 2, 80)));
-            assert!(!plain.edns.unwrap().flags().dnssec_ok);
-            let bare = reply(
-                replay
-                    .ask(
-                        &fcx,
-                        ask(COM, query(3, "www.example.com.", RecordType::A, None)),
-                    )
-                    .await,
-            );
-            assert_eq!(bare.answers[0].data, RData::A(A::new(192, 0, 2, 80)));
-            assert!(bare.edns.is_none());
         });
     }
 
     #[test]
-    fn capture_then_replay_gives_the_same_replies() {
+    fn capture_then_replay_gives_the_same_responses() {
         let path = archive("round-trip");
         run(async move |fcx| {
-            let asks = vec![
-                ask(A_ROOT, query(1, ".", RecordType::NS, Some(true))),
-                ask(A_ROOT, query(2, "com.", RecordType::NS, Some(false))),
-                ask(COM, query(3, "www.example.com.", RecordType::A, None)),
+            let lookups = vec![
+                lookup(A_ROOT, ".", RecordType::NS),
+                lookup(A_ROOT, "com.", RecordType::NS),
+                lookup(COM, "www.example.com.", RecordType::A),
             ];
             // WARC-Date has whole seconds.
             let before = time::OffsetDateTime::now_utc()
                 .replace_nanosecond(0)
                 .unwrap();
-            let observed = capture(&fcx, &path, asks.clone()).await;
+            let looked = capture(&fcx, &path, lookups.clone()).await;
             let replay = Replay::open([path.clone()]).unwrap();
             let newest = replay.newest_capture().expect("a capture time");
             assert!(before <= newest && newest <= time::OffsetDateTime::now_utc());
-            for (ask, observed) in asks.into_iter().zip(observed) {
-                assert_eq!(replay.ask(&fcx, ask).await, observed);
+            for (lookup, looked) in lookups.into_iter().zip(looked) {
+                assert_eq!(replay.lookup(&fcx, lookup).await, looked);
             }
 
             // Pages and DNS share capture files: each reader skips the
@@ -795,13 +722,13 @@ mod tests {
     fn a_recorded_reply_answers_for_the_other_servers_of_its_zone() {
         let path = archive("siblings");
         run(async move |fcx| {
-            let source = Arc::new(Hierarchy::default());
-            let capture = Capture::new(source.clone());
-            for ask in [
-                ask(A_ROOT, query(1, ".", RecordType::NS, Some(true))),
-                ask(A_ROOT, query(2, "com.", RecordType::NS, Some(true))),
+            let upstream = Arc::new(Hierarchy::default());
+            let capture = Capture::new(upstream.clone());
+            for lookup in [
+                lookup(A_ROOT, ".", RecordType::NS),
+                lookup(A_ROOT, "com.", RecordType::NS),
             ] {
-                capture.ask(&fcx, ask).await;
+                capture.lookup(&fcx, lookup).await;
             }
             capture.write(&path).unwrap();
             let replay = Replay::open([path.clone()]).unwrap();
@@ -810,13 +737,9 @@ mod tests {
             // serves the root zone and gets A_ROOT's referral for com.
             let referral = reply(
                 replay
-                    .ask(
-                        &fcx,
-                        ask(B_ROOT, query(9, "com.", RecordType::NS, Some(true))),
-                    )
+                    .lookup(&fcx, lookup(B_ROOT, "com.", RecordType::NS))
                     .await,
             );
-            assert_eq!(referral.metadata.id, 9);
             assert_eq!(
                 referral.authorities[0].data,
                 RData::NS(NS(name("a.gtld-servers.net.")))
@@ -825,25 +748,24 @@ mod tests {
             // capture never asked it this.
             assert_eq!(
                 replay
-                    .ask(&fcx, ask(COM, query(9, "com.", RecordType::NS, Some(true))))
+                    .lookup(&fcx, lookup(COM, "com.", RecordType::NS))
                     .await,
-                Observed::Timeout
+                Looked::NoReply
             );
-            assert_eq!(source.asked.load(Ordering::Relaxed), 2);
+            assert_eq!(upstream.asked.load(Ordering::Relaxed), 2);
         });
     }
 
     #[test]
     fn target_uris_follow_rfc_4501() {
-        let uri =
-            |server, qname, kind| target_uri(&ask(server, query(1, qname, kind, None))).unwrap();
+        let uri = |server, qname, kind| target_uri(&lookup(server, qname, kind));
         assert_eq!(
             uri(A_ROOT, ".", RecordType::NS),
             "dns://198.41.0.4/.?type=NS"
         );
         assert_eq!(
-            uri(COM, "_25._tcp.Mail.example.com.", RecordType::TLSA),
-            "dns://192.5.6.30/_25._tcp.Mail.example.com.?type=TLSA"
+            uri(COM, "_25._tcp.mail.example.com.", RecordType::TLSA),
+            "dns://192.5.6.30/_25._tcp.mail.example.com.?type=TLSA"
         );
         let v6 = SocketAddr::new("2001:503:ba3e::2:30".parse().unwrap(), 5353);
         assert_eq!(
@@ -861,22 +783,17 @@ mod tests {
     const C_ROOT: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 33, 4, 12)), 53);
 
     /// Three root servers that answer every name but the root with
-    /// `address`, and with DO refer `com` with a DS RRset.
+    /// `address`, and refer `com` with a DS RRset.
     struct Roots(Ipv4Addr);
 
-    impl Source for Roots {
-        fn ask<'a>(
+    impl Upstream for Roots {
+        fn lookup<'a>(
             &'a self,
             _fcx: &'a Cx,
-            ask: Ask,
-        ) -> Pin<Box<dyn Future<Output = Observed> + Send + 'a>> {
-            let Parsed::Request(request) = Request::parse(&ask.query, ask.transport) else {
-                return Box::pin(ready(Observed::Timeout));
-            };
-            let dnssec_ok = request.edns.is_some_and(|edns| edns.dnssec_ok);
-            let mut reply = Message::response(request.message.metadata.id, OpCode::Query);
-            reply.add_query(request.question.clone());
-            let qname = request.question.name().clone();
+            lookup: Lookup,
+        ) -> Pin<Box<dyn Future<Output = Looked> + Send + 'a>> {
+            let mut reply = response_to(&lookup);
+            let qname = lookup.question.name().clone();
             if qname.is_root() {
                 reply.metadata.authoritative = true;
                 for (letter, address) in [("a", A_ROOT), ("b", B_ROOT), ("c", C_ROOT)] {
@@ -899,16 +816,14 @@ mod tests {
                     172800,
                     RData::NS(NS(server.clone())),
                 ));
-                if dnssec_ok {
-                    let entropy = fictionet::SeededEntropy::new(Seed::from_u64(3));
-                    let key = ZoneKey::generate(&entropy, Algorithm::Ed25519, KeyFlags::KSK);
-                    let ds = dnssec::ds(&com, &key.dnskey(), DigestType::Sha256);
-                    reply.add_authority(Record::from_rdata(
-                        com,
-                        86400,
-                        RData::DNSSEC(DNSSECRData::DS(ds)),
-                    ));
-                }
+                let entropy = fictionet::SeededEntropy::new(Seed::from_u64(3));
+                let key = ZoneKey::generate(&entropy, Algorithm::Ed25519, KeyFlags::KSK);
+                let ds = dnssec::ds(&com, &key.dnskey(), DigestType::Sha256);
+                reply.add_authority(Record::from_rdata(
+                    com,
+                    86400,
+                    RData::DNSSEC(DNSSECRData::DS(ds)),
+                ));
                 reply.add_additional(Record::from_rdata(
                     server,
                     172800,
@@ -918,21 +833,15 @@ mod tests {
                 reply.metadata.authoritative = true;
                 reply.add_answer(Record::from_rdata(qname, 300, RData::A(A(self.0))));
             }
-            if let Some(edns) = &request.edns {
-                let mut out = Edns::new();
-                out.set_max_payload(1232);
-                out.set_dnssec_ok(edns.dnssec_ok);
-                reply.set_edns(out);
-            }
-            Box::pin(ready(Observed::Reply(reply.to_vec().unwrap())))
+            Box::pin(ready(Looked::Response(reply)))
         }
     }
 
-    /// Captures `asks` through `Roots(address)` into `path`.
-    async fn capture_roots(fcx: &Cx, path: &Path, address: Ipv4Addr, asks: Vec<Ask>) {
+    /// Captures `lookups` through `Roots(address)` into `path`.
+    async fn capture_roots(fcx: &Cx, path: &Path, address: Ipv4Addr, lookups: Vec<Lookup>) {
         let capture = Capture::new(Roots(address));
-        for ask in asks {
-            capture.ask(fcx, ask).await;
+        for lookup in lookups {
+            capture.lookup(fcx, lookup).await;
         }
         capture.write(path).unwrap();
     }
@@ -943,21 +852,21 @@ mod tests {
         let new = archive("newer");
         let (older, newer) = (old.clone(), new.clone());
         run(async move |fcx| {
-            let asks = |server| {
+            let lookups = |server| {
                 vec![
-                    ask(server, query(1, ".", RecordType::NS, Some(true))),
-                    ask(server, query(2, "probe.test.", RecordType::A, Some(true))),
+                    lookup(server, ".", RecordType::NS),
+                    lookup(server, "probe.test.", RecordType::A),
                 ]
             };
-            capture_roots(&fcx, &older, Ipv4Addr::new(192, 0, 2, 1), asks(B_ROOT)).await;
-            capture_roots(&fcx, &newer, Ipv4Addr::new(192, 0, 2, 2), asks(A_ROOT)).await;
+            capture_roots(&fcx, &older, Ipv4Addr::new(192, 0, 2, 1), lookups(B_ROOT)).await;
+            capture_roots(&fcx, &newer, Ipv4Addr::new(192, 0, 2, 2), lookups(A_ROOT)).await;
             let replay = Replay::open([older, newer]).unwrap();
             // b.root was asked only by the older capture, but a.root, of
             // the same zone, by the newer one, whose RRSIGs the world's
             // clock still finds valid.
             for server in [A_ROOT, B_ROOT, C_ROOT] {
-                let probe = ask(server, query(9, "probe.test.", RecordType::A, Some(true)));
-                let answer = reply(replay.ask(&fcx, probe).await);
+                let probe = lookup(server, "probe.test.", RecordType::A);
+                let answer = reply(replay.lookup(&fcx, probe).await);
                 assert_eq!(
                     answer.answers[0].data,
                     RData::A(A::new(192, 0, 2, 2)),
@@ -968,23 +877,19 @@ mod tests {
     }
 
     #[test]
-    fn a_referral_without_do_leaves_out_the_ds_rrset() {
+    fn a_referral_keeps_its_ds_rrset() {
         let path = archive("ds");
         run(async move |fcx| {
-            let referral = ask(A_ROOT, query(1, "example.com.", RecordType::A, Some(true)));
-            capture_roots(&fcx, &path, Ipv4Addr::new(192, 0, 2, 1), vec![referral]).await;
+            let referral = lookup(A_ROOT, "example.com.", RecordType::A);
+            capture_roots(
+                &fcx,
+                &path,
+                Ipv4Addr::new(192, 0, 2, 1),
+                vec![referral.clone()],
+            )
+            .await;
             let replay = Replay::open([path.clone()]).unwrap();
-            let plain = ask(A_ROOT, query(2, "example.com.", RecordType::A, Some(false)));
-            let referral = reply(replay.ask(&fcx, plain).await);
-            let types: Vec<RecordType> = referral
-                .authorities
-                .iter()
-                .map(Record::record_type)
-                .collect();
-            assert_eq!(types, [RecordType::NS]);
-            // Asked for with DO, it keeps it.
-            let signed = ask(A_ROOT, query(3, "example.com.", RecordType::A, Some(true)));
-            let referral = reply(replay.ask(&fcx, signed).await);
+            let referral = reply(replay.lookup(&fcx, referral).await);
             assert!(
                 referral
                     .authorities

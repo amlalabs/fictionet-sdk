@@ -5,12 +5,9 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use fictionet::stdlib::protocols::dns::op::{Edns, Header, Message, MessageType, ResponseCode};
-use fictionet::stdlib::protocols::dns::read_message;
-use fictionet::stdlib::protocols::dns::rr::rdata::opt::EdnsCode;
+use fictionet::stdlib::protocols::dns::op::{Edns, Message, MessageType, ResponseCode};
 use fictionet::stdlib::protocols::dns::rr::rdata::{NS, SOA, TXT};
 use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, Name, RData, Record, RecordType};
-use fictionet::stdlib::protocols::dns::serialize::binary::{BinDecodable, BinDecoder};
 use fictionet::stdlib::protocols::dns::{
     Ede, EdeCode, Fitted, Limit, Nsid, Request, Response, fit,
 };
@@ -26,10 +23,10 @@ use super::super::zone::AnyResponse;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServerConfig {
     /// What the server says about itself: its CHAOS answers and its NSID.
-    /// `None` when the authority behind the front speaks for the server,
-    /// as a relay of a real server passes on that server's own CHAOS
-    /// answers and NSID. Either way both come from one source, so they
-    /// describe the same instance.
+    /// `None` when the authority behind the front speaks for the server:
+    /// it answers CHAOS-class questions, and gives the NSID with its own
+    /// options. Either way both come from one source, so they describe the
+    /// same instance.
     pub identity: Option<Identity>,
     /// The largest UDP reply the server sends and advertises
     /// (RFC 6891 §6.2.5).
@@ -41,8 +38,8 @@ pub struct ServerConfig {
     /// Whether zone transfers reach the authority. Without it, AXFR and
     /// IXFR over TCP get REFUSED.
     pub transfer: bool,
-    /// How long the server waits for another server it asks before it
-    /// counts the question as unanswered.
+    /// How long the server waits for a lookup before it counts the
+    /// lookup as unanswered.
     pub ask_timeout: Duration,
     /// Whether the server offers recursion. Its replies then set RA
     /// (RFC 1035 §4.1.1) and keep the AD bit the engine behind it gave, as
@@ -222,47 +219,6 @@ impl ServerConfig {
         fit(&response, limit)
             .expect("a rejection holds only a question, an OPT record, and a TSIG record")
             .bytes
-    }
-
-    /// `bytes`, a whole reply for `req`, as they are when they fit the
-    /// client's size. A larger reply, such as one a source fetched over
-    /// TCP for a client that asked over UDP, is decoded and written again
-    /// with [`fit`], which keeps whole RRsets, the glue a referral needs,
-    /// and sets TC (RFC 2181 §9, RFC 9471 §3.1). A query that asked for
-    /// the NSID of a server with an [`identity`](ServerConfig::identity)
-    /// gets the identity's, written into the reply the same way, so the
-    /// NSID names the instance the CHAOS answers name. `None` for octets
-    /// that are not a response, and for a reply too large that does not
-    /// decode.
-    pub(super) fn verbatim(&self, req: &Request, bytes: Vec<u8>) -> Option<Vec<u8>> {
-        let header = Header::read(&mut BinDecoder::new(&bytes)).ok()?;
-        if header.metadata.message_type != MessageType::Response {
-            return None;
-        }
-        let limit = Limit::for_request(req, self.payload);
-        let nsid = self
-            .identity
-            .as_ref()
-            .and_then(|identity| identity.nsid.as_ref())
-            .filter(|_| req.edns.is_some_and(|edns| edns.nsid));
-        if bytes.len() <= limit.octets() && nsid.is_none() {
-            return Some(bytes);
-        }
-        let mut message = match read_message(&bytes) {
-            Ok(message) => message,
-            Err(_) if bytes.len() <= limit.octets() => return Some(bytes),
-            Err(_) => return None,
-        };
-        if let (Some(nsid), Some(edns)) = (nsid, &mut message.edns) {
-            edns.options_mut().remove(EdnsCode::NSID);
-            edns.options_mut().insert(Nsid(nsid.clone()).to_option());
-        }
-        let required_additional = glue_first(&mut message);
-        let response = Response {
-            message,
-            required_additional,
-        };
-        fit(&response, limit).ok().map(|fitted| fitted.bytes)
     }
 }
 

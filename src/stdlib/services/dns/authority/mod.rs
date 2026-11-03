@@ -2,18 +2,18 @@
 //! engine that runs one.
 //!
 //! An [`Authority`] is world code that decides a server's reply to one
-//! request. It may need to see what another server answers first, such
-//! as a relay that passes on a real server's reply: it returns
-//! [`Step::Need`] with the question, and the [`AuthorityEngine`] carries
-//! it, records what came back, and asks again with that observation
-//! [known](Known). The engine puts every reply through the server front
-//! of [`ServerConfig`], which gives it the header and EDNS details real
-//! servers send.
+//! request. A server whose zone is [learned](super::zone::Learned) may
+//! need a fact it does not hold yet: it returns [`Step::Need`] with a
+//! [`Lookup`] of one real server of the zone, and the [`AuthorityEngine`]
+//! has its driver put the lookup to the upstream, [files](Authority::file)
+//! what came back, and asks the authority again. The engine puts every
+//! reply through the server front of [`ServerConfig`], which gives it the
+//! header and EDNS details real servers send. Every reply is built from
+//! records; no message from a real server is passed on.
 //!
 //! | Authority | What it answers |
 //! | --- | --- |
-//! | [`Zones`] | From zone data, with the answer of RFC 1034 §4.3.2. |
-//! | [`Relay`] | What the real server at its own address answers. |
+//! | [`Zones`] | From zone data, with the answer of RFC 1034 §4.3.2, looking up what a learned zone lacks. |
 //! | [`Overlay`] | What its base answers, except for invented zones below it. |
 //! | [`Observe`] | What the authority it wraps answers, shown to a callback first. |
 //!
@@ -26,64 +26,32 @@ use std::sync::Arc;
 use fictionet::stdlib::protocols::dns::op::ResponseCode;
 use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, RecordType};
 use fictionet::stdlib::protocols::dns::{EdeCode, Request, Response, label_count};
-use fictionet::stdlib::services::serve::Transport;
 
-use super::exchange::Client;
+use super::exchange::{Client, Generation};
+use super::lookup::{Looked, Lookup};
 use super::zone::{Answered, ZoneData, answer};
 
 mod engine;
 mod observe;
 mod overlay;
-mod relay;
 mod server;
 
 pub use engine::AuthorityEngine;
 pub use observe::Observe;
 pub use overlay::Overlay;
-pub use relay::Relay;
 pub use server::{ChaosAnswer, ChaosReply, Identity, ServerConfig, bare_reply, chaos};
 
-/// A question, as bytes, that a server sends to another server.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct Ask {
-    /// The server asked.
-    pub server: SocketAddr,
-    /// How it is asked.
-    pub transport: Transport,
-    /// One DNS query.
-    pub query: Vec<u8>,
-}
-
-/// What a client of that server saw.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum Observed {
-    /// The server's reply, as it arrived.
-    Reply(Vec<u8>),
-    /// The server could not be reached, or refused the connection.
-    Unreachable,
-    /// No reply came in time.
-    Timeout,
-}
-
-/// The observations made so far for one request.
-pub trait Known {
-    /// What `ask` gave, if it was asked.
-    fn get(&self, ask: &Ask) -> Option<&Observed>;
-}
-
-/// What an authority does with one request, given what it knows so far.
+/// What an authority does with one request, given what its zones hold
+/// now.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Step {
     /// Reply with this, after the server front gives it the header and
     /// EDNS details of [`ServerConfig`] and it is fitted to the client's
     /// size.
     Reply(Response),
-    /// Reply with these octets exactly as they are, such as a real
-    /// server's reply that a relay passes on. Only a reply larger than the
-    /// client can take is written again, truncated as RFC 2181 §9 says.
-    Verbatim(Vec<u8>),
-    /// Ask another server first, then ask the authority again.
-    Need(Ask),
+    /// Look this up first, file what it gives, then ask the authority
+    /// again.
+    Need(Lookup),
     /// Send nothing, as a server that never replies.
     Silent,
 }
@@ -91,10 +59,10 @@ pub enum Step {
 /// What the server at `local` answers. World code: trusted, called
 /// synchronously by the engine, so it must return quickly.
 ///
-/// `respond` is a function of its arguments. Within one request the
-/// observations only grow, and an authority never asks for something it
-/// already knows, so each request ends within as many steps as it has
-/// distinct asks.
+/// `respond` depends on its arguments and on what the authority's zones
+/// hold. Filing only adds facts, so a request that needs a lookup it
+/// already made gets no reply from the engine, and each request ends
+/// within as many steps as it has distinct lookups.
 pub trait Authority: Send + Sync + 'static {
     /// The step for `req`, which `client` sent to the server at `local`,
     /// whose front is `server`.
@@ -104,8 +72,20 @@ pub trait Authority: Send + Sync + 'static {
         local: SocketAddr,
         server: &ServerConfig,
         client: &Client,
-        known: &dyn Known,
     ) -> Step;
+
+    /// Files what `lookup`, made in session `generation`, gave into the
+    /// zone it names. An authority without learned zones files nothing.
+    fn file(&self, lookup: &Lookup, looked: &Looked, generation: Generation) {
+        let _ = (lookup, looked, generation);
+    }
+
+    /// Starts session `generation`, if it is newer than the one the
+    /// authority's learned zones hold: what they learned before is
+    /// dropped.
+    fn advance(&self, generation: Generation) {
+        let _ = generation;
+    }
 }
 
 impl<A: Authority + ?Sized> Authority for Arc<A> {
@@ -115,9 +95,16 @@ impl<A: Authority + ?Sized> Authority for Arc<A> {
         local: SocketAddr,
         server: &ServerConfig,
         client: &Client,
-        known: &dyn Known,
     ) -> Step {
-        (**self).respond(req, local, server, client, known)
+        (**self).respond(req, local, server, client)
+    }
+
+    fn file(&self, lookup: &Lookup, looked: &Looked, generation: Generation) {
+        (**self).file(lookup, looked, generation);
+    }
+
+    fn advance(&self, generation: Generation) {
+        (**self).advance(generation);
     }
 }
 
@@ -127,14 +114,15 @@ impl<A: Authority + ?Sized> Authority for Arc<A> {
 /// a DS question at a zone's apex goes to the zone above it when that zone
 /// is hosted too and holds the cut, since the parent holds DS (RFC 4035
 /// §3.1.4.1). When that zone refers the question to a zone between them,
-/// the zone at the apex answers NODATA. A view
-/// that does not know a fact the reply needs gives SERVFAIL, never a
-/// negative. A QNAME no hosted zone contains gets REFUSED, with Extended
-/// DNS Error 20, Not Authoritative, when the front sends them (RFC 8914
-/// §4.21). Zone transfers are refused: zone data makes views for
-/// questions, not listings of a whole zone. Zones hold class IN only:
-/// QCLASS * gets FORMERR, as from BIND, and any other class REFUSED.
-/// Zones never ask another server.
+/// the zone at the apex answers NODATA. A view that does not know a fact
+/// the reply needs never gives a negative: a [learned](super::zone::Learned)
+/// zone looks the question up at the server's own address
+/// ([`Step::Need`]), and any other zone gives SERVFAIL. A QNAME no hosted
+/// zone contains gets REFUSED, with Extended DNS Error 20, Not
+/// Authoritative, when the front sends them (RFC 8914 §4.21). Zone
+/// transfers are refused: zone data makes views for questions, not
+/// listings of a whole zone. Zones hold class IN only: QCLASS * gets
+/// FORMERR, as from BIND, and any other class REFUSED.
 pub struct Zones {
     zones: Vec<Arc<dyn ZoneData>>,
 }
@@ -158,11 +146,21 @@ impl Zones {
     }
 }
 
-/// `zone`'s answer to `req`, from the server front `server`.
-fn answer_from(zone: &dyn ZoneData, req: &Request, server: &ServerConfig) -> Response {
+/// `zone`'s step for `req` at the server at `local`, whose front is
+/// `server`: its answer, a lookup of what a learned zone lacks, or
+/// SERVFAIL when another zone lacks a fact.
+fn answer_from(
+    zone: &dyn ZoneData,
+    req: &Request,
+    local: SocketAddr,
+    server: &ServerConfig,
+) -> Step {
     match answer(&*zone.view(&req.question), req, server.any) {
-        Answered::Response(response) => response,
-        Answered::Unknown { .. } => bare_reply(req, ResponseCode::ServFail, None),
+        Answered::Response(response) => Step::Reply(response),
+        Answered::Unknown { .. } if zone.learned().is_some() => {
+            Step::Need(Lookup::new(local, zone.apex().clone(), &req.question))
+        }
+        Answered::Unknown { .. } => Step::Reply(bare_reply(req, ResponseCode::ServFail, None)),
     }
 }
 
@@ -177,10 +175,9 @@ impl Authority for Zones {
     fn respond(
         &self,
         req: &Request,
-        _local: SocketAddr,
+        local: SocketAddr,
         server: &ServerConfig,
         _client: &Client,
-        _known: &dyn Known,
     ) -> Step {
         let qname = LowerName::new(req.question.name());
         let qtype = req.question.query_type();
@@ -210,11 +207,30 @@ impl Authority for Zones {
             // A zone above that refers the question on is not the parent,
             // so the zone itself answers NODATA from its apex (RFC 4035
             // §3.1.4.1), as BIND does.
-            let response = answer_from(above, req, server);
-            if !is_referral(&response) {
-                return Step::Reply(response);
+            match answer_from(above, req, local, server) {
+                Step::Reply(response) if is_referral(&response) => {}
+                step => return step,
             }
         }
-        Step::Reply(answer_from(zone, req, server))
+        answer_from(zone, req, local, server)
+    }
+
+    fn file(&self, lookup: &Lookup, looked: &Looked, generation: Generation) {
+        let Looked::Response(response) = looked else {
+            return;
+        };
+        for zone in &self.zones {
+            if let Some(learned) = zone.learned()
+                && *zone.apex() == lookup.zone
+            {
+                learned.file(generation, &lookup.question, response);
+            }
+        }
+    }
+
+    fn advance(&self, generation: Generation) {
+        for learned in self.zones.iter().filter_map(|zone| zone.learned()) {
+            learned.advance(generation);
+        }
     }
 }
