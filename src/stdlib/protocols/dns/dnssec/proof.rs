@@ -163,6 +163,78 @@ pub fn delegation_proof(name: &Name, zone: &Name, records: &[RecordSet]) -> Vec<
         .collect()
 }
 
+/// A negative claim a reply's denial records are sent for.
+#[derive(Clone, Copy, Debug)]
+pub enum Claim<'a> {
+    /// The name does not exist, and no wildcard matched it
+    /// (RFC 4035 §3.1.3.2, RFC 5155 §7.2.2).
+    Nxdomain(&'a Name),
+    /// The name has no records of the type: at the name, as an empty
+    /// non-terminal, or through a wildcard that has none
+    /// (RFC 4035 §3.1.3.1 and §3.1.3.4, RFC 5155 §7.2.3 to §7.2.5). At a
+    /// delegation with [`RecordType::DS`], that the child is unsigned
+    /// (RFC 4035 §3.1.4.1, RFC 5155 §7.2.4).
+    Nodata(&'a Name, RecordType),
+    /// The name does not exist, so the wildcard at `closest_encloser`
+    /// answered for it (RFC 4035 §3.1.3.3, RFC 5155 §7.2.6).
+    Wildcard {
+        /// The name the wildcard answered for.
+        name: &'a Name,
+        /// The deepest existing ancestor of the name.
+        closest_encloser: &'a Name,
+    },
+}
+
+/// The RRsets among `records`, the NSEC or NSEC3 RRsets one reply from
+/// `zone` carried, that make up the proof of `claim`: the records the
+/// checks of this module read for it, which a reply carries for that
+/// claim alone. `None` when the records hold no such proof. A reply that
+/// proves several claims, such as a wildcard answer whose CNAME ends in
+/// NODATA, sends the records of every one of them together.
+pub fn proof_of(claim: Claim<'_>, zone: &Name, records: &[RecordSet]) -> Option<Vec<RecordSet>> {
+    let denial = Denial::new(zone, records);
+    let nsec = match claim {
+        Claim::Nxdomain(name) => denial.nsec.nxdomain_owners(&fqdn(name)),
+        Claim::Nodata(name, qtype) => denial.nsec.nodata_owners(&fqdn(name), qtype),
+        Claim::Wildcard { name, .. } => denial
+            .nsec
+            .covering(&fqdn(name))
+            .map(|(owner, _)| vec![owner]),
+    };
+    if let Some(owners) = nsec {
+        return Some(nsecs_of(records, &owners));
+    }
+    let hashes = match claim {
+        Claim::Nxdomain(name) => denial.nsec3.nxdomain_proof(&fqdn(name)),
+        Claim::Nodata(name, _) => denial.nsec3.nodata_proof(&fqdn(name)),
+        Claim::Wildcard {
+            name,
+            closest_encloser,
+        } => {
+            let next_closer = fqdn(name).trim_to(label_count(closest_encloser) + 1);
+            denial
+                .nsec3
+                .covering_entry(&next_closer)
+                .map(|(hash, _)| vec![hash.clone()])
+        }
+    }?;
+    let kept: Vec<RecordSet> = records
+        .iter()
+        .filter(|set| {
+            set.record_type() == RecordType::NSEC3
+                && set.name().base_name() == *zone
+                && set
+                    .name()
+                    .iter()
+                    .next()
+                    .and_then(base32hex)
+                    .is_some_and(|hash| hashes.contains(&hash))
+        })
+        .cloned()
+        .collect();
+    Some(kept)
+}
+
 fn fqdn(name: &Name) -> Name {
     let mut name = name.clone();
     name.set_fqdn(true);
@@ -422,6 +494,52 @@ impl<'a> Nsec3s<'a> {
             }
         }
         Vec::new()
+    }
+
+    /// The owner hashes of the closest encloser proof for `name`
+    /// (RFC 5155 §7.2.1): the record matching its deepest ancestor that
+    /// has one, the closest encloser, and the one covering the next closer
+    /// name, with the closest encloser.
+    fn encloser_proof(&self, name: &Name) -> Option<(Name, Vec<Vec<u8>>)> {
+        let labels = label_count(name);
+        let apex = label_count(self.zone);
+        for count in (apex..labels).rev() {
+            let encloser = name.trim_to(count);
+            if let Some((hash, _)) = self.matching_entry(&encloser) {
+                let (cover, _) = self.covering_entry(&name.trim_to(count + 1))?;
+                return Some((encloser, vec![hash.clone(), cover.clone()]));
+            }
+        }
+        None
+    }
+
+    /// The owner hashes of the records that prove `name` does not exist
+    /// (RFC 5155 §7.2.2): the closest encloser proof and the record
+    /// covering the wildcard at the closest encloser.
+    fn nxdomain_proof(&self, name: &Name) -> Option<Vec<Vec<u8>>> {
+        if self.matching_entry(name).is_some() {
+            return None;
+        }
+        let (encloser, mut hashes) = self.encloser_proof(name)?;
+        let (cover, _) = self.covering_entry(&encloser.prepend_label("*").ok()?)?;
+        hashes.push(cover.clone());
+        Some(hashes)
+    }
+
+    /// The owner hashes of the records that prove `name` lacks a type: the
+    /// record matching it (RFC 5155 §7.2.3, §7.2.4), or else the closest
+    /// encloser proof, with the record matching the wildcard at the
+    /// closest encloser when there is one (§7.2.5) and none when an
+    /// opt-out span covers the next closer name (§7.2.4, erratum 3441).
+    fn nodata_proof(&self, name: &Name) -> Option<Vec<Vec<u8>>> {
+        if let Some((hash, _)) = self.matching_entry(name) {
+            return Some(vec![hash.clone()]);
+        }
+        let (encloser, mut hashes) = self.encloser_proof(name)?;
+        if let Some((wildcard, _)) = self.matching_entry(&encloser.prepend_label("*").ok()?) {
+            hashes.push(wildcard.clone());
+        }
+        Some(hashes)
     }
 
     /// The closest encloser proof of RFC 5155 §8.3: the deepest ancestor

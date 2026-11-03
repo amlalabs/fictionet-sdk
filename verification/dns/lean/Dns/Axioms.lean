@@ -340,11 +340,19 @@ non-terminal), and that `x.b` and `*.b` do not exist, with no denial records, as
 def filed : List Filing :=
   [.node apex apexNode, .node [LB, EX, COM] .empty, .denied [LX, LB, EX, COM] [], .denied (wild [LB, EX, COM]) []]
 
+/-- The denial records the servers of the unsigned `example.com.` send: none. -/
+def noProofs : Proofs := fun _ => []
+
 /-- A copy of `example.com.` that has filed that response. -/
 def copy : Learned := ⟨apex, zone.soa, filed, 1⟩
 
-theorem filed_true : (Looked.response filed).of zone = true := by decide +kernel
-theorem copy_copied : Copied zone copy := ⟨rfl, rfl, by decide +kernel⟩
+theorem filed_true : (Looked.response filed).of zone noProofs = true := by decide +kernel
+theorem copy_copied : Copied zone noProofs copy := ⟨rfl, rfl, by decide +kernel⟩
+
+/-- Were the zone signed, its servers would send an NSEC record for `x.b.example.com.`, and a filing without it
+would not be true of the zone. -/
+def nsecProofs : Proofs := fun n => [⟨n, 47, 300, []⟩]
+example : (Looked.response filed).of zone nsecProofs = false := by decide +kernel
 
 def nxResponse : Response := ⟨.nxdomain, true, [], [negSoa zone.soa], [], 0⟩
 
@@ -355,8 +363,8 @@ example : ∃ r, answer zone qNx .all = .response r ∧ nxResponse.Grows r :=
   learned_answer_upstream copy_copied qNx .all copy_answer
 
 #print axioms learned_nxdomain_proved
-example : ∃ n m p, Filing.denied m p ∈ copy.filings ∧ m <:+ n ∧ copy.fact n = .absent :=
-  learned_nxdomain_proved copy_answer rfl
+example : ∃ n m, copy.fact n = .absent ∧ m <:+ n ∧ copy.proof m = some (noProofs m) :=
+  learned_nxdomain_proved copy_copied copy_answer rfl
 
 /-- A copy that has filed only the apex: `www.example.com.` is unknown, so the answer is unknown, not
 NXDOMAIN. -/
@@ -386,6 +394,10 @@ example : ∃ r, answerPartial (copy.file (upstream ⟨1, apex, qNx⟩)).view qN
 /-- The server at address 1, holding only the apex, looks `x.b.example.com.` up once and answers NXDOMAIN. -/
 theorem serve_nx : (serve .all 1 upstream 2 apexCopy [] qNx).2 = .reply nxResponse := by decide +kernel
 
+#print axioms loop_bounded
+example : loop (respond .all 1) upstream 9 apexCopy [] qNx = loop (respond .all 1) upstream 2 apexCopy [] qNx :=
+  loop_bounded (respond .all 1) upstream qNx apexCopy _ (respond_needs .all 1 apex qNx) 7
+
 #print axioms serve_one_lookup
 example : (serve .all 1 upstream 7 apexCopy [] qNx).2 = .reply nxResponse := by
   rw [serve_one_lookup .all 1 upstream 5]; exact serve_nx
@@ -393,14 +405,53 @@ example : (serve .all 1 upstream 7 apexCopy [] qNx).2 = .reply nxResponse := by
 /-- With the real server unreachable, the server stays silent rather than guess. -/
 example : (serve .all 1 (fun _ => .nothing) 2 apexCopy [] qNx).2 = .silent := by decide +kernel
 
+theorem apexCopy_copied : Copied zone noProofs apexCopy := ⟨rfl, rfl, by decide +kernel⟩
+
 #print axioms serve_reply_upstream
 example : ∃ r, answer zone qNx .all = .response r ∧ nxResponse.Grows r :=
-  serve_reply_upstream (fun _ => filed_true) ⟨rfl, rfl, by decide +kernel⟩ serve_nx
+  serve_reply_upstream (fun _ => filed_true) apexCopy_copied serve_nx
 
 #print axioms serve_nxdomain_proved
-example : ∃ n m p, Filing.denied m p ∈ (serve .all 1 upstream 2 apexCopy [] qNx).1.filings ∧ m <:+ n ∧
-    (serve .all 1 upstream 2 apexCopy [] qNx).1.fact n = .absent :=
-  serve_nxdomain_proved serve_nx rfl
+example : ∃ n m, (serve .all 1 upstream 2 apexCopy [] qNx).1.fact n = .absent ∧ m <:+ n ∧
+    (serve .all 1 upstream 2 apexCopy [] qNx).1.proof m = some (noProofs m) :=
+  serve_nxdomain_proved (fun _ => filed_true) apexCopy_copied serve_nx rfl
+
+/-- A zone invented at `b.example.com.` below the copy of `example.com.`, at a server that is not one of its
+name servers. The parent's servers answer `b.example.com. DS` with AA, so the overlay refers questions below
+`b` with the authority section of that answer. -/
+def invented : Overlay where
+  own := false
+  inner := fun _ => nxResponse
+  below := fun q => [LB, EX, COM].isSuffixOf q.qname
+  ds := ⟨[LB, EX, COM], 43⟩
+  serves := fun r => r.aa
+  referral := fun _ r => ⟨.noerror, false, [], r.authority, [], 0⟩
+  unsigned := fun _ r => r
+
+theorem invented_stable : invented.Stable :=
+  ⟨fun _ _ h => h.2.1.symm, fun _ _ _ h => by simp only [invented, h.2.2.2.1], fun _ _ _ h => h⟩
+
+def qBelow : Request := ⟨[WWW, LB, EX, COM], 1⟩
+def referralToB : Response := ⟨.noerror, false, [], [negSoa zone.soa], [], 0⟩
+
+#print axioms overlay_needs
+example : Needs (overlay invented (respond .all 1)) apex qBelow [⟨1, apex, invented.ds⟩, ⟨1, apex, qBelow⟩] :=
+  overlay_needs invented .all 1 apex qBelow
+
+/-- Holding only the apex, the overlay looks `b.example.com. DS` up once and refers the question. -/
+theorem overlay_refers : (loop (overlay invented (respond .all 1)) upstream 3 apexCopy [] qBelow).2 =
+    .reply referralToB := by decide +kernel
+
+#print axioms overlay_loop_bounded
+example : (loop (overlay invented (respond .all 1)) upstream 8 apexCopy [] qBelow).2 = .reply referralToB := by
+  rw [overlay_loop_bounded invented .all 1 upstream 5]; exact overlay_refers
+
+theorem copy_refers : overlay invented (respond .all 1) copy qBelow = .reply referralToB := by decide +kernel
+
+#print axioms overlay_reply_stable
+example : ∃ r, overlay invented (respond .all 1) (copy.file (upstream ⟨1, apex, qBelow⟩)) qBelow = .reply r ∧
+    referralToB.Grows r :=
+  overlay_reply_stable copy_copied filed_true invented_stable copy_refers
 
 end Authority
 

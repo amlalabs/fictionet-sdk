@@ -6,6 +6,7 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use fictionet::stdlib::protocols::dns::dname_substitute;
+use fictionet::stdlib::protocols::dns::dnssec::proof::{Claim, proof_of};
 use fictionet::stdlib::protocols::dns::dnssec::rdata::DNSSECRData;
 use fictionet::stdlib::protocols::dns::op::{Message, Query, ResponseCode};
 use fictionet::stdlib::protocols::dns::rr::{
@@ -28,36 +29,42 @@ use super::zone::{Node, dname_target, targets, wildcard};
 /// [files](Learned::file) the response here. Every fact the data holds was
 /// filed from such a response:
 ///
-/// - An authoritative answer (AA set) gives the RRsets of its answer
-///   section that are in the zone and not below a cut it holds, each with
-///   its RRSIGs; the zone's apex NS RRset from its authority section; and
-///   the A and AAAA RRsets of its additional section, which never replace
-///   an RRset an answer section gave or stand against a filed NODATA, and
-///   which are served only as additional data, never as an answer
-///   (RFC 2181 §5.4.1): such an RRset may be glue below a cut the zone
-///   does not hold yet, or sent without its RRSIGs. A DNAME is kept,
-///   and the CNAME synthesized from it is not (RFC 6672 §3.4). An RRset
-///   of the answer section whose RRSIGs show a wildcard expansion (a
-///   Labels field below the owner's label count, RFC 4035 §5.3.4) is kept
-///   at the wildcard that made it, the name one label below the wildcard's parent toward the
-///   owner is kept as absent, and the NSEC and NSEC3 records of the
-///   authority section are kept as the proof for the expansion
-///   (RFC 4035 §3.1.3.3, RFC 5155 §7.2.6). An answer to ANY or RRSIG
-///   expanded from a wildcard is kept the same way.
+/// - An authoritative answer (AA set, NOERROR, NXDOMAIN, or YXDOMAIN)
+///   gives the RRsets of its answer section that are in the zone and not
+///   below a cut it holds, each with its RRSIGs; the zone's apex NS RRset
+///   from its authority section; and the A and AAAA RRsets of its
+///   additional section, which never replace an RRset an answer section
+///   gave or stand against a filed NODATA, and which are served only as
+///   additional data, never as an answer (RFC 2181 §5.4.1): such an RRset
+///   may be glue below a cut the zone does not hold yet, or sent without
+///   its RRSIGs. A DNAME is kept, and the CNAME synthesized from it is not
+///   (RFC 6672 §3.4); a YXDOMAIN gives the DNAME whose new name would pass
+///   255 octets (RFC 6672 §2.2). An RRset of the answer section whose
+///   RRSIGs show a wildcard expansion (a Labels field below the owner's
+///   label count, RFC 4035 §5.3.4) is kept at the wildcard that made it,
+///   the name one label below the wildcard's parent toward the owner is
+///   kept as absent, and the authority section's NSEC and NSEC3 records
+///   that prove the expansion are kept as its proof (RFC 4035 §3.1.3.3,
+///   RFC 5155 §7.2.6). An answer to ANY or RRSIG expanded from a wildcard
+///   is kept the same way.
 /// - Where the answer's CNAME and DNAME chain ends inside the zone
-///   without an RRset of the type asked, the answer is negative there.
-///   With the zone's SOA in its authority section (RFC 2308 §5), NXDOMAIN
-///   keeps the name as absent, and so the names below it (RFC 8020), and
-///   the wildcard at its parent, which would have matched it; NOERROR
-///   keeps the type as absent at the name. The authority section's NSEC
-///   and NSEC3 records, with their RRSIGs, are kept as the proof, and an
-///   unsigned zone's proof is empty, as the server sent it. A negative
-///   without the SOA is not kept.
+///   without an RRset of the type asked, the answer is negative there. A
+///   DNAME moves the chain on whatever the type asked (RFC 6672 §3.2); a
+///   CNAME does unless the question asks for CNAME, ANY, or RRSIG. With
+///   the zone's SOA in its authority section (RFC 2308 §5), NXDOMAIN keeps
+///   the name as absent, and so the names below it (RFC 8020), and the
+///   wildcard at its parent, which would have matched it; NOERROR keeps
+///   the type as absent at the name. The authority section's NSEC and
+///   NSEC3 records that prove the negative, with their RRSIGs, are kept as
+///   its proof, and an unsigned zone's proof is empty, as the server sent
+///   it. When the records sent do not prove the negative, all of them are
+///   kept as its proof, as the server sent them. A negative without the
+///   SOA is not kept.
 /// - A referral (AA clear, NOERROR, an NS RRset below the apex at or
 ///   above the question's name) gives a zone cut: the NS RRset, the glue
 ///   for its targets at or below the cut (RFC 9471 §3.1), and the DS
-///   RRset, or else the NSEC and NSEC3 records sent beside it as the proof
-///   that the cut has none, which the copy's referrals carry
+///   RRset, or else the NSEC and NSEC3 records sent beside it that prove
+///   the cut has none, which the copy's referrals carry
 ///   (RFC 4035 §3.1.4).
 /// - Any other response, such as REFUSED, SERVFAIL, an answer without
 ///   AA, or a truncated response (TC set), whose sections may be
@@ -336,7 +343,10 @@ impl Facts {
             .collect();
         let metadata = &response.metadata;
         match (metadata.authoritative, metadata.response_code) {
-            (true, rcode @ (ResponseCode::NoError | ResponseCode::NXDomain)) => {
+            (
+                true,
+                rcode @ (ResponseCode::NoError | ResponseCode::NXDomain | ResponseCode::YXDomain),
+            ) => {
                 let filed = Filed {
                     apex,
                     qname: &qname,
@@ -382,6 +392,7 @@ impl Facts {
             .iter()
             .filter(|set| set.record_type() == RecordType::DNAME)
             .collect();
+        let end = chain_end(apex, filed.qname, filed.qtype, answer, &dnames);
         for set in answer {
             let owner = LowerName::new(set.name());
             let synthesized = set.record_type() == RecordType::CNAME
@@ -390,7 +401,7 @@ impl Facts {
                     dname.zone_of(&owner) && dname != owner
                 });
             if !apex.zone_of(&owner)
-                || (whole && owner == *filed.qname)
+                || (whole && end.as_ref() == Some(&owner))
                 || synthesized
                 || self.below_cut(&owner, set.record_type())
             {
@@ -413,11 +424,6 @@ impl Facts {
             }
         }
 
-        let end = if whole {
-            Some(filed.qname.clone())
-        } else {
-            chain_end(apex, filed.qname, filed.qtype, answer, &dnames)
-        };
         let Some(end) = end else {
             return;
         };
@@ -444,8 +450,10 @@ impl Facts {
             ResponseCode::NXDomain if end != *apex => {
                 self.mark_absent(&end);
                 self.mark_absent(&wildcard(&end.base_name()));
-                self.proofs
-                    .insert((end, Denied::Name), filed.denial.to_vec());
+                self.proofs.insert(
+                    (end.clone(), Denied::Name),
+                    proof(apex, Claim::Nxdomain(&Name::from(&end)), filed.denial),
+                );
             }
             ResponseCode::NoError => {
                 self.unabsent(apex, &end);
@@ -459,8 +467,14 @@ impl Facts {
                     known.sets.remove(&filed.qtype);
                     self.rebuild(&end);
                 }
-                self.proofs
-                    .insert((end, Denied::Type(filed.qtype)), filed.denial.to_vec());
+                self.proofs.insert(
+                    (end.clone(), Denied::Type(filed.qtype)),
+                    proof(
+                        apex,
+                        Claim::Nodata(&Name::from(&end), filed.qtype),
+                        filed.denial,
+                    ),
+                );
             }
             _ => {}
         }
@@ -518,8 +532,14 @@ impl Facts {
                 known.sets.insert(RecordType::DS, (Section::Authority, ds));
             }
             None => {
-                self.proofs
-                    .insert((cut.clone(), Denied::Type(RecordType::DS)), denial.to_vec());
+                self.proofs.insert(
+                    (cut.clone(), Denied::Type(RecordType::DS)),
+                    proof(
+                        apex,
+                        Claim::Nodata(&Name::from(&cut), RecordType::DS),
+                        denial,
+                    ),
+                );
             }
         }
         self.rebuild(&cut);
@@ -576,9 +596,10 @@ impl Facts {
     }
 
     /// Notes that `owner` was answered by expanding the wildcard whose
-    /// parent has `labels` labels: the next closer name is absent, and
-    /// `denial` is the proof for the expansion (RFC 4035 §3.1.3.3, RFC 5155
-    /// §7.2.6). The wildcard, or `None` when its parent is outside the zone.
+    /// parent has `labels` labels: the next closer name is absent, and the
+    /// records of `denial` that prove the expansion are its proof
+    /// (RFC 4035 §3.1.3.3, RFC 5155 §7.2.6). The wildcard, or `None` when
+    /// its parent is outside the zone.
     fn expansion(
         &mut self,
         apex: &LowerName,
@@ -587,13 +608,18 @@ impl Facts {
         denial: &[RecordSet],
     ) -> Option<LowerName> {
         let name = Name::from(owner);
-        let encloser = LowerName::new(&name.trim_to(labels));
+        let encloser_name = name.trim_to(labels);
+        let encloser = LowerName::new(&encloser_name);
         let next_closer = LowerName::new(&name.trim_to(labels + 1));
         if !apex.zone_of(&encloser) {
             return None;
         }
         let at = wildcard(&encloser);
         self.mark_absent(&next_closer);
+        let claim = Claim::Wildcard {
+            name: &name,
+            closest_encloser: &encloser_name,
+        };
         self.proofs.insert(
             (
                 owner.clone(),
@@ -601,7 +627,7 @@ impl Facts {
                     closest_encloser: encloser,
                 },
             ),
-            denial.to_vec(),
+            proof(apex, claim, denial),
         );
         Some(at)
     }
@@ -731,8 +757,13 @@ struct Filed<'a> {
 
 /// Where the CNAME and DNAME chain of `answer`, an answer to `qname` and
 /// `qtype` from the zone at `apex`, ends: the name whose RRset of `qtype`
-/// the answer has, or whose negative it is. `None` when the chain leaves
-/// the zone or loops, which leaves nothing negative to keep.
+/// the answer has, or whose negative it is. A DNAME above a name moves the
+/// chain on whatever the type asked, as the walk of the answer does
+/// (RFC 6672 §3.2), and a CNAME at a name moves it on unless the question
+/// asks for CNAME (RFC 1034 §4.3.2 step 3a), or for ANY or RRSIG, which
+/// the answer gives at the name itself. `None` when the chain leaves
+/// the zone, loops, or substitutes a name past 255 octets (YXDOMAIN,
+/// RFC 6672 §2.2), which leaves nothing negative to keep.
 fn chain_end(
     apex: &LowerName,
     qname: &LowerName,
@@ -746,32 +777,42 @@ fn chain_end(
         if !apex.zone_of(&name) {
             return None;
         }
-        let at = |rtype: RecordType| {
-            answer
-                .iter()
-                .find(|set| set.record_type() == rtype && LowerName::new(set.name()) == name)
-        };
-        if qtype == RecordType::CNAME || at(qtype).is_some() {
-            return Some(name);
-        }
-        let cname = at(RecordType::CNAME).and_then(|set| {
-            set.records_without_rrsigs()
-                .find_map(|record| match &record.data {
-                    RData::CNAME(target) => Some(target.0.clone()),
-                    _ => None,
-                })
+        let dname = dnames.iter().find(|dname| {
+            let owner = LowerName::new(dname.name());
+            owner.zone_of(&name) && owner != name
         });
-        let target = cname.or_else(|| {
-            dnames.iter().find_map(|dname| {
-                let owner = dname.name();
+        let target = match dname {
+            Some(dname) => {
                 let target = dname
                     .records_without_rrsigs()
                     .find_map(|record| dname_target(&record.data))?;
-                dname_substitute(&Name::from(&name), owner, &target)
-            })
-        });
-        let Some(target) = target else {
-            return Some(name);
+                dname_substitute(&Name::from(&name), dname.name(), &target)?
+            }
+            None => {
+                let at = |rtype: RecordType| {
+                    answer.iter().find(|set| {
+                        set.record_type() == rtype && LowerName::new(set.name()) == name
+                    })
+                };
+                let stops = matches!(
+                    qtype,
+                    RecordType::CNAME | RecordType::ANY | RecordType::RRSIG
+                );
+                if stops || at(qtype).is_some() {
+                    return Some(name);
+                }
+                let cname = at(RecordType::CNAME).and_then(|set| {
+                    set.records_without_rrsigs()
+                        .find_map(|record| match &record.data {
+                            RData::CNAME(target) => Some(target.0.clone()),
+                            _ => None,
+                        })
+                });
+                let Some(target) = cname else {
+                    return Some(name);
+                };
+                target
+            }
         };
         let target = LowerName::new(&target);
         if target == name || seen.contains(&target) {
@@ -779,6 +820,15 @@ fn chain_end(
         }
         seen.push(std::mem::replace(&mut name, target));
     }
+}
+/// The records of `denial`, the NSEC and NSEC3 RRsets of one response
+/// from the zone at `apex`, that prove `claim` (RFC 4035 §3.1.3,
+/// RFC 5155 §7.2): a reply for that claim alone carries them, as a real
+/// server's reply to a question that needs only it does. All of them when
+/// they hold no proof of it, as the server sent them; none from an
+/// unsigned zone.
+fn proof(apex: &LowerName, claim: Claim<'_>, denial: &[RecordSet]) -> Vec<RecordSet> {
+    proof_of(claim, &Name::from(apex), denial).unwrap_or_else(|| denial.to_vec())
 }
 
 /// The label count of the wildcard's parent when `set`'s RRSIGs show a

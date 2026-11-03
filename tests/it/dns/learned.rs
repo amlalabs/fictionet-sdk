@@ -124,15 +124,119 @@ fn shape(message: &Message) -> (String, bool, [Vec<String>; 3]) {
 
 /// `EXAMPLE` signed with `denial` by a fresh key.
 fn signed(denial: Denial) -> Zone {
+    signed_master(EXAMPLE, denial)
+}
+
+/// The zone of the master file `text` signed with `denial` by a fresh
+/// key.
+fn signed_master(text: &str, denial: Denial) -> Zone {
     let entropy = SeededEntropy::new(Seed::from_u64(5));
     let key = ZoneKey::generate(&entropy, Algorithm::Ed25519, KeyFlags::KSK);
     let keys = KeySet {
         keys: vec![Arc::new(key) as Arc<dyn Sign>],
     };
-    Zone::from_master(EXAMPLE, None)
+    Zone::from_master(text, None)
         .unwrap()
         .signed(&keys, TestInternet::window(), denial)
         .unwrap()
+}
+
+/// The zone of `text` unsigned, signed with NSEC, and signed with NSEC3,
+/// each with its name.
+fn three_ways(text: &str) -> [(&'static str, Zone); 3] {
+    [
+        ("unsigned", Zone::from_master(text, None).unwrap()),
+        ("NSEC", signed_master(text, Denial::Nsec)),
+        (
+            "NSEC3",
+            signed_master(
+                text,
+                Denial::Nsec3 {
+                    opt_out: false,
+                    salt: Vec::new(),
+                },
+            ),
+        ),
+    ]
+}
+
+/// A zone whose answers run through DNAMEs and a wildcard CNAME: `d`
+/// maps names onto `deep`, which holds nothing, `long` onto a target so
+/// long that a name below it cannot be rewritten, and every name under
+/// `wild` is an alias of the name server.
+fn chains() -> String {
+    let long = vec!["x".repeat(61); 4].join(".");
+    format!(
+        "\
+example. 3600 IN SOA ns.example. hostmaster.example. 1 7200 3600 1209600 300
+example. 3600 IN NS ns.example.
+ns.example. 3600 IN A 192.0.2.53
+*.wild.example. 300 IN CNAME ns.example.
+d.example. 300 IN DNAME deep.example.
+long.example. 300 IN DNAME {long}.
+"
+    )
+}
+
+/// A copy follows a DNAME as the answer does, whatever the type asked
+/// (RFC 6672 §3.2): a CNAME or ANY question below `d` is answered with
+/// the DNAME, the CNAME made from it, and the NXDOMAIN of the new name,
+/// once the response to it is filed. A name below `long`, which no
+/// rewritten name could hold, gets YXDOMAIN with the DNAME, which the
+/// copy keeps from the real server's YXDOMAIN (RFC 6672 §2.2).
+#[test]
+fn a_copy_follows_dnames_as_the_zone_does() {
+    for (how, zone) in three_ways(&chains()) {
+        for (qname, qtype) in [
+            ("h.d.example.", RecordType::CNAME),
+            ("h.d.example.", RecordType::ANY),
+            ("h.d.example.", RecordType::A),
+            ("a-label-long-enough.long.example.", RecordType::A),
+            ("a-label-long-enough.long.example.", RecordType::ANY),
+        ] {
+            let learned = Learned::new(&name("example."));
+            let asked = request(qname, qtype, true);
+            learned.file(Generation(0), &asked.question, &real(&zone, &asked));
+            for dnssec_ok in [true, false] {
+                let request = request(qname, qtype, dnssec_ok);
+                let got = copied(&learned, &request)
+                    .unwrap_or_else(|| panic!("{how} {qname} {qtype} DO {dnssec_ok}: unknown"));
+                assert_eq!(
+                    shape(&got),
+                    shape(&real(&zone, &request)),
+                    "{how} {qname} {qtype} DO {dnssec_ok}"
+                );
+            }
+        }
+    }
+}
+
+/// One response can prove two negatives: `a.wild.example. MX` is answered
+/// by the wildcard's CNAME, whose proof shows no closer name exists, and
+/// ends in the NODATA of `ns.example. MX`. The copy keeps each proof
+/// apart, so a later reply for either one alone carries its own records,
+/// as the real zone's reply does (RFC 4035 §3.1.3, RFC 5155 §7.2).
+#[test]
+fn each_negative_keeps_only_its_own_proof() {
+    for (how, zone) in three_ways(&chains()) {
+        let learned = Learned::new(&name("example."));
+        let asked = request("a.wild.example.", RecordType::MX, true);
+        learned.file(Generation(0), &asked.question, &real(&zone, &asked));
+        for (qname, qtype) in [
+            ("a.wild.example.", RecordType::MX),
+            ("a.wild.example.", RecordType::CNAME),
+            ("ns.example.", RecordType::MX),
+        ] {
+            let request = request(qname, qtype, true);
+            let got = copied(&learned, &request)
+                .unwrap_or_else(|| panic!("{how} {qname} {qtype}: unknown"));
+            assert_eq!(
+                shape(&got),
+                shape(&real(&zone, &request)),
+                "{how} {qname} {qtype}"
+            );
+        }
+    }
 }
 
 /// The questions the copy is asked: positive answers, NODATA, NXDOMAIN,

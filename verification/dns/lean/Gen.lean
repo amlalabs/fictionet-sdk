@@ -8,7 +8,9 @@
   * `respond.json`: `Wire.parse` and `Wire.respondHeader`;
   * `zone.json`: `Zone.build` and `Zone.answer`;
   * `partial.json`: `Zone.answerPartial` over a zone with some facts made unknown;
+  * `learned.json`: `Authority.serve` over a copy of a zone, questions in turn, with what the real servers answer;
   * `signed.json`: `Dnssec.SignedZone.answerDo` and `Dnssec.validateAnswer`;
+  * `learned_signed.json`: `Dnssec.SignedZone.answerDo` for questions in turn, which a copy must answer the same;
   * `policy.json`: `Dnssec.AlgorithmPolicy.treat`, over `Policy.iana` and other policies;
   * `chain.json`: `Chain.check`;
   * `cache.json`: `Cache.insert`, `Cache.advance`, and `Cache.serve`;
@@ -24,6 +26,7 @@ import Dns.Wire
 import Dns.Fit
 import Dns.Zone
 import Dns.Partial
+import Dns.Authority
 import Dns.Dnssec
 import Dns.Policy
 import Dns.Chain
@@ -803,6 +806,15 @@ def rParent (z : Zone) (keys : List KeySpec) : G (Spec × List KeySpec × Denial
     [⟨z.apex, 86400, [ns], [⟨ns, 1, 86400, [.a [192, 0, 2, 1]]⟩], ds⟩]⟩
   return (parent, ← rKeys, ← rDenial)
 
+/-- A signed answer to `q` as the vectors give it: its RCODE and AA, each section's lines with their RRSIGs,
+and the denial records. -/
+def signedAnswerFields (sz : SignedZone Sch) (q : Request) (sa : SignedAnswer Sch) : List (String × String) :=
+  [("rcode", jstr (rcodeStr sa.rcode)), ("aa", jbool sa.aa),
+    ("answer", jarr ((sa.answer.flatMap setWithSigsLines ++ sa.anyExtra.flatMap (extraLines sz q.qname)).map jstr)),
+    ("authority", jarr ((sa.authority.flatMap setWithSigsLines).map jstr)),
+    ("additional", setsJson sa.additional),
+    ("denial", jarr ((sa.denial.flatMap (signedLines sz.denialTtl)).map jstr))]
+
 def signedCase : G String := do
   let (sp, z) ← rSignedZone
   let keys ← rKeys true
@@ -843,12 +855,7 @@ def signedCase : G String := do
         { sa with authority := sa.authority.map fun (s, sigs) => (s, if s.rtype == 6 then [] else sigs) }
         else sa
       let (vs, dv) := validateAnswer (some anchors) Policy.iana t chain q sa
-      jobj ([("rcode", jstr (rcodeStr sa.rcode)), ("aa", jbool sa.aa),
-        ("answer", jarr ((sa.answer.flatMap setWithSigsLines ++ sa.anyExtra.flatMap (extraLines sz q.qname)).map
-          jstr)),
-        ("authority", jarr ((sa.authority.flatMap setWithSigsLines).map jstr)),
-        ("additional", setsJson sa.additional),
-        ("denial", jarr ((sa.denial.flatMap (signedLines sz.denialTtl)).map jstr)),
+      jobj (signedAnswerFields sz q sa ++ [
         ("dnskey", jarr ((signedLines z.soa.ttl keySet).map jstr)),
         ("validation", jobj [("answer", jarr (vs.map validationJson)),
           ("denial", (dv.map validationJson).getD "null")])] ++ parentOut)
@@ -865,6 +872,84 @@ def signedCase : G String := do
     ("expected", expected)]
 
 end Signed
+
+/-! ## Learned zones -/
+
+section LearnedVectors
+open Zone Dnssec
+
+/-- What a real server of the unsigned zone `z` gives a world's copy for `req`: the facts `z`'s answer to it
+reads, found by adding, one at a time, the name the answer over the facts so far ends unknown at, each as `z` has
+it. A name absent from `z` is a denial with no records, as an unsigned zone sends none. Every filing is true of
+`z`, so `Authority.serve_reply_upstream` covers the copy it makes. -/
+def readFilings (z : Zone) (any : AnyResponse) (req : Request) : Nat → List Name → List Authority.Filing
+  | 0, _ => []
+  | f + 1, known =>
+    let v : View := ⟨z.apex, z.soa, fun n => if known.contains n then z.look n else .unknown, 0⟩
+    match answerPartial v req any with
+    | .unknown n => if known.contains n then [] else readFilings z any req f (n :: known)
+    | .response _ => known.filterMap fun n => match z.look n with
+      | .present nd => some (.node n nd)
+      | .absent => some (.denied n [])
+      | .unknown => none
+
+/-- One to six questions for `z`, a third of them for the name of an earlier one, so that later questions find
+facts earlier lookups filed. -/
+def rRequests (z : Zone) : G (List Request) := do
+  let n ← rRange 1 6
+  let mut out : Array Request := #[]
+  for _ in [0:n] do
+    let again ← chance 3
+    let qname ← match out[← rNat out.size]? with
+      | some r => if again then pure r.qname else rQname z
+      | none => rQname z
+    out := out.push ⟨qname, ← rQtype⟩
+  return out.toList
+
+def requestJson (q : Request) : String :=
+  jobj [("qname", jstr (nameStr q.qname)), ("qtype", jstr (typeStr q.qtype))]
+
+/-- A server of a copy of `z` asked the questions in turn: for each, what `z`'s real servers answer, and the
+engine's step over the copy (`Authority.serve`, at most one lookup), the copy carried from one question to the
+next. -/
+def learnedCase : G String := do
+  let (sp, z) ← rZone
+  let any ← rAny
+  let reqs ← rRequests z
+  let up : Authority.Lookup → Authority.Looked := fun l => .response (readFilings z any l.req 64 [])
+  let mut L : Authority.Learned := ⟨z.apex, z.soa, [], 0⟩
+  let mut steps : Array String := #[]
+  for q in reqs do
+    let (L', s) := Authority.serve any 1 up 2 L [] q
+    L := L'
+    let upstream := match answer z q any with
+      | .response r => responseJson r
+      | .unknown n => jobj [("unknown", jstr (nameStr n))]
+    let expected := match s with
+      | .reply r => jobj [("reply", responseJson r)]
+      | _ => jobj [("silent", jbool true)]
+    steps := steps.push (jobj [("request", requestJson q), ("upstream", upstream), ("expected", expected)])
+  return jobj [("input", jobj [("zone", specJson sp), ("any", jstr (anyStr any))]), ("steps", jarr steps.toList)]
+
+/-- A signed zone and questions for it in turn, each with the zone's answer with DO=1, which a server of a copy
+of it must give as the real servers do: the copy keeps the records, RRSIGs, and denial records they sent. -/
+def learnedSignedCase : G String := do
+  let (sp, z) ← rSignedZone
+  let keys ← rKeys
+  let denial ← rDenial
+  let w : Window := ⟨100, 200⟩
+  let sz : SignedZone Sch := SignedZone.make z (keys.map (·.signer)) w denial
+  let reqs ← rRequests z
+  let steps := reqs.map fun q =>
+    let expected := match sz.answerDo q .all with
+      | (.response r, some sa) => jobj (signedAnswerFields sz q sa ++ [("required_additional", jnat r.required)])
+      | (.unknown n, _) => jobj [("unknown", jstr (nameStr n))]
+      | (.response _, none) => "null"
+    jobj [("request", requestJson q), ("expected", expected)]
+  return jobj [("input", jobj [("zone", specJson sp), ("keys", keysJson keys), ("window", windowJson w),
+      ("denial", denialJson denial)]), ("steps", jarr steps)]
+
+end LearnedVectors
 
 /-! ## The algorithm policy -/
 
@@ -1192,7 +1277,8 @@ def cases (n : Nat) (g : G String) : G (List String) := rList n g
 def kinds : List (String × Nat × G String) :=
   [("names", 400, namesCase), ("wire", 400, wireCase), ("fit", 300, fitCase),
     ("respond", 400, respondCase), ("zone", 400, zoneCase), ("partial", 300, partialCase),
-    ("signed", 300, signedCase), ("policy", 200, policyCase), ("chain", 200, chainCase), ("cache", 200, cacheCase),
+    ("learned", 300, learnedCase), ("signed", 300, signedCase), ("learned_signed", 200, learnedSignedCase),
+    ("policy", 200, policyCase), ("chain", 200, chainCase), ("cache", 200, cacheCase),
     ("resolver", 200, resolverCase)]
 
 def main (args : List String) : IO UInt32 := do

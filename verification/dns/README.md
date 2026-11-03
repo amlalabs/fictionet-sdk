@@ -6,7 +6,7 @@ holds the Rust code to one of them:
 | Part | What it is | Where |
 |---|---|---|
 | TLA+ | Four specs of the engines' behaviour over time (the resolver, the exchange contract, the authority engine, the validator), checked with TLC, each with ablations that must fail | [`tla/`](tla/README.md) |
-| Lean 4 | Proofs about the pure functions (names, the wire format, truncation, zones, partial views, DNSSEC, the algorithm policy, the chain check, the cache, the resolver), and an executable reference that writes test vectors | [`lean/`](lean/README.md) |
+| Lean 4 | Proofs about the pure functions (names, the wire format, truncation, zones, partial views, learned zones and the servers of copies, DNSSEC, the algorithm policy, the chain check, the cache, the resolver), and an executable reference that writes test vectors | [`lean/`](lean/README.md) |
 | The differential test | The Rust code run on every Lean vector, compared field by field | [`tests/dns_vectors.rs`](../../tests/dns_vectors.rs) |
 
 Each subdirectory's README says what is modelled, what each property or
@@ -67,6 +67,8 @@ not compare whole, with why.
 | `fit` | `protocols::dns::fit` | the size, TC, and the RRsets kept in each section |
 | `zone` | `zone::answer` over `Zone::from_master` | RCODE, AA, every section, and the required additional RRsets |
 | `partial` | `zone::answer` over a view with unknown facts | the unknown name, or the response |
+| `learned` | `AuthorityEngine` running `Zones` over a `Learned` zone that holds nothing at first, asked questions in turn, each lookup answered with the real zone's response (Lean's `answer`) | each step against Lean's `Authority.serve` over its own copy: silence, or the reply's RCODE, AA, answer and authority sections, and required additional RRsets, with any other additional RRset one the real zone sends (`serve_reply_upstream`); and that each lookup is the client's question at the server's own address, at most once per question (`serve_one_lookup`) |
+| `learned_signed` | the same engine over a copy of a zone signed as in `signed`, asked with DO=1, each lookup answered by that signed zone | each reply against Lean's `SignedZone.answerDo` for the question: RCODE, AA, every section with its RRSIGs, and the NSEC or NSEC3 records, with optional additional data as in `learned`; this is where the denial records a copy serves are checked, which the Lean copy does not model |
 | `signed` | `Zone::signed`, `answer` with DO=1, `validate_rrset`, `validate_denial` | the answer's records and RRSIGs (for ANY, the NSEC and DNSKEY RRsets at the name too), its denial records, the DNSKEY RRset, and the validation of each answer RRset, paired by owner and type, and of the denial, its SOA RRset included, under the zone's own anchor or, for a zone below a signed parent, along the chain from the parent's anchor across the delegation, with the parent's DNSKEY RRset and its denial of the DS RRset compared too; NSEC3 zones hold their NSEC3PARAM RRset on both sides |
 | `policy` | `AlgorithmPolicy::treat`, under `AlgorithmPolicy::iana` where the vector names `iana` | the treatment of a DS record's algorithm and digest type, so the policy Rust ships is held to the one the Lean theorems are about |
 | `chain` | `check_chain` | the problems reported, as a set |
@@ -128,7 +130,8 @@ standards and Rust do, or where a standard lets both answers stand.
 | `wire` | `read_message` refuses messages holding a record hickory cannot read by its type's rules, such as an SRV without a target; the Lean codec carries such RDATA as octets (RFC 3597) | hickory's reading of typed RDATA |
 | `fit` | `Gen.lean` sometimes splits one RRset (same owner and type) into two in a section, and the Lean `fit` keeps the two apart | RFC 2181 §5 makes them one RRset, which `fit` writes together |
 | `zone`, `partial` | for QTYPE ANY answered with one RRset, Lean takes the first RRset in the zone's listed order and Rust the RRset of the lowest type; the test then checks that Rust answers Lean's RRset when asked for its type | RFC 8482 §4.1 lets a server pick any one RRset; a master file's order does not survive into a zone |
-| `signed` | for NODATA at a name that is itself a wildcard, Rust also sends the NSEC3 matching the wildcard's parent | the extra record proves nothing false; RFC 5155 §7.2.3 needs only the matching NSEC3 |
+| `signed`, `learned_signed` | for NODATA at a name that is itself a wildcard, Rust also sends the NSEC3 matching the wildcard's parent | the extra record proves nothing false; RFC 5155 §7.2.3 needs only the matching NSEC3 |
+| `learned`, `learned_signed` | a copy's reply leaves out optional additional data it does not hold, such as the address of an MX target it never looked up | RFC 2181 §5.4.1 and RFC 9471 §3.2 make such data optional; `serve_reply_upstream` allows exactly this (`Response.Grows`) |
 | `chain` | in a tree with a corrupted key, Rust also reports the breaks the bad signatures make, `SignatureInvalid` among them | the Lean check reads no signature and assumes honest signers (`check_sound`) |
 
 Two differences the test found were faults in Rust and are fixed there:
@@ -139,3 +142,12 @@ and
 `check_chain` no longer asks a parent whose keys all use algorithms the
 policy does not validate to prove that its unsigned delegations have no DS,
 since a validator already finds that parent Insecure.
+
+`learned` and `learned_signed` found three faults in `Learned`, fixed there:
+a CNAME or ANY question below a DNAME now follows the DNAME to the name it
+makes, as the answer's walk does (RFC 6672 §3.2), so the copy keeps the
+negative of that name; an authoritative YXDOMAIN now files the DNAME it
+carries (RFC 6672 §2.2); and a response proving two negatives, such as a
+wildcard CNAME that ends in NODATA, now files each with the NSEC or NSEC3
+records of its own proof (`dnssec::proof::proof_of`) rather than all of
+them, so a later reply for one carries what a real server sends for it.
