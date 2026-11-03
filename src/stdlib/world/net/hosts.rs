@@ -8,9 +8,9 @@ use fictionet::stdlib::network::{ConnError, Connection, icmp, ip, tcp, udp};
 use fictionet::stdlib::protocols::dns::label_count;
 use fictionet::stdlib::protocols::dns::op::Query;
 use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RecordSet};
-use fictionet::stdlib::services::dns::resolver::Config;
+use fictionet::stdlib::services::dns::resolver::{Config, LocalZone};
 use fictionet::stdlib::services::dns::zone::{
-    Denied, Fact, Node, Revision, Transparent, View, ZoneData, special, targets,
+    Denied, EmptyApex, Fact, Node, Revision, Transparent, View, ZoneData, targets,
 };
 use fictionet::stdlib::services::serve::ConnInfo;
 use fictionet::stdlib::services::serve::{self, Budget, ServeOptions, Service};
@@ -705,14 +705,14 @@ impl World {
 /// hosts placed with [`NetHandle::add_host`] declare, as zone data for a
 /// resolver's local zones.
 ///
-/// It is one static local zone per top-level domain those names use, as
-/// Unbound serves a `local-zone` of type `static` with its `local-data`:
+/// It is one static local zone per top-level domain those names use:
+/// each holds the declared names under it, and denies the rest. In it
 /// each declared name has its host's A and AAAA records, a name with
 /// declared names below it is an empty non-terminal, and every other name
 /// under that top-level domain does not exist. A name inside one of the
 /// resolver's other local zones, such as `home.arpa`, is in a zone at that
 /// zone's apex instead ([`Declared::over`]). Each zone has the SOA and NS
-/// records Unbound gives its own local zones. Under a top-level domain no
+/// records of [`EmptyApex::rfc6303`]. Under a top-level domain no
 /// declared name uses, it knows nothing, so a resolver goes on to its
 /// other zones and to iteration. The zones grow as hosts are placed.
 ///
@@ -729,8 +729,8 @@ pub struct Declared {
     /// The apexes of the resolver's other local zones, which
     /// [`over`](Declared::over) makes give way to the declared names.
     zones: Arc<[LowerName]>,
-    /// Whether each zone has the SOA and NS records Unbound gives a static
-    /// local zone at its apex. The zones of [`Declared::transparent`] have
+    /// Whether each zone has the SOA and NS records of
+    /// [`EmptyApex::rfc6303`] at its apex. The zones of [`Declared::transparent`] have
     /// none.
     apex_records: bool,
 }
@@ -745,8 +745,8 @@ impl Declared {
         }
     }
 
-    /// The declared names as Unbound serves `local-data` that no
-    /// `local-zone` contains: in an implicit transparent zone, with no SOA
+    /// The declared names in an implicit transparent zone, as a resolver
+    /// serves local data that no local zone contains, with no SOA
     /// or NS records of its own. A declared name answers with its host's
     /// addresses, and NODATA for other types. Every other name, a
     /// top-level domain's apex and a name above a declared name among
@@ -760,13 +760,12 @@ impl Declared {
     }
 
     /// `config` with the declared names served before anything else: these
-    /// zones are added as a local zone, and each of `config`'s local zones
-    /// with a declared name at or below its apex gives way to them. The
-    /// declared names then answer inside a zone at that apex, with the SOA
-    /// and NS records Unbound gives its own, as Unbound puts the operator's
-    /// `local-data` into a default local zone of the same name. So a world
-    /// that declares `dc01.corp.test` or `nas.home.arpa` gets its address,
-    /// where Unbound's default `test` zone (RFC 6761 §6.2) or `home.arpa`
+    /// zones are added as a local zone whose answers keep AA, and each of
+    /// `config`'s local zones with a declared name at or below its apex
+    /// gives way to them. The declared names then answer inside a zone at
+    /// that apex, with the apex records of [`EmptyApex::rfc6303`]. So a
+    /// world that declares `dc01.corp.test` or `nas.home.arpa` gets its
+    /// address, where a default `test` zone (RFC 6761 §6.2) or `home.arpa`
     /// zone (RFC 8375) would deny it, and the other names in that zone
     /// still do not exist.
     pub fn over(&self, mut config: Config) -> Config {
@@ -774,7 +773,7 @@ impl Declared {
             zones: config
                 .local
                 .iter()
-                .map(|zone| zone.apex().clone())
+                .map(|zone| zone.data.apex().clone())
                 .filter(|apex| !apex.is_root())
                 .collect(),
             ..self.clone()
@@ -783,17 +782,20 @@ impl Declared {
             .local
             .into_iter()
             .map(|zone| {
-                if zone.apex().is_root() {
+                if zone.data.apex().is_root() {
                     zone
                 } else {
-                    Arc::new(GivesWay {
-                        zone,
-                        declared: declared.clone(),
-                    }) as Arc<dyn ZoneData>
+                    LocalZone {
+                        data: Arc::new(GivesWay {
+                            zone: zone.data,
+                            declared: declared.clone(),
+                        }),
+                        ..zone
+                    }
                 }
             })
             .collect();
-        config.local(Arc::new(declared))
+        config.local(LocalZone::new(Arc::new(declared)))
     }
 
     /// Whether a declared name is at or below `apex`.
@@ -836,7 +838,7 @@ impl ZoneData for Declared {
                 tld
             }
         };
-        let (soa, ns) = special::local_apex(&Name::from(apex.clone()), special::LOCAL_TTL);
+        let (soa, ns) = EmptyApex::rfc6303().records(&Name::from(apex.clone()));
         let apex_sets = if self.apex_records {
             vec![soa.clone(), ns]
         } else {
@@ -880,7 +882,7 @@ impl Facts {
     /// A view of the zone at `apex` that knows nothing.
     pub(super) fn unknown(apex: LowerName) -> Facts {
         Facts {
-            soa: special::local_apex(&Name::from(apex.clone()), special::LOCAL_TTL).0,
+            soa: EmptyApex::rfc6303().records(&Name::from(apex.clone())).0,
             apex,
             revision: Revision(0),
             facts: BTreeMap::new(),

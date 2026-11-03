@@ -13,13 +13,22 @@ use fictionet::sync::Mutex;
 use super::super::exchange::{Client, Generation};
 use super::super::lookup::{Looked, Lookup};
 use super::super::zone::{Filing, Learned, ZoneData};
-use super::{Authority, ServerConfig, Step, Zones};
+use super::{Authority, ServerConfig, Step, respond_from};
 
 /// The [learned](Learned) copies of real zones, one per apex, shared by
 /// every address that serves the zone, and the zones each address serves.
 ///
-/// At each address it answers as [`Zones`] over the copies of the zones
+/// At each address it answers as [`Zones`](super::Zones) over the copies of the zones
 /// the address serves, looking up what they lack at the address itself.
+/// A copy's view that does not know a fact the reply needs never gives a
+/// negative: the copy looks the client's question up ([`Step::Need`]). A
+/// server that answers as RFC 1034 and RFC 6672 say carries the whole
+/// CNAME and DNAME chain in its response. When the response to the
+/// client's question was filed and the answer still stops at a name the
+/// chain led to in the zone, as when a server stops a chain early, the
+/// copy looks that name up with QTYPE instead, as the walk starts again
+/// there (RFC 1034 §4.3.2 step 3a, RFC 6672 §3.2).
+///
 /// A world notes which address serves which zone with
 /// [`serves`](Copies::serves), such as at the addresses a referral's glue
 /// gives.
@@ -204,7 +213,7 @@ impl Authority for Copies {
         req: &Request,
         local: SocketAddr,
         server: &ServerConfig,
-        client: &Client,
+        _client: &Client,
     ) -> Step {
         let qname = LowerName::new(req.question.name());
         let unplaced = self
@@ -217,7 +226,17 @@ impl Authority for Copies {
             let soa = Query::query(Name::from(qname), RecordType::SOA);
             return Step::Need(Lookup::new(local, zone, &soa));
         }
-        Zones::new(self.zones_at(local.ip())).respond(req, local, server, client)
+        let zones = self.zones_at(local.ip());
+        respond_from(&zones, req, server, &|zone, reached| {
+            let apex = zone.apex();
+            let mut question = req.question.clone();
+            if LowerName::new(question.name()) != reached
+                && self.copy(apex).answered(&req.question)
+            {
+                question.set_name(Name::from(reached));
+            }
+            Step::Need(Lookup::new(local, apex.clone(), &question))
+        })
     }
 
     fn file(&self, lookup: &Lookup, looked: &Looked, generation: Generation) {

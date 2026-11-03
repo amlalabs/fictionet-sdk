@@ -41,11 +41,9 @@
 //! | RFC 8767 | Serving stale data |
 //! | RFC 8914 | Extended DNS Errors |
 //! | RFC 9156 | QNAME minimisation |
-//! | RFC 9462 | `resolver.arpa` from the resolver's encrypted endpoints |
 //! | RFC 9520 | Failures cached apart from negatives; each server asked at most three times per transport |
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::Arc;
 
 use fictionet::Entropy;
 use fictionet::stdlib::protocols::dns::dnssec::{Ring, Validation, Verified, Verify};
@@ -58,7 +56,7 @@ use super::authority::{ServerConfig, bare_reply};
 use super::clock::WallClock;
 use super::event::{Event, QueryFlags};
 use super::exchange::{Action, Client, ClientQuery, Engine, Generation, Input, Session, Tokens};
-use super::zone::{Answered, ZoneData, answer, special};
+use super::zone::{Answered, answer};
 
 mod cache;
 mod config;
@@ -68,7 +66,7 @@ mod servers;
 
 pub use cache::{Cache, Checked, Entry, FailureKind, Key, Limits, Negative, Offer, Rank};
 pub use config::{
-    Config, Minimise, NameServer, NegativeAnchors, ROOT_SERVERS, Stale, Work, root_hints,
+    Config, LocalZone, Minimise, NameServer, NegativeAnchors, ROOT_SERVERS, Stale, Work, root_hints,
 };
 
 use resolution::{AskerId, CheckId, Graph, LookupId, Outcome, Subject, TreeId};
@@ -93,8 +91,6 @@ pub struct Resolver<V: Verify = Ring> {
     /// The front's view of `config`, for the header and EDNS rules
     /// authoritative servers and resolvers share.
     server: ServerConfig,
-    /// The local zones, in the order they were added.
-    local: Vec<LocalZone>,
     verify: V,
     clock: WallClock,
     tokens: Tokens,
@@ -107,13 +103,6 @@ pub struct Resolver<V: Verify = Ring> {
     restart: Vec<AskerId>,
     queue: VecDeque<Action>,
     now: Instant,
-}
-
-/// One of a resolver's local zones.
-struct LocalZone {
-    data: Arc<dyn ZoneData>,
-    /// Whether its answers keep the AA bit the zone gives them.
-    keep_aa: bool,
 }
 
 /// One client query being answered.
@@ -198,25 +187,9 @@ impl<V: Verify> Resolver<V> {
             payload: config.payload,
             ede: config.ede,
             any: config.any,
-            transfer: false,
             ask_timeout: config.retransmit,
             recursion_available: true,
         };
-        let mut local: Vec<LocalZone> = config
-            .local
-            .iter()
-            .map(|zone| LocalZone {
-                data: zone.clone(),
-                keep_aa: config.local_aa,
-            })
-            .collect();
-        if !config.ddr.is_empty() {
-            let zone = special::resolver_arpa(config.ddr.clone(), config.ddr_ttl);
-            local.push(LocalZone {
-                data: Arc::new(zone),
-                keep_aa: config.ddr_aa,
-            });
-        }
         let servers = Servers::new(config.retransmit, config.server_ttl);
         let limits = Limits {
             max_ttl: config.max_ttl,
@@ -229,7 +202,6 @@ impl<V: Verify> Resolver<V> {
         Resolver {
             config,
             server,
-            local,
             verify,
             clock,
             tokens: Tokens::new(),
@@ -315,6 +287,7 @@ impl<V: Verify> Resolver<V> {
     fn answer_locally(&self, request: &Request) -> Option<Vec<u8>> {
         let qname = LowerName::new(request.question.name());
         let mut zones: Vec<(usize, &LocalZone)> = self
+            .config
             .local
             .iter()
             .enumerate()
@@ -386,7 +359,7 @@ impl<V: Verify> Resolver<V> {
             // bit on, as it relays the rest of the client's header.
             let relay_cd = asker.request.cd
                 && self.config.anchors.is_none()
-                && !self.config.forward.is_empty();
+                && self.forward_zone(&key.name).is_some();
             // The aliases followed are counted above, apart from how
             // deeply this name's own lookups nest.
             match self.depend(

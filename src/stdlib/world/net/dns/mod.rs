@@ -44,7 +44,10 @@
 //! let clock = WallClock { start: SystemTime::UNIX_EPOCH };
 //! Net::new()
 //!     .host("www", |h| h.dns_name("intranet.corp.test"))
-//!     .gateway(move |h, declared| h.program(Recursive::new(declared.over(Config::gateway()), clock)))
+//!     .gateway(move |h, declared| {
+//!         let config = Config { hints: Vec::new(), ..Config::new() };
+//!         h.program(Recursive::new(declared.over(config), clock))
+//!     })
 //!     .start(&fcx, attachments)?;
 //! # Ok(())
 //! # }
@@ -67,7 +70,7 @@ use std::sync::Arc;
 
 use fictionet::stdlib::protocols::dns::op::Query;
 use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RecordSet};
-use fictionet::stdlib::services::dns::zone::{View, ZoneData, special};
+use fictionet::stdlib::services::dns::zone::{EmptyApex, View, ZoneData};
 use fictionet::sync::Mutex;
 
 use super::hosts::Facts;
@@ -84,7 +87,7 @@ pub use session::{Namespace, PerSession};
 pub use upstream::{Only, Upstream};
 
 /// How long resolvers may keep the addresses of a host placed by
-/// [`placing`], in seconds: Unbound's default TTL for `local-data`.
+/// [`placing`], in seconds.
 pub(super) const HOST_TTL: u32 = 3600;
 
 /// The TTL and negative TTL of the root zone of [`placing`]: a name given
@@ -122,7 +125,11 @@ where
     F: Fn(&str) -> Option<Host> + Send + Sync + 'static,
 {
     let root = Name::root();
-    let (soa, ns) = special::local_apex(&root, PLACING_NEGATIVE_TTL);
+    let apex = EmptyApex {
+        ttl: PLACING_NEGATIVE_TTL,
+        ..EmptyApex::rfc6303()
+    };
+    let (soa, ns) = apex.records(&root);
     Placing {
         root: LowerName::new(&root),
         soa,

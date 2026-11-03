@@ -9,7 +9,7 @@ use fictionet::Entropy;
 use fictionet::stdlib::protocols::dns::dnssec::Validation;
 use fictionet::stdlib::protocols::dns::op::ResponseCode;
 use fictionet::stdlib::protocols::dns::read_message;
-use fictionet::stdlib::protocols::dns::rr::{DNSClass, RecordType};
+use fictionet::stdlib::protocols::dns::rr::DNSClass;
 use fictionet::stdlib::protocols::dns::{Ede, EdeCode, Parsed, Request};
 use fictionet::time::Instant;
 
@@ -29,10 +29,11 @@ use super::{Authority, ServerConfig, Step, bare_reply};
 /// 1. Parses it with [`Request::parse`]. Bytes that get no reply get
 ///    none; a rejected query gets the rejection.
 /// 2. Queues [`Event::Query`].
-/// 3. Answers REFUSED to a zone transfer when the server does not offer
-///    them, whatever its class (RFC 5936 §2.2), and to a class other than
-///    IN, CH, and ANY. Answers another CHAOS-class question from the
-///    server's [`identity`](ServerConfig::identity).
+/// 3. Answers REFUSED to a class other than IN, CH, and ANY. Answers a
+///    CHAOS-class question from the server's
+///    [`identity`](ServerConfig::identity), which refuses zone transfers.
+///    A zone transfer in another class goes to the authority, which
+///    decides it as it decides any question.
 /// 4. Asks the authority. For [`Step::Need`] it queues [`Action::Lookup`]
 ///    under a fresh token and waits up to
 ///    [`ask_timeout`](ServerConfig::ask_timeout). When the lookup ends, it
@@ -111,14 +112,7 @@ impl<A: Authority> AuthorityEngine<A> {
             edns: req.edns,
         }));
 
-        let transfer = matches!(
-            req.question.query_type(),
-            RecordType::AXFR | RecordType::IXFR
-        );
         let response = match req.question.query_class() {
-            DNSClass::IN | DNSClass::ANY | DNSClass::CH if transfer && !self.server.transfer => {
-                Some(bare_reply(&req, ResponseCode::Refused, None))
-            }
             DNSClass::CH => {
                 let bytes = self.server.render_chaos(&req);
                 return self.answer(client, bytes);

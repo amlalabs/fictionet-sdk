@@ -324,7 +324,7 @@
 //!   sandbox sent before it detached can never complete a packet for the
 //!   next sandbox to take its address.
 //! - **DNS** at the gateway, at both of its addresses: a recursive
-//!   resolver like Unbound with no route to the internet. It answers A and
+//!   resolver with no route to the internet. It answers A and
 //!   AAAA records for sites, NODATA for other record types of their names,
 //!   and NXDOMAIN for names the callback turned down, with an SOA for the
 //!   sandbox's resolver to cache. Answers set RA, as a resolver's do.
@@ -463,9 +463,9 @@
 //!
 //! - **Names.** The callback gets each name in lowercase, without the
 //!   trailing dot. Lookups of `Example.COM.` and `example.com` are the same
-//!   lookup. Addresses have a TTL of an hour, as Unbound's local data
-//!   does. A name turned down may be cached for a minute, the negative TTL
-//!   of its SOA, since the callback may give it a site later.
+//!   lookup. Addresses have a TTL of an hour. A name turned down may be
+//!   cached for a minute, the negative TTL of its SOA, since the callback
+//!   may give it a site later.
 //! - **Automatic addresses** are handed out in order from `104.18.0.1` and
 //!   `2606:4700:100::1`. Addresses inside the sandboxes' subnets are skipped, so a
 //!   subnet such as `104.18.0.0/24` works too. A subnet that covers all of
@@ -547,10 +547,9 @@ use std::sync::Arc;
 use http::{Request, Response};
 
 use fictionet::stdlib::network::route::Prefix;
-use fictionet::stdlib::protocols::dns::rr::{LowerName, Name};
 use fictionet::stdlib::services::dns::{Event, WallClock};
-use fictionet::stdlib::services::dns::resolver::Config;
-use fictionet::stdlib::services::dns::zone::ZoneData;
+use fictionet::stdlib::services::dns::resolver::{Config, LocalZone};
+use fictionet::stdlib::services::dns::zone::{EmptyApex, ZoneData, special};
 use fictionet::stdlib::services::tls::ServerConfig;
 use fictionet::stdlib::world::net::dns::{self, Recursive};
 use fictionet::stdlib::world::net::{Host, Net};
@@ -634,13 +633,12 @@ impl Sites {
     /// The network these sites run on, before it starts: to add hosts
     /// with other services next to the websites.
     ///
-    /// Its gateway runs the network's default resolver, like Unbound with
-    /// no route to the internet ([`Net::gateway`]), whose local zone is a
-    /// root zone of the names the network's hosts declare that asks the
+    /// Its gateway runs a resolver with no route to the internet
+    /// ([`Net::gateway`]), whose local zones are `localhost` and a root
+    /// zone of the names the network's hosts declare that asks the
     /// callback about the others ([`dns::placing`]). The callback decides
-    /// every name but `localhost`, so the resolver's other default zones,
-    /// such as `test`, `home.arpa`, and the reverse zones of private
-    /// addresses, give way to it.
+    /// every name but `localhost`, such as names under `test`, `home.arpa`,
+    /// and the reverse zones of private addresses.
     pub fn into_net(self) -> Net {
         let site_for = self.site_for;
         let date = self.date;
@@ -657,10 +655,16 @@ impl Sites {
             })
         }));
         self.net.gateway(move |host, _declared| {
-            let localhost = LowerName::from(Name::from_ascii("localhost.").expect("a valid name"));
-            let mut config = Config::gateway();
-            config.local.retain(|zone| *zone.apex() == localhost);
-            let resolver = Recursive::new(config.local(sites.clone()), clock);
+            let localhost = special::localhost(&EmptyApex::rfc6303());
+            let config = Config {
+                hints: Vec::new(),
+                local: vec![
+                    LocalZone::new(Arc::new(localhost)),
+                    LocalZone::new(sites.clone()),
+                ],
+                ..Config::new()
+            };
+            let resolver = Recursive::new(config, clock);
             host.program(match &on_dns_event {
                 Some(f) => {
                     let f = f.clone();

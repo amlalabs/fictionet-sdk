@@ -33,9 +33,6 @@ pub struct ServerConfig {
     pub ede: bool,
     /// What the server sends for QTYPE ANY (RFC 8482 §4).
     pub any: AnyResponse,
-    /// Whether zone transfers reach the authority. Without it, AXFR and
-    /// IXFR over TCP get REFUSED.
-    pub transfer: bool,
     /// How long the server waits for a lookup before it counts the
     /// lookup as unanswered.
     pub ask_timeout: Duration,
@@ -48,37 +45,19 @@ pub struct ServerConfig {
 
 impl ServerConfig {
     /// An ordinary authoritative server: a 1232-octet payload, the size
-    /// the DNS Flag Day 2020 settled on; Extended DNS Errors; the RFC 8482
-    /// HINFO answer to ANY, as Cloudflare's servers send; no transfers; and
-    /// an identity with no names and no NSID.
+    /// the DNS Flag Day 2020 settled on; Extended DNS Errors; the
+    /// synthesized HINFO answer to ANY of RFC 8482 §4.2; and an identity
+    /// with no names and no NSID. A world that plays a particular server
+    /// writes its values over this one.
     pub fn generic() -> ServerConfig {
         ServerConfig {
             identity: Identity::none(),
             payload: 1232,
             ede: true,
             any: AnyResponse::Hinfo,
-            transfer: false,
             ask_timeout: ASK_TIMEOUT,
             recursion_available: false,
         }
-    }
-
-    /// A root server with `identity`, which carries its letter's and
-    /// site's CHAOS names and NSID. As observed at the root letters: a
-    /// 4096-octet payload, and every RRset of the name for ANY.
-    pub fn root(identity: Identity) -> ServerConfig {
-        ServerConfig {
-            identity,
-            payload: 4096,
-            any: AnyResponse::All,
-            ..ServerConfig::generic()
-        }
-    }
-
-    /// A `gtld-servers.net` server with `identity`: a 4096-octet payload
-    /// and every RRset of the name for ANY, as the root servers.
-    pub fn gtld(identity: Identity) -> ServerConfig {
-        ServerConfig::root(identity)
     }
 
     /// `response` with the header and EDNS details of this server, for
@@ -286,24 +265,21 @@ pub struct Identity {
     /// The reply to a question of a type other than TXT or ANY, for every
     /// name that is not a [zone](ChaosAnswer::Zone) or below one.
     pub other_types: ChaosReply,
-    /// Whether its [`Txt`](ChaosAnswer::Txt) answers set AA. Some Verisign
-    /// instances set it; NSD, Knot, and the public resolvers leave it
-    /// clear.
+    /// Whether its [`Txt`](ChaosAnswer::Txt) answers set AA.
     pub aa: bool,
     /// The name server identifier sent to a query that asks for one
     /// (RFC 5001).
     pub nsid: Option<Vec<u8>>,
-    /// The TTL of its TXT answers. Most servers give 0; e.root and f.root
-    /// gave 60 on 2026-11-01.
+    /// The TTL of its TXT answers.
     pub ttl: u32,
     /// The EDNS payload size its CHAOS replies advertise, when it is not
-    /// the server's own: e.root and f.root advertise 512 there.
+    /// the server's own.
     pub payload: Option<u16>,
 }
 
 impl Identity {
-    /// No names and no NSID: every CHAOS-class question gets REFUSED, as
-    /// at Cloudflare's resolver for names it does not answer.
+    /// No names and no NSID: every CHAOS-class question gets REFUSED, and
+    /// TXT answers, once names are added, have TTL 0 and AA clear.
     pub fn none() -> Identity {
         Identity {
             chaos: BTreeMap::new(),
@@ -332,8 +308,10 @@ impl Identity {
     /// adds its header details and EDNS, and whether it has an OPT record
     /// when the query had one:
     ///
+    /// - A zone transfer gets REFUSED: these names are no zones to list
+    ///   (RFC 5936 §2.2).
     /// - A name at or below a [zone](ChaosAnswer::Zone) gets the zone's
-    ///   answer.
+    ///   answer ([`ChaosZone`]).
     /// - Any other name asked for a type other than TXT or ANY gets
     ///   [`other_types`](Identity::other_types).
     /// - A [`Txt`](ChaosAnswer::Txt) name, asked for TXT or ANY, gets its
@@ -342,16 +320,19 @@ impl Identity {
     /// - A name with a reply of its own gets it, and an unlisted name gets
     ///   [`unlisted`](Identity::unlisted).
     pub fn reply(&self, req: &Request) -> (Response, bool) {
+        if matches!(
+            req.question.query_type(),
+            RecordType::AXFR | RecordType::IXFR
+        ) {
+            return (bare_reply(req, ResponseCode::Refused, None), true);
+        }
         let qname = LowerName::new(req.question.name());
         let zone = self.chaos.iter().find_map(|(name, answer)| match answer {
-            ChaosAnswer::Zone(text) if name.zone_of(&qname) => Some((name, text)),
+            ChaosAnswer::Zone(zone) if name.zone_of(&qname) => Some((name, zone)),
             _ => None,
         });
-        if let Some((apex, text)) = zone {
-            return (
-                self.zone_reply(req, &Name::from(apex), text.as_deref()),
-                true,
-            );
+        if let Some((apex, zone)) = zone {
+            return (self.zone_reply(req, &Name::from(apex), zone), true);
         }
         let other = !matches!(req.question.query_type(), RecordType::TXT | RecordType::ANY);
         let empty = |reply: &ChaosReply| {
@@ -376,39 +357,31 @@ impl Identity {
         }
     }
 
-    /// The reply to `req` from the CHAOS zone at `apex`, with TXT `text`
-    /// there if any, as BIND gives it: AA always; the zone's records of
-    /// the type asked, and its NS in the authority section when RD is
-    /// clear and the answer lacks it, as BIND's default
-    /// `minimal-responses no-auth-recursive` does; NODATA with the SOA
-    /// for any other type; and NXDOMAIN with the SOA below the apex, the
-    /// SOA's TTL 0 when the question is for an SOA.
-    fn zone_reply(&self, req: &Request, apex: &Name, text: Option<&str>) -> Response {
+    /// The reply to `req` from `zone`, the CHAOS zone at `apex`, with AA
+    /// set: at the apex, the zone's records of the type asked, or NODATA
+    /// with the SOA; below it, NXDOMAIN with the SOA (RFC 2308 §2.1,
+    /// §2.2).
+    fn zone_reply(&self, req: &Request, apex: &Name, zone: &ChaosZone) -> Response {
         let qtype = req.question.query_type();
         let mut response = bare_reply(req, ResponseCode::NoError, None);
         response.message.metadata.authoritative = true;
-        let mut soa = zone_soa(apex);
+        let soa = chaos_record(apex, zone.soa_ttl, RData::SOA(zone.soa.clone()));
         if req.question.name() != apex {
-            if qtype == RecordType::SOA {
-                soa.ttl = 0;
-            }
             response.message.metadata.response_code = ResponseCode::NXDomain;
             response.message.authorities.push(soa);
             return response;
         }
-        let ns = zone_ns(apex);
-        let txt = text.map(|text| self.txt(apex, text));
+        let ns = chaos_record(apex, zone.ns_ttl, RData::NS(NS(zone.ns.clone())));
+        let txt = zone.txt.as_deref().map(|text| self.txt(apex, text));
         let answers: Vec<Record> = match qtype {
             RecordType::TXT => txt.into_iter().collect(),
             RecordType::SOA => vec![soa.clone()],
-            RecordType::NS => vec![ns.clone()],
-            RecordType::ANY => txt.into_iter().chain([soa.clone(), ns.clone()]).collect(),
+            RecordType::NS => vec![ns],
+            RecordType::ANY => txt.into_iter().chain([soa.clone(), ns]).collect(),
             _ => Vec::new(),
         };
         if answers.is_empty() {
             response.message.authorities.push(soa);
-        } else if !req.rd && !answers.contains(&ns) {
-            response.message.authorities.push(ns);
         }
         response.message.answers = answers;
         response
@@ -418,26 +391,13 @@ impl Identity {
     /// TTL.
     fn txt(&self, name: &Name, text: &str) -> Record {
         let txt = RData::TXT(TXT::new(vec![text.to_string()]));
-        let mut record = Record::from_rdata(name.clone(), self.ttl, txt);
-        record.dns_class = DNSClass::CH;
-        record
+        chaos_record(name, self.ttl, txt)
     }
 }
 
-/// The SOA BIND gives the CHAOS zone at `name`.
-fn zone_soa(name: &Name) -> Record {
-    let hostmaster = Name::from_ascii("hostmaster")
-        .and_then(|label| label.append_name(name))
-        .unwrap_or_else(|_| name.clone());
-    let soa = SOA::new(name.clone(), hostmaster, 0, 28800, 7200, 604800, 86400);
-    let mut record = Record::from_rdata(name.clone(), 86400, RData::SOA(soa));
-    record.dns_class = DNSClass::CH;
-    record
-}
-
-/// The NS BIND gives the CHAOS zone at `name`: the name itself, TTL 0.
-fn zone_ns(name: &Name) -> Record {
-    let mut record = Record::from_rdata(name.clone(), 0, RData::NS(NS(name.clone())));
+/// `rdata` at `name` as a CHAOS-class record with `ttl`.
+fn chaos_record(name: &Name, ttl: u32, rdata: RData) -> Record {
+    let mut record = Record::from_rdata(name.clone(), ttl, rdata);
     record.dns_class = DNSClass::CH;
     record
 }
@@ -446,17 +406,29 @@ fn zone_ns(name: &Name) -> Record {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ChaosAnswer {
     /// One TXT string, at most 255 octets (RFC 1035 §3.3), served without
-    /// a zone, as NSD, Knot, and Verisign's servers serve their CHAOS
-    /// names.
+    /// a zone.
     Txt(String),
-    /// A zone of its own at the name, with this TXT string there if any,
-    /// as BIND serves each of its CHAOS names (c, g, i, and m at the root
-    /// on 2026-11-02): SOA
-    /// `<name> hostmaster.<name> 0 28800 7200 604800 86400` with TTL
-    /// 86400, and NS `<name>` with TTL 0.
-    Zone(Option<String>),
+    /// A zone of its own at the name.
+    Zone(ChaosZone),
     /// No data, with this reply, as servers that refuse to say.
     Reply(ChaosReply),
+}
+
+/// A CHAOS-class zone at one name, as some servers serve each name they
+/// answer about themselves: its apex records, and the TXT string at the
+/// apex if any. The zone holds no other names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChaosZone {
+    /// The zone's SOA, whose owner is the zone's name.
+    pub soa: SOA,
+    /// The TTL of the SOA record.
+    pub soa_ttl: u32,
+    /// The target of the zone's one NS record.
+    pub ns: Name,
+    /// The TTL of the NS record.
+    pub ns_ttl: u32,
+    /// The TXT string at the apex, with the identity's TTL.
+    pub txt: Option<String>,
 }
 
 /// A CHAOS-class reply without data.
@@ -466,8 +438,8 @@ pub struct ChaosReply {
     pub rcode: ResponseCode,
     /// The Extended DNS Error it carries (RFC 8914), if any.
     pub ede: Option<Ede>,
-    /// Whether it has an OPT record when the query had one. OpenDNS's
-    /// replies, and the NOTIMP replies of Verisign's servers, have none.
+    /// Whether it has an OPT record when the query had one, as some
+    /// servers leave it out.
     pub edns: bool,
 }
 

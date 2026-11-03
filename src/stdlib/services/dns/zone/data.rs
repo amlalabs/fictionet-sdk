@@ -7,8 +7,7 @@ use std::sync::Arc;
 use fictionet::stdlib::protocols::dns::op::Query;
 use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RecordSet, RecordType};
 
-use super::learned::Learned;
-use super::special::{LOCAL_TTL, local_apex};
+use super::apex::EmptyApex;
 use super::zone::{Node, ZoneError};
 
 /// What a zone knows about one fact.
@@ -104,11 +103,6 @@ pub trait ZoneData: Send + Sync + 'static {
     /// A view with every fact `question` needs that this data can know,
     /// all at one revision.
     fn view(&self, question: &Query) -> Arc<dyn View + Send + Sync>;
-    /// The data as [`Learned`] zone data, when it is: a server then looks
-    /// up the facts its views do not know, and files what it learns here.
-    fn learned(&self) -> Option<&Learned> {
-        None
-    }
 }
 
 /// Decides names as they are asked. World code: trusted, called
@@ -178,7 +172,7 @@ impl Shown {
         Ok(Shown {
             // A view needs an SOA, but every answer this data gives is a
             // positive one, which carries none.
-            soa: local_apex(owner, LOCAL_TTL).0,
+            soa: EmptyApex::rfc6303().records(owner).0,
             apex,
             sets: held,
         })

@@ -6,48 +6,60 @@
 //! here too: [`alpn`], [`port`], [`ipv4_hint`], [`ipv6_hint`], and
 //! [`dohpath`].
 //!
-//! Each zone has the apex records Unbound gives all of these zones in
-//! `add_empty_default` (`services/localzone.c`): `localhost.` as the NS
-//! target and as the SOA's MNAME, `nobody.invalid.` as RNAME, serial 1,
-//! and the refresh 3600, retry 1200, expire 604800, and minimum 10800 of
-//! RFC 6303 §3, with TTL 10800. A resolver's configuration holds the ones
-//! it serves. Unbound serves them; Google's and Cloudflare's public
-//! resolvers do not.
+//! Each zone takes the [`EmptyApex`] it gives its SOA and NS records.
+//! [`EmptyApex::rfc6303`] is the form RFC 6303 §3 recommends; RFC 6303
+//! also lets operators choose other values, so a world that plays some
+//! resolver software passes that software's. [`defaults`] gives every
+//! zone here, and a resolver's configuration holds the ones it serves.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::sync::Arc;
 
 use fictionet::stdlib::protocols::dns::rr::rdata::svcb::{
     Alpn, IpHint, SvcParamKey, SvcParamValue, Unknown,
 };
-use fictionet::stdlib::protocols::dns::rr::rdata::{A, AAAA, NS, PTR, SOA, SVCB};
+use fictionet::stdlib::protocols::dns::rr::rdata::{A, AAAA, SVCB};
 use fictionet::stdlib::protocols::dns::rr::{Name, RData, Record, RecordSet};
 
-use super::data::Redirect;
+use super::apex::EmptyApex;
+use super::data::{Redirect, ZoneData};
 use super::zone::{Zone, ZoneBuilder};
 
-/// The TTL of the records of the zones a resolver serves itself, and the
-/// minimum of their SOA (RFC 6303 §3).
-pub const LOCAL_TTL: u32 = 10800;
+/// Every zone here, each with `apex`: `localhost`, the zones of
+/// [`rfc6303`], `home.arpa`, an empty `resolver.arpa`, `service.arpa`,
+/// `onion`, `test`, and `invalid`.
+pub fn defaults(apex: &EmptyApex) -> Vec<Arc<dyn ZoneData>> {
+    let mut zones: Vec<Arc<dyn ZoneData>> = vec![Arc::new(localhost(apex))];
+    for zone in rfc6303(apex) {
+        zones.push(Arc::new(zone));
+    }
+    zones.push(Arc::new(home_arpa(apex)));
+    zones.push(Arc::new(resolver_arpa(apex, Vec::new(), apex.ttl)));
+    zones.push(Arc::new(service_arpa(apex)));
+    zones.push(Arc::new(onion(apex)));
+    zones.push(Arc::new(test(apex)));
+    zones.push(Arc::new(invalid(apex)));
+    zones
+}
 
 /// `localhost`, whose names all point at the loopback addresses
-/// (RFC 6761 §6.3): A 127.0.0.1 and AAAA ::1 at the apex. Unbound serves
-/// it as a `redirect` zone, so every name below the apex answers with
-/// the apex's RRsets, its SOA and NS among them.
-pub fn localhost() -> Redirect<Zone> {
-    let apex = name("localhost.");
-    let zone = builder(&apex)
-        .rrset(rrset(&apex, RData::A(A(Ipv4Addr::LOCALHOST))))
-        .rrset(rrset(&apex, RData::AAAA(AAAA(Ipv6Addr::LOCALHOST))));
+/// (RFC 6761 §6.3): A 127.0.0.1 and AAAA ::1 at the apex, and every name
+/// below the apex answering with the apex's RRsets, its SOA and NS among
+/// them.
+pub fn localhost(apex: &EmptyApex) -> Redirect<Zone> {
+    let name = name("localhost.");
+    let zone = apex
+        .zone(&name)
+        .rrset(rrset(&name, RData::A(A(Ipv4Addr::LOCALHOST)), apex.ttl))
+        .rrset(rrset(&name, RData::AAAA(AAAA(Ipv6Addr::LOCALHOST)), apex.ttl));
     Redirect(built(zone))
 }
 
 /// The empty zones of RFC 6303 §4, for the reverse names of private and
 /// special-use addresses, so their questions never leave the resolver,
 /// with the reverse zones of the Shared Address Space, 100.64.0.0/10,
-/// that RFC 6598 §7 added to the same registry and Unbound serves too.
-/// `1.0.0.127.in-addr.arpa` and the reverse name of `::1` point back at
-/// `localhost.`, as in Unbound.
-pub fn rfc6303() -> Vec<Zone> {
+/// that RFC 6598 §7 added to the same registry.
+pub fn rfc6303(apex: &EmptyApex) -> Vec<Zone> {
     let mut apexes: Vec<String> = vec!["10.in-addr.arpa.".to_string()];
     apexes.extend((16..=31).map(|octet| format!("{octet}.172.in-addr.arpa.")));
     apexes.extend((64..=127).map(|octet| format!("{octet}.100.in-addr.arpa.")));
@@ -74,19 +86,7 @@ pub fn rfc6303() -> Vec<Zone> {
     );
     apexes
         .iter()
-        .map(|text| {
-            let apex = name(text);
-            let loopback = match text.as_str() {
-                "127.in-addr.arpa." => Some(name("1.0.0.127.in-addr.arpa.")),
-                LOOPBACK_V6 => Some(apex.clone()),
-                _ => None,
-            };
-            let mut zone = builder(&apex);
-            if let Some(owner) = loopback {
-                zone = zone.rrset(rrset(&owner, RData::PTR(PTR(name("localhost.")))));
-            }
-            built(zone)
-        })
+        .map(|text| built(apex.zone(&name(text))))
         .collect()
 }
 
@@ -99,20 +99,21 @@ const LOOPBACK_V6: &str =
 
 /// `home.arpa`, for names inside a home network, which a resolver answers
 /// locally (RFC 8375 §7).
-pub fn home_arpa() -> Zone {
-    built(builder(&name("home.arpa.")))
+pub fn home_arpa(apex: &EmptyApex) -> Zone {
+    built(apex.zone(&name("home.arpa.")))
 }
 
 /// `resolver.arpa`, holding the resolver's own encrypted endpoints as
 /// SVCB records at `_dns.resolver.arpa` with `ttl`, for clients that
-/// discover them (RFC 9462 §4).
-pub fn resolver_arpa(endpoints: Vec<SVCB>, ttl: u32) -> Zone {
+/// discover them (RFC 9462 §4). With no endpoints it is an empty zone
+/// (RFC 9462 §6.4).
+pub fn resolver_arpa(apex: &EmptyApex, endpoints: Vec<SVCB>, ttl: u32) -> Zone {
     let owner = name("_dns.resolver.arpa.");
     let records = endpoints
         .into_iter()
         .map(|svcb| Record::from_rdata(owner.clone(), ttl, RData::SVCB(svcb)))
         .collect::<Vec<_>>();
-    let mut zone = builder(&name("resolver.arpa."));
+    let mut zone = apex.zone(&name("resolver.arpa."));
     if !records.is_empty() {
         let mut set = RecordSet::with_ttl(owner, records[0].record_type(), ttl);
         set.set_records(records);
@@ -166,70 +167,29 @@ pub fn dohpath() -> (SvcParamKey, SvcParamValue) {
 
 /// `onion`, whose names are reached through Tor and never through DNS:
 /// every name below the apex is NXDOMAIN (RFC 7686 §2).
-pub fn onion() -> Zone {
-    built(builder(&name("onion.")))
+pub fn onion(apex: &EmptyApex) -> Zone {
+    built(apex.zone(&name("onion.")))
 }
 
 /// `test`, kept for testing: every name below the apex is NXDOMAIN
 /// (RFC 6761 §6.2).
-pub fn test() -> Zone {
-    built(builder(&name("test.")))
+pub fn test(apex: &EmptyApex) -> Zone {
+    built(apex.zone(&name("test.")))
 }
 
 /// `invalid`, which never exists: every name below the apex is NXDOMAIN
 /// (RFC 6761 §6.4).
-pub fn invalid() -> Zone {
-    built(builder(&name("invalid.")))
+pub fn invalid(apex: &EmptyApex) -> Zone {
+    built(apex.zone(&name("invalid.")))
 }
 
-/// `service.arpa`, for names of services inside a home network, which
-/// Unbound serves as an empty zone (RFC 9665).
-pub fn service_arpa() -> Zone {
-    built(builder(&name("service.arpa.")))
+/// `service.arpa`, for names of services inside a home network, as an
+/// empty zone (RFC 9665).
+pub fn service_arpa(apex: &EmptyApex) -> Zone {
+    built(apex.zone(&name("service.arpa.")))
 }
 
-/// The SOA Unbound gives a zone it serves itself: `localhost.` as MNAME,
-/// `nobody.invalid.` as RNAME, serial 1, the refresh, retry, and expire
-/// of RFC 6303 §3, and `minimum`.
-pub fn local_soa(minimum: u32) -> SOA {
-    SOA::new(
-        name("localhost."),
-        name("nobody.invalid."),
-        1,
-        3600,
-        1200,
-        604800,
-        minimum,
-    )
-}
-
-/// The SOA and NS RRsets Unbound gives a zone it serves itself at
-/// `apex`, with `ttl` as their TTL and as the SOA's minimum: the SOA of
-/// [`local_soa`] and `NS localhost.`.
-pub fn local_apex(apex: &Name, ttl: u32) -> (RecordSet, RecordSet) {
-    (
-        rrset_with(apex, RData::SOA(local_soa(ttl)), ttl),
-        rrset_with(apex, RData::NS(NS(name("localhost."))), ttl),
-    )
-}
-
-/// A zone at `apex` that holds the RRsets of [`local_apex`], for the
-/// records added after them.
-pub fn local_zone(apex: &Name, ttl: u32) -> ZoneBuilder {
-    let (_, ns) = local_apex(apex, ttl);
-    Zone::builder(apex.clone(), local_soa(ttl), ttl).rrset(ns)
-}
-
-/// A zone at `apex` with the apex records of every zone here.
-fn builder(apex: &Name) -> ZoneBuilder {
-    local_zone(apex, LOCAL_TTL)
-}
-
-fn rrset(owner: &Name, rdata: RData) -> RecordSet {
-    rrset_with(owner, rdata, LOCAL_TTL)
-}
-
-fn rrset_with(owner: &Name, rdata: RData, ttl: u32) -> RecordSet {
+fn rrset(owner: &Name, rdata: RData, ttl: u32) -> RecordSet {
     let mut set = RecordSet::with_ttl(owner.clone(), rdata.record_type(), ttl);
     set.set_records(vec![Record::from_rdata(owner.clone(), ttl, rdata)]);
     set

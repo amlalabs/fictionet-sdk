@@ -44,7 +44,7 @@
 //! # let clock = WallClock { start };
 //! # let validity = Validity { not_before: Time::from_unix(1_700_000_000)?, not_after: Time::from_unix(1_900_000_000)? };
 //! let tls = ca.issue(&fcx, &["dns.example", "45.33.9.9"], validity)?.server_config(&fcx, start)?;
-//! let resolver = Recursive::new(Config::unbound(), clock);
+//! let resolver = Recursive::new(Config::new(), clock);
 //! let fronts = Fronts::new(resolver.handle(), move |_| tls.clone())
 //!     .names([Name::from_ascii("dns.example.")?]);
 //! Net::new()

@@ -12,7 +12,7 @@
 //! ```
 //! # use std::sync::Arc;
 //! # use fictionet::{Attachments, Cx, Result};
-//! # use fictionet::stdlib::services::dns::authority::{Identity, ServerConfig, Zones};
+//! # use fictionet::stdlib::services::dns::authority::{ServerConfig, Zones};
 //! # use fictionet::stdlib::world::net::Net;
 //! # use fictionet::stdlib::world::net::dns::Authoritative;
 //! # use fictionet::stdlib::world::net::dns::internet;
@@ -20,7 +20,7 @@
 //! let root = Arc::new(internet::root_zone(root)?);
 //! Net::new()
 //!     .hosts(internet::root_servers(|_, host| {
-//!         let server = ServerConfig::root(Identity::none());
+//!         let server = ServerConfig::generic();
 //!         host.program(Authoritative::new(Zones::new(vec![root.clone()]), server))
 //!     }))
 //!     .start(&fcx, attachments)?;
@@ -43,7 +43,7 @@ use fictionet::stdlib::protocols::dns::rr::rdata::TXT;
 use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RData, RecordType};
 use fictionet::stdlib::protocols::dns::{Request, dname_substitute};
 use fictionet::stdlib::services::dns::authority::{Authority, Copies, ServerConfig, Step};
-use fictionet::stdlib::services::dns::zone::{AnyResponse, Filing, Zone, ZoneError, dname_target};
+use fictionet::stdlib::services::dns::zone::{Filing, Zone, ZoneError, dname_target};
 use fictionet::stdlib::services::dns::{Client, Generation, Looked, Lookup};
 use fictionet::sync::Mutex;
 
@@ -63,126 +63,9 @@ pub fn server_host(server: &NameServer) -> Host {
         .at(server.v6)
 }
 
-/// One of the thirteen root server letters, with what its operator's
-/// software does wherever it answers.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Letter {
-    /// `<letter>.root-servers.net.` and its addresses.
-    pub server: NameServer,
-    /// Who runs it, as root-servers.org lists it.
-    pub operator: &'static str,
-    /// The EDNS payload size its replies advertise (RFC 6891 §6.2.5).
-    pub payload: u16,
-    /// What it sends for QTYPE ANY at the root (RFC 8482 §4).
-    pub any: AnyResponse,
-}
-
-/// The root letter `index` of [`ROOT_SERVERS`], with what its operator's
-/// software does.
-const fn letter(index: usize, operator: &'static str, payload: u16, any: AnyResponse) -> Letter {
-    Letter {
-        server: ROOT_SERVERS[index],
-        operator,
-        payload,
-        any,
-    }
-}
-
-/// The root servers, in letter order, at the addresses of
-/// [`ROOT_SERVERS`]; operators from root-servers.org. The payload sizes
-/// and ANY answers were seen at each letter on 2026-11-01: b, j, and k
-/// answer `. ANY` with the NS RRset alone, h and l with the SOA alone, and
-/// the others with every RRset. [`root_hints`] gives the same addresses
-/// as resolver hints.
-pub const ROOT_LETTERS: [Letter; 13] = [
-    letter(0, "Verisign", 4096, AnyResponse::All),
-    letter(1, "USC-ISI", 1232, AnyResponse::OneRrset(RecordType::NS)),
-    letter(2, "Cogent", 1232, AnyResponse::All),
-    letter(3, "University of Maryland", 1450, AnyResponse::All),
-    letter(4, "NASA Ames", 1472, AnyResponse::All),
-    letter(5, "ISC", 1472, AnyResponse::All),
-    letter(6, "US DoD (DISA)", 1232, AnyResponse::All),
-    letter(
-        7,
-        "US Army (ARL)",
-        1232,
-        AnyResponse::OneRrset(RecordType::SOA),
-    ),
-    letter(8, "Netnod", 1232, AnyResponse::All),
-    letter(9, "Verisign", 1472, AnyResponse::OneRrset(RecordType::NS)),
-    letter(10, "RIPE NCC", 1232, AnyResponse::OneRrset(RecordType::NS)),
-    letter(11, "ICANN", 4096, AnyResponse::OneRrset(RecordType::SOA)),
-    letter(12, "WIDE", 1232, AnyResponse::All),
-];
-
-/// `<letter>.ns.arpa.` on the root letter `index` of [`ROOT_LETTERS`].
-const fn arpa(host: &'static str, index: usize) -> NameServer {
-    NameServer {
-        host,
-        v4: ROOT_LETTERS[index].server.v4,
-        v6: ROOT_LETTERS[index].server.v6,
-    }
-}
-
-/// The servers of `arpa`: every root letter but j, each at the same
-/// addresses as its letter, as IANA's root zone database lists them
-/// (`https://www.iana.org/domains/root/db/arpa.html`). The root servers
-/// answer for `arpa` themselves, so a [`Mirror`] serves its copy at the
-/// root addresses once a root server answers from it.
-pub const ARPA_SERVERS: [NameServer; 12] = [
-    arpa("a.ns.arpa.", 0),
-    arpa("b.ns.arpa.", 1),
-    arpa("c.ns.arpa.", 2),
-    arpa("d.ns.arpa.", 3),
-    arpa("e.ns.arpa.", 4),
-    arpa("f.ns.arpa.", 5),
-    arpa("g.ns.arpa.", 6),
-    arpa("h.ns.arpa.", 7),
-    arpa("i.ns.arpa.", 8),
-    arpa("k.ns.arpa.", 10),
-    arpa("l.ns.arpa.", 11),
-    arpa("m.ns.arpa.", 12),
-];
-
 const fn server(host: &'static str, v4: Ipv4Addr, v6: Ipv6Addr) -> NameServer {
     NameServer { host, v4, v6 }
 }
-
-/// The servers of `in-addr.arpa`, the reverse names of IPv4 addresses,
-/// which IANA runs under `in-addr-servers.arpa` (RFC 5855). Addresses from
-/// the glue of the `arpa` zone, asked of a.ns.arpa on 2026-11-01.
-pub const IN_ADDR_SERVERS: [NameServer; 6] = [
-    server(
-        "a.in-addr-servers.arpa.",
-        Ipv4Addr::new(199, 180, 182, 53),
-        Ipv6Addr::new(0x2620, 0x37, 0xe000, 0, 0, 0, 0, 0x53),
-    ),
-    server(
-        "b.in-addr-servers.arpa.",
-        Ipv4Addr::new(199, 253, 183, 183),
-        Ipv6Addr::new(0x2001, 0x500, 0x87, 0, 0, 0, 0, 0x87),
-    ),
-    server(
-        "c.in-addr-servers.arpa.",
-        Ipv4Addr::new(196, 216, 169, 10),
-        Ipv6Addr::new(0x2001, 0x43f8, 0x110, 0, 0, 0, 0, 0x10),
-    ),
-    server(
-        "d.in-addr-servers.arpa.",
-        Ipv4Addr::new(200, 10, 60, 53),
-        Ipv6Addr::new(0x2001, 0x13c7, 0x7010, 0, 0, 0, 0, 0x53),
-    ),
-    server(
-        "e.in-addr-servers.arpa.",
-        Ipv4Addr::new(203, 119, 86, 101),
-        Ipv6Addr::new(0x2001, 0xdd8, 0x6, 0, 0, 0, 0, 0x101),
-    ),
-    server(
-        "f.in-addr-servers.arpa.",
-        Ipv4Addr::new(193, 0, 9, 1),
-        Ipv6Addr::new(0x2a13, 0x27c0, 0x30, 0, 0, 0, 0, 0x1),
-    ),
-];
 
 /// The servers of `com` and `net`, which serve both zones, as the root
 /// zone's glue gave them on 2026-11-01.
@@ -257,15 +140,14 @@ pub const GTLD_SERVERS: [NameServer; 13] = [
 // ---------------------------------------------------------------------------
 // Hosts
 
-/// One host per root letter, at both of its addresses, finished by
-/// `build`: the letter, and its [`server_host`]. `build` gives it its
-/// program, usually an [`Authoritative`] with the letter's
-/// [`payload`](Letter::payload) and [`any`](Letter::any) in its front, and
-/// any [`Host::delay`].
-pub fn root_servers(build: impl Fn(&Letter, Host) -> Host) -> Vec<Host> {
-    ROOT_LETTERS
+/// One host per root letter of [`ROOT_SERVERS`], at both of its
+/// addresses, finished by `build`: the letter, and its [`server_host`].
+/// `build` gives it its program, usually an [`Authoritative`] with the
+/// front the world gives that letter, and any [`Host::delay`].
+pub fn root_servers(build: impl Fn(&NameServer, Host) -> Host) -> Vec<Host> {
+    ROOT_SERVERS
         .iter()
-        .map(|letter| build(letter, server_host(&letter.server)))
+        .map(|server| build(server, server_host(server)))
         .collect()
 }
 

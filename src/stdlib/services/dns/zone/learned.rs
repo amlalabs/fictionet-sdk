@@ -357,10 +357,6 @@ impl ZoneData for Learned {
             facts,
         })
     }
-
-    fn learned(&self) -> Option<&Learned> {
-        Some(self)
-    }
 }
 
 impl Facts {
