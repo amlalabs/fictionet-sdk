@@ -3,8 +3,8 @@
 //!
 //! The world copies the real hierarchy ([`net`](crate::net)): machines at
 //! the root and `gtld-servers.net` addresses, and at every name server
-//! address a reply names, answer from records copied from the real server
-//! there. So the guest sees each site's real address and real
+//! address the copied records name, answer from records copied from the
+//! real server there. So the guest sees each site's real address and real
 //! signatures, whether it asks the gateway, a public resolver, or a root
 //! server itself. [`Outbound`] is the world's policy for the lookups
 //! those servers make of the real servers, and [`SessionSource`] is where
@@ -18,15 +18,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fictionet::Cx;
+use fictionet::stdlib::protocols::dns::label_count;
 use fictionet::stdlib::protocols::dns::op::Message;
 use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RData, Record};
-use fictionet::stdlib::protocols::dns::{Request, Response, label_count};
-use fictionet::stdlib::services::dns::{Client, Looked, Lookup};
+use fictionet::stdlib::services::dns::zone::Filing;
+use fictionet::stdlib::services::dns::{Looked, Lookup};
 use fictionet::stdlib::world::net::dns::internet::{Egress, Location};
 use fictionet::stdlib::world::net::dns::{PerSession, Upstream};
 use fictionet::sync::Mutex;
 use fictionet_extras::dns::Replay;
-use fictionet_host::dns::Live;
+use fictionet_host::dns::Internet;
 
 use crate::pages::{Pages, Source as Mode};
 
@@ -106,27 +107,38 @@ fn and_above(name: &LowerName) -> impl Iterator<Item = LowerName> {
         .map(move |labels| LowerName::new(&name.trim_to(labels)))
 }
 
-/// The NS and CNAME targets `message` names, and every name above one.
-fn named_and_above(message: &Message) -> impl Iterator<Item = LowerName> + '_ {
-    targets(message).flat_map(|(target, _)| and_above(&target).collect::<Vec<_>>())
+/// The NS and CNAME targets `records` name, and every name above one.
+fn named_and_above<'a>(
+    records: impl Iterator<Item = &'a Record> + 'a,
+) -> impl Iterator<Item = LowerName> + 'a {
+    targets(records).flat_map(|(target, _)| and_above(&target).collect::<Vec<_>>())
 }
 
-/// The targets of the NS and CNAME records in a reply's answer and
-/// authority sections, with the owner of each CNAME. A DNAME brings the
-/// CNAME it synthesizes (RFC 6672 §2.3), whose target is below the
-/// DNAME's, so the DNAME's own target is among the names above it.
-fn targets(message: &Message) -> impl Iterator<Item = (LowerName, Option<LowerName>)> + '_ {
-    message
-        .answers
+/// The records of a response's answer and authority sections.
+fn answer_and_authority(message: &Message) -> impl Iterator<Item = &Record> {
+    message.answers.iter().chain(&message.authorities)
+}
+
+/// The records of the RRsets `filing` kept.
+fn filed(filing: &Filing) -> impl Iterator<Item = &Record> {
+    filing
+        .sets
         .iter()
-        .chain(&message.authorities)
-        .filter_map(|record: &Record| match &record.data {
-            RData::NS(ns) => Some((LowerName::new(&ns.0), None)),
-            RData::CNAME(cname) => {
-                Some((LowerName::new(&cname.0), Some(LowerName::new(&record.name))))
-            }
-            _ => None,
-        })
+        .flat_map(|set| set.records_without_rrsigs())
+}
+
+/// The targets of the NS and CNAME `records`, with the owner of each
+/// CNAME. A DNAME brings the CNAME it synthesizes (RFC 6672 §2.3), whose
+/// target is below the DNAME's, so the DNAME's own target is among the
+/// names above it.
+fn targets<'a>(
+    records: impl Iterator<Item = &'a Record> + 'a,
+) -> impl Iterator<Item = (LowerName, Option<LowerName>)> + 'a {
+    records.filter_map(|record: &Record| match &record.data {
+        RData::NS(ns) => Some((LowerName::new(&ns.0), None)),
+        RData::CNAME(cname) => Some((LowerName::new(&cname.0), Some(LowerName::new(&record.name)))),
+        _ => None,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -137,11 +149,11 @@ fn targets(message: &Message) -> impl Iterator<Item = (LowerName, Option<LowerNa
 /// [`Pages::serves_host`]) and the names a resolver must ask on the way to
 /// them.
 ///
-/// [`policy`](Self::policy) sees every lookup a mirrored server would make of a
-/// real server: the gateway's, the public resolvers', and a guest's own to
-/// a root or top-level domain server alike. It decides from the question
-/// and the session alone, never from what a guest asked before. A
-/// question's name may leave when:
+/// [`policy`](Self::policy) sees every lookup a mirrored server would make
+/// of a real server, for the gateway's questions, the public resolvers',
+/// and a guest's own to a root or top-level domain server alike. It
+/// decides from the question and the session alone, never from what a
+/// guest asked before. A question's name may leave when:
 ///
 /// 1. it passes `admit` and the session serves it, or it is a name the
 ///    world serves in every session (the model gateway's and the time
@@ -159,8 +171,8 @@ fn targets(message: &Message) -> impl Iterator<Item = (LowerName, Option<LowerNa
 ///    labels, RFC 1035 §3.5) or `ip6.arpa` (at most 32 nibble labels,
 ///    RFC 3596 §2.5), or a name above one, `arpa` included;
 /// 5. the real hierarchy named it, or a name below it, while answering a
-///    question this session: an NS target, or a CNAME target, in a mirrored
-///    reply.
+///    question this session: an NS target, or a CNAME target, in the
+///    records a mirrored zone filed.
 ///
 /// In the live modes every name `admit` takes passes rule 1, so any host
 /// name under any domain already leaves, and a name with other labels
@@ -170,8 +182,9 @@ fn targets(message: &Message) -> impl Iterator<Item = (LowerName, Option<LowerNa
 /// guest could already ask about. Names under rule 5 were chosen by those
 /// operators, not by the guest.
 ///
-/// [`observer`](Self::observer) feeds rule 5 from the mirrored servers' replies. The
-/// names it learned are forgotten when the session changes.
+/// [`observer`](Self::observer) feeds rule 5 from the records the mirrored
+/// zones file, which are what their servers answer with. The names it
+/// learned are forgotten when the session changes.
 #[derive(Clone)]
 pub struct Outbound {
     inner: Arc<OutboundInner>,
@@ -187,10 +200,10 @@ struct OutboundInner {
 /// What the real hierarchy named this session.
 #[derive(Default)]
 struct Named {
-    /// Every NS and CNAME target the mirrored servers gave, and every name
+    /// Every NS and CNAME target the mirrored zones filed, and every name
     /// above one.
     below: HashSet<LowerName>,
-    /// The owners of the CNAME records the mirrored servers gave, by target.
+    /// The owners of the CNAME records the mirrored zones filed, by target.
     aliases: HashMap<LowerName, HashSet<LowerName>>,
 }
 
@@ -215,10 +228,11 @@ impl Outbound {
     }
 
     /// The observer for [`Mirror::observe`](fictionet::stdlib::world::net::dns::internet::Mirror::observe):
-    /// learns the NS and CNAME targets of each mirrored server's reply.
-    pub fn observer(&self) -> impl Fn(&Request, &Client, &Response) + Send + Sync + 'static {
+    /// learns the NS and CNAME targets of the records each mirrored zone
+    /// files.
+    pub fn observer(&self) -> impl Fn(&Filing) + Send + Sync + 'static {
         let outbound = self.clone();
-        move |_request, _client, reply| outbound.learn(&reply.message)
+        move |filing| outbound.learn(filing)
     }
 
     /// Whether the session lets `name` out by rule 1: the names it gives
@@ -236,8 +250,8 @@ impl Outbound {
             }
     }
 
-    /// The names the mirrored servers gave as aliases of `target` this session,
-    /// through any number of CNAME records.
+    /// The names the mirrored zones filed as aliases of `target` this
+    /// session, through any number of CNAME records.
     pub fn aliases(&self, target: &LowerName) -> Vec<LowerName> {
         self.named(|named| {
             let mut found: Vec<LowerName> = Vec::new();
@@ -297,15 +311,15 @@ impl Outbound {
         above > 0 && self.admits(&LowerName::new(&name.trim_to(above)))
     }
 
-    /// Notes the targets `message`, a mirrored server's reply, names.
-    fn learn(&self, message: &Message) {
+    /// Notes the targets the records `filing` kept name.
+    fn learn(&self, filing: &Filing) {
         self.named(|named| {
-            for (target, owner) in targets(message) {
+            for (target, owner) in targets(filed(filing)) {
                 if let Some(owner) = owner {
                     named.aliases.entry(target).or_default().insert(owner);
                 }
             }
-            named.below.extend(named_and_above(message));
+            named.below.extend(named_and_above(filed(filing)));
         })
     }
 
@@ -359,11 +373,10 @@ fn reverse(name: &LowerName) -> bool {
 /// A Copied session gives a lookup its capture lacks no reply, so the
 /// server that needed it stays silent and a resolver caches a failure,
 /// not a negative answer. The exception is a lookup of a name the world
-/// serves in every session (the model
-/// gateway's and the time server's), a name above
-/// one, or a name server or alias target the hierarchy named while
-/// answering one: those go to the internet, or the agent would lose its
-/// model and its clock.
+/// serves in every session (the model gateway's and the time server's),
+/// a name above one, or a name server or alias target the hierarchy
+/// named while answering one: those go to the internet, or the agent
+/// would lose its model and its clock.
 ///
 /// The source is chosen again each time the world's namespace advances,
 /// for the mode the new session runs in.
@@ -442,12 +455,12 @@ impl Upstream for SessionSource {
 
 /// The source for a session of `pages` in the mode it runs in now.
 fn session(pages: &Pages, needed: &Arc<[LowerName]>) -> Chosen {
-    let live = pages.live_dns();
+    let internet = pages.live_dns();
     match (pages.source(), pages.copied_dns()) {
         (Mode::Copied, Some(replay)) => {
             let copied = Arc::new(Copied {
                 replay,
-                live,
+                internet,
                 needed: Mutex::new(needed.iter().flat_map(and_above).collect()),
                 fresh: Mutex::new(needed.iter().cloned().collect()),
             });
@@ -457,7 +470,7 @@ fn session(pages: &Pages, needed: &Arc<[LowerName]>) -> Chosen {
             }
         }
         _ => Chosen {
-            source: live,
+            source: internet,
             copied: None,
         },
     }
@@ -467,7 +480,7 @@ fn session(pages: &Pages, needed: &Arc<[LowerName]>) -> Chosen {
 /// that resolve in every session.
 struct Copied {
     replay: Arc<Replay>,
-    live: Arc<Live>,
+    internet: Arc<Internet>,
     /// The names that resolve in every session, the name servers and
     /// alias targets the hierarchy named for them, and every name above
     /// one of those.
@@ -487,13 +500,15 @@ impl Upstream for Copied {
             let name = LowerName::new(lookup.question.name());
             let needed = self.needed.lock().contains(&name);
             let looked = match self.replay.lookup(fcx, lookup.clone()).await {
-                Looked::NoReply if needed => self.live.lookup(fcx, lookup).await,
+                Looked::NoReply if needed => self.internet.lookup(fcx, lookup).await,
                 looked => looked,
             };
             if needed && let Looked::Response(message) = &looked {
-                self.needed.lock().extend(named_and_above(message));
+                self.needed
+                    .lock()
+                    .extend(named_and_above(answer_and_authority(message)));
                 let mut fresh = self.fresh.lock();
-                for (target, owner) in targets(message) {
+                for (target, owner) in targets(answer_and_authority(message)) {
                     if owner.is_some_and(|owner| fresh.contains(&owner)) {
                         fresh.insert(target);
                     }
@@ -512,9 +527,9 @@ impl Pages {
     /// reach only its own resolver or has no IPv4: the world runs all the
     /// same, and leaves those names to the real hierarchy.
     pub async fn egress(&self, fcx: &Cx) -> Option<Egress> {
-        let live = self.live_dns();
+        let internet = self.live_dns();
         let found = fcx
-            .race(Some(fcx.now() + EGRESS_WAIT), live.egress(fcx))
+            .race(Some(fcx.now() + EGRESS_WAIT), internet.egress(fcx))
             .await;
         match found {
             Ok(Some(std::net::IpAddr::V4(address))) => Some(Egress(address)),
@@ -531,7 +546,7 @@ impl Pages {
     /// and public resolver servers it reaches describe themselves, so
     /// their answers agree with `egress` wherever the host runs.
     pub async fn location(&self, fcx: &Cx, egress: Option<Egress>) -> Location {
-        let live = self.live_dns();
-        Location::measured(fcx, &*live, egress, EGRESS_WAIT).await
+        let internet = self.live_dns();
+        Location::measured(fcx, &*internet, egress, EGRESS_WAIT).await
     }
 }

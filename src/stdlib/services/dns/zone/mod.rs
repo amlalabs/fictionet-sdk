@@ -11,7 +11,7 @@
 //! | --- | --- |
 //! | [`Zone`] | Everything: a complete zone, built with [`Zone::builder`] or read with [`Zone::from_master`]. Nothing is unknown. |
 //! | [`Lazy`] | The names a [`Provider`] gives when they are first asked. What the provider does not know stays unknown. |
-//! | [`Learned`] | What the zone's real servers answered, filed as records with their RRSIGs and proofs. What they have not answered stays unknown, and a server looks it up. |
+//! | [`Learned`] | What the zone's real servers answered, filed as records with their RRSIGs and proofs. What they have not answered stays unknown, and a server looks it up. Each [`Filing`] says what one response gave it. |
 //! | [`Redirect`] | The apex of the zone it wraps, for every name below it too. |
 //! | [`Shown`] | Some RRsets of one name, each for its own type. Every other fact is unknown. |
 //! | [`Transparent`] | The names with RRsets in the zone it wraps. Every other name is unknown, so a resolver goes on to iterate. |
@@ -50,7 +50,7 @@ pub use cover::cover;
 pub(crate) use cover::negative_ttl;
 pub use data::{Denied, Fact, Provider, Redirect, Revision, Shown, Transparent, View, ZoneData};
 pub use lazy::Lazy;
-pub use learned::Learned;
+pub use learned::{Filing, Learned};
 pub use master::MasterError;
 pub use signed::{Denial, Signed};
 pub(crate) use zone::targets;

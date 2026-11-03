@@ -1,41 +1,49 @@
 //! A world's lookups put to real servers on the internet, as an
 //! [`Upstream`] for its learned zones.
 //!
-//! [`Live`] sends each lookup from the host, over UDP and then over TCP
-//! when the response comes back truncated, on a Tokio runtime it owns.
-//! The world's executor only waits for the outcome.
+//! [`Internet`] asks each lookup from the host through hickory's client
+//! transports (`hickory-net`): over UDP, and over TCP when the response
+//! comes back truncated, on a Tokio runtime it owns. The world's executor
+//! only waits for the outcome.
 
-use std::future::{Future, ready};
-use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::future::Future;
+use std::net::IpAddr;
 use std::pin::Pin;
 use std::str::FromStr;
+use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, UdpSocket};
+use futures_util::StreamExt;
+use hickory_net::runtime::TokioRuntimeProvider;
+use hickory_net::tcp::TcpClientStream;
+use hickory_net::udp::UdpClientStream;
+use hickory_net::xfer::DnsRequestSender;
+use hickory_net::{DnsHandle, NetError};
 use tokio::runtime::Runtime;
 use tokio::task::AbortHandle;
 
 use fictionet::Cx;
-use fictionet::stdlib::protocols::dns::op::{Edns, Message, MessageType, OpCode, Query};
+use fictionet::stdlib::protocols::dns::Nsid;
+use fictionet::stdlib::protocols::dns::op::{
+    DnsRequest, DnsRequestOptions, DnsResponse, Edns, Message, MessageType, OpCode, Query,
+};
 use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RData, RecordType};
-use fictionet::stdlib::protocols::dns::{Nsid, read_message, stream_framed};
 use fictionet::stdlib::services::dns::{Looked, Lookup};
 use fictionet::stdlib::world::net::dns::Upstream;
 use fictionet::sync::Mutex;
-
-/// The largest DNS message a UDP datagram or a TCP frame can carry: the
-/// length prefix on TCP is two octets (RFC 1035 §4.2.2), and EDNS lets a
-/// UDP reply be as large (RFC 6891 §6.2.5).
-const MAX_MESSAGE: usize = u16::MAX as usize;
 
 /// The UDP payload size a lookup advertises: the size the DNS Flag Day
 /// 2020 settled on (RFC 6891 §6.2.5).
 const PAYLOAD: u16 = 1232;
 
-/// `ns1.google.com`, which answers a TXT question for
-/// [`WHOAMI`] with the address the question came from.
-const WHOAMI_SERVER: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(216, 239, 32, 10)), 53);
+/// How long hickory's transports wait on their own: without end, since
+/// the engine that made a lookup decides how long to wait and drops the
+/// lookup when it gives up.
+const NO_TIMEOUT: Duration = Duration::MAX;
+
+/// `ns1.google.com`, which answers a TXT question for [`WHOAMI`] with the
+/// address the question came from.
+const WHOAMI_SERVER: std::net::SocketAddr =
+    std::net::SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(216, 239, 32, 10)), 53);
 
 /// Google's name for asking which address a question came from.
 const WHOAMI: &str = "o-o.myaddr.l.google.com.";
@@ -45,39 +53,45 @@ const WHOAMI_ZONE: &str = "google.com.";
 
 /// The internet's DNS servers, asked from this host.
 ///
-/// Each lookup goes out as one query: a fresh ID drawn from the run's
-/// seeded random stream (RFC 5452 §9.2), the lookup's question and RD
-/// bit, and an OPT record with a 1232-octet payload, DO set (RFC 3225 §3),
-/// and an NSID request (RFC 5001). A datagram that does not carry that ID
-/// and the question back is not the response and is ignored, as RFC 5452
-/// §9.1 requires; a UDP response with TC set is asked again over TCP
-/// (RFC 7766 §5). The response comes back decoded. A refused or
-/// unreachable server is [`Looked::Unreachable`].
+/// Each lookup goes out as one query over UDP through hickory's
+/// `UdpClientStream`: a fresh ID drawn from the run's seeded random stream
+/// (RFC 5452 §9.2) from a random source port, the lookup's question and
+/// RD bit, and an OPT record with a 1232-octet payload, DO set (RFC 3225
+/// §3), and an NSID request (RFC 5001). hickory ignores a datagram from
+/// another address or port, or without that ID and the question back
+/// (RFC 5452 §9.1). A UDP response with TC set is asked again over one
+/// TCP connection through hickory's `TcpClientStream` (RFC 7766 §5), and
+/// a truncated response is never given as the outcome: its sections may
+/// be incomplete (RFC 2181 §9). The response comes back decoded. A server
+/// that refuses the TCP connection, or that the host cannot send to, is
+/// [`Looked::Unreachable`]; a response that does not answer the lookup's
+/// question, or a connection that ends without one, is
+/// [`Looked::NoReply`].
 ///
-/// A lookup waits until its response comes. The engine that made it
-/// decides how long to wait, and its driver drops the lookup when it
-/// gives up, which stops it here too.
-pub struct Live {
+/// A query is sent once and waits until its response comes. The engine
+/// that made it decides how long to wait, and its driver drops the lookup
+/// when it gives up, which stops it here too.
+pub struct Internet {
     runtime: Option<Runtime>,
     egress: Mutex<Option<IpAddr>>,
 }
 
-impl Default for Live {
-    fn default() -> Live {
-        Live::new()
+impl Default for Internet {
+    fn default() -> Internet {
+        Internet::new()
     }
 }
 
-impl Live {
+impl Internet {
     /// An upstream that asks the internet from this host.
-    pub fn new() -> Live {
+    pub fn new() -> Internet {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
             .thread_name("fictionet-dns")
             .build()
             .expect("create the DNS runtime");
-        Live {
+        Internet {
             runtime: Some(runtime),
             egress: Mutex::new(None),
         }
@@ -92,7 +106,7 @@ impl Live {
     }
 
     /// The address `server` says a whoami question came from.
-    async fn whoami(&self, fcx: &Cx, server: SocketAddr) -> Option<IpAddr> {
+    async fn whoami(&self, fcx: &Cx, server: std::net::SocketAddr) -> Option<IpAddr> {
         if let Some(address) = *self.egress.lock() {
             return Some(address);
         }
@@ -119,7 +133,7 @@ impl Live {
     }
 }
 
-impl Drop for Live {
+impl Drop for Internet {
     fn drop(&mut self) {
         // The last owner may be dropped inside another runtime's task.
         if let Some(runtime) = self.runtime.take() {
@@ -128,7 +142,7 @@ impl Drop for Live {
     }
 }
 
-impl Upstream for Live {
+impl Upstream for Internet {
     fn lookup<'a>(
         &'a self,
         fcx: &'a Cx,
@@ -136,23 +150,14 @@ impl Upstream for Live {
     ) -> Pin<Box<dyn Future<Output = Looked> + Send + 'a>> {
         let mut id = [0; 2];
         fcx.fill_random(&mut id);
-        let id = u16::from_be_bytes(id);
-        let Ok(query) = query(id, &lookup).to_vec() else {
-            return Box::pin(ready(Looked::NoReply));
-        };
-        let exchange = Exchange {
-            server: lookup.server,
-            id,
-            query,
-            lookup,
-        };
+        let request = request(u16::from_be_bytes(id), &lookup);
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let runtime = self
             .runtime
             .as_ref()
-            .expect("the runtime lives as long as Live");
+            .expect("the runtime lives as long as Internet");
         let task = runtime.spawn(async move {
-            let _ = sender.send(exchange.udp().await);
+            let _ = sender.send(ask(&lookup, request).await);
         });
         let abort = Abort(task.abort_handle());
         Box::pin(async move {
@@ -162,9 +167,9 @@ impl Upstream for Live {
     }
 }
 
-/// The query for `lookup` with `id`: its question and RD bit, and an OPT
+/// The request for `lookup` with `id`: its question and RD bit, and an OPT
 /// record with DO set and an NSID request.
-fn query(id: u16, lookup: &Lookup) -> Message {
+fn request(id: u16, lookup: &Lookup) -> DnsRequest {
     let mut message = Message::new(id, MessageType::Query, OpCode::Query);
     message.metadata.recursion_desired = lookup.recursion_desired;
     message.add_query(lookup.question.clone());
@@ -172,91 +177,58 @@ fn query(id: u16, lookup: &Lookup) -> Message {
     edns.set_max_payload(PAYLOAD).set_dnssec_ok(true);
     edns.options_mut().insert(Nsid(Vec::new()).to_option());
     message.set_edns(edns);
-    message
+    let mut options = DnsRequestOptions::default();
+    options.recursion_desired = lookup.recursion_desired;
+    options.edns_payload_len = PAYLOAD;
+    options.edns_set_dnssec_ok = true;
+    DnsRequest::new(message, options)
 }
 
-/// One lookup on its way to a real server.
-struct Exchange {
-    server: SocketAddr,
-    /// The ID the query went out with.
-    id: u16,
-    /// The query's octets.
-    query: Vec<u8>,
-    /// The lookup, to tell its response from other datagrams.
-    lookup: Lookup,
+/// What `lookup.server` gives `request`: over UDP, and over TCP when the
+/// UDP response is truncated.
+async fn ask(lookup: &Lookup, request: DnsRequest) -> Looked {
+    let provider = TokioRuntimeProvider::new();
+    let mut udp = UdpClientStream::builder(lookup.server, provider.clone())
+        .with_timeout(Some(NO_TIMEOUT))
+        // hickory counts the first send among its tries.
+        .with_max_retries(1)
+        .build();
+    let response = match udp.send_message(request.clone()).next().await {
+        Some(Ok(response)) => response,
+        Some(Err(error)) => return failed(error),
+        None => return Looked::NoReply,
+    };
+    if !response.metadata.truncation {
+        return answered(lookup, response);
+    }
+    let Ok(tcp) = TcpClientStream::exchange(lookup.server, None, NO_TIMEOUT, None, provider).await
+    else {
+        return Looked::Unreachable;
+    };
+    match tcp.send(request).next().await {
+        Some(Ok(response)) if !response.metadata.truncation => answered(lookup, response),
+        Some(Err(error)) => failed(error),
+        Some(Ok(_)) | None => Looked::NoReply,
+    }
 }
 
-impl Exchange {
-    /// Asks over UDP, and over TCP when the response is truncated. If TCP
-    /// then brings nothing, the truncated response is what came.
-    async fn udp(&self) -> Looked {
-        let response = match self.datagram().await {
-            Ok(response) => response,
-            Err(_) => return Looked::Unreachable,
-        };
-        if !response.metadata.truncation {
-            return Looked::Response(response);
-        }
-        match self.tcp().await {
-            Looked::Response(whole) => Looked::Response(whole),
-            Looked::Unreachable | Looked::NoReply => Looked::Response(response),
-        }
+/// `response` as the outcome of `lookup`, if it answers the lookup's
+/// question.
+fn answered(lookup: &Lookup, response: DnsResponse) -> Looked {
+    let response = response.into_message();
+    if lookup.answered_by(&response) {
+        Looked::Response(response)
+    } else {
+        Looked::NoReply
     }
+}
 
-    /// The first datagram from the server that answers the lookup.
-    async fn datagram(&self) -> io::Result<Message> {
-        let local = match self.server {
-            SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            SocketAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-        };
-        let socket = UdpSocket::bind(SocketAddr::new(local, 0)).await?;
-        // A connected socket takes datagrams only from the server, and
-        // reports the server's port unreachable as a refused receive.
-        socket.connect(self.server).await?;
-        socket.send(&self.query).await?;
-        let mut buffer = vec![0; MAX_MESSAGE];
-        loop {
-            let length = socket.recv(&mut buffer).await?;
-            if let Some(response) = self.response(&buffer[..length]) {
-                return Ok(response);
-            }
-        }
-    }
-
-    /// Asks over one TCP connection (RFC 7766 §6.2.1). A connection that
-    /// cannot be made is unreachable; one that ends before the response
-    /// brought none.
-    async fn tcp(&self) -> Looked {
-        let Ok(mut stream) = TcpStream::connect(self.server).await else {
-            return Looked::Unreachable;
-        };
-        // A query no stream can carry reaches no server.
-        let Some(frame) = stream_framed(&self.query) else {
-            return Looked::Unreachable;
-        };
-        if stream.write_all(&frame).await.is_err() {
-            return Looked::NoReply;
-        }
-        loop {
-            let mut length = [0; 2];
-            if stream.read_exact(&mut length).await.is_err() {
-                return Looked::NoReply;
-            }
-            let mut reply = vec![0; usize::from(u16::from_be_bytes(length))];
-            if stream.read_exact(&mut reply).await.is_err() {
-                return Looked::NoReply;
-            }
-            if let Some(response) = self.response(&reply) {
-                return Looked::Response(response);
-            }
-        }
-    }
-
-    /// `reply` decoded, if it is the server's response to this lookup: the
-    /// query's ID, QR set, and the question back (RFC 5452 §9.1).
-    fn response(&self, reply: &[u8]) -> Option<Message> {
-        let response = read_message(reply).ok()?;
-        (response.metadata.id == self.id && self.lookup.answered_by(&response)).then_some(response)
+/// What a transport's `error` means for a lookup: the host could not send
+/// or connect, or no response came.
+fn failed(error: NetError) -> Looked {
+    match error {
+        NetError::Io(_) => Looked::Unreachable,
+        _ => Looked::NoReply,
     }
 }
 
@@ -275,10 +247,9 @@ mod tests {
     use fictionet::stdlib::protocols::dns::rr::Record;
     use fictionet::stdlib::protocols::dns::rr::rdata::{A, TXT};
     use std::io::{Read, Write};
-    use std::net::{TcpListener, UdpSocket};
+    use std::net::{Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
     use std::sync::mpsc;
     use std::thread;
-    use std::time::Duration;
 
     fn run<F: Future<Output = ()> + Send + 'static>(test: impl FnOnce(Cx) -> F + Send) {
         fictionet::block_on(fictionet::run(Seed::from_u64(1), |fcx| {
@@ -324,6 +295,13 @@ mod tests {
         }
     }
 
+    /// The query's ID, which hickory's TCP transport sets afresh.
+    fn without_id(query: &[u8]) -> Message {
+        let mut query = Message::from_vec(query).unwrap();
+        query.metadata.id = 0;
+        query
+    }
+
     #[test]
     fn a_truncated_reply_is_asked_again_over_tcp() {
         let (udp, tcp) = sockets();
@@ -336,7 +314,7 @@ mod tests {
         );
         let record = answer.clone();
         let server_thread = thread::spawn(move || {
-            let mut buffer = [0; 512];
+            let mut buffer = [0; 1232];
             let (length, client) = udp.recv_from(&mut buffer).unwrap();
             let asked = buffer[..length].to_vec();
             // A datagram with another ID comes first, as a spoofed reply
@@ -364,8 +342,8 @@ mod tests {
             seen.send(asked).unwrap();
         });
         run(async move |fcx| {
-            let live = Live::new();
-            let looked = live
+            let internet = Internet::new();
+            let looked = internet
                 .lookup(&fcx, lookup(server, "www.example.test.", RecordType::A))
                 .await;
             let Looked::Response(response) = looked else {
@@ -378,12 +356,14 @@ mod tests {
             let over_tcp = queries.recv().unwrap();
             // The same query on both transports: the lookup's question,
             // no recursion, and DO with an NSID request.
-            assert_eq!(over_udp, over_tcp);
+            assert_eq!(without_id(&over_udp), without_id(&over_tcp));
             let query = Message::from_vec(&over_udp).unwrap();
             assert!(!query.metadata.recursion_desired);
+            assert_eq!(query.queries.len(), 1);
             assert_eq!(query.queries[0].name().to_ascii(), "www.example.test.");
             let edns = query.edns.expect("an OPT record");
             assert!(edns.flags().dnssec_ok);
+            assert_eq!(edns.max_payload(), PAYLOAD);
             assert!(
                 edns.options()
                     .as_ref()
@@ -394,18 +374,27 @@ mod tests {
         server_thread.join().unwrap();
     }
 
+    /// A truncated response whose server then refuses TCP is no outcome:
+    /// the lookup is unreachable, and the partial response is dropped.
     #[test]
-    fn a_closed_port_is_unreachable() {
+    fn a_truncated_reply_without_tcp_is_unreachable() {
         let (udp, tcp) = sockets();
         let server = udp.local_addr().unwrap();
-        drop((udp, tcp));
+        drop(tcp);
+        let server_thread = thread::spawn(move || {
+            let mut buffer = [0; 1232];
+            let (length, client) = udp.recv_from(&mut buffer).unwrap();
+            udp.send_to(&reply_to(&buffer[..length], vec![], true), client)
+                .unwrap();
+        });
         run(async move |fcx| {
-            let live = Live::new();
-            let looked = live
+            let internet = Internet::new();
+            let looked = internet
                 .lookup(&fcx, lookup(server, "www.example.test.", RecordType::A))
                 .await;
             assert_eq!(looked, Looked::Unreachable);
         });
+        server_thread.join().unwrap();
     }
 
     #[test]
@@ -413,7 +402,7 @@ mod tests {
         let (udp, _tcp) = sockets();
         let server = udp.local_addr().unwrap();
         let server_thread = thread::spawn(move || {
-            let mut buffer = [0; 512];
+            let mut buffer = [0; 1232];
             let (length, client) = udp.recv_from(&mut buffer).unwrap();
             let asked = &buffer[..length];
             let question = Message::from_vec(asked).unwrap();
@@ -430,10 +419,10 @@ mod tests {
             drop(udp);
         });
         run(async move |fcx| {
-            let live = Live::new();
+            let internet = Internet::new();
             let expected = Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)));
-            assert_eq!(live.whoami(&fcx, server).await, expected);
-            assert_eq!(live.whoami(&fcx, server).await, expected);
+            assert_eq!(internet.whoami(&fcx, server).await, expected);
+            assert_eq!(internet.whoami(&fcx, server).await, expected);
         });
         server_thread.join().unwrap();
     }

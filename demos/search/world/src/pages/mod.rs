@@ -222,7 +222,7 @@ pub struct Pages {
     namespace: fictionet::stdlib::world::net::dns::Namespace,
     /// The internet's DNS servers, asked from the host: made when first
     /// needed, and shared by every session.
-    live_dns: std::sync::OnceLock<Arc<fictionet_host::dns::Live>>,
+    live_dns: std::sync::OnceLock<Arc<fictionet_host::dns::Internet>>,
     /// What runs when the session comes to serve hosts it did not.
     served: Served,
 }

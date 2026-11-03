@@ -1,5 +1,5 @@
 //! Host transports for worlds: the HTTP client behind the core's
-//! explicitly injected web proxy, and [`dns::Live`], which puts a world's
+//! explicitly injected web proxy, and [`dns::Internet`], which puts a world's
 //! DNS lookups to real servers.
 
 #[cfg(not(target_arch = "wasm32"))]

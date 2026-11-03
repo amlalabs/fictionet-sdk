@@ -1,8 +1,8 @@
 //! DNS lookups kept in WARC archives beside captured pages, and played
 //! back as an [`Upstream`].
 //!
-//! [`Capture`] records what another upstream, such as the host's live
-//! one, gives for each lookup, and writes it as two WARC records: a
+//! [`Capture`] records what another upstream, such as the internet asked
+//! from the host, gives for each lookup, and writes it as two WARC records: a
 //! `request` holding the query the lookup stands for and a `response`
 //! holding the server's response, both as `application/dns-message`
 //! (RFC 8484 §6), with the server and the question in a `dns:` target URI

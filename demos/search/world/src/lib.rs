@@ -30,10 +30,10 @@ use std::time::SystemTime;
 
 use fictionet::Cx;
 use fictionet::stdlib::network::ip::non_public_address;
-use fictionet::stdlib::protocols::dns::op::Message;
 use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RData};
 use fictionet::stdlib::services::dns::Event;
 use fictionet::stdlib::services::dns::resolver::{Config, NegativeAnchors};
+use fictionet::stdlib::services::dns::zone::Filing;
 use fictionet::stdlib::services::tls::ServerConfig;
 use fictionet::stdlib::web;
 use fictionet::stdlib::world::net::dns::encrypted::Fronts;
@@ -53,20 +53,20 @@ pub use tls::Ca;
 /// Builds the world's unstarted network on the real DNS hierarchy, copied.
 ///
 /// The root and `gtld-servers.net` servers answer from records copied from
-/// the real ones, from the internet or a Copied session's capture, and the mirror
-/// places a server at each name server address their replies name, so
-/// every name the world serves resolves through the real hierarchy. Only
-/// the lookups the world's outbound policy allows reach a real server
-/// (`dns::Outbound`). The
-/// public resolvers run at their real addresses, and the gateway runs a
-/// recursive resolver like Unbound with the root hints, holding no data of
-/// its own. Every DNS reply either kind of resolver gives a client is
-/// reported as [`SearchObs::Resolved`].
+/// the real ones, from the internet or a Copied session's capture, and the
+/// mirror places a server at each name server address the copied records
+/// name, so every name the world serves resolves through the real
+/// hierarchy. Only the lookups the world's outbound policy allows reach a
+/// real server (`dns::Outbound`). The public resolvers run at their real
+/// addresses, and the gateway runs a recursive resolver like Unbound with
+/// the root hints, holding no data of its own. Every DNS reply either
+/// kind of resolver gives a client is reported as
+/// [`SearchObs::Resolved`].
 ///
-/// Each A record a mirrored server's reply gives for a name the session lets out
-/// gets a machine at that address, before the reply leaves: the
-/// `forwarded` host given for that name, such as the model gateway, or a
-/// site whose pages come from [`Pages`]. So the guest connects to the
+/// Each A record a mirrored zone files for a name the session lets out
+/// gets a machine at that address, before the reply that needed it
+/// leaves: the `forwarded` host given for that name, such as the model
+/// gateway, or a site whose pages come from [`Pages`]. So the guest connects to the
 /// address the real DNS gave, and the world changes the machine there,
 /// never the DNS. `location` is where the host is ([`Pages::location`]),
 /// with its public address, when known, which the public resolvers'
@@ -125,7 +125,7 @@ pub fn net(
     let mut mirror = Mirror::new(Only::new(outbound.policy(), source), handle, &location)
         .namespace(&namespace)
         .observe(outbound.observer())
-        .observe(move |_request, _client, reply| sites.place(&reply.message));
+        .observe(move |filing| sites.place(filing));
     // Each public resolver's DNS over HTTPS names, such as
     // `cloudflare-dns.com`, have addresses of their own, where the mirror
     // places a front that puts queries to the resolver's primary address.
@@ -246,16 +246,16 @@ struct Sites {
     /// once a session serves it: a guest that resolved the name keeps
     /// the address for the record's TTL.
     refused: Mutex<HashMap<LowerName, HashSet<Ipv4Addr>>>,
-    /// The IPv4 addresses mirrored replies gave each name this session,
-    /// its own or those at the end of its CNAME chain.
+    /// The IPv4 addresses the mirrored zones filed for each name this
+    /// session, its own or those at the end of its CNAME chain.
     addresses: PerSession<HashMap<LowerName, HashSet<Ipv4Addr>>>,
 }
 
 impl Sites {
-    /// Places a machine at each IPv4 address `reply`, a mirrored server's
-    /// reply, gives in an A record, for the record's name and every name
-    /// a CNAME in it made an alias of it, as long as the session lets the
-    /// name out. A CNAME whose target's addresses an earlier reply gave
+    /// Places a machine at each IPv4 address `filing`, what a mirrored
+    /// zone filed, gives in an A record, for the record's name and every
+    /// name a CNAME made an alias of it, as long as the session lets the
+    /// name out. A filed CNAME whose target's addresses were filed before
     /// places its owner there too, since a resolver that has the target's
     /// addresses cached does not ask for them again. A name is placed at
     /// an address once: several names at one address share its machine,
@@ -267,10 +267,14 @@ impl Sites {
     /// machine for the name. A name the session resolves but does not
     /// serve, outside Live-Depth's depth, gets no site: a machine there
     /// with no services refuses connections at TCP.
-    fn place(&self, reply: &Message) {
-        let mut found: Vec<(LowerName, Ipv4Addr)> = reply
-            .answers
-            .iter()
+    fn place(&self, filing: &Filing) {
+        let records = || {
+            filing
+                .sets
+                .iter()
+                .flat_map(|set| set.records_without_rrsigs())
+        };
+        let mut found: Vec<(LowerName, Ipv4Addr)> = records()
             .filter_map(|record| match &record.data {
                 RData::A(a) if !non_public_address(a.0.into()) => {
                     Some((LowerName::new(&record.name), a.0))
@@ -283,7 +287,7 @@ impl Sites {
             for (name, addr) in &found {
                 addresses.entry(name.clone()).or_default().insert(*addr);
             }
-            for record in &reply.answers {
+            for record in records() {
                 if let RData::CNAME(cname) = &record.data
                     && let Some(known) = addresses.get(&LowerName::new(&cname.0))
                 {

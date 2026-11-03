@@ -15,9 +15,11 @@ use fictionet::stdlib::protocols::dns::op::{Edns, Message, OpCode, Query, Respon
 use fictionet::stdlib::protocols::dns::rr::rdata::TXT;
 use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, Name, RData, Record, RecordType};
 use fictionet::stdlib::protocols::dns::{Nsid, Parsed, Request, Response};
-use fictionet::stdlib::services::dns::authority::{Identity, ServerConfig};
+use fictionet::stdlib::services::dns::authority::{Identity, Observe, ServerConfig};
 use fictionet::stdlib::services::dns::resolver::Config;
-use fictionet::stdlib::services::dns::zone::{Answered, AnyResponse, Zone, ZoneData, answer};
+use fictionet::stdlib::services::dns::zone::{
+    Answered, AnyResponse, Filing, Zone, ZoneData, answer,
+};
 use fictionet::stdlib::services::dns::{Client, Event, Generation, Looked, Lookup, WallClock};
 use fictionet::stdlib::services::serve::Transport;
 use fictionet::stdlib::world::net::dns::internet::{
@@ -79,6 +81,7 @@ ns.private. 172800 IN A 192.168.1.53
 home. 172800 IN NS ns.home.
 ns.home. 172800 IN A 45.70.0.9
 cloudflare-dns.com. 300 IN A 45.33.6.6
+alias-dns.com. 300 IN CNAME cloudflare-dns.com.
 plain. 300 IN A 45.33.7.7
 ";
 
@@ -585,9 +588,9 @@ fn nsid(reply: &Message) -> Option<Vec<u8>> {
         .map(|nsid| nsid.0)
 }
 
-/// A referral with glue places a server at the glue address before the
-/// referral reaches the client, so the client's next question to that
-/// address is answered. An answer for a name no NS RRset named
+/// A referral with glue, once filed, places a server at the glue address
+/// before the referral reaches the client, so the client's next question
+/// to that address is answered. An answer for a name no NS RRset named
 /// places nothing.
 #[test]
 fn the_mirror_places_a_server_at_referral_glue_before_the_reply_leaves() {
@@ -868,8 +871,8 @@ fn addresses_on_the_sandbox_subnet_or_off_the_internet_are_never_placed() {
     });
 }
 
-/// The addresses a mirrored server's reply gives for a name with a front get that
-/// front, and no server.
+/// The addresses filed for a name with a front get that front, and no
+/// server.
 #[test]
 fn a_front_goes_at_the_addresses_answered_for_its_name() {
     world(Duration::from_secs(60), |fcx| async move {
@@ -914,6 +917,114 @@ fn a_front_goes_at_the_addresses_answered_for_its_name() {
         )
         .await;
         assert!(reply.is_none(), "a server answered at the front's address");
+        Ok(())
+    });
+}
+
+/// A front's name that is an alias gets its front at the addresses filed
+/// for the name its CNAME chain ends at.
+#[test]
+fn a_front_for_an_alias_goes_at_its_targets_addresses() {
+    world(Duration::from_secs(60), |fcx| async move {
+        let hierarchy = Hierarchy::new();
+        let at = location();
+        let (attacher, attachments) = fictionet::attachments();
+        let net = Net::new().ipv4_only();
+        let handle = net.handle();
+        let mirror = Mirror::new(hierarchy.clone(), handle.clone(), &at)
+            .front(Name::from_ascii("alias-dns.com.")?, |host| host);
+        net.hosts(internet::root_servers(|s| mirror.server(s), &at))
+            .start(&fcx, attachments)?;
+        let m = machine(&fcx, attacher.attach("client")?, ME);
+        let a_root = ROOT_LETTERS[0].server.v4;
+        let front = v4(45, 33, 6, 6);
+
+        assert!(!handle.has_machine(front));
+        let reply = ask(
+            &fcx,
+            &m,
+            a_root,
+            &query(1, "alias-dns.com.", RecordType::A, false),
+        )
+        .await
+        .expect("an answer");
+        assert_eq!(addresses(&reply), vec![front]);
+        assert!(handle.has_machine(front), "the front is placed");
+        Ok(())
+    });
+}
+
+/// A filing as a test compares it: its zone, and the owner and type of
+/// each RRset it kept.
+type Kept = (String, Vec<(String, RecordType)>);
+
+/// The mirror's observers see what each response gave a mirrored zone,
+/// as the zone keeps it, before the reply that needed it leaves: the
+/// root's referral to `direct.` with its glue, then the answer of the
+/// server placed at that glue. A lookup that the world's policy keeps
+/// from leaving files nothing, and the observers see nothing.
+#[test]
+fn observers_see_each_filing_before_the_reply_leaves() {
+    world(Duration::from_secs(60), |fcx| async move {
+        let hierarchy = Hierarchy::new();
+        let at = location();
+        let (attacher, attachments) = fictionet::attachments();
+        let net = Net::new().ipv4_only();
+        let handle = net.handle();
+        let filings: Arc<Mutex<Vec<Kept>>> = Arc::default();
+        let seen = filings.clone();
+        let refused = lower("plain.");
+        let upstream = dns::Only::new(
+            move |lookup: &Lookup| LowerName::new(lookup.question.name()) != refused,
+            hierarchy.clone(),
+        );
+        let mirror = Mirror::new(upstream, handle.clone(), &at).observe(move |filing: &Filing| {
+            let sets = filing
+                .sets
+                .iter()
+                .map(|set| (set.name().to_ascii(), set.record_type()))
+                .collect();
+            seen.lock().unwrap().push((filing.zone.to_ascii(), sets));
+        });
+        net.hosts(internet::root_servers(|s| mirror.server(s), &at))
+            .start(&fcx, attachments)?;
+        let m = machine(&fcx, attacher.attach("client")?, ME);
+        let a_root = ROOT_LETTERS[0].server.v4;
+        let ns = v4(45, 33, 5, 53);
+
+        ask(
+            &fcx,
+            &m,
+            a_root,
+            &query(1, "www.direct.", RecordType::A, false),
+        )
+        .await
+        .expect("a referral");
+        assert_eq!(
+            filings.lock().unwrap().clone(),
+            vec![(
+                ".".to_string(),
+                vec![
+                    ("direct.".to_string(), RecordType::NS),
+                    ("ns.direct.".to_string(), RecordType::A),
+                ]
+            )]
+        );
+        ask(&fcx, &m, ns, &query(2, "www.direct.", RecordType::A, false))
+            .await
+            .expect("an answer");
+        let last = filings.lock().unwrap().last().cloned().expect("a filing");
+        assert_eq!(last.0, "direct.");
+        assert!(
+            last.1.contains(&("www.direct.".to_string(), RecordType::A)),
+            "{last:?}"
+        );
+
+        let count = filings.lock().unwrap().len();
+        let reply = ask(&fcx, &m, a_root, &query(3, "plain.", RecordType::A, false)).await;
+        assert!(reply.is_none(), "a refused lookup leaves the server silent");
+        assert_eq!(filings.lock().unwrap().len(), count, "nothing filed");
+        assert!(hierarchy.asked_for("plain.", RecordType::A).is_empty());
         Ok(())
     });
 }
@@ -1212,16 +1323,20 @@ fn public_resolvers_keep_one_cache_per_sandbox() {
         let served = served_www.clone();
         let (attacher, attachments) = fictionet::attachments();
         let net = Net::new().ipv4_only();
-        let mirror = Mirror::new(hierarchy.clone(), net.handle(), &at).observe(
-            move |req: &Request, client: &Client, reply: &Response| {
-                let www = Name::from_ascii("www.direct.").unwrap();
-                let asked =
-                    req.question.name() == &www && req.question.query_type() == RecordType::A;
-                if asked && reply.message.metadata.authoritative {
-                    served.lock().unwrap().push(client.local.ip());
-                }
-            },
-        );
+        let mirror = Mirror::new(hierarchy.clone(), net.handle(), &at).wrap(move |authority| {
+            let served = served.clone();
+            Arc::new(Observe::new(
+                authority,
+                move |req: &Request, client: &Client, reply: &Response| {
+                    let www = Name::from_ascii("www.direct.").unwrap();
+                    let asked =
+                        req.question.name() == &www && req.question.query_type() == RecordType::A;
+                    if asked && reply.message.metadata.authoritative {
+                        served.lock().unwrap().push(client.local.ip());
+                    }
+                },
+            ))
+        });
         net.hosts(internet::root_servers(|s| mirror.server(s), &at))
             .hosts(internet::public_resolvers(
                 |r, h| {

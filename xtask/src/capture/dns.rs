@@ -1,42 +1,44 @@
-//! Capture the DNS a copied session needs beside its pages: every exchange
-//! the world's resolver makes to resolve the captured hosts, asked of the
-//! real servers.
+//! Capture the DNS a copied session needs beside its pages: every lookup
+//! the world's servers make of the real servers to resolve the captured
+//! hosts.
 //!
-//! The walk runs the same resolver engine the world runs, with Unbound's
-//! configuration and only IPv4, as Search's network has. The public
-//! resolver presets minimise and ask for DNSSEC records as that
-//! configuration does, so one walk holds what they ask too. Its questions go,
-//! as lookups, to the internet through [`Live`] and are kept by [`Capture`], so the
-//! capture holds the priming, the referrals, the minimised steps, the DS
-//! and DNSKEY sets of each chain, and the addresses of name servers that
-//! referrals named without glue: what the world's resolvers ask when they
-//! resolve the same names from [`Replay`](fictionet_extras::dns::Replay).
+//! The walk runs the same network a session runs: a [`Mirror`] serving
+//! learned copies of the real hierarchy at the root and
+//! `gtld-servers.net` addresses and at every name server address the
+//! copies name, and a resolver with Unbound's configuration, as the
+//! session's gateway has, on a network with only IPv4, as Search's is.
+//! The resolver asks the copies, and the copies look up what they lack
+//! through [`Capture`] over the host's [`Internet`]. So the capture holds
+//! exactly the lookups a session's servers make for the same questions:
+//! the priming, the referrals, the minimised steps, the DS and DNSKEY sets
+//! of each chain, and the addresses of name servers that referrals named
+//! without glue, which a Copied session plays back from
+//! [`Replay`](fictionet_extras::dns::Replay). The public resolver presets
+//! minimise and ask for DNSSEC records as that configuration does, so one
+//! walk holds what they ask too.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::BTreeSet;
 use std::future::{Future, poll_fn};
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::Poll;
 use std::time::SystemTime;
 
-use fictionet::stdlib::protocols::dns::dnssec::Ring;
 use fictionet::stdlib::protocols::dns::op::{Message, MessageType, OpCode, Query, ResponseCode};
-use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RecordType};
-use fictionet::stdlib::protocols::dns::{Parsed, Request};
-use fictionet::stdlib::services::dns::resolver::{Config, Resolver};
-use fictionet::stdlib::services::dns::{
-    Action, Client, ClientQuery, Engine, ExchangeFailure, Input, Looked, Lookup, Token, Transmit,
-    WallClock,
-};
+use fictionet::stdlib::protocols::dns::rr::{Name, RecordType};
+use fictionet::stdlib::services::dns::resolver::Config;
+use fictionet::stdlib::services::dns::{Client, WallClock};
 use fictionet::stdlib::services::serve::Transport;
-use fictionet::stdlib::world::net::dns::Upstream;
+use fictionet::stdlib::world::net::Net;
+use fictionet::stdlib::world::net::dns::internet::{self, Location, Mirror};
+use fictionet::stdlib::world::net::dns::{Recursive, ResolverHandle, Upstream};
 use fictionet::sync::Mutex;
-use fictionet::{Cx, RaceError, Seed};
+use fictionet::{Cx, Seed};
 use fictionet_extras::dns::{Capture, Replay};
 use fictionet_extras::models::{Provider, oauth::Login};
-use fictionet_host::dns::Live;
+use fictionet_host::dns::Internet;
 
 use crate::Result;
 
@@ -48,6 +50,11 @@ const TYPES: [RecordType; 3] = [RecordType::A, RecordType::AAAA, RecordType::HTT
 /// How many client questions the walk keeps open at once, so the host is
 /// not asked to hold a socket for every question of a large corpus.
 const WINDOW: usize = 64;
+
+/// Where the walk's resolver runs: an address of the documentation range
+/// (RFC 5737), which no real name server has, so the mirror never places
+/// a server there.
+const RESOLVER: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 53);
 
 /// Records the DNS of `hosts`, every host the corpus serves, and of the
 /// names the world needs in every session (the model providers', their
@@ -84,10 +91,12 @@ pub async fn record(root: &Path, hosts: &[String]) -> Result {
     let failed = Arc::new(Mutex::new(Vec::new()));
     let failures = failed.clone();
     fictionet::run(Seed::random(), move |fcx| async move {
-        let capture = Capture::new(Live::new());
-        let failed = walk(&fcx, &capture, &names).await?;
+        let capture = Arc::new(Capture::new(Internet::new()));
+        let failed = walk(&fcx, capture.clone(), &names).await?;
         *failures.lock() = failed;
         capture.write(&path)?;
+        // The network runs until the run is stopped.
+        fcx.cancel();
         Ok(())
     })
     .await
@@ -113,180 +122,108 @@ fn fqdn(host: &str) -> Result<Name> {
     Ok(name)
 }
 
-/// One exchange the resolver started, on its way through the upstream.
-struct Flight<'a> {
-    token: Token,
-    /// What it brings back for the resolver ([`flight`]).
-    input: Pin<Box<dyn Future<Output = Option<Input>> + Send + 'a>>,
-}
+/// One client question on its way through the walk's resolver: its index
+/// in the walk's questions, and what the resolver answers.
+type Asked<'a> = Pin<Box<dyn Future<Output = (usize, Option<Vec<u8>>)> + Send + 'a>>;
 
-/// Resolves each of `names` for each of [`TYPES`] with Unbound's
-/// configuration, carrying the resolver's questions through `upstream` on
-/// the run's real clock. Returns the questions that got an RCODE other
-/// than NOERROR.
+/// Resolves each of `names` for each of [`TYPES`] through a resolver with
+/// Unbound's configuration on a network whose real hierarchy is copied
+/// from `upstream` by a [`Mirror`], on the run's real clock. Returns the
+/// questions that got an RCODE other than NOERROR, or no answer.
 async fn walk(
     fcx: &Cx,
-    upstream: &impl Upstream,
+    upstream: Arc<dyn Upstream>,
     names: &[Name],
 ) -> fictionet::Result<Vec<(Name, RecordType, ResponseCode)>> {
-    let mut config = Config::unbound();
-    config.hints.retain(|(_, address)| address.is_ipv4());
     // Dates for the signatures: the host's date now, at the run's instant now.
     let clock = WallClock {
         start: SystemTime::now() - fcx.now().since_start(),
     };
-    let mut engine = Resolver::new(config, Ring, clock);
+    // Where the servers are only sets their identities and round trips,
+    // which the capture does not keep.
+    let location = Location::san_francisco_bay_area(None);
+    let net = Net::new().ipv4_only().drop_unrouted();
+    let mirror = Mirror::new(upstream, net.handle(), &location);
+    let recursive = Recursive::new(Config::unbound(), clock);
+    let resolver = recursive.handle();
+    let (_attacher, attachments) = fictionet::attachments();
+    net.hosts(internet::root_servers(|s| mirror.server(s), &location))
+        .hosts(internet::gtld_servers(|s| mirror.server(s), &location))
+        .host("resolver", |host| {
+            host.at(RESOLVER).ipv4_only().program(recursive)
+        })
+        .start(fcx, attachments)?;
+    // Each program starts in a task of its own, and the resolver's handle
+    // gives nothing until it runs. The walk waits for it with the question
+    // the resolver asks first itself: the root's NS RRset (RFC 8109).
+    while ask(fcx, &resolver, 0, &Name::root(), RecordType::NS)?
+        .await
+        .1
+        .is_none()
+    {
+        fcx.yield_now().await?;
+    }
 
     let questions: Vec<(Name, RecordType)> = names
         .iter()
         .flat_map(|name| TYPES.map(|kind| (name.clone(), kind)))
         .collect();
-    let mut pending: VecDeque<ClientQuery> = questions
-        .iter()
-        .enumerate()
-        .map(|(index, (name, kind))| client_query(fcx, index, name, *kind))
-        .collect::<fictionet::Result<_>>()?;
-    let mut open = 0;
+    let mut pending = 0..questions.len();
+    let mut open: Vec<Asked<'_>> = Vec::new();
     let mut failed = Vec::new();
-    let mut flights: Vec<Flight<'_>> = Vec::new();
-    let mut inputs = Vec::new();
     loop {
-        while open < WINDOW
-            && let Some(query) = pending.pop_front()
+        while open.len() < WINDOW
+            && let Some(index) = pending.next()
         {
-            inputs.push(Input::Query(query));
-            open += 1;
+            let (name, kind) = &questions[index];
+            open.push(ask(fcx, &resolver, index, name, *kind)?);
         }
-        let now = fcx.now();
-        for input in inputs.drain(..) {
-            engine.handle(input, now, fcx);
+        if open.is_empty() {
+            return Ok(failed);
         }
-        while let Some(action) = engine.poll() {
-            match action {
-                // Search's network has no IPv6, so a transmit to an IPv6
-                // server fails at once, as on a machine with no IPv6 route.
-                Action::Send(transmit) if transmit.to.is_ipv6() => inputs.push(Input::Failed {
-                    token: transmit.token,
-                    failure: ExchangeFailure::Unreachable,
-                }),
-                Action::Send(transmit) => flights.push(flight(fcx, upstream, transmit)),
-                Action::Answer(answer) => {
-                    open -= 1;
-                    let rcode = Message::from_vec(&answer.bytes)
-                        .map_or(ResponseCode::FormErr, |reply| reply.metadata.response_code);
-                    if rcode != ResponseCode::NoError
-                        && let Some(index) = answer.client.connection
-                    {
-                        let (name, kind) = &questions[index as usize];
-                        failed.push((name.clone(), *kind, rcode));
-                    }
-                }
-                Action::Abandon(token) => flights.retain(|flight| flight.token != token),
-                Action::Lookup { .. } | Action::Event(_) => {}
-            }
-        }
-        if !inputs.is_empty() {
-            continue;
-        }
-        let deadline = engine.next_deadline();
-        if flights.is_empty() && deadline.is_none() {
-            if open > 0 {
-                return Err(fictionet::Error::msg(
-                    "the resolver stopped with questions unanswered",
-                ));
-            }
-            if pending.is_empty() {
-                return Ok(failed);
-            }
-            continue;
-        }
-        let landed = poll_fn(|cx| {
-            for (index, flight) in flights.iter_mut().enumerate() {
-                if let Poll::Ready(input) = flight.input.as_mut().poll(cx) {
-                    return Poll::Ready((index, input));
+        let (at, (index, answer)) = poll_fn(|cx| {
+            for (at, asked) in open.iter_mut().enumerate() {
+                if let Poll::Ready(answered) = asked.as_mut().poll(cx) {
+                    return Poll::Ready((at, answered));
                 }
             }
             Poll::Pending
+        })
+        .await;
+        drop(open.swap_remove(at));
+        let rcode = answer.map_or(ResponseCode::ServFail, |bytes| {
+            Message::from_vec(&bytes)
+                .map_or(ResponseCode::FormErr, |reply| reply.metadata.response_code)
         });
-        match fcx.race(deadline, landed).await {
-            Ok((index, input)) => {
-                flights.swap_remove(index);
-                inputs.extend(input);
-            }
-            Err(RaceError::Deadline) => inputs.push(Input::Tick),
-            Err(RaceError::Cancelled) => {
-                return Err(fictionet::Error::msg("the walk was cancelled"));
-            }
+        if rcode != ResponseCode::NoError {
+            let (name, kind) = &questions[index];
+            failed.push((name.clone(), *kind, rcode));
         }
     }
 }
 
-/// A client's recursive question for `name` and `kind`, numbered `index`
-/// by its connection so its answer can be told apart. It arrives over TCP,
-/// so no answer is truncated.
-fn client_query(
-    fcx: &Cx,
+/// Puts a client's recursive question for `name` and `kind`, number
+/// `index` of the walk, to `resolver`. It arrives over TCP, so no answer
+/// is truncated.
+fn ask<'a>(
+    fcx: &'a Cx,
+    resolver: &'a ResolverHandle,
     index: usize,
     name: &Name,
     kind: RecordType,
-) -> fictionet::Result<ClientQuery> {
+) -> fictionet::Result<Asked<'a>> {
     let mut message = Message::new(fcx.random_u64() as u16, MessageType::Query, OpCode::Query);
     message.metadata.recursion_desired = true;
     message.add_query(Query::query(name.clone(), kind));
-    let local = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 53);
-    Ok(ClientQuery {
-        client: Client {
-            peer: SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0),
-            local,
-            transport: Transport::Tcp,
-            connection: Some(index as u64),
-            sandbox: None,
-        },
-        bytes: message.to_vec()?,
-    })
-}
-
-/// Starts carrying `transmit` through `upstream`, as a lookup of its
-/// question at its server.
-///
-/// The walk's resolver does not say which zone it asks about, and a
-/// capture keeps only the server and the question, so each lookup names
-/// the root as its zone. The response goes back to the resolver written
-/// again with the query's ID and question, as the server's reply to it.
-/// A transmit that is no question gets nothing, and the resolver's
-/// deadline decides.
-fn flight<'a>(fcx: &'a Cx, upstream: &'a impl Upstream, transmit: Transmit) -> Flight<'a> {
-    let token = transmit.token;
-    let input = async move {
-        let Parsed::Request(request) = Request::parse(&transmit.bytes, transmit.transport) else {
-            return None;
-        };
-        let mut lookup = Lookup::new(
-            transmit.to,
-            LowerName::from(Name::root()),
-            &request.question,
-        );
-        lookup.recursion_desired = request.rd;
-        match upstream.lookup(fcx, lookup).await {
-            Looked::Response(mut response) => {
-                response.metadata.id = request.message.metadata.id;
-                response.queries = vec![request.question.clone()];
-                Some(Input::Reply {
-                    token,
-                    from: transmit.to,
-                    transport: transmit.transport,
-                    bytes: response.to_vec().ok()?,
-                })
-            }
-            Looked::Unreachable => Some(Input::Failed {
-                token,
-                failure: ExchangeFailure::Unreachable,
-            }),
-            Looked::NoReply => None,
-        }
+    let bytes = message.to_vec()?;
+    let client = Client {
+        peer: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        local: SocketAddr::new(IpAddr::V4(RESOLVER), 53),
+        transport: Transport::Tcp,
+        connection: None,
+        sandbox: None,
     };
-    Flight {
-        token,
-        input: Box::pin(input),
-    }
+    Ok(Box::pin(async move {
+        (index, resolver.query(fcx, client, bytes).await)
+    }))
 }

@@ -50,13 +50,13 @@ use fictionet::stdlib::protocols::dns::rr::rdata::TXT;
 use fictionet::stdlib::protocols::dns::rr::{
     DNSClass, LowerName, Name, RData, Record, RecordSet, RecordType,
 };
-use fictionet::stdlib::protocols::dns::{Ede, EdeCode, Nsid, Request, Response};
+use fictionet::stdlib::protocols::dns::{Ede, EdeCode, Nsid, Request};
 use fictionet::stdlib::protocols::urlencoded_form::{self, Form};
 use fictionet::stdlib::services::dns::authority::{
-    Authority, ChaosAnswer, ChaosReply, Copies, Identity, Observe, ServerConfig, Step, chaos,
+    Authority, ChaosAnswer, ChaosReply, Copies, Identity, ServerConfig, Step, chaos,
 };
 use fictionet::stdlib::services::dns::resolver::Config;
-use fictionet::stdlib::services::dns::zone::{AnyResponse, Shown, Zone, ZoneError};
+use fictionet::stdlib::services::dns::zone::{AnyResponse, Filing, Shown, Zone, ZoneError};
 use fictionet::stdlib::services::dns::{Client, Generation, Looked, Lookup, WallClock};
 use fictionet::stdlib::web::httpd::{self, Body, request_host};
 use fictionet::sync::Mutex;
@@ -1478,8 +1478,8 @@ pub fn root_zone(text: &str) -> Result<Zone, ZoneError> {
 // ---------------------------------------------------------------------------
 // Mirror
 
-/// A callback that sees each reply a mirrored server gives.
-type Observer = dyn Fn(&Request, &Client, &Response) + Send + Sync;
+/// A callback that sees what each response gave a mirrored zone.
+type Observer = dyn Fn(&Filing) + Send + Sync;
 
 /// What a world puts around each mirrored server's authority.
 type Wrap = dyn Fn(Arc<dyn Authority>) -> Arc<dyn Authority> + Send + Sync;
@@ -1488,42 +1488,43 @@ type Wrap = dyn Fn(Arc<dyn Authority>) -> Arc<dyn Authority> + Send + Sync;
 type Front = dyn Fn(Host) -> Host + Send + Sync;
 
 /// Copies of the real hierarchy: the root, `com`, `net`, and every zone
-/// below them that a reply names, each served at its real servers'
-/// addresses from records copied from those servers.
+/// below them that the copied records name, each served at its real
+/// servers' addresses from records copied from those servers.
 ///
 /// [`server`](Mirror::server) is a program that answers, at its own
 /// address, for the zones the mirror knows that address serves: the root
 /// at the root letters' addresses, `com` and `net` at the
-/// `gtld-servers.net` addresses, every zone a reply names that address a
-/// server of, and every zone below one of those that the real server
-/// turns out to answer from, such as `arpa` at the root letters'
-/// addresses. Each zone's data is
+/// `gtld-servers.net` addresses, every zone whose copied records name
+/// that address a server of it, and every zone below one of those that
+/// the real server turns out to answer from, such as `arpa` at the root
+/// letters' addresses. Each zone's data is
 /// [`Learned`](fictionet::stdlib::services::dns::zone::Learned): one per
 /// zone, shared by all of the zone's servers, filled from the real
 /// servers through the mirror's upstream as the world's servers need
 /// facts, and answered from by the world's own [`Copies`]. No real
-/// server's message reaches a client. A world runs the program on the root and
-/// `gtld-servers.net` presets. As replies leave, the mirror places more
-/// servers, so a resolver in the world can follow the hierarchy as far
-/// down as the upstream answers:
+/// server's message reaches a client. A world runs the program on the
+/// root and `gtld-servers.net` presets. As the copies file what the real
+/// servers answered ([`Filing`]), the mirror places more servers, so a
+/// resolver in the world can follow the hierarchy as far down as the
+/// upstream answers:
 ///
-/// - at each address a referral gives as glue for a name server it names
-///   (RFC 9471), and
-/// - at each address an A or AAAA answer gives this session for a name
-///   that an NS RRset named this session, whichever came first, for a
-///   delegation without glue, such as a `.com` zone served from
+/// - at each address a filed referral gives as glue for a name server it
+///   names (RFC 9471), and
+/// - at each address a filed A or AAAA RRset gives this session for a
+///   name that a filed NS RRset named this session, whichever came first,
+///   for a delegation without glue, such as a `.com` zone served from
 ///   `awsdns-NN.org` or `8.in-addr.arpa` served from `arin.net`.
 ///
-/// Each server is placed before the reply that names it leaves, behind
-/// [`Host::delay`] with half the location's
-/// [`authority_rtt`](Location::authority_rtt). Where a host's machine is
-/// already, such as a site placed first, the server joins it; where a
-/// mirrored server or a preset's server already answers, nothing more is
-/// placed, and the address serves the new zone too. A server joining a
-/// machine takes its port 53, so a world puts no DNS server of its own at
-/// an address the real hierarchy names. The names of name servers and the
-/// addresses answers gave are forgotten when the namespace advances, and
-/// so is every zone's copied data.
+/// Each server is placed when the records that name it are filed, before
+/// the reply that needed them leaves, behind [`Host::delay`] with half
+/// the location's [`authority_rtt`](Location::authority_rtt). Where a
+/// host's machine is already, such as a site placed first, the server
+/// joins it; where a mirrored server or a preset's server already
+/// answers, nothing more is placed, and the address serves the new zone
+/// too. A server joining a machine takes its port 53, so a world puts no
+/// DNS server of its own at an address the real hierarchy names. The
+/// names of name servers and the addresses filed for them are forgotten
+/// when the namespace advances, and so is every zone's copied data.
 ///
 /// Addresses on the sandboxes' subnet or a LAN, and addresses no
 /// internet host can have (those the IANA special-purpose registries of
@@ -1566,15 +1567,35 @@ struct Inner {
     resolvers: HashMap<IpAddr, IpAddr>,
 }
 
-/// What replies named this session.
+/// What the copies filed this session.
 #[derive(Default)]
 struct Named {
-    /// The name servers NS RRsets named, with the zones they serve.
+    /// The name servers filed NS RRsets named, with the zones they serve.
     targets: HashMap<LowerName, HashSet<LowerName>>,
-    /// The addresses A and AAAA answers gave, by owner, so a name server
-    /// whose address came before any NS RRset named it still gets its
-    /// server.
+    /// The addresses filed A and AAAA RRsets gave, by owner, so a name
+    /// server whose address came before any NS RRset named it still gets
+    /// its server.
     addresses: HashMap<LowerName, Vec<IpAddr>>,
+    /// The target of each filed CNAME, by owner, so a front's name that
+    /// is an alias finds its addresses.
+    aliases: HashMap<LowerName, LowerName>,
+}
+
+impl Named {
+    /// The addresses filed for `name` or for the name at the end of its
+    /// CNAME chain.
+    fn addresses_of(&self, name: &LowerName) -> Vec<IpAddr> {
+        let mut name = name;
+        let mut seen = vec![name];
+        while let Some(target) = self.aliases.get(name) {
+            if seen.contains(&target) {
+                return Vec::new();
+            }
+            seen.push(target);
+            name = target;
+        }
+        self.addresses.get(name).cloned().unwrap_or_default()
+    }
 }
 
 /// Where a mirror placed something, in every session.
@@ -1649,15 +1670,12 @@ impl Mirror {
         self.with(|inner| inner.namespace = Some(namespace.clone()))
     }
 
-    /// Calls `f` with each reply a mirrored server gives, before it leaves
-    /// and after the servers it names are placed, through an [`Observe`]
-    /// around the server's authority, and around its
-    /// [`wrap`](Mirror::wrap) when it has one. Observers run in the order
-    /// given.
-    pub fn observe(
-        self,
-        f: impl Fn(&Request, &Client, &Response) + Send + Sync + 'static,
-    ) -> Mirror {
+    /// Calls `f` with what each response gave a mirrored zone, when it
+    /// gave any RRset: after the servers it names are placed, and before
+    /// the reply that needed it leaves. So a world learns the names and
+    /// addresses the copies hold, which are what the world's servers
+    /// answer with. Observers run in the order given.
+    pub fn observe(self, f: impl Fn(&Filing) + Send + Sync + 'static) -> Mirror {
         self.with(|inner| inner.observers.push(Arc::new(f)))
     }
 
@@ -1671,10 +1689,11 @@ impl Mirror {
         self.with(|inner| inner.wrap = Some(Arc::new(f)))
     }
 
-    /// Places `build(host)` at each address a reply gives for `name` in an
-    /// A or AAAA answer, the first time it gives it, joining a machine
-    /// that is there. `host` is a host at that address only, and an
-    /// address no internet host can have gets none, as with servers. A
+    /// Places `build(host)` at each address filed for `name` in an A or
+    /// AAAA RRset, or for the name at the end of its CNAME chain, the
+    /// first time it is filed, joining a machine that is there. `host` is
+    /// a host at that address only, and an address no internet host can
+    /// have gets none, as with servers. A
     /// world uses it for a public resolver's DNS over HTTPS front at the
     /// addresses of [`PublicResolver::doh`] names, such as
     /// `cloudflare-dns.com`, which are not the resolver's own.
@@ -1684,8 +1703,8 @@ impl Mirror {
     }
 
     /// A program answering, at its own address, for the zones the mirror
-    /// knows that address serves, with `server` as its front, the mirror's
-    /// upstream and namespace, and its observers.
+    /// knows that address serves, with `server` as its front, and the
+    /// mirror's upstream and namespace.
     pub fn server(&self, server: ServerConfig) -> Authoritative<Arc<dyn Authority>> {
         self.inner.server(server)
     }
@@ -1694,18 +1713,10 @@ impl Mirror {
 impl Inner {
     fn server(self: &Arc<Self>, server: ServerConfig) -> Authoritative<Arc<dyn Authority>> {
         let mirrored: Arc<dyn Authority> = Arc::new(Mirrored(self.clone()));
-        let mut authority = match &self.wrap {
+        let authority = match &self.wrap {
             Some(wrap) => wrap(mirrored),
             None => mirrored,
         };
-        if !self.observers.is_empty() {
-            let observers = self.observers.clone();
-            authority = Arc::new(Observe::new(authority, move |req, client, response| {
-                for observer in &observers {
-                    observer(req, client, response);
-                }
-            }));
-        }
         let program = Authoritative::new(authority, server).upstream(self.upstream.clone());
         match &self.namespace {
             Some(namespace) => program.namespace(namespace),
@@ -1713,85 +1724,70 @@ impl Inner {
         }
     }
 
-    /// Places the servers and fronts `reply`, a mirrored server's reply to
-    /// `req`, names, and notes the zones they serve.
-    fn place(self: &Arc<Self>, req: &Request, reply: &Message) {
-        let qname = LowerName::new(req.question.name());
-        let asks_address = matches!(req.question.query_type(), RecordType::A | RecordType::AAAA);
-        let answered: Vec<IpAddr> = reply
-            .answers
-            .iter()
-            .filter_map(|record| record.data.ip_addr())
-            .collect();
-        let mut servers: Vec<(IpAddr, Name, LowerName)> = Vec::new();
-        let mut fronts: Vec<(IpAddr, &Arc<Front>)> = Vec::new();
-        // Each name server an NS RRset names, with the zone it serves.
+    /// Places the servers and fronts that `filing`, filed in session
+    /// `generation`, names, notes the zones they serve, and shows the
+    /// filing to the observers.
+    fn place(self: &Arc<Self>, filing: &Filing, generation: Generation) {
+        // Each name server a filed NS RRset names, with the zone it serves.
         let mut targets: HashMap<LowerName, HashSet<LowerName>> = HashMap::new();
-        for record in reply.answers.iter().chain(&reply.authorities) {
-            if let RData::NS(ns) = &record.data {
-                targets
-                    .entry(LowerName::new(&ns.0))
-                    .or_default()
-                    .insert(LowerName::new(&record.name));
-            }
-        }
-        for record in &reply.additionals {
-            if let Some(addr) = record.data.ip_addr()
-                && let Some(zones) = targets.get(&LowerName::new(&record.name))
-            {
-                for zone in zones {
-                    servers.push((addr, record.name.clone(), zone.clone()));
-                }
-            }
-        }
-        let generation = self
-            .namespace
-            .as_ref()
-            .map_or(Generation(0), |namespace| namespace.current().generation);
-        self.named.with(generation, |named| {
-            // A name server whose address an earlier answer gave, before
-            // this NS RRset named it: a resolver has its address cached
-            // and asks it next.
-            for (target, zones) in &targets {
-                let known = named.addresses.get(target).into_iter().flatten();
-                for addr in known {
-                    for zone in zones {
-                        servers.push((*addr, Name::from(target), zone.clone()));
+        let mut addresses: Vec<(LowerName, IpAddr)> = Vec::new();
+        let mut aliases: Vec<(LowerName, LowerName)> = Vec::new();
+        for set in &filing.sets {
+            let owner = LowerName::new(set.name());
+            for record in set.records_without_rrsigs() {
+                match &record.data {
+                    RData::NS(ns) => {
+                        targets
+                            .entry(LowerName::new(&ns.0))
+                            .or_default()
+                            .insert(owner.clone());
                     }
+                    RData::CNAME(cname) => aliases.push((owner.clone(), LowerName::new(&cname.0))),
+                    data => addresses.extend(data.ip_addr().map(|addr| (owner.clone(), addr))),
                 }
+            }
+        }
+        let mut servers: Vec<(IpAddr, LowerName, LowerName)> = Vec::new();
+        let mut fronts: Vec<(IpAddr, &LowerName, &Arc<Front>)> = Vec::new();
+        self.named.with(generation, |named| {
+            for (owner, addr) in &addresses {
+                let known = named.addresses.entry(owner.clone()).or_default();
+                if !known.contains(addr) {
+                    known.push(*addr);
+                }
+            }
+            named.aliases.extend(aliases);
+            for (target, zones) in &targets {
                 named
                     .targets
                     .entry(target.clone())
                     .or_default()
                     .extend(zones.iter().cloned());
             }
-            for record in &reply.answers {
-                if let Some(addr) = record.data.ip_addr() {
-                    let known = named
-                        .addresses
-                        .entry(LowerName::new(&record.name))
-                        .or_default();
-                    if !known.contains(&addr) {
-                        known.push(addr);
+            // Each name server this filing named that has an address, and
+            // each address it gave a name server, whichever of the NS
+            // RRset and the address was filed first.
+            for (target, zones) in &targets {
+                for addr in named.addresses.get(target).into_iter().flatten() {
+                    for zone in zones {
+                        servers.push((*addr, target.clone(), zone.clone()));
                     }
                 }
             }
-            if asks_address && let Some(zones) = named.targets.get(&qname) {
-                let name = req.question.name().clone();
-                for addr in &answered {
-                    for zone in zones {
-                        servers.push((*addr, name.clone(), zone.clone()));
-                    }
+            for (owner, addr) in &addresses {
+                for zone in named.targets.get(owner).into_iter().flatten() {
+                    servers.push((*addr, owner.clone(), zone.clone()));
                 }
+            }
+            for (name, front) in &self.fronts {
+                fronts.extend(
+                    named
+                        .addresses_of(name)
+                        .into_iter()
+                        .map(|addr| (addr, name, front)),
+                );
             }
         });
-        if asks_address {
-            for (name, front) in &self.fronts {
-                if *name == qname {
-                    fronts.extend(answered.iter().map(|addr| (*addr, front)));
-                }
-            }
-        }
         servers.retain(|(addr, _, _)| self.may_serve(*addr));
         for (addr, _, zone) in &servers {
             self.copies.serves(*addr, zone);
@@ -1799,7 +1795,7 @@ impl Inner {
         {
             let mut placed = self.placed.lock();
             servers.retain(|(addr, _, _)| !self.preset_runs(*addr) && placed.servers.insert(*addr));
-            fronts.retain(|(addr, _)| !non_public_address(*addr) && placed.fronts.insert(*addr));
+            fronts.retain(|(addr, _, _)| !non_public_address(*addr) && placed.fronts.insert(*addr));
         }
         // The network refuses an address on the sandboxes' subnet or a
         // LAN; such an address stays without a server.
@@ -1809,10 +1805,11 @@ impl Inner {
                 .program(self.server(ServerConfig::generic()));
             let _ = self.handle.add_host(host);
         }
-        for (addr, build) in fronts {
-            let _ = self
-                .handle
-                .add_host(build(only_at(&qname.to_ascii(), addr)));
+        for (addr, name, build) in fronts {
+            let _ = self.handle.add_host(build(only_at(&name.to_ascii(), addr)));
+        }
+        for observer in &self.observers {
+            observer(filing);
         }
     }
 
@@ -1867,7 +1864,7 @@ fn only_at(label: &str, addr: IpAddr) -> Host {
 }
 
 /// The zones a mirror knows an address serves, answered from their copied
-/// data, with the replies placing the servers they name.
+/// data, with what is filed into them placing the servers it names.
 struct Mirrored(Arc<Inner>);
 
 impl Authority for Mirrored {
@@ -1883,7 +1880,6 @@ impl Authority for Mirrored {
                 if let Some((egress, seen)) = self.0.seen_by(client) {
                     echo(&mut response.message, egress, seen);
                 }
-                self.0.place(req, &response.message);
                 Step::Reply(response)
             }
             step => step,
@@ -1891,7 +1887,11 @@ impl Authority for Mirrored {
     }
 
     fn file(&self, lookup: &Lookup, looked: &Looked, generation: Generation) {
-        self.0.copies.file(lookup, looked, generation);
+        if let Some(filing) = self.0.copies.keep(lookup, looked, generation)
+            && !filing.sets.is_empty()
+        {
+            self.0.place(&filing, generation);
+        }
     }
 
     fn advance(&self, generation: Generation) {

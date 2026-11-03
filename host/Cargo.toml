@@ -25,8 +25,9 @@ webpki-roots = "1"
 tower-service = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "time", "io-util"] }
 tokio-util = { version = "0.7", default-features = false }
+hickory-net = { version = "0.26.3", default-features = false, features = ["tokio"] }
+futures-util = { version = "0.3", default-features = false }
 
 [dev-dependencies]
 fictionet-test-support = { path = "../tests/support" }
 libc = "0.2"
-futures-util = { version = "0.3", default-features = false }

@@ -59,8 +59,9 @@ use super::zone::{Node, dname_target, targets, wildcard};
 ///   RRset, or else the NSEC and NSEC3 records sent beside it as the proof
 ///   that the cut has none, which the copy's referrals carry
 ///   (RFC 4035 §3.1.4).
-/// - Any other response, such as REFUSED, SERVFAIL, or an answer without
-///   AA, gives nothing.
+/// - Any other response, such as REFUSED, SERVFAIL, an answer without
+///   AA, or a truncated response (TC set), whose sections may be
+///   incomplete (RFC 2181 §9), gives nothing.
 ///
 /// TTLs are kept as sent, since an authoritative TTL does not count down,
 /// and RRSIGs as they came: copied records are never signed again, so a
@@ -98,6 +99,21 @@ use super::zone::{Node, dname_target, targets, wildcard};
 pub struct Learned {
     apex: LowerName,
     held: Mutex<Held>,
+}
+
+/// What one response gave a [`Learned`] zone: the RRsets it kept, each as
+/// the real server sent it, owned by the name the response gave it even
+/// when a wildcard made it. A world learns from these which names and
+/// addresses its copies hold, such as where the name servers a referral
+/// names are.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Filing {
+    /// The apex of the zone the RRsets were filed into.
+    pub zone: LowerName,
+    /// The RRsets kept, in the order they were filed: for an answer, the
+    /// apex NS RRset, the answers, then additional data; for a referral,
+    /// its NS RRset, its glue, and its DS RRset.
+    pub sets: Vec<RecordSet>,
 }
 
 /// The session a [`Learned`] zone's facts belong to, and the facts.
@@ -171,12 +187,17 @@ impl Learned {
 
     /// Files `response`, a real server of the zone's response to
     /// `question`, asked in session `generation`, as the type's
-    /// documentation says. A response from a session before the current
-    /// one is dropped; one from a newer session starts it first.
-    pub fn file(&self, generation: Generation, question: &Query, response: &Message) {
+    /// documentation says, and returns what it kept. A response from a
+    /// session before the current one is dropped; one from a newer
+    /// session starts it first.
+    pub fn file(&self, generation: Generation, question: &Query, response: &Message) -> Filing {
+        let mut filing = Filing {
+            zone: self.apex.clone(),
+            sets: Vec::new(),
+        };
         let mut held = self.held.lock();
         if generation < held.generation {
-            return;
+            return filing;
         }
         if generation > held.generation {
             *held = Held {
@@ -185,9 +206,10 @@ impl Learned {
             };
         }
         let facts = Arc::make_mut(&mut held.facts);
-        if facts.file(&self.apex, question, response) {
+        if facts.file(&self.apex, question, response, &mut filing.sets) {
             facts.revision = Revision(facts.revision.0 + 1);
         }
+        filing
     }
 
     /// The apex of the zone strictly below this one that `response`, a
@@ -274,11 +296,20 @@ impl Facts {
         }
     }
 
-    /// Files `response` to `question` for the zone at `apex`. Whether it
-    /// gave anything.
-    fn file(&mut self, apex: &LowerName, question: &Query, response: &Message) -> bool {
+    /// Files `response` to `question` for the zone at `apex`, adding the
+    /// RRsets it keeps to `kept` as they came. Whether it gave anything.
+    fn file(
+        &mut self,
+        apex: &LowerName,
+        question: &Query,
+        response: &Message,
+        kept: &mut Vec<RecordSet>,
+    ) -> bool {
         let qname = LowerName::new(question.name());
-        if !apex.zone_of(&qname) || question.query_class() != DNSClass::IN {
+        if !apex.zone_of(&qname)
+            || question.query_class() != DNSClass::IN
+            || response.metadata.truncation
+        {
             return false;
         }
         let in_class = |records: &[Record]| -> Vec<RecordSet> {
@@ -306,23 +337,25 @@ impl Facts {
                     rcode,
                     denial: &denial,
                 };
-                self.file_answer(&filed, &answer, &authority, &additional);
+                self.file_answer(&filed, &answer, &authority, &additional, kept);
                 true
             }
             (false, ResponseCode::NoError) if answer.is_empty() => {
-                self.file_referral(apex, &qname, &authority, &additional, &denial)
+                self.file_referral(apex, &qname, &authority, &additional, &denial, kept)
             }
             _ => false,
         }
     }
 
-    /// Files an authoritative answer.
+    /// Files an authoritative answer, adding the RRsets it keeps to
+    /// `kept`.
     fn file_answer(
         &mut self,
         filed: &Filed<'_>,
         answer: &[RecordSet],
         authority: &[RecordSet],
         additional: &[RecordSet],
+        kept: &mut Vec<RecordSet>,
     ) {
         let apex = filed.apex;
         let soa = authority
@@ -330,8 +363,11 @@ impl Facts {
             .find(|set| set.record_type() == RecordType::SOA && LowerName::new(set.name()) == *apex)
             .cloned();
         for set in authority {
-            if set.record_type() == RecordType::NS && LowerName::new(set.name()) == *apex {
-                self.put(apex, set.clone(), Rank::Authority);
+            if set.record_type() == RecordType::NS
+                && LowerName::new(set.name()) == *apex
+                && self.put(apex, set.clone(), Rank::Authority)
+            {
+                kept.push(set.clone());
             }
         }
         let whole = matches!(filed.qtype, RecordType::ANY | RecordType::RRSIG);
@@ -353,17 +389,20 @@ impl Facts {
             {
                 continue;
             }
-            self.put_expanded(apex, set, Rank::Answer, filed.denial);
+            if self.put_expanded(apex, set, Rank::Answer, filed.denial) {
+                kept.push(set.clone());
+            }
         }
         for set in additional {
             let owner = LowerName::new(set.name());
             if matches!(set.record_type(), RecordType::A | RecordType::AAAA)
                 && apex.zone_of(&owner)
                 && !self.below_cut(&owner, set.record_type())
-            {
                 // At its owner even when a wildcard made it: the answer's
                 // proofs are not the proof for it.
-                self.put(apex, set.clone(), Rank::Additional);
+                && self.put(apex, set.clone(), Rank::Additional)
+            {
+                kept.push(set.clone());
             }
         }
 
@@ -380,7 +419,9 @@ impl Facts {
             .filter(|set| LowerName::new(set.name()) == end)
             .collect();
         if whole && filed.rcode == ResponseCode::NoError && !at_end.is_empty() {
-            self.put_whole(apex, &end, filed, &at_end);
+            if self.put_whole(apex, &end, filed, &at_end) {
+                kept.extend(at_end.into_iter().cloned());
+            }
             return;
         }
         let positive = at_end.iter().any(|set| set.record_type() == filed.qtype);
@@ -418,8 +459,8 @@ impl Facts {
         }
     }
 
-    /// Files a referral to a cut below `apex` at or above `qname`. Whether
-    /// it was one.
+    /// Files a referral to a cut below `apex` at or above `qname`, adding
+    /// the NS, glue, and DS RRsets it keeps to `kept`. Whether it was one.
     fn file_referral(
         &mut self,
         apex: &LowerName,
@@ -427,6 +468,7 @@ impl Facts {
         authority: &[RecordSet],
         additional: &[RecordSet],
         denial: &[RecordSet],
+        kept: &mut Vec<RecordSet>,
     ) -> bool {
         let ns = authority.iter().find(|set| {
             let owner = LowerName::new(set.name());
@@ -459,6 +501,9 @@ impl Facts {
             .find(|set| set.record_type() == RecordType::DS && LowerName::new(set.name()) == cut)
             .cloned();
         self.unabsent(apex, &cut);
+        kept.push(ns.clone());
+        kept.extend(glue.iter().cloned());
+        kept.extend(ds.iter().cloned());
         let known = self.names.entry(cut.clone()).or_default();
         known.cut = Some((ns.clone(), glue));
         match ds {
@@ -476,39 +521,40 @@ impl Facts {
 
     /// Files `set` from an authoritative response's `rank` section: at
     /// its owner, or at the wildcard that made it, with `denial` as the
-    /// proof for the expansion.
+    /// proof for the expansion. Whether it was kept.
     fn put_expanded(
         &mut self,
         apex: &LowerName,
         set: &RecordSet,
         rank: Rank,
         denial: &[RecordSet],
-    ) {
+    ) -> bool {
         let Some(labels) = expanded_from(set) else {
             return self.put(apex, set.clone(), rank);
         };
         let owner = LowerName::new(set.name());
         let Some(at) = self.expansion(apex, &owner, labels, denial) else {
-            return;
+            return false;
         };
-        self.put(apex, renamed(set, &Name::from(&at)), rank);
+        self.put(apex, renamed(set, &Name::from(&at)), rank)
     }
 
     /// Files `at_end`, the RRsets of an answer to ANY or RRSIG at `end`,
     /// as that question's answer: at `end`, or at the wildcard that made
-    /// them, with the authority section's proof for the expansion.
+    /// them, with the authority section's proof for the expansion. Whether
+    /// they were kept.
     fn put_whole(
         &mut self,
         apex: &LowerName,
         end: &LowerName,
         filed: &Filed<'_>,
         at_end: &[&RecordSet],
-    ) {
+    ) -> bool {
         let (at, owner) = match at_end.iter().find_map(|set| expanded_from(set)) {
             None => (end.clone(), Name::from(end)),
             Some(labels) => {
                 let Some(at) = self.expansion(apex, end, labels, filed.denial) else {
-                    return;
+                    return false;
                 };
                 let owner = Name::from(&at);
                 (at, owner)
@@ -519,6 +565,7 @@ impl Facts {
             .map(|set| (set.record_type(), renamed(set, &owner)))
             .collect();
         self.whole.insert((at, filed.qtype), Node::Data(sets));
+        true
     }
 
     /// Notes that `owner` was answered by expanding the wildcard whose
@@ -555,18 +602,21 @@ impl Facts {
     /// Keeps `set` at its owner, unless an RRset of the same type is held
     /// from a section that outranks `rank`, or `rank` is the additional
     /// section's and a filed NODATA says the owner has no such RRset.
-    fn put(&mut self, apex: &LowerName, set: RecordSet, rank: Rank) {
+    /// Whether it was kept.
+    fn put(&mut self, apex: &LowerName, set: RecordSet, rank: Rank) -> bool {
         let owner = LowerName::new(set.name());
         self.unabsent(apex, &owner);
         let known = self.names.entry(owner.clone()).or_default();
         let rtype = set.record_type();
         let replaces = known.sets.get(&rtype).is_none_or(|(held, _)| *held <= rank);
         let denied = rank == Rank::Additional && known.absent.contains(&rtype);
-        if replaces && !denied {
+        let keeps = replaces && !denied;
+        if keeps {
             known.sets.insert(rtype, (rank, set));
             known.absent.remove(&rtype);
         }
         self.rebuild(&owner);
+        keeps
     }
 
     /// Keeps `name` as absent, with nothing below it.
