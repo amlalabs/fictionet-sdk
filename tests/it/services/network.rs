@@ -87,7 +87,9 @@ fn port_sharing_prepares_without_mutation_and_defaults_to_identity() {
 
 /// A name declared inside one of the gateway's default zones, such as
 /// `home.arpa`, answers, as Unbound puts the operator's data into its
-/// default zone; the zone's other names still do not exist.
+/// default zone; the zone's other names still do not exist. The rest of
+/// `arpa` stays out of the declared zones: with no internet, a public
+/// reverse lookup fails as it does in any world.
 #[test]
 fn a_name_declared_under_home_arpa_answers() {
     world(Duration::from_secs(60), move |fcx| async move {
@@ -100,6 +102,22 @@ fn a_name_declared_under_home_arpa_answers() {
         let m = machine(&fcx, attacher.attach("client")?, ME);
         assert_eq!(lookup(&fcx, &m, "nas.home.arpa").await, Some(nas));
         assert_eq!(lookup(&fcx, &m, "printer.home.arpa").await, None);
+        let gateway = SocketAddr::new(GATEWAY.into(), 53);
+        for (id, name, kind) in [
+            (6, "8.8.8.8.in-addr.arpa", RecordType::PTR),
+            (7, "arpa", RecordType::SOA),
+            (8, "ip6.arpa", RecordType::SOA),
+        ] {
+            let reply = ask(&fcx, &m, gateway, &dns_query(id, name, kind, true))
+                .await
+                .expect("the gateway answers");
+            assert_eq!(
+                reply.metadata.response_code,
+                ResponseCode::ServFail,
+                "{name}"
+            );
+            assert_eq!(edes(&reply), [EdeCode::NO_REACHABLE_AUTHORITY], "{name}");
+        }
         Ok(())
     });
 }

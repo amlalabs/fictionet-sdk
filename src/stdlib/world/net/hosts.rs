@@ -5,6 +5,7 @@ use super::{Hooks, LanSeg, Limits, connection_limit, link, normalize};
 use fictionet::stdlib::codec::Decode;
 use fictionet::stdlib::network::route::{Prefix, Router};
 use fictionet::stdlib::network::{ConnError, Connection, icmp, ip, tcp, udp};
+use fictionet::stdlib::protocols::dns::label_count;
 use fictionet::stdlib::protocols::dns::op::Query;
 use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RecordSet};
 use fictionet::stdlib::services::dns::resolver::Config;
@@ -663,6 +664,16 @@ impl World {
             .is_some_and(|(other, _)| name.zone_of(other))
     }
 
+    /// Whether a declared name is at or below `name` and inside none of
+    /// `zones`.
+    fn declares_outside(&self, name: &LowerName, zones: &[LowerName]) -> bool {
+        // The names below a name follow it directly in canonical order.
+        self.declared
+            .range(name.clone()..)
+            .take_while(|(other, _)| name.zone_of(other))
+            .any(|(other, _)| !zones.iter().any(|zone| zone.zone_of(other)))
+    }
+
     /// What a zone of the declared names holds at `name`, with `apex_sets`
     /// at `apex` beside them.
     fn fact(&self, apex: &LowerName, apex_sets: &[RecordSet], name: &LowerName) -> Fact<Node> {
@@ -856,16 +867,25 @@ impl ZoneData for Declared {
             return Arc::new(Facts::unknown(self.root.clone()));
         }
         let world = self.world.lock();
-        let apex = self
+        let zone = self
             .zones
             .iter()
             .filter(|zone| zone.zone_of(&qname) && world.declares_below(zone))
-            .max_by_key(|zone| zone.num_labels())
-            .cloned()
-            .unwrap_or_else(|| LowerName::new(&qname.trim_to(1)));
-        if !world.declares_below(&apex) {
-            return Arc::new(Facts::unknown(apex));
-        }
+            .max_by_key(|zone| label_count(zone))
+            .cloned();
+        let apex = match zone {
+            Some(zone) => zone,
+            None => {
+                // A declared name inside another local zone is in that
+                // zone, so only the others make a zone of their top-level
+                // domain.
+                let tld = LowerName::new(&qname.trim_to(1));
+                if !world.declares_outside(&tld, &self.zones) {
+                    return Arc::new(Facts::unknown(tld));
+                }
+                tld
+            }
+        };
         let (soa, ns) = local_zone(&Name::from(apex.clone()));
         let apex_sets = if self.apex_records {
             vec![soa.clone(), ns]
@@ -1646,7 +1666,11 @@ impl Machine {
                 admission: self.admission.clone(),
                 limits: self.limits,
             };
-            self.fcx.spawn(move |fcx| program.run(fcx, machine));
+            // The program is called in its own task, not inside this call,
+            // which runs under the network's lock, so it may use the
+            // network's handle from its first line.
+            self.fcx
+                .spawn(move |fcx| async move { program.run(fcx, machine).await });
         }
     }
 

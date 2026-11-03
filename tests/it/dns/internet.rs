@@ -792,8 +792,7 @@ fn a_glueless_delegation_resolves_through_the_answer_for_its_name_server() {
         let config = Config {
             anchors: None,
             ..Config::unbound()
-        }
-        .hints(&internet::root_hints());
+        };
         let (attacher, attachments) = fictionet::attachments();
         let net = Net::new().ipv4_only();
         let handle = net.handle();
@@ -843,8 +842,7 @@ fn a_glueless_name_server_known_before_its_delegation_gets_a_relay() {
         let config = Config {
             anchors: None,
             ..Config::unbound()
-        }
-        .hints(&internet::root_hints());
+        };
         let (attacher, attachments) = fictionet::attachments();
         let net = Net::new().ipv4_only();
         let handle = net.handle();

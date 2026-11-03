@@ -216,6 +216,33 @@ fn a_program_added_at_an_existing_machine_runs_there() {
     });
 }
 
+/// A program may use the network's handle before its first await, also
+/// when its host is added while the network runs.
+#[test]
+fn a_program_uses_the_handle_from_its_first_line() {
+    world(Duration::from_secs(10), |fcx| async move {
+        let (_attacher, attachments) = fictionet::attachments();
+        let net = Net::new().ipv4_only();
+        let handle = net.handle();
+        net.start(&fcx, attachments)?;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let inner = handle.clone();
+        let late = Host::new("late")
+            .at(LATE_AT)
+            .program(move |_fcx: Cx, machine: Endpoints| {
+                let placed = inner.has_machine(machine.addr);
+                let tx = tx.clone();
+                async move {
+                    let _ = tx.send(placed);
+                    Ok(())
+                }
+            });
+        handle.add_host(late)?;
+        assert!(from_program(&fcx, &mut rx).await);
+        Ok(())
+    });
+}
+
 #[test]
 fn adding_a_host_fails_before_start_and_on_the_sandboxes_subnet() {
     world(Duration::from_secs(60), |fcx| async move {

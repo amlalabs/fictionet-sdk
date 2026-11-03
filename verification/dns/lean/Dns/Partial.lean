@@ -28,6 +28,24 @@ def Refines (l1 l2 : Name → Fact Node) : Prop := ∀ n, l1 n ≠ .unknown → 
 in the zone. -/
 def Agrees (v : View) (z : Zone) : Prop := v.apex = z.apex ∧ v.soa = z.soa ∧ Refines v.node z.look
 
+/-- `r2` is `r1`, but for optional additional data `r1` may leave out: the addresses of NS, MX, and SRV
+targets a view does not know (RFC 2181 §5.4.1, RFC 9471 §3.2). -/
+def Response.Grows (r1 r2 : Response) : Prop :=
+  r1.rcode = r2.rcode ∧ r1.aa = r2.aa ∧ r1.answer = r2.answer ∧ r1.authority = r2.authority ∧
+    r1.additional.Sublist r2.additional ∧ r1.required = r2.required
+
+/-- `Response.Grows` for one step's outcome; a CNAME to follow is the same either way. -/
+def Out.Grows : Out → Out → Prop
+  | .done rc aa an au ad req, .done rc' aa' an' au' ad' req' =>
+    rc = rc' ∧ aa = aa' ∧ an = an' ∧ au = au' ∧ ad.Sublist ad' ∧ req = req'
+  | .restart an t, o => o = .restart an t
+  | .done .., .restart .. => False
+
+theorem Out.grows_refl (o : Out) : o.Grows o := by
+  cases o with
+  | done => exact ⟨rfl, rfl, rfl, rfl, List.Sublist.refl _, rfl⟩
+  | restart => rfl
+
 section Refine
 variable {l1 l2 : Name → Fact Node} (R : Refines l1 l2)
 include R
@@ -78,79 +96,95 @@ theorem locate_ref (apex : Name) : ∀ q L, locate l1 apex q = .ok L → locate 
         | _ => exact h
 
 omit R in
-theorem collect_ref {f1 f2 : Name → M (List RRset)} (hf : ∀ t a, f1 t = .ok a → f2 t = .ok a) :
-    ∀ ts a, collect f1 ts = .ok a → collect f2 ts = .ok a := by
+theorem collect_ref {f1 f2 : Name → M (List RRset)}
+    (hf : ∀ t a, f1 t = .ok a → ∃ b, f2 t = .ok b ∧ a.Sublist b) :
+    ∀ ts a, collect f1 ts = .ok a → ∃ b, collect f2 ts = .ok b ∧ a.Sublist b := by
   intro ts
   induction ts with
-  | nil => intro a h; exact h
+  | nil => intro a h; exact ⟨a, h, List.Sublist.refl a⟩
   | cons t ts ih =>
     intro a h
     unfold collect at h ⊢
     cases h1 : f1 t with
     | error e => rw [h1] at h; cases h
     | ok b =>
-      rw [hf t b h1]; rw [h1] at h
+      obtain ⟨b', h1', hb⟩ := hf t b h1
+      rw [h1']; rw [h1] at h
       cases h2 : collect f1 ts with
       | error e => simp only [h2] at h; cases h
-      | ok c => rw [ih c h2]; simp only [h2] at h; exact h
+      | ok c =>
+        obtain ⟨c', h2', hc⟩ := ih c h2
+        simp only [h2] at h; cases h
+        rw [h2']
+        exact ⟨b' ++ c', rfl, hb.append hc⟩
 
 theorem addrsOf_ref {apex t : Name} {a : List RRset} (h : addrsOf l1 apex t = .ok a) :
-    addrsOf l2 apex t = .ok a := by
+    ∃ b, addrsOf l2 apex t = .ok b ∧ a.Sublist b := by
   unfold addrsOf at h ⊢
   by_cases hu : under t apex = true
   · simp only [hu, ↓reduceIte] at h ⊢
     cases hl : locate l1 apex t with
-    | error e => rw [hl] at h; cases h
-    | ok L => rw [locate_ref R apex t L hl]; rw [hl] at h; exact h
-  · simp only [hu] at h ⊢; exact h
+    | error e =>
+      rw [hl] at h; cases h
+      split <;> exact ⟨_, rfl, List.nil_sublist _⟩
+    | ok L => rw [locate_ref R apex t L hl]; rw [hl] at h; exact ⟨a, h, List.Sublist.refl a⟩
+  · simp only [hu] at h ⊢; exact ⟨a, h, List.Sublist.refl a⟩
 
 theorem siblingGlue_ref {apex m t : Name} {a : List RRset} (h : siblingGlue l1 apex m t = .ok a) :
-    siblingGlue l2 apex m t = .ok a := by
+    ∃ b, siblingGlue l2 apex m t = .ok b ∧ a.Sublist b := by
   unfold siblingGlue at h ⊢
   by_cases hu : (under t apex && !under t m) = true
   · simp only [hu, ↓reduceIte] at h ⊢
     cases hl : locate l1 apex t with
-    | error e => rw [hl] at h; cases h
-    | ok L => rw [locate_ref R apex t L hl]; rw [hl] at h; exact h
-  · simp only [hu] at h ⊢; exact h
+    | error e =>
+      rw [hl] at h; cases h
+      split <;> exact ⟨_, rfl, List.nil_sublist _⟩
+    | ok L => rw [locate_ref R apex t L hl]; rw [hl] at h; exact ⟨a, h, List.Sublist.refl a⟩
+  · simp only [hu] at h ⊢; exact ⟨a, h, List.Sublist.refl a⟩
 
 theorem referral_ref {apex m : Name} {ns : RRset} {g : List RRset} {o : Out}
-    (h : referral l1 apex m ns g = .ok o) : referral l2 apex m ns g = .ok o := by
+    (h : referral l1 apex m ns g = .ok o) : ∃ o', referral l2 apex m ns g = .ok o' ∧ o.Grows o' := by
   unfold referral at h ⊢
   cases hc : collect (siblingGlue l1 apex m) (targets ns) with
   | error e => rw [hc] at h; cases h
   | ok s =>
-    rw [collect_ref (fun t a h => siblingGlue_ref R h) _ _ hc]; rw [hc] at h; exact h
+    obtain ⟨s', hc', hs⟩ := collect_ref (fun t a h => siblingGlue_ref R h) _ _ hc
+    rw [hc']; rw [hc] at h; cases h
+    exact ⟨_, rfl, rfl, rfl, rfl, rfl, (List.Sublist.refl _).append hs, rfl⟩
 
 theorem exact_ref {apex : Name} {soa : RRset} {any : AnyResponse} {q : Name} {qtype : Nat} {sets : List RRset}
-    {o : Out} (h : exact l1 apex soa any q qtype sets = .ok o) : exact l2 apex soa any q qtype sets = .ok o := by
+    {o : Out} (h : exact l1 apex soa any q qtype sets = .ok o) :
+    ∃ o', exact l2 apex soa any q qtype sets = .ok o' ∧ o.Grows o' := by
   unfold exact at h ⊢
   by_cases ht : qtype = 255
-  · simp only [ht, ↓reduceIte] at h ⊢; exact h
+  · simp only [ht, ↓reduceIte] at h ⊢; exact ⟨o, h, o.grows_refl⟩
   · simp only [ht, ↓reduceIte] at h ⊢
     cases hf : sets.find? (·.rtype == qtype) with
-    | none => simp only [hf] at h ⊢; exact h
+    | none => simp only [hf] at h ⊢; exact ⟨o, h, o.grows_refl⟩
     | some s =>
       simp only [hf] at h ⊢
       cases hc : collect (addrsOf l1 apex) (targets s) with
       | error e => rw [hc] at h; cases h
-      | ok a => rw [collect_ref (fun t a h => addrsOf_ref R h) _ _ hc]; rw [hc] at h; exact h
+      | ok a =>
+        obtain ⟨a', hc', ha⟩ := collect_ref (fun t a h => addrsOf_ref R h) _ _ hc
+        rw [hc']; rw [hc] at h; cases h
+        exact ⟨_, rfl, rfl, rfl, rfl, rfl, ha, rfl⟩
 
 theorem step_ref {apex : Name} {soa : RRset} {any : AnyResponse} {q : Name} {qtype : Nat} {o : Out}
-    (h : step l1 apex soa any q qtype = .ok o) : step l2 apex soa any q qtype = .ok o := by
+    (h : step l1 apex soa any q qtype = .ok o) : ∃ o', step l2 apex soa any q qtype = .ok o' ∧ o.Grows o' := by
   unfold step at h ⊢
   cases hl : locate l1 apex q with
   | error e => rw [hl] at h; cases h
   | ok L =>
     rw [locate_ref R apex q L hl]; rw [hl] at h
     cases L with
-    | outside => exact h
+    | outside => exact ⟨o, h, o.grows_refl⟩
     | cut m ns ds g =>
       simp only at h ⊢
       split
-      · rename_i hc; simp only [hc, and_self, ↓reduceIte] at h; exact h
+      · rename_i hc; simp only [hc, and_self, ↓reduceIte] at h; exact ⟨o, h, o.grows_refl⟩
       · rename_i hc; simp only [hc, ↓reduceIte] at h; exact referral_ref R h
-    | dname m d => exact h
+    | dname m d => exact ⟨o, h, o.grows_refl⟩
     | node n nd => exact exact_ref R h
     | absent c =>
       simp only at h ⊢
@@ -159,7 +193,7 @@ theorem step_ref {apex : Name} {soa : RRset} {any : AnyResponse} {q : Name} {qty
       | ok og =>
         rw [get_ref R hg]; rw [hg] at h
         cases og with
-        | none => exact h
+        | none => exact ⟨o, h, o.grows_refl⟩
         | some nd =>
           cases nd with
           | cut ns ds g => exact referral_ref R h
@@ -169,41 +203,59 @@ theorem step_ref {apex : Name} {soa : RRset} {any : AnyResponse} {q : Name} {qty
 
 theorem chase_ref {apex : Name} {soa : RRset} {any : AnyResponse} {qtype : Nat} :
     ∀ f seen acc q r, chase l1 apex soa any qtype f seen acc q = .ok r →
-      chase l2 apex soa any qtype f seen acc q = .ok r := by
+      ∃ r', chase l2 apex soa any qtype f seen acc q = .ok r' ∧ r.Grows r' := by
   intro f
   induction f with
-  | zero => intro _ _ _ _ h; exact h
+  | zero =>
+    intro _ _ _ _ h
+    exact ⟨_, h, rfl, rfl, rfl, rfl, List.Sublist.refl _, rfl⟩
   | succ f ih =>
     intro seen acc q r h
     unfold chase at h ⊢
     cases hs : step l1 apex soa any q qtype with
     | error e => rw [hs] at h; cases h
     | ok o =>
-      rw [step_ref R hs]; rw [hs] at h
+      obtain ⟨o', hs', ho⟩ := step_ref R hs
+      rw [hs']; rw [hs] at h
       cases o with
-      | done rc aa an au ad req => exact h
+      | done rc aa an au ad req =>
+        cases o' with
+        | done rc' aa' an' au' ad' req' =>
+          obtain ⟨rfl, rfl, rfl, rfl, had, rfl⟩ := ho
+          simp only at h; cases h
+          exact ⟨_, rfl, rfl, rfl, rfl, rfl, had, rfl⟩
+        | restart => exact ho.elim
       | restart an t =>
+        rw [show o' = .restart an t from ho]
         simp only at h ⊢
         split
-        · rename_i hc; simp only [hc, ↓reduceIte] at h; exact h
+        · rename_i hc; simp only [hc, ↓reduceIte] at h; cases h
+          exact ⟨_, rfl, rfl, rfl, rfl, rfl, List.Sublist.refl _, rfl⟩
         · rename_i hc; simp only [hc, ↓reduceIte] at h; exact ih _ _ _ _ h
 
 theorem answerWith_ref {apex : Name} {soa : RRset} {any : AnyResponse} {req : Request} {r : Response}
-    (h : answerWith l1 apex soa any req = .response r) : answerWith l2 apex soa any req = .response r := by
+    (h : answerWith l1 apex soa any req = .response r) :
+    ∃ r', answerWith l2 apex soa any req = .response r' ∧ r.Grows r' := by
   by_cases hu : under req.qname apex = true
   · rw [answerWith_inside hu] at h ⊢
     generalize chainFuel = F at h ⊢
     cases hc : chase l1 apex soa any req.qtype F [] [] req.qname with
     | error e => rw [hc] at h; cases h
-    | ok r' => rw [chase_ref R _ _ _ _ _ hc]; rw [hc] at h; exact h
-  · rw [answerWith_outside hu] at h ⊢; exact h
+    | ok r' =>
+      obtain ⟨r'', hc', hr⟩ := chase_ref R _ _ _ _ _ hc
+      rw [hc']; rw [hc] at h; cases h
+      exact ⟨r'', rfl, hr⟩
+  · rw [answerWith_outside hu] at h ⊢; cases h
+    exact ⟨_, rfl, rfl, rfl, rfl, rfl, List.Sublist.refl _, rfl⟩
 
 end Refine
 
-/-- If a view answers, every complete zone that agrees with it gives the same response. So an unknown fact
-never becomes NXDOMAIN or NODATA: a negative the view gives is the negative of every agreeing zone. -/
+/-- If a view answers, every complete zone that agrees with it gives the same response, but for optional
+additional data: the addresses of targets the view does not know. So an unknown fact never becomes NXDOMAIN
+or NODATA: a negative the view gives is the negative of every agreeing zone. -/
 theorem answer_partial_sound (v : View) (req : Request) (any : AnyResponse) (r : Response)
-    (h : answerPartial v req any = .response r) : ∀ z, Agrees v z → answer z req any = .response r := by
+    (h : answerPartial v req any = .response r) :
+    ∀ z, Agrees v z → ∃ r', answer z req any = .response r' ∧ r.Grows r' := by
   intro z ⟨ha, hs, R⟩
   unfold answer
   rw [← ha, ← hs]
@@ -598,10 +650,11 @@ theorem lazy_view_one_revision (p : Provider) (s : Lazy) (q : Name) :
         · simp only at hf; subst hf; rw [hl] at hk; exact absurd rfl hk
   · simp only [hn, ↓reduceIte] at hk; exact absurd rfl hk
 
-/-- So a lazy view's answer, when it has one, is the answer of the zone it leaves behind. -/
+/-- So a lazy view's answer, when it has one, is the answer of the zone it leaves behind, but for the addresses
+of targets the provider does not know. -/
 theorem lazy_answer (p : Provider) (s : Lazy) (q : Name) (req : Request) (any : AnyResponse) (r : Response)
     (h : answerPartial (lazyView p s q).1 req any = .response r) :
-    answer (lazyView p s q).2.zone req any = .response r :=
+    ∃ r', answer (lazyView p s q).2.zone req any = .response r' ∧ r.Grows r' :=
   answer_partial_sound _ req any r h _ (lazy_view_one_revision p s q).2.1
 
 end Dns.Zone

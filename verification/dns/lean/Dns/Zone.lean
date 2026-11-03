@@ -244,23 +244,23 @@ def collect (f : Name → M (List RRset)) : List Name → M (List RRset)
       | .error e => .error e
     | .error e => .error e
 
-/-- The address RRsets at a target's own node in this zone. -/
+/-- The address RRsets at a target's own node in this zone. They are optional additional data
+(RFC 2181 §5.4.1, RFC 9471 §3.2), so no answer rests on them: a target whose node is unknown has none. -/
 def addrsOf (look : Name → Fact Node) (apex t : Name) : M (List RRset) :=
   if under t apex then
     match locate look apex t with
     | .ok (.node _ nd) => .ok ((nodeSets nd).filter isAddr)
-    | .ok _ => .ok []
-    | .error e => .error e
+    | _ => .ok []
   else .ok []
 
 /-- Sibling glue for a referral at `m`: addresses of a target held under another cut of this zone
-(RFC 9471 §3.2), as the root holds `gtld-servers.net` addresses for its `com` referral. -/
+(RFC 9471 §3.2), as the root holds `gtld-servers.net` addresses for its `com` referral. It is optional
+additional data too, so a target whose cut is unknown has none. -/
 def siblingGlue (look : Name → Fact Node) (apex m t : Name) : M (List RRset) :=
   if under t apex && !under t m then
     match locate look apex t with
     | .ok (.cut _ _ _ g) => .ok (g.filter fun s => isAddr s && s.owner == t)
-    | .ok _ => .ok []
-    | .error e => .error e
+    | _ => .ok []
   else .ok []
 
 /-- One step's outcome: a finished response, or a CNAME (written or synthesized) and its target. -/
@@ -1373,7 +1373,6 @@ theorem siblingGlue_owners {look : Name → Fact Node} {apex m t : Name} {a : Li
       simp only [List.mem_filter, Bool.and_eq_true, beq_iff_eq] at hs
       rw [hs.2.2]; exact (under_iff _ _).mp hc.1
     · cases h; intro s hs; cases hs
-    · cases h
   · cases h; intro s hs; cases hs
 
 theorem referral_owners {look : Name → Fact Node} {apex m : Name} {ns : RRset} {g : List RRset}
@@ -1592,6 +1591,8 @@ inductive ZoneError where
   | cnameWithOtherData (owner : Name)
   /-- RFC 1912 §2.4. -/
   | cnameAtApex
+  /-- RFC 6672 §2.4: DNAME is a singleton type, so an owner holds one DNAME record. -/
+  | twoDnames (owner : Name)
   /-- RFC 6672 §2.4. -/
   | dataBelowDname (owner : Name)
   /-- Only glue lies below a cut. -/
@@ -1644,10 +1645,14 @@ def Spec.R9 (sp : Spec) : Prop :=
     ∀ d ∈ sp.delegations, d.nsTtl < maxTtl ∧ (∀ g ∈ d.glue, g.ttl < maxTtl) ∧ ∀ x ∈ d.ds, x.1 < maxTtl
 def Spec.R10 (sp : Spec) : Prop := ∃ s ∈ sp.sets, s.owner = sp.apex ∧ s.rtype = 2
 def Spec.R11 (sp : Spec) : Prop := ∀ s ∈ sp.sets, s.rtype ≠ 43
+/-- One DNAME record at an owner: every DNAME record there is the same. -/
+def Spec.R12 (sp : Spec) : Prop :=
+  ∀ s ∈ sp.sets, s.rtype = 39 → ∀ s' ∈ sp.sets, s'.owner = s.owner → s'.rtype = 39 →
+    ∀ r ∈ s.rdata, ∀ r' ∈ s'.rdata, r = r'
 
 /-- Every rule of `ZoneError` holds. -/
 def Spec.Valid (sp : Spec) : Prop :=
-  sp.R1 ∧ sp.R2 ∧ sp.R3 ∧ sp.R4 ∧ sp.R5 ∧ sp.R6 ∧ sp.R7 ∧ sp.R8 ∧ sp.R9 ∧ sp.R10 ∧ sp.R11
+  sp.R1 ∧ sp.R2 ∧ sp.R3 ∧ sp.R4 ∧ sp.R5 ∧ sp.R6 ∧ sp.R7 ∧ sp.R8 ∧ sp.R9 ∧ sp.R10 ∧ sp.R11 ∧ sp.R12
 
 /-! ### The checks, as an implementation computes them -/
 
@@ -1678,6 +1683,9 @@ def Spec.ok9 (sp : Spec) : Bool :=
       d.ds.all fun x => decide (x.1 < maxTtl)
 def Spec.ok10 (sp : Spec) : Bool := sp.sets.any fun s => s.owner == sp.apex && s.rtype == 2
 def Spec.ok11 (sp : Spec) : Bool := sp.sets.all fun s => s.rtype != 43
+def Spec.ok12 (sp : Spec) : Bool :=
+  sp.sets.all fun s => s.rtype != 39 || sp.sets.all fun s' => s'.owner != s.owner || s'.rtype != 39 ||
+    s.rdata.all fun r => s'.rdata.all (· == r)
 
 theorem Spec.ok1_iff (sp : Spec) : sp.ok1 = true ↔ sp.R1 := by
   simp [Spec.ok1, Spec.R1, under_iff]
@@ -1793,6 +1801,26 @@ theorem Spec.ok10_iff (sp : Spec) : sp.ok10 = true ↔ sp.R10 := by
 theorem Spec.ok11_iff (sp : Spec) : sp.ok11 = true ↔ sp.R11 := by
   simp [Spec.ok11, Spec.R11]
 
+theorem Spec.ok12_iff (sp : Spec) : sp.ok12 = true ↔ sp.R12 := by
+  simp only [Spec.ok12, Spec.R12, List.all_eq_true, Bool.or_eq_true, bne_iff_ne, ne_eq, beq_iff_eq]
+  constructor
+  · intro h s hs h39 s' hs' ho h39' r hr r' hr'
+    rcases h s hs with h1 | h1
+    · exact absurd h39 h1
+    · rcases h1 s' hs' with (h2 | h2) | h2
+      · exact absurd ho h2
+      · exact absurd h39' h2
+      · exact (h2 r hr r' hr').symm
+  · intro h s hs
+    by_cases h39 : s.rtype = 39
+    · refine Or.inr fun s' hs' => ?_
+      by_cases ho : s'.owner = s.owner
+      · by_cases h39' : s'.rtype = 39
+        · exact Or.inr fun r hr r' hr' => (h s hs h39 s' hs' ho h39' r hr r' hr').symm
+        · exact Or.inl (Or.inr h39')
+      · exact Or.inl (Or.inl ho)
+    · exact Or.inl h39
+
 /-! ### Assembling the nodes -/
 
 def unionR (a b : List RData) : List RData := b.foldl (fun acc r => if acc.contains r then acc else acc ++ [r]) a
@@ -1838,6 +1866,10 @@ def Spec.firstError (sp : Spec) : ZoneError :=
   else if !sp.ok2 then
     .cnameWithOtherData ((sp.sets.find? fun s => s.rtype == 5 &&
       sp.sets.any fun s' => s'.owner == s.owner && s'.rtype != 5).map (·.owner) |>.getD [])
+  else if !sp.ok12 then
+    .twoDnames ((sp.sets.find? fun s => s.rtype == 39 && !(sp.sets.all fun s' =>
+      s'.owner != s.owner || s'.rtype != 39 || s.rdata.all fun r => s'.rdata.all (· == r))).map (·.owner)
+      |>.getD [])
   else if !sp.ok4 then
     match sp.sets.find? (belowDname ·.owner) with
     | some s => .dataBelowDname s.owner
@@ -1879,7 +1911,8 @@ def Spec.firstError (sp : Spec) : ZoneError :=
   else .missingApexNs
 
 def Spec.okAll (sp : Spec) : Bool :=
-  sp.ok1 && sp.ok2 && sp.ok3 && sp.ok4 && sp.ok5 && sp.ok6 && sp.ok7 && sp.ok8 && sp.ok9 && sp.ok10 && sp.ok11
+  sp.ok1 && sp.ok2 && sp.ok3 && sp.ok4 && sp.ok5 && sp.ok6 && sp.ok7 && sp.ok8 && sp.ok9 && sp.ok10 && sp.ok11 &&
+    sp.ok12
 
 def build (sp : Spec) : Except ZoneError Zone :=
   if sp.okAll then .ok sp.assemble else .error sp.firstError
@@ -1889,6 +1922,7 @@ theorem builder_rejects_iff (sp : Spec) : (∃ e, build sp = .error e) ↔ ¬ sp
   have hv : sp.okAll = true ↔ sp.Valid := by
     simp only [Spec.okAll, Bool.and_eq_true, Spec.ok1_iff, Spec.ok2_iff, Spec.ok3_iff, Spec.ok4_iff,
       Spec.ok5_iff, Spec.ok6_iff, Spec.ok7_iff, Spec.ok8_iff, Spec.ok9_iff, Spec.ok10_iff, Spec.ok11_iff,
+      Spec.ok12_iff,
       Spec.Valid, and_assoc]
   unfold build
   constructor

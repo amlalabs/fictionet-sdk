@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use fictionet::stdlib::protocols::dns::op::ResponseCode;
 use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, RecordType};
-use fictionet::stdlib::protocols::dns::{EdeCode, Request, Response};
+use fictionet::stdlib::protocols::dns::{EdeCode, Request, Response, label_count};
 use fictionet::stdlib::services::serve::Transport;
 
 use super::exchange::Client;
@@ -151,7 +151,7 @@ impl Zones {
                 .iter()
                 .filter(|zone| zone.apex().zone_of(qname))
                 .filter(|zone| !strictly_above || zone.apex() != qname)
-                .max_by_key(|zone| zone.apex().num_labels())
+                .max_by_key(|zone| label_count(zone.apex()))
         };
         let zone = match qtype {
             RecordType::DS => deepest(true).or_else(|| deepest(false)),

@@ -26,9 +26,9 @@ use super::proof::{self, Proof};
 use super::rdata::{DNSKEY, DNSSECRData, DS};
 use super::sign::{serial, signed_data};
 use super::{Anchors, TrustAnchor, Verify};
-use crate::stdlib::protocols::dns::EdeCode;
 use crate::stdlib::protocols::dns::op::{Query, ResponseCode};
 use crate::stdlib::protocols::dns::rr::{Name, RData, RecordSet, RecordType, SerialNumber};
+use crate::stdlib::protocols::dns::{EdeCode, label_count};
 use hickory_proto::dnssec::PublicKey;
 
 /// What a validator established for one answer.
@@ -264,7 +264,7 @@ fn deeper_signer(sets: &[RecordSet], zone: &Name, name: &Name, ds: bool) -> bool
             _ => None,
         })
         .any(|signer| {
-            signer.num_labels() > zone.num_labels()
+            label_count(signer) > label_count(zone)
                 && zone.zone_of(signer)
                 && holds(signer, name, ds)
         })
@@ -326,7 +326,7 @@ impl<V: Verify> Check<'_, V> {
             .iter()
             .filter(|link| anchor.owner.zone_of(&link.zone) && holds(&link.zone, name, ds))
             .collect();
-        links.sort_by_key(|link| link.zone.num_labels());
+        links.sort_by_key(|link| label_count(&link.zone));
         links.dedup_by(|a, b| a.zone == b.zone);
         match links.first() {
             Some(first) if first.zone == anchor.owner => {}

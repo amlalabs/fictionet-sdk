@@ -251,17 +251,22 @@ Exchanges:
 
 Authority:
 
-* Each request needs at most one ask: the relayed question, or the
-  overlay's `<apex> DS`. `RespondMonotone` is checked on the model's
-  `respond` for every request once it knows its observation; `_reask`,
-  where a timeout makes `respond` ask again, breaks it.
-* The root server runs `Relay` and the TLD server `Overlay`, as a world
-  puts the overlay on the `com` servers. Before its DS ask, the overlay
-  reads the edited zone's apex NS RRset and the addresses of its target
-  `ns.fict` from the lazy zone, as `Overlay::respond` asks the inner
-  authority for `<apex> NS`, and a fact it does not know makes the
-  referral SERVFAIL. The referral rests on those facts, so
-  `UnknownNeverNegative` and `CoherentRevision` cover it.
+* A request needs the relayed question, or the overlay's `<apex> DS`
+  and, at a server that does not serve the parent, the relayed question
+  after it. `RespondMonotone` checks that `respond` never needs an ask
+  whose observation it knows; `_reask`, where a timeout makes `respond`
+  ask again, breaks it.
+* The root and TLD servers both run `Overlay` over `Relay`, as
+  `Mirror::wrap` puts an overlay on every relay. Before its DS ask, the
+  overlay reads the edited zone's apex NS RRset and the addresses of its
+  target `ns.fict` from the lazy zone, as `Overlay::respond` asks the
+  inner authority for `<apex> NS`. The real TLD server serves the
+  parent, so the TLD server refers, and SERVFAILs when the target's
+  address is not there. The referral rests on those facts, so
+  `UnknownNeverNegative` and `CoherentRevision` cover it. The real root
+  server does not serve the parent, so the root server relays the
+  question, and `NeverGuess`, `PolicyHolds`, and `OneAskPerNeed` cover
+  both of its asks.
 * `Lazy::view` takes the zone's lock once, so the view is one atomic step.
   `MixedRevision` splits it into two steps, reading the name and then the
   wildcard, and the world may change between them.

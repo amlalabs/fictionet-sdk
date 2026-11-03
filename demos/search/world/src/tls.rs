@@ -87,9 +87,9 @@ impl Ca {
         let world_now = self.world_now(fcx);
         let earliest = time::OffsetDateTime::from(self.earliest).min(world_now);
         let names = resolver
-            .doh
-            .iter()
-            .map(|name| name.trim_end_matches('.').to_owned());
+            .doh()
+            .into_iter()
+            .map(|name| name.to_ascii().trim_end_matches('.').to_owned());
         let addresses = resolver
             .addresses
             .iter()

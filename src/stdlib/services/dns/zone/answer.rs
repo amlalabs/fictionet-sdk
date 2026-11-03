@@ -5,7 +5,7 @@ use fictionet::stdlib::protocols::dns::rr::rdata::{CNAME, HINFO};
 use fictionet::stdlib::protocols::dns::rr::{
     LowerName, Name, RData, Record, RecordSet, RecordType,
 };
-use fictionet::stdlib::protocols::dns::{Request, Response};
+use fictionet::stdlib::protocols::dns::{Request, Response, dname_substitute};
 
 use super::cover::negative_ttl;
 use super::data::{Denied, Fact, View};
@@ -370,7 +370,7 @@ impl<'v> Walk<'v> {
         let mut additional = in_domain.clone();
         for target in &targets {
             if !cut.zone_of(target) {
-                additional.extend(self.addresses_of(target)?);
+                additional.extend(self.addresses_of(target));
             }
         }
         let mut authority = vec![ns.clone()];
@@ -389,21 +389,23 @@ impl<'v> Walk<'v> {
     }
 
     /// The address RRsets of a target in this zone: at its own node, or
-    /// held as glue under a cut.
-    fn addresses_of(&self, target: &LowerName) -> Result<Vec<RecordSet>, LowerName> {
+    /// held as glue under a cut. They are optional additional data
+    /// (RFC 2181 §5.4.1, RFC 9471 §3.2), so a reply never rests on them:
+    /// a target the view does not know has none.
+    fn addresses_of(&self, target: &LowerName) -> Vec<RecordSet> {
         if !self.view.apex().zone_of(target) {
-            return Ok(Vec::new());
+            return Vec::new();
         }
-        Ok(match self.locate(target)? {
-            Loc::Node(node) => node
+        match self.locate(target) {
+            Ok(Loc::Node(node)) => node
                 .rrsets()
                 .into_iter()
                 .filter(|set| is_address(set))
                 .cloned()
                 .collect(),
-            Loc::Cut { glue, .. } => glue_for(glue, target),
+            Ok(Loc::Cut { glue, .. }) => glue_for(glue, target),
             _ => Vec::new(),
-        })
+        }
     }
 
     /// A DNAME at `owner` above `name` (step 3).
@@ -420,19 +422,9 @@ impl<'v> Walk<'v> {
         let Some(target) = target else {
             return Ok(Out::Done(positive(vec![dname.clone()], Vec::new())));
         };
-        // The labels of `name` above the DNAME's owner. hickory's own label
-        // count leaves out a leading `*`, so the labels are counted here.
-        let name_labels = Name::from(name);
-        let labels: Vec<&[u8]> = name_labels.iter().collect();
-        let prefix = &labels[..labels.len() - Name::from(owner).iter().count()];
-        // A name takes at most 255 octets on the wire (RFC 6672 §2.2).
-        let length: usize = prefix.iter().map(|label| label.len() + 1).sum::<usize>()
-            + target.iter().map(|label| label.len() + 1).sum::<usize>()
-            + 1;
-        let synthesized = (length <= 255)
-            .then(|| Name::from_labels(prefix.iter().copied()).and_then(|n| n.append_name(&target)))
-            .and_then(Result::ok);
-        let Some(synthesized) = synthesized else {
+        // `owner` is strictly above `name`, so only a new name past 255
+        // octets has none.
+        let Some(synthesized) = dname_substitute(name, owner, &target) else {
             return Ok(Out::Done(Found {
                 answer: vec![dname.clone()],
                 ..Found::new(ResponseCode::YXDomain, true)
@@ -517,7 +509,7 @@ impl<'v> Walk<'v> {
         if let Some(set) = sets.iter().find(|set| set.record_type() == self.qtype) {
             let mut additional = Vec::new();
             for target in targets(set) {
-                additional.extend(self.addresses_of(&target)?);
+                additional.extend(self.addresses_of(&target));
             }
             let mut found = positive(vec![owned(set, &owner)], proof);
             found.additional = unique(additional.into_iter());

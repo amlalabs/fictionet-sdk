@@ -140,9 +140,8 @@ impl Entry {
     }
 
     /// The rank the entry holds its key at. A negative answer is an
-    /// authoritative answer. A failure ranks with glue, so it never
-    /// displaces live data that answers clients; laid over glue, it keeps
-    /// the glue beneath it for [`Cache::data`].
+    /// authoritative answer. A failure is no data and ranks lowest, so
+    /// any data replaces it.
     pub fn rank(&self) -> Rank {
         match self {
             Entry::Positive { rank, .. } => *rank,
@@ -312,14 +311,14 @@ struct SecureNsec {
 #[derive(Clone, Debug)]
 struct Stored {
     entry: Entry,
-    /// The data a failure was laid over: live data below
-    /// [`Rank::NonAuthAnswer`], such as glue, which still says where a
-    /// zone's servers are, or expired data that may still be served
-    /// stale.
+    /// The expired data a failure was laid over, which may still be
+    /// served stale (RFC 8767 §4).
     under: Option<Entry>,
-    /// The live glue a failure or a negative answer was laid over. A
-    /// negative answer for a name server's own name is no data about how
-    /// its parent reaches it, so the glue still finds the zone's servers
+    /// The live data below [`Rank::NonAuthAnswer`], such as glue or a
+    /// referral's NS RRset, that a failure or a negative answer was laid
+    /// over. Neither is data about how a zone's servers are reached: a
+    /// negative answer for a name server's own name says nothing of how
+    /// its parent reaches it, so this still finds the zone's servers
     /// (RFC 2181 §5.4.1, RFC 1034 §5.3.3).
     glue: Option<Entry>,
     /// When the entry was stored.
@@ -344,12 +343,16 @@ struct Stored {
 /// - A Secure RRset lives no longer than its RRSIGs (RFC 4035 §5.3.3).
 /// - A failure lives [`Limits::failure_ttl`] (RFC 9520 §3.2), and so does
 ///   data that validated Bogus or Indeterminate.
-/// - An entry replaces a live entry for its key only at equal or higher
-///   [`Rank`] (RFC 2181 §5.4.1). A failure or a negative answer laid over
-///   glue keeps the glue beneath it, for finding servers. Data or NODATA at a name ends a
-///   live NXDOMAIN at that name or above it at no higher rank, since the
-///   name exists after all (RFC 8020 §2). An NXDOMAIN replaces the entry
-///   of the type it answered.
+/// - Data replaces a live entry for its key only at equal or higher
+///   [`Rank`] (RFC 2181 §5.4.1). A failure is no data: any data replaces
+///   it, and it is laid over any live entry that does not answer clients,
+///   so it is cached whenever a resolution fails (RFC 9520 §3.2). A
+///   failure or a negative answer laid over data below
+///   [`Rank::NonAuthAnswer`] keeps that data beneath it, for finding
+///   servers. Data or NODATA at a name ends a live NXDOMAIN at that name
+///   or above it at no higher rank, under every type it is kept under,
+///   since the name exists after all (RFC 8020 §2). An NXDOMAIN replaces
+///   the entry of the type it answered.
 /// - Every entry records the generation that wrote it, and a new
 ///   generation starts empty.
 #[derive(Clone, Debug)]
@@ -404,16 +407,27 @@ impl Cache {
         let Some((key, entry)) = self.entry_for(now, offer) else {
             return;
         };
-        if let Some(old) = self.live(&key, now)
-            && entry.rank() < old.rank()
-        {
-            return;
+        if let Some(old) = self.live(&key, now) {
+            let kept = match entry {
+                // A failure never displaces live data that answers
+                // clients.
+                Entry::Failure { .. } => old.rank() >= Rank::NonAuthAnswer,
+                _ => entry.rank() < old.rank(),
+            };
+            if kept {
+                return;
+            }
         }
         // A failure is no data (RFC 9520 §3), so it takes away neither
         // live glue nor expired data that may still be served stale
-        // (RFC 8767 §4): they are kept beside the failure.
+        // (RFC 8767 §4): they are kept beside the failure. Data that
+        // answers clients under a failure has expired, since it would
+        // have kept the failure out while live.
         let under = match &entry {
-            Entry::Failure { .. } => self.stale(&key, now).cloned(),
+            Entry::Failure { .. } => self
+                .stale(&key, now)
+                .filter(|old| old.rank() >= Rank::NonAuthAnswer)
+                .cloned(),
             _ => None,
         };
         // Neither is a failure or a negative answer data about how a
@@ -472,32 +486,24 @@ impl Cache {
     /// server's name does not take away the glue that says where the
     /// server is (RFC 2181 §5.4.1), so this is what finding servers reads.
     pub fn data(&self, key: &Key, now: Instant) -> Option<&Entry> {
-        let live = |entry: &&Entry| now < entry.expires();
         let stored = self.stored(key)?;
-        let data = match &stored.entry {
-            Entry::Failure { .. } => stored.under.as_ref(),
-            entry => Some(entry),
-        };
-        data.filter(|entry| matches!(entry, Entry::Positive { .. }))
-            .filter(live)
-            .or_else(|| stored.glue.as_ref().filter(live))
+        [Some(&stored.entry), stored.glue.as_ref()]
+            .into_iter()
+            .flatten()
+            .find(|entry| matches!(entry, Entry::Positive { .. }) && now < entry.expires())
     }
 
     /// The live glue stored for `key` at `now`: an RRset below
     /// [`Rank::NonAuthAnswer`], as the entry or beneath it.
     fn glue(&self, key: &Key, now: Instant) -> Option<&Entry> {
         let stored = self.stored(key)?;
-        [
-            Some(&stored.entry),
-            stored.under.as_ref(),
-            stored.glue.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        .find(|entry| {
-            matches!(entry, Entry::Positive { rank, .. } if *rank < Rank::NonAuthAnswer)
-                && now < entry.expires()
-        })
+        [Some(&stored.entry), stored.glue.as_ref()]
+            .into_iter()
+            .flatten()
+            .find(|entry| {
+                matches!(entry, Entry::Positive { rank, .. } if *rank < Rank::NonAuthAnswer)
+                    && now < entry.expires()
+            })
     }
 
     /// What is stored for `key` in this generation.
@@ -588,27 +594,32 @@ impl Cache {
     ) {
         let mut keys = vec![key.clone()];
         if key.rtype == RecordType::ANY {
-            let copies = self
-                .entries
-                .range(Key::new(key.name.clone(), RecordType::from(0), key.class)..)
-                .take_while(|(other, _)| other.name == key.name)
-                .filter(|(other, stored)| {
-                    other.class == key.class
-                        && other.rtype != RecordType::ANY
-                        && matches!(
-                            stored.entry,
-                            Entry::Negative {
-                                kind: Negative::NxDomain,
-                                ..
-                            }
-                        )
-                })
-                .map(|(other, _)| other.clone());
-            keys.extend(copies);
+            keys.extend(self.nxdomain_copies(key));
         }
         for key in keys {
             self.validated_one(&key, checked, result, signatures_expire, original_ttl, now);
         }
+    }
+
+    /// The keys of the copies of the NXDOMAIN kept under `key`, of type
+    /// ANY, under the types it answered at the same name.
+    fn nxdomain_copies(&self, key: &Key) -> Vec<Key> {
+        self.entries
+            .range(Key::new(key.name.clone(), RecordType::from(0), key.class)..)
+            .take_while(|(other, _)| other.name == key.name)
+            .filter(|(other, stored)| {
+                other.class == key.class
+                    && other.rtype != RecordType::ANY
+                    && matches!(
+                        stored.entry,
+                        Entry::Negative {
+                            kind: Negative::NxDomain,
+                            ..
+                        }
+                    )
+            })
+            .map(|(other, _)| other.clone())
+            .collect()
     }
 
     /// [`validated`](Cache::validated) for the entry at `key` alone.
@@ -769,7 +780,7 @@ impl Cache {
     }
 
     /// Drops each live NXDOMAIN at `key`'s name or above it whose rank is
-    /// at most `rank`.
+    /// at most `rank`, with its copies under the types it answered.
     fn exists(&mut self, key: &Key, rank: Rank, now: Instant) {
         let mut at = key.name.clone();
         loop {
@@ -782,6 +793,9 @@ impl Cache {
             ) = self.live(&nxdomain, now)
                 && entry.rank() <= rank
             {
+                for copy in self.nxdomain_copies(&nxdomain) {
+                    self.entries.remove(&copy);
+                }
                 self.entries.remove(&nxdomain);
             }
             if at.is_root() {

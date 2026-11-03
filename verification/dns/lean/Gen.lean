@@ -266,6 +266,11 @@ def rRData (t : Nat) : G RData := do
   | 16 => do
     let n ← rRange 0 30
     return .octets (n :: (← rBytes n))
+  -- SRV: the priority, weight, and port, then the target uncompressed (RFC 2782); now and then octets that do
+  -- not read as SRV, which hickory refuses.
+  | 33 => do
+    if ← chance 8 then let n ← rRange 0 12; return .octets (← rBytes n)
+    return .octets ((← rBytes 6) ++ Dnssec.Symbolic.wire (← rName 3 true))
   | _ => do let n ← rRange 0 12; return .octets (← rBytes n)
 
 def rType : G Nat := pick #[1, 1, 28, 2, 5, 15, 6, 12, 16, 33, 65280]
@@ -485,7 +490,9 @@ def rSpec : G Spec := do
   if (← chance 2) then
     let target ← pick #[[lb "example", lb "net"], [lb "other", lb "org"], lb "deep" :: apex,
       List.replicate 4 (List.replicate 61 120), List.replicate 4 (List.replicate 61 120)]
-    sets := sets ++ [⟨lb "d" :: apex, 39, 300, [.dname target]⟩]
+    -- Now and then a second DNAME record at the owner, which the builder refuses (RFC 6672 §2.4).
+    let second : List RData := if ← chance 4 then [.dname [lb "second", lb "org"]] else []
+    sets := sets ++ [⟨lb "d" :: apex, 39, 300, .dname target :: second⟩]
   let mut dels : List Delegation := []
   let cut1 := lb "sub" :: apex
   let cut2 := lb "zone" :: apex
@@ -531,7 +538,26 @@ instance : Inhabited AnyResponse := ⟨.all⟩
 def rAny : G AnyResponse := pick #[.hinfo, .oneRrset, .all]
 
 
+def zoneErrorStr : ZoneError → String
+  | .outOfZone _ => "out_of_zone"
+  | .cnameWithOtherData _ => "cname_with_other_data"
+  | .cnameAtApex => "cname_at_apex"
+  | .twoDnames _ => "two_dnames"
+  | .dataBelowDname _ => "data_below_dname"
+  | .dataBelowCut _ _ => "data_below_cut"
+  | .dsNotAtCut _ => "ds_not_at_cut"
+  | .missingInDomainGlue _ _ => "missing_in_domain_glue"
+  | .targetIsAlias _ _ => "target_is_alias"
+  | .rrsetTtlsDiffer _ _ => "rrset_ttls_differ"
+  | .ttlTooLarge _ _ => "ttl_too_large"
+  | .missingApexNs => "missing_apex_ns"
+
+/-- A zone question, or now and then a zone the builder refuses, with the rule it breaks first. -/
 def zoneCase : G String := do
+  if ← chance 8 then
+    let sp ← rSpec
+    if let .error e := build sp then
+      return jobj [("input", jobj [("zone", specJson sp)]), ("expected", jobj [("error", jstr (zoneErrorStr e))])]
   let (sp, z) ← rZone
   let q : Request := ⟨← rQname z, ← rQtype⟩
   let any ← rAny
@@ -906,13 +932,15 @@ def optNat : Option Nat → String
   | none => "null"
 
 def offerJson : Offer → String
-  | .positive s r v sig tc =>
+  | .positive s r v sig orig tc =>
     jobj [("kind", jstr "positive"), ("set", setsJson [s]), ("rank", jstr (rankStr r)),
-      ("validation", validationJson v), ("sig_expires", optNat sig), ("truncated", jbool tc)]
-  | .negative k kind soa nsec v tc =>
+      ("validation", validationJson v), ("sig_expires", optNat sig), ("original_ttl", optNat orig),
+      ("truncated", jbool tc)]
+  | .negative k kind soa nsec v sig orig tc =>
     jobj [("kind", jstr "negative"), ("key", keyJson k), ("negative", jstr (negativeStr kind)),
       ("soa", (soa.map fun s => setsJson [s]).getD "null"), ("denial_ttl", optNat nsec),
-      ("validation", validationJson v), ("truncated", jbool tc)]
+      ("validation", validationJson v), ("sig_expires", optNat sig), ("original_ttl", optNat orig),
+      ("truncated", jbool tc)]
   | .failure k why => jobj [("kind", jstr "failure"), ("key", keyJson k), ("why", failureJson why)]
 
 def servedJson : Option Served → String
@@ -938,14 +966,17 @@ def rOption {α : Type} (g : G α) : G (Option α) := do
 def rOffer : G Offer := do
   let k ← pick cacheKeys
   let ttl ← pick #[0, 60, 300, 300, 86400, 2147483653, 1000000]
-  let v ← pick #[Validation.secure, .secure, .notPerformed, .insecure .provenNoDs, .bogus .expired]
+  let v ← pick #[Validation.secure, .secure, .notPerformed, .insecure .provenNoDs, .bogus .expired,
+    .indeterminate]
+  -- The first RRSIG expiration and the smallest Original TTL validation found.
+  let sig ← rOption (pick #[150, 500, 2000])
+  let orig ← rOption (pick #[30, 300, 2147483653])
   match ← rNat 5 with
   | 0 | 1 =>
     let octet ← rNat 256
     let rd : Zone.RData := if k.rtype == 15 then .mx 10 [lb "mx", lb "example"] else .a [192, 0, 2, octet]
-    let rank ← pick #[.authAnswer, .nonAuthAnswer, .glue, .authAuthority]
-    let sig ← rOption (pick #[150, 500, 2000])
-    return .positive ⟨k.name, k.rtype, ttl, [rd]⟩ rank v sig (← chance 8)
+    let rank ← pick #[.authAnswer, .nonAuthAnswer, .glue, .nonAuthAuthority, .authAuthority]
+    return .positive ⟨k.name, k.rtype, ttl, [rd]⟩ rank v sig orig (← chance 8)
   | 2 | 3 =>
     let minimum ← pick #[30, 300, 3600]
     let soa : RRset :=
@@ -953,7 +984,7 @@ def rOffer : G Offer := do
     let kind ← pick #[.nxDomain, .noData]
     let soa? := if ← chance 6 then none else some soa
     let denialTtl ← rOption (pick #[10, 100, 7200])
-    return .negative k kind soa? denialTtl v (← chance 8)
+    return .negative k kind soa? denialTtl v sig orig (← chance 8)
   | _ => return .failure k (← pick #[.noReachableAuthority, .workExceeded, .unknown])
 
 def cacheCase : G String := do

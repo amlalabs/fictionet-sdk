@@ -6,6 +6,7 @@ use std::fmt::Write;
 use super::DigestType;
 use super::keys::ds;
 use super::rdata::{DNSKEY, DS};
+use crate::stdlib::protocols::dns::label_count;
 use crate::stdlib::protocols::dns::rr::Name;
 
 /// The DS records a validator trusts for the zone at `owner`.
@@ -123,7 +124,7 @@ impl Anchors {
             .iter()
             .filter(|anchor| !anchor.ds.is_empty() && anchor.owner.zone_of(name))
             .filter(|anchor| !strictly_above || anchor.owner != *name)
-            .max_by_key(|anchor| anchor.owner.num_labels())
+            .max_by_key(|anchor| label_count(&anchor.owner))
     }
 }
 

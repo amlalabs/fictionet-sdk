@@ -471,12 +471,14 @@ impl Carrier for Packets {
 }
 
 /// A UDP socket on a port drawn from `entropy` in the dynamic range
-/// (RFC 6056 §2.1), drawing again while the port drawn is taken (RFC 5452
-/// §9.2). `None` only when every port of the range is taken.
+/// (RFC 6056 §2.1, RFC 5452 §9.2). While the port drawn is taken, the
+/// next one is tried, wrapping around the range, as RFC 6056 §3.3.1
+/// does. `None` only when every port of the range is taken.
 fn bind_random(entropy: &dyn Entropy, udp: &udp::Endpoint) -> Option<udp::Socket> {
     let ports = u64::from(u16::MAX - FIRST_PORT) + 1;
-    (0..ports).find_map(|_| {
-        let offset = u16::try_from(entropy.random_below(ports)).ok()?;
+    let first = entropy.random_below(ports);
+    (0..ports).find_map(|step| {
+        let offset = u16::try_from((first + step) % ports).ok()?;
         udp.bind(FIRST_PORT + offset).ok()
     })
 }

@@ -62,27 +62,72 @@ pub fn sign(
 
 /// The bytes an RRSIG with `input` signs over `set`: hickory's
 /// to-be-signed form, with the names in each record's RDATA in canonical,
-/// lowercase form (RFC 4034 §6.2 item 3). hickory lowercases those of the
-/// types it knows; DNAME, which it carries as unknown RDATA, is lowercased
-/// here. The error is hickory's, for a record whose data does not encode.
+/// lowercase form (RFC 4034 §6.2 item 3, as RFC 6840 §5.1 amends it).
+/// hickory lowercases those of the types it knows; the types on that list
+/// it carries as unknown RDATA are lowercased here. The error is
+/// hickory's, for a record whose data does not encode.
 pub fn signed_data(set: &RecordSet, input: &SigInput) -> Result<TBS, ProtoError> {
     let records: Vec<Record> = set
         .records_without_rrsigs()
         .map(|record| {
             let mut record = record.clone();
-            if let RData::Unknown {
-                code: RecordType::DNAME,
-                rdata,
-            } = &mut record.data
-            {
-                // The target, an uncompressed name (RFC 6672 §2.5). Its
-                // length octets are at most 63, below every ASCII letter.
-                rdata.anything.make_ascii_lowercase();
+            if let RData::Unknown { code, rdata } = &mut record.data {
+                lowercase_names(*code, &mut rdata.anything);
             }
             record
         })
         .collect();
     TBS::from_input(set.name(), set.dns_class(), input, records.iter())
+}
+
+/// Lowercases the uncompressed names in `rdata`, the RDATA of a type on
+/// the list of RFC 4034 §6.2 item 3 that hickory carries as unknown RDATA.
+/// The RDATA of any other type is left as it is, and so is a name that
+/// does not read.
+fn lowercase_names(rtype: RecordType, rdata: &mut [u8]) {
+    // Where the first name starts, and how many names follow one another
+    // from there.
+    let (start, names) = match u16::from(rtype) {
+        // MD, MF, MB, MG, MR (RFC 1035 §3.3), NXT, whose type bitmap
+        // follows its name (RFC 2535 §5.2), and DNAME (RFC 6672 §2.1).
+        3 | 4 | 7 | 8 | 9 | 30 | 39 => (0, 1),
+        // MINFO (RFC 1035 §3.3.7) and RP (RFC 1183 §2.2).
+        14 | 17 => (0, 2),
+        // AFSDB (RFC 1183 §1), RT (RFC 1183 §3.3), and KX (RFC 2230 §3.1),
+        // each after a 16-bit field.
+        18 | 21 | 36 => (2, 1),
+        // PX, after its preference (RFC 2163 §4).
+        26 => (2, 2),
+        // A6: the prefix length, the address suffix, then the prefix name
+        // when the prefix length is not 0 (RFC 2874 §3.1.1).
+        38 => match rdata.first() {
+            Some(&prefix @ 1..=128) => (1 + usize::from(128 - prefix).div_ceil(8), 1),
+            _ => return,
+        },
+        _ => return,
+    };
+    let mut at = start;
+    for _ in 0..names {
+        // Labels until the root; a length above 63 is no label.
+        loop {
+            let Some(&length) = rdata.get(at) else {
+                return;
+            };
+            let length = usize::from(length);
+            if length == 0 {
+                at += 1;
+                break;
+            }
+            let Some(label) = rdata
+                .get_mut(at + 1..at + 1 + length)
+                .filter(|_| length <= 63)
+            else {
+                return;
+            };
+            label.make_ascii_lowercase();
+            at += 1 + length;
+        }
+    }
 }
 
 /// A time as an RRSIG field: seconds since 1970 modulo 2^32, compared with

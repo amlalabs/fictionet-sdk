@@ -223,27 +223,27 @@ theorem relay_never_guesses (req : Req) (known : Known) (b : Bytes) (h : respond
 
 /-! ## Overlay -/
 
-/-- An overlay: questions at or below `apex` go to `inner`. A question asked of a parent server that crosses
-`apex` from above gets a referral composed from `inner`'s apex NS set and glue; with DO=1 the overlay first
-asks `base` for `<apex> DS` and puts the denial records of that reply in the referral. Everything else goes
-to `base`. -/
+/-- An overlay: questions at `inner`'s own name servers go to `inner`. For any other question that crosses the
+invented apex from above, the overlay asks `base` for `<apex> DS` with DO=1, whatever the client's DO bit.
+When `serves` says that reply comes from a server of the apex's parent, the question gets a referral composed
+from `inner`'s apex NS set and glue and that reply's denial records; when it does not, the server answers as
+`base` does (RFC 1034 §4.2.1), which for a relay is a second ask; without a reply, nothing. Everything else,
+the DS question at the apex among it, goes to `base`. -/
 structure Overlay where
   base : Authority
   inner : Authority
   below : Req → Bool
   crossing : Req → Bool
-  wantsDs : Req → Bool
   dsAsk : Req → Ask
-  referral : Req → Option Bytes → Bytes
+  serves : Req → Bytes → Bool
+  referral : Req → Bytes → Bytes
 
 def overlay (o : Overlay) : Authority := fun req =>
   if o.below req then o.inner req
   else if o.crossing req then
-    if o.wantsDs req then
-      .ask (o.dsAsk req) fun
-        | .reply b => .done (some (o.referral req (some b)))
-        | _ => .done none
-    else .done (some (o.referral req none))
+    .ask (o.dsAsk req) fun
+      | .reply b => if o.serves req b then .done (some (o.referral req b)) else o.base req
+      | _ => .done none
   else o.base req
 
 theorem overlay_asks (o : Overlay) (req : Req) (ab ai : List Ask) (hb : Asks o.base req ab)
@@ -253,12 +253,19 @@ theorem overlay_asks (o : Overlay) (req : Req) (ab ai : List Ask) (hb : Asks o.b
   split at h
   · simp [hi known a h]
   · split at h
-    · split at h
-      · simp only [run] at h
-        cases hg : known.get (o.dsAsk req) with
-        | none => rw [hg] at h; cases h; simp
-        | some ob => rw [hg] at h; cases ob <;> simp [run] at h
-      · simp [run] at h
+    · simp only [run] at h
+      cases hg : known.get (o.dsAsk req) with
+      | none => rw [hg] at h; cases h; simp
+      | some ob =>
+        rw [hg] at h
+        cases ob with
+        | reply b =>
+          simp only at h
+          split at h
+          · simp [run] at h
+          · simp [hb known a h]
+        | unreachable => simp [run] at h
+        | timeout => simp [run] at h
     · simp [hb known a h]
 
 /-- A zone authority answers from data it holds and never asks. -/

@@ -24,7 +24,7 @@ use std::pin::Pin;
 use fictionet::Cx;
 use fictionet::stdlib::protocols::dns::op::Message;
 use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, Name, RData, RecordType};
-use fictionet::stdlib::protocols::dns::{Parsed, Request, read_message, restore};
+use fictionet::stdlib::protocols::dns::{Parsed, Request, label_count, read_message, restore};
 use fictionet::stdlib::services::dns::authority::{Ask, Observed};
 use fictionet::stdlib::services::serve::Transport;
 use fictionet::stdlib::world::net::dns::{Question, Source};
@@ -423,14 +423,14 @@ impl Replay {
         // Within a capture the server's own reply ranks above any other.
         let rank = |from: &SocketAddr| {
             if *from == server {
-                return Some(u8::MAX);
+                return Some(usize::MAX);
             }
             if from.port() != server.port() {
                 return None;
             }
             serving(server.ip())
                 .filter(|zone| serving(from.ip()).any(|other| other == *zone))
-                .map(|zone| zone.num_labels())
+                .map(|zone| label_count(zone))
                 .max()
         };
         self.replies

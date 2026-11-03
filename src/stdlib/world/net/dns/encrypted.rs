@@ -76,12 +76,13 @@ use http::{HeaderValue, Method, Request, Response, StatusCode};
 
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::codec::base64::{self, Padding};
+use fictionet::stdlib::protocols::dns::dnssec::rdata::DNSSECRData;
 use fictionet::stdlib::protocols::dns::op::{Edns, Message, MessageType, OpCode, Query};
 use fictionet::stdlib::protocols::dns::read_message;
-use fictionet::stdlib::protocols::dns::rr::rdata::HTTPS;
 use fictionet::stdlib::protocols::dns::rr::rdata::svcb::{
     Alpn, EchConfigList, IpHint, Mandatory, SVCB, SvcParamKey, SvcParamValue, Unknown,
 };
+use fictionet::stdlib::protocols::dns::rr::rdata::{CNAME, HTTPS, NS, PTR};
 use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RData, Record, RecordType};
 use fictionet::stdlib::protocols::dns::serialize::binary::BinEncodable;
 use fictionet::stdlib::protocols::dns::{Framing, Queries, stream_framed};
@@ -296,9 +297,9 @@ pub fn certificate(
     validity: Validity,
 ) -> Result<Leaf, Error> {
     let names = resolver
-        .doh
-        .iter()
-        .map(|name| name.trim_end_matches('.').to_owned());
+        .doh()
+        .into_iter()
+        .map(|name| name.to_ascii().trim_end_matches('.').to_owned());
     let addresses = resolver
         .addresses
         .iter()
@@ -824,7 +825,7 @@ fn to_json(message: &Message) -> Vec<u8> {
         .iter()
         .map(|query| {
             Value::Object(vec![
-                ("name".to_owned(), Value::from(query.name().to_string())),
+                ("name".to_owned(), Value::from(name_text(query.name()))),
                 (
                     "type".to_owned(),
                     Value::from(u32::from(u16::from(query.query_type()))),
@@ -850,7 +851,7 @@ fn to_json(message: &Message) -> Vec<u8> {
 fn record_json(record: &Record) -> Value {
     let data = presentation(&record.data);
     Value::Object(vec![
-        ("name".to_owned(), Value::from(record.name.to_string())),
+        ("name".to_owned(), Value::from(name_text(&record.name))),
         (
             "type".to_owned(),
             Value::from(u32::from(u16::from(record.record_type()))),
@@ -867,9 +868,11 @@ fn record_json(record: &Record) -> Value {
 /// as Google gives TXT and SPF data. HINFO, CAA, and NAPTR strings are
 /// quoted and escaped (RFC 1035 §5.1), SVCB and HTTPS parameters are
 /// written as RFC 9460 §2.1 and Appendix A give them, and a DNAME gives
-/// its target. Types whose own text hickory writes in presentation format
-/// use it. Any other type, NULL and types hickory does not know among
-/// them, takes the generic `\# <length> <hex>` form (RFC 3597 §5).
+/// its target. Every name is written by [`name_text`], in ASCII as
+/// Google's and Cloudflare's APIs give names. Types without names whose
+/// own text hickory writes in presentation format use it. Any other type,
+/// NULL and types hickory does not know among them, takes the generic
+/// `\# <length> <hex>` form (RFC 3597 §5).
 fn presentation(data: &RData) -> String {
     match data {
         RData::TXT(txt) => txt.txt_data.iter().map(|part| quoted(part)).collect(),
@@ -882,33 +885,95 @@ fn presentation(data: &RData) -> String {
             quoted(&naptr.flags),
             quoted(&naptr.services),
             quoted(&naptr.regexp),
-            naptr.replacement
+            name_text(&naptr.replacement)
         ),
         RData::SVCB(svcb) | RData::HTTPS(HTTPS(svcb)) => service_binding(svcb),
+        RData::NS(NS(target)) | RData::CNAME(CNAME(target)) | RData::PTR(PTR(target)) => {
+            name_text(target)
+        }
+        RData::MX(mx) => format!("{} {}", mx.preference, name_text(&mx.exchange)),
+        RData::SRV(srv) => format!(
+            "{} {} {} {}",
+            srv.priority,
+            srv.weight,
+            srv.port,
+            name_text(&srv.target)
+        ),
+        RData::SOA(soa) => format!(
+            "{} {} {} {} {} {} {}",
+            name_text(&soa.mname),
+            name_text(&soa.rname),
+            soa.serial,
+            soa.refresh,
+            soa.retry,
+            soa.expire,
+            soa.minimum
+        ),
+        RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) => {
+            let input = rrsig.input();
+            format!(
+                "{} {} {} {} {} {} {} {} {}",
+                input.type_covered,
+                input.algorithm,
+                input.num_labels,
+                input.original_ttl,
+                input.sig_expiration.get(),
+                input.sig_inception.get(),
+                input.key_tag,
+                name_text(&input.signer_name),
+                base64::encode(rrsig.sig())
+            )
+        }
+        RData::DNSSEC(DNSSECRData::NSEC(nsec)) => {
+            let mut out = name_text(nsec.next_domain_name());
+            for rtype in nsec.type_bit_maps() {
+                out.push_str(&format!(" {rtype}"));
+            }
+            out
+        }
         RData::A(_)
         | RData::AAAA(_)
-        | RData::NS(_)
-        | RData::CNAME(_)
-        | RData::PTR(_)
-        | RData::MX(_)
-        | RData::SOA(_)
-        | RData::SRV(_)
         | RData::SSHFP(_)
         | RData::TLSA(_)
         | RData::OPENPGPKEY(_)
         | RData::DNSSEC(_) => data.to_string(),
         _ => match dname_target(data) {
-            Some(target) => target.to_string(),
+            Some(target) => name_text(&target),
             None => generic(data),
         },
     }
+}
+
+/// A name in presentation format, as a master file holds it (RFC 1035
+/// §5.1): each label as its octets, with A-labels as they are, a
+/// character a master file reads otherwise escaped with a backslash, and
+/// any other octet outside printable ASCII as `\DDD` in decimal.
+fn name_text(name: &Name) -> String {
+    if name.is_root() {
+        return ".".to_owned();
+    }
+    let mut out = String::new();
+    for label in name.iter() {
+        for &byte in label {
+            match byte {
+                b'.' | b'\\' | b'"' | b';' | b'(' | b')' | b'@' | b'$' => {
+                    out.push('\\');
+                    out.push(char::from(byte));
+                }
+                0x21..=0x7e => out.push(char::from(byte)),
+                _ => out.push_str(&format!("\\{byte:03}")),
+            }
+        }
+        out.push('.');
+    }
+    out
 }
 
 /// SVCB or HTTPS RDATA in presentation format (RFC 9460 §2.1): the
 /// priority, the target, and each parameter as `key=value`, a key without
 /// a value for `no-default-alpn` and empty values.
 fn service_binding(svcb: &SVCB) -> String {
-    let mut out = format!("{} {}", svcb.svc_priority, svcb.target_name);
+    let mut out = format!("{} {}", svcb.svc_priority, name_text(&svcb.target_name));
     for (key, value) in &svcb.svc_params {
         let key = match key {
             SvcParamKey::Mandatory => "mandatory".to_string(),

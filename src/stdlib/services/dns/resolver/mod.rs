@@ -51,7 +51,7 @@ use fictionet::Entropy;
 use fictionet::stdlib::protocols::dns::dnssec::{Ring, Validation, Verify};
 use fictionet::stdlib::protocols::dns::op::ResponseCode;
 use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, Name, RecordType};
-use fictionet::stdlib::protocols::dns::{Parsed, Request};
+use fictionet::stdlib::protocols::dns::{Parsed, Request, label_count};
 use fictionet::time::Instant;
 
 use super::authority::{ServerConfig, bare_reply};
@@ -319,7 +319,7 @@ impl<V: Verify> Resolver<V> {
             .filter(|(_, zone)| zone.data.apex().zone_of(&qname))
             .collect();
         zones.sort_by_key(|(index, zone)| {
-            std::cmp::Reverse((zone.data.apex().num_labels(), *index))
+            std::cmp::Reverse((label_count(zone.data.apex()), *index))
         });
         zones.into_iter().find_map(|(_, zone)| {
             match answer(
@@ -631,12 +631,11 @@ impl<V: Verify> Resolver<V> {
         }
     }
 
-    /// Answers client query `id` from its pieces, unless a record in them
-    /// ran out while the rest was resolved, such as a CNAME whose TTL
-    /// ended while its target was chased. An answer never carries a record
-    /// past its TTL, so the chain is then followed again from the
-    /// question, as the cache has it now. The work spent so far stays
-    /// counted against the question.
+    /// Answers client query `id` from its pieces, unless a record the
+    /// cache gave them ran out while the rest was resolved, such as a
+    /// cached CNAME whose TTL ended while its target was chased. The chain
+    /// is then followed again from the question, as the cache has it now.
+    /// The work spent so far stays counted against the question.
     fn answer_asker(&mut self, id: AskerId, entropy: &dyn Entropy) {
         if self.ran_out(id) {
             if let Some(asker) = self.askers.get_mut(&id) {
@@ -648,10 +647,13 @@ impl<V: Verify> Resolver<V> {
         self.send_pieces(id);
     }
 
-    /// Whether a fresh piece of client query `id` holds a record whose TTL
-    /// has ended by now. Data with TTL 0 serves the answer it came in
-    /// (RFC 1035 §7.4), and stale data is served past its TTL on purpose
-    /// (RFC 8767), so neither counts.
+    /// Whether a fresh piece of client query `id` that came from the cache
+    /// holds a record whose TTL has ended by now. Data that arrived while
+    /// the question was resolved serves the answer it came for, with the
+    /// TTL it has left, even 0 (RFC 1035 §7.4), so a following again could
+    /// only fetch it again. Cached data that shows TTL 0 has less than a
+    /// second left and serves the answer the same way. Stale data is
+    /// served past its TTL on purpose (RFC 8767).
     fn ran_out(&self, id: AskerId) -> bool {
         let Some(asker) = self.askers.get(&id) else {
             return false;
@@ -660,7 +662,7 @@ impl<V: Verify> Resolver<V> {
         asker
             .pieces
             .iter()
-            .filter(|piece| !piece.stale)
+            .filter(|piece| piece.cached && !piece.stale)
             .any(|piece| {
                 piece.outcome.records().iter().any(|set| {
                     let ttl = std::time::Duration::from_secs(u64::from(set.ttl())).min(max_ttl);

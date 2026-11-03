@@ -8,9 +8,9 @@ use fictionet::stdlib::protocols::dns::dnssec::rdata::DNSSECRData;
 use fictionet::stdlib::protocols::dns::op::{
     Edns, Message, MessageType, OpCode, Query, ResponseCode,
 };
-use fictionet::stdlib::protocols::dns::read_message;
 use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RData, Record, RecordType};
 use fictionet::stdlib::protocols::dns::{Parsed, Request, Response};
+use fictionet::stdlib::protocols::dns::{label_count, read_message};
 
 use super::super::exchange::Client;
 use super::super::records::rrsets;
@@ -34,7 +34,10 @@ use super::{Authority, Known, ServerConfig, Step, bare_reply};
 ///   places, and the root still refers only to the parent. When the base
 ///   stays silent for that question, so does the overlay.
 /// - Elsewhere the overlay answers as the parent: a referral composed from
-///   the invented zone's apex NS RRset and glue, with AA clear. A DS
+///   the invented zone's apex NS RRset and glue, with AA clear. When the
+///   invented zone gives no address for a name server at or below its
+///   apex, the referral could not be followed (RFC 9471 §3.1), so the
+///   overlay answers SERVFAIL in its place. A DS
 ///   question at the apex goes to the base, since the parent's side
 ///   answers DS (RFC 4035 §3.1.4.1). Where the base says the apex does
 ///   not exist, the overlay answers NODATA with the same records instead,
@@ -109,7 +112,7 @@ impl<B: Authority> Authority for Overlay<B> {
             .zones
             .iter()
             .filter(|(apex, _)| apex.zone_of(&qname))
-            .max_by_key(|(apex, _)| apex.num_labels());
+            .max_by_key(|(apex, _)| label_count(apex));
         let Some((apex, inner)) = invented else {
             return self.base.respond(req, local, server, client, known);
         };
@@ -142,7 +145,6 @@ impl<B: Authority> Authority for Overlay<B> {
             .filter(|record| record.data.ip_addr().is_some() && targets.contains(&&record.name))
             .cloned()
             .collect();
-
         if glue
             .iter()
             .any(|record| record.data.ip_addr() == Some(local.ip()))
@@ -167,6 +169,16 @@ impl<B: Authority> Authority for Overlay<B> {
         };
         if !serves(&parent, &apex, &zone) {
             return self.base.respond(req, local, server, client, known);
+        }
+
+        // A referral without the glue for a name server at or below the
+        // apex cannot be followed (RFC 9471 §3.1). The inner zone leaves
+        // out the addresses of a target it does not know.
+        let unglued = targets.iter().any(|target| {
+            apex.zone_of(target) && !glue.iter().any(|record| record.name == **target)
+        });
+        if unglued {
+            return Step::Reply(bare_reply(req, ResponseCode::ServFail, None));
         }
 
         let mut authority = ns;

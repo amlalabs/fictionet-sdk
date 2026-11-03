@@ -105,13 +105,17 @@ fn soa(mname: &str) -> SOA {
 
 /// Records at `kinds.example.` whose presentation hickory's own text gets
 /// wrong, each as its type number and its RDATA in presentation format,
-/// which is what the JSON API must give back.
-const KINDS: [(u16, &str); 5] = [
+/// which is what the JSON API must give back. Names stay in ASCII, an
+/// A-label as it is, with decimal escapes (RFC 1035 §5.1).
+const KINDS: [(u16, &str); 8] = [
     (65, "1 . alpn=h2,h3 ipv4hint=45.33.4.80,45.33.4.53"),
     (13, "\"Intel Xeon\" \"\""),
     (257, "0 issue \"a\\\"b; c\""),
     (35, "1 1 \"s\" \"x\\\"y\" \"\" ."),
     (65280, "\\# 2 ABCD"),
+    (15, "10 xn--bcher-kva.example."),
+    (33, "0 0 80 sp\\032ace.example."),
+    (12, "a\\.b.example."),
 ];
 
 /// The RRset of type `number` at `kinds.example.` that a master file line
@@ -878,8 +882,8 @@ fn a_front_on_another_host_answers_from_the_resolvers_cache() {
         let roots = Arc::new(roots);
         let sent: Arc<Mutex<Vec<Sent>>> = Arc::default();
         let resolver = recursive(anchors, &sent);
-        let fronts = Fronts::new(resolver.handle(), move |_| config.clone())
-            .names(cloudflare.doh.iter().map(|doh| name(doh)));
+        let fronts =
+            Fronts::new(resolver.handle(), move |_| config.clone()).names(cloudflare.doh());
         let away = fronts.clone().resolver_at(IpAddr::V4(one));
         Net::new()
             .ipv4_only()
@@ -933,10 +937,16 @@ fn each_public_resolver_answers_dns_over_https_as_its_operator() {
     world(Duration::from_secs(60), |fcx| async move {
         let (attacher, attachments) = fictionet::attachments();
         let (hosts, anchors) = authorities();
-        let names: Vec<&str> = PUBLIC_RESOLVERS
+        let names: Vec<String> = PUBLIC_RESOLVERS
             .iter()
-            .map(|resolver| resolver.doh[0].trim_end_matches('.'))
+            .map(|resolver| {
+                resolver.doh()[0]
+                    .to_ascii()
+                    .trim_end_matches('.')
+                    .to_owned()
+            })
             .collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
         let (ca, leaf) = certs::issue(&fcx, "World CA", &names)?;
         let config = leaf.server_config(&fcx, date(NOW))?;
         let mut roots = RootCertStore::empty();
@@ -951,7 +961,7 @@ fn each_public_resolver_answers_dns_over_https_as_its_operator() {
             .map(|(n, public)| {
                 let config = config.clone();
                 Fronts::new(resolver.handle(), move |_| config.clone())
-                    .names(public.doh.iter().map(|doh| name(doh)))
+                    .names(public.doh())
                     .operator(public.doh_operator)
                     .resolver_at(IpAddr::V4(RESOLVER))
                     .doh(Host::new(names[n]).at(address(n)))

@@ -72,7 +72,7 @@ What each theorem says:
 | `wildcard_blocked_by_node` | a node at the name answers with its own RRset, whatever wildcard the zone holds |
 | `dname_yx_iff_long` | below a DNAME, YXDOMAIN with just the DNAME exactly when the substituted name would pass 255 octets |
 | `builder_rejects_iff` | the builder fails exactly when one of its rules, stated as propositions, fails |
-| `answer_partial_sound` | if a view answers, every complete zone that agrees with the view's present and absent facts gives the same response |
+| `answer_partial_sound` | if a view answers, every complete zone that agrees with the view's present and absent facts gives the same response, but for the addresses of NS, MX, and SRV targets the view does not know, optional additional data the view leaves out |
 | `agreeing_zone_exists` | every consistent finite view has an agreeing complete zone, so the quantifier above is never empty |
 | `unknown_never_negative` | an unknown fact on the walk ends the answer with that name: the name itself, or the wildcard when the name is known absent |
 | `lazy_view_one_revision` | a lazy zone's view agrees with the zone it leaves behind, at that zone's revision, and the zone only grows |
@@ -105,15 +105,15 @@ What each theorem says:
 | `expired_never_served` | an entry is served only while it lives: written in the current generation and not expired |
 | `failure_never_negative` | a cached failure never answers NXDOMAIN or NODATA; while it lives it answers SERVFAIL |
 | `rrsig_caps_ttl` | a Secure RRset's entry expires no later than its RRSIG |
-| `rank_monotone` | data offered at a lower rank than the live entry for its key changes nothing |
+| `rank_monotone` | an offer that does not replace the live entry for its key changes nothing: data at a lower rank, or a failure over data that answers clients |
 | `measure_decreases` | every step of a resolution spends work or finishes it |
 | `resolve_terminates` | a resolution always ends, whatever the network loses |
 | `resolve_correct` | whatever is lost, the answer is the hierarchy's answer (`spec`, from the root down) or SERVFAIL, and the cache stays sound; with nothing lost, root hints, and work for one query per label and one more, it is the hierarchy's answer |
 | `glue_never_served` | every RRset in an answer is in the answer section of an authoritative server's answer to that question |
 
 Supporting results: `answer_never_unknown` (a complete zone never
-answers Unknown), `build_wf` (the builder makes well-formed zones), `lazy_answer` (a lazy view's answer is
-the answer of the zone it leaves behind), `relay_loop_terminates`, `overlay_loop_terminates`, and the
+answers Unknown), `build_wf` (the builder makes well-formed zones), `lazy_answer` (a lazy view's answer is,
+the addresses of unknown targets aside, the answer of the zone it leaves behind), `relay_loop_terminates`, `overlay_loop_terminates`, and the
 invariant `Exchange.Inv` with `inv_send`, `inv_onReply`, and `inv_advance` (no cache entry is ever of an older
 generation, and tokens are fresh). For the DNSSEC and resolver files: `walk_trusted`, `walk_insecure`, and
 the step lemmas (`keyStep_ok`, `dsStep_ok`, `linkStep_ok`, `noDsProof_some`, `noDsProof_of_evidence`) relate
@@ -143,12 +143,12 @@ form `\# <length> <hex>`. Octets are lowercase hex.
 | `restore.json` | `reply`, `query` | `restored`, or `error`: `question_mismatch` or `malformed` |
 | `fit.json` | `response` (header, question, RRsets per section, `required_additional`, `opt`), `limit` (`udp512`, `udp_edns` with `size`, or `stream`) | `size_le`, `fits`, `length`, `tc`, and `kept`: the number of RRsets kept per section |
 | `respond.json` | `bytes`, `transport` (`udp` or `tcp`) | `parsed`: `silent`; `reject` with `rcode` (extended), `flags`, and `opt` (its version, or null); or `request` with `rd`, `cd`, `ad`, `question`, `edns`, and the `answer` flags and `answer_opt` of an authoritative NOERROR answer to it through the server front |
-| `zone.json` | `zone` (`apex`, `records`), `any` (`hinfo`, `one_rrset`, `all`), `request` (`qname`, `qtype`) | `rcode`, `aa`, `answer`, `authority`, `additional`, `required_additional` |
+| `zone.json` | `zone` (`apex`, `records`), `any` (`hinfo`, `one_rrset`, `all`), `request` (`qname`, `qtype`); or, for a zone the builder refuses, `zone` alone | `rcode`, `aa`, `answer`, `authority`, `additional`, `required_additional`; or `error`, the first rule the zone breaks |
 | `partial.json` | as `zone.json`, plus `unknown`: names whose facts are unknown | `unknown` (a name), or `response` |
 | `signed.json` | `zone` (no DNAME), `keys` (`id`, `alg`, `sep`, `corrupt`), `window`, `denial` (`nsec`, or `nsec3` with `opt_out`), `request`, `time`, `policy`, `anchor_digest_type`, and for about a third of the cases a signed `parent` (`zone`, `keys`, `denial`) at the name above the apex, delegating to the zone with a DS set for its KSK, a wrong digest, RSASHA1, or no DS | `rcode`, `aa`, and with DO=1 the `answer` and `authority` lines each followed by its RRSIG lines, `additional`, `denial` (NSEC or NSEC3 lines with RRSIGs), `dnskey` (the DNSKEY set and its RRSIGs), and `validation`: one result per answer RRset and one for the denial of a negative answer, under the zone's own anchor (a DS of digest type 2 for each SEP key) and the one-link chain, or with a `parent` under the parent's anchor and the chain down the delegation, with `parent_dnskey` and `delegation` (the parent's DS set or no-DS proof, with RRSIGs); or `unknown` |
 | `policy.json` | `algorithm`, `digest`, `policy`: the string `iana` for `Policy.iana`, which the test reads as Rust's `AlgorithmPolicy::iana`, or a random one (`validate`, `digests`, `max_nsec3_iterations`) | `treatment`: `supported`, `unsupported_algorithm`, or `unsupported_digest` |
 | `chain.json` | `tree`: the parent and the child `sub`, each with `zone`, `keys`, `window`, `denial`; `time`; `policy` | `problems`: `ds_mismatch`, `no_ds_proof_missing` (with `parent`, `child`), `window_closed` (`apex`, `time`), `unsupported_algorithm` (`apex`, `algorithm`) |
-| `cache.json` | `limits` (`max_ttl`, `failure_ttl`); `ops`: `offer` (positive, negative, or failure, with time), `advance`, `serve` (key and time) | `served`: for each `serve` in order, `null` or the served positive RRset with its TTL counted down and its validation, the negative with its SOA, or the failure |
+| `cache.json` | `limits` (`max_ttl`, `failure_ttl`); `ops`: `offer` (positive, negative, or failure, with time; a positive or negative one with its validation, `sig_expires`, and `original_ttl`), `advance`, `serve` (key and time) | `served`: for each `serve` in order, `null` or the served positive RRset with its TTL counted down and its validation, the negative with its SOA, or the failure |
 | `resolver.json` | `zones` (a root and some of `test.`, `example.`, `sub.example.`, each server at an address of its own), `hints`, `work`, `any`, `questions`, `losses` (one per query sent, in order; `true` is lost), `dead` (servers that never answer) | `answers` (a response per question; a question past the script uses no loss), `dead_answers` (a response per question with the `dead` servers never answering and work to spare), `lossy_answers` (per question, under the loss script with work to spare, the `response` and the servers its losses made it give up on, `gone`), and the final `cache` (each item with its rank: a cut's NS set, glue, or a question and its answer) |
 
 Symbolic keys and signatures in `signed.json` and `chain.json`. A key is a number below 256. Its DNSKEY's
@@ -264,8 +264,11 @@ extra iterations, in base32hex. RRSIG times are decimal. Validation results are 
   does not look at signature bytes.
 - **The cache** keeps one entry per key (name and type; the class is IN) and one TTL per RRset, so the rule that
   mixed TTLs in one RRset read as the lowest is the builder's (RFC 2181 §5.2). Times are seconds on the run's
-  clock; RRSIG expirations arrive converted. A negative entry ranks as an authoritative answer and a failure
-  below all data.
+  clock; RRSIG expirations arrive converted. A negative entry ranks as an authoritative answer. A failure
+  ranks below all data, so any data replaces it, and it replaces any entry that answers no client. An offer
+  carries its validation, which Rust records after the store with `Cache::validated`, so `entryFor` applies
+  the caps validation puts on an entry when it is stored. Data that ends a cached NXDOMAIN at or above its
+  name (RFC 8020) is left out: the generated keys are at three different names.
 - **The resolver** follows referrals that go strictly down toward the name and asks a cut's servers in order,
   one query each, taking the next on a loss or a bizarre referral. Servers are named by the NS targets and
   answer with their zone's answer; a cut with no zone in the net never answers. It starts from the deepest

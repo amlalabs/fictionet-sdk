@@ -129,13 +129,13 @@ pub fn net(
     // Each public resolver's DNS over HTTPS names, such as
     // `cloudflare-dns.com`, have addresses of their own, where the mirror
     // places a front that puts queries to the resolver's primary address.
-    let doh: Arc<Mutex<HashMap<&'static str, Fronts>>> = Arc::default();
+    // The fronts are kept by the resolver's primary address.
+    let doh: Arc<Mutex<HashMap<IpAddr, Fronts>>> = Arc::default();
     for resolver in &PUBLIC_RESOLVERS {
-        for name in resolver.doh {
+        let primary = IpAddr::V4(resolver.addresses[0].v4);
+        for name in resolver.doh() {
             let doh = doh.clone();
-            let service = resolver.service;
-            let name = Name::from_ascii(name).expect("a public resolver's name is valid");
-            mirror = mirror.front(name, move |host| match doh.lock().get(service) {
+            mirror = mirror.front(name, move |host| match doh.lock().get(&primary) {
                 Some(fronts) => fronts.doh(host),
                 None => host,
             });
@@ -181,18 +181,15 @@ pub fn net(
                     })
                     .clone()
             };
-            let fronts =
-                Fronts::new(recursive.handle(), tls)
-                    .names(resolver.doh.iter().map(|name| {
-                        Name::from_ascii(name).expect("a public resolver's name is valid")
-                    }))
-                    .operator(resolver.doh_operator)
-                    .date(start);
+            let fronts = Fronts::new(recursive.handle(), tls)
+                .names(resolver.doh())
+                .operator(resolver.doh_operator)
+                .date(start);
             // The primary address comes first, and its fronts serve the
             // resolver's DNS over HTTPS names elsewhere.
             let primary = IpAddr::V4(resolver.addresses[0].v4);
             doh.lock()
-                .entry(resolver.service)
+                .entry(primary)
                 .or_insert_with(|| fronts.clone().resolver_at(primary));
             fronts.doh(fronts.dot(host.program(recursive)))
         },
@@ -205,8 +202,7 @@ pub fn net(
         let config = Config {
             negative_anchors: Some(negative_anchors.clone()),
             ..Config::unbound()
-        }
-        .hints(&internet::root_hints());
+        };
         host.program(
             Recursive::new(config, clock)
                 .namespace(&gateway_namespace)

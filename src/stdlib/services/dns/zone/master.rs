@@ -4,12 +4,14 @@
 //! The text is split into entries here, with parentheses, quotes,
 //! escapes, comments, and the `$ORIGIN` and `$TTL` directives. Names are
 //! read here, as BIND reads them: `@`, `\DDD` and `\X` escapes, and any
-//! octets in a label. The types whose RDATA is names and numbers (NS,
-//! CNAME, PTR, DNAME, MX, SRV, SOA), the DNSSEC types (DNSKEY, DS, RRSIG,
-//! NSEC, NSEC3, NSEC3PARAM, and their CDS and CDNSKEY forms), ZONEMD
-//! (RFC 8976), and the generic `\# <length> <hex>` form of RFC 3597 are
-//! written to wire format here and decoded by hickory. RDATA of the other
-//! types hickory reads from text goes through hickory's own parser.
+//! octets in a label. Character-strings are read the same way. The types
+//! whose RDATA is names and numbers (NS, CNAME, PTR, DNAME, MX, SRV, SOA),
+//! the types that hold character-strings (TXT, SPF, HINFO, CAA, NAPTR,
+//! SVCB, HTTPS), the DNSSEC types (DNSKEY, DS, RRSIG, NSEC, NSEC3,
+//! NSEC3PARAM, and their CDS and CDNSKEY forms), ZONEMD (RFC 8976), and
+//! the generic `\# <length> <hex>` form of RFC 3597 are written to wire
+//! format here and decoded by hickory. RDATA of the other types hickory
+//! reads from text goes through hickory's own parser.
 
 // A zone error names the owners it is about. It comes once per read,
 // never on a path that answers questions, so its size costs nothing.
@@ -17,11 +19,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 
 use fictionet::stdlib::protocols::dns::dnssec::proof::base32hex;
 use fictionet::stdlib::protocols::dns::dnssec::rdata::DNSSECRData;
-use fictionet::stdlib::protocols::dns::rr::rdata::HTTPS;
+use fictionet::stdlib::protocols::dns::rr::rdata::svcb::SvcParamKey;
 use fictionet::stdlib::protocols::dns::rr::{
     LowerName, Name, RData, Record, RecordSet, RecordType,
 };
@@ -446,15 +449,14 @@ fn absolute(token: &str, origin: Option<&Name>) -> Option<Name> {
     if !label.is_empty() {
         labels.push(label);
     }
+    // hickory refuses a name past 255 octets on the wire (RFC 1035
+    // §2.3.4).
     let name = Name::from_labels(labels.iter().map(Vec::as_slice)).ok()?;
-    let name = if dotted {
-        name
+    if dotted {
+        Some(name)
     } else {
-        name.append_name(origin?).ok()?
-    };
-    // A name takes at most 255 octets on the wire (RFC 1035 §2.3.4).
-    let length: usize = name.iter().map(|label| label.len() + 1).sum::<usize>() + 1;
-    (length <= 255).then_some(name)
+        name.append_name(origin?).ok()
+    }
 }
 
 /// Whether `token` names the IN class, `None` when it names no class.
@@ -512,13 +514,13 @@ fn rdata(
         25 | 48 | 60 => {
             wire.extend(fields.number::<u16>().ok_or_else(bad)?.to_be_bytes());
             wire.push(fields.number::<u8>().ok_or_else(bad)?);
-            wire.push(fields.number::<u8>().ok_or_else(bad)?);
+            wire.push(algorithm(fields.next().ok_or_else(bad)?).ok_or_else(bad)?);
             wire.extend(base64(fields.rest()).ok_or_else(bad)?);
         }
         // DS, CDS (RFC 4034 §5.3, RFC 7344 §3.1)
         43 | 59 => {
             wire.extend(fields.number::<u16>().ok_or_else(bad)?.to_be_bytes());
-            wire.push(fields.number::<u8>().ok_or_else(bad)?);
+            wire.push(algorithm(fields.next().ok_or_else(bad)?).ok_or_else(bad)?);
             wire.push(fields.number::<u8>().ok_or_else(bad)?);
             wire.extend(hex(fields.rest()).ok_or_else(bad)?);
         }
@@ -526,7 +528,7 @@ fn rdata(
         46 => {
             let covered = record_type(fields.next().ok_or_else(bad)?).ok_or_else(bad)?;
             wire.extend(u16::from(covered).to_be_bytes());
-            wire.push(fields.number::<u8>().ok_or_else(bad)?);
+            wire.push(algorithm(fields.next().ok_or_else(bad)?).ok_or_else(bad)?);
             wire.push(fields.number::<u8>().ok_or_else(bad)?);
             wire.extend(fields.number::<u32>().ok_or_else(bad)?.to_be_bytes());
             wire.extend(
@@ -608,7 +610,51 @@ fn rdata(
             wire.push(fields.number::<u8>().ok_or_else(bad)?);
             wire.extend(hex(fields.rest()).ok_or_else(bad)?);
         }
-        _ => return hickory_text(rtype, tokens, origin),
+        // TXT (RFC 1035 §3.3.14) and SPF (RFC 7208 §3.1): one or more
+        // character-strings.
+        16 | 99 => {
+            let strings = fields.rest();
+            if strings.is_empty() {
+                return Err(bad());
+            }
+            for token in strings {
+                write_string(&mut wire, token).ok_or_else(bad)?;
+            }
+        }
+        // HINFO (RFC 1035 §3.3.2): the CPU and the OS.
+        13 => {
+            for _ in 0..2 {
+                write_string(&mut wire, fields.next().ok_or_else(bad)?).ok_or_else(bad)?;
+            }
+        }
+        // CAA (RFC 8659 §4.1.1): the flags, the tag, and the value, which
+        // takes the rest of the RDATA.
+        257 => {
+            wire.push(fields.number::<u8>().ok_or_else(bad)?);
+            write_string(&mut wire, fields.next().ok_or_else(bad)?).ok_or_else(bad)?;
+            wire.extend(octets(fields.next().ok_or_else(bad)?).ok_or_else(bad)?);
+        }
+        // NAPTR (RFC 3403 §4.1): the order, the preference, the flags,
+        // the services, the regular expression, and the replacement.
+        35 => {
+            for _ in 0..2 {
+                wire.extend(fields.number::<u16>().ok_or_else(bad)?.to_be_bytes());
+            }
+            for _ in 0..3 {
+                write_string(&mut wire, fields.next().ok_or_else(bad)?).ok_or_else(bad)?;
+            }
+            let replacement = rdata_name(fields.next().ok_or_else(bad)?, origin, bad)?;
+            write_name(&mut wire, &replacement);
+        }
+        // SVCB and HTTPS (RFC 9460 §2.1): the priority, the target, and
+        // the SvcParams.
+        64 | 65 => {
+            wire.extend(fields.number::<u16>().ok_or_else(bad)?.to_be_bytes());
+            let target = rdata_name(fields.next().ok_or_else(bad)?, origin, bad)?;
+            write_name(&mut wire, &target);
+            wire.extend(svc_params(fields.rest()).ok_or_else(bad)?);
+        }
+        _ => return hickory_line(rtype, tokens, origin),
     }
     if !fields.rest().is_empty() {
         return Err(bad());
@@ -616,33 +662,172 @@ fn rdata(
     decode(rtype, &wire)
 }
 
-/// RDATA read by hickory's own master file parser, one record at a time.
-///
-/// hickory reads names in RDATA without `@` and through IDNA, which
-/// refuses legal labels such as `a_b`. So the one name SVCB, HTTPS, and
-/// NAPTR RDATA holds is read here with [`absolute`], and hickory reads the
-/// rest with the root name in its place.
-fn hickory_text(
-    rtype: RecordType,
-    tokens: &[String],
-    origin: Option<&Name>,
-) -> Result<RData, MasterError> {
-    let bad = || MasterError::Rdata { rtype };
-    let name_at = match rtype {
-        RecordType::SVCB | RecordType::HTTPS => 1,
-        RecordType::NAPTR => 5,
-        _ => return hickory_line(rtype, tokens, origin),
+/// The octets of a character-string (RFC 1035 §5.1), in quotes or not:
+/// `\DDD` is the octet with that decimal value, `\X` is X itself, and
+/// every other character stands for its own octets, as BIND reads it.
+/// `None` for a string that does not read.
+fn octets(token: &str) -> Option<Vec<u8>> {
+    let text = match token.strip_prefix('"') {
+        Some(rest) => rest.strip_suffix('"')?,
+        None => token,
     };
-    let name = rdata_name(tokens.get(name_at).ok_or_else(bad)?, origin, bad)?;
-    let mut around = tokens.to_vec();
-    around[name_at] = ".".to_string();
-    let mut data = hickory_line(rtype, &around, origin)?;
-    match &mut data {
-        RData::SVCB(svcb) | RData::HTTPS(HTTPS(svcb)) => svcb.target_name = name,
-        RData::NAPTR(naptr) => naptr.replacement = name,
-        _ => return Err(bad()),
+    let mut out = Vec::new();
+    let mut bytes = text.bytes();
+    while let Some(byte) = bytes.next() {
+        match byte {
+            b'\\' => {
+                let escaped = bytes.next()?;
+                if escaped.is_ascii_digit() {
+                    let digits = [escaped, bytes.next()?, bytes.next()?];
+                    if !digits.iter().all(u8::is_ascii_digit) {
+                        return None;
+                    }
+                    let value = digits
+                        .iter()
+                        .fold(0u16, |value, digit| value * 10 + u16::from(digit - b'0'));
+                    out.push(u8::try_from(value).ok()?);
+                } else {
+                    out.push(escaped);
+                }
+            }
+            // A quote or a line break inside a string must be escaped.
+            b'"' | b'\n' => return None,
+            _ => out.push(byte),
+        }
     }
-    Ok(data)
+    Some(out)
+}
+
+/// Writes `token` as a character-string: its length, then its octets,
+/// at most 255 (RFC 1035 §3.3).
+fn write_string(wire: &mut Vec<u8>, token: &str) -> Option<()> {
+    let octets = octets(token)?;
+    wire.push(u8::try_from(octets.len()).ok()?);
+    wire.extend(octets);
+    Some(())
+}
+
+/// SvcParams in presentation format (RFC 9460 §2.1), each `key=value` or
+/// a key alone, written in increasing order of key (§2.2), as BIND writes
+/// them whatever order the text has. A key written twice, the invalid key
+/// 65535, or a value that does not read as its key's gives `None`.
+fn svc_params(tokens: &[String]) -> Option<Vec<u8>> {
+    let mut params: BTreeMap<SvcParamKey, Vec<u8>> = BTreeMap::new();
+    for token in tokens {
+        let (key, value) = match token.split_once('=') {
+            Some((key, value)) => (key, Some(octets(value)?)),
+            None => (token.as_str(), None),
+        };
+        let key = SvcParamKey::from_str(key).ok()?;
+        if key == SvcParamKey::Key65535 {
+            return None;
+        }
+        let value = svc_value(key, value)?;
+        if params.insert(key, value).is_some() {
+            return None;
+        }
+    }
+    let mut wire = Vec::new();
+    for (key, value) in params {
+        wire.extend(u16::from(key).to_be_bytes());
+        wire.extend(u16::try_from(value.len()).ok()?.to_be_bytes());
+        wire.extend(value);
+    }
+    Some(wire)
+}
+
+/// The wire form of the value of SvcParam `key`, from the octets of its
+/// presentation value (RFC 9460 §7, Appendix A).
+fn svc_value(key: SvcParamKey, value: Option<Vec<u8>>) -> Option<Vec<u8>> {
+    let text = |value: &[u8]| String::from_utf8(value.to_vec()).ok();
+    match key {
+        // Keys in increasing order, none twice (RFC 9460 §8).
+        SvcParamKey::Mandatory => {
+            let mut keys = value_list(&value?)?
+                .iter()
+                .map(|item| SvcParamKey::from_str(&text(item)?).ok())
+                .collect::<Option<Vec<_>>>()?;
+            keys.sort();
+            if keys.windows(2).any(|pair| pair[0] == pair[1]) {
+                return None;
+            }
+            Some(
+                keys.into_iter()
+                    .flat_map(|k| u16::from(k).to_be_bytes())
+                    .collect(),
+            )
+        }
+        // Each ALPN ID after its length (RFC 9460 §7.1.1).
+        SvcParamKey::Alpn => {
+            let mut wire = Vec::new();
+            for id in value_list(&value?)? {
+                wire.push(u8::try_from(id.len()).ok()?);
+                wire.extend(id);
+            }
+            Some(wire)
+        }
+        SvcParamKey::NoDefaultAlpn => value.is_none_or(|value| value.is_empty()).then(Vec::new),
+        SvcParamKey::Port => Some(text(&value?)?.parse::<u16>().ok()?.to_be_bytes().to_vec()),
+        SvcParamKey::Ipv4Hint => value_list(&value?)?
+            .iter()
+            .map(|item| Some(text(item)?.parse::<Ipv4Addr>().ok()?.octets().to_vec()))
+            .collect::<Option<Vec<_>>>()
+            .map(|addresses| addresses.concat()),
+        SvcParamKey::Ipv6Hint => value_list(&value?)?
+            .iter()
+            .map(|item| Some(text(item)?.parse::<Ipv6Addr>().ok()?.octets().to_vec()))
+            .collect::<Option<Vec<_>>>()
+            .map(|addresses| addresses.concat()),
+        SvcParamKey::EchConfigList => base64(&[text(&value?)?]),
+        // Any other key's value is its octets (RFC 9460 Appendix A.1). Key
+        // 65535 is refused before.
+        SvcParamKey::Key(_) | SvcParamKey::Key65535 | SvcParamKey::Unknown(_) => {
+            Some(value.unwrap_or_default())
+        }
+    }
+}
+
+/// The items of a comma-separated value list (RFC 9460 Appendix A.1.1):
+/// a backslash makes the octet after it part of the item, and no item is
+/// empty.
+fn value_list(value: &[u8]) -> Option<Vec<Vec<u8>>> {
+    let mut items = vec![Vec::new()];
+    let mut bytes = value.iter();
+    while let Some(&byte) = bytes.next() {
+        match byte {
+            b'\\' => items.last_mut()?.push(*bytes.next()?),
+            b',' => items.push(Vec::new()),
+            _ => items.last_mut()?.push(byte),
+        }
+    }
+    items.iter().all(|item| !item.is_empty()).then_some(items)
+}
+
+/// A DNSSEC algorithm field: a decimal number or the algorithm's mnemonic
+/// (RFC 4034 §2.2, Appendix A.1), the IANA registry's or BIND's.
+fn algorithm(token: &str) -> Option<u8> {
+    if let Ok(number) = token.parse() {
+        return Some(number);
+    }
+    Some(match token.to_ascii_uppercase().as_str() {
+        "RSAMD5" => 1,
+        "DH" => 2,
+        "DSA" => 3,
+        "RSASHA1" => 5,
+        "DSA-NSEC3-SHA1" | "NSEC3DSA" => 6,
+        "RSASHA1-NSEC3-SHA1" | "NSEC3RSASHA1" => 7,
+        "RSASHA256" => 8,
+        "RSASHA512" => 10,
+        "ECC-GOST" | "ECCGOST" => 12,
+        "ECDSAP256SHA256" => 13,
+        "ECDSAP384SHA384" => 14,
+        "ED25519" => 15,
+        "ED448" => 16,
+        "INDIRECT" => 252,
+        "PRIVATEDNS" => 253,
+        "PRIVATEOID" => 254,
+        _ => return None,
+    })
 }
 
 /// RDATA of `rtype` that hickory's parser reads from `tokens`.

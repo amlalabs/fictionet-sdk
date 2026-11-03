@@ -71,49 +71,79 @@ structure Limits where
   failureTtl : Nat
 deriving DecidableEq, Repr
 
-/-- What a resolution offers the cache. -/
+/-- What a resolution offers the cache, with what validation established about it. -/
 inductive Offer where
-  /-- An RRset with its rank and validation, the RRSIG expiration when it was validated, and whether the reply
-  was truncated. -/
-  | positive (set : RRset) (rank : Rank) (validation : Validation) (sigExpires : Option Nat) (truncated : Bool)
+  /-- An RRset with its rank and validation, the first expiration and the smallest Original TTL of the RRSIGs
+  that validated it, and whether the reply was truncated. -/
+  | positive (set : RRset) (rank : Rank) (validation : Validation) (sigExpires : Option Nat)
+      (originalTtl : Option Nat) (truncated : Bool)
   /-- A negative answer for a key, with the SOA it came with, the NSEC or NSEC3 TTL when the denial was proven,
-  and whether the reply was truncated. -/
+  its validation, the first expiration and the smallest Original TTL of the RRSIGs that validated it, and
+  whether the reply was truncated. -/
   | negative (key : Key) (kind : Negative) (soa : Option RRset) (denialTtl : Option Nat) (validation : Validation)
-      (truncated : Bool)
+      (sigExpires : Option Nat) (originalTtl : Option Nat) (truncated : Bool)
   | failure (key : Key) (why : FailureKind)
 deriving DecidableEq, Repr
 
 def Offer.key : Offer → Key
-  | .positive s _ _ _ _ => ⟨s.owner, s.rtype⟩
-  | .negative k _ _ _ _ _ => k
+  | .positive s _ _ _ _ _ => ⟨s.owner, s.rtype⟩
+  | .negative k _ _ _ _ _ _ _ => k
   | .failure k _ => k
 
-/-- The rank an entry holds its key at. A negative answer is an authoritative answer; a failure ranks with glue,
-so it never displaces live data that answers clients. -/
+/-- The rank an entry holds its key at. A negative answer is an authoritative answer; a failure is no data and
+ranks lowest. -/
 def Body.rank : Body → Rank
   | .positive _ r _ => r
   | .negative _ _ _ => .authAnswer
   | .failure _ => .glue
 
+/-- Whether a new entry with body `new` takes the key from a live entry with body `old`: data at equal or higher
+rank (RFC 2181 §5.4.1), and a failure over anything that does not answer clients, so a failure is cached
+whenever a resolution fails (RFC 9520 §3.2). -/
+def Body.replaces (new old : Body) : Bool :=
+  match new with
+  | .failure _ => old.rank.level < Rank.nonAuthAnswer.level
+  | _ => old.rank.level ≤ new.rank.level
+
 /-- A TTL with the top bit set reads as zero (RFC 2181 §8). -/
 def readTtl (ttl : Nat) : Nat := if 2147483648 ≤ ttl then 0 else ttl
 
+/-- When an entry stored at `now` to expire at `exp` expires once validation is done: a Secure one no later than
+its RRSIGs' first expiration, nor than their smallest Original TTL after `now` (RFC 4035 §5.3.3); a Bogus or
+Indeterminate one no later than `failureTtl` after `now`, when it is fetched and validated again
+(RFC 9520 §3.2, RFC 4035 §4.7). -/
+def validatedCap (now : Nat) (lim : Limits) (v : Validation) (sig orig : Option Nat) (exp : Nat) : Nat :=
+  match v with
+  | .secure =>
+    let exp := match sig with
+      | some x => min exp x
+      | none => exp
+    match orig with
+    | some o => min exp (now + readTtl o)
+    | none => exp
+  | .bogus _ | .indeterminate => min exp (now + lim.failureTtl)
+  | .notPerformed | .insecure _ => exp
+
+theorem validatedCap_le (now : Nat) (lim : Limits) (v : Validation) (sig orig : Option Nat) (exp : Nat) :
+    validatedCap now lim v sig orig exp ≤ exp := by
+  unfold validatedCap
+  cases v with
+  | secure => cases sig <;> cases orig <;> (try simp only) <;> omega
+  | bogus _ => exact Nat.min_le_left _ _
+  | indeterminate => exact Nat.min_le_left _ _
+  | notPerformed => exact Nat.le_refl _
+  | insecure _ => exact Nat.le_refl _
+
 /-- The entry an offer makes at `now`, or none when the offer may not be cached: truncated replies
 (RFC 2181 §9), TTL zero (RFC 1035 §7.4), negatives without an SOA (RFC 2308 §5). TTLs are capped at
-`maxTtl` (RFC 8767 §4); a Secure RRset lives no longer than its RRSIG (RFC 4035 §5.3.3), and one validated
-Bogus or Indeterminate no longer than `failureTtl`; a proven negative uses min(SOA TTL, MINIMUM, NSEC TTL)
-(RFC 9077 §3); a failure lives `failureTtl` (RFC 9520 §3.2). -/
+`maxTtl` (RFC 8767 §4), and positive and negative entries by their validation (`validatedCap`); a proven
+negative uses min(SOA TTL, MINIMUM, NSEC TTL) (RFC 9077 §3); a failure lives `failureTtl` (RFC 9520 §3.2). -/
 def entryFor (now : Nat) (lim : Limits) (g : Nat) : Offer → Option Entry
-  | .positive s r v sig tc =>
+  | .positive s r v sig orig tc =>
     let ttl := min (readTtl s.ttl) lim.maxTtl
     if tc || ttl == 0 then none
-    else
-      let exp := match v, sig with
-        | .secure, some x => min (now + ttl) x
-        | .bogus _, some _ | .indeterminate, some _ => min (now + ttl) (now + lim.failureTtl)
-        | _, _ => now + ttl
-      some ⟨⟨s.owner, s.rtype⟩, .positive s r v, now, exp, s.ttl, g⟩
-  | .negative k kind soa nsec v tc =>
+    else some ⟨⟨s.owner, s.rtype⟩, .positive s r v, now, validatedCap now lim v sig orig (now + ttl), s.ttl, g⟩
+  | .negative k kind soa nsec v sig orig tc =>
     match soa with
     | none => none
     | some soa =>
@@ -122,21 +152,21 @@ def entryFor (now : Nat) (lim : Limits) (g : Nat) : Offer → Option Entry
         | some n => min base (readTtl n)
         | none => base) lim.maxTtl
       if tc || ttl == 0 then none
-      else some ⟨k, .negative kind soa v, now, now + ttl, soa.ttl, g⟩
+      else some ⟨k, .negative kind soa v, now, validatedCap now lim v sig orig (now + ttl), soa.ttl, g⟩
   | .failure k why => some ⟨k, .failure why, now, now + lim.failureTtl, lim.failureTtl, g⟩
 
 /-- The entry lives at `now`: written in the current generation and not expired. -/
 def live (c : Cache) (now : Nat) (e : Entry) : Bool := e.generation == c.generation && now < e.expires
 
-/-- Offers an answer to the cache at `now`. An entry replaces the live entry for its key only at equal or higher
-rank (RFC 2181 §5.4.1); expired entries and entries of older generations for the key are dropped. -/
+/-- Offers an answer to the cache at `now`. An entry takes the key from the live entry for it only when it
+`replaces` it; expired entries and entries of older generations for the key are dropped. -/
 def insert (now : Nat) (lim : Limits) (c : Cache) (o : Offer) : Cache :=
   match entryFor now lim c.generation o with
   | none => c
   | some e =>
     match c.entries.find? (fun x => x.key == e.key && live c now x) with
-    | some old => if e.body.rank.level < old.body.rank.level then c
-        else ⟨c.generation, e :: c.entries.filter (·.key != e.key)⟩
+    | some old => if e.body.replaces old.body then ⟨c.generation, e :: c.entries.filter (·.key != e.key)⟩
+        else c
     | none => ⟨c.generation, e :: c.entries.filter (·.key != e.key)⟩
 
 /-- A session change: a new generation, and nothing of the old one survives. -/
@@ -177,17 +207,18 @@ theorem entryFor_spec {now : Nat} {lim : Limits} {g : Nat} {o : Offer} {e : Entr
       ∀ s r v, e.body = .positive s r v → e.original = s.ttl := by
   unfold entryFor at h
   cases o with
-  | positive s r v sig tc =>
+  | positive s r v sig orig tc =>
     simp only at h
     split at h
     · cases h
     · cases h
       refine ⟨rfl, rfl, rfl, ?_, fun s' r' v' hb => by cases hb; rfl⟩
-      simp only
       have : min (readTtl s.ttl) lim.maxTtl ≤ s.ttl := by
         unfold readTtl; split <;> omega
-      split <;> omega
-  | negative k kind soa nsec v tc =>
+      have := validatedCap_le now lim v sig orig (now + min (readTtl s.ttl) lim.maxTtl)
+      simp only
+      omega
+  | negative k kind soa nsec v sig orig tc =>
     simp only at h
     cases soa with
     | none => cases h
@@ -201,12 +232,18 @@ theorem entryFor_spec {now : Nat} {lim : Limits} {g : Nat} {o : Offer} {e : Entr
         simp only at h
         split at h
         · cases h
-        · cases h; exact ⟨rfl, rfl, rfl, by simp only; omega, fun _ _ _ hb => by cases hb⟩
+        · cases h
+          have := validatedCap_le now lim v sig orig
+            (now + min (negTtl { soa with ttl := readTtl soa.ttl }) lim.maxTtl)
+          exact ⟨rfl, rfl, rfl, by simp only; omega, fun _ _ _ hb => by cases hb⟩
       | some n =>
         simp only at h
         split at h
         · cases h
-        · cases h; exact ⟨rfl, rfl, rfl, by simp only; omega, fun _ _ _ hb => by cases hb⟩
+        · cases h
+          have := validatedCap_le now lim v sig orig
+            (now + min (min (negTtl { soa with ttl := readTtl soa.ttl }) (readTtl n)) lim.maxTtl)
+          exact ⟨rfl, rfl, rfl, by simp only; omega, fun _ _ _ hb => by cases hb⟩
   | failure k why => cases h; exact ⟨rfl, rfl, rfl, Nat.le_refl _, fun _ _ _ hb => by cases hb⟩
 
 theorem insert_entries (now : Nat) (lim : Limits) (c : Cache) (o : Offer) :
@@ -220,8 +257,8 @@ theorem insert_entries (now : Nat) (lim : Limits) (c : Cache) (o : Offer) :
     simp only
     split
     · split
-      · exact ⟨rfl, Or.inl rfl⟩
       · exact ⟨rfl, Or.inr ⟨e, rfl, rfl⟩⟩
+      · exact ⟨rfl, Or.inl rfl⟩
     · exact ⟨rfl, Or.inr ⟨e, rfl, rfl⟩⟩
 
 theorem nodup_filter_cons {e : Entry} {l : List Entry} (h : (l.map (·.key)).Nodup) :
@@ -345,19 +382,22 @@ theorem failure_never_negative {now : Nat} {c : Cache} {k : Key} {e : Entry} {wh
 
 /-- A Secure RRset lives no longer than its RRSIG (RFC 4035 §5.3.3), so it is never served at or after the
 RRSIG's expiration. -/
-theorem rrsig_caps_ttl {now : Nat} {lim : Limits} {g : Nat} {s : RRset} {r : Rank} {x : Nat} {tc : Bool} {e : Entry}
-    (h : entryFor now lim g (.positive s r .secure (some x) tc) = some e) : e.expires ≤ x := by
+theorem rrsig_caps_ttl {now : Nat} {lim : Limits} {g : Nat} {s : RRset} {r : Rank} {x : Nat} {orig : Option Nat}
+    {tc : Bool} {e : Entry} (h : entryFor now lim g (.positive s r .secure (some x) orig tc) = some e) :
+    e.expires ≤ x := by
   unfold entryFor at h
   simp only at h
   split at h
   · cases h
-  · cases h; exact Nat.min_le_right _ _
+  · cases h
+    simp only [validatedCap]
+    cases orig <;> simp only <;> omega
 
-/-- Data offered at a lower rank than the live entry for its key changes nothing (RFC 2181 §5.4.1): an entry
-replaces another only at equal or higher rank. -/
+/-- An offer that does not replace the live entry for its key changes nothing: data at a lower rank
+(RFC 2181 §5.4.1), or a failure over data that answers clients. -/
 theorem rank_monotone {now : Nat} {lim : Limits} {c : Cache} {o : Offer} {e : Entry} (hu : Unique c)
     (he : e ∈ c.entries) (hk : e.key = o.key) (hl : live c now e = true)
-    (hr : ∀ e', entryFor now lim c.generation o = some e' → e'.body.rank.level < e.body.rank.level) :
+    (hr : ∀ e', entryFor now lim c.generation o = some e' → e'.body.replaces e.body = false) :
     insert now lim c o = c := by
   unfold insert
   cases hfor : entryFor now lim c.generation o with
