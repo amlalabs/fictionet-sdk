@@ -24,9 +24,9 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 
 use fictionet::Entropy;
-use fictionet::stdlib::protocols::dns::dnssec::rdata::{DNSSECRData, SigInput};
+use fictionet::stdlib::protocols::dns::dnssec::rdata::DNSSECRData;
 use fictionet::stdlib::protocols::dns::dnssec::{
-    Anchors, Chain, Fetched, Insecure, Link, Validation, Verify, proof, validate_denial,
+    Anchors, Chain, Fetched, Insecure, Link, Validation, Verified, Verify, proof, validate_denial,
     validate_rrset,
 };
 use fictionet::stdlib::protocols::dns::op::{
@@ -237,8 +237,26 @@ pub(super) enum Dep {
 
 /// What starting a check gave.
 pub(super) enum CheckStart {
-    Done(Validation),
+    Done(Verdict),
     Waiting(CheckId),
+}
+
+/// What a check established: the result, and the RRSIGs that verified the
+/// RRsets a Secure result rests on, which alone bound how long it lasts
+/// (RFC 4035 §5.3.3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Verdict {
+    pub(super) validation: Validation,
+    pub(super) verified: Vec<Verified>,
+}
+
+impl From<Validation> for Verdict {
+    fn from(validation: Validation) -> Verdict {
+        Verdict {
+            validation,
+            verified: Vec::new(),
+        }
+    }
 }
 
 /// Something that became ready for a node waiting on it.
@@ -255,7 +273,7 @@ pub(super) enum Ready {
         to: Node,
         check: CheckId,
         subject: Subject,
-        validation: Validation,
+        verdict: Verdict,
     },
 }
 
@@ -2044,20 +2062,20 @@ impl<V: Verify> Resolver<V> {
         entropy: &dyn Entropy,
     ) -> CheckStart {
         if self.config.anchors.is_none() {
-            return CheckStart::Done(Validation::NotPerformed);
+            return CheckStart::Done(Validation::NotPerformed.into());
         }
         let (Some((material, zone)), Some(checked)) =
             (material(&subject, outcome), checked(&subject, outcome))
         else {
-            return CheckStart::Done(Validation::Indeterminate);
+            return CheckStart::Done(Validation::Indeterminate.into());
         };
         if self.negative_anchor(&subject) {
             // RFC 7646 §1.1: below a negative trust anchor nothing is
             // validated, as though no trust anchor covered the name, until
             // a trust anchor further down.
-            let validation = Validation::Insecure(Insecure::NoAnchor);
-            self.validated(&subject, &checked, &material, validation);
-            return CheckStart::Done(validation);
+            let verdict = Verdict::from(Validation::Insecure(Insecure::NoAnchor));
+            self.validated(&subject, &checked, &material, &verdict);
+            return CheckStart::Done(verdict);
         }
         // A check under way for the same subject is joined only when it
         // validates the same data: the same key may hold other records by
@@ -2082,9 +2100,9 @@ impl<V: Verify> Resolver<V> {
                 .map(|anchor| anchor.owner.clone())
         };
         let Some(anchor) = anchor else {
-            let validation = self.validate(&material, &Chain::default());
-            self.validated(&subject, &checked, &material, validation);
-            return CheckStart::Done(validation);
+            let verdict = self.validate(&material, &Chain::default());
+            self.validated(&subject, &checked, &material, &verdict);
+            return CheckStart::Done(verdict);
         };
         let id = self.graph.check_id();
         self.graph.hold(tree);
@@ -2113,11 +2131,11 @@ impl<V: Verify> Resolver<V> {
         self.link(id, zone, entropy);
         match self.graph.checks.get(&id) {
             Some(check) if check.wait.is_empty() => match self.conclude(id, entropy) {
-                Some(validation) => CheckStart::Done(validation),
+                Some(verdict) => CheckStart::Done(verdict),
                 None => CheckStart::Waiting(id),
             },
             Some(_) => CheckStart::Waiting(id),
-            None => CheckStart::Done(Validation::Indeterminate),
+            None => CheckStart::Done(Validation::Indeterminate.into()),
         }
     }
 
@@ -2390,7 +2408,7 @@ impl<V: Verify> Resolver<V> {
     /// An unsigned RRset that is Bogus with the chain so far may sit below
     /// a cut the resolution never saw, so the check first probes for one,
     /// once. `None` while the probe waits.
-    fn conclude(&mut self, id: CheckId, entropy: &dyn Entropy) -> Option<Validation> {
+    fn conclude(&mut self, id: CheckId, entropy: &dyn Entropy) -> Option<Verdict> {
         let check = self.graph.checks.get(&id)?;
         let links = check
             .links
@@ -2402,12 +2420,12 @@ impl<V: Verify> Resolver<V> {
             })
             .collect();
         let chain = Chain { links };
-        let validation = self.validate(&check.material, &chain);
+        let verdict = self.validate(&check.material, &chain);
         let unsigned = match &check.material {
             Material::Rrset { set, .. } => set.rrsigs().is_empty(),
             Material::Denial { .. } => false,
         };
-        if unsigned && !check.probed && matches!(validation, Validation::Bogus(_)) {
+        if unsigned && !check.probed && matches!(verdict.validation, Validation::Bogus(_)) {
             self.probe(id, entropy);
             let waiting = self
                 .graph
@@ -2424,17 +2442,17 @@ impl<V: Verify> Resolver<V> {
         self.graph.unlist(&check.subject, id);
         self.graph.release(check.tree);
         if !check.bounded {
-            self.validated(&check.subject, &check.checked, &check.material, validation);
+            self.validated(&check.subject, &check.checked, &check.material, &verdict);
         }
         for to in check.dependents {
             self.graph.ready.push_back(Ready::Checked {
                 to,
                 check: id,
                 subject: check.subject.clone(),
-                validation,
+                verdict: verdict.clone(),
             });
         }
-        Some(validation)
+        Some(verdict)
     }
 
     /// What `material` validates to with `chain`.
@@ -2444,13 +2462,18 @@ impl<V: Verify> Resolver<V> {
     /// that does not: a record that did not verify would otherwise reach
     /// the client beside AD (RFC 4035 §3.2.3), and be kept to deny other
     /// names (RFC 8198 §5.1).
-    fn validate(&self, material: &Material, chain: &Chain) -> Validation {
+    fn validate(&self, material: &Material, chain: &Chain) -> Verdict {
         let anchors = self.config.anchors.as_ref().expect("anchors are set");
         let at = self.clock.at(self.now);
         let policy = &self.config.policy;
         match material {
             Material::Rrset { set, authority } => {
-                validate_rrset(set, authority, chain, anchors, policy, at, &self.verify)
+                let rrset =
+                    validate_rrset(set, authority, chain, anchors, policy, at, &self.verify);
+                Verdict {
+                    validation: rrset.validation,
+                    verified: rrset.verified,
+                }
             }
             Material::Denial {
                 query,
@@ -2468,44 +2491,51 @@ impl<V: Verify> Resolver<V> {
                     &self.verify,
                 );
                 match (denial.validation, denial.unverified) {
-                    (Validation::Secure, Some(code)) => Validation::Bogus(code),
-                    (validation, _) => validation,
+                    (Validation::Secure, Some(code)) => Validation::Bogus(code).into(),
+                    (validation, _) => Verdict {
+                        validation,
+                        verified: denial.verified,
+                    },
                 }
             }
         }
     }
 
-    /// Records `validation` of `subject`, made over `checked` with
+    /// Records `verdict` on `subject`, made over `checked` with
     /// `material`, in the cache, where the subject's entry still holds
-    /// `checked`. A Secure RRset lives no longer than the first of its
-    /// RRSIGs to expire (RFC 4035 §5.3.3), and a Secure negative answer no
-    /// longer than the first RRSIG of its SOA and denial records. The NSEC
-    /// records of a Secure negative answer, every one of which verified,
-    /// are kept for synthesizing answers while they and their SOA are
-    /// Secure (RFC 8198 §5.4).
+    /// `checked`. A Secure RRset lives no longer than the RRSIG that
+    /// verified it allows (RFC 4035 §5.3.3), and a Secure negative answer
+    /// no longer than the RRSIGs that verified its SOA and denial records.
+    /// The NSEC records of a Secure negative answer, every one of which
+    /// verified, are kept for synthesizing answers while they and their
+    /// SOA are Secure (RFC 8198 §5.4).
     fn validated(
         &mut self,
         subject: &Subject,
         checked: &Checked,
         material: &Material,
-        validation: Validation,
+        verdict: &Verdict,
     ) {
         let now = self.now;
-        // The records whose RRSIGs proved the result: the RRset, or a
-        // negative answer's SOA and NSEC or NSEC3 records, which together
-        // last only as long as each of them (RFC 8198 §5.4).
-        let (key, sets) = match (subject, material) {
-            (Subject::Rrset(key), Material::Rrset { set, .. }) => (key, std::slice::from_ref(set)),
-            (Subject::Denial(key, _), Material::Denial { authority, .. }) => {
-                (key, authority.as_slice())
-            }
+        let validation = verdict.validation;
+        let key = match (subject, material) {
+            (Subject::Rrset(key), Material::Rrset { .. })
+            | (Subject::Denial(key, _), Material::Denial { .. }) => key,
             _ => return,
         };
-        let expires = sets
+        // The RRSIGs that proved the result: the RRset's, or those of a
+        // negative answer's SOA and NSEC or NSEC3 records, which together
+        // last only as long as each of them (RFC 8198 §5.4).
+        let expires = verdict
+            .verified
             .iter()
-            .filter_map(|set| self.signatures_expire(set))
+            .map(|verified| self.signature_expires(verified))
             .min();
-        let original_ttl = sets.iter().filter_map(|set| self.original_ttl(set)).min();
+        let original_ttl = verdict
+            .verified
+            .iter()
+            .map(|verified| verified.original_ttl)
+            .min();
         self.cache
             .validated(key, checked, validation, expires, original_ttl, now);
         if let (Validation::Secure, Material::Denial { authority, .. }) = (validation, material)
@@ -2517,83 +2547,51 @@ impl<V: Verify> Resolver<V> {
             let nsec: Vec<(RecordSet, Option<Instant>)> = authority
                 .iter()
                 .filter(|set| set.record_type() == RecordType::NSEC)
-                .map(|set| (set.clone(), self.secure_until(set, now)))
+                .map(|set| (set.clone(), self.secure_until(set, now, &verdict.verified)))
                 .collect();
             if let Some(soa) = soa
                 && !nsec.is_empty()
             {
-                let soa_until = self.secure_until(soa, now);
+                let soa_until = self.secure_until(soa, now, &verdict.verified);
                 self.cache.add_secure_nsec(soa, soa_until, &nsec, now);
             }
         }
     }
 
     /// When `set`, Secure and current at `at`, may be served no longer:
-    /// the first of its RRSIGs to expire, or its smallest Original TTL
-    /// past `at`, whichever comes first (RFC 4035 §5.3.3).
-    pub(super) fn secure_until(&self, set: &RecordSet, at: Instant) -> Option<Instant> {
-        let original = self
-            .original_ttl(set)
-            .map(|ttl| at + std::time::Duration::from_secs(u64::from(ttl)));
-        [self.signatures_expire(set), original]
-            .into_iter()
-            .flatten()
-            .min()
-    }
-
-    /// The RRSIGs of `set` the validator reads: of its type, by an
-    /// algorithm the policy validates, and with whether each is inside
-    /// its validity window on the run's clock (RFC 4034 §3.1.5). Only the
-    /// current ones bound how long a Secure RRset lasts (RFC 4035
-    /// §5.3.3): an RRSIG that has expired, or that the validator skips,
-    /// proved nothing.
-    fn rrsigs_now<'s>(&self, set: &'s RecordSet) -> impl Iterator<Item = (&'s SigInput, bool)> {
-        use std::cmp::Ordering::{Equal, Greater, Less};
-        let now = self.serial_now();
-        let policy = &self.config.policy;
-        set.rrsigs()
+    /// when the RRSIG among `verified` that verified it expires, or its
+    /// Original TTL past `at`, whichever comes first (RFC 4035 §5.3.3).
+    /// `None` when no RRSIG verified `set`: RRSIGs that did not prove it
+    /// bound nothing.
+    pub(super) fn secure_until(
+        &self,
+        set: &RecordSet,
+        at: Instant,
+        verified: &[Verified],
+    ) -> Option<Instant> {
+        verified
             .iter()
-            .filter_map(|record| match &record.data {
-                RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) => Some(rrsig.input()),
-                _ => None,
+            .filter(|verified| verified.signs(set))
+            .map(|verified| {
+                let original =
+                    at + std::time::Duration::from_secs(u64::from(verified.original_ttl));
+                self.signature_expires(verified).min(original)
             })
-            .filter(move |input| {
-                input.type_covered == set.record_type()
-                    && policy.validates(u8::from(input.algorithm))
-            })
-            .map(move |input| {
-                let current =
-                    matches!(now.partial_cmp(&input.sig_inception), Some(Greater | Equal))
-                        && matches!(now.partial_cmp(&input.sig_expiration), Some(Less | Equal));
-                (input, current)
-            })
-    }
-
-    /// The first time one of `set`'s current RRSIGs expires, on the run's
-    /// clock, or now when it has RRSIGs and none is current.
-    fn signatures_expire(&self, set: &RecordSet) -> Option<Instant> {
-        let now = self.serial_now();
-        let mut signed = false;
-        let first = self
-            .rrsigs_now(set)
-            .filter_map(|(input, current)| {
-                signed = true;
-                // A current RRSIG expires within 2^31 seconds (RFC 1982),
-                // and is valid through its last second.
-                let ahead = input.sig_expiration.get().wrapping_sub(now.get());
-                current.then(|| self.now + std::time::Duration::from_secs(u64::from(ahead) + 1))
-            })
-            .min();
-        first.or(signed.then_some(self.now))
-    }
-
-    /// The smallest Original TTL among `set`'s current RRSIGs (RFC 4034
-    /// §3.1.4).
-    fn original_ttl(&self, set: &RecordSet) -> Option<u32> {
-        self.rrsigs_now(set)
-            .filter(|(_, current)| *current)
-            .map(|(input, _)| input.original_ttl)
             .min()
+    }
+
+    /// When the RRSIG that made `verified` expires, on the run's clock: it
+    /// is valid through its last second (RFC 4034 §3.1.5), or now when
+    /// that has passed.
+    fn signature_expires(&self, verified: &Verified) -> Instant {
+        use std::cmp::Ordering::{Equal, Less};
+        let now = self.serial_now();
+        if !matches!(now.partial_cmp(&verified.expiration), Some(Less | Equal)) {
+            return self.now;
+        }
+        // An RRSIG still current expires within 2^31 seconds (RFC 1982).
+        let ahead = verified.expiration.get().wrapping_sub(now.get());
+        self.now + std::time::Duration::from_secs(u64::from(ahead) + 1)
     }
 
     /// The run's clock as an RRSIG time field: seconds since 1970 modulo

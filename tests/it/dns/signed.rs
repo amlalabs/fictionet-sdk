@@ -188,6 +188,7 @@ fn validate(data: &dyn ZoneData, set: &RecordSet) -> Validation {
         now(),
         &Ring,
     )
+    .validation
 }
 
 #[test]
@@ -529,7 +530,11 @@ fn check_chain_finds_a_zone_of_two_algorithms_whole_with_either() {
             "without {dropped}"
         );
         let validation = validate_rrset(&served[0], &[], &chain, &anchors, &policy, now(), &Ring);
-        assert_eq!(validation, Validation::Secure, "without {dropped}");
+        assert_eq!(
+            validation.validation,
+            Validation::Secure,
+            "without {dropped}"
+        );
     }
     // Without both, validators find the zone Insecure.
     let mut policy = AlgorithmPolicy::iana();

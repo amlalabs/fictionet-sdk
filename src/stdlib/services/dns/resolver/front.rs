@@ -150,8 +150,9 @@ impl<V: Verify> Resolver<V> {
         for piece in pieces {
             // Fresh data has its TTL as the server sent it; the client sees
             // it within the cache's limit, counted down from when it
-            // arrived, and, when it is Secure, no longer than its RRSIGs
-            // allow (RFC 4035 §5.3.3), as it would from the cache.
+            // arrived, and, when it is Secure, no longer than the RRSIG
+            // that verified it allows (RFC 4035 §5.3.3), as it would from
+            // the cache.
             let secure = !piece.checks.is_empty() && piece.validation() == Validation::Secure;
             let ttl = |set: &RecordSet| {
                 let ttl = if piece.stale {
@@ -159,7 +160,8 @@ impl<V: Verify> Resolver<V> {
                 } else {
                     let ttl = Duration::from_secs(u64::from(set.ttl().min(max_ttl)));
                     let mut expires = piece.at + ttl;
-                    if secure && let Some(until) = self.secure_until(set, piece.at) {
+                    if secure && let Some(until) = self.secure_until(set, piece.at, &piece.verified)
+                    {
                         expires = expires.min(until);
                     }
                     ttl_left(expires, self.now)

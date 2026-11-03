@@ -159,12 +159,16 @@ VARIABLES
 vars == <<now, ver, editAt, cache, known, res, waiting, asked, ans, net, lost, tcs>>
 
 \* A cache entry. rank is "auth" or "glue" (RFC 2181 section 5.4.1); from is
-\* the zone of the server that sent it; tc says it came from a truncated
-\* reply; failure says it was written for a failed resolution, and bounded
-\* that the work bound caused the failure.
-Entry(t, val, ttl, rank, from, tc, failure) ==
+\* the zone of the server that sent it, or for a failure the zone whose
+\* servers the resolution tried; failure says it was written for a failed
+\* resolution, and tried holds the servers and transports that resolution
+\* tried at that zone.
+Entry(t, val, ttl, rank, from) ==
     [t |-> t, val |-> val, ttl |-> ttl, readAt |-> now, rank |-> rank, from |-> from,
-     tc |-> tc, failure |-> failure, bounded |-> FALSE]
+     failure |-> FALSE, tried |-> {}]
+
+\* The entry a failed resolution r leaves at the name its chain reached.
+FailEntry(t, r) == [Entry(t, None, FailureTtl, "auth", r.zone) EXCEPT !.failure = TRUE, !.tried = r.tried]
 
 Usable(e) ==
     /\ e # None
@@ -185,10 +189,19 @@ NewRes(q) == [qn |-> q, zone |-> Closest(q), tried |-> {}, out |-> None,
 \* to see a resolution go past it and keeps the state space finite.
 Min(a, b) == IF a < b THEN a ELSE b
 
-\* What an answer to a client records about each entry it used. fresh says
-\* the entry came in a reply to this resolution rather than from the cache.
-Used(n, e, fresh) == [n |-> n, t |-> e.t, val |-> e.val, ttl |-> e.ttl, readAt |-> e.readAt,
-                      rank |-> e.rank, failure |-> e.failure, fresh |-> fresh]
+\* What a resolution records about each entry it uses: fetched says the
+\* entry came in a reply to this resolution, FALSE that it was read from
+\* the cache.
+Used(n, e, fetched) == [n |-> n, t |-> e.t, val |-> e.val, ttl |-> e.ttl, readAt |-> e.readAt,
+                        rank |-> e.rank, failure |-> e.failure, fetched |-> fetched]
+
+\* The TTL a record has left now, as the client sees it: counted down from
+\* when it was read, and 0 once it has run out (cache::ttl_left).
+TtlLeft(u) == IF now < u.readAt + u.ttl THEN u.readAt + u.ttl - now ELSE 0
+
+\* A used record as the answer renders it, with the TTL it goes out with.
+Rendered(u) == [n |-> u.n, t |-> u.t, val |-> u.val, ttl |-> u.ttl, readAt |-> u.readAt,
+                rank |-> u.rank, failure |-> u.failure, fetched |-> u.fetched, left |-> TtlLeft(u)]
 
 Rcode(t) == CASE t = "a" -> "NOERROR" [] t = "cname" -> "NOERROR"
               [] t = "nodata" -> "NODATA" [] t = "nx" -> "NXDOMAIN" [] t = "fail" -> "SERVFAIL"
@@ -240,7 +253,8 @@ Ask(c, q) ==
 \* Every waiter of q gets the answer, rendered now.
 Finish(q, rcode, recs) ==
     /\ ans' = [c \in Clients |-> IF c \in waiting[q]
-                                  THEN [ans[c] EXCEPT ![q] = [rcode |-> rcode, recs |-> recs, at |-> now]]
+                                  THEN [ans[c] EXCEPT ![q] = [rcode |-> rcode, at |-> now,
+                                                              recs |-> {Rendered(u) : u \in recs}]]
                                   ELSE ans[c]]
     /\ res' = [res EXCEPT ![q] = None]
     /\ waiting' = [waiting EXCEPT ![q] = {}]
@@ -249,8 +263,7 @@ Finish(q, rcode, recs) ==
 (* failure_ttl (RFC 9520).                                                 *)
 Fail(q) ==
     LET r == res[q]
-        e == Entry(IF FailureAsNegative THEN "nx" ELSE "fail", None, FailureTtl, "auth",
-                   r.zone, FALSE, TRUE)
+        e == FailEntry(IF FailureAsNegative THEN "nx" ELSE "fail", r)
     IN  /\ cache' = [cache EXCEPT ![r.qn] = e]
         /\ Finish(q, Rcode(e.t), {Used(r.qn, e, FALSE)})
 
@@ -260,7 +273,7 @@ Fail(q) ==
 (* (RFC 9520 section 3.2).                                                 *)
 FailBounded(q) ==
     LET r == res[q]
-        e == [Entry("fail", None, FailureTtl, "auth", r.zone, FALSE, TRUE) EXCEPT !.bounded = TRUE]
+        e == FailEntry("fail", r)
     IN  /\ cache' = IF CacheBounded THEN [cache EXCEPT ![r.qn] = e] ELSE cache
         /\ Finish(q, "SERVFAIL", {})
 
@@ -274,14 +287,14 @@ Advance(q) ==
     /\ res[q] # None
     /\ res[q].out = None
     /\ LET r == res[q]
-           fresh == r.got # None
-           e == IF fresh THEN r.got ELSE cache[r.qn]
-           have == fresh \/ Usable(e)
+           fetched == r.got # None
+           e == IF fetched THEN r.got ELSE cache[r.qn]
+           have == fetched \/ Usable(e)
        IN
        \/ /\ have
           /\ e.t # "cname"
-          /\ LET recs == r.recs \cup {Used(r.qn, e, fresh)} IN
-             IF CheckExpiry /\ \E u \in recs : ~u.fresh /\ ~Live(u)
+          /\ LET recs == r.recs \cup {Used(r.qn, e, fetched)} IN
+             IF CheckExpiry /\ \E u \in recs : ~u.fetched /\ ~Live(u)
              \* A link the cache gave ran out while the chase went on: follow the
              \* chain again from the question, keeping the work done so far. A
              \* link that came for this resolution serves it with the TTL it has
@@ -299,7 +312,7 @@ Advance(q) ==
              ELSE /\ res' = [res EXCEPT ![q] = [qn |-> e.val, zone |-> Closest(e.val), tried |-> {},
                                               out |-> None, work |-> r.work,
                                               chain |-> Min(r.chain + 1, MaxChain + 1),
-                                              recs |-> r.recs \cup {Used(r.qn, e, fresh)},
+                                              recs |-> r.recs \cup {Used(r.qn, e, fetched)},
                                               got |-> None]]
                   /\ UNCHANGED <<cache, waiting, ans, net>>
        \/ /\ ~have
@@ -327,7 +340,7 @@ ServeOne(m) ==
 CacheExtra(c, x, rank, zone) ==
     IF x.n \in CacheNames /\ (CheckBailiwick => AtOrBelow(x.n, zone))
        /\ (c[x.n] = None \/ c[x.n].rank = "glue" \/ rank = "auth")
-    THEN [c EXCEPT ![x.n] = Entry("a", x.val, x.ttl, rank, zone, FALSE, FALSE)]
+    THEN [c EXCEPT ![x.n] = Entry("a", x.val, x.ttl, rank, zone)]
     ELSE c
 
 RECURSIVE CacheAll(_, _, _, _)
@@ -350,8 +363,7 @@ ReceiveOne(m) ==
               \* RFC 7766: retry the same server over TCP. A truncated reply is
               \* never cached (RFC 2181 section 9).
               /\ cache' = IF CacheTc
-                          THEN [cache EXCEPT ![r.qn] = Entry("nodata", None, NegTtl, "auth",
-                                                               m.srv[1], TRUE, FALSE)]
+                          THEN [cache EXCEPT ![r.qn] = Entry("nodata", None, NegTtl, "auth", m.srv[1])]
                           ELSE cache
               /\ IF BoundWork /\ r.work >= MaxWork
                  THEN /\ res' = [res EXCEPT ![q].out = None, ![q].tried = tried]
@@ -376,7 +388,7 @@ ReceiveOne(m) ==
                    /\ net' = net \ {m}
                    /\ UNCHANGED <<cache, known>>
          [] b.kind = "answer" ->
-              LET e == Entry(b.rr.t, b.rr.val, b.rr.ttl, "auth", m.srv[1], FALSE, FALSE) IN
+              LET e == Entry(b.rr.t, b.rr.val, b.rr.ttl, "auth", m.srv[1]) IN
               /\ cache' = CacheAll([cache EXCEPT ![r.qn] = e], b.extra, "auth", m.srv[1])
               /\ res' = [res EXCEPT ![q].out = None, ![q].got = e]
               /\ net' = net \ {m}
@@ -466,10 +478,10 @@ VersionsAt(s) == IF editAt = None THEN {ver}
                  ELSE {0, 1}
 
 \* Some second within the record's TTL before t at which the data said u. A
-\* record that came for the resolution and ran out before t reached the
+\* record fetched for the resolution that ran out before t reached the
 \* client with TTL 0; its TTL counts back from its last second instead.
 TrueWithin(u, t) ==
-    LET end == IF u.fresh THEN Min(t, u.readAt + u.ttl - 1) ELSE t IN
+    LET end == IF u.fetched THEN Min(t, u.readAt + u.ttl - 1) ELSE t IN
     \E s \in 0..MaxTime : s <= end /\ s > end - u.ttl /\
         \E v \in VersionsAt(s) : LET l == Lookup(v, u.n) IN l.t = u.t /\ l.val = u.val
 
@@ -500,24 +512,34 @@ NoPoison ==
 GlueNeverAnswers ==
     \A a \in Answers : \A u \in a.recs : u.rank = "auth"
 
-(* No answer uses a record from the cache at or after its expiry. A record  *)
-(* that came for the resolution serves it with the TTL it has left, even 0  *)
-(* (RFC 1035 section 7.4).                                                  *)
+(* No answer uses a record read from the cache at or after its expiry. A    *)
+(* record fetched for the resolution serves it even after its TTL has run   *)
+(* out, and then goes out with TTL 0 (RFC 1035 section 7.4).                *)
 TtlSound ==
-    \A a \in Answers : \A u \in a.recs : ~u.fresh => a.at < u.readAt + u.ttl
+    \A a \in Answers : \A u \in a.recs :
+        /\ ~u.fetched => a.at < u.readAt + u.ttl
+        /\ (u.fetched /\ a.at >= u.readAt + u.ttl) => u.left = 0
 
-(* Nothing from a truncated reply is cached. *)
-TcNotCached ==
-    \A n \in CacheNames : cache[n] # None => ~cache[n].tc
+(* Every cached NXDOMAIN or NODATA was true at some second within its TTL,  *)
+(* from when it was stored: so nothing a reply did not show, such as a       *)
+(* truncated reply's empty sections (RFC 2181 section 9), is cached as a     *)
+(* negative.                                                                *)
+CachedNegativeTrue ==
+    \A n \in CacheNames : (cache[n] # None /\ cache[n].t \in {"nx", "nodata"}) =>
+        \E s \in cache[n].readAt .. Min(now, cache[n].readAt + cache[n].ttl - 1) :
+            \E v \in VersionsAt(s) : Lookup(v, n).t = cache[n].t
 
 (* A failure never answers NXDOMAIN or NODATA (RFC 9520). *)
 FailureNeverNegative ==
     \A a \in Answers : a.rcode \in {"NXDOMAIN", "NODATA"} => \A u \in a.recs : ~u.failure
 
-(* A failure the work bound caused is never cached, so one question's       *)
-(* spent budget never answers SERVFAIL to another client.                   *)
-BoundedNotCached ==
-    \A n \in CacheNames : cache[n] # None => ~cache[n].bounded
+(* A cached failure says every server of its zone failed: the resolution   *)
+(* that wrote it tried each of them (RFC 9520 section 3.1). So a failure the *)
+(* work bound caused, which says nothing of the servers, is never cached,   *)
+(* and one question's spent budget never answers another client.            *)
+CachedFailureTriedAll ==
+    \A n \in CacheNames : (cache[n] # None /\ cache[n].failure) =>
+        \A s \in ServersOf(cache[n].from) : <<s, FALSE>> \in cache[n].tried
 
 (* Each resolution stays within its work and chain bounds. *)
 WorkBounded ==

@@ -283,9 +283,14 @@ def referral (look : Name → Fact Node) (apex m : Name) (ns : RRset) (glue : Li
 def hinfoAnswer (q : Name) (sets : List RRset) : RRset :=
   ⟨q, 13, ((sets.map (·.ttl)).min?).getD 0, [.hinfo [82, 70, 67, 56, 52, 56, 50] []]⟩
 
+/-- The answer to QTYPE ANY. No HINFO is made up at a CNAME (RFC 8482 §4.2), which leaves room for no other data
+(RFC 1034 §3.6.2): the answer is the CNAME. -/
 def anySets (any : AnyResponse) (q : Name) (sets : List RRset) : List RRset :=
   match any with
-  | .hinfo => [hinfoAnswer q sets]
+  | .hinfo =>
+    match sets.find? (·.rtype == 5) with
+    | some c => [withOwner q c]
+    | none => [hinfoAnswer q sets]
   | .oneRrset => (sets.take 1).map (withOwner q)
   | .all => sets.map (withOwner q)
 
@@ -895,11 +900,13 @@ theorem exact_out {look : Name → Fact Node} {apex : Name} {soa : RRset} {any :
     · cases h; exact Or.inl rfl
     · cases h; refine Or.inr (Or.inl ⟨_, _, rfl, ?_⟩)
       rename_i hs
-      cases any <;> simp [anySets]
-      · cases sets with
+      cases any with
+      | hinfo => simp only [anySets]; split <;> simp
+      | oneRrset =>
+        cases sets with
         | nil => exact absurd rfl hs
-        | cons _ _ => simp
-      · exact hs
+        | cons _ _ => simp [anySets]
+      | all => simpa [anySets] using hs
   · split at h
     · split at h
       · cases h; exact Or.inr (Or.inl ⟨_, _, rfl, by simp⟩)
@@ -1407,7 +1414,9 @@ theorem exact_owners {look : Name → Fact Node} {apex : Name} {soa : RRset} {an
       intro s hs
       simp only [List.append_nil, anySets] at hs
       cases any with
-      | hinfo => simp [hinfoAnswer] at hs; subst hs; exact hq
+      | hinfo =>
+        dsimp only at hs
+        split at hs <;> (simp only [List.mem_singleton] at hs; subst hs; exact hq)
       | oneRrset => obtain ⟨x, _, rfl⟩ := List.mem_map.mp hs; exact hq
       | all => obtain ⟨x, _, rfl⟩ := List.mem_map.mp hs; exact hq
   · split at h

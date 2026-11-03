@@ -356,7 +356,8 @@ struct Stored {
 ///   servers. Data or NODATA at a name ends a live NXDOMAIN at that name
 ///   or above it at no higher rank, under every type it is kept under,
 ///   since the name exists after all (RFC 8020 §2). An NXDOMAIN replaces
-///   the entry of the type it answered.
+///   the entry of the type it answered, and is not kept at all when that
+///   entry is live data of higher rank.
 /// - Every entry records the generation that wrote it, and a new
 ///   generation starts empty.
 #[derive(Clone, Debug)]
@@ -411,6 +412,15 @@ impl Cache {
         let Some((key, entry)) = self.entry_for(now, offer) else {
             return;
         };
+        // Live data of higher rank for the type it answered shows the
+        // name exists, so such an NXDOMAIN is not kept at all.
+        if let Some(asked) = &asked
+            && self
+                .live(asked, now)
+                .is_some_and(|old| entry.rank() < old.rank())
+        {
+            return;
+        }
         if let Some(old) = self.live(&key, now) {
             let kept = match entry {
                 // A failure never displaces live data that answers

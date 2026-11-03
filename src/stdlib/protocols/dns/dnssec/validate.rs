@@ -23,7 +23,7 @@ use std::time::SystemTime;
 use super::keys::{KeyFlags, digest_of, key_tag};
 use super::policy::{AlgorithmPolicy, Treatment};
 use super::proof::{self, Proof};
-use super::rdata::{DNSKEY, DNSSECRData, DS};
+use super::rdata::{DNSKEY, DNSSECRData, DS, SigInput};
 use super::sign::{serial, signed_data};
 use super::{Anchors, TrustAnchor, Verify};
 use crate::stdlib::protocols::dns::op::{Query, ResponseCode};
@@ -121,6 +121,58 @@ pub struct Link {
     pub dnskey: Fetched,
 }
 
+/// An RRset whose RRSIG verified, and how long that RRSIG lets the RRset
+/// count as Secure: until the RRSIG's Signature Expiration, and no longer
+/// than its Original TTL from when the RRset arrived (RFC 4035 §5.3.3).
+/// Other RRSIGs of the RRset, which did not verify, bound nothing.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Verified {
+    /// The RRset's owner.
+    pub owner: Name,
+    /// The RRset's type.
+    pub rtype: RecordType,
+    /// The RRSIG's Signature Expiration (RFC 4034 §3.1.5).
+    pub expiration: SerialNumber,
+    /// The RRSIG's Original TTL (RFC 4034 §3.1.4).
+    pub original_ttl: u32,
+}
+
+impl Verified {
+    fn of(set: &RecordSet, input: &SigInput) -> Verified {
+        Verified {
+            owner: set.name().clone(),
+            rtype: set.record_type(),
+            expiration: input.sig_expiration,
+            original_ttl: input.original_ttl,
+        }
+    }
+
+    /// Whether this is what verified `set`.
+    pub fn signs(&self, set: &RecordSet) -> bool {
+        self.rtype == set.record_type() && self.owner == *set.name()
+    }
+}
+
+/// What [`validate_rrset`] established about an RRset.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ValidatedRrset {
+    /// The result.
+    pub validation: Validation,
+    /// When the result is Secure, the RRSIG that verified each RRset it
+    /// rests on: the RRset, and for a wildcard answer the NSEC or NSEC3
+    /// records of its proof. Empty for any other result.
+    pub verified: Vec<Verified>,
+}
+
+impl From<Validation> for ValidatedRrset {
+    fn from(validation: Validation) -> ValidatedRrset {
+        ValidatedRrset {
+            validation,
+            verified: Vec::new(),
+        }
+    }
+}
+
 /// The DS, DNSKEY, RRSIG, and denial records gathered from a trust anchor
 /// down to an answer: one [`Link`] for each zone cut on the way, in any
 /// order. Links for zones off the path are ignored.
@@ -144,7 +196,7 @@ pub fn validate_rrset(
     policy: &AlgorithmPolicy,
     at: SystemTime,
     verify: &impl Verify,
-) -> Validation {
+) -> ValidatedRrset {
     let check = Check {
         policy,
         at: serial(at),
@@ -155,31 +207,44 @@ pub fn validate_rrset(
     let ds = set.record_type() == RecordType::DS && !name.is_root();
     let (zone, keys) = match check.zone_keys(chain, anchors, name, ds) {
         Ok(found) => found,
-        Err(result) => return result,
+        Err(result) => return result.into(),
     };
     if deeper_signer(std::slice::from_ref(set), &zone, name, ds) {
-        return Validation::Indeterminate;
+        return Validation::Indeterminate.into();
     }
-    match check.rrset(set, &zone, &keys) {
-        Err(code) => Validation::Bogus(code),
-        Ok(labels) if labels < name.num_labels() => {
-            let (proven, failure) = check.authenticate(authority, &zone, &keys);
-            let proof =
-                proof::wildcard_answer(name, labels, &zone, &proven, policy.max_nsec3_iterations);
-            match (from_proof(proof, failure), failure) {
-                // The proof goes out beside the answer, so a record of it
-                // that did not verify would reach a client under AD
-                // (RFC 4035 §3.2.3).
-                (Validation::Secure, Some(code)) => Validation::Bogus(code),
-                (validation, _) => validation,
-            }
-        }
-        Ok(_) => Validation::Secure,
+    let input = match check.rrset(set, &zone, &keys) {
+        Ok(input) => input,
+        Err(code) => return Validation::Bogus(code).into(),
+    };
+    let answer = Verified::of(set, input);
+    if input.num_labels >= name.num_labels() {
+        return ValidatedRrset {
+            validation: Validation::Secure,
+            verified: vec![answer],
+        };
+    }
+    let found = check.authenticate(authority, &zone, &keys);
+    let proof = proof::wildcard_answer(
+        name,
+        input.num_labels,
+        &zone,
+        &found.proven,
+        policy.max_nsec3_iterations,
+    );
+    match (from_proof(proof, found.failure), found.failure) {
+        // The proof goes out beside the answer, so a record of it that did
+        // not verify would reach a client under AD (RFC 4035 §3.2.3).
+        (Validation::Secure, Some(code)) => Validation::Bogus(code).into(),
+        (Validation::Secure, None) => ValidatedRrset {
+            validation: Validation::Secure,
+            verified: std::iter::once(answer).chain(found.verified).collect(),
+        },
+        (validation, _) => validation.into(),
     }
 }
 
 /// What [`validate_denial`] established about a negative answer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ValidatedDenial {
     /// The result.
     pub validation: Validation,
@@ -189,6 +254,10 @@ pub struct ValidatedDenial {
     /// other names (RFC 8198 §5.1), nor send it on as authentic data
     /// (RFC 4035 §3.2.3).
     pub unverified: Option<EdeCode>,
+    /// When the result is Secure, the RRSIG that verified the zone's SOA
+    /// and each NSEC or NSEC3 RRset that did verify. Empty for any other
+    /// result.
+    pub verified: Vec<Verified>,
 }
 
 impl From<Validation> for ValidatedDenial {
@@ -196,6 +265,7 @@ impl From<Validation> for ValidatedDenial {
         ValidatedDenial {
             validation,
             unverified: None,
+            verified: Vec::new(),
         }
     }
 }
@@ -230,24 +300,33 @@ pub fn validate_denial(
     if deeper_signer(authority, &zone, name, ds) {
         return Validation::Indeterminate.into();
     }
+    let mut verified = Vec::new();
     for soa in authority
         .iter()
         .filter(|set| set.record_type() == RecordType::SOA && *set.name() == zone)
     {
-        if let Err(code) = check.rrset(soa, &zone, &keys) {
-            return Validation::Bogus(code).into();
+        match check.rrset(soa, &zone, &keys) {
+            Ok(input) => verified.push(Verified::of(soa, input)),
+            Err(code) => return Validation::Bogus(code).into(),
         }
     }
-    let (proven, failure) = check.authenticate(authority, &zone, &keys);
+    let found = check.authenticate(authority, &zone, &keys);
     let max = policy.max_nsec3_iterations;
     let proof = match rcode {
-        ResponseCode::NXDomain => proof::nxdomain(name, &zone, &proven, max),
-        ResponseCode::NoError => proof::nodata(name, qtype, &zone, &proven, max),
+        ResponseCode::NXDomain => proof::nxdomain(name, &zone, &found.proven, max),
+        ResponseCode::NoError => proof::nodata(name, qtype, &zone, &found.proven, max),
         _ => return Validation::Indeterminate.into(),
     };
+    let validation = from_proof(proof, found.failure);
+    if validation == Validation::Secure {
+        verified.extend(found.verified);
+    } else {
+        verified.clear();
+    }
     ValidatedDenial {
-        validation: from_proof(proof, failure),
-        unverified: failure,
+        validation,
+        unverified: found.failure,
+        verified,
     }
 }
 
@@ -307,6 +386,14 @@ impl Failure {
             Failure::ExpiredBeforeValid => EdeCode::SIGNATURE_EXPIRED_BEFORE_VALID,
         }
     }
+}
+
+/// The NSEC and NSEC3 RRsets of a section that verified, with the RRSIG
+/// that verified each, and the most telling reason any others failed.
+struct Authenticated {
+    proven: Vec<RecordSet>,
+    verified: Vec<Verified>,
+    failure: Option<EdeCode>,
 }
 
 /// The inputs every check shares.
@@ -391,11 +478,16 @@ impl<V: Verify> Check<'_, V> {
                 return Ok(ds);
             }
         };
-        let (proven, failure) = self.authenticate(records, zone, keys);
-        let proof = proof::no_ds(&link.zone, zone, &proven, self.policy.max_nsec3_iterations);
+        let found = self.authenticate(records, zone, keys);
+        let proof = proof::no_ds(
+            &link.zone,
+            zone,
+            &found.proven,
+            self.policy.max_nsec3_iterations,
+        );
         Err(match proof {
             Proof::Proven => Validation::Insecure(Insecure::ProvenNoDs),
-            other => from_proof(other, failure),
+            other => from_proof(other, found.failure),
         })
     }
 
@@ -475,34 +567,40 @@ impl<V: Verify> Check<'_, V> {
     /// The NSEC and NSEC3 RRsets in `sets` whose signatures by `zone`'s
     /// `keys` verify for their own owner, and the most telling reason any
     /// others failed.
-    fn authenticate(
-        &self,
-        sets: &[RecordSet],
-        zone: &Name,
-        keys: &[DNSKEY],
-    ) -> (Vec<RecordSet>, Option<EdeCode>) {
-        let mut proven = Vec::new();
-        let mut failure = None;
+    fn authenticate(&self, sets: &[RecordSet], zone: &Name, keys: &[DNSKEY]) -> Authenticated {
+        let mut found = Authenticated {
+            proven: Vec::new(),
+            verified: Vec::new(),
+            failure: None,
+        };
         for set in sets
             .iter()
             .filter(|set| matches!(set.record_type(), RecordType::NSEC | RecordType::NSEC3))
         {
             match self.rrset(set, zone, keys) {
-                Ok(labels) if labels == set.name().num_labels() => proven.push(set.clone()),
+                Ok(input) if input.num_labels == set.name().num_labels() => {
+                    found.proven.push(set.clone());
+                    found.verified.push(Verified::of(set, input));
+                }
                 // A record a wildcard expanded, signed for fewer labels
                 // than its owner has, proves nothing about that owner
                 // (RFC 4035 §5.4), and no server sends one as a denial.
-                Ok(_) => failure = failure.or(Some(EdeCode::NSEC_MISSING)),
-                Err(code) => failure = failure.or(Some(code)),
+                Ok(_) => found.failure = found.failure.or(Some(EdeCode::NSEC_MISSING)),
+                Err(code) => found.failure = found.failure.or(Some(code)),
             }
         }
-        (proven, failure)
+        found
     }
 
     /// Checks the RRSIGs of `set` by `zone`'s `keys` (RFC 4035 §5.3). On
-    /// success, the labels field of the RRSIG that verified, which is
-    /// below the owner's label count for a wildcard answer.
-    fn rrset(&self, set: &RecordSet, zone: &Name, keys: &[DNSKEY]) -> Result<u8, EdeCode> {
+    /// success, the RRSIG that verified, whose labels field is below the
+    /// owner's label count for a wildcard answer.
+    fn rrset<'s>(
+        &self,
+        set: &'s RecordSet,
+        zone: &Name,
+        keys: &[DNSKEY],
+    ) -> Result<&'s SigInput, EdeCode> {
         let mut worst: Option<Failure> = None;
         for record in set.rrsigs() {
             let RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) = &record.data else {
@@ -518,7 +616,7 @@ impl<V: Verify> Check<'_, V> {
                 continue;
             }
             let failure = match self.signature(set, input, rrsig.sig(), keys) {
-                Ok(()) => return Ok(input.num_labels),
+                Ok(()) => return Ok(input),
                 Err(failure) => failure,
             };
             worst = worst.max(Some(failure));
@@ -529,7 +627,7 @@ impl<V: Verify> Check<'_, V> {
     fn signature(
         &self,
         set: &RecordSet,
-        input: &super::rdata::SigInput,
+        input: &SigInput,
         signature: &[u8],
         keys: &[DNSKEY],
     ) -> Result<(), Failure> {
@@ -776,6 +874,7 @@ mod tests {
                 time(NOW),
                 &Ring,
             )
+            .validation
         }
 
         fn deny(
@@ -1418,6 +1517,9 @@ mod tests {
             time(NOW),
             &Ring,
         );
-        assert_eq!(result, Validation::Insecure(Insecure::UnsupportedAlgorithm));
+        assert_eq!(
+            result.validation,
+            Validation::Insecure(Insecure::UnsupportedAlgorithm)
+        );
     }
 }

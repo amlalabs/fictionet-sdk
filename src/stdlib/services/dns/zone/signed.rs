@@ -698,6 +698,7 @@ pub(super) mod tests {
                 time(NOW),
                 &Ring,
             )
+            .validation
         }
 
         pub(in super::super) fn denial(

@@ -48,7 +48,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use fictionet::Entropy;
-use fictionet::stdlib::protocols::dns::dnssec::{Ring, Validation, Verify};
+use fictionet::stdlib::protocols::dns::dnssec::{Ring, Validation, Verified, Verify};
 use fictionet::stdlib::protocols::dns::op::ResponseCode;
 use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, Name, RecordType};
 use fictionet::stdlib::protocols::dns::{Parsed, Request, label_count};
@@ -150,6 +150,11 @@ struct Piece {
     outcome: Outcome,
     /// What validation established, per RRset or denial the piece holds.
     checks: Vec<(Subject, Validation)>,
+    /// The RRSIGs that verified its RRsets for Secure results of its
+    /// checks, which bound how long the client may keep them (RFC 4035
+    /// §5.3.3). Empty for data from the cache, whose TTL the cache already
+    /// bounded when it stored the result.
+    verified: Vec<Verified>,
     /// Whether it came from the cache.
     cached: bool,
     /// Whether it is expired data served under RFC 8767.
@@ -418,6 +423,7 @@ impl<V: Verify> Resolver<V> {
         };
         asker.pieces.push(Piece {
             checks: found.checks,
+            verified: Vec::new(),
             outcome: found.outcome,
             cached: found.cached,
             stale: false,
@@ -450,6 +456,7 @@ impl<V: Verify> Resolver<V> {
                 .collect();
             asker.pieces.push(Piece {
                 checks,
+                verified: Vec::new(),
                 outcome,
                 cached: false,
                 stale: false,
@@ -547,6 +554,7 @@ impl<V: Verify> Resolver<V> {
             };
             chain.push(Piece {
                 checks: found.checks,
+                verified: Vec::new(),
                 outcome: found.outcome,
                 cached: true,
                 stale: true,
@@ -598,9 +606,11 @@ impl<V: Verify> Resolver<V> {
                     0,
                     entropy,
                 ) {
-                    resolution::CheckStart::Done(validation) => {
+                    resolution::CheckStart::Done(verdict) => {
                         if let Some(asker) = self.askers.get_mut(&id) {
-                            asker.pieces[index].checks[at].1 = validation;
+                            let piece = &mut asker.pieces[index];
+                            piece.checks[at].1 = verdict.validation;
+                            piece.verified.extend(verdict.verified);
                         }
                     }
                     resolution::CheckStart::Waiting(check) => {
@@ -641,7 +651,7 @@ impl<V: Verify> Resolver<V> {
         id: AskerId,
         check: CheckId,
         subject: &Subject,
-        validation: Validation,
+        verdict: resolution::Verdict,
         entropy: &dyn Entropy,
     ) {
         let Some(asker) = self.askers.get_mut(&id) else {
@@ -654,10 +664,15 @@ impl<V: Verify> Resolver<V> {
             return;
         }
         for piece in &mut asker.pieces {
+            let mut took = false;
             for (have, result) in &mut piece.checks {
                 if have == subject && *result == Validation::NotPerformed {
-                    *result = validation;
+                    *result = verdict.validation;
+                    took = true;
                 }
+            }
+            if took {
+                piece.verified.extend(verdict.verified.iter().cloned());
             }
         }
         if waiting.is_empty() {
@@ -824,10 +839,10 @@ impl<V: Verify> Resolver<V> {
                     to,
                     check,
                     subject,
-                    validation,
+                    verdict,
                 } => {
                     if let resolution::Node::Asker(id) = to {
-                        self.asker_checked(id, check, &subject, validation, entropy);
+                        self.asker_checked(id, check, &subject, verdict, entropy);
                     }
                 }
             }

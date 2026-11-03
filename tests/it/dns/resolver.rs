@@ -4174,6 +4174,44 @@ fn an_expired_rrsig_beside_a_valid_one_leaves_a_secure_answers_ttl_alone() {
     }
 }
 
+/// An RRSIG inside its validity window whose signature does not verify
+/// proved nothing either: its small Original TTL does not shorten the
+/// Secure RRset beside it, fresh or from the cache (RFC 4035 §5.3.3).
+#[test]
+fn a_current_rrsig_that_does_not_verify_leaves_a_secure_answers_ttl_alone() {
+    // Made by the zone's own key over other records, so it names that key
+    // and its window is current, but it does not verify over www's A
+    // RRset. Its Original TTL is 60; the record itself has www's TTL.
+    let other = rrset("www.example.com.", 60, vec![a("192.0.2.81")]);
+    let zsk = keys(40).keys[1].clone();
+    let mut bad = sign(zsk.as_ref(), &other, &name("example.com."), window()).unwrap();
+    bad.ttl = 300;
+    let (mut net, anchors) = changed_example(move |req, message| {
+        if req.question.name() == &name("www.example.com.")
+            && req.question.query_type() == RecordType::A
+            && !message.answers.is_empty()
+        {
+            message.add_answer(bad.clone());
+        }
+    });
+    let mut resolver = resolver(config(anchors));
+    for (seconds, ttl) in [(0, 300), (100, 200)] {
+        let reply = ask(
+            &mut resolver,
+            &mut net,
+            seconds,
+            query(client(1), "www.example.com.", RecordType::A, dnssec_ok),
+        );
+        assert!(reply.metadata.authentic_data);
+        let a = reply
+            .answers
+            .iter()
+            .find(|record| record.record_type() == RecordType::A)
+            .unwrap();
+        assert_eq!(a.ttl, ttl, "at {seconds} s");
+    }
+}
+
 /// A wildcard answer whose authority section holds an NSEC RRset that
 /// does not verify is Bogus: its proof goes out with it, and AD may stand
 /// only when every RRset there is authentic (RFC 4035 §3.2.3).

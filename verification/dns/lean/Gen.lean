@@ -552,10 +552,47 @@ def zoneErrorStr : ZoneError → String
   | .ttlTooLarge _ _ => "ttl_too_large"
   | .missingApexNs => "missing_apex_ns"
 
+/-- A zone the builder refuses: an accepted zone changed to break one of the 12 rules, each as often as the
+others. Each change breaks only its own rule, so it is the one the builder reports. -/
+def rBroken : G Spec := do
+  let (sp, _) ← rZone
+  let apex := sp.apex
+  let other : Name := [lb "example", lb "net"]
+  let cut := lb "cut" :: apex
+  let addr (owner : Name) (ttl : Nat) : RRset := ⟨owner, 1, ttl, [.a [192, 0, 2, 9]]⟩
+  let add (sets : List RRset) : Spec := { sp with sets := sp.sets ++ sets }
+  match ← rNat 12 with
+  -- RFC 1034 §4.2: a record outside the zone.
+  | 0 => return add [addr [lb "elsewhere", lb "org"] 300]
+  -- RFC 1034 §3.6.2: a CNAME beside an address.
+  | 1 => return add [⟨lb "both" :: apex, 5, 300, [.cname other]⟩, addr (lb "both" :: apex) 300]
+  -- RFC 1912 §2.4: a CNAME at the apex.
+  | 2 => return add [⟨apex, 5, 300, [.cname other]⟩]
+  -- RFC 6672 §2.4: two DNAME records at one owner.
+  | 3 => return add [⟨lb "e" :: apex, 39, 300, [.dname other, .dname [lb "other", lb "org"]]⟩]
+  -- RFC 6672 §2.4: data below a DNAME.
+  | 4 => return add [⟨lb "e" :: apex, 39, 300, [.dname other]⟩, addr ([lb "x", lb "e"] ++ apex) 300]
+  -- RFC 1034 §4.2.1: data that is not glue below a cut.
+  | 5 => return { add [⟨lb "x" :: cut, 16, 300, [.txt [toBytes "x"]]⟩] with
+      delegations := sp.delegations ++ [⟨cut, 86400, [[lb "ns", lb "other", lb "org"]], [], none⟩] }
+  -- RFC 4035 §2.4: a DS RRset at a name that is no cut.
+  | 6 => return add [⟨lb "dsx" :: apex, 43, 300, [.ds 12345 13 2 (← rBytes 8)]⟩]
+  -- RFC 9471 §3.1: a nameserver below its own cut with no glue.
+  | 7 => return { sp with delegations := sp.delegations ++ [⟨cut, 86400, [lb "ns" :: cut], [], none⟩] }
+  -- RFC 2181 §10.3: an MX target that is an alias.
+  | 8 => return add [⟨lb "alias" :: apex, 5, 300, [.cname other]⟩,
+      ⟨lb "mx2" :: apex, 15, 300, [.mx 10 (lb "alias" :: apex)]⟩]
+  -- RFC 2181 §5.2: two TTLs in one RRset.
+  | 9 => return add [addr (lb "ttl" :: apex) 300, ⟨lb "ttl" :: apex, 1, 600, [.a [192, 0, 2, 10]]⟩]
+  -- RFC 2181 §8: a TTL of 2^31.
+  | 10 => return add [addr (lb "big" :: apex) maxTtl]
+  -- RFC 1034 §4.2.1: no NS RRset at the apex.
+  | _ => return { sp with sets := sp.sets.filter fun s => !(s.owner == apex && s.rtype == 2) }
+
 /-- A zone question, or now and then a zone the builder refuses, with the rule it breaks first. -/
 def zoneCase : G String := do
   if ← chance 8 then
-    let sp ← rSpec
+    let sp ← rBroken
     if let .error e := build sp then
       return jobj [("input", jobj [("zone", specJson sp)]), ("expected", jobj [("error", jstr (zoneErrorStr e))])]
   let (sp, z) ← rZone

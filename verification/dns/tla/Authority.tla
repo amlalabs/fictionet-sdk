@@ -418,6 +418,13 @@ RespondMonotone ==
     \A r \in Reqs : \A k, more \in Knowns(r) :
         (k \subseteq more /\ Respond(r, k) # "need") => Respond(r, more) = Respond(r, k)
 
+(* No ask goes out after its reply: once an ask's observation has come back *)
+(* to a request (the real server's reply, or Unreachable or Timeout in its  *)
+(* place), the request never sends that ask again in that generation. It    *)
+(* relates two states, so configs list it under PROPERTY.                   *)
+NoAskAfterReply ==
+    [][\A r \in Reqs : nAsks'[r] > nAsks[r] => Obs(known[r], AskOf(r)) = None]_vars
+
 (* A request sends one ask per Need, and in each generation needs each ask *)
 (* once: the relayed question, or the DS ask and, at a server that does not *)
 (* serve fict's parent, the relayed question after it.                      *)
