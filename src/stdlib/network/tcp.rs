@@ -58,7 +58,7 @@ use std::task::{Context, Poll, Waker};
 use smoltcp::iface::{Config, Interface as Iface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, RxToken, TxToken};
 use smoltcp::socket::tcp::{self as stcp, State as TcpState};
-use smoltcp::wire::{Ipv4Packet, TcpPacket, TcpRepr};
+use smoltcp::wire::{Ipv4Packet, TcpOption as WireOption, TcpPacket, TcpRepr};
 
 use fictionet::CancelWait;
 use fictionet::stdlib::network::ip::{
@@ -110,6 +110,105 @@ const EPHEMERAL: u16 = 49152;
 /// Dropped TIME-WAIT sockets per endpoint. Past this limit, those first
 /// seen in TIME-WAIT by housekeeping are forgotten first.
 const MAX_TIME_WAIT: usize = 1024;
+
+/// The option bytes [`Listener::answer_syn`] can add to a SYN-ACK: what
+/// the 40 bytes of option space leave beside the endpoint's own options.
+pub const SYN_OPTIONS_ROOM: usize = stcp::SYN_OPTIONS_ROOM;
+
+/// One option of a TCP header (RFC 9293 section 3.1): one a peer's SYN
+/// carried ([`TcpConnection::syn_options`]), or one a listener adds to
+/// its SYN-ACK ([`Listener::answer_syn`]). End of Option List is not one:
+/// the list just ends there.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum TcpOption {
+    /// No-Operation (kind 1), which pads the next option to a word.
+    NoOperation,
+    /// Maximum Segment Size (kind 2).
+    MaxSegmentSize(u16),
+    /// Window Scale (kind 3, RFC 7323): the shift as sent, even over 14.
+    WindowScale(u8),
+    /// SACK-Permitted (kind 4, RFC 2018).
+    SackPermitted,
+    /// SACK (kind 5, RFC 2018): one to four blocks, each a left and a
+    /// right edge.
+    Sack(Vec<(u32, u32)>),
+    /// Timestamps (kind 8, RFC 7323).
+    Timestamps {
+        /// TSval, the sender's clock.
+        tsval: u32,
+        /// TSecr, the TSval it echoes.
+        tsecr: u32,
+    },
+    /// Any other kind, such as MPTCP's 30 (RFC 8684), or Timestamps of a
+    /// length other than 10: the bytes after Kind and Length.
+    Unknown {
+        /// The option's kind.
+        kind: u8,
+        /// The bytes after Kind and Length.
+        data: Vec<u8>,
+    },
+}
+
+impl TcpOption {
+    /// The option smoltcp read, or `None` for End of Option List.
+    fn from_wire(option: WireOption) -> Option<TcpOption> {
+        Some(match option {
+            WireOption::EndOfList => return None,
+            WireOption::NoOperation => TcpOption::NoOperation,
+            WireOption::MaxSegmentSize(mss) => TcpOption::MaxSegmentSize(mss),
+            WireOption::WindowScale(shift) => TcpOption::WindowScale(shift),
+            WireOption::SackPermitted => TcpOption::SackPermitted,
+            WireOption::SackRange(blocks) => {
+                TcpOption::Sack(blocks.into_iter().flatten().collect())
+            }
+            WireOption::TimeStamp { tsval, tsecr } => TcpOption::Timestamps { tsval, tsecr },
+            WireOption::Unknown { kind, data } => TcpOption::Unknown {
+                kind,
+                data: data.to_vec(),
+            },
+        })
+    }
+
+    /// The option for smoltcp to write, or `None` for SACK without one to
+    /// four blocks.
+    fn to_wire(&self) -> Option<WireOption<'_>> {
+        Some(match self {
+            TcpOption::NoOperation => WireOption::NoOperation,
+            TcpOption::MaxSegmentSize(mss) => WireOption::MaxSegmentSize(*mss),
+            TcpOption::WindowScale(shift) => WireOption::WindowScale(*shift),
+            TcpOption::SackPermitted => WireOption::SackPermitted,
+            TcpOption::Sack(blocks) => {
+                if blocks.is_empty() || blocks.len() > 4 {
+                    return None;
+                }
+                let mut wire = [None; 4];
+                for (slot, block) in wire.iter_mut().zip(blocks) {
+                    *slot = Some(*block);
+                }
+                WireOption::SackRange(wire)
+            }
+            TcpOption::Timestamps { tsval, tsecr } => WireOption::TimeStamp {
+                tsval: *tsval,
+                tsecr: *tsecr,
+            },
+            TcpOption::Unknown { kind, data } => WireOption::Unknown { kind: *kind, data },
+        })
+    }
+}
+
+/// The options of `segment`, a TCP segment that smoltcp parsed.
+fn segment_options(segment: &[u8]) -> Arc<[TcpOption]> {
+    let Ok(options) = TcpPacket::new_unchecked(segment).options_iter() else {
+        return Arc::default();
+    };
+    options
+        .map_while(Result::ok)
+        .filter_map(TcpOption::from_wire)
+        .collect()
+}
+
+/// What [`Listener::answer_syn`] keeps.
+type AnswerSyn = Box<dyn Fn(&[TcpOption]) -> Vec<TcpOption> + Send>;
 
 /// Starts TCP for a machine with address `addr`, on the TCP packets of
 /// `inner`.
@@ -441,6 +540,8 @@ struct Listen {
     /// How many of `embryonic` and `ready` each peer address has.
     per_peer: HashMap<IpAddr, usize>,
     waker: Option<Waker>,
+    /// Options for SYN-ACKs: [`Listener::answer_syn`].
+    answer: Option<AnswerSyn>,
 }
 
 impl Listen {
@@ -495,6 +596,8 @@ struct Conn {
     iss: Option<u32>,
     /// An ICMPv4 destination-unreachable code for this pending connect.
     unreachable: Option<u8>,
+    /// The options of the peer's SYN, for a connection a listener took.
+    syn: Arc<[TcpOption]>,
     /// Kept until retirement or socket removal, after handle drop too: see
     /// [`TcpConnection::hold_until_gone`].
     held: Vec<Box<dyn std::any::Any + Send>>,
@@ -521,6 +624,7 @@ impl Conn {
             side,
             iss: None,
             unreachable: None,
+            syn: Arc::default(),
             held: Vec::new(),
             gone: Vec::new(),
         }
@@ -961,6 +1065,7 @@ impl State {
         let flags = t[13];
         let (syn, rst, ack) = (flags & 6 == 2, flags & 4 != 0, flags & 16 != 0);
         let mut listening = false;
+        let mut syn_options = Arc::default();
         if syn
             && !self.by_tuple.contains_key(&(dst, src))
             && !ack
@@ -973,6 +1078,7 @@ impl State {
                 return false;
             }
             listening = true;
+            syn_options = segment_options(t);
             if l.idle.is_empty() && l.embryonic.len() + l.ready.len() < self.backlog {
                 let mut s = new_socket(self.buffer);
                 s.0.listen(dst.port()).expect("a new socket can listen");
@@ -1055,8 +1161,18 @@ impl State {
                 let local = s.local_endpoint().map(SocketAddr::from).unwrap_or(dst);
                 let remote = s.remote_endpoint().map(SocketAddr::from).unwrap_or(src);
                 *l.per_peer.entry(remote.ip()).or_default() += 1;
-                self.conns.insert(h, Conn::new(local, remote, Side::Server));
+                let answer = l.answer.as_ref().map(|answer| answer(&syn_options));
+                let mut conn = Conn::new(local, remote, Side::Server);
+                conn.syn = syn_options;
+                self.conns.insert(h, conn);
                 self.by_tuple.insert((local, remote), h);
+                if let Some(answer) = answer {
+                    let wire: Option<Vec<_>> = answer.iter().map(TcpOption::to_wire).collect();
+                    let set = wire.map(|wire| self.sock(h).set_syn_options(&wire));
+                    if set != Some(Ok(())) {
+                        self.abort(h);
+                    }
+                }
             }
         }
         data
@@ -1395,6 +1511,7 @@ impl Endpoint {
                 handle: h,
                 local,
                 remote: to,
+                syn_options: Arc::default(),
                 read_wait: CancelWait::default(),
                 write_wait: CancelWait::default(),
             }
@@ -1439,6 +1556,28 @@ pub struct Listener {
 }
 
 impl Listener {
+    /// Adds options to the SYN-ACK of each connection attempt from now on,
+    /// and to its retransmissions. `answer` gets the options of the
+    /// attempt's SYN and returns the ones to add after the endpoint's own
+    /// (Maximum Segment Size, and Window Scale and SACK-Permitted when the
+    /// SYN offered them). A server for MPTCP (RFC 8684) answers an
+    /// MP_CAPABLE option with its own here. `answer` runs once per
+    /// attempt: a copy of the SYN does not run it again.
+    ///
+    /// `answer` runs inside the endpoint with its lock held, so it must not
+    /// use the endpoint or its connections. What it returns must fit in
+    /// [`SYN_OPTIONS_ROOM`] bytes and read back as written: an
+    /// [`Unknown`](TcpOption::Unknown) option may not have kind 0 or 1 or
+    /// the bytes of a known option, and SACK has one to four blocks.
+    /// Otherwise that attempt gets a RST.
+    pub fn answer_syn(&mut self, answer: impl Fn(&[TcpOption]) -> Vec<TcpOption> + Send + 'static) {
+        let mut st = self.shared.state.lock();
+        st.listeners
+            .get_mut(&self.port)
+            .expect("a listener has its port")
+            .answer = Some(Box::new(answer));
+    }
+
     /// Waits for the next connection.
     ///
     /// Returns early with [`ConnError::Cancelled`] if `fcx`'s
@@ -1470,7 +1609,7 @@ impl Listener {
                     .expect("a listener has its port");
                 if let Some(h) = l.ready.pop_front() {
                     let c = &st.conns[&h];
-                    let (local, remote) = (c.local, c.remote);
+                    let (local, remote, syn_options) = (c.local, c.remote, c.syn.clone());
                     st.listeners
                         .get_mut(&port)
                         .expect("a listener has its port")
@@ -1480,6 +1619,7 @@ impl Listener {
                         handle: h,
                         local,
                         remote,
+                        syn_options,
                         read_wait: CancelWait::default(),
                         write_wait: CancelWait::default(),
                     }));
@@ -1513,6 +1653,10 @@ impl fictionet::stdlib::network::Accepted for TcpConnection {
 
     fn peer_addr(&self) -> SocketAddr {
         TcpConnection::peer_addr(self)
+    }
+
+    fn syn_options(&self) -> Arc<[TcpOption]> {
+        TcpConnection::syn_options(self)
     }
 
     fn reset(self) {
@@ -1550,6 +1694,7 @@ pub struct TcpConnection {
     handle: Id,
     local: SocketAddr,
     remote: SocketAddr,
+    syn_options: Arc<[TcpOption]>,
     read_wait: CancelWait,
     write_wait: CancelWait,
 }
@@ -1563,6 +1708,13 @@ impl TcpConnection {
     /// This side's address and port.
     pub fn local_addr(&self) -> SocketAddr {
         self.local
+    }
+
+    /// The options of the SYN that opened the connection, in the order the
+    /// peer sent them, for one a listener accepted. Empty for one this side
+    /// opened.
+    pub fn syn_options(&self) -> Arc<[TcpOption]> {
+        self.syn_options.clone()
     }
 
     /// Closes the connection with a RST immediately and wakes disappearance
@@ -2640,6 +2792,7 @@ mod tests {
                     handle: h,
                     local,
                     remote: peer,
+                    syn_options: Arc::default(),
                     read_wait: CancelWait::default(),
                     write_wait: CancelWait::default(),
                 };

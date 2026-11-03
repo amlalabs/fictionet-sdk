@@ -24,6 +24,8 @@ pub trait Accepted: Connection {
     fn local_addr(&self) -> std::net::SocketAddr;
     /// The peer's address.
     fn peer_addr(&self) -> std::net::SocketAddr;
+    /// The options of the peer's SYN, in the order it sent them.
+    fn syn_options(&self) -> std::sync::Arc<[super::tcp::TcpOption]>;
     /// Resets the connection without waiting for a graceful close.
     fn reset(self);
     /// Retains `item` until the transport is gone, including after this

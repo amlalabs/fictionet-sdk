@@ -1253,8 +1253,10 @@ async fn accept(
                 };
                 let hooks = &admission.hooks;
                 let sandbox = Some(hooks.sandbox_at(conn.peer_addr().ip()));
-                let info = ConnInfo::new(hooks.next_conn(), conn.local_addr(), conn.peer_addr())
-                    .from_sandbox(sandbox);
+                let mut info =
+                    ConnInfo::new(hooks.next_conn(), conn.local_addr(), conn.peer_addr())
+                        .from_sandbox(sandbox);
+                info.syn_options = conn.syn_options();
                 let accepted = fcx.now();
                 let handshake = machine.handshake;
                 let port = port.clone();

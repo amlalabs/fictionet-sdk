@@ -112,6 +112,11 @@ mod field {
 
 pub(crate) const HEADER_LEN: usize = field::URGENT.end;
 
+/// The most option bytes a header holds. The data offset counts 32-bit
+/// words in four bits, so a header is at most 60 bytes (RFC 9293 section
+/// 3.1), and the fixed part takes 20 of them.
+pub const OPTIONS_MAX_LEN: usize = 40;
+
 impl<T: AsRef<[u8]>> Packet<T> {
     /// Imbue a raw octet buffer with TCP packet structure.
     pub const fn new_unchecked(buffer: T) -> Packet<T> {
@@ -270,7 +275,9 @@ impl<T: AsRef<[u8]>> Packet<T> {
                 TcpOption::MaxSegmentSize(mss) => summary.max_segment_size = Some(mss),
                 TcpOption::WindowScale(ws) => summary.window_scale = Some(ws),
                 TcpOption::SackPermitted => summary.sack_permitted = true,
-                TcpOption::SackRange(ranges) => summary.sack_ranges = ranges,
+                TcpOption::SackRange([first, second, third, _]) => {
+                    summary.sack_ranges = [first, second, third]
+                }
                 TcpOption::TimeStamp { tsval, tsecr } => summary.timestamp = Some((tsval, tsecr)),
                 TcpOption::Unknown { .. } => {}
             }
@@ -307,6 +314,14 @@ impl<'a, T: AsRef<[u8]> + ?Sized> Packet<&'a T> {
         let header_len = self.header_len();
         let data = self.buffer.as_ref();
         &data[field::OPTIONS(header_len)]
+    }
+
+    /// Return the options, in the order they appear, unknown kinds
+    /// included. Fails if the buffer is shorter than the fixed header or
+    /// the header length field says, or that field is under 20.
+    pub fn options_iter(&self) -> Result<TcpOptions<'a>> {
+        self.check_len()?;
+        Ok(TcpOptions::new(self.options()))
     }
 
     /// Return a pointer to the payload.
@@ -543,14 +558,23 @@ pub struct TcpOptionSummary {
 
 /// A representation of a single TCP option.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub(crate) enum TcpOption<'a> {
+pub enum TcpOption<'a> {
+    /// End of Option List: kind 0, one byte.
     EndOfList,
+    /// No-Operation: kind 1, one byte.
     NoOperation,
+    /// Maximum Segment Size: kind 2 (RFC 9293).
     MaxSegmentSize(u16),
+    /// Window Scale: kind 3 (RFC 7323).
     WindowScale(u8),
+    /// SACK-Permitted: kind 4 (RFC 2018).
     SackPermitted,
-    SackRange([Option<(u32, u32)>; 3]),
+    /// SACK: kind 5 (RFC 2018). The 40 option bytes hold at most four blocks.
+    SackRange([Option<(u32, u32)>; 4]),
+    /// Timestamps: kind 8 (RFC 7323).
     TimeStamp { tsval: u32, tsecr: u32 },
+    /// Any other kind, or Timestamps of another length: the bytes after
+    /// Kind and Length.
     Unknown { kind: u8, data: &'a [u8] },
 }
 
@@ -583,8 +607,8 @@ impl<'a> TcpOption<'a> {
                         if n < 10 || (n - 2) % 8 != 0 {
                             return Err(Error);
                         }
-                        // Keep up to three SACK blocks; RFC 2018 permits four without timestamps.
-                        let mut sack_ranges: [Option<(u32, u32)>; 3] = [None; 3];
+                        // Four blocks fill the option space; Repr keeps the first three.
+                        let mut sack_ranges: [Option<(u32, u32)>; 4] = [None; 4];
 
                         sack_ranges.iter_mut().enumerate().for_each(|(i, nmut)| {
                             let left = i * 8;
@@ -687,6 +711,44 @@ impl<'a> TcpOption<'a> {
     }
 }
 
+/// The options of one header, in order. Ends at End of Option List or at
+/// the end of the option space, and after the first malformed option,
+/// which it returns as an error.
+#[derive(Debug, Clone)]
+pub struct TcpOptions<'a> {
+    rest: &'a [u8],
+}
+
+impl<'a> TcpOptions<'a> {
+    pub(crate) fn new(area: &'a [u8]) -> TcpOptions<'a> {
+        TcpOptions { rest: area }
+    }
+}
+
+impl<'a> Iterator for TcpOptions<'a> {
+    type Item = Result<TcpOption<'a>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.rest.is_empty() {
+            return None;
+        }
+        match TcpOption::parse(self.rest) {
+            Ok((_, TcpOption::EndOfList)) => {
+                self.rest = &[];
+                None
+            }
+            Ok((rest, option)) => {
+                self.rest = rest;
+                Some(Ok(option))
+            }
+            Err(e) => {
+                self.rest = &[];
+                Some(Err(e))
+            }
+        }
+    }
+}
+
 /// The possible control flags of a Transmission Control Protocol packet.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(crate) enum Control {
@@ -730,6 +792,10 @@ pub struct Repr<'a> {
     pub(crate) sack_permitted: bool,
     pub(crate) sack_ranges: [Option<(u32, u32)>; 3],
     pub(crate) timestamp: Option<TcpTimestampRepr>,
+    /// Options emitted after the ones above, already encoded: whole
+    /// options, with no End of Option List. [`Repr::parse`] leaves this
+    /// empty; [`Packet::options_iter`] reads every option of a segment.
+    pub(crate) extra: &'a [u8],
     pub payload: &'a [u8],
 }
 
@@ -814,11 +880,14 @@ impl<'a> Repr<'a> {
                     window_scale = Some(value.min(14));
                 }
                 TcpOption::SackPermitted => sack_permitted = true,
-                TcpOption::SackRange(slice) => sack_ranges = slice,
+                TcpOption::SackRange([first, second, third, _]) => {
+                    sack_ranges = [first, second, third]
+                }
                 TcpOption::TimeStamp { tsval, tsecr } => {
                     timestamp = Some(TcpTimestampRepr::new(tsval, tsecr));
                 }
-                _ => (),
+                // The socket has no use for them; `Packet::options_iter` has them.
+                TcpOption::Unknown { .. } => (),
             }
             options = next_options;
         }
@@ -835,6 +904,7 @@ impl<'a> Repr<'a> {
             sack_permitted,
             sack_ranges,
             timestamp,
+            extra: &[],
             payload: packet.payload(),
         })
     }
@@ -865,6 +935,7 @@ impl<'a> Repr<'a> {
         if sack_range_len > 0 {
             length += sack_range_len + 2;
         }
+        length += self.extra.len();
         if !length.is_multiple_of(4) {
             length += 4 - length % 4;
         }
@@ -890,6 +961,8 @@ impl<'a> Repr<'a> {
         packet.set_seq_number(self.seq_number);
         packet.set_ack_number(self.ack_number.unwrap_or(SeqNumber(0)));
         packet.set_window_len(self.window_len);
+        // The data offset holds no more; sockets keep their options within it.
+        debug_assert!(self.header_len() <= HEADER_LEN + OPTIONS_MAX_LEN);
         packet.set_header_len(self.header_len() as u8);
         packet.clear_flags();
         match self.control {
@@ -916,7 +989,8 @@ impl<'a> Repr<'a> {
                 options = TcpOption::SackPermitted.emit(tmp);
             } else if self.ack_number.is_some() && self.sack_ranges.iter().any(|s| s.is_some()) {
                 let tmp = options;
-                options = TcpOption::SackRange(self.sack_ranges).emit(tmp);
+                let [first, second, third] = self.sack_ranges;
+                options = TcpOption::SackRange([first, second, third, None]).emit(tmp);
             }
             if let Some(timestamp) = self.timestamp {
                 let tmp = options;
@@ -926,6 +1000,9 @@ impl<'a> Repr<'a> {
                 }
                 .emit(tmp);
             }
+            let (extra, rest) = options.split_at_mut(self.extra.len());
+            extra.copy_from_slice(self.extra);
+            options = rest;
 
             if !options.is_empty() {
                 TcpOption::EndOfList.emit(options);
@@ -1068,6 +1145,7 @@ mod test {
             max_seg_size: None,
             sack_permitted: false,
             sack_ranges: [None, None, None],
+            extra: &[],
             timestamp: None,
             payload: &PAYLOAD_BYTES,
         }
@@ -1125,11 +1203,11 @@ mod test {
         assert_option_parses!(TcpOption::WindowScale(12), &[0x03, 0x03, 0x0c]);
         assert_option_parses!(TcpOption::SackPermitted, &[0x4, 0x02]);
         assert_option_parses!(
-            TcpOption::SackRange([Some((500, 1500)), None, None]),
+            TcpOption::SackRange([Some((500, 1500)), None, None, None]),
             &[0x05, 0x0a, 0x00, 0x00, 0x01, 0xf4, 0x00, 0x00, 0x05, 0xdc]
         );
         assert_option_parses!(
-            TcpOption::SackRange([Some((875, 1225)), Some((1500, 2500)), None]),
+            TcpOption::SackRange([Some((875, 1225)), Some((1500, 2500)), None, None]),
             &[
                 0x05, 0x12, 0x00, 0x00, 0x03, 0x6b, 0x00, 0x00, 0x04, 0xc9, 0x00, 0x00, 0x05, 0xdc,
                 0x00, 0x00, 0x09, 0xc4
@@ -1139,7 +1217,8 @@ mod test {
             TcpOption::SackRange([
                 Some((875000, 1225000)),
                 Some((1500000, 2500000)),
-                Some((876543210, 876654320))
+                Some((876543210, 876654320)),
+                None
             ]),
             &[
                 0x05, 0x1a, 0x00, 0x0d, 0x59, 0xf8, 0x00, 0x12, 0xb1, 0x28, 0x00, 0x16, 0xe3, 0x60,
@@ -1175,6 +1254,182 @@ mod test {
         assert_eq!(TcpOption::parse(&[0xc, 0x01]), Err(Error));
         assert_eq!(TcpOption::parse(&[0x2, 0x02]), Err(Error));
         assert_eq!(TcpOption::parse(&[0x3, 0x02]), Err(Error));
+    }
+
+    #[test]
+    fn test_four_sack_blocks() {
+        let mut bytes = vec![5, 34];
+        for n in 1..=8u32 {
+            bytes.extend_from_slice(&n.to_be_bytes());
+        }
+        assert_option_parses!(
+            TcpOption::SackRange([Some((1, 2)), Some((3, 4)), Some((5, 6)), Some((7, 8))]),
+            &bytes[..]
+        );
+    }
+
+    /// A SYN as Linux sends it with MPTCP, then End of Option List and
+    /// padding that is not read.
+    #[test]
+    fn test_options_iter_keeps_unknown_kinds() {
+        let options = [
+            2, 4, 5, 0xb4, 4, 2, 1, 3, 3, 7, 30, 4, 0x01, 0x81, 1, 0, 30, 2, 0xff, 0xff,
+        ];
+        let mut bytes = vec![0; 20 + options.len()];
+        let mut packet = Packet::new_unchecked(&mut bytes);
+        packet.set_header_len(40);
+        packet.options_mut().copy_from_slice(&options);
+        let packet = Packet::new_unchecked(&bytes[..]);
+        let read: Vec<_> = packet.options_iter().unwrap().collect();
+        assert_eq!(
+            read,
+            [
+                Ok(TcpOption::MaxSegmentSize(1460)),
+                Ok(TcpOption::SackPermitted),
+                Ok(TcpOption::NoOperation),
+                Ok(TcpOption::WindowScale(7)),
+                Ok(TcpOption::Unknown {
+                    kind: 30,
+                    data: &[0x01, 0x81]
+                }),
+                Ok(TcpOption::NoOperation),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_options_iter_ends_at_a_malformed_option() {
+        let mut bytes = vec![0; 28];
+        let mut packet = Packet::new_unchecked(&mut bytes);
+        packet.set_header_len(28);
+        packet
+            .options_mut()
+            .copy_from_slice(&[1, 30, 9, 0, 0, 1, 1, 1]);
+        let packet = Packet::new_unchecked(&bytes[..]);
+        let read: Vec<_> = packet.options_iter().unwrap().collect();
+        assert_eq!(read, [Ok(TcpOption::NoOperation), Err(Error)]);
+    }
+
+    #[test]
+    fn test_options_iter_checks_the_header_length() {
+        for len in 0..64 {
+            for offset in 0..16u8 {
+                let mut bytes = vec![0; len.max(20)];
+                Packet::new_unchecked(&mut bytes).set_header_len(offset * 4);
+                bytes.truncate(len);
+                let packet = Packet::new_unchecked(&bytes[..]);
+                let fits = len >= 20 && (5..=len / 4).contains(&(offset as usize));
+                assert_eq!(packet.options_iter().is_ok(), fits, "{len} {offset}");
+            }
+        }
+    }
+
+    /// The bytes of a header with every option area a peer can send: no
+    /// parse panics, and `Repr::parse` succeeds exactly when every option
+    /// reads.
+    #[test]
+    fn test_hostile_option_areas() {
+        fn check(options: &[u8]) {
+            let mut bytes = vec![0; 20 + options.len()];
+            let mut packet = Packet::new_unchecked(&mut bytes);
+            packet.set_src_port(1);
+            packet.set_dst_port(2);
+            packet.set_header_len(20 + options.len() as u8);
+            packet.set_syn(true);
+            packet.options_mut().copy_from_slice(options);
+            packet.fill_checksum(&SRC_ADDR.into(), &DST_ADDR.into());
+            let packet = Packet::new_unchecked(&bytes[..]);
+            let read: Vec<_> = packet.options_iter().unwrap().collect();
+            let repr = Repr::parse(&packet, &SRC_ADDR.into(), &DST_ADDR.into());
+            assert_eq!(repr.is_ok(), read.iter().all(Result::is_ok), "{options:?}");
+            assert!(read.iter().filter(|o| o.is_err()).count() <= 1);
+            let _ = packet.options_summary();
+        }
+        // Every kind and length at the start of a full option area, with
+        // the rest of the area all zeros and all ones.
+        for kind in 0..=255u8 {
+            for length in 0..=255u8 {
+                for fill in [0, 0xff] {
+                    let mut options = [fill; OPTIONS_MAX_LEN];
+                    options[0] = kind;
+                    options[1] = length;
+                    check(&options);
+                }
+            }
+        }
+        // Random areas of every length that fits the data offset.
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as u8
+        };
+        for _ in 0..20_000 {
+            let len = 4 * (next() as usize % 11);
+            let options: Vec<u8> = (0..len)
+                .map(|_| match next() % 4 {
+                    // Small values make plausible kinds and lengths.
+                    0 => next() % 12,
+                    1 => 30,
+                    _ => next(),
+                })
+                .collect();
+            check(&options);
+        }
+    }
+
+    /// Extra options go after the standard ones and count in the header
+    /// length, which stays a multiple of four.
+    #[test]
+    fn test_extra_options_emit() {
+        let extra = [1, 30, 12, 0x01, 0x01, 1, 2, 3, 4, 5, 6, 7, 8];
+        for (repr, header_len) in [
+            (
+                Repr {
+                    extra: &extra,
+                    ..packet_repr()
+                },
+                36,
+            ),
+            (
+                Repr {
+                    max_seg_size: Some(1460),
+                    window_scale: Some(7),
+                    sack_permitted: true,
+                    timestamp: Some(TcpTimestampRepr::new(1, 2)),
+                    extra: &extra,
+                    ..packet_repr()
+                },
+                52,
+            ),
+        ] {
+            assert_eq!(repr.header_len(), header_len);
+            let mut bytes = vec![0xa5; repr.buffer_len()];
+            repr.emit(
+                &mut Packet::new_unchecked(&mut bytes),
+                &SRC_ADDR.into(),
+                &DST_ADDR.into(),
+            );
+            let packet = Packet::new_checked(&bytes[..]).unwrap();
+            assert_eq!(packet.header_len() as usize, header_len);
+            let read: Vec<_> = packet.options_iter().unwrap().map(Result::unwrap).collect();
+            assert_eq!(
+                &read[read.len() - 2..],
+                [
+                    TcpOption::NoOperation,
+                    TcpOption::Unknown {
+                        kind: 30,
+                        data: &extra[3..]
+                    }
+                ]
+            );
+            assert_eq!(packet.payload(), &PAYLOAD_BYTES[..]);
+            assert_eq!(
+                Repr::parse(&packet, &SRC_ADDR.into(), &DST_ADDR.into()),
+                Ok(Repr { extra: &[], ..repr })
+            );
+        }
     }
 
     #[test]

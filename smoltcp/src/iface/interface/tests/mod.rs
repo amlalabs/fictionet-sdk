@@ -16,6 +16,7 @@ fn tcp_not_accepted() {
         max_seg_size: None,
         sack_permitted: false,
         sack_ranges: [None, None, None],
+        extra: &[],
         timestamp: None,
         payload: &[],
     };
@@ -60,6 +61,7 @@ fn tcp_not_accepted() {
                 max_seg_size: None,
                 sack_permitted: false,
                 sack_ranges: [None, None, None],
+                extra: &[],
                 timestamp: None,
                 payload: &[],
             }
@@ -112,6 +114,7 @@ fn tcp_listen_drops_unspecified_src() {
         max_seg_size: Some(1460),
         sack_permitted: false,
         sack_ranges: [None, None, None],
+        extra: &[],
         timestamp: None,
         payload: &[],
     };
@@ -154,6 +157,7 @@ fn syn_bytes(ip: IpRepr) -> std::vec::Vec<u8> {
         max_seg_size: None,
         sack_permitted: false,
         sack_ranges: [None; 3],
+        extra: &[],
         timestamp: None,
         payload: &[],
     };

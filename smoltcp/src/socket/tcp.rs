@@ -9,8 +9,9 @@ use crate::socket::WakerRegistration;
 use crate::storage::{Assembler, RingBuffer};
 use crate::time::{Duration, Instant};
 use crate::wire::{
-    IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol, IpRepr, TCP_HEADER_LEN, TcpControl,
-    TcpRepr, TcpSeqNumber, TcpTimestampGenerator, TcpTimestampRepr,
+    IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol, IpRepr, TCP_HEADER_LEN,
+    TCP_OPTIONS_MAX_LEN, TcpControl, TcpOption, TcpOptions, TcpRepr, TcpSeqNumber,
+    TcpTimestampGenerator, TcpTimestampRepr,
 };
 
 mod reno;
@@ -84,6 +85,32 @@ impl Display for RecvError {
 }
 
 impl core::error::Error for RecvError {}
+
+/// Error returned by [`Socket::set_syn_options`]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum SynOptionsError {
+    /// They take more than [`SYN_OPTIONS_ROOM`] bytes.
+    TooLong,
+    /// One would not read back as itself: End of Option List, an unknown
+    /// kind 0 or 1, or the bytes of a known option written as unknown.
+    Unreadable,
+}
+
+impl Display for SynOptionsError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            SynOptionsError::TooLong => write!(f, "options do not fit in a SYN"),
+            SynOptionsError::Unreadable => write!(f, "an option would not read back as written"),
+        }
+    }
+}
+
+impl core::error::Error for SynOptionsError {}
+
+/// The option bytes a SYN or SYN-ACK always has room for beside the
+/// socket's own: Maximum Segment Size (4), Window Scale (3),
+/// SACK-Permitted (2) and Timestamps (10) leave 21 of the 40.
+pub const SYN_OPTIONS_ROOM: usize = TCP_OPTIONS_MAX_LEN - 19;
 
 /// A TCP socket ring buffer.
 pub type SocketBuffer<'a> = RingBuffer<'a>;
@@ -481,6 +508,10 @@ pub struct Socket<'a> {
     /// 0 if not seen or timestamp not enabled
     last_remote_tsval: u32,
 
+    /// Options added to this connection's SYN or SYN-ACK, encoded: see
+    /// [`Socket::set_syn_options`].
+    syn_options: Vec<u8>,
+
     rx_waker: WakerRegistration,
 
     tx_waker: WakerRegistration,
@@ -545,6 +576,7 @@ impl<'a> Socket<'a> {
             tsval_generator: None,
             last_remote_tsval: 0,
             congestion_controller: reno::Reno::new(),
+            syn_options: Vec::new(),
 
             rx_waker: WakerRegistration::new(),
 
@@ -560,6 +592,34 @@ impl<'a> Socket<'a> {
     /// Return whether TCP Timestamp is enabled.
     pub fn timestamp_enabled(&self) -> bool {
         self.tsval_generator.is_some()
+    }
+
+    /// Adds `options` to this connection's SYN or SYN-ACK, and to every
+    /// retransmission of it, after the socket's own options. Set them
+    /// once the connection exists: after [`connect`](Socket::connect), or
+    /// once a SYN has moved a listening socket to SYN-RECEIVED. The socket
+    /// drops them when it forgets the connection.
+    ///
+    /// Fails, changing nothing, if they take more than
+    /// [`SYN_OPTIONS_ROOM`] bytes or one would not read back as written.
+    pub fn set_syn_options(&mut self, options: &[TcpOption]) -> Result<(), SynOptionsError> {
+        let len: usize = options.iter().map(TcpOption::buffer_len).sum();
+        if len > SYN_OPTIONS_ROOM {
+            return Err(SynOptionsError::TooLong);
+        }
+        let mut encoded = vec![0; len];
+        let mut rest = &mut encoded[..];
+        for option in options {
+            rest = option.emit(rest);
+        }
+        if !TcpOptions::new(&encoded)
+            .map(|o| o.ok())
+            .eq(options.iter().map(|&o| Some(o)))
+        {
+            return Err(SynOptionsError::Unreadable);
+        }
+        self.syn_options = encoded;
+        Ok(())
     }
 
     /// Register a waker for receive operations.
@@ -785,6 +845,7 @@ impl<'a> Socket<'a> {
         self.closed_before_syn_ack = false;
         self.last_remote_tsval = 0;
         self.congestion_controller = reno::Reno::new();
+        self.syn_options = Vec::new();
 
         {
             self.rx_waker.wake();
@@ -1123,6 +1184,7 @@ impl<'a> Socket<'a> {
             max_seg_size: None,
             sack_permitted: false,
             sack_ranges: [None, None, None],
+            extra: &[],
             timestamp: None,
             payload: &[],
         };
@@ -2065,6 +2127,7 @@ impl<'a> Socket<'a> {
             max_seg_size: None,
             sack_permitted: false,
             sack_ranges: [None, None, None],
+            extra: &[],
             timestamp: TcpTimestampRepr::generate_reply_with_tsval(
                 self.tsval_generator,
                 self.last_remote_tsval,
@@ -2196,6 +2259,7 @@ impl<'a> Socket<'a> {
             // Fill the MSS option. See RFC 6691 for an explanation of this calculation.
             let max_segment_size = cx.ip_mtu() - ip_repr.header_len() - TCP_HEADER_LEN;
             repr.max_seg_size = Some(max_segment_size as u16);
+            repr.extra = &self.syn_options;
         }
 
         // Advance send state only after the device accepts the packet.
@@ -2364,6 +2428,7 @@ mod test {
         max_seg_size: None,
         sack_permitted: false,
         sack_ranges: [None, None, None],
+        extra: &[],
         timestamp: None,
         payload: &[],
     };
@@ -2378,6 +2443,7 @@ mod test {
         max_seg_size: None,
         sack_permitted: false,
         sack_ranges: [None, None, None],
+        extra: &[],
         timestamp: None,
         payload: &[],
     };
@@ -2974,6 +3040,7 @@ mod test {
         let parsed = TcpRepr::parse(&packet, &REMOTE_ADDR.into(), &LOCAL_ADDR.into()).unwrap();
         TcpRepr {
             payload: &[],
+            extra: &[],
             ..parsed
         }
     }
@@ -3166,6 +3233,222 @@ mod test {
         assert_eq!(s.state, State::Listen);
         assert_eq!(s.listen_endpoint, LISTEN_END);
         assert_eq!(s.tuple, None);
+    }
+
+    /// An MPTCP MP_CAPABLE option as a listener answers with it (RFC 8684
+    /// section 3.1): kind 30, length 12, version 1, flag H, an 8-byte key.
+    const MP_CAPABLE: TcpOption<'static> = TcpOption::Unknown {
+        kind: 30,
+        data: &[0x01, 0x01, 1, 2, 3, 4, 5, 6, 7, 8],
+    };
+    const MP_CAPABLE_BYTES: &[u8] = &[30, 12, 0x01, 0x01, 1, 2, 3, 4, 5, 6, 7, 8];
+
+    #[test]
+    fn test_syn_options_ride_the_syn_ack_and_its_retransmission() {
+        let mut s = socket_listen();
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: None,
+                ..SEND_TEMPL
+            }
+        );
+        s.set_syn_options(&[TcpOption::NoOperation, MP_CAPABLE])
+            .unwrap();
+        let syn_ack = TcpRepr {
+            control: TcpControl::Syn,
+            seq_number: LOCAL_SEQ,
+            ack_number: Some(REMOTE_SEQ + 1),
+            max_seg_size: Some(BASE_MSS),
+            extra: &[1, 30, 12, 0x01, 0x01, 1, 2, 3, 4, 5, 6, 7, 8],
+            ..RECV_TEMPL
+        };
+        recv!(s, time 50, Ok(syn_ack));
+        recv!(s, time 1050, Ok(syn_ack));
+    }
+
+    #[test]
+    fn test_syn_options_ride_the_syn() {
+        let mut s = socket();
+        s.local_seq_no = LOCAL_SEQ;
+        s.socket.connect(&mut s.cx, REMOTE_END, LOCAL_END).unwrap();
+        s.set_syn_options(&[MP_CAPABLE]).unwrap();
+        recv!(
+            s,
+            [TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: LOCAL_SEQ,
+                ack_number: None,
+                max_seg_size: Some(BASE_MSS),
+                window_scale: Some(0),
+                sack_permitted: true,
+                extra: MP_CAPABLE_BYTES,
+                ..RECV_TEMPL
+            }]
+        );
+    }
+
+    #[test]
+    fn test_syn_options_end_with_the_connection() {
+        let mut s = socket_syn_received();
+        s.listen_endpoint = LISTEN_END;
+        s.set_syn_options(&[MP_CAPABLE]).unwrap();
+        recv!(
+            s,
+            [TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: LOCAL_SEQ,
+                ack_number: Some(REMOTE_SEQ + 1),
+                max_seg_size: Some(BASE_MSS),
+                extra: MP_CAPABLE_BYTES,
+                ..RECV_TEMPL
+            }]
+        );
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Rst,
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ),
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::Listen);
+        // The next peer's SYN-ACK carries none of them.
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: None,
+                ..SEND_TEMPL
+            }
+        );
+        recv(&mut s, Instant::from_millis(0), |repr| {
+            let repr = repr.unwrap();
+            assert_eq!(repr.control, TcpControl::Syn);
+            assert_eq!(repr.ack_number, Some(REMOTE_SEQ + 1));
+            assert_eq!(repr.extra, &[]);
+        });
+    }
+
+    #[test]
+    fn test_syn_options_that_cannot_be_sent_are_refused() {
+        let mut s = socket_syn_received();
+        s.set_syn_options(&[MP_CAPABLE]).unwrap();
+        let unchanged = s.syn_options.clone();
+        let room = |n: usize| TcpOption::Unknown {
+            kind: 253,
+            data: &[0; SYN_OPTIONS_ROOM][..n - 2],
+        };
+        s.set_syn_options(&[room(SYN_OPTIONS_ROOM)]).unwrap();
+        s.set_syn_options(&[MP_CAPABLE]).unwrap();
+        for (options, error) in [
+            (&[room(SYN_OPTIONS_ROOM + 1)][..], SynOptionsError::TooLong),
+            (&[MP_CAPABLE, MP_CAPABLE][..], SynOptionsError::TooLong),
+            (&[TcpOption::EndOfList][..], SynOptionsError::Unreadable),
+            (
+                &[TcpOption::EndOfList, MP_CAPABLE][..],
+                SynOptionsError::Unreadable,
+            ),
+            (
+                &[TcpOption::Unknown { kind: 0, data: &[] }][..],
+                SynOptionsError::Unreadable,
+            ),
+            (
+                &[TcpOption::Unknown {
+                    kind: 1,
+                    data: &[7],
+                }][..],
+                SynOptionsError::Unreadable,
+            ),
+            // These bytes read back as a Maximum Segment Size, and a
+            // three-byte one does not read at all.
+            (
+                &[TcpOption::Unknown {
+                    kind: 2,
+                    data: &[5, 0xb4],
+                }][..],
+                SynOptionsError::Unreadable,
+            ),
+            (
+                &[TcpOption::Unknown {
+                    kind: 2,
+                    data: &[5, 0xb4, 0],
+                }][..],
+                SynOptionsError::Unreadable,
+            ),
+            // A gap among the SACK blocks closes up when written.
+            (
+                &[TcpOption::SackRange([
+                    Some((1, 2)),
+                    None,
+                    Some((3, 4)),
+                    None,
+                ])][..],
+                SynOptionsError::Unreadable,
+            ),
+        ] {
+            assert_eq!(s.set_syn_options(options), Err(error), "{options:?}");
+            assert_eq!(s.syn_options, unchanged);
+        }
+    }
+
+    /// A SYN-ACK with every option the socket adds and the most extra
+    /// options it takes fills the whole header.
+    #[test]
+    fn test_syn_options_fill_the_header_beside_every_own_option() {
+        let mut s = socket_listen();
+        s.set_tsval_generator(Some(|| 7));
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: None,
+                window_scale: Some(0),
+                sack_permitted: true,
+                timestamp: Some(TcpTimestampRepr::new(9, 0)),
+                ..SEND_TEMPL
+            }
+        );
+        let data = [0xee; SYN_OPTIONS_ROOM - 2];
+        s.set_syn_options(&[TcpOption::Unknown {
+            kind: 253,
+            data: &data,
+        }])
+        .unwrap();
+        recv(&mut s, Instant::from_millis(0), |repr| {
+            let repr = repr.unwrap();
+            let mut bytes = vec![0; repr.buffer_len()];
+            repr.emit(
+                &mut crate::wire::TcpPacket::new_unchecked(&mut bytes),
+                &LOCAL_ADDR.into(),
+                &REMOTE_ADDR.into(),
+            );
+            let packet = crate::wire::TcpPacket::new_unchecked(&bytes[..]);
+            assert_eq!(packet.header_len(), 60);
+            let options: Vec<_> = packet.options_iter().unwrap().collect();
+            assert_eq!(
+                options,
+                [
+                    Ok(TcpOption::MaxSegmentSize(BASE_MSS)),
+                    Ok(TcpOption::WindowScale(0)),
+                    Ok(TcpOption::SackPermitted),
+                    Ok(TcpOption::TimeStamp { tsval: 7, tsecr: 9 }),
+                    Ok(TcpOption::Unknown {
+                        kind: 253,
+                        data: &data,
+                    }),
+                ]
+            );
+            assert_eq!(
+                TcpRepr::parse(&packet, &LOCAL_ADDR.into(), &REMOTE_ADDR.into()),
+                Ok(TcpRepr { extra: &[], ..repr })
+            );
+        });
     }
 
     #[test]
@@ -8294,7 +8577,15 @@ mod test {
         let mut sent = None;
         let _ = s.socket.dispatch(&mut s.cx, |_, (ip, tcp)| {
             let payload: &'static [u8] = Vec::leak(tcp.payload.to_vec());
-            sent = Some((ip, TcpRepr { payload, ..tcp }));
+            let extra: &'static [u8] = Vec::leak(tcp.extra.to_vec());
+            sent = Some((
+                ip,
+                TcpRepr {
+                    payload,
+                    extra,
+                    ..tcp
+                },
+            ));
             Ok::<(), ()>(())
         });
         sent

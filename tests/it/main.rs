@@ -55,6 +55,7 @@ mod services;
 mod sse_codec;
 mod streams_codec;
 mod stress;
+mod tcp_options;
 mod tcp_reassembly;
 mod tcpudp;
 mod text_codec;
