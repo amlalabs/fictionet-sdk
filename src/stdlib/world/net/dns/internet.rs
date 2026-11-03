@@ -320,6 +320,22 @@ impl PublicResolver {
             .collect()
     }
 
+    /// The subject alternative names of its DNS over TLS and HTTPS fronts'
+    /// certificate: its DNS over HTTPS names, then each of its addresses as
+    /// an IP SAN (RFC 5280 §4.2.1.6), so a client that connects to an
+    /// address checks it as it would a name.
+    pub fn sans(&self) -> Vec<String> {
+        let names = self
+            .doh()
+            .into_iter()
+            .map(|name| name.to_ascii().trim_end_matches('.').to_owned());
+        let addresses = self
+            .addresses
+            .iter()
+            .flat_map(|address| [address.v4.to_string(), address.v6.to_string()]);
+        names.chain(addresses).collect()
+    }
+
     /// The resolver's configuration as seen from `at`: its identity at
     /// the site that answers there, and its special names, the answers
     /// to its whoami names among them.
@@ -1744,7 +1760,7 @@ impl Inner {
             ..ServerConfig::generic()
         };
         for (addr, name) in relays {
-            let host = only_at(&name.to_string(), addr)
+            let host = only_at(&name.to_ascii(), addr)
                 .delay(self.delay)
                 .program(self.relay(front.clone()));
             let _ = self.handle.add_host(host);
@@ -1752,7 +1768,7 @@ impl Inner {
         for (addr, build) in fronts {
             let _ = self
                 .handle
-                .add_host(build(only_at(&qname.to_string(), addr)));
+                .add_host(build(only_at(&qname.to_ascii(), addr)));
         }
     }
 

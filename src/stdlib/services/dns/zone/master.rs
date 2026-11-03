@@ -5,10 +5,11 @@
 //! escapes, comments, and the `$ORIGIN` and `$TTL` directives. Names are
 //! read here, as BIND reads them: `@`, `\DDD` and `\X` escapes, and any
 //! octets in a label. Character-strings are read the same way. The types
-//! whose RDATA is names and numbers (NS, CNAME, PTR, DNAME, MX, SRV, SOA),
-//! the types that hold character-strings (TXT, SPF, HINFO, CAA, NAPTR,
-//! SVCB, HTTPS), the DNSSEC types (DNSKEY, DS, RRSIG, NSEC, NSEC3,
-//! NSEC3PARAM, and their CDS and CDNSKEY forms), ZONEMD (RFC 8976), and
+//! whose RDATA is names and numbers (NS, CNAME, PTR, DNAME, MX, SRV, SOA,
+//! MINFO, RP, AFSDB, KX, LP), the types that hold character-strings (TXT,
+//! SPF, HINFO, CAA, NAPTR, SVCB, HTTPS, URI), the DNSSEC types (DNSKEY,
+//! DS, RRSIG, NSEC, NSEC3, NSEC3PARAM, and their CDS and CDNSKEY forms),
+//! ZONEMD (RFC 8976), LOC, APL, DHCID, NID, L32, L64, EUI48, EUI64, and
 //! the generic `\# <length> <hex>` form of RFC 3597 are written to wire
 //! format here and decoded by hickory. RDATA of the other types hickory
 //! reads from text goes through hickory's own parser.
@@ -19,6 +20,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::iter::Peekable;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 
@@ -478,11 +480,27 @@ fn record_type(token: &str) -> Option<RecordType> {
     if let Some(number) = upper.strip_prefix("TYPE") {
         return number.parse::<u16>().ok().map(RecordType::from);
     }
-    match upper.as_str() {
-        // ZONEMD (RFC 8976), which hickory has no mnemonic for.
-        "ZONEMD" => Some(RecordType::from(ZONEMD)),
-        _ => RecordType::from_str(&upper).ok(),
-    }
+    // The types hickory has no mnemonic for.
+    let code = match upper.as_str() {
+        "MINFO" => 14,
+        "RP" => 17,
+        "AFSDB" => 18,
+        "LOC" => 29,
+        "KX" => 36,
+        "APL" => 42,
+        "DHCID" => 49,
+        "ZONEMD" => ZONEMD,
+        "SPF" => 99,
+        "NID" => 104,
+        "L32" => 105,
+        "L64" => 106,
+        "LP" => 107,
+        "EUI48" => 108,
+        "EUI64" => 109,
+        "URI" => 256,
+        _ => return RecordType::from_str(&upper).ok(),
+    };
+    Some(RecordType::from(code))
 }
 
 /// The ZONEMD type code (RFC 8976 §2).
@@ -576,8 +594,16 @@ fn rdata(
             let target = rdata_name(fields.next().ok_or_else(bad)?, origin, bad)?;
             write_name(&mut wire, &target);
         }
-        // MX (RFC 1035 §3.3.9): a preference and an exchange.
-        15 => {
+        // MINFO (RFC 1035 §3.3.7) and RP (RFC 1183 §2.2): two names.
+        14 | 17 => {
+            for _ in 0..2 {
+                let name = rdata_name(fields.next().ok_or_else(bad)?, origin, bad)?;
+                write_name(&mut wire, &name);
+            }
+        }
+        // MX (RFC 1035 §3.3.9), AFSDB (RFC 1183 §1), KX (RFC 2230 §3.1)
+        // and LP (RFC 6742 §2.4): a preference and a name.
+        15 | 18 | 36 | 107 => {
             wire.extend(fields.number::<u16>().ok_or_else(bad)?.to_be_bytes());
             let exchange = rdata_name(fields.next().ok_or_else(bad)?, origin, bad)?;
             write_name(&mut wire, &exchange);
@@ -654,6 +680,60 @@ fn rdata(
             write_name(&mut wire, &target);
             wire.extend(svc_params(fields.rest()).ok_or_else(bad)?);
         }
+        // LOC (RFC 1876 §3 and Appendix A)
+        29 => wire.extend(location(fields.rest()).ok_or_else(bad)?),
+        // APL (RFC 3123 §5): items `[!]afi:address/prefix`, perhaps none.
+        42 => {
+            for item in fields.rest() {
+                wire.extend(address_prefix(item).ok_or_else(bad)?);
+            }
+        }
+        // DHCID (RFC 4701 §4): the data in base64.
+        49 => wire.extend(base64(fields.rest()).ok_or_else(bad)?),
+        // NID and L64 (RFC 6742 §2.1, §2.3): a preference and 64 bits in
+        // four groups of hexadecimal.
+        104 | 106 => {
+            wire.extend(fields.number::<u16>().ok_or_else(bad)?.to_be_bytes());
+            let groups: Vec<&str> = fields.next().ok_or_else(bad)?.split(':').collect();
+            if groups.len() != 4 {
+                return Err(bad());
+            }
+            for group in groups {
+                if !(1..=4).contains(&group.len()) {
+                    return Err(bad());
+                }
+                wire.extend(hex(&[format!("{group:0>4}")]).ok_or_else(bad)?);
+            }
+        }
+        // L32 (RFC 6742 §2.2): a preference and an IPv4 address.
+        105 => {
+            wire.extend(fields.number::<u16>().ok_or_else(bad)?.to_be_bytes());
+            wire.extend(fields.number::<Ipv4Addr>().ok_or_else(bad)?.octets());
+        }
+        // EUI48 and EUI64 (RFC 7043 §3.2, §4.2): six or eight
+        // hexadecimal octets joined by hyphens.
+        108 | 109 => {
+            let length = if u16::from(rtype) == 108 { 6 } else { 8 };
+            let octets: Vec<&str> = fields.next().ok_or_else(bad)?.split('-').collect();
+            if octets.len() != length {
+                return Err(bad());
+            }
+            for octet in octets {
+                if octet.len() != 2 {
+                    return Err(bad());
+                }
+                wire.extend(hex(&[octet.to_owned()]).ok_or_else(bad)?);
+            }
+        }
+        // URI (RFC 7553 §4.5): the priority, the weight, and the target,
+        // the octets of one quoted string.
+        256 => {
+            for _ in 0..2 {
+                wire.extend(fields.number::<u16>().ok_or_else(bad)?.to_be_bytes());
+            }
+            let target = fields.next().filter(|token| token.starts_with('"'));
+            wire.extend(octets(target.ok_or_else(bad)?).ok_or_else(bad)?);
+        }
         _ => return hickory_line(rtype, tokens, origin),
     }
     if !fields.rest().is_empty() {
@@ -718,7 +798,7 @@ fn svc_params(tokens: &[String]) -> Option<Vec<u8>> {
             Some((key, value)) => (key, Some(octets(value)?)),
             None => (token.as_str(), None),
         };
-        let key = SvcParamKey::from_str(key).ok()?;
+        let key = param_key(key)?;
         if key == SvcParamKey::Key65535 {
             return None;
         }
@@ -736,6 +816,15 @@ fn svc_params(tokens: &[String]) -> Option<Vec<u8>> {
     Some(wire)
 }
 
+/// A SvcParamKey from its name or `keyN` (RFC 9460 §2.1), `dohpath` of
+/// RFC 9461 §5 among the names.
+fn param_key(text: &str) -> Option<SvcParamKey> {
+    match text {
+        "dohpath" => Some(SvcParamKey::from(7)),
+        _ => SvcParamKey::from_str(text).ok(),
+    }
+}
+
 /// The wire form of the value of SvcParam `key`, from the octets of its
 /// presentation value (RFC 9460 §7, Appendix A).
 fn svc_value(key: SvcParamKey, value: Option<Vec<u8>>) -> Option<Vec<u8>> {
@@ -745,7 +834,7 @@ fn svc_value(key: SvcParamKey, value: Option<Vec<u8>>) -> Option<Vec<u8>> {
         SvcParamKey::Mandatory => {
             let mut keys = value_list(&value?)?
                 .iter()
-                .map(|item| SvcParamKey::from_str(&text(item)?).ok())
+                .map(|item| param_key(&text(item)?))
                 .collect::<Option<Vec<_>>>()?;
             keys.sort();
             if keys.windows(2).any(|pair| pair[0] == pair[1]) {
@@ -785,6 +874,144 @@ fn svc_value(key: SvcParamKey, value: Option<Vec<u8>>) -> Option<Vec<u8>> {
             Some(value.unwrap_or_default())
         }
     }
+}
+
+/// LOC RDATA from its presentation form (RFC 1876 Appendix A): the
+/// latitude, the longitude, the altitude, then perhaps the size and the
+/// horizontal and vertical precision, which default to 1 m, 10 000 m and
+/// 10 m.
+fn location(tokens: &[String]) -> Option<Vec<u8>> {
+    let mut tokens = tokens.iter().map(String::as_str).peekable();
+    let latitude = angle(&mut tokens, 90, ["N", "S"])?;
+    let longitude = angle(&mut tokens, 180, ["E", "W"])?;
+    // The altitude is in centimetres above 100 000 m below the WGS 84
+    // reference spheroid.
+    let altitude = u32::try_from(metres(tokens.next()?)? + 10_000_000).ok()?;
+    let mut sizes = [100, 1_000_000, 1_000];
+    for size in &mut sizes {
+        if let Some(token) = tokens.next() {
+            *size = metres(token)?;
+        }
+    }
+    if tokens.next().is_some() {
+        return None;
+    }
+    let mut wire = vec![0];
+    for size in sizes {
+        wire.push(precision(size)?);
+    }
+    wire.extend(latitude.to_be_bytes());
+    wire.extend(longitude.to_be_bytes());
+    wire.extend(altitude.to_be_bytes());
+    Some(wire)
+}
+
+/// A LOC latitude or longitude (RFC 1876 Appendix A): degrees up to `max`,
+/// perhaps minutes and then seconds with up to three decimals, and the
+/// hemisphere, `positive` or `negative`. The wire value counts thousandths
+/// of a second of arc from 2^31.
+fn angle<'a>(
+    tokens: &mut Peekable<impl Iterator<Item = &'a str>>,
+    max: i64,
+    [positive, negative]: [&str; 2],
+) -> Option<u32> {
+    let hemisphere = |token: &&str| *token == positive || *token == negative;
+    let degrees = decimal(tokens.next()?, 0)?;
+    let mut minutes = 0;
+    let mut thousandths = 0;
+    if !tokens.peek().is_some_and(hemisphere) {
+        minutes = decimal(tokens.next()?, 0)?;
+        if !tokens.peek().is_some_and(hemisphere) {
+            thousandths = decimal(tokens.next()?, 3)?;
+        }
+    }
+    let side = tokens.next().filter(hemisphere)?;
+    if degrees > max || minutes > 59 || thousandths > 59_999 {
+        return None;
+    }
+    let offset = (degrees * 60 + minutes) * 60_000 + thousandths;
+    if offset > max * 3_600_000 {
+        return None;
+    }
+    let offset = if side == positive { offset } else { -offset };
+    u32::try_from((1 << 31) + offset).ok()
+}
+
+/// A LOC distance in metres with up to two decimals and perhaps an `m`
+/// after it (RFC 1876 Appendix A), in centimetres.
+fn metres(token: &str) -> Option<i64> {
+    let token = token
+        .strip_suffix('m')
+        .or_else(|| token.strip_suffix('M'))
+        .unwrap_or(token);
+    match token.strip_prefix('-') {
+        Some(rest) => decimal(rest, 2).map(|value| -value),
+        None => decimal(token, 2),
+    }
+}
+
+/// A number written in decimal digits with at most `places` digits after
+/// a point, times 10^`places`.
+fn decimal(token: &str, places: u32) -> Option<i64> {
+    let (whole, fraction) = token.split_once('.').unwrap_or((token, ""));
+    let digits = |text: &str| text.bytes().all(|byte| byte.is_ascii_digit());
+    if whole.is_empty() || !digits(whole) || !digits(fraction) {
+        return None;
+    }
+    if (token.contains('.') && fraction.is_empty()) || fraction.len() > places as usize {
+        return None;
+    }
+    let scale = 10i64.pow(places);
+    let fraction = format!("{fraction:0<width$}", width = places as usize);
+    whole
+        .parse::<i64>()
+        .ok()?
+        .checked_mul(scale)?
+        .checked_add(fraction.parse().unwrap_or(0))
+}
+
+/// A LOC size or precision of `centimetres` as one octet (RFC 1876 §2):
+/// its first digit and the power of ten of that digit's place, so the rest
+/// is dropped, as BIND writes it. The largest is 90 000 000 m.
+fn precision(centimetres: i64) -> Option<u8> {
+    if !(0..=9_000_000_000).contains(&centimetres) {
+        return None;
+    }
+    let mut mantissa = centimetres;
+    let mut exponent = 0;
+    while mantissa > 9 {
+        mantissa /= 10;
+        exponent += 1;
+    }
+    u8::try_from(mantissa << 4 | exponent).ok()
+}
+
+/// One APL item (RFC 3123 §4, §5), `[!]family:address/prefix`, in wire
+/// form: the address without its trailing zero octets.
+fn address_prefix(item: &str) -> Option<Vec<u8>> {
+    let (negated, item) = match item.strip_prefix('!') {
+        Some(rest) => (true, rest),
+        None => (false, item),
+    };
+    let (family, rest) = item.split_once(':')?;
+    let (address, prefix) = rest.split_once('/')?;
+    if prefix.is_empty() || !prefix.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let prefix: u8 = prefix.parse().ok()?;
+    let (family, mut octets) = match family {
+        "1" if prefix <= 32 => (1u16, address.parse::<Ipv4Addr>().ok()?.octets().to_vec()),
+        "2" if prefix <= 128 => (2u16, address.parse::<Ipv6Addr>().ok()?.octets().to_vec()),
+        _ => return None,
+    };
+    while octets.last() == Some(&0) {
+        octets.pop();
+    }
+    let mut wire = family.to_be_bytes().to_vec();
+    wire.push(prefix);
+    wire.push(u8::from(negated) << 7 | u8::try_from(octets.len()).ok()?);
+    wire.extend(octets);
+    Some(wire)
 }
 
 /// The items of a comma-separated value list (RFC 9460 Appendix A.1.1):

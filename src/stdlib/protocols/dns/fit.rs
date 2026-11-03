@@ -84,6 +84,8 @@ pub struct Fitted {
 ///    fits. The first that does not ends the section without TC
 ///    (RFC 2181 §9), so every section is written up to some RRset and
 ///    nothing after it.
+/// 4. The OPT record, then the message's TSIG record, which is last
+///    (RFC 8945 §5.1) and has its room kept from the start.
 ///
 /// The records of an RRset are written together where the RRset first
 /// appears in its section, so an RRset whose records are spread through a
@@ -92,7 +94,6 @@ pub struct Fitted {
 /// the room.
 pub fn fit(response: &Response, limit: Limit) -> Result<Fitted, ProtoError> {
     let message = &response.message;
-    let octets = limit.octets();
     let full_opt = message
         .edns
         .as_ref()
@@ -103,14 +104,24 @@ pub fn fit(response: &Response, limit: Limit) -> Result<Fitted, ProtoError> {
         .map(|edns| opt_record(message, edns, false));
     let full_room = full_opt.as_ref().map_or(Ok(0), encoded_len)?;
     let bare_room = bare_opt.as_ref().map_or(Ok(0), encoded_len)?;
+    let mut truncated = false;
+    // A TSIG record goes last, after the OPT (RFC 8945 §5.1), so the rest
+    // is fitted to the room it leaves. One that leaves no room for the
+    // header and an empty OPT is left out, and the reply is truncated.
+    let mut signature = message.signature();
+    let mut signature_room = signature.map_or(Ok(0), encoded_len)?;
+    if HEADER_LEN + bare_room + signature_room > limit.octets() {
+        (signature, signature_room, truncated) = (None, 0, true);
+    }
+    let octets = limit.octets() - signature_room;
 
     let mut bytes = Vec::new();
     let mut encoder = BinEncoder::new(&mut bytes);
-    let mut truncated = false;
     let mut counts = HeaderCounts::default();
 
     // Every limit is at least 512 octets, which holds a header and an
-    // empty OPT, so these subtractions never wrap.
+    // empty OPT, and a signature leaves room for both, so these
+    // subtractions never wrap.
     encoder.set_max_size(max_size(octets - bare_room));
     let place = encoder.place::<Header>()?;
     for query in &message.queries {
@@ -158,11 +169,19 @@ pub fn fit(response: &Response, limit: Limit) -> Result<Fitted, ProtoError> {
         opt.emit(&mut encoder)?;
         counts.additionals += 1;
     }
+    if let Some(signature) = signature {
+        encoder.set_max_size(max_size(limit.octets()));
+        signature.emit(&mut encoder)?;
+        counts.additionals += 1;
+    }
     let mut metadata = message.metadata;
     metadata.truncation |= truncated;
     place.replace(&mut encoder, Header { metadata, counts })?;
     Ok(Fitted { bytes, truncated })
 }
+
+/// The length of a DNS header (RFC 1035 §4.1.1).
+const HEADER_LEN: usize = 12;
 
 /// The OPT record for `edns`, carrying the high bits of the message's
 /// RCODE (RFC 6891 §6.1.3), with its options or without them.
@@ -176,8 +195,10 @@ fn opt_record(message: &Message, edns: &Edns, options: bool) -> Record {
 }
 
 /// The length of `record` written on its own. An OPT record's owner is the
-/// root, which is never compressed, so its length is the same anywhere.
-fn encoded_len(record: &Record) -> Result<usize, ProtoError> {
+/// root, which is never compressed, so its length is the same anywhere. A
+/// TSIG record's names may be compressed in the message, so it takes at
+/// most this much there.
+fn encoded_len(record: &impl BinEncodable) -> Result<usize, ProtoError> {
     let mut bytes = Vec::new();
     record.emit(&mut BinEncoder::new(&mut bytes))?;
     Ok(bytes.len())

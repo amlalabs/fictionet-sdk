@@ -133,7 +133,9 @@ pub struct Chain {
 /// Validates `set`, an RRset from an answer section, with its RRSIGs in
 /// it. `authority` is the authority section of the same reply, which
 /// holds the NSEC or NSEC3 records a wildcard answer needs to show that
-/// no closer name matched (RFC 4035 §5.3.4).
+/// no closer name matched (RFC 4035 §5.3.4). A wildcard answer is Bogus
+/// when any NSEC or NSEC3 RRset there fails to verify, as Unbound fails
+/// such a reply.
 pub fn validate_rrset(
     set: &RecordSet,
     authority: &[RecordSet],
@@ -164,7 +166,13 @@ pub fn validate_rrset(
             let (proven, failure) = check.authenticate(authority, &zone, &keys);
             let proof =
                 proof::wildcard_answer(name, labels, &zone, &proven, policy.max_nsec3_iterations);
-            from_proof(proof, failure)
+            match (from_proof(proof, failure), failure) {
+                // The proof goes out beside the answer, so a record of it
+                // that did not verify would reach a client under AD
+                // (RFC 4035 §3.2.3).
+                (Validation::Secure, Some(code)) => Validation::Bogus(code),
+                (validation, _) => validation,
+            }
         }
         Ok(_) => Validation::Secure,
     }
@@ -465,7 +473,8 @@ impl<V: Verify> Check<'_, V> {
     }
 
     /// The NSEC and NSEC3 RRsets in `sets` whose signatures by `zone`'s
-    /// `keys` verify, and the most telling reason any others failed.
+    /// `keys` verify for their own owner, and the most telling reason any
+    /// others failed.
     fn authenticate(
         &self,
         sets: &[RecordSet],
@@ -479,7 +488,11 @@ impl<V: Verify> Check<'_, V> {
             .filter(|set| matches!(set.record_type(), RecordType::NSEC | RecordType::NSEC3))
         {
             match self.rrset(set, zone, keys) {
-                Ok(_) => proven.push(set.clone()),
+                Ok(labels) if labels == set.name().num_labels() => proven.push(set.clone()),
+                // A record a wildcard expanded, signed for fewer labels
+                // than its owner has, proves nothing about that owner
+                // (RFC 4035 §5.4), and no server sends one as a denial.
+                Ok(_) => failure = failure.or(Some(EdeCode::NSEC_MISSING)),
                 Err(code) => failure = failure.or(Some(code)),
             }
         }

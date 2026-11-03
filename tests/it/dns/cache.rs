@@ -50,6 +50,7 @@ fn nxdomain(owner: &str) -> Offer {
         key: key(owner, RecordType::A),
         kind: Negative::NxDomain,
         soa: Some(soa()),
+        rank: Rank::AuthAnswer,
         denial: Vec::new(),
         validation: Validation::NotPerformed,
         truncated: false,
@@ -86,6 +87,40 @@ fn newer_data_at_a_name_ends_its_nxdomain() {
     ));
 }
 
+/// A negative answer ranks as the answer it came in (RFC 2181 §5.4.1): a
+/// forwarder's NODATA gives way to the forwarder's data for the key, and
+/// an authoritative NODATA does not.
+#[test]
+fn a_negative_ranks_as_the_answer_it_came_in() {
+    let nodata = |rank| Offer::Negative {
+        key: key("x.example.", RecordType::A),
+        kind: Negative::NoData,
+        soa: Some(soa()),
+        rank,
+        denial: Vec::new(),
+        validation: Validation::NotPerformed,
+        truncated: false,
+    };
+    let forwarded = Offer::Positive {
+        set: rrset("x.example.", 300, vec![a("192.0.2.88")]),
+        rank: Rank::NonAuthAnswer,
+        validation: Validation::NotPerformed,
+        proof: Vec::new(),
+        truncated: false,
+    };
+    for (rank, replaced) in [(Rank::NonAuthAnswer, true), (Rank::AuthAnswer, false)] {
+        let mut cache = cache();
+        cache.insert(at(100), nodata(rank));
+        cache.insert(at(110), forwarded.clone());
+        let entry = cache.get(&key("x.example.", RecordType::A), at(111));
+        assert_eq!(
+            matches!(entry, Some(Entry::Positive { .. })),
+            replaced,
+            "{rank:?}: {entry:?}"
+        );
+    }
+}
+
 #[test]
 fn newer_nodata_at_a_name_ends_its_nxdomain() {
     let mut cache = cache();
@@ -96,6 +131,7 @@ fn newer_nodata_at_a_name_ends_its_nxdomain() {
             key: key("www.example.", RecordType::A),
             kind: Negative::NoData,
             soa: Some(soa()),
+            rank: Rank::AuthAnswer,
             denial: Vec::new(),
             validation: Validation::NotPerformed,
             truncated: false,

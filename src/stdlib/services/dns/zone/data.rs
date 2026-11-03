@@ -75,7 +75,10 @@ pub trait View {
     fn node(&self, name: &LowerName) -> Fact<&Node>;
     /// The denial records that prove `kind` at `name` (NSEC or NSEC3, each
     /// with its RRSIGs), which a reply carries when the query set DO. An
-    /// unsigned zone returns `Present(vec![])`.
+    /// unsigned zone returns `Present(vec![])`. In a zone that denies with
+    /// NSEC, `Type(NSEC)` at a name gives the NSEC at that name, which
+    /// lists the name's types, and which the answer to QTYPE NSEC sends
+    /// when no node holds it.
     fn denial(&self, name: &LowerName, kind: Denied) -> Fact<Vec<RecordSet>>;
     /// Whether a name with nothing of its own but names below it answers
     /// NODATA when the answer ends there, rather than being unknown. Such

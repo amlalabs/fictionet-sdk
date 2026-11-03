@@ -404,11 +404,19 @@ CoherentRevision ==
     \A r \in Reqs : reply[r] # None =>
         \E s \in history : \A f \in reply[r].facts : FactAt(s, f[1]) = f[2]
 
-(* More observations never turn a reply into a Need (Lean: respond_monotone). *)
-(* Once a request knows what an ask observed, whatever that was, it never   *)
-(* needs that ask again.                                                   *)
+\* Every Known a request can hold: at most one observation for each of its
+\* asks. Respond reads only what each observation was.
+Knowns(r) ==
+    LET Seen(a) == {{}} \cup {{[ask |-> a, obs |-> o, v |-> None, val |-> None]} : o \in Observations}
+    IN  {d \cup x : d \in Seen(DsAsk(r)), x \in Seen(RelayAsk(r))}
+
+(* More observations never turn a reply into a Need, nor change it (Lean:    *)
+(* respond_monotone): whenever Respond replies or stays silent with what a  *)
+(* request knows, it does the same with anything more. It is a fact about  *)
+(* Respond for every Known, reached or not, as the Lean theorem is.         *)
 RespondMonotone ==
-    \A r \in Reqs : Respond(r, known[r]) = "need" => Obs(known[r], AskOf(r)) = None
+    \A r \in Reqs : \A k, more \in Knowns(r) :
+        (k \subseteq more /\ Respond(r, k) # "need") => Respond(r, more) = Respond(r, k)
 
 (* A request sends one ask per Need, and in each generation needs each ask *)
 (* once: the relayed question, or the DS ask and, at a server that does not *)

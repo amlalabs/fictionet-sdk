@@ -34,7 +34,7 @@ pub enum AnyResponse {
     /// With DO, a signed zone
     /// signs it as Cloudflare's online signer does; a zone signed once,
     /// whose keys the view does not hold, sends one RRset of the name
-    /// instead.
+    /// instead. A name with a CNAME gets the CNAME.
     Hinfo,
     /// One RRset of the name, as BIND's `minimal-any` does (RFC 8482 §4.1):
     /// the RRset of this type, or the name's first RRset in type order when
@@ -61,15 +61,18 @@ pub enum AnyResponse {
 ///    data, then the addresses this zone holds for the other targets, as
 ///    its own data or as glue under other cuts, as optional additional
 ///    data (RFC 1034 §4.3.2 step 3b, RFC 9471 §3 and §3.2). QTYPE DS
-///    at the cut is answered from the parent's side (RFC 4035 §3.1.4.1).
+///    at the cut is answered from the parent's side (RFC 4035 §3.1.4.1),
+///    and so is QTYPE NSEC when the zone holds an NSEC there (RFC 4035
+///    §2.6).
 /// 3. A DNAME above QNAME: the DNAME and a CNAME synthesized with the
 ///    DNAME's TTL, and the walk goes on at the new name inside the zone;
 ///    YXDOMAIN when the new name would pass 255 octets (RFC 6672 §2.2,
 ///    §3.1).
 /// 4. A node at QNAME: its RRset with AA set. A CNAME starts the walk
 ///    again at its target, inside this zone only, and the chain stops at
-///    the first name it has seen before (RFC 1034 §4.3.2 step 3a). No
-///    RRset of QTYPE, or an empty non-terminal: NODATA with the SOA.
+///    the first name it has seen before (RFC 1034 §4.3.2 step 3a). QTYPE
+///    NSEC gets the NSEC the zone holds at the name, in its node or not.
+///    No RRset of QTYPE, or an empty non-terminal: NODATA with the SOA.
 /// 5. No node at QNAME: the wildcard at the closest encloser, unless a
 ///    closer name exists, which stops it (RFC 4592 §2.2.2). A wildcard's
 ///    answer has QNAME as its owner and the wildcard's TTL, follows a
@@ -226,6 +229,22 @@ impl<'v> Walk<'v> {
         }
     }
 
+    /// The NSEC RRset the zone holds at `owner`, an existing name whose
+    /// node does not hold it, with its RRSIGs: the NSEC a zone signed once
+    /// keeps beside a cut, or the one a zone signed as it is asked makes
+    /// for `owner` (RFC 4470 §3). The view's denial records for type NSEC
+    /// at `owner` carry it. `None` when the zone holds none there (an
+    /// unsigned zone, NSEC3, or an empty non-terminal of a zone signed
+    /// once) or the view cannot say.
+    fn nsec_at(&self, owner: &LowerName) -> Option<RecordSet> {
+        match self.view.denial(owner, Denied::Type(RecordType::NSEC)) {
+            Fact::Present(sets) => sets.into_iter().find(|set| {
+                set.record_type() == RecordType::NSEC && LowerName::new(set.name()) == *owner
+            }),
+            Fact::Absent | Fact::Unknown => None,
+        }
+    }
+
     /// Walks from the apex down to `name` (steps 1 to 5 without the
     /// wildcard).
     fn locate(&self, name: &LowerName) -> Result<Loc<'v>, LowerName> {
@@ -325,6 +344,13 @@ impl<'v> Walk<'v> {
                         Some(ds) => Ok(Out::Done(positive(vec![ds.clone()], Vec::new()))),
                         None => self.nodata(name, None),
                     };
+                }
+                if cut == *name && self.qtype == RecordType::NSEC {
+                    // So does the NSEC at the cut, which is the parent's
+                    // data (RFC 4035 §2.6, §4.2).
+                    if let Some(nsec) = self.nsec_at(&cut) {
+                        return Ok(Out::Done(positive(vec![nsec], Vec::new())));
+                    }
                 }
                 self.referral(&cut, ns, ds, glue)
             }
@@ -475,16 +501,22 @@ impl<'v> Walk<'v> {
             let Some(first) = sets.first() else {
                 return self.nodata(name, encloser);
             };
-            let answer = match self.any {
-                AnyResponse::Hinfo => vec![
+            let cname = sets
+                .iter()
+                .find(|set| set.record_type() == RecordType::CNAME);
+            let answer = match (self.any, cname) {
+                // No HINFO is made up at a CNAME (RFC 8482 §4.2), which
+                // leaves room for no other data (RFC 1034 §3.6.2).
+                (AnyResponse::Hinfo, Some(cname)) => vec![owned(cname, &owner)],
+                (AnyResponse::Hinfo, None) => vec![
                     self.hinfo(&owner, smallest_ttl(&sets))
                         .unwrap_or_else(|| owned(first, &owner)),
                 ],
-                AnyResponse::OneRrset(rtype) => {
+                (AnyResponse::OneRrset(rtype), _) => {
                     let set = sets.iter().find(|set| set.record_type() == rtype);
                     vec![owned(set.unwrap_or(first), &owner)]
                 }
-                AnyResponse::All => {
+                (AnyResponse::All, _) => {
                     let mut answer: Vec<RecordSet> =
                         sets.iter().map(|set| owned(set, &owner)).collect();
                     // With DO the RRSIGs go out inside their RRsets.
@@ -514,6 +546,17 @@ impl<'v> Walk<'v> {
             let mut found = positive(vec![owned(set, &owner)], proof);
             found.additional = unique(additional.into_iter());
             return Ok(Out::Done(found));
+        }
+
+        if self.qtype == RecordType::NSEC {
+            // A zone signed as it is asked keeps its NSEC records out of
+            // its nodes, and serves the one it makes for the name
+            // (RFC 4470 §3). A NODATA here would carry that NSEC as its
+            // proof, though it lists NSEC.
+            let matched = encloser.map_or_else(|| name.clone(), wildcard);
+            if let Some(nsec) = self.nsec_at(&matched) {
+                return Ok(Out::Done(positive(vec![owned(&nsec, &owner)], proof)));
+            }
         }
 
         if let Some(cname) = sets

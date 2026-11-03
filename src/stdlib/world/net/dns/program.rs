@@ -44,8 +44,8 @@ use super::source::{Namespace, Source, carry};
 /// The port DNS servers answer on (RFC 1035 §4.2).
 const PORT: u16 = 53;
 
-/// The first port a resolver's UDP exchanges may leave from: the dynamic
-/// range of RFC 6056 §2.1 runs from 1024 to 65535.
+/// The first port a resolver's UDP exchanges may leave from: RFC 6056
+/// §3.2 has ephemeral ports drawn from the whole range 1024 to 65535.
 const FIRST_PORT: u16 = 1024;
 
 /// How many bytes a DNS-over-TCP connection reads at a time.
@@ -470,8 +470,8 @@ impl Carrier for Packets {
     }
 }
 
-/// A UDP socket on a port drawn from `entropy` in the dynamic range
-/// (RFC 6056 §2.1, RFC 5452 §9.2). While the port drawn is taken, the
+/// A UDP socket on a port drawn from `entropy` in the range 1024 to 65535
+/// (RFC 6056 §3.2, RFC 5452 §9.2). While the port drawn is taken, the
 /// next one is tried, wrapping around the range, as RFC 6056 §3.3.1
 /// does. `None` only when every port of the range is taken.
 fn bind_random(entropy: &dyn Entropy, udp: &udp::Endpoint) -> Option<udp::Socket> {

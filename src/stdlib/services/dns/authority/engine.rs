@@ -30,11 +30,11 @@ use super::{Ask, Authority, Known, Observed, ServerConfig, Step, bare_reply};
 /// 1. Parses it with [`Request::parse`]. Bytes that get no reply get
 ///    none; a rejected query gets the rejection.
 /// 2. Queues [`Event::Query`].
-/// 3. Answers a CHAOS-class question from the server's
-///    [`identity`](ServerConfig::identity), or from the authority when
-///    the server has none. A class other than IN, CH, and ANY gets
-///    REFUSED, and so does a zone transfer when the server does not
-///    offer them.
+/// 3. Answers REFUSED to a zone transfer when the server does not offer
+///    them, whatever its class (RFC 5936 §2.2), and to a class other than
+///    IN, CH, and ANY. Answers another CHAOS-class question from the
+///    server's [`identity`](ServerConfig::identity), or from the
+///    authority when the server has none.
 /// 4. Asks the authority. For [`Step::Need`] it sends the question under a
 ///    fresh token, waits up to [`ask_timeout`](ServerConfig::ask_timeout),
 ///    records what came of it, and asks the authority again. Requests
@@ -130,16 +130,14 @@ impl<A: Authority> AuthorityEngine<A> {
             req.question.query_type(),
             RecordType::AXFR | RecordType::IXFR
         );
-        if req.question.query_class() == DNSClass::CH
-            && let Some(bytes) = self.server.render_chaos(&req)
-        {
-            return self.answer(client, bytes);
-        }
         let response = match req.question.query_class() {
-            DNSClass::CH => None,
-            DNSClass::IN | DNSClass::ANY if transfer && !self.server.transfer => {
+            DNSClass::IN | DNSClass::ANY | DNSClass::CH if transfer && !self.server.transfer => {
                 Some(bare_reply(&req, ResponseCode::Refused, None))
             }
+            DNSClass::CH => match self.server.render_chaos(&req) {
+                Some(bytes) => return self.answer(client, bytes),
+                None => None,
+            },
             DNSClass::IN | DNSClass::ANY => None,
             _ => {
                 let ede = self.server.ede.then_some(EdeCode::NOT_AUTHORITATIVE);

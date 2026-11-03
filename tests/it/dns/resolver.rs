@@ -8,9 +8,10 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use fictionet::stdlib::protocols::dns::dnssec::rdata::{DNSSECRData, NSEC};
 use fictionet::stdlib::protocols::dns::dnssec::{
     Algorithm, AlgorithmPolicy, Anchors, DigestType, KeyFlags, KeySet, Ring, Sign, Validation,
-    Window, ZoneKey,
+    Window, ZoneKey, sign,
 };
 use fictionet::stdlib::protocols::dns::op::{
     Edns, Message, MessageType, OpCode, Query, ResponseCode,
@@ -835,6 +836,76 @@ fn a_cycle_of_glueless_name_servers_fails_instead_of_waiting_forever() {
     assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
     assert_eq!(edes(&reply), [EdeCode::NO_REACHABLE_AUTHORITY]);
     assert!(resolver.next_deadline().is_none());
+}
+
+/// A referral to a zone whose only name server lies inside it, with no
+/// glue, cannot be followed. Going back to the cut above gets the same
+/// referral again, so the question fails at once, and the failure is
+/// cached.
+#[test]
+fn a_referral_to_in_zone_servers_without_glue_fails_once_and_is_cached() {
+    let root = delegation(
+        builder(".", "a.root-servers.net.").rrset(rrset(
+            "a.root-servers.net.",
+            3600,
+            vec![a(ROOT)],
+        )),
+        "com.",
+        "ns.nic.com.",
+        Some(COM),
+        None,
+    )
+    .build()
+    .unwrap();
+    // A lazy zone refers with the glue it holds: none, since the provider
+    // says nothing is at the name server's name.
+    let provider = |name: &LowerName| match name.to_string().as_str() {
+        "ns.nic.com." => Fact::Present(vec![rrset("ns.nic.com.", 3600, vec![a(COM)])]),
+        "inb.com." => Fact::Present(vec![rrset("inb.com.", 3600, vec![ns("ns.inb.com.")])]),
+        _ => Fact::Absent,
+    };
+    let com = Lazy::new(
+        name("com."),
+        soa("com."),
+        rrset("com.", 3600, vec![ns("ns.nic.com.")]),
+        3600,
+        provider,
+    );
+    let mut net = MemoryNet::new();
+    let zones: [(&str, Arc<dyn ZoneData>); 2] = [(ROOT, Arc::new(root)), (COM, Arc::new(com))];
+    for (address, zone) in zones {
+        let local = SocketAddr::new(ip(address), 53);
+        net.serve(
+            ip(address),
+            AuthorityEngine::new(Zones::new(vec![zone]), ServerConfig::generic(), local),
+        );
+    }
+    let mut resolver = resolver(config(None));
+    let reply = ask(
+        &mut resolver,
+        &mut net,
+        0,
+        query(client(1), "www.inb.com.", RecordType::A, |_| {}),
+    );
+    assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
+    assert_eq!(edes(&reply), [EdeCode::NO_REACHABLE_AUTHORITY]);
+    // Priming, the root's referral to `com`, then `com` asked once for the
+    // question and once on the way to each of the name server's address
+    // types, which end on the cycle.
+    let first = net.recording().exchanges().len();
+    assert_eq!(first, 5, "{:?}", asked(&net));
+
+    let reply = ask(
+        &mut resolver,
+        &mut net,
+        1,
+        query(client(2), "www.inb.com.", RecordType::A, |_| {}),
+    );
+    assert_eq!(
+        edes(&reply),
+        [EdeCode::NO_REACHABLE_AUTHORITY, EdeCode::CACHED_ERROR]
+    );
+    assert_eq!(net.recording().exchanges().len(), first);
 }
 
 #[test]
@@ -3828,4 +3899,316 @@ fn a_dname_vouches_for_a_name_that_starts_with_a_star() {
         );
         assert!(reply.metadata.authentic_data, "{qname}");
     }
+}
+
+/// The root, `com` with `example.com`'s glue at `glue_ttl`, and
+/// `example.com`, whose own address record for its name server has
+/// `child_ttl`. The NS RRsets live an hour.
+fn short_address_tree(glue_ttl: u32, child_ttl: u32) -> MemoryNet {
+    let zone = |text: &str| Zone::from_master(text, None).unwrap();
+    let root = zone(
+        ". 86400 IN SOA a.root-servers.net. h.root. 1 7200 3600 1209600 300\n\
+         . 518400 IN NS a.root-servers.net.\n\
+         a.root-servers.net. 518400 IN A 198.41.0.4\n\
+         com. 172800 IN NS ns.nic.com.\n\
+         ns.nic.com. 172800 IN A 192.0.2.10\n",
+    );
+    let com = zone(&format!(
+        "com. 3600 IN SOA ns.nic.com. h.com. 1 7200 3600 1209600 300\n\
+         com. 3600 IN NS ns.nic.com.\n\
+         ns.nic.com. 3600 IN A 192.0.2.10\n\
+         example.com. 3600 IN NS ns1.example.com.\n\
+         ns1.example.com. {glue_ttl} IN A 192.0.2.20\n"
+    ));
+    let example = zone(&format!(
+        "example.com. 3600 IN SOA ns1.example.com. h.example.com. 1 7200 3600 1209600 300\n\
+         example.com. 3600 IN NS ns1.example.com.\n\
+         ns1.example.com. {child_ttl} IN A 192.0.2.20\n\
+         www.example.com. 300 IN A 192.0.2.80\n\
+         other.example.com. 300 IN A 192.0.2.81\n"
+    ));
+    let mut net = MemoryNet::new();
+    serve_at(&mut net, ROOT, vec![root]);
+    serve_at(&mut net, COM, vec![com]);
+    serve_at(&mut net, EXAMPLE, vec![example]);
+    net
+}
+
+/// A zone cut whose NS RRset is live but whose name servers, all inside
+/// it, have no address left is of no use: the resolver asks the parent
+/// again for a referral with glue rather than failing on the cycle of
+/// looking up a name server's address through itself (RFC 1034 §5.3.3).
+/// The glue can run out first, or the child's own shorter address record
+/// can replace the glue and run out.
+#[test]
+fn a_cut_whose_name_server_addresses_ran_out_is_asked_of_the_parent() {
+    let mut net = short_address_tree(60, 3600);
+    let mut r = resolver(config(None));
+    let reply = ask(
+        &mut r,
+        &mut net,
+        0,
+        query(client(1), "www.example.com.", RecordType::A, |_| {}),
+    );
+    assert_eq!(addresses(&reply), ["192.0.2.80"]);
+    let reply = ask(
+        &mut r,
+        &mut net,
+        100,
+        query(client(2), "other.example.com.", RecordType::A, |_| {}),
+    );
+    assert_eq!(addresses(&reply), ["192.0.2.81"], "{:?}", edes(&reply));
+
+    let mut net = short_address_tree(3600, 60);
+    let mut r = resolver(config(None));
+    let reply = ask(
+        &mut r,
+        &mut net,
+        0,
+        query(client(1), "ns1.example.com.", RecordType::A, |_| {}),
+    );
+    assert_eq!(addresses(&reply), ["192.0.2.20"]);
+    let reply = ask(
+        &mut r,
+        &mut net,
+        100,
+        query(client(2), "www.example.com.", RecordType::A, |_| {}),
+    );
+    assert_eq!(addresses(&reply), ["192.0.2.80"], "{:?}", edes(&reply));
+    // The second answer came by way of `com`.
+    assert!(
+        asked(&net)
+            .iter()
+            .filter(|(server, ..)| *server == ip(COM))
+            .count()
+            >= 2
+    );
+}
+
+/// `example.com` as it first is, without `x`, and as it is after `flip`,
+/// with `x` at `x_ttl` and `alias` pointing to it.
+struct Flipping {
+    before: Zones,
+    after: Zones,
+    flipped: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Flipping {
+    fn new(x_ttl: u32) -> Flipping {
+        let zone = |text: &str| {
+            let zone = Zone::from_master(text, None).unwrap();
+            Zones::new(vec![Arc::new(zone) as Arc<dyn ZoneData>])
+        };
+        let head = "example.com. 3600 IN NS ns1.example.com.\n\
+                    ns1.example.com. 3600 IN A 192.0.2.20\n";
+        Flipping {
+            before: zone(&format!(
+                "example.com. 3600 IN SOA ns1.example.com. h.example.com. 1 7200 3600 1209600 300\n\
+                 {head}"
+            )),
+            after: zone(&format!(
+                "example.com. 3600 IN SOA ns1.example.com. h.example.com. 2 7200 3600 1209600 300\n\
+                 {head}\
+                 x.example.com. {x_ttl} IN A 192.0.2.88\n\
+                 alias.example.com. 300 IN CNAME x.example.com.\n"
+            )),
+            flipped: Arc::default(),
+        }
+    }
+}
+
+impl Authority for Flipping {
+    fn respond(
+        &self,
+        req: &Request,
+        local: SocketAddr,
+        server: &ServerConfig,
+        client: &Client,
+        known: &dyn Known,
+    ) -> Step {
+        if self.flipped.load(std::sync::atomic::Ordering::SeqCst) {
+            self.after.respond(req, local, server, client, known)
+        } else {
+            self.before.respond(req, local, server, client, known)
+        }
+    }
+}
+
+/// `x.example.com` does not exist, then does, with `alias` pointing to
+/// it. The reply that answers `alias` carries x's address, and that is
+/// the answer, though the NXDOMAIN for x is still cached: the data a
+/// reply carries serves the question it came for (RFC 1035 §7.4), even
+/// when the cache does not keep it (TTL 0, here from the authority), and
+/// a forwarder's later data takes the place of the forwarder's earlier
+/// negative, which ranks no higher (RFC 2181 §5.4.1).
+#[test]
+fn a_chain_answers_with_the_data_its_reply_carried_over_a_cached_negative() {
+    let forwarder = Config::dnsmasq(vec![SocketAddr::new(ip(EXAMPLE), 53)]);
+    for (config, x_ttl) in [(config(None), 0), (forwarder, 300)] {
+        let example = Flipping::new(x_ttl);
+        let flipped = example.flipped.clone();
+        let mut net = short_address_tree(3600, 3600);
+        net.serve(
+            ip(EXAMPLE),
+            AuthorityEngine::new(
+                example,
+                ServerConfig::generic(),
+                SocketAddr::new(ip(EXAMPLE), 53),
+            ),
+        );
+        let mut r = resolver(config);
+        let reply = ask(
+            &mut r,
+            &mut net,
+            0,
+            query(client(1), "x.example.com.", RecordType::A, |_| {}),
+        );
+        assert_eq!(reply.metadata.response_code, ResponseCode::NXDomain);
+        flipped.store(true, std::sync::atomic::Ordering::SeqCst);
+        let reply = ask(
+            &mut r,
+            &mut net,
+            10,
+            query(client(2), "alias.example.com.", RecordType::A, |_| {}),
+        );
+        assert_eq!(
+            reply.metadata.response_code,
+            ResponseCode::NoError,
+            "{x_ttl}"
+        );
+        assert_eq!(addresses(&reply), ["192.0.2.88"], "{x_ttl}");
+    }
+}
+
+/// Zones whose server lets `change` touch every reply.
+struct Changing<F>(Zones, F);
+
+impl<F: Fn(&Request, &mut Message) + Send + Sync + 'static> Authority for Changing<F> {
+    fn respond(
+        &self,
+        req: &Request,
+        local: SocketAddr,
+        server: &ServerConfig,
+        client: &Client,
+        known: &dyn Known,
+    ) -> Step {
+        match self.0.respond(req, local, server, client, known) {
+            Step::Reply(mut response) => {
+                (self.1)(req, &mut response.message);
+                Step::Reply(response)
+            }
+            step => step,
+        }
+    }
+}
+
+/// [`internet`] signed, with `example.com` holding `www` and a wildcard
+/// at `*.wild`, signed with the keys its DS names, and served by servers
+/// that let `change` touch every reply.
+fn changed_example(
+    change: impl Fn(&Request, &mut Message) + Send + Sync + Clone + 'static,
+) -> (MemoryNet, Option<Anchors>) {
+    let (mut net, anchors) = internet(true);
+    let zone = builder("example.com.", "ns1.example.com.")
+        .rrset(rrset(
+            "ns1.example.com.",
+            3600,
+            vec![a(EXAMPLE), a(EXAMPLE_TOO)],
+        ))
+        .rrset(rrset("www.example.com.", 300, vec![a("192.0.2.80")]))
+        .rrset(rrset("*.wild.example.com.", 300, vec![a("192.0.2.77")]))
+        .build()
+        .unwrap()
+        .signed(&keys(40), window(), Denial::Nsec)
+        .unwrap();
+    for address in [EXAMPLE, EXAMPLE_TOO] {
+        let zones = Zones::new(vec![Arc::new(zone.clone()) as Arc<dyn ZoneData>]);
+        let local = SocketAddr::new(ip(address), 53);
+        net.serve(
+            ip(address),
+            AuthorityEngine::new(
+                Changing(zones, change.clone()),
+                ServerConfig::generic(),
+                local,
+            ),
+        );
+    }
+    (net, anchors)
+}
+
+/// A Secure RRset lasts as long as the RRSIG that proved it allows
+/// (RFC 4035 §5.3.3). An expired RRSIG beside it, as a re-signing can
+/// leave behind, proved nothing and bounds nothing.
+#[test]
+fn an_expired_rrsig_beside_a_valid_one_leaves_a_secure_answers_ttl_alone() {
+    let www = rrset("www.example.com.", 300, vec![a("192.0.2.80")]);
+    let zsk = keys(40).keys[1].clone();
+    let old = Window {
+        inception: date(1_600_000_000),
+        expiration: date(1_700_000_000),
+    };
+    let stale = sign(zsk.as_ref(), &www, &name("example.com."), old).unwrap();
+    let (mut net, anchors) = changed_example(move |req, message| {
+        if req.question.name() == &name("www.example.com.")
+            && req.question.query_type() == RecordType::A
+            && !message.answers.is_empty()
+        {
+            message.add_answer(stale.clone());
+        }
+    });
+    let mut resolver = resolver(config(anchors));
+    for (seconds, ttl) in [(0, 300), (100, 200)] {
+        let reply = ask(
+            &mut resolver,
+            &mut net,
+            seconds,
+            query(client(1), "www.example.com.", RecordType::A, dnssec_ok),
+        );
+        assert!(reply.metadata.authentic_data);
+        let a = reply
+            .answers
+            .iter()
+            .find(|record| record.record_type() == RecordType::A)
+            .unwrap();
+        assert_eq!(a.ttl, ttl, "at {seconds} s");
+    }
+}
+
+/// A wildcard answer whose authority section holds an NSEC RRset that
+/// does not verify is Bogus: its proof goes out with it, and AD may stand
+/// only when every RRset there is authentic (RFC 4035 §3.2.3).
+#[test]
+fn a_wildcard_answer_beside_an_nsec_that_does_not_verify_is_bogus() {
+    let (mut net, anchors) = changed_example(|req, message| {
+        if req.question.name() != &name("x.wild.example.com.") {
+            return;
+        }
+        // A made-up NSEC, carrying the RRSIG of the genuine one.
+        let Some(mut rrsig) = message
+            .authorities
+            .iter()
+            .find(|record| record.record_type() == RecordType::RRSIG)
+            .cloned()
+        else {
+            return;
+        };
+        let owner = name("forged.example.com.");
+        let nsec = NSEC::new_cover_self(name("zzz.example.com."), [RecordType::A]);
+        message.add_authority(Record::from_rdata(
+            owner.clone(),
+            900,
+            RData::DNSSEC(DNSSECRData::NSEC(nsec)),
+        ));
+        rrsig.name = owner;
+        message.add_authority(rrsig);
+    });
+    let mut resolver = resolver(config(anchors));
+    let reply = ask(
+        &mut resolver,
+        &mut net,
+        0,
+        query(client(1), "x.wild.example.com.", RecordType::A, dnssec_ok),
+    );
+    assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
+    assert_eq!(edes(&reply), [EdeCode::DNSSEC_BOGUS]);
 }

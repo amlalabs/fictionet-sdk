@@ -30,10 +30,11 @@
 //!
 //! The certificates are the world's: a TLS server proves who it is with
 //! its private key on every handshake, and the world holds no operator's
-//! key. [`certificate`] issues a public resolver's from the world's CA,
-//! with its addresses as IP SANs, so a client that connects to `1.1.1.1`
-//! checks the address as it would check a name. DNS over QUIC is not
-//! served: UDP port 853 stays closed.
+//! key. A world's CA issues a public resolver's certificate for its
+//! [`sans`](super::internet::PublicResolver::sans), its addresses among
+//! them, so a client that connects to `1.1.1.1` checks the address as it
+//! would check a name. DNS over QUIC is not served: UDP port 853 stays
+//! closed.
 //!
 //! ```
 //! # use std::net::Ipv4Addr;
@@ -88,8 +89,6 @@ use fictionet::stdlib::protocols::dns::serialize::binary::BinEncodable;
 use fictionet::stdlib::protocols::dns::{Framing, Queries, stream_framed};
 use fictionet::stdlib::protocols::json::Value;
 use fictionet::stdlib::protocols::urlencoded_form::{self, Form};
-use fictionet::stdlib::protocols::x509::Validity;
-use fictionet::stdlib::services::ca::{Ca, Leaf};
 use fictionet::stdlib::services::dns::Client;
 use fictionet::stdlib::services::dns::zone::dname_target;
 use fictionet::stdlib::services::serve::{
@@ -101,7 +100,6 @@ use fictionet::{Cx, Error};
 
 use super::super::{Arrival, Host, PortServer, Sni};
 use super::ResolverHandle;
-use super::internet::PublicResolver;
 
 /// The port of DNS over TLS (RFC 7858 §3.1).
 const DOT_PORT: u16 = 853;
@@ -263,20 +261,30 @@ impl Fronts {
     /// `host` serving DNS over HTTPS on TCP port 443, over HTTP/1.1 and
     /// HTTP/2. Its handshake takes any name, since a client that connects
     /// to the address sends none; its requests are answered only for
-    /// [`names`](Self::names) and the address.
+    /// [`names`](Self::names) and the address. Those names are its own on
+    /// the port, so no other host at the address can serve them there.
     pub fn doh(&self, host: Host) -> Host {
+        let server = || {
+            let server = httpd::Server::new(Doh {
+                front: self.front(),
+                names: self.names.clone(),
+                operator: self.operator,
+            })
+            .https()
+            .default_host();
+            match self.date {
+                Some(start) => server.date(start),
+                None => server,
+            }
+        };
         let tls = self.tls.clone();
-        let mut server = httpd::Server::new(Doh {
-            front: self.front(),
-            names: self.names.clone(),
-            operator: self.operator,
-        })
-        .https()
-        .default_host();
-        if let Some(start) = self.date {
-            server = server.date(start);
+        let mut host = host.tls_accept(DOH_PORT, Sni::Any, move |fcx| tls(fcx), server());
+        for name in &self.names {
+            let tls = self.tls.clone();
+            let sni = Sni::from(name.to_ascii().as_str());
+            host = host.tls_accept(DOH_PORT, sni, move |fcx| tls(fcx), server());
         }
-        host.tls_accept(DOH_PORT, Sni::Any, move |fcx| tls(fcx), server)
+        host
     }
 
     fn front(&self) -> Arc<Front> {
@@ -285,29 +293,6 @@ impl Fronts {
             at: self.at,
         })
     }
-}
-
-/// A certificate from `ca` for the fronts of `resolver`: its DNS over
-/// HTTPS names, and each of its addresses as an IP SAN (RFC 5280
-/// §4.2.1.6), valid for `validity`.
-pub fn certificate(
-    fcx: &Cx,
-    ca: &Ca,
-    resolver: &PublicResolver,
-    validity: Validity,
-) -> Result<Leaf, Error> {
-    let names = resolver
-        .doh()
-        .into_iter()
-        .map(|name| name.to_ascii().trim_end_matches('.').to_owned());
-    let addresses = resolver
-        .addresses
-        .iter()
-        .flat_map(|address| [IpAddr::V4(address.v4), IpAddr::V6(address.v6)])
-        .map(|addr| addr.to_string());
-    let sans: Vec<String> = names.chain(addresses).collect();
-    let sans: Vec<&str> = sans.iter().map(String::as_str).collect();
-    ca.issue(fcx, &sans, validity)
 }
 
 /// What both fronts put queries to.
@@ -975,20 +960,11 @@ fn name_text(name: &Name) -> String {
 fn service_binding(svcb: &SVCB) -> String {
     let mut out = format!("{} {}", svcb.svc_priority, name_text(&svcb.target_name));
     for (key, value) in &svcb.svc_params {
-        let key = match key {
-            SvcParamKey::Mandatory => "mandatory".to_string(),
-            SvcParamKey::Alpn => "alpn".to_string(),
-            SvcParamKey::NoDefaultAlpn => "no-default-alpn".to_string(),
-            SvcParamKey::Port => "port".to_string(),
-            SvcParamKey::Ipv4Hint => "ipv4hint".to_string(),
-            SvcParamKey::EchConfigList => "ech".to_string(),
-            SvcParamKey::Ipv6Hint => "ipv6hint".to_string(),
-            other => format!("key{}", u16::from(*other)),
-        };
+        let key = param_key(*key);
         let value: Vec<u8> = match value {
             SvcParamValue::Mandatory(Mandatory(keys)) => keys
                 .iter()
-                .map(|key| key.to_string())
+                .map(|key| param_key(*key))
                 .collect::<Vec<_>>()
                 .join(",")
                 .into_bytes(),
@@ -1034,6 +1010,21 @@ fn service_binding(svcb: &SVCB) -> String {
         }
     }
     out
+}
+
+/// A SvcParamKey in presentation format (RFC 9460 §14.3.2): its name, or
+/// `keyN` for a key without one.
+fn param_key(key: SvcParamKey) -> String {
+    match key {
+        SvcParamKey::Mandatory => "mandatory".to_string(),
+        SvcParamKey::Alpn => "alpn".to_string(),
+        SvcParamKey::NoDefaultAlpn => "no-default-alpn".to_string(),
+        SvcParamKey::Port => "port".to_string(),
+        SvcParamKey::Ipv4Hint => "ipv4hint".to_string(),
+        SvcParamKey::EchConfigList => "ech".to_string(),
+        SvcParamKey::Ipv6Hint => "ipv6hint".to_string(),
+        other => format!("key{}", u16::from(other)),
+    }
 }
 
 /// RDATA in the generic form of RFC 3597 §5: `\#`, the length, and the
