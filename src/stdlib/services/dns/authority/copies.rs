@@ -11,7 +11,7 @@ use fictionet::sync::Mutex;
 
 use super::super::exchange::{Client, Generation};
 use super::super::lookup::{Looked, Lookup};
-use super::super::zone::{Learned, ZoneData};
+use super::super::zone::{Filing, Learned, ZoneData};
 use super::{Authority, ServerConfig, Step, Zones};
 
 /// The [learned](Learned) copies of real zones, one per apex, shared by
@@ -59,6 +59,23 @@ impl Copies {
             .clone()
     }
 
+    /// Files what `lookup`, made in session `generation`, gave, as
+    /// [`Authority::file`] does, and returns what the copy it went into
+    /// kept: into the copy of the zone the lookup names, or of the child
+    /// zone the response comes from. `None` when the lookup brought no
+    /// response.
+    pub fn keep(&self, lookup: &Lookup, looked: &Looked, generation: Generation) -> Option<Filing> {
+        let Looked::Response(response) = looked else {
+            return None;
+        };
+        let mut learned = self.copy(&lookup.zone);
+        if let Some(child) = learned.child_answering(&lookup.question, response) {
+            self.serves(lookup.server.ip(), &child);
+            learned = self.copy(&child);
+        }
+        Some(learned.file(generation, &lookup.question, response))
+    }
+
     /// The copies of the zones `addr` serves.
     fn zones_at(&self, addr: IpAddr) -> Vec<Arc<dyn ZoneData>> {
         let apexes = self.served.lock().get(&addr).cloned().unwrap_or_default();
@@ -81,15 +98,7 @@ impl Authority for Copies {
     }
 
     fn file(&self, lookup: &Lookup, looked: &Looked, generation: Generation) {
-        let Looked::Response(response) = looked else {
-            return;
-        };
-        let mut learned = self.copy(&lookup.zone);
-        if let Some(child) = learned.child_answering(&lookup.question, response) {
-            self.serves(lookup.server.ip(), &child);
-            learned = self.copy(&child);
-        }
-        learned.file(generation, &lookup.question, response);
+        self.keep(lookup, looked, generation);
     }
 
     fn advance(&self, generation: Generation) {

@@ -19,7 +19,7 @@ use fictionet::stdlib::services::dns::authority::{
     Authority, AuthorityEngine, Copies, ServerConfig, Step, Zones,
 };
 use fictionet::stdlib::services::dns::zone::{
-    Answered, AnyResponse, Denial, Learned, Zone, ZoneData, answer,
+    Answered, AnyResponse, Denial, Filing, Learned, Zone, ZoneData, answer,
 };
 use fictionet::stdlib::services::dns::{
     Action, Client, ClientQuery, Engine, Generation, Input, Looked, Lookup, WallClock,
@@ -408,6 +408,107 @@ fn additional_data_from_a_wildcard_brings_no_proof() {
         let request = request("mail.wild.example.", RecordType::A, dnssec_ok);
         let got = copied(&learned, &request).expect("filed");
         assert_eq!(shape(&got), shape(&real(&zone, &request)), "DO {dnssec_ok}");
+    }
+}
+
+/// The owner and type of each RRset `filing` kept, in order.
+fn kept(filing: &Filing) -> Vec<(String, RecordType)> {
+    filing
+        .sets
+        .iter()
+        .map(|set| (set.name().to_ascii(), set.record_type()))
+        .collect()
+}
+
+/// A filing says what the zone kept, each RRset as the real server sent
+/// it: a referral's NS RRset and in-domain glue, an answer's RRset at the
+/// name the response gave it even when a wildcard made it, and nothing
+/// for a response the zone does not keep, such as one for another zone.
+#[test]
+fn a_filing_shows_the_rrsets_the_zone_kept() {
+    let zone = signed(Denial::Nsec);
+    let learned = Learned::new(&name("example."));
+    let file = |qname: &str, qtype: RecordType| {
+        let asked = request(qname, qtype, true);
+        let response = real(&zone, &asked);
+        (
+            learned.file(Generation(0), &asked.question, &response),
+            response,
+        )
+    };
+
+    let (referral, _) = file("www.child.example.", RecordType::A);
+    assert_eq!(referral.zone, lower("example."));
+    assert_eq!(
+        kept(&referral),
+        vec![
+            ("child.example.".to_string(), RecordType::NS),
+            ("ns.child.example.".to_string(), RecordType::A),
+        ]
+    );
+
+    let (answer, response) = file("www.example.", RecordType::A);
+    assert!(
+        kept(&answer).contains(&("www.example.".to_string(), RecordType::A)),
+        "{:?}",
+        kept(&answer)
+    );
+    let sent = response
+        .answers
+        .iter()
+        .filter(|record| record.record_type() == RecordType::A)
+        .cloned()
+        .collect::<Vec<_>>();
+    let filed = answer
+        .sets
+        .iter()
+        .find(|set| set.record_type() == RecordType::A && set.name() == &name("www.example."))
+        .expect("the A RRset");
+    assert_eq!(
+        filed.records_without_rrsigs().cloned().collect::<Vec<_>>(),
+        sent,
+        "as sent"
+    );
+    assert!(!filed.rrsigs().is_empty(), "with its RRSIGs");
+
+    let (expanded, _) = file("a.wild.example.", RecordType::A);
+    assert_eq!(
+        kept(&expanded),
+        vec![("a.wild.example.".to_string(), RecordType::A)],
+        "at the name the response gave"
+    );
+
+    // The same records, as the response to a question about another zone.
+    let other = request("www.other.", RecordType::A, true);
+    let mut foreign = real(&zone, &request("www.example.", RecordType::AAAA, true));
+    foreign.queries = vec![other.question.clone()];
+    assert!(
+        learned
+            .file(Generation(0), &other.question, &foreign)
+            .sets
+            .is_empty(),
+        "a question outside the zone"
+    );
+}
+
+/// A truncated response may lack records its full form has (RFC 2181
+/// §9): it files nothing, so what it would have answered stays unknown.
+#[test]
+fn a_truncated_response_files_nothing() {
+    let zone = Zone::from_master(EXAMPLE, None).unwrap();
+    let learned = Learned::new(&name("example."));
+    let asked = request("www.example.", RecordType::A, true);
+    let mut response = real(&zone, &asked);
+    response.metadata.truncation = true;
+    let filing = learned.file(Generation(0), &asked.question, &response);
+    assert!(filing.sets.is_empty(), "kept {:?}", kept(&filing));
+    for dnssec_ok in [true, false] {
+        let got = copied(&learned, &request("www.example.", RecordType::A, dnssec_ok));
+        assert!(
+            got.is_none(),
+            "DO {dnssec_ok}: got {:?}",
+            got.as_ref().map(shape)
+        );
     }
 }
 

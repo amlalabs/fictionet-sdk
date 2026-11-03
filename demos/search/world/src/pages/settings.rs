@@ -81,10 +81,12 @@ impl Pages {
         &self.namespace
     }
 
-    /// The internet's DNS servers, asked from the host.
-    pub(crate) fn live_dns(&self) -> Arc<fictionet_host::dns::Live> {
+    /// The internet's DNS servers, asked from the host: the upstream of
+    /// the world's learned zones in Live, Live-Depth, and Edited, and
+    /// what a Copied session asks for the names it needs in every session.
+    pub(crate) fn live_dns(&self) -> Arc<fictionet_host::dns::Internet> {
         self.live_dns
-            .get_or_init(|| Arc::new(fictionet_host::dns::Live::new()))
+            .get_or_init(|| Arc::new(fictionet_host::dns::Internet::new()))
             .clone()
     }
 

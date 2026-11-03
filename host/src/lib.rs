@@ -1,5 +1,5 @@
 //! Host HTTP and DNS transports and optional guest-only raw Ethernet I/O.
-//! [`dns::Live`] puts a world's DNS lookups to real servers.
+//! [`dns::Internet`] puts a world's DNS lookups to real servers.
 //!
 //! The `virtio-net` feature adds a polling VFIO driver for a dedicated modern
 //! virtio network device in an explicitly opted-in QEMU guest.
