@@ -149,7 +149,7 @@ inductive Agnostic {σ τ : Type} [Sign σ S] [Sign τ S] : List σ → List τ 
 def signedBy (v : List (Key × (Tbs → S.Sig))) (apex : Name) (w : Window) (labels ttl : Nat) (d : Payload) :
     List (Rrsig S) :=
   v.map fun (k, f) =>
-    let h : Header := ⟨k.alg, apex, labels, ttl, w.inception, w.expiration⟩
+    let h : Header := ⟨k.alg, apex, labels, ttl, w.inception, w.expiration, S.keyTag k⟩
     ⟨h, f ⟨h, d⟩⟩
 
 /-- The signers of the DNSKEY set: the SEP keys, or all when none has the bit. -/

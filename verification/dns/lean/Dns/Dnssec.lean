@@ -37,8 +37,9 @@ structure Ds where
   digest : Bytes
 deriving DecidableEq, Repr
 
-/-- The RRSIG fields a signature covers besides the records: algorithm, signer, labels, original TTL, and the
-validity window (RFC 4034 §3.1). The type covered is the signed RRset's own. -/
+/-- The RRSIG fields a signature covers besides the records: algorithm, signer, labels, original TTL, the
+validity window, and the key tag of the key that made it (RFC 4034 §3.1). The type covered is the signed
+RRset's own. -/
 structure Header where
   alg : Nat
   signer : Name
@@ -46,6 +47,7 @@ structure Header where
   ttl : Nat
   inception : Nat
   expiration : Nat
+  tag : Nat
 deriving DecidableEq, Repr
 
 /-- An NSEC record (RFC 4034 §4). -/
@@ -84,7 +86,8 @@ deriving DecidableEq, Repr
 
 /-- A signature scheme, symbolically. `verify_sound` is unforgeability: a signature that verifies under a
 public key was made with a private key whose public key that is. DS digests and NSEC3 hashes are the
-protocol's own operations; `hash` maps a name to its NSEC3 hash, a number below `hashSpace`. -/
+protocol's own operations; `hash` maps a name to its NSEC3 hash, a number below `hashSpace`, and `keyTag` a
+DNSKEY to its key tag (RFC 4034 Appendix B). -/
 class SigScheme where
   Priv : Type
   Sig : Type
@@ -92,6 +95,7 @@ class SigScheme where
   sign : Priv → Tbs → Sig
   verify : Bytes → Tbs → Sig → Bool
   digest : Name → Key → Bytes
+  keyTag : Key → Nat
   hash : Name → Nat
   hashSpace : Nat
   verify_sign : ∀ p m, verify (pub p) m (sign p m) = true
@@ -257,22 +261,28 @@ zone's trusted keys uses (RFC 4035 §5.3.1, RFC 6840 §5.11). -/
 def usable (P : AlgorithmPolicy) (apex : Name) (keys : List Key) (r : Rrsig S) : Bool :=
   r.hdr.signer == apex && P.validate.contains r.hdr.alg && keys.any (·.alg == r.hdr.alg)
 
-/-- The RRSIG is usable, its window holds, and it verifies under one of the keys over what it covers. -/
+/-- The key could have made the RRSIG: its algorithm and key tag are the RRSIG's (RFC 4035 §5.3.1). -/
+def names (r : Rrsig S) (k : Key) : Bool := k.alg == r.hdr.alg && S.keyTag k == r.hdr.tag
+
+/-- The RRSIG is usable, its window holds, and it verifies under one of the keys it names over what it
+covers. -/
 def verifies (P : AlgorithmPolicy) (t : Nat) (apex : Name) (keys : List Key) (cover : Header → Option Payload)
     (r : Rrsig S) : Bool :=
   usable P apex keys r && windowOk t r.hdr &&
     match cover r.hdr with
-    | some d => keys.any fun k => k.alg == r.hdr.alg && S.verify k.pub ⟨r.hdr, d⟩ r.sig
+    | some d => keys.any fun k => names r k && S.verify k.pub ⟨r.hdr, d⟩ r.sig
     | none => false
 
 /-- Why none of the usable RRSIGs verified: there are none (EDE 10), or the window of the first one is
-inverted (25), past (7), or not yet open (8), or its signature is bad (6). -/
-def failure (t : Nat) : List (Rrsig S) → Ede
+inverted (25), past (7), or not yet open (8), or no key has its algorithm and key tag (9), or its signature is
+bad (6). -/
+def failure (t : Nat) (keys : List Key) : List (Rrsig S) → Ede
   | [] => .rrsigsMissing
   | r :: _ =>
     if r.hdr.expiration < r.hdr.inception then .expiredBeforeValid
     else if r.hdr.expiration < t then .expired
     else if t < r.hdr.inception then .notYetValid
+    else if !keys.any (names r) then .dnskeyMissing
     else .bogus
 
 /-- The payloads of the denial records whose RRSIGs verify; the others are ignored. -/
@@ -368,7 +378,7 @@ def noDsProof (P : AlgorithmPolicy) (c : Name) (ps : List Payload) : Option Inse
 def denialFailure (P : AlgorithmPolicy) (t : Nat) (apex : Name) (keys : List Key) (ds : List (Signed S)) :
     Option Ede :=
   (ds.find? fun d => !d.sigs.any (verifies P t apex keys fun _ => some d.data)).map fun d =>
-    failure t (d.sigs.filter (usable P apex keys))
+    failure t keys (d.sigs.filter (usable P apex keys))
 
 /-- What verified denial records prove for a negative answer to `q`. A proof that fails is Bogus for why a denial
 record failed, `fail`, or for the missing denial when every record verified. -/
@@ -462,7 +472,7 @@ def keyStep (P : AlgorithmPolicy) (t : Nat) (apex : Name) (dss : List Ds) (ko : 
           let a := anchored (S := S) apex (supported P dss) ks
           if a = [] then .error (.bogus .dnskeyMissing)
           else if sk.sigs.any (verifies P t apex a fun _ => some (.keys apex ks)) then .ok ks
-          else .error (.bogus (failure t (sk.sigs.filter (usable P apex a))))
+          else .error (.bogus (failure t a (sk.sigs.filter (usable P apex a))))
       | _ => .error (.bogus .dnskeyMissing)
 
 /-- From a parent's trusted keys to the child's DS records: the DS RRset for the child, signed by the parent. -/
@@ -472,7 +482,7 @@ def dsStep (P : AlgorithmPolicy) (t : Nat) (papex : Name) (pkeys : List Key) (c 
   | .rrset s =>
     if s.owner ≠ c ∨ s.rtype ≠ 43 then .error (.bogus .dnskeyMissing)
     else if sd.sigs.any (verifies P t papex pkeys (exactCover s)) then .ok (dsOf s)
-    else .error (.bogus (failure t (sd.sigs.filter (usable P papex pkeys))))
+    else .error (.bogus (failure t pkeys (sd.sigs.filter (usable P papex pkeys))))
   | _ => .error (.bogus .dnskeyMissing)
 
 /-- One step down the chain, from the zone at `papex` with trusted keys `pkeys` to link `l`. -/
@@ -532,7 +542,7 @@ def rrsetResult (P : AlgorithmPolicy) (t : Nat) (apex : Name) (keys : List Key) 
       wildcardProof (S := S) (verified P t apex keys ds) set.owner r.hdr.labels == some true) then
     .insecure .optOutCovered
   else if sigs.any ok then .bogus .nsecMissing
-  else .bogus (failure t (sigs.filter (usable P apex keys)))
+  else .bogus (failure t keys (sigs.filter (usable P apex keys)))
 
 /-- `validate_rrset`: anchors (`none` when the resolver has none), policy, time, chain, the RRset, its RRSIGs,
 and the denial records of the answer. -/
@@ -674,7 +684,8 @@ says it covers. -/
 def SigBy (P : AlgorithmPolicy) (t : Nat) (apex : Name) (keys : List Key) (cover : Header → Option Payload)
     (r : Rrsig S) : Prop :=
   usable P apex keys r = true ∧ windowOk t r.hdr = true ∧
-    ∃ d, cover r.hdr = some d ∧ ∃ k ∈ keys, k.alg = r.hdr.alg ∧ S.verify k.pub ⟨r.hdr, d⟩ r.sig = true
+    ∃ d, cover r.hdr = some d ∧ ∃ k ∈ keys, k.alg = r.hdr.alg ∧ S.keyTag k = r.hdr.tag ∧
+      S.verify k.pub ⟨r.hdr, d⟩ r.sig = true
 
 theorem verifies_iff {P : AlgorithmPolicy} {t : Nat} {apex : Name} {keys : List Key}
     {cover : Header → Option Payload} {r : Rrsig S} :
@@ -682,7 +693,7 @@ theorem verifies_iff {P : AlgorithmPolicy} {t : Nat} {apex : Name} {keys : List 
   unfold verifies SigBy
   cases hc : cover r.hdr with
   | none => simp
-  | some d => simp [List.any_eq_true, Bool.and_eq_true, beq_iff_eq, and_assoc]
+  | some d => simp [names, List.any_eq_true, Bool.and_eq_true, beq_iff_eq, and_assoc]
 
 theorem any_verifies_iff {P : AlgorithmPolicy} {t : Nat} {apex : Name} {keys : List Key}
     {cover : Header → Option Payload} {sigs : List (Rrsig S)} :
@@ -1357,7 +1368,7 @@ theorem keys_vouched {A : List Anchor} {C : Chain S} {P : AlgorithmPolicy} {t : 
     {ks : List Key} (hk : KeysSigned P t l.apex dss l.keys ks) (hl : l ∈ C)
     (hd : ∀ d ∈ dss, ∀ k, d.digest = S.digest l.apex k → Vouched A C l.apex k) :
     ∀ k' ∈ ks, Vouched A C l.apex k' := by
-  obtain ⟨sk, hsk, hdata, k, _, _, ⟨d, hdm, _, _, hdd⟩, r, hr, _, _, d', hcov, k'', hk'', _, hver⟩ := hk
+  obtain ⟨sk, hsk, hdata, k, _, _, ⟨d, hdm, _, _, hdd⟩, r, hr, _, _, d', hcov, k'', hk'', _, _, hver⟩ := hk
   have hkk : k'' = k := List.mem_singleton.mp hk''
   rw [hkk] at hver
   simp only [Option.some.injEq] at hcov; subst hcov
@@ -1373,7 +1384,7 @@ theorem reaches_vouched {A : List Anchor} {C : Chain S} {P : AlgorithmPolicy} {t
   induction h with
   | nil => exact ⟨hv, id⟩
   | @cons apex keys l ls ks apex' keys' hl _ ih =>
-    obtain ⟨_, hu, sd, dss, hpar, ⟨s, hdata, hown, _, rfl, r, hr, husable, _, d, hcov, kp, hkp, _, hver⟩, hks⟩ := hl
+    obtain ⟨_, hu, sd, dss, hpar, ⟨s, hdata, hown, _, rfl, r, hr, husable, _, d, hcov, kp, hkp, _, _, hver⟩, hks⟩ := hl
     have hlC : l ∈ C := hsub l List.mem_cons_self
     have hd : ∀ d ∈ dsOf s, ∀ k, d.digest = S.digest l.apex k → Vouched A C l.apex k := by
       intro d' hd' k hdig
@@ -1406,7 +1417,7 @@ theorem secure_sound {A : List Anchor} {P : AlgorithmPolicy} {t : Nat} {C : Chai
   obtain ⟨hv, hu⟩ := reaches_vouched hr (fun l hl => by rw [hC]; exact List.mem_cons_of_mem _ hl) hv0
   have hfin : ∃ r ∈ sigs, SigBy P t apex keys (rrsetCover set) r := by
     rcases hf with ⟨r, hr, h, _⟩ | ⟨r, hr, h, _⟩ <;> exact ⟨r, hr, h⟩
-  obtain ⟨r, hr', husable, _, d, hcov, k, hk, _, hver⟩ := hfin
+  obtain ⟨r, hr', husable, _, d, hcov, k, hk, _, _, hver⟩ := hfin
   obtain ⟨p, hp, hsig⟩ := S.verify_sound _ _ _ hver
   unfold rrsetCover at hcov
   cases hx : expanded r.hdr set with
@@ -1444,11 +1455,12 @@ inductive Denial where
   | nsec3 (optOut : Bool)
 deriving DecidableEq, Repr
 
-/-- One RRSIG by each signer over `d`, whose owner has `labels` labels and whose TTL is `ttl`. -/
+/-- One RRSIG by each signer over `d`, whose owner has `labels` labels and whose TTL is `ttl`, with the key tag
+of the signer's DNSKEY. -/
 def sigsBy (ss : List (Signer S)) (apex : Name) (w : Window) (labels ttl : Nat) (d : Payload) :
     List (Rrsig S) :=
   ss.map fun s =>
-    let h : Header := ⟨s.dnskey.alg, apex, labels, ttl, w.inception, w.expiration⟩
+    let h : Header := ⟨s.dnskey.alg, apex, labels, ttl, w.inception, w.expiration, S.keyTag s.dnskey⟩
     ⟨h, s.sign ⟨h, d⟩⟩
 
 /-- The signers of the DNSKEY set: the SEP keys, or every key when none has the bit. -/
@@ -1672,13 +1684,49 @@ def dsFor (r : Response) : List RRset :=
     | _ => []
   | none => []
 
+/-- The DNSSEC RRsets a signed node holds besides its data, which an answer to QTYPE ANY carries too, since
+ANY asks for every RRset of the name (RFC 1035 §3.2.3, RFC 4035 §3.2.1): with NSEC the NSEC at the name the
+answer matched, the question's own name or the wildcard that answered for it, and at the apex the DNSKEY set.
+Each goes out with its RRSIGs, owned by the question's name. -/
+def anyExtra (q : Request) (r : Response) : List (Signed S) :=
+  if q.qtype = 255 ∧ r.rcode = .noerror ∧ r.aa = true ∧ r.answer ≠ [] then
+    let m := if (sz.zone.node q.qname).isSome then q.qname else wild (sz.zone.closest q.qname)
+    (match sz.denial with
+      | .nsec => sz.nsecWith (·.owner == m)
+      | .nsec3 _ => []) ++
+    (if m = sz.apex then [sz.keySet] else [])
+  else []
+
 end SignedZone
 
-/-- A response with DO=1: each answer and authority RRset with its RRSIGs, and the denial records. -/
+/-- The NSEC3PARAM RRset an NSEC3 zone holds at its apex (RFC 5155 §4): SHA-1, flags 0, no extra iterations,
+and an empty salt, with the TTL of the denial records. -/
+def nsec3ParamSet (z : Zone) : RRset := ⟨z.apex, 51, negTtl z.soa, [.other 51 [1, 0, 0, 0, 0]]⟩
+
+/-- `nd` with `s` among its RRsets. -/
+def withSet (s : RRset) : Node → Node
+  | .data sets => .data (sets ++ [s])
+  | .dname d sets => .dname d (sets ++ [s])
+  | nd => nd
+
+/-- The zone a signer serves for `z`: with NSEC3, the NSEC3PARAM RRset joins the apex (RFC 5155 §7.1), signed
+and named in the bitmap of the apex's NSEC3 like the apex's other RRsets. -/
+def withNsec3Param (z : Zone) : Denial → Zone
+  | .nsec => z
+  | .nsec3 _ =>
+    { z with nodes := z.nodes.map fun (n, nd) => (n, if n = z.apex then withSet (nsec3ParamSet z) nd else nd) }
+
+/-- `z` signed offline by `signers` over the window `w`, denying with `d`. -/
+def SignedZone.make (z : Zone) (signers : List (Signer S)) (w : Window) (d : Denial) : SignedZone S :=
+  ⟨withNsec3Param z d, signers, w, d⟩
+
+/-- A response with DO=1: each answer and authority RRset with its RRSIGs, the DNSSEC RRsets an answer to ANY
+carries (`anyExtra`), and the denial records. -/
 structure SignedAnswer (S : SigScheme) where
   rcode : Rcode
   aa : Bool
   answer : List (RRset × List (Rrsig S))
+  anyExtra : List (Signed S)
   authority : List (RRset × List (Rrsig S))
   additional : List RRset
   denial : List (Signed S)
@@ -1688,17 +1736,61 @@ def SignedZone.answerDo (sz : SignedZone S) (q : Request) (any : AnyResponse) : 
   match answer sz.zone q any with
   | .response r =>
     let auth := r.authority ++ sz.dsFor r
-    (.response r, some ⟨r.rcode, r.aa, r.answer.map (fun s => (s, sz.sigsFor s)),
+    (.response r, some ⟨r.rcode, r.aa, r.answer.map (fun s => (s, sz.sigsFor s)), sz.anyExtra q r,
       auth.map (fun s => (s, sz.sigsFor s)), r.additional, sz.denialFor q r⟩)
   | .unknown n => (.unknown n, none)
 
-/-- What a validating client concludes from a signed answer: a result for each answer RRset, and for a
-negative answer a result for its denial. -/
+/-- `validate_rrset` for a DNSSEC RRset an answer to ANY carries, `d` owned by `owner`: the walk down the chain,
+then an RRSIG over the records as signed, at `owner` or, when the RRSIG counts fewer labels, at the wildcard
+it was expanded from, with the denial records' proof for the expansion (RFC 4035 §5.3.4), as for any RRset. -/
+def validateExtra (A : Option (List Anchor)) (P : AlgorithmPolicy) (t : Nat) (C : Chain S) (owner : Name)
+    (d : Signed S) (ds : List (Signed S)) : Validation :=
+  match A with
+  | none => .notPerformed
+  | some A =>
+    match walk A P t owner C with
+    | .stop v => v
+    | .trusted apex keys =>
+      let ok := verifies P t apex keys fun h => if h.labels ≤ labelsOf owner then some d.data else none
+      let proof (r : Rrsig S) := wildcardProof (S := S) (verified P t apex keys ds) owner r.hdr.labels
+      if d.sigs.any (fun r => ok r && !(r.hdr.labels < labelsOf owner)) then .secure
+      else if d.sigs.any (fun r => ok r && r.hdr.labels < labelsOf owner && proof r == some false) then .secure
+      else if d.sigs.any (fun r => ok r && r.hdr.labels < labelsOf owner && proof r == some true) then
+        .insecure .optOutCovered
+      else if d.sigs.any ok then .bogus .nsecMissing
+      else .bogus (failure t keys (d.sigs.filter (usable P apex keys)))
+
+/-- Why the zone's SOA RRset in a negative answer's authority section fails, when it does: no RRSIG over it
+verifies under the zone's keys (RFC 4035 §3.1.1, §5.3). -/
+def soaFailure (P : AlgorithmPolicy) (t : Nat) (apex : Name) (keys : List Key)
+    (auth : List (RRset × List (Rrsig S))) : Option Ede :=
+  (auth.filter fun (s, _) => s.rtype == 6 && s.owner == apex).findSome? fun (s, sigs) =>
+    if sigs.any (verifies P t apex keys (exactCover s)) then none
+    else some (failure t keys (sigs.filter (usable P apex keys)))
+
+/-- `validate_denial` with the negative answer's authority section: the walk to the zone that holds the
+denial, then its SOA RRset, which must verify, then the denial records (`validateDenial`). -/
+def validateNegative (A : Option (List Anchor)) (P : AlgorithmPolicy) (t : Nat) (C : Chain S) (q : Request)
+    (rc : Rcode) (auth : List (RRset × List (Rrsig S))) (ds : List (Signed S)) : Validation :=
+  match A, chainName q with
+  | some A', some n =>
+    match walk A' P t n (holding n C) with
+    | .trusted apex keys =>
+      match soaFailure P t apex keys auth with
+      | some e => .bogus e
+      | none => validateDenial A P t C q rc ds
+    | .stop _ => validateDenial A P t C q rc ds
+  | _, _ => validateDenial A P t C q rc ds
+
+/-- What a validating client concludes from a signed answer: a result for each answer RRset and each DNSSEC
+RRset an answer to ANY carries, and for a negative answer a result for its denial. -/
 def validateAnswer (A : Option (List Anchor)) (P : AlgorithmPolicy) (t : Nat) (C : Chain S) (q : Request)
     (sa : SignedAnswer S) : List Validation × Option Validation :=
   let r : Response := ⟨sa.rcode, sa.aa, sa.answer.map (·.1), sa.authority.map (·.1), sa.additional, 0⟩
-  (sa.answer.map (fun (s, sigs) => validateRrset A P t C s sigs sa.denial),
-    if negativeAnswer r then some (validateDenial A P t C ⟨finalName q r, q.qtype⟩ sa.rcode sa.denial)
+  (sa.answer.map (fun (s, sigs) => validateRrset A P t C s sigs sa.denial) ++
+      sa.anyExtra.map (fun d => validateExtra A P t C q.qname d sa.denial),
+    if negativeAnswer r then
+      some (validateNegative A P t C ⟨finalName q r, q.qtype⟩ sa.rcode sa.authority sa.denial)
     else none)
 
 /-! ## Covering records for zones that grow
@@ -2205,8 +2297,8 @@ theorem validates_of_supported {P : AlgorithmPolicy} {alg dt : Nat} (h : P.treat
   · simp [hm] at h
 
 theorem SignsWell.windowOk {sz : SignedZone S} {P : AlgorithmPolicy} {t : Nat} (hw : SignsWell sz P t)
-    (a : Nat) (sg : Name) (lb tt : Nat) :
-    windowOk t ⟨a, sg, lb, tt, sz.window.inception, sz.window.expiration⟩ = true := by
+    (a : Nat) (sg : Name) (lb tt tg : Nat) :
+    windowOk t ⟨a, sg, lb, tt, sz.window.inception, sz.window.expiration, tg⟩ = true := by
   simp [Dnssec.windowOk, hw.window.1, hw.window.2]
 
 /-- A signed zone's SEP keys sign its DNSKEY set, so a supported DS record that names one makes the whole set
@@ -2217,8 +2309,8 @@ theorem keySet_signed {sz : SignedZone S} {P : AlgorithmPolicy} {t : Nat} (hw : 
     (hdd : d.digest = S.digest sz.apex s0.dnskey) : KeysSigned P t sz.apex dss (some sz.keySet) sz.keys := by
   refine ⟨sz.keySet, rfl, rfl, s0.dnskey, List.mem_map.mpr ⟨s0, hs0, rfl⟩, hsep0, ⟨d, hd, hdt, hda, hdd⟩, ?_⟩
   have ha0 : P.validate.contains s0.dnskey.alg = true := hda ▸ validates_of_supported hdt
-  refine ⟨_, List.mem_map.mpr ⟨s0, sep_keySigner hs0 hsep0, rfl⟩, ?_, hw.windowOk _ _ _ _, _, rfl, s0.dnskey,
-    List.mem_singleton_self _, rfl, honest_verifies (hw.honest s0 hs0) _ _⟩
+  refine ⟨_, List.mem_map.mpr ⟨s0, sep_keySigner hs0 hsep0, rfl⟩, ?_, hw.windowOk _ _ _ _ _, _, rfl, s0.dnskey,
+    List.mem_singleton_self _, rfl, rfl, honest_verifies (hw.honest s0 hs0) _ _⟩
   simp only [usable, beq_self_eq_true, ha0, Bool.and_self, List.any_cons, List.any_nil, Bool.or_false]
 
 /-- An RRset a zone signed, offered at its own owner with any TTL, passes the zone's own check. -/
@@ -2228,8 +2320,8 @@ theorem signSet_final {sz : SignedZone S} {P : AlgorithmPolicy} {t : Nat} (hw : 
     FinalSigned P t sz.apex sz.keys set (sz.signSet x).sigs ds := by
   obtain ⟨s1, hs1, ha1⟩ := hw.dataAlg
   have hs1' := mem_dataSigners hs1
-  refine Or.inl ⟨_, List.mem_map.mpr ⟨s1, hs1, rfl⟩, ⟨?_, hw.windowOk _ _ _ _, .rrset x, ?_, s1.dnskey,
-    List.mem_map.mpr ⟨s1, hs1', rfl⟩, rfl, honest_verifies (hw.honest s1 hs1') _ _⟩, ?_⟩
+  refine Or.inl ⟨_, List.mem_map.mpr ⟨s1, hs1, rfl⟩, ⟨?_, hw.windowOk _ _ _ _ _, .rrset x, ?_, s1.dnskey,
+    List.mem_map.mpr ⟨s1, hs1', rfl⟩, rfl, rfl, honest_verifies (hw.honest s1 hs1') _ _⟩, ?_⟩
   · simp only [usable, beq_self_eq_true, ha1, Bool.and_self, Bool.true_and, List.any_eq_true, beq_iff_eq]
     exact ⟨s1.dnskey, List.mem_map.mpr ⟨s1, hs1', rfl⟩, rfl⟩
   · simp only [rrsetCover, expanded, hown, ↓reduceIte, Option.map_some]
@@ -2393,6 +2485,7 @@ instance scheme : SigScheme where
   sign p m := (p, m)
   verify k m s := k == [s.1] && s.2 == m
   digest o k := wire o ++ [if k.sep then 1 else 0, k.alg] ++ k.pub
+  keyTag k := k.pub.headD 0
   hash n := sha1 (wire n)
   hashSpace := 2 ^ 160
   verify_sign p m := by simp

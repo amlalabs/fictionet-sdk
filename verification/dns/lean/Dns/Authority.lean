@@ -1,300 +1,467 @@
 /-
-  Authorities: `respond : Req → Known → Step`, the engine's loop that asks for each `Need` and
-  calls `respond` again with the observation, `Relay`, and `Overlay`.
+  Servers of learned zones: the zone a world's server copies from what the real servers of the zone answered,
+  the server's step for one request, and the engine's loop that looks up what the zone lacks, files what came
+  back, and asks again.
 
-  An authority is written as a tree of asks: finished (a reply or silence), or ask one server and go on with
-  what a client of that server saw. Every Rust `Authority` whose `respond` reads `known` only through
-  `Known::get` and returns `Need` only for an ask it has not seen is such a tree. The tree form makes
-  `respond_monotone` hold for every authority; `loop_terminates` needs the asks of one request to lie in a
-  finite list.
+  A learned zone holds filings, each what one response of a real server showed: the node at a name, or that
+  nothing is at or below a name, with the denial records the response carried. Its view knows those facts and
+  no others, so an answer from it rests only on what real servers said. When every filing is true of the real
+  zone (`Copied`), an answer from the view is the real zone's answer but for optional additional data the copy
+  does not hold (`learned_answer_upstream`), so a negative from the copy is the real zone's negative; a fact
+  the copy does not hold ends the answer unknown, never negative (`learned_unknown_never_negative`); NXDOMAIN
+  rests on a filed denial, with the denial records it came with (`learned_nxdomain_proved`); and filing more
+  never changes an answer the copy gave (`learned_answer_stable`). The engine looks a request up at most once
+  (`serve_one_lookup`), and what it replies keeps the same properties (`serve_reply_upstream`,
+  `serve_nxdomain_proved`).
 
-  Rust: `services::dns::authority::{Authority, Ask, Observed, Known, Step, Relay, Overlay}`.
+  Rust: `services::dns::zone::Learned`, `services::dns::lookup::{Lookup, Looked}`, and
+  `services::dns::authority::{Step, Zones, AuthorityEngine}`.
 -/
-import Dns.Wire
+import Dns.Partial
 
 namespace Dns.Authority
-open Wire
+open Zone
 
-/-- The same question, as bytes, sent to one server. -/
-structure Ask where
+/-! ## Learned zones -/
+
+/-- What one response of a real server showed about one name. -/
+inductive Filing where
+  /-- The node at `n`. -/
+  | node (n : Name) (nd : Node)
+  /-- Nothing at or below `n` (RFC 8020), with the denial records the response carried: NSEC or NSEC3 records
+  with their RRSIGs, none from an unsigned zone. -/
+  | denied (n : Name) (proof : List RRset)
+deriving DecidableEq, Repr
+
+/-- Whether the filing is true of the zone `z`. -/
+def Filing.holds (z : Zone) : Filing → Bool
+  | .node n nd => z.look n == .present nd
+  | .denied n _ => z.look n == .absent
+
+/-- Whether the filing shows nothing at or below `n`: it denies `n` or a name above it. -/
+def Filing.denies (n : Name) : Filing → Bool
+  | .node .. => false
+  | .denied m _ => under n m
+
+/-- The node the filing shows at `n`, if it shows one there. -/
+def Filing.nodeAt (n : Name) : Filing → Option Node
+  | .node m nd => if m = n then some nd else none
+  | .denied .. => none
+
+/-- A zone learned from the servers of one real zone: its apex and SOA, every filing so far, the newest first,
+and its revision, which each response filed makes new. -/
+structure Learned where
+  apex : Name
+  soa : RRset
+  filings : List Filing
+  revision : Nat
+deriving DecidableEq, Repr
+
+/-- What the zone knows about `n`: absent when a filing denies it, the node a filing shows there, and otherwise
+unknown. -/
+def Learned.fact (L : Learned) (n : Name) : Fact Node :=
+  if L.filings.any (·.denies n) then .absent
+  else match L.filings.findSome? (·.nodeAt n) with
+    | some nd => .present nd
+    | none => .unknown
+
+/-- The view of every question: the zone's facts, at its revision. -/
+def Learned.view (L : Learned) : View := ⟨L.apex, L.soa, L.fact, L.revision⟩
+
+/-- Every filing of `L` is true of the real zone `z`, whose apex and SOA `L` has. -/
+def Copied (z : Zone) (L : Learned) : Prop :=
+  L.apex = z.apex ∧ L.soa = z.soa ∧ L.filings.all (·.holds z) = true
+
+theorem Copied.holds {z : Zone} {L : Learned} (h : Copied z L) {f : Filing} (hf : f ∈ L.filings) :
+    f.holds z = true :=
+  List.all_eq_true.mp h.2.2 f hf
+
+/-- In a complete zone nothing is below a name that is absent. -/
+theorem look_absent_below {z : Zone} {m n : Name} (h : z.look m = .absent) (hn : under n m = true) :
+    z.look n = .absent := by
+  rw [Zone.look_absent_iff] at h ⊢
+  cases hp : z.presentB n with
+  | false => rfl
+  | true =>
+    have := z.presentB_mono ((under_iff n m).mp hn) hp
+    rw [h] at this
+    cases this
+
+/-- A learned zone's facts are the real zone's wherever it knows them. -/
+theorem fact_refines {z : Zone} {L : Learned} (h : Copied z L) : Refines L.fact z.look := by
+  intro n hk
+  unfold Learned.fact at hk ⊢
+  by_cases hd : L.filings.any (·.denies n) = true
+  · simp only [hd, ↓reduceIte]
+    obtain ⟨f, hf, hfd⟩ := List.any_eq_true.mp hd
+    cases f with
+    | node m nd => simp [Filing.denies] at hfd
+    | denied m p =>
+      have hh := h.holds hf
+      simp only [Filing.holds, beq_iff_eq] at hh
+      exact look_absent_below hh hfd
+  · simp only [hd, Bool.false_eq_true, ↓reduceIte] at hk ⊢
+    cases hs : L.filings.findSome? (·.nodeAt n) with
+    | none => rw [hs] at hk; exact absurd rfl hk
+    | some nd =>
+      obtain ⟨f, hf, hfn⟩ := List.exists_of_findSome?_eq_some hs
+      cases f with
+      | denied => simp [Filing.nodeAt] at hfn
+      | node m nd' =>
+        simp only [Filing.nodeAt] at hfn
+        by_cases hm : m = n
+        · simp only [hm, ↓reduceIte] at hfn
+          cases hfn
+          subst hm
+          have hh := h.holds hf
+          simp only [Filing.holds, beq_iff_eq] at hh
+          simpa using hh
+        · simp only [hm, ↓reduceIte] at hfn
+          cases hfn
+
+theorem learned_agrees {z : Zone} {L : Learned} (h : Copied z L) : Agrees L.view z :=
+  ⟨h.1, h.2.1, fact_refines h⟩
+
+/-- An answer from the facts a learned zone holds is the real zone's answer to the question, but for optional
+additional data the copy does not hold: the same RCODE, AA, answer, and authority sections. So every NXDOMAIN
+and NODATA a copy gives is the real zone's. -/
+theorem learned_answer_upstream {z : Zone} {L : Learned} (h : Copied z L) (req : Request) (any : AnyResponse)
+    {r : Response} (ha : answerPartial L.view req any = .response r) :
+    ∃ r', answer z req any = .response r' ∧ r.Grows r' :=
+  answer_partial_sound L.view req any r ha z (learned_agrees h)
+
+/-- A fact the zone does not hold ends the answer with that name, never with NXDOMAIN or NODATA: the question's
+name when the walk reaches it, or the wildcard when the name is known absent and the wildcard is not known. -/
+theorem learned_unknown_never_negative (L : Learned) (req : Request) (any : AnyResponse)
+    (hq : L.apex <:+ req.qname) (hr : L.view.Reaches req.qname) :
+    (L.fact req.qname = .unknown → answerPartial L.view req any = .unknown req.qname) ∧
+    (∀ l p, req.qname = l :: p → req.qname ≠ L.apex → L.fact req.qname = .absent →
+      L.fact (wild p) = .unknown → answerPartial L.view req any = .unknown (wild p)) :=
+  unknown_never_negative L.view req any hq hr
+
+/-! ## NXDOMAIN rests on a name read absent -/
+
+/-- Whether a step finished with NXDOMAIN. -/
+def isNx : Out → Bool
+  | .done .nxdomain .. => true
+  | _ => false
+
+theorem referral_not_nx {look : Name → Fact Node} {apex m : Name} {ns : RRset} {g : List RRset} {o : Out}
+    (h : referral look apex m ns g = .ok o) : isNx o = false := by
+  unfold referral at h
+  split at h
+  · cases h; rfl
+  · cases h
+
+theorem exact_not_nx {look : Name → Fact Node} {apex : Name} {soa : RRset} {any : AnyResponse} {q : Name}
+    {qtype : Nat} {sets : List RRset} {o : Out} (h : exact look apex soa any q qtype sets = .ok o) :
+    isNx o = false := by
+  unfold exact at h
+  split at h
+  · split at h <;> (cases h; rfl)
+  · split at h
+    · split at h
+      · cases h; rfl
+      · cases h
+    · split at h
+      · split at h <;> (cases h; rfl)
+      · cases h; rfl
+
+theorem step_nx {look : Name → Fact Node} {apex : Name} {soa : RRset} {any : AnyResponse} {q : Name}
+    {qtype : Nat} {o : Out} (h : step look apex soa any q qtype = .ok o) (hx : isNx o = true) :
+    ∃ n, look n = .absent := by
+  unfold step at h
+  split at h
+  · cases h
+  · cases h; cases hx
+  · split at h
+    · split at h <;> (cases h; cases hx)
+    · rw [referral_not_nx h] at hx; cases hx
+  · split at h
+    · dsimp only at h
+      split at h <;> (cases h; cases hx)
+    · cases h; cases hx
+  · rw [exact_not_nx h] at hx; cases hx
+  · rename_i ce _
+    split at h
+    · cases h
+    · rename_i hg
+      refine ⟨wild ce, ?_⟩
+      cases hl : look (wild ce) with
+      | present => simp [Zone.get, hl] at hg
+      | absent => rfl
+      | unknown => simp [Zone.get, hl] at hg
+    · rw [referral_not_nx h] at hx; cases hx
+    · rw [exact_not_nx h] at hx; cases hx
+
+theorem chase_nx {look : Name → Fact Node} {apex : Name} {soa : RRset} {any : AnyResponse} {qtype : Nat} :
+    ∀ f seen acc q r, chase look apex soa any qtype f seen acc q = .ok r → r.rcode = .nxdomain →
+      ∃ n, look n = .absent := by
+  intro f
+  induction f with
+  | zero => intro _ _ _ r h hr; simp only [chase] at h; cases h; cases hr
+  | succ f ih =>
+    intro seen acc q r h hr
+    unfold chase at h
+    split at h
+    · cases h
+    · rename_i rc aa an au ad req hs
+      cases h
+      simp only at hr
+      subst hr
+      exact step_nx hs rfl
+    · split at h
+      · cases h; cases hr
+      · exact ih _ _ _ _ h hr
+
+/-- NXDOMAIN from any view rests on a name the view read absent. -/
+theorem answer_nx {look : Name → Fact Node} {apex : Name} {soa : RRset} {any : AnyResponse} {req : Request}
+    {r : Response} (h : answerWith look apex soa any req = .response r) (hx : r.rcode = .nxdomain) :
+    ∃ n, look n = .absent := by
+  unfold answerWith at h
+  split at h
+  · cases h; cases hx
+  · split at h
+    · rename_i hc; cases h; exact chase_nx _ _ _ _ _ hc hx
+    · cases h
+
+theorem fact_absent {L : Learned} {n : Name} (h : L.fact n = .absent) :
+    ∃ m p, Filing.denied m p ∈ L.filings ∧ m <:+ n := by
+  unfold Learned.fact at h
+  by_cases hd : L.filings.any (·.denies n) = true
+  · obtain ⟨f, hf, hfd⟩ := List.any_eq_true.mp hd
+    cases f with
+    | node => simp [Filing.denies] at hfd
+    | denied m p => exact ⟨m, p, hf, (under_iff n m).mp hfd⟩
+  · simp only [hd, Bool.false_eq_true, ↓reduceIte] at h
+    split at h <;> cases h
+
+/-- A learned zone answers NXDOMAIN only with a filed denial: a response of a real server showed nothing at or
+below a name, and the zone holds the denial records that came with it. -/
+theorem learned_nxdomain_proved {L : Learned} {req : Request} {any : AnyResponse} {r : Response}
+    (h : answerPartial L.view req any = .response r) (hx : r.rcode = .nxdomain) :
+    ∃ n m p, Filing.denied m p ∈ L.filings ∧ m <:+ n ∧ L.fact n = .absent := by
+  obtain ⟨n, hn⟩ := answer_nx h hx
+  obtain ⟨m, p, hm, hs⟩ := fact_absent hn
+  exact ⟨n, m, p, hm, hs, hn⟩
+
+/-! ## Filing -/
+
+/-- One question put to a real server of a zone: the server, the zone the response is filed into, and the
+client's question. -/
+structure Lookup where
   server : Nat
-  stream : Bool
-  query : Bytes
+  zone : Name
+  req : Request
 deriving DecidableEq, Repr
 
-/-- What a client of that server saw. -/
-inductive Observed where
-  | reply (bytes : Bytes)
-  | unreachable
-  | timeout
+/-- What a lookup gave: the filings of the server's response, or nothing, when the server could not be reached,
+did not reply, or the world's policy kept the question from leaving. -/
+inductive Looked where
+  | response (filings : List Filing)
+  | nothing
 deriving DecidableEq, Repr
 
-/-- Observations obtained so far for one request: a finite map that only grows. -/
-abbrev Known := List (Ask × Observed)
+/-- Files what a lookup gave. A response is a new revision; nothing changes nothing. -/
+def Learned.file (L : Learned) : Looked → Learned
+  | .response fs => { L with filings := fs ++ L.filings, revision := L.revision + 1 }
+  | .nothing => L
 
-def Known.get (k : Known) (a : Ask) : Option Observed := k.lookup a
+/-- What a real server of the zone `z` can give: filings true of `z`, or nothing. -/
+def Looked.of (z : Zone) : Looked → Bool
+  | .response fs => fs.all (·.holds z)
+  | .nothing => true
 
-/-- `k'` knows everything `k` knows. -/
-def Known.Extends (k k' : Known) : Prop := ∀ a o, k.get a = some o → k'.get a = some o
+theorem file_apex (L : Learned) (lk : Looked) : (L.file lk).apex = L.apex := by
+  cases lk <;> rfl
 
-/-- Observations added after the ones already known never hide them. -/
-theorem Known.extends_append (k k' : Known) : k.Extends (k ++ k') := by
-  intro a o h
-  induction k with
-  | nil => simp [Known.get, List.lookup] at h
-  | cons e es ih =>
-    obtain ⟨b, w⟩ := e
-    unfold Known.get at h ih ⊢
-    cases hab : (a == b) with
-    | true => simp only [List.lookup, List.cons_append, hab] at h ⊢; exact h
-    | false => simp only [List.lookup, List.cons_append, hab] at h ⊢; exact ih h
+theorem file_copied {z : Zone} {L : Learned} {lk : Looked} (h : Copied z L) (hl : lk.of z = true) :
+    Copied z (L.file lk) := by
+  cases lk with
+  | nothing => exact h
+  | response fs =>
+    refine ⟨h.1, h.2.1, ?_⟩
+    simp only [Learned.file, List.all_append, Bool.and_eq_true]
+    exact ⟨hl, h.2.2⟩
+
+theorem fact_known_file {L : Learned} {n : Name} (lk : Looked) (hk : L.fact n ≠ .unknown) :
+    (L.file lk).fact n ≠ .unknown := by
+  cases lk with
+  | nothing => exact hk
+  | response fs =>
+    intro hu
+    apply hk
+    unfold Learned.fact at hu ⊢
+    simp only [Learned.file, List.any_append, List.findSome?_append] at hu
+    by_cases hd : L.filings.any (·.denies n) = true
+    · simp [hd] at hu
+    · simp only [hd, Bool.false_eq_true, ↓reduceIte]
+      cases hs : L.filings.findSome? (·.nodeAt n) with
+      | none => rfl
+      | some nd =>
+        exfalso
+        cases hf : fs.findSome? (·.nodeAt n) <;> by_cases hd' : fs.any (·.denies n) = true <;>
+          simp [hd', hd, hs, hf] at hu
+
+/-- Filing a response true of the zone only adds facts: every fact the zone knew stays as it was. -/
+theorem file_refines {z : Zone} {L : Learned} {lk : Looked} (h : Copied z L) (hl : lk.of z = true) :
+    Refines L.fact (L.file lk).fact := by
+  intro n hk
+  rw [← fact_refines (file_copied h hl) n (fact_known_file lk hk)]
+  exact fact_refines h n hk
+
+/-- An answer a learned zone gave stays its answer after any filing true of the zone, but for optional
+additional data the new facts may add. -/
+theorem learned_answer_stable {z : Zone} {L : Learned} {lk : Looked} (h : Copied z L) (hl : lk.of z = true)
+    {req : Request} {any : AnyResponse} {r : Response} (ha : answerPartial L.view req any = .response r) :
+    ∃ r', answerPartial (L.file lk).view req any = .response r' ∧ r.Grows r' := by
+  have hr := file_refines h hl
+  cases lk <;> exact answerWith_ref hr ha
+
+/-! ## The server and the engine -/
 
 inductive Step where
-  | reply (bytes : Bytes)
-  | need (a : Ask)
+  | reply (r : Response)
+  | need (l : Lookup)
   | silent
 deriving DecidableEq, Repr
 
-/-- An authority's decision for one request: finished with a reply (`some`) or silence (`none`), or an ask and
-what to do with each observation. -/
-inductive Prog where
-  | done (reply : Option Bytes)
-  | ask (a : Ask) (k : Observed → Prog)
+/-- `Zones` over one learned zone, at the server with address `addr`: the answer from the zone's view, or, when
+the view lacks a fact, a lookup of the client's question at the server's own address. -/
+def respond (any : AnyResponse) (addr : Nat) (L : Learned) (req : Request) : Step :=
+  match answerPartial L.view req any with
+  | .response r => .reply r
+  | .unknown _ => .need ⟨addr, L.apex, req⟩
 
-/-- One request as the server sees it: the query octets, the address it arrived at (Rust's `local`), and its
-transport. -/
-structure Req where
-  query : Bytes
-  addr : Nat
-  stream : Bool
-deriving DecidableEq, Repr
+/-- The engine's loop for one request: on a `Need` for a lookup it has not made for the request, the upstream
+answers it (`up`), the engine files what came back and asks again; on a `Need` for one it made, the server stays
+silent, as a server that cannot answer does. The fuel only makes the definition total (`serve_one_lookup`). -/
+def serve (any : AnyResponse) (addr : Nat) (up : Lookup → Looked) :
+    Nat → Learned → List Lookup → Request → Learned × Step
+  | 0, L, _, _ => (L, .silent)
+  | f + 1, L, looked, req =>
+    match respond any addr L req with
+    | .need l => if l ∈ looked then (L, .silent) else serve any addr up f (L.file (up l)) (l :: looked) req
+    | s => (L, s)
 
-/-- World code: trusted. -/
-abbrev Authority := Req → Prog
+theorem respond_need {any : AnyResponse} {addr : Nat} {L : Learned} {req : Request} {l : Lookup}
+    (h : respond any addr L req = .need l) : l = ⟨addr, L.apex, req⟩ := by
+  unfold respond at h
+  split at h <;> cases h
+  rfl
 
-def run : Prog → Known → Step
-  | .done (some b), _ => .reply b
-  | .done none, _ => .silent
-  | .ask a k, known =>
-    match known.get a with
-    | some o => run (k o) known
-    | none => .need a
+theorem respond_reply {any : AnyResponse} {addr : Nat} {L : Learned} {req : Request} {r : Response}
+    (h : respond any addr L req = .reply r) : answerPartial L.view req any = .response r := by
+  unfold respond at h
+  split at h
+  · rename_i hr; cases h; exact hr
+  · cases h
 
-def respond (A : Authority) (req : Req) (known : Known) : Step := run (A req) known
+/-- One step of the loop, by what the server's step is. -/
+theorem serve_succ (any : AnyResponse) (addr : Nat) (up : Lookup → Looked) (f : Nat) (L : Learned)
+    (looked : List Lookup) (req : Request) :
+    serve any addr up (f + 1) L looked req =
+      match respond any addr L req with
+      | .reply r => (L, .reply r)
+      | .silent => (L, .silent)
+      | .need l => if l ∈ looked then (L, .silent) else serve any addr up f (L.file (up l)) (l :: looked) req := by
+  conv => lhs; unfold serve
+  cases respond any addr L req <;> rfl
 
-/-! ## More observations never undo a reply -/
-
-theorem run_monotone : ∀ (p : Prog) (k k' : Known), k.Extends k' → (∀ a, run p k ≠ .need a) →
-    run p k' = run p k := by
-  intro p
-  induction p with
-  | done r => intro k k' _ _; cases r <;> rfl
-  | ask a f ih =>
-    intro k k' hext hn
-    simp only [run] at hn ⊢
-    cases hg : k.get a with
-    | none => rw [hg] at hn; exact absurd rfl (hn a)
-    | some o =>
-      rw [hext a o hg]
-      rw [hg] at hn
-      exact ih o k k' hext hn
-
-/-- An authority asks only what it does not know yet. -/
-theorem need_unknown : ∀ (p : Prog) (k : Known) (a : Ask), run p k = .need a → k.get a = none := by
-  intro p
-  induction p with
-  | done r => intro k a h; cases r <;> simp [run] at h
-  | ask b f ih =>
-    intro k a h
-    simp only [run] at h
-    cases hg : k.get b with
-    | none => rw [hg] at h; cases h; exact hg
-    | some o => rw [hg] at h; exact ih o k a h
-
-/-- Once `respond` replies or stays silent, more observations never change that, so it never turns into a
-`Need` again. -/
-theorem respond_monotone (A : Authority) (req : Req) (k k' : Known) (hext : k.Extends k')
-    (hdone : ∀ a, respond A req k ≠ .need a) : respond A req k' = respond A req k :=
-  run_monotone (A req) k k' hext hdone
-
-/-! ## The engine's loop ends -/
-
-/-- The engine's loop for one request: on `Need a` it obtains what a client of that server sees (`world a`),
-adds it to what it knows, and calls `respond` again. -/
-def loop (A : Authority) (req : Req) (world : Ask → Observed) : Nat → Known → Option Step
-  | 0, _ => none
-  | f + 1, known =>
-    match respond A req known with
-    | .need a => loop A req world f ((a, world a) :: known)
-    | s => some s
-
-/-- Every ask `A` can issue for `req` lies in `asks`. -/
-def Asks (A : Authority) (req : Req) (asks : List Ask) : Prop :=
-  ∀ known a, respond A req known = .need a → a ∈ asks
-
-theorem loop_ends (A : Authority) (req : Req) (world : Ask → Observed) (asks : List Ask) (hfin : Asks A req asks) :
-    ∀ f known, (known.map Prod.fst).Nodup → (∀ e ∈ known, e.1 ∈ asks) → asks.length + 1 ≤ f + known.length →
-      ∃ s, loop A req world f known = some s ∧ ∀ a, s ≠ .need a := by
+/-- The loop never ends on a `Need`. -/
+theorem serve_not_need (any : AnyResponse) (addr : Nat) (up : Lookup → Looked) (req : Request) (l : Lookup) :
+    ∀ f L looked, (serve any addr up f L looked req).2 ≠ .need l := by
   intro f
   induction f with
-  | zero =>
-    intro known hnd hsub hlen
-    have : (known.map Prod.fst).length ≤ asks.length :=
-      List.Nodup.length_le_of_subset hnd (fun a ha => by
-        obtain ⟨e, he, rfl⟩ := List.mem_map.mp ha; exact hsub e he)
-    simp at this; omega
+  | zero => intro L looked h; cases h
   | succ f ih =>
-    intro known hnd hsub hlen
-    simp only [loop]
-    cases hr : respond A req known with
-    | need a =>
-      have ha := hfin known a hr
-      have hnone := need_unknown (A req) known a hr
-      have hnot : a ∉ known.map Prod.fst := by
-        intro hm
-        obtain ⟨e, he, rfl⟩ := List.mem_map.mp hm
-        rw [Known.get, List.lookup_eq_none_iff] at hnone
-        have := hnone e he
-        simp at this
-      refine ih _ (by simp [List.nodup_cons, hnot, hnd]) (fun e he => ?_) (by simp; omega)
-      simp only [List.mem_cons] at he
-      rcases he with rfl | he
-      · exact ha
-      · exact hsub e he
-    | reply b => exact ⟨_, rfl, fun _ h => by cases h⟩
-    | silent => exact ⟨_, rfl, fun _ h => by cases h⟩
+    intro L looked
+    rw [serve_succ]
+    cases respond any addr L req with
+    | reply r => intro h; cases h
+    | silent => intro h; cases h
+    | need l' =>
+      dsimp only
+      by_cases hm : l' ∈ looked
+      · simp only [hm, ↓reduceIte]; intro h; cases h
+      · simp only [hm, ↓reduceIte]; exact ih _ _
 
-/-- With the asks of a request in a finite list, the loop replies or stays silent within one more step than
-there are asks. -/
-theorem loop_terminates (A : Authority) (req : Req) (world : Ask → Observed) (asks : List Ask)
-    (hfin : Asks A req asks) : ∃ s, loop A req world (asks.length + 1) [] = some s ∧ ∀ a, s ≠ .need a :=
-  loop_ends A req world asks hfin _ [] (by simp) (by simp) (by simp)
+/-- After its lookup, a request needs no other: the server replies, or stays silent. -/
+theorem serve_after_lookup (any : AnyResponse) (addr : Nat) (up : Lookup → Looked) (f : Nat) (L : Learned)
+    (req : Request) (l : Lookup) (hl : l = ⟨addr, L.apex, req⟩) :
+    serve any addr up (f + 1) L [l] req =
+      match respond any addr L req with
+      | .reply r => (L, .reply r)
+      | _ => (L, .silent) := by
+  rw [serve_succ]
+  cases h : respond any addr L req with
+  | need l' => simp [respond_need h, hl]
+  | reply r => rfl
+  | silent => rfl
 
-/-! ## Relay -/
+/-- The engine looks a request up at most once: with any fuel from 2 up, it gives what it gives with 2. -/
+theorem serve_one_lookup (any : AnyResponse) (addr : Nat) (up : Lookup → Looked) (f : Nat) (L : Learned)
+    (req : Request) : serve any addr up (f + 2) L [] req = serve any addr up 2 L [] req := by
+  rw [serve_succ, serve_succ]
+  cases h : respond any addr L req with
+  | reply r => rfl
+  | silent => rfl
+  | need l =>
+    have hl : l = ⟨addr, (L.file (up l)).apex, req⟩ := by rw [file_apex]; exact respond_need h
+    simp only [List.not_mem_nil, ↓reduceIte]
+    rw [serve_after_lookup any addr up f _ req l hl, serve_after_lookup any addr up 0 _ req l hl]
 
-def relayAsk (req : Req) : Ask := ⟨req.addr, req.stream, req.query⟩
+theorem serve_copied {z : Zone} {any : AnyResponse} {addr : Nat} {up : Lookup → Looked}
+    (hup : ∀ l, (up l).of z = true) {req : Request} :
+    ∀ f L looked, Copied z L → Copied z (serve any addr up f L looked req).1 := by
+  intro f
+  induction f with
+  | zero => intro L _ h; exact h
+  | succ f ih =>
+    intro L looked h
+    rw [serve_succ]
+    cases respond any addr L req with
+    | reply r => exact h
+    | silent => exact h
+    | need l =>
+      dsimp only
+      by_cases hm : l ∈ looked
+      · simp only [hm, ↓reduceIte]; exact h
+      · simp only [hm, ↓reduceIte]; exact ih _ _ (file_copied h (hup _))
 
-/-- Asks the real server at its own address the client's exact question, and sends back what it said with the
-client's ID and question case (`restore`). A timeout or an unreachable server is a silent simulated server. -/
-def relay : Authority := fun req =>
-  .ask (relayAsk req) fun
-    | .reply b =>
-      match restore b req.query with
-      | .ok r => .done (some r)
-      | .error _ => .done none
-    | _ => .done none
+theorem serve_reply {any : AnyResponse} {addr : Nat} {up : Lookup → Looked} {req : Request} :
+    ∀ f L looked r, (serve any addr up f L looked req).2 = .reply r →
+      answerPartial (serve any addr up f L looked req).1.view req any = .response r := by
+  intro f
+  induction f with
+  | zero => intro L looked r h; cases h
+  | succ f ih =>
+    intro L looked r
+    rw [serve_succ]
+    cases hr : respond any addr L req with
+    | reply r' => intro h; cases h; exact respond_reply hr
+    | silent => intro h; cases h
+    | need l =>
+      dsimp only
+      by_cases hm : l ∈ looked
+      · simp only [hm, ↓reduceIte]; intro h; cases h
+      · simp only [hm, ↓reduceIte]; exact ih _ _ _
 
-theorem relay_asks (req : Req) : Asks relay req [relayAsk req] := by
-  intro known a h
-  simp only [respond, relay, run] at h
-  cases hg : known.get (relayAsk req) with
-  | none => rw [hg] at h; cases h; simp
-  | some o =>
-    rw [hg] at h
-    cases o with
-    | reply b =>
-      simp only at h
-      split at h <;> simp [run] at h
-    | unreachable => simp [run] at h
-    | timeout => simp [run] at h
+/-- Whatever the engine replies over a copy of `z`, with an upstream whose responses are true of `z`, is `z`'s
+answer to the question, but for optional additional data: never a guess, and never a negative `z` does not
+give. -/
+theorem serve_reply_upstream {z : Zone} {any : AnyResponse} {addr : Nat} {up : Lookup → Looked}
+    (hup : ∀ l, (up l).of z = true) {f : Nat} {L : Learned} {looked : List Lookup} {req : Request} {r : Response}
+    (hc : Copied z L) (h : (serve any addr up f L looked req).2 = .reply r) :
+    ∃ r', answer z req any = .response r' ∧ r.Grows r' :=
+  learned_answer_upstream (serve_copied hup f L looked hc) req any (serve_reply f L looked r h)
 
-/-- A relay never invents a reply: whatever it sends is the restore of a reply the real server actually gave
-to this exact question, so it differs from that reply only in the ID and the question's case. -/
-theorem relay_never_guesses (req : Req) (known : Known) (b : Bytes) (h : respond relay req known = .reply b) :
-    ∃ obs, known.get (relayAsk req) = some (.reply obs) ∧ restore obs req.query = .ok b ∧
-      b.length = obs.length ∧ b.take 2 = req.query.take 2 := by
-  simp only [respond, relay, run] at h
-  cases hg : known.get (relayAsk req) with
-  | none => rw [hg] at h; cases h
-  | some o =>
-    rw [hg] at h
-    cases o with
-    | reply obs =>
-      simp only at h
-      split at h
-      · rename_i r hr
-        simp only [run, Step.reply.injEq] at h
-        subst h
-        obtain ⟨h1, h2, _⟩ := restore_changes_only_id_and_case obs req.query r hr
-        exact ⟨obs, rfl, hr, h1, h2⟩
-      · simp [run] at h
-    | unreachable => simp [run] at h
-    | timeout => simp [run] at h
-
-/-! ## Overlay -/
-
-/-- An overlay: questions at `inner`'s own name servers go to `inner`. For any other question that crosses the
-invented apex from above, the overlay asks `base` for `<apex> DS` with DO=1, whatever the client's DO bit.
-When `serves` says that reply comes from a server of the apex's parent, the question gets a referral composed
-from `inner`'s apex NS set and glue and that reply's denial records; when it does not, the server answers as
-`base` does (RFC 1034 §4.2.1), which for a relay is a second ask; without a reply, nothing. Everything else,
-the DS question at the apex among it, goes to `base`. -/
-structure Overlay where
-  base : Authority
-  inner : Authority
-  below : Req → Bool
-  crossing : Req → Bool
-  dsAsk : Req → Ask
-  serves : Req → Bytes → Bool
-  referral : Req → Bytes → Bytes
-
-def overlay (o : Overlay) : Authority := fun req =>
-  if o.below req then o.inner req
-  else if o.crossing req then
-    .ask (o.dsAsk req) fun
-      | .reply b => if o.serves req b then .done (some (o.referral req b)) else o.base req
-      | _ => .done none
-  else o.base req
-
-theorem overlay_asks (o : Overlay) (req : Req) (ab ai : List Ask) (hb : Asks o.base req ab)
-    (hi : Asks o.inner req ai) : Asks (overlay o) req (ai ++ o.dsAsk req :: ab) := by
-  intro known a h
-  simp only [respond, overlay] at h
-  split at h
-  · simp [hi known a h]
-  · split at h
-    · simp only [run] at h
-      cases hg : known.get (o.dsAsk req) with
-      | none => rw [hg] at h; cases h; simp
-      | some ob =>
-        rw [hg] at h
-        cases ob with
-        | reply b =>
-          simp only at h
-          split at h
-          · simp [run] at h
-          · simp [hb known a h]
-        | unreachable => simp [run] at h
-        | timeout => simp [run] at h
-    · simp [hb known a h]
-
-/-- A zone authority answers from data it holds and never asks. -/
-def zones (f : Req → Option Bytes) : Authority := fun req => .done (f req)
-
-theorem zones_asks (f : Req → Option Bytes) (req : Req) : Asks (zones f) req [] := by
-  intro known a h
-  simp only [respond, zones] at h
-  cases hf : f req <;> simp [hf, run] at h
-
-/-- Relay issues one ask per request. -/
-theorem relay_loop_terminates (req : Req) (world : Ask → Observed) :
-    ∃ s, loop relay req world 2 [] = some s ∧ ∀ a, s ≠ .need a :=
-  loop_terminates relay req world _ (relay_asks req)
-
-/-- An overlay of a zone authority on a relay issues at most two distinct asks per request: the DS question
-and the relayed question. -/
-theorem overlay_loop_terminates (o : Overlay) (f : Req → Option Bytes) (ho : o.base = relay)
-    (hi : o.inner = zones f) (req : Req) (world : Ask → Observed) :
-    ∃ s, loop (overlay o) req world 3 [] = some s ∧ ∀ a, s ≠ .need a := by
-  have h := overlay_asks o req [relayAsk req] [] (ho ▸ relay_asks req) (hi ▸ zones_asks f req)
-  exact loop_terminates (overlay o) req world _ h
-
-theorem relay_monotone (req : Req) (k k' : Known) (hext : k.Extends k')
-    (hdone : ∀ a, respond relay req k ≠ .need a) : respond relay req k' = respond relay req k :=
-  respond_monotone relay req k k' hext hdone
-
-theorem overlay_monotone (o : Overlay) (req : Req) (k k' : Known) (hext : k.Extends k')
-    (hdone : ∀ a, respond (overlay o) req k ≠ .need a) : respond (overlay o) req k' = respond (overlay o) req k :=
-  respond_monotone (overlay o) req k k' hext hdone
+/-- The engine replies NXDOMAIN only from a filed denial, held with the denial records it came with. -/
+theorem serve_nxdomain_proved {any : AnyResponse} {addr : Nat} {up : Lookup → Looked} {f : Nat} {L : Learned}
+    {looked : List Lookup} {req : Request} {r : Response} (h : (serve any addr up f L looked req).2 = .reply r)
+    (hx : r.rcode = .nxdomain) :
+    ∃ n m p, Filing.denied m p ∈ (serve any addr up f L looked req).1.filings ∧ m <:+ n ∧
+      (serve any addr up f L looked req).1.fact n = .absent :=
+  learned_nxdomain_proved (serve_reply f L looked r h) hx
 
 end Dns.Authority

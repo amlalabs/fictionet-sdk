@@ -26,12 +26,15 @@
 (*   cached     whether the answer comes from the resolver's cache, with   *)
 (*              the validation an earlier query without CD made            *)
 (*                                                                         *)
-(* The provider (Complete, Lazy, Relayed) and the signer implementation    *)
+(* The provider (Complete, Lazy, Copied) and the signer implementation     *)
 (* (A or B) produce the same records by contract; the validator must not   *)
-(* see them. RecordsOnly is checked by self-composition: two copies of the *)
-(* validator, each with its own provider and signer, get records of their  *)
-(* own, which differ where the second copy's changed2 differs, and must    *)
-(* agree whenever their records are equal.                                 *)
+(* see them. Copied records are a learned zone's: the real zone's records  *)
+(* with the RRSIGs the real servers sent, never signed again, so an edit   *)
+(* to them is a change after signing. RecordsOnly is checked by            *)
+(* self-composition: two copies of the validator, each with its own        *)
+(* provider and signer, get records of their own, which differ where the   *)
+(* second copy's changed2 differs, and must agree whenever their records   *)
+(* are equal.                                                              *)
 (*                                                                         *)
 (* Ablation flags: PolicyAlgs is the policy value (adding "sha1" accepts   *)
 (* algorithm 5), TrustUpstreamAd copies an upstream AD bit,                *)
@@ -227,6 +230,12 @@ Sha1Insecure ==
 RecordsOnly ==
     Records(1) = Records(2) => Result = Result2
 
+(* Copied records the world edited are never Secure: the world holds no    *)
+(* key of the real zone, so a copy is never signed again, and an edited     *)
+(* RRset keeps RRSIGs that no longer cover it.                              *)
+CopiedEditedNeverSecure ==
+    provider1 = "Copied" /\ (\E z \in Zones : changed[z]) => Result.kind # "Secure"
+
 (* check_chain over complete zones at build time, with each problem it      *)
 (* reports. An RRset changed after signing is SignatureInvalid.            *)
 ChainProblems ==
@@ -249,9 +258,11 @@ CheckChainAgrees ==
 AllSignedBy(k) == \A z \in Zones : signer[z] = k
 AllDs(p) == \A c \in Children : proof[c] = p
 
-\* Unedited zones relayed from real servers validate under the real anchor.
-RelayedUneditedSecure ==
-    provider1 = "Relayed" /\ anchor = "A" /\ AllSignedBy("A") /\ AllDs("DsA") /\ Result.kind = "Secure"
+\* Unedited zones copied from real servers validate under the real anchor.
+CopiedUneditedSecure ==
+    provider1 = "Copied" /\ anchor = "A" /\ AllSignedBy("A") /\ AllDs("DsA")
+    /\ \A z \in Zones : ~changed[z]
+    /\ Result.kind = "Secure"
 
 \* A zone the world re-signs under a real parent's DS is Bogus.
 EditedUnderRealAnchorBogus ==
@@ -279,7 +290,7 @@ UnsignedWithIanaAnchorBogus ==
 NoAnchorsNotPerformed ==
     anchor = "none" /\ Result.kind = "NotPerformed" /\ ~Rendered.ad
 
-NeverRelayedUneditedSecure == ~RelayedUneditedSecure
+NeverCopiedUneditedSecure == ~CopiedUneditedSecure
 NeverEditedUnderRealAnchorBogus == ~EditedUnderRealAnchorBogus
 NeverInventedUnderOptOutInsecure == ~InventedUnderOptOutInsecure
 NeverInventedTldUnderNsecBogus == ~InventedTldUnderNsecBogus

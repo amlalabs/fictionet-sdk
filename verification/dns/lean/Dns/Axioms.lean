@@ -126,21 +126,6 @@ example : (encRData true 7 [([EX, COM], 12)] 99 (.octets [2, 3, 4])).1 = slice [
   (unknown_rdata_verbatim [1, 2, 3, 4, 5] 99 1 3 (.octets [2, 3, 4]) true 7 _ rfl
     (eq_ok_of_isOk (by decide +kernel))).2
 
-/-- A query for `WwW.example.com. A` with ID 0x1234, and a reply with ID 0xabcd that says `www`. -/
-def query : Bytes := [18, 52, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0] ++
-  [3, 87, 119, 87, 7, 101, 120, 97, 109, 112, 108, 101, 3, 99, 111, 109, 0, 0, 1, 0, 1]
-def reply : Bytes := [171, 205, 129, 128, 0, 1, 0, 1, 0, 0, 0, 0] ++
-  [3, 119, 119, 119, 7, 101, 120, 97, 109, 112, 108, 101, 3, 99, 111, 109, 0, 0, 1, 0, 1] ++
-  [192, 12, 0, 1, 0, 1, 0, 0, 1, 44, 0, 4, 192, 0, 2, 1]
-def restored : Bytes := [18, 52, 129, 128, 0, 1, 0, 1, 0, 0, 0, 0] ++
-  [3, 87, 119, 87, 7, 101, 120, 97, 109, 112, 108, 101, 3, 99, 111, 109, 0, 0, 1, 0, 1] ++
-  [192, 12, 0, 1, 0, 1, 0, 0, 1, 44, 0, 4, 192, 0, 2, 1]
-
-#print axioms restore_changes_only_id_and_case
-example : restored.length = reply.length ∧ restored.take 2 = query.take 2 :=
-  let h := restore_changes_only_id_and_case reply query restored (eq_ok_of_isOk (by decide +kernel))
-  ⟨h.1, h.2.1⟩
-
 end Wire
 
 /-! ## `Dns/Fit.lean` -/
@@ -348,41 +333,74 @@ end Partial
 /-! ## `Dns/Authority.lean` -/
 
 section Authority
-open Authority
+open Authority Zone
 
-def req : Req := ⟨query, 7, false⟩
-def known : Known := [(relayAsk req, .reply reply)]
+/-- What a real server of `example.com.` sent when asked `x.b.example.com.`: the apex, `b` (an empty
+non-terminal), and that `x.b` and `*.b` do not exist, with no denial records, as the zone is unsigned. -/
+def filed : List Filing :=
+  [.node apex apexNode, .node [LB, EX, COM] .empty, .denied [LX, LB, EX, COM] [], .denied (wild [LB, EX, COM]) []]
 
-theorem relay_replies : respond relay req known = .reply restored := by decide +kernel
+/-- A copy of `example.com.` that has filed that response. -/
+def copy : Learned := ⟨apex, zone.soa, filed, 1⟩
 
-#print axioms respond_monotone
-example : respond relay req (known ++ [(⟨9, true, []⟩, .timeout)]) = .reply restored := by
-  rw [respond_monotone relay req known _ (Known.extends_append _ _) (by rw [relay_replies]; intro a h; cases h),
-    relay_replies]
+theorem filed_true : (Looked.response filed).of zone = true := by decide +kernel
+theorem copy_copied : Copied zone copy := ⟨rfl, rfl, by decide +kernel⟩
 
-#print axioms loop_terminates
-example : ∃ s, loop relay req (fun _ => .reply reply) 2 [] = some s ∧ ∀ a, s ≠ .need a :=
-  relay_loop_terminates req _
+def nxResponse : Response := ⟨.nxdomain, true, [], [negSoa zone.soa], [], 0⟩
 
-/-- An overlay that answers `fict.com.` itself on a relayed `com.`. -/
-def fict : Overlay :=
-  ⟨relay, zones fun _ => some [0], fun r => r.addr == 1, fun r => r.addr == 2,
-    fun r => ⟨r.addr, r.stream, [1]⟩, fun _ _ => true, fun _ ds => ds⟩
+theorem copy_answer : answerPartial copy.view qNx .all = .response nxResponse := by decide +kernel
 
-example : ∃ s, loop (overlay fict) req (fun _ => .timeout) 3 [] = some s ∧ ∀ a, s ≠ .need a :=
-  overlay_loop_terminates fict _ rfl rfl req _
+#print axioms learned_answer_upstream
+example : ∃ r, answer zone qNx .all = .response r ∧ nxResponse.Grows r :=
+  learned_answer_upstream copy_copied qNx .all copy_answer
 
-/-- The same overlay on a server of another zone, such as a root server: the DS reply does not come from the
-parent, so the overlay relays the question too, its second ask. -/
-def fictAtRoot : Overlay := { fict with serves := fun _ _ => false }
+#print axioms learned_nxdomain_proved
+example : ∃ n m p, Filing.denied m p ∈ copy.filings ∧ m <:+ n ∧ copy.fact n = .absent :=
+  learned_nxdomain_proved copy_answer rfl
 
-example : ∃ s, loop (overlay fictAtRoot) req (fun _ => .reply reply) 3 [] = some s ∧ ∀ a, s ≠ .need a :=
-  overlay_loop_terminates fictAtRoot _ rfl rfl req _
+/-- A copy that has filed only the apex: `www.example.com.` is unknown, so the answer is unknown, not
+NXDOMAIN. -/
+def apexCopy : Learned := ⟨apex, zone.soa, [.node apex apexNode], 1⟩
 
-#print axioms relay_never_guesses
-example : ∃ obs, known.get (relayAsk req) = some (.reply obs) ∧ Wire.restore obs req.query = .ok restored ∧
-    restored.length = obs.length ∧ restored.take 2 = req.query.take 2 :=
-  relay_never_guesses req known restored relay_replies
+theorem apexCopy_reaches : apexCopy.view.Reaches [WWW, EX, COM] := by
+  intro m h1 h2 h3
+  have hm : m <:+ [EX, COM] := suffix_cons_ne h2 h1
+  have : m = apex := List.IsSuffix.eq_of_length hm (Nat.le_antisymm hm.length_le h3.length_le)
+  subst this
+  have hb : (match apexNode with | .dname _ _ => true | _ => false) = false := by decide +kernel
+  exact ⟨apexNode, by decide +kernel, (fun d s h => by rw [h] at hb; cases hb), fun h => absurd rfl h⟩
+
+#print axioms learned_unknown_never_negative
+example : answerPartial apexCopy.view ⟨[WWW, EX, COM], 1⟩ .all = .unknown [WWW, EX, COM] :=
+  (learned_unknown_never_negative apexCopy ⟨[WWW, EX, COM], 1⟩ .all (by decide +kernel) apexCopy_reaches).1
+    (by decide +kernel)
+
+/-- The real server, answering every lookup with the response above. -/
+def upstream : Lookup → Looked := fun _ => .response filed
+
+#print axioms learned_answer_stable
+example : ∃ r, answerPartial (copy.file (upstream ⟨1, apex, qNx⟩)).view qNx .all = .response r ∧
+    nxResponse.Grows r :=
+  learned_answer_stable copy_copied filed_true copy_answer
+
+/-- The server at address 1, holding only the apex, looks `x.b.example.com.` up once and answers NXDOMAIN. -/
+theorem serve_nx : (serve .all 1 upstream 2 apexCopy [] qNx).2 = .reply nxResponse := by decide +kernel
+
+#print axioms serve_one_lookup
+example : (serve .all 1 upstream 7 apexCopy [] qNx).2 = .reply nxResponse := by
+  rw [serve_one_lookup .all 1 upstream 5]; exact serve_nx
+
+/-- With the real server unreachable, the server stays silent rather than guess. -/
+example : (serve .all 1 (fun _ => .nothing) 2 apexCopy [] qNx).2 = .silent := by decide +kernel
+
+#print axioms serve_reply_upstream
+example : ∃ r, answer zone qNx .all = .response r ∧ nxResponse.Grows r :=
+  serve_reply_upstream (fun _ => filed_true) ⟨rfl, rfl, by decide +kernel⟩ serve_nx
+
+#print axioms serve_nxdomain_proved
+example : ∃ n m p, Filing.denied m p ∈ (serve .all 1 upstream 2 apexCopy [] qNx).1.filings ∧ m <:+ n ∧
+    (serve .all 1 upstream 2 apexCopy [] qNx).1.fact n = .absent :=
+  serve_nxdomain_proved serve_nx rfl
 
 end Authority
 
