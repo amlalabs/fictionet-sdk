@@ -75,3 +75,17 @@ pub(super) fn signatures(records: &[Record]) -> Vec<RecordSet> {
     }
     sets
 }
+
+/// The label count of the wildcard's parent when `set`'s RRSIGs show a
+/// wildcard expansion: a Labels field below the owner's label count, a
+/// leading `*` not counted (RFC 4034 §3.1.3, RFC 4035 §5.3.4).
+pub(super) fn expanded_from(set: &RecordSet) -> Option<usize> {
+    let owner = usize::from(set.name().num_labels());
+    set.rrsigs().iter().find_map(|record| match &record.data {
+        RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) => {
+            let labels = usize::from(rrsig.input().num_labels);
+            (labels < owner).then_some(labels)
+        }
+        _ => None,
+    })
+}

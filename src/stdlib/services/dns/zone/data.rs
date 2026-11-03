@@ -139,7 +139,8 @@ where
 /// A question for the name and the type of an RRset it holds answers from
 /// that RRset. So does every question at the name when it holds a CNAME,
 /// which leaves no room for other data there (RFC 1034 §3.6.2), except a
-/// question for RRSIGs when the CNAME carries none. Every
+/// question for RRSIGs when the CNAME carries none, and one for NSEC,
+/// whose RRset may sit beside a CNAME (RFC 4035 §2.5). Every
 /// other fact is unknown: a capture holding `www.example A` says nothing
 /// about `www.example AAAA`, nor about the zone's SOA or NS RRsets. A
 /// resolver then goes on to its next local zone or iterates, and a server
@@ -196,6 +197,9 @@ impl ZoneData for Shown {
             // RRSIGs travel inside the RRsets they cover, so a CNAME
             // answers for them only when it carries some.
             RecordType::RRSIG => cname.filter(|set| !set.rrsigs().is_empty()),
+            // An NSEC RRset may sit beside a CNAME (RFC 4035 §2.5), and
+            // answers an NSEC question before the CNAME does.
+            RecordType::NSEC => self.sets.get(&RecordType::NSEC),
             qtype => self.sets.get(&qtype).or(cname),
         };
         Arc::new(ShownView {

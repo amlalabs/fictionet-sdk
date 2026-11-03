@@ -1523,7 +1523,10 @@ type Front = dyn Fn(Host) -> Host + Send + Sync;
 /// host's machine is already, such as a site placed first, the server
 /// joins it; where a mirrored server or a preset's server already
 /// answers, nothing more is placed, and the address serves the new zone
-/// too. A server joining a machine takes its port 53, so a world puts no
+/// too. An address a filed NS RRset names whose real server turns out not
+/// to serve the zone, as at a lame delegation, answers for the rest of
+/// the session from the zones it does serve, as [`Copies`] says. A
+/// server joining a machine takes its port 53, so a world puts no
 /// DNS server of its own at an address the real hierarchy names. The
 /// names of name servers and the addresses filed for them are forgotten
 /// when the namespace advances, and so is every zone's copied data.

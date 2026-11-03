@@ -649,7 +649,7 @@ pub(super) mod tests {
         let view = data.view(&request.question);
         match answer(&*view, &request, AnyResponse::All) {
             Answered::Response(response) => response.message,
-            Answered::Unknown { name } => panic!("{qname} {qtype}: unknown at {name}"),
+            Answered::Unknown { name, .. } => panic!("{qname} {qtype}: unknown at {name}"),
         }
     }
 

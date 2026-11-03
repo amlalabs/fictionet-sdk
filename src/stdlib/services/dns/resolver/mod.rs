@@ -194,7 +194,7 @@ impl<V: Verify> Resolver<V> {
     /// against dates from `clock`, in generation 0.
     pub fn new(config: Config, verify: V, clock: WallClock) -> Resolver<V> {
         let server = ServerConfig {
-            identity: Some(config.identity.clone()),
+            identity: config.identity.clone(),
             payload: config.payload,
             ede: config.ede,
             any: config.any,
@@ -274,10 +274,7 @@ impl<V: Verify> Resolver<V> {
         let qtype = request.question.query_type();
         match request.question.query_class() {
             DNSClass::CH => {
-                let bytes = self
-                    .server
-                    .render_chaos(&request)
-                    .expect("a resolver's server front has its identity");
+                let bytes = self.server.render_chaos(&request);
                 return self.send_answer(client, bytes, Validation::NotPerformed, false);
             }
             DNSClass::IN if !matches!(qtype, RecordType::AXFR | RecordType::IXFR) => {}
@@ -579,7 +576,7 @@ impl<V: Verify> Resolver<V> {
         };
         let mut waiting = BTreeSet::new();
         if asker.validate && !asker.cache_only {
-            let needed: Vec<(usize, usize, Subject, Outcome)> = asker
+            let needed: Vec<(usize, usize, Subject, Outcome, Instant)> = asker
                 .pieces
                 .iter()
                 .enumerate()
@@ -591,17 +588,18 @@ impl<V: Verify> Resolver<V> {
                         .enumerate()
                         .filter(|(_, (_, validation))| *validation == Validation::NotPerformed)
                         .map(move |(at, (subject, _))| {
-                            (index, at, subject.clone(), piece.outcome.clone())
+                            (index, at, subject.clone(), piece.outcome.clone(), piece.at)
                         })
                 })
                 .collect();
-            for (index, at, subject, outcome) in needed {
+            for (index, at, subject, outcome, current) in needed {
                 // Like a piece's lookup, its check's lookups nest from 0,
                 // whatever number of aliases led to it.
                 match self.check(
                     resolution::Node::Asker(id),
                     subject,
                     &outcome,
+                    current,
                     TreeId::of(id),
                     0,
                     entropy,

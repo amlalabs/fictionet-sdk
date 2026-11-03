@@ -1409,7 +1409,7 @@ fn zone_answers() {
             Answered::Response(response) => {
                 compare_answer(&zone, &req, any, expected, &response, tally)
             }
-            Answered::Unknown { name } => Err(format!(
+            Answered::Unknown { name, .. } => Err(format!(
                 "a complete zone answered Unknown at {}",
                 name_text(&Name::from(&name))
             )),
@@ -1459,7 +1459,7 @@ fn compare_answer(
     let typed = request(req.question.name(), lean_type, false);
     let mut typed = match answer(view, &typed, any) {
         Answered::Response(typed) => typed,
-        Answered::Unknown { name } => {
+        Answered::Unknown { name, .. } => {
             return Err(format!("unknown at {}", name_text(&Name::from(&name))));
         }
     };
@@ -1518,7 +1518,7 @@ fn partial_answers() {
         let any = any_response(text(input, "any"));
         let rust = answer(&view, &req, any);
         match (expected.get("unknown"), rust) {
-            (Some(lean), Answered::Unknown { name }) => same(
+            (Some(lean), Answered::Unknown { name, .. }) => same(
                 "unknown name",
                 lean.as_str().unwrap().to_string(),
                 name_text(&Name::from(&name)),
@@ -1536,7 +1536,7 @@ fn partial_answers() {
                 lean.as_str().unwrap(),
                 rcode_text(response.message.metadata.response_code)
             )),
-            (None, Answered::Unknown { name }) => Err(format!(
+            (None, Answered::Unknown { name, .. }) => Err(format!(
                 "Lean answered; Rust: unknown at {}",
                 name_text(&Name::from(&name))
             )),
@@ -2256,7 +2256,7 @@ fn signed_case(
     let req = vector_request(field(input, "request"), true);
     let response = match answer(&signed, &req, AnyResponse::All) {
         Answered::Response(response) => response,
-        Answered::Unknown { name } => {
+        Answered::Unknown { name, .. } => {
             return same(
                 "unknown",
                 expected
@@ -2428,7 +2428,7 @@ fn parent_chain(
         AnyResponse::All,
     ) {
         Answered::Response(response) => response.message,
-        Answered::Unknown { name } => return Err(format!("the parent does not know {name}")),
+        Answered::Unknown { name, .. } => return Err(format!("the parent does not know {name}")),
     };
     let ds_set = record_sets(&reply.answers)
         .into_iter()
@@ -3044,10 +3044,17 @@ fn offer(cache: &mut Cache, offer: &Value, now: Instant, limits: Limits) {
     }
     let validation = vector_validation(field(offer, "validation"));
     let truncated = flag(offer, "truncated");
+    // Stored and validated at once, so the RRSIGs' TTL counts from now.
+    // A TTL with the top bit set reads as 0 (RFC 2181 §8).
     let signatures_expire = field(offer, "sig_expires").as_u64().map(at);
-    let original_ttl = field(offer, "original_ttl")
-        .as_u64()
-        .map(|ttl| u32::try_from(ttl).expect("a TTL fits 32 bits"));
+    let ttl_bound = field(offer, "original_ttl").as_u64().map(|ttl| {
+        let ttl = if ttl & 0x8000_0000 != 0 { 0 } else { ttl };
+        now + Duration::from_secs(ttl)
+    });
+    let secure_until = match (signatures_expire, ttl_bound) {
+        (Some(expire), Some(ttl)) => Some(expire.min(ttl)),
+        (expire, ttl) => expire.or(ttl),
+    };
     match text(offer, "kind") {
         "positive" => {
             let set = vector_rrset(&texts(offer, "set"));
@@ -3076,14 +3083,7 @@ fn offer(cache: &mut Cache, offer: &Value, now: Instant, limits: Limits) {
                     Some(Entry::Positive { expires, rank: r, .. }) if *expires == fresh && *r == rank
                 );
             if stored {
-                cache.validated(
-                    &key,
-                    &checked,
-                    validation,
-                    signatures_expire,
-                    original_ttl,
-                    now,
-                );
+                cache.validated(&key, &checked, validation, secure_until, now);
             }
         }
         "negative" => {
@@ -3146,14 +3146,7 @@ fn offer(cache: &mut Cache, offer: &Value, now: Instant, limits: Limits) {
                     Some(Entry::Negative { expires, rank: r, .. }) if Some(*expires) == fresh && *r == rank
                 );
             if stored {
-                cache.validated(
-                    &stored_key,
-                    &checked,
-                    validation,
-                    signatures_expire,
-                    original_ttl,
-                    now,
-                );
+                cache.validated(&stored_key, &checked, validation, secure_until, now);
             }
         }
         other => panic!("no offer kind {other}"),

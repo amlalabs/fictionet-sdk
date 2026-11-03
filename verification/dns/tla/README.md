@@ -40,7 +40,7 @@ proof of the rule and the counterexample that shows why it is there.
 | | `PolicyHolds` | invariant | no lookup the policy refuses reaches the upstream, root and TLD lookups included |
 | | `UnknownNeverNegative` | invariant | no NXDOMAIN or NODATA rests on an unknown fact of the lazy zone, or on a question the copy does not settle |
 | | `CoherentRevision` | invariant | every reply from the lazy zone agrees with one revision of it |
-| | `OneAskPerNeed` | invariant | a request needs at most one lookup per generation, and requests that need the same lookup wait on one: no two pending lookups are the same |
+| | `OneAskPerNeed` | invariant | a request needs at most one lookup per fact per generation (the question, and for a crossing question first the overlay's `fict DS`), and requests that need the same lookup wait on one: no two pending lookups are the same |
 | | `NoAskAfterReply` | invariant over steps (`PROPERTY`) | once a lookup has come back to a request (a response, or Unreachable or NoReply in its place), the request never needs it again in that generation |
 | | `NoLockAcrossAsk` | invariant | a request parked on a lookup holds no part of a view |
 | | `EveryParkedAnswered` | liveness | every request that waits on a lookup is answered or silently dropped |
@@ -162,10 +162,10 @@ in `_concurrent` explores the same states as the invariants there.
 | Exchanges_idonly | `MatchRequiresTuple` | violated | 64 | 5 | 1 s | Query, Send, Spoof, Deliver |
 | Exchanges_flushonly | `ObsoleteNeverPopulates` | violated | 282 | 6 | 0 s | Query, Send, Serve, Advance, Deliver |
 | Exchanges_cancelshared | `CancelPreservesWaiters` | violated | 13 | 4 | 1 s | Query, Query, Gone |
-| Authority_base | the 6 invariants, `NoAskAfterReply`, `EveryParkedAnswered` | pass | 196896 | 27 | 2-36 s | |
-| Authority_fail | the 6 invariants, `NoAskAfterReply`, `EveryParkedAnswered` | pass | 48888 | 22 | 1-4 s | |
+| Authority_base | the 6 invariants, `NoAskAfterReply`, `EveryParkedAnswered` | pass | 401424 | 31 | 3-74 s | |
+| Authority_fail | the 6 invariants, `NoAskAfterReply`, `EveryParkedAnswered` | pass | 107712 | 26 | 1-9 s | |
 | Authority_lazy | the 6 invariants, `NoAskAfterReply`, `EveryParkedAnswered` | pass | 784 | 12 | 0-1 s | |
-| Authority_advance | the 6 invariants, `NoAskAfterReply`, `EveryParkedAnswered` | pass | 46304 | 21 | 0-3 s | |
+| Authority_advance | the 6 invariants, `NoAskAfterReply`, `EveryParkedAnswered` | pass | 46304 | 21 | 0-2 s | |
 | Authority_share | the 6 invariants, `NoAskAfterReply`, `EveryParkedAnswered` | pass | 2970 | 15 | 0-1 s | |
 | Authority_nopolicy | `PolicyHolds` | violated | 7 | 2 | 0 s | Step: the root server's copy lacks leak.evil, and its lookup reaches the upstream |
 | Authority_rootexempt | `PolicyHolds` | violated | 7 | 2 | 0 s | Step: the same lookup, exempt because it goes to a root server |
@@ -175,7 +175,7 @@ in `_concurrent` explores the same states as the invariants there.
 | Authority_reask | `NoAskAfterReply` | violated | 162 | 4 | 0 s | the same trace: the second Step needs the lookup whose NoReply came back |
 | Authority_parkinview | `NoLockAcrossAsk` | violated | 6 | 3 | 0 s | ReadOverlay, Step: the overlay reads the lazy zone, then parks on its DS lookup while it still holds that read |
 | Authority_noshare | `OneAskPerNeed` | violated | 7 | 3 | 0 s | Step, Step: two requests for www.real at the root server each put a lookup of it |
-| Authority_anyzone | `NeverGuess` | violated | 73 | 5 | 0 s | Step (the TLD server looks www.real up), Source, Observe (the response is filed into both copies), Step: the root server answers from the TLD's response |
+| Authority_anyzone | `NeverGuess` | violated | 73 | 5 | 0 s | Step (the root server looks www.real up), Upstream, Observe (the response is filed into both copies), Step: the TLD server answers from the root's response |
 | Authority_wakeone | `EveryParkedAnswered` | violated | 802 | stuttering | 1 s | the two requests for www.real at the root server wait on one lookup; when it ends, only the first is woken, and the second stays parked |
 | Validation_paths | the 11 invariants | pass | 681984 | 1 | 1-3 s | |
 | Validation_skew | the 11 invariants | pass | 10368 | 1 | 0-1 s | |
@@ -310,13 +310,26 @@ Authority:
 * A server of a learned zone answers from its copy and looks up what the
   copy does not settle, as `Zones` does: a lookup of the client's question
   at its own address. A response is filed into the copy the lookup names
-  (`Copies::keep`) and settles its question. The root's response to a
-  question below the TLD is a referral, a cut that settles every question
-  below the TLD, as `Learned` answers below a filed cut, so every request
-  needs at most one lookup. A copy belongs to one session: `Advance` drops
-  it.
-* `OneAskPerNeed` checks that a request needs at most one lookup per
-  generation, and that requests needing the same lookup wait on one
+  and settles its question. The root's response to a question below the
+  TLD is a referral, a cut that refers the name it was for and the names
+  above it, as `Learned` refers below a filed cut: the referral for
+  `a.fict` settles `fict DS`, but not the other way round. A copy belongs
+  to one session: `Advance` drops it.
+* The questions carry no CNAME or DNAME chains, so no lookup is for the
+  name a chain reached, which `Zones` looks up when the response to the
+  client's question was filed and did not settle it; a server that
+  answers as the RFCs say carries the whole chain in that response.
+* `Copies::keep` files a response into the copy the lookup names, which
+  `ObserveOne` models. Its other branches are not in this spec: filing a
+  response from a zone below the lookup's into that zone's copy
+  (`Learned::child_answering`), the SOA question that finds such a zone's
+  apex, and an address answering without a zone its real server turns out
+  not to serve. `tests/it/dns/learned.rs` checks them:
+  `copies_learn_a_child_zone_its_server_also_serves`,
+  `copies_find_a_zone_below_a_cut_they_hold`, and
+  `copies_drop_a_zone_their_real_server_does_not_serve`.
+* `OneAskPerNeed` checks that a request needs at most one lookup per fact
+  per generation, and that requests needing the same lookup wait on one
   pending lookup (`AuthorityEngine::park`); `_noshare`, which puts a lookup
   per need, breaks the second part. `NoAskAfterReply` checks that a lookup
   that came back is never needed again by that request in the generation,
@@ -334,7 +347,8 @@ Authority:
   on the copied DS response, so `UnknownNeverNegative`,
   `CoherentRevision`, and `NeverGuess` cover it. The real root server does
   not serve the parent, so the root server answers the question as its
-  base does, from its copy.
+  base does, from its copy, after a lookup of the question itself, which
+  the referral for `fict DS` does not settle.
 * `NeverGuess` checks each copied fact a reply rests on against the
   responses the upstream sent, per lookup: server and question.
   `_anyzone`, where a response is filed into every copy rather than the one
@@ -445,17 +459,17 @@ Authority:
 | Model | Rust |
 |---|---|
 | `Respond(r)` | `Authority::respond(req, local, server, client) -> Step` (`Reply`, `Need(Lookup)`, `Silent`) |
-| `copy[z]`, `Entry`, `Settles` | the zone's `Learned` copy in `Copies`, and the facts a filing gives |
+| `copy[z]`, `Entry`, `Settles` | the zone's `Learned` copy in `Copies`, and the facts a filing gives; a filed cut refers the name the referral was for and the names above it (`LearnedView::cut`) |
 | `looked[r]` | `Waiter::looked` |
 | `pending`, `waiting` | `AuthorityEngine.lookups: BTreeMap<Token, Pending>` and each `Pending`'s waiters |
-| `atSource`, `obsq` | the driver carrying `Action::Lookup` to the `Upstream` and back as `Input::Looked` |
+| `atUpstream`, `obsq` | the driver carrying `Action::Lookup` to the `Upstream` and back as `Input::Looked` |
 | `PolicyPasses` | `Only<U, P>` with `P: Fn(&Lookup) -> bool`; a refused lookup is `Looked::NoReply` |
-| `ObserveOne` | `AuthorityEngine::complete`: `Authority::file`, then `respond` again for each waiter |
+| `ObserveOne` | `AuthorityEngine::complete`: `Authority::file`, as `Copies::keep` files a response from the zone the lookup names, then `respond` again for each waiter |
 | `View(r)` | `Lazy::view` under its one lock, then `zone::answer` |
 | `Provider(w, n)` | `Provider::lookup -> Fact<Vec<RecordSet>>` |
-| `ins`, `history`, `rev` | the lazy zone's `Mutex<Zone>` and its `Revision`s |
+| `ins`, `history`, `rev` | the lazy zone's `Mutex<Held>`: the nodes it holds and their `Revision` |
 | `ViewReply` with `"unknown"` | `Answered::Unknown`, which `Zones` answers SERVFAIL for a zone that is not learned |
-| `Crosses(r)` | `Overlay::below` reading the inner authority's `<apex> NS` and asking its base `<apex> DS` before composing a referral |
+| `Crosses(r)` | `<Overlay as Authority>::respond` reading the inner authority's `<apex> NS` and asking its base `<apex> DS` before composing a referral |
 
 Validation:
 

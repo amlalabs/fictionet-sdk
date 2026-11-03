@@ -100,7 +100,7 @@ fn request(qname: &str, qtype: RecordType, dnssec_ok: bool) -> Request {
 fn response(view: &dyn View, qname: &str, qtype: RecordType, dnssec_ok: bool) -> Response {
     match answer(view, &request(qname, qtype, dnssec_ok), AnyResponse::All) {
         Answered::Response(response) => response,
-        Answered::Unknown { name } => panic!("{qname} {qtype}: unknown at {name}"),
+        Answered::Unknown { name, .. } => panic!("{qname} {qtype}: unknown at {name}"),
     }
 }
 
@@ -1397,7 +1397,7 @@ fn any_follows_rfc_8482() {
         mode,
     ) {
         Answered::Response(response) => response.message,
-        Answered::Unknown { name } => panic!("unknown at {name}"),
+        Answered::Unknown { name, .. } => panic!("unknown at {name}"),
     };
     let all = any(AnyResponse::All);
     assert_eq!(
@@ -1451,7 +1451,7 @@ fn any_at_a_cname_gets_the_cname_rather_than_a_hinfo() {
             AnyResponse::Hinfo,
         ) {
             Answered::Response(response) => response.message,
-            Answered::Unknown { name } => panic!("unknown at {name}"),
+            Answered::Unknown { name, .. } => panic!("unknown at {name}"),
         };
         assert_eq!(rows(&reply.answers), vec![row(owner, RecordType::CNAME)]);
         assert!(reply.metadata.authoritative);
@@ -1540,7 +1540,7 @@ fn rrsigs_travel_only_with_do() {
         AnyResponse::OneRrset(rtype),
     ) {
         Answered::Response(response) => rows(&response.message.answers),
-        Answered::Unknown { name } => panic!("unknown at {name}"),
+        Answered::Unknown { name, .. } => panic!("unknown at {name}"),
     };
     assert_eq!(
         one("www.signed.", RecordType::NSEC),
@@ -1870,11 +1870,7 @@ fn an_unknown_fact_never_becomes_a_negative() {
                 // zone would not give. An unknown NS, MX, or SRV target
                 // only leaves its addresses out of the optional
                 // additional data.
-                if partly
-                    == (Answered::Unknown {
-                        name: unknown.clone(),
-                    })
-                {
+                if matches!(&partly, Answered::Unknown { name, .. } if *name == unknown) {
                     read += 1;
                 } else if partly != complete {
                     let (Answered::Response(partly), Answered::Response(complete)) =
@@ -1903,28 +1899,75 @@ fn an_unknown_fact_never_becomes_a_negative() {
 #[test]
 fn negatives_rest_on_facts_that_must_be_known() {
     let zone = example();
-    // (question, a fact the negative rests on)
+    // (question, a fact the negative rests on, the name the answer had
+    // reached)
     let cases = [
         // NXDOMAIN needs the name absent and the wildcard absent.
-        ("nope.example.", RecordType::A, "nope.example."),
-        ("nope.example.", RecordType::A, "*.example."),
+        (
+            "nope.example.",
+            RecordType::A,
+            "nope.example.",
+            "nope.example.",
+        ),
+        (
+            "nope.example.",
+            RecordType::A,
+            "*.example.",
+            "nope.example.",
+        ),
         // A closer name stops a wildcard only if it is known to exist.
-        ("x.e.w.example.", RecordType::A, "e.w.example."),
-        ("x.e.w.example.", RecordType::A, "*.e.w.example."),
+        (
+            "x.e.w.example.",
+            RecordType::A,
+            "e.w.example.",
+            "x.e.w.example.",
+        ),
+        (
+            "x.e.w.example.",
+            RecordType::A,
+            "*.e.w.example.",
+            "x.e.w.example.",
+        ),
         // NODATA needs the node known.
-        ("b.c.example.", RecordType::A, "b.c.example."),
-        ("www.example.", RecordType::AAAA, "www.example."),
+        (
+            "b.c.example.",
+            RecordType::A,
+            "b.c.example.",
+            "b.c.example.",
+        ),
+        (
+            "www.example.",
+            RecordType::AAAA,
+            "www.example.",
+            "www.example.",
+        ),
         // Every name on the way down.
-        ("b.c.example.", RecordType::A, "c.example."),
-        ("nope.example.", RecordType::A, "example."),
+        ("b.c.example.", RecordType::A, "c.example.", "b.c.example."),
+        ("nope.example.", RecordType::A, "example.", "nope.example."),
         // A wildcard NODATA needs the wildcard known.
-        ("anything.w.example.", RecordType::AAAA, "*.w.example."),
-        // After a chain, the RCODE rests on the target.
-        ("dangling.example.", RecordType::A, "gone.example."),
+        (
+            "anything.w.example.",
+            RecordType::AAAA,
+            "*.w.example.",
+            "anything.w.example.",
+        ),
+        // After a chain, the RCODE rests on the target, which the answer
+        // has reached.
+        (
+            "dangling.example.",
+            RecordType::A,
+            "gone.example.",
+            "gone.example.",
+        ),
         // DS NODATA at a cut needs the cut known.
-        ("zone.example.", RecordType::DS, "zone.example."),
+        (
+            "zone.example.",
+            RecordType::DS,
+            "zone.example.",
+            "zone.example.",
+        ),
     ];
-    for (qname, qtype, unknown) in cases {
+    for (qname, qtype, unknown, reached) in cases {
         let partial = Partial {
             zone: &zone,
             unknown: lower(unknown),
@@ -1933,7 +1976,8 @@ fn negatives_rest_on_facts_that_must_be_known() {
         assert_eq!(
             answer(&partial, &request(qname, qtype, false), AnyResponse::All),
             Answered::Unknown {
-                name: lower(unknown)
+                name: lower(unknown),
+                reached: lower(reached),
             },
             "{qname} {qtype} with {unknown} unknown"
         );
@@ -1955,7 +1999,8 @@ fn negatives_rest_on_facts_that_must_be_known() {
         assert_eq!(
             answer(&partial, &request(qname, qtype, true), AnyResponse::All),
             Answered::Unknown {
-                name: lower(unknown)
+                name: lower(unknown),
+                reached: lower(qname),
             },
             "{qname} {qtype} with the denial at {unknown} unknown"
         );
@@ -1988,7 +2033,8 @@ fn transparent_turns_absence_into_unknown() {
             AnyResponse::All
         ),
         Answered::Unknown {
-            name: lower("nope.example.")
+            name: lower("nope.example."),
+            reached: lower("nope.example."),
         }
     );
     // So is a name that only an absent wildcard would deny.
@@ -1999,7 +2045,8 @@ fn transparent_turns_absence_into_unknown() {
             AnyResponse::All
         ),
         Answered::Unknown {
-            name: lower("x.e.w.example.")
+            name: lower("x.e.w.example."),
+            reached: lower("x.e.w.example."),
         }
     );
 }
@@ -2034,7 +2081,8 @@ fn transparent_walks_past_empty_non_terminals_to_a_cname_target() {
                 AnyResponse::All
             ),
             Answered::Unknown {
-                name: lower("b.example.")
+                name: lower("b.example."),
+                reached: lower("b.example."),
             },
             "{qname}"
         );
@@ -2078,7 +2126,8 @@ fn shown_data_knows_only_its_own_rrsets() {
         );
     }
 
-    // A CNAME answers every type at its name.
+    // A CNAME answers every type at its name but NSEC, whose RRset may
+    // sit beside it (RFC 4035 §2.5): whether the name has one is unknown.
     let alias = Shown::new(
         &name("www.example."),
         [rrset("www.example.", 300, vec![cname("edge.cdn.test.")])],
@@ -2092,6 +2141,15 @@ fn shown_data_knows_only_its_own_rrsets() {
     assert_eq!(
         rows(&reply.answers),
         vec![row("www.example.", RecordType::CNAME)]
+    );
+    let answered = answer(
+        &*view_of(&alias, "www.example.", RecordType::NSEC),
+        &request("www.example.", RecordType::NSEC, false),
+        AnyResponse::All,
+    );
+    assert!(
+        matches!(answered, Answered::Unknown { .. }),
+        "NSEC at the alias: {answered:?}"
     );
     let reply = ask(
         &*view_of(&alias, "www.example.", RecordType::ANY),
@@ -2111,7 +2169,8 @@ fn shown_data_knows_only_its_own_rrsets() {
             AnyResponse::All
         ),
         Answered::Unknown {
-            name: lower("www.example.")
+            name: lower("www.example."),
+            reached: lower("www.example."),
         }
     );
 
@@ -2187,7 +2246,7 @@ fn lazy_ask(zone: &dyn ZoneData, qname: &str, qtype: RecordType) -> Answered {
 fn lazy_reply(zone: &dyn ZoneData, qname: &str, qtype: RecordType) -> Message {
     match lazy_ask(zone, qname, qtype) {
         Answered::Response(response) => response.message,
-        Answered::Unknown { name } => panic!("unknown at {name}"),
+        Answered::Unknown { name, .. } => panic!("unknown at {name}"),
     }
 }
 
@@ -2324,13 +2383,15 @@ fn an_unknown_provider_answer_is_unknown_and_not_kept() {
     assert_eq!(
         lazy_ask(&zone, "dark.lazy.", RecordType::A),
         Answered::Unknown {
-            name: lower("dark.lazy.")
+            name: lower("dark.lazy."),
+            reached: lower("dark.lazy."),
         }
     );
     assert_eq!(
         lazy_ask(&zone, "below.dark.lazy.", RecordType::A),
         Answered::Unknown {
-            name: lower("dark.lazy.")
+            name: lower("dark.lazy."),
+            reached: lower("below.dark.lazy."),
         }
     );
     put(
@@ -2403,7 +2464,8 @@ fn transparent_over_lazy_lets_absent_names_through() {
     assert_eq!(
         lazy_ask(&zone, "other.lazy.", RecordType::A),
         Answered::Unknown {
-            name: lower("other.lazy.")
+            name: lower("other.lazy."),
+            reached: lower("other.lazy."),
         }
     );
 }
@@ -2427,7 +2489,8 @@ fn transparent_leaves_empty_non_terminals_unknown() {
     assert_eq!(
         lazy_ask(&zone, "b.lazy.", RecordType::A),
         Answered::Unknown {
-            name: lower("b.lazy.")
+            name: lower("b.lazy."),
+            reached: lower("b.lazy."),
         }
     );
     // A name with RRsets, without the asked type, is NODATA.
@@ -2448,13 +2511,23 @@ fn a_lazy_name_the_provider_does_not_know_stays_unknown_after_a_name_below_it() 
         "www.a.lazy.",
         Fact::Present(vec![rrset("www.a.lazy.", 60, vec![a("10.0.0.1")])]),
     );
-    let unknown = Answered::Unknown {
+    let unknown = |reached: &str| Answered::Unknown {
         name: lower("a.lazy."),
+        reached: lower(reached),
     };
-    assert_eq!(lazy_ask(&zone, "a.lazy.", RecordType::A), unknown);
+    assert_eq!(
+        lazy_ask(&zone, "a.lazy.", RecordType::A),
+        unknown("a.lazy.")
+    );
     // The walk down to the name below passes the unknown one.
-    assert_eq!(lazy_ask(&zone, "www.a.lazy.", RecordType::A), unknown);
-    assert_eq!(lazy_ask(&zone, "a.lazy.", RecordType::A), unknown);
+    assert_eq!(
+        lazy_ask(&zone, "www.a.lazy.", RecordType::A),
+        unknown("www.a.lazy.")
+    );
+    assert_eq!(
+        lazy_ask(&zone, "a.lazy.", RecordType::A),
+        unknown("a.lazy.")
+    );
     // Once the provider calls it absent, it is an empty non-terminal.
     put(&book, "a.lazy.", Fact::Absent);
     let reply = lazy_reply(&zone, "a.lazy.", RecordType::A);
@@ -2481,7 +2554,8 @@ fn a_lazy_cut_waits_for_its_in_domain_glue() {
     assert_eq!(
         lazy_ask(&zone, "www.sub.lazy.", RecordType::A),
         Answered::Unknown {
-            name: lower("sub.lazy.")
+            name: lower("sub.lazy."),
+            reached: lower("www.sub.lazy."),
         }
     );
     put(

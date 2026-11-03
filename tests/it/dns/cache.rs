@@ -354,27 +354,6 @@ fn expires(cache: &Cache, key: &Key, now: Instant) -> Instant {
     }
 }
 
-#[test]
-fn a_secure_rrset_lives_no_longer_than_its_rrsigs_original_ttl() {
-    let mut cache = cache();
-    let www = key("www.example.", RecordType::A);
-    let set = signed(
-        rrset("www.example.", 86400, vec![a("192.0.2.1")]),
-        86400,
-        300,
-    );
-    cache.insert(at(0), positive(set.clone()));
-    cache.validated(
-        &www,
-        &Checked::Rrset(set),
-        Validation::Secure,
-        Some(at(2_000_000)),
-        Some(300),
-        at(1),
-    );
-    assert_eq!(expires(&cache, &www, at(1)), at(300));
-}
-
 /// A validation's result lands only on the data it checked: an RRset
 /// stored at the key while the validation waited keeps what it had.
 #[test]
@@ -388,7 +367,6 @@ fn a_result_applies_only_to_the_data_it_checked() {
         &www,
         &Checked::Rrset(signed),
         Validation::Secure,
-        None,
         None,
         at(1),
     );
@@ -405,17 +383,17 @@ fn a_result_applies_only_to_the_data_it_checked() {
         &Checked::Rrset(same),
         Validation::Insecure(fictionet::stdlib::protocols::dns::dnssec::Insecure::NoAnchor),
         None,
-        None,
         at(1),
     );
     assert!(matches!(validation(&cache), Validation::Insecure(_)));
 }
 
 /// The RRSIGs are an RRset of their own: their TTL does not shorten data
-/// that has not validated, and the TTL of the RRSIG that verified it
-/// bounds a Secure RRset (RFC 4035 §5.3.3).
+/// that has not validated, and a Secure RRset lives no longer than the
+/// RRSIGs that verified it keep it Secure (RFC 4035 §5.3.3), as the
+/// resolver works that out.
 #[test]
-fn only_the_verifying_rrsigs_ttl_bounds_an_rrset() {
+fn a_secure_rrset_lives_no_longer_than_its_result() {
     let mut cache = cache();
     let www = key("www.example.", RecordType::A);
     let set = signed(
@@ -429,8 +407,7 @@ fn only_the_verifying_rrsigs_ttl_bounds_an_rrset() {
         &www,
         &Checked::Rrset(set),
         Validation::Secure,
-        Some(at(2_000_000)),
-        Some(600),
+        Some(at(600)),
         at(1),
     );
     assert_eq!(expires(&cache, &www, at(1)), at(600));

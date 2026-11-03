@@ -4250,11 +4250,13 @@ fn the_verifying_rrsigs_own_ttl_bounds_a_secure_answer() {
     }
 }
 
-/// A wildcard answer whose authority section holds an NSEC RRset that
-/// does not verify is Bogus: its proof goes out with it, and AD may stand
-/// only when every RRset there is authentic (RFC 4035 §3.2.3).
+/// A wildcard answer carries the NSEC records that prove no closer name
+/// matched (RFC 4035 §3.1.3.3), and only those: an NSEC RRset beside them
+/// that proves nothing for it, here one that does not verify, never
+/// reaches the client, so AD stands only on authentic data
+/// (RFC 4035 §3.2.3).
 #[test]
-fn a_wildcard_answer_beside_an_nsec_that_does_not_verify_is_bogus() {
+fn a_wildcard_answer_carries_only_its_own_proof() {
     let (mut net, anchors) = changed_example(|req, message| {
         if req.question.name() != &name("x.wild.example.com.") {
             return;
@@ -4285,6 +4287,276 @@ fn a_wildcard_answer_beside_an_nsec_that_does_not_verify_is_bogus() {
         0,
         query(client(1), "x.wild.example.com.", RecordType::A, dnssec_ok),
     );
+    assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+    assert!(reply.metadata.authentic_data);
+    assert_eq!(addresses(&reply), vec!["192.0.2.77"]);
+    let nsec: Vec<String> = reply
+        .authorities
+        .iter()
+        .filter(|record| record.record_type() == RecordType::NSEC)
+        .map(|record| record.name.to_string())
+        .collect();
+    assert_eq!(nsec, ["*.wild.example.com."]);
+}
+
+/// A wildcard answer whose proof does not verify is Bogus: the proof goes
+/// out with it, and AD may stand only when every RRset there is
+/// authentic (RFC 4035 §3.2.3).
+#[test]
+fn a_wildcard_answer_whose_proof_does_not_verify_is_bogus() {
+    let (mut net, anchors) = changed_example(|req, message| {
+        if req.question.name() != &name("x.wild.example.com.") {
+            return;
+        }
+        // The covering NSEC lists one type more than its RRSIG signed.
+        for record in &mut message.authorities {
+            if let RData::DNSSEC(DNSSECRData::NSEC(nsec)) = &record.data {
+                let changed = NSEC::new(
+                    nsec.next_domain_name().clone(),
+                    [
+                        RecordType::A,
+                        RecordType::TXT,
+                        RecordType::RRSIG,
+                        RecordType::NSEC,
+                    ],
+                );
+                record.data = RData::DNSSEC(DNSSECRData::NSEC(changed));
+            }
+        }
+    });
+    let mut resolver = resolver(config(anchors));
+    let reply = ask(
+        &mut resolver,
+        &mut net,
+        0,
+        query(client(1), "x.wild.example.com.", RecordType::A, dnssec_ok),
+    );
     assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
     assert_eq!(edes(&reply), [EdeCode::DNSSEC_BOGUS]);
+}
+
+/// Whether a record of `records` comes twice.
+fn repeats(records: &[Record]) -> bool {
+    records
+        .iter()
+        .enumerate()
+        .any(|(index, record)| records[..index].contains(record))
+}
+
+/// [`internet`] signed, with `example.com` built by `zone` from its apex
+/// NS RRset and name server address, signed with NSEC by the keys its DS
+/// names, at both of its servers.
+fn signed_example(zone: impl FnOnce(ZoneBuilder) -> ZoneBuilder) -> (MemoryNet, Option<Anchors>) {
+    let (mut net, anchors) = internet(true);
+    let zone = zone(builder("example.com.", "ns1.example.com.").rrset(rrset(
+        "ns1.example.com.",
+        3600,
+        vec![a(EXAMPLE), a(EXAMPLE_TOO)],
+    )))
+    .build()
+    .unwrap()
+    .signed(&keys(40), window(), Denial::Nsec)
+    .unwrap();
+    serve_at(&mut net, EXAMPLE, vec![zone.clone()]);
+    serve_at(&mut net, EXAMPLE_TOO, vec![zone]);
+    (net, anchors)
+}
+
+/// A CNAME that is no wildcard's answer brings no NSEC records of its
+/// own: those of the reply are the proof of the negative its chain ends
+/// in, which goes out once (RFC 4035 §3.1.3, RFC 2181 §5). So the reply
+/// keeps the size the server's had, with its SOA, and the CNAME answers
+/// a later question from the cache without them.
+#[test]
+fn a_chain_into_a_negative_carries_its_proof_once() {
+    let (mut net, anchors) = internet(true);
+    let mut r = resolver(config(anchors));
+    let reply = ask(
+        &mut r,
+        &mut net,
+        0,
+        query(client(1), "alias.example.com.", RecordType::AAAA, dnssec_ok),
+    );
+    assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+    assert!(reply.metadata.authentic_data);
+    assert!(!repeats(&reply.authorities), "{:?}", reply.authorities);
+    let authority = rows(&reply.authorities);
+    assert!(authority.contains(&("www.example.com.".to_string(), RecordType::NSEC)));
+    assert!(authority.contains(&("example.com.".to_string(), RecordType::SOA)));
+
+    let (mut net, anchors) = signed_example(|zone| {
+        zone.rrset(rrset(
+            "gone.example.com.",
+            300,
+            vec![RData::CNAME(CNAME(name("nothere.example.com.")))],
+        ))
+    });
+    let mut r = resolver(config(anchors));
+    let reply = ask(
+        &mut r,
+        &mut net,
+        0,
+        query(client(1), "gone.example.com.", RecordType::A, dnssec_ok),
+    );
+    assert_eq!(reply.metadata.response_code, ResponseCode::NXDomain);
+    assert!(!reply.metadata.truncation);
+    assert!(!repeats(&reply.authorities), "{:?}", reply.authorities);
+    let authority = rows(&reply.authorities);
+    assert!(authority.contains(&("example.com.".to_string(), RecordType::SOA)));
+
+    let reply = ask(
+        &mut r,
+        &mut net,
+        1,
+        query(client(1), "gone.example.com.", RecordType::CNAME, dnssec_ok),
+    );
+    assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(rows(&reply.answers)[0].1, RecordType::CNAME);
+    assert!(
+        !reply
+            .authorities
+            .iter()
+            .any(|record| record.record_type() == RecordType::NSEC),
+        "{:?}",
+        reply.authorities
+    );
+}
+
+/// A chain that passes one DNAME twice sends that DNAME once
+/// (RFC 2181 §5), as the authority's reply did.
+#[test]
+fn a_dname_the_chain_passes_twice_goes_out_once() {
+    let mut net = delegated(
+        |zone| {
+            zone.rrset(rrset(
+                "p.example.com.",
+                300,
+                vec![dname(&name("q.example.com."))],
+            ))
+            .rrset(rrset(
+                "x.q.example.com.",
+                300,
+                vec![RData::CNAME(CNAME(name("y.p.example.com.")))],
+            ))
+            .rrset(rrset("y.q.example.com.", 300, vec![a("192.0.2.77")]))
+        },
+        3600,
+        3600,
+    );
+    let mut r = resolver(config(None));
+    let reply = ask(
+        &mut r,
+        &mut net,
+        0,
+        query(client(1), "x.p.example.com.", RecordType::A, |_| {}),
+    );
+    assert_eq!(addresses(&reply), vec!["192.0.2.77"]);
+    let dnames = reply
+        .answers
+        .iter()
+        .filter(|record| record.record_type() == RecordType::DNAME)
+        .count();
+    assert_eq!(dnames, 1, "{:?}", reply.answers);
+}
+
+/// Data cached before it validated, here for a client that set CD, lives
+/// as long as its TTL once it validates Secure: the RRSIG's TTL counts
+/// from when the RRset arrived, not from when the cache gave it out with
+/// its TTL counted down (RFC 4035 §5.3.3, RFC 1035 §7.4).
+#[test]
+fn data_validated_from_the_cache_lives_out_its_ttl() {
+    let (mut net, anchors) = internet(true);
+    let mut r = resolver(config(anchors));
+    let of_example = |net: &MemoryNet| {
+        asked(net)
+            .into_iter()
+            .filter(|(server, qname, qtype, _)| {
+                (*server == ip(EXAMPLE) || *server == ip(EXAMPLE_TOO))
+                    && qname == "www.example.com."
+                    && *qtype == RecordType::A
+            })
+            .count()
+    };
+    ask(
+        &mut r,
+        &mut net,
+        0,
+        query(client(1), "www.example.com.", RecordType::A, |m| {
+            dnssec_ok(m);
+            m.metadata.checking_disabled = true;
+        }),
+    );
+    assert_eq!(of_example(&net), 1);
+    let a_ttl = |reply: &Message| {
+        reply
+            .answers
+            .iter()
+            .find(|record| record.record_type() == RecordType::A)
+            .map(|record| record.ttl)
+    };
+    let reply = ask(
+        &mut r,
+        &mut net,
+        200,
+        query(client(1), "www.example.com.", RecordType::A, dnssec_ok),
+    );
+    assert!(reply.metadata.authentic_data);
+    assert_eq!(a_ttl(&reply), Some(100));
+    let key = Key::new(
+        LowerName::new(&name("www.example.com.")),
+        RecordType::A,
+        fictionet::stdlib::protocols::dns::rr::DNSClass::IN,
+    );
+    assert!(r.cache().get(&key, at(200)).is_some());
+    let reply = ask(
+        &mut r,
+        &mut net,
+        201,
+        query(client(1), "www.example.com.", RecordType::A, dnssec_ok),
+    );
+    assert!(reply.metadata.authentic_data);
+    assert_eq!(a_ttl(&reply), Some(99));
+    assert_eq!(of_example(&net), 1, "no new query upstream");
+}
+
+/// A plain answer is Secure without the NSEC records beside it, so those
+/// never go out with it: here an unsigned one, which would otherwise
+/// reach the client under AD (RFC 4035 §3.2.3).
+#[test]
+fn an_nsec_beside_a_plain_answer_never_reaches_the_client() {
+    let (mut net, anchors) = changed_example(|req, message| {
+        if req.question.name() != &name("www.example.com.")
+            || req.question.query_type() != RecordType::A
+        {
+            return;
+        }
+        let nsec = NSEC::new(
+            name("zzz.example.com."),
+            [RecordType::A, RecordType::RRSIG, RecordType::NSEC],
+        );
+        message.add_authority(Record::from_rdata(
+            name("www.example.com."),
+            300,
+            RData::DNSSEC(DNSSECRData::NSEC(nsec)),
+        ));
+    });
+    let mut r = resolver(config(anchors));
+    for seconds in [0, 1] {
+        let reply = ask(
+            &mut r,
+            &mut net,
+            seconds,
+            query(client(1), "www.example.com.", RecordType::A, dnssec_ok),
+        );
+        assert!(reply.metadata.authentic_data, "at {seconds} s");
+        assert_eq!(addresses(&reply), vec!["192.0.2.80"]);
+        assert!(
+            !reply
+                .authorities
+                .iter()
+                .any(|record| record.record_type() == RecordType::NSEC),
+            "at {seconds} s: {:?}",
+            reply.authorities
+        );
+    }
 }
