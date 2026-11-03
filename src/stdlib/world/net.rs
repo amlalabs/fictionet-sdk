@@ -358,7 +358,9 @@ impl Net {
     /// with no filter, no address binding and no DHCP: a trusted
     /// participant, such as a real container that plays one of the hosts.
     /// Packets for `prefix` go to it, and what it sends is routed as it is.
-    /// Events attribute source addresses in `prefix` to this sandbox.
+    /// Connections from addresses in `prefix` that no other sandbox has
+    /// name this sandbox, and the network keeps nothing per source address,
+    /// so a route open to the internet can carry any number of them.
     pub fn route(mut self, name: &str, prefix: Prefix) -> Net {
         self.routes.push((name.to_owned(), prefix));
         self
@@ -404,7 +406,12 @@ impl Net {
     /// subnet cannot be used, or a host cannot be served as declared.
     /// A rejected host leaves no installation behind. Earlier hosts and
     /// the network infrastructure remain until the region is cancelled.
-    pub fn start(self, fcx: &Cx, mut attachments: Attachments) -> Result<(), Error> {
+    pub fn start(self, fcx: &Cx, attachments: Attachments) -> Result<(), Error> {
+        self.launch(fcx, attachments).map(drop)
+    }
+
+    /// [`start`](Net::start), returning the state the network's tasks share.
+    fn launch(self, fcx: &Cx, mut attachments: Attachments) -> Result<Arc<Shared>, Error> {
         let subnet = Subnet::new(self.subnet)?;
         let subnet6 = if self.ipv6 {
             Some(Subnet6::new(self.subnet_v6)?)
@@ -448,6 +455,7 @@ impl Net {
         }
         let hooks = Arc::new(Hooks {
             by_addr: Mutex::default(),
+            routes: Mutex::default(),
             conns: AtomicU64::new(0),
             attached: Mutex::default(),
         });
@@ -500,6 +508,7 @@ impl Net {
 
         let members = self.members;
         let context = shared.attachments();
+        let net = shared.clone();
         caller.spawn(move |fcx| async move {
             loop {
                 let sandbox = attachments.next(&fcx).await?;
@@ -521,7 +530,7 @@ impl Net {
                 fcx.spawn(move |fcx| filter(fcx, sandbox, context));
             }
         });
-        Ok(())
+        Ok(net)
     }
 }
 
@@ -609,12 +618,10 @@ impl Shared {
                     .collect(),
                 machines,
             },
-            abort_peers: Arc::new(move |addrs| {
-                abort.abort_peers(addrs);
+            abort_peers: Arc::new(move |which| {
+                abort.abort_peers(which);
                 for tcp in gateway_tcp.lock().iter() {
-                    for addr in addrs {
-                        tcp.abort_peer(*addr);
-                    }
+                    tcp.abort_peers(which);
                 }
             }),
         })
@@ -796,6 +803,8 @@ mod tests {
     use super::*;
     use super::attachments::answered_closed;
     use fictionet::stdlib::network::{ip, udp};
+    use fictionet::stdlib::network::ConnectionExt;
+    use crate::stdlib::services::serve::ConnInfo;
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -808,6 +817,7 @@ mod tests {
                 let router = route::router::<Box<dyn Interface>>(&fcx, Vec::new());
                 let hooks = Arc::new(Hooks {
                     by_addr: Mutex::default(),
+                    routes: Mutex::default(),
                     conns: AtomicU64::new(0),
                     attached: Mutex::default(),
                 });
@@ -902,6 +912,141 @@ mod tests {
         };
         assert!(answered_closed(&tcp(0x02), open(false)));
         assert!(!answered_closed(&tcp(0x04), open(false)));
+    }
+
+    /// Records who each connection is from. With `hold`, keeps it until it is
+    /// gone and counts it in `gone`; otherwise closes it at once.
+    struct Spy {
+        from: Arc<Mutex<Vec<ConnInfo>>>,
+        hold: bool,
+        gone: Arc<AtomicUsize>,
+    }
+
+    impl PortServer for Spy {
+        fn serve(
+            &self,
+            _: Cx,
+            arrival: Arrival,
+        ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> {
+            self.from.lock().push(arrival.info);
+            let (hold, gone) = (self.hold, self.gone.clone());
+            let (conn, socket) = (arrival.conn, arrival.socket);
+            Box::pin(async move {
+                if hold {
+                    std::future::poll_fn(move |cx| socket.poll_gone(cx)).await;
+                    drop(conn);
+                    gone.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        }
+    }
+
+    /// A route open to the whole internet carries connections from many
+    /// addresses, and SYNs from many more that never finish, as spoofed
+    /// ones do. Each connection names the route's sandbox, and once they
+    /// end the network keeps nothing for any of those addresses. When the
+    /// route's sandbox detaches, the connections still open are reset.
+    /// Before, the route kept an entry for every source address it ever
+    /// forwarded.
+    #[test]
+    fn a_public_route_keeps_nothing_per_source() {
+        fictionet::block_on(fictionet::lab(
+            fictionet::Seed::from_u64(1),
+            |fcx| async move {
+                let server = Ipv4Addr::new(10, 40, 0, 1);
+                let from = Arc::new(Mutex::new(Vec::new()));
+                let gone = Arc::new(AtomicUsize::new(0));
+                let spy = |hold| Spy {
+                    from: from.clone(),
+                    hold,
+                    gone: gone.clone(),
+                };
+                let (attacher, attachments) = fictionet::attachments();
+                let net = Net::new()
+                    .ipv4_only()
+                    .host("svc", |h| {
+                        h.at(server)
+                            .port_server(22, spy(false))
+                            .port_server(23, spy(true))
+                    })
+                    .route("internet", "0.0.0.0/0".parse()?)
+                    .launch(&fcx, attachments)?;
+
+                // The internet side: a router with the world behind the
+                // attachment, a machine at each client address, and a raw
+                // link for spoofed SYNs, whose SYN-ACKs have no route back.
+                let internet = route::router::<Box<dyn Interface>>(&fcx, Vec::new());
+                internet.add(
+                    "10.40.0.0/16".parse()?,
+                    Box::new(attacher.attach("internet")?),
+                );
+                let (raw_side, mut raw) = link();
+                internet.add("192.0.2.1/32".parse()?, Box::new(raw_side));
+                let clients: Vec<IpAddr> = (0..200u32)
+                    .map(|n| IpAddr::V4(Ipv4Addr::from(0xc612_0000 + n)))
+                    .collect();
+                let mut machines = Vec::new();
+                for &addr in &clients {
+                    let (router_side, side) = link();
+                    internet.add(host_prefix(addr), Box::new(router_side));
+                    machines.push(tcp::endpoint(&fcx, side, addr));
+                }
+
+                for n in 0..1000u32 {
+                    let src = Ipv4Addr::from(0x0b00_0000 + n);
+                    let mut t = vec![0u8; 20];
+                    t[0..2].copy_from_slice(&4000u16.to_be_bytes());
+                    t[2..4].copy_from_slice(&22u16.to_be_bytes());
+                    t[12] = 5 << 4;
+                    t[13] = 0x02;
+                    t[14..16].copy_from_slice(&65535u16.to_be_bytes());
+                    let sum = ip::transport_checksum(src.into(), server.into(), PROTO_TCP, &t);
+                    t[16..18].copy_from_slice(&sum.to_be_bytes());
+                    raw.send(ip::packet(src.into(), server.into(), PROTO_TCP, &t));
+                }
+                for machine in &machines {
+                    let mut conn = machine
+                        .connect(&fcx, SocketAddr::new(server.into(), 22))
+                        .await?;
+                    let mut buf = [0; 1];
+                    assert_eq!(conn.read(&fcx, &mut buf).await?, 0);
+                }
+                let held = machines[0]
+                    .connect(&fcx, SocketAddr::new(server.into(), 23))
+                    .await?;
+                fcx.sleep(Duration::from_secs(1)).await?;
+                {
+                    let from = from.lock();
+                    assert_eq!(from.len(), clients.len() + 1);
+                    for (n, info) in from.iter().enumerate() {
+                        assert_eq!(info.peer.map(|p| p.ip()), Some(clients[n % clients.len()]));
+                        assert_eq!(info.sandbox.as_ref().map(|s| &*s.name), Some("internet"));
+                    }
+                }
+                assert!(net.hooks.by_addr.lock().is_empty());
+                assert_eq!(net.hooks.routes.lock().len(), 1);
+                assert_eq!(net.peers.peers(), 1, "only the held connection's peer");
+
+                // The SYN-ACKs to the spoofed addresses time out, and the
+                // closed connections finish closing.
+                fcx.sleep(Duration::from_secs(150)).await?;
+                assert_eq!(net.peers.peers(), 1);
+                assert_eq!(gone.load(Ordering::SeqCst), 0);
+
+                // The route's sandbox detaches: its open connection is
+                // reset at once, not left to time out.
+                internet.add("10.40.0.0/16".parse()?, Box::new(link().0));
+                fcx.sleep(Duration::from_secs(1)).await?;
+                assert_eq!(gone.load(Ordering::SeqCst), 1);
+                assert_eq!(net.peers.peers(), 0);
+                assert!(net.hooks.by_addr.lock().is_empty());
+                assert_eq!(net.hooks.routes.lock().len(), 1);
+                drop(held);
+                fcx.cancel();
+                Ok(())
+            },
+        ))
+        .unwrap();
     }
 
     #[test]

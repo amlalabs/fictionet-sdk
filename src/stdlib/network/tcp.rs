@@ -1406,16 +1406,17 @@ impl Endpoint {
         self.shared.addr
     }
 
-    /// Ends every connection with `peer` immediately, discarding what was
-    /// still to be sent to it. Handles see [`ConnError::Reset`]. For a
-    /// peer that is gone for good, whose address someone else may take
-    /// next.
-    pub fn abort_peer(&self, peer: IpAddr) {
+    /// Ends every connection with a peer whose address `which` accepts
+    /// immediately, discarding what was still to be sent to it. Handles see
+    /// [`ConnError::Reset`]. For peers that are gone for good, whose
+    /// addresses someone else may take next. `which` runs with the endpoint
+    /// locked.
+    pub fn abort_peers(&self, which: impl Fn(IpAddr) -> bool) {
         let mut st = self.shared.state.lock();
         let hs: Vec<Id> = st
             .conns
             .iter()
-            .filter(|(_, c)| c.remote.ip() == peer)
+            .filter(|(_, c)| which(c.remote.ip()))
             .map(|(h, _)| *h)
             .collect();
         if hs.is_empty() {
@@ -2204,7 +2205,7 @@ mod tests {
                 match reset {
                     0 => watches[0].reset(),
                     1 => conn.take().unwrap().reset(),
-                    _ => server.abort_peer(client.addr()),
+                    _ => server.abort_peers(|peer| peer == client.addr()),
                 }
                 assert_eq!(*log.lock(), [0, 1]);
                 let cx = &mut Context::from_waker(Waker::noop());
@@ -2313,7 +2314,7 @@ mod tests {
     }
 
     #[test]
-    fn abort_peer_wakes_connections_in_socket_order() {
+    fn abort_peers_wakes_connections_in_socket_order() {
         block_on(run(fictionet::Seed::random(), |fcx| async move {
             let (_raw, side) = pair();
             let ep = endpoint(&fcx, side, "10.0.0.1".parse().unwrap());
@@ -2332,7 +2333,8 @@ mod tests {
                     st.conns.insert(id, conn);
                 }
             }
-            ep.abort_peer("10.0.0.2".parse().unwrap());
+            let peer: IpAddr = "10.0.0.2".parse().unwrap();
+            ep.abort_peers(|p| p == peer);
             assert_eq!(*log.lock(), [9000, 80, 443, 22, 8080]);
             fcx.cancel();
             Ok(())
@@ -3525,6 +3527,51 @@ mod tests {
             Err::<(), fictionet::Error>(fictionet::Error::msg("done"))
         }));
         assert_eq!(result.unwrap_err().to_string(), "done");
+    }
+
+    /// SYNs from many addresses that never answer the SYN-ACK, as spoofed
+    /// ones do, are forgotten once the handshake times out: no connection,
+    /// socket or per-peer count is left behind for any of them.
+    #[test]
+    fn unanswered_syns_from_many_addresses_leave_nothing_behind() {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
+            let (mut raw, side) = pair();
+            let server = endpoint(&fcx, side, "10.0.0.1".parse().unwrap());
+            let _listener = server.listen(80)?;
+            let to: SocketAddr = "10.0.0.1:80".parse().unwrap();
+            let sources = 1000u32;
+            for n in 0..sources {
+                let from = std::net::Ipv4Addr::from(0x0b00_0000 + n);
+                raw.send(segment(SocketAddr::new(from.into(), 4000), to, 7, 0, 0x02));
+            }
+            let mut syn_acks = 0;
+            while syn_acks < sources {
+                let p = raw.recv(&fcx).await?;
+                let t = Header::parse_whole(&p.0).unwrap().payload(&p.0).to_vec();
+                assert_eq!(t[13], 0x12, "a SYN-ACK");
+                syn_acks += 1;
+            }
+            {
+                let st = server.shared.state.lock();
+                let l = &st.listeners[&80];
+                assert_eq!(l.embryonic.len(), sources as usize);
+                assert_eq!(l.per_peer.len(), sources as usize);
+            }
+            // The SYN-ACKs are sent again, unanswered, until the timeout.
+            fcx.spawn(move |fcx| async move { while raw.recv(&fcx).await.is_ok() {} Ok(()) });
+            fcx.sleep(TIMEOUT + Duration::from_secs(5)).await?;
+            let st = server.shared.state.lock();
+            let l = &st.listeners[&80];
+            assert!(l.embryonic.is_empty() && l.ready.is_empty());
+            assert!(l.per_peer.is_empty(), "{} peers kept", l.per_peer.len());
+            assert!(st.conns.is_empty(), "{} connections kept", st.conns.len());
+            assert!(st.by_tuple.is_empty());
+            assert!(st.handles.len() <= 1, "{} sockets kept", st.handles.len());
+            drop(st);
+            fcx.cancel();
+            Ok(())
+        }))
+        .unwrap();
     }
 
     /// After many connections come and go, the socket set is rebuilt

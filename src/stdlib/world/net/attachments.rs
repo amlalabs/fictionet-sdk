@@ -11,7 +11,7 @@ use fictionet::stdlib::services::serve::Sandbox;
 use fictionet::stdlib::services::serve::{Budget, Counted};
 use fictionet::sync::Mutex;
 use fictionet::{Attachment, Cx, Interface, Packet};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -23,6 +23,13 @@ pub(super) struct Hooks {
     /// sandbox detaches, until another binds the address, so packets and
     /// connections still on their way name the sandbox that sent them.
     pub(super) by_addr: Mutex<HashMap<IpAddr, Sandbox>>,
+    /// Each trusted route's prefix ([`Net::route`](super::Net::route)),
+    /// with the sandbox that attached there last, which every address in
+    /// the prefix that no sandbox binds comes from. One entry per prefix,
+    /// kept after its sandbox detaches as `by_addr` keeps its own. A route
+    /// keeps nothing per source address, so sources it forwards, spoofed
+    /// ones included, leave nothing behind.
+    pub(super) routes: Mutex<Vec<(Prefix, Sandbox)>>,
     /// The last connection number given out.
     pub(super) conns: AtomicU64,
     /// The sandboxes attached now, by id, each with its budget.
@@ -30,6 +37,9 @@ pub(super) struct Hooks {
 }
 
 impl Hooks {
+    /// The sandbox that `addr` belongs to: the one that bound it, or else
+    /// the route with the longest prefix that holds it. One with id 0 and
+    /// no name if neither does.
     pub(super) fn sandbox_at(&self, addr: IpAddr) -> Sandbox {
         if let Some(s) = self.by_addr.lock().get(&addr) {
             return s.clone();
@@ -38,9 +48,11 @@ impl Hooks {
             IpAddr::V4(a) => (Some(a), None),
             IpAddr::V6(a) => (None, Some(a)),
         };
+        let (id, name) = longest_route(&self.routes.lock(), addr)
+            .map_or((0, Arc::from("")), |(_, s)| (s.id, s.name.clone()));
         Sandbox {
-            id: 0,
-            name: Arc::from(""),
+            id,
+            name,
             addr: v4,
             addr_v6: v6,
         }
@@ -71,7 +83,8 @@ pub(super) struct Context {
     pub(super) abort_peers: Arc<PeerAbort>,
 }
 
-pub(super) type PeerAbort = dyn Fn(&[IpAddr]) + Send + Sync;
+/// Resets every connection whose peer address the argument accepts.
+pub(super) type PeerAbort = dyn Fn(&dyn Fn(IpAddr) -> bool) + Send + Sync;
 
 /// Only the destination facts needed to classify forwarded packets.
 pub(super) struct Destinations {
@@ -85,8 +98,19 @@ impl Context {
     pub(super) fn routed(self: &Arc<Self>, sandbox: Attachment, prefix: Prefix) -> Routed {
         let owner = self.bindings.new_owner();
         self.hooks.attached.lock().insert(owner, None);
-        Routed {
+        let me = Sandbox {
+            id: owner,
             name: Arc::from(sandbox.name()),
+            addr: None,
+            addr_v6: None,
+        };
+        let mut routes = self.hooks.routes.lock();
+        match routes.iter_mut().find(|(p, _)| *p == prefix) {
+            Some((_, last)) => *last = me,
+            None => routes.push((prefix, me)),
+        }
+        drop(routes);
+        Routed {
             sandbox,
             context: self.clone(),
             owner,
@@ -132,11 +156,21 @@ impl Context {
     }
 }
 
+/// The route in `routes` with the longest prefix that holds `addr`, as the
+/// router picks one.
+fn longest_route(routes: &[(Prefix, Sandbox)], addr: IpAddr) -> Option<&(Prefix, Sandbox)> {
+    routes
+        .iter()
+        .filter(|(p, _)| p.contains(addr))
+        .max_by_key(|(p, _)| p.len)
+}
+
+/// A trusted sandbox wired to the router at its prefix. It passes packets
+/// as they are and keeps no state per source.
 pub(super) struct Routed {
     sandbox: Attachment,
     context: Arc<Context>,
     owner: u64,
-    name: Arc<str>,
     prefix: Prefix,
 }
 
@@ -146,38 +180,7 @@ impl Interface for Routed {
         fcx: &Cx,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Result<Packet, fictionet::RecvError>> {
-        let result = self.sandbox.poll_recv(fcx, cx);
-        if let Poll::Ready(Ok(packet)) = &result
-            && let Some(header) = Header::parse_whole(&packet.0)
-            && self.prefix.contains(header.src)
-        {
-            let me = Sandbox {
-                id: self.owner,
-                name: self.name.clone(),
-                addr: match header.src {
-                    IpAddr::V4(addr) => Some(addr),
-                    _ => None,
-                },
-                addr_v6: match header.src {
-                    IpAddr::V6(addr) => Some(addr),
-                    _ => None,
-                },
-            };
-            self.context
-                .hooks
-                .by_addr
-                .lock()
-                .insert(header.src, me.clone());
-            let attached = self
-                .context
-                .hooks
-                .by_addr
-                .lock()
-                .get(&header.dst)
-                .is_some_and(|sandbox| self.context.hooks.is_attached(sandbox.id));
-            if !attached && let Some(_why) = self.context.destinations.refused(&packet.0) {}
-        }
-        result
+        self.sandbox.poll_recv(fcx, cx)
     }
 
     fn send(&mut self, packet: Packet) {
@@ -186,17 +189,21 @@ impl Interface for Routed {
 }
 
 impl Drop for Routed {
+    /// Resets the connections of every peer the route's prefix gives this
+    /// sandbox: addresses that no sandbox binds and no route with a longer
+    /// prefix holds.
     fn drop(&mut self) {
-        self.context.hooks.attached.lock().remove(&self.owner);
-        let addresses = self
-            .context
-            .hooks
-            .by_addr
-            .lock()
-            .iter()
-            .filter_map(|(addr, sandbox)| (sandbox.id == self.owner).then_some(*addr))
-            .collect::<Vec<_>>();
-        (self.context.abort_peers)(&addresses);
+        let hooks = &self.context.hooks;
+        hooks.attached.lock().remove(&self.owner);
+        // Copied first: the aborts ask about each peer with the endpoints
+        // locked.
+        let bound: HashSet<IpAddr> = hooks.by_addr.lock().keys().copied().collect();
+        let routes = hooks.routes.lock().clone();
+        let prefix = self.prefix;
+        (self.context.abort_peers)(&|peer| {
+            !bound.contains(&peer)
+                && longest_route(&routes, peer).is_some_and(|(p, _)| *p == prefix)
+        });
     }
 }
 /// A UDP packet with correct checksums.
@@ -291,7 +298,7 @@ impl Drop for Attached {
             .chain(bound6.map(IpAddr::V6))
             .collect();
         if !addrs.is_empty() {
-            (context.abort_peers)(&addrs);
+            (context.abort_peers)(&|peer| addrs.contains(&peer));
         }
         context.bindings.release(self.owner);
         let _sandbox = Sandbox {

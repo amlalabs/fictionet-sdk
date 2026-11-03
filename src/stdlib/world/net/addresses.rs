@@ -506,6 +506,7 @@ mod tests {
                 gateway_tcp: Arc::default(),
                 hooks: Arc::new(Hooks {
                     by_addr: Mutex::default(),
+                    routes: Mutex::default(),
                     conns: AtomicU64::new(0),
                     attached: Mutex::default(),
                 }),
@@ -548,6 +549,7 @@ mod tests {
                 gateway_tcp: Arc::default(),
                 hooks: Arc::new(Hooks {
                     by_addr: Mutex::default(),
+                    routes: Mutex::default(),
                     conns: AtomicU64::new(0),
                     attached: Mutex::default(),
                 }),

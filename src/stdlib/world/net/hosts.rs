@@ -777,12 +777,10 @@ impl Machines {
         }))
     }
 
-    pub(super) fn abort_peers(&self, addrs: &[IpAddr]) {
+    pub(super) fn abort_peers(&self, which: &dyn Fn(IpAddr) -> bool) {
         let machines: Vec<_> = self.world.lock().machines.values().cloned().collect();
         for machine in machines {
-            for addr in addrs {
-                machine.tcp.abort_peer(*addr);
-            }
+            machine.tcp.abort_peers(which);
         }
     }
 }
@@ -823,6 +821,12 @@ impl Peers {
             open: Mutex::default(),
             max,
         })
+    }
+
+    /// How many peer addresses have connections open.
+    #[cfg(test)]
+    pub(super) fn peers(&self) -> usize {
+        self.open.lock().len()
     }
 
     pub(super) fn enter(self: &Arc<Self>, peer: IpAddr) -> Option<PeerGuard> {
