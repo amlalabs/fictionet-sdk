@@ -15,7 +15,9 @@ use fictionet::stdlib::protocols::dns::op::{Edns, Message, MessageType, OpCode, 
 use fictionet::stdlib::protocols::dns::rr::rdata::A;
 use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RData, Record, RecordType};
 use fictionet::stdlib::protocols::dns::{Parsed, Request};
-use fictionet::stdlib::services::dns::authority::{AuthorityEngine, ServerConfig, Zones};
+use fictionet::stdlib::services::dns::authority::{
+    Authority, AuthorityEngine, Copies, ServerConfig, Step, Zones,
+};
 use fictionet::stdlib::services::dns::zone::{
     Answered, AnyResponse, Denial, Learned, Zone, ZoneData, answer,
 };
@@ -242,6 +244,10 @@ fn an_unknown_never_becomes_nxdomain_or_nodata() {
         ("b.wild.example.", RecordType::A),
         // The wildcard's parent, which no response showed with data.
         ("wild.example.", RecordType::A),
+        // DS at the cut, which only a NODATA for it answers: the referral
+        // carries no SOA, and may come from a child zone the server also
+        // serves.
+        ("child.example.", RecordType::DS),
     ] {
         for dnssec_ok in [true, false] {
             let got = copied(&learned, &request(qname, qtype, dnssec_ok));
@@ -251,12 +257,6 @@ fn an_unknown_never_becomes_nxdomain_or_nodata() {
             );
         }
     }
-    // The referral's NSEC at the cut, from the parent's own server, says
-    // the cut has no DS: that is a held negative, answered as the parent
-    // answers it.
-    let ds = request("child.example.", RecordType::DS, true);
-    let got = copied(&learned, &ds).expect("the referral settled DS at the cut");
-    assert_eq!(shape(&got), shape(&real(&zone, &ds)));
 
     // A server of the learned zone with no upstream looks the question up
     // and, when nothing comes, sends nothing: no negative answer.
@@ -293,6 +293,283 @@ fn an_unknown_never_becomes_nxdomain_or_nodata() {
             .any(|action| matches!(action, Action::Answer(_))),
         "no answer in {actions:?}"
     );
+}
+
+/// The records of `message`'s additional section, as `shape` shows them.
+fn additionals(message: &Message) -> Vec<String> {
+    let [_, _, additional] = shape(message).2;
+    additional
+}
+
+/// Additional data never answers a question (RFC 2181 §5.4.1). The glue
+/// an MX answer carries for a target below a cut the copy has not seen
+/// stays unknown until the real referral is filed, and an address that
+/// came only as additional data, possibly without its RRSIGs, is looked
+/// up before it is served as an answer.
+#[test]
+fn additional_data_never_answers() {
+    let text = format!("{EXAMPLE}mx.example. 300 IN MX 10 ns.child.example.\n");
+    let unsigned = Zone::from_master(&text, None).unwrap();
+    let entropy = SeededEntropy::new(Seed::from_u64(5));
+    let key = ZoneKey::generate(&entropy, Algorithm::Ed25519, KeyFlags::KSK);
+    let keys = KeySet {
+        keys: vec![Arc::new(key) as Arc<dyn Sign>],
+    };
+    let nsec = Zone::from_master(&text, None)
+        .unwrap()
+        .signed(&keys, TestInternet::window(), Denial::Nsec)
+        .unwrap();
+    for (how, zone) in [("unsigned", unsigned), ("NSEC", nsec)] {
+        let learned = Learned::new(&name("example."));
+        for (qname, qtype) in [
+            ("mx.example.", RecordType::MX),
+            ("example.", RecordType::NS),
+        ] {
+            let asked = request(qname, qtype, true);
+            let response = real(&zone, &asked);
+            assert!(
+                !additionals(&response).is_empty(),
+                "{how}: the real {qname} {qtype} carries additional data"
+            );
+            learned.file(Generation(0), &asked.question, &response);
+        }
+        for qname in ["ns.child.example.", "ns.example."] {
+            for dnssec_ok in [true, false] {
+                let got = copied(&learned, &request(qname, RecordType::A, dnssec_ok));
+                assert!(
+                    got.is_none(),
+                    "{how} {qname} A DO {dnssec_ok} is unknown, got {:?}",
+                    got.as_ref().map(shape)
+                );
+            }
+        }
+        // What the MX answer carries is still served as its additional
+        // data.
+        let mx = request("mx.example.", RecordType::MX, false);
+        let got = copied(&learned, &mx).expect("the MX answer was filed");
+        assert_eq!(shape(&got), shape(&real(&zone, &mx)), "{how} MX");
+        for qname in ["ns.child.example.", "ns.example."] {
+            let asked = request(qname, RecordType::A, true);
+            learned.file(Generation(0), &asked.question, &real(&zone, &asked));
+            for dnssec_ok in [true, false] {
+                let request = request(qname, RecordType::A, dnssec_ok);
+                let got = copied(&learned, &request).expect("filed");
+                assert_eq!(
+                    shape(&got),
+                    shape(&real(&zone, &request)),
+                    "{how} {qname} A DO {dnssec_ok}"
+                );
+            }
+        }
+    }
+}
+
+/// An address a wildcard made, sent as additional data beside an MX
+/// answer as some servers send it, is kept at its own name: the MX
+/// answer's authority section is not the proof for the expansion, so the
+/// name stays unknown, with and without DO, until its own answer is filed,
+/// even once the wildcard's address is known from another name.
+#[test]
+fn additional_data_from_a_wildcard_brings_no_proof() {
+    let text = format!("{EXAMPLE}mx.example. 300 IN MX 10 mail.wild.example.\n");
+    let entropy = SeededEntropy::new(Seed::from_u64(5));
+    let key = ZoneKey::generate(&entropy, Algorithm::Ed25519, KeyFlags::KSK);
+    let keys = KeySet {
+        keys: vec![Arc::new(key) as Arc<dyn Sign>],
+    };
+    let zone = Zone::from_master(&text, None)
+        .unwrap()
+        .signed(&keys, TestInternet::window(), Denial::Nsec)
+        .unwrap();
+    let learned = Learned::new(&name("example."));
+    let mx = request("mx.example.", RecordType::MX, true);
+    let mut response = real(&zone, &mx);
+    let mail = request("mail.wild.example.", RecordType::A, true);
+    let expanded = real(&zone, &mail);
+    response
+        .additionals
+        .extend(expanded.answers.iter().cloned());
+    learned.file(Generation(0), &mx.question, &response);
+    let other = request("a.wild.example.", RecordType::A, true);
+    learned.file(Generation(0), &other.question, &real(&zone, &other));
+    for dnssec_ok in [true, false] {
+        let got = copied(
+            &learned,
+            &request("mail.wild.example.", RecordType::A, dnssec_ok),
+        );
+        assert!(
+            got.is_none(),
+            "mail.wild.example A DO {dnssec_ok} is unknown, got {:?}",
+            got.as_ref().map(shape)
+        );
+    }
+    learned.file(Generation(0), &mail.question, &expanded);
+    for dnssec_ok in [true, false] {
+        let request = request("mail.wild.example.", RecordType::A, dnssec_ok);
+        let got = copied(&learned, &request).expect("filed");
+        assert_eq!(shape(&got), shape(&real(&zone, &request)), "DO {dnssec_ok}");
+    }
+}
+
+/// A referral shows that a cut has no DS, but carries no SOA, which the
+/// NODATA answer to DS at the cut needs (RFC 2308 §3). Until the NODATA
+/// for DS at the cut is filed, DS there stays unknown.
+#[test]
+fn ds_at_a_cut_waits_for_the_soa_a_referral_lacks() {
+    let zones = [
+        ("unsigned", Zone::from_master(EXAMPLE, None).unwrap()),
+        ("NSEC", signed(Denial::Nsec)),
+        (
+            "NSEC3",
+            signed(Denial::Nsec3 {
+                opt_out: false,
+                salt: Vec::new(),
+            }),
+        ),
+    ];
+    for (how, zone) in zones {
+        let learned = Learned::new(&name("example."));
+        let referral = request("www.child.example.", RecordType::A, true);
+        learned.file(Generation(0), &referral.question, &real(&zone, &referral));
+        for dnssec_ok in [true, false] {
+            let got = copied(
+                &learned,
+                &request("child.example.", RecordType::DS, dnssec_ok),
+            );
+            assert!(
+                got.is_none(),
+                "{how} DO {dnssec_ok}: DS at the cut is unknown, got {:?}",
+                got.as_ref().map(shape)
+            );
+        }
+        let asked = request("child.example.", RecordType::DS, true);
+        learned.file(Generation(0), &asked.question, &real(&zone, &asked));
+        for dnssec_ok in [true, false] {
+            let ds = request("child.example.", RecordType::DS, dnssec_ok);
+            let got = copied(&learned, &ds).expect("the NODATA was filed");
+            assert_eq!(
+                shape(&got),
+                shape(&real(&zone, &ds)),
+                "{how} DO {dnssec_ok}"
+            );
+        }
+    }
+}
+
+/// An answer to ANY or RRSIG that a wildcard made keeps the proof that
+/// no closer name exists (RFC 4035 §3.1.3.3, RFC 5155 §7.2.6). Another
+/// name under the wildcard, which no response showed absent, stays
+/// unknown.
+#[test]
+fn any_and_rrsig_at_a_wildcard_keep_its_proof() {
+    let zones = [
+        ("NSEC", signed(Denial::Nsec)),
+        (
+            "NSEC3",
+            signed(Denial::Nsec3 {
+                opt_out: false,
+                salt: Vec::new(),
+            }),
+        ),
+    ];
+    for (how, zone) in zones {
+        for qtype in [RecordType::ANY, RecordType::RRSIG] {
+            let learned = Learned::new(&name("example."));
+            let asked = request("a.wild.example.", qtype, true);
+            learned.file(Generation(0), &asked.question, &real(&zone, &asked));
+            for dnssec_ok in [true, false] {
+                let request = request("a.wild.example.", qtype, dnssec_ok);
+                let got = copied(&learned, &request).expect("filed");
+                assert_eq!(
+                    shape(&got),
+                    shape(&real(&zone, &request)),
+                    "{how} {qtype} DO {dnssec_ok}"
+                );
+            }
+            for dnssec_ok in [true, false] {
+                let other = copied(&learned, &request("b.wild.example.", qtype, dnssec_ok));
+                assert!(
+                    other.is_none(),
+                    "{how} {qtype} DO {dnssec_ok}: b.wild.example may exist"
+                );
+            }
+        }
+    }
+}
+
+/// `child.example`, which the parent's server serves too.
+const CHILD: &str = "\
+child.example. 3600 IN SOA ns.child.example. hostmaster.example. 1 7200 3600 1209600 300
+child.example. 3600 IN NS ns.child.example.
+ns.child.example. 3600 IN A 192.0.2.54
+www.child.example. 300 IN A 192.0.2.81
+";
+
+/// A real server that serves `example` and its child `child.example`
+/// answers for the child's names from the child's data, never with a
+/// referral. Copies of the server noted only as serving `example` learn
+/// the child from the responses, file them into the child's copy, and
+/// answer every question as the real server does: none stays silent.
+#[test]
+fn copies_learn_a_child_zone_its_server_also_serves() {
+    let real = Zones::new(vec![
+        Arc::new(Zone::from_master(EXAMPLE, None).unwrap()) as Arc<dyn ZoneData>,
+        Arc::new(Zone::from_master(CHILD, None).unwrap()) as Arc<dyn ZoneData>,
+    ]);
+    let local: SocketAddr = "192.0.2.53:53".parse().unwrap();
+    let server = ServerConfig::generic();
+    let client = Client {
+        peer: "198.51.100.7:5353".parse().unwrap(),
+        local,
+        transport: Transport::Udp,
+        connection: None,
+        sandbox: None,
+    };
+    let reply = |authority: &dyn Authority, request: &Request| match authority
+        .respond(request, local, &server, &client)
+    {
+        Step::Reply(response) => Some(response.message),
+        Step::Need(lookup) => panic!("the real server needs {lookup:?}"),
+        Step::Silent => None,
+    };
+    let copies = Copies::new();
+    copies.serves(local.ip(), &lower("example."));
+    for (qname, qtype) in [
+        ("nx.child.example.", RecordType::A),
+        ("www.child.example.", RecordType::A),
+        ("www.child.example.", RecordType::TXT),
+        ("child.example.", RecordType::SOA),
+        ("child.example.", RecordType::DS),
+        ("www.example.", RecordType::A),
+        ("nx.example.", RecordType::A),
+    ] {
+        for dnssec_ok in [false, true] {
+            let request = request(qname, qtype, dnssec_ok);
+            let mut looked = Vec::new();
+            let got = loop {
+                match copies.respond(&request, local, &server, &client) {
+                    Step::Reply(response) => break response.message,
+                    Step::Need(lookup) => {
+                        assert!(
+                            !looked.contains(&lookup),
+                            "{qname} {qtype} DO {dnssec_ok}: {lookup:?} again, so silent"
+                        );
+                        let asked = self::request(
+                            &lookup.question.name().to_ascii(),
+                            lookup.question.query_type(),
+                            true,
+                        );
+                        let response = reply(&real, &asked).expect("the real server answers");
+                        copies.file(&lookup, &Looked::Response(response), Generation(0));
+                        looked.push(lookup);
+                    }
+                    Step::Silent => panic!("{qname} {qtype} DO {dnssec_ok}: silent"),
+                }
+            };
+            let want = reply(&real, &request).expect("the real server answers");
+            assert_eq!(shape(&got), shape(&want), "{qname} {qtype} DO {dnssec_ok}");
+        }
+    }
 }
 
 /// An upstream that answers every lookup with one A record whose address

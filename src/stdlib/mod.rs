@@ -260,7 +260,7 @@
 //! | [`protocols::dhcpv6`] | DHCPv6 client, server and relay messages. |
 //! | [`protocols::diameter`] | Diameter messages and attribute-value pairs. |
 //! | [`protocols::dnp3`] | DNP3 link frames, transport segments and application headers. |
-//! | [`protocols::dns`] | DNS messages from the re-exported `hickory-proto` crate, with query checks, truncation, and relay restore. |
+//! | [`protocols::dns`] | DNS messages from the re-exported `hickory-proto` crate, with query checks and truncation. |
 //! | [`protocols::dtls`] | DTLS records and handshake reassembly without cryptography. |
 //! | [`protocols::enip`] | EtherNet/IP encapsulation and CIP messages. |
 //! | [`protocols::fast`] | FAST 1.1 templates, dictionaries, encoding and decoding. |

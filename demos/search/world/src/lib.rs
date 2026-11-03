@@ -154,11 +154,11 @@ pub fn net(
     let gateway_namespace = namespace.clone();
     let (report_cx, report_pages) = (fcx.clone(), pages);
     net.hosts(internet::root_servers(
-        |server| mirror.relay(server),
+        |server| mirror.server(server),
         &location,
     ))
     .hosts(internet::gtld_servers(
-        |server| mirror.relay(server),
+        |server| mirror.server(server),
         &location,
     ))
     .hosts(internet::public_resolvers(
@@ -246,15 +246,15 @@ struct Sites {
     /// once a session serves it: a guest that resolved the name keeps
     /// the address for the record's TTL.
     refused: Mutex<HashMap<LowerName, HashSet<Ipv4Addr>>>,
-    /// The session's relayed IPv4 addresses of each name, its own or those
-    /// at the end of its CNAME chain.
+    /// The IPv4 addresses mirrored replies gave each name this session,
+    /// its own or those at the end of its CNAME chain.
     addresses: PerSession<HashMap<LowerName, HashSet<Ipv4Addr>>>,
 }
 
 impl Sites {
-    /// Places a machine at each IPv4 address `reply`, a relayed reply,
-    /// gives in an A record, for the record's name and every name a
-    /// relayed CNAME made an alias of it, as long as the session lets the
+    /// Places a machine at each IPv4 address `reply`, a mirrored server's
+    /// reply, gives in an A record, for the record's name and every name
+    /// a CNAME in it made an alias of it, as long as the session lets the
     /// name out. A CNAME whose target's addresses an earlier reply gave
     /// places its owner there too, since a resolver that has the target's
     /// addresses cached does not ask for them again. A name is placed at

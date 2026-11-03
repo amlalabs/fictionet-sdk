@@ -352,8 +352,8 @@ fn a_root_letter_answers_the_root_ns_as_dig_sees_it() {
         let (attacher, attachments) = fictionet::attachments();
         let net = Net::new().ipv4_only();
         let mirror = Mirror::new(hierarchy.clone(), net.handle(), &at);
-        net.hosts(internet::root_servers(|s| mirror.relay(s), &at))
-            .hosts(internet::gtld_servers(|s| mirror.relay(s), &at))
+        net.hosts(internet::root_servers(|s| mirror.server(s), &at))
+            .hosts(internet::gtld_servers(|s| mirror.server(s), &at))
             .start(&fcx, attachments)?;
         let m = machine(&fcx, attacher.attach("client")?, ME);
         let a_root = ROOT_LETTERS[0].server.v4;
@@ -426,7 +426,7 @@ fn a_mirrored_server_names_one_instance_by_chaos_and_by_nsid() {
         let (attacher, attachments) = fictionet::attachments();
         let net = Net::new().ipv4_only();
         let mirror = Mirror::new(hierarchy.clone(), net.handle(), &at);
-        net.hosts(internet::root_servers(|s| mirror.relay(s), &at))
+        net.hosts(internet::root_servers(|s| mirror.server(s), &at))
             .start(&fcx, attachments)?;
         let m = machine(&fcx, attacher.attach("client")?, ME);
         let a_root = ROOT_LETTERS[0].server.v4;
@@ -598,7 +598,7 @@ fn the_mirror_places_a_server_at_referral_glue_before_the_reply_leaves() {
         let net = Net::new().ipv4_only();
         let handle = net.handle();
         let mirror = Mirror::new(hierarchy.clone(), handle.clone(), &at);
-        net.hosts(internet::root_servers(|s| mirror.relay(s), &at))
+        net.hosts(internet::root_servers(|s| mirror.server(s), &at))
             .start(&fcx, attachments)?;
         let m = machine(&fcx, attacher.attach("client")?, ME);
         let a_root = ROOT_LETTERS[0].server.v4;
@@ -650,7 +650,7 @@ fn a_mirrored_name_server_refuses_zone_transfers() {
         let (attacher, attachments) = fictionet::attachments();
         let net = Net::new().ipv4_only();
         let mirror = Mirror::new(hierarchy.clone(), net.handle(), &at);
-        net.hosts(internet::root_servers(|s| mirror.relay(s), &at))
+        net.hosts(internet::root_servers(|s| mirror.server(s), &at))
             .start(&fcx, attachments)?;
         let m = machine(&fcx, attacher.attach("client")?, ME);
         let a_root = ROOT_LETTERS[0].server.v4;
@@ -696,7 +696,7 @@ fn the_mirror_places_no_server_at_the_egress() {
         let net = Net::new().ipv4_only();
         let handle = net.handle();
         let mirror = Mirror::new(hierarchy.clone(), handle.clone(), &at);
-        net.hosts(internet::root_servers(|s| mirror.relay(s), &at))
+        net.hosts(internet::root_servers(|s| mirror.server(s), &at))
             .start(&fcx, attachments)?;
         let m = machine(&fcx, attacher.attach("client")?, ME);
         let a_root = ROOT_LETTERS[0].server.v4;
@@ -750,7 +750,7 @@ fn a_glueless_delegation_resolves_through_the_answer_for_its_name_server() {
         let net = Net::new().ipv4_only();
         let handle = net.handle();
         let mirror = Mirror::new(hierarchy.clone(), handle.clone(), &at);
-        net.hosts(internet::root_servers(|s| mirror.relay(s), &at))
+        net.hosts(internet::root_servers(|s| mirror.server(s), &at))
             .gateway(move |h, _| h.program(Recursive::new(config.clone(), clock)))
             .start(&fcx, attachments)?;
         let m = machine(&fcx, attacher.attach("client")?, ME);
@@ -800,7 +800,7 @@ fn a_glueless_name_server_known_before_its_delegation_gets_a_server() {
         let net = Net::new().ipv4_only();
         let handle = net.handle();
         let mirror = Mirror::new(hierarchy.clone(), handle.clone(), &at);
-        net.hosts(internet::root_servers(|s| mirror.relay(s), &at))
+        net.hosts(internet::root_servers(|s| mirror.server(s), &at))
             .gateway(move |h, _| h.program(Recursive::new(config.clone(), clock)))
             .start(&fcx, attachments)?;
         let m = machine(&fcx, attacher.attach("client")?, ME);
@@ -847,7 +847,7 @@ fn addresses_on_the_sandbox_subnet_or_off_the_internet_are_never_placed() {
             .subnet("45.60.0.0/24".parse::<Prefix>()?);
         let handle = net.handle();
         let mirror = Mirror::new(hierarchy.clone(), handle.clone(), &at);
-        net.hosts(internet::root_servers(|s| mirror.relay(s), &at))
+        net.hosts(internet::root_servers(|s| mirror.server(s), &at))
             .start(&fcx, attachments)?;
         let m = machine(&fcx, attacher.attach("client")?, me);
         let a_root = ROOT_LETTERS[0].server.v4;
@@ -887,7 +887,7 @@ fn a_front_goes_at_the_addresses_answered_for_its_name() {
                 host
             },
         );
-        net.hosts(internet::root_servers(|s| mirror.relay(s), &at))
+        net.hosts(internet::root_servers(|s| mirror.server(s), &at))
             .start(&fcx, attachments)?;
         let m = machine(&fcx, attacher.attach("client")?, ME);
         let a_root = ROOT_LETTERS[0].server.v4;
@@ -931,7 +931,7 @@ fn whoami_names_are_answered_from_the_egress_and_never_looked_up() {
         let (attacher, attachments) = fictionet::attachments();
         let net = Net::new().ipv4_only();
         let mirror = Mirror::new(hierarchy.clone(), net.handle(), &at);
-        net.hosts(internet::root_servers(|s| mirror.relay(s), &at))
+        net.hosts(internet::root_servers(|s| mirror.server(s), &at))
             .hosts(internet::public_resolvers(
                 |r, h| h.program(r.recursive(r.config(&at), clock)),
                 &at,
@@ -1145,7 +1145,7 @@ fn an_echoed_address_is_the_public_resolvers_egress() {
         let net = Net::new().ipv4_only();
         let mirror = Mirror::new(hierarchy.clone(), net.handle(), &at);
         // The test root is unsigned, so the resolvers do not validate.
-        net.hosts(internet::root_servers(|s| mirror.relay(s), &at))
+        net.hosts(internet::root_servers(|s| mirror.server(s), &at))
             .hosts(internet::public_resolvers(
                 |r, h| {
                     let config = Config {
@@ -1222,7 +1222,7 @@ fn public_resolvers_keep_one_cache_per_sandbox() {
                 }
             },
         );
-        net.hosts(internet::root_servers(|s| mirror.relay(s), &at))
+        net.hosts(internet::root_servers(|s| mirror.server(s), &at))
             .hosts(internet::public_resolvers(
                 |r, h| {
                     let record = record.clone();
