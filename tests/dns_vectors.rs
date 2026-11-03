@@ -63,8 +63,8 @@ use fictionet::stdlib::services::dns::resolver::{
     Cache, Checked, Config, Entry, FailureKind, Key, Limits, Negative, Offer, Rank, Resolver, Work,
 };
 use fictionet::stdlib::services::dns::zone::{
-    Answered, AnyResponse, Denial, Denied, Fact, Node, Revision, View, Zone, ZoneData, answer,
-    check_chain,
+    Answered, AnyResponse, Denial, Denied, Fact, Node, Revision, View, Zone, ZoneData, ZoneError,
+    answer, check_chain,
 };
 use fictionet::stdlib::services::dns::{Client, ClientQuery, WallClock};
 use fictionet::stdlib::services::serve::Transport;
@@ -941,6 +941,32 @@ fn vector_request(value: &Value, dnssec_ok: bool) -> Request {
     request(&qname, qtype, dnssec_ok)
 }
 
+/// Checks that Rust's builder refuses a vector's `zone` for the rule the
+/// Lean builder names first, as `Gen.lean`'s `zoneErrorStr` writes it.
+fn refused(value: &Value, rule: &str) -> Result<(), String> {
+    let lines = texts(value, "records");
+    let error = match Zone::from_master(&lines.join("\n"), None) {
+        Ok(_) => return Err(format!("Rust builds a zone Lean refuses for {rule}")),
+        Err(error) => error,
+    };
+    let rust = match &error {
+        ZoneError::OutOfZone { .. } => "out_of_zone",
+        ZoneError::CnameWithOtherData { .. } => "cname_with_other_data",
+        ZoneError::CnameAtApex => "cname_at_apex",
+        ZoneError::TwoDnames { .. } => "two_dnames",
+        ZoneError::DataBelowDname { .. } => "data_below_dname",
+        ZoneError::DataBelowCut { .. } => "data_below_cut",
+        ZoneError::DsNotAtCut { .. } => "ds_not_at_cut",
+        ZoneError::MissingInDomainGlue { .. } => "missing_in_domain_glue",
+        ZoneError::TargetIsAlias { .. } => "target_is_alias",
+        ZoneError::RrsetTtlsDiffer { .. } => "rrset_ttls_differ",
+        ZoneError::TtlTooLarge { .. } => "ttl_too_large",
+        ZoneError::MissingApexNs => "missing_apex_ns",
+        other => return Err(format!("Lean refuses for {rule}, Rust for {other}")),
+    };
+    same("the rule broken first", rule.to_string(), rust.to_string())
+}
+
 /// A zone from a vector's `zone`: master file lines, read with
 /// [`Zone::from_master`].
 fn vector_zone(value: &Value) -> Result<Zone, String> {
@@ -1045,6 +1071,22 @@ fn question_line(query: &Query) -> String {
     )
 }
 
+/// Where in `bytes` hickory's reader first fails on a record, counting the
+/// records of the answer, authority, and additional sections in turn, or
+/// `None` when the header or a question fails or every record reads.
+fn first_refused_record(bytes: &[u8]) -> Option<usize> {
+    let mut decoder = BinDecoder::new(bytes);
+    let header = Header::read(&mut decoder).ok()?;
+    for _ in 0..header.counts.queries {
+        Query::read(&mut decoder).ok()?;
+    }
+    let counts = header.counts;
+    let records = usize::from(counts.answers)
+        + usize::from(counts.authorities)
+        + usize::from(counts.additionals);
+    (0..records).find(|_| Record::read(&mut decoder).is_err())
+}
+
 /// The records of a message's additional section, with the OPT record
 /// hickory moves into `edns` put back.
 fn additionals_with_opt(message: &Message) -> Vec<Record> {
@@ -1105,11 +1147,16 @@ fn wire() {
                 // hickory reads the RDATA of every type it knows by that
                 // type's rules; the Lean codec carries every type but the
                 // RFC 1035 name types as octets (RFC 3597). Such a message
-                // agrees when one of its records is one hickory refuses.
+                // agrees when the first record hickory fails on is one
+                // hickory refuses on its own.
                 let lean = field(expected, "message");
-                let rejected = ["answer", "authority", "additional"]
+                let lines: Vec<String> = ["answer", "authority", "additional"]
                     .iter()
-                    .any(|s| texts(lean, s).iter().any(|l| refused_in_messages(l)));
+                    .flat_map(|s| texts(lean, s))
+                    .collect();
+                let rejected = first_refused_record(&bytes)
+                    .and_then(|index| lines.get(index))
+                    .is_some_and(|line| refused_in_messages(line));
                 if rejected {
                     tally.note("messages with a record hickory refuses");
                     Ok(())
@@ -1385,6 +1432,9 @@ fn zone_answers() {
     each_case("zone", |case, tally| {
         let input = field(case, "input");
         let expected = field(case, "expected");
+        if let Some(error) = expected.get("error") {
+            return refused(field(input, "zone"), error.as_str().unwrap_or_default());
+        }
         let zone = vector_zone(field(input, "zone"))?;
         let req = vector_request(field(input, "request"), false);
         let any = any_response(text(input, "any"));
@@ -2596,14 +2646,30 @@ fn cache() {
     });
 }
 
-/// Offers one `cache.json` offer. A Secure RRset with an RRSIG expiration
-/// is capped by it through [`Cache::validated`], as the resolver does
-/// once validation is done (RFC 4035 §5.3.3), when the offer was stored.
+/// Offers one `cache.json` offer, then hands the cache what validation
+/// established through [`Cache::validated`], with the RRSIGs' first
+/// expiration and smallest Original TTL, as the resolver does once
+/// validation is done (RFC 4035 §5.3.3, RFC 9520 §3.2), when the offer was
+/// stored.
 fn offer(cache: &mut Cache, offer: &Value, now: Instant, limits: Limits) {
+    if text(offer, "kind") == "failure" {
+        return cache.insert(
+            now,
+            Offer::Failure {
+                key: cache_key(field(offer, "key")),
+                why: failure_kind(field(offer, "why")),
+            },
+        );
+    }
+    let validation = vector_validation(field(offer, "validation"));
+    let truncated = flag(offer, "truncated");
+    let signatures_expire = field(offer, "sig_expires").as_u64().map(at);
+    let original_ttl = field(offer, "original_ttl")
+        .as_u64()
+        .map(|ttl| u32::try_from(ttl).expect("a TTL fits 32 bits"));
     match text(offer, "kind") {
         "positive" => {
             let set = vector_rrset(&texts(offer, "set"));
-            let validation = vector_validation(field(offer, "validation"));
             let rank = rank(text(offer, "rank"));
             let key = Key::new(LowerName::new(set.name()), set.record_type(), DNSClass::IN);
             let ttl = if set.ttl() & 0x8000_0000 != 0 {
@@ -2620,17 +2686,23 @@ fn offer(cache: &mut Cache, offer: &Value, now: Instant, limits: Limits) {
                     rank,
                     validation,
                     proof: Vec::new(),
-                    truncated: flag(offer, "truncated"),
+                    truncated,
                 },
             );
-            let stored = matches!(
-                cache.get(&key, now),
-                Some(Entry::Positive { expires, rank: r, .. }) if *expires == fresh && *r == rank
-            );
-            if let Some(expires) = field(offer, "sig_expires").as_u64()
-                && stored
-            {
-                cache.validated(&key, &checked, validation, Some(at(expires)), None, now);
+            let stored = !truncated
+                && matches!(
+                    cache.get(&key, now),
+                    Some(Entry::Positive { expires, rank: r, .. }) if *expires == fresh && *r == rank
+                );
+            if stored {
+                cache.validated(
+                    &key,
+                    &checked,
+                    validation,
+                    signatures_expire,
+                    original_ttl,
+                    now,
+                );
             }
         }
         "negative" => {
@@ -2647,34 +2719,61 @@ fn offer(cache: &mut Cache, offer: &Value, now: Instant, limits: Limits) {
             let key = cache_key(field(offer, "key"));
             // A proven negative lives no longer than its NSEC records
             // (RFC 9077 §3); the offer carries their TTL.
-            let denial = field(offer, "denial_ttl").as_u64().map(|ttl| {
-                let mut set =
-                    RecordSet::with_ttl(Name::from(&key.name), RecordType::NSEC, ttl as u32);
-                set.set_ttl(ttl as u32);
-                set
-            });
+            let denial: Vec<RecordSet> = field(offer, "denial_ttl")
+                .as_u64()
+                .map(|ttl| {
+                    let mut set =
+                        RecordSet::with_ttl(Name::from(&key.name), RecordType::NSEC, ttl as u32);
+                    set.set_ttl(ttl as u32);
+                    set
+                })
+                .into_iter()
+                .collect();
+            let kind = match text(offer, "negative") {
+                "nxdomain" => Negative::NxDomain,
+                _ => Negative::NoData,
+            };
+            // An NXDOMAIN is kept under type ANY, and its result holds for
+            // its copy under the type asked too.
+            let stored_key = match kind {
+                Negative::NxDomain => Key::new(key.name.clone(), RecordType::ANY, key.class),
+                Negative::NoData => key.clone(),
+            };
+            let fresh = soa
+                .as_ref()
+                .map(|soa| now + cache.negative_ttl(soa, &denial));
+            let checked = Checked::Denial {
+                soa: soa.clone(),
+                denial: denial.clone(),
+            };
             cache.insert(
                 now,
                 Offer::Negative {
                     key,
-                    kind: match text(offer, "negative") {
-                        "nxdomain" => Negative::NxDomain,
-                        _ => Negative::NoData,
-                    },
+                    kind,
                     soa,
-                    denial: denial.into_iter().collect(),
-                    validation: vector_validation(field(offer, "validation")),
-                    truncated: flag(offer, "truncated"),
+                    denial,
+                    validation,
+                    truncated,
                 },
             );
+            let stored = !truncated
+                && matches!(
+                    cache.get(&stored_key, now),
+                    Some(Entry::Negative { expires, .. }) if Some(*expires) == fresh
+                );
+            if stored {
+                cache.validated(
+                    &stored_key,
+                    &checked,
+                    validation,
+                    signatures_expire,
+                    original_ttl,
+                    now,
+                );
+            }
         }
-        _ => cache.insert(
-            now,
-            Offer::Failure {
-                key: cache_key(field(offer, "key")),
-                why: failure_kind(field(offer, "why")),
-            },
-        ),
+        other => panic!("no offer kind {other}"),
     }
 }
 

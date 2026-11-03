@@ -24,6 +24,7 @@
 //! | [`fit`] | Writes a reply within the requestor's size: whole RRsets, needed data first, TC only when that data does not fit. |
 //! | [`restore`] | Gives a relayed reply the client's ID and question case and changes nothing else. |
 //! | [`Ede`], [`Nsid`], [`Padding`] | EDNS options hickory carries as raw bytes or its own type (RFC 8914, 5001, 7830). |
+//! | [`label_count`], [`dname_substitute`] | Counts a name's labels with a leading `*`, and makes the name a DNAME substitutes (RFC 6672 §2.2). |
 //!
 //! A world's DNS server is a zone and an authoritative server program on
 //! a host, which apply these rules on every reply: the engines in
@@ -77,12 +78,14 @@ pub use hickory_proto::*;
 pub mod dnssec;
 mod fit;
 mod framing;
+mod names;
 mod options;
 mod relay;
 mod request;
 
 pub use fit::{Fitted, Limit, Response, fit};
 pub use framing::{Framing, Queries, stream_framed};
+pub use names::{dname_substitute, label_count};
 pub use options::{Ede, EdeCode, Nsid, Padding};
 pub use relay::{RelayError, restore};
 pub use request::{EdnsIn, Parsed, Request, read_message};

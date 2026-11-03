@@ -26,7 +26,7 @@ use fictionet::stdlib::services::dns::authority::{
     Ask, Authority, AuthorityEngine, ChaosAnswer, ChaosReply, Identity, Known, Observe, Overlay,
     Relay, ServerConfig, Step, Zones, bare_reply, chaos,
 };
-use fictionet::stdlib::services::dns::zone::{Fact, Lazy, Zone, ZoneData};
+use fictionet::stdlib::services::dns::zone::{Fact, Lazy, Transparent, Zone, ZoneData};
 use fictionet::stdlib::services::dns::{
     Action, Client, ClientQuery, Engine, Event, ExchangeFailure, Generation, Input, ObservedKind,
     Session, Token, Transmit, Unmatched, WallClock,
@@ -1572,6 +1572,33 @@ fn an_overlay_on_a_server_of_another_zone_answers_as_its_base() {
             "DO {dnssec_ok}"
         );
     }
+}
+
+/// A referral needs the glue for a name server at or below the invented
+/// apex (RFC 9471 §3.1). When the invented zone does not know the server's
+/// address, a server of the parent answers SERVFAIL in its place.
+#[test]
+fn an_overlay_without_the_glue_it_needs_answers_servfail() {
+    let com = Zone::builder(name("com."), soa("com."), 86400)
+        .rrset(rrset("com.", 172800, vec![ns("a.gtld-servers.net.")]))
+        .build()
+        .unwrap();
+    let without = Zone::builder(name("fict.com."), soa("fict.com."), 3600)
+        .rrset(rrset("fict.com.", 3600, vec![ns("ns1.fict.com.")]))
+        .rrset(rrset("www.fict.com.", 300, vec![a("192.0.2.81")]))
+        .build()
+        .unwrap();
+    let inner = Zones::new(vec![Arc::new(Transparent(without)) as Arc<dyn ZoneData>]);
+    let overlay = Overlay::new(zones(vec![com]), name("com.")).below(name("fict.com."), inner);
+    let mut engine = AuthorityEngine::new(overlay, ServerConfig::generic(), local());
+    let actions = ask_with(
+        &mut engine,
+        &query("www.fict.com.", RecordType::A, |_| {}),
+        Transport::Udp,
+    );
+    assert!(sends(&actions).is_empty());
+    let reply = the_answer(&actions);
+    assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
 }
 
 #[test]

@@ -639,6 +639,63 @@ fn qname_minimisation_stays_within_the_rfc_9156_counts() {
     assert_eq!(whole, 1);
 }
 
+/// The questions `net` carried to the servers of `example.com`.
+fn asked_of_example(net: &MemoryNet) -> Vec<String> {
+    asked(net)
+        .into_iter()
+        .filter(|(server, _, _, _)| *server == ip(EXAMPLE) || *server == ip(EXAMPLE_TOO))
+        .map(|(_, qname, _, _)| qname)
+        .collect()
+}
+
+#[test]
+fn a_minimised_question_asked_again_after_a_timeout_is_the_same_step() {
+    let (mut net, _) = internet(false);
+    // The first two queries for `n.example.com` are lost.
+    let mut lost = 0;
+    net.lose(move |transmit| {
+        let query = Message::from_vec(&transmit.bytes).unwrap();
+        let lose = query.queries[0].name().to_lowercase() == name("n.example.com.") && lost < 2;
+        lost += usize::from(lose);
+        lose
+    });
+    let mut resolver = resolver(config(None));
+    let long = "a.b.c.d.e.f.g.h.i.j.k.l.m.n.example.com.";
+    let reply = ask(
+        &mut resolver,
+        &mut net,
+        0,
+        query(client(1), long, RecordType::A, |_| {}),
+    );
+    assert_eq!(addresses(&reply), ["192.0.2.82"]);
+    assert_eq!(
+        asked_of_example(&net)[..4],
+        [
+            "n.example.com.",
+            "n.example.com.",
+            "n.example.com.",
+            "m.n.example.com.",
+        ]
+    );
+}
+
+#[test]
+fn qname_minimisation_counts_a_leading_star_as_a_label() {
+    let (mut net, _) = internet(false);
+    let mut resolver = resolver(config(None));
+    let reply = ask(
+        &mut resolver,
+        &mut net,
+        0,
+        query(client(1), "*.y.example.com.", RecordType::A, |_| {}),
+    );
+    assert_eq!(reply.metadata.response_code, ResponseCode::NXDomain);
+    assert_eq!(
+        asked_of_example(&net),
+        ["y.example.com.", "*.y.example.com."]
+    );
+}
+
 #[test]
 fn a_truncated_reply_is_asked_again_over_tcp_of_the_same_server() {
     let (mut net, _) = internet(false);
@@ -803,50 +860,59 @@ fn the_work_bound_ends_a_question_that_costs_too_much() {
 
 #[test]
 fn a_failure_is_cached_and_answered_with_ede_13_never_as_a_negative() {
-    let (mut net, _) = internet(false);
-    // No server answers at the addresses of `example.com`.
-    net.lose(|transmit| {
-        let to = transmit.to.ip();
-        to == ip(EXAMPLE) || to == ip(EXAMPLE_TOO)
-    });
-    let mut resolver = resolver(config(None));
-    let reply = ask(
-        &mut resolver,
-        &mut net,
-        0,
-        query(client(1), "www.example.com.", RecordType::A, |_| {}),
-    );
-    assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
-    assert_eq!(edes(&reply), [EdeCode::NO_REACHABLE_AUTHORITY]);
-    assert!(reply.authorities.is_empty());
+    // The zone's own NS question fails too, although the referral to the
+    // zone left its NS RRset in the cache.
+    for (qname, qtype) in [
+        ("www.example.com.", RecordType::A),
+        ("example.com.", RecordType::NS),
+    ] {
+        let (mut net, _) = internet(false);
+        // No server answers at the addresses of `example.com`.
+        net.lose(|transmit| {
+            let to = transmit.to.ip();
+            to == ip(EXAMPLE) || to == ip(EXAMPLE_TOO)
+        });
+        let mut resolver = resolver(config(None));
+        let reply = ask(
+            &mut resolver,
+            &mut net,
+            0,
+            query(client(1), qname, qtype, |_| {}),
+        );
+        assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
+        assert_eq!(edes(&reply), [EdeCode::NO_REACHABLE_AUTHORITY]);
+        assert!(reply.authorities.is_empty());
 
-    let before = net.recording().exchanges().len();
-    let reply = ask(
-        &mut resolver,
-        &mut net,
-        2,
-        query(client(2), "www.example.com.", RecordType::A, |_| {}),
-    );
-    assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
-    assert_eq!(
-        edes(&reply),
-        [EdeCode::NO_REACHABLE_AUTHORITY, EdeCode::CACHED_ERROR]
-    );
-    assert!(reply.authorities.is_empty());
-    assert_eq!(
-        net.recording().exchanges().len(),
-        before,
-        "answered from the cache"
-    );
+        let before = net.recording().exchanges().len();
+        let reply = ask(
+            &mut resolver,
+            &mut net,
+            2,
+            query(client(2), qname, qtype, |_| {}),
+        );
+        assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
+        assert_eq!(
+            edes(&reply),
+            [EdeCode::NO_REACHABLE_AUTHORITY, EdeCode::CACHED_ERROR],
+            "{qname} {qtype}"
+        );
+        assert!(reply.authorities.is_empty());
+        assert_eq!(
+            net.recording().exchanges().len(),
+            before,
+            "{qname} {qtype} is answered from the cache"
+        );
 
-    // The failure lasts `failure_ttl`, 5 seconds, and is then asked again.
-    ask(
-        &mut resolver,
-        &mut net,
-        30,
-        query(client(3), "www.example.com.", RecordType::A, |_| {}),
-    );
-    assert!(net.recording().exchanges().len() > before);
+        // The failure lasts `failure_ttl`, 5 seconds, and is then asked
+        // again.
+        ask(
+            &mut resolver,
+            &mut net,
+            30,
+            query(client(3), qname, qtype, |_| {}),
+        );
+        assert!(net.recording().exchanges().len() > before);
+    }
 }
 
 #[test]
@@ -1655,6 +1721,31 @@ fn a_negative_trust_anchor_stops_validation_below_it() {
         query(client(1), "bad.com.", RecordType::DS, dnssec_ok),
     );
     assert!(reply.metadata.authentic_data, "com validates its DS RRset");
+}
+
+/// A trust anchor below a negative trust anchor starts validation again
+/// (RFC 7646 §1.1), as Unbound's trust anchors override its
+/// `domain-insecure`.
+#[test]
+fn a_trust_anchor_below_a_negative_one_validates_again() {
+    let (mut net, anchors) = internet(true);
+    let mut anchors: Vec<_> = anchors.unwrap().iter().cloned().collect();
+    anchors.push(keys(40).anchor(&name("example.com.")));
+    let com = LowerName::new(&name("com."));
+    let mut resolver = resolver(Config {
+        negative_anchors: Some(Arc::new(move |name: &LowerName| *name == com)),
+        ..config(Some(Anchors::of(anchors)))
+    });
+    for (qname, secure) in [("www.example.com.", true), ("www.bad.com.", false)] {
+        let reply = ask(
+            &mut resolver,
+            &mut net,
+            0,
+            query(client(1), qname, RecordType::A, dnssec_ok),
+        );
+        assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(reply.metadata.authentic_data, secure, "{qname}");
+    }
 }
 
 /// Validated NSEC records deny nothing below a negative trust anchor
@@ -2494,9 +2585,9 @@ fn an_unsigned_child_its_signed_parents_server_also_serves_is_insecure() {
 }
 
 #[test]
-fn a_cname_that_runs_out_while_its_target_is_chased_is_fetched_again() {
-    // An answer never carries a record past its TTL: the chain is followed
-    // again from the question.
+fn a_cached_cname_that_runs_out_while_its_target_is_chased_is_fetched_again() {
+    // A record the cache gave the answer never goes out past its TTL: the
+    // chain is followed again from the question.
     let root = Zone::from_master(
         ". 86400 IN SOA a.root. h.root. 1 7200 3600 1209600 300\n\
          . 518400 IN NS a.root.\n\
@@ -2558,11 +2649,20 @@ fn a_cname_that_runs_out_while_its_target_is_chased_is_fetched_again() {
         minimise: None,
         ..config(None)
     });
+    // The CNAME question puts the CNAME in the cache, and the A question
+    // takes it from there.
     let reply = ask(
         &mut resolver,
         &mut net,
         0,
-        query(client(1), "alias.alpha.", RecordType::A, |_| {}),
+        query(client(1), "alias.alpha.", RecordType::CNAME, |_| {}),
+    );
+    assert_eq!(reply.answers.len(), 1);
+    let reply = ask(
+        &mut resolver,
+        &mut net,
+        0,
+        query(client(2), "alias.alpha.", RecordType::A, |_| {}),
     );
     assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
     assert_eq!(addresses(&reply), ["192.0.2.80"]);
@@ -2574,6 +2674,54 @@ fn a_cname_that_runs_out_while_its_target_is_chased_is_fetched_again() {
         .filter(|(server, qname, _, _)| *server == ip("192.0.2.1") && qname == "alias.alpha.")
         .count();
     assert_eq!(cnames, 2, "the CNAME is fetched again after it ran out");
+}
+
+#[test]
+fn data_that_runs_out_while_it_is_fetched_serves_the_answer_it_came_for() {
+    // Each round trip takes longer than the CNAME's and the target's TTL.
+    // Data that arrived for the question serves its answer with the TTL it
+    // has left (RFC 1035 §7.4), so the question is answered once.
+    let (mut net, _) = internet(false);
+    let example = builder("example.com.", "ns1.example.com.")
+        .rrset(rrset(
+            "ns1.example.com.",
+            3600,
+            vec![a(EXAMPLE), a(EXAMPLE_TOO)],
+        ))
+        .rrset(rrset(
+            "c.example.com.",
+            1,
+            vec![RData::CNAME(CNAME(name("t.example.org.")))],
+        ))
+        .build()
+        .unwrap();
+    serve_at(&mut net, EXAMPLE, vec![example.clone()]);
+    serve_at(&mut net, EXAMPLE_TOO, vec![example]);
+    let example_org = builder("example.org.", "ns1.example.org.")
+        .rrset(rrset("ns1.example.org.", 3600, vec![a(EXAMPLE_ORG)]))
+        .rrset(rrset("t.example.org.", 1, vec![a("192.0.2.91")]))
+        .build()
+        .unwrap();
+    serve_at(&mut net, EXAMPLE_ORG, vec![example_org]);
+    // The resolver waits longer than a round trip, so no query times out.
+    let mut resolver = resolver(Config {
+        retransmit: Duration::from_secs(3),
+        ..config(None)
+    });
+    let reply = ask_slowly(
+        &mut resolver,
+        &mut net,
+        query(client(1), "c.example.com.", RecordType::A, |_| {}),
+        Duration::from_millis(1100),
+    );
+    assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(addresses(&reply), ["192.0.2.91"]);
+    assert_eq!(reply.answers[0].ttl, 0, "the CNAME has run out");
+    let cnames = asked(&net)
+        .iter()
+        .filter(|(_, qname, rtype, _)| qname == "c.example.com." && *rtype == RecordType::A)
+        .count();
+    assert_eq!(cnames, 1, "the CNAME is fetched once");
 }
 
 #[test]

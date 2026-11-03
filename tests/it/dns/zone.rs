@@ -12,10 +12,12 @@ use fictionet::stdlib::protocols::dns::dnssec::rdata::{DNSSECRData, NSEC3};
 use fictionet::stdlib::protocols::dns::op::{
     Edns, Message, MessageType, OpCode, Query, ResponseCode,
 };
-use fictionet::stdlib::protocols::dns::rr::rdata::{A, CNAME, MX, NS, PTR, SOA, SVCB, TXT};
+use fictionet::stdlib::protocols::dns::rr::rdata::svcb::{Alpn, SvcParamKey, SvcParamValue};
+use fictionet::stdlib::protocols::dns::rr::rdata::{A, CNAME, HTTPS, MX, NS, PTR, SOA, SVCB, TXT};
 use fictionet::stdlib::protocols::dns::rr::{
     LowerName, Name, RData, Record, RecordSet, RecordType,
 };
+use fictionet::stdlib::protocols::dns::serialize::binary::BinEncodable;
 use fictionet::stdlib::protocols::dns::{Parsed, Request, Response};
 use fictionet::stdlib::services::dns::WallClock;
 use fictionet::stdlib::services::dns::zone::{
@@ -435,8 +437,9 @@ fn master_file_faults_name_their_line() {
         fault(&with("www TXT \"open")),
         (6, MasterError::UnclosedQuote)
     );
-    // A line break inside a quoted string never reaches hickory's parser,
-    // where a `$INCLUDE` after it would read a file.
+    // A line break inside a quoted string must be escaped, as BIND reads
+    // it, and never reaches hickory's parser, where a `$INCLUDE` after it
+    // would read a file.
     assert_eq!(
         fault(&with("www TXT \"a\n$INCLUDE /etc/hostname\"")),
         (
@@ -685,6 +688,166 @@ fn master_file_names_take_at_signs_escapes_and_any_octets() {
     let octets = Name::from_labels(["é".as_bytes(), b"t"]).unwrap();
     assert!(utf8.node(&LowerName::new(&octets)).is_some());
     assert!(utf8.node(&lower("xn--9ca.t.")).is_none());
+}
+
+/// Character-strings, SvcParams, and DNSSEC algorithm fields read as BIND
+/// reads them: `\DDD` is one octet of that decimal value (RFC 1035 §5.1),
+/// SvcParams in any order go out in increasing order of key and a key
+/// written twice is refused (RFC 9460 §2.1, §2.2), and an algorithm may
+/// be its mnemonic (RFC 4034 §2.2, §3.2, §5.3).
+#[test]
+fn master_file_strings_parameters_and_algorithms_read_as_bind_reads_them() {
+    let head = "$TTL 300\n@ IN SOA @ h 1 2 3 4 5\n@ IN NS ns\nns IN A 192.0.2.1\n";
+    let read = |line: &str| {
+        Zone::from_master(&format!("{head}{line}\n"), Some(name("t."))).map_err(Box::new)
+    };
+    let data = |line: &str, owner: &str, rtype: RecordType| -> RData {
+        let zone = read(line).unwrap_or_else(|e| panic!("{line}: {e}"));
+        let Some(Node::Data(sets)) = zone.node(&lower(owner)) else {
+            panic!("no data at {owner}");
+        };
+        let data = sets[&rtype]
+            .records_without_rrsigs()
+            .next()
+            .unwrap()
+            .data
+            .clone();
+        assert!(data.to_bytes().is_ok(), "{line} encodes");
+        data
+    };
+
+    let RData::TXT(txt) = data(
+        "x TXT \"\\065\\066C\" \"tab\\009x\" \\200 \"q\\\"\"",
+        "x.t.",
+        RecordType::TXT,
+    ) else {
+        panic!("TXT");
+    };
+    let strings: Vec<&[u8]> = txt.txt_data.iter().map(|s| &s[..]).collect();
+    assert_eq!(strings, [&b"ABC"[..], b"tab\tx", b"\xc8", b"q\""]);
+    let RData::HINFO(hinfo) = data("x HINFO \"\\065\" os", "x.t.", RecordType::HINFO) else {
+        panic!("HINFO");
+    };
+    assert_eq!((&hinfo.cpu[..], &hinfo.os[..]), (&b"A"[..], &b"os"[..]));
+    let RData::CAA(caa) = data("x CAA 0 issue \"ca\\046example\"", "x.t.", RecordType::CAA) else {
+        panic!("CAA");
+    };
+    assert_eq!(caa.value, b"ca.example".to_vec());
+    let RData::NAPTR(naptr) = data(
+        "x NAPTR 10 20 \"\\083\" \"SIP\\043D2U\" \"\" @",
+        "x.t.",
+        RecordType::NAPTR,
+    ) else {
+        panic!("NAPTR");
+    };
+    assert_eq!(&naptr.flags[..], b"S");
+    assert_eq!(&naptr.services[..], b"SIP+D2U");
+    assert_eq!(naptr.replacement, name("t."));
+    // A string past 255 octets is no character-string.
+    let long = format!("x TXT {}", "a".repeat(256));
+    assert!(read(&long).is_err());
+
+    let keys = |data: RData| -> Vec<SvcParamKey> {
+        let svcb = match data {
+            RData::SVCB(svcb) | RData::HTTPS(HTTPS(svcb)) => svcb,
+            other => panic!("{other:?}"),
+        };
+        svcb.svc_params.iter().map(|(key, _)| *key).collect()
+    };
+    assert_eq!(
+        keys(data(
+            "svc SVCB 1 . alpn=\"h2,h3\" ipv6hint=2001:db8::1 mandatory=alpn",
+            "svc.t.",
+            RecordType::SVCB,
+        )),
+        [
+            SvcParamKey::Mandatory,
+            SvcParamKey::Alpn,
+            SvcParamKey::Ipv6Hint
+        ]
+    );
+    assert_eq!(
+        keys(data(
+            "h HTTPS 1 . ech=AEX+ alpn=h2",
+            "h.t.",
+            RecordType::HTTPS
+        )),
+        [SvcParamKey::Alpn, SvcParamKey::EchConfigList]
+    );
+    // A comma or a backslash inside one ALPN ID is escaped (RFC 9460
+    // Appendix A.1).
+    let RData::SVCB(svcb) = data(
+        "a SVCB 1 . alpn=\"f\\\\\\\\oo\\\\,bar,h2\"",
+        "a.t.",
+        RecordType::SVCB,
+    ) else {
+        panic!("SVCB");
+    };
+    assert_eq!(
+        svcb.svc_params,
+        [(
+            SvcParamKey::Alpn,
+            SvcParamValue::Alpn(Alpn(vec!["f\\oo,bar".to_owned(), "h2".to_owned()]))
+        )]
+    );
+    for line in [
+        "d SVCB 1 . alpn=h2 alpn=h3",
+        "d SVCB 1 . mandatory=alpn,alpn alpn=h2",
+        "d SVCB 1 . key65535=x",
+    ] {
+        assert_eq!(
+            read(line).err(),
+            Some(Box::new(ZoneError::Master {
+                line: 5,
+                error: MasterError::Rdata {
+                    rtype: RecordType::SVCB
+                }
+            })),
+            "{line}"
+        );
+    }
+
+    let key = "7uMa/2wdqJXCNCJt0hp/MA==";
+    let digest = "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF";
+    for (mnemonic, number) in [
+        (
+            format!("t. DNSKEY 257 3 ECDSAP256SHA256 {key}"),
+            format!("t. DNSKEY 257 3 13 {key}"),
+        ),
+        (
+            format!("c.t. DS 12345 ecdsap256sha256 2 {digest}"),
+            format!("c.t. DS 12345 13 2 {digest}"),
+        ),
+    ] {
+        let rtype = if mnemonic.contains("DS ") {
+            RecordType::DS
+        } else {
+            RecordType::DNSKEY
+        };
+        let owner = mnemonic.split(' ').next().unwrap();
+        let with = |line: &str| {
+            let zone = Zone::from_master(&format!("{head}c.t. NS ns\n{line}\n"), Some(name("t.")))
+                .unwrap_or_else(|e| panic!("{line}: {e}"));
+            match zone.node(&lower(owner)) {
+                Some(Node::Data(sets)) => sets[&rtype].clone(),
+                Some(Node::Cut { ds: Some(ds), .. }) => ds.clone(),
+                other => panic!("{line}: {other:?}"),
+            }
+        };
+        assert_eq!(with(&mnemonic), with(&number), "{mnemonic}");
+    }
+    let rrsig = |algorithm: &str| {
+        format!("t. RRSIG SOA {algorithm} 1 300 20261121000000 20261031000000 12345 t. AAAA")
+    };
+    let signatures = |algorithm: &str| {
+        let zone = read(&rrsig(algorithm)).unwrap_or_else(|e| panic!("{algorithm}: {e}"));
+        let Some(Node::Data(apex)) = zone.node(&lower("t.")) else {
+            panic!("apex");
+        };
+        apex[&RecordType::SOA].rrsigs().to_vec()
+    };
+    assert_eq!(signatures("ECDSAP256SHA256"), signatures("13"));
+    assert!(read(&rrsig("NOSUCHALGORITHM")).is_err());
 }
 
 /// A DS RRset belongs at a zone cut, where the parent holds it, and BIND
@@ -1539,15 +1702,32 @@ fn an_unknown_fact_never_becomes_a_negative() {
                 // Either the answer did not need the fact and is the
                 // complete zone's, or it ends at the unknown name. It is
                 // never any other reply, so never a negative the complete
-                // zone would not give.
+                // zone would not give. An unknown NS, MX, or SRV target
+                // only leaves its addresses out of the optional
+                // additional data.
                 if partly
                     == (Answered::Unknown {
                         name: unknown.clone(),
                     })
                 {
                     read += 1;
-                } else {
-                    assert_eq!(partly, complete, "{qname} {qtype} with {unknown} unknown");
+                } else if partly != complete {
+                    let (Answered::Response(partly), Answered::Response(complete)) =
+                        (&partly, &complete)
+                    else {
+                        panic!("{qname} {qtype} with {unknown} unknown: {partly:?}");
+                    };
+                    // The optional records at or below the unknown name
+                    // are left out; the required glue comes first.
+                    let mut without = complete.clone();
+                    let required = without.required_additional;
+                    let mut index = 0;
+                    without.message.additionals.retain(|record| {
+                        index += 1;
+                        index <= required || !unknown.zone_of(&LowerName::new(&record.name))
+                    });
+                    assert_eq!(*partly, without, "{qname} {qtype} with {unknown} unknown");
+                    read += 1;
                 }
             }
             assert!(read > 0, "{qname} {qtype} read no fact");
@@ -2153,6 +2333,80 @@ fn a_lazy_cut_waits_for_its_in_domain_glue() {
     );
     assert_eq!(addresses(&reply.message.additionals), vec!["10.0.0.53"]);
     assert_eq!(reply.required_additional, 1);
+}
+
+/// The addresses of NS, MX, and SRV targets are optional additional data
+/// (RFC 2181 §5.4.1, RFC 9471 §3.2). A view that does not know a target
+/// still answers, without the target's addresses.
+#[test]
+fn an_unknown_target_leaves_out_only_its_addresses() {
+    let mx = |target: &str| RData::MX(MX::new(10, name(target)));
+
+    let shown = Shown::new(
+        &name("example."),
+        [rrset("example.", 300, vec![mx("mail.example.")])],
+    )
+    .unwrap();
+    let reply = ask(
+        &*view_of(&shown, "example.", RecordType::MX),
+        "example.",
+        RecordType::MX,
+    );
+    assert_eq!(rows(&reply.answers), vec![row("example.", RecordType::MX)]);
+    assert!(reply.additionals.is_empty());
+
+    let corp = Zone::builder(name("corp."), soa("corp.", 300), 3600)
+        .rrset(rrset("corp.", 3600, vec![ns("ns.corp.")]))
+        .rrset(rrset("ns.corp.", 3600, vec![a("192.0.2.1")]))
+        .rrset(rrset("www.corp.", 3600, vec![mx("mail.corp.")]))
+        .build()
+        .unwrap();
+    let transparent = Transparent(corp);
+    let reply = ask(
+        &*view_of(&transparent, "www.corp.", RecordType::MX),
+        "www.corp.",
+        RecordType::MX,
+    );
+    assert_eq!(rows(&reply.answers), vec![row("www.corp.", RecordType::MX)]);
+    assert!(reply.additionals.is_empty());
+
+    let (book, asked) = (Book::default(), Asked::default());
+    let zone = lazy(&book, &asked);
+    put(
+        &book,
+        "www.lazy.",
+        Fact::Present(vec![rrset("www.lazy.", 60, vec![mx("mail.lazy.")])]),
+    );
+    put(&book, "mail.lazy.", Fact::Unknown);
+    let reply = lazy_reply(&zone, "www.lazy.", RecordType::MX);
+    assert_eq!(rows(&reply.answers), vec![row("www.lazy.", RecordType::MX)]);
+    assert!(reply.additionals.is_empty());
+    // The provider was still asked about the target.
+    assert_eq!(times_asked(&asked, "mail.lazy."), 1);
+    // Once it knows the target, the answer carries its address.
+    put(
+        &book,
+        "mail.lazy.",
+        Fact::Present(vec![rrset("mail.lazy.", 60, vec![a("10.0.0.25")])]),
+    );
+    let reply = lazy_reply(&zone, "www.lazy.", RecordType::MX);
+    assert_eq!(addresses(&reply.additionals), vec!["10.0.0.25"]);
+
+    // A referral whose NS target outside the cut is unknown still refers.
+    put(
+        &book,
+        "sub.lazy.",
+        Fact::Present(vec![rrset("sub.lazy.", 60, vec![ns("ns.other.lazy.")])]),
+    );
+    put(&book, "other.lazy.", Fact::Unknown);
+    let view = view_of(&zone, "www.sub.lazy.", RecordType::A);
+    let reply = response(&*view, "www.sub.lazy.", RecordType::A, false);
+    assert!(!reply.message.metadata.authoritative);
+    assert_eq!(
+        rows(&reply.message.authorities),
+        vec![row("sub.lazy.", RecordType::NS)]
+    );
+    assert!(reply.message.additionals.is_empty());
 }
 
 // Locally served zones.

@@ -15,6 +15,7 @@
 use fictionet::stdlib::protocols::dns::dnssec::Nsec3HashAlgorithm;
 use fictionet::stdlib::protocols::dns::dnssec::proof::base32hex_encode;
 use fictionet::stdlib::protocols::dns::dnssec::rdata::{DNSSECRData, NSEC, NSEC3};
+use fictionet::stdlib::protocols::dns::label_count;
 use fictionet::stdlib::protocols::dns::rr::{
     LowerName, Name, RData, Record, RecordSet, RecordType,
 };
@@ -471,9 +472,7 @@ fn successor(name: &Name, apex: &Name) -> Name {
 /// as the last NSEC of a chain does (RFC 4034 §4.1.1).
 fn after_subtree(name: &Name, apex: &Name) -> Name {
     let mut name = name.clone();
-    // hickory's label count leaves out a leading `*`, so labels are
-    // counted here.
-    while name.iter().count() > apex.iter().count() {
+    while label_count(&name) > label_count(apex) {
         let parent = name.base_name();
         let room = (MAX_NAME - wire_len(&parent) - 1).min(MAX_LABEL);
         if let Some(next) = next_label(&first_label(&name), room) {

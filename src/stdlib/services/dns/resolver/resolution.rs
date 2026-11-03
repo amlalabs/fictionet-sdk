@@ -26,7 +26,8 @@ use std::net::{IpAddr, SocketAddr};
 use fictionet::Entropy;
 use fictionet::stdlib::protocols::dns::dnssec::rdata::DNSSECRData;
 use fictionet::stdlib::protocols::dns::dnssec::{
-    Chain, Fetched, Insecure, Link, Validation, Verify, proof, validate_denial, validate_rrset,
+    Anchors, Chain, Fetched, Insecure, Link, Validation, Verify, proof, validate_denial,
+    validate_rrset,
 };
 use fictionet::stdlib::protocols::dns::op::{
     Edns, Message, MessageType, OpCode, Query, ResponseCode,
@@ -35,6 +36,7 @@ use fictionet::stdlib::protocols::dns::rr::domain::Label;
 use fictionet::stdlib::protocols::dns::rr::{
     DNSClass, LowerName, Name, RData, RecordSet, RecordType,
 };
+use fictionet::stdlib::protocols::dns::{dname_substitute, label_count};
 use fictionet::stdlib::services::serve::Transport;
 use fictionet::time::Instant;
 
@@ -315,8 +317,9 @@ struct Lookup {
 
 #[derive(Default)]
 struct Minimising {
-    /// Minimised queries sent so far.
-    sent: u8,
+    /// Minimised questions answered so far. A question asked again after
+    /// a timeout or an unusable reply is the same step (RFC 9156 §2.3).
+    steps: u8,
     /// The deepest name below the current zone cut known not to be a cut.
     through: Option<LowerName>,
     /// Whether minimisation stopped, after a minimised query got NXDOMAIN
@@ -973,7 +976,7 @@ impl<V: Verify> Resolver<V> {
         let deeper = |cut: &LowerName| {
             cached
                 .as_ref()
-                .is_none_or(|cached| cut.num_labels() > cached.num_labels())
+                .is_none_or(|cached| label_count(cut) > label_count(cached))
         };
         let (zone, targets) = match (&lookup.delegation, cached.clone()) {
             (Some((cut, targets)), _)
@@ -1253,12 +1256,12 @@ impl<V: Verify> Resolver<V> {
     /// question, or with QNAME minimisation the name a few labels past
     /// what is known, with QTYPE A (RFC 9156 §2.3).
     fn next_question(
-        &mut self,
+        &self,
         id: LookupId,
         zone: &LowerName,
         forwarded: bool,
     ) -> Option<(Name, RecordType, bool)> {
-        let lookup = self.graph.lookups.get_mut(&id)?;
+        let lookup = self.graph.lookups.get(&id)?;
         let qname = Name::from(&lookup.key.name);
         let whole = (qname.clone(), lookup.key.rtype, false);
         let Some(bounds) = self.config.minimise else {
@@ -1268,30 +1271,29 @@ impl<V: Verify> Resolver<V> {
         if forwarded || priming || lookup.minimise.off {
             return Some(whole);
         }
-        let mut known = zone.num_labels();
+        let mut known = label_count(zone);
         if let Some(through) = &lookup.minimise.through
             && zone.zone_of(through)
             && through.zone_of(&lookup.key.name)
         {
-            known = known.max(through.num_labels());
+            known = known.max(label_count(through));
         }
-        let total = qname.num_labels();
-        if known + 1 >= total || lookup.minimise.sent >= bounds.max_queries {
+        let total = label_count(&qname);
+        let steps = lookup.minimise.steps;
+        if known + 1 >= total || steps >= bounds.max_queries {
             return Some(whole);
         }
-        let sent = lookup.minimise.sent;
-        let add = if sent < bounds.one_label {
+        let add = if steps < bounds.one_label {
             1
         } else {
-            let left = bounds.max_queries - sent;
+            let left = usize::from(bounds.max_queries - steps);
             (total - known).div_ceil(left).max(1)
         };
         let labels = known + add;
         if labels >= total {
             return Some(whole);
         }
-        lookup.minimise.sent += 1;
-        Some((qname.trim_to(usize::from(labels)), RecordType::A, true))
+        Some((qname.trim_to(labels), RecordType::A, true))
     }
 
     /// Sends one query for lookup `id` and waits for it.
@@ -1720,6 +1722,7 @@ impl<V: Verify> Resolver<V> {
                 })
                 .collect();
             if let Some(lookup) = self.graph.lookups.get_mut(&id) {
+                lookup.minimise.steps += u8::from(exchange.minimised);
                 lookup.delegation = Some((LowerName::new(&cut), targets));
                 for set in glue {
                     let addresses = set
@@ -1749,6 +1752,7 @@ impl<V: Verify> Resolver<V> {
     fn through(&mut self, id: LookupId, name: &Name, entropy: &dyn Entropy) {
         if let Some(lookup) = self.graph.lookups.get_mut(&id) {
             lookup.minimise.through = Some(LowerName::new(name));
+            lookup.minimise.steps += 1;
         }
         self.plan(id, entropy);
     }
@@ -1980,7 +1984,8 @@ impl<V: Verify> Resolver<V> {
         };
         if self.negative_anchor(&subject) {
             // RFC 7646 §1.1: below a negative trust anchor nothing is
-            // validated, as though no trust anchor covered the name.
+            // validated, as though no trust anchor covered the name, until
+            // a trust anchor further down.
             let validation = Validation::Insecure(Insecure::NoAnchor);
             self.validated(&subject, &checked, &material, validation);
             return CheckStart::Done(validation);
@@ -2048,11 +2053,21 @@ impl<V: Verify> Resolver<V> {
     }
 
     /// Whether a negative trust anchor covers `subject`: its name or a
-    /// name above it is one. A DS RRset belongs to the parent's side of
-    /// its name, so for DS the names from the parent up count.
+    /// name above it is one, with no trust anchor between them. A trust
+    /// anchor at the negative one or below it starts validation again
+    /// (RFC 7646 §1.1), as Unbound's trust anchors override its
+    /// `domain-insecure`. A DS RRset belongs to the parent's side of its
+    /// name, so for DS the names from the parent up count.
     fn negative_anchor(&self, subject: &Subject) -> bool {
-        let Some(anchors) = &self.config.negative_anchors else {
+        let Some(negative) = &self.config.negative_anchors else {
             return false;
+        };
+        let anchored = |name: &LowerName| {
+            self.config
+                .anchors
+                .iter()
+                .flat_map(Anchors::iter)
+                .any(|anchor| !anchor.ds.is_empty() && LowerName::new(&anchor.owner) == *name)
         };
         let key = match subject {
             Subject::Rrset(key) | Subject::Denial(key, _) => key,
@@ -2065,7 +2080,10 @@ impl<V: Verify> Resolver<V> {
             name = name.base_name();
         }
         loop {
-            if anchors(&name) {
+            if anchored(&name) {
+                return false;
+            }
+            if negative(&name) {
                 return true;
             }
             if name.is_root() {
@@ -2153,7 +2171,7 @@ impl<V: Verify> Resolver<V> {
         };
         let mut names = Vec::new();
         let mut name = last;
-        while name.num_labels() > zone.num_labels() && zone.zone_of(&name) {
+        while label_count(&name) > label_count(&zone) && zone.zone_of(&name) {
             names.push(LowerName::new(&name));
             name = name.base_name();
         }
@@ -2261,7 +2279,7 @@ impl<V: Verify> Resolver<V> {
         {
             let parent = parent.to_lowercase();
             let above =
-                parent.num_labels() < zone.num_labels() && parent.zone_of(&Name::from(zone));
+                label_count(&parent) < label_count(zone) && parent.zone_of(&Name::from(zone));
             if above && anchor.zone_of(&parent) {
                 self.link(id, parent, entropy);
             }
@@ -2619,20 +2637,7 @@ fn dname_matches(dname: &RecordSet, cname: &RecordSet) -> bool {
     let Some(alias) = cname_target(cname) else {
         return false;
     };
-    // hickory's own label count leaves out a leading `*`, which a name
-    // below a DNAME may start with, so the labels are counted here.
-    let owner = cname.name();
-    let Some(keep) = owner
-        .iter()
-        .count()
-        .checked_sub(dname.name().iter().count())
-    else {
-        return false;
-    };
-    let prefix: Vec<&[u8]> = owner.iter().take(keep).collect();
-    Name::from_labels(prefix)
-        .and_then(|prefix| prefix.append_domain(&target))
-        .is_ok_and(|expected| expected == alias)
+    dname_substitute(cname.name(), dname.name(), &target).is_some_and(|expected| expected == alias)
 }
 
 /// Whether `set` is a DNAME RRset (RFC 6672).

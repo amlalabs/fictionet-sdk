@@ -301,10 +301,8 @@ pub struct PublicResolver {
     pub service: &'static str,
     /// Its primary and secondary addresses.
     pub addresses: [ResolverAddress; 2],
-    /// The names its DNS over HTTPS service answers under. The addresses
-    /// the real hierarchy gives for them are where a world puts the
-    /// resolver's DoH front ([`Mirror::front`]).
-    pub doh: &'static [&'static str],
+    /// The names of [`doh`](Self::doh), fully qualified.
+    doh: &'static [&'static str],
     /// How its DNS over HTTPS service answers past RFC 8484, as seen on
     /// 2026-11-02 ([`Fronts::operator`](super::encrypted::Fronts::operator)).
     pub doh_operator: &'static dyn Operator,
@@ -312,6 +310,16 @@ pub struct PublicResolver {
 }
 
 impl PublicResolver {
+    /// The names its DNS over HTTPS service answers under. The addresses
+    /// the real hierarchy gives for them are where a world puts the
+    /// resolver's DoH front ([`Mirror::front`]).
+    pub fn doh(&self) -> Vec<Name> {
+        self.doh
+            .iter()
+            .map(|text| Name::from_ascii(text).expect("a public resolver's name is valid"))
+            .collect()
+    }
+
     /// The resolver's configuration as seen from `at`: its identity at
     /// the site that answers there, and its special names, the answers
     /// to its whoami names among them.

@@ -60,9 +60,12 @@ pub struct Config {
     /// Negative trust anchors (RFC 7646), as Unbound's `domain-insecure`
     /// sets them: `true` for a name at and below which no answer is
     /// validated, so each is Insecure as though no trust anchor covered
-    /// it. World code: the resolver asks it about an answer's owner and
-    /// every name above, while it works, so it must return quickly, and
-    /// its answers may change as the world runs. `None` for none.
+    /// it. A trust anchor in `anchors` at that name or below it starts
+    /// validation again there (RFC 7646 §1.1), as Unbound's trust anchors
+    /// override `domain-insecure`. World code: the resolver asks it about
+    /// an answer's owner and every name above, while it works, so it must
+    /// return quickly, and its answers may change as the world runs.
+    /// `None` for none.
     pub negative_anchors: Option<NegativeAnchors>,
     /// Which algorithms and digests may make an answer Secure (RFC 9904,
     /// RFC 9905).

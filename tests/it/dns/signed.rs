@@ -11,7 +11,7 @@ use fictionet::stdlib::protocols::dns::dnssec::{
     Sign, TBS, Validation, Verify, Window, ZoneKey, ds, validate_denial, validate_rrset,
 };
 use fictionet::stdlib::protocols::dns::op::{Edns, Message, MessageType, OpCode, Query};
-use fictionet::stdlib::protocols::dns::rr::rdata::{A, NS, SOA};
+use fictionet::stdlib::protocols::dns::rr::rdata::{A, NS, NULL, SOA};
 use fictionet::stdlib::protocols::dns::rr::{
     LowerName, Name, RData, Record, RecordSet, RecordType,
 };
@@ -450,11 +450,69 @@ fn check_chain_finds_a_zone_of_two_algorithms_whole_with_either() {
     );
 }
 
-/// A DNAME's target is signed in canonical, lowercase form (RFC 4034
-/// §6.2 item 3), as other validators check it, whatever its case in the
-/// zone, and validates as served.
+/// `text` as an uncompressed name on the wire.
+fn wire(text: &str) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for label in name(text).iter() {
+        bytes.push(label.len() as u8);
+        bytes.extend_from_slice(label);
+    }
+    bytes.push(0);
+    bytes
+}
+
+/// RDATA of type `code`, which hickory carries as unknown, from `parts`.
+fn unknown(code: u16, parts: &[&[u8]]) -> RData {
+    RData::Unknown {
+        code: RecordType::from(code),
+        rdata: NULL::with(parts.concat()),
+    }
+}
+
+/// The names in the RDATA of the types RFC 4034 §6.2 item 3 lists, as
+/// RFC 6840 §5.1 amends it, that hickory carries as unknown RDATA are
+/// signed in canonical, lowercase form, as other validators check them,
+/// whatever their case in the zone, and validate as served. The other
+/// fields keep their octets, letters among them.
 #[test]
-fn a_dname_target_is_signed_in_lowercase() {
+fn names_in_unknown_rdata_are_signed_in_lowercase() {
+    // A 16-bit field and an A6 address suffix whose octets are ASCII
+    // capitals.
+    let field: &[u8] = b"AB";
+    let suffix: &[u8] = b"CDEFGHIJ";
+    // (owner, as served, as another validator signs it)
+    let cases = [
+        (
+            "d.example.",
+            dname(&name("Target.TEST.")),
+            dname(&name("target.test.")),
+        ),
+        (
+            "rp.example.",
+            unknown(17, &[&wire("Admin.Example."), &wire("Txt.Example.")]),
+            unknown(17, &[&wire("admin.example."), &wire("txt.example.")]),
+        ),
+        (
+            "afsdb.example.",
+            unknown(18, &[field, &wire("AFS.Example.")]),
+            unknown(18, &[field, &wire("afs.example.")]),
+        ),
+        (
+            "px.example.",
+            unknown(26, &[field, &wire("Map.Example."), &wire("X400.Example.")]),
+            unknown(26, &[field, &wire("map.example."), &wire("x400.example.")]),
+        ),
+        (
+            "a6.example.",
+            unknown(38, &[&[64], suffix, &wire("Prefix.Example.")]),
+            unknown(38, &[&[64], suffix, &wire("prefix.example.")]),
+        ),
+        (
+            "mb.example.",
+            unknown(7, &[&wire("Host.Example.")]),
+            unknown(7, &[&wire("host.example.")]),
+        ),
+    ];
     let soa = SOA::new(
         name("ns1.example."),
         name("hostmaster.example."),
@@ -464,33 +522,40 @@ fn a_dname_target_is_signed_in_lowercase() {
         1209600,
         300,
     );
-    let zone = Zone::builder(name("example."), soa, 3600)
+    let mut zone = Zone::builder(name("example."), soa, 3600)
         .rrset(rrset("example.", vec![RData::NS(NS(name("ns1.example.")))]))
-        .rrset(rrset("ns1.example.", vec![RData::A(A::new(192, 0, 2, 1))]))
-        .rrset(rrset("d.example.", vec![dname(&name("Target.TEST."))]))
+        .rrset(rrset("ns1.example.", vec![RData::A(A::new(192, 0, 2, 1))]));
+    for (owner, served, _) in &cases {
+        zone = zone.rrset(rrset(owner, vec![served.clone()]));
+    }
+    let signed = zone
         .build()
+        .unwrap()
+        .signed(&keys(), window(), Denial::Nsec)
         .unwrap();
-    let signed = zone.signed(&keys(), window(), Denial::Nsec).unwrap();
-    let served = sets(&ask(&signed, "d.example.", RecordType::DNAME, AnyResponse::All).answers);
-    assert_eq!(validate(&signed, &served[0]), Validation::Secure);
-    // The bytes another validator checks: the target in lowercase.
-    let lowercase = rrset("d.example.", vec![dname(&name("target.test."))]);
     let keys: Vec<_> = keys().keys.iter().map(|key| key.dnskey()).collect();
-    assert_eq!(served[0].rrsigs().len(), 2);
-    for record in served[0].rrsigs() {
-        let RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) = &record.data else {
-            panic!("an RRSIG");
-        };
-        let tbs = TBS::from_input(
-            lowercase.name(),
-            lowercase.dns_class(),
-            rrsig.input(),
-            lowercase.records_without_rrsigs(),
-        )
-        .unwrap();
-        let verified = keys
-            .iter()
-            .any(|key| Ring.verify(key, tbs.as_ref(), rrsig.sig()));
-        assert!(verified, "the {:?} RRSIG", rrsig.input().algorithm);
+    for (owner, data, canonical) in cases {
+        let rtype = data.record_type();
+        let served = sets(&ask(&signed, owner, rtype, AnyResponse::All).answers);
+        assert_eq!(validate(&signed, &served[0]), Validation::Secure, "{owner}");
+        // The bytes another validator checks: the names in lowercase.
+        let canonical = rrset(owner, vec![canonical]);
+        assert_eq!(served[0].rrsigs().len(), 2);
+        for record in served[0].rrsigs() {
+            let RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) = &record.data else {
+                panic!("an RRSIG");
+            };
+            let tbs = TBS::from_input(
+                canonical.name(),
+                canonical.dns_class(),
+                rrsig.input(),
+                canonical.records_without_rrsigs(),
+            )
+            .unwrap();
+            let verified = keys
+                .iter()
+                .any(|key| Ring.verify(key, tbs.as_ref(), rrsig.sig()));
+            assert!(verified, "{owner}: the {:?} RRSIG", rrsig.input().algorithm);
+        }
     }
 }

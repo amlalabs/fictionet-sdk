@@ -4,16 +4,18 @@
 (* addresses of one world: a root server, a TLD server, and the server of  *)
 (* an edited zone "fict".                                                  *)
 (*                                                                         *)
-(* The root server runs Relay: every question is relayed to the real      *)
-(* server at that address through a source. The TLD server runs           *)
-(* Overlay(Relay).below("fict", Lazy): a question for an unedited name is  *)
-(* relayed the same way; a question at or below "fict" gets a referral     *)
-(* composed from the edited zone's apex NS RRset and the addresses of its  *)
-(* target "ns.fict", read from the lazy zone, after the overlay asks the   *)
-(* real TLD server for "fict DS" (DO=1). A fact of that read the zone does *)
-(* not know makes the referral SERVFAIL. The fict server answers from a   *)
-(* Lazy zone whose Provider says, per name, Present, Absent, or Unknown,   *)
-(* and whose answers change as the world runs.                             *)
+(* The root and TLD servers both run Overlay(Relay).below("fict", Lazy),  *)
+(* as Mirror::wrap puts an overlay on every relay. A question for an       *)
+(* unedited name is relayed to the real server at that address through a  *)
+(* source. For a question at or below "fict" the overlay reads the edited  *)
+(* zone's apex NS RRset and the addresses of its target "ns.fict" from the *)
+(* lazy zone, then asks the real server for "fict DS" (DO=1). The real TLD *)
+(* server serves fict's parent, so the TLD server refers: a referral       *)
+(* composed from what it read, or SERVFAIL when the target's address is    *)
+(* not there. The real root server does not, so the root server answers   *)
+(* as its base: a second ask relays the question. The fict server answers *)
+(* from a Lazy zone whose Provider says, per name, Present, Absent, or     *)
+(* Unknown, and whose answers change as the world runs.                    *)
 (*                                                                         *)
 (* Every ask passes the world's Only policy before the source sees it; a   *)
 (* refused ask is a Timeout. The source answers after any delay, may fail  *)
@@ -76,14 +78,31 @@ Provider(w, n) ==
 \* The real server's reply to an ask while the real data is at v.
 RealReply(ask, v) == <<ask.srv, ask.q, v>>
 
-\* A question the overlay at the TLD server answers with a referral.
-Crosses(r) == r.q \in Edited /\ r.srv = "tld"
+\* A question at or below the edited apex at a server the overlay runs on.
+Crosses(r) == r.q \in Edited /\ r.srv \in {"root", "tld"}
 
-\* The ask a request needs: the overlay's DS ask for a question that crosses
-\* the apex at the TLD server, the relayed question otherwise.
-AskOf(r) ==
-    IF Crosses(r) THEN [srv |-> "tld", q |-> "fict DS"]
-    ELSE [srv |-> r.srv, q |-> r.q]
+\* Whether the real server at srv serves fict's parent: its reply to
+\* "fict DS" has AA and the parent's SOA. The TLD server does; the root
+\* server refers to the TLD.
+Serves(srv) == srv = "tld"
+
+\* A crossing question at a server of fict's parent gets a referral.
+Referral(r) == Crosses(r) /\ Serves(r.srv)
+
+DsAsk(r) == [srv |-> r.srv, q |-> "fict DS"]
+RelayAsk(r) == [srv |-> r.srv, q |-> r.q]
+
+\* What a Known holds for ask a: the observation record, or None.
+Obs(k, a) == IF \E x \in k : x.ask = a THEN CHOOSE x \in k : x.ask = a ELSE None
+
+\* The ask a request needs next, or whose observation decides its reply, as
+\* Overlay::respond goes: for a crossing question the DS ask, and after a
+\* reply from a server that does not serve the parent, the relayed
+\* question; for any other question the relayed question.
+Deciding(r, k) ==
+    IF ~Crosses(r) THEN RelayAsk(r)
+    ELSE LET d == Obs(k, DsAsk(r))
+         IN  IF d # None /\ d.obs = "reply" /\ ~Serves(r.srv) THEN RelayAsk(r) ELSE DsAsk(r)
 
 \* The fict server answers from the lazy zone with no ask.
 FromView(r) == r.srv = "fict"
@@ -97,17 +116,19 @@ LazyA == [id |-> "a", srv |-> "fict", q |-> "a.fict"]
 LazyB == [id |-> "b", srv |-> "fict", q |-> "b.fict"]
 LazyC == [id |-> "c", srv |-> "fict", q |-> "c.fict"]
 Cross == [id |-> "cross", srv |-> "tld", q |-> "a.fict"]
-ReqsBase == {Real, Leak, LazyB, Cross}
+CrossRoot == [id |-> "crossroot", srv |-> "root", q |-> "a.fict"]
+ReqsBase == {Real, Leak, LazyB, Cross, CrossRoot}
 ReqsLazy == {LazyA, LazyB, LazyC, Cross}
 ReqsAdvance == {Real, Cross}
 
 \* Authority::respond for a request that is not answered from the view, as a
-\* function of what is known: None, or the observation for its ask.
+\* function of what is known: the observations for its asks so far.
 Respond(r, k) ==
-    IF k = None THEN "need"
-    ELSE IF k.obs = "reply" THEN "reply"
-    ELSE IF ReaskTimeout /\ k.obs = "timeout" THEN "need"
-    ELSE "silent"
+    LET o == Obs(k, Deciding(r, k))
+    IN  IF o = None THEN "need"
+        ELSE IF o.obs = "reply" THEN "reply"
+        ELSE IF ReaskTimeout /\ o.obs = "timeout" THEN "need"
+        ELSE "silent"
 
 VARIABLES
     world,     \* the world's state: what the provider says
@@ -118,7 +139,7 @@ VARIABLES
     realSeen,  \* real versions that have existed
     gen,       \* the engine's generation
     st,        \* [Reqs -> "new" | "reading" | "overlay" | "parked" | "done"]
-    known,     \* [Reqs -> None or [obs, v]]: the request's Known
+    known,     \* [Reqs -> set of [ask, obs, v, val]]: the request's Known
     partial,   \* [Reqs -> None or facts read so far under the lazy zone's lock]
     reply,     \* [Reqs -> None or the reply sent]
     nAsks,     \* [Reqs -> asks sent for the request in this generation]
@@ -128,6 +149,9 @@ VARIABLES
 
 vars == <<world, ins, history, rev, real, realSeen, gen, st, known, partial, reply, nAsks,
           atSource, obsq, reached>>
+
+\* The ask a request needs next, or whose observation decides its reply.
+AskOf(r) == Deciding(r, known[r])
 
 FactAt(s, n) == IF n \in s.ins THEN "present" ELSE Provider(s.w, n)
 Fact(n) == FactAt([w |-> world, ins |-> ins], n)
@@ -144,7 +168,7 @@ Init ==
     /\ realSeen = {0}
     /\ gen = 1
     /\ st = [r \in Reqs |-> "new"]
-    /\ known = [r \in Reqs |-> None]
+    /\ known = [r \in Reqs |-> {}]
     /\ partial = [r \in Reqs |-> None]
     /\ reply = [r \in Reqs |-> None]
     /\ nAsks = [r \in Reqs |-> 0]
@@ -213,8 +237,9 @@ ReadRest(r) ==
 
 (* The engine calls respond. An overlay first reads the edited zone's apex *)
 (* NS RRset and the address of its target under one view of the lazy      *)
-(* zone, holding the zone's lock while it reads. The engine runs one       *)
-(* respond at a time, so nothing else moves until the step below ends it.  *)
+(* zone, holding the zone's lock while it reads, at either server. The     *)
+(* engine runs one respond at a time, so nothing else moves until the step *)
+(* below ends it.                                                          *)
 ReadOverlay(r) ==
     /\ st[r] = "new"
     /\ ~FromView(r)
@@ -228,23 +253,21 @@ ReadOverlay(r) ==
 
 (* A Need parks the request under a token and sends its ask through the    *)
 (* policy: a refused ask comes back as Timeout without reaching the        *)
-(* source. An overlay lets go of what it read from the lazy zone first.    *)
+(* source. An overlay lets go of what it read from the lazy zone first. A  *)
+(* referral rests on what the overlay read; without the target's address  *)
+(* it is SERVFAIL.                                                         *)
 Step(r) ==
     /\ \/ st[r] = "new" /\ ~Crosses(r)
        \/ st[r] = "overlay"
     /\ ~FromView(r)
     /\ LET a == AskOf(r)
            tok == <<gen, r.id>>
+           o == Obs(known[r], a)
            read == IF Crosses(r) THEN partial[r] ELSE {}
-           unknown == \E f \in read : Read(f[2]) = "unknown"
+           unglued == \E f \in read : f[1] = NsTarget /\ Read(f[2]) # "present"
            released == [partial EXCEPT ![r] = None]
        IN  /\ UNCHANGED <<ins, history, rev>>
-           /\ CASE unknown ->
-                  /\ reply' = [reply EXCEPT ![r] = Reply("SERVFAIL", None, read, None)]
-                  /\ st' = [st EXCEPT ![r] = "done"]
-                  /\ partial' = released
-                  /\ UNCHANGED <<nAsks, atSource, obsq, reached>>
-                [] Respond(r, known[r]) = "need" ->
+           /\ CASE Respond(r, known[r]) = "need" ->
                   /\ st' = [st EXCEPT ![r] = "parked"]
                   /\ nAsks' = [nAsks EXCEPT ![r] = @ + 1]
                   /\ partial' = IF ParkInView THEN partial ELSE released
@@ -255,8 +278,13 @@ Step(r) ==
                      ELSE /\ obsq' = obsq \cup {[token |-> tok, ask |-> a, obs |-> "timeout", v |-> None]}
                           /\ UNCHANGED <<atSource, reached>>
                   /\ UNCHANGED reply
+                [] Respond(r, known[r]) = "reply" /\ Referral(r) /\ unglued ->
+                  /\ reply' = [reply EXCEPT ![r] = Reply("SERVFAIL", None, read, None)]
+                  /\ st' = [st EXCEPT ![r] = "done"]
+                  /\ partial' = released
+                  /\ UNCHANGED <<nAsks, atSource, obsq, reached>>
                 [] Respond(r, known[r]) = "reply" ->
-                  /\ reply' = [reply EXCEPT ![r] = Reply("NOERROR", known[r].val, read, known[r].v)]
+                  /\ reply' = [reply EXCEPT ![r] = Reply("NOERROR", o.val, IF Referral(r) THEN read ELSE {}, o.v)]
                   /\ st' = [st EXCEPT ![r] = "done"]
                   /\ partial' = released
                   /\ UNCHANGED <<nAsks, atSource, obsq, reached>>
@@ -285,8 +313,10 @@ ObserveOne(o) ==
     /\ obsq' = obsq \ {o}
     /\ IF Owner(o.token) # {}
        THEN LET r == CHOOSE x \in Owner(o.token) : TRUE IN
-            /\ known' = [known EXCEPT ![r] = [obs |-> o.obs, v |-> o.v,
-                                              val |-> IF o.obs = "reply" THEN RealReply(o.ask, o.v) ELSE None]]
+            /\ known' = [known EXCEPT ![r] =
+                           {x \in @ : x.ask # o.ask} \cup
+                           {[ask |-> o.ask, obs |-> o.obs, v |-> o.v,
+                             val |-> IF o.obs = "reply" THEN RealReply(o.ask, o.v) ELSE None]}]
             /\ st' = [st EXCEPT ![r] = "new"]
        ELSE UNCHANGED <<known, st>>
     /\ UNCHANGED <<world, ins, history, rev, real, realSeen, gen, partial, reply, nAsks, atSource, reached>>
@@ -312,7 +342,7 @@ Advance ==
     /\ gen < MaxGeneration
     /\ gen' = gen + 1
     /\ st' = [r \in Reqs |-> IF st[r] = "parked" THEN "new" ELSE st[r]]
-    /\ known' = [r \in Reqs |-> IF st[r] = "done" THEN known[r] ELSE None]
+    /\ known' = [r \in Reqs |-> IF st[r] = "done" THEN known[r] ELSE {}]
     /\ nAsks' = [r \in Reqs |-> IF st[r] = "done" THEN nAsks[r] ELSE 0]
     /\ UNCHANGED <<world, ins, history, rev, real, realSeen, partial, reply, atSource, obsq, reached>>
 
@@ -350,13 +380,15 @@ FairSpec == Spec /\ Fairness
 -----------------------------------------------------------------------------
 (* Properties *)
 
-Unedited(r) == r.q \notin Edited
+\* A question whose reply relays the real server's: one for an unedited name,
+\* or one below fict at a server that does not serve fict's parent.
+Relayed(r) == r.srv # "fict" /\ ~Referral(r)
 
-(* A relayed reply for an unedited name is the real server's reply to that *)
-(* question as it was when the source asked: never a guess.               *)
+(* A relayed reply is the real server's reply to that question as it was   *)
+(* when the source asked: never a guess.                                  *)
 NeverGuess ==
-    \A r \in Reqs : (Unedited(r) /\ reply[r] # None /\ reply[r].rcode # "SILENT") =>
-        reply[r].v \in realSeen /\ reply[r].val = RealReply(AskOf(r), reply[r].v)
+    \A r \in Reqs : (Relayed(r) /\ reply[r] # None /\ reply[r].rcode = "NOERROR") =>
+        reply[r].v \in realSeen /\ reply[r].val = RealReply(RelayAsk(r), reply[r].v)
 
 (* No ask the policy refuses reaches the source, root and TLD asks included. *)
 PolicyHolds ==
@@ -373,14 +405,16 @@ CoherentRevision ==
         \E s \in history : \A f \in reply[r].facts : FactAt(s, f[1]) = f[2]
 
 (* More observations never turn a reply into a Need (Lean: respond_monotone). *)
-(* Each request here needs one ask, so once it knows what that ask observed, *)
-(* whatever that was, it never needs another.                              *)
+(* Once a request knows what an ask observed, whatever that was, it never   *)
+(* needs that ask again.                                                   *)
 RespondMonotone ==
-    \A r \in Reqs : known[r] # None => Respond(r, known[r]) # "need"
+    \A r \in Reqs : Respond(r, known[r]) = "need" => Obs(known[r], AskOf(r)) = None
 
-(* A request sends at most one ask per Need, and one Need per generation. *)
+(* A request sends one ask per Need, and in each generation needs each ask *)
+(* once: the relayed question, or the DS ask and, at a server that does not *)
+(* serve fict's parent, the relayed question after it.                      *)
 OneAskPerNeed ==
-    \A r \in Reqs : nAsks[r] <= 1
+    \A r \in Reqs : nAsks[r] <= IF Crosses(r) /\ ~Serves(r.srv) THEN 2 ELSE 1
 
 (* A request parked on an ask holds no part of a view: the zone's lock is   *)
 (* taken only inside view, which never waits on an ask, and the overlay    *)

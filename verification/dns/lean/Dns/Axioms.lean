@@ -311,7 +311,8 @@ theorem view_answer : answerPartial view qNx .all = .response ⟨.nxdomain, true
   decide +kernel
 
 #print axioms answer_partial_sound
-example : ∀ z, Agrees view z → answer z qNx .all = .response ⟨.nxdomain, true, [], [negSoa zone.soa], [], 0⟩ :=
+example : ∀ z, Agrees view z → ∃ r, answer z qNx .all = .response r ∧
+    Response.Grows ⟨.nxdomain, true, [], [negSoa zone.soa], [], 0⟩ r :=
   answer_partial_sound view qNx .all _ view_answer
 
 #print axioms agreeing_zone_exists
@@ -365,11 +366,18 @@ example : ∃ s, loop relay req (fun _ => .reply reply) 2 [] = some s ∧ ∀ a,
 
 /-- An overlay that answers `fict.com.` itself on a relayed `com.`. -/
 def fict : Overlay :=
-  ⟨relay, zones fun _ => some [0], fun r => r.addr == 1, fun r => r.addr == 2, fun _ => true,
-    fun r => ⟨r.addr, r.stream, [1]⟩, fun _ ds => ds.getD [2]⟩
+  ⟨relay, zones fun _ => some [0], fun r => r.addr == 1, fun r => r.addr == 2,
+    fun r => ⟨r.addr, r.stream, [1]⟩, fun _ _ => true, fun _ ds => ds⟩
 
 example : ∃ s, loop (overlay fict) req (fun _ => .timeout) 3 [] = some s ∧ ∀ a, s ≠ .need a :=
   overlay_loop_terminates fict _ rfl rfl req _
+
+/-- The same overlay on a server of another zone, such as a root server: the DS reply does not come from the
+parent, so the overlay relays the question too, its second ask. -/
+def fictAtRoot : Overlay := { fict with serves := fun _ _ => false }
+
+example : ∃ s, loop (overlay fictAtRoot) req (fun _ => .reply reply) 3 [] = some s ∧ ∀ a, s ≠ .need a :=
+  overlay_loop_terminates fictAtRoot _ rfl rfl req _
 
 #print axioms relay_never_guesses
 example : ∃ obs, known.get (relayAsk req) = some (.reply obs) ∧ Wire.restore obs req.query = .ok restored ∧
@@ -695,7 +703,7 @@ def limits : Limits := ⟨604800, 30⟩
 def wwwKey : Cache.Key := ⟨[WWW, EX, COM], 16⟩
 
 /-- `www.example.com. TXT`, validated Secure with an RRSIG that expires at 400, cached at time 100. -/
-def cache1 : Cache := insert 100 limits ⟨0, []⟩ (.positive wwwTxt .authAnswer .secure (some 400) false)
+def cache1 : Cache := insert 100 limits ⟨0, []⟩ (.positive wwwTxt .authAnswer .secure (some 400) none false)
 
 theorem cache1_timed : WellTimed cache1 150 :=
   wellTimed_mono (insert_wellTimed (t := 0) (fun _ h => by cases h) (by decide)) (by decide)
@@ -712,7 +720,7 @@ example : ∃ e ∈ cache1.entries, e.key = wwwKey ∧ e.generation = cache1.gen
   expired_never_served (s := .positive { wwwTxt with ttl := 250 } .secure) (by decide +kernel)
 
 #print axioms rrsig_caps_ttl
-example : ∀ e, entryFor 100 limits 0 (.positive wwwTxt .authAnswer .secure (some 400) false) = some e →
+example : ∀ e, entryFor 100 limits 0 (.positive wwwTxt .authAnswer .secure (some 400) none false) = some e →
     e.expires ≤ 400 :=
   fun _ h => rrsig_caps_ttl h
 
@@ -727,7 +735,7 @@ example : ∀ kind soa v, serve 110 cache2 wwwKey ≠ some (.negative kind soa v
 
 #print axioms rank_monotone
 /-- The same TXT records offered as glue at time 120 change nothing. -/
-example : insert 120 limits cache1 (.positive wwwTxt .glue .notPerformed none false) = cache1 :=
+example : insert 120 limits cache1 (.positive wwwTxt .glue .notPerformed none none false) = cache1 :=
   rank_monotone cache1_unique (e := ⟨wwwKey, .positive wwwTxt .authAnswer .secure, 100, 400, 300, 0⟩)
     (by decide +kernel) rfl (by decide)
     (fun e h => by

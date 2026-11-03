@@ -17,6 +17,7 @@
 use std::cmp::Ordering;
 
 use super::rdata::{DNSSECRData, NSEC, NSEC3};
+use crate::stdlib::protocols::dns::label_count;
 use crate::stdlib::protocols::dns::rr::{Name, RData, RecordSet, RecordType};
 use hickory_proto::dnssec::Nsec3HashAlgorithm;
 
@@ -265,7 +266,7 @@ impl<'a> Nsecs<'a> {
     fn closest_encloser(name: &Name, owner: &Name, rdata: &NSEC) -> Name {
         let a = common_ancestor(name, owner);
         let b = common_ancestor(name, rdata.next_domain_name());
-        if a.iter().count() >= b.iter().count() {
+        if label_count(&a) >= label_count(&b) {
             a
         } else {
             b
@@ -406,8 +407,8 @@ impl<'a> Nsec3s<'a> {
         if let Some((hash, _)) = self.matching_entry(name) {
             return vec![hash.clone()];
         }
-        let labels = name.iter().count();
-        let apex = self.zone.iter().count();
+        let labels = label_count(name);
+        let apex = label_count(self.zone);
         for count in (apex..labels).rev() {
             let encloser = name.trim_to(count);
             if let Some((hash, _)) = self.matching_entry(&encloser) {
@@ -428,8 +429,8 @@ impl<'a> Nsec3s<'a> {
     /// next closer name has opt-out set. A matching NSEC3 at a cut means
     /// `name` lies in another zone, and proves nothing.
     fn closest_encloser(&self, name: &Name) -> Option<(Name, bool)> {
-        let labels = name.iter().count();
-        let apex = self.zone.iter().count();
+        let labels = label_count(name);
+        let apex = label_count(self.zone);
         for count in (apex..labels).rev() {
             let encloser = name.trim_to(count);
             if let Some(rdata) = self.matching(&encloser) {
@@ -545,11 +546,9 @@ fn common_ancestor(a: &Name, b: &Name) -> Name {
     a.trim_to(shared)
 }
 
-/// Whether `name` is strictly below `ancestor`. hickory's own label count
-/// leaves out a leading `*`, so `*.<ancestor>` would count as the
-/// ancestor itself; the labels are counted here.
+/// Whether `name` is strictly below `ancestor`, `*.<ancestor>` included.
 fn is_below(name: &Name, ancestor: &Name) -> bool {
-    ancestor.zone_of(name) && name.iter().count() > ancestor.iter().count()
+    ancestor.zone_of(name) && label_count(name) > label_count(ancestor)
 }
 
 /// A base32hex label (RFC 4648 §7) decoded, ignoring case, as NSEC3

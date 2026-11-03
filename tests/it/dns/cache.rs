@@ -6,10 +6,10 @@ use std::time::Duration;
 use fictionet::stdlib::protocols::dns::dnssec::{
     Algorithm, KeyFlags, Validation, Window, ZoneKey, sign,
 };
-use fictionet::stdlib::protocols::dns::rr::rdata::SOA;
+use fictionet::stdlib::protocols::dns::rr::rdata::{NS, SOA};
 use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, RData, RecordSet, RecordType};
 use fictionet::stdlib::services::dns::resolver::{
-    Cache, Checked, Entry, Key, Limits, Negative, Offer, Rank,
+    Cache, Checked, Entry, FailureKind, Key, Limits, Negative, Offer, Rank,
 };
 use fictionet::time::Instant;
 use fictionet::{Seed, SeededEntropy};
@@ -107,6 +107,82 @@ fn newer_nodata_at_a_name_ends_its_nxdomain() {
             .nxdomain_above(&LowerName::new(&name("www.example.")), DNSClass::IN, now)
             .is_none()
     );
+}
+
+/// Data at a name ends its NXDOMAIN under every type, not only under ANY:
+/// the copy under the type the NXDOMAIN answered goes too.
+#[test]
+fn data_below_a_name_ends_its_nxdomain_under_the_type_it_answered() {
+    let mut cache = cache();
+    cache.insert(at(100), nxdomain("foo.example."));
+    cache.insert(
+        at(101),
+        positive(rrset("bar.foo.example.", 300, vec![a("192.0.2.14")])),
+    );
+    let now = at(102);
+    assert!(
+        cache
+            .get(&key("foo.example.", RecordType::ANY), now)
+            .is_none()
+    );
+    assert!(
+        cache
+            .get(&key("foo.example.", RecordType::A), now)
+            .is_none()
+    );
+}
+
+/// A failure is cached over a referral's NS RRset, which answers no
+/// client, and keeps it beneath for finding the zone's servers
+/// (RFC 9520 §3.2). Data that answers clients keeps a failure out.
+#[test]
+fn a_failure_is_laid_over_data_that_answers_no_client() {
+    let mut cache = cache();
+    let ns_key = key("example.", RecordType::NS);
+    let ns = rrset("example.", 3600, vec![RData::NS(NS(name("ns.example.")))]);
+    cache.insert(
+        at(100),
+        Offer::Positive {
+            set: ns.clone(),
+            rank: Rank::NonAuthAuthority,
+            validation: Validation::NotPerformed,
+            proof: Vec::new(),
+            truncated: false,
+        },
+    );
+    let failure = |key: &Key| Offer::Failure {
+        key: key.clone(),
+        why: FailureKind::NoReachableAuthority,
+    };
+    cache.insert(at(100), failure(&ns_key));
+    assert!(matches!(
+        cache.get(&ns_key, at(101)),
+        Some(Entry::Failure { .. })
+    ));
+    assert!(matches!(
+        cache.data(&ns_key, at(101)),
+        Some(Entry::Positive {
+            rank: Rank::NonAuthAuthority,
+            ..
+        })
+    ));
+    // Once the failure expires, the NS RRset still finds the servers for
+    // the rest of its TTL.
+    assert!(matches!(
+        cache.data(&ns_key, at(200)),
+        Some(Entry::Positive { .. })
+    ));
+
+    let www = key("www.example.", RecordType::A);
+    cache.insert(
+        at(100),
+        positive(rrset("www.example.", 300, vec![a("192.0.2.1")])),
+    );
+    cache.insert(at(100), failure(&www));
+    assert!(matches!(
+        cache.get(&www, at(101)),
+        Some(Entry::Positive { .. })
+    ));
 }
 
 #[test]

@@ -20,7 +20,7 @@ use std::time::Duration;
 use fictionet::Cx;
 use fictionet::stdlib::protocols::dns::op::Message;
 use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RData, Record};
-use fictionet::stdlib::protocols::dns::{Parsed, Request, Response};
+use fictionet::stdlib::protocols::dns::{Parsed, Request, Response, label_count};
 use fictionet::stdlib::services::dns::Client;
 use fictionet::stdlib::services::dns::authority::{Ask, Observed};
 use fictionet::stdlib::world::net::dns::internet::{Egress, Location};
@@ -107,16 +107,10 @@ fn question(ask: &Ask) -> Option<LowerName> {
     }
 }
 
-/// How many labels `name` has, a `*` label among them, which
-/// [`Name::num_labels`] leaves out.
-fn labels(name: &Name) -> usize {
-    name.iter().count()
-}
-
 /// `name` and every name above it, up to the root.
 fn and_above(name: &LowerName) -> impl Iterator<Item = LowerName> {
     let name = Name::from(name.clone());
-    (0..=labels(&name))
+    (0..=label_count(&name))
         .rev()
         .map(move |labels| LowerName::new(&name.trim_to(labels)))
 }
@@ -161,12 +155,11 @@ fn targets(message: &Message) -> impl Iterator<Item = (LowerName, Option<LowerNa
 ///    world serves in every session (the model gateway's and the time
 ///    server's). Live-Depth uses Live's boundary here: DNS stays real,
 ///    and the site's machine refuses names outside the depth;
-/// 2. it is above a name rule 1 lets out: the root and every single label,
-///    which the root servers answer, and in the live modes any name whose
-///    labels are letters, digits, and hyphens, whatever its top-level
-///    domain, or in Copied the names above captured hosts.
-///    Priming, referrals, minimised questions, and the DS and DNSKEY sets
-///    of a chain of trust need these;
+/// 2. it is the root or a single label, which the root servers answer; in
+///    the live modes, any name at all, whatever its labels or top-level
+///    domain; in Copied, a name above a captured host. Priming,
+///    referrals, minimised questions, and the DS and DNSKEY sets of a
+///    chain of trust need these;
 /// 3. it has an underscore label (RFC 8552), and any labels below that
 ///    one, above a name rule 1 lets out: `_dmarc`, `_25._tcp`, a DKIM
 ///    selector's `google._domainkey`, or a BIMI `default._bimi`;
@@ -177,11 +170,13 @@ fn targets(message: &Message) -> impl Iterator<Item = (LowerName, Option<LowerNa
 ///    question this session: an NS target, or a CNAME target, in a relayed
 ///    reply.
 ///
-/// In Live and Edited every name `admit` takes passes rule 1, so the
-/// names rules 2 to 4 add are no channel the live web lacks: they reach
-/// only the root, top-level domain, and reverse zone operators, or the
-/// operator of a name the guest could already ask about. Names under
-/// rule 5 were chosen by those operators, not by the guest.
+/// In the live modes every name `admit` takes passes rule 1, so any host
+/// name under any domain already leaves, and a name with other labels
+/// reaches the same operators: the names rules 2 to 4 add are no channel
+/// the live web lacks. In Copied they reach only the root, top-level
+/// domain, and reverse zone operators, or the operator of a name the
+/// guest could already ask about. Names under rule 5 were chosen by those
+/// operators, not by the guest.
 ///
 /// [`observer`](Self::observer) feeds rule 5 from the relays' replies. The
 /// names it learned are forgotten when the session changes.
@@ -277,9 +272,10 @@ impl Outbound {
             || self.named(|named| named.below.contains(name))
     }
 
-    /// Rule 2: whether `name` is above a name rule 1 lets out.
+    /// Rule 2: whether `name` is the root or a single label, any name in
+    /// the live modes, or above a captured host in Copied.
     fn above_admitted(&self, name: &LowerName) -> bool {
-        if labels(name) <= 1 {
+        if label_count(name) <= 1 {
             return true;
         }
         let inner = &self.inner;
@@ -288,13 +284,13 @@ impl Outbound {
                 inner.pages.serves_below(&host(name))
                     || inner.always.iter().any(|always| name.zone_of(always))
             }
-            // Any name of host name labels, under any top-level domain:
-            // the root servers answer for reserved ones too, NXDOMAIN
-            // for `internal` or `example` included.
-            Mode::Live | Mode::LiveDepth | Mode::Edited => {
-                let text = host(name);
-                text.len() <= 253 && text.split('.').all(host_label)
-            }
+            // Any name, under any top-level domain, so the real servers
+            // answer it as they would the guest: the root servers answer
+            // for reserved domains too, NXDOMAIN for `internal` or
+            // `example` included, and a label that is no host name label,
+            // such as `x_y` or `*`, gets the zone's own NXDOMAIN or
+            // wildcard answer.
+            Mode::Live | Mode::LiveDepth | Mode::Edited => true,
         }
     }
 
