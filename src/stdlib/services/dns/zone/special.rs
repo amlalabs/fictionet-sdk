@@ -12,18 +12,20 @@
 //! resolver software passes that software's. [`defaults`] gives every
 //! zone here, and a resolver's configuration holds the ones it serves.
 
+use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
+use fictionet::stdlib::protocols::dns::op::Query;
 use fictionet::stdlib::protocols::dns::rr::rdata::svcb::{
     Alpn, IpHint, SvcParamKey, SvcParamValue, Unknown,
 };
 use fictionet::stdlib::protocols::dns::rr::rdata::{A, AAAA, SVCB};
-use fictionet::stdlib::protocols::dns::rr::{Name, RData, Record, RecordSet};
+use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RData, Record, RecordSet};
 
 use super::apex::EmptyApex;
-use super::data::{Redirect, ZoneData};
-use super::zone::{Zone, ZoneBuilder};
+use super::data::{Denied, Fact, Revision, View, ZoneData};
+use super::zone::{Node, Zone, ZoneBuilder};
 
 /// Every zone here, each with `apex`: `localhost`, the zones of
 /// [`rfc6303`], `home.arpa`, an empty `resolver.arpa`, `service.arpa`,
@@ -42,21 +44,21 @@ pub fn defaults(apex: &EmptyApex) -> Vec<Arc<dyn ZoneData>> {
     zones
 }
 
-/// `localhost`, whose names all point at the loopback addresses
-/// (RFC 6761 §6.3): A 127.0.0.1 and AAAA ::1 at the apex, and every name
-/// below the apex answering with the apex's RRsets, its SOA and NS among
-/// them.
-pub fn localhost(apex: &EmptyApex) -> Redirect<Zone> {
+/// `localhost`, whose names are all the loopback host (RFC 6761 §6.3):
+/// the apex and every name below it answer A with 127.0.0.1 and AAAA
+/// with ::1, and every other type, SOA and NS among them, with NODATA,
+/// the immediate negative answer RFC 6761 §6.3 asks of resolvers.
+pub fn localhost(apex: &EmptyApex) -> SpecialUse {
     let name = name("localhost.");
-    let zone = apex
-        .zone(&name)
-        .rrset(rrset(&name, RData::A(A(Ipv4Addr::LOCALHOST)), apex.ttl))
-        .rrset(rrset(
-            &name,
-            RData::AAAA(AAAA(Ipv6Addr::LOCALHOST)),
-            apex.ttl,
-        ));
-    Redirect(built(zone))
+    let sets = [
+        RData::A(A(Ipv4Addr::LOCALHOST)),
+        RData::AAAA(AAAA(Ipv6Addr::LOCALHOST)),
+    ]
+    .map(|rdata| {
+        let set = rrset(&name, rdata, apex.ttl);
+        (set.record_type(), set)
+    });
+    SpecialUse::new(&name, apex, Some(Node::Data(BTreeMap::from(sets))))
 }
 
 /// The empty zones of RFC 6303 §4, for the reverse names of private and
@@ -181,10 +183,72 @@ pub fn test(apex: &EmptyApex) -> Zone {
     built(apex.zone(&name("test.")))
 }
 
-/// `invalid`, which never exists: every name below the apex is NXDOMAIN
-/// (RFC 6761 §6.4).
-pub fn invalid(apex: &EmptyApex) -> Zone {
-    built(apex.zone(&name("invalid.")))
+/// `invalid`, which never exists: the apex and every name below it are
+/// NXDOMAIN (RFC 6761 §6.4).
+pub fn invalid(apex: &EmptyApex) -> SpecialUse {
+    SpecialUse::new(&name("invalid."), apex, None)
+}
+
+/// A special-use zone a resolver answers by itself, every name in it
+/// alike (RFC 6761 §6.3 and §6.4): every name at or below the apex is one
+/// node, or none, when every name is NXDOMAIN. The SOA RRset its
+/// [`EmptyApex`] gives is no node's data. It goes only in the authority
+/// section of negative answers (RFC 2308 §3), so a question for the SOA
+/// or NS RRset of such a name gets a negative answer too.
+pub struct SpecialUse(Arc<Alike>);
+
+impl SpecialUse {
+    fn new(apex: &Name, empty: &EmptyApex, node: Option<Node>) -> SpecialUse {
+        let (soa, _) = empty.records(apex);
+        SpecialUse(Arc::new(Alike {
+            apex: LowerName::new(apex),
+            soa,
+            node,
+        }))
+    }
+}
+
+impl ZoneData for SpecialUse {
+    fn apex(&self) -> &LowerName {
+        &self.0.apex
+    }
+
+    fn view(&self, _question: &Query) -> Arc<dyn View + Send + Sync> {
+        self.0.clone()
+    }
+}
+
+/// The data of a [`SpecialUse`] zone, which never changes.
+struct Alike {
+    apex: LowerName,
+    soa: RecordSet,
+    node: Option<Node>,
+}
+
+impl View for Alike {
+    fn apex(&self) -> &LowerName {
+        &self.apex
+    }
+
+    fn revision(&self) -> Revision {
+        Revision(0)
+    }
+
+    fn soa(&self) -> &RecordSet {
+        &self.soa
+    }
+
+    fn node(&self, name: &LowerName) -> Fact<&Node> {
+        match &self.node {
+            Some(node) if self.apex.zone_of(name) => Fact::Present(node),
+            _ => Fact::Absent,
+        }
+    }
+
+    /// The zone is unsigned.
+    fn denial(&self, _name: &LowerName, _kind: Denied) -> Fact<Vec<RecordSet>> {
+        Fact::Present(Vec::new())
+    }
 }
 
 /// `service.arpa`, for names of services inside a home network, as an

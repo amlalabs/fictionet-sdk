@@ -569,6 +569,14 @@ example : validateDenial (some [optOutZone.anchor 2]) Policy.iana 150 [optOutZon
   rw [h3, List.mem_singleton] at hr
   rw [hr]; rfl
 
+#print axioms optout_wildcard_insecure
+/-- In the opt-out zone, `x.example.com. TXT` is expanded from `*.example.com.`, and only an opt-out NSEC3
+backs the expansion, so the answer is Insecure. -/
+example : (optOutZone.answerDo ⟨[LX, EX, COM], 16⟩ .all).2.map (fun sa =>
+    (validateAnswer (some [optOutZone.anchor 2]) Policy.iana 150 [optOutZone.link] ⟨[LX, EX, COM], 16⟩ sa).1) =
+    some [.insecure .optOutCovered] := by
+  decide +kernel
+
 #print axioms nsec_cover_sound
 /-- An NSEC of the complete chain covers `x.b.example.com.`, so nothing is at or below it. -/
 example : zone.presentB [LX, LB, EX, COM] = false := by

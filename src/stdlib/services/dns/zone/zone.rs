@@ -894,9 +894,16 @@ impl Inner {
                 let wildcard = wildcard(&self.closest_encloser(name));
                 vec![covering(name), covering(&wildcard)]
             }
-            // The NSEC at the name, or for an empty non-terminal or a name a
-            // wildcard answered, the one that covers it.
-            Denied::Type(_) | Denied::Wildcard { .. } => vec![covering(name)],
+            // The NSEC at the name. A name a wildcard answers for takes the
+            // one that covers it and the wildcard's own (RFC 4035
+            // §3.1.3.4).
+            Denied::Type(_) if !self.nodes.contains_key(name) => {
+                let wildcard = wildcard(&self.closest_encloser(name));
+                vec![covering(name), self.nsec.get(&wildcard).cloned()]
+            }
+            Denied::Type(_) => vec![covering(name)],
+            // The NSEC that covers a name a wildcard answered.
+            Denied::Wildcard { .. } => vec![covering(name)],
         };
         unique(proof.into_iter().flatten())
     }
@@ -925,18 +932,26 @@ impl Inner {
                 ]
             }
             Denied::Type(_) => match matching(name) {
-                // A wildcard's NODATA also needs its closest encloser
-                // matched (RFC 5155 §7.2.5).
-                Some(set) if name.is_wildcard() => vec![Some(set), matching(&name.base_name())],
+                // The NSEC3 that matches the name, a wildcard's own name
+                // included (RFC 5155 §7.2.3).
                 Some(set) => vec![Some(set)],
                 None => {
-                    // No NSEC3 at the name: an opt-out cut, proven by its
-                    // closest provable encloser (RFC 5155 §7.2.4).
+                    // No NSEC3 at the name: an opt-out cut, or a name a
+                    // wildcard answers for, proven by its closest provable
+                    // encloser (RFC 5155 §7.2.4), with the wildcard's own
+                    // NSEC3 for the latter (§7.2.5).
                     let mut encloser = name.base_name();
                     while encloser != self.apex && matching(&encloser).is_none() {
                         encloser = encloser.base_name();
                     }
-                    vec![matching(&encloser), covering(&next_closer(name, &encloser))]
+                    let wildcard = (!self.nodes.contains_key(name))
+                        .then(|| matching(&wildcard(&encloser)))
+                        .flatten();
+                    vec![
+                        matching(&encloser),
+                        covering(&next_closer(name, &encloser)),
+                        wildcard,
+                    ]
                 }
             },
             Denied::Wildcard { closest_encloser } => {

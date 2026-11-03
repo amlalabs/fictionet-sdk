@@ -39,10 +39,17 @@ pub(super) struct Servers {
 
 #[derive(Clone, Copy, Debug)]
 struct Host {
-    srtt: Duration,
-    rttvar: Duration,
+    /// The smoothed round trip and its variation, once a reply came.
+    rtt: Option<Rtt>,
     rto: Duration,
     expires: Instant,
+}
+
+/// A server's smoothed round trip and its variation (RFC 6298 §2).
+#[derive(Clone, Copy, Debug)]
+struct Rtt {
+    srtt: Duration,
+    rttvar: Duration,
 }
 
 impl Servers {
@@ -84,32 +91,41 @@ impl Servers {
             .collect()
     }
 
-    /// Notes a reply from `address` that took `rtt` (RFC 6298 §2.2, §2.3).
+    /// Notes a reply from `address` that took `rtt`. The first reply
+    /// sets the smoothed round trip to `rtt` and its variation to half of
+    /// it (RFC 6298 §2.2); each later one updates both (RFC 6298 §2.3).
     pub(super) fn replied(&mut self, address: IpAddr, rtt: Duration, now: Instant) {
-        let mut host = self.live(address, now).copied().unwrap_or(Host {
-            srtt: Duration::ZERO,
-            rttvar: self.unknown / 4,
-            rto: self.unknown,
-            expires: now,
-        });
-        let delta = rtt.abs_diff(host.srtt);
-        host.rttvar = (host.rttvar * 3 + delta) / 4;
-        host.srtt = (host.srtt * 7 + rtt) / 8;
-        host.rto = (host.srtt + host.rttvar * 4).clamp(MIN_TIMEOUT, MAX_TIMEOUT);
+        let mut host = self.host(address, now);
+        let next = match host.rtt {
+            None => Rtt {
+                srtt: rtt,
+                rttvar: rtt / 2,
+            },
+            Some(Rtt { srtt, rttvar }) => Rtt {
+                rttvar: (rttvar * 3 + rtt.abs_diff(srtt)) / 4,
+                srtt: (srtt * 7 + rtt) / 8,
+            },
+        };
+        host.rto = (next.srtt + next.rttvar * 4).clamp(MIN_TIMEOUT, MAX_TIMEOUT);
+        host.rtt = Some(next);
         self.store(address, host, now);
     }
 
     /// Notes that `address` did not reply in time: its wait doubles
     /// (RFC 6298 §5.5).
     pub(super) fn lost(&mut self, address: IpAddr, now: Instant) {
-        let mut host = self.live(address, now).copied().unwrap_or(Host {
-            srtt: Duration::ZERO,
-            rttvar: self.unknown / 4,
-            rto: self.unknown,
-            expires: now,
-        });
+        let mut host = self.host(address, now);
         host.rto = (host.rto * 2).min(MAX_TIMEOUT);
         self.store(address, host, now);
+    }
+
+    /// What is known of `address` now, or a server never heard from.
+    fn host(&self, address: IpAddr, now: Instant) -> Host {
+        self.live(address, now).copied().unwrap_or(Host {
+            rtt: None,
+            rto: self.unknown,
+            expires: now,
+        })
     }
 
     fn live(&self, address: IpAddr, now: Instant) -> Option<&Host> {

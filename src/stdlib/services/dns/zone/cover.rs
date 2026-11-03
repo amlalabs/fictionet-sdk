@@ -98,38 +98,56 @@ pub fn cover(
                 }
             }
         }
-        Denied::Type(rtype) => {
-            let node = match place(view, name) {
-                Fact::Present(Place::Node(node)) => node,
-                Fact::Present(Place::Absent { .. }) | Fact::Absent => return Fact::Absent,
-                Fact::Unknown => return Fact::Unknown,
-            };
-            if !lacks(node, rtype) {
-                return Fact::Absent;
-            }
-            match denial {
-                Denial::Nsec => vec![spans.matching(name, node)],
-                Denial::Nsec3 { opt_out, salt } => {
-                    let lies = WhiteLies::new(&apex, ttl, *opt_out, salt);
-                    let mut sets = vec![lies.matching(name, node)];
-                    // A wildcard's NODATA also needs its closest encloser
-                    // matched (RFC 5155 §7.2.5).
-                    if name.is_wildcard() {
-                        let encloser = name.base_name();
-                        match place(view, &encloser) {
-                            Fact::Present(Place::Node(node)) => {
-                                sets.push(lies.matching(&encloser, node));
-                            }
-                            Fact::Present(Place::Absent { .. }) | Fact::Absent => {
-                                return Fact::Absent;
-                            }
-                            Fact::Unknown => return Fact::Unknown,
-                        }
+        Denied::Type(rtype) => match place(view, name) {
+            Fact::Present(Place::Node(node)) => {
+                if !lacks(node, rtype) {
+                    return Fact::Absent;
+                }
+                // The record that matches the name, a wildcard's own name
+                // included (RFC 4035 §3.1.3.1, RFC 5155 §7.2.3).
+                match denial {
+                    Denial::Nsec => vec![spans.matching(name, node)],
+                    Denial::Nsec3 { opt_out, salt } => {
+                        vec![WhiteLies::new(&apex, ttl, *opt_out, salt).matching(name, node)]
                     }
-                    sets
                 }
             }
-        }
+            // A name the wildcard at its closest encloser answers for, when
+            // the wildcard has no RRset of the type: the records that
+            // deny the name, and the one that matches the wildcard
+            // (RFC 4035 §3.1.3.4, RFC 5155 §7.2.5).
+            Fact::Present(Place::Absent {
+                encloser,
+                encloser_node,
+                next_closer,
+            }) => {
+                let wild = wildcard(&encloser);
+                let wild_node = match view.node(&wild) {
+                    Fact::Present(node) => node,
+                    Fact::Absent => return Fact::Absent,
+                    Fact::Unknown => return Fact::Unknown,
+                };
+                if !lacks(wild_node, rtype) {
+                    return Fact::Absent;
+                }
+                match denial {
+                    Denial::Nsec => vec![
+                        spans.covering(&next_closer, &encloser, encloser_node),
+                        spans.matching(&wild, wild_node),
+                    ],
+                    Denial::Nsec3 { opt_out, salt } => {
+                        let lies = WhiteLies::new(&apex, ttl, *opt_out, salt);
+                        vec![
+                            lies.matching(&encloser, encloser_node),
+                            lies.covering(&next_closer),
+                            lies.matching(&wild, wild_node),
+                        ]
+                    }
+                }
+            }
+            Fact::Absent => return Fact::Absent,
+            Fact::Unknown => return Fact::Unknown,
+        },
         Denied::Wildcard { closest_encloser } => {
             let (encloser, encloser_node, next_closer) = match place(view, name) {
                 Fact::Present(Place::Absent {

@@ -45,14 +45,25 @@ use super::{Authority, ServerConfig, Step, refuse_transfer, respond_from};
 /// address is asked for the SOA RRset at the name, whose response shows
 /// the child's apex (RFC 2308 §3), before the question is answered.
 ///
+/// Servers of one zone differ only in the other zones they serve, so each
+/// address answers from its copies as its own real server does
+/// ([`Learned::at`]). An authoritative answer that shows no zone, at a
+/// name below no cut the copy holds, may come from a child that only its
+/// server serves, so its answer RRsets stand for that address alone, and
+/// every other address looks the name up itself. A referral shows only
+/// that its own server holds no zone below the cut, so the cut refers
+/// the name at that address alone.
+///
 /// An address noted for a zone may not serve it, as the servers of a lame
 /// delegation do not. A real server that does not serve a zone refuses
 /// questions in it (RFC 8906 §3.1.1), or answers them without authority:
 /// from a zone above it, with a referral to that zone's cut or above
-/// (RFC 1034 §4.3.1). When a lookup's response shows that, the address
-/// answers for the rest of the session as though it had never been noted
-/// for the zone: from the other zones it serves, or REFUSED when none
-/// holds the name.
+/// (RFC 1034 §4.3.1). A server that serves only a zone below answers DS
+/// at that zone's apex from it, where a server of a zone above answers
+/// from the zone above (RFC 4035 §3.1.4.1). When a lookup's response
+/// shows any of that, the address answers for the rest of the session as
+/// though it had never been noted for the zone: from the other zones it
+/// serves, or REFUSED when none holds the name.
 #[derive(Default)]
 pub struct Copies {
     /// Each zone's copy, by apex.
@@ -143,7 +154,12 @@ impl Copies {
         {
             let mut seen = self.seen.lock();
             if seen.at(generation) {
-                if disowns(&lookup.zone, response) {
+                // A server of a zone above a child answers DS at the
+                // child's apex from the zone above (RFC 4035 §3.1.4.1), so
+                // one that answers it from the child serves no zone above.
+                let child_ds = lookup.question.query_type() == RecordType::DS
+                    && child.as_ref() == Some(&qname);
+                if disowns(&lookup.zone, response) || child_ds {
                     seen.lame.insert((addr, lookup.zone.clone()));
                 }
                 match &child {
@@ -164,7 +180,7 @@ impl Copies {
             self.serves(addr, &child);
             learned = self.copy(&child);
         }
-        Some(learned.file(generation, &lookup.question, response))
+        Some(learned.file(generation, addr, &lookup.question, response))
     }
 
     /// The copies of the zones `addr` serves.
@@ -174,7 +190,7 @@ impl Copies {
         apexes
             .iter()
             .filter(|apex| !seen.lame.contains(&(addr, (*apex).clone())))
-            .map(|apex| self.copy(apex) as Arc<dyn ZoneData>)
+            .map(|apex| self.copy(apex).at(addr))
             .collect()
     }
 }

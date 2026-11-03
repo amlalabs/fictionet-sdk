@@ -777,12 +777,12 @@ fn p_chaos() {
             (
                 Ipv4Addr::new(1, 1, 1, 1),
                 chaos::id_server(),
-                at.resolver(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))).identity,
+                at.resolver(Ipv4Addr::new(1, 1, 1, 1)).identity,
             ),
             (
                 Ipv4Addr::new(9, 9, 9, 9),
                 chaos::version_bind(),
-                at.resolver(IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9))).identity,
+                at.resolver(Ipv4Addr::new(9, 9, 9, 9)).identity,
             ),
             (
                 k_root,

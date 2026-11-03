@@ -1,7 +1,4 @@
-//! Trust anchors: the DS records a validator trusts without proof, and the
-//! files a guest's own resolvers read them from.
-
-use std::fmt::Write;
+//! Trust anchors: the DS records a validator trusts without proof.
 
 use super::DigestType;
 use super::keys::ds;
@@ -16,70 +13,6 @@ pub struct TrustAnchor {
     pub owner: Name,
     /// DS records for the zone's key-signing keys.
     pub ds: Vec<DS>,
-}
-
-impl TrustAnchor {
-    /// The anchor as a systemd-resolved positive trust anchor file, such
-    /// as `/etc/dnssec-trust-anchors.d/root.positive`: one DS record per
-    /// line in zone file syntax (dnssec-trust-anchors.d(5)).
-    pub fn resolved_positive(&self) -> String {
-        self.ds_lines()
-    }
-
-    /// The anchor as Unbound reads it from a trust anchor file, such as
-    /// `/usr/share/dns/root.key` or `/var/lib/unbound/root.key`: DS records
-    /// in zone file syntax, which Unbound's `auto-trust-anchor-file` takes
-    /// as well as DNSKEY records.
-    pub fn root_key(&self) -> String {
-        self.ds_lines()
-    }
-
-    /// The anchor as a BIND `bind.keys` file, such as
-    /// `/etc/bind/bind.keys`, which `delv` reads: a `trust-anchors`
-    /// statement with one `initial-ds` entry per DS record, as BIND ships
-    /// the root's.
-    pub fn bind_keys(&self) -> String {
-        let mut text = String::from("trust-anchors {\n");
-        for ds in &self.ds {
-            let _ = writeln!(
-                text,
-                "\t{} initial-ds {} {} {} \"{}\";",
-                self.owner_text(),
-                ds.key_tag(),
-                u8::from(ds.algorithm()),
-                u8::from(ds.digest_type()),
-                hex_upper(ds.digest()),
-            );
-        }
-        text.push_str("};\n");
-        text
-    }
-
-    fn ds_lines(&self) -> String {
-        let mut text = String::new();
-        for ds in &self.ds {
-            let _ = writeln!(
-                text,
-                "{} IN DS {} {} {} {}",
-                self.owner_text(),
-                ds.key_tag(),
-                u8::from(ds.algorithm()),
-                u8::from(ds.digest_type()),
-                hex_upper(ds.digest()),
-            );
-        }
-        text
-    }
-
-    fn owner_text(&self) -> String {
-        let mut owner = self.owner.clone();
-        owner.set_fqdn(true);
-        owner.to_string()
-    }
-}
-
-fn hex_upper(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02X}")).collect()
 }
 
 /// The trust anchors a validator starts from.
@@ -131,26 +64,6 @@ impl Anchors {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn iana_root_renders_the_real_root_anchor_files() {
-        let anchors = Anchors::iana_root();
-        let root = anchors.iter().next().unwrap();
-        let positive = root.resolved_positive();
-        assert!(positive.contains(
-            ". IN DS 20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D\n"
-        ));
-        assert!(positive.contains(
-            ". IN DS 38696 8 2 683D2D0ACB8C9B712A1948B27F741219298D0A450D612C483AF444A4C0FB2B16\n"
-        ));
-        assert_eq!(root.root_key(), positive);
-        let bind = root.bind_keys();
-        assert!(bind.starts_with("trust-anchors {\n"));
-        assert!(bind.contains(
-            "\t. initial-ds 20326 8 2 \"E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D\";\n"
-        ));
-        assert!(bind.ends_with("};\n"));
-    }
 
     #[test]
     fn closest_picks_the_deepest_anchor_holding_the_name() {

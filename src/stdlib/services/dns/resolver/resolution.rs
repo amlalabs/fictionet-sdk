@@ -530,6 +530,23 @@ impl Graph {
         }
     }
 
+    /// Whether `tree` has sent fewer than `limit` queries.
+    fn within(&self, tree: TreeId, limit: u16) -> bool {
+        self.trees
+            .get(&tree)
+            .is_some_and(|entry| entry.sent < limit)
+    }
+
+    /// The tree `node` belongs to. A refresh belongs to none.
+    fn tree_of(&self, node: Node) -> Option<TreeId> {
+        match node {
+            Node::Asker(asker) => Some(TreeId::of(asker)),
+            Node::Lookup(id) => self.lookups.get(&id).map(|lookup| lookup.tree),
+            Node::Check(id) => self.checks.get(&id).map(|check| check.tree),
+            Node::Refresh => None,
+        }
+    }
+
     /// Counts one query against `tree`. Whether the tree may send it.
     fn charge(&mut self, tree: TreeId, limit: u16) -> bool {
         match self.trees.get_mut(&tree) {
@@ -714,7 +731,10 @@ impl<V: Verify> Resolver<V> {
         };
         let checks = subjects(&outcome)
             .into_iter()
-            .map(|subject| (subject, *validation))
+            .map(|subject| {
+                let validation = self.recheck(&subject, &outcome, *validation);
+                (subject, validation)
+            })
             .collect();
         Found {
             outcome,
@@ -756,7 +776,7 @@ impl<V: Verify> Resolver<V> {
             .into_iter()
             .map(|subject| {
                 let validation = if own {
-                    *validation
+                    self.recheck(&subject, &outcome, *validation)
                 } else {
                     Validation::NotPerformed
                 };
@@ -769,6 +789,30 @@ impl<V: Verify> Resolver<V> {
             cached: true,
             rest: Vec::new(),
         })
+    }
+
+    /// `stored`, the result the cache holds for `subject` of `outcome`, or
+    /// `NotPerformed`, so that the subject is checked again, when the
+    /// result rests on a negative trust anchor that no longer covers it.
+    /// An entry cached under a negative trust anchor then counts as
+    /// removed with the anchor (RFC 7646 §4). A result is Insecure for
+    /// want of an anchor only below a negative trust anchor or where no
+    /// trust anchor covers the zone.
+    fn recheck(&self, subject: &Subject, outcome: &Outcome, stored: Validation) -> Validation {
+        if stored != Validation::Insecure(Insecure::NoAnchor) || self.negative_anchor(subject) {
+            return stored;
+        }
+        let anchored = material(subject, outcome).is_some_and(|(_, zone)| {
+            self.config
+                .anchors
+                .as_ref()
+                .is_some_and(|anchors| anchors.closest(&zone, false).is_some())
+        });
+        if anchored {
+            Validation::NotPerformed
+        } else {
+            stored
+        }
     }
 
     /// The negative answer validated NSEC records prove for `key`, when
@@ -1263,6 +1307,45 @@ impl<V: Verify> Resolver<V> {
         }
     }
 
+    /// Hands lookup `id`, whose tree `spent` has used up the work bound,
+    /// to the tree of another node waiting on it that has not, and returns
+    /// that tree. The bound is per client question (RFC 1034 §5.3.3), so a
+    /// question that joined a lookup another one started pays for the
+    /// rest of it from its own bound. The nodes of `spent` stop waiting,
+    /// with the failure the bound makes. `None` when no other waiting tree
+    /// has queries left.
+    fn take_over(&mut self, id: LookupId, spent: TreeId) -> Option<TreeId> {
+        let limit = self.config.work.queries;
+        let lookup = self.graph.lookups.get(&id)?;
+        let next = lookup
+            .dependents
+            .iter()
+            .filter_map(|node| self.graph.tree_of(*node))
+            .find(|tree| *tree != spent && self.graph.within(*tree, limit))?;
+        let (gone, kept): (Vec<Node>, Vec<Node>) = lookup
+            .dependents
+            .iter()
+            .partition(|node| self.graph.tree_of(**node) == Some(spent));
+        let key = lookup.key.clone();
+        let failure = Found::fresh(Outcome::Failure(self.bound_failure(spent)));
+        self.graph.hold(next);
+        self.graph.release(spent);
+        if let Some(lookup) = self.graph.lookups.get_mut(&id) {
+            lookup.tree = next;
+            lookup.dependents = kept;
+        }
+        for to in gone {
+            self.graph.ready.push_back(Ready::Looked {
+                to,
+                lookup: id,
+                key: key.clone(),
+                found: Box::new(failure.clone()),
+                bounded: true,
+            });
+        }
+        Some(next)
+    }
+
     /// Notes that the work bound stopped lookup `id` or something it
     /// needed.
     fn bound(&mut self, id: LookupId) {
@@ -1392,13 +1475,18 @@ impl<V: Verify> Resolver<V> {
         let Some(lookup) = self.graph.lookups.get(&id) else {
             return;
         };
-        let (tree, relay_cd) = (lookup.tree, lookup.relay_cd);
-        if !self.graph.charge(tree, self.config.work.queries) {
-            // Past the bound, the question fails. The bound is one tree's,
-            // so the failure is not cached.
-            let why = self.bound_failure(tree);
-            self.bound(id);
-            return self.finish(id, Found::fresh(Outcome::Failure(why)));
+        let (mut tree, relay_cd) = (lookup.tree, lookup.relay_cd);
+        while !self.graph.charge(tree, self.config.work.queries) {
+            match self.take_over(id, tree) {
+                Some(next) => tree = next,
+                None => {
+                    // Past the bound, the question fails. The bound is one
+                    // tree's, so the failure is not cached.
+                    let why = self.bound_failure(tree);
+                    self.bound(id);
+                    return self.finish(id, Found::fresh(Outcome::Failure(why)));
+                }
+            }
         }
         let mut name = question.name().clone();
         if self.config.case_randomise {

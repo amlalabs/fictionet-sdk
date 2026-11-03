@@ -308,7 +308,7 @@ Exchanges:
 Authority:
 
 * A server of a learned zone answers from its copy and looks up what the
-  copy does not settle, as `Zones` does: a lookup of the client's question
+  copy does not settle, as `Copies` does: a lookup of the client's question
   at its own address. A response is filed into the copy the lookup names
   and settles its question. The root's response to a question below the
   TLD is a referral, a cut that refers the name it was for and the names
@@ -316,7 +316,7 @@ Authority:
   `a.fict` settles `fict DS`, but not the other way round. A copy belongs
   to one session: `Advance` drops it.
 * The questions carry no CNAME or DNAME chains, so no lookup is for the
-  name a chain reached, which `Zones` looks up when the response to the
+  name a chain reached, which `Copies` looks up when the response to the
   client's question was filed and did not settle it; a server that
   answers as the RFCs say carries the whole chain in that response.
 * `Copies::keep` files a response into the copy the lookup names, which
@@ -468,7 +468,7 @@ Authority:
 | `View(r)` | `Lazy::view` under its one lock, then `zone::answer` |
 | `Provider(w, n)` | `Provider::lookup -> Fact<Vec<RecordSet>>` |
 | `ins`, `history`, `rev` | the lazy zone's `Mutex<Held>`: the nodes it holds and their `Revision` |
-| `ViewReply` with `"unknown"` | `Answered::Unknown`, which `Zones` answers SERVFAIL for a zone that is not learned |
+| `ViewReply` with `"unknown"` | `Answered::Unknown`, which `Zones` answers SERVFAIL for |
 | `Crosses(r)` | `<Overlay as Authority>::respond` reading the inner authority's `<apex> NS` and asking its base `<apex> DS` before composing a referral |
 
 Validation:

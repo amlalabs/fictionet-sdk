@@ -130,14 +130,10 @@ impl ServerConfig {
     /// The octets of the reply to a CHAOS-class question, from
     /// [`identity`](ServerConfig::identity) alone ([`Identity::reply`]),
     /// through the front and fitted to the client's size, with the
-    /// identity's payload and OPT record.
+    /// payload the identity advertises.
     pub(in super::super) fn render_chaos(&self, req: &Request) -> Vec<u8> {
         let identity = &self.identity;
-        let (response, edns) = identity.reply(req);
-        let mut response = self.front(req, response);
-        if !edns {
-            response.message.edns = None;
-        }
+        let mut response = self.front(req, identity.reply(req));
         let payload = identity.payload.unwrap_or(self.payload);
         if let Some(edns) = &mut response.message.edns {
             edns.set_max_payload(payload.max(512));
@@ -305,8 +301,7 @@ impl Identity {
     }
 
     /// The reply to the CHAOS-class question `req`, before a server front
-    /// adds its header details and EDNS, and whether it has an OPT record
-    /// when the query had one:
+    /// adds its header details and EDNS:
     ///
     /// - A zone transfer gets REFUSED: these names are no zones to list
     ///   (RFC 5936 §2.2).
@@ -319,12 +314,12 @@ impl Identity {
     ///   [`aa`](Identity::aa) says.
     /// - A name with a reply of its own gets it, and an unlisted name gets
     ///   [`unlisted`](Identity::unlisted).
-    pub fn reply(&self, req: &Request) -> (Response, bool) {
+    pub fn reply(&self, req: &Request) -> Response {
         if matches!(
             req.question.query_type(),
             RecordType::AXFR | RecordType::IXFR
         ) {
-            return (bare_reply(req, ResponseCode::Refused, None), true);
+            return bare_reply(req, ResponseCode::Refused, None);
         }
         let qname = LowerName::new(req.question.name());
         let zone = self.chaos.iter().find_map(|(name, answer)| match answer {
@@ -332,15 +327,10 @@ impl Identity {
             _ => None,
         });
         if let Some((apex, zone)) = zone {
-            return (self.zone_reply(req, &Name::from(apex), zone), true);
+            return self.zone_reply(req, &Name::from(apex), zone);
         }
         let other = !matches!(req.question.query_type(), RecordType::TXT | RecordType::ANY);
-        let empty = |reply: &ChaosReply| {
-            (
-                bare_reply_with(req, reply.rcode, reply.ede.clone()),
-                reply.edns,
-            )
-        };
+        let empty = |reply: &ChaosReply| bare_reply_with(req, reply.rcode, reply.ede.clone());
         match self.chaos.get(&qname) {
             _ if other => empty(&self.other_types),
             Some(ChaosAnswer::Txt(text)) => {
@@ -350,7 +340,7 @@ impl Identity {
                     .message
                     .answers
                     .push(self.txt(req.question.name(), text));
-                (response, true)
+                response
             }
             Some(ChaosAnswer::Reply(reply)) => empty(reply),
             Some(ChaosAnswer::Zone(_)) | None => empty(&self.unlisted),
@@ -360,28 +350,23 @@ impl Identity {
     /// The reply to `req` from `zone`, the CHAOS zone at `apex`, with AA
     /// set: at the apex, the zone's records of the type asked, or NODATA
     /// with the SOA; below it, NXDOMAIN with the SOA (RFC 2308 §2.1,
-    /// §2.2), its TTL [`soa_question_ttl`](ChaosZone::soa_question_ttl)
-    /// when the question is for an SOA. A positive answer to a query with
-    /// RD clear also carries, in the authority section, the apex records
-    /// of each type in [`authority_without_rd`](ChaosZone::authority_without_rd)
-    /// that the answer lacks.
+    /// §2.2). A negative reply gives the SOA the smaller of its TTL and
+    /// its MINIMUM field (RFC 2308 §3).
     fn zone_reply(&self, req: &Request, apex: &Name, zone: &ChaosZone) -> Response {
         let qtype = req.question.query_type();
         let mut response = bare_reply(req, ResponseCode::NoError, None);
         response.message.metadata.authoritative = true;
         let soa = chaos_record(apex, zone.soa_ttl, RData::SOA(zone.soa.clone()));
+        let mut negative_soa = soa.clone();
+        negative_soa.ttl = zone.soa_ttl.min(zone.soa.minimum);
         if req.question.name() != apex {
-            let mut soa = soa;
-            if qtype == RecordType::SOA {
-                soa.ttl = zone.soa_question_ttl;
-            }
             response.message.metadata.response_code = ResponseCode::NXDomain;
-            response.message.authorities.push(soa);
+            response.message.authorities.push(negative_soa);
             return response;
         }
         let ns = chaos_record(apex, zone.ns_ttl, RData::NS(NS(zone.ns.clone())));
         let txt = zone.txt.as_deref().map(|text| self.txt(apex, text));
-        let apex_records: Vec<Record> = txt.into_iter().chain([soa.clone(), ns]).collect();
+        let apex_records: Vec<Record> = txt.into_iter().chain([soa, ns]).collect();
         let of_type = |kind: RecordType| {
             apex_records
                 .iter()
@@ -393,15 +378,7 @@ impl Identity {
             _ => of_type(qtype).collect(),
         };
         if answers.is_empty() {
-            response.message.authorities.push(soa);
-        } else if !req.rd {
-            let extra: Vec<Record> = zone
-                .authority_without_rd
-                .iter()
-                .flat_map(|&kind| of_type(kind))
-                .filter(|record| !answers.contains(record))
-                .collect();
-            response.message.authorities.extend(extra);
+            response.message.authorities.push(negative_soa);
         }
         response.message.answers = answers;
         response
@@ -449,14 +426,6 @@ pub struct ChaosZone {
     pub ns_ttl: u32,
     /// The TXT string at the apex, with the identity's TTL.
     pub txt: Option<String>,
-    /// The apex record types a positive answer to a query with RD clear
-    /// also carries in its authority section, when the answer lacks them.
-    /// Empty for none.
-    pub authority_without_rd: Vec<RecordType>,
-    /// The TTL of the SOA in the NXDOMAIN reply to an SOA question below
-    /// the apex. Every other negative reply gives the SOA
-    /// [`soa_ttl`](ChaosZone::soa_ttl).
-    pub soa_question_ttl: u32,
 }
 
 /// A CHAOS-class reply without data.
@@ -466,20 +435,12 @@ pub struct ChaosReply {
     pub rcode: ResponseCode,
     /// The Extended DNS Error it carries (RFC 8914), if any.
     pub ede: Option<Ede>,
-    /// Whether it has an OPT record when the query had one, as some
-    /// servers leave it out.
-    pub edns: bool,
 }
 
 impl ChaosReply {
-    /// A reply with `rcode`, no Extended DNS Error, and an OPT record when
-    /// the query had one.
+    /// A reply with `rcode` and no Extended DNS Error.
     pub fn rcode(rcode: ResponseCode) -> ChaosReply {
-        ChaosReply {
-            rcode,
-            ede: None,
-            edns: true,
-        }
+        ChaosReply { rcode, ede: None }
     }
 }
 

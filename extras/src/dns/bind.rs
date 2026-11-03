@@ -2,17 +2,14 @@
 //! it answers about itself.
 
 use fictionet::stdlib::protocols::dns::rr::rdata::SOA;
-use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RecordType};
+use fictionet::stdlib::protocols::dns::rr::{LowerName, Name};
 use fictionet::stdlib::services::dns::authority::{ChaosAnswer, ChaosZone};
 
 /// The zone BIND serves at the CHAOS name `name`, with TXT `txt` at its
 /// apex if any, as c, g, i, and m at the root and a local BIND 9.20
 /// answered on 2026-11-02: SOA
 /// `<name> hostmaster.<name> 0 28800 7200 604800 86400` with TTL 86400,
-/// and NS `<name>` with TTL 0. A positive answer to a query with RD clear
-/// also carries the NS in its authority section, as BIND's default
-/// `minimal-responses no-auth-recursive` does, and the NXDOMAIN reply to
-/// an SOA question below the apex gives the SOA TTL 0.
+/// and NS `<name>` with TTL 0.
 pub fn chaos_zone(name: &LowerName, txt: Option<String>) -> ChaosAnswer {
     let name = Name::from(name);
     let hostmaster = Name::from_ascii("hostmaster")
@@ -24,7 +21,5 @@ pub fn chaos_zone(name: &LowerName, txt: Option<String>) -> ChaosAnswer {
         ns: name,
         ns_ttl: 0,
         txt,
-        authority_without_rd: vec![RecordType::NS],
-        soa_question_ttl: 0,
     }))
 }

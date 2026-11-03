@@ -281,6 +281,11 @@ impl Endpoint {
         self.shared.state.lock().groups.retain(|g| *g != group);
     }
 
+    /// Whether a socket is open on `port`.
+    pub fn is_bound(&self, port: u16) -> bool {
+        self.shared.state.lock().sockets.contains_key(&port)
+    }
+
     /// Opens a socket on `port`.
     ///
     /// Port zero selects a free port from 49152 through 65535. Fails if

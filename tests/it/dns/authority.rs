@@ -662,8 +662,9 @@ fn chaos_questions_are_answered_by_name_from_the_identity() {
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 
     // NSD leaves AA clear and refuses other types; Verisign answers them
-    // with NOTIMP and no OPT record; e.root and f.root with NOTIMP and EDE
-    // 21, advertising 512 octets.
+    // with NOTIMP; e.root and f.root with NOTIMP and EDE 21, advertising
+    // 512 octets. Every reply to a query with an OPT record has one
+    // (RFC 6891 §7).
     let not_supported = Ede {
         code: EdeCode::NOT_SUPPORTED,
         text: Some("Unsupported DNS Type for Class CHAOS".to_string()),
@@ -682,15 +683,12 @@ fn chaos_questions_are_answered_by_name_from_the_identity() {
         ),
         (
             Identity {
-                other_types: ChaosReply {
-                    edns: false,
-                    ..ChaosReply::rcode(ResponseCode::NotImp)
-                },
+                other_types: ChaosReply::rcode(ResponseCode::NotImp),
                 ..identity.clone()
             },
             true,
             ResponseCode::NotImp,
-            None,
+            Some(1232),
             None,
         ),
         (
@@ -777,13 +775,14 @@ fn a_chaos_zone_answers_from_its_records() {
 
     // (question, RD, RCODE, answer section, authority section)
     let cases = [
-        // The text, with the zone's NS when RD is clear.
+        // The text, whatever RD says, with nothing in the authority
+        // section, where it is optional.
         (
             ("hostname.bind.", Txt),
             false,
             ResponseCode::NoError,
             vec![host(Txt, 0)],
-            vec![host(Ns, 0)],
+            vec![],
         ),
         (
             ("hostname.bind.", Txt),
@@ -798,7 +797,7 @@ fn a_chaos_zone_answers_from_its_records() {
             false,
             ResponseCode::NoError,
             vec![host(Soa, 86400)],
-            vec![host(Ns, 0)],
+            vec![],
         ),
         (
             ("hostname.bind.", Ns),
@@ -822,7 +821,9 @@ fn a_chaos_zone_answers_from_its_records() {
             vec![],
             vec![host(Soa, 86400)],
         ),
-        // Below the zone is NXDOMAIN with the SOA, TTL 0 for an SOA question.
+        // Below the zone is NXDOMAIN with the SOA, whose TTL is the
+        // smaller of its own and its MINIMUM for any question
+        // (RFC 2308 §3).
         (
             ("foo.hostname.bind.", Txt),
             false,
@@ -835,7 +836,7 @@ fn a_chaos_zone_answers_from_its_records() {
             false,
             ResponseCode::NXDomain,
             vec![],
-            vec![host(Soa, 0)],
+            vec![host(Soa, 86400)],
         ),
         // A zone with no text.
         (
@@ -1745,6 +1746,52 @@ fn an_overlay_without_the_glue_it_needs_answers_servfail() {
     assert!(lookups(&actions).is_empty());
     let reply = the_answer(&actions);
     assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
+}
+
+/// Where the parent holds a DS RRset at the invented apex, as for a real
+/// signed domain the invented zone stands in for, a referral with DO
+/// carries that DS RRset (RFC 4035 §3.1.4): the same one the overlay
+/// answers `<apex> DS` with.
+#[test]
+fn an_overlay_refers_with_the_ds_its_base_holds() {
+    let base = Zone::from_master(
+        "\
+example. 3600 IN SOA ns.example. hostmaster.example. 1 7200 3600 1209600 300
+example. 3600 IN NS ns.example.
+ns.example. 3600 IN A 192.0.2.53
+inv.example. 3600 IN NS ns.elsewhere.test.
+inv.example. 3600 IN DS 12345 8 2 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+",
+        None,
+    )
+    .unwrap();
+    let invented = Zone::builder(name("inv.example."), soa("inv.example."), 3600)
+        .rrset(rrset("inv.example.", 3600, vec![ns("ns1.inv.example.")]))
+        .rrset(rrset("ns1.inv.example.", 3600, vec![a("192.0.2.99")]))
+        .build()
+        .unwrap();
+    let overlay = Overlay::new(zones(vec![base]), name("example."))
+        .below(name("inv.example."), zones(vec![invented]));
+    let mut engine = AuthorityEngine::new(overlay, ServerConfig::generic(), local());
+    let mut ask = |qname: &str, qtype: RecordType| {
+        let message = query(qname, qtype, |m| {
+            m.set_edns(edns(1232, true));
+        });
+        the_answer(&ask_with(&mut engine, &message, Transport::Udp))
+    };
+    let ds = |records: &[Record]| -> Vec<RData> {
+        records
+            .iter()
+            .filter(|record| record.record_type() == RecordType::DS)
+            .map(|record| record.data.clone())
+            .collect()
+    };
+    let answer = ask("inv.example.", RecordType::DS);
+    assert!(answer.metadata.authoritative);
+    assert_eq!(ds(&answer.answers).len(), 1);
+    let referral = ask("www.inv.example.", RecordType::A);
+    assert!(!referral.metadata.authoritative);
+    assert_eq!(ds(&referral.authorities), ds(&answer.answers));
 }
 
 #[test]

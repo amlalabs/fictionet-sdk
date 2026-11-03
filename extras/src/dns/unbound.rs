@@ -166,8 +166,10 @@ mod tests {
     }
 
     /// Every zone Unbound serves by default names `localhost.` as its
-    /// name server and as its SOA's MNAME, and the loopback addresses'
-    /// reverse names point at `localhost.`.
+    /// SOA's MNAME, and as its name server where its apex has one:
+    /// `localhost` and `invalid` answer NS with a negative
+    /// (RFC 6761 §6.3, §6.4). The loopback addresses' reverse names point
+    /// at `localhost.`.
     #[test]
     fn unbound_zones_name_localhost() {
         let zones = local_zones();
@@ -175,12 +177,18 @@ mod tests {
         for zone in &zones {
             assert!(zone.keep_aa);
             let apex = zone.data.apex().to_string();
-            assert_eq!(
-                records(&*zone.data, &apex, RecordType::NS),
-                vec![RData::NS(NS(name("localhost.")))],
-                "{apex}"
-            );
-            let soa = records(&*zone.data, &apex, RecordType::SOA);
+            let ns = match apex.as_str() {
+                "localhost." | "invalid." => vec![],
+                _ => vec![RData::NS(NS(name("localhost.")))],
+            };
+            assert_eq!(records(&*zone.data, &apex, RecordType::NS), ns, "{apex}");
+            let question = Query::query(name(&apex), RecordType::SOA);
+            let view = zone.data.view(&question);
+            let soa: Vec<&RData> = view
+                .soa()
+                .records_without_rrsigs()
+                .map(|record| &record.data)
+                .collect();
             let [RData::SOA(soa)] = soa.as_slice() else {
                 panic!("{apex}: one SOA");
             };

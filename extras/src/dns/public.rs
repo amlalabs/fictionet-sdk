@@ -439,7 +439,7 @@ fn ddr(endpoints: Vec<SVCB>, ttl: u32, keep_aa: bool) -> LocalZone {
 /// and the client's subnet (RFC 7871), so a copy of its records could
 /// never give it.
 fn google_whoami(config: Config, site: &ResolverSite, egress: Ipv4Addr) -> Config {
-    config.local(plain(Arc::new(myaddr(site.egress, egress))))
+    config.local(plain(Arc::new(myaddr(IpAddr::V4(site.egress), egress))))
 }
 
 /// Cloudflare's 1.1.1.1, answering `whoami.cloudflare` CH TXT with the

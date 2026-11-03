@@ -49,20 +49,25 @@ use super::{Authority, ServerConfig, Step, bare_reply, refuse_transfer};
 ///   both refers to the zone and denies it.
 ///
 /// With DO, the referral needs the parent's word on the DS RRset
-/// (RFC 4035 §3.1.4). The overlay puts the NSEC and NSEC3 records of the
-/// base's reply to `<apex> DS` that speak to a delegation at the apex,
-/// with their RRSIGs, into the
-/// referral's authority section, leaving out a record that shows only
-/// that no wildcard matched, which a parent never sends with a
-/// delegation (RFC 5155 §7.2.7). The base's reply carries the denial its
-/// zone holds for the apex ([`View::denial`](super::super::zone::View::denial)),
-/// such as the NSEC3 records a learned zone copied from the real parent
-/// with their RRSIGs. The overlay does not judge them: a validator checks them for
+/// (RFC 4035 §3.1.4), the same word the base gives `<apex> DS`. When the
+/// base's reply to `<apex> DS` has the DS RRset, as the real parent of a
+/// signed domain that an invented zone stands in for does, the referral
+/// carries it with its RRSIGs. Otherwise the overlay puts the NSEC and
+/// NSEC3 records of that reply that speak to a delegation at the apex,
+/// with their RRSIGs, into the referral's authority section, leaving out
+/// a record that shows only that no wildcard matched, which a parent
+/// never sends with a delegation (RFC 5155 §7.2.7). The base's reply
+/// carries the denial its zone holds for the apex
+/// ([`View::denial`](super::super::zone::View::denial)), such as the
+/// NSEC3 records a learned zone copied from the real parent with their
+/// RRSIGs. The overlay does not judge them: a validator checks them for
 /// this name. Under an opt-out NSEC3 parent, as `com`, `net`, and `org`
 /// are, they prove the delegation insecure (RFC 5155 §8.9), so the
 /// invented zone resolves as an unsigned zone. Under an NSEC parent, as
 /// the root is, no record proves it, and validators call the delegation
-/// bogus. The invented zone is never passed off as a signed one.
+/// bogus. Where the parent has a DS RRset, validators call it bogus too,
+/// since the invented zone has no key the DS names. The invented zone is
+/// never passed off as a signed one.
 pub struct Overlay<B: Authority> {
     base: B,
     /// The zone the base serves, whose children the overlay invents.
@@ -187,7 +192,17 @@ impl<B: Authority> Authority for Overlay<B> {
 
         let mut authority = ns;
         if req.edns.is_some_and(|edns| edns.dnssec_ok) {
-            authority.extend(denial(&apex, &zone, &parent.authorities));
+            let ds: Vec<Record> = parent
+                .answers
+                .iter()
+                .filter(|record| record.name == apex && covered(record) == RecordType::DS)
+                .cloned()
+                .collect();
+            if ds.is_empty() {
+                authority.extend(denial(&apex, &zone, &parent.authorities));
+            } else {
+                authority.extend(ds);
+            }
         }
         Step::Reply(referral(req, authority, glue))
     }

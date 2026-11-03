@@ -1602,6 +1602,51 @@ fn a_resolver_with_no_hints_answers_servfail_with_ede_22() {
     assert!(net.recording().exchanges().is_empty());
 }
 
+/// A resolver answers `localhost` and `invalid` by itself as RFC 6761
+/// says: loopback addresses for A and AAAA at any `localhost` name and a
+/// negative for every other type (§6.3), and NXDOMAIN for `invalid` and
+/// every name below it (§6.4).
+#[test]
+fn localhost_and_invalid_are_answered_as_rfc_6761_says() {
+    let (mut net, _) = internet(false);
+    let mut resolver = resolver(Config {
+        hints: vec![(name("a.root-servers.net."), ip(ROOT))],
+        ..Config::new()
+    });
+    let mut ask = |qname: &str, qtype| {
+        ask(
+            &mut resolver,
+            &mut net,
+            0,
+            query(client(1), qname, qtype, |_| {}),
+        )
+    };
+    for qname in ["localhost.", "foo.localhost."] {
+        assert_eq!(addresses(&ask(qname, RecordType::A)), ["127.0.0.1"]);
+        for qtype in [RecordType::NS, RecordType::SOA, RecordType::TXT] {
+            let reply = ask(qname, qtype);
+            assert_eq!(
+                reply.metadata.response_code,
+                ResponseCode::NoError,
+                "{qname} {qtype}"
+            );
+            assert!(reply.answers.is_empty(), "{qname} {qtype}");
+        }
+    }
+    for qname in ["invalid.", "x.invalid."] {
+        for qtype in [RecordType::A, RecordType::SOA] {
+            let reply = ask(qname, qtype);
+            assert_eq!(
+                reply.metadata.response_code,
+                ResponseCode::NXDomain,
+                "{qname} {qtype}"
+            );
+            assert!(reply.answers.is_empty(), "{qname} {qtype}");
+        }
+    }
+    assert!(net.recording().exchanges().is_empty());
+}
+
 #[test]
 fn rd_clear_is_refused_or_answered_from_the_cache_alone() {
     let (mut net, _) = internet(false);
@@ -1805,6 +1850,55 @@ fn a_negative_trust_anchor_stops_validation_below_it() {
         query(client(1), "bad.com.", RecordType::DS, dnssec_ok),
     );
     assert!(reply.metadata.authentic_data, "com validates its DS RRset");
+}
+
+/// What was cached under a negative trust anchor counts as gone once the
+/// anchor is removed (RFC 7646 §4): data that does not validate, served
+/// as Insecure while the anchor stood, is checked again and fails, for
+/// positive answers and negative ones alike, though its TTL has not run
+/// out.
+#[test]
+fn removing_a_negative_trust_anchor_checks_cached_data_again() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (mut net, anchors) = internet(true);
+    let bad = LowerName::new(&name("bad.com."));
+    let standing = Arc::new(AtomicBool::new(true));
+    let flag = standing.clone();
+    let mut resolver = resolver(Config {
+        negative_anchors: Some(Arc::new(move |name: &LowerName| {
+            flag.load(Ordering::SeqCst) && *name == bad
+        })),
+        ..config(anchors)
+    });
+    let questions = [
+        ("www.bad.com.", RecordType::A, ResponseCode::NoError),
+        ("nx.bad.com.", RecordType::A, ResponseCode::NXDomain),
+    ];
+    for (qname, qtype, rcode) in questions {
+        let reply = ask(
+            &mut resolver,
+            &mut net,
+            0,
+            query(client(1), qname, qtype, dnssec_ok),
+        );
+        assert_eq!(reply.metadata.response_code, rcode, "{qname}");
+        assert!(!reply.metadata.authentic_data, "{qname}");
+    }
+    standing.store(false, Ordering::SeqCst);
+    for (qname, qtype, _) in questions {
+        let reply = ask(
+            &mut resolver,
+            &mut net,
+            1,
+            query(client(1), qname, qtype, dnssec_ok),
+        );
+        assert_eq!(
+            reply.metadata.response_code,
+            ResponseCode::ServFail,
+            "{qname}"
+        );
+        assert!(reply.answers.is_empty(), "{qname}");
+    }
 }
 
 /// A trust anchor below a negative trust anchor starts validation again
@@ -2602,6 +2696,65 @@ fn a_failure_the_work_bound_caused_is_not_cached_for_other_clients() {
     assert_eq!(addresses(&second), ["192.0.2.90"]);
 }
 
+/// The work bound is per client question (RFC 1034 §5.3.3). A question
+/// that joins a lookup another question started pays for the rest of it
+/// from its own bound, so it does not fail because the other question
+/// spent its own.
+#[test]
+fn a_question_that_joins_another_ones_lookup_pays_from_its_own_bound() {
+    let (mut net, _) = internet(false);
+    let mut resolver = resolver(Config {
+        minimise: None,
+        work: Work {
+            queries: 6,
+            depth: 11,
+        },
+        ..config(None)
+    });
+    let entropy = entropy();
+    let now = at(0);
+    let first = query(client(1), "away.example.com.", RecordType::A, |_| {});
+    resolver.handle(Input::Query(first), now, &entropy);
+    let mut answers: Vec<Answer> = Vec::new();
+    let mut pending = Vec::new();
+    let mut joined = false;
+    loop {
+        while let Some(action) = resolver.poll() {
+            match action {
+                Action::Send(transmit) => pending.push(transmit),
+                Action::Answer(answer) => answers.push(answer),
+                Action::Lookup { .. } | Action::Abandon(_) | Action::Event(_) => {}
+            }
+        }
+        if pending.is_empty() {
+            break;
+        }
+        let transmit = pending.remove(0);
+        let asked = Message::from_vec(&transmit.bytes).unwrap();
+        // The second question arrives while the first one's lookup of
+        // its alias target waits for its first reply.
+        if !joined && asked.queries[0].name().to_lowercase() == name("www.example.org.") {
+            joined = true;
+            let second = query(client(2), "www.example.org.", RecordType::A, |_| {});
+            resolver.handle(Input::Query(second), now, &entropy);
+        }
+        for input in net.exchange(&transmit, now, &entropy) {
+            resolver.handle(input, now, &entropy);
+        }
+    }
+    assert!(joined);
+    let reply = |port: u16| {
+        let answer = answers
+            .iter()
+            .find(|answer| answer.client.peer.port() == port)
+            .expect("an answer");
+        Message::from_vec(&answer.bytes).unwrap()
+    };
+    assert_eq!(reply(1).metadata.response_code, ResponseCode::ServFail);
+    assert_eq!(reply(2).metadata.response_code, ResponseCode::NoError);
+    assert_eq!(addresses(&reply(2)), ["192.0.2.90"]);
+}
+
 #[test]
 fn a_failed_lookup_keeps_the_glue_it_lays_over() {
     // A failure is no data (RFC 9520 §3): the glue that says where the
@@ -3034,6 +3187,59 @@ fn servers_slower_than_the_first_wait_are_asked_again_and_answer() {
     let mut unique = names.clone();
     unique.dedup();
     assert_eq!(names, unique, "no question is sent twice: {questions:?}");
+}
+
+/// A server's first reply sets the wait for it as RFC 6298 §2.2 says: the
+/// smoothed round trip is that reply's, its variation half of it, and the
+/// wait the round trip plus four times the variation.
+#[test]
+fn a_servers_first_reply_sets_its_wait_as_rfc_6298_says() {
+    let (mut net, _) = internet(false);
+    let mut resolver = resolver(Config {
+        retransmit: Duration::from_secs(1),
+        minimise: None,
+        ..config(None)
+    });
+    let entropy = entropy();
+    let delay = Duration::from_millis(100);
+    let mut now = Instant::ZERO;
+    let mut due: Vec<(Instant, Input)> = Vec::new();
+    // Each query's server and how long the resolver waits for it.
+    let mut waits: Vec<(IpAddr, Duration)> = Vec::new();
+    let query = query(client(1), "www.example.com.", RecordType::A, |_| {});
+    resolver.handle(Input::Query(query), now, &entropy);
+    let reply = 'resolve: loop {
+        while let Some(action) = resolver.poll() {
+            match action {
+                Action::Send(transmit) => {
+                    let deadline = resolver.next_deadline().expect("a query waits");
+                    let wait = deadline.since_start() - now.since_start();
+                    waits.push((transmit.to.ip(), wait));
+                    for input in net.exchange(&transmit, now, &entropy) {
+                        due.push((now + delay, input));
+                    }
+                }
+                Action::Answer(answer) => break 'resolve Message::from_vec(&answer.bytes).unwrap(),
+                Action::Lookup { .. } | Action::Abandon(_) | Action::Event(_) => {}
+            }
+        }
+        let (when, input) = due.remove(0);
+        now = when;
+        resolver.handle(input, now, &entropy);
+    };
+    assert_eq!(addresses(&reply), ["192.0.2.80"]);
+    let root: Vec<Duration> = waits
+        .iter()
+        .filter(|(server, _)| *server == ip(ROOT))
+        .map(|(_, wait)| *wait)
+        .collect();
+    // Priming, then the question: 1 s for a server never heard from, then
+    // 100 ms + 4 × 50 ms.
+    assert_eq!(
+        root,
+        [Duration::from_secs(1), Duration::from_millis(300)],
+        "{waits:?}"
+    );
 }
 
 #[test]

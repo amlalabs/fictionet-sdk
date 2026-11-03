@@ -244,13 +244,6 @@ mod tests {
         }
     }
 
-    /// The query's ID, which hickory's TCP transport sets afresh.
-    fn without_id(query: &[u8]) -> Message {
-        let mut query = Message::from_vec(query).unwrap();
-        query.metadata.id = 0;
-        query
-    }
-
     #[test]
     fn a_truncated_reply_is_asked_again_over_tcp() {
         let (udp, tcp) = sockets();
@@ -303,9 +296,9 @@ mod tests {
 
             let over_udp = queries.recv().unwrap();
             let over_tcp = queries.recv().unwrap();
-            // The same query on both transports: the lookup's question,
-            // no recursion, and DO with no options.
-            assert_eq!(without_id(&over_udp), without_id(&over_tcp));
+            // The same query on both transports, ID included: the
+            // lookup's question, no recursion, and DO with no options.
+            assert_eq!(over_udp, over_tcp);
             let query = Message::from_vec(&over_udp).unwrap();
             assert!(!query.metadata.recursion_desired);
             assert_eq!(query.queries.len(), 1);

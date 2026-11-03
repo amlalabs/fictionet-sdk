@@ -80,7 +80,7 @@ What each theorem says:
 | `learned_nxdomain_proved` | NXDOMAIN from a copy rests on a filed denial whose records it holds: a response of the real server showed nothing at or below a name at or above one the answer read absent, and the records the copy holds for that name (`Learned.proof`, Rust's `View::denial` for `Denied::Name`) are the ones the real zone's servers send for it |
 | `learned_answer_stable` | filing a response true of the real zone never changes an answer the learned zone gave, but for optional additional data the new facts add (`file_refines`: filing only adds facts) |
 | `loop_bounded` | for any authority over a learned zone whose lookups for a request lie in a list, the engine's loop replies or stays silent within one more step than the list is long: more fuel changes nothing (`loop_not_need`: it never ends on a `Need`) |
-| `serve_one_lookup` | the engine running `Zones` over a learned zone looks a request up at most once: with any fuel from 2 up it gives what it gives with 2 |
+| `serve_one_lookup` | the engine running `Copies` over one learned zone looks a request up at most once: with any fuel from 2 up it gives what it gives with 2 |
 | `serve_reply_upstream` | with an upstream whose responses are true of the real zone, whatever the engine replies is the real zone's answer, but for optional additional data |
 | `serve_nxdomain_proved` | the engine replies NXDOMAIN only from a filed denial, held with the real zone's denial records for it |
 | `overlay_needs` | an overlay over a learned zone needs at most two lookups for a request: the parent's `<apex> DS`, and the question itself |
@@ -230,9 +230,9 @@ extra iterations, in base32hex. RRSIG times are decimal. Validation results are 
   follows from it. The answers carry no denial records, since the answer here is the unsigned one of
   `Dns/Zone.lean`, and a node filing carries no NODATA proof: that a signed copy sends the records it holds,
   for NODATA and wildcard answers too, is checked by `learned_signed.json` against `Dnssec.lean`'s signed
-  answers. The engine looks up the client's question at the server's own address, as `Zones` does, so one
+  answers. The engine looks up the client's question at the server's own address, as `Copies` does, so one
   request makes at most one lookup. When the response to the client's question was filed and the answer
-  still stops at a name a CNAME or DNAME chain reached, `Zones` looks that name up; only a real server that
+  still stops at a name a CNAME or DNAME chain reached, `Copies` looks that name up; only a real server that
   stops a chain early, outside `Copied`, leaves it so, and this model leaves that lookup out. An overlay is a function of its base's steps for the question and for
   `<apex> DS`, with what it invents abstract: the theorems bound its lookups and keep its replies stable,
   and `Authority.tla` checks it with lookups shared between requests.
@@ -329,11 +329,11 @@ extra iterations, in base32hex. RRSIG times are decimal. Validation results are 
 | `Zone.Spec`, `Zone.build`, `Zone.ZoneError` | `ZoneBuilder::{rrset, delegate, build}`, `ZoneError` |
 | `Zone.View`, `Zone.answerPartial` | `View` and `answer` over any view |
 | `Zone.Lazy`, `Zone.Provider`, `Zone.lazyView` | `Lazy`, `Provider`, `Lazy::view` |
-| `Authority.Filing`, `Learned`, `Learned.file`, `Learned.view` | `zone::Learned`, `Learned::file`, `Learned`'s `View` |
+| `Authority.Filing`, `Learned`, `Learned.file`, `Learned.view` | `zone::Learned`, `Learned::file`, `Learned::view_at` |
 | `Authority.Learned.proof`, `Proofs` | `View::denial` of a learned zone for `Denied::Name`; the records `dnssec::proof::proof_of` keeps for a claim |
 | `Authority.Lookup`, `Looked` | `services::dns::{Lookup, Looked}` |
-| `Authority.Step`, `respond` | `authority::Step`, `Zones::respond` over a learned zone (`Step::Need` for what it lacks) |
-| `Authority.loop`, `serve` | `AuthorityEngine`'s handling of `Need`, `Input::Looked`, and `Authority::file` for one request, over any authority and over `Zones` |
+| `Authority.Step`, `respond` | `authority::Step`, `Copies::respond` over one learned zone (`Step::Need` for what it lacks) |
+| `Authority.loop`, `serve` | `AuthorityEngine`'s handling of `Need`, `Input::Looked`, and `Authority::file` for one request, over any authority and over `Copies` |
 | `Authority.Overlay`, `overlay` | `authority::Overlay` over a learned base |
 | `Exchange.Token`, `send`, `onReply`, `advance` | `services::dns::exchange::{Token, Transmit, Input::Reply, Engine::advance}` |
 | `Dnssec.Key`, `Ds`, `Rrsig`, `Nsec`, `Nsec3` | hickory's `DNSKEY`, `DS`, `RRSIG`, `NSEC`, `NSEC3` under `protocols::dns::dnssec` |

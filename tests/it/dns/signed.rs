@@ -221,6 +221,80 @@ fn nodata_at_a_dname_owner_validates() {
     }
 }
 
+/// NODATA for a wildcard's own name is a NODATA for a name that exists:
+/// it carries the one record that matches the name (RFC 4035 §3.1.3.1,
+/// RFC 5155 §7.2.3), and no more. NODATA for a name the wildcard answers
+/// for carries the records that deny the name and the one that matches
+/// the wildcard, and with NSEC3 the one that matches the closest
+/// encloser too (RFC 4035 §3.1.3.4, RFC 5155 §7.2.5). Every one
+/// validates.
+#[test]
+fn wildcard_nodata_carries_the_proof_for_the_name_asked() {
+    for denial in denials() {
+        let base = || {
+            let soa = SOA::new(
+                name("ns1.example."),
+                name("hostmaster.example."),
+                1,
+                7200,
+                3600,
+                1209600,
+                300,
+            );
+            Zone::builder(name("example."), soa, 3600)
+                .rrset(rrset("example.", vec![RData::NS(NS(name("ns1.example.")))]))
+                .rrset(rrset("ns1.example.", vec![RData::A(A::new(192, 0, 2, 1))]))
+                .rrset(rrset(
+                    "*.wild.example.",
+                    vec![RData::A(A::new(192, 0, 2, 9))],
+                ))
+                .build()
+                .unwrap()
+        };
+        let offline = base().signed(&keys(), window(), denial.clone()).unwrap();
+        let online = Signed::new(base(), keys(), window(), denial.clone());
+        let denials = match denial {
+            Denial::Nsec => RecordType::NSEC,
+            Denial::Nsec3 { .. } => RecordType::NSEC3,
+        };
+        for (how, data) in [
+            ("signed once", &offline as &dyn ZoneData),
+            ("signed as asked", &online),
+        ] {
+            for qname in ["*.wild.example.", "x.wild.example."] {
+                let reply = ask(data, qname, RecordType::TXT, AnyResponse::All);
+                let case = format!("{denial:?} {how} {qname}");
+                assert_eq!(
+                    reply.metadata.response_code,
+                    ResponseCode::NoError,
+                    "{case}"
+                );
+                assert!(reply.answers.is_empty(), "{case}");
+                let proof: Vec<RecordSet> = sets(&reply.authorities)
+                    .into_iter()
+                    .filter(|set| set.record_type() == denials)
+                    .collect();
+                if qname.starts_with('*') {
+                    assert_eq!(proof.len(), 1, "{case}: {proof:?}");
+                }
+                let (chain, anchors) = chain(data);
+                let validation = validate_denial(
+                    &Query::query(name(qname), RecordType::TXT),
+                    reply.metadata.response_code,
+                    &sets(&reply.authorities),
+                    &chain,
+                    &anchors,
+                    &AlgorithmPolicy::iana(),
+                    now(),
+                    &Ring,
+                )
+                .validation;
+                assert_eq!(validation, Validation::Secure, "{case}");
+            }
+        }
+    }
+}
+
 /// The signed NSEC at a wildcard owner, copied to another owner, still
 /// verifies, since its RRSIG's labels field rebuilds the wildcard. It
 /// proves nothing there (RFC 4035 §5.4): alone it leaves an NXDOMAIN

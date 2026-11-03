@@ -362,7 +362,7 @@ impl<'v> Walk<'v> {
                     // (RFC 4035 §3.1.4.1).
                     return match ds {
                         Some(ds) => Ok(Out::Done(positive(vec![ds.clone()], Vec::new()))),
-                        None => self.nodata(name, None),
+                        None => self.nodata(name),
                     };
                 }
                 if cut == *name && self.qtype == RecordType::NSEC {
@@ -519,7 +519,7 @@ impl<'v> Walk<'v> {
                 })
                 .collect();
             let Some(first) = sets.first() else {
-                return self.nodata(name, encloser);
+                return self.nodata(name);
             };
             let cname = sets
                 .iter()
@@ -528,10 +528,16 @@ impl<'v> Walk<'v> {
                 // No HINFO is made up at a CNAME (RFC 8482 §4.2), which
                 // leaves room for no other data (RFC 1034 §3.6.2).
                 (AnyResponse::Hinfo, Some(cname)) => vec![owned(cname, &owner)],
-                (AnyResponse::Hinfo, None) => vec![
-                    self.hinfo(&owner, smallest_ttl(&sets))
-                        .unwrap_or_else(|| owned(first, &owner)),
-                ],
+                (AnyResponse::Hinfo, None) => {
+                    // Every RRset of a signed zone is signed
+                    // (RFC 4035 §2.2), so the name's own RRsets show
+                    // whether the zone is.
+                    let signed = sets.iter().any(|set| !set.rrsigs().is_empty());
+                    vec![
+                        self.hinfo(&owner, smallest_ttl(&sets), signed)
+                            .unwrap_or_else(|| owned(first, &owner)),
+                    ]
+                }
                 (AnyResponse::OneRrset(rtype), _) => {
                     let set = sets.iter().find(|set| set.record_type() == rtype);
                     vec![owned(set.unwrap_or(first), &owner)]
@@ -554,7 +560,7 @@ impl<'v> Walk<'v> {
             // question gathers them.
             return Ok(Out::Done(match rrsigs_of(sets, &owner) {
                 Some(set) => positive(vec![set], proof),
-                None => return self.nodata(name, encloser),
+                None => return self.nodata(name),
             }));
         }
 
@@ -599,23 +605,16 @@ impl<'v> Walk<'v> {
             });
         }
 
-        self.nodata(name, encloser)
+        self.nodata(name)
     }
 
-    /// NODATA at `name`, matched at its own node or, with `encloser`, at
-    /// the wildcard there (RFC 2308 §2.2, RFC 4035 §3.1.3.1 and §3.1.3.4).
-    fn nodata(&self, name: &LowerName, encloser: Option<&LowerName>) -> Result<Out, LowerName> {
+    /// NODATA at `name`, matched at its own node or at the wildcard that
+    /// answers for it (RFC 2308 §2.2), with the proof of the type's
+    /// absence at `name` either way (RFC 4035 §3.1.3.1 and §3.1.3.4,
+    /// RFC 5155 §7.2.3 and §7.2.5).
+    fn nodata(&self, name: &LowerName) -> Result<Out, LowerName> {
         let mut authority = vec![self.negative_soa()];
-        match encloser {
-            None => authority.extend(self.denial(name, Denied::Type(self.qtype))?),
-            Some(encloser) => {
-                let kind = Denied::Wildcard {
-                    closest_encloser: encloser.clone(),
-                };
-                authority.extend(self.denial(name, kind)?);
-                authority.extend(self.denial(&wildcard(encloser), Denied::Type(self.qtype))?);
-            }
-        }
+        authority.extend(self.denial(name, Denied::Type(self.qtype))?);
         Ok(Out::Done(Found {
             authority: unique(authority.into_iter()),
             ..Found::new(ResponseCode::NoError, true)
@@ -623,16 +622,16 @@ impl<'v> Walk<'v> {
     }
 
     /// The synthesized HINFO answer to QTYPE ANY at `owner` (RFC 8482
-    /// §4.2). With DO, in a signed zone, it is signed, since a validator
-    /// rejects an unsigned RRset there. A view that cannot sign gives
-    /// `None`, and the answer is one RRset of the name with its RRSIGs
-    /// instead (RFC 8482 §4.1). Without DO no RRSIG goes out, so the
-    /// HINFO goes out as it is.
-    fn hinfo(&self, owner: &Name, ttl: u32) -> Option<RecordSet> {
+    /// §4.2). With DO, at a name whose RRsets are `signed`, it is signed,
+    /// since a validator rejects an unsigned RRset there. A view that
+    /// cannot sign gives `None`, and the answer is one RRset of the name
+    /// with its RRSIGs instead (RFC 8482 §4.1). Without DO no RRSIG goes
+    /// out, so the HINFO goes out as it is.
+    fn hinfo(&self, owner: &Name, ttl: u32, signed: bool) -> Option<RecordSet> {
         let rdata = RData::HINFO(HINFO::new("RFC8482".to_string(), String::new()));
         let mut set = RecordSet::with_ttl(owner.clone(), RecordType::HINFO, ttl);
         set.set_records(vec![Record::from_rdata(owner.clone(), ttl, rdata)]);
-        if !self.dnssec_ok || self.view.soa().rrsigs().is_empty() {
+        if !self.dnssec_ok || !signed {
             return Some(set);
         }
         self.view.sign(&set)

@@ -41,8 +41,8 @@ const EGRESS: Ipv4Addr = Ipv4Addr::new(45, 70, 0, 9);
 /// The root zone the upstream answers for at every root letter: the root
 /// servers, `example.` delegated without glue to a server under `org.`,
 /// `org.` and `direct.` with glue, `lan.` and `private.` with glue no
-/// internet host can be at, `home.` with the egress as its glue, and two
-/// names with addresses.
+/// internet host can be at, `home.` with the egress as its glue, and names
+/// with addresses, `web.` at the address of `org.`'s name server.
 const ROOT: &str = "\
 . 86400 IN SOA a.root-servers.net. nstld.verisign-grs.com. 2026110101 1800 900 604800 86400
 . 518400 IN NS a.root-servers.net.
@@ -87,6 +87,7 @@ alias-dns.com. 300 IN CNAME cloudflare-dns.com.
 renamed. 300 IN DNAME com.
 doh.com. 300 IN A 45.33.6.7
 plain. 300 IN A 45.33.7.7
+web. 300 IN A 45.33.1.53
 ";
 
 const ORG: &str = "\
@@ -867,6 +868,68 @@ fn a_glueless_name_server_known_before_its_delegation_gets_a_server() {
     });
 }
 
+/// A machine a world placed at a name's address before any referral named
+/// that address a name server's, as a world places web sites, still gets
+/// the name server once a referral does: the server joins the machine,
+/// and the delegation resolves.
+#[test]
+fn a_name_server_joins_a_site_placed_at_its_address_first() {
+    world(Duration::from_secs(60), |fcx| async move {
+        let hierarchy = Hierarchy::new();
+        let at = place();
+        let clock = WallClock {
+            start: SystemTime::UNIX_EPOCH,
+        };
+        let config = Config {
+            anchors: None,
+            ..unbound::config()
+        };
+        let (attacher, attachments) = fictionet::attachments();
+        let net = Net::new().ipv4_only();
+        let handle = net.handle();
+        let sites = handle.clone();
+        // A site at each address an answer gives, as a world that serves
+        // web pages places them.
+        let mirror = mirror(hierarchy.clone(), handle.clone()).observe(move |filing| {
+            for (section, set) in &filing.sets {
+                for record in set.records_without_rrsigs() {
+                    if let (Section::Answer, RData::A(a)) = (section, &record.data) {
+                        let _ = sites.add_host(Host::new("site").at(a.0).ipv4_only());
+                    }
+                }
+            }
+        });
+        net.hosts(at.root_servers(|s| mirror.server(s)))
+            .gateway(move |h, _| h.program(Recursive::new(config.clone(), clock)))
+            .start(&fcx, attachments)?;
+        let m = machine(&fcx, attacher.attach("client")?, ME);
+        let org = v4(45, 33, 1, 53);
+
+        let reply = ask(&fcx, &m, GATEWAY, &query(1, "web.", RecordType::A, true))
+            .await
+            .expect("an answer");
+        assert_eq!(addresses(&reply), vec![org]);
+        assert!(handle.has_machine(org), "the site is placed");
+
+        let reply = ask(
+            &fcx,
+            &m,
+            GATEWAY,
+            &query(2, "www.example.", RecordType::A, true),
+        )
+        .await
+        .expect("an answer");
+        assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(addresses(&reply), vec![v4(45, 33, 4, 80)]);
+        assert!(
+            !hierarchy
+                .asked_for("ns.provider.org.", RecordType::A)
+                .is_empty()
+        );
+        Ok(())
+    });
+}
+
 /// Glue on the sandboxes' subnet, or at an address no internet host can
 /// have, reaches the client as the real server sent it, and no server is
 /// placed there.
@@ -1196,6 +1259,8 @@ fn whoami_names_are_answered_from_the_egress_and_never_looked_up() {
 /// A real server that echoes the address a question came from would see
 /// a public resolver's own egress, not the world's: `whoami.direct` plays
 /// such a server, answering with the address the upstream asks from.
+/// Every public resolver shows its own IPv4 egress, and none shows the
+/// world's.
 #[test]
 fn an_echoed_address_is_the_public_resolvers_egress() {
     world(Duration::from_secs(60), |fcx| async move {
@@ -1218,28 +1283,39 @@ fn an_echoed_address_is_the_public_resolvers_egress() {
             }))
             .start(&fcx, attachments)?;
         let m = machine(&fcx, attacher.attach("client")?, ME);
-        let cloudflare = PUBLIC_RESOLVERS[1].addresses[0].v4;
-        let seen = v4(172, 69, 133, 100);
-
-        let reply = ask(
-            &fcx,
-            &m,
-            cloudflare,
-            &query(1, "whoami.direct.", RecordType::A, true),
-        )
-        .await
-        .expect("an answer");
-        assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
-        assert_eq!(addresses(&reply), vec![seen]);
-        let reply = ask(
-            &fcx,
-            &m,
-            cloudflare,
-            &query(2, "whoami.direct.", RecordType::TXT, true),
-        )
-        .await
-        .expect("an answer");
-        assert_eq!(texts(&reply), vec![seen.to_string()]);
+        assert_eq!(
+            at.resolver(PUBLIC_RESOLVERS[1].addresses[0].v4).egress,
+            Ipv4Addr::new(172, 69, 133, 100)
+        );
+        for (index, resolver) in PUBLIC_RESOLVERS.iter().enumerate() {
+            let address = resolver.addresses[0].v4;
+            let seen = at.resolver(address).egress;
+            assert_ne!(seen, EGRESS, "{address}");
+            let id = 2 * u16::try_from(index).unwrap();
+            let reply = ask(
+                &fcx,
+                &m,
+                address,
+                &query(id, "whoami.direct.", RecordType::A, true),
+            )
+            .await
+            .expect("an answer");
+            assert_eq!(
+                reply.metadata.response_code,
+                ResponseCode::NoError,
+                "{address}"
+            );
+            assert_eq!(addresses(&reply), vec![IpAddr::V4(seen)], "{address}");
+            let reply = ask(
+                &fcx,
+                &m,
+                address,
+                &query(id + 1, "whoami.direct.", RecordType::TXT, true),
+            )
+            .await
+            .expect("an answer");
+            assert_eq!(texts(&reply), vec![seen.to_string()], "{address}");
+        }
         Ok(())
     });
 }

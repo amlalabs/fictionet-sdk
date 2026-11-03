@@ -660,6 +660,20 @@ impl NetHandle {
             .is_ok_and(|shared| shared.world.lock().machines.contains_key(&addr))
     }
 
+    /// Whether a machine at `addr` has a socket open on UDP port `port`,
+    /// as a program that answers DNS there has on port 53. Before the
+    /// network has started, none has.
+    pub fn udp_bound(&self, addr: IpAddr, port: u16) -> bool {
+        self.shared().is_ok_and(|shared| {
+            shared
+                .world
+                .lock()
+                .machines
+                .get(&addr)
+                .is_some_and(|machine| machine.udp_bound(port))
+        })
+    }
+
     fn shared(&self) -> Result<Arc<Shared>, Error> {
         let network = self
             .0

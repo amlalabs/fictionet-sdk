@@ -91,6 +91,9 @@ pub fn root_zone(text: &str) -> Result<Zone, ZoneError> {
 // ---------------------------------------------------------------------------
 // Mirror
 
+/// The port DNS servers answer on (RFC 1035 §4.2).
+const DNS_PORT: u16 = 53;
+
 /// A callback that sees what each response gave a mirrored zone.
 type Observer = dyn Fn(&Filing) + Send + Sync;
 
@@ -130,10 +133,13 @@ type Front = dyn Fn(Host) -> Host + Send + Sync;
 ///
 /// Each server is placed when the records that name it are filed, before
 /// the reply that needed them leaves, behind the mirror's
-/// [`delay`](Mirror::delay). An address where a host's machine already
-/// is gets no server: the world's own hosts there, such as its root
-/// servers or a resolver, answer as the world made them, and where one
-/// runs a mirrored server, that server answers for the new zone too. An
+/// [`delay`](Mirror::delay). An address where a machine already answers
+/// on UDP port 53 gets no server: the world's own hosts there, such as
+/// its root servers or a resolver, answer as the world made them, and
+/// where one runs a mirrored server, that server answers for the new zone
+/// too. A machine there that answers no DNS, such as a web site a world
+/// placed at the address before any NS RRset named it, gets the server
+/// beside its own services, behind the machine's own link. An
 /// address a filed NS RRset
 /// names whose real server turns out not to serve the zone, as at a lame
 /// delegation, answers for the rest of the session from the zones it does
@@ -419,7 +425,7 @@ impl Inner {
         {
             let mut placed = self.placed.lock();
             servers.retain(|(addr, _, _)| {
-                !self.handle.has_machine(*addr) && placed.servers.insert(*addr)
+                !self.handle.udp_bound(*addr, DNS_PORT) && placed.servers.insert(*addr)
             });
             fronts.retain(|(addr, _, _)| !non_public_address(*addr) && placed.fronts.insert(*addr));
         }
@@ -484,20 +490,20 @@ impl Authority for Mirrored {
 /// real servers would leave from, for servers that echo the address a
 /// question came from, as the whoami names of Akamai do.
 ///
-/// A [`Mirror`]'s upstream asks every real server from one address, the
-/// [`upstream`](Echo::new) address, and the copied records hold what the
-/// real server said to it. A resolver in the world whose real counterpart
-/// asks from another address, its egress, would be shown that address
-/// instead. So a reply to a client given with [`client`](Echo::client)
-/// carries its egress in place of the upstream's: in an unsigned A record
-/// when the egress is IPv4, and in a TXT string. The copied record stays
-/// as the real server sent it; the address is put in as the reply leaves,
-/// since it depends on who asked. A world adds it with [`Mirror::wrap`]
-/// and [`Echo::over`].
+/// A [`Mirror`]'s upstream asks every real server from one IPv4 address,
+/// the [`upstream`](Echo::new) address, and the copied records hold what
+/// the real server said to it. A resolver in the world whose real
+/// counterpart asks that server from another IPv4 address, its egress,
+/// would be shown that address instead. So a reply to a client given with
+/// [`client`](Echo::client) carries its egress in place of the
+/// upstream's, in an unsigned A record and in a TXT string. The copied
+/// record stays as the real server sent it; the address is put in as the
+/// reply leaves, since it depends on who asked. A world adds it with
+/// [`Mirror::wrap`] and [`Echo::over`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Echo {
     upstream: Ipv4Addr,
-    egress: HashMap<IpAddr, IpAddr>,
+    egress: HashMap<IpAddr, Ipv4Addr>,
 }
 
 impl Echo {
@@ -510,9 +516,9 @@ impl Echo {
         }
     }
 
-    /// Shows the client at `client` the address `egress` where a reply
-    /// echoes the upstream's.
-    pub fn client(mut self, client: IpAddr, egress: IpAddr) -> Echo {
+    /// Shows the client at `client` the IPv4 address `egress` where a
+    /// reply echoes the upstream's.
+    pub fn client(mut self, client: IpAddr, egress: Ipv4Addr) -> Echo {
         self.egress.insert(client, egress);
         self
     }
@@ -543,7 +549,7 @@ impl Authority for Echoed {
         match self.authority.respond(req, local, server, client) {
             Step::Reply(mut response) => {
                 if let Some(&seen) = self.echo.egress.get(&client.peer.ip())
-                    && seen != IpAddr::V4(self.echo.upstream)
+                    && seen != self.echo.upstream
                 {
                     echo(&mut response.message, self.echo.upstream, seen);
                 }
@@ -564,10 +570,10 @@ impl Authority for Echoed {
 
 /// Puts `seen` in place of `egress` where `message`'s answer echoes the
 /// address a question came from, as `whoami.akamai.net` A or
-/// `whoami.ds.akahelp.net` TXT do: an A record holding `egress`, which
-/// takes `seen` when it is IPv4, and a TXT string that is `egress`. An
-/// RRset its RRSIGs cover is left as it is.
-fn echo(message: &mut Message, egress: Ipv4Addr, seen: IpAddr) {
+/// `whoami.ds.akahelp.net` TXT do: an A record holding `egress`, and a
+/// TXT string that is `egress`. An RRset its RRSIGs cover is left as
+/// it is.
+fn echo(message: &mut Message, egress: Ipv4Addr, seen: Ipv4Addr) {
     let signed: Vec<(Name, RecordType)> = message
         .answers
         .iter()
@@ -583,9 +589,9 @@ fn echo(message: &mut Message, egress: Ipv4Addr, seen: IpAddr) {
         if signed.contains(&(record.name.clone(), record.record_type())) {
             continue;
         }
-        match (&mut record.data, seen) {
-            (RData::A(a), IpAddr::V4(seen)) if a.0 == egress => a.0 = seen,
-            (RData::TXT(txt), _) if txt.txt_data.iter().any(|s| **s == *text.as_bytes()) => {
+        match &mut record.data {
+            RData::A(a) if a.0 == egress => a.0 = seen,
+            RData::TXT(txt) if txt.txt_data.iter().any(|s| **s == *text.as_bytes()) => {
                 let strings = txt.txt_data.iter().map(|s| {
                     if **s == *text.as_bytes() {
                         seen.to_string()

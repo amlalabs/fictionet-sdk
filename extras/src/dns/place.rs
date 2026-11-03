@@ -10,7 +10,7 @@
 //! public resolvers of [`public`].
 
 use std::collections::BTreeMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 
 use fictionet::stdlib::protocols::dns::op::ResponseCode;
@@ -43,9 +43,9 @@ pub struct ResolverSite {
     pub rtt: Duration,
     /// Its answers to CHAOS-class questions and its NSID.
     pub identity: Identity,
-    /// The address its own questions to authorities leave from, which
-    /// Google's whoami answer and servers that echo the asker show.
-    pub egress: IpAddr,
+    /// The IPv4 address its own questions to authorities leave from,
+    /// which Google's whoami answer and servers that echo the asker show.
+    pub egress: Ipv4Addr,
 }
 
 /// Where a world's network is on the internet: the round trips to
@@ -75,9 +75,9 @@ impl Place {
     /// listed answers with no identity after
     /// [`authority_rtt`](Self::authority_rtt), and asks from its own
     /// address.
-    pub fn resolver(&self, addr: IpAddr) -> ResolverSite {
+    pub fn resolver(&self, addr: Ipv4Addr) -> ResolverSite {
         self.resolvers
-            .get(&addr)
+            .get(&IpAddr::V4(addr))
             .cloned()
             .unwrap_or_else(|| ResolverSite {
                 rtt: self.authority_rtt,
@@ -121,7 +121,7 @@ impl Place {
         build: impl Fn(&PublicResolver, &ResolverSite, Host) -> Host,
     ) -> Vec<Host> {
         public::public_resolvers(|resolver, host| {
-            let site = self.resolver(IpAddr::V4(resolver.addresses[0].v4));
+            let site = self.resolver(resolver.addresses[0].v4);
             let host = host.delay(site.rtt / 2);
             build(resolver, &site, host)
         })
@@ -134,7 +134,7 @@ impl Place {
         PUBLIC_RESOLVERS
             .iter()
             .flat_map(|resolver| {
-                let egress = self.resolver(IpAddr::V4(resolver.addresses[0].v4)).egress;
+                let egress = self.resolver(resolver.addresses[0].v4).egress;
                 resolver.addresses.iter().flat_map(move |address| {
                     [
                         (IpAddr::V4(address.v4), egress),
@@ -156,7 +156,9 @@ impl Place {
     /// set AA, and the payload of its CHAOS replies are as seen there on
     /// 2026-11-02. Instances are the ones anycast picked there that day,
     /// so some sit far away: k.root answered from London. Other
-    /// authorities took 20 ms, the median over six of them.
+    /// authorities took 20 ms, the median over six of them. Quad9's and
+    /// OpenDNS's egress are the addresses `whoami.akamai.net` A gave
+    /// through each there on 2026-11-03.
     pub fn san_francisco_bay_area() -> Place {
         use ResponseCode::{NoError, NotImp, Refused, ServFail};
         let txt = |text: &str| ChaosAnswer::Txt(text.to_string());
@@ -204,13 +206,10 @@ impl Place {
             let zone = bind::chaos_zone(&authors, None);
             zones(identity).answer(authors, zone)
         };
-        // Verisign's servers answer other types with NOTIMP and no OPT
-        // record. Its root letter sets AA; its gTLD servers do not.
+        // Verisign's servers answer other types with NOTIMP. Its root
+        // letter sets AA; its gTLD servers do not.
         let verisign = |identity: Identity| Identity {
-            other_types: ChaosReply {
-                edns: false,
-                ..ChaosReply::rcode(NotImp)
-            },
+            other_types: ChaosReply::rcode(NotImp),
             ..identity
         };
         // E and F answer other types with NOTIMP and EDE 21, and advertise
@@ -435,7 +434,7 @@ impl Place {
                 (IpAddr::V4(server.v4), site)
             })
             .collect();
-        let resolver = |rtt: u64, identity: Identity, egress: IpAddr| ResolverSite {
+        let resolver = |rtt: u64, identity: Identity, egress: Ipv4Addr| ResolverSite {
             rtt: ms(rtt),
             identity,
             egress,
@@ -452,7 +451,7 @@ impl Place {
                         [no(ServFail), no(ServFail), no(ServFail), no(ServFail)],
                     )
                 },
-                IpAddr::V4(Ipv4Addr::new(172, 253, 1, 21)),
+                Ipv4Addr::new(172, 253, 1, 21),
             ),
             resolver(
                 8,
@@ -464,7 +463,7 @@ impl Place {
                         [txt("sjc10"), no(Refused), no(Refused), txt("2026.10.11")],
                     )
                 },
-                IpAddr::V4(Ipv4Addr::new(172, 69, 133, 100)),
+                Ipv4Addr::new(172, 69, 133, 100),
             ),
             resolver(
                 7,
@@ -482,16 +481,13 @@ impl Place {
                     )
                     .answer(chaos::authors_bind(), no(ServFail))
                 },
-                IpAddr::V6(Ipv6Addr::new(0x2620, 0x171, 0xf0, 0xf0, 0, 0, 0, 0x227)),
+                Ipv4Addr::new(74, 63, 16, 229),
             ),
             resolver(
                 17,
-                // Every CHAOS question gets REFUSED with no OPT record.
+                // Every CHAOS question gets REFUSED.
                 {
-                    let refused = ChaosReply {
-                        edns: false,
-                        ..ChaosReply::rcode(Refused)
-                    };
+                    let refused = ChaosReply::rcode(Refused);
                     let no = || ChaosAnswer::Reply(refused.clone());
                     Identity {
                         unlisted: refused.clone(),
@@ -499,7 +495,7 @@ impl Place {
                         ..identity("r3003.lax", Refused, [no(), no(), no(), no()])
                     }
                 },
-                IpAddr::V6(Ipv6Addr::new(0x2620, 0, 0xcc8, 0, 0, 0, 0, 0x36)),
+                Ipv4Addr::new(208, 67, 219, 130),
             ),
         ];
         let resolvers = PUBLIC_RESOLVERS

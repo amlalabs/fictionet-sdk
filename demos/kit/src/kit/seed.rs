@@ -53,17 +53,69 @@ pub fn root_anchor_files(anchor: &TrustAnchor) -> [(&'static str, String); 3] {
     [
         (
             "/etc/dnssec-trust-anchors.d/root.positive",
-            anchor.resolved_positive(),
+            ds_lines(anchor),
         ),
-        ("/usr/share/dns/root.key", anchor.root_key()),
-        ("/etc/bind/bind.keys", anchor.bind_keys()),
+        ("/usr/share/dns/root.key", ds_lines(anchor)),
+        ("/etc/bind/bind.keys", bind_keys(anchor)),
     ]
 }
 
 /// Unbound's own root trust anchor file, which it reads and keeps up to
 /// date, for a guest that installs Unbound.
 pub fn unbound_root_anchor(anchor: &TrustAnchor) -> (&'static str, String) {
-    ("/var/lib/unbound/root.key", anchor.root_key())
+    ("/var/lib/unbound/root.key", ds_lines(anchor))
+}
+
+/// `anchor`'s DS records, one per line in zone file syntax, as
+/// systemd-resolved reads a positive trust anchor file
+/// (dnssec-trust-anchors.d(5)) and Unbound a trust anchor file.
+fn ds_lines(anchor: &TrustAnchor) -> String {
+    anchor
+        .ds
+        .iter()
+        .map(|ds| {
+            format!(
+                "{} IN DS {} {} {} {}\n",
+                owner_text(anchor),
+                ds.key_tag(),
+                u8::from(ds.algorithm()),
+                u8::from(ds.digest_type()),
+                hex_upper(ds.digest()),
+            )
+        })
+        .collect()
+}
+
+/// `anchor` as a BIND `bind.keys` file, which `delv` reads: a
+/// `trust-anchors` statement with one `initial-ds` entry per DS record,
+/// as BIND ships the root's.
+fn bind_keys(anchor: &TrustAnchor) -> String {
+    let entries: String = anchor
+        .ds
+        .iter()
+        .map(|ds| {
+            format!(
+                "\t{} initial-ds {} {} {} \"{}\";\n",
+                owner_text(anchor),
+                ds.key_tag(),
+                u8::from(ds.algorithm()),
+                u8::from(ds.digest_type()),
+                hex_upper(ds.digest()),
+            )
+        })
+        .collect();
+    format!("trust-anchors {{\n{entries}}};\n")
+}
+
+/// The anchor's zone, fully qualified.
+fn owner_text(anchor: &TrustAnchor) -> String {
+    let mut owner = anchor.owner.clone();
+    owner.set_fqdn(true);
+    owner.to_string()
+}
+
+fn hex_upper(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02X}")).collect()
 }
 
 /// The guest configuration and credentials for one seed.
@@ -267,7 +319,9 @@ fn cloud_data<P: Software>(p: &Provision<P>, installation: &Installation) -> Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::protocols::dns::dnssec::{Algorithm, KeyFlags, KeySet, ZoneKey};
+    use fictionet::stdlib::protocols::dns::dnssec::{
+        Algorithm, Anchors, KeyFlags, KeySet, ZoneKey,
+    };
     use fictionet::stdlib::protocols::dns::rr::Name;
     use fictionet::{Seed, SeededEntropy};
     use std::sync::Arc;
@@ -299,18 +353,37 @@ mod tests {
         let (path, content) = unbound_root_anchor(&anchor);
         let data = user_data(&guest.file(path, 0o644, content));
         let files = files(&data).unwrap();
-        let ds = anchor.resolved_positive();
+        let ds = ds_lines(&anchor);
         assert!(ds.starts_with(". IN DS "));
         assert_eq!(files["/etc/dnssec-trust-anchors.d/root.positive"], ds);
         assert_eq!(files["/usr/share/dns/root.key"], ds);
         assert_eq!(files["/var/lib/unbound/root.key"], ds);
-        assert_eq!(files["/etc/bind/bind.keys"], anchor.bind_keys());
+        assert_eq!(files["/etc/bind/bind.keys"], bind_keys(&anchor));
         let restart = data
             .find("systemctl try-restart systemd-resolved.service")
             .unwrap();
         assert!(data.find("daemon-reexec").unwrap() < restart);
         assert!(restart < data.find("apt-get update").unwrap());
         assert_eq!(data.matches("systemd-resolved").count(), 1);
+    }
+
+    #[test]
+    fn the_iana_root_anchor_renders_as_the_real_files() {
+        let anchors = Anchors::iana_root();
+        let root = anchors.iter().next().unwrap();
+        let ds = ds_lines(root);
+        assert!(ds.contains(
+            ". IN DS 20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D\n"
+        ));
+        assert!(ds.contains(
+            ". IN DS 38696 8 2 683D2D0ACB8C9B712A1948B27F741219298D0A450D612C483AF444A4C0FB2B16\n"
+        ));
+        let bind = bind_keys(root);
+        assert!(bind.starts_with("trust-anchors {\n"));
+        assert!(bind.contains(
+            "\t. initial-ds 20326 8 2 \"E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D\";\n"
+        ));
+        assert!(bind.ends_with("};\n"));
     }
 
     #[test]

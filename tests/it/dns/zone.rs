@@ -2651,37 +2651,59 @@ fn an_unknown_target_leaves_out_only_its_addresses() {
 
 // Locally served zones.
 
+/// Every name at or below `localhost` is the loopback host: A and AAAA
+/// questions get the loopback addresses, owned by the name asked, and
+/// every other type, SOA and NS included, gets NODATA, the immediate
+/// negative answer RFC 6761 §6.3 asks for.
 #[test]
 fn localhost_points_every_name_at_loopback() {
     let zone = special::localhost(&EmptyApex::rfc6303());
     let ask = |qname: &str, qtype| ask(&*view_of(&zone, qname, qtype), qname, qtype);
-    assert_eq!(
-        addresses(&ask("localhost.", RecordType::A).answers),
-        vec!["127.0.0.1"]
-    );
-    assert_eq!(
-        addresses(&ask("localhost.", RecordType::AAAA).answers),
-        vec!["::1"]
-    );
-    let reply = ask("anything.below.localhost.", RecordType::A);
-    assert_eq!(addresses(&reply.answers), vec!["127.0.0.1"]);
-    // The apex is its own name server (`localhost. NS localhost.`).
-    let reply = ask("localhost.", RecordType::NS);
-    assert_eq!(reply.answers[0].data, ns("localhost."));
-    // A name below answers with the apex's RRsets, owned by the name
-    // asked (RFC 6761 §6.3).
-    for qtype in [RecordType::NS, RecordType::SOA] {
-        let reply = ask("foo.localhost.", qtype);
-        assert_eq!(rows(&reply.answers), vec![row("foo.localhost.", qtype)]);
-        assert!(reply.metadata.authoritative);
+    for qname in ["localhost.", "anything.below.localhost."] {
+        let reply = ask(qname, RecordType::A);
+        assert_eq!(addresses(&reply.answers), vec!["127.0.0.1"], "{qname}");
+        assert_eq!(rows(&reply.answers), vec![row(qname, RecordType::A)]);
+        let reply = ask(qname, RecordType::AAAA);
+        assert_eq!(addresses(&reply.answers), vec!["::1"], "{qname}");
+        for qtype in [RecordType::NS, RecordType::SOA, RecordType::MX] {
+            let reply = ask(qname, qtype);
+            assert_eq!(
+                reply.metadata.response_code,
+                ResponseCode::NoError,
+                "{qname} {qtype}"
+            );
+            assert!(reply.metadata.authoritative, "{qname} {qtype}");
+            assert!(reply.answers.is_empty(), "{qname} {qtype}");
+            assert_eq!(
+                rows(&reply.authorities),
+                vec![row("localhost.", RecordType::SOA)],
+                "{qname} {qtype}"
+            );
+        }
     }
-    let reply = ask("foo.localhost.", RecordType::MX);
-    assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
-    assert!(reply.answers.is_empty());
-    assert_eq!(
-        rows(&reply.authorities),
-        vec![row("localhost.", RecordType::SOA)]
-    );
+}
+
+/// `invalid` never exists, and neither does any name below it: every
+/// question gets NXDOMAIN, at the apex too (RFC 6761 §6.4).
+#[test]
+fn invalid_is_nxdomain_at_its_apex_too() {
+    let zone = special::invalid(&EmptyApex::rfc6303());
+    for qname in ["invalid.", "x.invalid."] {
+        for qtype in [RecordType::A, RecordType::SOA, RecordType::NS] {
+            let reply = ask(&*view_of(&zone, qname, qtype), qname, qtype);
+            assert_eq!(
+                reply.metadata.response_code,
+                ResponseCode::NXDomain,
+                "{qname} {qtype}"
+            );
+            assert!(reply.answers.is_empty(), "{qname} {qtype}");
+            assert_eq!(
+                rows(&reply.authorities),
+                vec![row("invalid.", RecordType::SOA)],
+                "{qname} {qtype}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -2738,7 +2760,6 @@ fn special_use_zones_are_empty_with_the_apex_they_are_given() {
     for zone in [
         special::onion(&apex),
         special::test(&apex),
-        special::invalid(&apex),
         special::home_arpa(&apex),
         special::service_arpa(&apex),
         special::resolver_arpa(&apex, vec![], 3600),

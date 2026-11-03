@@ -1395,6 +1395,11 @@ pub(super) struct Machine {
 }
 
 impl Machine {
+    /// Whether a socket is open on UDP port `port`.
+    pub(super) fn udp_bound(&self, port: u16) -> bool {
+        self.udp.is_bound(port)
+    }
+
     /// Builds a machine without publishing its route or starting its tasks.
     fn stage(
         installation: &Installation<'_>,

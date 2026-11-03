@@ -23,7 +23,7 @@
   proofs, are checked by the differential test's `learned_signed` vectors against `Dns/Dnssec.lean`.
 
   Rust: `services::dns::zone::Learned`, `services::dns::lookup::{Lookup, Looked}`, and
-  `services::dns::authority::{Step, Zones, AuthorityEngine, Overlay}`.
+  `services::dns::authority::{Step, Copies, AuthorityEngine, Overlay}`.
 -/
 import Dns.Partial
 
@@ -504,14 +504,14 @@ theorem loop_reply {R : Learned → Request → Step} {up : Lookup → Looked} {
 
 /-! ## The server of a learned zone -/
 
-/-- `Zones` over one learned zone, at the server with address `addr`: the answer from the zone's view, or, when
+/-- `Copies` serving one learned zone, at the server with address `addr`: the answer from the zone's view, or, when
 the view lacks a fact, a lookup of the client's question at the server's own address. -/
 def respond (any : AnyResponse) (addr : Nat) (L : Learned) (req : Request) : Step :=
   match answerPartial L.view req any with
   | .response r => .reply r
   | .unknown _ => .need ⟨addr, L.apex, req⟩
 
-/-- The engine running `Zones` over one learned zone. -/
+/-- The engine running `Copies` over one learned zone. -/
 def serve (any : AnyResponse) (addr : Nat) (up : Lookup → Looked) :
     Nat → Learned → List Lookup → Request → Learned × Step :=
   loop (respond any addr) up
