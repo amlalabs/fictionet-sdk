@@ -110,10 +110,11 @@ pub struct Learned {
 pub struct Filing {
     /// The apex of the zone the RRsets were filed into.
     pub zone: LowerName,
-    /// The RRsets kept, in the order they were filed: for an answer, the
-    /// apex NS RRset, the answers, then additional data; for a referral,
-    /// its NS RRset, its glue, and its DS RRset.
-    pub sets: Vec<RecordSet>,
+    /// The RRsets kept, each with the section it came from, in the order
+    /// they were filed: for an answer, the apex NS RRset, the answers,
+    /// then additional data; for a referral, its NS RRset, its glue, and
+    /// its DS RRset.
+    pub sets: Vec<(Section, RecordSet)>,
 }
 
 /// The session a [`Learned`] zone's facts belong to, and the facts.
@@ -143,7 +144,7 @@ struct Facts {
 #[derive(Clone)]
 struct Known {
     /// RRsets, each with the section it was filed from.
-    sets: BTreeMap<RecordType, (Rank, RecordSet)>,
+    sets: BTreeMap<RecordType, (Section, RecordSet)>,
     /// Types a NODATA answer showed the name lacks.
     absent: BTreeSet<RecordType>,
     /// A zone cut's NS RRset and glue. Its DS RRset is in `sets`.
@@ -163,13 +164,19 @@ impl Default for Known {
     }
 }
 
-/// Which section of an authoritative response an RRset came from: an
-/// answer outranks the authority section, which outranks additional data
-/// (RFC 2181 §5.4.1).
+/// Which section of a response an RRset came from: an answer outranks
+/// the authority section, which outranks additional data
+/// (RFC 2181 §5.4.1). A referral's NS and DS RRsets come from its
+/// authority section, and its glue from additional data.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum Rank {
+pub enum Section {
+    /// The additional section: glue, or the addresses of names the
+    /// answer or authority section names.
     Additional,
+    /// The authority section: the zone's NS RRset, or a referral's NS and
+    /// DS RRsets.
     Authority,
+    /// The answer section.
     Answer,
 }
 
@@ -303,7 +310,7 @@ impl Facts {
         apex: &LowerName,
         question: &Query,
         response: &Message,
-        kept: &mut Vec<RecordSet>,
+        kept: &mut Vec<(Section, RecordSet)>,
     ) -> bool {
         let qname = LowerName::new(question.name());
         if !apex.zone_of(&qname)
@@ -355,7 +362,7 @@ impl Facts {
         answer: &[RecordSet],
         authority: &[RecordSet],
         additional: &[RecordSet],
-        kept: &mut Vec<RecordSet>,
+        kept: &mut Vec<(Section, RecordSet)>,
     ) {
         let apex = filed.apex;
         let soa = authority
@@ -365,9 +372,9 @@ impl Facts {
         for set in authority {
             if set.record_type() == RecordType::NS
                 && LowerName::new(set.name()) == *apex
-                && self.put(apex, set.clone(), Rank::Authority)
+                && self.put(apex, set.clone(), Section::Authority)
             {
-                kept.push(set.clone());
+                kept.push((Section::Authority, set.clone()));
             }
         }
         let whole = matches!(filed.qtype, RecordType::ANY | RecordType::RRSIG);
@@ -389,8 +396,8 @@ impl Facts {
             {
                 continue;
             }
-            if self.put_expanded(apex, set, Rank::Answer, filed.denial) {
-                kept.push(set.clone());
+            if self.put_expanded(apex, set, Section::Answer, filed.denial) {
+                kept.push((Section::Answer, set.clone()));
             }
         }
         for set in additional {
@@ -400,9 +407,9 @@ impl Facts {
                 && !self.below_cut(&owner, set.record_type())
                 // At its owner even when a wildcard made it: the answer's
                 // proofs are not the proof for it.
-                && self.put(apex, set.clone(), Rank::Additional)
+                && self.put(apex, set.clone(), Section::Additional)
             {
-                kept.push(set.clone());
+                kept.push((Section::Additional, set.clone()));
             }
         }
 
@@ -420,7 +427,7 @@ impl Facts {
             .collect();
         if whole && filed.rcode == ResponseCode::NoError && !at_end.is_empty() {
             if self.put_whole(apex, &end, filed, &at_end) {
-                kept.extend(at_end.into_iter().cloned());
+                kept.extend(at_end.into_iter().map(|set| (Section::Answer, set.clone())));
             }
             return;
         }
@@ -468,7 +475,7 @@ impl Facts {
         authority: &[RecordSet],
         additional: &[RecordSet],
         denial: &[RecordSet],
-        kept: &mut Vec<RecordSet>,
+        kept: &mut Vec<(Section, RecordSet)>,
     ) -> bool {
         let ns = authority.iter().find(|set| {
             let owner = LowerName::new(set.name());
@@ -501,14 +508,14 @@ impl Facts {
             .find(|set| set.record_type() == RecordType::DS && LowerName::new(set.name()) == cut)
             .cloned();
         self.unabsent(apex, &cut);
-        kept.push(ns.clone());
-        kept.extend(glue.iter().cloned());
-        kept.extend(ds.iter().cloned());
+        kept.push((Section::Authority, ns.clone()));
+        kept.extend(glue.iter().map(|set| (Section::Additional, set.clone())));
+        kept.extend(ds.iter().map(|set| (Section::Authority, set.clone())));
         let known = self.names.entry(cut.clone()).or_default();
         known.cut = Some((ns.clone(), glue));
         match ds {
             Some(ds) => {
-                known.sets.insert(RecordType::DS, (Rank::Authority, ds));
+                known.sets.insert(RecordType::DS, (Section::Authority, ds));
             }
             None => {
                 self.proofs
@@ -526,7 +533,7 @@ impl Facts {
         &mut self,
         apex: &LowerName,
         set: &RecordSet,
-        rank: Rank,
+        rank: Section,
         denial: &[RecordSet],
     ) -> bool {
         let Some(labels) = expanded_from(set) else {
@@ -603,13 +610,13 @@ impl Facts {
     /// from a section that outranks `rank`, or `rank` is the additional
     /// section's and a filed NODATA says the owner has no such RRset.
     /// Whether it was kept.
-    fn put(&mut self, apex: &LowerName, set: RecordSet, rank: Rank) -> bool {
+    fn put(&mut self, apex: &LowerName, set: RecordSet, rank: Section) -> bool {
         let owner = LowerName::new(set.name());
         self.unabsent(apex, &owner);
         let known = self.names.entry(owner.clone()).or_default();
         let rtype = set.record_type();
         let replaces = known.sets.get(&rtype).is_none_or(|(held, _)| *held <= rank);
-        let denied = rank == Rank::Additional && known.absent.contains(&rtype);
+        let denied = rank == Section::Additional && known.absent.contains(&rtype);
         let keeps = replaces && !denied;
         if keeps {
             known.sets.insert(rtype, (rank, set));
@@ -876,7 +883,7 @@ impl LearnedView {
             known
                 .sets
                 .get(&rtype)
-                .is_some_and(|(rank, _)| *rank > Rank::Additional)
+                .is_some_and(|(rank, _)| *rank > Section::Additional)
         };
         !matches!(qtype, RecordType::ANY | RecordType::RRSIG)
             && (answers(qtype) || answers(RecordType::CNAME) || known.absent.contains(&qtype))

@@ -18,10 +18,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fictionet::Cx;
-use fictionet::stdlib::protocols::dns::label_count;
 use fictionet::stdlib::protocols::dns::op::Message;
 use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RData, Record};
-use fictionet::stdlib::services::dns::zone::Filing;
+use fictionet::stdlib::protocols::dns::{dname_substitute, label_count};
+use fictionet::stdlib::services::dns::zone::{Filing, dname_target};
 use fictionet::stdlib::services::dns::{Looked, Lookup};
 use fictionet::stdlib::world::net::dns::internet::{Egress, Location};
 use fictionet::stdlib::world::net::dns::{PerSession, Upstream};
@@ -124,7 +124,44 @@ fn filed(filing: &Filing) -> impl Iterator<Item = &Record> {
     filing
         .sets
         .iter()
-        .flat_map(|set| set.records_without_rrsigs())
+        .flat_map(|(_, set)| set.records_without_rrsigs())
+}
+
+/// The DNAME records `filing` kept, as owner and target. A zone keeps a
+/// DNAME without the CNAME synthesized from it (RFC 6672 §3.4), so what
+/// it redirects is found from the DNAME itself.
+pub(crate) fn dnames(filing: &Filing) -> impl Iterator<Item = (LowerName, Name)> + '_ {
+    filed(filing).filter_map(|record| {
+        dname_target(&record.data).map(|target| (LowerName::new(&record.name), target))
+    })
+}
+
+/// The names that a DNAME in `dnames`, its owners by target, substitutes
+/// `name` for (RFC 6672 §2.2): `name` with the target above it replaced
+/// by the DNAME's owner. A DNAME redirects only the names strictly below
+/// its owner, so its target itself is no substitute for anything.
+pub(crate) fn substituted_for(
+    dnames: &HashMap<LowerName, HashSet<LowerName>>,
+    name: &LowerName,
+) -> Vec<LowerName> {
+    let full = Name::from(name.clone());
+    let mut above = name.clone();
+    let mut found = Vec::new();
+    while !above.is_root() {
+        above = above.base_name();
+        for owner in dnames.get(&above).into_iter().flatten() {
+            // Back from the target to the owner: the same substitution,
+            // the other way round.
+            if let Some(original) = dname_substitute(
+                &full,
+                &Name::from(above.clone()),
+                &Name::from(owner.clone()),
+            ) {
+                found.push(LowerName::new(&original));
+            }
+        }
+    }
+    found
 }
 
 /// The targets of the NS and CNAME `records`, with the owner of each
@@ -171,8 +208,10 @@ fn targets<'a>(
 ///    labels, RFC 1035 §3.5) or `ip6.arpa` (at most 32 nibble labels,
 ///    RFC 3596 §2.5), or a name above one, `arpa` included;
 /// 5. the real hierarchy named it, or a name below it, while answering a
-///    question this session: an NS target, or a CNAME target, in the
-///    records a mirrored zone filed.
+///    question this session: an NS target, a CNAME target, or a DNAME
+///    target, in the records a mirrored zone filed; or it is the name a
+///    filed DNAME substitutes (RFC 6672 §2.2) for a name these rules let
+///    out.
 ///
 /// In the live modes every name `admit` takes passes rule 1, so any host
 /// name under any domain already leaves, and a name with other labels
@@ -180,7 +219,9 @@ fn targets<'a>(
 /// the live web lacks. In Copied they reach only the root, top-level
 /// domain, and reverse zone operators, or the operator of a name the
 /// guest could already ask about. Names under rule 5 were chosen by those
-/// operators, not by the guest.
+/// operators, not by the guest; a name a DNAME substitutes has the labels
+/// of a name the guest could already ask about, below a target the
+/// operator chose.
 ///
 /// [`observer`](Self::observer) feeds rule 5 from the records the mirrored
 /// zones file, which are what their servers answer with. The names it
@@ -200,11 +241,13 @@ struct OutboundInner {
 /// What the real hierarchy named this session.
 #[derive(Default)]
 struct Named {
-    /// Every NS and CNAME target the mirrored zones filed, and every name
-    /// above one.
+    /// Every NS, CNAME, and DNAME target the mirrored zones filed, and
+    /// every name above one.
     below: HashSet<LowerName>,
     /// The owners of the CNAME records the mirrored zones filed, by target.
     aliases: HashMap<LowerName, HashSet<LowerName>>,
+    /// The owners of the DNAME records the mirrored zones filed, by target.
+    dnames: HashMap<LowerName, HashSet<LowerName>>,
 }
 
 impl Outbound {
@@ -228,8 +271,8 @@ impl Outbound {
     }
 
     /// The observer for [`Mirror::observe`](fictionet::stdlib::world::net::dns::internet::Mirror::observe):
-    /// learns the NS and CNAME targets of the records each mirrored zone
-    /// files.
+    /// learns the NS, CNAME, and DNAME targets of the records each
+    /// mirrored zone files.
     pub fn observer(&self) -> impl Fn(&Filing) + Send + Sync + 'static {
         let outbound = self.clone();
         move |filing| outbound.learn(filing)
@@ -251,16 +294,18 @@ impl Outbound {
     }
 
     /// The names the mirrored zones filed as aliases of `target` this
-    /// session, through any number of CNAME records.
+    /// session, through any number of CNAME records and DNAME records: a
+    /// CNAME's owner, and the name a DNAME substitutes `target` for.
     pub fn aliases(&self, target: &LowerName) -> Vec<LowerName> {
         self.named(|named| {
             let mut found: Vec<LowerName> = Vec::new();
             let mut pending = vec![target.clone()];
             while let Some(name) = pending.pop() {
-                for owner in named.aliases.get(&name).into_iter().flatten() {
-                    if owner != target && !found.contains(owner) {
+                let owners = named.aliases.get(&name).into_iter().flatten().cloned();
+                for owner in owners.chain(substituted_for(&named.dnames, &name)) {
+                    if owner != *target && !found.contains(&owner) {
                         found.push(owner.clone());
-                        pending.push(owner.clone());
+                        pending.push(owner);
                     }
                 }
             }
@@ -268,8 +313,40 @@ impl Outbound {
         })
     }
 
-    /// Whether a question for `name` may reach a real server.
+    /// The owners of the DNAME records the mirrored zones filed this
+    /// session, by target.
+    fn dnames(&self) -> HashMap<LowerName, HashSet<LowerName>> {
+        self.named(|named| named.dnames.clone())
+    }
+
+    /// Whether a question for `name` may reach a real server: by rules 1
+    /// to 5, or as the name a filed DNAME substitutes for one they let
+    /// out, through any number of DNAME records.
     fn allows(&self, name: &LowerName) -> bool {
+        if self.lets_out(name) {
+            return true;
+        }
+        let dnames = self.dnames();
+        let mut seen = vec![name.clone()];
+        let mut pending = vec![name.clone()];
+        while let Some(name) = pending.pop() {
+            for original in substituted_for(&dnames, &name) {
+                if seen.contains(&original) {
+                    continue;
+                }
+                if self.lets_out(&original) {
+                    return true;
+                }
+                seen.push(original.clone());
+                pending.push(original);
+            }
+        }
+        false
+    }
+
+    /// Whether rules 1 to 5 let a question for `name` out, before DNAME
+    /// substitution.
+    fn lets_out(&self, name: &LowerName) -> bool {
         self.admits(name)
             || self.on_the_way(name)
             || self.underscored(name)
@@ -320,6 +397,11 @@ impl Outbound {
                 }
             }
             named.below.extend(named_and_above(filed(filing)));
+            for (owner, target) in dnames(filing) {
+                let target = LowerName::new(&target);
+                named.below.extend(and_above(&target));
+                named.dnames.entry(target).or_default().insert(owner);
+            }
         })
     }
 

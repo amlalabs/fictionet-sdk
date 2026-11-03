@@ -19,7 +19,7 @@ use fictionet::stdlib::services::dns::authority::{
     Authority, AuthorityEngine, Copies, ServerConfig, Step, Zones,
 };
 use fictionet::stdlib::services::dns::zone::{
-    Answered, AnyResponse, Denial, Filing, Learned, Zone, ZoneData, answer,
+    Answered, AnyResponse, Denial, Filing, Learned, Section, Zone, ZoneData, answer,
 };
 use fictionet::stdlib::services::dns::{
     Action, Client, ClientQuery, Engine, Generation, Input, Looked, Lookup, WallClock,
@@ -411,19 +411,22 @@ fn additional_data_from_a_wildcard_brings_no_proof() {
     }
 }
 
-/// The owner and type of each RRset `filing` kept, in order.
-fn kept(filing: &Filing) -> Vec<(String, RecordType)> {
+/// The section, owner, and type of each RRset `filing` kept, in order.
+fn kept(filing: &Filing) -> Vec<(Section, String, RecordType)> {
     filing
         .sets
         .iter()
-        .map(|set| (set.name().to_ascii(), set.record_type()))
+        .map(|(section, set)| (*section, set.name().to_ascii(), set.record_type()))
         .collect()
 }
 
 /// A filing says what the zone kept, each RRset as the real server sent
-/// it: a referral's NS RRset and in-domain glue, an answer's RRset at the
-/// name the response gave it even when a wildcard made it, and nothing
-/// for a response the zone does not keep, such as one for another zone.
+/// it with the section it came from: a referral's NS RRset from its
+/// authority section and in-domain glue from additional data, an
+/// answer's RRset from the answer section at the name the response gave
+/// it even when a wildcard made it, a name server's address from
+/// additional data, and nothing for a response the zone does not keep,
+/// such as one for another zone.
 #[test]
 fn a_filing_shows_the_rrsets_the_zone_kept() {
     let zone = signed(Denial::Nsec);
@@ -442,16 +445,23 @@ fn a_filing_shows_the_rrsets_the_zone_kept() {
     assert_eq!(
         kept(&referral),
         vec![
-            ("child.example.".to_string(), RecordType::NS),
-            ("ns.child.example.".to_string(), RecordType::A),
+            (
+                Section::Authority,
+                "child.example.".to_string(),
+                RecordType::NS
+            ),
+            (
+                Section::Additional,
+                "ns.child.example.".to_string(),
+                RecordType::A
+            ),
         ]
     );
 
     let (answer, response) = file("www.example.", RecordType::A);
-    assert!(
-        kept(&answer).contains(&("www.example.".to_string(), RecordType::A)),
-        "{:?}",
-        kept(&answer)
+    assert_eq!(
+        kept(&answer),
+        vec![(Section::Answer, "www.example.".to_string(), RecordType::A)]
     );
     let sent = response
         .answers
@@ -459,10 +469,10 @@ fn a_filing_shows_the_rrsets_the_zone_kept() {
         .filter(|record| record.record_type() == RecordType::A)
         .cloned()
         .collect::<Vec<_>>();
-    let filed = answer
+    let (_, filed) = answer
         .sets
         .iter()
-        .find(|set| set.record_type() == RecordType::A && set.name() == &name("www.example."))
+        .find(|(_, set)| set.record_type() == RecordType::A && set.name() == &name("www.example."))
         .expect("the A RRset");
     assert_eq!(
         filed.records_without_rrsigs().cloned().collect::<Vec<_>>(),
@@ -471,10 +481,31 @@ fn a_filing_shows_the_rrsets_the_zone_kept() {
     );
     assert!(!filed.rrsigs().is_empty(), "with its RRSIGs");
 
+    let (apex, _) = file("example.", RecordType::NS);
+    assert_eq!(
+        kept(&apex),
+        vec![
+            (Section::Answer, "example.".to_string(), RecordType::NS),
+            (
+                Section::Additional,
+                "ns.example.".to_string(),
+                RecordType::A
+            ),
+        ],
+        "the name server's address is additional data"
+    );
+
     let (expanded, _) = file("a.wild.example.", RecordType::A);
     assert_eq!(
-        kept(&expanded),
-        vec![("a.wild.example.".to_string(), RecordType::A)],
+        kept(&expanded)
+            .into_iter()
+            .filter(|(section, _, _)| *section == Section::Answer)
+            .collect::<Vec<_>>(),
+        vec![(
+            Section::Answer,
+            "a.wild.example.".to_string(),
+            RecordType::A
+        )],
         "at the name the response gave"
     );
 

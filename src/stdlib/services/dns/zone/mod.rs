@@ -50,7 +50,7 @@ pub use cover::cover;
 pub(crate) use cover::negative_ttl;
 pub use data::{Denied, Fact, Provider, Redirect, Revision, Shown, Transparent, View, ZoneData};
 pub use lazy::Lazy;
-pub use learned::{Filing, Learned};
+pub use learned::{Filing, Learned, Section};
 pub use master::MasterError;
 pub use signed::{Denial, Signed};
 pub(crate) use zone::targets;
