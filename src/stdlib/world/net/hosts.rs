@@ -80,6 +80,15 @@ pub trait PortServer: Any + Send + Sync {
         Vec::new()
     }
 
+    /// How the port answers each connection attempt by the options of its
+    /// SYN ([`tcp::Listener::answer_syn`]), such as an MPTCP server with
+    /// MP_CAPABLE. Asked once, when the port's listener opens, so the
+    /// server that opens a port answers for every host that shares it.
+    /// Default `None`: the endpoint's plain SYN-ACK.
+    fn answer_syn(&self) -> Option<tcp::AnswerSyn> {
+        None
+    }
+
     /// Prepares to serve `other`'s DNS `names` at the local endpoint.
     /// This must not change either server. Return a token that commits
     /// the registration without failure, scoped to `local`. Dropping
@@ -1055,11 +1064,18 @@ impl Machine {
                 Entry::Vacant(entry) => {
                     let existing = self.ports.lock().get(number).cloned();
                     let listener = if existing.is_none() {
-                        Some(
-                            self.tcp
-                                .listen(*number)
-                                .map_err(|e| format!("TCP port {number} at {addr}: {e}"))?,
-                        )
+                        let mut listener = self
+                            .tcp
+                            .listen(*number)
+                            .map_err(|e| format!("TCP port {number} at {addr}: {e}"))?;
+                        let opener = match spec {
+                            PortSpec::Tcp(accept) | PortSpec::Tls { accept, .. } => accept,
+                            PortSpec::Udp(_) => unreachable!(),
+                        };
+                        if let Some(answer) = opener.answer_syn() {
+                            listener.answer_syn(answer);
+                        }
+                        Some(listener)
                     } else {
                         None
                     };
@@ -1261,6 +1277,7 @@ async fn accept(
                     ConnInfo::new(hooks.next_conn(), conn.local_addr(), conn.peer_addr())
                         .from_sandbox(sandbox);
                 info.syn_options = conn.syn_options();
+                info.syn_ack_options = conn.syn_ack_options();
                 let accepted = fcx.now();
                 let handshake = machine.handshake;
                 let port = port.clone();

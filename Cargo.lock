@@ -1945,6 +1945,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "honeypot-world"
+version = "0.0.0"
+dependencies = [
+ "fictionet",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "html5ever"
 version = "0.25.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

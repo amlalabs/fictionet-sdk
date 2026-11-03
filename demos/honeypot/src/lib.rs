@@ -1,0 +1,202 @@
+//! A honeypot for CVE-2026-98432: a world that looks like a Linux server
+//! with an MPTCP listener, and logs everyone who tries it.
+//!
+//! CVE-2026-98432 is a use-after-free in the Linux kernel's IPv4 TCP
+//! connection setup. Anthropic showed on 2026-10-27 that it gives
+//! unauthenticated root on a server with an MPTCP listener. No exploit code
+//! is public.
+//!
+//! The world is one host at a public address ([`Config::address`]) with
+//! MPTCP listeners on its open ports: SSH with an OpenSSH identification
+//! line and HTTP with nginx's default page ([`services`]). A SYN with
+//! MP_CAPABLE gets an RFC 8684 SYN-ACK with MP_CAPABLE and a key, and an
+//! MP_JOIN gets the RST with MP_TCPRST that RFC 8684 gives ([`mptcp`]).
+//! The internet reaches the host through an attachment called `internet`
+//! routed at [`Config::internet`] with `Net::route`. Sandboxes attached
+//! under any other name join the network as usual, and reach the host
+//! through its router.
+//!
+//! Every packet that crosses any attachment, both ways, goes to a pcapng
+//! file, and a typed [`Observation`](observe::Observation) per SYN,
+//! payload, answer and burst goes to a JSON-lines log ([`observe`]). The
+//! observer sees each packet before the world's TCP does.
+//!
+//! Nothing here is a real kernel, and nothing runs what a client sends.
+//! The packets come from the internet, so the world treats every byte as
+//! hostile: each reader checks lengths, and the state kept per source or
+//! connection is removed when that source or connection is gone.
+//!
+//! | Module | Contents |
+//! | --- | --- |
+//! | [`config`] | The command line and the world's settings |
+//! | [`mptcp`] | How the listener answers MP_CAPABLE and MP_JOIN |
+//! | [`services`] | SSH and HTTP once a connection is open |
+//! | [`observe`] | The packet log and the observations |
+
+use std::sync::Arc;
+use std::task::Poll;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use fictionet::stdlib::network::ports::{Event, Ports};
+use fictionet::stdlib::world::net::{Host, Net};
+use fictionet::sync::Mutex;
+use fictionet::time::Instant;
+use fictionet::{Attachment, Attachments, Cx, End, Interface};
+
+pub mod config;
+pub mod mptcp;
+pub mod observe;
+pub mod services;
+
+pub use config::{Args, Config, Port, Service};
+use mptcp::{Listener, Tokens};
+use observe::{Direction, Observer, Sinks};
+
+/// The wall clock: the time the run's clock reads zero, so that run times
+/// become Unix times.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Clock {
+    epoch: SystemTime,
+}
+
+impl Clock {
+    /// A clock for a run that starts now.
+    pub fn starting_now() -> Clock {
+        Clock {
+            epoch: SystemTime::now(),
+        }
+    }
+
+    /// A clock for a run that started `secs` after the Unix epoch.
+    pub fn at_unix_secs(secs: u64) -> Clock {
+        Clock {
+            epoch: UNIX_EPOCH + Duration::from_secs(secs),
+        }
+    }
+
+    /// `at` in microseconds since the Unix epoch.
+    pub fn micros(&self, at: Instant) -> u64 {
+        self.since_epoch(at).as_micros() as u64
+    }
+
+    /// `at` in whole seconds since the Unix epoch.
+    pub fn unix_secs(&self, at: Instant) -> u64 {
+        self.since_epoch(at).as_secs()
+    }
+
+    fn since_epoch(&self, at: Instant) -> Duration {
+        (self.epoch + at.since_start())
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+    }
+}
+
+/// The network before it starts: the server with its ports, and the route
+/// the internet comes in by.
+pub fn network(fcx: &Cx, config: &Config, clock: Clock, tokens: &Arc<Tokens>) -> Net {
+    let mut server = Host::new("server").at(config.address);
+    server = if config.address.is_ipv4() {
+        server.ipv4_only()
+    } else {
+        server.ipv6_only()
+    };
+    for port in &config.ports {
+        server = match port.service {
+            Service::Ssh => server.port_server(
+                port.number,
+                Listener::new(fcx, tokens.clone(), services::Ssh),
+            ),
+            Service::Http => server.port_server(
+                port.number,
+                Listener::new(fcx, tokens.clone(), services::Http { clock }),
+            ),
+        };
+    }
+    Net::new()
+        .add_host(server)
+        .route("internet", config.internet)
+}
+
+/// A running honeypot, for looking at what it holds.
+#[derive(Clone)]
+pub struct Honeypot {
+    tokens: Arc<Tokens>,
+    observer: Arc<Mutex<Observer>>,
+}
+
+impl Honeypot {
+    /// How many open connections negotiated MPTCP.
+    pub fn mptcp_connections(&self) -> usize {
+        self.tokens.len()
+    }
+
+    /// How many source addresses the observer holds burst state for.
+    pub fn sources(&self) -> usize {
+        self.observer.lock().sources()
+    }
+}
+
+/// Starts the honeypot in `fcx`: the network, and a relay for every
+/// sandbox in `attachments` that writes what crosses it to `sinks`.
+/// Returns once the network is up, or fails if `config` cannot be served
+/// or the pcapng header cannot be written.
+pub fn start(
+    fcx: &Cx,
+    config: &Config,
+    clock: Clock,
+    sinks: Sinks,
+    mut attachments: Attachments,
+) -> fictionet::Result<Honeypot> {
+    let tokens = Arc::new(Tokens::default());
+    let observer = Observer::new(sinks, clock, config.burst, tokens.clone())?;
+    let observer = Arc::new(Mutex::new(observer));
+    let honeypot = Honeypot {
+        tokens: tokens.clone(),
+        observer: observer.clone(),
+    };
+    let (attacher, inner) = fictionet::attachments();
+    network(fcx, config, clock, &tokens).start(fcx, inner)?;
+    fcx.spawn(move |fcx| async move {
+        loop {
+            let sandbox = attachments.next(&fcx).await?;
+            // A name still held by a relay that has not seen its sandbox
+            // go yet is refused, and the new sandbox is cut off.
+            let Ok(end) = attacher.attach(sandbox.name()) else {
+                continue;
+            };
+            let observer = observer.clone();
+            fcx.spawn(move |fcx| relay(fcx, sandbox, end, observer));
+        }
+    });
+    Ok(honeypot)
+}
+
+/// Passes packets between a sandbox and the network, writing each one
+/// first. Ends when either side closes. A write that fails ends the run:
+/// the honeypot does not run without its log.
+async fn relay(
+    fcx: Cx,
+    sandbox: Attachment,
+    end: End,
+    observer: Arc<Mutex<Observer>>,
+) -> fictionet::Result {
+    let name: Arc<str> = sandbox.name().into();
+    let mut ports = Ports::new(vec![Box::new(sandbox) as Box<dyn Interface>, Box::new(end)]);
+    loop {
+        match ports.next(&fcx, None, |_| Poll::Pending).await? {
+            Event::Packet(side, packet) => {
+                let direction = if side == 0 {
+                    Direction::In
+                } else {
+                    Direction::Out
+                };
+                observer
+                    .lock()
+                    .packet(&name, direction, &packet.0, fcx.now())?;
+                ports.send(1 - side, packet);
+            }
+            Event::Timer | Event::Extra => {}
+            Event::Closed(_) => return Ok(()),
+        }
+    }
+}

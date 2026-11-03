@@ -198,6 +198,10 @@ pub struct ConnInfo {
     /// The options of the peer's SYN, in the order it sent them, for a
     /// TCP connection.
     pub syn_options: Arc<[TcpOption]>,
+    /// The options the listener added to its SYN-ACK
+    /// ([`Listener::answer_syn`](crate::stdlib::network::tcp::Listener::answer_syn)),
+    /// in order, for a TCP connection.
+    pub syn_ack_options: Arc<[TcpOption]>,
     /// Whether the bytes arrived over TLS.
     pub tls: bool,
     /// The name the client sent in its TLS hello, in lowercase.
@@ -2394,6 +2398,7 @@ where
             };
             let mut info = ConnInfo::new(ids + 1, conn.local_addr(), conn.peer_addr());
             info.syn_options = conn.syn_options();
+            info.syn_ack_options = conn.syn_ack_options();
             info.sandbox = info
                 .peer
                 .and_then(|peer| opts.sandbox.as_ref().and_then(|f| f(peer.ip())));

@@ -1,0 +1,19 @@
+[package]
+name = "honeypot-world"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+description = "A Linux server with an MPTCP listener that logs everyone who tries it."
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "honeypot"
+path = "src/main.rs"
+
+[dependencies]
+fictionet = { path = "../.." }
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"

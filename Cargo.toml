@@ -13,6 +13,7 @@ members = [
     "demos/search/app",
     "demos/search/world",
     "demos/nuclear/world",
+    "demos/honeypot",
     "smoltcp",
     "xtask",
 ]

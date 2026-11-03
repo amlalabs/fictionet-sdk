@@ -1049,6 +1049,114 @@ mod tests {
         .unwrap();
     }
 
+    /// Answers each SYN with one option, and records what it serves.
+    struct Answers {
+        from: Arc<Mutex<Vec<ConnInfo>>>,
+    }
+
+    impl PortServer for Answers {
+        fn serve(
+            &self,
+            _: Cx,
+            arrival: Arrival,
+        ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> {
+            self.from.lock().push(arrival.info);
+            Box::pin(async {})
+        }
+
+        fn answer_syn(&self) -> Option<tcp::AnswerSyn> {
+            Some(Box::new(|syn: &[tcp::TcpOption]| {
+                if syn.contains(&tcp::TcpOption::Unknown { kind: 253, data: vec![1] }) {
+                    tcp::SynAnswer::Refuse(vec![tcp::TcpOption::Unknown {
+                        kind: 253,
+                        data: vec![0],
+                    }])
+                } else {
+                    tcp::SynAnswer::Accept(vec![tcp::TcpOption::Unknown {
+                        kind: 253,
+                        data: vec![9],
+                    }])
+                }
+            }))
+        }
+    }
+
+    /// A host's port server answers the SYNs its port gets: a SYN-ACK with
+    /// its options, which the connection's ConnInfo keeps, or a RST.
+    #[test]
+    fn a_port_server_answers_syns() {
+        fictionet::block_on(fictionet::lab(
+            fictionet::Seed::from_u64(1),
+            |fcx| async move {
+                let server = Ipv4Addr::new(10, 40, 0, 1);
+                let from = Arc::new(Mutex::new(Vec::new()));
+                let (attacher, attachments) = fictionet::attachments();
+                Net::new()
+                    .ipv4_only()
+                    .host("svc", |h| h.at(server).port_server(22, Answers { from: from.clone() }))
+                    .route("internet", "198.51.100.0/24".parse()?)
+                    .start(&fcx, attachments)?;
+                let mut internet = attacher.attach("internet")?;
+                let client = Ipv4Addr::new(198, 51, 100, 7);
+                let syn = |port: u16, seq: u32, ack: u32, flags: u8, options: &[u8]| {
+                    let mut t = vec![0u8; 20];
+                    t[0..2].copy_from_slice(&port.to_be_bytes());
+                    t[2..4].copy_from_slice(&22u16.to_be_bytes());
+                    t[4..8].copy_from_slice(&seq.to_be_bytes());
+                    t[8..12].copy_from_slice(&ack.to_be_bytes());
+                    t[12] = ((20 + options.len()) / 4) as u8 * 16;
+                    t[13] = flags;
+                    t[14..16].copy_from_slice(&65535u16.to_be_bytes());
+                    t.extend_from_slice(options);
+                    let sum = ip::transport_checksum(client.into(), server.into(), PROTO_TCP, &t);
+                    t[16..18].copy_from_slice(&sum.to_be_bytes());
+                    ip::packet(client.into(), server.into(), PROTO_TCP, &t)
+                };
+                let tcp_of = |p: &fictionet::Packet| p.0[20..].to_vec();
+
+                internet.send(syn(4000, 100, 0, 0x02, &[253, 3, 2, 0]));
+                let syn_ack = tcp_of(&internet.recv(&fcx).await?);
+                assert_eq!(syn_ack[13], 0x12);
+                let answered = tcp::options(&syn_ack).unwrap();
+                assert_eq!(
+                    answered.last(),
+                    Some(&tcp::TcpOption::Unknown { kind: 253, data: vec![9] })
+                );
+                let iss = u32::from_be_bytes(syn_ack[4..8].try_into().unwrap());
+                internet.send(syn(4000, 101, iss.wrapping_add(1), 0x10, &[]));
+
+                internet.send(syn(4001, 100, 0, 0x02, &[253, 3, 1, 0]));
+                let refused = loop {
+                    let t = tcp_of(&internet.recv(&fcx).await?);
+                    if t[0..4] == [0, 22, 0x0f, 0xa1] {
+                        break t;
+                    }
+                };
+                assert_eq!(refused[13] & 0x06, 0x04, "a RST");
+                assert_eq!(
+                    tcp::options(&refused),
+                    Ok(vec![tcp::TcpOption::Unknown { kind: 253, data: vec![0] }])
+                );
+                fcx.sleep(Duration::from_secs(1)).await?;
+                let from = from.lock();
+                assert_eq!(from.len(), 1, "the refused attempt is never served");
+                assert_eq!(from[0].peer, Some(SocketAddr::new(client.into(), 4000)));
+                assert_eq!(
+                    *from[0].syn_options,
+                    [tcp::TcpOption::Unknown { kind: 253, data: vec![2] }]
+                );
+                assert_eq!(
+                    *from[0].syn_ack_options,
+                    [tcp::TcpOption::Unknown { kind: 253, data: vec![9] }]
+                );
+                drop(from);
+                fcx.cancel();
+                Ok(())
+            },
+        ))
+        .unwrap();
+    }
+
     #[test]
     fn closed_udp_ports_use_the_declared_datagram_boundary() {
         for (src, dst) in [

@@ -13,9 +13,11 @@ use std::time::Duration;
 
 use fictionet::stdlib::codec::{Ending, LineError, Lines, Wire};
 use fictionet::stdlib::network::ip::{Fields, packet_with, transport_checksum};
-use fictionet::stdlib::network::tcp::{self, SYN_OPTIONS_ROOM, TcpOption};
+use fictionet::stdlib::network::tcp::{self, SYN_OPTIONS_ROOM, SynAnswer, TcpOption};
 use fictionet::stdlib::network::{Accepted, ConnectionExt};
-use fictionet::stdlib::protocols::mptcp::{self, Capable, Keys, MptcpOption, algorithm};
+use fictionet::stdlib::protocols::mptcp::{
+    self, Capable, Join, Keys, MptcpOption, algorithm, reason,
+};
 use fictionet::stdlib::services::serve::{self, Flow};
 use fictionet::{Cx, End, Interface, InterfaceExt, Packet, pair};
 use fictionet_test_support::timeout;
@@ -111,7 +113,7 @@ fn linux_syn_options() -> Vec<TcpOption> {
 
 /// Answers an MP_CAPABLE SYN as an RFC 8684 listener does: the same
 /// version and flags, HMAC-SHA256, and its key.
-fn answer_mp_capable(syn: &[TcpOption]) -> Vec<TcpOption> {
+fn answer_mp_capable(syn: &[TcpOption]) -> SynAnswer {
     let offer = syn.iter().find_map(|o| match o {
         TcpOption::Unknown { kind, data } if *kind == mptcp::KIND => match MptcpOption::parse(data)
         {
@@ -121,17 +123,17 @@ fn answer_mp_capable(syn: &[TcpOption]) -> Vec<TcpOption> {
         _ => None,
     });
     let Some(offer) = offer else {
-        return Vec::new();
+        return SynAnswer::Accept(Vec::new());
     };
     let answer = MptcpOption::Capable(Capable {
         algorithms: algorithm::HMAC_SHA256,
         keys: Keys::Sender(KEY),
         ..offer
     });
-    vec![TcpOption::Unknown {
+    SynAnswer::Accept(vec![TcpOption::Unknown {
         kind: mptcp::KIND,
         data: answer.to_bytes().unwrap(),
-    }]
+    }])
 }
 
 #[test]
@@ -189,6 +191,11 @@ fn syn_options_reach_the_connection_and_the_syn_ack_answers_mptcp() {
         assert_eq!(conn.peer_addr(), SocketAddr::new(ip(PEER), 4000));
         assert_eq!(*conn.syn_options(), *linux_syn_options());
         assert_eq!(*Accepted::syn_options(&conn), *linux_syn_options());
+        let SynAnswer::Accept(answered) = answer_mp_capable(&linux_syn_options()) else {
+            unreachable!()
+        };
+        assert_eq!(*conn.syn_ack_options(), *answered);
+        assert_eq!(*Accepted::syn_ack_options(&conn), *answered);
         Ok(())
     });
 }
@@ -208,6 +215,7 @@ fn a_listener_without_an_answer_adds_nothing() {
         raw.send(segment(4000, 1001, iss.wrapping_add(1), ACK, &[]));
         let conn = listener.accept(&fcx).await?;
         assert_eq!(*conn.syn_options(), *linux_syn_options());
+        assert!(conn.syn_ack_options().is_empty());
         Ok(())
     });
 }
@@ -326,7 +334,7 @@ fn an_answer_that_cannot_be_sent_resets_the_attempt() {
             let server = tcp::endpoint(&fcx, side, ip(SERVER));
             let mut listener = server.listen(80)?;
             let expected = answer.clone();
-            listener.answer_syn(move |_| answer.clone());
+            listener.answer_syn(move |_| SynAnswer::Accept(answer.clone()));
             raw.send(segment(4000, 1000, 0, SYN, &LINUX_SYN));
             let reply = next(&fcx, &mut raw).await.expect("an answer");
             let t = tcp_of(&reply);
@@ -342,7 +350,7 @@ fn an_answer_that_cannot_be_sent_resets_the_attempt() {
             } else {
                 assert_eq!(t[13] & RST, RST, "{expected:?}");
                 // The listener still answers the next attempt.
-                listener.answer_syn(|_| Vec::new());
+                listener.answer_syn(|_| SynAnswer::Accept(Vec::new()));
                 raw.send(segment(4001, 1000, 0, SYN, &LINUX_SYN));
                 let reply = next(&fcx, &mut raw).await.expect("a SYN-ACK");
                 assert_eq!(tcp_of(&reply)[13], SYN | ACK);
@@ -350,6 +358,101 @@ fn an_answer_that_cannot_be_sent_resets_the_attempt() {
             Ok(())
         });
     }
+}
+
+/// An MP_JOIN SYN refused as an MPTCP listener refuses one: a RST that
+/// carries MP_TCPRST. The attempt never reaches accept, and the next one
+/// is answered.
+#[test]
+fn a_refused_attempt_gets_a_rst_with_the_answer_s_options() {
+    world(Duration::from_secs(10), |fcx| async move {
+        let (mut raw, side) = pair();
+        let server = tcp::endpoint(&fcx, side, ip(SERVER));
+        let mut listener = server.listen(80)?;
+        let tcprst = MptcpOption::TcpRst {
+            transient: false,
+            reason: reason::ADMINISTRATIVELY_PROHIBITED,
+        };
+        let refusal = TcpOption::Unknown {
+            kind: mptcp::KIND,
+            data: tcprst.to_bytes().unwrap(),
+        };
+        let answer = refusal.clone();
+        listener.answer_syn(move |syn| {
+            let join = syn.iter().any(|o| match o {
+                TcpOption::Unknown { kind, data } if *kind == mptcp::KIND => {
+                    matches!(MptcpOption::parse(data), Ok(MptcpOption::Join(_)))
+                }
+                _ => false,
+            });
+            if join {
+                SynAnswer::Refuse(vec![answer.clone()])
+            } else {
+                SynAnswer::Accept(Vec::new())
+            }
+        });
+        let join = MptcpOption::Join(Join::Syn {
+            backup: false,
+            address_id: 1,
+            token: 0x55c5_3f5d,
+            random: 7,
+        })
+        .to_bytes()
+        .unwrap();
+        let mut area = vec![mptcp::KIND, join.len() as u8 + 2];
+        area.extend_from_slice(&join);
+        raw.send(segment(4000, 1000, 0, SYN, &area));
+        let reply = next(&fcx, &mut raw).await.expect("a RST");
+        let t = tcp_of(&reply);
+        assert_eq!(t[13] & (SYN | RST), RST);
+        assert_eq!(t[13] & ACK, ACK);
+        assert_eq!(u32::from_be_bytes(t[8..12].try_into().unwrap()), 1001);
+        assert_eq!(
+            tcp::options(t),
+            Ok(vec![refusal]),
+            "the RST carries MP_TCPRST"
+        );
+        assert!(
+            next(&fcx, &mut raw).await.is_none(),
+            "one RST, then nothing"
+        );
+
+        raw.send(segment(4001, 1000, 0, SYN, &LINUX_SYN));
+        let syn_ack = next(&fcx, &mut raw).await.expect("a SYN-ACK");
+        let t = tcp_of(&syn_ack);
+        assert_eq!(t[13], SYN | ACK);
+        let iss = u32::from_be_bytes(t[4..8].try_into().unwrap());
+        raw.send(segment(4001, 1001, iss.wrapping_add(1), ACK, &[]));
+        let conn = listener.accept(&fcx).await?;
+        assert_eq!(
+            conn.peer_addr().port(),
+            4001,
+            "the refused one never reached accept"
+        );
+        Ok(())
+    });
+}
+
+/// `tcp::options` reads what a segment carries, up to the first malformed
+/// option, and refuses a header length that does not fit.
+#[test]
+fn options_reads_any_bytes() {
+    let syn = segment(4000, 1000, 0, SYN, &LINUX_SYN);
+    assert_eq!(tcp::options(tcp_of(&syn)), Ok(linux_syn_options()));
+    let broken = segment(4000, 1000, 0, SYN, &[1, 2, 4, 5, 0xb4, 30, 9, 0]);
+    assert_eq!(
+        tcp::options(tcp_of(&broken)),
+        Err(tcp::OptionsError::Malformed(vec![
+            TcpOption::NoOperation,
+            TcpOption::MaxSegmentSize(1460)
+        ]))
+    );
+    let t = tcp_of(&syn);
+    assert_eq!(tcp::options(&t[..30]), Err(tcp::OptionsError::Header));
+    assert_eq!(tcp::options(&t[..10]), Err(tcp::OptionsError::Header));
+    let mut short = t.to_vec();
+    short[12] = 4 << 4;
+    assert_eq!(tcp::options(&short), Err(tcp::OptionsError::Header));
 }
 
 /// SYNs with every kind of broken or odd option list get a well-formed

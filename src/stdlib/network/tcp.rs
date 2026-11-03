@@ -196,19 +196,73 @@ impl TcpOption {
     }
 }
 
-/// The options of `segment`, a TCP segment that smoltcp parsed.
-fn segment_options(segment: &[u8]) -> Arc<[TcpOption]> {
-    let Ok(options) = TcpPacket::new_unchecked(segment).options_iter() else {
-        return Arc::default();
-    };
-    options
-        .map_while(Result::ok)
-        .filter_map(TcpOption::from_wire)
-        .collect()
+/// Why [`options`] could not read all of a segment's options.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OptionsError {
+    /// The segment is shorter than 20 bytes or than its header length
+    /// says, or its header length is under 20 bytes.
+    Header,
+    /// An option's Length is under 2 or runs past the header. Holds the
+    /// options before it, which read correctly.
+    Malformed(Vec<TcpOption>),
 }
 
-/// What [`Listener::answer_syn`] keeps.
-type AnswerSyn = Box<dyn Fn(&[TcpOption]) -> Vec<TcpOption> + Send>;
+impl std::fmt::Display for OptionsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OptionsError::Header => f.write_str("TCP header length does not fit the segment"),
+            OptionsError::Malformed(read) => {
+                write!(f, "TCP option malformed after {} good ones", read.len())
+            }
+        }
+    }
+}
+
+impl std::error::Error for OptionsError {}
+
+/// The options in the header of `segment`, a TCP segment from its first
+/// header byte, in the order they were sent. Reading stops at End of
+/// Option List. The checks are those the world's TCP makes, so any bytes
+/// may be passed, such as a packet straight off an attachment.
+pub fn options(segment: &[u8]) -> Result<Vec<TcpOption>, OptionsError> {
+    let iter = TcpPacket::new_unchecked(segment)
+        .options_iter()
+        .map_err(|_| OptionsError::Header)?;
+    let mut read = Vec::new();
+    for option in iter {
+        match option {
+            Ok(option) => read.extend(TcpOption::from_wire(option)),
+            Err(_) => return Err(OptionsError::Malformed(read)),
+        }
+    }
+    Ok(read)
+}
+
+/// The options of `segment`, a TCP segment that smoltcp parsed, up to the
+/// first malformed one.
+fn segment_options(segment: &[u8]) -> Arc<[TcpOption]> {
+    match options(segment) {
+        Ok(read) | Err(OptionsError::Malformed(read)) => read.into(),
+        Err(OptionsError::Header) => Arc::default(),
+    }
+}
+
+/// How a listener answers one connection attempt: what
+/// [`Listener::answer_syn`] returns for its SYN.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SynAnswer {
+    /// Answer with a SYN-ACK that carries these options after the
+    /// endpoint's own. An empty list is the SYN-ACK the endpoint sends
+    /// with no answer set.
+    Accept(Vec<TcpOption>),
+    /// Refuse with a RST that carries these options, as an MPTCP host
+    /// refuses a subflow with MP_TCPRST (RFC 8684 section 3.6). The
+    /// attempt never reaches `accept`.
+    Refuse(Vec<TcpOption>),
+}
+
+/// A function for [`Listener::answer_syn`], boxed.
+pub type AnswerSyn = Box<dyn Fn(&[TcpOption]) -> SynAnswer + Send>;
 
 /// Starts TCP for a machine with address `addr`, on the TCP packets of
 /// `inner`.
@@ -598,6 +652,8 @@ struct Conn {
     unreachable: Option<u8>,
     /// The options of the peer's SYN, for a connection a listener took.
     syn: Arc<[TcpOption]>,
+    /// The options the listener's answer added to the SYN-ACK.
+    syn_ack: Arc<[TcpOption]>,
     /// Kept until retirement or socket removal, after handle drop too: see
     /// [`TcpConnection::hold_until_gone`].
     held: Vec<Box<dyn std::any::Any + Send>>,
@@ -625,6 +681,7 @@ impl Conn {
             iss: None,
             unreachable: None,
             syn: Arc::default(),
+            syn_ack: Arc::default(),
             held: Vec::new(),
             gone: Vec::new(),
         }
@@ -1164,12 +1221,26 @@ impl State {
                 let answer = l.answer.as_ref().map(|answer| answer(&syn_options));
                 let mut conn = Conn::new(local, remote, Side::Server);
                 conn.syn = syn_options;
+                if let Some(SynAnswer::Accept(options)) = &answer {
+                    conn.syn_ack = options.as_slice().into();
+                }
                 self.conns.insert(h, conn);
                 self.by_tuple.insert((local, remote), h);
-                if let Some(answer) = answer {
-                    let wire: Option<Vec<_>> = answer.iter().map(TcpOption::to_wire).collect();
-                    let set = wire.map(|wire| self.sock(h).set_syn_options(&wire));
-                    if set != Some(Ok(())) {
+                match answer {
+                    None => {}
+                    Some(SynAnswer::Accept(options)) => {
+                        let wire: Option<Vec<_>> = options.iter().map(TcpOption::to_wire).collect();
+                        let set = wire.map(|wire| self.sock(h).set_syn_options(&wire));
+                        if set != Some(Ok(())) {
+                            self.abort(h);
+                        }
+                    }
+                    Some(SynAnswer::Refuse(options)) => {
+                        // Options that cannot be sent leave a plain RST.
+                        let wire: Option<Vec<_>> = options.iter().map(TcpOption::to_wire).collect();
+                        if let Some(wire) = wire {
+                            let _ = self.sock(h).set_rst_options(&wire);
+                        }
                         self.abort(h);
                     }
                 }
@@ -1513,6 +1584,7 @@ impl Endpoint {
                 local,
                 remote: to,
                 syn_options: Arc::default(),
+                syn_ack_options: Arc::default(),
                 read_wait: CancelWait::default(),
                 write_wait: CancelWait::default(),
             }
@@ -1557,21 +1629,25 @@ pub struct Listener {
 }
 
 impl Listener {
-    /// Adds options to the SYN-ACK of each connection attempt from now on,
-    /// and to its retransmissions. `answer` gets the options of the
-    /// attempt's SYN and returns the ones to add after the endpoint's own
-    /// (Maximum Segment Size, and Window Scale and SACK-Permitted when the
-    /// SYN offered them). A server for MPTCP (RFC 8684) answers an
-    /// MP_CAPABLE option with its own here. `answer` runs once per
-    /// attempt: a copy of the SYN does not run it again.
+    /// Answers each connection attempt from now on by the options of its
+    /// SYN. [`SynAnswer::Accept`] adds options to the SYN-ACK and its
+    /// retransmissions, after the endpoint's own (Maximum Segment Size, and
+    /// Window Scale and SACK-Permitted when the SYN offered them).
+    /// [`SynAnswer::Refuse`] resets the attempt with a RST that carries
+    /// options. A server for MPTCP (RFC 8684) answers an MP_CAPABLE option
+    /// with its own here, and refuses an MP_JOIN it will not take with
+    /// MP_TCPRST. `answer` runs once per attempt: a copy of the SYN does
+    /// not run it again. The accepted connection keeps what was added
+    /// ([`TcpConnection::syn_ack_options`]).
     ///
     /// `answer` runs inside the endpoint with its lock held, so it must not
-    /// use the endpoint or its connections. What it returns must fit in
-    /// [`SYN_OPTIONS_ROOM`] bytes and read back as written: an
+    /// use the endpoint or its connections. The options it returns must
+    /// fit in [`SYN_OPTIONS_ROOM`] bytes and read back as written: an
     /// [`Unknown`](TcpOption::Unknown) option may not have kind 0 or 1 or
     /// the bytes of a known option, and SACK has one to four blocks.
-    /// Otherwise that attempt gets a RST.
-    pub fn answer_syn(&mut self, answer: impl Fn(&[TcpOption]) -> Vec<TcpOption> + Send + 'static) {
+    /// Otherwise an accepted attempt gets a RST, and a refused one a RST
+    /// without them.
+    pub fn answer_syn(&mut self, answer: impl Fn(&[TcpOption]) -> SynAnswer + Send + 'static) {
         let mut st = self.shared.state.lock();
         st.listeners
             .get_mut(&self.port)
@@ -1610,7 +1686,8 @@ impl Listener {
                     .expect("a listener has its port");
                 if let Some(h) = l.ready.pop_front() {
                     let c = &st.conns[&h];
-                    let (local, remote, syn_options) = (c.local, c.remote, c.syn.clone());
+                    let (local, remote) = (c.local, c.remote);
+                    let (syn_options, syn_ack_options) = (c.syn.clone(), c.syn_ack.clone());
                     st.listeners
                         .get_mut(&port)
                         .expect("a listener has its port")
@@ -1621,6 +1698,7 @@ impl Listener {
                         local,
                         remote,
                         syn_options,
+                        syn_ack_options,
                         read_wait: CancelWait::default(),
                         write_wait: CancelWait::default(),
                     }));
@@ -1660,6 +1738,10 @@ impl fictionet::stdlib::network::Accepted for TcpConnection {
         TcpConnection::syn_options(self)
     }
 
+    fn syn_ack_options(&self) -> Arc<[TcpOption]> {
+        TcpConnection::syn_ack_options(self)
+    }
+
     fn reset(self) {
         TcpConnection::reset(self);
     }
@@ -1696,6 +1778,7 @@ pub struct TcpConnection {
     local: SocketAddr,
     remote: SocketAddr,
     syn_options: Arc<[TcpOption]>,
+    syn_ack_options: Arc<[TcpOption]>,
     read_wait: CancelWait,
     write_wait: CancelWait,
 }
@@ -1716,6 +1799,13 @@ impl TcpConnection {
     /// opened.
     pub fn syn_options(&self) -> Arc<[TcpOption]> {
         self.syn_options.clone()
+    }
+
+    /// The options the listener's [answer](Listener::answer_syn) added to
+    /// the SYN-ACK, in order. Empty when it added none, and for a
+    /// connection this side opened.
+    pub fn syn_ack_options(&self) -> Arc<[TcpOption]> {
+        self.syn_ack_options.clone()
     }
 
     /// Closes the connection with a RST immediately and wakes disappearance
@@ -2795,6 +2885,7 @@ mod tests {
                     local,
                     remote: peer,
                     syn_options: Arc::default(),
+                    syn_ack_options: Arc::default(),
                     read_wait: CancelWait::default(),
                     write_wait: CancelWait::default(),
                 };

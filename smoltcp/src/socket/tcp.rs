@@ -86,7 +86,8 @@ impl Display for RecvError {
 
 impl core::error::Error for RecvError {}
 
-/// Error returned by [`Socket::set_syn_options`]
+/// Error returned by [`Socket::set_syn_options`] and
+/// [`Socket::set_rst_options`]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum SynOptionsError {
     /// They take more than [`SYN_OPTIONS_ROOM`] bytes.
@@ -106,6 +107,27 @@ impl Display for SynOptionsError {
 }
 
 impl core::error::Error for SynOptionsError {}
+
+/// Encodes options for a SYN, SYN-ACK or RST, checking that they fit in
+/// [`SYN_OPTIONS_ROOM`] and read back as themselves.
+fn encode_options(options: &[TcpOption]) -> Result<Vec<u8>, SynOptionsError> {
+    let len: usize = options.iter().map(TcpOption::buffer_len).sum();
+    if len > SYN_OPTIONS_ROOM {
+        return Err(SynOptionsError::TooLong);
+    }
+    let mut encoded = vec![0; len];
+    let mut rest = &mut encoded[..];
+    for option in options {
+        rest = option.emit(rest);
+    }
+    if !TcpOptions::new(&encoded)
+        .map(|o| o.ok())
+        .eq(options.iter().map(|&o| Some(o)))
+    {
+        return Err(SynOptionsError::Unreadable);
+    }
+    Ok(encoded)
+}
 
 /// The option bytes a SYN or SYN-ACK always has room for beside the
 /// socket's own: Maximum Segment Size (4), Window Scale (3),
@@ -512,6 +534,10 @@ pub struct Socket<'a> {
     /// [`Socket::set_syn_options`].
     syn_options: Vec<u8>,
 
+    /// Options added to the RST of an abort, encoded: see
+    /// [`Socket::set_rst_options`].
+    rst_options: Vec<u8>,
+
     rx_waker: WakerRegistration,
 
     tx_waker: WakerRegistration,
@@ -577,6 +603,7 @@ impl<'a> Socket<'a> {
             last_remote_tsval: 0,
             congestion_controller: reno::Reno::new(),
             syn_options: Vec::new(),
+            rst_options: Vec::new(),
 
             rx_waker: WakerRegistration::new(),
 
@@ -603,22 +630,19 @@ impl<'a> Socket<'a> {
     /// Fails, changing nothing, if they take more than
     /// [`SYN_OPTIONS_ROOM`] bytes or one would not read back as written.
     pub fn set_syn_options(&mut self, options: &[TcpOption]) -> Result<(), SynOptionsError> {
-        let len: usize = options.iter().map(TcpOption::buffer_len).sum();
-        if len > SYN_OPTIONS_ROOM {
-            return Err(SynOptionsError::TooLong);
-        }
-        let mut encoded = vec![0; len];
-        let mut rest = &mut encoded[..];
-        for option in options {
-            rest = option.emit(rest);
-        }
-        if !TcpOptions::new(&encoded)
-            .map(|o| o.ok())
-            .eq(options.iter().map(|&o| Some(o)))
-        {
-            return Err(SynOptionsError::Unreadable);
-        }
-        self.syn_options = encoded;
+        self.syn_options = encode_options(options)?;
+        Ok(())
+    }
+
+    /// Adds `options` to the RST this socket sends when it is next
+    /// [aborted](Socket::abort), as an MPTCP host puts MP_TCPRST on a RST
+    /// that refuses a subflow (RFC 8684 section 3.6). The socket drops them
+    /// once that RST is sent, or when it forgets the connection.
+    ///
+    /// Fails, changing nothing, as [`set_syn_options`](Socket::set_syn_options)
+    /// does: a RST has the same room.
+    pub fn set_rst_options(&mut self, options: &[TcpOption]) -> Result<(), SynOptionsError> {
+        self.rst_options = encode_options(options)?;
         Ok(())
     }
 
@@ -846,6 +870,7 @@ impl<'a> Socket<'a> {
         self.last_remote_tsval = 0;
         self.congestion_controller = reno::Reno::new();
         self.syn_options = Vec::new();
+        self.rst_options = Vec::new();
 
         {
             self.rx_waker.wake();
@@ -2142,6 +2167,7 @@ impl<'a> Socket<'a> {
             // with a specified endpoint, it means that the socket was aborted.
             State::Closed => {
                 repr.control = TcpControl::Rst;
+                repr.extra = &self.rst_options;
             }
 
             // We never transmit anything in the LISTEN state.
@@ -2311,6 +2337,7 @@ impl<'a> Socket<'a> {
         if self.state == State::Closed {
             // When aborting a connection, forget about it after sending a single RST packet.
             self.tuple = None;
+            self.rst_options = Vec::new();
 
             {
                 // Wake tx now so that async users can wait for the RST to be sent
@@ -3332,6 +3359,60 @@ mod test {
             assert_eq!(repr.ack_number, Some(REMOTE_SEQ + 1));
             assert_eq!(repr.extra, &[]);
         });
+    }
+
+    /// MP_TCPRST (RFC 8684 section 3.6): kind 30, length 4, subtype 8,
+    /// reason 3, "administratively prohibited".
+    const MP_TCPRST: TcpOption<'static> = TcpOption::Unknown {
+        kind: 30,
+        data: &[0x80, 0x03],
+    };
+
+    #[test]
+    fn test_rst_options_ride_the_abort_rst_once() {
+        let mut s = socket_syn_received();
+        s.set_syn_options(&[MP_CAPABLE]).unwrap();
+        s.set_rst_options(&[MP_TCPRST]).unwrap();
+        s.abort();
+        recv(&mut s, Instant::from_millis(0), |repr| {
+            let repr = repr.unwrap();
+            assert_eq!(repr.control, TcpControl::Rst);
+            assert_eq!(repr.extra, &[30, 4, 0x80, 0x03]);
+        });
+        assert_eq!(s.tuple, None);
+        assert!(s.rst_options.is_empty());
+
+        // A later abort of another connection sends a plain RST.
+        let mut s = socket_established();
+        s.set_rst_options(&[MP_TCPRST]).unwrap();
+        s.reset();
+        assert!(s.rst_options.is_empty());
+        let mut s = socket_established();
+        s.abort();
+        recv(&mut s, Instant::from_millis(0), |repr| {
+            let repr = repr.unwrap();
+            assert_eq!(repr.control, TcpControl::Rst);
+            assert_eq!(repr.extra, &[]);
+        });
+    }
+
+    #[test]
+    fn test_rst_options_that_cannot_be_sent_are_refused() {
+        let mut s = socket_syn_received();
+        s.set_rst_options(&[MP_TCPRST]).unwrap();
+        let too_long = TcpOption::Unknown {
+            kind: 253,
+            data: &[0; SYN_OPTIONS_ROOM][..SYN_OPTIONS_ROOM - 1],
+        };
+        assert_eq!(
+            s.set_rst_options(&[too_long]),
+            Err(SynOptionsError::TooLong)
+        );
+        assert_eq!(
+            s.set_rst_options(&[TcpOption::EndOfList]),
+            Err(SynOptionsError::Unreadable)
+        );
+        assert_eq!(s.rst_options, [30, 4, 0x80, 0x03]);
     }
 
     #[test]
