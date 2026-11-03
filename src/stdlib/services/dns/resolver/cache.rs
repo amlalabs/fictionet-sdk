@@ -344,7 +344,8 @@ struct Stored {
 ///   negative answers without an SOA (RFC 2308 §5).
 /// - A negative answer lives min(SOA TTL, MINIMUM) (RFC 2308 §5), and no
 ///   longer than the NSEC or NSEC3 records that prove it (RFC 9077 §3).
-/// - A Secure RRset lives no longer than its RRSIGs (RFC 4035 §5.3.3).
+/// - A Secure RRset lives no longer than the RRSIGs that verified it
+///   (RFC 4035 §5.3.3).
 /// - A failure lives [`Limits::failure_ttl`] (RFC 9520 §3.2), and so does
 ///   data that validated Bogus or Indeterminate.
 /// - Data replaces a live entry for its key only at equal or higher
@@ -356,8 +357,9 @@ struct Stored {
 ///   servers. Data or NODATA at a name ends a live NXDOMAIN at that name
 ///   or above it at no higher rank, under every type it is kept under,
 ///   since the name exists after all (RFC 8020 §2). An NXDOMAIN replaces
-///   the entry of the type it answered, and is not kept at all when that
-///   entry is live data of higher rank.
+///   the entry of the type it answered, and is not kept at all when live
+///   data or NODATA of higher rank, of any type, at the name or below it
+///   shows the name exists.
 /// - Every entry records the generation that wrote it, and a new
 ///   generation starts empty.
 #[derive(Clone, Debug)]
@@ -412,12 +414,11 @@ impl Cache {
         let Some((key, entry)) = self.entry_for(now, offer) else {
             return;
         };
-        // Live data of higher rank for the type it answered shows the
-        // name exists, so such an NXDOMAIN is not kept at all.
+        // Live data or NODATA of higher rank at the name, of any type, or
+        // at a name below it shows the name exists, so such an NXDOMAIN
+        // is not kept at all.
         if let Some(asked) = &asked
-            && self
-                .live(asked, now)
-                .is_some_and(|old| entry.rank() < old.rank())
+            && self.shows_exists(asked, entry.rank(), now)
         {
             return;
         }
@@ -589,12 +590,12 @@ impl Cache {
     ///
     /// A Secure RRset then lives no longer than `signatures_expire`, the
     /// first expiration of the RRSIGs that proved it, nor longer than
-    /// `original_ttl`, the smallest Original TTL in those RRSIGs, from when
-    /// it was stored (RFC 4035 §5.3.3). The RRSIGs' own TTLs already
-    /// count toward the RRset's TTL. A Bogus or Indeterminate RRset lives
-    /// no longer than [`Limits::failure_ttl`]: the result is a failure, so
-    /// it is answered as one for that long and then fetched and validated
-    /// again (RFC 9520 §3.2, RFC 4035 §4.7). The result of an NXDOMAIN,
+    /// `ttl`, the smallest own TTL or Original TTL among those RRSIGs, from
+    /// when it was stored (RFC 4035 §5.3.3). RRSIGs that did not prove it
+    /// bound nothing. A Bogus or Indeterminate RRset lives no longer than
+    /// [`Limits::failure_ttl`]: the result is a failure, so it is answered
+    /// as one for that long and then fetched and validated again
+    /// (RFC 9520 §3.2, RFC 4035 §4.7). The result of an NXDOMAIN,
     /// kept under type ANY, holds for its copies under the types it
     /// answered too.
     pub fn validated(
@@ -603,7 +604,7 @@ impl Cache {
         checked: &Checked,
         result: Validation,
         signatures_expire: Option<Instant>,
-        original_ttl: Option<u32>,
+        ttl: Option<u32>,
         now: Instant,
     ) {
         let mut keys = vec![key.clone()];
@@ -611,7 +612,7 @@ impl Cache {
             keys.extend(self.nxdomain_copies(key));
         }
         for key in keys {
-            self.validated_one(&key, checked, result, signatures_expire, original_ttl, now);
+            self.validated_one(&key, checked, result, signatures_expire, ttl, now);
         }
     }
 
@@ -643,7 +644,7 @@ impl Cache {
         checked: &Checked,
         result: Validation,
         signatures_expire: Option<Instant>,
-        original_ttl: Option<u32>,
+        ttl: Option<u32>,
         now: Instant,
     ) {
         let generation = self.generation;
@@ -656,10 +657,10 @@ impl Cache {
         {
             return;
         }
-        let original = original_ttl.map(|ttl| stored.at + seconds(ttl));
-        let signatures_expire = match (signatures_expire, original) {
-            (Some(expire), Some(original)) => Some(expire.min(original)),
-            (expire, original) => expire.or(original),
+        let ttl = ttl.map(|ttl| stored.at + seconds(ttl));
+        let signatures_expire = match (signatures_expire, ttl) {
+            (Some(expire), Some(ttl)) => Some(expire.min(ttl)),
+            (expire, ttl) => expire.or(ttl),
         };
         match &mut stored.entry {
             Entry::Positive {
@@ -791,6 +792,29 @@ impl Cache {
             .filter(|stored| stored.generation == self.generation)
             .map(|stored| &stored.entry)
             .filter(|entry| now < entry.expires())
+    }
+
+    /// Whether live data or NODATA ranked above `rank`, at `key`'s name or
+    /// below it in `key`'s class, shows that the name exists. Names below
+    /// a name follow it in the key order.
+    fn shows_exists(&self, key: &Key, rank: Rank, now: Instant) -> bool {
+        self.entries
+            .range(Key::new(key.name.clone(), RecordType::from(0), key.class)..)
+            .take_while(|(other, _)| key.name.zone_of(&other.name))
+            .any(|(other, stored)| {
+                other.class == key.class
+                    && stored.generation == self.generation
+                    && now < stored.entry.expires()
+                    && stored.entry.rank() > rank
+                    && matches!(
+                        stored.entry,
+                        Entry::Positive { .. }
+                            | Entry::Negative {
+                                kind: Negative::NoData,
+                                ..
+                            }
+                    )
+            })
     }
 
     /// Drops each live NXDOMAIN at `key`'s name or above it whose rank is
@@ -926,17 +950,19 @@ fn seconds(ttl: u32) -> Duration {
 }
 
 /// `set` with its owner and every record's owner in lowercase, every
-/// record and RRSIG at the lowest TTL among them (RFC 2181 §5.2, and
-/// RFC 4035 §5.3.3 for the RRSIGs), duplicates collapsed (RFC 2181 §5),
-/// and its RRSIGs kept.
+/// record at the lowest TTL among them (RFC 2181 §5.2), duplicates
+/// collapsed (RFC 2181 §5), and its RRSIGs kept. The RRSIGs are an RRset
+/// of their own and do not shorten the data: each keeps its own TTL, at
+/// most the data's, for validation to bound a Secure RRset by the RRSIG
+/// that verified it (RFC 4035 §5.3.3).
 pub(super) fn normalized(set: &RecordSet) -> RecordSet {
     let owner = set.name().to_lowercase();
+    let readable = |ttl: u32| if ttl & 0x8000_0000 != 0 { 0 } else { ttl };
     let ttl = set
         .records_without_rrsigs()
-        .chain(set.rrsigs())
         .map(|record| record.ttl)
         .chain(std::iter::once(set.ttl()))
-        .map(|ttl| if ttl & 0x8000_0000 != 0 { 0 } else { ttl })
+        .map(readable)
         .min()
         .unwrap_or(0);
     let mut out = RecordSet::with_ttl(owner.clone(), set.record_type(), ttl);
@@ -954,7 +980,7 @@ pub(super) fn normalized(set: &RecordSet) -> RecordSet {
     for rrsig in set.rrsigs() {
         let mut rrsig = rrsig.clone();
         rrsig.name = owner.clone();
-        rrsig.ttl = ttl;
+        rrsig.ttl = readable(rrsig.ttl).min(ttl);
         out.insert_rrsig(rrsig);
     }
     out

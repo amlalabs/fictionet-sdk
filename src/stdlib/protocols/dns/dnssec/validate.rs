@@ -123,8 +123,9 @@ pub struct Link {
 
 /// An RRset whose RRSIG verified, and how long that RRSIG lets the RRset
 /// count as Secure: until the RRSIG's Signature Expiration, and no longer
-/// than its Original TTL from when the RRset arrived (RFC 4035 §5.3.3).
-/// Other RRSIGs of the RRset, which did not verify, bound nothing.
+/// than the RRSIG's own TTL or its Original TTL from when the RRset
+/// arrived (RFC 4035 §5.3.3). Other RRSIGs of the RRset, which did not
+/// verify, bound nothing.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Verified {
     /// The RRset's owner.
@@ -135,16 +136,26 @@ pub struct Verified {
     pub expiration: SerialNumber,
     /// The RRSIG's Original TTL (RFC 4034 §3.1.4).
     pub original_ttl: u32,
+    /// The RRSIG record's own TTL.
+    pub ttl: u32,
 }
 
 impl Verified {
-    fn of(set: &RecordSet, input: &SigInput) -> Verified {
+    fn of(set: &RecordSet, signature: Signature<'_>) -> Verified {
         Verified {
             owner: set.name().clone(),
             rtype: set.record_type(),
-            expiration: input.sig_expiration,
-            original_ttl: input.original_ttl,
+            expiration: signature.input.sig_expiration,
+            original_ttl: signature.input.original_ttl,
+            ttl: signature.ttl,
         }
+    }
+
+    /// The longest the RRset counts as Secure from when it arrived: the
+    /// lower of the RRSIG's own TTL and its Original TTL (RFC 4035
+    /// §5.3.3).
+    pub fn ttl_bound(&self) -> u32 {
+        self.ttl.min(self.original_ttl)
     }
 
     /// Whether this is what verified `set`.
@@ -212,12 +223,12 @@ pub fn validate_rrset(
     if deeper_signer(std::slice::from_ref(set), &zone, name, ds) {
         return Validation::Indeterminate.into();
     }
-    let input = match check.rrset(set, &zone, &keys) {
-        Ok(input) => input,
+    let signature = match check.rrset(set, &zone, &keys) {
+        Ok(signature) => signature,
         Err(code) => return Validation::Bogus(code).into(),
     };
-    let answer = Verified::of(set, input);
-    if input.num_labels >= name.num_labels() {
+    let answer = Verified::of(set, signature);
+    if signature.input.num_labels >= name.num_labels() {
         return ValidatedRrset {
             validation: Validation::Secure,
             verified: vec![answer],
@@ -226,7 +237,7 @@ pub fn validate_rrset(
     let found = check.authenticate(authority, &zone, &keys);
     let proof = proof::wildcard_answer(
         name,
-        input.num_labels,
+        signature.input.num_labels,
         &zone,
         &found.proven,
         policy.max_nsec3_iterations,
@@ -306,7 +317,7 @@ pub fn validate_denial(
         .filter(|set| set.record_type() == RecordType::SOA && *set.name() == zone)
     {
         match check.rrset(soa, &zone, &keys) {
-            Ok(input) => verified.push(Verified::of(soa, input)),
+            Ok(signature) => verified.push(Verified::of(soa, signature)),
             Err(code) => return Validation::Bogus(code).into(),
         }
     }
@@ -386,6 +397,13 @@ impl Failure {
             Failure::ExpiredBeforeValid => EdeCode::SIGNATURE_EXPIRED_BEFORE_VALID,
         }
     }
+}
+
+/// The RRSIG that verified an RRset: its fields, and its record's TTL.
+#[derive(Clone, Copy)]
+struct Signature<'s> {
+    input: &'s SigInput,
+    ttl: u32,
 }
 
 /// The NSEC and NSEC3 RRsets of a section that verified, with the RRSIG
@@ -578,9 +596,9 @@ impl<V: Verify> Check<'_, V> {
             .filter(|set| matches!(set.record_type(), RecordType::NSEC | RecordType::NSEC3))
         {
             match self.rrset(set, zone, keys) {
-                Ok(input) if input.num_labels == set.name().num_labels() => {
+                Ok(signature) if signature.input.num_labels == set.name().num_labels() => {
                     found.proven.push(set.clone());
-                    found.verified.push(Verified::of(set, input));
+                    found.verified.push(Verified::of(set, signature));
                 }
                 // A record a wildcard expanded, signed for fewer labels
                 // than its owner has, proves nothing about that owner
@@ -600,7 +618,7 @@ impl<V: Verify> Check<'_, V> {
         set: &'s RecordSet,
         zone: &Name,
         keys: &[DNSKEY],
-    ) -> Result<&'s SigInput, EdeCode> {
+    ) -> Result<Signature<'s>, EdeCode> {
         let mut worst: Option<Failure> = None;
         for record in set.rrsigs() {
             let RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) = &record.data else {
@@ -616,7 +634,12 @@ impl<V: Verify> Check<'_, V> {
                 continue;
             }
             let failure = match self.signature(set, input, rrsig.sig(), keys) {
-                Ok(()) => return Ok(input),
+                Ok(()) => {
+                    return Ok(Signature {
+                        input,
+                        ttl: record.ttl,
+                    });
+                }
                 Err(failure) => failure,
             };
             worst = worst.max(Some(failure));
