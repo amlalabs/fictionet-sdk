@@ -44,19 +44,19 @@ use fictionet::stdlib::protocols::dns::rr::{
     LowerName, Name, RData, Record, RecordSet, RecordType,
 };
 use fictionet::stdlib::services::dns::authority::{ChaosAnswer, Identity};
-use fictionet::stdlib::services::dns::resolver::Config;
-use fictionet::stdlib::services::dns::zone::Shown;
+use fictionet::stdlib::services::dns::resolver::{Config, LocalZone};
 use fictionet::stdlib::services::dns::zone::special::{
     self, alpn, dohpath, ipv4_hint, ipv6_hint, port,
 };
+use fictionet::stdlib::services::dns::zone::{Shown, ZoneData};
 use fictionet::stdlib::services::dns::{Looked, Lookup};
 use fictionet::stdlib::web::httpd::Handler;
 use fictionet::stdlib::world::net::Host;
 use fictionet::stdlib::world::net::dns::Upstream;
 use fictionet::stdlib::world::net::dns::encrypted::Fronts;
 
-use super::doh;
 use super::place::ResolverSite;
+use super::{doh, unbound};
 
 /// One address pair of a public resolver and the name its PTR records
 /// give.
@@ -251,21 +251,21 @@ pub const PUBLIC_RESOLVERS: [PublicResolver; 4] = [
 pub fn google(identity: Identity) -> Config {
     let google = name("dns.google.");
     Config {
-        local: Vec::new(),
-        local_aa: false,
+        local: vec![ddr(
+            vec![
+                SVCB::new(1, google.clone(), vec![alpn(&["dot"])]),
+                SVCB::new(2, google, vec![alpn(&["h2", "h3"]), dohpath()]),
+            ],
+            86400,
+            true,
+        )],
         payload: 512,
         case_randomise: true,
         policy: AlgorithmPolicy::iana(),
         rd0_from_cache: true,
         ede: true,
         identity,
-        ddr: vec![
-            SVCB::new(1, google.clone(), vec![alpn(&["dot"])]),
-            SVCB::new(2, google, vec![alpn(&["h2", "h3"]), dohpath()]),
-        ],
-        ddr_ttl: 86400,
-        ddr_aa: true,
-        ..Config::unbound()
+        ..unbound::config()
     }
 }
 
@@ -283,30 +283,30 @@ pub fn cloudflare(identity: Identity) -> Config {
         Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1001),
     ]);
     Config {
-        local: Vec::new(),
-        local_aa: false,
+        local: vec![ddr(
+            vec![
+                SVCB::new(
+                    1,
+                    host.clone(),
+                    vec![
+                        alpn(&["h2", "h3"]),
+                        port(443),
+                        v4.clone(),
+                        v6.clone(),
+                        dohpath(),
+                    ],
+                ),
+                SVCB::new(2, host, vec![alpn(&["dot"]), port(853), v4, v6]),
+            ],
+            300,
+            false,
+        )],
         payload: 1232,
         policy: AlgorithmPolicy::iana(),
         rd0_from_cache: true,
         ede: true,
         identity,
-        ddr: vec![
-            SVCB::new(
-                1,
-                host.clone(),
-                vec![
-                    alpn(&["h2", "h3"]),
-                    port(443),
-                    v4.clone(),
-                    v6.clone(),
-                    dohpath(),
-                ],
-            ),
-            SVCB::new(2, host, vec![alpn(&["dot"]), port(853), v4, v6]),
-        ],
-        ddr_ttl: 300,
-        ddr_aa: false,
-        ..Config::unbound()
+        ..unbound::config()
     }
 }
 
@@ -330,28 +330,31 @@ pub fn quad9(identity: Identity) -> Config {
         Ipv6Addr::new(0x2620, 0xfe, 0, 0, 0, 0, 0xfe, 0x9),
     ]);
     Config {
-        local: vec![Arc::new(special::localhost())],
-        local_aa: false,
+        local: vec![
+            plain(Arc::new(special::localhost(&unbound::apex()))),
+            ddr(
+                vec![
+                    SVCB::new(
+                        1,
+                        host.clone(),
+                        vec![alpn(&["h3", "h2"]), v4.clone(), v6.clone(), dohpath()],
+                    ),
+                    SVCB::new(
+                        2,
+                        host.clone(),
+                        vec![alpn(&["dot"]), v4.clone(), v6.clone()],
+                    ),
+                    SVCB::new(3, host, vec![alpn(&["doq"]), v4, v6]),
+                ],
+                60,
+                false,
+            ),
+        ],
         payload: 512,
         policy: AlgorithmPolicy::iana(),
         ede: true,
         identity,
-        ddr: vec![
-            SVCB::new(
-                1,
-                host.clone(),
-                vec![alpn(&["h3", "h2"]), v4.clone(), v6.clone(), dohpath()],
-            ),
-            SVCB::new(
-                2,
-                host.clone(),
-                vec![alpn(&["dot"]), v4.clone(), v6.clone()],
-            ),
-            SVCB::new(3, host, vec![alpn(&["doq"]), v4, v6]),
-        ],
-        ddr_ttl: 60,
-        ddr_aa: false,
-        ..Config::unbound()
+        ..unbound::config()
     }
 }
 
@@ -389,19 +392,42 @@ pub fn opendns(identity: Identity) -> Config {
         (20, "doh.umbrella.com.", https(&doh)),
     ];
     Config {
-        local: vec![Arc::new(special::localhost()), Arc::new(special::test())],
-        local_aa: false,
+        local: vec![
+            plain(Arc::new(special::localhost(&unbound::apex()))),
+            plain(Arc::new(special::test(&unbound::apex()))),
+            ddr(
+                endpoints
+                    .into_iter()
+                    .map(|(priority, host, params)| SVCB::new(priority, name(host), params))
+                    .collect(),
+                300,
+                false,
+            ),
+        ],
         payload: 1410,
         rd0_from_cache: true,
         ede: true,
         identity,
-        ddr: endpoints
-            .into_iter()
-            .map(|(priority, host, params)| SVCB::new(priority, name(host), params))
-            .collect(),
-        ddr_ttl: 300,
-        ddr_aa: false,
-        ..Config::unbound()
+        ..unbound::config()
+    }
+}
+
+/// `data` as a local zone whose answers have AA clear.
+fn plain(data: Arc<dyn ZoneData>) -> LocalZone {
+    LocalZone {
+        data,
+        keep_aa: false,
+    }
+}
+
+/// `resolver.arpa` holding the resolver's encrypted `endpoints` with
+/// `ttl`, for clients that discover them (RFC 9462 §4), with Unbound's
+/// apex records, and AA on its answers as `keep_aa` says.
+fn ddr(endpoints: Vec<SVCB>, ttl: u32, keep_aa: bool) -> LocalZone {
+    let zone = special::resolver_arpa(&unbound::apex(), endpoints, ttl);
+    LocalZone {
+        data: Arc::new(zone),
+        keep_aa,
     }
 }
 
@@ -413,7 +439,7 @@ pub fn opendns(identity: Identity) -> Config {
 /// and the client's subnet (RFC 7871), so a copy of its records could
 /// never give it.
 fn google_whoami(config: Config, site: &ResolverSite, egress: Ipv4Addr) -> Config {
-    config.local(Arc::new(myaddr(site.egress, egress)))
+    config.local(plain(Arc::new(myaddr(site.egress, egress))))
 }
 
 /// Cloudflare's 1.1.1.1, answering `whoami.cloudflare` CH TXT with the

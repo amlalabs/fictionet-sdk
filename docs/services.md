@@ -486,10 +486,10 @@ gets its address by DHCP or by its first packet, and asks the gateway at
 `10.0.0.1` for names. It reaches every host and no other sandbox. An
 address with no host answers "host unreachable", and a closed port a RST.
 
-The gateway runs a recursive resolver like Unbound with no route to the
-internet (`net::dns::Recursive` over `resolver::Config::gateway()`). It
-answers the names hosts declare with their addresses, with RA set and
-Unbound's one-hour TTL for local data. Another name under a top-level
+The gateway runs a recursive resolver with no route to the internet
+(`net::dns::Recursive` over `resolver::Config::new()` with no root
+hints). It answers the names hosts declare with their addresses, with RA
+set and a one-hour TTL. Another name under a top-level
 domain a declared name uses gets NXDOMAIN with an SOA, and a name under
 any other top-level domain gets SERVFAIL with Extended DNS Error 22, No
 Reachable Authority. `Net::gateway` runs something else there: a resolver

@@ -13,8 +13,8 @@
 //!
 //! | Authority | What it answers |
 //! | --- | --- |
-//! | [`Zones`] | From zone data, with the answer of RFC 1034 §4.3.2, looking up what a learned zone lacks. |
-//! | [`Copies`] | As [`Zones`], over learned copies of the zones each address serves, noting the child zones real servers turn out to serve. |
+//! | [`Zones`] | From zone data, with the answer of RFC 1034 §4.3.2. |
+//! | [`Copies`] | As [`Zones`], over learned copies of the zones each address serves, looking up what a copy lacks and noting the child zones real servers turn out to serve. |
 //! | [`Overlay`] | What its base answers, except for invented zones below it. |
 //! | [`Observe`] | What the authority it wraps answers, shown to a callback first. |
 //!
@@ -25,7 +25,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use fictionet::stdlib::protocols::dns::op::ResponseCode;
-use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, Name, RecordType};
+use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, RecordType};
 use fictionet::stdlib::protocols::dns::{EdeCode, Request, Response, label_count};
 
 use super::exchange::{Client, Generation};
@@ -42,7 +42,7 @@ pub use copies::Copies;
 pub use engine::AuthorityEngine;
 pub use observe::Observe;
 pub use overlay::Overlay;
-pub use server::{ChaosAnswer, ChaosReply, Identity, ServerConfig, bare_reply, chaos};
+pub use server::{ChaosAnswer, ChaosReply, ChaosZone, Identity, ServerConfig, bare_reply, chaos};
 
 /// What an authority does with one request, given what its zones hold
 /// now.
@@ -118,16 +118,15 @@ impl<A: Authority + ?Sized> Authority for Arc<A> {
 /// is hosted too and holds the cut, since the parent holds DS (RFC 4035
 /// §3.1.4.1). When that zone refers the question to a zone between them,
 /// the zone at the apex answers NODATA. A view that does not know a fact
-/// the reply needs never gives a negative: a [learned](super::zone::Learned)
-/// zone looks the question up at the server's own address
-/// ([`Step::Need`]), or, once the response to it was filed, the name a
-/// CNAME or DNAME chain led to where the answer still stops, and any
-/// other zone gives SERVFAIL. A QNAME no hosted
-/// zone contains gets REFUSED, with Extended DNS Error 20, Not
-/// Authoritative, when the front sends them (RFC 8914 §4.21). Zone
-/// transfers are refused: zone data makes views for questions, not
+/// the reply needs never gives a negative: the server answers SERVFAIL.
+/// A QNAME no hosted zone contains gets REFUSED, with Extended DNS Error
+/// 20, Not Authoritative, when the front sends them (RFC 8914 §4.21).
+/// Zone transfers are refused: zone data makes views for questions, not
 /// listings of a whole zone. Zones hold class IN only: QCLASS * gets
 /// FORMERR, as from BIND, and any other class REFUSED.
+///
+/// [`Copies`] answers the same way from learned zones, and looks up what
+/// they do not know.
 pub struct Zones {
     zones: Vec<Arc<dyn ZoneData>>,
 }
@@ -137,48 +136,75 @@ impl Zones {
     pub fn new(zones: Vec<Arc<dyn ZoneData>>) -> Zones {
         Zones { zones }
     }
-
-    /// The deepest hosted zone that contains `qname`, or with
-    /// `strictly_above`, the deepest whose apex is not `qname`.
-    fn deepest(&self, qname: &LowerName, strictly_above: bool) -> Option<&dyn ZoneData> {
-        // `max_by_key` keeps the last of equal keys: the zone given last.
-        self.zones
-            .iter()
-            .filter(|zone| zone.apex().zone_of(qname))
-            .filter(|zone| !strictly_above || zone.apex() != qname)
-            .max_by_key(|zone| label_count(zone.apex()))
-            .map(|zone| &**zone)
-    }
 }
 
-/// `zone`'s step for `req` at the server at `local`, whose front is
-/// `server`: its answer, a lookup of what a learned zone lacks, or
-/// SERVFAIL when another zone lacks a fact.
-///
-/// A learned zone looks the client's question up. A server that answers
-/// as RFC 1034 and RFC 6672 say carries the whole CNAME and DNAME chain
-/// in its response. When the response to the client's question was filed
-/// and the answer still stops at a name the chain led to in the zone, as
-/// when a server stops a chain early, the zone looks that name up with
-/// QTYPE instead, as the walk starts again there (RFC 1034 §4.3.2 step
-/// 3a, RFC 6672 §3.2).
-fn answer_from(
-    zone: &dyn ZoneData,
+/// The deepest of `zones` that contains `qname`, or with
+/// `strictly_above`, the deepest whose apex is not `qname`. At equal
+/// depth, the zone given last.
+fn deepest<'z>(
+    zones: &'z [Arc<dyn ZoneData>],
+    qname: &LowerName,
+    strictly_above: bool,
+) -> Option<&'z dyn ZoneData> {
+    // `max_by_key` keeps the last of equal keys: the zone given last.
+    zones
+        .iter()
+        .filter(|zone| zone.apex().zone_of(qname))
+        .filter(|zone| !strictly_above || zone.apex() != qname)
+        .max_by_key(|zone| label_count(zone.apex()))
+        .map(|zone| &**zone)
+}
+
+/// What a server hosting `zones` does with `req`, with `server` as its
+/// front, as [`Zones`] describes. `unknown` gives the step when a zone's
+/// view does not know a fact the reply needs: it gets the zone and the
+/// name the answer had reached, QNAME or the target of the last CNAME or
+/// DNAME it followed (RFC 1034 §4.3.2 step 3a, RFC 6672 §3.2).
+fn respond_from(
+    zones: &[Arc<dyn ZoneData>],
     req: &Request,
-    local: SocketAddr,
     server: &ServerConfig,
+    unknown: &dyn Fn(&dyn ZoneData, LowerName) -> Step,
 ) -> Step {
-    match answer(&*zone.view(&req.question), req, server.any) {
-        Answered::Response(response) => Step::Reply(response),
-        Answered::Unknown { reached, .. } if let Some(learned) = zone.learned() => {
-            let mut question = req.question.clone();
-            if LowerName::new(question.name()) != reached && learned.answered(&req.question) {
-                question.set_name(Name::from(reached));
-            }
-            Step::Need(Lookup::new(local, zone.apex().clone(), &question))
-        }
-        Answered::Unknown { .. } => Step::Reply(bare_reply(req, ResponseCode::ServFail, None)),
+    let qname = LowerName::new(req.question.name());
+    let qtype = req.question.query_type();
+    if matches!(qtype, RecordType::AXFR | RecordType::IXFR) {
+        return Step::Reply(bare_reply(req, ResponseCode::Refused, None));
     }
+    match req.question.query_class() {
+        DNSClass::IN => {}
+        // A zone answers from its data with AA, and an answer to QCLASS
+        // * can never be authoritative (RFC 1034 §3.7.1). BIND 9.20
+        // answers FORMERR, as here.
+        DNSClass::ANY => return Step::Reply(bare_reply(req, ResponseCode::FormErr, None)),
+        // Zones hold class IN data only.
+        _ => {
+            let ede = server.ede.then_some(EdeCode::NOT_AUTHORITATIVE);
+            return Step::Reply(bare_reply(req, ResponseCode::Refused, ede));
+        }
+    }
+    let Some(zone) = deepest(zones, &qname, false) else {
+        let ede = server.ede.then_some(EdeCode::NOT_AUTHORITATIVE);
+        return Step::Reply(bare_reply(req, ResponseCode::Refused, ede));
+    };
+    let answer_from =
+        |zone: &dyn ZoneData| match answer(&*zone.view(&req.question), req, server.any) {
+            Answered::Response(response) => Step::Reply(response),
+            Answered::Unknown { reached, .. } => unknown(zone, reached),
+        };
+    if qtype == RecordType::DS
+        && zone.apex() == &qname
+        && let Some(above) = deepest(zones, &qname, true)
+    {
+        // A zone above that refers the question on is not the parent,
+        // so the zone itself answers NODATA from its apex (RFC 4035
+        // §3.1.4.1), as BIND does.
+        match answer_from(above) {
+            Step::Reply(response) if is_referral(&response) => {}
+            step => return step,
+        }
+    }
+    answer_from(zone)
 }
 
 /// Whether `response` is a referral: NOERROR with AA clear, which a zone
@@ -192,62 +218,12 @@ impl Authority for Zones {
     fn respond(
         &self,
         req: &Request,
-        local: SocketAddr,
+        _local: SocketAddr,
         server: &ServerConfig,
         _client: &Client,
     ) -> Step {
-        let qname = LowerName::new(req.question.name());
-        let qtype = req.question.query_type();
-        if matches!(qtype, RecordType::AXFR | RecordType::IXFR) {
-            return Step::Reply(bare_reply(req, ResponseCode::Refused, None));
-        }
-        match req.question.query_class() {
-            DNSClass::IN => {}
-            // A zone answers from its data with AA, and an answer to QCLASS
-            // * can never be authoritative (RFC 1034 §3.7.1). BIND 9.20
-            // answers FORMERR, as here.
-            DNSClass::ANY => return Step::Reply(bare_reply(req, ResponseCode::FormErr, None)),
-            // Zones hold class IN data only.
-            _ => {
-                let ede = server.ede.then_some(EdeCode::NOT_AUTHORITATIVE);
-                return Step::Reply(bare_reply(req, ResponseCode::Refused, ede));
-            }
-        }
-        let Some(zone) = self.deepest(&qname, false) else {
-            let ede = server.ede.then_some(EdeCode::NOT_AUTHORITATIVE);
-            return Step::Reply(bare_reply(req, ResponseCode::Refused, ede));
-        };
-        if qtype == RecordType::DS
-            && zone.apex() == &qname
-            && let Some(above) = self.deepest(&qname, true)
-        {
-            // A zone above that refers the question on is not the parent,
-            // so the zone itself answers NODATA from its apex (RFC 4035
-            // §3.1.4.1), as BIND does.
-            match answer_from(above, req, local, server) {
-                Step::Reply(response) if is_referral(&response) => {}
-                step => return step,
-            }
-        }
-        answer_from(zone, req, local, server)
-    }
-
-    fn file(&self, lookup: &Lookup, looked: &Looked, generation: Generation) {
-        let Looked::Response(response) = looked else {
-            return;
-        };
-        for zone in &self.zones {
-            if let Some(learned) = zone.learned()
-                && *zone.apex() == lookup.zone
-            {
-                learned.file(generation, &lookup.question, response);
-            }
-        }
-    }
-
-    fn advance(&self, generation: Generation) {
-        for learned in self.zones.iter().filter_map(|zone| zone.learned()) {
-            learned.advance(generation);
-        }
+        respond_from(&self.zones, req, server, &|_, _| {
+            Step::Reply(bare_reply(req, ResponseCode::ServFail, None))
+        })
     }
 }

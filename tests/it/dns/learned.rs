@@ -333,12 +333,13 @@ fn an_unknown_never_becomes_nxdomain_or_nodata() {
 
     // What one positive answer, one NODATA, one referral, and one wildcard
     // answer leave unknown.
-    for (qname, qtype) in [
+    let filed = [
         ("www.example.", RecordType::A),
         ("www.example.", RecordType::TXT),
         ("www.child.example.", RecordType::A),
         ("a.wild.example.", RecordType::A),
-    ] {
+    ];
+    for (qname, qtype) in filed {
         let asked = request(qname, qtype, true);
         learned.file(Generation(0), &asked.question, &real(&zone, &asked));
     }
@@ -369,11 +370,19 @@ fn an_unknown_never_becomes_nxdomain_or_nodata() {
         }
     }
 
-    // A server of the learned zone with no upstream looks the question up
-    // and, when nothing comes, sends nothing: no negative answer.
+    // A server of a copy holding the same responses, with no upstream,
+    // looks the question up and, when nothing comes, sends nothing: no
+    // negative answer.
     let local: SocketAddr = "192.0.2.53:53".parse().unwrap();
-    let zones = Zones::new(vec![Arc::new(learned) as Arc<dyn ZoneData>]);
-    let mut engine = AuthorityEngine::new(zones, ServerConfig::generic(), local);
+    let copies = Copies::new();
+    copies.serves(local.ip(), &lower("example."));
+    for (qname, qtype) in filed {
+        let asked = request(qname, qtype, true);
+        let lookup = Lookup::new(local, lower("example."), &asked.question);
+        let looked = Looked::Response(real(&zone, &asked));
+        copies.keep(&lookup, &looked, Generation(0));
+    }
+    let mut engine = AuthorityEngine::new(copies, ServerConfig::generic(), local);
     let entropy = SeededEntropy::new(Seed::from_u64(1));
     let mut message = Message::new(9, MessageType::Query, OpCode::Query);
     message.add_query(Query::query(name("nx.example."), RecordType::A));
@@ -875,8 +884,8 @@ fn a_policy_refused_lookup_leaves_the_server_silent() {
         let allowed = lower("allowed.example.");
         let policy =
             move |lookup: &Lookup| allowed.zone_of(&LowerName::new(lookup.question.name()));
-        let learned = Learned::new(&name("example."));
-        let zones = Zones::new(vec![Arc::new(learned) as Arc<dyn ZoneData>]);
+        let zones = Copies::new();
+        zones.serves(address.into(), &lower("example."));
         let program = Authoritative::new(zones, ServerConfig::generic())
             .upstream(Only::new(policy, upstream.clone()));
         let (attacher, attachments) = fictionet::attachments();
@@ -922,8 +931,8 @@ fn a_namespace_advance_clears_learned_data() {
         };
         let namespace = Namespace::new(clock);
         let upstream = Counting::default();
-        let learned = Learned::new(&name("example."));
-        let zones = Zones::new(vec![Arc::new(learned) as Arc<dyn ZoneData>]);
+        let zones = Copies::new();
+        zones.serves(address.into(), &lower("example."));
         let program = Authoritative::new(zones, ServerConfig::generic())
             .upstream(upstream.clone())
             .namespace(&namespace);

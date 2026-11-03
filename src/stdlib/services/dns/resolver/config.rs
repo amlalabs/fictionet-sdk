@@ -1,43 +1,42 @@
 //! What a resolver does, as a value: every knob real resolver software
-//! has, and presets with the values of the resolvers a world copies.
+//! has, starting from the values the standards fix.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
 use fictionet::stdlib::protocols::dns::dnssec::{AlgorithmPolicy, Anchors};
-use fictionet::stdlib::protocols::dns::rr::rdata::SVCB;
 use fictionet::stdlib::protocols::dns::rr::{LowerName, Name};
 
-use super::super::authority::{ChaosAnswer, Identity, chaos};
-use super::super::zone::{AnyResponse, ZoneData, special};
+use super::super::authority::Identity;
+use super::super::zone::{AnyResponse, EmptyApex, ZoneData, special};
 
 /// Whether a name is a negative trust anchor ([`Config::negative_anchors`]).
 pub type NegativeAnchors = Arc<dyn Fn(&LowerName) -> bool + Send + Sync>;
 
 /// How a recursive resolver behaves.
 ///
-/// Every field is a knob real resolver software has. The presets are
-/// values; a world that wants other behavior writes another value.
+/// Every field is a knob real resolver software has. [`Config::new`]
+/// holds the values the standards fix; a world that plays some resolver
+/// writes that resolver's values over it.
 #[derive(Clone)]
 pub struct Config {
     /// The root servers to start from (RFC 8109). Empty: the resolver
-    /// iterates nowhere, and a question its local zones do not answer
-    /// gets SERVFAIL with Extended DNS Error 22, as a resolver with no
-    /// route to the roots gives.
+    /// iterates nowhere, and a question its local zones and forward zones
+    /// do not answer gets SERVFAIL with Extended DNS Error 22, as a
+    /// resolver with no route to the roots gives.
     pub hints: Vec<(Name, IpAddr)>,
-    /// Servers to forward every question to, with RD set, instead of
-    /// iterating, as dnsmasq does. Their answers are taken whole.
-    pub forward: Vec<SocketAddr>,
+    /// Zones whose questions go to servers that resolve them, with RD
+    /// set, instead of iterating: each zone's name and its servers. A
+    /// question goes to the servers of the deepest zone that holds its
+    /// name, and their answers are taken whole. `(".", servers)` forwards
+    /// every question, as a home router does.
+    pub forward: Vec<(Name, Vec<SocketAddr>)>,
     /// Zones answered without a query. The zones that hold QNAME answer
     /// deepest first, and at equal depth the zone added last; a fact a
     /// zone does not know passes the question on to the next, and after
     /// the last to the cache and iteration.
-    pub local: Vec<Arc<dyn ZoneData>>,
-    /// Whether answers from the zones in [`local`](Config::local) keep the
-    /// AA bit the zone gives them, as Unbound does for its local zones.
-    /// Otherwise every such answer has AA clear.
-    pub local_aa: bool,
+    pub local: Vec<LocalZone>,
     /// The EDNS payload size offered to servers and advertised to clients
     /// (RFC 6891 §6.2.5).
     pub payload: u16,
@@ -54,15 +53,13 @@ pub struct Config {
     ///
     /// [`Validation::NotPerformed`]: fictionet::stdlib::protocols::dns::dnssec::Validation::NotPerformed
     pub anchors: Option<Anchors>,
-    /// Negative trust anchors (RFC 7646), as Unbound's `domain-insecure`
-    /// sets them: `true` for a name at and below which no answer is
-    /// validated, so each is Insecure as though no trust anchor covered
-    /// it. A trust anchor in `anchors` at that name or below it starts
-    /// validation again there (RFC 7646 §1.1), as Unbound's trust anchors
-    /// override `domain-insecure`. World code: the resolver asks it about
-    /// an answer's owner and every name above, while it works, so it must
-    /// return quickly, and its answers may change as the world runs.
-    /// `None` for none.
+    /// Negative trust anchors (RFC 7646): `true` for a name at and below
+    /// which no answer is validated, so each is Insecure as though no
+    /// trust anchor covered it. A trust anchor in `anchors` at that name
+    /// or below it starts validation again there (RFC 7646 §1.1). World
+    /// code: the resolver asks it about an answer's owner and every name
+    /// above, while it works, so it must return quickly, and its answers
+    /// may change as the world runs. `None` for none.
     pub negative_anchors: Option<NegativeAnchors>,
     /// Which algorithms and digests may make an answer Secure (RFC 9904,
     /// RFC 9905).
@@ -91,16 +88,6 @@ pub struct Config {
     /// What the resolver says about itself to CHAOS-class questions and
     /// NSID requests.
     pub identity: Identity,
-    /// The resolver's encrypted endpoints, as SVCB records at
-    /// `_dns.resolver.arpa` (RFC 9462). When there are any, the resolver
-    /// answers `resolver.arpa` from them with TTL [`ddr_ttl`](Config::ddr_ttl),
-    /// ahead of its other local zones.
-    pub ddr: Vec<SVCB>,
-    /// The TTL of the [`ddr`](Config::ddr) records.
-    pub ddr_ttl: u32,
-    /// Whether answers from the [`ddr`](Config::ddr) records carry AA, as
-    /// Google's resolver sets it there and on no other answer.
-    pub ddr_aa: bool,
     /// What local zones send for QTYPE ANY (RFC 8482 §4). A question for
     /// ANY that leaves the resolver gets what the authority sends.
     pub any: AnyResponse,
@@ -115,6 +102,27 @@ pub struct Config {
     /// How long the resolver remembers a server's round trips after it
     /// last asked it.
     pub server_ttl: Duration,
+}
+
+/// One of a resolver's local zones ([`Config::local`]).
+#[derive(Clone)]
+pub struct LocalZone {
+    /// The zone's data.
+    pub data: Arc<dyn ZoneData>,
+    /// Whether its answers keep the AA bit the zone gives them. Otherwise
+    /// every answer from it has AA clear.
+    pub keep_aa: bool,
+}
+
+impl LocalZone {
+    /// `data`, answered with the AA bit its zone gives, as a server
+    /// answers from a zone it serves (RFC 6303 §3).
+    pub fn new(data: Arc<dyn ZoneData>) -> LocalZone {
+        LocalZone {
+            data,
+            keep_aa: true,
+        }
+    }
 }
 
 /// The bounds of QNAME minimisation (RFC 9156 §2.3).
@@ -161,133 +169,72 @@ pub struct Stale {
 pub struct Work {
     /// The most queries sent to servers.
     pub queries: u16,
-    /// The deepest dependency, counted apart for each, as Unbound counts
-    /// CNAME restarts apart from target fetches: how many aliases one
-    /// answer follows, and how deeply the lookups one alias's name needs,
-    /// for name server addresses and for the DS and DNSKEY sets a
-    /// validation fetches, may nest.
+    /// The deepest dependency: how many aliases one answer follows, and,
+    /// counted apart, how deeply the lookups one alias's name needs, for
+    /// name server addresses and for the DS and DNSKEY sets a validation
+    /// fetches, may nest.
     pub depth: u8,
 }
 
 impl Config {
-    /// Unbound 1.26 with its documented defaults, read from the
-    /// `unbound.conf` manual on 2026-11-01:
+    /// A resolver with the values the standards fix, and no more:
     ///
-    /// - The IANA root hints, which Unbound has built in.
-    /// - Its default local zones: `localhost`, the reverse zones of
-    ///   RFC 6303 and RFC 6598 (Unbound's default AS112, RFC 1918, and
-    ///   Shared Address Space zones),
-    ///   `home.arpa`, `resolver.arpa`, `service.arpa`, `onion`, `test`,
-    ///   and `invalid`. With `ede: no` and no DDR endpoints,
-    ///   `resolver.arpa` is an empty zone (RFC 9462 §6.4).
-    /// - `edns-buffer-size: 1232`, `qname-minimisation: yes` with
-    ///   `qname-minimisation-strict: no`, `use-caps-for-id: no`,
-    ///   `aggressive-nsec: yes`, `serve-expired: no`, `ede: no`,
-    ///   `deny-any: no`.
-    /// - `cache-max-ttl: 86400` and `cache-max-negative-ttl: 3600`.
-    /// - `val-nsec3-keysize-iterations: "1024 150 2048 150 4096 150"`:
-    ///   NSEC3 records with more than 150 iterations make an answer
-    ///   Insecure, whatever the key size.
-    /// - `max-global-quota: 200` queries for one client question, and
-    ///   `max-query-restarts: 11` aliases.
-    /// - `unknown-server-time-limit: 376` milliseconds for a server it
-    ///   has no round-trip time for, and `infra-host-ttl: 900` seconds.
-    /// - `hide-identity: no` and `hide-version: no`: `id.server` and
-    ///   `hostname.bind` give the host name, which this preset leaves as
-    ///   `localhost` for a world to set; `version.server` and
-    ///   `version.bind` give "unbound 1.26.2", the release of 2026-10-21.
-    ///   Other CHAOS names get REFUSED.
-    /// - The `allow` access control: a query with RD clear is answered
-    ///   only from local zones and is otherwise REFUSED.
-    /// - Validation with the IANA root anchors.
+    /// - The IANA root hints ([`root_hints`], RFC 8109), and no forward
+    ///   zones.
+    /// - Every special-use zone of [`special::defaults`], with the apex
+    ///   records of [`EmptyApex::rfc6303`], answered with AA (RFC 6303 §3).
+    /// - A 1232-octet payload, the size the DNS Flag Day 2020 settled on.
+    /// - QNAME minimisation with the bounds RFC 9156 §2.3 recommends, and
+    ///   no random case.
+    /// - Validation from the IANA root anchors, under the IANA algorithm
+    ///   policy ([`AlgorithmPolicy::iana`]), with no negative trust
+    ///   anchors, and with aggressive use of validated NSEC records
+    ///   (RFC 8198).
+    /// - A failure cached for 5 seconds, inside the bounds of RFC 9520
+    ///   §3.2; data cached for at most 604800 seconds (RFC 8767 §4);
+    ///   negative answers for at most 10800 seconds, the three hours
+    ///   RFC 2308 §5 suggests; and no stale data served.
+    /// - A query with RD clear answered from the cache (RFC 1034 §4.3.1).
+    /// - Extended DNS Errors (RFC 8914).
+    /// - Every RRset of a local zone's name for ANY, as RFC 1035 §3.2.3
+    ///   defines the type.
+    /// - An identity with no names and no NSID ([`Identity::none`]).
+    /// - The initial retransmission timeout of RFC 6298 §2.1, 1 second.
     ///
-    /// A failure is cached for 5 seconds, inside the bounds of
-    /// RFC 9520 §3.2.
-    pub fn unbound() -> Config {
-        let mut local: Vec<Arc<dyn ZoneData>> = vec![Arc::new(special::localhost())];
-        for zone in special::rfc6303() {
-            local.push(Arc::new(zone));
-        }
-        local.push(Arc::new(special::home_arpa()));
-        local.push(Arc::new(special::resolver_arpa(Vec::new(), 3600)));
-        local.push(Arc::new(special::service_arpa()));
-        local.push(Arc::new(special::onion()));
-        local.push(Arc::new(special::test()));
-        local.push(Arc::new(special::invalid()));
-        let host = ChaosAnswer::Txt("localhost".to_string());
-        let version = ChaosAnswer::Txt("unbound 1.26.2".to_string());
-        let identity = Identity::none()
-            .answer(chaos::id_server(), host.clone())
-            .answer(chaos::hostname_bind(), host)
-            .answer(chaos::version_server(), version.clone())
-            .answer(chaos::version_bind(), version);
+    /// Two values are the SDK's own, since no standard fixes them: one
+    /// client question may send 200 queries and follow 11 aliases, and a
+    /// server's round trips are remembered for 600 seconds.
+    pub fn new() -> Config {
+        let apex = EmptyApex::rfc6303();
         Config {
             hints: root_hints(),
             forward: Vec::new(),
-            local,
-            local_aa: false,
+            local: special::defaults(&apex)
+                .into_iter()
+                .map(LocalZone::new)
+                .collect(),
             payload: 1232,
             minimise: Some(Minimise::rfc9156()),
             case_randomise: false,
             anchors: Some(Anchors::iana_root()),
             negative_anchors: None,
-            policy: AlgorithmPolicy {
-                max_nsec3_iterations: 150,
-                ..AlgorithmPolicy::iana()
-            },
+            policy: AlgorithmPolicy::iana(),
             work: Work {
                 queries: 200,
                 depth: 11,
             },
             failure_ttl: Duration::from_secs(5),
-            max_ttl: Duration::from_secs(86400),
-            max_negative_ttl: Duration::from_secs(3600),
-            serve_stale: None,
-            rd0_from_cache: false,
-            ede: false,
-            aggressive_nsec: true,
-            identity,
-            ddr: Vec::new(),
-            ddr_ttl: 3600,
-            ddr_aa: true,
-            any: AnyResponse::All,
-            retransmit: Duration::from_millis(376),
-            server_ttl: Duration::from_secs(900),
-        }
-    }
 
-    /// [`Config::unbound`] with no root hints and `ede: yes`: a resolver
-    /// with no route to the roots, as on a network with no internet. It
-    /// answers from its local zones and gives SERVFAIL with Extended DNS
-    /// Error 22, No Reachable Authority (RFC 8914 §4.23), for everything
-    /// else, so a client can tell why.
-    pub fn gateway() -> Config {
-        Config {
-            hints: Vec::new(),
-            ede: true,
-            ..Config::unbound()
-        }
-    }
-
-
-    /// dnsmasq forwarding to `forward`, as a home router runs it: no root
-    /// hints, no local zones, no validation, and no QNAME minimisation; a
-    /// 1232-octet payload; and TTLs capped only by RFC 8767 §4. It answers
-    /// `version.bind` with its version and refuses other CHAOS names.
-    pub fn dnsmasq(forward: Vec<SocketAddr>) -> Config {
-        let version = ChaosAnswer::Txt("dnsmasq-2.91".to_string());
-        Config {
-            hints: Vec::new(),
-            forward,
-            local: Vec::new(),
-            minimise: None,
-            anchors: None,
-            policy: AlgorithmPolicy::iana(),
             max_ttl: Duration::from_secs(604800),
-            max_negative_ttl: Duration::from_secs(604800),
-            aggressive_nsec: false,
-            identity: Identity::none().answer(chaos::version_bind(), version),
-            ..Config::unbound()
+            max_negative_ttl: Duration::from_secs(10800),
+            serve_stale: None,
+            rd0_from_cache: true,
+            ede: true,
+            aggressive_nsec: true,
+            identity: Identity::none(),
+            any: AnyResponse::All,
+            retransmit: Duration::from_secs(1),
+            server_ttl: Duration::from_secs(600),
         }
     }
 
@@ -297,10 +244,10 @@ impl Config {
         self
     }
 
-    /// This configuration with `data` as one more local zone, which wins
+    /// This configuration with `zone` as one more local zone, which wins
     /// over the zones before it at equal depth.
-    pub fn local(mut self, data: Arc<dyn ZoneData>) -> Config {
-        self.local.push(data);
+    pub fn local(mut self, zone: LocalZone) -> Config {
+        self.local.push(zone);
         self
     }
 
@@ -308,6 +255,12 @@ impl Config {
     pub fn anchors(mut self, anchors: Anchors) -> Config {
         self.anchors = Some(anchors);
         self
+    }
+}
+
+impl Default for Config {
+    fn default() -> Config {
+        Config::new()
     }
 }
 
@@ -405,7 +358,7 @@ pub const ROOT_SERVERS: [NameServer; 13] = [
 ];
 
 /// [`ROOT_SERVERS`] as resolver hints, both addresses of each letter: the
-/// hints Unbound and every other resolver build in (RFC 8109).
+/// hints resolvers build in (RFC 8109).
 pub fn root_hints() -> Vec<(Name, IpAddr)> {
     ROOT_SERVERS
         .iter()
@@ -414,5 +367,5 @@ pub fn root_hints() -> Vec<(Name, IpAddr)> {
 }
 
 fn name(text: &str) -> Name {
-    Name::from_ascii(text).expect("a preset's name is valid")
+    Name::from_ascii(text).expect("a root server's name is valid")
 }

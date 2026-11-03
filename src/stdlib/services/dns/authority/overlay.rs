@@ -24,8 +24,8 @@ use super::{Authority, ServerConfig, Step, bare_reply};
 /// servers of a world that learns `com` from the real ones
 /// ([`Learned`](super::super::zone::Learned)), with each invented zone, a
 /// child of that parent,
-/// added by [`below`](Overlay::below). For a question at or below an invented
-/// zone's apex:
+/// added by [`below`](Overlay::below). A zone transfer gets REFUSED. For a
+/// question at or below an invented zone's apex:
 ///
 /// - At one of the invented zone's own name servers (an address its apex
 ///   NS targets have in its glue), the zone's authority answers.
@@ -111,6 +111,14 @@ impl<B: Authority> Authority for Overlay<B> {
         server: &ServerConfig,
         client: &Client,
     ) -> Step {
+        // A transfer lists a zone; a referral, or a parent's answer in
+        // place of one, is no listing (RFC 5936 §2.2).
+        if matches!(
+            req.question.query_type(),
+            RecordType::AXFR | RecordType::IXFR
+        ) {
+            return Step::Reply(bare_reply(req, ResponseCode::Refused, None));
+        }
         let qname = LowerName::new(req.question.name());
         let invented = self
             .zones

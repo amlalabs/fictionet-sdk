@@ -216,7 +216,7 @@ fn recursive(anchors: Anchors, sent: &Arc<Mutex<Vec<Sent>>>) -> Recursive {
     let seen = sent.clone();
     let config = Config {
         anchors: Some(anchors),
-        ..Config::unbound()
+        ..Config::new()
     }
     .hints(&[(name("a.root-servers.net."), IpAddr::V4(ROOT))]);
     Recursive::new(config, WallClock { start: date(NOW) })

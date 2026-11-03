@@ -37,20 +37,19 @@ pub(super) struct Stopped {
     reached: LowerName,
 }
 
-/// What a server sends for QTYPE ANY (RFC 8482 §4).
+/// What a server sends for QTYPE ANY: one of the answers RFC 8482 §4
+/// allows, or every RRset, as RFC 1035 §3.2.3 defines the type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AnyResponse {
-    /// One synthesized HINFO record with CPU "RFC8482" and an empty OS, as
-    /// Cloudflare's servers send (RFC 8482 §4.2), with the smallest TTL
-    /// among the name's RRsets, which leaves the TTL to the responder.
-    /// With DO, a signed zone
-    /// signs it as Cloudflare's online signer does; a zone signed once,
-    /// whose keys the view does not hold, sends one RRset of the name
-    /// instead. A name with a CNAME gets the CNAME.
+    /// One synthesized HINFO record with CPU "RFC8482" and an empty OS
+    /// (RFC 8482 §4.2), with the smallest TTL among the name's RRsets,
+    /// since RFC 8482 leaves the TTL to the responder. With DO, a zone
+    /// that holds its keys signs it; a zone signed once, whose keys the
+    /// view does not hold, sends one RRset of the name instead, as
+    /// RFC 8482 §4.1 allows. A name with a CNAME gets the CNAME.
     Hinfo,
-    /// One RRset of the name, as BIND's `minimal-any` does (RFC 8482 §4.1):
-    /// the RRset of this type, or the name's first RRset in type order when
-    /// it has none of this type.
+    /// One RRset of the name (RFC 8482 §4.1): the RRset of this type, or
+    /// the name's first RRset in type order when it has none of this type.
     OneRrset(RecordType),
     /// Every RRset of the name, as servers did before RFC 8482, with the
     /// NSEC RRset and the RRSIGs even without DO: such servers count ANY as

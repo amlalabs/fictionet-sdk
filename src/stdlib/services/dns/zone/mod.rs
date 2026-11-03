@@ -33,6 +33,7 @@
 //! | [`check_chain`] | RFC 4035 §5.2, RFC 4034 §3.1.5, RFC 9905 §2 |
 
 mod answer;
+mod apex;
 mod chain;
 mod cover;
 mod data;
@@ -45,6 +46,7 @@ pub mod special;
 mod zone;
 
 pub use answer::{Answered, AnyResponse, answer};
+pub use apex::EmptyApex;
 pub use chain::{ChainProblem, check_chain};
 pub use cover::cover;
 pub(crate) use cover::negative_ttl;

@@ -23,7 +23,7 @@ use super::zone::{Node, dname_target, targets, wildcard};
 ///
 /// A world's server never passes a real server's message on. It answers
 /// from this data with [`answer`](super::answer), and when a reply needs a
-/// fact the data does not hold, [`Zones`](super::super::authority::Zones)
+/// fact the data does not hold, [`Copies`](super::super::authority::Copies)
 /// looks the client's question up at a real server of the zone, or the
 /// name its chain reached when that response did not settle it, and
 /// [files](Learned::file) the response here.
@@ -356,10 +356,6 @@ impl ZoneData for Learned {
             soa,
             facts,
         })
-    }
-
-    fn learned(&self) -> Option<&Learned> {
-        Some(self)
     }
 }
 

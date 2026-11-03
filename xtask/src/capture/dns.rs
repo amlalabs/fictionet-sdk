@@ -28,8 +28,8 @@ use std::time::SystemTime;
 
 use fictionet::stdlib::protocols::dns::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use fictionet::stdlib::protocols::dns::rr::{Name, RecordType};
-use fictionet::stdlib::services::dns::authority::{Identity, ServerConfig};
-use fictionet::stdlib::services::dns::resolver::Config;
+use fictionet::stdlib::services::dns::authority::Identity;
+use fictionet::stdlib::services::dns::resolver::ROOT_SERVERS;
 use fictionet::stdlib::services::dns::{Client, WallClock};
 use fictionet::stdlib::services::serve::Transport;
 use fictionet::stdlib::world::net::Net;
@@ -37,7 +37,7 @@ use fictionet::stdlib::world::net::dns::internet::{self, Mirror};
 use fictionet::stdlib::world::net::dns::{Recursive, ResolverHandle, Upstream};
 use fictionet::sync::Mutex;
 use fictionet::{Cx, Seed};
-use fictionet_extras::dns::{Capture, Replay};
+use fictionet_extras::dns::{Capture, Replay, roots, unbound};
 use fictionet_extras::models::{Provider, oauth::Login};
 use fictionet_host::dns::Internet;
 
@@ -144,8 +144,8 @@ async fn walk(
     // The root letters serve the root, and the `gtld-servers.net`
     // servers `com` and `net`.
     let mut mirror = Mirror::new(upstream, net.handle());
-    for letter in &internet::ROOT_LETTERS {
-        for addr in letter.server.addresses() {
+    for server in &ROOT_SERVERS {
+        for addr in server.addresses() {
             mirror = mirror.serves(addr, &Name::root());
         }
     }
@@ -156,15 +156,16 @@ async fn walk(
             }
         }
     }
-    let recursive = Recursive::new(Config::unbound(), clock);
+    let recursive = Recursive::new(unbound::config(), clock);
     let resolver = recursive.handle();
     let (_attacher, attachments) = fictionet::attachments();
     // What the servers say about themselves does not reach the capture.
-    net.hosts(internet::root_servers(|_, host| {
-        host.program(mirror.server(ServerConfig::root(Identity::none())))
+    net.hosts(internet::root_servers(|server, host| {
+        let letter = roots::letter_at(server.v4).expect("a root letter");
+        host.program(mirror.server(letter.front(Identity::none())))
     }))
     .hosts(internet::gtld_servers(|_, host| {
-        host.program(mirror.server(ServerConfig::gtld(Identity::none())))
+        host.program(mirror.server(roots::gtld_front(Identity::none())))
     }))
     .host("resolver", |host| {
         host.at(RESOLVER).ipv4_only().program(recursive)

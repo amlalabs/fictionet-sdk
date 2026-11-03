@@ -5,13 +5,11 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use fictionet::stdlib::protocols::dns::op::{Message, MessageType, OpCode, Query, ResponseCode};
-use fictionet::stdlib::protocols::dns::rr::RecordType;
+use fictionet::stdlib::protocols::dns::rr::{LowerName, RecordType};
 use fictionet::stdlib::protocols::dns::{Parsed, Request};
-use fictionet::stdlib::services::dns::authority::{AuthorityEngine, ServerConfig, Zones};
+use fictionet::stdlib::services::dns::authority::{AuthorityEngine, Copies, ServerConfig};
 use fictionet::stdlib::services::dns::memory::{Exchanges, MemoryNet, Outcome, drive};
-use fictionet::stdlib::services::dns::zone::{
-    Answered, AnyResponse, Learned, Zone, ZoneData, answer,
-};
+use fictionet::stdlib::services::dns::zone::{Answered, AnyResponse, Zone, answer};
 use fictionet::stdlib::services::dns::{
     ExchangeFailure, Input, Looked, Lookup, Token, Tokens, Transmit,
 };
@@ -150,15 +148,12 @@ fn a_learned_server_in_memory_files_what_its_upstream_gives_and_is_silent_withou
         .build()
         .unwrap();
     let local = SocketAddr::new(ip(EXAMPLE), 53);
-    let learned = Learned::new(&name("example.com."));
+    let copies = Copies::new();
+    copies.serves(ip(EXAMPLE), &LowerName::new(&name("example.com.")));
     let mut net = MemoryNet::new();
     net.serve(
         ip(EXAMPLE),
-        AuthorityEngine::new(
-            Zones::new(vec![Arc::new(learned) as Arc<dyn ZoneData>]),
-            ServerConfig::generic(),
-            local,
-        ),
+        AuthorityEngine::new(copies, ServerConfig::generic(), local),
     );
     // The real server answers `www` from its zone, and nothing else.
     let looked_up: Arc<Mutex<Vec<Lookup>>> = Arc::default();

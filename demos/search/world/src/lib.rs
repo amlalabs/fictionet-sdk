@@ -32,17 +32,18 @@ use fictionet::Cx;
 use fictionet::stdlib::network::ip::non_public_address;
 use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RData};
 use fictionet::stdlib::services::dns::Event;
-use fictionet::stdlib::services::dns::resolver::{Config, NegativeAnchors};
+use fictionet::stdlib::services::dns::resolver::{Config, NegativeAnchors, ROOT_SERVERS};
 use fictionet::stdlib::services::dns::zone::{Filing, Section};
 use fictionet::stdlib::services::tls::ServerConfig;
 use fictionet::stdlib::web;
 use fictionet::stdlib::world::net::dns::encrypted::Fronts;
-use fictionet::stdlib::world::net::dns::internet::{GTLD_SERVERS, Mirror, ROOT_LETTERS};
+use fictionet::stdlib::world::net::dns::internet::{GTLD_SERVERS, Mirror};
 use fictionet::stdlib::world::net::dns::{Only, PerSession, Recursive};
 use fictionet::stdlib::world::net::{Host, Net, NetHandle};
 use fictionet::sync::Mutex;
 use fictionet_extras::dns::place::Place;
 use fictionet_extras::dns::public::PUBLIC_RESOLVERS;
+use fictionet_extras::dns::unbound;
 
 use observation::SearchObs;
 use pages::Pages;
@@ -136,8 +137,8 @@ pub fn net(
         .observe(move |filing| sites.place(filing));
     // The root letters serve the root, and the `gtld-servers.net`
     // servers `com` and `net`.
-    for letter in &ROOT_LETTERS {
-        for addr in letter.server.addresses() {
+    for server in &ROOT_SERVERS {
+        for addr in server.addresses() {
             mirror = mirror.serves(addr, &Name::root());
         }
     }
@@ -230,7 +231,7 @@ pub fn net(
             // hierarchy answers for all of them.
             let config = Config {
                 negative_anchors: Some(negative_anchors.clone()),
-                ..Config::unbound()
+                ..unbound::config()
             };
             host.program(
                 Recursive::new(config, clock)

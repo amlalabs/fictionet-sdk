@@ -25,7 +25,9 @@ use fictionet::stdlib::services::dns::authority::{
     Authority, AuthorityEngine, Identity, ServerConfig, Step, Zones,
 };
 use fictionet::stdlib::services::dns::memory::{Exchanges, MemoryNet, drive};
-use fictionet::stdlib::services::dns::resolver::{Config, Entry, FailureKind, Key, Resolver, Work};
+use fictionet::stdlib::services::dns::resolver::{
+    Config, Entry, FailureKind, Key, LocalZone, Resolver, Work,
+};
 use fictionet::stdlib::services::dns::zone::{
     Denial, Fact, Lazy, Transparent, Zone, ZoneBuilder, ZoneData, dname,
 };
@@ -36,7 +38,8 @@ use fictionet::stdlib::services::dns::{
 use fictionet::stdlib::services::serve::Transport;
 use fictionet::time::Instant;
 use fictionet::{Seed, SeededEntropy};
-use fictionet_extras::dns::public;
+use fictionet_extras::dns::{public, unbound};
+use fictionet_test_support::dns::dnsmasq;
 
 pub(super) const ROOT: &str = "198.41.0.4";
 pub(super) const COM: &str = "192.0.2.10";
@@ -381,16 +384,16 @@ impl Authority for Bizarre {
     }
 }
 
-/// The resolver configuration every test starts from: Unbound's preset
-/// with the test root as its only hint, no local zones, Extended DNS
-/// Errors on, and `anchors`.
+/// The resolver configuration every test starts from: Unbound's
+/// ([`unbound::config`]) with the test root as its only hint, no local
+/// zones, Extended DNS Errors on, and `anchors`.
 pub(super) fn config(anchors: Option<Anchors>) -> Config {
     Config {
         hints: vec![(name("a.root-servers.net."), ip(ROOT))],
         local: Vec::new(),
         anchors,
         ede: true,
-        ..Config::unbound()
+        ..unbound::config()
     }
 }
 
@@ -1497,14 +1500,22 @@ fn local_zones_answer_deepest_first_and_the_last_added_first_at_equal_depth() {
         unknown,
     );
     let config = config(None)
-        .local(Arc::new(small("test.", "a.test.", "192.0.2.1")))
-        .local(Arc::new(Transparent(small(
+        .local(LocalZone::new(Arc::new(small(
+            "test.",
+            "a.test.",
+            "192.0.2.1",
+        ))))
+        .local(LocalZone::new(Arc::new(Transparent(small(
             "test.",
             "b.test.",
             "192.0.2.2",
-        ))))
-        .local(Arc::new(sub))
-        .local(Arc::new(Transparent(small("com.", "x.com.", "192.0.2.3"))));
+        )))))
+        .local(LocalZone::new(Arc::new(sub)))
+        .local(LocalZone::new(Arc::new(Transparent(small(
+            "com.",
+            "x.com.",
+            "192.0.2.3",
+        )))));
     let mut resolver = resolver(config);
     // The zone added last answers what it holds.
     let reply = ask(
@@ -1559,7 +1570,11 @@ fn local_zones_answer_deepest_first_and_the_last_added_first_at_equal_depth() {
 #[test]
 fn a_resolver_with_no_hints_answers_servfail_with_ede_22() {
     let (mut net, _) = internet(false);
-    let mut resolver = resolver(Config::gateway());
+    let mut resolver = resolver(Config {
+        hints: Vec::new(),
+        ede: true,
+        ..unbound::config()
+    });
     let reply = ask(
         &mut resolver,
         &mut net,
@@ -1943,7 +1958,7 @@ fn a_forwarder_sends_the_whole_question_with_rd_and_takes_the_answer() {
     let (mut net, _) = internet(false);
     let mut resolver = resolver(Config {
         ede: true,
-        ..Config::dnsmasq(vec![SocketAddr::new(ip(EXAMPLE), 53)])
+        ..dnsmasq(vec![SocketAddr::new(ip(EXAMPLE), 53)])
     });
     let reply = ask(
         &mut resolver,
@@ -1962,6 +1977,58 @@ fn a_forwarder_sends_the_whole_question_with_rd_and_takes_the_answer() {
     assert_eq!(message.queries[0].name(), &name("x.y.example.com."));
     // dnsmasq does not validate: CD is clear upstream.
     assert!(!message.metadata.checking_disabled);
+}
+
+/// A forward zone takes only the questions below its name, to the servers
+/// of the deepest such zone; every other question iterates from the
+/// root.
+#[test]
+fn a_forward_zone_takes_its_own_questions_and_the_rest_iterate() {
+    let (mut net, _) = internet(false);
+    let example = SocketAddr::new(ip(EXAMPLE), 53);
+    let example_too = SocketAddr::new(ip(EXAMPLE_TOO), 53);
+    let mut resolver = resolver(Config {
+        forward: vec![
+            (name("y.example.com."), vec![example_too]),
+            (name("com."), vec![example]),
+        ],
+        ..config(None)
+    });
+
+    let reply = ask(
+        &mut resolver,
+        &mut net,
+        0,
+        query(client(1), "x.y.example.com.", RecordType::A, |_| {}),
+    );
+    assert_eq!(addresses(&reply), ["192.0.2.81"]);
+    let recording = net.recording();
+    let [asked] = recording.exchanges() else {
+        panic!("one question, to the deepest forward zone's server");
+    };
+    assert_eq!(asked.server, example_too);
+    let message = Message::from_vec(&asked.query).unwrap();
+    assert!(message.metadata.recursion_desired);
+    assert_eq!(message.queries[0].name(), &name("x.y.example.com."));
+
+    let reply = ask(
+        &mut resolver,
+        &mut net,
+        0,
+        query(client(2), "www.example.org.", RecordType::A, |_| {}),
+    );
+    assert_eq!(addresses(&reply), ["192.0.2.90"]);
+    let recording = net.recording();
+    let asked: Vec<SocketAddr> = recording.exchanges()[1..]
+        .iter()
+        .map(|exchange| exchange.server)
+        .collect();
+    assert_eq!(asked.first(), Some(&SocketAddr::new(ip(ROOT), 53)));
+    assert!(!asked.contains(&example) && !asked.contains(&example_too));
+    for exchange in &recording.exchanges()[1..] {
+        let message = Message::from_vec(&exchange.query).unwrap();
+        assert!(!message.metadata.recursion_desired);
+    }
 }
 
 /// An upstream that validates, playing a zone whose signatures fail: it
@@ -2010,7 +2077,7 @@ fn a_forwarder_that_does_not_validate_passes_cd_on() {
         ip(EXAMPLE),
         AuthorityEngine::new(Validating, ServerConfig::generic(), upstream),
     );
-    let mut dnsmasq = resolver(Config::dnsmasq(vec![upstream]));
+    let mut dnsmasq = resolver(dnsmasq(vec![upstream]));
     let reply = ask(
         &mut dnsmasq,
         &mut net,
@@ -2056,7 +2123,7 @@ fn a_forwarder_never_answers_a_client_without_cd_from_a_cd_answer() {
         ip(EXAMPLE),
         AuthorityEngine::new(Validating, ServerConfig::generic(), upstream),
     );
-    let mut dnsmasq = resolver(Config::dnsmasq(vec![upstream]));
+    let mut dnsmasq = resolver(dnsmasq(vec![upstream]));
     let checking_disabled = |message: &mut Message| {
         message.metadata.checking_disabled = true;
         dnssec_ok(message);
@@ -2096,7 +2163,7 @@ fn a_forwarder_never_answers_a_client_without_cd_from_a_cd_answer() {
 #[test]
 fn a_referral_from_a_forwarder_fails_the_question() {
     let (mut net, _) = internet(false);
-    let mut dnsmasq = resolver(Config::dnsmasq(vec![SocketAddr::new(ip(ROOT), 53)]));
+    let mut dnsmasq = resolver(dnsmasq(vec![SocketAddr::new(ip(ROOT), 53)]));
     let reply = ask(
         &mut dnsmasq,
         &mut net,
@@ -4039,7 +4106,7 @@ impl Authority for Flipping {
 /// negative, which ranks no higher (RFC 2181 §5.4.1).
 #[test]
 fn a_chain_answers_with_the_data_its_reply_carried_over_a_cached_negative() {
-    let forwarder = Config::dnsmasq(vec![SocketAddr::new(ip(EXAMPLE), 53)]);
+    let forwarder = dnsmasq(vec![SocketAddr::new(ip(EXAMPLE), 53)]);
     for (config, x_ttl) in [(config(None), 0), (forwarder, 300)] {
         let example = Flipping::new(x_ttl);
         let flipped = example.flipped.clone();

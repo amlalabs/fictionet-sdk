@@ -54,15 +54,15 @@ use fictionet::stdlib::protocols::dns::serialize::binary::{
 use fictionet::stdlib::protocols::dns::{Limit, Parsed, Request, Response, fit, read_message};
 use fictionet::stdlib::protocols::json::Value;
 use fictionet::stdlib::services::dns::authority::{
-    AuthorityEngine, ServerConfig, Zones, bare_reply,
+    AuthorityEngine, Copies, ServerConfig, Zones, bare_reply,
 };
 use fictionet::stdlib::services::dns::memory::{MemoryNet, drive};
 use fictionet::stdlib::services::dns::resolver::{
     Cache, Checked, Config, Entry, FailureKind, Key, Limits, Negative, Offer, Rank, Resolver, Work,
 };
 use fictionet::stdlib::services::dns::zone::{
-    Answered, AnyResponse, Denial, Denied, Fact, Learned, Node, Revision, View, Zone, ZoneData,
-    ZoneError, answer, check_chain,
+    Answered, AnyResponse, Denial, Denied, Fact, Node, Revision, View, Zone, ZoneData, ZoneError,
+    answer, check_chain,
 };
 use fictionet::stdlib::services::dns::{
     Action, Client, ClientQuery, Engine, Input, Looked, Lookup, WallClock,
@@ -70,6 +70,7 @@ use fictionet::stdlib::services::dns::{
 use fictionet::stdlib::services::serve::Transport;
 use fictionet::time::Instant;
 use fictionet::{Seed, SeededEntropy};
+use fictionet_extras::dns::unbound;
 
 // ---------------------------------------------------------------------
 // Reading the vectors
@@ -1552,11 +1553,13 @@ fn partial_answers() {
 /// server it looks facts up at.
 const COPY: &str = "192.0.2.53:53";
 
-/// A server at [`COPY`] behind `server`, answering as [`Zones`] over a
+/// A server at [`COPY`] behind `server`, answering as [`Copies`] over a
 /// copy of the zone at `apex` that holds nothing yet.
-fn copy_engine(apex: &Name, server: ServerConfig) -> AuthorityEngine<Zones> {
-    let zone: Arc<dyn ZoneData> = Arc::new(Learned::new(apex));
-    AuthorityEngine::new(Zones::new(vec![zone]), server, COPY.parse().unwrap())
+fn copy_engine(apex: &Name, server: ServerConfig) -> AuthorityEngine<Copies> {
+    let local: SocketAddr = COPY.parse().unwrap();
+    let copies = Copies::new();
+    copies.serves(local.ip(), &LowerName::new(apex));
+    AuthorityEngine::new(copies, server, local)
 }
 
 /// A client's query for `qname` `qtype` over TCP, so that no reply is
@@ -1581,7 +1584,7 @@ fn copy_query(qname: &Name, qtype: RecordType, dnssec_ok: bool) -> ClientQuery {
 /// What the server of a copy does with `query`: the replies it sends and
 /// the lookups it makes, each answered at once by `upstream`.
 fn ask_copy(
-    engine: &mut AuthorityEngine<Zones>,
+    engine: &mut AuthorityEngine<Copies>,
     query: ClientQuery,
     upstream: &dyn Fn(&Lookup) -> Looked,
 ) -> (Vec<Message>, Vec<Lookup>) {
@@ -3380,7 +3383,7 @@ fn vector_resolver(input: &Value, zones: &[Zone], queries: u16) -> Resolver {
         aggressive_nsec: false,
         any: AnyResponse::All,
         work: Work { queries, depth: 11 },
-        ..Config::unbound()
+        ..unbound::config()
     };
     Resolver::new(
         config,

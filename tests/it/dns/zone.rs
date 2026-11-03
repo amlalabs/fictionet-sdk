@@ -21,8 +21,9 @@ use fictionet::stdlib::protocols::dns::serialize::binary::BinEncodable;
 use fictionet::stdlib::protocols::dns::{Parsed, Request, Response};
 use fictionet::stdlib::services::dns::WallClock;
 use fictionet::stdlib::services::dns::zone::{
-    Answered, AnyResponse, Denied, Fact, Lazy, MasterError, Node, Revision, Shown, Transparent,
-    View, Zone, ZoneBuilder, ZoneData, ZoneError, answer, dname, dname_target, special,
+    Answered, AnyResponse, Denied, EmptyApex, Fact, Lazy, MasterError, Node, Revision, Shown,
+    Transparent, View, Zone, ZoneBuilder, ZoneData, ZoneError, answer, dname, dname_target,
+    special,
 };
 use fictionet::stdlib::services::serve::Transport;
 use fictionet::time::Instant;
@@ -2652,7 +2653,7 @@ fn an_unknown_target_leaves_out_only_its_addresses() {
 
 #[test]
 fn localhost_points_every_name_at_loopback() {
-    let zone = special::localhost();
+    let zone = special::localhost(&EmptyApex::rfc6303());
     let ask = |qname: &str, qtype| ask(&*view_of(&zone, qname, qtype), qname, qtype);
     assert_eq!(
         addresses(&ask("localhost.", RecordType::A).answers),
@@ -2667,8 +2668,8 @@ fn localhost_points_every_name_at_loopback() {
     // The apex is its own name server (`localhost. NS localhost.`).
     let reply = ask("localhost.", RecordType::NS);
     assert_eq!(reply.answers[0].data, ns("localhost."));
-    // A name below answers with the apex's RRsets, as Unbound's redirect
-    // zone does, owned by the name asked.
+    // A name below answers with the apex's RRsets, owned by the name
+    // asked (RFC 6761 §6.3).
     for qtype in [RecordType::NS, RecordType::SOA] {
         let reply = ask("foo.localhost.", qtype);
         assert_eq!(rows(&reply.answers), vec![row("foo.localhost.", qtype)]);
@@ -2684,10 +2685,10 @@ fn localhost_points_every_name_at_loopback() {
 }
 
 #[test]
-fn special_use_zones_are_empty_with_unbounds_soa_and_ns() {
-    let zones = special::rfc6303();
+fn special_use_zones_are_empty_with_the_apex_they_are_given() {
+    let zones = special::rfc6303(&EmptyApex::rfc6303());
     // 33 zones of RFC 6303 and the 64 of the Shared Address Space
-    // (RFC 6598 §7), as Unbound serves them.
+    // (RFC 6598 §7).
     assert_eq!(zones.len(), 97);
     let find = |apex: &str| {
         zones
@@ -2709,7 +2710,8 @@ fn special_use_zones_are_empty_with_unbounds_soa_and_ns() {
         let RData::SOA(soa) = &reply.authorities[0].data else {
             panic!("SOA");
         };
-        assert_eq!(soa.mname, name("localhost."), "Unbound names localhost.");
+        // The zone names itself (RFC 6303 §3).
+        assert_eq!(soa.mname, name(apex));
         assert_eq!(soa.rname, name("nobody.invalid."));
         assert_eq!(
             (soa.serial, soa.refresh, soa.retry, soa.expire, soa.minimum),
@@ -2717,23 +2719,30 @@ fn special_use_zones_are_empty_with_unbounds_soa_and_ns() {
         );
         assert_eq!(reply.authorities[0].ttl, 10800);
     }
+    // The reverse zone of 127.0.0.0/8 is as empty as the others.
     let reply = ask(
         find("127.in-addr.arpa."),
         "1.0.0.127.in-addr.arpa.",
         RecordType::PTR,
     );
-    assert_eq!(reply.answers[0].data, RData::PTR(PTR(name("localhost."))));
+    assert_eq!(reply.metadata.response_code, ResponseCode::NXDomain);
 
-    // Every zone Unbound serves by default names `localhost.` as its name
-    // server and as its SOA's MNAME (`add_empty_default`).
+    // Each zone takes the name server and MNAME it is given, here
+    // `localhost.`, and its TTL.
+    let apex = EmptyApex {
+        ns: Some(name("localhost.")),
+        ttl: 300,
+        ..EmptyApex::rfc6303()
+    };
+    let zones = special::rfc6303(&apex);
     for zone in [
-        special::onion(),
-        special::test(),
-        special::invalid(),
-        special::home_arpa(),
-        special::service_arpa(),
-        special::resolver_arpa(vec![], 3600),
-        find("10.in-addr.arpa.").clone(),
+        special::onion(&apex),
+        special::test(&apex),
+        special::invalid(&apex),
+        special::home_arpa(&apex),
+        special::service_arpa(&apex),
+        special::resolver_arpa(&apex, vec![], 3600),
+        zones[0].clone(),
     ] {
         let apex = zone.apex().to_string();
         let reply = ask(&zone, &format!("anything.{apex}"), RecordType::A);
@@ -2746,6 +2755,8 @@ fn special_use_zones_are_empty_with_unbounds_soa_and_ns() {
             panic!("SOA");
         };
         assert_eq!(soa.mname, name("localhost."), "{apex}");
+        assert_eq!(soa.minimum, 300, "{apex}");
+        assert_eq!(reply.authorities[0].ttl, 300, "{apex}");
         let reply = ask(&zone, &apex, RecordType::NS);
         assert_eq!(reply.answers[0].data, ns("localhost."), "{apex}");
     }
@@ -2754,12 +2765,12 @@ fn special_use_zones_are_empty_with_unbounds_soa_and_ns() {
 #[test]
 fn resolver_arpa_holds_the_resolvers_endpoints() {
     let endpoint = SVCB::new(1, name("dns.example."), vec![]);
-    let zone = special::resolver_arpa(vec![endpoint.clone()], 300);
+    let zone = special::resolver_arpa(&EmptyApex::rfc6303(), vec![endpoint.clone()], 300);
     let reply = ask(&zone, "_dns.resolver.arpa.", RecordType::SVCB);
     assert_eq!(reply.answers.len(), 1);
     assert_eq!(reply.answers[0].data, RData::SVCB(endpoint));
     assert_eq!(reply.answers[0].ttl, 300);
-    let empty = special::resolver_arpa(vec![], 300);
+    let empty = special::resolver_arpa(&EmptyApex::rfc6303(), vec![], 300);
     let reply = ask(&empty, "_dns.resolver.arpa.", RecordType::SVCB);
     assert_eq!(reply.metadata.response_code, ResponseCode::NXDomain);
 }

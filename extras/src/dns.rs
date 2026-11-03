@@ -17,13 +17,18 @@
 //!
 //! The real internet's DNS as a world plays it lives here too, beside the
 //! SDK's primitives: [`public`] has the large public resolvers, [`doh`]
-//! what their DNS over HTTPS servers answer past RFC 8484, and [`place`]
+//! what their DNS over HTTPS servers answer past RFC 8484, [`place`]
 //! how the root, `gtld-servers.net`, and public resolver servers look
-//! from one place.
+//! from one place, and [`roots`] what those servers' software does
+//! everywhere. [`unbound`] plays Unbound's configuration, and [`bind`]
+//! BIND's CHAOS-class zones.
 
+pub mod bind;
 pub mod doh;
 pub mod place;
 pub mod public;
+pub mod roots;
+pub mod unbound;
 
 use std::collections::{HashMap, HashSet};
 use std::future::{Future, ready};

@@ -95,8 +95,8 @@
 //!   container playing a host or the open internet, with no address
 //!   binding or DHCP. It drops only packets from sources the network does
 //!   not route back to it.
-//! - **DNS** at the gateway, over UDP and TCP: a recursive resolver like
-//!   Unbound ([`Config::gateway`](fictionet::stdlib::services::dns::resolver::Config::gateway)),
+//! - **DNS** at the gateway, over UDP and TCP: a recursive resolver
+//!   ([`Config::new`](fictionet::stdlib::services::dns::resolver::Config::new) with no root hints),
 //!   with no route to the internet. It answers each host's names with the
 //!   host's addresses, and other types with NODATA. Another name under a
 //!   top-level domain that a host's name uses gets NXDOMAIN, and a name
@@ -414,14 +414,15 @@ impl Net {
     /// pings. It is called once per gateway address, so each address has
     /// its own programs, and a resolver its own cache.
     ///
-    /// The default runs a recursive resolver like Unbound with no route to
-    /// the internet, answering the declared names:
-    /// `h.program(Recursive::new(declared.over(Config::gateway()), clock))`,
-    /// with [`Config::gateway`](fictionet::stdlib::services::dns::resolver::Config::gateway)
-    /// and a `clock` that starts at the Unix epoch, since a resolver that asks
-    /// no other server checks no signature. A world whose resolver
-    /// iterates to root servers of its own gives it root hints
-    /// ([`Config::hints`](fictionet::stdlib::services::dns::resolver::Config::hints)).
+    /// The default runs a recursive resolver with no route to the
+    /// internet, answering the declared names: [`Config::new`] with no
+    /// root hints, under [`Declared::over`], and a clock that starts at the
+    /// Unix epoch, since a resolver that asks no other server checks no
+    /// signature. A world whose resolver iterates to root servers of its
+    /// own gives it root hints ([`Config::hints`]).
+    ///
+    /// [`Config::new`]: fictionet::stdlib::services::dns::resolver::Config::new
+    /// [`Config::hints`]: fictionet::stdlib::services::dns::resolver::Config::hints
     pub fn gateway(self, build: impl Fn(Host, Declared) -> Host + Send + Sync + 'static) -> Net {
         Net {
             gateway: Arc::new(build),
@@ -862,7 +863,11 @@ fn default_gateway(host: Host, declared: Declared) -> Host {
     let clock = WallClock {
         start: SystemTime::UNIX_EPOCH,
     };
-    host.program(Recursive::new(declared.over(Config::gateway()), clock))
+    let config = Config {
+        hints: Vec::new(),
+        ..Config::new()
+    };
+    host.program(Recursive::new(declared.over(config), clock))
 }
 
 /// The gateway: a machine at its IPv4 address and, with IPv6, at its IPv6

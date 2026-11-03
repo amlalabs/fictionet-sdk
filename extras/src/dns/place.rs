@@ -18,10 +18,13 @@ use fictionet::stdlib::protocols::dns::{Ede, EdeCode};
 use fictionet::stdlib::services::dns::authority::{
     ChaosAnswer, ChaosReply, Identity, ServerConfig, chaos,
 };
-use fictionet::stdlib::world::net::dns::internet::{self, Echo, GTLD_SERVERS, ROOT_LETTERS};
+use fictionet::stdlib::services::dns::resolver::ROOT_SERVERS;
+use fictionet::stdlib::world::net::dns::internet::{self, Echo, GTLD_SERVERS};
 use fictionet::stdlib::world::net::{Host, Program};
 
+use super::bind;
 use super::public::{self, PUBLIC_RESOLVERS, PublicResolver};
+use super::roots;
 
 /// How one anycast server looks from a place: the round trip to the
 /// instance that answers there, and what that instance says about itself.
@@ -89,13 +92,10 @@ impl Place {
     /// same time, running `program` with the letter's front: its identity
     /// here, its payload size, and its answer to ANY.
     pub fn root_servers<P: Program>(&self, program: impl Fn(ServerConfig) -> P) -> Vec<Host> {
-        internet::root_servers(|letter, host| {
-            let site = self.site(IpAddr::V4(letter.server.v4));
-            let server = ServerConfig {
-                payload: letter.payload,
-                any: letter.any,
-                ..ServerConfig::root(site.identity)
-            };
+        internet::root_servers(|server, host| {
+            let site = self.site(IpAddr::V4(server.v4));
+            let letter = roots::letter_at(server.v4).expect("a root letter");
+            let server = letter.front(site.identity);
             host.delay(site.rtt / 2).program(program(server))
         })
     }
@@ -108,7 +108,7 @@ impl Place {
         internet::gtld_servers(|server, host| {
             let site = self.site(IpAddr::V4(server.v4));
             host.delay(site.rtt / 2)
-                .program(program(ServerConfig::gtld(site.identity)))
+                .program(program(roots::gtld_front(site.identity)))
         })
     }
 
@@ -189,7 +189,10 @@ impl Place {
                 .chaos
                 .into_iter()
                 .map(|(name, answer)| match answer {
-                    ChaosAnswer::Txt(text) => (name, ChaosAnswer::Zone(Some(text))),
+                    ChaosAnswer::Txt(text) => {
+                        let zone = bind::chaos_zone(&name, Some(text));
+                        (name, zone)
+                    }
                     answer => (name, answer),
                 })
                 .collect(),
@@ -197,7 +200,9 @@ impl Place {
         };
         // C, I, and M also serve `authors.bind`, a zone with no TXT.
         let bind = |identity: Identity| {
-            zones(identity).answer(chaos::authors_bind(), ChaosAnswer::Zone(None))
+            let authors = chaos::authors_bind();
+            let zone = bind::chaos_zone(&authors, None);
+            zones(identity).answer(authors, zone)
         };
         // Verisign's servers answer other types with NOTIMP and no OPT
         // record. Its root letter sets AA; its gTLD servers do not.
@@ -418,9 +423,8 @@ impl Place {
             (47, atlas("nnn1-usdal-3a", "nnn1-usdal-3c", "nnn1-usdal-3a")),
             (45, atlas("nnn1-usdal-3a", "nnn1-usdal-3c", "nnn1-usdal-3c")),
         ];
-        let servers = ROOT_LETTERS
-            .iter()
-            .map(|letter| letter.server)
+        let servers = ROOT_SERVERS
+            .into_iter()
             .zip(letters)
             .chain(GTLD_SERVERS.into_iter().zip(gtld))
             .map(|(server, (rtt, identity))| {

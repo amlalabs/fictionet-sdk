@@ -962,13 +962,13 @@ impl<V: Verify> Resolver<V> {
         if let Some(found) = self.cached_for(&key, lookup.relay_cd) {
             return self.finish(id, found);
         }
-        if !self.config.forward.is_empty() {
-            let mut servers = self.config.forward.clone();
+        if let Some((zone, servers)) = self.forward_zone(&key.name) {
+            let mut servers = servers.to_vec();
             servers.retain(|server| !lookup.tried.contains(&(*server, Transport::Udp)));
             if servers.is_empty() {
                 return self.fail(id);
             }
-            return self.ask_one(id, LowerName::from(Name::root()), servers, entropy);
+            return self.ask_one(id, zone, servers, true, entropy);
         }
         if self.config.hints.is_empty() {
             return self.fail(id);
@@ -985,7 +985,7 @@ impl<V: Verify> Resolver<V> {
                 if hints.is_empty() {
                     return self.fail(id);
                 }
-                return self.ask_one(id, root, hints, entropy);
+                return self.ask_one(id, root, hints, false, entropy);
             }
             let (tree, depth) = (lookup.tree, lookup.depth);
             return match self.depend(Node::Lookup(id), priming, false, tree, depth + 1, entropy) {
@@ -1052,7 +1052,7 @@ impl<V: Verify> Resolver<V> {
         }
         servers.retain(|server| !lookup.tried.contains(&(*server, Transport::Udp)));
         if !servers.is_empty() {
-            return self.ask_one(id, zone, servers, entropy);
+            return self.ask_one(id, zone, servers, false, entropy);
         }
 
         // No server of the cut is left to ask: look up the addresses of a
@@ -1294,19 +1294,33 @@ impl<V: Verify> Resolver<V> {
         }
     }
 
+    /// The deepest forward zone ([`Config::forward`](super::Config::forward))
+    /// that holds `name`, with its servers. At equal depth, the zone given
+    /// last.
+    pub(super) fn forward_zone(&self, name: &LowerName) -> Option<(LowerName, &[SocketAddr])> {
+        self.config
+            .forward
+            .iter()
+            .map(|(zone, servers)| (LowerName::new(zone), servers))
+            .filter(|(zone, _)| zone.zone_of(name))
+            .max_by_key(|(zone, _)| label_count(zone))
+            .map(|(zone, servers)| (zone, servers.as_slice()))
+    }
+
     /// Sends lookup `id`'s next question to one of `servers`, chosen at
-    /// random, as an authority for `zone`.
+    /// random: to a server that resolves it, with RD set, when
+    /// `forwarded`, and otherwise to an authority for `zone`.
     fn ask_one(
         &mut self,
         id: LookupId,
         zone: LowerName,
         servers: Vec<SocketAddr>,
+        forwarded: bool,
         entropy: &dyn Entropy,
     ) {
         let servers = self.servers.band(&servers, self.now);
         let index = entropy.random_below(servers.len() as u64) as usize;
         let to = servers[index];
-        let forwarded = !self.config.forward.is_empty();
         let Some((name, rtype, minimised)) = self.next_question(id, &zone, forwarded) else {
             return;
         };

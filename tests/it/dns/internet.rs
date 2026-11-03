@@ -22,11 +22,14 @@ use fictionet::stdlib::services::dns::zone::{
 };
 use fictionet::stdlib::services::dns::{Client, Event, Generation, Looked, Lookup, WallClock};
 use fictionet::stdlib::services::serve::Transport;
-use fictionet::stdlib::world::net::dns::internet::{self, GTLD_SERVERS, Mirror, ROOT_LETTERS};
+use fictionet::stdlib::world::net::dns::internet::{
+    self, GTLD_SERVERS, Mirror, NameServer, ROOT_SERVERS,
+};
 use fictionet::stdlib::world::net::dns::{self, Recursive, Upstream};
 use fictionet::stdlib::world::net::{Host, Net, NetHandle};
 use fictionet_extras::dns::place::{Place, ResolverSite};
 use fictionet_extras::dns::public::{PUBLIC_RESOLVERS, PublicResolver};
+use fictionet_extras::dns::{roots, unbound};
 use fictionet_test_support::sandbox::{Machine, machine};
 use fictionet_test_support::timeout;
 
@@ -131,9 +134,9 @@ impl Hierarchy {
         let zone = |text: &str| Arc::new(Zone::from_master(text, None).expect("a test zone"));
         let root = Arc::new(internet::root_zone(ROOT).expect("the test root zone"));
         let at = |a: [u8; 4]| vec![IpAddr::V4(Ipv4Addr::from(a))];
-        let letters = ROOT_LETTERS
+        let letters = ROOT_SERVERS
             .iter()
-            .map(|letter| IpAddr::V4(letter.server.v4))
+            .map(|letter| IpAddr::V4(letter.v4))
             .collect();
         Hierarchy {
             servers: Arc::new(vec![
@@ -262,8 +265,8 @@ fn mirror(upstream: impl Upstream, handle: NetHandle) -> Mirror {
         .delay(at.authority_rtt / 2)
         .egress(IpAddr::V4(EGRESS))
         .wrap(move |authority| echo.over(authority));
-    for letter in &ROOT_LETTERS {
-        for addr in letter.server.addresses() {
+    for letter in &ROOT_SERVERS {
+        for addr in letter.addresses() {
             mirror = mirror.serves(addr, &Name::root());
         }
     }
@@ -363,19 +366,26 @@ fn no_public_host_has_a_special_purpose_address() {
     }
 }
 
-/// The resolver hints and the root letter presets name the same servers
-/// at the same addresses.
+/// The resolver hints, the hints a configuration starts from, and the
+/// root letters the extras give fronts to name the same servers at the
+/// same addresses.
 #[test]
 fn the_root_hints_are_the_root_letters() {
-    let letters: Vec<(Name, IpAddr)> = ROOT_LETTERS
+    let letters: Vec<(Name, IpAddr)> = ROOT_SERVERS
         .iter()
         .flat_map(|letter| {
-            let name = letter.server.name();
-            letter.server.addresses().map(|addr| (name.clone(), addr))
+            let name = letter.name();
+            letter.addresses().map(|addr| (name.clone(), addr))
         })
         .collect();
     assert_eq!(internet::root_hints(), letters);
-    assert_eq!(Config::unbound().hints, letters);
+    assert_eq!(Config::new().hints, letters);
+    assert_eq!(unbound::config().hints, letters);
+    let fronted: Vec<NameServer> = roots::ROOT_LETTERS
+        .iter()
+        .map(|letter| letter.server)
+        .collect();
+    assert_eq!(fronted, ROOT_SERVERS);
 }
 
 /// `dig @198.41.0.4 . NS` at a root letter copying the hierarchy: the
@@ -394,7 +404,7 @@ fn a_root_letter_answers_the_root_ns_as_dig_sees_it() {
             .hosts(at.gtld_servers(|s| mirror.server(s)))
             .start(&fcx, attachments)?;
         let m = machine(&fcx, attacher.attach("client")?, ME);
-        let a_root = ROOT_LETTERS[0].server.v4;
+        let a_root = ROOT_SERVERS[0].v4;
 
         let sent = fcx.now().since_start();
         let reply = ask(&fcx, &m, a_root, &query(7, ".", RecordType::NS, false))
@@ -414,18 +424,18 @@ fn a_root_letter_answers_the_root_ns_as_dig_sees_it() {
                 _ => None,
             })
             .collect();
-        let expected: Vec<String> = ROOT_LETTERS
+        let expected: Vec<String> = ROOT_SERVERS
             .iter()
-            .map(|letter| letter.server.host.to_string())
+            .map(|letter| letter.host.to_string())
             .collect();
         let mut sorted = servers.clone();
         sorted.sort();
         assert_eq!(sorted, expected);
         let mut glue = addresses(&reply);
         glue.sort();
-        let mut letters: Vec<IpAddr> = ROOT_LETTERS
+        let mut letters: Vec<IpAddr> = ROOT_SERVERS
             .iter()
-            .map(|letter| IpAddr::V4(letter.server.v4))
+            .map(|letter| IpAddr::V4(letter.v4))
             .collect();
         letters.sort();
         assert_eq!(glue, letters);
@@ -467,7 +477,7 @@ fn a_mirrored_server_names_one_instance_by_chaos_and_by_nsid() {
         net.hosts(at.root_servers(|s| mirror.server(s)))
             .start(&fcx, attachments)?;
         let m = machine(&fcx, attacher.attach("client")?, ME);
-        let a_root = ROOT_LETTERS[0].server.v4;
+        let a_root = ROOT_SERVERS[0].v4;
         let site = at.site(IpAddr::V4(a_root)).identity;
         assert!(site.nsid.is_some());
 
@@ -559,10 +569,9 @@ fn a_placed_host_makes_the_names_above_it_exist() {
     });
 }
 
-/// The root zone of `placing` answers its own NS RRset, `localhost.`, as
-/// an Unbound static local zone at the root does: the view knows that no
-/// host has the name of the NS target, so nothing goes in the additional
-/// section.
+/// The root zone of `placing` answers its own NS RRset, which names the
+/// root itself (RFC 6303 §3): the view knows that no host has the name
+/// of the NS target, so nothing goes in the additional section.
 #[test]
 fn the_placing_root_answers_its_ns_set() {
     world(Duration::from_secs(60), |fcx| async move {
@@ -591,7 +600,7 @@ fn the_placing_root_answers_its_ns_set() {
                 _ => None,
             })
             .collect();
-        assert_eq!(ns, vec!["localhost.".to_string()]);
+        assert_eq!(ns, vec![".".to_string()]);
         assert!(reply.additionals.is_empty());
         Ok(())
     });
@@ -639,7 +648,7 @@ fn the_mirror_places_a_server_at_referral_glue_before_the_reply_leaves() {
         net.hosts(at.root_servers(|s| mirror.server(s)))
             .start(&fcx, attachments)?;
         let m = machine(&fcx, attacher.attach("client")?, ME);
-        let a_root = ROOT_LETTERS[0].server.v4;
+        let a_root = ROOT_SERVERS[0].v4;
         let ns = v4(45, 33, 5, 53);
 
         assert!(!handle.has_machine(ns));
@@ -691,7 +700,7 @@ fn a_mirrored_name_server_refuses_zone_transfers() {
         net.hosts(at.root_servers(|s| mirror.server(s)))
             .start(&fcx, attachments)?;
         let m = machine(&fcx, attacher.attach("client")?, ME);
-        let a_root = ROOT_LETTERS[0].server.v4;
+        let a_root = ROOT_SERVERS[0].v4;
         let ns = v4(45, 33, 5, 53);
         ask(
             &fcx,
@@ -737,7 +746,7 @@ fn the_mirror_places_no_server_at_the_egress() {
         net.hosts(at.root_servers(|s| mirror.server(s)))
             .start(&fcx, attachments)?;
         let m = machine(&fcx, attacher.attach("client")?, ME);
-        let a_root = ROOT_LETTERS[0].server.v4;
+        let a_root = ROOT_SERVERS[0].v4;
         let egress = IpAddr::V4(EGRESS);
 
         let reply = ask(&fcx, &m, a_root, &query(1, "x.home.", RecordType::A, false))
@@ -782,7 +791,7 @@ fn a_glueless_delegation_resolves_through_the_answer_for_its_name_server() {
         // The test hierarchy is unsigned.
         let config = Config {
             anchors: None,
-            ..Config::unbound()
+            ..unbound::config()
         };
         let (attacher, attachments) = fictionet::attachments();
         let net = Net::new().ipv4_only();
@@ -832,7 +841,7 @@ fn a_glueless_name_server_known_before_its_delegation_gets_a_server() {
         };
         let config = Config {
             anchors: None,
-            ..Config::unbound()
+            ..unbound::config()
         };
         let (attacher, attachments) = fictionet::attachments();
         let net = Net::new().ipv4_only();
@@ -888,7 +897,7 @@ fn addresses_on_the_sandbox_subnet_or_off_the_internet_are_never_placed() {
         net.hosts(at.root_servers(|s| mirror.server(s)))
             .start(&fcx, attachments)?;
         let m = machine(&fcx, attacher.attach("client")?, me);
-        let a_root = ROOT_LETTERS[0].server.v4;
+        let a_root = ROOT_SERVERS[0].v4;
 
         for (id, name, glue) in [
             (1, "x.lan.", v4(45, 60, 0, 77)),
@@ -928,7 +937,7 @@ fn a_front_goes_at_the_addresses_answered_for_its_name() {
         net.hosts(at.root_servers(|s| mirror.server(s)))
             .start(&fcx, attachments)?;
         let m = machine(&fcx, attacher.attach("client")?, ME);
-        let a_root = ROOT_LETTERS[0].server.v4;
+        let a_root = ROOT_SERVERS[0].v4;
         let front = v4(45, 33, 6, 6);
 
         for id in [1, 2] {
@@ -971,7 +980,7 @@ fn a_front_for_an_alias_goes_at_its_targets_addresses() {
         net.hosts(at.root_servers(|s| mirror.server(s)))
             .start(&fcx, attachments)?;
         let m = machine(&fcx, attacher.attach("client")?, ME);
-        let a_root = ROOT_LETTERS[0].server.v4;
+        let a_root = ROOT_SERVERS[0].v4;
         let front = v4(45, 33, 6, 6);
 
         assert!(!handle.has_machine(front));
@@ -1005,7 +1014,7 @@ fn a_front_below_a_dname_goes_at_its_substitutes_addresses() {
         net.hosts(at.root_servers(|s| mirror.server(s)))
             .start(&fcx, attachments)?;
         let m = machine(&fcx, attacher.attach("client")?, ME);
-        let a_root = ROOT_LETTERS[0].server.v4;
+        let a_root = ROOT_SERVERS[0].v4;
         let front = v4(45, 33, 6, 7);
 
         assert!(!handle.has_machine(front));
@@ -1058,7 +1067,7 @@ fn observers_see_each_filing_before_the_reply_leaves() {
         net.hosts(at.root_servers(|s| mirror.server(s)))
             .start(&fcx, attachments)?;
         let m = machine(&fcx, attacher.attach("client")?, ME);
-        let a_root = ROOT_LETTERS[0].server.v4;
+        let a_root = ROOT_SERVERS[0].v4;
         let ns = v4(45, 33, 5, 53);
 
         ask(

@@ -40,19 +40,18 @@ use fictionet::stdlib::protocols::dns::dnssec::{
 use fictionet::stdlib::protocols::dns::rr::{Name, RecordSet};
 use fictionet::stdlib::services::dns::WallClock;
 use fictionet::stdlib::services::dns::authority::{
-    Authority, AuthorityEngine, Overlay, ServerConfig, Zones,
+    Authority, AuthorityEngine, ChaosAnswer, Identity, Overlay, ServerConfig, Zones, chaos,
 };
 use fictionet::stdlib::services::dns::memory::MemoryNet;
-use fictionet::stdlib::services::dns::resolver::Config;
+use fictionet::stdlib::services::dns::resolver::{Config, NameServer, ROOT_SERVERS};
 use fictionet::stdlib::services::dns::zone::{AnyResponse, Denial, Zone, ZoneData};
 use fictionet::stdlib::world::net::Host;
 use fictionet::stdlib::world::net::dns::Authoritative;
-use fictionet::stdlib::world::net::dns::internet::{
-    self, ARPA_SERVERS, GTLD_SERVERS, IN_ADDR_SERVERS, ROOT_LETTERS,
-};
+use fictionet::stdlib::world::net::dns::internet::GTLD_SERVERS;
 use fictionet::{Seed, SeededEntropy};
 use fictionet_extras::dns::place::Place;
 use fictionet_extras::dns::public::PUBLIC_RESOLVERS;
+use fictionet_extras::dns::{roots, unbound};
 
 /// The date every test of this internet runs at: 2026-11-01 00:00:00 UTC.
 pub const START: u64 = 1_793_491_200;
@@ -76,6 +75,75 @@ pub const EXAMPLE_ORG: Ipv4Addr = Ipv4Addr::new(45, 33, 24, 53);
 pub const FICT_COM: Ipv4Addr = Ipv4Addr::new(45, 33, 25, 53);
 /// The server of `dnssec-failed.com`.
 pub const DNSSEC_FAILED: Ipv4Addr = Ipv4Addr::new(45, 33, 26, 53);
+
+/// `<letter>.ns.arpa.` on the root letter `index` of [`ROOT_SERVERS`].
+const fn arpa(host: &'static str, index: usize) -> NameServer {
+    NameServer {
+        host,
+        v4: ROOT_SERVERS[index].v4,
+        v6: ROOT_SERVERS[index].v6,
+    }
+}
+
+/// The servers of `arpa`: every root letter but j, each at the same
+/// addresses as its letter, as IANA's root zone database lists them
+/// (`https://www.iana.org/domains/root/db/arpa.html`). The root servers
+/// answer for `arpa` themselves, so a mirror serves its copy at the
+/// root addresses once a root server answers from it.
+pub const ARPA_SERVERS: [NameServer; 12] = [
+    arpa("a.ns.arpa.", 0),
+    arpa("b.ns.arpa.", 1),
+    arpa("c.ns.arpa.", 2),
+    arpa("d.ns.arpa.", 3),
+    arpa("e.ns.arpa.", 4),
+    arpa("f.ns.arpa.", 5),
+    arpa("g.ns.arpa.", 6),
+    arpa("h.ns.arpa.", 7),
+    arpa("i.ns.arpa.", 8),
+    arpa("k.ns.arpa.", 10),
+    arpa("l.ns.arpa.", 11),
+    arpa("m.ns.arpa.", 12),
+];
+
+const fn server(host: &'static str, v4: Ipv4Addr, v6: Ipv6Addr) -> NameServer {
+    NameServer { host, v4, v6 }
+}
+
+/// The servers of `in-addr.arpa`, the reverse names of IPv4 addresses,
+/// which IANA runs under `in-addr-servers.arpa` (RFC 5855). Addresses from
+/// the glue of the `arpa` zone, asked of a.ns.arpa on 2026-11-01.
+pub const IN_ADDR_SERVERS: [NameServer; 6] = [
+    server(
+        "a.in-addr-servers.arpa.",
+        Ipv4Addr::new(199, 180, 182, 53),
+        Ipv6Addr::new(0x2620, 0x37, 0xe000, 0, 0, 0, 0, 0x53),
+    ),
+    server(
+        "b.in-addr-servers.arpa.",
+        Ipv4Addr::new(199, 253, 183, 183),
+        Ipv6Addr::new(0x2001, 0x500, 0x87, 0, 0, 0, 0, 0x87),
+    ),
+    server(
+        "c.in-addr-servers.arpa.",
+        Ipv4Addr::new(196, 216, 169, 10),
+        Ipv6Addr::new(0x2001, 0x43f8, 0x110, 0, 0, 0, 0, 0x10),
+    ),
+    server(
+        "d.in-addr-servers.arpa.",
+        Ipv4Addr::new(200, 10, 60, 53),
+        Ipv6Addr::new(0x2001, 0x13c7, 0x7010, 0, 0, 0, 0, 0x53),
+    ),
+    server(
+        "e.in-addr-servers.arpa.",
+        Ipv4Addr::new(203, 119, 86, 101),
+        Ipv6Addr::new(0x2001, 0xdd8, 0x6, 0, 0, 0, 0, 0x101),
+    ),
+    server(
+        "f.in-addr-servers.arpa.",
+        Ipv4Addr::new(193, 0, 9, 1),
+        Ipv6Addr::new(0x2a13, 0x27c0, 0x30, 0, 0, 0, 0, 0x1),
+    ),
+];
 
 /// The IANA servers `ipv4only.arpa` is delegated to, with the addresses
 /// they had on 2026-11-01.
@@ -352,13 +420,15 @@ impl TestInternet {
         &self.place
     }
 
-    /// An Unbound-like resolver for this internet: [`Config::gateway`],
-    /// which sends Extended DNS Errors, with the real root hints, whose
+    /// An Unbound-like resolver for this internet: [`unbound::config`]
+    /// sending Extended DNS Errors, with the real root hints, whose
     /// addresses the test root letters have, and the test root's anchor.
     pub fn config(&self) -> Config {
-        Config::gateway()
-            .hints(&internet::root_hints())
-            .anchors(self.anchors())
+        Config {
+            ede: true,
+            ..unbound::config()
+        }
+        .anchors(self.anchors())
     }
 
     /// Every server as an engine in memory, at every address it has. Each
@@ -375,15 +445,15 @@ impl TestInternet {
                     );
                 }
             };
-        for letter in &ROOT_LETTERS {
+        for server in &ROOT_SERVERS {
             serve(
-                &letter.server.addresses(),
-                &self.letter_front(letter.server.v4),
+                &server.addresses(),
+                &self.letter_front(server.v4),
                 &self.root,
             );
         }
         for server in &GTLD_SERVERS {
-            let front = ServerConfig::gtld(self.place.site(IpAddr::V4(server.v4)).identity);
+            let front = roots::gtld_front(self.place.site(IpAddr::V4(server.v4)).identity);
             serve(&server.addresses(), &front, &self.gtld);
         }
         for server in &self.servers {
@@ -414,15 +484,30 @@ impl TestInternet {
 
     /// The front [`Place::root_servers`] gives the letter at `v4`.
     pub fn letter_front(&self, v4: Ipv4Addr) -> ServerConfig {
-        let letter = ROOT_LETTERS
-            .iter()
-            .find(|letter| letter.server.v4 == v4)
-            .expect("a root letter");
-        ServerConfig {
-            payload: letter.payload,
-            any: letter.any,
-            ..ServerConfig::root(self.place.site(IpAddr::V4(v4)).identity)
-        }
+        let letter = roots::letter_at(v4).expect("a root letter");
+        letter.front(self.place.site(IpAddr::V4(v4)).identity)
+    }
+}
+
+/// dnsmasq forwarding every question to `forward`, as a home router runs
+/// it: no root hints, no local zones, no validation, and no QNAME
+/// minimisation; a 1232-octet payload; and TTLs capped only by RFC 8767
+/// §4. It answers `version.bind` with its version and refuses other CHAOS
+/// names. What it does not show takes Unbound's values.
+pub fn dnsmasq(forward: Vec<SocketAddr>) -> Config {
+    let version = ChaosAnswer::Txt("dnsmasq-2.91".to_string());
+    Config {
+        hints: Vec::new(),
+        forward: vec![(Name::root(), forward)],
+        local: Vec::new(),
+        minimise: None,
+        anchors: None,
+        policy: AlgorithmPolicy::iana(),
+        max_ttl: Duration::from_secs(604800),
+        max_negative_ttl: Duration::from_secs(604800),
+        aggressive_nsec: false,
+        identity: Identity::none().answer(chaos::version_bind(), version),
+        ..unbound::config()
     }
 }
 
@@ -516,9 +601,9 @@ fn servers_of(owner: &str, ttl: u32, servers: &[(&str, Ipv4Addr, Option<Ipv6Addr
 }
 
 fn letters() -> Vec<(&'static str, Ipv4Addr, Option<Ipv6Addr>)> {
-    ROOT_LETTERS
+    ROOT_SERVERS
         .iter()
-        .map(|letter| (letter.server.host, letter.server.v4, Some(letter.server.v6)))
+        .map(|server| (server.host, server.v4, Some(server.v6)))
         .collect()
 }
 

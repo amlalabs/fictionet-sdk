@@ -28,7 +28,7 @@ use fictionet::stdlib::services::dns::Event;
 use fictionet::stdlib::services::dns::authority::{ChaosAnswer, Identity, chaos};
 use fictionet::stdlib::world::net::Net;
 use fictionet::stdlib::world::net::dns::Recursive;
-use fictionet::stdlib::world::net::dns::internet::{GTLD_SERVERS, ROOT_LETTERS};
+use fictionet::stdlib::world::net::dns::internet::{GTLD_SERVERS, ROOT_SERVERS};
 use fictionet_extras::dns::public::PUBLIC_RESOLVERS;
 use fictionet_test_support::dns::{
     ECH, EGRESS, EXAMPLE_COM, ROOT_SERIAL, TestInternet, WWW_EXAMPLE_COM,
@@ -183,14 +183,11 @@ fn p_root() {
         assert!(!reply.metadata.recursion_available);
         let mut servers = data(&reply.answers, RecordType::NS);
         servers.sort();
-        let letters: Vec<String> = ROOT_LETTERS
-            .iter()
-            .map(|l| l.server.host.to_string())
-            .collect();
+        let letters: Vec<String> = ROOT_SERVERS.iter().map(|l| l.host.to_string()).collect();
         assert_eq!(servers, letters);
         let glue = addresses(&reply.additionals);
-        for letter in &ROOT_LETTERS {
-            for address in letter.server.addresses() {
+        for letter in &ROOT_SERVERS {
+            for address in letter.addresses() {
                 assert!(glue.contains(&address), "{address} in {glue:?}");
             }
         }
@@ -481,9 +478,9 @@ fn nsid(reply: &Message) -> Option<Vec<u8>> {
 #[test]
 fn p_edns() {
     probe(|fcx, p| async move {
-        let letter = ROOT_LETTERS
+        let letter = ROOT_SERVERS
             .iter()
-            .map(|letter| letter.server.v4)
+            .map(|letter| letter.v4)
             .find(|v4| {
                 p.internet
                     .place()
@@ -754,10 +751,10 @@ fn p_nxcut() {
 /// RCODE and its text.
 fn identity_answer(identity: &Identity, name: LowerName) -> (ResponseCode, Vec<String>) {
     match identity.chaos.get(&name) {
-        Some(ChaosAnswer::Txt(text) | ChaosAnswer::Zone(Some(text))) => {
-            (ResponseCode::NoError, vec![text.clone()])
+        Some(ChaosAnswer::Txt(text)) => (ResponseCode::NoError, vec![text.clone()]),
+        Some(ChaosAnswer::Zone(zone)) => {
+            (ResponseCode::NoError, zone.txt.iter().cloned().collect())
         }
-        Some(ChaosAnswer::Zone(None)) => (ResponseCode::NoError, Vec::new()),
         Some(ChaosAnswer::Reply(reply)) => (reply.rcode, Vec::new()),
         None => (identity.unlisted.rcode, Vec::new()),
     }
@@ -770,7 +767,7 @@ fn identity_answer(identity: &Identity, name: LowerName) -> (ResponseCode, Vec<S
 fn p_chaos() {
     probe(|fcx, p| async move {
         let at = p.internet.place().clone();
-        let k_root = ROOT_LETTERS[10].server.v4;
+        let k_root = ROOT_SERVERS[10].v4;
         let unbound = Identity::none().answer(
             chaos::version_bind(),
             ChaosAnswer::Txt("unbound 1.26.2".to_string()),

@@ -23,10 +23,10 @@ use fictionet::stdlib::protocols::dns::rr::{
 };
 use fictionet::stdlib::protocols::dns::{Ede, EdeCode, Nsid, Request, Response};
 use fictionet::stdlib::services::dns::authority::{
-    Authority, AuthorityEngine, ChaosAnswer, ChaosReply, Identity, Observe, Overlay, ServerConfig,
-    Step, Zones, bare_reply, chaos,
+    Authority, AuthorityEngine, ChaosAnswer, ChaosReply, Copies, Identity, Observe, Overlay,
+    ServerConfig, Step, Zones, bare_reply, chaos,
 };
-use fictionet::stdlib::services::dns::zone::{Fact, Lazy, Learned, Transparent, Zone, ZoneData};
+use fictionet::stdlib::services::dns::zone::{Fact, Lazy, Transparent, Zone, ZoneData};
 use fictionet::stdlib::services::dns::{
     Action, Client, ClientQuery, Engine, Event, ExchangeFailure, Generation, Input, Looked, Lookup,
     LookupOutcome, Session, Token, Unmatched, WallClock,
@@ -34,6 +34,8 @@ use fictionet::stdlib::services::dns::{
 use fictionet::stdlib::services::serve::Transport;
 use fictionet::time::Instant;
 use fictionet::{Seed, SeededEntropy};
+use fictionet_extras::dns::bind;
+use fictionet_extras::dns::roots::gtld_front;
 
 /// The server the engines under test run at.
 const LOCAL: &str = "192.0.2.53:53";
@@ -279,7 +281,7 @@ impl Authority for Counting {
 
 /// A server of `example.test.` whose zone is learned from the real
 /// server at its own address.
-fn learned_engine() -> AuthorityEngine<Zones> {
+fn learned_engine() -> AuthorityEngine<Copies> {
     AuthorityEngine::new(
         learned(&["example.test."]),
         ServerConfig::generic(),
@@ -287,14 +289,14 @@ fn learned_engine() -> AuthorityEngine<Zones> {
     )
 }
 
-/// Servers for learned zones at `apexes`.
-fn learned(apexes: &[&str]) -> Zones {
-    Zones::new(
-        apexes
-            .iter()
-            .map(|apex| Arc::new(Learned::new(&name(apex))) as Arc<dyn ZoneData>)
-            .collect(),
-    )
+/// Copies of the zones at `apexes`, served at [`LOCAL`] and learned from
+/// the real server there.
+fn learned(apexes: &[&str]) -> Copies {
+    let copies = Copies::new();
+    for apex in apexes {
+        copies.serves(local().ip(), &LowerName::new(&name(apex)));
+    }
+    copies
 }
 
 /// The lookup a learned server at [`LOCAL`] makes of `qname` and `qtype`
@@ -736,16 +738,18 @@ fn chaos_questions_are_answered_by_name_from_the_identity() {
     }
 }
 
-/// Each CHAOS name of a BIND server is a zone of its own, as c.root,
-/// g.root, and a local BIND 9.20 answered on 2026-11-02.
+/// A CHAOS name with a zone of its own answers from the zone's records,
+/// as each CHAOS name of a BIND server does ([`bind::chaos_zone`]).
 #[test]
-fn bind_serves_each_chaos_name_as_a_zone() {
+fn a_chaos_zone_answers_from_its_records() {
+    let hostname = chaos::hostname_bind();
+    let authors = chaos::authors_bind();
     let identity = Identity::none()
         .answer(
-            chaos::hostname_bind(),
-            ChaosAnswer::Zone(Some("lax1a".to_string())),
+            hostname.clone(),
+            bind::chaos_zone(&hostname, Some("lax1a".to_string())),
         )
-        .answer(chaos::authors_bind(), ChaosAnswer::Zone(None))
+        .answer(authors.clone(), bind::chaos_zone(&authors, None))
         .answer(
             chaos::version_server(),
             ChaosAnswer::Reply(ChaosReply::rcode(ResponseCode::Refused)),
@@ -773,13 +777,13 @@ fn bind_serves_each_chaos_name_as_a_zone() {
 
     // (question, RD, RCODE, answer section, authority section)
     let cases = [
-        // The text, with the zone's NS when RD is clear.
+        // The text, whatever RD says.
         (
             ("hostname.bind.", Txt),
             false,
             ResponseCode::NoError,
             vec![host(Txt, 0)],
-            vec![host(Ns, 0)],
+            vec![],
         ),
         (
             ("hostname.bind.", Txt),
@@ -794,7 +798,7 @@ fn bind_serves_each_chaos_name_as_a_zone() {
             false,
             ResponseCode::NoError,
             vec![host(Soa, 86400)],
-            vec![host(Ns, 0)],
+            vec![],
         ),
         (
             ("hostname.bind.", Ns),
@@ -818,7 +822,7 @@ fn bind_serves_each_chaos_name_as_a_zone() {
             vec![],
             vec![host(Soa, 86400)],
         ),
-        // Below the zone is NXDOMAIN with the SOA, TTL 0 for an SOA question.
+        // Below the zone is NXDOMAIN with the SOA.
         (
             ("foo.hostname.bind.", Txt),
             false,
@@ -831,7 +835,7 @@ fn bind_serves_each_chaos_name_as_a_zone() {
             false,
             ResponseCode::NXDomain,
             vec![],
-            vec![host(Soa, 0)],
+            vec![host(Soa, 86400)],
         ),
         // A zone with no text.
         (
@@ -890,36 +894,55 @@ fn bind_serves_each_chaos_name_as_a_zone() {
 }
 
 #[test]
-fn zone_transfers_reach_the_authority_only_when_offered() {
+fn zone_transfers_are_the_authoritys_to_decide() {
     let calls = Arc::new(AtomicUsize::new(0));
     let axfr = query("example.test.", RecordType::AXFR, |_| {});
 
+    // Over UDP a transfer is malformed (RFC 5936 §4.2), and never reaches
+    // the authority.
     let mut engine =
         AuthorityEngine::new(Counting(calls.clone()), ServerConfig::generic(), local());
-    let reply = the_answer(&ask_with(&mut engine, &axfr, Transport::Tcp));
-    assert_eq!(reply.metadata.response_code, ResponseCode::Refused);
-    assert_eq!(calls.load(Ordering::SeqCst), 0);
-    // Over UDP a transfer is malformed (RFC 5936 §4.2).
     let reply = the_answer(&ask_with(&mut engine, &axfr, Transport::Udp));
     assert_eq!(reply.metadata.response_code, ResponseCode::FormErr);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
 
-    let mut offering = ServerConfig::generic();
-    offering.transfer = true;
-    let mut engine = AuthorityEngine::new(Counting(calls.clone()), offering.clone(), local());
+    // Over TCP the authority decides it, as any question.
     ask_with(&mut engine, &axfr, Transport::Tcp);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-    // Zone data answers questions; it cannot list a zone, so zones refuse.
-    let mut engine = AuthorityEngine::new(zones(vec![example()]), offering, local());
+    // Zone data answers questions; it cannot list a zone, so zones refuse,
+    // and so do their copies and an overlay on them.
+    let mut engine = AuthorityEngine::new(zones(vec![example()]), ServerConfig::generic(), local());
     let reply = the_answer(&ask_with(&mut engine, &axfr, Transport::Tcp));
     assert_eq!(reply.metadata.response_code, ResponseCode::Refused);
+    let mut engine = learned_engine();
+    let actions = ask_with(&mut engine, &axfr, Transport::Tcp);
+    assert!(lookups(&actions).is_empty());
+    assert_eq!(
+        the_answer(&actions).metadata.response_code,
+        ResponseCode::Refused
+    );
+    for qname in ["fict.com.", "www.fict.com.", "com."] {
+        let axfr = query(qname, RecordType::AXFR, |_| {});
+        let mut engine = AuthorityEngine::new(overlay(), ServerConfig::generic(), local());
+        let actions = ask_with(&mut engine, &axfr, Transport::Tcp);
+        assert!(lookups(&actions).is_empty(), "{qname}");
+        let reply = the_answer(&actions);
+        assert_eq!(
+            reply.metadata.response_code,
+            ResponseCode::Refused,
+            "{qname}"
+        );
+        assert!(reply.authorities.is_empty(), "{qname}: no referral");
+    }
 }
 
-/// A server that does not offer transfers refuses one of a CHAOS zone too
-/// (RFC 5936 §2.2), as BIND does, rather than answering it as a question.
+/// A transfer of a CHAOS zone is refused (RFC 5936 §2.2), as BIND
+/// refuses it, rather than answered as a question.
 #[test]
-fn a_chaos_zone_transfer_is_refused_when_transfers_are_not_offered() {
-    let identity = Identity::none().answer(chaos::version_bind(), ChaosAnswer::Zone(None));
+fn a_chaos_zone_transfer_is_refused() {
+    let version = chaos::version_bind();
+    let identity = Identity::none().answer(version.clone(), bind::chaos_zone(&version, None));
     let server = ServerConfig {
         identity,
         ..ServerConfig::generic()
@@ -1070,6 +1093,11 @@ fn a_learned_server_is_silent_when_the_lookup_gets_no_reply() {
     assert_eq!(engine.next_deadline(), None);
 }
 
+/// A copy's server sends nothing when the real server could not be
+/// reached or sent nothing. When the real server refused the question, or
+/// answered it without authority, it does not serve the zone (RFC 8906
+/// §3.1.1), and the copy's server refuses it too ([`Copies`]). It never
+/// makes up an answer.
 #[test]
 fn a_learned_server_is_silent_when_the_real_server_is_unreachable_or_says_nothing() {
     let refused = |lookup: &Lookup| {
@@ -1091,13 +1119,13 @@ fn a_learned_server_is_silent_when_the_real_server_is_unreachable_or_says_nothin
     };
     // What the upstream gives the lookup, in each case.
     type Gives = fn(&Lookup) -> Looked;
-    let outcomes: [(&str, Gives); 4] = [
-        ("unreachable", |_| Looked::Unreachable),
-        ("no reply", |_| Looked::NoReply),
-        ("refused", refused),
-        ("lame", lame),
+    let outcomes: [(&str, Gives, &[&str]); 4] = [
+        ("unreachable", |_| Looked::Unreachable, &["looked"]),
+        ("no reply", |_| Looked::NoReply, &["looked"]),
+        ("refused", refused, &["looked", "reply", "answer"]),
+        ("lame", lame, &["looked", "reply", "answer"]),
     ];
-    for (what, outcome) in outcomes {
+    for (what, outcome, expected) in outcomes {
         let mut engine = learned_engine();
         let actions = ask_with(
             &mut engine,
@@ -1106,7 +1134,16 @@ fn a_learned_server_is_silent_when_the_real_server_is_unreachable_or_says_nothin
         );
         let (token, lookup) = lookups(&actions)[0].clone();
         let actions = run(&mut engine, looked(token, outcome(&lookup)), Instant::ZERO);
-        assert_eq!(kinds(&actions), ["looked"], "{what}");
+        assert_eq!(kinds(&actions), expected, "{what}");
+        if expected.contains(&"answer") {
+            let reply = the_answer(&actions);
+            assert_eq!(
+                reply.metadata.response_code,
+                ResponseCode::Refused,
+                "{what}"
+            );
+            assert!(reply.answers.is_empty(), "{what}");
+        }
         assert_eq!(engine.next_deadline(), None, "{what}");
     }
 }
@@ -1351,7 +1388,7 @@ fn fict() -> Zone {
 
 /// `fict.com.` invented below a server of `com.` learned from the real
 /// one at its address.
-fn overlay() -> Overlay<Zones> {
+fn overlay() -> Overlay<Copies> {
     Overlay::new(learned(&["com."]), name("com.")).below(name("fict.com."), zones(vec![fict()]))
 }
 
@@ -1409,7 +1446,7 @@ fn com_denial() -> Vec<Record> {
 
 #[test]
 fn an_overlay_refers_with_the_denial_records_its_base_copied() {
-    let mut engine = AuthorityEngine::new(overlay(), ServerConfig::gtld(Identity::none()), local());
+    let mut engine = AuthorityEngine::new(overlay(), gtld_front(Identity::none()), local());
     let message = query("www.fict.com.", RecordType::A, |m| {
         m.set_edns(edns(1232, true));
     });
@@ -1567,8 +1604,7 @@ fn an_overlay_sends_the_unsigned_delegation_proof_without_the_wildcard_cover() {
         ("www.fict.com.", RecordType::A),
         ("fict.com.", RecordType::DS),
     ] {
-        let mut engine =
-            AuthorityEngine::new(overlay(), ServerConfig::gtld(Identity::none()), local());
+        let mut engine = AuthorityEngine::new(overlay(), gtld_front(Identity::none()), local());
         let message = query(qname, qtype, |m| {
             m.set_edns(edns(1232, true));
         });

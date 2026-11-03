@@ -32,7 +32,7 @@ use fictionet::stdlib::services::dns::authority::{AuthorityEngine, Copies, Serve
 use fictionet::stdlib::services::dns::memory::{Exchanges, MemoryNet, Recording, drive};
 use fictionet::stdlib::services::dns::resolver::{Config, Resolver};
 use fictionet::stdlib::services::dns::zone::{
-    AnyResponse, Denial, Fact, Lazy, Learned, Node, Provider, Signed, Zone, ZoneBuilder, ZoneData,
+    AnyResponse, Denial, Fact, Lazy, Node, Provider, Signed, Zone, ZoneBuilder, ZoneData,
 };
 use fictionet::stdlib::services::dns::{
     Action, Client, ClientQuery, Engine, Event, Generation, Input, Looked, Lookup, Session, Tokens,
@@ -40,10 +40,11 @@ use fictionet::stdlib::services::dns::{
 };
 use fictionet::stdlib::services::serve::Transport;
 use fictionet::stdlib::world::net::dns::Recursive;
-use fictionet::stdlib::world::net::dns::internet::{GTLD_SERVERS, ROOT_LETTERS};
+use fictionet::stdlib::world::net::dns::internet::{GTLD_SERVERS, ROOT_SERVERS};
 use fictionet::stdlib::world::net::{Host, Net};
 use fictionet::time::Instant;
 use fictionet::{Cx, Entropy, Seed, SeededEntropy};
+use fictionet_extras::dns::roots;
 use fictionet_test_support::dns::{DNSSEC_FAILED, EXAMPLE_COM, TestInternet, v6};
 use fictionet_test_support::sandbox::{Machine, machine};
 use fictionet_test_support::timeout;
@@ -734,11 +735,11 @@ fn the_validator_sees_the_same_records_however_they_are_served_or_signed() {
         // The servers at example.com's addresses answer from a copy of
         // what the complete zone's servers answer them; every other
         // server answers from its zones as before.
-        let learned = Arc::new(Learned::new(&apex)) as Arc<dyn ZoneData>;
-        let mut served: MemoryNet = internet
-            .clone()
-            .serving("example.com.", Zones::new(vec![learned]))
-            .memory();
+        let copies = Copies::new();
+        for address in example_com() {
+            copies.serves(address, &LowerName::new(&apex));
+        }
+        let mut served: MemoryNet = internet.clone().serving("example.com.", copies).memory();
         let mut real = internet
             .clone()
             .serving("example.com.", Zones::new(vec![complete.clone()]))
@@ -856,15 +857,15 @@ fn copying(real: &TestInternet, world: TestInternet) -> MemoryNet {
             );
         }
     };
-    for letter in &ROOT_LETTERS {
-        let front = real.letter_front(letter.server.v4);
-        serve(letter.server.addresses().to_vec(), front, &["."]);
+    for letter in &ROOT_SERVERS {
+        let front = real.letter_front(letter.v4);
+        serve(letter.addresses().to_vec(), front, &["."]);
     }
     for server in &GTLD_SERVERS {
         let identity = real.place().site(IpAddr::V4(server.v4)).identity;
         serve(
             server.addresses().to_vec(),
-            ServerConfig::gtld(identity),
+            roots::gtld_front(identity),
             &["com.", "net."],
         );
     }

@@ -3,9 +3,9 @@ use fictionet::stdlib::protocols::dns::op::{Edns, OpCode, ResponseCode};
 use fictionet::stdlib::protocols::dns::rr::rdata::{NS, SOA};
 use fictionet::stdlib::protocols::dns::rr::{LowerName, Record, RecordSet};
 use fictionet::stdlib::protocols::dns::{Ede, EdeCode};
-use fictionet::stdlib::services::dns::authority::{ServerConfig, Zones};
-use fictionet::stdlib::services::dns::resolver::Config;
-use fictionet::stdlib::services::dns::zone::{Learned, Zone, ZoneData};
+use fictionet::stdlib::services::dns::authority::{Copies, ServerConfig, Zones};
+use fictionet::stdlib::services::dns::resolver::{Config, LocalZone};
+use fictionet::stdlib::services::dns::zone::Zone;
 use fictionet::stdlib::services::dns::{Client, Event, Looked, Lookup, WallClock};
 use fictionet::stdlib::services::serve::Transport;
 use fictionet::stdlib::world::net::{Lan, Pools};
@@ -1405,8 +1405,8 @@ fn only_looks_up_what_its_policy_allows() {
                 asked: asked.clone(),
             },
         );
-        let learned = Learned::new(&Name::from_ascii("test.").unwrap());
-        let zones = Zones::new(vec![Arc::new(learned) as Arc<dyn ZoneData>]);
+        let zones = Copies::new();
+        zones.serves(address.into(), &lower("test."));
         let (attacher, attachments) = fictionet::attachments();
         Net::new()
             .ipv4_only()
@@ -1492,10 +1492,10 @@ fn transparent_declared_names_leave_the_names_above_them_to_iteration() {
                 let config = Config {
                     anchors: None,
                     local: Vec::new(),
-                    ..Config::gateway()
+                    ..Config::new()
                 }
                 .hints(&[(Name::from_ascii("ns.").unwrap(), IpAddr::V4(root))])
-                .local(Arc::new(declared.transparent()));
+                .local(LocalZone::new(Arc::new(declared.transparent())));
                 h.program(Recursive::new(config, clock))
             })
             .start(&fcx, attachments)?;
@@ -1561,7 +1561,7 @@ fn advancing_a_namespace_reaches_a_running_resolver() {
         // The resolver iterates from this root, which is unsigned.
         let config = Config {
             anchors: None,
-            ..Config::gateway()
+            ..Config::new()
         }
         .hints(&[(Name::from_ascii("ns.")?, IpAddr::V4(root))]);
         let resolvers = namespace.clone();
@@ -1615,7 +1615,11 @@ fn a_resolver_handle_answers_as_udp_does() {
                 let clock = WallClock {
                     start: std::time::SystemTime::UNIX_EPOCH,
                 };
-                let resolver = Recursive::new(declared.over(Config::gateway()), clock);
+                let config = Config {
+                    hints: Vec::new(),
+                    ..Config::new()
+                };
+                let resolver = Recursive::new(declared.over(config), clock);
                 kept.lock().unwrap().push(resolver.handle());
                 h.program(resolver)
             })
