@@ -199,65 +199,69 @@ Run the agent under test in the same namespace. Its every packet is in
 `/tmp/honeypot.jsonl`, named `agent`. Linux clients send MP_CAPABLE when the
 program opens an MPTCP socket, or through `mptcpize run`.
 
-## The planned public setup
+## Dedicated raw virtio NIC
 
-These are instructions for the deployment, which has not been done. Do not
-run them before the deployment is approved, and check the cloud provider's
-acceptable-use policy first.
+The `raw-virtio` feature connects a dedicated virtio NIC directly to this
+world through `fictionet_host::raw`. The driver and bounded host pump own
+all device polling outside the run. Complete Ethernet frames cross the
+attachment before any Ethernet or IP parsing. Linux does not receive IP
+packets from that assigned NIC; the honeypot's existing `internet`
+attachment and simulated TCP stack handle them.
 
-The idea: the host's own kernel only forwards packets for the honeypot's
-address and never terminates them. Every packet for that address goes through
-a TUN device into the world.
+This is the integrated guest transport, not a public deployment. The driver
+currently supports a modern virtio-net device in an explicitly marked QEMU
+guest. Public hosting requires a suitable dedicated device and deployment
+support; the local sandbox attachment above is only an internal test path.
 
-1. **A cloud VM with two NICs.** The first is for the operators and stays in
-   the root namespace. The second carries the honeypot's traffic.
-2. **A kernel patched for CVE-2026-98432**, with MPTCP off on the host:
+Run this only inside the disposable QEMU guest described in
+[`host/README.md`](../../host/README.md), with `fictionet.rawnic=1` on its
+kernel command line, an IOMMU, and the dedicated NIC already bound to
+`vfio-pci`. The driver requires that guest setup. Build the example on the
+host, then run the resulting binary in the guest:
 
-   ```sh
-   sudo sysctl -w net.mptcp.enabled=0
-   ```
+```sh
+cargo build -p honeypot-world --features raw-virtio --example raw_honeypot
+```
 
-3. **An edge network namespace** that holds the second NIC and forwards
-   between it and the world. The edge namespace must have no address of the
-   honeypot's own, so its kernel never answers for it. It answers ARP for the
-   address with proxy ARP instead, and routes it to the TUN device:
+```sh
+./raw_honeypot 0000:00:03.0 ethernet.jsonl \
+  --address 203.0.113.10 --internet 0.0.0.0/0 \
+  --ssh 22 --http 80 --log honeypot.jsonl --pcap honeypot.pcapng
+```
 
-   ```sh
-   sudo ip netns add edge
-   sudo ip link set eth1 netns edge
-   sudo ip netns exec edge sysctl -w net.mptcp.enabled=0
-   sudo ip netns exec edge sysctl -w net.ipv4.ip_forward=1
-   sudo ip netns exec edge sysctl -w net.ipv4.conf.eth1.proxy_arp=1
-   sudo ip -n edge link set lo up
-   sudo ip -n edge link set eth1 up
-   sudo ip -n edge route add default via <provider gateway> dev eth1 onlink
-   ```
+The first two arguments are the assigned NIC's PCI address and the raw
+Ethernet log path. The remaining flags select the existing honeypot
+configuration and IP logs. This example uses the NIC attachment; the
+`--world` socket setting does not create a socket listener.
 
-   `net.mptcp.enabled` is set per namespace, so it is set again in `edge`.
+`ethernet.jsonl` records each complete frame as hexadecimal `bytes`, with
+`direction` (`in` or `out`), world-clock `at_us`, and `lost` (records the
+writer refused since the last accepted record). It retains malformed
+frames, VLAN headers, unknown EtherTypes and Ethernet padding before the
+world chooses whether to interpret them. Each accepted line is flushed;
+partially written records are completed before the next record. Refused
+records are counted and do not stop packet handling. `honeypot.pcapng`
+continues to contain IP packets, and `honeypot.jsonl` records TCP options,
+MPTCP negotiation and the normal observations.
 
-4. **The world**, with `--address` set to the address packets carry when they
-   reach the NIC. On a provider that maps a public address to a private one,
-   that is the private one.
+The world answers ARP for its configured IPv4 address. Untagged IPv4 and
+IPv6 packets addressed to the NIC or broadcast enter the existing IP
+attachment, which limits delivery to the configured honeypot address.
+VLAN and unknown EtherTypes remain in the raw log. A bounded table of
+1024 source IP addresses learns each reply's destination MAC from the
+incoming frame; an evicted source must send again before it receives
+another reply. IPv6 peers need a static neighbor entry. The adapter does
+not provision addresses, configure routing, or bind PCI devices.
+Outgoing IP packets above the Ethernet MTU of 1500 bytes are dropped without
+stopping the world. This adapter does not fragment oversized replies; the IP
+capture still records them.
 
-   ```sh
-   honeypot --world unix:/run/fictionet/honeypot.sock \
-       --address <honeypot address> --internet 0.0.0.0/0 \
-       --log /var/log/honeypot/honeypot.jsonl \
-       --pcap /var/log/honeypot/honeypot.pcapng
-   ```
+Embedding applications can call `honeypot_world::start_raw` with a
+`RawAttachment`, the usual configuration and observation sinks, and a
+`Box<dyn Write + Send>` for raw JSON lines. Create and retain the
+`RawPump` outside `fictionet::run`; only the raw attachment enters the
+world. All driver and raw frame tests run in the QEMU harness:
 
-5. **The internet attachment**: a TUN device in `edge`, routed into the world
-   as `internet` (`Net::route("internet", 0.0.0.0/0)` in the world). Then route
-   the honeypot's address to it in `edge`. Attach prints the device's name:
-
-   ```sh
-   sudo fictionet attach tun --world unix:/run/fictionet/honeypot.sock \
-       --name internet --netns /run/netns/edge --no-resolv-conf
-   sudo ip -n edge route add <honeypot address>/32 dev tun0
-   ```
-
-The world answers from the honeypot's address, and the edge namespace sends
-those packets out through its default route.
-
-A `cargo xtask honeypot-up` is planned to do all of this from one command,
-without Docker.
+```sh
+cargo xtask rawnic target/rawnic-qemu
+```

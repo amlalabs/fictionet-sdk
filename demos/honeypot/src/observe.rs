@@ -671,14 +671,14 @@ pub struct Sinks {
 /// line of the log. A record the file refuses is lost. One it takes only
 /// part of is finished before the next record, so the file never holds
 /// part of one record followed by another.
-struct Sink {
+pub(super) struct Sink {
     out: Box<dyn Write + Send>,
     /// The rest of a record the file took only part of.
     torn: Vec<u8>,
 }
 
 impl Sink {
-    fn new(out: Box<dyn Write + Send>) -> Sink {
+    pub(super) fn new(out: Box<dyn Write + Send>) -> Sink {
         Sink {
             out,
             torn: Vec::new(),
@@ -687,7 +687,7 @@ impl Sink {
 
     /// Writes `record`, after the rest of a torn one. Returns whether the
     /// file took it: all of it, or a part whose rest comes first next time.
-    fn put(&mut self, record: &[u8]) -> bool {
+    pub(super) fn put(&mut self, record: &[u8]) -> bool {
         if !self.torn.is_empty() {
             let torn = std::mem::take(&mut self.torn);
             let wrote = self.write(&torn);

@@ -55,6 +55,11 @@ pub mod mptcp;
 pub mod observe;
 pub mod services;
 
+#[cfg(all(feature = "raw-virtio", target_os = "linux"))]
+pub mod raw;
+#[cfg(all(feature = "raw-virtio", target_os = "linux"))]
+pub use raw::start_raw;
+
 pub use config::{Args, Config, Port, Service};
 use mptcp::{Listener, Tokens};
 use observe::{Direction, Observer, Sinks};

@@ -10,6 +10,10 @@ publish = false
 [features]
 default = ["proxy"]
 proxy = ["fictionet/web-proxy"]
+virtio-net = ["dep:libc"]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { version = "0.2", optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 fictionet = { path = "..", default-features = false }
@@ -30,3 +34,7 @@ tokio-util = { version = "0.7", default-features = false }
 fictionet-test-support = { path = "../tests/support" }
 libc = "0.2"
 futures-util = { version = "0.3", default-features = false }
+
+[[example]]
+name = "raw_world"
+required-features = ["virtio-net"]

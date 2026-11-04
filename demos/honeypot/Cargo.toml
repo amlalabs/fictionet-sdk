@@ -15,5 +15,13 @@ path = "src/main.rs"
 
 [dependencies]
 fictionet = { path = "../.." }
+fictionet-host = { path = "../../host", default-features = false, features = ["virtio-net"], optional = true }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
+
+[features]
+raw-virtio = ["dep:fictionet-host"]
+
+[[example]]
+name = "raw_honeypot"
+required-features = ["raw-virtio"]
