@@ -1,5 +1,7 @@
 //! Guest-only entry point for the isolated raw Ethernet exercise.
 use std::{ffi::CString, fs, io};
+#[path = "../rawnic_frames.rs"]
+mod rawnic_frames;
 #[path = "../rawnic_world.rs"]
 mod rawnic_world;
 
@@ -56,12 +58,36 @@ fn run(guest: &mut bool) -> Result<(), Box<dyn std::error::Error>> {
             return Err(io::Error::last_os_error().into());
         }
     }
-    if !std::process::Command::new("/driver-tests")
-        .args(["virtio::tests::", "--nocapture"])
-        .status()?
-        .success()
-    {
-        return Err("guest driver unit tests failed".into());
+    fs::create_dir_all("/etc")?;
+    fs::write("/etc/hosts", "127.0.0.1 localhost\n")?;
+    // The full host transport tests use guest-local TCP listeners.
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
+    let mut interface: libc::ifreq = unsafe { std::mem::zeroed() };
+    interface.ifr_name[0] = b'l' as libc::c_char;
+    interface.ifr_name[1] = b'o' as libc::c_char;
+    use std::os::fd::AsRawFd;
+    if unsafe { libc::ioctl(socket.as_raw_fd(), libc::SIOCGIFFLAGS, &mut interface) } != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    unsafe {
+        interface.ifr_ifru.ifru_flags |= libc::IFF_UP as libc::c_short;
+    }
+    if unsafe { libc::ioctl(socket.as_raw_fd(), libc::SIOCSIFFLAGS, &interface) } != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    drop(socket);
+    for index in 0.. {
+        let path = format!("/tests/{index}");
+        if !std::path::Path::new(&path).exists() {
+            break;
+        }
+        if !std::process::Command::new(path)
+            .arg("--nocapture")
+            .status()?
+            .success()
+        {
+            return Err("guest tests failed".into());
+        }
     }
     let device = "0000:00:03.0";
     let path = format!("/sys/bus/pci/devices/{device}");
@@ -77,14 +103,15 @@ fn run(guest: &mut bool) -> Result<(), Box<dyn std::error::Error>> {
     fs::write("/sys/bus/pci/drivers_probe", device)?;
     let group = fs::read_link(format!("{path}/iommu_group"))?;
     println!("Guest VFIO IOMMU group: {}", group.display());
-    let nic = fictionet_host::virtio::VirtioNet::open(device)?;
+    let address: fictionet_host::PciAddress = device.parse()?;
+    let nic = fictionet_host::virtio::VirtioNet::open(address)?;
     let mac = nic.mac_address();
     rawnic_world::run(nic, 6).map_err(|error| io::Error::other(error.to_string()))?;
-    let reopened = fictionet_host::VirtioNet::open(device)?;
+    let reopened = fictionet_host::VirtioNet::open(address)?;
     if reopened.mac_address() != mac {
         return Err("device MAC changed after reopen".into());
     }
-    drop(reopened);
+    rawnic_world::honeypot(reopened).map_err(|error| io::Error::other(error.to_string()))?;
     println!("Guest device reset and reopen passed");
     println!("RAWNIC PASS");
     Ok(())

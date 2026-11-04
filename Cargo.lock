@@ -1949,6 +1949,7 @@ name = "honeypot-world"
 version = "0.0.0"
 dependencies = [
  "fictionet",
+ "fictionet-host",
  "serde",
  "serde_json",
 ]
@@ -6037,6 +6038,7 @@ dependencies = [
  "fictionet-demo",
  "fictionet-extras",
  "fictionet-host",
+ "honeypot-world",
  "http",
  "libc",
  "mime_guess",

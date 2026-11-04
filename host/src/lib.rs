@@ -7,7 +7,10 @@
 pub mod virtio;
 
 #[cfg(all(target_os = "linux", feature = "virtio-net"))]
-pub use virtio::VirtioNet;
+pub mod raw;
+
+#[cfg(all(target_os = "linux", feature = "virtio-net"))]
+pub use virtio::{PciAddress, VirtioNet};
 
 #[cfg(not(target_arch = "wasm32"))]
 fictionet::cfg_web_proxy! {

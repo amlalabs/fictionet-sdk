@@ -260,3 +260,62 @@ those packets out through its default route.
 
 A `cargo xtask honeypot-up` is planned to do all of this from one command,
 without Docker.
+
+## Dedicated raw virtio NIC
+
+The `raw-virtio` feature connects a dedicated virtio NIC directly to this
+world through `fictionet_host::raw`. The driver and bounded host pump own
+all device polling outside the run. Complete Ethernet frames cross the
+attachment before any Ethernet or IP parsing. Linux does not receive IP
+packets from that assigned NIC; the honeypot's existing `internet`
+attachment and simulated TCP stack handle them.
+
+Run this only inside the disposable QEMU guest described in
+[`host/README.md`](../../host/README.md), with `fictionet.rawnic=1` on its
+kernel command line, an IOMMU, and the dedicated NIC already bound to
+`vfio-pci`. The driver requires that guest setup. Build the example on the
+host, then run the resulting binary in the guest:
+
+```sh
+cargo build -p honeypot-world --features raw-virtio --example raw_honeypot
+```
+
+```sh
+./raw_honeypot 0000:00:03.0 ethernet.jsonl \
+  --address 203.0.113.10 --internet 0.0.0.0/0 \
+  --ssh 22 --http 80 --log honeypot.jsonl --pcap honeypot.pcapng
+```
+
+The first two arguments are the assigned NIC's PCI address and the raw
+Ethernet log path. The remaining flags select the existing honeypot
+configuration and IP logs. This example uses the NIC attachment; the
+`--world` socket setting does not create a socket listener.
+
+`ethernet.jsonl` records each complete frame as hexadecimal `bytes`, with
+`direction` (`in` or `out`), world-clock `at_us`, and `lost` (records the
+writer refused since the last accepted record). It retains malformed
+frames, VLAN headers, unknown EtherTypes and Ethernet padding before the
+world chooses whether to interpret them. Each accepted line is flushed;
+partially written records are completed before the next record. Refused
+records are counted and do not stop packet handling. `honeypot.pcapng`
+continues to contain IP packets, and `honeypot.jsonl` records TCP options,
+MPTCP negotiation and the normal observations.
+
+The world answers ARP for its configured IPv4 address. Untagged IPv4 and
+IPv6 packets addressed to the NIC or broadcast enter the existing IP
+attachment, which limits delivery to the configured honeypot address.
+VLAN and unknown EtherTypes remain in the raw log. A bounded table of
+1024 source IP addresses learns each reply's destination MAC from the
+incoming frame; an evicted source must send again before it receives
+another reply. IPv6 peers need a static neighbor entry. The adapter does
+not provision addresses, configure routing, or bind PCI devices.
+
+Embedding applications can call `honeypot_world::start_raw` with a
+`RawAttachment`, the usual configuration and observation sinks, and a
+`Box<dyn Write + Send>` for raw JSON lines. Create and retain the
+`RawPump` outside `fictionet::run`; only the raw attachment enters the
+world. All driver and raw frame tests run in the QEMU harness:
+
+```sh
+cargo xtask rawnic target/rawnic-qemu
+```

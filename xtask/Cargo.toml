@@ -7,7 +7,7 @@ publish = false
 default-run = "xtask"
 
 [features]
-rawnic = ["dep:fictionet-host"]
+rawnic = ["dep:fictionet-host", "dep:honeypot-world"]
 
 [[bin]]
 name = "rawnic-guest"
@@ -15,6 +15,7 @@ path = "src/bin/rawnic-guest.rs"
 required-features = ["rawnic"]
 
 [dependencies]
+honeypot-world = { path = "../demos/honeypot", features = ["raw-virtio"], optional = true }
 fictionet-host = { path = "../host", default-features = false, features = ["virtio-net"], optional = true }
 fictionet = { path = ".." }
 fictionet-demo = { path = "../demos/kit" }

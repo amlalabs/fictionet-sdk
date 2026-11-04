@@ -10,7 +10,72 @@ use std::os::unix::fs::FileExt;
 use std::ptr::NonNull;
 use std::sync::atomic::{Ordering, fence};
 
-const VFIO: libc::c_ulong = (b';' as libc::c_ulong) << 8;
+// Linux VFIO UAPI request numbers and flags.
+const VFIO_TYPE: libc::c_ulong = (b';' as libc::c_ulong) << 8;
+const VFIO_GET_API_VERSION: libc::c_ulong = VFIO_TYPE | 100;
+const VFIO_CHECK_EXTENSION: libc::c_ulong = VFIO_TYPE | 101;
+const VFIO_SET_IOMMU: libc::c_ulong = VFIO_TYPE | 102;
+const VFIO_GROUP_GET_STATUS: libc::c_ulong = VFIO_TYPE | 103;
+const VFIO_GROUP_SET_CONTAINER: libc::c_ulong = VFIO_TYPE | 104;
+const VFIO_GROUP_GET_DEVICE_FD: libc::c_ulong = VFIO_TYPE | 106;
+const VFIO_DEVICE_GET_INFO: libc::c_ulong = VFIO_TYPE | 107;
+const VFIO_DEVICE_GET_REGION_INFO: libc::c_ulong = VFIO_TYPE | 108;
+const VFIO_DEVICE_RESET: libc::c_ulong = VFIO_TYPE | 111;
+const VFIO_IOMMU_MAP_DMA: libc::c_ulong = VFIO_TYPE | 113;
+const VFIO_IOMMU_UNMAP_DMA: libc::c_ulong = VFIO_TYPE | 114;
+const VFIO_API_VERSION: i32 = 0;
+const VFIO_TYPE1_IOMMU: usize = 1;
+const VFIO_GROUP_FLAGS_VIABLE: u32 = 1 << 0;
+const VFIO_DEVICE_FLAGS_PCI: u32 = 1 << 1;
+const VFIO_REGION_INFO_FLAG_READ: u32 = 1 << 0;
+const VFIO_REGION_INFO_FLAG_WRITE: u32 = 1 << 1;
+const VFIO_REGION_INFO_FLAG_MMAP: u32 = 1 << 2;
+const VFIO_DMA_MAP_FLAG_READ: u32 = 1 << 0;
+const VFIO_DMA_MAP_FLAG_WRITE: u32 = 1 << 1;
+const VFIO_PCI_CONFIG_REGION_INDEX: u32 = 7;
+
+// PCI configuration space and modern virtio common configuration offsets.
+const PCI_COMMAND: usize = 0x04;
+const PCI_COMMAND_MEMORY: u16 = 0x2;
+const PCI_COMMAND_MASTER: u16 = 0x4;
+const PCI_STATUS: usize = 0x06;
+const PCI_STATUS_CAP_LIST: u16 = 0x10;
+const PCI_CAPABILITY_LIST: usize = 0x34;
+const PCI_CAP_ID_VNDR: u8 = 0x09;
+const VIRTIO_PCI_CAP_COMMON_CFG: u8 = 1;
+const VIRTIO_PCI_CAP_NOTIFY_CFG: u8 = 2;
+const VIRTIO_PCI_CAP_DEVICE_CFG: u8 = 4;
+const VIRTIO_PCI_COMMON_DFSELECT: usize = 0;
+const VIRTIO_PCI_COMMON_DF: usize = 4;
+const VIRTIO_PCI_COMMON_GFSELECT: usize = 8;
+const VIRTIO_PCI_COMMON_GF: usize = 12;
+const VIRTIO_PCI_COMMON_STATUS: usize = 20;
+const VIRTIO_PCI_COMMON_CFGGENERATION: usize = 21;
+const VIRTIO_PCI_COMMON_Q_SELECT: usize = 22;
+const VIRTIO_PCI_COMMON_Q_SIZE: usize = 24;
+const VIRTIO_PCI_COMMON_Q_MSIX: usize = 26;
+const VIRTIO_PCI_COMMON_Q_ENABLE: usize = 28;
+const VIRTIO_PCI_COMMON_Q_NOFF: usize = 30;
+const VIRTIO_PCI_COMMON_Q_DESCLO: usize = 32;
+const VIRTIO_PCI_COMMON_Q_AVAILLO: usize = 40;
+const VIRTIO_PCI_COMMON_Q_USEDLO: usize = 48;
+const VIRTIO_CONFIG_S_ACKNOWLEDGE: u8 = 1;
+const VIRTIO_CONFIG_S_DRIVER: u8 = 2;
+const VIRTIO_CONFIG_S_DRIVER_OK: u8 = 4;
+const VIRTIO_CONFIG_S_FEATURES_OK: u8 = 8;
+const VIRTIO_CONFIG_S_RESET: u8 = 0;
+const DRIVER_STARTED: u8 = VIRTIO_CONFIG_S_ACKNOWLEDGE | VIRTIO_CONFIG_S_DRIVER;
+const FEATURES_ACCEPTED: u8 = DRIVER_STARTED | VIRTIO_CONFIG_S_FEATURES_OK;
+const DRIVER_READY: u8 = FEATURES_ACCEPTED | VIRTIO_CONFIG_S_DRIVER_OK;
+const VIRTIO_NET_F_MAC: u32 = 5;
+const VIRTIO_F_VERSION_1: u32 = 32;
+const VIRTIO_F_ACCESS_PLATFORM: u32 = 33;
+const PLATFORM_FEATURES: u32 =
+    (1 << (VIRTIO_F_VERSION_1 - 32)) | (1 << (VIRTIO_F_ACCESS_PLATFORM - 32));
+const VRING_DESC_F_WRITE: u16 = 2;
+const VRING_AVAIL_F_NO_INTERRUPT: u16 = 1;
+const VIRTIO_MSI_NO_VECTOR: u16 = 0xffff;
+
 const DMA_SIZE: usize = 2 * 1024 * 1024;
 const IOVA: u64 = 0x1000_0000;
 const BUFFER_SIZE: usize = 2048;
@@ -227,9 +292,8 @@ unsafe impl Send for VirtioNet {}
 
 impl VirtioNet {
     /// Open a domain-qualified PCI address, such as `0000:00:03.0`.
-    pub fn open(pci_address: &str) -> io::Result<Self> {
+    pub fn open(pci_address: PciAddress) -> io::Result<Self> {
         guest_gate()?;
-        validate_address(pci_address)?;
         let path = format!("/sys/bus/pci/devices/{pci_address}");
         if fs::read_to_string(format!("{path}/vendor"))?.trim() != "0x1af4"
             || fs::read_to_string(format!("{path}/device"))?.trim() != "0x1041"
@@ -248,8 +312,12 @@ impl VirtioNet {
             .read(true)
             .write(true)
             .open("/dev/vfio/vfio")?;
-        if ioctl(container.as_raw_fd(), VFIO + 100, 0)? != 0
-            || ioctl(container.as_raw_fd(), VFIO + 101, 1)? != 1
+        if ioctl(container.as_raw_fd(), VFIO_GET_API_VERSION, 0)? != VFIO_API_VERSION
+            || ioctl(
+                container.as_raw_fd(),
+                VFIO_CHECK_EXTENSION,
+                VFIO_TYPE1_IOMMU,
+            )? != 1
         {
             return Err(invalid("VFIO type one IOMMU is unavailable"));
         }
@@ -263,22 +331,26 @@ impl VirtioNet {
         };
         ioctl(
             group.as_raw_fd(),
-            VFIO + 103,
+            VFIO_GROUP_GET_STATUS,
             (&mut status as *mut GroupStatus) as usize,
         )?;
-        if status.flags & 1 == 0 {
+        if status.flags & VFIO_GROUP_FLAGS_VIABLE == 0 {
             return Err(invalid("VFIO group is not viable"));
         }
         let container_fd = container.as_raw_fd();
         ioctl(
             group.as_raw_fd(),
-            VFIO + 104,
+            VFIO_GROUP_SET_CONTAINER,
             (&container_fd as *const RawFd) as usize,
         )?;
-        ioctl(container_fd, VFIO + 102, 1)?;
-        let address =
-            std::ffi::CString::new(pci_address).map_err(|_| invalid("invalid PCI address"))?;
-        let fd = ioctl(group.as_raw_fd(), VFIO + 106, address.as_ptr() as usize)?;
+        ioctl(container_fd, VFIO_SET_IOMMU, VFIO_TYPE1_IOMMU)?;
+        let address = std::ffi::CString::new(pci_address.to_string())
+            .map_err(|_| invalid("invalid PCI address"))?;
+        let fd = ioctl(
+            group.as_raw_fd(),
+            VFIO_GROUP_GET_DEVICE_FD,
+            address.as_ptr() as usize,
+        )?;
         use std::os::fd::FromRawFd;
         // SAFETY: VFIO returns a new owned device file descriptor.
         let device = unsafe { File::from_raw_fd(fd) };
@@ -288,22 +360,37 @@ impl VirtioNet {
             regions: 0,
             irqs: 0,
         };
-        ioctl(fd, VFIO + 107, (&mut info as *mut DeviceInfo) as usize)?;
-        if info.flags & 2 == 0 || info.regions <= 7 {
+        ioctl(
+            fd,
+            VFIO_DEVICE_GET_INFO,
+            (&mut info as *mut DeviceInfo) as usize,
+        )?;
+        if info.flags & VFIO_DEVICE_FLAGS_PCI == 0 || info.regions <= VFIO_PCI_CONFIG_REGION_INDEX {
             return Err(invalid("VFIO device is not PCI"));
         }
-        let config_region = region(fd, 7)?;
+        let config_region = region(fd, VFIO_PCI_CONFIG_REGION_INDEX)?;
         let mut config = [0u8; 256];
         device.read_exact_at(&mut config, config_region.offset)?;
         let (common, notify, net, multiplier) = capabilities(&config)?;
         // Enable BAR decoding before touching common registers, keeping DMA
         // disabled until the IOMMU mapping and both queues are ready.
-        let command = (u16::from_le_bytes([config[4], config[5]]) | 2) & !4;
-        device.write_all_at(&command.to_le_bytes(), config_region.offset + 4)?;
+        let command = (u16::from_le_bytes([config[PCI_COMMAND], config[PCI_COMMAND + 1]])
+            | PCI_COMMAND_MEMORY)
+            & !PCI_COMMAND_MASTER;
+        device.write_all_at(
+            &command.to_le_bytes(),
+            config_region.offset + PCI_COMMAND as u64,
+        )?;
         let mut bars: Vec<Option<Mapping>> = (0..6).map(|_| None).collect();
         for capability in [common, notify, net] {
             let region = region(fd, capability.bar as u32)?;
-            if region.flags & 7 != 7
+            if region.flags
+                & (VFIO_REGION_INFO_FLAG_READ
+                    | VFIO_REGION_INFO_FLAG_WRITE
+                    | VFIO_REGION_INFO_FLAG_MMAP)
+                != (VFIO_REGION_INFO_FLAG_READ
+                    | VFIO_REGION_INFO_FLAG_WRITE
+                    | VFIO_REGION_INFO_FLAG_MMAP)
                 || capability
                     .offset
                     .checked_add(capability.length)
@@ -337,44 +424,50 @@ impl VirtioNet {
             tx: Queue::new(1, DMA_SIZE / 2, 0),
             mac: [0; 6],
         };
-        driver.common_write(20, 0u8);
-        if driver.common_read::<u8>(20) != 0 {
+        driver.common_write(VIRTIO_PCI_COMMON_STATUS, VIRTIO_CONFIG_S_RESET);
+        if driver.common_read::<u8>(VIRTIO_PCI_COMMON_STATUS) != VIRTIO_CONFIG_S_RESET {
             return Err(invalid("virtio reset did not complete"));
         }
-        driver.common_write(20, 1u8);
-        driver.common_write(20, 3u8);
-        driver.common_write(0, 1u32.to_le());
-        if u32::from_le(driver.common_read(4)) & 3 != 3 {
+        driver.common_write(VIRTIO_PCI_COMMON_STATUS, VIRTIO_CONFIG_S_ACKNOWLEDGE);
+        driver.common_write(VIRTIO_PCI_COMMON_STATUS, DRIVER_STARTED);
+        driver.common_write(VIRTIO_PCI_COMMON_DFSELECT, 1u32.to_le());
+        if u32::from_le(driver.common_read(VIRTIO_PCI_COMMON_DF)) & PLATFORM_FEATURES
+            != PLATFORM_FEATURES
+        {
             return Err(invalid(
                 "virtio version one and platform DMA access are required",
             ));
         }
-        driver.common_write(0, 0u32);
-        if u32::from_le(driver.common_read(4)) & (1 << 5) == 0 {
+        driver.common_write(VIRTIO_PCI_COMMON_DFSELECT, 0u32);
+        if u32::from_le(driver.common_read(VIRTIO_PCI_COMMON_DF)) & (1 << VIRTIO_NET_F_MAC) == 0 {
             return Err(invalid("virtio MAC feature is required"));
         }
-        driver.common_write(8, 0u32);
-        driver.common_write(12, (1u32 << 5).to_le());
-        driver.common_write(8, 1u32.to_le());
-        driver.common_write(12, 3u32.to_le());
-        driver.common_write(20, 11u8);
-        if driver.common_read::<u8>(20) & 8 == 0 {
+        driver.common_write(VIRTIO_PCI_COMMON_GFSELECT, 0u32);
+        driver.common_write(VIRTIO_PCI_COMMON_GF, (1u32 << VIRTIO_NET_F_MAC).to_le());
+        driver.common_write(VIRTIO_PCI_COMMON_GFSELECT, 1u32.to_le());
+        driver.common_write(VIRTIO_PCI_COMMON_GF, PLATFORM_FEATURES.to_le());
+        driver.common_write(VIRTIO_PCI_COMMON_STATUS, FEATURES_ACCEPTED);
+        if driver.common_read::<u8>(VIRTIO_PCI_COMMON_STATUS) & VIRTIO_CONFIG_S_FEATURES_OK == 0 {
             return Err(invalid("virtio rejected features"));
         }
         let mut map = DmaMap {
             argsz: size_of::<DmaMap>() as u32,
-            flags: 3,
+            flags: VFIO_DMA_MAP_FLAG_READ | VFIO_DMA_MAP_FLAG_WRITE,
             vaddr: driver.dma.pointer.as_ptr() as u64,
             iova: IOVA,
             size: DMA_SIZE as u64,
         };
-        ioctl(container_fd, VFIO + 113, (&mut map as *mut DmaMap) as usize)?;
+        ioctl(
+            container_fd,
+            VFIO_IOMMU_MAP_DMA,
+            (&mut map as *mut DmaMap) as usize,
+        )?;
         driver.dma_mapped = true;
         driver.rx = driver.configure_queue(0, 0, multiplier)?;
         driver.tx = driver.configure_queue(1, DMA_SIZE / 2, multiplier)?;
         let mut stable = false;
         for _ in 0..100 {
-            let generation = driver.common_read::<u8>(21);
+            let generation = driver.common_read::<u8>(VIRTIO_PCI_COMMON_CFGGENERATION);
             for (offset, byte) in driver.mac.iter_mut().enumerate() {
                 *byte = driver.bars[net.bar]
                     .as_ref()
@@ -382,7 +475,7 @@ impl VirtioNet {
                     .read(net.offset + offset);
             }
             fence(Ordering::Acquire);
-            if generation == driver.common_read::<u8>(21) {
+            if generation == driver.common_read::<u8>(VIRTIO_PCI_COMMON_CFGGENERATION) {
                 stable = true;
                 break;
             }
@@ -393,14 +486,19 @@ impl VirtioNet {
         for id in 0..driver.rx.size {
             let desc = driver.rx.desc + usize::from(id) * 16;
             driver.dma.write(desc + 8, (BUFFER_SIZE as u32).to_le());
-            driver.dma.write(desc + 12, 2u16.to_le());
+            driver.dma.write(desc + 12, VRING_DESC_F_WRITE.to_le());
             driver.rx.busy[usize::from(id)] = true;
             driver.rx.publish(&driver.dma, id);
         }
-        let command = u16::from_le_bytes([config[4], config[5]]) | 6;
+        let command = u16::from_le_bytes([config[PCI_COMMAND], config[PCI_COMMAND + 1]])
+            | PCI_COMMAND_MEMORY
+            | PCI_COMMAND_MASTER;
         let device = driver.device.as_ref().unwrap();
-        device.write_all_at(&command.to_le_bytes(), config_region.offset + 4)?;
-        driver.common_write(20, 15u8);
+        device.write_all_at(
+            &command.to_le_bytes(),
+            config_region.offset + PCI_COMMAND as u64,
+        )?;
+        driver.common_write(VIRTIO_PCI_COMMON_STATUS, DRIVER_READY);
         driver.kick(0, driver.rx.notify);
         Ok(driver)
     }
@@ -497,15 +595,15 @@ impl VirtioNet {
             .write(self.notify.offset + offset, queue.to_le());
     }
     fn check_status(&self) -> io::Result<()> {
-        if self.common_read::<u8>(20) != 15 {
+        if self.common_read::<u8>(VIRTIO_PCI_COMMON_STATUS) != DRIVER_READY {
             Err(invalid("virtio device requires reset"))
         } else {
             Ok(())
         }
     }
     fn configure_queue(&self, index: u16, base: usize, multiplier: u32) -> io::Result<Queue> {
-        self.common_write(22, index.to_le());
-        let maximum = u16::from_le(self.common_read(24));
+        self.common_write(VIRTIO_PCI_COMMON_Q_SELECT, index.to_le());
+        let maximum = u16::from_le(self.common_read(VIRTIO_PCI_COMMON_Q_SIZE));
         if maximum == 0 {
             return Err(invalid("required virtio queue is unavailable"));
         }
@@ -513,7 +611,7 @@ impl VirtioNet {
         if !size.is_power_of_two() {
             return Err(invalid("invalid split queue size"));
         }
-        let notify = usize::from(u16::from_le(self.common_read(30)))
+        let notify = usize::from(u16::from_le(self.common_read(VIRTIO_PCI_COMMON_Q_NOFF)))
             .checked_mul(multiplier as usize)
             .ok_or_else(|| invalid("notify offset overflow"))?;
         if notify
@@ -527,12 +625,22 @@ impl VirtioNet {
         if queue.buffers + usize::from(size) * BUFFER_SIZE > base + DMA_SIZE / 2 {
             return Err(invalid("queue exceeds DMA allocation"));
         }
-        self.common_write(24, size.to_le());
-        self.common_write(26, u16::MAX.to_le());
-        self.common_write(32, (IOVA + queue.desc as u64).to_le());
-        self.common_write(40, (IOVA + queue.avail as u64).to_le());
-        self.common_write(48, (IOVA + queue.used as u64).to_le());
-        self.dma.write(queue.avail, 1u16.to_le());
+        self.common_write(VIRTIO_PCI_COMMON_Q_SIZE, size.to_le());
+        self.common_write(VIRTIO_PCI_COMMON_Q_MSIX, VIRTIO_MSI_NO_VECTOR.to_le());
+        self.common_write(
+            VIRTIO_PCI_COMMON_Q_DESCLO,
+            (IOVA + queue.desc as u64).to_le(),
+        );
+        self.common_write(
+            VIRTIO_PCI_COMMON_Q_AVAILLO,
+            (IOVA + queue.avail as u64).to_le(),
+        );
+        self.common_write(
+            VIRTIO_PCI_COMMON_Q_USEDLO,
+            (IOVA + queue.used as u64).to_le(),
+        );
+        self.dma
+            .write(queue.avail, VRING_AVAIL_F_NO_INTERRUPT.to_le());
         for id in 0..size {
             self.dma.write(
                 queue.desc + usize::from(id) * 16,
@@ -540,16 +648,17 @@ impl VirtioNet {
             );
         }
         fence(Ordering::Release);
-        self.common_write(28, 1u16.to_le());
+        self.common_write(VIRTIO_PCI_COMMON_Q_ENABLE, 1u16.to_le());
         Ok(queue)
     }
 }
 impl Drop for VirtioNet {
     fn drop(&mut self) {
-        self.common_write(20, 0u8);
+        self.common_write(VIRTIO_PCI_COMMON_STATUS, VIRTIO_CONFIG_S_RESET);
         if let Some(device) = self.device.take() {
-            let _ = device.write_all_at(&0u16.to_le_bytes(), self.config_offset + 4);
-            let _ = ioctl(device.as_raw_fd(), VFIO + 111, 0);
+            let _ =
+                device.write_all_at(&0u16.to_le_bytes(), self.config_offset + PCI_COMMAND as u64);
+            let _ = ioctl(device.as_raw_fd(), VFIO_DEVICE_RESET, 0);
             self.bars.clear();
             drop(device);
         }
@@ -562,7 +671,7 @@ impl Drop for VirtioNet {
             };
             let _ = ioctl(
                 self.container.as_raw_fd(),
-                VFIO + 114,
+                VFIO_IOMMU_UNMAP_DMA,
                 (&mut unmap as *mut DmaUnmap) as usize,
             );
         }
@@ -575,7 +684,11 @@ fn region(fd: RawFd, index: u32) -> io::Result<RegionInfo> {
         index,
         ..RegionInfo::default()
     };
-    ioctl(fd, VFIO + 108, (&mut info as *mut RegionInfo) as usize)?;
+    ioctl(
+        fd,
+        VFIO_DEVICE_GET_REGION_INFO,
+        (&mut info as *mut RegionInfo) as usize,
+    )?;
     Ok(info)
 }
 fn guest_gate() -> io::Result<()> {
@@ -599,31 +712,65 @@ fn guest_gate() -> io::Result<()> {
     }
     Ok(())
 }
-fn validate_address(address: &str) -> io::Result<()> {
-    let bytes = address.as_bytes();
-    if bytes.len() != 12
-        || bytes[4] != b':'
-        || bytes[7] != b':'
-        || bytes[10] != b'.'
-        || !bytes
-            .iter()
-            .enumerate()
-            .all(|(i, b)| [4, 7, 10].contains(&i) || b.is_ascii_hexdigit())
-        || u8::from_str_radix(&address[8..10], 16).unwrap_or(255) > 31
-        || bytes[11] > b'7'
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "expected domain:bus:slot.function PCI address",
-        ));
-    }
-    Ok(())
+/// A domain-qualified PCI function address, parsed before device access.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PciAddress {
+    domain: u16,
+    bus: u8,
+    slot: u8,
+    function: u8,
 }
+
+impl std::str::FromStr for PciAddress {
+    type Err = io::Error;
+
+    fn from_str(address: &str) -> io::Result<Self> {
+        let malformed = || {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "expected domain:bus:slot.function PCI address",
+            )
+        };
+        let bytes = address.as_bytes();
+        if bytes.len() != 12
+            || bytes[4] != b':'
+            || bytes[7] != b':'
+            || bytes[10] != b'.'
+            || !bytes
+                .iter()
+                .enumerate()
+                .all(|(i, b)| [4, 7, 10].contains(&i) || b.is_ascii_hexdigit())
+        {
+            return Err(malformed());
+        }
+        let result = Self {
+            domain: u16::from_str_radix(&address[..4], 16).map_err(|_| malformed())?,
+            bus: u8::from_str_radix(&address[5..7], 16).map_err(|_| malformed())?,
+            slot: u8::from_str_radix(&address[8..10], 16).map_err(|_| malformed())?,
+            function: u8::from_str_radix(&address[11..], 16).map_err(|_| malformed())?,
+        };
+        if result.slot > 31 || result.function > 7 {
+            return Err(malformed());
+        }
+        Ok(result)
+    }
+}
+
+impl std::fmt::Display for PciAddress {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{:04x}:{:02x}:{:02x}.{:x}",
+            self.domain, self.bus, self.slot, self.function
+        )
+    }
+}
+
 fn capabilities(config: &[u8; 256]) -> io::Result<(Capability, Capability, Capability, u32)> {
-    if u16::from_le_bytes([config[6], config[7]]) & 0x10 == 0 {
+    if u16::from_le_bytes([config[PCI_STATUS], config[PCI_STATUS + 1]]) & PCI_STATUS_CAP_LIST == 0 {
         return Err(invalid("PCI capability list is absent"));
     }
-    let mut cursor = usize::from(config[0x34]);
+    let mut cursor = usize::from(config[PCI_CAPABILITY_LIST]);
     let mut visited = [false; 256];
     let (mut common, mut notify, mut net) = (None, None, None);
     let mut multiplier = 0;
@@ -632,7 +779,7 @@ fn capabilities(config: &[u8; 256]) -> io::Result<(Capability, Capability, Capab
             return Err(invalid("invalid PCI capability chain"));
         }
         visited[cursor] = true;
-        if config[cursor] == 9 {
+        if config[cursor] == PCI_CAP_ID_VNDR {
             if cursor + 16 > 256 {
                 return Err(invalid("truncated virtio capability"));
             }
@@ -654,7 +801,7 @@ fn capabilities(config: &[u8; 256]) -> io::Result<(Capability, Capability, Capab
                 length: length_bytes,
             };
             match config[cursor + 3] {
-                1 => {
+                VIRTIO_PCI_CAP_COMMON_CFG => {
                     if length_bytes < 56
                         || !offset.is_multiple_of(8)
                         || common.replace(cap).is_some()
@@ -662,17 +809,17 @@ fn capabilities(config: &[u8; 256]) -> io::Result<(Capability, Capability, Capab
                         return Err(invalid("invalid common capability"));
                     }
                 }
-                2 => {
+                VIRTIO_PCI_CAP_NOTIFY_CFG => {
                     if length < 20 || notify.replace(cap).is_some() {
                         return Err(invalid("invalid notify capability"));
                     }
                     multiplier =
                         u32::from_le_bytes(config[cursor + 16..cursor + 20].try_into().unwrap());
                 }
-                4 if length_bytes < 6 || net.is_some() => {
+                VIRTIO_PCI_CAP_DEVICE_CFG if length_bytes < 6 || net.is_some() => {
                     return Err(invalid("invalid network capability"));
                 }
-                4 => net = Some(cap),
+                VIRTIO_PCI_CAP_DEVICE_CFG => net = Some(cap),
                 _ => {}
             }
         }
@@ -730,13 +877,13 @@ mod tests {
     fn malformed_capabilities_are_rejected() {
         let mut config = [0; 256];
         config[6] = 0x10;
-        config[0x34] = 0xfc;
+        config[PCI_CAPABILITY_LIST] = 0xfc;
         config[0xfc] = 9;
         assert_eq!(
             capabilities(&config).err().unwrap().to_string(),
             "truncated virtio capability"
         );
-        config[0x34] = 0x40;
+        config[PCI_CAPABILITY_LIST] = 0x40;
         config[0x40] = 9;
         config[0x42] = 16;
         config[0x43] = 1;
@@ -756,15 +903,20 @@ mod tests {
 
     #[test]
     fn pci_addresses_are_strict() {
-        assert!(validate_address("0000:00:03.0").is_ok());
+        assert!("0000:00:03.0".parse::<PciAddress>().is_ok());
+        let address = "ABCD:EF:1F.7".parse::<PciAddress>().unwrap();
+        assert_eq!(address.to_string(), "abcd:ef:1f.7");
+        assert_eq!(address.to_string().parse::<PciAddress>().unwrap(), address);
         for address in [
+            "0000:00:03.0\0",
+            "0000:00:é3.0",
             "../vfio/vfio",
             "0000:00:20.0",
             "0000:00:03.8",
             "0000:00:03.f",
             "00:03.0",
         ] {
-            assert!(validate_address(address).is_err());
+            assert!(address.parse::<PciAddress>().is_err());
         }
     }
 
@@ -772,7 +924,7 @@ mod tests {
     fn capability_cycles_are_rejected() {
         let mut config = [0; 256];
         config[6] = 0x10;
-        config[0x34] = 0x40;
+        config[PCI_CAPABILITY_LIST] = 0x40;
         config[0x41] = 0x40;
         assert!(capabilities(&config).is_err());
     }

@@ -1,15 +1,28 @@
 # Raw Ethernet in a QEMU guest
 
 The optional `virtio-net` feature provides a userspace VFIO driver for a
-modern virtio-net PCI device. A Rust world can own the driver and receive
-and transmit Ethernet frames directly. The guest Linux IP and TCP stacks
-do not process those frames. Linux still supplies VFIO, IOMMU mappings,
-memory and scheduling; QEMU still implements the virtual NIC.
+modern virtio-net PCI device. A host-side pump owns the driver and carries
+complete Ethernet frames to and from a Rust world over bounded channels.
+The guest Linux IP and TCP stacks do not process those frames. Linux still
+supplies VFIO, IOMMU mappings, memory and scheduling; QEMU still implements
+the virtual NIC.
 
-The [raw world example](examples/raw_world.rs) moves the NIC into a
-`fictionet::run` task. It handles complete frames before any IP parsing and
-keeps a pending frame when the transmit queue is full. The ordinary
-`fictionet::Interface` remains an IP-packet interface.
+The [raw world example](examples/raw_world.rs) parses a typed `PciAddress`,
+opens `VirtioNet`, and calls `RawPump::attach` before `fictionet::run`.
+The pump polls hardware on a separate host thread and parks when idle or
+backpressured. The world awaits `RawAttachment::recv`; it never polls the
+device or checks a host deadline. Each direction holds at most sixty four
+queued frames plus one pending host frame. Sending waits for queue space;
+a full receive queue stops driver reads, so the NIC may drop traffic.
+Receive, send and flush observe world cancellation. Driver failures close
+the channels and propagate to the world. Dropping the pump joins its thread
+and resets the device. The ordinary `fictionet::Interface` remains an
+IP-packet interface; `EthernetFrame` carries complete Ethernet bytes.
+
+The [raw honeypot example](../demos/honeypot/examples/raw_honeypot.rs), built
+with the honeypot crate's `raw-virtio` feature, uses the same attachment.
+It records complete ingress frames before parsing and passes supported IP
+traffic to the existing honeypot world. It runs only in the opted-in guest.
 
 This implementation is restricted to QEMU guests. It checks QEMU's DMI
 identity and the guest kernel command line token `fictionet.rawnic=1`
@@ -29,8 +42,10 @@ The current implementation supports one receive/transmit queue pair on
 x86-64, frames of 14 through 2,036 bytes, and the modern PCI device ID.
 It requires a real VFIO type-one IOMMU mapping, including inside the guest;
 there is no unsafe no-IOMMU fallback. A successful transmit means queued,
-not delivered: use `transmit_idle` before orderly teardown. A short receive
-buffer consumes that frame and returns an error.
+not delivered: world code awaits `RawAttachment::flush` before orderly
+teardown, while direct driver callers poll `transmit_idle`. Pump shutdown
+discards any remaining queued frames. A short driver receive buffer
+consumes that frame and returns an error.
 
 Raw here means the virtual NIC's Ethernet frame, not a physical wire
 capture: preamble, interpacket gap and Ethernet FCS are not supplied by
@@ -58,12 +73,18 @@ bridge, host device passthrough or external network is needed. The output
 directory holds the initramfs and `serial.log`; failed assertions or missing
 prerequisites fail the command.
 
-Validation runs the driver unit tests in the guest, including split queue
-index wraparound and malformed completion rejection. The host then checks
+Validation runs the host crate and honeypot tests only in the guest, including
+split queue index wraparound, malformed completion rejection, and raw
+attachment backpressure, cancellation and flush completion. The guest uses
+2 GiB of RAM for the test image and enables its own loopback for HTTP
+transport tests. The host then checks
 six byte-exact round trips through a Fictionet world: MP_CAPABLE, DSS,
 VLAN, malformed IPv4/TCP, broadcast unknown data, and a 1,514-byte unknown
 EtherType frame. A final acknowledgment precedes device close and reopen.
-This is functional validation, not a throughput benchmark.
+The harness then runs the real honeypot through the same raw attachment,
+verifies an Ethernet SYN-ACK reply, and checks complete frame capture and
+MPTCP SYN, answer and DSS logs. All driver, attachment and frame test execution
+stays inside QEMU. This is functional validation, not a throughput benchmark.
 
 The current harness expects an x86-64 Linux host with
 `qemu-system-x86_64`, `/boot/vmlinuz-linux`, matching installed kernel
