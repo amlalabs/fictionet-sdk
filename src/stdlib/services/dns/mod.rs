@@ -46,7 +46,7 @@
 //! | RFC 5001 | NSID, only when asked |
 //! | RFC 5452 §9.1 | A reply counts only from the address asked, with the query's ID and question |
 //! | RFC 5155 §7.2 | NSEC3 denial records |
-//! | RFC 6303, RFC 6761, RFC 7686, RFC 8375, RFC 9462 | Locally served zones ([`zone::special`]) |
+//! | RFC 6303, RFC 6761, RFC 6762, RFC 7686, RFC 8375, RFC 9462, RFC 9665 | Locally served zones ([`zone::special`]) |
 //! | RFC 6604 §2 | The RCODE after a CNAME chain |
 //! | RFC 6672 | DNAME |
 //! | RFC 6891 §6.1.2, §6.1.4, §7 | No OPT without one in the query; unknown options and flags ignored |

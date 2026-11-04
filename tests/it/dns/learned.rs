@@ -2088,3 +2088,478 @@ fn a_copys_first_referral_carries_the_sibling_glue() {
         assert!(!got.additionals.is_empty(), "DO {dnssec_ok}: glue");
     }
 }
+
+/// A parent zone for questions asked in any order: data, aliases into
+/// itself, out of it, into a child, and in a loop; wildcards, one with an
+/// alias into the child; DNAMEs into itself and onto the child; and cuts
+/// at `child.example` and at `sec.example`, a lame delegation to the
+/// parent's own server.
+const MIXED_PARENT: &str = "\
+example. 3600 IN SOA ns.example. hostmaster.example. 1 7200 3600 1209600 300
+example. 3600 IN NS ns.example.
+example. 300 IN MX 10 mail.example.
+ns.example. 3600 IN A 192.0.2.53
+mail.example. 300 IN A 192.0.2.25
+www.example. 300 IN A 192.0.2.80
+www.example. 300 IN AAAA 2001:db8::80
+www.example. 300 IN TXT \"hi\"
+alias.example. 300 IN CNAME www.example.
+alias2.example. 300 IN CNAME alias.example.
+out.example. 300 IN CNAME www.other.test.
+intochild.example. 300 IN CNAME www.child.example.
+intosrv.example. 300 IN CNAME www.srv.child.example.
+*.wild.example. 300 IN A 192.0.2.99
+*.wild.example. 300 IN TXT \"wild\"
+sub.wild.example. 300 IN A 192.0.2.98
+*.wc.example. 300 IN CNAME www.example.
+host.ent.example. 300 IN A 192.0.2.7
+d.example. 300 IN DNAME deep.example.
+x.deep.example. 300 IN A 192.0.2.8
+l1.example. 300 IN CNAME l2.example.
+l2.example. 300 IN CNAME l1.example.
+child.example. 3600 IN NS ns.child.example.
+ns.child.example. 3600 IN A 192.0.2.54
+sec.example. 3600 IN NS ns.example.
+d2.example. 300 IN DNAME child.example.
+*.wc2.example. 300 IN CNAME www.child.example.
+";
+
+/// The child of [`MIXED_PARENT`]: data, a wildcard, and an alias back
+/// into the parent.
+const MIXED_CHILD: &str = "\
+child.example. 3600 IN SOA ns.child.example. h.child.example. 1 7200 3600 1209600 600
+child.example. 3600 IN NS ns.child.example.
+ns.child.example. 3600 IN A 192.0.2.54
+www.child.example. 300 IN A 192.0.2.55
+*.child.example. 300 IN TXT \"cw\"
+back.child.example. 300 IN CNAME www.example.
+";
+
+/// The names asked in any order.
+const MIXED_NAMES: &[&str] = &[
+    "example.",
+    "www.example.",
+    "alias.example.",
+    "alias2.example.",
+    "out.example.",
+    "intochild.example.",
+    "intosrv.example.",
+    "a.wild.example.",
+    "b.wild.example.",
+    "sub.wild.example.",
+    "x.sub.wild.example.",
+    "wild.example.",
+    "a.wc.example.",
+    "wc.example.",
+    "ent.example.",
+    "host.ent.example.",
+    "d.example.",
+    "a.d.example.",
+    "x.d.example.",
+    "deep.example.",
+    "x.deep.example.",
+    "l1.example.",
+    "nx.example.",
+    "deep.nx.example.",
+    "child.example.",
+    "www.child.example.",
+    "ns.child.example.",
+    "a.child.example.",
+    "back.child.example.",
+    "srv.child.example.",
+    "www.srv.child.example.",
+    "sec.example.",
+    "a.sec.example.",
+    "mail.example.",
+    "ns.example.",
+    "*.wild.example.",
+    "y.a.wild.example.",
+    "a.d2.example.",
+    "www.d2.example.",
+    "x.wc2.example.",
+    "d2.example.",
+    "q.back.child.example.",
+];
+
+/// The types asked in any order.
+const MIXED_TYPES: &[RecordType] = &[
+    RecordType::A,
+    RecordType::AAAA,
+    RecordType::TXT,
+    RecordType::MX,
+    RecordType::NS,
+    RecordType::SOA,
+    RecordType::DS,
+    RecordType::NSEC,
+    RecordType::CNAME,
+    RecordType::DNAME,
+    RecordType::ANY,
+    RecordType::RRSIG,
+    RecordType::HINFO,
+];
+
+/// `text` as a zone: unsigned, signed with NSEC, or signed with NSEC3,
+/// as `signing` says (0, 1, or 2).
+fn mixed_zone(text: &str, signing: usize) -> Arc<dyn ZoneData> {
+    let zone = match signing {
+        0 => Zone::from_master(text, None).unwrap(),
+        1 => signed_master(text, Denial::Nsec),
+        _ => signed_master(
+            text,
+            Denial::Nsec3 {
+                opt_out: false,
+                salt: Vec::new(),
+            },
+        ),
+    };
+    Arc::new(zone)
+}
+
+/// The real servers of [`MIXED_PARENT`], each noted for it: one that also
+/// serves [`SRV`] below the child's cut, one that also serves the child,
+/// one that serves the parent alone, and one that serves only the child,
+/// so its delegation from the parent is lame.
+fn mixed_servers(signing: usize) -> Vec<(SocketAddr, Zones)> {
+    let parent = || mixed_zone(MIXED_PARENT, signing);
+    let child = || mixed_zone(MIXED_CHILD, signing);
+    vec![
+        (
+            "192.0.2.53:53".parse().unwrap(),
+            Zones::new(vec![parent(), mixed_zone(SRV, signing)]),
+        ),
+        (
+            "192.0.2.153:53".parse().unwrap(),
+            Zones::new(vec![parent(), child()]),
+        ),
+        (
+            "192.0.2.253:53".parse().unwrap(),
+            Zones::new(vec![parent()]),
+        ),
+        ("192.0.2.99:53".parse().unwrap(), Zones::new(vec![child()])),
+    ]
+}
+
+/// What `zones`, a real server at `local`, reply to `request`.
+fn real_at(zones: &Zones, local: SocketAddr, request: &Request) -> Message {
+    let client = Client {
+        peer: "198.51.100.7:5353".parse().unwrap(),
+        local,
+        transport: Transport::Udp,
+        connection: None,
+        sandbox: None,
+    };
+    match zones.respond(request, local, &ServerConfig::generic(), &client) {
+        Step::Reply(response) => response.message,
+        step => panic!("the real server gave {step:?}"),
+    }
+}
+
+/// What `authority` at `local` replies to `request`, with each lookup put
+/// to `real` and filed, or what kept it from replying.
+fn answer_through(
+    authority: &dyn Authority,
+    real: Real<'_>,
+    local: SocketAddr,
+    request: &Request,
+) -> Result<Message, String> {
+    let client = Client {
+        peer: "198.51.100.7:5353".parse().unwrap(),
+        local,
+        transport: Transport::Udp,
+        connection: None,
+        sandbox: None,
+    };
+    let mut looked: Vec<Lookup> = Vec::new();
+    loop {
+        match authority.respond(request, local, &ServerConfig::generic(), &client) {
+            Step::Reply(response) => return Ok(response.message),
+            Step::Need(lookup) if looked.contains(&lookup) => {
+                return Err(format!("silent: {lookup:?} again"));
+            }
+            Step::Need(lookup) => {
+                authority.file(&lookup, &Looked::Response(real(&lookup)), Generation(0));
+                looked.push(lookup);
+            }
+            Step::Silent => return Err("silent".to_string()),
+        }
+    }
+}
+
+/// A question asked of a real server and of its copy: the server's
+/// address, the name, the type, and whether DO is set.
+type Asked<'a> = (SocketAddr, &'a str, RecordType, bool);
+
+/// Asks `asked` in turn of copies of
+/// `servers`' zones noted at every one of their addresses for `example`,
+/// and of the real servers. The first question whose replies differ, with
+/// both replies.
+fn first_difference(servers: &[(SocketAddr, Zones)], asked: &[Asked<'_>]) -> Option<String> {
+    let real = |lookup: &Lookup| {
+        let (_, zones) = servers
+            .iter()
+            .find(|(addr, _)| addr.ip() == lookup.server.ip())
+            .expect("a real server at the address");
+        reply_of(zones, lookup)
+    };
+    let copies = Copies::new();
+    for (addr, _) in servers {
+        copies.serves(addr.ip(), &lower("example."));
+    }
+    for (step, (local, qname, qtype, dnssec_ok)) in asked.iter().enumerate() {
+        let req = request(qname, *qtype, *dnssec_ok);
+        let (_, zones) = servers
+            .iter()
+            .find(|(addr, _)| addr == local)
+            .expect("a real server at the address");
+        let want = shape(&real_at(zones, *local, &req));
+        match answer_through(&copies, &real, *local, &req) {
+            Ok(got) if shape(&got) == want => {}
+            got => {
+                return Some(format!(
+                    "step {step}, {local} {qname} {qtype} DO={dnssec_ok}:\n  got  {:?}\n  want {want:?}",
+                    got.map(|got| shape(&got))
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// Each address answers as its own real server does, whatever was asked
+/// before at it or at the others: lame addresses, chains into a child
+/// some addresses serve, signed and unsigned, and names a child holds
+/// below a cut.
+#[test]
+fn each_address_answers_as_its_own_server_after_any_questions() {
+    let (both, alone, lame, srv): (SocketAddr, SocketAddr, SocketAddr, SocketAddr) = (
+        "192.0.2.153:53".parse().unwrap(),
+        "192.0.2.253:53".parse().unwrap(),
+        "192.0.2.99:53".parse().unwrap(),
+        "192.0.2.53:53".parse().unwrap(),
+    );
+    let cases: Vec<(usize, Vec<Asked>)> = vec![
+        // The child's signature shows its data is the child's, so the
+        // address that serves the parent alone refers the alias's target.
+        (
+            1,
+            vec![
+                (both, "intochild.example.", RecordType::A, true),
+                (alone, "intochild.example.", RecordType::A, false),
+            ],
+        ),
+        (
+            1,
+            vec![
+                (both, "www.d2.example.", RecordType::A, true),
+                (alone, "www.d2.example.", RecordType::A, true),
+            ],
+        ),
+        (
+            2,
+            vec![
+                (both, "www.d2.example.", RecordType::RRSIG, false),
+                (alone, "www.d2.example.", RecordType::RRSIG, true),
+            ],
+        ),
+        // A lame address refuses, whatever another address answered.
+        (
+            1,
+            vec![
+                (srv, "y.a.wild.example.", RecordType::TXT, true),
+                (lame, "y.a.wild.example.", RecordType::TXT, false),
+            ],
+        ),
+        (
+            0,
+            vec![
+                (srv, "alias2.example.", RecordType::A, false),
+                (lame, "alias2.example.", RecordType::A, false),
+            ],
+        ),
+        // A lame address answers for the child it serves.
+        (
+            0,
+            vec![
+                (lame, "alias.example.", RecordType::SOA, false),
+                (lame, "www.child.example.", RecordType::A, true),
+            ],
+        ),
+        (
+            0,
+            vec![
+                (lame, "wc.example.", RecordType::DS, false),
+                (lame, "ns.child.example.", RecordType::ANY, false),
+            ],
+        ),
+        (
+            0,
+            vec![(lame, "back.child.example.", RecordType::NSEC, true)],
+        ),
+        // Another address's answer to ANY leaves this one's additional
+        // data in place.
+        (
+            0,
+            vec![
+                (alone, "mail.example.", RecordType::ANY, true),
+                (both, "example.", RecordType::MX, false),
+            ],
+        ),
+        // Chains into the child below a cut learned at another address.
+        (
+            0,
+            vec![
+                (alone, "www.child.example.", RecordType::A, false),
+                (both, "x.wc2.example.", RecordType::A, false),
+                (both, "a.d2.example.", RecordType::A, false),
+            ],
+        ),
+        (
+            0,
+            vec![
+                (alone, "www.child.example.", RecordType::A, false),
+                (srv, "intosrv.example.", RecordType::A, false),
+            ],
+        ),
+        (
+            0,
+            vec![
+                (alone, "www.d2.example.", RecordType::DS, false),
+                (both, "back.child.example.", RecordType::DNAME, true),
+            ],
+        ),
+        (
+            0,
+            vec![
+                (both, "back.child.example.", RecordType::DS, false),
+                (srv, "back.child.example.", RecordType::CNAME, false),
+            ],
+        ),
+    ];
+    for (signing, asked) in cases {
+        let servers = mixed_servers(signing);
+        if let Some(difference) = first_difference(&servers, &asked) {
+            panic!("signing {signing}, {asked:?}: {difference}");
+        }
+    }
+}
+
+/// Copies answer as their real servers do over many questions in a
+/// pseudo-random order, the same each run, unsigned and signed with NSEC
+/// and NSEC3.
+#[test]
+fn copies_answer_as_their_servers_in_any_order() {
+    for signing in 0..3 {
+        let servers = mixed_servers(signing);
+        // A linear congruential generator (Knuth's MMIX constants).
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15 ^ signing as u64;
+        let mut next = |n: usize| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) as usize % n
+        };
+        for trial in 0..300 {
+            let asked: Vec<Asked> = (0..100)
+                .map(|_| {
+                    let (local, _) = &servers[next(servers.len())];
+                    let qname = MIXED_NAMES[next(MIXED_NAMES.len())];
+                    let qtype = MIXED_TYPES[next(MIXED_TYPES.len())];
+                    (*local, qname, qtype, next(2) == 0)
+                })
+                .collect();
+            if let Some(difference) = first_difference(&servers, &asked) {
+                panic!("signing {signing}, trial {trial}, after {asked:?}: {difference}");
+            }
+        }
+    }
+}
+
+/// The root zone, with cuts at `net` and `com`.
+const ROOT_WITH_CUTS: &str = "\
+. 86400 IN SOA a.root-servers.net. nstld.verisign-grs.com. 1 1800 900 604800 86400
+. 518400 IN NS a.root-servers.net.
+net. 172800 IN NS a.gtld-servers.net.
+com. 172800 IN NS a.gtld-servers.net.
+a.gtld-servers.net. 172800 IN A 192.5.6.30
+";
+
+/// `root-servers.net`, below the cut at `net`, which the root servers
+/// also serve.
+const ROOT_SERVERS_NET: &str = "\
+root-servers.net. 3600000 IN SOA a.root-servers.net. nstld.verisign-grs.com. 1 14400 7200 1209600 3600000
+root-servers.net. 3600000 IN NS a.root-servers.net.
+a.root-servers.net. 3600000 IN A 198.41.0.4
+";
+
+/// A root letter answers DS at `root-servers.net`'s apex from that zone,
+/// since the zone that holds the cut there is `net`'s, which it does not
+/// serve (RFC 4035 §3.1.4.1). It still serves the root.
+#[test]
+fn a_root_letter_answers_ds_below_another_cut_and_still_serves_the_root() {
+    let zone = |text: &str| Arc::new(Zone::from_master(text, None).unwrap()) as Arc<dyn ZoneData>;
+    let real = Zones::new(vec![zone(ROOT_WITH_CUTS), zone(ROOT_SERVERS_NET)]);
+    let answer = |lookup: &Lookup| reply_of(&real, lookup);
+    let local: SocketAddr = "198.41.0.4:53".parse().unwrap();
+    let copies = Copies::new();
+    copies.serves(local.ip(), &LowerName::new(&Name::root()));
+    for (qname, qtype) in [
+        ("root-servers.net.", RecordType::DS),
+        ("com.", RecordType::NS),
+        ("root-servers.net.", RecordType::DS),
+        (".", RecordType::SOA),
+    ] {
+        let req = request(qname, qtype, false);
+        let got = answer_through(&copies, &answer, local, &req).unwrap();
+        assert_eq!(
+            shape(&got),
+            shape(&real_at(&real, local, &req)),
+            "{qname} {qtype}"
+        );
+    }
+}
+
+/// An alias into a child the address also serves, below a cut the copy
+/// learned from another address, is followed into the child, as the real
+/// server does (RFC 1034 §4.3.2 step 3a).
+#[test]
+fn a_chain_into_a_hosted_child_below_a_learned_cut_is_followed() {
+    let zone = |text: &str| Arc::new(Zone::from_master(text, None).unwrap()) as Arc<dyn ZoneData>;
+    let alone: SocketAddr = "192.0.2.253:53".parse().unwrap();
+    let both: SocketAddr = "192.0.2.153:53".parse().unwrap();
+    let servers = [
+        (alone, Zones::new(vec![zone(MIXED_PARENT)])),
+        (
+            both,
+            Zones::new(vec![zone(MIXED_PARENT), zone(MIXED_CHILD)]),
+        ),
+    ];
+    let asked = [
+        (alone, "www.child.example.", RecordType::A, false),
+        (both, "intochild.example.", RecordType::A, false),
+    ];
+    assert_eq!(first_difference(&servers, &asked), None);
+}
+
+/// A copy of a signed zone holds the one RRset its server sends for ANY
+/// with DO, and answers ANY without DO with the HINFO its server sends,
+/// whose TTL is the operator's (RFC 8482 §4.2).
+#[test]
+fn any_without_do_at_a_signed_copy_gets_its_servers_hinfo() {
+    for signing in [1, 2] {
+        let servers = [(
+            "192.0.2.53:53".parse().unwrap(),
+            Zones::new(vec![mixed_zone(MIXED_PARENT, signing)]),
+        )];
+        let local = servers[0].0;
+        let asked = [
+            (local, "example.", RecordType::ANY, false),
+            (local, "www.example.", RecordType::ANY, true),
+            (local, "www.example.", RecordType::ANY, false),
+        ];
+        assert_eq!(
+            first_difference(&servers, &asked),
+            None,
+            "signing {signing}"
+        );
+    }
+}

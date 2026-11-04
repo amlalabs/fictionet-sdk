@@ -42,12 +42,16 @@ pub(super) struct Stopped {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AnyResponse {
     /// One synthesized HINFO record with CPU "RFC8482" and an empty OS
-    /// (RFC 8482 §4.2), with the smallest TTL among the name's RRsets,
-    /// since RFC 8482 leaves the TTL to the responder. With DO, a zone
-    /// that holds its keys signs it; a zone signed once, whose keys the
-    /// view does not hold, sends one RRset of the name instead, as
-    /// RFC 8482 §4.1 allows. A name with a CNAME gets the CNAME.
-    Hinfo,
+    /// (RFC 8482 §4.2). With DO, a zone that holds its keys signs it; a
+    /// zone signed once, whose keys the view does not hold, sends one
+    /// RRset of the name instead, as RFC 8482 §4.1 allows. A name with a
+    /// CNAME gets the CNAME.
+    Hinfo {
+        /// The HINFO record's TTL, which RFC 8482 §4.2 leaves to the
+        /// operator: long enough to keep the same client from asking ANY
+        /// again soon.
+        ttl: u32,
+    },
     /// One RRset of the name (RFC 8482 §4.1): the RRset of this type, or
     /// the name's first RRset in type order when it has none of this type.
     OneRrset(RecordType),
@@ -618,14 +622,14 @@ impl<'v> Walk<'v> {
             let answer = match (self.any, cname) {
                 // No HINFO is made up at a CNAME (RFC 8482 §4.2), which
                 // leaves room for no other data (RFC 1034 §3.6.2).
-                (AnyResponse::Hinfo, Some(cname)) => vec![owned(cname, &owner)],
-                (AnyResponse::Hinfo, None) => {
+                (AnyResponse::Hinfo { .. }, Some(cname)) => vec![owned(cname, &owner)],
+                (AnyResponse::Hinfo { ttl }, None) => {
                     // Every RRset of a signed zone is signed
                     // (RFC 4035 §2.2), so the name's own RRsets show
                     // whether the zone is.
                     let signed = sets.iter().any(|set| !set.rrsigs().is_empty());
                     vec![
-                        self.hinfo(&owner, smallest_ttl(&sets), signed)
+                        self.hinfo(&owner, ttl, signed)
                             .unwrap_or_else(|| owned(first, &owner)),
                     ]
                 }
@@ -757,11 +761,6 @@ fn positive(answer: Vec<RecordSet>, authority: Vec<RecordSet>) -> Found {
         authority,
         ..Found::new(ResponseCode::NoError, true)
     }
-}
-
-/// The smallest TTL among `sets`, or 0 when there are none.
-fn smallest_ttl(sets: &[&RecordSet]) -> u32 {
-    sets.iter().map(|set| set.ttl()).min().unwrap_or(0)
 }
 
 /// `set` with `owner` as the owner of every record and RRSIG.

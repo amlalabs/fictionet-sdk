@@ -1418,11 +1418,13 @@ fn any_follows_rfc_8482() {
     // Without an RRset of the type it prefers, the first in type order.
     let one = any(AnyResponse::OneRrset(RecordType::MX));
     assert_eq!(rows(&one.answers), vec![row("www.example.", RecordType::A)]);
-    let hinfo = any(AnyResponse::Hinfo);
+    // Its TTL is the operator's, not the name's data's (RFC 8482 §4.2).
+    let hinfo = any(AnyResponse::Hinfo { ttl: 3789 });
     assert_eq!(
         rows(&hinfo.answers),
         vec![row("www.example.", RecordType::HINFO)]
     );
+    assert_eq!(hinfo.answers[0].ttl, 3789);
     let RData::HINFO(synthesized) = &hinfo.answers[0].data else {
         panic!("HINFO");
     };
@@ -1451,7 +1453,7 @@ fn any_at_a_cname_gets_the_cname_rather_than_a_hinfo() {
         let reply = match answer(
             &zone,
             &request(qname, RecordType::ANY, false),
-            AnyResponse::Hinfo,
+            AnyResponse::Hinfo { ttl: 3600 },
         ) {
             Answered::Response(response) => response.message,
             Answered::Unknown { name, .. } => panic!("unknown at {name}"),

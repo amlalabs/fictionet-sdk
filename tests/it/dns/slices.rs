@@ -870,7 +870,7 @@ fn copying(real: &TestInternet, world: TestInternet) -> MemoryNet {
         );
     }
     let cloudflare = ServerConfig {
-        any: AnyResponse::Hinfo,
+        any: AnyResponse::Hinfo { ttl: 3600 },
         ..ServerConfig::generic()
     };
     serve(example_com(), cloudflare, &["example.com."]);

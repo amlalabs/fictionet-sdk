@@ -157,7 +157,13 @@ def responseJson (r : Response) : String :=
     ("required_additional", jnat r.required)]
 
 def anyStr : AnyResponse → String
-  | .hinfo => "hinfo" | .oneRrset => "one_rrset" | .all => "all"
+  | .hinfo _ => "hinfo" | .oneRrset => "one_rrset" | .all => "all"
+
+/-- The input fields that say what a server sends for QTYPE ANY: `any`, and for `hinfo` its TTL, `hinfo_ttl`. -/
+def anyFields (any : AnyResponse) : List (String × String) :=
+  ("any", jstr (anyStr any)) :: match any with
+    | .hinfo ttl => [("hinfo_ttl", jnat ttl)]
+    | _ => []
 
 /-- The zone as master-file lines: the SOA, every RRset, and each delegation's NS, DS, and glue. -/
 def specLines (sp : Spec) : List String :=
@@ -529,7 +535,7 @@ def rQtype : G Nat := pick #[1, 1, 28, 2, 15, 16, 5, 6, 43, 255, 13, 33, 39, 99]
 
 instance : Inhabited AnyResponse := ⟨.all⟩
 
-def rAny : G AnyResponse := pick #[.hinfo, .oneRrset, .all]
+def rAny : G AnyResponse := do pick #[.hinfo (← rTtl), .oneRrset, .all]
 
 
 def zoneErrorStr : ZoneError → String
@@ -595,8 +601,8 @@ def zoneCase : G String := do
   let expected := match answer z q any with
     | .response r => responseJson r
     | .unknown n => jobj [("unknown", jstr (nameStr n))]
-  return jobj [("input", jobj [("zone", specJson sp), ("any", jstr (anyStr any)),
-      ("request", jobj [("qname", jstr (nameStr q.qname)), ("qtype", jstr (typeStr q.qtype))])]),
+  return jobj [("input", jobj ([("zone", specJson sp)] ++ anyFields any ++
+      [("request", jobj [("qname", jstr (nameStr q.qname)), ("qtype", jstr (typeStr q.qtype))])])),
     ("expected", expected)]
 
 def ancestorsIn (apex q : Name) : List Name :=
@@ -614,9 +620,9 @@ def partialCase : G String := do
   let expected := match answerPartial v q any with
     | .response r => jobj [("response", responseJson r)]
     | .unknown n => jobj [("unknown", jstr (nameStr n))]
-  return jobj [("input", jobj [("zone", specJson sp), ("unknown", jarr (unknown.map (jstr ∘ nameStr))),
-      ("any", jstr (anyStr any)),
-      ("request", jobj [("qname", jstr (nameStr q.qname)), ("qtype", jstr (typeStr q.qtype))])]),
+  return jobj [("input", jobj ([("zone", specJson sp), ("unknown", jarr (unknown.map (jstr ∘ nameStr)))] ++
+      anyFields any ++
+      [("request", jobj [("qname", jstr (nameStr q.qname)), ("qtype", jstr (typeStr q.qtype))])])),
     ("expected", expected)]
 
 end Zones
@@ -948,7 +954,7 @@ def learnedCase : G String := do
       | .reply r => jobj [("reply", responseJson r)]
       | _ => jobj [("silent", jbool true)]
     steps := steps.push (jobj [("request", requestJson q), ("upstream", upstream), ("expected", expected)])
-  return jobj [("input", jobj [("zone", specJson sp), ("any", jstr (anyStr any))]), ("steps", jarr steps.toList)]
+  return jobj [("input", jobj ([("zone", specJson sp)] ++ anyFields any)), ("steps", jarr steps.toList)]
 
 /-- A signed zone and questions for it in turn, each with the zone's answer with DO=1, which a server of a copy
 of it must give as the real servers do: the copy keeps the records, RRSIGs, and denial records they sent. -/

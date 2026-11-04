@@ -2088,10 +2088,13 @@ impl<V: Verify> Resolver<V> {
         {
             let cut = ns.name().to_lowercase();
             // RFC 1034 §5.3.3: a referral moves strictly closer to the
-            // name. Anything else is a broken server. A forwarder was asked
-            // to recurse (RFC 1034 §4.3.1), so a referral from it is no
-            // step closer: it does not recurse.
-            if exchange.forwarded || !cut.zone_of(&sname) {
+            // name. Anything else is a broken server. DS is the parent's
+            // data (RFC 4035 §2.4), so it is asked of the zone above the
+            // name, and a referral to the name itself leads back there. A
+            // forwarder was asked to recurse (RFC 1034 §4.3.1), so a
+            // referral from it is no step closer: it does not recurse.
+            let to_ds_owner = stype == RecordType::DS && cut == sname;
+            if exchange.forwarded || !cut.zone_of(&sname) || to_ds_owner {
                 return self.give_up(exchange, true, entropy);
             }
             self.cache.insert(
@@ -2294,6 +2297,15 @@ impl<V: Verify> Resolver<V> {
                 ResponseCode::NXDomain => Negative::NxDomain,
                 _ => Negative::NoData,
             };
+            // The negative is the SOA's zone's, and only that zone's
+            // denial records prove it (RFC 4035 §5.4). The proofs of the
+            // chain's wildcard aliases may come from other zones.
+            let denial: Vec<RecordSet> = denial
+                .iter()
+                .filter(|set| proof::of_zone(set, soa.name()))
+                .cloned()
+                .collect();
+            let denial = denial.as_slice();
             if let Some(rank) = rank {
                 self.cache.insert(
                     self.now,

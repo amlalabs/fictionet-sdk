@@ -306,7 +306,9 @@ impl Sites {
     /// its web site and its name server on one machine, and so does the
     /// name of a name server: a name is known to name one only once a
     /// delegation to it is filed, and the site a name gets must not depend
-    /// on what was asked first. A name the
+    /// on what was asked first. In a live mode the site shakes hands only
+    /// as the real host does, so a name server with nothing on port 443
+    /// gives no handshake ([`site`](Sites::site)). A name the
     /// session resolves but does not serve, outside Live-Depth's depth,
     /// gets no site: a machine there with no services refuses connections
     /// at TCP.
@@ -433,7 +435,8 @@ impl Sites {
 
     /// A site for `name`, answered by the world's handler, with a
     /// certificate from the world's CA, or in a live mode the one the real
-    /// host's certificate failure calls for.
+    /// host's certificate failure calls for, and no handshake where the
+    /// real host gives none.
     fn site(&self, name: &LowerName) -> Host {
         let host = dns::host(name);
         if self.pages.source().is_live() {
@@ -459,9 +462,17 @@ impl Sites {
                 );
                 let (config, refused) = (config.clone(), refused.clone());
                 async move {
-                    if pages.source().is_live()
-                        && let Some(refusal) = upstream.refusal(&name).await
-                    {
+                    let verdict = match pages.source().is_live() {
+                        true => upstream.verdict(&name).await,
+                        false => tls::Verdict::Verifies,
+                    };
+                    // A real host that gives no handshake, such as a name
+                    // server with nothing on port 443, gets none here
+                    // either: the handshake runs out its time.
+                    if verdict == tls::Verdict::NoHandshake {
+                        std::future::pending::<()>().await;
+                    }
+                    if let tls::Verdict::Refused(refusal) = verdict {
                         if let Ok(host) = name.parse() {
                             pages.report(
                                 &fcx,

@@ -124,7 +124,7 @@ fn nsecs_of(records: &[RecordSet], zone: &Name, owners: &[&Name]) -> Vec<RecordS
 /// §5.3.1). A reply may also carry the denial records of a zone below a
 /// cut, which share owners with the zone above and are no part of its
 /// chain (RFC 6840 §4.1).
-fn of_zone(set: &RecordSet, zone: &Name) -> bool {
+pub fn of_zone(set: &RecordSet, zone: &Name) -> bool {
     let signers = set.rrsigs().iter().filter_map(|rrsig| match &rrsig.data {
         RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) => Some(&rrsig.input().signer_name),
         _ => None,

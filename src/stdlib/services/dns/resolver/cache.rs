@@ -359,10 +359,12 @@ struct Stored {
 ///   (RFC 4035 §5.3.3).
 /// - A failure lives [`Limits::failure_ttl`], and so does data that
 ///   validated Bogus or Indeterminate. A failure that persists lives
-///   longer each time, as RFC 9520 §3.2 asks: one that comes no later
-///   after the failure before it at the key ended than that one lasted
-///   lives twice as long, up to 5 minutes or [`Limits::failure_ttl`],
-///   whichever is longer.
+///   longer each time, as RFC 9520 §3.2 asks: one whose
+///   [`Offer::Failure`] says how long the failure before it lasted
+///   (`follows`) lives twice as long, up to 5 minutes or
+///   [`Limits::failure_ttl`], whichever is longer. The resolution reads
+///   that with [`persisting`](Cache::persisting) when it begins, since
+///   the failure before may end while it runs.
 /// - Data replaces a live entry for its key only at equal or higher
 ///   [`Rank`] (RFC 2181 §5.4.1). A failure is no data: any data replaces
 ///   it, and it is laid over any live entry that does not answer clients,

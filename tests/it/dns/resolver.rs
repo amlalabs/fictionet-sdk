@@ -5815,3 +5815,221 @@ fn an_nsec_beside_a_plain_answer_never_reaches_the_client() {
         );
     }
 }
+
+/// Answers as the authority it wraps does, but answers every DS question
+/// with a referral to `example.com`, as a server that does not know DS
+/// does.
+struct DsReferral<A>(A);
+
+impl<A: Authority> Authority for DsReferral<A> {
+    fn respond(
+        &self,
+        req: &Request,
+        local: SocketAddr,
+        server: &ServerConfig,
+        client: &Client,
+    ) -> Step {
+        if req.question.query_type() != RecordType::DS {
+            return self.0.respond(req, local, server, client);
+        }
+        let query = &req.message.metadata;
+        let mut message = Message::response(query.id, query.op_code);
+        message.add_query(req.question.clone());
+        message.add_authority(Record::from_rdata(
+            name("example.com."),
+            3600,
+            ns("ns1.example.com."),
+        ));
+        message.add_additional(Record::from_rdata(
+            name("ns1.example.com."),
+            3600,
+            a(EXAMPLE),
+        ));
+        Step::Reply(Response {
+            message,
+            required_additional: 0,
+        })
+    }
+}
+
+#[test]
+fn a_referral_to_the_owner_of_a_ds_question_is_no_step_closer() {
+    let root = delegation(
+        builder(".", "a.root-servers.net.").rrset(rrset(
+            "a.root-servers.net.",
+            3600,
+            vec![a(ROOT)],
+        )),
+        "com.",
+        "ns.nic.com.",
+        Some(COM),
+        None,
+    )
+    .build()
+    .unwrap();
+    let com = delegation(
+        builder("com.", "ns.nic.com.").rrset(rrset("ns.nic.com.", 3600, vec![a(COM)])),
+        "example.com.",
+        "ns1.example.com.",
+        Some(EXAMPLE),
+        None,
+    )
+    .build()
+    .unwrap();
+    let example = builder("example.com.", "ns1.example.com.")
+        .rrset(rrset("ns1.example.com.", 3600, vec![a(EXAMPLE)]))
+        .rrset(rrset("www.example.com.", 300, vec![a("192.0.2.80")]))
+        .build()
+        .unwrap();
+    let mut net = MemoryNet::new();
+    serve_at(&mut net, ROOT, vec![root]);
+    serve_at(&mut net, EXAMPLE, vec![example]);
+    let zones = Zones::new(vec![Arc::new(com) as Arc<dyn ZoneData>]);
+    let local = SocketAddr::new(ip(COM), 53);
+    net.serve(
+        ip(COM),
+        AuthorityEngine::new(DsReferral(zones), ServerConfig::generic(), local),
+    );
+    let mut resolver = resolver(config(None));
+    let reply = ask(
+        &mut resolver,
+        &mut net,
+        0,
+        query(client(1), "www.example.com.", RecordType::A, |_| {}),
+    );
+    assert_eq!(addresses(&reply), ["192.0.2.80"]);
+    let ds_asked = |net: &MemoryNet| {
+        asked(net)
+            .iter()
+            .filter(|(_, qname, qtype, _)| qname == "example.com." && *qtype == RecordType::DS)
+            .count()
+    };
+    let reply = ask(
+        &mut resolver,
+        &mut net,
+        1,
+        query(client(1), "example.com.", RecordType::DS, |_| {}),
+    );
+    assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
+    // The one server of `com` is given up on after its referral, over
+    // UDP and TCP at most.
+    let first = ds_asked(&net);
+    assert!(first <= 2, "asked DS {first} times");
+    // The failure is cached (RFC 9520 §3.2).
+    let reply = ask(
+        &mut resolver,
+        &mut net,
+        2,
+        query(client(1), "example.com.", RecordType::DS, |_| {}),
+    );
+    assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
+    assert_eq!(ds_asked(&net), first);
+}
+
+#[test]
+fn a_negative_after_a_wildcard_alias_from_another_zone_validates() {
+    let nsec3 = Denial::Nsec3 {
+        opt_out: false,
+        salt: Vec::new(),
+    };
+    for denial in [Denial::Nsec, nsec3] {
+        let root_keys = keys(10);
+        let com_keys = keys(20);
+        let example_keys = keys(40);
+        let sub_keys = keys(60);
+        let cname = |target: &str| RData::CNAME(CNAME(name(target)));
+        let root = delegation(
+            builder(".", "a.root-servers.net.").rrset(rrset(
+                "a.root-servers.net.",
+                3600,
+                vec![a(ROOT)],
+            )),
+            "com.",
+            "ns.nic.com.",
+            Some(COM),
+            Some(ds(&com_keys, "com.")),
+        )
+        .build()
+        .unwrap()
+        .signed(&root_keys, window(), Denial::Nsec)
+        .unwrap();
+        let com = delegation(
+            builder("com.", "ns.nic.com.").rrset(rrset("ns.nic.com.", 3600, vec![a(COM)])),
+            "example.com.",
+            "ns1.example.com.",
+            Some(EXAMPLE),
+            Some(ds(&example_keys, "example.com.")),
+        )
+        .build()
+        .unwrap()
+        .signed(&com_keys, window(), Denial::Nsec)
+        .unwrap();
+        let example = delegation(
+            builder("example.com.", "ns1.example.com.")
+                .rrset(rrset("ns1.example.com.", 3600, vec![a(EXAMPLE)]))
+                .rrset(rrset("www.example.com.", 300, vec![a("192.0.2.80")])),
+            "sub.example.com.",
+            "ns1.example.com.",
+            None,
+            Some(ds(&sub_keys, "sub.example.com.")),
+        )
+        .build()
+        .unwrap()
+        .signed(&example_keys, window(), denial.clone())
+        .unwrap();
+        // Wildcard aliases in the child into the parent: to data, to a
+        // type the target lacks, and to a name the parent lacks.
+        let sub = builder("sub.example.com.", "ns1.example.com.")
+            .rrset(rrset(
+                "*.w.sub.example.com.",
+                300,
+                vec![cname("www.example.com.")],
+            ))
+            .rrset(rrset(
+                "*.n.sub.example.com.",
+                300,
+                vec![cname("gone.example.com.")],
+            ))
+            .build()
+            .unwrap()
+            .signed(&sub_keys, window(), denial.clone())
+            .unwrap();
+        let mut net = MemoryNet::new();
+        serve_at(&mut net, ROOT, vec![root]);
+        serve_at(&mut net, COM, vec![com]);
+        serve_at(&mut net, EXAMPLE, vec![example, sub]);
+        let anchors = Anchors::of(vec![root_keys.anchor(&Name::root())]);
+        let mut resolver = resolver(config(Some(anchors)));
+        let questions = [
+            ("x.w.sub.example.com.", RecordType::A, ResponseCode::NoError),
+            (
+                "x.w.sub.example.com.",
+                RecordType::TXT,
+                ResponseCode::NoError,
+            ),
+            (
+                "x.n.sub.example.com.",
+                RecordType::A,
+                ResponseCode::NXDomain,
+            ),
+            // The negatives the chains ended in, now from the cache.
+            ("www.example.com.", RecordType::TXT, ResponseCode::NoError),
+            ("gone.example.com.", RecordType::A, ResponseCode::NXDomain),
+        ];
+        for (seconds, (qname, qtype, rcode)) in (0..).zip(questions) {
+            let reply = ask(
+                &mut resolver,
+                &mut net,
+                seconds,
+                query(client(1), qname, qtype, dnssec_ok),
+            );
+            assert_eq!(
+                reply.metadata.response_code,
+                rcode,
+                "{denial:?} {qname} {qtype}: {:?}",
+                edes(&reply)
+            );
+            assert!(reply.metadata.authentic_data, "{denial:?} {qname} {qtype}");
+        }
+    }
+}

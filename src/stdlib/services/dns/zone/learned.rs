@@ -125,15 +125,19 @@ use super::zone::{Node, dname_target, targets, wildcard};
 /// name says nothing of other cuts, of the zones its server holds under
 /// the cut at other names, or of the zones other servers hold. A
 /// referral to a cut below a cut the data holds comes from a zone below
-/// that cut, which its server also serves. An authoritative answer shows the
-/// zone it comes from with the zone's SOA or apex NS RRset in its
-/// authority section, with the zone's signature on its answer
-/// (RFC 4034 §3.1.7), or by being for the apex or a name the zone holds
-/// data at; one that shows none, such as a minimal response, may come
-/// from a zone below a cut the data does not hold yet. Its answer RRsets
-/// are then the answers of the server that sent them alone, and the
-/// names they are at are unknown to the other servers until a response
-/// shows the zone there. A DS or NSEC question at
+/// that cut, which its server also serves. An answer RRset shows it is
+/// this zone's when the zone signed it (RFC 4034 §3.1.7); in a signed zone
+/// every RRset is signed (RFC 4035 §2.2), so one another zone signed, or
+/// an unsigned one beside the zone's signatures, is not. An unsigned
+/// RRset shows it is the zone's when it is at the apex or a name the zone
+/// holds data at, at or above a question's name the zone holds data at,
+/// or where the chain ends when the authority section holds the zone's
+/// SOA or apex NS RRset. One that shows none, as in a minimal response,
+/// may come from a zone below a cut the data does not hold yet: it is
+/// then the answer of the server that sent it alone, and the other
+/// servers do not know it until a response shows it is the zone's. Each
+/// server's view leaves out the answer RRsets only other servers gave
+/// that way, and keeps the rest of the name's data. A DS or NSEC question at
 /// the cut is answered from the parent's side (RFC 4035 §2.6, §3.1.4.1):
 /// from a filed RRset of the type, a filed NODATA for DS, or a referral
 /// filed for NSEC there. A referral carries no SOA, and may come from a
@@ -166,8 +170,9 @@ pub struct Filing {
     pub zone: LowerName,
     /// The RRsets kept, each with the section it came from, in the order
     /// they were filed: for an answer, the apex NS RRset, the answers,
-    /// then additional data; for a referral, its NS RRset, its glue, and
-    /// its DS RRset.
+    /// then additional data; for a referral, its NS RRset, its glue, its
+    /// DS RRset, then the addresses of name servers in the zone outside
+    /// the cut (sibling glue, RFC 9471 §3.2).
     pub sets: Vec<(Section, RecordSet)>,
 }
 
@@ -189,10 +194,11 @@ struct Facts {
     /// name or the name its chain ended at, each with the servers that
     /// sent such a referral and the cut each referred it to.
     referred: BTreeMap<LowerName, BTreeSet<(IpAddr, LowerName)>>,
-    /// The names whose answer RRsets came only from responses that did
-    /// not show which zone they were answered from, each with the servers
-    /// that sent them.
-    scoped: BTreeMap<LowerName, BTreeSet<IpAddr>>,
+    /// The answer RRsets, by owner and type, that came only from
+    /// responses that did not show they were this zone's, each with the
+    /// servers that sent them. The answers to ANY and RRSIG are under
+    /// those types.
+    scoped: BTreeMap<(LowerName, RecordType), BTreeSet<IpAddr>>,
     /// The questions a whole response was filed for, by name and type.
     answered: HashSet<(LowerName, RecordType)>,
     /// The questions a server answered with an error RCODE that gives no
@@ -222,6 +228,10 @@ struct Known {
     absent: BTreeSet<RecordType>,
     /// A zone cut's NS RRset and glue. Its DS RRset is in `sets`.
     cut: Option<(RecordSet, Vec<RecordSet>)>,
+    /// Address RRsets from additional sections, of types `sets` holds
+    /// from an answer: the additional data of the servers that answer
+    /// without that answer, when only some servers gave it.
+    additional: BTreeMap<RecordType, RecordSet>,
     /// The node `sets` and `cut` make, for views.
     node: Node,
 }
@@ -232,6 +242,7 @@ impl Default for Known {
             sets: BTreeMap::new(),
             absent: BTreeSet::new(),
             cut: None,
+            additional: BTreeMap::new(),
             node: Node::Data(BTreeMap::new()),
         }
     }
@@ -305,8 +316,9 @@ impl Learned {
     /// comes from (RFC 2308 §3), or else an NS RRset there, which an
     /// authoritative answer carries only at its zone's apex, owned
     /// strictly below this zone's apex and at or above the question's
-    /// name; or the SOA RRset that answers an SOA question at the
-    /// question's name, which is then that zone's apex; or the signer of
+    /// name; or an SOA or NS RRset at the question's name in its answer
+    /// section, which an authoritative answer carries only at its zone's
+    /// apex, which the question's name then is; or the signer of
     /// the RRSIGs over the answer RRsets at or above the question's name,
     /// which is the zone that holds them (RFC 4034 §3.1.7). A server that
     /// also serves a child zone answers that way for the child's names,
@@ -333,18 +345,17 @@ impl Learned {
                 .then_some(owner)
             })
         };
-        let apex_soa = question.query_type() == RecordType::SOA
-            && below(&qname)
+        let at_apex = below(&qname)
             && response.answers.iter().any(|record| {
-                record.record_type() == RecordType::SOA
+                matches!(record.record_type(), RecordType::SOA | RecordType::NS)
                     && record.dns_class == DNSClass::IN
                     && LowerName::new(&record.name) == qname
             });
-        let signer = signer(&response.answers, &qname)
+        let signer = signer_above(&response.answers, &qname)
             .filter(|signer| below(signer) && signer.zone_of(&qname));
         owner(RecordType::SOA)
             .or_else(|| owner(RecordType::NS))
-            .or_else(|| apex_soa.then_some(qname))
+            .or_else(|| at_apex.then_some(qname))
             .or(signer)
     }
 
@@ -432,6 +443,66 @@ impl Learned {
             .below_cut(&qname, question.query_type())
     }
 
+    /// Whether the zone holds a cut at `name`, which a referral gave.
+    pub fn holds_cut(&self, name: &LowerName) -> bool {
+        self.held
+            .lock()
+            .facts
+            .names
+            .get(name)
+            .is_some_and(|known| known.cut.is_some())
+    }
+
+    /// Whether `response`, a real server of the zone's response to
+    /// `question`, shows that the server serves this zone, when it does
+    /// not come from a zone below ([`child_answering`](Learned::child_answering)).
+    /// An authoritative answer shows it with the zone's SOA or apex NS
+    /// RRset in its authority section, an answer RRset the zone signed
+    /// (RFC 4034 §3.1.7), or by answering for the apex or a name the zone
+    /// holds data at. A referral shows it when it refers to a cut one
+    /// label below the apex, which no zone but this one can hold
+    /// (RFC 1034 §4.2.1). A truncated response, whose sections may be
+    /// incomplete (RFC 2181 §9), shows nothing.
+    pub fn shows(&self, question: &Query, response: &Message) -> bool {
+        let metadata = &response.metadata;
+        if metadata.truncation || question.query_class() != DNSClass::IN {
+            return false;
+        }
+        let apex = &self.apex;
+        let qname = LowerName::new(question.name());
+        let in_class = |records: &[Record]| -> Vec<RecordSet> {
+            rrsets(records)
+                .into_iter()
+                .filter(|set| set.dns_class() == DNSClass::IN)
+                .collect()
+        };
+        let authority = in_class(&response.authorities);
+        match (metadata.authoritative, metadata.response_code) {
+            (true, ResponseCode::NoError | ResponseCode::NXDomain | ResponseCode::YXDomain) => {
+                let signed = in_class(&response.answers)
+                    .iter()
+                    .any(|set| signer(set).as_ref() == Some(apex));
+                signed
+                    || names_zone(apex, &authority)
+                    || self
+                        .held
+                        .lock()
+                        .facts
+                        .answers_for(apex, &qname, question.query_type())
+            }
+            (false, ResponseCode::NoError) if response.answers.is_empty() => {
+                authority.iter().any(|set| {
+                    let owner = LowerName::new(set.name());
+                    set.record_type() == RecordType::NS
+                        && owner != *apex
+                        && owner.base_name() == *apex
+                        && owner.zone_of(&qname)
+                })
+            }
+            _ => false,
+        }
+    }
+
     /// Starts session `generation`, if it is newer than the current one,
     /// dropping every fact filed before.
     pub fn advance(&self, generation: Generation) {
@@ -473,12 +544,21 @@ impl Learned {
             .unwrap_or_else(|| RecordSet::new(Name::from(&self.apex), RecordType::SOA, 0));
         let qname = LowerName::new(question.name());
         let (chain, answering) = answering(&self.apex, &facts, server, qname.clone());
+        let hidden = facts
+            .hidden_from(server)
+            .into_iter()
+            .filter_map(|(name, types)| {
+                let known = facts.names.get(&name)?;
+                Some((name, node_of(known, |rtype| !types.contains(&rtype))))
+            })
+            .collect();
         Arc::new(LearnedView {
             apex: self.apex.clone(),
             server,
             qname,
             chain,
             answering,
+            hidden,
             qtype: question.query_type(),
             soa,
             facts,
@@ -638,29 +718,6 @@ impl Facts {
             .iter()
             .find(|set| set.record_type() == RecordType::SOA && LowerName::new(set.name()) == *apex)
             .cloned();
-        // The name whose zone answers the question: its own, or for DS the
-        // parent's side, which holds DS (RFC 4035 §2.4).
-        let placing = if filed.qtype == RecordType::DS && filed.qname != apex {
-            filed.qname.base_name()
-        } else {
-            filed.qname.clone()
-        };
-        // A response shows that this zone answered it with the zone's SOA
-        // or apex NS RRset in its authority section, with the zone's
-        // signature on its answer (RFC 4034 §3.1.7), or by answering for
-        // the apex or a name the zone holds data at. Otherwise the server
-        // may also serve a zone below a cut the zone does not know yet,
-        // and have answered from that zone (RFC 1034 §4.3.2), so the
-        // answer RRsets stand only for the server that sent them.
-        let shown = soa.is_some()
-            || authority.iter().any(|set| {
-                set.record_type() == RecordType::NS && LowerName::new(set.name()) == *apex
-            })
-            || signer(answer.iter().flat_map(|set| set.rrsigs()), filed.qname).as_ref()
-                == Some(apex)
-            || placing == *apex
-            || self.placed(&placing);
-        let scope = (!shown).then_some(filed.server);
         for set in authority {
             if set.record_type() == RecordType::NS
                 && LowerName::new(set.name()) == *apex
@@ -675,6 +732,37 @@ impl Facts {
             .filter(|set| set.record_type() == RecordType::DNAME)
             .collect();
         let end = chain_end(apex, filed.qname, filed.qtype, answer, &dnames);
+        // Each answer RRset stands for every server of the zone when the
+        // response shows it is the zone's, and otherwise only for the
+        // server that sent it, which may also serve a zone below a cut the
+        // zone does not know yet, and have answered from that zone
+        // (RFC 1034 §4.3.2). In a signed zone every RRset is signed, and
+        // its RRSIGs name the zone that holds it (RFC 4035 §2.2,
+        // RFC 4034 §3.1.7): an RRset this zone signed is its own, and one
+        // another zone signed, or an unsigned one beside this zone's
+        // signatures, is not. An unsigned RRset otherwise is the zone's
+        // when it is kept at the apex or a name the zone holds data at; at
+        // or above the question's name, when the zone answers for that
+        // name ([`answers_for`](Facts::answers_for)); or where the chain
+        // ends, when the authority section names the zone, which it does
+        // for that name alone ([`names_zone`]).
+        let signed = answer.iter().any(|set| signer(set).as_ref() == Some(apex));
+        let for_qname = self.answers_for(apex, filed.qname, filed.qtype);
+        let end_named = names_zone(apex, authority);
+        let scope_of = |facts: &Facts, set: &RecordSet, at: &LowerName| {
+            let owner = LowerName::new(set.name());
+            let shown = match signer(set) {
+                Some(signer) => signer == *apex,
+                None => {
+                    !signed
+                        && (*at == *apex
+                            || facts.placed(at)
+                            || (for_qname && owner.zone_of(filed.qname))
+                            || (end_named && end.as_ref() == Some(&owner)))
+                }
+            };
+            (!shown).then_some(filed.server)
+        };
         // A CNAME made from a DNAME above its owner.
         let synthesized = |set: &RecordSet| {
             let owner = LowerName::new(set.name());
@@ -693,11 +781,14 @@ impl Facts {
             {
                 continue;
             }
-            let scope = scope.filter(|_| !self.placed(&owner));
+            let Some(at) = kept_at(apex, set) else {
+                continue;
+            };
+            let scope = scope_of(self, set, &at);
             if self.put_expanded(apex, set, Section::Answer, filed.denial) {
                 kept.push((Section::Answer, set.clone()));
+                self.scope(&at, set.record_type(), scope);
             }
-            self.scope(&owner, scope);
         }
         // An NSEC RRset may sit beside a CNAME (RFC 4035 §2.5), so each
         // CNAME the answer to an NSEC question followed shows that the
@@ -725,7 +816,7 @@ impl Facts {
         }
         self.put_additional(apex, additional, kept);
 
-        let Some(end) = end else {
+        let Some(end) = end.clone() else {
             return;
         };
         let at_end: Vec<&RecordSet> = answer
@@ -733,11 +824,11 @@ impl Facts {
             .filter(|set| LowerName::new(set.name()) == end)
             .collect();
         if whole && filed.rcode == ResponseCode::NoError && !at_end.is_empty() {
-            let scope = scope.filter(|_| !self.placed(&end));
-            if self.put_whole(apex, &end, filed, &at_end) {
+            let scope = at_end.iter().find_map(|set| scope_of(self, set, &end));
+            if let Some(at) = self.put_whole(apex, &end, filed, &at_end) {
                 kept.extend(at_end.into_iter().map(|set| (Section::Answer, set.clone())));
+                self.scope(&at, filed.qtype, scope);
             }
-            self.scope(&end, scope);
             return;
         }
         if at_end.iter().any(|set| set.record_type() == filed.qtype) {
@@ -783,7 +874,7 @@ impl Facts {
             }
             ResponseCode::NoError => {
                 self.unabsent(apex, &end);
-                self.scope(&end, None);
+                self.unscope(&end);
                 if whole {
                     self.whole
                         .insert((end.clone(), filed.qtype), Node::Data(BTreeMap::new()));
@@ -930,21 +1021,19 @@ impl Facts {
 
     /// Files `at_end`, the RRsets of an answer to ANY or RRSIG at `end`,
     /// as that question's answer: at `end`, or at the wildcard that made
-    /// them, with the authority section's proof for the expansion. Whether
-    /// they were kept.
+    /// them, with the authority section's proof for the expansion. The
+    /// name they were kept at, if they were.
     fn put_whole(
         &mut self,
         apex: &LowerName,
         end: &LowerName,
         filed: &Filed<'_>,
         at_end: &[&RecordSet],
-    ) -> bool {
+    ) -> Option<LowerName> {
         let (at, owner) = match at_end.iter().find_map(|set| expanded_from(set)) {
             None => (end.clone(), Name::from(end)),
             Some(labels) => {
-                let Some(at) = self.expansion(apex, end, labels, filed.denial) else {
-                    return false;
-                };
+                let at = self.expansion(apex, end, labels, filed.denial)?;
                 let owner = Name::from(&at);
                 (at, owner)
             }
@@ -953,8 +1042,9 @@ impl Facts {
             .iter()
             .map(|set| (set.record_type(), renamed(set, &owner)))
             .collect();
-        self.whole.insert((at, filed.qtype), Node::Data(sets));
-        true
+        self.whole
+            .insert((at.clone(), filed.qtype), Node::Data(sets));
+        Some(at)
     }
 
     /// Notes that `owner` was answered by expanding the wildcard whose
@@ -996,8 +1086,9 @@ impl Facts {
 
     /// Keeps `set` at its owner, unless an RRset of the same type is held
     /// from a section that outranks `rank`, or `rank` is the additional
-    /// section's and a filed NODATA says the owner has no such RRset.
-    /// Whether it was kept.
+    /// section's and a filed NODATA says the owner has no such RRset. An
+    /// additional RRset outranked so is kept beside the held one
+    /// ([`Known::additional`]). Whether it was kept.
     fn put(&mut self, apex: &LowerName, set: RecordSet, rank: Section) -> bool {
         let owner = LowerName::new(set.name());
         self.unabsent(apex, &owner);
@@ -1005,13 +1096,23 @@ impl Facts {
         let rtype = set.record_type();
         let replaces = known.sets.get(&rtype).is_none_or(|(held, _)| *held <= rank);
         let denied = rank == Section::Additional && known.absent.contains(&rtype);
-        let keeps = replaces && !denied;
-        if keeps {
-            known.sets.insert(rtype, (rank, set));
+        if denied {
+            return false;
+        }
+        if replaces {
+            if let Some((Section::Additional, held)) = known.sets.insert(rtype, (rank, set))
+                && rank > Section::Additional
+            {
+                known.additional.insert(rtype, held);
+            }
             known.absent.remove(&rtype);
+        } else if rank == Section::Additional {
+            known.additional.insert(rtype, set);
+        } else {
+            return false;
         }
         self.rebuild(&owner);
-        keeps
+        true
     }
 
     /// Keeps `name` as absent, with nothing below it.
@@ -1019,7 +1120,7 @@ impl Facts {
         self.names.retain(|held, _| !name.zone_of(held));
         self.whole.retain(|(held, _), _| !name.zone_of(held));
         self.referred.retain(|held, _| !name.zone_of(held));
-        self.scoped.retain(|held, _| !name.zone_of(held));
+        self.scoped.retain(|(held, _), _| !name.zone_of(held));
         self.absent.insert(name.clone());
     }
 
@@ -1037,41 +1138,78 @@ impl Facts {
             .any(|(_, referrals)| referrals.contains(&referral))
     }
 
-    /// Notes that the answer RRsets at `name` stand only for `scope`'s
-    /// server, or with `None`, for every server of the zone.
-    fn scope(&mut self, name: &LowerName, scope: Option<IpAddr>) {
+    /// Notes that the answer RRset of `rtype` at `name` stands only for
+    /// `scope`'s server, or with `None`, for every server of the zone.
+    fn scope(&mut self, name: &LowerName, rtype: RecordType, scope: Option<IpAddr>) {
+        let key = (name.clone(), rtype);
         match scope {
             Some(server) => {
-                self.scoped.entry(name.clone()).or_default().insert(server);
+                self.scoped.entry(key).or_default().insert(server);
             }
             None => {
-                self.scoped.remove(name);
+                self.scoped.remove(&key);
             }
         }
     }
 
-    /// Whether `server` answers with the facts held at `name`: every
-    /// server does, but for answer RRsets only some servers gave.
-    fn visible(&self, name: &LowerName, server: IpAddr) -> bool {
+    /// Notes that every answer RRset at `name` stands for every server of
+    /// the zone.
+    fn unscope(&mut self, name: &LowerName) {
+        self.scoped.retain(|(held, _), _| held != name);
+    }
+
+    /// Whether `server` answers with the RRset of `rtype` held at `name`:
+    /// every server does, but for answer RRsets only some servers gave.
+    fn visible(&self, name: &LowerName, rtype: RecordType, server: IpAddr) -> bool {
         self.scoped
-            .get(name)
+            .get(&(name.clone(), rtype))
             .is_none_or(|servers| servers.contains(&server))
+    }
+
+    /// The names holding answer RRsets `server` does not answer with,
+    /// each with those RRsets' types.
+    fn hidden_from(&self, server: IpAddr) -> BTreeMap<LowerName, BTreeSet<RecordType>> {
+        let mut hidden: BTreeMap<LowerName, BTreeSet<RecordType>> = BTreeMap::new();
+        for ((name, rtype), servers) in &self.scoped {
+            if !servers.contains(&server) {
+                hidden.entry(name.clone()).or_default().insert(*rtype);
+            }
+        }
+        hidden
     }
 
     /// Whether the zone holds facts at `name`, which is no cut, from a
     /// response that showed the zone: an RRset from an answer or
-    /// authority section, or a type known absent. Every server of the
-    /// zone then answers for `name` from the zone.
+    /// authority section, or a type a NODATA showed absent. Every server
+    /// of the zone then answers for `name` from the zone. DS and NSEC
+    /// are left out: the parent holds them at a cut too (RFC 4035 §2.6),
+    /// so they do not show that `name` is no cut.
     fn placed(&self, name: &LowerName) -> bool {
-        !self.scoped.contains_key(name)
-            && self.names.get(name).is_some_and(|known| {
-                known.cut.is_none()
-                    && (!known.absent.is_empty()
-                        || known
-                            .sets
-                            .values()
-                            .any(|(rank, _)| *rank > Section::Additional))
-            })
+        let own = |rtype: &RecordType| !matches!(rtype, RecordType::DS | RecordType::NSEC);
+        self.names.get(name).is_some_and(|known| {
+            known.cut.is_none()
+                && (known.absent.iter().any(own)
+                    || known.sets.iter().any(|(rtype, (rank, _))| {
+                        own(rtype)
+                            && *rank > Section::Additional
+                            && !self.scoped.contains_key(&(name.clone(), *rtype))
+                    }))
+        })
+    }
+
+    /// Whether the zone at `apex` answers `qname` and `qtype` for every
+    /// server: the question is for the apex or a name the zone holds data
+    /// at, or for DS, the parent's side of such a name, which holds DS
+    /// (RFC 4035 §2.4). Otherwise a server may also serve a zone below a
+    /// cut the zone does not know yet, and answer from that zone
+    /// (RFC 1034 §4.3.2).
+    fn answers_for(&self, apex: &LowerName, qname: &LowerName, qtype: RecordType) -> bool {
+        let placing = if qtype == RecordType::DS && qname != apex {
+            qname.base_name()
+        } else {
+            qname.clone()
+        };
+        placing == *apex || self.placed(&placing)
     }
 
     /// Forgets that `name` or a name above it is absent, as a response
@@ -1108,22 +1246,7 @@ impl Facts {
         let Some(known) = self.names.get_mut(name) else {
             return;
         };
-        let mut sets: BTreeMap<RecordType, RecordSet> = known
-            .sets
-            .iter()
-            .map(|(rtype, (_, set))| (*rtype, set.clone()))
-            .collect();
-        known.node = match &known.cut {
-            Some((ns, glue)) => Node::Cut {
-                ns: ns.clone(),
-                ds: sets.remove(&RecordType::DS),
-                glue: glue.clone(),
-            },
-            None => match sets.remove(&RecordType::DNAME) {
-                Some(dname) => Node::Dname(dname, sets),
-                None => Node::Data(sets),
-            },
-        };
+        known.node = node_of(known, |_| true);
     }
 
     /// Whether `name`, below `apex`, or a name above it is absent.
@@ -1292,7 +1415,7 @@ fn chain_end(
 /// The zone that signed the RRsets of an answer at or above `qname`: the
 /// signer of the RRSIGs among `records` that cover them (RFC 4034
 /// §3.1.7).
-fn signer<'a>(
+fn signer_above<'a>(
     records: impl IntoIterator<Item = &'a Record>,
     qname: &LowerName,
 ) -> Option<LowerName> {
@@ -1304,6 +1427,42 @@ fn signer<'a>(
         }
         _ => None,
     })
+}
+
+/// Whether `authority`, an authoritative answer's authority section,
+/// holds the SOA or apex NS RRset of the zone at `apex`, which shows the
+/// zone the answer's chain ends in: a negative carries its zone's SOA
+/// (RFC 2308 §3), and a server may add the NS RRset of the zone its
+/// answer came from.
+fn names_zone(apex: &LowerName, authority: &[RecordSet]) -> bool {
+    authority.iter().any(|set| {
+        matches!(set.record_type(), RecordType::SOA | RecordType::NS)
+            && LowerName::new(set.name()) == *apex
+    })
+}
+
+/// The zone that signed `set`, which holds it (RFC 4034 §3.1.7), when it
+/// came with RRSIGs.
+fn signer(set: &RecordSet) -> Option<LowerName> {
+    set.rrsigs().iter().find_map(|record| match &record.data {
+        RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) => {
+            Some(LowerName::new(&rrsig.input().signer_name))
+        }
+        _ => None,
+    })
+}
+
+/// Where the answer RRset `set` of the zone at `apex` is kept: at its
+/// owner, or at the wildcard that made it (RFC 4035 §5.3.4), unless that
+/// wildcard's parent is outside the zone.
+fn kept_at(apex: &LowerName, set: &RecordSet) -> Option<LowerName> {
+    match expanded_from(set) {
+        None => Some(LowerName::new(set.name())),
+        Some(labels) => {
+            let encloser = LowerName::new(&set.name().trim_to(labels));
+            apex.zone_of(&encloser).then(|| wildcard(&encloser))
+        }
+    }
 }
 
 /// The records of `denial`, the NSEC and NSEC3 RRsets of one response
@@ -1322,6 +1481,31 @@ fn proof(apex: &LowerName, claim: Claim<'_>, denial: &[RecordSet]) -> Vec<Record
 fn at_alias(apex: &LowerName, name: &LowerName, denial: &[RecordSet]) -> bool {
     let (zone, name) = (Name::from(apex), Name::from(name));
     proof::alias(&name, &zone, denial, u16::MAX) == Proof::Proven
+}
+
+/// The node `known` makes from its cut and the RRsets of the types
+/// `shows` keeps, with the additional data held beside those it leaves
+/// out.
+fn node_of(known: &Known, shows: impl Fn(RecordType) -> bool) -> Node {
+    let mut sets: BTreeMap<RecordType, RecordSet> = known
+        .sets
+        .iter()
+        .filter_map(|(rtype, (_, set))| match shows(*rtype) {
+            true => Some((*rtype, set.clone())),
+            false => known.additional.get(rtype).map(|set| (*rtype, set.clone())),
+        })
+        .collect();
+    match &known.cut {
+        Some((ns, glue)) => Node::Cut {
+            ns: ns.clone(),
+            ds: sets.remove(&RecordType::DS),
+            glue: glue.clone(),
+        },
+        None => match sets.remove(&RecordType::DNAME) {
+            Some(dname) => Node::Dname(dname, sets),
+            None => Node::Data(sets),
+        },
+    }
 }
 
 /// `set` with `owner` as the owner of every record and RRSIG.
@@ -1365,7 +1549,7 @@ fn answering(
         let cname = facts
             .names
             .get(&name)
-            .filter(|_| facts.visible(&name, server))
+            .filter(|_| facts.visible(&name, RecordType::CNAME, server))
             .and_then(|known| known.sets.get(&RecordType::CNAME))
             .and_then(|(_, set)| {
                 set.records_without_rrsigs()
@@ -1383,7 +1567,7 @@ fn answering(
             let dname = facts
                 .names
                 .get(&above)
-                .filter(|_| facts.visible(&above, server))
+                .filter(|_| facts.visible(&above, RecordType::DNAME, server))
                 .and_then(|known| known.sets.get(&RecordType::DNAME))
                 .and_then(|(_, set)| {
                     set.records_without_rrsigs()
@@ -1412,6 +1596,10 @@ struct LearnedView {
     chain: BTreeSet<LowerName>,
     /// The names the answer may end at ([`answering`]).
     answering: BTreeSet<LowerName>,
+    /// The nodes of the names that hold answer RRsets another server gave
+    /// without showing they were the zone's, without those RRsets, which
+    /// are not this server's.
+    hidden: BTreeMap<LowerName, Node>,
     qtype: RecordType,
     soa: RecordSet,
     facts: Arc<Facts>,
@@ -1440,27 +1628,38 @@ impl LearnedView {
                 .sets
                 .get(&rtype)
                 .is_some_and(|(rank, _)| *rank > Section::Additional)
+                && self.facts.visible(name, rtype, self.server)
         };
         let alias = answers(RecordType::CNAME)
             && (qtype != RecordType::NSEC
                 || known.absent.contains(&RecordType::NSEC)
                 || self.facts.stops_at_alias.contains(&self.qname));
-        let absent = self.chain.contains(name) && known.absent.contains(&qtype);
+        // NSEC absent at a CNAME the CNAME's own answer showed, so it
+        // stands where the CNAME does.
+        let cname_hidden = known.sets.contains_key(&RecordType::CNAME)
+            && !self.facts.visible(name, RecordType::CNAME, self.server);
+        let absent = self.chain.contains(name)
+            && known.absent.contains(&qtype)
+            && !(qtype == RecordType::NSEC && cname_hidden);
         !matches!(qtype, RecordType::ANY | RecordType::RRSIG) && (answers(qtype) || alias || absent)
     }
 
     /// What the view gives for the cut `known` holds at `name`. DS and
     /// NSEC at the cut are the parent's data (RFC 4035 §2.6, §3.1.4.1),
     /// so a question for them there stands once the zone holds an RRset
-    /// of the type or knows there is none. A name of the chain at or
+    /// of the type or knows there is none. That the parent holds no NSEC
+    /// there comes from a referral, which shows it for its own server
+    /// alone: a server that also serves the child answers NSEC at the
+    /// child's apex from the child. A name of the chain at or
     /// below the cut is referred only when the view's server's referral
     /// to this cut was filed for it or a name below it
     /// ([`Facts::refers`]).
     fn cut<'a>(&self, name: &LowerName, known: &'a Known) -> Fact<&'a Node> {
         let parents = matches!(self.qtype, RecordType::DS | RecordType::NSEC);
         if parents && self.chain.contains(name) {
-            let settled =
-                known.sets.contains_key(&self.qtype) || known.absent.contains(&self.qtype);
+            let absent = known.absent.contains(&self.qtype)
+                && (self.qtype != RecordType::NSEC || self.facts.refers(name, self.server, name));
+            let settled = known.sets.contains_key(&self.qtype) || absent;
             return if settled {
                 Fact::Present(&known.node)
             } else {
@@ -1497,22 +1696,23 @@ impl View for LearnedView {
         if !self.apex.zone_of(name) || facts.is_absent(&self.apex, name) {
             return Fact::Absent;
         }
-        let visible = facts.visible(name, self.server);
         if let Some(known) = facts.names.get(name) {
-            match &known.node {
+            // Answers another server gave without showing their zone are
+            // not this server's.
+            let node = self.hidden.get(name).unwrap_or(&known.node);
+            match node {
                 Node::Cut { .. } => return self.cut(name, known),
-                // Answers another server gave without showing their zone
-                // are not this server's.
-                _ if !visible => {}
                 // A name the answer only passes, or reads addresses at,
                 // never ends it.
                 _ if !self.answering.contains(name) || self.knows(name, known) => {
-                    return Fact::Present(&known.node);
+                    return Fact::Present(node);
                 }
                 _ => {}
             }
         }
-        if visible && let Some(node) = facts.whole.get(&(name.clone(), self.qtype)) {
+        if facts.visible(name, self.qtype, self.server)
+            && let Some(node) = facts.whole.get(&(name.clone(), self.qtype))
+        {
             return Fact::Present(node);
         }
         if facts.names.contains_key(name) || facts.holds_below(name) {
@@ -1529,7 +1729,8 @@ impl View for LearnedView {
             .names
             .get(name)
             .and_then(|known| known.sets.get(&RecordType::NSEC))
-            .filter(|(rank, _)| *rank > Section::Additional);
+            .filter(|(rank, _)| *rank > Section::Additional)
+            .filter(|_| self.facts.visible(name, RecordType::NSEC, self.server));
         if kind == Denied::Type(RecordType::NSEC)
             && let Some((_, set)) = nsec
         {

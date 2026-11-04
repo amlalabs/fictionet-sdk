@@ -455,7 +455,12 @@ fn an_nsec_moved_off_its_wildcard_owner_proves_nothing() {
 fn the_hinfo_answer_to_any_is_signed_where_the_zone_can_sign() {
     // RFC 8482 §4.2: a synthesized HINFO in a signed zone must be signed.
     let online = Signed::new(zone(), keys(), window(), Denial::Nsec);
-    let reply = ask(&online, "ns1.example.", RecordType::ANY, AnyResponse::Hinfo);
+    let reply = ask(
+        &online,
+        "ns1.example.",
+        RecordType::ANY,
+        AnyResponse::Hinfo { ttl: 3600 },
+    );
     let answer = sets(&reply.answers);
     assert_eq!(answer.len(), 1);
     assert_eq!(answer[0].record_type(), RecordType::HINFO);
@@ -468,7 +473,7 @@ fn the_hinfo_answer_to_any_is_signed_where_the_zone_can_sign() {
         &offline,
         "ns1.example.",
         RecordType::ANY,
-        AnyResponse::Hinfo,
+        AnyResponse::Hinfo { ttl: 3600 },
     );
     let answer = sets(&reply.answers);
     assert_eq!(answer.len(), 1);
@@ -1073,7 +1078,7 @@ fn any_at_a_signed_cname_gets_the_cname() {
         &online,
         "alias.example.",
         RecordType::ANY,
-        AnyResponse::Hinfo,
+        AnyResponse::Hinfo { ttl: 3600 },
     );
     let answer = sets(&reply.answers);
     assert_eq!(answer.len(), 1);

@@ -273,7 +273,7 @@ impl TestInternet {
         // example.com is served the way Cloudflare serves it, with one
         // HINFO record for ANY (RFC 8482 §4.2).
         let cloudflare = ServerConfig {
-            any: AnyResponse::Hinfo,
+            any: AnyResponse::Hinfo { ttl: 3600 },
             ..ServerConfig::generic()
         };
         let generic = ServerConfig::generic;

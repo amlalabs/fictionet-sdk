@@ -45,7 +45,8 @@ pub struct ServerConfig {
 impl ServerConfig {
     /// An ordinary authoritative server: a 1232-octet payload, the size
     /// the DNS Flag Day 2020 settled on; Extended DNS Errors; the
-    /// synthesized HINFO answer to ANY of RFC 8482 §4.2; and an identity
+    /// synthesized HINFO answer to ANY of RFC 8482 §4.2, with a TTL of an
+    /// hour; and an identity
     /// with no CHAOS data and no NSID. A world that plays a particular server
     /// writes its values over this one.
     pub fn generic() -> ServerConfig {
@@ -53,7 +54,7 @@ impl ServerConfig {
             identity: Identity::none(),
             payload: 1232,
             ede: true,
-            any: AnyResponse::Hinfo,
+            any: AnyResponse::Hinfo { ttl: 3600 },
             ask_timeout: ASK_TIMEOUT,
             recursion_available: false,
         }

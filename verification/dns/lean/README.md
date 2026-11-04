@@ -153,7 +153,7 @@ form `\# <length> <hex>`. Octets are lowercase hex.
 | `wire.json` | `bytes`: an encoded message, sometimes truncated, altered, given a bad pointer, or padded | `ok`; then `message` (header, question, answer, authority, additional) and `canonical` (the uncompressed encoding), or `error` |
 | `fit.json` | `response` (header, question, RRsets per section, `required_additional`, `opt`), `limit` (`udp512`, `udp_edns` with `size`, or `stream`) | `size_le`, `fits`, `length`, `tc`, and `kept`: the number of RRsets kept per section |
 | `respond.json` | `bytes`, `transport` (`udp` or `tcp`) | `parsed`: `silent`; `reject` with `rcode` (extended), `flags`, and `opt` (its version, or null); or `request` with `rd`, `cd`, `ad`, `question`, `edns`, and the `answer` flags and `answer_opt` of an authoritative NOERROR answer to it through the server front |
-| `zone.json` | `zone` (`apex`, `records`), `any` (`hinfo`, `one_rrset`, `all`), `request` (`qname`, `qtype`); or, for about one case in eight, a zone the builder refuses, `zone` alone: an accepted zone changed to break one of the 12 rules, each as often as the others | `rcode`, `aa`, `answer`, `authority`, `additional`, `required_additional`; or `error`, the first rule the zone breaks |
+| `zone.json` | `zone` (`apex`, `records`), `any` (`hinfo`, with its TTL in `hinfo_ttl`; `one_rrset`; `all`), `request` (`qname`, `qtype`); or, for about one case in eight, a zone the builder refuses, `zone` alone: an accepted zone changed to break one of the 12 rules, each as often as the others | `rcode`, `aa`, `answer`, `authority`, `additional`, `required_additional`; or `error`, the first rule the zone breaks |
 | `partial.json` | as `zone.json`, plus `unknown`: names whose facts are unknown | `unknown` (a name), or `response` |
 | `learned.json` | `zone`, `any`; `steps`: one to six questions in turn, a third of them for the name of an earlier one, each with `upstream`, the zone's answer to it (as `zone.json` writes a response), or, in a quarter of the cases, a bare SERVFAIL for the first question, which is not asked again | per step, `expected`: `reply` (a response) or `silent`, from `Authority.serve` over a copy that holds nothing at first and is carried from step to step, its upstream filing the facts the zone's answer to each lookup reads |
 | `learned_signed.json` | `zone` (no DNAME), `keys`, `window`, `denial`, as in `signed.json`; `steps`: questions as in `learned.json` | per step, `expected`: the signed zone's answer with DO=1, written as `signed.json` writes one (`rcode`, `aa`, `answer`, `authority`, `additional`, `denial`), with `required_additional` |
@@ -198,7 +198,8 @@ extra iterations, in base32hex. RRSIG times are decimal. Validation results are 
 - **Zones** hold nodes by name. An empty non-terminal is not stored: a name with no node of its own but nodes
   below it is reported as `Empty`. A wildcard that is itself a cut gives a referral to that cut. DNAME at the
   question name is ordinary data; DNAME above it substitutes. The synthesized HINFO answer to QTYPE ANY
-  (RFC 8482 §4.2) takes the smallest TTL among the node's RRsets; at a CNAME the answer is the CNAME instead.
+  (RFC 8482 §4.2) takes the TTL the operator chose, which `hinfo` carries; at a CNAME the answer is the CNAME
+  instead.
 - **DO=1 is outside the zone files.** RRSIGs and denial records belong to `Dns/Dnssec.lean`, which adds them to
   `Zone.answer`'s response (`SignedZone.answerDo`); the answers of `Zone.answer` are the DO=0 answers. An
   answer to ANY with DO=1 also carries the DNSSEC RRsets of the name it matched, which ANY asks for
@@ -245,7 +246,9 @@ extra iterations, in base32hex. RRSIG times are decimal. Validation results are 
   server that stops a chain early; the CNAME at an alias whose server answered NSEC there with NODATA while its
   own denial records show the CNAME (`Learned::stops_at_alias`); the client's question at an address that
   turned out not to serve the zone it was noted for, to find a child zone it does serve
-  (`Copies::lame_holding`); and the SOA RRset at a name below a cut whose zone no response has shown yet.
+  (`Copies::lame_holding`); the SOA RRset at a name below a cut, or answered by such an address, whose zone no
+  response has shown yet; and the SOA RRset at the apex of a zone an address was noted for, when a chain led
+  there from another zone, or a truncated response showed neither that it serves the zone nor that it does not.
   The differential test's `check_lookups` rejects them, and the vectors draw none of them;
   `tests/it/dns/learned.rs` tests them. An overlay is a function of its base's steps for the question and for
   `<apex> DS`, with what it invents abstract: the theorems bound its lookups and keep its replies stable,

@@ -136,9 +136,10 @@ inductive Answered where
   | unknown (name : Name)
 deriving DecidableEq, Repr
 
-/-- What a server sends for QTYPE ANY (RFC 8482 §4). -/
+/-- What a server sends for QTYPE ANY (RFC 8482 §4). `hinfo` carries the synthesized HINFO's TTL, which the
+operator chooses (RFC 8482 §4.2). -/
 inductive AnyResponse where
-  | hinfo
+  | hinfo (ttl : Nat)
   | oneRrset
   | all
 deriving DecidableEq, Repr
@@ -279,18 +280,18 @@ def referral (look : Name → Fact Node) (apex m : Name) (ns : RRset) (glue : Li
   | .ok sib => .ok (.done .noerror false [] [ns] (inDomain ++ sib) inDomain.length)
   | .error e => .error e
 
-/-- The synthesized HINFO answer to QTYPE ANY (RFC 8482 §4.2), with the smallest TTL among the name's RRsets. -/
-def hinfoAnswer (q : Name) (sets : List RRset) : RRset :=
-  ⟨q, 13, ((sets.map (·.ttl)).min?).getD 0, [.hinfo [82, 70, 67, 56, 52, 56, 50] []]⟩
+/-- The synthesized HINFO answer to QTYPE ANY (RFC 8482 §4.2), with the TTL the operator chose. -/
+def hinfoAnswer (q : Name) (ttl : Nat) : RRset :=
+  ⟨q, 13, ttl, [.hinfo [82, 70, 67, 56, 52, 56, 50] []]⟩
 
 /-- The answer to QTYPE ANY. No HINFO is made up at a CNAME (RFC 8482 §4.2), which leaves room for no other data
 (RFC 1034 §3.6.2): the answer is the CNAME. -/
 def anySets (any : AnyResponse) (q : Name) (sets : List RRset) : List RRset :=
   match any with
-  | .hinfo =>
+  | .hinfo ttl =>
     match sets.find? (·.rtype == 5) with
     | some c => [withOwner q c]
-    | none => [hinfoAnswer q sets]
+    | none => [hinfoAnswer q ttl]
   | .oneRrset => (sets.take 1).map (withOwner q)
   | .all => sets.map (withOwner q)
 
@@ -905,7 +906,7 @@ theorem exact_out {look : Name → Fact Node} {apex : Name} {soa : RRset} {any :
     · cases h; refine Or.inr (Or.inl ⟨_, _, rfl, ?_⟩)
       rename_i hs
       cases any with
-      | hinfo => simp only [anySets]; split <;> simp
+      | hinfo _ => simp only [anySets]; split <;> simp
       | oneRrset =>
         cases sets with
         | nil => exact absurd rfl hs
@@ -1424,7 +1425,7 @@ theorem exact_owners {look : Name → Fact Node} {apex : Name} {soa : RRset} {an
       intro s hs
       simp only [List.append_nil, anySets] at hs
       cases any with
-      | hinfo =>
+      | hinfo _ =>
         dsimp only at hs
         split at hs <;> (simp only [List.mem_singleton] at hs; subst hs; exact hq)
       | oneRrset => obtain ⟨x, _, rfl⟩ := List.mem_map.mp hs; exact hq

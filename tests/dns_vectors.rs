@@ -908,14 +908,18 @@ fn rcode_text(rcode: ResponseCode) -> String {
     }
 }
 
-fn any_response(text: &str) -> AnyResponse {
-    match text {
-        "hinfo" => AnyResponse::Hinfo,
+/// What a server sends for QTYPE ANY, as `input`'s `any` field says,
+/// with the HINFO TTL in `hinfo_ttl`.
+fn any_response(input: &Value) -> AnyResponse {
+    match text(input, "any") {
+        "hinfo" => AnyResponse::Hinfo {
+            ttl: u32::try_from(number(input, "hinfo_ttl")).expect("a TTL"),
+        },
         // The model sends the name's first RRset; the preferred type only
         // decides which one Rust sends (see `compare_answer`).
         "one_rrset" => AnyResponse::OneRrset(RecordType::SOA),
         "all" => AnyResponse::All,
-        _ => panic!("unknown ANY response {text}"),
+        other => panic!("unknown ANY response {other}"),
     }
 }
 
@@ -1405,7 +1409,7 @@ fn zone_answers() {
         }
         let zone = vector_zone(field(input, "zone"))?;
         let req = vector_request(field(input, "request"), false);
-        let any = any_response(text(input, "any"));
+        let any = any_response(input);
         match answer(&zone, &req, any) {
             Answered::Response(response) => {
                 compare_answer(&zone, &req, any, expected, &response, tally)
@@ -1516,7 +1520,7 @@ fn partial_answers() {
             .collect();
         let view = Partial { zone, unknown };
         let req = vector_request(field(input, "request"), false);
-        let any = any_response(text(input, "any"));
+        let any = any_response(input);
         let rust = answer(&view, &req, any);
         match (expected.get("unknown"), rust) {
             (Some(lean), Answered::Unknown { name, .. }) => same(
@@ -1744,7 +1748,7 @@ fn learned_copies() {
         let input = field(case, "input");
         let apex = name(text(field(input, "zone"), "apex"));
         let server = ServerConfig {
-            any: any_response(text(input, "any")),
+            any: any_response(input),
             ..ServerConfig::generic()
         };
         let mut engine = copy_engine(&apex, server);

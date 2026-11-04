@@ -157,8 +157,20 @@ pub struct Upstream {
     checks: Mutex<HashMap<String, Check>>,
 }
 
+/// What a real host's TLS handshake showed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    /// Its certificate verifies.
+    Verifies,
+    /// Its certificate fails verification this way.
+    Refused(Refusal),
+    /// No handshake: the host cannot be reached on port 443, or it ended
+    /// the handshake before its certificate was checked.
+    NoHandshake,
+}
+
 /// One host's check: its verdict once the handshake ends.
-type Check = tokio::sync::watch::Receiver<Option<Option<Refusal>>>;
+type Check = tokio::sync::watch::Receiver<Option<Verdict>>;
 
 impl Upstream {
     /// Starts checking `host`'s real certificate, unless a check started.
@@ -180,32 +192,47 @@ impl Upstream {
         check
     }
 
-    /// How `host`'s real certificate fails verification, once its check
-    /// ends; `None` when it verifies or the host cannot be reached. Only
-    /// the caller waits: a host that never answers holds up its own
+    /// What `host`'s real handshake showed, once its check ends. Only the
+    /// caller waits: a host that never answers holds up its own
     /// handshakes, never the world.
-    pub async fn refusal(&self, host: &str) -> Option<Refusal> {
+    pub async fn verdict(&self, host: &str) -> Verdict {
         let mut check = self.check(host);
-        let verdict = check.wait_for(Option::is_some).await;
-        verdict.ok().and_then(|verdict| verdict.clone().flatten())
+        match check.wait_for(Option::is_some).await {
+            Ok(verdict) => verdict.clone().unwrap_or(Verdict::NoHandshake),
+            Err(_) => Verdict::NoHandshake,
+        }
     }
 }
 
 /// Shakes hands with the real `host` on port 443 as a browser would, with
 /// the Mozilla roots.
-fn verify(host: &str) -> Option<Refusal> {
+fn verify(host: &str) -> Verdict {
+    match refusal(host) {
+        Ok(None) => Verdict::Verifies,
+        Ok(Some(refusal)) => Verdict::Refused(refusal),
+        Err(NoHandshake) => Verdict::NoHandshake,
+    }
+}
+
+/// The real `host` gave no handshake whose certificate could be checked.
+struct NoHandshake;
+
+/// How the real `host`'s certificate fails verification, `None` when it
+/// verifies.
+fn refusal(host: &str) -> Result<Option<Refusal>, NoHandshake> {
     use rustls::{CertificateError, Error};
     let roots = rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let config = rustls::ClientConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
     .with_safe_default_protocol_versions()
-    .ok()?
+    .map_err(|_| NoHandshake)?
     .with_root_certificates(roots)
     .with_no_client_auth();
-    let name = rustls::pki_types::ServerName::try_from(host.to_owned()).ok()?;
-    let mut connection = rustls::ClientConnection::new(Arc::new(config), name).ok()?;
-    let mut socket = std::net::TcpStream::connect((host, 443)).ok()?;
+    let name = rustls::pki_types::ServerName::try_from(host.to_owned()).map_err(|_| NoHandshake)?;
+    let mut connection =
+        rustls::ClientConnection::new(Arc::new(config), name).map_err(|_| NoHandshake)?;
+    let mut socket = std::net::TcpStream::connect((host, 443)).map_err(|_| NoHandshake)?;
     while connection.is_handshaking() {
         let Err(error) = connection.complete_io(&mut socket) else {
             continue;
@@ -214,13 +241,13 @@ fn verify(host: &str) -> Option<Refusal> {
             .get_ref()
             .and_then(|inner| inner.downcast_ref::<Error>())
         else {
-            return None;
+            return Err(NoHandshake);
         };
         let seconds = |time: &rustls::pki_types::UnixTime| time.as_secs() as i64;
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map_or(0, |since| since.as_secs() as i64);
-        return Some(match certificate {
+        return Ok(Some(match certificate {
             CertificateError::ExpiredContext { not_after, .. } => Refusal::Expired {
                 not_after: seconds(not_after),
             },
@@ -244,7 +271,7 @@ fn verify(host: &str) -> Option<Refusal> {
                 }
             }
             _ => Refusal::Untrusted,
-        });
+        }));
     }
-    None
+    Ok(None)
 }
