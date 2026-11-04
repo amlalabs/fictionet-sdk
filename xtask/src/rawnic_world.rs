@@ -1,5 +1,6 @@
 //! Guest worlds reached through the same raw attachment as the honeypot.
 
+use fictionet::stdlib::network::ethernet::host::Ipv6Gateway;
 use fictionet_host::VirtioNet;
 use fictionet_host::raw::{EthernetFrame, RawPump};
 use std::io::Write;
@@ -88,8 +89,10 @@ pub fn honeypot(nic: VirtioNet) -> fictionet::Result {
         fictionet::Seed::from_u64(0),
         move |fcx| async move {
             let config = honeypot_world::Config {
-                address: "192.0.2.2".parse().unwrap(),
-                gateway: "192.0.2.254".parse().unwrap(),
+                address: crate::rawnic_frames::ADDRESS,
+                address_v6: Some(crate::rawnic_frames::ADDRESS6),
+                gateway: crate::rawnic_frames::GATEWAY,
+                gateway_v6: Ipv6Gateway::FromRouterAdvertisements,
                 ..Default::default()
             };
             let _honeypot = honeypot_world::start_raw(
@@ -171,6 +174,17 @@ pub fn honeypot(nic: VirtioNet) -> fictionet::Result {
     }) {
         return Err(fictionet::Error::msg("IPv4 reply bypassed the gateway"));
     }
+    // IPv6 unicast goes to the router; only multicast goes elsewhere.
+    if frames.iter().any(|entry| {
+        entry["direction"] == "out"
+            && entry["bytes"].as_str().is_some_and(|bytes| {
+                bytes.get(24..28) == Some("86dd")
+                    && !bytes.starts_with(&gateway)
+                    && !bytes.starts_with("3333")
+            })
+    }) {
+        return Err(fictionet::Error::msg("IPv6 unicast bypassed the router"));
+    }
     for frame in crate::rawnic_frames::fixtures() {
         if !frames
             .iter()
@@ -202,6 +216,16 @@ pub fn honeypot(nic: VirtioNet) -> fictionet::Result {
             ));
         }
     }
+    let ssh6 = std::net::SocketAddr::new(crate::rawnic_frames::ADDRESS6.into(), 22).to_string();
+    if !events
+        .iter()
+        .any(|entry| entry["event"] == "syn" && entry["dst"] == ssh6.as_str())
+    {
+        return Err(fictionet::Error::msg(
+            "honeypot did not log the IPv6 SYN to SSH",
+        ));
+    }
     println!("Honeypot captured complete Ethernet frames and logged MPTCP SYN and answer");
+    println!("Honeypot logged the IPv6 SYN to SSH");
     Ok(())
 }

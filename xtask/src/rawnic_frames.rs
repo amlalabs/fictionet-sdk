@@ -1,6 +1,16 @@
 //! Ethernet inputs shared by the QEMU peer and guest assertions.
 
+use std::net::{Ipv4Addr, Ipv6Addr};
+
 pub const GATEWAY_MAC: [u8; 6] = [0x52, 0x54, 0, 0x65, 0x43, 0x21];
+
+/// The honeypot's IPv4 address and gateway in the guest.
+pub const ADDRESS: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 2);
+pub const GATEWAY: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 254);
+
+/// The honeypot's IPv6 address in the guest. Its gateway is learned from
+/// the peer's router advertisement.
+pub const ADDRESS6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 2, 0, 0, 0, 0, 2);
 
 pub fn fixtures() -> Vec<Vec<u8>> {
     fn checksum(bytes: &[u8]) -> u16 {

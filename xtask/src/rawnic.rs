@@ -92,62 +92,25 @@ fn executable(archive: &mut Vec<u8>, source: &Path, destination: &str, directory
 #[path = "rawnic_frames.rs"]
 mod frames;
 
-fn send_frame(stream: &mut TcpStream, frame: &[u8]) -> Result {
-    stream.write_all(&(frame.len() as u32).to_be_bytes())?;
-    stream.write_all(frame)?;
-    Ok(())
-}
+#[path = "rawnic_peer.rs"]
+mod peer;
 
-fn resolve_gateway(stream: &mut TcpStream) -> Result {
-    use fictionet::stdlib::network::ethernet::frame;
+use peer::{HONEYPOT_MAC, Peer};
 
-    let mac = [0x52, 0x54, 0, 0x12, 0x34, 0x56];
-    let mut request = vec![0, 1, 8, 0, 6, 4, 0, 1];
-    request.extend_from_slice(&mac);
-    request.extend_from_slice(&[192, 0, 2, 2]);
-    request.extend_from_slice(&[0; 6]);
-    request.extend_from_slice(&[192, 0, 2, 254]);
-    let expected = frame::frame(frame::BROADCAST, mac, frame::ARP, &request);
-    for _ in 0..2 {
-        let mut size = [0; 4];
-        stream.read_exact(&mut size)?;
-        if u32::from_be_bytes(size) as usize != expected.len() {
-            return Err("invalid gateway ARP request length".into());
-        }
-        let mut bytes = vec![0; expected.len()];
-        stream.read_exact(&mut bytes)?;
-        if bytes != expected {
-            return Err("honeypot did not request its configured gateway".into());
-        }
-    }
-    let mut reply = request;
-    reply[6..8].copy_from_slice(&2u16.to_be_bytes());
-    reply[8..14].copy_from_slice(&frames::GATEWAY_MAC);
-    reply[14..18].copy_from_slice(&[192, 0, 2, 254]);
-    reply[18..24].copy_from_slice(&mac);
-    reply[24..28].copy_from_slice(&[192, 0, 2, 2]);
-    let bytes = frame::frame(mac, frames::GATEWAY_MAC, frame::ARP, &reply);
-    send_frame(stream, &bytes)?;
-    println!("Honeypot requested and retried ARP for its configured gateway");
-    Ok(())
-}
+/// The MAC IPv4 clients' frames come from.
+const CLIENT_MAC: [u8; 6] = [0x52, 0x54, 0, 0xab, 0xcd, 0xef];
 
-fn receive_tcp(stream: &mut TcpStream, port: u16) -> Result<Vec<u8>> {
+fn receive_tcp(peer: &mut Peer, port: u16) -> Result<Vec<u8>> {
     use fictionet::stdlib::network::{ethernet::frame, ip, tcp};
-    loop {
-        let mut size = [0; 4];
-        stream.read_exact(&mut size)?;
-        let size = u32::from_be_bytes(size) as usize;
-        if !(54..=2036).contains(&size) {
+    peer.next(|bytes| {
+        if !(54..=2036).contains(&bytes.len()) {
             return Err("invalid honeypot response length".into());
         }
-        let mut bytes = vec![0; size];
-        stream.read_exact(&mut bytes)?;
-        let frame = frame::Frame::parse(&bytes).ok_or("invalid Ethernet response")?;
+        let frame = frame::Frame::parse(bytes).ok_or("invalid Ethernet response")?;
         let header = ip::Header::parse_whole(frame.payload).ok_or("invalid IP response")?;
         let segment = header.payload(frame.payload);
         if frame.dst != frames::GATEWAY_MAC
-            || frame.src != [0x52, 0x54, 0, 0x12, 0x34, 0x56]
+            || frame.src != HONEYPOT_MAC
             || frame.ethertype != frame::IPV4
             || header.src != "192.0.2.2".parse::<std::net::IpAddr>()?
             || header.dst != "192.0.2.1".parse::<std::net::IpAddr>()?
@@ -159,19 +122,17 @@ fn receive_tcp(stream: &mut TcpStream, port: u16) -> Result<Vec<u8>> {
             return Err("invalid honeypot TCP response".into());
         }
         tcp::options(segment)?;
-        if segment[2..4] == port.to_be_bytes() {
-            return Ok(segment.to_vec());
-        }
-    }
+        Ok((segment[2..4] == port.to_be_bytes()).then(|| segment.to_vec()))
+    })
 }
 
-fn mapped_http(stream: &mut TcpStream) -> Result {
+fn mapped_http(peer: &mut Peer) -> Result {
     use fictionet::stdlib::codec::Wire;
     use fictionet::stdlib::network::{ethernet::frame, ip, tcp};
     use fictionet::stdlib::protocols::mptcp::{self, Capable, Keys, MptcpOption, Sequence};
 
     let port = 0x5678u16;
-    let send = |stream: &mut TcpStream,
+    let send = |peer: &mut Peer,
                 seq: u32,
                 ack: u32,
                 flags: u8,
@@ -207,18 +168,15 @@ fn mapped_http(stream: &mut TcpStream) -> Result {
         let checksum = ip::transport_checksum(source, destination, 6, &segment);
         segment[16..18].copy_from_slice(&checksum.to_be_bytes());
         let packet = ip::packet(source, destination, 6, &segment);
-        send_frame(
-            stream,
-            &frame::frame(
-                [0x52, 0x54, 0, 0x12, 0x34, 0x56],
-                [0x52, 0x54, 0, 0xab, 0xcd, 0xef],
-                frame::IPV4,
-                &packet.0,
-            ),
-        )
+        peer.send(&frame::frame(
+            HONEYPOT_MAC,
+            CLIENT_MAC,
+            frame::IPV4,
+            &packet.0,
+        ))
     };
-    send(stream, 5000, 0, 2, Keys::Absent, 0, &[])?;
-    let syn_ack = receive_tcp(stream, port)?;
+    send(peer, 5000, 0, 2, Keys::Absent, 0, &[])?;
+    let syn_ack = receive_tcp(peer, port)?;
     if syn_ack[13] != 0x12 || syn_ack[8..12] != 5001u32.to_be_bytes() {
         return Err("invalid MPTCP handshake response".into());
     }
@@ -246,7 +204,7 @@ fn mapped_http(stream: &mut TcpStream) -> Result {
     let server_seq = u32::from_be_bytes(syn_ack[4..8].try_into()?).wrapping_add(1);
     let client_key = 0x5555_6666_7777_8888;
     send(
-        stream,
+        peer,
         5001,
         server_seq,
         0x10,
@@ -259,7 +217,7 @@ fn mapped_http(stream: &mut TcpStream) -> Result {
     )?;
     let request = b"GET / HTTP/1.1\r\nHost: 192.0.2.2\r\n\r\n";
     send(
-        stream,
+        peer,
         5001,
         server_seq,
         0x18,
@@ -275,7 +233,7 @@ fn mapped_http(stream: &mut TcpStream) -> Result {
     let client_data = mptcp::idsn(client_key).advance(1 + request.len() as u64);
     let mut http = Vec::new();
     loop {
-        let response = receive_tcp(stream, port)?;
+        let response = receive_tcp(peer, port)?;
         if response[13] & 6 != 0 {
             return Err("MPTCP HTTP exchange was reset".into());
         }
@@ -339,7 +297,7 @@ fn mapped_http(stream: &mut TcpStream) -> Result {
     }
 }
 
-fn oversized_ping(stream: &mut TcpStream) -> Result {
+fn oversized_ping(peer: &mut Peer) -> Result {
     use fictionet::stdlib::network::{ethernet::frame, ip};
 
     let mut echo = vec![0xa5; 4096];
@@ -352,15 +310,12 @@ fn oversized_ping(stream: &mut TcpStream) -> Result {
         let fragment = (index as u16 * 128) | if index < 3 { 0x2000 } else { 0 };
         packet.0[6..8].copy_from_slice(&fragment.to_be_bytes());
         ip::set_header_checksum(&mut packet.0[..20]);
-        send_frame(
-            stream,
-            &frame::frame(
-                [0x52, 0x54, 0, 0x12, 0x34, 0x56],
-                [0x52, 0x54, 0, 0xab, 0xcd, 0xef],
-                frame::IPV4,
-                &packet.0,
-            ),
-        )?;
+        peer.send(&frame::frame(
+            HONEYPOT_MAC,
+            CLIENT_MAC,
+            frame::IPV4,
+            &packet.0,
+        ))?;
     }
     Ok(())
 }
@@ -567,19 +522,17 @@ pub fn run(directory: PathBuf) -> Result {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        resolve_gateway(&mut stream)?;
+        let mut peer = Peer::new(stream);
+        peer::start_link(&mut peer)?;
+        peer::neighbor_discovery(&mut peer)?;
+        peer::ssh6(&mut peer)?;
         for (index, frame) in frames::fixtures().into_iter().enumerate() {
-            stream.write_all(&(frame.len() as u32).to_be_bytes())?;
-            stream.write_all(&frame)?;
+            peer.send(&frame)?;
             if index == 0 {
-                let mut size = [0; 4];
-                stream.read_exact(&mut size)?;
-                let size = u32::from_be_bytes(size) as usize;
-                if !(54..=2036).contains(&size) {
+                let answer = peer.next(|bytes| Ok(Some(bytes.to_vec())))?;
+                if !(54..=2036).contains(&answer.len()) {
                     return Err("invalid honeypot response length".into());
                 }
-                let mut answer = vec![0; size];
-                stream.read_exact(&mut answer)?;
                 use fictionet::stdlib::network::{ip, tcp};
                 let header = ip::Header::parse_whole(&answer[14..])
                     .ok_or("honeypot response is not valid IP")?;
@@ -604,9 +557,9 @@ pub fn run(directory: PathBuf) -> Result {
                 println!("Honeypot answered raw MPTCP SYN with a valid Ethernet SYN-ACK");
             }
         }
-        oversized_ping(&mut stream)?;
-        mapped_http(&mut stream)?;
-        send_frame(&mut stream, &acknowledgment)?;
+        oversized_ping(&mut peer)?;
+        mapped_http(&mut peer)?;
+        peer.send(&acknowledgment)?;
         loop {
             if let Some(status) = child.0.try_wait()? {
                 if !status.success() || !fs::read_to_string(&log)?.contains("RAWNIC PASS") {

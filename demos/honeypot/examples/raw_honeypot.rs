@@ -2,6 +2,7 @@
 
 #[cfg(target_os = "linux")]
 fn main() -> fictionet::Result {
+    use fictionet::stdlib::network::ethernet::host::Ipv6Gateway;
     use fictionet_host::raw::RawPump;
     use fictionet_host::virtio::{PciAddress, VirtioNet};
     use honeypot_world::{Args, Clock, observe::Sinks};
@@ -25,9 +26,19 @@ fn main() -> fictionet::Result {
     };
     let (pump, attachment) = RawPump::attach(VirtioNet::open(address)?)?;
     let clock = Clock::starting_now();
+    let config = &args.config;
+    let ipv6 = match (config.address_v6, config.gateway_v6) {
+        (None, _) => String::new(),
+        (Some(address_v6), Ipv6Gateway::Configured(gateway_v6)) => {
+            format!(" and {address_v6} via {gateway_v6}")
+        }
+        (Some(address_v6), Ipv6Gateway::FromRouterAdvertisements) => {
+            format!(" and {address_v6} via the advertised router")
+        }
+    };
     println!(
-        "raw honeypot at {} via {} on {address}",
-        args.config.address, args.config.gateway
+        "raw honeypot at {} via {}{ipv6} on {address}",
+        config.address, config.gateway
     );
     let result = fictionet::block_on(fictionet::run(fictionet::Seed::random(), move |fcx| {
         let started =

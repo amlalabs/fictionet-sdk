@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::network::ip::{Fields, packet_with, transport_checksum};
+use fictionet::stdlib::network::ip::{self, Fields, packet_with, transport_checksum};
 use fictionet::stdlib::network::tcp::{self, TcpOption};
 use fictionet::stdlib::protocols::mptcp::{
     self, Capable, Dss, Join, Keys, Mapping, MptcpOption, Sequence, algorithm, join_hmac, reason,
@@ -157,7 +157,7 @@ where
 }
 
 fn server(port: u16) -> SocketAddr {
-    SocketAddr::new(DEFAULT_ADDRESS, port)
+    SocketAddr::new(DEFAULT_ADDRESS.into(), port)
 }
 
 fn client(n: u32, port: u16) -> SocketAddr {
@@ -226,10 +226,11 @@ fn join_syn(token: u32, random: u32) -> MptcpOption {
     })
 }
 
-/// The TCP header and payload of a packet.
+/// The TCP header and payload of a packet, IPv4 or IPv6.
 fn tcp_of(p: &Packet) -> &[u8] {
-    let ihl = (p.0[0] & 15) as usize * 4;
-    &p.0[ihl..]
+    fictionet::stdlib::network::ip::Header::parse(&p.0)
+        .expect("an IP packet")
+        .payload(&p.0)
 }
 
 fn ipv4_options(packet: Packet, options: &[fictionet::stdlib::network::ip::Ipv4Option]) -> Packet {
@@ -275,9 +276,7 @@ fn ipv4_options_echo_and_pending_retransmission_are_observed() {
         let answer = net.recv().await.unwrap();
         assert_eq!(flags(&answer), SYN | ACK);
         let echoed = ip::ipv4_options(&answer.0).unwrap();
-        let IpAddr::V4(local) = DEFAULT_ADDRESS else {
-            unreachable!()
-        };
+        let local = DEFAULT_ADDRESS;
         assert_eq!(
             echoed[0],
             Ipv4Option::RecordRoute {
@@ -388,15 +387,18 @@ fn hex(bytes: &[u8]) -> String {
 /// Opens a connection to the server's `port` from `from`, sends `request`
 /// in the pieces given, and returns what the server sent back.
 async fn exchange(net: &mut Internet, from: SocketAddr, port: u16, pieces: &[&[u8]]) -> Vec<u8> {
-    net.send(segment(
-        from,
-        server(port),
-        1000,
-        0,
-        SYN,
-        &with_mss(&[]),
-        b"",
-    ));
+    exchange_with(net, from, server(port), pieces).await
+}
+
+/// Opens a connection to `to` from `from`, sends `request` in the pieces
+/// given, and returns what the server sent back.
+async fn exchange_with(
+    net: &mut Internet,
+    from: SocketAddr,
+    to: SocketAddr,
+    pieces: &[&[u8]],
+) -> Vec<u8> {
+    net.send(segment(from, to, 1000, 0, SYN, &with_mss(&[]), b""));
     // Earlier connections may still be closing.
     let syn_ack = loop {
         let p = net.recv().await.expect("a SYN-ACK");
@@ -406,17 +408,9 @@ async fn exchange(net: &mut Internet, from: SocketAddr, port: u16, pieces: &[&[u
     };
     let iss = seq_of(&syn_ack);
     let mut seq = 1001;
-    net.send(segment(from, server(port), seq, iss + 1, ACK, &[], b""));
+    net.send(segment(from, to, seq, iss + 1, ACK, &[], b""));
     for piece in pieces {
-        net.send(segment(
-            from,
-            server(port),
-            seq,
-            iss + 1,
-            PSH | ACK,
-            &[],
-            piece,
-        ));
+        net.send(segment(from, to, seq, iss + 1, PSH | ACK, &[], piece));
         seq += piece.len() as u32;
     }
     let mut reply = Vec::new();
@@ -510,6 +504,83 @@ fn a_plain_syn_gets_ssh() {
         assert_eq!(blocks[1].0, 1);
         assert!(blocks[2..].iter().all(|(kind, _)| *kind == 6));
         assert_eq!(blocks.len() - 2, net.crossed);
+        Ok(())
+    });
+}
+
+/// With an IPv6 address, the server serves the same SSH and HTTP there as
+/// at its IPv4 address, and the log has the same lines for it. The
+/// internet still reaches no other IPv6 address.
+#[test]
+fn ipv6_gets_the_same_ssh_and_http() {
+    let address_v6: IpAddr = "2001:db8:113::10".parse().unwrap();
+    let IpAddr::V6(v6) = address_v6 else {
+        unreachable!()
+    };
+    let config = Config {
+        address_v6: Some(v6),
+        ..Config::default()
+    };
+    honeypot(config, move |mut net| async move {
+        let from: SocketAddr = "[2001:db8:1::1]:40000".parse().unwrap();
+        let ssh = SocketAddr::new(address_v6, 22);
+        net.send(segment(from, ssh, 1000, 0, SYN, &with_mss(&[]), b""));
+        let syn_ack = net.recv().await.expect("a SYN-ACK");
+        assert_eq!(flags(&syn_ack), SYN | ACK);
+        assert_eq!(
+            transport_checksum(address_v6, from.ip(), 6, tcp_of(&syn_ack)),
+            0
+        );
+        let iss = seq_of(&syn_ack);
+        net.send(segment(from, ssh, 1001, iss + 1, ACK, &[], b""));
+        let banner = net.recv().await.expect("the banner");
+        assert_eq!(payload_of(&banner), SSH_BANNER);
+        let acked = iss + 1 + SSH_BANNER.len() as u32;
+        net.send(segment(from, ssh, 1001, acked, ACK, &[], b""));
+
+        let page = exchange_with(
+            &mut net,
+            "[2001:db8:1::1]:40001".parse().unwrap(),
+            SocketAddr::new(address_v6, 80),
+            &[b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"],
+        )
+        .await;
+        let page = String::from_utf8(page).unwrap();
+        assert!(page.starts_with("HTTP/1.1 200 OK\r\n"), "{page}");
+        assert!(page.contains("Welcome to nginx!"));
+
+        let elsewhere = SocketAddr::new("2001:db8:113::11".parse().unwrap(), 22);
+        net.send(segment(from, elsewhere, 1, 0, SYN, &with_mss(&[]), b""));
+        let from_elsewhere = net
+            .drain()
+            .await
+            .into_iter()
+            .filter(|p| ip::source(&p.0) == Some(elsewhere.ip()))
+            .count();
+        assert_eq!(from_elsewhere, 0, "nothing else answers");
+
+        // The IPv4 address still serves.
+        let from4 = client(1, 40002);
+        net.send(segment(from4, server(22), 1, 0, SYN, &with_mss(&[]), b""));
+        let syn_ack = net.recv().await.expect("an IPv4 SYN-ACK");
+        assert_eq!(flags(&syn_ack), SYN | ACK);
+
+        let syns = net.events("syn");
+        let dsts: Vec<&str> = syns.iter().map(|s| s["dst"].as_str().unwrap()).collect();
+        assert_eq!(
+            dsts,
+            [
+                "[2001:db8:113::10]:22",
+                "[2001:db8:113::10]:80",
+                "[2001:db8:113::11]:22",
+                "203.0.113.10:22"
+            ]
+        );
+        assert!(syns.iter().all(|s| s["attachment"] == "internet"));
+        assert_eq!(syns[0]["src"], "[2001:db8:1::1]:40000");
+        let answers = net.events("answer");
+        assert_eq!(answers[0]["flags"], "SYN|ACK");
+        assert_eq!(answers[0]["src"], "[2001:db8:113::10]:22");
         Ok(())
     });
 }

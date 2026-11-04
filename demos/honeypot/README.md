@@ -12,8 +12,13 @@ Linux host only gets logged here.
 
 ## What the server presents
 
-One host at a public address (`--address`) with an MPTCP listener on each
-open port:
+One host at a public IPv4 address (`--address`), and at a public IPv6
+address too when one is given (`--address-v6`), with an MPTCP listener on each
+open port. Both addresses serve the same ports, and the log has the same
+lines for both. The IPv4 address is always there, because the flaw is in
+IPv4 connection setup. The IPv6 address is optional, as many servers have
+none. The internet comes in by one attachment that carries both families,
+from `0.0.0.0/0` and `::/0` unless `--internet` narrows one of them.
 
 - **SSH** (`--ssh`, 22 by default): the identification line of OpenSSH 9.6p1
   on Ubuntu 24.04. It reads whatever comes back until the client leaves or
@@ -233,14 +238,18 @@ cargo build -p honeypot-world --features raw-virtio --example raw_honeypot
 
 ```sh
 ./raw_honeypot 0000:00:03.0 ethernet.jsonl \
-  --address 203.0.113.10 --gateway 203.0.113.1 --internet 0.0.0.0/0 \
+  --address 203.0.113.10 --gateway 203.0.113.1 \
+  --address-v6 2001:db8:113::10 --gateway-v6 fe80::1 \
   --ssh 22 --http 80 --log honeypot.jsonl --pcap honeypot.pcapng
 ```
 
 The first argument is the card's PCI address, and the second is where to
 log Ethernet frames. The flags are the honeypot's usual ones. `--gateway`
-sets the raw adapter's IPv4 default gateway (default `203.0.113.1`). `--world`
-is not used: there is no socket to attach to.
+sets the raw adapter's IPv4 default gateway (default `203.0.113.1`).
+`--gateway-v6` sets its IPv6 default gateway, such as `fe80::1` on Hetzner.
+Without it, the gateway is the first router that advertises itself, as on
+AWS and Google Cloud. `--world` is not used: there is no socket to attach
+to.
 
 `ethernet.jsonl` has one line per frame, both ways, before the world reads
 it: `direction` (`in` or `out`), `at_us`, the frame in hex as `bytes`, and
@@ -249,25 +258,36 @@ So it keeps frames the world ignores: VLAN tags, unknown EtherTypes,
 malformed headers and Ethernet padding. `honeypot.pcapng` and
 `honeypot.jsonl` are as above.
 
-The world plays a Linux host on the link:
+The world plays a Linux host on the link, through `fictionet`'s
+`ethernet::Host`:
 
-- It answers ARP for its address, to the sender the request names.
-- Untagged IPv4 and IPv6 frames sent to its MAC address, or broadcast, go
+- It answers ARP for its IPv4 address, to the sender the request names.
+- With an IPv6 address, it also has a link-local address made from the
+  card's MAC. Before it uses either address, it joins their solicited-node
+  groups with an MLDv2 report and checks that no other node has them
+  ([duplicate address detection](https://www.rfc-editor.org/rfc/rfc4862#section-5.4)).
+  Then it answers neighbor solicitations for them, and checks from other
+  nodes are answered to all nodes. An address another node has is never
+  used.
+- Untagged IPv4 and IPv6 packets to one of its usable addresses, in frames
+  sent to its MAC address, broadcast, or to a multicast group it joined, go
   on to the `internet` attachment. Every other frame is only logged.
 - It broadcasts an [ARP request](https://www.rfc-editor.org/rfc/rfc826.html)
-  for the configured gateway at startup and retries every second until
-  resolved, matching [Linux's initial ARP retransmission interval](https://github.com/torvalds/linux/blob/master/net/ipv4/arp.c).
-  It learns and updates one MAC from the gateway's own ARP requests and
-  replies. Traffic from other IP senders cannot replace it.
-- It sends every IPv4 reply to that gateway MAC, whatever the destination
-  IP address. It drops replies until the gateway is known, without queuing
-  them. It has no per-source neighbor table or on-link route handling.
+  for the IPv4 gateway at startup and asks again every second until
+  answered, matching [Linux's initial ARP retransmission interval](https://github.com/torvalds/linux/blob/master/net/ipv4/arp.c).
+  It finds the IPv6 gateway's MAC the same way, with
+  [neighbor solicitations](https://www.rfc-editor.org/rfc/rfc4861#section-7.2).
+  Without `--gateway-v6`, it first sends router solicitations, and takes the
+  first router that advertises itself as its gateway for as long as the
+  advertisement says. Each gateway's MAC is learned from that gateway's own
+  messages. Traffic from other senders cannot replace it. Once known, it
+  is checked again as RFC 4861 section 7.3 says.
+- It sends every reply to the gateway of its family, whatever the
+  destination IP address. It drops replies until that gateway is known,
+  without queuing them. It has no other neighbors or on-link routes.
 - It drops replies longer than 1,500 bytes, and does not fragment them. The
-  IP capture still has them. It also drops replies while the card's
-  transmit queue is full.
-- The server's address must be IPv4. IPv6 input still reaches the IP
-  attachment, but IPv6 replies are dropped because there is no IPv6 gateway
-  or neighbor discovery.
+  IP capture still has them. It drops any frame, its own ARP and neighbor
+  discovery included, while the card's transmit queue is full.
 
 The world does not set up addresses or routes, or bind PCI devices.
 

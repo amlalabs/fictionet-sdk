@@ -5,17 +5,19 @@
 //! from MP_CAPABLE offers that close or expire without sending data. These
 //! are observations of traffic shape, not proof of exploitation.
 //!
-//! The world is one host at a public address ([`Config::address`]) with
-//! MPTCP listeners on its open ports: SSH with an OpenSSH identification
-//! line and HTTP with nginx's default page ([`services`]). A SYN with
+//! The world is one host at a public IPv4 address ([`Config::address`]),
+//! and at a public IPv6 address too when it has one
+//! ([`Config::address_v6`]), with MPTCP listeners on its open ports: SSH
+//! with an OpenSSH identification line and HTTP with nginx's default page
+//! ([`services`]). Both addresses serve the same ports. A SYN with
 //! MP_CAPABLE gets an RFC 8684 SYN-ACK with MP_CAPABLE and a key, its data
 //! then carries DSS, and an MP_JOIN is answered, taken or refused as Linux
 //! answers, takes and refuses it ([`mptcp`]). The internet reaches the
-//! host through an attachment called [`INTERNET`] routed at
-//! [`Config::internet`] with `Net::route`, and reaches nothing else: its
-//! packets for any other address are logged and dropped. Sandboxes
-//! attached under any other name join the network as usual, and reach the
-//! host through its router.
+//! host through an attachment called [`INTERNET`], which carries both
+//! families and is routed at [`Config::internet`] with `Net::route`, and
+//! reaches nothing else: its packets for any other address are logged and
+//! dropped. Sandboxes attached under any other name join the network as
+//! usual, and reach the host through its router.
 //!
 //! Every packet that crosses any attachment, both ways, goes to a pcapng
 //! file, and a typed [`Observation`](observe::Observation) per SYN,
@@ -37,7 +39,7 @@
 //! | [`services`] | SSH and HTTP once a connection is open |
 //! | [`observe`] | The packet log and the observations |
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::task::Poll;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -108,10 +110,9 @@ pub fn network(fcx: &Cx, config: &Config, clock: Clock, tokens: &Arc<Tokens>) ->
     let mut server = Host::new("server")
         .at(config.address)
         .tcp_options(fictionet_extras::linux::tcp());
-    server = if config.address.is_ipv4() {
-        server.ipv4_only()
-    } else {
-        server.ipv6_only()
+    server = match config.address_v6 {
+        Some(address_v6) => server.at(address_v6),
+        None => server.ipv4_only(),
     };
     for port in &config.ports {
         server = match port.service {
@@ -131,11 +132,24 @@ pub fn network(fcx: &Cx, config: &Config, clock: Clock, tokens: &Arc<Tokens>) ->
             ),
         };
     }
-    Net::new().add_host(server).route(INTERNET, config.internet)
+    let net = Net::new()
+        .add_host(server)
+        .route(INTERNET, config.internet.ipv4);
+    match config.address_v6 {
+        Some(_) => net.route(INTERNET6, config.internet.ipv6),
+        None => net,
+    }
 }
 
-/// The name of the attachment the internet comes in by.
+/// The name of the attachment the internet comes in by, with IPv4 and
+/// IPv6 alike.
 pub const INTERNET: &str = "internet";
+
+/// The name of the internet's IPv6 route inside the world. A network
+/// route carries one prefix, so the relay for [`INTERNET`] passes IPv4 to
+/// the route called `internet` and IPv6 to this one. A sandbox that comes
+/// with this name is cut off.
+const INTERNET6: &str = "internet6";
 
 /// A running honeypot, for looking at what it holds.
 #[derive(Clone)]
@@ -188,28 +202,64 @@ pub fn start(
             expiring.lock().expire(fcx.now());
         }
     });
-    let address = config.address;
+    let (address, address_v6) = (config.address, config.address_v6);
     fcx.spawn(move |fcx| async move {
         loop {
             let sandbox = attachments.next(&fcx).await?;
+            if sandbox.name() == INTERNET6 {
+                continue;
+            }
             // A name still held by a relay that has not seen its sandbox
             // go yet is refused, and the new sandbox is cut off.
             let Ok(end) = attacher.attach(sandbox.name()) else {
                 continue;
             };
+            let (ends, route) = match (sandbox.name() == INTERNET, address_v6) {
+                (false, _) => (vec![end], Route::All),
+                (true, None) => (vec![end], Route::Server(address, None)),
+                (true, Some(address_v6)) => match attacher.attach(INTERNET6) {
+                    Ok(end6) => (vec![end, end6], Route::Server(address, Some(address_v6))),
+                    Err(_) => continue,
+                },
+            };
             let observer = observer.clone();
-            let only = (sandbox.name() == INTERNET).then_some(address);
-            fcx.spawn(move |fcx| relay(fcx, sandbox, end, observer, only));
+            fcx.spawn(move |fcx| relay(fcx, sandbox, ends, route, observer));
         }
     });
     Ok(honeypot)
 }
 
+/// Which of the network's attachments a packet from a sandbox goes on
+/// by. The relay's port 0 is the sandbox, and its network attachments are
+/// ports 1 and on.
+enum Route {
+    /// A sandbox's own attachment: port 1, whatever the destination.
+    All,
+    /// The internet's routes, one per family: port 1 for the server's IPv4
+    /// address, port 2 for its IPv6 address, and none for any other
+    /// destination. The internet reaches the server and nothing else in
+    /// the world.
+    Server(Ipv4Addr, Option<Ipv6Addr>),
+}
+
+impl Route {
+    fn port(&self, packet: &[u8]) -> Option<usize> {
+        match (self, ip::destination(packet)) {
+            (Route::All, _) => Some(1),
+            (Route::Server(address, _), Some(IpAddr::V4(dst))) if dst == *address => Some(1),
+            (Route::Server(_, Some(address_v6)), Some(IpAddr::V6(dst))) if dst == *address_v6 => {
+                Some(2)
+            }
+            (Route::Server(..), _) => None,
+        }
+    }
+}
+
 /// Passes packets between a sandbox and the network, writing each one
-/// first. With `only`, a packet from the sandbox goes on only when it is
-/// for that address: the internet reaches the server and nothing else in
-/// the world. Ends when either side closes. A write that fails does not
-/// end it: the observer counts what was lost ([`observe`]).
+/// first. A packet from the sandbox goes on by `ends` as `route` says:
+/// for the internet, only when it is for one of the server's addresses.
+/// Ends when either side closes. A write that fails does not end it: the
+/// observer counts what was lost ([`observe`]).
 ///
 /// Every packet goes to the packet log as it crossed. Fragments from the
 /// sandbox that go on are put back together here, as a host puts them
@@ -222,12 +272,17 @@ pub fn start(
 async fn relay(
     fcx: Cx,
     sandbox: Attachment,
-    end: End,
+    ends: Vec<End>,
+    route: Route,
     observer: Arc<Mutex<Observer>>,
-    only: Option<IpAddr>,
 ) -> fictionet::Result {
     let name: Arc<str> = sandbox.name().into();
-    let mut ports = Ports::new(vec![Box::new(sandbox) as Box<dyn Interface>, Box::new(end)]);
+    let mut interfaces = vec![Box::new(sandbox) as Box<dyn Interface>];
+    interfaces.extend(
+        ends.into_iter()
+            .map(|end| Box::new(end) as Box<dyn Interface>),
+    );
+    let mut ports = Ports::new(interfaces);
     let mut reassembly = Reassembly::default();
     loop {
         let deadline = reassembly.next_expiry();
@@ -235,7 +290,8 @@ async fn relay(
             Event::Packet(0, packet) => {
                 let mut observer = observer.lock();
                 observer.crossed(&name, Direction::In, &packet.0, fcx.now());
-                let goes_on = only.is_none_or(|only| ip::destination(&packet.0) == Some(only));
+                let port = route.port(&packet.0);
+                let goes_on = port.is_some();
                 let fragment = ip::Header::parse_truncated(&packet.0)
                     .is_some_and(|h| h.fragment.is_some_and(|f| !f.is_atomic()));
                 if fragment && !goes_on {
@@ -249,8 +305,8 @@ async fn relay(
                     Intake::Waiting => continue,
                 };
                 observer.whole(&name, Direction::In, &packet.0, fcx.now());
-                if goes_on {
-                    ports.send(1, packet);
+                if let Some(port) = port {
+                    ports.send(port, packet);
                 }
             }
             Event::Packet(_, packet) => {

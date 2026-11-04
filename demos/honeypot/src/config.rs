@@ -2,37 +2,93 @@
 //!
 //! ```text
 //! honeypot [--world unix:PATH] [--log PATH] [--pcap PATH]
-//!          [--address ADDR] [--internet PREFIX] [--gateway IPV4]
+//!          [--address IPV4] [--address-v6 IPV6] [--internet PREFIX]...
+//!          [--gateway IPV4] [--gateway-v6 IPV6]
 //!          [--ssh PORT]... [--http PORT]...
 //!          [--burst-window-ms MS] [--burst-syns N]
 //! ```
 //!
 //! With no `--ssh` or `--http`, the server has SSH on 22 and HTTP on 80.
+//! With no `--address-v6`, it has IPv4 only.
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 use std::time::Duration;
 
 use fictionet::WorldSocket;
+use fictionet::stdlib::network::ethernet::host::Ipv6Gateway;
 use fictionet::stdlib::network::route::Prefix;
 
-/// The server's address when none is given: in TEST-NET-3 (RFC 5737).
-pub const DEFAULT_ADDRESS: IpAddr = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10));
+/// The server's IPv4 address when none is given: in TEST-NET-3
+/// ([RFC 5737](https://www.rfc-editor.org/rfc/rfc5737)).
+pub const DEFAULT_ADDRESS: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 10);
 
 /// The world: the server, the route the internet comes in by, and what
 /// counts as a burst.
+///
+/// The server always has an IPv4 address, because the flaw the honeypot
+/// is built for is in Linux's IPv4 connection setup. Its IPv6 address is
+/// optional, as many servers have none. When it has one, it serves the
+/// same ports and logs the same observations on both addresses.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
-    /// The server's public address.
-    pub address: IpAddr,
+    /// The server's public IPv4 address.
+    pub address: Ipv4Addr,
+    /// The server's public IPv6 address, or `None` for a server with IPv4
+    /// only.
+    pub address_v6: Option<Ipv6Addr>,
     /// The addresses the `internet` attachment carries.
-    pub internet: Prefix,
-    /// The IPv4 default gateway used by the raw Ethernet adapter.
+    pub internet: Internet,
+    /// The IPv4 default gateway of the raw Ethernet adapter
+    /// ([`start_raw`](crate::start_raw)): the router every IPv4 packet goes
+    /// to.
     pub gateway: Ipv4Addr,
+    /// Where the raw Ethernet adapter's IPv6 default gateway comes from: an
+    /// address, such as `fe80::1` on Hetzner, or the router advertisements
+    /// on the link, as on AWS and Google Cloud. Unused without
+    /// [`address_v6`](Config::address_v6).
+    pub gateway_v6: Ipv6Gateway,
     /// The server's open TCP ports, each with an MPTCP listener.
     pub ports: Vec<Port>,
     /// When SYNs from one source count as a burst.
     pub burst: Burst,
+}
+
+/// The addresses the internet comes in from, one prefix per family. The
+/// internet may send from any address in them that the network does not
+/// have elsewhere.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Internet {
+    /// The IPv4 prefix, `0.0.0.0/0` by default.
+    pub ipv4: Prefix,
+    /// The IPv6 prefix, `::/0` by default. Used only when the server has an
+    /// IPv6 address.
+    pub ipv6: Prefix,
+}
+
+impl Default for Internet {
+    fn default() -> Internet {
+        Internet {
+            ipv4: Prefix {
+                addr: Ipv4Addr::UNSPECIFIED.into(),
+                len: 0,
+            },
+            ipv6: Prefix {
+                addr: Ipv6Addr::UNSPECIFIED.into(),
+                len: 0,
+            },
+        }
+    }
+}
+
+impl Internet {
+    /// Sets the prefix of `prefix`'s family.
+    pub fn set(&mut self, prefix: Prefix) {
+        match prefix.addr {
+            IpAddr::V4(_) => self.ipv4 = prefix,
+            IpAddr::V6(_) => self.ipv6 = prefix,
+        }
+    }
 }
 
 /// One open port and what answers on it.
@@ -76,11 +132,10 @@ impl Default for Config {
     fn default() -> Config {
         Config {
             address: DEFAULT_ADDRESS,
+            address_v6: None,
             gateway: Ipv4Addr::new(203, 0, 113, 1),
-            internet: Prefix {
-                addr: Ipv4Addr::UNSPECIFIED.into(),
-                len: 0,
-            },
+            gateway_v6: Ipv6Gateway::FromRouterAdvertisements,
+            internet: Internet::default(),
             ports: vec![
                 Port {
                     number: 22,
@@ -149,10 +204,15 @@ pub enum Flag {
     Pcap,
     /// `--address`: [`Config::address`].
     Address,
-    /// `--internet`: [`Config::internet`].
+    /// `--address-v6`: [`Config::address_v6`].
+    AddressV6,
+    /// `--internet`: the prefix of its family in [`Config::internet`].
     Internet,
     /// `--gateway`: [`Config::gateway`].
     Gateway,
+    /// `--gateway-v6`: a configured [`Config::gateway_v6`]. Without it, the
+    /// gateway is learned from router advertisements.
+    GatewayV6,
     /// `--ssh`: a port with [`Service::Ssh`].
     Ssh,
     /// `--http`: a port with [`Service::Http`].
@@ -165,13 +225,15 @@ pub enum Flag {
 
 impl Flag {
     /// Every flag.
-    pub const ALL: [Flag; 10] = [
+    pub const ALL: [Flag; 12] = [
         Flag::World,
         Flag::Log,
         Flag::Pcap,
         Flag::Address,
+        Flag::AddressV6,
         Flag::Internet,
         Flag::Gateway,
+        Flag::GatewayV6,
         Flag::Ssh,
         Flag::Http,
         Flag::BurstWindowMs,
@@ -185,8 +247,10 @@ impl Flag {
             Flag::Log => "--log",
             Flag::Pcap => "--pcap",
             Flag::Address => "--address",
+            Flag::AddressV6 => "--address-v6",
             Flag::Internet => "--internet",
             Flag::Gateway => "--gateway",
+            Flag::GatewayV6 => "--gateway-v6",
             Flag::Ssh => "--ssh",
             Flag::Http => "--http",
             Flag::BurstWindowMs => "--burst-window-ms",
@@ -228,8 +292,12 @@ impl Args {
                 Flag::Log => parsed.log = value.into(),
                 Flag::Pcap => parsed.pcap = value.into(),
                 Flag::Address => config.address = value.parse().map_err(|_| bad())?,
-                Flag::Internet => config.internet = value.parse().map_err(|_| bad())?,
+                Flag::AddressV6 => config.address_v6 = Some(value.parse().map_err(|_| bad())?),
+                Flag::Internet => config.internet.set(value.parse().map_err(|_| bad())?),
                 Flag::Gateway => config.gateway = value.parse().map_err(|_| bad())?,
+                Flag::GatewayV6 => {
+                    config.gateway_v6 = Ipv6Gateway::Configured(value.parse().map_err(|_| bad())?)
+                }
                 Flag::Ssh => config.ports.push(Port {
                     number: value.parse().map_err(|_| bad())?,
                     service: Service::Ssh,
@@ -270,6 +338,7 @@ mod tests {
             let value = match flag {
                 Flag::World => "unix:/tmp/w.sock",
                 Flag::Address | Flag::Gateway => "192.0.2.1",
+                Flag::AddressV6 | Flag::GatewayV6 => "2001:db8::1",
                 Flag::Internet => "0.0.0.0/0",
                 _ => "7",
             };
@@ -285,6 +354,11 @@ mod tests {
     fn defaults_serve_ssh_and_http() {
         let parsed = args("").unwrap();
         assert_eq!(parsed.config, Config::default());
+        assert_eq!(parsed.config.address_v6, None);
+        assert_eq!(
+            parsed.config.gateway_v6,
+            Ipv6Gateway::FromRouterAdvertisements
+        );
         assert_eq!(parsed.log, PathBuf::from("honeypot.jsonl"));
     }
 
@@ -292,16 +366,28 @@ mod tests {
     fn flags_set_the_world() {
         let parsed = args(
             "--world unix:/tmp/w.sock --log a.jsonl --pcap a.pcapng --address 198.51.100.7 \
-             --internet 198.51.0.0/16 --gateway 198.51.100.1 --ssh 2222 --http 8080 --http 80 \
+             --address-v6 2001:db8::7 --internet 198.51.0.0/16 --internet 2001:db8::/32 \
+             --gateway 198.51.100.1 --gateway-v6 fe80::1 --ssh 2222 --http 8080 --http 80 \
              --burst-window-ms 50 --burst-syns 4",
         )
         .unwrap();
         assert_eq!(parsed.world, WorldSocket::UnixSocket("/tmp/w.sock".into()));
         assert_eq!(parsed.pcap, PathBuf::from("a.pcapng"));
         let config = parsed.config;
-        assert_eq!(config.address, "198.51.100.7".parse::<IpAddr>().unwrap());
-        assert_eq!(config.internet, "198.51.0.0/16".parse().unwrap());
+        assert_eq!(config.address, Ipv4Addr::new(198, 51, 100, 7));
+        assert_eq!(config.address_v6, Some("2001:db8::7".parse().unwrap()));
+        assert_eq!(
+            config.internet,
+            Internet {
+                ipv4: "198.51.0.0/16".parse().unwrap(),
+                ipv6: "2001:db8::/32".parse().unwrap(),
+            }
+        );
         assert_eq!(config.gateway, Ipv4Addr::new(198, 51, 100, 1));
+        assert_eq!(
+            config.gateway_v6,
+            Ipv6Gateway::Configured("fe80::1".parse().unwrap())
+        );
         assert_eq!(
             config.ports.iter().map(|p| p.number).collect::<Vec<_>>(),
             [2222, 8080, 80]
@@ -334,6 +420,19 @@ mod tests {
         );
         assert!(args("--burst-syns 0").is_err());
         assert!(args("--world /no/scheme").is_err());
+        for (flag, value) in [
+            (Flag::Address, "2001:db8::1"),
+            (Flag::AddressV6, "192.0.2.1"),
+            (Flag::GatewayV6, "192.0.2.1"),
+        ] {
+            assert_eq!(
+                args(&format!("{} {value}", flag.name())),
+                Err(ArgsError::Bad {
+                    flag,
+                    value: value.into()
+                })
+            );
+        }
         assert_eq!(args("--gateway"), Err(ArgsError::Missing(Flag::Gateway)));
         assert_eq!(
             args("--gateway ::1"),

@@ -21,8 +21,13 @@ fn main() -> fictionet::Result {
         pcap: Box::new(BufWriter::new(append(&args.pcap)?)),
     };
     let (_listening, attachments) = fictionet::Listening::bind(args.world.clone())?;
+    let address_v6 = args
+        .config
+        .address_v6
+        .map(|address_v6| format!(" and {address_v6}"))
+        .unwrap_or_default();
     println!(
-        "honeypot at {} on {}, logging to {} and {}",
+        "honeypot at {}{address_v6} on {}, logging to {} and {}",
         args.config.address,
         args.world,
         args.log.display(),
