@@ -922,6 +922,7 @@ pub enum AckWidth {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DataLevel {
     local_idsn: u64,
+    local_next: u64,
     remote_idsn: u64,
     /// This end's and the peer's initial subflow sequence numbers.
     iss: u32,
@@ -984,6 +985,7 @@ impl DataLevel {
     ) -> DataLevel {
         DataLevel {
             local_idsn: idsn(local_key),
+            local_next: idsn(local_key).wrapping_add(1),
             remote_idsn: idsn(remote_key),
             iss,
             irs,
@@ -1284,20 +1286,13 @@ impl DataLevel {
     /// 4-octet one is taken as the 64-bit number nearest the next byte
     /// this end expects at the data level.
     fn expand(&self, sequence: Sequence) -> u64 {
-        match sequence {
-            Sequence::Long(n) => n,
-            Sequence::Short(low) => {
-                let near = self.next;
-                let offset = low.wrapping_sub(near as u32) as i32;
-                near.wrapping_add_signed(i64::from(offset))
-            }
-        }
+        sequence.expand(self.next)
     }
 
     /// The DSS for a segment this end sends: its sequence number, its
     /// data, whether it carries a FIN, and its acknowledgment number.
     /// `None` once the connection has fallen back.
-    pub fn sent(&self, seq: u32, payload: &[u8], fin: bool, ack: Option<u32>) -> Option<Dss> {
+    pub fn sent(&mut self, seq: u32, payload: &[u8], fin: bool, ack: Option<u32>) -> Option<Dss> {
         if self.fallen_back {
             return None;
         }
@@ -1315,7 +1310,13 @@ impl DataLevel {
         let length = u16::try_from(payload.len() + usize::from(fin)).ok()?;
         let mapping = (length > 0).then(|| {
             let offset = seq.wrapping_sub(self.iss);
-            let data_sequence_number = self.local_idsn.wrapping_add(u64::from(offset));
+            let data_sequence_number =
+                Sequence::Short((self.local_idsn as u32).wrapping_add(offset))
+                    .expand(self.local_next);
+            let end = data_sequence_number.wrapping_add(u64::from(length));
+            if (end.wrapping_sub(self.local_next) as i64) > 0 {
+                self.local_next = end;
+            }
             // A DATA_FIN on a segment with no data maps no subflow bytes.
             let subflow_sequence_number = if payload.is_empty() { 0 } else { offset };
             Mapping {
@@ -1337,6 +1338,20 @@ impl DataLevel {
             mapping,
             data_fin: fin,
         })
+    }
+}
+
+impl Sequence {
+    /// Expands a short sequence to the full number nearest `near`, modulo
+    /// the 64-bit data sequence space. The half-window tie goes backward.
+    pub fn expand(self, near: u64) -> u64 {
+        match self {
+            Sequence::Long(n) => n,
+            Sequence::Short(low) => {
+                let offset = low.wrapping_sub(near as u32) as i32;
+                near.wrapping_add_signed(i64::from(offset))
+            }
+        }
     }
 }
 
@@ -2112,7 +2127,7 @@ mod tests {
     /// With checksums, each mapping carries the checksum of its bytes.
     #[test]
     fn a_data_level_with_checksums_sums_each_mapping() {
-        let level = DataLevel::new(KEY_B, KEY_A, ISS, IRS, true, None);
+        let mut level = DataLevel::new(KEY_B, KEY_A, ISS, IRS, true, None);
         let dss = level
             .sent(ISS.wrapping_add(3), b"abc", false, Some(IRS + 1))
             .unwrap();
@@ -2222,7 +2237,7 @@ mod tests {
                 data_fin: true,
             });
             assert!(level.received(IRS + 6, 0, false, [data_fin.clone()]));
-            let data_ack = |level: &DataLevel, ack| {
+            let data_ack = |level: &mut DataLevel, ack| {
                 let dss = level.sent(ISS.wrapping_add(1), b"", false, Some(ack));
                 match dss.unwrap().data_ack.unwrap() {
                     Sequence::Long(n) => n,
@@ -2231,13 +2246,13 @@ mod tests {
             };
             let after_data_fin = idsn(KEY_A).wrapping_add(7);
             let expected = after_data_fin;
-            assert_eq!(data_ack(&level, IRS + 6), expected);
+            assert_eq!(data_ack(&mut level, IRS + 6), expected);
             // Sent again, it is acknowledged again, and counts once.
             assert!(level.received(IRS + 6, 0, false, [data_fin]));
-            assert_eq!(data_ack(&level, IRS + 6), expected);
+            assert_eq!(data_ack(&mut level, IRS + 6), expected);
             // The subflow's FIN, without DATA_FIN.
             assert!(!level.received(IRS + 6, 0, true, []));
-            assert_eq!(data_ack(&level, IRS + 7), expected);
+            assert_eq!(data_ack(&mut level, IRS + 7), expected);
             assert!(!level.fallen_back());
         }
     }
@@ -2261,16 +2276,16 @@ mod tests {
             data_fin: true,
         });
         assert!(level.received(IRS + 3, 3, true, [last]));
-        let data_ack = |level: &DataLevel, ack| {
+        let data_ack = |level: &mut DataLevel, ack| {
             let dss = level.sent(ISS.wrapping_add(1), b"", false, Some(ack));
             dss.unwrap().data_ack.unwrap()
         };
         // Bytes 1 and 2 are missing: the subflow ACK stays at 1.
-        assert_eq!(data_ack(&level, IRS + 1), dsn(1));
+        assert_eq!(data_ack(&mut level, IRS + 1), dsn(1));
         level.received(IRS + 1, 2, false, [mapping(dsn(1), 1, 2)]);
         level.arrived(IRS + 1, b"hello", &mut Vec::new());
         // All 5 bytes and the FIN: the DATA_FIN is covered.
-        assert_eq!(data_ack(&level, IRS + 7), dsn(7));
+        assert_eq!(data_ack(&mut level, IRS + 7), dsn(7));
         assert!(!level.fallen_back());
     }
     #[test]
@@ -2423,5 +2438,34 @@ mod tests {
         let failed = level.clone();
         level.received(IRS + 1, 1, false, []);
         assert_eq!(level, failed);
+    }
+
+    #[test]
+    fn outgoing_data_sequence_survives_subflow_wrap_and_retransmission() {
+        let mut level = DataLevel::new(KEY_B, KEY_A, ISS, IRS, false, None);
+        let payload = vec![0; 65535];
+        for offset in (1..(1u64 << 32) + 131070).step_by(payload.len()) {
+            let dss = level
+                .sent(ISS.wrapping_add(offset as u32), &payload, false, None)
+                .unwrap();
+            assert_eq!(
+                dss.mapping.unwrap().data_sequence_number,
+                Sequence::Long(idsn(KEY_B).wrapping_add(offset))
+            );
+        }
+        let before = level.local_next;
+        for offset in [(1u64 << 32) - 65535, (1u64 << 32) + 1] {
+            let dss = level
+                .sent(ISS.wrapping_add(offset as u32), b"x", false, None)
+                .unwrap();
+            assert_eq!(
+                dss.mapping.unwrap().data_sequence_number,
+                Sequence::Long(idsn(KEY_B).wrapping_add(offset))
+            );
+            assert_eq!(
+                level.local_next, before,
+                "retransmission does not rewind the send position"
+            );
+        }
     }
 }

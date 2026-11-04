@@ -660,7 +660,7 @@ impl Segments for Dss {
 
     fn sent(&mut self, segment: &Sent<'_>) -> Vec<TcpOption> {
         self.level
-            .as_ref()
+            .as_mut()
             .and_then(|level| level.sent(segment.seq, segment.payload, segment.fin, segment.ack))
             .map(|dss| vec![option(MptcpOption::Dss(dss))])
             .unwrap_or_default()
