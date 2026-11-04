@@ -38,10 +38,12 @@ pub fn authors_bind() -> LowerName {
     name("authors.bind.")
 }
 
-/// The plain look, as NSD, Knot, Unbound, and the public resolvers answer
-/// a name: `text` as one TXT record with `ttl` at `name`, in a zone of its
-/// own with no SOA. Other types there are NODATA, and names below it
-/// NXDOMAIN.
+/// The plain look: `text` as one TXT record with `ttl` at `name`, in a
+/// zone of its own with no SOA, answered as any zone is (RFC 1034
+/// §4.3.2) with AA set. Other types there are NODATA, and names below it
+/// NXDOMAIN. Real servers that answer a name with text alone differ in
+/// the rest, such as AA clear or REFUSED for other types; the look keeps
+/// only the text and the TTL they give.
 pub fn txt(name: &LowerName, ttl: u32, text: &str) -> ChaosZone {
     let txt = RData::TXT(TXT::new(vec![text.to_string()]));
     ChaosZone::new(Name::from(name)).record(ttl, txt)

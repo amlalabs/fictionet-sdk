@@ -90,8 +90,9 @@ impl Request {
     /// 6. An opcode other than QUERY: NOTIMP.
     /// 7. A question count other than 1: FORMERR (RFC 9619).
     /// 8. QTYPE OPT, which only appears as a record: FORMERR (RFC 6891 §6.1.1).
-    /// 9. AXFR or IXFR over UDP, which they are not defined for: FORMERR
-    ///    (RFC 5936 §4.2, RFC 1995 §2).
+    /// 9. AXFR over UDP, which it is not defined for: FORMERR
+    ///    (RFC 5936 §4.2). IXFR is defined over UDP as well as TCP
+    ///    (RFC 1995 §2), so the server's transfer policy answers it.
     /// 10. QTYPE MAILA or MAILB: NOTIMP (RFC 1035 §3.2.3).
     ///
     /// A rejection copies the query's ID, opcode, RD, and CD. It echoes
@@ -131,7 +132,7 @@ impl Request {
         let question = message.queries[0].clone();
         match question.query_type() {
             RecordType::OPT => return reject(ResponseCode::FormErr),
-            RecordType::AXFR | RecordType::IXFR if transport == Transport::Udp => {
+            RecordType::AXFR if transport == Transport::Udp => {
                 return reject(ResponseCode::FormErr);
             }
             kind if matches!(u16::from(kind), MAILB | MAILA) => {

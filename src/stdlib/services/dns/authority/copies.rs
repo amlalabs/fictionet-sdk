@@ -13,7 +13,7 @@ use fictionet::sync::Mutex;
 use super::super::exchange::{Client, Generation};
 use super::super::lookup::{Looked, Lookup};
 use super::super::zone::{Filing, Learned, ZoneData};
-use super::{Authority, ServerConfig, Step, refuse_transfer, respond_from};
+use super::{Authority, ServerConfig, Step, bare_reply, refuse_transfer, respond_from};
 
 /// The [learned](Learned) copies of real zones, one per apex, shared by
 /// every address that serves the zone, and the zones each address serves.
@@ -22,7 +22,10 @@ use super::{Authority, ServerConfig, Step, refuse_transfer, respond_from};
 /// of the zones the address serves, looking up what they lack at the
 /// address itself. A copy's view that does not know a fact the reply
 /// needs never gives a negative: the copy looks the client's question up
-/// ([`Step::Need`]). A server that answers as RFC 1034 and RFC 6672 say
+/// ([`Step::Need`]). When the real server answered that lookup with an
+/// error RCODE that gives no facts, such as FORMERR or SERVFAIL, the reply
+/// is that RCODE ([`Learned::failed`]). A server that answers as RFC 1034
+/// and RFC 6672 say
 /// carries the whole
 /// CNAME and DNAME chain in its response. When the response to the
 /// client's question was filed and the answer still stops at a name the
@@ -39,7 +42,9 @@ use super::{Authority, ServerConfig, Step, refuse_transfer, respond_from};
 /// answers for the child's names from the child's data, never with a
 /// referral to it. When a lookup's response shows the child's apex
 /// ([`Learned::child_answering`]), the address is noted as serving the
-/// child, and the response is filed into the child's copy. An
+/// child, and the response is filed into the child's copy. So is a
+/// referral to a cut below a cut the copy holds, which only a server of
+/// the zone at that cut, or one below it, gives. An
 /// authoritative answer below a cut the copy holds that shows no apex
 /// ([`Learned::below_cut`]) comes from such a child all the same, so the
 /// address is asked for the SOA RRset at the name, whose response shows
@@ -183,6 +188,18 @@ impl Copies {
         Some(learned.file(generation, addr, &lookup.question, response))
     }
 
+    /// The step that looks `question` up at `local` for `req`, as a
+    /// question in the zone at `zone`: the lookup, or the reply with the
+    /// error RCODE the real server already answered that lookup with
+    /// this session ([`Learned::failed`]), which a server sends rather
+    /// than no reply (RFC 8906 §3.1.1).
+    fn look_up(&self, req: &Request, local: SocketAddr, zone: LowerName, question: &Query) -> Step {
+        match self.copy(&zone).failed(local.ip(), question) {
+            Some(rcode) => Step::Reply(bare_reply(req, rcode, None)),
+            None => Step::Need(Lookup::new(local, zone, question)),
+        }
+    }
+
     /// The copies of the zones `addr` serves.
     fn zones_at(&self, addr: IpAddr) -> Vec<Arc<dyn ZoneData>> {
         let apexes = self.served.lock().get(&addr).cloned().unwrap_or_default();
@@ -244,17 +261,16 @@ impl Authority for Copies {
             .cloned();
         if let Some(zone) = unplaced {
             let soa = Query::query(Name::from(qname), RecordType::SOA);
-            return Step::Need(Lookup::new(local, zone, &soa));
+            return self.look_up(req, local, zone, &soa);
         }
         let zones = self.zones_at(local.ip());
-        respond_from(&zones, req, server, &|zone, reached| {
+        respond_from(&zones, req, server, &|zone, asked, reached| {
             let apex = zone.apex();
-            let mut question = req.question.clone();
-            if LowerName::new(question.name()) != reached && self.copy(apex).answered(&req.question)
-            {
+            let mut question = asked.clone();
+            if LowerName::new(question.name()) != reached && self.copy(apex).answered(asked) {
                 question.set_name(Name::from(reached));
             }
-            Step::Need(Lookup::new(local, apex.clone(), &question))
+            self.look_up(req, local, apex.clone(), &question)
         })
     }
 

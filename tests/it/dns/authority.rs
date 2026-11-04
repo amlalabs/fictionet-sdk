@@ -876,6 +876,98 @@ fn a_chaos_zone_answers_from_its_records() {
     );
 }
 
+/// A CNAME chain whose target lies in another zone the server hosts, out
+/// of the zone or below one of its cuts, goes on in that zone: the reply
+/// carries the chain and the target's data with AA, and no referral back
+/// to the server itself, as step 1 searches every zone the server has
+/// (RFC 1034 §4.3.2 step 3a). A chain that comes back to a name it passed
+/// stops there, and one whose target no hosted zone holds ends with its
+/// CNAME.
+#[test]
+fn a_chain_goes_on_in_the_other_zones_the_server_hosts() {
+    let master = |text: &str| Zone::from_master(text, None).unwrap();
+    let example = master(
+        "\
+example. 3600 IN SOA ns.example. hostmaster.example. 1 7200 3600 1209600 300
+example. 3600 IN NS ns.example.
+ns.example. 3600 IN A 192.0.2.53
+alias.example. 300 IN CNAME www.other.
+inchild.example. 300 IN CNAME www.child.example.
+back.example. 300 IN CNAME loop.other.
+away.example. 300 IN CNAME www.elsewhere.
+child.example. 3600 IN NS ns.example.
+",
+    );
+    let other = master(
+        "\
+other. 3600 IN SOA ns.example. hostmaster.example. 1 7200 3600 1209600 300
+other. 3600 IN NS ns.example.
+www.other. 300 IN A 192.0.2.90
+loop.other. 300 IN CNAME back.example.
+",
+    );
+    let child = master(
+        "\
+child.example. 3600 IN SOA ns.example. hostmaster.example. 1 7200 3600 1209600 300
+child.example. 3600 IN NS ns.example.
+www.child.example. 300 IN A 192.0.2.91
+",
+    );
+    let texts = |records: &[Record]| -> Vec<String> {
+        records
+            .iter()
+            .map(|record| format!("{} {} {}", record.name, record.record_type(), record.data))
+            .collect()
+    };
+    let cases: [(&str, &[&str]); 4] = [
+        (
+            "inchild.example.",
+            &[
+                "inchild.example. CNAME www.child.example.",
+                "www.child.example. A 192.0.2.91",
+            ],
+        ),
+        (
+            "alias.example.",
+            &["alias.example. CNAME www.other.", "www.other. A 192.0.2.90"],
+        ),
+        (
+            "back.example.",
+            &[
+                "back.example. CNAME loop.other.",
+                "loop.other. CNAME back.example.",
+            ],
+        ),
+        ("away.example.", &["away.example. CNAME www.elsewhere."]),
+    ];
+    for (qname, want) in cases {
+        let mut engine = AuthorityEngine::new(
+            zones(vec![example.clone(), other.clone(), child.clone()]),
+            ServerConfig::generic(),
+            local(),
+        );
+        let reply = the_answer(&ask_with(
+            &mut engine,
+            &query(qname, RecordType::A, |_| {}),
+            Transport::Udp,
+        ));
+        assert_eq!(
+            reply.metadata.response_code,
+            ResponseCode::NoError,
+            "{qname}"
+        );
+        assert!(reply.metadata.authoritative, "{qname}");
+        assert_eq!(texts(&reply.answers), want, "{qname}");
+        assert!(
+            reply
+                .authorities
+                .iter()
+                .all(|record| record.record_type() != RecordType::NS),
+            "{qname}: no referral"
+        );
+    }
+}
+
 #[test]
 fn zone_transfers_are_the_authoritys_to_decide() {
     let calls = Arc::new(AtomicUsize::new(0));
@@ -892,6 +984,22 @@ fn zone_transfers_are_the_authoritys_to_decide() {
     // Over TCP the authority decides it, as any question.
     ask_with(&mut engine, &axfr, Transport::Tcp);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    // IXFR is defined over UDP too (RFC 1995 §2), so the authority
+    // decides it there as well, and zones refuse it on both transports.
+    let ixfr = query("example.test.", RecordType::IXFR, |_| {});
+    ask_with(&mut engine, &ixfr, Transport::Udp);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    for transport in [Transport::Udp, Transport::Tcp] {
+        let mut engine =
+            AuthorityEngine::new(zones(vec![example()]), ServerConfig::generic(), local());
+        let reply = the_answer(&ask_with(&mut engine, &ixfr, transport));
+        assert_eq!(
+            reply.metadata.response_code,
+            ResponseCode::Refused,
+            "{transport:?}"
+        );
+    }
 
     // Zone data answers questions; it cannot list a zone, so zones refuse,
     // and so do their copies and an overlay on them.

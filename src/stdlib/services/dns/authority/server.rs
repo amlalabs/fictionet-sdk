@@ -240,8 +240,9 @@ pub fn bare_reply(req: &Request, rcode: ResponseCode, ede: Option<EdeCode>) -> R
 /// questions from, and its NSID.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Identity {
-    /// Its CHAOS-class zones, by apex.
-    pub zones: BTreeMap<LowerName, ChaosZone>,
+    /// Its CHAOS-class zones. Each holds its own apex, and at equal apex
+    /// the zone given last answers.
+    pub zones: Vec<ChaosZone>,
     /// Names it answers with an RCODE and no records, whatever the type
     /// asked.
     pub rcodes: BTreeMap<LowerName, ResponseCode>,
@@ -258,7 +259,7 @@ impl Identity {
     /// (RFC 1035 §4.1.1).
     pub fn none() -> Identity {
         Identity {
-            zones: BTreeMap::new(),
+            zones: Vec::new(),
             rcodes: BTreeMap::new(),
             unlisted: ResponseCode::Refused,
             nsid: None,
@@ -268,7 +269,9 @@ impl Identity {
     /// This identity serving `zone`, in place of any zone it served at
     /// the same apex.
     pub fn zone(mut self, zone: ChaosZone) -> Identity {
-        self.zones.insert(LowerName::new(&zone.apex), zone);
+        let apex = LowerName::new(&zone.apex);
+        self.zones.retain(|held| LowerName::new(&held.apex) != apex);
+        self.zones.push(zone);
         self
     }
 
@@ -298,13 +301,14 @@ impl Identity {
         if let Some(rcode) = self.rcodes.get(&qname) {
             return bare_reply(req, *rcode, None);
         }
+        // `max_by_key` keeps the last of equal keys: the zone given last.
         let zone = self
             .zones
             .iter()
-            .filter(|(apex, _)| apex.zone_of(&qname))
-            .max_by_key(|(apex, _)| apex.num_labels());
+            .filter(|zone| LowerName::new(&zone.apex).zone_of(&qname))
+            .max_by_key(|zone| zone.apex.num_labels());
         match zone {
-            Some((_, zone)) => zone.respond(req),
+            Some(zone) => zone.respond(req),
             None => bare_reply(req, self.unlisted, None),
         }
     }

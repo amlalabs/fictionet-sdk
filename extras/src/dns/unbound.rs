@@ -220,10 +220,8 @@ mod tests {
     fn unbound_answers_its_version() {
         let identity = config().identity;
         for name in [chaos::version_bind(), chaos::version_server()] {
-            assert_eq!(
-                identity.zones.get(&name),
-                Some(&chaos::txt(&name, 0, VERSION))
-            );
+            let zone = chaos::txt(&name, 0, VERSION);
+            assert!(identity.zones.contains(&zone), "{name}");
         }
     }
 }

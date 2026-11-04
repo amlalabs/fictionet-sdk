@@ -24,13 +24,13 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use fictionet::stdlib::protocols::dns::op::ResponseCode;
-use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, RecordType};
+use fictionet::stdlib::protocols::dns::op::{Query, ResponseCode};
+use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, Name, RecordType};
 use fictionet::stdlib::protocols::dns::{EdeCode, Request, Response, label_count};
 
 use super::exchange::{Client, Generation};
 use super::lookup::{Looked, Lookup};
-use super::zone::{Answered, ZoneData, answer};
+use super::zone::{Answered, ZoneData, answer_onward};
 
 mod copies;
 mod engine;
@@ -117,7 +117,11 @@ impl<A: Authority + ?Sized> Authority for Arc<A> {
 /// a DS question at a zone's apex goes to the zone above it when that zone
 /// is hosted too and holds the cut, since the parent holds DS (RFC 4035
 /// §3.1.4.1). When that zone refers the question to a zone between them,
-/// the zone at the apex answers NODATA. A view that does not know a fact
+/// the zone at the apex answers NODATA. A CNAME or DNAME chain that
+/// leaves its zone, or reaches a cut, for a name another hosted zone
+/// holds goes on in that zone, and the reply carries the whole chain and
+/// the data it leads to, as step 1 searches every zone the server has
+/// (RFC 1034 §4.3.2 step 3a). A view that does not know a fact
 /// the reply needs never gives a negative: the server answers SERVFAIL.
 /// A QNAME no hosted zone contains gets REFUSED, with Extended DNS Error
 /// 20, Not Authoritative, when the front sends them (RFC 8914 §4.21).
@@ -167,22 +171,24 @@ fn refuse_transfer(req: &Request) -> Option<Step> {
     .then(|| Step::Reply(bare_reply(req, ResponseCode::Refused, None)))
 }
 
+/// What a zone's view does not know: the zone, the question it was asked
+/// in that zone, and the name its answer had reached, that question's
+/// name or the target of the last CNAME or DNAME it followed (RFC 1034
+/// §4.3.2 step 3a, RFC 6672 §3.2). Gives the step to take.
+type Unknown<'a> = &'a dyn Fn(&dyn ZoneData, &Query, LowerName) -> Step;
+
 /// What a server hosting `zones` does with `req`, with `server` as its
 /// front, as [`Zones`] describes. `unknown` gives the step when a zone's
-/// view does not know a fact the reply needs: it gets the zone and the
-/// name the answer had reached, QNAME or the target of the last CNAME or
-/// DNAME it followed (RFC 1034 §4.3.2 step 3a, RFC 6672 §3.2).
+/// view does not know a fact the reply needs.
 fn respond_from(
     zones: &[Arc<dyn ZoneData>],
     req: &Request,
     server: &ServerConfig,
-    unknown: &dyn Fn(&dyn ZoneData, LowerName) -> Step,
+    unknown: Unknown<'_>,
 ) -> Step {
     if let Some(refused) = refuse_transfer(req) {
         return refused;
     }
-    let qname = LowerName::new(req.question.name());
-    let qtype = req.question.query_type();
     match req.question.query_class() {
         DNSClass::IN => {}
         // A zone answers from its data with AA, and an answer to QCLASS
@@ -195,15 +201,52 @@ fn respond_from(
             return Step::Reply(bare_reply(req, ResponseCode::Refused, ede));
         }
     }
+    let qname = LowerName::new(req.question.name());
     let Some(zone) = deepest(zones, &qname, false) else {
         let ede = server.ede.then_some(EdeCode::NOT_AUTHORITATIVE);
         return Step::Reply(bare_reply(req, ResponseCode::Refused, ede));
     };
-    let answer_from =
-        |zone: &dyn ZoneData| match answer(&*zone.view(&req.question), req, server.any) {
-            Answered::Response(response) => Step::Reply(response),
-            Answered::Unknown { reached, .. } => unknown(zone, reached),
-        };
+    respond_hosted(zones, zone, req, server, unknown, &mut vec![qname])
+}
+
+/// The reply to `req` from `zone`, the deepest of `zones` that holds its
+/// QNAME. Where a CNAME or DNAME chain goes past that zone, to a name
+/// another hosted zone holds, the answer goes on in that zone, as step 1
+/// searches every zone the server has (RFC 1034 §4.3.2 step 3a). `seen`
+/// holds the names the chain went on at, so that it stops at one it
+/// reaches again.
+fn respond_hosted(
+    zones: &[Arc<dyn ZoneData>],
+    zone: &dyn ZoneData,
+    req: &Request,
+    server: &ServerConfig,
+    unknown: Unknown<'_>,
+    seen: &mut Vec<LowerName>,
+) -> Step {
+    let qname = LowerName::new(req.question.name());
+    let qtype = req.question.query_type();
+    let answer_from = |zone: &dyn ZoneData, seen: &mut Vec<LowerName>| match answer_onward(
+        &*zone.view(&req.question),
+        req,
+        server.any,
+    ) {
+        (Answered::Response(response), Some(onward)) => {
+            let hosted =
+                deepest(zones, &onward.target, false).filter(|next| next.apex() != zone.apex());
+            let Some(next_zone) = hosted.filter(|_| !seen.contains(&onward.target)) else {
+                return Step::Reply(response);
+            };
+            seen.push(onward.target.clone());
+            let mut next = req.clone();
+            next.question.set_name(Name::from(&onward.target));
+            match respond_hosted(zones, next_zone, &next, server, unknown, seen) {
+                Step::Reply(rest) => Step::Reply(joined(onward.chain, rest)),
+                step => step,
+            }
+        }
+        (Answered::Response(response), None) => Step::Reply(response),
+        (Answered::Unknown { reached, .. }, _) => unknown(zone, &req.question, reached),
+    };
     if qtype == RecordType::DS
         && zone.apex() == &qname
         && let Some(above) = deepest(zones, &qname, true)
@@ -211,12 +254,41 @@ fn respond_from(
         // A zone above that refers the question on is not the parent,
         // so the zone itself answers NODATA from its apex (RFC 4035
         // §3.1.4.1), as BIND does.
-        match answer_from(above) {
+        match answer_from(above, seen) {
             Step::Reply(response) if is_referral(&response) => {}
             step => return step,
         }
     }
-    answer_from(zone)
+    answer_from(zone, seen)
+}
+
+/// `chain`, the reply that holds a CNAME and DNAME chain up to the name
+/// it went past its zone at, followed by `rest`, the reply for that name
+/// from the zone that holds it: the chain's answers, then the rest's, the
+/// chain's denial records beside the rest's authority section, and the
+/// rest's additional section and RCODE (RFC 6604 §2). The header and the
+/// question are the chain's, which is the client's, and AA stays set,
+/// since the first answer is authoritative (RFC 1035 §4.1.1).
+fn joined(chain: Response, rest: Response) -> Response {
+    let mut message = chain.message;
+    let rest_message = rest.message;
+    message.metadata.response_code = rest_message.metadata.response_code;
+    for record in rest_message.answers {
+        if !message.answers.contains(&record) {
+            message.answers.push(record);
+        }
+    }
+    let proofs = std::mem::replace(&mut message.authorities, rest_message.authorities);
+    for record in proofs {
+        if !message.authorities.contains(&record) {
+            message.authorities.push(record);
+        }
+    }
+    message.additionals = rest_message.additionals;
+    Response {
+        message,
+        required_additional: rest.required_additional,
+    }
 }
 
 /// Whether `response` is a referral: NOERROR with AA clear, which a zone
@@ -234,7 +306,7 @@ impl Authority for Zones {
         server: &ServerConfig,
         _client: &Client,
     ) -> Step {
-        respond_from(&self.zones, req, server, &|_, _| {
+        respond_from(&self.zones, req, server, &|_, _, _| {
             Step::Reply(bare_reply(req, ResponseCode::ServFail, None))
         })
     }

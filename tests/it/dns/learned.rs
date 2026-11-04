@@ -1583,3 +1583,113 @@ a.target.example. 300 IN A 192.0.2.41
     let (got, _) = through(&copies, &stopping, local, &nsec);
     assert_eq!(shape(&got), shape(&real(&zone, &nsec)));
 }
+
+/// `child.example` as its own zone, with a cut of its own at
+/// `sub.child.example`.
+const CHILD_WITH_CUT: &str = "\
+child.example. 3600 IN SOA ns.child.example. hostmaster.example. 1 7200 3600 1209600 300
+child.example. 3600 IN NS ns.child.example.
+ns.child.example. 3600 IN A 192.0.2.54
+sub.child.example. 3600 IN NS ns.sub.child.example.
+ns.sub.child.example. 3600 IN A 192.0.2.60
+";
+
+/// Two real servers of `example`: the first also serves `child.example`,
+/// so it refers names below `sub.child.example` there, and the second
+/// refers them to `child.example`. Each address of the copy answers as
+/// its own server, in every order the two are asked, and never stays
+/// silent: a referral to a cut below a cut the copy holds comes from the
+/// zone at that cut, and a referral to one cut says nothing of another
+/// (RFC 1034 §4.2.1, §4.3.2 step 3b).
+#[test]
+fn each_address_refers_to_its_own_servers_deepest_cut() {
+    let zone = |text: &str| Arc::new(Zone::from_master(text, None).unwrap()) as Arc<dyn ZoneData>;
+    let servers: [(SocketAddr, Zones); 2] = [
+        (
+            "192.0.2.53:53".parse().unwrap(),
+            Zones::new(vec![zone(EXAMPLE), zone(CHILD_WITH_CUT)]),
+        ),
+        (
+            "192.0.2.153:53".parse().unwrap(),
+            Zones::new(vec![zone(EXAMPLE)]),
+        ),
+    ];
+    let real = |lookup: &Lookup| {
+        let (_, zones) = servers
+            .iter()
+            .find(|(addr, _)| addr.ip() == lookup.server.ip())
+            .expect("a real server at the address");
+        reply_of(zones, lookup)
+    };
+    let questions = [
+        request("www.sub.child.example.", RecordType::A, false),
+        request("nope.child.example.", RecordType::TXT, false),
+        request("sub.child.example.", RecordType::MX, false),
+    ];
+    for order in [[0, 1, 0], [1, 0, 1]] {
+        for first in &questions {
+            for second in &questions {
+                let copies = Copies::new();
+                for (addr, _) in &servers {
+                    copies.serves(addr.ip(), &lower("example."));
+                }
+                for (step, at) in order.into_iter().enumerate() {
+                    let question = if step == 1 { second } else { first };
+                    let local = servers[at].0;
+                    let (got, _) = through(&copies, &real, local, question);
+                    let want = reply_of(&servers[at].1, &own(local, question));
+                    assert_eq!(
+                        shape(&got),
+                        shape(&want),
+                        "{:?} at {local}, order {order:?}, step {step}",
+                        question.question
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// A real server may answer a question with an error RCODE that gives no
+/// records, as BIND answers FORMERR to a meta-type and SERVFAIL to a CNAME
+/// loop. The copy answers that question with the same RCODE, never with
+/// silence (RFC 8906 §3.1).
+#[test]
+fn a_copy_answers_with_the_error_its_real_server_gave() {
+    let real = Zones::new(vec![
+        Arc::new(Zone::from_master(EXAMPLE, None).unwrap()) as Arc<dyn ZoneData>
+    ]);
+    let erring = |lookup: &Lookup| {
+        let mut message = reply_of(&real, lookup);
+        let rcode = match lookup.question.query_type() {
+            RecordType::TSIG => ResponseCode::FormErr,
+            RecordType::TXT => ResponseCode::ServFail,
+            RecordType::MX => ResponseCode::NotImp,
+            _ => return message,
+        };
+        message.metadata.response_code = rcode;
+        message.answers.clear();
+        message.authorities.clear();
+        message.additionals.clear();
+        message
+    };
+    let local: SocketAddr = "192.0.2.53:53".parse().unwrap();
+    let copies = Copies::new();
+    copies.serves(local.ip(), &lower("example."));
+    for (qtype, rcode) in [
+        (RecordType::TSIG, ResponseCode::FormErr),
+        (RecordType::TXT, ResponseCode::ServFail),
+        (RecordType::MX, ResponseCode::NotImp),
+    ] {
+        for round in 0..2 {
+            let asked = request("www.example.", qtype, false);
+            let (got, _) = through(&copies, &erring, local, &asked);
+            assert_eq!(got.metadata.response_code, rcode, "{qtype} round {round}");
+            assert!(got.answers.is_empty(), "{qtype} round {round}");
+        }
+    }
+    // A name whose own records the copy still learns from its server.
+    let asked = request("www.example.", RecordType::A, false);
+    let (got, _) = through(&copies, &erring, local, &asked);
+    assert_eq!(shape(&got), shape(&reply_of(&real, &own(local, &asked))));
+}

@@ -81,7 +81,9 @@ pub enum AnyResponse {
 ///    §3.1).
 /// 4. A node at QNAME: its RRset with AA set. A CNAME starts the walk
 ///    again at its target, inside this zone only, and the chain stops at
-///    the first name it has seen before (RFC 1034 §4.3.2 step 3a). QTYPE
+///    the first name it has seen before (RFC 1034 §4.3.2 step 3a). Where
+///    it leaves the zone, [`answer_onward`] says so, for a server that
+///    hosts other zones to go on. QTYPE
 ///    NSEC gets the NSEC the zone holds at the name, in its node or not.
 ///    No RRset of QTYPE, or an empty non-terminal: NODATA with the SOA.
 /// 5. No node at QNAME: the wildcard at the closest encloser, unless a
@@ -105,19 +107,57 @@ pub enum AnyResponse {
 /// are QNAME in lowercase; the server front gives them the question's case
 /// (RFC 4343 §4.1). A QNAME outside the zone gets REFUSED.
 pub fn answer(view: &dyn View, req: &Request, any: AnyResponse) -> Answered {
+    answer_onward(view, req, any).0
+}
+
+/// Where a CNAME or DNAME chain went past the zone an answer came from.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Onward {
+    /// The name the chain reached: a target outside the zone, or a name
+    /// the zone refers to a cut. A server that hosts a zone that holds it
+    /// goes on there, back at step 1 (RFC 1034 §4.3.2 step 3a).
+    pub target: LowerName,
+    /// The reply holding the chain up to `target` alone: its CNAME and
+    /// DNAME records, with AA, and the denial records its wildcard
+    /// CNAMEs need.
+    pub chain: Response,
+}
+
+/// [`answer`], and where the chain of a reply that followed a CNAME or
+/// DNAME went past the zone, if it did: out of it, or to a referral.
+/// [`Zones`](super::super::authority::Zones) goes on from there in the
+/// zones it hosts.
+pub fn answer_onward(
+    view: &dyn View,
+    req: &Request,
+    any: AnyResponse,
+) -> (Answered, Option<Onward>) {
     let qname = LowerName::new(req.question.name());
     let qtype = req.question.query_type();
     let dnssec_ok = req.edns.is_some_and(|edns| edns.dnssec_ok);
-    match resolve(view, &qname, qtype, dnssec_ok, any) {
-        Ok(found) => Answered::Response(found.response(req, dnssec_ok)),
+    let walk = Walk {
+        view,
+        qtype,
+        dnssec_ok,
+        any,
+    };
+    match walk.chase(qname) {
+        Ok((found, onward)) => {
+            let onward = onward.map(|(target, chain)| Onward {
+                target,
+                chain: chain.response(req, dnssec_ok),
+            });
+            (Answered::Response(found.response(req, dnssec_ok)), onward)
+        }
         Err(stopped) => {
             let Stopped { name, reached } = *stopped;
-            Answered::Unknown { name, reached }
+            (Answered::Unknown { name, reached }, None)
         }
     }
 }
 
 /// The sections of an answer, before they become a message.
+#[derive(Clone)]
 pub(super) struct Found {
     rcode: ResponseCode,
     aa: bool,
@@ -179,7 +219,7 @@ pub(super) fn resolve(
         dnssec_ok,
         any,
     };
-    walk.chase(qname.clone())
+    walk.chase(qname.clone()).map(|(found, _)| found)
 }
 
 /// Where the walk from the apex toward a name stops.
@@ -306,11 +346,20 @@ impl<'v> Walk<'v> {
     /// name or at a target outside the zone (RFC 1034 §4.3.2 step 3a).
     /// The RCODE is the last name's (RFC 6604 §2). An RRset the chain
     /// reaches twice, such as a DNAME it passes again, goes out once
-    /// (RFC 2181 §5).
-    fn chase(&self, mut name: LowerName) -> Result<Found, Box<Stopped>> {
+    /// (RFC 2181 §5). With the answer, the name the chain went past the
+    /// zone at, out of it or to a referral, and the chain up to there.
+    fn chase(
+        &self,
+        mut name: LowerName,
+    ) -> Result<(Found, Option<(LowerName, Found)>), Box<Stopped>> {
         let mut seen = Vec::new();
         let mut answer = Vec::new();
         let mut proofs = Vec::new();
+        let chain = |answer: &[RecordSet], proofs: &[RecordSet]| Found {
+            answer: unique(answer.iter().cloned()),
+            authority: unique(proofs.iter().cloned()),
+            ..Found::new(ResponseCode::NoError, true)
+        };
         loop {
             let step = self.step(&name).map_err(|unknown| {
                 Box::new(Stopped {
@@ -320,11 +369,14 @@ impl<'v> Walk<'v> {
             })?;
             match step {
                 Out::Done(mut found) => {
+                    let referred = !found.aa && found.rcode == ResponseCode::NoError;
+                    let onward =
+                        (referred && !answer.is_empty()).then(|| (name, chain(&answer, &proofs)));
                     found.aa |= !answer.is_empty();
                     answer.append(&mut found.answer);
                     found.answer = unique(answer.into_iter());
                     found.authority = unique(found.authority.into_iter().chain(proofs));
-                    return Ok(found);
+                    return Ok((found, onward));
                 }
                 Out::Restart {
                     answer: mut more,
@@ -334,12 +386,12 @@ impl<'v> Walk<'v> {
                     answer.append(&mut more);
                     proofs.extend(proof);
                     let looped = target == name || seen.contains(&target);
-                    if looped || !self.view.apex().zone_of(&target) {
-                        return Ok(Found {
-                            answer: unique(answer.into_iter()),
-                            authority: unique(proofs.into_iter()),
-                            ..Found::new(ResponseCode::NoError, true)
-                        });
+                    if looped {
+                        return Ok((chain(&answer, &proofs), None));
+                    }
+                    if !self.view.apex().zone_of(&target) {
+                        let found = chain(&answer, &proofs);
+                        return Ok((found.clone(), Some((target, found))));
                     }
                     seen.push(std::mem::replace(&mut name, target));
                 }

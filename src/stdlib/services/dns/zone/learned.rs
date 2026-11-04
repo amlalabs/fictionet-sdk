@@ -76,9 +76,13 @@ use super::zone::{Node, dname_target, targets, wildcard};
 ///   (RFC 4035 §3.1.4). It shows that the server holds no zone at the
 ///   name it referred or above it, below the cut. A referral for an NSEC
 ///   question at the cut shows that the parent holds no NSEC RRset there.
-/// - Any other response, such as REFUSED, SERVFAIL, an answer without
-///   AA, or a truncated response (TC set), whose sections may be
-///   incomplete (RFC 2181 §9), gives nothing.
+/// - An error RCODE other than REFUSED, such as FORMERR for a meta-type
+///   or SERVFAIL for a CNAME loop, gives no records, only that the server
+///   answers the question with that RCODE ([`failed`](Learned::failed)):
+///   a server may answer so, and must answer (RFC 8906 §3.1).
+/// - Any other response, such as REFUSED, an answer without AA, or a
+///   truncated response (TC set), whose sections may be incomplete
+///   (RFC 2181 §9), gives nothing.
 ///
 /// TTLs are kept as sent, since an authoritative TTL does not count down,
 /// and RRSIGs as they came: copied records are never signed again, so a
@@ -110,10 +114,12 @@ use super::zone::{Node, dname_target, targets, wildcard};
 /// `root-servers.net` below `net`, and a real server answers from the
 /// deepest zone it holds (RFC 1034 §4.3.2). So the data is viewed as one
 /// server answers it ([`at`](Learned::at)). A cut refers a name on the
-/// chain at or below it only when a referral from that server was filed
-/// for that name or a name below it; a referral for one name says
-/// nothing of the zones its server holds under the cut at other names,
-/// nor of the zones other servers hold. An authoritative answer shows the
+/// chain at or below it only when a referral from that server to that
+/// cut was filed for that name or a name below it. A referral for one
+/// name says nothing of other cuts, of the zones its server holds under
+/// the cut at other names, or of the zones other servers hold. A
+/// referral to a cut below a cut the data holds comes from a zone below
+/// that cut, which its server also serves. An authoritative answer shows the
 /// zone it comes from with the zone's SOA or apex NS RRset in its
 /// authority section, with the zone's signature on its answer
 /// (RFC 4034 §3.1.7), or by being for the apex or a name the zone holds
@@ -175,14 +181,17 @@ struct Facts {
     absent: BTreeSet<LowerName>,
     /// The names below a cut a filed referral was for, the question's
     /// name or the name its chain ended at, each with the servers that
-    /// sent such a referral.
-    referred: BTreeMap<LowerName, BTreeSet<IpAddr>>,
+    /// sent such a referral and the cut each referred it to.
+    referred: BTreeMap<LowerName, BTreeSet<(IpAddr, LowerName)>>,
     /// The names whose answer RRsets came only from responses that did
     /// not show which zone they were answered from, each with the servers
     /// that sent them.
     scoped: BTreeMap<LowerName, BTreeSet<IpAddr>>,
     /// The questions a whole response was filed for, by name and type.
     answered: HashSet<(LowerName, RecordType)>,
+    /// The questions a server answered with an error RCODE that gives no
+    /// facts, by server, name, and type, with that RCODE.
+    failed: HashMap<(IpAddr, LowerName, RecordType), ResponseCode>,
     /// The denial records that came with each negative, by what they prove.
     proofs: HashMap<(LowerName, Denied), Vec<RecordSet>>,
     /// The answers to ANY and RRSIG questions, by name and type.
@@ -292,11 +301,17 @@ impl Learned {
     /// which is the zone that holds them (RFC 4034 §3.1.7). A server that
     /// also serves a child zone answers that way for the child's names,
     /// and never with a referral to it.
+    ///
+    /// For a referral (AA clear, NOERROR, no answer), the deepest cut this
+    /// zone holds strictly above the cut it refers to: only a zone below
+    /// that cut holds the deeper cut's NS RRset (RFC 1034 §4.2.1), so the
+    /// server serves one there, and refers from it (RFC 1034 §4.3.2
+    /// step 3b).
     pub fn child_answering(&self, question: &Query, response: &Message) -> Option<LowerName> {
-        if !response.metadata.authoritative {
-            return None;
-        }
         let qname = LowerName::new(question.name());
+        if !response.metadata.authoritative {
+            return self.child_referring(&qname, response);
+        }
         let below = |owner: &LowerName| *owner != self.apex && self.apex.zone_of(owner);
         let owner = |rtype: RecordType| {
             response.authorities.iter().find_map(|record| {
@@ -323,6 +338,42 @@ impl Learned {
             .or(signer)
     }
 
+    /// The deepest cut this zone holds strictly above the cut `response`,
+    /// a referral for `qname`, refers to, as
+    /// [`child_answering`](Learned::child_answering) says.
+    fn child_referring(&self, qname: &LowerName, response: &Message) -> Option<LowerName> {
+        let metadata = &response.metadata;
+        if metadata.response_code != ResponseCode::NoError
+            || metadata.truncation
+            || !response.answers.is_empty()
+        {
+            return None;
+        }
+        let referred = response.authorities.iter().find_map(|record| {
+            let owner = LowerName::new(&record.name);
+            (record.record_type() == RecordType::NS
+                && record.dns_class == DNSClass::IN
+                && owner != self.apex
+                && self.apex.zone_of(&owner)
+                && owner.zone_of(qname))
+            .then_some(owner)
+        })?;
+        let held = self.held.lock();
+        let mut at = referred;
+        while at != self.apex {
+            at = at.base_name();
+            if held
+                .facts
+                .names
+                .get(&at)
+                .is_some_and(|known| known.cut.is_some())
+            {
+                return Some(at);
+            }
+        }
+        None
+    }
+
     /// Whether a whole response to `question` was filed this session,
     /// whatever it gave.
     pub fn answered(&self, question: &Query) -> bool {
@@ -332,6 +383,17 @@ impl Learned {
             .facts
             .answered
             .contains(&(qname, question.query_type()))
+    }
+
+    /// The error RCODE `server` answered `question` with this session,
+    /// when it answered with one that gives no facts.
+    pub fn failed(&self, server: IpAddr, question: &Query) -> Option<ResponseCode> {
+        let key = (
+            server,
+            LowerName::new(question.name()),
+            question.query_type(),
+        );
+        self.held.lock().facts.failed.get(&key).copied()
     }
 
     /// Whether the answer to `question` lies below a cut the zone holds,
@@ -424,6 +486,7 @@ impl Facts {
             referred: BTreeMap::new(),
             scoped: BTreeMap::new(),
             answered: HashSet::new(),
+            failed: HashMap::new(),
             proofs: HashMap::new(),
             whole: BTreeMap::new(),
             negative_soa: None,
@@ -491,6 +554,19 @@ impl Facts {
                     denial: &denial,
                 };
                 self.file_cut(&referral, kept)
+            }
+            (_, rcode)
+                if !matches!(
+                    rcode,
+                    ResponseCode::NoError
+                        | ResponseCode::NXDomain
+                        | ResponseCode::YXDomain
+                        | ResponseCode::Refused
+                ) =>
+            {
+                self.failed
+                    .insert((server, qname, question.query_type()), rcode);
+                false
             }
             _ => false,
         }
@@ -730,7 +806,7 @@ impl Facts {
         self.referred
             .entry(name.clone())
             .or_default()
-            .insert(server);
+            .insert((server, cut.clone()));
         kept.push((Section::Authority, ns.clone()));
         kept.extend(glue.iter().map(|set| (Section::Additional, set.clone())));
         kept.extend(ds.iter().map(|set| (Section::Authority, set.clone())));
@@ -875,15 +951,18 @@ impl Facts {
         self.absent.insert(name.clone());
     }
 
-    /// Whether a referral from `server` was filed for `name` or a name
-    /// below it, which shows that the server holds no zone at `name`, nor
-    /// between it and the cut. Another server may hold one there.
-    fn refers(&self, name: &LowerName, server: IpAddr) -> bool {
+    /// Whether a referral from `server` to the cut at `cut` was filed for
+    /// `name` or a name below it, which shows that the server holds no
+    /// zone at `name`, nor between it and that cut. Another server may
+    /// hold one there, and a referral to another cut says nothing of this
+    /// one: a server that serves a zone below `cut` refers from there.
+    fn refers(&self, name: &LowerName, server: IpAddr, cut: &LowerName) -> bool {
         // Names below `name` follow it directly in canonical order.
+        let referral = (server, cut.clone());
         self.referred
             .range(name.clone()..)
             .take_while(|(held, _)| name.zone_of(held))
-            .any(|(_, servers)| servers.contains(&server))
+            .any(|(_, referrals)| referrals.contains(&referral))
     }
 
     /// Notes that the answer RRsets at `name` stand only for `scope`'s
@@ -1256,7 +1335,8 @@ impl LearnedView {
     /// so a question for them there stands once the zone holds an RRset
     /// of the type or knows there is none. A name of the chain at or
     /// below the cut is referred only when the view's server's referral
-    /// was filed for it or a name below it ([`Facts::refers`]).
+    /// to this cut was filed for it or a name below it
+    /// ([`Facts::refers`]).
     fn cut<'a>(&self, name: &LowerName, known: &'a Known) -> Fact<&'a Node> {
         let parents = matches!(self.qtype, RecordType::DS | RecordType::NSEC);
         if parents && self.chain.contains(name) {
@@ -1271,7 +1351,7 @@ impl LearnedView {
         let unreferred = self
             .chain
             .iter()
-            .any(|reached| name.zone_of(reached) && !self.facts.refers(reached, self.server));
+            .any(|reached| name.zone_of(reached) && !self.facts.refers(reached, self.server, name));
         if unreferred {
             Fact::Unknown
         } else {

@@ -44,7 +44,7 @@ pub mod special;
 #[allow(clippy::module_inception)]
 mod zone;
 
-pub use answer::{Answered, AnyResponse, answer};
+pub use answer::{Answered, AnyResponse, Onward, answer, answer_onward};
 pub use apex::EmptyApex;
 pub use chain::{ChainProblem, check_chain};
 pub use cover::cover;

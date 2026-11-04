@@ -195,11 +195,7 @@ impl Place {
         // BIND serves each of its names with text as a zone with an SOA
         // and an NS record, and G runs it too.
         let zones = |identity: Identity| Identity {
-            zones: identity
-                .zones
-                .into_iter()
-                .map(|(name, zone)| (name, bind::chaos_zone(zone)))
-                .collect(),
+            zones: identity.zones.into_iter().map(bind::chaos_zone).collect(),
             ..identity
         };
         // C, I, and M also serve `authors.bind`, a zone with no TXT.
