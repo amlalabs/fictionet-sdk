@@ -13,13 +13,144 @@
 //! and [MPTCP options](https://github.com/torvalds/linux/blob/v6.12/net/mptcp/options.c).
 
 use fictionet::Cx;
+use fictionet::stdlib::network::ip::{Ipv4Option, Ipv4Reply};
 use fictionet::stdlib::network::tcp::{
     self, CookieInput, CookieReply, CookieState, SynCookies, TcpOption,
 };
 use siphasher::sip::SipHasher24;
 use std::hash::Hasher;
 use std::net::IpAddr;
+use std::net::Ipv4Addr;
 use std::time::Duration;
+
+/// IPv4 reply options following Linux receive compilation, option echo and build.
+///
+/// The input is the options as received, before local RR and Timestamp updates.
+/// `timestamp` is milliseconds since midnight UTC. `is_unicast` supplies the
+/// world's route classification: local, broadcast and multicast addresses must
+/// return false, just as Linux's `inet_addr_type` does for those routes.
+/// Invalid or duplicate route and timestamp options cannot produce a reply.
+/// Unknown options are not echoed. Source routes return their first hop
+/// separately; TCP's checksum still uses the original peer address.
+///
+/// See [Linux option handling](https://github.com/torvalds/linux/blob/v6.12/net/ipv4/ip_options.c),
+/// [IPv4 options](https://www.rfc-editor.org/rfc/rfc791.html#section-3.1), and
+/// [source routes](https://www.rfc-editor.org/rfc/rfc1812.html#section-5.2.4.1).
+pub fn ipv4_options(
+    options: &[Ipv4Option],
+    local: Ipv4Addr,
+    remote: Ipv4Addr,
+    timestamp: u32,
+    is_unicast: impl Fn(Ipv4Addr) -> bool,
+) -> Option<Ipv4Reply> {
+    let mut rr = None;
+    let mut ts = None;
+    let mut sr = None;
+    for option in options {
+        let slot = match option {
+            Ipv4Option::EndOfList => break,
+            Ipv4Option::Malformed { .. } => return None,
+            Ipv4Option::RecordRoute { .. } => &mut rr,
+            Ipv4Option::Timestamp { .. } => &mut ts,
+            Ipv4Option::LooseSourceRoute { .. } | Ipv4Option::StrictSourceRoute { .. } => &mut sr,
+            _ => continue,
+        };
+        if slot.replace(option.clone()).is_some() {
+            return None;
+        }
+    }
+    let mut reply = Ipv4Reply::default();
+    for option in [rr, ts].into_iter().flatten() {
+        let mut bytes = fictionet::stdlib::network::ip::encode_ipv4_options(&[option]).ok()?;
+        let len = usize::from(bytes[1]);
+        bytes.truncate(len);
+        let mut pointer = usize::from(bytes[2]);
+        let flags = if bytes[0] == 68 { bytes[3] & 15 } else { 0 };
+        if pointer > len && bytes[0] == 68 && flags != 3 {
+            let overflow = bytes[3] >> 4;
+            if overflow == 15 {
+                return None;
+            }
+            bytes[3] += 16;
+        }
+        // Compile the receive option, then reserve and fill the reply slot.
+        for _ in 0..2 {
+            if pointer > len {
+                break;
+            }
+            if pointer + 3 > len {
+                return None;
+            }
+            let offset = pointer - 1;
+            let advance = if bytes[0] == 7 {
+                bytes[offset..offset + 4].copy_from_slice(&local.octets());
+                4
+            } else {
+                match flags {
+                    0 => {
+                        bytes[offset..offset + 4].copy_from_slice(&timestamp.to_be_bytes());
+                        4
+                    }
+                    1 | 3 => {
+                        if pointer + 7 > len {
+                            // Echo may leave a prespecified trailing partial slot untouched.
+                            if flags == 3 && pointer != usize::from(bytes[2]) {
+                                break;
+                            }
+                            return None;
+                        }
+                        if flags == 3 {
+                            let address = Ipv4Addr::from(
+                                <[u8; 4]>::try_from(&bytes[offset..offset + 4]).ok()?,
+                            );
+                            if is_unicast(address) {
+                                break;
+                            }
+                        } else {
+                            bytes[offset..offset + 4].copy_from_slice(&local.octets());
+                        }
+                        bytes[offset + 4..offset + 8].copy_from_slice(&timestamp.to_be_bytes());
+                        8
+                    }
+                    _ => break,
+                }
+            };
+            pointer += advance;
+        }
+        bytes[2] = pointer as u8;
+        reply
+            .options
+            .push(fictionet::stdlib::network::ip::Ipv4Options::new(&bytes).next()?);
+    }
+    if let Some(route) = sr {
+        let bytes = fictionet::stdlib::network::ip::encode_ipv4_options(&[route]).ok()?;
+        let len = usize::from(bytes[1]);
+        let mut offset = usize::from(bytes[2]).min(len + 1) - 4;
+        if offset > 3 {
+            let first = Ipv4Addr::from(<[u8; 4]>::try_from(&bytes[offset - 1..offset + 3]).ok()?);
+            let mut reversed = Vec::new();
+            offset -= 4;
+            while offset > 3 {
+                reversed.extend_from_slice(&bytes[offset - 1..offset + 3]);
+                offset -= 4;
+            }
+            if bytes[offset + 3..offset + 7] == remote.octets() {
+                if reversed.is_empty() {
+                    return Some(reply);
+                }
+                reversed.truncate(reversed.len() - 4);
+            }
+            reversed.extend_from_slice(&remote.octets());
+            let mut result = vec![bytes[0], (3 + reversed.len()) as u8, 4];
+            result.extend(reversed);
+            reply.destination = Some(first);
+            reply
+                .options
+                .push(fictionet::stdlib::network::ip::Ipv4Options::new(&result).next()?);
+        }
+    }
+    Some(reply)
+}
 
 /// TCP settings for a Linux server with the default Ethernet window.
 pub fn tcp() -> tcp::Options {

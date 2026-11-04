@@ -5,6 +5,189 @@ use fictionet_extras::linux::{self, Cookies};
 use std::net::SocketAddr;
 use std::time::Duration;
 
+fn ipv4_reply(bytes: &[u8]) -> Option<ip::Ipv4Reply> {
+    let local = "203.0.113.10".parse().unwrap();
+    linux::ipv4_options(
+        &ip::Ipv4Options::new(bytes).collect::<Vec<_>>(),
+        local,
+        "192.0.2.1".parse().unwrap(),
+        0x01020304,
+        |address| address != local && !address.is_broadcast() && !address.is_multicast(),
+    )
+}
+
+fn echoed(bytes: &[u8]) -> Option<Vec<u8>> {
+    ipv4_reply(bytes).map(|reply| ip::encode_ipv4_options(&reply.options).unwrap())
+}
+
+#[test]
+fn ipv4_record_route_records_receive_and_reply_addresses() {
+    assert_eq!(
+        echoed(&[7, 11, 4, 0, 0, 0, 0, 0, 0, 0, 0]),
+        Some(vec![7, 11, 12, 203, 0, 113, 10, 203, 0, 113, 10])
+    );
+    assert_eq!(
+        echoed(&[7, 7, 4, 0, 0, 0, 0]),
+        Some(vec![7, 7, 8, 203, 0, 113, 10])
+    );
+    assert_eq!(
+        echoed(&[7, 7, 8, 192, 0, 2, 9]),
+        Some(vec![7, 7, 8, 192, 0, 2, 9])
+    );
+    assert_eq!(
+        echoed(&[7, 15, 5, 99, 0, 0, 0, 0, 0, 0, 0, 0, 88, 77, 66]),
+        Some(vec![
+            7, 15, 13, 99, 203, 0, 113, 10, 203, 0, 113, 10, 88, 77, 66
+        ])
+    );
+    assert_eq!(echoed(&[7, 7, 5, 0, 0, 0, 0]), None);
+}
+
+#[test]
+fn ipv4_timestamps_record_receive_and_reply_and_preserve_unaligned_pointers() {
+    assert_eq!(
+        echoed(&[68, 12, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+        Some(vec![68, 12, 13, 0, 1, 2, 3, 4, 1, 2, 3, 4])
+    );
+    assert_eq!(
+        echoed(&[68, 16, 6, 0, 99, 0, 0, 0, 0, 0, 0, 0, 0, 88, 77, 66]),
+        Some(vec![68, 16, 14, 0, 99, 1, 2, 3, 4, 1, 2, 3, 4, 88, 77, 66])
+    );
+    assert_eq!(
+        echoed(&[68, 20, 5, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+        Some(vec![
+            68, 20, 21, 1, 203, 0, 113, 10, 1, 2, 3, 4, 203, 0, 113, 10, 1, 2, 3, 4
+        ])
+    );
+    assert_eq!(echoed(&[68, 12, 6, 1, 0, 0, 0, 0, 0, 0, 0, 0]), None);
+    assert_eq!(
+        echoed(&[
+            68, 28, 6, 1, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 8, 8, 8, 8, 8, 8
+        ]),
+        Some(vec![
+            68, 28, 22, 1, 99, 203, 0, 113, 10, 1, 2, 3, 4, 203, 0, 113, 10, 1, 2, 3, 4, 8, 8, 8,
+            8, 8, 8, 8
+        ])
+    );
+    assert_eq!(
+        echoed(&[
+            68, 28, 9, 3, 9, 9, 9, 9, 203, 0, 113, 10, 0, 0, 0, 0, 203, 0, 113, 10, 0, 0, 0, 0, 8,
+            8, 8, 8
+        ]),
+        Some(vec![
+            68, 28, 25, 3, 9, 9, 9, 9, 203, 0, 113, 10, 1, 2, 3, 4, 203, 0, 113, 10, 1, 2, 3, 4, 8,
+            8, 8, 8
+        ])
+    );
+}
+
+#[test]
+fn ipv4_prespecified_timestamps_use_route_classification() {
+    for address in [[203, 0, 113, 10], [255, 255, 255, 255], [224, 0, 0, 1]] {
+        let mut input = vec![68, 20, 5, 3];
+        input.extend(address);
+        input.extend([0; 4]);
+        input.extend(address);
+        input.extend([0; 4]);
+        let mut expected = vec![68, 20, 21, 3];
+        expected.extend(address);
+        expected.extend([1, 2, 3, 4]);
+        expected.extend(address);
+        expected.extend([1, 2, 3, 4]);
+        assert_eq!(echoed(&input), Some(expected));
+    }
+    let unicast = [
+        68, 20, 5, 3, 192, 0, 2, 9, 0, 0, 0, 0, 203, 0, 113, 10, 0, 0, 0, 0,
+    ];
+    assert_eq!(echoed(&unicast), Some(unicast.to_vec()));
+    assert_eq!(
+        echoed(&[
+            68, 20, 5, 3, 203, 0, 113, 10, 0, 0, 0, 0, 192, 0, 2, 9, 0, 0, 0, 0
+        ]),
+        Some(vec![
+            68, 20, 13, 3, 203, 0, 113, 10, 1, 2, 3, 4, 192, 0, 2, 9, 0, 0, 0, 0
+        ])
+    );
+}
+
+#[test]
+fn ipv4_timestamp_overflow_and_unknown_flags_follow_receive_rules() {
+    for flags in 0..16 {
+        let expected = if flags == 3 { 0xe3 } else { 0xf0 | flags };
+        assert_eq!(
+            echoed(&[68, 4, 5, 0xe0 | flags]),
+            Some(vec![68, 4, 5, expected])
+        );
+        assert_eq!(
+            echoed(&[68, 4, 255, 0xf0 | flags]),
+            (flags == 3).then(|| vec![68, 4, 255, 0xf3])
+        );
+        if ![0, 1, 3].contains(&flags) {
+            let input = [68, 8, 5, flags, 1, 2, 3, 4];
+            assert_eq!(echoed(&input), Some(input.to_vec()));
+            assert_eq!(echoed(&[68, 7, 5, flags, 1, 2, 3]), None);
+        }
+    }
+    assert_eq!(
+        echoed(&[68, 8, 5, 0xf0, 0, 0, 0, 0]),
+        Some(vec![68, 8, 9, 0xf0, 1, 2, 3, 4])
+    );
+}
+
+#[test]
+fn ipv4_source_routes_reverse_consumed_hops_and_remove_duplicate_source() {
+    for kind in [131, 137] {
+        for pointer in [16, 255] {
+            let reply =
+                ipv4_reply(&[kind, 15, pointer, 192, 0, 2, 5, 192, 0, 2, 6, 192, 0, 2, 7]).unwrap();
+            assert_eq!(reply.destination, Some("192.0.2.7".parse().unwrap()));
+            assert_eq!(
+                ip::encode_ipv4_options(&reply.options).unwrap(),
+                [kind, 15, 4, 192, 0, 2, 6, 192, 0, 2, 5, 192, 0, 2, 1]
+            );
+        }
+        let reply = ipv4_reply(&[kind, 15, 16, 192, 0, 2, 1, 192, 0, 2, 6, 192, 0, 2, 7]).unwrap();
+        assert_eq!(reply.destination, Some("192.0.2.7".parse().unwrap()));
+        assert_eq!(
+            ip::encode_ipv4_options(&reply.options).unwrap(),
+            [kind, 11, 4, 192, 0, 2, 6, 192, 0, 2, 1]
+        );
+        assert_eq!(
+            ipv4_reply(&[kind, 7, 8, 192, 0, 2, 1]).unwrap(),
+            ip::Ipv4Reply::default()
+        );
+        assert_eq!(
+            ipv4_reply(&[kind, 7, 4, 192, 0, 2, 1]).unwrap(),
+            ip::Ipv4Reply::default()
+        );
+        let reply = ipv4_reply(&[kind, 11, 8, 192, 0, 2, 6, 192, 0, 2, 7]).unwrap();
+        assert_eq!(reply.destination, Some("192.0.2.6".parse().unwrap()));
+        assert_eq!(
+            ip::encode_ipv4_options(&reply.options).unwrap(),
+            [kind, 7, 4, 192, 0, 2, 1]
+        );
+    }
+}
+
+#[test]
+fn ipv4_invalid_and_duplicate_options_cannot_produce_a_reply() {
+    for input in [
+        &[7, 3, 3][..],
+        &[68, 4, 4, 0],
+        &[7, 9, 4, 0],
+        &[7, 3, 4, 7, 3, 4],
+        &[68, 4, 5, 0, 68, 4, 5, 3],
+        &[131, 3, 4, 137, 3, 4],
+    ] {
+        assert_eq!(echoed(input), None, "{input:?}");
+    }
+    assert_eq!(echoed(&[1, 222, 4, 12, 13, 0, 7, 3, 3]), Some(vec![]));
+    assert_eq!(
+        echoed(&[68, 4, 5, 0, 7, 3, 4]),
+        Some(vec![7, 3, 4, 68, 4, 5, 16])
+    );
+}
+
 fn packet(
     from: SocketAddr,
     to: SocketAddr,
