@@ -774,14 +774,17 @@ impl Answer for Answers {
         let (key, level) = match complete(handshake) {
             Completion::Mptcp(n) => (
                 n.keys.local,
-                Some(DataLevel::new(
-                    n.keys.local,
-                    n.keys.remote,
-                    handshake.iss,
-                    handshake.irs,
-                    n.checksums,
-                    n.first,
-                )),
+                Some(
+                    DataLevel::new(
+                        n.keys.local,
+                        n.keys.remote,
+                        handshake.iss,
+                        handshake.irs,
+                        n.checksums,
+                        n.first,
+                    )
+                    .ack_width(fictionet_extras::linux::mptcp_ack_width()),
+                ),
             ),
             Completion::Join(Some(join)) => (self.tokens.keys(join.token)?.local, None),
             _ => return None,

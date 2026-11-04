@@ -17,6 +17,10 @@ fn tcp_not_accepted() {
         sack_permitted: false,
         sack_ranges: [None, None, None],
         extra: &[],
+        layout: crate::wire::OptionLayout {
+            order: crate::wire::OptionOrder::WindowBeforeSack,
+            align: false,
+        },
         timestamp: None,
         payload: &[],
     };
@@ -62,6 +66,10 @@ fn tcp_not_accepted() {
                 sack_permitted: false,
                 sack_ranges: [None, None, None],
                 extra: &[],
+                layout: crate::wire::OptionLayout {
+                    order: crate::wire::OptionOrder::WindowBeforeSack,
+                    align: false
+                },
                 timestamp: None,
                 payload: &[],
             }
@@ -115,6 +123,10 @@ fn tcp_listen_drops_unspecified_src() {
         sack_permitted: false,
         sack_ranges: [None, None, None],
         extra: &[],
+        layout: crate::wire::OptionLayout {
+            order: crate::wire::OptionOrder::WindowBeforeSack,
+            align: false,
+        },
         timestamp: None,
         payload: &[],
     };
@@ -158,6 +170,10 @@ fn syn_bytes(ip: IpRepr) -> std::vec::Vec<u8> {
         sack_permitted: false,
         sack_ranges: [None; 3],
         extra: &[],
+        layout: crate::wire::OptionLayout {
+            order: crate::wire::OptionOrder::WindowBeforeSack,
+            align: false,
+        },
         timestamp: None,
         payload: &[],
     };

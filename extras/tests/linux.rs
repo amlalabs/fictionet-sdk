@@ -1,0 +1,316 @@
+use fictionet::stdlib::network::ip::{self, Header, transport_checksum};
+use fictionet::stdlib::network::tcp::{self, CookieInput, SynCookies, TcpOption};
+use fictionet::{Cx, End, Interface, InterfaceExt, Packet, Seed, block_on, lab, pair};
+use fictionet_extras::linux::{self, Cookies};
+use std::net::SocketAddr;
+use std::time::Duration;
+
+fn packet(
+    from: SocketAddr,
+    to: SocketAddr,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    options: &[u8],
+) -> Packet {
+    let size = 20 + options.len().div_ceil(4) * 4;
+    let mut tcp = vec![0; size];
+    tcp[..2].copy_from_slice(&from.port().to_be_bytes());
+    tcp[2..4].copy_from_slice(&to.port().to_be_bytes());
+    tcp[4..8].copy_from_slice(&seq.to_be_bytes());
+    tcp[8..12].copy_from_slice(&ack.to_be_bytes());
+    tcp[12] = (size / 4) as u8 * 16;
+    tcp[13] = flags;
+    tcp[14..16].copy_from_slice(&4096u16.to_be_bytes());
+    tcp[20..20 + options.len()].copy_from_slice(options);
+    let sum = transport_checksum(from.ip(), to.ip(), 6, &tcp);
+    tcp[16..18].copy_from_slice(&sum.to_be_bytes());
+    ip::packet(from.ip(), to.ip(), 6, &tcp)
+}
+
+async fn receive(raw: &mut End, cx: &Cx) -> Vec<u8> {
+    let p = cx
+        .race(Some(cx.now() + Duration::from_secs(1)), raw.recv(cx))
+        .await
+        .unwrap()
+        .unwrap();
+    Header::parse_whole(&p.0).unwrap().payload(&p.0).to_vec()
+}
+
+fn sequence(t: &[u8]) -> u32 {
+    u32::from_be_bytes(t[4..8].try_into().unwrap())
+}
+
+fn timestamp(t: &[u8]) -> u32 {
+    tcp::options(t)
+        .unwrap()
+        .iter()
+        .find_map(|o| match o {
+            TcpOption::Timestamps { tsval, .. } => Some(*tsval),
+            _ => None,
+        })
+        .unwrap()
+}
+
+#[test]
+fn syn_ack_bytes_offsets_and_repeated_syn() {
+    block_on(lab(Seed::from_u64(7), |cx| async move {
+        let (mut raw, side) = pair();
+        let local: SocketAddr = "10.0.0.1:80".parse()?;
+        let peer: SocketAddr = "10.0.0.2:1000".parse()?;
+        let server = tcp::endpoint_with(&cx, side, local.ip(), linux::tcp());
+        let mut listener = server.listen(80)?;
+        let options = [
+            2, 4, 5, 180, 4, 2, 8, 10, 1, 2, 3, 4, 0, 0, 0, 0, 1, 3, 3, 7,
+        ];
+        let syn = packet(peer, local, 100, 0, 2, &options);
+        raw.send(syn.clone());
+        let first = receive(&mut raw, &cx).await;
+        assert_eq!(first[13], 0x12);
+        assert_eq!(&first[14..16], &65160u16.to_be_bytes());
+        assert_eq!(&first[20..28], &[2, 4, 5, 180, 4, 2, 8, 10]);
+        assert_eq!(&first[32..40], &[1, 2, 3, 4, 1, 3, 3, 7]);
+        let ts = timestamp(&first);
+        assert_ne!(ts, 0);
+        raw.send(syn);
+        let repeat = receive(&mut raw, &cx).await;
+        assert_eq!(repeat, first);
+        raw.send(packet(
+            SocketAddr::new(peer.ip(), 1001),
+            local,
+            100,
+            0,
+            2,
+            &options,
+        ));
+        let second = receive(&mut raw, &cx).await;
+        assert_ne!(timestamp(&second), ts);
+        raw.send(packet(
+            SocketAddr::new(peer.ip(), 1002),
+            local,
+            100,
+            0,
+            2,
+            &[2, 4, 5, 180, 4, 2, 3, 3, 7],
+        ));
+        let plain = receive(&mut raw, &cx).await;
+        assert_eq!(&plain[14..16], &64240u16.to_be_bytes());
+        assert_eq!(&plain[20..32], &[2, 4, 5, 180, 1, 1, 4, 2, 1, 3, 3, 7]);
+        let mut echo = vec![1, 1, 8, 10];
+        echo.extend_from_slice(&0x0102_0305u32.to_be_bytes());
+        echo.extend_from_slice(&ts.to_be_bytes());
+        let next = sequence(&first).wrapping_add(1);
+        raw.send(packet(peer, local, 101, next, 16, &echo));
+        let _connection = listener.accept(&cx).await?;
+        let out_of_order = packet(peer, local, 102, next, 16, &echo);
+        let mut tcp = Header::parse_whole(&out_of_order.0)
+            .unwrap()
+            .payload(&out_of_order.0)
+            .to_vec();
+        tcp.extend_from_slice(b"hello");
+        tcp[16..18].fill(0);
+        let sum = transport_checksum(peer.ip(), local.ip(), 6, &tcp);
+        tcp[16..18].copy_from_slice(&sum.to_be_bytes());
+        raw.send(ip::packet(peer.ip(), local.ip(), 6, &tcp));
+        let sack = receive(&mut raw, &cx).await;
+        assert_eq!(&sack[20..24], &[1, 1, 8, 10]);
+        assert_eq!(&sack[32..44], &[1, 1, 5, 10, 0, 0, 0, 102, 0, 0, 0, 107]);
+        cx.cancel();
+        Ok(())
+    }))
+    .unwrap();
+}
+
+#[test]
+fn cookie_encoding_keeps_options_and_authenticates_the_attempt() {
+    for (local, remote, mss) in [
+        ("10.0.0.1:80", "10.0.0.2:1000", 1460),
+        ("[2001:db8::1]:80", "[2001:db8::2]:1000", 1440),
+    ] {
+        for scale in [None, Some(0), Some(7), Some(14)] {
+            for sack in [false, true] {
+                for timestamps in [false, true] {
+                    let mut options = vec![TcpOption::MaxSegmentSize(mss)];
+                    if let Some(scale) = scale {
+                        options.push(TcpOption::WindowScale(scale));
+                    }
+                    if sack {
+                        options.push(TcpOption::SackPermitted);
+                    }
+                    if timestamps {
+                        options.push(TcpOption::Timestamps {
+                            tsval: 1234,
+                            tsecr: 0,
+                        });
+                    }
+                    let key = [42; 32];
+                    let mut input = CookieInput {
+                        key: &key,
+                        local: local.parse().unwrap(),
+                        remote: remote.parse().unwrap(),
+                        sequence: u32::MAX,
+                        now: Duration::from_secs(59),
+                        options: &options,
+                        ecn: true,
+                    };
+                    let issued = Cookies.issue(&input);
+                    let cookie = issued.sequence;
+                    let sent = issued.options;
+                    assert_eq!(issued.ecn, timestamps);
+                    let ack: Vec<_> = sent
+                        .iter()
+                        .filter_map(|o| match o {
+                            TcpOption::Timestamps { tsval, .. } => Some(TcpOption::Timestamps {
+                                tsval: 1235,
+                                tsecr: *tsval,
+                            }),
+                            _ => None,
+                        })
+                        .collect();
+                    input.options = &ack;
+                    let kept = Cookies.validate(&input, cookie).unwrap();
+                    assert_eq!(kept.mss, mss);
+                    assert_eq!(kept.scale, if timestamps { scale } else { None });
+                    assert_eq!(kept.sack, timestamps && sack);
+                    assert_eq!(kept.ecn, timestamps);
+                    assert_eq!(kept.timestamp.is_some(), timestamps);
+                    input.now = Duration::from_secs(119);
+                    assert!(Cookies.validate(&input, cookie).is_some());
+                    input.now = Duration::from_secs(120);
+                    assert!(Cookies.validate(&input, cookie).is_none());
+                    input.now = Duration::from_secs(59);
+                    input.remote.set_port(1001);
+                    assert!(Cookies.validate(&input, cookie).is_none());
+                    input.remote.set_port(1000);
+                    // The additive cookie format permits a small sequence change
+                    // to select a smaller MSS index, exactly as the kernel does.
+                    input.sequence = 1;
+                    assert_eq!(
+                        Cookies.validate(&input, cookie).unwrap().mss,
+                        if input.local.is_ipv6() { 1220 } else { 1300 }
+                    );
+                    input.sequence = 1 << 20;
+                    assert!(Cookies.validate(&input, cookie).is_none());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn cookie_connection_restores_timestamp_and_window_scale() {
+    block_on(lab(Seed::from_u64(11), |cx| async move {
+        let (mut raw, side) = pair();
+        let local: SocketAddr = "10.0.0.1:80".parse()?;
+        let peer: SocketAddr = "10.0.0.2:1000".parse()?;
+        let server = tcp::endpoint_with(&cx, side, local.ip(), linux::tcp().backlog(1));
+        let mut listener = server.listen(80)?;
+        raw.send(packet(peer, local, 100, 0, 2, &[]));
+        receive(&mut raw, &cx).await;
+        let peer = SocketAddr::new(peer.ip(), 1001);
+        raw.send(packet(
+            peer,
+            local,
+            100,
+            0,
+            2,
+            &[
+                2, 4, 5, 180, 4, 2, 8, 10, 0, 0, 0, 9, 0, 0, 0, 0, 1, 3, 3, 7,
+            ],
+        ));
+        let syn_ack = receive(&mut raw, &cx).await;
+        let ts = timestamp(&syn_ack);
+        let mut options = vec![1, 1, 8, 10];
+        options.extend_from_slice(&10u32.to_be_bytes());
+        options.extend_from_slice(&ts.to_be_bytes());
+        raw.send(packet(
+            peer,
+            local,
+            101,
+            sequence(&syn_ack).wrapping_add(1),
+            16,
+            &options,
+        ));
+        let mut connection = listener.accept(&cx).await?;
+        assert_eq!(
+            connection.handshake().unwrap().origin,
+            tcp::HandshakeOrigin::Cookie
+        );
+        use fictionet::stdlib::network::ConnectionExt;
+        connection.write_all(&cx, b"hello").await?;
+        let data = receive(&mut raw, &cx).await;
+        assert_eq!(&data[20..24], &[1, 1, 8, 10]);
+        assert!(timestamp(&data).wrapping_sub(ts) < 64);
+        assert_eq!(&data[14..16], &2048u16.to_be_bytes());
+        cx.cancel();
+        Ok(())
+    }))
+    .unwrap();
+}
+
+#[test]
+fn mptcp_data_ack_width_matches_the_peer_mapping() {
+    use fictionet::stdlib::protocols::mptcp::{
+        DataLevel, Dss, Mapping, MptcpOption, Sequence, idsn,
+    };
+    let mut level = DataLevel::new(7, 9, 100, 200, false, None).ack_width(linux::mptcp_ack_width());
+    let dsn = idsn(9).wrapping_add(1);
+    assert_eq!(
+        level.sent(101, b"", false, Some(201)).unwrap().data_ack,
+        Some(Sequence::Short(dsn as u32))
+    );
+    for sequence in [Sequence::Long(dsn), Sequence::Short(dsn as u32)] {
+        level.received(
+            201,
+            0,
+            false,
+            [MptcpOption::Dss(Dss {
+                data_ack: None,
+                mapping: Some(Mapping {
+                    data_sequence_number: sequence,
+                    subflow_sequence_number: 1,
+                    data_level_length: 5,
+                    checksum: None,
+                }),
+                data_fin: false,
+            })],
+        );
+        assert_eq!(level.error(), None);
+        assert!(!level.fallen_back());
+        assert_eq!(
+            level.sent(101, b"", false, Some(201)).unwrap().data_ack,
+            Some(sequence)
+        );
+    }
+}
+
+#[test]
+fn time_wait_expires_after_sixty_seconds() {
+    block_on(lab(Seed::from_u64(13), |cx| async move {
+        let (mut raw, side) = pair();
+        let local: SocketAddr = "10.0.0.1:80".parse()?;
+        let peer: SocketAddr = "10.0.0.2:1000".parse()?;
+        let server = tcp::endpoint_with(&cx, side, local.ip(), linux::tcp());
+        let mut listener = server.listen(80)?;
+        raw.send(packet(peer, local, 100, 0, 2, &[]));
+        let syn_ack = receive(&mut raw, &cx).await;
+        let next = sequence(&syn_ack).wrapping_add(1);
+        raw.send(packet(peer, local, 101, next, 16, &[]));
+        drop(listener.accept(&cx).await?);
+        let fin = receive(&mut raw, &cx).await;
+        assert_eq!(fin[13] & 1, 1);
+        let fin = packet(peer, local, 101, next.wrapping_add(1), 17, &[]);
+        raw.send(fin.clone());
+        assert_eq!(receive(&mut raw, &cx).await[13], 16);
+        cx.sleep(Duration::from_secs(59)).await?;
+        raw.send(fin.clone());
+        assert_eq!(receive(&mut raw, &cx).await[13], 16);
+        // Retransmitting the FIN restarts the TIME-WAIT timer.
+        cx.sleep(Duration::from_secs(60)).await?;
+        raw.send(fin);
+        assert_eq!(receive(&mut raw, &cx).await[13], 4);
+        cx.cancel();
+        Ok(())
+    }))
+    .unwrap();
+}

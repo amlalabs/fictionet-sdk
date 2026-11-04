@@ -61,8 +61,18 @@ fn node(archive: &mut Vec<u8>, name: &str, mode: u32, bytes: &[u8], device: (u32
     }
 }
 
-fn executable(archive: &mut Vec<u8>, source: &Path, destination: &str) -> Result {
-    entry(archive, destination, 0o100755, &fs::read(source)?);
+fn executable(archive: &mut Vec<u8>, source: &Path, destination: &str, directory: &Path) -> Result {
+    // Debug sections can exhaust guest memory while the initramfs is unpacked.
+    // Keep the original binary for debugging and strip only its guest copy.
+    let stripped = directory.join("guest-executable");
+    output(
+        Command::new("objcopy")
+            .arg("--strip-debug")
+            .arg(source)
+            .arg(&stripped),
+    )?;
+    entry(archive, destination, 0o100755, &fs::read(&stripped)?);
+    fs::remove_file(stripped)?;
     let deps = output(Command::new("ldd").arg(source))?;
     for word in String::from_utf8(deps)?
         .split_whitespace()
@@ -383,9 +393,14 @@ pub fn run(directory: PathBuf) -> Result {
         entry(&mut archive, dir, 0o40755, &[]);
     }
     node(&mut archive, "dev/console", 0o020600, &[], (5, 1));
-    executable(&mut archive, &target.join("debug/rawnic-guest"), "init")?;
+    executable(
+        &mut archive,
+        &target.join("debug/rawnic-guest"),
+        "init",
+        &directory,
+    )?;
     for (index, binary) in test_binaries.iter().enumerate() {
-        executable(&mut archive, binary, &format!("tests/{index}"))?;
+        executable(&mut archive, binary, &format!("tests/{index}"), &directory)?;
     }
     let mut modules = Vec::new();
     for module in ["vfio-pci", "vfio_iommu_type1"] {

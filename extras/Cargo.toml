@@ -8,6 +8,7 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [dependencies]
+siphasher = "1"
 fictionet = { path = "..", default-features = false }
 hyper = "1"
 bytes = "1"

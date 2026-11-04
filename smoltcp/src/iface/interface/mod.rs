@@ -30,6 +30,7 @@ pub struct InterfaceInner {
     now: Instant,
     initial_seq: InitialSeq,
     ip_addr: IpAddress,
+    ignore_malformed_options: bool,
 }
 
 /// Picks the initial sequence number of a connection from its local and
@@ -55,8 +56,14 @@ impl Interface {
                 now,
                 initial_seq: config.initial_seq,
                 ip_addr: config.ip_addr,
+                ignore_malformed_options: false,
             },
         }
+    }
+
+    /// Selects whether a malformed option list retains its valid prefix.
+    pub fn set_ignore_malformed_options(&mut self, ignore: bool) {
+        self.inner.ignore_malformed_options = ignore;
     }
 
     /// Context for connecting a TCP socket.

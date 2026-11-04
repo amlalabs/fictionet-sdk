@@ -28,8 +28,8 @@ pub(crate) use self::ipv6::{
     Address as Ipv6Address, HEADER_LEN as IPV6_HEADER_LEN, Packet as Ipv6Packet, Repr as Ipv6Repr,
 };
 pub use self::tcp::{
-    OPTIONS_MAX_LEN as TCP_OPTIONS_MAX_LEN, Packet as TcpPacket, Repr as TcpRepr, TcpOption,
-    TcpOptions, TcpTimestampGenerator,
+    OPTIONS_MAX_LEN as TCP_OPTIONS_MAX_LEN, OptionLayout, OptionOrder, Packet as TcpPacket,
+    Repr as TcpRepr, TcpOption, TcpOptions, TcpTimestampGenerator,
 };
 
 pub(crate) use self::tcp::{

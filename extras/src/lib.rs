@@ -30,6 +30,7 @@
 
 pub mod args;
 pub mod hyper_io;
+pub mod linux;
 pub mod log;
 
 #[cfg(not(target_arch = "wasm32"))]

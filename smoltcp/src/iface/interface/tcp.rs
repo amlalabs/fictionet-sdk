@@ -12,7 +12,7 @@ impl InterfaceInner {
             return None;
         }
         let packet = TcpPacket::new_checked(payload).ok()?;
-        let tcp = TcpRepr::parse(&packet, &src, &dst).ok()?;
+        let tcp = TcpRepr::parse_with(&packet, &src, &dst, self.ignore_malformed_options).ok()?;
         for (_, socket) in sockets.iter_mut() {
             if socket.accepts(self, &ip, &tcp) {
                 return socket.process(self, &ip, &tcp, packet.options());

@@ -887,6 +887,16 @@ pub fn dss_checksum(
     ip::fold(ip::sum(ip::sum(0, &header), data))
 }
 
+/// Width used for outgoing data acknowledgments.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AckWidth {
+    /// Use the full data sequence number.
+    #[default]
+    Full,
+    /// Match the width of the latest peer mapping.
+    MatchMapping,
+}
+
 /// The data level of a Multipath TCP connection with one subflow, at one
 /// end, with no I/O (RFC 8684 section 3.3): the DSS each segment this end
 /// sends carries, and whether the connection has fallen back to plain TCP
@@ -895,9 +905,8 @@ pub fn dss_checksum(
 /// This end's bytes go in data sequence order as they go on the subflow:
 /// its first byte is its IDSN + 1, and DATA_FIN comes with its FIN. Each
 /// segment it sends maps its own bytes with a 64-bit data sequence number,
-/// and acknowledges what the peer has sent so far. The Data ACK is 4
-/// octets when the latest mapping has a 32-bit data sequence number,
-/// and 8 octets when it has a 64-bit number, as Linux sends it.
+/// and acknowledges what the peer has sent so far. Data ACKs use 64 bits
+/// by default; [`DataLevel::ack_width`] selects another policy.
 ///
 /// The peer's data must come under a mapping: a DSS, or an MP_CAPABLE
 /// with data, which maps the peer's first bytes from subflow sequence
@@ -907,8 +916,7 @@ pub fn dss_checksum(
 ///
 /// The peer's DATA_FIN takes the last data sequence number of its mapping
 /// (section 3.3.3), and the Data ACK covers it once every byte before it
-/// has come. It may come on a segment with no data and no FIN, as Linux
-/// sends it when its socket shuts down, and such a segment is
+/// has come. It may come on a segment with no data and no FIN, as permitted by section 3.3.3, and such a segment is
 /// acknowledged at once. The peer's FIN closes only the subflow, and takes
 /// no data sequence number.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -921,6 +929,7 @@ pub struct DataLevel {
     checksums: bool,
     /// Width of the most recently received mapping.
     long_ack: bool,
+    ack_width: AckWidth,
     mapped_until: u32,
     next: u64,
     mappings: Vec<ReceivedMapping>,
@@ -979,9 +988,9 @@ impl DataLevel {
             iss,
             irs,
             checksums,
-            // Linux maps the data of an MP_CAPABLE with a 64-bit data
-            // sequence number, so its Data ACKs are 8 octets.
+            // MP_CAPABLE maps data relative to the full initial sequence number.
             long_ack: first.is_some(),
+            ack_width: AckWidth::default(),
             mapped_until: irs
                 .wrapping_add(1)
                 .wrapping_add(u32::from(first.unwrap_or(0))),
@@ -1008,6 +1017,12 @@ impl DataLevel {
             fallen_back: false,
             error: None,
         }
+    }
+
+    /// Selects the width of outgoing Data ACKs.
+    pub fn ack_width(mut self, width: AckWidth) -> Self {
+        self.ack_width = width;
+        self
     }
 
     /// Whether the connection has fallen back to plain TCP.
@@ -1087,7 +1102,8 @@ impl DataLevel {
                         existing.dsn = dsn;
                         existing.fin = data_fin;
                     } else if existing.dsn != dsn
-                        || existing.mapping != mapping
+                        || existing.mapping.data_level_length != mapping.data_level_length
+                        || existing.mapping.checksum != mapping.checksum
                         || existing.fin != data_fin
                     {
                         self.error = Some(DataError::Mapping);
@@ -1257,7 +1273,7 @@ impl DataLevel {
             if self.data_fin == Some(next) {
                 next = next.wrapping_add(1);
             }
-            if self.long_ack {
+            if self.ack_width == AckWidth::Full || self.long_ack {
                 Sequence::Long(next)
             } else {
                 Sequence::Short(next as u32)
@@ -2003,7 +2019,7 @@ mod tests {
 
     /// The listener's first bytes are IDSN + 1 on, mapped by the segment
     /// that carries them, with the peer's data acknowledged at its IDSN +
-    /// 1 on, in 4 octets until the peer sends 8.
+    /// 1 on, using the full sequence number.
     #[test]
     fn a_data_level_maps_what_it_sends_and_acknowledges_what_it_got() {
         let mut level = DataLevel::new(KEY_B, KEY_A, ISS, IRS, false, None);
@@ -2011,7 +2027,7 @@ mod tests {
         assert_eq!(
             first,
             Some(Dss {
-                data_ack: Some(Sequence::Short(idsn(KEY_A).wrapping_add(1) as u32)),
+                data_ack: Some(Sequence::Long(idsn(KEY_A).wrapping_add(1))),
                 mapping: Some(Mapping {
                     data_sequence_number: Sequence::Long(idsn(KEY_B).wrapping_add(1)),
                     subflow_sequence_number: 1,
@@ -2071,7 +2087,7 @@ mod tests {
         let mapping = dss.mapping.unwrap();
         assert_eq!(mapping.checksum, Some(dss_checksum(dsn, 3, 3, b"abc")));
         let bytes = MptcpOption::Dss(dss).to_bytes().unwrap();
-        assert_eq!(bytes.len() + 2, 24, "a 4-octet Data ACK");
+        assert_eq!(bytes.len() + 2, 28, "an 8-octet Data ACK");
     }
 
     /// Data from the peer outside every mapping, or an infinite mapping,
@@ -2097,8 +2113,8 @@ mod tests {
     }
 
     /// A mapping sent again must be the same: a second DSS for the same
-    /// bytes with another data sequence number is an error, as Linux
-    /// takes it (MAPPING_INVALID), even before those bytes come.
+    /// bytes with another data sequence number violates section 3.3.1,
+    /// even before those bytes come.
     #[test]
     fn a_data_level_refuses_a_conflicting_mapping() {
         let mut level = DataLevel::new(KEY_B, KEY_A, ISS, IRS, false, None);
@@ -2131,7 +2147,7 @@ mod tests {
         });
         assert!(!level.received(IRS + 1, 5, false, [first.clone()]));
         assert!(!level.fallen_back());
-        // Sent again, as Linux resends it until it sees a DSS.
+        // A retransmission carries the same immutable mapping.
         level.received(IRS + 1, 5, false, [first]);
         level.arrived(IRS + 1, b"hello", &mut Vec::new());
         assert!(!level.fallen_back());
@@ -2177,18 +2193,11 @@ mod tests {
                 let dss = level.sent(ISS.wrapping_add(1), b"", false, Some(ack));
                 match dss.unwrap().data_ack.unwrap() {
                     Sequence::Long(n) => n,
-                    Sequence::Short(n) => {
-                        assert!(!long, "4 octets until the peer sends 8");
-                        u64::from(n)
-                    }
+                    Sequence::Short(_) => panic!("default Data ACKs use the full sequence number"),
                 }
             };
             let after_data_fin = idsn(KEY_A).wrapping_add(7);
-            let expected = if long {
-                after_data_fin
-            } else {
-                u64::from(after_data_fin as u32)
-            };
+            let expected = after_data_fin;
             assert_eq!(data_ack(&level, IRS + 6), expected);
             // Sent again, it is acknowledged again, and counts once.
             assert!(level.received(IRS + 6, 0, false, [data_fin]));
@@ -2279,7 +2288,7 @@ mod tests {
     }
 
     #[test]
-    fn data_sequence_gaps_are_queued_and_ack_width_follows_each_mapping() {
+    fn data_sequence_gaps_are_queued_and_acknowledged_in_full() {
         let dsn = idsn(KEY_A).wrapping_add(1);
         let mut level = DataLevel::new(KEY_B, KEY_A, ISS, IRS, false, None);
         level.received(
@@ -2311,7 +2320,7 @@ mod tests {
                 .sent(ISS + 1, b"", false, Some(IRS + 11))
                 .unwrap()
                 .data_ack,
-            Some(Sequence::Short(dsn.wrapping_add(10) as u32))
+            Some(Sequence::Long(dsn.wrapping_add(10)))
         );
         assert_eq!(level.error(), None);
     }

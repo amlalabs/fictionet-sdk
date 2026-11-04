@@ -106,7 +106,9 @@ impl Clock {
 /// The network before it starts: the server with its ports, and the route
 /// the internet comes in by.
 pub fn network(fcx: &Cx, config: &Config, clock: Clock, tokens: &Arc<Tokens>) -> Net {
-    let mut server = Host::new("server").at(config.address);
+    let mut server = Host::new("server")
+        .at(config.address)
+        .tcp_options(fictionet_extras::linux::tcp());
     server = if config.address.is_ipv4() {
         server.ipv4_only()
     } else {

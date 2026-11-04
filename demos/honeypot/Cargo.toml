@@ -14,6 +14,7 @@ name = "honeypot"
 path = "src/main.rs"
 
 [dependencies]
+fictionet-extras = { path = "../../extras" }
 fictionet = { path = "../.." }
 fictionet-host = { path = "../../host", default-features = false, features = ["virtio-net"], optional = true }
 serde = { version = "1", features = ["derive", "rc"] }

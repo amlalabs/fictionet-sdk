@@ -1499,6 +1499,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "siphasher 1.0.4",
  "tantivy",
  "tar",
  "time",
@@ -1949,6 +1950,7 @@ name = "honeypot-world"
 version = "0.0.0"
 dependencies = [
  "fictionet",
+ "fictionet-extras",
  "fictionet-host",
  "serde",
  "serde_json",

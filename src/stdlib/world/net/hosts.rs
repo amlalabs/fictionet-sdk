@@ -228,6 +228,7 @@ pub struct Host {
     family: Family,
     pub(super) ports: Vec<(u16, PortSpec)>,
     lan: Option<super::Lan>,
+    tcp_options: tcp::Options,
 }
 
 impl Host {
@@ -241,7 +242,14 @@ impl Host {
             family: Family::Both,
             ports: Vec::new(),
             lan: None,
+            tcp_options: tcp::Options::default(),
         }
+    }
+
+    /// Sets transport choices for this host's TCP endpoints.
+    pub fn tcp_options(mut self, options: tcp::Options) -> Self {
+        self.tcp_options = options;
+        self
     }
 
     /// Serves the host at `addr`, IPv4 or IPv6, which sets its address of
@@ -684,7 +692,13 @@ impl Installation<'_> {
             .chain(placed.v6.map(IpAddr::V6));
         let prepared = addrs
             .map(|addr| {
-                let machine = Machine::stage(self, addr, &label, world.machines.get(&addr));
+                let machine = Machine::stage(
+                    self,
+                    addr,
+                    &label,
+                    world.machines.get(&addr),
+                    host.tcp_options,
+                );
                 let ports = machine.machine.prepare(&host)?;
                 Ok((machine, ports))
             })
@@ -737,7 +751,13 @@ impl Installation<'_> {
                 .ok_or_else(|| format!("LAN {name} has no free address left"))?,
         };
         let label = host.names.first().unwrap_or(&host.label);
-        let mut machine = Machine::stage(self, addr, label, world.machines.get(&addr));
+        let mut machine = Machine::stage(
+            self,
+            addr,
+            label,
+            world.machines.get(&addr),
+            host.tcp_options,
+        );
         let ports = machine.machine.prepare(host)?;
         // Joining is the last fallible step. No service or task has started.
         if let Some(side) = machine.route.take() {
@@ -998,6 +1018,7 @@ impl Machine {
         addr: IpAddr,
         _label: &str,
         existing: Option<&Arc<Machine>>,
+        options: tcp::Options,
     ) -> PreparedMachine {
         if let Some(machine) = existing {
             return PreparedMachine {
@@ -1009,7 +1030,7 @@ impl Machine {
         let fcx = installation.fcx.clone();
         let (router_side, side) = link();
         let ((tcp, udp, icmp, _other), split) = ip::prepare_split_protocols(&fcx, side);
-        let (tcp, tcp_task) = tcp::prepare_endpoint(&fcx, tcp, addr, tcp::Options::default());
+        let (tcp, tcp_task) = tcp::prepare_endpoint(&fcx, tcp, addr, options);
         let hooks = installation.admission.hooks.clone();
         tcp.limit_isolated_peers(move |addr| hooks.by_addr.lock().contains_key(&addr));
         let (udp, udp_task) = udp::prepare_endpoint(&fcx, udp, addr);

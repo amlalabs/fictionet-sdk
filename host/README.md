@@ -100,9 +100,10 @@ It checks that things work, not how fast.
 
 The harness expects an x86-64 Linux host with `qemu-system-x86_64`,
 `/boot/vmlinuz-linux`, the kernel modules that match it, `modprobe` to list
-module dependencies, `zstd` for compressed modules, and `ldd` for the guest
-binaries' libraries. It uses QEMU's software emulation, and needs neither
-KVM nor root on the host.
+module dependencies, `zstd` for compressed modules, `objcopy` to remove
+debug sections from guest copies, and `ldd` for the guest binaries' libraries.
+The original binaries keep their debug information. It uses QEMU's software
+emulation, and needs neither KVM nor root on the host.
 
 Driver and frame tests run only inside the QEMU guest. Do not run a driver
 example on the development host. Do not load VFIO modules on the host, bind

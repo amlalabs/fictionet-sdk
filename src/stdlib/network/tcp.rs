@@ -88,28 +88,18 @@ const RELEASE_EVERY: Duration = Duration::from_secs(1);
 /// A connection whose peer sends nothing for this long while it waits for
 /// an answer (a SYN, unacknowledged data, a keepalive) is given up.
 const TIMEOUT: Duration = Duration::from_secs(120);
-/// A handshake whose last ACK has not come this long after its SYN is
-/// dropped without a RST, as Linux drops it: by default Linux resends the
-/// SYN-ACK five times (tcp_synack_retries), 1, 3, 7, 15 and 31 seconds
-/// after the first, and waits 32 seconds after the last.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(63);
-/// A connection whose handle was dropped is given up when the peer sends
-/// nothing for this long, and forgotten this long after it enters
-/// FIN-WAIT-2, as when the peer never closes its side.
-const ORPHAN_TIMEOUT: Duration = Duration::from_secs(60);
 /// Idle connections send a keepalive this often, so a peer that is gone is
 /// noticed within `TIMEOUT`.
 const KEEPALIVE: Duration = Duration::from_secs(45);
 /// Connections per port that have arrived but not been accepted yet,
-/// unless [`Options::backlog`] says otherwise. More connection attempts get
-/// SYN cookies.
+/// unless [`Options::backlog`] says otherwise. Further attempts use the
+/// configured cookie codec, when present.
 const BACKLOG: usize = 4096;
 /// The largest backlog [`Options::backlog`] allows.
 const MAX_BACKLOG: usize = 65_536;
 /// Of those, at most this many from one peer address. More attempts from
-/// that address get SYN cookies, so spoofed attempts cannot prevent a
-/// real peer from completing its handshake. A peer whose address cannot be
-/// spoofed has them dropped instead.
+/// that address use the configured cookie codec, or are dropped. A peer
+/// whose address cannot be spoofed always has further attempts dropped.
 const BACKLOG_PER_PEER: usize = 256;
 /// The first local port for outgoing connections.
 const EPHEMERAL: u16 = 49152;
@@ -146,7 +136,7 @@ pub enum TcpOption {
         tsecr: u32,
     },
     /// Any other kind, such as MPTCP's 30 (RFC 8684), or a known kind with
-    /// a Length its RFC does not define, which Linux ignores: the bytes
+    /// a Length its RFC does not define: the bytes
     /// after Kind and Length.
     Unknown {
         /// The option's kind.
@@ -619,10 +609,6 @@ fn segment(
     fictionet::stdlib::network::ip::packet(from.ip(), to.ip(), TCP, &t).0
 }
 
-/// The peer MSS values a SYN cookie can keep, as Linux's (msstab): the
-/// largest at most the peer's is kept. IPv4, then IPv6.
-const COOKIE_MSS: [[u16; 4]; 2] = [[536, 1300, 1440, 1460], [1220, 1420, 1440, 8940]];
-
 /// An HMAC-SHA256 key of 32 bytes from the run's random stream.
 fn secret(fcx: &Cx) -> ring::hmac::Key {
     let mut key = [0; 32];
@@ -661,61 +647,98 @@ impl Sequences {
     }
 }
 
-/// The key of an endpoint's SYN cookies, drawn apart from the key of its
-/// initial sequence numbers.
-struct Cookies(ring::hmac::Key);
+/// Stateless handshake input. The key belongs to this endpoint only.
+pub struct CookieInput<'a> {
+    /// Endpoint secret, independent of initial sequence numbers.
+    pub key: &'a [u8; 32],
+    /// Local address and port.
+    pub local: SocketAddr,
+    /// Remote address and port.
+    pub remote: SocketAddr,
+    /// Initial remote sequence number.
+    pub sequence: u32,
+    /// Time since the world started.
+    pub now: Duration,
+    /// Options from the incoming segment.
+    pub options: &'a [TcpOption],
+    /// Whether the SYN requested ECN negotiation.
+    pub ecn: bool,
+}
 
-impl Cookies {
-    /// A cookie for a SYN from `remote` to `local` with sequence number
-    /// `irs`, made in `minute` and keeping the peer's MSS as index `mss`
-    /// of [`COOKIE_MSS`] (RFC 4987 section 3.6). Its low 2 bits hold `mss`,
-    /// the next 5 the low bits of `minute`, and the top 25 an HMAC-SHA256
-    /// of all of these, so a peer cannot make one.
-    fn make(&self, local: SocketAddr, remote: SocketAddr, irs: u32, minute: u64, mss: u8) -> u32 {
-        let mut message = Vec::with_capacity(48);
-        put_ends(&mut message, [local, remote]);
-        message.extend_from_slice(&irs.to_be_bytes());
-        message.extend_from_slice(&minute.to_be_bytes());
-        message.push(mss);
-        let tag = ring::hmac::sign(&self.0, &message);
-        let t = tag.as_ref();
-        (u32::from_be_bytes([t[0], t[1], t[2], t[3]]) & !0x7f)
-            | ((minute as u32 & 0x1f) << 2)
-            | u32::from(mss)
+/// Options recovered from a validated SYN cookie.
+#[derive(Clone, Copy, Debug)]
+pub struct CookieState {
+    /// Remote maximum segment size.
+    pub mss: u16,
+    /// Remote receive window scale.
+    pub scale: Option<u8>,
+    /// Whether selective acknowledgments were negotiated.
+    pub sack: bool,
+    /// Whether ECN was negotiated.
+    pub ecn: bool,
+    /// Local timestamp offset and latest remote timestamp.
+    pub timestamp: Option<(u32, u32)>,
+}
+
+/// A stateless SYN-ACK produced by a world's cookie codec.
+pub struct CookieReply {
+    /// Authenticated initial sequence number.
+    pub sequence: u32,
+    /// Options after MSS, including any codec-specific padding.
+    pub options: Vec<TcpOption>,
+    /// Whether to acknowledge an ECN request in the SYN-ACK.
+    pub ecn: bool,
+}
+
+/// Encoding and validation of stateless handshakes (RFC 4987).
+/// Implementations must authenticate the tuple, sequence and expiry.
+pub trait SynCookies: Send + Sync + std::fmt::Debug {
+    /// Issues a sequence number, options after MSS, and ECN negotiation.
+    fn issue(&self, input: &CookieInput<'_>) -> CookieReply;
+    /// Validates a returned sequence number and recovers negotiated options.
+    fn validate(&self, input: &CookieInput<'_>, cookie: u32) -> Option<CookieState>;
+}
+
+/// Transport choices for an endpoint. Core defaults use the buffer window,
+/// compact options, and a four minute TIME-WAIT (RFC 9293).
+#[derive(Clone, Copy, Debug)]
+pub struct Settings {
+    /// Socket window, option layout, TIME-WAIT and handshake choices.
+    pub socket: SocketSettings,
+    /// Stateless handshake codec. With none, a full SYN queue drops new SYNs.
+    pub cookies: Option<&'static dyn SynCookies>,
+    /// Per-connection timestamp offset drawn from the world's random stream.
+    pub timestamp_offset: Option<fn(&Cx) -> u32>,
+    /// Timestamp clock; an offset is added separately for each connection.
+    pub timestamp_clock: Option<smoltcp::wire::TcpTimestampGenerator>,
+    /// How long an incomplete handshake may occupy the backlog.
+    pub handshake_timeout: Duration,
+    /// How long a detached connection may remain in FIN-WAIT-2.
+    pub orphan_timeout: Duration,
+    /// Answer a SYN with a reset when the accept queue is full.
+    pub reset_full_queue: bool,
+    /// Accept the valid prefix of a malformed option list.
+    pub ignore_malformed_options: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            socket: SocketSettings::default(),
+            cookies: None,
+            timestamp_offset: None,
+            timestamp_clock: Some(|now| (now.total_micros() / 1000) as u32),
+            handshake_timeout: TIMEOUT,
+            orphan_timeout: TIMEOUT,
+            reset_full_queue: false,
+            ignore_malformed_options: false,
+        }
     }
-
-    /// The peer's MSS, if `cookie` is one [`make`](Cookies::make) gave for
-    /// this SYN in this minute or the one before, as Linux takes one up to
-    /// two minutes old (MAX_SYNCOOKIE_AGE).
-    fn check(
-        &self,
-        local: SocketAddr,
-        remote: SocketAddr,
-        irs: u32,
-        cookie: u32,
-        minute: u64,
-    ) -> Option<u16> {
-        let mss = (cookie & 3) as u8;
-        let made = [minute, minute.wrapping_sub(1)]
-            .into_iter()
-            .find(|m| (*m as u32 & 0x1f) == (cookie >> 2) & 0x1f)?;
-        (self.make(local, remote, irs, made, mss) == cookie)
-            .then(|| COOKIE_MSS[usize::from(local.is_ipv6())][usize::from(mss)])
-    }
 }
 
-/// The index in [`COOKIE_MSS`] of the largest MSS at most `mss`, the
-/// peer's: the smallest when it sent none or one below them all.
-fn cookie_mss(v6: bool, mss: Option<u16>) -> u8 {
-    let table = COOKIE_MSS[usize::from(v6)];
-    let mss = mss.unwrap_or(0);
-    table.iter().rposition(|&m| m <= mss).unwrap_or(0) as u8
-}
-
-/// The minute of the SYN cookie clock at `now`.
-fn cookie_minute(now: smoltcp::time::Instant) -> u64 {
-    now.total_micros().max(0) as u64 / 60_000_000
-}
+/// TCP socket settings and option layout, independent of an operating system.
+pub use smoltcp::socket::tcp::Settings as SocketSettings;
+pub use smoltcp::wire::{OptionLayout, OptionOrder};
 
 /// Starts TCP for a machine with address `addr`, on the TCP packets of
 /// `inner`.
@@ -732,10 +755,10 @@ fn cookie_minute(now: smoltcp::time::Instant) -> u64 {
 /// Each connection has 256 KiB buffers each way, a 1,500-byte MTU, no
 /// Nagle delay, and Reno congestion control. Each listening port holds up
 /// to the default [`backlog`](Options::backlog) of connections not yet
-/// accepted, including handshakes, and answers further SYNs with SYN
-/// cookies. A handshake whose last ACK has not come 63 seconds after its
-/// SYN is dropped without a RST, as Linux drops it. [`endpoint_with`]
-/// takes other buffer sizes and backlogs, subject to the maximum and
+/// accepted, including handshakes. Further SYNs are dropped unless a world
+/// supplies [`Settings::cookies`]. Incomplete handshakes expire after
+/// [`Settings::handshake_timeout`]. [`endpoint_with`] takes other settings,
+/// buffer sizes and backlogs, subject to the maximum and
 /// per-peer limits described in [`Options::backlog`]. Buffer memory is used only
 /// as data passes through: once a connection's buffers are empty, their
 /// pages go back to the system within about two seconds, though the
@@ -744,9 +767,8 @@ fn cookie_minute(now: smoltcp::time::Instant) -> u64 {
 /// a SYN, data that is not acknowledged, or a keepalive (sent after 45
 /// seconds of quiet). A connection whose handle was dropped finishes
 /// closing in the background, and is given up when the peer has sent
-/// nothing for one minute. Once the peer has acknowledged its FIN, it is
-/// forgotten one minute later, whatever the peer sends, as Linux forgets
-/// one in FIN-WAIT-2 (`tcp_fin_timeout`). ICMPv4
+/// nothing for [`Settings::orphan_timeout`]. Once the peer acknowledges its
+/// FIN, that same limit bounds FIN-WAIT-2, regardless of later ACKs. ICMPv4
 /// destination-unreachable messages can fail a pending connect; see
 /// [`Endpoint::connect`]. Other ICMP messages are dropped. Established
 /// connections ignore ICMP, and there is no path MTU discovery.
@@ -755,7 +777,7 @@ fn cookie_minute(now: smoltcp::time::Instant) -> u64 {
 /// [`TcpConnection::hold_until_gone`], including connection counts, and
 /// makes its [`GoneWatch`] ready. Only transport recovery state stays:
 /// its socket, tuple, buffers and outgoing port remain until smoltcp's
-/// ten-second transport timer expires. Retransmitted FINs get ACKs and
+/// configured TIME-WAIT timer expires. Retransmitted FINs get ACKs and
 /// restart that timer. An endpoint retains at most 1,024 such sockets.
 /// Past that cap, housekeeping forgets them in the order it first saw
 /// them as TIME-WAIT orphans, so later packets for those tuples may get
@@ -769,8 +791,9 @@ pub fn endpoint(fcx: &Cx, inner: impl Interface, addr: IpAddr) -> Endpoint {
 }
 
 /// Settings for [`endpoint_with`]. The default is what [`endpoint`] uses.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 pub struct Options {
+    settings: Settings,
     buffer: usize,
     backlog: usize,
 }
@@ -778,6 +801,7 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Options {
         Options {
+            settings: Settings::default(),
             buffer: BUFFER,
             backlog: BACKLOG,
         }
@@ -785,6 +809,11 @@ impl Default for Options {
 }
 
 impl Options {
+    /// Uses transport choices supplied by the world.
+    pub fn settings(self, settings: Settings) -> Self {
+        Self { settings, ..self }
+    }
+
     /// Sets the size of each connection's receive buffer and of its send
     /// buffer, in bytes. The default is 256 KiB. Sizes below 4 KiB or above
     /// 64 MiB are raised or lowered to those limits.
@@ -822,22 +851,14 @@ impl Options {
     /// connections waiting for [`Listener::accept`]. The default is 4,096.
     /// Values below 1 or above 65,536 are raised or lowered to those
     /// limits. At most 256 attempts from one peer address keep handshake
-    /// state, whatever the backlog. Further SYNs from that address get
-    /// cookies, so spoofed attempts cannot shut out a real peer.
+    /// state, whatever the backlog. A configured cookie codec can answer
+    /// further SYNs without allocating connection state.
     ///
-    /// Past the backlog, a SYN gets a SYN cookie (RFC 4987 section 3.6), as
-    /// from Linux with a full SYN queue: a SYN-ACK whose sequence number
-    /// holds what the handshake needs, so the endpoint keeps nothing for
-    /// the attempt until the ACK that returns the cookie. The SYN-ACK
-    /// carries a Maximum Segment Size and what the listener's
-    /// [`Answer::syn`] adds, and nothing else. So such a connection has no
-    /// window scaling, SACK, timestamps or ECN, and its [`Handshake`] has
-    /// no SYN options. Linux sends the same SYN-ACK to a SYN without
-    /// timestamps. To one with them, it also sends timestamps, SACK and
-    /// Window Scale, keeping their settings in the timestamp value.
-    /// When the connections waiting for `accept` alone fill the backlog,
-    /// SYNs and ACKs that return cookies are dropped, as Linux drops them
-    /// with a full accept queue.
+    /// Past the backlog, a SYN is dropped unless [`Settings::cookies`]
+    /// supplies a stateless handshake codec (RFC 4987 section 3.6).
+    /// The codec determines which negotiated options survive. When the
+    /// accept queue is full, [`Settings::reset_full_queue`] selects whether
+    /// a new SYN gets a reset; otherwise it is dropped.
     ///
     /// Each connection in the backlog has its buffers from its first SYN.
     /// Their pages cost memory only once data arrives, but each connection
@@ -904,6 +925,8 @@ pub fn prepare_endpoint(
     Prepared<impl Future<Output = fictionet::Result> + Send + 'static>,
 ) {
     let mut dev = Dev::default();
+    let mut cookie_key = [0; 32];
+    fcx.fill_random(&mut cookie_key);
     let sequences = Sequences(secret(fcx));
     let config = Config {
         initial_seq: Box::new(move |local, remote, now| {
@@ -911,7 +934,8 @@ pub fn prepare_endpoint(
         }),
         ip_addr: addr.into(),
     };
-    let iface = Iface::new(config, &mut dev, smol_now(fcx));
+    let mut iface = Iface::new(config, &mut dev, smol_now(fcx));
+    iface.set_ignore_malformed_options(options.settings.ignore_malformed_options);
     let shared = Arc::new(Shared {
         addr,
         state: Mutex::new(State {
@@ -938,7 +962,9 @@ pub fn prepare_endpoint(
             buffer: options.buffer,
             backlog: options.backlog,
             isolated_peer: None,
-            cookies: Cookies(secret(fcx)),
+            cookie_key,
+            settings: options.settings,
+            fcx: fcx.clone(),
         }),
     });
     let driver = shared.clone();
@@ -1061,7 +1087,9 @@ struct State {
     /// Connections per listening port not accepted yet: [`Options::backlog`].
     backlog: usize,
     /// The key of this endpoint's SYN cookies.
-    cookies: Cookies,
+    cookie_key: [u8; 32],
+    settings: Settings,
+    fcx: Cx,
     /// Sources whose ownership the enclosing network verifies.
     isolated_peer: Option<Box<dyn Fn(IpAddr) -> bool + Send>>,
 }
@@ -1373,7 +1401,14 @@ impl State {
     }
 
     /// Adds a socket made by [`new_socket`].
-    fn add_socket(&mut self, (s, pages): (stcp::Socket<'static>, Option<Pages>)) -> Id {
+    fn add_socket(&mut self, (mut s, pages): (stcp::Socket<'static>, Option<Pages>)) -> Id {
+        s.set_settings(self.settings.socket);
+        if s.state() != TcpState::SynReceived {
+            s.set_tsval_generator(self.settings.timestamp_clock);
+        }
+        if let Some(offset) = self.settings.timestamp_offset {
+            s.set_timestamp_offset(offset(&self.fcx));
+        }
         let h = Id(self.next_id);
         self.next_id += 1;
         self.handles.insert(h, self.sockets.add(s));
@@ -1495,11 +1530,12 @@ impl State {
             self.close_if_drained(h);
         }
         // An orphan should not live on keepalives. A peer that never
-        // closes its side keeps it only for a minute, as Linux does
+        // closes its side keeps it only for the configured orphan timeout
         // (tcp_fin_timeout): see `expire_orphans`.
+        let timeout = self.settings.orphan_timeout;
         let s = self.sock(h);
         s.set_keep_alive(None);
-        s.set_timeout(Some(ORPHAN_TIMEOUT.into()));
+        s.set_timeout(Some(timeout.into()));
         self.conns.get_mut(&h).unwrap().orphaned = true;
         self.orphans.push(h);
         self.kick();
@@ -1579,7 +1615,13 @@ impl State {
             return;
         }
         if quoted.len() >= total
-            && TcpRepr::parse(&TcpPacket::new_unchecked(t), &ip.src.into(), &ip.dst.into()).is_err()
+            && TcpRepr::parse_with(
+                &TcpPacket::new_unchecked(t),
+                &ip.src.into(),
+                &ip.dst.into(),
+                self.settings.ignore_malformed_options,
+            )
+            .is_err()
         {
             return;
         }
@@ -1635,8 +1677,12 @@ impl State {
             return false;
         }
         let t = &packet[ip.payload.clone()];
-        let Ok(repr) = TcpRepr::parse(&TcpPacket::new_unchecked(t), &ip.src.into(), &ip.dst.into())
-        else {
+        let Ok(repr) = TcpRepr::parse_with(
+            &TcpPacket::new_unchecked(t),
+            &ip.src.into(),
+            &ip.dst.into(),
+            self.settings.ignore_malformed_options,
+        ) else {
             return false;
         };
         // A host discards what comes from an address that is not one
@@ -1668,7 +1714,7 @@ impl State {
             };
             attempt = Some(taken);
         }
-        if new && ack && !syn && !rst && !self.take_cookie(arrived, now) {
+        if new && ack && !syn && !rst && !self.take_cookie(arrived, t, now) {
             return false;
         }
         let handle = self.by_tuple.get(&(dst, src)).copied();
@@ -1766,7 +1812,7 @@ impl State {
                 .position(|&h| sockets.get(handles[&h]).state() == TcpState::SynReceived)
             {
                 let h = l.idle.swap_remove(i);
-                let gives_up = now + HANDSHAKE_TIMEOUT.into();
+                let gives_up = now + self.settings.handshake_timeout.into();
                 l.embryonic.insert((gives_up, h));
                 let s = self.sockets.get(self.handles[&h]);
                 let local = s.local_endpoint().map(SocketAddr::from).unwrap_or(dst);
@@ -1806,6 +1852,10 @@ impl State {
             .per_peer
             .get(&src.ip())
             .is_some_and(|&n| n >= BACKLOG_PER_PEER);
+        if l.ready.len() >= self.backlog && self.settings.reset_full_queue {
+            self.dev.tx.push(arrived.reset(&[]));
+            return None;
+        }
         if l.ready.len() >= self.backlog
             || (peer_full
                 && self
@@ -1838,23 +1888,51 @@ impl State {
             return None;
         };
         if cookie {
-            let peer_mss = syn.iter().find_map(|o| match o {
-                TcpOption::MaxSegmentSize(mss) => Some(*mss),
-                _ => None,
-            });
-            let mss = cookie_mss(dst.is_ipv6(), peer_mss);
-            let iss = self
-                .cookies
-                .make(dst, src, arrived.seq, cookie_minute(now), mss);
+            let codec = self.settings.cookies?;
+            let input = CookieInput {
+                key: &self.cookie_key,
+                local: dst,
+                remote: src,
+                sequence: arrived.seq,
+                now: Duration::from_micros(now.total_micros().max(0) as u64),
+                options: &syn,
+                ecn: t[13] & 0xc0 == 0xc0,
+            };
+            let CookieReply {
+                sequence: iss,
+                options: kept,
+                ecn,
+            } = codec.issue(&input);
+            let timestamps = kept
+                .iter()
+                .any(|o| matches!(o, TcpOption::Timestamps { .. }));
             let own_mss = MTU - if dst.is_ipv6() { 40 } else { 20 } - 20;
             let mut options = vec![2, 4];
             options.extend_from_slice(&(own_mss as u16).to_be_bytes());
+            options.extend_from_slice(&encode(&kept)?);
             options.extend_from_slice(&encoded);
-            let window = self.buffer.min(usize::from(u16::MAX)) as u16;
+            if options.len() > 40 {
+                return None;
+            }
+            let window = if timestamps {
+                self.settings
+                    .socket
+                    .syn_window_with_timestamps
+                    .or(self.settings.socket.syn_window)
+            } else {
+                self.settings.socket.syn_window
+            }
+            .unwrap_or(self.buffer.min(usize::from(u16::MAX)) as u16);
             let ack = arrived.seq.wrapping_add(1);
-            self.dev
-                .tx
-                .push(segment(dst, src, iss, Some(ack), 0x02, window, &options));
+            self.dev.tx.push(segment(
+                dst,
+                src,
+                iss,
+                Some(ack),
+                0x02 | if ecn { 0x40 } else { 0 },
+                window,
+                &options,
+            ));
             return None;
         }
         if l.idle.is_empty() {
@@ -1864,9 +1942,13 @@ impl State {
             self.listeners.get_mut(&dst.port()).unwrap().idle.push(h);
         }
         for &h in &self.listeners[&dst.port()].idle {
-            self.sockets
-                .get_mut(self.handles[&h])
-                .set_tsval_generator(Some(|now| (now.total_micros() / 1000) as u32));
+            let socket = self.sockets.get_mut(self.handles[&h]);
+            socket.set_tsval_generator(self.settings.timestamp_clock);
+            socket.set_timestamp_offset(
+                self.settings
+                    .timestamp_offset
+                    .map_or(0, |offset| offset(&self.fcx)),
+            );
         }
         Some((syn, added))
     }
@@ -1876,13 +1958,26 @@ impl State {
     /// SYN-RECEIVED, which the ACK then completes. Returns whether to go on
     /// with the ACK: not when it returns a cookie but the connections
     /// waiting for `accept` fill the backlog.
-    fn take_cookie(&mut self, arrived: Arrived, now: smoltcp::time::Instant) -> bool {
+    fn take_cookie(&mut self, arrived: Arrived, t: &[u8], now: smoltcp::time::Instant) -> bool {
         let (src, dst) = (arrived.from, arrived.to);
         let Some(ack) = arrived.ack else {
             return true;
         };
         let (irs, iss) = (arrived.seq.wrapping_sub(1), ack.wrapping_sub(1));
-        let Some(mss) = self.cookies.check(dst, src, irs, iss, cookie_minute(now)) else {
+        let Some(codec) = self.settings.cookies else {
+            return true;
+        };
+        let options = segment_options(t);
+        let input = CookieInput {
+            key: &self.cookie_key,
+            local: dst,
+            remote: src,
+            sequence: irs,
+            now: Duration::from_micros(now.total_micros().max(0) as u64),
+            options: &options,
+            ecn: false,
+        };
+        let Some(kept) = codec.validate(&input, iss) else {
             return true;
         };
         let l = &self.listeners[&dst.port()];
@@ -1900,14 +1995,26 @@ impl State {
         }
         let mut s = new_socket(self.buffer);
         s.0.listen(dst.port()).expect("a new socket can listen");
-        s.0.accept_syn_cookie(dst.into(), src.into(), irs, iss, mss, now);
+        s.0.accept_syn_cookie(dst.into(), src.into(), irs, iss, kept.mss, now);
         let h = self.add_socket(s);
+        self.sockets
+            .get_mut(self.handles[&h])
+            .restore_cookie_options(
+                kept.scale,
+                kept.sack,
+                kept.timestamp.and_then(|(offset, remote)| {
+                    self.settings
+                        .timestamp_clock
+                        .map(|clock| (clock, offset, remote))
+                }),
+            );
         let l = self.listeners.get_mut(&dst.port()).unwrap();
-        let gives_up = now + HANDSHAKE_TIMEOUT.into();
+        let gives_up = now + self.settings.handshake_timeout.into();
         l.embryonic.insert((gives_up, h));
         *l.per_peer.entry(src.ip()).or_default() += 1;
         let mut conn = Conn::new(dst, src, Side::Server);
         conn.gives_up = Some(gives_up);
+        conn.ecn = kept.ecn;
         conn.handshake.origin = HandshakeOrigin::Cookie;
         (conn.handshake.irs, conn.handshake.iss) = (irs, iss);
         self.conns.insert(h, conn);
@@ -1978,7 +2085,7 @@ impl State {
     }
 
     /// Drops the handshakes still waiting for their last ACK
-    /// [`HANDSHAKE_TIMEOUT`] after their SYN, without a RST.
+    /// [`Settings::handshake_timeout`] after their SYN, without a RST.
     fn expire_handshakes(&mut self, now: smoltcp::time::Instant) {
         let mut gone = Vec::new();
         for l in self.listeners.values_mut() {
@@ -2006,9 +2113,8 @@ impl State {
         }
     }
 
-    /// Forgets each orphan [`ORPHAN_TIMEOUT`] after it entered FIN-WAIT-2,
-    /// whatever its peer sends meanwhile, without a RST, as Linux forgets
-    /// one `tcp_fin_timeout` after (tcp_time_wait with TCP_FIN_WAIT2).
+    /// Forgets each orphan [`Settings::orphan_timeout`] after it entered FIN-WAIT-2,
+    /// whatever its peer sends meanwhile, without a RST.
     /// Later segments from the peer get a RST, as there is no connection.
     /// Otherwise a peer that acknowledges the FIN and then sends an ACK
     /// now and then would keep the connection forever.
@@ -2027,7 +2133,7 @@ impl State {
                     self.remove_conn(h);
                     continue;
                 }
-                (true, None) => c.gives_up = Some(now + ORPHAN_TIMEOUT.into()),
+                (true, None) => c.gives_up = Some(now + self.settings.orphan_timeout.into()),
                 (true, Some(_)) => {}
                 (false, _) => c.gives_up = None,
             }
@@ -2452,8 +2558,8 @@ impl Listener {
     /// [`Answer::syn`] sees each SYN's options. [`SynAnswer::Accept`] adds
     /// options to the SYN-ACK and its retransmissions, after the endpoint's
     /// own (Maximum Segment Size, and SACK-Permitted, Timestamps and Window
-    /// Scale when the SYN offered them), or after the Maximum Segment Size
-    /// of a SYN cookie. [`SynAnswer::Refuse`] resets the attempt.
+    /// Scale when the SYN offered them), or after the options supplied by
+    /// the SYN cookie codec. [`SynAnswer::Refuse`] resets the attempt.
     ///
     /// [`Answer::ack`] sees the [`Handshake`] when the ACK that completes it
     /// arrives. [`AckAnswer::Refuse`] resets the connection then, and
@@ -2488,7 +2594,7 @@ impl Listener {
     /// waiting for `accept`, counting those still in their handshake. See
     /// [`Options::backlog`] for the default, maximum and separate per-peer
     /// limit. Past the backlog, or past a peer's own limit, connection
-    /// attempts get SYN cookies. A peer at its limit whose address the
+    /// attempts use [`Settings::cookies`] when present. A peer at its limit whose address the
     /// network keeps from being spoofed, such as an attached sandbox, has
     /// its SYNs dropped instead, until some of its connections are accepted
     /// or give up.
@@ -2625,7 +2731,7 @@ impl TcpConnection {
     ///
     /// Dropping a connection whose received bytes were all read closes it
     /// with a FIN instead. Its connection counts stay until the peer has
-    /// finished closing too, or has sent nothing for a minute. Reaching
+    /// finished closing too, or [`Settings::orphan_timeout`] expires. Reaching
     /// TIME-WAIT releases those counts; only bounded transport recovery
     /// state stays (see [`endpoint`]). A server that must bound how many
     /// closing sockets a peer can hold, such as one that turns connections
@@ -2648,7 +2754,7 @@ impl TcpConnection {
 
     /// Keeps `item` until the connection is gone, which may be
     /// after this handle is dropped: closing waits for the peer (FIN-WAIT,
-    /// LAST-ACK) until it has sent nothing for a minute. A socket that reaches
+    /// LAST-ACK) until [`Settings::orphan_timeout`] expires. A socket that reaches
     /// TIME-WAIT after handle drop releases its items immediately. Only
     /// transport recovery state stays as described in [`endpoint`]. Limits
     /// that count connections hold their count here, so a peer that never
@@ -2857,6 +2963,31 @@ mod tests {
     use fictionet::stdlib::test_support::rounds;
     use fictionet::{InterfaceExt, Seed, block_on, lab, pair, run};
 
+    #[derive(Debug)]
+    struct TestCookies;
+
+    impl SynCookies for TestCookies {
+        fn issue(&self, input: &CookieInput<'_>) -> CookieReply {
+            let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, input.key);
+            let mut message = Vec::new();
+            put_ends(&mut message, [input.local, input.remote]);
+            message.extend_from_slice(&input.sequence.to_be_bytes());
+            message.extend_from_slice(&(input.now.as_secs() / 37).to_be_bytes());
+            let tag = ring::hmac::sign(&key, &message);
+            CookieReply { sequence: u32::from_be_bytes(tag.as_ref()[..4].try_into().unwrap()), options: Vec::new(), ecn: false }
+        }
+
+        fn validate(&self, input: &CookieInput<'_>, cookie: u32) -> Option<CookieState> {
+            (self.issue(input).sequence == cookie).then_some(CookieState {
+                mss: 536, scale: None, sack: false, ecn: false, timestamp: None,
+            })
+        }
+    }
+
+    fn cookie_options() -> Options {
+        Options::default().settings(Settings { cookies: Some(&TestCookies), ..Settings::default() })
+    }
+
     /// Sets the IP length fields and the checksums of a TCP packet that ends at
     /// `packet.len()` and whose TCP header starts at `tcp_at`.
     fn fix_lengths(packet: &mut [u8], tcp_at: usize, src: IpAddr, dst: IpAddr) {
@@ -3010,9 +3141,9 @@ mod tests {
             let t = Header::parse_whole(&packets[0]).unwrap().payload(&packets[0]);
             assert_eq!(t[13], 0x10);
             assert_eq!(u32::from_be_bytes(t[8..12].try_into().unwrap()), 102);
-            // FINs near expiry restart the ten-second timer, even past the
+            // FINs near expiry restart the two-MSL timer, even past the
             // orphan timeout for sockets that have not reached TIME-WAIT.
-            for seconds in [9, 18, 27, 36, 45, 54, 63] {
+            for seconds in [239, 478, 717, 956, 1195, 1434, 1673] {
                 let retry = now + smoltcp::time::Duration::from_secs(seconds);
                 st.ingress(local.ip(), retry, fin.0.clone());
                 let packets = egress(st, retry);
@@ -3020,11 +3151,11 @@ mod tests {
                 let t = Header::parse_whole(&packets[0]).unwrap().payload(&packets[0]);
                 assert_eq!(t[13], 0x10);
             }
-            let before = now + smoltcp::time::Duration::from_secs(72);
+            let before = now + smoltcp::time::Duration::from_secs(1912);
             assert!(egress(st, before).is_empty());
             st.housekeeping();
             assert!(st.conns.contains_key(&h));
-            let expiry = now + smoltcp::time::Duration::from_secs(73);
+            let expiry = now + smoltcp::time::Duration::from_secs(1913);
             assert!(egress(st, expiry).is_empty());
             st.housekeeping();
             assert!(!st.conns.contains_key(&h));
@@ -3083,7 +3214,7 @@ mod tests {
             assert!(dropped[1..].iter().all(|h| st.conns.contains_key(h)));
             // Eviction itself emits nothing. Normal expiry frees the rest.
             assert!(egress(&mut st, later).is_empty());
-            let expiry = later + smoltcp::time::Duration::from_secs(10);
+            let expiry = later + smoltcp::time::Duration::from_secs(240);
             assert!(egress(&mut st, expiry).is_empty());
             st.housekeeping();
             assert!(st.orphans.is_empty());
@@ -3526,9 +3657,8 @@ mod tests {
                 for fault in [
                     "empty_checksum", "checksum", "ack", "offset", "options", "flags", "ip", "none",
                 ] {
-                    // A SYN-ACK whose options end at a malformed one is
-                    // taken with those before it, as Linux takes it.
-                    if matches!(fault, "none" | "flags" | "options") && !established
+                    // A valid SYN-ACK can establish, and RST can close the socket.
+                    if matches!(fault, "none" | "flags") && !established
                         || fault == "ip" && local.is_ipv6()
                     {
                         continue;
@@ -3749,7 +3879,8 @@ mod tests {
                 assert_eq!(st.get(h).recv_queue(), 10);
                 egress(&mut st, now);
                 // The application reads only after TIME-WAIT is over.
-                egress(&mut st, now + smoltcp::time::Duration::from_secs(11));
+                egress(&mut st, now + smoltcp::time::Duration::from_secs(241));
+                assert_eq!(st.get(h).state(), TcpState::Closed);
                 st.housekeeping();
                 conn
             };
@@ -4394,7 +4525,7 @@ mod tests {
                 &fcx,
                 side,
                 "10.0.0.1".parse().unwrap(),
-                Options::default().backlog(4),
+                cookie_options().backlog(4),
             );
             let mut listener = server.listen(80)?;
             let to: SocketAddr = "10.0.0.1:80".parse().unwrap();
@@ -4449,7 +4580,7 @@ mod tests {
             let (_raw, side) = pair();
             let local: SocketAddr = "10.0.0.1:80".parse()?;
             let peer = |port| SocketAddr::new("10.0.0.2".parse().unwrap(), port);
-            let server = endpoint(&fcx, side, local.ip());
+            let server = endpoint_with(&fcx, side, local.ip(), cookie_options());
             let mut listener = server.listen(local.port())?;
             let now = smol_now(&fcx);
             {
@@ -4570,7 +4701,7 @@ mod tests {
     }
 
     /// Handshakes wait in the order their SYNs came, and each is dropped
-    /// [`HANDSHAKE_TIMEOUT`] after its own SYN; the next one due is the
+    /// [`Settings::handshake_timeout`] after its own SYN; the next one due is the
     /// endpoint's next timer. Housekeeping looks only at those a segment
     /// reached: one completed among many waiting is accepted, and nothing
     /// is left for it to look at once the turn is over.
@@ -4619,16 +4750,16 @@ mod tests {
             let conn = listener.accept(&fcx).await?;
             assert_eq!(conn.peer_addr(), late);
             fcx.spawn(move |fcx| async move { while raw.recv(&fcx).await.is_ok() {} Ok(()) });
-            // The first batch goes 63 seconds after its SYNs, the second
+            // Each batch expires at the configured handshake deadline, the second
             // ten seconds later.
-            fcx.sleep_until(start + HANDSHAKE_TIMEOUT + Duration::from_secs(5)).await?;
+            fcx.sleep_until(start + Settings::default().handshake_timeout + Duration::from_secs(5)).await?;
             {
                 let st = server.shared.state.lock();
                 let (waiting, _, touched) = due(&st);
                 assert_eq!(waiting, 99);
                 assert_eq!(touched, 0);
             }
-            fcx.sleep_until(start + HANDSHAKE_TIMEOUT + Duration::from_secs(15)).await?;
+            fcx.sleep_until(start + Settings::default().handshake_timeout + Duration::from_secs(15)).await?;
             let st = server.shared.state.lock();
             assert!(st.listeners[&80].embryonic.is_empty());
             assert_eq!(st.next_expiry(), None);
@@ -4693,8 +4824,14 @@ mod tests {
     fn the_socket_set_shrinks_after_a_crowd_leaves() {
         let result = block_on(lab(Seed::from_u64(1), |fcx| async move {
             let (a, b) = pair();
-            let server = endpoint(&fcx, a, "10.0.0.1".parse().unwrap());
-            let client = endpoint(&fcx, b, "10.0.0.2".parse().unwrap());
+            // Exercise reclamation with a short configured segment lifetime.
+            let settings = Settings {
+                socket: SocketSettings { time_wait: smoltcp::time::Duration::from_secs(10), ..SocketSettings::default() },
+                ..Settings::default()
+            };
+            let options = Options::default().settings(settings);
+            let server = endpoint_with(&fcx, a, "10.0.0.1".parse().unwrap(), options);
+            let client = endpoint_with(&fcx, b, "10.0.0.2".parse().unwrap(), options);
             let mut listener = server.listen(80)?;
             let mut keep_c = client.connect(&fcx, "10.0.0.1:80".parse().unwrap()).await?;
             let mut keep_s = listener.accept(&fcx).await?;
@@ -4743,10 +4880,9 @@ mod tests {
         assert_eq!(result.unwrap_err().to_string(), "done");
     }
 
-    /// A connection whose handle is dropped waits for the peer for at most
-    /// a minute, not the two minutes of an open one.
+    /// Dropping a connection applies the configured orphan timeout.
     #[test]
-    fn a_dropped_connection_waits_a_minute_at_most() {
+    fn a_dropped_connection_uses_the_orphan_timeout() {
         let result = block_on(run(fictionet::Seed::random(), |fcx| async move {
             let (a, b) = pair();
             let server = endpoint(&fcx, a, "10.0.0.1".parse().unwrap());
@@ -4767,18 +4903,17 @@ mod tests {
                 TcpState::FinWait2,
                 "the client never closes its side"
             );
-            assert_eq!(st.get(h).timeout(), Some(ORPHAN_TIMEOUT.into()));
+            assert_eq!(st.get(h).timeout(), Some(st.settings.orphan_timeout.into()));
             drop(st);
             Err::<(), fictionet::Error>(fictionet::Error::msg("done"))
         }));
         assert_eq!(result.unwrap_err().to_string(), "done");
     }
 
-    /// A dropped connection whose peer acknowledged its FIN is forgotten a
-    /// minute later, though the peer keeps sending ACKs: nothing the peer
-    /// sends keeps it in FIN-WAIT-2.
+    /// A dropped connection whose peer acknowledged its FIN expires at the
+    /// configured deadline even if the peer keeps sending ACKs.
     #[test]
-    fn an_orphan_in_fin_wait_2_goes_a_minute_after_whatever_the_peer_sends() {
+    fn an_orphan_in_fin_wait_2_expires_despite_peer_acks() {
         let result = block_on(lab(Seed::from_u64(1), |fcx| async move {
             let (mut raw, side) = pair();
             let server = endpoint(&fcx, side, "10.0.0.1".parse().unwrap());
@@ -4811,7 +4946,7 @@ mod tests {
                 raw.send(segment(peer, to, 8, acked, 0x10));
             }
             fcx.sleep(Duration::from_millis(10)).await?;
-            assert!(!open(&server), "forgotten a minute after FIN-WAIT-2");
+            assert!(!open(&server), "forgotten at the orphan deadline");
             // Data now gets a RST: there is no connection.
             raw.send(data_segment(peer, to, 8, acked, 0x18, b"x"));
             let p = raw.recv(&fcx).await?;
