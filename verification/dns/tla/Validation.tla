@@ -27,26 +27,21 @@
 (*   cached     whether the answer comes from the resolver's cache, with   *)
 (*              the validation an earlier query without CD made            *)
 (*                                                                         *)
-(* The provider (Complete, Lazy, Copied) says where the records come from. *)
-(* Complete and Lazy zones are the world's own: the world signs them over  *)
-(* their data, its edits included, and both publish the same records      *)
-(* (Lean: lazy_agrees_complete). Copied records are a learned zone's: the  *)
-(* real zone's records with the RRSIGs the real servers sent, made with    *)
-(* the real key A, or none for an unsigned zone. The world holds no real   *)
-(* key, so a copy is never signed again: the world's key B never signs it, *)
-(* and an edit to it is a change after signing (Stale). The signer         *)
-(* implementation (A or B) produces the same records by contract           *)
-(* (signer_agnostic). The validator must see neither the provider nor the  *)
-(* implementation. RecordsOnly is checked by self-composition: two copies  *)
-(* of the validator, each with its own provider and signer, get records of *)
-(* their own, which differ where the second copy's changed2 or provider    *)
-(* makes them differ, and must agree whenever their records are equal.    *)
+(* The provider (Complete or Lazy) says where the records come from. Both  *)
+(* are the world's own zones: the world signs them over their data, its    *)
+(* edits included, and both publish the same records                       *)
+(* (Lean: lazy_agrees_complete). The signer implementation (A or B)        *)
+(* produces the same records by contract (signer_agnostic). The validator  *)
+(* must see neither the provider nor the implementation. RecordsOnly is    *)
+(* checked by self-composition: two copies of the validator, each with     *)
+(* its own provider and signer, get records of their own, which differ     *)
+(* where the second copy's changed2 makes them differ, and must agree      *)
+(* whenever their records are equal.                                       *)
 (*                                                                         *)
 (* Ablation flags: PolicyAlgs is the policy value (adding "sha1" accepts   *)
 (* algorithm 5), TrustUpstreamAd copies an upstream AD bit,                *)
 (* MissingAsInsecure reads a failed fetch as Insecure, SignerPeek lets the *)
-(* validator skip a check for records from signer A, ResignCopies signs a  *)
-(* copy again after the world edits it, as only the real key could.        *)
+(* validator skip a check for records from signer A.                       *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets, TLC
 
@@ -56,8 +51,7 @@ CONSTANTS
     PolicyAlgs,        \* the algorithms AlgorithmPolicy.validate admits
     TrustUpstreamAd,   \* ablation: AD from upstream reaches the client
     MissingAsInsecure, \* ablation: a failed fetch is Insecure
-    SignerPeek,        \* ablation: the validator reads the signer implementation
-    ResignCopies       \* ablation: a copy is signed again after the world edits it
+    SignerPeek         \* ablation: the validator reads the signer implementation
 
 Path == <<"root", "tld", "sld">>
 Zones == {"root", "tld", "sld"}
@@ -90,27 +84,20 @@ Init ==
     /\ provider1 \in ProviderChoices /\ impl1 \in ImplChoices
     /\ provider2 \in ProviderChoices /\ impl2 \in ImplChoices
     /\ changed2 \in [Zones -> ChangedChoices]
-    \* A copy keeps the real zone's RRSIGs: the world's key B never signs it.
-    /\ (provider1 = "Copied" \/ provider2 = "Copied") => \A z \in Zones : signer[z] # "B"
 
 Next == UNCHANGED vars
 Spec == Init /\ [][Next]_vars
 
 -----------------------------------------------------------------------------
-(* Published records. Every signer, and the world's own providers, publish *)
-(* the same records for the same zone data (Lean: lazy_agrees_complete and *)
-(* signer_agnostic); a copy publishes the real zone's records as they were *)
-(* signed. The faults are what the validator's fetches and clock see.      *)
-
-Provider(run) == IF run = 1 THEN provider1 ELSE provider2
+(* Published records. Every signer, and both providers, publish the same   *)
+(* records for the same zone data (Lean: lazy_agrees_complete and          *)
+(* signer_agnostic). The faults are what the validator's fetches and       *)
+(* clock see.                                                              *)
 
 (* Whether z's records, as copy `run` of the validator gets them, changed  *)
-(* after they were signed: by a fault, or by the world's edit to a copied  *)
-(* zone, which is never signed again. The world signs its own zones over   *)
-(* their edits.                                                            *)
-Stale(run, z) ==
-    \/ (IF run = 1 THEN changed ELSE changed2)[z]
-    \/ (Provider(run) = "Copied" /\ edited[z] /\ ~ResignCopies)
+(* after they were signed. The world signs its zones over their edits, so  *)
+(* only a fault changes them.                                              *)
+Stale(run, z) == (IF run = 1 THEN changed ELSE changed2)[z]
 
 \* The records copy `run` of the validator gets.
 Records(run) ==
@@ -251,16 +238,8 @@ Sha1Insecure ==
 RecordsOnly ==
     Records(1) = Records(2) => Result = Result2
 
-(* Copied records the world edited are never Secure: the world holds no    *)
-(* key of the real zone, so a copy is never signed again, and an edited     *)
-(* RRset keeps RRSIGs that no longer cover it. The world's own zones,      *)
-(* which it signs over its edits, may be (EditedWorldZoneSecure), and a    *)
-(* copy signed again after an edit would be (_resigncopies).               *)
-CopiedEditedNeverSecure ==
-    provider1 = "Copied" /\ (\E z \in Zones : edited[z]) => Result.kind # "Secure"
-
 (* check_chain at build time, with each problem it reports. An RRset       *)
-(* changed after signing, or edited in a copy, is SignatureInvalid.        *)
+(* changed after signing is SignatureInvalid.                              *)
 ChainProblems ==
     { <<"DsMismatch", c>> : c \in {c \in Children : proof[c] \in {"DsA", "DsB"} /\ signer[c] # DsKey(proof[c])} }
     \cup { <<"NoDsProofMissing", c>> : c \in {c \in Children : proof[c] \in {"Nsec", "Nothing"}} }
@@ -280,12 +259,6 @@ CheckChainAgrees ==
 
 AllSignedBy(k) == \A z \in Zones : signer[z] = k
 AllDs(p) == \A c \in Children : proof[c] = p
-
-\* Unedited zones copied from real servers validate under the real anchor.
-CopiedUneditedSecure ==
-    provider1 = "Copied" /\ anchor = "A" /\ AllSignedBy("A") /\ AllDs("DsA")
-    /\ \A z \in Zones : ~changed[z] /\ ~edited[z]
-    /\ Result.kind = "Secure"
 
 \* A zone of the world's own that it edited, signed with the world's key
 \* under the world's anchor, validates Secure: the world signs its edits.
@@ -320,7 +293,6 @@ UnsignedWithIanaAnchorBogus ==
 NoAnchorsNotPerformed ==
     anchor = "none" /\ Result.kind = "NotPerformed" /\ ~Rendered.ad
 
-NeverCopiedUneditedSecure == ~CopiedUneditedSecure
 NeverEditedWorldZoneSecure == ~EditedWorldZoneSecure
 NeverEditedUnderRealAnchorBogus == ~EditedUnderRealAnchorBogus
 NeverInventedUnderOptOutInsecure == ~InventedUnderOptOutInsecure

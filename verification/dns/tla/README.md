@@ -2,7 +2,7 @@
 
 Four specs model the DNS engines of `services::dns` and
 `protocols::dns::dnssec`: the recursive resolver, the step contract every
-engine keeps, the authority engine with its learned copies and providers, and the
+engine keeps, the authority engine with its lookups and providers, and the
 DNSSEC validator with the resolver's rendering of its result. Each spec has
 flags that remove one rule the engines follow, so one spec gives both the
 proof of the rule and the counterexample that shows why it is there.
@@ -11,8 +11,8 @@ proof of the rule and the counterexample that shows why it is there.
 |---|---|---|
 | `Resolution.tla` | The resolver against zones `.`, `tld`, `sld.tld`, and `alt.tld`, each with one good and one lame server; an address, a CNAME, an empty non-terminal, a missing name, a glued nameserver, a CNAME loop across two zones, and a wildcard; questions of type A and AAAA; queries from a port and with a DNS ID drawn for each, and an off-path attacker forging replies; a rogue server adding a record outside its bailiwick; two clients; a network that loses and truncates; one world edit; TTLs of 1 and 2 | `services/dns/resolver/{mod,cache,resolution,front}.rs` |
 | `Exchanges.tla` | The step contract of `Engine`: tokens with a generation and an exchange identity, matching on the token and the tuple, duplicate, late, and spoofed replies, `Gone`, `Advance`, one resolution shared by two clients | `services/dns/exchange.rs` (`Token`, `Generation`, `Input`, `Action`, `Engine`), kept by `AuthorityEngine` and `Resolver` |
-| `Authority.tla` | `AuthorityEngine` at a root, a TLD, and an edited zone's address: learned copies of the root and TLD zones, filed from lookups of the real servers through an `Only` policy and an upstream that delays and fails, each lookup shared by the requests that need it; `Overlay` reading the edited zone's apex NS RRset and its target's addresses and then asking its base for its DS; `Lazy` over a `Provider` whose facts are present, absent, or unknown and change as the world runs | `services/dns/authority/{mod,engine,copies,overlay}.rs`, `services/dns/zone/{data,lazy,learned}.rs`, `world/net/dns/upstream.rs` |
-| `Validation.tla` | The validator on a path root, tld, sld, with the data free per config (signer, parent proof, window, algorithm, changes after signing, the world's edits), clock skew, unreachable zones, the AD/CD rendering, `check_chain`, copies of real zones that are never signed again, and two validators with providers, signers, and records of their own | `protocols/dns/dnssec/{validate,policy,proof}.rs`, `services/dns/zone/chain.rs`, `services/dns/resolver/front.rs` |
+| `Authority.tla` | `AuthorityEngine` at a root, a TLD, and an edited zone's address: at the root and TLD, a base authority that answers from what lookups filed and returns `Need` for what it does not hold, its lookups going through an `Only` policy to an upstream that delays and fails, each lookup shared by the requests that need it; `Overlay` reading the edited zone's apex NS RRset and its target's addresses and then asking its base for its DS; `Lazy` over a `Provider` whose facts are present, absent, or unknown and change as the world runs | `services/dns/authority/{mod,engine,overlay}.rs`, `services/dns/zone/{data,lazy}.rs`, `world/net/dns/upstream.rs` |
+| `Validation.tla` | The validator on a path root, tld, sld, with the data free per config (signer, parent proof, window, algorithm, changes after signing, the world's edits), clock skew, unreachable zones, the AD/CD rendering, `check_chain`, and two validators with providers, signers, and records of their own | `protocols/dns/dnssec/{validate,policy,proof}.rs`, `services/dns/zone/chain.rs`, `services/dns/resolver/front.rs` |
 
 ## Properties
 
@@ -37,9 +37,8 @@ proof of the rule and the counterexample that shows why it is there.
 | | `CancelPreservesWaiters` | invariant | after `Gone(c)`, every other client still waits on live work or has its answer |
 | | `OneAnswerPerQuery` | invariant | each client query gets at most one answer |
 | | `EveryAcceptedAnswered` | liveness | every accepted query is answered unless its client goes |
-| Authority | `NeverGuess` | invariant | every fact a server serves from its copy was filed from a response the real server of that zone sent to that question |
-| | `PolicyHolds` | invariant | no lookup the policy refuses reaches the upstream, root and TLD lookups included |
-| | `UnknownNeverNegative` | invariant | no NXDOMAIN or NODATA rests on an unknown fact of the lazy zone, or on a question the copy does not settle |
+| Authority | `PolicyHolds` | invariant | no lookup the policy refuses reaches the upstream, root and TLD lookups included |
+| | `UnknownNeverNegative` | invariant | no NXDOMAIN or NODATA rests on an unknown fact of the lazy zone, or on a question a base holds no response for |
 | | `CoherentRevision` | invariant | every reply from the lazy zone agrees with one revision of it |
 | | `OneAskPerNeed` | invariant | a request needs at most one lookup per fact per generation (the question, and for a crossing question first the overlay's `fict DS`), and requests that need the same lookup wait on one: no two pending lookups are the same |
 | | `NoAskAfterReply` | invariant over steps (`PROPERTY`) | once a lookup has come back to a request (a response, or Unreachable or NoReply in its place), the request never needs it again in that generation |
@@ -56,9 +55,8 @@ proof of the rule and the counterexample that shows why it is there.
 | | `Sha1Insecure` | invariant | under the default policy a zone whose DS names algorithm 5 or 7 below a validated chain is Insecure, never Secure (RFC 9905 section 2) |
 | | `RecordsOnly` | invariant | two validators, each with its own provider, signer, and records, reach the same result whenever their records are equal |
 | | `CheckChainAgrees` | invariant | a tree `check_chain` passes validates Secure or Insecure everywhere |
-| | `CopiedEditedNeverSecure` | invariant | copied records the world edited are never Secure: a copy keeps the real servers' RRSIGs and is never signed again |
-| | `EditedWorldZoneSecure` | reachability | a zone of the world's own that it edited and signed validates Secure under the world's anchor, so the property above is about copies; its `Never...` form must fail |
-| | `CopiedUneditedSecure`, `EditedUnderRealAnchorBogus`, `InventedUnderOptOutInsecure`, `InventedTldUnderNsecBogus`, `WorldRootAllSecure`, `UnsignedWithIanaAnchorBogus`, `NoAnchorsNotPerformed` | reachability | each scenario happens; its `Never...` form must fail |
+| | `EditedWorldZoneSecure` | reachability | a zone of the world's own that it edited and signed validates Secure under the world's anchor; its `Never...` form must fail |
+| | `EditedUnderRealAnchorBogus`, `InventedUnderOptOutInsecure`, `InventedTldUnderNsecBogus`, `WorldRootAllSecure`, `UnsignedWithIanaAnchorBogus`, `NoAnchorsNotPerformed` | reachability | each scenario happens; its `Never...` form must fail |
 
 ## Running
 
@@ -90,13 +88,12 @@ Configs:
 * **Authority:** `_base`, `_fail`, `_lazy`, `_advance`, `_share` (two
   requests waiting on one lookup). Ablations: `_nopolicy`, `_rootexempt`,
   `_unknownasabsent`, `_mixedrevision`, `_reask`, `_parkinview`,
-  `_noshare`, `_anyzone`, `_wakeone`.
+  `_noshare`, `_wakeone`.
 * **Validation:** `_paths`, `_skew`, `_unreachable`, `_policy`,
-  `_providers`, `_copies` (edits to copies and to the world's own zones),
-  `_witnesses` (every reachability witness, each expected to fail), and
+  `_providers`, `_witnesses` (every reachability witness, each expected to fail), and
   `_edits` (the witness that an edited zone of the world's own can be
   Secure). Ablations: `_trustupstreamad`, `_nopolicy`,
-  `_missingasinsecure`, `_signerpeek`, `_resigncopies`.
+  `_missingasinsecure`, `_signerpeek`.
 
 Bounds. Every counter is bounded in the enabling conditions of its
 actions, never by a `CONSTRAINT`, so the liveness checks are sound:
@@ -116,8 +113,7 @@ actions, never by a `CONSTRAINT`, so the liveness checks are sound:
   `_cancel`); one duplicate, one spoofed reply, one `Gone`.
 * **Authority:** revisions by `MaxRevision` 2 for world changes (inserts
   are bounded by the finite set of names, and filings by the finite set of
-  questions), generations by `MaxGeneration` 2 in `_advance`; one change to
-  the real data.
+  questions), generations by `MaxGeneration` 2 in `_advance`.
 * **Validation:** no counters; the data dimensions are finite sets.
 
 ## Results
@@ -165,41 +161,38 @@ in `_concurrent` explores the same states as the invariants there.
 | Exchanges_idonly | `MatchRequiresTuple` | violated | 64 | 5 | 1 s | Query, Send, Spoof, Deliver |
 | Exchanges_flushonly | `ObsoleteNeverPopulates` | violated | 282 | 6 | 0 s | Query, Send, Serve, Advance, Deliver |
 | Exchanges_cancelshared | `CancelPreservesWaiters` | violated | 13 | 4 | 1 s | Query, Query, Gone |
-| Authority_base | the 6 invariants, `NoAskAfterReply`, `EveryParkedAnswered` | pass | 401424 | 31 | 3-74 s | |
-| Authority_fail | the 6 invariants, `NoAskAfterReply`, `EveryParkedAnswered` | pass | 107712 | 26 | 1-9 s | |
-| Authority_lazy | the 6 invariants, `NoAskAfterReply`, `EveryParkedAnswered` | pass | 784 | 12 | 0-1 s | |
-| Authority_advance | the 6 invariants, `NoAskAfterReply`, `EveryParkedAnswered` | pass | 46304 | 21 | 0-2 s | |
-| Authority_share | the 6 invariants, `NoAskAfterReply`, `EveryParkedAnswered` | pass | 2970 | 15 | 0-1 s | |
-| Authority_nopolicy | `PolicyHolds` | violated | 7 | 2 | 0 s | Step: the root server's copy lacks leak.evil, and its lookup reaches the upstream |
+| Authority_base | the 5 invariants, `NoAskAfterReply`, `EveryParkedAnswered` | pass | 42000 | 30 | 1-6 s | |
+| Authority_fail | the 5 invariants, `NoAskAfterReply`, `EveryParkedAnswered` | pass | 25488 | 25 | 0-2 s | |
+| Authority_lazy | the 5 invariants, `NoAskAfterReply`, `EveryParkedAnswered` | pass | 296 | 11 | 0 s | |
+| Authority_advance | the 5 invariants, `NoAskAfterReply`, `EveryParkedAnswered` | pass | 9095 | 18 | 0-1 s | |
+| Authority_share | the 5 invariants, `NoAskAfterReply`, `EveryParkedAnswered` | pass | 1026 | 14 | 0 s | |
+| Authority_nopolicy | `PolicyHolds` | violated | 7 | 2 | 0 s | Step: the root server's base holds nothing for leak.evil, and its lookup reaches the upstream |
 | Authority_rootexempt | `PolicyHolds` | violated | 7 | 2 | 0 s | Step: the same lookup, exempt because it goes to a root server |
 | Authority_unknownasabsent | `UnknownNeverNegative` | violated | 2 | 2 | 0 s | View: b.fict is unknown and the wildcard absent, so NXDOMAIN |
-| Authority_mixedrevision | `CoherentRevision` | violated | 43 | 4 | 0 s | ReadName (a.fict absent), WorldChange, ReadRest (the wildcard present): a wildcard answer no revision gives |
-| Authority_reask | `OneAskPerNeed` | violated | 162 | 4 | 0 s | Step (the policy refuses leak.evil: NoReply), Observe, Step: the request needs the lookup it made and puts it again |
-| Authority_reask | `NoAskAfterReply` | violated | 162 | 4 | 0 s | the same trace: the second Step needs the lookup whose NoReply came back |
-| Authority_parkinview | `NoLockAcrossAsk` | violated | 6 | 3 | 0 s | ReadOverlay, Step: the overlay reads the lazy zone, then parks on its DS lookup while it still holds that read |
-| Authority_noshare | `OneAskPerNeed` | violated | 7 | 3 | 0 s | Step, Step: two requests for www.real at the root server each put a lookup of it |
-| Authority_anyzone | `NeverGuess` | violated | 73 | 5 | 0 s | Step (the root server looks www.real up), Upstream, Observe (the response is filed into both copies), Step: the TLD server answers from the root's response |
-| Authority_wakeone | `EveryParkedAnswered` | violated | 802 | stuttering | 1 s | the two requests for www.real at the root server wait on one lookup; when it ends, only the first is woken, and the second stays parked |
-| Validation_paths | the 11 invariants | pass | 681984 | 1 | 1-3 s | |
+| Authority_mixedrevision | `CoherentRevision` | violated | 34 | 4 | 0 s | ReadName (a.fict absent), WorldChange, ReadRest (the wildcard present): a wildcard answer no revision gives |
+| Authority_reask | `OneAskPerNeed` | violated | 129 | 4 | 0 s | Step (the policy refuses leak.evil: NoReply), Observe, Step: the request needs the lookup it made and puts it again |
+| Authority_reask | `NoAskAfterReply` | violated | 129 | 4 | 0 s | the same trace: the second Step needs the lookup whose NoReply came back |
+| Authority_parkinview | `NoLockAcrossAsk` | violated | 5 | 3 | 0 s | ReadOverlay, Step: the overlay reads the lazy zone, then parks on its DS lookup while it still holds that read |
+| Authority_noshare | `OneAskPerNeed` | violated | 6 | 3 | 0 s | Step, Step: two requests for www.real at the root server each put a lookup of it |
+| Authority_wakeone | `EveryParkedAnswered` | violated | 210 | stuttering | 0 s | the two requests for www.real at the root server wait on one lookup; when it ends, only the first is woken, and the second stays parked |
+| Validation_paths | the 11 invariants | pass | 497664 | 1 | 1-2 s | |
 | Validation_skew | the 11 invariants | pass | 10368 | 1 | 0-1 s | |
 | Validation_unreachable | the 11 invariants | pass | 147456 | 1 | 0-1 s | |
 | Validation_policy | the 11 invariants | pass | 3456 | 1 | 0-1 s | |
-| Validation_providers | the 11 invariants | pass | 303104 | 1 | 1-2 s | |
-| Validation_copies | the 11 invariants and `CopiedEditedNeverSecure` | pass | 681984 | 1 | 1-3 s | |
-| Validation_witnesses | each of the 7 `Never...` forms, alone | violated (reachable) | 1 | 1 | 0-1 s | an initial state of each scenario |
+| Validation_providers | the 11 invariants | pass | 262144 | 1 | 1 s | |
+| Validation_witnesses | each of the 6 `Never...` forms, alone | violated (reachable) | 1 | 1 | 0-1 s | an initial state of each scenario |
 | Validation_edits | `NeverEditedWorldZoneSecure` | violated (reachable) | 1 | 1 | 1 s | a world zone signed with key B under anchor B, an RRset of it edited and signed again: Secure |
 | Validation_trustupstreamad | `AdOnlySecure` | violated | 1 | 1 | 0 s | no anchors configured (NotPerformed), the upstream reply has AD, the client gets AD |
 | Validation_nopolicy | `Sha1Insecure` | violated | 1 | 1 | 1 s | a chain of key A where sld's DS names algorithm 5: Secure |
 | Validation_missingasinsecure | `InsecureNeedsProof` | violated | 1 | 1 | 1 s | the root cannot be fetched: Insecure with no proof |
 | Validation_signerpeek | `RecordsOnly` | violated | 1 | 1 | 0 s | sld's RRset changed after signing: Bogus for signer B, Secure for signer A |
-| Validation_resigncopies | `CopiedEditedNeverSecure` | violated | 1 | 1 | 0 s | a copy signed with key A under anchor A, its sld RRset edited and signed again: Secure |
 
 ## Modelling choices
 
 General:
 
 * Names, records, and messages are abstract values, not wire bytes. The
-  wire, `fit`, the answer algorithm, and learned zones' facts are Lean's;
+  wire, `fit`, and the answer algorithm are Lean's;
   these specs check the behavior of the engines around them.
 * Properties that relate two states (`ReferralsDescend`,
   `MatchRequiresTuple`, `DuplicateHarmless`) are written as `[][A]_vars`
@@ -321,40 +314,16 @@ Exchanges:
 
 Authority:
 
-* A server of a learned zone answers from its copy and looks up what the
-  copy does not settle, as `Copies` does: a lookup of the client's question
-  at its own address. A response is filed into the copy the lookup names
-  and settles its question. The root's response to a question below the
-  TLD is a referral, a cut that refers the name it was for and the names
-  above it, as `Learned` refers below a filed cut: the referral for
-  `a.fict` settles `fict DS`, but not the other way round. A copy belongs
-  to one session: `Advance` drops it.
-* The questions carry no CNAME or DNAME chains, so no lookup is for the
-  name a chain reached, which `Copies` looks up when the response to the
-  client's question was filed and did not settle it; a server that
-  answers as the RFCs say carries the whole chain in that response.
-* `Copies::keep` files a response into the copy the lookup names, which
-  `ObserveOne` models. Its other branches are not in this spec: filing a
-  response from a zone below the lookup's into that zone's copy
-  (`Learned::child_answering`), the SOA questions that find such a zone's
-  apex, an address answering without a zone its real server turns out
-  not to serve, the client's question looked up once at such an address
-  to find a child zone it does serve (`Copies::lame_holding`), the CNAME
-  looked up at an alias whose server answered NSEC there with NODATA
-  while its own denial records show the CNAME
-  (`Learned::stops_at_alias`), and a question the real server answered
-  with an error RCODE, which gets that RCODE (`Learned::failed`);
-  `RealRcode` gives only NOERROR and NXDOMAIN. `extras/tests/copies/learned.rs`
-  checks them: `copies_learn_a_child_zone_its_server_also_serves`,
-  `copies_find_a_zone_below_a_cut_they_hold`,
-  `copies_place_an_alias_below_a_cut`,
-  `copies_drop_a_zone_their_real_server_does_not_serve`,
-  `a_lame_address_finds_the_child_its_server_serves_in_any_order`,
-  `a_copy_follows_an_alias_its_server_stopped_at_for_nsec`,
-  `an_address_that_refuses_to_place_a_name_answers_refused`, and
-  `a_copy_answers_with_the_error_its_real_server_gave`. The Lean model's
-  `Authority.respond` has the error RCODE branch, and `learned.json`
-  drives it.
+* The root and TLD servers' base is any authority that may return
+  `Need`: it answers a question from the response a lookup of that
+  question filed, and returns `Need` with a lookup of the client's
+  question at its own address for a question it holds no response for.
+  The engine files what the lookup gives through `Authority::file`, and
+  the base files it under that question. How an authority files a
+  response, and which other questions a response settles, is its own and
+  is not modelled. What a base filed belongs to one session: `Advance`
+  drops it. The upstream's responses are NOERROR, or NXDOMAIN for
+  `nx.real`.
 * `OneAskPerNeed` checks that a request needs at most one lookup per fact
   per generation, and that requests needing the same lookup wait on one
   pending lookup (`AuthorityEngine::park`); `_noshare`, which puts a lookup
@@ -364,22 +333,16 @@ Authority:
   breaks both. `_wakeone`, which wakes only the request that started a
   lookup when it ends, leaves the others parked and breaks
   `EveryParkedAnswered`.
-* The root and TLD servers both run `Overlay` over their copies, as
-  `Mirror::wrap` puts one on every server a mirror makes. Before it asks its
-  base for `fict DS`, the overlay reads the edited zone's apex NS RRset and
-  the addresses of its target `ns.fict` from the lazy zone, as
-  `Overlay::respond` asks the inner authority for `<apex> NS`. The real TLD
-  server serves the parent, so the TLD server refers, and SERVFAILs when
-  the target's address is not there. The referral rests on those facts and
-  on the copied DS response, so `UnknownNeverNegative`,
-  `CoherentRevision`, and `NeverGuess` cover it. The real root server does
-  not serve the parent, so the root server answers the question as its
-  base does, from its copy, after a lookup of the question itself, which
-  the referral for `fict DS` does not settle.
-* `NeverGuess` checks each copied fact a reply rests on against the
-  responses the upstream sent, per lookup: server and question.
-  `_anyzone`, where a response is filed into every copy rather than the one
-  its lookup names, serves the TLD's response from the root's copy.
+* The root and TLD servers both run `Overlay` over their base. Before it
+  asks its base for `fict DS`, the overlay reads the edited zone's apex NS
+  RRset and the addresses of its target `ns.fict` from the lazy zone, as
+  `Overlay::respond` asks the inner authority for `<apex> NS`. The TLD
+  server's base serves the parent, so the TLD server refers, and
+  SERVFAILs when the target's address is not there. The referral rests on
+  those facts and on the filed DS response, so `UnknownNeverNegative` and
+  `CoherentRevision` cover it. The root server's base does not serve the
+  parent, so the root server answers the question as its base does, after
+  a lookup of the question itself.
 * `Lazy::view` takes the zone's lock once, so the view is one atomic step.
   `MixedRevision` splits it into two steps, reading the name and then the
   wildcard, and the world may change between them.
@@ -391,9 +354,9 @@ Authority:
   a refused lookup comes back as NoReply at once, as `Only` gives
   `Looked::NoReply`. `_nopolicy` and `_rootexempt` both let it reach the
   root server.
-* `Advance` drops every copy, abandons the pending lookups, and restarts
-  parked requests with no lookups made; what an abandoned lookup gives is
-  ignored when it arrives.
+* `Advance` drops what every base filed, abandons the pending lookups,
+  and restarts parked requests with no lookups made; what an abandoned
+  lookup gives is ignored when it arrives.
 * `NoLockAcrossAsk` holds because a view never waits and the overlay lets
   go of what it read from the lazy zone before it parks. The overlay's read
   is a step of its own (`ReadOverlay`), after which nothing but that
@@ -427,14 +390,9 @@ Validation:
   (`lazy_agrees_complete`, `signer_agnostic`). The check here is that the
   validator reads nothing else; `SignerPeek` lets it skip the signature
   check for signer A's records.
-* A copy (`Copied`) publishes the real zone's records with the RRSIGs the
-  real servers sent, made with the real key A or none at all: the world's
-  key B never signs a copy. The world signs its own zones over its edits,
-  but it holds no real key, so its edit to a copy (`edited`) is a change
-  after signing (`Stale`), and `CopiedEditedNeverSecure` holds for that
-  reason only: `_resigncopies` signs a copy again after the edit and
-  breaks it, and `_edits` shows an edited zone of the world's own
-  validating Secure under the world's anchor.
+* The world signs its zones over their edits, so an edit (`edited`) is
+  never a change after signing; `_edits` shows an edited zone of the
+  world's own validating Secure under the world's anchor.
 * `check_chain` reports five problems: `DsMismatch`, `NoDsProofMissing`,
   `WindowClosed`, `UnsupportedAlgorithm`, and `SignatureInvalid`. A zone
   whose RRset changed after signing (a `Zone::with` after `Zone::signed`)
@@ -486,12 +444,12 @@ Authority:
 | Model | Rust |
 |---|---|
 | `Respond(r)` | `Authority::respond(req, local, server, client) -> Step` (`Reply`, `Need(Lookup)`, `Silent`) |
-| `copy[z]`, `Entry`, `Settles` | the zone's `Learned` copy in `Copies`, and the facts a filing gives; a filed cut refers the name the referral was for and the names above it (`LearnedView::cut`) |
+| `filed[z]` | what the base at server `z` filed through `Authority::file` in this session |
 | `looked[r]` | `Waiter::looked` |
 | `pending`, `waiting` | `AuthorityEngine.lookups: BTreeMap<Token, Pending>` and each `Pending`'s waiters |
 | `atUpstream`, `obsq` | the driver carrying `Action::Lookup` to the `Upstream` and back as `Input::Looked` |
 | `PolicyPasses` | `Only<U, P>` with `P: Fn(&Lookup) -> bool`; a refused lookup is `Looked::NoReply` |
-| `ObserveOne` | `AuthorityEngine::complete`: `Authority::file`, as `Copies::keep` files a response from the zone the lookup names, then `respond` again for each waiter |
+| `ObserveOne` | `AuthorityEngine::complete`: `Authority::file` for the lookup, then `respond` again for each waiter |
 | `View(r)` | `Lazy::view` under its one lock, then `zone::answer` |
 | `Provider(w, n)` | `Provider::lookup -> Fact<Vec<RecordSet>>` |
 | `ins`, `history`, `rev` | the lazy zone's `Mutex<Held>`: the nodes it holds and their `Revision` |
@@ -510,5 +468,5 @@ Validation:
 | result kinds | `Validation::{NotPerformed, Secure, Insecure(Insecure), Bogus(EdeCode), Indeterminate}`; reasons `Insecure::{ProvenNoDs, OptOutCovered, NoAnchor, UnsupportedAlgorithm}` and EDE codes 5, 6, 7, 8, 9, 12 |
 | `Established`, `Rendered` | what `Resolver` established (NotPerformed for a fresh answer under CD) and its front: AD, CD, SERVFAIL |
 | `ChainProblems` | `check_chain -> Vec<ChainProblem>` |
-| `provider1`, `impl1` | `Zone`, `Lazy`, or `Learned`; two `Sign` implementations |
-| `edited`, `Stale` | a world's edit to a zone; `Learned` serves the RRSIGs it filed as the real servers sent them and signs nothing (`View::sign` is `None`), so an edited copied RRset keeps RRSIGs that no longer cover it |
+| `provider1`, `impl1` | `Zone` or `Lazy`; two `Sign` implementations |
+| `edited`, `Stale` | a world's edit to a zone, which the world signs again; an RRset changed after signing (a `Zone::with` after `Zone::signed`) |
