@@ -28,3 +28,16 @@ import Mptcp
 #print axioms Mptcp.fin_blocks_later_data
 #print axioms Mptcp.fallback_keeps_gap
 #print axioms Mptcp.singleton_length_rule
+#print axioms Ipv4.decode_encode
+#print axioms Ipv4.encoded_length
+#print axioms Ipv4.unknown_preserved
+#print axioms Ipv4.route_length_rule
+#print axioms Ipv4.timestamp_length_rule
+#print axioms Ipv4.malformed_frame_preserved
+#print axioms Ipv4.walk_encode
+#print axioms Ipv4.echo_unknown
+#print axioms Ipv4.security_length_rule
+#print axioms Ipv4.stream_length_rule
+#print axioms Ipv4.alert_length_rule
+#print axioms Ipv4.eol_stops
+#print axioms Ipv4.walk_options_encode

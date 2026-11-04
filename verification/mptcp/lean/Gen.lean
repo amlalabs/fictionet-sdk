@@ -163,6 +163,81 @@ def transmitVectors (seed : Nat) (emit : Json → IO Unit) : IO Unit := do
     emit (obj [("key",num key), ("offset",num offset),
       ("dsn",num ((base + offset) % 18446744073709551616))])
 
+def ipv4Fields : Ipv4.Opt → List Nat
+  | .eol => [0]
+  | .nop => [1]
+  | .route kind pointer slots => [2,kind,pointer] ++ slots
+  | .timestamp pointer flags slots => [3,pointer,flags] ++ slots
+  | .security data => [4] ++ data
+  | .stream data => [5] ++ data
+  | .alert data => [6] ++ data
+  | .unknown kind data => [7,kind] ++ data
+  | .malformed kind data => [8,kind] ++ data
+
+def ipv4Case (input : List Nat) : Json :=
+  let options := Ipv4.parse input
+  let output := options.flatMap Ipv4.emit
+  let malformed := options.any (fun o => match o with | .malformed _ _ => true | _ => false)
+  let base := [("input",nums input), ("fields",toJson (options.map ipv4Fields))]
+  if malformed || output.length > 40 then obj (base ++ [("error",toJson true)])
+  else obj (base ++ [("output",nums output)])
+
+def ipv4Vectors (seed : Nat) (emit : Json → IO Unit) : IO Unit := do
+  for input in [[],[0],[1],[0,255],[1,0,255],[7],[7,0],[7,1],[7,8,4],
+      [7,3,3,1,0],[68,4,4,0,1,0],[148,4,0,0,136,4,0,1]] do
+    emit (ipv4Case input)
+  for kind in [:256] do
+    for length in [:42] do
+      let data := octets (step (seed + kind * 256 + length)) length
+      emit (ipv4Case (Ipv4.framed kind data))
+  for kind in [7,131,137] do
+    for pointer in [0,1,3,4,5,8,39,40,41,255] do
+      for length in [:39] do
+        emit (ipv4Case (Ipv4.framed kind (pointer :: octets (seed + length) length)))
+  for flags in [:256] do
+    for pointer in [0,4,5,6,9,41,255] do
+      for length in [:38] do
+        emit (ipv4Case (Ipv4.framed 68 (pointer :: flags :: octets (seed + flags + length) length)))
+
+def ipv4EchoCase (input host remote : List Nat) (timestamp : Nat) : Json :=
+  let base := [("input", nums input), ("local", nums host), ("remote", nums remote),
+               ("timestamp", num timestamp)]
+  match Ipv4.echo (Ipv4.parse input) host remote (be 4 timestamp) with
+  | none => obj (base ++ [("error", toJson true)])
+  | some (destination, options) => obj (base ++
+      [("destination", toJson destination), ("fields", toJson (options.map ipv4Fields)),
+       ("output", nums (options.flatMap Ipv4.emit))])
+
+def ipv4EchoVectors (seed : Nat) (emit : Json → IO Unit) : IO Unit := do
+  let host := [192,0,2,1]
+  let remote := [198,51,100,2]
+  let timestamp := step seed % 86400000
+  let send := fun input => emit (ipv4EchoCase input host remote timestamp)
+  for input in [[],[0],[1],[7],[7,2],[68,3,5],[7,3,4,7,3,4],
+      [68,4,5,0,68,4,5,0],[131,3,4,137,3,4],
+      [148,4,0,0,1,136,4,0,1,0,7,3,4],
+      [131,7,8,198,51,100,2],
+      [131,11,12,198,51,100,2,203,0,113,3]] do
+    send input
+  for kind in [7,131,137] do
+    for pointer in [:256] do
+      for count in [:10] do
+        send (Ipv4.framed kind (pointer :: octets (seed + count) (4 * count)))
+  for flags in [:256] do
+    for pointer in [0,4,5,6,8,9,10,12,13,17,21,29,37,40,41,255] do
+      for length in [0,4,8,12,16,24,32,36] do
+        send (Ipv4.framed 68 (pointer :: flags :: octets (seed + flags + length) length))
+  for address in [host,remote,[0,0,0,0],[255,255,255,255],[224,0,0,1]] do
+    for pointer in [5,6,9,13,17,21] do
+      send (Ipv4.framed 68 ([pointer,3] ++ address ++ [0,0,0,0] ++ host ++ [0,0,0,0]))
+  for kind in [:256] do
+    send (Ipv4.framed kind (octets (seed + kind) 4))
+  for ordering in [[7,68,131],[131,68,7],[68,7,137]] do
+    let parts := ordering.map (fun kind => if kind = 68 then
+        Ipv4.framed kind ([5,1] ++ octets seed 8)
+      else Ipv4.framed kind (8 :: octets seed 8))
+    send parts.flatten
+
 def write (dir : System.FilePath) (name : String)
     (generate : (Json → IO Unit) → IO Unit) : IO Unit := do
   IO.FS.withFile (dir / (name ++ ".json")) .write fun handle => do
@@ -186,3 +261,5 @@ def main (args : List String) : IO Unit := do
   write dir "layout" layoutVectors
   write dir "data" (dataVectors seed)
   write dir "transmit" (transmitVectors seed)
+  write dir "ipv4" (ipv4Vectors seed)
+  write dir "ipv4_echo" (ipv4EchoVectors seed)

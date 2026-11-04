@@ -11,6 +11,7 @@ network or a refinement proof of all Rust instructions.
 | Connection | `demos/honeypot/src/mptcp.rs`: MP_CAPABLE third ACK with/without data or the option; MP_JOIN SYN/ACK authentication, cookie retention/eviction, missing or bad HMAC, MP_TCPRST refusal, plain fallback, keyed MP_FASTCLOSE | Joined subflows authenticated; cookie state retained; fast close authenticated; joining never falls back to plain TCP; third ACK data mapped; reset reason defined |
 | Data | `src/stdlib/protocols/mptcp.rs`: mappings from subflow offsets to data offsets, complete checksum-validated arrivals, data-level reassembly, DATA_FIN and fallback | Mapping immutable; delivery contiguous and ordered; no bytes at or beyond DATA_FIN; corrupt data never accepted; fallback cannot discard a gap or FIN |
 | Listener | `src/stdlib/network/tcp.rs`: SYN backlog, cookies when full, repeat SYNs, completion, application accept, close and TIME-WAIT expiry | Ready queue bounded; unauthenticated cookies never open connections; repeat SYNs reuse state; TIME-WAIT and a live connection cannot own the same tuple |
+| Observation signals | Per-attachment endpoint tuple and initial sequence; first and repeated SYNs, matching server answers and third ACKs, payload, close and expiry | Trigger needs initial IPv4 options and a live pending repeat; no-data needs MP_CAPABLE and no payload; handshake sequences match; repeat SYN preserves initial evidence and other attempts; completed attempts stay complete |
 | Observation | `demos/honeypot/src/observe.rs` and the source lifetime contract around routed connections | Exact sliding-window counts; no source retained after its last connection closes; cleanup of an obsolete answer epoch preserves a fresh answer |
 
 Bounds are fixed in the checked configurations: Data has three subflow slots
@@ -56,10 +57,46 @@ source ownership contract of live connections, not an actual extra routing
 map. The Rust test `a_public_route_keeps_nothing_per_source` checks that property
 with real simulated connections and detachment. No new source table was added.
 
+`Observation_signals.cfg` runs an independent signal sub-specification in the
+same module. It retains the two sources, three SYNs, two-tick window and four-tick
+clock, adding two initial sequence values per tuple. This avoids the unrelated
+counter/routing state product without pruning any signal states. A source here
+abstracts attachment plus both endpoints; distinct initial sequences retain
+separate attempts. Plain SYNs without IPv4 options or MP_CAPABLE create no probe.
+The first SYN can carry payload; a repeat retains the first options and time,
+and cannot reopen a completed attempt. Matching SYN-ACKs can replace the server
+sequence. Pending data and close require the client's next sequence, while
+completed data follows the tuple. Close and expiry are per-attempt subactions;
+payload on a third ACK is included in completion. Packet parsing, checksums,
+32-bit arithmetic and simultaneous mutation of several attempts are covered by
+Rust tests rather than asserted as a refinement of this finite state model.
+The model permits closing pending attempts, so no-data is not claimed to prove
+a completed handshake or malicious intent.
+
+Signal evidence and completed-handshake records are sets of every distinct
+emitted record. The first version kept ordered sequences; neither transitions
+nor properties read their ordering or multiplicity. Mapping each sequence to
+its set of elements commutes with every update, and universal safety invariants
+have exactly the same truth value over both representations. This removes
+irrelevant event permutations and duplicates while retaining every distinct
+piece of evidence. No source, clock, sequence, event or probe bound is reduced,
+and no event condition or safety requirement is relaxed. The original
+Observation counting history is unchanged because its multiplicity matters.
+
+The two properties that quantify `SignalSyn` first test its shared guard:
+`syns < MaxSyns /\ now < MaxTime /\ syns' = syns + 1`. Every `SignalSyn`
+action already implies that guard, so when it is false every implication under
+the original quantifier is true. Guarding the unchanged quantified formula is
+therefore logically equivalent and avoids reevaluating all SYN parameter
+combinations on non-SYN transitions. This changes no transition, bound or
+property requirement.
+
 ## Ablations
 
 Each `without_...cfg` disables one guard and names the one invariant that must
-fail. The runner checks each property separately and rejects unexpected passes.
+fail. The runner checks each ablation property separately and rejects unexpected
+passes. Passing configurations keep all their checks enabled in one complete
+exploration; only a successful, error-free completion passes the entire group.
 Connection removes HMAC validation, cookie retention, fast-close key validation,
 or the ban on join fallback. Data removes mapping immutability, gap waiting,
 the FIN boundary, checksum validation, or fallback preservation. Listener removes

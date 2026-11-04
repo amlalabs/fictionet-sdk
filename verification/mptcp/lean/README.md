@@ -8,6 +8,7 @@ protocol behaviour, native decision oracles, or unfinished proofs. Use
 | Module | Theorems and executable reference |
 |---|---|
 | Option, Codec | Every well-formed option round-trips through `emit` and `parse`; an independent length table matches acceptance of every multi-byte option; absent subtype, unknown/experimental subtypes and overlong data are errors |
+| Codec IPv4 | The actual option walker inverts each well-formed encoded option; exact route and timestamp body lengths, preserved unknown payloads and malformed framing, and the forty-byte encoded bound; executable Linux reply reference |
 | Pure | Network-order encoding preserves every representable key; token is the high 32 digest bits and IDSN the low 64; SHA-256 output is exactly 32 octets; ordered HMAC inputs have the required lengths; checksum is a 16-bit complement that balances the one's-complement sum; odd bytes occupy the high half-word; DSN expansion preserves the low bits, stays in 64 bits, and chooses a signed half-window offset |
 | Layout | All combinations of standard options fit; padded headers align to four bytes; every extra option within `room` fits; explicit core and extras Linux SYN/segment room; the RFC 5681 second-full-segment ACK threshold |
 | Data | Failed receive state is terminal; FIN prevents later data; fallback cannot discard a data gap |
@@ -30,6 +31,31 @@ presence/width flags, and ADD_ADDR's echo, address size and optional port.
 Reserved bits are ignored when parsing and emitted as zero. An arbitrary wire
 string is therefore compared with its canonical encoding, not asserted to be
 identical after decoding. Unknown subtypes are typed errors, not invented values.
+
+The IPv4 reference keeps route slots and timestamps as octets, independently of
+Rust's typed addresses and integers. `Ipv4.walk_encode` proves the inverse for
+the actual length-fuelled iterator, including EOL and NOP.
+`Ipv4.walk_options_encode` extends that inverse to complete typed lists by
+induction on the list and the iterator fuel. Its structural precondition requires
+well-formed elements and EOL only at the end; the result holds even beyond the
+forty-byte total limit enforced by the Rust encoder. `Ipv4.decode_encode`
+also checks complete individual frames. Well-formedness states field shapes,
+pointers and lengths; it does not assume successful decoding or the inverse.
+Unknown timestamp flags retain their opaque bytes. Malformed framed records
+retain the received length and remaining bytes; they cannot be encoded as valid
+options. EOL terminates parsing, so trailing padding is intentionally absent
+from the canonical encoding. Header padding is a separate packet-builder step.
+
+The Linux IPv4 echo reference models receive compilation followed by reply
+construction: RR and Timestamp advance twice when space permits, Timestamp
+overflow and prespecified-address classification are explicit, and consumed
+source routes reverse into a first hop and return route. It rejects malformed
+and duplicate meaningful options and drops unrelated options. The classifier
+in differential vectors distinguishes the local, unspecified, broadcast and
+multicast addresses from unicast; the Rust helper accepts the world's classifier.
+Vectors compare every decoded field, destination and emitted byte. These are
+checks against an executable reference, not a theorem that Linux implements
+that reference. The echo theorem only proves unknown options are omitted.
 
 The SHA-256 implementation follows FIPS 180-4 and HMAC uses the fixed 16-byte key
 material of MP_JOIN. It is executable Lean, independent of Rust's ring calls.

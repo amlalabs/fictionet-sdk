@@ -19,8 +19,13 @@ keys and byte payloads; it does not change the exhaustive length/flag cases.
 
 Each cargo, Lake, generator and TLC subprocess has its own 12 GiB systemd scope.
 They run sequentially. TLC uses `-Xmx6g`, two workers for passing configurations
-and one for counterexamples. An ablation must violate the property named in its
-configuration; a parse error, a crash, and a passing ablation all fail the run.
+and one for counterexamples. Each passing configuration runs once with its
+entire original configuration and every invariant and action property enabled.
+The report marks its properties passed only after complete error-free exploration
+and a successful process exit; any failure fails the grouped configuration.
+This avoids exploring an identical graph again for each property. Ablation
+properties still run separately and must violate exactly the property named in
+their configuration; a parse error, a crash, and a passing ablation fail the run.
 The Lean axiom audit rejects anything beyond `propext`, `Quot.sound`, and
 `Classical.choice`.
 
@@ -41,6 +46,8 @@ systemd-run --user --scope -p MemoryMax=12G -q \
 | Suite | Compared with Rust |
 |---|---|
 | Codec | Exact error variant and parameters, every decoded semantic field, and canonical encoded bytes; all 256 first bytes, every DSS flag combination, valid and invalid lengths through overlong options, and MP_CAPABLE algorithm/version cases |
+| IPv4 codec | Every typed field and canonical byte, all kinds and lengths, route pointers, all timestamp overflow/flag combinations, malformed framing and EOL termination |
+| IPv4 echo | Linux reply fields, destination and bytes for RR, Timestamp, source route reversal, overflow, prespecified address classification, duplicates, option ordering and malformed input |
 | Crypto | SHA-256 token and IDSN, full MP_JOIN HMAC with ordered keys/nonces, DSS checksum with odd/even payloads and DATA_FIN length |
 | Sequence | Short and full sequence expansion, both wrapping boundaries and the signed half-window tie |
 | Layout | Real simulated TCP SYN-ACK option order, NOPs, padded header length and MPTCP space, using default core settings or `fictionet_extras::linux::settings()` |

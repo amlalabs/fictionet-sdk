@@ -419,3 +419,156 @@ fn transmit() {
         );
     });
 }
+
+fn ipv4_fields(option: &fictionet::stdlib::network::ip::Ipv4Option) -> Vec<u64> {
+    use fictionet::stdlib::network::ip::{Ipv4Option, Ipv4Timestamp};
+    let mut result = Vec::new();
+    match option {
+        Ipv4Option::EndOfList => result.push(0),
+        Ipv4Option::NoOperation => result.push(1),
+        Ipv4Option::RecordRoute { pointer, routes }
+        | Ipv4Option::LooseSourceRoute { pointer, routes }
+        | Ipv4Option::StrictSourceRoute { pointer, routes } => {
+            let kind = match option {
+                Ipv4Option::RecordRoute { .. } => 7,
+                Ipv4Option::LooseSourceRoute { .. } => 131,
+                _ => 137,
+            };
+            result.extend([2, kind, (*pointer).into()]);
+            for address in routes {
+                result.extend(address.octets().map(u64::from));
+            }
+        }
+        Ipv4Option::Timestamp {
+            pointer,
+            overflow,
+            timestamps,
+        } => {
+            let flags = match timestamps {
+                Ipv4Timestamp::Timestamps(_) => 0,
+                Ipv4Timestamp::Addresses(_) => 1,
+                Ipv4Timestamp::Prespecified(_) => 3,
+                Ipv4Timestamp::Unknown { flags, .. } => *flags,
+            };
+            result.extend([3, (*pointer).into(), u64::from(overflow << 4 | flags)]);
+            match timestamps {
+                Ipv4Timestamp::Timestamps(entries) => {
+                    for value in entries {
+                        result.extend(value.to_be_bytes().map(u64::from));
+                    }
+                }
+                Ipv4Timestamp::Addresses(entries) | Ipv4Timestamp::Prespecified(entries) => {
+                    for (address, value) in entries {
+                        result.extend(address.octets().map(u64::from));
+                        result.extend(value.to_be_bytes().map(u64::from));
+                    }
+                }
+                Ipv4Timestamp::Unknown { data, .. } => {
+                    result.extend(data.iter().copied().map(u64::from))
+                }
+            }
+        }
+        Ipv4Option::Security {
+            security,
+            compartments,
+            handling_restrictions,
+            transmission_control_code,
+        } => {
+            result.push(4);
+            for value in [security, compartments, handling_restrictions] {
+                result.extend(value.to_be_bytes().map(u64::from));
+            }
+            result.extend(transmission_control_code.iter().copied().map(u64::from));
+        }
+        Ipv4Option::StreamId(value) | Ipv4Option::RouterAlert(value) => {
+            result.push(if matches!(option, Ipv4Option::StreamId(_)) {
+                5
+            } else {
+                6
+            });
+            result.extend(value.to_be_bytes().map(u64::from));
+        }
+        Ipv4Option::Unknown { kind, data } | Ipv4Option::Malformed { kind, data } => {
+            result.extend([
+                if matches!(option, Ipv4Option::Unknown { .. }) {
+                    7
+                } else {
+                    8
+                },
+                (*kind).into(),
+            ]);
+            result.extend(data.iter().copied().map(u64::from));
+        }
+    }
+    result
+}
+
+#[test]
+fn ipv4() {
+    use fictionet::stdlib::network::ip::{Ipv4Options, encode_ipv4_options};
+    cases("ipv4", |case| {
+        let input = bytes(&case["input"]);
+        let options: Vec<_> = Ipv4Options::new(&input).collect();
+        assert_eq!(
+            serde_json::json!(options.iter().map(ipv4_fields).collect::<Vec<_>>()),
+            case["fields"],
+            "{case}"
+        );
+        let encoded = encode_ipv4_options(&options);
+        if case["error"].as_bool() == Some(true) {
+            assert!(encoded.is_err(), "{case}");
+        } else {
+            let encoded = encoded.unwrap();
+            assert_eq!(encoded, bytes(&case["output"]), "{case}");
+            assert_eq!(
+                Ipv4Options::new(&encoded).collect::<Vec<_>>(),
+                options,
+                "{case}"
+            );
+        }
+    });
+}
+
+#[test]
+fn ipv4_echo() {
+    use fictionet::stdlib::network::ip::{Ipv4Options, encode_ipv4_options};
+    use std::net::Ipv4Addr;
+    cases("ipv4_echo", |case| {
+        let address = |name: &str| Ipv4Addr::from(<[u8; 4]>::try_from(bytes(&case[name])).unwrap());
+        let local = address("local");
+        let input = bytes(&case["input"]);
+        let options: Vec<_> = Ipv4Options::new(&input).collect();
+        let reply = fictionet_extras::linux::ipv4_options(
+            &options,
+            local,
+            address("remote"),
+            u32::try_from(n(case, "timestamp")).unwrap(),
+            |address| {
+                address != local
+                    && !address.is_unspecified()
+                    && !address.is_broadcast()
+                    && !address.is_multicast()
+            },
+        );
+        if case["error"].as_bool() == Some(true) {
+            assert!(reply.is_none(), "{case}");
+        } else {
+            let reply = reply.unwrap_or_else(|| panic!("{case}"));
+            assert_eq!(
+                serde_json::json!(reply.destination.map(|address| address.octets())),
+                case["destination"],
+                "{case}"
+            );
+            assert_eq!(
+                serde_json::json!(reply.options.iter().map(ipv4_fields).collect::<Vec<_>>()),
+                case["fields"],
+                "{case}"
+            );
+            assert_eq!(
+                encode_ipv4_options(&reply.options).unwrap(),
+                bytes(&case["output"]),
+                "{case}"
+            );
+        }
+    });
+}

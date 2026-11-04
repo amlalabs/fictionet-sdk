@@ -4,7 +4,7 @@
 //!
 //! | Command | Does |
 //! | --- | --- |
-//! | `mptcp-verify tlc [spec] [config]` | TLC once per property of each config, checking that each ablation fails with exactly the violation its config expects |
+//! | `mptcp-verify tlc [spec] [config]` | TLC with every property of each passing config together, and each ablation property separately with its expected violation |
 //! | `mptcp-verify lean` | `lake build`, then the axioms of every headline theorem |
 //! | `mptcp-verify vectors [seed]` | the Lean model's test vectors, from `seed`, or from each of seeds 1 to 8 when left out |
 //! | `mptcp-verify diff [seed]` | the vectors, then `tests/mptcp_vectors.rs` against them, for each seed |
@@ -399,15 +399,14 @@ fn configs(paths: &Paths, spec: Option<&str>, config: Option<&str>) -> Result<Ve
     Ok(chosen)
 }
 
-/// TLC on each config, once per property. A config that expects
-/// violations must list exactly the properties it expects to fail, and
-/// each must fail; every other config must pass every property.
+/// Passing configs check every property together in one complete exploration.
+/// Expected violations run separately and must name exactly the listed checks.
 fn tlc(paths: &Paths, spec: Option<&str>, config: Option<&str>) -> Result<Report> {
     let jar = std::env::var_os("TLA2TOOLS").ok_or("TLA2TOOLS must name tla2tools.jar")?;
     let java = std::env::var_os("JAVA").unwrap_or_else(|| "java".into());
     let out = paths.out.join("tlc");
     // TLC looks for a config in the directory of its spec, so the specs
-    // are copied next to the one-property configs made from them.
+    // are copied next to the full passing configs and single-property ablations.
     let specs = out.join("specs");
     std::fs::create_dir_all(&specs)?;
     for entry in std::fs::read_dir(&paths.tla)? {
@@ -426,12 +425,31 @@ fn tlc(paths: &Paths, spec: Option<&str>, config: Option<&str>) -> Result<Report
             ));
             continue;
         }
+        if config.checks.is_empty() {
+            report.fail(format!("{}: no properties listed", config.name));
+            continue;
+        }
         let spec_file = format!("{}.tla", config.spec);
-        for (property, kind) in &config.checks {
-            let expect_violation = config.expected.contains(property);
-            let run = format!("{}-{property}", config.name);
+        let expect_violation = !config.expected.is_empty();
+        let group_size = if expect_violation {
+            1
+        } else {
+            config.checks.len()
+        };
+        for checks in config.checks.chunks(group_size) {
+            let (property, kind) = &checks[0];
+            let run = if expect_violation {
+                format!("{}-{property}", config.name)
+            } else {
+                config.name.clone()
+            };
             let cfg = specs.join(format!("{run}.cfg"));
-            std::fs::write(&cfg, config.checking_only(property, *kind))?;
+            let contents = if expect_violation {
+                config.checking_only(property, *kind)
+            } else {
+                config.text.clone()
+            };
+            std::fs::write(&cfg, contents)?;
             let states = out.join("states").join(&run);
             // One worker for an ablation, so its counterexample is a
             // shortest one.
@@ -462,7 +480,12 @@ fn tlc(paths: &Paths, spec: Option<&str>, config: Option<&str>) -> Result<Report
             let stats = statistics(&text);
             match (outcome(&text, property), expect_violation) {
                 (Outcome::Pass, false) if success => {
-                    report.pass(format!("{run}: pass, {stats}, {seconds} s"));
+                    for (property, _) in checks {
+                        report.pass(format!(
+                            "{}-{property}: pass, {stats}, {seconds} s; see {run}.out",
+                            config.name
+                        ));
+                    }
                 }
                 (Outcome::Pass, false) => {
                     report.fail(format!("{run}: TLC exited unsuccessfully; see {run}.out"));
