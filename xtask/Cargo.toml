@@ -4,8 +4,18 @@ version = "0.1.0"
 edition = "2024"
 rust-version.workspace = true
 publish = false
+default-run = "xtask"
+
+[features]
+rawnic = ["dep:fictionet-host"]
+
+[[bin]]
+name = "rawnic-guest"
+path = "src/bin/rawnic-guest.rs"
+required-features = ["rawnic"]
 
 [dependencies]
+fictionet-host = { path = "../host", default-features = false, features = ["virtio-net"], optional = true }
 fictionet = { path = ".." }
 fictionet-demo = { path = "../demos/kit" }
 fictionet-extras = { path = "../extras" }

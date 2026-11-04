@@ -2,6 +2,7 @@
 
 mod capture;
 mod image;
+mod rawnic;
 mod web;
 mod workstation;
 
@@ -16,6 +17,12 @@ async fn main() -> Result {
         .next()
         .ok_or("expected search-image or search-capture")?;
     let downloads = PathBuf::from(args.next().ok_or("missing downloads directory")?);
+    if task == "rawnic" {
+        if args.next().is_some() {
+            return Err("unexpected argument".into());
+        }
+        return rawnic::run(downloads);
+    }
     if task == "search-web" {
         let step = match args.next().as_deref() {
             None => web::Step::All,
