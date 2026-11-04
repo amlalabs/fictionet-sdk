@@ -13,8 +13,14 @@
 //!
 //! Every frame comes from the VM, which the agent runs, so every frame is
 //! read as hostile input.
+//!
+//! A [`Host`] is the other side: one host on a segment, for a world that
+//! owns a network card. It answers ARP and neighbor solicitations for its
+//! own addresses, checks its IPv6 addresses for duplicates, joins its
+//! multicast groups, and finds its gateways. [`host`] describes it.
 
 pub mod frame;
+pub mod host;
 pub mod stream;
 
 mod addresses;
@@ -25,6 +31,7 @@ use fictionet::stdlib::protocols::{dhcp, dhcpv6, ndp};
 
 pub use addresses::{Cidr, Family, Lease, RA_EVERY};
 use frame::{Frame, Mac, Upper};
+pub use host::Host;
 
 /// The VM's side of the link: what to do with each frame from the VM, and
 /// how to frame each packet from the world. It does no I/O.
