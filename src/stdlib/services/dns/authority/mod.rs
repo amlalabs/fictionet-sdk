@@ -2,7 +2,7 @@
 //! engine that runs one.
 //!
 //! An [`Authority`] is world code that decides a server's reply to one
-//! request. A server whose zone is [learned](super::zone::Learned) may
+//! request. An authority whose zone data comes from real servers may
 //! need a fact it does not hold yet: it returns [`Step::Need`] with a
 //! [`Lookup`] of one real server of the zone, and the [`AuthorityEngine`]
 //! has its driver put the lookup to the upstream, [files](Authority::file)
@@ -14,12 +14,16 @@
 //! | Authority | What it answers |
 //! | --- | --- |
 //! | [`Zones`] | From zone data, with the answer of RFC 1034 §4.3.2. |
-//! | [`Copies`] | As [`Zones`], over learned copies of the zones each address serves, looking up what a copy lacks and noting the child zones real servers turn out to serve. |
 //! | [`Overlay`] | What its base answers, except for invented zones below it. |
 //! | [`Observe`] | What the authority it wraps answers, shown to a callback first. |
 //!
 //! A world writes its own for anything else, such as a server that
-//! answers one sandbox differently from the others.
+//! answers one sandbox differently from the others. [`respond_from_zones`]
+//! gives such an authority the answer of [`Zones`] over its own zone
+//! data, with the step it takes for a fact the data does not know, and
+//! [`refuse_transfer`] the refusal of zone transfers. The copies of real
+//! servers in `fictionet-extras` (`fictionet_extras::dns::copies`) are
+//! built that way.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -32,13 +36,11 @@ use super::exchange::{Client, Generation};
 use super::lookup::{Looked, Lookup};
 use super::zone::{Answered, ZoneData, answer_onward};
 
-mod copies;
 mod engine;
 mod observe;
 mod overlay;
 mod server;
 
-pub use copies::Copies;
 pub use engine::AuthorityEngine;
 pub use observe::Observe;
 pub use overlay::Overlay;
@@ -130,8 +132,8 @@ impl<A: Authority + ?Sized> Authority for Arc<A> {
 /// listings of a whole zone. Zones hold class IN only: QCLASS * gets
 /// FORMERR, as from BIND, and any other class REFUSED.
 ///
-/// [`Copies`] answers the same way from learned zones, and looks up what
-/// they do not know.
+/// [`respond_from_zones`] answers the same way for an authority that
+/// takes its own step when a view does not know a fact.
 pub struct Zones {
     zones: Vec<Arc<dyn ZoneData>>,
 }
@@ -161,10 +163,10 @@ fn deepest<'z>(
 }
 
 /// REFUSED when `req` asks for a zone transfer, before an authority looks
-/// at anything else. A transfer lists a zone, and these authorities list
-/// none; a referral, a lookup, or a parent's answer in place of one is no
-/// listing (RFC 5936 §2.2).
-fn refuse_transfer(req: &Request) -> Option<Step> {
+/// at anything else; `None` for any other question. A transfer lists a
+/// zone, and the authorities here list none; a referral, a lookup, or a
+/// parent's answer in place of one is no listing (RFC 5936 §2.2).
+pub fn refuse_transfer(req: &Request) -> Option<Step> {
     matches!(
         req.question.query_type(),
         RecordType::AXFR | RecordType::IXFR
@@ -172,20 +174,26 @@ fn refuse_transfer(req: &Request) -> Option<Step> {
     .then(|| Step::Reply(bare_reply(req, ResponseCode::Refused, None)))
 }
 
-/// What a zone's view does not know: the zone, the question it was asked
-/// in that zone, and the name its answer had reached, that question's
-/// name or the target of the last CNAME or DNAME it followed (RFC 1034
-/// §4.3.2 step 3a, RFC 6672 §3.2). Gives the step to take.
-type Unknown<'a> = &'a dyn Fn(&dyn ZoneData, &Query, LowerName) -> Step;
+/// The step [`respond_from_zones`] takes when a zone's view does not know
+/// a fact the reply needs. It is called with the zone, the question asked
+/// in that zone, and the name the answer had reached: that question's
+/// name, or the target of the last CNAME or DNAME it followed (RFC 1034
+/// §4.3.2 step 3a, RFC 6672 §3.2).
+pub type OnUnknown<'a> = &'a dyn Fn(&dyn ZoneData, &Query, LowerName) -> Step;
 
 /// What a server hosting `zones` does with `req`, with `server` as its
-/// front, as [`Zones`] describes. `unknown` gives the step when a zone's
-/// view does not know a fact the reply needs.
-fn respond_from(
+/// front, as [`Zones`] describes: the authoritative answer of RFC 1034
+/// §4.3.2 over every zone it hosts, with CNAME and DNAME chains that go
+/// on in the other hosted zones, and DS at a zone's apex asked of the
+/// zone above it first (RFC 4035 §3.1.4.1). Where a zone's view does not
+/// know a fact the reply needs, the step is what `unknown` gives: [`Zones`]
+/// answers SERVFAIL there, and an authority that learns its data may
+/// return [`Step::Need`].
+pub fn respond_from_zones(
     zones: &[Arc<dyn ZoneData>],
     req: &Request,
     server: &ServerConfig,
-    unknown: Unknown<'_>,
+    unknown: OnUnknown<'_>,
 ) -> Step {
     if let Some(refused) = refuse_transfer(req) {
         return refused;
@@ -221,7 +229,7 @@ fn respond_hosted(
     zone: &dyn ZoneData,
     req: &Request,
     server: &ServerConfig,
-    unknown: Unknown<'_>,
+    unknown: OnUnknown<'_>,
     seen: &mut Vec<LowerName>,
 ) -> Step {
     let qname = LowerName::new(req.question.name());
@@ -317,7 +325,7 @@ impl Authority for Zones {
         server: &ServerConfig,
         _client: &Client,
     ) -> Step {
-        respond_from(&self.zones, req, server, &|_, _, _| {
+        respond_from_zones(&self.zones, req, server, &|_, _, _| {
             Step::Reply(bare_reply(req, ResponseCode::ServFail, None))
         })
     }

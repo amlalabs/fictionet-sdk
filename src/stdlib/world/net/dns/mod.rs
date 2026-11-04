@@ -25,9 +25,9 @@
 //! are hosts placed when a name is first asked, for worlds whose hosts
 //! come into being as they are looked up.
 //!
-//! [`internet`] has the internet's servers as hosts at their real
-//! addresses: the root servers, and a
-//! [`Mirror`](internet::Mirror) that copies the real hierarchy. A world
+//! [`internet`] has the root servers as hosts at their real addresses,
+//! and the root zone they serve. The mirror that copies the real
+//! hierarchy is in `fictionet-extras` (`fictionet_extras::dns::mirror`). A world
 //! that adds none of them has no internet.
 //!
 //! [`encrypted`] puts DNS over TLS and DNS over HTTPS in front of a
@@ -63,7 +63,7 @@
 //! | [`Namespace`] | The session a world's DNS programs answer for; advancing it starts a new one everywhere. |
 //! | [`PerSession`] | State that belongs to one session and starts afresh in the next. |
 //! | [`placing`] | A root zone that places a host for a name the first time the name is asked. |
-//! | [`internet`] | The root server hosts, and a mirror that copies the real hierarchy. |
+//! | [`internet`] | The root server hosts and the root zone. |
 //! | [`encrypted`] | DNS over TLS on port 853 and DNS over HTTPS on port 443 for a running [`Recursive`]. |
 
 use std::sync::Arc;

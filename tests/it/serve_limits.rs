@@ -3,8 +3,8 @@
 //! same limits, budget and seed as HTTP/1.
 
 use crate::common::io;
-use crate::common::world;
 use crate::http2_server::H2_INPUT;
+use fictionet_test_support::world;
 
 use fictionet_extras::hyper_io;
 use hyper_io::{Exec, Io};
@@ -159,7 +159,7 @@ fn a_response_body_waiting_to_be_written_counts_against_the_budget() {
 /// Before, the driver waited for ever on a client that stopped reading.
 #[test]
 fn a_client_that_stops_reading_times_out() {
-    crate::common::world::world(Duration::from_secs(60), |fcx| async move {
+    fictionet_test_support::world::world(Duration::from_secs(60), |fcx| async move {
         let (server, client) = two_machines(&fcx);
         let opts = ServeOptions::default()
             .idle(None)
@@ -407,7 +407,7 @@ fn an_http10_body_of_unknown_length_closes_the_connection() {
 /// before reading it.
 #[test]
 fn a_response_cut_off_by_a_reset_is_logged_incomplete() {
-    crate::common::world::world(Duration::from_secs(60), |fcx| async move {
+    fictionet_test_support::world::world(Duration::from_secs(60), |fcx| async move {
         let (server, client) = two_machines(&fcx);
         let size = 8 << 20;
         serve_http(
@@ -737,7 +737,7 @@ impl Handler for WaitingMetadata {
 
 #[test]
 fn http2_rejects_metadata_before_calling_the_handler() {
-    crate::common::world::world(Duration::from_secs(10), |fcx| async move {
+    fictionet_test_support::world::world(Duration::from_secs(10), |fcx| async move {
         let (server, client) = two_machines(&fcx);
         let budget = Budget::new(H2_INPUT + 1024);
         let router = fictionet_test_support::handler(
@@ -777,7 +777,7 @@ fn http2_rejects_metadata_before_calling_the_handler() {
 
 #[test]
 fn http2_pending_metadata_releases_on_reset_and_region_cancellation() {
-    crate::common::world::world(Duration::from_secs(10), |fcx| async move {
+    fictionet_test_support::world::world(Duration::from_secs(10), |fcx| async move {
         let budget = Budget::new(64 << 10);
         let shared = budget.clone();
         fcx.region(move |fcx| async move {
@@ -851,7 +851,7 @@ fn http2_pending_metadata_releases_on_reset_and_region_cancellation() {
 
 #[test]
 fn http1_pending_metadata_releases_on_reset() {
-    crate::common::world::world(Duration::from_secs(10), |fcx| async move {
+    fictionet_test_support::world::world(Duration::from_secs(10), |fcx| async move {
         let (server, client) = two_machines(&fcx);
         let budget = Budget::new(1 << 20);
         let waiting = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -907,7 +907,7 @@ impl Handler for StreamingMetadata {
 
 #[test]
 fn streaming_responses_release_request_metadata() {
-    crate::common::world::world(Duration::from_secs(10), |fcx| async move {
+    fictionet_test_support::world::world(Duration::from_secs(10), |fcx| async move {
         let budget = Budget::new(1 << 20);
 
         let mut h = Harness::with_options(

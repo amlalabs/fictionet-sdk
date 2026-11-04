@@ -616,7 +616,7 @@ impl Parts {
 
         // In-domain glue (RFC 9471 §3.1).
         for (child, cut) in &self.cuts {
-            for target in targets(&cut.ns) {
+            for target in additional_targets(&cut.ns) {
                 let glued = [RecordType::A, RecordType::AAAA]
                     .iter()
                     .any(|rtype| cut.glue.contains_key(&(target.clone(), *rtype)));
@@ -637,7 +637,10 @@ impl Parts {
             .values()
             .chain(self.cuts.values().map(|cut| &cut.ns));
         for set in named {
-            if let Some(target) = targets(set).into_iter().find(|target| alias(target)) {
+            if let Some(target) = additional_targets(set)
+                .into_iter()
+                .find(|target| alias(target))
+            {
                 return Err(ZoneError::TargetIsAlias {
                     owner: LowerName::new(set.name()),
                     target,
@@ -781,7 +784,7 @@ pub(super) fn union(
 
 /// The names an NS, MX, or SRV RRset points at, whose addresses go in the
 /// additional section (RFC 1034 §4.3.2 step 6).
-pub(crate) fn targets(set: &RecordSet) -> Vec<LowerName> {
+pub fn additional_targets(set: &RecordSet) -> Vec<LowerName> {
     set.records_without_rrsigs()
         .filter_map(|record| match &record.data {
             RData::NS(ns) => Some(LowerName::new(&ns.0)),
@@ -1003,7 +1006,7 @@ struct Hashing {
 }
 
 /// The wildcard at `encloser`: `*.<encloser>` (RFC 4592 §2.1.1).
-pub(super) fn wildcard(encloser: &LowerName) -> LowerName {
+pub fn wildcard(encloser: &LowerName) -> LowerName {
     let name = Name::from(encloser)
         .prepend_label("*")
         .expect("a wildcard label fits");

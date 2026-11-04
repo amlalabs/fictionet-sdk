@@ -7,7 +7,7 @@ use fictionet::stdlib::protocols::dns::rr::{RData, Record, RecordSet, RecordType
 /// type, and class, each RRSIG with the RRset it covers and each RRset at
 /// the lowest TTL among its records (RFC 2181 §5.2). An OPT record is no
 /// RRset (RFC 6891 §6.1.1) and is left out.
-pub(super) fn rrsets(records: &[Record]) -> Vec<RecordSet> {
+pub fn rrsets(records: &[Record]) -> Vec<RecordSet> {
     let mut sets: Vec<RecordSet> = Vec::new();
     for record in records {
         let covered = match &record.data {
@@ -79,7 +79,7 @@ pub(super) fn signatures(records: &[Record]) -> Vec<RecordSet> {
 /// The label count of the wildcard's parent when `set`'s RRSIGs show a
 /// wildcard expansion: a Labels field below the owner's label count, a
 /// leading `*` not counted (RFC 4034 §3.1.3, RFC 4035 §5.3.4).
-pub(super) fn expanded_from(set: &RecordSet) -> Option<usize> {
+pub fn expanded_from(set: &RecordSet) -> Option<usize> {
     let owner = usize::from(set.name().num_labels());
     set.rrsigs().iter().find_map(|record| match &record.data {
         RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) => {

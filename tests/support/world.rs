@@ -1,9 +1,13 @@
+//! Worlds a test runs to their end: a lab world on virtual time, or a
+//! world on real time, each within a limit of host time and required to
+//! end with [`Done`].
+
 use std::future::Future;
 use std::time::Duration;
 
 use fictionet::{Cx, block_on, lab};
 
-use fictionet_test_support::{Done, ended_with_done, within};
+use crate::{Done, ended_with_done, within};
 
 /// Runs a closed lab world within the host limit and requires Done.
 pub fn world<F, Fut>(limit: Duration, f: F)

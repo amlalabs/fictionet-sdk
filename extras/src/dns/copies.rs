@@ -8,17 +8,20 @@ use std::sync::Arc;
 use fictionet::stdlib::protocols::dns::op::{Message, Query, ResponseCode};
 use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, Name, RecordSet, RecordType};
 use fictionet::stdlib::protocols::dns::{Request, Response, label_count};
+use fictionet::stdlib::services::dns::authority::{
+    Authority, ServerConfig, Step, bare_reply, refuse_transfer, respond_from_zones,
+};
+use fictionet::stdlib::services::dns::zone::{Denied, Fact, Node, Revision, View, ZoneData};
+use fictionet::stdlib::services::dns::{Client, Generation, Looked, Lookup};
 use fictionet::sync::Mutex;
 
-use super::super::exchange::{Client, Generation};
-use super::super::lookup::{Looked, Lookup};
-use super::super::zone::{Denied, Fact, Filing, Learned, Node, Revision, View, ZoneData};
-use super::{Authority, ServerConfig, Step, bare_reply, refuse_transfer, respond_from};
+use super::learned::{Filing, Learned};
 
 /// The [learned](Learned) copies of real zones, one per apex, shared by
 /// every address that serves the zone, and the zones each address serves.
 ///
-/// At each address it answers as [`Zones`](super::Zones) over the copies
+/// At each address it answers as
+/// [`Zones`](fictionet::stdlib::services::dns::authority::Zones) over the copies
 /// of the zones the address serves, looking up what they lack at the
 /// address itself. A copy's view that does not know a fact the reply
 /// needs never gives a negative: the copy looks the client's question up
@@ -581,7 +584,7 @@ impl Authority for Copies {
         let qname = LowerName::new(req.question.name());
         let zones = self.zones_at(local, &req.question);
         // A question of another class is answered without data
-        // (`respond_from`), so it needs no lookup.
+        // (`respond_from_zones`), so it needs no lookup.
         if req.question.query_class() == DNSClass::IN {
             if let Some(step) = self.placing(req, local, &qname) {
                 return step;
@@ -590,7 +593,7 @@ impl Authority for Copies {
                 return self.look_up(req, local, lame, &req.question);
             }
         }
-        let step = respond_from(&zones, req, server, &|zone, asked, reached| {
+        let step = respond_from_zones(&zones, req, server, &|zone, asked, reached| {
             // A name a chain led to, answered from a zone not placed yet.
             if let Some(step) = self.placing(req, local, &reached) {
                 return step;

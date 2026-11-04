@@ -11,8 +11,8 @@
 //!
 //! Locks are taken in one order: an engine's mutex, then a zone's own lock
 //! (a [`Lazy`](fictionet::stdlib::services::dns::zone::Lazy) zone asking its
-//! provider, or a [`Learned`](fictionet::stdlib::services::dns::zone::Learned)
-//! zone filing a lookup's response), then the network's lock (a provider
+//! provider, or zone data an authority learns from real servers
+//! filing a lookup's response), then the network's lock (a provider
 //! placing a host). Nothing that holds the network's lock calls into an
 //! engine. A lookup runs in a task of its own, with no lock held.
 

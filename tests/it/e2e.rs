@@ -4,8 +4,8 @@
 //! rustls client. Every byte crosses as IP packets through both splits, the
 //! router and a delayed link.
 
-use crate::common::world;
 use fictionet_test_support::certs;
+use fictionet_test_support::world;
 
 use certs::certs;
 use world::world;

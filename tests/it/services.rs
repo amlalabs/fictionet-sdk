@@ -6,8 +6,8 @@
 
 use crate::common::echo_service;
 use crate::common::io;
-use crate::common::world;
 use fictionet_test_support::certs;
+use fictionet_test_support::world;
 use fictionet_test_support::{Done, timeout};
 
 mod driver;

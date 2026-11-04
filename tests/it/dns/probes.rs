@@ -36,7 +36,7 @@ use fictionet_test_support::dns::{
 use fictionet_test_support::sandbox::{Machine, machine};
 
 use super::slices::{ME, edes, tcp, udp};
-use crate::common::world::world;
+use fictionet_test_support::world::world;
 
 /// The gateway, the sandbox's DHCP resolver.
 const GATEWAY: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);

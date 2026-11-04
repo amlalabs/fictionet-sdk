@@ -54,7 +54,7 @@ use fictionet::stdlib::protocols::dns::serialize::binary::{
 use fictionet::stdlib::protocols::dns::{Limit, Parsed, Request, Response, fit, read_message};
 use fictionet::stdlib::protocols::json::Value;
 use fictionet::stdlib::services::dns::authority::{
-    AuthorityEngine, Copies, ServerConfig, Zones, bare_reply,
+    AuthorityEngine, ServerConfig, Zones, bare_reply,
 };
 use fictionet::stdlib::services::dns::memory::{MemoryNet, drive};
 use fictionet::stdlib::services::dns::resolver::{
@@ -70,6 +70,7 @@ use fictionet::stdlib::services::dns::{
 use fictionet::stdlib::services::serve::Transport;
 use fictionet::time::Instant;
 use fictionet::{Seed, SeededEntropy};
+use fictionet_extras::dns::copies::Copies;
 use fictionet_extras::dns::unbound;
 
 // ---------------------------------------------------------------------

@@ -1,6 +1,6 @@
 //! The authoritative engine driven directly with inputs: the server
-//! front's header and EDNS rules, CHAOS answers, refusals, learned zones
-//! and their lookups, completions that must change nothing, sessions,
+//! front's header and EDNS rules, CHAOS answers, refusals, lookups of what
+//! an authority lacks, completions that must change nothing, sessions,
 //! overlays, unknown facts, and the order of events and actions.
 
 use std::net::SocketAddr;
@@ -23,13 +23,13 @@ use fictionet::stdlib::protocols::dns::rr::{
 };
 use fictionet::stdlib::protocols::dns::{Ede, EdeCode, Nsid, Request, Response};
 use fictionet::stdlib::services::dns::authority::{
-    Authority, AuthorityEngine, ChaosZone, Copies, Identity, Observe, Overlay, ServerConfig, Step,
-    Zones, bare_reply,
+    Authority, AuthorityEngine, ChaosZone, Identity, Observe, Overlay, ServerConfig, Step, Zones,
+    bare_reply,
 };
 use fictionet::stdlib::services::dns::zone::{Fact, Lazy, Transparent, Zone, ZoneData};
 use fictionet::stdlib::services::dns::{
     Action, Client, ClientQuery, Engine, Event, ExchangeFailure, Generation, Input, Looked, Lookup,
-    LookupOutcome, Session, Token, Unmatched, WallClock,
+    Session, Token, Unmatched, WallClock,
 };
 use fictionet::stdlib::services::serve::Transport;
 use fictionet::time::Instant;
@@ -39,6 +39,7 @@ use fictionet_extras::dns::public::PUBLIC_RESOLVERS;
 use fictionet_extras::dns::roots::gtld_front;
 use fictionet_extras::dns::unbound;
 use fictionet_extras::dns::{bind, chaos};
+use fictionet_test_support::lookup_authority::LookupAuthority;
 
 /// The server the engines under test run at.
 const LOCAL: &str = "192.0.2.53:53";
@@ -282,27 +283,17 @@ impl Authority for Counting {
     }
 }
 
-/// A server of `example.test.` whose zone is learned from the real
-/// server at its own address.
-fn learned_engine() -> AuthorityEngine<Copies> {
+/// A server of `example.test.` that knows only what its lookups of the
+/// real server at its own address gave it.
+fn lookup_engine() -> AuthorityEngine<LookupAuthority> {
     AuthorityEngine::new(
-        learned(&["example.test."]),
+        LookupAuthority::new("example.test."),
         ServerConfig::generic(),
         local(),
     )
 }
 
-/// Copies of the zones at `apexes`, served at [`LOCAL`] and learned from
-/// the real server there.
-fn learned(apexes: &[&str]) -> Copies {
-    let copies = Copies::new();
-    for apex in apexes {
-        copies.serves(local().ip(), &LowerName::new(&name(apex)));
-    }
-    copies
-}
-
-/// The lookup a learned server at [`LOCAL`] makes of `qname` and `qtype`
+/// The lookup a server at [`LOCAL`] makes of `qname` and `qtype`
 /// for the zone at `zone`.
 fn lookup_of(zone: &str, qname: &str, qtype: RecordType) -> Lookup {
     Lookup::new(
@@ -1035,11 +1026,12 @@ fn zone_transfers_are_the_authoritys_to_decide() {
     }
 
     // Zone data answers questions; it cannot list a zone, so zones refuse,
-    // and so do their copies and an overlay on them.
+    // and so do an authority that looks up what it lacks and an overlay
+    // on it.
     let mut engine = AuthorityEngine::new(zones(vec![example()]), ServerConfig::generic(), local());
     let reply = the_answer(&ask_with(&mut engine, &axfr, Transport::Tcp));
     assert_eq!(reply.metadata.response_code, ResponseCode::Refused);
-    let mut engine = learned_engine();
+    let mut engine = lookup_engine();
     let actions = ask_with(&mut engine, &axfr, Transport::Tcp);
     assert!(lookups(&actions).is_empty());
     assert_eq!(
@@ -1625,234 +1617,9 @@ fn malformed_queries_get_the_parse_outcome() {
     assert_eq!(opt.max_payload(), 1232);
 }
 
-// Learned zones.
-
-#[test]
-fn a_learned_server_looks_up_what_it_lacks_and_answers_from_what_it_filed() {
-    let mut engine = learned_engine();
-    let message = query("WwW.ExAmPlE.TeSt.", RecordType::A, |m| {
-        m.metadata.recursion_desired = true;
-        m.set_edns(edns(1232, true));
-    });
-    let sent = message.to_vec().unwrap();
-    let actions = ask_with(&mut engine, &message, Transport::Udp);
-    assert_eq!(kinds(&actions), ["query", "lookup"]);
-    let (token, lookup) = lookups(&actions)[0].clone();
-    assert_eq!(
-        lookup,
-        lookup_of("example.test.", "www.example.test.", RecordType::A)
-    );
-    assert_eq!(
-        engine.next_deadline(),
-        Some(Instant::ZERO + Duration::from_secs(5))
-    );
-
-    // The real server answers with the A RRset and a record of a type
-    // hickory does not know (RFC 3597), filed as an RRset of its own.
-    let real = real_response(&lookup, |m| {
-        m.add_answer(Record::from_rdata(
-            name("www.example.test."),
-            60,
-            a("192.0.2.10"),
-        ));
-        m.add_answer(Record::from_rdata(
-            name("www.example.test."),
-            60,
-            RData::Unknown {
-                code: RecordType::Unknown(65400),
-                rdata: fictionet::stdlib::protocols::dns::rr::rdata::NULL::with(vec![1, 2, 3, 4]),
-            },
-        ));
-    });
-    let actions = run(&mut engine, looked(token, real), Instant::ZERO);
-    assert_eq!(kinds(&actions), ["looked", "reply", "answer"]);
-    assert!(matches!(
-        actions[0],
-        Action::Event(Event::Looked {
-            outcome: LookupOutcome::Response {
-                rcode: ResponseCode::NoError
-            },
-            ..
-        })
-    ));
-    let bytes = answer_bytes(&actions);
-    // The world's own reply: the client's ID and question case, AA from
-    // the zone, and only the RRset asked for.
-    assert_eq!(&bytes[..2], &sent[..2]);
-    assert_eq!(question_octets(&bytes), question_octets(&sent));
-    let reply = Message::from_vec(&bytes).unwrap();
-    assert!(reply.metadata.authoritative);
-    assert_eq!(reply.answers.len(), 1);
-    assert_eq!(reply.answers[0].data, a("192.0.2.10"));
-    assert_eq!(reply.answers[0].name.to_string(), "WwW.ExAmPlE.TeSt.");
-    assert_eq!(engine.next_deadline(), None);
-
-    // The fact is held now: the same question needs no lookup.
-    let actions = ask_with(&mut engine, &message, Transport::Udp);
-    assert_eq!(kinds(&actions), ["query", "reply", "answer"]);
-    // Another type at the name is not known, so it is looked up, never
-    // answered NODATA.
-    let other = query("www.example.test.", RecordType::AAAA, |_| {});
-    let actions = ask_with(&mut engine, &other, Transport::Udp);
-    assert_eq!(kinds(&actions), ["query", "lookup"]);
-}
-
-/// A real server that serves `example.test` and its child
-/// `sub.example.test` follows an alias into the child from the child's
-/// data, as step 1 searches every zone it holds (RFC 1034 §4.3.2 step
-/// 3a). A copy of it answers the alias with the chain, whether or not it
-/// was noted for the child: it never stays silent.
-#[test]
-fn a_learned_alias_into_a_child_its_server_serves_is_answered() {
-    let alias = || {
-        Record::from_rdata(
-            name("alias3.example.test."),
-            300,
-            RData::CNAME(CNAME(name("www.sub.example.test."))),
-        )
-    };
-    let target = || Record::from_rdata(name("www.sub.example.test."), 300, a("192.0.2.20"));
-    let child_ns =
-        || Record::from_rdata(name("sub.example.test."), 3600, ns("ns1.sub.example.test."));
-    for noted in [
-        &["example.test."][..],
-        &["example.test.", "sub.example.test."],
-    ] {
-        let mut engine = AuthorityEngine::new(learned(noted), ServerConfig::generic(), local());
-        let message = query("alias3.example.test.", RecordType::A, |_| {});
-        let mut actions = ask_with(&mut engine, &message, Transport::Udp);
-        let mut asked = Vec::new();
-        while let [(token, lookup)] = lookups(&actions).as_slice() {
-            let (token, lookup) = (*token, lookup.clone());
-            assert!(!asked.contains(&lookup), "{noted:?}: {lookup:?} again");
-            let real = real_response(&lookup, |m| {
-                if lookup.question.name().to_ascii() == "alias3.example.test." {
-                    m.add_answer(alias());
-                } else {
-                    // The child's data, with the child's NS RRset in the
-                    // authority section, as BIND sends it.
-                    m.add_answer(target());
-                    m.add_authority(child_ns());
-                }
-            });
-            asked.push(lookup);
-            actions = run(&mut engine, looked(token, real), Instant::ZERO);
-        }
-        let reply = the_answer(&actions);
-        assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
-        assert!(reply.metadata.authoritative);
-        assert_eq!(
-            reply
-                .answers
-                .iter()
-                .map(|r| r.data.clone())
-                .collect::<Vec<_>>(),
-            [alias().data, target().data],
-            "{noted:?}"
-        );
-        let zones: Vec<String> = asked.iter().map(|lookup| lookup.zone.to_string()).collect();
-        assert_eq!(
-            zones.last().map(String::as_str),
-            Some(if noted.len() == 2 {
-                "sub.example.test."
-            } else {
-                "example.test."
-            }),
-            "{noted:?}: the target is asked in {zones:?}"
-        );
-    }
-}
-
-#[test]
-fn a_learned_server_is_silent_when_the_lookup_gets_no_reply() {
-    let mut engine = learned_engine();
-    let actions = ask_with(
-        &mut engine,
-        &query("www.example.test.", RecordType::A, |_| {}),
-        Transport::Udp,
-    );
-    let (token, _) = lookups(&actions)[0].clone();
-    let deadline = engine.next_deadline().unwrap();
-
-    // A tick before the deadline changes nothing.
-    let early = run(
-        &mut engine,
-        Input::Tick,
-        Instant::ZERO + Duration::from_secs(1),
-    );
-    assert!(early.is_empty());
-
-    let actions = run(&mut engine, Input::Tick, deadline);
-    assert_eq!(kinds(&actions), ["abandon", "looked"]);
-    assert_eq!(abandoned(&actions), [token]);
-    assert!(matches!(
-        actions[1],
-        Action::Event(Event::Looked {
-            outcome: LookupOutcome::NoReply,
-            ..
-        })
-    ));
-    assert_eq!(engine.next_deadline(), None);
-}
-
-/// A copy's server sends nothing when the real server could not be
-/// reached or sent nothing. When the real server refused the question, or
-/// answered it without authority, it does not serve the zone (RFC 8906
-/// §3.1.1), and the copy's server refuses it too ([`Copies`]). It never
-/// makes up an answer.
-#[test]
-fn a_learned_server_is_silent_when_the_real_server_is_unreachable_or_says_nothing() {
-    let refused = |lookup: &Lookup| {
-        real_response(lookup, |m| {
-            m.metadata.authoritative = false;
-            m.metadata.response_code = ResponseCode::Refused;
-        })
-    };
-    let lame = |lookup: &Lookup| {
-        // An answer without AA is no authoritative data (RFC 2181 §5.4.1).
-        real_response(lookup, |m| {
-            m.metadata.authoritative = false;
-            m.add_answer(Record::from_rdata(
-                name("www.example.test."),
-                60,
-                a("192.0.2.10"),
-            ));
-        })
-    };
-    // What the upstream gives the lookup, in each case.
-    type Gives = fn(&Lookup) -> Looked;
-    let outcomes: [(&str, Gives, &[&str]); 4] = [
-        ("unreachable", |_| Looked::Unreachable, &["looked"]),
-        ("no reply", |_| Looked::NoReply, &["looked"]),
-        ("refused", refused, &["looked", "reply", "answer"]),
-        ("lame", lame, &["looked", "reply", "answer"]),
-    ];
-    for (what, outcome, expected) in outcomes {
-        let mut engine = learned_engine();
-        let actions = ask_with(
-            &mut engine,
-            &query("www.example.test.", RecordType::A, |_| {}),
-            Transport::Tcp,
-        );
-        let (token, lookup) = lookups(&actions)[0].clone();
-        let actions = run(&mut engine, looked(token, outcome(&lookup)), Instant::ZERO);
-        assert_eq!(kinds(&actions), expected, "{what}");
-        if expected.contains(&"answer") {
-            let reply = the_answer(&actions);
-            assert_eq!(
-                reply.metadata.response_code,
-                ResponseCode::Refused,
-                "{what}"
-            );
-            assert!(reply.answers.is_empty(), "{what}");
-        }
-        assert_eq!(engine.next_deadline(), None, "{what}");
-    }
-}
-
 #[test]
 fn a_reply_larger_than_the_client_takes_is_truncated() {
-    let mut engine = learned_engine();
+    let mut engine = lookup_engine();
     let message = query("big.example.test.", RecordType::A, |_| {});
     let actions = ask_with(&mut engine, &message, Transport::Udp);
     let (token, lookup) = lookups(&actions)[0].clone();
@@ -1877,7 +1644,7 @@ fn a_reply_larger_than_the_client_takes_is_truncated() {
 
 #[test]
 fn completions_for_the_wrong_question_or_of_another_kind_are_ignored() {
-    let mut engine = learned_engine();
+    let mut engine = lookup_engine();
     let actions = ask_with(
         &mut engine,
         &query("www.example.test.", RecordType::A, |_| {}),
@@ -1938,7 +1705,7 @@ fn completions_for_the_wrong_question_or_of_another_kind_are_ignored() {
 
 #[test]
 fn advance_abandons_every_lookup_drops_what_was_learned_and_restarts_the_requests() {
-    let mut engine = learned_engine();
+    let mut engine = lookup_engine();
     let first = ask_with(
         &mut engine,
         &query("one.example.test.", RecordType::A, |_| {}),
@@ -2009,7 +1776,7 @@ fn advance_abandons_every_lookup_drops_what_was_learned_and_restarts_the_request
 
 #[test]
 fn requests_needing_the_same_fact_share_one_lookup() {
-    let mut engine = learned_engine();
+    let mut engine = lookup_engine();
     let message = query("www.example.test.", RecordType::A, |_| {});
     let mut other = client(Transport::Udp);
     other.peer = "198.51.100.8:40000".parse().unwrap();
@@ -2046,7 +1813,7 @@ fn requests_needing_the_same_fact_share_one_lookup() {
 
 #[test]
 fn gone_drops_only_that_clients_waits() {
-    let mut engine = learned_engine();
+    let mut engine = lookup_engine();
     let message = query("www.example.test.", RecordType::A, |_| {});
     let mut other = client(Transport::Tcp);
     other.connection = Some(9);
@@ -2088,10 +1855,11 @@ fn fict() -> Zone {
         .unwrap()
 }
 
-/// `fict.com.` invented below a server of `com.` learned from the real
+/// `fict.com.` invented below a server of `com.` that looks up the real
 /// one at its address.
-fn overlay() -> Overlay<Copies> {
-    Overlay::new(learned(&["com."]), name("com.")).below(name("fict.com."), zones(vec![fict()]))
+fn overlay() -> Overlay<LookupAuthority> {
+    Overlay::new(LookupAuthority::new("com."), name("com."))
+        .below(name("fict.com."), zones(vec![fict()]))
 }
 
 /// The names between `com` and a deeper invented apex are the base's, so
@@ -2099,7 +1867,7 @@ fn overlay() -> Overlay<Copies> {
 #[test]
 #[should_panic(expected = "not a child of com.")]
 fn an_invented_zone_must_be_a_child_of_the_overlays_zone() {
-    let _ = Overlay::new(learned(&["com."]), name("com."))
+    let _ = Overlay::new(LookupAuthority::new("com."), name("com."))
         .below(name("shop.nonexistent.com."), zones(vec![fict()]));
 }
 
@@ -2580,7 +2348,7 @@ fn events_come_before_the_actions_they_explain() {
     let seen: Arc<Mutex<Vec<(String, ResponseCode)>>> = Arc::default();
     let log = seen.clone();
     let observed = Observe::new(
-        learned(&["example.test."]),
+        LookupAuthority::new("example.test."),
         move |req: &Request, _client: &Client, response: &Response| {
             log.lock().unwrap().push((
                 req.question.name().to_string(),

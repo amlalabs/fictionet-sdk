@@ -2,7 +2,7 @@
 //! copies, and what came of it.
 //!
 //! A world never passes a DNS message from a real server on to a client.
-//! A server whose zone data is [learned](super::zone::Learned) answers
+//! A server that learns its zone data from real servers answers
 //! from records it holds, and when a reply needs a fact it does not hold
 //! it asks one real server of the zone a [`Lookup`]. The driver puts the
 //! lookup to its upstream, outside the engine, and hands back what came

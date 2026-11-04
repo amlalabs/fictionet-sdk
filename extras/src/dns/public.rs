@@ -94,7 +94,7 @@ impl PublicResolver {
     /// The names its DNS over HTTPS service answers under. The addresses
     /// the real hierarchy gives for them are where a world puts the
     /// resolver's DNS over HTTPS front
-    /// ([`Mirror::front`](fictionet::stdlib::world::net::dns::internet::Mirror::front)).
+    /// ([`Mirror::front`](super::mirror::Mirror::front)).
     pub fn doh(&self) -> Vec<Name> {
         self.doh.iter().map(|text| name(text)).collect()
     }
@@ -537,7 +537,7 @@ const MYADDR_SERVER: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(216, 
 /// `o-o.myaddr.l.google.com` TXT. `None` when the server cannot be
 /// reached or its answer holds no address. A world that shows the real
 /// internet passes it to [`PublicResolver::whoami`] and
-/// [`Mirror::egress`](fictionet::stdlib::world::net::dns::internet::Mirror::egress).
+/// [`Mirror::egress`](super::mirror::Mirror::egress).
 pub async fn egress(fcx: &Cx, upstream: &dyn Upstream) -> Option<IpAddr> {
     myaddr_at(fcx, upstream, MYADDR_SERVER).await
 }

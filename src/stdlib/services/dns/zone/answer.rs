@@ -9,7 +9,7 @@ use fictionet::stdlib::protocols::dns::{Request, Response, dname_substitute};
 
 use super::cover::negative_ttl;
 use super::data::{Denied, Fact, View};
-use super::zone::{Node, dname_target, targets, unique, wildcard};
+use super::zone::{Node, additional_targets, dname_target, unique, wildcard};
 
 /// What [`answer`] found.
 #[derive(Clone, Debug, PartialEq)]
@@ -491,7 +491,7 @@ impl<'v> Walk<'v> {
         ds: Option<&RecordSet>,
         glue: &[RecordSet],
     ) -> Result<Out, LowerName> {
-        let targets = targets(ns);
+        let targets = additional_targets(ns);
         let in_domain: Vec<RecordSet> = glue
             .iter()
             .filter(|set| {
@@ -661,7 +661,7 @@ impl<'v> Walk<'v> {
 
         if let Some(set) = sets.iter().find(|set| set.record_type() == self.qtype) {
             let mut additional = Vec::new();
-            for target in targets(set) {
+            for target in additional_targets(set) {
                 additional.extend(self.addresses_of(&target));
             }
             let mut found = positive(vec![owned(set, &owner)], proof);

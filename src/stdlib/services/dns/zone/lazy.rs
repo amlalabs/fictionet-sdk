@@ -13,7 +13,7 @@ use fictionet::sync::Mutex;
 
 use super::answer::{AnyResponse, resolve};
 use super::data::{Denied, Fact, Provider, Revision, View, ZoneData};
-use super::zone::{Node, targets, union};
+use super::zone::{Node, additional_targets, union};
 
 /// A zone whose names come from a [`Provider`], asked the first time a
 /// question needs them.
@@ -114,7 +114,10 @@ impl<P: Provider> Lazy<P> {
         if let Some(ns) = by_type.remove(&RecordType::NS) {
             let ds = by_type.remove(&RecordType::DS);
             let mut glue = Vec::new();
-            for target in targets(&ns).into_iter().filter(|t| name.zone_of(t)) {
+            for target in additional_targets(&ns)
+                .into_iter()
+                .filter(|t| name.zone_of(t))
+            {
                 match self.provider.lookup(&target) {
                     Fact::Present(sets) => glue.extend(sets.into_iter().filter(|set| {
                         matches!(set.record_type(), RecordType::A | RecordType::AAAA)

@@ -22,10 +22,11 @@ use fictionet::Cx;
 use fictionet::stdlib::protocols::dns::op::Message;
 use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RData, Record};
 use fictionet::stdlib::protocols::dns::{dname_substitute, label_count};
-use fictionet::stdlib::services::dns::zone::{Filing, dname_target};
+use fictionet::stdlib::services::dns::zone::dname_target;
 use fictionet::stdlib::services::dns::{Looked, Lookup};
 use fictionet::stdlib::world::net::dns::{PerSession, Upstream};
 use fictionet::sync::Mutex;
+use fictionet_extras::dns::learned::Filing;
 use fictionet_extras::dns::{Replay, public};
 use fictionet_host::dns::Internet;
 
@@ -270,7 +271,7 @@ impl Outbound {
         move |lookup| outbound.allows(&LowerName::new(lookup.question.name()))
     }
 
-    /// The observer for [`Mirror::observe`](fictionet::stdlib::world::net::dns::internet::Mirror::observe):
+    /// The observer for [`Mirror::observe`](fictionet_extras::dns::mirror::Mirror::observe):
     /// learns the NS, CNAME, and DNAME targets of the records each
     /// mirrored zone files.
     pub fn observer(&self) -> impl Fn(&Filing) + Send + Sync + 'static {

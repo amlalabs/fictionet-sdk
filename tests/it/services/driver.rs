@@ -93,7 +93,7 @@ fn replies_do_not_depend_on_chunk_boundaries() {
 
 #[test]
 fn listen_serves_each_connection() {
-    crate::common::world::world(Duration::from_secs(60), |fcx| async move {
+    fictionet_test_support::world::world(Duration::from_secs(60), |fcx| async move {
         let (server, _su, client, _cu) = two_machines(&fcx);
         let opts = ServeOptions::default();
         serve::listen(
@@ -120,7 +120,7 @@ fn listen_serves_each_connection() {
 
 #[test]
 fn timers_tick_and_idle_connections_close() {
-    crate::common::world::world(Duration::from_secs(60), |fcx| async move {
+    fictionet_test_support::world::world(Duration::from_secs(60), |fcx| async move {
         let (server, _su, client, _cu) = two_machines(&fcx);
         serve::listen(
             &fcx,
@@ -201,7 +201,7 @@ fn a_handoff_returns_the_connection_with_its_unread_bytes() {
 
 #[test]
 fn a_connection_cap_resets_connections_past_it() {
-    crate::common::world::world(Duration::from_secs(60), |fcx| async move {
+    fictionet_test_support::world::world(Duration::from_secs(60), |fcx| async move {
         let (server, _su, client, _cu) = two_machines(&fcx);
         serve::listen(
             &fcx,
@@ -342,7 +342,7 @@ fn a_decoder_that_skips_a_long_line_keeps_the_connection_open() {
     let mut h = Harness::new(fictionet::Seed::from_u64(0), Short, ());
     assert_eq!(h.push(&input).unwrap(), b"long\nok\n");
     assert!(!h.closed());
-    crate::common::world::world(Duration::from_secs(60), move |fcx| async move {
+    fictionet_test_support::world::world(Duration::from_secs(60), move |fcx| async move {
         let (server, _su, client, _cu) = two_machines(&fcx);
         serve::listen(
             &fcx,
@@ -845,7 +845,7 @@ fn an_error_closes_only_its_connection_and_a_panic_ends_the_run() {
 
     let addr = Ipv4Addr::new(10, 40, 0, 9);
     let to = SocketAddr::new(addr.into(), 7);
-    crate::common::world::world(Duration::from_secs(60), move |fcx| async move {
+    fictionet_test_support::world::world(Duration::from_secs(60), move |fcx| async move {
         let (attacher, attachments) = fictionet::attachments();
         Net::new(fictionet_extras::network::cdn_pools())
             .ipv4_only()

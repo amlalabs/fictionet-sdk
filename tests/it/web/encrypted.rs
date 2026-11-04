@@ -43,7 +43,7 @@ use http::{HeaderMap, Method, Request, StatusCode};
 use http_body_util::{BodyExt, Full};
 use rustls::RootCertStore;
 
-use crate::common::world::world;
+use fictionet_test_support::world::world;
 
 const ME: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
 const ROOT: Ipv4Addr = Ipv4Addr::new(198, 41, 0, 4);

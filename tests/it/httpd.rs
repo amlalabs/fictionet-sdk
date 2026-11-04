@@ -9,7 +9,7 @@ use fictionet::stdlib::services::serve::ConnInfo;
 use fictionet::stdlib::services::serve::Harness;
 use fictionet::stdlib::web::httpd::{self, Http1};
 
-use crate::common::world;
+use fictionet_test_support::world;
 use world::world;
 
 // ---------------------------------------------------------------------------

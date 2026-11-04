@@ -1,6 +1,6 @@
 //! TCP and UDP endpoints, two machines joined by a `pair()` cable.
 
-use crate::common::world;
+use fictionet_test_support::world;
 
 use world::world;
 

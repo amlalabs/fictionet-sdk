@@ -20,7 +20,7 @@ fn tls_pair(fcx: &Cx, names: &[&str]) -> (Arc<rustls::ServerConfig>, Arc<rustls:
 /// cancelled, not as a broken connection.
 #[test]
 fn a_cancel_during_the_tls_handshake_is_a_cancel() {
-    crate::common::world::world(Duration::from_secs(60), |fcx| async move {
+    fictionet_test_support::world::world(Duration::from_secs(60), |fcx| async move {
         let (config, _roots) = tls_pair(&fcx, &["a.test"]);
         let (server, _su, client, _cu) = two_machines(&fcx);
         let mut listener = server.listen(443)?;
@@ -236,7 +236,7 @@ fn net_performs_starttls_for_a_service_that_asks() {
 /// the service's default of 10 seconds.
 #[test]
 fn net_limits_a_starttls_handshake() {
-    crate::common::world::world(Duration::from_secs(60), move |fcx| async move {
+    fictionet_test_support::world::world(Duration::from_secs(60), move |fcx| async move {
         let (config, _roots) = tls_pair(&fcx, &["mail.test"]);
         let (attacher, attachments) = fictionet::attachments();
         let addr = Ipv4Addr::new(10, 40, 0, 25);

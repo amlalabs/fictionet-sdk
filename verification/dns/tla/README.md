@@ -344,7 +344,7 @@ Authority:
   while its own denial records show the CNAME
   (`Learned::stops_at_alias`), and a question the real server answered
   with an error RCODE, which gets that RCODE (`Learned::failed`);
-  `RealRcode` gives only NOERROR and NXDOMAIN. `tests/it/dns/learned.rs`
+  `RealRcode` gives only NOERROR and NXDOMAIN. `extras/tests/copies/learned.rs`
   checks them: `copies_learn_a_child_zone_its_server_also_serves`,
   `copies_find_a_zone_below_a_cut_they_hold`,
   `copies_place_an_alias_below_a_cut`,

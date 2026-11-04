@@ -11,7 +11,9 @@ use fictionet::stdlib::services::dns::authority::{Identity, ServerConfig};
 use fictionet::stdlib::services::dns::resolver::{NameServer, ROOT_SERVERS};
 use fictionet::stdlib::services::dns::zone::AnyResponse;
 use fictionet::stdlib::world::net::Host;
-use fictionet::stdlib::world::net::dns::internet::{Mirror, server_host};
+use fictionet::stdlib::world::net::dns::internet::server_host;
+
+use super::mirror::Mirror;
 
 /// One of the thirteen root server letters, with what its operator's
 /// software does wherever it answers.

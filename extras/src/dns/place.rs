@@ -9,15 +9,21 @@
 //! [`Place::root_servers`] and [`Place::gtld_servers`], and with the
 //! public resolvers of [`public`].
 
-use std::collections::BTreeMap;
-use std::net::{IpAddr, Ipv4Addr};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
-use fictionet::stdlib::protocols::dns::op::ResponseCode;
-use fictionet::stdlib::protocols::dns::rr::Name;
-use fictionet::stdlib::services::dns::authority::{ChaosZone, Identity, ServerConfig};
+use fictionet::stdlib::protocols::dns::Request;
+use fictionet::stdlib::protocols::dns::dnssec::rdata::DNSSECRData;
+use fictionet::stdlib::protocols::dns::op::{Message, ResponseCode};
+use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RData, RecordType};
+use fictionet::stdlib::services::dns::authority::{
+    Authority, ChaosZone, Identity, ServerConfig, Step,
+};
 use fictionet::stdlib::services::dns::resolver::ROOT_SERVERS;
-use fictionet::stdlib::world::net::dns::internet::{self, Echo};
+use fictionet::stdlib::services::dns::{Client, Generation, Looked, Lookup};
+use fictionet::stdlib::world::net::dns::internet;
 use fictionet::stdlib::world::net::{Host, Program};
 
 use super::public::{self, PUBLIC_RESOLVERS, PublicResolver};
@@ -62,7 +68,7 @@ pub struct Place {
     /// Public resolvers by their primary IPv4 address.
     pub resolvers: BTreeMap<IpAddr, ResolverSite>,
     /// The round trip to any other authoritative server, such as one a
-    /// [`Mirror`](internet::Mirror) places.
+    /// [`Mirror`](super::mirror::Mirror) places.
     pub authority_rtt: Duration,
 }
 
@@ -478,6 +484,148 @@ impl Place {
             servers,
             resolvers,
             authority_rtt: ms(20),
+        }
+    }
+}
+
+/// Replies that show each client the address its own questions to the
+/// real servers would leave from, for servers that echo the address a
+/// question came from, as the whoami names of Akamai do.
+///
+/// A [`Mirror`](super::mirror::Mirror)'s upstream asks every real server
+/// from one IPv4 address,
+/// the [`upstream`](Echo::new) address, and the copied records hold what
+/// the real server said to it. A resolver in the world whose real
+/// counterpart asks that server from another IPv4 address, its egress,
+/// would be shown that address instead. So a reply to a client given with
+/// [`client`](Echo::client) carries its egress in place of the
+/// upstream's: in an unsigned TXT string that is the upstream's address,
+/// at any name, since a zone's own text names no single asker's address,
+/// and in an unsigned A record at the names given with
+/// [`name`](Echo::name), whose servers echo the asker. An A record at any
+/// other name that holds the upstream's address is real data, such as a
+/// site on the host's own address, and is left alone. The copied record
+/// stays as the real server sent it; the
+/// address is put in as the reply leaves, since it depends on who asked.
+/// A world adds it with [`Mirror::wrap`](super::mirror::Mirror::wrap) and
+/// [`Echo::over`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Echo {
+    upstream: Ipv4Addr,
+    egress: HashMap<IpAddr, Ipv4Addr>,
+    names: HashSet<LowerName>,
+}
+
+impl Echo {
+    /// Echoes for questions whose answers were asked from `upstream`. It
+    /// changes no reply until a [`client`](Self::client) is given. Then it
+    /// changes the TXT strings that are the upstream's address, at any
+    /// name, and the A records that hold it only at the names given with
+    /// [`name`](Self::name).
+    pub fn new(upstream: Ipv4Addr) -> Echo {
+        Echo {
+            upstream,
+            egress: HashMap::new(),
+            names: HashSet::new(),
+        }
+    }
+
+    /// Shows the client at `client` the IPv4 address `egress` where a
+    /// reply echoes the upstream's.
+    pub fn client(mut self, client: IpAddr, egress: Ipv4Addr) -> Echo {
+        self.egress.insert(client, egress);
+        self
+    }
+
+    /// Echoes the asker's address in the A records at `name`, whose real
+    /// servers answer with the address a question came from.
+    pub fn name(mut self, name: &Name) -> Echo {
+        self.names.insert(LowerName::new(name));
+        self
+    }
+
+    /// `authority`, its replies echoing each client's egress.
+    pub fn over(&self, authority: Arc<dyn Authority>) -> Arc<dyn Authority> {
+        Arc::new(Echoed {
+            echo: self.clone(),
+            authority,
+        })
+    }
+}
+
+/// An authority whose replies [`Echo`] changes.
+struct Echoed {
+    echo: Echo,
+    authority: Arc<dyn Authority>,
+}
+
+impl Authority for Echoed {
+    fn respond(
+        &self,
+        req: &Request,
+        local: SocketAddr,
+        server: &ServerConfig,
+        client: &Client,
+    ) -> Step {
+        match self.authority.respond(req, local, server, client) {
+            Step::Reply(mut response) => {
+                if let Some(&seen) = self.echo.egress.get(&client.peer.ip())
+                    && seen != self.echo.upstream
+                {
+                    echo(
+                        &mut response.message,
+                        &self.echo.names,
+                        self.echo.upstream,
+                        seen,
+                    );
+                }
+                Step::Reply(response)
+            }
+            step => step,
+        }
+    }
+
+    fn file(&self, lookup: &Lookup, looked: &Looked, generation: Generation) {
+        self.authority.file(lookup, looked, generation);
+    }
+
+    fn advance(&self, generation: Generation) {
+        self.authority.advance(generation);
+    }
+}
+
+/// Puts `seen` in place of `egress` where `message`'s answer echoes the
+/// address a question came from: a TXT string that is `egress`, and an A
+/// record holding `egress` at one of `names`. An RRset its RRSIGs cover
+/// is left as it is.
+fn echo(message: &mut Message, names: &HashSet<LowerName>, egress: Ipv4Addr, seen: Ipv4Addr) {
+    let signed: Vec<(Name, RecordType)> = message
+        .answers
+        .iter()
+        .filter_map(|record| match &record.data {
+            RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) => {
+                Some((record.name.clone(), rrsig.input().type_covered))
+            }
+            _ => None,
+        })
+        .collect();
+    let text = egress.to_string();
+    for record in &mut message.answers {
+        if signed.contains(&(record.name.clone(), record.record_type())) {
+            continue;
+        }
+        let named = names.contains(&LowerName::new(&record.name));
+        match &mut record.data {
+            RData::A(a) if a.0 == egress && named => a.0 = seen,
+            // Every other string keeps its octets (RFC 1035 §3.3.14).
+            RData::TXT(txt) => {
+                for string in txt.txt_data.iter_mut() {
+                    if **string == *text.as_bytes() {
+                        *string = seen.to_string().into_bytes().into_boxed_slice();
+                    }
+                }
+            }
+            _ => {}
         }
     }
 }

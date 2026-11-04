@@ -250,7 +250,7 @@ extra iterations, in base32hex. RRSIG times are decimal. Validation results are 
   response has shown yet; and the SOA RRset at the apex of a zone an address was noted for, when a chain led
   there from another zone, or a truncated response showed neither that it serves the zone nor that it does not.
   The differential test's `check_lookups` rejects them, and the vectors draw none of them;
-  `tests/it/dns/learned.rs` tests them. An overlay is a function of its base's steps for the question and for
+  `extras/tests/copies/learned.rs` tests them. An overlay is a function of its base's steps for the question and for
   `<apex> DS`, with what it invents abstract: the theorems bound its lookups and keep its replies stable,
   and `Authority.tla` checks it with lookups shared between requests.
 - **Exchanges** model the state the matching rule touches: the generation, the next exchange number, the
@@ -346,10 +346,10 @@ extra iterations, in base32hex. RRSIG times are decimal. Validation results are 
 | `Zone.Spec`, `Zone.build`, `Zone.ZoneError` | `ZoneBuilder::{rrset, delegate, build}`, `ZoneError` |
 | `Zone.View`, `Zone.answerPartial` | `View` and `answer` over any view |
 | `Zone.Lazy`, `Zone.Provider`, `Zone.lazyView` | `Lazy`, `Provider`, `Lazy::view` |
-| `Authority.Filing`, `Learned`, `Learned.file`, `Learned.view` | `zone::Learned`, `Learned::file`, `Learned::view_at` |
+| `Authority.Filing`, `Learned`, `Learned.file`, `Learned.view` | `fictionet_extras::dns::learned::Learned`, `Learned::file`, `Learned::view_at` |
 | `Authority.Learned.proof`, `Proofs` | `View::denial` of a learned zone for `Denied::Name`; the records `dnssec::proof::proof_of` keeps for a claim |
 | `Authority.Lookup`, `Looked` | `services::dns::{Lookup, Looked}` |
-| `Authority.Step`, `respond` | `authority::Step`, `Copies::respond` over one learned zone (`Step::Need` for what it lacks) |
+| `Authority.Step`, `respond` | `authority::Step`, `fictionet_extras::dns::copies::Copies::respond` over one learned zone (`Step::Need` for what it lacks) |
 | `Authority.loop`, `serve` | `AuthorityEngine`'s handling of `Need`, `Input::Looked`, and `Authority::file` for one request, over any authority and over `Copies` |
 | `Authority.Overlay`, `overlay` | `authority::Overlay` over a learned base |
 | `Exchange.Token`, `send`, `onReply`, `advance` | `services::dns::exchange::{Token, Transmit, Input::Reply, Engine::advance}` |

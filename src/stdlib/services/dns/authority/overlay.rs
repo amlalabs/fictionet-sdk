@@ -22,7 +22,7 @@ use super::{Authority, ServerConfig, Step, bare_reply, refuse_transfer};
 ///
 /// An overlay sits on the servers of a zone's parent, such as the `com`
 /// servers of a world that learns `com` from the real ones
-/// ([`Learned`](super::super::zone::Learned)), with each invented zone, a
+/// (the copies in `fictionet-extras`), with each invented zone, a
 /// child of that parent,
 /// added by [`below`](Overlay::below). A zone transfer gets REFUSED, and a
 /// question in a class other than IN gets what the base gives it. For a

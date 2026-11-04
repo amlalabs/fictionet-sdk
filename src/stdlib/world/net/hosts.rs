@@ -10,7 +10,7 @@ use fictionet::stdlib::protocols::dns::op::Query;
 use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RecordSet};
 use fictionet::stdlib::services::dns::resolver::{Config, LocalZone};
 use fictionet::stdlib::services::dns::zone::{
-    Denied, EmptyApex, Fact, Node, Revision, Transparent, View, ZoneData, targets,
+    Denied, EmptyApex, Fact, Node, Revision, Transparent, View, ZoneData, additional_targets,
 };
 use fictionet::stdlib::services::serve::ConnInfo;
 use fictionet::stdlib::services::serve::{
@@ -730,7 +730,7 @@ impl World {
                 _ => None,
             })
             .flatten()
-            .flat_map(targets)
+            .flat_map(additional_targets)
             .filter(|target| apex.zone_of(target))
             .collect();
         for mut name in wanted {

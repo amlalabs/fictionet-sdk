@@ -13,19 +13,19 @@ use fictionet::stdlib::protocols::dns::op::{Message, Query, ResponseCode};
 use fictionet::stdlib::protocols::dns::rr::{
     DNSClass, LowerName, Name, RData, Record, RecordSet, RecordType,
 };
+use fictionet::stdlib::services::dns::Generation;
+use fictionet::stdlib::services::dns::zone::{
+    Denied, Fact, Node, Revision, View, ZoneData, additional_targets, dname_target, expanded_from,
+    rrsets, wildcard,
+};
 use fictionet::sync::Mutex;
-
-use super::super::exchange::Generation;
-use super::super::records::{expanded_from, rrsets};
-use super::data::{Denied, Fact, Revision, View, ZoneData};
-use super::zone::{Node, dname_target, targets, wildcard};
 
 /// Zone data copied from what one zone's real servers answered, one
 /// session at a time.
 ///
 /// A world's server never passes a real server's message on. It answers
-/// from this data with [`answer`](super::answer), and when a reply needs a
-/// fact the data does not hold, [`Copies`](super::super::authority::Copies)
+/// from this data with [`answer`](fictionet::stdlib::services::dns::zone::answer), and when a reply needs a
+/// fact the data does not hold, [`Copies`](super::copies::Copies)
 /// looks the client's question up at a real server of the zone, or the
 /// name its chain reached when that response did not settle it, and
 /// [files](Learned::file) the response here.
@@ -149,7 +149,7 @@ use super::zone::{Node, dname_target, targets, wildcard};
 /// tells such a response apart, so that it is filed into the child's copy
 /// instead, and [`below_cut`](Learned::below_cut) tells an authoritative
 /// answer from a zone whose apex it does not show
-/// ([`Copies`](super::super::authority::Copies) does both).
+/// ([`Copies`](super::copies::Copies) does both).
 ///
 /// Facts belong to a session ([`Generation`]): [`advance`](Learned::advance)
 /// to a newer one drops them all, and a response to a lookup made in an
@@ -950,7 +950,7 @@ impl Facts {
         if self.below_cut(&cut.base_name(), RecordType::NS) {
             return false;
         }
-        let names = targets(ns);
+        let names = additional_targets(ns);
         let glue: Vec<RecordSet> = additional
             .iter()
             .filter(|set| {

@@ -3,7 +3,7 @@ use fictionet::stdlib::protocols::dns::op::{Edns, OpCode, ResponseCode};
 use fictionet::stdlib::protocols::dns::rr::rdata::{NS, SOA};
 use fictionet::stdlib::protocols::dns::rr::{LowerName, Record, RecordSet};
 use fictionet::stdlib::protocols::dns::{Ede, EdeCode};
-use fictionet::stdlib::services::dns::authority::{Copies, ServerConfig, Zones};
+use fictionet::stdlib::services::dns::authority::{ServerConfig, Zones};
 use fictionet::stdlib::services::dns::resolver::{Config, LocalZone};
 use fictionet::stdlib::services::dns::zone::Zone;
 use fictionet::stdlib::services::dns::{Client, Event, Looked, Lookup, WallClock};
@@ -13,6 +13,7 @@ use fictionet::stdlib::world::net::dns::{
     Authoritative, Namespace, Only, Recursive, ResolverHandle, Upstream,
 };
 use fictionet_test_support::ended_with_done;
+use fictionet_test_support::lookup_authority::LookupAuthority;
 
 // ---------------------------------------------------------------------------
 // A network: a PLC and a web server
@@ -410,7 +411,7 @@ fn a_rejected_host_does_not_install_http_names_or_a_default() {
 
 #[test]
 fn a_plc_and_a_web_server_on_one_net_with_observe_decoding_both() {
-    crate::common::world::world(Duration::from_secs(60), |fcx| async move {
+    fictionet_test_support::world::world(Duration::from_secs(60), |fcx| async move {
         let plant = Arc::new(Plant {
             limit: 1000,
             ..Plant::default()
@@ -549,7 +550,7 @@ fn a_plc_and_a_web_server_on_one_net_with_observe_decoding_both() {
 
 #[test]
 fn net_serves_udp_services_and_trusted_sandboxes() {
-    crate::common::world::world(Duration::from_secs(60), |fcx| async move {
+    fictionet_test_support::world::world(Duration::from_secs(60), |fcx| async move {
         let counter = Arc::new(AtomicUsize::new(0));
         /// Counts datagrams.
         struct Udp;
@@ -639,7 +640,7 @@ service_fixture! {
 /// read neither.
 #[test]
 fn net_caps_connections_per_service_and_bytes_per_sandbox() {
-    crate::common::world::world(Duration::from_secs(60), |fcx| async move {
+    fictionet_test_support::world::world(Duration::from_secs(60), |fcx| async move {
         let (attacher, attachments) = fictionet::attachments();
         let addr = Ipv4Addr::new(10, 40, 0, 3);
         let limits = fictionet::stdlib::world::net::Limits {
@@ -813,7 +814,7 @@ fn hosts_and_members_share_a_lan_on_the_net() {
             Ok(())
         }
     }
-    crate::common::world::world(Duration::from_secs(60), |fcx| async move {
+    fictionet_test_support::world::world(Duration::from_secs(60), |fcx| async move {
         let (attacher, attachments) = fictionet::attachments();
         let corp = Lan::new("corp", "192.168.56.0/24".parse()?);
         let dc: Ipv4Addr = "192.168.56.10".parse()?;
@@ -893,7 +894,7 @@ fn hosts_and_members_share_a_lan_on_the_net() {
 
 #[test]
 fn trusted_routes_attribute_requests_and_refusals() {
-    crate::common::world::world(Duration::from_secs(10), |fcx| async move {
+    fictionet_test_support::world::world(Duration::from_secs(10), |fcx| async move {
         let (attacher, attachments) = fictionet::attachments();
         let address: Ipv4Addr = "192.168.56.50".parse()?;
         Net::new(fictionet_extras::network::cdn_pools())
@@ -1027,7 +1028,7 @@ fn early_region_error_is_failure() {
 /// budget after its sandbox detached.
 #[test]
 fn net_keeps_one_budget_per_attachment() {
-    crate::common::world::world(Duration::from_secs(60), |fcx| async move {
+    fictionet_test_support::world::world(Duration::from_secs(60), |fcx| async move {
         let (attacher, attachments) = fictionet::attachments();
         let (addr, addr6) = (
             Ipv4Addr::new(10, 40, 0, 3),
@@ -1103,7 +1104,7 @@ fn net_keeps_one_budget_per_attachment() {
 /// member was never detached.
 #[test]
 fn a_lan_member_detaches_like_any_sandbox() {
-    crate::common::world::world(Duration::from_secs(60), |fcx| async move {
+    fictionet_test_support::world::world(Duration::from_secs(60), |fcx| async move {
         let (attacher, attachments) = fictionet::attachments();
         let dc: Ipv4Addr = "192.168.56.10".parse()?;
         let ws: Ipv4Addr = "192.168.56.31".parse()?;
@@ -1405,8 +1406,7 @@ fn only_looks_up_what_its_policy_allows() {
                 asked: asked.clone(),
             },
         );
-        let zones = Copies::new();
-        zones.serves(address.into(), &lower("test."));
+        let zones = LookupAuthority::new("test.");
         let (attacher, attachments) = fictionet::attachments();
         Net::new()
             .ipv4_only()

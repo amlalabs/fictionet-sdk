@@ -10,7 +10,6 @@ pub mod echo_service;
 pub mod io;
 pub mod rustls_client;
 pub mod threads;
-pub mod world;
 
 /// Runs the test `name` alone in a child process of this binary, and fails
 /// if it fails there. Returns true here, where the test then returns, and
