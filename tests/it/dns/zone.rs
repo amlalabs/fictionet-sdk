@@ -2683,25 +2683,34 @@ fn localhost_points_every_name_at_loopback() {
     }
 }
 
-/// `invalid` never exists, and neither does any name below it: every
-/// question gets NXDOMAIN, at the apex too (RFC 6761 §6.4).
+/// `invalid` never exists, and neither does any name below it (RFC 6761
+/// §6.4); a caching server answers every query for `test` and the names
+/// within it negatively (RFC 6761 §6.2), and every `.onion` query with
+/// NXDOMAIN (RFC 7686 §2). Each question gets NXDOMAIN, at the apex too.
 #[test]
-fn invalid_is_nxdomain_at_its_apex_too() {
-    let zone = special::invalid(&EmptyApex::rfc6303());
-    for qname in ["invalid.", "x.invalid."] {
-        for qtype in [RecordType::A, RecordType::SOA, RecordType::NS] {
-            let reply = ask(&*view_of(&zone, qname, qtype), qname, qtype);
-            assert_eq!(
-                reply.metadata.response_code,
-                ResponseCode::NXDomain,
-                "{qname} {qtype}"
-            );
-            assert!(reply.answers.is_empty(), "{qname} {qtype}");
-            assert_eq!(
-                rows(&reply.authorities),
-                vec![row("invalid.", RecordType::SOA)],
-                "{qname} {qtype}"
-            );
+fn invalid_onion_and_test_are_nxdomain_at_their_apex_too() {
+    let apex = EmptyApex::rfc6303();
+    for zone in [
+        special::invalid(&apex),
+        special::onion(&apex),
+        special::test(&apex),
+    ] {
+        let apex = zone.apex().to_string();
+        for qname in [apex.clone(), format!("x.{apex}")] {
+            for qtype in [RecordType::A, RecordType::SOA, RecordType::NS] {
+                let reply = ask(&*view_of(&zone, &qname, qtype), &qname, qtype);
+                assert_eq!(
+                    reply.metadata.response_code,
+                    ResponseCode::NXDomain,
+                    "{qname} {qtype}"
+                );
+                assert!(reply.answers.is_empty(), "{qname} {qtype}");
+                assert_eq!(
+                    rows(&reply.authorities),
+                    vec![row(&apex, RecordType::SOA)],
+                    "{qname} {qtype}"
+                );
+            }
         }
     }
 }
@@ -2758,8 +2767,6 @@ fn special_use_zones_are_empty_with_the_apex_they_are_given() {
     };
     let zones = special::rfc6303(&apex);
     for zone in [
-        special::onion(&apex),
-        special::test(&apex),
         special::home_arpa(&apex),
         special::service_arpa(&apex),
         special::resolver_arpa(&apex, vec![], 3600),

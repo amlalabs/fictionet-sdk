@@ -22,7 +22,11 @@
 (*                                                                         *)
 (* Each client asks a fixed script of questions, each a name and a type    *)
 (* (A or AAAA), one at a time, as a stub resolver does; two clients asking *)
-(* the same question share one resolution. The resolver starts with the    *)
+(* the same question share one resolution. Each client's question has its  *)
+(* own budget of MaxWork queries (RFC 1034 section 5.3.3). A resolution    *)
+(* charges the client that started it; once that client's budget is spent, *)
+(* a waiting client with queries left takes it over, and the spent client  *)
+(* gets SERVFAIL (Resolver::take_over). The resolver starts with the       *)
 (* root's servers as hints and keeps every cut it learns (NS TTLs outlast  *)
 (* MaxTime). The cache keeps answers by name and type.                     *)
 (*                                                                         *)
@@ -44,9 +48,9 @@
 (*                                                                         *)
 (* Ablation flags: CheckBailiwick, BoundWork, CacheTc, CheckExpiry,        *)
 (* FailureAsNegative, CacheBounded, CountDown, CheckId, CheckPort,         *)
-(* CheckType, and CacheByName. Each is the rule as the design states it    *)
-(* when TRUE (FALSE for CacheTc, FailureAsNegative, CacheBounded, and      *)
-(* CacheByName).                                                           *)
+(* CheckType, CacheByName, and SharedBound. Each is the rule as the design *)
+(* states it when TRUE (FALSE for CacheTc, FailureAsNegative,              *)
+(* CacheBounded, CacheByName, and SharedBound).                            *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets, Sequences, TLC
 
@@ -54,7 +58,7 @@ CONSTANTS
     Clients,           \* clients of the resolver
     Script,            \* the distinct questions every client asks, in this order
     MaxTime,           \* the clock runs 0..MaxTime
-    MaxWork,           \* upstream queries per resolution (Config.work.queries)
+    MaxWork,           \* upstream queries per client question (Config.work.queries)
     MaxChain,          \* CNAME restarts per resolution (Config.work.depth)
     MaxLoss,           \* messages the network may lose
     MaxTc,             \* UDP replies the network may truncate
@@ -74,6 +78,7 @@ CONSTANTS
     CheckPort,         \* a reply must come to the query's port
     CheckType,         \* a reply's question must have the query's type
     CacheByName,       \* ablation: the cache keeps answers by name alone
+    SharedBound,       \* ablation: only the client that started a resolution pays for it
     None               \* a model value for "nothing here"
 
 -----------------------------------------------------------------------------
@@ -187,12 +192,13 @@ VARIABLES
     waiting,  \* [Questions -> clients waiting on that resolution]
     asked,    \* [Clients -> questions asked]
     ans,      \* [Clients -> [Questions -> answer or None]]
+    spent,    \* [Clients -> [Questions -> queries the client's question paid for]]
     net,      \* messages in flight
     lost,     \* messages lost so far
     tcs,      \* replies truncated so far
     spoofs    \* forged replies sent so far
 
-vars == <<now, ver, editAt, cache, known, res, waiting, asked, ans, net, lost, tcs, spoofs>>
+vars == <<now, ver, editAt, cache, known, res, waiting, asked, ans, spent, net, lost, tcs, spoofs>>
 
 \* A cache entry. rank is "auth" or "glue" (RFC 2181 section 5.4.1); from is
 \* the zone of the server that sent it, or for a failure the zone whose
@@ -217,9 +223,10 @@ Closest(n) == CHOOSE z \in known : AtOrBelow(n, z)
 
 \* got is the entry the last reply brought for qn, which serves this
 \* resolution whether or not the cache keeps it (RFC 1035 section 7.4). out
-\* is the exchange outstanding: [s, tcp, port, id].
-NewRes(q) == [qn |-> q[1], zone |-> Closest(q[1]), tried |-> {}, out |-> None,
-              work |-> 0, chain |-> 0, recs |-> {}, got |-> None]
+\* is the exchange outstanding: [s, tcp, port, id]. payer is the waiting
+\* client whose budget pays for its queries.
+NewRes(q, payer) == [qn |-> q[1], zone |-> Closest(q[1]), tried |-> {}, out |-> None,
+                     payer |-> payer, chain |-> 0, recs |-> {}, got |-> None]
 
 \* The work and chain counters count every query and restart, with or
 \* without the bounds kept, and stop one past their bound, which is enough
@@ -292,6 +299,7 @@ Init ==
     /\ waiting = [q \in Questions |-> {}]
     /\ asked = [c \in Clients |-> {}]
     /\ ans = [c \in Clients |-> [q \in Questions |-> None]]
+    /\ spent = [c \in Clients |-> [q \in Questions |-> 0]]
     /\ net = {}
     /\ lost = 0
     /\ tcs = 0
@@ -306,14 +314,17 @@ Ask(c, q) ==
     /\ \A p \in asked[c] : ans[c][p] # None
     /\ asked' = [asked EXCEPT ![c] = @ \cup {q}]
     /\ waiting' = [waiting EXCEPT ![q] = @ \cup {c}]
-    /\ res' = IF res[q] = None THEN [res EXCEPT ![q] = NewRes(q)] ELSE res
-    /\ UNCHANGED <<now, ver, editAt, cache, known, ans, net, lost, tcs, spoofs>>
+    /\ res' = IF res[q] = None THEN [res EXCEPT ![q] = NewRes(q, c)] ELSE res
+    /\ UNCHANGED <<now, ver, editAt, cache, known, ans, spent, net, lost, tcs, spoofs>>
+
+\* An answer to a client, rendered now. bound says the work bound ended it.
+Answer(rcode, recs, bound) ==
+    [rcode |-> rcode, at |-> now, recs |-> {Rendered(u) : u \in recs}, bound |-> bound]
 
 \* Every waiter of q gets the answer, rendered now.
-Finish(q, rcode, recs) ==
+Finish(q, rcode, recs, bound) ==
     /\ ans' = [c \in Clients |-> IF c \in waiting[q]
-                                  THEN [ans[c] EXCEPT ![q] = [rcode |-> rcode, at |-> now,
-                                                              recs |-> {Rendered(u) : u \in recs}]]
+                                  THEN [ans[c] EXCEPT ![q] = Answer(rcode, recs, bound)]
                                   ELSE ans[c]]
     /\ res' = [res EXCEPT ![q] = None]
     /\ waiting' = [waiting EXCEPT ![q] = {}]
@@ -324,17 +335,41 @@ Fail(q) ==
     LET r == res[q]
         e == FailEntry(IF FailureAsNegative THEN "nx" ELSE "fail", r)
     IN  /\ cache' = [cache EXCEPT ![Key(r.qn, q[2])] = e]
-        /\ Finish(q, Rcode(e.t), {Used(r.qn, q[2], e, FALSE)})
+        /\ Finish(q, Rcode(e.t), {Used(r.qn, q[2], e, FALSE)}, FALSE)
 
-(* The resolution reached the work bound: SERVFAIL. The bound is one        *)
-(* question's budget and says nothing of the servers, so the failure is not *)
-(* cached for other clients, as Resolution::send leaves it out of the cache  *)
-(* (RFC 9520 section 3.2).                                                 *)
+(* No client waiting on the resolution has queries left: SERVFAIL. The      *)
+(* bound is each question's budget and says nothing of the servers, so the  *)
+(* failure is not cached for other clients, as Resolution::send leaves it   *)
+(* out of the cache (RFC 9520 section 3.2).                                *)
 FailBounded(q) ==
     LET r == res[q]
         e == FailEntry("fail", r)
     IN  /\ cache' = IF CacheBounded THEN [cache EXCEPT ![Key(r.qn, q[2])] = e] ELSE cache
-        /\ Finish(q, "SERVFAIL", {})
+        /\ Finish(q, "SERVFAIL", {}, TRUE)
+
+\* Whether client p, waiting on q, may pay for one more query of q's
+\* resolution: it has queries left, and with SharedBound it is the payer.
+CanPay(q, p) ==
+    /\ p \in waiting[q]
+    /\ BoundWork => spent[p][q] < MaxWork
+    /\ SharedBound => p = res[q].payer
+
+\* The clients that may pay for q's next query: its payer while it can, or
+\* else any waiting client that can, which takes the resolution over.
+Payers(q) == IF CanPay(q, res[q].payer) THEN {res[q].payer}
+             ELSE {p \in waiting[q] : CanPay(q, p)}
+
+(* Client p pays for one more query of q's resolution. A p other than the   *)
+(* payer takes the resolution over from the payer, whose budget is spent:   *)
+(* the payer gets SERVFAIL and stops waiting, and the others wait on        *)
+(* (Resolver::take_over). The caller sets res'[q].payer to p.              *)
+Charge(q, p) ==
+    LET payer == res[q].payer IN
+    /\ spent' = [spent EXCEPT ![p][q] = Min(@ + 1, MaxWork + 1)]
+    /\ IF p = payer
+       THEN UNCHANGED <<waiting, ans>>
+       ELSE /\ ans' = [ans EXCEPT ![payer][q] = Answer("SERVFAIL", {}, TRUE)]
+            /\ waiting' = [waiting EXCEPT ![q] = @ \ {payer}]
 
 \* A record is live while its TTL has not run out.
 Live(u) == now < u.readAt + u.ttl
@@ -358,33 +393,34 @@ Advance(q) ==
              \* chain again from the question, keeping the work done so far. A
              \* link that came for this resolution serves it with the TTL it has
              \* left, even 0: following again could only fetch it again.
-             THEN /\ res' = [res EXCEPT ![q] = [NewRes(q) EXCEPT !.work = r.work, !.chain = r.chain]]
+             THEN /\ res' = [res EXCEPT ![q] = [NewRes(q, r.payer) EXCEPT !.chain = r.chain]]
                   /\ UNCHANGED <<waiting, ans>>
-             ELSE Finish(q, Rcode(e.t), recs)
-          /\ UNCHANGED <<cache, net>>
+             ELSE Finish(q, Rcode(e.t), recs, FALSE)
+          /\ UNCHANGED <<cache, spent, net>>
        \/ /\ have
           /\ e.t = "cname"
           /\ IF BoundWork /\ r.chain >= MaxChain
              \* The chain is too long: SERVFAIL, keeping the cached CNAME.
-             THEN /\ Finish(q, "SERVFAIL", {})
-                  /\ UNCHANGED <<cache, net>>
+             THEN /\ Finish(q, "SERVFAIL", {}, FALSE)
+                  /\ UNCHANGED <<cache, spent, net>>
              ELSE /\ res' = [res EXCEPT ![q] = [qn |-> e.val, zone |-> Closest(e.val), tried |-> {},
-                                              out |-> None, work |-> r.work,
+                                              out |-> None, payer |-> r.payer,
                                               chain |-> Min(r.chain + 1, MaxChain + 1),
                                               recs |-> r.recs \cup {Used(r.qn, q[2], e, fetched)},
                                               got |-> None]]
-                  /\ UNCHANGED <<cache, waiting, ans, net>>
+                  /\ UNCHANGED <<cache, waiting, ans, spent, net>>
        \/ /\ ~have
-          /\ IF BoundWork /\ r.work >= MaxWork
-             THEN FailBounded(q) /\ UNCHANGED net
+          /\ IF Payers(q) = {}
+             THEN FailBounded(q) /\ UNCHANGED <<spent, net>>
              ELSE IF \A s \in ServersOf(r.zone) : <<s, FALSE>> \in r.tried
-             THEN Fail(q) /\ UNCHANGED net
-             ELSE \E s \in ServersOf(r.zone), port \in Ports, id \in IDs :
+             THEN Fail(q) /\ UNCHANGED <<spent, net>>
+             ELSE \E p \in Payers(q), s \in ServersOf(r.zone), port \in Ports, id \in IDs :
                     /\ <<s, FALSE>> \notin r.tried
                     /\ res' = [res EXCEPT ![q].out = [s |-> s, tcp |-> FALSE, port |-> port, id |-> id],
-                                          ![q].work = Min(@ + 1, MaxWork + 1)]
+                                          ![q].payer = p]
+                    /\ Charge(q, p)
                     /\ net' = net \cup {Msg("q", q, r.qn, q[2], s, FALSE, port, id, FALSE, None)}
-                    /\ UNCHANGED <<cache, waiting, ans>>
+                    /\ UNCHANGED cache
     /\ UNCHANGED <<now, ver, editAt, known, asked, lost, tcs, spoofs>>
 
 (* A server gets a query and replies at once from the data it serves now,   *)
@@ -394,7 +430,7 @@ ServeOne(m) ==
     /\ m.k = "q"
     /\ net' = (net \ {m}) \cup {Msg("r", m.q, m.qn, m.qt, m.srv, m.tcp, m.port, m.id, FALSE,
                                     Respond(m.srv, m.qn, m.qt))}
-    /\ UNCHANGED <<now, ver, editAt, cache, known, res, waiting, asked, ans, lost, tcs, spoofs>>
+    /\ UNCHANGED <<now, ver, editAt, cache, known, res, waiting, asked, ans, spent, lost, tcs, spoofs>>
 
 \* Caching rules for an extra record, glue included: an entry is replaced only
 \* by one of equal or higher rank (RFC 2181 section 5.4.1). Extra records are
@@ -427,36 +463,39 @@ ReceiveOne(m) ==
               /\ cache' = IF CacheTc
                           THEN [cache EXCEPT ![Key(r.qn, q[2])] = Entry("nodata", None, NegTtl, "auth", m.srv[1])]
                           ELSE cache
-              /\ IF BoundWork /\ r.work >= MaxWork
+              /\ IF Payers(q) = {}
                  THEN /\ res' = [res EXCEPT ![q].out = None, ![q].tried = tried]
                       /\ net' = net \ {m}
-                 ELSE \E port \in Ports, id \in IDs :
+                      /\ UNCHANGED <<waiting, ans, spent>>
+                 ELSE \E p \in Payers(q), port \in Ports, id \in IDs :
                       /\ res' = [res EXCEPT ![q].out = [s |-> m.srv, tcp |-> TRUE, port |-> port, id |-> id],
-                                            ![q].tried = tried, ![q].work = Min(@ + 1, MaxWork + 1)]
+                                            ![q].tried = tried, ![q].payer = p]
+                      /\ Charge(q, p)
                       /\ net' = (net \ {m}) \cup {Msg("q", q, r.qn, q[2], m.srv, TRUE, port, id, FALSE, None)}
               /\ UNCHANGED known
          [] b.kind = "refused" ->
               /\ res' = [res EXCEPT ![q].out = None, ![q].tried = tried]
               /\ net' = net \ {m}
-              /\ UNCHANGED <<cache, known>>
+              /\ UNCHANGED <<cache, known, waiting, ans, spent>>
          [] b.kind = "referral" ->
               \* A referral must lead strictly below the current cut and to a zone
               \* at or above the name; anything else is lame.
-              IF StrictlyBelow(b.to, r.zone) /\ AtOrBelow(r.qn, b.to)
-              THEN /\ known' = known \cup {b.to}
-                   /\ cache' = CacheAll(cache, b.extra, "glue", m.srv[1])
-                   /\ res' = [res EXCEPT ![q].out = None, ![q].zone = b.to, ![q].tried = {}]
-                   /\ net' = net \ {m}
-              ELSE /\ res' = [res EXCEPT ![q].out = None, ![q].tried = tried]
-                   /\ net' = net \ {m}
-                   /\ UNCHANGED <<cache, known>>
+              /\ IF StrictlyBelow(b.to, r.zone) /\ AtOrBelow(r.qn, b.to)
+                 THEN /\ known' = known \cup {b.to}
+                      /\ cache' = CacheAll(cache, b.extra, "glue", m.srv[1])
+                      /\ res' = [res EXCEPT ![q].out = None, ![q].zone = b.to, ![q].tried = {}]
+                      /\ net' = net \ {m}
+                 ELSE /\ res' = [res EXCEPT ![q].out = None, ![q].tried = tried]
+                      /\ net' = net \ {m}
+                      /\ UNCHANGED <<cache, known>>
+              /\ UNCHANGED <<waiting, ans, spent>>
          [] b.kind = "answer" ->
               LET e == Entry(b.rr.t, b.rr.val, b.rr.ttl, "auth", m.srv[1]) IN
               /\ cache' = CacheAll([cache EXCEPT ![Key(r.qn, q[2])] = e], b.extra, "auth", m.srv[1])
               /\ res' = [res EXCEPT ![q].out = None, ![q].got = e]
               /\ net' = net \ {m}
-              /\ UNCHANGED known
-    /\ UNCHANGED <<now, ver, editAt, waiting, asked, ans, lost, tcs, spoofs>>
+              /\ UNCHANGED <<known, waiting, ans, spent>>
+    /\ UNCHANGED <<now, ver, editAt, asked, lost, tcs, spoofs>>
 
 (* A reply no outstanding exchange takes changes nothing: it is dropped,   *)
 (* as `Event::Ignored`.                                                    *)
@@ -465,7 +504,7 @@ IgnoreOne(m) ==
     /\ m.k = "r"
     /\ ~Matches(m, m.q, res[m.q])
     /\ net' = net \ {m}
-    /\ UNCHANGED <<now, ver, editAt, cache, known, res, waiting, asked, ans, lost, tcs, spoofs>>
+    /\ UNCHANGED <<now, ver, editAt, cache, known, res, waiting, asked, ans, spent, lost, tcs, spoofs>>
 
 (* The exchange's query or reply was lost, so its timeout fires. A forged   *)
 (* reply in flight does not stand for the real one.                        *)
@@ -474,7 +513,7 @@ Timeout(q) ==
     /\ res[q].out # None
     /\ ~\E m \in net : m.q = q /\ ~m.spoof
     /\ res' = [res EXCEPT ![q].tried = @ \cup {<<res[q].out.s, res[q].out.tcp>>}, ![q].out = None]
-    /\ UNCHANGED <<now, ver, editAt, cache, known, waiting, asked, ans, net, lost, tcs, spoofs>>
+    /\ UNCHANGED <<now, ver, editAt, cache, known, waiting, asked, ans, spent, net, lost, tcs, spoofs>>
 
 (* The attacker forges a reply to an exchange of q the resolver has         *)
 (* outstanding, from the server it asked, over its transport, about the     *)
@@ -490,14 +529,14 @@ SpoofOne(q) ==
                                   Body("answer", None, [t |-> qt, val |-> Poison.val, ttl |-> Poison.ttl], {}))
                               EXCEPT !.spoof = TRUE]}
     /\ spoofs' = spoofs + 1
-    /\ UNCHANGED <<now, ver, editAt, cache, known, res, waiting, asked, ans, lost, tcs>>
+    /\ UNCHANGED <<now, ver, editAt, cache, known, res, waiting, asked, ans, spent, lost, tcs>>
 
 LoseOne(m) ==
     /\ m \in net
     /\ lost < MaxLoss
     /\ net' = net \ {m}
     /\ lost' = lost + 1
-    /\ UNCHANGED <<now, ver, editAt, cache, known, res, waiting, asked, ans, tcs, spoofs>>
+    /\ UNCHANGED <<now, ver, editAt, cache, known, res, waiting, asked, ans, spent, tcs, spoofs>>
 
 (* A UDP reply too large for the path arrives with TC and no records. *)
 TruncateOne(m) ==
@@ -506,7 +545,7 @@ TruncateOne(m) ==
     /\ tcs < MaxTc
     /\ net' = (net \ {m}) \cup {[m EXCEPT !.tc = TRUE, !.body = Body("empty", None, None, {})]}
     /\ tcs' = tcs + 1
-    /\ UNCHANGED <<now, ver, editAt, cache, known, res, waiting, asked, ans, lost, spoofs>>
+    /\ UNCHANGED <<now, ver, editAt, cache, known, res, waiting, asked, ans, spent, lost, spoofs>>
 
 \* The clock does not advance while a reply is in flight or before the
 \* resolver has acted on it.
@@ -520,13 +559,13 @@ Tick ==
                 THEN [k \in CacheKeys |-> IF cache[k] # None /\ now + 1 >= cache[k].readAt + cache[k].ttl
                                           THEN None ELSE cache[k]]
                 ELSE cache
-    /\ UNCHANGED <<ver, editAt, known, res, waiting, asked, ans, net, lost, tcs, spoofs>>
+    /\ UNCHANGED <<ver, editAt, known, res, waiting, asked, ans, spent, net, lost, tcs, spoofs>>
 
 WorldEdit ==
     /\ ver < MaxEdits
     /\ ver' = ver + 1
     /\ editAt' = now
-    /\ UNCHANGED <<now, cache, known, res, waiting, asked, ans, net, lost, tcs, spoofs>>
+    /\ UNCHANGED <<now, cache, known, res, waiting, asked, ans, spent, net, lost, tcs, spoofs>>
 
 \* Each network step on some message, named so traces show which one ran.
 Serve == \E m \in net : ServeOne(m)
@@ -638,15 +677,23 @@ FailureNeverNegative ==
 (* A cached failure says every server of its zone failed: the resolution   *)
 (* that wrote it tried each of them (RFC 9520 section 3.1). So a failure the *)
 (* work bound caused before every server was tried, which says nothing of   *)
-(* the servers, is never cached, and one question's spent budget never      *)
-(* answers another client.                                                  *)
+(* the servers, is never cached for another client.                        *)
 CachedFailureTriedAll ==
     \A k \in CacheKeys : (cache[k] # None /\ cache[k].failure) =>
         \A s \in ServersOf(cache[k].from) : <<s, FALSE>> \in cache[k].tried
 
-(* Each resolution stays within its work and chain bounds. *)
+(* Each client's question stays within its work bound, and each resolution  *)
+(* within its chain bound.                                                  *)
 WorkBounded ==
-    \A q \in Questions : res[q] # None => res[q].work <= MaxWork /\ res[q].chain <= MaxChain
+    /\ \A c \in Clients, q \in Questions : spent[c][q] <= MaxWork
+    /\ \A q \in Questions : res[q] # None => res[q].chain <= MaxChain
+
+(* The work bound is each client question's own (RFC 1034 section 5.3.3):  *)
+(* a client fails for want of queries only once its own budget is spent,    *)
+(* never because another client that started the resolution spent its own. *)
+BoundIsOwn ==
+    \A c \in Clients, q \in Questions :
+        (ans[c][q] # None /\ ans[c][q].bound) => spent[c][q] >= MaxWork
 
 (* The resolver follows only referrals that lead strictly down toward the   *)
 (* name; the cut it works from always contains the name. It relates two     *)

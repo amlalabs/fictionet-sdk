@@ -172,15 +172,17 @@ pub fn dohpath() -> (SvcParamKey, SvcParamValue) {
 }
 
 /// `onion`, whose names are reached through Tor and never through DNS:
-/// every name below the apex is NXDOMAIN (RFC 7686 §2).
-pub fn onion(apex: &EmptyApex) -> Zone {
-    built(apex.zone(&name("onion.")))
+/// the apex and every name below it are NXDOMAIN, as a caching server
+/// must answer every `.onion` query (RFC 7686 §2).
+pub fn onion(apex: &EmptyApex) -> SpecialUse {
+    SpecialUse::new(&name("onion."), apex, None)
 }
 
-/// `test`, kept for testing: every name below the apex is NXDOMAIN
-/// (RFC 6761 §6.2).
-pub fn test(apex: &EmptyApex) -> Zone {
-    built(apex.zone(&name("test.")))
+/// `test`, kept for testing: the apex and every name below it get the
+/// immediate negative answer, NXDOMAIN, a caching server gives every
+/// query for `test.` and the names within it (RFC 6761 §6.2).
+pub fn test(apex: &EmptyApex) -> SpecialUse {
+    SpecialUse::new(&name("test."), apex, None)
 }
 
 /// `invalid`, which never exists: the apex and every name below it are

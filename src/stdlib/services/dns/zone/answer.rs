@@ -222,6 +222,9 @@ pub(super) fn resolve(
     walk.chase(qname.clone()).map(|(found, _)| found)
 }
 
+/// The name a chain went past its zone at, and the chain up to there.
+type Passed = (LowerName, Found);
+
 /// Where the walk from the apex toward a name stops.
 enum Loc<'v> {
     /// The name is outside the zone.
@@ -348,10 +351,7 @@ impl<'v> Walk<'v> {
     /// reaches twice, such as a DNAME it passes again, goes out once
     /// (RFC 2181 §5). With the answer, the name the chain went past the
     /// zone at, out of it or to a referral, and the chain up to there.
-    fn chase(
-        &self,
-        mut name: LowerName,
-    ) -> Result<(Found, Option<(LowerName, Found)>), Box<Stopped>> {
+    fn chase(&self, mut name: LowerName) -> Result<(Found, Option<Passed>), Box<Stopped>> {
         let mut seen = Vec::new();
         let mut answer = Vec::new();
         let mut proofs = Vec::new();

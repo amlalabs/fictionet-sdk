@@ -82,6 +82,9 @@ pub struct PublicResolver {
     pub addresses: [ResolverAddress; 2],
     /// The names of [`doh`](Self::doh), fully qualified.
     doh: &'static [&'static str],
+    /// The other names its certificate covers, such as the name it gives
+    /// for DNS over TLS.
+    certified: &'static [&'static str],
     config: fn(Identity) -> Config,
     whoami: fn(Config, &ResolverSite, Ipv4Addr) -> Config,
     fallback: fn(Fronts) -> Arc<dyn Handler>,
@@ -97,14 +100,16 @@ impl PublicResolver {
     }
 
     /// The subject alternative names of its DNS over TLS and HTTPS fronts'
-    /// certificate: its DNS over HTTPS names, then each of its addresses as
-    /// an IP SAN (RFC 5280 §4.2.1.6), so a client that connects to an
-    /// address checks it as it would a name.
+    /// certificate: its DNS over HTTPS names and the other names its real
+    /// certificate covers, then each of its addresses as an IP SAN
+    /// (RFC 5280 §4.2.1.6), so a client that connects to an address checks
+    /// it as it would a name.
     pub fn sans(&self) -> Vec<String> {
         let names = self
             .doh()
             .into_iter()
-            .map(|name| name.to_ascii().trim_end_matches('.').to_owned());
+            .map(|name| name.to_ascii().trim_end_matches('.').to_owned())
+            .chain(self.certified.iter().map(|name| (*name).to_owned()));
         let addresses = self
             .addresses
             .iter()
@@ -174,6 +179,7 @@ pub const PUBLIC_RESOLVERS: [PublicResolver; 4] = [
             },
         ],
         doh: &["dns.google."],
+        certified: &[],
         fallback: doh::google,
         config: google,
         whoami: google_whoami,
@@ -193,6 +199,9 @@ pub const PUBLIC_RESOLVERS: [PublicResolver; 4] = [
             },
         ],
         doh: &["cloudflare-dns.com.", "one.one.one.one."],
+        // Its documented DNS over TLS name is
+        // `1dot1dot1dot1.cloudflare-dns.com`, which this covers.
+        certified: &["*.cloudflare-dns.com"],
         fallback: doh::cloudflare,
         config: cloudflare,
         whoami: cloudflare_whoami,
@@ -212,6 +221,7 @@ pub const PUBLIC_RESOLVERS: [PublicResolver; 4] = [
             },
         ],
         doh: &["dns.quad9.net."],
+        certified: &[],
         fallback: doh::quad9,
         config: quad9,
         whoami: no_whoami,
@@ -231,6 +241,7 @@ pub const PUBLIC_RESOLVERS: [PublicResolver; 4] = [
             },
         ],
         doh: &["doh.opendns.com.", "dns.opendns.com."],
+        certified: &[],
         fallback: doh::opendns,
         config: opendns,
         whoami: no_whoami,

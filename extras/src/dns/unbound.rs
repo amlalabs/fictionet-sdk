@@ -91,6 +91,10 @@ pub fn local_zones() -> Vec<LocalZone> {
 ///   `max-query-restarts: 11` aliases.
 /// - `unknown-server-time-limit: 376` milliseconds for a server it has no
 ///   round-trip time for, and `infra-host-ttl: 900` seconds.
+/// - `infra-cache-min-rtt: 50` and `infra-cache-max-rtt: 120000`
+///   milliseconds, the shortest and longest wait for a server, and the
+///   400-millisecond band of servers it chooses among, `RTT_BAND` in its
+///   `util/rtt.h`.
 /// - `hide-identity: no` and `hide-version: no`: `id.server` and
 ///   `hostname.bind` give the host name, which this leaves as
 ///   `localhost` for a world to set; `version.server` and `version.bind`
@@ -126,6 +130,9 @@ pub fn config() -> Config {
         identity,
         retransmit: Duration::from_millis(376),
         server_ttl: Duration::from_secs(900),
+        min_timeout: Duration::from_millis(50),
+        max_timeout: Duration::from_secs(120),
+        band: Duration::from_millis(400),
         ..Config::new()
     }
 }

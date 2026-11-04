@@ -244,6 +244,16 @@ fn internet_appending(signed: bool, appended: Option<Record>) -> (MemoryNet, Opt
             600,
             vec![RData::CNAME(CNAME(name("www.example.org.")))],
         ))
+        .rrset(rrset(
+            "loopback.example.com.",
+            600,
+            vec![RData::CNAME(CNAME(name("localhost.")))],
+        ))
+        .rrset(rrset(
+            "nas.example.com.",
+            600,
+            vec![RData::CNAME(CNAME(name("nas.home.arpa.")))],
+        ))
         .rrset(rrset("x.y.example.com.", 300, vec![a("192.0.2.81")]))
         .rrset(rrset(long, 300, vec![a("192.0.2.82")]))
         .rrset(rrset("big.example.com.", 300, big))
@@ -640,6 +650,36 @@ fn qname_minimisation_stays_within_the_rfc_9156_counts() {
     );
     let whole = questions.iter().filter(|(_, n, _, _)| n == long).count();
     assert_eq!(whole, 1);
+}
+
+/// After the queries that add one label each, the labels left are
+/// divided over the queries left, and the remainder goes to the last of
+/// them (RFC 9156 §2.3): with `example.com` known, 14 labels to show,
+/// and 6 queries left after 4, the labels added are 1, 1, 2, 2, 2, 2.
+#[test]
+fn qname_minimisation_adds_the_remainder_to_the_last_queries() {
+    let (mut net, _) = internet(false);
+    let mut resolver = resolver(config(None));
+    ask(
+        &mut resolver,
+        &mut net,
+        0,
+        query(client(1), "ns1.example.com.", RecordType::A, |_| {}),
+    );
+    let before = asked_of_example(&net).len();
+    let long = "a.b.c.d.e.f.g.h.i.j.k.l.m.n.example.com.";
+    let reply = ask(
+        &mut resolver,
+        &mut net,
+        1,
+        query(client(2), long, RecordType::A, |_| {}),
+    );
+    assert_eq!(addresses(&reply), ["192.0.2.82"]);
+    let labels: Vec<usize> = asked_of_example(&net)[before..]
+        .iter()
+        .map(|qname| name(qname).num_labels() as usize)
+        .collect();
+    assert_eq!(labels, [3, 4, 5, 6, 7, 8, 10, 12, 14, 16]);
 }
 
 /// The questions `net` carried to the servers of `example.com`.
@@ -1633,8 +1673,17 @@ fn localhost_and_invalid_are_answered_as_rfc_6761_says() {
             assert!(reply.answers.is_empty(), "{qname} {qtype}");
         }
     }
-    for qname in ["invalid.", "x.invalid."] {
-        for qtype in [RecordType::A, RecordType::SOA] {
+    // `onion` and `test` get NXDOMAIN at their apex too (RFC 7686 §2,
+    // RFC 6761 §6.2).
+    for qname in [
+        "invalid.",
+        "x.invalid.",
+        "onion.",
+        "x.onion.",
+        "test.",
+        "x.test.",
+    ] {
+        for qtype in [RecordType::A, RecordType::SOA, RecordType::NS] {
             let reply = ask(qname, qtype);
             assert_eq!(
                 reply.metadata.response_code,
@@ -1645,6 +1694,92 @@ fn localhost_and_invalid_are_answered_as_rfc_6761_says() {
         }
     }
     assert!(net.recording().exchanges().is_empty());
+}
+
+/// An alias whose target a local zone holds is answered from that zone,
+/// as QNAME would be: local data is the first source for every name a
+/// chain reaches (RFC 1034 §4.3.2 step 1 and 3a), so `localhost` and
+/// `home.arpa` names never leave the resolver (RFC 6761 §6.3, RFC 8375
+/// §7).
+#[test]
+fn an_alias_into_a_local_zone_is_answered_from_it() {
+    let (mut net, _) = internet(false);
+    let mut resolver = resolver(Config {
+        hints: vec![(name("a.root-servers.net."), ip(ROOT))],
+        anchors: None,
+        ..Config::new()
+    });
+    let reply = ask(
+        &mut resolver,
+        &mut net,
+        0,
+        query(client(1), "loopback.example.com.", RecordType::A, |_| {}),
+    );
+    assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(reply.answers.len(), 2, "{:?}", reply.answers);
+    assert_eq!(
+        reply.answers[0].data,
+        RData::CNAME(CNAME(name("localhost.")))
+    );
+    assert_eq!(addresses(&reply), ["127.0.0.1"]);
+    let reply = ask(
+        &mut resolver,
+        &mut net,
+        0,
+        query(client(1), "nas.example.com.", RecordType::A, |_| {}),
+    );
+    assert_eq!(reply.metadata.response_code, ResponseCode::NXDomain);
+    assert_eq!(
+        reply.answers[0].data,
+        RData::CNAME(CNAME(name("nas.home.arpa.")))
+    );
+    let asked = asked(&net);
+    assert!(
+        asked
+            .iter()
+            .all(|(_, qname, _, _)| qname != "localhost." && qname != "nas.home.arpa."),
+        "{asked:?}"
+    );
+}
+
+/// A local zone's CNAME to a name outside it is followed when the client
+/// asked for recursion, as any alias is (RFC 1034 §4.3.2 step 3a): the
+/// answer carries the CNAME and the data its target resolves to. With RD
+/// clear, the zone's own answer goes out as it is.
+#[test]
+fn a_local_alias_out_of_its_zone_is_followed() {
+    let (mut net, _) = internet(false);
+    let corp = Zone::builder(name("corp."), soa("corp."), 3600)
+        .rrset(rrset("corp.", 3600, vec![ns("corp.")]))
+        .rrset(rrset(
+            "www.corp.",
+            300,
+            vec![RData::CNAME(CNAME(name("www.glueless.com.")))],
+        ))
+        .build()
+        .unwrap();
+    let mut resolver = resolver(config(None).local(LocalZone::new(Arc::new(corp))));
+    let reply = ask(
+        &mut resolver,
+        &mut net,
+        0,
+        query(client(1), "www.corp.", RecordType::A, |_| {}),
+    );
+    assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(
+        reply.answers[0].data,
+        RData::CNAME(CNAME(name("www.glueless.com.")))
+    );
+    assert_eq!(addresses(&reply), ["192.0.2.99"]);
+    let norec = |m: &mut Message| m.metadata.recursion_desired = false;
+    let reply = ask(
+        &mut resolver,
+        &mut net,
+        1,
+        query(client(1), "www.corp.", RecordType::A, norec),
+    );
+    assert_eq!(reply.answers.len(), 1);
+    assert!(reply.metadata.authoritative);
 }
 
 #[test]
@@ -1899,6 +2034,42 @@ fn removing_a_negative_trust_anchor_checks_cached_data_again() {
         );
         assert!(reply.answers.is_empty(), "{qname}");
     }
+}
+
+/// A negative trust anchor added while the world runs restores access at
+/// once (RFC 7646 §2): a cached Bogus answer below it is answered
+/// without validation, and a cached Secure one loses AD, though neither
+/// TTL has run out.
+#[test]
+fn adding_a_negative_trust_anchor_stops_validating_cached_data() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (mut net, anchors) = internet(true);
+    let standing = Arc::new(AtomicBool::new(false));
+    let flag = standing.clone();
+    let covered = [
+        LowerName::new(&name("bad.com.")),
+        LowerName::new(&name("example.com.")),
+    ];
+    let mut resolver = resolver(Config {
+        negative_anchors: Some(Arc::new(move |name: &LowerName| {
+            flag.load(Ordering::SeqCst) && covered.contains(name)
+        })),
+        ..config(anchors)
+    });
+    let bogus = || query(client(1), "www.bad.com.", RecordType::A, dnssec_ok);
+    let secure = || query(client(1), "www.example.com.", RecordType::A, dnssec_ok);
+    let reply = ask(&mut resolver, &mut net, 0, bogus());
+    assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
+    let reply = ask(&mut resolver, &mut net, 0, secure());
+    assert!(reply.metadata.authentic_data);
+    standing.store(true, Ordering::SeqCst);
+    let reply = ask(&mut resolver, &mut net, 1, bogus());
+    assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(addresses(&reply), ["192.0.2.98"]);
+    assert!(!reply.metadata.authentic_data);
+    let reply = ask(&mut resolver, &mut net, 1, secure());
+    assert_eq!(addresses(&reply), ["192.0.2.80"]);
+    assert!(!reply.metadata.authentic_data);
 }
 
 /// A trust anchor below a negative trust anchor starts validation again
@@ -2753,6 +2924,110 @@ fn a_question_that_joins_another_ones_lookup_pays_from_its_own_bound() {
     assert_eq!(reply(1).metadata.response_code, ResponseCode::ServFail);
     assert_eq!(reply(2).metadata.response_code, ResponseCode::NoError);
     assert_eq!(addresses(&reply(2)), ["192.0.2.90"]);
+}
+
+/// The wait for a server that replied never falls under the
+/// configuration's shortest: 1 second from [`Config::new`], as RFC 6298
+/// §2.4 rounds a shorter one up to, and Unbound's 50 milliseconds from
+/// its configuration, though the servers here reply at once.
+#[test]
+fn a_servers_wait_is_never_under_the_configured_shortest() {
+    let standard = Config {
+        hints: vec![(name("a.root-servers.net."), ip(ROOT))],
+        anchors: None,
+        ..Config::new()
+    };
+    for (config, floor) in [
+        (standard, Duration::from_secs(1)),
+        (config(None), Duration::from_millis(50)),
+    ] {
+        let config = Config {
+            retransmit: Duration::from_secs(3),
+            ..config
+        };
+        let (mut net, _) = internet(false);
+        let mut resolver = resolver(config);
+        ask(
+            &mut resolver,
+            &mut net,
+            0,
+            query(client(1), "www.example.com.", RecordType::A, |_| {}),
+        );
+        let next = query(client(2), "x.y.example.com.", RecordType::A, |_| {});
+        resolver.handle(Input::Query(next), at(1), &entropy());
+        let mut sent = Vec::new();
+        while let Some(action) = resolver.poll() {
+            if let Action::Send(transmit) = action {
+                sent.push(transmit.to.ip());
+            }
+        }
+        assert!(
+            sent.iter()
+                .all(|to| *to == ip(EXAMPLE) || *to == ip(EXAMPLE_TOO)),
+            "{sent:?}"
+        );
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(resolver.next_deadline(), Some(at(1) + floor), "{floor:?}");
+    }
+}
+
+/// A question that joins a lookup pays from its own bound for the
+/// lookups that lookup waits on too, however deep: here the addresses of
+/// `glueless.com`'s name server, which came without glue, once the
+/// question that started them has spent its bound (RFC 1034 §5.3.3).
+#[test]
+fn a_joined_question_pays_for_the_lookups_its_lookup_waits_on() {
+    let (mut net, _) = internet(false);
+    let mut resolver = resolver(Config {
+        minimise: None,
+        work: Work {
+            queries: 6,
+            depth: 11,
+        },
+        ..config(None)
+    });
+    let entropy = entropy();
+    let now = at(0);
+    let first = query(client(1), "www.glueless.com.", RecordType::A, |_| {});
+    resolver.handle(Input::Query(first), now, &entropy);
+    let mut answers: Vec<Answer> = Vec::new();
+    let mut pending = Vec::new();
+    let mut joined = false;
+    loop {
+        while let Some(action) = resolver.poll() {
+            match action {
+                Action::Send(transmit) => pending.push(transmit),
+                Action::Answer(answer) => answers.push(answer),
+                Action::Lookup { .. } | Action::Abandon(_) | Action::Event(_) => {}
+            }
+        }
+        if pending.is_empty() {
+            break;
+        }
+        let transmit = pending.remove(0);
+        let asked = Message::from_vec(&transmit.bytes).unwrap();
+        // The second question joins the first one's lookup once that
+        // lookup waits on the addresses of its name server.
+        if !joined && asked.queries[0].name().to_lowercase() == name("ns.provider.org.") {
+            joined = true;
+            let second = query(client(2), "www.glueless.com.", RecordType::A, |_| {});
+            resolver.handle(Input::Query(second), now, &entropy);
+        }
+        for input in net.exchange(&transmit, now, &entropy) {
+            resolver.handle(input, now, &entropy);
+        }
+    }
+    assert!(joined);
+    let reply = |port: u16| {
+        let answer = answers
+            .iter()
+            .find(|answer| answer.client.peer.port() == port)
+            .expect("an answer");
+        Message::from_vec(&answer.bytes).unwrap()
+    };
+    assert_eq!(reply(1).metadata.response_code, ResponseCode::ServFail);
+    assert_eq!(reply(2).metadata.response_code, ResponseCode::NoError);
+    assert_eq!(addresses(&reply(2)), ["192.0.2.99"]);
 }
 
 #[test]

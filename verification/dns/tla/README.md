@@ -25,8 +25,9 @@ proof of the rule and the counterexample that shows why it is there.
 | | `TtlSound` | invariant | no answer uses a record read from the cache at or after its expiry; every record goes out with a TTL that ends by its own expiry, so a record fetched for the resolution that ran out before the reply goes out with TTL 0 (RFC 1035 section 7.4) |
 | | `CachedNegativeTrue` | invariant | every cached NXDOMAIN or NODATA was true, for its name and type, at some second within its TTL since it was stored, so nothing a truncated reply left out is cached as a negative (RFC 2181 section 9) |
 | | `FailureNeverNegative` | invariant | a cached failure never answers NXDOMAIN or NODATA (RFC 9520) |
-| | `CachedFailureTriedAll` | invariant | the resolution that cached a failure tried every server of its zone (RFC 9520 section 3.1), so a failure the work bound caused before every server was tried is never cached and one question's spent budget never answers another client |
-| | `WorkBounded` | invariant | every resolution stays within `MaxWork` queries and `MaxChain` CNAME restarts |
+| | `CachedFailureTriedAll` | invariant | the resolution that cached a failure tried every server of its zone (RFC 9520 section 3.1), so a failure the work bound caused before every server was tried is never cached for another client |
+| | `WorkBounded` | invariant | every client's question stays within `MaxWork` queries, and every resolution within `MaxChain` CNAME restarts |
+| | `BoundIsOwn` | invariant | a client fails for want of queries only once its own question's budget is spent (RFC 1034 section 5.3.3), never because the client that started a shared resolution spent its own |
 | | `ReferralsDescend` | invariant over steps (`PROPERTY`) | the cut a resolution works from always contains its name, and a referral is followed only strictly downward |
 | | `LoopServfails` | invariant | the CNAME loop always ends in SERVFAIL |
 | | `EveryQueryAnswered` | liveness | every question asked is answered, under weak fairness of delivery and of the resolver's steps |
@@ -83,7 +84,7 @@ Configs:
   (two ports, two IDs, and a forged reply). Ablations: `_nobailiwick`,
   `_nobound`, `_cachetc`, `_noexpiry`, `_failureasnegative`,
   `_cachebounded`, `_nocountdown`, `_noid`, `_noport`, `_notype`,
-  `_cachebyname`.
+  `_cachebyname`, `_sharedbound`.
 * **Exchanges:** `_base`, `_advance`, `_cancel`. Ablations: `_idonly`,
   `_flushonly`, `_cancelshared`.
 * **Authority:** `_base`, `_fail`, `_lazy`, `_advance`, `_share` (two
@@ -101,7 +102,8 @@ Bounds. Every counter is bounded in the enabling conditions of its
 actions, never by a `CONSTRAINT`, so the liveness checks are sound:
 
 * **Resolution:** the clock by `MaxTime` 4; `MaxWork` 4 upstream queries
-  and `MaxChain` 3 CNAME restarts per resolution (`MaxWork` 6 in `_loop`
+  per client question and `MaxChain` 3 CNAME restarts per resolution
+  (`MaxWork` 6 in `_loop`
   and `_nobound`; see the modelling choices); one loss, one truncation, one
   edit; one forged reply, two ports, and two IDs in `_spoof` and its
   ablations, and one port and one ID elsewhere; each client asks a fixed
@@ -131,28 +133,29 @@ in `_concurrent` explores the same states as the invariants there.
 
 | Config | Properties | Result | Distinct states | Depth | Time | Counterexample |
 |---|---|---|---|---|---|---|
-| Resolution_base | the 10 invariants, `ReferralsDescend` | pass | 391900 | 56 | 2 s | |
-| Resolution_base | `EveryQueryAnswered` | pass | 391900 | 56 | 23 s | |
-| Resolution_concurrent | the 10 invariants, `ReferralsDescend` (symmetry) | pass | 2526581 | 55 | 8-11 s | |
-| Resolution_concurrent_live | `EveryQueryAnswered` | pass | 5034772 | 55 | 222 s | |
-| Resolution_loop | the 10 invariants, `ReferralsDescend`, `EveryQueryAnswered` | pass | 12336 | 30 | 0-1 s | |
-| Resolution_rogue | the 10 invariants, `ReferralsDescend`, `EveryQueryAnswered` | pass | 26603 | 33-34 | 0-1 s | |
-| Resolution_edit | the 10 invariants, `ReferralsDescend` | pass | 198851 | 41 | 1 s | |
-| Resolution_edit | `EveryQueryAnswered` | pass | 198851 | 41 | 6 s | |
+| Resolution_base | the 11 invariants, `ReferralsDescend` | pass | 2749819 | 66 | 11-16 s | |
+| Resolution_base | `EveryQueryAnswered` | pass | 2749819 | 66 | 142 s | |
+| Resolution_concurrent | the 11 invariants, `ReferralsDescend` (symmetry) | pass | 4519385 | 59 | 19-20 s | |
+| Resolution_concurrent_live | `EveryQueryAnswered` | pass | 9038685 | 59 | 519 s | |
+| Resolution_loop | the 11 invariants, `ReferralsDescend`, `EveryQueryAnswered` | pass | 12560 | 30 | 0-1 s | |
+| Resolution_rogue | the 11 invariants, `ReferralsDescend`, `EveryQueryAnswered` | pass | 36437 | 33 | 0-2 s | |
+| Resolution_edit | the 11 invariants, `ReferralsDescend` | pass | 468532 | 45 | 2 s | |
+| Resolution_edit | `EveryQueryAnswered` | pass | 468532 | 45 | 17 s | |
 | Resolution_nobailiwick | `NoPoison` | violated | 312 | 11 | 1 s | Ask, Advance, Serve, Receive (root's referral), Advance, Serve, Receive (tld's referral), Advance, Serve, Receive: alt.tld's answer for x.w.alt.tld carries www.sld.tld, which is cached |
-| Resolution_nobound | `WorkBounded` | violated | 5334 | 21 | 0 s | the loop's CNAME chase restarts past `MaxChain` |
-| Resolution_nobound | `EveryQueryAnswered` | violated | 38292 | lasso | 2 s | down to sld.tld and over to alt.tld, then round a lasso: the chain follows loop.sld.tld and loop.alt.tld from the cache forever, its counter stopped one past `MaxChain` |
+| Resolution_nobound | `WorkBounded` | violated | 5406 | 21 | 0 s | the loop's CNAME chase restarts past `MaxChain` |
+| Resolution_nobound | `EveryQueryAnswered` | violated | 38802 | lasso | 3 s | down to sld.tld and over to alt.tld, then round a lasso: the chain follows loop.sld.tld and loop.alt.tld from the cache forever, its counter stopped one past `MaxChain` |
 | Resolution_cachetc | `CachedNegativeTrue` | violated | 33 | 6 | 0 s | Ask, Advance, Serve, Truncate, Receive: the truncated reply for cn.sld.tld, a CNAME, is cached as NODATA |
 | Resolution_noexpiry | `TtlSound` | violated | 5031 | 20 | 0 s | Ask cn.sld.tld; Advance, Serve, Receive three times down to sld.tld; Advance follows the CNAME; Advance, Serve, Receive, Advance for www.sld.tld; Ask www.sld.tld; Tick, Tick, Advance: the cache answers www.sld.tld after its two-second TTL ran out |
 | Resolution_failureasnegative | `FailureNeverNegative` | violated | 173 | 9 | 0 s | Ask, Advance, Lose, Timeout, Advance, Serve, Receive, Advance: the query to one root server is lost and times out, the other refuses, and the cached failure answers NXDOMAIN |
-| Resolution_cachebounded | `CachedFailureTriedAll` | violated | 1279 | 15 | 0 s | Ask, then Advance, Serve, Receive twice down to sld.tld; Advance, Serve, Truncate, Receive (the TCP retry is the fourth query); Lose, Timeout, Advance: the work bound ends the resolution and its failure is cached, with one of sld.tld's servers never tried |
-| Resolution_nocountdown | `TtlSound` | violated | 2224 | 17 | 0 s | Ask cn.sld.tld; Advance, Serve, Receive three times down to sld.tld, fetching the CNAME with its one-second TTL at second 0; Advance follows it; Advance, Tick, Serve, Receive, Advance for www.sld.tld: the answer at second 1 carries the CNAME, which ran out at second 1, with TTL 1 |
-| Resolution_types | the 10 invariants, `ReferralsDescend`, `EveryQueryAnswered` | pass | 217596 | 49 | 1-9 s | |
-| Resolution_spoof | the 10 invariants, `ReferralsDescend`, `EveryQueryAnswered` | pass | 157329 | 22 | 1-8 s | |
+| Resolution_cachebounded | `CachedFailureTriedAll` | violated | 1283 | 15 | 0 s | Ask, then Advance, Serve, Receive twice down to sld.tld; Advance, Serve, Truncate, Receive (the TCP retry is the fourth query); Lose, Timeout, Advance: the work bound ends the resolution and its failure is cached, with one of sld.tld's servers never tried |
+| Resolution_nocountdown | `TtlSound` | violated | 2248 | 17 | 0 s | Ask cn.sld.tld; Advance, Serve, Receive three times down to sld.tld, fetching the CNAME with its one-second TTL at second 0; Advance follows it; Advance, Tick, Serve, Receive, Advance for www.sld.tld: the answer at second 1 carries the CNAME, which ran out at second 1, with TTL 1 |
+| Resolution_types | the 11 invariants, `ReferralsDescend`, `EveryQueryAnswered` | pass | 739960 | 58 | 3-31 s | |
+| Resolution_spoof | the 11 invariants, `ReferralsDescend`, `EveryQueryAnswered` | pass | 157600 | 22 | 1-8 s | |
 | Resolution_noid | `AnswersTrueWithinTtl` | violated | 381 | 6 | 0 s | Ask, Advance, Spoof (the root's exchange, the wrong ID), Receive, Advance: the forged www.sld.tld answer reaches the client |
 | Resolution_noport | `AnswersTrueWithinTtl` | violated | 379 | 6 | 0 s | the same, with the wrong port |
 | Resolution_notype | `AnswersTrueWithinTtl` | violated | 381 | 6 | 0 s | the same, with the question's type AAAA: an AAAA record answers the question for A |
-| Resolution_cachebyname | `NegativeTrue` | violated | 2817 | 18 | 0 s | cn.sld.tld AAAA ends NODATA at www.sld.tld, cached under the name alone, which then answers www.sld.tld A NODATA |
+| Resolution_cachebyname | `NegativeTrue` | violated | 2857 | 18 | 0 s | cn.sld.tld AAAA ends NODATA at www.sld.tld, cached under the name alone, which then answers www.sld.tld A NODATA |
+| Resolution_sharedbound | `BoundIsOwn` | violated | 3402 | 16 | 0 s | Ask (c1, cn.sld.tld), Ask (c2 joins before any query); Advance, Serve, Receive twice down to sld.tld; Advance, Serve, Truncate, Receive (the TCP retry is c1's fourth query); Lose, Timeout, Advance: c1's budget is spent, and c2, which paid for none, gets SERVFAIL with it |
 | Exchanges_base | the 3 invariants, `MatchRequiresTuple`, `DuplicateHarmless` | pass | 66914 | 19 | 1 s | |
 | Exchanges_base | `EveryAcceptedAnswered` | pass | 66914 | 19 | 3 s | |
 | Exchanges_advance | the 3 invariants, `MatchRequiresTuple`, `DuplicateHarmless` | pass | 4564834 | 28 | 10-12 s | |
@@ -248,8 +251,16 @@ Resolution:
   `ns.sld.tld` is glued in the cache, which is the glue `GlueNeverAnswers`
   needs; the edit changes the child's address record and not the parent's
   glue, so stale glue is reachable.
-* `MaxWork` counts upstream queries, TCP retries included; `MaxChain`
-  counts CNAME restarts. In `_loop` and `_nobound` `MaxWork` is 6, not the
+* `MaxWork` counts upstream queries, TCP retries included, against each
+  client's question, as Rust counts them against each client question's
+  tree; `MaxChain` counts CNAME restarts. A resolution charges the client
+  that started it. Once that client's budget is spent, a waiting client
+  with queries left takes the resolution over and pays from then on, and
+  the spent client gets SERVFAIL, as `Resolver::take_over` hands a lookup
+  to another tree and fails the spent tree's nodes; with no such client,
+  every client waiting gets SERVFAIL. `_sharedbound` lets only the client
+  that started a resolution pay, and `BoundIsOwn` fails there.
+  In `_loop` and `_nobound` `MaxWork` is 6, not the
   4 of the other configs: following the loop once takes five queries (root, tld,
   sld, tld again for alt, alt), so with 4 the work bound always ends the
   loop before the chain bound is ever reached, and the chain bound would go

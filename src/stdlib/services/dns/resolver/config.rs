@@ -32,10 +32,11 @@ pub struct Config {
     /// name, and their answers are taken whole. `(".", servers)` forwards
     /// every question, as a home router does.
     pub forward: Vec<(Name, Vec<SocketAddr>)>,
-    /// Zones answered without a query. The zones that hold QNAME answer
-    /// deepest first, and at equal depth the zone added last; a fact a
-    /// zone does not know passes the question on to the next, and after
-    /// the last to the cache and iteration.
+    /// Zones answered without a query. The zones that hold QNAME, or a
+    /// name an alias chain reaches, answer deepest first, and at equal
+    /// depth the zone added last; a fact a zone does not know passes the
+    /// question on to the next, and after the last to the cache and
+    /// iteration.
     pub local: Vec<LocalZone>,
     /// The EDNS payload size offered to servers and advertised to clients
     /// (RFC 6891 §6.2.5).
@@ -93,7 +94,9 @@ pub struct Config {
     pub any: AnyResponse,
     /// How long the resolver waits for a server it knows nothing of.
     /// After a server's first reply it waits what that server's round
-    /// trips teach it (RFC 6298 §2), and each timeout doubles the wait.
+    /// trips teach it (RFC 6298 §2), and each timeout doubles the wait,
+    /// within [`min_timeout`](Config::min_timeout) and
+    /// [`max_timeout`](Config::max_timeout).
     /// A query over TCP waits twice as long, for the connection's
     /// handshake. A query that times out is asked again, of the same
     /// server or another, and each server address gets the query at most
@@ -102,6 +105,16 @@ pub struct Config {
     /// How long the resolver remembers a server's round trips after it
     /// last asked it.
     pub server_ttl: Duration,
+    /// The shortest wait for a server that has replied, whatever its round
+    /// trips (RFC 6298 §2.4).
+    pub min_timeout: Duration,
+    /// The longest wait for any server, however often it timed out
+    /// (RFC 6298 §2.5).
+    pub max_timeout: Duration,
+    /// How much longer than the quickest server's wait another server's
+    /// may be and still be chosen among at random. A server whose wait is
+    /// longer is asked only when no quicker one is left.
+    pub band: Duration,
 }
 
 /// One of a resolver's local zones ([`Config::local`]).
@@ -131,8 +144,8 @@ pub struct Minimise {
     /// The most minimised queries one resolution sends before it asks for
     /// the whole name: MAX_MINIMISE_COUNT.
     pub max_queries: u8,
-    /// How many of those add one label each, before the rest add as many
-    /// labels as reach the whole name within `max_queries`:
+    /// How many of those add one label each, before the rest divide the
+    /// labels left among them, the later ones taking the remainder:
     /// MINIMISE_ONE_LAB.
     pub one_label: u8,
 }
@@ -199,11 +212,16 @@ impl Config {
     /// - Every RRset of a local zone's name for ANY, as RFC 1035 §3.2.3
     ///   defines the type.
     /// - An identity with no CHAOS data and no NSID ([`Identity::none`]).
-    /// - The initial retransmission timeout of RFC 6298 §2.1, 1 second.
+    /// - The initial retransmission timeout of RFC 6298 §2.1, 1 second; a
+    ///   wait never under 1 second (RFC 6298 §2.4) nor over 60 seconds,
+    ///   the least maximum RFC 6298 §2.5 allows.
     ///
-    /// Two values are the SDK's own, since no standard fixes them: one
-    /// client question may send 200 queries and follow 11 aliases, and a
-    /// server's round trips are remembered for 600 seconds.
+    /// Three values are the SDK's own, since no standard fixes them: one
+    /// client question may send 200 queries and follow 11 aliases, a
+    /// server's round trips are remembered for 600 seconds, and only the
+    /// servers with the quickest wait are chosen among, a band of 0. With
+    /// the 1-second floor, every server that replies within a second has
+    /// that wait, so the choice spreads over them all.
     pub fn new() -> Config {
         let apex = EmptyApex::rfc6303();
         Config {
@@ -235,6 +253,9 @@ impl Config {
             any: AnyResponse::All,
             retransmit: Duration::from_secs(1),
             server_ttl: Duration::from_secs(600),
+            min_timeout: Duration::from_secs(1),
+            max_timeout: Duration::from_secs(60),
+            band: Duration::ZERO,
         }
     }
 

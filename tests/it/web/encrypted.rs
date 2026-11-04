@@ -925,6 +925,48 @@ fn a_front_on_another_host_answers_from_the_resolvers_cache() {
     });
 }
 
+/// Cloudflare's certificate covers `1dot1dot1dot1.cloudflare-dns.com`,
+/// the name it gives for DNS over TLS, so a client that checks that name
+/// talks DNS over TLS to 1.1.1.1 as it would to the real one.
+#[test]
+fn dns_over_tls_to_cloudflare_checks_its_documented_name() {
+    world(Duration::from_secs(60), |fcx| async move {
+        let (attacher, attachments) = fictionet::attachments();
+        let (hosts, anchors) = authorities();
+        let cloudflare = &PUBLIC_RESOLVERS[1];
+        let one = cloudflare.addresses[0].v4;
+        let ca = Ca::new(&fcx, "World CA")?;
+        let validity = Validity {
+            not_before: Time::from_unix(946_684_800)?,
+            not_after: Time::from_unix(4_102_444_800)?,
+        };
+        let sans = cloudflare.sans();
+        let sans: Vec<&str> = sans.iter().map(String::as_str).collect();
+        let config = ca
+            .issue(&fcx, &sans, validity)?
+            .server_config(&fcx, date(NOW))?;
+        let mut roots = RootCertStore::empty();
+        roots.add(ca.cert_der())?;
+        let roots = Arc::new(roots);
+        let sent: Arc<Mutex<Vec<Sent>>> = Arc::default();
+        let resolver = recursive(anchors, &sent);
+        let fronts =
+            Fronts::new(resolver.handle(), move |_| config.clone()).names(cloudflare.doh());
+        Net::new()
+            .ipv4_only()
+            .hosts(hosts)
+            .hosts([fronts.dot(Host::new("one.one.one.one").at(one).program(resolver))])
+            .start(&fcx, attachments)?;
+        let m = machine(&fcx, attacher.attach("agent")?, ME);
+        let documented = "1dot1dot1dot1.cloudflare-dns.com";
+        let mut conn = tls(&fcx, &m, &roots, at(one, 853), documented, &[b"dot"]).await;
+        send_framed(&fcx, &mut conn, &query(1, "www.example.", RecordType::A)).await;
+        let reply = read_framed(&fcx, &mut conn).await;
+        assert_eq!(answers(&reply), vec![(WWW, TTL)]);
+        Ok(())
+    });
+}
+
 /// The names a DNS over HTTPS front answers for are its own at its
 /// address: a site for one of them cannot be placed there, and requests
 /// for the name still reach the resolver.

@@ -15,10 +15,13 @@
 //!    [`identity`](Config::identity).
 //! 3. Asks its local zones that hold QNAME, deepest first and at equal
 //!    depth the one added last. The first that knows the answer gives it;
-//!    a zone that does not know passes the question on.
+//!    a zone that does not know passes the question on. A local chain
+//!    that leaves its zone goes on from its target as any alias does,
+//!    when RD is set.
 //! 4. Answers from its cache, or starts or joins a resolution: the
 //!    iteration of RFC 1034 §5.3.3 from the root servers down, following
-//!    aliases, looking up name servers that came without glue, and
+//!    aliases, each target asked of the local zones first as in step 3,
+//!    looking up name servers that came without glue, and
 //!    fetching the DS and DNSKEY sets that validation needs.
 //! 5. Renders the answer for this client: its ID, flags, EDNS, question
 //!    case, and TTLs counted down.
@@ -49,14 +52,14 @@ use fictionet::Entropy;
 use fictionet::stdlib::protocols::dns::dnssec::{Ring, Validation, Verified, Verify};
 use fictionet::stdlib::protocols::dns::op::ResponseCode;
 use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, Name, RecordType};
-use fictionet::stdlib::protocols::dns::{Parsed, Request, label_count};
+use fictionet::stdlib::protocols::dns::{Parsed, Request, Response, label_count};
 use fictionet::time::Instant;
 
 use super::authority::{ServerConfig, bare_reply};
 use super::clock::WallClock;
 use super::event::{Event, QueryFlags};
 use super::exchange::{Action, Client, ClientQuery, Engine, Generation, Input, Session, Tokens};
-use super::zone::{Answered, answer};
+use super::zone::{Answered, answer_onward};
 
 mod cache;
 mod config;
@@ -148,18 +151,37 @@ struct Piece {
     cached: bool,
     /// Whether it is expired data served under RFC 8767.
     stale: bool,
+    /// Whether it came from a local zone, whose data is never validated.
+    local: bool,
     /// When the TTLs in `outcome` were current.
     at: Instant,
 }
 
 impl Piece {
-    /// What validation established for the whole piece: its worst result.
+    /// What validation established for the whole piece: its worst result,
+    /// or `NotPerformed` for local data.
     fn validation(&self) -> Validation {
+        if self.local {
+            return Validation::NotPerformed;
+        }
         self.checks
             .iter()
             .map(|(_, validation)| *validation)
             .fold(Validation::Secure, worse)
     }
+}
+
+/// What a local zone answered a question with.
+struct Local {
+    /// The answer, before the front renders it.
+    response: Response,
+    /// The apex of the zone that answered.
+    zone: Name,
+    /// Whether the answer keeps the AA bit the zone gives it.
+    keep_aa: bool,
+    /// Whether its CNAME and DNAME chain went past the zone, out of it or
+    /// to a referral ([`answer_onward`]).
+    onward: bool,
 }
 
 /// The worse of two validation results, for an answer made of several
@@ -190,7 +212,7 @@ impl<V: Verify> Resolver<V> {
             ask_timeout: config.retransmit,
             recursion_available: true,
         };
-        let servers = Servers::new(config.retransmit, config.server_ttl);
+        let servers = Servers::new(&config);
         let limits = Limits {
             max_ttl: config.max_ttl,
             max_negative_ttl: config.max_negative_ttl,
@@ -257,7 +279,13 @@ impl<V: Verify> Resolver<V> {
             }
         }
 
-        if let Some(bytes) = self.answer_locally(&request) {
+        // A local chain that leaves its zone goes on from its target as
+        // any alias does, when the client asked for recursion
+        // (RFC 1034 §4.3.2 step 3a).
+        if let Some(local) = self.local_answer(&request)
+            && !(local.onward && request.rd)
+        {
+            let bytes = self.render_local(&request, local.response, local.keep_aa);
             return self.send_answer(client, bytes, Validation::NotPerformed, false);
         }
         if !request.rd && !self.config.rd0_from_cache {
@@ -282,9 +310,9 @@ impl<V: Verify> Resolver<V> {
         self.step_asker(id, entropy);
     }
 
-    /// The reply from the local zones that hold QNAME, if one knows it:
+    /// The answer of the local zones that hold QNAME, if one knows it:
     /// deepest zone first, and at equal depth the zone added last.
-    fn answer_locally(&self, request: &Request) -> Option<Vec<u8>> {
+    fn local_answer(&self, request: &Request) -> Option<Local> {
         let qname = LowerName::new(request.question.name());
         let mut zones: Vec<(usize, &LocalZone)> = self
             .config
@@ -297,17 +325,37 @@ impl<V: Verify> Resolver<V> {
             std::cmp::Reverse((label_count(zone.data.apex()), *index))
         });
         zones.into_iter().find_map(|(_, zone)| {
-            match answer(
-                &*zone.data.view(&request.question),
-                request,
-                self.config.any,
-            ) {
-                Answered::Response(response) => {
-                    Some(self.render_local(request, response, zone.keep_aa))
-                }
-                Answered::Unknown { .. } => None,
+            let view = zone.data.view(&request.question);
+            match answer_onward(&*view, request, self.config.any) {
+                (Answered::Response(response), onward) => Some(Local {
+                    response,
+                    zone: Name::from(zone.data.apex()),
+                    keep_aa: zone.keep_aa,
+                    onward: onward.is_some(),
+                }),
+                (Answered::Unknown { .. }, _) => None,
             }
         })
+    }
+
+    /// Adds `outcomes`, a local zone's answer ([`Resolver::local_outcomes`]),
+    /// to the answer of client query `id`. Local data is never validated,
+    /// so it holds no checks.
+    fn push_local(&mut self, id: AskerId, outcomes: Vec<Outcome>) {
+        let Some(asker) = self.askers.get_mut(&id) else {
+            return;
+        };
+        asker
+            .pieces
+            .extend(outcomes.into_iter().map(|outcome| Piece {
+                outcome,
+                checks: Vec::new(),
+                verified: Vec::new(),
+                cached: false,
+                stale: false,
+                local: true,
+                at: self.now,
+            }));
     }
 
     /// Moves the client query `id` on as far as it can go now: along its
@@ -344,6 +392,18 @@ impl<V: Verify> Resolver<V> {
                 self.push_piece(id, Outcome::Failure(FailureKind::WorkExceeded), false);
                 break;
             }
+            // Local data is the first source for every name the chain
+            // reaches, as for QNAME (RFC 1034 §4.3.2 step 1, §5.3.3), so
+            // a name a local zone holds never leaves the resolver.
+            let mut asked = asker.request.clone();
+            asked.question.set_name(name.clone());
+            if let Some(outcomes) = self.local_outcomes(&asked) {
+                self.push_local(id, outcomes);
+                continue;
+            }
+            let Some(asker) = self.askers.get(&id) else {
+                return;
+            };
             if asker.cache_only {
                 // A query with RD clear may not start the lookups a
                 // validation needs, so data no check has validated is
@@ -397,6 +457,7 @@ impl<V: Verify> Resolver<V> {
             outcome: found.outcome,
             cached: found.cached,
             stale: false,
+            local: false,
             at: self.now,
         });
         // The rest of a chain the same reply carried answers its targets,
@@ -430,6 +491,7 @@ impl<V: Verify> Resolver<V> {
                 outcome,
                 cached: false,
                 stale: false,
+                local: false,
                 at: self.now,
             });
         }
@@ -528,6 +590,7 @@ impl<V: Verify> Resolver<V> {
                 outcome: found.outcome,
                 cached: true,
                 stale: true,
+                local: false,
                 at: self.now,
             });
             let Some(target) = target else {

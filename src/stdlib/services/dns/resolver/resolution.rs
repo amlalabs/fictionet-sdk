@@ -18,7 +18,9 @@
 //! The queries a client question costs, over everything it needs, are
 //! counted against [`Work`](super::Work): the question is its own *tree*,
 //! and lookups and checks it starts belong to it. A lookup another tree
-//! started and this one joins stays charged to its own tree.
+//! started and this one joins stays charged to that tree until its bound
+//! runs out, and then goes on charged to another tree it does work for,
+//! directly or through the lookups and checks that wait on it.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
@@ -36,7 +38,7 @@ use fictionet::stdlib::protocols::dns::rr::domain::Label;
 use fictionet::stdlib::protocols::dns::rr::{
     DNSClass, LowerName, Name, RData, RecordSet, RecordType, SerialNumber,
 };
-use fictionet::stdlib::protocols::dns::{dname_substitute, label_count};
+use fictionet::stdlib::protocols::dns::{Request, dname_substitute, label_count};
 use fictionet::stdlib::services::serve::Transport;
 use fictionet::time::Instant;
 
@@ -547,6 +549,28 @@ impl Graph {
         }
     }
 
+    /// The trees whose work `node` does: its own, and those of every node
+    /// that waits on it, directly or through others. A refresh does
+    /// none's.
+    fn served(&self, node: Node) -> BTreeSet<TreeId> {
+        let mut trees = BTreeSet::new();
+        let mut seen = BTreeSet::new();
+        let mut todo = vec![node];
+        while let Some(node) = todo.pop() {
+            if !seen.insert(node) {
+                continue;
+            }
+            trees.extend(self.tree_of(node));
+            let dependents = match node {
+                Node::Lookup(id) => self.lookups.get(&id).map(|l| &l.dependents),
+                Node::Check(id) => self.checks.get(&id).map(|c| &c.dependents),
+                Node::Asker(_) | Node::Refresh => None,
+            };
+            todo.extend(dependents.into_iter().flatten().copied());
+        }
+        trees
+    }
+
     /// Counts one query against `tree`. Whether the tree may send it.
     fn charge(&mut self, tree: TreeId, limit: u16) -> bool {
         match self.trees.get_mut(&tree) {
@@ -667,6 +691,69 @@ impl<V: Verify> Resolver<V> {
     fn cached_for(&self, key: &Key, relay_cd: bool) -> Option<Found> {
         self.cached(key)
             .filter(|found| !(relay_cd && matches!(found.outcome, Outcome::Failure(_))))
+    }
+
+    /// What the local zones give for `request`'s question, as the
+    /// outcomes of an answer: the aliases its chain follows inside the
+    /// zone that answers, then the data or the negative the chain ends
+    /// in, or nothing more when the chain leaves the zone, where the
+    /// answer goes on at the last alias's target (RFC 1034 §4.3.2 step 1
+    /// and 3a). `None` when no local zone knows the answer, or the zone
+    /// refers the name to a cut, which the resolution follows instead.
+    pub(super) fn local_outcomes(&mut self, request: &Request) -> Option<Vec<Outcome>> {
+        let local = self.local_answer(request)?;
+        let message = local.response.message;
+        if !message.metadata.authoritative {
+            return None;
+        }
+        let zone = local.zone;
+        let sname = request.question.name().to_lowercase();
+        let stype = request.question.query_type();
+        let rcode = message.metadata.response_code;
+        let answers: Vec<RecordSet> = match stype {
+            RecordType::RRSIG => signatures(&message.answers),
+            _ => rrsets(&message.answers),
+        }
+        .iter()
+        .map(normalized)
+        .collect();
+        let authority: Vec<RecordSet> = rrsets(&message.authorities)
+            .iter()
+            .map(normalized)
+            .collect();
+        let denial: Vec<RecordSet> = authority
+            .iter()
+            .filter(|set| matches!(set.record_type(), RecordType::NSEC | RecordType::NSEC3))
+            .cloned()
+            .collect();
+        let soa = authority
+            .iter()
+            .find(|set| set.record_type() == RecordType::SOA)
+            .cloned();
+        if rcode == ResponseCode::YXDomain {
+            let dname = answers.into_iter().find(is_dname)?;
+            return Some(vec![Outcome::TooLong { dname, zone }]);
+        }
+        if !answers.is_empty() {
+            // Nothing is offered to the cache: local data is the
+            // resolver's own, and is asked of the zone each time.
+            let (first, rest) =
+                self.store_chain(&answers, &sname, stype, None, &denial, rcode, &soa, &zone)?;
+            return Some(std::iter::once(first).chain(rest).collect());
+        }
+        let kind = match rcode {
+            ResponseCode::NXDomain => Negative::NxDomain,
+            ResponseCode::NoError => Negative::NoData,
+            _ => return None,
+        };
+        Some(vec![Outcome::Negative {
+            kind,
+            name: sname,
+            qtype: stype,
+            soa,
+            denial,
+            zone,
+        }])
     }
 
     /// Expired data for `key`, for serving stale (RFC 8767 §4): the RRset
@@ -793,13 +880,23 @@ impl<V: Verify> Resolver<V> {
 
     /// `stored`, the result the cache holds for `subject` of `outcome`, or
     /// `NotPerformed`, so that the subject is checked again, when the
-    /// result rests on a negative trust anchor that no longer covers it.
-    /// An entry cached under a negative trust anchor then counts as
-    /// removed with the anchor (RFC 7646 §4). A result is Insecure for
-    /// want of an anchor only below a negative trust anchor or where no
-    /// trust anchor covers the zone.
+    /// negative trust anchors changed under it since. A result validated
+    /// before a negative trust anchor came to cover the subject counts for
+    /// nothing below the anchor, where nothing is validated (RFC 7646 §2).
+    /// An entry cached under a negative trust anchor counts as removed
+    /// with the anchor (RFC 7646 §4). A result is Insecure for want of an
+    /// anchor only below a negative trust anchor or where no trust anchor
+    /// covers the zone.
     fn recheck(&self, subject: &Subject, outcome: &Outcome, stored: Validation) -> Validation {
-        if stored != Validation::Insecure(Insecure::NoAnchor) || self.negative_anchor(subject) {
+        let no_anchor = Validation::Insecure(Insecure::NoAnchor);
+        if self.negative_anchor(subject) {
+            return if stored == no_anchor {
+                stored
+            } else {
+                Validation::NotPerformed
+            };
+        }
+        if stored != no_anchor {
             return stored;
         }
         let anchored = material(subject, outcome).is_some_and(|(_, zone)| {
@@ -1308,24 +1405,31 @@ impl<V: Verify> Resolver<V> {
     }
 
     /// Hands lookup `id`, whose tree `spent` has used up the work bound,
-    /// to the tree of another node waiting on it that has not, and returns
-    /// that tree. The bound is per client question (RFC 1034 §5.3.3), so a
+    /// to another tree it does work for that has not, and returns that
+    /// tree. The bound is per client question (RFC 1034 §5.3.3), so a
     /// question that joined a lookup another one started pays for the
-    /// rest of it from its own bound. The nodes of `spent` stop waiting,
-    /// with the failure the bound makes. `None` when no other waiting tree
-    /// has queries left.
+    /// rest of it from its own bound, and so for the lookups and checks
+    /// that lookup waits on, however deep. The nodes waiting on `id` that
+    /// do work for `spent` alone stop waiting, with the failure the bound
+    /// makes. `None` when no other tree it does work for has queries left.
     fn take_over(&mut self, id: LookupId, spent: TreeId) -> Option<TreeId> {
         let limit = self.config.work.queries;
         let lookup = self.graph.lookups.get(&id)?;
-        let next = lookup
+        let served: Vec<(Node, BTreeSet<TreeId>)> = lookup
             .dependents
             .iter()
-            .filter_map(|node| self.graph.tree_of(*node))
+            .map(|node| (*node, self.graph.served(*node)))
+            .collect();
+        let next = served
+            .iter()
+            .flat_map(|(_, trees)| trees)
+            .copied()
             .find(|tree| *tree != spent && self.graph.within(*tree, limit))?;
-        let (gone, kept): (Vec<Node>, Vec<Node>) = lookup
-            .dependents
-            .iter()
-            .partition(|node| self.graph.tree_of(**node) == Some(spent));
+        let (gone, kept): (Vec<_>, Vec<_>) = served
+            .into_iter()
+            .partition(|(_, trees)| !trees.is_empty() && trees.iter().all(|tree| *tree == spent));
+        let gone: Vec<Node> = gone.into_iter().map(|(node, _)| node).collect();
+        let kept: Vec<Node> = kept.into_iter().map(|(node, _)| node).collect();
         let key = lookup.key.clone();
         let failure = Found::fresh(Outcome::Failure(self.bound_failure(spent)));
         self.graph.hold(next);
@@ -1449,11 +1553,14 @@ impl<V: Verify> Resolver<V> {
         if known + 1 >= total || steps >= bounds.max_queries {
             return Some(whole);
         }
+        // The labels not yet shown are divided over the queries left, and
+        // the remainder goes to the last ones (RFC 9156 §2.3): rounding
+        // down here leaves it for the queries after this one.
         let add = if steps < bounds.one_label {
             1
         } else {
             let left = usize::from(bounds.max_queries - steps);
-            (total - known).div_ceil(left).max(1)
+            ((total - known) / left).max(1)
         };
         let labels = known + add;
         if labels >= total {

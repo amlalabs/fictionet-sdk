@@ -238,6 +238,15 @@ pub fn net(
         })
 }
 
+/// Whether `addr` is one of [`PUBLIC_RESOLVERS`]' addresses, which the
+/// world gives the resolver's machine.
+fn resolver_address(addr: Ipv4Addr) -> bool {
+    PUBLIC_RESOLVERS
+        .iter()
+        .flat_map(|resolver| resolver.addresses)
+        .any(|address| address.v4 == addr)
+}
+
 /// What puts each served name's machine at the real addresses the
 /// hierarchy gives it.
 struct Sites {
@@ -286,9 +295,12 @@ impl Sites {
     /// The network has no IPv6, so AAAA records place nothing. An address
     /// the network refuses, such as one on the sandboxes' subnet, or one
     /// whose port 443 already serves the world's infrastructure, keeps no
-    /// machine for the name. A name the session resolves but does not
-    /// serve, outside Live-Depth's depth, gets no site: a machine there
-    /// with no services refuses connections at TCP.
+    /// machine for the name. So does a public resolver's address, whose
+    /// port 443 answers every name with its DNS over HTTPS front, as
+    /// `1dot1dot1dot1.cloudflare-dns.com` at 1.1.1.1 does. A name the
+    /// session resolves but does not serve, outside Live-Depth's depth,
+    /// gets no site: a machine there with no services refuses connections
+    /// at TCP.
     fn place(&self, filing: &Filing) {
         let answers = || {
             filing
@@ -299,7 +311,7 @@ impl Sites {
         };
         let mut found: Vec<(LowerName, Ipv4Addr)> = answers()
             .filter_map(|record| match &record.data {
-                RData::A(a) if !non_public_address(a.0.into()) => {
+                RData::A(a) if !non_public_address(a.0.into()) && !resolver_address(a.0) => {
                     Some((LowerName::new(&record.name), a.0))
                 }
                 _ => None,
