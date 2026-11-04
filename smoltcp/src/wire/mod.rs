@@ -29,13 +29,10 @@ pub(crate) use self::ipv6::{
 };
 pub use self::tcp::{
     OPTIONS_MAX_LEN as TCP_OPTIONS_MAX_LEN, OptionLayout, OptionOrder, Packet as TcpPacket,
-    Repr as TcpRepr, TcpOption, TcpOptions, TcpTimestampGenerator,
+    Repr as TcpRepr, SeqNumber as TcpSeqNumber, TcpOption, TcpOptions, TcpTimestampGenerator,
 };
 
-pub(crate) use self::tcp::{
-    Control as TcpControl, HEADER_LEN as TCP_HEADER_LEN, SeqNumber as TcpSeqNumber,
-    TcpTimestampRepr,
-};
+pub(crate) use self::tcp::{Control as TcpControl, HEADER_LEN as TCP_HEADER_LEN, TcpTimestampRepr};
 
 /// Parsing a packet failed.
 ///

@@ -9,10 +9,35 @@ use crate::wire::{IpAddress, IpProtocol};
 ///
 /// A sequence number is a monotonically advancing integer modulo 2<sup>32</sup>.
 /// Sequence numbers do not have a discontiguity when compared pairwise across a signed overflow.
+/// Pairwise ordering is defined within a half-space; numbers exactly 2^31
+/// apart are unordered. Addition and subtraction of lengths require a length
+/// smaller than that half-space.
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Default)]
-pub(crate) struct SeqNumber(pub(crate) i32);
+pub struct SeqNumber(pub(crate) i32);
 
 impl SeqNumber {
+    /// Reads the unsigned bits of a sequence number from a TCP header.
+    pub const fn new(bits: u32) -> Self {
+        Self(bits as i32)
+    }
+
+    /// The unsigned bits to write to a TCP header.
+    pub const fn to_bits(self) -> u32 {
+        self.0 as u32
+    }
+
+    /// The modulo-2^32 offset from an origin, such as the subflow's SYN.
+    /// This is a wire offset, not a serial-number ordering comparison.
+    pub const fn relative_to(self, origin: Self) -> u32 {
+        self.0.wrapping_sub(origin.0) as u32
+    }
+
+    /// Resolves a modulo-2^32 wire offset from this origin. Unlike advancing
+    /// within a receive window, a subflow offset may span the whole space.
+    pub const fn at_offset(self, offset: u32) -> Self {
+        Self(self.0.wrapping_add(offset as i32))
+    }
+
     pub(crate) fn max(self, rhs: Self) -> Self {
         if self > rhs { self } else { rhs }
     }
@@ -64,7 +89,8 @@ impl ops::Sub for SeqNumber {
 
 impl cmp::PartialOrd for SeqNumber {
     fn partial_cmp(&self, other: &SeqNumber) -> Option<cmp::Ordering> {
-        self.0.wrapping_sub(other.0).partial_cmp(&0)
+        let distance = self.0.wrapping_sub(other.0);
+        (distance != i32::MIN).then(|| distance.cmp(&0))
     }
 }
 
@@ -1085,6 +1111,20 @@ mod test {
     use super::*;
 
     use crate::wire::Ipv4Address;
+
+    #[test]
+    fn serial_order_wraps_but_does_not_order_opposite_numbers() {
+        let zero = SeqNumber::new(0);
+        let last = SeqNumber::new(u32::MAX);
+        let half = SeqNumber::new(1 << 31);
+        assert_eq!(last + 1, zero);
+        assert!(last < zero);
+        assert!(zero > last);
+        assert_eq!(zero.partial_cmp(&half), None);
+        assert_eq!(half.partial_cmp(&zero), None);
+        assert_eq!(last.at_offset(2), SeqNumber::new(1));
+        assert_eq!(SeqNumber::new(1).relative_to(last), 2);
+    }
 
     const SRC_ADDR: Ipv4Address = Ipv4Address::new(192, 168, 1, 1);
 
