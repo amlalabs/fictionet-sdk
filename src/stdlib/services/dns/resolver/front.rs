@@ -23,7 +23,7 @@ use super::super::exchange::Client;
 use super::super::records::rrsets;
 use super::cache::{Entry, Negative, ttl_left};
 use super::resolution::{Outcome, is_dname, with_ttl};
-use super::{Asker, Piece, Resolver, worse};
+use super::{Asker, Delegation, Piece, Resolver, worse};
 use fictionet::stdlib::protocols::dns::dnssec::Verify;
 
 impl<V: Verify> Resolver<V> {
@@ -250,17 +250,19 @@ impl<V: Verify> Resolver<V> {
         )
     }
 
-    /// A referral from the cache for `request`, whose RD was clear and
-    /// whose question the cache could follow as far as `name`, through the
-    /// aliases in `pieces`: those aliases in the answer section (RFC 1034
-    /// §4.3.2 step 3a), then the deepest NS RRset the cache holds at or
-    /// above `name`, and the cached addresses of its targets (step 4).
-    /// With no NS RRset, SERVFAIL.
+    /// A referral for `request`, whose RD was clear, through the aliases
+    /// in `pieces`: those aliases in the answer section (RFC 1034 §4.3.2
+    /// step 3a), then `delegation`. A local zone's referral goes out with
+    /// its authority and additional sections as the zone gave them
+    /// (step 3b). A referral from the cache for a name it could follow
+    /// no further holds the deepest NS RRset the cache holds at or above
+    /// the name, and the cached addresses of its targets (step 4); with
+    /// no NS RRset, SERVFAIL.
     pub(super) fn render_referral(
         &self,
         request: &Request,
         pieces: &[Piece],
-        name: &LowerName,
+        delegation: Delegation,
     ) -> Vec<u8> {
         let query = &request.message.metadata;
         let mut message = Message::response(query.id, query.op_code);
@@ -280,7 +282,19 @@ impl<V: Verify> Resolver<V> {
             }
             push(&mut message.answers, &ttl(cname), dnssec_ok);
         }
-        let mut at = name.clone();
+        let name = match delegation {
+            Delegation::Local(referral) => {
+                message.authorities.extend(referral.message.authorities);
+                message.additionals.extend(referral.message.additionals);
+                let response = Response {
+                    message,
+                    required_additional: referral.required_additional,
+                };
+                return self.render_with(request, response, false, false);
+            }
+            Delegation::Cached(name) => name,
+        };
+        let mut at = name;
         let ns = loop {
             let key = super::Key::new(at.clone(), RecordType::NS, DNSClass::IN);
             if let Some(Entry::Positive { set, expires, .. }) = self.cache.data(&key, self.now) {

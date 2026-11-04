@@ -699,6 +699,61 @@ fn check_chain_finds_a_zone_of_two_algorithms_whole_with_either() {
     );
 }
 
+/// A 768-bit RSA key, below the 1024 bits ring verifies.
+const RSA_768: &str = "\
+-----BEGIN PRIVATE KEY-----
+MIIB5gIBADANBgkqhkiG9w0BAQEFAASCAdAwggHMAgEAAmEAv/j377CXA6WwFmuu
+6z3A/fHdVuv4PvK2W84mGtO5aBJ+g24/wWbLvxz0dMNb+nIkZHItdMB3qioDE4p9
+wFCTqaAw6Ad6fBASe/iAe5C0js/hs5T84EUBzwVJtc6Nu8uVAgMBAAECYFa++9o1
+Y6fkQNOAyUPHXePiXPAgJMbdCgYl+xX4QjmC0eQ1910/RCYRwWzZskBTPtI5j15m
+TeeZa7osw6yGz3EzGo8zDHLtVmdbAM4D8DCmfQYG7s6yUWR0ftqC8DYUwQIxAOIV
+uQ8SY5ixEs1e33GwRwrSdtZ1jyeBAjQTxjF7XU0ukDuV2CWwALGFOHeo7TQ43QIx
+ANlfvj1HNJtyB1vLeZLp/F04pRO3nNIUZy/vlXjYEQFuBjRp8s0SWYZtzHmobihW
+GQIxAIRCVv9lL5SMykYQYUD98aF4HAM7xKJEi0hx5PjfhWZ4ffINp+PsQYuYNr9x
+uEpblQIxAM0ub57d6I1V/BYsoWwIi1rfDgrnhRJTifcYegmgQaUM2rR80V+7E2At
+ohWv45MVeQIxALIFJ1ICBy/LeiFLIT7pL09Op6t633mfL1jXD5J9lwuMeC9acSLw
+Xo2a4bUygBz7Cg==
+-----END PRIVATE KEY-----
+";
+
+/// RFC 5702 §2 allows RSA/SHA-256 moduli from 512 bits, and a zone signed
+/// with such a key validates Secure: the signer and the verifier agree
+/// (RFC 4035 §5.3). A signature over other data still fails.
+#[test]
+fn a_zone_signed_with_a_768_bit_rsa_key_validates() {
+    use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey};
+    let der = rsa::RsaPrivateKey::from_pkcs8_pem(RSA_768)
+        .unwrap()
+        .to_pkcs8_der()
+        .unwrap();
+    let rsa = ZoneKey::from_pkcs8(der.as_bytes(), Algorithm::RsaSha256, KeyFlags::KSK).unwrap();
+    let keys = KeySet {
+        keys: vec![Arc::new(rsa)],
+    };
+    let signed = zone().signed(&keys, window(), Denial::Nsec).unwrap();
+    assert_eq!(check_chain(&[&signed], &AlgorithmPolicy::iana(), now()), []);
+    let served = sets(&ask(&signed, "ns1.example.", RecordType::A, AnyResponse::All).answers);
+    let dnskey =
+        sets(&ask(&signed, "example.", RecordType::DNSKEY, AnyResponse::All).answers).remove(0);
+    let chain = Chain {
+        links: vec![Link {
+            zone: name("example."),
+            ds: Fetched::Failed,
+            dnskey: Fetched::Answer(dnskey),
+        }],
+    };
+    let anchors = Anchors::of(vec![keys.anchor(&name("example."))]);
+    let policy = AlgorithmPolicy::iana();
+    let validation = validate_rrset(&served[0], &[], &chain, &anchors, &policy, now(), &Ring);
+    assert_eq!(validation.validation, Validation::Secure);
+
+    let dnskey = keys.keys[0].dnskey();
+    let tbs = b"to be signed";
+    let signature = keys.keys[0].sign(tbs);
+    assert!(Ring.verify(&dnskey, tbs, &signature));
+    assert!(!Ring.verify(&dnskey, b"something else", &signature));
+}
+
 /// `text` as an uncompressed name on the wire.
 fn wire(text: &str) -> Vec<u8> {
     let mut bytes = Vec::new();

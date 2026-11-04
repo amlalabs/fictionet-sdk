@@ -1975,6 +1975,130 @@ fn rd_clear_follows_a_cached_alias_and_refers_for_its_target() {
     assert!(ns.iter().all(|owner| owner == "."), "{ns:?}");
 }
 
+/// The `org.` zone with a cut at `example.org.`, its server's glue, and
+/// `alias.org.` pointing below the cut, as a resolver's local zone.
+fn org_with_a_cut() -> LocalZone {
+    let org = delegation(
+        builder("org.", "ns.nic.org.").rrset(rrset("ns.nic.org.", 3600, vec![a(ORG)])),
+        "example.org.",
+        "ns1.example.org.",
+        Some(EXAMPLE_ORG),
+        None,
+    )
+    .rrset(rrset(
+        "alias.org.",
+        300,
+        vec![RData::CNAME(CNAME(name("www.example.org.")))],
+    ))
+    .build()
+    .unwrap();
+    LocalZone::new(Arc::new(org))
+}
+
+/// Whether `reply` refers to `example.org.` as the local zone's cut does:
+/// its NS RRset in the authority section and the glue for its server.
+fn refers_to_local_example_org(reply: &Message) -> bool {
+    let ns = reply
+        .authorities
+        .iter()
+        .filter(|record| record.record_type() == RecordType::NS)
+        .map(|record| (record.name.to_string(), record.data.clone()))
+        .collect::<Vec<_>>();
+    let glue = reply
+        .additionals
+        .iter()
+        .any(|record| record.name == name("ns1.example.org.") && record.data == a(EXAMPLE_ORG));
+    ns == [(
+        "example.org.".to_string(),
+        RData::NS(NS(name("ns1.example.org."))),
+    )] && glue
+}
+
+/// With RD clear, an alias target below a local zone's cut gets that
+/// zone's referral, as QNAME does, and not the closest delegation the
+/// cache holds (RFC 1034 §4.3.2 steps 3a and 3b).
+#[test]
+fn rd_clear_refers_a_cached_alias_target_to_a_local_cut() {
+    let (mut net, _) = internet(false);
+    let norec = |m: &mut Message| m.metadata.recursion_desired = false;
+    let mut resolver = resolver(Config {
+        rd0_from_cache: true,
+        ..config(None).local(org_with_a_cut())
+    });
+    // The cache holds the alias; its target lies below the local cut.
+    ask(
+        &mut resolver,
+        &mut net,
+        0,
+        query(client(1), "away.example.com.", RecordType::CNAME, |_| {}),
+    );
+    let before = net.recording().exchanges().len();
+    let reply = ask(
+        &mut resolver,
+        &mut net,
+        1,
+        query(client(1), "away.example.com.", RecordType::A, norec),
+    );
+    assert_eq!(net.recording().exchanges().len(), before);
+    assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(
+        reply.answers[0].data,
+        RData::CNAME(CNAME(name("www.example.org.")))
+    );
+    assert_eq!(reply.answers.len(), 1);
+    assert!(refers_to_local_example_org(&reply), "{reply:?}");
+}
+
+/// With RD clear, a local alias whose target lies in another local
+/// zone goes on in that zone (RFC 1034 §4.3.2 step 3a goes back to step
+/// 1), here to its referral, with no query sent.
+#[test]
+fn rd_clear_follows_a_local_alias_into_another_local_zone() {
+    let (mut net, _) = internet(false);
+    let norec = |m: &mut Message| m.metadata.recursion_desired = false;
+    let corp = builder("corp.", "ns.corp.")
+        .rrset(rrset(
+            "alias.corp.",
+            300,
+            vec![RData::CNAME(CNAME(name("alias.org.")))],
+        ))
+        .build()
+        .unwrap();
+    let mut resolver = resolver(Config {
+        rd0_from_cache: true,
+        ..config(None)
+            .local(org_with_a_cut())
+            .local(LocalZone::new(Arc::new(corp)))
+    });
+    let reply = ask(
+        &mut resolver,
+        &mut net,
+        0,
+        query(client(1), "alias.corp.", RecordType::A, norec),
+    );
+    assert!(net.recording().exchanges().is_empty());
+    assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+    let chain: Vec<(String, RData)> = reply
+        .answers
+        .iter()
+        .map(|record| (record.name.to_string(), record.data.clone()))
+        .collect();
+    assert_eq!(
+        chain,
+        [
+            (
+                "alias.corp.".to_string(),
+                RData::CNAME(CNAME(name("alias.org.")))
+            ),
+            (
+                "alias.org.".to_string(),
+                RData::CNAME(CNAME(name("www.example.org.")))
+            ),
+        ]
+    );
+    assert!(refers_to_local_example_org(&reply), "{reply:?}");
+}
+
 #[test]
 fn chaos_questions_are_answered_from_the_identity() {
     let (mut net, _) = internet(false);
@@ -2387,6 +2511,37 @@ fn a_forward_zone_takes_its_own_questions_and_the_rest_iterate() {
         let message = Message::from_vec(&exchange.query).unwrap();
         assert!(!message.metadata.recursion_desired);
     }
+}
+
+/// The DS RRset at a forward zone's apex is the parent's data
+/// (RFC 4035 §2.4), so a validating resolver asks it where the parent's
+/// data is, here by iteration, and an unsigned delegation to a forward
+/// zone validates Insecure (RFC 4035 §5.2) instead of failing.
+#[test]
+fn the_ds_of_a_forward_zone_is_asked_where_its_parent_is() {
+    let (mut net, anchors) = internet(true);
+    let mut resolver = resolver(Config {
+        forward: vec![(
+            name("example.org."),
+            vec![SocketAddr::new(ip(EXAMPLE_ORG), 53)],
+        )],
+        ..config(anchors)
+    });
+    let reply = ask(
+        &mut resolver,
+        &mut net,
+        0,
+        query(client(1), "www.example.org.", RecordType::A, |_| {}),
+    );
+    assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(addresses(&reply), ["192.0.2.90"]);
+    assert!(!reply.metadata.authentic_data);
+    let ds: Vec<IpAddr> = asked(&net)
+        .into_iter()
+        .filter(|(_, qname, qtype, _)| qname == "example.org." && *qtype == RecordType::DS)
+        .map(|(server, _, _, _)| server)
+        .collect();
+    assert_eq!(ds, [ip(ORG)]);
 }
 
 /// An upstream that validates, playing a zone whose signatures fail: it
@@ -3680,6 +3835,67 @@ e   A   192.0.2.5
     assert_eq!(rtype, empty);
 }
 
+/// An NSEC3 record whose Flags field has a bit RFC 5155 does not define
+/// is ignored (RFC 5155 §8.2), and the rest of the reply is read: a
+/// resolver reads its replies with `read_message`.
+#[test]
+fn a_reply_with_an_nsec3_of_unknown_flags_is_read_without_it() {
+    use fictionet::stdlib::protocols::dns::dnssec::Nsec3HashAlgorithm;
+    use fictionet::stdlib::protocols::dns::dnssec::rdata::NSEC3;
+    let nsec3 = |iterations: u16| {
+        let rdata = NSEC3::new(
+            Nsec3HashAlgorithm::SHA1,
+            true,
+            iterations,
+            Vec::new(),
+            vec![0x11; 20],
+            [RecordType::A],
+        );
+        Record::from_rdata(
+            name("ck0pojmg874ljref7efn8430qvit8bsm.example.com."),
+            300,
+            RData::DNSSEC(DNSSECRData::NSEC3(rdata)),
+        )
+    };
+    let mut message = Message::response(7, OpCode::Query);
+    message.add_query(Query::query(name("nx.example.com."), RecordType::A));
+    message.metadata.response_code = ResponseCode::NXDomain;
+    message.add_authority(Record::from_rdata(
+        name("example.com."),
+        300,
+        RData::SOA(soa("example.com.")),
+    ));
+    // Flags 0x01, Opt-Out, then 0x1234 iterations and no salt: the second
+    // record's flags octet is set to 0x03 below.
+    message.add_authority(nsec3(0));
+    message.add_authority(nsec3(0x1234));
+    let mut bytes = message.to_vec().unwrap();
+    let at = bytes
+        .windows(5)
+        .position(|window| window == [1, 1, 0x12, 0x34, 0])
+        .unwrap();
+    bytes[at + 1] = 0x03;
+    assert!(Message::from_vec(&bytes).is_err(), "hickory refuses it");
+
+    let read = read_message(&bytes).unwrap();
+    assert_eq!(read.metadata.response_code, ResponseCode::NXDomain);
+    let kept: Vec<(RecordType, Option<u16>)> = read
+        .authorities
+        .iter()
+        .map(|record| {
+            let iterations = match &record.data {
+                RData::DNSSEC(DNSSECRData::NSEC3(nsec3)) => Some(nsec3.iterations()),
+                _ => None,
+            };
+            (record.record_type(), iterations)
+        })
+        .collect();
+    assert_eq!(
+        kept,
+        [(RecordType::SOA, None), (RecordType::NSEC3, Some(0))]
+    );
+}
+
 /// The owner and type of each record.
 fn rows(records: &[Record]) -> Vec<(String, RecordType)> {
     records
@@ -3834,6 +4050,40 @@ fn root_ns_with_ttl_0_serve_the_question_they_were_primed_for() {
         .filter(|(_, name, rtype, _)| name == "." && *rtype == RecordType::NS)
         .count();
     assert_eq!(priming, 1);
+}
+
+/// After priming, the root's servers are the ones the priming response
+/// gave; the hint the resolver primed from is not asked again
+/// (RFC 8109 §2).
+#[test]
+fn after_priming_the_hints_are_not_asked() {
+    const HINT: &str = "192.0.2.250";
+    let root = builder(".", "a.root-servers.net.")
+        .rrset(rrset("a.root-servers.net.", 3600, vec![a(ROOT)]))
+        .build()
+        .unwrap();
+    let mut net = MemoryNet::new();
+    serve_at(&mut net, ROOT, vec![root.clone()]);
+    serve_at(&mut net, HINT, vec![root]);
+    let mut resolver = resolver(Config {
+        hints: vec![(name("a.root-servers.net."), ip(HINT))],
+        ..config(None)
+    });
+    for n in 0..10 {
+        let reply = ask(
+            &mut resolver,
+            &mut net,
+            n,
+            query(client(1), &format!("nx{n}."), RecordType::A, |_| {}),
+        );
+        assert_eq!(reply.metadata.response_code, ResponseCode::NXDomain);
+    }
+    let of_hint: Vec<(String, RecordType)> = asked(&net)
+        .into_iter()
+        .filter(|(server, _, _, _)| *server == ip(HINT))
+        .map(|(_, qname, qtype, _)| (qname, qtype))
+        .collect();
+    assert_eq!(of_hint, [(".".to_string(), RecordType::NS)]);
 }
 
 #[test]
@@ -4938,6 +5188,48 @@ fn a_wildcard_answer_carries_only_its_own_proof() {
         .map(|record| record.name.to_string())
         .collect();
     assert_eq!(nsec, ["*.wild.example.com."]);
+}
+
+/// A wildcard answer from the cache goes out with the NSEC records that
+/// prove it, whose TTL is counted down from what the zone gave them and
+/// never raised (RFC 1035 §7.4, RFC 2181 §8): the answer is kept no
+/// longer than its proof.
+#[test]
+fn a_cached_wildcard_proof_keeps_its_own_ttl() {
+    let (mut net, _) = changed_example(|req, message| {
+        if req.question.name() == &name("x.wild.example.com.") {
+            for record in &mut message.authorities {
+                record.ttl = 100;
+            }
+        }
+    });
+    let mut resolver = resolver(config(None));
+    let nsec_ttls = |reply: &Message| -> Vec<u32> {
+        reply
+            .authorities
+            .iter()
+            .filter(|record| record.record_type() == RecordType::NSEC)
+            .map(|record| record.ttl)
+            .collect()
+    };
+    let reply = ask(
+        &mut resolver,
+        &mut net,
+        0,
+        query(client(1), "x.wild.example.com.", RecordType::A, dnssec_ok),
+    );
+    assert_eq!(addresses(&reply), ["192.0.2.77"]);
+    assert_eq!(nsec_ttls(&reply), [100]);
+    let before = net.recording().exchanges().len();
+    let reply = ask(
+        &mut resolver,
+        &mut net,
+        60,
+        query(client(1), "x.wild.example.com.", RecordType::A, dnssec_ok),
+    );
+    assert_eq!(net.recording().exchanges().len(), before, "from the cache");
+    assert_eq!(addresses(&reply), ["192.0.2.77"]);
+    assert_eq!(nsec_ttls(&reply), [40]);
 }
 
 /// A wildcard answer whose proof does not verify is Bogus: the proof goes

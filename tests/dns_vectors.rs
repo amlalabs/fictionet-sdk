@@ -2098,21 +2098,6 @@ fn apex_of(zone: &Zone) -> Name {
     Name::from(zone.apex())
 }
 
-/// The owner, as text, of the NSEC3 record for `name` in the zone at
-/// `apex`: SHA-1 with no salt and no extra iterations, as every zone here
-/// is signed (RFC 9276 §3.1).
-fn nsec3_owner(name: &Name, apex: &Name) -> String {
-    use fictionet::stdlib::protocols::dns::dnssec::Nsec3HashAlgorithm;
-    let hash = Nsec3HashAlgorithm::SHA1
-        .hash(&[], name, 0)
-        .expect("a name hashes");
-    format!(
-        "{}.{}",
-        base32hex(hash.as_ref()),
-        name_text(apex).trim_start_matches('.')
-    )
-}
-
 /// The name a negative answer is about: the target of the last CNAME in
 /// the answer, unless the question was for CNAME (Lean's `finalName`).
 fn final_name(qname: &Name, qtype: RecordType, answers: &[Record]) -> Name {
@@ -2141,15 +2126,12 @@ enum Extra {
     Required(usize),
 }
 
-/// Compares `message`, an answer to `qname` from the signed zone at
-/// `apex` or a copy of it, with the answer Lean writes for it
-/// (`signedAnswerFields`): the RCODE, AA, every section with its RRSIGs
-/// in `form`, and the denial records.
+/// Compares `message`, an answer from a signed zone or a copy of it, with
+/// the answer Lean writes for it (`signedAnswerFields`): the RCODE, AA,
+/// every section with its RRSIGs in `form`, and the denial records.
 fn compare_signed(
     expected: &Value,
     message: &Message,
-    qname: &Name,
-    apex: &Name,
     form: Form<'_>,
     extra: Extra,
     tally: &mut Tally,
@@ -2178,25 +2160,10 @@ fn compare_signed(
     // Lean writes one record each time a proof needs it; a message
     // holds each record once (RFC 2181 §5).
     let lean_denial: BTreeSet<String> = texts(expected, "denial").into_iter().collect();
-    let mut rust_denial: BTreeSet<String> =
+    let rust_denial: BTreeSet<String> =
         lines(&mut message.authorities.iter().filter(|r| is_denial(r)))
             .into_iter()
             .collect();
-    // For NODATA at a name that is itself a wildcard, RFC 5155 §7.2.3
-    // needs only the NSEC3 matching it. Rust also sends the one
-    // matching the wildcard's parent, which the NODATA of a name a
-    // wildcard answered needs (§7.2.5); the extra record proves
-    // nothing false.
-    if qname.is_wildcard() && rust_denial.is_superset(&lean_denial) {
-        let parent = nsec3_owner(&qname.base_name(), apex);
-        let extra: Vec<&String> = rust_denial.difference(&lean_denial).collect();
-        if !extra.is_empty() && extra.iter().all(|l| l.starts_with(&parent)) {
-            tally.note(
-                "NODATA at a wildcard name with its parent's NSEC3 too, which Lean leaves out",
-            );
-            rust_denial = lean_denial.clone();
-        }
-    }
     same("denial", lean_denial, rust_denial)?;
     // The Lean model's signed answers carry no RRSIGs in the
     // additional section.
@@ -2288,15 +2255,7 @@ fn signed_case(
     };
     let rcode = message.metadata.response_code;
     if compare_lines {
-        compare_signed(
-            expected,
-            message,
-            req.question.name(),
-            &apex_of(&signed),
-            form,
-            Extra::Exact,
-            tally,
-        )?;
+        compare_signed(expected, message, form, Extra::Exact, tally)?;
     }
     let apex = Name::from(signed.apex());
     let dnskeys = match signed.node(signed.apex()) {
@@ -2543,16 +2502,9 @@ fn learned_signed_copies() {
             }
             let extra = Extra::Required(number(expected, "required_additional") as usize);
             match replies.as_slice() {
-                [reply] => compare_signed(
-                    expected,
-                    reply,
-                    &qname,
-                    &apex,
-                    Form::Zone(&tags),
-                    extra,
-                    tally,
-                )
-                .map_err(at)?,
+                [reply] => {
+                    compare_signed(expected, reply, Form::Zone(&tags), extra, tally).map_err(at)?
+                }
                 [] => return Err(at("Rust is silent".to_string())),
                 more => return Err(at(format!("{} replies to one query", more.len()))),
             }

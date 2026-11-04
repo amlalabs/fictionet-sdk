@@ -130,7 +130,6 @@ standards and Rust do, or where a standard lets both answers stand.
 | `wire` | `read_message` refuses messages holding a record hickory cannot read by its type's rules, such as an SRV without a target; the Lean codec carries such RDATA as octets (RFC 3597) | hickory's reading of typed RDATA |
 | `fit` | `Gen.lean` sometimes splits one RRset (same owner and type) into two in a section, and the Lean `fit` keeps the two apart | RFC 2181 §5 makes them one RRset, which `fit` writes together |
 | `zone`, `partial` | for QTYPE ANY answered with one RRset, Lean takes the first RRset in the zone's listed order and Rust the RRset of the lowest type; the test then checks that Rust answers Lean's RRset when asked for its type | RFC 8482 §4.1 lets a server pick any one RRset; a master file's order does not survive into a zone |
-| `signed`, `learned_signed` | for NODATA at a name that is itself a wildcard, Rust also sends the NSEC3 matching the wildcard's parent | the extra record proves nothing false; RFC 5155 §7.2.3 needs only the matching NSEC3 |
 | `learned`, `learned_signed` | a copy's reply leaves out optional additional data it does not hold, such as the address of an MX target it never looked up | RFC 2181 §5.4.1 and RFC 9471 §3.2 make such data optional; `serve_reply_upstream` allows exactly this (`Response.Grows`) |
 | `chain` | in a tree with a corrupted key, Rust also reports the breaks the bad signatures make, `SignatureInvalid` among them | the Lean check reads no signature and assumes honest signers (`check_sound`) |
 

@@ -17,7 +17,9 @@
 //!    depth the one added last. The first that knows the answer gives it;
 //!    a zone that does not know passes the question on. When RD is set,
 //!    a local chain that leaves its zone goes on from its target as any
-//!    alias does, and a local referral is followed.
+//!    alias does, and a local referral is followed. When RD is clear,
+//!    the chain goes on through the local zones and the cache, and a
+//!    name a local zone refers to a cut gets that zone's referral.
 //! 4. Answers from its cache, or starts or joins a resolution: the
 //!    iteration of RFC 1034 §5.3.3 from the root servers down, or from
 //!    the servers a local zone's cut names, following aliases, each
@@ -193,6 +195,17 @@ impl Piece {
     }
 }
 
+/// The delegation a client query with RD clear is referred to, when its
+/// chain stops at a name the resolver cannot answer.
+enum Delegation {
+    /// A local zone's referral to a cut below it, with its NS RRset and
+    /// glue as the zone gives them.
+    Local(Response),
+    /// The closest delegation the cache holds for the name, as a server
+    /// answering from its cache gives it.
+    Cached(LowerName),
+}
+
 /// What a local zone answered a question with.
 struct Local {
     /// The answer, before the front renders it.
@@ -314,9 +327,13 @@ impl<V: Verify> Resolver<V> {
         // not settle the question is resolved on, as every name the
         // resolution reaches is (RFC 1034 §4.3.2 step 1, §5.3.3): a local
         // chain that leaves its zone goes on from its target, and a local
-        // referral is followed to the servers it names.
+        // referral is followed to the servers it names. With RD clear, a
+        // resolver that answers from its cache takes a local chain that
+        // goes past its zone on through its local zones and its cache, as
+        // step 3a goes back to step 1, and a local referral goes out as it
+        // is (step 3b).
         if let Some(local) = self.local_answer(&request)
-            && (local.settles() || !request.rd)
+            && (local.settles() || (!request.rd && !(local.onward && self.config.rd0_from_cache)))
         {
             let bytes = self.render_local(&request, local.response, local.keep_aa);
             return self.send_answer(client, bytes, Validation::NotPerformed, false);
@@ -430,13 +447,18 @@ impl<V: Verify> Resolver<V> {
                 return;
             };
             if asker.cache_only {
+                // A name a local zone refers to a cut gets that referral,
+                // as QNAME does (RFC 1034 §4.3.2 step 3b).
+                if let Some(referral) = self.local_referral(&asked) {
+                    return self.answer_referral(id, Delegation::Local(referral));
+                }
                 // A query with RD clear may not start the lookups a
                 // validation needs, so data no check has validated is
                 // answered as if the cache did not hold it.
                 let validate = asker.validate;
                 match self.cached(&key) {
                     Some(found) if !unchecked(validate, &found) => self.push_found(id, found),
-                    _ => return self.answer_referral(id, &key.name),
+                    _ => return self.answer_referral(id, Delegation::Cached(key.name)),
                 }
                 continue;
             }
@@ -444,7 +466,7 @@ impl<V: Verify> Resolver<V> {
             // bit on, as it relays the rest of the client's header.
             let relay_cd = asker.request.cd
                 && self.config.anchors.is_none()
-                && self.forward_zone(&key.name).is_some();
+                && self.forward_for(&key).is_some();
             // The aliases followed are counted above, apart from how
             // deeply this name's own lookups nest.
             match self.depend(
@@ -814,17 +836,17 @@ impl<V: Verify> Resolver<V> {
         self.send_answer(asker.client, bytes, validation, cached);
     }
 
-    /// Answers client query `id`, whose RD was clear and whose question
-    /// the cache cannot answer past `name`, with the aliases it followed
-    /// to `name` and the closest delegation the cache holds for it, as a
-    /// server answering from its cache does.
-    fn answer_referral(&mut self, id: AskerId, name: &LowerName) {
+    /// Answers client query `id`, whose RD was clear and whose chain
+    /// stopped at a name it cannot answer, with the aliases it followed to
+    /// that name and `delegation`.
+    fn answer_referral(&mut self, id: AskerId, delegation: Delegation) {
         let Some(asker) = self.askers.remove(&id) else {
             return;
         };
         self.graph.release(TreeId::of(id));
-        let bytes = self.render_referral(&asker.request, &asker.pieces, name);
-        self.send_answer(asker.client, bytes, Validation::NotPerformed, true);
+        let cached = matches!(delegation, Delegation::Cached(_));
+        let bytes = self.render_referral(&asker.request, &asker.pieces, delegation);
+        self.send_answer(asker.client, bytes, Validation::NotPerformed, cached);
     }
 
     /// Serves stale data to client queries that waited longer than the

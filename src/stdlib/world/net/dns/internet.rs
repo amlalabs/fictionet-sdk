@@ -333,6 +333,26 @@ impl Mirror {
     pub fn server(&self, server: ServerConfig) -> Authoritative<Arc<dyn Authority>> {
         self.inner.server(server)
     }
+
+    /// The addresses the mirror's name servers answer at, those given
+    /// with [`serves`](Self::serves) and those it places, as it learns
+    /// them. A server is placed before the observers see the filing
+    /// that named it, so an observer finds its address here.
+    pub fn servers(&self) -> Servers {
+        Servers(self.inner.copies.clone())
+    }
+}
+
+/// The addresses a [`Mirror`]'s name servers answer at
+/// ([`Mirror::servers`]).
+#[derive(Clone)]
+pub struct Servers(Arc<Copies>);
+
+impl Servers {
+    /// Whether a name server of the mirror answers at `addr`.
+    pub fn contains(&self, addr: IpAddr) -> bool {
+        self.0.serves_any(addr)
+    }
 }
 
 impl Inner {

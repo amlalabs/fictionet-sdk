@@ -29,8 +29,10 @@ pub struct Config {
     /// Zones whose questions go to servers that resolve them, with RD
     /// set, instead of iterating: each zone's name and its servers. A
     /// question goes to the servers of the deepest zone that holds its
-    /// name, and their answers are taken whole. `(".", servers)` forwards
-    /// every question, as a home router does.
+    /// name, and their answers are taken whole. A question for DS goes
+    /// where its parent's would, since the DS RRset is the parent's data
+    /// (RFC 4035 §2.4). `(".", servers)` forwards every question, as a
+    /// home router does.
     pub forward: Vec<(Name, Vec<SocketAddr>)>,
     /// Zones answered without a query. The zones that hold QNAME, or a
     /// name an alias chain reaches, answer deepest first, and at equal

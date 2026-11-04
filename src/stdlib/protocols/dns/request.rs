@@ -14,7 +14,7 @@ use super::op::{
 use super::rr::rdata::TSIG;
 use super::rr::rdata::opt::EdnsCode;
 use super::rr::rdata::tsig::TsigError;
-use super::rr::{DNSClass, RData, Record, RecordType};
+use super::rr::{DNSClass, Name, RData, Record, RecordType};
 use super::serialize::binary::{BinDecodable, BinDecoder, DecodeError};
 use fictionet::stdlib::services::serve::Transport;
 
@@ -173,6 +173,11 @@ impl Request {
 /// [`RData::Update0`](super::rr::RData::Update0), and refuses any other
 /// message that holds one. A resolver reads its replies with this, so a
 /// zone that holds such a record can still be resolved.
+///
+/// An NSEC3 or NSEC3PARAM record with a Flags bit set other than Opt-Out
+/// is left out of the message, and the rest is read: RFC 5155 §8.2 has
+/// validators ignore such NSEC3 records, and §4.1.2 such NSEC3PARAM
+/// records, where hickory refuses the whole message.
 pub fn read_message(bytes: &[u8]) -> Result<Message, DecodeError> {
     let mut decoder = BinDecoder::new(bytes);
     let Header {
@@ -182,13 +187,12 @@ pub fn read_message(bytes: &[u8]) -> Result<Message, DecodeError> {
     let queries = (0..counts.queries)
         .map(|_| Query::read(&mut decoder))
         .collect::<Result<Vec<_>, _>>()?;
-    // UPDATE is the one opcode under which hickory reads empty RDATA.
-    let mut records = |count: u16, additional: bool| {
-        Message::read_records(&mut decoder, usize::from(count), additional, OpCode::Update)
-    };
-    let (answers, _, _) = records(counts.answers, false)?;
-    let (authorities, _, _) = records(counts.authorities, false)?;
-    let (additionals, edns, _) = records(counts.additionals, true)?;
+    let answers = read_section(bytes, &mut decoder, counts.answers, false)?.records;
+    let authorities = read_section(bytes, &mut decoder, counts.authorities, false)?.records;
+    let Section {
+        records: additionals,
+        edns,
+    } = read_section(bytes, &mut decoder, counts.additionals, true)?;
     if let Some(edns) = &edns {
         metadata.merge_response_code(edns.rcode_high());
     }
@@ -200,6 +204,75 @@ pub fn read_message(bytes: &[u8]) -> Result<Message, DecodeError> {
     message.additionals = additionals;
     message.edns = edns;
     Ok(message)
+}
+
+/// The records of one section of a message, and the EDNS of its OPT
+/// record.
+struct Section {
+    records: Vec<Record>,
+    edns: Option<Edns>,
+}
+
+/// Reads the `count` records of one section from `decoder`, a decoder of
+/// `bytes`, as [`Message::read_records`] does under UPDATE, the one
+/// opcode under which hickory reads empty RDATA. An NSEC3 or NSEC3PARAM
+/// record hickory refuses for its flags is skipped
+/// ([`past_unknown_nsec3_flags`]).
+fn read_section<'a>(
+    bytes: &'a [u8],
+    decoder: &mut BinDecoder<'a>,
+    count: u16,
+    additional: bool,
+) -> Result<Section, DecodeError> {
+    let mut section = Section {
+        records: Vec::new(),
+        edns: None,
+    };
+    let mut signed = false;
+    for _ in 0..count {
+        if signed {
+            // A TSIG record is the last in the message (RFC 8945 §5.1).
+            return Err(DecodeError::RecordAfterSig);
+        }
+        if let Some(past) = past_unknown_nsec3_flags(bytes, decoder) {
+            *decoder = past;
+            continue;
+        }
+        let (records, edns, sig) = Message::read_records(decoder, 1, additional, OpCode::Update)?;
+        if edns.is_some() && section.edns.is_some() {
+            return Err(DecodeError::DuplicateEdns);
+        }
+        section.records.extend(records);
+        section.edns = section.edns.or(edns);
+        signed = sig.is_some();
+    }
+    Ok(section)
+}
+
+/// A decoder of `bytes` past the record `decoder` is at, when that record
+/// is an NSEC3 or NSEC3PARAM record with a Flags bit set other than
+/// Opt-Out, which hickory refuses to read. The record is read as
+/// RFC 1035 §4.1.3 lays it out: its owner, TYPE, CLASS, TTL, and
+/// RDLENGTH, then RDATA, whose second octet is the Flags field
+/// (RFC 5155 §3.2, §4.2). `None` for any other record, or one that does
+/// not fit, which hickory then reads or refuses.
+fn past_unknown_nsec3_flags<'a>(
+    bytes: &'a [u8],
+    decoder: &BinDecoder<'a>,
+) -> Option<BinDecoder<'a>> {
+    let mut ahead = BinDecoder::new(bytes);
+    ahead.read_slice(decoder.index()).ok()?;
+    Name::read(&mut ahead).ok()?;
+    let rtype = RecordType::from(ahead.read_u16().ok()?.unverified());
+    if !matches!(rtype, RecordType::NSEC3 | RecordType::NSEC3PARAM) {
+        return None;
+    }
+    // CLASS and TTL.
+    ahead.read_slice(6).ok()?;
+    let length = ahead.read_u16().ok()?.unverified();
+    let rdata = ahead.read_slice(usize::from(length)).ok()?.unverified();
+    let flags = *rdata.get(1)?;
+    (flags & 0b1111_1110 != 0).then_some(ahead)
 }
 
 /// QTYPE TKEY, a meta-type for key agreement (RFC 2930 §2).

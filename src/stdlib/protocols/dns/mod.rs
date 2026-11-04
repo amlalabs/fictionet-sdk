@@ -20,7 +20,7 @@
 //! | --- | --- |
 //! | [`Queries`] | Frames messages, one per datagram or after a two-octet length on a stream (RFC 1035 §4.2.2). |
 //! | [`Request::parse`] | Checks a query in one fixed order and gives a request, a rejection to send, or silence. |
-//! | [`read_message`] | Reads a message as hickory does, and also with records whose RDATA is empty (RFC 3597 §4). |
+//! | [`read_message`] | Reads a message as hickory does, and also with records whose RDATA is empty (RFC 3597 §4), leaving out NSEC3 and NSEC3PARAM records with unknown flags (RFC 5155 §8.2). |
 //! | [`fit`] | Writes a reply within the requestor's size: whole RRsets, needed data first, TC only when that data does not fit. |
 //! | [`Ede`], [`Nsid`], [`Padding`] | EDNS options hickory carries as raw bytes or its own type (RFC 8914, 5001, 7830). |
 //! | [`label_count`], [`dname_substitute`] | Counts a name's labels with a leading `*`, and makes the name a DNAME substitutes (RFC 6672 §2.2). |

@@ -37,7 +37,7 @@ use fictionet::stdlib::services::dns::zone::{Filing, Section};
 use fictionet::stdlib::services::tls::ServerConfig;
 use fictionet::stdlib::web;
 use fictionet::stdlib::world::net::dns::encrypted::Fronts;
-use fictionet::stdlib::world::net::dns::internet::Mirror;
+use fictionet::stdlib::world::net::dns::internet::{Mirror, Servers};
 use fictionet::stdlib::world::net::dns::{Only, PerSession, Recursive};
 use fictionet::stdlib::world::net::{Host, Net, NetHandle};
 use fictionet::sync::Mutex;
@@ -109,8 +109,9 @@ pub fn net(
     ));
     let negative_anchors: NegativeAnchors = Arc::new(upstream.negative_anchors());
     let resolver_ca = ca.clone();
+    let mirror = Mirror::new(Only::new(outbound.policy(), upstream), handle.clone());
     let sites = Arc::new(Sites {
-        handle: handle.clone(),
+        handle,
         outbound: outbound.clone(),
         handler: handler::Handler::new(fcx, pages.clone()),
         ca,
@@ -123,6 +124,7 @@ pub fn net(
         refusing: Mutex::default(),
         refused: Mutex::default(),
         addresses: PerSession::new(),
+        servers: mirror.servers(),
     });
     // A host refused once is served as soon as the session serves it.
     {
@@ -134,7 +136,7 @@ pub fn net(
         });
     }
     let mut mirror = roots::seed(
-        Mirror::new(Only::new(outbound.policy(), upstream), handle)
+        mirror
             .delay(place.authority_rtt / 2)
             .namespace(&namespace)
             .observe(outbound.observer())
@@ -279,6 +281,8 @@ struct Sites {
     /// The IPv4 addresses the mirrored zones filed for each name this
     /// session, its own or those at the end of its CNAME chain.
     addresses: PerSession<HashMap<LowerName, HashSet<Ipv4Addr>>>,
+    /// The addresses the mirror's name servers answer at.
+    servers: Servers,
 }
 
 impl Sites {
@@ -300,7 +304,9 @@ impl Sites {
     /// whose port 443 already serves the world's infrastructure, keeps no
     /// machine for the name. So does a public resolver's address, whose
     /// port 443 answers every name with its DNS over HTTPS front, as
-    /// `1dot1dot1dot1.cloudflare-dns.com` at 1.1.1.1 does. A name the
+    /// `1dot1dot1dot1.cloudflare-dns.com` at 1.1.1.1 does. So does an
+    /// address where the mirror runs a name server, such as a root
+    /// letter's: the real servers there serve DNS and no web site. A name the
     /// session resolves but does not serve, outside Live-Depth's depth,
     /// gets no site: a machine there with no services refuses connections
     /// at TCP.
@@ -314,7 +320,11 @@ impl Sites {
         };
         let mut found: Vec<(LowerName, Ipv4Addr)> = answers()
             .filter_map(|record| match &record.data {
-                RData::A(a) if !non_public_address(a.0.into()) && !resolver_address(a.0) => {
+                RData::A(a)
+                    if !non_public_address(a.0.into())
+                        && !resolver_address(a.0)
+                        && !self.servers.contains(a.0.into()) =>
+                {
                     Some((LowerName::new(&record.name), a.0))
                 }
                 _ => None,

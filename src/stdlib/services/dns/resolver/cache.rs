@@ -342,6 +342,9 @@ struct Stored {
 ///   negative answers without an SOA (RFC 2308 §5).
 /// - A negative answer lives min(SOA TTL, MINIMUM) (RFC 2308 §5), and no
 ///   longer than the NSEC or NSEC3 records that prove it (RFC 9077 §3).
+///   So does an RRset with the records that support it, such as a
+///   wildcard answer's NSEC records, whose TTLs are never raised
+///   (RFC 2181 §8).
 /// - A Secure RRset lives no longer than the RRSIGs that verified it
 ///   (RFC 4035 §5.3.3).
 /// - A failure lives [`Limits::failure_ttl`] (RFC 9520 §3.2), and so does
@@ -861,7 +864,14 @@ impl Cache {
                 truncated,
             } => {
                 let set = normalized(&set);
-                let ttl = seconds(set.ttl()).min(self.limits.max_ttl);
+                let proof: Vec<RecordSet> = proof.iter().map(normalized).collect();
+                // The proof goes out with the RRset, at the TTL left on
+                // it, so the entry lasts no longer than the proof's own
+                // TTL, which is never raised (RFC 2181 §8).
+                let ttl = std::iter::once(&set)
+                    .chain(&proof)
+                    .map(|set| seconds(set.ttl()))
+                    .fold(self.limits.max_ttl, Duration::min);
                 if truncated || ttl.is_zero() {
                     return None;
                 }

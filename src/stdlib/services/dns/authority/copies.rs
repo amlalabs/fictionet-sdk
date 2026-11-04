@@ -145,6 +145,11 @@ impl Copies {
         }
     }
 
+    /// Whether `addr` serves any zone.
+    pub fn serves_any(&self, addr: IpAddr) -> bool {
+        self.served.lock().contains_key(&addr)
+    }
+
     /// The copy of the zone at `apex`, made empty the first time.
     fn copy(&self, apex: &LowerName) -> Arc<Learned> {
         self.zones

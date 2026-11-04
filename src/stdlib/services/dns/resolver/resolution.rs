@@ -38,7 +38,7 @@ use fictionet::stdlib::protocols::dns::rr::domain::Label;
 use fictionet::stdlib::protocols::dns::rr::{
     DNSClass, LowerName, Name, RData, RecordSet, RecordType, SerialNumber,
 };
-use fictionet::stdlib::protocols::dns::{Parsed, Request, dname_substitute, label_count};
+use fictionet::stdlib::protocols::dns::{Parsed, Request, Response, dname_substitute, label_count};
 use fictionet::stdlib::services::serve::Transport;
 use fictionet::time::Instant;
 
@@ -768,19 +768,24 @@ impl<V: Verify> Resolver<V> {
         }])
     }
 
+    /// A local zone's answer to `request`, when it is a referral to a cut
+    /// below the zone (RFC 1034 §4.3.2 step 3b).
+    pub(super) fn local_referral(&self, request: &Request) -> Option<Response> {
+        let response = self.local_answer(request)?.response;
+        let message = &response.message;
+        let metadata = &message.metadata;
+        let referral = !metadata.authoritative
+            && metadata.response_code == ResponseCode::NoError
+            && message.answers.is_empty();
+        referral.then_some(response)
+    }
+
     /// The zone cut a local zone refers `request`'s question to, when its
     /// answer is a referral. The name servers local data names are the
     /// best to ask for a name below the cut (RFC 1034 §5.3.3 step 2), so
     /// a resolution of it starts there, not at the root.
     pub(super) fn local_cut(&self, request: &Request) -> Option<LocalCut> {
-        let message = self.local_answer(request)?.response.message;
-        let metadata = &message.metadata;
-        if metadata.authoritative
-            || metadata.response_code != ResponseCode::NoError
-            || !message.answers.is_empty()
-        {
-            return None;
-        }
+        let message = self.local_referral(request)?.message;
         let mut cut = None;
         let mut targets = Vec::new();
         for record in &message.authorities {
@@ -1158,7 +1163,7 @@ impl<V: Verify> Resolver<V> {
         if let Some(found) = self.cached_for(&key, lookup.relay_cd) {
             return self.finish(id, found);
         }
-        if let Some((zone, servers)) = self.forward_zone(&key.name) {
+        if let Some((zone, servers)) = self.forward_for(&key) {
             let mut servers = servers.to_vec();
             servers.retain(|server| !lookup.tried.contains(&(*server, Transport::Udp)));
             if servers.is_empty() {
@@ -1239,12 +1244,11 @@ impl<V: Verify> Resolver<V> {
                 }
             }
         }
-        if zone.is_root() {
-            for server in self.hint_servers() {
-                if !servers.contains(&server) {
-                    servers.push(server);
-                }
-            }
+        // After priming, the root's servers are the ones the priming
+        // response gave, and the hints serve only when it gave none an
+        // address (RFC 8109 §2).
+        if zone.is_root() && servers.is_empty() {
+            servers = self.hint_servers();
         }
         servers.retain(|server| !lookup.tried.contains(&(*server, Transport::Udp)));
         if !servers.is_empty() {
@@ -1539,7 +1543,7 @@ impl<V: Verify> Resolver<V> {
     /// The deepest forward zone ([`Config::forward`](super::Config::forward))
     /// that holds `name`, with its servers. At equal depth, the zone given
     /// last.
-    pub(super) fn forward_zone(&self, name: &LowerName) -> Option<(LowerName, &[SocketAddr])> {
+    fn forward_zone(&self, name: &LowerName) -> Option<(LowerName, &[SocketAddr])> {
         self.config
             .forward
             .iter()
@@ -1547,6 +1551,18 @@ impl<V: Verify> Resolver<V> {
             .filter(|(zone, _)| zone.zone_of(name))
             .max_by_key(|(zone, _)| label_count(zone))
             .map(|(zone, servers)| (zone, servers.as_slice()))
+    }
+
+    /// The forward zone whose servers `key` is asked of. A DS RRset is
+    /// the parent's data (RFC 4035 §2.4), so the DS at a forward zone's
+    /// apex is asked where the parent's data is: of the forward zone that
+    /// holds the parent, or by iteration. The root has no parent.
+    pub(super) fn forward_for(&self, key: &Key) -> Option<(LowerName, &[SocketAddr])> {
+        if key.rtype == RecordType::DS && !key.name.is_root() {
+            self.forward_zone(&key.name.base_name())
+        } else {
+            self.forward_zone(&key.name)
+        }
     }
 
     /// Sends lookup `id`'s next question to one of `servers`, chosen at

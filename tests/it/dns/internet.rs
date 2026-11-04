@@ -679,6 +679,56 @@ fn the_mirror_places_a_server_at_referral_glue_before_the_reply_leaves() {
     });
 }
 
+/// The mirror's server addresses are the root letters it was given and
+/// each server it places, which an observer already finds in the filing
+/// that placed it. An address answered for a web name is none of them.
+#[test]
+fn the_mirror_knows_its_server_addresses_before_observers_run() {
+    world(Duration::from_secs(60), |fcx| async move {
+        let hierarchy = Hierarchy::new();
+        let at = place();
+        let (attacher, attachments) = fictionet::attachments();
+        let net = Net::new().ipv4_only();
+        let handle = net.handle();
+        let ns = v4(45, 33, 5, 53);
+        let mirror = mirror(hierarchy.clone(), handle.clone());
+        let servers = mirror.servers();
+        let seen: Arc<Mutex<Vec<bool>>> = Arc::default();
+        let mirror = {
+            let (servers, seen) = (servers.clone(), seen.clone());
+            mirror.observe(move |_| seen.lock().unwrap().push(servers.contains(ns)))
+        };
+        net.hosts(at.root_servers(|s| mirror.server(s)))
+            .start(&fcx, attachments)?;
+        let m = machine(&fcx, attacher.attach("client")?, ME);
+        let a_root = ROOT_SERVERS[0].v4;
+        assert!(servers.contains(a_root.into()));
+        assert!(!servers.contains(ns));
+
+        ask(
+            &fcx,
+            &m,
+            a_root,
+            &query(1, "www.direct.", RecordType::A, false),
+        )
+        .await
+        .expect("a referral");
+        let seen = seen.lock().unwrap().clone();
+        assert!(
+            !seen.is_empty() && seen.iter().all(|&known| known),
+            "{seen:?}"
+        );
+        assert!(servers.contains(ns));
+
+        let reply = ask(&fcx, &m, ns, &query(2, "www.direct.", RecordType::A, false))
+            .await
+            .expect("an answer");
+        assert_eq!(addresses(&reply), vec![v4(45, 33, 5, 80)]);
+        assert!(!servers.contains(v4(45, 33, 5, 80)));
+        Ok(())
+    });
+}
+
 /// A zone transfer asked of a mirrored name server is refused: zone data
 /// makes answers to questions, never a listing of a whole zone, and no
 /// transfer is ever looked up at the real server.
