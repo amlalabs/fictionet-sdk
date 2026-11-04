@@ -85,6 +85,7 @@
 //! ```
 
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use smoltcp::wire::TcpSeqNumber;
 
 use fictionet::stdlib::codec::{Reader, Truncated, Wire};
 
@@ -182,7 +183,7 @@ pub enum MptcpOption {
     /// the mapping whose checksum failed.
     Fail {
         /// The full 64-bit data sequence number.
-        data_sequence_number: u64,
+        data_sequence_number: DataSequence,
     },
     /// MP_FASTCLOSE (section 3.5): closes the whole connection at once.
     FastClose {
@@ -286,6 +287,67 @@ pub enum Join {
     },
 }
 
+/// A full MPTCP data sequence number, modulo 2^64.
+///
+/// Serial ordering is defined only within a half-space. In particular,
+/// numbers exactly 2^63 apart have no order. There is deliberately no `Ord`:
+/// sequence numbers cannot be sorted as ordinary integers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct DataSequence(u64);
+
+impl DataSequence {
+    /// Reads the bits of a full data sequence number from the wire or digest.
+    pub const fn new(bits: u64) -> Self {
+        Self(bits)
+    }
+
+    /// The bits to write to a full-width wire field.
+    pub const fn to_bits(self) -> u64 {
+        self.0
+    }
+
+    /// The low 32 bits used by a short DSS field.
+    pub const fn short(self) -> u32 {
+        self.0 as u32
+    }
+
+    /// Advances within the serial half-space, wrapping at 2^64.
+    ///
+    /// Panics if the increment is at least 2^63, whose order is undefined.
+    pub fn advance(self, bytes: u64) -> Self {
+        assert!(
+            bytes <= i64::MAX as u64,
+            "data sequence increment exceeds half-space"
+        );
+        Self(self.0.wrapping_add(bytes))
+    }
+
+    /// Signed serial displacement from `other`, or `None` at exactly 2^63.
+    pub fn offset_from(self, other: Self) -> Option<i64> {
+        let distance = self.0.wrapping_sub(other.0) as i64;
+        (distance != i64::MIN).then_some(distance)
+    }
+
+    /// Whether this number is at or before `other` in serial order.
+    /// An ambiguous half-space distance returns false.
+    pub fn at_or_before(self, other: Self) -> bool {
+        self.offset_from(other)
+            .is_some_and(|distance| distance <= 0)
+    }
+
+    /// Expands a DSS field near this position. A short field exactly half
+    /// its 32-bit space away goes backward; a full field is already expanded.
+    pub fn expand(self, sequence: Sequence) -> Self {
+        match sequence {
+            Sequence::Long(full) => full,
+            Sequence::Short(low) => {
+                let distance = low.wrapping_sub(self.short()) as i32;
+                Self(self.0.wrapping_add_signed(i64::from(distance)))
+            }
+        }
+    }
+}
+
 /// A data sequence number or Data ACK in DSS, which a flag makes 4 or 8
 /// octets long. The default is the 8-octet 0.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -293,12 +355,12 @@ pub enum Sequence {
     /// A 4-octet number: the low 32 bits of the 64-bit one.
     Short(u32),
     /// An 8-octet number.
-    Long(u64),
+    Long(DataSequence),
 }
 
 impl Default for Sequence {
     fn default() -> Sequence {
-        Sequence::Long(0)
+        Sequence::Long(DataSequence::new(0))
     }
 }
 
@@ -539,7 +601,9 @@ impl Wire for MptcpOption {
                 let data_ack = match ack_len {
                     0 => None,
                     4 => Some(Sequence::Short(r.u32_be().map_err(short)?)),
-                    _ => Some(Sequence::Long(r.u64_be().map_err(short)?)),
+                    _ => Some(Sequence::Long(DataSequence::new(
+                        r.u64_be().map_err(short)?,
+                    ))),
                 };
                 let mapping = match dsn_len {
                     None => None,
@@ -547,7 +611,7 @@ impl Wire for MptcpOption {
                         data_sequence_number: if n == 4 {
                             Sequence::Short(r.u32_be().map_err(short)?)
                         } else {
-                            Sequence::Long(r.u64_be().map_err(short)?)
+                            Sequence::Long(DataSequence::new(r.u64_be().map_err(short)?))
                         },
                         subflow_sequence_number: r.u32_be().map_err(short)?,
                         data_level_length: r.u16_be().map_err(short)?,
@@ -625,7 +689,7 @@ impl Wire for MptcpOption {
                 let value = r.u64_be().map_err(short)?;
                 if sub == subtype::MP_FAIL {
                     MptcpOption::Fail {
-                        data_sequence_number: value,
+                        data_sequence_number: DataSequence::new(value),
                     }
                 } else {
                     MptcpOption::FastClose {
@@ -773,9 +837,12 @@ impl Wire for MptcpOption {
             }
             MptcpOption::Prio { backup } => b.push(sub | u8::from(*backup)),
             MptcpOption::Fail {
-                data_sequence_number: value,
+                data_sequence_number,
+            } => {
+                b.extend_from_slice(&[sub, 0]);
+                b.extend_from_slice(&data_sequence_number.to_bits().to_be_bytes());
             }
-            | MptcpOption::FastClose {
+            MptcpOption::FastClose {
                 receiver_key: value,
             } => {
                 b.extend_from_slice(&[sub, 0]);
@@ -793,7 +860,7 @@ impl Wire for MptcpOption {
 fn write_sequence(s: Sequence, b: &mut Vec<u8>) {
     match s {
         Sequence::Short(n) => b.extend_from_slice(&n.to_be_bytes()),
-        Sequence::Long(n) => b.extend_from_slice(&n.to_be_bytes()),
+        Sequence::Long(n) => b.extend_from_slice(&n.to_bits().to_be_bytes()),
     }
 }
 
@@ -824,13 +891,13 @@ pub fn token(key: u64) -> u32 {
 ///
 /// ```
 /// use fictionet::stdlib::protocols::mptcp::idsn;
-/// assert_eq!(idsn(0xfedc_ba98_7654_3210), 0x2808_18bf_0fa7_e28e);
+/// assert_eq!(idsn(0xfedc_ba98_7654_3210).to_bits(), 0x2808_18bf_0fa7_e28e);
 /// ```
-pub fn idsn(key: u64) -> u64 {
+pub fn idsn(key: u64) -> DataSequence {
     let d = key_digest(key);
     let mut low = [0; 8];
     low.copy_from_slice(&d[24..]);
-    u64::from_be_bytes(low)
+    DataSequence::new(u64::from_be_bytes(low))
 }
 
 /// The HMAC-SHA256 a host sends in MP_JOIN (RFC 8684 section 3.2): keyed
@@ -869,19 +936,19 @@ pub fn join_hmac(own_key: u64, peer_key: u64, own_random: u32, peer_random: u32)
 /// with no data covers no bytes.
 ///
 /// ```
-/// use fictionet::stdlib::protocols::mptcp::dss_checksum;
-/// let sum = dss_checksum(0x0102_0304_0506_0708, 1, 2, b"hi");
+/// use fictionet::stdlib::protocols::mptcp::{DataSequence, dss_checksum};
+/// let sum = dss_checksum(DataSequence::new(0x0102_0304_0506_0708), 1, 2, b"hi");
 /// assert_eq!(sum, 0x877f);
 /// ```
 pub fn dss_checksum(
-    data_sequence_number: u64,
+    data_sequence_number: DataSequence,
     subflow_sequence_number: u32,
     data_level_length: u16,
     data: &[u8],
 ) -> u16 {
     use fictionet::stdlib::network::ip;
     let mut header = [0; 16];
-    header[..8].copy_from_slice(&data_sequence_number.to_be_bytes());
+    header[..8].copy_from_slice(&data_sequence_number.to_bits().to_be_bytes());
     header[8..12].copy_from_slice(&subflow_sequence_number.to_be_bytes());
     header[12..14].copy_from_slice(&data_level_length.to_be_bytes());
     ip::fold(ip::sum(ip::sum(0, &header), data))
@@ -912,7 +979,9 @@ pub enum AckWidth {
 /// with data, which maps the peer's first bytes from subflow sequence
 /// number 1 (section 3.1). When data the peer sends is outside every
 /// mapping it sent, or the peer sends an infinite mapping, the connection
-/// falls back, and from then on carries no DSS.
+/// falls back only if no data is buffered and no DATA_FIN has been accepted.
+/// Otherwise it fails. Both terminal states release the MPTCP queues; a
+/// failed connection retains only its error and frozen data acknowledgment.
 ///
 /// The peer's DATA_FIN takes the last data sequence number of its mapping
 /// (section 3.3.3), and the Data ACK covers it once every byte before it
@@ -921,23 +990,18 @@ pub enum AckWidth {
 /// no data sequence number.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DataLevel {
-    local_idsn: u64,
-    local_next: u64,
-    remote_idsn: u64,
-    /// This end's and the peer's initial subflow sequence numbers.
-    iss: u32,
-    irs: u32,
+    state: DataState,
     checksums: bool,
-    /// Width of the most recently received mapping.
-    long_ack: bool,
     ack_width: AckWidth,
-    mapped_until: u32,
-    next: u64,
-    mappings: Vec<ReceivedMapping>,
-    ready: Vec<(u64, Vec<u8>)>,
-    data_fin: Option<u64>,
-    fallen_back: bool,
-    error: Option<DataError>,
+}
+
+/// Only the receiving state owns queues and a sender. Failure retains its
+/// error and frozen acknowledgment, with no ability to map or deliver data.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DataState {
+    Receiving { receive: Receiver, send: Sender },
+    FallenBack,
+    Failed { error: DataError, ack: Sequence },
 }
 
 /// Why the data level must close its subflow.
@@ -947,34 +1011,393 @@ pub enum DataError {
     ChecksumMode,
     /// A mapping checksum is invalid.
     Checksum,
-    /// Conflicting mappings or exhausted receive space.
+    /// Conflicting mappings, ambiguous sequence order, or exhausted receive space.
     Mapping,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Transition {
+    /// The first byte of this call that belongs to plain TCP.
+    Plain(usize),
+    Failed(DataError),
+}
+
+impl From<DataError> for Transition {
+    fn from(error: DataError) -> Self {
+        Self::Failed(error)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Sender {
+    initial: DataSequence,
+    state: SendState,
+    iss: TcpSeqNumber,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SendState {
+    Open { next: DataSequence },
+    Finished { fin: DataSequence },
+}
+
+impl SendState {
+    fn next(self) -> DataSequence {
+        match self {
+            Self::Open { next } => next,
+            Self::Finished { fin } => fin.advance(1),
+        }
+    }
+}
+
+impl Sender {
+    fn mapping(
+        &mut self,
+        seq: TcpSeqNumber,
+        payload: &[u8],
+        fin: bool,
+        checksums: bool,
+    ) -> Result<Option<Mapping>, DataError> {
+        let Some(length) = payload
+            .len()
+            .checked_add(usize::from(fin))
+            .and_then(|n| u16::try_from(n).ok())
+        else {
+            return Ok(None);
+        };
+        if length == 0 {
+            return Ok(None);
+        }
+        let offset = seq.relative_to(self.iss);
+        let low = self.initial.advance(u64::from(offset)).short();
+        let start = self.state.next().expand(Sequence::Short(low));
+        let range = DataRange {
+            start,
+            bytes: length - u16::from(fin),
+            fin,
+        };
+        match self.state {
+            SendState::Finished { fin } => range.within(fin)?,
+            SendState::Open { next } => {
+                if fin {
+                    if !next.at_or_before(range.end()) {
+                        return Err(DataError::Mapping);
+                    }
+                    self.state = SendState::Finished { fin: range.end() };
+                } else if next.at_or_before(range.end()) {
+                    self.state = SendState::Open { next: range.end() };
+                }
+            }
+        }
+        let subflow_sequence_number = if payload.is_empty() { 0 } else { offset };
+        Ok(Some(Mapping {
+            data_sequence_number: Sequence::Long(start),
+            subflow_sequence_number,
+            data_level_length: length,
+            checksum: checksums
+                .then(|| dss_checksum(start, subflow_sequence_number, length, payload)),
+        }))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DataRange {
+    start: DataSequence,
+    bytes: u16,
+    fin: bool,
+}
+
+impl DataRange {
+    fn end(self) -> DataSequence {
+        self.start.advance(u64::from(self.bytes))
+    }
+
+    /// Both directions use this rule for a stream whose FIN is fixed.
+    fn within(self, fin: DataSequence) -> Result<(), DataError> {
+        let available = fin.offset_from(self.start).ok_or(DataError::Mapping)?;
+        let bytes = i64::from(self.bytes);
+        if bytes <= available && (!self.fin || bytes == available) {
+            Ok(())
+        } else {
+            Err(DataError::Mapping)
+        }
+    }
+}
+
+/// Admission owns the fixed FIN and every data-level byte. Pending mappings
+/// and completed mappings pass through the same boundary rule, since a FIN
+/// can arrive between the announcement of a mapping and its completion.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DataStream {
+    next: DataSequence,
+    fin: Option<DataSequence>,
+    ready: Vec<(DataSequence, Vec<u8>)>,
+}
+
+impl DataStream {
+    fn admit(&mut self, range: DataRange, data: Option<Vec<u8>>) -> Result<(), DataError> {
+        let end = range.end();
+        let skip = self
+            .next
+            .offset_from(range.start)
+            .ok_or(DataError::Mapping)?;
+        if let Some(fin) = self.fin {
+            range.within(fin)?;
+        }
+        if range.fin
+            && (!self.next.at_or_before(end)
+                || self.ready.iter().any(|(start, bytes)| {
+                    DataRange {
+                        start: *start,
+                        bytes: bytes.len() as u16,
+                        fin: false,
+                    }
+                    .within(end)
+                    .is_err()
+                }))
+        {
+            return Err(DataError::Mapping);
+        }
+        if let Some(data) = data {
+            if range.fin {
+                self.fin = Some(end);
+            }
+            // Reinjection cannot deliver already acknowledged bytes again.
+            if !data.is_empty() && skip < i64::from(range.bytes) {
+                let skip = skip.max(0) as usize;
+                self.ready
+                    .push((range.start.advance(skip as u64), data[skip..].to_vec()));
+            }
+        }
+        Ok(())
+    }
+
+    fn deliver(&mut self, out: &mut Vec<u8>) {
+        while let Some((index, skip)) =
+            self.ready
+                .iter()
+                .enumerate()
+                .find_map(|(index, (start, bytes))| {
+                    let skip = usize::try_from(self.next.offset_from(*start)?).ok()?;
+                    (skip < bytes.len()).then_some((index, skip))
+                })
+        {
+            let (_, bytes) = self.ready.remove(index);
+            out.extend_from_slice(&bytes[skip..]);
+            self.next = self.next.advance((bytes.len() - skip) as u64);
+        }
+        self.ready.retain(|(start, bytes)| {
+            self.next
+                .offset_from(*start)
+                .is_none_or(|skip| skip < bytes.len() as i64)
+        });
+    }
+
+    fn ack(&self) -> DataSequence {
+        self.next.advance(u64::from(self.fin == Some(self.next)))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Receiver {
+    initial: DataSequence,
+    irs: TcpSeqNumber,
+    long_ack: bool,
+    mapped_until: TcpSeqNumber,
+    mappings: Vec<ReceivedMapping>,
+    stream: DataStream,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ReceivedMapping {
-    /// Whether [`DataLevel::new`] made it from the handshake's
-    /// MP_CAPABLE with data, before that option is read again.
+    /// The handshake's MP_CAPABLE mapping takes its original option once.
     seeded: bool,
-    start: u32,
-    dsn: u64,
+    start: TcpSeqNumber,
+    range: DataRange,
     mapping: Mapping,
-    fin: bool,
     data: Vec<u8>,
 }
 
+impl Receiver {
+    fn ack(&self, width: AckWidth) -> Sequence {
+        let next = self.stream.ack();
+        if width == AckWidth::Full || self.long_ack {
+            Sequence::Long(next)
+        } else {
+            Sequence::Short(next.short())
+        }
+    }
+
+    fn fallback(&self, offset: usize) -> Transition {
+        if self.stream.fin.is_some()
+            || !self.stream.ready.is_empty()
+            || self.mappings.iter().any(|m| !m.data.is_empty())
+        {
+            Transition::Failed(DataError::Mapping)
+        } else {
+            Transition::Plain(offset)
+        }
+    }
+
+    fn received(
+        &mut self,
+        seq: TcpSeqNumber,
+        payload: usize,
+        checksums: bool,
+        options: impl IntoIterator<Item = MptcpOption>,
+    ) -> Result<bool, Transition> {
+        if payload > i32::MAX as usize {
+            return Err(DataError::Mapping.into());
+        }
+        let mut answer = false;
+        for option in options {
+            let (mapping, fin) = match option {
+                MptcpOption::Dss(Dss {
+                    mapping: Some(mapping),
+                    data_fin,
+                    ..
+                }) => (mapping, data_fin),
+                MptcpOption::Capable(Capable {
+                    keys:
+                        Keys::Data {
+                            data_level_length,
+                            checksum,
+                            ..
+                        },
+                    ..
+                }) => (
+                    Mapping {
+                        data_sequence_number: Sequence::Long(self.initial.advance(1)),
+                        subflow_sequence_number: 1,
+                        data_level_length,
+                        checksum,
+                    },
+                    false,
+                ),
+                _ => continue,
+            };
+            let length = mapping.data_level_length;
+            if length == 0 {
+                return Err(self.fallback(0));
+            }
+            if mapping.checksum.is_some() != checksums {
+                return Err(DataError::ChecksumMode.into());
+            }
+            self.long_ack = matches!(mapping.data_sequence_number, Sequence::Long(_));
+            let range = DataRange {
+                start: self.stream.next.expand(mapping.data_sequence_number),
+                bytes: length - u16::from(fin),
+                fin,
+            };
+            let start = self.irs.at_offset(mapping.subflow_sequence_number);
+            if range.bytes == 0 {
+                if mapping.checksum.is_some_and(|sum| {
+                    sum != dss_checksum(range.start, mapping.subflow_sequence_number, length, &[])
+                }) {
+                    return Err(DataError::Checksum.into());
+                }
+                self.stream.admit(range, Some(Vec::new()))?;
+            } else {
+                self.stream.admit(range, None)?;
+                let end = start + usize::from(range.bytes);
+                if end > self.mapped_until {
+                    self.mapped_until = end;
+                }
+                if let Some(existing) = self.mappings.iter_mut().find(|m| m.start == start) {
+                    if existing.seeded {
+                        existing.seeded = false;
+                        existing.mapping = mapping;
+                        existing.range = range;
+                    } else if existing.range != range
+                        || existing.mapping.checksum != mapping.checksum
+                    {
+                        return Err(DataError::Mapping.into());
+                    }
+                } else if self.mappings.iter().any(|m| {
+                    start.relative_to(m.start) < u32::from(m.range.bytes)
+                        || m.start.relative_to(start) < u32::from(range.bytes)
+                }) || self.mappings.len() >= 256
+                {
+                    return Err(DataError::Mapping.into());
+                } else {
+                    self.mappings.push(ReceivedMapping {
+                        seeded: false,
+                        start,
+                        range,
+                        mapping,
+                        data: Vec::new(),
+                    });
+                }
+            }
+            answer |= fin;
+        }
+        if payload > 0 && seq + payload > self.mapped_until {
+            return Err(self.fallback(0));
+        }
+        Ok(answer)
+    }
+
+    fn arrived(
+        &mut self,
+        seq: TcpSeqNumber,
+        data: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), Transition> {
+        if data.len() > i32::MAX as usize {
+            return Err(DataError::Mapping.into());
+        }
+        let mut offset = 0;
+        while offset < data.len() {
+            let at = seq + offset;
+            let index = self
+                .mappings
+                .iter()
+                .position(|m| at.relative_to(m.start) < u32::from(m.range.bytes))
+                .ok_or_else(|| self.fallback(offset))?;
+            let m = &mut self.mappings[index];
+            let inside = at.relative_to(m.start) as usize;
+            if inside != m.data.len() {
+                return Err(DataError::Mapping.into());
+            }
+            let count = (usize::from(m.range.bytes) - inside).min(data.len() - offset);
+            m.data.extend_from_slice(&data[offset..offset + count]);
+            offset += count;
+            if m.data.len() == usize::from(m.range.bytes) {
+                let m = self.mappings.remove(index);
+                if m.mapping.checksum.is_some_and(|sum| {
+                    sum != dss_checksum(
+                        m.range.start,
+                        m.mapping.subflow_sequence_number,
+                        m.mapping.data_level_length,
+                        &m.data,
+                    )
+                }) {
+                    return Err(DataError::Checksum.into());
+                }
+                self.stream.admit(m.range, Some(m.data))?;
+            }
+        }
+        self.stream.deliver(out);
+        let buffered = self.mappings.iter().map(|m| m.data.len()).sum::<usize>()
+            + self
+                .stream
+                .ready
+                .iter()
+                .map(|(_, data)| data.len())
+                .sum::<usize>();
+        if buffered > 65_535 {
+            return Err(DataError::Mapping.into());
+        }
+        Ok(())
+    }
+}
+
 impl DataLevel {
-    /// The most option bytes [`sent`](DataLevel::sent) gives a segment: DSS
-    /// with a 64-bit Data ACK, a 64-bit data sequence number and a
-    /// checksum.
+    /// The most option bytes a DSS uses with a full ACK, full mapping and checksum.
     pub const ROOM: usize = 28;
 
-    /// A connection whose keys are `local_key` and `remote_key`, whose
-    /// subflow started at sequence numbers `iss` (this end's SYN) and `irs`
-    /// (the peer's), and which uses DSS checksums when `checksums`.
-    /// `first` is the Data-Level Length of the MP_CAPABLE with data that
-    /// mapped the peer's first bytes on the handshake's ACK, if one did
-    /// (section 3.1).
+    /// A single-subflow connection negotiated with these keys and initial TCP
+    /// sequence numbers. `first` is the MP_CAPABLE third ACK's data length.
     pub fn new(
         local_key: u64,
         remote_key: u64,
@@ -982,42 +1405,53 @@ impl DataLevel {
         irs: u32,
         checksums: bool,
         first: Option<u16>,
-    ) -> DataLevel {
-        DataLevel {
-            local_idsn: idsn(local_key),
-            local_next: idsn(local_key).wrapping_add(1),
-            remote_idsn: idsn(remote_key),
-            iss,
-            irs,
+    ) -> Self {
+        let local = idsn(local_key);
+        let remote = idsn(remote_key);
+        let irs = TcpSeqNumber::new(irs);
+        Self {
             checksums,
-            // MP_CAPABLE maps data relative to the full initial sequence number.
-            long_ack: first.is_some(),
             ack_width: AckWidth::default(),
-            mapped_until: irs
-                .wrapping_add(1)
-                .wrapping_add(u32::from(first.unwrap_or(0))),
-            next: idsn(remote_key).wrapping_add(1),
-            mappings: first
-                .into_iter()
-                .filter(|n| *n > 0)
-                .map(|length| ReceivedMapping {
-                    seeded: true,
-                    start: irs.wrapping_add(1),
-                    dsn: idsn(remote_key).wrapping_add(1),
-                    mapping: Mapping {
-                        data_sequence_number: Sequence::Long(idsn(remote_key).wrapping_add(1)),
-                        subflow_sequence_number: 1,
-                        data_level_length: length,
-                        checksum: None,
+            state: DataState::Receiving {
+                send: Sender {
+                    initial: local,
+                    state: SendState::Open {
+                        next: local.advance(1),
                     },
-                    fin: false,
-                    data: Vec::new(),
-                })
-                .collect(),
-            ready: Vec::new(),
-            data_fin: None,
-            fallen_back: false,
-            error: None,
+                    iss: TcpSeqNumber::new(iss),
+                },
+                receive: Receiver {
+                    initial: remote,
+                    irs,
+                    long_ack: first.is_some(),
+                    mapped_until: irs + 1 + usize::from(first.unwrap_or(0)),
+                    mappings: first
+                        .into_iter()
+                        .filter(|n| *n > 0)
+                        .map(|length| ReceivedMapping {
+                            seeded: true,
+                            start: irs + 1,
+                            range: DataRange {
+                                start: remote.advance(1),
+                                bytes: length,
+                                fin: false,
+                            },
+                            mapping: Mapping {
+                                data_sequence_number: Sequence::Long(remote.advance(1)),
+                                subflow_sequence_number: 1,
+                                data_level_length: length,
+                                checksum: None,
+                            },
+                            data: Vec::new(),
+                        })
+                        .collect(),
+                    stream: DataStream {
+                        next: remote.advance(1),
+                        fin: None,
+                        ready: Vec::new(),
+                    },
+                },
+            },
         }
     }
 
@@ -1029,335 +1463,93 @@ impl DataLevel {
 
     /// Whether the connection has fallen back to plain TCP.
     pub fn fallen_back(&self) -> bool {
-        self.fallen_back
-    }
-
-    /// Takes a segment from the peer in the subflow's receive window: its
-    /// sequence number, how many bytes of data it carries, whether it
-    /// carries a FIN, and its MPTCP options. Returns whether this end
-    /// acknowledges it at once though it may carry no data: it carries a
-    /// DATA_FIN.
-    pub fn received(
-        &mut self,
-        seq: u32,
-        payload: usize,
-        fin: bool,
-        options: impl IntoIterator<Item = MptcpOption>,
-    ) -> bool {
-        if self.fallen_back || self.error.is_some() {
-            return false;
-        }
-        let mut answer = false;
-        for option in options {
-            let (mapping, data_fin) = match option {
-                MptcpOption::Dss(Dss {
-                    mapping: Some(mapping),
-                    data_fin,
-                    ..
-                }) => (mapping, data_fin),
-                // The same data parameters as DSS, for the peer's first
-                // bytes (section 3.1).
-                MptcpOption::Capable(Capable {
-                    keys:
-                        Keys::Data {
-                            data_level_length,
-                            checksum,
-                            ..
-                        },
-                    ..
-                }) => {
-                    let mapping = Mapping {
-                        data_sequence_number: Sequence::Long(self.remote_idsn.wrapping_add(1)),
-                        subflow_sequence_number: 1,
-                        data_level_length,
-                        checksum,
-                    };
-                    (mapping, false)
-                }
-                _ => continue,
-            };
-            let length = mapping.data_level_length;
-            if length == 0 {
-                self.fallback();
-                return false;
-            }
-            if mapping.checksum.is_some() != self.checksums {
-                self.error = Some(DataError::ChecksumMode);
-                return false;
-            }
-            self.long_ack = matches!(mapping.data_sequence_number, Sequence::Long(_));
-            let bytes = length - u16::from(data_fin);
-            let dsn = self.expand(mapping.data_sequence_number);
-            let end = dsn.wrapping_add(u64::from(bytes));
-            if self
-                .data_fin
-                .is_some_and(|fin| (end.wrapping_sub(fin) as i64) > 0 || (data_fin && end != fin))
-            {
-                self.error = Some(DataError::Mapping);
-                return false;
-            }
-            let start = self.irs.wrapping_add(mapping.subflow_sequence_number);
-            if bytes > 0 {
-                let end = start.wrapping_add(u32::from(bytes));
-                if after(end, self.mapped_until) {
-                    self.mapped_until = end;
-                }
-                if let Some(existing) = self.mappings.iter_mut().find(|m| m.start == start) {
-                    // The mapping `new` seeded from the handshake takes
-                    // the option it came from, checksum included, once.
-                    // Any other mapping must be repeated as it was.
-                    if existing.seeded {
-                        existing.seeded = false;
-                        existing.mapping = mapping;
-                        existing.dsn = dsn;
-                        existing.fin = data_fin;
-                    } else if existing.dsn != dsn
-                        || existing.mapping.data_level_length != mapping.data_level_length
-                        || existing.mapping.checksum != mapping.checksum
-                        || existing.fin != data_fin
-                    {
-                        self.error = Some(DataError::Mapping);
-                    }
-                } else if self.mappings.iter().any(|m| {
-                    let existing_length = u32::from(m.mapping.data_level_length - u16::from(m.fin));
-                    start.wrapping_sub(m.start) < existing_length
-                        || m.start.wrapping_sub(start) < u32::from(bytes)
-                }) {
-                    self.error = Some(DataError::Mapping);
-                } else if self.mappings.len() < 256 {
-                    self.mappings.push(ReceivedMapping {
-                        seeded: false,
-                        start,
-                        dsn,
-                        mapping,
-                        fin: data_fin,
-                        data: Vec::new(),
-                    });
-                } else {
-                    self.error = Some(DataError::Mapping);
-                }
-            } else if let Some(sum) = mapping.checksum
-                && sum != dss_checksum(dsn, mapping.subflow_sequence_number, length, &[])
-            {
-                self.error = Some(DataError::Checksum);
-                return false;
-            }
-            if self.error.is_some() || (data_fin && bytes == 0 && !self.finish(dsn)) {
-                return false;
-            }
-            answer |= data_fin;
-        }
-        let end = seq.wrapping_add(payload as u32);
-        if payload > 0 && after(end, self.mapped_until) {
-            self.fallback();
-            return false;
-        }
-        let _ = fin;
-        answer
-    }
-
-    fn fallback(&mut self) {
-        if self.data_fin.is_some()
-            || !self.ready.is_empty()
-            || self.mappings.iter().any(|m| !m.data.is_empty())
-        {
-            self.error = Some(DataError::Mapping);
-        } else {
-            self.fallen_back = true;
-        }
-    }
-
-    /// A DATA_FIN is immutable and cannot precede bytes already received.
-    fn finish(&mut self, fin: u64) -> bool {
-        if self.data_fin.is_some_and(|previous| previous != fin)
-            || (self.next.wrapping_sub(fin) as i64) > 0
-            || self.ready.iter().any(|(dsn, data)| {
-                (dsn.wrapping_add(data.len() as u64).wrapping_sub(fin) as i64) > 0
-            })
-        {
-            self.error = Some(DataError::Mapping);
-            false
-        } else {
-            self.data_fin = Some(fin);
-            true
-        }
+        matches!(self.state, DataState::FallenBack)
     }
 
     /// The error that requires a subflow reset, if any.
     pub fn error(&self) -> Option<DataError> {
-        self.error
+        match self.state {
+            DataState::Failed { error, .. } => Some(error),
+            _ => None,
+        }
     }
 
-    /// Takes contiguous subflow bytes from sequence number `seq`, and
-    /// appends to `out` the data they complete, in data sequence order.
-    /// When they bring an error, nothing from this call is appended. At
-    /// most one TCP receive window is held back.
+    /// The only lifecycle transition point. Terminal states never invoke the
+    /// operation, and relinquish all mappings and send state.
+    fn update<T>(
+        &mut self,
+        operation: impl FnOnce(&mut Receiver, &mut Sender) -> Result<T, Transition>,
+    ) -> Result<T, Transition> {
+        let (receive, send) = match &mut self.state {
+            DataState::Receiving { receive, send } => (receive, send),
+            DataState::FallenBack => return Err(Transition::Plain(0)),
+            DataState::Failed { error, .. } => return Err(Transition::Failed(*error)),
+        };
+        let result = operation(receive, send);
+        if let Err(exit) = result {
+            self.state = match exit {
+                Transition::Plain(_) => DataState::FallenBack,
+                Transition::Failed(error) => DataState::Failed {
+                    error,
+                    ack: receive.ack(self.ack_width),
+                },
+            };
+        }
+        result
+    }
+
+    /// Takes an in-window segment's mapping options. A DATA_FIN asks for an
+    /// immediate ACK. A subflow FIN alone does not close the data stream.
+    pub fn received(
+        &mut self,
+        seq: u32,
+        payload: usize,
+        options: impl IntoIterator<Item = MptcpOption>,
+    ) -> bool {
+        let checksums = self.checksums;
+        self.update(|receive, _| {
+            receive.received(TcpSeqNumber::new(seq), payload, checksums, options)
+        })
+        .unwrap_or(false)
+    }
+
+    /// Takes contiguous subflow bytes and appends completed data in data order.
+    /// On failure this call appends nothing. At most one TCP window is buffered.
     pub fn arrived(&mut self, seq: u32, data: &[u8], out: &mut Vec<u8>) {
         let before = out.len();
-        if self.error.is_some() {
-            return;
-        }
-        if self.fallen_back {
-            out.extend_from_slice(data);
-            return;
-        }
-        let mut offset = 0;
-        while offset < data.len() {
-            let at = seq.wrapping_add(offset as u32);
-            let Some(index) = self.mappings.iter().position(|m| {
-                at.wrapping_sub(m.start) < u32::from(m.mapping.data_level_length - u16::from(m.fin))
-            }) else {
-                self.fallback();
-                if self.error.is_none() {
-                    out.extend_from_slice(&data[offset..]);
-                } else {
-                    out.truncate(before);
-                }
-                return;
-            };
-            let m = &mut self.mappings[index];
-            let inside = at.wrapping_sub(m.start) as usize;
-            if inside != m.data.len() {
-                self.error = Some(DataError::Mapping);
-                return;
-            }
-            let length = usize::from(m.mapping.data_level_length) - usize::from(m.fin);
-            let count = (length - inside).min(data.len() - offset);
-            m.data.extend_from_slice(&data[offset..offset + count]);
-            offset += count;
-            if m.data.len() == length {
-                let m = self.mappings.remove(index);
-                if let Some(sum) = m.mapping.checksum
-                    && sum
-                        != dss_checksum(
-                            m.dsn,
-                            m.mapping.subflow_sequence_number,
-                            m.mapping.data_level_length,
-                            &m.data,
-                        )
-                {
-                    self.error = Some(DataError::Checksum);
-                    out.truncate(before);
-                    return;
-                }
-                let end = m.dsn.wrapping_add(length as u64);
-                if self
-                    .data_fin
-                    .is_some_and(|fin| (end.wrapping_sub(fin) as i64) > 0)
-                    || (m.fin && !self.finish(end))
-                {
-                    self.error = Some(DataError::Mapping);
-                    out.truncate(before);
-                    return;
-                }
-                // Reinjected bytes already acknowledged at the data level are ignored.
-                let skip = self.next.wrapping_sub(m.dsn) as i64;
-                if skip < length as i64 {
-                    let skip = skip.max(0) as usize;
-                    self.ready
-                        .push((m.dsn.wrapping_add(skip as u64), m.data[skip..].to_vec()));
-                }
-            }
-        }
-        while let Some(index) = self.ready.iter().position(|(dsn, bytes)| {
-            let skip = self.next.wrapping_sub(*dsn) as i64;
-            skip >= 0 && skip < bytes.len() as i64
-        }) {
-            let (dsn, bytes) = self.ready.remove(index);
-            let skip = self.next.wrapping_sub(dsn) as usize;
-            out.extend_from_slice(&bytes[skip..]);
-            self.next = self.next.wrapping_add((bytes.len() - skip) as u64);
-        }
-        self.ready
-            .retain(|(dsn, bytes)| (self.next.wrapping_sub(*dsn) as i64) < bytes.len() as i64);
-        let buffered = self.mappings.iter().map(|m| m.data.len()).sum::<usize>()
-            + self
-                .ready
-                .iter()
-                .map(|(_, bytes)| bytes.len())
-                .sum::<usize>();
-        if buffered > 65_535 {
-            self.error = Some(DataError::Mapping);
-            out.truncate(before);
+        match self.update(|receive, _| receive.arrived(TcpSeqNumber::new(seq), data, out)) {
+            Ok(()) => (),
+            Err(Transition::Plain(offset)) => out.extend_from_slice(&data[offset..]),
+            Err(Transition::Failed(_)) => out.truncate(before),
         }
     }
 
-    /// The full data sequence number of `sequence`, from the peer: a
-    /// 4-octet one is taken as the 64-bit number nearest the next byte
-    /// this end expects at the data level.
-    fn expand(&self, sequence: Sequence) -> u64 {
-        sequence.expand(self.next)
-    }
-
-    /// The DSS for a segment this end sends: its sequence number, its
-    /// data, whether it carries a FIN, and its acknowledgment number.
-    /// `None` once the connection has fallen back.
-    pub fn sent(&mut self, seq: u32, payload: &[u8], fin: bool, ack: Option<u32>) -> Option<Dss> {
-        if self.fallen_back {
-            return None;
+    /// The outgoing DSS, or none in plain TCP. Failed connections can repeat
+    /// only their frozen data ACK; they cannot create new mappings.
+    pub fn sent(&mut self, seq: u32, payload: &[u8], fin: bool, acknowledge: bool) -> Option<Dss> {
+        if let DataState::Failed { ack, .. } = self.state {
+            return acknowledge.then_some(Dss {
+                data_ack: Some(ack),
+                mapping: None,
+                data_fin: false,
+            });
         }
-        let data_ack = ack.map(|_| {
-            let mut next = self.next;
-            if self.data_fin == Some(next) {
-                next = next.wrapping_add(1);
+        let (checksums, width) = (self.checksums, self.ack_width);
+        self.update(|receive, send| {
+            let mapping = send.mapping(TcpSeqNumber::new(seq), payload, fin, checksums)?;
+            if (!payload.is_empty() || fin) && mapping.is_none() {
+                return Ok(None);
             }
-            if self.ack_width == AckWidth::Full || self.long_ack {
-                Sequence::Long(next)
-            } else {
-                Sequence::Short(next as u32)
-            }
-        });
-        let length = u16::try_from(payload.len() + usize::from(fin)).ok()?;
-        let mapping = (length > 0).then(|| {
-            let offset = seq.wrapping_sub(self.iss);
-            let data_sequence_number =
-                Sequence::Short((self.local_idsn as u32).wrapping_add(offset))
-                    .expand(self.local_next);
-            let end = data_sequence_number.wrapping_add(u64::from(length));
-            if (end.wrapping_sub(self.local_next) as i64) > 0 {
-                self.local_next = end;
-            }
-            // A DATA_FIN on a segment with no data maps no subflow bytes.
-            let subflow_sequence_number = if payload.is_empty() { 0 } else { offset };
-            Mapping {
-                data_sequence_number: Sequence::Long(data_sequence_number),
-                subflow_sequence_number,
-                data_level_length: length,
-                checksum: self.checksums.then(|| {
-                    dss_checksum(
-                        data_sequence_number,
-                        subflow_sequence_number,
-                        length,
-                        payload,
-                    )
-                }),
-            }
-        });
-        (data_ack.is_some() || mapping.is_some()).then_some(Dss {
-            data_ack,
-            mapping,
-            data_fin: fin,
+            let data_ack = acknowledge.then(|| receive.ack(width));
+            Ok((mapping.is_some() || data_ack.is_some()).then_some(Dss {
+                data_ack,
+                mapping,
+                data_fin: fin,
+            }))
         })
+        .ok()
+        .flatten()
     }
-}
-
-impl Sequence {
-    /// Expands a short sequence to the full number nearest `near`, modulo
-    /// the 64-bit data sequence space. The half-window tie goes backward.
-    pub fn expand(self, near: u64) -> u64 {
-        match self {
-            Sequence::Long(n) => n,
-            Sequence::Short(low) => {
-                let offset = low.wrapping_sub(near as u32) as i32;
-                near.wrapping_add_signed(i64::from(offset))
-            }
-        }
-    }
-}
-
-/// Whether sequence number `a` is after `b`, modulo 2^32.
-fn after(a: u32, b: u32) -> bool {
-    (a.wrapping_sub(b) as i32) > 0
 }
 
 #[cfg(test)]
@@ -1501,9 +1693,9 @@ mod tests {
         // Section 3.1: the most significant 32 bits and the least
         // significant 64 bits of SHA-256 over the key in network order.
         assert_eq!(token(KEY_A), 0x55c5_3f5d);
-        assert_eq!(idsn(KEY_A), 0x5707_62cd_38be_9818);
+        assert_eq!(idsn(KEY_A).to_bits(), 0x5707_62cd_38be_9818);
         assert_eq!(token(KEY_B), 0x18f9_781b);
-        assert_eq!(idsn(KEY_B), 0x2808_18bf_0fa7_e28e);
+        assert_eq!(idsn(KEY_B).to_bits(), 0x2808_18bf_0fa7_e28e);
     }
 
     #[test]
@@ -1565,9 +1757,9 @@ mod tests {
         option.extend_from_slice(&0x1112_1314_1516_1718u64.to_be_bytes());
         option.extend_from_slice(&[0, 0, 0, 1, 0x05, 0xa0, 0xab, 0xcd]);
         let dss = Dss {
-            data_ack: Some(Sequence::Long(0x0102_0304_0506_0708)),
+            data_ack: Some(Sequence::Long(DataSequence::new(0x0102_0304_0506_0708))),
             mapping: Some(Mapping {
-                data_sequence_number: Sequence::Long(0x1112_1314_1516_1718),
+                data_sequence_number: Sequence::Long(DataSequence::new(0x1112_1314_1516_1718)),
                 subflow_sequence_number: 1,
                 data_level_length: 1440,
                 checksum: Some(0xabcd),
@@ -1591,7 +1783,11 @@ mod tests {
 
     #[test]
     fn dss_lengths_follow_the_flags() {
-        let sequences = [None, Some(Sequence::Short(9)), Some(Sequence::Long(9))];
+        let sequences = [
+            None,
+            Some(Sequence::Short(9)),
+            Some(Sequence::Long(DataSequence::new(9))),
+        ];
         for data_ack in sequences {
             for dsn in sequences {
                 for checksum in [None, Some(0x1234)] {
@@ -1720,7 +1916,7 @@ mod tests {
         figure(
             &option,
             &MptcpOption::Fail {
-                data_sequence_number: u64::MAX,
+                data_sequence_number: DataSequence::new(u64::MAX),
             },
         );
         figure(
@@ -1901,7 +2097,7 @@ mod tests {
             if rng.coin() {
                 Sequence::Short(rng.next() as u32)
             } else {
-                Sequence::Long(rng.next())
+                Sequence::Long(DataSequence::new(rng.next()))
             }
         };
         let maybe16 = |rng: &mut Lcg| rng.coin().then(|| rng.next() as u16);
@@ -1975,7 +2171,7 @@ mod tests {
             },
             5 => MptcpOption::Prio { backup: rng.coin() },
             6 => MptcpOption::Fail {
-                data_sequence_number: rng.next(),
+                data_sequence_number: DataSequence::new(rng.next()),
             },
             7 => MptcpOption::FastClose {
                 receiver_key: rng.next(),
@@ -2045,7 +2241,10 @@ mod tests {
             while sum > 0xffff {
                 sum = (sum & 0xffff) + (sum >> 16);
             }
-            assert_eq!(dss_checksum(dsn, ssn, len, data), !(sum as u16));
+            assert_eq!(
+                dss_checksum(DataSequence::new(dsn), ssn, len, data),
+                !(sum as u16)
+            );
         }
     }
 
@@ -2071,13 +2270,13 @@ mod tests {
     #[test]
     fn a_data_level_maps_what_it_sends_and_acknowledges_what_it_got() {
         let mut level = DataLevel::new(KEY_B, KEY_A, ISS, IRS, false, None);
-        let first = level.sent(ISS.wrapping_add(1), b"SSH-2.0", false, Some(IRS + 1));
+        let first = level.sent(ISS.wrapping_add(1), b"SSH-2.0", false, true);
         assert_eq!(
             first,
             Some(Dss {
-                data_ack: Some(Sequence::Long(idsn(KEY_A).wrapping_add(1))),
+                data_ack: Some(Sequence::Long(idsn(KEY_A).advance(1))),
                 mapping: Some(Mapping {
-                    data_sequence_number: Sequence::Long(idsn(KEY_B).wrapping_add(1)),
+                    data_sequence_number: Sequence::Long(idsn(KEY_B).advance(1)),
                     subflow_sequence_number: 1,
                     data_level_length: 7,
                     checksum: None,
@@ -2089,24 +2288,24 @@ mod tests {
         assert!(bytes.len() + 2 <= DataLevel::ROOM);
         // The peer maps 5 bytes with a 64-bit number: the ACK now has 8
         // octets, and covers them.
-        let dsn = Sequence::Long(idsn(KEY_A).wrapping_add(1));
-        level.received(IRS + 1, 5, false, [mapping(dsn, 1, 5)]);
+        let dsn = Sequence::Long(idsn(KEY_A).advance(1));
+        level.received(IRS + 1, 5, [mapping(dsn, 1, 5)]);
         level.arrived(IRS + 1, b"hello", &mut Vec::new());
         assert_eq!(
-            level.sent(ISS.wrapping_add(8), b"", false, Some(IRS + 6)),
+            level.sent(ISS.wrapping_add(8), b"", false, true),
             Some(Dss {
-                data_ack: Some(Sequence::Long(idsn(KEY_A).wrapping_add(6))),
+                data_ack: Some(Sequence::Long(idsn(KEY_A).advance(6))),
                 mapping: None,
                 data_fin: false,
             })
         );
         // The FIN carries DATA_FIN, with no subflow bytes mapped.
         assert_eq!(
-            level.sent(ISS.wrapping_add(8), b"", true, Some(IRS + 6)),
+            level.sent(ISS.wrapping_add(8), b"", true, true),
             Some(Dss {
-                data_ack: Some(Sequence::Long(idsn(KEY_A).wrapping_add(6))),
+                data_ack: Some(Sequence::Long(idsn(KEY_A).advance(6))),
                 mapping: Some(Mapping {
-                    data_sequence_number: Sequence::Long(idsn(KEY_B).wrapping_add(8)),
+                    data_sequence_number: Sequence::Long(idsn(KEY_B).advance(8)),
                     subflow_sequence_number: 0,
                     data_level_length: 1,
                     checksum: None,
@@ -2115,11 +2314,11 @@ mod tests {
             })
         );
         // A FIN from the peer without DATA_FIN is not data.
-        level.received(IRS + 6, 0, true, []);
-        let dss = level.sent(ISS.wrapping_add(9), b"", false, Some(IRS + 7));
+        level.received(IRS + 6, 0, []);
+        let dss = level.sent(ISS.wrapping_add(9), b"", false, true);
         assert_eq!(
             dss.unwrap().data_ack,
-            Some(Sequence::Long(idsn(KEY_A).wrapping_add(6)))
+            Some(Sequence::Long(idsn(KEY_A).advance(6)))
         );
         assert!(!level.fallen_back());
     }
@@ -2129,9 +2328,9 @@ mod tests {
     fn a_data_level_with_checksums_sums_each_mapping() {
         let mut level = DataLevel::new(KEY_B, KEY_A, ISS, IRS, true, None);
         let dss = level
-            .sent(ISS.wrapping_add(3), b"abc", false, Some(IRS + 1))
+            .sent(ISS.wrapping_add(3), b"abc", false, true)
             .unwrap();
-        let dsn = idsn(KEY_B).wrapping_add(3);
+        let dsn = idsn(KEY_B).advance(3);
         let mapping = dss.mapping.unwrap();
         assert_eq!(mapping.checksum, Some(dss_checksum(dsn, 3, 3, b"abc")));
         let bytes = MptcpOption::Dss(dss).to_bytes().unwrap();
@@ -2142,21 +2341,21 @@ mod tests {
     /// makes the connection fall back: no more DSS.
     #[test]
     fn a_data_level_falls_back_on_unmapped_data() {
-        let dsn = Sequence::Short(idsn(KEY_A) as u32 + 1);
+        let dsn = Sequence::Short(idsn(KEY_A).advance(1).short());
         // Data the MP_CAPABLE on the third ACK mapped is fine.
         let mut level = DataLevel::new(KEY_B, KEY_A, ISS, IRS, false, Some(10));
-        level.received(IRS + 1, 10, false, []);
+        level.received(IRS + 1, 10, []);
         assert!(!level.fallen_back());
-        level.received(IRS + 11, 4, false, [mapping(dsn, 11, 2)]);
+        level.received(IRS + 11, 4, [mapping(dsn, 11, 2)]);
         assert!(level.fallen_back(), "two bytes past the mapping");
-        assert_eq!(level.sent(ISS + 1, b"x", false, Some(IRS + 15)), None);
+        assert_eq!(level.sent(ISS + 1, b"x", false, true), None);
 
         let mut level = DataLevel::new(KEY_B, KEY_A, ISS, IRS, false, None);
-        level.received(IRS + 1, 1, false, []);
+        level.received(IRS + 1, 1, []);
         assert!(level.fallen_back(), "data with no mapping");
 
         let mut level = DataLevel::new(KEY_B, KEY_A, ISS, IRS, false, None);
-        level.received(IRS + 1, 0, false, [mapping(dsn, 1, 0)]);
+        level.received(IRS + 1, 0, [mapping(dsn, 1, 0)]);
         assert!(level.fallen_back(), "an infinite mapping");
     }
 
@@ -2166,11 +2365,11 @@ mod tests {
     #[test]
     fn a_data_level_refuses_a_conflicting_mapping() {
         let mut level = DataLevel::new(KEY_B, KEY_A, ISS, IRS, false, None);
-        let dsn = |offset: u64| Sequence::Long(idsn(KEY_A).wrapping_add(offset));
-        level.received(IRS + 1, 0, false, [mapping(dsn(1), 1, 5)]);
-        level.received(IRS + 1, 0, false, [mapping(dsn(1), 1, 5)]);
+        let dsn = |offset: u64| Sequence::Long(idsn(KEY_A).advance(offset));
+        level.received(IRS + 1, 0, [mapping(dsn(1), 1, 5)]);
+        level.received(IRS + 1, 0, [mapping(dsn(1), 1, 5)]);
         assert_eq!(level.error(), None, "the same mapping again");
-        level.received(IRS + 1, 0, false, [mapping(dsn(9), 1, 5)]);
+        level.received(IRS + 1, 0, [mapping(dsn(9), 1, 5)]);
         assert_eq!(level.error(), Some(DataError::Mapping));
     }
 
@@ -2193,19 +2392,19 @@ mod tests {
                 checksum: None,
             },
         });
-        assert!(!level.received(IRS + 1, 5, false, [first.clone()]));
+        assert!(!level.received(IRS + 1, 5, [first.clone()]));
         assert!(!level.fallen_back());
         // A retransmission carries the same immutable mapping.
-        level.received(IRS + 1, 5, false, [first]);
+        level.received(IRS + 1, 5, [first]);
         level.arrived(IRS + 1, b"hello", &mut Vec::new());
         assert!(!level.fallen_back());
-        let dss = level.sent(ISS.wrapping_add(1), b"HTTP", false, Some(IRS + 6));
+        let dss = level.sent(ISS.wrapping_add(1), b"HTTP", false, true);
         assert_eq!(
             dss.unwrap().data_ack,
-            Some(Sequence::Long(idsn(KEY_A).wrapping_add(6)))
+            Some(Sequence::Long(idsn(KEY_A).advance(6)))
         );
         // Its mapping covers those 5 bytes and no more.
-        level.received(IRS + 6, 1, false, []);
+        level.received(IRS + 6, 1, []);
         assert!(level.fallen_back());
     }
 
@@ -2216,15 +2415,15 @@ mod tests {
     fn a_data_level_acknowledges_a_data_fin_alone() {
         for long in [true, false] {
             let at = |n: u64| {
-                let dsn = idsn(KEY_A).wrapping_add(n);
+                let dsn = idsn(KEY_A).advance(n);
                 if long {
                     Sequence::Long(dsn)
                 } else {
-                    Sequence::Short(dsn as u32)
+                    Sequence::Short(dsn.short())
                 }
             };
             let mut level = DataLevel::new(KEY_B, KEY_A, ISS, IRS, false, None);
-            assert!(!level.received(IRS + 1, 5, false, [mapping(at(1), 1, 5)]));
+            assert!(!level.received(IRS + 1, 5, [mapping(at(1), 1, 5)]));
             level.arrived(IRS + 1, b"hello", &mut Vec::new());
             let data_fin = MptcpOption::Dss(Dss {
                 data_ack: None,
@@ -2236,23 +2435,23 @@ mod tests {
                 }),
                 data_fin: true,
             });
-            assert!(level.received(IRS + 6, 0, false, [data_fin.clone()]));
-            let data_ack = |level: &mut DataLevel, ack| {
-                let dss = level.sent(ISS.wrapping_add(1), b"", false, Some(ack));
+            assert!(level.received(IRS + 6, 0, [data_fin.clone()]));
+            let data_ack = |level: &mut DataLevel| {
+                let dss = level.sent(ISS.wrapping_add(1), b"", false, true);
                 match dss.unwrap().data_ack.unwrap() {
                     Sequence::Long(n) => n,
                     Sequence::Short(_) => panic!("default Data ACKs use the full sequence number"),
                 }
             };
-            let after_data_fin = idsn(KEY_A).wrapping_add(7);
+            let after_data_fin = idsn(KEY_A).advance(7);
             let expected = after_data_fin;
-            assert_eq!(data_ack(&mut level, IRS + 6), expected);
+            assert_eq!(data_ack(&mut level), expected);
             // Sent again, it is acknowledged again, and counts once.
-            assert!(level.received(IRS + 6, 0, false, [data_fin]));
-            assert_eq!(data_ack(&mut level, IRS + 6), expected);
+            assert!(level.received(IRS + 6, 0, [data_fin]));
+            assert_eq!(data_ack(&mut level), expected);
             // The subflow's FIN, without DATA_FIN.
-            assert!(!level.received(IRS + 6, 0, true, []));
-            assert_eq!(data_ack(&mut level, IRS + 7), expected);
+            assert!(!level.received(IRS + 6, 0, []));
+            assert_eq!(data_ack(&mut level), expected);
             assert!(!level.fallen_back());
         }
     }
@@ -2262,7 +2461,7 @@ mod tests {
     #[test]
     fn a_data_level_acknowledges_a_data_fin_in_order() {
         let mut level = DataLevel::new(KEY_B, KEY_A, ISS, IRS, false, None);
-        let dsn = |n: u64| Sequence::Long(idsn(KEY_A).wrapping_add(n));
+        let dsn = |n: u64| Sequence::Long(idsn(KEY_A).advance(n));
         // Data and DATA_FIN in one mapping, with the FIN: 3 bytes, then the
         // DATA_FIN.
         let last = MptcpOption::Dss(Dss {
@@ -2275,22 +2474,22 @@ mod tests {
             }),
             data_fin: true,
         });
-        assert!(level.received(IRS + 3, 3, true, [last]));
-        let data_ack = |level: &mut DataLevel, ack| {
-            let dss = level.sent(ISS.wrapping_add(1), b"", false, Some(ack));
+        assert!(level.received(IRS + 3, 3, [last]));
+        let data_ack = |level: &mut DataLevel| {
+            let dss = level.sent(ISS.wrapping_add(1), b"", false, true);
             dss.unwrap().data_ack.unwrap()
         };
         // Bytes 1 and 2 are missing: the subflow ACK stays at 1.
-        assert_eq!(data_ack(&mut level, IRS + 1), dsn(1));
-        level.received(IRS + 1, 2, false, [mapping(dsn(1), 1, 2)]);
+        assert_eq!(data_ack(&mut level), dsn(1));
+        level.received(IRS + 1, 2, [mapping(dsn(1), 1, 2)]);
         level.arrived(IRS + 1, b"hello", &mut Vec::new());
         // All 5 bytes and the FIN: the DATA_FIN is covered.
-        assert_eq!(data_ack(&mut level, IRS + 7), dsn(7));
+        assert_eq!(data_ack(&mut level), dsn(7));
         assert!(!level.fallen_back());
     }
     #[test]
     fn checksums_gate_delivery_until_the_whole_mapping_arrives() {
-        let dsn = idsn(KEY_A).wrapping_add(1);
+        let dsn = idsn(KEY_A).advance(1);
         for checksum in [None, Some(0), Some(dss_checksum(dsn, 1, 5, b"hello"))] {
             let mut level = DataLevel::new(KEY_B, KEY_A, ISS, IRS, true, None);
             let option = MptcpOption::Dss(Dss {
@@ -2303,7 +2502,7 @@ mod tests {
                 }),
                 data_fin: false,
             });
-            level.received(IRS + 1, 2, false, [option]);
+            level.received(IRS + 1, 2, [option]);
             let mut out = Vec::new();
             level.arrived(IRS + 1, b"he", &mut out);
             assert!(out.is_empty());
@@ -2320,7 +2519,6 @@ mod tests {
         level.received(
             IRS + 1,
             1,
-            false,
             [MptcpOption::Dss(Dss {
                 data_ack: None,
                 mapping: Some(Mapping {
@@ -2337,42 +2535,26 @@ mod tests {
 
     #[test]
     fn data_sequence_gaps_are_queued_and_acknowledged_in_full() {
-        let dsn = idsn(KEY_A).wrapping_add(1);
+        let dsn = idsn(KEY_A).advance(1);
         let mut level = DataLevel::new(KEY_B, KEY_A, ISS, IRS, false, None);
-        level.received(
-            IRS + 1,
-            5,
-            false,
-            [mapping(Sequence::Long(dsn.wrapping_add(5)), 1, 5)],
-        );
+        level.received(IRS + 1, 5, [mapping(Sequence::Long(dsn.advance(5)), 1, 5)]);
         let mut out = Vec::new();
         level.arrived(IRS + 1, b"world", &mut out);
         assert!(out.is_empty());
         assert_eq!(
-            level
-                .sent(ISS + 1, b"", false, Some(IRS + 6))
-                .unwrap()
-                .data_ack,
+            level.sent(ISS + 1, b"", false, true).unwrap().data_ack,
             Some(Sequence::Long(dsn))
         );
-        level.received(
-            IRS + 6,
-            5,
-            false,
-            [mapping(Sequence::Short(dsn as u32), 6, 5)],
-        );
+        level.received(IRS + 6, 5, [mapping(Sequence::Short(dsn.short()), 6, 5)]);
         level.arrived(IRS + 6, b"hello", &mut out);
         assert_eq!(out, b"helloworld");
         assert_eq!(
-            level
-                .sent(ISS + 1, b"", false, Some(IRS + 11))
-                .unwrap()
-                .data_ack,
-            Some(Sequence::Long(dsn.wrapping_add(10)))
+            level.sent(ISS + 1, b"", false, true).unwrap().data_ack,
+            Some(Sequence::Long(dsn.advance(10)))
         );
         assert_eq!(level.error(), None);
     }
-    fn end_mapping(dsn: u64) -> MptcpOption {
+    fn end_mapping(dsn: DataSequence) -> MptcpOption {
         MptcpOption::Dss(Dss {
             data_ack: None,
             data_fin: true,
@@ -2387,41 +2569,38 @@ mod tests {
 
     #[test]
     fn data_fin_rejects_later_data_and_fallback() {
-        let first = idsn(KEY_A).wrapping_add(1);
+        let first = idsn(KEY_A).advance(1);
         for mapped in [false, true] {
             let mut level = DataLevel::new(KEY_B, KEY_A, ISS, IRS, false, None);
-            level.received(IRS + 1, 0, false, [end_mapping(first)]);
+            level.received(IRS + 1, 0, [end_mapping(first)]);
             let options = mapped.then(|| mapping(Sequence::Long(first), 1, 1));
-            level.received(IRS + 1, 1, false, options);
+            level.received(IRS + 1, 1, options);
             let mut out = Vec::new();
             level.arrived(IRS + 1, b"x", &mut out);
             assert!(out.is_empty());
             assert_eq!(level.error(), Some(DataError::Mapping));
             assert!(!level.fallen_back());
             assert_eq!(
-                level
-                    .sent(ISS + 1, b"", false, Some(IRS + 2))
-                    .unwrap()
-                    .data_ack,
-                Some(Sequence::Long(first.wrapping_add(1)))
+                level.sent(ISS + 1, b"", false, true).unwrap().data_ack,
+                Some(Sequence::Long(first.advance(1)))
             );
         }
     }
 
     #[test]
     fn data_fin_cannot_move_or_precede_accepted_data() {
-        let first = idsn(KEY_A).wrapping_add(1);
+        let first = idsn(KEY_A).advance(1);
         for buffered in [false, true] {
             let mut level = DataLevel::new(KEY_B, KEY_A, ISS, IRS, false, None);
-            let dsn = first.wrapping_add(u64::from(buffered));
-            level.received(IRS + 1, 1, false, [mapping(Sequence::Long(dsn), 1, 1)]);
+            let dsn = first.advance(u64::from(buffered));
+            level.received(IRS + 1, 1, [mapping(Sequence::Long(dsn), 1, 1)]);
             level.arrived(IRS + 1, b"x", &mut Vec::new());
-            level.received(IRS + 2, 0, false, [end_mapping(first)]);
+            level.received(IRS + 2, 0, [end_mapping(first)]);
             assert_eq!(level.error(), Some(DataError::Mapping));
         }
         let mut level = DataLevel::new(KEY_B, KEY_A, ISS, IRS, false, None);
-        level.received(IRS + 1, 0, false, [end_mapping(first)]);
-        level.received(IRS + 1, 0, false, [end_mapping(first.wrapping_add(1))]);
+        level.received(IRS + 1, 0, [end_mapping(first)]);
+        level.received(IRS + 1, 0, [end_mapping(first.advance(1))]);
         assert_eq!(level.error(), Some(DataError::Mapping));
     }
 
@@ -2431,13 +2610,120 @@ mod tests {
         level.received(
             IRS + 1,
             1,
-            false,
-            [mapping(Sequence::Long(idsn(KEY_A).wrapping_add(1)), 1, 1)],
+            [mapping(Sequence::Long(idsn(KEY_A).advance(1)), 1, 1)],
         );
         assert_eq!(level.error(), Some(DataError::ChecksumMode));
         let failed = level.clone();
-        level.received(IRS + 1, 1, false, []);
+        level.received(IRS + 1, 1, []);
         assert_eq!(level, failed);
+    }
+
+    #[test]
+    fn data_sequences_wrap_and_leave_half_space_unordered() {
+        let zero = DataSequence::new(0);
+        let last = DataSequence::new(u64::MAX);
+        let half = DataSequence::new(1 << 63);
+        assert_eq!(last.advance(1), zero);
+        assert!(last.at_or_before(zero));
+        assert!(!zero.at_or_before(last));
+        assert_eq!(zero.offset_from(last), Some(1));
+        assert_eq!(last.offset_from(zero), Some(-1));
+        assert_eq!(half.offset_from(zero), None);
+        assert_eq!(zero.offset_from(half), None);
+        assert!(!half.at_or_before(zero));
+        assert!(!zero.at_or_before(half));
+    }
+
+    #[test]
+    fn outgoing_fin_is_fixed_and_failed_senders_cannot_map() {
+        let mut level = DataLevel::new(KEY_B, KEY_A, ISS, IRS, false, None);
+        let last = level.sent(ISS + 1, b"ab", true, false).unwrap();
+        assert_eq!(level.sent(ISS + 1, b"ab", true, false), Some(last));
+        assert!(level.sent(ISS + 2, b"b", false, false).is_some());
+        for (seq, payload, fin) in [(ISS + 3, &b"x"[..], false), (ISS + 4, &b""[..], true)] {
+            let mut failed = level.clone();
+            assert_eq!(failed.sent(seq, payload, fin, false), None);
+            assert_eq!(failed.error(), Some(DataError::Mapping));
+            let frozen = failed.clone();
+            assert_eq!(failed.sent(ISS + 1, b"ab", false, false), None);
+            assert_eq!(
+                failed.sent(ISS + 1, b"ab", false, true).unwrap().mapping,
+                None
+            );
+            failed.received(IRS + 1, 1, []);
+            assert_eq!(failed, frozen);
+            assert!(!failed.fallen_back());
+        }
+        let mut level = DataLevel::new(KEY_B, KEY_A, ISS, IRS, false, None);
+        assert!(level.sent(ISS + 1, b"ab", false, false).is_some());
+        assert_eq!(level.sent(ISS + 2, b"", true, false), None);
+        assert_eq!(level.error(), Some(DataError::Mapping));
+    }
+
+    #[test]
+    fn pending_mapping_obeys_a_fin_received_before_completion() {
+        let first = idsn(KEY_A).advance(1);
+        for length in [1, 2] {
+            let mut level = DataLevel::new(KEY_B, KEY_A, ISS, IRS, false, None);
+            level.received(IRS + 1, 2, [mapping(Sequence::Long(first), 1, 2)]);
+            let mut out = Vec::new();
+            level.arrived(IRS + 1, b"a", &mut out);
+            assert!(out.is_empty());
+            level.received(IRS + 2, 0, [end_mapping(first.advance(length))]);
+            level.arrived(IRS + 2, b"b", &mut out);
+            if length == 1 {
+                assert!(out.is_empty());
+                assert_eq!(level.error(), Some(DataError::Mapping));
+            } else {
+                assert_eq!(out, b"ab");
+                assert_eq!(level.error(), None);
+            }
+        }
+    }
+
+    #[test]
+    fn an_out_of_order_data_fin_is_idempotent() {
+        let mut level = DataLevel::new(KEY_B, KEY_A, ISS, IRS, false, None);
+        let fin = end_mapping(idsn(KEY_A).advance(3));
+        assert!(level.received(IRS + 1, 0, [fin.clone()]));
+        let remembered = level.clone();
+        for _ in 0..100 {
+            assert!(level.received(IRS + 1, 0, [fin.clone()]));
+            assert_eq!(level, remembered);
+        }
+    }
+
+    #[test]
+    fn buffered_data_is_not_lost_across_a_serial_half_space_boundary() {
+        let mut level = DataLevel::new(KEY_B, KEY_A, ISS, IRS, false, None);
+        let far = idsn(KEY_A).advance(1).advance(i64::MAX as u64);
+        level.received(IRS + 1, 2, [mapping(Sequence::Long(far), 1, 2)]);
+        let mut out = Vec::new();
+        level.arrived(IRS + 1, b"ab", &mut out);
+        assert!(out.is_empty());
+        level.received(IRS + 3, 1, []);
+        assert_eq!(level.error(), Some(DataError::Mapping));
+        assert!(!level.fallen_back());
+    }
+
+    #[test]
+    fn a_mapping_cannot_cross_the_serial_half_space_to_evade_fin() {
+        let first = idsn(KEY_A).advance(1);
+        let far = first.advance(i64::MAX as u64);
+        for fin_first in [false, true] {
+            let mut level = DataLevel::new(KEY_B, KEY_A, ISS, IRS, false, None);
+            if fin_first {
+                level.received(IRS + 1, 0, [end_mapping(first)]);
+            }
+            level.received(IRS + 1, 2, [mapping(Sequence::Long(far), 1, 2)]);
+            let mut out = Vec::new();
+            level.arrived(IRS + 1, b"ab", &mut out);
+            if !fin_first {
+                level.received(IRS + 3, 0, [end_mapping(first)]);
+            }
+            assert!(out.is_empty());
+            assert_eq!(level.error(), Some(DataError::Mapping));
+        }
     }
 
     #[test]
@@ -2446,24 +2732,24 @@ mod tests {
         let payload = vec![0; 65535];
         for offset in (1..(1u64 << 32) + 131070).step_by(payload.len()) {
             let dss = level
-                .sent(ISS.wrapping_add(offset as u32), &payload, false, None)
+                .sent(ISS.wrapping_add(offset as u32), &payload, false, false)
                 .unwrap();
             assert_eq!(
                 dss.mapping.unwrap().data_sequence_number,
-                Sequence::Long(idsn(KEY_B).wrapping_add(offset))
+                Sequence::Long(idsn(KEY_B).advance(offset))
             );
         }
-        let before = level.local_next;
+        let before = level.clone();
         for offset in [(1u64 << 32) - 65535, (1u64 << 32) + 1] {
             let dss = level
-                .sent(ISS.wrapping_add(offset as u32), b"x", false, None)
+                .sent(ISS.wrapping_add(offset as u32), b"x", false, false)
                 .unwrap();
             assert_eq!(
                 dss.mapping.unwrap().data_sequence_number,
-                Sequence::Long(idsn(KEY_B).wrapping_add(offset))
+                Sequence::Long(idsn(KEY_B).advance(offset))
             );
             assert_eq!(
-                level.local_next, before,
+                level, before,
                 "retransmission does not rewind the send position"
             );
         }

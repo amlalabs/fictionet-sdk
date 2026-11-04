@@ -197,6 +197,7 @@ fn logged(command: &mut Command, log: &Path) -> Result<(String, bool)> {
 fn scoped(program: impl AsRef<std::ffi::OsStr>) -> Command {
     let mut command = Command::new("systemd-run");
     command.args(["--user", "--scope", "-p", "MemoryMax=12G", "-q"]);
+    command.arg("--setenv=PATH");
     command.arg(program);
     command
 }

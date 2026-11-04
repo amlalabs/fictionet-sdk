@@ -1,6 +1,6 @@
 //! Differential checks against the executable Lean reference.
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::protocols::mptcp::{Error, MptcpOption};
+use fictionet::stdlib::protocols::mptcp::{DataSequence, Error, MptcpOption};
 use serde_json::Value;
 
 fn cases(kind: &str, mut check: impl FnMut(&Value)) {
@@ -66,7 +66,7 @@ fn crypto() {
     use fictionet::stdlib::protocols::mptcp::{dss_checksum, idsn, join_hmac, token};
     cases("crypto", |v| {
         assert_eq!(u64::from(token(n(v, "key"))), n(v, "token"), "{v}");
-        assert_eq!(idsn(n(v, "key")), n(v, "idsn"), "{v}");
+        assert_eq!(idsn(n(v, "key")).to_bits(), n(v, "idsn"), "{v}");
         assert_eq!(
             join_hmac(
                 n(v, "key"),
@@ -80,7 +80,7 @@ fn crypto() {
         );
         assert_eq!(
             u64::from(dss_checksum(
-                n(v, "key"),
+                DataSequence::new(n(v, "key")),
                 n(v, "a") as u32,
                 n(v, "length") as u16,
                 &bytes(&v["data"])
@@ -96,12 +96,16 @@ fn sequence() {
     use fictionet::stdlib::protocols::mptcp::Sequence;
     cases("sequence", |v| {
         assert_eq!(
-            Sequence::Short(n(v, "low") as u32).expand(n(v, "near")),
+            DataSequence::new(n(v, "near"))
+                .expand(Sequence::Short(n(v, "low") as u32))
+                .to_bits(),
             n(v, "expanded"),
             "{v}"
         );
         assert_eq!(
-            Sequence::Long(n(v, "expanded")).expand(n(v, "near")),
+            DataSequence::new(n(v, "near"))
+                .expand(Sequence::Long(DataSequence::new(n(v, "expanded"))))
+                .to_bits(),
             n(v, "expanded"),
             "{v}"
         );
@@ -113,7 +117,7 @@ fn semantic_fields(option: &MptcpOption) -> Vec<u64> {
     fn seq(s: Sequence) -> Vec<u64> {
         match s {
             Sequence::Short(v) => vec![4, u64::from(v)],
-            Sequence::Long(v) => vec![8, v],
+            Sequence::Long(v) => vec![8, v.to_bits()],
         }
     }
     fn optional(n: Option<u16>) -> Vec<u64> {
@@ -217,7 +221,7 @@ fn semantic_fields(option: &MptcpOption) -> Vec<u64> {
         MptcpOption::Prio { backup } => vec![5, (*backup).into()],
         MptcpOption::Fail {
             data_sequence_number,
-        } => vec![6, *data_sequence_number],
+        } => vec![6, data_sequence_number.to_bits()],
         MptcpOption::FastClose { receiver_key } => vec![7, *receiver_key],
         MptcpOption::TcpRst { transient, reason } => vec![8, (*transient).into(), (*reason).into()],
     }
@@ -332,7 +336,7 @@ fn data() {
     };
     cases("data", |v| {
         let key = n(v, "key");
-        let base = idsn(key).wrapping_add(1);
+        let base = idsn(key).advance(1);
         let checksums = v["checksums"].as_bool().unwrap();
         let mut level = DataLevel::new(7, key, 0, 0, checksums, None);
         let mut seq = 1u32;
@@ -341,18 +345,17 @@ fn data() {
             let kind = n(event, "kind");
             let index = n(event, "index");
             if kind == 2 {
-                level.received(seq, 1, false, []);
+                level.received(seq, 1, []);
             } else {
                 let fin = kind == 1;
                 let payload = if fin { vec![] } else { vec![65 + index as u8] };
-                let dsn = base.wrapping_add(index);
+                let dsn = base.advance(index);
                 let ssn = if fin { 0 } else { seq };
                 let sum =
                     checksums.then(|| dss_checksum(dsn, ssn, 1, &payload) ^ u16::from(kind == 3));
                 level.received(
                     seq,
                     payload.len(),
-                    false,
                     [MptcpOption::Dss(Dss {
                         data_ack: None,
                         data_fin: fin,
@@ -380,8 +383,8 @@ fn data() {
             );
             if !level.fallen_back() {
                 assert_eq!(
-                    level.sent(1, &[], false, Some(seq)).unwrap().data_ack,
-                    Some(Sequence::Long(base.wrapping_add(n(event, "ack")))),
+                    level.sent(1, &[], false, true).unwrap().data_ack,
+                    Some(Sequence::Long(base.advance(n(event, "ack")))),
                     "{v} at {event}"
                 );
             }
@@ -400,13 +403,13 @@ fn transmit() {
             level.get_or_insert_with(|| DataLevel::new(n(v, "key"), 7, iss, 0, false, None));
         let seq = iss.wrapping_add(n(v, "offset") as u32);
         let mapping = level
-            .sent(seq, &payload, false, None)
+            .sent(seq, &payload, false, false)
             .unwrap()
             .mapping
             .unwrap();
         assert_eq!(
             mapping.data_sequence_number,
-            Sequence::Long(n(v, "dsn")),
+            Sequence::Long(DataSequence::new(n(v, "dsn"))),
             "{v}"
         );
         assert_eq!(

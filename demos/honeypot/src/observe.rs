@@ -417,7 +417,7 @@ impl From<Sequence> for Seq {
     fn from(sequence: Sequence) -> Seq {
         match sequence {
             Sequence::Short(n) => Seq::Short(n),
-            Sequence::Long(n) => Seq::Long(n),
+            Sequence::Long(n) => Seq::Long(n.to_bits()),
         }
     }
 }
@@ -592,7 +592,7 @@ impl Mptcp {
             MptcpOption::Fail {
                 data_sequence_number,
             } => Mptcp::MpFail {
-                data_sequence_number,
+                data_sequence_number: data_sequence_number.to_bits(),
             },
             MptcpOption::FastClose { receiver_key } => Mptcp::MpFastclose {
                 receiver_key: Key(receiver_key),
@@ -1199,7 +1199,7 @@ mod tests {
         let dss = logged(MptcpOption::Dss(Dss {
             data_ack: Some(Sequence::Short(5)),
             mapping: Some(Mapping {
-                data_sequence_number: Sequence::Long(6),
+                data_sequence_number: Sequence::Long(mptcp::DataSequence::new(6)),
                 subflow_sequence_number: 7,
                 data_level_length: 8,
                 checksum: Some(0xbeef),

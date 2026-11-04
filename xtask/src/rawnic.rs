@@ -238,7 +238,7 @@ fn mapped_http(stream: &mut TcpStream) -> Result {
         timestamp,
         request,
     )?;
-    let client_data = mptcp::idsn(client_key).wrapping_add(1 + request.len() as u64);
+    let client_data = mptcp::idsn(client_key).advance(1 + request.len() as u64);
     let mut http = Vec::new();
     loop {
         let response = receive_tcp(stream, port)?;
@@ -267,7 +267,7 @@ fn mapped_http(stream: &mut TcpStream) -> Result {
             || response[8..12] != (5001 + request.len() as u32).to_be_bytes()
             || dss.data_ack != Some(Sequence::Long(client_data))
             || mapping.data_sequence_number
-                != Sequence::Long(mptcp::idsn(key).wrapping_add(1 + http.len() as u64))
+                != Sequence::Long(mptcp::idsn(key).advance(1 + http.len() as u64))
             || mapping.subflow_sequence_number != 1 + http.len() as u32
             || usize::from(mapping.data_level_length) < payload.len()
             || !options

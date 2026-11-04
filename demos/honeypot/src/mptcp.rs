@@ -661,7 +661,14 @@ impl Segments for Dss {
     fn sent(&mut self, segment: &Sent<'_>) -> Vec<TcpOption> {
         self.level
             .as_mut()
-            .and_then(|level| level.sent(segment.seq, segment.payload, segment.fin, segment.ack))
+            .and_then(|level| {
+                level.sent(
+                    segment.seq,
+                    segment.payload,
+                    segment.fin,
+                    segment.ack.is_some(),
+                )
+            })
             .map(|dss| vec![option(MptcpOption::Dss(dss))])
             .unwrap_or_default()
     }
@@ -673,7 +680,7 @@ impl Segments for Dss {
             return SegmentVerdict::Reset(self.reset());
         }
         let acknowledge = if let Some(level) = &mut self.level {
-            level.received(segment.seq, segment.payload.len(), segment.fin, options)
+            level.received(segment.seq, segment.payload.len(), options)
         } else {
             options
                 .iter()

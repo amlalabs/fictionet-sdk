@@ -465,9 +465,9 @@ fn an_mptcp_connection_speaks_dss_until_the_client_falls_back() {
         assert_eq!(
             dss_of(&banner),
             Some(Dss {
-                data_ack: Some(Sequence::Short(mptcp::idsn(client_key) as u32 + 1)),
+                data_ack: Some(Sequence::Short(mptcp::idsn(client_key).advance(1).short())),
                 mapping: Some(Mapping {
-                    data_sequence_number: Sequence::Long(mptcp::idsn(key).wrapping_add(1)),
+                    data_sequence_number: Sequence::Long(mptcp::idsn(key).advance(1)),
                     subflow_sequence_number: 1,
                     data_level_length: SSH_BANNER.len() as u16,
                     checksum: None,
@@ -481,10 +481,10 @@ fn an_mptcp_connection_speaks_dss_until_the_client_falls_back() {
         let hello = b"SSH-2.0-x\r\n";
         let dss = mptcp_bytes(MptcpOption::Dss(Dss {
             data_ack: Some(Sequence::Long(
-                mptcp::idsn(key).wrapping_add(1 + SSH_BANNER.len() as u64),
+                mptcp::idsn(key).advance(1 + SSH_BANNER.len() as u64),
             )),
             mapping: Some(Mapping {
-                data_sequence_number: Sequence::Long(mptcp::idsn(client_key).wrapping_add(1)),
+                data_sequence_number: Sequence::Long(mptcp::idsn(client_key).advance(1)),
                 subflow_sequence_number: 1,
                 data_level_length: hello.len() as u16,
                 checksum: None,
@@ -502,7 +502,7 @@ fn an_mptcp_connection_speaks_dss_until_the_client_falls_back() {
         ));
         let ack = net.recv().await.expect("an ACK");
         assert_eq!(ack_of(&ack), 5001 + hello.len() as u32);
-        let data_ack = mptcp::idsn(client_key).wrapping_add(1 + hello.len() as u64);
+        let data_ack = mptcp::idsn(client_key).advance(1 + hello.len() as u64);
         assert_eq!(
             dss_of(&ack).unwrap().data_ack,
             Some(Sequence::Long(data_ack))
@@ -1457,7 +1457,7 @@ fn mp_capable_with_data_maps_a_client_s_first_bytes() {
             payload_of(&replies[0]).starts_with(b"HTTP/1.1 200 OK"),
             "{replies:?}"
         );
-        let past_request = mptcp::idsn(client_key).wrapping_add(1 + request.len() as u64);
+        let past_request = mptcp::idsn(client_key).advance(1 + request.len() as u64);
         for reply in &replies {
             let dss = dss_of(reply).expect("DSS on the answer");
             assert!(dss.mapping.is_some());
@@ -1482,10 +1482,10 @@ fn a_data_fin_alone_is_acknowledged_at_once() {
         let acked = iss + 1 + SSH_BANNER.len() as u32;
         let data_fin = mptcp_bytes(MptcpOption::Dss(Dss {
             data_ack: Some(Sequence::Long(
-                mptcp::idsn(key).wrapping_add(1 + SSH_BANNER.len() as u64),
+                mptcp::idsn(key).advance(1 + SSH_BANNER.len() as u64),
             )),
             mapping: Some(Mapping {
-                data_sequence_number: Sequence::Long(mptcp::idsn(client_key).wrapping_add(1)),
+                data_sequence_number: Sequence::Long(mptcp::idsn(client_key).advance(1)),
                 subflow_sequence_number: 0,
                 data_level_length: 1,
                 checksum: None,
@@ -1498,7 +1498,7 @@ fn a_data_fin_alone_is_acknowledged_at_once() {
         assert_eq!(ack_of(&ack), 5001, "no subflow byte");
         assert_eq!(
             dss_of(&ack).unwrap().data_ack,
-            Some(Sequence::Long(mptcp::idsn(client_key).wrapping_add(2)))
+            Some(Sequence::Long(mptcp::idsn(client_key).advance(2)))
         );
         Ok(())
     });
@@ -1946,9 +1946,7 @@ fn mappings_with_invalid_checksum_mode_or_contents_reset_before_delivery() {
                 let mapping = mptcp_bytes(MptcpOption::Dss(Dss {
                     data_ack: None,
                     mapping: Some(Mapping {
-                        data_sequence_number: Sequence::Long(
-                            mptcp::idsn(client_key).wrapping_add(1),
-                        ),
+                        data_sequence_number: Sequence::Long(mptcp::idsn(client_key).advance(1)),
                         subflow_sequence_number: 1,
                         data_level_length: 5,
                         checksum,

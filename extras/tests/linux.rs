@@ -265,16 +265,15 @@ fn mptcp_data_ack_width_matches_the_peer_mapping() {
         DataLevel, Dss, Mapping, MptcpOption, Sequence, idsn,
     };
     let mut level = DataLevel::new(7, 9, 100, 200, false, None).ack_width(linux::mptcp_ack_width());
-    let dsn = idsn(9).wrapping_add(1);
+    let dsn = idsn(9).advance(1);
     assert_eq!(
-        level.sent(101, b"", false, Some(201)).unwrap().data_ack,
-        Some(Sequence::Short(dsn as u32))
+        level.sent(101, b"", false, true).unwrap().data_ack,
+        Some(Sequence::Short(dsn.short()))
     );
-    for sequence in [Sequence::Long(dsn), Sequence::Short(dsn as u32)] {
+    for sequence in [Sequence::Long(dsn), Sequence::Short(dsn.short())] {
         level.received(
             201,
             0,
-            false,
             [MptcpOption::Dss(Dss {
                 data_ack: None,
                 mapping: Some(Mapping {
@@ -289,7 +288,7 @@ fn mptcp_data_ack_width_matches_the_peer_mapping() {
         assert_eq!(level.error(), None);
         assert!(!level.fallen_back());
         assert_eq!(
-            level.sent(101, b"", false, Some(201)).unwrap().data_ack,
+            level.sent(101, b"", false, true).unwrap().data_ack,
             Some(sequence)
         );
     }
