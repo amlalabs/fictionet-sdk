@@ -2,6 +2,7 @@
 
 mod capture;
 mod image;
+mod mptcp_verify;
 mod rawnic;
 mod web;
 mod workstation;
@@ -16,6 +17,9 @@ async fn main() -> Result {
     let task = args
         .next()
         .ok_or("expected search-image or search-capture")?;
+    if task == "mptcp-verify" {
+        return mptcp_verify::run(&args.collect::<Vec<_>>());
+    }
     let downloads = PathBuf::from(args.next().ok_or("missing downloads directory")?);
     if task == "rawnic" {
         if args.next().is_some() {
