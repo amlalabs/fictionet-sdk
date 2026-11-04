@@ -1042,7 +1042,7 @@ impl DataLevel {
         fin: bool,
         options: impl IntoIterator<Item = MptcpOption>,
     ) -> bool {
-        if self.fallen_back {
+        if self.fallen_back || self.error.is_some() {
             return false;
         }
         let mut answer = false;
@@ -1086,6 +1086,14 @@ impl DataLevel {
             self.long_ack = matches!(mapping.data_sequence_number, Sequence::Long(_));
             let bytes = length - u16::from(data_fin);
             let dsn = self.expand(mapping.data_sequence_number);
+            let end = dsn.wrapping_add(u64::from(bytes));
+            if self
+                .data_fin
+                .is_some_and(|fin| (end.wrapping_sub(fin) as i64) > 0 || (data_fin && end != fin))
+            {
+                self.error = Some(DataError::Mapping);
+                return false;
+            }
             let start = self.irs.wrapping_add(mapping.subflow_sequence_number);
             if bytes > 0 {
                 let end = start.wrapping_add(u32::from(bytes));
@@ -1132,8 +1140,8 @@ impl DataLevel {
                 self.error = Some(DataError::Checksum);
                 return false;
             }
-            if data_fin && bytes == 0 {
-                self.data_fin.get_or_insert(dsn);
+            if self.error.is_some() || (data_fin && bytes == 0 && !self.finish(dsn)) {
+                return false;
             }
             answer |= data_fin;
         }
@@ -1147,10 +1155,29 @@ impl DataLevel {
     }
 
     fn fallback(&mut self) {
-        if !self.ready.is_empty() || self.mappings.iter().any(|m| !m.data.is_empty()) {
+        if self.data_fin.is_some()
+            || !self.ready.is_empty()
+            || self.mappings.iter().any(|m| !m.data.is_empty())
+        {
             self.error = Some(DataError::Mapping);
         } else {
             self.fallen_back = true;
+        }
+    }
+
+    /// A DATA_FIN is immutable and cannot precede bytes already received.
+    fn finish(&mut self, fin: u64) -> bool {
+        if self.data_fin.is_some_and(|previous| previous != fin)
+            || (self.next.wrapping_sub(fin) as i64) > 0
+            || self.ready.iter().any(|(dsn, data)| {
+                (dsn.wrapping_add(data.len() as u64).wrapping_sub(fin) as i64) > 0
+            })
+        {
+            self.error = Some(DataError::Mapping);
+            false
+        } else {
+            self.data_fin = Some(fin);
+            true
         }
     }
 
@@ -1211,9 +1238,15 @@ impl DataLevel {
                     out.truncate(before);
                     return;
                 }
-                if m.fin {
-                    self.data_fin
-                        .get_or_insert(m.dsn.wrapping_add(length as u64));
+                let end = m.dsn.wrapping_add(length as u64);
+                if self
+                    .data_fin
+                    .is_some_and(|fin| (end.wrapping_sub(fin) as i64) > 0)
+                    || (m.fin && !self.finish(end))
+                {
+                    self.error = Some(DataError::Mapping);
+                    out.truncate(before);
+                    return;
                 }
                 // Reinjected bytes already acknowledged at the data level are ignored.
                 let skip = self.next.wrapping_sub(m.dsn) as i64;
@@ -2323,5 +2356,72 @@ mod tests {
             Some(Sequence::Long(dsn.wrapping_add(10)))
         );
         assert_eq!(level.error(), None);
+    }
+    fn end_mapping(dsn: u64) -> MptcpOption {
+        MptcpOption::Dss(Dss {
+            data_ack: None,
+            data_fin: true,
+            mapping: Some(Mapping {
+                data_sequence_number: Sequence::Long(dsn),
+                subflow_sequence_number: 0,
+                data_level_length: 1,
+                checksum: None,
+            }),
+        })
+    }
+
+    #[test]
+    fn data_fin_rejects_later_data_and_fallback() {
+        let first = idsn(KEY_A).wrapping_add(1);
+        for mapped in [false, true] {
+            let mut level = DataLevel::new(KEY_B, KEY_A, ISS, IRS, false, None);
+            level.received(IRS + 1, 0, false, [end_mapping(first)]);
+            let options = mapped.then(|| mapping(Sequence::Long(first), 1, 1));
+            level.received(IRS + 1, 1, false, options);
+            let mut out = Vec::new();
+            level.arrived(IRS + 1, b"x", &mut out);
+            assert!(out.is_empty());
+            assert_eq!(level.error(), Some(DataError::Mapping));
+            assert!(!level.fallen_back());
+            assert_eq!(
+                level
+                    .sent(ISS + 1, b"", false, Some(IRS + 2))
+                    .unwrap()
+                    .data_ack,
+                Some(Sequence::Long(first.wrapping_add(1)))
+            );
+        }
+    }
+
+    #[test]
+    fn data_fin_cannot_move_or_precede_accepted_data() {
+        let first = idsn(KEY_A).wrapping_add(1);
+        for buffered in [false, true] {
+            let mut level = DataLevel::new(KEY_B, KEY_A, ISS, IRS, false, None);
+            let dsn = first.wrapping_add(u64::from(buffered));
+            level.received(IRS + 1, 1, false, [mapping(Sequence::Long(dsn), 1, 1)]);
+            level.arrived(IRS + 1, b"x", &mut Vec::new());
+            level.received(IRS + 2, 0, false, [end_mapping(first)]);
+            assert_eq!(level.error(), Some(DataError::Mapping));
+        }
+        let mut level = DataLevel::new(KEY_B, KEY_A, ISS, IRS, false, None);
+        level.received(IRS + 1, 0, false, [end_mapping(first)]);
+        level.received(IRS + 1, 0, false, [end_mapping(first.wrapping_add(1))]);
+        assert_eq!(level.error(), Some(DataError::Mapping));
+    }
+
+    #[test]
+    fn mapping_errors_are_terminal() {
+        let mut level = DataLevel::new(KEY_B, KEY_A, ISS, IRS, true, None);
+        level.received(
+            IRS + 1,
+            1,
+            false,
+            [mapping(Sequence::Long(idsn(KEY_A).wrapping_add(1)), 1, 1)],
+        );
+        assert_eq!(level.error(), Some(DataError::ChecksumMode));
+        let failed = level.clone();
+        level.received(IRS + 1, 1, false, []);
+        assert_eq!(level, failed);
     }
 }
