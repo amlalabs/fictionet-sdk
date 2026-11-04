@@ -320,7 +320,9 @@ deriving DecidableEq, Repr
 
 /-- What a lookup gave: the filings of the server's response; that the server at `server` answered `req` with
 an error RCODE other than REFUSED, such as SERVFAIL, which gives no facts (RFC 8906 §3.1); or nothing, when the
-server could not be reached, did not reply, or the world's policy kept the question from leaving. -/
+server could not be reached, did not reply, or the world's policy kept the question from leaving. An
+authoritative SERVFAIL for a CNAME loop gives the chain's CNAME RRsets, the zone's data (RFC 1034 §3.6.2), so it is
+a `response` with their filings, as Rust's `Learned` files them. -/
 inductive Looked where
   | response (filings : List Filing)
   | failed (server : Nat) (req : Request) (rcode : Rcode)
@@ -520,7 +522,9 @@ def bare (rc : Rcode) : Response := ⟨rc, false, [], [], [], 0⟩
 
 /-- `Copies` serving one learned zone, at the server with address `addr`: the answer from the zone's view, or,
 when the view lacks a fact, the error RCODE the real server at `addr` answered the client's question with, which
-a server sends rather than no reply (RFC 8906 §3.1), or else a lookup of the question at that address. -/
+a server sends rather than no reply (RFC 8906 §3.1), or else a lookup of the question at that address. Rust's
+`Copies` makes other lookups for real servers outside `Copied` or that serve more zones than one, which the
+README lists and this model leaves out. -/
 def respond (any : AnyResponse) (addr : Nat) (L : Learned) (req : Request) : Step :=
   match answerPartial L.view req any with
   | .response r => .reply r

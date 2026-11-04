@@ -598,7 +598,13 @@ impl Facts {
                     additional: &additional,
                     denial: &denial,
                 };
-                self.file_cut(&referral, kept)
+                let referred = self.file_cut(&referral, kept);
+                // Its sibling glue: addresses of name servers in the zone
+                // outside the cut (RFC 9471 §3.2).
+                if referred {
+                    self.put_additional(apex, &additional, kept);
+                }
+                referred
             }
             (_, rcode)
                 if !matches!(
@@ -717,18 +723,7 @@ impl Facts {
                 }
             }
         }
-        for set in additional {
-            let owner = LowerName::new(set.name());
-            if matches!(set.record_type(), RecordType::A | RecordType::AAAA)
-                && apex.zone_of(&owner)
-                && !self.below_cut(&owner, set.record_type())
-                // At its owner even when a wildcard made it: the answer's
-                // proofs are not the proof for it.
-                && self.put(apex, set.clone(), Section::Additional)
-            {
-                kept.push((Section::Additional, set.clone()));
-            }
-        }
+        self.put_additional(apex, additional, kept);
 
         let Some(end) = end else {
             return;
@@ -809,6 +804,30 @@ impl Facts {
                 );
             }
             _ => {}
+        }
+    }
+
+    /// Keeps the address RRsets of `additional`, a response's additional
+    /// section, at their owners in the zone above any cut it holds, adding
+    /// them to `kept`. They serve as additional data only, such as the
+    /// sibling glue of a referral, and never answer (RFC 2181 §5.4.1).
+    fn put_additional(
+        &mut self,
+        apex: &LowerName,
+        additional: &[RecordSet],
+        kept: &mut Vec<(Section, RecordSet)>,
+    ) {
+        for set in additional {
+            let owner = LowerName::new(set.name());
+            if matches!(set.record_type(), RecordType::A | RecordType::AAAA)
+                && apex.zone_of(&owner)
+                && !self.below_cut(&owner, set.record_type())
+                // At its owner even when a wildcard made it: the answer's
+                // proofs are not the proof for it.
+                && self.put(apex, set.clone(), Section::Additional)
+            {
+                kept.push((Section::Additional, set.clone()));
+            }
         }
     }
 

@@ -86,7 +86,7 @@ pub fn alias(name: &Name, zone: &Name, records: &[RecordSet], max_iterations: u1
 pub fn nxdomain_nsecs(name: &Name, zone: &Name, records: &[RecordSet]) -> Option<Vec<RecordSet>> {
     let name = fqdn(name);
     let owners = Denial::new(zone, records).nsec.nxdomain_owners(&name)?;
-    Some(nsecs_of(records, &owners))
+    Some(nsecs_of(records, zone, &owners))
 }
 
 /// The NSEC RRsets among `records` that prove `name` in `zone` has no
@@ -103,16 +103,35 @@ pub fn nodata_nsecs(
     let owners = Denial::new(zone, records)
         .nsec
         .nodata_owners(&name, qtype)?;
-    Some(nsecs_of(records, &owners))
+    Some(nsecs_of(records, zone, &owners))
 }
 
-/// The NSEC RRsets among `records` owned by one of `owners`.
-fn nsecs_of(records: &[RecordSet], owners: &[&Name]) -> Vec<RecordSet> {
+/// The NSEC RRsets of `zone` among `records` owned by one of `owners`.
+fn nsecs_of(records: &[RecordSet], zone: &Name, owners: &[&Name]) -> Vec<RecordSet> {
     records
         .iter()
-        .filter(|set| set.record_type() == RecordType::NSEC && owners.contains(&set.name()))
+        .filter(|set| {
+            set.record_type() == RecordType::NSEC
+                && of_zone(set, zone)
+                && owners.contains(&set.name())
+        })
         .cloned()
         .collect()
+}
+
+/// Whether `set` can be a denial record of `zone`: its owner is at or
+/// below the apex, and when it is signed, `zone` signed it (RFC 4035
+/// §5.3.1). A reply may also carry the denial records of a zone below a
+/// cut, which share owners with the zone above and are no part of its
+/// chain (RFC 6840 §4.1).
+fn of_zone(set: &RecordSet, zone: &Name) -> bool {
+    let signers = set.rrsigs().iter().filter_map(|rrsig| match &rrsig.data {
+        RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) => Some(&rrsig.input().signer_name),
+        _ => None,
+    });
+    let mut signers = signers.peekable();
+    let by_zone = |signer: &Name| zone.zone_of(signer) && signer.zone_of(zone);
+    zone.zone_of(set.name()) && (signers.peek().is_none() || signers.any(by_zone))
 }
 
 /// Whether `records` from the parent `zone` prove that `name` is a
@@ -164,6 +183,7 @@ pub fn delegation_proof(name: &Name, zone: &Name, records: &[RecordSet]) -> Vec<
     let hashes = denial.nsec3.delegation_proof(&name);
     records
         .iter()
+        .filter(|set| of_zone(set, zone))
         .filter(|set| match set.record_type() {
             RecordType::NSEC => nsec.is_some_and(|owner| set.name() == owner),
             RecordType::NSEC3 => set
@@ -217,7 +237,7 @@ pub fn proof_of(claim: Claim<'_>, zone: &Name, records: &[RecordSet]) -> Option<
             .map(|(owner, _)| vec![owner]),
     };
     if let Some(owners) = nsec {
-        return Some(nsecs_of(records, &owners));
+        return Some(nsecs_of(records, zone, &owners));
     }
     let hashes = match claim {
         Claim::Nxdomain(name) => denial.nsec3.nxdomain_proof(&fqdn(name)),
@@ -238,6 +258,7 @@ pub fn proof_of(claim: Claim<'_>, zone: &Name, records: &[RecordSet]) -> Option<
         .filter(|set| {
             set.record_type() == RecordType::NSEC3
                 && set.name().base_name() == *zone
+                && of_zone(set, zone)
                 && set
                     .name()
                     .iter()
@@ -266,9 +287,10 @@ impl<'a> Denial<'a> {
     fn new(zone: &'a Name, records: &'a [RecordSet]) -> Denial<'a> {
         let mut nsec = Vec::new();
         let mut nsec3 = Vec::new();
-        for record in records.iter().flat_map(|set| set.records_without_rrsigs()) {
+        let sets = records.iter().filter(|set| of_zone(set, zone));
+        for record in sets.flat_map(|set| set.records_without_rrsigs()) {
             match &record.data {
-                RData::DNSSEC(DNSSECRData::NSEC(rdata)) if zone.zone_of(&record.name) => {
+                RData::DNSSEC(DNSSECRData::NSEC(rdata)) => {
                     nsec.push((&record.name, rdata));
                 }
                 RData::DNSSEC(DNSSECRData::NSEC3(rdata)) => {

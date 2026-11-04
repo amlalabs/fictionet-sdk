@@ -330,7 +330,9 @@ Finish(q, rcode, recs, bound) ==
     /\ waiting' = [waiting EXCEPT ![q] = {}]
 
 (* The resolution fails: every server was tried. The failure is cached for  *)
-(* failure_ttl (RFC 9520).                                                 *)
+(* failure_ttl (RFC 9520). Rust caches one that persists longer (RFC 9520  *)
+(* section 3.2), which the Lean cache model checks; here each lasts the    *)
+(* same.                                                                   *)
 Fail(q) ==
     LET r == res[q]
         e == FailEntry(IF FailureAsNegative THEN "nx" ELSE "fail", r)

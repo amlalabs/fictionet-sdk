@@ -37,7 +37,7 @@ use fictionet::stdlib::services::dns::zone::{Filing, Section};
 use fictionet::stdlib::services::tls::ServerConfig;
 use fictionet::stdlib::web;
 use fictionet::stdlib::world::net::dns::encrypted::Fronts;
-use fictionet::stdlib::world::net::dns::internet::{Mirror, Servers};
+use fictionet::stdlib::world::net::dns::internet::Mirror;
 use fictionet::stdlib::world::net::dns::{Only, PerSession, Recursive};
 use fictionet::stdlib::world::net::{Host, Net, NetHandle};
 use fictionet::sync::Mutex;
@@ -124,7 +124,6 @@ pub fn net(
         refusing: Mutex::default(),
         refused: Mutex::default(),
         addresses: PerSession::new(),
-        servers: mirror.servers(),
     });
     // A host refused once is served as soon as the session serves it.
     {
@@ -281,8 +280,6 @@ struct Sites {
     /// The IPv4 addresses the mirrored zones filed for each name this
     /// session, its own or those at the end of its CNAME chain.
     addresses: PerSession<HashMap<LowerName, HashSet<Ipv4Addr>>>,
-    /// The names of the mirror's name servers.
-    servers: Servers,
 }
 
 impl Sites {
@@ -304,11 +301,12 @@ impl Sites {
     /// whose port 443 already serves the world's infrastructure, keeps no
     /// machine for the name. So does a public resolver's address, whose
     /// port 443 answers every name with its DNS over HTTPS front, as
-    /// `1dot1dot1dot1.cloudflare-dns.com` at 1.1.1.1 does. The name of a
-    /// name server, such as a root letter's, gets no machine: it names a
-    /// server of DNS, not of a web site. Any other name at a name server's
-    /// address gets its site there, as a small domain often runs its web
-    /// site and its name server on one machine. A name the
+    /// `1dot1dot1dot1.cloudflare-dns.com` at 1.1.1.1 does. A name at a name
+    /// server's address gets its site there, as a small domain often runs
+    /// its web site and its name server on one machine, and so does the
+    /// name of a name server: a name is known to name one only once a
+    /// delegation to it is filed, and the site a name gets must not depend
+    /// on what was asked first. A name the
     /// session resolves but does not serve, outside Live-Depth's depth,
     /// gets no site: a machine there with no services refuses connections
     /// at TCP.
@@ -324,8 +322,7 @@ impl Sites {
         let mut found: Vec<(LowerName, Ipv4Addr)> = answers()
             .filter_map(|record| match &record.data {
                 RData::A(a) if !non_public_address(a.0.into()) && !resolver_address(a.0) => {
-                    let name = LowerName::new(&record.name);
-                    (!self.servers.named(generation, &name)).then_some((name, a.0))
+                    Some((LowerName::new(&record.name), a.0))
                 }
                 _ => None,
             })

@@ -174,10 +174,14 @@ impl Request {
 /// message that holds one. A resolver reads its replies with this, so a
 /// zone that holds such a record can still be resolved.
 ///
-/// A record hickory refuses whose RDATA a validator ignores, while the
-/// rest of the message stands, is read with its RDATA as octets
-/// (RFC 3597 §5), where hickory refuses the whole message
-/// ([`ignored_by_validators`]).
+/// Records whose RDATA a validator ignores while the rest of the message
+/// stands are read with their RDATA as octets (RFC 3597 §5), where
+/// hickory refuses the whole message or reads them as records to use:
+/// NSEC3 records with a Hash Algorithm other than SHA-1 or a Flags bit
+/// other than Opt-Out (RFC 5155 §8.1, §8.2), NSEC3PARAM records with a
+/// Hash Algorithm other than SHA-1 or any Flags bit set (RFC 5155 §4.1.2,
+/// §4.2), and DNSKEY records whose Protocol is not 3 (RFC 4034 §2.1.2).
+/// Each keeps its place in its RRset, whose RRSIG covers it.
 pub fn read_message(bytes: &[u8]) -> Result<Message, DecodeError> {
     let mut decoder = BinDecoder::new(bytes);
     let Header {

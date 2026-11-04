@@ -21,7 +21,7 @@ use fictionet::stdlib::protocols::dns::op::{
 };
 use fictionet::stdlib::protocols::dns::rr::rdata::A;
 use fictionet::stdlib::protocols::dns::rr::{
-    LowerName, Name, RData, Record, RecordSet, RecordType,
+    DNSClass, LowerName, Name, RData, Record, RecordSet, RecordType,
 };
 use fictionet::stdlib::protocols::dns::{Parsed, Request};
 use fictionet::stdlib::services::dns::authority::{
@@ -1955,5 +1955,136 @@ fn an_address_that_refuses_to_place_a_name_answers_refused() {
             ResponseCode::Refused,
             "round {round}"
         );
+    }
+}
+
+/// A real server may answer ANY with DO at an NSEC-signed name with the
+/// name's NSEC RRset alone (RFC 8482 §4.1). The copy that filed that
+/// answer still knows the name has data, so it answers ANY without DO as
+/// the real server does, never with NODATA.
+#[test]
+fn an_any_answer_of_only_nsec_never_makes_a_nodata() {
+    let text = format!("{EXAMPLE}svc.example. 300 IN HTTPS 1 . alpn=h2\n");
+    let real = Zones::new(vec![
+        Arc::new(signed_master(&text, Denial::Nsec)) as Arc<dyn ZoneData>
+    ]);
+    let answer = |lookup: &Lookup| reply_of(&real, lookup);
+    let local: SocketAddr = "192.0.2.53:53".parse().unwrap();
+    let copies = Copies::new();
+    copies.serves(local.ip(), &lower("example."));
+    let with_do = request("svc.example.", RecordType::ANY, true);
+    let (got, _) = through(&copies, &answer, local, &with_do);
+    assert_eq!(shape(&got), shape(&reply_of(&real, &own(local, &with_do))));
+    assert!(
+        got.answers
+            .iter()
+            .all(|record| matches!(record.record_type(), RecordType::NSEC | RecordType::RRSIG)),
+        "the real server answers with the NSEC RRset: {got:?}"
+    );
+    let without_do = request("svc.example.", RecordType::ANY, false);
+    let (got, _) = through(&copies, &answer, local, &without_do);
+    let want = match real.respond(
+        &without_do,
+        local,
+        &ServerConfig::generic(),
+        &Client {
+            peer: "198.51.100.7:5353".parse().unwrap(),
+            local,
+            transport: Transport::Udp,
+            connection: None,
+            sandbox: None,
+        },
+    ) {
+        Step::Reply(response) => response.message,
+        step => panic!("the real server gave {step:?}"),
+    };
+    assert_eq!(shape(&got), shape(&want));
+    assert!(!got.answers.is_empty(), "no NODATA: {got:?}");
+}
+
+/// QCLASS * gets FORMERR at a name the copy has yet to place below a
+/// cut, as at every other name (RFC 1034 §3.7.1), with no lookup.
+#[test]
+fn qclass_any_gets_formerr_at_a_name_not_yet_placed() {
+    let real = Zones::new(vec![
+        Arc::new(Zone::from_master(EXAMPLE, None).unwrap()) as Arc<dyn ZoneData>,
+        Arc::new(Zone::from_master(SRV, None).unwrap()) as Arc<dyn ZoneData>,
+    ]);
+    let answer = |lookup: &Lookup| reply_of(&real, lookup);
+    let local: SocketAddr = "192.0.2.53:53".parse().unwrap();
+    let copies = Copies::new();
+    copies.serves(local.ip(), &lower("example."));
+    let server = ServerConfig::generic();
+    let client = Client {
+        peer: "198.51.100.7:5353".parse().unwrap(),
+        local,
+        transport: Transport::Udp,
+        connection: None,
+        sandbox: None,
+    };
+    through(
+        &copies,
+        &answer,
+        local,
+        &request("x.child.example.", RecordType::A, false),
+    );
+    let below = request("www.srv.child.example.", RecordType::A, false);
+    let Step::Need(lookup) = copies.respond(&below, local, &server, &client) else {
+        panic!("the copy looks the question up");
+    };
+    copies.file(&lookup, &Looked::Response(answer(&lookup)), Generation(0));
+    let mut message = Message::new(7, MessageType::Query, OpCode::Query);
+    let mut query = Query::query(name("www.srv.child.example."), RecordType::A);
+    query.set_query_class(DNSClass::ANY);
+    message.add_query(query);
+    let Parsed::Request(any_class) = Request::parse(&message.to_vec().unwrap(), Transport::Udp)
+    else {
+        panic!("QCLASS * parses");
+    };
+    for (authority, what) in [(&copies as &dyn Authority, "copy"), (&real, "real")] {
+        match authority.respond(&any_class, local, &server, &client) {
+            Step::Reply(response) => assert_eq!(
+                response.message.metadata.response_code,
+                ResponseCode::FormErr,
+                "{what}"
+            ),
+            step => panic!("{what}: {step:?}"),
+        }
+    }
+}
+
+/// A root zone whose `com` and `net` servers sit below the `net` cut,
+/// as `gtld-servers.net` does.
+const SIBLINGS: &str = "\
+. 86400 IN SOA a.root-servers.net. nstld.verisign-grs.com. 1 1800 900 604800 86400
+. 518400 IN NS a.root-servers.net.
+com. 172800 IN NS a.gtld-servers.net.
+com. 172800 IN NS b.gtld-servers.net.
+net. 172800 IN NS a.gtld-servers.net.
+net. 172800 IN NS b.gtld-servers.net.
+a.gtld-servers.net. 172800 IN A 192.5.6.30
+a.gtld-servers.net. 172800 IN AAAA 2001:503:a83e::2:30
+b.gtld-servers.net. 172800 IN A 192.33.14.30
+a.root-servers.net. 518400 IN A 198.41.0.4
+";
+
+/// A copy answers its first referral with the sibling glue the real
+/// server sent with it, the addresses of name servers below another cut
+/// the copy has not learned yet (RFC 9471 §3.2), as the real server does.
+#[test]
+fn a_copys_first_referral_carries_the_sibling_glue() {
+    let real = Zones::new(vec![
+        Arc::new(Zone::from_master(SIBLINGS, None).unwrap()) as Arc<dyn ZoneData>
+    ]);
+    let answer = |lookup: &Lookup| reply_of(&real, lookup);
+    let local: SocketAddr = "198.41.0.4:53".parse().unwrap();
+    let copies = Copies::new();
+    copies.serves(local.ip(), &lower("."));
+    for dnssec_ok in [false, true] {
+        let asked = request("com.", RecordType::A, dnssec_ok);
+        let (got, _) = through(&copies, &answer, local, &asked);
+        let want = reply_of(&real, &Lookup::new(local, lower("."), &asked.question));
+        assert_eq!(shape(&got), shape(&want), "DO {dnssec_ok}");
+        assert!(!got.additionals.is_empty(), "DO {dnssec_ok}: glue");
     }
 }

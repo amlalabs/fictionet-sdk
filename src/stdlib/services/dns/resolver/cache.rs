@@ -197,6 +197,9 @@ pub enum Offer {
         key: Key,
         /// Why.
         why: FailureKind,
+        /// How long the failure before it lasted, when the resolution
+        /// began while that one persisted ([`Cache::persisting`]).
+        follows: Option<Duration>,
     },
 }
 
@@ -497,6 +500,21 @@ impl Cache {
         );
         if self.entries.len() >= 2 * self.swept.max(64) {
             self.sweep(now);
+        }
+    }
+
+    /// How long the failure cached for `key` lasts, when a resolution of
+    /// `key` that begins at `now` finds it persisting: it is served still,
+    /// or ended less than its own length ago. A failure that persists is
+    /// cached twice as long as the one before it, up to 5 minutes, unless
+    /// [`Limits::failure_ttl`] is longer (RFC 9520 §3.2). The resolution
+    /// that fails again may take longer than that, as one waiting on
+    /// servers that never reply does, so this is read when it begins and
+    /// offered with its failure ([`Offer::Failure`]).
+    pub fn persisting(&self, key: &Key, now: Instant) -> Option<Duration> {
+        match self.stored(key).map(|stored| &stored.entry) {
+            Some(Entry::Failure { until, lasts, .. }) if now < *until + *lasts => Some(*lasts),
+            _ => None,
         }
     }
 
@@ -937,13 +955,11 @@ impl Cache {
                 };
                 Some((key, entry))
             }
-            Offer::Failure { key, why } => {
+            Offer::Failure { key, why, follows } => {
                 let first = self.limits.failure_ttl;
-                let lasts = match self.stored(&key).map(|stored| &stored.entry) {
-                    Some(Entry::Failure { until, lasts, .. }) if now < *until + *lasts => {
-                        (*lasts * 2).min(MAX_FAILURE_TTL.max(first))
-                    }
-                    _ => first,
+                let lasts = match follows {
+                    Some(lasts) => (lasts * 2).min(MAX_FAILURE_TTL.max(first)),
+                    None => first,
                 };
                 let until = now + lasts;
                 Some((key, Entry::Failure { why, until, lasts }))

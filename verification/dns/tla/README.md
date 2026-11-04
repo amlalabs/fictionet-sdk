@@ -281,7 +281,10 @@ Resolution:
   with TTL 0. `_nocountdown`, where a fetched record keeps the TTL it came
   with, shows that `TtlSound` checks this.
 * A failure after every server was tried is cached for `failure_ttl`
-  (1 s) at the name the chain had reached. A resolution that reaches the
+  (1 s) at the name the chain had reached. Rust caches a failure that
+  persists twice as long as the one before it (RFC 9520 section 3.2);
+  the model caches every failure for `failure_ttl`, and the Lean cache
+  model checks the longer times. A resolution that reaches the
   work bound answers SERVFAIL without caching, as `Resolution::send` leaves
   a failure the bound caused out of the cache: the bound is one question's
   budget and says nothing of the servers. When the bound is reached just
@@ -335,13 +338,19 @@ Authority:
   response from a zone below the lookup's into that zone's copy
   (`Learned::child_answering`), the SOA questions that find such a zone's
   apex, an address answering without a zone its real server turns out
-  not to serve, and a question the real server answered with an error
-  RCODE, which gets that RCODE (`Learned::failed`); `RealRcode` gives
-  only NOERROR and NXDOMAIN. `tests/it/dns/learned.rs` checks them:
-  `copies_learn_a_child_zone_its_server_also_serves`,
+  not to serve, the client's question looked up once at such an address
+  to find a child zone it does serve (`Copies::lame_holding`), the CNAME
+  looked up at an alias whose server answered NSEC there with NODATA
+  while its own denial records show the CNAME
+  (`Learned::stops_at_alias`), and a question the real server answered
+  with an error RCODE, which gets that RCODE (`Learned::failed`);
+  `RealRcode` gives only NOERROR and NXDOMAIN. `tests/it/dns/learned.rs`
+  checks them: `copies_learn_a_child_zone_its_server_also_serves`,
   `copies_find_a_zone_below_a_cut_they_hold`,
   `copies_place_an_alias_below_a_cut`,
   `copies_drop_a_zone_their_real_server_does_not_serve`,
+  `a_lame_address_finds_the_child_its_server_serves_in_any_order`,
+  `a_copy_follows_an_alias_its_server_stopped_at_for_nsec`,
   `an_address_that_refuses_to_place_a_name_answers_refused`, and
   `a_copy_answers_with_the_error_its_real_server_gave`. The Lean model's
   `Authority.respond` has the error RCODE branch, and `learned.json`
@@ -444,7 +453,7 @@ Resolution:
 | `cache[<<n, t>>]` | `Cache`, keyed by `(LowerName, RecordType, DNSClass)` |
 | entry `t` = `"a"` or `"cname"` | `Entry::Positive { set, rank, expires, validation }` |
 | entry `t` = `"nx"` or `"nodata"` | `Entry::Negative { kind: Negative::NxDomain` or `NoData, .. }` |
-| entry `t` = `"fail"` | `Entry::Failure { why: FailureKind, until }`, kept for `Config::failure_ttl` |
+| entry `t` = `"fail"` | `Entry::Failure { why: FailureKind, until, lasts }`, kept for `Config::failure_ttl`; Rust keeps a failure that persists longer |
 | entry `rank` | `Rank::AuthAnswer` and `Rank::Glue` (two of the five ranks) |
 | entry `readAt + ttl` | `expires: Instant` |
 | entry `tried` of a failure | not stored: the model keeps what the failed resolution tried, since Rust writes `Entry::Failure` only after trying every address of the zone (RFC 9520 section 3.1) |

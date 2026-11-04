@@ -2722,14 +2722,17 @@ fn localhost_points_every_name_at_loopback() {
 /// `invalid` never exists, and neither does any name below it (RFC 6761
 /// §6.4); a caching server answers every query for `test` and the names
 /// within it negatively (RFC 6761 §6.2), and every `.onion` query with
-/// NXDOMAIN (RFC 7686 §2). Each question gets NXDOMAIN, at the apex too.
+/// NXDOMAIN (RFC 7686 §2), as it does every query for `local` and the
+/// names within it (RFC 6762 §22.1). Each question gets NXDOMAIN, at the
+/// apex too.
 #[test]
-fn invalid_onion_and_test_are_nxdomain_at_their_apex_too() {
+fn invalid_onion_test_and_local_are_nxdomain_at_their_apex_too() {
     let apex = EmptyApex::rfc6303();
     for zone in [
         special::invalid(&apex),
         special::onion(&apex),
         special::test(&apex),
+        special::local(&apex),
     ] {
         let apex = zone.apex().to_string();
         for qname in [apex.clone(), format!("x.{apex}")] {

@@ -1673,8 +1673,9 @@ fn localhost_and_invalid_are_answered_as_rfc_6761_says() {
             assert!(reply.answers.is_empty(), "{qname} {qtype}");
         }
     }
-    // `onion` and `test` get NXDOMAIN at their apex too (RFC 7686 §2,
-    // RFC 6761 §6.2).
+    // `onion`, `test`, and `local` get NXDOMAIN at their apex too
+    // (RFC 7686 §2, RFC 6761 §6.2, RFC 6762 §22.1), and no query leaves
+    // the resolver.
     for qname in [
         "invalid.",
         "x.invalid.",
@@ -1682,6 +1683,8 @@ fn localhost_and_invalid_are_answered_as_rfc_6761_says() {
         "x.onion.",
         "test.",
         "x.test.",
+        "local.",
+        "printer.local.",
     ] {
         for qtype in [RecordType::A, RecordType::SOA, RecordType::NS] {
             let reply = ask(qname, qtype);
@@ -3550,6 +3553,86 @@ fn an_unsigned_child_its_signed_parents_server_also_serves_is_insecure() {
     ));
 }
 
+/// A server that serves a signed zone and a signed child below it
+/// follows a wildcard CNAME of the parent into the child in one reply
+/// (RFC 1034 §4.3.2), with the denial records of both zones. Each
+/// expanded RRset rests on the proof of the zone that signed it, never on
+/// the other zone's records (RFC 4035 §5.3.4, RFC 5155 §8.8, RFC 6840
+/// §4.1), so the answer is Secure with NSEC and NSEC3 alike.
+#[test]
+fn wildcard_answers_of_a_parent_and_its_child_on_one_server_validate() {
+    let nsec3 = Denial::Nsec3 {
+        opt_out: false,
+        salt: Vec::new(),
+    };
+    for denial in [Denial::Nsec, nsec3] {
+        let root_keys = keys(10);
+        let com_keys = keys(20);
+        let secure_keys = keys(40);
+        let cname = |target: &str| RData::CNAME(CNAME(name(target)));
+        let root = delegation(
+            builder(".", "a.root-servers.net.").rrset(rrset(
+                "a.root-servers.net.",
+                3600,
+                vec![a(ROOT)],
+            )),
+            "com.",
+            "ns.nic.com.",
+            Some(COM),
+            Some(ds(&com_keys, "com.")),
+        )
+        .build()
+        .unwrap()
+        .signed(&root_keys, window(), Denial::Nsec)
+        .unwrap();
+        let com = delegation(
+            builder("com.", "ns.nic.com.")
+                .rrset(rrset("ns.nic.com.", 3600, vec![a(COM)]))
+                .rrset(rrset("*.cd.com.", 300, vec![cname("www.secure.com.")]))
+                .rrset(rrset("*.cx.com.", 300, vec![cname("a.w.secure.com.")])),
+            "secure.com.",
+            "ns.nic.com.",
+            None,
+            Some(ds(&secure_keys, "secure.com.")),
+        )
+        .build()
+        .unwrap()
+        .signed(&com_keys, window(), denial.clone())
+        .unwrap();
+        let secure = builder("secure.com.", "ns.nic.com.")
+            .rrset(rrset("www.secure.com.", 300, vec![a("192.0.2.73")]))
+            .rrset(rrset("*.w.secure.com.", 300, vec![a("192.0.2.74")]))
+            .build()
+            .unwrap()
+            .signed(&secure_keys, window(), denial.clone())
+            .unwrap();
+        let mut net = MemoryNet::new();
+        serve_at(&mut net, ROOT, vec![root]);
+        serve_at(&mut net, COM, vec![com, secure]);
+        let anchors = Anchors::of(vec![root_keys.anchor(&Name::root())]);
+        let mut resolver = resolver(config(Some(anchors)));
+        let questions: [(u16, &str, RecordType, &[&str]); 2] = [
+            (1, "x.cd.com.", RecordType::TXT, &[]),
+            (2, "x.cx.com.", RecordType::A, &["192.0.2.74"]),
+        ];
+        for (id, qname, qtype, want) in questions {
+            let reply = ask(
+                &mut resolver,
+                &mut net,
+                0,
+                query(client(id), qname, qtype, dnssec_ok),
+            );
+            assert_eq!(
+                reply.metadata.response_code,
+                ResponseCode::NoError,
+                "{qname} {denial:?}"
+            );
+            assert_eq!(addresses(&reply), want, "{qname} {denial:?}");
+            assert!(reply.metadata.authentic_data, "{qname} {denial:?}");
+        }
+    }
+}
+
 #[test]
 fn a_cached_cname_that_runs_out_while_its_target_is_chased_is_fetched_again() {
     // A record the cache gave the answer never goes out past its TTL: the
@@ -3793,6 +3876,76 @@ fn a_silent_root_is_asked_at_most_three_times_per_hint_and_the_failure_is_cached
     );
     assert_eq!(again.metadata.response_code, ResponseCode::ServFail);
     assert_eq!(net.recording().exchanges().len(), sent, "from the cache");
+}
+
+/// A failure that persists is cached twice as long each time (RFC 9520
+/// §3.2), also when each resolution that fails again takes longer than
+/// the failure before it was cached for, as one does that waits on
+/// servers that never reply.
+#[test]
+fn a_failure_from_timeouts_is_cached_longer_each_time() {
+    let (mut net, _) = internet(false);
+    lose_example(&mut net);
+    let mut resolver = resolver(config(None));
+    let key = Key::new(
+        LowerName::new(&name("www.example.com.")),
+        RecordType::A,
+        fictionet::stdlib::protocols::dns::rr::DNSClass::IN,
+    );
+    let mut now = at(0);
+    let mut lasted = Vec::new();
+    let mut took = Vec::new();
+    for id in 1..=5 {
+        let asked = query(client(id), "www.example.com.", RecordType::A, |_| {});
+        let answered = answered_at(&mut resolver, &mut net, asked, now);
+        let Some(&Entry::Failure { until, lasts, .. }) = resolver.cache().get(&key, answered)
+        else {
+            panic!("the failure is cached");
+        };
+        took.push(answered.since_start() - now.since_start());
+        lasted.push(lasts.as_secs());
+        // Asked again as the failure stops being served.
+        now = until;
+    }
+    let first = lasted[0];
+    assert_eq!(
+        lasted,
+        [first, 2 * first, 4 * first, 8 * first, 16 * first],
+        "each resolution took {took:?}"
+    );
+    assert!(
+        took[1..].iter().all(|took| took.as_secs() > first),
+        "a resolution outlasts the first failure: {took:?}"
+    );
+}
+
+/// When `resolver`, asked `query` at `start` through `net`, answers it,
+/// as [`drive`] runs it.
+fn answered_at(
+    resolver: &mut Resolver,
+    net: &mut MemoryNet,
+    query: ClientQuery,
+    start: Instant,
+) -> Instant {
+    let entropy = entropy();
+    let mut now = start;
+    let mut inputs = vec![Input::Query(query)];
+    loop {
+        for input in std::mem::take(&mut inputs) {
+            resolver.handle(input, now, &entropy);
+            while let Some(action) = resolver.poll() {
+                match action {
+                    Action::Send(transmit) => inputs.extend(net.exchange(&transmit, now, &entropy)),
+                    Action::Answer(_) => return now,
+                    _ => {}
+                }
+            }
+        }
+        if inputs.is_empty() {
+            now = now.max(resolver.next_deadline().expect("an answer comes"));
+            inputs.push(Input::Tick);
+        }
+    }
 }
 
 /// Resolves `query` at time zero through `net`, with every reply arriving

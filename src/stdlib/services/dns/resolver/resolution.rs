@@ -347,6 +347,10 @@ struct Lookup {
     /// went, not what the servers did, so it is not cached for other
     /// clients (RFC 9520 §3.2).
     bounded: bool,
+    /// How long the cached failure of its key lasted, when the lookup
+    /// began while that failure persisted
+    /// ([`Cache::persisting`](super::cache::Cache::persisting)).
+    follows: Option<std::time::Duration>,
     wait: LookupWait,
 }
 
@@ -1141,6 +1145,7 @@ impl<V: Verify> Resolver<V> {
             Some(LocalCut { cut, targets, glue }) => (Some((cut, targets)), glue),
             None => (None, BTreeMap::new()),
         };
+        let follows = self.cache.persisting(&key, self.now);
         let id = self.graph.lookup_id();
         self.graph.hold(tree);
         self.graph.by_key.insert(shared, id);
@@ -1160,6 +1165,7 @@ impl<V: Verify> Resolver<V> {
                 asked: BTreeSet::new(),
                 delegation,
                 bounded: false,
+                follows,
                 wait: LookupWait::Nothing,
             },
         );
@@ -1461,7 +1467,9 @@ impl<V: Verify> Resolver<V> {
         };
         if !lookup.bounded {
             let key = lookup.key.clone();
-            self.cache.insert(self.now, Offer::Failure { key, why });
+            let follows = lookup.follows;
+            self.cache
+                .insert(self.now, Offer::Failure { key, why, follows });
         }
         self.finish(id, Found::fresh(Outcome::Failure(why)));
     }
@@ -3134,7 +3142,9 @@ fn vouched(set: &RecordSet, proof: &[RecordSet], zone: &Name) -> (Material, Name
 /// that show no closer name matched when a wildcard made `set`
 /// (RFC 4035 §3.1.3.3, RFC 5155 §7.2.6): all of them when they hold no
 /// such proof, so that validation finds it missing, and none when no
-/// wildcard made `set`.
+/// wildcard made `set`. The proof comes from the zone that signed
+/// `set`, which holds the wildcard: a server that serves a zone below
+/// `zone` too may answer from both in one reply (RFC 1034 §4.3.2).
 fn expansion_proof(set: &RecordSet, zone: &Name, denial: &[RecordSet]) -> Vec<RecordSet> {
     let Some(labels) = expanded_from(set) else {
         return Vec::new();
@@ -3144,7 +3154,8 @@ fn expansion_proof(set: &RecordSet, zone: &Name, denial: &[RecordSet]) -> Vec<Re
         name: set.name(),
         closest_encloser: &closest_encloser,
     };
-    proof::proof_of(claim, zone, denial).unwrap_or_else(|| denial.to_vec())
+    let zone = signer(set).unwrap_or_else(|| zone.clone());
+    proof::proof_of(claim, &zone, denial).unwrap_or_else(|| denial.to_vec())
 }
 
 /// Whether `cname` is what `dname` synthesizes for its owner (RFC 6672

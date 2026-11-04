@@ -241,9 +241,16 @@ pub fn reserved_address(address: IpAddr) -> bool {
 /// holding it is not globally reachable. That takes in the ranges of
 /// [`reserved_address`], private, loopback, link-local and unique local
 /// space, multicast, and IPv6 outside global unicast. IPv4-mapped
-/// addresses use IPv4 rules.
+/// addresses use IPv4 rules, and so do addresses under the NAT64
+/// Well-Known Prefix, 64:ff9b::/96, which never stands for a non-global
+/// IPv4 address (RFC 6052 §3.1).
 pub fn non_public_address(address: IpAddr) -> bool {
-    let address = unmapped(address);
+    let address = match unmapped(address) {
+        IpAddr::V6(a) if a.segments()[..6] == [0x64, 0xff9b, 0, 0, 0, 0] => {
+            IpAddr::V4(Ipv4Addr::from_bits(a.to_bits() as u32))
+        }
+        address => address,
+    };
     SPECIAL_PURPOSE
         .iter()
         .filter(|(block, _)| block.contains(address))

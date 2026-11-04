@@ -241,10 +241,10 @@ fn respond_hosted(
             };
             if seen.contains(&onward.target) {
                 // The chain came back to a name it passed: a loop, which
-                // is an error (RFC 1034 §3.6.2).
+                // is an error (RFC 1034 §3.6.2). The chain goes with the
+                // proofs of its wildcard expansions (RFC 4035 §3.1.3.3).
                 let mut looped = onward.chain;
                 looped.message.metadata.response_code = ResponseCode::ServFail;
-                looped.message.authorities.clear();
                 return Step::Reply(looped);
             }
             seen.push(onward.target.clone());

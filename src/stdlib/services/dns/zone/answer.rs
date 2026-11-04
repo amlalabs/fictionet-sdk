@@ -410,9 +410,12 @@ impl<'v> Walk<'v> {
                     let looped = target == name || seen.contains(&target);
                     if looped {
                         // A CNAME loop is an error (RFC 1034 §3.6.2):
-                        // SERVFAIL, with the chain as far as the loop.
+                        // SERVFAIL, with the chain as far as the loop and
+                        // the proofs of its wildcard expansions
+                        // (RFC 4035 §3.1.3.3).
                         let failed = Found {
                             answer: unique(answer.into_iter()),
+                            authority: unique(proofs.into_iter()),
                             ..Found::new(ResponseCode::ServFail, true)
                         };
                         return Ok((failed, None));
@@ -590,14 +593,22 @@ impl<'v> Walk<'v> {
         };
 
         if self.qtype == RecordType::ANY {
-            // Without DO, only `All` sends the DNSSEC RRsets.
-            let sets: Vec<&RecordSet> = sets
+            // Without DO, only `All` sends the DNSSEC RRsets, unless the
+            // name holds no other: it has data, so the answer is no
+            // NODATA, and without DO they are RRsets like any other
+            // (RFC 4035 §3.1). A copy filed from an answer to ANY with
+            // DO may hold only the name's NSEC RRset (RFC 8482 §4.1).
+            let mut shown: Vec<&RecordSet> = sets
                 .iter()
                 .copied()
                 .filter(|set| {
                     self.dnssec_ok || self.any == AnyResponse::All || !is_dnssec(set.record_type())
                 })
                 .collect();
+            if shown.is_empty() {
+                shown = sets.to_vec();
+            }
+            let sets = shown;
             let Some(first) = sets.first() else {
                 return self.nodata(name);
             };

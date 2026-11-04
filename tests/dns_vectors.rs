@@ -2989,11 +2989,15 @@ fn cache() {
 /// stored.
 fn offer(cache: &mut Cache, offer: &Value, now: Instant, limits: Limits) {
     if text(offer, "kind") == "failure" {
+        // The resolution that failed began and ended at `now`.
+        let key = cache_key(field(offer, "key"));
+        let follows = cache.persisting(&key, now);
         return cache.insert(
             now,
             Offer::Failure {
-                key: cache_key(field(offer, "key")),
+                key,
                 why: failure_kind(field(offer, "why")),
+                follows,
             },
         );
     }

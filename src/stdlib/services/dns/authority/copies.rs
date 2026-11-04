@@ -340,21 +340,23 @@ impl Authority for Copies {
             return refused;
         }
         let qname = LowerName::new(req.question.name());
-        let unplaced = self
-            .seen
-            .lock()
-            .unplaced
-            .get(&(local.ip(), qname.clone()))
-            .map(|unplaced| (unplaced.zone.clone(), unplaced.at.clone()));
-        if let Some((zone, at)) = unplaced {
-            let soa = Query::query(Name::from(at), RecordType::SOA);
-            return self.look_up(req, local, zone, &soa);
-        }
         let zones = self.zones_at(local.ip());
-        if req.question.query_class() == DNSClass::IN
-            && let Some(lame) = self.lame_holding(local.ip(), &qname, &zones)
-        {
-            return self.look_up(req, local, lame, &req.question);
+        // A question of another class is answered without data
+        // (`respond_from`), so it needs no lookup.
+        if req.question.query_class() == DNSClass::IN {
+            let unplaced = self
+                .seen
+                .lock()
+                .unplaced
+                .get(&(local.ip(), qname.clone()))
+                .map(|unplaced| (unplaced.zone.clone(), unplaced.at.clone()));
+            if let Some((zone, at)) = unplaced {
+                let soa = Query::query(Name::from(at), RecordType::SOA);
+                return self.look_up(req, local, zone, &soa);
+            }
+            if let Some(lame) = self.lame_holding(local.ip(), &qname, &zones) {
+                return self.look_up(req, local, lame, &req.question);
+            }
         }
         respond_from(&zones, req, server, &|zone, asked, reached| {
             let apex = zone.apex();

@@ -120,6 +120,7 @@ whoami.direct. 300 IN A 45.70.0.9
 whoami.direct. 300 IN TXT \"45.70.0.9\"
 home.direct. 300 IN A 45.70.0.9
 whoami.v4.direct. 300 IN TXT \"45.70.0.9\"
+bin.direct. 300 IN TXT \"45.70.0.9\" \"\\255\\254\"
 ";
 
 /// What the real hierarchy answers, played from fixed zones: each server
@@ -341,7 +342,9 @@ fn v4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
 /// One rule says which addresses a public internet host can have, the
 /// IANA special-purpose registries' (RFC 6890), for the network and the
 /// mirror alike: multicast and `0.0.0.0/8` are no host's, as private
-/// space is not.
+/// space is not. The NAT64 Well-Known Prefix holds only global IPv4
+/// addresses (RFC 6052 §3.1), so a non-global one there is no host's
+/// either.
 #[test]
 fn no_public_host_has_a_special_purpose_address() {
     use fictionet::stdlib::network::ip::non_public_address;
@@ -352,10 +355,19 @@ fn no_public_host_has_a_special_purpose_address() {
         "192.0.2.1",
         "ff02::1",
         "fec0::1",
+        "64:ff9b::7f00:1",
+        "64:ff9b::a00:1",
+        "64:ff9b::c0a8:101",
+        "64:ff9b::a9fe:a9fe",
     ] {
         assert!(non_public_address(address.parse().unwrap()), "{address}");
     }
-    for address in ["45.33.4.80", "192.0.0.9", "2606:4700:4700::1111"] {
+    for address in [
+        "45.33.4.80",
+        "192.0.0.9",
+        "2606:4700:4700::1111",
+        "64:ff9b::2d21:450",
+    ] {
         assert!(!non_public_address(address.parse().unwrap()), "{address}");
     }
 }
@@ -1323,7 +1335,8 @@ fn whoami_names_are_answered_from_the_egress_and_never_looked_up() {
 /// world's, also in the TXT string of `whoami.v4.direct`, a name the echo
 /// was not given, as `whoami.v4.powerdns.org` gives it. `home.direct` is
 /// an A record of real data that holds the upstream's address, and every
-/// resolver answers it as the real server does.
+/// resolver answers it as the real server does. The other strings of an
+/// echoed TXT record keep their octets, UTF-8 or not.
 #[test]
 fn an_echoed_address_is_the_public_resolvers_egress() {
     world(Duration::from_secs(60), |fcx| async move {
@@ -1387,6 +1400,28 @@ fn an_echoed_address_is_the_public_resolvers_egress() {
             .await
             .expect("an answer");
             assert_eq!(texts(&reply), vec![seen.to_string()], "{address}");
+            let reply = ask(
+                &fcx,
+                &m,
+                address,
+                &query(id + 300, "bin.direct.", RecordType::TXT, true),
+            )
+            .await
+            .expect("an answer");
+            let strings: Vec<Vec<u8>> = reply
+                .answers
+                .iter()
+                .filter_map(|record| match &record.data {
+                    RData::TXT(txt) => Some(txt.txt_data.iter().map(|s| s.to_vec())),
+                    _ => None,
+                })
+                .flatten()
+                .collect();
+            assert_eq!(
+                strings,
+                vec![seen.to_string().into_bytes(), vec![255, 254]],
+                "{address}"
+            );
             let reply = ask(
                 &fcx,
                 &m,

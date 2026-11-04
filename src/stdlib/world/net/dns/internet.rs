@@ -37,7 +37,6 @@ use std::time::Duration;
 use fictionet::stdlib::network::ip::non_public_address;
 use fictionet::stdlib::protocols::dns::dnssec::rdata::DNSSECRData;
 use fictionet::stdlib::protocols::dns::op::Message;
-use fictionet::stdlib::protocols::dns::rr::rdata::TXT;
 use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RData, RecordType};
 use fictionet::stdlib::protocols::dns::{Request, dname_substitute};
 use fictionet::stdlib::services::dns::authority::{Authority, Copies, ServerConfig, Step};
@@ -534,8 +533,10 @@ pub struct Echo {
 
 impl Echo {
     /// Echoes for questions whose answers were asked from `upstream`. It
-    /// changes no reply until a [`client`](Self::client) and a
-    /// [`name`](Self::name) are given.
+    /// changes no reply until a [`client`](Self::client) is given. Then it
+    /// changes the TXT strings that are the upstream's address, at any
+    /// name, and the A records that hold it only at the names given with
+    /// [`name`](Self::name).
     pub fn new(upstream: Ipv4Addr) -> Echo {
         Echo {
             upstream,
@@ -631,15 +632,13 @@ fn echo(message: &mut Message, names: &HashSet<LowerName>, egress: Ipv4Addr, see
         let named = names.contains(&LowerName::new(&record.name));
         match &mut record.data {
             RData::A(a) if a.0 == egress && named => a.0 = seen,
-            RData::TXT(txt) if txt.txt_data.iter().any(|s| **s == *text.as_bytes()) => {
-                let strings = txt.txt_data.iter().map(|s| {
-                    if **s == *text.as_bytes() {
-                        seen.to_string()
-                    } else {
-                        String::from_utf8_lossy(s).into_owned()
+            // Every other string keeps its octets (RFC 1035 §3.3.14).
+            RData::TXT(txt) => {
+                for string in txt.txt_data.iter_mut() {
+                    if **string == *text.as_bytes() {
+                        *string = seen.to_string().into_bytes().into_boxed_slice();
                     }
-                });
-                *txt = TXT::new(strings.collect());
+                }
             }
             _ => {}
         }

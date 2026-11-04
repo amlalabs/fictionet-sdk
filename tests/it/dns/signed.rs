@@ -1141,3 +1141,57 @@ fn a_dnskey_of_another_protocol_is_read_and_is_no_key() {
     );
     assert_eq!(validation.validation, Validation::Secure);
 }
+
+/// A CNAME loop through a wildcard answers SERVFAIL with the chain, and
+/// with DO the chain goes with the proofs of its wildcard expansions
+/// (RFC 1034 §3.6.2, RFC 4035 §3.1.3.3), signed offline and online alike.
+#[test]
+fn a_loop_through_a_wildcard_carries_its_proof() {
+    let looped = || {
+        let soa = SOA::new(
+            name("ns1.example."),
+            name("hostmaster.example."),
+            1,
+            7200,
+            3600,
+            1209600,
+            300,
+        );
+        Zone::builder(name("example."), soa, 3600)
+            .rrset(rrset("example.", vec![RData::NS(NS(name("ns1.example.")))]))
+            .rrset(rrset("ns1.example.", vec![RData::A(A::new(192, 0, 2, 1))]))
+            .rrset(rrset(
+                "*.example.",
+                vec![RData::CNAME(CNAME(name("x.example.")))],
+            ))
+            .build()
+            .unwrap()
+    };
+    for denial in denials() {
+        let offline = looped().signed(&keys(), window(), denial.clone()).unwrap();
+        let online = Signed::new(looped(), keys(), window(), denial.clone());
+        for (how, data) in [("offline", &offline as &dyn ZoneData), ("online", &online)] {
+            let reply = ask(data, "x.example.", RecordType::A, AnyResponse::All);
+            assert_eq!(
+                reply.metadata.response_code,
+                ResponseCode::ServFail,
+                "{how} {denial:?}"
+            );
+            assert!(reply.metadata.authoritative, "{how} {denial:?}");
+            assert!(
+                reply
+                    .answers
+                    .iter()
+                    .any(|record| record.record_type() == RecordType::CNAME),
+                "{how} {denial:?}: the chain"
+            );
+            assert!(
+                reply.authorities.iter().any(|record| matches!(
+                    record.record_type(),
+                    RecordType::NSEC | RecordType::NSEC3
+                )),
+                "{how} {denial:?}: the proof"
+            );
+        }
+    }
+}

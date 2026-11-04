@@ -204,7 +204,8 @@ extra iterations, in base32hex. RRSIG times are decimal. Validation results are 
   answer to ANY with DO=1 also carries the DNSSEC RRsets of the name it matched, which ANY asks for
   (`anyExtra`): the NSEC there in an NSEC zone, the DNSKEY set at the apex, each owned by the question's
   name, as Rust's `AnyResponse::All` answers; the NSEC3PARAM RRset is zone data.
-- **The CNAME chase** stops at the first repeated name, at a name outside the zone, or at YXDOMAIN, and an
+- **The CNAME chase** answers SERVFAIL with AA and the chain at the first repeated name, since a loop is an error
+  (RFC 1034 §3.6.2), and stops at a name outside the zone or at YXDOMAIN. An
   RRset it reaches twice, such as a DNAME it passes again, goes out once (RFC 2181 §5). The
   definition carries fuel of 256^256 steps only to be total. Each step visits a new name, a CNAME target the
   zone holds or a DNAME substitution of at most 255 octets, so a chain ends another way long before that;
@@ -236,9 +237,17 @@ extra iterations, in base32hex. RRSIG times are decimal. Validation results are 
   request makes at most one lookup. A real server that answered that lookup with an error RCODE other than
   REFUSED, which gives no facts (`Looked.failed`), has the question answered with that RCODE
   (`respond_failed`), as `Learned::failed` does; such a response is no filing true of the zone, so `Copied`
-  and the theorems that rest on it leave it out. When the response to the client's question was filed and the answer
-  still stops at a name a CNAME or DNAME chain reached, `Copies` looks that name up; only a real server that
-  stops a chain early, outside `Copied`, leaves it so, and this model leaves that lookup out. An overlay is a function of its base's steps for the question and for
+  and the theorems that rest on it leave it out. An authoritative SERVFAIL for a CNAME loop does give facts,
+  the chain's CNAME RRsets, which are the zone's data (RFC 1034 §3.6.2): Rust files them beside the RCODE, and
+  the generator files them as a `response`. `Copies` makes other lookups this model leaves out, each for a
+  real server that answers outside `Copied` or serves more zones than one: the name a CNAME or DNAME chain
+  reached, when the response to the client's question was filed and the answer still stops there, as at a
+  server that stops a chain early; the CNAME at an alias whose server answered NSEC there with NODATA while its
+  own denial records show the CNAME (`Learned::stops_at_alias`); the client's question at an address that
+  turned out not to serve the zone it was noted for, to find a child zone it does serve
+  (`Copies::lame_holding`); and the SOA RRset at a name below a cut whose zone no response has shown yet.
+  The differential test's `check_lookups` rejects them, and the vectors draw none of them;
+  `tests/it/dns/learned.rs` tests them. An overlay is a function of its base's steps for the question and for
   `<apex> DS`, with what it invents abstract: the theorems bound its lookups and keep its replies stable,
   and `Authority.tla` checks it with lookups shared between requests.
 - **Exchanges** model the state the matching rule touches: the generation, the next exchange number, the

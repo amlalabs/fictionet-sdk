@@ -806,7 +806,7 @@ example : ∀ e, entryFor 100 limits 0 (.positive wwwTxt .authAnswer .secure (so
   fun _ h => rrsig_caps_ttl h
 
 /-- A failure cached for the key. -/
-def cache2 : Cache := insert 100 limits ⟨0, []⟩ (.failure wwwKey .noReachableAuthority)
+def cache2 : Cache := insert 100 limits ⟨0, []⟩ (.failure wwwKey .noReachableAuthority none)
 
 #print axioms failure_never_negative
 example : ∀ kind soa v, serve 110 cache2 wwwKey ≠ some (.negative kind soa v) :=

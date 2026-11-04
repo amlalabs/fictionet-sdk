@@ -82,13 +82,15 @@ inductive Offer where
   the RRSIGs that validated it, and whether the reply was truncated. -/
   | negative (key : Key) (kind : Negative) (soa : Option RRset) (rank : Rank) (denialTtl : Option Nat)
       (validation : Validation) (sigExpires : Option Nat) (originalTtl : Option Nat) (truncated : Bool)
-  | failure (key : Key) (why : FailureKind)
+  /-- A failed resolution of a key, with how long the failure before it lasted when the resolution began while
+  that one persisted (`persisting`). -/
+  | failure (key : Key) (why : FailureKind) (follows : Option Nat)
 deriving DecidableEq, Repr
 
 def Offer.key : Offer → Key
   | .positive s _ _ _ _ _ => ⟨s.owner, s.rtype⟩
   | .negative k _ _ _ _ _ _ _ _ => k
-  | .failure k _ => k
+  | .failure k _ _ => k
 
 /-- The rank an entry holds its key at. A negative answer ranks as the answer it came in; a failure is no data
 and ranks lowest. -/
@@ -137,7 +139,9 @@ theorem validatedCap_le (now : Nat) (lim : Limits) (v : Validation) (sig orig : 
 /-- The entry an offer makes at `now`, or none when the offer may not be cached: truncated replies
 (RFC 2181 §9), TTL zero (RFC 1035 §7.4), negatives without an SOA (RFC 2308 §5). TTLs are capped at
 `maxTtl` (RFC 8767 §4), and positive and negative entries by their validation (`validatedCap`); a proven
-negative uses min(SOA TTL, MINIMUM, NSEC TTL) (RFC 9077 §3); a failure lives `failureTtl` (RFC 9520 §3.2). -/
+negative uses min(SOA TTL, MINIMUM, NSEC TTL) (RFC 9077 §3); a failure lives `failureTtl`, or twice as long as the
+failure it follows, up to 300 seconds unless `failureTtl` is longer (RFC 9520 §3.2). The entry's offered TTL is
+how long the failure lasts. -/
 def entryFor (now : Nat) (lim : Limits) (g : Nat) : Offer → Option Entry
   | .positive s r v sig orig tc =>
     let ttl := min (readTtl s.ttl) lim.maxTtl
@@ -153,7 +157,19 @@ def entryFor (now : Nat) (lim : Limits) (g : Nat) : Offer → Option Entry
         | none => base) lim.maxTtl
       if tc || ttl == 0 then none
       else some ⟨k, .negative kind soa r v, now, validatedCap now lim v sig orig (now + ttl), soa.ttl, g⟩
-  | .failure k why => some ⟨k, .failure why, now, now + lim.failureTtl, lim.failureTtl, g⟩
+  | .failure k why follows =>
+    let lasts := match follows with
+      | some l => min (2 * l) (max 300 lim.failureTtl)
+      | none => lim.failureTtl
+    some ⟨k, .failure why, now, now + lasts, lasts, g⟩
+
+/-- How long the failure cached for `k` lasts, when a resolution of `k` that begins at `now` finds it persisting:
+it is served still, or ended less than its own length ago (RFC 9520 §3.2). A resolution reads it when it begins and
+offers it with its failure. -/
+def persisting (now : Nat) (c : Cache) (k : Key) : Option Nat :=
+  match c.entries.find? (·.key == k) with
+  | some ⟨_, .failure _, _, exp, lasts, g⟩ => if g == c.generation && now < exp + lasts then some lasts else none
+  | _ => none
 
 /-- The entry lives at `now`: written in the current generation and not expired. -/
 def live (c : Cache) (now : Nat) (e : Entry) : Bool := e.generation == c.generation && now < e.expires
@@ -244,7 +260,7 @@ theorem entryFor_spec {now : Nat} {lim : Limits} {g : Nat} {o : Offer} {e : Entr
           have := validatedCap_le now lim v sig orig
             (now + min (min (negTtl { soa with ttl := readTtl soa.ttl }) (readTtl n)) lim.maxTtl)
           exact ⟨rfl, rfl, rfl, by simp only; omega, fun _ _ _ hb => by cases hb⟩
-  | failure k why => cases h; exact ⟨rfl, rfl, rfl, Nat.le_refl _, fun _ _ _ hb => by cases hb⟩
+  | failure k why follows => cases h; exact ⟨rfl, rfl, rfl, Nat.le_refl _, fun _ _ _ hb => by cases hb⟩
 
 theorem insert_entries (now : Nat) (lim : Limits) (c : Cache) (o : Offer) :
     (insert now lim c o).generation = c.generation ∧

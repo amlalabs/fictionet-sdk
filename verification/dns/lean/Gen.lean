@@ -478,7 +478,8 @@ def rSpec : G Spec := do
   let mut sets : List RRset := [⟨apex, 2, 3600, [.ns ns1]⟩, ⟨ns1, 1, 3600, [.a [192, 0, 2, 1]]⟩]
   for n in chosen do
     sets := sets ++ (← rDataSets n apex (ns1 :: chosen))
-  if (← chance 2) then sets := sets ++ (← rDataSets (lb "*" :: apex) apex [ns1])
+  -- A CNAME at the wildcard to a name it answers for is a loop through the wildcard.
+  if (← chance 2) then sets := sets ++ (← rDataSets (lb "*" :: apex) apex [ns1, lb "loop" :: apex])
   if (← chance 3) then sets := sets ++ (← rDataSets ([lb "*", lb "b"] ++ apex) apex [ns1])
   if (← chance 2) then
     let target ← pick #[[lb "example", lb "net"], [lb "other", lb "org"], lb "deep" :: apex,
@@ -1099,7 +1100,7 @@ def offerJson : Offer → String
       ("denial_ttl", optNat nsec),
       ("validation", validationJson v), ("sig_expires", optNat sig), ("original_ttl", optNat orig),
       ("truncated", jbool tc)]
-  | .failure k why => jobj [("kind", jstr "failure"), ("key", keyJson k), ("why", failureJson why)]
+  | .failure k why _ => jobj [("kind", jstr "failure"), ("key", keyJson k), ("why", failureJson why)]
 
 def servedJson : Option Served → String
   | none => "null"
@@ -1145,7 +1146,7 @@ def rOffer : G Offer := do
     -- An authoritative server's negative, or a forwarder's.
     let rank ← pick #[.authAnswer, .nonAuthAnswer]
     return .negative k kind soa? rank denialTtl v sig orig (← chance 8)
-  | _ => return .failure k (← pick #[.noReachableAuthority, .workExceeded, .unknown])
+  | _ => return .failure k (← pick #[.noReachableAuthority, .workExceeded, .unknown]) none
 
 def cacheCase : G String := do
   let lim : Limits := ⟨← pick #[3600, 604800], ← pick #[5, 30, 300]⟩
@@ -1155,10 +1156,14 @@ def cacheCase : G String := do
   let mut ops : Array String := #[]
   let mut results : Array String := #[]
   for _ in [0:n] do
-    now := now + (← pick #[0, 1, 10, 100, 1000])
+    -- A step past one failure TTL lands where a failure that persisted outlasts the one before it.
+    now := now + (← pick #[0, 1, 10, 100, 1000, lim.failureTtl + 1])
     match ← rNat 6 with
     | 0 | 1 | 2 =>
-      let o ← rOffer
+      -- A failed resolution begins and ends at `now`.
+      let o := match ← rOffer with
+        | .failure k why _ => .failure k why (persisting now c k)
+        | o => o
       c := insert now lim c o
       ops := ops.push (jobj [("op", jstr "offer"), ("time", jnat now), ("offer", offerJson o)])
     | 3 =>

@@ -1,6 +1,6 @@
 //! Zones a resolver serves itself instead of asking the internet: the
-//! special-use names of RFC 6761 and RFC 7686, the reverse zones of
-//! private and special addresses (RFC 6303), `home.arpa` (RFC 8375),
+//! special-use names of RFC 6761, RFC 6762, and RFC 7686, the reverse
+//! zones of private and special addresses (RFC 6303), `home.arpa` (RFC 8375),
 //! `resolver.arpa` (RFC 9462), and `service.arpa` (RFC 9665). The SVCB
 //! parameters of a resolver's encrypted endpoints in `resolver.arpa` are
 //! here too: [`alpn`], [`port`], [`ipv4_hint`], [`ipv6_hint`], and
@@ -29,7 +29,7 @@ use super::zone::{Node, Zone, ZoneBuilder};
 
 /// Every zone here, each with `apex`: `localhost`, the zones of
 /// [`rfc6303`], `home.arpa`, an empty `resolver.arpa`, `service.arpa`,
-/// `onion`, `test`, and `invalid`.
+/// `onion`, `test`, `invalid`, and `local`.
 pub fn defaults(apex: &EmptyApex) -> Vec<Arc<dyn ZoneData>> {
     let mut zones: Vec<Arc<dyn ZoneData>> = vec![Arc::new(localhost(apex))];
     for zone in rfc6303(apex) {
@@ -41,6 +41,7 @@ pub fn defaults(apex: &EmptyApex) -> Vec<Arc<dyn ZoneData>> {
     zones.push(Arc::new(onion(apex)));
     zones.push(Arc::new(test(apex)));
     zones.push(Arc::new(invalid(apex)));
+    zones.push(Arc::new(local(apex)));
     zones
 }
 
@@ -189,6 +190,14 @@ pub fn test(apex: &EmptyApex) -> SpecialUse {
 /// NXDOMAIN (RFC 6761 §6.4).
 pub fn invalid(apex: &EmptyApex) -> SpecialUse {
     SpecialUse::new(&name("invalid."), apex, None)
+}
+
+/// `local`, whose names Multicast DNS resolves on the local link: the
+/// apex and every name below it get the immediate NXDOMAIN a caching
+/// server gives every query for them, never asking the internet
+/// (RFC 6762 §22.1).
+pub fn local(apex: &EmptyApex) -> SpecialUse {
+    SpecialUse::new(&name("local."), apex, None)
 }
 
 /// A special-use zone a resolver answers by itself, every name in it

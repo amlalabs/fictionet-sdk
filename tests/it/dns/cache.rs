@@ -276,6 +276,7 @@ fn a_failure_is_laid_over_data_that_answers_no_client() {
     let failure = |key: &Key| Offer::Failure {
         key: key.clone(),
         why: FailureKind::NoReachableAuthority,
+        follows: None,
     };
     cache.insert(at(100), failure(&ns_key));
     assert!(matches!(
@@ -421,11 +422,13 @@ fn a_persistent_failure_is_cached_longer_each_time() {
     let mut cache = cache();
     let www = key("www.example.", RecordType::A);
     let fail = |cache: &mut Cache, now: u64| {
+        let follows = cache.persisting(&www, at(now));
         cache.insert(
             at(now),
             Offer::Failure {
                 key: www.clone(),
                 why: FailureKind::NoReachableAuthority,
+                follows,
             },
         );
         cache.get(&www, at(now)).map(Entry::expires)
@@ -446,4 +449,25 @@ fn a_persistent_failure_is_cached_longer_each_time() {
     // Long after the last one ended, a failure is new again.
     let later = now + 300 + 300 + 1;
     assert_eq!(fail(&mut cache, later), Some(at(later + 5)));
+}
+
+/// Whether a failure persists is read when the resolution that fails
+/// again begins, so one that begins while the last failure persists and
+/// ends long after is still cached twice as long (RFC 9520 §3.2).
+#[test]
+fn a_failure_persists_from_when_its_resolution_began() {
+    let mut cache = cache();
+    let www = key("www.example.", RecordType::A);
+    let offer = |follows| Offer::Failure {
+        key: www.clone(),
+        why: FailureKind::NoReachableAuthority,
+        follows,
+    };
+    cache.insert(at(0), offer(None));
+    assert_eq!(cache.persisting(&www, at(9)), Some(Duration::from_secs(5)));
+    assert_eq!(cache.persisting(&www, at(10)), None);
+    // Began at 6, while the first failure persisted, and failed at 60.
+    let follows = cache.persisting(&www, at(6));
+    cache.insert(at(60), offer(follows));
+    assert_eq!(cache.get(&www, at(60)).map(Entry::expires), Some(at(70)));
 }
