@@ -14,17 +14,15 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 
 use fictionet::stdlib::protocols::dns::op::ResponseCode;
-use fictionet::stdlib::protocols::dns::{Ede, EdeCode};
-use fictionet::stdlib::services::dns::authority::{
-    ChaosAnswer, ChaosReply, Identity, ServerConfig, chaos,
-};
+use fictionet::stdlib::protocols::dns::rr::Name;
+use fictionet::stdlib::services::dns::authority::{ChaosZone, Identity, ServerConfig};
 use fictionet::stdlib::services::dns::resolver::ROOT_SERVERS;
 use fictionet::stdlib::world::net::dns::internet::{self, Echo};
 use fictionet::stdlib::world::net::{Host, Program};
 
-use super::bind;
 use super::public::{self, PUBLIC_RESOLVERS, PublicResolver};
 use super::roots::{self, GTLD_SERVERS};
+use super::{bind, chaos};
 
 /// How one anycast server looks from a place: the round trip to the
 /// instance that answers there, and what that instance says about itself.
@@ -152,21 +150,28 @@ impl Place {
     /// median of five round trips to each, the instance names it gave for
     /// `id.server`, `hostname.bind`, `version.bind`, and `version.server`
     /// and their TTL, its NSID, and the RCODE it gave for other CHAOS
-    /// names. What each gives `id.server` CH A, whether its TXT answers
-    /// set AA, and the payload of its CHAOS replies are as seen there on
-    /// 2026-11-02. Instances are the ones anycast picked there that day,
-    /// so some sit far away: k.root answered from London. Other
-    /// authorities took 20 ms, the median over six of them. Quad9's and
-    /// OpenDNS's egress are the addresses `whoami.akamai.net` A gave
-    /// through each there on 2026-11-03.
+    /// names. Instances are the ones anycast picked there that day, so
+    /// some sit far away: k.root answered from London. Other authorities
+    /// took 20 ms, the median over six of them. Quad9's and OpenDNS's
+    /// egress are the addresses `whoami.akamai.net` A gave through each
+    /// there on 2026-11-03.
     pub fn san_francisco_bay_area() -> Place {
         use ResponseCode::{NoError, NotImp, Refused, ServFail};
-        let txt = |text: &str| ChaosAnswer::Txt(text.to_string());
-        let no = |rcode| ChaosAnswer::Reply(ChaosReply::rcode(rcode));
-        // The names below, in order: id.server, hostname.bind,
-        // version.bind, version.server. Other types get REFUSED, and TXT
-        // answers leave AA clear, as NSD and Knot do.
-        let identity = |nsid: &str, unlisted: ResponseCode, answers: [ChaosAnswer; 4]| {
+        fn txt(text: &str) -> Result<&str, ResponseCode> {
+            Ok(text)
+        }
+        fn no(rcode: ResponseCode) -> Result<&'static str, ResponseCode> {
+            Err(rcode)
+        }
+        // The names of `answers`, in order: id.server, hostname.bind,
+        // version.bind, version.server. A name with text gets it in the
+        // plain look with TTL `ttl`.
+        fn identity(
+            nsid: &str,
+            unlisted: ResponseCode,
+            ttl: u32,
+            answers: [Result<&str, ResponseCode>; 4],
+        ) -> Identity {
             let names = [
                 chaos::id_server(),
                 chaos::hostname_bind(),
@@ -174,80 +179,55 @@ impl Place {
                 chaos::version_server(),
             ];
             let mut identity = Identity {
-                unlisted: ChaosReply::rcode(unlisted),
+                unlisted,
                 nsid: Some(nsid.as_bytes().to_vec()),
                 ..Identity::none()
             };
             for (name, answer) in names.into_iter().zip(answers) {
-                identity = identity.answer(name, answer);
+                identity = match answer {
+                    Ok(text) => identity.zone(chaos::txt(&name, ttl, text)),
+                    Err(rcode) => identity.rcode(name, rcode),
+                };
             }
             identity
-        };
+        }
         let ms = Duration::from_millis;
-        // BIND serves each of its names with text as a zone, and G runs it
-        // too.
+        // BIND serves each of its names with text as a zone with an SOA
+        // and an NS record, and G runs it too.
         let zones = |identity: Identity| Identity {
-            chaos: identity
-                .chaos
+            zones: identity
+                .zones
                 .into_iter()
-                .map(|(name, answer)| match answer {
-                    ChaosAnswer::Txt(text) => {
-                        let zone = bind::chaos_zone(&name, Some(text));
-                        (name, zone)
-                    }
-                    answer => (name, answer),
-                })
+                .map(|(name, zone)| (name, bind::chaos_zone(zone)))
                 .collect(),
             ..identity
         };
         // C, I, and M also serve `authors.bind`, a zone with no TXT.
         let bind = |identity: Identity| {
-            let authors = chaos::authors_bind();
-            let zone = bind::chaos_zone(&authors, None);
-            zones(identity).answer(authors, zone)
-        };
-        // Verisign's servers answer other types with NOTIMP. Its root
-        // letter sets AA; its gTLD servers do not.
-        let verisign = |identity: Identity| Identity {
-            other_types: ChaosReply::rcode(NotImp),
-            ..identity
-        };
-        // E and F answer other types with NOTIMP and EDE 21, and advertise
-        // 512 octets.
-        let not_supported = |identity: Identity| Identity {
-            aa: true,
-            other_types: ChaosReply {
-                ede: Some(Ede {
-                    code: EdeCode::NOT_SUPPORTED,
-                    text: Some("Unsupported DNS Type for Class CHAOS".to_string()),
-                }),
-                ..ChaosReply::rcode(NotImp)
-            },
-            payload: Some(512),
-            ..identity
+            let authors = ChaosZone::new(Name::from(&chaos::authors_bind()));
+            zones(identity).zone(bind::chaos_zone(authors))
         };
         let letters = [
             (
                 32,
-                Identity {
-                    aa: true,
-                    ..verisign(identity(
-                        "a.r.ussea-4c",
-                        NoError,
-                        [
-                            txt("nnn1-ussea-4c"),
-                            txt("nnn1-ussea-4c"),
-                            txt("ATLAS"),
-                            txt("ATLAS"),
-                        ],
-                    ))
-                },
+                identity(
+                    "a.r.ussea-4c",
+                    NoError,
+                    0,
+                    [
+                        txt("nnn1-ussea-4c"),
+                        txt("nnn1-ussea-4c"),
+                        txt("ATLAS"),
+                        txt("ATLAS"),
+                    ],
+                ),
             ),
             (
                 72,
                 identity(
                     "b1-iad",
                     Refused,
+                    0,
                     [
                         txt("b1-iad"),
                         txt("b1-iad"),
@@ -261,6 +241,7 @@ impl Place {
                 bind(identity(
                     "lax1a.c.root-servers.org",
                     Refused,
+                    0,
                     [
                         txt("lax1b.c.root-servers.org"),
                         txt("lax1a.c.root-servers.org"),
@@ -274,6 +255,7 @@ impl Place {
                 identity(
                     "paca6.droot.maxgigapop.net",
                     Refused,
+                    0,
                     [
                         txt("paca7.droot.maxgigapop.net"),
                         txt("paca8.droot.maxgigapop.net"),
@@ -284,65 +266,61 @@ impl Place {
             ),
             (
                 24,
-                not_supported(identity(
+                identity(
                     "c01.SEA.eroot",
                     NotImp,
+                    60,
                     [
                         txt("c01.SEA.eroot"),
                         txt("c01.SEA.eroot"),
                         txt("2026.10.4"),
                         no(NotImp),
                     ],
-                ))
-                .ttl(60),
+                ),
             ),
             (
                 9,
-                not_supported(identity(
+                identity(
                     "SJC.cf.f.root-servers.org",
                     NotImp,
+                    60,
                     [
                         txt("SJC.cf.f.root-servers.org"),
                         txt("SJC.cf.f.root-servers.org"),
                         txt("2026.10.4"),
                         no(NotImp),
                     ],
-                ))
-                .ttl(60),
+                ),
             ),
             (
                 48,
                 zones(identity(
                     "groot-con2-3",
                     Refused,
+                    0,
                     [no(Refused), txt("groot-con2-2"), no(Refused), no(Refused)],
                 )),
             ),
             (
                 21,
-                // H adds EDE 21 to its REFUSED.
-                Identity {
-                    other_types: ChaosReply {
-                        ede: Some(Ede::new(EdeCode::NOT_SUPPORTED)),
-                        ..ChaosReply::rcode(Refused)
-                    },
-                    ..identity(
-                        "001.nzy.h.root-servers.org",
-                        Refused,
-                        [
-                            txt("001.nzy.h.root-servers.org"),
-                            txt("001.nzy.h.root-servers.org"),
-                            txt("NSD 4.x"),
-                            txt("NSD 4.x"),
-                        ],
-                    )
-                },
+                identity(
+                    "001.nzy.h.root-servers.org",
+                    Refused,
+                    0,
+                    [
+                        txt("001.nzy.h.root-servers.org"),
+                        txt("001.nzy.h.root-servers.org"),
+                        txt("NSD 4.x"),
+                        txt("NSD 4.x"),
+                    ],
+                ),
             ),
             (
                 7,
                 bind(identity(
                     "s1.pix",
                     Refused,
+                    0,
                     [
                         txt("s1.pix"),
                         txt("s1.pix"),
@@ -356,6 +334,7 @@ impl Place {
                 identity(
                     "k.r.ussjc-3",
                     Refused,
+                    0,
                     [
                         txt("rootns-ussjc-3"),
                         txt("rootns-ussjc-3"),
@@ -369,6 +348,7 @@ impl Place {
                 identity(
                     "ns2.gb-lon.k.ripe.net",
                     Refused,
+                    0,
                     [
                         txt("ns3.gb-lon.k.ripe.net"),
                         txt("ns2.gb-lon.k.ripe.net"),
@@ -382,6 +362,7 @@ impl Place {
                 identity(
                     "us-lax-aa",
                     Refused,
+                    0,
                     [
                         txt("us-lax-aa"),
                         txt("us-lax-aa"),
@@ -395,17 +376,19 @@ impl Place {
                 bind(identity(
                     "M-SJC-4",
                     Refused,
+                    0,
                     [txt("M-SJC-4"), txt("M-SJC-4"), txt("9.16"), no(Refused)],
                 )),
             ),
         ];
         // Every gtld-servers.net server answers "ATLAS" for its version.
         let atlas = |nsid: &str, id: &str, hostname: &str| {
-            verisign(identity(
+            identity(
                 nsid,
                 Refused,
+                0,
                 [txt(id), txt(hostname), txt("ATLAS"), txt("ATLAS")],
-            ))
+            )
         };
         let gtld = [
             (6, atlas("nnn1-ussjc-3", "nnn1-ussjc-3", "nnn1-ussjc-3")),
@@ -439,62 +422,45 @@ impl Place {
             identity,
             egress,
         };
+        let nsid = |nsid: &str, identity: Identity| Identity {
+            nsid: Some(nsid.as_bytes().to_vec()),
+            ..identity
+        };
         let resolvers = [
             resolver(
                 7,
-                // Every CHAOS question gets SERVFAIL.
-                Identity {
-                    other_types: ChaosReply::rcode(ServFail),
-                    ..identity(
-                        "gpdns-sfo",
-                        ServFail,
-                        [no(ServFail), no(ServFail), no(ServFail), no(ServFail)],
-                    )
-                },
+                nsid("gpdns-sfo", chaos::refusing(ServFail)),
                 Ipv4Addr::new(172, 253, 1, 21),
             ),
             resolver(
                 8,
-                Identity {
-                    other_types: ChaosReply::rcode(NotImp),
-                    ..identity(
-                        "sjc01",
-                        Refused,
-                        [txt("sjc10"), no(Refused), no(Refused), txt("2026.10.11")],
-                    )
-                },
+                identity(
+                    "sjc01",
+                    Refused,
+                    0,
+                    [txt("sjc10"), no(Refused), no(Refused), txt("2026.10.11")],
+                ),
                 Ipv4Addr::new(172, 69, 133, 100),
             ),
             resolver(
                 7,
-                Identity {
-                    other_types: ChaosReply::rcode(NoError),
-                    ..identity(
-                        "res130.pao",
-                        Refused,
-                        [
-                            txt("res711.pao"),
-                            no(ServFail),
-                            txt("Q9-P-2026080500"),
-                            no(ServFail),
-                        ],
-                    )
-                    .answer(chaos::authors_bind(), no(ServFail))
-                },
+                identity(
+                    "res130.pao",
+                    Refused,
+                    0,
+                    [
+                        txt("res711.pao"),
+                        no(ServFail),
+                        txt("Q9-P-2026080500"),
+                        no(ServFail),
+                    ],
+                )
+                .rcode(chaos::authors_bind(), ServFail),
                 Ipv4Addr::new(74, 63, 16, 229),
             ),
             resolver(
                 17,
-                // Every CHAOS question gets REFUSED.
-                {
-                    let refused = ChaosReply::rcode(Refused);
-                    let no = || ChaosAnswer::Reply(refused.clone());
-                    Identity {
-                        unlisted: refused.clone(),
-                        other_types: refused.clone(),
-                        ..identity("r3003.lax", Refused, [no(), no(), no(), no()])
-                    }
-                },
+                nsid("r3003.lax", chaos::refusing(Refused)),
                 Ipv4Addr::new(208, 67, 219, 130),
             ),
         ];

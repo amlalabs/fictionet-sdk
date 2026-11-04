@@ -198,7 +198,7 @@ impl Config {
     /// - Extended DNS Errors (RFC 8914).
     /// - Every RRset of a local zone's name for ANY, as RFC 1035 §3.2.3
     ///   defines the type.
-    /// - An identity with no names and no NSID ([`Identity::none`]).
+    /// - An identity with no CHAOS data and no NSID ([`Identity::none`]).
     /// - The initial retransmission timeout of RFC 6298 §2.1, 1 second.
     ///
     /// Two values are the SDK's own, since no standard fixes them: one

@@ -42,7 +42,7 @@ pub use copies::Copies;
 pub use engine::AuthorityEngine;
 pub use observe::Observe;
 pub use overlay::Overlay;
-pub use server::{ChaosAnswer, ChaosReply, ChaosZone, Identity, ServerConfig, bare_reply, chaos};
+pub use server::{ChaosZone, Identity, ServerConfig, bare_reply};
 
 /// What an authority does with one request, given what its zones hold
 /// now.

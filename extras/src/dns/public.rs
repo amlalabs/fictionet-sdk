@@ -43,7 +43,7 @@ use fictionet::stdlib::protocols::dns::rr::rdata::{SVCB, TXT};
 use fictionet::stdlib::protocols::dns::rr::{
     LowerName, Name, RData, Record, RecordSet, RecordType,
 };
-use fictionet::stdlib::services::dns::authority::{ChaosAnswer, Identity};
+use fictionet::stdlib::services::dns::authority::Identity;
 use fictionet::stdlib::services::dns::resolver::{Config, LocalZone};
 use fictionet::stdlib::services::dns::zone::special::{
     self, alpn, dohpath, ipv4_hint, ipv6_hint, port,
@@ -56,7 +56,7 @@ use fictionet::stdlib::world::net::dns::Upstream;
 use fictionet::stdlib::world::net::dns::encrypted::Fronts;
 
 use super::place::ResolverSite;
-use super::{doh, unbound};
+use super::{chaos, doh, unbound};
 
 /// One address pair of a public resolver and the name its PTR records
 /// give.
@@ -445,8 +445,8 @@ fn google_whoami(config: Config, site: &ResolverSite, egress: Ipv4Addr) -> Confi
 /// Cloudflare's 1.1.1.1, answering `whoami.cloudflare` CH TXT with the
 /// network's egress address, the address the real one would see.
 fn cloudflare_whoami(mut config: Config, _site: &ResolverSite, egress: Ipv4Addr) -> Config {
-    let whoami = ChaosAnswer::Txt(egress.to_string());
-    config.identity = config.identity.answer(whoami_cloudflare(), whoami);
+    let whoami = chaos::txt(&whoami_cloudflare(), 0, &egress.to_string());
+    config.identity = config.identity.zone(whoami);
     config
 }
 

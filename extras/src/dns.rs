@@ -21,10 +21,13 @@
 //! how the root, `gtld-servers.net`, and public resolver servers look
 //! from one place, and [`roots`] the `gtld-servers.net` servers' addresses,
 //! what the root and `gtld-servers.net` servers' software does
-//! everywhere, and the zones a mirror serves at their addresses. [`unbound`] plays Unbound's configuration, and [`bind`]
-//! BIND's CHAOS-class zones.
+//! everywhere, and the zones a mirror serves at their addresses. [`unbound`] plays Unbound's configuration, [`chaos`]
+//! the CHAOS-class names servers answer about themselves and the plain
+//! and refusing looks of those answers, and [`bind`] BIND's CHAOS-class
+//! zones.
 
 pub mod bind;
+pub mod chaos;
 pub mod doh;
 pub mod place;
 pub mod public;

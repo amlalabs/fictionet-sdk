@@ -17,14 +17,14 @@ use fictionet::stdlib::protocols::dns::op::{
     Edns, Message, MessageType, OpCode, Query, ResponseCode,
 };
 use fictionet::stdlib::protocols::dns::rr::rdata::opt::EdnsOption;
-use fictionet::stdlib::protocols::dns::rr::rdata::{A, NS, SOA, TXT};
+use fictionet::stdlib::protocols::dns::rr::rdata::{A, CNAME, NS, SOA, TXT};
 use fictionet::stdlib::protocols::dns::rr::{
     DNSClass, LowerName, Name, RData, Record, RecordSet, RecordType,
 };
 use fictionet::stdlib::protocols::dns::{Ede, EdeCode, Nsid, Request, Response};
 use fictionet::stdlib::services::dns::authority::{
-    Authority, AuthorityEngine, ChaosAnswer, ChaosReply, Copies, Identity, Observe, Overlay,
-    ServerConfig, Step, Zones, bare_reply, chaos,
+    Authority, AuthorityEngine, ChaosZone, Copies, Identity, Observe, Overlay, ServerConfig, Step,
+    Zones, bare_reply,
 };
 use fictionet::stdlib::services::dns::zone::{Fact, Lazy, Transparent, Zone, ZoneData};
 use fictionet::stdlib::services::dns::{
@@ -34,8 +34,11 @@ use fictionet::stdlib::services::dns::{
 use fictionet::stdlib::services::serve::Transport;
 use fictionet::time::Instant;
 use fictionet::{Seed, SeededEntropy};
-use fictionet_extras::dns::bind;
+use fictionet_extras::dns::place::Place;
+use fictionet_extras::dns::public::PUBLIC_RESOLVERS;
 use fictionet_extras::dns::roots::gtld_front;
+use fictionet_extras::dns::unbound;
+use fictionet_extras::dns::{bind, chaos};
 
 /// The server the engines under test run at.
 const LOCAL: &str = "192.0.2.53:53";
@@ -607,33 +610,29 @@ fn an_unknown_fact_gives_servfail_never_a_negative() {
 // CHAOS.
 
 #[test]
-fn chaos_questions_are_answered_by_name_from_the_identity() {
+fn chaos_questions_are_answered_from_the_identitys_data() {
     let calls = Arc::new(AtomicUsize::new(0));
-    let mut server = ServerConfig::generic();
     let identity = Identity {
-        unlisted: ChaosReply::rcode(ResponseCode::ServFail),
-        aa: true,
+        unlisted: ResponseCode::ServFail,
         ..Identity::none()
     }
-    .answer(chaos::id_server(), ChaosAnswer::Txt("sjc07".to_string()))
-    .answer(
-        chaos::version_bind(),
-        ChaosAnswer::Reply(ChaosReply::rcode(ResponseCode::Refused)),
-    )
-    .ttl(60);
-    server.identity = identity.clone();
+    .zone(chaos::txt(&chaos::id_server(), 60, "sjc07"))
+    .rcode(chaos::version_bind(), ResponseCode::Refused);
+    let server = ServerConfig {
+        identity,
+        ..ServerConfig::generic()
+    };
     let mut engine = AuthorityEngine::new(Counting(calls.clone()), server, local());
-    let chaos_query = |qname: &str, qtype: RecordType| {
-        query(qname, qtype, |m| {
+    let mut ask = |qname: &str, qtype: RecordType| {
+        let message = query(qname, qtype, |m| {
             m.queries[0].set_query_class(DNSClass::CH);
-        })
+            m.set_edns(Edns::new());
+        });
+        the_answer(&ask_with(&mut engine, &message, Transport::Udp))
     };
 
-    let reply = the_answer(&ask_with(
-        &mut engine,
-        &chaos_query("ID.Server.", RecordType::TXT),
-        Transport::Udp,
-    ));
+    // The text, with AA set, in the question's case.
+    let reply = ask("ID.Server.", RecordType::TXT);
     assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
     assert!(reply.metadata.authoritative);
     assert_eq!(reply.answers.len(), 1);
@@ -642,98 +641,87 @@ fn chaos_questions_are_answered_by_name_from_the_identity() {
     assert_eq!(record.dns_class, DNSClass::CH);
     assert_eq!(record.ttl, 60);
     assert_eq!(record.data, RData::TXT(TXT::new(vec!["sjc07".to_string()])));
+    // Every reply to a query with an OPT record has one, with the
+    // server's payload (RFC 6891 §7).
+    assert_eq!(reply.edns.map(|edns| edns.max_payload()), Some(1232));
 
-    let reply = the_answer(&ask_with(
-        &mut engine,
-        &chaos_query("version.bind.", RecordType::TXT),
-        Transport::Udp,
-    ));
-    assert_eq!(reply.metadata.response_code, ResponseCode::Refused);
-    assert!(reply.answers.is_empty());
+    // Another type at the name is NODATA, and a name below it NXDOMAIN,
+    // both without an SOA, since the zone has none.
+    for (qname, qtype, rcode) in [
+        ("id.server.", RecordType::A, ResponseCode::NoError),
+        ("id.server.", RecordType::SOA, ResponseCode::NoError),
+        ("foo.id.server.", RecordType::TXT, ResponseCode::NXDomain),
+    ] {
+        let reply = ask(qname, qtype);
+        assert_eq!(reply.metadata.response_code, rcode, "{qname} {qtype}");
+        assert!(reply.metadata.authoritative, "{qname} {qtype}");
+        assert!(reply.answers.is_empty(), "{qname} {qtype}");
+        assert!(reply.authorities.is_empty(), "{qname} {qtype}");
+    }
 
-    let reply = the_answer(&ask_with(
-        &mut engine,
-        &chaos_query("hostname.bind.", RecordType::TXT),
-        Transport::Udp,
-    ));
-    assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
+    // A name with an RCODE of its own gets it for every type, and an
+    // unlisted name gets the identity's, all without AA.
+    for (qname, qtype, rcode) in [
+        ("version.bind.", RecordType::TXT, ResponseCode::Refused),
+        ("version.bind.", RecordType::A, ResponseCode::Refused),
+        ("hostname.bind.", RecordType::TXT, ResponseCode::ServFail),
+        ("hostname.bind.", RecordType::A, ResponseCode::ServFail),
+    ] {
+        let reply = ask(qname, qtype);
+        assert_eq!(reply.metadata.response_code, rcode, "{qname} {qtype}");
+        assert!(!reply.metadata.authoritative, "{qname} {qtype}");
+        assert!(reply.answers.is_empty(), "{qname} {qtype}");
+        assert!(reply.edns.is_some(), "{qname} {qtype}");
+    }
 
     // The IN lookup never sees a CHAOS question.
     assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
 
-    // NSD leaves AA clear and refuses other types; Verisign answers them
-    // with NOTIMP; e.root and f.root with NOTIMP and EDE 21, advertising
-    // 512 octets. Every reply to a query with an OPT record has one
-    // (RFC 6891 §7).
-    let not_supported = Ede {
-        code: EdeCode::NOT_SUPPORTED,
-        text: Some("Unsupported DNS Type for Class CHAOS".to_string()),
+/// An RCODE for a name is for that name alone, and a name below a zone is
+/// answered from the deepest zone above it.
+#[test]
+fn chaos_zones_nest_and_rcodes_name_one_name() {
+    let identity = Identity::none()
+        .zone(chaos::txt(&LowerName::new(&name("server.")), 0, "outer"))
+        .zone(chaos::txt(&chaos::id_server(), 0, "inner"))
+        .rcode(chaos::version_server(), ResponseCode::NotImp);
+    let server = ServerConfig {
+        identity,
+        ..ServerConfig::generic()
     };
-    let fronts = [
-        (
-            Identity {
-                aa: false,
-                other_types: ChaosReply::rcode(ResponseCode::Refused),
-                ..identity.clone()
-            },
-            false,
-            ResponseCode::Refused,
-            Some(1232),
-            None,
-        ),
-        (
-            Identity {
-                other_types: ChaosReply::rcode(ResponseCode::NotImp),
-                ..identity.clone()
-            },
-            true,
-            ResponseCode::NotImp,
-            Some(1232),
-            None,
-        ),
-        (
-            Identity {
-                other_types: ChaosReply {
-                    ede: Some(not_supported.clone()),
-                    ..ChaosReply::rcode(ResponseCode::NotImp)
-                },
-                payload: Some(512),
-                ..identity
-            },
-            true,
-            ResponseCode::NotImp,
-            Some(512),
-            Some(not_supported),
-        ),
-    ];
-    for (identity, aa, rcode, payload, ede) in fronts {
-        let server = ServerConfig {
-            identity,
-            ..ServerConfig::generic()
-        };
-        let mut engine = AuthorityEngine::new(Counting(calls.clone()), server, local());
-        let mut txt = chaos_query("id.server.", RecordType::TXT);
-        txt.set_edns(Edns::new());
-        let reply = the_answer(&ask_with(&mut engine, &txt, Transport::Udp));
-        assert_eq!(reply.metadata.authoritative, aa);
-        assert_eq!(reply.answers.len(), 1);
-        let mut a = chaos_query("id.server.", RecordType::A);
-        a.set_edns(Edns::new());
-        let reply = the_answer(&ask_with(&mut engine, &a, Transport::Udp));
-        assert_eq!(reply.metadata.response_code, rcode);
-        assert!(!reply.metadata.authoritative);
-        assert!(reply.authorities.is_empty());
-        assert_eq!(reply.edns.as_ref().map(|edns| edns.max_payload()), payload);
-        let sent = reply
-            .edns
+    let mut engine = AuthorityEngine::new(zones(vec![example()]), server, local());
+    let mut ask = |qname: &str| {
+        let message = query(qname, RecordType::TXT, |m| {
+            m.queries[0].set_query_class(DNSClass::CH);
+        });
+        the_answer(&ask_with(&mut engine, &message, Transport::Udp))
+    };
+    let texts = |reply: &Message| -> Vec<String> {
+        reply
+            .answers
             .iter()
-            .flat_map(|edns| edns.options().as_ref().iter());
-        assert_eq!(
-            sent.filter_map(|(_, option)| Ede::from_option(option))
-                .next(),
-            ede
-        );
-    }
+            .map(|record| record.data.to_string())
+            .collect()
+    };
+    let reply = ask("server.");
+    assert_eq!(texts(&reply), ["outer"]);
+    let reply = ask("id.server.");
+    assert_eq!(texts(&reply), ["inner"]);
+    let reply = ask("a.id.server.");
+    assert_eq!(reply.metadata.response_code, ResponseCode::NXDomain);
+    let reply = ask("version.server.");
+    assert_eq!(reply.metadata.response_code, ResponseCode::NotImp);
+    // Below the name with an RCODE is the outer zone's, where it is not.
+    let reply = ask("a.version.server.");
+    assert_eq!(reply.metadata.response_code, ResponseCode::NXDomain);
+    assert!(reply.metadata.authoritative);
+}
+
+#[test]
+#[should_panic(expected = "a CHAOS zone holds no aliases")]
+fn a_chaos_zone_holds_no_alias() {
+    let _ = ChaosZone::new(name("id.server.")).record(0, RData::CNAME(CNAME(name("a."))));
 }
 
 /// A CHAOS name with a zone of its own answers from the zone's records,
@@ -743,15 +731,9 @@ fn a_chaos_zone_answers_from_its_records() {
     let hostname = chaos::hostname_bind();
     let authors = chaos::authors_bind();
     let identity = Identity::none()
-        .answer(
-            hostname.clone(),
-            bind::chaos_zone(&hostname, Some("lax1a".to_string())),
-        )
-        .answer(authors.clone(), bind::chaos_zone(&authors, None))
-        .answer(
-            chaos::version_server(),
-            ChaosAnswer::Reply(ChaosReply::rcode(ResponseCode::Refused)),
-        );
+        .zone(bind::chaos_zone(chaos::txt(&hostname, 0, "lax1a")))
+        .zone(bind::chaos_zone(ChaosZone::new(Name::from(&authors))))
+        .rcode(chaos::version_server(), ResponseCode::Refused);
     let server = ServerConfig {
         identity,
         ..ServerConfig::generic()
@@ -943,7 +925,7 @@ fn zone_transfers_are_the_authoritys_to_decide() {
 #[test]
 fn a_chaos_zone_transfer_is_refused() {
     let version = chaos::version_bind();
-    let identity = Identity::none().answer(version.clone(), bind::chaos_zone(&version, None));
+    let identity = Identity::none().zone(bind::chaos_zone(ChaosZone::new(Name::from(&version))));
     let server = ServerConfig {
         identity,
         ..ServerConfig::generic()
@@ -960,6 +942,518 @@ fn a_chaos_zone_transfer_is_refused() {
             "{qtype}"
         );
         assert!(reply.answers.is_empty() && reply.authorities.is_empty());
+    }
+}
+
+/// Every root letter, `gtld-servers.net` server, and public resolver of
+/// [`Place::san_francisco_bay_area`], and the Unbound look, answer each
+/// CHAOS TXT name a guest asks as they were measured to: the RCODE, and
+/// the text and TTL of each TXT record.
+#[test]
+fn the_measured_servers_answer_chaos_txt_as_measured() {
+    use ResponseCode::{NoError, NotImp, Refused, ServFail};
+    let place = Place::san_francisco_bay_area();
+    let egress = std::net::Ipv4Addr::new(45, 70, 0, 9);
+    let mut servers: Vec<(String, Identity)> = place
+        .servers
+        .iter()
+        .map(|(addr, site)| (addr.to_string(), site.identity.clone()))
+        .collect();
+    for resolver in &PUBLIC_RESOLVERS {
+        let site = place.resolver(resolver.addresses[0].v4);
+        let config = resolver.whoami(resolver.config(site.identity.clone()), &site, egress);
+        servers.push((resolver.addresses[0].v4.to_string(), config.identity));
+    }
+    servers.push(("unbound".to_string(), unbound::config().identity));
+    let names = [
+        "id.server.",
+        "hostname.bind.",
+        "version.bind.",
+        "version.server.",
+        "authors.bind.",
+        "whoami.cloudflare.",
+    ];
+    let mut seen = Vec::new();
+    for (server, identity) in servers {
+        let front = ServerConfig {
+            identity,
+            ..ServerConfig::generic()
+        };
+        let mut engine = AuthorityEngine::new(zones(vec![example()]), front, local());
+        for qname in names {
+            let message = query(qname, RecordType::TXT, |m| {
+                m.queries[0].set_query_class(DNSClass::CH);
+            });
+            let reply = the_answer(&ask_with(&mut engine, &message, Transport::Udp));
+            let texts: Vec<(String, u32)> = reply
+                .answers
+                .iter()
+                .filter_map(|record| match &record.data {
+                    RData::TXT(txt) => Some((txt.to_string(), record.ttl)),
+                    _ => None,
+                })
+                .collect();
+            seen.push((server.clone(), qname, reply.metadata.response_code, texts));
+        }
+    }
+    type Row = (
+        &'static str,
+        &'static str,
+        ResponseCode,
+        &'static [(&'static str, u32)],
+    );
+    let measured: &[Row] = &[
+        ("170.247.170.2", "id.server.", NoError, &[("b1-iad", 0)]),
+        ("170.247.170.2", "hostname.bind.", NoError, &[("b1-iad", 0)]),
+        (
+            "170.247.170.2",
+            "version.bind.",
+            NoError,
+            &[("knot 3.x", 0)],
+        ),
+        (
+            "170.247.170.2",
+            "version.server.",
+            NoError,
+            &[("knot 3.x", 0)],
+        ),
+        ("170.247.170.2", "authors.bind.", Refused, &[]),
+        ("170.247.170.2", "whoami.cloudflare.", Refused, &[]),
+        (
+            "192.5.5.241",
+            "id.server.",
+            NoError,
+            &[("SJC.cf.f.root-servers.org", 60)],
+        ),
+        (
+            "192.5.5.241",
+            "hostname.bind.",
+            NoError,
+            &[("SJC.cf.f.root-servers.org", 60)],
+        ),
+        (
+            "192.5.5.241",
+            "version.bind.",
+            NoError,
+            &[("2026.10.4", 60)],
+        ),
+        ("192.5.5.241", "version.server.", NotImp, &[]),
+        ("192.5.5.241", "authors.bind.", NotImp, &[]),
+        ("192.5.5.241", "whoami.cloudflare.", NotImp, &[]),
+        ("192.5.6.30", "id.server.", NoError, &[("nnn1-ussjc-3", 0)]),
+        (
+            "192.5.6.30",
+            "hostname.bind.",
+            NoError,
+            &[("nnn1-ussjc-3", 0)],
+        ),
+        ("192.5.6.30", "version.bind.", NoError, &[("ATLAS", 0)]),
+        ("192.5.6.30", "version.server.", NoError, &[("ATLAS", 0)]),
+        ("192.5.6.30", "authors.bind.", Refused, &[]),
+        ("192.5.6.30", "whoami.cloudflare.", Refused, &[]),
+        (
+            "192.12.94.30",
+            "id.server.",
+            NoError,
+            &[("nnn1-ussjc-3", 0)],
+        ),
+        (
+            "192.12.94.30",
+            "hostname.bind.",
+            NoError,
+            &[("nnn1-ussjc-3", 0)],
+        ),
+        ("192.12.94.30", "version.bind.", NoError, &[("ATLAS", 0)]),
+        ("192.12.94.30", "version.server.", NoError, &[("ATLAS", 0)]),
+        ("192.12.94.30", "authors.bind.", Refused, &[]),
+        ("192.12.94.30", "whoami.cloudflare.", Refused, &[]),
+        (
+            "192.26.92.30",
+            "id.server.",
+            NoError,
+            &[("nnn1-ussjc-3", 0)],
+        ),
+        (
+            "192.26.92.30",
+            "hostname.bind.",
+            NoError,
+            &[("nnn1-ussjc-3", 0)],
+        ),
+        ("192.26.92.30", "version.bind.", NoError, &[("ATLAS", 0)]),
+        ("192.26.92.30", "version.server.", NoError, &[("ATLAS", 0)]),
+        ("192.26.92.30", "authors.bind.", Refused, &[]),
+        ("192.26.92.30", "whoami.cloudflare.", Refused, &[]),
+        (
+            "192.31.80.30",
+            "id.server.",
+            NoError,
+            &[("nnn1-ussjc-3", 0)],
+        ),
+        (
+            "192.31.80.30",
+            "hostname.bind.",
+            NoError,
+            &[("nnn1-ussjc-3", 0)],
+        ),
+        ("192.31.80.30", "version.bind.", NoError, &[("ATLAS", 0)]),
+        ("192.31.80.30", "version.server.", NoError, &[("ATLAS", 0)]),
+        ("192.31.80.30", "authors.bind.", Refused, &[]),
+        ("192.31.80.30", "whoami.cloudflare.", Refused, &[]),
+        (
+            "192.33.4.12",
+            "id.server.",
+            NoError,
+            &[("lax1b.c.root-servers.org", 0)],
+        ),
+        (
+            "192.33.4.12",
+            "hostname.bind.",
+            NoError,
+            &[("lax1a.c.root-servers.org", 0)],
+        ),
+        ("192.33.4.12", "version.bind.", NoError, &[("c-root", 0)]),
+        ("192.33.4.12", "version.server.", Refused, &[]),
+        ("192.33.4.12", "authors.bind.", NoError, &[]),
+        ("192.33.4.12", "whoami.cloudflare.", Refused, &[]),
+        ("192.33.14.30", "id.server.", NoError, &[("nnn1-ein4", 0)]),
+        (
+            "192.33.14.30",
+            "hostname.bind.",
+            NoError,
+            &[("nnn1-ein1", 0)],
+        ),
+        ("192.33.14.30", "version.bind.", NoError, &[("ATLAS", 0)]),
+        ("192.33.14.30", "version.server.", NoError, &[("ATLAS", 0)]),
+        ("192.33.14.30", "authors.bind.", Refused, &[]),
+        ("192.33.14.30", "whoami.cloudflare.", Refused, &[]),
+        (
+            "192.35.51.30",
+            "id.server.",
+            NoError,
+            &[("nnn1-uschi-2c", 0)],
+        ),
+        (
+            "192.35.51.30",
+            "hostname.bind.",
+            NoError,
+            &[("nnn1-uschi-2a", 0)],
+        ),
+        ("192.35.51.30", "version.bind.", NoError, &[("ATLAS", 0)]),
+        ("192.35.51.30", "version.server.", NoError, &[("ATLAS", 0)]),
+        ("192.35.51.30", "authors.bind.", Refused, &[]),
+        ("192.35.51.30", "whoami.cloudflare.", Refused, &[]),
+        ("192.36.148.17", "id.server.", NoError, &[("s1.pix", 0)]),
+        ("192.36.148.17", "hostname.bind.", NoError, &[("s1.pix", 0)]),
+        (
+            "192.36.148.17",
+            "version.bind.",
+            NoError,
+            &[("contact info@netnod.se", 0)],
+        ),
+        ("192.36.148.17", "version.server.", Refused, &[]),
+        ("192.36.148.17", "authors.bind.", NoError, &[]),
+        ("192.36.148.17", "whoami.cloudflare.", Refused, &[]),
+        (
+            "192.41.162.30",
+            "id.server.",
+            NoError,
+            &[("nnn1-usdal-3c", 0)],
+        ),
+        (
+            "192.41.162.30",
+            "hostname.bind.",
+            NoError,
+            &[("nnn1-usdal-3a", 0)],
+        ),
+        ("192.41.162.30", "version.bind.", NoError, &[("ATLAS", 0)]),
+        ("192.41.162.30", "version.server.", NoError, &[("ATLAS", 0)]),
+        ("192.41.162.30", "authors.bind.", Refused, &[]),
+        ("192.41.162.30", "whoami.cloudflare.", Refused, &[]),
+        (
+            "192.42.93.30",
+            "id.server.",
+            NoError,
+            &[("nnn1-uschi-2c", 0)],
+        ),
+        (
+            "192.42.93.30",
+            "hostname.bind.",
+            NoError,
+            &[("nnn1-uschi-2b", 0)],
+        ),
+        ("192.42.93.30", "version.bind.", NoError, &[("ATLAS", 0)]),
+        ("192.42.93.30", "version.server.", NoError, &[("ATLAS", 0)]),
+        ("192.42.93.30", "authors.bind.", Refused, &[]),
+        ("192.42.93.30", "whoami.cloudflare.", Refused, &[]),
+        (
+            "192.43.172.30",
+            "id.server.",
+            NoError,
+            &[("nnn1-uschi-2b", 0)],
+        ),
+        (
+            "192.43.172.30",
+            "hostname.bind.",
+            NoError,
+            &[("nnn1-uschi-2b", 0)],
+        ),
+        ("192.43.172.30", "version.bind.", NoError, &[("ATLAS", 0)]),
+        ("192.43.172.30", "version.server.", NoError, &[("ATLAS", 0)]),
+        ("192.43.172.30", "authors.bind.", Refused, &[]),
+        ("192.43.172.30", "whoami.cloudflare.", Refused, &[]),
+        (
+            "192.48.79.30",
+            "id.server.",
+            NoError,
+            &[("nnn1-usdal-3b", 0)],
+        ),
+        (
+            "192.48.79.30",
+            "hostname.bind.",
+            NoError,
+            &[("nnn1-usdal-3b", 0)],
+        ),
+        ("192.48.79.30", "version.bind.", NoError, &[("ATLAS", 0)]),
+        ("192.48.79.30", "version.server.", NoError, &[("ATLAS", 0)]),
+        ("192.48.79.30", "authors.bind.", Refused, &[]),
+        ("192.48.79.30", "whoami.cloudflare.", Refused, &[]),
+        (
+            "192.52.178.30",
+            "id.server.",
+            NoError,
+            &[("nnn1-usdal-3a", 0)],
+        ),
+        (
+            "192.52.178.30",
+            "hostname.bind.",
+            NoError,
+            &[("nnn1-usdal-3a", 0)],
+        ),
+        ("192.52.178.30", "version.bind.", NoError, &[("ATLAS", 0)]),
+        ("192.52.178.30", "version.server.", NoError, &[("ATLAS", 0)]),
+        ("192.52.178.30", "authors.bind.", Refused, &[]),
+        ("192.52.178.30", "whoami.cloudflare.", Refused, &[]),
+        (
+            "192.54.112.30",
+            "id.server.",
+            NoError,
+            &[("nnn1-uschi-2a", 0)],
+        ),
+        (
+            "192.54.112.30",
+            "hostname.bind.",
+            NoError,
+            &[("nnn1-uschi-2b", 0)],
+        ),
+        ("192.54.112.30", "version.bind.", NoError, &[("ATLAS", 0)]),
+        ("192.54.112.30", "version.server.", NoError, &[("ATLAS", 0)]),
+        ("192.54.112.30", "authors.bind.", Refused, &[]),
+        ("192.54.112.30", "whoami.cloudflare.", Refused, &[]),
+        (
+            "192.55.83.30",
+            "id.server.",
+            NoError,
+            &[("nnn1-usdal-3c", 0)],
+        ),
+        (
+            "192.55.83.30",
+            "hostname.bind.",
+            NoError,
+            &[("nnn1-usdal-3c", 0)],
+        ),
+        ("192.55.83.30", "version.bind.", NoError, &[("ATLAS", 0)]),
+        ("192.55.83.30", "version.server.", NoError, &[("ATLAS", 0)]),
+        ("192.55.83.30", "authors.bind.", Refused, &[]),
+        ("192.55.83.30", "whoami.cloudflare.", Refused, &[]),
+        (
+            "192.58.128.30",
+            "id.server.",
+            NoError,
+            &[("rootns-ussjc-3", 0)],
+        ),
+        (
+            "192.58.128.30",
+            "hostname.bind.",
+            NoError,
+            &[("rootns-ussjc-3", 0)],
+        ),
+        ("192.58.128.30", "version.bind.", NoError, &[("KnotDNS", 0)]),
+        (
+            "192.58.128.30",
+            "version.server.",
+            NoError,
+            &[("KnotDNS", 0)],
+        ),
+        ("192.58.128.30", "authors.bind.", Refused, &[]),
+        ("192.58.128.30", "whoami.cloudflare.", Refused, &[]),
+        ("192.112.36.4", "id.server.", Refused, &[]),
+        (
+            "192.112.36.4",
+            "hostname.bind.",
+            NoError,
+            &[("groot-con2-2", 0)],
+        ),
+        ("192.112.36.4", "version.bind.", Refused, &[]),
+        ("192.112.36.4", "version.server.", Refused, &[]),
+        ("192.112.36.4", "authors.bind.", Refused, &[]),
+        ("192.112.36.4", "whoami.cloudflare.", Refused, &[]),
+        (
+            "192.203.230.10",
+            "id.server.",
+            NoError,
+            &[("c01.SEA.eroot", 60)],
+        ),
+        (
+            "192.203.230.10",
+            "hostname.bind.",
+            NoError,
+            &[("c01.SEA.eroot", 60)],
+        ),
+        (
+            "192.203.230.10",
+            "version.bind.",
+            NoError,
+            &[("2026.10.4", 60)],
+        ),
+        ("192.203.230.10", "version.server.", NotImp, &[]),
+        ("192.203.230.10", "authors.bind.", NotImp, &[]),
+        ("192.203.230.10", "whoami.cloudflare.", NotImp, &[]),
+        (
+            "193.0.14.129",
+            "id.server.",
+            NoError,
+            &[("ns3.gb-lon.k.ripe.net", 0)],
+        ),
+        (
+            "193.0.14.129",
+            "hostname.bind.",
+            NoError,
+            &[("ns2.gb-lon.k.ripe.net", 0)],
+        ),
+        ("193.0.14.129", "version.bind.", NoError, &[("BIND", 0)]),
+        ("193.0.14.129", "version.server.", Refused, &[]),
+        ("193.0.14.129", "authors.bind.", Refused, &[]),
+        ("193.0.14.129", "whoami.cloudflare.", Refused, &[]),
+        ("198.41.0.4", "id.server.", NoError, &[("nnn1-ussea-4c", 0)]),
+        (
+            "198.41.0.4",
+            "hostname.bind.",
+            NoError,
+            &[("nnn1-ussea-4c", 0)],
+        ),
+        ("198.41.0.4", "version.bind.", NoError, &[("ATLAS", 0)]),
+        ("198.41.0.4", "version.server.", NoError, &[("ATLAS", 0)]),
+        ("198.41.0.4", "authors.bind.", NoError, &[]),
+        ("198.41.0.4", "whoami.cloudflare.", NoError, &[]),
+        (
+            "198.97.190.53",
+            "id.server.",
+            NoError,
+            &[("001.nzy.h.root-servers.org", 0)],
+        ),
+        (
+            "198.97.190.53",
+            "hostname.bind.",
+            NoError,
+            &[("001.nzy.h.root-servers.org", 0)],
+        ),
+        ("198.97.190.53", "version.bind.", NoError, &[("NSD 4.x", 0)]),
+        (
+            "198.97.190.53",
+            "version.server.",
+            NoError,
+            &[("NSD 4.x", 0)],
+        ),
+        ("198.97.190.53", "authors.bind.", Refused, &[]),
+        ("198.97.190.53", "whoami.cloudflare.", Refused, &[]),
+        ("199.7.83.42", "id.server.", NoError, &[("us-lax-aa", 0)]),
+        (
+            "199.7.83.42",
+            "hostname.bind.",
+            NoError,
+            &[("us-lax-aa", 0)],
+        ),
+        ("199.7.83.42", "version.bind.", NoError, &[("NSD 4", 0)]),
+        ("199.7.83.42", "version.server.", NoError, &[("NSD 4", 0)]),
+        ("199.7.83.42", "authors.bind.", Refused, &[]),
+        ("199.7.83.42", "whoami.cloudflare.", Refused, &[]),
+        (
+            "199.7.91.13",
+            "id.server.",
+            NoError,
+            &[("paca7.droot.maxgigapop.net", 0)],
+        ),
+        (
+            "199.7.91.13",
+            "hostname.bind.",
+            NoError,
+            &[("paca8.droot.maxgigapop.net", 0)],
+        ),
+        ("199.7.91.13", "version.bind.", NoError, &[("NSD 4", 0)]),
+        ("199.7.91.13", "version.server.", NoError, &[("NSD 4", 0)]),
+        ("199.7.91.13", "authors.bind.", Refused, &[]),
+        ("199.7.91.13", "whoami.cloudflare.", Refused, &[]),
+        ("202.12.27.33", "id.server.", NoError, &[("M-SJC-4", 0)]),
+        ("202.12.27.33", "hostname.bind.", NoError, &[("M-SJC-4", 0)]),
+        ("202.12.27.33", "version.bind.", NoError, &[("9.16", 0)]),
+        ("202.12.27.33", "version.server.", Refused, &[]),
+        ("202.12.27.33", "authors.bind.", NoError, &[]),
+        ("202.12.27.33", "whoami.cloudflare.", Refused, &[]),
+        ("8.8.8.8", "id.server.", ServFail, &[]),
+        ("8.8.8.8", "hostname.bind.", ServFail, &[]),
+        ("8.8.8.8", "version.bind.", ServFail, &[]),
+        ("8.8.8.8", "version.server.", ServFail, &[]),
+        ("8.8.8.8", "authors.bind.", ServFail, &[]),
+        ("8.8.8.8", "whoami.cloudflare.", ServFail, &[]),
+        ("1.1.1.1", "id.server.", NoError, &[("sjc10", 0)]),
+        ("1.1.1.1", "hostname.bind.", Refused, &[]),
+        ("1.1.1.1", "version.bind.", Refused, &[]),
+        ("1.1.1.1", "version.server.", NoError, &[("2026.10.11", 0)]),
+        ("1.1.1.1", "authors.bind.", Refused, &[]),
+        (
+            "1.1.1.1",
+            "whoami.cloudflare.",
+            NoError,
+            &[("45.70.0.9", 0)],
+        ),
+        ("9.9.9.9", "id.server.", NoError, &[("res711.pao", 0)]),
+        ("9.9.9.9", "hostname.bind.", ServFail, &[]),
+        (
+            "9.9.9.9",
+            "version.bind.",
+            NoError,
+            &[("Q9-P-2026080500", 0)],
+        ),
+        ("9.9.9.9", "version.server.", ServFail, &[]),
+        ("9.9.9.9", "authors.bind.", ServFail, &[]),
+        ("9.9.9.9", "whoami.cloudflare.", Refused, &[]),
+        ("208.67.222.222", "id.server.", Refused, &[]),
+        ("208.67.222.222", "hostname.bind.", Refused, &[]),
+        ("208.67.222.222", "version.bind.", Refused, &[]),
+        ("208.67.222.222", "version.server.", Refused, &[]),
+        ("208.67.222.222", "authors.bind.", Refused, &[]),
+        ("208.67.222.222", "whoami.cloudflare.", Refused, &[]),
+        ("unbound", "id.server.", NoError, &[("localhost", 0)]),
+        ("unbound", "hostname.bind.", NoError, &[("localhost", 0)]),
+        (
+            "unbound",
+            "version.bind.",
+            NoError,
+            &[("unbound 1.26.2", 0)],
+        ),
+        (
+            "unbound",
+            "version.server.",
+            NoError,
+            &[("unbound 1.26.2", 0)],
+        ),
+        ("unbound", "authors.bind.", Refused, &[]),
+        ("unbound", "whoami.cloudflare.", Refused, &[]),
+    ];
+    assert_eq!(seen.len(), measured.len());
+    for ((server, qname, rcode, texts), row) in seen.iter().zip(measured) {
+        let texts: Vec<(&str, u32)> = texts.iter().map(|(text, ttl)| (&text[..], *ttl)).collect();
+        assert_eq!((&server[..], *qname, *rcode, &texts[..]), *row);
     }
 }
 

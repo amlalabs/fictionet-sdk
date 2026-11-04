@@ -10,9 +10,11 @@ use fictionet::stdlib::protocols::dns::rr::rdata::PTR;
 use fictionet::stdlib::protocols::dns::rr::{
     LowerName, Name, RData, Record, RecordSet, RecordType,
 };
-use fictionet::stdlib::services::dns::authority::{ChaosAnswer, Identity, chaos};
+use fictionet::stdlib::services::dns::authority::Identity;
 use fictionet::stdlib::services::dns::resolver::{Config, LocalZone, Work};
 use fictionet::stdlib::services::dns::zone::{EmptyApex, Zone, ZoneData, special};
+
+use super::chaos;
 
 /// The version Unbound gives `version.server` and `version.bind`: the
 /// release of 2026-10-21.
@@ -99,13 +101,11 @@ pub fn local_zones() -> Vec<LocalZone> {
 ///
 /// A failure is cached for 5 seconds, inside the bounds of RFC 9520 §3.2.
 pub fn config() -> Config {
-    let host = ChaosAnswer::Txt("localhost".to_string());
-    let version = ChaosAnswer::Txt(VERSION.to_string());
     let identity = Identity::none()
-        .answer(chaos::id_server(), host.clone())
-        .answer(chaos::hostname_bind(), host)
-        .answer(chaos::version_server(), version.clone())
-        .answer(chaos::version_bind(), version);
+        .zone(chaos::txt(&chaos::id_server(), 0, "localhost"))
+        .zone(chaos::txt(&chaos::hostname_bind(), 0, "localhost"))
+        .zone(chaos::txt(&chaos::version_server(), 0, VERSION))
+        .zone(chaos::txt(&chaos::version_bind(), 0, VERSION));
     Config {
         local: local_zones(),
         payload: 1232,
@@ -221,8 +221,8 @@ mod tests {
         let identity = config().identity;
         for name in [chaos::version_bind(), chaos::version_server()] {
             assert_eq!(
-                identity.chaos.get(&name),
-                Some(&ChaosAnswer::Txt(VERSION.to_string()))
+                identity.zones.get(&name),
+                Some(&chaos::txt(&name, 0, VERSION))
             );
         }
     }

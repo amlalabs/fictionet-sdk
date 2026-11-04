@@ -23,9 +23,8 @@ use fictionet::stdlib::protocols::dns::op::{
 use fictionet::stdlib::protocols::dns::rr::rdata::TSIG;
 use fictionet::stdlib::protocols::dns::rr::rdata::opt::EdnsOption;
 use fictionet::stdlib::protocols::dns::rr::rdata::tsig::{TsigAlgorithm, TsigError};
-use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, Name, RData, Record, RecordType};
+use fictionet::stdlib::protocols::dns::rr::{DNSClass, Name, RData, Record, RecordType};
 use fictionet::stdlib::services::dns::Event;
-use fictionet::stdlib::services::dns::authority::{ChaosAnswer, Identity, chaos};
 use fictionet::stdlib::world::net::Net;
 use fictionet::stdlib::world::net::dns::Recursive;
 use fictionet::stdlib::world::net::dns::internet::ROOT_SERVERS;
@@ -748,52 +747,29 @@ fn p_nxcut() {
 // ---------------------------------------------------------------------------
 // Identity probes
 
-/// What `identity` answers a CHAOS-class TXT question for `name`: its
-/// RCODE and its text.
-fn identity_answer(identity: &Identity, name: LowerName) -> (ResponseCode, Vec<String>) {
-    match identity.chaos.get(&name) {
-        Some(ChaosAnswer::Txt(text)) => (ResponseCode::NoError, vec![text.clone()]),
-        Some(ChaosAnswer::Zone(zone)) => {
-            (ResponseCode::NoError, zone.txt.iter().cloned().collect())
-        }
-        Some(ChaosAnswer::Reply(reply)) => (reply.rcode, Vec::new()),
-        None => (identity.unlisted.rcode, Vec::new()),
-    }
-}
-
 /// P-CHAOS: `id.server` at 1.1.1.1, `version.bind` at 9.9.9.9, and
 /// `hostname.bind` at k.root give what those sites gave from here, and the
 /// gateway gives Unbound's version.
 #[test]
 fn p_chaos() {
     probe(|fcx, p| async move {
-        let at = p.internet.place().clone();
-        let k_root = ROOT_SERVERS[10].v4;
-        let unbound = Identity::none().answer(
-            chaos::version_bind(),
-            ChaosAnswer::Txt("unbound 1.26.2".to_string()),
-        );
         let cases = [
-            (
-                Ipv4Addr::new(1, 1, 1, 1),
-                chaos::id_server(),
-                at.resolver(Ipv4Addr::new(1, 1, 1, 1)).identity,
-            ),
+            (Ipv4Addr::new(1, 1, 1, 1), "id.server.", "sjc10"),
             (
                 Ipv4Addr::new(9, 9, 9, 9),
-                chaos::version_bind(),
-                at.resolver(Ipv4Addr::new(9, 9, 9, 9)).identity,
+                "version.bind.",
+                "Q9-P-2026080500",
             ),
             (
-                k_root,
-                chaos::hostname_bind(),
-                at.site(IpAddr::V4(k_root)).identity,
+                ROOT_SERVERS[10].v4,
+                "hostname.bind.",
+                "ns2.gb-lon.k.ripe.net",
             ),
-            (GATEWAY, chaos::version_bind(), unbound),
+            (GATEWAY, "version.bind.", "unbound 1.26.2"),
         ];
-        for (n, (server, name, identity)) in cases.into_iter().enumerate() {
+        for (n, (server, name, text)) in cases.into_iter().enumerate() {
             let mut query = Message::new(n as u16, MessageType::Query, OpCode::Query);
-            let mut question = Query::query(Name::from(&name), RecordType::TXT);
+            let mut question = Query::query(Name::from_ascii(name).unwrap(), RecordType::TXT);
             question.set_query_class(DNSClass::CH);
             query.add_query(question);
             let reply = send(&fcx, &p.m, server, &query).await;
@@ -812,7 +788,7 @@ fn p_chaos() {
                 .collect();
             assert_eq!(
                 (reply.metadata.response_code, texts),
-                identity_answer(&identity, name.clone()),
+                (ResponseCode::NoError, vec![text.to_string()]),
                 "{name} at {server}"
             );
         }

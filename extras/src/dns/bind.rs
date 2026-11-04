@@ -1,25 +1,23 @@
 //! BIND as a world plays it: the CHAOS-class zone it serves at each name
 //! it answers about itself.
 
-use fictionet::stdlib::protocols::dns::rr::rdata::SOA;
-use fictionet::stdlib::protocols::dns::rr::{LowerName, Name};
-use fictionet::stdlib::services::dns::authority::{ChaosAnswer, ChaosZone};
+use fictionet::stdlib::protocols::dns::rr::rdata::{NS, SOA};
+use fictionet::stdlib::protocols::dns::rr::{Name, RData};
+use fictionet::stdlib::services::dns::authority::ChaosZone;
 
-/// The zone BIND serves at the CHAOS name `name`, with TXT `txt` at its
-/// apex if any, as c, g, i, and m at the root and a local BIND 9.20
-/// answered on 2026-11-02: SOA
-/// `<name> hostmaster.<name> 0 28800 7200 604800 86400` with TTL 86400,
-/// and NS `<name>` with TTL 0.
-pub fn chaos_zone(name: &LowerName, txt: Option<String>) -> ChaosAnswer {
-    let name = Name::from(name);
+/// `zone` as BIND serves a CHAOS name: its records, then an SOA and an NS
+/// record at its apex, as c, g, i, and m at the root and a local BIND
+/// 9.20 answered on 2026-11-02: SOA
+/// `<apex> hostmaster.<apex> 0 28800 7200 604800 86400` with TTL 86400,
+/// and NS `<apex>` with TTL 0. A name BIND answers with text is
+/// [`chaos::txt`](super::chaos::txt) through this, and one without, such
+/// as `authors.bind`, an empty zone through this.
+pub fn chaos_zone(zone: ChaosZone) -> ChaosZone {
+    let apex = zone.apex().clone();
     let hostmaster = Name::from_ascii("hostmaster")
-        .and_then(|label| label.append_name(&name))
-        .unwrap_or_else(|_| name.clone());
-    ChaosAnswer::Zone(Box::new(ChaosZone {
-        soa: SOA::new(name.clone(), hostmaster, 0, 28800, 7200, 604800, 86400),
-        soa_ttl: 86400,
-        ns: name,
-        ns_ttl: 0,
-        txt,
-    }))
+        .and_then(|label| label.append_name(&apex))
+        .unwrap_or_else(|_| apex.clone());
+    let soa = SOA::new(apex.clone(), hostmaster, 0, 28800, 7200, 604800, 86400);
+    zone.record(86400, RData::SOA(soa))
+        .record(0, RData::NS(NS(apex)))
 }

@@ -40,7 +40,7 @@ use fictionet::stdlib::protocols::dns::dnssec::{
 use fictionet::stdlib::protocols::dns::rr::{Name, RecordSet};
 use fictionet::stdlib::services::dns::WallClock;
 use fictionet::stdlib::services::dns::authority::{
-    Authority, AuthorityEngine, ChaosAnswer, Identity, Overlay, ServerConfig, Zones, chaos,
+    Authority, AuthorityEngine, Identity, Overlay, ServerConfig, Zones,
 };
 use fictionet::stdlib::services::dns::memory::MemoryNet;
 use fictionet::stdlib::services::dns::resolver::{Config, NameServer, ROOT_SERVERS};
@@ -48,6 +48,7 @@ use fictionet::stdlib::services::dns::zone::{AnyResponse, Denial, Zone, ZoneData
 use fictionet::stdlib::world::net::Host;
 use fictionet::stdlib::world::net::dns::Authoritative;
 use fictionet::{Seed, SeededEntropy};
+use fictionet_extras::dns::chaos;
 use fictionet_extras::dns::place::Place;
 use fictionet_extras::dns::public::PUBLIC_RESOLVERS;
 use fictionet_extras::dns::roots::{self, GTLD_SERVERS};
@@ -495,7 +496,7 @@ impl TestInternet {
 /// §4. It answers `version.bind` with its version and refuses other CHAOS
 /// names. What it does not show takes Unbound's values.
 pub fn dnsmasq(forward: Vec<SocketAddr>) -> Config {
-    let version = ChaosAnswer::Txt("dnsmasq-2.91".to_string());
+    let version = chaos::txt(&chaos::version_bind(), 0, "dnsmasq-2.91");
     Config {
         hints: Vec::new(),
         forward: vec![(Name::root(), forward)],
@@ -506,7 +507,7 @@ pub fn dnsmasq(forward: Vec<SocketAddr>) -> Config {
         max_ttl: Duration::from_secs(604800),
         max_negative_ttl: Duration::from_secs(604800),
         aggressive_nsec: false,
-        identity: Identity::none().answer(chaos::version_bind(), version),
+        identity: Identity::none().zone(version),
         ..unbound::config()
     }
 }

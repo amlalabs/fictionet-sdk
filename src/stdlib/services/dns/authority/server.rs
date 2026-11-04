@@ -6,7 +6,6 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use fictionet::stdlib::protocols::dns::op::{Edns, Message, MessageType, ResponseCode};
-use fictionet::stdlib::protocols::dns::rr::rdata::{NS, SOA, TXT};
 use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, Name, RData, Record, RecordType};
 use fictionet::stdlib::protocols::dns::{
     Ede, EdeCode, Fitted, Limit, Nsid, Request, Response, fit,
@@ -22,7 +21,7 @@ use super::super::zone::AnyResponse;
 /// §6.1.2), as the root servers and the large public resolvers do.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServerConfig {
-    /// What the server says about itself: its CHAOS answers and its NSID,
+    /// What the server says about itself: its CHAOS data and its NSID,
     /// which come from this one source so that they describe the same
     /// instance.
     pub identity: Identity,
@@ -47,7 +46,7 @@ impl ServerConfig {
     /// An ordinary authoritative server: a 1232-octet payload, the size
     /// the DNS Flag Day 2020 settled on; Extended DNS Errors; the
     /// synthesized HINFO answer to ANY of RFC 8482 §4.2; and an identity
-    /// with no names and no NSID. A world that plays a particular server
+    /// with no CHAOS data and no NSID. A world that plays a particular server
     /// writes its values over this one.
     pub fn generic() -> ServerConfig {
         ServerConfig {
@@ -128,17 +127,11 @@ impl ServerConfig {
     }
 
     /// The octets of the reply to a CHAOS-class question, from
-    /// [`identity`](ServerConfig::identity) alone ([`Identity::reply`]),
-    /// through the front and fitted to the client's size, with the
-    /// payload the identity advertises.
+    /// [`identity`](ServerConfig::identity) alone
+    /// ([`Identity::respond`]), through the front and fitted to the
+    /// client's size.
     pub(in super::super) fn render_chaos(&self, req: &Request) -> Vec<u8> {
-        let identity = &self.identity;
-        let mut response = self.front(req, identity.reply(req));
-        let payload = identity.payload.unwrap_or(self.payload);
-        if let Some(edns) = &mut response.message.edns {
-            edns.set_max_payload(payload.max(512));
-        }
-        self.write(req, response, Limit::for_request(req, payload))
+        self.render(req, self.identity.respond(req))
     }
 
     /// The octets of `response` for `req`, through the front and fitted to
@@ -229,17 +222,12 @@ pub(super) fn glue_first(message: &mut Message) -> usize {
 /// with Extended DNS Error `ede` when given. The server front adds the
 /// rest.
 pub fn bare_reply(req: &Request, rcode: ResponseCode, ede: Option<EdeCode>) -> Response {
-    bare_reply_with(req, rcode, ede.map(Ede::new))
-}
-
-/// [`bare_reply`] with an Extended DNS Error that may carry text.
-fn bare_reply_with(req: &Request, rcode: ResponseCode, ede: Option<Ede>) -> Response {
     let query = &req.message.metadata;
     let mut message = Message::error_msg(query.id, query.op_code, rcode);
     message.add_query(req.question.clone());
-    if let Some(ede) = ede {
+    if let Some(code) = ede {
         let mut edns = Edns::new();
-        edns.options_mut().insert(ede.to_option());
+        edns.options_mut().insert(Ede::new(code).to_option());
         message.set_edns(edns);
     }
     Response {
@@ -248,73 +236,58 @@ fn bare_reply_with(req: &Request, rcode: ResponseCode, ede: Option<Ede>) -> Resp
     }
 }
 
-/// What a server says about itself: its answers to CHAOS-class questions
-/// by name, how those replies look, and its NSID.
+/// What a server says about itself: the CHAOS-class data it answers
+/// questions from, and its NSID.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Identity {
-    /// Answers by name. Real servers answer the names of [`chaos`] and
-    /// more of their own.
-    pub chaos: BTreeMap<LowerName, ChaosAnswer>,
-    /// The reply for a CHAOS-class name not in [`chaos`](Identity::chaos)
-    /// and not below one of its [zones](ChaosAnswer::Zone).
-    pub unlisted: ChaosReply,
-    /// The reply to a question of a type other than TXT or ANY, for every
-    /// name that is not a [zone](ChaosAnswer::Zone) or below one.
-    pub other_types: ChaosReply,
-    /// Whether its [`Txt`](ChaosAnswer::Txt) answers set AA.
-    pub aa: bool,
+    /// Its CHAOS-class zones, by apex.
+    pub zones: BTreeMap<LowerName, ChaosZone>,
+    /// Names it answers with an RCODE and no records, whatever the type
+    /// asked.
+    pub rcodes: BTreeMap<LowerName, ResponseCode>,
+    /// The RCODE for a name in none of its zones and with no RCODE of its
+    /// own.
+    pub unlisted: ResponseCode,
     /// The name server identifier sent to a query that asks for one
     /// (RFC 5001).
     pub nsid: Option<Vec<u8>>,
-    /// The TTL of its TXT answers.
-    pub ttl: u32,
-    /// The EDNS payload size its CHAOS replies advertise, when it is not
-    /// the server's own.
-    pub payload: Option<u16>,
 }
 
 impl Identity {
-    /// No names and no NSID: every CHAOS-class question gets REFUSED, and
-    /// TXT answers, once names are added, have TTL 0 and AA clear.
+    /// No zones and no NSID: every CHAOS-class question gets REFUSED
+    /// (RFC 1035 §4.1.1).
     pub fn none() -> Identity {
         Identity {
-            chaos: BTreeMap::new(),
-            unlisted: ChaosReply::rcode(ResponseCode::Refused),
-            other_types: ChaosReply::rcode(ResponseCode::Refused),
-            aa: false,
+            zones: BTreeMap::new(),
+            rcodes: BTreeMap::new(),
+            unlisted: ResponseCode::Refused,
             nsid: None,
-            ttl: 0,
-            payload: None,
         }
     }
 
-    /// This identity with `answer` for `name`.
-    pub fn answer(mut self, name: LowerName, answer: ChaosAnswer) -> Identity {
-        self.chaos.insert(name, answer);
+    /// This identity serving `zone`, in place of any zone it served at
+    /// the same apex.
+    pub fn zone(mut self, zone: ChaosZone) -> Identity {
+        self.zones.insert(LowerName::new(&zone.apex), zone);
         self
     }
 
-    /// This identity giving its TXT answers TTL `ttl`.
-    pub fn ttl(mut self, ttl: u32) -> Identity {
-        self.ttl = ttl;
+    /// This identity answering `name` with `rcode` and no records.
+    pub fn rcode(mut self, name: LowerName, rcode: ResponseCode) -> Identity {
+        self.rcodes.insert(name, rcode);
         self
     }
 
     /// The reply to the CHAOS-class question `req`, before a server front
     /// adds its header details and EDNS:
     ///
-    /// - A zone transfer gets REFUSED: these names are no zones to list
-    ///   (RFC 5936 §2.2).
-    /// - A name at or below a [zone](ChaosAnswer::Zone) gets the zone's
-    ///   answer ([`ChaosZone`]).
-    /// - Any other name asked for a type other than TXT or ANY gets
-    ///   [`other_types`](Identity::other_types).
-    /// - A [`Txt`](ChaosAnswer::Txt) name, asked for TXT or ANY, gets its
-    ///   text as one TXT record with the identity's TTL, and AA as
-    ///   [`aa`](Identity::aa) says.
-    /// - A name with a reply of its own gets it, and an unlisted name gets
-    ///   [`unlisted`](Identity::unlisted).
-    pub fn reply(&self, req: &Request) -> Response {
+    /// - A zone transfer gets REFUSED: these zones answer questions, and
+    ///   cannot be listed (RFC 5936 §2.2).
+    /// - A name in [`rcodes`](Identity::rcodes) gets its RCODE.
+    /// - A name at or below the apex of one of its zones is answered from
+    ///   the deepest such zone ([`ChaosZone`]).
+    /// - Any other name gets [`unlisted`](Identity::unlisted).
+    pub fn respond(&self, req: &Request) -> Response {
         if matches!(
             req.question.query_type(),
             RecordType::AXFR | RecordType::IXFR
@@ -322,159 +295,97 @@ impl Identity {
             return bare_reply(req, ResponseCode::Refused, None);
         }
         let qname = LowerName::new(req.question.name());
-        let zone = self.chaos.iter().find_map(|(name, answer)| match answer {
-            ChaosAnswer::Zone(zone) if name.zone_of(&qname) => Some((name, zone)),
-            _ => None,
-        });
-        if let Some((apex, zone)) = zone {
-            return self.zone_reply(req, &Name::from(apex), zone);
+        if let Some(rcode) = self.rcodes.get(&qname) {
+            return bare_reply(req, *rcode, None);
         }
-        let other = !matches!(req.question.query_type(), RecordType::TXT | RecordType::ANY);
-        let empty = |reply: &ChaosReply| bare_reply_with(req, reply.rcode, reply.ede.clone());
-        match self.chaos.get(&qname) {
-            _ if other => empty(&self.other_types),
-            Some(ChaosAnswer::Txt(text)) => {
-                let mut response = bare_reply(req, ResponseCode::NoError, None);
-                response.message.metadata.authoritative = self.aa;
-                response
-                    .message
-                    .answers
-                    .push(self.txt(req.question.name(), text));
-                response
-            }
-            Some(ChaosAnswer::Reply(reply)) => empty(reply),
-            Some(ChaosAnswer::Zone(_)) | None => empty(&self.unlisted),
+        let zone = self
+            .zones
+            .iter()
+            .filter(|(apex, _)| apex.zone_of(&qname))
+            .max_by_key(|(apex, _)| apex.num_labels());
+        match zone {
+            Some((_, zone)) => zone.respond(req),
+            None => bare_reply(req, self.unlisted, None),
+        }
+    }
+}
+
+/// A CHAOS-class zone whose records are all at its apex, answered as any
+/// zone is (RFC 1034 §4.3.2), with AA set: at the apex, its records of
+/// the type asked, or NODATA; below the apex, NXDOMAIN. A negative reply
+/// carries the zone's SOA when it has one, with the smaller of the SOA's
+/// TTL and its MINIMUM field (RFC 2308 §2.1, §2.2, §3).
+///
+/// The zone holds no aliases. A CNAME at an apex could not stand beside
+/// other data (RFC 1034 §3.6.2), and a DNAME would redirect the names
+/// below the apex, which this zone answers NXDOMAIN (RFC 6672 §2.3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChaosZone {
+    apex: Name,
+    records: Vec<Record>,
+}
+
+impl ChaosZone {
+    /// An empty zone at `apex`.
+    pub fn new(apex: Name) -> ChaosZone {
+        ChaosZone {
+            apex,
+            records: Vec::new(),
         }
     }
 
-    /// The reply to `req` from `zone`, the CHAOS zone at `apex`, with AA
-    /// set: at the apex, the zone's records of the type asked, or NODATA
-    /// with the SOA; below it, NXDOMAIN with the SOA (RFC 2308 §2.1,
-    /// §2.2). A negative reply gives the SOA the smaller of its TTL and
-    /// its MINIMUM field (RFC 2308 §3).
-    fn zone_reply(&self, req: &Request, apex: &Name, zone: &ChaosZone) -> Response {
+    /// This zone with `rdata` at its apex, as a CHAOS-class record with
+    /// `ttl`. Panics if `rdata` is a CNAME or a DNAME.
+    pub fn record(mut self, ttl: u32, rdata: RData) -> ChaosZone {
+        assert!(
+            !matches!(rdata.record_type(), RecordType::CNAME | RecordType::DNAME),
+            "a CHAOS zone holds no aliases"
+        );
+        let mut record = Record::from_rdata(self.apex.clone(), ttl, rdata);
+        record.dns_class = DNSClass::CH;
+        self.records.push(record);
+        self
+    }
+
+    /// The zone's apex.
+    pub fn apex(&self) -> &Name {
+        &self.apex
+    }
+
+    /// The zone's records, in the order they were added, which is the
+    /// order an answer to ANY gives them in.
+    pub fn records(&self) -> &[Record] {
+        &self.records
+    }
+
+    /// The reply to `req`, whose QNAME is at or below the apex.
+    fn respond(&self, req: &Request) -> Response {
         let qtype = req.question.query_type();
         let mut response = bare_reply(req, ResponseCode::NoError, None);
         response.message.metadata.authoritative = true;
-        let soa = chaos_record(apex, zone.soa_ttl, RData::SOA(zone.soa.clone()));
-        let mut negative_soa = soa.clone();
-        negative_soa.ttl = zone.soa_ttl.min(zone.soa.minimum);
-        if req.question.name() != apex {
+        let negative_soa = self.records.iter().find_map(|record| match &record.data {
+            RData::SOA(soa) => {
+                let mut negative = record.clone();
+                negative.ttl = record.ttl.min(soa.minimum);
+                Some(negative)
+            }
+            _ => None,
+        });
+        if *req.question.name() != self.apex {
             response.message.metadata.response_code = ResponseCode::NXDomain;
-            response.message.authorities.push(negative_soa);
+            response.message.authorities.extend(negative_soa);
             return response;
         }
-        let ns = chaos_record(apex, zone.ns_ttl, RData::NS(NS(zone.ns.clone())));
-        let txt = zone.txt.as_deref().map(|text| self.txt(apex, text));
-        let apex_records: Vec<Record> = txt.into_iter().chain([soa, ns]).collect();
-        let of_type = |kind: RecordType| {
-            apex_records
-                .iter()
-                .filter(move |record| record.record_type() == kind)
-                .cloned()
-        };
-        let answers: Vec<Record> = match qtype {
-            RecordType::ANY => apex_records.clone(),
-            _ => of_type(qtype).collect(),
-        };
+        let answers: Vec<Record> = self
+            .records
+            .iter()
+            .filter(|record| qtype == RecordType::ANY || record.record_type() == qtype)
+            .cloned()
+            .collect();
         if answers.is_empty() {
-            response.message.authorities.push(negative_soa);
+            response.message.authorities.extend(negative_soa);
         }
         response.message.answers = answers;
         response
-    }
-
-    /// `text` at `name` as one CHAOS-class TXT record with the identity's
-    /// TTL.
-    fn txt(&self, name: &Name, text: &str) -> Record {
-        let txt = RData::TXT(TXT::new(vec![text.to_string()]));
-        chaos_record(name, self.ttl, txt)
-    }
-}
-
-/// `rdata` at `name` as a CHAOS-class record with `ttl`.
-fn chaos_record(name: &Name, ttl: u32, rdata: RData) -> Record {
-    let mut record = Record::from_rdata(name.clone(), ttl, rdata);
-    record.dns_class = DNSClass::CH;
-    record
-}
-
-/// A server's answer to a CHAOS-class question for one name.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ChaosAnswer {
-    /// One TXT string, at most 255 octets (RFC 1035 §3.3), served without
-    /// a zone.
-    Txt(String),
-    /// A zone of its own at the name.
-    Zone(Box<ChaosZone>),
-    /// No data, with this reply, as servers that refuse to say.
-    Reply(ChaosReply),
-}
-
-/// A CHAOS-class zone at one name, as some servers serve each name they
-/// answer about themselves: its apex records, and the TXT string at the
-/// apex if any. The zone holds no other names.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ChaosZone {
-    /// The zone's SOA, whose owner is the zone's name.
-    pub soa: SOA,
-    /// The TTL of the SOA record.
-    pub soa_ttl: u32,
-    /// The target of the zone's one NS record.
-    pub ns: Name,
-    /// The TTL of the NS record.
-    pub ns_ttl: u32,
-    /// The TXT string at the apex, with the identity's TTL.
-    pub txt: Option<String>,
-}
-
-/// A CHAOS-class reply without data.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ChaosReply {
-    /// Its RCODE.
-    pub rcode: ResponseCode,
-    /// The Extended DNS Error it carries (RFC 8914), if any.
-    pub ede: Option<Ede>,
-}
-
-impl ChaosReply {
-    /// A reply with `rcode` and no Extended DNS Error.
-    pub fn rcode(rcode: ResponseCode) -> ChaosReply {
-        ChaosReply { rcode, ede: None }
-    }
-}
-
-/// The CHAOS-class names servers answer about themselves.
-pub mod chaos {
-    use fictionet::stdlib::protocols::dns::rr::{LowerName, Name};
-
-    fn name(text: &str) -> LowerName {
-        LowerName::new(&Name::from_ascii(text).expect("a valid name"))
-    }
-
-    /// `id.server.`: which server instance answered (RFC 4892 §2).
-    pub fn id_server() -> LowerName {
-        name("id.server.")
-    }
-
-    /// `version.server.`: the server's software version, as some
-    /// operators publish it.
-    pub fn version_server() -> LowerName {
-        name("version.server.")
-    }
-
-    /// `hostname.bind.`: BIND's name for the instance (RFC 4892 §2).
-    pub fn hostname_bind() -> LowerName {
-        name("hostname.bind.")
-    }
-
-    /// `version.bind.`: BIND's name for the software version.
-    pub fn version_bind() -> LowerName {
-        name("version.bind.")
-    }
-
-    /// `authors.bind.`: BIND's list of its authors.
-    pub fn authors_bind() -> LowerName {
-        name("authors.bind.")
     }
 }
