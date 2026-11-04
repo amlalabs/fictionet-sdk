@@ -2,9 +2,9 @@
 
 A Fictionet world that looks like a Linux server with an MPTCP listener, and
 logs everyone who tries it. It is built for CVE-2026-98432, a use-after-free
-in the Linux kernel's IPv4 TCP connection setup. Anthropic showed on
-2026-10-27 that the flaw gives unauthenticated root on a server with an MPTCP
-listener. No exploit code is public.
+in the Linux kernel's IPv4 TCP connection setup. It observes options-bearing
+SYN retransmissions separately from MPTCP connections that send no data.
+The honeypot contains no exploit code.
 
 Nothing in the world is a real kernel. The server is Fictionet's TCP stack
 and a few lines of world code, so an attempt that would take over a vulnerable
@@ -25,6 +25,10 @@ open port:
 The MPTCP listener follows RFC 8684, and reads MPTCP options as Linux does:
 an option Linux ignores counts for nothing, and of several that count the
 last one wins.
+
+Its SYN-ACK carries IPv4 Record Route, Timestamp, and reversed source-route
+options through the Linux echo helper in `fictionet-extras`. The core codec
+and listener hook contain only protocol representation and plumbing.
 
 - A SYN with MP_CAPABLE that offers HMAC-SHA256 alone gets a SYN-ACK with
   MP_CAPABLE version 1 and a fresh random key. A SYN that offers a higher
@@ -86,7 +90,7 @@ kind it is:
 
 | `event` | When | What it holds |
 | --- | --- | --- |
-| `syn` | A SYN into the world | Source and destination, flags, the initial sequence number, every TCP option in order, `options_fault` if the options did not all read, each MPTCP option decoded, the payload in hex when the SYN carried one, and `gap_us` since the same source's previous SYN when that SYN was within the burst window |
+| `syn` | A SYN into the world | Source and destination, flags, the initial sequence number, every IPv4 and TCP option in order, `options_fault` if the options did not all read, each MPTCP option decoded, the payload in hex when the SYN carried one, and `gap_us` since the same source's previous SYN when that SYN was within the burst window |
 | `segment` | Any other segment in with a payload, a FIN, a RST or MPTCP options | Flags, sequence number, every TCP option in order, `options_fault`, each MPTCP option decoded, and the payload in hex |
 | `answer` | A RST from the world, or the SYN-ACK that first answers a SYN | Flags, every TCP option in order, and each MPTCP option decoded, such as the key the server issued |
 | `burst` | A source's SYNs, or its SYNs with MP_JOIN, reach the burst threshold | Source address, which kind, how many, and the window |
@@ -121,22 +125,26 @@ first, so both files hold whole records.
 
 ### Bursts are a heuristic
 
-The exploit is not public. The published description says it races
-connection setup on a server with an MPTCP listener, so the log flags what
-such a race would look like. A burst is at least `--burst-syns` SYNs (8 by
-default), or that many SYNs with MP_JOIN, from one source address within
-`--burst-window-ms` (100 by default). That is a guess at the attack's shape,
-not a signature of it. Every SYN is logged in full whether or not it is part of
-a burst, so signatures written once the exploit is known can be run over the
-log.
+An `ip_options_retransmit` record means a SYN with IPv4 options was followed
+by the same initial sequence number on the same attachment and connection tuple while its handshake remained
+pending. An observed SYN-ACK does not complete that handshake; its matching
+third ACK does. An `mptcp_no_data` record independently reports an MP_CAPABLE
+offer that closed or reached the existing 63 second observation timeout
+without inbound payload during that observation interval. Its `completed`
+field distinguishes attempts whose handshake ACK was observed. Neither
+signal proves exploitation.
+
+A burst is at least `--burst-syns` SYNs (8 by default), or that many SYNs
+with MP_JOIN, from one source within `--burst-window-ms` (100 by default).
+Every SYN retains its typed IPv4 and TCP options regardless of these signals.
 
 ### Hostile input
 
 Internet attackers send whatever they like, so every reader checks lengths.
 The world keeps burst state for a source only while that source has a SYN
-within the burst window. It tracks unanswered SYNs independently for up to
-63 seconds, the listener's handshake timeout, and an MPTCP token only while
-its connection is open. Burst and answer state expires even when traffic is
+within the burst window. It tracks unanswered SYNs and probe attempts for up
+to 63 seconds, the listener's handshake timeout, and an MPTCP token only while
+its connection is open. Burst, answer and probe state expires even when traffic is
 quiet, so a flood from spoofed addresses leaves no permanent state.
 
 Spoofed SYNs cannot shut real attackers out either. Each port holds 4,096

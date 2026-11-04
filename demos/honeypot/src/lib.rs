@@ -1,10 +1,9 @@
 //! A honeypot for CVE-2026-98432: a world that looks like a Linux server
 //! with an MPTCP listener, and logs everyone who tries it.
 //!
-//! CVE-2026-98432 is a use-after-free in the Linux kernel's IPv4 TCP
-//! connection setup. Anthropic showed on 2026-10-27 that it gives
-//! unauthenticated root on a server with an MPTCP listener. No exploit code
-//! is public.
+//! IPv4 option-bearing SYNs and their retransmissions are logged separately
+//! from MP_CAPABLE offers that close or expire without sending data. These
+//! are observations of traffic shape, not proof of exploitation.
 //!
 //! The world is one host at a public address ([`Config::address`]) with
 //! MPTCP listeners on its open ports: SSH with an OpenSSH identification
@@ -118,11 +117,17 @@ pub fn network(fcx: &Cx, config: &Config, clock: Clock, tokens: &Arc<Tokens>) ->
         server = match port.service {
             Service::Ssh => server.port_server(
                 port.number,
-                Listener::new(fcx, tokens.clone(), port.number, services::Ssh),
+                Listener::new(fcx, clock, tokens.clone(), port.number, services::Ssh),
             ),
             Service::Http => server.port_server(
                 port.number,
-                Listener::new(fcx, tokens.clone(), port.number, services::Http { clock }),
+                Listener::new(
+                    fcx,
+                    clock,
+                    tokens.clone(),
+                    port.number,
+                    services::Http { clock },
+                ),
             ),
         };
     }

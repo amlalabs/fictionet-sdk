@@ -232,6 +232,124 @@ fn tcp_of(p: &Packet) -> &[u8] {
     &p.0[ihl..]
 }
 
+fn ipv4_options(packet: Packet, options: &[fictionet::stdlib::network::ip::Ipv4Option]) -> Packet {
+    use fictionet::stdlib::network::ip;
+    let header = ip::Header::parse(&packet.0).unwrap();
+    let (IpAddr::V4(src), IpAddr::V4(dst)) = (header.src, header.dst) else {
+        panic!("IPv4 test packet")
+    };
+    ip::packet_with_ipv4_options(
+        src,
+        dst,
+        6,
+        Fields::default(),
+        options,
+        header.payload(&packet.0),
+    )
+    .unwrap()
+}
+
+#[test]
+fn ipv4_options_echo_and_pending_retransmission_are_observed() {
+    use fictionet::stdlib::network::ip::{self, Ipv4Option, Ipv4Timestamp};
+    honeypot(Config::default(), |mut net| async move {
+        let src = client(1, 40001);
+        let options = [
+            Ipv4Option::RecordRoute {
+                pointer: 4,
+                routes: vec![Ipv4Addr::UNSPECIFIED; 2],
+            },
+            Ipv4Option::Timestamp {
+                pointer: 5,
+                overflow: 0,
+                timestamps: Ipv4Timestamp::Timestamps(vec![0; 2]),
+            },
+        ];
+        let syn = || {
+            ipv4_options(
+                segment(src, server(80), 1000, 0, SYN, &with_mss(&[]), b""),
+                &options,
+            )
+        };
+        net.send(syn());
+        let answer = net.recv().await.unwrap();
+        assert_eq!(flags(&answer), SYN | ACK);
+        let echoed = ip::ipv4_options(&answer.0).unwrap();
+        let IpAddr::V4(local) = DEFAULT_ADDRESS else {
+            unreachable!()
+        };
+        assert_eq!(
+            echoed[0],
+            Ipv4Option::RecordRoute {
+                pointer: 12,
+                routes: vec![local; 2]
+            }
+        );
+        assert_eq!(
+            echoed[1],
+            Ipv4Option::Timestamp {
+                pointer: 13,
+                overflow: 0,
+                timestamps: Ipv4Timestamp::Timestamps(vec![((EPOCH % 86_400) * 1000) as u32; 2]),
+            }
+        );
+        assert_eq!(
+            ip::checksum(&answer.0[..usize::from(answer.0[0] & 15) * 4]),
+            0
+        );
+        assert_eq!(
+            transport_checksum(server(80).ip(), src.ip(), 6, tcp_of(&answer)),
+            0
+        );
+        net.send(syn());
+        let repeated = net.recv().await.unwrap();
+        assert_eq!(ip::ipv4_options(&repeated.0).unwrap(), echoed);
+        assert_eq!(net.events("ip_options_retransmit").len(), 1);
+        assert!(net.events("mptcp_no_data").is_empty());
+        assert_eq!(
+            net.events("syn")[0]["ipv4_options"][0]["kind"],
+            "record_route"
+        );
+        net.send(segment(
+            src,
+            server(80),
+            1001,
+            seq_of(&answer).wrapping_add(1),
+            ACK,
+            &[],
+            b"",
+        ));
+        net.send(syn());
+        net.drain().await;
+        assert_eq!(net.events("ip_options_retransmit").len(), 1);
+        Ok(())
+    });
+}
+
+#[test]
+fn mptcp_no_data_is_separate_and_expires_while_quiet() {
+    honeypot(Config::default(), |mut net| async move {
+        net.send(segment(
+            client(2, 40002),
+            server(80),
+            1000,
+            0,
+            SYN,
+            &with_mss(&mptcp_bytes(linux_capable())),
+            b"",
+        ));
+        net.recv().await.unwrap();
+        assert!(net.events("mptcp_no_data").is_empty());
+        net.fcx.sleep(Duration::from_secs(64)).await?;
+        let records = net.events("mptcp_no_data");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["end"], "expired");
+        assert_eq!(records[0]["completed"], false);
+        assert!(net.events("ip_options_retransmit").is_empty());
+        Ok(())
+    });
+}
+
 fn flags(p: &Packet) -> u8 {
     tcp_of(p)[13]
 }

@@ -42,32 +42,30 @@
 //! codec reads ([`Mptcp`]). So signatures written later can be run over
 //! either.
 //!
-//! # Bursts are a heuristic
+//! Repeated option-bearing SYNs are a separate signal from MP_CAPABLE
+//! offers that close or expire without inbound data. The former requires
+//! the same attachment, address pair, ports and initial sequence number,
+//! while the observed handshake is still pending. A SYN-ACK does not end
+//! that interval; an ACK must match both sequence numbers. Neither signal
+//! proves exploitation. Burst records remain a general traffic heuristic.
 //!
-//! The exploit for CVE-2026-98432 is not public. The published
-//! description says it races connection setup on a server with an MPTCP
-//! listener, so the observer flags what such a race would look like: at
-//! least [`Burst::syns`] SYNs, or SYNs carrying MP_JOIN, from one source
-//! address within [`Burst::window`]. That is a guess at the attack's shape,
-//! not a signature of it. Every SYN is logged in full whether or not it is
-//! part of a burst, so signatures written later can be run over the log.
-//!
-//! The observer keeps state for a source only while that source has a SYN
-//! within the burst window. Answers are tracked separately for at most
-//! the listener's 63 second handshake timeout. Both expire even when no
-//! further packets arrive, bounding retention after a spoofed flood.
+//! The observer keeps burst state for a source only while that source has
+//! a SYN within the burst window. Answers and probe attempts are tracked
+//! separately for at most the listener's 63 second handshake timeout.
+//! All expire even when no further packets arrive, bounding retention
+//! after a spoofed flood.
 //! The time since a source's previous SYN is given when that SYN was within
 //! the window; each line's timestamp gives longer gaps.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Write};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::task::{Context, Waker};
 use std::time::Duration;
 
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::network::ip::{self, protocol};
+use fictionet::stdlib::network::ip::{self, Ipv4Option, Ipv4Timestamp, protocol};
 use fictionet::stdlib::network::tcp::{self, OptionsError, TcpOption};
 use fictionet::stdlib::pcap;
 use fictionet::stdlib::protocols::mptcp::{self, AddAddr, Capable, Dss, Join, Keys, Mapping};
@@ -116,6 +114,8 @@ pub enum Observation {
         flags: Flags,
         /// Its initial sequence number.
         seq: u32,
+        /// Its IPv4 options in wire order, including unknown or malformed data.
+        ipv4_options: Vec<Ipv4Opt>,
         /// Its TCP options, in order, up to the first malformed one.
         options: Vec<Opt>,
         /// Why its options could not all be read.
@@ -173,6 +173,38 @@ pub enum Observation {
         /// Its MPTCP options, decoded.
         mptcp: Vec<Mptcp>,
     },
+    /// An option-bearing SYN was repeated before its handshake completed.
+    IpOptionsRetransmit {
+        /// When the repeated SYN arrived.
+        at_us: u64,
+        /// The attachment both SYNs crossed.
+        attachment: Arc<str>,
+        /// The claimed source address and port.
+        src: SocketAddr,
+        /// The listener address and port.
+        dst: SocketAddr,
+        /// The repeated initial sequence number.
+        seq: u32,
+        /// When the first option-bearing SYN arrived.
+        first_syn_us: u64,
+    },
+    /// An MP_CAPABLE offer ended or expired without inbound payload.
+    MptcpNoData {
+        /// When it ended or expired.
+        at_us: u64,
+        /// Its attachment.
+        attachment: Arc<str>,
+        /// Its claimed source address and port.
+        src: SocketAddr,
+        /// Its listener address and port.
+        dst: SocketAddr,
+        /// Its initial sequence number.
+        seq: u32,
+        /// Whether an ACK matched the observed SYN and SYN-ACK.
+        completed: bool,
+        /// How observation ended.
+        end: ProbeEnd,
+    },
     /// A source sent a burst of SYNs: see the [module docs](self).
     Burst {
         /// When the SYN that made it a burst arrived.
@@ -196,6 +228,121 @@ pub enum Observation {
         /// Observations left out of the log.
         observations: u64,
     },
+}
+
+/// Why a no-data observation ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeEnd {
+    /// Either side sent FIN or RST.
+    Close,
+    /// The existing handshake observation timeout elapsed.
+    Expired,
+}
+
+/// A decoded IPv4 option, retaining opaque bytes when decoding is impossible.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Ipv4Opt {
+    /// End of the option list.
+    EndOfList,
+    /// A padding byte.
+    NoOperation,
+    /// Recorded IPv4 addresses.
+    RecordRoute { pointer: u8, routes: Vec<Ipv4Addr> },
+    /// A loose source route.
+    LooseSourceRoute { pointer: u8, routes: Vec<Ipv4Addr> },
+    /// A strict source route.
+    StrictSourceRoute { pointer: u8, routes: Vec<Ipv4Addr> },
+    /// Timestamp option header and typed entries.
+    Timestamp {
+        pointer: u8,
+        overflow: u8,
+        timestamps: Timestamp,
+    },
+    /// The original security labels.
+    Security {
+        security: u16,
+        compartments: u16,
+        handling_restrictions: u16,
+        transmission_control_code: [u8; 3],
+    },
+    /// The obsolete stream identifier.
+    StreamId { value: u16 },
+    /// Router Alert value.
+    RouterAlert { value: u16 },
+    /// An unrecognized option with its data.
+    Unknown { number: u8, data: Hex },
+    /// A malformed option with its remaining bytes.
+    Malformed { number: u8, data: Hex },
+}
+
+/// The entry format selected by the IPv4 Timestamp flag.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "format", content = "entries", rename_all = "snake_case")]
+pub enum Timestamp {
+    /// Milliseconds since midnight UTC.
+    Timestamps(Vec<u32>),
+    /// Recorded address and timestamp pairs.
+    Addresses(Vec<(Ipv4Addr, u32)>),
+    /// Prespecified addresses and their timestamps.
+    Prespecified(Vec<(Ipv4Addr, u32)>),
+    /// An unknown flag and the bytes it describes.
+    Unknown { flags: u8, data: Hex },
+}
+
+impl From<Ipv4Option> for Ipv4Opt {
+    fn from(option: Ipv4Option) -> Self {
+        match option {
+            Ipv4Option::EndOfList => Self::EndOfList,
+            Ipv4Option::NoOperation => Self::NoOperation,
+            Ipv4Option::RecordRoute { pointer, routes } => Self::RecordRoute { pointer, routes },
+            Ipv4Option::LooseSourceRoute { pointer, routes } => {
+                Self::LooseSourceRoute { pointer, routes }
+            }
+            Ipv4Option::StrictSourceRoute { pointer, routes } => {
+                Self::StrictSourceRoute { pointer, routes }
+            }
+            Ipv4Option::Timestamp {
+                pointer,
+                overflow,
+                timestamps,
+            } => Self::Timestamp {
+                pointer,
+                overflow,
+                timestamps: match timestamps {
+                    Ipv4Timestamp::Timestamps(values) => Timestamp::Timestamps(values),
+                    Ipv4Timestamp::Addresses(values) => Timestamp::Addresses(values),
+                    Ipv4Timestamp::Prespecified(values) => Timestamp::Prespecified(values),
+                    Ipv4Timestamp::Unknown { flags, data } => Timestamp::Unknown {
+                        flags,
+                        data: Hex(data),
+                    },
+                },
+            },
+            Ipv4Option::Security {
+                security,
+                compartments,
+                handling_restrictions,
+                transmission_control_code,
+            } => Self::Security {
+                security,
+                compartments,
+                handling_restrictions,
+                transmission_control_code,
+            },
+            Ipv4Option::StreamId(value) => Self::StreamId { value },
+            Ipv4Option::RouterAlert(value) => Self::RouterAlert { value },
+            Ipv4Option::Unknown { kind, data } => Self::Unknown {
+                number: kind,
+                data: Hex(data),
+            },
+            Ipv4Option::Malformed { kind, data } => Self::Malformed {
+                number: kind,
+                data: Hex(data),
+            },
+        }
+    }
 }
 
 /// What the SYNs of a burst carried.
@@ -739,6 +886,38 @@ struct Awaited {
     ack: u32,
 }
 
+/// A connection attempt, separated by attachment and initial sequence number.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct Attempt {
+    attachment: Arc<str>,
+    src: SocketAddr,
+    dst: SocketAddr,
+    seq: u32,
+}
+
+struct Probe {
+    first: Instant,
+    options: bool,
+    capable: bool,
+    payload: bool,
+    server_seq: Option<u32>,
+    completed: bool,
+}
+
+impl Probe {
+    fn report(&self, key: &Attempt, at_us: u64, end: ProbeEnd) -> Option<Observation> {
+        (self.capable && !self.payload).then(|| Observation::MptcpNoData {
+            at_us,
+            attachment: key.attachment.clone(),
+            src: key.src,
+            dst: key.dst,
+            seq: key.seq,
+            completed: self.completed,
+            end,
+        })
+    }
+}
+
 /// One source address with a SYN in the burst window.
 struct Source {
     /// When its last SYN arrived.
@@ -768,6 +947,7 @@ pub struct Observer {
     /// Pending answers, with their most recent SYN and outstanding count.
     awaited: HashMap<Awaited, (Instant, usize)>,
     pending: VecDeque<(Instant, Awaited)>,
+    probes: HashMap<Attempt, Probe>,
     expiry_waiter: Option<Waker>,
 }
 
@@ -796,11 +976,12 @@ impl Observer {
             sources: HashMap::new(),
             awaited: HashMap::new(),
             pending: VecDeque::new(),
+            probes: HashMap::new(),
             expiry_waiter: None,
         })
     }
 
-    /// How many source addresses the observer holds state for.
+    /// How many source addresses have SYNs in the burst window.
     pub fn sources(&self) -> usize {
         self.sources.len()
     }
@@ -842,10 +1023,14 @@ impl Observer {
         packet: &[u8],
         now: Instant,
     ) {
-        let mut observations = self.observe(attachment, direction, packet, now);
+        let observations = self.observe(attachment, direction, packet, now);
+        self.write_observations(self.clock.micros(now), observations);
+    }
+
+    fn write_observations(&mut self, at_us: u64, mut observations: Vec<Observation>) {
         if self.lost != Lost::default() && self.capturing {
             let lost = Observation::Lost {
-                at_us: self.clock.micros(now),
+                at_us,
                 packets: self.lost.packets,
                 observations: self.lost.observations,
             };
@@ -920,21 +1105,94 @@ impl Observer {
                 _ => None,
             })
             .collect();
+        let ipv4_options = ip::ipv4_options(packet).unwrap_or_default();
+        let mut flow_dst = dst;
+        if direction == Direction::Out {
+            for option in &ipv4_options {
+                match option {
+                    Ipv4Option::LooseSourceRoute { pointer, routes }
+                    | Ipv4Option::StrictSourceRoute { pointer, routes }
+                        if usize::from(*pointer) <= 3 + routes.len() * 4 =>
+                    {
+                        flow_dst.set_ip((*routes.last().expect("unconsumed route slot")).into());
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
         let options: Vec<Opt> = read.iter().map(Opt::from).collect();
         let attachment = attachment.clone();
+        let offset = usize::from(t[12] >> 4) * 4;
+        let payload = Hex(t
+            .get(offset..)
+            .filter(|_| offset >= 20)
+            .unwrap_or_default()
+            .to_vec());
+        let ack = u32::from_be_bytes([t[8], t[9], t[10], t[11]]);
+        let mut signals = Vec::new();
+        if direction == Direction::Out {
+            for (key, probe) in &mut self.probes {
+                if key.attachment == attachment
+                    && key.src == flow_dst
+                    && key.dst == src
+                    && flags & (SYN | ACK | RST) == SYN | ACK
+                    && ack == key.seq.wrapping_add(1)
+                {
+                    probe.server_seq = Some(seq);
+                }
+            }
+        }
+        let closing: Vec<_> = self
+            .probes
+            .iter_mut()
+            .filter_map(|(key, probe)| {
+                let incoming = direction == Direction::In && key.src == src && key.dst == dst;
+                let outgoing = direction == Direction::Out && key.src == flow_dst && key.dst == src;
+                if key.attachment != attachment || !(incoming || outgoing) {
+                    return None;
+                }
+                if incoming
+                    && flags & (SYN | RST | ACK) == ACK
+                    && seq == key.seq.wrapping_add(1)
+                    && probe
+                        .server_seq
+                        .is_some_and(|server| ack == server.wrapping_add(1))
+                {
+                    probe.completed = true;
+                }
+                let belongs = probe.completed
+                    || (incoming
+                        && seq
+                            == if flags & SYN != 0 {
+                                key.seq
+                            } else {
+                                key.seq.wrapping_add(1)
+                            })
+                    || (outgoing && flags & ACK != 0 && ack == key.seq.wrapping_add(1));
+                if incoming && belongs && !payload.is_empty() {
+                    probe.payload = true;
+                }
+                (belongs && flags & (FIN | RST) != 0).then(|| key.clone())
+            })
+            .collect();
+        for key in closing {
+            let probe = self.probes.remove(&key).unwrap();
+            signals.extend(probe.report(&key, at_us, ProbeEnd::Close));
+        }
         if direction == Direction::Out {
             let rst = flags & RST != 0;
             let syn_ack = flags & (SYN | ACK) == SYN | ACK;
             let ack = u32::from_be_bytes([t[8], t[9], t[10], t[11]]);
             let awaited = Awaited {
                 from: src,
-                to: dst,
+                to: flow_dst,
                 ack,
             };
             // An answer with no pending SYN is a retransmission.
             let first = (rst || syn_ack) && self.answered(awaited);
             if rst || (syn_ack && first) {
-                return vec![Observation::Answer {
+                signals.push(Observation::Answer {
                     at_us,
                     attachment,
                     src,
@@ -942,16 +1200,11 @@ impl Observer {
                     flags: Flags(flags),
                     options,
                     mptcp,
-                }];
+                });
+                return signals;
             }
-            return Vec::new();
+            return signals;
         }
-        let offset = usize::from(t[12] >> 4) * 4;
-        let payload = Hex(t
-            .get(offset..)
-            .filter(|_| offset >= 20)
-            .unwrap_or_default()
-            .to_vec());
         if flags & (SYN | RST | ACK) == SYN {
             let join = mptcp.iter().any(|m| matches!(m, Mptcp::MpJoinSyn { .. }));
             let awaited = Awaited {
@@ -959,6 +1212,42 @@ impl Observer {
                 to: src,
                 ack: seq.wrapping_add(1),
             };
+            let key = Attempt {
+                attachment: attachment.clone(),
+                src,
+                dst,
+                seq,
+            };
+            if let Some(probe) = self.probes.get(&key) {
+                if probe.options && !probe.completed {
+                    signals.push(Observation::IpOptionsRetransmit {
+                        at_us,
+                        attachment: attachment.clone(),
+                        src,
+                        dst,
+                        seq,
+                        first_syn_us: self.clock.micros(probe.first),
+                    });
+                }
+            } else {
+                let has_options = header.src.is_ipv4() && header.payload.start > 20;
+                let capable = mptcp
+                    .iter()
+                    .any(|option| matches!(option, Mptcp::MpCapable { .. }));
+                if has_options || capable {
+                    self.probes.insert(
+                        key,
+                        Probe {
+                            first: now,
+                            options: has_options,
+                            capable,
+                            payload: !payload.is_empty(),
+                            server_seq: None,
+                            completed: false,
+                        },
+                    );
+                }
+            }
             let (gap_us, bursts) = self.syn(src.ip(), join, awaited, now);
             let mut out = vec![Observation::Syn {
                 at_us,
@@ -967,6 +1256,7 @@ impl Observer {
                 dst,
                 flags: Flags(flags),
                 seq,
+                ipv4_options: ipv4_options.into_iter().map(Ipv4Opt::from).collect(),
                 options,
                 options_fault,
                 mptcp,
@@ -980,12 +1270,13 @@ impl Observer {
                 syns,
                 window_us: self.burst.window.as_micros() as u64,
             }));
+            out.extend(signals);
             return out;
         }
         if payload.is_empty() && mptcp.is_empty() && flags & (FIN | RST) == 0 {
-            return Vec::new();
+            return signals;
         }
-        vec![Observation::Segment {
+        signals.push(Observation::Segment {
             at_us,
             attachment,
             src,
@@ -996,7 +1287,8 @@ impl Observer {
             options_fault,
             mptcp,
             payload,
-        }]
+        });
+        signals
     }
 
     /// Whether a SYN awaits `answer`. It awaits it no more.
@@ -1019,12 +1311,30 @@ impl Observer {
         burst
             .into_iter()
             .chain(answer)
+            .chain(
+                self.probes
+                    .values()
+                    .map(|probe| probe.first + ANSWER_TIMEOUT),
+            )
             .min()
             .unwrap_or(Instant::from_since_start(Duration::MAX))
     }
 
     /// Releases expired burst and unanswered SYN state, including while quiet.
     pub(crate) fn expire(&mut self, now: Instant) {
+        let at_us = self.clock.micros(now);
+        let mut expired = Vec::new();
+        self.probes.retain(|key, probe| {
+            if now < probe.first + ANSWER_TIMEOUT {
+                return true;
+            }
+            expired.extend(probe.report(key, at_us, ProbeEnd::Expired));
+            false
+        });
+        self.write_observations(at_us, expired);
+        if self.probes.is_empty() {
+            self.probes.shrink_to_fit();
+        }
         while let Some(&(at, from, joined)) = self.recent.front() {
             if now < at + self.burst.window {
                 break;
@@ -1266,6 +1576,328 @@ mod tests {
     fn observe(observer: &mut Observer, direction: Direction, packet: &[u8]) -> Vec<Observation> {
         let at = Instant::from_since_start(Duration::from_secs(1));
         observer.observe(&Arc::from("internet"), direction, packet, at)
+    }
+
+    fn probe_packet(packet: Vec<u8>, seq: u32, ack: u32, reverse: bool, ipv4: &[u8]) -> Vec<u8> {
+        let header = ip::Header::parse_whole(&packet).unwrap();
+        let mut tcp = header.payload(&packet).to_vec();
+        let (src, dst) = if reverse {
+            tcp.swap(0, 2);
+            tcp.swap(1, 3);
+            (header.dst, header.src)
+        } else {
+            (header.src, header.dst)
+        };
+        tcp[4..8].copy_from_slice(&seq.to_be_bytes());
+        tcp[8..12].copy_from_slice(&ack.to_be_bytes());
+        tcp[16..18].fill(0);
+        let checksum = transport_checksum(src, dst, 6, &tcp);
+        tcp[16..18].copy_from_slice(&checksum.to_be_bytes());
+        let mut packet = packet_with(src, dst, 6, Fields::default(), &tcp).0;
+        assert_eq!(ipv4.len() % 4, 0);
+        packet.splice(20..20, ipv4.iter().copied());
+        let len = packet.len() as u16;
+        packet[2..4].copy_from_slice(&len.to_be_bytes());
+        packet[0] += (ipv4.len() / 4) as u8;
+        packet[10..12].fill(0);
+        let checksum = ip::checksum(&packet[..20 + ipv4.len()]);
+        packet[10..12].copy_from_slice(&checksum.to_be_bytes());
+        packet
+    }
+
+    #[test]
+    fn option_probe_correlation_separates_attachment_tuple_and_initial_sequence() {
+        let mut observer = observer();
+        let syn = probe_packet(segment(SYN, &[], b""), 100, 0, false, &[1; 4]);
+        observe(&mut observer, Direction::In, &syn);
+        let other_sequence = probe_packet(segment(SYN, &[], b""), 200, 0, false, &[1; 4]);
+        let mut other_tuple = segment(SYN, &[], b"");
+        other_tuple[20] += 1;
+        let other_tuple = probe_packet(other_tuple, 100, 0, false, &[1; 4]);
+        for packet in [&other_sequence, &other_tuple] {
+            let events = observe(&mut observer, Direction::In, packet);
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, Observation::IpOptionsRetransmit { .. }))
+            );
+        }
+        let events = observer.observe(
+            &Arc::from("sandbox"),
+            Direction::In,
+            &syn,
+            Instant::from_since_start(Duration::from_secs(1)),
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Observation::IpOptionsRetransmit { .. }))
+        );
+        assert_eq!(observer.probes.len(), 4);
+        let events = observe(&mut observer, Direction::In, &syn);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Observation::IpOptionsRetransmit { seq: 100, .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn only_matching_handshake_ack_stops_option_probe_retransmission() {
+        let mut observer = observer();
+        let syn = probe_packet(segment(SYN, &[], b""), u32::MAX, 0, false, &[0; 4]);
+        observe(&mut observer, Direction::In, &syn);
+        let answer = probe_packet(segment(SYN | ACK, &[], b""), u32::MAX, 0, true, &[]);
+        observe(&mut observer, Direction::Out, &answer);
+        for (seq, ack, flags) in [(1, 0, ACK), (0, 1, ACK), (0, 0, SYN | ACK)] {
+            let wrong = probe_packet(segment(flags, &[], b""), seq, ack, false, &[]);
+            observe(&mut observer, Direction::In, &wrong);
+            assert!(!observer.probes.values().next().unwrap().completed);
+            let events = observe(&mut observer, Direction::In, &syn);
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, Observation::IpOptionsRetransmit { .. }))
+            );
+        }
+        let valid = probe_packet(segment(ACK, &[], b""), 0, 0, false, &[]);
+        observe(&mut observer, Direction::In, &valid);
+        assert!(observer.probes.values().next().unwrap().completed);
+        let events = observe(&mut observer, Direction::In, &syn);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Observation::IpOptionsRetransmit { .. }))
+        );
+    }
+
+    #[test]
+    fn bare_syn_retransmissions_do_not_create_option_probes() {
+        let mut observer = observer();
+        for _ in 0..3 {
+            let events = observe(&mut observer, Direction::In, &segment(SYN, &[], b""));
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, Observation::IpOptionsRetransmit { .. }))
+            );
+        }
+        assert!(observer.probes.is_empty());
+    }
+
+    #[test]
+    fn source_routed_answers_correlate_with_the_peer_and_keep_the_wire_destination() {
+        for kind in [131, 137] {
+            for consumed in [false, true] {
+                let mut observer = observer();
+                let syn = probe_packet(segment(SYN, &[], b""), 1, 0, false, &[1; 4]);
+                observe(&mut observer, Direction::In, &syn);
+                let route = [
+                    kind,
+                    7,
+                    if consumed { 8 } else { 4 },
+                    192,
+                    0,
+                    2,
+                    if consumed { 9 } else { 1 },
+                    0,
+                ];
+                let routed = |flags| {
+                    let mut packet = probe_packet(segment(flags, &[], b""), 40, 2, true, &route);
+                    if !consumed {
+                        packet[16..20].copy_from_slice(&[192, 0, 2, 9]);
+                        packet[10..12].fill(0);
+                        let checksum = ip::checksum(&packet[..28]);
+                        packet[10..12].copy_from_slice(&checksum.to_be_bytes());
+                    }
+                    packet
+                };
+                let events = observe(&mut observer, Direction::Out, &routed(SYN | ACK));
+                let [Observation::Answer { dst, .. }] = &events[..] else {
+                    panic!("the routed SYN-ACK answers the pending SYN")
+                };
+                assert_eq!(
+                    dst.ip(),
+                    IpAddr::V4(Ipv4Addr::new(192, 0, 2, if consumed { 1 } else { 9 }))
+                );
+                assert!(observer.awaited.is_empty());
+                assert_eq!(
+                    observer.probes.values().next().unwrap().server_seq,
+                    Some(40)
+                );
+
+                let mut wrong = segment(ACK, &[], b"");
+                wrong[12..16].copy_from_slice(&[192, 0, 2, 9]);
+                ip::set_header_checksum(&mut wrong[..20]);
+                let wrong = probe_packet(wrong, 2, 41, false, &[]);
+                observe(&mut observer, Direction::In, &wrong);
+                assert!(!observer.probes.values().next().unwrap().completed);
+                let ack = probe_packet(segment(ACK, &[], b""), 2, 41, false, &[]);
+                observe(&mut observer, Direction::In, &ack);
+                assert!(observer.probes.values().next().unwrap().completed);
+                let events = observe(&mut observer, Direction::In, &syn);
+                assert!(
+                    !events
+                        .iter()
+                        .any(|event| matches!(event, Observation::IpOptionsRetransmit { .. }))
+                );
+                observe(&mut observer, Direction::Out, &routed(RST | ACK));
+                assert!(observer.probes.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn option_probe_expiry_releases_attempt_without_a_retransmission_signal() {
+        let mut observer = observer();
+        let syn = probe_packet(segment(SYN, &[], b""), 1, 0, false, &[1; 4]);
+        observe(&mut observer, Direction::In, &syn);
+        let deadline = Instant::from_since_start(Duration::from_secs(1) + ANSWER_TIMEOUT);
+        observer.expire(deadline);
+        assert!(observer.probes.is_empty());
+        let events = observer.observe(&Arc::from("internet"), Direction::In, &syn, deadline);
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            Observation::IpOptionsRetransmit { .. } | Observation::MptcpNoData { .. }
+        )));
+    }
+
+    #[test]
+    fn completed_mptcp_probe_reports_close_after_matching_ack() {
+        let mut observer = observer();
+        let syn = segment(SYN, &[30, 4, 1, 1], b"");
+        observe(&mut observer, Direction::In, &syn);
+        let answer = probe_packet(segment(SYN | ACK, &[], b""), 40, 2, true, &[]);
+        observe(&mut observer, Direction::Out, &answer);
+        let ack = probe_packet(segment(ACK, &[], b""), 2, 41, false, &[]);
+        observer.observe(
+            &Arc::from("sandbox"),
+            Direction::In,
+            &ack,
+            Instant::from_since_start(Duration::from_secs(1)),
+        );
+        assert!(!observer.probes.values().next().unwrap().completed);
+        observe(&mut observer, Direction::In, &ack);
+        assert!(observer.probes.values().next().unwrap().completed);
+        let close = probe_packet(segment(ACK | FIN, &[], b""), 2, 41, false, &[]);
+        let events = observe(&mut observer, Direction::In, &close);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Observation::MptcpNoData {
+                completed: true,
+                end: ProbeEnd::Close,
+                ..
+            }
+        )));
+        assert!(observer.probes.is_empty());
+    }
+
+    #[test]
+    fn unknown_and_malformed_ipv4_options_are_logged_in_wire_order() {
+        let mut observer = observer();
+        let syn = probe_packet(
+            segment(SYN, &[], b""),
+            1,
+            0,
+            false,
+            &[222, 4, 12, 13, 7, 3, 3, 0],
+        );
+        let events = observe(&mut observer, Direction::In, &syn);
+        let Observation::Syn { ipv4_options, .. } = &events[0] else {
+            panic!("SYN observation")
+        };
+        assert_eq!(
+            ipv4_options,
+            &[
+                Ipv4Opt::Unknown {
+                    number: 222,
+                    data: Hex(vec![12, 13])
+                },
+                Ipv4Opt::Malformed {
+                    number: 7,
+                    data: Hex(vec![3, 3])
+                },
+                Ipv4Opt::EndOfList,
+            ]
+        );
+        let line = serde_json::to_value(&events[0]).unwrap();
+        assert_eq!(line["ipv4_options"][0]["data"], "0c0d");
+        assert_eq!(line["ipv4_options"][1]["data"], "0303");
+        let events = observe(&mut observer, Direction::In, &syn);
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, Observation::IpOptionsRetransmit { .. }))
+        );
+    }
+
+    #[test]
+    fn mptcp_probe_payload_suppresses_no_data_on_close() {
+        for payload_on_syn in [false, true] {
+            let mut observer = observer();
+            let syn = segment(
+                SYN,
+                &[30, 4, 1, 1],
+                if payload_on_syn { b"data" } else { b"" },
+            );
+            observe(&mut observer, Direction::In, &syn);
+            if !payload_on_syn {
+                let data = probe_packet(segment(ACK, &[], b"data"), 2, 30, false, &[]);
+                observe(&mut observer, Direction::In, &data);
+            }
+            let close = probe_packet(segment(RST, &[], b""), 2, 0, false, &[]);
+            let events = observe(&mut observer, Direction::In, &close);
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, Observation::MptcpNoData { .. }))
+            );
+            assert!(observer.probes.is_empty());
+        }
+    }
+
+    #[test]
+    fn pending_mptcp_probe_ignores_another_attempts_payload_and_close() {
+        let mut observer = observer();
+        observe(
+            &mut observer,
+            Direction::In,
+            &segment(SYN, &[30, 4, 1, 1], b""),
+        );
+        for (reverse, flags) in [(false, ACK | FIN), (true, ACK | RST)] {
+            let packet = probe_packet(segment(flags, &[], b"data"), 50, 60, reverse, &[]);
+            observe(
+                &mut observer,
+                if reverse {
+                    Direction::Out
+                } else {
+                    Direction::In
+                },
+                &packet,
+            );
+            assert_eq!(observer.probes.len(), 1);
+            assert!(!observer.probes.values().next().unwrap().payload);
+        }
+        let close = probe_packet(segment(RST, &[], b""), 2, 0, false, &[]);
+        let events = observe(&mut observer, Direction::In, &close);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Observation::MptcpNoData {
+                seq: 1,
+                completed: false,
+                end: ProbeEnd::Close,
+                ..
+            }
+        )));
+        assert!(observer.probes.is_empty());
+        let events = observe(&mut observer, Direction::In, &close);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Observation::MptcpNoData { .. }))
+        );
     }
 
     /// A bare FIN is a segment line, as the docs say.
@@ -1553,6 +2185,50 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn quiet_probe_expiry_reports_recovered_loss_before_no_data() {
+        let log = Disk::default();
+        let mut observer = observer();
+        observer.log = Sink::new(Box::new(log.clone()));
+        let name = Arc::from("internet");
+        let at = Instant::from_since_start(Duration::from_secs(1));
+        let syn = segment(SYN, &[30, 4, 1, 1], b"");
+        observer.crossed(&name, Direction::In, &syn, at);
+        observer.whole(&name, Direction::In, &syn, at);
+        assert_eq!(
+            observer.lost,
+            Lost {
+                packets: 0,
+                observations: 1
+            }
+        );
+        assert!(log.0.lock().unwrap().0.is_empty());
+
+        log.0.lock().unwrap().1 = usize::MAX;
+        let deadline = at + ANSWER_TIMEOUT;
+        observer.expire(deadline);
+        let written = log.0.lock().unwrap().0.clone();
+        let lines: Vec<serde_json::Value> = std::str::from_utf8(&written)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines[0],
+            serde_json::json!({
+                "event": "lost", "at_us": 64_000_000, "packets": 0, "observations": 1
+            })
+        );
+        assert_eq!(lines[1]["event"], "mptcp_no_data");
+        assert_eq!(lines[1]["at_us"], 64_000_000);
+        assert_eq!(lines[1]["end"], "expired");
+        assert_eq!(observer.lost, Lost::default());
+        assert!(observer.probes.is_empty());
+        observer.expire(deadline);
+        assert_eq!(log.0.lock().unwrap().0, written);
     }
 
     /// A full disk loses records but stops nothing. A record cut short is

@@ -718,18 +718,26 @@ pub struct Listener<S> {
     port: u16,
     joins: Arc<Mutex<JoinCookies>>,
     fcx: Cx,
+    clock: crate::Clock,
 }
 
 impl<S> Listener<S> {
     /// `inner` on `port` behind an MPTCP listener whose keys come from
     /// `fcx`.
-    pub fn new(fcx: &Cx, tokens: Arc<Tokens>, port: u16, inner: S) -> Listener<S> {
+    pub fn new(
+        fcx: &Cx,
+        clock: crate::Clock,
+        tokens: Arc<Tokens>,
+        port: u16,
+        inner: S,
+    ) -> Listener<S> {
         Listener {
             inner,
             tokens,
             port,
             joins: Arc::new(Mutex::new(JoinCookies::new(fcx.random_u64()))),
             fcx: fcx.clone(),
+            clock,
         }
     }
 }
@@ -740,6 +748,31 @@ struct Answers {
     port: u16,
     joins: Arc<Mutex<JoinCookies>>,
     fcx: Cx,
+    clock: crate::Clock,
+}
+
+impl Answers {
+    fn echo(&self, syn: &Syn<'_>) -> Option<fictionet::stdlib::network::ip::Ipv4Reply> {
+        let (std::net::IpAddr::V4(local), std::net::IpAddr::V4(remote)) =
+            (syn.to.ip(), syn.from.ip())
+        else {
+            return Some(Default::default());
+        };
+        let timestamp = ((self.clock.micros(self.fcx.now()) / 1000) % 86_400_000) as u32;
+        fictionet_extras::linux::ipv4_options(
+            syn.ipv4_options,
+            local,
+            remote,
+            timestamp,
+            |address| {
+                address != local
+                    && !address.is_unspecified()
+                    && !address.is_loopback()
+                    && !address.is_multicast()
+                    && !address.is_broadcast()
+            },
+        )
+    }
 }
 
 impl Answer for Answers {
@@ -748,12 +781,13 @@ impl Answer for Answers {
         let offer = SynOffer::read(syn.options);
         if let (true, None, Some((token, _)), SynAnswer::Accept(added)) =
             (syn.cookie, offer.capable, offer.join, &answer)
+            && let Some(ipv4) = self.ipv4_options(syn)
         {
             let kept = Kept {
                 syn: syn.options.into(),
                 syn_ack: added.as_slice().into(),
                 syn_ipv4: syn.to.is_ipv4().then(|| syn.ipv4_options.into()),
-                syn_ack_ipv4: syn.to.is_ipv4().then(Arc::default),
+                syn_ack_ipv4: syn.to.is_ipv4().then(|| ipv4.options.into()),
             };
             let cookie = JoinCookie { token, kept };
             self.joins
@@ -761,6 +795,10 @@ impl Answer for Answers {
                 .save(syn.seq, syn.from.port(), self.port, cookie);
         }
         answer
+    }
+
+    fn ipv4_options(&self, syn: &Syn<'_>) -> Option<fictionet::stdlib::network::ip::Ipv4Reply> {
+        self.echo(syn)
     }
 
     fn cookie(&self, from: SocketAddr, handshake: &Handshake) -> Option<Kept> {
@@ -888,6 +926,7 @@ impl<S: PortServer> PortServer for Listener<S> {
             port: self.port,
             joins: self.joins.clone(),
             fcx: self.fcx.clone(),
+            clock: self.clock,
         }))
     }
 }
@@ -1197,7 +1236,13 @@ mod tests {
                     remote: 0x1111,
                 };
                 let open = tokens.open(keys, PORT).unwrap();
-                let listener = Listener::new(&fcx, tokens.clone(), PORT, H2);
+                let listener = Listener::new(
+                    &fcx,
+                    crate::Clock::at_unix_secs(0),
+                    tokens.clone(),
+                    PORT,
+                    H2,
+                );
                 let answers = listener.answer().unwrap();
                 let options = syn(&[join(token(42))]);
                 // The SYN, past the backlog: the server's random number.
@@ -1495,7 +1540,13 @@ mod tests {
         fictionet::block_on(fictionet::lab(
             fictionet::Seed::from_u64(1),
             |fcx| async move {
-                let listener = Listener::new(&fcx, Arc::default(), PORT, H2);
+                let listener = Listener::new(
+                    &fcx,
+                    crate::Clock::at_unix_secs(0),
+                    Arc::default(),
+                    PORT,
+                    H2,
+                );
                 assert_eq!(listener.alpn(), H2.alpn());
                 assert!(listener.answer().is_some());
                 Ok(())
