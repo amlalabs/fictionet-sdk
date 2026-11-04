@@ -15,14 +15,15 @@
 //!    [`identity`](Config::identity).
 //! 3. Asks its local zones that hold QNAME, deepest first and at equal
 //!    depth the one added last. The first that knows the answer gives it;
-//!    a zone that does not know passes the question on. A local chain
-//!    that leaves its zone goes on from its target as any alias does,
-//!    when RD is set.
+//!    a zone that does not know passes the question on. When RD is set,
+//!    a local chain that leaves its zone goes on from its target as any
+//!    alias does, and a local referral is followed.
 //! 4. Answers from its cache, or starts or joins a resolution: the
-//!    iteration of RFC 1034 §5.3.3 from the root servers down, following
-//!    aliases, each target asked of the local zones first as in step 3,
-//!    looking up name servers that came without glue, and
-//!    fetching the DS and DNSKEY sets that validation needs.
+//!    iteration of RFC 1034 §5.3.3 from the root servers down, or from
+//!    the servers a local zone's cut names, following aliases, each
+//!    target asked of the local zones first as in step 3, looking up
+//!    name servers that came without glue, and fetching the DS and
+//!    DNSKEY sets that validation needs.
 //! 5. Renders the answer for this client: its ID, flags, EDNS, question
 //!    case, and TTLs counted down.
 //!
@@ -129,6 +130,25 @@ struct Asker {
     stale_tried: bool,
 }
 
+impl Asker {
+    /// The client's request with the name the answer asks for next: QNAME,
+    /// then the target of each alias it follows. `None` once the answer
+    /// holds what its chain ends in.
+    fn next_question(&self) -> Option<Request> {
+        let name = match self.pieces.last() {
+            None => self.request.question.name().to_lowercase(),
+            Some(Piece {
+                outcome: Outcome::Alias { target, .. },
+                ..
+            }) => target.clone(),
+            Some(_) => return None,
+        };
+        let mut asked = self.request.clone();
+        asked.question.set_name(name);
+        Some(asked)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum AskerWait {
     Nothing,
@@ -151,7 +171,9 @@ struct Piece {
     cached: bool,
     /// Whether it is expired data served under RFC 8767.
     stale: bool,
-    /// Whether it came from a local zone, whose data is never validated.
+    /// Whether it came from a local zone, or from the servers a local
+    /// zone's cut names, which rests on that zone's data. Local data is
+    /// never validated.
     local: bool,
     /// When the TTLs in `outcome` were current.
     at: Instant,
@@ -182,6 +204,15 @@ struct Local {
     /// Whether its CNAME and DNAME chain went past the zone, out of it or
     /// to a referral ([`answer_onward`]).
     onward: bool,
+}
+
+impl Local {
+    /// Whether the answer settles the question: the zone answered with
+    /// authority, and its chain stayed inside the zone. A referral, or a
+    /// chain that goes past the zone, leaves the rest to resolve.
+    fn settles(&self) -> bool {
+        self.response.message.metadata.authoritative && !self.onward
+    }
 }
 
 /// The worse of two validation results, for an answer made of several
@@ -279,11 +310,13 @@ impl<V: Verify> Resolver<V> {
             }
         }
 
-        // A local chain that leaves its zone goes on from its target as
-        // any alias does, when the client asked for recursion
-        // (RFC 1034 §4.3.2 step 3a).
+        // When the client asked for recursion, a local answer that does
+        // not settle the question is resolved on, as every name the
+        // resolution reaches is (RFC 1034 §4.3.2 step 1, §5.3.3): a local
+        // chain that leaves its zone goes on from its target, and a local
+        // referral is followed to the servers it names.
         if let Some(local) = self.local_answer(&request)
-            && !(local.onward && request.rd)
+            && (local.settles() || !request.rd)
         {
             let bytes = self.render_local(&request, local.response, local.keep_aa);
             return self.send_answer(client, bytes, Validation::NotPerformed, false);
@@ -368,17 +401,10 @@ impl<V: Verify> Resolver<V> {
             if asker.wait != AskerWait::Nothing {
                 return;
             }
-            let next = match asker.pieces.last() {
-                None => Some(asker.request.question.name().to_lowercase()),
-                Some(Piece {
-                    outcome: Outcome::Alias { target, .. },
-                    ..
-                }) => Some(target.clone()),
-                Some(_) => None,
-            };
-            let Some(name) = next else {
+            let Some(asked) = asker.next_question() else {
                 break;
             };
+            let name = asked.question.name().clone();
             let qtype = asker.request.question.query_type();
             let aliases = u8::try_from(asker.pieces.len()).unwrap_or(u8::MAX);
             let looped = asker.pieces.iter().any(|piece| match &piece.outcome {
@@ -394,9 +420,8 @@ impl<V: Verify> Resolver<V> {
             }
             // Local data is the first source for every name the chain
             // reaches, as for QNAME (RFC 1034 §4.3.2 step 1, §5.3.3), so
-            // a name a local zone holds never leaves the resolver.
-            let mut asked = asker.request.clone();
-            asked.question.set_name(name.clone());
+            // a name a local zone holds never leaves the resolver, but
+            // for the servers a local cut names.
             if let Some(outcomes) = self.local_outcomes(&asked) {
                 self.push_local(id, outcomes);
                 continue;
@@ -448,25 +473,39 @@ impl<V: Verify> Resolver<V> {
 
     fn push_found(&mut self, id: AskerId, found: resolution::Found) {
         let depth = usize::from(self.config.work.depth);
+        let Some(asker) = self.askers.get(&id) else {
+            return;
+        };
+        // What the servers a local zone's cut names answered rests on that
+        // zone's data, and is not validated, as the zone's own is not.
+        let asked = asker.next_question();
+        let local = asked
+            .as_ref()
+            .is_some_and(|asked| self.local_cut(asked).is_some());
         let Some(asker) = self.askers.get_mut(&id) else {
             return;
         };
         asker.pieces.push(Piece {
-            checks: found.checks,
+            checks: if local { Vec::new() } else { found.checks },
             verified: Vec::new(),
             outcome: found.outcome,
             cached: found.cached,
             stale: false,
-            local: false,
+            local,
             at: self.now,
         });
         // The rest of a chain the same reply carried answers its targets,
         // before any lookup of them, so the data that came for this
         // question serves it even when the cache did not keep it
         // (RFC 1035 §7.4). It stops where following the chain one name at
-        // a time would stop: at a name the chain passed, or past the work
-        // bound, which the next step then fails on.
+        // a time would stop: at a name the chain passed, past the work
+        // bound, which the next step then fails on, or at a name a local
+        // zone answers for, since local data comes first for every name
+        // the chain reaches (RFC 1034 §4.3.2 step 1).
         for outcome in found.rest {
+            let Some(asker) = self.askers.get(&id) else {
+                return;
+            };
             let Some(Piece {
                 outcome: Outcome::Alias { target, .. },
                 ..
@@ -481,10 +520,19 @@ impl<V: Verify> Resolver<V> {
             if looped || asker.pieces.len() > depth {
                 break;
             }
+            if asker
+                .next_question()
+                .is_some_and(|asked| self.local_answer(&asked).is_some())
+            {
+                break;
+            }
             let checks = resolution::subjects(&outcome)
                 .into_iter()
                 .map(|subject| (subject, Validation::NotPerformed))
                 .collect();
+            let Some(asker) = self.askers.get_mut(&id) else {
+                return;
+            };
             asker.pieces.push(Piece {
                 checks,
                 verified: Vec::new(),

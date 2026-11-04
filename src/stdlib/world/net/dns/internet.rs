@@ -496,23 +496,28 @@ impl Authority for Mirrored {
 /// counterpart asks that server from another IPv4 address, its egress,
 /// would be shown that address instead. So a reply to a client given with
 /// [`client`](Echo::client) carries its egress in place of the
-/// upstream's, in an unsigned A record and in a TXT string. The copied
-/// record stays as the real server sent it; the address is put in as the
-/// reply leaves, since it depends on who asked. A world adds it with
-/// [`Mirror::wrap`] and [`Echo::over`].
+/// upstream's, in an unsigned A record and in a TXT string, at the names
+/// given with [`name`](Echo::name), whose servers echo the asker. A record
+/// at any other name that holds the upstream's address is real data, and
+/// is left alone. The copied record stays as the real server sent it; the
+/// address is put in as the reply leaves, since it depends on who asked.
+/// A world adds it with [`Mirror::wrap`] and [`Echo::over`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Echo {
     upstream: Ipv4Addr,
     egress: HashMap<IpAddr, Ipv4Addr>,
+    names: HashSet<LowerName>,
 }
 
 impl Echo {
     /// Echoes for questions whose answers were asked from `upstream`. It
-    /// changes no reply until a [`client`](Self::client) is given.
+    /// changes no reply until a [`client`](Self::client) and a
+    /// [`name`](Self::name) are given.
     pub fn new(upstream: Ipv4Addr) -> Echo {
         Echo {
             upstream,
             egress: HashMap::new(),
+            names: HashSet::new(),
         }
     }
 
@@ -520,6 +525,13 @@ impl Echo {
     /// reply echoes the upstream's.
     pub fn client(mut self, client: IpAddr, egress: Ipv4Addr) -> Echo {
         self.egress.insert(client, egress);
+        self
+    }
+
+    /// Echoes the asker's address in the records at `name`, whose real
+    /// servers answer with the address a question came from.
+    pub fn name(mut self, name: &Name) -> Echo {
+        self.names.insert(LowerName::new(name));
         self
     }
 
@@ -551,7 +563,12 @@ impl Authority for Echoed {
                 if let Some(&seen) = self.echo.egress.get(&client.peer.ip())
                     && seen != self.echo.upstream
                 {
-                    echo(&mut response.message, self.echo.upstream, seen);
+                    echo(
+                        &mut response.message,
+                        &self.echo.names,
+                        self.echo.upstream,
+                        seen,
+                    );
                 }
                 Step::Reply(response)
             }
@@ -569,11 +586,10 @@ impl Authority for Echoed {
 }
 
 /// Puts `seen` in place of `egress` where `message`'s answer echoes the
-/// address a question came from, as `whoami.akamai.net` A or
-/// `whoami.ds.akahelp.net` TXT do: an A record holding `egress`, and a
-/// TXT string that is `egress`. An RRset its RRSIGs cover is left as
-/// it is.
-fn echo(message: &mut Message, egress: Ipv4Addr, seen: Ipv4Addr) {
+/// address a question came from, at one of `names`: an A record holding
+/// `egress`, and a TXT string that is `egress`. An RRset its RRSIGs cover
+/// is left as it is.
+fn echo(message: &mut Message, names: &HashSet<LowerName>, egress: Ipv4Addr, seen: Ipv4Addr) {
     let signed: Vec<(Name, RecordType)> = message
         .answers
         .iter()
@@ -586,7 +602,9 @@ fn echo(message: &mut Message, egress: Ipv4Addr, seen: Ipv4Addr) {
         .collect();
     let text = egress.to_string();
     for record in &mut message.answers {
-        if signed.contains(&(record.name.clone(), record.record_type())) {
+        if !names.contains(&LowerName::new(&record.name))
+            || signed.contains(&(record.name.clone(), record.record_type()))
+        {
             continue;
         }
         match &mut record.data {

@@ -1651,9 +1651,9 @@ fn each_address_refers_to_its_own_servers_deepest_cut() {
 }
 
 /// A real server may answer a question with an error RCODE that gives no
-/// records, as BIND answers FORMERR to a meta-type and SERVFAIL to a CNAME
-/// loop. The copy answers that question with the same RCODE, never with
-/// silence (RFC 8906 §3.1).
+/// records, such as FORMERR to a type it will not serve or SERVFAIL to a
+/// CNAME loop. The copy answers that question with the same RCODE, never
+/// with silence (RFC 8906 §3.1).
 #[test]
 fn a_copy_answers_with_the_error_its_real_server_gave() {
     let real = Zones::new(vec![
@@ -1662,7 +1662,7 @@ fn a_copy_answers_with_the_error_its_real_server_gave() {
     let erring = |lookup: &Lookup| {
         let mut message = reply_of(&real, lookup);
         let rcode = match lookup.question.query_type() {
-            RecordType::TSIG => ResponseCode::FormErr,
+            RecordType::NULL => ResponseCode::FormErr,
             RecordType::TXT => ResponseCode::ServFail,
             RecordType::MX => ResponseCode::NotImp,
             _ => return message,
@@ -1677,7 +1677,7 @@ fn a_copy_answers_with_the_error_its_real_server_gave() {
     let copies = Copies::new();
     copies.serves(local.ip(), &lower("example."));
     for (qtype, rcode) in [
-        (RecordType::TSIG, ResponseCode::FormErr),
+        (RecordType::NULL, ResponseCode::FormErr),
         (RecordType::TXT, ResponseCode::ServFail),
         (RecordType::MX, ResponseCode::NotImp),
     ] {
@@ -1692,4 +1692,91 @@ fn a_copy_answers_with_the_error_its_real_server_gave() {
     let asked = request("www.example.", RecordType::A, false);
     let (got, _) = through(&copies, &erring, local, &asked);
     assert_eq!(shape(&got), shape(&reply_of(&real, &own(local, &asked))));
+}
+
+/// The real servers of `example` and of `srv.child.example` below its cut
+/// at `child.example`, with an alias in the child that leads out of both,
+/// answering with minimal responses: no authority or additional section
+/// beside an answer.
+fn minimal_servers() -> impl Fn(&Lookup) -> Message {
+    let text = format!("{SRV}alias.srv.child.example. 300 IN CNAME www.elsewhere.test.\n");
+    let real = Zones::new(vec![
+        Arc::new(Zone::from_master(EXAMPLE, None).unwrap()) as Arc<dyn ZoneData>,
+        Arc::new(Zone::from_master(&text, None).unwrap()) as Arc<dyn ZoneData>,
+    ]);
+    move |lookup: &Lookup| {
+        let mut message = reply_of(&real, lookup);
+        if !message.answers.is_empty() {
+            message.authorities.clear();
+            message.additionals.clear();
+        }
+        message
+    }
+}
+
+/// An alias in a zone below a cut answers an SOA question at its name
+/// with the CNAME alone (RFC 1034 §3.6.2), which shows no apex when the
+/// server sends no authority section. The copy asks for the SOA RRset at
+/// each name above it in turn, up to the cut, until one shows the zone,
+/// and then answers as the real server does, never with silence.
+#[test]
+fn copies_place_an_alias_below_a_cut() {
+    let real = minimal_servers();
+    let local: SocketAddr = "192.0.2.53:53".parse().unwrap();
+    for qtype in [RecordType::A, RecordType::SOA] {
+        let copies = Copies::new();
+        copies.serves(local.ip(), &lower("example."));
+        // A referral files the cut at `child.example`.
+        through(
+            &copies,
+            &real,
+            local,
+            &request("x.child.example.", RecordType::A, false),
+        );
+        let asked = request("alias.srv.child.example.", qtype, false);
+        for round in 0..2 {
+            let (got, _) = through(&copies, &real, local, &asked);
+            let want = real(&own(local, &asked));
+            assert_eq!(shape(&got), shape(&want), "{qtype} round {round}");
+            assert_eq!(got.answers.len(), 1, "{qtype} round {round}");
+        }
+    }
+}
+
+/// An address that refuses the SOA question the copy asks to place a
+/// name below a cut does not serve the zone it was noted for, so it
+/// answers as though never noted for it (RFC 8906 §3.1.1): REFUSED, as
+/// it serves no other zone, and never silence.
+#[test]
+fn an_address_that_refuses_to_place_a_name_answers_refused() {
+    let minimal = minimal_servers();
+    let refusing = |lookup: &Lookup| {
+        let mut message = minimal(lookup);
+        if lookup.question.query_type() == RecordType::SOA {
+            message.metadata.response_code = ResponseCode::Refused;
+            message.metadata.authoritative = false;
+            message.answers.clear();
+            message.authorities.clear();
+            message.additionals.clear();
+        }
+        message
+    };
+    let local: SocketAddr = "192.0.2.53:53".parse().unwrap();
+    let copies = Copies::new();
+    copies.serves(local.ip(), &lower("example."));
+    through(
+        &copies,
+        &refusing,
+        local,
+        &request("x.child.example.", RecordType::A, false),
+    );
+    for round in 0..2 {
+        let asked = request("www.srv.child.example.", RecordType::A, false);
+        let (got, _) = through(&copies, &refusing, local, &asked);
+        assert_eq!(
+            got.metadata.response_code,
+            ResponseCode::Refused,
+            "round {round}"
+        );
+    }
 }

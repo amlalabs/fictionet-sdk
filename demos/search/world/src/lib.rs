@@ -84,16 +84,19 @@ pub fn net(
     egress: Option<Ipv4Addr>,
     forwarded: impl IntoIterator<Item = (Name, Host)>,
 ) -> Net {
-    let mut forwarded: HashMap<LowerName, Host> = forwarded
-        .into_iter()
-        .map(|(name, host)| (LowerName::new(&name), host))
-        .collect();
     // The workstation sets its clock from Ubuntu's time server, which the
     // world plays in every mode.
-    forwarded.insert(
-        LowerName::new(&Name::from_ascii(ntp::HOST).expect("a valid name")),
-        ntp::host(pages.clone()),
-    );
+    let ntp = Name::from_ascii(ntp::HOST).expect("a valid name");
+    // Names off the wire are fully qualified, and a relative name never
+    // equals one, so each forwarded name is taken from the root.
+    let forwarded: HashMap<LowerName, Host> = forwarded
+        .into_iter()
+        .chain([(ntp, ntp::host(pages.clone()))])
+        .map(|(mut name, host)| {
+            name.set_fqdn(true);
+            (LowerName::new(&name), host)
+        })
+        .collect();
     let namespace = pages.namespace().clone();
     let clock = namespace.current().clock;
     let net = Net::new(fictionet_extras::network::cdn_pools()).ipv4_only().drop_unrouted();

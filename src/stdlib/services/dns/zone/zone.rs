@@ -896,10 +896,14 @@ impl Inner {
             }
             // The NSEC at the name. A name a wildcard answers for takes the
             // one that covers it and the wildcard's own (RFC 4035
-            // §3.1.3.4).
+            // §3.1.3.4). A wildcard that is an empty non-terminal has no
+            // NSEC (RFC 4035 §2.3) and still matches (RFC 4592 §2.2.1):
+            // the one that covers it, with a next name below it, shows it
+            // exists with no records.
             Denied::Type(_) if !self.nodes.contains_key(name) => {
                 let wildcard = wildcard(&self.closest_encloser(name));
-                vec![covering(name), self.nsec.get(&wildcard).cloned()]
+                let at_wildcard = self.nsec.get(&wildcard).cloned();
+                vec![covering(name), at_wildcard.or_else(|| covering(&wildcard))]
             }
             Denied::Type(_) => vec![covering(name)],
             // The NSEC that covers a name a wildcard answered.

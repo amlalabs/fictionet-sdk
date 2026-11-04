@@ -1782,6 +1782,99 @@ fn a_local_alias_out_of_its_zone_is_followed() {
     assert!(reply.metadata.authoritative);
 }
 
+/// An alias target a local zone holds is answered from that zone even
+/// when the reply that brought the alias carried the target's data: local
+/// data comes first for every name a chain reaches (RFC 1034 §4.3.2
+/// step 1). The same question gets the same answer whether the alias is
+/// fresh or cached.
+#[test]
+fn a_chain_target_a_local_zone_holds_is_answered_locally() {
+    let (mut net, _) = internet(false);
+    let local = small("www.example.com.", "www.example.com.", "10.0.0.1");
+    let mut resolver = resolver(config(None).local(LocalZone::new(Arc::new(local))));
+    for seconds in [0, 1] {
+        let reply = ask(
+            &mut resolver,
+            &mut net,
+            seconds,
+            query(client(1), "alias.example.com.", RecordType::A, |_| {}),
+        );
+        assert_eq!(
+            reply.answers[0].data,
+            RData::CNAME(CNAME(name("www.example.com."))),
+            "at {seconds} s"
+        );
+        assert_eq!(addresses(&reply), ["10.0.0.1"], "at {seconds} s");
+    }
+}
+
+/// A local zone that holds a zone cut names the best servers for the
+/// names below it (RFC 1034 §5.3.3 step 2). With RD set, the resolver
+/// asks them, for QNAME and for an alias target alike, and never the
+/// root. With RD clear, the zone's referral goes out as it is
+/// (RFC 1034 §4.3.1).
+#[test]
+fn a_local_zone_cut_is_followed_to_its_servers() {
+    let (mut net, _) = internet(false);
+    let org = delegation(
+        builder("org.", "ns.nic.org.").rrset(rrset("ns.nic.org.", 3600, vec![a(ORG)])),
+        "example.org.",
+        "ns1.example.org.",
+        Some(EXAMPLE_ORG),
+        None,
+    )
+    .rrset(rrset(
+        "alias.org.",
+        300,
+        vec![RData::CNAME(CNAME(name("www.example.org.")))],
+    ))
+    .build()
+    .unwrap();
+    let mut resolver = resolver(config(None).local(LocalZone::new(Arc::new(org))));
+    let reply = ask(
+        &mut resolver,
+        &mut net,
+        0,
+        query(client(1), "www.example.org.", RecordType::A, |_| {}),
+    );
+    assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(addresses(&reply), ["192.0.2.90"]);
+    let reply = ask(
+        &mut resolver,
+        &mut net,
+        1,
+        query(client(2), "alias.org.", RecordType::A, |_| {}),
+    );
+    assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(
+        reply.answers[0].data,
+        RData::CNAME(CNAME(name("www.example.org.")))
+    );
+    assert_eq!(addresses(&reply), ["192.0.2.90"]);
+    let asked = asked(&net);
+    assert!(!asked.is_empty());
+    assert!(
+        asked
+            .iter()
+            .all(|(server, _, _, _)| *server == ip(EXAMPLE_ORG)),
+        "{asked:?}"
+    );
+
+    let norec = |m: &mut Message| m.metadata.recursion_desired = false;
+    let reply = ask(
+        &mut resolver,
+        &mut net,
+        2,
+        query(client(3), "www.example.org.", RecordType::A, norec),
+    );
+    assert!(reply.answers.is_empty());
+    assert!(!reply.metadata.authoritative);
+    assert_eq!(
+        reply.authorities[0].data,
+        RData::NS(NS(name("ns1.example.org.")))
+    );
+}
+
 #[test]
 fn rd_clear_is_refused_or_answered_from_the_cache_alone() {
     let (mut net, _) = internet(false);

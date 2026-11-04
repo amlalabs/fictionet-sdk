@@ -333,12 +333,19 @@ Authority:
 * `Copies::keep` files a response into the copy the lookup names, which
   `ObserveOne` models. Its other branches are not in this spec: filing a
   response from a zone below the lookup's into that zone's copy
-  (`Learned::child_answering`), the SOA question that finds such a zone's
-  apex, and an address answering without a zone its real server turns out
-  not to serve. `tests/it/dns/learned.rs` checks them:
+  (`Learned::child_answering`), the SOA questions that find such a zone's
+  apex, an address answering without a zone its real server turns out
+  not to serve, and a question the real server answered with an error
+  RCODE, which gets that RCODE (`Learned::failed`); `RealRcode` gives
+  only NOERROR and NXDOMAIN. `tests/it/dns/learned.rs` checks them:
   `copies_learn_a_child_zone_its_server_also_serves`,
-  `copies_find_a_zone_below_a_cut_they_hold`, and
-  `copies_drop_a_zone_their_real_server_does_not_serve`.
+  `copies_find_a_zone_below_a_cut_they_hold`,
+  `copies_place_an_alias_below_a_cut`,
+  `copies_drop_a_zone_their_real_server_does_not_serve`,
+  `an_address_that_refuses_to_place_a_name_answers_refused`, and
+  `a_copy_answers_with_the_error_its_real_server_gave`. The Lean model's
+  `Authority.respond` has the error RCODE branch, and `learned.json`
+  drives it.
 * `OneAskPerNeed` checks that a request needs at most one lookup per fact
   per generation, and that requests needing the same lookup wait on one
   pending lookup (`AuthorityEngine::park`); `_noshare`, which puts a lookup

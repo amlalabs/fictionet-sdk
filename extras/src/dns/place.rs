@@ -24,6 +24,15 @@ use super::public::{self, PUBLIC_RESOLVERS, PublicResolver};
 use super::roots::{self, GTLD_SERVERS};
 use super::{bind, chaos};
 
+/// The names whose real servers answer with the address a question came
+/// from, Akamai's in an A record and a TXT string, Google's in a TXT
+/// string, which shows a resolver its own egress.
+const ECHOING: [&str; 3] = [
+    "whoami.akamai.net.",
+    "whoami.ds.akahelp.net.",
+    "o-o.myaddr.l.google.com.",
+];
+
 /// How one anycast server looks from a place: the round trip to the
 /// instance that answers there, and what that instance says about itself.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -127,8 +136,12 @@ impl Place {
 
     /// The [`Echo`] for a mirror whose upstream asks from `upstream`: each
     /// address of each public resolver is shown its resolver's
-    /// [`egress`](ResolverSite::egress) from here.
+    /// [`egress`](ResolverSite::egress) from here, at the names whose
+    /// real servers answer with the address a question came from.
     pub fn echo(&self, upstream: Ipv4Addr) -> Echo {
+        let echo = ECHOING.iter().fold(Echo::new(upstream), |echo, name| {
+            echo.name(&Name::from_ascii(name).expect("a valid name"))
+        });
         PUBLIC_RESOLVERS
             .iter()
             .flat_map(|resolver| {
@@ -140,9 +153,7 @@ impl Place {
                     ]
                 })
             })
-            .fold(Echo::new(upstream), |echo, (client, egress)| {
-                echo.client(client, egress)
-            })
+            .fold(echo, |echo, (client, egress)| echo.client(client, egress))
     }
 
     /// The San Francisco Bay Area, as every root letter, `gtld-servers.net`

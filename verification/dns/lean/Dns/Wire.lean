@@ -938,6 +938,47 @@ def faultInOpt (msg : Bytes) : Bool :=
     | .error _ => false
   | _, _, _, _ => false
 
+/-- The first fault among `rs`, a message's records in order, of the kinds a message that decodes may still
+have: an OPT record among the first `outside` records, outside the additional section (RFC 6891 §6.1.1),
+whose FORMERR carries an OPT (`some true`), or a TSIG record that is not the last record of the message
+(RFC 8945 §5.2), whose FORMERR does not (`some false`). -/
+def placementFault (outside : Nat) : List RR → Nat → Option Bool
+  | [], _ => none
+  | r :: rs, i =>
+    if r.rtype == 41 && i < outside then some true
+    else if r.rtype == 250 && !rs.isEmpty then some false
+    else placementFault outside rs (i + 1)
+
+/-- Where the record after the next `k` records from `pos` starts, each read as `readRR` reads it. -/
+def skipRRs (msg : Bytes) : Nat → Nat → Option Nat
+  | 0, pos => some pos
+  | k + 1, pos =>
+    match readRR msg pos with
+    | .ok (_, e) => skipRRs msg k e
+    | .error _ => none
+
+/-- Whether the TSIG record at `pos` reads (RFC 8945 §4.2): its RDATA is the algorithm name, which may point
+to a name earlier in the message, then the time signed (6 octets), the fudge, the MAC size and the MAC, the
+original ID, the error, and the other length and other data, ending where the RDATA ends. -/
+def tsigReads (msg : Bytes) (pos : Nat) : Bool :=
+  match name msg msg.length pos with
+  | .error _ => false
+  | .ok (_, e) =>
+    match rd16 msg (e + 8) with
+    | none => false
+    | some len =>
+      let start := e + 10
+      let finish := start + len
+      match name msg finish start with
+      | .error _ => false
+      | .ok (_, a) =>
+        match rd16 msg (a + 8) with
+        | none => false
+        | some mac =>
+          match rd16 msg (a + 10 + mac + 4) with
+          | none => false
+          | some other => a + 10 + mac + 6 + other == finish && finish ≤ msg.length
+
 /-- `Request::parse`'s fixed order. `udp` says whether the query came over UDP. -/
 def parse (bytes : Bytes) (udp : Bool) : Parsed :=
   match rd16 bytes 0, rd16 bytes 2 with
@@ -948,8 +989,13 @@ def parse (bytes : Bytes) (udp : Bool) : Parsed :=
     match decode bytes with
     | .error _ => rej 1 (if faultInOpt bytes then some 0 else none)
     | .ok m =>
-      -- an OPT record belongs in the additional section alone (RFC 6891 §6.1.1)
-      if (m.answer ++ m.authority).any optRR then rej 1 (some 0) else
+      let records := m.answer ++ m.authority ++ m.additional
+      -- an OPT record belongs in the additional section alone (RFC 6891 §6.1.1), and a TSIG record is the last
+      -- record of the message (RFC 8945 §5.2)
+      match placementFault (m.answer.length + m.authority.length) records 0 with
+      | some true => rej 1 (some 0)
+      | some false => rej 1 none
+      | none =>
       match m.additional.filter optRR with
       | _ :: _ :: _ => rej 1 (some 0)
       | os =>
@@ -960,6 +1006,12 @@ def parse (bytes : Bytes) (udp : Bool) : Parsed :=
               | _ => true)
           | none => false
         if optBad then rej 1 (some 0) else
+        let signed := m.additional.getLast?.any (·.rtype == 250)
+        let tsigAt := match readList (readQuestion bytes) m.question.length 12 with
+          | .ok (_, p) => skipRRs bytes (records.length - 1) p
+          | .error _ => none
+        -- a TSIG record that does not read is a fault in the message (RFC 8945 §5.2)
+        if signed && !tsigAt.any (tsigReads bytes) then rej 1 none else
         let edns : Option EdnsIn := opt.map fun o =>
           ⟨o.rclass, o.ttl / 65536 % 256, o.ttl / 32768 % 2 == 1,
             match o.rdata with
@@ -968,10 +1020,14 @@ def parse (bytes : Bytes) (udp : Bool) : Parsed :=
         -- the reply carries an OPT of version 0 exactly when the query had one (RFC 6891 §7)
         let optOut : Option Nat := edns.map fun _ => 0
         if 0 < ((edns.map (·.version)).getD 0) then rej 16 (some 0) else
+        -- signed with a key a server here does not hold: NOTAUTH, with a TSIG of error BADKEY (RFC 8945 §5.2.1)
+        if signed then rej 9 optOut else
         if h.opcode != 0 then rej 4 optOut else
         match m.question with
         | [q] =>
-          if q.qtype == 41 then rej 1 optOut
+          -- OPT, TSIG, and TKEY are meta-types, records of one message, never data to ask for (RFC 6891
+          -- §6.1.1, RFC 6895 §3.1)
+          if q.qtype == 41 || q.qtype == 250 || q.qtype == 249 then rej 1 optOut
           -- AXFR is not defined over UDP (RFC 5936 §4.2); IXFR is (RFC 1995 §2)
           else if udp && q.qtype == 252 then rej 1 optOut
           else if q.qtype == 253 || q.qtype == 254 then rej 4 optOut

@@ -149,8 +149,8 @@ pub struct Shown {
 
 impl Shown {
     /// The RRsets `sets` of `owner`. An RRset of another owner is
-    /// [`ZoneError::OutOfZone`], and a CNAME beside other data is
-    /// [`ZoneError::CnameWithOtherData`].
+    /// [`ZoneError::OutOfZone`], and a CNAME beside data other than NSEC
+    /// (RFC 4035 §2.5) is [`ZoneError::CnameWithOtherData`].
     // `ZoneError` is large; this returns it as `Zone::builder` does, once
     // per build and never on a path that answers questions.
     #[allow(clippy::result_large_err)]
@@ -168,7 +168,10 @@ impl Shown {
             }
             held.insert(set.record_type(), set);
         }
-        if held.contains_key(&RecordType::CNAME) && held.len() > 1 {
+        let beside_cname = held
+            .keys()
+            .any(|rtype| !matches!(rtype, RecordType::CNAME | RecordType::NSEC));
+        if held.contains_key(&RecordType::CNAME) && beside_cname {
             return Err(ZoneError::CnameWithOtherData { owner: apex });
         }
         Ok(Shown {

@@ -9,7 +9,7 @@ use fictionet::stdlib::protocols::dns::label_count;
 use fictionet::stdlib::protocols::dns::op::{
     Edns, Message, MessageType, OpCode, Query, ResponseCode,
 };
-use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RData, Record, RecordType};
+use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, Name, RData, Record, RecordType};
 use fictionet::stdlib::protocols::dns::{Parsed, Request, Response};
 
 use super::super::exchange::{Client, Generation};
@@ -24,7 +24,8 @@ use super::{Authority, ServerConfig, Step, bare_reply, refuse_transfer};
 /// servers of a world that learns `com` from the real ones
 /// ([`Learned`](super::super::zone::Learned)), with each invented zone, a
 /// child of that parent,
-/// added by [`below`](Overlay::below). A zone transfer gets REFUSED. For a
+/// added by [`below`](Overlay::below). A zone transfer gets REFUSED, and a
+/// question in a class other than IN gets what the base gives it. For a
 /// question at or below an invented zone's apex:
 ///
 /// - At one of the invented zone's own name servers (an address its apex
@@ -118,6 +119,12 @@ impl<B: Authority> Authority for Overlay<B> {
     ) -> Step {
         if let Some(refused) = refuse_transfer(req) {
             return refused;
+        }
+        // Invented zones hold class IN data only, and an answer to QCLASS
+        // * can never be authoritative (RFC 1034 §3.7.1), so the server
+        // answers any other class for every name as its base does.
+        if req.question.query_class() != DNSClass::IN {
+            return self.base.respond(req, local, server, client);
         }
         let qname = LowerName::new(req.question.name());
         let invented = self

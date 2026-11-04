@@ -155,7 +155,7 @@ form `\# <length> <hex>`. Octets are lowercase hex.
 | `respond.json` | `bytes`, `transport` (`udp` or `tcp`) | `parsed`: `silent`; `reject` with `rcode` (extended), `flags`, and `opt` (its version, or null); or `request` with `rd`, `cd`, `ad`, `question`, `edns`, and the `answer` flags and `answer_opt` of an authoritative NOERROR answer to it through the server front |
 | `zone.json` | `zone` (`apex`, `records`), `any` (`hinfo`, `one_rrset`, `all`), `request` (`qname`, `qtype`); or, for about one case in eight, a zone the builder refuses, `zone` alone: an accepted zone changed to break one of the 12 rules, each as often as the others | `rcode`, `aa`, `answer`, `authority`, `additional`, `required_additional`; or `error`, the first rule the zone breaks |
 | `partial.json` | as `zone.json`, plus `unknown`: names whose facts are unknown | `unknown` (a name), or `response` |
-| `learned.json` | `zone`, `any`; `steps`: one to six questions in turn, a third of them for the name of an earlier one, each with `upstream`, the zone's answer to it (as `zone.json` writes a response) | per step, `expected`: `reply` (a response) or `silent`, from `Authority.serve` over a copy that holds nothing at first and is carried from step to step, its upstream filing the facts the zone's answer to each lookup reads |
+| `learned.json` | `zone`, `any`; `steps`: one to six questions in turn, a third of them for the name of an earlier one, each with `upstream`, the zone's answer to it (as `zone.json` writes a response), or, in a quarter of the cases, a bare SERVFAIL for the first question, which is not asked again | per step, `expected`: `reply` (a response) or `silent`, from `Authority.serve` over a copy that holds nothing at first and is carried from step to step, its upstream filing the facts the zone's answer to each lookup reads |
 | `learned_signed.json` | `zone` (no DNAME), `keys`, `window`, `denial`, as in `signed.json`; `steps`: questions as in `learned.json` | per step, `expected`: the signed zone's answer with DO=1, written as `signed.json` writes one (`rcode`, `aa`, `answer`, `authority`, `additional`, `denial`), with `required_additional` |
 | `signed.json` | `zone` (no DNAME), `keys` (`id`, `alg`, `sep`, `corrupt`, `mistag`), `window`, `denial` (`nsec`, or `nsec3` with `opt_out`), `request`, `time`, `policy`, `anchor_digest_type`, `strip_soa`, and for about a third of the cases a signed `parent` (`zone`, `keys`, `denial`) at the name above the apex, delegating to the zone with a DS set for its KSK, a wrong digest, RSASHA1, or no DS | `rcode`, `aa`, and with DO=1 the `answer` lines (for ANY, the NSEC and DNSKEY RRsets at the name after the data) and `authority` lines, each RRset followed by its RRSIG lines, as they reach the validator (a `mistag` key's RRSIGs with key tag `key + 512`, and with `strip_soa` the SOA's RRSIGs left out), `additional`, `denial` (NSEC or NSEC3 lines with RRSIGs), `dnskey` (the DNSKEY set and its RRSIGs), and `validation`: one result per answer RRset, in the order of the `answer` lines, and one for the denial of a negative answer, its SOA RRset checked first, under the zone's own anchor (a DS of digest type 2 for each SEP key) and the one-link chain, or with a `parent` under the parent's anchor and the chain down the delegation, with `parent_dnskey` and `delegation` (the parent's DS set or no-DS proof, with RRSIGs); or `unknown` |
 | `policy.json` | `algorithm`, `digest`, `policy`: the string `iana` for `Policy.iana`, which the test reads as Rust's `AlgorithmPolicy::iana`, or a random one (`validate`, `digests`, `max_nsec3_iterations`) | `treatment`: `supported`, `unsupported_algorithm`, or `unsupported_digest` |
@@ -188,7 +188,9 @@ extra iterations, in base32hex. RRSIG times are decimal. Validation results are 
   last record are ignored. A name that reads past the end of its RDATA is rejected.
 - **`parse`** answers FORMERR without an OPT when the message does not decode, and FORMERR with an OPT when the
   fault is in an OPT record (one that does not read, one outside the additional section, a second OPT, an owner
-  other than the root, or options that do not split).
+  other than the root, or options that do not split). A TSIG record that is not the last record, or whose RDATA
+  does not read, is FORMERR without an OPT; a TSIG record last in the additional section gets NOTAUTH, after the
+  EDNS version check (RFC 8945 §5.2, §5.2.1). The BADKEY TSIG record of that reply is not modelled.
   Header fields and the question are not echoed in the model; `respond.json` checks the RCODE, flags, and the
   OPT's presence and version.
 - **Fit** treats each RRset as a list of records with the same owner and type, and measures candidates by
@@ -231,7 +233,10 @@ extra iterations, in base32hex. RRSIG times are decimal. Validation results are 
   `Dns/Zone.lean`, and a node filing carries no NODATA proof: that a signed copy sends the records it holds,
   for NODATA and wildcard answers too, is checked by `learned_signed.json` against `Dnssec.lean`'s signed
   answers. The engine looks up the client's question at the server's own address, as `Copies` does, so one
-  request makes at most one lookup. When the response to the client's question was filed and the answer
+  request makes at most one lookup. A real server that answered that lookup with an error RCODE other than
+  REFUSED, which gives no facts (`Looked.failed`), has the question answered with that RCODE
+  (`respond_failed`), as `Learned::failed` does; such a response is no filing true of the zone, so `Copied`
+  and the theorems that rest on it leave it out. When the response to the client's question was filed and the answer
   still stops at a name a CNAME or DNAME chain reached, `Copies` looks that name up; only a real server that
   stops a chain early, outside `Copied`, leaves it so, and this model leaves that lookup out. An overlay is a function of its base's steps for the question and for
   `<apex> DS`, with what it invents abstract: the theorems bound its lookups and keep its replies stable,

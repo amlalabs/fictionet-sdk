@@ -89,7 +89,9 @@ impl Request {
     ///    a server here holds no keys (RFC 8945 §5.2.1).
     /// 6. An opcode other than QUERY: NOTIMP.
     /// 7. A question count other than 1: FORMERR (RFC 9619).
-    /// 8. QTYPE OPT, which only appears as a record: FORMERR (RFC 6891 §6.1.1).
+    /// 8. QTYPE OPT, TSIG, or TKEY, meta-types that only appear as records
+    ///    of the one message they travel in, never as data to ask for:
+    ///    FORMERR (RFC 6891 §6.1.1, RFC 6895 §3.1).
     /// 9. AXFR over UDP, which it is not defined for: FORMERR
     ///    (RFC 5936 §4.2). IXFR is defined over UDP as well as TCP
     ///    (RFC 1995 §2), so the server's transfer policy answers it.
@@ -131,7 +133,11 @@ impl Request {
         }
         let question = message.queries[0].clone();
         match question.query_type() {
-            RecordType::OPT => return reject(ResponseCode::FormErr),
+            kind if matches!(kind, RecordType::OPT | RecordType::TSIG)
+                || u16::from(kind) == TKEY =>
+            {
+                return reject(ResponseCode::FormErr);
+            }
             RecordType::AXFR if transport == Transport::Udp => {
                 return reject(ResponseCode::FormErr);
             }
@@ -196,6 +202,8 @@ pub fn read_message(bytes: &[u8]) -> Result<Message, DecodeError> {
     Ok(message)
 }
 
+/// QTYPE TKEY, a meta-type for key agreement (RFC 2930 §2).
+const TKEY: u16 = 249;
 /// QTYPE MAILB, mailbox records (RFC 1035 §3.2.3).
 const MAILB: u16 = 253;
 /// QTYPE MAILA, mail agent records, obsolete (RFC 1035 §3.2.3).
@@ -594,26 +602,43 @@ mod tests {
     }
 
     #[test]
-    fn qtype_opt_gets_formerr() {
-        let bytes = query(|m| {
-            m.queries[0].set_query_type(RecordType::OPT);
-        });
-        let reply = rejected(&bytes, Transport::Tcp);
-        assert_eq!(reply.metadata.response_code, ResponseCode::FormErr);
-        assert_eq!(reply.queries[0].query_type(), RecordType::OPT);
-    }
-
-    #[test]
-    fn zone_transfers_over_udp_get_formerr() {
-        for kind in [RecordType::AXFR, RecordType::IXFR] {
+    fn meta_qtypes_get_formerr() {
+        for kind in [RecordType::OPT, RecordType::TSIG, RecordType::from(TKEY)] {
             let bytes = query(|m| {
                 m.queries[0].set_query_type(kind);
             });
+            let reply = rejected(&bytes, Transport::Tcp);
             assert_eq!(
-                rejected(&bytes, Transport::Udp).metadata.response_code,
-                ResponseCode::FormErr
+                reply.metadata.response_code,
+                ResponseCode::FormErr,
+                "{kind}"
             );
-            assert_eq!(accepted(&bytes, Transport::Tcp).question.query_type(), kind);
+            assert_eq!(reply.queries[0].query_type(), kind);
+        }
+    }
+
+    #[test]
+    fn axfr_over_udp_gets_formerr_and_ixfr_does_not() {
+        let axfr = query(|m| {
+            m.queries[0].set_query_type(RecordType::AXFR);
+        });
+        assert_eq!(
+            rejected(&axfr, Transport::Udp).metadata.response_code,
+            ResponseCode::FormErr
+        );
+        assert_eq!(
+            accepted(&axfr, Transport::Tcp).question.query_type(),
+            RecordType::AXFR
+        );
+        // IXFR is defined over UDP too (RFC 1995 §2).
+        let ixfr = query(|m| {
+            m.queries[0].set_query_type(RecordType::IXFR);
+        });
+        for transport in [Transport::Udp, Transport::Tcp] {
+            assert_eq!(
+                accepted(&ixfr, transport).question.query_type(),
+                RecordType::IXFR
+            );
         }
     }
 

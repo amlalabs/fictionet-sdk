@@ -38,7 +38,7 @@ use fictionet::stdlib::protocols::dns::rr::domain::Label;
 use fictionet::stdlib::protocols::dns::rr::{
     DNSClass, LowerName, Name, RData, RecordSet, RecordType, SerialNumber,
 };
-use fictionet::stdlib::protocols::dns::{Request, dname_substitute, label_count};
+use fictionet::stdlib::protocols::dns::{Parsed, Request, dname_substitute, label_count};
 use fictionet::stdlib::services::serve::Transport;
 use fictionet::time::Instant;
 
@@ -209,6 +209,15 @@ pub(super) struct Found {
     pub(super) rest: Vec<Outcome>,
 }
 
+/// A zone cut a local zone refers a question to.
+pub(super) struct LocalCut {
+    cut: LowerName,
+    /// The cut's NS targets.
+    targets: Vec<Name>,
+    /// The addresses the zone holds for its targets, as glue.
+    glue: BTreeMap<LowerName, Vec<IpAddr>>,
+}
+
 impl Found {
     fn fresh(outcome: Outcome) -> Found {
         let checks = subjects(&outcome)
@@ -322,11 +331,13 @@ struct Lookup {
     /// Whether a server sent a reply the lookup could not use.
     errors: bool,
     minimise: Minimising,
-    /// Addresses of name servers that lookups this one waited on found.
+    /// Addresses of name servers that lookups this one waited on found,
+    /// or that a local zone holds as glue for its cut.
     learned: BTreeMap<LowerName, Vec<IpAddr>>,
     /// Name servers whose addresses this lookup asked for.
     asked: BTreeSet<LowerName>,
-    /// The last referral this lookup followed: the cut and its NS
+    /// The last referral this lookup followed, or a local zone's cut it
+    /// started from: the cut and its NS
     /// targets. Data with TTL 0 is not cached but serves the resolution in
     /// progress (RFC 1035 §7.4), so the referral moves the lookup down
     /// even when the cache kept nothing of it.
@@ -699,7 +710,8 @@ impl<V: Verify> Resolver<V> {
     /// in, or nothing more when the chain leaves the zone, where the
     /// answer goes on at the last alias's target (RFC 1034 §4.3.2 step 1
     /// and 3a). `None` when no local zone knows the answer, or the zone
-    /// refers the name to a cut, which the resolution follows instead.
+    /// refers the name to a cut, whose servers the resolution then asks
+    /// ([`local_cut`](Resolver::local_cut)).
     pub(super) fn local_outcomes(&mut self, request: &Request) -> Option<Vec<Outcome>> {
         let local = self.local_answer(request)?;
         let message = local.response.message;
@@ -754,6 +766,42 @@ impl<V: Verify> Resolver<V> {
             denial,
             zone,
         }])
+    }
+
+    /// The zone cut a local zone refers `request`'s question to, when its
+    /// answer is a referral. The name servers local data names are the
+    /// best to ask for a name below the cut (RFC 1034 §5.3.3 step 2), so
+    /// a resolution of it starts there, not at the root.
+    pub(super) fn local_cut(&self, request: &Request) -> Option<LocalCut> {
+        let message = self.local_answer(request)?.response.message;
+        let metadata = &message.metadata;
+        if metadata.authoritative
+            || metadata.response_code != ResponseCode::NoError
+            || !message.answers.is_empty()
+        {
+            return None;
+        }
+        let mut cut = None;
+        let mut targets = Vec::new();
+        for record in &message.authorities {
+            if let RData::NS(ns) = &record.data {
+                cut = Some(LowerName::new(&record.name));
+                targets.push(ns.0.to_lowercase());
+            }
+        }
+        let mut glue: BTreeMap<LowerName, Vec<IpAddr>> = BTreeMap::new();
+        for record in &message.additionals {
+            if let Some(address) = record.data.ip_addr() {
+                glue.entry(LowerName::new(&record.name))
+                    .or_default()
+                    .push(address);
+            }
+        }
+        Some(LocalCut {
+            cut: cut?,
+            targets,
+            glue,
+        })
     }
 
     /// Expired data for `key`, for serving stale (RFC 8767 §4): the RRset
@@ -1066,6 +1114,13 @@ impl<V: Verify> Resolver<V> {
         if depth > self.config.work.depth {
             return Dep::TooDeep;
         }
+        // A name below a local zone's cut is resolved from the servers the
+        // cut names, as from a referral.
+        let (delegation, learned) = match question_of(&key).and_then(|asked| self.local_cut(&asked))
+        {
+            Some(LocalCut { cut, targets, glue }) => (Some((cut, targets)), glue),
+            None => (None, BTreeMap::new()),
+        };
         let id = self.graph.lookup_id();
         self.graph.hold(tree);
         self.graph.by_key.insert(shared, id);
@@ -1081,9 +1136,9 @@ impl<V: Verify> Resolver<V> {
                 timeouts: Vec::new(),
                 errors: false,
                 minimise: Minimising::default(),
-                learned: BTreeMap::new(),
+                learned,
                 asked: BTreeSet::new(),
-                delegation: None,
+                delegation,
                 bounded: false,
                 wait: LookupWait::Nothing,
             },
@@ -2888,6 +2943,17 @@ impl<V: Verify> Resolver<V> {
                 Node::Asker(_) | Node::Refresh => {}
             }
         }
+    }
+}
+
+/// `key`'s question as a client's request, as the local zones are asked
+/// it. `None` for a type no request may ask for.
+fn question_of(key: &Key) -> Option<Request> {
+    let mut message = Message::new(0, MessageType::Query, OpCode::Query);
+    message.add_query(Query::query(Name::from(&key.name), key.rtype));
+    match Request::parse(&message.to_vec().ok()?, Transport::Tcp) {
+        Parsed::Request(request) => Some(request),
+        Parsed::Reject(_) | Parsed::Silent => None,
     }
 }
 

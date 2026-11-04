@@ -344,10 +344,10 @@ def filed : List Filing :=
 def noProofs : Proofs := fun _ => []
 
 /-- A copy of `example.com.` that has filed that response. -/
-def copy : Learned := ⟨apex, zone.soa, filed, 1⟩
+def copy : Learned := ⟨apex, zone.soa, filed, 1, []⟩
 
 theorem filed_true : (Looked.response filed).of zone noProofs = true := by decide +kernel
-theorem copy_copied : Copied zone noProofs copy := ⟨rfl, rfl, by decide +kernel⟩
+theorem copy_copied : Copied zone noProofs copy := ⟨rfl, rfl, by decide +kernel, rfl⟩
 
 /-- Were the zone signed, its servers would send an NSEC record for `x.b.example.com.`, and a filing without it
 would not be true of the zone. -/
@@ -368,7 +368,7 @@ example : ∃ n m, copy.fact n = .absent ∧ m <:+ n ∧ copy.proof m = some (no
 
 /-- A copy that has filed only the apex: `www.example.com.` is unknown, so the answer is unknown, not
 NXDOMAIN. -/
-def apexCopy : Learned := ⟨apex, zone.soa, [.node apex apexNode], 1⟩
+def apexCopy : Learned := ⟨apex, zone.soa, [.node apex apexNode], 1, []⟩
 
 theorem apexCopy_reaches : apexCopy.view.Reaches [WWW, EX, COM] := by
   intro m h1 h2 h3
@@ -405,7 +405,11 @@ example : (serve .all 1 upstream 7 apexCopy [] qNx).2 = .reply nxResponse := by
 /-- With the real server unreachable, the server stays silent rather than guess. -/
 example : (serve .all 1 (fun _ => .nothing) 2 apexCopy [] qNx).2 = .silent := by decide +kernel
 
-theorem apexCopy_copied : Copied zone noProofs apexCopy := ⟨rfl, rfl, by decide +kernel⟩
+/-- With the real server answering SERVFAIL, the server answers SERVFAIL too, never silence (RFC 8906 §3.1). -/
+example : (serve .all 1 (fun l => .failed l.server l.req .servfail) 2 apexCopy [] qNx).2 =
+    .reply (bare .servfail) := by decide +kernel
+
+theorem apexCopy_copied : Copied zone noProofs apexCopy := ⟨rfl, rfl, by decide +kernel, rfl⟩
 
 #print axioms serve_reply_upstream
 example : ∃ r, answer zone qNx .all = .response r ∧ nxResponse.Grows r :=

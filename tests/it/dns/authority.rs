@@ -470,6 +470,28 @@ fn qclass_any_gets_formerr_without_aa() {
     }
 }
 
+/// TSIG and TKEY are meta-types, records of the one message they travel
+/// in and never data to ask for (RFC 6895 §3.1): a question for either
+/// gets FORMERR, as one for OPT does and as BIND 9.20 answers, never a
+/// NODATA a resolver could cache.
+#[test]
+fn meta_qtypes_get_formerr() {
+    let mut engine = AuthorityEngine::new(zones(vec![example()]), ServerConfig::generic(), local());
+    for qtype in [RecordType::TSIG, RecordType::from(249), RecordType::OPT] {
+        let meta = query("example.test.", qtype, |m| {
+            m.set_edns(edns(1232, true));
+        });
+        let reply = the_answer(&ask_with(&mut engine, &meta, Transport::Udp));
+        assert_eq!(
+            reply.metadata.response_code,
+            ResponseCode::FormErr,
+            "{qtype}"
+        );
+        assert!(!reply.metadata.authoritative, "{qtype}");
+        assert!(reply.authorities.is_empty(), "{qtype}");
+    }
+}
+
 #[test]
 fn ds_at_a_hosted_child_is_answered_from_the_parent() {
     let key = ZoneKey::generate(&entropy(), Algorithm::Ed25519, KeyFlags::KSK);
@@ -2394,6 +2416,43 @@ inv.example. 3600 IN DS 12345 8 2 0123456789ABCDEF0123456789ABCDEF0123456789ABCD
     let referral = ask("www.inv.example.", RecordType::A);
     assert!(!referral.metadata.authoritative);
     assert_eq!(ds(&referral.authorities), ds(&answer.answers));
+}
+
+/// An answer to QCLASS * can never be authoritative (RFC 1034 §3.7.1), so
+/// a server of the parent answers it with FORMERR for an invented name as
+/// for any other: one address answers as one server.
+#[test]
+fn an_overlay_answers_qclass_any_as_its_base_does() {
+    let base = Zone::from_master(
+        "\
+example. 3600 IN SOA ns.example. hostmaster.example. 1 7200 3600 1209600 300
+example. 3600 IN NS ns.example.
+ns.example. 3600 IN A 192.0.2.53
+www.example. 300 IN A 192.0.2.80
+",
+        None,
+    )
+    .unwrap();
+    let invented = Zone::builder(name("inv.example."), soa("inv.example."), 3600)
+        .rrset(rrset("inv.example.", 3600, vec![ns("ns1.inv.example.")]))
+        .rrset(rrset("ns1.inv.example.", 3600, vec![a("192.0.2.99")]))
+        .build()
+        .unwrap();
+    let overlay = Overlay::new(zones(vec![base]), name("example."))
+        .below(name("inv.example."), zones(vec![invented]));
+    let mut engine = AuthorityEngine::new(overlay, ServerConfig::generic(), local());
+    for qname in ["www.example.", "www.inv.example.", "inv.example."] {
+        let message = query(qname, RecordType::A, |m| {
+            m.queries[0].set_query_class(DNSClass::ANY);
+        });
+        let reply = the_answer(&ask_with(&mut engine, &message, Transport::Udp));
+        assert_eq!(
+            reply.metadata.response_code,
+            ResponseCode::FormErr,
+            "{qname}"
+        );
+        assert!(reply.authorities.is_empty(), "{qname}");
+    }
 }
 
 #[test]

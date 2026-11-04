@@ -367,7 +367,12 @@ impl<'a> Nsecs<'a> {
         if self.matching(&wildcard).is_some() {
             return None;
         }
-        let (wildcard_owner, _) = self.covering(&wildcard)?;
+        let (wildcard_owner, rdata) = self.covering(&wildcard)?;
+        // A next name below the wildcard makes it an empty non-terminal,
+        // which matches `name` (RFC 4592 §2.2.1).
+        if is_below(rdata.next_domain_name(), &wildcard) {
+            return None;
+        }
         Some(vec![owner, wildcard_owner])
     }
 
@@ -378,7 +383,7 @@ impl<'a> Nsecs<'a> {
     /// The owners of the records that prove `name` has no `qtype`: the one
     /// matching it, the one covering it as an empty non-terminal, or the
     /// one covering it and the one matching the wildcard that has no
-    /// `qtype`.
+    /// `qtype`, or covering the wildcard as an empty non-terminal.
     fn nodata_owners(&self, name: &Name, qtype: RecordType) -> Option<Vec<&'a Name>> {
         if let Some((owner, rdata)) = self.0.iter().find(|(owner, _)| *owner == name) {
             let types = rdata.type_set();
@@ -402,10 +407,17 @@ impl<'a> Nsecs<'a> {
         }
         let encloser = Nsecs::closest_encloser(name, owner, rdata);
         let wildcard = encloser.prepend_label("*").ok()?;
-        let (wildcard_owner, rdata) = self.0.iter().find(|(owner, _)| **owner == wildcard)?;
-        let types = rdata.type_set();
-        (!types.contains(qtype) && !types.contains(RecordType::CNAME))
-            .then(|| vec![owner, *wildcard_owner])
+        if let Some((wildcard_owner, rdata)) = self.0.iter().find(|(owner, _)| **owner == wildcard)
+        {
+            let types = rdata.type_set();
+            return (!types.contains(qtype) && !types.contains(RecordType::CNAME))
+                .then(|| vec![owner, *wildcard_owner]);
+        }
+        // A wildcard that is an empty non-terminal has no NSEC (RFC 4035
+        // §2.3) and still matches, with no records (RFC 4592 §2.2.1): the
+        // NSEC that covers it has a next name below it.
+        let (wildcard_owner, rdata) = self.covering(&wildcard)?;
+        is_below(rdata.next_domain_name(), &wildcard).then(|| vec![owner, wildcard_owner])
     }
 
     fn no_ds(&self, name: &Name) -> bool {

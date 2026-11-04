@@ -118,6 +118,7 @@ ns.direct. 3600 IN A 45.33.5.53
 www.direct. 300 IN A 45.33.5.80
 whoami.direct. 300 IN A 45.70.0.9
 whoami.direct. 300 IN TXT \"45.70.0.9\"
+home.direct. 300 IN A 45.70.0.9
 ";
 
 /// What the real hierarchy answers, played from fixed zones: each server
@@ -257,10 +258,13 @@ fn resolver_config(resolver: &PublicResolver, site: &ResolverSite) -> Config {
 /// the root at every root letter, `com` and `net` at every
 /// `gtld-servers.net` server, each placed server behind half the round
 /// trip to an authority, no server at the egress, and each public
-/// resolver shown its own egress where a real server echoes the asker.
+/// resolver shown its own egress where a real server echoes the asker,
+/// as `whoami.direct` does.
 fn mirror(upstream: impl Upstream, handle: NetHandle) -> Mirror {
     let at = place();
-    let echo = at.echo(EGRESS);
+    let echo = at
+        .echo(EGRESS)
+        .name(&Name::from_ascii("whoami.direct.").unwrap());
     roots::seed(
         Mirror::new(upstream, handle)
             .delay(at.authority_rtt / 2)
@@ -1260,7 +1264,8 @@ fn whoami_names_are_answered_from_the_egress_and_never_looked_up() {
 /// a public resolver's own egress, not the world's: `whoami.direct` plays
 /// such a server, answering with the address the upstream asks from.
 /// Every public resolver shows its own IPv4 egress, and none shows the
-/// world's.
+/// world's. `home.direct` is real data that holds the upstream's address,
+/// and every resolver answers it as the real server does.
 #[test]
 fn an_echoed_address_is_the_public_resolvers_egress() {
     world(Duration::from_secs(60), |fcx| async move {
@@ -1315,6 +1320,15 @@ fn an_echoed_address_is_the_public_resolvers_egress() {
             .await
             .expect("an answer");
             assert_eq!(texts(&reply), vec![seen.to_string()], "{address}");
+            let reply = ask(
+                &fcx,
+                &m,
+                address,
+                &query(id + 100, "home.direct.", RecordType::A, true),
+            )
+            .await
+            .expect("an answer");
+            assert_eq!(addresses(&reply), vec![IpAddr::V4(EGRESS)], "{address}");
         }
         Ok(())
     });

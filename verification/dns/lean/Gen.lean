@@ -394,12 +394,24 @@ def respondCase : G String := do
       let z ← chance 10
       let flags := Wire.flagsOf qr opcode false false rd false z ad cd 0
       let qd ← pick #[1, 1, 1, 1, 1, 1, 1, 0, 2]
-      let qs ← rList qd (do return (⟨← rName 3 true, ← pick #[1, 1, 28, 15, 41, 251, 252, 253, 254, 255], 1⟩ :
-        Question))
+      let qs ← rList qd (do return (⟨← rName 3 true,
+        ← pick #[1, 1, 28, 15, 41, 249, 250, 251, 252, 253, 254, 255], 1⟩ : Question))
       let nopt ← pick #[0, 0, 1, 1, 1, 1, 2]
       let opts ← rList nopt rOpt
       let opts ← if (← chance 10) then pure (opts.map fun o => { o with owner := [toBytes "x"] }) else pure opts
-      let m : Message := ⟨⟨← rNat 65536, flags⟩, qs, [], [], opts⟩
+      -- a TSIG record (RFC 8945 §4.2): HMAC-SHA256, a time, a fudge of 300, a MAC, the original ID, no error
+      let mac ← pick #[0, 0, 32]
+      let fields := [0, 0, 104, 0, 0, 1, 1, 44, 0, mac] ++ List.replicate mac 42 ++ [18, 52, 0, 0, 0, 0]
+      let fields := if (← chance 6) then fields.dropLast else fields
+      let tsig : RR := ⟨[toBytes "key"], 250, 255, 0,
+        .octets (Dnssec.Symbolic.wire [toBytes "hmac-sha256"] ++ fields)⟩
+      -- last, as it belongs, or before the OPT records, or twice
+      let additional ← match ← rNat 8 with
+        | 0 | 1 => pure (opts ++ [tsig])
+        | 2 => pure (tsig :: opts)
+        | 3 => pure (opts ++ [tsig, tsig])
+        | _ => pure opts
+      let m : Message := ⟨⟨← rNat 65536, flags⟩, qs, [], [], additional⟩
       let b := encode true m
       if (← chance 10) then corrupt b else pure b
   let expected := match parse bytes udp with
@@ -916,13 +928,22 @@ def learnedCase : G String := do
   let (sp, z) ← rZone
   let any ← rAny
   let reqs ← rRequests z
-  let up : Authority.Lookup → Authority.Looked := fun l => .response (readFilings z any l.req 64 [])
-  let mut L : Authority.Learned := ⟨z.apex, z.soa, [], 0⟩
+  -- in a quarter of the cases the real servers answer the first question SERVFAIL, as a server may (RFC 8906
+  -- §3.1); it is asked of a copy that holds nothing, and not again, since the two copies file at different
+  -- grains and may know other facts about its name
+  let erring : List Request ← match reqs with
+    | q :: rest => if !rest.contains q && (← chance 4) then pure [q] else pure []
+    | [] => pure []
+  let up : Authority.Lookup → Authority.Looked := fun l =>
+    if erring.contains l.req then .failed l.server l.req .servfail
+    else .response (readFilings z any l.req 64 [])
+  let mut L : Authority.Learned := ⟨z.apex, z.soa, [], 0, []⟩
   let mut steps : Array String := #[]
   for q in reqs do
     let (L', s) := Authority.serve any 1 up 2 L [] q
     L := L'
-    let upstream := match answer z q any with
+    let upstream := if erring.contains q then responseJson (Authority.bare .servfail) else
+      match answer z q any with
       | .response r => responseJson r
       | .unknown n => jobj [("unknown", jstr (nameStr n))]
     let expected := match s with

@@ -67,12 +67,14 @@ def Filing.proofAt (n : Name) : Filing → Option (List RRset)
   | .denied m p => if m = n then some p else none
 
 /-- A zone learned from the servers of one real zone: its apex and SOA, every filing so far, the newest first,
-and its revision, which each response filed makes new. -/
+its revision, which each response filed makes new, and the questions a server answered with an error RCODE
+that gives no facts, by server, with that RCODE. Rust: `Learned::failed`. -/
 structure Learned where
   apex : Name
   soa : RRset
   filings : List Filing
   revision : Nat
+  failed : List (Nat × Request × Rcode)
 deriving DecidableEq, Repr
 
 /-- What the zone knows about `n`: absent when a filing denies it, the node a filing shows there, and otherwise
@@ -92,13 +94,13 @@ def Learned.proof (L : Learned) (n : Name) : Option (List RRset) :=
 def Learned.view (L : Learned) : View := ⟨L.apex, L.soa, L.fact, L.revision⟩
 
 /-- Every filing of `L` is true of the real zone `z`, whose apex and SOA `L` has, and whose servers send the
-denial records `proofs`. -/
+denial records `proofs`, and no server answered a question of it with an error. -/
 def Copied (z : Zone) (proofs : Proofs) (L : Learned) : Prop :=
-  L.apex = z.apex ∧ L.soa = z.soa ∧ L.filings.all (·.holds z proofs) = true
+  L.apex = z.apex ∧ L.soa = z.soa ∧ L.filings.all (·.holds z proofs) = true ∧ L.failed = []
 
 theorem Copied.holds {z : Zone} {proofs : Proofs} {L : Learned} (h : Copied z proofs L) {f : Filing}
     (hf : f ∈ L.filings) : f.holds z proofs = true :=
-  List.all_eq_true.mp h.2.2 f hf
+  List.all_eq_true.mp h.2.2.1 f hf
 
 /-- In a complete zone nothing is below a name that is absent. -/
 theorem look_absent_below {z : Zone} {m n : Name} (h : z.look m = .absent) (hn : under n m = true) :
@@ -314,22 +316,27 @@ structure Lookup where
   req : Request
 deriving DecidableEq, Repr
 
-/-- What a lookup gave: the filings of the server's response, or nothing, when the server could not be reached,
-did not reply, or the world's policy kept the question from leaving. -/
+/-- What a lookup gave: the filings of the server's response; that the server at `server` answered `req` with
+an error RCODE other than REFUSED, such as SERVFAIL, which gives no facts (RFC 8906 §3.1); or nothing, when the
+server could not be reached, did not reply, or the world's policy kept the question from leaving. -/
 inductive Looked where
   | response (filings : List Filing)
+  | failed (server : Nat) (req : Request) (rcode : Rcode)
   | nothing
 deriving DecidableEq, Repr
 
-/-- Files what a lookup gave. A response is a new revision; nothing changes nothing. -/
+/-- Files what a lookup gave. A response is a new revision; an error RCODE is kept apart from the facts, and
+nothing changes nothing. -/
 def Learned.file (L : Learned) : Looked → Learned
   | .response fs => { L with filings := fs ++ L.filings, revision := L.revision + 1 }
+  | .failed s q rc => { L with failed := (s, q, rc) :: L.failed }
   | .nothing => L
 
-/-- What a real server of the zone `z`, whose servers send the denial records `proofs`, can give: filings true
-of `z`, or nothing. -/
+/-- What a real server of the zone `z`, whose servers send the denial records `proofs`, gives when it answers
+every question from `z`: filings true of `z`, or nothing. -/
 def Looked.of (z : Zone) (proofs : Proofs) : Looked → Bool
   | .response fs => fs.all (·.holds z proofs)
+  | .failed .. => false
   | .nothing => true
 
 theorem file_apex (L : Learned) (lk : Looked) : (L.file lk).apex = L.apex := by
@@ -339,15 +346,17 @@ theorem file_copied {z : Zone} {proofs : Proofs} {L : Learned} {lk : Looked} (h 
     (hl : lk.of z proofs = true) : Copied z proofs (L.file lk) := by
   cases lk with
   | nothing => exact h
+  | failed => cases hl
   | response fs =>
-    refine ⟨h.1, h.2.1, ?_⟩
+    refine ⟨h.1, h.2.1, ?_, h.2.2.2⟩
     simp only [Learned.file, List.all_append, Bool.and_eq_true]
-    exact ⟨hl, h.2.2⟩
+    exact ⟨hl, h.2.2.1⟩
 
 theorem fact_known_file {L : Learned} {n : Name} (lk : Looked) (hk : L.fact n ≠ .unknown) :
     (L.file lk).fact n ≠ .unknown := by
   cases lk with
   | nothing => exact hk
+  | failed => exact hk
   | response fs =>
     intro hu
     apply hk
@@ -504,12 +513,19 @@ theorem loop_reply {R : Learned → Request → Step} {up : Lookup → Looked} {
 
 /-! ## The server of a learned zone -/
 
-/-- `Copies` serving one learned zone, at the server with address `addr`: the answer from the zone's view, or, when
-the view lacks a fact, a lookup of the client's question at the server's own address. -/
+/-- A reply with RCODE `rc` and nothing else, without AA. -/
+def bare (rc : Rcode) : Response := ⟨rc, false, [], [], [], 0⟩
+
+/-- `Copies` serving one learned zone, at the server with address `addr`: the answer from the zone's view, or,
+when the view lacks a fact, the error RCODE the real server at `addr` answered the client's question with, which
+a server sends rather than no reply (RFC 8906 §3.1), or else a lookup of the question at that address. -/
 def respond (any : AnyResponse) (addr : Nat) (L : Learned) (req : Request) : Step :=
   match answerPartial L.view req any with
   | .response r => .reply r
-  | .unknown _ => .need ⟨addr, L.apex, req⟩
+  | .unknown _ =>
+    match L.failed.find? (fun e => e.1 == addr && e.2.1 == req) with
+    | some (_, _, rc) => .reply (bare rc)
+    | none => .need ⟨addr, L.apex, req⟩
 
 /-- The engine running `Copies` over one learned zone. -/
 def serve (any : AnyResponse) (addr : Nat) (up : Lookup → Looked) :
@@ -519,15 +535,30 @@ def serve (any : AnyResponse) (addr : Nat) (up : Lookup → Looked) :
 theorem respond_need {any : AnyResponse} {addr : Nat} {L : Learned} {req : Request} {l : Lookup}
     (h : respond any addr L req = .need l) : l = ⟨addr, L.apex, req⟩ := by
   unfold respond at h
-  split at h <;> cases h
-  rfl
+  split at h
+  · cases h
+  · split at h
+    · cases h
+    · cases h; rfl
 
+/-- Over a zone no server answered with an error, a reply is the answer from the zone's view. -/
 theorem respond_reply {any : AnyResponse} {addr : Nat} {L : Learned} {req : Request} {r : Response}
-    (h : respond any addr L req = .reply r) : answerPartial L.view req any = .response r := by
+    (h : respond any addr L req = .reply r) (hf : L.failed = []) : answerPartial L.view req any = .response r := by
   unfold respond at h
   split at h
   · rename_i hr; cases h; exact hr
-  · cases h
+  · split at h
+    · rename_i hfind; rw [hf] at hfind; cases hfind
+    · cases h
+
+/-- A question the real server at `addr` answered with an error RCODE, which the zone's view does not answer,
+gets that RCODE, never silence (RFC 8906 §3.1). -/
+theorem respond_failed {any : AnyResponse} {addr : Nat} {L : Learned} {req : Request} {n : Name} {rc : Rcode}
+    (hu : answerPartial L.view req any = .unknown n) (hf : L.failed.find? (fun e => e.1 == addr && e.2.1 == req) =
+      some (addr, req, rc)) : respond any addr L req = .reply (bare rc) := by
+  unfold respond
+  rw [hu]
+  simp only [hf]
 
 theorem respond_needs (any : AnyResponse) (addr : Nat) (a : Name) (req : Request) :
     Needs (respond any addr) a req [⟨addr, a, req⟩] := by
@@ -541,7 +572,7 @@ theorem respond_stable {z : Zone} {proofs : Proofs} {L : Learned} {lk : Looked} 
     (hl : lk.of z proofs = true) {any : AnyResponse} {addr : Nat} {req : Request} {r : Response}
     (hr : respond any addr L req = .reply r) :
     ∃ r', respond any addr (L.file lk) req = .reply r' ∧ r.Grows r' := by
-  obtain ⟨r', ha, hg⟩ := learned_answer_stable h hl (respond_reply hr)
+  obtain ⟨r', ha, hg⟩ := learned_answer_stable h hl (respond_reply hr h.2.2.2)
   exact ⟨r', by unfold respond; rw [ha], hg⟩
 
 /-- The engine looks a request up at most once: with any fuel from 2 up, it gives what it gives with 2. -/
@@ -559,7 +590,8 @@ theorem serve_reply_upstream {z : Zone} {proofs : Proofs} {any : AnyResponse} {a
     {up : Lookup → Looked} (hup : ∀ l, (up l).of z proofs = true) {f : Nat} {L : Learned} {looked : List Lookup}
     {req : Request} {r : Response} (hc : Copied z proofs L) (h : (serve any addr up f L looked req).2 = .reply r) :
     ∃ r', answer z req any = .response r' ∧ r.Grows r' :=
-  learned_answer_upstream (loop_copied hup f L looked hc) req any (respond_reply (loop_reply f L looked r h))
+  have hc' := loop_copied hup f L looked hc
+  learned_answer_upstream hc' req any (respond_reply (loop_reply f L looked r h) hc'.2.2.2)
 
 /-- The engine replies NXDOMAIN only from a filed denial, held with the real zone's denial records for it. -/
 theorem serve_nxdomain_proved {z : Zone} {proofs : Proofs} {any : AnyResponse} {addr : Nat}
@@ -568,7 +600,8 @@ theorem serve_nxdomain_proved {z : Zone} {proofs : Proofs} {any : AnyResponse} {
     (hx : r.rcode = .nxdomain) :
     ∃ n m, (serve any addr up f L looked req).1.fact n = .absent ∧ m <:+ n ∧
       (serve any addr up f L looked req).1.proof m = some (proofs m) :=
-  learned_nxdomain_proved (loop_copied hup f L looked hc) (respond_reply (loop_reply f L looked r h)) hx
+  have hc' := loop_copied hup f L looked hc
+  learned_nxdomain_proved hc' (respond_reply (loop_reply f L looked r h) hc'.2.2.2) hx
 
 /-! ## Overlays -/
 

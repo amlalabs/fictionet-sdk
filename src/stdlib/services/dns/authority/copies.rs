@@ -48,7 +48,9 @@ use super::{Authority, ServerConfig, Step, bare_reply, refuse_transfer, respond_
 /// authoritative answer below a cut the copy holds that shows no apex
 /// ([`Learned::below_cut`]) comes from such a child all the same, so the
 /// address is asked for the SOA RRset at the name, whose response shows
-/// the child's apex (RFC 2308 §3), before the question is answered.
+/// the child's apex (RFC 2308 §3), before the question is answered. A
+/// name that is an alias answers that with the alias alone, so the
+/// address is then asked at each name above it in turn, up to the cut.
 ///
 /// Servers of one zone differ only in the other zones they serve, so each
 /// address answers from its copies as its own real server does
@@ -86,9 +88,20 @@ struct Seen {
     /// The zones addresses were noted for and turned out not to serve.
     lame: HashSet<(IpAddr, LowerName)>,
     /// The names each address answered with authority from a zone below
-    /// a cut whose apex its response did not show, with the zone of the
-    /// lookup that showed it.
-    unplaced: HashMap<(IpAddr, LowerName), LowerName>,
+    /// a cut whose apex its response did not show.
+    unplaced: HashMap<(IpAddr, LowerName), Unplaced>,
+}
+
+/// A name an address answered with authority from a zone below a cut,
+/// whose apex no response has shown yet.
+struct Unplaced {
+    /// The zone of the lookup that showed it.
+    zone: LowerName,
+    /// The name whose SOA RRset the address is asked for next: the name
+    /// itself, then each name above it up to the cut. An SOA question at
+    /// an alias is answered with the alias, which shows no apex
+    /// (RFC 1034 §3.6.2), and the apex answers it with the zone's SOA.
+    at: LowerName,
 }
 
 impl Default for Seen {
@@ -164,9 +177,6 @@ impl Copies {
                 // one that answers it from the child serves no zone above.
                 let child_ds = lookup.question.query_type() == RecordType::DS
                     && child.as_ref() == Some(&qname);
-                if disowns(&lookup.zone, response) || child_ds {
-                    seen.lame.insert((addr, lookup.zone.clone()));
-                }
                 match &child {
                     Some(child) => seen
                         .unplaced
@@ -174,10 +184,52 @@ impl Copies {
                     None if response.metadata.authoritative
                         && learned.below_cut(&lookup.question) =>
                     {
-                        seen.unplaced
-                            .insert((addr, qname.clone()), lookup.zone.clone());
+                        // The name above `name` up to the cut, if any.
+                        let above = |name: &LowerName| {
+                            let up = name.base_name();
+                            let soa = Query::query(Name::from(&up), RecordType::SOA);
+                            learned.below_cut(&soa).then_some(up)
+                        };
+                        let soa = lookup.question.query_type() == RecordType::SOA;
+                        if soa {
+                            seen.unplaced.retain(|(at, _), unplaced| {
+                                if *at != addr
+                                    || unplaced.zone != lookup.zone
+                                    || unplaced.at != qname
+                                {
+                                    return true;
+                                }
+                                match above(&qname) {
+                                    Some(up) => {
+                                        unplaced.at = up;
+                                        true
+                                    }
+                                    None => false,
+                                }
+                            });
+                        }
+                        let at = if soa {
+                            above(&qname)
+                        } else {
+                            Some(qname.clone())
+                        };
+                        if let Some(at) = at {
+                            seen.unplaced
+                                .entry((addr, qname.clone()))
+                                .or_insert(Unplaced {
+                                    zone: lookup.zone.clone(),
+                                    at,
+                                });
+                        }
                     }
                     None => {}
+                }
+                if disowns(&lookup.zone, response) || child_ds {
+                    seen.lame.insert((addr, lookup.zone.clone()));
+                    // The address answers as though never noted for the
+                    // zone, so nothing is placed in it there.
+                    seen.unplaced
+                        .retain(|(at, _), unplaced| *at != addr || unplaced.zone != lookup.zone);
                 }
             }
         }
@@ -257,17 +309,23 @@ impl Authority for Copies {
             .seen
             .lock()
             .unplaced
-            .get(&(local.ip(), qname.clone()))
-            .cloned();
-        if let Some(zone) = unplaced {
-            let soa = Query::query(Name::from(qname), RecordType::SOA);
+            .get(&(local.ip(), qname))
+            .map(|unplaced| (unplaced.zone.clone(), unplaced.at.clone()));
+        if let Some((zone, at)) = unplaced {
+            let soa = Query::query(Name::from(at), RecordType::SOA);
             return self.look_up(req, local, zone, &soa);
         }
         let zones = self.zones_at(local.ip());
         respond_from(&zones, req, server, &|zone, asked, reached| {
             let apex = zone.apex();
+            let learned = self.copy(apex);
+            // A question the real server answered with an error RCODE gets
+            // that RCODE, wherever the copy's answer stops.
             let mut question = asked.clone();
-            if LowerName::new(question.name()) != reached && self.copy(apex).answered(asked) {
+            if LowerName::new(question.name()) != reached
+                && learned.answered(asked)
+                && learned.failed(local.ip(), asked).is_none()
+            {
                 question.set_name(Name::from(reached));
             }
             self.look_up(req, local, apex.clone(), &question)

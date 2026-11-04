@@ -295,6 +295,75 @@ fn wildcard_nodata_carries_the_proof_for_the_name_asked() {
     }
 }
 
+/// A wildcard that is only an empty non-terminal, with data below it,
+/// still matches a name that does not exist, and the answer is NODATA
+/// (RFC 4592 §2.2.1). It has no NSEC (RFC 4035 §2.3), so the NSEC that
+/// covers it, whose next name is below it, proves it holds no records,
+/// beside the NSEC that covers the name. Every way of signing gives a
+/// proof that validates, and the proof never stands for an NXDOMAIN.
+#[test]
+fn nodata_at_an_empty_non_terminal_wildcard_validates() {
+    for denial in denials() {
+        let base = || {
+            let soa = SOA::new(
+                name("ns1.example."),
+                name("hostmaster.example."),
+                1,
+                7200,
+                3600,
+                1209600,
+                300,
+            );
+            Zone::builder(name("example."), soa, 3600)
+                .rrset(rrset("example.", vec![RData::NS(NS(name("ns1.example.")))]))
+                .rrset(rrset("ns1.example.", vec![RData::A(A::new(192, 0, 2, 1))]))
+                .rrset(rrset("a.*.example.", vec![RData::A(A::new(192, 0, 2, 9))]))
+                .rrset(rrset("www.example.", vec![RData::A(A::new(192, 0, 2, 10))]))
+                .build()
+                .unwrap()
+        };
+        let offline = base().signed(&keys(), window(), denial.clone()).unwrap();
+        let online = Signed::new(base(), keys(), window(), denial.clone());
+        for (how, data) in [
+            ("signed once", &offline as &dyn ZoneData),
+            ("signed as asked", &online),
+        ] {
+            let case = format!("{denial:?} {how}");
+            let reply = ask(data, "x.example.", RecordType::A, AnyResponse::All);
+            assert_eq!(
+                reply.metadata.response_code,
+                ResponseCode::NoError,
+                "{case}"
+            );
+            assert!(reply.answers.is_empty(), "{case}");
+            let (chain, anchors) = chain(data);
+            let validate = |rcode| {
+                validate_denial(
+                    &Query::query(name("x.example."), RecordType::A),
+                    rcode,
+                    &sets(&reply.authorities),
+                    &chain,
+                    &anchors,
+                    &AlgorithmPolicy::iana(),
+                    now(),
+                    &Ring,
+                )
+                .validation
+            };
+            assert_eq!(
+                validate(ResponseCode::NoError),
+                Validation::Secure,
+                "{case}"
+            );
+            assert_ne!(
+                validate(ResponseCode::NXDomain),
+                Validation::Secure,
+                "{case}: the wildcard exists"
+            );
+        }
+    }
+}
+
 /// The signed NSEC at a wildcard owner, copied to another owner, still
 /// verifies, since its RRSIG's labels field rebuilds the wildcard. It
 /// proves nothing there (RFC 4035 §5.4): alone it leaves an NXDOMAIN

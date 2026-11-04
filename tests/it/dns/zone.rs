@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use fictionet::stdlib::protocols::dns::dnssec::Nsec3HashAlgorithm;
-use fictionet::stdlib::protocols::dns::dnssec::rdata::{DNSSECRData, NSEC3};
+use fictionet::stdlib::protocols::dns::dnssec::rdata::{DNSSECRData, NSEC, NSEC3};
 use fictionet::stdlib::protocols::dns::op::{
     Edns, Message, MessageType, OpCode, Query, ResponseCode,
 };
@@ -2198,6 +2198,40 @@ fn shown_data_knows_only_its_own_rrsets() {
         Some(ZoneError::CnameWithOtherData {
             owner: lower("www.example.")
         })
+    );
+
+    // A signed alias holds its NSEC RRset beside the CNAME (RFC 4035
+    // §2.5), as a capture with DO shows it: the NSEC answers an NSEC
+    // question, and the CNAME every other type.
+    let nsec = RData::DNSSEC(DNSSECRData::NSEC(NSEC::new(
+        name("x.example."),
+        [RecordType::CNAME, RecordType::RRSIG, RecordType::NSEC],
+    )));
+    let signed_alias = Shown::new(
+        &name("www.example."),
+        [
+            rrset("www.example.", 300, vec![cname("edge.cdn.test.")]),
+            rrset("www.example.", 300, vec![nsec]),
+        ],
+    )
+    .unwrap();
+    let reply = ask(
+        &*view_of(&signed_alias, "www.example.", RecordType::NSEC),
+        "www.example.",
+        RecordType::NSEC,
+    );
+    assert_eq!(
+        rows(&reply.answers),
+        vec![row("www.example.", RecordType::NSEC)]
+    );
+    let reply = ask(
+        &*view_of(&signed_alias, "www.example.", RecordType::A),
+        "www.example.",
+        RecordType::A,
+    );
+    assert_eq!(
+        rows(&reply.answers),
+        vec![row("www.example.", RecordType::CNAME)]
     );
 }
 

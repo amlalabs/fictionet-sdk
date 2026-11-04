@@ -174,9 +174,10 @@ mod tests {
 
     /// Every zone Unbound serves by default names `localhost.` as its
     /// SOA's MNAME, and as its name server where its apex has one:
-    /// `localhost` and `invalid` answer NS with a negative
-    /// (RFC 6761 §6.3, §6.4). The loopback addresses' reverse names point
-    /// at `localhost.`.
+    /// the special-use zones answer NS with a negative: `localhost` with
+    /// NODATA, and `invalid`, `test`, and `onion` with NXDOMAIN at the
+    /// apex (RFC 6761 §6.2, §6.3, §6.4, RFC 7686 §2). The loopback
+    /// addresses' reverse names point at `localhost.`.
     #[test]
     fn unbound_zones_name_localhost() {
         let zones = local_zones();
@@ -185,7 +186,7 @@ mod tests {
             assert!(zone.keep_aa);
             let apex = zone.data.apex().to_string();
             let ns = match apex.as_str() {
-                "localhost." | "invalid." => vec![],
+                "localhost." | "invalid." | "test." | "onion." => vec![],
                 _ => vec![RData::NS(NS(name("localhost.")))],
             };
             assert_eq!(records(&*zone.data, &apex, RecordType::NS), ns, "{apex}");

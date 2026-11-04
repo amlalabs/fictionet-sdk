@@ -323,21 +323,29 @@ def closestNsec (r : Nsec) (q : Name) : Option Name :=
 /-- An NSEC proves that nothing exists at or below `q`: it covers `q` and its next name is not below `q`. -/
 def nsecNone (r : Nsec) (q : Name) : Bool := covers r.owner r.next q && !under r.next q
 
+/-- An NSEC covers `w` and its next name is strictly below it: `w` is an empty non-terminal, which exists with
+no records. -/
+def entCover (r : Nsec) (w : Name) : Bool := covers r.owner r.next w && under r.next w && r.next != w
+
 /-- `q` does not exist, by NSEC: an NSEC proves nothing is at or below `q`, and an NSEC covers the wildcard at
-the closest encloser it proves. -/
+the closest encloser it proves, as a name that does not exist: a wildcard that is an empty non-terminal still
+matches `q` (RFC 4592 §2.2.1). -/
 def nx (rs : List Nsec) (q : Name) : Bool :=
   rs.any fun r => nsecNone r q && match closestNsec r q with
-    | some ce => rs.any fun r' => covers r'.owner r'.next (wild ce)
+    | some ce => rs.any fun r' => covers r'.owner r'.next (wild ce) && !entCover r' (wild ce)
     | none => false
 
 /-- `q` has no RRset of type `qt`, by NSEC: its own NSEC lacks the type and CNAME; or `q` is an empty
 non-terminal (an NSEC covers it and its next name is below it); or no closer match exists and the wildcard's
-NSEC lacks the type and CNAME (RFC 4035 §3.1.3.4). -/
+NSEC lacks the type and CNAME (RFC 4035 §3.1.3.4), or the wildcard has no NSEC and is an empty non-terminal,
+which matches with no records (RFC 4035 §2.3, RFC 4592 §2.2.1). -/
 def nodata (rs : List Nsec) (q : Name) (qt : Nat) : Bool :=
   (rs.any fun r => r.owner == q && !hasType r.types qt && !hasType r.types 5) ||
-  (rs.any fun r => covers r.owner r.next q && under r.next q && r.next != q) ||
+  (rs.any fun r => entCover r q) ||
   (rs.any fun r => nsecNone r q && match closestNsec r q with
-    | some ce => rs.any fun r' => r'.owner == wild ce && !hasType r'.types qt && !hasType r'.types 5
+    | some ce =>
+      (rs.any fun r' => r'.owner == wild ce && !hasType r'.types qt && !hasType r'.types 5) ||
+      (rs.all (·.owner != wild ce) && rs.any fun r' => entCover r' (wild ce))
     | none => false)
 
 /-- `q` has no RRset of type `qt`, by NSEC3. `some false`: a matching NSEC3 lacking the type and CNAME
@@ -1661,7 +1669,11 @@ def denialFor (q : Request) (r : Response) : List (Signed S) :=
       match sz.denial, z.node f, z.presentB f with
       | .nsec, some _, _ => sz.nsecWith (·.owner == f)
       | .nsec, none, true => sz.nsecWith fun x => covers x.owner x.next f && under x.next f
-      | .nsec, none, false => sz.nsecWith (nsecNone · f) ++ sz.nsecWith (·.owner == wild ce)
+      | .nsec, none, false =>
+        -- a wildcard that is an empty non-terminal has no NSEC: the one that covers it shows it exists empty
+        sz.nsecWith (nsecNone · f) ++
+          (if sz.nsecChain.any (·.owner == wild ce) then sz.nsecWith (·.owner == wild ce)
+          else sz.nsecWith fun x => covers x.owner x.next (wild ce))
       | .nsec3 _, _, true =>
         -- a DS question at a delegation an opt-out chain leaves out gets the opt-out proof (RFC 5155 §7.2.4)
         if sz.nsec3Chain.any (·.hash == S.hash f) then sz.nsec3Matching f else sz.noDsRecords f
