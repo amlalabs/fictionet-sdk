@@ -380,12 +380,15 @@ Observe == \E o \in obsq : ObserveOne(o)
 \* stepped. `A` runs only then.
 Quiet(A) == (\A r \in Reqs : st[r] # "overlay") /\ A
 
+\* No respond but r's is half done: r's own step may end its respond call.
+Alone(r, A) == (\A o \in Reqs \ {r} : st[o] # "overlay") /\ A
+
 Next ==
     \/ \E r \in Reqs : Quiet(View(r))
     \/ \E r \in Reqs : Quiet(ReadName(r))
     \/ \E r \in Reqs : Quiet(ReadRest(r))
     \/ \E r \in Reqs : Quiet(ReadOverlay(r))
-    \/ \E r \in Reqs : Step(r)
+    \/ \E r \in Reqs : Alone(r, Step(r))
     \/ Quiet(Upstream)
     \/ Quiet(Observe)
     \/ Quiet(WorldChange)
@@ -396,7 +399,7 @@ Next ==
 Fairness ==
     /\ \A r \in Reqs : /\ WF_vars(Quiet(View(r))) /\ WF_vars(Quiet(ReadName(r)))
                        /\ WF_vars(Quiet(ReadRest(r))) /\ WF_vars(Quiet(ReadOverlay(r)))
-                       /\ WF_vars(Step(r))
+                       /\ WF_vars(Alone(r, Step(r)))
     /\ WF_vars(Quiet(Upstream))
     /\ WF_vars(Quiet(Observe))
 

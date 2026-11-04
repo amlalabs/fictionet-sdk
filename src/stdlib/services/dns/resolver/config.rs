@@ -22,9 +22,10 @@ pub type NegativeAnchors = Arc<dyn Fn(&LowerName) -> bool + Send + Sync>;
 #[derive(Clone)]
 pub struct Config {
     /// The root servers to start from (RFC 8109). Empty: the resolver
-    /// iterates nowhere, and a question its local zones and forward zones
-    /// do not answer gets SERVFAIL with Extended DNS Error 22, as a
-    /// resolver with no route to the roots gives.
+    /// iterates only from the cuts its local zones name, and a question
+    /// its local zones, their cuts and forward zones do not answer gets
+    /// SERVFAIL with Extended DNS Error 22, as a resolver with no route
+    /// to the roots gives.
     pub hints: Vec<(Name, IpAddr)>,
     /// Zones whose questions go to servers that resolve them, with RD
     /// set, instead of iterating: each zone's name and its servers. A

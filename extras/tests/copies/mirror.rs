@@ -635,6 +635,52 @@ fn the_mirror_knows_its_server_names_before_observers_run() {
     });
 }
 
+/// What the mirror learned belongs to its session: once the namespace
+/// advances, a root letter looks the name up again, and the mirror has
+/// forgotten the name servers it saw named until a new filing names them.
+#[test]
+fn a_namespace_advance_makes_the_mirror_forget_what_it_learned() {
+    world(Duration::from_secs(60), |fcx| async move {
+        let hierarchy = Hierarchy::new();
+        let at = place();
+        let clock = WallClock {
+            start: SystemTime::UNIX_EPOCH,
+        };
+        let namespace = dns::Namespace::new(clock);
+        let (attacher, attachments) = fictionet::attachments();
+        let net = Net::new().ipv4_only();
+        let mirror = mirror(hierarchy.clone(), net.handle()).namespace(&namespace);
+        let servers = mirror.servers();
+        net.hosts(at.root_servers(|s| mirror.server(s)))
+            .start(&fcx, attachments)?;
+        let m = machine(&fcx, attacher.attach("client")?, ME);
+        let a_root = ROOT_SERVERS[0].v4;
+        let ns_name = lower("ns.direct.");
+        let www = query(1, "www.direct.", RecordType::A, false);
+
+        for _ in 0..2 {
+            ask(&fcx, &m, a_root, &www).await.expect("a referral");
+        }
+        assert_eq!(
+            hierarchy.asked_for("www.direct.", RecordType::A),
+            [IpAddr::V4(a_root)],
+            "one copy"
+        );
+        assert!(servers.named(Generation(0), &ns_name));
+
+        namespace.advance(clock);
+        assert!(!servers.named(Generation(1), &ns_name));
+        ask(&fcx, &m, a_root, &www).await.expect("a referral");
+        assert_eq!(
+            hierarchy.asked_for("www.direct.", RecordType::A),
+            [IpAddr::V4(a_root); 2],
+            "the new session's copy"
+        );
+        assert!(servers.named(Generation(1), &ns_name));
+        Ok(())
+    });
+}
+
 /// A zone transfer asked of a mirrored name server is refused: zone data
 /// makes answers to questions, never a listing of a whole zone, and no
 /// transfer is ever looked up at the real server.

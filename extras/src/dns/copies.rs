@@ -12,7 +12,7 @@ use fictionet::stdlib::protocols::dns::rr::{
 };
 use fictionet::stdlib::protocols::dns::{Request, label_count};
 use fictionet::stdlib::services::dns::authority::{
-    Authority, ServerConfig, Step, bare_reply, refuse_transfer, respond_from_zones,
+    Authority, ServerConfig, Step, bare_reply, respond_from_zones,
 };
 use fictionet::stdlib::services::dns::zone::{Denied, Fact, Node, Revision, View, ZoneData};
 use fictionet::stdlib::services::dns::{Client, Generation, Looked, Lookup};
@@ -111,8 +111,10 @@ impl Copies {
     /// kept. `None` when the lookup brought no response.
     ///
     /// A response goes into the zone of the lookup's address that it
-    /// [comes from](zone_of), and a question whose response went into
-    /// another zone is [declined](Declined::Elsewhere) in the zone asked.
+    /// comes from, as the signer, SOA or apex NS RRset it carries shows,
+    /// or else the deepest zone of that address it fits. A question whose
+    /// response went into another zone is
+    /// [declined](Declined::Elsewhere) in the zone asked.
     /// So is one the server answered with a referral to a cut at or above
     /// the apex of the zone asked, from a zone above it, which files
     /// nothing. A REFUSED and a response without AA that is no referral
@@ -364,9 +366,6 @@ impl Authority for Copies {
         server: &ServerConfig,
         _client: &Client,
     ) -> Step {
-        if let Some(refused) = refuse_transfer(req) {
-            return refused;
-        }
         let qname = LowerName::new(req.question.name());
         let copies = self.server(local.ip()).zones();
         let mut around: Vec<Around> = Vec::new();

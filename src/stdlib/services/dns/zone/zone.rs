@@ -1006,6 +1006,13 @@ struct Hashing {
 }
 
 /// The wildcard at `encloser`: `*.<encloser>` (RFC 4592 §2.1.1).
+///
+/// # Panics
+///
+/// When `*.<encloser>` is longer than a name may be (255 octets,
+/// RFC 1035 §3.1). It never is when `encloser` is a proper ancestor of
+/// a name, as a closest encloser is: the label it drops takes at least
+/// the two octets `*` adds.
 pub fn wildcard(encloser: &LowerName) -> LowerName {
     let name = Name::from(encloser)
         .prepend_label("*")

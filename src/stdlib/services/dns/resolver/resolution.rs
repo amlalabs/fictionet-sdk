@@ -659,7 +659,8 @@ impl<V: Verify> Resolver<V> {
     /// What the cache answers for `key` now, with TTLs counted down: an
     /// NXDOMAIN at the name or a Secure one above it (RFC 8020), what
     /// validated NSEC records prove (RFC 8198), the RRset, the negative or
-    /// failure, or a CNAME at the name. Data below [`Rank::NonAuthAnswer`]
+    /// failure, or a CNAME at the name when the question
+    /// [follows](follows_alias) it. Data below [`Rank::NonAuthAnswer`]
     /// never answers (RFC 2181 §5.4.1), and QTYPE ANY is always asked
     /// again.
     pub(super) fn cached(&self, key: &Key) -> Option<Found> {
@@ -690,7 +691,7 @@ impl<V: Verify> Resolver<V> {
             }
             _ => {}
         }
-        if key.rtype != RecordType::CNAME {
+        if follows_alias(key.rtype) {
             let alias = Key::new(key.name.clone(), RecordType::CNAME, key.class);
             if let Some(entry @ Entry::Positive { rank, .. }) = self.cache.get(&alias, now)
                 && *rank >= Rank::NonAuthAnswer
@@ -814,8 +815,8 @@ impl<V: Verify> Resolver<V> {
     }
 
     /// Expired data for `key`, for serving stale (RFC 8767 §4): the RRset
-    /// or the negative, or else a CNAME at the name, as
-    /// [`cached`](Resolver::cached) finds them.
+    /// or the negative, or else a CNAME at the name the question
+    /// follows, as [`cached`](Resolver::cached) finds them.
     pub(super) fn stale_found(&self, key: &Key) -> Option<Found> {
         let found = match self.cache.stale(key, self.now) {
             Some(entry @ Entry::Positive { rank, .. }) if *rank >= Rank::NonAuthAnswer => {
@@ -824,7 +825,7 @@ impl<V: Verify> Resolver<V> {
             Some(entry @ Entry::Negative { .. }) => self.found_negative(key, &key.name, entry),
             _ => None,
         };
-        if found.is_some() || matches!(key.rtype, RecordType::CNAME | RecordType::ANY) {
+        if found.is_some() || key.rtype == RecordType::ANY || !follows_alias(key.rtype) {
             return found;
         }
         let alias = Key::new(key.name.clone(), RecordType::CNAME, key.class);
@@ -1192,7 +1193,9 @@ impl<V: Verify> Resolver<V> {
             }
             return self.ask_one(id, zone, servers, true, entropy);
         }
-        if self.config.hints.is_empty() {
+        // With no hints the resolver iterates only from a cut a local zone
+        // names (RFC 1034 §5.3.3 step 2).
+        if self.config.hints.is_empty() && lookup.delegation.is_none() {
             return self.fail(id);
         }
         let root = LowerName::from(Name::root());
@@ -3183,6 +3186,17 @@ fn dname_matches(dname: &RecordSet, cname: &RecordSet) -> bool {
         return false;
     };
     dname_substitute(cname.name(), dname.name(), &target).is_some_and(|expected| expected == alias)
+}
+
+/// Whether a cached CNAME answers a question of type `rtype` at its
+/// owner. A question for the CNAME itself, or for the RRSIG and NSEC
+/// records that may sit beside it (RFC 4035 §2.5, RFC 2181 §10.1), is
+/// about the alias's own records, which the alias's server answers.
+fn follows_alias(rtype: RecordType) -> bool {
+    !matches!(
+        rtype,
+        RecordType::CNAME | RecordType::RRSIG | RecordType::NSEC
+    )
 }
 
 /// Whether `set` is a DNAME RRset (RFC 6672).

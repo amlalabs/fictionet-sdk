@@ -1948,6 +1948,51 @@ fn a_local_zone_cut_is_followed_to_its_servers() {
 }
 
 #[test]
+fn a_local_zone_cut_is_followed_without_root_hints() {
+    let (mut net, _) = internet(false);
+    let mut resolver = resolver(
+        Config {
+            hints: Vec::new(),
+            ..config(None)
+        }
+        .local(org_with_a_cut()),
+    );
+    let reply = ask(
+        &mut resolver,
+        &mut net,
+        0,
+        query(client(1), "www.example.org.", RecordType::A, |_| {}),
+    );
+    assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(addresses(&reply), ["192.0.2.90"]);
+    let reply = ask(
+        &mut resolver,
+        &mut net,
+        1,
+        query(client(2), "alias.org.", RecordType::A, |_| {}),
+    );
+    assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(addresses(&reply), ["192.0.2.90"]);
+    let asked = asked(&net);
+    assert!(!asked.is_empty());
+    assert!(
+        asked
+            .iter()
+            .all(|(server, _, _, _)| *server == ip(EXAMPLE_ORG)),
+        "{asked:?}"
+    );
+    // A name outside the local zone still has nowhere to go.
+    let reply = ask(
+        &mut resolver,
+        &mut net,
+        2,
+        query(client(3), "www.example.com.", RecordType::A, |_| {}),
+    );
+    assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
+    assert_eq!(edes(&reply), [EdeCode::NO_REACHABLE_AUTHORITY]);
+}
+
+#[test]
 fn rd_clear_is_refused_or_answered_from_the_cache_alone() {
     let (mut net, _) = internet(false);
     let norec = |m: &mut Message| m.metadata.recursion_desired = false;
@@ -5674,6 +5719,93 @@ fn a_chain_into_a_negative_carries_its_proof_once() {
             .any(|record| record.record_type() == RecordType::NSEC),
         "{:?}",
         reply.authorities
+    );
+}
+
+/// RRSIG and NSEC records sit beside a CNAME (RFC 4035 §2.5), so a
+/// question for them at an alias is about the alias's own records. A
+/// cached CNAME does not answer it: the reply is the one a fresh lookup
+/// gets, with the same AD bit.
+#[test]
+fn a_cached_cname_does_not_answer_for_the_records_beside_it() {
+    for rtype in [RecordType::RRSIG, RecordType::NSEC] {
+        let (mut net, anchors) = internet(true);
+        let mut fresh = resolver(config(anchors.clone()));
+        let want = ask(
+            &mut fresh,
+            &mut net,
+            0,
+            query(client(1), "alias.example.com.", rtype, dnssec_ok),
+        );
+        assert_eq!(want.metadata.response_code, ResponseCode::NoError);
+        assert!(!want.answers.is_empty());
+        assert!(
+            want.answers
+                .iter()
+                .all(|record| record.name == name("alias.example.com.")),
+            "{rtype}: {:?}",
+            want.answers
+        );
+
+        let (mut net, anchors) = internet(true);
+        let mut r = resolver(config(anchors));
+        ask(
+            &mut r,
+            &mut net,
+            0,
+            query(client(1), "alias.example.com.", RecordType::A, dnssec_ok),
+        );
+        let got = ask(
+            &mut r,
+            &mut net,
+            1,
+            query(client(2), "alias.example.com.", rtype, dnssec_ok),
+        );
+        assert_eq!(got.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(rows(&got.answers), rows(&want.answers), "{rtype}");
+        assert_eq!(
+            got.metadata.authentic_data, want.metadata.authentic_data,
+            "{rtype}"
+        );
+    }
+}
+
+/// Nor does an expired CNAME answer for them when the alias's zone
+/// cannot be reached (RFC 8767 §4).
+#[test]
+fn a_stale_cname_does_not_answer_for_the_records_beside_it() {
+    let (mut net, _) = internet(true);
+    let mut r = resolver(stale_config(Duration::from_millis(376)));
+    for (asked, rtype) in [
+        ("www.example.com.", RecordType::RRSIG),
+        ("alias.example.com.", RecordType::A),
+    ] {
+        ask(
+            &mut r,
+            &mut net,
+            0,
+            query(client(1), asked, rtype, dnssec_ok),
+        );
+    }
+    lose_example(&mut net);
+    let reply = ask(
+        &mut r,
+        &mut net,
+        700,
+        query(
+            client(2),
+            "alias.example.com.",
+            RecordType::RRSIG,
+            dnssec_ok,
+        ),
+    );
+    assert!(
+        reply
+            .answers
+            .iter()
+            .all(|record| record.name == name("alias.example.com.")),
+        "{:?}",
+        reply.answers
     );
 }
 

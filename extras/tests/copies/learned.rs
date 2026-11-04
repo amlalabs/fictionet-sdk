@@ -1232,6 +1232,121 @@ fn each_address_answers_as_its_own_server_whichever_asked_first() {
     }
 }
 
+/// A zone whose name servers lie below one of its own cuts, as the root
+/// servers lie below `net`: their addresses are glue under the cut.
+const SERVERS_BELOW: &str = "\
+top. 3600 IN SOA a.servers.net.top. hostmaster.top. 1 7200 3600 1209600 300
+top. 3600 IN NS a.servers.net.top.
+top. 3600 IN NS b.servers.net.top.
+a.servers.net.top. 3600 IN A 192.0.2.1
+b.servers.net.top. 3600 IN A 192.0.2.2
+net.top. 3600 IN NS x.gtld.net.top.
+x.gtld.net.top. 3600 IN A 192.0.2.10
+";
+
+/// The addresses of an apex's name servers that lie below a cut go out
+/// with its NS RRset as the real server sends them, whether the copy
+/// learned the cut before or after the apex's NS RRset.
+#[test]
+fn an_apex_ns_answer_keeps_its_addresses_below_a_cut() {
+    for (signing, zone) in three_ways(SERVERS_BELOW) {
+        let real = Zones::new(vec![Arc::new(zone) as Arc<dyn ZoneData>]);
+        let answer = |lookup: &Lookup| reply_of(&real, lookup);
+        let local: SocketAddr = "192.0.2.1:53".parse().unwrap();
+        let ns = request("top.", RecordType::NS, false);
+        let client = Client {
+            peer: "198.51.100.7:5353".parse().unwrap(),
+            local,
+            transport: Transport::Udp,
+            connection: None,
+            sandbox: None,
+        };
+        let Step::Reply(want) = real.respond(&ns, local, &ServerConfig::generic(), &client) else {
+            panic!("the real server answers");
+        };
+        let want = want.message;
+        assert_eq!(additionals(&want).len(), 2, "{:?}", want.additionals);
+        for order in [
+            ["www.net.top.", "top.", "top."],
+            ["top.", "www.net.top.", "top."],
+        ] {
+            let copies = Copies::new();
+            copies.serves(local.ip(), &lower("top."));
+            let mut got = None;
+            for qname in order {
+                let qtype = match qname {
+                    "top." => RecordType::NS,
+                    _ => RecordType::A,
+                };
+                let question = request(qname, qtype, false);
+                got = Some(through(&copies, &answer, local, &question).0);
+            }
+            let got = got.expect("an answer");
+            assert_eq!(shape(&got), shape(&want), "{signing}, {order:?}");
+        }
+    }
+}
+
+/// What each address filed belongs to its session. When the session
+/// advances, every address looks its questions up again, a response to a
+/// lookup of the session before files nothing when it comes late, and
+/// the new session's response answers as the real server does.
+#[test]
+fn a_session_advance_clears_every_address_and_drops_late_responses() {
+    let servers = two_servers();
+    let real = |lookup: &Lookup| {
+        let (_, zones) = servers
+            .iter()
+            .find(|(addr, _)| addr.ip() == lookup.server.ip())
+            .expect("a real server at the address");
+        reply_of(zones, lookup)
+    };
+    let copies = Copies::new();
+    for (addr, _) in &servers {
+        copies.serves(addr.ip(), &lower("example."));
+    }
+    let question = request("www.example.", RecordType::A, false);
+    let server = ServerConfig::generic();
+    let step = |local: SocketAddr| {
+        let client = Client {
+            peer: "198.51.100.7:5353".parse().unwrap(),
+            local,
+            transport: Transport::Udp,
+            connection: None,
+            sandbox: None,
+        };
+        copies.respond(&question, local, &server, &client)
+    };
+    for (local, zones) in &servers {
+        let (got, looked) = through(&copies, &real, *local, &question);
+        assert_eq!(looked, [own(*local, &question)], "{local}");
+        assert_eq!(
+            shape(&got),
+            shape(&reply_of(zones, &own(*local, &question)))
+        );
+        assert!(matches!(step(*local), Step::Reply(_)), "{local}: filed");
+    }
+
+    copies.advance(Generation(1));
+    for (local, zones) in &servers {
+        let lookup = own(*local, &question);
+        let Step::Need(needed) = step(*local) else {
+            panic!("{local}: the new session looks the question up again");
+        };
+        assert_eq!(needed, lookup, "{local}");
+        copies.file(&lookup, &Looked::Response(real(&lookup)), Generation(0));
+        assert!(
+            matches!(step(*local), Step::Need(_)),
+            "{local}: the session before filed into this one"
+        );
+        copies.file(&lookup, &Looked::Response(real(&lookup)), Generation(1));
+        let Step::Reply(got) = step(*local) else {
+            panic!("{local}: the new session's response answers");
+        };
+        assert_eq!(shape(&got.message), shape(&reply_of(zones, &lookup)));
+    }
+}
+
 /// An address noted for `example` whose real server serves only
 /// `srv.child.example` below it answers DS at that zone's apex from the
 /// child, NODATA, as that server does: a server of a zone above would

@@ -39,7 +39,9 @@ use fictionet::sync::Mutex;
 ///   gave or stand against a filed NODATA, and which are served only as
 ///   additional data, never as an answer (RFC 2181 §5.4.1): such an RRset
 ///   may be glue below a cut the zone does not hold yet, or sent without
-///   its RRSIGs. A DNAME is kept, and the CNAME synthesized from it is not
+///   its RRSIGs. One at or below a cut the zone holds, as the addresses
+///   of the root servers lie below `net`, is that cut's glue, and stays
+///   so when the cut is filed after it. A DNAME is kept, and the CNAME synthesized from it is not
 ///   (RFC 6672 §3.4); a YXDOMAIN gives the DNAME whose new name would pass
 ///   255 octets (RFC 6672 §2.2). An RRset of the answer section whose
 ///   RRSIGs show a wildcard expansion (a Labels field below the owner's
@@ -674,9 +676,12 @@ impl Facts {
     }
 
     /// Keeps the address RRsets of `additional`, a response's additional
-    /// section, at their owners in the zone above any cut it holds, adding
-    /// them to `kept`. They serve as additional data only, such as the
-    /// sibling glue of a referral, and never answer (RFC 2181 §5.4.1).
+    /// section, adding them to `kept`: at their owners in the zone above
+    /// any cut it holds, and as the glue of the deepest cut at or above
+    /// the others, as a master file's zone holds them (RFC 1034 §4.2.1).
+    /// They serve as additional data only, such as the sibling glue of a
+    /// referral or the addresses of the apex's name servers below a cut,
+    /// and never answer (RFC 2181 §5.4.1).
     fn put_additional(
         &mut self,
         apex: &LowerName,
@@ -685,16 +690,36 @@ impl Facts {
     ) {
         for set in additional {
             let owner = LowerName::new(set.name());
-            if matches!(set.record_type(), RecordType::A | RecordType::AAAA)
-                && apex.zone_of(&owner)
-                && !self.below_cut(&owner, set.record_type())
+            // A referral's glue is kept with its cut already.
+            if !matches!(set.record_type(), RecordType::A | RecordType::AAAA)
+                || !apex.zone_of(&owner)
+                || kept.iter().any(|(_, held)| same_rrset(held, set))
+            {
+                continue;
+            }
+            let put = match self.cut_over(&owner, set.record_type()) {
+                Some(cut) => self.put_glue(&cut, set.clone()),
                 // At its owner even when a wildcard made it: the answer's
                 // proofs are not the proof for it.
-                && self.put(apex, set.clone(), Section::Additional)
-            {
+                None => self.put(apex, set.clone(), Section::Additional),
+            };
+            if put {
                 kept.push((Section::Additional, set.clone()));
             }
         }
+    }
+
+    /// Keeps the address RRset `set`, at or below the cut the zone holds
+    /// at `cut`, as that cut's glue, in place of any it held for the same
+    /// owner and type. Whether it was kept.
+    fn put_glue(&mut self, cut: &LowerName, set: RecordSet) -> bool {
+        let Some((_, glue)) = self.names.get_mut(cut).and_then(|known| known.cut.as_mut()) else {
+            return false;
+        };
+        glue.retain(|held| !same_rrset(held, &set));
+        glue.push(set);
+        self.rebuild(cut);
+        true
     }
 
     /// Files `referral`, to a cut below its apex at or above its name,
@@ -747,6 +772,32 @@ impl Facts {
         kept.push((Section::Authority, ns.clone()));
         kept.extend(glue.iter().map(|set| (Section::Additional, set.clone())));
         kept.extend(ds.iter().map(|set| (Section::Authority, set.clone())));
+        // Address data at or below the cut that the zone held before, as
+        // glue an earlier referral gave or the addresses of the apex's
+        // name servers, stays as the cut's glue where the referral gives
+        // none for its owner.
+        let mut glue = glue;
+        let before: Vec<RecordSet> = self
+            .names
+            .get(&cut)
+            .and_then(|known| known.cut.as_ref())
+            .into_iter()
+            .flat_map(|(_, glue)| glue.iter().cloned())
+            .chain(
+                self.names
+                    .range(cut.clone()..)
+                    .take_while(|(held, _)| cut.zone_of(held))
+                    .flat_map(|(_, known)| known.sets.values())
+                    .map(|(_, set)| set)
+                    .filter(|set| matches!(set.record_type(), RecordType::A | RecordType::AAAA))
+                    .cloned(),
+            )
+            .collect();
+        for set in before {
+            if !glue.iter().any(|held| same_rrset(held, &set)) {
+                glue.push(set);
+            }
+        }
         let known = self.names.entry(cut.clone()).or_default();
         known.cut = Some((ns.clone(), glue));
         // The parent's side answers NSEC at the cut when it holds one
@@ -1136,6 +1187,11 @@ fn node_of(known: &Known) -> Node {
             None => Node::Data(sets),
         },
     }
+}
+
+/// Whether `a` and `b` are RRsets of one owner and type.
+fn same_rrset(a: &RecordSet, b: &RecordSet) -> bool {
+    a.record_type() == b.record_type() && LowerName::new(a.name()) == LowerName::new(b.name())
 }
 
 /// `set` with `owner` as the owner of every record and RRSIG.

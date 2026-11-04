@@ -276,14 +276,17 @@ impl Question {
 /// answers for the others too: a resolver that picks another root letter
 /// than the capture did, or another of a domain's name servers, gets the
 /// recorded response. The capture's own NS records and addresses say
-/// which servers those are.
+/// which servers those are. Each server answers from the deepest zone it
+/// serves that holds the name, and DS from the zone above, so a response
+/// stands in only for a server that answers the question from the same
+/// zone: a.root's authoritative answer from `arpa`, which j.root does not
+/// serve, never answers for j.root.
 ///
 /// A corpus holds several captures, and a world's clock stands at the
 /// newest one, so the response comes from the newest capture that holds
 /// one for the server or a server of its zone: an older capture's RRSIGs
 /// may have expired by that clock. Within one capture, the server's own
-/// response comes first, then the response of the server sharing the
-/// deepest zone.
+/// response comes first.
 ///
 /// Any other lookup gets [`Looked::NoReply`], as from a server that never
 /// replies.
@@ -412,31 +415,30 @@ impl Replay {
 
     /// The recorded response to `question` sent to `server`, from the
     /// newest capture that holds one from that server or from a server
-    /// sharing a zone with it that holds the question's name: in that
-    /// capture, the server's own, or else the one from the server sharing
-    /// the deepest such zone.
+    /// that answers it from the same zone: in that capture, the server's
+    /// own, or else another's.
     fn reply(&self, server: SocketAddr, question: &Question) -> Option<&Message> {
         let name = &question.name;
-        let serving = |address: IpAddr| {
+        // An authoritative server answers from the deepest zone it serves
+        // that holds the name (RFC 1034 §4.3.2 step 2), and DS from the
+        // zone above the name's own (RFC 4035 §3.1.4.1).
+        let parents = question.qtype == RecordType::DS && !name.is_root();
+        let answering = |address: IpAddr| {
             self.zones
                 .get(&address)
                 .into_iter()
                 .flatten()
-                .filter(|zone| zone.zone_of(name))
+                .filter(|zone| zone.zone_of(name) && !(parents && *zone == name))
+                .max_by_key(|zone| label_count(zone))
         };
         // Within a capture the server's own response ranks above any
         // other.
         let rank = |from: &SocketAddr| {
             if *from == server {
-                return Some(usize::MAX);
+                return Some(true);
             }
-            if from.port() != server.port() {
-                return None;
-            }
-            serving(server.ip())
-                .filter(|zone| serving(from.ip()).any(|other| other == *zone))
-                .map(|zone| label_count(zone))
-                .max()
+            let zone = answering(server.ip())?;
+            (from.port() == server.port() && answering(from.ip()) == Some(zone)).then_some(false)
         };
         self.replies
             .get(question)?
@@ -765,6 +767,87 @@ mod tests {
                 Looked::NoReply
             );
             assert_eq!(upstream.asked.load(Ordering::Relaxed), 2);
+        });
+    }
+
+    /// Two root servers of which only a.root also serves `arpa`, as
+    /// a.ns.arpa: it answers `arpa NS` from that zone, and `arpa DS`, the
+    /// root zone's data, from the root zone.
+    struct ArpaAtA;
+
+    impl Upstream for ArpaAtA {
+        fn lookup<'a>(
+            &'a self,
+            _fcx: &'a Cx,
+            lookup: Lookup,
+        ) -> Pin<Box<dyn Future<Output = Looked> + Send + 'a>> {
+            let mut reply = response_to(&lookup);
+            reply.metadata.authoritative = true;
+            let qname = lookup.question.name().clone();
+            let glue = |reply: &mut Message, server: &str, address: SocketAddr| {
+                let IpAddr::V4(ip) = address.ip() else {
+                    unreachable!("the servers here have IPv4 addresses")
+                };
+                reply.add_additional(Record::from_rdata(name(server), 518400, RData::A(A(ip))));
+            };
+            if qname.is_root() {
+                for (letter, address) in [("a", A_ROOT), ("b", B_ROOT)] {
+                    let server = format!("{letter}.root-servers.net.");
+                    reply.add_answer(Record::from_rdata(
+                        Name::root(),
+                        518400,
+                        RData::NS(NS(name(&server))),
+                    ));
+                    glue(&mut reply, &server, address);
+                }
+            } else if lookup.question.query_type() == RecordType::NS {
+                reply.add_answer(Record::from_rdata(
+                    qname,
+                    518400,
+                    RData::NS(NS(name("a.ns.arpa."))),
+                ));
+                glue(&mut reply, "a.ns.arpa.", A_ROOT);
+            }
+            Box::pin(ready(Looked::Response(reply)))
+        }
+    }
+
+    #[test]
+    fn a_recorded_reply_answers_only_for_servers_answering_from_its_zone() {
+        let path = archive("arpa");
+        run(async move |fcx| {
+            let capture = Capture::new(ArpaAtA);
+            for lookup in [
+                lookup(A_ROOT, ".", RecordType::NS),
+                lookup(A_ROOT, "arpa.", RecordType::NS),
+                lookup(A_ROOT, "arpa.", RecordType::DS),
+            ] {
+                capture.lookup(&fcx, lookup).await;
+            }
+            capture.write(&path).unwrap();
+            let replay = Replay::open([path.clone()]).unwrap();
+
+            let own = reply(
+                replay
+                    .lookup(&fcx, lookup(A_ROOT, "arpa.", RecordType::NS))
+                    .await,
+            );
+            assert_eq!(own.answers[0].data, RData::NS(NS(name("a.ns.arpa."))));
+            // b.root serves the root zone alone, and answers `arpa NS`
+            // from it, not from `arpa` as a.root did.
+            assert_eq!(
+                replay
+                    .lookup(&fcx, lookup(B_ROOT, "arpa.", RecordType::NS))
+                    .await,
+                Looked::NoReply
+            );
+            // Both answer `arpa DS` from the root zone.
+            let ds = reply(
+                replay
+                    .lookup(&fcx, lookup(B_ROOT, "arpa.", RecordType::DS))
+                    .await,
+            );
+            assert_eq!(ds.queries[0].query_type(), RecordType::DS);
         });
     }
 
