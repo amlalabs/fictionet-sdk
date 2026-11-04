@@ -9,7 +9,7 @@ use fictionet::stdlib::protocols::dns::EdeCode;
 use fictionet::stdlib::protocols::dns::dnssec::rdata::DNSSECRData;
 use fictionet::stdlib::protocols::dns::dnssec::{
     Algorithm, AlgorithmPolicy, Anchors, Chain, DigestType, Fetched, KeyFlags, KeySet, Link, Ring,
-    Sign, TBS, Validation, Verify, Window, ZoneKey, ds, validate_denial, validate_rrset,
+    Sign, TBS, Validation, Verify, Window, ZoneKey, ds, sign, validate_denial, validate_rrset,
 };
 use fictionet::stdlib::protocols::dns::op::{
     Edns, Message, MessageType, OpCode, Query, ResponseCode,
@@ -18,7 +18,7 @@ use fictionet::stdlib::protocols::dns::rr::rdata::{A, CNAME, MX, NS, NULL, SOA};
 use fictionet::stdlib::protocols::dns::rr::{
     LowerName, Name, RData, Record, RecordSet, RecordType,
 };
-use fictionet::stdlib::protocols::dns::{Parsed, Request};
+use fictionet::stdlib::protocols::dns::{Parsed, Request, read_message};
 use fictionet::stdlib::services::dns::zone::{
     Answered, AnyResponse, ChainProblem, Denial, Signed, Zone, ZoneData, answer, check_chain, dname,
 };
@@ -1079,4 +1079,65 @@ fn any_at_a_signed_cname_gets_the_cname() {
     assert_eq!(answer.len(), 1);
     assert_eq!(answer[0].record_type(), RecordType::CNAME);
     assert_eq!(validate(&online, &answer[0]), Validation::Secure);
+}
+
+/// A DNSKEY whose Protocol field is not 3 is no key (RFC 4034 §2.1.2),
+/// but it stays in its RRset, which the RRSIG covers whole: a reply that
+/// holds one reads, with that record as octets, and the RRset validates
+/// with the keys that are.
+#[test]
+fn a_dnskey_of_another_protocol_is_read_and_is_no_key() {
+    let keys = keys();
+    let signed = zone().signed(&keys, window(), Denial::Nsec).unwrap();
+    let served = sets(&ask(&signed, "example.", RecordType::DNSKEY, AnyResponse::All).answers);
+    let apex = name("example.");
+    let mut set = RecordSet::with_ttl(apex.clone(), RecordType::DNSKEY, 3600);
+    for record in served[0].records_without_rrsigs() {
+        set.insert(record.clone(), 0);
+    }
+    // Flags 257, Protocol 4, Algorithm 15, and a 32-octet key.
+    let mut odd = vec![1, 1, 4, 15];
+    odd.extend([0x5a; 32]);
+    let odd = Record::from_rdata(
+        apex.clone(),
+        3600,
+        RData::Unknown {
+            code: RecordType::DNSKEY,
+            rdata: NULL::with(odd.clone()),
+        },
+    );
+    set.insert(odd.clone(), 0);
+    let rrsig = sign(&*keys.keys[0], &set, &apex, window()).unwrap();
+    let mut message = Message::response(7, OpCode::Query);
+    message.add_query(Query::query(apex.clone(), RecordType::DNSKEY));
+    message.metadata.authoritative = true;
+    for record in set.records_without_rrsigs() {
+        message.add_answer(record.clone());
+    }
+    message.add_answer(rrsig);
+    let bytes = message.to_vec().unwrap();
+    assert!(Message::from_vec(&bytes).is_err(), "hickory refuses it");
+
+    let read = read_message(&bytes).unwrap();
+    assert!(read.answers.contains(&odd));
+    let dnskey = sets(&read.answers).remove(0);
+    assert_eq!(dnskey.records_without_rrsigs().count(), 3);
+    let chain = Chain {
+        links: vec![Link {
+            zone: apex.clone(),
+            ds: Fetched::Failed,
+            dnskey: Fetched::Answer(dnskey.clone()),
+        }],
+    };
+    let anchors = Anchors::of(vec![keys.anchor(&apex)]);
+    let validation = validate_rrset(
+        &dnskey,
+        &[],
+        &chain,
+        &anchors,
+        &AlgorithmPolicy::iana(),
+        now(),
+        &Ring,
+    );
+    assert_eq!(validation.validation, Validation::Secure);
 }

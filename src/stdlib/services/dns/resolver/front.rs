@@ -239,12 +239,21 @@ impl<V: Verify> Resolver<V> {
         edes.extend(validation.ede());
         set_edes(&mut message, &edes);
         let authentic = validation == Validation::Secure && (dnssec_ok || request.ad);
+        // An answer to a query with RD clear that starts in a local zone
+        // is that zone's, with AA as the zone keeps it, as when the zone
+        // answers alone.
+        let keep_aa = asker.cache_only
+            && pieces.first().is_some_and(|piece| piece.local)
+            && self
+                .local_answer(request)
+                .is_some_and(|local| local.keep_aa);
+        message.metadata.authoritative = keep_aa;
         let response = Response {
             message,
             required_additional: 0,
         };
         (
-            self.render_with(request, response, authentic, false),
+            self.render_with(request, response, authentic, keep_aa),
             validation,
             cached,
         )

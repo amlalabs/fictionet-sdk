@@ -475,7 +475,7 @@ fn tlc(paths: &Paths, spec: Option<&str>, config: Option<&str>) -> Result<Report
 fn lean(paths: &Paths) -> Result<Report> {
     let out = paths.out.join("lean");
     let mut report = Report::new("lean");
-    let (_, built) = logged(
+    let (log, built) = logged(
         lake().arg("build").current_dir(&paths.lean),
         &out.join("build.out"),
     )?;
@@ -483,7 +483,17 @@ fn lean(paths: &Paths) -> Result<Report> {
         report.fail("lake build; see lean/build.out".to_string());
         return Ok(report);
     }
-    report.pass("lake build: every proof checks".to_string());
+    // Lean accepts a proof left as `sorry` with a warning, which Lake
+    // prints again for a module it does not rebuild.
+    let sorry: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("declaration uses") && line.contains("sorry"))
+        .collect();
+    if !sorry.is_empty() {
+        report.fail(format!("a proof is left as sorry: {}", sorry.join("; ")));
+        return Ok(report);
+    }
+    report.pass("lake build: every proof checks, none left as sorry".to_string());
     let (text, checked) = logged(
         lake()
             .args(["env", "lean", "Dns/Axioms.lean"])

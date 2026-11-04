@@ -130,6 +130,9 @@ pub enum Entry {
         why: FailureKind,
         /// When it stops being served.
         until: Instant,
+        /// How long it is served: [`Limits::failure_ttl`], or twice as
+        /// long as the failure before it for a failure that persists.
+        lasts: Duration,
     },
 }
 
@@ -303,6 +306,10 @@ pub struct Limits {
     pub stale: Duration,
 }
 
+/// The longest a failure that persists is kept (RFC 9520 §3.2: up to 5
+/// minutes), unless [`Limits::failure_ttl`] is longer.
+const MAX_FAILURE_TTL: Duration = Duration::from_secs(300);
+
 /// The validated NSEC records of one zone.
 #[derive(Clone, Debug)]
 struct SecureNsec {
@@ -347,8 +354,12 @@ struct Stored {
 ///   (RFC 2181 §8).
 /// - A Secure RRset lives no longer than the RRSIGs that verified it
 ///   (RFC 4035 §5.3.3).
-/// - A failure lives [`Limits::failure_ttl`] (RFC 9520 §3.2), and so does
-///   data that validated Bogus or Indeterminate.
+/// - A failure lives [`Limits::failure_ttl`], and so does data that
+///   validated Bogus or Indeterminate. A failure that persists lives
+///   longer each time, as RFC 9520 §3.2 asks: one that comes no later
+///   after the failure before it at the key ended than that one lasted
+///   lives twice as long, up to 5 minutes or [`Limits::failure_ttl`],
+///   whichever is longer.
 /// - Data replaces a live entry for its key only at equal or higher
 ///   [`Rank`] (RFC 2181 §5.4.1). A failure is no data: any data replaces
 ///   it, and it is laid over any live entry that does not answer clients,
@@ -837,16 +848,22 @@ impl Cache {
         }
     }
 
-    /// Drops entries past any use: expired, and past the stale window.
+    /// Drops entries past any use: expired, past the stale window, and
+    /// for a failure, past the time a failure after it would count as
+    /// persisting.
     fn sweep(&mut self, now: Instant) {
         let stale = self.limits.stale;
         let generation = self.generation;
         self.entries.retain(|_, stored| {
+            let persists = match stored.entry {
+                Entry::Failure { until, lasts, .. } => until + lasts,
+                _ => stored.entry.expires(),
+            };
             let last = [stored.under.as_ref(), stored.glue.as_ref()]
                 .into_iter()
                 .flatten()
                 .map(Entry::expires)
-                .fold(stored.entry.expires(), Instant::max);
+                .fold(persists, Instant::max);
             stored.generation == generation && now < last + stale
         });
         self.swept = self.entries.len();
@@ -921,8 +938,15 @@ impl Cache {
                 Some((key, entry))
             }
             Offer::Failure { key, why } => {
-                let until = now + self.limits.failure_ttl;
-                Some((key, Entry::Failure { why, until }))
+                let first = self.limits.failure_ttl;
+                let lasts = match self.stored(&key).map(|stored| &stored.entry) {
+                    Some(Entry::Failure { until, lasts, .. }) if now < *until + *lasts => {
+                        (*lasts * 2).min(MAX_FAILURE_TTL.max(first))
+                    }
+                    _ => first,
+                };
+                let until = now + lasts;
+                Some((key, Entry::Failure { why, until, lasts }))
             }
         }
     }

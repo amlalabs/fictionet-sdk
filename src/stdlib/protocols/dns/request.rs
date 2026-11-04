@@ -11,9 +11,9 @@ use super::op::{
     DEFAULT_MAX_PAYLOAD_LEN, Edns, Header, Message, MessageType, Metadata, OpCode, Query,
     ResponseCode,
 };
-use super::rr::rdata::TSIG;
 use super::rr::rdata::opt::EdnsCode;
 use super::rr::rdata::tsig::TsigError;
+use super::rr::rdata::{NULL, TSIG};
 use super::rr::{DNSClass, Name, RData, Record, RecordType};
 use super::serialize::binary::{BinDecodable, BinDecoder, DecodeError};
 use fictionet::stdlib::services::serve::Transport;
@@ -174,10 +174,10 @@ impl Request {
 /// message that holds one. A resolver reads its replies with this, so a
 /// zone that holds such a record can still be resolved.
 ///
-/// An NSEC3 or NSEC3PARAM record with a Flags bit set other than Opt-Out
-/// is left out of the message, and the rest is read: RFC 5155 §8.2 has
-/// validators ignore such NSEC3 records, and §4.1.2 such NSEC3PARAM
-/// records, where hickory refuses the whole message.
+/// A record hickory refuses whose RDATA a validator ignores, while the
+/// rest of the message stands, is read with its RDATA as octets
+/// (RFC 3597 §5), where hickory refuses the whole message
+/// ([`ignored_by_validators`]).
 pub fn read_message(bytes: &[u8]) -> Result<Message, DecodeError> {
     let mut decoder = BinDecoder::new(bytes);
     let Header {
@@ -215,9 +215,8 @@ struct Section {
 
 /// Reads the `count` records of one section from `decoder`, a decoder of
 /// `bytes`, as [`Message::read_records`] does under UPDATE, the one
-/// opcode under which hickory reads empty RDATA. An NSEC3 or NSEC3PARAM
-/// record hickory refuses for its flags is skipped
-/// ([`past_unknown_nsec3_flags`]).
+/// opcode under which hickory reads empty RDATA. A record a validator
+/// ignores is read with its RDATA as octets ([`ignored_by_validators`]).
 fn read_section<'a>(
     bytes: &'a [u8],
     decoder: &mut BinDecoder<'a>,
@@ -234,8 +233,9 @@ fn read_section<'a>(
             // A TSIG record is the last in the message (RFC 8945 §5.1).
             return Err(DecodeError::RecordAfterSig);
         }
-        if let Some(past) = past_unknown_nsec3_flags(bytes, decoder) {
+        if let Some((record, past)) = ignored_by_validators(bytes, decoder) {
             *decoder = past;
+            section.records.push(record);
             continue;
         }
         let (records, edns, sig) = Message::read_records(decoder, 1, additional, OpCode::Update)?;
@@ -249,31 +249,66 @@ fn read_section<'a>(
     Ok(section)
 }
 
-/// A decoder of `bytes` past the record `decoder` is at, when that record
-/// is an NSEC3 or NSEC3PARAM record with a Flags bit set other than
-/// Opt-Out, which hickory refuses to read. The record is read as
-/// RFC 1035 §4.1.3 lays it out: its owner, TYPE, CLASS, TTL, and
-/// RDLENGTH, then RDATA, whose second octet is the Flags field
-/// (RFC 5155 §3.2, §4.2). `None` for any other record, or one that does
-/// not fit, which hickory then reads or refuses.
-fn past_unknown_nsec3_flags<'a>(
+/// The record `decoder`, a decoder of `bytes`, is at, with its RDATA as
+/// octets (RFC 3597 §5), and a decoder past it, when the RFCs have the
+/// record ignored as the rest of the message stands, which hickory would
+/// refuse, with the whole message, or read as a record to use:
+///
+/// - an NSEC3 record with a Hash Algorithm other than SHA-1, the one
+///   hickory reads, or a Flags bit set other than Opt-Out (RFC 5155 §8.1,
+///   §8.2);
+/// - an NSEC3PARAM record with a Hash Algorithm other than SHA-1, or any
+///   Flags bit set (RFC 5155 §4.1.2, §4.2);
+/// - a DNSKEY record whose Protocol field is not 3, which is no key
+///   (RFC 4034 §2.1.2).
+///
+/// The record keeps its place in its RRset, whose RRSIG covers it
+/// (RFC 4034 §3.1.8.1), and no code that reads the type's RDATA takes it.
+/// The record is read as RFC 1035 §4.1.3 lays it out: its owner, TYPE,
+/// CLASS, TTL, and RDLENGTH, then RDATA, which starts with the Hash
+/// Algorithm and Flags (RFC 5155 §3.2, §4.2) or the Flags and Protocol
+/// (RFC 4034 §2.1). `None` for any other record, or one that does not
+/// fit, which hickory then reads or refuses.
+fn ignored_by_validators<'a>(
     bytes: &'a [u8],
     decoder: &BinDecoder<'a>,
-) -> Option<BinDecoder<'a>> {
+) -> Option<(Record, BinDecoder<'a>)> {
     let mut ahead = BinDecoder::new(bytes);
     ahead.read_slice(decoder.index()).ok()?;
-    Name::read(&mut ahead).ok()?;
+    let owner = Name::read(&mut ahead).ok()?;
     let rtype = RecordType::from(ahead.read_u16().ok()?.unverified());
-    if !matches!(rtype, RecordType::NSEC3 | RecordType::NSEC3PARAM) {
-        return None;
-    }
-    // CLASS and TTL.
-    ahead.read_slice(6).ok()?;
+    let class = DNSClass::from(ahead.read_u16().ok()?.unverified());
+    let ttl = ahead.read_u32().ok()?.unverified();
     let length = ahead.read_u16().ok()?.unverified();
     let rdata = ahead.read_slice(usize::from(length)).ok()?.unverified();
-    let flags = *rdata.get(1)?;
-    (flags & 0b1111_1110 != 0).then_some(ahead)
+    let ignored = match rtype {
+        RecordType::NSEC3 => match rdata {
+            [algorithm, flags, ..] => *algorithm != SHA1 || flags & !OPT_OUT != 0,
+            _ => false,
+        },
+        RecordType::NSEC3PARAM => match rdata {
+            [algorithm, flags, ..] => *algorithm != SHA1 || *flags != 0,
+            _ => false,
+        },
+        RecordType::DNSKEY => rdata.get(2).is_some_and(|protocol| *protocol != 3),
+        _ => false,
+    };
+    if !ignored {
+        return None;
+    }
+    let data = RData::Unknown {
+        code: rtype,
+        rdata: NULL::with(rdata.to_vec()),
+    };
+    let mut record = Record::from_rdata(owner, ttl, data);
+    record.dns_class = class;
+    Some((record, ahead))
 }
+
+/// NSEC3 Hash Algorithm SHA-1 (RFC 5155 §11).
+const SHA1: u8 = 1;
+/// The NSEC3 Opt-Out flag, the one Flags bit RFC 5155 §3.1.2 defines.
+const OPT_OUT: u8 = 0b0000_0001;
 
 /// QTYPE TKEY, a meta-type for key agreement (RFC 2930 §2).
 const TKEY: u16 = 249;

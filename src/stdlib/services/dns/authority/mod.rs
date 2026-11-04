@@ -118,8 +118,9 @@ impl<A: Authority + ?Sized> Authority for Arc<A> {
 /// is hosted too and holds the cut, since the parent holds DS (RFC 4035
 /// §3.1.4.1). When that zone refers the question to a zone between them,
 /// the zone at the apex answers NODATA. A CNAME or DNAME chain that
-/// leaves its zone, or reaches a cut, for a name another hosted zone
-/// holds goes on in that zone, and the reply carries the whole chain and
+/// leaves its zone, reaches a cut, or reaches a name a hosted zone below
+/// its zone holds goes on in the deepest hosted zone that holds the name,
+/// and the reply carries the whole chain and
 /// the data it leads to, as step 1 searches every zone the server has
 /// (RFC 1034 §4.3.2 step 3a). A view that does not know a fact
 /// the reply needs never gives a negative: the server answers SERVFAIL.
@@ -213,8 +214,8 @@ fn respond_from(
 /// QNAME. Where a CNAME or DNAME chain goes past that zone, to a name
 /// another hosted zone holds, the answer goes on in that zone, as step 1
 /// searches every zone the server has (RFC 1034 §4.3.2 step 3a). `seen`
-/// holds the names the chain went on at, so that it stops at one it
-/// reaches again.
+/// holds the names the chain went on at: one it reaches again is a loop,
+/// answered SERVFAIL with the chain (RFC 1034 §3.6.2).
 fn respond_hosted(
     zones: &[Arc<dyn ZoneData>],
     zone: &dyn ZoneData,
@@ -225,17 +226,27 @@ fn respond_hosted(
 ) -> Step {
     let qname = LowerName::new(req.question.name());
     let qtype = req.question.query_type();
+    let hosted: Vec<LowerName> = zones.iter().map(|zone| zone.apex().clone()).collect();
     let answer_from = |zone: &dyn ZoneData, seen: &mut Vec<LowerName>| match answer_onward(
         &*zone.view(&req.question),
         req,
         server.any,
+        &hosted,
     ) {
         (Answered::Response(response), Some(onward)) => {
             let hosted =
                 deepest(zones, &onward.target, false).filter(|next| next.apex() != zone.apex());
-            let Some(next_zone) = hosted.filter(|_| !seen.contains(&onward.target)) else {
+            let Some(next_zone) = hosted else {
                 return Step::Reply(response);
             };
+            if seen.contains(&onward.target) {
+                // The chain came back to a name it passed: a loop, which
+                // is an error (RFC 1034 §3.6.2).
+                let mut looped = onward.chain;
+                looped.message.metadata.response_code = ResponseCode::ServFail;
+                looped.message.authorities.clear();
+                return Step::Reply(looped);
+            }
             seen.push(onward.target.clone());
             let mut next = req.clone();
             next.question.set_name(Name::from(&onward.target));

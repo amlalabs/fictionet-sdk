@@ -18,14 +18,10 @@ use tokio::runtime::Runtime;
 use tokio::task::AbortHandle;
 
 use fictionet::Cx;
-use fictionet::stdlib::protocols::dns::op::{Edns, Message, MessageType, OpCode, SerialMessage};
+use fictionet::stdlib::protocols::dns::op::{Message, SerialMessage};
 use fictionet::stdlib::protocols::dns::read_message;
 use fictionet::stdlib::services::dns::{Looked, Lookup};
 use fictionet::stdlib::world::net::dns::Upstream;
-
-/// The UDP payload size a lookup advertises: the size the DNS Flag Day
-/// 2020 settled on (RFC 6891 §6.2.5).
-const PAYLOAD: u16 = 1232;
 
 /// The internet's DNS servers, asked from this host.
 ///
@@ -92,7 +88,10 @@ impl Upstream for Internet {
         let mut id = [0; 2];
         fcx.fill_random(&mut id);
         let id = u16::from_be_bytes(id);
-        let query = query(id, &lookup);
+        let query = lookup
+            .query(id)
+            .to_vec()
+            .expect("a query of one question and an OPT record writes");
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let runtime = self
             .runtime
@@ -107,19 +106,6 @@ impl Upstream for Internet {
             receiver.await.unwrap_or(Looked::NoReply)
         })
     }
-}
-
-/// The query for `lookup` with `id`: its question without recursion, and
-/// an OPT record with DO set.
-fn query(id: u16, lookup: &Lookup) -> Vec<u8> {
-    let mut message = Message::new(id, MessageType::Query, OpCode::Query);
-    message.add_query(lookup.question.clone());
-    let mut edns = Edns::new();
-    edns.set_max_payload(PAYLOAD).set_dnssec_ok(true);
-    message.set_edns(edns);
-    message
-        .to_vec()
-        .expect("a query of one question and an OPT record writes")
 }
 
 /// What `lookup.server` gives `query`, whose ID is `id`: over UDP, and
@@ -191,7 +177,7 @@ impl Drop for Abort {
 mod tests {
     use super::*;
     use fictionet::Seed;
-    use fictionet::stdlib::protocols::dns::op::Query;
+    use fictionet::stdlib::protocols::dns::op::{OpCode, Query};
     use fictionet::stdlib::protocols::dns::rr::rdata::A;
     use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RData, Record, RecordType};
     use std::io::{Read, Write};
@@ -305,7 +291,7 @@ mod tests {
             assert_eq!(query.queries[0].name().to_ascii(), "www.example.test.");
             let edns = query.edns.expect("an OPT record");
             assert!(edns.flags().dnssec_ok);
-            assert_eq!(edns.max_payload(), PAYLOAD);
+            assert_eq!(edns.max_payload(), Lookup::PAYLOAD);
             assert!(edns.options().as_ref().is_empty());
         });
         server_thread.join().unwrap();

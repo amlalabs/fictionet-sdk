@@ -119,6 +119,7 @@ www.direct. 300 IN A 45.33.5.80
 whoami.direct. 300 IN A 45.70.0.9
 whoami.direct. 300 IN TXT \"45.70.0.9\"
 home.direct. 300 IN A 45.70.0.9
+whoami.v4.direct. 300 IN TXT \"45.70.0.9\"
 ";
 
 /// What the real hierarchy answers, played from fixed zones: each server
@@ -679,11 +680,11 @@ fn the_mirror_places_a_server_at_referral_glue_before_the_reply_leaves() {
     });
 }
 
-/// The mirror's server addresses are the root letters it was given and
-/// each server it places, which an observer already finds in the filing
-/// that placed it. An address answered for a web name is none of them.
+/// The mirror knows the names of its name servers, the targets of the NS
+/// RRsets it filed, before an observer sees the filing that named them.
+/// A web name at a name server's address is none of them.
 #[test]
-fn the_mirror_knows_its_server_addresses_before_observers_run() {
+fn the_mirror_knows_its_server_names_before_observers_run() {
     world(Duration::from_secs(60), |fcx| async move {
         let hierarchy = Hierarchy::new();
         let at = place();
@@ -691,19 +692,24 @@ fn the_mirror_knows_its_server_addresses_before_observers_run() {
         let net = Net::new().ipv4_only();
         let handle = net.handle();
         let ns = v4(45, 33, 5, 53);
+        let ns_name = LowerName::new(&Name::from_ascii("ns.direct.").unwrap());
+        let www = LowerName::new(&Name::from_ascii("www.direct.").unwrap());
         let mirror = mirror(hierarchy.clone(), handle.clone());
         let servers = mirror.servers();
         let seen: Arc<Mutex<Vec<bool>>> = Arc::default();
         let mirror = {
-            let (servers, seen) = (servers.clone(), seen.clone());
-            mirror.observe(move |_| seen.lock().unwrap().push(servers.contains(ns)))
+            let (servers, seen, ns_name) = (servers.clone(), seen.clone(), ns_name.clone());
+            mirror.observe(move |_| {
+                seen.lock()
+                    .unwrap()
+                    .push(servers.named(Generation(0), &ns_name))
+            })
         };
         net.hosts(at.root_servers(|s| mirror.server(s)))
             .start(&fcx, attachments)?;
         let m = machine(&fcx, attacher.attach("client")?, ME);
         let a_root = ROOT_SERVERS[0].v4;
-        assert!(servers.contains(a_root.into()));
-        assert!(!servers.contains(ns));
+        assert!(!servers.named(Generation(0), &ns_name));
 
         ask(
             &fcx,
@@ -718,13 +724,13 @@ fn the_mirror_knows_its_server_addresses_before_observers_run() {
             !seen.is_empty() && seen.iter().all(|&known| known),
             "{seen:?}"
         );
-        assert!(servers.contains(ns));
 
         let reply = ask(&fcx, &m, ns, &query(2, "www.direct.", RecordType::A, false))
             .await
             .expect("an answer");
         assert_eq!(addresses(&reply), vec![v4(45, 33, 5, 80)]);
-        assert!(!servers.contains(v4(45, 33, 5, 80)));
+        assert!(servers.named(Generation(0), &ns_name));
+        assert!(!servers.named(Generation(0), &www));
         Ok(())
     });
 }
@@ -1314,8 +1320,10 @@ fn whoami_names_are_answered_from_the_egress_and_never_looked_up() {
 /// a public resolver's own egress, not the world's: `whoami.direct` plays
 /// such a server, answering with the address the upstream asks from.
 /// Every public resolver shows its own IPv4 egress, and none shows the
-/// world's. `home.direct` is real data that holds the upstream's address,
-/// and every resolver answers it as the real server does.
+/// world's, also in the TXT string of `whoami.v4.direct`, a name the echo
+/// was not given, as `whoami.v4.powerdns.org` gives it. `home.direct` is
+/// an A record of real data that holds the upstream's address, and every
+/// resolver answers it as the real server does.
 #[test]
 fn an_echoed_address_is_the_public_resolvers_egress() {
     world(Duration::from_secs(60), |fcx| async move {
@@ -1366,6 +1374,15 @@ fn an_echoed_address_is_the_public_resolvers_egress() {
                 &m,
                 address,
                 &query(id + 1, "whoami.direct.", RecordType::TXT, true),
+            )
+            .await
+            .expect("an answer");
+            assert_eq!(texts(&reply), vec![seen.to_string()], "{address}");
+            let reply = ask(
+                &fcx,
+                &m,
+                address,
+                &query(id + 200, "whoami.v4.direct.", RecordType::TXT, true),
             )
             .await
             .expect("an answer");

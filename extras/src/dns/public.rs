@@ -39,7 +39,7 @@ use fictionet::Cx;
 use fictionet::stdlib::protocols::dns::dnssec::AlgorithmPolicy;
 use fictionet::stdlib::protocols::dns::op::Query;
 use fictionet::stdlib::protocols::dns::rr::rdata::svcb::{SvcParamKey, SvcParamValue};
-use fictionet::stdlib::protocols::dns::rr::rdata::{SVCB, TXT};
+use fictionet::stdlib::protocols::dns::rr::rdata::{A, SVCB, TXT};
 use fictionet::stdlib::protocols::dns::rr::{
     LowerName, Name, RData, Record, RecordSet, RecordType,
 };
@@ -244,7 +244,7 @@ pub const PUBLIC_RESOLVERS: [PublicResolver; 4] = [
         certified: &[],
         fallback: doh::opendns,
         config: opendns,
-        whoami: no_whoami,
+        whoami: opendns_whoami,
     },
 ];
 
@@ -461,6 +461,12 @@ fn cloudflare_whoami(mut config: Config, _site: &ResolverSite, egress: Ipv4Addr)
     config
 }
 
+/// OpenDNS, answering `myip.opendns.com` A with the network's egress
+/// address, the address the real one would see the question come from.
+fn opendns_whoami(config: Config, _site: &ResolverSite, egress: Ipv4Addr) -> Config {
+    config.local(plain(Arc::new(myip(egress))))
+}
+
 /// A resolver with no whoami names of its own.
 fn no_whoami(config: Config, _site: &ResolverSite, _egress: Ipv4Addr) -> Config {
     config
@@ -491,6 +497,33 @@ fn myaddr(google: IpAddr, egress: Ipv4Addr) -> Shown {
     txt.set_records(records.to_vec());
     Shown::new(&owner, [txt]).expect("the TXT RRset is owned by o-o.myaddr.l.google.com")
 }
+
+/// `myip.opendns.com` as OpenDNS's resolver answers it for a client
+/// behind `egress`, as seen on 2026-11-04: A with that address, and TXT
+/// with the line that says what to ask, each with TTL 0 and AA clear. The
+/// zone knows nothing else there, so AAAA, every other type, and every
+/// name below are asked of the real hierarchy, as the real resolver does.
+fn myip(egress: Ipv4Addr) -> Shown {
+    const TTL: u32 = 0;
+    let owner = name(MYIP);
+    let set = |data: RData| {
+        let mut set = RecordSet::with_ttl(owner.clone(), data.record_type(), TTL);
+        set.set_records(vec![Record::from_rdata(owner.clone(), TTL, data)]);
+        set
+    };
+    let help = "Query A or AAAA for your source address as seen by the resolver";
+    Shown::new(
+        &owner,
+        [
+            set(RData::A(A(egress))),
+            set(RData::TXT(TXT::new(vec![help.to_owned()]))),
+        ],
+    )
+    .expect("the RRsets are owned by myip.opendns.com")
+}
+
+/// OpenDNS's name for asking which address a question came from.
+const MYIP: &str = "myip.opendns.com.";
 
 /// Google's name for asking which address a question came from.
 const MYADDR: &str = "o-o.myaddr.l.google.com.";

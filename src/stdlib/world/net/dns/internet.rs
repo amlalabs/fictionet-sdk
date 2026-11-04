@@ -334,24 +334,24 @@ impl Mirror {
         self.inner.server(server)
     }
 
-    /// The addresses the mirror's name servers answer at, those given
-    /// with [`serves`](Self::serves) and those it places, as it learns
-    /// them. A server is placed before the observers see the filing
-    /// that named it, so an observer finds its address here.
+    /// The names of the mirror's name servers, as it learns them: the
+    /// targets of the NS RRsets its copies file. A filing's targets are
+    /// known before the observers see it.
     pub fn servers(&self) -> Servers {
-        Servers(self.inner.copies.clone())
+        Servers(self.inner.named.clone())
     }
 }
 
-/// The addresses a [`Mirror`]'s name servers answer at
-/// ([`Mirror::servers`]).
+/// The names of a [`Mirror`]'s name servers ([`Mirror::servers`]).
 #[derive(Clone)]
-pub struct Servers(Arc<Copies>);
+pub struct Servers(Arc<PerSession<Named>>);
 
 impl Servers {
-    /// Whether a name server of the mirror answers at `addr`.
-    pub fn contains(&self, addr: IpAddr) -> bool {
-        self.0.serves_any(addr)
+    /// Whether `name` names a name server in session `generation`: the
+    /// target of an NS RRset the mirror's copies filed in it.
+    pub fn named(&self, generation: Generation, name: &LowerName) -> bool {
+        self.0
+            .with(generation, |named| named.targets.contains_key(name))
     }
 }
 
@@ -516,10 +516,13 @@ impl Authority for Mirrored {
 /// counterpart asks that server from another IPv4 address, its egress,
 /// would be shown that address instead. So a reply to a client given with
 /// [`client`](Echo::client) carries its egress in place of the
-/// upstream's, in an unsigned A record and in a TXT string, at the names
-/// given with [`name`](Echo::name), whose servers echo the asker. A record
-/// at any other name that holds the upstream's address is real data, and
-/// is left alone. The copied record stays as the real server sent it; the
+/// upstream's: in an unsigned TXT string that is the upstream's address,
+/// at any name, since a zone's own text names no single asker's address,
+/// and in an unsigned A record at the names given with
+/// [`name`](Echo::name), whose servers echo the asker. An A record at any
+/// other name that holds the upstream's address is real data, such as a
+/// site on the host's own address, and is left alone. The copied record
+/// stays as the real server sent it; the
 /// address is put in as the reply leaves, since it depends on who asked.
 /// A world adds it with [`Mirror::wrap`] and [`Echo::over`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -548,7 +551,7 @@ impl Echo {
         self
     }
 
-    /// Echoes the asker's address in the records at `name`, whose real
+    /// Echoes the asker's address in the A records at `name`, whose real
     /// servers answer with the address a question came from.
     pub fn name(mut self, name: &Name) -> Echo {
         self.names.insert(LowerName::new(name));
@@ -606,8 +609,8 @@ impl Authority for Echoed {
 }
 
 /// Puts `seen` in place of `egress` where `message`'s answer echoes the
-/// address a question came from, at one of `names`: an A record holding
-/// `egress`, and a TXT string that is `egress`. An RRset its RRSIGs cover
+/// address a question came from: a TXT string that is `egress`, and an A
+/// record holding `egress` at one of `names`. An RRset its RRSIGs cover
 /// is left as it is.
 fn echo(message: &mut Message, names: &HashSet<LowerName>, egress: Ipv4Addr, seen: Ipv4Addr) {
     let signed: Vec<(Name, RecordType)> = message
@@ -622,13 +625,12 @@ fn echo(message: &mut Message, names: &HashSet<LowerName>, egress: Ipv4Addr, see
         .collect();
     let text = egress.to_string();
     for record in &mut message.answers {
-        if !names.contains(&LowerName::new(&record.name))
-            || signed.contains(&(record.name.clone(), record.record_type()))
-        {
+        if signed.contains(&(record.name.clone(), record.record_type())) {
             continue;
         }
+        let named = names.contains(&LowerName::new(&record.name));
         match &mut record.data {
-            RData::A(a) if a.0 == egress => a.0 = seen,
+            RData::A(a) if a.0 == egress && named => a.0 = seen,
             RData::TXT(txt) if txt.txt_data.iter().any(|s| **s == *text.as_bytes()) => {
                 let strings = txt.txt_data.iter().map(|s| {
                     if **s == *text.as_bytes() {

@@ -80,10 +80,11 @@ pub enum AnyResponse {
 ///    YXDOMAIN when the new name would pass 255 octets (RFC 6672 §2.2,
 ///    §3.1).
 /// 4. A node at QNAME: its RRset with AA set. A CNAME starts the walk
-///    again at its target, inside this zone only, and the chain stops at
-///    the first name it has seen before (RFC 1034 §4.3.2 step 3a). Where
-///    it leaves the zone, [`answer_onward`] says so, for a server that
-///    hosts other zones to go on. QTYPE
+///    again at its target, inside this zone only (RFC 1034 §4.3.2 step
+///    3a). A chain that comes back to a name it has seen is a loop, an
+///    error (RFC 1034 §3.6.2): SERVFAIL, with AA and the chain. Where
+///    it leaves the zone, or reaches a zone below it that the server also
+///    hosts, [`answer_onward`] says so, for the server to go on. QTYPE
 ///    NSEC gets the NSEC the zone holds at the name, in its node or not.
 ///    No RRset of QTYPE, or an empty non-terminal: NODATA with the SOA.
 /// 5. No node at QNAME: the wildcard at the closest encloser, unless a
@@ -107,15 +108,16 @@ pub enum AnyResponse {
 /// are QNAME in lowercase; the server front gives them the question's case
 /// (RFC 4343 §4.1). A QNAME outside the zone gets REFUSED.
 pub fn answer(view: &dyn View, req: &Request, any: AnyResponse) -> Answered {
-    answer_onward(view, req, any).0
+    answer_onward(view, req, any, &[]).0
 }
 
 /// Where a CNAME or DNAME chain went past the zone an answer came from.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Onward {
-    /// The name the chain reached: a target outside the zone, or a name
-    /// the zone refers to a cut. A server that hosts a zone that holds it
-    /// goes on there, back at step 1 (RFC 1034 §4.3.2 step 3a).
+    /// The name the chain reached: a target outside the zone, a name the
+    /// zone refers to a cut, or a name in a zone below it that the server
+    /// also hosts. The server goes on in the zone nearest the name, back
+    /// at step 1 (RFC 1034 §4.3.2 step 3a).
     pub target: LowerName,
     /// The reply holding the chain up to `target` alone: its CNAME and
     /// DNAME records, with AA, and the denial records its wildcard
@@ -124,13 +126,18 @@ pub struct Onward {
 }
 
 /// [`answer`], and where the chain of a reply that followed a CNAME or
-/// DNAME went past the zone, if it did: out of it, or to a referral.
+/// DNAME went past the zone, if it did: out of it, to a referral, or to a
+/// name below one of `hosted`, the apexes of the zones the server hosts,
+/// that is below the view's apex. Step 1 answers from the zone nearest
+/// the name (RFC 1034 §4.3.2), so the chain goes on there, though the
+/// zone above may hold no cut for it.
 /// [`Zones`](super::super::authority::Zones) goes on from there in the
 /// zones it hosts.
 pub fn answer_onward(
     view: &dyn View,
     req: &Request,
     any: AnyResponse,
+    hosted: &[LowerName],
 ) -> (Answered, Option<Onward>) {
     let qname = LowerName::new(req.question.name());
     let qtype = req.question.query_type();
@@ -140,6 +147,7 @@ pub fn answer_onward(
         qtype,
         dnssec_ok,
         any,
+        hosted,
     };
     match walk.chase(qname) {
         Ok((found, onward)) => {
@@ -218,6 +226,7 @@ pub(super) fn resolve(
         qtype,
         dnssec_ok,
         any,
+        hosted: &[],
     };
     walk.chase(qname.clone()).map(|(found, _)| found)
 }
@@ -262,9 +271,20 @@ struct Walk<'v> {
     qtype: RecordType,
     dnssec_ok: bool,
     any: AnyResponse,
+    /// The apexes of the zones the server hosts.
+    hosted: &'v [LowerName],
 }
 
 impl<'v> Walk<'v> {
+    /// Whether `target`, a name in the zone, is in a zone below it that
+    /// the server hosts too.
+    fn hosted_below(&self, target: &LowerName) -> bool {
+        let apex = self.view.apex();
+        self.hosted
+            .iter()
+            .any(|hosted| hosted != apex && apex.zone_of(hosted) && hosted.zone_of(target))
+    }
+
     /// The node at `name`: `None` when known absent, or the end of the
     /// answer when unknown.
     fn get(&self, name: &LowerName) -> Result<Option<&'v Node>, LowerName> {
@@ -345,8 +365,10 @@ impl<'v> Walk<'v> {
         Ok(Loc::Node(node))
     }
 
-    /// Follows CNAMEs inside the zone, stopping at the first repeated
-    /// name or at a target outside the zone (RFC 1034 §4.3.2 step 3a).
+    /// Follows CNAMEs inside the zone, stopping at a target outside the
+    /// zone or in a zone below it the server hosts (RFC 1034 §4.3.2 step
+    /// 3a), or with SERVFAIL at the first repeated name: a loop is an
+    /// error (RFC 1034 §3.6.2).
     /// The RCODE is the last name's (RFC 6604 §2). An RRset the chain
     /// reaches twice, such as a DNAME it passes again, goes out once
     /// (RFC 2181 §5). With the answer, the name the chain went past the
@@ -387,9 +409,15 @@ impl<'v> Walk<'v> {
                     proofs.extend(proof);
                     let looped = target == name || seen.contains(&target);
                     if looped {
-                        return Ok((chain(&answer, &proofs), None));
+                        // A CNAME loop is an error (RFC 1034 §3.6.2):
+                        // SERVFAIL, with the chain as far as the loop.
+                        let failed = Found {
+                            answer: unique(answer.into_iter()),
+                            ..Found::new(ResponseCode::ServFail, true)
+                        };
+                        return Ok((failed, None));
                     }
-                    if !self.view.apex().zone_of(&target) {
+                    if !self.view.apex().zone_of(&target) || self.hosted_below(&target) {
                         let found = chain(&answer, &proofs);
                         return Ok((found.clone(), Some((target, found))));
                     }

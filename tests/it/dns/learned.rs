@@ -28,7 +28,7 @@ use fictionet::stdlib::services::dns::authority::{
     Authority, AuthorityEngine, Copies, ServerConfig, Step, Zones,
 };
 use fictionet::stdlib::services::dns::zone::{
-    Answered, AnyResponse, Denial, Filing, Learned, Section, Zone, ZoneData, answer,
+    Answered, AnyResponse, Denial, Denied, Fact, Filing, Learned, Section, Zone, ZoneData, answer,
 };
 use fictionet::stdlib::services::dns::{
     Action, Client, ClientQuery, Engine, Generation, Input, Looked, Lookup, WallClock,
@@ -1519,6 +1519,53 @@ ns.lame.example. 3600 IN A 192.0.2.53
     }
 }
 
+/// An address noted for the root, whose real server serves only the
+/// signed `example` below it, answers each question as that server does
+/// in every order: a refusal in the root does not hide the child zone
+/// the server serves (RFC 1034 §4.3.2 step 2, RFC 8906 §3.1.1).
+#[test]
+fn a_lame_address_finds_the_child_its_server_serves_in_any_order() {
+    let real = Zones::new(vec![
+        Arc::new(signed_master(EXAMPLE, Denial::Nsec)) as Arc<dyn ZoneData>
+    ]);
+    let answer = |lookup: &Lookup| reply_of(&real, lookup);
+    let local: SocketAddr = "192.0.2.53:53".parse().unwrap();
+    let client = Client {
+        peer: "198.51.100.7:5353".parse().unwrap(),
+        local,
+        transport: Transport::Udp,
+        connection: None,
+        sandbox: None,
+    };
+    let want =
+        |request: &Request| match real.respond(request, local, &ServerConfig::generic(), &client) {
+            Step::Reply(response) => response.message,
+            step => panic!("the real server gave {step:?}"),
+        };
+    let questions = [
+        request("foo.", RecordType::A, false),
+        request("www.example.", RecordType::A, false),
+        request("www.example.", RecordType::A, true),
+        request("nx.example.", RecordType::A, true),
+    ];
+    for order in [[0, 1, 2, 3], [1, 0, 3, 2], [3, 2, 1, 0]] {
+        let copies = Copies::new();
+        copies.serves(local.ip(), &lower("."));
+        for round in 0..2 {
+            for at in order {
+                let asked = &questions[at];
+                let (got, _) = through(&copies, &answer, local, asked);
+                assert_eq!(
+                    shape(&got),
+                    shape(&want(asked)),
+                    "{:?}, order {order:?}, round {round}",
+                    asked.question
+                );
+            }
+        }
+    }
+}
+
 /// A real server that stops a chain early, as BIND does at the CNAME a
 /// DNAME makes for a CNAME question, and as it answers NODATA for NSEC at
 /// a CNAME in an NSEC3 zone: the copy goes on where the chain leads, as
@@ -1582,6 +1629,136 @@ a.target.example. 300 IN A 192.0.2.41
     let nsec = request("alias.example.", RecordType::NSEC, true);
     let (got, _) = through(&copies, &stopping, local, &nsec);
     assert_eq!(shape(&got), shape(&real(&zone, &nsec)));
+}
+
+/// A CNAME loop is an error (RFC 1034 §3.6.2): the real server answers
+/// SERVFAIL with the chain, and its copy answers every question at the
+/// loop with the same RCODE and records, in any order of questions.
+#[test]
+fn a_copy_answers_a_cname_loop_as_its_server_does() {
+    let text = format!(
+        "{EXAMPLE}\
+self.example. 300 IN CNAME self.example.
+loop1.example. 300 IN CNAME loop2.example.
+loop2.example. 300 IN CNAME loop1.example.
+"
+    );
+    let real = Zones::new(vec![
+        Arc::new(Zone::from_master(&text, None).unwrap()) as Arc<dyn ZoneData>
+    ]);
+    let answer = |lookup: &Lookup| reply_of(&real, lookup);
+    let local: SocketAddr = "192.0.2.53:53".parse().unwrap();
+    let questions = [
+        request("self.example.", RecordType::A, true),
+        request("self.example.", RecordType::CNAME, true),
+        request("loop1.example.", RecordType::A, true),
+        request("loop2.example.", RecordType::TXT, true),
+        request("loop2.example.", RecordType::CNAME, true),
+    ];
+    for order in [[0, 1, 2, 3, 4], [1, 0, 4, 3, 2], [4, 2, 3, 1, 0]] {
+        let copies = Copies::new();
+        copies.serves(local.ip(), &lower("example."));
+        for round in 0..2 {
+            for at in order {
+                let asked = &questions[at];
+                let (got, _) = through(&copies, &answer, local, asked);
+                let want = answer(&own(local, asked));
+                assert_eq!(
+                    shape(&got),
+                    shape(&want),
+                    "{:?}, order {order:?}, round {round}",
+                    asked.question
+                );
+            }
+        }
+    }
+    let want = answer(&own(local, &questions[0]));
+    assert_eq!(want.metadata.response_code, ResponseCode::ServFail);
+}
+
+/// A real server that answers NSEC at a CNAME, or at a name a wildcard
+/// CNAME answers for, with NODATA, as BIND does in an NSEC3 zone, though
+/// its denial records show the CNAME there. Without an NSEC RRset beside
+/// it the CNAME is followed (RFC 1034 §4.3.2 step 3a, RFC 4035 §2.5), so
+/// the copy asks for the CNAME and answers every question as the RFCs do,
+/// in any order of questions.
+#[test]
+fn a_copy_follows_an_alias_its_server_stopped_at_for_nsec() {
+    let text = format!(
+        "{EXAMPLE}*.wc.example. 300 IN CNAME www.example.
+"
+    );
+    let zone = signed_master(
+        &text,
+        Denial::Nsec3 {
+            opt_out: false,
+            salt: Vec::new(),
+        },
+    );
+    let zones = Zones::new(vec![Arc::new(zone.clone()) as Arc<dyn ZoneData>]);
+    let soa: Vec<Record> = real(&zone, &request("example.", RecordType::SOA, true)).answers;
+    // The NSEC3 records of every proof such a NODATA may need, which
+    // show the CNAME at the name or at the wildcard in their type bitmaps.
+    let view = zone.view(&Query::query(name("example."), RecordType::NSEC));
+    let wc = lower("wc.example.");
+    let mut nsec3: Vec<Record> = Vec::new();
+    for (owner, kind) in [
+        ("y.wc.example.", Denied::Name),
+        (
+            "y.wc.example.",
+            Denied::Wildcard {
+                closest_encloser: wc,
+            },
+        ),
+        ("*.wc.example.", Denied::Type(RecordType::NSEC)),
+        ("alias.example.", Denied::Type(RecordType::NSEC)),
+    ] {
+        let Fact::Present(sets) = view.denial(&lower(owner), kind) else {
+            panic!("{owner}: the zone proves it");
+        };
+        for record in sets.iter().flat_map(|set| set.records(true)) {
+            if !nsec3.contains(record) {
+                nsec3.push(record.clone());
+            }
+        }
+    }
+    let stopping = |lookup: &Lookup| {
+        let mut message = reply_of(&zones, lookup);
+        let cname = message
+            .answers
+            .first()
+            .is_some_and(|record| record.record_type() == RecordType::CNAME);
+        if lookup.question.query_type() == RecordType::NSEC && cname {
+            message.answers.clear();
+            message.authorities = soa.iter().chain(&nsec3).cloned().collect();
+        }
+        message
+    };
+    let local: SocketAddr = "192.0.2.53:53".parse().unwrap();
+    let questions = [
+        request("y.wc.example.", RecordType::NSEC, true),
+        request("y.wc.example.", RecordType::CNAME, true),
+        request("*.wc.example.", RecordType::NSEC, true),
+        request("alias.example.", RecordType::NSEC, true),
+        request("alias.example.", RecordType::A, true),
+        request("y.wc.example.", RecordType::NSEC, false),
+    ];
+    for order in [[0, 1, 2, 3, 4, 5], [4, 2, 1, 0, 5, 3], [5, 3, 4, 2, 0, 1]] {
+        let copies = Copies::new();
+        copies.serves(local.ip(), &lower("example."));
+        for round in 0..2 {
+            for at in order {
+                let asked = &questions[at];
+                let (got, _) = through(&copies, &stopping, local, asked);
+                assert_eq!(
+                    shape(&got),
+                    shape(&real(&zone, asked)),
+                    "{:?}, order {order:?}, round {round}",
+                    asked.question
+                );
+            }
+        }
+    }
 }
 
 /// `child.example` as its own zone, with a cut of its own at

@@ -239,7 +239,9 @@ theorem chase_nx {look : Name → Fact Node} {apex : Name} {soa : RRset} {any : 
       exact step_nx hs rfl
     · split at h
       · cases h; cases hr
-      · exact ih _ _ _ _ h hr
+      · split at h
+        · cases h; cases hr
+        · exact ih _ _ _ _ h hr
 
 /-- NXDOMAIN from any view rests on a name the view read absent. -/
 theorem answer_nx {look : Name → Fact Node} {apex : Name} {soa : RRset} {any : AnyResponse} {req : Request}

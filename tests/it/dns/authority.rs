@@ -903,8 +903,9 @@ fn a_chaos_zone_answers_from_its_records() {
 /// carries the chain and the target's data with AA, and no referral back
 /// to the server itself, as step 1 searches every zone the server has
 /// (RFC 1034 §4.3.2 step 3a). A chain that comes back to a name it passed
-/// stops there, and one whose target no hosted zone holds ends with its
-/// CNAME.
+/// is a loop, answered SERVFAIL with the chain (RFC 1034 §3.6.2), within
+/// one zone or across two, and one whose target no hosted zone holds ends
+/// with its CNAME.
 #[test]
 fn a_chain_goes_on_in_the_other_zones_the_server_hosts() {
     let master = |text: &str| Zone::from_master(text, None).unwrap();
@@ -917,6 +918,7 @@ alias.example. 300 IN CNAME www.other.
 inchild.example. 300 IN CNAME www.child.example.
 back.example. 300 IN CNAME loop.other.
 away.example. 300 IN CNAME www.elsewhere.
+self.example. 300 IN CNAME self.example.
 child.example. 3600 IN NS ns.example.
 ",
     );
@@ -941,9 +943,11 @@ www.child.example. 300 IN A 192.0.2.91
             .map(|record| format!("{} {} {}", record.name, record.record_type(), record.data))
             .collect()
     };
-    let cases: [(&str, &[&str]); 4] = [
+    use ResponseCode::{NoError, ServFail};
+    let cases: [(&str, ResponseCode, &[&str]); 5] = [
         (
             "inchild.example.",
+            NoError,
             &[
                 "inchild.example. CNAME www.child.example.",
                 "www.child.example. A 192.0.2.91",
@@ -951,18 +955,29 @@ www.child.example. 300 IN A 192.0.2.91
         ),
         (
             "alias.example.",
+            NoError,
             &["alias.example. CNAME www.other.", "www.other. A 192.0.2.90"],
         ),
         (
             "back.example.",
+            ServFail,
             &[
                 "back.example. CNAME loop.other.",
                 "loop.other. CNAME back.example.",
             ],
         ),
-        ("away.example.", &["away.example. CNAME www.elsewhere."]),
+        (
+            "away.example.",
+            NoError,
+            &["away.example. CNAME www.elsewhere."],
+        ),
+        (
+            "self.example.",
+            ServFail,
+            &["self.example. CNAME self.example."],
+        ),
     ];
-    for (qname, want) in cases {
+    for (qname, rcode, want) in cases {
         let mut engine = AuthorityEngine::new(
             zones(vec![example.clone(), other.clone(), child.clone()]),
             ServerConfig::generic(),
@@ -973,11 +988,7 @@ www.child.example. 300 IN A 192.0.2.91
             &query(qname, RecordType::A, |_| {}),
             Transport::Udp,
         ));
-        assert_eq!(
-            reply.metadata.response_code,
-            ResponseCode::NoError,
-            "{qname}"
-        );
+        assert_eq!(reply.metadata.response_code, rcode, "{qname}");
         assert!(reply.metadata.authoritative, "{qname}");
         assert_eq!(texts(&reply.answers), want, "{qname}");
         assert!(
@@ -1684,6 +1695,72 @@ fn a_learned_server_looks_up_what_it_lacks_and_answers_from_what_it_filed() {
     let other = query("www.example.test.", RecordType::AAAA, |_| {});
     let actions = ask_with(&mut engine, &other, Transport::Udp);
     assert_eq!(kinds(&actions), ["query", "lookup"]);
+}
+
+/// A real server that serves `example.test` and its child
+/// `sub.example.test` follows an alias into the child from the child's
+/// data, as step 1 searches every zone it holds (RFC 1034 §4.3.2 step
+/// 3a). A copy of it answers the alias with the chain, whether or not it
+/// was noted for the child: it never stays silent.
+#[test]
+fn a_learned_alias_into_a_child_its_server_serves_is_answered() {
+    let alias = || {
+        Record::from_rdata(
+            name("alias3.example.test."),
+            300,
+            RData::CNAME(CNAME(name("www.sub.example.test."))),
+        )
+    };
+    let target = || Record::from_rdata(name("www.sub.example.test."), 300, a("192.0.2.20"));
+    let child_ns =
+        || Record::from_rdata(name("sub.example.test."), 3600, ns("ns1.sub.example.test."));
+    for noted in [
+        &["example.test."][..],
+        &["example.test.", "sub.example.test."],
+    ] {
+        let mut engine = AuthorityEngine::new(learned(noted), ServerConfig::generic(), local());
+        let message = query("alias3.example.test.", RecordType::A, |_| {});
+        let mut actions = ask_with(&mut engine, &message, Transport::Udp);
+        let mut asked = Vec::new();
+        while let [(token, lookup)] = lookups(&actions).as_slice() {
+            let (token, lookup) = (*token, lookup.clone());
+            assert!(!asked.contains(&lookup), "{noted:?}: {lookup:?} again");
+            let real = real_response(&lookup, |m| {
+                if lookup.question.name().to_ascii() == "alias3.example.test." {
+                    m.add_answer(alias());
+                } else {
+                    // The child's data, with the child's NS RRset in the
+                    // authority section, as BIND sends it.
+                    m.add_answer(target());
+                    m.add_authority(child_ns());
+                }
+            });
+            asked.push(lookup);
+            actions = run(&mut engine, looked(token, real), Instant::ZERO);
+        }
+        let reply = the_answer(&actions);
+        assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+        assert!(reply.metadata.authoritative);
+        assert_eq!(
+            reply
+                .answers
+                .iter()
+                .map(|r| r.data.clone())
+                .collect::<Vec<_>>(),
+            [alias().data, target().data],
+            "{noted:?}"
+        );
+        let zones: Vec<String> = asked.iter().map(|lookup| lookup.zone.to_string()).collect();
+        assert_eq!(
+            zones.last().map(String::as_str),
+            Some(if noted.len() == 2 {
+                "sub.example.test."
+            } else {
+                "example.test."
+            }),
+            "{noted:?}: the target is asked in {zones:?}"
+        );
+    }
 }
 
 #[test]

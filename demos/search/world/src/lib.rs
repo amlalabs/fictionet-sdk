@@ -281,7 +281,7 @@ struct Sites {
     /// The IPv4 addresses the mirrored zones filed for each name this
     /// session, its own or those at the end of its CNAME chain.
     addresses: PerSession<HashMap<LowerName, HashSet<Ipv4Addr>>>,
-    /// The addresses the mirror's name servers answer at.
+    /// The names of the mirror's name servers.
     servers: Servers,
 }
 
@@ -304,9 +304,11 @@ impl Sites {
     /// whose port 443 already serves the world's infrastructure, keeps no
     /// machine for the name. So does a public resolver's address, whose
     /// port 443 answers every name with its DNS over HTTPS front, as
-    /// `1dot1dot1dot1.cloudflare-dns.com` at 1.1.1.1 does. So does an
-    /// address where the mirror runs a name server, such as a root
-    /// letter's: the real servers there serve DNS and no web site. A name the
+    /// `1dot1dot1dot1.cloudflare-dns.com` at 1.1.1.1 does. The name of a
+    /// name server, such as a root letter's, gets no machine: it names a
+    /// server of DNS, not of a web site. Any other name at a name server's
+    /// address gets its site there, as a small domain often runs its web
+    /// site and its name server on one machine. A name the
     /// session resolves but does not serve, outside Live-Depth's depth,
     /// gets no site: a machine there with no services refuses connections
     /// at TCP.
@@ -318,19 +320,16 @@ impl Sites {
                 .filter(|(section, _)| *section == Section::Answer)
                 .flat_map(|(_, set)| set.records_without_rrsigs())
         };
+        let generation = self.pages.namespace().current().generation;
         let mut found: Vec<(LowerName, Ipv4Addr)> = answers()
             .filter_map(|record| match &record.data {
-                RData::A(a)
-                    if !non_public_address(a.0.into())
-                        && !resolver_address(a.0)
-                        && !self.servers.contains(a.0.into()) =>
-                {
-                    Some((LowerName::new(&record.name), a.0))
+                RData::A(a) if !non_public_address(a.0.into()) && !resolver_address(a.0) => {
+                    let name = LowerName::new(&record.name);
+                    (!self.servers.named(generation, &name)).then_some((name, a.0))
                 }
                 _ => None,
             })
             .collect();
-        let generation = self.pages.namespace().current().generation;
         let placing = self.addresses.with(generation, |addresses| {
             for (name, addr) in &found {
                 addresses.entry(name.clone()).or_default().insert(*addr);

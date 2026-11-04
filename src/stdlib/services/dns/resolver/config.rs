@@ -70,7 +70,8 @@ pub struct Config {
     /// How much one client question may cost (RFC 1034 §5.3.3).
     pub work: Work,
     /// How long a failed resolution is answered from the cache
-    /// (RFC 9520 §3.2: at least 1 second and at most 300).
+    /// (RFC 9520 §3.2: at least 1 second and at most 300). A failure that
+    /// persists is answered twice as long each time, up to 300 seconds.
     pub failure_ttl: Duration,
     /// The longest any data is cached (RFC 8767 §4: at most 604800
     /// seconds).

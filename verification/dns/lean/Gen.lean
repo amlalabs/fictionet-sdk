@@ -105,7 +105,8 @@ def charString (s : List Nat) : String :=
 def typeStr : Nat → String
   | 1 => "A" | 2 => "NS" | 3 => "MD" | 4 => "MF" | 5 => "CNAME" | 6 => "SOA" | 7 => "MB" | 8 => "MG"
   | 9 => "MR" | 12 => "PTR" | 13 => "HINFO" | 14 => "MINFO" | 15 => "MX" | 16 => "TXT" | 28 => "AAAA"
-  | 33 => "SRV" | 39 => "DNAME" | 41 => "OPT" | 43 => "DS" | 251 => "IXFR" | 252 => "AXFR"
+  | 33 => "SRV" | 39 => "DNAME" | 41 => "OPT" | 43 => "DS" | 46 => "RRSIG" | 47 => "NSEC" | 48 => "DNSKEY"
+  | 50 => "NSEC3" | 251 => "IXFR" | 252 => "AXFR"
   | 253 => "MAILB" | 254 => "MAILA" | 255 => "ANY"
   | t => "TYPE" ++ toString t
 
@@ -275,7 +276,7 @@ def rRData (t : Nat) : G RData := do
     return .octets ((← rBytes 6) ++ Dnssec.Symbolic.wire (← rName 3 true))
   | _ => do let n ← rRange 0 12; return .octets (← rBytes n)
 
-def rType : G Nat := pick #[1, 1, 28, 2, 5, 15, 6, 12, 16, 33, 65280]
+def rType : G Nat := pick #[1, 1, 28, 2, 5, 15, 6, 12, 16, 33, 65280, 48, 50, 50, 51]
 
 def rRR (owner : Option Name) (t : Option Nat) : G RR := do
   let t ← match t with | some t => pure t | none => rType
@@ -652,11 +653,7 @@ def base64 (bs : List Nat) : String := String.ofList (b64go bs)
 def b32hex (n : Nat) : String :=
   String.ofList ((List.range 32).map fun i => "0123456789abcdefghijklmnopqrstuv".toList[n / 2 ^ (155 - 5 * i) % 32]!)
 
-def dnssecTypeStr : Nat → String
-  | 46 => "RRSIG" | 47 => "NSEC" | 48 => "DNSKEY" | 50 => "NSEC3"
-  | t => typeStr t
-
-def bitmapStr (ts : List Nat) : String := " ".intercalate ((sortBy (· < ·) ts).map dnssecTypeStr)
+def bitmapStr (ts : List Nat) : String := " ".intercalate ((sortBy (· < ·) ts).map typeStr)
 
 def nsec3Owner (r : Nsec3) : Name := toBytes (b32hex r.hash) :: r.zone
 
@@ -685,7 +682,7 @@ def payloadLines (ttl : Nat) : Payload → List String
 
 def rrsigLine (owner : Name) (ttl cov : Nat) (r : Rrsig Sch) : String :=
   let p := (r.sig : Nat × Tbs).1
-  s!"{nameStr owner} {ttl} IN RRSIG {dnssecTypeStr cov} {r.hdr.alg} {r.hdr.labels} {r.hdr.ttl} " ++
+  s!"{nameStr owner} {ttl} IN RRSIG {typeStr cov} {r.hdr.alg} {r.hdr.labels} {r.hdr.ttl} " ++
     s!"{r.hdr.expiration} {r.hdr.inception} {r.hdr.tag} {nameStr r.hdr.signer} {base64 [p / 256 % 256, p % 256]}"
 
 /-- The lines of records and the RRSIGs over them; RRSIGs take the TTL of the records they cover. -/

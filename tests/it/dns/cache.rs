@@ -412,3 +412,38 @@ fn a_secure_rrset_lives_no_longer_than_its_result() {
     );
     assert_eq!(expires(&cache, &www, at(1)), at(600));
 }
+
+/// A failure that persists is cached twice as long each time, up to 5
+/// minutes, and one that comes long after the last starts again at the
+/// failure TTL (RFC 9520 §3.2).
+#[test]
+fn a_persistent_failure_is_cached_longer_each_time() {
+    let mut cache = cache();
+    let www = key("www.example.", RecordType::A);
+    let fail = |cache: &mut Cache, now: u64| {
+        cache.insert(
+            at(now),
+            Offer::Failure {
+                key: www.clone(),
+                why: FailureKind::NoReachableAuthority,
+            },
+        );
+        cache.get(&www, at(now)).map(Entry::expires)
+    };
+    let mut now = 0;
+    let mut lasted = Vec::new();
+    for _ in 0..7 {
+        let until = fail(&mut cache, now)
+            .expect("cached")
+            .since_start()
+            .as_secs();
+        lasted.push(until - now);
+        // Asked again a second after it ends.
+        now = until + 1;
+    }
+    assert_eq!(lasted, [5, 10, 20, 40, 80, 160, 300]);
+    assert_eq!(fail(&mut cache, now), Some(at(now + 300)));
+    // Long after the last one ended, a failure is new again.
+    let later = now + 300 + 300 + 1;
+    assert_eq!(fail(&mut cache, later), Some(at(later + 5)));
+}

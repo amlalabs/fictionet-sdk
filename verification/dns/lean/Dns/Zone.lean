@@ -367,8 +367,9 @@ theorem addNew_ne_nil {acc an : List RRset} (h : an ≠ []) : addNew acc an ≠ 
   | nil => simpa using h
   | cons x xs => simp [addNew]
 
-/-- Follows CNAMEs inside the zone, stopping at the first repeated name (RFC 1034 §4.3.2 step 3a). The RCODE is the
-last name's (RFC 6604 §2). -/
+/-- Follows CNAMEs inside the zone (RFC 1034 §4.3.2 step 3a), stopping at a target outside it. A chain that comes back
+to a name it passed is a loop, an error (RFC 1034 §3.6.2): SERVFAIL with AA and the chain. The RCODE is the last
+name's (RFC 6604 §2). -/
 def chase (look : Name → Fact Node) (apex : Name) (soa : RRset) (any : AnyResponse) (qtype : Nat) :
     Nat → List Name → List RRset → Name → M Response
   | 0, _, acc, _ => .ok ⟨.servfail, false, acc, [], [], 0⟩
@@ -377,7 +378,8 @@ def chase (look : Name → Fact Node) (apex : Name) (soa : RRset) (any : AnyResp
     | .error e => .error e
     | .ok (.done rc aa an au ad req) => .ok ⟨rc, aa || !acc.isEmpty, addNew acc an, au, ad, req⟩
     | .ok (.restart an t) =>
-      if t ∈ q :: seen ∨ ¬ under t apex = true then .ok ⟨.noerror, true, addNew acc an, [], [], 0⟩
+      if t ∈ q :: seen then .ok ⟨.servfail, true, addNew acc an, [], [], 0⟩
+      else if ¬ under t apex = true then .ok ⟨.noerror, true, addNew acc an, [], [], 0⟩
       else chase look apex soa any qtype f (q :: seen) (addNew acc an) t
 
 /-- RFC 1034 §4.3.2 over any `look`. -/
@@ -872,7 +874,9 @@ theorem chase_total (apex : Name) (soa : RRset) (any : AnyResponse) (qtype : Nat
       simp only
       split
       · exact ⟨_, rfl⟩
-      · exact ih _ _ _
+      · split
+        · exact ⟨_, rfl⟩
+        · exact ih _ _ _
 
 end Total
 
@@ -967,10 +971,12 @@ theorem chase_acc {look : Name → Fact Node} {apex : Name} {soa : RRset} {any :
     · cases h; exact List.prefix_append _ _
     · split at h
       · cases h; exact List.prefix_append _ _
-      · exact (List.prefix_append acc _).trans (ih _ _ _ _ h)
+      · split at h
+        · cases h; exact List.prefix_append _ _
+        · exact (List.prefix_append acc _).trans (ih _ _ _ _ h)
 
-/-- How a chain ends: a step's finished response after the answers gathered so far, a stop at a repeated name
-or a name outside the zone, or running out of steps. -/
+/-- How a chain ends: a step's finished response after the answers gathered so far, a stop at a name outside the
+zone, a loop back to a name it passed, or running out of steps. -/
 theorem chase_cases {look : Name → Fact Node} {apex : Name} {soa : RRset} {any : AnyResponse} {qtype : Nat} :
     ∀ f seen acc q r, chase look apex soa any qtype f seen acc q = .ok r →
       (∃ q' rc aa an au ad req acc', step look apex soa any q' qtype = .ok (.done rc aa an au ad req) ∧
@@ -991,8 +997,10 @@ theorem chase_cases {look : Name → Fact Node} {apex : Name} {soa : RRset} {any
     · rename_i an t hs
       have hne := step_restart_ne hs
       split at h
-      · cases h; exact Or.inr (Or.inl ⟨rfl, rfl, rfl, addNew_ne_nil hne⟩)
-      · exact ih _ _ _ _ h
+      · cases h; exact Or.inr (Or.inr ⟨rfl, rfl⟩)
+      · split at h
+        · cases h; exact Or.inr (Or.inl ⟨rfl, rfl, rfl, addNew_ne_nil hne⟩)
+        · exact ih _ _ _ _ h
 
 /-- The answer when the question's first step finishes. -/
 theorem answer_done (z : Zone) (q : Request) (any : AnyResponse) (hq : z.apex <:+ q.qname)
@@ -1016,7 +1024,9 @@ theorem answer_restart (z : Zone) (q : Request) (any : AnyResponse) (hq : z.apex
   simp only at hr
   split at hr
   · cases hr; simp
-  · simpa using chase_acc _ _ _ _ _ hr
+  · split at hr
+    · cases hr; simp
+    · simpa using chase_acc _ _ _ _ _ hr
 
 /-! ## The headline theorems for complete zones -/
 
@@ -1555,9 +1565,11 @@ theorem Zone.chase_owners (z : Zone) (hwf : z.WF) (any : AnyResponse) (qtype : N
         · exact hown s h'
       split at h
       · cases h; simpa using hacc'
-      · rename_i hc
-        simp only [not_or, Decidable.not_not] at hc
-        exact ih _ _ _ _ hacc' ((under_iff _ _).mp hc.2) h
+      · split at h
+        · cases h; simpa using hacc'
+        · rename_i hc
+          simp only [Decidable.not_not] at hc
+          exact ih _ _ _ _ hacc' ((under_iff _ _).mp hc) h
 
 /-- Every RRset in every section of an answer has its owner at or below the apex. -/
 theorem answer_in_zone (z : Zone) (hwf : z.WF) (q : Request) (any : AnyResponse) {r : Response}

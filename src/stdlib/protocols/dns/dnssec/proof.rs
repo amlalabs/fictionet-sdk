@@ -65,6 +65,21 @@ pub fn nodata(
     )
 }
 
+/// Whether `records` prove that `name` in `zone` owns a CNAME, or that
+/// the wildcard at its closest encloser, which answers for it, does: the
+/// type bitmap of the NSEC or NSEC3 record that matches the name or that
+/// wildcard has CNAME (RFC 4034 §4.1.2, RFC 5155 §3.1.8, §8.7). Such
+/// records prove no NODATA there (RFC 4035 §5.4), since the CNAME answers
+/// every type but the ones that may sit beside it.
+pub fn alias(name: &Name, zone: &Name, records: &[RecordSet], max_iterations: u16) -> Proof {
+    let name = fqdn(name);
+    Denial::new(zone, records).decide(
+        max_iterations,
+        |nsec| nsec.alias(&name),
+        |nsec3| nsec3.alias(&name),
+    )
+}
+
 /// The NSEC RRsets among `records` that prove `name` does not exist in
 /// `zone`, the ones a reply carries for the claim (RFC 4035 §3.1.3.2), or
 /// `None` when NSEC records do not prove it.
@@ -420,6 +435,22 @@ impl<'a> Nsecs<'a> {
         is_below(rdata.next_domain_name(), &wildcard).then(|| vec![owner, wildcard_owner])
     }
 
+    fn alias(&self, name: &Name) -> bool {
+        let cname = |rdata: &NSEC| rdata.type_set().contains(RecordType::CNAME);
+        if let Some(rdata) = self.matching(name) {
+            return cname(rdata);
+        }
+        let Some((owner, rdata)) = self.covering(name) else {
+            return false;
+        };
+        let encloser = Nsecs::closest_encloser(name, owner, rdata);
+        encloser
+            .prepend_label("*")
+            .ok()
+            .and_then(|wildcard| self.matching(&wildcard))
+            .is_some_and(cname)
+    }
+
     fn no_ds(&self, name: &Name) -> bool {
         self.matching(name).is_some_and(|rdata| {
             let types = rdata.type_set();
@@ -635,6 +666,31 @@ impl<'a> Nsec3s<'a> {
             }
             _ => Proof::Unproven,
         }
+    }
+
+    fn alias(&self, name: &Name) -> Proof {
+        let proven = |rdata: &NSEC3| {
+            if rdata.type_set().contains(RecordType::CNAME) {
+                Proof::Proven
+            } else {
+                Proof::Unproven
+            }
+        };
+        if let Some(rdata) = self.matching(name) {
+            return proven(rdata);
+        }
+        let Some((encloser, opt_out)) = self.closest_encloser(name) else {
+            return Proof::Unproven;
+        };
+        // An opt-out span over the next closer name may hide an unsigned
+        // delegation there (RFC 5155 §6).
+        if opt_out {
+            return Proof::OptOut;
+        }
+        let Ok(wildcard) = encloser.prepend_label("*") else {
+            return Proof::Unproven;
+        };
+        self.matching(&wildcard).map_or(Proof::Unproven, proven)
     }
 
     fn no_ds(&self, name: &Name) -> Proof {

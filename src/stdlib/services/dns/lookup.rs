@@ -11,7 +11,7 @@
 
 use std::net::SocketAddr;
 
-use fictionet::stdlib::protocols::dns::op::{Message, MessageType, Query};
+use fictionet::stdlib::protocols::dns::op::{Edns, Message, MessageType, OpCode, Query};
 use fictionet::stdlib::protocols::dns::rr::LowerName;
 
 /// One question put to a real server of a zone, with the zone it is
@@ -28,6 +28,10 @@ pub struct Lookup {
 }
 
 impl Lookup {
+    /// The UDP payload size the query of a lookup advertises: the size the
+    /// DNS Flag Day 2020 settled on (RFC 6891 §6.2.5).
+    pub const PAYLOAD: u16 = 1232;
+
     /// A lookup of `question` at `server` for the zone at `zone`. It asks
     /// without recursion, as an authority's question to another
     /// authority does. The question's name is put in lowercase.
@@ -39,6 +43,19 @@ impl Lookup {
             zone,
             question,
         }
+    }
+
+    /// The query this lookup stands for, with ID `id`: its question,
+    /// without recursion, and an OPT record with a [`PAYLOAD`](Lookup::PAYLOAD)
+    /// payload and DO set, so RRSIGs and NSEC and NSEC3 records come back
+    /// (RFC 3225 §3). Every upstream sends this, and a capture records it.
+    pub fn query(&self, id: u16) -> Message {
+        let mut message = Message::new(id, MessageType::Query, OpCode::Query);
+        message.add_query(self.question.clone());
+        let mut edns = Edns::new();
+        edns.set_max_payload(Lookup::PAYLOAD).set_dnssec_ok(true);
+        message.set_edns(edns);
+        message
     }
 
     /// Whether `response` answers this lookup: a response with one

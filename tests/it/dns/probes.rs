@@ -297,6 +297,28 @@ fn p_pubres() {
     });
 }
 
+/// `dig myip.opendns.com @208.67.222.222` gives the address the question
+/// came from as OpenDNS sees it, the network's egress, with TTL 0 and AA
+/// clear, as the real resolver answers it.
+#[test]
+fn p_myip() {
+    probe(|fcx, p| async move {
+        let opendns = Ipv4Addr::new(208, 67, 222, 222);
+        let reply = send(
+            &fcx,
+            &p.m,
+            opendns,
+            &dig(1, "myip.opendns.com.", RecordType::A),
+        )
+        .await;
+        assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+        assert!(!reply.metadata.authoritative);
+        assert_eq!(addresses(&reply.answers), [IpAddr::from(EGRESS)]);
+        assert_eq!(ttl(&reply.answers, RecordType::A), 0);
+        Ok(())
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Header and protocol
 

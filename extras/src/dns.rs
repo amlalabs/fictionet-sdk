@@ -42,7 +42,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
 use fictionet::Cx;
-use fictionet::stdlib::protocols::dns::op::{Edns, Message, MessageType, OpCode, Query};
+use fictionet::stdlib::protocols::dns::op::{Message, Query};
 use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, Name, RData, RecordType};
 use fictionet::stdlib::protocols::dns::{Parsed, Request, label_count, read_message};
 use fictionet::stdlib::services::dns::{Looked, Lookup};
@@ -57,9 +57,6 @@ const DNS_MESSAGE: &str = "application/dns-message";
 
 /// The port a `dns:` URI means when it names none (RFC 4501 §2).
 const DNS_PORT: u16 = 53;
-
-/// The UDP payload size the recorded query of a lookup advertises.
-const PAYLOAD: u16 = 1232;
 
 /// Whether `uri` is a `dns:` URI (RFC 4501), whose scheme name is
 /// case-insensitive (RFC 3986 §3.1).
@@ -105,9 +102,10 @@ impl<U: Upstream> Capture<U> {
     pub fn write(&self, path: &Path) -> io::Result<()> {
         let exchanges = std::mem::take(&mut *self.exchanges.lock());
         for exchange in exchanges {
-            let (Ok(query), Ok(response)) =
-                (query(&exchange.lookup).to_vec(), exchange.response.to_vec())
-            else {
+            let (Ok(query), Ok(response)) = (
+                exchange.lookup.query(0).to_vec(),
+                exchange.response.to_vec(),
+            ) else {
                 continue;
             };
             let target = target_uri(&exchange.lookup);
@@ -159,17 +157,6 @@ impl<U: Upstream> Upstream for Capture<U> {
             looked
         })
     }
-}
-
-/// The query `lookup` stands for, with ID 0: its question, without
-/// recursion, and an OPT record with DO set.
-fn query(lookup: &Lookup) -> Message {
-    let mut message = Message::new(0, MessageType::Query, OpCode::Query);
-    message.add_query(lookup.question.clone());
-    let mut edns = Edns::new();
-    edns.set_max_payload(PAYLOAD).set_dnssec_ok(true);
-    message.set_edns(edns);
-    message
 }
 
 /// The `dns:` URI of `lookup` (RFC 4501 §2): the server as the authority,
@@ -506,6 +493,7 @@ mod tests {
     use fictionet::stdlib::protocols::dns::dnssec::{
         self, Algorithm, DigestType, KeyFlags, Sign, ZoneKey,
     };
+    use fictionet::stdlib::protocols::dns::op::{Edns, OpCode};
     use fictionet::stdlib::protocols::dns::rr::Record;
     use fictionet::stdlib::protocols::dns::rr::rdata::{A, NS};
     use std::net::Ipv4Addr;

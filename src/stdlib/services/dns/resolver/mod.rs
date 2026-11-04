@@ -18,8 +18,9 @@
 //!    a zone that does not know passes the question on. When RD is set,
 //!    a local chain that leaves its zone goes on from its target as any
 //!    alias does, and a local referral is followed. When RD is clear,
-//!    the chain goes on through the local zones and the cache, and a
-//!    name a local zone refers to a cut gets that zone's referral.
+//!    the chain goes on through the local zones, and through the cache
+//!    with [`rd0_from_cache`](Config::rd0_from_cache), and a name a
+//!    local zone refers to a cut gets that zone's referral.
 //! 4. Answers from its cache, or starts or joins a resolution: the
 //!    iteration of RFC 1034 §5.3.3 from the root servers down, or from
 //!    the servers a local zone's cut names, following aliases, each
@@ -47,7 +48,7 @@
 //! | RFC 8767 | Serving stale data |
 //! | RFC 8914 | Extended DNS Errors |
 //! | RFC 9156 | QNAME minimisation |
-//! | RFC 9520 | Failures cached apart from negatives; each server asked at most three times per transport |
+//! | RFC 9520 | Failures cached apart from negatives, for longer each time they persist; each server asked at most three times per transport |
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -328,17 +329,18 @@ impl<V: Verify> Resolver<V> {
         // resolution reaches is (RFC 1034 §4.3.2 step 1, §5.3.3): a local
         // chain that leaves its zone goes on from its target, and a local
         // referral is followed to the servers it names. With RD clear, a
-        // resolver that answers from its cache takes a local chain that
-        // goes past its zone on through its local zones and its cache, as
-        // step 3a goes back to step 1, and a local referral goes out as it
-        // is (step 3b).
-        if let Some(local) = self.local_answer(&request)
-            && (local.settles() || (!request.rd && !(local.onward && self.config.rd0_from_cache)))
+        // local chain that goes past its zone goes on through the local
+        // zones, and through the cache of a resolver that answers from
+        // it, as step 3a goes back to step 1, and a local referral goes
+        // out as it is (step 3b).
+        let local = self.local_answer(&request);
+        if let Some(local) = &local
+            && (local.settles() || (!request.rd && !local.onward))
         {
-            let bytes = self.render_local(&request, local.response, local.keep_aa);
+            let bytes = self.render_local(&request, local.response.clone(), local.keep_aa);
             return self.send_answer(client, bytes, Validation::NotPerformed, false);
         }
-        if !request.rd && !self.config.rd0_from_cache {
+        if !request.rd && !self.config.rd0_from_cache && local.is_none() {
             let refused = bare_reply(&request, ResponseCode::Refused, None);
             let bytes = self.render_response(&request, refused);
             return self.send_answer(client, bytes, Validation::NotPerformed, false);
@@ -374,9 +376,15 @@ impl<V: Verify> Resolver<V> {
         zones.sort_by_key(|(index, zone)| {
             std::cmp::Reverse((label_count(zone.data.apex()), *index))
         });
+        let hosted: Vec<LowerName> = self
+            .config
+            .local
+            .iter()
+            .map(|zone| zone.data.apex().clone())
+            .collect();
         zones.into_iter().find_map(|(_, zone)| {
             let view = zone.data.view(&request.question);
-            match answer_onward(&*view, request, self.config.any) {
+            match answer_onward(&*view, request, self.config.any, &hosted) {
                 (Answered::Response(response), onward) => Some(Local {
                     response,
                     zone: Name::from(zone.data.apex()),
@@ -451,6 +459,12 @@ impl<V: Verify> Resolver<V> {
                 // as QNAME does (RFC 1034 §4.3.2 step 3b).
                 if let Some(referral) = self.local_referral(&asked) {
                     return self.answer_referral(id, Delegation::Local(referral));
+                }
+                // A resolver that answers no question with RD clear from
+                // its cache ends a local chain where it leaves the local
+                // zones, as step 4 of RFC 1034 §4.3.2 then finds nothing.
+                if !self.config.rd0_from_cache {
+                    break;
                 }
                 // A query with RD clear may not start the lookups a
                 // validation needs, so data no check has validated is

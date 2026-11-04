@@ -5,9 +5,9 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use fictionet::stdlib::protocols::dns::Request;
 use fictionet::stdlib::protocols::dns::op::{Message, Query, ResponseCode};
 use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, Name, RecordType};
+use fictionet::stdlib::protocols::dns::{Request, label_count};
 use fictionet::sync::Mutex;
 
 use super::super::exchange::{Client, Generation};
@@ -31,7 +31,10 @@ use super::{Authority, ServerConfig, Step, bare_reply, refuse_transfer, respond_
 /// client's question was filed and the answer still stops at a name the
 /// chain led to in the zone, as when a server stops a chain early, the
 /// copy looks that name up with QTYPE instead, as the walk starts again
-/// there (RFC 1034 §4.3.2 step 3a, RFC 6672 §3.2).
+/// there (RFC 1034 §4.3.2 step 3a, RFC 6672 §3.2). A server that answers
+/// NSEC at an alias with NODATA, where its own denial records show the
+/// CNAME, is asked for the CNAME, and the copy follows it
+/// ([`Learned::stops_at_alias`]).
 ///
 /// A world notes which address serves which zone with
 /// [`serves`](Copies::serves), such as at the addresses a referral's glue
@@ -70,7 +73,11 @@ use super::{Authority, ServerConfig, Step, bare_reply, refuse_transfer, respond_
 /// from the zone above (RFC 4035 §3.1.4.1). When a lookup's response
 /// shows any of that, the address answers for the rest of the session as
 /// though it had never been noted for the zone: from the other zones it
-/// serves, or REFUSED when none holds the name.
+/// serves, or REFUSED when none holds the name. The server may still
+/// serve a zone below the one it does not, so a name in that zone the
+/// address was never asked about is looked up there all the same, and
+/// answered from the child zone its response shows, or REFUSED when it
+/// shows none. The answer does not depend on what was asked before.
 #[derive(Default)]
 pub struct Copies {
     /// Each zone's copy, by apex.
@@ -87,6 +94,8 @@ struct Seen {
     generation: Generation,
     /// The zones addresses were noted for and turned out not to serve.
     lame: HashSet<(IpAddr, LowerName)>,
+    /// The names each address was asked about in a lookup.
+    asked: HashSet<(IpAddr, LowerName)>,
     /// The names each address answered with authority from a zone below
     /// a cut whose apex its response did not show.
     unplaced: HashMap<(IpAddr, LowerName), Unplaced>,
@@ -115,6 +124,7 @@ impl Seen {
         Seen {
             generation,
             lame: HashSet::new(),
+            asked: HashSet::new(),
             unplaced: HashMap::new(),
         }
     }
@@ -145,11 +155,6 @@ impl Copies {
         }
     }
 
-    /// Whether `addr` serves any zone.
-    pub fn serves_any(&self, addr: IpAddr) -> bool {
-        self.served.lock().contains_key(&addr)
-    }
-
     /// The copy of the zone at `apex`, made empty the first time.
     fn copy(&self, apex: &LowerName) -> Arc<Learned> {
         self.zones
@@ -177,6 +182,7 @@ impl Copies {
         {
             let mut seen = self.seen.lock();
             if seen.at(generation) {
+                seen.asked.insert((addr, qname.clone()));
                 // A server of a zone above a child answers DS at the
                 // child's apex from the zone above (RFC 4035 §3.1.4.1), so
                 // one that answers it from the child serves no zone above.
@@ -257,6 +263,30 @@ impl Copies {
         }
     }
 
+    /// The zone `addr` was noted for and does not serve, the deepest that
+    /// holds `qname`, when none of `zones`, the zones it serves, holds
+    /// `qname` and `addr` was never asked about `qname` this session.
+    fn lame_holding(
+        &self,
+        addr: IpAddr,
+        qname: &LowerName,
+        zones: &[Arc<dyn ZoneData>],
+    ) -> Option<LowerName> {
+        if zones.iter().any(|zone| zone.apex().zone_of(qname)) {
+            return None;
+        }
+        let seen = self.seen.lock();
+        if seen.asked.contains(&(addr, qname.clone())) {
+            return None;
+        }
+        seen.lame
+            .iter()
+            .filter(|(at, apex)| *at == addr && apex.zone_of(qname))
+            .map(|(_, apex)| apex)
+            .max_by_key(|apex| label_count(apex))
+            .cloned()
+    }
+
     /// The copies of the zones `addr` serves.
     fn zones_at(&self, addr: IpAddr) -> Vec<Arc<dyn ZoneData>> {
         let apexes = self.served.lock().get(&addr).cloned().unwrap_or_default();
@@ -314,13 +344,18 @@ impl Authority for Copies {
             .seen
             .lock()
             .unplaced
-            .get(&(local.ip(), qname))
+            .get(&(local.ip(), qname.clone()))
             .map(|unplaced| (unplaced.zone.clone(), unplaced.at.clone()));
         if let Some((zone, at)) = unplaced {
             let soa = Query::query(Name::from(at), RecordType::SOA);
             return self.look_up(req, local, zone, &soa);
         }
         let zones = self.zones_at(local.ip());
+        if req.question.query_class() == DNSClass::IN
+            && let Some(lame) = self.lame_holding(local.ip(), &qname, &zones)
+        {
+            return self.look_up(req, local, lame, &req.question);
+        }
         respond_from(&zones, req, server, &|zone, asked, reached| {
             let apex = zone.apex();
             let learned = self.copy(apex);
@@ -332,6 +367,11 @@ impl Authority for Copies {
                 && learned.failed(local.ip(), asked).is_none()
             {
                 question.set_name(Name::from(reached));
+            }
+            // A server that stopped at an alias for NSEC is asked for the
+            // CNAME, which the answer then follows.
+            if learned.stops_at_alias(&question) {
+                question.set_query_type(RecordType::CNAME);
             }
             self.look_up(req, local, apex.clone(), &question)
         })

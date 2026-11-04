@@ -7,7 +7,7 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use fictionet::stdlib::protocols::dns::dname_substitute;
-use fictionet::stdlib::protocols::dns::dnssec::proof::{Claim, proof_of};
+use fictionet::stdlib::protocols::dns::dnssec::proof::{self, Claim, Proof, proof_of};
 use fictionet::stdlib::protocols::dns::dnssec::rdata::DNSSECRData;
 use fictionet::stdlib::protocols::dns::op::{Message, Query, ResponseCode};
 use fictionet::stdlib::protocols::dns::rr::{
@@ -49,6 +49,10 @@ use super::zone::{Node, dname_target, targets, wildcard};
 ///   that prove the expansion are kept as its proof (RFC 4035 §3.1.3.3,
 ///   RFC 5155 §7.2.6). An answer to ANY or RRSIG expanded from a wildcard
 ///   is kept the same way.
+/// - A NODATA for NSEC whose denial records show a CNAME at the name, or
+///   at the wildcard that answers for it, is no negative: the server
+///   stopped at an alias that RFC 1034 §4.3.2 step 3a follows for NSEC
+///   when no NSEC RRset sits beside it ([`stops_at_alias`](Learned::stops_at_alias)).
 /// - Where the answer's CNAME and DNAME chain ends inside the zone
 ///   without an RRset of the type asked, the answer is negative there. A
 ///   DNAME moves the chain on whatever the type asked (RFC 6672 §3.2); a
@@ -76,10 +80,12 @@ use super::zone::{Node, dname_target, targets, wildcard};
 ///   (RFC 4035 §3.1.4). It shows that the server holds no zone at the
 ///   name it referred or above it, below the cut. A referral for an NSEC
 ///   question at the cut shows that the parent holds no NSEC RRset there.
-/// - An error RCODE other than REFUSED, such as FORMERR for a meta-type
-///   or SERVFAIL for a CNAME loop, gives no records, only that the server
-///   answers the question with that RCODE ([`failed`](Learned::failed)):
-///   a server may answer so, and must answer (RFC 8906 §3.1).
+/// - An error RCODE other than REFUSED, such as FORMERR for a meta-type,
+///   gives no records, only that the server answers the question with
+///   that RCODE ([`failed`](Learned::failed)): a server may answer so,
+///   and must answer (RFC 8906 §3.1). An authoritative SERVFAIL whose
+///   answer is a CNAME loop, which RFC 1034 §3.6.2 has signalled as an
+///   error, gives its CNAME RRsets too, as an answer does.
 /// - Any other response, such as REFUSED, an answer without AA, or a
 ///   truncated response (TC set), whose sections may be incomplete
 ///   (RFC 2181 §9), gives nothing.
@@ -196,6 +202,10 @@ struct Facts {
     proofs: HashMap<(LowerName, Denied), Vec<RecordSet>>,
     /// The answers to ANY and RRSIG questions, by name and type.
     whole: BTreeMap<(LowerName, RecordType), Node>,
+    /// The names whose NSEC question a server answered with a NODATA
+    /// whose own denial records show a CNAME there, where it stopped at
+    /// an alias that RFC 1034 §4.3.2 step 3a follows.
+    stops_at_alias: BTreeSet<LowerName>,
     /// The SOA RRset a negative answer carried, with its TTL already the
     /// negative TTL (RFC 2308 §3).
     negative_soa: Option<RecordSet>,
@@ -396,6 +406,20 @@ impl Learned {
         self.held.lock().facts.failed.get(&key).copied()
     }
 
+    /// Whether `question` asks for NSEC at a name where a server answered
+    /// it with a NODATA whose own denial records show a CNAME: the server
+    /// stopped at an alias, whose CNAME is looked up next, so the answer
+    /// follows it (RFC 1034 §4.3.2 step 3a).
+    pub fn stops_at_alias(&self, question: &Query) -> bool {
+        question.query_type() == RecordType::NSEC
+            && self
+                .held
+                .lock()
+                .facts
+                .stops_at_alias
+                .contains(&LowerName::new(question.name()))
+    }
+
     /// Whether the answer to `question` lies below a cut the zone holds,
     /// where only the child zone has data (RFC 4035 §2.4): an
     /// authoritative answer to it comes from a zone below the cut that
@@ -448,10 +472,11 @@ impl Learned {
             // reads it.
             .unwrap_or_else(|| RecordSet::new(Name::from(&self.apex), RecordType::SOA, 0));
         let qname = LowerName::new(question.name());
-        let (chain, answering) = answering(&self.apex, &facts, server, qname);
+        let (chain, answering) = answering(&self.apex, &facts, server, qname.clone());
         Arc::new(LearnedView {
             apex: self.apex.clone(),
             server,
+            qname,
             chain,
             answering,
             qtype: question.query_type(),
@@ -489,6 +514,7 @@ impl Facts {
             failed: HashMap::new(),
             proofs: HashMap::new(),
             whole: BTreeMap::new(),
+            stops_at_alias: BTreeSet::new(),
             negative_soa: None,
         }
     }
@@ -538,6 +564,25 @@ impl Facts {
                     qname: &qname,
                     qtype: question.query_type(),
                     rcode,
+                    denial: &denial,
+                };
+                self.file_answer(&filed, &answer, &authority, &additional, kept);
+                true
+            }
+            // A CNAME loop is signalled as an error (RFC 1034 §3.6.2),
+            // and its CNAME RRsets are the zone's data, from which the
+            // copy answers the loop as the server does.
+            (true, ResponseCode::ServFail) if loops(&qname, question.query_type(), &answer) => {
+                self.failed.insert(
+                    (server, qname.clone(), question.query_type()),
+                    ResponseCode::ServFail,
+                );
+                let filed = Filed {
+                    apex,
+                    server,
+                    qname: &qname,
+                    qtype: question.query_type(),
+                    rcode: ResponseCode::ServFail,
                     denial: &denial,
                 };
                 self.file_answer(&filed, &answer, &authority, &additional, kept);
@@ -725,6 +770,14 @@ impl Facts {
         };
         self.negative_soa = Some(soa);
         match filed.rcode {
+            // An NSEC RRset may sit beside a CNAME (RFC 4035 §2.5), and
+            // without one the CNAME is followed, so such a NODATA is no
+            // negative of the zone's.
+            ResponseCode::NoError
+                if filed.qtype == RecordType::NSEC && at_alias(apex, &end, filed.denial) =>
+            {
+                self.stops_at_alias.insert(end);
+            }
             ResponseCode::NXDomain if end != *apex => {
                 self.mark_absent(&end);
                 self.mark_absent(&wildcard(&end.base_name()));
@@ -1116,6 +1169,40 @@ struct Referral<'a> {
     denial: &'a [RecordSet],
 }
 
+/// Whether the CNAME chain of `answer`, an answer to `qname` and `qtype`,
+/// comes back to a name it passed: a loop. A question for CNAME, ANY, or
+/// RRSIG follows no CNAME.
+fn loops(qname: &LowerName, qtype: RecordType, answer: &[RecordSet]) -> bool {
+    if matches!(
+        qtype,
+        RecordType::CNAME | RecordType::ANY | RecordType::RRSIG
+    ) {
+        return false;
+    }
+    let mut name = qname.clone();
+    let mut seen = vec![name.clone()];
+    loop {
+        let target = answer
+            .iter()
+            .filter(|set| {
+                set.record_type() == RecordType::CNAME && LowerName::new(set.name()) == name
+            })
+            .flat_map(|set| set.records_without_rrsigs())
+            .find_map(|record| match &record.data {
+                RData::CNAME(target) => Some(LowerName::new(&target.0)),
+                _ => None,
+            });
+        let Some(target) = target else {
+            return false;
+        };
+        if seen.contains(&target) {
+            return true;
+        }
+        seen.push(target.clone());
+        name = target;
+    }
+}
+
 /// Where the CNAME and DNAME chain of `answer`, an answer to `qname` and
 /// `qtype` from the zone at `apex`, ends: the name whose RRset of `qtype`
 /// the answer has, or whose negative it is. A DNAME above a name moves the
@@ -1210,6 +1297,14 @@ fn proof(apex: &LowerName, claim: Claim<'_>, denial: &[RecordSet]) -> Vec<Record
     proof_of(claim, &Name::from(apex), denial).unwrap_or_else(|| denial.to_vec())
 }
 
+/// Whether `denial`, the records a NODATA for NSEC at `name` in the zone
+/// at `apex` came with, show a CNAME at the name, or at the wildcard that
+/// answers for it ([`proof::alias`]).
+fn at_alias(apex: &LowerName, name: &LowerName, denial: &[RecordSet]) -> bool {
+    let (zone, name) = (Name::from(apex), Name::from(name));
+    proof::alias(&name, &zone, denial, u16::MAX) == Proof::Proven
+}
+
 /// `set` with `owner` as the owner of every record and RRSIG.
 fn renamed(set: &RecordSet, owner: &Name) -> RecordSet {
     let rename = |record: &Record| {
@@ -1292,6 +1387,8 @@ struct LearnedView {
     apex: LowerName,
     /// The real server whose answers the view gives.
     server: IpAddr,
+    /// The question's name.
+    qname: LowerName,
     /// The names the question's chain reaches ([`answering`]).
     chain: BTreeSet<LowerName>,
     /// The names the answer may end at ([`answering`]).
@@ -1310,8 +1407,9 @@ impl LearnedView {
     /// at `name`: an RRset of that type from an answer or authority
     /// section; a CNAME from one, which answers every type
     /// (RFC 1034 §3.6.2) but NSEC, whose RRset may sit beside it
-    /// (RFC 4035 §2.5), unless the name is known to have none; or the
-    /// type known absent where the chain reaches `name`. A wildcard's
+    /// (RFC 4035 §2.5), unless the name is known to have none or a server
+    /// stopped there for the question's name; or the type known absent
+    /// where the chain reaches `name`. A wildcard's
     /// absent type is the proof for the wildcard's own name, which a name
     /// it answers for cannot use (RFC 5155 §7.2.5). Additional data never
     /// answers (RFC 2181 §5.4.1). ANY and RRSIG are answered from their
@@ -1325,7 +1423,9 @@ impl LearnedView {
                 .is_some_and(|(rank, _)| *rank > Section::Additional)
         };
         let alias = answers(RecordType::CNAME)
-            && (qtype != RecordType::NSEC || known.absent.contains(&RecordType::NSEC));
+            && (qtype != RecordType::NSEC
+                || known.absent.contains(&RecordType::NSEC)
+                || self.facts.stops_at_alias.contains(&self.qname));
         let absent = self.chain.contains(name) && known.absent.contains(&qtype);
         !matches!(qtype, RecordType::ANY | RecordType::RRSIG) && (answers(qtype) || alias || absent)
     }

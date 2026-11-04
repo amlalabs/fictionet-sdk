@@ -231,7 +231,11 @@ theorem chase_ref {apex : Name} {soa : RRset} {any : AnyResponse} {qtype : Nat} 
         split
         · rename_i hc; simp only [hc, ↓reduceIte] at h; cases h
           exact ⟨_, rfl, rfl, rfl, rfl, rfl, List.Sublist.refl _, rfl⟩
-        · rename_i hc; simp only [hc, ↓reduceIte] at h; exact ih _ _ _ _ h
+        · rename_i hc; simp only [hc, ↓reduceIte] at h
+          split
+          · rename_i hc'; simp only [hc', ↓reduceIte] at h; cases h
+            exact ⟨_, rfl, rfl, rfl, rfl, rfl, List.Sublist.refl _, rfl⟩
+          · rename_i hc'; simp only [hc', ↓reduceIte] at h; exact ih _ _ _ _ h
 
 theorem answerWith_ref {apex : Name} {soa : RRset} {any : AnyResponse} {req : Request} {r : Response}
     (h : answerWith l1 apex soa any req = .response r) :

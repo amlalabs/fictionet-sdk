@@ -743,8 +743,8 @@ impl<V: Verify> Resolver<V> {
             .find(|set| set.record_type() == RecordType::SOA)
             .cloned();
         if rcode == ResponseCode::YXDomain {
-            let dname = answers.into_iter().find(is_dname)?;
-            return Some(vec![Outcome::TooLong { dname, zone }]);
+            let (first, rest) = self.too_long(&answers, &sname, stype, None, &denial, &zone)?;
+            return Some(std::iter::once(first).chain(rest).collect());
         }
         if !answers.is_empty() {
             // Nothing is offered to the cache: local data is the
@@ -1087,7 +1087,12 @@ impl<V: Verify> Resolver<V> {
     }
 
     /// Makes `from` wait on the lookup of `key`, starting it when none
-    /// runs, unless the cache answers at once.
+    /// runs, unless a local zone or the cache answers at once. Local data
+    /// comes first for every name the resolver looks up, a name server's
+    /// address or a DS or DNSKEY RRset as much as a client's question
+    /// (RFC 1034 §5.3.3 step 2), so a name a local zone holds never
+    /// leaves the resolver, such as the special-use names of RFC 6761
+    /// §6.4 and RFC 7686 §2.
     ///
     /// With `relay_cd`, the lookup forwards a client's CD bit, as a
     /// forwarder that does not validate relays the client's header: it
@@ -1103,6 +1108,16 @@ impl<V: Verify> Resolver<V> {
         depth: u8,
         entropy: &dyn Entropy,
     ) -> Dep {
+        let local = question_of(&key).and_then(|asked| self.local_outcomes(&asked));
+        if let Some((outcome, rest)) = local.and_then(split) {
+            // Local data is never validated.
+            return Dep::Ready(Box::new(Found {
+                outcome,
+                checks: Vec::new(),
+                cached: false,
+                rest,
+            }));
+        }
         if let Some(found) = self.cached_for(&key, relay_cd) {
             return Dep::Ready(Box::new(found));
         }
@@ -1999,18 +2014,21 @@ impl<V: Verify> Resolver<V> {
         let rank = (!lookup.relay_cd).then_some(rank);
 
         if rcode == ResponseCode::YXDomain {
-            // RFC 6672 §2.2: the DNAME above the name would make it longer
-            // than a name may be. With the DNAME, that is the answer.
-            let dname = answers
-                .iter()
-                .find(|set| is_dname(set) && set.name().zone_of(&sname) && *set.name() != sname)
-                .cloned();
-            return match dname {
-                Some(dname) if authoritative => {
-                    self.offer(&dname, rank, Vec::new());
-                    self.finish(id, Found::fresh(Outcome::TooLong { dname, zone }));
-                }
-                _ => self.give_up(exchange, true, entropy),
+            // RFC 6672 §2.2: the DNAME above the name the chain reached
+            // would make it longer than a name may be. With the chain and
+            // the DNAME, that is the answer.
+            let too_long = authoritative
+                .then(|| self.too_long(&answers, &sname, stype, rank, &denial, &zone))
+                .flatten();
+            return match too_long {
+                Some((outcome, rest)) => self.finish(
+                    id,
+                    Found {
+                        rest,
+                        ..Found::fresh(outcome)
+                    },
+                ),
+                None => self.give_up(exchange, true, entropy),
             };
         }
 
@@ -2295,6 +2313,59 @@ impl<V: Verify> Resolver<V> {
             });
         }
         split(chain)
+    }
+
+    /// The outcomes of a YXDOMAIN answer to `sname` from `zone`, offered
+    /// to the cache at `rank` as [`store_chain`](Resolver::store_chain)
+    /// does: the aliases its CNAME chain follows inside the zone, then the
+    /// DNAME above the name the chain reached, whose new name would pass
+    /// 255 octets (RFC 6672 §2.2). The RCODE is the last name's
+    /// (RFC 6604 §2). `None` when the answer holds no such DNAME.
+    fn too_long(
+        &mut self,
+        answers: &[RecordSet],
+        sname: &Name,
+        stype: RecordType,
+        rank: Option<Rank>,
+        denial: &[RecordSet],
+        zone: &Name,
+    ) -> Option<(Outcome, Vec<Outcome>)> {
+        let mut reached = sname.clone();
+        let mut seen = vec![reached.clone()];
+        while let Some(target) = answers
+            .iter()
+            .find(|set| *set.name() == reached && set.record_type() == RecordType::CNAME)
+            .and_then(cname_target)
+            .filter(|target| zone.zone_of(target) && !seen.contains(target))
+        {
+            seen.push(target.clone());
+            reached = target;
+        }
+        let dname = answers
+            .iter()
+            .find(|set| is_dname(set) && set.name().zone_of(&reached) && *set.name() != reached)
+            .cloned()?;
+        let mut outcomes = Vec::new();
+        if reached != *sname {
+            let (first, rest) = self.store_chain(
+                answers,
+                sname,
+                stype,
+                rank,
+                denial,
+                ResponseCode::YXDomain,
+                &None,
+                zone,
+            )?;
+            outcomes.push(first);
+            outcomes.extend(rest);
+        }
+        self.offer(&dname, rank, Vec::new());
+        outcomes.push(Outcome::TooLong {
+            dname,
+            zone: zone.clone(),
+        });
+        split(outcomes)
     }
 
     /// Offers `set` to the cache at `rank`, or nothing when `rank` is

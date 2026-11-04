@@ -1696,6 +1696,75 @@ fn localhost_and_invalid_are_answered_as_rfc_6761_says() {
     assert!(net.recording().exchanges().is_empty());
 }
 
+/// A name server's address is local data first too (RFC 1034 §5.3.3 step
+/// 2): a glueless server named in `localhost` is never asked of the root
+/// (RFC 6761 §6.3), and one only a local zone holds is found there.
+#[test]
+fn a_name_servers_address_comes_from_the_local_zones_first() {
+    let root = delegation(
+        delegation(
+            builder(".", "a.root-servers.net.").rrset(rrset(
+                "a.root-servers.net.",
+                3600,
+                vec![a(ROOT)],
+            )),
+            "lh.",
+            "ns.localhost.",
+            None,
+            None,
+        ),
+        "corp-served.",
+        "ns.corp.",
+        None,
+        None,
+    )
+    .build()
+    .unwrap();
+    let served = builder("corp-served.", "ns.corp.")
+        .rrset(rrset("www.corp-served.", 300, vec![a("192.0.2.77")]))
+        .build()
+        .unwrap();
+    let corp = builder("corp.", "ns.corp.")
+        .rrset(rrset("ns.corp.", 3600, vec![a(EXAMPLE_ORG)]))
+        .build()
+        .unwrap();
+    let leaves = |net: &MemoryNet| {
+        asked(net)
+            .into_iter()
+            .map(|(_, qname, _, _)| qname)
+            .filter(|qname| qname.ends_with("localhost.") || qname.ends_with("corp."))
+            .collect::<Vec<_>>()
+    };
+
+    let mut net = MemoryNet::new();
+    serve_at(&mut net, ROOT, vec![root.clone()]);
+    let mut special = resolver(Config {
+        hints: vec![(name("a.root-servers.net."), ip(ROOT))],
+        anchors: None,
+        ..Config::new()
+    });
+    ask(
+        &mut special,
+        &mut net,
+        0,
+        query(client(1), "www.lh.", RecordType::A, |_| {}),
+    );
+    assert_eq!(leaves(&net), Vec::<String>::new());
+
+    let mut net = MemoryNet::new();
+    serve_at(&mut net, ROOT, vec![root]);
+    serve_at(&mut net, EXAMPLE_ORG, vec![served]);
+    let mut site = resolver(config(None).local(LocalZone::new(Arc::new(corp))));
+    let reply = ask(
+        &mut site,
+        &mut net,
+        0,
+        query(client(1), "www.corp-served.", RecordType::A, |_| {}),
+    );
+    assert_eq!(addresses(&reply), ["192.0.2.77"], "{:?}", edes(&reply));
+    assert_eq!(leaves(&net), Vec::<String>::new());
+}
+
 /// An alias whose target a local zone holds is answered from that zone,
 /// as QNAME would be: local data is the first source for every name a
 /// chain reaches (RFC 1034 §4.3.2 step 1 and 3a), so `localhost` and
@@ -2051,10 +2120,12 @@ fn rd_clear_refers_a_cached_alias_target_to_a_local_cut() {
 
 /// With RD clear, a local alias whose target lies in another local
 /// zone goes on in that zone (RFC 1034 §4.3.2 step 3a goes back to step
-/// 1), here to its referral, with no query sent.
+/// 1), here to its referral, with no query sent, whether or not the
+/// resolver answers such questions from its cache. Where the chain
+/// leaves the local zones, a resolver that does not answers with the
+/// chain alone.
 #[test]
 fn rd_clear_follows_a_local_alias_into_another_local_zone() {
-    let (mut net, _) = internet(false);
     let norec = |m: &mut Message| m.metadata.recursion_desired = false;
     let corp = builder("corp.", "ns.corp.")
         .rrset(rrset(
@@ -2062,41 +2133,68 @@ fn rd_clear_follows_a_local_alias_into_another_local_zone() {
             300,
             vec![RData::CNAME(CNAME(name("alias.org.")))],
         ))
+        .rrset(rrset(
+            "away.corp.",
+            300,
+            vec![RData::CNAME(CNAME(name("www.example.com.")))],
+        ))
         .build()
         .unwrap();
+    for rd0_from_cache in [true, false] {
+        let (mut net, _) = internet(false);
+        let mut resolver = resolver(Config {
+            rd0_from_cache,
+            ..config(None)
+                .local(org_with_a_cut())
+                .local(LocalZone::new(Arc::new(corp.clone())))
+        });
+        let reply = ask(
+            &mut resolver,
+            &mut net,
+            0,
+            query(client(1), "alias.corp.", RecordType::A, norec),
+        );
+        assert!(net.recording().exchanges().is_empty());
+        assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+        let chain: Vec<(String, RData)> = reply
+            .answers
+            .iter()
+            .map(|record| (record.name.to_string(), record.data.clone()))
+            .collect();
+        assert_eq!(
+            chain,
+            [
+                (
+                    "alias.corp.".to_string(),
+                    RData::CNAME(CNAME(name("alias.org.")))
+                ),
+                (
+                    "alias.org.".to_string(),
+                    RData::CNAME(CNAME(name("www.example.org.")))
+                ),
+            ],
+            "rd0_from_cache {rd0_from_cache}"
+        );
+        assert!(refers_to_local_example_org(&reply), "{reply:?}");
+    }
+    let (mut net, _) = internet(false);
     let mut resolver = resolver(Config {
-        rd0_from_cache: true,
-        ..config(None)
-            .local(org_with_a_cut())
-            .local(LocalZone::new(Arc::new(corp)))
+        rd0_from_cache: false,
+        ..config(None).local(LocalZone::new(Arc::new(corp)))
     });
     let reply = ask(
         &mut resolver,
         &mut net,
         0,
-        query(client(1), "alias.corp.", RecordType::A, norec),
+        query(client(1), "away.corp.", RecordType::A, norec),
     );
     assert!(net.recording().exchanges().is_empty());
     assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
-    let chain: Vec<(String, RData)> = reply
-        .answers
-        .iter()
-        .map(|record| (record.name.to_string(), record.data.clone()))
-        .collect();
     assert_eq!(
-        chain,
-        [
-            (
-                "alias.corp.".to_string(),
-                RData::CNAME(CNAME(name("alias.org.")))
-            ),
-            (
-                "alias.org.".to_string(),
-                RData::CNAME(CNAME(name("www.example.org.")))
-            ),
-        ]
+        rows(&reply.answers),
+        [("away.corp.".to_string(), RecordType::CNAME)]
     );
-    assert!(refers_to_local_example_org(&reply), "{reply:?}");
+    assert!(reply.authorities.is_empty(), "{reply:?}");
 }
 
 #[test]
@@ -3029,6 +3127,63 @@ fn a_yxdomain_from_a_dname_is_passed_on_with_the_dname() {
     assert_eq!(reply.answers[0].record_type(), RecordType::DNAME);
 }
 
+/// A CNAME whose target is below a DNAME that makes it too long: the
+/// authority answers YXDOMAIN with the CNAME and the DNAME, and the RCODE
+/// is the last name's (RFC 6672 §2.2, RFC 6604 §2). Asked of the server
+/// and of a local zone, the resolver passes that on.
+#[test]
+fn a_yxdomain_after_an_alias_is_passed_on_with_the_chain() {
+    let target = format!(
+        "{}.{}.{}.example.org.",
+        "t".repeat(60),
+        "u".repeat(60),
+        "v".repeat(60)
+    );
+    let alias = format!("{}.long.example.com.", "y".repeat(60));
+    let zone = |zone: ZoneBuilder| {
+        zone.rrset(rrset("long.example.com.", 300, vec![dname(&name(&target))]))
+            .rrset(rrset(
+                "x.example.com.",
+                300,
+                vec![RData::CNAME(CNAME(name(&alias)))],
+            ))
+    };
+    let local = zone(builder("example.com.", "ns1.example.com."))
+        .build()
+        .unwrap();
+    for config in [
+        config(None),
+        config(None).local(LocalZone::new(Arc::new(local))),
+    ] {
+        let mut net = delegated(zone, 3600, 3600);
+        let mut resolver = resolver(config);
+        let reply = ask(
+            &mut resolver,
+            &mut net,
+            0,
+            query(client(1), "x.example.com.", RecordType::A, |_| {}),
+        );
+        assert_eq!(
+            reply.metadata.response_code,
+            ResponseCode::YXDomain,
+            "{:?}",
+            edes(&reply)
+        );
+        let answers: Vec<(String, RecordType)> = reply
+            .answers
+            .iter()
+            .map(|record| (record.name.to_ascii(), record.record_type()))
+            .collect();
+        assert_eq!(
+            answers,
+            [
+                ("x.example.com.".to_string(), RecordType::CNAME),
+                ("long.example.com.".to_string(), RecordType::DNAME),
+            ]
+        );
+    }
+}
+
 #[test]
 fn glue_with_ttl_0_serves_the_resolution_it_came_in() {
     // RFC 1035 §7.4: data with TTL 0 is not cached, but is used for the
@@ -3835,11 +3990,13 @@ e   A   192.0.2.5
     assert_eq!(rtype, empty);
 }
 
-/// An NSEC3 record whose Flags field has a bit RFC 5155 does not define
-/// is ignored (RFC 5155 §8.2), and the rest of the reply is read: a
-/// resolver reads its replies with `read_message`.
+/// An NSEC3 record whose Flags field has a bit RFC 5155 does not define,
+/// or whose Hash Algorithm is not one the validator knows, is ignored
+/// (RFC 5155 §8.1, §8.2), and the rest of the reply is read: a resolver
+/// reads its replies with `read_message`. The record is kept with its
+/// RDATA as octets, which no proof takes as an NSEC3.
 #[test]
-fn a_reply_with_an_nsec3_of_unknown_flags_is_read_without_it() {
+fn a_reply_with_an_nsec3_to_ignore_is_read_with_it_as_octets() {
     use fictionet::stdlib::protocols::dns::dnssec::Nsec3HashAlgorithm;
     use fictionet::stdlib::protocols::dns::dnssec::rdata::NSEC3;
     let nsec3 = |iterations: u16| {
@@ -3865,35 +4022,47 @@ fn a_reply_with_an_nsec3_of_unknown_flags_is_read_without_it() {
         300,
         RData::SOA(soa("example.com.")),
     ));
-    // Flags 0x01, Opt-Out, then 0x1234 iterations and no salt: the second
-    // record's flags octet is set to 0x03 below.
+    // Hash Algorithm 1, Flags 0x01, Opt-Out, then 0x1234 iterations and
+    // no salt: the second record's Flags, then its Hash Algorithm, is
+    // changed below.
     message.add_authority(nsec3(0));
     message.add_authority(nsec3(0x1234));
-    let mut bytes = message.to_vec().unwrap();
-    let at = bytes
+    let sent = message.to_vec().unwrap();
+    let at = sent
         .windows(5)
         .position(|window| window == [1, 1, 0x12, 0x34, 0])
         .unwrap();
-    bytes[at + 1] = 0x03;
-    assert!(Message::from_vec(&bytes).is_err(), "hickory refuses it");
+    for (offset, value) in [(1, 0x03), (0, 2)] {
+        let mut bytes = sent.clone();
+        bytes[at + offset] = value;
+        assert!(Message::from_vec(&bytes).is_err(), "hickory refuses it");
 
-    let read = read_message(&bytes).unwrap();
-    assert_eq!(read.metadata.response_code, ResponseCode::NXDomain);
-    let kept: Vec<(RecordType, Option<u16>)> = read
-        .authorities
-        .iter()
-        .map(|record| {
-            let iterations = match &record.data {
-                RData::DNSSEC(DNSSECRData::NSEC3(nsec3)) => Some(nsec3.iterations()),
-                _ => None,
-            };
-            (record.record_type(), iterations)
-        })
-        .collect();
-    assert_eq!(
-        kept,
-        [(RecordType::SOA, None), (RecordType::NSEC3, Some(0))]
-    );
+        let read = read_message(&bytes).unwrap();
+        assert_eq!(read.metadata.response_code, ResponseCode::NXDomain);
+        let kept: Vec<(RecordType, Option<u16>)> = read
+            .authorities
+            .iter()
+            .map(|record| {
+                let iterations = match &record.data {
+                    RData::DNSSEC(DNSSECRData::NSEC3(nsec3)) => Some(nsec3.iterations()),
+                    _ => None,
+                };
+                (record.record_type(), iterations)
+            })
+            .collect();
+        assert_eq!(
+            kept,
+            [
+                (RecordType::SOA, None),
+                (RecordType::NSEC3, Some(0)),
+                (RecordType::NSEC3, None)
+            ]
+        );
+        // The ignored record reads back as it was sent.
+        let ignored = &read.authorities[2];
+        assert!(matches!(ignored.data, RData::Unknown { .. }));
+        assert_eq!(read.to_vec().unwrap(), bytes);
+    }
 }
 
 /// The owner and type of each record.

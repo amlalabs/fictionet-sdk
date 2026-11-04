@@ -1151,9 +1151,11 @@ fn cnames_restart_inside_the_zone() {
         ]
     );
 
-    // A loop stops at the first name seen again (RFC 1034 §4.3.2 step 3a).
+    // A loop is an error (RFC 1034 §3.6.2): SERVFAIL with AA, and the
+    // chain up to the first name seen again.
     let reply = ask(&zone, "loop1.example.", RecordType::A);
-    assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
+    assert!(reply.metadata.authoritative);
     assert_eq!(
         rows(&reply.answers),
         vec![

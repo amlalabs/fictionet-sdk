@@ -127,7 +127,7 @@ standards and Rust do, or where a standard lets both answers stand.
 
 | Kind | Difference | Why Rust is kept |
 |---|---|---|
-| `wire` | `read_message` refuses messages holding a record hickory cannot read by its type's rules, such as an SRV without a target; the Lean codec carries such RDATA as octets (RFC 3597) | hickory's reading of typed RDATA |
+| `wire` | `read_message` refuses messages holding a record hickory cannot read by its type's rules, such as an SRV without a target; the Lean codec carries such RDATA as octets (RFC 3597). A record the RFCs have ignored while the rest of the message stands (an NSEC3 or NSEC3PARAM of another hash algorithm or with unknown flags, RFC 5155 §8.1, §8.2, §4.1.2; a DNSKEY whose Protocol is not 3, RFC 4034 §2.1.2) is kept as octets by both, and compared | hickory's reading of typed RDATA |
 | `fit` | `Gen.lean` sometimes splits one RRset (same owner and type) into two in a section, and the Lean `fit` keeps the two apart | RFC 2181 §5 makes them one RRset, which `fit` writes together |
 | `zone`, `partial` | for QTYPE ANY answered with one RRset, Lean takes the first RRset in the zone's listed order and Rust the RRset of the lowest type; the test then checks that Rust answers Lean's RRset when asked for its type | RFC 8482 §4.1 lets a server pick any one RRset; a master file's order does not survive into a zone |
 | `learned`, `learned_signed` | a copy's reply leaves out optional additional data it does not hold, such as the address of an MX target it never looked up | RFC 2181 §5.4.1 and RFC 9471 §3.2 make such data optional; `serve_reply_upstream` allows exactly this (`Response.Grows`) |
