@@ -64,7 +64,12 @@ last one wins.
   connection has gone, that ACK is dropped with no answer.
 - A RST that refuses a SYN or a third ACK has the fields Linux gives it: the
   sequence number the segment acknowledged, or else 0 and an ACK of the SYN,
-  window 0, and MP_TCPRST as its only option.
+  window 0, and MP_TCPRST as its only option. Any other RST the server
+  sends on an MPTCP subflow carries MP_TCPRST too, with "unspecified error"
+  unless it has a reason, as Linux sends it.
+- TCP options go out in the order and with the padding Linux gives them. A
+  SYN-ACK carries Maximum Segment Size, SACK-Permitted, Timestamps, a
+  No-Operation and Window Scale, in that order, then any MPTCP option.
 - TCP options are read as Linux reads them: an option whose Length runs past
   the header ends the list, a known kind of another length is ignored, and
   the SYN is answered.
@@ -82,7 +87,7 @@ kind it is:
 | `event` | When | What it holds |
 | --- | --- | --- |
 | `syn` | A SYN into the world | Source and destination, flags, the initial sequence number, every TCP option in order, `options_fault` if the options did not all read, each MPTCP option decoded, the payload in hex when the SYN carried one, and `gap_us` since the same source's previous SYN when that SYN was within the burst window |
-| `segment` | Any other segment in with a payload, a FIN or MPTCP options | Flags, sequence number, every TCP option in order, `options_fault`, each MPTCP option decoded, and the payload in hex |
+| `segment` | Any other segment in with a payload, a FIN, a RST or MPTCP options | Flags, sequence number, every TCP option in order, `options_fault`, each MPTCP option decoded, and the payload in hex |
 | `answer` | A RST from the world, or the SYN-ACK that first answers a SYN | Flags, every TCP option in order, and each MPTCP option decoded, such as the key the server issued |
 | `burst` | A source's SYNs, or its SYNs with MP_JOIN, reach the burst threshold | Source address, which kind, how many, and the window |
 | `lost` | The log takes lines again after a file could not be written, such as while the disk was full | How many packets the capture and how many lines the log left out |
@@ -199,25 +204,20 @@ Run the agent under test in the same namespace. Its every packet is in
 `/tmp/honeypot.jsonl`, named `agent`. Linux clients send MP_CAPABLE when the
 program opens an MPTCP socket, or through `mptcpize run`.
 
-## Dedicated raw virtio NIC
+## A NIC of its own
 
-The `raw-virtio` feature connects a dedicated virtio NIC directly to this
-world through `fictionet_host::raw`. The driver and bounded host pump own
-all device polling outside the run. Complete Ethernet frames cross the
-attachment before any Ethernet or IP parsing. Linux does not receive IP
-packets from that assigned NIC; the honeypot's existing `internet`
-attachment and simulated TCP stack handle them.
+With the `raw-virtio` feature, the world can own a virtio network card
+outright. A driver in `fictionet_host` reads whole Ethernet frames from the
+card and hands them to the world. The Linux kernel on the machine never
+sees the card's traffic, so it never runs its IP or TCP code on it. The
+world answers in its place, through the same `internet` attachment as
+above.
 
-This is the integrated guest transport, not a public deployment. The driver
-currently supports a modern virtio-net device in an explicitly marked QEMU
-guest. Public hosting requires a suitable dedicated device and deployment
-support; the local sandbox attachment above is only an internal test path.
-
-Run this only inside the disposable QEMU guest described in
-[`host/README.md`](../../host/README.md), with `fictionet.rawnic=1` on its
-kernel command line, an IOMMU, and the dedicated NIC already bound to
-`vfio-pci`. The driver requires that guest setup. Build the example on the
-host, then run the resulting binary in the guest:
+For now the driver runs only in a QEMU guest set up for it, as
+[`host/README.md`](../../host/README.md) describes. The guest's kernel
+command line has `fictionet.rawnic=1`, it has an IOMMU, and the card is
+already bound to `vfio-pci`. Build the example on the host, and run it in
+the guest:
 
 ```sh
 cargo build -p honeypot-world --features raw-virtio --example raw_honeypot
@@ -229,38 +229,39 @@ cargo build -p honeypot-world --features raw-virtio --example raw_honeypot
   --ssh 22 --http 80 --log honeypot.jsonl --pcap honeypot.pcapng
 ```
 
-The first two arguments are the assigned NIC's PCI address and the raw
-Ethernet log path. The remaining flags select the existing honeypot
-configuration and IP logs. This example uses the NIC attachment; the
-`--world` socket setting does not create a socket listener.
+The first argument is the card's PCI address, and the second is where to
+log Ethernet frames. The flags are the honeypot's usual ones. `--world` is
+not used: there is no socket to attach to.
 
-`ethernet.jsonl` records each complete frame as hexadecimal `bytes`, with
-`direction` (`in` or `out`), world-clock `at_us`, and `lost` (records the
-writer refused since the last accepted record). It retains malformed
-frames, VLAN headers, unknown EtherTypes and Ethernet padding before the
-world chooses whether to interpret them. Each accepted line is flushed;
-partially written records are completed before the next record. Refused
-records are counted and do not stop packet handling. `honeypot.pcapng`
-continues to contain IP packets, and `honeypot.jsonl` records TCP options,
-MPTCP negotiation and the normal observations.
+`ethernet.jsonl` has one line per frame, both ways, before the world reads
+it: `direction` (`in` or `out`), `at_us`, the frame in hex as `bytes`, and
+`lost`, how many lines the file could not take since the last one it did.
+So it keeps frames the world ignores: VLAN tags, unknown EtherTypes,
+malformed headers and Ethernet padding. `honeypot.pcapng` and
+`honeypot.jsonl` are as above.
 
-The world answers ARP for its configured IPv4 address. Untagged IPv4 and
-IPv6 packets addressed to the NIC or broadcast enter the existing IP
-attachment, which limits delivery to the configured honeypot address.
-VLAN and unknown EtherTypes remain in the raw log. A bounded table of
-1024 source IP addresses learns each reply's destination MAC from the
-incoming frame; an evicted source must send again before it receives
-another reply. IPv6 peers need a static neighbor entry. The adapter does
-not provision addresses, configure routing, or bind PCI devices.
-Outgoing IP packets above the Ethernet MTU of 1500 bytes are dropped without
-stopping the world. This adapter does not fragment oversized replies; the IP
-capture still records them.
+The world plays a Linux host on the link:
 
-Embedding applications can call `honeypot_world::start_raw` with a
-`RawAttachment`, the usual configuration and observation sinks, and a
-`Box<dyn Write + Send>` for raw JSON lines. Create and retain the
-`RawPump` outside `fictionet::run`; only the raw attachment enters the
-world. All driver and raw frame tests run in the QEMU harness:
+- It answers ARP for its address, to the sender the request names.
+- Untagged IPv4 and IPv6 frames sent to its MAC address, or broadcast, go
+  on to the `internet` attachment. Every other frame is only logged.
+- It sends each reply to the MAC address that the reply's destination last
+  sent from. It remembers 1,024 addresses, as Linux's neighbor table holds
+  by default. A source pushed out sends again before it gets more replies.
+- It drops replies longer than 1,500 bytes, and does not fragment them. The
+  IP capture still has them. It also drops replies while the card's
+  transmit queue is full.
+- The server's address must be IPv4. The world does no IPv6 neighbor
+  discovery.
+
+The world does not set up addresses or routes, or bind PCI devices.
+
+A program that embeds the honeypot calls `honeypot_world::start_raw` with a
+`RawAttachment`, the usual configuration and sinks, and a writer for the
+Ethernet log. It opens the `RawPump` before `fictionet::run` and keeps it
+for the run. Only the attachment goes into the world.
+
+Every test of the driver and of raw frames runs in QEMU:
 
 ```sh
 cargo xtask rawnic target/rawnic-qemu

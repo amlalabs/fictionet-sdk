@@ -293,8 +293,8 @@ fn a_listener_without_an_answer_adds_nothing() {
         let kinds: Vec<u8> = options_of(t).iter().map(|o| o.0).collect();
         assert_eq!(
             kinds,
-            [2, 3, 4, 8],
-            "MSS, Window Scale, SACK-Permitted, Timestamps"
+            [2, 4, 8, 1, 3],
+            "MSS, SACK-Permitted, Timestamps, No-Operation and Window Scale, as Linux lays them out"
         );
         raw.send(segment(4000, 1001, seq_of(t).wrapping_add(1), ACK, &[]));
         let conn = listener.accept(&fcx).await?;
@@ -331,9 +331,10 @@ fn an_endpoint_s_own_syn_reaches_the_other_endpoint() {
                 *syn,
                 [
                     TcpOption::MaxSegmentSize(1460),
-                    TcpOption::WindowScale(_),
                     TcpOption::SackPermitted,
-                    TcpOption::Timestamps { .. }
+                    TcpOption::Timestamps { .. },
+                    TcpOption::NoOperation,
+                    TcpOption::WindowScale(_),
                 ]
             ),
             "{syn:?}"
@@ -837,6 +838,8 @@ fn an_answer_drops_at_the_ack_or_stamps_the_segments() {
         conn.write_all(&fcx, b"hi").await?;
         let data = next(&fcx, &mut raw).await.expect("data");
         let t = tcp_of(&data);
+        // Timestamps after two No-Operations, as Linux pads them.
+        let nop = || (1, Vec::new());
         let timestamp = || {
             let mut value = (fcx.now().since_start().as_millis() as u32)
                 .to_be_bytes()
@@ -844,7 +847,10 @@ fn an_answer_drops_at_the_ack_or_stamps_the_segments() {
             value.extend_from_slice(&1u32.to_be_bytes());
             (8, value)
         };
-        assert_eq!(options_of(t), [timestamp(), (254, vec![0, 2])]);
+        assert_eq!(
+            options_of(t),
+            [nop(), nop(), timestamp(), (254, vec![0, 2])]
+        );
         raw.send(segment_with(
             4001,
             1001,
@@ -855,7 +861,10 @@ fn an_answer_drops_at_the_ack_or_stamps_the_segments() {
         ));
         assert_eq!(read_n(&fcx, &mut conn, 5).await?, b"hello");
         let ack = next(&fcx, &mut raw).await.expect("an ACK");
-        assert_eq!(options_of(tcp_of(&ack)), [timestamp(), (254, vec![0, 0])]);
+        assert_eq!(
+            options_of(tcp_of(&ack)),
+            [nop(), nop(), timestamp(), (254, vec![0, 0])]
+        );
         assert_eq!(*taken.lock().unwrap(), [0, 5]);
         Ok(())
     });
@@ -1017,7 +1026,7 @@ fn syns_past_the_backlog_get_syn_cookies() {
             assert_eq!(ack_of(t), 1001);
             let kinds: Vec<u8> = options_of(t).iter().map(|o| o.0).collect();
             if dport_of(t) < 5002 {
-                assert_eq!(kinds, [2, 3, 4, 8, 253], "a full SYN-ACK");
+                assert_eq!(kinds, [2, 4, 8, 1, 3, 253], "a full SYN-ACK");
             } else {
                 assert_eq!(
                     options_of(t),

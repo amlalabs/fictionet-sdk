@@ -916,31 +916,37 @@ impl<'a> Repr<'a> {
         })
     }
 
+    /// How many SACK blocks `emit` writes: those of an ACK whose segment
+    /// does not offer SACK-Permitted.
+    fn sack_blocks(&self) -> usize {
+        if self.sack_permitted || self.ack_number.is_none() {
+            return 0;
+        }
+        self.sack_ranges.iter().flatten().count()
+    }
+
     /// Return the length of a header that will be emitted from this high-level representation.
     ///
     /// This should be used for buffer space calculations.
     /// The TCP header length is a multiple of 4.
     pub(crate) fn header_len(&self) -> usize {
+        // The layout `emit` writes: each option padded to a word with
+        // No-Operations, as Linux writes them.
         let mut length = field::URGENT.end;
         if self.max_seg_size.is_some() {
             length += 4
         }
+        length += match (self.sack_permitted, self.timestamp.is_some()) {
+            (_, true) => 12,
+            (true, false) => 4,
+            (false, false) => 0,
+        };
         if self.window_scale.is_some() {
-            length += 3
+            length += 4
         }
-        if self.sack_permitted {
-            length += 2;
-        }
-        if self.timestamp.is_some() {
-            length += 10;
-        }
-        let sack_range_len: usize = self
-            .sack_ranges
-            .iter()
-            .map(|o| o.map(|_| 8).unwrap_or(0))
-            .sum();
-        if sack_range_len > 0 {
-            length += sack_range_len + 2;
+        let blocks = self.sack_blocks();
+        if blocks > 0 {
+            length += 4 + 8 * blocks;
         }
         length += self.extra.len();
         if !length.is_multiple_of(4) {
@@ -981,23 +987,25 @@ impl<'a> Repr<'a> {
         }
         packet.set_ack(self.ack_number.is_some());
         {
-            // SYN and SYN-ACK options are emitted in this order.
+            // Options go in the order and with the padding Linux gives them
+            // (tcp_options_write): MSS; SACK-Permitted and Timestamps
+            // together, or either after two No-Operations; Window Scale
+            // after one; SACK blocks after two; then the extra options.
             let mut options = packet.options_mut();
             if let Some(value) = self.max_seg_size {
                 let tmp = options;
                 options = TcpOption::MaxSegmentSize(value).emit(tmp);
             }
-            if let Some(value) = self.window_scale {
-                let tmp = options;
-                options = TcpOption::WindowScale(value).emit(tmp);
-            }
-            if self.sack_permitted {
-                let tmp = options;
-                options = TcpOption::SackPermitted.emit(tmp);
-            } else if self.ack_number.is_some() && self.sack_ranges.iter().any(|s| s.is_some()) {
-                let tmp = options;
-                let [first, second, third] = self.sack_ranges;
-                options = TcpOption::SackRange([first, second, third, None]).emit(tmp);
+            match (self.sack_permitted, self.timestamp) {
+                (true, Some(_)) => {
+                    let tmp = options;
+                    options = TcpOption::SackPermitted.emit(tmp);
+                }
+                (true, None) | (false, Some(_)) => {
+                    let tmp = options;
+                    options = TcpOption::NoOperation.emit(TcpOption::NoOperation.emit(tmp));
+                }
+                (false, None) => {}
             }
             if let Some(timestamp) = self.timestamp {
                 let tmp = options;
@@ -1006,6 +1014,19 @@ impl<'a> Repr<'a> {
                     tsecr: timestamp.tsecr,
                 }
                 .emit(tmp);
+            } else if self.sack_permitted {
+                let tmp = options;
+                options = TcpOption::SackPermitted.emit(tmp);
+            }
+            if let Some(value) = self.window_scale {
+                let tmp = options;
+                options = TcpOption::WindowScale(value).emit(TcpOption::NoOperation.emit(tmp));
+            }
+            if self.sack_blocks() > 0 {
+                let tmp = options;
+                let [first, second, third] = self.sack_ranges;
+                let tmp = TcpOption::NoOperation.emit(TcpOption::NoOperation.emit(tmp));
+                options = TcpOption::SackRange([first, second, third, None]).emit(tmp);
             }
             let (extra, rest) = options.split_at_mut(self.extra.len());
             extra.copy_from_slice(self.extra);
@@ -1186,10 +1207,72 @@ mod test {
             &DST_ADDR.into(),
         );
         let packet = Packet::new_checked(&bytes).unwrap();
-        assert_eq!(packet.options(), &[3, 3, 0, 0]);
+        assert_eq!(packet.options(), &[1, 3, 3, 0]);
         assert_eq!(
             Repr::parse(&packet, &SRC_ADDR.into(), &DST_ADDR.into()),
             Ok(repr)
+        );
+    }
+
+    /// Options go on the wire as Linux writes them: a SYN-ACK's as
+    /// `M5B4,S,T,N,W7`, and a later segment's timestamps and SACK blocks
+    /// each after two No-Operations.
+    #[test]
+    fn test_options_are_laid_out_as_linux_writes_them() {
+        let timestamp = Some(TcpTimestampRepr {
+            tsval: 0x0102_0304,
+            tsecr: 0x0506_0708,
+        });
+        let options = |repr: &Repr| {
+            let mut bytes = vec![0xa5; repr.buffer_len()];
+            repr.emit(
+                &mut Packet::new_unchecked(&mut bytes),
+                &SRC_ADDR.into(),
+                &DST_ADDR.into(),
+            );
+            let packet = Packet::new_checked(&bytes).unwrap();
+            assert_eq!(
+                Repr::parse(&packet, &SRC_ADDR.into(), &DST_ADDR.into()),
+                Ok(*repr)
+            );
+            packet.options().to_vec()
+        };
+        let syn_ack = Repr {
+            ack_number: Some(SeqNumber(1)),
+            max_seg_size: Some(1460),
+            window_scale: Some(7),
+            sack_permitted: true,
+            timestamp,
+            payload: &[],
+            ..packet_repr()
+        };
+        assert_eq!(
+            options(&syn_ack),
+            [
+                2, 4, 0x05, 0xb4, 4, 2, 8, 10, 1, 2, 3, 4, 5, 6, 7, 8, 1, 3, 3, 7
+            ]
+        );
+        let no_timestamps = Repr {
+            timestamp: None,
+            ..syn_ack
+        };
+        assert_eq!(
+            options(&no_timestamps),
+            [2, 4, 0x05, 0xb4, 1, 1, 4, 2, 1, 3, 3, 7]
+        );
+        let segment = Repr {
+            control: Control::None,
+            max_seg_size: None,
+            window_scale: None,
+            sack_permitted: false,
+            sack_ranges: [Some((10, 20)), None, None],
+            ..syn_ack
+        };
+        assert_eq!(
+            options(&segment),
+            [
+                1, 1, 8, 10, 1, 2, 3, 4, 5, 6, 7, 8, 1, 1, 5, 10, 0, 0, 0, 10, 0, 0, 0, 20
+            ]
         );
     }
 
@@ -1459,7 +1542,7 @@ mod test {
                     extra: &extra,
                     ..packet_repr()
                 },
-                52,
+                56,
             ),
         ] {
             assert_eq!(repr.header_len(), header_len);

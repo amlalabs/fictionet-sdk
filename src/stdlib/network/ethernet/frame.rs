@@ -137,7 +137,7 @@ pub(super) fn destination(
 /// The IP packet in an IPv4 or IPv6 frame's payload, without the padding
 /// Ethernet may add after it. `None` if the header is broken or says the
 /// packet is longer than the payload.
-pub(super) fn ip_packet(ethertype: u16, payload: &[u8]) -> Option<&[u8]> {
+pub fn ip_packet(ethertype: u16, payload: &[u8]) -> Option<&[u8]> {
     let version = match ethertype {
         IPV4 => 4,
         IPV6 => 6,

@@ -1,8 +1,9 @@
-//! Complete Ethernet frames between a world and a dedicated host driver thread.
+//! Whole Ethernet frames between a world and the thread that drives a NIC.
 //!
-//! This link deliberately does not implement Fictionet's IP packet interface.
-//! Each direction holds at most sixty four frames, plus one pending host frame.
-//! When ingress is full the driver stops reading; the NIC may then drop traffic.
+//! This link carries Ethernet frames, not the IP packets of Fictionet's
+//! `Interface`. Each direction holds at most 64 frames, plus one the
+//! driver thread holds. When the receive queue is full, the thread stops
+//! reading, and the NIC may drop frames.
 
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -45,6 +46,17 @@ pub struct RawReceiver {
 enum Command {
     Frame(EthernetFrame),
     Flush(oneshot::Sender<()>),
+}
+
+fn check_length(frame: &EthernetFrame) -> Result {
+    if (14..=MAX_FRAME).contains(&frame.0.len()) {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "Ethernet frame length is outside supported bounds",
+    )
+    .into())
 }
 
 fn closed(failure: &Mutex<Option<Error>>) -> Error {
@@ -98,14 +110,20 @@ impl RawSender {
     /// Queues a frame, waiting for space and observing world cancellation.
     /// Cancelling before queue space is available discards the supplied frame.
     pub async fn send(&self, fcx: &Cx, frame: EthernetFrame) -> Result {
-        if !(14..=MAX_FRAME).contains(&frame.0.len()) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Ethernet frame length is outside supported bounds",
-            )
-            .into());
-        }
+        check_length(&frame)?;
         self.command(fcx, Command::Frame(frame)).await
+    }
+
+    /// Queues a frame if there is room, without waiting. Returns whether it
+    /// was queued: a frame sent while the queue is full is dropped, as a
+    /// host's full transmit queue drops it.
+    pub fn try_send(&self, frame: EthernetFrame) -> Result<bool> {
+        check_length(&frame)?;
+        match self.tx.try_send(Command::Frame(frame)) {
+            Ok(()) => Ok(true),
+            Err(mpsc::error::TrySendError::Full(_)) => Ok(false),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(closed(&self.failure)),
+        }
     }
 
     async fn command(&self, fcx: &Cx, command: Command) -> Result {
@@ -280,6 +298,27 @@ mod tests {
             assert!(matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
             Ok(())
         })).unwrap();
+    }
+
+    #[test]
+    fn try_send_drops_a_frame_when_the_queue_is_full() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let sender = RawSender {
+            tx,
+            failure: Arc::new(Mutex::new(None)),
+        };
+        assert!(sender.try_send(EthernetFrame(vec![1; 14])).unwrap());
+        assert!(!sender.try_send(EthernetFrame(vec![2; 14])).unwrap());
+        assert!(sender.try_send(EthernetFrame(vec![3; 13])).is_err());
+        assert!(
+            matches!(rx.try_recv(), Ok(Command::Frame(EthernetFrame(bytes))) if bytes == vec![1; 14])
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        drop(rx);
+        assert!(sender.try_send(EthernetFrame(vec![4; 14])).is_err());
     }
 
     #[test]

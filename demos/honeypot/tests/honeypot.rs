@@ -1854,10 +1854,17 @@ fn fastclose_resets_the_connection_and_removes_its_token() {
         assert_eq!(ack_of(&fourth), 7001);
         let close = mptcp_bytes(MptcpOption::FastClose { receiver_key: key });
         net.send(segment(from, server(22), 5001, ack, ACK, &close, b""));
+        // Each subflow's RST carries MP_TCPRST, as Linux sends it.
+        let unspecified = [MptcpOption::TcpRst {
+            transient: false,
+            reason: reason::UNSPECIFIED,
+        }];
         let reset = net.recv().await.expect("the fastclose reset");
         assert_eq!(flags(&reset) & RST, RST);
+        assert_eq!(mptcp_of(&reset), unspecified);
         let joined_reset = net.recv().await.expect("the joined subflow reset");
         assert_eq!(flags(&joined_reset) & RST, RST);
+        assert_eq!(mptcp_of(&joined_reset), unspecified);
         net.drain().await;
         assert_eq!(net.honeypot.mptcp_connections(), 0);
         let join = with_mss(&mptcp_bytes(join_syn(token(key), 99)));

@@ -82,7 +82,8 @@ pub trait PortServer: Any + Send + Sync {
 
     /// How the port answers each connection attempt's handshake
     /// ([`tcp::Listener::answer`]), such as an MPTCP server with
-    /// MP_CAPABLE. Asked once, when the port's listener opens. A SYN comes
+    /// MP_CAPABLE. Asked when the port's listener opens, and again when
+    /// another server would share the port. A SYN comes
     /// before anything that tells hosts apart, so a server that answers
     /// cannot share its port with another host: placing one there fails.
     /// Default `None`: the endpoint's plain handshake.

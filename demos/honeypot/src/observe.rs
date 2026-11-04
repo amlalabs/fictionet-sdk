@@ -17,7 +17,7 @@
 //!   options in order, why the options could not all be read, the MPTCP
 //!   options decoded, its payload, and the time since the same source's
 //!   previous SYN when that SYN was within the burst window;
-//! - every other segment with a payload, a FIN or an MPTCP option
+//! - every other segment with a payload, a FIN, a RST or an MPTCP option
 //!   ([`Observation::Segment`]), with its options and payload;
 //! - a burst of SYNs, or of SYNs with MP_JOIN, from one source address
 //!   ([`Observation::Burst`]).
@@ -86,8 +86,9 @@ const ACK: u8 = 0x10;
 
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(63);
 
-/// Which way a packet crosses an attachment.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Which way a packet crosses an attachment, logged as `in` or `out`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Direction {
     /// From the sandbox (or the internet) into the world.
     In,
@@ -130,8 +131,8 @@ pub enum Observation {
         #[serde(skip_serializing_if = "Option::is_none")]
         gap_us: Option<u64>,
     },
-    /// Any other segment into the world with a payload, a FIN or MPTCP
-    /// options.
+    /// Any other segment into the world with a payload, a FIN, a RST or
+    /// MPTCP options.
     Segment {
         /// When it arrived.
         at_us: u64,
@@ -932,7 +933,6 @@ impl Observer {
             };
             // An answer with no pending SYN is a retransmission.
             let first = (rst || syn_ack) && self.answered(awaited);
-            self.expire(now);
             if rst || (syn_ack && first) {
                 return vec![Observation::Answer {
                     at_us,
@@ -982,7 +982,7 @@ impl Observer {
             }));
             return out;
         }
-        if payload.is_empty() && mptcp.is_empty() && flags & FIN == 0 {
+        if payload.is_empty() && mptcp.is_empty() && flags & (FIN | RST) == 0 {
             return Vec::new();
         }
         vec![Observation::Segment {
@@ -1345,6 +1345,22 @@ mod tests {
                 data: Hex(vec![0x80, 3])
             }]
         );
+    }
+
+    /// A client's RST is logged though it carries nothing else, since a
+    /// race in connection setup may turn on one. A bare ACK is not.
+    #[test]
+    fn a_client_rst_is_logged() {
+        let rst = segment(RST, &[], b"");
+        assert!(matches!(
+            &observe(&mut observer(), Direction::In, &rst)[..],
+            [Observation::Segment {
+                flags: Flags(RST),
+                ..
+            }]
+        ));
+        let ack = segment(ACK, &[], b"");
+        assert_eq!(observe(&mut observer(), Direction::In, &ack), []);
     }
 
     #[test]

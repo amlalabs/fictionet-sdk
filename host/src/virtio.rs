@@ -800,26 +800,30 @@ fn capabilities(config: &[u8; 256]) -> io::Result<(Capability, Capability, Capab
                 offset,
                 length: length_bytes,
             };
+            // A device may offer several capabilities of one type, in the
+            // order it prefers them, and the driver uses the first
+            // (virtio 1.2 section 4.1.4).
             match config[cursor + 3] {
-                VIRTIO_PCI_CAP_COMMON_CFG => {
-                    if length_bytes < 56
-                        || !offset.is_multiple_of(8)
-                        || common.replace(cap).is_some()
-                    {
+                VIRTIO_PCI_CAP_COMMON_CFG if common.is_none() => {
+                    if length_bytes < 56 || !offset.is_multiple_of(8) {
                         return Err(invalid("invalid common capability"));
                     }
+                    common = Some(cap);
                 }
-                VIRTIO_PCI_CAP_NOTIFY_CFG => {
-                    if length < 20 || notify.replace(cap).is_some() {
+                VIRTIO_PCI_CAP_NOTIFY_CFG if notify.is_none() => {
+                    if length < 20 {
                         return Err(invalid("invalid notify capability"));
                     }
+                    notify = Some(cap);
                     multiplier =
                         u32::from_le_bytes(config[cursor + 16..cursor + 20].try_into().unwrap());
                 }
-                VIRTIO_PCI_CAP_DEVICE_CFG if length_bytes < 6 || net.is_some() => {
-                    return Err(invalid("invalid network capability"));
+                VIRTIO_PCI_CAP_DEVICE_CFG if net.is_none() => {
+                    if length_bytes < 6 {
+                        return Err(invalid("invalid network capability"));
+                    }
+                    net = Some(cap);
                 }
-                VIRTIO_PCI_CAP_DEVICE_CFG => net = Some(cap),
                 _ => {}
             }
         }
@@ -918,6 +922,31 @@ mod tests {
         ] {
             assert!(address.parse::<PciAddress>().is_err());
         }
+    }
+
+    /// A device such as QEMU's with `modern-pio-notify=on` offers a second
+    /// notify capability. The first of each type is used.
+    #[test]
+    fn the_first_capability_of_each_type_is_used() {
+        let mut config = [0; 256];
+        config[PCI_STATUS] = 0x10;
+        config[PCI_CAPABILITY_LIST] = 0x40;
+        // Vendor capability: next, length, type, BAR, offset, length.
+        let mut cap =
+            |at: usize, next: u8, len: u8, kind: u8, bar: u8, offset: u32, length: u32| {
+                config[at..at + 5].copy_from_slice(&[PCI_CAP_ID_VNDR, next, len, kind, bar]);
+                config[at + 8..at + 12].copy_from_slice(&offset.to_le_bytes());
+                config[at + 12..at + 16].copy_from_slice(&length.to_le_bytes());
+            };
+        cap(0x40, 0x50, 16, VIRTIO_PCI_CAP_COMMON_CFG, 0, 0, 56);
+        cap(0x50, 0x64, 20, VIRTIO_PCI_CAP_NOTIFY_CFG, 0, 0x1000, 4);
+        cap(0x64, 0x78, 20, VIRTIO_PCI_CAP_NOTIFY_CFG, 1, 0, 4);
+        cap(0x78, 0, 16, VIRTIO_PCI_CAP_DEVICE_CFG, 0, 0x2000, 8);
+        config[0x60] = 4;
+        config[0x74] = 8;
+        let (_, notify, net, multiplier) = capabilities(&config).unwrap();
+        assert_eq!((notify.bar, notify.offset, multiplier), (0, 0x1000, 4));
+        assert_eq!((net.offset, net.length), (0x2000, 8));
     }
 
     #[test]

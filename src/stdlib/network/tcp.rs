@@ -108,7 +108,8 @@ const BACKLOG: usize = 4096;
 const MAX_BACKLOG: usize = 65_536;
 /// Of those, at most this many from one peer address. More attempts from
 /// that address get SYN cookies, so spoofed attempts cannot prevent a
-/// real peer from completing its handshake.
+/// real peer from completing its handshake. A peer whose address cannot be
+/// spoofed has them dropped instead.
 const BACKLOG_PER_PEER: usize = 256;
 /// The first local port for outgoing connections.
 const EPHEMERAL: u16 = 49152;
@@ -456,6 +457,13 @@ pub trait Segments: Send {
         out.extend_from_slice(data);
         SegmentVerdict::Take
     }
+
+    /// The options for a RST the connection sends with none of its own,
+    /// such as when the server resets it, as an MPTCP host puts MP_TCPRST
+    /// on every RST of a subflow (RFC 8684 section 3.6). Default none.
+    fn reset(&mut self) -> Vec<TcpOption> {
+        Vec::new()
+    }
 }
 
 /// The action requested by the protocol carried over a TCP connection.
@@ -524,6 +532,10 @@ impl stcp::SegmentOptions for SegmentsOnWire {
 
     fn arrived(&mut self, seq: u32, data: &[u8], out: &mut Vec<u8>) -> stcp::Verdict {
         self.0.arrived(seq, data, out).on_wire()
+    }
+
+    fn reset(&mut self, out: &mut Vec<u8>) {
+        out.extend(encode(&self.0.reset()).unwrap_or_default());
     }
 }
 
@@ -820,7 +832,9 @@ impl Options {
     /// carries a Maximum Segment Size and what the listener's
     /// [`Answer::syn`] adds, and nothing else. So such a connection has no
     /// window scaling, SACK, timestamps or ECN, and its [`Handshake`] has
-    /// no SYN options.
+    /// no SYN options. Linux sends the same SYN-ACK to a SYN without
+    /// timestamps. To one with them, it also sends timestamps, SACK and
+    /// Window Scale, keeping their settings in the timestamp value.
     /// When the connections waiting for `accept` alone fill the backlog,
     /// SYNs and ACKs that return cookies are dropped, as Linux drops them
     /// with a full accept queue.
@@ -2437,9 +2451,9 @@ impl Listener {
     ///
     /// [`Answer::syn`] sees each SYN's options. [`SynAnswer::Accept`] adds
     /// options to the SYN-ACK and its retransmissions, after the endpoint's
-    /// own (Maximum Segment Size, and Window Scale and SACK-Permitted when
-    /// the SYN offered them), or after the Maximum Segment Size of a SYN
-    /// cookie. [`SynAnswer::Refuse`] resets the attempt.
+    /// own (Maximum Segment Size, and SACK-Permitted, Timestamps and Window
+    /// Scale when the SYN offered them), or after the Maximum Segment Size
+    /// of a SYN cookie. [`SynAnswer::Refuse`] resets the attempt.
     ///
     /// [`Answer::ack`] sees the [`Handshake`] when the ACK that completes it
     /// arrives. [`AckAnswer::Refuse`] resets the connection then, and
@@ -2473,9 +2487,11 @@ impl Listener {
     /// Each listening port holds up to its configured backlog of connections
     /// waiting for `accept`, counting those still in their handshake. See
     /// [`Options::backlog`] for the default, maximum and separate per-peer
-    /// limit. SYNs from a peer already at its limit are dropped until some
-    /// of its connections are accepted or give up. Otherwise, past the
-    /// backlog, connection attempts get SYN cookies.
+    /// limit. Past the backlog, or past a peer's own limit, connection
+    /// attempts get SYN cookies. A peer at its limit whose address the
+    /// network keeps from being spoofed, such as an attached sandbox, has
+    /// its SYNs dropped instead, until some of its connections are accepted
+    /// or give up.
     pub async fn accept(&mut self, fcx: &Cx) -> Result<TcpConnection, ConnError> {
         let port = self.port;
         let shared = &self.shared;

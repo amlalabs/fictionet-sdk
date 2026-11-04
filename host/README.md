@@ -1,57 +1,61 @@
 # Raw Ethernet in a QEMU guest
 
-The optional `virtio-net` feature provides a userspace VFIO driver for a
-modern virtio-net PCI device. A host-side pump owns the driver and carries
-complete Ethernet frames to and from a Rust world over bounded channels.
-The guest Linux IP and TCP stacks do not process those frames. Linux still
-supplies VFIO, IOMMU mappings, memory and scheduling; QEMU still implements
-the virtual NIC.
+The optional `virtio-net` feature is a user-space VFIO driver for a modern
+virtio-net PCI device. A driver thread, the `RawPump`, owns the device and
+carries whole Ethernet frames to and from a Rust world. The guest's Linux
+IP and TCP code never sees those frames. Linux still provides VFIO, the
+IOMMU mappings, memory and scheduling, and QEMU still emulates the card.
 
-The [raw world example](examples/raw_world.rs) parses a typed `PciAddress`,
-opens `VirtioNet`, and calls `RawPump::attach` before `fictionet::run`.
-The pump polls hardware on a separate host thread and parks when idle or
-backpressured. The world awaits `RawAttachment::recv`; it never polls the
-device or checks a host deadline. Each direction holds at most sixty four
-queued frames plus one pending host frame. Sending waits for queue space;
-a full receive queue stops driver reads, so the NIC may drop traffic.
-Receive, send and flush observe world cancellation. Driver failures close
-the channels and propagate to the world. Dropping the pump joins its thread
-and resets the device. The ordinary `fictionet::Interface` remains an
-IP-packet interface; `EthernetFrame` carries complete Ethernet bytes.
+The [raw world example](examples/raw_world.rs) parses a `PciAddress`, opens
+`VirtioNet`, and calls `RawPump::attach` before `fictionet::run`.
 
-The [raw honeypot example](../demos/honeypot/examples/raw_honeypot.rs), built
-with the honeypot crate's `raw-virtio` feature, uses the same attachment.
-It records complete ingress frames before parsing and passes supported IP
-traffic to the existing honeypot world. It runs only in the opted-in guest.
+- The pump polls the device on its own thread, and parks when there is
+  nothing to do or the world is not keeping up.
+- The world awaits `RawAttachment::recv`. It never polls the device.
+- Each direction holds at most 64 frames, plus one the pump holds.
+  `send` waits for room, and `try_send` drops the frame when there is
+  none. When the receive queue is full, the pump stops reading, and the
+  card may drop frames.
+- Receive, send, and flush end when the world is cancelled.
+- A driver failure closes both directions, and the world gets the error.
+- Dropping the pump stops its thread and resets the device.
+- `fictionet::Interface` stays an interface for IP packets.
+  `EthernetFrame` carries whole Ethernet frames.
 
-This implementation is restricted to QEMU guests. It checks QEMU's DMI
-identity and the guest kernel command line token `fictionet.rawnic=1`
-before opening VFIO. The caller must supply an already bound virtio-net
-device. The library does not load modules, unbind drivers or configure
-network interfaces. The guard prevents accidental use outside the test
-environment; it is not a security boundary against a privileged caller.
+The [raw honeypot example](../demos/honeypot/examples/raw_honeypot.rs),
+built with the honeypot crate's `raw-virtio` feature, uses the same
+attachment. It logs each frame before reading it, and passes IP packets
+on to the honeypot world.
 
-`VirtioNet::receive` returns the Ethernet bytes delivered by the device,
-without the virtio transport header. `transmit` accepts Ethernet bytes.
-Polling and bounded split queues provide backpressure. The driver does not
-negotiate checksum, segmentation or receive coalescing offloads, and does
-not parse or repair IP or TCP headers. MPTCP options are TCP options (kind
-30), and reach the world as part of those bytes.
+The driver runs only in a QEMU guest. Before it opens VFIO, it checks
+QEMU's DMI identity and the token `fictionet.rawnic=1` on the guest's
+kernel command line. The device must already be bound to `vfio-pci`. The
+library loads no modules, unbinds no drivers, and configures no network
+interfaces.
 
-The current implementation supports one receive/transmit queue pair on
-x86-64, frames of 14 through 2,036 bytes, and the modern PCI device ID.
-It requires a real VFIO type-one IOMMU mapping, including inside the guest;
-there is no unsafe no-IOMMU fallback. A successful transmit means queued,
-not delivered: world code awaits `RawAttachment::flush` before orderly
-teardown, while direct driver callers poll `transmit_idle`. Pump shutdown
-discards any remaining queued frames. A short driver receive buffer
-consumes that frame and returns an error.
+`VirtioNet::receive` returns the Ethernet frame the device delivered,
+without the virtio header, and `transmit` takes an Ethernet frame. The
+driver turns on no checksum, segmentation, or receive coalescing offloads,
+and never parses or repairs IP or TCP headers. MPTCP options are TCP
+options (kind 30), so they reach the world inside those frames.
 
-Raw here means the virtual NIC's Ethernet frame, not a physical wire
-capture: preamble, interpacket gap and Ethernet FCS are not supplied by
-virtio-net. A virtual NIC and its upstream network may filter traffic before
-the driver sees it. This does not establish that a cloud hypervisor or NAT
-preserves every packet.
+The driver supports:
+
+- one receive queue and one transmit queue, on x86-64;
+- frames of 14 to 2,036 bytes;
+- the modern virtio-net PCI device ID;
+- a real VFIO type 1 IOMMU, in the guest too. There is no no-IOMMU mode.
+
+A transmit that succeeds means the frame is queued, not delivered. World
+code awaits `RawAttachment::flush` before an orderly shutdown, and code
+that calls the driver directly polls `transmit_idle`. Shutting the pump
+down discards frames still queued. A receive buffer too short for a frame
+uses up that frame and returns an error.
+
+The frames are the virtual card's, not a capture of a physical wire.
+virtio-net has no preamble, gap between frames, or Ethernet FCS. The
+virtual card and the network behind it may filter traffic before the
+driver sees it.
 
 Build without opening a device:
 
@@ -59,54 +63,52 @@ Build without opening a device:
 cargo build -p fictionet-host --no-default-features --features virtio-net
 ```
 
-Run the isolated validation:
+Run the tests:
 
 ```sh
 cargo xtask rawnic target/rawnic-qemu
 ```
 
 The harness builds a guest initramfs, boots QEMU with an emulated Intel
-IOMMU, and connects the emulated virtio-net device to a loopback socket.
-It reads the local kernel and module files to populate the guest; module
-loading and PCI binding happen only inside that guest. No TAP device,
-bridge, host device passthrough or external network is needed. The output
-directory holds the initramfs and `serial.log`; failed assertions or missing
-prerequisites fail the command.
+IOMMU, and connects the emulated virtio-net card to a loopback socket. It
+reads the local kernel and module files to build the guest. Modules load,
+and the card is bound, only inside the guest. It needs no TAP device,
+bridge, host device passthrough, or outside network. The output directory
+holds the initramfs and `serial.log`. A failed check or a missing
+prerequisite fails the command.
 
-Validation runs the host crate and honeypot tests only in the guest, including
-split queue index wraparound, malformed completion rejection, and raw
-attachment backpressure, cancellation and flush completion. The guest uses
-2 GiB of RAM for the test image and enables its own loopback for HTTP
-transport tests. The host then checks
-six byte-exact round trips through a Fictionet world: MP_CAPABLE, DSS,
-VLAN, malformed IPv4/TCP, broadcast unknown data, and a 1,514-byte unknown
-EtherType frame. A final acknowledgment precedes device close and reopen.
-The harness then runs the real honeypot through the same raw attachment,
-verifies an Ethernet SYN-ACK reply, and completes an MP_CAPABLE handshake
-with timestamps. A mapped HTTP request must receive the complete nginx page
-with valid TCP checksums, DSS sequence mappings, Data ACKs and timestamp
-echoes. The guest also checks complete frame capture and MPTCP SYN, answer
-and DSS logs. Before the HTTP exchange, a fragmented ping produces an
-oversized echo reply in the IP capture; the Ethernet adapter must discard
-that reply and continue serving traffic. All driver, attachment and frame
-test execution stays inside QEMU. This is functional validation, not a
-throughput benchmark.
+In the guest, with 2 GiB of RAM and its own loopback up for the HTTP
+transport tests, the harness runs the host crate's and the honeypot's
+tests. Among them are split queue indices that wrap, completions the
+driver must refuse, and the raw attachment's backpressure, cancellation,
+and flush. From the host, it then checks:
 
-The current harness expects an x86-64 Linux host with
-`qemu-system-x86_64`, `/boot/vmlinuz-linux`, matching installed kernel
-modules, `modprobe` for read-only dependency listing, `zstd` for compressed
-modules, and `ldd` for guest binary dependencies. It uses QEMU's software
-emulation and does not require KVM or root on the host.
+- six frames sent through a Fictionet world and back, byte for byte:
+  MP_CAPABLE, DSS, a VLAN tag, malformed IPv4 and TCP, broadcast unknown
+  data, and a 1,514-byte frame of an unknown EtherType;
+- a last acknowledgment before the device closes and opens again;
+- the real honeypot on the same attachment: an Ethernet SYN-ACK, and an
+  MP_CAPABLE handshake with timestamps;
+- a fragmented ping whose echo reply is too big for one frame, which the
+  Ethernet adapter must drop and keep serving;
+- an HTTP request under a DSS mapping, which must get the whole nginx page
+  with valid TCP checksums, DSS mappings, Data ACKs, and timestamp echoes;
+- in the guest, the Ethernet log, and the honeypot's log lines for the
+  MPTCP SYN, its answer, and DSS.
+
+It checks that things work, not how fast.
+
+The harness expects an x86-64 Linux host with `qemu-system-x86_64`,
+`/boot/vmlinuz-linux`, the kernel modules that match it, `modprobe` to list
+module dependencies, `zstd` for compressed modules, and `ldd` for the guest
+binaries' libraries. It uses QEMU's software emulation, and needs neither
+KVM nor root on the host.
 
 Driver and frame tests run only inside the QEMU guest. Do not run a driver
-example on the development host. Do not load host VFIO modules, bind host
-devices, run XDP or AF_XDP binaries, attach XDP programs, or change host NIC
-settings to test this code.
+example on the development host. Do not load VFIO modules on the host, bind
+host devices, run XDP or AF_XDP binaries, attach XDP programs, or change the
+host's NIC settings to test this code.
 
-The driver follows the modern PCI transport and split virtqueue rules in
-the [Virtio specification](https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html)
+The driver follows the modern PCI transport and split virtqueue rules of
+the [virtio specification](https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html)
 and the Linux [VFIO interface](https://www.kernel.org/doc/html/latest/driver-api/vfio.html).
-
-ENA and EC2 deployment are outside this implementation. ENA requires a
-separate driver and separate approval; this QEMU result is not an EC2
-compatibility claim.

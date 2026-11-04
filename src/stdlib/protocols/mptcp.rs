@@ -58,14 +58,15 @@
 //! };
 //!
 //! // A Linux client's SYN carries MP_CAPABLE version 1: Kind 30,
-//! // Length 4, subtype 0 and version 1, then flags A and H (checksums
-//! // and HMAC-SHA256).
-//! let syn = [KIND, 4, 0x01, 0x81];
+//! // Length 4, subtype 0 and version 1, then flag H (HMAC-SHA256). It
+//! // sets flag A, for checksums, only when net.mptcp.checksum_enabled
+//! // is on, which it is not by default.
+//! let syn = [KIND, 4, 0x01, 0x01];
 //! let MptcpOption::Capable(offer) = MptcpOption::parse(&syn[2..]).unwrap() else {
 //!     unreachable!()
 //! };
 //! assert_eq!((offer.version, offer.keys), (1, Keys::Absent));
-//! assert!(offer.checksum_required);
+//! assert!(!offer.checksum_required);
 //!
 //! // The listener picks a key and sends it back in the SYN/ACK, choosing
 //! // HMAC-SHA256.
@@ -77,7 +78,7 @@
 //! });
 //! let data = answer.to_bytes().unwrap();
 //! assert_eq!(data.len() + 2, 12);
-//! assert_eq!(data[..2], [0x01, 0x81]);
+//! assert_eq!(data[..2], [0x01, 0x01]);
 //!
 //! // A joining subflow names this connection by the key's token.
 //! assert_eq!(token(key), 0x55c5_3f5d);
@@ -942,6 +943,9 @@ pub enum DataError {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ReceivedMapping {
+    /// Whether [`DataLevel::new`] made it from the handshake's
+    /// MP_CAPABLE with data, before that option is read again.
+    seeded: bool,
     start: u32,
     dsn: u64,
     mapping: Mapping,
@@ -975,7 +979,9 @@ impl DataLevel {
             iss,
             irs,
             checksums,
-            long_ack: false,
+            // Linux maps the data of an MP_CAPABLE with a 64-bit data
+            // sequence number, so its Data ACKs are 8 octets.
+            long_ack: first.is_some(),
             mapped_until: irs
                 .wrapping_add(1)
                 .wrapping_add(u32::from(first.unwrap_or(0))),
@@ -984,6 +990,7 @@ impl DataLevel {
                 .into_iter()
                 .filter(|n| *n > 0)
                 .map(|length| ReceivedMapping {
+                    seeded: true,
                     start: irs.wrapping_add(1),
                     dsn: idsn(remote_key).wrapping_add(1),
                     mapping: Mapping {
@@ -1071,8 +1078,11 @@ impl DataLevel {
                     self.mapped_until = end;
                 }
                 if let Some(existing) = self.mappings.iter_mut().find(|m| m.start == start) {
-                    // The handshake seeds its initial mapping before the ACK is replayed.
-                    if existing.data.is_empty() && existing.mapping.checksum.is_none() {
+                    // The mapping `new` seeded from the handshake takes
+                    // the option it came from, checksum included, once.
+                    // Any other mapping must be repeated as it was.
+                    if existing.seeded {
+                        existing.seeded = false;
                         existing.mapping = mapping;
                         existing.dsn = dsn;
                         existing.fin = data_fin;
@@ -1090,6 +1100,7 @@ impl DataLevel {
                     self.error = Some(DataError::Mapping);
                 } else if self.mappings.len() < 256 {
                     self.mappings.push(ReceivedMapping {
+                        seeded: false,
                         start,
                         dsn,
                         mapping,
@@ -1132,9 +1143,12 @@ impl DataLevel {
         self.error
     }
 
-    /// Takes contiguous subflow bytes and returns only validated data in
-    /// data sequence order. At most one TCP receive window is retained.
+    /// Takes contiguous subflow bytes from sequence number `seq`, and
+    /// appends to `out` the data they complete, in data sequence order.
+    /// When they bring an error, nothing from this call is appended. At
+    /// most one TCP receive window is held back.
     pub fn arrived(&mut self, seq: u32, data: &[u8], out: &mut Vec<u8>) {
+        let before = out.len();
         if self.error.is_some() {
             return;
         }
@@ -1152,7 +1166,7 @@ impl DataLevel {
                 if self.error.is_none() {
                     out.extend_from_slice(&data[offset..]);
                 } else {
-                    out.clear();
+                    out.truncate(before);
                 }
                 return;
             };
@@ -1178,7 +1192,7 @@ impl DataLevel {
                         )
                 {
                     self.error = Some(DataError::Checksum);
-                    out.clear();
+                    out.truncate(before);
                     return;
                 }
                 if m.fin {
@@ -1213,13 +1227,13 @@ impl DataLevel {
                 .sum::<usize>();
         if buffered > 65_535 {
             self.error = Some(DataError::Mapping);
-            out.clear();
+            out.truncate(before);
         }
     }
 
     /// The full data sequence number of `sequence`, from the peer: a
-    /// 4-octet one is taken as the 64-bit number nearest the peer's
-    /// furthest mapped byte, as Linux expands it.
+    /// 4-octet one is taken as the 64-bit number nearest the next byte
+    /// this end expects at the data level.
     fn expand(&self, sequence: Sequence) -> u64 {
         match sequence {
             Sequence::Long(n) => n,
@@ -2080,6 +2094,20 @@ mod tests {
         let mut level = DataLevel::new(KEY_B, KEY_A, ISS, IRS, false, None);
         level.received(IRS + 1, 0, false, [mapping(dsn, 1, 0)]);
         assert!(level.fallen_back(), "an infinite mapping");
+    }
+
+    /// A mapping sent again must be the same: a second DSS for the same
+    /// bytes with another data sequence number is an error, as Linux
+    /// takes it (MAPPING_INVALID), even before those bytes come.
+    #[test]
+    fn a_data_level_refuses_a_conflicting_mapping() {
+        let mut level = DataLevel::new(KEY_B, KEY_A, ISS, IRS, false, None);
+        let dsn = |offset: u64| Sequence::Long(idsn(KEY_A).wrapping_add(offset));
+        level.received(IRS + 1, 0, false, [mapping(dsn(1), 1, 5)]);
+        level.received(IRS + 1, 0, false, [mapping(dsn(1), 1, 5)]);
+        assert_eq!(level.error(), None, "the same mapping again");
+        level.received(IRS + 1, 0, false, [mapping(dsn(9), 1, 5)]);
+        assert_eq!(level.error(), Some(DataError::Mapping));
     }
 
     /// After a third ACK with no data, a Linux client that speaks first

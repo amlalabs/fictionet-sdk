@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::io::Write;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
 use fictionet::stdlib::network::ethernet::frame::{self, Frame, Mac};
@@ -11,7 +11,15 @@ use fictionet::sync::Mutex;
 use fictionet::{Cx, Interface, Packet};
 use fictionet_host::raw::{EthernetFrame, RawAttachment};
 
-use crate::{Clock, Config, Honeypot, INTERNET, observe::Hex, observe::Sink, observe::Sinks};
+use crate::observe::{Direction, Hex, Sink, Sinks};
+use crate::{Clock, Config, Honeypot, INTERNET};
+
+/// How many source addresses the adapter remembers the Ethernet sender
+/// of, as many as Linux's neighbor table holds by default (gc_thresh3).
+const PEERS: usize = 1024;
+
+/// The largest IP packet one Ethernet frame carries.
+const MTU: usize = 1500;
 
 struct Capture {
     writer: Sink,
@@ -20,7 +28,7 @@ struct Capture {
 }
 
 impl Capture {
-    fn frame(&mut self, fcx: &Cx, direction: &str, bytes: &[u8]) {
+    fn frame(&mut self, fcx: &Cx, direction: Direction, bytes: &[u8]) {
         let record = serde_json::json!({
             "at_us": self.clock.micros(fcx.now()),
             "direction": direction,
@@ -38,6 +46,8 @@ impl Capture {
 }
 
 /// Starts the existing honeypot behind a complete Ethernet attachment.
+/// The server's address must be IPv4: the adapter answers ARP, and does
+/// not do IPv6 neighbor discovery.
 ///
 /// `raw_log` receives every frame, including malformed headers, VLAN tags,
 /// unknown EtherTypes and Ethernet padding, as hexadecimal JSON lines before
@@ -46,13 +56,13 @@ impl Capture {
 /// capture and TCP option observations.
 ///
 /// Only untagged IPv4 and IPv6 addressed to this NIC enter the IP attachment.
-/// ARP for the configured IPv4 address is answered here. A bounded table of
-/// source IP addresses and Ethernet senders supplies reply destinations;
-/// eviction drops replies until another packet refreshes that source. IPv6
-/// peers must have a static neighbor entry. Outgoing IP packets exceeding the
-/// Ethernet MTU of 1500 bytes are dropped; this adapter does not fragment them.
-/// The driver and its polling thread must be opened outside `fictionet::run`
-/// and kept alive for the run.
+/// ARP for the configured IPv4 address is answered here. A table of
+/// 1,024 source IP addresses and their Ethernet senders gives replies
+/// their destination; a source pushed out of it must send again before it
+/// gets another reply. Outgoing IP packets over the Ethernet MTU of 1500
+/// bytes are dropped, as are those sent while the NIC's transmit queue is
+/// full. The driver and its polling thread must be opened outside
+/// `fictionet::run` and kept alive for the run.
 pub fn start_raw(
     fcx: &Cx,
     config: &Config,
@@ -61,6 +71,11 @@ pub fn start_raw(
     raw: RawAttachment,
     raw_log: Box<dyn Write + Send>,
 ) -> fictionet::Result<Honeypot> {
+    let IpAddr::V4(address) = config.address else {
+        return Err(fictionet::Error::msg(
+            "a raw Ethernet honeypot needs an IPv4 address",
+        ));
+    };
     let mac = raw.mac_address();
     let (sender, mut receiver) = raw.split();
     let (attacher, attachments) = fictionet::attachments();
@@ -72,7 +87,6 @@ pub fn start_raw(
         lost: 0,
         clock,
     }));
-    let address = config.address;
     let incoming_end = end.clone();
     let incoming_peers = peers.clone();
     let incoming_capture = capture.clone();
@@ -82,7 +96,7 @@ pub fn start_raw(
         let _attacher = attacher;
         loop {
             let EthernetFrame(bytes) = receiver.recv(&fcx).await?;
-            incoming_capture.lock().frame(&fcx, "in", &bytes);
+            incoming_capture.lock().frame(&fcx, Direction::In, &bytes);
             fcx.yield_now().await?;
             let Some(frame) = Frame::parse(&bytes) else {
                 continue;
@@ -91,16 +105,19 @@ pub fn start_raw(
                 continue;
             }
             if let Some(reply) = arp_reply(&frame, mac, address) {
-                incoming_capture.lock().frame(&fcx, "out", &reply);
+                incoming_capture.lock().frame(&fcx, Direction::Out, &reply);
                 incoming_sender.send(&fcx, EthernetFrame(reply)).await?;
                 continue;
             }
-            let Some((source, packet)) = ip_packet(&frame) else {
+            let Some(packet) = frame::ip_packet(frame.ethertype, frame.payload) else {
+                continue;
+            };
+            let Some(source) = ip::source(packet) else {
                 continue;
             };
             {
                 let mut peers = incoming_peers.lock();
-                if peers.len() >= 1024 && !peers.contains_key(&source) {
+                if peers.len() >= PEERS && !peers.contains_key(&source) {
                     peers.pop_first();
                 }
                 peers.insert(source, frame.src);
@@ -112,7 +129,7 @@ pub fn start_raw(
         loop {
             let packet = std::future::poll_fn(|cx| end.lock().poll_recv(&fcx, cx)).await?;
             // Reassembly can produce a reply larger than the Ethernet MTU.
-            if packet.0.len() > 1500 {
+            if packet.0.len() > MTU {
                 continue;
             }
             let Some(header) = ip::Header::parse(&packet.0) else {
@@ -127,46 +144,32 @@ pub fn start_raw(
                 frame::IPV6
             };
             let bytes = frame::frame(peer, mac, kind, &packet.0);
-            capture.lock().frame(&fcx, "out", &bytes);
-            sender.send(&fcx, EthernetFrame(bytes)).await?;
+            capture.lock().frame(&fcx, Direction::Out, &bytes);
+            sender.try_send(EthernetFrame(bytes))?;
         }
     });
     Ok(honeypot)
 }
 
-fn ip_packet<'a>(frame: &Frame<'a>) -> Option<(IpAddr, &'a [u8])> {
-    let version = match frame.ethertype {
-        frame::IPV4 => 4,
-        frame::IPV6 => 6,
-        _ => return None,
-    };
-    if frame.payload.first()? >> 4 != version {
-        return None;
-    }
-    let header = ip::Header::parse(frame.payload)?;
-    Some((header.src, &frame.payload[..header.payload.end]))
-}
-
-fn arp_reply(frame: &Frame<'_>, mac: Mac, address: IpAddr) -> Option<Vec<u8>> {
-    let IpAddr::V4(address) = address else {
-        return None;
-    };
+/// The reply to an Ethernet/IPv4 ARP request for `address`, as Linux
+/// sends it: to the sender's hardware address the request gives.
+fn arp_reply(frame: &Frame<'_>, mac: Mac, address: Ipv4Addr) -> Option<Vec<u8>> {
     let p = frame.payload;
     if frame.ethertype != frame::ARP
         || p.len() < 28
         || p[..8] != [0, 1, 8, 0, 6, 4, 0, 1]
-        || p[8..14] != frame.src
         || p[24..28] != address.octets()
     {
         return None;
     }
+    let sender: Mac = p[8..14].try_into().expect("six bytes");
     let mut reply = p[..28].to_vec();
     reply[6..8].copy_from_slice(&2u16.to_be_bytes());
-    reply[18..24].copy_from_slice(&frame.src);
+    reply[18..24].copy_from_slice(&sender);
     reply[24..28].copy_from_slice(&p[14..18]);
     reply[8..14].copy_from_slice(&mac);
     reply[14..18].copy_from_slice(&address.octets());
-    Some(frame::frame(frame.src, mac, frame::ARP, &reply))
+    Some(frame::frame(sender, mac, frame::ARP, &reply))
 }
 
 #[cfg(test)]
@@ -180,14 +183,20 @@ mod tests {
         let packet = ip::packet(source, destination, 1, &[8, 0, 0, 0]);
         let bytes = frame::frame([2; 6], [4; 6], frame::IPV4, &packet.0);
         let parsed = Frame::parse(&bytes).unwrap();
-        assert_eq!(ip_packet(&parsed), Some((source, packet.0.as_slice())));
+        assert_eq!(
+            frame::ip_packet(parsed.ethertype, parsed.payload),
+            Some(packet.0.as_slice())
+        );
         let mut malformed = bytes.clone();
         malformed[16..18].copy_from_slice(&200u16.to_be_bytes());
-        assert!(ip_packet(&Frame::parse(&malformed).unwrap()).is_none());
+        let malformed = Frame::parse(&malformed).unwrap();
+        assert!(frame::ip_packet(malformed.ethertype, malformed.payload).is_none());
         let vlan = frame::frame([2; 6], [4; 6], 0x8100, &packet.0);
-        assert!(ip_packet(&Frame::parse(&vlan).unwrap()).is_none());
+        let vlan = Frame::parse(&vlan).unwrap();
+        assert!(frame::ip_packet(vlan.ethertype, vlan.payload).is_none());
         let unknown = frame::frame([2; 6], [4; 6], 0x88b5, &packet.0);
-        assert!(ip_packet(&Frame::parse(&unknown).unwrap()).is_none());
+        let unknown = Frame::parse(&unknown).unwrap();
+        assert!(frame::ip_packet(unknown.ethertype, unknown.payload).is_none());
     }
 
     #[test]
@@ -215,5 +224,24 @@ mod tests {
         assert_eq!(&reply.payload[24..28], &[192, 0, 2, 5]);
         assert!(arp_reply(&request, mac, "203.0.113.11".parse().unwrap()).is_none());
         assert!(Frame::parse(&[0; 13]).is_none());
+    }
+
+    /// Linux answers to the hardware address the request gives, even when
+    /// the frame came from another.
+    #[test]
+    fn arp_answers_the_sender_the_request_names() {
+        let named = [6; 6];
+        let mut payload = vec![0, 1, 8, 0, 6, 4, 0, 1];
+        payload.extend_from_slice(&named);
+        payload.extend_from_slice(&[192, 0, 2, 5]);
+        payload.extend_from_slice(&[0; 6]);
+        payload.extend_from_slice(&[203, 0, 113, 10]);
+        let bytes = frame::frame(frame::BROADCAST, [4; 6], frame::ARP, &payload);
+        let request = Frame::parse(&bytes).unwrap();
+        let address = "203.0.113.10".parse().unwrap();
+        let bytes = arp_reply(&request, [2; 6], address).unwrap();
+        let reply = Frame::parse(&bytes).unwrap();
+        assert_eq!(reply.dst, named);
+        assert_eq!(&reply.payload[18..24], &named);
     }
 }

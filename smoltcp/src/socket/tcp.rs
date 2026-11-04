@@ -141,9 +141,10 @@ pub fn encode_options_within(
 }
 
 /// The option bytes a SYN or SYN-ACK always has room for beside the
-/// socket's own: Maximum Segment Size (4), Window Scale (3),
-/// SACK-Permitted (2) and Timestamps (10) leave 21 of the 40.
-pub const SYN_OPTIONS_ROOM: usize = TCP_OPTIONS_MAX_LEN - 19;
+/// socket's own: Maximum Segment Size (4), SACK-Permitted with
+/// Timestamps (12) and Window Scale after a No-Operation (4) leave 20 of
+/// the 40.
+pub const SYN_OPTIONS_ROOM: usize = TCP_OPTIONS_MAX_LEN - 20;
 
 /// A TCP socket ring buffer.
 pub type SocketBuffer<'a> = RingBuffer<'a>;
@@ -552,8 +553,10 @@ pub struct Socket<'a> {
     segment_extra: Vec<u8>,
     /// It asked for an ACK, which the next segment sent carries.
     ack_asked: bool,
-    /// The options of the RST it asked for, encoded.
-    rst_options: Vec<u8>,
+    /// The options of the RST it asked for, encoded. `None` when the
+    /// connection was aborted without any: the RST then carries what
+    /// [`SegmentOptions::reset`] gives.
+    rst_options: Option<Vec<u8>>,
 
     rx_waker: WakerRegistration,
 
@@ -634,6 +637,14 @@ pub trait SegmentOptions: Send {
         out.extend_from_slice(data);
         Verdict::Take
     }
+
+    /// Writes the options for a RST the socket sends with none of its own:
+    /// when it is aborted, or must reset for a reason of its own. Whole
+    /// options with no End of Option List, as an MPTCP host puts MP_TCPRST
+    /// on every RST of a subflow (RFC 8684 section 3.6). Default none.
+    fn reset(&mut self, out: &mut Vec<u8>) {
+        let _ = out;
+    }
 }
 
 /// What a socket does with a segment its [`SegmentOptions`] saw.
@@ -713,7 +724,7 @@ impl<'a> Socket<'a> {
             segment_options: None,
             segment_extra: Vec::new(),
             ack_asked: false,
-            rst_options: Vec::new(),
+            rst_options: None,
 
             rx_waker: WakerRegistration::new(),
 
@@ -778,7 +789,7 @@ impl<'a> Socket<'a> {
     /// that carries `options`, whole options encoded with
     /// [`encode_options`].
     pub fn abort_with(&mut self, options: Vec<u8>) {
-        self.rst_options = options;
+        self.rst_options = Some(options);
         self.abort();
     }
 
@@ -811,7 +822,9 @@ impl<'a> Socket<'a> {
         let verdict = options.0.arrived(seq.0 as u32, &data, &mut kept);
         let after = self.assembler.iter_data().last().map_or(0, |(_, end)| end);
         if kept.len() + after > self.rx_buffer.window() {
-            return Verdict::Reset(Vec::new());
+            let mut reset = Vec::new();
+            options.0.reset(&mut reset);
+            return Verdict::Reset(reset);
         }
         if kept.len() != contiguous || kept != data {
             let mut later = vec![0; after];
@@ -1106,7 +1119,7 @@ impl<'a> Socket<'a> {
         self.syn_options = Vec::new();
         self.segment_options = None;
         self.ack_asked = false;
-        self.rst_options = Vec::new();
+        self.rst_options = None;
 
         {
             self.rx_waker.wake();
@@ -2584,7 +2597,16 @@ impl<'a> Socket<'a> {
             repr.max_seg_size = Some(max_segment_size as u16);
             repr.extra = &self.syn_options;
         } else if repr.control == TcpControl::Rst {
-            repr.extra = &self.rst_options;
+            if let Some(options) = &self.rst_options {
+                repr.extra = options;
+            } else if let Some(options) = self.segment_options.as_mut() {
+                self.segment_extra.clear();
+                options.0.reset(&mut self.segment_extra);
+                if self.segment_extra.len() > TCP_OPTIONS_MAX_LEN {
+                    self.segment_extra.clear();
+                }
+                repr.extra = &self.segment_extra;
+            }
         } else if let Some(options) = self.segment_options.as_mut() {
             let segment = Outgoing {
                 seq: repr.seq_number.0 as u32,
@@ -4258,9 +4280,10 @@ pub(crate) mod test {
                 options,
                 [
                     Ok(TcpOption::MaxSegmentSize(BASE_MSS)),
-                    Ok(TcpOption::WindowScale(0)),
                     Ok(TcpOption::SackPermitted),
                     Ok(TcpOption::TimeStamp { tsval: 7, tsecr: 9 }),
+                    Ok(TcpOption::NoOperation),
+                    Ok(TcpOption::WindowScale(0)),
                     Ok(TcpOption::Unknown {
                         kind: 253,
                         data: &data,

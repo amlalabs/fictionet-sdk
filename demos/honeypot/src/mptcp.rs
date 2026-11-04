@@ -670,7 +670,7 @@ impl Segments for Dss {
         let options: Vec<_> = mptcp_options(segment.options).collect();
         if options.iter().any(|option| matches!(option, MptcpOption::FastClose { receiver_key } if *receiver_key == self.key)) {
             self.tokens.close(token(self.key), true);
-            return SegmentVerdict::Reset(Vec::new());
+            return SegmentVerdict::Reset(self.reset());
         }
         let acknowledge = if let Some(level) = &mut self.level {
             level.received(segment.seq, segment.payload.len(), segment.fin, options)
@@ -687,6 +687,17 @@ impl Segments for Dss {
             level.arrived(seq, data, out);
         }
         self.verdict(false)
+    }
+
+    /// Linux puts MP_TCPRST on every RST of a subflow that has not fallen
+    /// back, with "unspecified error" unless it had a reason
+    /// (mptcp_established_options_rst).
+    fn reset(&mut self) -> Vec<TcpOption> {
+        if self.level.as_ref().is_some_and(DataLevel::fallen_back) {
+            Vec::new()
+        } else {
+            vec![tcprst(reason::UNSPECIFIED)]
+        }
     }
 }
 
