@@ -10,6 +10,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use fictionet::stdlib::network::ip::{self, Fields, Header};
 use fictionet::stdlib::network::route::Prefix;
 use fictionet::stdlib::network::udp;
+use fictionet::stdlib::protocols::arp;
+use fictionet::stdlib::protocols::ndp::{self, NdOption, NeighborAdvertisement};
 
 /// A MAC address.
 pub type Mac = [u8; 6];
@@ -122,9 +124,9 @@ pub(super) fn destination(
             Some((mac, IPV4))
         }
         6 if packet.len() >= 40 => {
-            let d = &packet[24..40];
-            let mac = if d[0] == 0xff {
-                [0x33, 0x33, d[12], d[13], d[14], d[15]]
+            let d = destination_v6(packet);
+            let mac = if d.is_multicast() {
+                multicast_mac(d)
             } else {
                 vm?
             };
@@ -226,27 +228,35 @@ pub(super) fn udp6(src: Ipv6Addr, sport: u16, dst: Ipv6Addr, dport: u16, data: &
 
 /// An ICMPv6 message in an IPv6 packet with hop limit 255, as neighbor
 /// discovery requires. `body` is the whole message with its checksum
-/// field (bytes 2 and 3) zero; this fills it in.
+/// field (bytes 2 and 3) zero; this fills it in. Tests build hostile
+/// messages with it, which the typed writers refuse to write.
+#[cfg(test)]
 pub(super) fn icmp6(src: Ipv6Addr, dst: Ipv6Addr, mut body: Vec<u8>) -> Vec<u8> {
     let sum = ip::transport_checksum(src.into(), dst.into(), ICMPV6, &body);
     body[2..4].copy_from_slice(&sum.to_be_bytes());
     ipv6(src, dst, ICMPV6, 255, &body)
 }
 
-/// The link-local address made from a MAC (modified EUI-64).
-pub(super) fn link_local(mac: Mac) -> Ipv6Addr {
-    let mut a = [0u8; 16];
-    a[0] = 0xfe;
-    a[1] = 0x80;
-    a[8] = mac[0] ^ 0x02;
-    a[9] = mac[1];
-    a[10] = mac[2];
-    a[11] = 0xff;
-    a[12] = 0xfe;
-    a[13] = mac[3];
-    a[14] = mac[4];
-    a[15] = mac[5];
+/// The link-local address an interface with MAC `mac` gives itself:
+/// fe80::/64 with the modified EUI-64 interface identifier, which puts
+/// ff:fe in the middle of the MAC and flips its universal/local bit
+/// ([RFC 4291](https://www.rfc-editor.org/rfc/rfc4291) appendix A;
+/// [RFC 2464](https://www.rfc-editor.org/rfc/rfc2464) sections 4 and 5).
+pub fn link_local(mac: Mac) -> Ipv6Addr {
+    let mut a = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xfe, 0, 0, 0];
+    a[8..11].copy_from_slice(&mac[..3]);
+    a[8] ^= 0x02;
+    a[13..].copy_from_slice(&mac[3..]);
     Ipv6Addr::from(a)
+}
+
+/// The Ethernet MAC an IPv6 multicast group is sent to: 33:33 followed by
+/// the group's last 32 bits
+/// ([RFC 2464](https://www.rfc-editor.org/rfc/rfc2464) section 7). An
+/// interface that joins a group accepts frames to this MAC.
+pub fn multicast_mac(group: Ipv6Addr) -> Mac {
+    let g = group.octets();
+    [0x33, 0x33, g[12], g[13], g[14], g[15]]
 }
 
 // ARP and neighbor discovery
@@ -263,31 +273,18 @@ pub(super) fn link_local(mac: Mac) -> Ipv6Addr {
 /// - questions about `own`, the address the link handed the VM, for the same
 ///   reason;
 /// - anything that is not an Ethernet/IPv4 request.
-pub(super) fn arp_reply(arp: &[u8], vm: Mac, own: Option<Ipv4Addr>) -> Option<Vec<u8>> {
-    if arp.len() < 28 || arp[0..8] != [0, 1, 0x08, 0x00, 6, 4, 0, 1] {
+pub(super) fn arp_reply(payload: &[u8], vm: Mac, own: Option<Ipv4Addr>) -> Option<Vec<u8>> {
+    let request = arp::Packet::receive(payload).ok()?;
+    if request.operation != arp::Operation::Request
+        || request.sender_ip.is_unspecified()
+        || request.sender_ip == request.target_ip
+        || Some(request.target_ip) == own
+    {
         return None;
     }
-    let sha = &arp[8..14];
-    let spa = &arp[14..18];
-    let tpa = &arp[24..28];
-    if spa == [0; 4] || spa == tpa || own.is_some_and(|a| a.octets() == tpa) {
-        return None;
-    }
-    let mut reply = Vec::with_capacity(28);
-    reply.extend_from_slice(&[0, 1, 0x08, 0x00, 6, 4, 0, 2]);
-    reply.extend_from_slice(&GATEWAY_MAC);
-    reply.extend_from_slice(tpa);
-    reply.extend_from_slice(sha);
-    reply.extend_from_slice(spa);
-    Some(frame(vm, GATEWAY_MAC, ARP, &reply))
+    let reply = request.reply(GATEWAY_MAC);
+    Some(frame(vm, GATEWAY_MAC, ARP, &reply.encode()))
 }
-
-/// ICMPv6 types of neighbor discovery.
-pub(super) const ROUTER_SOLICITATION: u8 = 133;
-pub(super) const ROUTER_ADVERTISEMENT: u8 = 134;
-pub(super) const NEIGHBOR_SOLICITATION: u8 = 135;
-pub(super) const NEIGHBOR_ADVERTISEMENT: u8 = 136;
-pub(super) const REDIRECT: u8 = 137;
 
 /// What the link needs to know about the transport of one IP packet from
 /// the VM. [`Header::check`] reads the extension headers and fragments,
@@ -368,29 +365,19 @@ pub(super) fn upper(packet: &[u8]) -> Result<Upper<'_>, Unreadable> {
 /// The ICMPv6 types of neighbor discovery and redirects, which only make
 /// sense on one link.
 pub(super) fn is_neighbor_discovery(kind: u8) -> bool {
-    (ROUTER_SOLICITATION..=REDIRECT).contains(&kind)
+    (ndp::kind::ROUTER_SOLICITATION..=ndp::kind::REDIRECT).contains(&kind)
 }
 
-/// Checks solicitation fields and option boundaries. Checksums belong to
-/// the recipient because a VM backend may leave them to an offload.
-pub(super) fn solicitation_valid(packet: &[u8], msg: &[u8], fixed: usize) -> bool {
-    if packet[7] != 255 || msg.len() < fixed || msg[1] != 0 {
-        return false;
-    }
-    let mut options = &msg[fixed..];
-    while !options.is_empty() {
-        if options.len() < 2
-            || options[1] == 0
-            || (source_v6(packet).is_unspecified() && options[0] == 1)
-        {
-            return false;
-        }
-        let Some(rest) = options.get(usize::from(options[1]) * 8..) else {
-            return false;
-        };
-        options = rest;
-    }
-    true
+/// Reads a neighbor discovery message `msg` from the VM in `packet`, an
+/// IPv6 packet [`ip_packet`] has checked, and checks it as RFC 4861 asks
+/// of a receiver. `None` if it is not valid. The checksum is not checked:
+/// it belongs to the recipient, because a VM backend may leave it to an
+/// offload.
+pub(super) fn neighbor_discovery(packet: &[u8], msg: &[u8]) -> Option<ndp::Message> {
+    let envelope = ndp::Envelope::of(packet)?;
+    let message = ndp::Message::parse(msg).ok()?;
+    message.validate(&envelope).ok()?;
+    Some(message)
 }
 
 /// Whether a packet that calls for Parameter Problem hides neighbor discovery.
@@ -414,23 +401,24 @@ pub(super) fn neighbor_advert(
     vm: Mac,
     own: Option<Ipv6Addr>,
 ) -> Option<Vec<u8>> {
-    if !solicitation_valid(packet, msg, 24) {
+    let Some(ndp::Message::NeighborSolicitation(ns)) = neighbor_discovery(packet, msg) else {
+        return None;
+    };
+    let (src, target) = (source_v6(packet), ns.target);
+    if src.is_unspecified() || src == target || Some(target) == own {
         return None;
     }
-    let src = source_v6(packet);
-    let target = address_v6(&msg[8..24]);
-    if src.is_unspecified() || src == target || target.is_multicast() || Some(target) == own {
-        return None;
-    }
-    let mut body = Vec::with_capacity(32);
     // Router, solicited and override: the VM may use the link as a router
     // for any address, so the router flag is always set.
-    body.extend_from_slice(&[NEIGHBOR_ADVERTISEMENT, 0, 0, 0, 0xe0, 0, 0, 0]);
-    body.extend_from_slice(&target.octets());
-    // Target link-layer address option.
-    body.extend_from_slice(&[2, 1]);
-    body.extend_from_slice(&GATEWAY_MAC);
-    let ip = icmp6(target, src, body);
+    let na = ndp::Message::NeighborAdvertisement(NeighborAdvertisement {
+        router: true,
+        solicited: true,
+        overrides: true,
+        target,
+        options: vec![NdOption::TargetLinkLayer(GATEWAY_MAC)],
+    });
+    // A source no answer can go to, such as a multicast one, gets none.
+    let ip = na.packet(target, src).ok()?;
     Some(frame(vm, GATEWAY_MAC, IPV6, &ip))
 }
 
@@ -564,7 +552,7 @@ pub(super) mod tests {
         icmp6(
             src,
             "ff02::2".parse().unwrap(),
-            vec![ROUTER_SOLICITATION, 0, 0, 0, 0, 0, 0, 0],
+            vec![ndp::kind::ROUTER_SOLICITATION, 0, 0, 0, 0, 0, 0, 0],
         )
     }
 
@@ -606,7 +594,7 @@ pub(super) mod tests {
     }
 
     pub(crate) fn solicitation(src: Ipv6Addr, target: Ipv6Addr, hop: u8) -> Vec<u8> {
-        let mut body = vec![NEIGHBOR_SOLICITATION, 0, 0, 0, 0, 0, 0, 0];
+        let mut body = vec![ndp::kind::NEIGHBOR_SOLICITATION, 0, 0, 0, 0, 0, 0, 0];
         body.extend_from_slice(&target.octets());
         body.extend_from_slice(&[1, 1]);
         body.extend_from_slice(&VM);
@@ -646,7 +634,7 @@ pub(super) mod tests {
         let mut ext = vec![ICMPV6, 0, 1, 4, 0, 0, 0, 0];
         ext.extend_from_slice(&ra[40..]);
         let p = ipv6(src, "ff02::1".parse().unwrap(), 0, 255, &ext);
-        assert_eq!(icmp6_kind(&p), Some(ROUTER_ADVERTISEMENT));
+        assert_eq!(icmp6_kind(&p), Some(ndp::kind::ROUTER_ADVERTISEMENT));
         for n in [8, 16] {
             assert_eq!(
                 icmp6_kind(&behind_options(
@@ -656,7 +644,7 @@ pub(super) mod tests {
                     ICMPV6,
                     &ra[40..]
                 )),
-                Some(ROUTER_ADVERTISEMENT)
+                Some(ndp::kind::ROUTER_ADVERTISEMENT)
             );
         }
         // Behind an authentication header.
@@ -664,7 +652,7 @@ pub(super) mod tests {
         ah.extend_from_slice(&ra[40..]);
         assert_eq!(
             icmp6_kind(&ipv6(src, "ff02::1".parse().unwrap(), 51, 255, &ah)),
-            Some(ROUTER_ADVERTISEMENT)
+            Some(ndp::kind::ROUTER_ADVERTISEMENT)
         );
         // A first fragment holds the type, and says it is a fragment; a later
         // one does not hold it.
@@ -672,7 +660,7 @@ pub(super) mod tests {
         assert!(matches!(
             upper(&p),
             Ok(Upper::Icmp6 {
-                kind: ROUTER_ADVERTISEMENT,
+                kind: ndp::kind::ROUTER_ADVERTISEMENT,
                 fragment: true,
                 ..
             })
@@ -765,6 +753,17 @@ pub(super) mod tests {
         );
         let (p6, _) = fragments6(&u, 48);
         assert_eq!(upper(&p6), Ok(Upper::UdpFragment { port: 547 }));
+    }
+
+    #[test]
+    fn multicast_macs() {
+        for (group, mac) in [
+            ("ff02::1", [0x33, 0x33, 0, 0, 0, 1]),
+            ("ff02::1:ff12:3456", [0x33, 0x33, 0xff, 0x12, 0x34, 0x56]),
+            ("ff3e::8000:1", [0x33, 0x33, 0x80, 0, 0, 1]),
+        ] {
+            assert_eq!(multicast_mac(group.parse().unwrap()), mac);
+        }
     }
 
     #[test]

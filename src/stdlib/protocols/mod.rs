@@ -4,6 +4,7 @@
 //! The [module table](super#protocol-modules) lists them.
 
 pub mod amqp;
+pub mod arp;
 pub mod asn1;
 pub mod bacnet;
 pub mod bgp;
@@ -52,6 +53,7 @@ pub mod l2tp;
 pub mod ldap;
 pub mod memcache;
 pub mod mime_multipart;
+pub mod mld;
 pub mod modbus;
 pub mod moldudp64;
 pub mod mongodb;
@@ -61,6 +63,7 @@ pub mod mysql;
 pub mod nbdgm;
 pub mod nbns;
 pub mod nbss;
+pub mod ndp;
 pub mod netbios;
 pub mod nfs;
 pub mod ntlmssp;

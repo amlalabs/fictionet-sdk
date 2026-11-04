@@ -244,6 +244,7 @@
 //! | Module | Description |
 //! | --- | --- |
 //! | [`protocols::amqp`] | AMQP 0-9-1 frames, methods, field tables and content headers. |
+//! | [`protocols::arp`] | ARP requests and replies for IPv4 over Ethernet. |
 //! | [`protocols::asn1`] | ASN.1 BER and DER tags, lengths and values. |
 //! | [`protocols::bacnet`] | BACnet/IP messages and application values. |
 //! | [`protocols::bgp`] | BGP-4 messages, path attributes and prefixes. |
@@ -291,6 +292,7 @@
 //! | [`protocols::ldap`] | LDAP messages, search filters and distinguished names. |
 //! | [`protocols::memcache`] | Memcached text and binary messages and UDP framing. |
 //! | [`protocols::mime_multipart`] | MIME multipart body parsing and writing. |
+//! | [`protocols::mld`] | MLDv2 multicast listener reports and their packets. |
 //! | [`protocols::modbus`] | Modbus/TCP frames, requests and responses. |
 //! | [`protocols::moldudp64`] | MoldUDP64 packets, gap recovery and retransmission. |
 //! | [`protocols::mongodb`] | MongoDB BSON documents and wire messages. |
@@ -300,6 +302,7 @@
 //! | [`protocols::nbdgm`] | NetBIOS datagrams and fragment reassembly. |
 //! | [`protocols::nbns`] | NetBIOS name queries, registration and node status. |
 //! | [`protocols::nbss`] | NetBIOS Session Service packets. |
+//! | [`protocols::ndp`] | IPv6 neighbor discovery messages, options and checks. |
 //! | [`protocols::netbios`] | Shared NetBIOS name encoding and display. |
 //! | [`protocols::nfs`] | NFS version 3 and MOUNT procedure arguments and results. |
 //! | [`protocols::ntlmssp`] | NTLM negotiation and authentication messages without cryptography. |

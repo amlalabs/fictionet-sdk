@@ -182,8 +182,11 @@
 //!   detection (source `::`), for a multicast target or the address attach
 //!   handed the VM, for a target equal to its source, and for a solicitation
 //!   that is not valid. No neighbor solicitation reaches the world. Router advertisements, neighbor
-//!   advertisements and redirects from the VM are dropped. Router
-//!   solicitations are checked for hop limit, code, length and options.
+//!   advertisements and redirects from the VM are dropped. Router and
+//!   neighbor solicitations are read with
+//!   [`protocols::ndp`](crate::stdlib::protocols::ndp), and checked for
+//!   hop limit, code, length, options and addresses as RFC 4861 asks of a
+//!   receiver. The checksum is not checked.
 //!   Valid solicitations and DHCPv6 requests (UDP to port 547) are handled as
 //!   the table below says. Packets from `::` or a link-local address stay
 //!   on the link, unless the IPv6 address flags were left out. When attach

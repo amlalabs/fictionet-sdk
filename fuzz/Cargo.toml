@@ -975,3 +975,24 @@ path = "fuzz_targets/cboe_boe.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "arp"
+path = "fuzz_targets/arp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ndp"
+path = "fuzz_targets/ndp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mld"
+path = "fuzz_targets/mld.rs"
+test = false
+doc = false
+bench = false

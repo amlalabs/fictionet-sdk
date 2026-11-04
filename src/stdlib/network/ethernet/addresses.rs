@@ -15,6 +15,9 @@ use fictionet::stdlib::protocols::dhcp::{self, opt};
 use fictionet::stdlib::protocols::dhcpv6::{
     self, DhcpOption, Duid, IaAddr, IaNa, Message, StatusCode, msg, status,
 };
+use fictionet::stdlib::protocols::ndp::{
+    self, ALL_NODES, NdOption, PrefixInformation, RouterAdvertisement,
+};
 
 use super::frame;
 
@@ -163,40 +166,46 @@ fn mask4(prefix: u8) -> Ipv4Addr {
 /// - the link is the default router, if the lease has a gateway;
 /// - the MTU, and the lease's DNS server, if there is one.
 pub(super) fn router_advert(lease: &Lease<Ipv6Addr>, mtu: u16) -> Vec<u8> {
-    let lifetime: u16 = if lease.gateway.is_some() { 1800 } else { 0 };
-    let mut b = vec![frame::ROUTER_ADVERTISEMENT, 0, 0, 0, 64, 0xc0];
-    b.extend_from_slice(&lifetime.to_be_bytes());
-    b.extend_from_slice(&[0; 8]);
-    // Source link-layer address.
-    b.extend_from_slice(&[1, 1]);
-    b.extend_from_slice(&frame::GATEWAY_MAC);
-    // MTU.
-    b.extend_from_slice(&[5, 1, 0, 0]);
-    b.extend_from_slice(&(mtu as u32).to_be_bytes());
-    // Prefix information: on-link, but not for making addresses.
-    let prefix = lease.addr.prefix;
     let IpAddr::V6(net) = (Prefix {
         addr: lease.addr.addr.into(),
-        len: prefix,
+        len: lease.addr.prefix,
     })
     .network() else {
         unreachable!("an IPv6 lease has an IPv6 network address")
     };
-    b.extend_from_slice(&[3, 4, prefix, 0x80]);
-    b.extend_from_slice(&u32::MAX.to_be_bytes());
-    b.extend_from_slice(&u32::MAX.to_be_bytes());
-    b.extend_from_slice(&[0; 4]);
-    b.extend_from_slice(&net.octets());
+    let mut options = vec![
+        NdOption::SourceLinkLayer(frame::GATEWAY_MAC),
+        NdOption::Mtu(u32::from(mtu)),
+        // On-link, but not for making addresses.
+        NdOption::PrefixInformation(PrefixInformation {
+            prefix_len: lease.addr.prefix,
+            on_link: true,
+            autonomous: false,
+            valid_lifetime: u32::MAX,
+            preferred_lifetime: u32::MAX,
+            prefix: net,
+        }),
+    ];
     if let Some(dns) = lease.dns {
-        // Recursive DNS server (RFC 8106).
-        b.extend_from_slice(&[25, 3, 0, 0]);
-        b.extend_from_slice(&u32::MAX.to_be_bytes());
-        b.extend_from_slice(&dns.octets());
+        // Recursive DNS server (RFC 8106, section 5.1): two reserved bytes,
+        // the lifetime, then the address.
+        let mut data = vec![0, 0];
+        data.extend_from_slice(&u32::MAX.to_be_bytes());
+        data.extend_from_slice(&dns.octets());
+        options.push(NdOption::Unknown { kind: 25, data });
     }
-    frame::icmp6(frame::link_local(frame::GATEWAY_MAC), ALL_NODES, b)
+    ndp::Message::RouterAdvertisement(RouterAdvertisement {
+        cur_hop_limit: 64,
+        managed: true,
+        other: true,
+        router_lifetime: if lease.gateway.is_some() { 1800 } else { 0 },
+        reachable_time: 0,
+        retrans_timer: 0,
+        options,
+    })
+    .packet(frame::link_local(frame::GATEWAY_MAC), ALL_NODES)
+    .expect("a router advertisement from a link-local address to all nodes is valid")
 }
-
-const ALL_NODES: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
 
 // DHCPv6
 
@@ -627,7 +636,7 @@ pub(super) mod tests {
         assert_eq!(frame::source_v6(&p), frame::link_local(frame::GATEWAY_MAC));
         assert_eq!(&p[24..40], &ALL_NODES.octets());
         let ra = &p[40..];
-        assert_eq!(ra[0], frame::ROUTER_ADVERTISEMENT);
+        assert_eq!(ra[0], ndp::kind::ROUTER_ADVERTISEMENT);
         assert_eq!(ra[5], 0xc0, "managed and other");
         assert_eq!(u16::from_be_bytes([ra[6], ra[7]]), 1800);
         let opts = &ra[16..];

@@ -21,7 +21,7 @@ mod addresses;
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use fictionet::stdlib::protocols::{dhcp, dhcpv6};
+use fictionet::stdlib::protocols::{dhcp, dhcpv6, ndp};
 
 pub use addresses::{Cidr, Family, Lease, RA_EVERY};
 use frame::{Frame, Mac, Upper};
@@ -228,7 +228,7 @@ impl Link {
                 return FromVm::Drop(Why::Handled);
             }
             Upper::Icmp6 {
-                kind: frame::NEIGHBOR_SOLICITATION,
+                kind: ndp::kind::NEIGHBOR_SOLICITATION,
                 msg,
                 ..
             } => {
@@ -238,11 +238,14 @@ impl Link {
                 };
             }
             Upper::Icmp6 {
-                kind: frame::ROUTER_SOLICITATION,
+                kind: ndp::kind::ROUTER_SOLICITATION,
                 msg,
                 ..
             } => {
-                if !frame::solicitation_valid(p, msg, 8) {
+                if !matches!(
+                    frame::neighbor_discovery(p, msg),
+                    Some(ndp::Message::RouterSolicitation(_))
+                ) {
                     return FromVm::Drop(Why::Handled);
                 }
                 return self.v6.handle(p, |_| self.router_advert());
@@ -861,7 +864,7 @@ mod tests {
         assert_eq!(p[7], 255, "hop limit");
         assert_eq!(frame::source_v6(p), target);
         assert_eq!(&p[24..40], &ll.octets());
-        assert_eq!(p[40], frame::NEIGHBOR_ADVERTISEMENT);
+        assert_eq!(p[40], ndp::kind::NEIGHBOR_ADVERTISEMENT);
         assert_eq!(p[44], 0xe0, "router, solicited, override");
         assert_eq!(&p[48..64], &target.octets());
         assert_eq!(&p[64..72], &[2, 1, 0x74, 0x83, 0xc2, 0x9a, 0x47, 0xd1]);
@@ -873,7 +876,7 @@ mod tests {
         };
         let f = Frame::parse(&ra).unwrap();
         assert_eq!(f.dst, [0x33, 0x33, 0, 0, 0, 1]);
-        assert_eq!(f.payload[40], frame::ROUTER_ADVERTISEMENT);
+        assert_eq!(f.payload[40], ndp::kind::ROUTER_ADVERTISEMENT);
         // Left to the world, the solicitation goes there; turned off, nowhere.
         let mut world = Link::new(Family::Off, Family::FromWorld, 1500).unwrap();
         assert!(matches!(world.frame_from_vm(&rs_frame), FromVm::World(_)));
@@ -1103,7 +1106,7 @@ mod tests {
             let redirect = frame::icmp6(
                 ll,
                 all,
-                [vec![frame::REDIRECT, 0, 0, 0], vec![0; 36]].concat(),
+                [vec![ndp::kind::REDIRECT, 0, 0, 0], vec![0; 36]].concat(),
             );
             let (first, _) = fragments6(&redirect, 8);
             assert_eq!(
