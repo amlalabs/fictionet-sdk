@@ -598,6 +598,10 @@ fn joins_are_answered_taken_and_refused_as_on_linux() {
                 b"",
             ));
             if right {
+                let fourth = net.recv().await.expect("the join confirmation ACK");
+                assert_eq!(flags(&fourth), ACK);
+                assert_eq!(ack_of(&fourth), 7001);
+                assert!(payload_of(&fourth).is_empty());
                 net.send(segment(
                     joiner,
                     server(22),
@@ -948,12 +952,89 @@ fn many_sources_leave_nothing_behind() {
         );
         assert_eq!(net.honeypot.mptcp_connections(), 0, "no handshake finished");
 
-        // A window later, one more SYN clears the old sources.
+        // Quiet traffic still releases all burst state when the window ends.
         net.fcx.sleep(Duration::from_secs(1)).await?;
-        let from = client(6, 44000);
-        net.send(segment(from, server(22), 1, 0, SYN, &with_mss(&[]), b""));
-        net.drain().await;
-        assert_eq!(net.honeypot.sources(), 1);
+        assert_eq!(net.honeypot.sources(), 0);
+        Ok(())
+    });
+}
+
+#[test]
+fn zero_burst_window_keeps_every_first_answer() {
+    honeypot(
+        Config {
+            burst: Burst {
+                window: Duration::ZERO,
+                syns: 8,
+            },
+            ..Config::default()
+        },
+        |mut net| async move {
+            for n in 1..=2 {
+                net.send(segment(
+                    client(n, 40000),
+                    server(22),
+                    1,
+                    0,
+                    SYN,
+                    &with_mss(&[]),
+                    b"",
+                ));
+            }
+            net.drain().await;
+            assert_eq!(net.events("syn").len(), 2);
+            assert_eq!(net.events("answer").len(), 2);
+            assert_eq!(net.honeypot.sources(), 0);
+            Ok(())
+        },
+    );
+}
+
+#[test]
+fn new_bursts_expire_before_older_answer_deadlines() {
+    honeypot(Config::default(), |mut net| async move {
+        net.send(segment(
+            client(3, 40000),
+            "203.0.113.11:22".parse().unwrap(),
+            1,
+            0,
+            SYN,
+            &with_mss(&[]),
+            b"",
+        ));
+        for n in 1..=2 {
+            net.send(segment(
+                client(n, 40000),
+                server(22),
+                1,
+                0,
+                SYN,
+                &with_mss(&[]),
+                b"",
+            ));
+            net.drain().await;
+            assert_eq!(net.honeypot.sources(), 0);
+        }
+        Ok(())
+    });
+}
+
+#[test]
+fn burst_state_expires_after_the_attachment_leaves() {
+    honeypot(Config::default(), |mut net| async move {
+        net.send(segment(
+            client(1, 40000),
+            server(22),
+            1,
+            0,
+            SYN,
+            &with_mss(&[]),
+            b"",
+        ));
+        net.recv().await.expect("the SYN was processed");
+        drop(net.end);
+        net.fcx.sleep(Duration::from_secs(1)).await?;
+        assert_eq!(net.honeypot.sources(), 0);
         Ok(())
     });
 }
@@ -1734,4 +1815,159 @@ fn a_full_disk_does_not_stop_the_world() {
         },
     ))
     .unwrap();
+}
+
+#[test]
+fn fastclose_resets_the_connection_and_removes_its_token() {
+    honeypot(Config::default(), |mut net| async move {
+        let from = client(2, 43000);
+        let (key, iss) = open_mptcp(&mut net, from, 22, 123456).await;
+        let banner = net.recv().await.expect("the banner");
+        let ack = iss + 1 + payload_of(&banner).len() as u32;
+        let wrong = mptcp_bytes(MptcpOption::FastClose {
+            receiver_key: key ^ 1,
+        });
+        net.send(segment(from, server(22), 5001, ack, ACK, &wrong, b""));
+        net.drain().await;
+        assert_eq!(net.honeypot.mptcp_connections(), 1);
+        let joiner = client(2, 43002);
+        let join = with_mss(&mptcp_bytes(join_syn(token(key), 99)));
+        net.send(segment(joiner, server(22), 7000, 0, SYN, &join, b""));
+        let syn_ack = net.recv().await.expect("the join SYN ACK");
+        let [MptcpOption::Join(Join::SynAck { random, .. })] = mptcp_of(&syn_ack)[..] else {
+            panic!("join nonce")
+        };
+        let join_iss = seq_of(&syn_ack);
+        let hmac = join_hmac(123456, key, 99, random)[..20].try_into().unwrap();
+        let third = mptcp_bytes(MptcpOption::Join(Join::Ack { hmac }));
+        net.send(segment(
+            joiner,
+            server(22),
+            7001,
+            join_iss + 1,
+            ACK,
+            &third,
+            b"",
+        ));
+        let fourth = net.recv().await.expect("the join confirmation");
+        assert_eq!(flags(&fourth), ACK);
+        assert_eq!(ack_of(&fourth), 7001);
+        let close = mptcp_bytes(MptcpOption::FastClose { receiver_key: key });
+        net.send(segment(from, server(22), 5001, ack, ACK, &close, b""));
+        let reset = net.recv().await.expect("the fastclose reset");
+        assert_eq!(flags(&reset) & RST, RST);
+        let joined_reset = net.recv().await.expect("the joined subflow reset");
+        assert_eq!(flags(&joined_reset) & RST, RST);
+        net.drain().await;
+        assert_eq!(net.honeypot.mptcp_connections(), 0);
+        let join = with_mss(&mptcp_bytes(join_syn(token(key), 99)));
+        net.send(segment(
+            client(2, 43001),
+            server(22),
+            7000,
+            0,
+            SYN,
+            &join,
+            b"",
+        ));
+        assert_eq!(
+            flags(&net.recv().await.expect("the refused join")) & RST,
+            RST
+        );
+        Ok(())
+    });
+}
+
+#[test]
+fn mappings_with_invalid_checksum_mode_or_contents_reset_before_delivery() {
+    for (required, checksum, handshake_data) in [
+        (true, None, false),
+        (true, Some(0), false),
+        (false, Some(0), false),
+        (true, None, true),
+        (true, Some(0), true),
+    ] {
+        honeypot(Config::default(), move |mut net| async move {
+            let from = client(2, 44000);
+            let client_key = 0x123456789abcdef;
+            let capable = Capable {
+                version: 1,
+                checksum_required: required,
+                extensibility: false,
+                no_new_subflows: false,
+                algorithms: algorithm::HMAC_SHA256,
+                keys: Keys::Absent,
+            };
+            let syn = with_mss(&mptcp_bytes(MptcpOption::Capable(capable)));
+            net.send(segment(from, server(22), 5000, 0, SYN, &syn, b""));
+            let answer = net.recv().await.expect("the SYN ACK");
+            let [
+                MptcpOption::Capable(Capable {
+                    keys: Keys::Sender(key),
+                    ..
+                }),
+            ] = mptcp_of(&answer)[..]
+            else {
+                panic!("server key")
+            };
+            let iss = seq_of(&answer);
+            let keys = if handshake_data {
+                Keys::Data {
+                    sender: client_key,
+                    receiver: key,
+                    data_level_length: 5,
+                    checksum,
+                }
+            } else {
+                Keys::Both {
+                    sender: client_key,
+                    receiver: key,
+                }
+            };
+            let third = mptcp_bytes(MptcpOption::Capable(Capable { keys, ..capable }));
+            net.send(segment(
+                from,
+                server(22),
+                5001,
+                iss + 1,
+                ACK,
+                &third,
+                if handshake_data { b"hello" } else { b"" },
+            ));
+            if !handshake_data {
+                let banner = net.recv().await.expect("the banner");
+                let mapping = mptcp_bytes(MptcpOption::Dss(Dss {
+                    data_ack: None,
+                    mapping: Some(Mapping {
+                        data_sequence_number: Sequence::Long(
+                            mptcp::idsn(client_key).wrapping_add(1),
+                        ),
+                        subflow_sequence_number: 1,
+                        data_level_length: 5,
+                        checksum,
+                    }),
+                    data_fin: false,
+                }));
+                net.send(segment(
+                    from,
+                    server(22),
+                    5001,
+                    iss + 1 + payload_of(&banner).len() as u32,
+                    PSH | ACK,
+                    &mapping,
+                    b"hello",
+                ));
+            }
+            let reset = net.recv().await.expect("the checksum reset");
+            assert_eq!(flags(&reset) & RST, RST);
+            assert_eq!(
+                mptcp_of(&reset),
+                [MptcpOption::TcpRst {
+                    transient: false,
+                    reason: reason::MPTCP_SPECIFIC
+                }]
+            );
+            Ok(())
+        });
+    }
 }

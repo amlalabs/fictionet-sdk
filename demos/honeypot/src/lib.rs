@@ -164,6 +164,18 @@ pub fn start(
     };
     let (attacher, inner) = fictionet::attachments();
     network(fcx, config, clock, &tokens).start(fcx, inner)?;
+    let expiring = observer.clone();
+    fcx.spawn(move |fcx| async move {
+        let mut timer = fictionet::Timer::new(&fcx);
+        loop {
+            std::future::poll_fn(|cx| {
+                let deadline = expiring.lock().expiry(cx);
+                timer.poll_until(cx, deadline)
+            })
+            .await?;
+            expiring.lock().expire(fcx.now());
+        }
+    });
     let address = config.address;
     fcx.spawn(move |fcx| async move {
         loop {

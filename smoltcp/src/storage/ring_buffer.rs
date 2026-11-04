@@ -199,6 +199,23 @@ impl<'a> RingBuffer<'a> {
         size_1 + size_2
     }
 
+    /// Read as many unallocated buffer elements, starting at the given offset
+    /// past the last allocated element, as fit into the given slice, and
+    /// return the amount read.
+    pub(crate) fn read_unallocated(&mut self, offset: usize, data: &mut [u8]) -> usize {
+        let mut read = 0;
+        while read < data.len() {
+            let slice = self.get_unallocated(offset + read, data.len() - read);
+            if slice.is_empty() {
+                break;
+            }
+            let len = slice.len();
+            data[read..read + len].copy_from_slice(slice);
+            read += len;
+        }
+        read
+    }
+
     /// Enqueue the given number of unallocated buffer elements.
     ///
     /// # Panics

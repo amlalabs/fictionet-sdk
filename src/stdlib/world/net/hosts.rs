@@ -1009,6 +1009,8 @@ impl Machine {
         let (router_side, side) = link();
         let ((tcp, udp, icmp, _other), split) = ip::prepare_split_protocols(&fcx, side);
         let (tcp, tcp_task) = tcp::prepare_endpoint(&fcx, tcp, addr, tcp::Options::default());
+        let hooks = installation.admission.hooks.clone();
+        tcp.limit_isolated_peers(move |addr| hooks.by_addr.lock().contains_key(&addr));
         let (udp, udp_task) = udp::prepare_endpoint(&fcx, udp, addr);
         let machine = Arc::new(Machine {
             fcx: fcx.clone(),
@@ -1289,7 +1291,7 @@ async fn accept(
                 let mut info =
                     ConnInfo::new(hooks.next_conn(), conn.local_addr(), conn.peer_addr())
                         .from_sandbox(sandbox);
-                info.handshake = conn.handshake().clone();
+                info.handshake = conn.handshake().cloned();
                 let accepted = fcx.now();
                 let handshake = machine.handshake;
                 let port = port.clone();

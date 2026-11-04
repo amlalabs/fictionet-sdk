@@ -243,7 +243,10 @@ fn syn_options_reach_the_connection_and_the_syn_ack_answers_mptcp() {
                 break p;
             }
         };
-        assert_eq!(options_of(tcp_of(&again)), options);
+        let mut resent_options = options.clone();
+        let timestamp = &mut resent_options.iter_mut().find(|o| o.0 == 8).unwrap().1;
+        timestamp[..4].copy_from_slice(&(fcx.now().since_start().as_millis() as u32).to_be_bytes());
+        assert_eq!(options_of(tcp_of(&again)), resent_options);
         assert_eq!(seen.lock().unwrap().len(), 1);
 
         // The third ACK's options reach the connection too.
@@ -256,6 +259,7 @@ fn syn_options_reach_the_connection_and_the_syn_ack_answers_mptcp() {
             unreachable!()
         };
         let handshake = Handshake {
+            origin: tcp::HandshakeOrigin::Syn,
             syn: Some(linux_syn_options().into()),
             syn_ack: Some(answered.into()),
             ack: vec![
@@ -271,8 +275,8 @@ fn syn_options_reach_the_connection_and_the_syn_ack_answers_mptcp() {
             irs: 1000,
             iss,
         };
-        assert_eq!(*conn.handshake(), handshake);
-        assert_eq!(Accepted::handshake(&conn), handshake);
+        assert_eq!(*conn.handshake().unwrap(), handshake);
+        assert_eq!(Accepted::handshake(&conn), Some(handshake));
         Ok(())
     });
 }
@@ -287,10 +291,14 @@ fn a_listener_without_an_answer_adds_nothing() {
         let syn_ack = next(&fcx, &mut raw).await.expect("a SYN-ACK");
         let t = tcp_of(&syn_ack);
         let kinds: Vec<u8> = options_of(t).iter().map(|o| o.0).collect();
-        assert_eq!(kinds, [2, 3, 4], "MSS, Window Scale, SACK-Permitted");
+        assert_eq!(
+            kinds,
+            [2, 3, 4, 8],
+            "MSS, Window Scale, SACK-Permitted, Timestamps"
+        );
         raw.send(segment(4000, 1001, seq_of(t).wrapping_add(1), ACK, &[]));
         let conn = listener.accept(&fcx).await?;
-        let handshake = conn.handshake();
+        let handshake = conn.handshake().unwrap();
         assert_eq!(handshake.syn.as_deref(), Some(&linux_syn_options()[..]));
         assert_eq!(handshake.syn_ack.as_deref(), Some(&[][..]));
         assert!(handshake.ack.is_empty());
@@ -311,18 +319,147 @@ fn an_endpoint_s_own_syn_reaches_the_other_endpoint() {
             .connect(&fcx, SocketAddr::new(ip(SERVER), 80))
             .await?;
         let accepted = listener.accept(&fcx).await?;
-        assert_eq!(*conn.handshake(), Handshake::default());
-        let syn = accepted.handshake().syn.clone().expect("the SYN's options");
+        assert!(conn.handshake().is_none());
+        let syn = accepted
+            .handshake()
+            .unwrap()
+            .syn
+            .clone()
+            .expect("the SYN's options");
         assert!(
             matches!(
                 *syn,
                 [
                     TcpOption::MaxSegmentSize(1460),
                     TcpOption::WindowScale(_),
-                    TcpOption::SackPermitted
+                    TcpOption::SackPermitted,
+                    TcpOption::Timestamps { .. }
                 ]
             ),
             "{syn:?}"
+        );
+        Ok(())
+    });
+}
+
+#[test]
+fn timestamps_and_ecn_are_negotiated_and_timestamps_advance() {
+    world(Duration::from_secs(10), |fcx| async move {
+        let (mut raw, side) = pair();
+        let server = tcp::endpoint(&fcx, side, ip(SERVER));
+        let mut listener = server.listen(80)?;
+        raw.send(segment(4000, 0, 0, SYN | 0xc0, &LINUX_SYN));
+        let syn_ack = next(&fcx, &mut raw).await.expect("a SYN-ACK");
+        let t = tcp_of(&syn_ack);
+        assert_eq!(t[13], SYN | ACK | 0x40);
+        assert_eq!(transport_checksum(ip(SERVER), ip(PEER), 6, t), 0);
+        let timestamps = |t: &[u8]| {
+            let (_, value) = options_of(t)
+                .into_iter()
+                .find(|(kind, _)| *kind == 8)
+                .unwrap();
+            (
+                u32::from_be_bytes(value[..4].try_into().unwrap()),
+                u32::from_be_bytes(value[4..].try_into().unwrap()),
+            )
+        };
+        let (tsval, tsecr) = timestamps(t);
+        assert_eq!(tsecr, 1);
+        let iss = seq_of(t);
+        let again = timeout(&fcx, Duration::from_secs(2), raw.recv(&fcx))
+            .await
+            .expect("a retransmitted SYN-ACK")?;
+        let (later, echoed) = timestamps(tcp_of(&again));
+        assert_eq!(later.wrapping_sub(tsval), 1000);
+        assert_eq!(echoed, 1);
+        assert_eq!(tcp_of(&again)[13], SYN | ACK | 0x40);
+        assert_eq!(
+            transport_checksum(ip(SERVER), ip(PEER), 6, tcp_of(&again)),
+            0
+        );
+        raw.send(segment(4000, 1, iss.wrapping_add(1), ACK, &[]));
+        let conn = listener.accept(&fcx).await?;
+        assert_eq!(conn.handshake().unwrap().origin, tcp::HandshakeOrigin::Syn);
+        assert_eq!(conn.handshake().unwrap().irs, 0);
+        let marked = segment_with(4000, 1, iss.wrapping_add(1), PSH | ACK, &[], b"a");
+        raw.send(packet_with(
+            ip(PEER),
+            ip(SERVER),
+            6,
+            Fields {
+                tos: 3,
+                ..Fields::default()
+            },
+            tcp_of(&marked),
+        ));
+        let echo = next(&fcx, &mut raw).await.expect("a congestion echo");
+        assert_eq!(tcp_of(&echo)[13] & 0x40, 0x40);
+        assert_eq!(
+            transport_checksum(ip(SERVER), ip(PEER), 6, tcp_of(&echo)),
+            0
+        );
+        raw.send(segment_with(
+            4000,
+            2,
+            iss.wrapping_add(1),
+            PSH | ACK | 0x80,
+            &[],
+            b"b",
+        ));
+        let cleared = next(&fcx, &mut raw)
+            .await
+            .expect("the acknowledged congestion response");
+        assert_eq!(tcp_of(&cleared)[13] & 0x40, 0);
+        assert_eq!(
+            transport_checksum(ip(SERVER), ip(PEER), 6, tcp_of(&cleared)),
+            0
+        );
+        Ok(())
+    });
+}
+
+#[test]
+fn cookies_decline_timestamps_and_ecn_without_retaining_state() {
+    world(Duration::from_secs(10), |fcx| async move {
+        let (mut raw, side) = pair();
+        let server = tcp::endpoint_with(&fcx, side, ip(SERVER), tcp::Options::default().backlog(1));
+        let mut listener = server.listen(80)?;
+        for port in [4000, 4001] {
+            raw.send(segment(port, 0, 0, SYN | 0xc0, &LINUX_SYN));
+        }
+        let first = next(&fcx, &mut raw).await.expect("a SYN-ACK");
+        let second = next(&fcx, &mut raw).await.expect("the other SYN-ACK");
+        let (stateful, cookie) = if dport_of(tcp_of(&first)) == 4000 {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        assert_eq!(dport_of(tcp_of(&stateful)), 4000);
+        assert_eq!(tcp_of(&stateful)[13], SYN | ACK | 0x40);
+        assert_eq!(
+            transport_checksum(ip(SERVER), ip(PEER), 6, tcp_of(&stateful)),
+            0
+        );
+        let t = tcp_of(&cookie);
+        assert_eq!(dport_of(t), 4001);
+        assert_eq!(t[13], SYN | ACK);
+        assert_eq!(options_of(t), [(2, vec![0x05, 0xb4])]);
+        assert_eq!(transport_checksum(ip(SERVER), ip(PEER), 6, t), 0);
+        raw.send(segment(4001, 1, seq_of(t).wrapping_add(1), ACK, &[]));
+        let mut conn = listener.accept(&fcx).await?;
+        assert_eq!(
+            conn.handshake().unwrap().origin,
+            tcp::HandshakeOrigin::Cookie
+        );
+        conn.write_all(&fcx, b"hello").await?;
+        let data = next(&fcx, &mut raw)
+            .await
+            .expect("data without negotiated extensions");
+        assert_eq!(tcp_of(&data)[13] & 0xc0, 0);
+        assert!(options_of(tcp_of(&data)).is_empty());
+        assert_eq!(
+            transport_checksum(ip(SERVER), ip(PEER), 6, tcp_of(&data)),
+            0
         );
         Ok(())
     });
@@ -348,7 +485,7 @@ impl serve::Service for RecordSyn {
     ) -> Result<Flow, Self::Error> {
         seen.lock()
             .unwrap()
-            .push(driver.conn().handshake.syn.clone());
+            .push(driver.conn().handshake.as_ref().unwrap().syn.clone());
         Ok(Flow::Close)
     }
 
@@ -439,9 +576,9 @@ fn an_answer_that_cannot_be_sent_resets_the_attempt() {
                     unreachable!()
                 };
                 assert_eq!(options_of(t).last().unwrap(), &(*kind, data.clone()));
-                // MSS, Window Scale and SACK-Permitted take 9 bytes, the
-                // answer 21, and End of Option List pads to a word.
-                assert_eq!((t[12] >> 4) as usize * 4, 52);
+                // MSS, Window Scale, SACK-Permitted and Timestamps take
+                // 19 bytes, and the answer fills the remaining 21.
+                assert_eq!((t[12] >> 4) as usize * 4, 60);
             } else {
                 assert_syn_reset(t, &[]);
                 // The listener still answers the next attempt.
@@ -606,7 +743,7 @@ fn an_answer_refuses_a_connection_at_its_ack() {
         let mut conn = listener.accept(&fcx).await?;
         assert_eq!(conn.peer_addr().port(), 4001, "the refused one never came");
         assert_eq!(
-            *conn.handshake().ack,
+            *conn.handshake().unwrap().ack,
             [
                 TcpOption::Unknown {
                     kind: 253,
@@ -640,9 +777,9 @@ impl tcp::Segments for Stamp {
         }]
     }
 
-    fn received(&mut self, segment: &tcp::Received<'_>) -> bool {
+    fn received(&mut self, segment: &tcp::Received<'_>) -> tcp::SegmentVerdict {
         self.0.lock().unwrap().push(segment.payload.len());
-        false
+        tcp::SegmentVerdict::Take
     }
 }
 
@@ -700,7 +837,14 @@ fn an_answer_drops_at_the_ack_or_stamps_the_segments() {
         conn.write_all(&fcx, b"hi").await?;
         let data = next(&fcx, &mut raw).await.expect("data");
         let t = tcp_of(&data);
-        assert_eq!(options_of(t), [(254, vec![0, 2])]);
+        let timestamp = || {
+            let mut value = (fcx.now().since_start().as_millis() as u32)
+                .to_be_bytes()
+                .to_vec();
+            value.extend_from_slice(&1u32.to_be_bytes());
+            (8, value)
+        };
+        assert_eq!(options_of(t), [timestamp(), (254, vec![0, 2])]);
         raw.send(segment_with(
             4001,
             1001,
@@ -711,8 +855,8 @@ fn an_answer_drops_at_the_ack_or_stamps_the_segments() {
         ));
         assert_eq!(read_n(&fcx, &mut conn, 5).await?, b"hello");
         let ack = next(&fcx, &mut raw).await.expect("an ACK");
-        assert_eq!(options_of(tcp_of(&ack)), [(254, vec![0, 0])]);
-        assert_eq!(*taken.lock().unwrap(), [5]);
+        assert_eq!(options_of(tcp_of(&ack)), [timestamp(), (254, vec![0, 0])]);
+        assert_eq!(*taken.lock().unwrap(), [0, 5]);
         Ok(())
     });
 }
@@ -760,12 +904,12 @@ fn a_syn_with_a_malformed_option_is_answered() {
         }
         let first = listener.accept(&fcx).await?;
         assert_eq!(
-            first.handshake().syn.as_deref(),
+            first.handshake().unwrap().syn.as_deref(),
             Some(&[TcpOption::MaxSegmentSize(1460)][..])
         );
         let second = listener.accept(&fcx).await?;
         assert_eq!(
-            second.handshake().syn.as_deref(),
+            second.handshake().unwrap().syn.as_deref(),
             Some(
                 &[TcpOption::Unknown {
                     kind: 2,
@@ -835,7 +979,7 @@ fn hostile_syn_options_get_well_formed_answers() {
         raw.send(segment(4000, 1001, iss.wrapping_add(1), ACK, &[]));
         let mut conn = listener.accept(&fcx).await?;
         assert_eq!(
-            conn.handshake().syn.as_deref(),
+            conn.handshake().unwrap().syn.as_deref(),
             Some(&linux_syn_options()[..])
         );
         conn.write_all(&fcx, b"SSH-2.0-OpenSSH_9.6\r\n").await?;
@@ -873,7 +1017,7 @@ fn syns_past_the_backlog_get_syn_cookies() {
             assert_eq!(ack_of(t), 1001);
             let kinds: Vec<u8> = options_of(t).iter().map(|o| o.0).collect();
             if dport_of(t) < 5002 {
-                assert_eq!(kinds, [2, 3, 4, 253], "a full SYN-ACK");
+                assert_eq!(kinds, [2, 3, 4, 8, 253], "a full SYN-ACK");
             } else {
                 assert_eq!(
                     options_of(t),
@@ -907,7 +1051,7 @@ fn syns_past_the_backlog_get_syn_cookies() {
         ));
         let mut conn = listener.accept(&fcx).await?;
         assert_eq!(conn.peer_addr().port(), 5002);
-        let handshake = conn.handshake();
+        let handshake = conn.handshake().unwrap();
         assert_eq!(
             (handshake.syn.clone(), handshake.syn_ack.clone()),
             (None, None)

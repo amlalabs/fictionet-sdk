@@ -552,6 +552,8 @@ pub struct Socket<'a> {
     segment_extra: Vec<u8>,
     /// It asked for an ACK, which the next segment sent carries.
     ack_asked: bool,
+    /// The options of the RST it asked for, encoded.
+    rst_options: Vec<u8>,
 
     rx_waker: WakerRegistration,
 
@@ -620,11 +622,32 @@ pub trait SegmentOptions: Send {
     /// included.
     fn sent(&mut self, segment: &Outgoing<'_>, out: &mut Vec<u8>);
 
-    /// Sees a segment the socket took, before its data can be read.
-    /// Returns whether the socket acknowledges it at once, though it may
-    /// carry no data, as an MPTCP host acknowledges a DATA_FIN (RFC 8684
-    /// section 3.3.3).
-    fn received(&mut self, segment: &Incoming<'_>) -> bool;
+    /// Sees a segment the socket took, in any order, before its data can
+    /// be read, and says what the socket does with it.
+    fn received(&mut self, segment: &Incoming<'_>) -> Verdict;
+
+    /// Transforms newly contiguous subflow bytes into application bytes.
+    /// May hold bytes until a complete mapping can be validated, then return
+    /// them in data sequence order. Output must fit the receive buffer.
+    fn arrived(&mut self, seq: u32, data: &[u8], out: &mut Vec<u8>) -> Verdict {
+        let _ = seq;
+        out.extend_from_slice(data);
+        Verdict::Take
+    }
+}
+
+/// What a socket does with a segment its [`SegmentOptions`] saw.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    /// Goes on as usual.
+    Take,
+    /// Acknowledges the segment at once, though it may carry no data, as
+    /// an MPTCP host acknowledges a DATA_FIN (RFC 8684 section 3.3.3).
+    Acknowledge,
+    /// Resets the connection with a RST that carries these whole options,
+    /// encoded, as an MPTCP host resets a subflow with MP_TCPRST (RFC 8684
+    /// section 3.6). Nothing more of the segment is taken.
+    Reset(Vec<u8>),
 }
 
 /// A boxed [`SegmentOptions`], so that the socket can print itself.
@@ -690,6 +713,7 @@ impl<'a> Socket<'a> {
             segment_options: None,
             segment_extra: Vec::new(),
             ack_asked: false,
+            rst_options: Vec::new(),
 
             rx_waker: WakerRegistration::new(),
 
@@ -697,7 +721,7 @@ impl<'a> Socket<'a> {
         }
     }
 
-    /// Enable or disable TCP Timestamp.
+    /// Enable or disable TCP Timestamp. The generator receives the stack clock.
     pub fn set_tsval_generator(&mut self, generator: Option<TcpTimestampGenerator>) {
         self.tsval_generator = generator;
     }
@@ -726,6 +750,97 @@ impl<'a> Socket<'a> {
     /// forgets the connection.
     pub fn set_segment_options(&mut self, options: Box<dyn SegmentOptions>) {
         self.segment_options = Some(SegmentOptionsBox(options));
+    }
+
+    /// Applies newly installed options to data carried by the handshake ACK.
+    pub fn process_handshake_data(&mut self, seq: u32, options: &[u8]) {
+        let data = self.unread();
+        let Some(hook) = self.segment_options.as_mut() else {
+            return;
+        };
+        let verdict = hook.0.received(&Incoming {
+            seq,
+            payload: &data,
+            fin: false,
+            options,
+        });
+        if self.heed(verdict) {
+            return;
+        }
+        self.rx_buffer.clear();
+        let wrote = self.rx_buffer.write_unallocated(0, &data);
+        debug_assert_eq!(wrote, data.len());
+        let verdict = self.arrived(TcpSeqNumber(seq as i32), data.len());
+        self.heed(verdict);
+    }
+
+    /// Resets the connection, as [`abort`](Socket::abort) does, with a RST
+    /// that carries `options`, whole options encoded with
+    /// [`encode_options`].
+    pub fn abort_with(&mut self, options: Vec<u8>) {
+        self.rst_options = options;
+        self.abort();
+    }
+
+    /// A copy of the bytes received and not yet read.
+    fn unread(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.rx_buffer.len());
+        while out.len() < self.rx_buffer.len() {
+            let part = self
+                .rx_buffer
+                .get_allocated(out.len(), self.rx_buffer.len() - out.len());
+            out.extend_from_slice(part);
+        }
+        out
+    }
+
+    /// Shows the segment options the bytes that just became contiguous,
+    /// the first `contiguous` of the unallocated receive buffer starting at
+    /// sequence number `seq`, and readies those they keep for reading. The
+    /// rest are dropped, so the bytes received out of order after them
+    /// move down to stay at their offsets, and the sequence number of the
+    /// next byte expected stays where it was.
+    fn arrived(&mut self, seq: TcpSeqNumber, contiguous: usize) -> Verdict {
+        let Some(options) = self.segment_options.as_mut() else {
+            self.rx_buffer.enqueue_unallocated(contiguous);
+            return Verdict::Take;
+        };
+        let mut data = vec![0; contiguous];
+        self.rx_buffer.read_unallocated(0, &mut data);
+        let mut kept = Vec::new();
+        let verdict = options.0.arrived(seq.0 as u32, &data, &mut kept);
+        let after = self.assembler.iter_data().last().map_or(0, |(_, end)| end);
+        if kept.len() + after > self.rx_buffer.window() {
+            return Verdict::Reset(Vec::new());
+        }
+        if kept.len() != contiguous || kept != data {
+            let mut later = vec![0; after];
+            self.rx_buffer.read_unallocated(contiguous, &mut later);
+            let wrote = self.rx_buffer.write_unallocated(0, &kept);
+            debug_assert_eq!(wrote, kept.len());
+            let wrote = self.rx_buffer.write_unallocated(kept.len(), &later);
+            debug_assert_eq!(wrote, later.len());
+            self.remote_seq_no += contiguous;
+            self.remote_seq_no = self.remote_seq_no - kept.len();
+        }
+        self.rx_buffer.enqueue_unallocated(kept.len());
+        verdict
+    }
+
+    /// Acts on what the segment options said of a segment. Returns whether
+    /// the socket reset the connection.
+    fn heed(&mut self, verdict: Verdict) -> bool {
+        match verdict {
+            Verdict::Take => false,
+            Verdict::Acknowledge => {
+                self.ack_asked = true;
+                false
+            }
+            Verdict::Reset(options) => {
+                self.abort_with(options);
+                true
+            }
+        }
     }
 
     /// Takes up a handshake that a listener answered without keeping any
@@ -991,6 +1106,7 @@ impl<'a> Socket<'a> {
         self.syn_options = Vec::new();
         self.segment_options = None;
         self.ack_asked = false;
+        self.rst_options = Vec::new();
 
         {
             self.rx_waker.wake();
@@ -1369,11 +1485,16 @@ impl<'a> Socket<'a> {
         (ip_reply_repr, reply_repr)
     }
 
-    fn ack_reply(&mut self, ip_repr: &IpRepr, repr: &TcpRepr) -> (IpRepr, TcpRepr<'static>) {
+    fn ack_reply(
+        &mut self,
+        cx: &mut Context,
+        ip_repr: &IpRepr,
+        repr: &TcpRepr,
+    ) -> (IpRepr, TcpRepr<'static>) {
         let (mut ip_reply_repr, mut reply_repr) = Self::reply(ip_repr, repr);
         reply_repr.timestamp = repr
             .timestamp
-            .and_then(|tcp_ts| tcp_ts.generate_reply(self.tsval_generator));
+            .and_then(|tcp_ts| tcp_ts.generate_reply(self.tsval_generator, cx.now()));
 
         // From RFC 793:
         // [...] an empty acknowledgment segment containing the current send-sequence number
@@ -1451,7 +1572,7 @@ impl<'a> Socket<'a> {
         // Rate-limit to 1 per second max.
         self.challenge_ack_timer = cx.now() + Duration::from_secs(1);
 
-        Some(self.ack_reply(ip_repr, repr))
+        Some(self.ack_reply(cx, ip_repr, repr))
     }
 
     pub(crate) fn accepts(&self, _cx: &mut Context, ip_repr: &IpRepr, repr: &TcpRepr) -> bool {
@@ -1657,7 +1778,7 @@ impl<'a> Socket<'a> {
                             TcpControl::None | TcpControl::Psh | TcpControl::Fin
                         )
                     {
-                        return Some(self.ack_reply(ip_repr, repr));
+                        return Some(self.ack_reply(cx, ip_repr, repr));
                     }
 
                     return self.challenge_ack_reply(cx, ip_repr, repr);
@@ -1847,12 +1968,15 @@ impl<'a> Socket<'a> {
         self.remote_last_ts = Some(cx.now());
 
         if let Some(segment_options) = self.segment_options.as_mut() {
-            self.ack_asked |= segment_options.0.received(&Incoming {
+            let verdict = segment_options.0.received(&Incoming {
                 seq: repr.seq_number.0 as u32,
                 payload: repr.payload,
                 fin: control == TcpControl::Fin,
                 options,
             });
+            if self.heed(verdict) {
+                return None;
+            }
         }
 
         // RFC 1323: The window field (SEG.WND) in the header of every incoming segment, with the
@@ -1928,7 +2052,7 @@ impl<'a> Socket<'a> {
 
         let payload_len = payload.len();
         if payload_len == 0 {
-            return dropped_probe.then(|| self.ack_reply(ip_repr, repr));
+            return dropped_probe.then(|| self.ack_reply(cx, ip_repr, repr));
         }
 
         let assembler_was_empty = self.assembler.is_empty();
@@ -1938,7 +2062,7 @@ impl<'a> Socket<'a> {
             .assembler
             .add_then_remove_front(payload_offset, payload_len)
         else {
-            return Some(self.ack_reply(ip_repr, repr));
+            return Some(self.ack_reply(cx, ip_repr, repr));
         };
 
         // Place payload octets into the buffer.
@@ -1946,12 +2070,16 @@ impl<'a> Socket<'a> {
         debug_assert!(len_written == payload_len);
 
         if contig_len != 0 {
-            // Enqueue the contiguous data octets in front of the buffer.
-            self.rx_buffer.enqueue_unallocated(contig_len);
+            // Enqueue the contiguous data octets in front of the buffer, those
+            // the segment options keep.
+            let verdict = self.arrived(window_start, contig_len);
 
             // There's new data in rx_buffer, notify waiting task if any.
 
             self.rx_waker.wake();
+            if self.heed(verdict) {
+                return None;
+            }
         }
 
         // Handle delayed acks
@@ -1975,7 +2103,7 @@ impl<'a> Socket<'a> {
             // Note that we change the transmitter state here.
             // This is fine because smoltcp assumes that it can always transmit zero or one
             // packets for every packet it receives.
-            Some(self.ack_reply(ip_repr, repr))
+            Some(self.ack_reply(cx, ip_repr, repr))
         } else {
             None
         }
@@ -2321,6 +2449,7 @@ impl<'a> Socket<'a> {
             timestamp: TcpTimestampRepr::generate_reply_with_tsval(
                 self.tsval_generator,
                 self.last_remote_tsval,
+                cx.now(),
             ),
             payload: &[],
         };
@@ -2454,9 +2583,9 @@ impl<'a> Socket<'a> {
             let max_segment_size = cx.ip_mtu() - ip_repr.header_len() - TCP_HEADER_LEN;
             repr.max_seg_size = Some(max_segment_size as u16);
             repr.extra = &self.syn_options;
-        } else if repr.control != TcpControl::Rst
-            && let Some(options) = self.segment_options.as_mut()
-        {
+        } else if repr.control == TcpControl::Rst {
+            repr.extra = &self.rst_options;
+        } else if let Some(options) = self.segment_options.as_mut() {
             let segment = Outgoing {
                 seq: repr.seq_number.0 as u32,
                 payload: if is_keep_alive { &[] } else { repr.payload },
@@ -3586,14 +3715,14 @@ pub(crate) mod test {
             }
         }
 
-        fn received(&mut self, segment: &Incoming<'_>) -> bool {
+        fn received(&mut self, segment: &Incoming<'_>) -> Verdict {
             self.seen.lock().unwrap().received.push((
                 segment.seq,
                 segment.payload.to_vec(),
                 segment.fin,
                 segment.options.to_vec(),
             ));
-            false
+            Verdict::Take
         }
     }
 
@@ -3610,8 +3739,12 @@ pub(crate) mod test {
             out.extend_from_slice(&[253, 2]);
         }
 
-        fn received(&mut self, segment: &Incoming<'_>) -> bool {
-            segment.options.first() == Some(&254)
+        fn received(&mut self, segment: &Incoming<'_>) -> Verdict {
+            if segment.options.first() == Some(&254) {
+                Verdict::Acknowledge
+            } else {
+                Verdict::Take
+            }
         }
     }
 
@@ -3754,6 +3887,140 @@ pub(crate) mod test {
             }]
         );
         assert_eq!(seen.lock().unwrap().sent.len(), 1);
+    }
+
+    /// Keeps every byte but `x`, and resets the connection with an option
+    /// of kind 252 when a segment carries `!`.
+    struct DropX;
+
+    impl SegmentOptions for DropX {
+        fn room(&self) -> usize {
+            0
+        }
+
+        fn sent(&mut self, _: &Outgoing<'_>, _: &mut Vec<u8>) {}
+
+        fn received(&mut self, segment: &Incoming<'_>) -> Verdict {
+            if segment.payload.contains(&b'!') {
+                Verdict::Reset(vec![252, 2])
+            } else {
+                Verdict::Take
+            }
+        }
+
+        fn arrived(&mut self, _: u32, data: &[u8], out: &mut Vec<u8>) -> Verdict {
+            out.extend(data.iter().copied().filter(|byte| *byte != b'x'));
+            Verdict::Take
+        }
+    }
+
+    /// Bytes the segment options drop are acknowledged and never read,
+    /// whether they came in order or filled a gap, and bytes that came
+    /// after the gap stay where they belong.
+    #[test]
+    fn test_segment_options_choose_the_bytes_read() {
+        let mut s = socket_established();
+        s.set_segment_options(Box::new(DropX));
+        // Out of order: kept aside until the gap fills.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 4,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"exgh"[..],
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                window_len: 64,
+                sack_ranges: [None, None, None],
+                ..RECV_TEMPL
+            })
+        );
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 8,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"ij"[..],
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                window_len: 64,
+                ..RECV_TEMPL
+            })
+        );
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"axcd"[..],
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 10),
+                window_len: 56,
+                ..RECV_TEMPL
+            })
+        );
+        let mut read = [0; 16];
+        let n = s.recv_slice(&mut read).unwrap();
+        assert_eq!(&read[..n], b"acdeghij");
+        // A later byte goes on from there.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 10,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"xk"[..],
+                ..SEND_TEMPL
+            }
+        );
+        let n = s.recv_slice(&mut read).unwrap();
+        assert_eq!(&read[..n], b"k");
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 12),
+                window_len: 64,
+                ..RECV_TEMPL
+            }]
+        );
+    }
+
+    /// A segment the segment options reset on is not taken: the connection
+    /// closes, and its RST carries the options they gave.
+    #[test]
+    fn test_segment_options_can_reset() {
+        let mut s = socket_established();
+        s.set_segment_options(Box::new(DropX));
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"no!"[..],
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::Closed);
+        assert_eq!(s.recv_queue(), 0);
+        recv!(
+            s,
+            [TcpRepr {
+                control: TcpControl::Rst,
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                extra: &[252, 2],
+                ..RECV_TEMPL
+            }]
+        );
     }
 
     /// Segment options see each segment the socket takes, with its wire
@@ -3957,7 +4224,7 @@ pub(crate) mod test {
     #[test]
     fn test_syn_options_fill_the_header_beside_every_own_option() {
         let mut s = socket_listen();
-        s.set_tsval_generator(Some(|| 7));
+        s.set_tsval_generator(Some(|_| 7));
         send!(
             s,
             TcpRepr {
@@ -5630,7 +5897,7 @@ pub(crate) mod test {
 
         // construct socket where remote MSS is less than local MSS
         let mut s = socket_established();
-        s.set_tsval_generator(Some(|| 1));
+        s.set_tsval_generator(Some(|_| 1));
         s.remote_mss = EFFECTIVE_MSS;
 
         // Payload should contain 12 bytes less due to timestamp
@@ -5653,7 +5920,7 @@ pub(crate) mod test {
 
         // construct socket where remote MSS is more than local MSS
         let mut s = socket_established_with_buffer_sizes(EFFECTIVE_MSS, 64);
-        s.set_tsval_generator(Some(|| 1));
+        s.set_tsval_generator(Some(|_| 1));
         s.remote_mss = 9999;
         s.remote_win_len = 9999;
 
@@ -5678,7 +5945,7 @@ pub(crate) mod test {
         // options length would result in an effective MSS of zero, sending
         // empty segments in a loop without ever making progress.
         let mut s = socket();
-        s.set_tsval_generator(Some(|| 1));
+        s.set_tsval_generator(Some(|_| 1));
         s.local_seq_no = LOCAL_SEQ;
         s.socket.connect(&mut s.cx, REMOTE_END, LOCAL_END).unwrap();
         recv!(
@@ -10616,7 +10883,7 @@ pub(crate) mod test {
 
         let mut s = socket_established_with_buffer_sizes(256, 64);
         s.set_nagle_enabled(true);
-        s.set_tsval_generator(Some(|| 1));
+        s.set_tsval_generator(Some(|_| 1));
         s.remote_mss = EFFECTIVE_MSS;
 
         // Send small segment to "arm" Nagle's
@@ -10780,7 +11047,7 @@ pub(crate) mod test {
     #[test]
     fn test_tsval_established_connection() {
         let mut s = socket_established();
-        s.set_tsval_generator(Some(|| 1));
+        s.set_tsval_generator(Some(|_| 1));
 
         assert!(s.timestamp_enabled());
 
@@ -10833,7 +11100,7 @@ pub(crate) mod test {
     #[test]
     fn test_tsval_disabled_in_remote_client() {
         let mut s = socket_listen();
-        s.set_tsval_generator(Some(|| 1));
+        s.set_tsval_generator(Some(|_| 1));
         assert!(s.timestamp_enabled());
         send!(
             s,
@@ -10914,7 +11181,7 @@ pub(crate) mod test {
     #[test]
     fn test_tsval_disabled_in_remote_server() {
         let mut s = socket();
-        s.set_tsval_generator(Some(|| 1));
+        s.set_tsval_generator(Some(|_| 1));
         assert!(s.timestamp_enabled());
         s.local_seq_no = LOCAL_SEQ;
         s.socket.connect(&mut s.cx, REMOTE_END, LOCAL_END).unwrap();

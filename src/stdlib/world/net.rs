@@ -1151,11 +1151,11 @@ mod tests {
                 assert_eq!(from.len(), 1, "the refused attempt is never served");
                 assert_eq!(from[0].peer, Some(SocketAddr::new(client.into(), 4000)));
                 assert_eq!(
-                    from[0].handshake.syn.as_deref(),
+                    from[0].handshake.as_ref().unwrap().syn.as_deref(),
                     Some(&[tcp::TcpOption::Unknown { kind: 253, data: vec![2] }][..])
                 );
                 assert_eq!(
-                    from[0].handshake.syn_ack.as_deref(),
+                    from[0].handshake.as_ref().unwrap().syn_ack.as_deref(),
                     Some(&[tcp::TcpOption::Unknown { kind: 253, data: vec![9] }][..])
                 );
                 drop(from);

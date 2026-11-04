@@ -70,12 +70,14 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::net::SocketAddr;
 use std::pin::{Pin, pin};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll, Waker};
 
 use fictionet::Cx;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::network::tcp::{
-    AckAnswer, Answer, Handshake, Kept, Received, Segments, Sent, Syn, SynAnswer, TcpOption,
+    AckAnswer, Answer, GoneWatch, Handshake, Kept, Received, SegmentVerdict, Segments, Sent, Syn,
+    SynAnswer, TcpOption,
 };
 use fictionet::stdlib::network::{Connection, ConnectionExt};
 use fictionet::stdlib::protocols::mptcp::{
@@ -105,6 +107,8 @@ struct Entry {
     /// Its joined subflows, each with the waker of the task that holds
     /// it, woken when the connection is gone.
     joined: Vec<(u64, Option<Waker>)>,
+    primary: Option<Waker>,
+    reset: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
@@ -154,6 +158,22 @@ impl Tokens {
         self.0.lock().entries.is_empty()
     }
 
+    /// Removes a connection immediately and wakes every joined subflow.
+    fn close(&self, token: u32, reset: bool) {
+        let entry = self.0.lock().entries.remove(&token);
+        if let Some(entry) = entry {
+            entry.reset.store(reset, Ordering::Relaxed);
+            if let Some(waker) = entry.primary {
+                waker.wake();
+            }
+            for (_, waker) in entry.joined {
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
+            }
+        }
+    }
+
     /// Notes the connection with `keys`, accepted on `port`, until the
     /// guard drops. `None` when its token already names an open
     /// connection: that one keeps it.
@@ -169,6 +189,8 @@ impl Tokens {
                 keys,
                 port,
                 joined: Vec::new(),
+                primary: None,
+                reset: Arc::default(),
             },
         );
         Some(Opened {
@@ -194,6 +216,7 @@ impl Tokens {
             tokens: self.clone(),
             token,
             id,
+            reset: entry.reset.clone(),
         })
     }
 }
@@ -207,12 +230,7 @@ struct Opened {
 
 impl Drop for Opened {
     fn drop(&mut self) {
-        let entry = self.tokens.0.lock().entries.remove(&self.token);
-        for (_, waker) in entry.into_iter().flat_map(|e| e.joined) {
-            if let Some(waker) = waker {
-                waker.wake();
-            }
-        }
+        self.tokens.close(self.token, false);
     }
 }
 
@@ -222,6 +240,7 @@ struct Joined {
     tokens: Arc<Tokens>,
     token: u32,
     id: u64,
+    reset: Arc<AtomicBool>,
 }
 
 impl Joined {
@@ -611,8 +630,28 @@ fn tcprst(reason: u8) -> TcpOption {
     })
 }
 
-/// The DSS of an MPTCP connection's segments.
-struct Dss(DataLevel);
+/// MPTCP control and data options on an established subflow.
+struct Dss {
+    level: Option<DataLevel>,
+    key: u64,
+    tokens: Arc<Tokens>,
+}
+
+impl Dss {
+    fn verdict(&self, acknowledge: bool) -> SegmentVerdict {
+        if self
+            .level
+            .as_ref()
+            .is_some_and(|level| level.error().is_some())
+        {
+            SegmentVerdict::Reset(vec![tcprst(reason::MPTCP_SPECIFIC)])
+        } else if acknowledge {
+            SegmentVerdict::Acknowledge
+        } else {
+            SegmentVerdict::Take
+        }
+    }
+}
 
 impl Segments for Dss {
     fn room(&self) -> usize {
@@ -620,17 +659,34 @@ impl Segments for Dss {
     }
 
     fn sent(&mut self, segment: &Sent<'_>) -> Vec<TcpOption> {
-        let dss = self
-            .0
-            .sent(segment.seq, segment.payload, segment.fin, segment.ack);
-        dss.map(|dss| vec![option(MptcpOption::Dss(dss))])
+        self.level
+            .as_ref()
+            .and_then(|level| level.sent(segment.seq, segment.payload, segment.fin, segment.ack))
+            .map(|dss| vec![option(MptcpOption::Dss(dss))])
             .unwrap_or_default()
     }
 
-    fn received(&mut self, segment: &Received<'_>) -> bool {
-        let options = mptcp_options(segment.options);
-        self.0
-            .received(segment.seq, segment.payload.len(), segment.fin, options)
+    fn received(&mut self, segment: &Received<'_>) -> SegmentVerdict {
+        let options: Vec<_> = mptcp_options(segment.options).collect();
+        if options.iter().any(|option| matches!(option, MptcpOption::FastClose { receiver_key } if *receiver_key == self.key)) {
+            self.tokens.close(token(self.key), true);
+            return SegmentVerdict::Reset(Vec::new());
+        }
+        let acknowledge = if let Some(level) = &mut self.level {
+            level.received(segment.seq, segment.payload.len(), segment.fin, options)
+        } else {
+            options
+                .iter()
+                .any(|option| matches!(option, MptcpOption::Join(Join::Ack { .. })))
+        };
+        self.verdict(acknowledge)
+    }
+
+    fn arrived(&mut self, seq: u32, data: &[u8], out: &mut Vec<u8>) -> SegmentVerdict {
+        if let Some(level) = &mut self.level {
+            level.arrived(seq, data, out);
+        }
+        self.verdict(false)
     }
 }
 
@@ -704,24 +760,32 @@ impl Answer for Answers {
     }
 
     fn segments(&self, handshake: &Handshake) -> Option<Box<dyn Segments>> {
-        let Completion::Mptcp(n) = complete(handshake) else {
-            return None;
+        let (key, level) = match complete(handshake) {
+            Completion::Mptcp(n) => (
+                n.keys.local,
+                Some(DataLevel::new(
+                    n.keys.local,
+                    n.keys.remote,
+                    handshake.iss,
+                    handshake.irs,
+                    n.checksums,
+                    n.first,
+                )),
+            ),
+            Completion::Join(Some(join)) => (self.tokens.keys(join.token)?.local, None),
+            _ => return None,
         };
-        let level = DataLevel::new(
-            n.keys.local,
-            n.keys.remote,
-            handshake.iss,
-            handshake.irs,
-            n.checksums,
-            n.first,
-        );
-        Some(Box::new(Dss(level)))
+        Some(Box::new(Dss {
+            level,
+            key,
+            tokens: self.tokens.clone(),
+        }))
     }
 }
 
 /// Reads a joined subflow until the client closes it or the connection it
 /// joined is gone.
-async fn hold(fcx: Cx, mut conn: Box<dyn Connection>, joined: Joined) {
+async fn hold(fcx: Cx, mut conn: Box<dyn Connection>, socket: GoneWatch, joined: Joined) {
     let mut buf = [0; 4096];
     loop {
         let mut read = pin!(conn.read(&fcx, &mut buf));
@@ -732,6 +796,9 @@ async fn hold(fcx: Cx, mut conn: Box<dyn Connection>, joined: Joined) {
             read.as_mut().poll(cx).map(Some)
         })
         .await;
+        if step.is_none() && joined.reset.load(Ordering::Relaxed) {
+            socket.reset();
+        }
         if !matches!(step, Some(Ok(1..))) {
             return;
         }
@@ -740,19 +807,42 @@ async fn hold(fcx: Cx, mut conn: Box<dyn Connection>, joined: Joined) {
 
 impl<S: PortServer> PortServer for Listener<S> {
     fn serve(&self, fcx: Cx, arrival: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-        match complete(&arrival.info.handshake) {
+        match complete(
+            arrival
+                .info
+                .handshake
+                .as_ref()
+                .expect("accepted TCP handshake"),
+        ) {
             Completion::Mptcp(n) => {
                 if let Some(opened) = self.tokens.open(n.keys, self.port) {
                     arrival.socket.hold_until_gone(Box::new(opened));
                 }
-                self.inner.serve(fcx, arrival)
+                let socket = arrival.socket.clone();
+                let tokens = self.tokens.clone();
+                let token = token(n.keys.local);
+                let mut service = self.inner.serve(fcx, arrival);
+                Box::pin(async move {
+                    poll_fn(|cx| {
+                        let mut open = tokens.0.lock();
+                        let Some(entry) = open.entries.get_mut(&token) else {
+                            drop(open);
+                            socket.reset();
+                            return Poll::Ready(());
+                        };
+                        entry.primary = Some(cx.waker().clone());
+                        drop(open);
+                        service.as_mut().poll(cx)
+                    })
+                    .await;
+                })
             }
             Completion::Join(Some(join)) => match self.tokens.join(join.token) {
                 Some(joined) => {
                     // Linux's first keepalive on a subflow comes no sooner
                     // than its connection's, which ends long before.
                     arrival.socket.set_keep_alive(None);
-                    Box::pin(hold(fcx, arrival.conn, joined))
+                    Box::pin(hold(fcx, arrival.conn, arrival.socket, joined))
                 }
                 None => {
                     arrival.socket.reset();

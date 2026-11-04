@@ -256,6 +256,7 @@ async fn dns_conn(fcx: &Cx, conn: tcp::TcpConnection, context: &Context) -> Resu
         sandbox: Some(context.admission.hooks.sandbox_at(conn.peer_addr().ip())),
         peer: Some(conn.peer_addr()),
         local: Some(conn.local_addr()),
+        handshake: conn.handshake().cloned(),
         ..ConnInfo::default()
     };
     let opts = ServeOptions {

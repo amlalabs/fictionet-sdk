@@ -895,8 +895,8 @@ pub fn dss_checksum(
 /// its first byte is its IDSN + 1, and DATA_FIN comes with its FIN. Each
 /// segment it sends maps its own bytes with a 64-bit data sequence number,
 /// and acknowledges what the peer has sent so far. The Data ACK is 4
-/// octets until the peer sends a 64-bit data sequence number, as Linux
-/// sends it.
+/// octets when the latest mapping has a 32-bit data sequence number,
+/// and 8 octets when it has a 64-bit number, as Linux sends it.
 ///
 /// The peer's data must come under a mapping: a DSS, or an MP_CAPABLE
 /// with data, which maps the peer's first bytes from subflow sequence
@@ -918,16 +918,35 @@ pub struct DataLevel {
     iss: u32,
     irs: u32,
     checksums: bool,
-    /// The peer has sent a 64-bit data sequence number.
+    /// Width of the most recently received mapping.
     long_ack: bool,
-    /// The subflow sequence number after the furthest byte the peer
-    /// mapped.
     mapped_until: u32,
-    /// The subflow sequence number of the peer's FIN.
-    fin: Option<u32>,
-    /// The data sequence number of the peer's DATA_FIN.
+    next: u64,
+    mappings: Vec<ReceivedMapping>,
+    ready: Vec<(u64, Vec<u8>)>,
     data_fin: Option<u64>,
     fallen_back: bool,
+    error: Option<DataError>,
+}
+
+/// Why the data level must close its subflow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DataError {
+    /// The mapping does not match the negotiated checksum mode.
+    ChecksumMode,
+    /// A mapping checksum is invalid.
+    Checksum,
+    /// Conflicting mappings or exhausted receive space.
+    Mapping,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReceivedMapping {
+    start: u32,
+    dsn: u64,
+    mapping: Mapping,
+    fin: bool,
+    data: Vec<u8>,
 }
 
 impl DataLevel {
@@ -960,9 +979,27 @@ impl DataLevel {
             mapped_until: irs
                 .wrapping_add(1)
                 .wrapping_add(u32::from(first.unwrap_or(0))),
-            fin: None,
+            next: idsn(remote_key).wrapping_add(1),
+            mappings: first
+                .into_iter()
+                .filter(|n| *n > 0)
+                .map(|length| ReceivedMapping {
+                    start: irs.wrapping_add(1),
+                    dsn: idsn(remote_key).wrapping_add(1),
+                    mapping: Mapping {
+                        data_sequence_number: Sequence::Long(idsn(remote_key).wrapping_add(1)),
+                        subflow_sequence_number: 1,
+                        data_level_length: length,
+                        checksum: None,
+                    },
+                    fin: false,
+                    data: Vec::new(),
+                })
+                .collect(),
+            ready: Vec::new(),
             data_fin: None,
             fallen_back: false,
+            error: None,
         }
     }
 
@@ -1017,38 +1054,167 @@ impl DataLevel {
             };
             let length = mapping.data_level_length;
             if length == 0 {
-                self.fallen_back = true;
+                self.fallback();
                 return false;
             }
-            self.long_ack |= matches!(mapping.data_sequence_number, Sequence::Long(_));
-            // DATA_FIN takes the mapping's last data sequence number, and
-            // no subflow byte. A DATA_FIN alone maps no data, whatever its
-            // subflow sequence number (as Linux reads it).
+            if mapping.checksum.is_some() != self.checksums {
+                self.error = Some(DataError::ChecksumMode);
+                return false;
+            }
+            self.long_ack = matches!(mapping.data_sequence_number, Sequence::Long(_));
             let bytes = length - u16::from(data_fin);
-            if mapping.subflow_sequence_number != 0 && bytes > 0 {
-                let start = self.irs.wrapping_add(mapping.subflow_sequence_number);
+            let dsn = self.expand(mapping.data_sequence_number);
+            let start = self.irs.wrapping_add(mapping.subflow_sequence_number);
+            if bytes > 0 {
                 let end = start.wrapping_add(u32::from(bytes));
                 if after(end, self.mapped_until) {
                     self.mapped_until = end;
                 }
+                if let Some(existing) = self.mappings.iter_mut().find(|m| m.start == start) {
+                    // The handshake seeds its initial mapping before the ACK is replayed.
+                    if existing.data.is_empty() && existing.mapping.checksum.is_none() {
+                        existing.mapping = mapping;
+                        existing.dsn = dsn;
+                        existing.fin = data_fin;
+                    } else if existing.dsn != dsn
+                        || existing.mapping != mapping
+                        || existing.fin != data_fin
+                    {
+                        self.error = Some(DataError::Mapping);
+                    }
+                } else if self.mappings.iter().any(|m| {
+                    let existing_length = u32::from(m.mapping.data_level_length - u16::from(m.fin));
+                    start.wrapping_sub(m.start) < existing_length
+                        || m.start.wrapping_sub(start) < u32::from(bytes)
+                }) {
+                    self.error = Some(DataError::Mapping);
+                } else if self.mappings.len() < 256 {
+                    self.mappings.push(ReceivedMapping {
+                        start,
+                        dsn,
+                        mapping,
+                        fin: data_fin,
+                        data: Vec::new(),
+                    });
+                } else {
+                    self.error = Some(DataError::Mapping);
+                }
+            } else if let Some(sum) = mapping.checksum
+                && sum != dss_checksum(dsn, mapping.subflow_sequence_number, length, &[])
+            {
+                self.error = Some(DataError::Checksum);
+                return false;
             }
-            if data_fin && (payload > 0 || length == 1) {
-                let first = self.expand(mapping.data_sequence_number);
-                // The first DATA_FIN counts, as on Linux.
-                self.data_fin
-                    .get_or_insert(first.wrapping_add(u64::from(length) - 1));
-                answer = true;
+            if data_fin && bytes == 0 {
+                self.data_fin.get_or_insert(dsn);
             }
+            answer |= data_fin;
         }
         let end = seq.wrapping_add(payload as u32);
         if payload > 0 && after(end, self.mapped_until) {
-            self.fallen_back = true;
+            self.fallback();
             return false;
         }
-        if fin {
-            self.fin.get_or_insert(end);
-        }
+        let _ = fin;
         answer
+    }
+
+    fn fallback(&mut self) {
+        if !self.ready.is_empty() || self.mappings.iter().any(|m| !m.data.is_empty()) {
+            self.error = Some(DataError::Mapping);
+        } else {
+            self.fallen_back = true;
+        }
+    }
+
+    /// The error that requires a subflow reset, if any.
+    pub fn error(&self) -> Option<DataError> {
+        self.error
+    }
+
+    /// Takes contiguous subflow bytes and returns only validated data in
+    /// data sequence order. At most one TCP receive window is retained.
+    pub fn arrived(&mut self, seq: u32, data: &[u8], out: &mut Vec<u8>) {
+        if self.error.is_some() {
+            return;
+        }
+        if self.fallen_back {
+            out.extend_from_slice(data);
+            return;
+        }
+        let mut offset = 0;
+        while offset < data.len() {
+            let at = seq.wrapping_add(offset as u32);
+            let Some(index) = self.mappings.iter().position(|m| {
+                at.wrapping_sub(m.start) < u32::from(m.mapping.data_level_length - u16::from(m.fin))
+            }) else {
+                self.fallback();
+                if self.error.is_none() {
+                    out.extend_from_slice(&data[offset..]);
+                } else {
+                    out.clear();
+                }
+                return;
+            };
+            let m = &mut self.mappings[index];
+            let inside = at.wrapping_sub(m.start) as usize;
+            if inside != m.data.len() {
+                self.error = Some(DataError::Mapping);
+                return;
+            }
+            let length = usize::from(m.mapping.data_level_length) - usize::from(m.fin);
+            let count = (length - inside).min(data.len() - offset);
+            m.data.extend_from_slice(&data[offset..offset + count]);
+            offset += count;
+            if m.data.len() == length {
+                let m = self.mappings.remove(index);
+                if let Some(sum) = m.mapping.checksum
+                    && sum
+                        != dss_checksum(
+                            m.dsn,
+                            m.mapping.subflow_sequence_number,
+                            m.mapping.data_level_length,
+                            &m.data,
+                        )
+                {
+                    self.error = Some(DataError::Checksum);
+                    out.clear();
+                    return;
+                }
+                if m.fin {
+                    self.data_fin
+                        .get_or_insert(m.dsn.wrapping_add(length as u64));
+                }
+                // Reinjected bytes already acknowledged at the data level are ignored.
+                let skip = self.next.wrapping_sub(m.dsn) as i64;
+                if skip < length as i64 {
+                    let skip = skip.max(0) as usize;
+                    self.ready
+                        .push((m.dsn.wrapping_add(skip as u64), m.data[skip..].to_vec()));
+                }
+            }
+        }
+        while let Some(index) = self.ready.iter().position(|(dsn, bytes)| {
+            let skip = self.next.wrapping_sub(*dsn) as i64;
+            skip >= 0 && skip < bytes.len() as i64
+        }) {
+            let (dsn, bytes) = self.ready.remove(index);
+            let skip = self.next.wrapping_sub(dsn) as usize;
+            out.extend_from_slice(&bytes[skip..]);
+            self.next = self.next.wrapping_add((bytes.len() - skip) as u64);
+        }
+        self.ready
+            .retain(|(dsn, bytes)| (self.next.wrapping_sub(*dsn) as i64) < bytes.len() as i64);
+        let buffered = self.mappings.iter().map(|m| m.data.len()).sum::<usize>()
+            + self
+                .ready
+                .iter()
+                .map(|(_, bytes)| bytes.len())
+                .sum::<usize>();
+        if buffered > 65_535 {
+            self.error = Some(DataError::Mapping);
+            out.clear();
+        }
     }
 
     /// The full data sequence number of `sequence`, from the peer: a
@@ -1058,9 +1224,7 @@ impl DataLevel {
         match sequence {
             Sequence::Long(n) => n,
             Sequence::Short(low) => {
-                let near = self
-                    .remote_idsn
-                    .wrapping_add(u64::from(self.mapped_until.wrapping_sub(self.irs)));
+                let near = self.next;
                 let offset = low.wrapping_sub(near as u32) as i32;
                 near.wrapping_add_signed(i64::from(offset))
             }
@@ -1074,18 +1238,8 @@ impl DataLevel {
         if self.fallen_back {
             return None;
         }
-        let data_ack = ack.map(|ack| {
-            // The subflow sequence numbers the ACK covers past the SYN:
-            // the peer's bytes, and its FIN if it covers that.
-            let fin = self.fin.is_some_and(|at| after(ack, at));
-            let bytes = ack
-                .wrapping_sub(self.irs)
-                .wrapping_sub(1)
-                .wrapping_sub(u32::from(fin));
-            let mut next = self
-                .remote_idsn
-                .wrapping_add(1)
-                .wrapping_add(u64::from(bytes));
+        let data_ack = ack.map(|_| {
+            let mut next = self.next;
             if self.data_fin == Some(next) {
                 next = next.wrapping_add(1);
             }
@@ -1859,6 +2013,7 @@ mod tests {
         // octets, and covers them.
         let dsn = Sequence::Long(idsn(KEY_A).wrapping_add(1));
         level.received(IRS + 1, 5, false, [mapping(dsn, 1, 5)]);
+        level.arrived(IRS + 1, b"hello", &mut Vec::new());
         assert_eq!(
             level.sent(ISS.wrapping_add(8), b"", false, Some(IRS + 6)),
             Some(Dss {
@@ -1950,6 +2105,7 @@ mod tests {
         assert!(!level.fallen_back());
         // Sent again, as Linux resends it until it sees a DSS.
         level.received(IRS + 1, 5, false, [first]);
+        level.arrived(IRS + 1, b"hello", &mut Vec::new());
         assert!(!level.fallen_back());
         let dss = level.sent(ISS.wrapping_add(1), b"HTTP", false, Some(IRS + 6));
         assert_eq!(
@@ -1977,6 +2133,7 @@ mod tests {
             };
             let mut level = DataLevel::new(KEY_B, KEY_A, ISS, IRS, false, None);
             assert!(!level.received(IRS + 1, 5, false, [mapping(at(1), 1, 5)]));
+            level.arrived(IRS + 1, b"hello", &mut Vec::new());
             let data_fin = MptcpOption::Dss(Dss {
                 data_ack: None,
                 mapping: Some(Mapping {
@@ -2041,8 +2198,93 @@ mod tests {
         // Bytes 1 and 2 are missing: the subflow ACK stays at 1.
         assert_eq!(data_ack(&level, IRS + 1), dsn(1));
         level.received(IRS + 1, 2, false, [mapping(dsn(1), 1, 2)]);
+        level.arrived(IRS + 1, b"hello", &mut Vec::new());
         // All 5 bytes and the FIN: the DATA_FIN is covered.
         assert_eq!(data_ack(&level, IRS + 7), dsn(7));
         assert!(!level.fallen_back());
+    }
+    #[test]
+    fn checksums_gate_delivery_until_the_whole_mapping_arrives() {
+        let dsn = idsn(KEY_A).wrapping_add(1);
+        for checksum in [None, Some(0), Some(dss_checksum(dsn, 1, 5, b"hello"))] {
+            let mut level = DataLevel::new(KEY_B, KEY_A, ISS, IRS, true, None);
+            let option = MptcpOption::Dss(Dss {
+                data_ack: None,
+                mapping: Some(Mapping {
+                    data_sequence_number: Sequence::Long(dsn),
+                    subflow_sequence_number: 1,
+                    data_level_length: 5,
+                    checksum,
+                }),
+                data_fin: false,
+            });
+            level.received(IRS + 1, 2, false, [option]);
+            let mut out = Vec::new();
+            level.arrived(IRS + 1, b"he", &mut out);
+            assert!(out.is_empty());
+            level.arrived(IRS + 3, b"llo", &mut out);
+            if checksum == Some(dss_checksum(dsn, 1, 5, b"hello")) {
+                assert_eq!(out, b"hello");
+                assert_eq!(level.error(), None);
+            } else {
+                assert!(out.is_empty());
+                assert!(level.error().is_some());
+            }
+        }
+        let mut level = DataLevel::new(KEY_B, KEY_A, ISS, IRS, false, None);
+        level.received(
+            IRS + 1,
+            1,
+            false,
+            [MptcpOption::Dss(Dss {
+                data_ack: None,
+                mapping: Some(Mapping {
+                    data_sequence_number: Sequence::Long(dsn),
+                    subflow_sequence_number: 1,
+                    data_level_length: 1,
+                    checksum: Some(1),
+                }),
+                data_fin: false,
+            })],
+        );
+        assert_eq!(level.error(), Some(DataError::ChecksumMode));
+    }
+
+    #[test]
+    fn data_sequence_gaps_are_queued_and_ack_width_follows_each_mapping() {
+        let dsn = idsn(KEY_A).wrapping_add(1);
+        let mut level = DataLevel::new(KEY_B, KEY_A, ISS, IRS, false, None);
+        level.received(
+            IRS + 1,
+            5,
+            false,
+            [mapping(Sequence::Long(dsn.wrapping_add(5)), 1, 5)],
+        );
+        let mut out = Vec::new();
+        level.arrived(IRS + 1, b"world", &mut out);
+        assert!(out.is_empty());
+        assert_eq!(
+            level
+                .sent(ISS + 1, b"", false, Some(IRS + 6))
+                .unwrap()
+                .data_ack,
+            Some(Sequence::Long(dsn))
+        );
+        level.received(
+            IRS + 6,
+            5,
+            false,
+            [mapping(Sequence::Short(dsn as u32), 6, 5)],
+        );
+        level.arrived(IRS + 6, b"hello", &mut out);
+        assert_eq!(out, b"helloworld");
+        assert_eq!(
+            level
+                .sent(ISS + 1, b"", false, Some(IRS + 11))
+                .unwrap()
+                .data_ack,
+            Some(Sequence::Short(dsn.wrapping_add(10) as u32))
+        );
+        assert_eq!(level.error(), None);
     }
 }

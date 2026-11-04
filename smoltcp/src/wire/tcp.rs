@@ -795,7 +795,8 @@ pub struct Repr<'a> {
     pub payload: &'a [u8],
 }
 
-pub type TcpTimestampGenerator = fn() -> u32;
+/// Produces a TCP timestamp from the stack clock.
+pub type TcpTimestampGenerator = fn(crate::time::Instant) -> u32;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(crate) struct TcpTimestampRepr {
@@ -808,15 +809,20 @@ impl TcpTimestampRepr {
         Self { tsval, tsecr }
     }
 
-    pub(crate) fn generate_reply(&self, generator: Option<TcpTimestampGenerator>) -> Option<Self> {
-        Self::generate_reply_with_tsval(generator, self.tsval)
+    pub(crate) fn generate_reply(
+        &self,
+        generator: Option<TcpTimestampGenerator>,
+        now: crate::time::Instant,
+    ) -> Option<Self> {
+        Self::generate_reply_with_tsval(generator, self.tsval, now)
     }
 
     pub(crate) fn generate_reply_with_tsval(
         generator: Option<TcpTimestampGenerator>,
         tsval: u32,
+        now: crate::time::Instant,
     ) -> Option<Self> {
-        Some(Self::new(generator?(), tsval))
+        Some(Self::new(generator?(now), tsval))
     }
 }
 

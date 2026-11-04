@@ -13,7 +13,7 @@
 //! dropped, and its line names that address. For packets from the sandbox
 //! side it records:
 //!
-//! - every SYN ([`Observation::Syn`]): source and destination, all its TCP
+//! - every SYN ([`Observation::Syn`]): source and destination, flags, all its TCP
 //!   options in order, why the options could not all be read, the MPTCP
 //!   options decoded, its payload, and the time since the same source's
 //!   previous SYN when that SYN was within the burst window;
@@ -29,10 +29,9 @@
 //! cannot be guessed.
 //!
 //! For packets to the sandbox side it records each RST the world sends,
-//! and the SYN-ACK that first answers a SYN still within the burst window
-//! ([`Observation::Answer`]), with their options. The world answers at
-//! once, so that is each SYN's. The SYN-ACKs the world sends again, until
-//! the handshake completes, are in the capture only.
+//! and the SYN-ACK that first answers a SYN within the handshake timeout
+//! ([`Observation::Answer`]), with their options. The SYN-ACKs the world
+//! sends again, until the handshake completes, are in the capture only.
 //!
 //! Neither file can stop the world. A record a file refuses, when the disk
 //! is full say, is lost, and the next line the log takes once both files
@@ -54,9 +53,9 @@
 //! part of a burst, so signatures written later can be run over the log.
 //!
 //! The observer keeps state for a source only while that source has a SYN
-//! within the burst window, and for a SYN's answer only while the SYN is
-//! within the window. Its memory is the SYNs of the last window, so a
-//! flood from spoofed addresses cannot grow it past what one window holds.
+//! within the burst window. Answers are tracked separately for at most
+//! the listener's 63 second handshake timeout. Both expire even when no
+//! further packets arrive, bounding retention after a spoofed flood.
 //! The time since a source's previous SYN is given when that SYN was within
 //! the window; each line's timestamp gives longer gaps.
 
@@ -64,6 +63,8 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{self, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::task::{Context, Waker};
+use std::time::Duration;
 
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::network::ip::{self, protocol};
@@ -82,6 +83,8 @@ const FIN: u8 = 0x01;
 const SYN: u8 = 0x02;
 const RST: u8 = 0x04;
 const ACK: u8 = 0x10;
+
+const ANSWER_TIMEOUT: Duration = Duration::from_secs(63);
 
 /// Which way a packet crosses an attachment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -108,6 +111,8 @@ pub enum Observation {
         src: SocketAddr,
         /// Its destination address and port.
         dst: SocketAddr,
+        /// Its TCP flags.
+        flags: Flags,
         /// Its initial sequence number.
         seq: u32,
         /// Its TCP options, in order, up to the first malformed one.
@@ -756,12 +761,13 @@ pub struct Observer {
     burst: Burst,
     tokens: Arc<Tokens>,
     /// The SYNs within the window, oldest first: when, from where, whether
-    /// each carried MP_JOIN, and the answer it awaits.
-    recent: VecDeque<(Instant, IpAddr, bool, Awaited)>,
+    /// each carried MP_JOIN.
+    recent: VecDeque<(Instant, IpAddr, bool)>,
     sources: HashMap<IpAddr, Source>,
-    /// The answers SYNs within the window await, each with how many SYNs
-    /// await it.
-    awaited: HashMap<Awaited, usize>,
+    /// Pending answers, with their most recent SYN and outstanding count.
+    awaited: HashMap<Awaited, (Instant, usize)>,
+    pending: VecDeque<(Instant, Awaited)>,
+    expiry_waiter: Option<Waker>,
 }
 
 impl Observer {
@@ -788,6 +794,8 @@ impl Observer {
             recent: VecDeque::new(),
             sources: HashMap::new(),
             awaited: HashMap::new(),
+            pending: VecDeque::new(),
+            expiry_waiter: None,
         })
     }
 
@@ -871,6 +879,7 @@ impl Observer {
         packet: &[u8],
         now: Instant,
     ) -> Vec<Observation> {
+        self.expire(now);
         let Some(header) = ip::Header::parse_truncated(packet) else {
             return Vec::new();
         };
@@ -921,9 +930,9 @@ impl Observer {
                 to: dst,
                 ack,
             };
-            // A SYN-ACK that answers no SYN within the window is one sent
-            // again.
+            // An answer with no pending SYN is a retransmission.
             let first = (rst || syn_ack) && self.answered(awaited);
+            self.expire(now);
             if rst || (syn_ack && first) {
                 return vec![Observation::Answer {
                     at_us,
@@ -956,6 +965,7 @@ impl Observer {
                 attachment,
                 src,
                 dst,
+                flags: Flags(flags),
                 seq,
                 options,
                 options_fault,
@@ -989,17 +999,66 @@ impl Observer {
         }]
     }
 
-    /// Whether a SYN within the window awaits `answer`. It awaits it no
-    /// more.
+    /// Whether a SYN awaits `answer`. It awaits it no more.
     fn answered(&mut self, answer: Awaited) -> bool {
         let Some(waiting) = self.awaited.get_mut(&answer) else {
             return false;
         };
-        *waiting -= 1;
-        if *waiting == 0 {
+        waiting.1 -= 1;
+        if waiting.1 == 0 {
             self.awaited.remove(&answer);
         }
         true
+    }
+
+    /// The next expiry, waking the caller when new state changes its deadline.
+    pub(crate) fn expiry(&mut self, cx: &mut Context<'_>) -> Instant {
+        self.expiry_waiter = Some(cx.waker().clone());
+        let burst = self.recent.front().map(|(at, ..)| *at + self.burst.window);
+        let answer = self.pending.front().map(|(at, _)| *at + ANSWER_TIMEOUT);
+        burst
+            .into_iter()
+            .chain(answer)
+            .min()
+            .unwrap_or(Instant::from_since_start(Duration::MAX))
+    }
+
+    /// Releases expired burst and unanswered SYN state, including while quiet.
+    pub(crate) fn expire(&mut self, now: Instant) {
+        while let Some(&(at, from, joined)) = self.recent.front() {
+            if now < at + self.burst.window {
+                break;
+            }
+            self.recent.pop_front();
+            if let Some(source) = self.sources.get_mut(&from) {
+                source.syns -= 1;
+                source.joins -= usize::from(joined);
+                if source.syns == 0 {
+                    self.sources.remove(&from);
+                }
+            }
+        }
+        while let Some(&(at, answer)) = self.pending.front() {
+            let current = self
+                .awaited
+                .get(&answer)
+                .is_some_and(|waiting| waiting.0 == at);
+            if current && now < at + ANSWER_TIMEOUT {
+                break;
+            }
+            self.pending.pop_front();
+            if current {
+                self.awaited.remove(&answer);
+            }
+        }
+        if self.recent.is_empty() {
+            self.recent.shrink_to_fit();
+            self.sources.shrink_to_fit();
+        }
+        if self.pending.is_empty() {
+            self.pending.shrink_to_fit();
+            self.awaited.shrink_to_fit();
+        }
     }
 
     /// Counts a SYN from `src`, with MP_JOIN if `join`, that awaits
@@ -1012,23 +1071,15 @@ impl Observer {
         answer: Awaited,
         now: Instant,
     ) -> (Option<u64>, Vec<(BurstKind, usize)>) {
-        let window = self.burst.window;
-        while let Some(&(at, from, joined, awaited)) = self.recent.front() {
-            if now.since_start().saturating_sub(at.since_start()) < window {
-                break;
-            }
-            self.recent.pop_front();
-            self.answered(awaited);
-            if let Some(source) = self.sources.get_mut(&from) {
-                source.syns -= 1;
-                source.joins -= usize::from(joined);
-                if source.syns == 0 {
-                    self.sources.remove(&from);
-                }
-            }
+        self.expire(now);
+        self.recent.push_back((now, src, join));
+        self.pending.push_back((now, answer));
+        let waiting = self.awaited.entry(answer).or_insert((now, 0));
+        waiting.0 = now;
+        waiting.1 += 1;
+        if let Some(waiter) = self.expiry_waiter.take() {
+            waiter.wake();
         }
-        self.recent.push_back((now, src, join, answer));
-        *self.awaited.entry(answer).or_default() += 1;
         let source = self.sources.entry(src).or_insert(Source {
             last: now,
             syns: 0,
@@ -1061,7 +1112,6 @@ impl Observer {
 mod tests {
     use super::*;
     use fictionet::stdlib::network::ip::{Fields, packet_with, transport_checksum};
-    use std::time::Duration;
 
     #[test]
     fn hex_keys_tokens_and_flags_serialize_as_text() {
@@ -1248,6 +1298,22 @@ mod tests {
         assert!(line.get("payload").is_none(), "{line}");
     }
 
+    #[test]
+    fn syn_flags_keep_scanner_probes_and_ecn() {
+        for (bits, text) in [
+            (SYN, "SYN"),
+            (SYN | FIN, "FIN|SYN"),
+            (SYN | 0x08, "SYN|PSH"),
+            (SYN | 0x20, "SYN|URG"),
+            (SYN | 0xc0, "SYN|ECE|CWR"),
+        ] {
+            let seen = observe(&mut observer(), Direction::In, &segment(bits, &[], b""));
+            let line = serde_json::to_value(&seen[0]).unwrap();
+            assert_eq!(line["event"], "syn");
+            assert_eq!(line["flags"], text);
+        }
+    }
+
     /// Segments and answers keep every option's bytes, MPTCP or not.
     #[test]
     fn segments_and_answers_keep_their_options() {
@@ -1312,7 +1378,14 @@ mod tests {
         assert_eq!(observer.syn(b, false, awaits(), at(500)), (None, vec![]));
         assert_eq!(observer.sources(), 1);
         assert_eq!(observer.recent.len(), 1);
-        assert_eq!(observer.awaited[&awaits()], 1, "the answers aged out too");
+        assert_eq!(observer.awaited[&awaits()].1, 7);
+        observer.expire(at(600));
+        assert_eq!(observer.sources(), 0);
+        assert!(observer.recent.is_empty());
+        assert_eq!(observer.awaited[&awaits()].1, 7);
+        observer.expire(at(63_500));
+        assert!(observer.awaited.is_empty());
+        assert!(observer.pending.is_empty());
     }
 
     /// The answer the SYNs of `burst_state_lasts_one_window` await.
@@ -1381,6 +1454,67 @@ mod tests {
         let rst = answer(RST | ACK);
         assert_eq!(answers(&mut observer, &rst), 1);
         assert_eq!(answers(&mut observer, &rst), 1);
+    }
+
+    #[test]
+    fn answers_outlive_the_burst_window() {
+        for window in [Duration::ZERO, Duration::from_millis(100)] {
+            let mut observer = observer();
+            observer.burst.window = window;
+            let at = Instant::from_since_start(Duration::from_secs(1));
+            for _ in 0..2 {
+                observer.observe(
+                    &Arc::from("internet"),
+                    Direction::In,
+                    &segment(SYN, &[], b""),
+                    at,
+                );
+            }
+            let later = at + Duration::from_secs(1);
+            observer.expire(later);
+            assert_eq!(observer.sources(), 0);
+            for _ in 0..2 {
+                assert!(matches!(
+                    observer.observe(
+                        &Arc::from("internet"),
+                        Direction::Out,
+                        &answer(SYN | ACK),
+                        later,
+                    )[..],
+                    [Observation::Answer { .. }]
+                ));
+            }
+            assert!(observer.awaited.is_empty());
+            assert!(
+                observer
+                    .observe(
+                        &Arc::from("internet"),
+                        Direction::Out,
+                        &answer(SYN | ACK),
+                        later,
+                    )
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn an_old_syn_expiry_preserves_its_new_attempt() {
+        let mut observer = observer();
+        let source = awaits().to.ip();
+        observer.syn(source, false, awaits(), Instant::ZERO);
+        assert!(observer.answered(awaits()));
+        observer.syn(
+            source,
+            false,
+            awaits(),
+            Instant::from_since_start(Duration::from_secs(1)),
+        );
+        observer.expire(Instant::from_since_start(ANSWER_TIMEOUT));
+        assert!(observer.answered(awaits()));
+        observer.expire(Instant::from_since_start(ANSWER_TIMEOUT));
+        assert!(observer.pending.is_empty());
+        assert!(observer.awaited.is_empty());
     }
 
     /// Takes the first `room` bytes written, then refuses all until

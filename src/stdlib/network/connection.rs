@@ -25,7 +25,7 @@ pub trait Accepted: Connection {
     /// The peer's address.
     fn peer_addr(&self) -> std::net::SocketAddr;
     /// What the TCP handshake that opened it carried.
-    fn handshake(&self) -> super::tcp::Handshake;
+    fn handshake(&self) -> Option<super::tcp::Handshake>;
     /// Resets the connection without waiting for a graceful close.
     fn reset(self);
     /// Retains `item` until the transport is gone, including after this

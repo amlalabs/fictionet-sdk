@@ -81,7 +81,7 @@ kind it is:
 
 | `event` | When | What it holds |
 | --- | --- | --- |
-| `syn` | A SYN into the world | Source and destination, the initial sequence number, every TCP option in order, `options_fault` if the options did not all read, each MPTCP option decoded, the payload in hex when the SYN carried one, and `gap_us` since the same source's previous SYN when that SYN was within the burst window |
+| `syn` | A SYN into the world | Source and destination, flags, the initial sequence number, every TCP option in order, `options_fault` if the options did not all read, each MPTCP option decoded, the payload in hex when the SYN carried one, and `gap_us` since the same source's previous SYN when that SYN was within the burst window |
 | `segment` | Any other segment in with a payload, a FIN or MPTCP options | Flags, sequence number, every TCP option in order, `options_fault`, each MPTCP option decoded, and the payload in hex |
 | `answer` | A RST from the world, or the SYN-ACK that first answers a SYN | Flags, every TCP option in order, and each MPTCP option decoded, such as the key the server issued |
 | `burst` | A source's SYNs, or its SYNs with MP_JOIN, reach the burst threshold | Source address, which kind, how many, and the window |
@@ -128,10 +128,11 @@ log.
 ### Hostile input
 
 Internet attackers send whatever they like, so every reader checks lengths.
-The world keeps state for a source, and for the answer to its SYN, only while
-that source has a SYN within the burst window, and an MPTCP token only while
-its connection is open. A flood from spoofed addresses cannot grow either past
-what one window or the open connections hold.
+The world keeps burst state for a source only while that source has a SYN
+within the burst window. It tracks unanswered SYNs independently for up to
+63 seconds, the listener's handshake timeout, and an MPTCP token only while
+its connection is open. Burst and answer state expires even when traffic is
+quiet, so a flood from spoofed addresses leaves no permanent state.
 
 Spoofed SYNs cannot shut real attackers out either. Each port holds 4,096
 handshakes. Past that, the server answers with SYN cookies, as Linux does, and
