@@ -45,13 +45,13 @@ type Front = dyn Fn(Host) -> Host + Send + Sync;
 /// [`server`](Mirror::server) is a program that answers, at its own
 /// address, for the zones the mirror knows that address serves: those
 /// given with [`serves`](Mirror::serves), every zone whose copied records
-/// name that address a server of it, and every zone below one of those
-/// that the real server turns out to answer from, such as `arpa` at the
-/// root letters' addresses. Each zone's data is
-/// [`Learned`](super::learned::Learned): one per
-/// zone, shared by all of the zone's servers, filled from the real
-/// servers through the mirror's upstream as the world's servers need
-/// facts, and answered from by the world's own [`Copies`]. No real
+/// name that address a server of it, and every zone that the real server
+/// at the address turns out to answer from, such as `arpa` at the root
+/// letters' addresses. Each address's copy of a zone is
+/// [`Learned`](super::learned::Learned), its own and shared with no other
+/// address, filled from the real server at that address through the
+/// mirror's upstream as the world's server there needs facts, and
+/// answered from by the world's own [`Copies`]. No real
 /// server's message reaches a client. A world runs the program on hosts
 /// of its own, such as
 /// [`root_servers`](fictionet::stdlib::world::net::dns::internet::root_servers).
@@ -77,11 +77,11 @@ type Front = dyn Fn(Host) -> Host + Send + Sync;
 /// placed at the address before any NS RRset named it, gets the server
 /// beside its own services, behind the machine's own link. An
 /// address a filed NS RRset
-/// names whose real server turns out not to serve the zone, as at a lame
-/// delegation, answers for the rest of the session from the zones it does
-/// serve, as [`Copies`] says. The names of name servers and the addresses
-/// filed for them are forgotten when the namespace advances, and so is
-/// every zone's copied data.
+/// names whose real server does not serve the zone, as at a lame
+/// delegation, answers each question as its real server did: from the
+/// zones it does serve, or with REFUSED, as [`Copies`] says. The names of
+/// name servers and the addresses filed for them are forgotten when the
+/// namespace advances, and so is every copy's data.
 ///
 /// Addresses on the sandboxes' subnet or a LAN, addresses no internet
 /// host can have (those the IANA special-purpose registries of RFC 6890
@@ -104,7 +104,7 @@ struct Inner {
     fronts: Vec<(LowerName, Arc<Front>)>,
     named: Arc<PerSession<Named>>,
     placed: Arc<Mutex<Placed>>,
-    /// Each zone's copied data, and the zones each address serves.
+    /// Each address's copies of the zones it serves.
     copies: Arc<Copies>,
     /// The addresses the upstream asks the real servers from.
     egress: Vec<IpAddr>,
@@ -204,7 +204,8 @@ impl Mirror {
 
     /// Notes that the server at `addr` serves the zone at `zone`, such as
     /// the root at each root letter's addresses, so a
-    /// [`server`](Self::server) there answers for it from the zone's copy.
+    /// [`server`](Self::server) there answers for it from its own copy of
+    /// the zone.
     pub fn serves(self, addr: IpAddr, zone: &Name) -> Mirror {
         self.inner.copies.serves(addr, &LowerName::new(zone));
         self

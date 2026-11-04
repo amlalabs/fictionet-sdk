@@ -18,8 +18,8 @@
 //! The real internet's DNS as a world plays it lives here too, beside the
 //! SDK's primitives: [`mirror`] copies the real hierarchy onto servers at
 //! the real servers' addresses, which answer from [`copies`] of the zones
-//! they serve, each zone's data [`learned`] from what its real servers
-//! answered. [`public`] has the large public resolvers, [`doh`]
+//! they serve, each address's copy of a zone [`learned`] from what its own
+//! real server answered. [`public`] has the large public resolvers, [`doh`]
 //! what their DNS over HTTPS servers answer past RFC 8484, [`place`]
 //! how the root, `gtld-servers.net`, and public resolver servers look
 //! from one place, and [`roots`] the `gtld-servers.net` servers' addresses,
