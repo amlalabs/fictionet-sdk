@@ -92,6 +92,29 @@ use fictionet::stdlib::network::{
 use fictionet::time::{Duration, Instant};
 use fictionet::{Cx, End, Interface, Packet};
 
+/// Typed IPv4 options and their standards-level wire codec.
+pub use smoltcp::wire::{
+    Ipv4Option, Ipv4Options, Ipv4OptionsError, Ipv4Timestamp, encode_ipv4_options,
+};
+
+/// IPv4 header options selected by a listener for its SYN-ACK.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Ipv4Reply {
+    /// Options in wire order. Packet emission adds zero padding.
+    pub options: Vec<Ipv4Option>,
+    /// First source-route hop, when different from the peer. This changes only
+    /// the IPv4 destination; the TCP pseudoheader still identifies the peer.
+    pub destination: Option<Ipv4Addr>,
+}
+
+/// Read a complete IPv4 packet's options, preserving unknown and malformed
+/// options. This validates header lengths and version, but not the checksum.
+pub fn ipv4_options(packet: &[u8]) -> Result<Vec<Ipv4Option>, Ipv4OptionsError> {
+    smoltcp::wire::Ipv4Packet::new_unchecked(packet)
+        .options_iter()
+        .map(Iterator::collect)
+}
+
 pub(crate) const RESERVED_RANGES: [super::route::Prefix; 8] = [
     super::route::Prefix {
         addr: IpAddr::V4(Ipv4Addr::new(198, 18, 0, 0)),
@@ -1638,6 +1661,36 @@ pub fn packet_with(
     }
     p.extend_from_slice(payload);
     Packet(p)
+}
+
+/// Build an IPv4 packet carrying typed options. `dst` is the wire destination;
+/// callers constructing transport checksums use the final destination when a
+/// source route is present. The header length and checksum include the options.
+pub fn packet_with_ipv4_options(
+    src: Ipv4Addr,
+    dst: Ipv4Addr,
+    protocol: u8,
+    fields: Fields,
+    options: &[Ipv4Option],
+    payload: &[u8],
+) -> Result<Packet, Ipv4OptionsError> {
+    let options = encode_ipv4_options(options)?;
+    let header_len = 20 + options.len().div_ceil(4) * 4;
+    let total = u16::try_from(header_len + payload.len()).map_err(|_| Ipv4OptionsError::TooLong)?;
+    let mut p = vec![0; header_len];
+    p[0] = 0x40 | (header_len / 4) as u8;
+    p[1] = fields.tos;
+    p[2..4].copy_from_slice(&total.to_be_bytes());
+    p[4..6].copy_from_slice(&fields.id.to_be_bytes());
+    p[6] = if fields.dont_fragment { 0x40 } else { 0 };
+    p[8] = fields.ttl;
+    p[9] = protocol;
+    p[12..16].copy_from_slice(&src.octets());
+    p[16..20].copy_from_slice(&dst.octets());
+    p[20..20 + options.len()].copy_from_slice(&options);
+    set_header_checksum(&mut p);
+    p.extend_from_slice(payload);
+    Ok(Packet(p))
 }
 
 /// What a router hop did to a packet's TTL or hop limit, from [`hop`].

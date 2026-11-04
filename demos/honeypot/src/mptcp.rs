@@ -752,6 +752,8 @@ impl Answer for Answers {
             let kept = Kept {
                 syn: syn.options.into(),
                 syn_ack: added.as_slice().into(),
+                syn_ipv4: syn.to.is_ipv4().then(|| syn.ipv4_options.into()),
+                syn_ack_ipv4: syn.to.is_ipv4().then(Arc::default),
             };
             let cookie = JoinCookie { token, kept };
             self.joins
@@ -932,7 +934,9 @@ mod tests {
     fn syn_of(options: &[TcpOption], cookie: bool) -> Syn<'_> {
         Syn {
             options,
+            ipv4_options: &[],
             from: client(),
+            to: "192.0.2.1:22".parse().unwrap(),
             seq: 1000,
             cookie,
         }

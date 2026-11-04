@@ -548,6 +548,8 @@ pub struct Socket<'a> {
     /// Options added to this connection's SYN or SYN-ACK, encoded: see
     /// [`Socket::set_syn_options`].
     syn_options: Vec<u8>,
+    syn_ipv4_options: crate::wire::Ipv4OptionBytes,
+    syn_ipv4_destination: Option<core::net::Ipv4Addr>,
 
     /// What adds options to this connection's other segments: see
     /// [`Socket::set_segment_options`].
@@ -761,6 +763,8 @@ impl<'a> Socket<'a> {
             last_remote_tsval: 0,
             congestion_controller: reno::Reno::new(),
             syn_options: Vec::new(),
+            syn_ipv4_options: crate::wire::Ipv4OptionBytes::EMPTY,
+            syn_ipv4_destination: None,
             segment_options: None,
             segment_extra: Vec::new(),
             ack_asked: false,
@@ -830,6 +834,19 @@ impl<'a> Socket<'a> {
     /// Return whether TCP Timestamp is enabled.
     pub fn timestamp_enabled(&self) -> bool {
         self.tsval_generator.is_some()
+    }
+
+    /// Set IPv4 options on SYN segments, including retransmissions. The optional
+    /// destination is the next source-route hop; TCP checksums retain the peer.
+    pub fn set_syn_ipv4_options(
+        &mut self,
+        options: &[crate::wire::Ipv4Option],
+        destination: Option<core::net::Ipv4Addr>,
+    ) -> Result<(), crate::wire::Ipv4OptionsError> {
+        let bytes = crate::wire::encode_ipv4_options(options)?;
+        self.syn_ipv4_options = crate::wire::Ipv4OptionBytes::new(&bytes);
+        self.syn_ipv4_destination = destination;
+        Ok(())
     }
 
     /// Adds `options` to this connection's SYN or SYN-ACK, and to every
@@ -1212,6 +1229,8 @@ impl<'a> Socket<'a> {
         self.last_remote_tsval = 0;
         self.congestion_controller = reno::Reno::new();
         self.syn_options = Vec::new();
+        self.syn_ipv4_options = crate::wire::Ipv4OptionBytes::EMPTY;
+        self.syn_ipv4_destination = None;
         self.segment_options = None;
         self.ack_asked = false;
         self.rst_options = None;
@@ -2728,8 +2747,18 @@ impl<'a> Socket<'a> {
         };
 
         if repr.control == TcpControl::Syn {
+            if let IpRepr::Ipv4(ip) = &mut ip_repr {
+                ip.options = self.syn_ipv4_options;
+                ip.wire_dst = self.syn_ipv4_destination;
+            }
             // Fill the MSS option. See RFC 6691 for an explanation of this calculation.
-            let max_segment_size = cx.ip_mtu() - ip_repr.header_len() - TCP_HEADER_LEN;
+            let max_segment_size = cx.ip_mtu()
+                - if matches!(ip_repr, IpRepr::Ipv4(_)) {
+                    20
+                } else {
+                    40
+                }
+                - TCP_HEADER_LEN;
             repr.max_seg_size = Some(max_segment_size as u16);
             repr.extra = &self.syn_options;
         } else if repr.control == TcpControl::Rst {
@@ -2915,6 +2944,8 @@ pub(crate) mod test {
     };
 
     const SEND_IP_TEMPL: IpRepr = IpReprIpvX(IpvXRepr {
+        options: crate::wire::Ipv4OptionBytes::EMPTY,
+        wire_dst: None,
         src_addr: LOCAL_ADDR,
         dst_addr: REMOTE_ADDR,
         next_header: IpProtocol::Tcp,
@@ -2991,6 +3022,8 @@ pub(crate) mod test {
         socket.cx.set_now(timestamp);
 
         let ip_repr = IpReprIpvX(IpvXRepr {
+            options: crate::wire::Ipv4OptionBytes::EMPTY,
+            wire_dst: None,
             src_addr: REMOTE_ADDR,
             dst_addr: LOCAL_ADDR,
             next_header: IpProtocol::Tcp,
@@ -3922,6 +3955,8 @@ pub(crate) mod test {
         let mut s = socket_established();
         s.set_segment_options(Box::new(AskOn254));
         let ip_repr = IpReprIpvX(IpvXRepr {
+            options: crate::wire::Ipv4OptionBytes::EMPTY,
+            wire_dst: None,
             src_addr: REMOTE_ADDR,
             dst_addr: LOCAL_ADDR,
             next_header: IpProtocol::Tcp,
@@ -4197,6 +4232,8 @@ pub(crate) mod test {
         let mut s = socket_established();
         let seen = stamped(&mut s, false);
         let ip_repr = IpReprIpvX(IpvXRepr {
+            options: crate::wire::Ipv4OptionBytes::EMPTY,
+            wire_dst: None,
             src_addr: REMOTE_ADDR,
             dst_addr: LOCAL_ADDR,
             next_header: IpProtocol::Tcp,
@@ -11237,6 +11274,8 @@ pub(crate) mod test {
         };
 
         let ip_repr = IpReprIpvX(IpvXRepr {
+            options: crate::wire::Ipv4OptionBytes::EMPTY,
+            wire_dst: None,
             src_addr: REMOTE_ADDR,
             dst_addr: LOCAL_ADDR,
             next_header: IpProtocol::Tcp,
@@ -11246,6 +11285,8 @@ pub(crate) mod test {
         assert!(s.socket.accepts(&mut s.cx, &ip_repr, &tcp_repr));
 
         let ip_repr_wrong_src = IpReprIpvX(IpvXRepr {
+            options: crate::wire::Ipv4OptionBytes::EMPTY,
+            wire_dst: None,
             src_addr: OTHER_ADDR,
             dst_addr: LOCAL_ADDR,
             next_header: IpProtocol::Tcp,
@@ -11255,6 +11296,8 @@ pub(crate) mod test {
         assert!(!s.socket.accepts(&mut s.cx, &ip_repr_wrong_src, &tcp_repr));
 
         let ip_repr_wrong_dst = IpReprIpvX(IpvXRepr {
+            options: crate::wire::Ipv4OptionBytes::EMPTY,
+            wire_dst: None,
             src_addr: REMOTE_ADDR,
             dst_addr: OTHER_ADDR,
             next_header: IpProtocol::Tcp,

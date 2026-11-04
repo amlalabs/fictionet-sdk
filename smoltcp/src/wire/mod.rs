@@ -19,9 +19,13 @@ pub use self::ip::{
 };
 pub(crate) use self::ip::{Protocol as IpProtocol, Repr as IpRepr, Version as IpVersion};
 pub(crate) use self::ipv4::AddressExt as Ipv4AddressExt;
-pub use self::ipv4::Packet as Ipv4Packet;
+pub(crate) use self::ipv4::OptionBytes as Ipv4OptionBytes;
 pub(crate) use self::ipv4::{
     Address as Ipv4Address, HEADER_LEN as IPV4_HEADER_LEN, Repr as Ipv4Repr,
+};
+pub use self::ipv4::{
+    Ipv4Option, Ipv4Options, Ipv4OptionsError, Ipv4Timestamp, Packet as Ipv4Packet,
+    encode_ipv4_options,
 };
 pub(crate) use self::ipv6::AddressExt as Ipv6AddressExt;
 pub(crate) use self::ipv6::{

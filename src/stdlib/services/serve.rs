@@ -197,7 +197,8 @@ pub struct ConnInfo {
     pub peer: Option<SocketAddr>,
     /// What the TCP handshake carried, for a TCP connection: the options
     /// of the peer's SYN, those the listener added to its SYN-ACK, and
-    /// those of the ACK that completed it. `None` for datagrams or a
+    /// those of the ACK that completed it, including the SYN and SYN-ACK's
+    /// typed IPv4 options. `None` for datagrams or a
     /// connection this side opened.
     pub handshake: Option<Handshake>,
     /// Whether the bytes arrived over TLS.

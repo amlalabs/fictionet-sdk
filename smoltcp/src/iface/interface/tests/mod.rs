@@ -141,6 +141,8 @@ fn tcp_listen_drops_unspecified_src() {
     let reply = iface.inner.process_tcp(
         &mut sockets,
         IpRepr::Ipv4(Ipv4Repr {
+            options: crate::wire::Ipv4OptionBytes::EMPTY,
+            wire_dst: None,
             src_addr: Ipv4Address::UNSPECIFIED,
             dst_addr: Ipv4Address::new(127, 0, 0, 1),
             next_header: IpProtocol::Tcp,
@@ -193,6 +195,8 @@ fn ipv4_fragments_are_dropped() {
         let (mut iface, mut sockets, mut device) = setup();
         let mut bytes = syn_bytes(
             Ipv4Repr {
+                options: crate::wire::Ipv4OptionBytes::EMPTY,
+                wire_dst: None,
                 src_addr: Ipv4Address::new(192, 168, 1, 2),
                 dst_addr: Ipv4Address::new(192, 168, 1, 1),
                 next_header: IpProtocol::Tcp,
@@ -270,6 +274,8 @@ fn tcp_ingress_checks_addresses_and_checksums() {
                 .into()
             } else {
                 Ipv4Repr {
+                    options: crate::wire::Ipv4OptionBytes::EMPTY,
+                    wire_dst: None,
                     src_addr: Ipv4Address::new(192, 168, 1, 2),
                     dst_addr: Ipv4Address::new(192, 168, 1, 1),
                     next_header: IpProtocol::Tcp,
@@ -338,6 +344,8 @@ fn egress_respects_ip_mtu() {
                 })
             } else {
                 IpRepr::Ipv4(Ipv4Repr {
+                    options: crate::wire::Ipv4OptionBytes::EMPTY,
+                    wire_dst: None,
                     src_addr: Ipv4Address::LOCALHOST,
                     dst_addr: Ipv4Address::LOCALHOST,
                     next_header: IpProtocol::Tcp,
@@ -382,6 +390,8 @@ fn tcp_reset_with_syn_or_fin_closes_connection() {
         socket.listen(4243).unwrap();
         let handle = sockets.add(socket);
         let ip = IpRepr::Ipv4(Ipv4Repr {
+            options: crate::wire::Ipv4OptionBytes::EMPTY,
+            wire_dst: None,
             src_addr: Ipv4Address::new(192, 168, 1, 2),
             dst_addr: Ipv4Address::new(192, 168, 1, 1),
             next_header: IpProtocol::Tcp,

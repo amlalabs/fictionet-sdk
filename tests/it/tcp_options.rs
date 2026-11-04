@@ -262,6 +262,8 @@ fn syn_options_reach_the_connection_and_the_syn_ack_answers_mptcp() {
             origin: tcp::HandshakeOrigin::Syn,
             syn: Some(linux_syn_options().into()),
             syn_ack: Some(answered.into()),
+            syn_ipv4: Some(Arc::default()),
+            syn_ack_ipv4: Some(Arc::default()),
             ack: vec![
                 TcpOption::NoOperation,
                 TcpOption::NoOperation,
@@ -1166,4 +1168,168 @@ fn an_unanswered_handshake_is_dropped_quietly() {
             Ok(())
         });
     }
+}
+
+#[test]
+fn ipv4_syn_options_and_source_route_reply_survive_retransmission_and_cookies() {
+    use fictionet::stdlib::network::ip::{self, Ipv4Option, Ipv4Reply};
+
+    fn route(strict: bool, consumed: bool) -> Ipv4Option {
+        let pointer = if consumed { 8 } else { 4 };
+        let routes = vec![if consumed { "10.0.0.3" } else { PEER }.parse().unwrap()];
+        if strict {
+            Ipv4Option::StrictSourceRoute { pointer, routes }
+        } else {
+            Ipv4Option::LooseSourceRoute { pointer, routes }
+        }
+    }
+
+    struct RouteReply {
+        strict: bool,
+        consumed: bool,
+    }
+    impl Answer for RouteReply {
+        fn syn(&self, _syn: &tcp::Syn<'_>) -> SynAnswer {
+            SynAnswer::Accept(Vec::new())
+        }
+        fn ipv4_options(&self, syn: &tcp::Syn<'_>) -> Option<Ipv4Reply> {
+            assert_eq!(syn.to, SocketAddr::new(ip(SERVER), 80));
+            assert!(matches!(
+                syn.ipv4_options.first(),
+                Some(Ipv4Option::RecordRoute { pointer: 4, .. })
+            ));
+            Some(Ipv4Reply {
+                options: vec![route(self.strict, self.consumed)],
+                destination: (!self.consumed).then(|| "10.0.0.3".parse().unwrap()),
+            })
+        }
+    }
+    for cookie in [false, true] {
+        for strict in [false, true] {
+            for consumed in [false, true] {
+                world(Duration::from_secs(10), move |fcx| async move {
+                    let (mut raw, side) = pair();
+                    let server =
+                        tcp::endpoint_with(&fcx, side, ip(SERVER), cookie_options().backlog(1));
+                    let mut listener = server.listen(80)?;
+                    if cookie {
+                        raw.send(segment(3999, 1000, 0, SYN, &[]));
+                        next(&fcx, &mut raw).await.expect("the backlog SYN-ACK");
+                    }
+                    listener.answer(Box::new(RouteReply { strict, consumed }));
+                    let syn = segment(4000, 1000, 0, SYN | 0xc0, &LINUX_SYN);
+                    let received = vec![Ipv4Option::RecordRoute {
+                        pointer: 4,
+                        routes: vec![std::net::Ipv4Addr::UNSPECIFIED],
+                    }];
+                    let syn = ip::packet_with_ipv4_options(
+                        PEER.parse().unwrap(),
+                        SERVER.parse().unwrap(),
+                        6,
+                        Fields::default(),
+                        &received,
+                        tcp_of(&syn),
+                    )
+                    .unwrap();
+                    let received = ip::ipv4_options(&syn.0).unwrap();
+                    raw.send(syn);
+                    let reply = next(&fcx, &mut raw).await.expect("optioned SYN-ACK");
+                    let check = |packet: &Packet| {
+                        let header = ip::Header::parse(&packet.0).unwrap();
+                        assert_eq!(header.dst, ip(if consumed { PEER } else { "10.0.0.3" }));
+                        assert_eq!(header.payload.start, 28);
+                        assert_eq!(
+                            u16::from_be_bytes(packet.0[2..4].try_into().unwrap()) as usize,
+                            packet.0.len()
+                        );
+                        assert_eq!(ip::checksum(&packet.0[..28]), 0);
+                        assert_eq!(
+                            tcp_of(packet)[13],
+                            SYN | ACK | if cookie { 0 } else { 0x40 }
+                        );
+                        assert_eq!(
+                            transport_checksum(ip(SERVER), ip(PEER), 6, tcp_of(packet)),
+                            0
+                        );
+                        assert_eq!(
+                            ip::ipv4_options(&packet.0).unwrap(),
+                            vec![route(strict, consumed), Ipv4Option::EndOfList,]
+                        );
+                    };
+                    check(&reply);
+                    if !cookie {
+                        let again = timeout(&fcx, Duration::from_secs(2), raw.recv(&fcx))
+                            .await
+                            .expect("retransmitted SYN-ACK")?;
+                        check(&again);
+                        // A duplicate SYN cannot replace the first SYN's retained options.
+                        raw.send(segment(4000, 1000, 0, SYN, &[]));
+                    } else {
+                        // Free the backlog before returning the cookie.
+                        raw.send(segment(3999, 1001, 0, RST, &[]));
+                    }
+                    raw.send(segment(
+                        4000,
+                        1001,
+                        seq_of(tcp_of(&reply)).wrapping_add(1),
+                        ACK,
+                        &[],
+                    ));
+                    let conn = listener.accept(&fcx).await?;
+                    let handshake = conn.handshake().unwrap();
+                    assert_eq!(handshake.iss, seq_of(tcp_of(&reply)));
+                    if cookie {
+                        assert_eq!(handshake.origin, tcp::HandshakeOrigin::Cookie);
+                        assert_eq!(handshake.syn_ipv4, None);
+                        assert_eq!(handshake.syn_ack_ipv4, None);
+                    } else {
+                        assert_eq!(handshake.syn_ipv4.as_deref(), Some(received.as_slice()));
+                        assert_eq!(
+                            handshake.syn_ack_ipv4.as_deref(),
+                            Some(&[route(strict, consumed),][..])
+                        );
+                    }
+                    Ok(())
+                });
+            }
+        }
+    }
+}
+
+#[test]
+fn declining_ipv4_options_drops_the_syn_without_consuming_backlog() {
+    use fictionet::stdlib::network::ip::Ipv4Reply;
+
+    struct DeclineOptions;
+    impl Answer for DeclineOptions {
+        fn syn(&self, _syn: &tcp::Syn<'_>) -> SynAnswer {
+            SynAnswer::Accept(Vec::new())
+        }
+
+        fn ipv4_options(&self, syn: &tcp::Syn<'_>) -> Option<Ipv4Reply> {
+            (syn.from.port() == 4001).then(Ipv4Reply::default)
+        }
+    }
+
+    world(Duration::from_secs(10), |fcx| async move {
+        let (mut raw, side) = pair();
+        let server = tcp::endpoint_with(&fcx, side, ip(SERVER), tcp::Options::default().backlog(1));
+        let mut listener = server.listen(80)?;
+        listener.answer(Box::new(DeclineOptions));
+        raw.send(segment(4000, 1000, 0, SYN, &[]));
+        raw.send(segment(4001, 2000, 0, SYN, &[]));
+        let reply = next(&fcx, &mut raw).await.expect("the accepted SYN-ACK");
+        assert_eq!(dport_of(tcp_of(&reply)), 4001);
+        assert_eq!(tcp_of(&reply)[13], SYN | ACK);
+        raw.send(segment(
+            4001,
+            2001,
+            seq_of(tcp_of(&reply)).wrapping_add(1),
+            ACK,
+            &[],
+        ));
+        let conn = listener.accept(&fcx).await?;
+        assert_eq!(conn.handshake().unwrap().origin, tcp::HandshakeOrigin::Syn);
+        Ok(())
+    });
 }

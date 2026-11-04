@@ -62,7 +62,7 @@ use smoltcp::wire::{Ipv4Packet, TcpOption as WireOption, TcpPacket, TcpRepr};
 
 use fictionet::CancelWait;
 use fictionet::stdlib::network::ip::{
-    Header, checksum,
+    Header, Ipv4Option, Ipv4Reply, checksum, encode_ipv4_options, ipv4_options,
     protocol::{ICMP, TCP},
     strip_extension_headers, transport_checksum,
 };
@@ -286,6 +286,10 @@ pub struct Handshake {
     /// The options the listener's [`Answer::syn`] added to its SYN-ACK, in
     /// order. `None` as for `syn`.
     pub syn_ack: Option<Arc<[TcpOption]>>,
+    /// IPv4 options on the first SYN; absent for IPv6 or an unretained cookie.
+    pub syn_ipv4: Option<Arc<[Ipv4Option]>>,
+    /// IPv4 options selected for its SYN-ACK, before wire padding.
+    pub syn_ack_ipv4: Option<Arc<[Ipv4Option]>>,
     /// The options of the ACK that completed the handshake, as `syn` reads
     /// them.
     pub ack: Arc<[TcpOption]>,
@@ -302,6 +306,10 @@ pub struct Handshake {
 pub struct Syn<'a> {
     /// Its options, in the order sent, up to the first malformed one.
     pub options: &'a [TcpOption],
+    /// IPv4 options in wire order; empty for IPv6.
+    pub ipv4_options: &'a [Ipv4Option],
+    /// The listener address and port.
+    pub to: SocketAddr,
     /// Its source address and port.
     pub from: SocketAddr,
     /// Its sequence number.
@@ -319,6 +327,10 @@ pub struct Kept {
     pub syn: Arc<[TcpOption]>,
     /// The options the SYN-ACK added: its [`syn_ack`](Handshake::syn_ack).
     pub syn_ack: Arc<[TcpOption]>,
+    /// Retained IPv4 SYN options, or none for IPv6 or missing state.
+    pub syn_ipv4: Option<Arc<[Ipv4Option]>>,
+    /// Retained IPv4 SYN-ACK options, or none for IPv6 or missing state.
+    pub syn_ack_ipv4: Option<Arc<[Ipv4Option]>>,
 }
 
 /// How a listener answers one connection attempt's SYN: what
@@ -366,6 +378,15 @@ pub trait Answer: Send {
     /// answer that draws something new, such as a key, gives each copy a
     /// different one.
     fn syn(&self, syn: &Syn<'_>) -> SynAnswer;
+
+    /// IPv4 options and an optional source-route hop for an accepted SYN-ACK.
+    /// Called only for IPv4, after `syn` accepts. Retransmissions of a retained
+    /// SYN use the original reply. `None` drops the SYN without an answer.
+    /// The default sends no IPv4 options.
+    fn ipv4_options(&self, syn: &Syn<'_>) -> Option<Ipv4Reply> {
+        let _ = syn;
+        Some(Ipv4Reply::default())
+    }
 
     /// What the SYN and SYN-ACK of `handshake`, answered with a SYN cookie,
     /// carried, if this listener kept that itself when it answered the SYN,
@@ -532,6 +553,14 @@ impl<F: Fn(&Syn<'_>) -> SynAnswer + Send> Answer for F {
     fn syn(&self, syn: &Syn<'_>) -> SynAnswer {
         self(syn)
     }
+}
+
+/// The first SYN and the listener's accepted reply.
+struct Attempt {
+    syn: Arc<[TcpOption]>,
+    added: Vec<TcpOption>,
+    syn_ipv4: Option<Vec<Ipv4Option>>,
+    ipv4_reply: Ipv4Reply,
 }
 
 /// One arriving segment, as much as a reset in answer to it needs.
@@ -1565,7 +1594,25 @@ impl State {
             return;
         }
         let local = SocketAddr::new(ip.src, u16::from_be_bytes([t[0], t[1]]));
-        let remote = SocketAddr::new(ip.dst, u16::from_be_bytes([t[2], t[3]]));
+        let mut destination = ip.dst;
+        if destination.is_ipv4() {
+            for option in Ipv4Packet::new_unchecked(&*packet)
+                .options_iter()
+                .expect("validated IPv4 header")
+            {
+                match option {
+                    Ipv4Option::LooseSourceRoute { pointer, routes }
+                    | Ipv4Option::StrictSourceRoute { pointer, routes }
+                        if usize::from(pointer) <= 3 + routes.len() * 4 =>
+                    {
+                        destination = (*routes.last().expect("unconsumed route slot")).into();
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let remote = SocketAddr::new(destination, u16::from_be_bytes([t[2], t[3]]));
         if let Some(h) = self.by_tuple.get(&(local, remote)) {
             let c = self.conns.get_mut(h).unwrap();
             let seq = u32::from_be_bytes([t[4], t[5], t[6], t[7]]);
@@ -1727,7 +1774,16 @@ impl State {
         // what the listener's answer adds to the SYN-ACK.
         let mut attempt = None;
         if new && syn && !ack {
-            let Some(taken) = self.attempt(arrived, t, now) else {
+            let Some(taken) = self.attempt(
+                arrived,
+                t,
+                if src.is_ipv4() {
+                    Some(ipv4_options(&packet).expect("validated IPv4 header"))
+                } else {
+                    None
+                },
+                now,
+            ) else {
                 return false;
             };
             attempt = Some(taken);
@@ -1820,7 +1876,13 @@ impl State {
                 self.completed(h, arrived, ack);
             }
         }
-        if let Some((syn, added)) = attempt {
+        if let Some(Attempt {
+            syn,
+            added,
+            syn_ipv4,
+            ipv4_reply,
+        }) = attempt
+        {
             // At most one idle socket took the SYN.
             let l = self.listeners.get_mut(&dst.port()).unwrap();
             let (sockets, handles) = (&self.sockets, &self.handles);
@@ -1840,8 +1902,13 @@ impl State {
                 self.sock(h)
                     .set_syn_options(&wire)
                     .expect("`attempt` checked that the answer can be sent");
+                self.sock(h)
+                    .set_syn_ipv4_options(&ipv4_reply.options, ipv4_reply.destination)
+                    .expect("attempt checked IPv4 options");
                 let mut conn = Conn::new(local, remote, Side::Server);
                 conn.ecn = flags & 0xc0 == 0xc0;
+                conn.handshake.syn_ipv4 = syn_ipv4.map(Arc::from);
+                conn.handshake.syn_ack_ipv4 = local.is_ipv4().then(|| ipv4_reply.options.into());
                 conn.handshake.syn = Some(syn);
                 conn.handshake.syn_ack = Some(added.into());
                 conn.handshake.irs = arrived.seq;
@@ -1862,8 +1929,9 @@ impl State {
         &mut self,
         arrived: Arrived,
         t: &[u8],
+        syn_ipv4: Option<Vec<Ipv4Option>>,
         now: smoltcp::time::Instant,
-    ) -> Option<(Arc<[TcpOption]>, Vec<TcpOption>)> {
+    ) -> Option<Attempt> {
         let (src, dst) = (arrived.from, arrived.to);
         let l = &self.listeners[&dst.port()];
         let peer_full = l
@@ -1887,6 +1955,8 @@ impl State {
         let cookie = l.embryonic.len() + l.ready.len() >= self.backlog || peer_full;
         let asked = Syn {
             options: &syn,
+            ipv4_options: syn_ipv4.as_deref().unwrap_or_default(),
+            to: dst,
             from: src,
             seq: arrived.seq,
             cookie,
@@ -1905,6 +1975,18 @@ impl State {
             self.dev.tx.push(arrived.reset(&[]));
             return None;
         };
+        let ipv4_reply = if dst.is_ipv4() {
+            l.answer.as_ref().map_or_else(
+                || Some(Ipv4Reply::default()),
+                |answer| answer.ipv4_options(&asked),
+            )?
+        } else {
+            Ipv4Reply::default()
+        };
+        if encode_ipv4_options(&ipv4_reply.options).is_err() {
+            self.dev.tx.push(arrived.reset(&[]));
+            return None;
+        }
         if cookie {
             let codec = self.settings.cookies?;
             let input = CookieInput {
@@ -1942,7 +2024,7 @@ impl State {
             }
             .unwrap_or(self.buffer.min(usize::from(u16::MAX)) as u16);
             let ack = arrived.seq.wrapping_add(1);
-            self.dev.tx.push(segment(
+            let reply = segment(
                 dst,
                 src,
                 iss,
@@ -1950,7 +2032,22 @@ impl State {
                 0x02 | if ecn { 0x40 } else { 0 },
                 window,
                 &options,
-            ));
+            );
+            let reply = if let (IpAddr::V4(local), IpAddr::V4(peer)) = (dst.ip(), src.ip()) {
+                fictionet::stdlib::network::ip::packet_with_ipv4_options(
+                    local,
+                    ipv4_reply.destination.unwrap_or(peer),
+                    TCP,
+                    fictionet::stdlib::network::ip::Fields::default(),
+                    &ipv4_reply.options,
+                    &reply[20..],
+                )
+                .expect("checked IPv4 reply")
+                .0
+            } else {
+                reply
+            };
+            self.dev.tx.push(reply);
             return None;
         }
         if l.idle.is_empty() {
@@ -1968,7 +2065,12 @@ impl State {
                     .map_or(0, |offset| offset(&self.fcx)),
             );
         }
-        Some((syn, added))
+        Some(Attempt {
+            syn,
+            added,
+            syn_ipv4,
+            ipv4_reply,
+        })
     }
 
     /// Takes an ACK for a listening port that no connection has. When it
@@ -2062,6 +2164,8 @@ impl State {
         {
             c.handshake.syn = Some(kept.syn);
             c.handshake.syn_ack = Some(kept.syn_ack);
+            c.handshake.syn_ipv4 = kept.syn_ipv4;
+            c.handshake.syn_ack_ipv4 = kept.syn_ack_ipv4;
         }
         let handshake = &self.conns[&h].handshake;
         let answer = l

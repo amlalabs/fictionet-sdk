@@ -11,6 +11,334 @@ const MINIMUM_IHL_BYTES: u8 = 20;
 
 pub use core::net::Ipv4Addr as Address;
 
+/// One IPv4 header option, preserving unknown and malformed wire contents.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Ipv4Option {
+    /// Terminates the list; remaining header bytes are padding.
+    EndOfList,
+    /// Single byte padding.
+    NoOperation,
+    /// Addresses recorded along the path. The pointer is one based.
+    RecordRoute { pointer: u8, routes: Vec<Address> },
+    /// A loose source route. The pointer is one based.
+    LooseSourceRoute { pointer: u8, routes: Vec<Address> },
+    /// A strict source route. The pointer is one based.
+    StrictSourceRoute { pointer: u8, routes: Vec<Address> },
+    /// Internet timestamps and their overflow count.
+    Timestamp {
+        pointer: u8,
+        overflow: u8,
+        timestamps: Ipv4Timestamp,
+    },
+    /// The original security option.
+    Security {
+        security: u16,
+        compartments: u16,
+        handling_restrictions: u16,
+        transmission_control_code: [u8; 3],
+    },
+    /// The obsolete stream identifier.
+    StreamId(u16),
+    /// Router Alert value.
+    RouterAlert(u16),
+    /// Unrecognized full type octet and bytes after type and length.
+    Unknown { kind: u8, data: Vec<u8> },
+    /// Invalid option, with every byte after its type, including length.
+    Malformed { kind: u8, data: Vec<u8> },
+}
+
+/// Timestamp data selected by the option's low flag nibble.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Ipv4Timestamp {
+    /// Flag zero: timestamps only.
+    Timestamps(Vec<u32>),
+    /// Flag one: addresses and timestamps.
+    Addresses(Vec<(Address, u32)>),
+    /// Flag three: timestamps for prespecified addresses.
+    Prespecified(Vec<(Address, u32)>),
+    /// An unrecognized flag nibble and its uninterpreted data.
+    Unknown { flags: u8, data: Vec<u8> },
+}
+
+/// Why an IPv4 option list cannot be encoded or its header cannot be read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ipv4OptionsError {
+    /// Invalid IPv4 header lengths or version.
+    Header,
+    /// Options exceed the forty bytes permitted by the header length field.
+    TooLong,
+    /// An option cannot be read back as the value supplied.
+    Unreadable,
+}
+
+impl core::fmt::Display for Ipv4OptionsError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Header => "invalid IPv4 header",
+            Self::TooLong => "IPv4 options exceed forty bytes",
+            Self::Unreadable => "IPv4 option cannot be read back as written",
+        })
+    }
+}
+impl core::error::Error for Ipv4OptionsError {}
+
+/// A lossless option walker. An invalid length consumes the remaining area.
+/// A framed but malformed option consumes only its own bytes.
+pub struct Ipv4Options<'a> {
+    rest: &'a [u8],
+}
+impl<'a> Ipv4Options<'a> {
+    /// Walk an IPv4 header's option area, stopping at End of List.
+    pub fn new(area: &'a [u8]) -> Self {
+        Self { rest: area }
+    }
+}
+impl Iterator for Ipv4Options<'_> {
+    type Item = Ipv4Option;
+    fn next(&mut self) -> Option<Self::Item> {
+        use Ipv4Option::*;
+        let (&kind, suffix) = self.rest.split_first()?;
+        if kind == 0 {
+            self.rest = &[];
+            return Some(EndOfList);
+        }
+        if kind == 1 {
+            self.rest = suffix;
+            return Some(NoOperation);
+        }
+        let len = suffix.first().copied().unwrap_or(0) as usize;
+        if len < 2 || len > self.rest.len() {
+            self.rest = &[];
+            return Some(Malformed {
+                kind,
+                data: suffix.to_vec(),
+            });
+        }
+        let bytes = &self.rest[..len];
+        self.rest = &self.rest[len..];
+        let data = &bytes[2..];
+        let malformed = || Malformed {
+            kind,
+            data: bytes[1..].to_vec(),
+        };
+        Some(match kind {
+            7 | 131 | 137 if len >= 3 && (len - 3).is_multiple_of(4) && data[0] >= 4 => {
+                let pointer = data[0];
+                let routes = data[1..]
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| Address::from_octets(*b))
+                    .collect();
+                match kind {
+                    7 => RecordRoute { pointer, routes },
+                    131 => LooseSourceRoute { pointer, routes },
+                    _ => StrictSourceRoute { pointer, routes },
+                }
+            }
+            68 if len >= 4 && data[0] >= 5 => {
+                let flags = data[1] & 15;
+                let body = &data[2..];
+                let timestamps = match flags {
+                    0 if body.len().is_multiple_of(4) => Ipv4Timestamp::Timestamps(
+                        body.as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|b| NetworkEndian::read_u32(b))
+                            .collect(),
+                    ),
+                    1 | 3 if body.len().is_multiple_of(8) => {
+                        let entries = body
+                            .as_chunks::<8>()
+                            .0
+                            .iter()
+                            .map(|b| {
+                                (
+                                    Address::from_octets(b[..4].try_into().unwrap()),
+                                    NetworkEndian::read_u32(&b[4..]),
+                                )
+                            })
+                            .collect();
+                        if flags == 1 {
+                            Ipv4Timestamp::Addresses(entries)
+                        } else {
+                            Ipv4Timestamp::Prespecified(entries)
+                        }
+                    }
+                    0 | 1 | 3 => return Some(malformed()),
+                    _ => Ipv4Timestamp::Unknown {
+                        flags,
+                        data: body.to_vec(),
+                    },
+                };
+                Timestamp {
+                    pointer: data[0],
+                    overflow: data[1] >> 4,
+                    timestamps,
+                }
+            }
+            130 if len == 11 => Security {
+                security: NetworkEndian::read_u16(data),
+                compartments: NetworkEndian::read_u16(&data[2..]),
+                handling_restrictions: NetworkEndian::read_u16(&data[4..]),
+                transmission_control_code: data[6..9].try_into().unwrap(),
+            },
+            136 if len == 4 => StreamId(NetworkEndian::read_u16(data)),
+            148 if len == 4 => RouterAlert(NetworkEndian::read_u16(data)),
+            7 | 131 | 137 | 68 | 130 | 136 | 148 => malformed(),
+            _ => Unknown {
+                kind,
+                data: data.to_vec(),
+            },
+        })
+    }
+}
+
+/// Encode the exact option bytes without header padding. Malformed values,
+/// values with incompatible kinds, and options after End of List are refused.
+pub fn encode_ipv4_options(
+    options: &[Ipv4Option],
+) -> core::result::Result<Vec<u8>, Ipv4OptionsError> {
+    use Ipv4Option::*;
+    let mut bytes = Vec::new();
+    for (index, option) in options.iter().enumerate() {
+        if bytes.len() >= 40 {
+            return Err(Ipv4OptionsError::TooLong);
+        }
+        let start = bytes.len();
+        match option {
+            EndOfList => {
+                if index + 1 != options.len() {
+                    return Err(Ipv4OptionsError::Unreadable);
+                }
+                bytes.push(0);
+            }
+            NoOperation => bytes.push(1),
+            RecordRoute { pointer, routes }
+            | LooseSourceRoute { pointer, routes }
+            | StrictSourceRoute { pointer, routes } => {
+                if routes.len() > 9 {
+                    return Err(Ipv4OptionsError::TooLong);
+                }
+                let kind = match option {
+                    RecordRoute { .. } => 7,
+                    LooseSourceRoute { .. } => 131,
+                    _ => 137,
+                };
+                bytes.extend([kind, (3 + routes.len() * 4) as u8, *pointer]);
+                for address in routes {
+                    bytes.extend(address.octets());
+                }
+            }
+            Timestamp {
+                pointer,
+                overflow,
+                timestamps,
+            } => {
+                if *overflow > 15 {
+                    return Err(Ipv4OptionsError::Unreadable);
+                }
+                bytes.extend([68, 0, *pointer, overflow << 4]);
+                match timestamps {
+                    Ipv4Timestamp::Timestamps(entries) => {
+                        if entries.len() > 9 {
+                            return Err(Ipv4OptionsError::TooLong);
+                        }
+                        for value in entries {
+                            bytes.extend(value.to_be_bytes());
+                        }
+                    }
+                    Ipv4Timestamp::Addresses(entries) | Ipv4Timestamp::Prespecified(entries) => {
+                        if entries.len() > 4 {
+                            return Err(Ipv4OptionsError::TooLong);
+                        }
+                        bytes[start + 3] |= if matches!(timestamps, Ipv4Timestamp::Addresses(_)) {
+                            1
+                        } else {
+                            3
+                        };
+                        for (address, value) in entries {
+                            bytes.extend(address.octets());
+                            bytes.extend(value.to_be_bytes());
+                        }
+                    }
+                    Ipv4Timestamp::Unknown { flags, data } => {
+                        if *flags > 15 {
+                            return Err(Ipv4OptionsError::Unreadable);
+                        }
+                        if data.len() > 36 {
+                            return Err(Ipv4OptionsError::TooLong);
+                        }
+                        bytes[start + 3] |= flags;
+                        bytes.extend(data);
+                    }
+                }
+                bytes[start + 1] = (bytes.len() - start) as u8;
+            }
+            Security {
+                security,
+                compartments,
+                handling_restrictions,
+                transmission_control_code,
+            } => {
+                bytes.extend([130, 11]);
+                bytes.extend(security.to_be_bytes());
+                bytes.extend(compartments.to_be_bytes());
+                bytes.extend(handling_restrictions.to_be_bytes());
+                bytes.extend(transmission_control_code);
+            }
+            StreamId(value) | RouterAlert(value) => {
+                bytes.extend([
+                    if matches!(option, StreamId(_)) {
+                        136
+                    } else {
+                        148
+                    },
+                    4,
+                ]);
+                bytes.extend(value.to_be_bytes());
+            }
+            Unknown { kind, data } => {
+                if data.len() > 38 {
+                    return Err(Ipv4OptionsError::TooLong);
+                }
+                bytes.extend([*kind, (data.len() + 2) as u8]);
+                bytes.extend(data);
+            }
+            Malformed { .. } => return Err(Ipv4OptionsError::Unreadable),
+        }
+        if bytes.len() > 40 {
+            return Err(Ipv4OptionsError::TooLong);
+        }
+        if !Ipv4Options::new(&bytes[start..]).eq(core::iter::once(option.clone())) {
+            return Err(Ipv4OptionsError::Unreadable);
+        }
+    }
+    Ok(bytes)
+}
+
+/// Bounded storage imposed by IPv4's header length field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OptionBytes {
+    bytes: [u8; 40],
+    len: u8,
+}
+impl OptionBytes {
+    pub(crate) const EMPTY: Self = Self {
+        bytes: [0; 40],
+        len: 0,
+    };
+    pub(crate) fn new(bytes: &[u8]) -> Self {
+        let mut out = Self::EMPTY;
+        out.bytes[..bytes.len()].copy_from_slice(bytes);
+        out.len = (bytes.len().div_ceil(4) * 4) as u8;
+        out
+    }
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len as usize]
+    }
+}
+
 pub(crate) trait AddressExt {
     /// Query whether the address is an unicast address.
     ///
@@ -171,6 +499,17 @@ impl<T: AsRef<[u8]>> Packet<T> {
 }
 
 impl<'a, T: AsRef<[u8]> + ?Sized> Packet<&'a T> {
+    /// Read the option area after validating the complete IPv4 header.
+    pub fn options_iter(&self) -> core::result::Result<Ipv4Options<'a>, Ipv4OptionsError> {
+        self.check_len().map_err(|_| Ipv4OptionsError::Header)?;
+        if self.version() != 4 {
+            return Err(Ipv4OptionsError::Header);
+        }
+        Ok(Ipv4Options::new(
+            &self.buffer.as_ref()[HEADER_LEN..self.header_len() as usize],
+        ))
+    }
+
     /// Return a pointer to the payload.
     #[inline]
     pub(crate) fn payload(&self) -> &'a [u8] {
@@ -317,6 +656,8 @@ pub(crate) struct Repr {
     pub(crate) next_header: Protocol,
     pub(crate) payload_len: usize,
     pub(crate) hop_limit: u8,
+    pub(crate) options: OptionBytes,
+    pub(crate) wire_dst: Option<Address>,
 }
 
 impl Repr {
@@ -348,19 +689,22 @@ impl Repr {
             next_header: packet.next_header(),
             payload_len,
             hop_limit: packet.hop_limit(),
+            options: OptionBytes::new(
+                &packet.buffer.as_ref()[HEADER_LEN..packet.header_len() as usize],
+            ),
+            wire_dst: None,
         })
     }
 
     /// Return the length of a header that will be emitted from this high-level representation.
     pub(crate) const fn buffer_len(&self) -> usize {
-        // We never emit any options.
-        field::DST_ADDR.end
+        HEADER_LEN + self.options.len as usize
     }
 
     /// Emit a high-level representation into an Internet Protocol version 4 packet.
     pub(crate) fn emit<T: AsRef<[u8]> + AsMut<[u8]>>(&self, packet: &mut Packet<T>) {
         packet.set_version(4);
-        packet.set_header_len(field::DST_ADDR.end as u8);
+        packet.set_header_len(self.buffer_len() as u8);
         packet.set_dscp(0);
         packet.set_ecn(0);
 
@@ -375,7 +719,9 @@ impl Repr {
         packet.set_hop_limit(self.hop_limit);
         packet.set_next_header(self.next_header);
         packet.set_src_addr(self.src_addr);
-        packet.set_dst_addr(self.dst_addr);
+        packet.set_dst_addr(self.wire_dst.unwrap_or(self.dst_addr));
+        packet.buffer.as_mut()[HEADER_LEN..self.buffer_len()]
+            .copy_from_slice(self.options.as_slice());
 
         packet.fill_checksum();
     }
@@ -384,6 +730,260 @@ impl Repr {
 #[cfg(test)]
 pub(crate) mod test {
     use super::*;
+
+    #[test]
+    fn options_decode_known_unknown_and_malformed_without_losing_bytes() {
+        let bytes = [
+            1, 7, 7, 4, 192, 0, 2, 1, 68, 8, 5, 0x20, 0, 0, 0, 42, 222, 3, 9, 7, 3, 0, 1, 254, 8, 4,
+        ];
+        assert_eq!(
+            Ipv4Options::new(&bytes).collect::<Vec<_>>(),
+            vec![
+                Ipv4Option::NoOperation,
+                Ipv4Option::RecordRoute {
+                    pointer: 4,
+                    routes: vec![Address::new(192, 0, 2, 1)]
+                },
+                Ipv4Option::Timestamp {
+                    pointer: 5,
+                    overflow: 2,
+                    timestamps: Ipv4Timestamp::Timestamps(vec![42])
+                },
+                Ipv4Option::Unknown {
+                    kind: 222,
+                    data: vec![9]
+                },
+                Ipv4Option::Malformed {
+                    kind: 7,
+                    data: vec![3, 0]
+                },
+                Ipv4Option::NoOperation,
+                Ipv4Option::Malformed {
+                    kind: 254,
+                    data: vec![8, 4]
+                },
+            ]
+        );
+        assert_eq!(
+            Ipv4Options::new(&[0, 254, 255]).collect::<Vec<_>>(),
+            vec![Ipv4Option::EndOfList]
+        );
+        for bytes in [&[7][..], &[7, 0][..], &[7, 1, 9][..]] {
+            assert_eq!(
+                Ipv4Options::new(bytes).collect::<Vec<_>>(),
+                vec![Ipv4Option::Malformed {
+                    kind: 7,
+                    data: bytes[1..].to_vec()
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn option_values_roundtrip_exactly_before_header_padding() {
+        use Ipv4Option::*;
+        let address = Address::new(192, 0, 2, 1);
+        let values = vec![
+            EndOfList,
+            NoOperation,
+            RecordRoute {
+                pointer: 4,
+                routes: vec![address],
+            },
+            LooseSourceRoute {
+                pointer: 8,
+                routes: vec![address],
+            },
+            StrictSourceRoute {
+                pointer: 255,
+                routes: vec![],
+            },
+            Timestamp {
+                pointer: 5,
+                overflow: 15,
+                timestamps: Ipv4Timestamp::Timestamps(vec![0, u32::MAX]),
+            },
+            Timestamp {
+                pointer: 13,
+                overflow: 0,
+                timestamps: Ipv4Timestamp::Addresses(vec![(address, 42)]),
+            },
+            Timestamp {
+                pointer: 255,
+                overflow: 1,
+                timestamps: Ipv4Timestamp::Prespecified(vec![(address, 1)]),
+            },
+            Timestamp {
+                pointer: 6,
+                overflow: 0,
+                timestamps: Ipv4Timestamp::Unknown {
+                    flags: 2,
+                    data: vec![9],
+                },
+            },
+            Security {
+                security: 0xf135,
+                compartments: 1,
+                handling_restrictions: 2,
+                transmission_control_code: [3, 4, 5],
+            },
+            StreamId(42),
+            RouterAlert(0),
+            Unknown {
+                kind: 222,
+                data: vec![1, 2],
+            },
+        ];
+        for value in values {
+            let encoded = encode_ipv4_options(core::slice::from_ref(&value)).unwrap();
+            assert_eq!(Ipv4Options::new(&encoded).collect::<Vec<_>>(), vec![value]);
+        }
+        let values = [
+            NoOperation,
+            Unknown {
+                kind: 30,
+                data: vec![1],
+            },
+            EndOfList,
+        ];
+        let encoded = encode_ipv4_options(&values).unwrap();
+        assert_eq!(encoded.len(), 5);
+        assert_eq!(Ipv4Options::new(&encoded).collect::<Vec<_>>(), values);
+    }
+
+    #[test]
+    fn every_framed_option_is_preserved_or_explicitly_malformed() {
+        for kind in 2..=255 {
+            for len in 2..=40 {
+                for value in [0, 1, 3, 4, 5, 15, 255] {
+                    let mut bytes = vec![value; len];
+                    bytes[0] = kind;
+                    bytes[1] = len as u8;
+                    let mut options = Ipv4Options::new(&bytes);
+                    let option = options.next().unwrap();
+                    assert_eq!(options.next(), None);
+                    if let Ipv4Option::Malformed { kind: actual, data } = &option {
+                        assert_eq!(*actual, kind);
+                        assert_eq!(data, &bytes[1..]);
+                        assert_eq!(
+                            encode_ipv4_options(&[option]),
+                            Err(Ipv4OptionsError::Unreadable)
+                        );
+                    } else {
+                        assert_eq!(encode_ipv4_options(&[option]).unwrap(), bytes);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn option_walker_checks_header_lengths_before_reading_options() {
+        for len in 0..=64 {
+            for ihl in 0..=15 {
+                for total in [0, 20, 60, 65] {
+                    let mut bytes = vec![0; len];
+                    if let Some(first) = bytes.first_mut() {
+                        *first = 0x40 | ihl;
+                    }
+                    if len >= 4 {
+                        bytes[3] = total;
+                    }
+                    let packet = Packet::new_unchecked(&bytes);
+                    let valid = ihl >= 5
+                        && usize::from(ihl) * 4 <= usize::from(total)
+                        && usize::from(total) <= len;
+                    assert_eq!(packet.options_iter().is_ok(), valid);
+                }
+            }
+        }
+        let mut bytes = [0; 20];
+        bytes[0] = 0x65;
+        bytes[3] = 20;
+        assert!(matches!(
+            Packet::new_unchecked(&bytes).options_iter(),
+            Err(Ipv4OptionsError::Header)
+        ));
+    }
+
+    #[test]
+    fn option_encoding_rejects_incompatible_values_and_oversized_headers() {
+        use Ipv4Option::*;
+        for values in [
+            vec![EndOfList, NoOperation],
+            vec![Malformed {
+                kind: 7,
+                data: vec![2],
+            }],
+            vec![Unknown {
+                kind: 1,
+                data: vec![],
+            }],
+            vec![Unknown {
+                kind: 7,
+                data: vec![4],
+            }],
+            vec![RecordRoute {
+                pointer: 3,
+                routes: vec![],
+            }],
+            vec![Timestamp {
+                pointer: 5,
+                overflow: 16,
+                timestamps: Ipv4Timestamp::Timestamps(vec![]),
+            }],
+            vec![Timestamp {
+                pointer: 5,
+                overflow: 0,
+                timestamps: Ipv4Timestamp::Unknown {
+                    flags: 0,
+                    data: vec![],
+                },
+            }],
+        ] {
+            assert_eq!(
+                encode_ipv4_options(&values),
+                Err(Ipv4OptionsError::Unreadable)
+            );
+        }
+        assert_eq!(
+            encode_ipv4_options(&vec![NoOperation; 41]),
+            Err(Ipv4OptionsError::TooLong)
+        );
+        assert_eq!(
+            encode_ipv4_options(&vec![NoOperation; 40]).unwrap().len(),
+            40
+        );
+        assert_eq!(
+            encode_ipv4_options(&[Unknown {
+                kind: 222,
+                data: vec![0; 39]
+            }]),
+            Err(Ipv4OptionsError::TooLong)
+        );
+    }
+
+    #[test]
+    fn option_header_lengths_padding_and_checksums_include_the_full_header() {
+        let options = [Ipv4Option::RecordRoute {
+            pointer: 4,
+            routes: vec![Address::new(192, 0, 2, 1)],
+        }];
+        let mut repr = packet_repr();
+        repr.options = OptionBytes::new(&encode_ipv4_options(&options).unwrap());
+        let mut bytes = vec![0xa5; repr.buffer_len() + repr.payload_len];
+        repr.emit(&mut Packet::new_unchecked(&mut bytes));
+        let packet = Packet::new_checked(&bytes).unwrap();
+        assert_eq!(packet.header_len(), 28);
+        assert_eq!(packet.total_len(), 32);
+        assert!(packet.verify_checksum());
+        assert_eq!(bytes[27], 0);
+        assert_eq!(Repr::parse(&packet).unwrap(), repr);
+        assert_eq!(
+            packet.options_iter().unwrap().collect::<Vec<_>>(),
+            vec![options[0].clone(), Ipv4Option::EndOfList]
+        );
+    }
 
     static PACKET_BYTES: [u8; 30] = [
         0x45, 0x00, 0x00, 0x1e, 0x01, 0x02, 0x62, 0x03, 0x1a, 0x01, 0xd5, 0x6e, 0x11, 0x12, 0x13,
@@ -466,6 +1066,8 @@ pub(crate) mod test {
             next_header: Protocol::Icmp,
             payload_len: 4,
             hop_limit: 64,
+            options: OptionBytes::EMPTY,
+            wire_dst: None,
         }
     }
 
