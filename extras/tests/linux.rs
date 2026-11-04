@@ -238,7 +238,18 @@ fn cookie_connection_restores_timestamp_and_window_scale() {
         );
         use fictionet::stdlib::network::ConnectionExt;
         connection.write_all(&cx, b"hello").await?;
+        // Restoring the smaller SYN window prompts an update to the full
+        // receive buffer. Check it separately from the application's data.
+        let update = receive(&mut raw, &cx).await;
+        assert_eq!(update[13], 16);
+        assert_eq!(sequence(&update), sequence(&syn_ack).wrapping_add(1));
+        assert_eq!(update.len(), usize::from(update[12] >> 4) * 4);
+        assert_eq!(&update[20..24], &[1, 1, 8, 10]);
+        assert!(timestamp(&update).wrapping_sub(ts) < 64);
+        assert_eq!(&update[14..16], &2048u16.to_be_bytes());
         let data = receive(&mut raw, &cx).await;
+        assert_eq!(sequence(&data), sequence(&syn_ack).wrapping_add(1));
+        assert_eq!(&data[usize::from(data[12] >> 4) * 4..], b"hello");
         assert_eq!(&data[20..24], &[1, 1, 8, 10]);
         assert!(timestamp(&data).wrapping_sub(ts) < 64);
         assert_eq!(&data[14..16], &2048u16.to_be_bytes());

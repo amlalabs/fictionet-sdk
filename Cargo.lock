@@ -1481,6 +1481,7 @@ dependencies = [
  "cssparser 0.38.0",
  "fictionet",
  "fictionet-host",
+ "fictionet-test-support",
  "flate2",
  "html5ever 0.40.1",
  "http",

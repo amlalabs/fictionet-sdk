@@ -293,8 +293,8 @@ fn a_listener_without_an_answer_adds_nothing() {
         let kinds: Vec<u8> = options_of(t).iter().map(|o| o.0).collect();
         assert_eq!(
             kinds,
-            [2, 4, 8, 1, 3],
-            "MSS, SACK-Permitted, Timestamps, No-Operation and Window Scale, as Linux lays them out"
+            [2, 3, 4, 8],
+            "MSS, Window Scale, SACK-Permitted and Timestamps without alignment padding"
         );
         raw.send(segment(4000, 1001, seq_of(t).wrapping_add(1), ACK, &[]));
         let conn = listener.accept(&fcx).await?;
@@ -331,10 +331,9 @@ fn an_endpoint_s_own_syn_reaches_the_other_endpoint() {
                 *syn,
                 [
                     TcpOption::MaxSegmentSize(1460),
+                    TcpOption::WindowScale(_),
                     TcpOption::SackPermitted,
                     TcpOption::Timestamps { .. },
-                    TcpOption::NoOperation,
-                    TcpOption::WindowScale(_),
                 ]
             ),
             "{syn:?}"
@@ -419,11 +418,43 @@ fn timestamps_and_ecn_are_negotiated_and_timestamps_advance() {
     });
 }
 
+/// A test codec binds the tuple and initial sequence, retaining no extensions.
+/// Core supplies the handshake mechanics; worlds supply cookie formats.
+#[derive(Debug)]
+struct TestCookies;
+impl tcp::SynCookies for TestCookies {
+    fn issue(&self, input: &tcp::CookieInput<'_>) -> tcp::CookieReply {
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, input.key);
+        let message = format!("{} {} {}", input.local, input.remote, input.sequence);
+        let tag = ring::hmac::sign(&key, message.as_bytes());
+        tcp::CookieReply {
+            sequence: u32::from_be_bytes(tag.as_ref()[..4].try_into().unwrap()),
+            options: Vec::new(),
+            ecn: false,
+        }
+    }
+    fn validate(&self, input: &tcp::CookieInput<'_>, cookie: u32) -> Option<tcp::CookieState> {
+        (self.issue(input).sequence == cookie).then_some(tcp::CookieState {
+            mss: 1460,
+            scale: None,
+            sack: false,
+            ecn: false,
+            timestamp: None,
+        })
+    }
+}
+fn cookie_options() -> tcp::Options {
+    tcp::Options::default().settings(tcp::Settings {
+        cookies: Some(&TestCookies),
+        ..tcp::Settings::default()
+    })
+}
+
 #[test]
-fn cookies_decline_timestamps_and_ecn_without_retaining_state() {
+fn configured_cookies_decline_timestamps_and_ecn_without_retaining_state() {
     world(Duration::from_secs(10), |fcx| async move {
         let (mut raw, side) = pair();
-        let server = tcp::endpoint_with(&fcx, side, ip(SERVER), tcp::Options::default().backlog(1));
+        let server = tcp::endpoint_with(&fcx, side, ip(SERVER), cookie_options().backlog(1));
         let mut listener = server.listen(80)?;
         for port in [4000, 4001] {
             raw.send(segment(port, 0, 0, SYN | 0xc0, &LINUX_SYN));
@@ -528,7 +559,7 @@ fn a_service_sees_the_syn_options_in_its_conn_info() {
 }
 
 /// Asserts that `t` is the RST that answers a SYN with sequence number
-/// 1000 and no payload (RFC 9293 section 3.10.7.1), as Linux sends it:
+/// 1000 and no payload (RFC 9293 section 3.10.7.1):
 /// sequence number 0, an ACK of the SYN, window 0, and `options` as its
 /// only options.
 fn assert_syn_reset(t: &[u8], options: &[TcpOption]) {
@@ -624,7 +655,7 @@ fn join_area() -> Vec<u8> {
 }
 
 /// An MP_JOIN SYN refused as an MPTCP listener refuses one: a RST that
-/// carries MP_TCPRST, formed as RFC 9293 and Linux form the reset for a
+/// carries MP_TCPRST, formed as RFC 9293 section 3.10.7.1 specifies for a
 /// SYN. The attempt never reaches accept, and the next one is answered.
 #[test]
 fn a_refused_attempt_gets_a_rst_with_the_answer_s_options() {
@@ -705,7 +736,7 @@ impl Answer for RefuseMarkedAcks {
 }
 
 /// A connection refused at the ACK that completes its handshake gets a RST
-/// in answer to that ACK, as Linux refuses an MP_JOIN at its third ACK, and
+/// in answer to that ACK (RFC 8684 sections 3.2 and 3.6), and
 /// never reaches accept. One taken keeps the ACK's options.
 #[test]
 fn an_answer_refuses_a_connection_at_its_ack() {
@@ -838,8 +869,7 @@ fn an_answer_drops_at_the_ack_or_stamps_the_segments() {
         conn.write_all(&fcx, b"hi").await?;
         let data = next(&fcx, &mut raw).await.expect("data");
         let t = tcp_of(&data);
-        // Timestamps after two No-Operations, as Linux pads them.
-        let nop = || (1, Vec::new());
+        // RFC 9293 permits options on any octet boundary.
         let timestamp = || {
             let mut value = (fcx.now().since_start().as_millis() as u32)
                 .to_be_bytes()
@@ -847,10 +877,7 @@ fn an_answer_drops_at_the_ack_or_stamps_the_segments() {
             value.extend_from_slice(&1u32.to_be_bytes());
             (8, value)
         };
-        assert_eq!(
-            options_of(t),
-            [nop(), nop(), timestamp(), (254, vec![0, 2])]
-        );
+        assert_eq!(options_of(t), [timestamp(), (254, vec![0, 2])]);
         raw.send(segment_with(
             4001,
             1001,
@@ -861,10 +888,7 @@ fn an_answer_drops_at_the_ack_or_stamps_the_segments() {
         ));
         assert_eq!(read_n(&fcx, &mut conn, 5).await?, b"hello");
         let ack = next(&fcx, &mut raw).await.expect("an ACK");
-        assert_eq!(
-            options_of(tcp_of(&ack)),
-            [nop(), nop(), timestamp(), (254, vec![0, 0])]
-        );
+        assert_eq!(options_of(tcp_of(&ack)), [timestamp(), (254, vec![0, 0])]);
         assert_eq!(*taken.lock().unwrap(), [0, 5]);
         Ok(())
     });
@@ -892,10 +916,8 @@ fn options_reads_any_bytes() {
     assert_eq!(tcp::options(&short), Err(tcp::OptionsError::Header));
 }
 
-/// A SYN whose options Linux reads only in part is answered as Linux
-/// answers it: an option whose Length runs past the header ends the list,
-/// and a known kind of another length is ignored. The connection keeps the
-/// options that read.
+/// Illegal lengths get the reset suggested by RFC 9293 section 3.1. An
+/// unknown option with a readable length is ignored without losing the SYN.
 #[test]
 fn a_syn_with_a_malformed_option_is_answered() {
     world(Duration::from_secs(10), |fcx| async move {
@@ -904,19 +926,29 @@ fn a_syn_with_a_malformed_option_is_answered() {
         let mut listener = server.listen(80)?;
         let runs_past = [2, 4, 5, 0xb4, 30, 12, 0x01, 0x81];
         let odd_mss = [2, 3, 5, 0xb4];
-        for (port, area) in [(4000, &runs_past[..]), (4001, &odd_mss[..])] {
+        let unknown = [2, 3, 5, 0];
+        for (port, area) in [
+            (4000, &runs_past[..]),
+            (4001, &odd_mss[..]),
+            (4002, &unknown[..]),
+        ] {
             raw.send(segment(port, 1000, 0, SYN, area));
-            let syn_ack = next(&fcx, &mut raw).await.expect("a SYN-ACK");
-            let t = tcp_of(&syn_ack);
-            assert_eq!(t[13], SYN | ACK);
-            raw.send(segment(port, 1001, seq_of(t).wrapping_add(1), ACK, &[]));
+            let reply = next(&fcx, &mut raw).await.expect("an answer");
+            let t = tcp_of(&reply);
+            if port < 4002 {
+                assert_syn_reset(t, &[]);
+                assert_eq!(transport_checksum(ip(SERVER), ip(PEER), 6, t), 0);
+            } else {
+                assert_eq!(t[13], SYN | ACK);
+                raw.send(segment(port, 1001, seq_of(t).wrapping_add(1), ACK, &[]));
+            }
         }
-        let first = listener.accept(&fcx).await?;
-        assert_eq!(
-            first.handshake().unwrap().syn.as_deref(),
-            Some(&[TcpOption::MaxSegmentSize(1460)][..])
-        );
         let second = listener.accept(&fcx).await?;
+        assert_eq!(
+            second.peer_addr().port(),
+            4002,
+            "the malformed SYNs opened nothing"
+        );
         assert_eq!(
             second.handshake().unwrap().syn.as_deref(),
             Some(
@@ -930,9 +962,9 @@ fn a_syn_with_a_malformed_option_is_answered() {
     });
 }
 
-/// SYNs with every kind of broken or odd option list each get a
-/// well-formed SYN-ACK, as Linux answers them, the answer sees what was
-/// read, and the listener still accepts afterwards.
+/// Every SYN gets a well-formed answer: a reset for illegal option lengths,
+/// otherwise a SYN-ACK. Rejected options never reach the listener callback,
+/// and the listener still accepts afterwards.
 #[test]
 fn hostile_syn_options_get_well_formed_answers() {
     world(Duration::from_secs(30), |fcx| async move {
@@ -952,9 +984,10 @@ fn hostile_syn_options_get_well_formed_answers() {
                 .wrapping_add(1442695040888963407);
             (state >> 33) as u8
         };
-        // Ports whose SYN got a SYN-ACK. Earlier ones may be resent while
+        // Ports whose SYN got an answer. Earlier SYN-ACKs may be resent while
         // later SYNs go out.
         let mut answered = HashSet::new();
+        let mut accepted = HashSet::new();
         for i in 0..200u16 {
             let len = 4 * (byte() as usize % 11);
             let options: Vec<u8> = (0..len)
@@ -967,15 +1000,29 @@ fn hostile_syn_options_get_well_formed_answers() {
             raw.send(segment(10_000 + i, 1000, 0, SYN, &options));
             while let Some(reply) = timeout(&fcx, Duration::from_millis(50), raw.recv(&fcx)).await {
                 let t = tcp_of(&reply?).to_vec();
-                assert_eq!(t[13], SYN | ACK);
                 let port = dport_of(&t);
+                if t[13] == SYN | ACK {
+                    accepted.insert(port);
+                } else {
+                    assert_syn_reset(&t, &[]);
+                }
+                assert_eq!(transport_checksum(ip(SERVER), ip(PEER), 6, &t), 0);
                 assert!((10_000..=10_000 + i).contains(&port));
                 options_of(&t);
                 answered.insert(port);
             }
         }
         assert_eq!(answered.len(), 200, "every SYN is answered");
-        assert_eq!(seen.lock().unwrap().len(), 200);
+        assert_eq!(
+            accepted.len(),
+            31,
+            "the readable option lists in this corpus"
+        );
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            31,
+            "only accepted SYNs reach the callback"
+        );
 
         raw.send(segment(4000, 1000, 0, SYN, &LINUX_SYN));
         let syn_ack = loop {
@@ -1004,7 +1051,7 @@ fn hostile_syn_options_get_well_formed_answers() {
 fn syns_past_the_backlog_get_syn_cookies() {
     world(Duration::from_secs(10), |fcx| async move {
         let (mut raw, side) = pair();
-        let options = tcp::Options::default().backlog(2);
+        let options = cookie_options().backlog(2);
         let server = tcp::endpoint_with(&fcx, side, ip(SERVER), options);
         let mut listener = server.listen(80)?;
         let added = TcpOption::Unknown {
@@ -1026,7 +1073,7 @@ fn syns_past_the_backlog_get_syn_cookies() {
             assert_eq!(ack_of(t), 1001);
             let kinds: Vec<u8> = options_of(t).iter().map(|o| o.0).collect();
             if dport_of(t) < 5002 {
-                assert_eq!(kinds, [2, 4, 8, 1, 3, 253], "a full SYN-ACK");
+                assert_eq!(kinds, [2, 3, 4, 8, 253], "a full SYN-ACK");
             } else {
                 assert_eq!(
                     options_of(t),
@@ -1081,32 +1128,42 @@ fn syns_past_the_backlog_get_syn_cookies() {
     });
 }
 
-/// A handshake whose last ACK never comes gets six SYN-ACKs, as from
-/// Linux, then is dropped without a RST.
+/// RFC 6298 retransmission backoff continues until the configured handshake
+/// deadline, then the attempt is dropped without a RST.
 #[test]
 fn an_unanswered_handshake_is_dropped_quietly() {
-    world(Duration::from_secs(10), |fcx| async move {
-        let (mut raw, side) = pair();
-        let server = tcp::endpoint(&fcx, side, ip(SERVER));
-        let mut listener = server.listen(80)?;
-        let start = fcx.now();
-        raw.send(segment(4000, 1000, 0, SYN, &LINUX_SYN));
-        let mut sent = Vec::new();
-        while let Some(p) = timeout(&fcx, Duration::from_secs(100), raw.recv(&fcx)).await {
-            let p = p?;
-            assert_eq!(tcp_of(&p)[13], SYN | ACK, "only SYN-ACKs");
-            sent.push((fcx.now().since_start() - start.since_start()).as_secs());
-        }
-        assert_eq!(sent, [0, 1, 3, 7, 15, 31]);
-        // The attempt is gone: its ACK now finds nothing.
-        raw.send(segment(4000, 1001, 1, ACK, &[]));
-        let reply = next(&fcx, &mut raw).await.expect("a RST");
-        assert_eq!(tcp_of(&reply)[13] & RST, RST);
-        assert!(
-            timeout(&fcx, Duration::from_secs(1), listener.accept(&fcx))
-                .await
-                .is_none()
-        );
-        Ok(())
-    });
+    for (seconds, expected) in [(15, vec![0, 1, 3, 7]), (120, vec![0, 1, 3, 7, 15, 31, 63])] {
+        world(Duration::from_secs(10), move |fcx| async move {
+            let (mut raw, side) = pair();
+            let server = tcp::endpoint_with(
+                &fcx,
+                side,
+                ip(SERVER),
+                tcp::Options::default().settings(tcp::Settings {
+                    handshake_timeout: Duration::from_secs(seconds),
+                    ..tcp::Settings::default()
+                }),
+            );
+            let mut listener = server.listen(80)?;
+            let start = fcx.now();
+            raw.send(segment(4000, 1000, 0, SYN, &LINUX_SYN));
+            let mut sent = Vec::new();
+            while let Some(p) = timeout(&fcx, Duration::from_secs(100), raw.recv(&fcx)).await {
+                let p = p?;
+                assert_eq!(tcp_of(&p)[13], SYN | ACK, "only SYN-ACKs");
+                sent.push((fcx.now().since_start() - start.since_start()).as_secs());
+            }
+            assert_eq!(sent, expected);
+            // The attempt is gone: its ACK now finds nothing.
+            raw.send(segment(4000, 1001, 1, ACK, &[]));
+            let reply = next(&fcx, &mut raw).await.expect("a RST");
+            assert_eq!(tcp_of(&reply)[13] & RST, RST);
+            assert!(
+                timeout(&fcx, Duration::from_secs(1), listener.accept(&fcx))
+                    .await
+                    .is_none()
+            );
+            Ok(())
+        });
+    }
 }

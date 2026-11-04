@@ -346,8 +346,7 @@ pub enum AckAnswer {
     /// 3.2 and 3.6). The connection never reaches `accept`.
     Refuse(Vec<TcpOption>),
     /// Drop the ACK and forget the connection without sending anything,
-    /// as Linux drops an ACK that returns a SYN cookie when it cannot set
-    /// up what the ACK asks for. The connection never reaches `accept`.
+    /// as requested by the listener. The connection never reaches `accept`.
     Drop,
 }
 
@@ -362,7 +361,7 @@ pub enum AckAnswer {
 pub trait Answer: Send {
     /// How to answer `syn`. A socket keeps the attempt while the backlog
     /// has room, and a copy of the SYN does not ask again. Past the
-    /// backlog the SYN gets a SYN cookie and nothing is kept (see
+    /// backlog a configured codec can issue a SYN cookie without keeping state (see
     /// [`Options::backlog`]), so each copy of the SYN asks again, and an
     /// answer that draws something new, such as a key, gives each copy a
     /// different one.
@@ -370,8 +369,8 @@ pub trait Answer: Send {
 
     /// What the SYN and SYN-ACK of `handshake`, answered with a SYN cookie,
     /// carried, if this listener kept that itself when it answered the SYN,
-    /// as Linux keeps an MP_JOIN's (RFC 8684 section 3.2). Asked once, when
-    /// the ACK that returns the cookie arrives from `from`, before
+    /// such as MP_JOIN authentication state (RFC 8684 section 3.2). Asked
+    /// once, when the ACK that returns the cookie arrives from `from`, before
     /// [`ack`](Answer::ack). What it returns becomes the handshake's `syn`
     /// and `syn_ack`. The default keeps nothing.
     fn cookie(&self, from: SocketAddr, handshake: &Handshake) -> Option<Kept> {
@@ -570,8 +569,7 @@ impl Arrived {
     /// connection (RFC 9293 section 3.10.7.1): with the sequence number
     /// the segment acknowledged, or with sequence number 0 and an ACK of
     /// the segment when it had no ACK. It has window 0 and `options`, whole
-    /// options from [`encode`], as its only options, as a Linux host sends
-    /// one (tcp_v4_send_reset).
+    /// options from [`encode`], as its only options.
     fn reset(&self, options: &[u8]) -> Vec<u8> {
         let (seq, ack) = match self.ack {
             Some(ack) => (ack, None),
@@ -717,7 +715,8 @@ pub struct Settings {
     pub orphan_timeout: Duration,
     /// Answer a SYN with a reset when the accept queue is full.
     pub reset_full_queue: bool,
-    /// Accept the valid prefix of a malformed option list.
+    /// Accept the valid prefix of a malformed option list. Otherwise, answer
+    /// illegal option lengths with a reset, as suggested by RFC 9293 section 3.1.
     pub ignore_malformed_options: bool,
 }
 
@@ -1683,6 +1682,25 @@ impl State {
             &ip.dst.into(),
             self.settings.ignore_malformed_options,
         ) else {
+            // A valid header with an unreadable option suffix gets the reset
+            // suggested by RFC 9293 section 3.1. Parsing the prefix still
+            // validates the checksum, header length and control flags. No
+            // rejected segment may change connection bookkeeping.
+            if unicast(ip.src)
+                && let Ok(repr) = TcpRepr::parse_with(
+                    &TcpPacket::new_unchecked(t),
+                    &ip.src.into(),
+                    &ip.dst.into(),
+                    true,
+                )
+                && t[13] & 4 == 0
+            {
+                let src = SocketAddr::new(ip.src, u16::from_be_bytes([t[0], t[1]]));
+                let dst = SocketAddr::new(ip.dst, u16::from_be_bytes([t[2], t[3]]));
+                self.dev
+                    .tx
+                    .push(Arrived::of(src, dst, t, repr.payload.len()).reset(&[]));
+            }
             return false;
         };
         // A host discards what comes from an address that is not one
@@ -2570,8 +2588,7 @@ impl Listener {
     ///
     /// A refusal's RST answers the segment refused, as RFC 9293 section
     /// 3.10.7.1 forms a reset, with window 0 and the refusal's options as
-    /// its only options, as a Linux host sends one. The options either
-    /// returns must fit in [`SYN_OPTIONS_ROOM`] bytes and read back as
+    /// its only options. The options either returns must fit in [`SYN_OPTIONS_ROOM`] bytes and read back as
     /// written: an [`Unknown`](TcpOption::Unknown) option may not have kind
     /// 0 or 1 or the bytes of a known option, and SACK has one to four
     /// blocks. Otherwise an accepted attempt gets a RST, and a refusal a RST
@@ -2798,9 +2815,8 @@ impl GoneWatch {
     /// keepalive, and how often it sends one after that, as a socket's
     /// SO_KEEPALIVE and TCP_KEEPIDLE do. `None` sends none. A connection
     /// starts with one every 45 seconds, so a peer that is gone is noticed;
-    /// a Linux server sends none unless it asked for them, and then the
-    /// first after two hours. Works after the connection itself was handed
-    /// on. Does nothing once its handle was dropped.
+    /// this interval is a world setting. Works after the connection itself
+    /// was handed on. Does nothing once its handle was dropped.
     pub fn set_keep_alive(&self, interval: Option<Duration>) {
         let mut st = self.shared.state.lock();
         if st.conns.get(&self.handle).is_some_and(|c| !c.orphaned) {

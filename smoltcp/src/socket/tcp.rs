@@ -2215,7 +2215,11 @@ impl<'a> Socket<'a> {
         {
             self.ack_delay_timer = match self.ack_delay_timer {
                 AckDelayTimer::Idle => AckDelayTimer::Waiting(cx.now() + ack_delay),
-                AckDelayTimer::Waiting(_) if self.immediate_ack_to_transmit() => {
+                AckDelayTimer::Waiting(_)
+                    if self.immediate_ack_to_transmit(
+                        ip_repr.payload_len() - TCP_HEADER_LEN - repr.payload.len(),
+                    ) =>
+                {
                     AckDelayTimer::Immediate
                 }
                 timer @ AckDelayTimer::Waiting(_) => timer,
@@ -2308,7 +2312,7 @@ impl<'a> Socket<'a> {
     /// sent: its SYN or SYN-ACK, data, its FIN, or, with keep-alive on, a
     /// keep-alive. Only then does the timeout run, as
     /// [`set_timeout`](Socket::set_timeout) says. An idle connection
-    /// with neither waits for nothing, as on Linux.
+    /// with neither has no unacknowledged data (RFC 9293 section 3.9.1.2).
     fn waits_for_answer(&self) -> bool {
         match self.state {
             State::SynSent
@@ -2430,10 +2434,15 @@ impl<'a> Socket<'a> {
     /// 2*RMSS bytes of new data (where RMSS is the MSS specified by the TCP endpoint receiving the
     /// segments to be acknowledged, or the default value if not specified) (SHLD-19)."
     ///
-    fn immediate_ack_to_transmit(&self) -> bool {
+    fn immediate_ack_to_transmit(&self, options_len: usize) -> bool {
         if let Some(remote_last_ack) = self.remote_last_ack {
+            // Options reduce a full segment's payload (RFC 6691 section 2).
+            // Waiting for two unadjusted MSS values can stall a sender after
+            // two full segments, contrary to RFC 5681 section 4.2.
             let threshold = self
                 .remote_mss
+                .saturating_sub(options_len)
+                .max(1)
                 .saturating_mul(usize::from(self.settings.ack_segments.max(1)));
             let threshold = threshold.saturating_sub(usize::from(self.settings.ack_inclusive));
             remote_last_ack + threshold < self.remote_seq_no + self.rx_buffer.len()
@@ -10277,7 +10286,7 @@ pub(crate) mod test {
 
     /// An idle connection with nothing to send and no keep-alive waits for
     /// no answer, so it does not time out however long the peer is quiet,
-    /// as on Linux. With keep-alive on it does.
+    /// per RFC 9293 section 3.9.1.2. With keep-alive on it does.
     #[test]
     fn test_idle_without_keep_alive_does_not_time_out() {
         let mut s = socket_established();
@@ -10811,6 +10820,50 @@ pub(crate) mod test {
             window_len: 61,
             ..RECV_TEMPL
         }));
+    }
+
+    #[test]
+    fn test_two_full_segments_with_options_are_acked_without_delay() {
+        for timestamps in [false, true] {
+            let mut s = socket_established();
+            s.remote_mss = 32;
+            s.set_ack_delay(Some(ACK_DELAY_DEFAULT));
+            let timestamp = timestamps.then_some(TcpTimestampRepr::new(500, 0));
+            if timestamps {
+                s.set_tsval_generator(Some(|_| 1));
+            }
+            // Include an unknown option as well: all header bytes reduce the
+            // payload, regardless of whether the receiver understands them.
+            let extra = [253, 4, 0, 0];
+            let count = if timestamps { 16 } else { 28 };
+            let payload = vec![42; count];
+            for index in 0..2 {
+                send!(
+                    s,
+                    TcpRepr {
+                        seq_number: REMOTE_SEQ + 1 + index * count,
+                        ack_number: Some(LOCAL_SEQ + 1),
+                        timestamp,
+                        extra: &extra,
+                        payload: &payload,
+                        ..SEND_TEMPL
+                    }
+                );
+                if index == 0 {
+                    recv_nothing!(s);
+                }
+            }
+            recv!(
+                s,
+                [TcpRepr {
+                    seq_number: LOCAL_SEQ + 1,
+                    ack_number: Some(REMOTE_SEQ + 1 + 2 * count),
+                    window_len: (64 - 2 * count) as u16,
+                    timestamp: timestamps.then_some(TcpTimestampRepr::new(1, 500)),
+                    ..RECV_TEMPL
+                }]
+            );
+        }
     }
 
     #[test]

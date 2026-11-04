@@ -1026,8 +1026,18 @@ fn lost_final_ack(simultaneous: bool) {
             }
             false
         });
-        let ea = tcp::endpoint(&fcx, a, ip(A));
-        let eb = tcp::endpoint(&fcx, d, ip(B));
+        // Use a five-second simulated MSL to exercise TIME-WAIT expiry and
+        // recovery within this scenario. The default two-MSL lifetime is
+        // covered by the transport tests.
+        let options = tcp::Options::default().settings(tcp::Settings {
+            socket: tcp::SocketSettings {
+                time_wait: Duration::from_secs(10).into(),
+                ..tcp::SocketSettings::default()
+            },
+            ..tcp::Settings::default()
+        });
+        let ea = tcp::endpoint_with(&fcx, a, ip(A), options);
+        let eb = tcp::endpoint_with(&fcx, d, ip(B), options);
         let mut listener = eb.listen(80)?;
         let mut client = ea.connect(&fcx, SocketAddr::new(ip(B), 80)).await?;
         let mut server = listener.accept(&fcx).await?;

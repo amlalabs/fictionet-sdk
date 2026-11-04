@@ -94,8 +94,13 @@ impl Reno {
         self.in_fast_recovery = false
     }
 
+    /// Sets the MSS learned during the handshake and the initial window.
     pub(crate) fn set_mss(&mut self, mss: usize) {
         self.mss = mss;
+        // RFC 5681 section 3.1 allows two full segments initially. Keeping
+        // the pre-handshake byte count can leave less than two segments in
+        // flight and force a sender to wait for the delayed-ACK timer.
+        self.cwnd = 2 * mss;
     }
 
     pub(crate) fn set_remote_window(&mut self, remote_window: usize) {
@@ -110,6 +115,17 @@ mod test {
     use super::*;
 
     const MSS: usize = 1024;
+
+    #[test]
+    fn initial_window_uses_the_negotiated_mss() {
+        for mss in [536, 1440, 1460, 8940] {
+            let mut reno = Reno::new();
+            reno.set_mss(mss);
+            assert_eq!(reno.window(), 2 * mss);
+            reno.on_ack(mss);
+            assert_eq!(reno.window(), 3 * mss);
+        }
+    }
 
     #[test]
     fn congestion_avoidance_works() {

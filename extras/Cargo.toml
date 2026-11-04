@@ -47,4 +47,5 @@ zstd = "0.14"
 tantivy = { version = "0.27", default-features = false, features = ["mmap", "lz4-compression", "zstd-compression", "stemmer"] }
 
 [dev-dependencies]
+fictionet-test-support = { path = "../tests/support" }
 axum = { version = "0.8", default-features = false, features = ["json", "http1", "tokio"] }
