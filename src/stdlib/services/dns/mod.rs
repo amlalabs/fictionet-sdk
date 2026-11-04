@@ -15,10 +15,10 @@
 //! which answers clients from local zones, its cache, and the servers it
 //! asks, and validates what it learns. [`memory`] drives engines with no
 //! runtime: servers in memory, recorded exchanges, and a virtual clock.
-//! A server that learns its zone data from real servers
-//! asks one of them a typed [`Lookup`] for a fact it does not hold; its
-//! driver hands back what came of it ([`Looked`]), which is filed as
-//! records. No message from a real server reaches a client.
+//! An authoritative server may ask another server of a zone a typed
+//! [`Lookup`] for a fact it does not hold; its driver hands back what
+//! came of it ([`Looked`]), which is filed as records. No message from
+//! another server reaches a client.
 //!
 //! Every engine has the shape of [`Engine`]: a driver hands it
 //! [inputs](Input) with the time, and takes [actions](Action) and

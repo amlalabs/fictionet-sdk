@@ -1,4 +1,4 @@
-//! Where a world's lookups of real servers go: the one asynchronous step
+//! Where a world's lookups of other servers go: the one asynchronous step
 //! of serving DNS, at the edge, outside the engines.
 
 use std::future::{Future, ready};
@@ -8,13 +8,13 @@ use std::sync::Arc;
 use fictionet::Cx;
 use fictionet::stdlib::services::dns::{Looked, Lookup};
 
-/// What real servers answer the lookups of a world's servers: the
+/// What the servers asked answer the lookups of a world's servers: the
 /// internet's servers, recorded responses, or answers a world writes
 /// itself.
 ///
 /// [`Authoritative`](super::Authoritative) puts its authority's
-/// [lookups](Lookup) here, such as a learned zone's question to a real
-/// server of the zone, and files what comes back as records. An upstream
+/// [lookups](Lookup), its questions to a server of a zone, here, and
+/// files what comes back as records. An upstream
 /// never answers a client: what it gives is data, and the world's own
 /// engines build every reply from it.
 ///

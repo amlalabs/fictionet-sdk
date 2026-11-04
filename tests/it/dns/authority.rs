@@ -21,10 +21,10 @@ use fictionet::stdlib::protocols::dns::rr::rdata::{A, CNAME, NS, SOA, TXT};
 use fictionet::stdlib::protocols::dns::rr::{
     DNSClass, LowerName, Name, RData, Record, RecordSet, RecordType,
 };
-use fictionet::stdlib::protocols::dns::{Ede, EdeCode, Nsid, Request, Response};
+use fictionet::stdlib::protocols::dns::{Ede, EdeCode, Nsid, Parsed, Request, Response};
 use fictionet::stdlib::services::dns::authority::{
     Authority, AuthorityEngine, ChaosZone, Identity, Observe, Overlay, ServerConfig, Step, Zones,
-    bare_reply,
+    bare_reply, respond_from_zones,
 };
 use fictionet::stdlib::services::dns::zone::{Fact, Lazy, Transparent, Zone, ZoneData};
 use fictionet::stdlib::services::dns::{
@@ -618,6 +618,195 @@ fn an_unknown_fact_gives_servfail_never_a_negative() {
     assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
     assert!(reply.answers.is_empty());
     assert!(reply.authorities.is_empty());
+}
+
+// The answer of hosted zones, with an authority's own step for what
+// they do not know.
+
+/// A request for `qname` `qtype` over UDP.
+fn request(qname: &str, qtype: RecordType) -> Request {
+    let message = query(qname, qtype, |_| {});
+    match Request::parse(&message.to_vec().unwrap(), Transport::Udp) {
+        Parsed::Request(request) => request,
+        other => panic!("not a request: {other:?}"),
+    }
+}
+
+/// `lazy.test.`, which holds `a.lazy.test. CNAME b.lazy.test.` and knows
+/// no other name.
+fn lazy() -> Arc<dyn ZoneData> {
+    Arc::new(Lazy::new(
+        name("lazy.test."),
+        soa("lazy.test."),
+        rrset("lazy.test.", 3600, vec![ns("lazy.test.")]),
+        3600,
+        |asked: &LowerName| {
+            if *asked == LowerName::new(&name("a.lazy.test.")) {
+                let target = RData::CNAME(CNAME(name("b.lazy.test.")));
+                Fact::Present(vec![rrset("a.lazy.test.", 300, vec![target])])
+            } else {
+                Fact::Unknown
+            }
+        },
+    ))
+}
+
+/// One call of the unknown step: the apex of the zone whose view did not
+/// know a fact, the question asked in that zone, and the name the answer
+/// had reached.
+type Unknown = (LowerName, Query, LowerName);
+
+/// What [`respond_from_zones`] over `zones` takes for `qname` `qtype`,
+/// when an unknown fact is looked up at [`LOCAL`] in the zone whose view
+/// did not know it, and every call of that step.
+fn from_zones(zones: &[Arc<dyn ZoneData>], qname: &str, qtype: RecordType) -> (Step, Vec<Unknown>) {
+    let calls = Mutex::new(Vec::new());
+    let unknown = |zone: &dyn ZoneData, question: &Query, reached: LowerName| {
+        let call = (zone.apex().clone(), question.clone(), reached);
+        calls.lock().unwrap().push(call);
+        Step::Need(Lookup::new(local(), zone.apex().clone(), question))
+    };
+    let step = respond_from_zones(
+        zones,
+        &request(qname, qtype),
+        &ServerConfig::generic(),
+        &unknown,
+    );
+    (step, calls.into_inner().unwrap())
+}
+
+/// The call of the unknown step for `qname` `qtype` asked in the zone at
+/// `zone`, whose answer reached `reached`.
+fn unknown_in(zone: &str, qname: &str, qtype: RecordType, reached: &str) -> Unknown {
+    (
+        LowerName::new(&name(zone)),
+        Query::query(name(qname), qtype),
+        LowerName::new(&name(reached)),
+    )
+}
+
+/// Where a hosted zone's view does not know a fact the reply needs, the
+/// step is the authority's, called with that zone, the question, and the
+/// name the answer reached, which a CNAME inside the zone moves on. A
+/// zone that knows every fact replies without it.
+#[test]
+fn an_unknown_fact_takes_the_authoritys_own_step() {
+    let hosted = [lazy(), Arc::new(example()) as Arc<dyn ZoneData>];
+
+    let (step, calls) = from_zones(&hosted, "www.example.test.", RecordType::A);
+    let Step::Reply(reply) = step else {
+        panic!("a complete zone replies, got {step:?}");
+    };
+    assert!(reply.message.metadata.authoritative);
+    assert_eq!(reply.message.answers[0].data, a("192.0.2.10"));
+    assert!(calls.is_empty());
+
+    let (step, calls) = from_zones(&hosted, "www.lazy.test.", RecordType::A);
+    assert_eq!(
+        step,
+        Step::Need(lookup_of("lazy.test.", "www.lazy.test.", RecordType::A))
+    );
+    assert_eq!(
+        calls,
+        [unknown_in(
+            "lazy.test.",
+            "www.lazy.test.",
+            RecordType::A,
+            "www.lazy.test."
+        )]
+    );
+
+    let (step, calls) = from_zones(&hosted, "a.lazy.test.", RecordType::A);
+    assert_eq!(
+        step,
+        Step::Need(lookup_of("lazy.test.", "a.lazy.test.", RecordType::A))
+    );
+    assert_eq!(
+        calls,
+        [unknown_in(
+            "lazy.test.",
+            "a.lazy.test.",
+            RecordType::A,
+            "b.lazy.test."
+        )]
+    );
+}
+
+/// A CNAME or DNAME chain that goes on in another hosted zone (RFC 1034
+/// §4.3.2 step 3a, RFC 6672 §3.2) takes the authority's step in that
+/// zone where its view does not know the target, with the question moved
+/// to the target, and no reply of the chain so far goes out.
+#[test]
+fn a_chain_into_another_hosted_zone_takes_the_step_there() {
+    let example = Zone::from_master(
+        "\
+example. 3600 IN SOA ns.example. hostmaster.example. 1 7200 3600 1209600 300
+example. 3600 IN NS ns.example.
+ns.example. 3600 IN A 192.0.2.53
+alias.example. 300 IN CNAME www.lazy.test.
+d.example. 300 IN DNAME lazy.test.
+",
+        None,
+    )
+    .unwrap();
+    let hosted = [Arc::new(example) as Arc<dyn ZoneData>, lazy()];
+    let want = Step::Need(lookup_of("lazy.test.", "www.lazy.test.", RecordType::A));
+    for qname in ["alias.example.", "www.d.example."] {
+        let (step, calls) = from_zones(&hosted, qname, RecordType::A);
+        assert_eq!(step, want, "{qname}");
+        assert_eq!(
+            calls,
+            [unknown_in(
+                "lazy.test.",
+                "www.lazy.test.",
+                RecordType::A,
+                "www.lazy.test."
+            )],
+            "{qname}"
+        );
+    }
+}
+
+/// DS at a hosted zone's apex is asked of the hosted zone above it first
+/// (RFC 4035 §3.1.4.1), so where that zone does not know the delegation,
+/// the step is taken there and the child is not asked. Every other type
+/// at the apex is the child's.
+#[test]
+fn ds_at_an_apex_takes_the_step_of_an_unknown_parent_first() {
+    let parent = Lazy::new(
+        name("test."),
+        soa("test."),
+        rrset("test.", 3600, vec![ns("ns1.test.")]),
+        3600,
+        |_: &LowerName| Fact::Unknown,
+    );
+    let hosted = [
+        Arc::new(parent) as Arc<dyn ZoneData>,
+        Arc::new(example()) as Arc<dyn ZoneData>,
+    ];
+
+    let (step, calls) = from_zones(&hosted, "example.test.", RecordType::DS);
+    assert_eq!(
+        step,
+        Step::Need(lookup_of("test.", "example.test.", RecordType::DS))
+    );
+    assert_eq!(
+        calls,
+        [unknown_in(
+            "test.",
+            "example.test.",
+            RecordType::DS,
+            "example.test."
+        )]
+    );
+
+    let (step, calls) = from_zones(&hosted, "example.test.", RecordType::NS);
+    let Step::Reply(reply) = step else {
+        panic!("the child replies, got {step:?}");
+    };
+    assert!(reply.message.metadata.authoritative);
+    assert_eq!(reply.message.answers[0].data, ns("ns1.example.test."));
+    assert!(calls.is_empty());
 }
 
 // CHAOS.

@@ -65,8 +65,8 @@ type OnEvent = Arc<dyn Fn(&Event) + Send + Sync>;
 /// machine it runs on.
 ///
 /// Each machine has its own engine, for its own address. The authority's
-/// lookups, such as a learned zone's question to a real server of the
-/// zone, go to the [`upstream`](Self::upstream), and the engine files what
+/// lookups, its questions to a server of a zone, go to the
+/// [`upstream`](Self::upstream), and the engine files what
 /// comes back; without one, no answer comes and the engine gives up on
 /// them at its deadline. A TCP connection stays open after a
 /// response until the client closes it or it is idle for
@@ -104,7 +104,7 @@ impl<A: Authority> Authoritative<A> {
     }
 
     /// Answers for the sessions of `namespace`: when it advances, the
-    /// authority's learned zones drop what they copied, and the engine
+    /// authority drops what its lookups filed, and the engine
     /// abandons its lookups and asks again in the new session.
     pub fn namespace(self, namespace: &Namespace) -> Authoritative<A> {
         Authoritative {

@@ -24,8 +24,8 @@ pub enum Answered {
         name: LowerName,
         /// The name the answer had reached: QNAME, or the target of the
         /// last CNAME or DNAME the chain followed (RFC 1034 §4.3.2 step
-        /// 3a, RFC 6672 §3.2). A learned zone looks this name up with
-        /// QTYPE.
+        /// 3a, RFC 6672 §3.2). An authority that looks up what its data
+        /// lacks asks this name with QTYPE.
         reached: LowerName,
     },
 }
@@ -600,7 +600,7 @@ impl<'v> Walk<'v> {
             // Without DO, only `All` sends the DNSSEC RRsets, unless the
             // name holds no other: it has data, so the answer is no
             // NODATA, and without DO they are RRsets like any other
-            // (RFC 4035 §3.1). A copy filed from an answer to ANY with
+            // (RFC 4035 §3.1). Data filed from an answer to ANY with
             // DO may hold only the name's NSEC RRset (RFC 8482 §4.1).
             let mut shown: Vec<&RecordSet> = sets
                 .iter()

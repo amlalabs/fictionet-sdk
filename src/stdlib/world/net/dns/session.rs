@@ -13,10 +13,10 @@ use fictionet::sync::Mutex;
 /// switches from live pages to a capture. Every program given the
 /// namespace moves to the new session before its next input: each
 /// engine abandons what it was waiting for, a resolver empties its cache
-/// and starts the queries still waiting again, a learned zone drops what
-/// it copied, and nothing that completes for the old session can change
-/// the new one. Guests keep their own caches until the TTLs run out; a
-/// session change cannot reach them.
+/// and starts the queries still waiting again, an authority drops what
+/// its lookups filed, and nothing that completes for the old session can
+/// change the new one. Guests keep their own caches until the TTLs run
+/// out; a session change cannot reach them.
 #[derive(Clone)]
 pub struct Namespace {
     session: Arc<Mutex<Session>>,

@@ -288,8 +288,8 @@ impl<A: Authority> Engine for AuthorityEngine<A> {
         self.lookups.values().map(|pending| pending.deadline).min()
     }
 
-    /// Starts the authority's new session, so its learned zones drop what
-    /// they learned; abandons every pending lookup; and asks the authority
+    /// Starts the authority's new session, so it drops what its lookups
+    /// filed; abandons every pending lookup; and asks the authority
     /// again, with no lookups made, for each request that waited, so it
     /// is answered from the new session. The deadlines of the lookups this
     /// starts count from the time of the last input. An authoritative

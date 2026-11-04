@@ -5,10 +5,9 @@
 //! a guest that asks `198.41.0.4` directly reaches one, and
 //! [`server_host`] does the same for any other [`NameServer`]. What runs
 //! on them, and how far away they are, is the world's
-//! choice: a world with its own root serves zones, and a world that shows
-//! the real internet serves copies of its zones, answered by the world's
-//! own servers, such as the mirror in `fictionet-extras`
-//! (`fictionet_extras::dns::mirror`).
+//! choice: any [`Authority`](fictionet::stdlib::services::dns::authority::Authority)
+//! may run there, such as [`Zones`](fictionet::stdlib::services::dns::authority::Zones)
+//! over the zone from [`root_zone`].
 //!
 //! ```
 //! # use std::sync::Arc;

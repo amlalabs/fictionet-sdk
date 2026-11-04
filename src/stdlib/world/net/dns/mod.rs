@@ -1,6 +1,6 @@
 //! DNS servers as programs on the world's hosts: authoritative servers and
 //! recursive resolvers that answer over real packets, where their lookups
-//! of real servers go, and the namespace a world advances when its session
+//! of other servers go, and the namespace a world advances when its session
 //! changes.
 //!
 //! The engines in [`services::dns`](fictionet::stdlib::services::dns)
@@ -13,10 +13,10 @@
 //! other servers leave the machine as packets, so it resolves through
 //! authoritative programs on other hosts, or through a real server
 //! attached with [`Net::route`](super::Net::route), and the network's
-//! dissector sees each exchange. An authority's lookups, such as a learned
-//! zone's questions to the zone's real servers, go to an [`Upstream`],
-//! and what comes back is filed as records: no real server's message
-//! reaches a client. Raw UDP and TCP routes are the only pass-through.
+//! dissector sees each exchange. An authority's lookups, its questions to
+//! another server of a zone, go to an [`Upstream`], and what comes back
+//! is filed as records: no other server's message reaches a client. Raw
+//! UDP and TCP routes are the only pass-through.
 //!
 //! The network's gateway is such a host: [`Net::gateway`](super::Net::gateway)
 //! says what runs there, and by default it is a resolver with no route to
@@ -26,9 +26,8 @@
 //! come into being as they are looked up.
 //!
 //! [`internet`] has the root servers as hosts at their real addresses,
-//! and the root zone they serve. The mirror that copies the real
-//! hierarchy is in `fictionet-extras` (`fictionet_extras::dns::mirror`). A world
-//! that adds none of them has no internet.
+//! and the root zone they serve. A world that adds none of them has no
+//! internet.
 //!
 //! [`encrypted`] puts DNS over TLS and DNS over HTTPS in front of a
 //! resolver: the same engines and caches answer them as answer port 53.

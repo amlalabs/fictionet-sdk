@@ -15,9 +15,9 @@
 //! | [`Transparent`] | The names with RRsets in the zone it wraps. Every other name is unknown, so a resolver goes on to iterate. |
 //! | [`special`] | The zones a resolver serves itself: `localhost`, the RFC 6303 reverse zones, `home.arpa`, `resolver.arpa`, `service.arpa`, `onion`, `test`, `invalid`, and `local`. |
 //!
-//! A world writes its own [`ZoneData`] for anything else, such as the
-//! copies of real zones in `fictionet-extras`, which file what real
-//! servers answered. [`rrsets`], [`expanded_from`], [`wildcard`], and
+//! A world writes its own [`ZoneData`] for anything else, such as data
+//! that files what other servers answered its lookups. [`rrsets`],
+//! [`expanded_from`], [`wildcard`], and
 //! [`additional_targets`] are the pieces such data reads records with.
 //!
 //! Signing is data too. [`Zone::signed`] signs a complete zone once, with

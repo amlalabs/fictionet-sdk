@@ -97,7 +97,7 @@ impl MemoryNet {
         );
     }
 
-    /// Where the servers' lookups of real servers are answered, at once.
+    /// Where the servers' lookups of other servers are answered, at once.
     /// Without it no lookup is answered, and each server's deadline
     /// decides.
     pub fn upstream(&mut self, upstream: impl FnMut(&Lookup) -> Looked + 'static) {

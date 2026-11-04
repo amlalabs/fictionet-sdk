@@ -2,14 +2,14 @@
 //! engine that runs one.
 //!
 //! An [`Authority`] is world code that decides a server's reply to one
-//! request. An authority whose zone data comes from real servers may
+//! request. An authority whose zone data comes from other servers may
 //! need a fact it does not hold yet: it returns [`Step::Need`] with a
-//! [`Lookup`] of one real server of the zone, and the [`AuthorityEngine`]
+//! [`Lookup`] of one server of the zone, and the [`AuthorityEngine`]
 //! has its driver put the lookup to the upstream, [files](Authority::file)
 //! what came back, and asks the authority again. The engine puts every
 //! reply through the server front of [`ServerConfig`], which gives it the
 //! header and EDNS details real servers send. Every reply is built from
-//! records; no message from a real server is passed on.
+//! records; no message from another server is passed on.
 //!
 //! | Authority | What it answers |
 //! | --- | --- |
@@ -21,9 +21,7 @@
 //! answers one sandbox differently from the others. [`respond_from_zones`]
 //! gives such an authority the answer of [`Zones`] over its own zone
 //! data, with the step it takes for a fact the data does not know, and
-//! [`refuse_transfer`] the refusal of zone transfers. The copies of real
-//! servers in `fictionet-extras` (`fictionet_extras::dns::copies`) are
-//! built that way.
+//! [`refuse_transfer`] the refusal of zone transfers.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -80,14 +78,13 @@ pub trait Authority: Send + Sync + 'static {
     ) -> Step;
 
     /// Files what `lookup`, made in session `generation`, gave into the
-    /// zone it names. An authority without learned zones files nothing.
+    /// zone it names. An authority that makes no lookups files nothing.
     fn file(&self, lookup: &Lookup, looked: &Looked, generation: Generation) {
         let _ = (lookup, looked, generation);
     }
 
     /// Starts session `generation`, if it is newer than the one the
-    /// authority's learned zones hold: what they learned before is
-    /// dropped.
+    /// authority holds: what its lookups filed before is dropped.
     fn advance(&self, generation: Generation) {
         let _ = generation;
     }

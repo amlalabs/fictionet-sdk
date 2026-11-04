@@ -1,10 +1,10 @@
-//! What an authoritative server asks the real servers of a zone it
-//! copies, and what came of it.
+//! What an authoritative server asks another server of a zone for a fact
+//! it does not hold, and what came of it.
 //!
-//! A world never passes a DNS message from a real server on to a client.
-//! A server that learns its zone data from real servers answers
-//! from records it holds, and when a reply needs a fact it does not hold
-//! it asks one real server of the zone a [`Lookup`]. The driver puts the
+//! A world never passes a DNS message from another server on to a
+//! client. An authority answers from records it holds, and when a reply
+//! needs a fact it does not hold it may ask one server of the zone a
+//! [`Lookup`]. The driver puts the
 //! lookup to its upstream, outside the engine, and hands back what came
 //! of it as [`Looked`]; the response is filed into the zone as records,
 //! and the server answers from those.
@@ -14,12 +14,12 @@ use std::net::SocketAddr;
 use fictionet::stdlib::protocols::dns::op::{Edns, Message, MessageType, OpCode, Query};
 use fictionet::stdlib::protocols::dns::rr::LowerName;
 
-/// One question put to a real server of a zone, with the zone it is
-/// about. Two lookups are the same when every field is, so requests that
-/// need the same fact wait on one lookup.
+/// One question put to a server of a zone, with the zone it is about.
+/// Two lookups are the same when every field is, so requests that need
+/// the same fact wait on one lookup.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Lookup {
-    /// The real server asked.
+    /// The server asked.
     pub server: SocketAddr,
     /// The apex of the zone the response is filed into.
     pub zone: LowerName,

@@ -21,10 +21,9 @@ use super::{Authority, ServerConfig, Step, bare_reply, refuse_transfer};
 /// Answers as its base does, except for zones invented below it.
 ///
 /// An overlay sits on the servers of a zone's parent, such as the `com`
-/// servers of a world that learns `com` from the real ones
-/// (the copies in `fictionet-extras`), with each invented zone, a
-/// child of that parent,
-/// added by [`below`](Overlay::below). A zone transfer gets REFUSED, and a
+/// servers of a world whose `com` data comes from lookups of other
+/// servers, with each invented zone, a child of that parent, added by
+/// [`below`](Overlay::below). A zone transfer gets REFUSED, and a
 /// question in a class other than IN gets what the base gives it. For a
 /// question at or below an invented zone's apex:
 ///
@@ -34,8 +33,8 @@ use super::{Authority, ServerConfig, Step, bare_reply, refuse_transfer};
 ///   its base does, since only the parent's servers refer to a child
 ///   (RFC 1034 §4.2.1). The base serves the parent where its reply to
 ///   `<apex> DS` has AA set and carries the parent's SOA or the DS
-///   RRset. So an overlay may wrap every server a mirror places, and
-///   the root still refers only to the parent. When the base needs a
+///   RRset. So an overlay may wrap every server of a world, and the
+///   root still refers only to the parent. When the base needs a
 ///   lookup for that question, the overlay needs it too; when the base
 ///   stays silent, so does the overlay.
 /// - Elsewhere the overlay answers as the parent: a referral composed from
@@ -60,7 +59,7 @@ use super::{Authority, ServerConfig, Step, bare_reply, refuse_transfer};
 /// never sends with a delegation (RFC 5155 §7.2.7). The base's reply
 /// carries the denial its zone holds for the apex
 /// ([`View::denial`](super::super::zone::View::denial)), such as the
-/// NSEC3 records a learned zone copied from the real parent with their
+/// NSEC3 records a lookup of the parent's servers filed, with their
 /// RRSIGs. The overlay does not judge them: a validator checks them for
 /// this name. Under an opt-out NSEC3 parent, as `com`, `net`, and `org`
 /// are, they prove the delegation insecure (RFC 5155 §8.9), so the
