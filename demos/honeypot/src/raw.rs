@@ -202,14 +202,16 @@ pub fn start_raw(
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
     use fictionet::stdlib::network::ethernet::frame::{self, Frame};
-    use fictionet::stdlib::network::ethernet::host::{AddressState, Dropped, Ipv6Gateway, Unsent};
-    use fictionet::stdlib::network::ip;
-    use fictionet::stdlib::protocols::ndp::{
-        self, Message, NdOption, NeighborSolicitation, RouterAdvertisement,
+    use fictionet::stdlib::network::ethernet::host::{
+        AddressState, DELAY_FIRST_PROBE_TIME, Ipv6Gateway, REACHABLE_TIME, Unsent,
     };
+    use fictionet::stdlib::network::ip;
+    use fictionet::stdlib::protocols::arp;
+    use fictionet_host::raw::RawWire;
+    use serde_json::Value;
 
     use super::*;
 
@@ -234,388 +236,267 @@ mod tests {
         }
     }
 
-    fn at(secs: u64) -> Instant {
-        Instant::from_since_start(Duration::from_secs(secs))
+    /// The host `config` makes for the card with [`MAC`], started at 0.
+    fn host_of(config: &Config) -> Host {
+        host(config, MAC, Instant::ZERO).unwrap()
     }
 
-    /// Every frame the host has to send at `now`.
-    fn drain(host: &mut Host, now: Instant) -> Vec<Vec<u8>> {
-        std::iter::from_fn(|| host.transmit(now)).collect()
+    fn arp_frame(
+        dst: Mac,
+        op: arp::Operation,
+        sender: (Mac, Ipv4Addr),
+        target: (Mac, Ipv4Addr),
+    ) -> Vec<u8> {
+        let p = arp::Packet {
+            operation: op,
+            sender_mac: sender.0,
+            sender_ip: sender.1,
+            target_mac: target.0,
+            target_ip: target.1,
+        };
+        frame::frame(dst, sender.0, frame::ARP, &p.encode())
     }
 
-    /// An Ethernet/IPv4 ARP packet, byte by byte as RFC 826 lays it out.
-    fn arp(op: u8, sender: Mac, sender_ip: Ipv4Addr, target: Mac, target_ip: Ipv4Addr) -> Vec<u8> {
-        let mut p = vec![0, 1, 8, 0, 6, 4, 0, op];
-        p.extend_from_slice(&sender);
-        p.extend_from_slice(&sender_ip.octets());
-        p.extend_from_slice(&target);
-        p.extend_from_slice(&target_ip.octets());
-        p
-    }
-
-    fn arp_request(sender: Mac, sender_ip: Ipv4Addr, target_ip: Ipv4Addr) -> Vec<u8> {
-        let p = arp(1, sender, sender_ip, [0; 6], target_ip);
-        frame::frame(frame::BROADCAST, sender, frame::ARP, &p)
-    }
-
-    /// A host that has sent its first frames, with no gateway known yet.
-    fn started(config: &Config) -> Host {
-        let mut host = host(config, MAC, at(0)).unwrap();
-        drain(&mut host, at(0));
-        host
-    }
-
-    /// The host's first ARP request for the gateway, and the reply that
-    /// resolves it.
-    #[test]
-    fn gateway_is_learned_from_requests_and_replies() {
-        let mut host = host(&config(), MAC, at(0)).unwrap();
-        let sent = drain(&mut host, at(0));
-        assert_eq!(sent, [arp_request(MAC, ADDRESS, GATEWAY)]);
-        let request = Frame::parse(&sent[0]).unwrap();
-        assert_eq!(
-            (request.src, request.dst, request.ethertype),
-            (MAC, frame::BROADCAST, frame::ARP)
-        );
-        assert_eq!(&request.payload[..8], &[0, 1, 8, 0, 6, 4, 0, 1]);
-        assert_eq!(&request.payload[8..14], &MAC);
-        assert_eq!(&request.payload[14..18], &ADDRESS.octets());
-        assert_eq!(&request.payload[18..24], &[0; 6]);
-        assert_eq!(&request.payload[24..28], &GATEWAY.octets());
-        // Asked again every second until answered.
-        assert_eq!(host.poll_at(), Some(at(1)));
-        assert_eq!(drain(&mut host, at(1)), sent);
-        let reply = frame::frame(
-            MAC,
-            ROUTER,
-            frame::ARP,
-            &arp(2, ROUTER, GATEWAY, MAC, ADDRESS),
-        );
-        assert_eq!(host.receive(at(1), &reply), Received::Handled);
-        assert_eq!(host.ipv4_gateway(), Some(ROUTER));
-        assert!(drain(&mut host, at(2)).is_empty());
-
-        let mut host = started(&config());
-        let request = arp_request(ROUTER, GATEWAY, ADDRESS);
-        host.receive(at(0), &request);
-        assert_eq!(host.ipv4_gateway(), Some(ROUTER));
-        for target in [GATEWAY, Ipv4Addr::new(203, 0, 113, 20)] {
-            let mut host = started(&config());
-            host.receive(at(0), &arp_request([6; 6], GATEWAY, target));
-            assert_eq!(host.ipv4_gateway(), Some([6; 6]));
-        }
-    }
-
-    #[test]
-    fn other_senders_and_invalid_arp_do_not_resolve_the_gateway() {
-        let request = arp_request(ROUTER, GATEWAY, ADDRESS);
-        for (offset, value) in [(12, 0x86), (14, 1), (18, 5), (21, 3), (22, 1), (28, 192)] {
-            let mut bad = request.clone();
-            bad[offset] = value;
-            let mut host = started(&config());
-            host.receive(at(0), &bad);
-            assert_eq!(host.ipv4_gateway(), None, "byte {offset}");
-        }
-        let mut host = started(&config());
-        assert_eq!(
-            host.receive(at(0), &request[..41]),
-            Received::Drop(Dropped::Malformed)
-        );
-        host.receive(at(0), &arp_request([0; 6], GATEWAY, ADDRESS));
-        let packet = ip::packet(GATEWAY.into(), ADDRESS.into(), 1, &[8, 0, 0, 0]);
-        host.receive(at(0), &frame::frame(MAC, ROUTER, frame::IPV4, &packet.0));
-        assert_eq!(host.ipv4_gateway(), None);
-    }
-
-    #[test]
-    fn all_ipv4_destinations_use_the_gateway_mac() {
-        let mut host = started(&config());
-        let packets: Vec<_> = ["192.0.2.5", "198.51.100.27"]
-            .into_iter()
-            .map(|to| ip::packet(ADDRESS.into(), to.parse().unwrap(), 1, &[0, 0, 0, 0]))
-            .collect();
-        for packet in &packets {
-            assert_eq!(host.send(at(0), &packet.0), Err(Unsent::Unresolved));
-        }
-        let reply = frame::frame(
-            MAC,
-            ROUTER,
-            frame::ARP,
-            &arp(2, ROUTER, GATEWAY, MAC, ADDRESS),
-        );
-        host.receive(at(0), &reply);
-        for packet in &packets {
-            let bytes = host.send(at(0), &packet.0).unwrap();
-            let parsed = Frame::parse(&bytes).unwrap();
-            assert_eq!(
-                (parsed.src, parsed.dst, parsed.ethertype),
-                (MAC, ROUTER, frame::IPV4)
-            );
-            assert_eq!(
-                frame::ip_packet(parsed.ethertype, parsed.payload),
-                Some(packet.0.as_slice())
-            );
-        }
-    }
-
-    #[test]
-    fn oversized_replies_are_dropped() {
-        let mut host = started(&config());
-        let reply = frame::frame(
-            MAC,
-            ROUTER,
-            frame::ARP,
-            &arp(2, ROUTER, GATEWAY, MAC, ADDRESS),
-        );
-        host.receive(at(0), &reply);
-        let packet = ip::packet(
-            ADDRESS.into(),
-            "192.0.2.5".parse().unwrap(),
-            1,
-            &[0; MTU as usize - 20],
-        );
-        assert!(host.send(at(0), &packet.0).is_ok());
-        let mut oversized = packet.0;
-        oversized.push(0);
-        assert_eq!(host.send(at(0), &oversized), Err(Unsent::TooBig));
-    }
-
-    #[test]
-    fn ethernet_padding_is_not_an_ip_payload() {
-        let mut host = started(&config());
-        let packet = ip::packet(
-            "192.0.2.5".parse().unwrap(),
-            ADDRESS.into(),
-            1,
-            &[8, 0, 0, 0],
-        );
-        let bytes = frame::frame(MAC, ROUTER, frame::IPV4, &packet.0);
-        assert!(bytes.len() > 14 + packet.0.len(), "the frame is padded");
-        assert_eq!(
-            host.receive(at(0), &bytes),
-            Received::World(packet.0.as_slice())
-        );
-        let mut malformed = bytes.clone();
-        malformed[16..18].copy_from_slice(&200u16.to_be_bytes());
-        assert_eq!(
-            host.receive(at(0), &malformed),
-            Received::Drop(Dropped::Malformed)
-        );
-        let vlan = frame::frame(MAC, ROUTER, 0x8100, &packet.0);
-        assert_eq!(
-            host.receive(at(0), &vlan),
-            Received::Drop(Dropped::OtherType)
-        );
-        let unknown = frame::frame(MAC, ROUTER, 0x88b5, &packet.0);
-        assert_eq!(
-            host.receive(at(0), &unknown),
-            Received::Drop(Dropped::OtherType)
-        );
-    }
-
-    #[test]
-    fn arp_answers_only_for_the_configured_address() {
-        let mut host = started(&config());
-        let peer = [4; 6];
-        let request = arp_request(peer, Ipv4Addr::new(192, 0, 2, 5), ADDRESS);
-        assert_eq!(host.receive(at(0), &request), Received::Handled);
-        let sent = drain(&mut host, at(0));
-        assert_eq!(sent.len(), 1);
-        let reply = Frame::parse(&sent[0]).unwrap();
-        assert_eq!(
-            (reply.src, reply.dst, reply.ethertype),
-            (MAC, peer, frame::ARP)
-        );
-        assert_eq!(&reply.payload[6..8], &[0, 2]);
-        assert_eq!(&reply.payload[8..14], &MAC);
-        assert_eq!(&reply.payload[14..18], &[203, 0, 113, 10]);
-        assert_eq!(&reply.payload[18..24], &peer);
-        assert_eq!(&reply.payload[24..28], &[192, 0, 2, 5]);
-        let other = arp_request(
-            peer,
-            Ipv4Addr::new(192, 0, 2, 5),
-            Ipv4Addr::new(203, 0, 113, 11),
-        );
-        host.receive(at(0), &other);
-        assert!(drain(&mut host, at(0)).is_empty());
-        assert_eq!(
-            host.receive(at(0), &[0; 13]),
-            Received::Drop(Dropped::Malformed)
-        );
-    }
-
-    /// Linux answers to the hardware address the request gives, even when
-    /// the frame came from another.
-    #[test]
-    fn arp_answers_the_sender_the_request_names() {
-        let mut host = started(&config());
-        let named = [6; 6];
-        let p = arp(1, named, Ipv4Addr::new(192, 0, 2, 5), [0; 6], ADDRESS);
-        let request = frame::frame(frame::BROADCAST, [4; 6], frame::ARP, &p);
-        host.receive(at(0), &request);
-        let sent = drain(&mut host, at(0));
-        let reply = Frame::parse(&sent[0]).unwrap();
-        assert_eq!(reply.dst, named);
-        assert_eq!(&reply.payload[18..24], &named);
-    }
-
-    /// The router's advertisement from its link-local address, with its MAC.
-    fn advertisement() -> Vec<u8> {
-        let ra = Message::RouterAdvertisement(RouterAdvertisement {
-            cur_hop_limit: 64,
-            managed: false,
-            other: false,
-            router_lifetime: 1800,
-            reachable_time: 0,
-            retrans_timer: 0,
-            options: vec![NdOption::SourceLinkLayer(ROUTER)],
-        });
-        let packet = ra
-            .packet(frame::link_local(ROUTER), ndp::ALL_NODES)
-            .unwrap();
-        frame::frame(
-            frame::multicast_mac(ndp::ALL_NODES),
-            ROUTER,
-            frame::IPV6,
-            &packet,
+    /// The host's request for the gateway: broadcast, or unicast to `to`.
+    fn request_for_gateway(to: Mac) -> Vec<u8> {
+        arp_frame(
+            to,
+            arp::Operation::Request,
+            (MAC, ADDRESS),
+            ([0; 6], GATEWAY),
         )
     }
 
-    /// With an IPv6 address, the host checks it and its link-local address
-    /// before it uses them, learns its router from the router's
-    /// advertisement, and then frames IPv6 replies to the router's MAC.
-    #[test]
-    fn ipv6_replies_go_to_the_router_after_its_advertisement() {
-        let mut host = host(&dual_stack(), MAC, at(0)).unwrap();
-        let link_local = frame::link_local(MAC);
-        drain(&mut host, at(0));
-        assert_eq!(host.address_state(ADDRESS6), Some(AddressState::Tentative));
-        let client: IpAddr = "2001:db8:1::1".parse().unwrap();
-        let reply = ip::packet(ADDRESS6.into(), client, 6, &[0; 20]);
-        assert_eq!(host.send(at(0), &reply.0), Err(Unsent::Source));
-        drain(&mut host, at(1));
-        for address in [ADDRESS6, link_local] {
-            assert_eq!(host.address_state(address), Some(AddressState::Preferred));
-        }
-        assert_eq!(host.send(at(1), &reply.0), Err(Unsent::Unresolved));
-        assert_eq!(host.receive(at(1), &advertisement()), Received::Handled);
-        assert_eq!(
-            host.ipv6_gateway(),
-            Some((frame::link_local(ROUTER), Some(ROUTER)))
-        );
-        let bytes = host.send(at(1), &reply.0).unwrap();
-        let parsed = Frame::parse(&bytes).unwrap();
-        assert_eq!(
-            (parsed.src, parsed.dst, parsed.ethertype),
-            (MAC, ROUTER, frame::IPV6)
-        );
-        assert_eq!(
-            frame::ip_packet(parsed.ethertype, parsed.payload),
-            Some(reply.0.as_slice())
-        );
-        // Without an IPv6 address, IPv6 is off.
-        let mut host = started(&config());
-        assert_eq!(host.send(at(0), &reply.0), Err(Unsent::Off));
+    /// The gateway's reply to the host's request.
+    fn gateway_reply() -> Vec<u8> {
+        arp_frame(
+            MAC,
+            arp::Operation::Reply,
+            (ROUTER, GATEWAY),
+            (MAC, ADDRESS),
+        )
     }
 
-    /// A configured IPv6 gateway, such as Hetzner's `fe80::1`, is resolved
-    /// by neighbor solicitation and needs no advertisement.
+    /// The host has the server's IPv4 address and gateway, and the card's
+    /// MAC: its first frame asks for that gateway from that address, and
+    /// IPv6 is off without an IPv6 address.
     #[test]
-    fn a_configured_ipv6_gateway_is_resolved() {
+    fn the_host_has_the_server_s_ipv4_address_and_gateway() {
+        let mut host = host_of(&config());
+        assert_eq!(host.mac(), MAC);
+        assert_eq!(
+            host.transmit(Instant::ZERO),
+            Some(request_for_gateway(frame::BROADCAST))
+        );
+        let v6 = ip::packet(
+            ADDRESS6.into(),
+            "2001:db8:1::1".parse().unwrap(),
+            6,
+            &[0; 20],
+        );
+        assert_eq!(host.send(Instant::ZERO, &v6.0), Err(Unsent::Off));
+    }
+
+    /// The host's MTU is Ethernet's 1500 bytes.
+    #[test]
+    fn the_host_sends_packets_up_to_the_ethernet_mtu() {
+        let mut host = host_of(&config());
+        host.receive(Instant::ZERO, &gateway_reply());
+        let to = "192.0.2.5".parse().unwrap();
+        let full = ip::packet(ADDRESS.into(), to, 1, &[0; MTU as usize - 20]);
+        assert!(host.send(Instant::ZERO, &full.0).is_ok());
+        let over = ip::packet(ADDRESS.into(), to, 1, &[0; MTU as usize - 19]);
+        assert_eq!(host.send(Instant::ZERO, &over.0), Err(Unsent::TooBig));
+    }
+
+    /// With [`Config::address_v6`] the host has that address and a
+    /// link-local one from the card's MAC, and its IPv6 gateway is the
+    /// configured one or, without one, learned from router advertisements.
+    #[test]
+    fn the_host_has_the_server_s_ipv6_address_and_gateway() {
+        let host = host_of(&dual_stack());
+        for addr in [ADDRESS6, frame::link_local(MAC)] {
+            assert_eq!(host.address_state(addr), Some(AddressState::Tentative));
+        }
+        assert_eq!(host.ipv6_gateway(), None, "learned, so none yet");
         let gateway: Ipv6Addr = "fe80::1".parse().unwrap();
-        let config = Config {
+        let host = host_of(&Config {
             gateway_v6: Ipv6Gateway::Configured(gateway),
             ..dual_stack()
-        };
-        let mut host = host(&config, MAC, at(0)).unwrap();
-        drain(&mut host, at(0));
-        let sent = drain(&mut host, at(1));
-        let solicited = frame::multicast_mac(ndp::solicited_node(gateway));
-        assert!(
-            sent.iter()
-                .any(|f| Frame::parse(f).is_some_and(|f| f.dst == solicited)),
-            "the host solicits its gateway"
-        );
+        });
         assert_eq!(host.ipv6_gateway(), Some((gateway, None)));
     }
 
-    /// The host takes in frames to the solicited-node group of each of its
-    /// IPv6 addresses, and answers neighbor solicitations for its address
-    /// to the asker, and only once the address passed its check.
-    #[test]
-    fn neighbor_solicitations_are_answered() {
-        let mut host = host(&dual_stack(), MAC, at(0)).unwrap();
-        let link_local = frame::link_local(MAC);
-        for address in [ADDRESS6, link_local] {
-            assert!(host.accepts(frame::multicast_mac(ndp::solicited_node(address))));
+    /// A buffer the test reads while the world writes to it.
+    #[derive(Clone, Default)]
+    struct Shared(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl Write for Shared {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
         }
-        assert!(!host.accepts(frame::multicast_mac(ndp::solicited_node(
-            "2001:db8::99".parse().unwrap()
-        ))));
-        let router = frame::link_local(ROUTER);
-        let ns = Message::NeighborSolicitation(NeighborSolicitation {
-            target: ADDRESS6,
-            options: vec![NdOption::SourceLinkLayer(ROUTER)],
-        });
-        let group = ndp::solicited_node(ADDRESS6);
-        let packet = ns.packet(router, group).unwrap();
-        let solicitation = frame::frame(frame::multicast_mac(group), ROUTER, frame::IPV6, &packet);
-        drain(&mut host, at(0));
-        host.receive(at(0), &solicitation);
-        assert!(
-            drain(&mut host, at(0)).is_empty(),
-            "a tentative address is not answered"
-        );
-        drain(&mut host, at(1));
-        assert_eq!(host.receive(at(1), &solicitation), Received::Handled);
-        let sent = drain(&mut host, at(1));
-        assert_eq!(sent.len(), 1);
-        let answer = Frame::parse(&sent[0]).unwrap();
-        assert_eq!((answer.src, answer.dst), (MAC, ROUTER));
-        let packet = frame::ip_packet(answer.ethertype, answer.payload).unwrap();
-        let envelope = ndp::Envelope::of(packet).unwrap();
-        assert_eq!((envelope.source, envelope.destination), (ADDRESS6, router));
-        let header = ip::Header::parse(packet).unwrap();
-        let Message::NeighborAdvertisement(na) =
-            Message::receive(&envelope, header.payload(packet)).unwrap()
-        else {
-            panic!("a neighbor advertisement")
-        };
-        assert_eq!(na.target, ADDRESS6);
-        assert!(na.solicited && na.overrides && !na.router);
-        assert_eq!(na.options, [NdOption::TargetLinkLayer(MAC)]);
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
-    /// IPv6 to the server's address, once it passed its check, enters the
-    /// world, and so does IPv4 to its IPv4 address; other destinations do
-    /// not.
+    impl Shared {
+        /// The raw log's records, as (direction, bytes).
+        fn records(&self) -> Vec<(String, Vec<u8>)> {
+            let log = self.0.lock().unwrap();
+            std::str::from_utf8(&log)
+                .unwrap()
+                .lines()
+                .map(|line| {
+                    let v: Value = serde_json::from_str(line).unwrap();
+                    let hex = v["bytes"].as_str().unwrap();
+                    let bytes = (0..hex.len())
+                        .step_by(2)
+                        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                        .collect();
+                    (v["direction"].as_str().unwrap().to_owned(), bytes)
+                })
+                .collect()
+        }
+    }
+
+    /// Starts the raw honeypot with `config` on an in-memory wire, and runs
+    /// `test` with the wire and the raw log.
+    fn raw_honeypot<F, Fut>(config: Config, test: F)
+    where
+        F: FnOnce(Cx, RawWire, Shared) -> Fut + Send + 'static,
+        Fut: Future<Output = fictionet::Result> + Send + 'static,
+    {
+        fictionet::block_on(fictionet::lab(
+            fictionet::Seed::from_u64(3),
+            |fcx| async move {
+                let (raw, wire) = RawAttachment::in_memory(MAC);
+                let log = Shared::default();
+                let sinks = Sinks {
+                    log: Box::new(std::io::sink()),
+                    pcap: Box::new(std::io::sink()),
+                };
+                start_raw(
+                    &fcx,
+                    &config,
+                    Clock::at_unix_secs(1_800_000_000),
+                    sinks,
+                    raw,
+                    Box::new(log.clone()),
+                )?;
+                test(fcx.clone(), wire, log).await?;
+                fcx.cancel();
+                Ok(())
+            },
+        ))
+        .unwrap();
+    }
+
+    /// The next frame the world puts on the wire before `deadline`.
+    async fn next(fcx: &Cx, wire: &mut RawWire, deadline: Instant) -> Option<Vec<u8>> {
+        let frame = fcx
+            .race(Some(deadline), wire.recv(fcx))
+            .await
+            .ok()?
+            .ok()??;
+        Some(frame.0)
+    }
+
+    /// A TCP SYN from `from` to the server's port 22, framed by the router.
+    fn syn(from: SocketAddr) -> Vec<u8> {
+        let to = SocketAddr::new(ADDRESS.into(), 22);
+        let mut t = vec![0u8; 20];
+        t[0..2].copy_from_slice(&from.port().to_be_bytes());
+        t[2..4].copy_from_slice(&to.port().to_be_bytes());
+        t[12] = 5 << 4;
+        t[13] = 0x02;
+        t[14..16].copy_from_slice(&65535u16.to_be_bytes());
+        let sum = ip::transport_checksum(from.ip(), to.ip(), 6, &t);
+        t[16..18].copy_from_slice(&sum.to_be_bytes());
+        let packet = ip::packet(from.ip(), to.ip(), 6, &t);
+        frame::frame(MAC, ROUTER, frame::IPV4, &packet.0)
+    }
+
+    /// Whether `bytes` is the server's SYN-ACK to `to`, framed to the router.
+    fn is_syn_ack_to(bytes: &[u8], to: SocketAddr) -> bool {
+        let Some(f) = Frame::parse(bytes) else {
+            return false;
+        };
+        let Some(p) = frame::ip_packet(f.ethertype, f.payload) else {
+            return false;
+        };
+        let Some(header) = ip::Header::parse(p) else {
+            return false;
+        };
+        let t = header.payload(p);
+        (f.src, f.dst, f.ethertype) == (MAC, ROUTER, frame::IPV4)
+            && ip::destination(p) == Some(to.ip())
+            && t.len() >= 20
+            && u16::from_be_bytes([t[2], t[3]]) == to.port()
+            && t[13] == 0x12
+    }
+
+    /// The raw log holds every frame that crossed the card, both ways and
+    /// in order, byte for byte: the host's ARP request, the gateway's
+    /// reply, the client's SYN, and the server's SYN-ACK.
     #[test]
-    fn packets_to_both_addresses_enter_the_world() {
-        let mut host = host(&dual_stack(), MAC, at(0)).unwrap();
-        drain(&mut host, at(0));
-        let from: SocketAddr = "[2001:db8:1::1]:40000".parse().unwrap();
-        let syn = ip::packet(from.ip(), ADDRESS6.into(), 6, &[0; 20]);
-        let bytes = frame::frame(MAC, ROUTER, frame::IPV6, &syn.0);
-        assert_eq!(
-            host.receive(at(0), &bytes),
-            Received::Drop(Dropped::NotOurs)
-        );
-        drain(&mut host, at(1));
-        assert_eq!(
-            host.receive(at(1), &bytes),
-            Received::World(syn.0.as_slice())
-        );
-        let elsewhere = ip::packet(from.ip(), "2001:db8::11".parse().unwrap(), 6, &[0; 20]);
-        let bytes = frame::frame(MAC, ROUTER, frame::IPV6, &elsewhere.0);
-        assert_eq!(
-            host.receive(at(1), &bytes),
-            Received::Drop(Dropped::NotOurs)
-        );
-        let syn = ip::packet("192.0.2.5".parse().unwrap(), ADDRESS.into(), 6, &[0; 20]);
-        let bytes = frame::frame(MAC, ROUTER, frame::IPV4, &syn.0);
-        assert_eq!(
-            host.receive(at(1), &bytes),
-            Received::World(syn.0.as_slice())
-        );
+    fn every_frame_is_logged_both_ways() {
+        raw_honeypot(config(), |fcx, mut wire, log| async move {
+            let within = |fcx: &Cx| fcx.now() + Duration::from_millis(500);
+            let request = next(&fcx, &mut wire, within(&fcx)).await;
+            assert_eq!(request, Some(request_for_gateway(frame::BROADCAST)));
+            wire.send(&fcx, EthernetFrame(gateway_reply())).await?;
+            let client: SocketAddr = "192.0.2.5:40000".parse().unwrap();
+            wire.send(&fcx, EthernetFrame(syn(client))).await?;
+            let answer = next(&fcx, &mut wire, within(&fcx)).await.unwrap();
+            assert!(is_syn_ack_to(&answer, client));
+            let records = log.records();
+            let expected = [
+                ("out", request_for_gateway(frame::BROADCAST)),
+                ("in", gateway_reply()),
+                ("in", syn(client)),
+                ("out", answer),
+            ];
+            assert_eq!(records.len(), expected.len());
+            for ((dir, bytes), (want_dir, want_bytes)) in records.iter().zip(expected) {
+                assert_eq!((dir.as_str(), bytes), (want_dir, &want_bytes));
+            }
+            Ok(())
+        });
+    }
+
+    /// A packet from the world to a gateway gone stale starts the wait
+    /// before the gateway is checked, and the timer task wakes for it: a
+    /// unicast ARP request goes out [`DELAY_FIRST_PROBE_TIME`] later (RFC
+    /// 4861 section 7.3.3), with no frame coming in to wake it.
+    #[test]
+    fn a_send_to_a_stale_gateway_wakes_the_timer_for_its_probe() {
+        raw_honeypot(config(), |fcx, mut wire, log| async move {
+            let within = |fcx: &Cx| fcx.now() + Duration::from_millis(500);
+            next(&fcx, &mut wire, within(&fcx)).await.unwrap();
+            wire.send(&fcx, EthernetFrame(gateway_reply())).await?;
+            fcx.sleep(REACHABLE_TIME + Duration::from_secs(1)).await?;
+            let client: SocketAddr = "192.0.2.5:40000".parse().unwrap();
+            wire.send(&fcx, EthernetFrame(syn(client))).await?;
+            let answer = next(&fcx, &mut wire, within(&fcx)).await.unwrap();
+            assert!(is_syn_ack_to(&answer, client), "the stale MAC is used");
+            let sent = fcx.now();
+            let probe = request_for_gateway(ROUTER);
+            let deadline = sent + DELAY_FIRST_PROBE_TIME + Duration::from_millis(500);
+            let mut probed = None;
+            while let Some(frame) = next(&fcx, &mut wire, deadline).await {
+                if frame == probe {
+                    probed = Some(fcx.now());
+                    break;
+                }
+                assert!(is_syn_ack_to(&frame, client), "only retransmissions");
+            }
+            let probed = probed.expect("the stale gateway is probed");
+            assert!(probed >= sent + DELAY_FIRST_PROBE_TIME);
+            assert_eq!(log.records().last().unwrap(), &("out".to_owned(), probe));
+            Ok(())
+        });
     }
 }

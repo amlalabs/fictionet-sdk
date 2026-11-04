@@ -94,9 +94,9 @@ pub(super) struct Destinations {
 }
 
 impl Context {
-    /// Attributes traffic from a route, and passes on only packets from
-    /// sources the network routes back to it: see [`Routed`].
-    pub(super) fn routed(self: &Arc<Self>, sandbox: Attachment, prefix: Prefix) -> Routed {
+    /// Attributes traffic from a route at `prefixes`, and passes on only
+    /// packets from sources the network routes back to it: see [`Routed`].
+    pub(super) fn routed(self: &Arc<Self>, sandbox: Attachment, prefixes: Vec<Prefix>) -> Routed {
         let owner = self.bindings.new_owner();
         self.hooks.attached.lock().insert(owner, None);
         let me = Sandbox {
@@ -106,16 +106,18 @@ impl Context {
             addr_v6: None,
         };
         let mut routes = self.hooks.routes.lock();
-        match routes.iter_mut().find(|(p, _)| *p == prefix) {
-            Some((_, last)) => *last = me,
-            None => routes.push((prefix, me)),
+        for &prefix in &prefixes {
+            match routes.iter_mut().find(|(p, _)| *p == prefix) {
+                Some((_, last)) => *last = me.clone(),
+                None => routes.push((prefix, me.clone())),
+            }
         }
         drop(routes);
         Routed {
             sandbox,
             context: self.clone(),
             owner,
-            prefix,
+            prefixes,
         }
     }
 
@@ -201,7 +203,7 @@ impl Context {
     }
 }
 
-/// A sandbox wired to the router at its prefix
+/// A sandbox wired to the router at its prefixes
 /// ([`Net::route`](super::Net::route)). It passes packets as they are and
 /// keeps no state per source.
 ///
@@ -216,7 +218,7 @@ pub(super) struct Routed {
     sandbox: Attachment,
     context: Arc<Context>,
     owner: u64,
-    prefix: Prefix,
+    prefixes: Vec<Prefix>,
 }
 
 impl Interface for Routed {
@@ -227,7 +229,11 @@ impl Interface for Routed {
     ) -> Poll<Result<Packet, fictionet::RecvError>> {
         loop {
             let packet = std::task::ready!(self.sandbox.poll_recv(fcx, cx))?;
-            if ip::source(&packet.0).is_some_and(|src| self.context.routes_to(self.prefix, src)) {
+            if ip::source(&packet.0).is_some_and(|src| {
+                self.prefixes
+                    .iter()
+                    .any(|p| self.context.routes_to(*p, src))
+            }) {
                 return Poll::Ready(Ok(packet));
             }
         }
@@ -239,7 +245,7 @@ impl Interface for Routed {
 }
 
 impl Drop for Routed {
-    /// Resets the connections of every peer the route's prefix gives this
+    /// Resets the connections of every peer the route's prefixes give this
     /// sandbox: addresses that no sandbox binds and no route with a longer
     /// prefix holds.
     fn drop(&mut self) {
@@ -249,10 +255,10 @@ impl Drop for Routed {
         // locked.
         let bound: HashSet<IpAddr> = hooks.by_addr.lock().keys().copied().collect();
         let routes = hooks.routes.lock().clone();
-        let prefix = self.prefix;
+        let prefixes = &self.prefixes;
         (self.context.abort_peers)(&|peer| {
             !bound.contains(&peer)
-                && longest_route(&routes, peer).is_some_and(|(p, _)| *p == prefix)
+                && longest_route(&routes, peer).is_some_and(|(p, _)| prefixes.contains(p))
         });
     }
 }

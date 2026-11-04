@@ -370,6 +370,10 @@ impl Net {
     /// from addresses in `prefix` that no other sandbox has name this
     /// sandbox, and the network keeps nothing per source address, so a
     /// route open to the internet can carry any number of them.
+    ///
+    /// Call it again with the same `name` to give the sandbox more
+    /// prefixes, such as `0.0.0.0/0` and `::/0` for the internet over both
+    /// IPv4 and IPv6. The sandbox is then one route for all of them.
     pub fn route(mut self, name: &str, prefix: Prefix) -> Net {
         self.routes.push((name.to_owned(), prefix));
         self
@@ -521,10 +525,14 @@ impl Net {
         caller.spawn(move |fcx| async move {
             loop {
                 let sandbox = attachments.next(&fcx).await?;
-                if let Some((_, prefix)) = routes.iter().find(|(n, _)| n == sandbox.name()) {
-                    shared
-                        .router
-                        .add(*prefix, Box::new(context.routed(sandbox, *prefix)));
+                let prefixes: Vec<Prefix> = routes
+                    .iter()
+                    .filter(|(n, _)| n == sandbox.name())
+                    .map(|(_, p)| *p)
+                    .collect();
+                if !prefixes.is_empty() {
+                    let routed = context.routed(sandbox, prefixes.clone());
+                    shared.router.add_prefixes(prefixes, Box::new(routed));
                     continue;
                 }
                 if let Some((name, lan, addr)) =
@@ -1224,6 +1232,63 @@ mod tests {
                     assert_eq!(u16::from_be_bytes([p.0[22], p.0[23]]), 45000);
                 }
                 drop((internet, agent));
+                fcx.cancel();
+                Ok(())
+            },
+        ))
+        .unwrap();
+    }
+
+    /// One route name can carry a prefix of each family: the sandbox
+    /// attached under it gets both, and what it sends from either is
+    /// passed on. Before, only the first prefix with the name was wired,
+    /// and the second was dropped without an error.
+    #[test]
+    fn a_route_carries_a_prefix_of_each_family() {
+        fictionet::block_on(fictionet::lab(
+            fictionet::Seed::from_u64(1),
+            |fcx| async move {
+                let server4: IpAddr = "10.40.0.1".parse()?;
+                let server6: IpAddr = "2001:db8:40::1".parse()?;
+                let from = Arc::new(Mutex::new(Vec::new()));
+                let (attacher, attachments) = fictionet::attachments();
+                Net::new()
+                    .host("svc", |h| {
+                        h.at(server4).at(server6).port_server(
+                            22,
+                            Spy {
+                                from: from.clone(),
+                                hold: true,
+                                gone: Arc::default(),
+                            },
+                        )
+                    })
+                    .route("internet", "0.0.0.0/0".parse()?)
+                    .route("internet", "::/0".parse()?)
+                    .start(&fcx, attachments)?;
+                let mut internet = attacher.attach("internet")?;
+                let syn = |src: IpAddr, dst: IpAddr| {
+                    let mut t = vec![0u8; 20];
+                    t[0..2].copy_from_slice(&4000u16.to_be_bytes());
+                    t[2..4].copy_from_slice(&22u16.to_be_bytes());
+                    t[12] = 5 << 4;
+                    t[13] = 0x02;
+                    t[14..16].copy_from_slice(&65535u16.to_be_bytes());
+                    let sum = ip::transport_checksum(src, dst, PROTO_TCP, &t);
+                    t[16..18].copy_from_slice(&sum.to_be_bytes());
+                    ip::packet(src, dst, PROTO_TCP, &t)
+                };
+                let within = |fcx: &Cx| Some(fcx.now() + Duration::from_secs(1));
+                for (client, server) in [
+                    ("198.51.100.7".parse::<IpAddr>()?, server4),
+                    ("2001:db8:ffff::7".parse()?, server6),
+                ] {
+                    internet.send(syn(client, server));
+                    let syn_ack = fcx.race(within(&fcx), internet.recv(&fcx)).await??;
+                    assert_eq!(ip::source(&syn_ack.0), Some(server));
+                    assert_eq!(ip::destination(&syn_ack.0), Some(client));
+                }
+                drop(internet);
                 fcx.cancel();
                 Ok(())
             },

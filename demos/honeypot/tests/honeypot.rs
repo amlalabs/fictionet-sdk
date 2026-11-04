@@ -1232,6 +1232,19 @@ fn burst_state_expires_after_the_attachment_leaves() {
 /// network's router, and its packets are logged too.
 #[test]
 fn an_attached_sandbox_is_logged_too() {
+    attached_sandbox_reaches_the_server("agent");
+}
+
+/// The world reserves no name but [`INTERNET`](honeypot_world::INTERNET):
+/// a sandbox called `internet6` joins as any other does. Before, the
+/// world kept that name for the internet's IPv6 route and cut such a
+/// sandbox off.
+#[test]
+fn only_the_internet_s_name_is_reserved() {
+    attached_sandbox_reaches_the_server("internet6");
+}
+
+fn attached_sandbox_reaches_the_server(name: &'static str) {
     let config = Config::default();
     fictionet::block_on(fictionet::lab(
         fictionet::Seed::from_u64(9),
@@ -1249,7 +1262,7 @@ fn an_attached_sandbox_is_logged_too() {
                 sinks,
                 attachments,
             )?;
-            let mut agent = attacher.attach("agent")?;
+            let mut agent = attacher.attach(name)?;
             let from = SocketAddr::new(Ipv4Addr::new(10, 0, 0, 2).into(), 45000);
             let syn = with_mss(&mptcp_bytes(linux_capable()));
             agent.send(segment(from, server(22), 1, 0, SYN, &syn, b""));
@@ -1260,7 +1273,7 @@ fn an_attached_sandbox_is_logged_too() {
             let log = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
             let first: Value = serde_json::from_str(log.lines().next().unwrap()).unwrap();
             assert_eq!(first["event"], "syn");
-            assert_eq!(first["attachment"], "agent");
+            assert_eq!(first["attachment"], name);
             fcx.cancel();
             Ok(())
         },

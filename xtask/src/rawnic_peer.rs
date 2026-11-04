@@ -5,8 +5,12 @@
 use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv6Addr, TcpStream};
+use std::time::Instant;
 
 use fictionet::stdlib::network::ethernet::frame::{self, Frame, Mac};
+use fictionet::stdlib::network::ethernet::host::{
+    DELAY_FIRST_PROBE_TIME, MLD_ROBUSTNESS, REACHABLE_TIME,
+};
 use fictionet::stdlib::network::ip;
 use fictionet::stdlib::protocols::arp;
 use fictionet::stdlib::protocols::mld::{self, RecordType};
@@ -32,13 +36,45 @@ fn router() -> Ipv6Addr {
 
 /// The QEMU socket: frames, each after its length as four big-endian
 /// bytes.
-pub struct Peer {
-    stream: TcpStream,
+pub struct Peer<S = TcpStream> {
+    stream: S,
+    link: LinkState,
 }
 
-impl Peer {
-    pub fn new(stream: TcpStream) -> Peer {
-        Peer { stream }
+/// What the peer did to bring the honeypot's link up, which decides the
+/// link-layer frames the honeypot may still send after [`start_link`].
+#[derive(Default)]
+struct LinkState {
+    /// The earliest the honeypot may check its gateway with a unicast ARP
+    /// request, once the gateway has answered: REACHABLE_TIME and then
+    /// DELAY_FIRST_PROBE_TIME after the last answer (RFC 4861 section
+    /// 7.3.3).
+    gateway_probe: Option<Instant>,
+    /// The earliest the honeypot may check its router with a unicast
+    /// neighbor solicitation, once the router has advertised itself:
+    /// DELAY_FIRST_PROBE_TIME after the advertisement, which leaves the
+    /// router's entry stale, and REACHABLE_TIME and DELAY_FIRST_PROBE_TIME
+    /// after the router last answered a check.
+    router_probe: Option<Instant>,
+    /// Broadcast ARP requests for the gateway since the reply.
+    late_requests: u8,
+    /// MLDv2 reports so far.
+    reports: u8,
+}
+
+impl LinkState {
+    /// The gateway answered the honeypot's ARP request now.
+    fn gateway_answered(&mut self) {
+        self.gateway_probe = Some(Instant::now() + REACHABLE_TIME + DELAY_FIRST_PROBE_TIME);
+    }
+}
+
+impl<S: Read + Write> Peer<S> {
+    pub fn new(stream: S) -> Peer<S> {
+        Peer {
+            stream,
+            link: LinkState::default(),
+        }
     }
 
     pub fn send(&mut self, frame: &[u8]) -> Result {
@@ -76,11 +112,25 @@ impl Peer {
         }
     }
 
-    /// Answers a frame the honeypot sends to keep the link up, as its
-    /// gateway and router do: ARP requests for the gateway, and neighbor
-    /// solicitations for the router. Its group reports, router
-    /// solicitations and duplicate address checks need no answer. Returns
-    /// whether `bytes` was one of those.
+    /// Answers a frame the honeypot may send to keep its link up after
+    /// [`start_link`], as its gateway and router do, and fails on one it
+    /// should not send by now. Returns whether `bytes` was such a frame.
+    ///
+    /// What may come:
+    /// - One more broadcast ARP request for the gateway: the one already
+    ///   on its way when the reply went out, RETRANS_TIMER after the last.
+    /// - A unicast ARP request to the gateway's MAC, once the reply's
+    ///   REACHABLE_TIME and then DELAY_FIRST_PROBE_TIME have passed: the
+    ///   check of a gateway gone stale (RFC 4861 section 7.3.3).
+    /// - A unicast neighbor solicitation to the router's MAC, once
+    ///   DELAY_FIRST_PROBE_TIME has passed since the router advertised
+    ///   itself, which left its entry stale.
+    /// - MLDv2 reports for the solicited-node groups, MLD_ROBUSTNESS of
+    ///   them in all (RFC 3810 section 6.1).
+    ///
+    /// Router solicitations after the router advertised itself, duplicate
+    /// address checks after both addresses were checked, and any other
+    /// ARP or neighbor solicitation for the gateway are errors.
     fn answer(&mut self, bytes: &[u8]) -> Result<bool> {
         let Some(f) = Frame::parse(bytes) else {
             return Err("invalid Ethernet frame from the honeypot".into());
@@ -88,14 +138,35 @@ impl Peer {
         if f.src != HONEYPOT_MAC {
             return Err("frame from another MAC".into());
         }
+        let due = |at: Option<Instant>| at.is_some_and(|at| Instant::now() >= at);
         match link(&f)? {
             Some(Link::Arp(p))
                 if p.operation == arp::Operation::Request && p.target_ip == GATEWAY =>
             {
+                if self.link.gateway_probe.is_none() {
+                    return Err("ARP for the gateway before the link started".into());
+                }
+                if bytes == request_for_gateway(frame::BROADCAST) && self.link.late_requests == 0 {
+                    self.link.late_requests += 1;
+                } else if bytes != request_for_gateway(GATEWAY_MAC) || !due(self.link.gateway_probe)
+                {
+                    return Err("honeypot asked for its gateway again after the reply".into());
+                }
                 self.send(&arp_reply())?;
+                self.link.gateway_answered();
                 Ok(true)
             }
-            Some(Link::Nd(_, Message::NeighborSolicitation(ns))) if ns.target == router() => {
+            Some(Link::Nd(envelope, Message::NeighborSolicitation(ns)))
+                if ns.target == router() =>
+            {
+                if f.dst != GATEWAY_MAC
+                    || envelope.destination != router()
+                    || !due(self.link.router_probe)
+                {
+                    return Err("honeypot solicited its router before it went stale".into());
+                }
+                self.link.router_probe =
+                    Some(Instant::now() + REACHABLE_TIME + DELAY_FIRST_PROBE_TIME);
                 let asker = ns.options.iter().find_map(|option| match option {
                     NdOption::SourceLinkLayer(mac) => Some(*mac),
                     _ => None,
@@ -103,15 +174,67 @@ impl Peer {
                 self.send(&router_advertises_itself(asker))?;
                 Ok(true)
             }
-            Some(Link::Mld(_) | Link::Nd(_, Message::RouterSolicitation(_))) => Ok(true),
+            Some(Link::Mld(report)) => {
+                self.report(&f, &report)?;
+                Ok(true)
+            }
+            Some(Link::Nd(_, Message::RouterSolicitation(_))) => {
+                Err("honeypot solicited a router after the router advertised itself".into())
+            }
             Some(Link::Nd(envelope, Message::NeighborSolicitation(_)))
                 if envelope.source.is_unspecified() =>
             {
-                Ok(true)
+                Err("honeypot checked an address for duplicates again".into())
             }
             _ => Ok(false),
         }
     }
+
+    /// Checks an MLDv2 report from the honeypot: one of the
+    /// MLD_ROBUSTNESS that join the solicited-node groups of both its IPv6
+    /// addresses (RFC 3810 section 6.1), to all MLDv2 routers, from the
+    /// unspecified address or its link-local address (RFC 3590 section
+    /// 4). Returns its source.
+    fn report(&mut self, f: &Frame<'_>, report: &mld::Report) -> Result<IpAddr> {
+        let link_local = frame::link_local(HONEYPOT_MAC);
+        let groups: HashSet<Ipv6Addr> = [
+            ndp::solicited_node(link_local),
+            ndp::solicited_node(ADDRESS6),
+        ]
+        .into_iter()
+        .collect();
+        let packet = frame::ip_packet(f.ethertype, f.payload).ok_or("invalid MLD packet")?;
+        let ip = ip::Header::parse_whole(packet).ok_or("invalid MLD packet")?;
+        let reported: HashSet<Ipv6Addr> = report
+            .records
+            .iter()
+            .filter(|r| r.kind == RecordType::ChangeToExclude && r.sources.is_empty())
+            .map(|r| r.group)
+            .collect();
+        if reported != groups
+            || f.dst != frame::multicast_mac(mld::ALL_MLDV2_ROUTERS)
+            || ![IpAddr::V6(Ipv6Addr::UNSPECIFIED), IpAddr::V6(link_local)].contains(&ip.src)
+        {
+            return Err("honeypot did not join its solicited-node groups".into());
+        }
+        if self.link.reports >= MLD_ROBUSTNESS {
+            return Err("honeypot reported its groups more than MLD_ROBUSTNESS times".into());
+        }
+        self.link.reports += 1;
+        Ok(ip.src)
+    }
+}
+
+/// The honeypot's ARP request for its gateway, to `dst`.
+fn request_for_gateway(dst: Mac) -> Vec<u8> {
+    let request = arp::Packet {
+        operation: arp::Operation::Request,
+        sender_mac: HONEYPOT_MAC,
+        sender_ip: ADDRESS,
+        target_mac: [0; 6],
+        target_ip: GATEWAY,
+    };
+    frame::frame(dst, HONEYPOT_MAC, frame::ARP, &request.encode())
 }
 
 /// A link-layer message from the honeypot.
@@ -189,27 +312,9 @@ fn router_advertises_itself(asker: Option<Mac>) -> Vec<u8> {
 /// a second, and, once its link-local address passed the check, a router
 /// solicitation from it (RFC 4861 section 6.3.7). Then the gateway
 /// answers the ARP, and the router advertises itself.
-pub fn start_link(peer: &mut Peer) -> Result {
+pub fn start_link<S: Read + Write>(peer: &mut Peer<S>) -> Result {
     let link_local = frame::link_local(HONEYPOT_MAC);
-    let request = arp::Packet {
-        operation: arp::Operation::Request,
-        sender_mac: HONEYPOT_MAC,
-        sender_ip: ADDRESS,
-        target_mac: [0; 6],
-        target_ip: GATEWAY,
-    };
-    let expected_arp = frame::frame(
-        frame::BROADCAST,
-        HONEYPOT_MAC,
-        frame::ARP,
-        &request.encode(),
-    );
-    let groups: HashSet<Ipv6Addr> = [
-        ndp::solicited_node(link_local),
-        ndp::solicited_node(ADDRESS6),
-    ]
-    .into_iter()
-    .collect();
+    let expected_arp = request_for_gateway(frame::BROADCAST);
     let mut arps = 0;
     let mut joined = false;
     let mut checked = HashSet::new();
@@ -225,22 +330,7 @@ pub fn start_link(peer: &mut Peer) -> Result {
                 arps += 1;
             }
             Some(Link::Mld(report)) => {
-                let ip = ip::Header::parse_whole(frame::ip_packet(f.ethertype, f.payload).unwrap())
-                    .ok_or("invalid MLD packet")?;
-                let reported: HashSet<Ipv6Addr> = report
-                    .records
-                    .iter()
-                    .filter(|r| r.kind == RecordType::ChangeToExclude && r.sources.is_empty())
-                    .map(|r| r.group)
-                    .collect();
-                if reported != groups
-                    || f.dst != frame::multicast_mac(mld::ALL_MLDV2_ROUTERS)
-                    || ![IpAddr::V6(Ipv6Addr::UNSPECIFIED), IpAddr::V6(link_local)]
-                        .contains(&ip.src)
-                {
-                    return Err("honeypot did not join its solicited-node groups".into());
-                }
-                joined |= ip.src == IpAddr::V6(Ipv6Addr::UNSPECIFIED);
+                joined |= peer.report(&f, &report)? == IpAddr::V6(Ipv6Addr::UNSPECIFIED);
             }
             Some(Link::Nd(envelope, Message::NeighborSolicitation(ns)))
                 if envelope.source.is_unspecified() =>
@@ -273,6 +363,7 @@ pub fn start_link(peer: &mut Peer) -> Result {
         "Honeypot joined its groups, checked both IPv6 addresses for duplicates, and solicited a router"
     );
     peer.send(&arp_reply())?;
+    peer.link.gateway_answered();
     println!("Honeypot requested and retried ARP for its configured gateway");
     let ra = Message::RouterAdvertisement(RouterAdvertisement {
         cur_hop_limit: 64,
@@ -290,6 +381,7 @@ pub fn start_link(peer: &mut Peer) -> Result {
         frame::IPV6,
         &packet,
     ))?;
+    peer.link.router_probe = Some(Instant::now() + DELAY_FIRST_PROBE_TIME);
     Ok(())
 }
 
@@ -413,4 +505,167 @@ pub fn ssh6(peer: &mut Peer) -> Result {
     peer.send(&segment6(22, 1001, acked, 0x04, &[]))?;
     println!("Honeypot served the SSH banner at its IPv6 address through the advertised router");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+    use std::time::Duration;
+
+    use super::*;
+
+    /// The honeypot's side of the socket, scripted: the frames it sends,
+    /// and what the peer writes back.
+    struct Script {
+        from_honeypot: Cursor<Vec<u8>>,
+        to_honeypot: Vec<u8>,
+    }
+
+    impl Read for Script {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.from_honeypot.read(buf)
+        }
+    }
+
+    impl Write for Script {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.to_honeypot.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A peer past [`start_link`] whose gateway answered `answered` ago and
+    /// whose router advertised itself `advertised` ago, reading `frames`.
+    fn peer(answered: Duration, advertised: Duration, frames: &[Vec<u8>]) -> Peer<Script> {
+        let mut peer = Peer::new(Script {
+            from_honeypot: Cursor::new(written(frames)),
+            to_honeypot: Vec::new(),
+        });
+        let now = Instant::now();
+        peer.link.gateway_probe = Some(now - answered + REACHABLE_TIME + DELAY_FIRST_PROBE_TIME);
+        peer.link.router_probe = Some(now - advertised + DELAY_FIRST_PROBE_TIME);
+        peer.link.reports = MLD_ROBUSTNESS;
+        peer
+    }
+
+    /// A frame that is not link-layer housekeeping: what the test waits for.
+    fn data() -> Vec<u8> {
+        let packet = ip::packet(ADDRESS.into(), "192.0.2.1".parse().unwrap(), 17, &[0; 8]);
+        frame::frame(GATEWAY_MAC, HONEYPOT_MAC, frame::IPV4, &packet.0)
+    }
+
+    /// The honeypot's link-layer message `m` from its link-local address.
+    fn nd(dst: Mac, source: Ipv6Addr, destination: Ipv6Addr, m: Message) -> Vec<u8> {
+        let packet = m.packet(source, destination).unwrap();
+        frame::frame(dst, HONEYPOT_MAC, frame::IPV6, &packet)
+    }
+
+    fn router_probe() -> Vec<u8> {
+        let ns = Message::NeighborSolicitation(NeighborSolicitation {
+            target: router(),
+            options: vec![NdOption::SourceLinkLayer(HONEYPOT_MAC)],
+        });
+        nd(GATEWAY_MAC, frame::link_local(HONEYPOT_MAC), router(), ns)
+    }
+
+    /// Reads up to the data frame, and returns what the peer made of the
+    /// frames before it.
+    fn wait_for_data(peer: &mut Peer<Script>) -> Result<Vec<u8>> {
+        peer.next(|bytes| Ok((bytes == data()).then(|| bytes.to_vec())))
+    }
+
+    const LONG_AGO: Duration = Duration::from_secs(60);
+
+    /// The frames `peer` wrote, as the socket carries them.
+    fn written(frames: &[Vec<u8>]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for f in frames {
+            bytes.extend((f.len() as u32).to_be_bytes());
+            bytes.extend(f);
+        }
+        bytes
+    }
+
+    #[test]
+    fn housekeeping_the_timers_allow_is_answered() {
+        // The broadcast request on its way when the reply went out.
+        let late = request_for_gateway(frame::BROADCAST);
+        let mut fresh = peer(Duration::ZERO, Duration::ZERO, &[late, data()]);
+        assert_eq!(wait_for_data(&mut fresh).unwrap(), data());
+        assert_eq!(fresh.stream.to_honeypot, written(&[arp_reply()]));
+        // Checks of a gateway and a router gone stale.
+        let probes = [request_for_gateway(GATEWAY_MAC), router_probe(), data()];
+        let mut stale = peer(LONG_AGO, LONG_AGO, &probes);
+        assert_eq!(wait_for_data(&mut stale).unwrap(), data());
+        assert_eq!(
+            stale.stream.to_honeypot,
+            written(&[arp_reply(), router_advertises_itself(Some(HONEYPOT_MAC))])
+        );
+    }
+
+    #[test]
+    fn a_second_late_broadcast_request_is_an_error() {
+        let late = request_for_gateway(frame::BROADCAST);
+        let mut peer = peer(LONG_AGO, LONG_AGO, &[late.clone(), late, data()]);
+        assert!(wait_for_data(&mut peer).is_err());
+    }
+
+    #[test]
+    fn a_gateway_probe_before_the_reply_goes_stale_is_an_error() {
+        let fresh = REACHABLE_TIME;
+        let mut peer = peer(fresh, LONG_AGO, &[request_for_gateway(GATEWAY_MAC), data()]);
+        assert!(wait_for_data(&mut peer).is_err());
+    }
+
+    #[test]
+    fn a_router_probe_before_the_delay_is_an_error() {
+        let mut peer = peer(LONG_AGO, Duration::ZERO, &[router_probe(), data()]);
+        assert!(wait_for_data(&mut peer).is_err());
+    }
+
+    #[test]
+    fn startup_messages_after_startup_are_errors() {
+        let link_local = frame::link_local(HONEYPOT_MAC);
+        let rs = nd(
+            frame::multicast_mac(ndp::ALL_ROUTERS),
+            link_local,
+            ndp::ALL_ROUTERS,
+            Message::RouterSolicitation(ndp::RouterSolicitation {
+                options: vec![NdOption::SourceLinkLayer(HONEYPOT_MAC)],
+            }),
+        );
+        let group = ndp::solicited_node(ADDRESS6);
+        let dad = nd(
+            frame::multicast_mac(group),
+            Ipv6Addr::UNSPECIFIED,
+            group,
+            Message::NeighborSolicitation(NeighborSolicitation {
+                target: ADDRESS6,
+                options: vec![],
+            }),
+        );
+        let report = mld::Report {
+            records: [link_local, ADDRESS6]
+                .map(|a| mld::Record {
+                    kind: RecordType::ChangeToExclude,
+                    group: ndp::solicited_node(a),
+                    sources: vec![],
+                })
+                .into(),
+        };
+        let report = frame::frame(
+            frame::multicast_mac(mld::ALL_MLDV2_ROUTERS),
+            HONEYPOT_MAC,
+            frame::IPV6,
+            &report.packet(link_local).unwrap(),
+        );
+        for extra in [rs, dad, report] {
+            let mut peer = peer(LONG_AGO, LONG_AGO, &[extra, data()]);
+            assert!(wait_for_data(&mut peer).is_err());
+        }
+    }
 }

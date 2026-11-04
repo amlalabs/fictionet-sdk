@@ -94,6 +94,63 @@ impl RawAttachment {
     }
 }
 
+/// The far side of an attachment made by [`RawAttachment::in_memory`]:
+/// the wire, with no NIC behind it. What the world sends comes out of
+/// [`recv`](RawWire::recv), and what [`send`](RawWire::send) puts on the
+/// wire reaches the world, so a world's link layer runs against frames a
+/// program writes and reads.
+pub struct RawWire {
+    incoming: mpsc::Sender<EthernetFrame>,
+    outgoing: mpsc::Receiver<Command>,
+}
+
+impl RawAttachment {
+    /// An attachment with the Ethernet address `mac` whose frames go to
+    /// and come from the returned [`RawWire`]. Each direction holds 64
+    /// frames, as one to a NIC does.
+    pub fn in_memory(mac: [u8; 6]) -> (RawAttachment, RawWire) {
+        let (incoming, rx) = mpsc::channel(CAPACITY);
+        let (tx, outgoing) = mpsc::channel(CAPACITY);
+        let failure = Arc::new(Mutex::new(None));
+        (
+            RawAttachment {
+                sender: RawSender {
+                    tx,
+                    failure: failure.clone(),
+                },
+                receiver: RawReceiver { rx, failure },
+                mac,
+            },
+            RawWire { incoming, outgoing },
+        )
+    }
+}
+
+impl RawWire {
+    /// Puts `frame` on the wire to the world, waiting for room.
+    pub async fn send(&self, fcx: &Cx, frame: EthernetFrame) -> Result {
+        check_length(&frame)?;
+        fcx.race(None, self.incoming.send(frame))
+            .await?
+            .map_err(|_| Error::msg("raw Ethernet attachment closed"))
+    }
+
+    /// The next frame the world sent, or `None` once the world's side is
+    /// gone. A flush the world asks for completes at once: nothing is in
+    /// flight on this wire.
+    pub async fn recv(&mut self, fcx: &Cx) -> Result<Option<EthernetFrame>> {
+        loop {
+            match fcx.race(None, self.outgoing.recv()).await? {
+                Some(Command::Frame(frame)) => return Ok(Some(frame)),
+                Some(Command::Flush(done)) => {
+                    let _ = done.send(());
+                }
+                None => return Ok(None),
+            }
+        }
+    }
+}
+
 impl RawReceiver {
     /// Drains queued frames before reporting closure or a driver failure.
     pub async fn recv(&mut self, fcx: &Cx) -> Result<EthernetFrame> {

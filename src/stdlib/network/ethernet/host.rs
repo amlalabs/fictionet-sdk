@@ -487,27 +487,41 @@ impl Neighbor {
     /// A neighbor advertisement from the gateway, or an ARP reply, which
     /// counts as a solicited advertisement that overrides (RFC 4861 section
     /// 7.2.5).
-    fn advertised(&mut self, now: Instant, mac: Option<Mac>, solicited: bool, overrides: bool) {
+    ///
+    /// Returns whether the advertisement updated the entry. Only then does
+    /// its Router flag count: an advertisement without a MAC for an
+    /// incomplete entry is discarded, and one that names another MAC without
+    /// the Override flag at most makes the entry stale and "does not update
+    /// the entry in any other way".
+    #[must_use]
+    fn advertised(
+        &mut self,
+        now: Instant,
+        mac: Option<Mac>,
+        solicited: bool,
+        overrides: bool,
+    ) -> bool {
         let reachable = |mac| Neighbor::Reachable {
             mac,
             until: now + REACHABLE_TIME,
         };
         let Some(known) = self.mac() else {
-            if let Some(mac) = mac {
-                *self = if solicited {
-                    reachable(mac)
-                } else {
-                    Neighbor::Stale { mac }
-                };
-            }
-            return;
+            let Some(mac) = mac else {
+                return false;
+            };
+            *self = if solicited {
+                reachable(mac)
+            } else {
+                Neighbor::Stale { mac }
+            };
+            return true;
         };
         let changed = mac.is_some_and(|mac| mac != known);
         if changed && !overrides {
             if let Neighbor::Reachable { .. } = self {
                 *self = Neighbor::Stale { mac: known };
             }
-            return;
+            return false;
         }
         let mac = mac.unwrap_or(known);
         if solicited {
@@ -515,6 +529,7 @@ impl Neighbor {
         } else if changed {
             *self = Neighbor::Stale { mac };
         }
+        true
     }
 
     /// A packet went to the gateway: a stale entry starts the wait before
@@ -795,7 +810,8 @@ impl Host {
                 && p.target_ip == v4.address
                 && p.target_mac == self.mac
             {
-                v4.neighbor.advertised(now, Some(p.sender_mac), true, true);
+                // A reply carries a MAC and overrides, so it always applies.
+                let _ = v4.neighbor.advertised(now, Some(p.sender_mac), true, true);
             } else {
                 v4.neighbor.heard(p.sender_mac);
             }
@@ -914,11 +930,14 @@ impl Host {
                     if let Some((gateway, neighbor)) = v6.gateway()
                         && na.target == gateway
                     {
-                        neighbor.advertised(now, target_ll, na.solicited, na.overrides);
-                        // A learned router that says it is no longer one
+                        let applied =
+                            neighbor.advertised(now, target_ll, na.solicited, na.overrides);
+                        // A learned router that says, in an advertisement
+                        // that updates its entry, that it is no longer one
                         // leaves the default router list (RFC 4861 section
                         // 7.2.5).
                         if let Gateway::Learned { router, .. } = &mut v6.gateway
+                            && applied
                             && !na.router
                         {
                             *router = None;
@@ -2021,6 +2040,58 @@ mod tests {
         // A router that says it is no longer one is dropped.
         h.receive(at(1700), &gateway_na(false));
         assert_eq!(h.ipv6_gateway(), None);
+    }
+
+    /// An unsolicited advertisement for the router with R=0, from another
+    /// node on the segment, to all nodes.
+    fn not_a_router(mac: Option<Mac>) -> Vec<u8> {
+        nd(
+            OTHER_MAC,
+            frame::multicast_mac(ndp::ALL_NODES),
+            GW6,
+            ndp::ALL_NODES,
+            na(GW6, mac, false, false, false),
+        )
+    }
+
+    #[test]
+    fn an_advertisement_without_a_mac_for_an_unresolved_router_is_discarded() {
+        let (mut h, _) = settled(Ipv6Gateway::FromRouterAdvertisements);
+        let advert = nd(
+            GW_MAC,
+            frame::multicast_mac(ndp::ALL_NODES),
+            GW6,
+            ndp::ALL_NODES,
+            ra(1800, None),
+        );
+        h.receive(at(1500), &advert);
+        assert_eq!(h.ipv6_gateway(), Some((GW6, None)));
+        // RFC 4861 section 7.2.5: with the entry INCOMPLETE and no target
+        // link-layer address, the advertisement is discarded, IsRouter
+        // included.
+        assert_eq!(h.receive(at(1600), &not_a_router(None)), Received::Handled);
+        assert_eq!(h.ipv6_gateway(), Some((GW6, None)));
+    }
+
+    #[test]
+    fn an_advertisement_that_does_not_override_leaves_the_router() {
+        let (mut h, _) = settled(Ipv6Gateway::FromRouterAdvertisements);
+        let advert = nd(
+            GW_MAC,
+            frame::multicast_mac(ndp::ALL_NODES),
+            GW6,
+            ndp::ALL_NODES,
+            ra(1800, Some(GW_MAC)),
+        );
+        h.receive(at(1500), &advert);
+        h.receive(at(1600), &gateway_na(true));
+        assert_eq!(h.ipv6_gateway(), Some((GW6, Some(GW_MAC))));
+        // RFC 4861 section 7.2.5: O=0 with another MAC only makes the entry
+        // stale and does not update it in any other way.
+        h.receive(at(1700), &not_a_router(Some(OTHER_MAC)));
+        assert_eq!(h.ipv6_gateway(), Some((GW6, Some(GW_MAC))));
+        let f = h.send(at(1700), &packet6(ADDR6, REMOTE6)).unwrap();
+        assert_eq!(read(&f), Sent::Ip(GW_MAC, packet6(ADDR6, REMOTE6)));
     }
 
     #[test]

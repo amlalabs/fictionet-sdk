@@ -242,8 +242,12 @@ impl Prefix {
 /// [`keep_ttl`](Router::keep_ttl) changes no packet.
 #[track_caller]
 pub fn router<I: Interface>(fcx: &Cx, routes: Vec<(Prefix, I)>) -> Router<I> {
-    let (sender, changes) =
-        Changes::channel(routes.into_iter().map(|(p, i)| Edit::Route(p, i)).collect());
+    let (sender, changes) = Changes::channel(
+        routes
+            .into_iter()
+            .map(|(p, i)| Edit::Route(vec![p], i))
+            .collect(),
+    );
     let router = Router {
         handle: Arc::new(sender),
     };
@@ -258,8 +262,8 @@ pub fn router<I: Interface>(fcx: &Cx, routes: Vec<(Prefix, I)>) -> Router<I> {
             let (edits, gone) = changes.drain();
             handles_gone = handles_gone || gone;
             for edit in edits {
-                let (prefix, interface) = match edit {
-                    Edit::Route(prefix, interface) => (prefix, interface),
+                let (prefixes, interface) = match edit {
+                    Edit::Route(prefixes, interface) => (prefixes, interface),
                     Edit::Address(addr) => {
                         match addr {
                             IpAddr::V4(a) => addrs.0 = Some(a),
@@ -272,13 +276,23 @@ pub fn router<I: Interface>(fcx: &Cx, routes: Vec<(Prefix, I)>) -> Router<I> {
                         continue;
                     }
                 };
-                let prefix = prefix.canonical();
-                match table.routes.get(&prefix) {
-                    Some(&i) => ports.replace(i, interface),
-                    None => {
-                        let i = ports.add(interface);
-                        table.insert(prefix, i);
+                let mut prefixes: Vec<Prefix> =
+                    prefixes.into_iter().map(Prefix::canonical).collect();
+                prefixes.sort_unstable_by_key(|p| (p.addr, p.len));
+                prefixes.dedup();
+                if prefixes.is_empty() {
+                    continue;
+                }
+                let i = ports.add(interface);
+                for prefix in prefixes {
+                    // The prefix moves to the new interface. An old one left
+                    // with no prefix is dropped, which closes it.
+                    if let Some(old) = table.unroute(prefix)
+                        && !table.has_port(old)
+                    {
+                        ports.close(old);
                     }
+                    table.insert(prefix, i);
                 }
             }
             if table.is_empty() && handles_gone {
@@ -357,8 +371,8 @@ fn is_own(addrs: Addrs, addr: IpAddr) -> bool {
 struct Table {
     /// Prefix to port.
     routes: HashMap<Prefix, usize>,
-    /// Port to prefix.
-    by_port: HashMap<usize, Prefix>,
+    /// Port to its prefixes.
+    by_port: HashMap<usize, Vec<Prefix>>,
     /// How many routes have each (IPv4?, length), longest last.
     lengths: BTreeMap<(bool, u8), usize>,
 }
@@ -371,25 +385,41 @@ impl Table {
     /// Adds a route for a prefix that has none.
     fn insert(&mut self, prefix: Prefix, port: usize) {
         self.routes.insert(prefix, port);
-        self.by_port.insert(port, prefix);
+        self.by_port.entry(port).or_default().push(prefix);
         *self
             .lengths
             .entry((prefix.addr.is_ipv4(), prefix.len))
             .or_default() += 1;
     }
 
-    /// Drops the route that goes out on `port`.
-    fn remove_port(&mut self, port: usize) {
-        let Some(prefix) = self.by_port.remove(&port) else {
-            return;
-        };
-        self.routes.remove(&prefix);
+    /// Whether any route goes out on `port`.
+    fn has_port(&self, port: usize) -> bool {
+        self.by_port.contains_key(&port)
+    }
+
+    /// Drops the route for `prefix`, and returns the port it went out on.
+    fn unroute(&mut self, prefix: Prefix) -> Option<usize> {
+        let port = self.routes.remove(&prefix)?;
+        if let Some(prefixes) = self.by_port.get_mut(&port) {
+            prefixes.retain(|p| *p != prefix);
+            if prefixes.is_empty() {
+                self.by_port.remove(&port);
+            }
+        }
         let key = (prefix.addr.is_ipv4(), prefix.len);
         if let Some(n) = self.lengths.get_mut(&key) {
             *n -= 1;
             if *n == 0 {
                 self.lengths.remove(&key);
             }
+        }
+        Some(port)
+    }
+
+    /// Drops every route that goes out on `port`.
+    fn remove_port(&mut self, port: usize) {
+        for prefix in self.by_port.get(&port).cloned().unwrap_or_default() {
+            self.unroute(prefix);
         }
     }
 
@@ -491,7 +521,7 @@ impl<C> Drop for Receiver<C> {
 }
 
 enum Edit<I> {
-    Route(Prefix, I),
+    Route(Vec<Prefix>, I),
     Address(IpAddr),
     KeepTtl,
 }
@@ -518,11 +548,19 @@ impl<I: Interface> Router<I> {
     /// packets that arrive on `interface` are forwarded like any others.
     ///
     /// If a route for exactly `prefix` already exists, the new one replaces
-    /// it, and the old interface is dropped, which closes it.
+    /// it. An old interface left with no route is dropped, which closes it.
     ///
     /// If the router has stopped, `interface` is dropped.
     pub fn add(&self, prefix: Prefix, interface: I) {
-        drop(self.handle.send(Edit::Route(prefix, interface)));
+        self.add_prefixes(vec![prefix], interface);
+    }
+
+    /// Adds one interface for several prefixes, such as an IPv4 and an IPv6
+    /// prefix for a machine with an address of each family. Packets for any
+    /// of `prefixes` go out on `interface`, as [`add`](Router::add) says for
+    /// one. With no prefixes, `interface` is dropped.
+    pub fn add_prefixes(&self, prefixes: Vec<Prefix>, interface: I) {
+        drop(self.handle.send(Edit::Route(prefixes, interface)));
     }
 
     /// Gives the router an address of `addr`'s family, replacing the one it
