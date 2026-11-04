@@ -233,13 +233,14 @@ cargo build -p honeypot-world --features raw-virtio --example raw_honeypot
 
 ```sh
 ./raw_honeypot 0000:00:03.0 ethernet.jsonl \
-  --address 203.0.113.10 --internet 0.0.0.0/0 \
+  --address 203.0.113.10 --gateway 203.0.113.1 --internet 0.0.0.0/0 \
   --ssh 22 --http 80 --log honeypot.jsonl --pcap honeypot.pcapng
 ```
 
 The first argument is the card's PCI address, and the second is where to
-log Ethernet frames. The flags are the honeypot's usual ones. `--world` is
-not used: there is no socket to attach to.
+log Ethernet frames. The flags are the honeypot's usual ones. `--gateway`
+sets the raw adapter's IPv4 default gateway (default `203.0.113.1`). `--world`
+is not used: there is no socket to attach to.
 
 `ethernet.jsonl` has one line per frame, both ways, before the world reads
 it: `direction` (`in` or `out`), `at_us`, the frame in hex as `bytes`, and
@@ -253,14 +254,20 @@ The world plays a Linux host on the link:
 - It answers ARP for its address, to the sender the request names.
 - Untagged IPv4 and IPv6 frames sent to its MAC address, or broadcast, go
   on to the `internet` attachment. Every other frame is only logged.
-- It sends each reply to the MAC address that the reply's destination last
-  sent from. It remembers 1,024 addresses, as Linux's neighbor table holds
-  by default. A source pushed out sends again before it gets more replies.
+- It broadcasts an [ARP request](https://www.rfc-editor.org/rfc/rfc826.html)
+  for the configured gateway at startup and retries every second until
+  resolved, matching [Linux's initial ARP retransmission interval](https://github.com/torvalds/linux/blob/master/net/ipv4/arp.c).
+  It learns and updates one MAC from the gateway's own ARP requests and
+  replies. Traffic from other IP senders cannot replace it.
+- It sends every IPv4 reply to that gateway MAC, whatever the destination
+  IP address. It drops replies until the gateway is known, without queuing
+  them. It has no per-source neighbor table or on-link route handling.
 - It drops replies longer than 1,500 bytes, and does not fragment them. The
   IP capture still has them. It also drops replies while the card's
   transmit queue is full.
-- The server's address must be IPv4. The world does no IPv6 neighbor
-  discovery.
+- The server's address must be IPv4. IPv6 input still reaches the IP
+  attachment, but IPv6 replies are dropped because there is no IPv6 gateway
+  or neighbor discovery.
 
 The world does not set up addresses or routes, or bind PCI devices.
 

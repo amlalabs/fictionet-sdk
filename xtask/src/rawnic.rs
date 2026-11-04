@@ -98,6 +98,40 @@ fn send_frame(stream: &mut TcpStream, frame: &[u8]) -> Result {
     Ok(())
 }
 
+fn resolve_gateway(stream: &mut TcpStream) -> Result {
+    use fictionet::stdlib::network::ethernet::frame;
+
+    let mac = [0x52, 0x54, 0, 0x12, 0x34, 0x56];
+    let mut request = vec![0, 1, 8, 0, 6, 4, 0, 1];
+    request.extend_from_slice(&mac);
+    request.extend_from_slice(&[192, 0, 2, 2]);
+    request.extend_from_slice(&[0; 6]);
+    request.extend_from_slice(&[192, 0, 2, 254]);
+    let expected = frame::frame(frame::BROADCAST, mac, frame::ARP, &request);
+    for _ in 0..2 {
+        let mut size = [0; 4];
+        stream.read_exact(&mut size)?;
+        if u32::from_be_bytes(size) as usize != expected.len() {
+            return Err("invalid gateway ARP request length".into());
+        }
+        let mut bytes = vec![0; expected.len()];
+        stream.read_exact(&mut bytes)?;
+        if bytes != expected {
+            return Err("honeypot did not request its configured gateway".into());
+        }
+    }
+    let mut reply = request;
+    reply[6..8].copy_from_slice(&2u16.to_be_bytes());
+    reply[8..14].copy_from_slice(&frames::GATEWAY_MAC);
+    reply[14..18].copy_from_slice(&[192, 0, 2, 254]);
+    reply[18..24].copy_from_slice(&mac);
+    reply[24..28].copy_from_slice(&[192, 0, 2, 2]);
+    let bytes = frame::frame(mac, frames::GATEWAY_MAC, frame::ARP, &reply);
+    send_frame(stream, &bytes)?;
+    println!("Honeypot requested and retried ARP for its configured gateway");
+    Ok(())
+}
+
 fn receive_tcp(stream: &mut TcpStream, port: u16) -> Result<Vec<u8>> {
     use fictionet::stdlib::network::{ethernet::frame, ip, tcp};
     loop {
@@ -112,7 +146,7 @@ fn receive_tcp(stream: &mut TcpStream, port: u16) -> Result<Vec<u8>> {
         let frame = frame::Frame::parse(&bytes).ok_or("invalid Ethernet response")?;
         let header = ip::Header::parse_whole(frame.payload).ok_or("invalid IP response")?;
         let segment = header.payload(frame.payload);
-        if frame.dst != [0x52, 0x54, 0, 0xab, 0xcd, 0xef]
+        if frame.dst != frames::GATEWAY_MAC
             || frame.src != [0x52, 0x54, 0, 0x12, 0x34, 0x56]
             || frame.ethertype != frame::IPV4
             || header.src != "192.0.2.2".parse::<std::net::IpAddr>()?
@@ -533,6 +567,7 @@ pub fn run(directory: PathBuf) -> Result {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+        resolve_gateway(&mut stream)?;
         for (index, frame) in frames::fixtures().into_iter().enumerate() {
             stream.write_all(&(frame.len() as u32).to_be_bytes())?;
             stream.write_all(&frame)?;
@@ -549,7 +584,7 @@ pub fn run(directory: PathBuf) -> Result {
                 let header = ip::Header::parse_whole(&answer[14..])
                     .ok_or("honeypot response is not valid IP")?;
                 let segment = header.payload(&answer[14..]);
-                if answer[..6] != frame[6..12]
+                if answer[..6] != frames::GATEWAY_MAC
                     || answer[6..12] != frame[..6]
                     || answer[12..14] != [8, 0]
                     || header.protocol != 6

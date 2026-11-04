@@ -89,6 +89,7 @@ pub fn honeypot(nic: VirtioNet) -> fictionet::Result {
         move |fcx| async move {
             let config = honeypot_world::Config {
                 address: "192.0.2.2".parse().unwrap(),
+                gateway: "192.0.2.254".parse().unwrap(),
                 ..Default::default()
             };
             let _honeypot = honeypot_world::start_raw(
@@ -161,6 +162,15 @@ pub fn honeypot(nic: VirtioNet) -> fictionet::Result {
         .lines()
         .map(serde_json::from_str)
         .collect::<Result<_, _>>()?;
+    let gateway = hex(&crate::rawnic_frames::GATEWAY_MAC);
+    if frames.iter().any(|entry| {
+        entry["direction"] == "out"
+            && entry["bytes"].as_str().is_some_and(|bytes| {
+                bytes.get(24..28) == Some("0800") && !bytes.starts_with(&gateway)
+            })
+    }) {
+        return Err(fictionet::Error::msg("IPv4 reply bypassed the gateway"));
+    }
     for frame in crate::rawnic_frames::fixtures() {
         if !frames
             .iter()

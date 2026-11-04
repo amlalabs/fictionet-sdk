@@ -25,7 +25,10 @@ fn main() -> fictionet::Result {
     };
     let (pump, attachment) = RawPump::attach(VirtioNet::open(address)?)?;
     let clock = Clock::starting_now();
-    println!("raw honeypot at {} on {address}", args.config.address);
+    println!(
+        "raw honeypot at {} via {} on {address}",
+        args.config.address, args.config.gateway
+    );
     let result = fictionet::block_on(fictionet::run(fictionet::Seed::random(), move |fcx| {
         let started =
             honeypot_world::start_raw(&fcx, &args.config, clock, sinks, attachment, raw_log);

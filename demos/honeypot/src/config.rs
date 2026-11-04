@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! honeypot [--world unix:PATH] [--log PATH] [--pcap PATH]
-//!          [--address ADDR] [--internet PREFIX]
+//!          [--address ADDR] [--internet PREFIX] [--gateway IPV4]
 //!          [--ssh PORT]... [--http PORT]...
 //!          [--burst-window-ms MS] [--burst-syns N]
 //! ```
@@ -27,6 +27,8 @@ pub struct Config {
     pub address: IpAddr,
     /// The addresses the `internet` attachment carries.
     pub internet: Prefix,
+    /// The IPv4 default gateway used by the raw Ethernet adapter.
+    pub gateway: Ipv4Addr,
     /// The server's open TCP ports, each with an MPTCP listener.
     pub ports: Vec<Port>,
     /// When SYNs from one source count as a burst.
@@ -74,6 +76,7 @@ impl Default for Config {
     fn default() -> Config {
         Config {
             address: DEFAULT_ADDRESS,
+            gateway: Ipv4Addr::new(203, 0, 113, 1),
             internet: Prefix {
                 addr: Ipv4Addr::UNSPECIFIED.into(),
                 len: 0,
@@ -148,6 +151,8 @@ pub enum Flag {
     Address,
     /// `--internet`: [`Config::internet`].
     Internet,
+    /// `--gateway`: [`Config::gateway`].
+    Gateway,
     /// `--ssh`: a port with [`Service::Ssh`].
     Ssh,
     /// `--http`: a port with [`Service::Http`].
@@ -160,12 +165,13 @@ pub enum Flag {
 
 impl Flag {
     /// Every flag.
-    pub const ALL: [Flag; 9] = [
+    pub const ALL: [Flag; 10] = [
         Flag::World,
         Flag::Log,
         Flag::Pcap,
         Flag::Address,
         Flag::Internet,
+        Flag::Gateway,
         Flag::Ssh,
         Flag::Http,
         Flag::BurstWindowMs,
@@ -180,6 +186,7 @@ impl Flag {
             Flag::Pcap => "--pcap",
             Flag::Address => "--address",
             Flag::Internet => "--internet",
+            Flag::Gateway => "--gateway",
             Flag::Ssh => "--ssh",
             Flag::Http => "--http",
             Flag::BurstWindowMs => "--burst-window-ms",
@@ -222,6 +229,7 @@ impl Args {
                 Flag::Pcap => parsed.pcap = value.into(),
                 Flag::Address => config.address = value.parse().map_err(|_| bad())?,
                 Flag::Internet => config.internet = value.parse().map_err(|_| bad())?,
+                Flag::Gateway => config.gateway = value.parse().map_err(|_| bad())?,
                 Flag::Ssh => config.ports.push(Port {
                     number: value.parse().map_err(|_| bad())?,
                     service: Service::Ssh,
@@ -261,7 +269,7 @@ mod tests {
             assert_eq!(Flag::parse(flag.name()), Some(flag));
             let value = match flag {
                 Flag::World => "unix:/tmp/w.sock",
-                Flag::Address => "192.0.2.1",
+                Flag::Address | Flag::Gateway => "192.0.2.1",
                 Flag::Internet => "0.0.0.0/0",
                 _ => "7",
             };
@@ -284,7 +292,7 @@ mod tests {
     fn flags_set_the_world() {
         let parsed = args(
             "--world unix:/tmp/w.sock --log a.jsonl --pcap a.pcapng --address 198.51.100.7 \
-             --internet 198.51.0.0/16 --ssh 2222 --http 8080 --http 80 \
+             --internet 198.51.0.0/16 --gateway 198.51.100.1 --ssh 2222 --http 8080 --http 80 \
              --burst-window-ms 50 --burst-syns 4",
         )
         .unwrap();
@@ -293,6 +301,7 @@ mod tests {
         let config = parsed.config;
         assert_eq!(config.address, "198.51.100.7".parse::<IpAddr>().unwrap());
         assert_eq!(config.internet, "198.51.0.0/16".parse().unwrap());
+        assert_eq!(config.gateway, Ipv4Addr::new(198, 51, 100, 1));
         assert_eq!(
             config.ports.iter().map(|p| p.number).collect::<Vec<_>>(),
             [2222, 8080, 80]
@@ -325,5 +334,13 @@ mod tests {
         );
         assert!(args("--burst-syns 0").is_err());
         assert!(args("--world /no/scheme").is_err());
+        assert_eq!(args("--gateway"), Err(ArgsError::Missing(Flag::Gateway)));
+        assert_eq!(
+            args("--gateway ::1"),
+            Err(ArgsError::Bad {
+                flag: Flag::Gateway,
+                value: "::1".into()
+            })
+        );
     }
 }

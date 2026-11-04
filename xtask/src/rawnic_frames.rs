@@ -1,5 +1,7 @@
 //! Ethernet inputs shared by the QEMU peer and guest assertions.
 
+pub const GATEWAY_MAC: [u8; 6] = [0x52, 0x54, 0, 0x65, 0x43, 0x21];
+
 pub fn fixtures() -> Vec<Vec<u8>> {
     fn checksum(bytes: &[u8]) -> u16 {
         let mut sum = bytes

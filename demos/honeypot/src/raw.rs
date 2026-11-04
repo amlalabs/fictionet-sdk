@@ -1,9 +1,9 @@
 //! Complete Ethernet frames reach this world before any protocol parsing.
 
-use std::collections::BTreeMap;
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use fictionet::stdlib::network::ethernet::frame::{self, Frame, Mac};
 use fictionet::stdlib::network::ip;
@@ -14,9 +14,8 @@ use fictionet_host::raw::{EthernetFrame, RawAttachment};
 use crate::observe::{Direction, Hex, Sink, Sinks};
 use crate::{Clock, Config, Honeypot, INTERNET};
 
-/// How many source addresses the adapter remembers the Ethernet sender
-/// of, as many as Linux's neighbor table holds by default (gc_thresh3).
-const PEERS: usize = 1024;
+/// Linux's initial ARP retransmission interval.
+const ARP_RETRY: Duration = Duration::from_secs(1);
 
 /// The largest IP packet one Ethernet frame carries.
 const MTU: usize = 1500;
@@ -56,12 +55,15 @@ impl Capture {
 /// capture and TCP option observations.
 ///
 /// Only untagged IPv4 and IPv6 addressed to this NIC enter the IP attachment.
-/// ARP for the configured IPv4 address is answered here. A table of
-/// 1,024 source IP addresses and their Ethernet senders gives replies
-/// their destination; a source pushed out of it must send again before it
-/// gets another reply. Outgoing IP packets over the Ethernet MTU of 1500
-/// bytes are dropped, as are those sent while the NIC's transmit queue is
-/// full. The driver and its polling thread must be opened outside
+/// ARP for the configured IPv4 address is answered here. The adapter broadcasts
+/// an ARP request for [`Config::gateway`] at startup and every second until it
+/// learns the gateway's MAC from its own ARP requests or replies.
+/// Every IPv4 reply goes to that MAC, regardless of its destination IP;
+/// replies are dropped until the gateway is known. IPv6 replies are dropped:
+/// the configuration supplies only an IPv4 gateway and no neighbor discovery.
+/// Outgoing packets over the Ethernet MTU of 1500 bytes are dropped, as are
+/// those sent while the NIC's transmit queue is full. The driver and its
+/// polling thread must be opened outside
 /// `fictionet::run` and kept alive for the run.
 pub fn start_raw(
     fcx: &Cx,
@@ -81,14 +83,15 @@ pub fn start_raw(
     let (attacher, attachments) = fictionet::attachments();
     let end = Arc::new(Mutex::new(attacher.attach(INTERNET)?));
     let honeypot = crate::start(fcx, config, clock, sinks, attachments)?;
-    let peers = Arc::new(Mutex::new(BTreeMap::<IpAddr, Mac>::new()));
+    let gateway = config.gateway;
+    let gateway_mac = Arc::new(Mutex::new(None));
     let capture = Arc::new(Mutex::new(Capture {
         writer: Sink::new(raw_log),
         lost: 0,
         clock,
     }));
     let incoming_end = end.clone();
-    let incoming_peers = peers.clone();
+    let incoming_gateway = gateway_mac.clone();
     let incoming_capture = capture.clone();
     let incoming_sender = sender.clone();
     fcx.spawn(move |fcx| async move {
@@ -104,6 +107,9 @@ pub fn start_raw(
             if frame::is_group(&frame.src) || (frame.dst != mac && frame.dst != frame::BROADCAST) {
                 continue;
             }
+            if let Some(learned) = arp_gateway(&frame, gateway) {
+                *incoming_gateway.lock() = Some(learned);
+            }
             if let Some(reply) = arp_reply(&frame, mac, address) {
                 incoming_capture.lock().frame(&fcx, Direction::Out, &reply);
                 incoming_sender.send(&fcx, EthernetFrame(reply)).await?;
@@ -112,43 +118,63 @@ pub fn start_raw(
             let Some(packet) = frame::ip_packet(frame.ethertype, frame.payload) else {
                 continue;
             };
-            let Some(source) = ip::source(packet) else {
-                continue;
-            };
-            {
-                let mut peers = incoming_peers.lock();
-                if peers.len() >= PEERS && !peers.contains_key(&source) {
-                    peers.pop_first();
-                }
-                peers.insert(source, frame.src);
-            }
             incoming_end.lock().send(Packet(packet.to_vec()));
         }
+    });
+    let resolving_gateway = gateway_mac.clone();
+    let resolving_capture = capture.clone();
+    let resolving_sender = sender.clone();
+    fcx.spawn(move |fcx| async move {
+        while resolving_gateway.lock().is_none() {
+            let bytes = arp_request(mac, address, gateway);
+            resolving_capture.lock().frame(&fcx, Direction::Out, &bytes);
+            resolving_sender.try_send(EthernetFrame(bytes))?;
+            fcx.sleep(ARP_RETRY).await?;
+        }
+        Ok(())
     });
     fcx.spawn(move |fcx| async move {
         loop {
             let packet = std::future::poll_fn(|cx| end.lock().poll_recv(&fcx, cx)).await?;
-            // Reassembly can produce a reply larger than the Ethernet MTU.
-            if packet.0.len() > MTU {
-                continue;
-            }
-            let Some(header) = ip::Header::parse(&packet.0) else {
+            let Some(bytes) = outgoing(&packet.0, mac, *gateway_mac.lock()) else {
                 continue;
             };
-            let Some(peer) = peers.lock().get(&header.dst).copied() else {
-                continue;
-            };
-            let kind = if header.dst.is_ipv4() {
-                frame::IPV4
-            } else {
-                frame::IPV6
-            };
-            let bytes = frame::frame(peer, mac, kind, &packet.0);
             capture.lock().frame(&fcx, Direction::Out, &bytes);
             sender.try_send(EthernetFrame(bytes))?;
         }
     });
     Ok(honeypot)
+}
+
+fn outgoing(packet: &[u8], mac: Mac, gateway: Option<Mac>) -> Option<Vec<u8>> {
+    // Reassembly can produce a reply larger than the Ethernet MTU.
+    if packet.len() > MTU || !ip::Header::parse(packet)?.dst.is_ipv4() {
+        return None;
+    }
+    Some(frame::frame(gateway?, mac, frame::IPV4, packet))
+}
+
+fn arp_request(mac: Mac, address: Ipv4Addr, gateway: Ipv4Addr) -> Vec<u8> {
+    let mut request = vec![0, 1, 8, 0, 6, 4, 0, 1];
+    request.extend_from_slice(&mac);
+    request.extend_from_slice(&address.octets());
+    request.extend_from_slice(&[0; 6]);
+    request.extend_from_slice(&gateway.octets());
+    frame::frame(frame::BROADCAST, mac, frame::ARP, &request)
+}
+
+fn arp_gateway(frame: &Frame<'_>, gateway: Ipv4Addr) -> Option<Mac> {
+    let p = frame.payload;
+    if frame.ethertype != frame::ARP
+        || p.len() < 28
+        || p[..6] != [0, 1, 8, 0, 6, 4]
+        || !matches!(&p[6..8], [0, 1] | [0, 2])
+        || p[14..18] != gateway.octets()
+    {
+        return None;
+    }
+    let sender: Mac = p[8..14].try_into().expect("six bytes");
+    (!frame::is_group(&sender) && sender != [0; 6]).then_some(sender)
 }
 
 /// The reply to an Ethernet/IPv4 ARP request for `address`, as Linux
@@ -175,6 +201,104 @@ fn arp_reply(frame: &Frame<'_>, mac: Mac, address: Ipv4Addr) -> Option<Vec<u8>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gateway_is_learned_from_requests_and_replies() {
+        let address = Ipv4Addr::new(203, 0, 113, 10);
+        let gateway = Ipv4Addr::new(203, 0, 113, 1);
+        let mac = [2; 6];
+        let router = [4; 6];
+        let bytes = arp_request(mac, address, gateway);
+        let request = Frame::parse(&bytes).unwrap();
+        assert_eq!(
+            (request.src, request.dst, request.ethertype),
+            (mac, frame::BROADCAST, frame::ARP)
+        );
+        assert_eq!(&request.payload[..8], &[0, 1, 8, 0, 6, 4, 0, 1]);
+        assert_eq!(&request.payload[8..14], &mac);
+        assert_eq!(&request.payload[14..18], &address.octets());
+        assert_eq!(&request.payload[18..24], &[0; 6]);
+        assert_eq!(&request.payload[24..28], &gateway.octets());
+        let reply = arp_reply(&request, router, gateway).unwrap();
+        assert_eq!(
+            arp_gateway(&Frame::parse(&reply).unwrap(), gateway),
+            Some(router)
+        );
+        let request = arp_request(router, gateway, address);
+        assert_eq!(
+            arp_gateway(&Frame::parse(&request).unwrap(), gateway),
+            Some(router)
+        );
+        for target in [gateway, Ipv4Addr::new(203, 0, 113, 20)] {
+            let request = arp_request([6; 6], gateway, target);
+            assert_eq!(
+                arp_gateway(&Frame::parse(&request).unwrap(), gateway),
+                Some([6; 6])
+            );
+        }
+    }
+
+    #[test]
+    fn other_senders_and_invalid_arp_do_not_resolve_the_gateway() {
+        let address = Ipv4Addr::new(203, 0, 113, 10);
+        let gateway = Ipv4Addr::new(203, 0, 113, 1);
+        let request = arp_request([4; 6], gateway, address);
+        for (offset, value) in [(12, 0x86), (14, 1), (18, 5), (21, 3), (22, 1), (28, 192)] {
+            let mut bad = request.clone();
+            bad[offset] = value;
+            assert_eq!(arp_gateway(&Frame::parse(&bad).unwrap(), gateway), None);
+        }
+        let truncated = Frame::parse(&request[..41]).unwrap();
+        assert_eq!(arp_gateway(&truncated, gateway), None);
+        let empty_mac = arp_request([0; 6], gateway, address);
+        assert_eq!(
+            arp_gateway(&Frame::parse(&empty_mac).unwrap(), gateway),
+            None
+        );
+        let packet = ip::packet(gateway.into(), address.into(), 1, &[8, 0, 0, 0]);
+        let bytes = frame::frame([2; 6], [4; 6], frame::IPV4, &packet.0);
+        assert_eq!(arp_gateway(&Frame::parse(&bytes).unwrap(), gateway), None);
+    }
+
+    #[test]
+    fn all_ipv4_destinations_use_the_gateway_mac() {
+        let address = "203.0.113.10".parse().unwrap();
+        for destination in ["192.0.2.5", "198.51.100.27"] {
+            let packet = ip::packet(address, destination.parse().unwrap(), 1, &[0, 0, 0, 0]);
+            let bytes = outgoing(&packet.0, [2; 6], Some([4; 6])).unwrap();
+            let parsed = Frame::parse(&bytes).unwrap();
+            assert_eq!(
+                (parsed.src, parsed.dst, parsed.ethertype),
+                ([2; 6], [4; 6], frame::IPV4)
+            );
+            assert_eq!(
+                frame::ip_packet(parsed.ethertype, parsed.payload),
+                Some(packet.0.as_slice())
+            );
+            assert!(outgoing(&packet.0, [2; 6], None).is_none());
+        }
+    }
+
+    #[test]
+    fn oversized_and_ipv6_replies_are_dropped() {
+        let packet = ip::packet(
+            "203.0.113.10".parse().unwrap(),
+            "192.0.2.5".parse().unwrap(),
+            1,
+            &[0; MTU - 20],
+        );
+        assert!(outgoing(&packet.0, [2; 6], Some([4; 6])).is_some());
+        let mut oversized = packet.0;
+        oversized.push(0);
+        assert!(outgoing(&oversized, [2; 6], Some([4; 6])).is_none());
+        let packet = ip::packet(
+            "2001:db8::1".parse().unwrap(),
+            "2001:db8::2".parse().unwrap(),
+            58,
+            &[0; 8],
+        );
+        assert!(outgoing(&packet.0, [2; 6], Some([4; 6])).is_none());
+    }
 
     #[test]
     fn ethernet_padding_is_not_an_ip_payload() {
