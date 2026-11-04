@@ -972,7 +972,8 @@ def parse (bytes : Bytes) (udp : Bool) : Parsed :=
         match m.question with
         | [q] =>
           if q.qtype == 41 then rej 1 optOut
-          else if udp && (q.qtype == 251 || q.qtype == 252) then rej 1 optOut
+          -- AXFR is not defined over UDP (RFC 5936 §4.2); IXFR is (RFC 1995 §2)
+          else if udp && q.qtype == 252 then rej 1 optOut
           else if q.qtype == 253 || q.qtype == 254 then rej 4 optOut
           else .request ⟨h, q, edns⟩
         | _ => rej 1 optOut
