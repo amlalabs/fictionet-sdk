@@ -539,9 +539,11 @@ fn creates_queued_behind_a_running_response_are_bounded() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let (release, released) = std::sync::mpsc::channel::<()>();
+    let (arrive, arrived) = tokio::sync::oneshot::channel::<()>();
     let upstream = std::thread::spawn(move || {
         let (mut socket, _) = listener.accept().unwrap();
         received(&mut socket);
+        arrive.send(()).unwrap();
         // Never answer: the first response stays running.
         let _ = released.recv();
     });
@@ -558,6 +560,9 @@ fn creates_queued_behind_a_running_response_are_bounded() {
             // The session refuses work it would otherwise hold without limit.
             let refused = client.event().await;
             assert_eq!(refused["type"], "error");
+            // The refusal can come back before the first request has
+            // reached the upstream. Cancelling then would cut it off.
+            arrived.await.unwrap();
             release.send(()).unwrap();
             cx.cancel();
             Ok(())
