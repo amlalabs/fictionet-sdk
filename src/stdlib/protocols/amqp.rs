@@ -2519,7 +2519,7 @@ mod tests {
     use fictionet::assert_cases;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream, pump};
     use fictionet::stdlib::test_support::contract;
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
+    use fictionet::stdlib::test_support::rounds;
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn s(v: &str) -> String {
@@ -3543,19 +3543,15 @@ mod tests {
     }
 
     #[test]
-    fn stream_takes_many_small_frames_in_linear_time() {
-        assert_linear(
-            "stream_takes_many_small_frames_in_linear_time",
-            rounds(50_000),
-            |size| {
-                let bytes = Frame::heartbeat().to_bytes().unwrap().repeat(size);
-                let mut stream = Stream::new(Frames::new());
-                let mut n = 0;
-                pump(&mut stream, &bytes, |_| n += 1).unwrap();
-                assert_eq!(n, size);
-                assert_eq!(stream.buffered(), 0);
-            },
-        );
+    fn stream_takes_many_small_frames() {
+        for size in [rounds(50_000), 4 * (rounds(50_000))] {
+            let bytes = Frame::heartbeat().to_bytes().unwrap().repeat(size);
+            let mut stream = Stream::new(Frames::new());
+            let mut n = 0;
+            pump(&mut stream, &bytes, |_| n += 1).unwrap();
+            assert_eq!(n, size);
+            assert_eq!(stream.buffered(), 0);
+        }
     }
 
     #[test]

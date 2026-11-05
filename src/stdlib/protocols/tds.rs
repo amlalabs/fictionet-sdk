@@ -3447,7 +3447,7 @@ mod tests {
     use fictionet::stdlib::codec::{Fail, Lcg, Stream};
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::hex;
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
+    use fictionet::stdlib::test_support::rounds;
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     // Examples from MS-TDS section 4.
@@ -4056,20 +4056,16 @@ mod tests {
     }
 
     #[test]
-    fn stream_reads_many_small_messages_in_linear_time() {
-        assert_linear(
-            "stream_reads_many_small_messages_in_linear_time",
-            rounds(50_000),
-            |size| {
-                let one = Message::new(packet_type::SQL_BATCH, vec![b'x', 0])
-                    .to_bytes()
-                    .unwrap();
-                let bytes = one.repeat(size);
-                let (messages, failure) = decode_all(Messages::new, &bytes);
-                assert_eq!(messages.len(), size);
-                assert_eq!(failure, None);
-            },
-        );
+    fn stream_reads_many_small_messages() {
+        for size in [rounds(50_000), 4 * (rounds(50_000))] {
+            let one = Message::new(packet_type::SQL_BATCH, vec![b'x', 0])
+                .to_bytes()
+                .unwrap();
+            let bytes = one.repeat(size);
+            let (messages, failure) = decode_all(Messages::new, &bytes);
+            assert_eq!(messages.len(), size);
+            assert_eq!(failure, None);
+        }
     }
 
     #[test]

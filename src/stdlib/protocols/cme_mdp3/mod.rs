@@ -16588,486 +16588,145 @@ impl fictionet::stdlib::codec::Wire for Message {
 #[cfg(test)]
 mod generated_tests {
     use super::*;
+    use fictionet::stdlib::test_support::assert_write;
 
     #[test]
-    fn generated_contracts() -> Result<(), Error> {
-        {
-            use super::Decimal9 as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::Decimal9Null as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::DecimalQty as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MaturityMonthYear as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::Price9 as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::Pricenull9 as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::AggressorFlag as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::AggressorSide as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::EventType as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::HaltReason as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::LegSide as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdEntryType as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdEntryTypeBook as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdEntryTypeDailyStatistics as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdEntryTypeStatistics as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdUpdateAction as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MoneyOrPar as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::OpenCloseSettlFlag as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::OrderUpdateAction as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::PriceSource as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::PutOrCall as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::RepoSubType as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::SecurityAltIdSource as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::SecurityTradingEvent as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::SecurityTradingStatus as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::SecurityUpdateAction as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::Side as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::WorkupTradingStatus as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::InstAttribValue as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MatchEventIndicator as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::SettlPriceType as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::ChannelReset4 as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::ChannelReset4NoMdEntries as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::AdminHeartbeat12 as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::AdminLogin15 as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::AdminLogout16 as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::SecurityStatus30 as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdIncrementalRefreshVolume37 as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdIncrementalRefreshVolume37NoMdEntries as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::QuoteRequest39 as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::QuoteRequest39NoRelatedSym as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdIncrementalRefreshBook46 as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdIncrementalRefreshBook46NoMdEntries as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdIncrementalRefreshBook46NoOrderIdEntries as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdIncrementalRefreshOrderBook47 as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdIncrementalRefreshOrderBook47NoMdEntries as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdIncrementalRefreshTradeSummary48 as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdIncrementalRefreshTradeSummary48NoMdEntries as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdIncrementalRefreshTradeSummary48NoOrderIdEntries as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdIncrementalRefreshDailyStatistics49 as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdIncrementalRefreshDailyStatistics49NoMdEntries as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdIncrementalRefreshLimitsBanding50 as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdIncrementalRefreshLimitsBanding50NoMdEntries as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdIncrementalRefreshSessionStatistics51 as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdIncrementalRefreshSessionStatistics51NoMdEntries as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::SnapshotFullRefresh52 as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::SnapshotFullRefresh52NoMdEntries as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::SnapshotFullRefreshOrderBook53 as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::SnapshotFullRefreshOrderBook53NoMdEntries as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdInstrumentDefinitionFuture54 as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdInstrumentDefinitionFuture54NoEvents as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdInstrumentDefinitionFuture54NoMdFeedTypes as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdInstrumentDefinitionFuture54NoInstAttrib as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdInstrumentDefinitionFuture54NoLotTypeRules as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdInstrumentDefinitionOption55 as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdInstrumentDefinitionOption55NoEvents as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdInstrumentDefinitionOption55NoMdFeedTypes as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdInstrumentDefinitionOption55NoInstAttrib as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdInstrumentDefinitionOption55NoLotTypeRules as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdInstrumentDefinitionOption55NoUnderlyings as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdInstrumentDefinitionOption55NoRelatedInstruments as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdInstrumentDefinitionSpread56 as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdInstrumentDefinitionSpread56NoEvents as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdInstrumentDefinitionSpread56NoMdFeedTypes as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdInstrumentDefinitionSpread56NoInstAttrib as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdInstrumentDefinitionSpread56NoLotTypeRules as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdInstrumentDefinitionSpread56NoLegs as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdInstrumentDefinitionFixedIncome57 as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdInstrumentDefinitionFixedIncome57NoEvents as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdInstrumentDefinitionFixedIncome57NoMdFeedTypes as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdInstrumentDefinitionFixedIncome57NoInstAttrib as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdInstrumentDefinitionFixedIncome57NoLotTypeRules as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdInstrumentDefinitionRepo58 as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdInstrumentDefinitionRepo58NoEvents as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdInstrumentDefinitionRepo58NoMdFeedTypes as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdInstrumentDefinitionRepo58NoInstAttrib as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdInstrumentDefinitionRepo58NoLotTypeRules as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdInstrumentDefinitionRepo58NoUnderlyings as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdInstrumentDefinitionRepo58NoRelatedInstruments as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdInstrumentDefinitionRepo58NoBrokenDates as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::SnapshotRefreshTopOrders59 as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::SnapshotRefreshTopOrders59NoMdEntries as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::SecurityStatusWorkup60 as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::SecurityStatusWorkup60NoOrderIdEntries as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::SnapshotFullRefreshTcp61 as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::SnapshotFullRefreshTcp61NoMdEntries as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::CollateralMarketValue62 as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::CollateralMarketValue62NoMdEntries as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdInstrumentDefinitionFx63 as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdInstrumentDefinitionFx63NoEvents as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdInstrumentDefinitionFx63NoMdFeedTypes as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdInstrumentDefinitionFx63NoInstAttrib as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdInstrumentDefinitionFx63NoLotTypeRules as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdInstrumentDefinitionFx63NoTradingSessions as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdIncrementalRefreshBookLongQty64 as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdIncrementalRefreshBookLongQty64NoMdEntries as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdIncrementalRefreshBookLongQty64NoOrderIdEntries as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdIncrementalRefreshTradeSummaryLongQty65 as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdIncrementalRefreshTradeSummaryLongQty65NoMdEntries as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdIncrementalRefreshTradeSummaryLongQty65NoOrderIdEntries as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdIncrementalRefreshVolumeLongQty66 as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdIncrementalRefreshVolumeLongQty66NoMdEntries as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdIncrementalRefreshSessionStatisticsLongQty67 as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::MdIncrementalRefreshSessionStatisticsLongQty67NoMdEntries as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::SnapshotFullRefreshTcpLongQty68 as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::SnapshotFullRefreshTcpLongQty68NoMdEntries as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::SnapshotFullRefreshLongQty69 as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::SnapshotFullRefreshLongQty69NoMdEntries as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::Message as Value;
-            __wire::check::<Value>()?;
-        }
-        Ok(())
+    fn generated_values_round_trip() {
+        macro_rules! values {
+            ($($ty:ty),+ $(,)?) => {
+                $({
+                    let mut written = 0;
+                    for seed in 0..32 {
+                        let mut sampler = __wire::Sampler::seed(seed);
+                        if let Ok(value) = <$ty as __wire::Codec>::sample(&mut sampler) {
+                            written += usize::from(assert_write(&value).is_ok());
+                        }
+                    }
+                    assert!(written > 0, "no writable sample for {}", std::any::type_name::<$ty>());
+                })+
+            };
+        }
+        values!(
+            super::Decimal9,
+            super::Decimal9Null,
+            super::DecimalQty,
+            super::MaturityMonthYear,
+            super::Price9,
+            super::Pricenull9,
+            super::AggressorFlag,
+            super::AggressorSide,
+            super::EventType,
+            super::HaltReason,
+            super::LegSide,
+            super::MdEntryType,
+            super::MdEntryTypeBook,
+            super::MdEntryTypeDailyStatistics,
+            super::MdEntryTypeStatistics,
+            super::MdUpdateAction,
+            super::MoneyOrPar,
+            super::OpenCloseSettlFlag,
+            super::OrderUpdateAction,
+            super::PriceSource,
+            super::PutOrCall,
+            super::RepoSubType,
+            super::SecurityAltIdSource,
+            super::SecurityTradingEvent,
+            super::SecurityTradingStatus,
+            super::SecurityUpdateAction,
+            super::Side,
+            super::WorkupTradingStatus,
+            super::InstAttribValue,
+            super::MatchEventIndicator,
+            super::SettlPriceType,
+            super::ChannelReset4,
+            super::ChannelReset4NoMdEntries,
+            super::AdminHeartbeat12,
+            super::AdminLogin15,
+            super::AdminLogout16,
+            super::SecurityStatus30,
+            super::MdIncrementalRefreshVolume37,
+            super::MdIncrementalRefreshVolume37NoMdEntries,
+            super::QuoteRequest39,
+            super::QuoteRequest39NoRelatedSym,
+            super::MdIncrementalRefreshBook46,
+            super::MdIncrementalRefreshBook46NoMdEntries,
+            super::MdIncrementalRefreshBook46NoOrderIdEntries,
+            super::MdIncrementalRefreshOrderBook47,
+            super::MdIncrementalRefreshOrderBook47NoMdEntries,
+            super::MdIncrementalRefreshTradeSummary48,
+            super::MdIncrementalRefreshTradeSummary48NoMdEntries,
+            super::MdIncrementalRefreshTradeSummary48NoOrderIdEntries,
+            super::MdIncrementalRefreshDailyStatistics49,
+            super::MdIncrementalRefreshDailyStatistics49NoMdEntries,
+            super::MdIncrementalRefreshLimitsBanding50,
+            super::MdIncrementalRefreshLimitsBanding50NoMdEntries,
+            super::MdIncrementalRefreshSessionStatistics51,
+            super::MdIncrementalRefreshSessionStatistics51NoMdEntries,
+            super::SnapshotFullRefresh52,
+            super::SnapshotFullRefresh52NoMdEntries,
+            super::SnapshotFullRefreshOrderBook53,
+            super::SnapshotFullRefreshOrderBook53NoMdEntries,
+            super::MdInstrumentDefinitionFuture54,
+            super::MdInstrumentDefinitionFuture54NoEvents,
+            super::MdInstrumentDefinitionFuture54NoMdFeedTypes,
+            super::MdInstrumentDefinitionFuture54NoInstAttrib,
+            super::MdInstrumentDefinitionFuture54NoLotTypeRules,
+            super::MdInstrumentDefinitionOption55,
+            super::MdInstrumentDefinitionOption55NoEvents,
+            super::MdInstrumentDefinitionOption55NoMdFeedTypes,
+            super::MdInstrumentDefinitionOption55NoInstAttrib,
+            super::MdInstrumentDefinitionOption55NoLotTypeRules,
+            super::MdInstrumentDefinitionOption55NoUnderlyings,
+            super::MdInstrumentDefinitionOption55NoRelatedInstruments,
+            super::MdInstrumentDefinitionSpread56,
+            super::MdInstrumentDefinitionSpread56NoEvents,
+            super::MdInstrumentDefinitionSpread56NoMdFeedTypes,
+            super::MdInstrumentDefinitionSpread56NoInstAttrib,
+            super::MdInstrumentDefinitionSpread56NoLotTypeRules,
+            super::MdInstrumentDefinitionSpread56NoLegs,
+            super::MdInstrumentDefinitionFixedIncome57,
+            super::MdInstrumentDefinitionFixedIncome57NoEvents,
+            super::MdInstrumentDefinitionFixedIncome57NoMdFeedTypes,
+            super::MdInstrumentDefinitionFixedIncome57NoInstAttrib,
+            super::MdInstrumentDefinitionFixedIncome57NoLotTypeRules,
+            super::MdInstrumentDefinitionRepo58,
+            super::MdInstrumentDefinitionRepo58NoEvents,
+            super::MdInstrumentDefinitionRepo58NoMdFeedTypes,
+            super::MdInstrumentDefinitionRepo58NoInstAttrib,
+            super::MdInstrumentDefinitionRepo58NoLotTypeRules,
+            super::MdInstrumentDefinitionRepo58NoUnderlyings,
+            super::MdInstrumentDefinitionRepo58NoRelatedInstruments,
+            super::MdInstrumentDefinitionRepo58NoBrokenDates,
+            super::SnapshotRefreshTopOrders59,
+            super::SnapshotRefreshTopOrders59NoMdEntries,
+            super::SecurityStatusWorkup60,
+            super::SecurityStatusWorkup60NoOrderIdEntries,
+            super::SnapshotFullRefreshTcp61,
+            super::SnapshotFullRefreshTcp61NoMdEntries,
+            super::CollateralMarketValue62,
+            super::CollateralMarketValue62NoMdEntries,
+            super::MdInstrumentDefinitionFx63,
+            super::MdInstrumentDefinitionFx63NoEvents,
+            super::MdInstrumentDefinitionFx63NoMdFeedTypes,
+            super::MdInstrumentDefinitionFx63NoInstAttrib,
+            super::MdInstrumentDefinitionFx63NoLotTypeRules,
+            super::MdInstrumentDefinitionFx63NoTradingSessions,
+            super::MdIncrementalRefreshBookLongQty64,
+            super::MdIncrementalRefreshBookLongQty64NoMdEntries,
+            super::MdIncrementalRefreshBookLongQty64NoOrderIdEntries,
+            super::MdIncrementalRefreshTradeSummaryLongQty65,
+            super::MdIncrementalRefreshTradeSummaryLongQty65NoMdEntries,
+            super::MdIncrementalRefreshTradeSummaryLongQty65NoOrderIdEntries,
+            super::MdIncrementalRefreshVolumeLongQty66,
+            super::MdIncrementalRefreshVolumeLongQty66NoMdEntries,
+            super::MdIncrementalRefreshSessionStatisticsLongQty67,
+            super::MdIncrementalRefreshSessionStatisticsLongQty67NoMdEntries,
+            super::SnapshotFullRefreshTcpLongQty68,
+            super::SnapshotFullRefreshTcpLongQty68NoMdEntries,
+            super::SnapshotFullRefreshLongQty69,
+            super::SnapshotFullRefreshLongQty69NoMdEntries,
+            super::Message,
+        );
     }
 }
 

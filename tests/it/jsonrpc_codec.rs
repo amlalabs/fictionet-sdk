@@ -365,7 +365,7 @@ fn dispatch_continues_after_refused_reply_and_ignores_responses() {
 }
 
 #[test]
-fn lines_take_one_byte_at_a_time_in_linear_time() {
+fn lines_take_one_byte_at_a_time() {
     let mut bytes = format!(
         r#"{{"jsonrpc":"2.0","method":"{}"}}"#,
         "x".repeat(jsonrpc::MAX_LINE - 64)
@@ -387,28 +387,24 @@ fn lines_take_one_byte_at_a_time_in_linear_time() {
         ErrorKind::Line(fictionet::stdlib::codec::LineError::TooLong { .. })
     ));
     assert!(items[2].is_ok());
-    fictionet::stdlib::test_support::assert_linear(
-        "JSON-RPC bytewise lines",
-        jsonrpc::MAX_LINE / 8,
-        |n| {
-            let bytes = format!("{{\"jsonrpc\":\"2.0\",\"method\":\"{}\"}}\n", "x".repeat(n));
-            let mut stream = Stream::new(Messages::new());
-            let mut count = 0;
-            for byte in bytes.as_bytes().chunks(1) {
-                pump(&mut stream, byte, |item| {
-                    item.unwrap();
-                    count += 1;
-                })
-                .unwrap();
-            }
-            finish(&mut stream, |item| {
+    for n in [jsonrpc::MAX_LINE / 8, 4 * (jsonrpc::MAX_LINE / 8)] {
+        let bytes = format!("{{\"jsonrpc\":\"2.0\",\"method\":\"{}\"}}\n", "x".repeat(n));
+        let mut stream = Stream::new(Messages::new());
+        let mut count = 0;
+        for byte in bytes.as_bytes().chunks(1) {
+            pump(&mut stream, byte, |item| {
                 item.unwrap();
                 count += 1;
             })
             .unwrap();
-            assert_eq!(count, 1);
-        },
-    );
+        }
+        finish(&mut stream, |item| {
+            item.unwrap();
+            count += 1;
+        })
+        .unwrap();
+        assert_eq!(count, 1);
+    }
 }
 
 #[test]

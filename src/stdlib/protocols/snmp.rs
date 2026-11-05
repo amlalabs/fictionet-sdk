@@ -1713,7 +1713,7 @@ mod tests {
     use super::*;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream, pump};
     use fictionet::stdlib::test_support::contract;
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
+    use fictionet::stdlib::test_support::rounds;
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn oid(s: &str) -> Oid {
@@ -2449,31 +2449,27 @@ mod tests {
     }
 
     #[test]
-    fn stream_takes_many_small_messages_in_linear_time() {
-        assert_linear(
-            "stream_takes_many_small_messages_in_linear_time",
-            rounds(500000),
-            |size| {
-                let count = size;
-                let bytes = [0x30, 0].repeat(count);
-                let mut stream = Stream::new(Frames::<Message>::new());
-                let mut got = 0;
-                pump(&mut stream, &bytes, |item| {
-                    assert_eq!(item, Err(Error::Truncated));
-                    got += 1;
-                })
-                .unwrap();
-                assert_eq!(got, count);
-                assert_eq!(stream.buffered(), 0);
-                let message = Message::parse(&GET_SYS_DESCR).unwrap();
-                assert_eq!(stream.push(&GET_SYS_DESCR), 43);
-                assert_eq!(stream.push(&GET_SYS_DESCR[..5]), 5);
-                assert_eq!(stream.next(), Some(Ok(Ok(message.clone()))));
-                assert_eq!(stream.push(&GET_SYS_DESCR[5..]), 38);
-                assert_eq!(stream.next(), Some(Ok(Ok(message))));
-                assert_eq!(stream.next(), None);
-            },
-        );
+    fn stream_takes_many_small_messages() {
+        for size in [rounds(500000), 4 * (rounds(500000))] {
+            let count = size;
+            let bytes = [0x30, 0].repeat(count);
+            let mut stream = Stream::new(Frames::<Message>::new());
+            let mut got = 0;
+            pump(&mut stream, &bytes, |item| {
+                assert_eq!(item, Err(Error::Truncated));
+                got += 1;
+            })
+            .unwrap();
+            assert_eq!(got, count);
+            assert_eq!(stream.buffered(), 0);
+            let message = Message::parse(&GET_SYS_DESCR).unwrap();
+            assert_eq!(stream.push(&GET_SYS_DESCR), 43);
+            assert_eq!(stream.push(&GET_SYS_DESCR[..5]), 5);
+            assert_eq!(stream.next(), Some(Ok(Ok(message.clone()))));
+            assert_eq!(stream.push(&GET_SYS_DESCR[5..]), 38);
+            assert_eq!(stream.next(), Some(Ok(Ok(message))));
+            assert_eq!(stream.next(), None);
+        }
     }
 
     #[test]

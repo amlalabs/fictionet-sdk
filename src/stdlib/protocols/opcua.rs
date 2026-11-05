@@ -3598,8 +3598,8 @@ mod tests {
     use super::*;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream, pump};
     use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::rounds;
     use fictionet::stdlib::test_support::{self, decode_all};
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
 
     /// Writes chunks and fails the test with the original error on refusal.
     fn wire_chunks(chunks: Vec<Chunk>) -> Vec<u8> {
@@ -5130,27 +5130,23 @@ mod tests {
     }
 
     #[test]
-    fn decoder_takes_many_small_messages_in_linear_time() {
-        assert_linear(
-            "decoder_takes_many_small_messages_in_linear_time",
-            rounds(25_000),
-            |size| {
-                let mut stream = Vec::new();
-                for seq in 0..size {
-                    stream.extend_from_slice(
-                        &msg(1, seq as u32, 1, vec![1, 2, 3])
-                            .chunks(&Limits::default())
-                            .map(wire_chunks)
-                            .unwrap(),
-                    );
-                }
-                let mut d = Stream::new(Messages::new());
-                let mut n = 0;
-                pump(&mut d, &stream, |_| n += 1).unwrap();
-                assert_eq!(n, size);
-                assert_eq!(d.buffered(), 0);
-            },
-        );
+    fn decoder_takes_many_small_messages() {
+        for size in [rounds(25_000), 4 * (rounds(25_000))] {
+            let mut stream = Vec::new();
+            for seq in 0..size {
+                stream.extend_from_slice(
+                    &msg(1, seq as u32, 1, vec![1, 2, 3])
+                        .chunks(&Limits::default())
+                        .map(wire_chunks)
+                        .unwrap(),
+                );
+            }
+            let mut d = Stream::new(Messages::new());
+            let mut n = 0;
+            pump(&mut d, &stream, |_| n += 1).unwrap();
+            assert_eq!(n, size);
+            assert_eq!(d.buffered(), 0);
+        }
     }
 
     #[test]

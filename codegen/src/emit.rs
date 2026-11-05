@@ -1630,25 +1630,22 @@ fn tests(out: &mut Output, checked: &ValidatedSchema) -> Result<(), Error> {
     }
     writeln!(
         out,
-        "#[cfg(test)]\nmod generated_tests {{\n    use super::*;\n\n    #[test]\n    fn generated_contracts() -> Result<(), Error> {{"
+        "#[cfg(test)]\nmod generated_tests {{\n    use super::*;\n    use fictionet::stdlib::test_support::assert_write;\n\n    #[test]\n    fn generated_values_round_trip() {{\n        macro_rules! values {{\n            ($($ty:ty),+ $(,)?) => {{\n                $({{\n                    let mut written = 0;\n                    for seed in 0..32 {{\n                        let mut sampler = __wire::Sampler::seed(seed);\n                        if let Ok(value) = <$ty as __wire::Codec>::sample(&mut sampler) {{\n                            written += usize::from(assert_write(&value).is_ok());\n                        }}\n                    }}\n                    assert!(written > 0, \"no writable sample for {{}}\", std::any::type_name::<$ty>());\n                }})+\n            }};\n        }}\n        values!("
     )?;
     for t in &checked.schema.types {
-        writeln!(
-            out,
-            "        {{\n            {}\n            __wire::check::<Value>()?;\n        }}",
-            import("super", &name(&t.name)?, "Value")
-        )?;
+        writeln!(out, "            super::{},", name(&t.name)?)?;
     }
+    writeln!(out, "        );")?;
     for s in &checked.schema.streams {
-        let n = name(&s.name)?;
         writeln!(
             out,
-            "        {{\n            {}\n            __wire::check_stream(|| Frames, Frames::write, {});\n        }}",
-            import("super", &n, "Frames"),
-            s.magic.len() + s.prefix.bytes()
+            "        {{\n            {}\n            {}\n            use fictionet::stdlib::codec::Stream;\n            use fictionet::stdlib::test_support::{{chunks, decode_chunks}};\n            let mut bytes = Vec::new();\n            let mut values = Vec::new();\n            for seed in 0..32 {{\n                let mut sampler = __wire::Sampler::seed(seed);\n                if let Ok(value) = <Value as __wire::Codec>::sample(&mut sampler) {{\n                    let before = bytes.clone();\n                    if Frames::write(&value, &mut bytes).is_ok() {{\n                        assert!(bytes.starts_with(&before));\n                        values.push(value);\n                    }} else {{\n                        assert_eq!(bytes, before, \"writer changed destination on error\");\n                    }}\n                }}\n            }}\n            assert!(!values.is_empty(), \"no writable frame for {{}}\", std::any::type_name::<Frames>());\n            let mut stream = Stream::new(Frames);\n            let (items, failure) = decode_chunks(&mut stream, chunks(&bytes, &[1, 7, 64]), |s| {{\n                assert!(s.allocated() <= 2 * (MAX_MESSAGE + {}));\n                assert_eq!(s.held(), 0);\n            }});\n            assert_eq!(failure, None);\n            assert_eq!(items, values);\n            assert_eq!(stream.offset(), bytes.len() as u64);\n        }}",
+            import("super", &name(&s.name)?, "Frames"),
+            import("super", &name(&s.item)?, "Value"),
+            s.magic.len() + s.prefix.bytes(),
         )?;
     }
-    writeln!(out, "        Ok(())\n    }}\n}}")?;
+    writeln!(out, "    }}\n}}")?;
     Ok(())
 }
 
@@ -1694,23 +1691,35 @@ pub fn emit_fuzz(
         checked.limits,
         &format!("-o <module file> --fuzz <this file> --fuzz-module {module}"),
     )?;
-    // The module's import is a group of its own, so rustfmt keeps it in place
-    // whatever its path sorts after.
+    writeln!(out, "#![no_main]\n")?;
+    if !checked.schema.types.is_empty() {
+        writeln!(
+            out,
+            "use fictionet::stdlib::codec::Wire;\nuse fictionet::stdlib::test_support::assert_write;"
+        )?;
+    }
+    if !checked.schema.streams.is_empty() {
+        writeln!(
+            out,
+            "use fictionet::stdlib::codec::Stream;\nuse fictionet::stdlib::test_support::{{chunks, decode_all, decode_chunks}};"
+        )?;
+    }
+    // Keep the protocol import separate so rustfmt preserves its position.
     writeln!(
         out,
-        "#![no_main]\n\nuse fictionet::stdlib::test_support::contract;\nuse libfuzzer_sys::fuzz_target;\n\nuse {module} as protocol;\n\nfuzz_target!(|data: &[u8]| {{"
+        "use libfuzzer_sys::fuzz_target;\n\nuse {module} as protocol;\n\nfuzz_target!(|data: &[u8]| {{"
     )?;
     for t in &checked.schema.types {
         writeln!(
             out,
-            "    {{\n        {}\n        contract::check_wire::<Value>(data);\n    }}",
+            "    {{\n        {}\n        if let Ok(value) = Value::parse(data) {{\n            let _ = assert_write(&value);\n        }}\n    }}",
             import("protocol", &name(&t.name)?, "Value")
         )?;
     }
     for s in &checked.schema.streams {
         writeln!(
             out,
-            "    {{\n        {}\n        contract::check_decode_with_alloc_limit(|| Frames, data, 2 * (protocol::MAX_MESSAGE + {}));\n    }}",
+            "    {{\n        {}\n        let mut stream = Stream::new(Frames);\n        let fragmented = decode_chunks(&mut stream, chunks(data, &[1, 7, 64]), |s| {{\n            assert!(s.allocated() <= 2 * (protocol::MAX_MESSAGE + {}));\n            assert_eq!(s.held(), 0);\n        }});\n        assert_eq!(fragmented, decode_all(|| Frames, data));\n    }}",
             import("protocol", &name(&s.name)?, "Frames"),
             s.magic.len() + s.prefix.bytes()
         )?;

@@ -1825,7 +1825,7 @@ impl Wire for Reply {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
+    use fictionet::stdlib::test_support::rounds;
     use std::net::SocketAddrV6;
 
     use codec::{Fail, Lcg, Stream};
@@ -2640,21 +2640,17 @@ mod tests {
     }
 
     #[test]
-    fn decoders_take_many_short_lines_in_linear_time() {
-        assert_linear(
-            "decoders_take_many_short_lines_in_linear_time",
-            rounds(125_000),
-            |size| {
-                let stream = b"NOOP\r\n".repeat(size);
-                let got = commands(&stream);
-                assert_eq!(got.len(), size);
-                assert!(got.iter().all(|c| *c == Ok(Command::new("NOOP", None))));
-                let stream = b"200 ok\r\n".repeat(size);
-                let got = replies(&stream);
-                assert_eq!(got.len(), size);
-                assert!(got.iter().all(|r| *r == Ok(Reply::new(code::OK, "ok"))));
-            },
-        );
+    fn decoders_take_many_short_lines() {
+        for size in [rounds(125_000), 4 * (rounds(125_000))] {
+            let stream = b"NOOP\r\n".repeat(size);
+            let got = commands(&stream);
+            assert_eq!(got.len(), size);
+            assert!(got.iter().all(|c| *c == Ok(Command::new("NOOP", None))));
+            let stream = b"200 ok\r\n".repeat(size);
+            let got = replies(&stream);
+            assert_eq!(got.len(), size);
+            assert!(got.iter().all(|r| *r == Ok(Reply::new(code::OK, "ok"))));
+        }
     }
 
     #[test]

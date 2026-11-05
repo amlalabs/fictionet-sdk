@@ -1,13 +1,13 @@
 //! Deterministic data and chunking helpers shared by unit tests and fuzz targets.
 //! Seeds are explicit. Chunk iterators borrow input and allocate no storage.
 //! [`mutate`] edits a byte vector in place, and [`decode_all`] runs a decoder
-//! over a whole input.
+//! over a whole input. [`decode_chunks`] exposes a chosen chunk schedule and
+//! storage assertions against the real stream; [`assert_write`] checks one
+//! transactional write and its semantic parse.
 //! [`Scripted`] runs caller decisions before decoder calls and after items.
 //!
 //! [`rounds`] sizes randomized loops and large inputs, so a default
 //! `cargo test` stays fast and a deep run is one environment variable away.
-//! [`assert_linear`] checks that work grows linearly with input size by
-//! comparing two sizes, instead of holding a test to a wall-clock limit.
 //! [`assert_linear_work`] and [`assert_constant_work`] compare counted work
 //! across a named dimension without using a clock.
 //! [`fictionet::assert_cases!`] checks calls or named input rows against expected
@@ -19,6 +19,11 @@ use alloc::vec::Vec;
 use fictionet::stdlib::codec::{Decode, Fail, Lcg, Stream, finish, pump};
 
 pub mod contract;
+
+mod decode;
+pub use decode::decode_chunks;
+mod wire;
+pub use wire::assert_write;
 
 mod scripted;
 pub use scripted::Scripted;
@@ -264,118 +269,11 @@ pub fn rounds(n: usize) -> usize {
     n
 }
 
-/// Checks that `run(size)` takes time linear in `size`, not quadratic.
-/// Times `run(n)` and `run(4 * n)`, alternating, three times each, and
-/// keeps the fastest of each. Linear work takes about 4 times as long at
-/// 4 times the size, quadratic work about 16 times. The check fails when the
-/// ratio exceeds 10.
-///
-/// On Unix, [`thread_cpu_time`] uses the calling thread's CPU clock. Time
-/// spent running other threads does not count. Wall time is the fallback
-/// if the clock fails or on other targets. Pick `n` so that `run(n)` takes at least a millisecond,
-/// or timer noise decides the ratio.
-///
-/// Every dimension multiplied by the guarded cost must grow with `size`.
-/// For a scan of retained state per token, grow both state and token count.
-/// Keeping either fixed makes the regression look linear. Keep both sizes
-/// within protocol limits. Repeating fixed-size messages checks message count,
-/// not scanning within one message. Use [`assert_linear_with_setup`] to exclude
-/// fixture construction and reference decoding from the measurement.
-/// Use timing ratios only when both sizes do enough work for a stable clock
-/// measurement. For short bounded inputs or incremental rescanning, use a real
-/// work counter with [`check_work`] or [`assert_linear_work`].
-///
-/// # Panics
-///
-/// If the ratio exceeds 10. `name` labels the message.
-pub fn assert_linear(name: &str, n: usize, mut run: impl FnMut(usize)) {
-    assert_linear_times(name, n, |size| {
-        let started = thread_cpu_time();
-        run(size);
-        thread_cpu_time().saturating_sub(started)
-    });
-}
-
-/// Checks linear time like [`assert_linear`], measuring only `run(&fixture)`.
-/// Builds a fresh fixture with `setup(size)` before each measurement, then
-/// calls `check(&fixture, result)` after stopping the clock. Fixture and result
-/// destruction are outside the measurement too. Reference decoding belongs
-/// in `setup`, and correctness assertions belong in `check`.
-///
-/// Grow every dimension multiplied by the guarded cost together, as described
-/// in [`assert_linear`]. The sizes, clock, sample count, and ratio limit are
-/// the same as that helper's.
-///
-/// # Panics
-///
-/// If the time ratio exceeds 10 or any closure panics. `name` labels the ratio
-/// failure.
-pub fn assert_linear_with_setup<T, R>(
-    name: &str,
-    n: usize,
-    mut setup: impl FnMut(usize) -> T,
-    mut run: impl FnMut(&T) -> R,
-    mut check: impl FnMut(&T, R),
-) {
-    assert_linear_times(name, n, |size| {
-        let fixture = setup(size);
-        let started = thread_cpu_time();
-        let result = run(&fixture);
-        let elapsed = thread_cpu_time().saturating_sub(started);
-        check(&fixture, result);
-        elapsed
-    });
-}
-
-fn assert_linear_times(name: &str, n: usize, mut time: impl FnMut(usize) -> core::time::Duration) {
-    let (mut small, mut large) = (core::time::Duration::MAX, core::time::Duration::MAX);
-    for _ in 0..3 {
-        small = small.min(time(n));
-        large = large.min(time(n.saturating_mul(4)));
-    }
-    let ratio = large.as_secs_f64() / small.as_secs_f64().max(1e-6);
-    assert!(
-        ratio <= 10.0,
-        "{name}: 4 times the input took {ratio:.1} times as long \
-         ({small:?} for {n}, {large:?} for {}); linear work stays near 4",
-        n.saturating_mul(4)
-    );
-}
-
-/// Returns the CPU time used by the calling thread on Unix with the `std`
-/// feature or in this crate's unit tests, regardless of features.
-/// If the CPU clock fails, on other targets, or for other callers built
-/// without `std` (such as integration tests), returns elapsed wall time
-/// since the first fallback call.
-pub fn thread_cpu_time() -> core::time::Duration {
-    macro_rules! read_clock {
-        ($enabled:meta) => {
-            #[cfg($enabled)]
-            {
-                let mut t = libc::timespec {
-                    tv_sec: 0,
-                    tv_nsec: 0,
-                };
-                // SAFETY: `t` is a valid, writable timespec.
-                if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut t) } == 0 {
-                    return core::time::Duration::new(
-                        u64::try_from(t.tv_sec).unwrap_or_default(),
-                        u32::try_from(t.tv_nsec).unwrap_or_default(),
-                    );
-                }
-            }
-        };
-    }
-    read_clock!(unix);
-    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    START.get_or_init(std::time::Instant::now).elapsed()
-}
-
 /// Checks cumulative work with whole input, byte chunks, and repeated `Need` calls.
 /// The allowance is `fixed_allowance + units_per_byte * accepted_bytes`.
 /// `measured` must include speculative work and survive message resets.
 /// Overflow, saturation, and decreasing measurements fail the check.
-/// This audits counted work; use contract checks for decoded results.
+/// This measures counted work; assert decoded results separately.
 ///
 /// ```
 /// use fictionet::stdlib::{test_support::check_work, protocols::thrift::EncodedMessages};

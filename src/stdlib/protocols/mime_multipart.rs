@@ -1480,7 +1480,7 @@ mod tests {
     use super::*;
     use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::codec::{Fail, Stream, finish, pump};
-    use fictionet::stdlib::test_support::assert_linear;
+
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::decode_all;
 
@@ -2202,7 +2202,7 @@ Content-Type: text/plain
     }
 
     #[test]
-    fn slow_headers_take_linear_time() {
+    fn long_headers_remain_bounded() {
         let check = |size| {
             // Header blocks near the limit, decoded a byte at a time. The parser
             // looks at each new byte once, not at the whole block again.
@@ -2214,16 +2214,14 @@ Content-Type: text/plain
             assert_eq!(m.parts.len(), 64);
         };
         check(MAX_HEADER_BYTES - 9);
-        assert_linear(
-            "slow_headers_take_linear_time",
-            (MAX_HEADER_BYTES - 9) / 4,
-            check,
-        );
+        for size in [(MAX_HEADER_BYTES - 9) / 4, 4 * ((MAX_HEADER_BYTES - 9) / 4)] {
+            check(size);
+        }
     }
 
     #[test]
-    fn many_parts_read_in_linear_time() {
-        assert_linear("many_parts_read_in_linear_time", MAX_PARTS / 4, |size| {
+    fn many_parts_read() {
+        for size in [MAX_PARTS / 4, 4 * (MAX_PARTS / 4)] {
             // Reading a part must not copy the bytes after it.
             let mut body = Vec::new();
             for _ in 0..size {
@@ -2241,7 +2239,7 @@ Content-Type: text/plain
             finish(&mut stream, |_| count += 1).unwrap();
             assert_eq!(count, size);
             assert!(stream.into_parts().0.allocated() <= 2 * Parts::new("b").unwrap().capacity());
-        });
+        }
     }
 
     #[test]

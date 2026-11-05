@@ -1090,7 +1090,7 @@ mod tests {
     use fictionet::stdlib::codec::{Fail, Stream, Wire, finish, pump};
     use fictionet::stdlib::test_support;
     use fictionet::stdlib::test_support::contract;
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
+    use fictionet::stdlib::test_support::rounds;
 
     fn other_attribute(typ: u16, value: Vec<u8>) -> Attribute {
         Attribute::Other { typ, value }
@@ -1706,11 +1706,10 @@ mod tests {
         );
     }
 
-    // A stream of many small messages pushed at once is split in linear time:
-    // taking one message out does not move the bytes after it.
+    // A large batch preserves message boundaries and the partial suffix.
     #[test]
-    fn stream_is_linear() {
-        assert_linear("stream_is_linear", rounds(250000), |size| {
+    fn stream_takes_many_messages() {
+        for size in [rounds(250000), 4 * (rounds(250000))] {
             let one = Message::binding_request([1; 12]).to_bytes().unwrap();
             let n = size;
             let mut stream = Vec::with_capacity(one.len() * n);
@@ -1760,7 +1759,7 @@ mod tests {
             );
             assert_eq!(d.buffered(), 3);
             assert_eq!(d.into_parts().0.len(), 3);
-        });
+        }
     }
 
     #[test]

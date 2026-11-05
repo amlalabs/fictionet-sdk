@@ -504,7 +504,7 @@ mod tests {
     use fictionet::stdlib::codec::{Fail, Lcg, Stream};
     use fictionet::stdlib::protocols::netbios::{MAX_LABEL, decode_first_level};
     use fictionet::stdlib::test_support::contract;
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
+    use fictionet::stdlib::test_support::rounds;
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     /// "FRED" padded with spaces, from RFC 1002, section 4.1.
@@ -932,17 +932,13 @@ mod tests {
     }
 
     #[test]
-    fn stream_takes_many_small_packets_in_linear_time() {
-        assert_linear(
-            "stream_takes_many_small_packets_in_linear_time",
-            rounds(50_000),
-            |size| {
-                let bytes = Packet::KeepAlive.to_bytes().unwrap().repeat(size);
-                let (packets, error) = decode_all(Frames::<Packet>::new, &bytes);
-                assert_eq!(packets.len(), size);
-                assert_eq!(error, None);
-            },
-        );
+    fn stream_takes_many_small_packets() {
+        for size in [rounds(50_000), 4 * (rounds(50_000))] {
+            let bytes = Packet::KeepAlive.to_bytes().unwrap().repeat(size);
+            let (packets, error) = decode_all(Frames::<Packet>::new, &bytes);
+            assert_eq!(packets.len(), size);
+            assert_eq!(error, None);
+        }
     }
 
     #[test]

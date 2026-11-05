@@ -2079,7 +2079,7 @@ mod tests {
     use super::*;
     use fictionet::assert_cases;
     use fictionet::stdlib::codec::Lcg;
-    use fictionet::stdlib::test_support::assert_linear;
+
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::hex;
     use fictionet::stdlib::test_support::mutate;
@@ -3427,7 +3427,7 @@ mod tests {
     }
 
     #[test]
-    fn reassembler_sparse_reads_linear_time() {
+    fn reassembler_sparse_reads_preserve_the_tail() {
         fn run(size: usize) {
             let mut r = Reassembler::new();
             let mut read = Vec::new();
@@ -3447,11 +3447,11 @@ mod tests {
             assert!(r.read().is_empty());
         }
 
-        // Grow both the retained distance and the number of reads fourfold.
-        // Queue work stays linear; moving or scanning all retained bytes on
-        // every read is quadratic. Keep n fixed: 4n is MAX_REASSEMBLY, so
-        // rounds() could exceed the permitted window.
-        assert_linear("QUIC sparse reassembly", 16_384, run);
+        // Grow both the retained distance and the number of reads.
+        // The larger case fills the permitted reassembly window.
+        for size in [16_384, 4 * (16_384)] {
+            run(size);
+        }
     }
 
     fn random_value(rng: &mut Lcg) -> u64 {

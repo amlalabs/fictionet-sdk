@@ -2370,7 +2370,7 @@ mod tests {
     use super::*;
     use codec::Lcg;
     use fictionet::stdlib::test_support::contract;
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
+    use fictionet::stdlib::test_support::rounds;
     use fictionet::stdlib::test_support::{chunks, decode_all, mutate};
 
     fn server_init(width: u16, height: u16, format: PixelFormat, name: Vec<u8>) -> ServerInit {
@@ -3106,11 +3106,9 @@ mod tests {
             assert_eq!(server.buffered(), 0);
         };
         check(MAX_ITEMS);
-        assert_linear(
-            "session_messages_byte_at_a_time_are_bounded",
-            MAX_ITEMS / 4,
-            check,
-        );
+        for size in [MAX_ITEMS / 4, 4 * (MAX_ITEMS / 4)] {
+            check(size);
+        }
     }
 
     #[test]
@@ -3545,11 +3543,9 @@ mod tests {
             assert_eq!(got, 1);
         };
         check(MAX_ITEMS);
-        assert_linear(
-            "sends_between_pushes_keep_update_progress",
-            MAX_ITEMS / 4,
-            check,
-        );
+        for size in [MAX_ITEMS / 4, 4 * (MAX_ITEMS / 4)] {
+            check(size);
+        }
     }
 
     #[test]

@@ -317,7 +317,7 @@ fictionet::prefixed! {
 mod codec_tests {
     use super::*;
     use fictionet::stdlib::codec::{Fail, Stream};
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
 
     #[test]
     fn exact_wire_and_transactional_writes() {
@@ -325,9 +325,7 @@ mod codec_tests {
             reserved: 0x91,
             payload: vec![2, 0xf0, 0x80],
         };
-        let bytes = Wire::to_bytes(&packet).unwrap();
-        assert_eq!(<Packet as Wire>::parse(&bytes), Ok(packet.clone()));
-        contract::check_wire::<Packet>(&bytes);
+        let bytes = assert_write(&packet).unwrap();
         for cut in 0..bytes.len() {
             assert_eq!(
                 <Packet as Wire>::parse(&bytes[..cut]),
@@ -354,13 +352,8 @@ mod codec_tests {
             MAX_PAYLOAD + 1,
         ] {
             let value = Packet::new(vec![0; size]);
-            contract::check_wire_value(&value);
-            let mut out = vec![0x55];
-            let result = value.write(&mut out);
+            let result = assert_write(&value);
             assert_eq!(result.is_ok(), (MIN_PAYLOAD..=MAX_PAYLOAD).contains(&size));
-            if result.is_err() {
-                assert_eq!(out, [0x55]);
-            }
         }
     }
 
@@ -377,7 +370,15 @@ mod codec_tests {
                 &[0],
                 &[3, 4, 0, 7, 2, 0xf0, 0x80],
             ] {
-                contract::check_decode_with_held_limit(|| frames, input, 0);
+                let fragmented =
+                    decode_chunks(&mut Stream::new(frames), chunks(input, &[1]), |s| {
+                        assert_eq!(s.held(), 0);
+                        assert!(s.allocated() <= 2 * frames.capacity());
+                    });
+                assert_eq!(
+                    fragmented,
+                    fictionet::stdlib::test_support::decode_all(|| frames, input)
+                );
             }
         }
         let mut stream = Stream::new(Frames::<Packet>::with_limit(8));
@@ -431,7 +432,7 @@ mod tests {
     use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::codec::{Fail, Stream};
     use fictionet::stdlib::test_support;
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{chunks, decode_chunks};
 
     // RFC 1006 section 6: version 3, reserved, then the length of the
     // whole packet, header included. The smallest TPDU, a class 0 data
@@ -575,11 +576,13 @@ mod tests {
         for p in &packets {
             stream.extend_from_slice(&p.to_bytes().unwrap());
         }
-        contract::check_decode_with_alloc_limit(Frames::<Packet>::new, &stream, 2 * MAX_PACKET);
-        assert_eq!(
-            test_support::decode_all(Frames::<Packet>::new, &stream),
-            (packets.clone(), None)
-        );
+        let mut decoder = Stream::new(Frames::<Packet>::new());
+        let decoded = decode_chunks(&mut decoder, chunks(&stream, &[1, 7, 64]), |s| {
+            assert!(s.allocated() <= 2 * MAX_PACKET);
+            assert_eq!(s.held(), 0);
+        });
+        assert_eq!(decoded, (packets.clone(), None));
+        assert_eq!(decoder.offset(), stream.len() as u64);
         // An error after good packets, and the decoder stays broken.
         stream.extend_from_slice(&[4, 0, 0, 7]);
         let mut d = Stream::new(Frames::<Packet>::new());
@@ -638,12 +641,15 @@ mod tests {
                 test_support::mutate(&mut rng, &mut data);
             }
             let limit = [MAX_PACKET, 7, 20, 64, 1000][rng.index(5)];
-            contract::check_decode_with_alloc_limit(
-                || Frames::<Packet>::with_limit(limit),
-                &data,
-                2 * clamp_limit(limit),
+            let fragmented = decode_chunks(
+                &mut Stream::new(Frames::<Packet>::with_limit(limit)),
+                chunks(&data, &[1, 7, 64]),
+                |s| {
+                    assert!(s.allocated() <= 2 * clamp_limit(limit));
+                },
             );
             let whole = test_support::decode_all(|| Frames::<Packet>::with_limit(limit), &data);
+            assert_eq!(fragmented, whole);
             for p in &whole.0 {
                 assert!(p.payload.len() + HEADER_LEN <= limit);
                 let bytes = p.to_bytes().unwrap();
@@ -665,8 +671,17 @@ mod tests {
             let raw = rng.bytes(19);
             let _ = Packet::parse_prefix(&raw);
             let _ = Packet::parse_limited(&raw, rng.index(usize::MAX));
-            contract::check_decode_with_alloc_limit(Frames::<Packet>::new, &raw, 2 * MAX_PACKET);
-            let _ = test_support::decode_all(Frames::<Packet>::new, &raw);
+            let fragmented = decode_chunks(
+                &mut Stream::new(Frames::<Packet>::new()),
+                chunks(&raw, &[1, 7, 64]),
+                |s| {
+                    assert!(s.allocated() <= 2 * MAX_PACKET);
+                },
+            );
+            assert_eq!(
+                fragmented,
+                test_support::decode_all(Frames::<Packet>::new, &raw)
+            );
         }
     }
 }

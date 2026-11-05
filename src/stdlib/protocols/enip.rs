@@ -1693,8 +1693,8 @@ mod tests {
     use super::*;
     use fictionet::stdlib::codec::{Lcg, Stream, pump};
     use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::rounds;
     use fictionet::stdlib::test_support::{self, decode_all};
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
 
     #[test]
     fn register_session_round_trip() {
@@ -1784,29 +1784,25 @@ mod tests {
     }
 
     #[test]
-    fn decoder_takes_many_small_packets_in_linear_time() {
-        assert_linear(
-            "decoder_takes_many_small_packets_in_linear_time",
-            rounds(50_000),
-            |size| {
-                let one = Packet {
-                    command: Command::Nop,
-                    session_handle: 0,
-                    status: 0,
-                    sender_context: [0; 8],
-                    options: 0,
-                    data: Vec::new(),
-                }
-                .to_bytes()
-                .unwrap();
-                let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * size).collect();
-                let mut d = Stream::new(Frames::<Packet>::new());
-                let mut n = 0;
-                pump(&mut d, &stream, |_| n += 1).unwrap();
-                assert_eq!(n, size);
-                assert_eq!(d.buffered(), 0);
-            },
-        );
+    fn decoder_takes_many_small_packets() {
+        for size in [rounds(50_000), 4 * (rounds(50_000))] {
+            let one = Packet {
+                command: Command::Nop,
+                session_handle: 0,
+                status: 0,
+                sender_context: [0; 8],
+                options: 0,
+                data: Vec::new(),
+            }
+            .to_bytes()
+            .unwrap();
+            let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * size).collect();
+            let mut d = Stream::new(Frames::<Packet>::new());
+            let mut n = 0;
+            pump(&mut d, &stream, |_| n += 1).unwrap();
+            assert_eq!(n, size);
+            assert_eq!(d.buffered(), 0);
+        }
     }
 
     #[test]

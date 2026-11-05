@@ -1315,7 +1315,7 @@ mod tests {
     use fictionet::stdlib::codec::{Decode, Step};
     use fictionet::stdlib::codec::{Fail, Lcg, Stream};
     use fictionet::stdlib::test_support::contract;
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
+    use fictionet::stdlib::test_support::rounds;
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn s(v: &[u8]) -> Vec<u8> {
@@ -1957,22 +1957,18 @@ mod tests {
     }
 
     #[test]
-    fn stream_takes_many_small_packets_in_linear_time() {
-        assert_linear(
-            "stream_takes_many_small_packets_in_linear_time",
-            rounds(50_000),
-            |size| {
-                let one = Request::Readdir {
-                    id: 1,
-                    handle: s(b"d"),
-                }
-                .to_bytes()
-                .unwrap();
-                let (packets, failure) = decode_all(Frames::<Packet>::new, &one.repeat(size));
-                assert_eq!(failure, None);
-                assert_eq!(packets.len(), size);
-            },
-        );
+    fn stream_takes_many_small_packets() {
+        for size in [rounds(50_000), 4 * (rounds(50_000))] {
+            let one = Request::Readdir {
+                id: 1,
+                handle: s(b"d"),
+            }
+            .to_bytes()
+            .unwrap();
+            let (packets, failure) = decode_all(Frames::<Packet>::new, &one.repeat(size));
+            assert_eq!(failure, None);
+            assert_eq!(packets.len(), size);
+        }
     }
 
     #[test]

@@ -1098,7 +1098,7 @@ impl Decode for Replies {
 mod tests {
     use super::*;
     use codec::{Fail, Lcg, Stream};
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn data_server() -> Inputs {
@@ -1223,9 +1223,15 @@ mod tests {
             Ok(Input::Command(Command::new("QUIT", None))),
         ];
         assert_eq!(decode_all(Inputs::new, &wire), (expected, None));
-        contract::check_decode_with_alloc_limit(Inputs::new, &wire, 2 * (MAX_AUTH_LINE + 2));
+        decode_chunks(
+            &mut Stream::new(Inputs::new()),
+            chunks(&wire, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 2 * (MAX_AUTH_LINE + 2));
+            },
+        );
         assert_eq!(
-            contract::check_refused(&Command::new("NOOP", Some(&"a".repeat(MAX_LINE - 6)))),
+            assert_write(&Command::new("NOOP", Some(&"a".repeat(MAX_LINE - 6)))).unwrap_err(),
             Error::Unwritable
         );
     }
@@ -1242,7 +1248,13 @@ mod tests {
             decode_all(Replies::new, bytes),
             (vec![Ok(first), Ok(Reply::new(221, ""))], None)
         );
-        contract::check_decode_with_alloc_limit(Replies::new, bytes, 2 * MAX_LINE);
+        decode_chunks(
+            &mut Stream::new(Replies::new()),
+            chunks(bytes, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 2 * MAX_LINE);
+            },
+        );
         for (bad, error, fatal) in [
             (
                 &b"250-hi\r\n550 done\r\n"[..],
@@ -1271,9 +1283,21 @@ mod tests {
             if fatal.is_some() {
                 let followed = [bad, b"250 next\r\n"].concat();
                 assert_eq!(decode_all(Replies::new, &followed), expected);
-                contract::check_decode_with_alloc_limit(Replies::new, &followed, 2 * MAX_LINE);
+                decode_chunks(
+                    &mut Stream::new(Replies::new()),
+                    chunks(&followed, &[1, 7, 64]),
+                    |s| {
+                        assert!(s.allocated() <= 2 * MAX_LINE);
+                    },
+                );
             }
-            contract::check_decode_with_alloc_limit(Replies::new, bad, 2 * MAX_LINE);
+            decode_chunks(
+                &mut Stream::new(Replies::new()),
+                chunks(bad, &[1, 7, 64]),
+                |s| {
+                    assert!(s.allocated() <= 2 * MAX_LINE);
+                },
+            );
         }
     }
 
@@ -1293,7 +1317,13 @@ mod tests {
                 "prefix {cut}"
             );
         }
-        contract::check_decode_with_alloc_limit(Replies::new, short, 2 * MAX_LINE);
+        decode_chunks(
+            &mut Stream::new(Replies::new()),
+            chunks(short, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 2 * MAX_LINE);
+            },
+        );
         let endless = b"250-\r\n".repeat(MAX_REPLY_LINES);
         assert_eq!(
             decode_all(Replies::new, &endless).1,
@@ -1308,7 +1338,7 @@ mod tests {
             Reply::new(999, "bad"),
             Reply::new(250, "ok\r\n550 bad"),
         ] {
-            assert_eq!(contract::check_refused(&reply), Error::Unwritable);
+            assert_eq!(assert_write(&reply).unwrap_err(), Error::Unwritable);
         }
         let mut stream = Stream::new(Replies::new());
         let bad = b"250-first\r\n550 bad\r\n";
@@ -1329,8 +1359,16 @@ mod tests {
         let wire = message.to_bytes().unwrap();
         assert_eq!(wire, b"Subject: hi\r\n\r\n..\r\n...dots\r\n\xff\r\n.\r\n");
         assert_eq!(Data::parse(&wire), Ok(message));
-        contract::check_wire::<Data>(&wire);
-        contract::check_decode_with_alloc_limit(data_server, &wire, 2 * (MAX_AUTH_LINE + 2));
+        if let Ok(value) = <Data as Wire>::parse(&wire) {
+            let _ = assert_write(&value);
+        }
+        decode_chunks(
+            &mut Stream::new(data_server()),
+            chunks(&wire, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 2 * (MAX_AUTH_LINE + 2));
+            },
+        );
         assert_eq!(Data { bytes: vec![] }.to_bytes().unwrap(), b".\r\n");
         assert_eq!(Data::parse(b".\r\n").unwrap().bytes, b"");
         assert_eq!(Data::parse(b".x\r\n.\r\n").unwrap().bytes, b"x\r\n");
@@ -1376,9 +1414,15 @@ mod tests {
             let wire = message.to_bytes().unwrap();
             assert_eq!(wire.len(), MAX_DATA_LINE + 3 + usize::from(dot));
             assert_eq!(Data::parse(&wire), Ok(message.clone()));
-            contract::check_decode_with_alloc_limit(data_server, &wire, 2 * (MAX_AUTH_LINE + 2));
+            decode_chunks(
+                &mut Stream::new(data_server()),
+                chunks(&wire, &[1, 7, 64]),
+                |s| {
+                    assert!(s.allocated() <= 2 * (MAX_AUTH_LINE + 2));
+                },
+            );
             message.bytes.insert(1, b'x');
-            assert_eq!(contract::check_refused(&message), Error::Unwritable);
+            assert_eq!(assert_write(&message).unwrap_err(), Error::Unwritable);
             let mut wire = message.bytes;
             if dot {
                 wire.insert(0, b'.');
@@ -1391,9 +1435,10 @@ mod tests {
         }
         for bad in [&b"bare\n"[..], b"bare\r", b"nul\0\r\n", b"cr\rinside\r\n"] {
             assert_eq!(
-                contract::check_refused(&Data {
+                assert_write(&Data {
                     bytes: bad.to_vec(),
-                }),
+                })
+                .unwrap_err(),
                 Error::Unwritable
             );
         }
@@ -1416,8 +1461,11 @@ mod tests {
         assert_eq!(stream.push(bytes), bytes.len());
         assert_eq!(stream.next(), Some(Ok(Err(Error::LineEnding))));
         assert_eq!(stream.held(), 0);
-        contract::check_decode_with_held_limit(data_server, bytes, MAX_DATA);
-        contract::check_decode_with_alloc_limit(data_server, bytes, 2 * (MAX_AUTH_LINE + 2));
+        let fragmented = decode_chunks(&mut Stream::new(data_server()), chunks(bytes, &[1]), |s| {
+            assert!(s.held() <= MAX_DATA);
+            assert!(s.allocated() <= 2 * (MAX_AUTH_LINE + 2));
+        });
+        assert_eq!(fragmented, decode_all(data_server, bytes));
     }
 
     #[test]
@@ -1440,15 +1488,16 @@ mod tests {
         );
         assert_eq!(stream.next(), None);
         assert_eq!(
-            contract::check_refused(&Data {
+            assert_write(&Data {
                 bytes: vec![0; MAX_DATA + 1],
-            }),
+            })
+            .unwrap_err(),
             Error::Unwritable
         );
     }
 
     #[test]
-    fn mutated_streams_and_values_obey_contracts() {
+    fn mutated_streams_and_values() {
         const PIECES: &[&[u8]] = &[
             b"MAIL FROM:",
             b"RCPT TO:",
@@ -1494,15 +1543,44 @@ mod tests {
             for _ in 0..rng.index(5) {
                 mutate(&mut rng, &mut bytes);
             }
-            contract::check_decode_with_alloc_limit(Inputs::new, &bytes, 2 * (MAX_AUTH_LINE + 2));
-            contract::check_decode_with_alloc_limit(Replies::new, &bytes, 2 * MAX_LINE);
-            contract::check_decode_with_alloc_limit(data_server, &bytes, 2 * (MAX_AUTH_LINE + 2));
-            contract::check_wire::<Command>(&bytes);
-            contract::check_wire::<Request>(&bytes);
-            contract::check_wire::<Reply>(&bytes);
-            contract::check_wire::<Data>(&bytes);
-            contract::check_wire_value(&Command::new(&rng.text(20), Some(&rng.text(520))));
-            contract::check_wire_value(&Data {
+            let fragmented = decode_chunks(
+                &mut Stream::new(Inputs::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| {
+                    assert!(s.allocated() <= 2 * (MAX_AUTH_LINE + 2));
+                },
+            );
+            assert_eq!(fragmented, decode_all(Inputs::new, &bytes));
+            let fragmented = decode_chunks(
+                &mut Stream::new(Replies::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| {
+                    assert!(s.allocated() <= 2 * MAX_LINE);
+                },
+            );
+            assert_eq!(fragmented, decode_all(Replies::new, &bytes));
+            let fragmented = decode_chunks(
+                &mut Stream::new(data_server()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| {
+                    assert!(s.allocated() <= 2 * (MAX_AUTH_LINE + 2));
+                },
+            );
+            assert_eq!(fragmented, decode_all(data_server, &bytes));
+            if let Ok(value) = <Command as Wire>::parse(&bytes) {
+                let _ = assert_write(&value);
+            }
+            if let Ok(value) = <Request as Wire>::parse(&bytes) {
+                let _ = assert_write(&value);
+            }
+            if let Ok(value) = <Reply as Wire>::parse(&bytes) {
+                let _ = assert_write(&value);
+            }
+            if let Ok(value) = <Data as Wire>::parse(&bytes) {
+                let _ = assert_write(&value);
+            }
+            let _ = assert_write(&Command::new(&rng.text(20), Some(&rng.text(520))));
+            let _ = assert_write(&Data {
                 bytes: rng.bytes(100),
             });
         }

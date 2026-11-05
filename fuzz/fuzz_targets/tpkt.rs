@@ -3,15 +3,15 @@
 #![no_main]
 
 use arbitrary::{Result, Unstructured};
-use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Assembled, Wire};
+use fictionet::stdlib::codec::{Frames, Stream};
 use fictionet::stdlib::protocols::cotp::{Connect, Data, Parameter, Tpdu, Variable};
 use fictionet::stdlib::protocols::cotp::{messages, over_tpkt};
 use fictionet::stdlib::protocols::tpkt::{
     Error, HEADER_LEN, Header, MAX_PACKET, MAX_PAYLOAD, MIN_PACKET, MIN_PAYLOAD, Packet,
 };
-use fictionet::stdlib::test_support::contract::{check_decode, check_wire, check_wire_value};
 use fictionet::stdlib::test_support::decode_all;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
 use libfuzzer_sys::fuzz_target;
 
 /// Values a world builds: whatever a writer accepts reads back the same.
@@ -22,22 +22,17 @@ fn built(data: &[u8]) -> Result<()> {
         reserved: u.arbitrary()?,
         length: u.arbitrary()?,
     };
-    match header.to_bytes() {
-        Ok(bytes) => assert_eq!(<Header as Wire>::parse(&bytes), Ok(header)),
-        Err(e) => {
-            assert!(usize::from(header.length) < MIN_PACKET);
-            assert_eq!(e, Error::PayloadTooShort(header.payload_len()));
-        }
+    if let Err(e) = assert_write(&header) {
+        assert!(usize::from(header.length) < MIN_PACKET);
+        assert_eq!(e, Error::PayloadTooShort(header.payload_len()));
     }
     let n = u.int_in_range(0..=300usize)?;
     let packet = Packet {
         reserved: u.arbitrary()?,
         payload: u.bytes(n)?.to_vec(),
     };
-    check_wire_value(&packet);
-    match packet.to_bytes() {
-        Ok(bytes) => assert_eq!(<Packet as Wire>::parse(&bytes), Ok(packet)),
-        Err(e) => assert_eq!(e, Error::PayloadTooShort(n)),
+    if let Err(e) = assert_write(&packet) {
+        assert_eq!(e, Error::PayloadTooShort(n));
     }
     // A data TPDU a world builds, up to and past what one packet holds: the
     // checked writer takes it exactly when it fits, and then it reads back
@@ -50,7 +45,7 @@ fn built(data: &[u8]) -> Result<()> {
         number,
         data: vec![0x41; n],
     });
-    check_wire_value(&data);
+    let _ = assert_write(&data);
     let fits = n <= MAX_PAYLOAD - 3 && number < 0x80;
     match over_tpkt::from_tpdu(&data) {
         Ok(p) => {
@@ -90,7 +85,7 @@ fn built(data: &[u8]) -> Result<()> {
         Variable::Parameters(params)
     };
     let t = Tpdu::ConnectionRequest(connect.clone());
-    check_wire_value(&t);
+    let _ = assert_write(&t);
     if let Ok(p) = over_tpkt::from_tpdu(&t) {
         assert!(connect.credit < 16 && connect.class < 16 && connect.options < 16);
         if let Variable::Raw(b) = &connect.variable {
@@ -112,23 +107,38 @@ fn built(data: &[u8]) -> Result<()> {
 
 fuzz_target!(|data: &[u8]| {
     fictionet::stdlib::protocols::cotp::harness::check_buffer(data, 4000);
-    check_wire::<Packet>(data);
-    check_wire::<Header>(data);
+    if let Ok(value) = <Packet as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Header as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
     // The size limit comes from the first two bytes.
     let limit = match data {
         [a, b, ..] => usize::from(u16::from_be_bytes([*a, *b])),
         _ => MAX_PACKET,
     };
     for limit in [MAX_PACKET, limit] {
-        check_decode(|| Frames::<Packet>::with_limit(limit), data);
-        let (packets, _) = decode_all(|| Frames::<Packet>::with_limit(limit), data);
-        for packet in packets {
+        let frames = Frames::<Packet>::with_limit(limit);
+        let capacity = frames.limit();
+        let mut stream = Stream::new(frames);
+        let fragmented = decode_chunks(&mut stream, chunks(data, &[1, 7, 64]), |s| {
+            assert_eq!(s.held(), 0);
+            assert!(s.allocated() <= 2 * capacity);
+        });
+        assert_eq!(
+            fragmented,
+            decode_all(|| Frames::<Packet>::with_limit(limit), data)
+        );
+        for packet in fragmented.0 {
             assert!(
                 packet.payload.len() + HEADER_LEN <= Frames::<Packet>::with_limit(limit).limit()
             );
             assert!((MIN_PAYLOAD..=MAX_PAYLOAD).contains(&packet.payload.len()));
-            check_wire_value(&packet);
-            check_wire::<Tpdu>(&packet.payload);
+            let _ = assert_write(&packet);
+            if let Ok(value) = <Tpdu as Wire>::parse(&packet.payload) {
+                let _ = assert_write(&value);
+            }
             if let Ok(tpdu) = over_tpkt::tpdu(&packet) {
                 assert_eq!(
                     over_tpkt::tpdu(&over_tpkt::from_tpdu(&tpdu).unwrap()),

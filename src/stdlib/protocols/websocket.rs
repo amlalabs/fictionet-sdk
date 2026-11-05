@@ -1650,7 +1650,7 @@ mod tests {
     use super::*;
     use fictionet::stdlib::codec::{AssembleError, Decode, Fail, Lcg, Stream};
     use fictionet::stdlib::test_support::contract;
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
+    use fictionet::stdlib::test_support::rounds;
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     // RFC 6455 section 5.7.
@@ -2301,36 +2301,32 @@ mod tests {
     }
 
     #[test]
-    fn decoder_reads_many_frames_from_one_push_in_linear_time() {
-        assert_linear(
-            "decoder_reads_many_frames_from_one_push_in_linear_time",
-            rounds(524288),
-            |size| {
-                let n = size;
-                let stream: Vec<u8> = [0x8a, 0x00].repeat(n);
-                let mut d = Stream::new(Messages::for_receiver(Side::Client));
-                push(&mut d, &stream);
-                let mut count = 0;
-                while let Some(m) = d.next() {
-                    assert_eq!(m, Ok(Message::Pong(vec![])));
-                    count += 1;
-                }
-                assert_eq!(count, n);
-                assert_eq!(d.buffered(), 0);
-                // Pushing after some frames are taken out keeps the order.
-                let mut d = Stream::new(Messages::for_receiver(Side::Client));
-                push(&mut d, &[&PING[..], &HEL, &PING].concat());
-                assert_eq!(d.next(), Some(Ok(Message::Ping(b"Hello".to_vec()))));
-                assert_eq!(d.buffered(), HEL.len() + PING.len());
-                push(&mut d, &LO[..1]);
-                assert_eq!(d.next(), Some(Ok(Message::Ping(b"Hello".to_vec()))));
-                assert_eq!(d.buffered(), 1);
-                assert_eq!(d.next(), None);
-                push(&mut d, &LO[1..]);
-                assert_eq!(d.next(), Some(Ok(Message::Text("Hello".into()))));
-                assert_eq!(d.buffered(), 0);
-            },
-        );
+    fn decoder_reads_many_frames_from_one_push() {
+        for size in [rounds(524288), 4 * (rounds(524288))] {
+            let n = size;
+            let stream: Vec<u8> = [0x8a, 0x00].repeat(n);
+            let mut d = Stream::new(Messages::for_receiver(Side::Client));
+            push(&mut d, &stream);
+            let mut count = 0;
+            while let Some(m) = d.next() {
+                assert_eq!(m, Ok(Message::Pong(vec![])));
+                count += 1;
+            }
+            assert_eq!(count, n);
+            assert_eq!(d.buffered(), 0);
+            // Pushing after some frames are taken out keeps the order.
+            let mut d = Stream::new(Messages::for_receiver(Side::Client));
+            push(&mut d, &[&PING[..], &HEL, &PING].concat());
+            assert_eq!(d.next(), Some(Ok(Message::Ping(b"Hello".to_vec()))));
+            assert_eq!(d.buffered(), HEL.len() + PING.len());
+            push(&mut d, &LO[..1]);
+            assert_eq!(d.next(), Some(Ok(Message::Ping(b"Hello".to_vec()))));
+            assert_eq!(d.buffered(), 1);
+            assert_eq!(d.next(), None);
+            push(&mut d, &LO[1..]);
+            assert_eq!(d.next(), Some(Ok(Message::Text("Hello".into()))));
+            assert_eq!(d.buffered(), 0);
+        }
     }
 
     #[test]

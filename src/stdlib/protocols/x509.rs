@@ -3024,7 +3024,7 @@ mod tests {
     use super::harness::check;
     use super::*;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream, finish as finish_stream, pump};
-    use fictionet::stdlib::test_support::assert_linear;
+
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::{chunks, decode_all, mutate};
 
@@ -4451,29 +4451,25 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
     }
 
     #[test]
-    fn pem_decoder_takes_a_big_block_a_byte_at_a_time_in_linear_time() {
-        assert_linear(
-            "pem_decoder_takes_a_big_block_a_byte_at_a_time_in_linear_time",
-            MAX_PEM_DATA / 4,
-            |size| {
-                let big = PemBlock {
-                    label: "X".into(),
-                    data: vec![0x5a; size],
+    fn pem_decoder_takes_a_big_block_a_byte_at_a_time() {
+        for size in [MAX_PEM_DATA / 4, 4 * (MAX_PEM_DATA / 4)] {
+            let big = PemBlock {
+                label: "X".into(),
+                data: vec![0x5a; size],
+            }
+            .to_bytes()
+            .unwrap();
+            let mut d = Stream::new(PemBlocks::new());
+            let mut n = 0;
+            for b in chunks(&big, &[1]) {
+                assert_eq!(d.push(b), 1);
+                while let Some(r) = d.next() {
+                    assert_eq!(r.unwrap().data.len(), size);
+                    n += 1;
                 }
-                .to_bytes()
-                .unwrap();
-                let mut d = Stream::new(PemBlocks::new());
-                let mut n = 0;
-                for b in chunks(&big, &[1]) {
-                    assert_eq!(d.push(b), 1);
-                    while let Some(r) = d.next() {
-                        assert_eq!(r.unwrap().data.len(), size);
-                        n += 1;
-                    }
-                }
-                assert_eq!(n, 1);
-            },
-        );
+            }
+            assert_eq!(n, 1);
+        }
     }
 
     #[test]

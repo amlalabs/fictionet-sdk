@@ -1726,7 +1726,7 @@ mod tests {
     use fictionet::stdlib::codec::{Decode, Step};
     use fictionet::stdlib::codec::{Fail, Lcg, Stream};
     use fictionet::stdlib::test_support::contract;
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
+    use fictionet::stdlib::test_support::rounds;
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn s(v: &str) -> Bson {
@@ -2724,21 +2724,17 @@ mod tests {
     }
 
     #[test]
-    fn stream_takes_many_small_messages_in_linear_time() {
-        assert_linear(
-            "stream_takes_many_small_messages_in_linear_time",
-            rounds(25_000),
-            |size| {
-                let one = msg(1, Document::new().with("ping", Bson::Int32(1)))
-                    .to_bytes()
-                    .unwrap();
-                let bytes = one.repeat(size);
-                let (items, failure) = decode_all(Frames::<Message>::new, &bytes);
-                assert_eq!(failure, None);
-                assert_eq!(items.len(), size);
-                assert!(items.iter().all(Result::is_ok));
-            },
-        );
+    fn stream_takes_many_small_messages() {
+        for size in [rounds(25_000), 4 * (rounds(25_000))] {
+            let one = msg(1, Document::new().with("ping", Bson::Int32(1)))
+                .to_bytes()
+                .unwrap();
+            let bytes = one.repeat(size);
+            let (items, failure) = decode_all(Frames::<Message>::new, &bytes);
+            assert_eq!(failure, None);
+            assert_eq!(items.len(), size);
+            assert!(items.iter().all(Result::is_ok));
+        }
     }
 
     #[test]

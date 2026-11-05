@@ -1,7 +1,6 @@
 use std::future::Future;
 use std::time::Duration;
 
-use fictionet::run;
 use fictionet::{Cx, block_on, lab};
 
 use fictionet_test_support::{Done, ended_with_done, within};
@@ -23,30 +22,6 @@ where
 {
     let result = within(limit, move || {
         block_on(lab(options, move |fcx| async move {
-            f(fcx).await?;
-            Err(fictionet::Error::from(Done))
-        }))
-    });
-    ended_with_done(result).unwrap_or_else(|e| panic!("the world failed: {e}"));
-}
-
-/// Runs a world on real time within the host limit and requires Done.
-pub fn real_world<F, Fut>(limit: Duration, f: F)
-where
-    F: FnOnce(Cx) -> Fut + Send + 'static,
-    Fut: Future<Output = fictionet::Result> + Send + 'static,
-{
-    seeded_real_world(fictionet::Seed::random(), limit, f)
-}
-
-/// Runs a seeded real-time world within the host limit and requires Done.
-pub fn seeded_real_world<F, Fut>(options: fictionet::Seed, limit: Duration, f: F)
-where
-    F: FnOnce(Cx) -> Fut + Send + 'static,
-    Fut: Future<Output = fictionet::Result> + Send + 'static,
-{
-    let result = within(limit, move || {
-        block_on(run(options, move |fcx| async move {
             f(fcx).await?;
             Err(fictionet::Error::from(Done))
         }))

@@ -1,8 +1,8 @@
 //! SMTP commands, replies, AUTH lines, DATA, and strict wire values.
 #![no_main]
 
-use fictionet::stdlib::codec::{Decode, Fail, Wire};
-use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::codec::{Decode, Fail, Stream, Wire};
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
 
 use fictionet::stdlib::protocols::smtp::{
     Command, Data, Error, FrameError, Input, Inputs, MAX_AUTH_LINE, MAX_DATA, MAX_DATA_LINE,
@@ -24,23 +24,57 @@ fn auth_server() -> Inputs {
 }
 
 fn check_reply(reply: &Reply) {
-    contract::check_wire_value(reply);
-    if let Ok(bytes) = reply.to_bytes() {
-        contract::check_decode_with_held_limit(Replies::new, &bytes, MAX_REPLY_TEXT);
-        assert_eq!(
-            decode_all(Replies::new, &bytes),
-            (vec![Ok(reply.clone())], None)
+    if let Ok(bytes) = assert_write(reply) {
+        let decoded = decode_chunks(
+            &mut Stream::new(Replies::new()),
+            chunks(&bytes, &[1]),
+            |s| {
+                assert!(s.held() <= MAX_REPLY_TEXT);
+                assert!(s.allocated() <= 2 * MAX_LINE);
+            },
         );
+        assert_eq!(decoded, (vec![Ok(reply.clone())], None));
     }
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(Inputs::new, data, 2 * (MAX_AUTH_LINE + 2));
-    contract::check_decode_with_alloc_limit(Replies::new, data, 2 * MAX_LINE);
-    contract::check_decode_with_alloc_limit(data_server, data, 2 * (MAX_AUTH_LINE + 2));
-    contract::check_decode_with_alloc_limit(auth_server, data, 2 * (MAX_AUTH_LINE + 2));
-    contract::check_decode_with_held_limit(auth_server, data, 0);
-    let (auth, _) = decode_all(auth_server, data);
+    let commands = decode_chunks(
+        &mut Stream::new(Inputs::new()),
+        chunks(data, &[1, 7, 64]),
+        |s| {
+            assert!(s.allocated() <= 2 * (MAX_AUTH_LINE + 2));
+            assert!(s.held() <= MAX_DATA);
+        },
+    );
+    assert_eq!(commands, decode_all(Inputs::new, data));
+    let replies = decode_chunks(
+        &mut Stream::new(Replies::new()),
+        chunks(data, &[1, 7, 64]),
+        |s| {
+            assert!(s.allocated() <= 2 * MAX_LINE);
+            assert!(s.held() <= MAX_REPLY_TEXT);
+        },
+    );
+    assert_eq!(replies, decode_all(Replies::new, data));
+    let messages = decode_chunks(
+        &mut Stream::new(data_server()),
+        chunks(data, &[1, 7, 64]),
+        |s| {
+            assert!(s.allocated() <= 2 * (MAX_AUTH_LINE + 2));
+            assert!(s.held() <= MAX_DATA);
+        },
+    );
+    assert_eq!(messages, decode_all(data_server, data));
+    let auth = decode_chunks(
+        &mut Stream::new(auth_server()),
+        chunks(data, &[1, 7, 64]),
+        |s| {
+            assert!(s.allocated() <= 2 * (MAX_AUTH_LINE + 2));
+            assert_eq!(s.held(), 0);
+        },
+    );
+    assert_eq!(auth, decode_all(auth_server, data));
+    let (auth, _) = auth;
     for (index, item) in auth.iter().enumerate() {
         if let Ok(Input::Line(line)) = item {
             assert_eq!(index, 0);
@@ -52,24 +86,27 @@ fuzz_target!(|data: &[u8]| {
             );
         }
     }
-    contract::check_decode_with_held_limit(Inputs::new, data, MAX_DATA);
-    contract::check_decode_with_held_limit(Replies::new, data, MAX_REPLY_TEXT);
-    contract::check_decode_with_held_limit(data_server, data, MAX_DATA);
-    contract::check_wire::<Command>(data);
-    contract::check_wire::<Request>(data);
-    contract::check_wire::<Reply>(data);
-    contract::check_wire::<Data>(data);
-    for item in decode_all(Inputs::new, data).0 {
+    if let Ok(value) = <Command as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Request as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Reply as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Data as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    for item in commands.0 {
         if let Ok(Input::Command(command)) = item {
-            contract::check_wire_value(&command);
+            let _ = assert_write(&command);
             if let Ok(request) = Request::from_command(&command) {
-                contract::check_wire_value(&request);
-                let bytes = request.to_bytes().unwrap();
-                assert_eq!(Request::parse(&bytes), Ok(request));
+                let _ = assert_write(&request);
             }
         }
     }
-    let (replies, failure) = decode_all(Replies::new, data);
+    let (replies, failure) = replies;
     match Reply::parse(data) {
         Ok(reply) => assert_eq!(replies.first(), Some(&Ok(reply))),
         Err(Error::Framing(error)) => {
@@ -96,10 +133,10 @@ fuzz_target!(|data: &[u8]| {
     for reply in replies.into_iter().flatten() {
         check_reply(&reply);
     }
-    for item in decode_all(data_server, data).0 {
+    for item in messages.0 {
         if let Ok(Input::Message(bytes)) = item {
             let message = Data { bytes };
-            contract::check_wire::<Data>(&message.to_bytes().unwrap());
+            assert_write(&message).unwrap();
         }
     }
     let text = String::from_utf8_lossy(data);
@@ -107,13 +144,13 @@ fuzz_target!(|data: &[u8]| {
         .split_once(' ')
         .map_or((text.as_ref(), None), |(v, a)| (v, Some(a)));
     let command = Command::new(verb, arg);
-    contract::check_wire_value(&command);
-    contract::check_wire_value(&Request::Other(command));
+    let _ = assert_write(&command);
+    let _ = assert_write(&Request::Other(command));
     check_reply(&Reply {
         code: data.first().map_or(250, |b| u16::from(*b) * 3),
         lines: text.split('\n').map(str::to_string).collect(),
     });
-    contract::check_wire_value(&Data {
+    let _ = assert_write(&Data {
         bytes: data.to_vec(),
     });
     if data.len() <= 4096 {
@@ -127,8 +164,14 @@ fuzz_target!(|data: &[u8]| {
             );
             body.extend_from_slice(b"\r\n");
         }
-        let bytes = Data { bytes: body }.to_bytes().unwrap();
-        contract::check_wire::<Data>(&bytes);
-        contract::check_decode_with_alloc_limit(data_server, &bytes, 2 * data_server().capacity());
+        let bytes = assert_write(&Data {
+            bytes: body.clone(),
+        })
+        .unwrap();
+        let decoded = decode_chunks(&mut Stream::new(data_server()), chunks(&bytes, &[1]), |s| {
+            assert!(s.allocated() <= 2 * data_server().capacity());
+            assert!(s.held() <= MAX_DATA);
+        });
+        assert_eq!(decoded, (vec![Ok(Input::Message(body))], None));
     }
 });

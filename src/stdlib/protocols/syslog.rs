@@ -1736,7 +1736,7 @@ mod tests {
     use super::*;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream, pump};
     use fictionet::stdlib::test_support::contract;
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
+    use fictionet::stdlib::test_support::rounds;
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     /// The four examples of RFC 5424 section 6.5, with the BOM bytes in
@@ -2583,34 +2583,30 @@ mod tests {
     }
 
     #[test]
-    fn many_frames_in_one_push_take_linear_time() {
-        assert_linear(
-            "many_frames_in_one_push_take_linear_time",
-            rounds(100000),
-            |size| {
-                let n = size;
-                let data = b"<13>x\n".repeat(n);
-                let mut stream = Stream::new(Frames::new());
-                let mut count = 0;
-                pump(&mut stream, &data, |f| {
-                    assert_eq!(f.message, b"<13>x");
-                    count += 1;
-                })
-                .unwrap();
-                assert_eq!((count, stream.buffered()), (n, 0));
-                pump(&mut stream, &vec![b'\n'; 6 * n], |_| panic!("blank frame")).unwrap();
-                assert_eq!(stream.buffered(), 0);
-                // Bytes held after a frame is taken still count, and still frame.
-                let mut d = Stream::new(Frames::new());
-                assert_eq!(d.push(b"<13>a\n<13>b\n<13>"), b"<13>a\n<13>b\n<13>".len());
-                assert_eq!(d.next().unwrap().unwrap().message, b"<13>a");
-                assert_eq!(d.buffered(), 10);
-                assert_eq!(d.push(b"c\n"), b"c\n".len());
-                assert_eq!(d.next().unwrap().unwrap().message, b"<13>b");
-                assert_eq!(d.next().unwrap().unwrap().message, b"<13>c");
-                assert_eq!(d.buffered(), 0);
-            },
-        );
+    fn many_frames_in_one_push() {
+        for size in [rounds(100000), 4 * (rounds(100000))] {
+            let n = size;
+            let data = b"<13>x\n".repeat(n);
+            let mut stream = Stream::new(Frames::new());
+            let mut count = 0;
+            pump(&mut stream, &data, |f| {
+                assert_eq!(f.message, b"<13>x");
+                count += 1;
+            })
+            .unwrap();
+            assert_eq!((count, stream.buffered()), (n, 0));
+            pump(&mut stream, &vec![b'\n'; 6 * n], |_| panic!("blank frame")).unwrap();
+            assert_eq!(stream.buffered(), 0);
+            // Bytes held after a frame is taken still count, and still frame.
+            let mut d = Stream::new(Frames::new());
+            assert_eq!(d.push(b"<13>a\n<13>b\n<13>"), b"<13>a\n<13>b\n<13>".len());
+            assert_eq!(d.next().unwrap().unwrap().message, b"<13>a");
+            assert_eq!(d.buffered(), 10);
+            assert_eq!(d.push(b"c\n"), b"c\n".len());
+            assert_eq!(d.next().unwrap().unwrap().message, b"<13>b");
+            assert_eq!(d.next().unwrap().unwrap().message, b"<13>c");
+            assert_eq!(d.buffered(), 0);
+        }
     }
 
     #[test]

@@ -530,9 +530,6 @@ impl Response {
         if rtag.is_some() && matches!(status, Status::Preauth | Status::Bye) {
             return Err(syntax("PREAUTH and BYE are never tagged"));
         }
-        if rest.len() == w && b.len() + 1 > MAX_TEXT {
-            return Err(Error::TooLong);
-        }
         let (code, text) = resp_text(rest.get(w + 1..).unwrap_or(&[])).map_err(syntax)?;
         Ok(Response::Status {
             tag: rtag,
@@ -569,8 +566,7 @@ pub enum Error {
         waiting: bool,
     },
     /// A command or response holds more than [`MAX_TEXT`] bytes outside
-    /// its literals, or more than [`MAX_MESSAGE`] in all. The required
-    /// status separator counts toward [`MAX_TEXT`] even when omitted.
+    /// its literals, or more than [`MAX_MESSAGE`] in all.
     TooLong,
     /// Line framing or assembly failed while reading one value.
     Framing(FrameError),
@@ -832,17 +828,21 @@ fn text_str(b: &[u8]) -> Result<&str, &'static str> {
     std::str::from_utf8(b).map_err(|_| "text is not UTF-8")
 }
 
+/// The closing bracket of a response code, if the text begins with one.
+fn response_code_end(text: &[u8]) -> Option<usize> {
+    if text.first() != Some(&b'[') {
+        return None;
+    }
+    let close = text.iter().position(|&x| x == b']')?;
+    (close > 1 && matches!(text.get(close + 1), None | Some(b' '))).then_some(close)
+}
+
 /// The code and text after a status word and its space.
 fn resp_text(rest: &[u8]) -> Result<(Option<String>, String), &'static str> {
-    if rest.first() == Some(&b'[')
-        && let Some(close) = rest.iter().position(|&x| x == b']')
-    {
-        let after = &rest[close + 1..];
-        if close > 1 && (after.is_empty() || after[0] == b' ') {
-            let code = text_str(&rest[1..close])?;
-            let text = text_str(after.get(1..).unwrap_or(&[]))?;
-            return Ok((Some(code.to_string()), text.to_string()));
-        }
+    if let Some(close) = response_code_end(rest) {
+        let code = text_str(&rest[1..close])?;
+        let text = text_str(rest.get(close + 2..).unwrap_or(&[]))?;
+        return Ok((Some(code.to_string()), text.to_string()));
     }
     Ok((None, text_str(rest)?.to_string()))
 }
@@ -1098,7 +1098,8 @@ impl Wire for Command {
     /// Reads one whole command with counted literals and final CRLF.
     /// Refuses trailing bytes, invalid grammar, non-synchronizing literals
     /// over [`MAX_NON_SYNC`], and text, literal, message, or nesting overflow.
-    /// A section literal must fit its canonical quoted form.
+    /// Section literals must be short lines of UTF-8. Their quoted form
+    /// may exceed the writer's text limit.
     fn parse(mut bytes: &[u8]) -> Result<Self, Error> {
         let mut commands = Inputs::new();
         loop {
@@ -1135,9 +1136,6 @@ impl Wire for Command {
         }
         writer.args(&self.args)?;
         writer.text(b"\r\n")?;
-        if Self::parse_message(&writer.out).as_ref() != Ok(self) {
-            return Err(Error::Unwritable);
-        }
         out.try_reserve(writer.out.len())
             .map_err(|_| Error::Unwritable)?;
         out.extend_from_slice(&writer.out);
@@ -1151,10 +1149,9 @@ impl Wire for Response {
 
     /// Reads one whole response with CRLF framing and counted literal bytes.
     /// Refuses trailing bytes, invalid grammar, non-synchronizing literals,
-    /// and text, literal, message, or nesting overflow. A section literal
-    /// must fit its canonical quoted form. A status line that omits the space
-    /// after its status word must still fit [`MAX_TEXT`] with the space
-    /// added; otherwise this returns [`Error::TooLong`].
+    /// and text, literal, message, or nesting overflow. Limits apply to the
+    /// input, even if adding a status separator or quoting section literals
+    /// would make the writer's output longer.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         fictionet::stdlib::codec::decode_exact(
             Responses::new(),
@@ -1201,6 +1198,8 @@ impl Wire for Response {
                     writer.text(b"[")?;
                     writer.response_text(code)?;
                     writer.text(b"] ")?;
+                } else if response_code_end(text.as_bytes()).is_some() {
+                    return Err(Error::Unwritable);
                 }
                 writer.response_text(text)?;
             }
@@ -1214,9 +1213,6 @@ impl Wire for Response {
             }
         }
         writer.text(b"\r\n")?;
-        if Self::parse_message(&writer.out).as_ref() != Ok(self) {
-            return Err(Error::Unwritable);
-        }
         out.try_reserve(writer.out.len())
             .map_err(|_| Error::Unwritable)?;
         out.extend_from_slice(&writer.out);
@@ -1356,30 +1352,6 @@ impl Writer {
         self.text(b"}\r\n")?;
         self.append(data, true)
     }
-}
-
-// A parsed value must also fit after canonical re-encoding. In particular,
-// a literal inside a section becomes quoted text in an Atom and may expand.
-fn codec_command(bytes: &[u8]) -> Result<Command, Error> {
-    let command = Command::parse_message(bytes)?;
-    if command.write(&mut Vec::new()).is_err() {
-        return Err(Error::Syntax {
-            tag: Some(command.tag),
-            reason: "command cannot be written unchanged",
-        });
-    }
-    Ok(command)
-}
-
-fn codec_response(bytes: &[u8]) -> Result<Response, Error> {
-    let response = Response::parse_message(bytes)?;
-    if response.write(&mut Vec::new()).is_err() {
-        return Err(Error::Syntax {
-            tag: None,
-            reason: "response cannot be written unchanged",
-        });
-    }
-    Ok(response)
 }
 
 enum MailFrame {
@@ -1686,7 +1658,7 @@ impl Decode for Inputs {
             codec::Step::Item(frame, used) => codec::Step::Item(
                 frame.and_then(|frame| match frame {
                     MailFrame::Continue { tag, size } => Ok(Input::Continue { tag, size }),
-                    MailFrame::Message(bytes) => codec_command(&bytes).map(Input::Command),
+                    MailFrame::Message(bytes) => Command::parse_message(&bytes).map(Input::Command),
                 }),
                 used,
             ),
@@ -1742,7 +1714,7 @@ impl Decode for Responses {
         Ok(match self.framing.decode(input, eof)? {
             codec::Step::Item(frame, used) => codec::Step::Item(
                 frame.and_then(|frame| match frame {
-                    MailFrame::Message(bytes) => codec_response(&bytes),
+                    MailFrame::Message(bytes) => Response::parse_message(&bytes),
                     MailFrame::Continue { .. } => Err(Error::Syntax {
                         tag: None,
                         reason: "unexpected continuation event",
@@ -1771,9 +1743,9 @@ mod tests {
 
     use super::*;
     use codec::{Fail, Lcg, Stream};
-    use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::rounds;
     use fictionet::stdlib::test_support::{Scripted, decode_all, mutate};
+    use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
 
     fn cmd(bytes: &[u8]) -> Command {
         Command::parse(bytes).unwrap()
@@ -1996,7 +1968,7 @@ mod tests {
         assert_eq!(Response::parse(&expected), Ok(r.clone()));
         assert_eq!(responses(&expected), vec![Ok(r.clone())]);
 
-        // A missing separator is accepted only when the writer can add it.
+        // Reading accepts an omitted separator; writing supplies it.
         let mut without_space = tag.into_bytes();
         without_space.extend_from_slice(b" OK\r\n");
         let parsed = Response::parse(&without_space).unwrap();
@@ -2008,28 +1980,53 @@ mod tests {
     #[test]
     fn max_minus_five_rejected() {
         let r = Response::tagged(&"t".repeat(MAX_TEXT - 5), Status::Ok, "");
-        assert_eq!(contract::check_refused(&r), Error::Unwritable);
+        assert_eq!(assert_write(&r).unwrap_err(), Error::Unwritable);
     }
 
     #[test]
-    fn max_minus_five_parse_rejected() {
-        let mut b = "t".repeat(MAX_TEXT - 5).into_bytes();
+    fn status_input_limit_does_not_count_an_omitted_separator() {
+        let tag = "t".repeat(MAX_TEXT - 5);
+        let mut b = tag.as_bytes().to_vec();
         b.extend_from_slice(b" OK\r\n");
         assert_eq!(b.len(), MAX_TEXT);
-        assert_eq!(Response::parse(&b), Err(Error::TooLong));
+        let response = Response::tagged(&tag, Status::Ok, "");
+        assert_eq!(Response::parse(&b), Ok(response.clone()));
+        assert_eq!(assert_write(&response).unwrap_err(), Error::Unwritable);
     }
 
     #[test]
-    fn max_minus_five_stream_rejected() {
-        let mut b = "t".repeat(MAX_TEXT - 5).into_bytes();
+    fn unwritable_status_does_not_interrupt_the_response_stream() {
+        let tag = "t".repeat(MAX_TEXT - 5);
+        let mut b = tag.as_bytes().to_vec();
         b.extend_from_slice(b" OK\r\na OK next\r\n");
         assert_eq!(
             responses(&b),
             vec![
-                Err(Error::TooLong),
+                Ok(Response::tagged(&tag, Status::Ok, "")),
                 Ok(Response::tagged("a", Status::Ok, "next"))
             ]
         );
+    }
+
+    #[test]
+    fn status_writing_preserves_tags_and_response_codes() {
+        for text in ["[ALERT]", "[ALERT] message", "[ALERT]  message"] {
+            let response = Response::tagged("a", Status::Ok, text);
+            assert_eq!(assert_write(&response).unwrap_err(), Error::Unwritable);
+            let with_code = response.with_code("READ-WRITE");
+            assert_eq!(
+                Response::parse(&with_code.to_bytes().unwrap()),
+                Ok(with_code)
+            );
+        }
+        for text in ["[", "[]", "[] message", "[ALERT]message", " [ALERT]"] {
+            let response = Response::tagged("a", Status::Ok, text);
+            assert_eq!(Response::parse(&response.to_bytes().unwrap()), Ok(response));
+        }
+        let tagged = Response::tagged("*", Status::Ok, "ready");
+        assert_eq!(assert_write(&tagged).unwrap_err(), Error::Unwritable);
+        let untagged = Response::untagged(Status::Ok, "ready");
+        assert_eq!(Response::parse(b"* OK ready\r\n"), Ok(untagged));
     }
 
     #[test]
@@ -2138,7 +2135,7 @@ mod tests {
             value = Value::List(vec![value]);
         }
         assert_eq!(
-            contract::check_refused(&Response::Data(vec![value])),
+            assert_write(&Response::Data(vec![value])).unwrap_err(),
             Error::Unwritable
         );
     }
@@ -2158,7 +2155,7 @@ mod tests {
             b"a SELECT foo[\r\n"
         );
         assert_eq!(
-            contract::check_refused(&Command::new("a", "X", vec![Value::atom("BODY[")])),
+            assert_write(&Command::new("a", "X", vec![Value::atom("BODY[")])).unwrap_err(),
             Error::Unwritable
         );
         // header-fld-name is an astring, so it may be quoted or a literal.
@@ -2194,6 +2191,42 @@ mod tests {
     }
 
     #[test]
+    fn section_literal_limits_apply_before_quoting() {
+        let mut section = b"BODY[(".to_vec();
+        for i in 0..4 {
+            if i != 0 {
+                section.push(b' ');
+            }
+            section.extend_from_slice(format!("{{{MAX_QUOTED}}}\r\n").as_bytes());
+            section.extend_from_slice(&vec![b'"'; MAX_QUOTED]);
+        }
+        section.extend_from_slice(b")]\r\n");
+        let quoted = format!("\"{}\"", "\\\"".repeat(MAX_QUOTED));
+        let atom = Value::atom(&format!("BODY[({})]", [quoted.as_str(); 4].join(" ")));
+
+        let command_bytes = [b"a X ".as_slice(), &section].concat();
+        let command = Command::new("a", "X", vec![atom.clone()]);
+        assert_eq!(Command::parse(&command_bytes), Ok(command.clone()));
+        let items = events(&command_bytes);
+        assert_eq!(items.len(), 5);
+        assert!(items[..4].iter().all(|item| matches!(
+            item,
+            Ok(Input::Continue {
+                size: MAX_QUOTED,
+                ..
+            })
+        )));
+        assert_eq!(items[4], Ok(Input::Command(command.clone())));
+        assert_eq!(assert_write(&command).unwrap_err(), Error::Unwritable);
+
+        let response_bytes = [b"* X ".as_slice(), &section].concat();
+        let response = Response::Data(vec![Value::atom("X"), atom]);
+        assert_eq!(Response::parse(&response_bytes), Ok(response.clone()));
+        assert_eq!(responses(&response_bytes), vec![Ok(response.clone())]);
+        assert_eq!(assert_write(&response).unwrap_err(), Error::Unwritable);
+    }
+
+    #[test]
     fn binary_literals() {
         // literal8 = "~{" number64 "}" CRLF *OCTET (RFC 9051 section 9),
         // in FETCH BINARY responses and in APPEND.
@@ -2218,7 +2251,7 @@ mod tests {
             1,
             vec![Value::atom("BINARY[]"), fixture_value_binary(vec![0], true)],
         );
-        assert_eq!(contract::check_refused(&r), Error::Unwritable);
+        assert_eq!(assert_write(&r).unwrap_err(), Error::Unwritable);
         // A plain literal still may not hold NUL, and ~ alone is a word.
         assert_eq!(
             Command::parse(b"a X {1}\r\n\0\r\n"),
@@ -2250,7 +2283,7 @@ mod tests {
         let r = Response::parse(&b).unwrap();
         assert_eq!(r.to_bytes().unwrap(), b);
         let r = Response::tagged(&"t".repeat(MAX_TEXT), Status::Bad, "x").with_code("C");
-        assert_eq!(contract::check_refused(&r), Error::Unwritable);
+        assert_eq!(assert_write(&r).unwrap_err(), Error::Unwritable);
     }
 
     fn strings_needing_literals() -> Vec<Vec<u8>> {
@@ -2276,7 +2309,14 @@ mod tests {
             assert_eq!(response.to_bytes().unwrap(), expected);
             assert_eq!(Response::parse(&expected), Ok(response.clone()));
             assert_eq!(responses(&expected), vec![Ok(response)]);
-            contract::check_decode_with_alloc_limit(Responses::new, &expected, 2 * MAX_LINE);
+            decode_chunks(
+                &mut Stream::new(Responses::new()),
+                chunks(&expected, &[1, 7, 64]),
+                |stream| {
+                    assert!(stream.held() <= MAX_HELD);
+                    assert!(stream.allocated() <= 2 * MAX_LINE);
+                },
+            );
         }
         assert_eq!(
             Value::string(&vec![b'a'; MAX_QUOTED]),
@@ -2297,7 +2337,14 @@ mod tests {
             assert_eq!(response.to_bytes().unwrap(), expected);
             assert_eq!(Response::parse(&expected), Ok(response.clone()));
             assert_eq!(responses(&expected), vec![Ok(response)]);
-            contract::check_decode_with_alloc_limit(Responses::new, &expected, 2 * MAX_LINE);
+            decode_chunks(
+                &mut Stream::new(Responses::new()),
+                chunks(&expected, &[1, 7, 64]),
+                |stream| {
+                    assert!(stream.held() <= MAX_HELD);
+                    assert!(stream.allocated() <= 2 * MAX_LINE);
+                },
+            );
         }
     }
 
@@ -2324,7 +2371,7 @@ mod tests {
             (Response::Data(vec![]), b"*\r\n"),
         ] {
             assert_eq!(value.to_bytes().unwrap(), bytes);
-            contract::check_wire_value(&value);
+            let _ = assert_write(&value);
         }
         let fetch = Response::fetch(
             1,
@@ -2354,7 +2401,7 @@ mod tests {
             Command::new("a b", "", vec![]),
             Command::new("", "no op", vec![]),
         ] {
-            assert_eq!(contract::check_refused(&command), Error::Unwritable);
+            assert_eq!(assert_write(&command).unwrap_err(), Error::Unwritable);
         }
         for response in [
             Response::tagged("a", Status::Bye, "x"),
@@ -2362,7 +2409,7 @@ mod tests {
             Response::untagged(Status::Ok, "x").with_code("A]B"),
             Response::Data(atoms(&["OK", "x"])),
         ] {
-            assert_eq!(contract::check_refused(&response), Error::Unwritable);
+            assert_eq!(assert_write(&response).unwrap_err(), Error::Unwritable);
         }
     }
 
@@ -2407,7 +2454,14 @@ mod tests {
             };
             assert_eq!(Command::parse(bytes), Err(error.clone()), "{bytes:?}");
             assert_eq!(decode_all(Inputs::new, bytes), (vec![Err(error)], None));
-            contract::check_decode_with_alloc_limit(Inputs::new, bytes, 2 * MAX_LINE);
+            decode_chunks(
+                &mut Stream::new(Inputs::new()),
+                chunks(bytes, &[1, 7, 64]),
+                |stream| {
+                    assert!(stream.held() <= MAX_HELD);
+                    assert!(stream.allocated() <= 2 * MAX_LINE);
+                },
+            );
         }
         assert_eq!(
             Command::parse(b"a NOOP\r\nb NOOP\r\n"),
@@ -2421,7 +2475,14 @@ mod tests {
             (b"a X {3}\r\nab", FrameError::Incomplete),
         ] {
             assert_eq!(Command::parse(bytes), Err(Error::Framing(error)));
-            contract::check_decode_with_alloc_limit(Inputs::new, bytes, 2 * MAX_LINE);
+            decode_chunks(
+                &mut Stream::new(Inputs::new()),
+                chunks(bytes, &[1, 7, 64]),
+                |stream| {
+                    assert!(stream.held() <= MAX_HELD);
+                    assert!(stream.allocated() <= 2 * MAX_LINE);
+                },
+            );
         }
         for (depth, valid) in [(MAX_DEPTH, true), (MAX_DEPTH + 1, false)] {
             let bytes = [
@@ -2555,7 +2616,14 @@ mod tests {
                         .all(|e| matches!(e, Ok(Input::Continue { .. })))
                 );
             }
-            contract::check_decode_with_alloc_limit(Inputs::new, bytes, 2 * MAX_LINE);
+            decode_chunks(
+                &mut Stream::new(Inputs::new()),
+                chunks(bytes, &[1, 7, 64]),
+                |stream| {
+                    assert!(stream.held() <= MAX_HELD);
+                    assert!(stream.allocated() <= 2 * MAX_LINE);
+                },
+            );
         }
         for bytes in [
             b"* 12 FETCH (FLAGS (\\Seen) BODY[HEADER] {13}\r\nSubject: hi\r\n)\r\n".as_slice(),
@@ -2566,7 +2634,14 @@ mod tests {
                 assert!(Response::parse(&bytes[..cut]).is_err());
                 assert!(decode_all(Responses::new, &bytes[..cut]).0.is_empty());
             }
-            contract::check_decode_with_alloc_limit(Responses::new, bytes, 2 * MAX_LINE);
+            decode_chunks(
+                &mut Stream::new(Responses::new()),
+                chunks(bytes, &[1, 7, 64]),
+                |stream| {
+                    assert!(stream.held() <= MAX_HELD);
+                    assert!(stream.allocated() <= 2 * MAX_LINE);
+                },
+            );
         }
     }
 
@@ -2587,7 +2662,14 @@ mod tests {
             Ok(Input::Command(Command::new("a3", "X", vec![]))),
         ];
         assert_eq!(events(wire), expected);
-        contract::check_decode_with_alloc_limit(Inputs::new, wire, 2 * MAX_LINE);
+        decode_chunks(
+            &mut Stream::new(Inputs::new()),
+            chunks(wire, &[1, 7, 64]),
+            |stream| {
+                assert!(stream.held() <= MAX_HELD);
+                assert!(stream.allocated() <= 2 * MAX_LINE);
+            },
+        );
         let mut stream = Stream::new(Inputs::new());
         let wire = b"b1 APPEND INBOX {10}\r\nb2 NOOP\r\n";
         assert_eq!(stream.push(wire), wire.len());
@@ -2672,7 +2754,14 @@ mod tests {
             Ok(Response::tagged("t", Status::Ok, "done")),
         ];
         assert_eq!(responses(wire), expected);
-        contract::check_decode_with_alloc_limit(Responses::new, wire, 2 * MAX_LINE);
+        decode_chunks(
+            &mut Stream::new(Responses::new()),
+            chunks(wire, &[1, 7, 64]),
+            |stream| {
+                assert!(stream.held() <= MAX_HELD);
+                assert!(stream.allocated() <= 2 * MAX_LINE);
+            },
+        );
         assert!(matches!(
             decode_all(Responses::new, b"* 1 FETCH (BODY[] {2000000}\r\n").1,
             Some(Fail::Protocol(FrameError::LiteralTooLarge { .. }))
@@ -2692,7 +2781,7 @@ mod tests {
     #[test]
     fn writers_refuse_size_and_nesting_overflow() {
         fictionet::assert_cases! {
-            contract::check_refused;
+            |value| assert_write(value).unwrap_err();
             (&Command::new(
                 "a",
                 "APPEND",
@@ -2718,15 +2807,16 @@ mod tests {
             value = Value::List(vec![value]);
         }
         assert_eq!(
-            contract::check_refused(&Command::new("a", "X", vec![value])),
+            assert_write(&Command::new("a", "X", vec![value])).unwrap_err(),
             Error::Unwritable
         );
         assert_eq!(
-            contract::check_refused(&Command::new(
+            assert_write(&Command::new(
                 "a",
                 "X",
                 vec![Value::Quoted(vec![b'q'; MAX_QUOTED + 1])],
-            )),
+            ))
+            .unwrap_err(),
             Error::Unwritable
         );
     }
@@ -2754,21 +2844,23 @@ mod tests {
             Ok(Input::Command(Command::new("b", "NOOP", vec![])))
         );
         assert_eq!(
-            contract::check_refused(&Command::new(
+            assert_write(&Command::new(
                 "a",
                 "X",
                 vec![
                     Value::string(b"a\0b"),
                     fixture_value_literal(b"\0c\0".to_vec(), true),
                 ],
-            )),
+            ))
+            .unwrap_err(),
             Error::Unwritable
         );
         assert_eq!(
-            contract::check_refused(&Response::fetch(
+            assert_write(&Response::fetch(
                 1,
                 vec![Value::atom("BODY[]"), Value::string(b"x\r\n\0")],
-            )),
+            ))
+            .unwrap_err(),
             Error::Unwritable
         );
     }
@@ -2795,18 +2887,20 @@ mod tests {
         assert_eq!(command.args[0].as_str(), Some("é"));
         assert_eq!(cmd(&command.to_bytes().unwrap()), command);
         assert_eq!(
-            contract::check_refused(&Command::new(
+            assert_write(&Command::new(
                 "a",
                 "X",
                 vec![Value::Quoted(b"\xff".to_vec())],
-            )),
+            ))
+            .unwrap_err(),
             Error::Unwritable
         );
         assert_eq!(
-            contract::check_refused(&Response::Data(vec![
+            assert_write(&Response::Data(vec![
                 Value::atom("X"),
                 Value::Quoted(b"a\x80".to_vec()),
-            ])),
+            ]))
+            .unwrap_err(),
             Error::Unwritable
         );
         let command = Command::new("a", "X", vec![fixture_value_literal(vec![0xff], true)]);
@@ -2849,7 +2943,14 @@ mod tests {
             b"DONE\nx NOOP\r\n",
             &vec![b'a'; MAX_TEXT],
         ] {
-            contract::check_decode_with_alloc_limit(make, bytes, 2 * MAX_LINE);
+            decode_chunks(
+                &mut Stream::new(make()),
+                chunks(bytes, &[1, 7, 64]),
+                |stream| {
+                    assert!(stream.held() <= MAX_HELD);
+                    assert!(stream.allocated() <= 2 * MAX_LINE);
+                },
+            );
         }
         assert_eq!(
             decode_all(make, b"abc\r\nx NOOP\r\n").0[0],
@@ -2875,7 +2976,14 @@ mod tests {
             b"\r\n".to_vec(),
         ]
         .concat();
-        contract::check_decode_with_alloc_limit(Inputs::new, &bytes, 2 * MAX_LINE);
+        decode_chunks(
+            &mut Stream::new(Inputs::new()),
+            chunks(&bytes, &[1, 7, 64]),
+            |stream| {
+                assert!(stream.held() <= MAX_HELD);
+                assert!(stream.allocated() <= 2 * MAX_LINE);
+            },
+        );
         let mut stream = Stream::new(Inputs::new());
         codec::pump(&mut stream, &bytes, |_| {}).unwrap();
         assert_eq!(stream.held(), 0);
@@ -2890,13 +2998,14 @@ mod tests {
             100
         ]);
         assert_eq!(
-            contract::check_refused(&Response::Data(vec![value])),
+            assert_write(&Response::Data(vec![value])).unwrap_err(),
             Error::Unwritable
         );
         assert_eq!(
-            contract::check_refused(&Response::Data(vec![Value::List(vec![Value::atom(
+            assert_write(&Response::Data(vec![Value::List(vec![Value::atom(
                 &"a".repeat(MAX_TEXT + 1),
-            )])])),
+            )])]))
+            .unwrap_err(),
             Error::Unwritable
         );
     }
@@ -2907,11 +3016,12 @@ mod tests {
         let command = Command::new("a", "X", vec![fixture_value_literal(long.clone(), false)]);
         assert!(command.to_bytes().unwrap().starts_with(b"a X {4097}\r\n"));
         assert_eq!(
-            contract::check_refused(&Command::new(
+            assert_write(&Command::new(
                 "a",
                 "X",
                 vec![fixture_value_literal(long, true)],
-            )),
+            ))
+            .unwrap_err(),
             Error::Unwritable
         );
         let command = Command::new(
@@ -2941,7 +3051,7 @@ mod tests {
         );
         let big = fixture_value_literal(vec![b'y'; MAX_LITERAL], false);
         assert_eq!(
-            contract::check_refused(&Command::new("a", "X", vec![big; 6])),
+            assert_write(&Command::new("a", "X", vec![big; 6])).unwrap_err(),
             Error::Unwritable
         );
     }
@@ -3010,12 +3120,26 @@ mod tests {
             items[2],
             Ok(Input::Command(Command::new("b", "NOOP", vec![])))
         );
-        contract::check_decode_with_alloc_limit(make, bytes, 2 * MAX_LINE);
+        decode_chunks(
+            &mut Stream::new(make()),
+            chunks(bytes, &[1, 7, 64]),
+            |stream| {
+                assert!(stream.held() <= MAX_HELD);
+                assert!(stream.allocated() <= 2 * MAX_LINE);
+            },
+        );
         let mut rng = Lcg::new(7);
         for _ in 0..5000 {
             let bytes = generated_stream(&mut rng);
             let choices = rng.bytes(8);
-            contract::check_decode_with_alloc_limit(|| refusals(&choices), &bytes, 2 * MAX_LINE);
+            decode_chunks(
+                &mut Stream::new(refusals(&choices)),
+                chunks(&bytes, &[1, 7, 64]),
+                |stream| {
+                    assert!(stream.held() <= MAX_HELD);
+                    assert!(stream.allocated() <= 2 * MAX_LINE);
+                },
+            );
         }
     }
 
@@ -3090,19 +3214,41 @@ mod tests {
         let (mut commands, mut replies) = (0, 0);
         for _ in 0..1024 {
             let bytes = generated_stream(&mut rng);
-            contract::check_decode_with_alloc_limit(Inputs::new, &bytes, 2 * MAX_LINE);
-            contract::check_decode_with_alloc_limit(Responses::new, &bytes, 2 * MAX_LINE);
-            contract::check_wire::<Command>(&bytes);
-            contract::check_wire::<Response>(&bytes);
-            for item in decode_all(Inputs::new, &bytes).0 {
+            let chunked_commands = decode_chunks(
+                &mut Stream::new(Inputs::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |stream| {
+                    assert!(stream.held() <= MAX_HELD);
+                    assert!(stream.allocated() <= 2 * MAX_LINE);
+                },
+            );
+            let chunked_responses = decode_chunks(
+                &mut Stream::new(Responses::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |stream| {
+                    assert!(stream.held() <= MAX_HELD);
+                    assert!(stream.allocated() <= 2 * MAX_LINE);
+                },
+            );
+            if let Ok(value) = Command::parse(&bytes) {
+                let _ = assert_write(&value);
+            }
+            if let Ok(value) = Response::parse(&bytes) {
+                let _ = assert_write(&value);
+            }
+            let whole_commands = decode_all(Inputs::new, &bytes);
+            let whole_responses = decode_all(Responses::new, &bytes);
+            assert_eq!(chunked_commands, whole_commands);
+            assert_eq!(chunked_responses, whole_responses);
+            for item in whole_commands.0 {
                 if let Ok(Input::Command(command)) = item {
                     commands += 1;
-                    assert_eq!(Command::parse(&command.to_bytes().unwrap()), Ok(command));
+                    let _ = assert_write(&command);
                 }
             }
-            for reply in decode_all(Responses::new, &bytes).0.into_iter().flatten() {
+            for reply in whole_responses.0.into_iter().flatten() {
                 replies += 1;
-                assert_eq!(Response::parse(&reply.to_bytes().unwrap()), Ok(reply));
+                let _ = assert_write(&reply);
             }
         }
         assert!(commands > 100);
@@ -3149,13 +3295,11 @@ mod tests {
             let tags = ["a", "A1", "t2", "tag.3"];
             let tag = tags[rng.index(tags.len())];
             let command = Command::new(tag, "X", args.clone());
-            contract::check_wire_value(&command);
-            if command.to_bytes().is_ok() {
+            if assert_write(&command).is_ok() {
                 commands_written += 1;
             }
             let response = Response::Data(args);
-            contract::check_wire_value(&response);
-            if let Ok(bytes) = response.to_bytes() {
+            if let Ok(bytes) = assert_write(&response) {
                 assert_eq!(
                     decode_all(Responses::new, &bytes),
                     (vec![Ok(response)], None)
@@ -3163,13 +3307,13 @@ mod tests {
                 responses_written += 1;
             }
             let text = rng.text(128);
-            contract::check_wire_value(&Response::Status {
+            let _ = assert_write(&Response::Status {
                 tag: Some(tag.into()),
                 status: Status::No,
                 code: Some(text.clone()),
                 text: text.clone(),
             });
-            contract::check_wire_value(&Response::continue_req(&text));
+            let _ = assert_write(&Response::continue_req(&text));
         }
         assert!(
             commands_written > 500,

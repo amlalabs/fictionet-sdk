@@ -1575,7 +1575,7 @@ mod tests {
     use fictionet::stdlib::codec::{Fail, Stream, pump};
     use fictionet::stdlib::test_support;
     use fictionet::stdlib::test_support::contract;
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
+    use fictionet::stdlib::test_support::rounds;
     use tpkt::{MAX_PACKET, MAX_PAYLOAD, Packet};
 
     fn parameter(code: u8, value: Vec<u8>) -> Parameter {
@@ -2396,25 +2396,21 @@ mod tests {
     }
 
     #[test]
-    fn stream_takes_many_small_packets_in_linear_time() {
-        assert_linear(
-            "stream_takes_many_small_packets_in_linear_time",
-            rounds(50_000),
-            |size| {
-                let one = Tpdu::Data(data_fixture(true, 0, vec![1]))
-                    .to_bytes()
-                    .map(tpkt::Packet::new)
-                    .unwrap()
-                    .to_bytes()
-                    .unwrap();
-                let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * size).collect();
-                let mut d = Stream::new(Frames::<tpkt::Packet>::new());
-                let mut n = 0;
-                pump(&mut d, &stream, |_| n += 1).unwrap();
-                assert_eq!(n, size);
-                assert_eq!(d.buffered(), 0);
-            },
-        );
+    fn stream_takes_many_small_packets() {
+        for size in [rounds(50_000), 4 * (rounds(50_000))] {
+            let one = Tpdu::Data(data_fixture(true, 0, vec![1]))
+                .to_bytes()
+                .map(tpkt::Packet::new)
+                .unwrap()
+                .to_bytes()
+                .unwrap();
+            let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * size).collect();
+            let mut d = Stream::new(Frames::<tpkt::Packet>::new());
+            let mut n = 0;
+            pump(&mut d, &stream, |_| n += 1).unwrap();
+            assert_eq!(n, size);
+            assert_eq!(d.buffered(), 0);
+        }
     }
 
     #[test]

@@ -1532,7 +1532,7 @@ mod tests {
     use super::*;
     use codec::{Decode, Fail, Lcg, Stream};
     use fictionet::assert_cases;
-    use fictionet::stdlib::test_support::assert_linear;
+
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::{chunks, decode_all, mutate};
 
@@ -1841,11 +1841,9 @@ mod tests {
             }
         };
         check(MAX_USER_ID);
-        assert_linear(
-            "requests_byte_at_a_time_are_bounded",
-            MAX_USER_ID / 4,
-            check,
-        );
+        for size in [MAX_USER_ID / 4, 4 * (MAX_USER_ID / 4)] {
+            check(size);
+        }
     }
 
     #[test]

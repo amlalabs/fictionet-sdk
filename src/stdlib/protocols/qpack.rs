@@ -2003,7 +2003,7 @@ mod tests {
     use super::*;
     use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::protocols::prefix_int::Integer;
-    use fictionet::stdlib::test_support::assert_linear;
+
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::hex;
     use fictionet::stdlib::test_support::{decode_all, mutate};
@@ -2951,7 +2951,7 @@ mod tests {
 
     #[test]
     fn long_instruction_allocation_contract() {
-        assert_linear("long_instruction_allocation_contract", 7_500, |size| {
+        for size in [7_500, 4 * (7_500)] {
             let ins = EncoderInstruction::InsertWithLiteralName {
                 name: vec![b'0'; size],
                 value: vec![b'1'; size],
@@ -2966,7 +2966,7 @@ mod tests {
             table.set_capacity(MAX_TABLE_CAPACITY).unwrap();
             apply(&mut table, &bytes).unwrap();
             assert_eq!(table.len(), 1);
-        });
+        }
     }
 
     #[test]

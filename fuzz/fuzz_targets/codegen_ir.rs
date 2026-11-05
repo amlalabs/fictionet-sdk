@@ -4,7 +4,10 @@
 
 #![no_main]
 
-use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::codec::Stream;
+use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::test_support::assert_write;
+use fictionet::stdlib::test_support::{chunks, decode_all, decode_chunks};
 use libfuzzer_sys::fuzz_target;
 
 use fictionet_codegen_golden::recursive as protocol;
@@ -12,14 +15,23 @@ use fictionet_codegen_golden::recursive as protocol;
 fuzz_target!(|data: &[u8]| {
     {
         use protocol::Node as Value;
-        contract::check_wire::<Value>(data);
+        if let Ok(value) = Value::parse(data) {
+            let _ = assert_write(&value);
+        }
     }
     {
         use protocol::Shared as Value;
-        contract::check_wire::<Value>(data);
+        if let Ok(value) = Value::parse(data) {
+            let _ = assert_write(&value);
+        }
     }
     {
         use protocol::Nodes as Frames;
-        contract::check_decode_with_alloc_limit(|| Frames, data, 2 * (protocol::MAX_MESSAGE + 6));
+        let mut stream = Stream::new(Frames);
+        let fragmented = decode_chunks(&mut stream, chunks(data, &[1, 7, 64]), |s| {
+            assert!(s.allocated() <= 2 * (protocol::MAX_MESSAGE + 6));
+            assert_eq!(s.held(), 0);
+        });
+        assert_eq!(fragmented, decode_all(|| Frames, data));
     }
 });

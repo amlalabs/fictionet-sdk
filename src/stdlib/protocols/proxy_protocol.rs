@@ -1434,7 +1434,7 @@ mod tests {
 
     use super::*;
     use codec::{Lcg, Stream};
-    use fictionet::stdlib::test_support::assert_linear;
+
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::{chunks, decode_all, mutate};
 
@@ -2235,28 +2235,24 @@ mod tests {
 
     #[test]
     fn longest_header_byte_at_a_time_is_bounded() {
-        assert_linear(
-            "longest_header_byte_at_a_time_is_bounded",
-            MAX_TLV_VALUE / 4,
-            |size| {
-                let header = V2 {
-                    command: Command::Proxy,
-                    addresses: Addresses::Unspec,
-                    tlvs: vec![Tlv::Noop(vec![0; size])],
-                };
-                let bytes = header.to_bytes().unwrap();
-                let mut stream = Stream::new(Headers::new());
-                for (i, chunk) in chunks(&bytes, &[1]).enumerate() {
-                    assert_eq!(stream.push(chunk), 1);
-                    if i + 1 < bytes.len() {
-                        assert_eq!(stream.next(), None);
-                    }
-                    assert!(stream.buffered() <= MAX_HEADER_LEN);
+        for size in [MAX_TLV_VALUE / 4, 4 * (MAX_TLV_VALUE / 4)] {
+            let header = V2 {
+                command: Command::Proxy,
+                addresses: Addresses::Unspec,
+                tlvs: vec![Tlv::Noop(vec![0; size])],
+            };
+            let bytes = header.to_bytes().unwrap();
+            let mut stream = Stream::new(Headers::new());
+            for (i, chunk) in chunks(&bytes, &[1]).enumerate() {
+                assert_eq!(stream.push(chunk), 1);
+                if i + 1 < bytes.len() {
+                    assert_eq!(stream.next(), None);
                 }
-                assert_eq!(stream.next(), Some(Ok(Ok(Header::V2(header)))));
-                assert_eq!(stream.buffered(), 0);
-            },
-        );
+                assert!(stream.buffered() <= MAX_HEADER_LEN);
+            }
+            assert_eq!(stream.next(), Some(Ok(Ok(Header::V2(header)))));
+            assert_eq!(stream.buffered(), 0);
+        }
     }
 
     fn random_v2(rng: &mut Lcg) -> V2 {

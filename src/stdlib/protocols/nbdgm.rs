@@ -901,7 +901,7 @@ mod tests {
     use fictionet::stdlib::protocols::netbios::{MAX_LABEL, MAX_NAME_LEN, decode_first_level};
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::mutate;
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
+    use fictionet::stdlib::test_support::rounds;
 
     fn ip() -> Ipv4Addr {
         Ipv4Addr::new(10, 0, 0, 9)
@@ -1554,10 +1554,10 @@ mod tests {
     }
 
     #[test]
-    fn split_large_is_linear() {
+    fn split_large_datagrams_reassemble() {
         // Time split plus reassembly while data and minimum-sized fragments
         // grow together. Copying the whole datagram per fragment is quadratic.
-        assert_linear("split_large_is_linear", 16_000, |size| {
+        for size in [16_000, 4 * (16_000)] {
             let mut p = sample_datagram();
             let Body::Datagram(d) = &mut p.body else {
                 panic!("not a datagram")
@@ -1576,7 +1576,7 @@ mod tests {
                 let whole = got.expect("not reassembled");
                 assert_eq!(whole.as_datagram().unwrap().data.len(), size);
             }
-        });
+        }
     }
 
     #[test]

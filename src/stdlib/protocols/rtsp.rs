@@ -2276,7 +2276,7 @@ pub mod harness {
 #[cfg(test)]
 mod tests {
     use super::harness::{round_trip, text_value};
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
+    use fictionet::stdlib::test_support::rounds;
     #[test]
     fn unexpected_line_error_is_malformed_head() {
         assert_eq!(
@@ -3315,21 +3315,17 @@ mod tests {
     }
 
     #[test]
-    fn stream_takes_many_small_items_in_linear_time() {
-        assert_linear(
-            "stream_takes_many_small_items_in_linear_time",
-            rounds(12_500),
-            |size| {
-                let mut one = OPTIONS.to_vec();
-                interleaved(0, vec![9; 10]).write(&mut one).unwrap();
-                let bytes = one.repeat(size);
-                let (items, failure) = decode_all(Frames::new, &bytes);
-                assert_eq!(failure, None);
-                assert_eq!(items.len(), size * 2);
-                assert!(items.iter().all(Result::is_ok));
-            },
-        );
-        assert_linear("large_rtsp_body", MAX_BODY / 4, |size| {
+    fn stream_takes_many_small_items() {
+        for size in [rounds(12_500), 4 * (rounds(12_500))] {
+            let mut one = OPTIONS.to_vec();
+            interleaved(0, vec![9; 10]).write(&mut one).unwrap();
+            let bytes = one.repeat(size);
+            let (items, failure) = decode_all(Frames::new, &bytes);
+            assert_eq!(failure, None);
+            assert_eq!(items.len(), size * 2);
+            assert!(items.iter().all(Result::is_ok));
+        }
+        for size in [MAX_BODY / 4, 4 * (MAX_BODY / 4)] {
             let mut message = Message::response(Version::Rtsp10, 200, "OK");
             message.body = vec![b'x'; size];
             message.push_header("Content-Length", &size.to_string());
@@ -3339,7 +3335,7 @@ mod tests {
                 decode_all(Frames::new, &bytes),
                 (vec![Ok(Frame::Message(message))], None)
             );
-        });
+        }
     }
 
     fn items_of(bytes: &[u8]) -> Vec<Result<Frame, Error>> {

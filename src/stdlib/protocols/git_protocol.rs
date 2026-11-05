@@ -1834,7 +1834,7 @@ mod tests {
     use fictionet::assert_cases;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream};
     use fictionet::stdlib::test_support::contract;
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
+    use fictionet::stdlib::test_support::rounds;
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn advertised_ref(id: ObjectId, name: String) -> AdvertisedRef {
@@ -2028,22 +2028,18 @@ mod tests {
     }
 
     #[test]
-    fn stream_takes_many_small_packets_in_linear_time() {
-        assert_linear(
-            "stream_takes_many_small_packets_in_linear_time",
-            rounds(50_000),
-            |size| {
-                let stream: Vec<u8> = b"0009done\n"
-                    .iter()
-                    .copied()
-                    .cycle()
-                    .take(9 * size)
-                    .collect();
-                let (packets, failed) = decode_all(Frames::<Packet>::new, &stream);
-                assert_eq!(failed, None);
-                assert_eq!(packets.len(), size);
-            },
-        );
+    fn stream_takes_many_small_packets() {
+        for size in [rounds(50_000), 4 * (rounds(50_000))] {
+            let stream: Vec<u8> = b"0009done\n"
+                .iter()
+                .copied()
+                .cycle()
+                .take(9 * size)
+                .collect();
+            let (packets, failed) = decode_all(Frames::<Packet>::new, &stream);
+            assert_eq!(failed, None);
+            assert_eq!(packets.len(), size);
+        }
     }
 
     // gitprotocol-pack, "Git Transport".

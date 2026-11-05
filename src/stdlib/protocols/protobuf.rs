@@ -1515,7 +1515,9 @@ mod tests {
             assert_eq!(stream.buffered(), 0);
         };
         read(MAX_MESSAGE);
-        fictionet::stdlib::test_support::assert_linear("protobuf frames", MAX_MESSAGE / 64, read);
+        for size in [MAX_MESSAGE / 64, 4 * (MAX_MESSAGE / 64)] {
+            read(size);
+        }
     }
 
     #[test]

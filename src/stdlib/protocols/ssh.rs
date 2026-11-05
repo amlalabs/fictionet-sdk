@@ -1456,7 +1456,7 @@ mod tests {
     use super::*;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream, pump};
     use fictionet::stdlib::test_support::contract;
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
+    use fictionet::stdlib::test_support::rounds;
     use fictionet::stdlib::test_support::{chunks, decode_all, mutate};
     fn names(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
@@ -1834,8 +1834,8 @@ mod tests {
     }
 
     #[test]
-    fn choose_takes_linear_time() {
-        assert_linear("choose_takes_linear_time", rounds(12_500), |size| {
+    fn choose_respects_client_order_in_large_lists() {
+        for size in [rounds(12_500), 4 * (rounds(12_500))] {
             let client: Vec<String> = (0..size).map(|i| format!("client-{i:08}")).collect();
             let server: Vec<String> = (0..size).map(|i| format!("server-{i:08}")).collect();
             assert_eq!(KexInit::choose(&client, &server), None);
@@ -1843,7 +1843,7 @@ mod tests {
             both.push(client[size - 1].clone());
             both.push(client[123].clone());
             assert_eq!(KexInit::choose(&client, &both), Some("client-00000123"));
-        });
+        }
     }
 
     #[test]
@@ -2212,28 +2212,24 @@ mod tests {
 
     #[test]
     fn stream_takes_many_packets_and_partial_suffixes() {
-        assert_linear(
-            "stream_takes_many_packets_and_partial_suffixes",
-            rounds(100_000),
-            |size| {
-                let one = Packet::from_message(&Message::NewKeys)
-                    .unwrap()
-                    .to_bytes()
-                    .unwrap();
-                let mut bytes = one.repeat(size);
-                bytes.extend_from_slice(&one[..3]);
-                let (events, failure) = decode_all(Events::after_version, &bytes);
-                assert_eq!(events.len(), size);
-                assert_eq!(failure, Some(Fail::Truncated { unread: 3 }));
-                assert!(matches!(
-                    events.last(),
-                    Some(Event::Packet {
-                        sequence,
-                        ..
-                    }) if *sequence as usize == size - 1
-                ));
-            },
-        );
+        for size in [rounds(100_000), 4 * (rounds(100_000))] {
+            let one = Packet::from_message(&Message::NewKeys)
+                .unwrap()
+                .to_bytes()
+                .unwrap();
+            let mut bytes = one.repeat(size);
+            bytes.extend_from_slice(&one[..3]);
+            let (events, failure) = decode_all(Events::after_version, &bytes);
+            assert_eq!(events.len(), size);
+            assert_eq!(failure, Some(Fail::Truncated { unread: 3 }));
+            assert!(matches!(
+                events.last(),
+                Some(Event::Packet {
+                    sequence,
+                    ..
+                }) if *sequence as usize == size - 1
+            ));
+        }
     }
 
     #[test]

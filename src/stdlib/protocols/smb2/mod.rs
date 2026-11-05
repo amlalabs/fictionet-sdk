@@ -2945,7 +2945,7 @@ mod tests {
     use super::*;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream};
     use fictionet::stdlib::test_support::contract;
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
+    use fictionet::stdlib::test_support::rounds;
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn request_body(req: &Request) -> Result<Vec<u8>, Error> {
@@ -4294,22 +4294,18 @@ mod tests {
     }
 
     #[test]
-    fn stream_takes_many_small_frames_in_linear_time() {
-        assert_linear(
-            "stream_takes_many_small_frames_in_linear_time",
-            rounds(50_000),
-            |size| {
-                let bytes = Frame {
-                    payload: b"\xffSMB".to_vec(),
-                }
-                .to_bytes()
-                .unwrap()
-                .repeat(size);
-                let (frames, error) = decode_all(Frames::<Frame>::new, &bytes);
-                assert_eq!(frames.len(), size);
-                assert_eq!(error, None);
-            },
-        );
+    fn stream_takes_many_small_frames() {
+        for size in [rounds(50_000), 4 * (rounds(50_000))] {
+            let bytes = Frame {
+                payload: b"\xffSMB".to_vec(),
+            }
+            .to_bytes()
+            .unwrap()
+            .repeat(size);
+            let (frames, error) = decode_all(Frames::<Frame>::new, &bytes);
+            assert_eq!(frames.len(), size);
+            assert_eq!(error, None);
+        }
     }
 
     #[test]

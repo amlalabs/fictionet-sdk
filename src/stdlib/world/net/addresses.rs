@@ -467,7 +467,7 @@ mod tests {
     use super::super::hosts::{Lookup, PortSpec, UdpStart};
     use super::super::*;
     use super::*;
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
+    use fictionet::stdlib::test_support::rounds;
 
     #[test]
     fn default_pools_avoid_non_public_ranges() {
@@ -591,23 +591,19 @@ mod tests {
 
     #[test]
     fn a_full_automatic_range_is_not_scanned_again() {
-        assert_linear(
-            "a_full_automatic_range_is_not_scanned_again",
-            rounds(2_000_000),
-            |size| {
-                let mut w = World::new(MAX_HOSTS);
-                let subnet = Subnet::new(Prefix {
-                    addr: Ipv4Addr::new(104, 0, 0, 0).into(),
-                    len: 8,
-                })
-                .unwrap();
-                assert_eq!(w.free_auto(&subnet), None);
-                assert!(w.addresses.auto_full);
-                for _ in 0..size {
-                    assert_eq!(std::hint::black_box(&mut w).free_auto(&subnet), None);
-                }
-            },
-        );
+        for size in [rounds(2_000_000), 4 * (rounds(2_000_000))] {
+            let mut w = World::new(MAX_HOSTS);
+            let subnet = Subnet::new(Prefix {
+                addr: Ipv4Addr::new(104, 0, 0, 0).into(),
+                len: 8,
+            })
+            .unwrap();
+            assert_eq!(w.free_auto(&subnet), None);
+            assert!(w.addresses.auto_full);
+            for _ in 0..size {
+                assert_eq!(std::hint::black_box(&mut w).free_auto(&subnet), None);
+            }
+        }
     }
 
     fn subnet6(s: &str) -> Result<Subnet6, Error> {

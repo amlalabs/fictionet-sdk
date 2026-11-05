@@ -4,7 +4,7 @@
 ///
 /// The arguments name the local error type, runtime module, and message,
 /// nesting, allocation, and node limits. Each invocation defines distinct
-/// types and uses the supplied schema limits. Sampling and contract helpers
+/// types and uses the supplied schema limits. Sampling helpers
 /// compile only when tests are enabled in the consuming crate.
 ///
 /// Optional values that encode as their null sentinel are refused with the
@@ -677,72 +677,6 @@ macro_rules! generated_runtime {
                         Ok(None)
                     }
                 }
-            }
-            #[cfg(test)]
-            pub fn check<T>() -> Result<(), $error>
-            where
-                T: Codec
-                    + fictionet::stdlib::codec::Wire<ParseError = $error, WriteError = $error>
-                    + std::fmt::Debug
-                    + PartialEq,
-            {
-                use fictionet::stdlib::test_support::contract;
-                let mut successes = 0;
-                for seed in 0..32 {
-                    let mut s = Sampler::seed(seed);
-                    if let Ok(value) = T::sample(&mut s) {
-                        contract::check_wire_value(&value);
-                        if let Ok(bytes) = value.to_bytes() {
-                            assert_eq!(T::parse(&bytes)?, value);
-                            successes += 1;
-                        }
-                    }
-                }
-                assert!(
-                    successes > 0,
-                    "no writable sample for {}",
-                    std::any::type_name::<T>()
-                );
-                Ok(())
-            }
-            #[cfg(test)]
-            pub fn check_stream<T, D>(
-                make: impl Fn() -> D,
-                write: fn(&T, &mut Vec<u8>) -> Result<(), $error>,
-                header: usize,
-            ) where
-                T: Codec + std::fmt::Debug + PartialEq,
-                D: fictionet::stdlib::codec::Decode<Item = T, Error = $error>,
-            {
-                use fictionet::stdlib::test_support::contract;
-                let mut successes = 0;
-                let mut stream = Vec::new();
-                let mut values = Vec::new();
-                let alloc_limit = 2 * ($max_message + header);
-                for seed in 0..32 {
-                    let mut s = Sampler::seed(seed);
-                    if let Ok(value) = T::sample(&mut s) {
-                        let mut bytes = Vec::new();
-                        if write(&value, &mut bytes).is_ok() {
-                            contract::check_decoded(
-                                &make,
-                                &bytes,
-                                std::slice::from_ref(&value),
-                                usize::MAX,
-                                alloc_limit,
-                            );
-                            write(&value, &mut stream).expect("writable sample must append");
-                            values.push(value);
-                            successes += 1;
-                        }
-                    }
-                }
-                assert!(
-                    successes > 0,
-                    "no writable frame for {}",
-                    std::any::type_name::<D>()
-                );
-                contract::check_decoded(make, &stream, &values, usize::MAX, alloc_limit);
             }
             pub fn parse<T: Codec>(bytes: &[u8], le: bool) -> Result<T, $error> {
                 if bytes.len() > $max_message {

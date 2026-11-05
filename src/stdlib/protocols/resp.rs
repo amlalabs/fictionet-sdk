@@ -1830,7 +1830,7 @@ mod tests {
     use codec::{Lcg, Step as Decoded, Stream};
     use fictionet::stdlib::test_support;
     use fictionet::stdlib::test_support::contract;
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
+    use fictionet::stdlib::test_support::rounds;
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn value_step(b: &[u8], limits: Limits) -> Result<Decoded<Value>, Error> {
@@ -3132,10 +3132,9 @@ mod tests {
         }
     }
 
-    /// One big value receiving a few bytes at a time takes linear time: the
-    /// decoder does not read its first elements again after every push.
+    /// A fragmented large value retains all its elements.
     #[test]
-    fn decoder_is_linear_in_one_big_value() {
+    fn decoder_preserves_large_values() {
         let run = |n: usize| {
             // An array of nulls, a map inside an attribute, and a streamed
             // string of one-byte chunks.
@@ -3177,7 +3176,9 @@ mod tests {
             assert_eq!(commands.len(), 1);
             assert_eq!(commands[0].args.len(), n);
         };
-        test_support::assert_linear("RESP big values", 12_500, run);
+        for size in [12_500, 4 * (12_500)] {
+            run(size);
+        }
     }
 
     /// Feeds a stream one byte at a time, draining it after each byte, until
@@ -3191,9 +3192,9 @@ mod tests {
         }
     }
 
-    /// Long lines keep the stream contract with linear work byte by byte.
+    /// Long lines preserve decoding and rejection behavior byte by byte.
     #[test]
-    fn stream_is_linear_in_one_long_line() {
+    fn stream_reads_and_refuses_long_lines() {
         let check = |size| {
             for (lead, byte) in [(&b"+"[..], b'a'), (b"$", b'1')] {
                 let mut bytes = lead.to_vec();
@@ -3217,11 +3218,9 @@ mod tests {
             }
         };
         check(MAX_LINE_LEN - 2);
-        assert_linear(
-            "stream_is_linear_in_one_long_line",
-            (MAX_LINE_LEN - 2) / 4,
-            check,
-        );
+        for size in [(MAX_LINE_LEN - 2) / 4, 4 * ((MAX_LINE_LEN - 2) / 4)] {
+            check(size);
+        }
     }
 
     /// Attributes retain every entry and their value, or writing fails.

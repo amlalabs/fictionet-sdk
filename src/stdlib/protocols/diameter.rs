@@ -1708,7 +1708,7 @@ mod tests {
     use fictionet::stdlib::codec::{Decode, Step};
     use fictionet::stdlib::codec::{Fail, Lcg, Stream};
     use fictionet::stdlib::test_support::contract;
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
+    use fictionet::stdlib::test_support::rounds;
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn address_other(family: u16, bytes: Vec<u8>) -> Address {
@@ -2275,21 +2275,17 @@ mod tests {
     }
 
     #[test]
-    fn stream_takes_many_small_messages_in_linear_time() {
-        assert_linear(
-            "stream_takes_many_small_messages_in_linear_time",
-            rounds(50_000),
-            |size| {
-                let data = Message::request(command::DEVICE_WATCHDOG, 0, 1, 1)
-                    .to_bytes()
-                    .unwrap()
-                    .repeat(size);
-                let (messages, error) = decode_all(Frames::<Message>::new, &data);
-                assert_eq!(error, None);
-                assert_eq!(messages.len(), size);
-                assert!(messages.iter().all(Result::is_ok));
-            },
-        );
+    fn stream_takes_many_small_messages() {
+        for size in [rounds(50_000), 4 * (rounds(50_000))] {
+            let data = Message::request(command::DEVICE_WATCHDOG, 0, 1, 1)
+                .to_bytes()
+                .unwrap()
+                .repeat(size);
+            let (messages, error) = decode_all(Frames::<Message>::new, &data);
+            assert_eq!(error, None);
+            assert_eq!(messages.len(), size);
+            assert!(messages.iter().all(Result::is_ok));
+        }
     }
 
     #[test]

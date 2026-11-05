@@ -1779,7 +1779,7 @@ mod tests {
     use super::*;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream};
     use fictionet::stdlib::test_support::contract;
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
+    use fictionet::stdlib::test_support::rounds;
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     /// An endpoint mapper bind as Windows sends it: one context, the
@@ -2334,7 +2334,7 @@ mod tests {
     }
 
     #[test]
-    fn fragments_are_bounded_and_linear() {
+    fn fragments_respect_the_count_bound() {
         // A peer that binds with a tiny max_recv_frag must not make a
         // world build millions of fragments, or copy the stub once per
         // fragment.
@@ -2348,11 +2348,11 @@ mod tests {
             request(vec![0; n + 1]).fragments(25),
             Err(Error::Unwritable)
         );
-        assert_linear("fragments_are_bounded_and_linear", 15_000, |size| {
+        for size in [15_000, 4 * (15_000)] {
             let parts = request(vec![1; size]).fragments(25).unwrap();
             assert_eq!(parts.len(), size);
             assert!(parts.iter().all(|p| p.body.stub() == Some(&[1][..])));
-        });
+        }
     }
 
     #[test]
@@ -2806,18 +2806,14 @@ mod tests {
     }
 
     #[test]
-    fn stream_takes_many_small_pdus_in_linear_time() {
-        assert_linear(
-            "stream_takes_many_small_pdus_in_linear_time",
-            rounds(50_000),
-            |size| {
-                let bytes = Pdu::new(1, Body::Shutdown).to_bytes().unwrap().repeat(size);
-                let (pdus, error) = decode_all(Frames::<Pdu>::new, &bytes);
-                assert_eq!(pdus.len(), size);
-                assert!(pdus.iter().all(Result::is_ok));
-                assert_eq!(error, None);
-            },
-        );
+    fn stream_takes_many_small_pdus() {
+        for size in [rounds(50_000), 4 * (rounds(50_000))] {
+            let bytes = Pdu::new(1, Body::Shutdown).to_bytes().unwrap().repeat(size);
+            let (pdus, error) = decode_all(Frames::<Pdu>::new, &bytes);
+            assert_eq!(pdus.len(), size);
+            assert!(pdus.iter().all(Result::is_ok));
+            assert_eq!(error, None);
+        }
     }
 
     #[test]

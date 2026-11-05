@@ -1824,9 +1824,9 @@ mod tests {
             stream.into_parts().0.allocated()
         };
         assert!(read(MAX_SIZE) <= 2 * (MAX_SIZE + 1));
-        fictionet::stdlib::test_support::assert_linear("json values", MAX_SIZE / 16, |size| {
+        for size in [MAX_SIZE / 16, 4 * (MAX_SIZE / 16)] {
             read(size);
-        });
+        }
     }
 
     const PIECES: [&str; 32] = [

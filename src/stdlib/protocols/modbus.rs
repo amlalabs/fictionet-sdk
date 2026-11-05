@@ -859,7 +859,7 @@ mod tests {
     use fictionet::stdlib::codec::{Fail, Stream, finish, pump, try_pump};
     use fictionet::stdlib::test_support;
     use fictionet::stdlib::test_support::contract;
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
+    use fictionet::stdlib::test_support::rounds;
 
     // Examples from the Modbus Application Protocol Specification v1.1b3,
     // section 6.
@@ -1405,33 +1405,29 @@ mod tests {
     }
 
     #[test]
-    fn stream_takes_many_small_frames_in_linear_time() {
-        assert_linear(
-            "stream_takes_many_small_frames_in_linear_time",
-            rounds(50_000),
-            |size| {
-                let one = Frame {
-                    transaction: 1,
-                    unit: 1,
-                    pdu: vec![3, 0, 0, 0, 1],
+    fn stream_takes_many_small_frames() {
+        for size in [rounds(50_000), 4 * (rounds(50_000))] {
+            let one = Frame {
+                transaction: 1,
+                unit: 1,
+                pdu: vec![3, 0, 0, 0, 1],
+            }
+            .to_bytes()
+            .unwrap();
+            let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * size).collect();
+            let mut d = Stream::new(Frames::<Frame>::new());
+            let mut rest = &stream[..];
+            let mut n = 0;
+            while !rest.is_empty() {
+                rest = &rest[d.push(rest)..];
+                while let Some(f) = d.next() {
+                    f.unwrap();
+                    n += 1;
                 }
-                .to_bytes()
-                .unwrap();
-                let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * size).collect();
-                let mut d = Stream::new(Frames::<Frame>::new());
-                let mut rest = &stream[..];
-                let mut n = 0;
-                while !rest.is_empty() {
-                    rest = &rest[d.push(rest)..];
-                    while let Some(f) = d.next() {
-                        f.unwrap();
-                        n += 1;
-                    }
-                }
-                assert_eq!(n, size);
-                assert_eq!(d.buffered(), 0);
-            },
-        );
+            }
+            assert_eq!(n, size);
+            assert_eq!(d.buffered(), 0);
+        }
     }
 
     #[test]

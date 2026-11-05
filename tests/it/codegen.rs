@@ -4,9 +4,9 @@
 use fictionet_codegen_golden::{budgets, groups, primitives, recursive, xdr};
 
 use fictionet::stdlib::{
-    codec::{Decode, Lcg, Step, Wire},
+    codec::{Decode, Lcg, Step, Stream, Wire},
     protocols::onc_rpc::{self, Reader, Writer},
-    test_support::contract,
+    test_support::{assert_write, chunks, decode_all, decode_chunks},
 };
 
 fn dynamic_read(bytes: &[u8]) -> Result<xdr::Record, onc_rpc::Error> {
@@ -114,7 +114,7 @@ fn recursive_depth_and_transactional_errors() {
             next: None,
         };
     }
-    contract::check_wire_value(&value);
+    let _ = assert_write(&value);
     let mut framed = Vec::new();
     Nodes::write(&value, &mut framed).unwrap();
     let mut decoder = Nodes;
@@ -152,7 +152,11 @@ fn recursive_depth_and_transactional_errors() {
     }
     bytes.extend_from_slice(&[0, 0, 0, 1, 0, 0]);
     assert_eq!(Node::parse(&bytes), Err(Error::Depth));
-    contract::check_decode_with_alloc_limit(|| Nodes, &bytes, 2 * (recursive::MAX_MESSAGE + 6));
+    let fragmented = decode_chunks(&mut Stream::new(Nodes), chunks(&bytes, &[1, 7, 64]), |s| {
+        assert!(s.allocated() <= 2 * (recursive::MAX_MESSAGE + 6));
+        assert_eq!(s.held(), 0);
+    });
+    assert_eq!(fragmented, decode_all(|| Nodes, &bytes));
 }
 #[test]
 fn strict_data_null_float_and_set_writes() {
@@ -197,7 +201,7 @@ fn strict_data_null_float_and_set_writes() {
         Err(primitives::Error::Trailing)
     );
     value.null_u8 = Some(255);
-    contract::check_wire_value(&value);
+    let _ = assert_write(&value);
     let mut out = vec![1, 2];
     assert_eq!(value.write(&mut out), Err(primitives::Error::Value));
     assert_eq!(out, [1, 2]);
@@ -214,18 +218,28 @@ fn strict_data_null_float_and_set_writes() {
     assert_eq!(groups::Status::parse(&[0, 0]), Err(groups::Error::Value));
 }
 #[test]
-fn arbitrary_input_contracts() {
+fn arbitrary_input_round_trips() {
     let mut rng = Lcg::new(13);
     for _ in 0..128 {
         let bytes = rng.bytes(128);
-        contract::check_wire::<primitives::PrimitiveMessage>(&bytes);
-        contract::check_wire::<groups::Batch>(&bytes);
-        contract::check_wire::<recursive::Node>(&bytes);
-        contract::check_decode_with_alloc_limit(
-            || recursive::Nodes,
-            &bytes,
-            2 * (recursive::MAX_MESSAGE + 6),
+        if let Ok(value) = <primitives::PrimitiveMessage as Wire>::parse(&bytes) {
+            let _ = assert_write(&value);
+        }
+        if let Ok(value) = <groups::Batch as Wire>::parse(&bytes) {
+            let _ = assert_write(&value);
+        }
+        if let Ok(value) = <recursive::Node as Wire>::parse(&bytes) {
+            let _ = assert_write(&value);
+        }
+        let fragmented = decode_chunks(
+            &mut Stream::new(recursive::Nodes),
+            chunks(&bytes, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 2 * (recursive::MAX_MESSAGE + 6));
+                assert_eq!(s.held(), 0);
+            },
         );
+        assert_eq!(fragmented, decode_all(|| recursive::Nodes, &bytes));
     }
 }
 

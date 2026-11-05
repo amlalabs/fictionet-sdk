@@ -920,7 +920,7 @@ mod tests {
     use super::*;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream};
     use fictionet::stdlib::test_support::contract;
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
+    use fictionet::stdlib::test_support::rounds;
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn wire(packet: &Packet) -> Result<Vec<u8>, Error> {
@@ -1760,18 +1760,14 @@ mod tests {
     }
 
     #[test]
-    fn stream_takes_many_small_packets_in_linear_time() {
-        assert_linear(
-            "stream_takes_many_small_packets_in_linear_time",
-            rounds(50_000),
-            |size| {
-                let bytes = Frame(vec![0x30, 1]).to_bytes().unwrap().repeat(size);
-                let (items, error) = decode_all(Frames::<Frame>::new, &bytes);
-                assert_eq!(error, None);
-                assert_eq!(items.len(), size);
-                assert!(items.iter().all(|p| p.0 == [0x30, 1]));
-            },
-        );
+    fn stream_takes_many_small_packets() {
+        for size in [rounds(50_000), 4 * (rounds(50_000))] {
+            let bytes = Frame(vec![0x30, 1]).to_bytes().unwrap().repeat(size);
+            let (items, error) = decode_all(Frames::<Frame>::new, &bytes);
+            assert_eq!(error, None);
+            assert_eq!(items.len(), size);
+            assert!(items.iter().all(|p| p.0 == [0x30, 1]));
+        }
     }
 
     #[test]

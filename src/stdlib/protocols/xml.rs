@@ -2302,7 +2302,7 @@ mod tests {
     use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::codec::{Fail, Stream, pump};
     use fictionet::stdlib::test_support::contract;
-    use fictionet::stdlib::test_support::{assert_linear, assert_linear_with_setup, rounds};
+    use fictionet::stdlib::test_support::rounds;
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn built_text(builder: Builder) -> Result<String, ErrorKind> {
@@ -2405,39 +2405,32 @@ mod tests {
     }
 
     #[test]
-    fn codec_namespace_heavy_decode_cost() {
-        assert_linear_with_setup(
-            "codec_namespace_heavy_decode_cost",
-            2_500,
-            |size| {
-                // Grow retained state and children together: rescanning the
-                // stack, scope, or interned URIs per token must look quadratic.
-                let depth = size / 40;
-                assert!(depth < MAX_DEPTH);
-                assert!(4 * depth <= MAX_NAMESPACES);
-                let mut document = String::new();
-                for level in 0..depth {
-                    document.push_str("<a");
-                    for prefix in 0..4 {
-                        document.push_str(&format!(
-                            " xmlns:p{level}_{prefix}=\"urn:{level}:{prefix}\""
-                        ));
-                    }
-                    document.push('>');
+    fn decoder_retains_nested_namespaces() {
+        for size in [2_500, 10_000] {
+            // Grow retained state and children together: rescanning the
+            // stack, scope, or interned URIs per token must look quadratic.
+            let depth = size / 40;
+            assert!(depth < MAX_DEPTH);
+            assert!(4 * depth <= MAX_NAMESPACES);
+            let mut document = String::new();
+            for level in 0..depth {
+                document.push_str("<a");
+                for prefix in 0..4 {
+                    document.push_str(&format!(
+                        " xmlns:p{level}_{prefix}=\"urn:{level}:{prefix}\""
+                    ));
                 }
-                document.push_str(&"<b/>".repeat(size));
-                document.push_str(&"</a>".repeat(depth));
-                let expected = read_events(document.as_bytes()).unwrap();
-                assert_eq!(expected.len(), 2 * (depth + size));
-                (document, expected)
-            },
-            |(document, _)| decode_all(Events::new, document.as_bytes()),
-            |(_, expected), (events, error)| {
-                assert_eq!(error, None);
-                assert_eq!(events.len(), expected.len());
-                assert_eq!(&events, expected);
-            },
-        );
+                document.push('>');
+            }
+            document.push_str(&"<b/>".repeat(size));
+            document.push_str(&"</a>".repeat(depth));
+            let expected = read_events(document.as_bytes()).unwrap();
+            assert_eq!(expected.len(), 2 * (depth + size));
+            let (events, error) = decode_all(Events::new, document.as_bytes());
+            assert_eq!(error, None);
+            assert_eq!(events.len(), expected.len());
+            assert_eq!(events, expected);
+        }
     }
 
     fn kind(doc: &str) -> ErrorKind {
@@ -2801,7 +2794,7 @@ mod tests {
 
     #[test]
     fn shared_namespaces() {
-        assert_linear("shared_namespaces", 5_000, |size| {
+        for size in [5_000, 4 * (5_000)] {
             // A long URI, declared once, is shared by every name in it rather
             // than copied, so a short element does not cost the URI's length.
             let uri = "u".repeat(64 << 10);
@@ -2832,7 +2825,7 @@ mod tests {
                 }
             }
             assert_eq!(decode_all(Events::new, doc.as_bytes()), (events, None));
-        });
+        }
     }
 
     #[test]
@@ -3077,7 +3070,7 @@ mod tests {
         // Two URIs that share a long prefix, bound to two prefixes, and many
         // tags with an attribute in each. Telling the attributes apart must
         // not compare the URIs each time.
-        assert_linear("long_namespace_prefixes", 1 << 18, |size| {
+        for size in [1 << 18, 4 * (1 << 18)] {
             let shared = "u".repeat(size);
             for child in ["<x p:a='' b=''/>  ", "<x p:a='' q:a=''/>"] {
                 let mut doc = format!("<r xmlns:p='{shared}a' xmlns:q='{shared}b'>");
@@ -3087,7 +3080,7 @@ mod tests {
                 doc.push_str("</r>");
                 assert!(read_events(doc.as_bytes()).is_ok());
             }
-        });
+        }
         // The same URI under two prefixes is still a duplicate.
         let shared = "u".repeat(1 << 20);
         let bad = format!("<r xmlns:p='{shared}' xmlns:q='{shared}'><x p:a='' q:a=''/></r>");

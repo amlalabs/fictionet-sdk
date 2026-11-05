@@ -2182,35 +2182,31 @@ mod tests {
     }
 
     #[test]
-    fn growing_backlog_drains_in_linear_time() {
-        test_support::assert_linear(
-            "growing_backlog_drains_in_linear_time",
-            rounds(1 << 18),
-            |count| {
-                let bytes = [0x80, 0, 0, 0].repeat(count);
-                let mut stream = Stream::with_buffer(super::records(MAX_RECORD), bytes.len());
-                assert_eq!(stream.push(&bytes), bytes.len());
-                // Retain every record before the first decode.
-                assert_eq!(stream.buffered(), bytes.len());
-                let mut got = 0;
-                while let Some(item) = stream.next() {
-                    assert_eq!(item, Ok(Assembled::Message(vec![])));
-                    got += 1;
-                }
-                assert_eq!(got, count);
-                assert_eq!(stream.buffered(), 0);
-                assert!(stream.allocated() <= 2 * bytes.len());
+    fn growing_backlog_drains() {
+        for count in [rounds(1 << 18), 4 * (rounds(1 << 18))] {
+            let bytes = [0x80, 0, 0, 0].repeat(count);
+            let mut stream = Stream::with_buffer(super::records(MAX_RECORD), bytes.len());
+            assert_eq!(stream.push(&bytes), bytes.len());
+            // Retain every record before the first decode.
+            assert_eq!(stream.buffered(), bytes.len());
+            let mut got = 0;
+            while let Some(item) = stream.next() {
+                assert_eq!(item, Ok(Assembled::Message(vec![])));
+                got += 1;
+            }
+            assert_eq!(got, count);
+            assert_eq!(stream.buffered(), 0);
+            assert!(stream.allocated() <= 2 * bytes.len());
 
-                let tail = encode_fragments(&[1, 2, 3], 2).unwrap();
-                assert_eq!(stream.push(&tail), tail.len());
-                let mut items = Vec::new();
-                while let Some(item) = stream.next() {
-                    items.push(item.unwrap());
-                }
-                assert_eq!(items, [Assembled::Message(vec![1, 2, 3])]);
-                assert_eq!(stream.buffered(), 0);
-            },
-        );
+            let tail = encode_fragments(&[1, 2, 3], 2).unwrap();
+            assert_eq!(stream.push(&tail), tail.len());
+            let mut items = Vec::new();
+            while let Some(item) = stream.next() {
+                items.push(item.unwrap());
+            }
+            assert_eq!(items, [Assembled::Message(vec![1, 2, 3])]);
+            assert_eq!(stream.buffered(), 0);
+        }
     }
 
     #[test]

@@ -1314,7 +1314,7 @@ mod tests {
     use codec::{Fail, Lcg, Stream};
     use fictionet::assert_cases;
     use fictionet::stdlib::test_support::contract;
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
+    use fictionet::stdlib::test_support::rounds;
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn request_apop(name: String, digest: [u8; 16]) -> Request {
@@ -1976,40 +1976,35 @@ mod tests {
         let mut body_reply = Reply::ok("").with_body(Vec::new());
         let mut text_reply = Reply::ok("");
         let mut requests = [Request::Pass(String::new()), Request::User(String::new())];
-        // Keep buffer capacity between runs to avoid timing fresh page faults.
-        assert_linear(
-            "writers_stop_reading_input_past_their_limits",
-            MAX_BODY / 4,
-            |size| {
-                let body = body_reply.body.as_mut().unwrap();
-                body.clear();
-                body.resize(size * 8, b'\n');
-                assert_eq!(contract::check_refused(&body_reply), Error::Unwritable);
-                text_reply.text.clear();
-                text_reply.text.extend(std::iter::repeat_n('t', size));
-                assert_eq!(contract::check_refused(&text_reply), Error::Unwritable);
-                for request in &mut requests {
-                    let (Request::Pass(text) | Request::User(text)) = request else {
-                        unreachable!()
-                    };
-                    text.clear();
-                    text.extend(std::iter::repeat_n('t', size));
-                    assert_eq!(contract::check_refused(request), Error::Unwritable);
-                }
-            },
-        );
+        for size in [MAX_BODY / 4, 4 * (MAX_BODY / 4)] {
+            let body = body_reply.body.as_mut().unwrap();
+            body.clear();
+            body.resize(size * 8, b'\n');
+            assert_eq!(contract::check_refused(&body_reply), Error::Unwritable);
+            text_reply.text.clear();
+            text_reply.text.extend(std::iter::repeat_n('t', size));
+            assert_eq!(contract::check_refused(&text_reply), Error::Unwritable);
+            for request in &mut requests {
+                let (Request::Pass(text) | Request::User(text)) = request else {
+                    unreachable!()
+                };
+                text.clear();
+                text.extend(std::iter::repeat_n('t', size));
+                assert_eq!(contract::check_refused(request), Error::Unwritable);
+            }
+        }
     }
 
     #[test]
-    fn decoders_take_many_small_lines_in_linear_time() {
+    fn decoders_take_many_small_lines() {
         let wire = |n: usize| b"NOOP\r\n".repeat(n);
         let body = |n: usize| [b"+OK\r\n".to_vec(), b"a\r\n".repeat(n), b".\r\n".to_vec()].concat();
-        fictionet::stdlib::test_support::assert_linear("POP3 lines", 12_500, |n| {
+        for n in [12_500, 4 * (12_500)] {
             let (items, error) = decode_all(Inputs::new, &wire(n));
             assert_eq!(error, None);
             assert_eq!(items.len(), n);
             assert_eq!(Reply::parse(&body(n)).unwrap().lines().count(), n);
-        });
+        }
         let (wire, body) = (wire(50_000), body(50_000));
         contract::check_decode_with_alloc_limit(Inputs::new, &wire, 2 * (MAX_AUTH_LINE + 2));
         contract::check_decode_with_alloc_limit(

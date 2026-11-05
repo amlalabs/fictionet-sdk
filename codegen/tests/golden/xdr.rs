@@ -327,17 +327,24 @@ impl fictionet::stdlib::codec::Wire for Record {
 #[cfg(test)]
 mod generated_tests {
     use super::*;
+    use fictionet::stdlib::test_support::assert_write;
 
     #[test]
-    fn generated_contracts() -> Result<(), Error> {
-        {
-            use super::Choice as Value;
-            __wire::check::<Value>()?;
+    fn generated_values_round_trip() {
+        macro_rules! values {
+            ($($ty:ty),+ $(,)?) => {
+                $({
+                    let mut written = 0;
+                    for seed in 0..32 {
+                        let mut sampler = __wire::Sampler::seed(seed);
+                        if let Ok(value) = <$ty as __wire::Codec>::sample(&mut sampler) {
+                            written += usize::from(assert_write(&value).is_ok());
+                        }
+                    }
+                    assert!(written > 0, "no writable sample for {}", std::any::type_name::<$ty>());
+                })+
+            };
         }
-        {
-            use super::Record as Value;
-            __wire::check::<Value>()?;
-        }
-        Ok(())
+        values!(super::Choice, super::Record,);
     }
 }

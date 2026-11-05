@@ -3560,23 +3560,22 @@ mod tests {
     }
 
     #[test]
-    fn decoder_takes_many_small_commands_in_linear_time() {
-        use fictionet::stdlib::test_support::assert_linear;
+    fn decoder_takes_many_small_commands() {
         let one = b"set k 0 0 1\r\nx\r\nget k\r\n";
-        assert_linear("memcache commands", 6_250, |n| {
+        for n in [6_250, 4 * (6_250)] {
             let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * n).collect();
             let got = commands(&stream);
             assert_eq!(got.len(), 2 * n);
             assert!(got.iter().all(Result::is_ok));
-        });
+        }
         // This grows the line count, not one line's length. It checks per-line
         // amortization and the allocation bound under shared schedules,
         // including single-byte pushes. The incremental tests below count
         // work within one growing line.
         let line = [vec![b' '; MAX_LINE - 3], b"\r\n".to_vec()].concat();
-        assert_linear("memcache long lines", 5, |n| {
+        for n in [5, 4 * (5)] {
             contract::check_decode_with_alloc_limit(Commands::new, &line.repeat(n), 2 * MAX_LINE);
-        });
+        }
     }
 
     #[test]

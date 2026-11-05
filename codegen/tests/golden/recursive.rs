@@ -357,21 +357,57 @@ impl fictionet::stdlib::codec::Decode for Nodes {
 #[cfg(test)]
 mod generated_tests {
     use super::*;
+    use fictionet::stdlib::test_support::assert_write;
 
     #[test]
-    fn generated_contracts() -> Result<(), Error> {
+    fn generated_values_round_trip() {
+        macro_rules! values {
+            ($($ty:ty),+ $(,)?) => {
+                $({
+                    let mut written = 0;
+                    for seed in 0..32 {
+                        let mut sampler = __wire::Sampler::seed(seed);
+                        if let Ok(value) = <$ty as __wire::Codec>::sample(&mut sampler) {
+                            written += usize::from(assert_write(&value).is_ok());
+                        }
+                    }
+                    assert!(written > 0, "no writable sample for {}", std::any::type_name::<$ty>());
+                })+
+            };
+        }
+        values!(super::Node, super::Shared,);
         {
             use super::Node as Value;
-            __wire::check::<Value>()?;
-        }
-        {
-            use super::Shared as Value;
-            __wire::check::<Value>()?;
-        }
-        {
             use super::Nodes as Frames;
-            __wire::check_stream(|| Frames, Frames::write, 6);
+            use fictionet::stdlib::codec::Stream;
+            use fictionet::stdlib::test_support::{chunks, decode_chunks};
+            let mut bytes = Vec::new();
+            let mut values = Vec::new();
+            for seed in 0..32 {
+                let mut sampler = __wire::Sampler::seed(seed);
+                if let Ok(value) = <Value as __wire::Codec>::sample(&mut sampler) {
+                    let before = bytes.clone();
+                    if Frames::write(&value, &mut bytes).is_ok() {
+                        assert!(bytes.starts_with(&before));
+                        values.push(value);
+                    } else {
+                        assert_eq!(bytes, before, "writer changed destination on error");
+                    }
+                }
+            }
+            assert!(
+                !values.is_empty(),
+                "no writable frame for {}",
+                std::any::type_name::<Frames>()
+            );
+            let mut stream = Stream::new(Frames);
+            let (items, failure) = decode_chunks(&mut stream, chunks(&bytes, &[1, 7, 64]), |s| {
+                assert!(s.allocated() <= 2 * (MAX_MESSAGE + 6));
+                assert_eq!(s.held(), 0);
+            });
+            assert_eq!(failure, None);
+            assert_eq!(items, values);
+            assert_eq!(stream.offset(), bytes.len() as u64);
         }
-        Ok(())
     }
 }

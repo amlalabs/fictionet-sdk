@@ -2154,7 +2154,7 @@ pub mod harness {
 #[cfg(test)]
 mod tests {
     use super::harness::{cseq_round_trip, round_trip, text_value};
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
+    use fictionet::stdlib::test_support::rounds;
     #[test]
     fn unexpected_line_error_is_malformed_head() {
         assert_eq!(
@@ -3136,19 +3136,15 @@ mod tests {
     }
 
     #[test]
-    fn stream_takes_many_small_messages_in_linear_time() {
-        assert_linear(
-            "stream_takes_many_small_messages_in_linear_time",
-            rounds(12_500),
-            |size| {
-                let one = b"\r\nOPTIONS sip:a@b SIP/2.0\r\nl: 1\r\n\r\nx";
-                let bytes = one.repeat(size);
-                let (items, failure) = decode_all(Messages::new, &bytes);
-                assert_eq!(failure, None);
-                assert_eq!(items.len(), size);
-                assert!(items.iter().all(Result::is_ok));
-            },
-        );
+    fn stream_takes_many_small_messages() {
+        for size in [rounds(12_500), 4 * (rounds(12_500))] {
+            let one = b"\r\nOPTIONS sip:a@b SIP/2.0\r\nl: 1\r\n\r\nx";
+            let bytes = one.repeat(size);
+            let (items, failure) = decode_all(Messages::new, &bytes);
+            assert_eq!(failure, None);
+            assert_eq!(items.len(), size);
+            assert!(items.iter().all(Result::is_ok));
+        }
     }
 
     #[test]

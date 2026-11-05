@@ -15,7 +15,6 @@ use fictionet::stdlib::network::ip::{
     Fields, checksum, destination, packet_with, source, transport_checksum,
 };
 use fictionet::stdlib::network::{ConnError, Connection, tcp, udp};
-use fictionet::stdlib::test_support::thread_cpu_time;
 use fictionet::{Cx, Interface, Packet, RecvError, pair};
 
 const A: &str = "10.0.0.1";
@@ -1226,12 +1225,46 @@ fn boxed_connections_and_write_all() {
     });
 }
 
-/// Endpoints with connections in many states use no CPU while nothing
-/// happens.
+/// Idle endpoints stop polling their interfaces until more work arrives.
 #[test]
 fn idle_endpoints_stay_idle() {
-    world::real_world(Duration::from_secs(20), |fcx| async move {
-        let (ea, eb) = two_tcp(&fcx, A, B);
+    world(Duration::from_secs(20), |fcx| async move {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Counted {
+            inner: fictionet::End,
+            polls: Arc<AtomicUsize>,
+        }
+        impl Interface for Counted {
+            fn poll_recv(
+                &mut self,
+                fcx: &Cx,
+                cx: &mut std::task::Context<'_>,
+            ) -> Poll<Result<Packet, RecvError>> {
+                self.polls.fetch_add(1, Ordering::Relaxed);
+                self.inner.poll_recv(fcx, cx)
+            }
+            fn send(&mut self, packet: Packet) {
+                self.inner.send(packet);
+            }
+        }
+        let polls = Arc::new(AtomicUsize::new(0));
+        let (a, b) = pair();
+        let ea = tcp::endpoint(
+            &fcx,
+            Counted {
+                inner: a,
+                polls: polls.clone(),
+            },
+            ip(A),
+        );
+        let eb = tcp::endpoint(
+            &fcx,
+            Counted {
+                inner: b,
+                polls: polls.clone(),
+            },
+            ip(B),
+        );
         let mut listener = eb.listen(80)?;
         // Open, half-closed, closed and dropped connections, and one
         // waiting in the accept queue.
@@ -1266,14 +1299,11 @@ fn idle_endpoints_stay_idle() {
         }
         let _waiting = ea.connect(&fcx, SocketAddr::new(ip(B), 80)).await?;
         fcx.idle().await?;
-        let before = thread_cpu_time();
-        fcx.sleep(Duration::from_secs(1)).await?;
-        let used = thread_cpu_time() - before;
-        eprintln!("one idle second used {used:?} of CPU");
-        assert!(
-            used < Duration::from_millis(20),
-            "idle endpoints used {used:?}"
-        );
+        let before = polls.load(Ordering::Relaxed);
+        for _ in 0..100 {
+            fcx.yield_now().await?;
+        }
+        assert_eq!(polls.load(Ordering::Relaxed), before);
         Ok(())
     });
 }

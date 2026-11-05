@@ -473,12 +473,9 @@ service_fixture! {
     }
     on_item(self, line: Result<Vec<u8>, LineError>; _, driver) -> Flow {
         self.lines += 1;
-        if line.as_deref() == Ok(b"slow") {
-            // Work that takes a while, so the client's bytes pile up.
-            let started = fictionet::stdlib::test_support::thread_cpu_time();
-            while fictionet::stdlib::test_support::thread_cpu_time() - started
-                < Duration::from_micros(50)
-            {}
+        if line.as_deref() == Ok(b"step") {
+            assert_eq!(self.beats, self.lines - 2, "due heartbeat before the next line");
+            driver.set_timer(SessionTimer::Heartbeat, Duration::ZERO);
         }
         if line.as_deref() == Ok(b"logon") {
             driver.cancel_timer(SessionTimer::Logon);
@@ -546,7 +543,7 @@ fn named_timers_run_side_by_side() {
 /// were there and only then looked at its one timer.
 #[test]
 fn continuous_input_cannot_starve_a_timer() {
-    world::real_world(Duration::from_secs(60), |fcx| async move {
+    world(Duration::from_secs(60), |fcx| async move {
         let (server, _su, client, _cu) = two_machines(&fcx);
         serve::listen(
             &fcx,
@@ -560,7 +557,7 @@ fn continuous_input_cannot_starve_a_timer() {
             .await?;
         let mut flood = b"logon\n".to_vec();
         for _ in 0..10_000 {
-            flood.extend_from_slice(b"slow\n");
+            flood.extend_from_slice(b"step\n");
         }
         flood.extend_from_slice(b"end\n");
         conn.write_all(&fcx, &flood).await?;
@@ -582,21 +579,7 @@ fn continuous_input_cannot_starve_a_timer() {
             .unwrap(),
         )
         .unwrap();
-        // The work took at least 500 ms: a 10 ms heartbeat that is never
-        // starved beats nearly every 10 ms of it.
-        let expected = 50;
-        let beats: u64 = reply
-            .rsplit("beats=")
-            .next()
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        assert!(reply.contains("end lines=10002"), "{reply}");
-        assert!(
-            beats >= expected * 7 / 10,
-            "{reply}, expected about {expected}"
-        );
+        assert_eq!(reply, "logged on\nend lines=10002 beats=10000\n");
         Ok(())
     });
 }

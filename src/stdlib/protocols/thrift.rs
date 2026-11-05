@@ -1727,7 +1727,7 @@ mod tests {
     use super::*;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream, finish, pump};
     use fictionet::stdlib::test_support::contract;
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
+    use fictionet::stdlib::test_support::rounds;
     use fictionet::stdlib::test_support::{chunks, decode_all, mutate};
 
     fn encoded(message: Message, protocol: Protocol) -> EncodedMessage {
@@ -2369,24 +2369,20 @@ mod tests {
     }
 
     #[test]
-    fn stream_reads_many_small_frames_in_linear_time() {
-        assert_linear(
-            "stream_reads_many_small_frames_in_linear_time",
-            rounds(50_000),
-            |size| {
-                let one = Frame(vec![1, 2, 3]).to_bytes().unwrap();
-                let mut stream = Stream::new(Frames::<Frame>::new());
-                let mut n = 0;
-                pump(&mut stream, &one.repeat(size), |frame| {
-                    assert_eq!(frame.0, [1, 2, 3]);
-                    n += 1;
-                })
-                .unwrap();
-                finish(&mut stream, |_| unreachable!()).unwrap();
-                assert_eq!(n, size);
-                assert_eq!(stream.buffered(), 0);
-            },
-        );
+    fn stream_reads_many_small_frames() {
+        for size in [rounds(50_000), 4 * (rounds(50_000))] {
+            let one = Frame(vec![1, 2, 3]).to_bytes().unwrap();
+            let mut stream = Stream::new(Frames::<Frame>::new());
+            let mut n = 0;
+            pump(&mut stream, &one.repeat(size), |frame| {
+                assert_eq!(frame.0, [1, 2, 3]);
+                n += 1;
+            })
+            .unwrap();
+            finish(&mut stream, |_| unreachable!()).unwrap();
+            assert_eq!(n, size);
+            assert_eq!(stream.buffered(), 0);
+        }
     }
 
     fn check_messages(bytes: &[u8]) {

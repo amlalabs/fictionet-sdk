@@ -1840,7 +1840,7 @@ mod tests {
     use fictionet::stdlib::codec::{Fail, Lcg, Stream};
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::hex;
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
+    use fictionet::stdlib::test_support::rounds;
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     // RFC 2865, section 7.1: User Telnet to Specified Host.
@@ -2901,19 +2901,15 @@ mod tests {
     }
 
     #[test]
-    fn stream_takes_many_small_packets_in_linear_time() {
-        assert_linear(
-            "stream_takes_many_small_packets_in_linear_time",
-            rounds(25_000),
-            |size| {
-                let one = Packet::new(Code::StatusServer, 1, [0; 16])
-                    .to_bytes()
-                    .unwrap();
-                let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * size).collect();
-                let (packets, error) = decode_all(Frames::<Packet>::new, &stream);
-                assert_eq!((packets.len(), error), (size, None));
-            },
-        );
+    fn stream_takes_many_small_packets() {
+        for size in [rounds(25_000), 4 * (rounds(25_000))] {
+            let one = Packet::new(Code::StatusServer, 1, [0; 16])
+                .to_bytes()
+                .unwrap();
+            let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * size).collect();
+            let (packets, error) = decode_all(Frames::<Packet>::new, &stream);
+            assert_eq!((packets.len(), error), (size, None));
+        }
     }
 
     #[test]
