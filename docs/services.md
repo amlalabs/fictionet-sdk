@@ -861,3 +861,22 @@ them. Existing command and DATA parsing keeps its grammar and limits.
 `Driver::peek_decoder()` reads its state. `DatagramDriver::decoder()` does
 the same for the current datagram; each new datagram starts with a fresh
 decoder.
+
+## SSH sessions
+
+`stdlib::services::ssh::Server` runs the SSH transport through `serve::connection`.
+Its `Handler` chooses each authentication result and creates a `Session` for a
+shell, exec command or subsystem. `SessionRequest` carries the authenticated
+user, accepted environment and optional terminal settings. The session receives
+raw input bytes and typed resize, signal, EOF and close events. `Output` queues
+stdout, stderr and exit status under a fixed bound; the server drains it under
+the peer's channel window and maximum packet size. Applications must handle a
+full output queue. A per-connection channel limit and authentication deadline
+bound retained state.
+
+The transport and message codecs contain protocol standards. World code owns
+credentials, account policy, host keys and application behavior. The optional
+`fictionet_extras::ssh` module provides a sourced Ubuntu OpenSSH profile,
+`honeypot::Observed` to record typed activity without changing policy, and a
+separate terminal line editor. The honeypot demo combines them with a fake
+shell and a read-only SFTP directory; it never executes client commands.

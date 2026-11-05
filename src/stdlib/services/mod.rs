@@ -7,4 +7,5 @@ pub mod ca;
 pub mod dns;
 pub mod keys;
 pub mod serve;
+pub mod ssh;
 pub mod tls;
