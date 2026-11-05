@@ -122,6 +122,7 @@ pub fn prepare_endpoint(
             ip_id: fcx.random_u64() as u16,
             groups: Vec::new(),
             next_port: 49152,
+            icmp_options: icmp::Options::default(),
         }),
     });
     let driver = shared.clone();
@@ -158,6 +159,7 @@ struct State {
     stopped: bool,
     ip_id: u16,
     next_port: u16,
+    icmp_options: icmp::Options,
 }
 
 #[derive(Default)]
@@ -237,7 +239,7 @@ fn deliver(shared: &Shared, packet: Packet) {
             }
             // No one answers a group's datagram with an error.
             None if group => None,
-            None => port_unreachable(&packet.0, ip.dst),
+            None => port_unreachable(&packet.0, ip.dst, &st.icmp_options),
         }
     };
     if let Some(reply) = reply {
@@ -255,6 +257,11 @@ pub struct Endpoint {
 }
 
 impl Endpoint {
+    /// Sets the header choices for this endpoint's ICMP errors.
+    pub fn icmp_options(&self, options: icmp::Options) {
+        self.shared.state.lock().icmp_options = options;
+    }
+
     /// Joins the multicast group `group`: datagrams sent to it reach this
     /// endpoint's sockets on their ports, as datagrams to its own address
     /// do. Delivering them is the network's job: a
@@ -434,10 +441,10 @@ impl Drop for Socket {
 
 /// The ICMP "port unreachable" answer to `packet`, a whole UDP packet to
 /// `addr`, this machine (RFC 1122, RFC 4443).
-fn port_unreachable(packet: &[u8], addr: IpAddr) -> Option<Packet> {
+fn port_unreachable(packet: &[u8], addr: IpAddr, options: &icmp::Options) -> Option<Packet> {
     match addr {
-        IpAddr::V4(_) => icmp::error(packet, addr, 3, 3, 0),
-        IpAddr::V6(_) => icmp::error(packet, addr, 1, 4, 0),
+        IpAddr::V4(_) => options.error(packet, addr, 3, 3, 0),
+        IpAddr::V6(_) => options.error(packet, addr, 1, 4, 0),
     }
 }
 

@@ -718,15 +718,16 @@ pub struct Listener<S> {
     port: u16,
     joins: Arc<Mutex<JoinCookies>>,
     fcx: Cx,
-    clock: crate::Clock,
+    timestamp: Arc<dyn Fn() -> u32 + Send + Sync>,
 }
 
 impl<S> Listener<S> {
     /// `inner` on `port` behind an MPTCP listener whose keys come from
-    /// `fcx`.
+    /// `fcx`. `timestamp` supplies IPv4 option timestamps in milliseconds
+    /// since midnight UTC.
     pub fn new(
         fcx: &Cx,
-        clock: crate::Clock,
+        timestamp: impl Fn() -> u32 + Send + Sync + 'static,
         tokens: Arc<Tokens>,
         port: u16,
         inner: S,
@@ -737,7 +738,7 @@ impl<S> Listener<S> {
             port,
             joins: Arc::new(Mutex::new(JoinCookies::new(fcx.random_u64()))),
             fcx: fcx.clone(),
-            clock,
+            timestamp: Arc::new(timestamp),
         }
     }
 }
@@ -748,31 +749,7 @@ struct Answers {
     port: u16,
     joins: Arc<Mutex<JoinCookies>>,
     fcx: Cx,
-    clock: crate::Clock,
-}
-
-impl Answers {
-    fn echo(&self, syn: &Syn<'_>) -> Option<fictionet::stdlib::network::ip::Ipv4Reply> {
-        let (std::net::IpAddr::V4(local), std::net::IpAddr::V4(remote)) =
-            (syn.to.ip(), syn.from.ip())
-        else {
-            return Some(Default::default());
-        };
-        let timestamp = ((self.clock.micros(self.fcx.now()) / 1000) % 86_400_000) as u32;
-        fictionet_extras::linux::ipv4_options(
-            syn.ipv4_options,
-            local,
-            remote,
-            timestamp,
-            |address| {
-                address != local
-                    && !address.is_unspecified()
-                    && !address.is_loopback()
-                    && !address.is_multicast()
-                    && !address.is_broadcast()
-            },
-        )
-    }
+    timestamp: Arc<dyn Fn() -> u32 + Send + Sync>,
 }
 
 impl Answer for Answers {
@@ -798,7 +775,14 @@ impl Answer for Answers {
     }
 
     fn ipv4_options(&self, syn: &Syn<'_>) -> Option<fictionet::stdlib::network::ip::Ipv4Reply> {
-        self.echo(syn)
+        super::syn_ipv4_options(syn, (self.timestamp)())
+    }
+
+    fn retransmit_ipv4_options(
+        &self,
+        handshake: &Handshake,
+    ) -> Option<Vec<fictionet::stdlib::network::ip::Ipv4Option>> {
+        super::handshake_ipv4_options(handshake, (self.timestamp)())
     }
 
     fn cookie(&self, from: SocketAddr, handshake: &Handshake) -> Option<Kept> {
@@ -830,7 +814,7 @@ impl Answer for Answers {
                         n.checksums,
                         n.first,
                     )
-                    .ack_width(fictionet_extras::linux::mptcp_ack_width()),
+                    .ack_width(super::mptcp_ack_width()),
                 ),
             ),
             Completion::Join(Some(join)) => (self.tokens.keys(join.token)?.local, None),
@@ -920,638 +904,17 @@ impl<S: PortServer> PortServer for Listener<S> {
         self.inner.alpn()
     }
 
+    fn backlog(&self) -> Option<usize> {
+        self.inner.backlog()
+    }
+
     fn answer(&self) -> Option<Box<dyn Answer>> {
         Some(Box::new(Answers {
             tokens: self.tokens.clone(),
             port: self.port,
             joins: self.joins.clone(),
             fcx: self.fcx.clone(),
-            clock: self.clock,
+            timestamp: self.timestamp.clone(),
         }))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn syn(options: &[MptcpOption]) -> Vec<TcpOption> {
-        let mut syn = vec![TcpOption::MaxSegmentSize(1460), TcpOption::SackPermitted];
-        syn.extend(options.iter().cloned().map(option));
-        syn
-    }
-
-    fn linux_capable() -> Capable {
-        Capable {
-            version: 1,
-            checksum_required: false,
-            extensibility: false,
-            no_new_subflows: false,
-            algorithms: algorithm::HMAC_SHA256,
-            keys: Keys::Absent,
-        }
-    }
-
-    fn join(token: u32) -> MptcpOption {
-        MptcpOption::Join(Join::Syn {
-            backup: false,
-            address_id: 0,
-            token,
-            random: 1,
-        })
-    }
-
-    const PORT: u16 = 22;
-
-    /// The client the SYNs in these tests come from.
-    fn client() -> SocketAddr {
-        "198.51.100.1:40000".parse().unwrap()
-    }
-
-    /// A SYN with `options` from the client, with a SYN cookie if
-    /// `cookie`.
-    fn syn_of(options: &[TcpOption], cookie: bool) -> Syn<'_> {
-        Syn {
-            options,
-            ipv4_options: &[],
-            from: client(),
-            to: "192.0.2.1:22".parse().unwrap(),
-            seq: 1000,
-            cookie,
-        }
-    }
-
-    /// The answer's key, with this `random`.
-    fn answer(options: &[TcpOption], tokens: &Tokens, random: u64) -> SynAnswer {
-        answer_syn(&syn_of(options, false), PORT, tokens, || random)
-    }
-
-    fn plain() -> SynAnswer {
-        SynAnswer::Accept(Vec::new())
-    }
-
-    #[test]
-    fn mp_capable_gets_a_key() {
-        let tokens = Tokens::default();
-        for checksums in [false, true] {
-            let offer = Capable {
-                checksum_required: checksums,
-                ..linux_capable()
-            };
-            let answer = answer(&syn(&[MptcpOption::Capable(offer)]), &tokens, 7);
-            assert_eq!(
-                answer,
-                SynAnswer::Accept(vec![option(MptcpOption::Capable(Capable {
-                    keys: Keys::Sender(7),
-                    ..offer
-                }))])
-            );
-        }
-    }
-
-    /// A version above 1 gets version 1 back, as Linux answers it: a SYN
-    /// with Length 4 and a higher version is taken (mptcp_parse_option).
-    #[test]
-    fn a_higher_version_gets_version_1() {
-        let tokens = Tokens::default();
-        for version in 2..=15 {
-            let offer = Capable {
-                version,
-                ..linux_capable()
-            };
-            assert_eq!(
-                answer(&syn(&[MptcpOption::Capable(offer)]), &tokens, 7),
-                SynAnswer::Accept(vec![option(MptcpOption::Capable(Capable {
-                    keys: Keys::Sender(7),
-                    ..linux_capable()
-                }))]),
-                "version {version}"
-            );
-        }
-    }
-
-    /// Linux ignores MP_CAPABLE of version 0, with a key, with flag B, or
-    /// with any algorithm but HMAC-SHA256 alone, so its SYN is plain TCP.
-    #[test]
-    fn offers_linux_ignores_are_plain_tcp() {
-        let tokens = Tokens::default();
-        let mut offers = vec![
-            Capable {
-                version: 0,
-                keys: Keys::Sender(1),
-                ..linux_capable()
-            },
-            Capable {
-                keys: Keys::Sender(1),
-                ..linux_capable()
-            },
-            Capable {
-                extensibility: true,
-                ..linux_capable()
-            },
-        ];
-        for algorithms in 2..=algorithm::ALL {
-            offers.push(Capable {
-                algorithms,
-                ..linux_capable()
-            });
-        }
-        for offer in offers {
-            let options = syn(&[MptcpOption::Capable(offer)]);
-            assert_eq!(answer(&options, &tokens, 7), plain(), "{offer:?}");
-        }
-        assert_eq!(answer(&syn(&[]), &tokens, 7), plain());
-        let malformed = vec![TcpOption::Unknown {
-            kind: mptcp::KIND,
-            data: vec![0x00],
-        }];
-        assert_eq!(answer(&malformed, &tokens, 7), plain());
-    }
-
-    /// Only options Linux takes count. An MP_CAPABLE it ignores before
-    /// one it takes leaves the SYN MPTCP; one it ignores beside an
-    /// MP_JOIN leaves the join to be answered; two it takes, MP_CAPABLE
-    /// and MP_JOIN, make plain TCP.
-    #[test]
-    fn only_options_linux_takes_count() {
-        let tokens = Arc::new(Tokens::default());
-        let v0 = TcpOption::Unknown {
-            kind: mptcp::KIND,
-            data: vec![0x00, 0x81, 1, 2, 3, 4, 5, 6, 7, 8],
-        };
-        let v1 = option(MptcpOption::Capable(linux_capable()));
-        assert_eq!(
-            answer(&[v0, v1], &tokens, 7),
-            SynAnswer::Accept(vec![option(MptcpOption::Capable(Capable {
-                keys: Keys::Sender(7),
-                ..linux_capable()
-            }))])
-        );
-        let ignored = MptcpOption::Capable(Capable {
-            extensibility: true,
-            ..linux_capable()
-        });
-        assert_eq!(
-            answer(&syn(&[ignored, join(0xdead_beef)]), &tokens, 7),
-            SynAnswer::Refuse(vec![tcprst(reason::MPTCP_SPECIFIC)])
-        );
-        let both = syn(&[MptcpOption::Capable(linux_capable()), join(1)]);
-        assert_eq!(answer(&both, &tokens, 7), plain());
-    }
-
-    /// A join to an open connection on the same port gets a SYN-ACK with
-    /// MP_JOIN, whose HMAC is the listener's (RFC 8684 section 3.2); one
-    /// to no connection gets a RST at once; one to a connection on another
-    /// port gets "administratively prohibited".
-    #[test]
-    fn joins_get_a_syn_ack_when_their_token_is_known_here() {
-        let tokens = Arc::new(Tokens::default());
-        let keys = KeyPair {
-            local: 42,
-            remote: 0x1111,
-        };
-        let open = tokens.open(keys, PORT).unwrap();
-        assert!(tokens.knows(token(42)));
-        let SynAnswer::Accept(sent) = answer(&syn(&[join(token(42))]), &tokens, 0x7777) else {
-            panic!("a SYN-ACK")
-        };
-        let hmac = join_hmac(42, 0x1111, 0x7777, 1);
-        assert_eq!(
-            sent,
-            [option(MptcpOption::Join(Join::SynAck {
-                backup: false,
-                address_id: 0,
-                hmac: hmac[..8].try_into().unwrap(),
-                random: 0x7777,
-            }))]
-        );
-        assert_eq!(
-            answer(&syn(&[join(token(43))]), &tokens, 7),
-            SynAnswer::Refuse(vec![tcprst(reason::MPTCP_SPECIFIC)])
-        );
-        assert_eq!(
-            answer_syn(&syn_of(&syn(&[join(token(42))]), false), 80, &tokens, || 7),
-            SynAnswer::Refuse(vec![tcprst(reason::ADMINISTRATIVELY_PROHIBITED)])
-        );
-        drop(open);
-        assert!(tokens.is_empty());
-        assert_eq!(
-            answer(&syn(&[join(token(42))]), &tokens, 7),
-            SynAnswer::Refuse(vec![tcprst(reason::MPTCP_SPECIFIC)])
-        );
-    }
-
-    /// The handshake of a join to the connection with keys (42, 0x1111):
-    /// the client's random 1, the server's 0x7777, and `hmac` on the ACK.
-    fn join_handshake(hmac: Option<[u8; 20]>) -> Handshake {
-        let syn_ack = option(MptcpOption::Join(Join::SynAck {
-            backup: false,
-            address_id: 0,
-            hmac: [0; 8],
-            random: 0x7777,
-        }));
-        let ack = hmac
-            .map(|hmac| vec![option(MptcpOption::Join(Join::Ack { hmac }))])
-            .unwrap_or_default();
-        Handshake {
-            syn: Some(syn(&[join(token(42))]).into()),
-            syn_ack: Some(vec![syn_ack].into()),
-            ack: ack.into(),
-            ..Handshake::default()
-        }
-    }
-
-    /// A join is taken at its third ACK when its HMAC is the client's
-    /// (RFC 8684 section 3.2) and the connection has room, as Linux takes
-    /// it. Any other HMAC or a full connection is refused as
-    /// "administratively prohibited", and an ACK with no MP_JOIN as an
-    /// "MPTCP-specific error", as Linux refuses a join it would have to
-    /// fall back.
-    #[test]
-    fn joins_with_the_right_hmac_are_taken() {
-        let tokens = Arc::new(Tokens::default());
-        let keys = KeyPair {
-            local: 42,
-            remote: 0x1111,
-        };
-        let _open = tokens.open(keys, PORT).unwrap();
-        let hmac_a: [u8; 20] = join_hmac(0x1111, 42, 1, 0x7777)[..20].try_into().unwrap();
-        let refused = AckAnswer::Refuse(vec![tcprst(reason::ADMINISTRATIVELY_PROHIBITED)]);
-        assert_eq!(
-            answer_ack(&join_handshake(Some(hmac_a)), &tokens),
-            AckAnswer::Accept
-        );
-        let mut wrong = hmac_a;
-        wrong[19] ^= 1;
-        assert_eq!(answer_ack(&join_handshake(Some(wrong)), &tokens), refused);
-        assert_eq!(
-            answer_ack(&join_handshake(None), &tokens),
-            AckAnswer::Refuse(vec![tcprst(reason::MPTCP_SPECIFIC)])
-        );
-        // Two joined subflows fill the connection.
-        let joined: Vec<_> = (0..MAX_SUBFLOWS)
-            .map(|_| tokens.join(token(42)).unwrap())
-            .collect();
-        assert!(tokens.join(token(42)).is_none());
-        assert_eq!(answer_ack(&join_handshake(Some(hmac_a)), &tokens), refused);
-        drop(joined);
-        assert_eq!(tokens.joined(token(42)), 0);
-        assert_eq!(
-            answer_ack(&join_handshake(Some(hmac_a)), &tokens),
-            AckAnswer::Accept
-        );
-        // A join to a connection that has gone is refused too, but an ACK
-        // with no MP_JOIN is still the MPTCP-specific error.
-        drop(_open);
-        assert_eq!(answer_ack(&join_handshake(Some(hmac_a)), &tokens), refused);
-        assert_eq!(
-            answer_ack(&join_handshake(None), &tokens),
-            AckAnswer::Refuse(vec![tcprst(reason::MPTCP_SPECIFIC)])
-        );
-        // After a SYN cookie with nothing of the SYN kept, Linux drops it.
-        let cookie = Handshake {
-            ack: vec![option(MptcpOption::Join(Join::Ack { hmac: hmac_a }))].into(),
-            ..Handshake::default()
-        };
-        assert_eq!(answer_ack(&cookie, &tokens), AckAnswer::Drop);
-        assert_eq!(
-            answer_ack(&Handshake::default(), &tokens),
-            AckAnswer::Accept
-        );
-    }
-
-    /// A join SYN that gets a SYN cookie is kept in the table, as Linux
-    /// keeps it, and its ACK is checked as any other: taken with the right
-    /// HMAC, refused with a wrong one. An ACK whose slot is empty, or whose
-    /// connection has gone, is dropped with no answer. A full connection
-    /// refuses the SYN at once.
-    #[test]
-    fn a_cookie_join_is_kept_until_its_ack() {
-        fictionet::block_on(fictionet::lab(
-            fictionet::Seed::from_u64(1),
-            |fcx| async move {
-                let tokens = Arc::new(Tokens::default());
-                let keys = KeyPair {
-                    local: 42,
-                    remote: 0x1111,
-                };
-                let open = tokens.open(keys, PORT).unwrap();
-                let listener = Listener::new(
-                    &fcx,
-                    crate::Clock::at_unix_secs(0),
-                    tokens.clone(),
-                    PORT,
-                    H2,
-                );
-                let answers = listener.answer().unwrap();
-                let options = syn(&[join(token(42))]);
-                // The SYN, past the backlog: the server's random number.
-                let syn_ack = || {
-                    let SynAnswer::Accept(added) = answers.syn(&syn_of(&options, true)) else {
-                        panic!("a SYN-ACK")
-                    };
-                    match mptcp_options(&added).collect::<Vec<_>>()[..] {
-                        [MptcpOption::Join(Join::SynAck { random, .. })] => random,
-                        _ => panic!("MP_JOIN: {added:?}"),
-                    }
-                };
-                // The ACK that returns the cookie with `ack`, as the
-                // endpoint completes it.
-                let ack = |ack: Vec<TcpOption>| {
-                    let mut handshake = Handshake {
-                        ack: ack.into(),
-                        irs: 1000,
-                        iss: 5000,
-                        ..Handshake::default()
-                    };
-                    if let Some(kept) = answers.cookie(client(), &handshake) {
-                        handshake.syn = Some(kept.syn);
-                        handshake.syn_ack = Some(kept.syn_ack);
-                    }
-                    handshake
-                };
-                // The client's MP_JOIN, with its HMAC for `our_random`.
-                let hmac = |our_random, flip: u8| {
-                    let mut hmac: [u8; 20] = join_hmac(0x1111, 42, 1, our_random)[..20]
-                        .try_into()
-                        .unwrap();
-                    hmac[0] ^= flip;
-                    option(MptcpOption::Join(Join::Ack { hmac }))
-                };
-                let prohibited =
-                    AckAnswer::Refuse(vec![tcprst(reason::ADMINISTRATIVELY_PROHIBITED)]);
-
-                // The right HMAC is taken, with the SYN as it came.
-                let random = syn_ack();
-                let taken = ack(vec![hmac(random, 0)]);
-                assert_eq!(taken.syn.as_deref(), Some(&options[..]));
-                assert_eq!(answers.ack(&taken), AckAnswer::Accept);
-                // That emptied the slot: the same ACK again is dropped.
-                let again = ack(vec![hmac(random, 0)]);
-                assert_eq!(again.syn, None);
-                assert_eq!(answers.ack(&again), AckAnswer::Drop);
-                // A wrong HMAC is refused.
-                let random = syn_ack();
-                assert_eq!(answers.ack(&ack(vec![hmac(random, 1)])), prohibited);
-                // An ACK with MP_CAPABLE too takes nothing back and is
-                // dropped. The slot stays for one with MP_JOIN alone.
-                let random = syn_ack();
-                let echo = capable_ack(
-                    1,
-                    0x01,
-                    Keys::Both {
-                        sender: 9,
-                        receiver: 7,
-                    },
-                );
-                let both = ack(vec![echo, hmac(random, 0)]);
-                assert_eq!(both.syn, None);
-                assert_eq!(answers.ack(&both), AckAnswer::Drop);
-                assert_eq!(answers.ack(&ack(vec![hmac(random, 0)])), AckAnswer::Accept);
-                // A later SYN with the same slot takes it from an earlier
-                // one, whose ACK then fails its check.
-                let first = syn_ack();
-                let second = syn_ack();
-                assert_ne!(first, second);
-                assert_eq!(answers.ack(&ack(vec![hmac(first, 0)])), prohibited);
-                // A connection gone before the ACK: the ACK is dropped.
-                let random = syn_ack();
-                drop(open);
-                let gone = ack(vec![hmac(random, 0)]);
-                assert_eq!(gone.syn, None);
-                assert_eq!(answers.ack(&gone), AckAnswer::Drop);
-                // A full connection refuses a SYN cookie's join at once,
-                // and one with no cookie at its ACK.
-                let _open = tokens.open(keys, PORT).unwrap();
-                let _joined: Vec<_> = (0..MAX_SUBFLOWS)
-                    .map(|_| tokens.join(token(42)).unwrap())
-                    .collect();
-                assert_eq!(
-                    answers.syn(&syn_of(&options, true)),
-                    SynAnswer::Refuse(vec![tcprst(reason::ADMINISTRATIVELY_PROHIBITED)])
-                );
-                assert!(matches!(
-                    answers.syn(&syn_of(&options, false)),
-                    SynAnswer::Accept(_)
-                ));
-                Ok(())
-            },
-        ))
-        .unwrap();
-    }
-
-    /// A joined subflow learns when its connection is gone.
-    #[test]
-    fn joined_subflows_see_their_connection_go() {
-        let tokens = Arc::new(Tokens::default());
-        let keys = KeyPair {
-            local: 5,
-            remote: 6,
-        };
-        let open = tokens.open(keys, PORT).unwrap();
-        let joined = tokens.join(token(5)).unwrap();
-        let waker = Waker::noop();
-        let mut cx = Context::from_waker(waker);
-        assert!(joined.poll_gone(&mut cx).is_pending());
-        drop(open);
-        assert!(joined.poll_gone(&mut cx).is_ready());
-    }
-
-    fn capable_ack(version: u8, flags: u8, keys: Keys) -> TcpOption {
-        option(MptcpOption::Capable(Capable {
-            version,
-            checksum_required: flags & 0x80 != 0,
-            extensibility: flags & 0x40 != 0,
-            no_new_subflows: flags & 0x20 != 0,
-            algorithms: flags & 0x1f,
-            keys,
-        }))
-    }
-
-    fn handshake(
-        syn_ack: Option<Vec<TcpOption>>,
-        ack: Vec<TcpOption>,
-        payload: usize,
-    ) -> Handshake {
-        Handshake {
-            syn: syn_ack.as_ref().map(|_| Arc::default()),
-            syn_ack: syn_ack.map(Arc::from),
-            ack: ack.into(),
-            ack_payload: payload,
-            ..Handshake::default()
-        }
-    }
-
-    fn issued(checksums: bool) -> TcpOption {
-        option(MptcpOption::Capable(Capable {
-            checksum_required: checksums,
-            keys: Keys::Sender(7),
-            ..linux_capable()
-        }))
-    }
-
-    fn mptcp(local: u64, remote: u64, first: Option<u16>, cookie: bool) -> Completion {
-        Completion::Mptcp(Negotiated {
-            keys: KeyPair { local, remote },
-            checksums: false,
-            first,
-            cookie,
-        })
-    }
-
-    /// A connection uses MPTCP once its third ACK echoes the keys; the
-    /// server's key is the one it sent, or after a SYN cookie the echo.
-    #[test]
-    fn the_third_ack_decides_mptcp() {
-        let both = |receiver| Keys::Both {
-            sender: 9,
-            receiver,
-        };
-        let echo = |receiver| capable_ack(1, 0x01, both(receiver));
-        let kept = Some(vec![issued(false)]);
-        assert_eq!(
-            complete(&handshake(kept.clone(), vec![echo(7)], 0)),
-            mptcp(7, 9, None, false)
-        );
-        // The key sent stands whatever the echo says.
-        assert_eq!(
-            complete(&handshake(kept.clone(), vec![echo(8)], 0)),
-            mptcp(7, 9, None, false)
-        );
-        assert_eq!(complete(&handshake(kept, vec![], 0)), Completion::Plain);
-        assert_eq!(
-            complete(&handshake(Some(vec![]), vec![echo(7)], 0)),
-            Completion::Plain
-        );
-        assert_eq!(
-            complete(&handshake(None, vec![echo(7)], 0)),
-            mptcp(7, 9, None, true)
-        );
-    }
-
-    /// On the third ACK Linux takes MP_CAPABLE of version 1 only, with
-    /// flag B clear, HMAC-SHA256 alone, and the Length the segment calls
-    /// for: 20 on a pure ACK, 22 or 24 with data. Any other is ignored, and
-    /// the connection is plain TCP.
-    #[test]
-    fn the_third_ack_s_mp_capable_must_be_one_linux_takes() {
-        let both = Keys::Both {
-            sender: 9,
-            receiver: 7,
-        };
-        let data = |checksum| Keys::Data {
-            sender: 9,
-            receiver: 7,
-            data_level_length: 5,
-            checksum,
-        };
-        for (cookie, kept) in [(false, Some(vec![issued(false)])), (true, None)] {
-            let ack = |option, payload| complete(&handshake(kept.clone(), vec![option], payload));
-            for ignored in [
-                ack(capable_ack(0, 0x01, both), 0),
-                ack(capable_ack(2, 0x01, both), 0),
-                ack(capable_ack(1, 0x41, both), 0),
-                ack(capable_ack(1, 0x03, both), 0),
-                ack(capable_ack(1, 0x11, both), 0),
-                ack(capable_ack(1, 0x01, data(None)), 0),
-                ack(capable_ack(1, 0x01, both), 5),
-            ] {
-                assert_eq!(ignored, Completion::Plain, "cookie {cookie}");
-            }
-            assert_eq!(
-                ack(capable_ack(1, 0x01, data(None)), 5),
-                mptcp(7, 9, Some(5), cookie)
-            );
-            let Completion::Mptcp(n) = ack(capable_ack(1, 0x81, data(Some(3))), 5) else {
-                panic!("MPTCP with a checksum")
-            };
-            assert!(n.checksums);
-            // Flag C does not matter.
-            assert_eq!(
-                ack(capable_ack(1, 0x21, both), 0),
-                mptcp(7, 9, None, cookie)
-            );
-        }
-        // The SYN-ACK's checksum flag carries over.
-        let kept = Some(vec![issued(true)]);
-        let Completion::Mptcp(n) = complete(&handshake(kept, vec![capable_ack(1, 1, both)], 0))
-        else {
-            panic!("MPTCP")
-        };
-        assert!(n.checksums);
-    }
-
-    /// After a SYN cookie Linux drops the ACK when it carries both
-    /// MP_CAPABLE and MP_JOIN, when the client's key is 0, or when the
-    /// echoed key's token names an open connection, which keeps its entry.
-    #[test]
-    fn cookie_acks_linux_drops_are_dropped() {
-        let tokens = Arc::new(Tokens::default());
-        let echo = |sender, receiver| capable_ack(1, 0x01, Keys::Both { sender, receiver });
-        let join_ack = option(MptcpOption::Join(Join::Ack { hmac: [0; 20] }));
-        let cookie = |ack| handshake(None, ack, 0);
-        assert_eq!(
-            answer_ack(&cookie(vec![echo(9, 7), join_ack]), &tokens),
-            AckAnswer::Drop
-        );
-        assert_eq!(
-            answer_ack(&cookie(vec![echo(0, 7)]), &tokens),
-            AckAnswer::Drop
-        );
-        let victim = KeyPair {
-            local: 7,
-            remote: 3,
-        };
-        let open = tokens.open(victim, PORT).unwrap();
-        assert_eq!(
-            answer_ack(&cookie(vec![echo(9, 7)]), &tokens),
-            AckAnswer::Drop
-        );
-        assert_eq!(tokens.keys(token(7)), Some(victim));
-        // Even one that gets past the ACK does not take the token.
-        let other = KeyPair {
-            local: 7,
-            remote: 9,
-        };
-        assert!(tokens.open(other, PORT).is_none());
-        assert_eq!(tokens.keys(token(7)), Some(victim));
-        drop(open);
-        assert_eq!(
-            answer_ack(&cookie(vec![echo(9, 7)]), &tokens),
-            AckAnswer::Accept
-        );
-    }
-
-    /// Any port server, with ALPN.
-    struct H2;
-
-    impl PortServer for H2 {
-        fn serve(&self, _: Cx, _: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-            Box::pin(async {})
-        }
-
-        fn alpn(&self) -> Vec<Vec<u8>> {
-            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
-        }
-    }
-
-    #[test]
-    fn the_listener_keeps_the_inner_server_s_alpn() {
-        fictionet::block_on(fictionet::lab(
-            fictionet::Seed::from_u64(1),
-            |fcx| async move {
-                let listener = Listener::new(
-                    &fcx,
-                    crate::Clock::at_unix_secs(0),
-                    Arc::default(),
-                    PORT,
-                    H2,
-                );
-                assert_eq!(listener.alpn(), H2.alpn());
-                assert!(listener.answer().is_some());
-                Ok(())
-            },
-        ))
-        .unwrap();
     }
 }

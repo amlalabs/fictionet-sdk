@@ -10,12 +10,13 @@ The [raw world example](examples/raw_world.rs) parses a `PciAddress`, opens
 `VirtioNet`, and calls `RawPump::attach` before `fictionet::run`.
 
 - The pump polls the device on its own thread, and parks when there is
-  nothing to do or the world is not keeping up.
+  nothing to do.
 - The world awaits `RawAttachment::recv`. It never polls the device.
 - Each direction holds at most 64 frames, plus one the pump holds.
   `send` waits for room, and `try_send` drops the frame when there is
-  none. When the receive queue is full, the pump stops reading, and the
-  card may drop frames.
+  none. When the receive queue is full, the pump keeps reading and counts
+  discarded frames. `receive_stats` and `transmit_stats` expose queue loss;
+  losses inside the card or backend remain unknown.
 - Receive, send, and flush end when the world is cancelled.
 - A driver failure closes both directions, and the world gets the error.
 - Dropping the pump stops its thread and resets the device.
@@ -91,7 +92,7 @@ and flush. From the host, it then checks:
   MP_CAPABLE handshake with timestamps;
 - a fragmented ping whose echo reply is too big for one frame, which the
   Ethernet adapter must drop and keep serving;
-- an HTTP request under a DSS mapping, which must get the whole nginx page
+- an HTTP request under a DSS mapping, which must get the whole Caddy page
   with valid TCP checksums, DSS mappings, Data ACKs, and timestamp echoes;
 - in the guest, the Ethernet log, and the honeypot's log lines for the
   MPTCP SYN, its answer, and DSS.
@@ -113,3 +114,6 @@ host's NIC settings to test this code.
 The driver follows the modern PCI transport and split virtqueue rules of
 the [virtio specification](https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html)
 and the Linux [VFIO interface](https://www.kernel.org/doc/html/latest/driver-api/vfio.html).
+
+The same guest then runs the shipped `raw_honeypot` example and repeats
+neighbor discovery, IPv6 SSH and the complete MPTCP HTTP exchange.

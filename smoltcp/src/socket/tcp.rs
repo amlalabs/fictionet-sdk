@@ -540,6 +540,8 @@ pub struct Socket<'a> {
     /// tsval generator - if some, tcp timestamp is enabled
     tsval_generator: Option<TcpTimestampGenerator>,
     timestamp_offset: u32,
+    /// Private identification counter, when configured by the endpoint.
+    ipv4_identification: Option<u16>,
     settings: Settings,
 
     /// 0 if not seen or timestamp not enabled
@@ -570,6 +572,15 @@ pub struct Socket<'a> {
 
 const DEFAULT_MSS: usize = 536;
 
+/// Payload on a keep-alive probe, both forms permitted by RFC 1122 section 4.2.3.6.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeepAlivePayload {
+    /// Send only the acknowledgment with the preceding sequence number.
+    Empty,
+    /// Include one garbage byte for peers that require it.
+    OneByte,
+}
+
 /// Transport choices supplied by the world.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Settings {
@@ -593,6 +604,10 @@ pub struct Settings {
     pub ack_inclusive: bool,
     /// Window growth ratio that triggers an immediate window update.
     pub window_update_ratio: u16,
+    /// Minimum interval between challenge acknowledgments on one socket.
+    pub challenge_ack_interval: Duration,
+    /// Whether keep-alive probes include a garbage byte.
+    pub keep_alive_payload: KeepAlivePayload,
 }
 
 impl Default for Settings {
@@ -608,6 +623,8 @@ impl Default for Settings {
             ack_segments: 2,
             ack_inclusive: true,
             window_update_ratio: 2,
+            challenge_ack_interval: Duration::from_secs(1),
+            keep_alive_payload: KeepAlivePayload::OneByte,
         }
     }
 }
@@ -759,6 +776,7 @@ impl<'a> Socket<'a> {
             nagle: true,
             tsval_generator: None,
             timestamp_offset: 0,
+            ipv4_identification: None,
             settings: Settings::default(),
             last_remote_tsval: 0,
             congestion_controller: reno::Reno::new(),
@@ -792,6 +810,33 @@ impl<'a> Socket<'a> {
     /// Keeps an offset for this connection's timestamp clock.
     pub fn set_timestamp_offset(&mut self, offset: u32) {
         self.timestamp_offset = offset;
+    }
+
+    /// Uses a private IPv4 identification counter for this socket.
+    /// Passive SYN and TIME-WAIT replies carry identification zero.
+    pub fn set_ipv4_identification(&mut self, initial: u16) {
+        self.ipv4_identification = Some(initial);
+    }
+
+    fn identify_ipv4(&self, ip: &mut IpRepr) {
+        if !matches!(
+            self.state,
+            State::Listen | State::SynReceived | State::TimeWait
+        ) && let (Some(id), IpRepr::Ipv4(ip)) = (self.ipv4_identification, ip)
+        {
+            ip.identification = id;
+        }
+    }
+
+    fn advance_ipv4_identification(&mut self, ip: &IpRepr) {
+        if !matches!(
+            self.state,
+            State::Listen | State::SynReceived | State::TimeWait
+        ) && matches!(ip, IpRepr::Ipv4(_))
+            && let Some(id) = &mut self.ipv4_identification
+        {
+            *id = id.wrapping_add(1);
+        }
     }
 
     /// Restores options negotiated by a stateless handshake.
@@ -1135,6 +1180,12 @@ impl<'a> Socket<'a> {
             // until the next packet, unless we wind up the timer explicitly.
             self.timer.set_keep_alive();
         }
+    }
+
+    /// Starts the configured idle interval at `timestamp` for an established
+    /// socket whose keep-alive setting changed outside packet processing.
+    pub fn restart_keep_alive(&mut self, timestamp: Instant) {
+        self.timer.rewind_keep_alive(timestamp, self.keep_alive);
     }
 
     /// Return the time-to-live (IPv4) or hop limit (IPv6) value used in outgoing packets.
@@ -1623,13 +1674,15 @@ impl<'a> Socket<'a> {
         repr: &TcpRepr,
     ) -> (IpRepr, TcpRepr<'static>) {
         let (mut ip_reply_repr, mut reply_repr) = Self::reply(ip_repr, repr);
-        reply_repr.timestamp = repr
-            .timestamp
-            .and_then(|tcp_ts| tcp_ts.generate_reply(self.tsval_generator, cx.now()))
-            .map(|mut ts| {
-                ts.tsval = ts.tsval.wrapping_add(self.timestamp_offset);
-                ts
-            });
+        reply_repr.timestamp = TcpTimestampRepr::generate_reply_with_tsval(
+            self.tsval_generator,
+            self.last_remote_tsval,
+            cx.now(),
+        )
+        .map(|mut ts| {
+            ts.tsval = ts.tsval.wrapping_add(self.timestamp_offset);
+            ts
+        });
         reply_repr.layout = self.settings.layout;
 
         // From RFC 793:
@@ -1684,6 +1737,8 @@ impl<'a> Socket<'a> {
 
         // Since the sACK option may have changed the length of the payload, update that.
         ip_reply_repr.set_payload_len(reply_repr.buffer_len());
+        self.identify_ipv4(&mut ip_reply_repr);
+        self.advance_ipv4_identification(&ip_reply_repr);
         (ip_reply_repr, reply_repr)
     }
 
@@ -1705,8 +1760,7 @@ impl<'a> Socket<'a> {
             return None;
         }
 
-        // Rate-limit to 1 per second max.
-        self.challenge_ack_timer = cx.now() + Duration::from_secs(1);
+        self.challenge_ack_timer = cx.now() + self.settings.challenge_ack_interval;
 
         Some(self.ack_reply(cx, ip_repr, repr))
     }
@@ -2740,7 +2794,10 @@ impl<'a> Socket<'a> {
 
         let is_keep_alive = if self.timer.should_keep_alive(cx.now()) && repr.is_empty() {
             repr.seq_number = repr.seq_number - 1;
-            repr.payload = b"\x00"; // RFC 1122 says we should do this
+            repr.payload = match self.settings.keep_alive_payload {
+                KeepAlivePayload::Empty => &[],
+                KeepAlivePayload::OneByte => b"\x00",
+            };
             true
         } else {
             false
@@ -2790,7 +2847,15 @@ impl<'a> Socket<'a> {
 
         // Advance send state only after the device accepts the packet.
         ip_repr.set_payload_len(repr.buffer_len());
+        self.identify_ipv4(&mut ip_repr);
+        let increment_id = !matches!(
+            self.state,
+            State::Listen | State::SynReceived | State::TimeWait
+        ) && matches!(ip_repr, IpRepr::Ipv4(_));
         emit(cx, (ip_repr, repr))?;
+        if increment_id && let Some(id) = &mut self.ipv4_identification {
+            *id = id.wrapping_add(1);
+        }
 
         self.pending_fast_retransmit = false;
         self.local_seq_max = self.local_seq_max.max(repr.seq_number + repr.segment_len());
@@ -2944,6 +3009,7 @@ pub(crate) mod test {
     };
 
     const SEND_IP_TEMPL: IpRepr = IpReprIpvX(IpvXRepr {
+        identification: 0,
         options: crate::wire::Ipv4OptionBytes::EMPTY,
         wire_dst: None,
         src_addr: LOCAL_ADDR,
@@ -3022,6 +3088,7 @@ pub(crate) mod test {
         socket.cx.set_now(timestamp);
 
         let ip_repr = IpReprIpvX(IpvXRepr {
+            identification: 0,
             options: crate::wire::Ipv4OptionBytes::EMPTY,
             wire_dst: None,
             src_addr: REMOTE_ADDR,
@@ -3955,6 +4022,7 @@ pub(crate) mod test {
         let mut s = socket_established();
         s.set_segment_options(Box::new(AskOn254));
         let ip_repr = IpReprIpvX(IpvXRepr {
+            identification: 0,
             options: crate::wire::Ipv4OptionBytes::EMPTY,
             wire_dst: None,
             src_addr: REMOTE_ADDR,
@@ -4232,6 +4300,7 @@ pub(crate) mod test {
         let mut s = socket_established();
         let seen = stamped(&mut s, false);
         let ip_repr = IpReprIpvX(IpvXRepr {
+            identification: 0,
             options: crate::wire::Ipv4OptionBytes::EMPTY,
             wire_dst: None,
             src_addr: REMOTE_ADDR,
@@ -10453,6 +10522,42 @@ pub(crate) mod test {
         }));
     }
 
+    #[test]
+    fn test_keep_alive_restart_and_empty_payload() {
+        let mut s = socket_established();
+        send!(s, time 50, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            ..SEND_TEMPL
+        });
+        s.settings.keep_alive_payload = KeepAlivePayload::Empty;
+        s.set_keep_alive(Some(Duration::from_millis(100)));
+        s.restart_keep_alive(Instant::from_millis(50));
+        assert_eq!(
+            s.socket.poll_at(&mut s.cx),
+            PollAt::Time(Instant::from_millis(150))
+        );
+        recv_nothing!(s, time 149);
+        recv!(s, time 150, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &[],
+            ..RECV_TEMPL
+        }));
+        send!(s, time 175, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            ..SEND_TEMPL
+        });
+        assert_eq!(
+            s.socket.poll_at(&mut s.cx),
+            PollAt::Time(Instant::from_millis(275))
+        );
+        s.set_keep_alive(None);
+        s.restart_keep_alive(Instant::from_millis(200));
+        recv_nothing!(s, time 275);
+    }
+
     // =========================================================================================//
     // Tests for time-to-live configuration.
     // =========================================================================================//
@@ -11274,6 +11379,7 @@ pub(crate) mod test {
         };
 
         let ip_repr = IpReprIpvX(IpvXRepr {
+            identification: 0,
             options: crate::wire::Ipv4OptionBytes::EMPTY,
             wire_dst: None,
             src_addr: REMOTE_ADDR,
@@ -11285,6 +11391,7 @@ pub(crate) mod test {
         assert!(s.socket.accepts(&mut s.cx, &ip_repr, &tcp_repr));
 
         let ip_repr_wrong_src = IpReprIpvX(IpvXRepr {
+            identification: 0,
             options: crate::wire::Ipv4OptionBytes::EMPTY,
             wire_dst: None,
             src_addr: OTHER_ADDR,
@@ -11296,6 +11403,7 @@ pub(crate) mod test {
         assert!(!s.socket.accepts(&mut s.cx, &ip_repr_wrong_src, &tcp_repr));
 
         let ip_repr_wrong_dst = IpReprIpvX(IpvXRepr {
+            identification: 0,
             options: crate::wire::Ipv4OptionBytes::EMPTY,
             wire_dst: None,
             src_addr: REMOTE_ADDR,

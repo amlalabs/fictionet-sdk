@@ -267,7 +267,9 @@ fn syn_ack_bytes_offsets_and_repeated_syn() {
             &options,
         ));
         let second = receive(&mut raw, &cx).await;
-        assert_ne!(timestamp(&second), ts);
+        assert_eq!(timestamp(&second), ts);
+        raw.send(packet("10.0.0.3:1000".parse()?, local, 100, 0, 2, &options));
+        assert_ne!(timestamp(&receive(&mut raw, &cx).await), ts);
         raw.send(packet(
             SocketAddr::new(peer.ip(), 1002),
             local,
@@ -388,21 +390,16 @@ fn cookie_connection_restores_timestamp_and_window_scale() {
         let peer: SocketAddr = "10.0.0.2:1000".parse()?;
         let server = tcp::endpoint_with(&cx, side, local.ip(), linux::tcp().backlog(1));
         let mut listener = server.listen(80)?;
-        raw.send(packet(peer, local, 100, 0, 2, &[]));
-        receive(&mut raw, &cx).await;
+        let options = [
+            2, 4, 5, 180, 4, 2, 8, 10, 0, 0, 0, 9, 0, 0, 0, 0, 1, 3, 3, 7,
+        ];
+        raw.send(packet(peer, local, 100, 0, 2, &options));
+        let stateful = timestamp(&receive(&mut raw, &cx).await);
         let peer = SocketAddr::new(peer.ip(), 1001);
-        raw.send(packet(
-            peer,
-            local,
-            100,
-            0,
-            2,
-            &[
-                2, 4, 5, 180, 4, 2, 8, 10, 0, 0, 0, 9, 0, 0, 0, 0, 1, 3, 3, 7,
-            ],
-        ));
+        raw.send(packet(peer, local, 100, 0, 2, &options));
         let syn_ack = receive(&mut raw, &cx).await;
         let ts = timestamp(&syn_ack);
+        assert!(stateful.wrapping_sub(ts) < 64);
         let mut options = vec![1, 1, 8, 10];
         options.extend_from_slice(&10u32.to_be_bytes());
         options.extend_from_slice(&ts.to_be_bytes());
@@ -494,7 +491,9 @@ fn time_wait_expires_after_sixty_seconds() {
         assert_eq!(fin[13] & 1, 1);
         let fin = packet(peer, local, 101, next.wrapping_add(1), 17, &[]);
         raw.send(fin.clone());
-        assert_eq!(receive(&mut raw, &cx).await[13], 16);
+        let ack = raw.recv(&cx).await?;
+        assert_eq!(Header::parse_whole(&ack.0).unwrap().payload(&ack.0)[13], 16);
+        assert_eq!(&ack.0[4..6], &[0, 0]);
         cx.sleep(Duration::from_secs(59)).await?;
         raw.send(fin.clone());
         assert_eq!(receive(&mut raw, &cx).await[13], 16);

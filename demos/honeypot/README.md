@@ -7,31 +7,45 @@ SYN retransmissions separately from MPTCP connections that send no data.
 The honeypot contains no exploit code.
 
 Nothing in the world is a real kernel. The server is Fictionet's TCP stack
-and a few lines of world code, so an attempt that would take over a vulnerable
-Linux host only gets logged here.
+and world code, and it never executes client commands. The deployment host
+still needs a fixed kernel: disabling MPTCP does not protect ordinary IPv4
+TCP listeners.
 
 ## What the server presents
 
 One host at a public IPv4 address (`--address`), and at a public IPv6
-address too when one is given (`--address-v6`), with an MPTCP listener on each
-open port. Both addresses serve the same ports, and the log has the same
+address too when one is given (`--address-v6`). Caddy's HTTP ports accept MPTCP;
+SSH uses ordinary TCP. Both addresses serve the same ports, and the log has the same
 lines for both. The IPv4 address is always there, because the flaw is in
 IPv4 connection setup. The IPv6 address is optional, as many servers have
 none. The internet comes in by one attachment that carries both families,
 from `0.0.0.0/0` and `::/0` unless `--internet` narrows one of them.
 
 - **SSH** (`--ssh`, 22 by default): the identification line of OpenSSH 9.6p1
-  on Ubuntu 24.04. It reads whatever comes back until the client leaves or
+  on Ubuntu 24.04, followed by its key exchange proposal after the client's
+  version line. It reads whatever comes back until the client leaves or
   120 seconds pass, as sshd's `LoginGraceTime` does. No keepalives: on
   Linux sshd's first comes after two hours idle, so a client sees none.
-- **HTTP** (`--http`, 80 by default): nginx's default page for one request,
-  then it closes. No keepalives, as nginx asks for none.
+- **HTTP** (`--http`, 80 by default): the official Caddy 2.11.9 package's page,
+  with MPTCP, persistent HTTP/1.1, a 300-second idle timeout and 15-second TCP
+  keepalives. It has no request-count limit per connection. The untouched
+  package site has no HTTPS listener on 443.
+- **nginx comparison** (`--http-profile nginx`): Ubuntu's nginx page over
+  ordinary TCP, with up to 1,000 requests, 75 seconds between requests and no
+  TCP keepalives. The default profile is `--http-profile caddy`.
+
+The transport profile targets Ubuntu 24.04's Linux 6.8 kernel.
+Listener backlogs match Ubuntu 24.04: 4,096 for systemd's `ssh.socket`
+and Caddy, capped by the kernel's `net.core.somaxconn`; nginx uses 511.
+The unmodified [Caddy page](src/caddy.html) comes from
+[caddyserver/dist](https://github.com/caddyserver/dist/tree/master/welcome),
+under the [Apache License 2.0](../../LICENSE-APACHE).
 
 The MPTCP listener follows RFC 8684, and reads MPTCP options as Linux does:
 an option Linux ignores counts for nothing, and of several that count the
 last one wins.
 
-Its SYN-ACK carries IPv4 Record Route, Timestamp, and reversed source-route
+Both ordinary and MPTCP SYN-ACKs carry IPv4 Record Route, Timestamp, and reversed source-route
 options through the Linux echo helper in `fictionet-extras`. The core codec
 and listener hook contain only protocol representation and plumbing.
 
@@ -131,9 +145,13 @@ first, so both files hold whole records.
 ### Bursts are a heuristic
 
 An `ip_options_retransmit` record means a SYN with IPv4 options was followed
-by the same initial sequence number on the same attachment and connection tuple while its handshake remained
-pending. An observed SYN-ACK does not complete that handshake; its matching
-third ACK does. An `mptcp_no_data` record independently reports an MP_CAPABLE
+by the same initial sequence number on the same attachment and connection
+tuple. Its typed `phase` distinguishes `offered`, `pending` and `completed`:
+no answer, a matching SYN-ACK, or the matching third ACK observed. First and
+previous SYN times, repeat gap, SYN-ACK time, completion time and time since
+completion preserve proximity without inventing an attack threshold. Correlation
+expires at the original 63-second first-SYN deadline; a close or a new initial
+sequence number on that tuple ends it. An `mptcp_no_data` record independently reports an MP_CAPABLE
 offer that closed or reached the existing 63 second observation timeout
 without inbound payload during that observation interval. Its `completed`
 field distinguishes attempts whose handshake ACK was observed. Neither
@@ -141,7 +159,8 @@ signal proves exploitation.
 
 A burst is at least `--burst-syns` SYNs (8 by default), or that many SYNs
 with MP_JOIN, from one source within `--burst-window-ms` (100 by default).
-Every SYN retains its typed IPv4 and TCP options regardless of these signals.
+Every SYN retains its typed IPv4 and TCP options regardless of these signals;
+`ipv4_options_raw` also preserves the complete IPv4 option bytes and padding.
 
 ### Hostile input
 
@@ -152,21 +171,21 @@ to 63 seconds, the listener's handshake timeout, and an MPTCP token only while
 its connection is open. Burst, answer and probe state expires even when traffic is
 quiet, so a flood from spoofed addresses leaves no permanent state.
 
-Spoofed SYNs cannot shut real attackers out either. Each port holds 4,096
-handshakes. Past that, the server answers with SYN cookies, as Linux does, and
+Spoofed SYNs cannot shut real attackers out either. SSH and Caddy hold 4,096
+pending handshakes each; the nginx profile holds 511. Past that, the server answers with SYN cookies and
 keeps nothing until the ACK that returns one. A handshake whose last ACK never
 comes gets six SYN-ACKs, at 0, 1, 3, 7, 15 and 31 seconds, and is dropped at 63
 seconds without a RST, as on Linux. A closed connection whose client never
 closes its side is forgotten a minute after the client acknowledged the
 server's FIN, whatever the client sends meanwhile, as on Linux.
 
-A client cannot connect in another address's name. Each connection's initial
-sequence number is a keyed hash of its addresses and ports plus a clock, as
-Linux makes it (RFC 6528), so the numbers a client sees on its own
-connections tell it nothing about another's. The SYN cookies have a key of
-their own. So the segments of a connection whose handshake completed come
-from the address they name. A SYN needs no handshake, so the source of a
-`syn` or `burst` line is only what the sender wrote, and may be spoofed.
+Each connection's initial sequence number is a keyed hash of its addresses
+and ports plus a clock, as Linux makes it (RFC 6528). SYN cookies have a key
+of their own. These mechanisms make blind spoofing harder. A matching
+handshake ACK provides evidence of return-path reachability, not
+authentication or proof of the sender's identity. A SYN needs no handshake,
+so the source of a `syn` or `burst` line is only what the sender wrote and
+may be spoofed.
 
 The internet reaches the server and nothing else. Its packets for any other
 address are logged and dropped, and the network drops those whose source
@@ -175,47 +194,6 @@ cannot draw answers to the sandbox. It drops those from addresses no router
 forwards from, such as loopback, multicast or broadcast addresses, and the
 server answers no SYN from an address that cannot be one host's, as Linux
 answers none.
-
-## Running it locally
-
-This is the internal test: the same world, with a sandbox attached the normal
-way.
-
-Build the world and the attach command:
-
-```sh
-cargo build -p honeypot-world -p fictionet-cli
-```
-
-Start the world. It prints its address and where it logs:
-
-```sh
-target/debug/honeypot --world unix:/tmp/honeypot.sock \
-    --log /tmp/honeypot.jsonl --pcap /tmp/honeypot.pcapng
-```
-
-Attach a sandbox in a new network namespace. The sandboxes' subnet is
-`10.0.0.0/24`, with the gateway and DNS at `10.0.0.1`:
-
-```sh
-sudo ip netns add agent
-sudo target/debug/fictionet attach tun --world unix:/tmp/honeypot.sock \
-    --name agent --netns /run/netns/agent \
-    --ip-addr 10.0.0.2/24 --gateway 10.0.0.1 --dns 10.0.0.1
-```
-
-Anything in that namespace now reaches the server at `203.0.113.10`, and
-nothing else:
-
-```sh
-sudo ip netns exec agent nc 203.0.113.10 22
-sudo ip netns exec agent curl http://203.0.113.10/
-```
-
-Run the agent under test in the same namespace. Its every packet is in
-`/tmp/honeypot.pcapng`, and its SYNs, payloads and bursts are in
-`/tmp/honeypot.jsonl`, named `agent`. Linux clients send MP_CAPABLE when the
-program opens an MPTCP socket, or through `mptcpize run`.
 
 ## A NIC of its own
 
@@ -252,8 +230,13 @@ AWS and Google Cloud. `--world` is not used: there is no socket to attach
 to.
 
 `ethernet.jsonl` has one line per frame, both ways, before the world reads
-it: `direction` (`in` or `out`), `at_us`, the frame in hex as `bytes`, and
-`lost`, how many lines the file could not take since the last one it did.
+it: `direction` (`in` or `out`), `at_us`, the frame in hex as `bytes`,
+`lost`, how many lines the file could not take since the last one it did,
+`rx_queue_dropped`, frames discarded by the pump's full receive queue,
+and `tx_queue_dropped`, frames refused by the full transmit queue
+since the last accepted log record. Both counts survive a refused log write.
+`nic_rx_dropped` is null: the driver does not expose device or backend loss
+counters, so those losses cannot be inferred from the software queue count.
 So it keeps frames the world ignores: VLAN tags, unknown EtherTypes,
 malformed headers and Ethernet padding. `honeypot.pcapng` and
 `honeypot.jsonl` are as above.

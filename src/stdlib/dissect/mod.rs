@@ -856,43 +856,27 @@ fn flag_names(flags: u8) -> Vec<&'static str> {
         .collect()
 }
 
-fn tcp_options(o: &[u8]) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < o.len() {
-        match o[i] {
-            0 => break,
-            1 => i += 1,
-            kind => {
-                let Some(&len) = o.get(i + 1) else { break };
-                let len = usize::from(len);
-                if len < 2 || i + len > o.len() {
-                    break;
-                }
-                let v = &o[i + 2..i + len];
-                out.push(match (kind, v.len()) {
-                    (2, 2) => {
-                        let Some(mss) = be16(v, 0) else {
-                            break;
-                        };
-                        format!("MSS={mss}")
+fn tcp_options(bytes: &[u8]) -> Vec<String> {
+    use fictionet::stdlib::network::tcp::{OptionRead, TcpOption, read_options};
+    read_options(bytes)
+        .filter_map(|read| {
+            Some(match read {
+                OptionRead::End { .. } => return None,
+                OptionRead::Malformed { bytes } => format!("malformed option {}", bytes[0]),
+                OptionRead::Option { value, .. } => match value {
+                    TcpOption::NoOperation => return None,
+                    TcpOption::MaxSegmentSize(mss) => format!("MSS={mss}"),
+                    TcpOption::WindowScale(shift) => format!("WS={}", 1u32 << shift.min(14)),
+                    TcpOption::SackPermitted => "SACK_PERM".to_owned(),
+                    TcpOption::Sack(blocks) => format!("SACK({} blocks)", blocks.len()),
+                    TcpOption::Timestamps { tsval, tsecr } => {
+                        format!("TSval={tsval} TSecr={tsecr}")
                     }
-                    (3, 1) => format!("WS={}", 1u32 << v[0].min(14)),
-                    (4, 0) => "SACK_PERM".to_owned(),
-                    (5, _) => format!("SACK({} blocks)", v.len() / 8),
-                    (8, 8) => {
-                        let (Some(value), Some(echo)) = (be32(v, 0), be32(v, 4)) else {
-                            break;
-                        };
-                        format!("TSval={value} TSecr={echo}")
-                    }
-                    _ => format!("option {kind}"),
-                });
-                i += len;
-            }
-        }
-    }
-    out
+                    TcpOption::Unknown { kind, .. } => format!("option {kind}"),
+                },
+            })
+        })
+        .collect()
 }
 
 fn udp(

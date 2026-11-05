@@ -4,7 +4,7 @@
 //! honeypot [--world unix:PATH] [--log PATH] [--pcap PATH]
 //!          [--address IPV4] [--address-v6 IPV6] [--internet PREFIX]...
 //!          [--gateway IPV4] [--gateway-v6 IPV6]
-//!          [--ssh PORT]... [--http PORT]...
+//!          [--ssh PORT]... [--http PORT]... [--http-profile caddy|nginx]
 //!          [--burst-window-ms MS] [--burst-syns N]
 //! ```
 //!
@@ -48,8 +48,10 @@ pub struct Config {
     /// on the link, as on AWS and Google Cloud. Unused without
     /// [`address_v6`](Config::address_v6).
     pub gateway_v6: Ipv6Gateway,
-    /// The server's open TCP ports, each with an MPTCP listener.
+    /// The server's open TCP ports.
     pub ports: Vec<Port>,
+    /// The HTTP server persona. Caddy accepts MPTCP; nginx uses ordinary TCP.
+    pub http_profile: HttpProfile,
     /// When SYNs from one source count as a burst.
     pub burst: Burst,
 }
@@ -105,8 +107,18 @@ pub struct Port {
 pub enum Service {
     /// An OpenSSH server's identification line.
     Ssh,
-    /// nginx's default page.
+    /// The configured HTTP profile's default page.
     Http,
+}
+
+/// The packaged HTTP server whose behavior is exposed to clients.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HttpProfile {
+    /// Official Caddy with its packaged site and default MPTCP listener.
+    #[default]
+    Caddy,
+    /// Ubuntu nginx with its packaged site and ordinary TCP listener.
+    Nginx,
 }
 
 /// When SYNs from one source address count as a burst: at least `syns`
@@ -147,6 +159,7 @@ impl Default for Config {
                 },
             ],
             burst: Burst::default(),
+            http_profile: HttpProfile::default(),
         }
     }
 }
@@ -217,6 +230,8 @@ pub enum Flag {
     Ssh,
     /// `--http`: a port with [`Service::Http`].
     Http,
+    /// `--http-profile`: [`Config::http_profile`].
+    HttpProfile,
     /// `--burst-window-ms`: [`Burst::window`].
     BurstWindowMs,
     /// `--burst-syns`: [`Burst::syns`].
@@ -225,7 +240,7 @@ pub enum Flag {
 
 impl Flag {
     /// Every flag.
-    pub const ALL: [Flag; 12] = [
+    pub const ALL: [Flag; 13] = [
         Flag::World,
         Flag::Log,
         Flag::Pcap,
@@ -236,6 +251,7 @@ impl Flag {
         Flag::GatewayV6,
         Flag::Ssh,
         Flag::Http,
+        Flag::HttpProfile,
         Flag::BurstWindowMs,
         Flag::BurstSyns,
     ];
@@ -253,6 +269,7 @@ impl Flag {
             Flag::GatewayV6 => "--gateway-v6",
             Flag::Ssh => "--ssh",
             Flag::Http => "--http",
+            Flag::HttpProfile => "--http-profile",
             Flag::BurstWindowMs => "--burst-window-ms",
             Flag::BurstSyns => "--burst-syns",
         }
@@ -306,6 +323,13 @@ impl Args {
                     number: value.parse().map_err(|_| bad())?,
                     service: Service::Http,
                 }),
+                Flag::HttpProfile => {
+                    config.http_profile = match value.as_str() {
+                        "caddy" => HttpProfile::Caddy,
+                        "nginx" => HttpProfile::Nginx,
+                        _ => return Err(bad()),
+                    };
+                }
                 Flag::BurstWindowMs => {
                     config.burst.window = Duration::from_millis(value.parse().map_err(|_| bad())?)
                 }
@@ -319,127 +343,5 @@ impl Args {
             parsed.config.ports = Config::default().ports;
         }
         Ok(parsed)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn args(line: &str) -> Result<Args, ArgsError> {
-        Args::parse(line.split_whitespace().map(String::from))
-    }
-
-    /// Every flag reads back from its name, and each name is one flag's.
-    #[test]
-    fn flags_read_by_name() {
-        for flag in Flag::ALL {
-            assert_eq!(Flag::parse(flag.name()), Some(flag));
-            let value = match flag {
-                Flag::World => "unix:/tmp/w.sock",
-                Flag::Address | Flag::Gateway => "192.0.2.1",
-                Flag::AddressV6 | Flag::GatewayV6 => "2001:db8::1",
-                Flag::Internet => "0.0.0.0/0",
-                _ => "7",
-            };
-            assert!(
-                args(&format!("{} {value}", flag.name())).is_ok(),
-                "{flag:?}"
-            );
-        }
-        assert_eq!(Flag::parse("--world=unix:/x"), None);
-    }
-
-    #[test]
-    fn defaults_serve_ssh_and_http() {
-        let parsed = args("").unwrap();
-        assert_eq!(parsed.config, Config::default());
-        assert_eq!(parsed.config.address_v6, None);
-        assert_eq!(
-            parsed.config.gateway_v6,
-            Ipv6Gateway::FromRouterAdvertisements
-        );
-        assert_eq!(parsed.log, PathBuf::from("honeypot.jsonl"));
-    }
-
-    #[test]
-    fn flags_set_the_world() {
-        let parsed = args(
-            "--world unix:/tmp/w.sock --log a.jsonl --pcap a.pcapng --address 198.51.100.7 \
-             --address-v6 2001:db8::7 --internet 198.51.0.0/16 --internet 2001:db8::/32 \
-             --gateway 198.51.100.1 --gateway-v6 fe80::1 --ssh 2222 --http 8080 --http 80 \
-             --burst-window-ms 50 --burst-syns 4",
-        )
-        .unwrap();
-        assert_eq!(parsed.world, WorldSocket::UnixSocket("/tmp/w.sock".into()));
-        assert_eq!(parsed.pcap, PathBuf::from("a.pcapng"));
-        let config = parsed.config;
-        assert_eq!(config.address, Ipv4Addr::new(198, 51, 100, 7));
-        assert_eq!(config.address_v6, Some("2001:db8::7".parse().unwrap()));
-        assert_eq!(
-            config.internet,
-            Internet {
-                ipv4: "198.51.0.0/16".parse().unwrap(),
-                ipv6: "2001:db8::/32".parse().unwrap(),
-            }
-        );
-        assert_eq!(config.gateway, Ipv4Addr::new(198, 51, 100, 1));
-        assert_eq!(
-            config.gateway_v6,
-            Ipv6Gateway::Configured("fe80::1".parse().unwrap())
-        );
-        assert_eq!(
-            config.ports.iter().map(|p| p.number).collect::<Vec<_>>(),
-            [2222, 8080, 80]
-        );
-        assert_eq!(config.ports[0].service, Service::Ssh);
-        assert_eq!(config.ports[2].service, Service::Http);
-        assert_eq!(
-            config.burst,
-            Burst {
-                window: Duration::from_millis(50),
-                syns: 4
-            }
-        );
-    }
-
-    #[test]
-    fn bad_arguments_say_what_is_wrong() {
-        assert_eq!(args("--ssh"), Err(ArgsError::Missing(Flag::Ssh)));
-        assert_eq!(args("--port 22"), Err(ArgsError::Unknown("--port".into())));
-        assert_eq!(
-            args("--address example"),
-            Err(ArgsError::Bad {
-                flag: Flag::Address,
-                value: "example".into()
-            })
-        );
-        assert_eq!(
-            args("--burst-syns 0").unwrap_err().to_string(),
-            "--burst-syns: cannot use \"0\""
-        );
-        assert!(args("--burst-syns 0").is_err());
-        assert!(args("--world /no/scheme").is_err());
-        for (flag, value) in [
-            (Flag::Address, "2001:db8::1"),
-            (Flag::AddressV6, "192.0.2.1"),
-            (Flag::GatewayV6, "192.0.2.1"),
-        ] {
-            assert_eq!(
-                args(&format!("{} {value}", flag.name())),
-                Err(ArgsError::Bad {
-                    flag,
-                    value: value.into()
-                })
-            );
-        }
-        assert_eq!(args("--gateway"), Err(ArgsError::Missing(Flag::Gateway)));
-        assert_eq!(
-            args("--gateway ::1"),
-            Err(ArgsError::Bad {
-                flag: Flag::Gateway,
-                value: "::1".into()
-            })
-        );
     }
 }

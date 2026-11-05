@@ -3,7 +3,7 @@
 //! frames over QEMU's socket network.
 
 use std::collections::HashSet;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv6Addr, TcpStream};
 use std::time::Instant;
 
@@ -11,6 +11,7 @@ use fictionet::stdlib::network::ethernet::frame::{self, Frame, Mac};
 use fictionet::stdlib::network::ethernet::host::{
     DELAY_FIRST_PROBE_TIME, MLD_ROBUSTNESS, REACHABLE_TIME,
 };
+use fictionet::stdlib::network::ethernet::stream::Decoder;
 use fictionet::stdlib::network::ip;
 use fictionet::stdlib::protocols::arp;
 use fictionet::stdlib::protocols::mld::{self, RecordType};
@@ -38,6 +39,7 @@ fn router() -> Ipv6Addr {
 /// bytes.
 pub struct Peer<S = TcpStream> {
     stream: S,
+    decoder: Decoder,
     link: LinkState,
 }
 
@@ -73,6 +75,7 @@ impl<S: Read + Write> Peer<S> {
     pub fn new(stream: S) -> Peer<S> {
         Peer {
             stream,
+            decoder: Decoder::new(),
             link: LinkState::default(),
         }
     }
@@ -83,17 +86,35 @@ impl<S: Read + Write> Peer<S> {
         Ok(())
     }
 
+    /// Starts observing a reopened device without discarding buffered frames.
+    pub fn reset_link(&mut self) {
+        self.link = LinkState::default();
+    }
+
     /// The next frame from the honeypot.
     pub fn recv(&mut self) -> Result<Vec<u8>> {
-        let mut size = [0; 4];
-        self.stream.read_exact(&mut size)?;
-        let size = u32::from_be_bytes(size) as usize;
-        if !(frame::HEADER..=2036).contains(&size) {
-            return Err("invalid honeypot frame length".into());
+        loop {
+            if let Some(bytes) = self.decoder.next_frame().map_err(|length| {
+                format!("QEMU frame length {} exceeds the stream buffer", length.0)
+            })? {
+                if !(frame::HEADER..=2036).contains(&bytes.len()) {
+                    return Err("invalid honeypot frame length".into());
+                }
+                return Ok(bytes.to_vec());
+            }
+            match self.stream.read(self.decoder.spare()) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "QEMU Ethernet stream closed",
+                    )
+                    .into());
+                }
+                Ok(n) => self.decoder.filled(n),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error.into()),
+            }
         }
-        let mut bytes = vec![0; size];
-        self.stream.read_exact(&mut bytes)?;
-        Ok(bytes)
     }
 
     /// The first frame `want` takes, answering the honeypot's ARP and
@@ -505,167 +526,4 @@ pub fn ssh6(peer: &mut Peer) -> Result {
     peer.send(&segment6(22, 1001, acked, 0x04, &[]))?;
     println!("Honeypot served the SSH banner at its IPv6 address through the advertised router");
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use std::io::Cursor;
-    use std::time::Duration;
-
-    use super::*;
-
-    /// The honeypot's side of the socket, scripted: the frames it sends,
-    /// and what the peer writes back.
-    struct Script {
-        from_honeypot: Cursor<Vec<u8>>,
-        to_honeypot: Vec<u8>,
-    }
-
-    impl Read for Script {
-        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            self.from_honeypot.read(buf)
-        }
-    }
-
-    impl Write for Script {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.to_honeypot.extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    /// A peer past [`start_link`] whose gateway answered `answered` ago and
-    /// whose router advertised itself `advertised` ago, reading `frames`.
-    fn peer(answered: Duration, advertised: Duration, frames: &[Vec<u8>]) -> Peer<Script> {
-        let mut peer = Peer::new(Script {
-            from_honeypot: Cursor::new(written(frames)),
-            to_honeypot: Vec::new(),
-        });
-        let now = Instant::now();
-        peer.link.gateway_probe = Some(now - answered + REACHABLE_TIME + DELAY_FIRST_PROBE_TIME);
-        peer.link.router_probe = Some(now - advertised + DELAY_FIRST_PROBE_TIME);
-        peer.link.reports = MLD_ROBUSTNESS;
-        peer
-    }
-
-    /// A frame that is not link-layer housekeeping: what the test waits for.
-    fn data() -> Vec<u8> {
-        let packet = ip::packet(ADDRESS.into(), "192.0.2.1".parse().unwrap(), 17, &[0; 8]);
-        frame::frame(GATEWAY_MAC, HONEYPOT_MAC, frame::IPV4, &packet.0)
-    }
-
-    /// The honeypot's link-layer message `m` from its link-local address.
-    fn nd(dst: Mac, source: Ipv6Addr, destination: Ipv6Addr, m: Message) -> Vec<u8> {
-        let packet = m.packet(source, destination).unwrap();
-        frame::frame(dst, HONEYPOT_MAC, frame::IPV6, &packet)
-    }
-
-    fn router_probe() -> Vec<u8> {
-        let ns = Message::NeighborSolicitation(NeighborSolicitation {
-            target: router(),
-            options: vec![NdOption::SourceLinkLayer(HONEYPOT_MAC)],
-        });
-        nd(GATEWAY_MAC, frame::link_local(HONEYPOT_MAC), router(), ns)
-    }
-
-    /// Reads up to the data frame, and returns what the peer made of the
-    /// frames before it.
-    fn wait_for_data(peer: &mut Peer<Script>) -> Result<Vec<u8>> {
-        peer.next(|bytes| Ok((bytes == data()).then(|| bytes.to_vec())))
-    }
-
-    const LONG_AGO: Duration = Duration::from_secs(60);
-
-    /// The frames `peer` wrote, as the socket carries them.
-    fn written(frames: &[Vec<u8>]) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        for f in frames {
-            bytes.extend((f.len() as u32).to_be_bytes());
-            bytes.extend(f);
-        }
-        bytes
-    }
-
-    #[test]
-    fn housekeeping_the_timers_allow_is_answered() {
-        // The broadcast request on its way when the reply went out.
-        let late = request_for_gateway(frame::BROADCAST);
-        let mut fresh = peer(Duration::ZERO, Duration::ZERO, &[late, data()]);
-        assert_eq!(wait_for_data(&mut fresh).unwrap(), data());
-        assert_eq!(fresh.stream.to_honeypot, written(&[arp_reply()]));
-        // Checks of a gateway and a router gone stale.
-        let probes = [request_for_gateway(GATEWAY_MAC), router_probe(), data()];
-        let mut stale = peer(LONG_AGO, LONG_AGO, &probes);
-        assert_eq!(wait_for_data(&mut stale).unwrap(), data());
-        assert_eq!(
-            stale.stream.to_honeypot,
-            written(&[arp_reply(), router_advertises_itself(Some(HONEYPOT_MAC))])
-        );
-    }
-
-    #[test]
-    fn a_second_late_broadcast_request_is_an_error() {
-        let late = request_for_gateway(frame::BROADCAST);
-        let mut peer = peer(LONG_AGO, LONG_AGO, &[late.clone(), late, data()]);
-        assert!(wait_for_data(&mut peer).is_err());
-    }
-
-    #[test]
-    fn a_gateway_probe_before_the_reply_goes_stale_is_an_error() {
-        let fresh = REACHABLE_TIME;
-        let mut peer = peer(fresh, LONG_AGO, &[request_for_gateway(GATEWAY_MAC), data()]);
-        assert!(wait_for_data(&mut peer).is_err());
-    }
-
-    #[test]
-    fn a_router_probe_before_the_delay_is_an_error() {
-        let mut peer = peer(LONG_AGO, Duration::ZERO, &[router_probe(), data()]);
-        assert!(wait_for_data(&mut peer).is_err());
-    }
-
-    #[test]
-    fn startup_messages_after_startup_are_errors() {
-        let link_local = frame::link_local(HONEYPOT_MAC);
-        let rs = nd(
-            frame::multicast_mac(ndp::ALL_ROUTERS),
-            link_local,
-            ndp::ALL_ROUTERS,
-            Message::RouterSolicitation(ndp::RouterSolicitation {
-                options: vec![NdOption::SourceLinkLayer(HONEYPOT_MAC)],
-            }),
-        );
-        let group = ndp::solicited_node(ADDRESS6);
-        let dad = nd(
-            frame::multicast_mac(group),
-            Ipv6Addr::UNSPECIFIED,
-            group,
-            Message::NeighborSolicitation(NeighborSolicitation {
-                target: ADDRESS6,
-                options: vec![],
-            }),
-        );
-        let report = mld::Report {
-            records: [link_local, ADDRESS6]
-                .map(|a| mld::Record {
-                    kind: RecordType::ChangeToExclude,
-                    group: ndp::solicited_node(a),
-                    sources: vec![],
-                })
-                .into(),
-        };
-        let report = frame::frame(
-            frame::multicast_mac(mld::ALL_MLDV2_ROUTERS),
-            HONEYPOT_MAC,
-            frame::IPV6,
-            &report.packet(link_local).unwrap(),
-        );
-        for extra in [rs, dad, report] {
-            let mut peer = peer(LONG_AGO, LONG_AGO, &[extra, data()]);
-            assert!(wait_for_data(&mut peer).is_err());
-        }
-    }
 }

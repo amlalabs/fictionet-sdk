@@ -28,9 +28,32 @@
 //! some threshold.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::Arc;
 
 use fictionet::Packet;
 use fictionet::stdlib::network::ip::{self, Fields, Header, protocol};
+
+/// Constructs IPv4 header fields from reply source, reply destination,
+/// request TOS, and whether the reply is an error rather than an echo.
+pub type Ipv4Fields = Arc<dyn Fn(Ipv4Addr, Ipv4Addr, u8, bool) -> Fields + Send + Sync>;
+
+/// Host choices shared by echo replies and transport errors.
+#[derive(Clone, Default)]
+pub struct Options {
+    /// Accept IPv4 echo requests with a nonzero code and echo that code.
+    pub echo_nonzero_code: bool,
+    /// Header policy for IPv4 replies. IPv6 retains the default behavior.
+    pub ipv4_fields: Option<Ipv4Fields>,
+}
+
+impl Options {
+    fn fields(&self, from: IpAddr, to: IpAddr, tos: u8, error: bool, default: Fields) -> Fields {
+        match (&self.ipv4_fields, from, to) {
+            (Some(make), IpAddr::V4(from), IpAddr::V4(to)) => make(from, to, tos, error),
+            _ => default,
+        }
+    }
+}
 
 /// The reply to `packet`, if it is an echo request (a ping) sent to `addr`.
 ///
@@ -49,42 +72,59 @@ use fictionet::stdlib::network::ip::{self, Fields, Header, protocol};
 /// the packet, gets no reply; `split_protocols` drops those before they get
 /// here, and answers the ones RFC 8200 asks it to.
 pub fn echo_reply(packet: &Packet, addr: IpAddr) -> Option<Packet> {
-    let bytes = &packet.0;
-    let ip = Header::parse_whole(bytes)?;
-    if ip.dst != addr || !is_one_host(ip.src) {
-        return None;
+    Options::default().echo_reply(packet, addr)
+}
+
+impl Options {
+    /// Builds an echo reply using this host's receive and header choices.
+    pub fn echo_reply(&self, packet: &Packet, addr: IpAddr) -> Option<Packet> {
+        let bytes = &packet.0;
+        let ip = Header::parse_whole(bytes)?;
+        if ip.dst != addr || !is_one_host(ip.src) {
+            return None;
+        }
+        let icmp = ip.payload(bytes);
+        // Type 8 is an echo request over IPv4, 0 its reply; 128 and 129 over
+        // IPv6. The checksum covers a pseudo-header only over IPv6.
+        let (proto, request, reply, sum) = match addr {
+            IpAddr::V4(_) => (protocol::ICMP, 8, 0, ip::checksum(icmp)),
+            IpAddr::V6(_) => (
+                protocol::ICMPV6,
+                128,
+                129,
+                ip::transport_checksum(ip.src, addr, protocol::ICMPV6, icmp),
+            ),
+        };
+        if ip.protocol != proto
+            || icmp.len() < 8
+            || icmp[0] != request
+            || (icmp[1] != 0 && !(addr.is_ipv4() && self.echo_nonzero_code))
+            || sum != 0
+        {
+            return None;
+        }
+        let mut message = icmp.to_vec();
+        message[0] = reply;
+        set_checksum(&mut message, addr, ip.src);
+        // Default IPv4 fields echo the request; a host policy may replace them.
+        let fields = self.fields(
+            addr,
+            ip.src,
+            bytes[1],
+            false,
+            Fields {
+                id: u16::from_be_bytes([bytes[4], bytes[5]]),
+                tos: bytes[1],
+                dont_fragment: false,
+                ..Fields::default()
+            },
+        );
+        let mut out = ip::packet_with(addr, ip.src, proto, fields, &message);
+        if addr.is_ipv6() {
+            out.0[..4].copy_from_slice(&bytes[..4]);
+        }
+        Some(out)
     }
-    let icmp = ip.payload(bytes);
-    // Type 8 is an echo request over IPv4, 0 its reply; 128 and 129 over
-    // IPv6. The checksum covers a pseudo-header only over IPv6.
-    let (proto, request, reply, sum) = match addr {
-        IpAddr::V4(_) => (protocol::ICMP, 8, 0, ip::checksum(icmp)),
-        IpAddr::V6(_) => (
-            protocol::ICMPV6,
-            128,
-            129,
-            ip::transport_checksum(ip.src, addr, protocol::ICMPV6, icmp),
-        ),
-    };
-    if ip.protocol != proto || icmp.len() < 8 || icmp[0] != request || icmp[1] != 0 || sum != 0 {
-        return None;
-    }
-    let mut message = icmp.to_vec();
-    message[0] = reply;
-    set_checksum(&mut message, addr, ip.src);
-    // The IPv4 identification and type of service, and the IPv6 traffic
-    // class and flow label, as in the request.
-    let fields = Fields {
-        id: u16::from_be_bytes([bytes[4], bytes[5]]),
-        tos: bytes[1],
-        dont_fragment: false,
-        ..Fields::default()
-    };
-    let mut out = ip::packet_with(addr, ip.src, proto, fields, &message);
-    if addr.is_ipv6() {
-        out.0[..4].copy_from_slice(&bytes[..4]);
-    }
-    Some(out)
 }
 
 /// Sets the checksum of an ICMP or ICMPv6 message (bytes 2 and 3) from
@@ -152,44 +192,60 @@ pub fn address_unreachable(packet: &[u8], from: Ipv6Addr) -> Option<Packet> {
 /// - when `from` is not of the packet's family, or the packet cannot be
 ///   read.
 pub fn error(packet: &[u8], from: IpAddr, kind: u8, code: u8, word: u32) -> Option<Packet> {
-    let ip = Header::parse(packet)?;
-    let later = ip.fragment.is_some_and(|f| f.offset != 0);
-    let first = ip.payload(packet).first().copied();
-    let (proto, limit) = match (ip.src, ip.dst, from) {
-        (IpAddr::V4(_), IpAddr::V4(dst), IpAddr::V4(_)) => {
-            if later || !is_one_host(ip.src) {
-                return None;
+    Options::default().error(packet, from, kind, code, word)
+}
+
+impl Options {
+    /// Builds an ICMP error with this host's header choices and [`error`]'s exclusions.
+    pub fn error(
+        &self,
+        packet: &[u8],
+        from: IpAddr,
+        kind: u8,
+        code: u8,
+        word: u32,
+    ) -> Option<Packet> {
+        let ip = Header::parse(packet)?;
+        let later = ip.fragment.is_some_and(|f| f.offset != 0);
+        let first = ip.payload(packet).first().copied();
+        let (proto, limit) = match (ip.src, ip.dst, from) {
+            (IpAddr::V4(_), IpAddr::V4(dst), IpAddr::V4(_)) => {
+                if later || !is_one_host(ip.src) {
+                    return None;
+                }
+                if dst.is_broadcast() || dst.is_multicast() {
+                    return None;
+                }
+                if ip.protocol == protocol::ICMP
+                    && !first.is_some_and(|k| matches!(k, 0 | 8 | 13..=18))
+                {
+                    return None;
+                }
+                (protocol::ICMP, 576 - 28)
             }
-            if dst.is_broadcast() || dst.is_multicast() {
-                return None;
+            (IpAddr::V6(_), IpAddr::V6(dst), IpAddr::V6(_)) => {
+                if !is_one_host(ip.src) || dst.is_multicast() {
+                    return None;
+                }
+                if ip.protocol == protocol::ICMPV6
+                    && !later
+                    && first.is_none_or(|t| t < 128 || (133..=137).contains(&t))
+                {
+                    return None;
+                }
+                (protocol::ICMPV6, 1280 - 48)
             }
-            if ip.protocol == protocol::ICMP && !first.is_some_and(|k| matches!(k, 0 | 8 | 13..=18))
-            {
-                return None;
-            }
-            (protocol::ICMP, 576 - 28)
-        }
-        (IpAddr::V6(_), IpAddr::V6(dst), IpAddr::V6(_)) => {
-            if !is_one_host(ip.src) || dst.is_multicast() {
-                return None;
-            }
-            if ip.protocol == protocol::ICMPV6
-                && !later
-                && first.is_none_or(|t| t < 128 || (133..=137).contains(&t))
-            {
-                return None;
-            }
-            (protocol::ICMPV6, 1280 - 48)
-        }
-        _ => return None,
-    };
-    let quote = &packet[..ip.payload.end.min(limit)];
-    let mut icmp = Vec::with_capacity(8 + quote.len());
-    icmp.extend_from_slice(&[kind, code, 0, 0]);
-    icmp.extend_from_slice(&word.to_be_bytes());
-    icmp.extend_from_slice(quote);
-    set_checksum(&mut icmp, from, ip.src);
-    Some(ip::packet(from, ip.src, proto, &icmp))
+            _ => return None,
+        };
+        let quote = &packet[..ip.payload.end.min(limit)];
+        let mut icmp = Vec::with_capacity(8 + quote.len());
+        icmp.extend_from_slice(&[kind, code, 0, 0]);
+        icmp.extend_from_slice(&word.to_be_bytes());
+        icmp.extend_from_slice(quote);
+        set_checksum(&mut icmp, from, ip.src);
+        let fields = self.fields(from, ip.src, packet[1], true, Fields::default());
+        Some(ip::packet_with(from, ip.src, proto, fields, &icmp))
+    }
 }
 
 /// Whether `src` can be the source of one host: not the unspecified

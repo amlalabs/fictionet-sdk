@@ -141,6 +141,7 @@ fn tcp_listen_drops_unspecified_src() {
     let reply = iface.inner.process_tcp(
         &mut sockets,
         IpRepr::Ipv4(Ipv4Repr {
+            identification: 0,
             options: crate::wire::Ipv4OptionBytes::EMPTY,
             wire_dst: None,
             src_addr: Ipv4Address::UNSPECIFIED,
@@ -195,6 +196,7 @@ fn ipv4_fragments_are_dropped() {
         let (mut iface, mut sockets, mut device) = setup();
         let mut bytes = syn_bytes(
             Ipv4Repr {
+                identification: 0,
                 options: crate::wire::Ipv4OptionBytes::EMPTY,
                 wire_dst: None,
                 src_addr: Ipv4Address::new(192, 168, 1, 2),
@@ -274,6 +276,7 @@ fn tcp_ingress_checks_addresses_and_checksums() {
                 .into()
             } else {
                 Ipv4Repr {
+                    identification: 0,
                     options: crate::wire::Ipv4OptionBytes::EMPTY,
                     wire_dst: None,
                     src_addr: Ipv4Address::new(192, 168, 1, 2),
@@ -344,6 +347,7 @@ fn egress_respects_ip_mtu() {
                 })
             } else {
                 IpRepr::Ipv4(Ipv4Repr {
+                    identification: 0,
                     options: crate::wire::Ipv4OptionBytes::EMPTY,
                     wire_dst: None,
                     src_addr: Ipv4Address::LOCALHOST,
@@ -390,6 +394,7 @@ fn tcp_reset_with_syn_or_fin_closes_connection() {
         socket.listen(4243).unwrap();
         let handle = sockets.add(socket);
         let ip = IpRepr::Ipv4(Ipv4Repr {
+            identification: 0,
             options: crate::wire::Ipv4OptionBytes::EMPTY,
             wire_dst: None,
             src_addr: Ipv4Address::new(192, 168, 1, 2),

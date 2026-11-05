@@ -1,5 +1,6 @@
 //! Guest worlds reached through the same raw attachment as the honeypot.
 
+use fictionet::stdlib::dissect::hex;
 use fictionet::stdlib::network::ethernet::host::Ipv6Gateway;
 use fictionet_host::VirtioNet;
 use fictionet_host::raw::{EthernetFrame, RawPump};
@@ -62,10 +63,6 @@ impl Write for RawCapture {
         }
         Ok(())
     }
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 pub fn honeypot(nic: VirtioNet) -> fictionet::Result {
@@ -227,5 +224,95 @@ pub fn honeypot(nic: VirtioNet) -> fictionet::Result {
     }
     println!("Honeypot captured complete Ethernet frames and logged MPTCP SYN and answer");
     println!("Honeypot logged the IPv6 SYN to SSH");
+    Ok(())
+}
+
+/// Runs the shipped example against the same guest NIC and host probes.
+pub fn example(address: fictionet_host::PciAddress, mac: [u8; 6]) -> fictionet::Result {
+    use std::fs::OpenOptions;
+    use std::io::{self, BufRead, BufReader, Read};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::process::{Command, Stdio};
+
+    // The reader exists before the child opens its log, so neither open blocks.
+    // SAFETY: the name is a valid C string and the permissions apply to this FIFO.
+    if unsafe { libc::mkfifo(c"/raw-example.frames".as_ptr(), 0o600) } != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    let frames = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open("/raw-example.frames")?;
+    let mut child = Command::new("/raw_honeypot")
+        .arg(address.to_string())
+        .arg("/raw-example.frames")
+        .args(["--address", &crate::rawnic_frames::ADDRESS.to_string()])
+        .args(["--address-v6", &crate::rawnic_frames::ADDRESS6.to_string()])
+        .args(["--gateway", &crate::rawnic_frames::GATEWAY.to_string()])
+        .args([
+            "--log",
+            "/raw-example.jsonl",
+            "--pcap",
+            "/raw-example.pcapng",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+    let mut output = BufReader::new(child.stdout.take().expect("piped example stdout"));
+    let mut frames = BufReader::new(frames);
+    let result = (|| -> fictionet::Result {
+        let mut line = String::new();
+        if output.read_line(&mut line)? == 0 {
+            return Err(fictionet::Error::msg("raw example exited before startup"));
+        }
+        print!("{line}");
+        // The example opens its frame writer before announcing startup.
+        // SAFETY: frames owns this descriptor; fcntl changes only its status flags.
+        let flags = unsafe { libc::fcntl(frames.get_ref().as_raw_fd(), libc::F_GETFL) };
+        if flags < 0
+            || unsafe {
+                libc::fcntl(
+                    frames.get_ref().as_raw_fd(),
+                    libc::F_SETFL,
+                    flags & !libc::O_NONBLOCK,
+                )
+            } < 0
+        {
+            return Err(io::Error::last_os_error().into());
+        }
+        println!("RAW EXAMPLE READY");
+        let mut acknowledgement = [0x5a; 60];
+        acknowledgement[..6].copy_from_slice(&mac);
+        let acknowledgement = hex(&acknowledgement);
+        loop {
+            line.clear();
+            if frames.read_line(&mut line)? == 0 {
+                break;
+            }
+            let record: serde_json::Value = serde_json::from_str(&line)?;
+            if record["direction"] == "in" && record["bytes"] == acknowledgement {
+                return Ok(());
+            }
+        }
+        Err(fictionet::Error::msg(
+            "raw example closed its frame log before acknowledgment",
+        ))
+    })();
+    let exited = child.try_wait()?;
+    if exited.is_none() {
+        child.kill()?;
+    }
+    let status = child.wait()?;
+    let mut remaining = String::new();
+    output.read_to_string(&mut remaining)?;
+    print!("{remaining}");
+    result?;
+    if exited.is_some() {
+        return Err(fictionet::Error::msg(format!(
+            "raw example exited unexpectedly: {status}"
+        )));
+    }
+    println!("RAW EXAMPLE PASS");
     Ok(())
 }
