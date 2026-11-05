@@ -1,10 +1,10 @@
 //! TCP record marking through RPC, NFS, and portmap, in both directions.
 
 use fictionet::stdlib::codec::{self, Assembled, Decode, Stream, Wire, finish, pump};
-use fictionet::stdlib::test_support::contract;
 
 use fictionet::stdlib::protocols::{nfs, onc_rpc, portmap};
 use fictionet::stdlib::test_support::chunks;
+use fictionet::stdlib::test_support::{assert_write, decode_all, decode_chunks};
 use onc_rpc::{Accept, Body, Message, Reply};
 
 const RECORD_LIMIT: usize = 4096;
@@ -128,8 +128,24 @@ fn tcp_requests_and_replies() -> Result<(), Box<dyn core::error::Error>> {
         tcp.extend_from_slice(&0u32.to_be_bytes());
         tcp.extend(onc_rpc::encode_fragments(&payload, fragment_len)?);
     }
-    contract::check_decode(request_stream, &tcp);
-    contract::check_decode_with_held_limit(|| onc_rpc::records(RECORD_LIMIT), &tcp, RECORD_LIMIT);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(request_stream()),
+            chunks(&tcp, &[1, 7, 64]),
+            |_| {}
+        ),
+        decode_all(request_stream, &tcp)
+    );
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(onc_rpc::records(RECORD_LIMIT)),
+            chunks(&tcp, &[1, 7, 64]),
+            |s| {
+                assert!(s.held() <= RECORD_LIMIT);
+            }
+        ),
+        decode_all(|| onc_rpc::records(RECORD_LIMIT), &tcp)
+    );
 
     // Run the layers separately as an oracle for the composed decoder.
     let mut fragments = Stream::new(onc_rpc::Fragments::with_limit(RECORD_LIMIT));
@@ -191,7 +207,9 @@ fn tcp_requests_and_replies() -> Result<(), Box<dyn core::error::Error>> {
             let reply = message.reply(reply);
             let mut payload = Vec::new();
             Wire::write(&reply, &mut payload)?;
-            contract::check_wire::<Message>(&payload);
+            if let Ok(value) = <Message as Wire>::parse(&payload) {
+                assert_write(&value).unwrap();
+            }
             onc_rpc::Record(payload).write(&mut replies)?;
         }
 

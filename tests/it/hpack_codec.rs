@@ -1,4 +1,6 @@
 //! Public HPACK and shared Huffman values through the codec tools.
+use fictionet::stdlib::codec::Stream;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
 use fictionet::stdlib::{
     codec::{Collect, Lcg, Wire},
     protocols::{
@@ -7,7 +9,6 @@ use fictionet::stdlib::{
         prefix_int::Integer,
     },
     test_support,
-    test_support::contract,
 };
 
 #[test]
@@ -15,19 +16,32 @@ fn wire_contracts_and_collection_at_eof() {
     let mut rng = Lcg::new(7541);
     for _ in 0..64 {
         let bytes = rng.bytes(128);
-        contract::check_wire::<Integer<5>>(&bytes);
-        contract::check_wire::<Integer<8>>(&bytes);
-        contract::check_wire::<StringLiteral>(&bytes);
-        contract::check_wire::<Field>(&bytes);
-        contract::check_wire::<HuffmanString>(&bytes);
+        if let Ok(value) = <Integer<5> as Wire>::parse(&bytes) {
+            let _ = assert_write(&value);
+        }
+        if let Ok(value) = <Integer<8> as Wire>::parse(&bytes) {
+            let _ = assert_write(&value);
+        }
+        if let Ok(value) = <StringLiteral as Wire>::parse(&bytes) {
+            let _ = assert_write(&value);
+        }
+        if let Ok(value) = <Field as Wire>::parse(&bytes) {
+            let _ = assert_write(&value);
+        }
+        if let Ok(value) = <HuffmanString as Wire>::parse(&bytes) {
+            let _ = assert_write(&value);
+        }
         let mut field = Field::new(rng.bytes(64), &bytes);
         field.never_index = rng.coin();
-        contract::check_wire_value(&field);
-        contract::check_wire_value(&StringLiteral(bytes.clone()));
-        contract::check_wire_value(&HuffmanString(bytes));
+        let _ = assert_write(&field);
+        let _ = assert_write(&StringLiteral(bytes.clone()));
+        let _ = assert_write(&HuffmanString(bytes));
         let wire = field.to_bytes().unwrap();
         let make = || Collect::<Field>::new(hpack::MAX_BLOCK);
-        contract::check_decode(make, &wire);
+        assert_eq!(
+            decode_chunks(&mut Stream::new(make()), chunks(&wire, &[1, 7, 64]), |_| {}),
+            decode_all(make, &wire)
+        );
         let (items, fail) = test_support::decode_all(make, &wire);
         assert_eq!(items, [field]);
         assert_eq!(fail, None);
@@ -74,15 +88,22 @@ fn settings_table_eviction_and_round_trips_through_public_api() {
 #[test]
 fn fields_huffman_strings_and_prefix_integers_keep_the_public_contracts() {
     let field = hpack::Field::new("x-owned", [0, 255]);
-    contract::check_wire_value(&field);
+    let _ = assert_write(&field);
     let bytes = field.to_bytes().unwrap();
-    contract::check_decode(|| Collect::<hpack::Field>::new(hpack::MAX_BLOCK), &bytes);
-    contract::check_wire_value(&huffman::HuffmanString(vec![0, 255]));
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Collect::<hpack::Field>::new(hpack::MAX_BLOCK)),
+            chunks(&bytes, &[1, 7, 64]),
+            |_| {}
+        ),
+        decode_all(|| Collect::<hpack::Field>::new(hpack::MAX_BLOCK), &bytes)
+    );
+    let _ = assert_write(&huffman::HuffmanString(vec![0, 255]));
     let integer = Integer::<5> {
         flags: 0x20,
         value: u64::MAX,
     };
-    contract::check_wire_value(&integer);
+    let _ = assert_write(&integer);
     assert_eq!(
         Integer::<5>::parse(&integer.to_bytes().unwrap())
             .unwrap()

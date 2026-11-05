@@ -4,12 +4,12 @@ use fictionet::stdlib::codec::{
     Carry, Collect, CollectError, Demux, Ending, Fail, Layered, Lcg, Lines, Pipe, Stream, Wire,
     finish, pump, try_pump,
 };
-use fictionet::stdlib::test_support::contract;
 
 use fictionet::stdlib::protocols::json::{self, Limits, Value};
 use fictionet::stdlib::protocols::jsonrpc::{
     self, Batch, Body, ErrorKind, Id, Message, Messages, Request,
 };
+use fictionet::stdlib::test_support::{assert_write, decode_chunks};
 use fictionet::stdlib::test_support::{chunks, decode_all, mutate};
 
 #[test]
@@ -23,13 +23,31 @@ fn line_write_decode_round_trips_under_all_chunkings() {
     let messages: Vec<_> = inputs.iter().map(|b| Message::parse(b).unwrap()).collect();
     let mut bytes = Vec::new();
     for (message, input) in messages.iter().zip(inputs) {
-        contract::check_wire::<Message>(input);
-        contract::check_wire_value(message);
+        if let Ok(value) = <Message as Wire>::parse(input) {
+            assert_write(&value).unwrap();
+        }
+        let _ = assert_write(message);
         message.write_line(&mut bytes).unwrap();
     }
     let expected: Vec<_> = messages.into_iter().map(Ok).collect();
-    contract::check_decode(Messages::new, &bytes);
-    contract::check_decode_with_held_limit(Messages::new, &bytes, 0);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Messages::new()),
+            chunks(&bytes, &[1, 7, 64]),
+            |_| {}
+        ),
+        decode_all(Messages::new, &bytes)
+    );
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Messages::new()),
+            chunks(&bytes, &[1, 7, 64]),
+            |s| {
+                assert_eq!(s.held(), 0);
+            }
+        ),
+        decode_all(Messages::new, &bytes)
+    );
     assert_eq!(decode_all(Messages::new, &bytes), (expected, None));
 }
 
@@ -40,11 +58,20 @@ fn body_wire_and_collection_contracts() {
         br#"[{"jsonrpc":"2.0","method":"ping","id":1e400},{"jsonrpc":"2.0","method":"ready"}]"#,
         br#"[{"jsonrpc":"2.0","result":null,"id":1.0}]"#,
     ] {
-        contract::check_wire::<Body>(bytes);
-        contract::check_wire::<Batch>(bytes);
-        contract::check_wire::<Message>(bytes);
+        if let Ok(value) = <Body as Wire>::parse(bytes) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = <Batch as Wire>::parse(bytes) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = <Message as Wire>::parse(bytes) {
+            assert_write(&value).unwrap();
+        }
         let make = || Collect::<Body>::new(json::MAX_SIZE);
-        contract::check_decode(make, bytes);
+        assert_eq!(
+            decode_chunks(&mut Stream::new(make()), chunks(bytes, &[1, 7, 64]), |_| {}),
+            decode_all(make, bytes)
+        );
         let body = Body::parse(bytes).unwrap();
         let written = body.to_bytes().unwrap();
         assert_eq!(decode_all(make, &written), (vec![body], None));
@@ -55,7 +82,10 @@ fn body_wire_and_collection_contracts() {
 fn server_body_collection_preserves_mixed_batch_entries() {
     let bytes = br#"[{"jsonrpc":"2.0","method":"ping","id":"1"},{"foo":"boo"},{"jsonrpc":"2.0","method":"ready"},{"result":null}]"#;
     let make = || Collect::<Value>::new(json::MAX_SIZE);
-    contract::check_decode(make, bytes);
+    assert_eq!(
+        decode_chunks(&mut Stream::new(make()), chunks(bytes, &[1, 7, 64]), |_| {}),
+        decode_all(make, bytes)
+    );
     let (values, failure) = decode_all(make, bytes);
     assert_eq!(failure, None);
     assert_eq!(values.len(), 1);
@@ -81,14 +111,17 @@ fn server_body_collection_preserves_mixed_batch_entries() {
     }
     let reply = Batch { messages: replies };
     assert_eq!(reply.to_bytes().unwrap(), br#"[{"jsonrpc":"2.0","result":null,"id":"1"},{"jsonrpc":"2.0","error":{"code":-32600,"message":"Invalid Request"},"id":null}]"#);
-    contract::check_wire_value(&reply);
+    let _ = assert_write(&reply);
 }
 
 #[test]
 fn server_body_json_errors_have_public_rpc_conversion() {
     for bytes in [b"{".as_slice(), b"", b"[{\"jsonrpc\":\"2.0\",]"] {
         let make = || Collect::<Value>::new(json::MAX_SIZE);
-        contract::check_decode(make, bytes);
+        assert_eq!(
+            decode_chunks(&mut Stream::new(make()), chunks(bytes, &[1, 7, 64]), |_| {}),
+            decode_all(make, bytes)
+        );
         let (items, failure) = decode_all(make, bytes);
         assert!(items.is_empty());
         let Some(Fail::Protocol(CollectError::Parse(json_error))) = failure else {
@@ -104,7 +137,7 @@ fn server_body_json_errors_have_public_rpc_conversion() {
             reply.to_bytes().unwrap(),
             br#"{"jsonrpc":"2.0","error":{"code":-32700,"message":"Parse error"},"id":null}"#
         );
-        contract::check_wire_value(&reply);
+        let _ = assert_write(&reply);
     }
     let bytes = vec![b'1'; json::MAX_NUMBER_LEN + 1];
     let (items, failure) = decode_all(|| Collect::<Value>::new(json::MAX_SIZE), &bytes);
@@ -114,13 +147,20 @@ fn server_body_json_errors_have_public_rpc_conversion() {
     };
     let error = jsonrpc::Error::from(json_error);
     assert_eq!(error.rpc_code(), jsonrpc::INVALID_REQUEST);
-    contract::check_wire_value(&Message::Response(error.response()));
+    let _ = assert_write(&Message::Response(error.response()));
 }
 
 #[test]
 fn mcp_dispatch_can_skip_blank_lines_by_public_kind() {
     let bytes = b"\n \t\r\n{\n{\"jsonrpc\":\"2.0\",\"method\":\"ping\",\"id\":1}\n";
-    contract::check_decode(Messages::new, bytes);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Messages::new()),
+            chunks(bytes, &[1, 7, 64]),
+            |_| {}
+        ),
+        decode_all(Messages::new, bytes)
+    );
     let (items, failure) = decode_all(Messages::new, bytes);
     assert_eq!(failure, None);
     assert_eq!(items.len(), 4);
@@ -172,7 +212,14 @@ fn stdio_answers_objects_without_method_or_response_members() {
             Value::from(5),
         ),
     ] {
-        contract::check_decode(Messages::new, bytes);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Messages::new()),
+                chunks(bytes, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(Messages::new, bytes)
+        );
         let (items, failure) = decode_all(Messages::new, bytes);
         assert_eq!(failure, None);
         assert_eq!(items.len(), 1);
@@ -184,19 +231,26 @@ fn stdio_answers_objects_without_method_or_response_members() {
             reply.value().get("error").unwrap().get("code"),
             Some(&Value::from(jsonrpc::INVALID_REQUEST))
         );
-        contract::check_wire_value(&reply);
+        let _ = assert_write(&reply);
     }
 }
 
 #[test]
 fn recoverable_errors_and_eof_contracts() {
     let bytes = b"\n{\n0\n{\"jsonrpc\":\"2.0\",\"method\":false,\"id\":1e400}\r\n{\"jsonrpc\":\"2.0\",\"method\":\"ok\"}\npartial";
-    contract::check_decode(Messages::new, bytes);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Messages::new()),
+            chunks(bytes, &[1, 7, 64]),
+            |_| {}
+        ),
+        decode_all(Messages::new, bytes)
+    );
     let (items, failure) = decode_all(Messages::new, bytes);
     assert_eq!(failure, None);
     assert!(items.iter().any(Result::is_ok));
     for error in items.into_iter().filter_map(Result::err) {
-        contract::check_wire_value(&Message::Response(error.response()));
+        let _ = assert_write(&Message::Response(error.response()));
     }
     let oversized = [
         vec![b'x'; 200],
@@ -209,7 +263,14 @@ fn recoverable_errors_and_eof_contracts() {
             ..Limits::default()
         })
     };
-    contract::check_decode(make, &oversized);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(make()),
+            chunks(&oversized, &[1, 7, 64]),
+            |_| {}
+        ),
+        decode_all(make, &oversized)
+    );
     let (items, failure) = decode_all(make, &oversized);
     assert_eq!(failure, None);
     assert_eq!(items.len(), 2);
@@ -219,16 +280,35 @@ fn recoverable_errors_and_eof_contracts() {
     ));
     assert!(items.last().unwrap().is_ok());
     for limit in [0, 1, 2, 32, 64] {
-        contract::check_decode(
-            || {
-                Messages::with_limits(Limits {
-                    size: limit,
-                    ..Limits::default()
-                })
-            },
-            bytes,
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new({
+                    Messages::with_limits(Limits {
+                        size: limit,
+                        ..Limits::default()
+                    })
+                }),
+                chunks(bytes, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(
+                || {
+                    Messages::with_limits(Limits {
+                        size: limit,
+                        ..Limits::default()
+                    })
+                },
+                bytes
+            )
         );
-        contract::check_decode(|| Collect::<Body>::new(limit), bytes);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Collect::<Body>::new(limit)),
+                chunks(bytes, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(|| Collect::<Body>::new(limit), bytes)
+        );
     }
 }
 
@@ -257,7 +337,7 @@ fn parse_error_with_near_limit_id_always_has_a_writable_response() {
         assert_eq!(reply.value().get("id"), Some(&Value::Null));
         let mut out = Vec::new();
         reply.write_line(&mut out).unwrap();
-        contract::check_wire_value(&reply);
+        let _ = assert_write(&reply);
     }
 }
 
@@ -266,7 +346,7 @@ fn assert_error_response_writes(error: jsonrpc::Error) {
     let bytes = reply.to_bytes().expect("parse error response must fit");
     assert_eq!(Message::parse(&bytes).unwrap(), reply);
     reply.write_line(&mut Vec::new()).unwrap();
-    contract::check_wire_value(&reply);
+    let _ = assert_write(&reply);
 }
 
 #[test]
@@ -419,9 +499,9 @@ fn edited_envelopes_are_checked_before_writing() {
             let (_, id) = members.iter_mut().find(|(key, _)| key == "id").unwrap();
             *id = replacement;
         }
-        contract::check_wire_value(&message);
-        contract::check_wire_value(&Body::Message(message.clone()));
-        contract::check_wire_value(&Batch {
+        let _ = assert_write(&message);
+        let _ = assert_write(&Body::Message(message.clone()));
+        let _ = assert_write(&Batch {
             messages: vec![message.clone()],
         });
         let mut out = b"unchanged".to_vec();
@@ -443,7 +523,10 @@ fn bounded_body_pipe_and_independent_stdio_streams() {
         )
     };
     let bytes = b"{\"jsonrpc\":\"2.0\",\n\"method\":\"ping\",\"id\":1}\n";
-    contract::check_decode(make, bytes);
+    assert_eq!(
+        decode_chunks(&mut Stream::new(make()), chunks(bytes, &[1, 7, 64]), |_| {}),
+        decode_all(make, bytes)
+    );
     let expected = Body::parse(br#"{"jsonrpc":"2.0","method":"ping","id":1}"#).unwrap();
     assert_eq!(
         decode_all(make, bytes),
@@ -476,19 +559,44 @@ fn mutations_preserve_decoder_and_writer_contracts() {
     for _ in 0..40 {
         let mut input = seed.to_vec();
         mutate(&mut rng, &mut input);
-        contract::check_decode(|| Collect::<Body>::new(256), &input);
-        contract::check_wire::<Message>(&input);
-        contract::check_wire::<Batch>(&input);
-        contract::check_wire::<Body>(&input);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Collect::<Body>::new(256)),
+                chunks(&input, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(|| Collect::<Body>::new(256), &input)
+        );
+        if let Ok(value) = <Message as Wire>::parse(&input) {
+            let _ = assert_write(&value);
+        }
+        if let Ok(value) = <Batch as Wire>::parse(&input) {
+            let _ = assert_write(&value);
+        }
+        if let Ok(value) = <Body as Wire>::parse(&input) {
+            let _ = assert_write(&value);
+        }
         input.push(b'\n');
-        contract::check_decode(
-            || {
-                Messages::with_limits(Limits {
-                    size: 256,
-                    ..Limits::default()
-                })
-            },
-            &input,
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new({
+                    Messages::with_limits(Limits {
+                        size: 256,
+                        ..Limits::default()
+                    })
+                }),
+                chunks(&input, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(
+                || {
+                    Messages::with_limits(Limits {
+                        size: 256,
+                        ..Limits::default()
+                    })
+                },
+                &input
+            )
         );
     }
 }

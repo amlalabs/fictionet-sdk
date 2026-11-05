@@ -1,6 +1,7 @@
 //! QPACK session values and HTTP/3 stream handoffs under shared budgets.
 
 use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::test_support::{assert_write, decode_all, decode_chunks};
 use fictionet::stdlib::{
     codec::{self, Decode, Fail, Stream, Wire, finish, pump},
     protocols::{
@@ -10,7 +11,6 @@ use fictionet::stdlib::{
             SectionResult, Table,
         },
     },
-    test_support::contract,
     test_support::{self, chunks},
 };
 use std::collections::BTreeMap;
@@ -53,7 +53,7 @@ fn blocked_stream_keeps_frames_in_connection_budget_until_unpaused() {
     let mut state = http3::RequestStream::new(0, http3::MessageSide::Response, false).unwrap();
     let mut session = Session::new(fictionet::stdlib::codec::Side::Server, 4, http3::MAX_FRAME);
     let data = Frame::Data(vec![7; 10]);
-    let mut bytes = contract::check_written(&Frame::Headers(vec![2, 0, 0x80]));
+    let mut bytes = assert_write(&Frame::Headers(vec![2, 0, 0x80])).unwrap();
     for _ in 0..50 {
         Wire::write(&data, &mut bytes).unwrap();
     }
@@ -66,10 +66,10 @@ fn blocked_stream_keeps_frames_in_connection_budget_until_unpaused() {
     };
     session.pause(0);
     let buffered = session.buffered();
-    assert_eq!(buffered, 50 * contract::check_written(&data).len());
+    assert_eq!(buffered, 50 * assert_write(&data).unwrap().len());
     assert_eq!(
-        session.push(4, &contract::check_written(&data)),
-        contract::check_written(&data).len()
+        session.push(4, &assert_write(&data).unwrap()),
+        assert_write(&data).unwrap().len()
     );
     let mut other_frames = 0;
     while let Some((id, result)) = session.next() {
@@ -79,7 +79,7 @@ fn blocked_stream_keeps_frames_in_connection_budget_until_unpaused() {
     }
     assert_eq!(other_frames, 1);
     assert_eq!(session.buffered(), buffered);
-    assert_eq!(session.push(0, &contract::check_written(&data)), 0);
+    assert_eq!(session.push(0, &assert_write(&data).unwrap()), 0);
     table
         .apply(EI::InsertWithLiteralName {
             name: b":status".to_vec(),
@@ -103,8 +103,8 @@ fn blocked_stream_keeps_frames_in_connection_budget_until_unpaused() {
     assert!(session.next().is_none());
     assert_eq!(session.buffered(), 0);
     assert_eq!(
-        session.push(0, &contract::check_written(&data)),
-        contract::check_written(&data).len()
+        session.push(0, &assert_write(&data).unwrap()),
+        assert_write(&data).unwrap().len()
     );
 }
 
@@ -115,7 +115,7 @@ fn paused_stream_defers_eof_and_preserves_offsets() {
             let mut session =
                 Session::new(fictionet::stdlib::codec::Side::Client, 1, http3::MAX_FRAME);
             let frame = Frame::Data(vec![7; 10]);
-            let mut bytes = contract::check_written(&frame);
+            let mut bytes = assert_write(&frame).unwrap();
             if partial {
                 bytes.extend_from_slice(&[0, 2, 7]);
             }
@@ -152,10 +152,7 @@ fn paused_stream_defers_eof_and_preserves_offsets() {
             assert!(session.next().is_none());
             let stream = session.remove(0).unwrap();
             assert!(stream.is_done());
-            assert_eq!(
-                stream.offset(),
-                contract::check_written(&frame).len() as u64
-            );
+            assert_eq!(stream.offset(), assert_write(&frame).unwrap().len() as u64);
             assert_eq!(stream.buffered(), if partial { 3 } else { 0 });
             assert_eq!(
                 stream.failed(),
@@ -245,7 +242,7 @@ fn request_field_limit_rejects_oversized_fields() {
         section.extend_from_slice(&field.value);
     }
     let frame = Frame::Headers(section);
-    let bytes = contract::check_written(&frame);
+    let bytes = assert_write(&frame).unwrap();
     assert!((2000..2200).contains(&bytes.len()));
     let expected = http3::Error::Qpack(qpack::Error::FieldSectionTooLarge);
     let mut state = http3::RequestStream::new(0, http3::MessageSide::Request, false)
@@ -484,12 +481,13 @@ fn two_request_states_resume_in_qpack_release_order() {
             static_table: false,
             index: 0,
         });
-        let mut bytes = contract::check_written(&Frame::Headers(section(
+        let mut bytes = assert_write(&Frame::Headers(section(
             required,
             required,
             table.max_entries(),
             &reps,
-        )));
+        )))
+        .unwrap();
         Frame::Data(vec![id as u8]).write(&mut bytes).unwrap();
         assert_eq!(session.push(id, &bytes), bytes.len());
         session.end(id);
@@ -854,18 +852,35 @@ fn decoder_instruction_capacity_is_one_bounded_integer() {
         DI::StreamCancel(fictionet::stdlib::protocols::quic::MAX_VARINT),
         DI::InsertCountIncrement(fictionet::stdlib::protocols::quic::MAX_VARINT),
     ] {
-        let bytes = contract::check_written(&ins);
+        let bytes = assert_write(&ins).unwrap();
         assert_eq!(bytes.len(), qpack::MAX_INTEGER_BYTES);
-        contract::check_decode_with_alloc_limit(
-            Frames::<qpack::DecoderInstruction>::new,
-            &bytes,
-            2 * (Frames::<qpack::DecoderInstruction>::new)().capacity(),
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<qpack::DecoderInstruction>::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| {
+                    assert!(
+                        s.allocated()
+                            <= 2 * (Frames::<qpack::DecoderInstruction>::new)().capacity()
+                    );
+                }
+            ),
+            decode_all(Frames::<qpack::DecoderInstruction>::new, &bytes)
         );
     }
-    contract::check_decode_with_alloc_limit(
-        Frames::<qpack::DecoderInstruction>::new,
-        &[0xff; qpack::MAX_INTEGER_BYTES],
-        2 * (Frames::<qpack::DecoderInstruction>::new)().capacity(),
+    let alloc_limit = 2 * Frames::<qpack::DecoderInstruction>::new().capacity();
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<qpack::DecoderInstruction>::new()),
+            chunks(&[0xff; qpack::MAX_INTEGER_BYTES], &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= alloc_limit);
+            }
+        ),
+        decode_all(
+            Frames::<qpack::DecoderInstruction>::new,
+            &[0xff; qpack::MAX_INTEGER_BYTES]
+        )
     );
 }
 
@@ -1097,12 +1112,20 @@ fn qpack_instructions_table_sections_and_acknowledgments() {
     let mut bytes = Vec::new();
     for ins in &instructions {
         Wire::write(ins, &mut bytes).unwrap();
-        contract::check_wire::<EI>(&contract::check_written(ins));
+        if let Ok(value) = <EI as Wire>::parse(&assert_write(ins).unwrap()) {
+            assert_write(&value).unwrap();
+        }
     }
-    contract::check_decode_with_alloc_limit(
-        Frames::<qpack::EncoderInstruction>::new,
-        &bytes,
-        2 * (Frames::<qpack::EncoderInstruction>::new)().capacity(),
+    let alloc_limit = 2 * Frames::<qpack::EncoderInstruction>::new().capacity();
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<qpack::EncoderInstruction>::new()),
+            chunks(&bytes, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= alloc_limit);
+            }
+        ),
+        decode_all(Frames::<qpack::EncoderInstruction>::new, &bytes)
     );
     {
         let mut table = Table::new(4096);
@@ -1165,7 +1188,7 @@ fn qpack_instructions_table_sections_and_acknowledgments() {
         let mut held = qpack::BlockedSections::new(2);
         held.push(blocked).unwrap();
         assert!(held.next_ready(&table).is_none());
-        let late = contract::check_written(&EI::Duplicate(3));
+        let late = assert_write(&EI::Duplicate(3)).unwrap();
         let (items, failure) =
             test_support::decode_all(Frames::<qpack::EncoderInstruction>::new, &late);
         assert!(failure.is_none());
@@ -1194,12 +1217,20 @@ fn qpack_instructions_table_sections_and_acknowledgments() {
         let mut ack_bytes = Vec::new();
         for ack in &ack_values {
             Wire::write(ack, &mut ack_bytes).unwrap();
-            contract::check_wire_value(ack);
+            let _ = assert_write(ack);
         }
-        contract::check_decode_with_alloc_limit(
-            Frames::<qpack::DecoderInstruction>::new,
-            &ack_bytes,
-            2 * (Frames::<qpack::DecoderInstruction>::new)().capacity(),
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<qpack::DecoderInstruction>::new()),
+                chunks(&ack_bytes, &[1, 7, 64]),
+                |s| {
+                    assert!(
+                        s.allocated()
+                            <= 2 * (Frames::<qpack::DecoderInstruction>::new)().capacity()
+                    );
+                }
+            ),
+            decode_all(Frames::<qpack::DecoderInstruction>::new, &ack_bytes)
         );
         let (items, failure) =
             test_support::decode_all(Frames::<qpack::DecoderInstruction>::new, &ack_bytes);
@@ -1366,29 +1397,51 @@ fn qpack_instruction_failures_and_eof() {
     assert!(stream.next().is_none());
     assert_eq!(stream.buffered(), over.len());
     assert_eq!(stream.held(), 0);
-    contract::check_decode_with_alloc_limit(
-        Frames::<qpack::EncoderInstruction>::new,
-        &over,
-        2 * (Frames::<qpack::EncoderInstruction>::new)().capacity(),
+    let alloc_limit = 2 * Frames::<qpack::EncoderInstruction>::new().capacity();
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<qpack::EncoderInstruction>::new()),
+            chunks(&over, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= alloc_limit);
+            }
+        ),
+        decode_all(Frames::<qpack::EncoderInstruction>::new, &over)
     );
 
     let mut overflow = vec![0x1f];
     overflow.extend_from_slice(&[0x80; 9]);
     for encoder in [false, true] {
         if encoder {
-            contract::check_decode_with_alloc_limit(
-                Frames::<qpack::EncoderInstruction>::new,
-                &overflow,
-                2 * (Frames::<qpack::EncoderInstruction>::new)().capacity(),
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Frames::<qpack::EncoderInstruction>::new()),
+                    chunks(&overflow, &[1, 7, 64]),
+                    |s| {
+                        assert!(
+                            s.allocated()
+                                <= 2 * (Frames::<qpack::EncoderInstruction>::new)().capacity()
+                        );
+                    }
+                ),
+                decode_all(Frames::<qpack::EncoderInstruction>::new, &overflow)
             );
         } else {
             // Decoder increments use a six-bit prefix.
             let mut bytes = overflow.clone();
             bytes[0] = 0x3f;
-            contract::check_decode_with_alloc_limit(
-                Frames::<qpack::DecoderInstruction>::new,
-                &bytes,
-                2 * (Frames::<qpack::DecoderInstruction>::new)().capacity(),
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Frames::<qpack::DecoderInstruction>::new()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |s| {
+                        assert!(
+                            s.allocated()
+                                <= 2 * (Frames::<qpack::DecoderInstruction>::new)().capacity()
+                        );
+                    }
+                ),
+                decode_all(Frames::<qpack::DecoderInstruction>::new, &bytes)
             );
         }
     }
@@ -1403,11 +1456,17 @@ fn qpack_instruction_failures_and_eof() {
     assert_eq!(partial.next(), Some(Err(Fail::Truncated { unread: 1 })));
 
     let mut malformed = vec![0x41, b'a', 0x81, 0];
-    malformed.extend(contract::check_written(&EI::SetCapacity(128)));
-    contract::check_decode_with_alloc_limit(
-        Frames::<qpack::EncoderInstruction>::new,
-        &malformed,
-        2 * (Frames::<qpack::EncoderInstruction>::new)().capacity(),
+    malformed.extend(assert_write(&EI::SetCapacity(128)).unwrap());
+    let alloc_limit = 2 * Frames::<qpack::EncoderInstruction>::new().capacity();
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<qpack::EncoderInstruction>::new()),
+            chunks(&malformed, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= alloc_limit);
+            }
+        ),
+        decode_all(Frames::<qpack::EncoderInstruction>::new, &malformed)
     );
     let mut input = Stream::new(Frames::<qpack::EncoderInstruction>::new());
     assert_eq!(input.push(&malformed), malformed.len());
@@ -1418,10 +1477,16 @@ fn qpack_instruction_failures_and_eof() {
     assert_eq!(input.push(&[0, 1]), 2);
     assert_eq!(input.next(), Some(Ok(Err(qpack::Error::ZeroIncrement))));
     assert_eq!(input.next(), Some(Ok(Ok(DI::InsertCountIncrement(1)))));
-    contract::check_decode_with_alloc_limit(
-        Frames::<qpack::DecoderInstruction>::new,
-        &[0, 1],
-        2 * (Frames::<qpack::DecoderInstruction>::new)().capacity(),
+    let alloc_limit = 2 * Frames::<qpack::DecoderInstruction>::new().capacity();
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<qpack::DecoderInstruction>::new()),
+            chunks(&[0, 1], &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= alloc_limit);
+            }
+        ),
+        decode_all(Frames::<qpack::DecoderInstruction>::new, &[0, 1])
     );
 }
 
@@ -1455,7 +1520,7 @@ fn qpack_strict_writers() {
             value: vec![0; qpack::MAX_STRING + 1],
         },
     ] {
-        contract::check_wire_value(&invalid);
+        let _ = assert_write(&invalid);
         let mut out = vec![7, 9];
         assert!(Wire::write(&invalid, &mut out).is_err());
         assert_eq!(out, [7, 9]);
@@ -1466,7 +1531,7 @@ fn qpack_strict_writers() {
         DI::SectionAck(u64::MAX),
         DI::StreamCancel(u64::MAX),
     ] {
-        contract::check_wire_value(&invalid);
+        let _ = assert_write(&invalid);
         assert_eq!(invalid.to_bytes(), Err(qpack::Error::Unwritable));
     }
     for invalid in [
@@ -1492,10 +1557,10 @@ fn qpack_strict_writers() {
             value: vec![0; qpack::MAX_STRING + 1],
         },
     ] {
-        contract::check_wire_value(&invalid);
+        let _ = assert_write(&invalid);
         assert_eq!(invalid.to_bytes(), Err(qpack::Error::Unwritable));
     }
-    let mut trailing = contract::check_written(&EI::SetCapacity(8));
+    let mut trailing = assert_write(&EI::SetCapacity(8)).unwrap();
     trailing.push(0);
     assert_eq!(<EI as Wire>::parse(&trailing), Err(qpack::Error::Trailing));
 }
@@ -1544,12 +1609,20 @@ fn http3_frame_round_trips_and_allocation_contract() {
     let mut bytes = Vec::new();
     for frame in &frames {
         Wire::write(frame, &mut bytes).unwrap();
-        contract::check_wire::<Frame>(&contract::check_written(frame));
+        if let Ok(value) = <Frame as Wire>::parse(&assert_write(frame).unwrap()) {
+            assert_write(&value).unwrap();
+        }
     }
-    contract::check_decode_with_alloc_limit(
-        Frames::<http3::Frame>::new,
-        &bytes,
-        2 * (Frames::<http3::Frame>::new)().capacity(),
+    let alloc_limit = 2 * Frames::<http3::Frame>::new().capacity();
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<http3::Frame>::new()),
+            chunks(&bytes, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= alloc_limit);
+            }
+        ),
+        decode_all(Frames::<http3::Frame>::new, &bytes)
     );
     let (items, failure) = test_support::decode_all(Frames::<http3::Frame>::new, &bytes);
     assert!(failure.is_none());
@@ -1565,10 +1638,16 @@ fn http3_stream_header_end_swap_and_parts_preserve_bytes_and_eof() {
     // Nonminimal type varint and multibyte push ID, both split bytewise.
     let mut bytes = vec![0x40, 1, 0x41, 0];
     Wire::write(&frame, &mut bytes).unwrap();
-    contract::check_decode_with_alloc_limit(
-        http3::StreamHeaders::new,
-        &bytes,
-        2 * (http3::StreamHeaders::new)().capacity(),
+    let alloc_limit = 2 * http3::StreamHeaders::new().capacity();
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(http3::StreamHeaders::new()),
+            chunks(&bytes, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= alloc_limit);
+            }
+        ),
+        decode_all(http3::StreamHeaders::new, &bytes)
     );
     let mut stream = Stream::with_buffer(http3::StreamHeaders::new(), bytes.len());
     assert_eq!(stream.push(&bytes), bytes.len());
@@ -1579,7 +1658,7 @@ fn http3_stream_header_end_swap_and_parts_preserve_bytes_and_eof() {
     );
     assert_eq!(stream.next(), None);
     assert!(stream.is_done());
-    assert_eq!(stream.unread(), contract::check_written(&frame));
+    assert_eq!(stream.unread(), assert_write(&frame).unwrap());
     let mut stream = stream.swap(Frames::<http3::Frame>::new());
     assert_eq!(
         stream.next_span(),
@@ -1613,14 +1692,14 @@ fn interleaved_connection(chunk_size: usize) {
     let mut session = Session::new(fictionet::stdlib::codec::Side::Client, 5, BUDGET);
     let mut table = Table::new(4096);
     let mut items = SessionItems::new();
-    let mut control = contract::check_written(&StreamHeader::Control);
+    let mut control = assert_write(&StreamHeader::Control).unwrap();
     Wire::write(&settings(), &mut control).unwrap();
     Wire::write(&Frame::Goaway(128), &mut control).unwrap();
-    let mut encoder = contract::check_written(&StreamHeader::QpackEncoder);
+    let mut encoder = assert_write(&StreamHeader::QpackEncoder).unwrap();
     for ins in encoder_units() {
         Wire::write(&ins, &mut encoder).unwrap();
     }
-    let mut decoder = contract::check_written(&StreamHeader::QpackDecoder);
+    let mut decoder = assert_write(&StreamHeader::QpackDecoder).unwrap();
     Wire::write(&DI::SectionAck(1024), &mut decoder).unwrap();
     Wire::write(&DI::StreamCancel(4096), &mut decoder).unwrap();
     let dynamic = section(
@@ -1633,13 +1712,13 @@ fn interleaved_connection(chunk_size: usize) {
         }],
     );
     let first = [
-        contract::check_written(&Frame::Headers(dynamic.clone())),
-        contract::check_written(&Frame::Data(vec![0xfd; 140])),
+        assert_write(&Frame::Headers(dynamic.clone())).unwrap(),
+        assert_write(&Frame::Data(vec![0xfd; 140])).unwrap(),
     ]
     .concat();
     let second = [
-        contract::check_written(&Frame::Headers(vec![0, 0])),
-        contract::check_written(&Frame::Data(b"second".to_vec())),
+        assert_write(&Frame::Headers(vec![0, 0])).unwrap(),
+        assert_write(&Frame::Data(b"second".to_vec())).unwrap(),
     ]
     .concat();
     let inputs = [
@@ -1789,10 +1868,16 @@ fn http3_errors_are_items_or_terminal_according_to_boundary() {
     // A complete malformed SETTINGS frame retains a trusted next boundary.
     let mut bytes = vec![4, 4, 1, 0, 1, 0];
     Wire::write(&Frame::Data(b"next".to_vec()), &mut bytes).unwrap();
-    contract::check_decode_with_alloc_limit(
-        Frames::<http3::Frame>::new,
-        &bytes,
-        2 * (Frames::<http3::Frame>::new)().capacity(),
+    let alloc_limit = 2 * Frames::<http3::Frame>::new().capacity();
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<http3::Frame>::new()),
+            chunks(&bytes, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= alloc_limit);
+            }
+        ),
+        decode_all(Frames::<http3::Frame>::new, &bytes)
     );
     let mut input = Stream::new(Frames::<http3::Frame>::new());
     assert_eq!(input.push(&bytes), bytes.len());
@@ -1822,16 +1907,28 @@ fn http3_errors_are_items_or_terminal_according_to_boundary() {
     assert!(stream.is_done());
     assert_eq!(stream.buffered(), over.len());
     assert_eq!(stream.held(), 0);
-    contract::check_decode_with_alloc_limit(
-        Frames::<http3::Frame>::new,
-        &over,
-        2 * (Frames::<http3::Frame>::new)().capacity(),
+    let alloc_limit = 2 * Frames::<http3::Frame>::new().capacity();
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<http3::Frame>::new()),
+            chunks(&over, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= alloc_limit);
+            }
+        ),
+        decode_all(Frames::<http3::Frame>::new, &over)
     );
     for bytes in [&[0x40][..], &[0, 0x40], &[0, 2, 1]] {
-        contract::check_decode_with_alloc_limit(
-            Frames::<http3::Frame>::new,
-            bytes,
-            2 * (Frames::<http3::Frame>::new)().capacity(),
+        let alloc_limit = 2 * Frames::<http3::Frame>::new().capacity();
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<http3::Frame>::new()),
+                chunks(bytes, &[1, 7, 64]),
+                |s| {
+                    assert!(s.allocated() <= alloc_limit);
+                }
+            ),
+            decode_all(Frames::<http3::Frame>::new, bytes)
         );
         let mut stream = Stream::new(Frames::<http3::Frame>::new());
         assert_eq!(stream.push(bytes), bytes.len());
@@ -1848,13 +1945,27 @@ fn http3_errors_are_items_or_terminal_according_to_boundary() {
 
 #[test]
 fn http3_control_and_selected_stream_contracts() {
-    let mut control = contract::check_written(&settings());
+    let mut control = assert_write(&settings()).unwrap();
     Wire::write(&Frame::Goaway(8), &mut control).unwrap();
     Wire::write(&Frame::Goaway(4), &mut control).unwrap();
-    contract::check_decode_with_alloc_limit(
-        || http3::ControlFrames::new(fictionet::stdlib::codec::Side::Server),
-        &control,
-        2 * http3::ControlFrames::new(fictionet::stdlib::codec::Side::Server).capacity(),
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(http3::ControlFrames::new(
+                fictionet::stdlib::codec::Side::Server
+            )),
+            chunks(&control, &[1, 7, 64]),
+            |s| {
+                assert!(
+                    s.allocated()
+                        <= 2 * http3::ControlFrames::new(fictionet::stdlib::codec::Side::Server)
+                            .capacity()
+                );
+            }
+        ),
+        decode_all(
+            || http3::ControlFrames::new(fictionet::stdlib::codec::Side::Server),
+            &control
+        )
     );
     let mut stream = Stream::new(http3::ControlFrames::new(
         fictionet::stdlib::codec::Side::Server,
@@ -1867,50 +1978,112 @@ fn http3_control_and_selected_stream_contracts() {
         Err(Fail::Protocol(http3::Error::ClosedCriticalStream))
     );
     let header = StreamHeader::QpackEncoder;
-    let bytes = contract::check_written(&EI::SetCapacity(4096));
-    contract::check_decode_with_alloc_limit(
-        || http3::StreamItems::after_header(header, fictionet::stdlib::codec::Side::Client),
-        &bytes,
-        2 * http3::StreamItems::after_header(header, fictionet::stdlib::codec::Side::Client)
-            .capacity(),
-    );
-    contract::check_decode_with_alloc_limit(
-        || {
-            http3::StreamItems::after_header(
-                StreamHeader::QpackDecoder,
-                fictionet::stdlib::codec::Side::Client,
-            )
-        },
-        &[1],
-        2 * http3::StreamItems::after_header(
-            StreamHeader::QpackDecoder,
-            fictionet::stdlib::codec::Side::Client,
+    let bytes = assert_write(&EI::SetCapacity(4096)).unwrap();
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(http3::StreamItems::after_header(
+                header,
+                fictionet::stdlib::codec::Side::Client
+            )),
+            chunks(&bytes, &[1, 7, 64]),
+            |s| {
+                assert!(
+                    s.allocated()
+                        <= 2 * http3::StreamItems::after_header(
+                            header,
+                            fictionet::stdlib::codec::Side::Client
+                        )
+                        .capacity()
+                );
+            }
+        ),
+        decode_all(
+            || http3::StreamItems::after_header(header, fictionet::stdlib::codec::Side::Client),
+            &bytes
         )
-        .capacity(),
     );
-    contract::check_decode_with_alloc_limit(
-        || {
-            http3::StreamItems::after_header(
-                StreamHeader::Unknown(64),
-                fictionet::stdlib::codec::Side::Client,
-            )
-        },
-        &[0xff; 128],
-        2 * http3::StreamItems::after_header(
-            StreamHeader::Unknown(64),
-            fictionet::stdlib::codec::Side::Client,
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new({
+                http3::StreamItems::after_header(
+                    StreamHeader::QpackDecoder,
+                    fictionet::stdlib::codec::Side::Client,
+                )
+            }),
+            chunks(&[1], &[1, 7, 64]),
+            |s| {
+                assert!(
+                    s.allocated()
+                        <= 2 * http3::StreamItems::after_header(
+                            StreamHeader::QpackDecoder,
+                            fictionet::stdlib::codec::Side::Client,
+                        )
+                        .capacity()
+                );
+            }
+        ),
+        decode_all(
+            || {
+                http3::StreamItems::after_header(
+                    StreamHeader::QpackDecoder,
+                    fictionet::stdlib::codec::Side::Client,
+                )
+            },
+            &[1]
         )
-        .capacity(),
     );
-    contract::check_decode_with_alloc_limit(
-        http3::StreamItems::request,
-        &contract::check_written(&Frame::Data(vec![1, 2])),
-        2 * (http3::StreamItems::request)().capacity(),
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new({
+                http3::StreamItems::after_header(
+                    StreamHeader::Unknown(64),
+                    fictionet::stdlib::codec::Side::Client,
+                )
+            }),
+            chunks(&[0xff; 128], &[1, 7, 64]),
+            |s| {
+                assert!(
+                    s.allocated()
+                        <= 2 * http3::StreamItems::after_header(
+                            StreamHeader::Unknown(64),
+                            fictionet::stdlib::codec::Side::Client,
+                        )
+                        .capacity()
+                );
+            }
+        ),
+        decode_all(
+            || {
+                http3::StreamItems::after_header(
+                    StreamHeader::Unknown(64),
+                    fictionet::stdlib::codec::Side::Client,
+                )
+            },
+            &[0xff; 128]
+        )
     );
-    contract::check_decode_with_alloc_limit(
-        http3::StreamItems::unidirectional,
-        &[0x40, 2, 0x20],
-        2 * (http3::StreamItems::unidirectional)().capacity(),
+    let data = assert_write(&Frame::Data(vec![1, 2])).unwrap();
+    let alloc_limit = 2 * http3::StreamItems::request().capacity();
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(http3::StreamItems::request()),
+            chunks(&data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= alloc_limit);
+            }
+        ),
+        decode_all(http3::StreamItems::request, &data)
+    );
+    let alloc_limit = 2 * http3::StreamItems::unidirectional().capacity();
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(http3::StreamItems::unidirectional()),
+            chunks(&[0x40, 2, 0x20], &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= alloc_limit);
+            }
+        ),
+        decode_all(http3::StreamItems::unidirectional, &[0x40, 2, 0x20])
     );
 }
 
@@ -1918,7 +2091,7 @@ fn http3_control_and_selected_stream_contracts() {
 fn http3_connection_eof_survives_handoff_and_unknown_streams_are_skipped() {
     let mut session = Session::new(fictionet::stdlib::codec::Side::Server, 3, 64);
     // Push ID is part of the header; the entire DATA frame is already buffered.
-    let mut bytes = contract::check_written(&StreamHeader::Push(65));
+    let mut bytes = assert_write(&StreamHeader::Push(65)).unwrap();
     Wire::write(&Frame::Data(b"hello".to_vec()), &mut bytes).unwrap();
     assert_eq!(session.push(3, &bytes), bytes.len());
     session.end(3);
@@ -1983,7 +2156,7 @@ fn http3_strict_writers_are_transactional() {
             entries: vec![http3::Setting { id: 8, value: 2 }],
         }),
     ] {
-        contract::check_wire_value(&frame);
+        let _ = assert_write(&frame);
         let mut output = vec![0xaa, 0xbb];
         assert_eq!(
             Wire::write(&frame, &mut output),
@@ -1997,10 +2170,10 @@ fn http3_strict_writers_are_transactional() {
         StreamHeader::Unknown(0),
         StreamHeader::Unknown(u64::MAX),
     ] {
-        contract::check_wire_value(&header);
+        let _ = assert_write(&header);
     }
-    contract::check_wire_value(&http3::Settings::default());
-    let mut bytes = contract::check_written(&Frame::Data(vec![]));
+    let _ = assert_write(&http3::Settings::default());
+    let mut bytes = assert_write(&Frame::Data(vec![])).unwrap();
     bytes.push(0);
     assert_eq!(<Frame as Wire>::parse(&bytes), Err(http3::Error::Trailing));
 }
@@ -2038,10 +2211,9 @@ fn http3_header_list_section_preserves_values_and_never_index() {
                 continue;
             }
             let section = result.unwrap();
-            contract::check_wire_value(&section);
+            let _ = assert_write(&section);
             let SectionResult::Fields { fields, ack } =
-                qpack::decode_section(&Table::new(0), 0, &contract::check_written(&section))
-                    .unwrap()
+                qpack::decode_section(&Table::new(0), 0, &assert_write(&section).unwrap()).unwrap()
             else {
                 panic!("a literal section blocked");
             };
@@ -2059,32 +2231,72 @@ fn codec_contracts_on_bounded_arbitrary_inputs() {
     for length in [0, 1, 2, 3, 10, 31, 64, 129, 257] {
         let mut bytes = vec![0; length];
         random.fill(&mut bytes);
-        contract::check_decode_with_alloc_limit(
-            Frames::<qpack::EncoderInstruction>::new,
-            &bytes,
-            2 * (Frames::<qpack::EncoderInstruction>::new)().capacity(),
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<qpack::EncoderInstruction>::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| {
+                    assert!(
+                        s.allocated()
+                            <= 2 * (Frames::<qpack::EncoderInstruction>::new)().capacity()
+                    );
+                }
+            ),
+            decode_all(Frames::<qpack::EncoderInstruction>::new, &bytes)
         );
-        contract::check_decode_with_alloc_limit(
-            Frames::<qpack::DecoderInstruction>::new,
-            &bytes,
-            2 * (Frames::<qpack::DecoderInstruction>::new)().capacity(),
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<qpack::DecoderInstruction>::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| {
+                    assert!(
+                        s.allocated()
+                            <= 2 * (Frames::<qpack::DecoderInstruction>::new)().capacity()
+                    );
+                }
+            ),
+            decode_all(Frames::<qpack::DecoderInstruction>::new, &bytes)
         );
-        contract::check_decode_with_alloc_limit(
-            Frames::<http3::Frame>::new,
-            &bytes,
-            2 * (Frames::<http3::Frame>::new)().capacity(),
+        let alloc_limit = 2 * Frames::<http3::Frame>::new().capacity();
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<http3::Frame>::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| {
+                    assert!(s.allocated() <= alloc_limit);
+                }
+            ),
+            decode_all(Frames::<http3::Frame>::new, &bytes)
         );
-        contract::check_decode_with_alloc_limit(
-            http3::StreamHeaders::new,
-            &bytes,
-            2 * (http3::StreamHeaders::new)().capacity(),
+        let alloc_limit = 2 * http3::StreamHeaders::new().capacity();
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(http3::StreamHeaders::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| {
+                    assert!(s.allocated() <= alloc_limit);
+                }
+            ),
+            decode_all(http3::StreamHeaders::new, &bytes)
         );
-        contract::check_wire::<EI>(&bytes);
-        contract::check_wire::<DI>(&bytes);
-        contract::check_wire::<Rep>(&bytes);
-        contract::check_wire::<Frame>(&bytes);
-        contract::check_wire::<StreamHeader>(&bytes);
-        contract::check_wire::<http3::Settings>(&bytes);
+        if let Ok(value) = <EI as Wire>::parse(&bytes) {
+            let _ = assert_write(&value);
+        }
+        if let Ok(value) = <DI as Wire>::parse(&bytes) {
+            let _ = assert_write(&value);
+        }
+        if let Ok(value) = <Rep as Wire>::parse(&bytes) {
+            let _ = assert_write(&value);
+        }
+        if let Ok(value) = <Frame as Wire>::parse(&bytes) {
+            let _ = assert_write(&value);
+        }
+        if let Ok(value) = <StreamHeader as Wire>::parse(&bytes) {
+            let _ = assert_write(&value);
+        }
+        if let Ok(value) = <http3::Settings as Wire>::parse(&bytes) {
+            let _ = assert_write(&value);
+        }
     }
 }
 
@@ -2093,7 +2305,7 @@ fn qpack_encoder_session_accepts_one_decoded_instruction_at_a_time() {
     let mut encoder = qpack::Encoder::new(4096, qpack::MAX_FIELD_SECTION_SIZE);
     encoder.set_capacity(4096).unwrap();
     encoder.insert(b"x-example", b"value").unwrap();
-    let mut bytes = contract::check_written(&DI::InsertCountIncrement(1));
+    let mut bytes = assert_write(&DI::InsertCountIncrement(1)).unwrap();
     Wire::write(&DI::SectionAck(1024), &mut bytes).unwrap();
     let mut stream = Stream::new(Frames::<qpack::DecoderInstruction>::new());
     assert_eq!(stream.push(&bytes), bytes.len());

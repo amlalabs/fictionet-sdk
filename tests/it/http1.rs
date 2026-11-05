@@ -4,7 +4,7 @@ use fictionet::stdlib::protocols::http1::{
     Event, Header, Limits, Request, RequestEvents, Requests, Response, ResponseEvents, Responses,
 };
 use fictionet::stdlib::test_support;
-use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
 
 const FIRST: &[u8] = b"POST /tools HTTP/1.1\r\nHost: api.test\r\nTransfer-Encoding: chunked\r\nX-Raw:\t keep \t\r\n\r\n01\r\n{\r\n1\r\n}\r\n000\r\n\r\n";
 const SECOND: &[u8] = b"GET /next HTTP/1.1\r\nHost:api.test\r\n\r\n";
@@ -189,7 +189,7 @@ fn keep_alive_requests_decode_and_round_trip_at_each_chunking() {
 
         let mut output = Vec::new();
         for request in &requests {
-            contract::check_wire_value(request);
+            let _ = assert_write(request);
             request.write(&mut output).unwrap();
         }
         assert_eq!(
@@ -197,7 +197,14 @@ fn keep_alive_requests_decode_and_round_trip_at_each_chunking() {
             (requests, None)
         );
     }
-    contract::check_decode(Requests::default, &input);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Requests::default()),
+            chunks(&input, &[1, 7, 64]),
+            |_| {}
+        ),
+        decode_all(Requests::default, &input)
+    );
 }
 
 #[test]
@@ -351,7 +358,14 @@ fn queued_head_and_get_responses_preserve_framing_after_edits() {
         assert!(stream.is_done());
         assert_eq!(test_support::decode_all(make, &output), (expected, None));
     }
-    contract::check_decode(make, &input);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(make()),
+            chunks(&input, &[1, 7, 64]),
+            |_| {}
+        ),
+        decode_all(make, &input)
+    );
 }
 
 #[test]
@@ -367,7 +381,7 @@ fn message_decoders_preserve_bytes_and_share_wire_traits() {
         request
     }) {
         let request = result.unwrap();
-        contract::check_wire_value(&request);
+        let _ = assert_write(&request);
         request.write(&mut output).unwrap();
         expected.push(request);
     }
@@ -382,7 +396,14 @@ fn message_decoders_preserve_bytes_and_share_wire_traits() {
         Response::parse(&response.to_bytes().unwrap()).unwrap().body,
         b"{}"
     );
-    contract::check_decode(Responses::new, b"HTTP/1.1 204 \r\n\r\n");
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Responses::new()),
+            chunks(b"HTTP/1.1 204 \r\n\r\n", &[1, 7, 64]),
+            |_| {}
+        ),
+        decode_all(Responses::new, b"HTTP/1.1 204 \r\n\r\n")
+    );
 }
 
 #[test]

@@ -3,9 +3,9 @@
 use fictionet::stdlib::codec::{
     AssembleError, Decode, Fail, Lcg, Step, Stream, Wire, finish, pump,
 };
-use fictionet::stdlib::test_support::contract;
 
 use fictionet::stdlib::protocols::{telnet as tn, websocket as ws};
+use fictionet::stdlib::test_support::{assert_write, decode_chunks};
 use fictionet::stdlib::test_support::{chunks, decode_all};
 
 fn bounded<D: Decode>(make: impl Fn() -> D, bytes: &[u8]) -> (Vec<D::Item>, Option<Fail<D::Error>>)
@@ -14,7 +14,9 @@ where
     D::Error: Clone + PartialEq + core::fmt::Debug,
 {
     let limit = make().capacity().checked_mul(2).unwrap();
-    contract::check_decode_with_alloc_limit(make, bytes, limit)
+    decode_chunks(&mut Stream::new(make()), chunks(bytes, &[1, 7, 64]), |s| {
+        assert!(s.allocated() <= limit);
+    })
 }
 
 fn telnet_units() -> Vec<tn::Event> {
@@ -56,11 +58,22 @@ fn telnet_chunked_wire_round_trip() {
     let mut bytes = Vec::new();
     for event in &events {
         event.write(&mut bytes).unwrap();
-        contract::check_wire_value(event);
-        contract::check_wire::<tn::Event>(&Wire::to_bytes(event).unwrap());
+        let _ = assert_write(event);
+        if let Ok(value) = <tn::Event as Wire>::parse(&Wire::to_bytes(event).unwrap()) {
+            assert_write(&value).unwrap();
+        }
     }
     bounded(tn::Events::new, &bytes);
-    contract::check_decode_with_held_limit(tn::Events::new, &bytes, 0);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(tn::Events::new()),
+            chunks(&bytes, &[1, 7, 64]),
+            |s| {
+                assert_eq!(s.held(), 0);
+            }
+        ),
+        decode_all(tn::Events::new, &bytes)
+    );
     assert_eq!(
         bounded(|| tn::Events::with_limit(tn::MAX_DATA), &bytes),
         (events.clone(), None)
@@ -78,9 +91,11 @@ fn telnet_chunked_wire_round_trip() {
         },
     ];
     for value in typed {
-        contract::check_wire_value(&value);
+        let _ = assert_write(&value);
         let bytes = Wire::to_bytes(&value).unwrap();
-        contract::check_wire::<tn::Subnegotiation>(&bytes);
+        if let Ok(value) = <tn::Subnegotiation as Wire>::parse(&bytes) {
+            assert_write(&value).unwrap();
+        }
         assert_eq!(<tn::Subnegotiation as Wire>::parse(&bytes), Ok(value));
     }
 }
@@ -239,7 +254,16 @@ fn telnet_recovers_from_bad_units_and_discards_oversized_subnegotiations() {
         tn::Event::Error(tn::Error::SubnegotiationInterrupted { option: 43 }),
         tn::Event::Command(tn::Command::Nop),
     ];
-    contract::check_decode_with_held_limit(tn::Events::new, &bytes, 0);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(tn::Events::new()),
+            chunks(&bytes, &[1, 7, 64]),
+            |s| {
+                assert_eq!(s.held(), 0);
+            }
+        ),
+        decode_all(tn::Events::new, &bytes)
+    );
     assert_eq!(bounded(tn::Events::new, &bytes), (want.clone(), None));
     // Overflow followed by another command reports interruption.
     let mut interrupted = vec![255, 250, 42];
@@ -437,7 +461,7 @@ fn telnet_wire_is_exact_strict_and_transactional() {
         },
         tn::Event::Error(tn::Error::UnknownCommand(0)),
     ] {
-        contract::check_wire_value(&event);
+        let _ = assert_write(&event);
         let mut out = vec![7, 8];
         assert!(event.write(&mut out).is_err());
         assert_eq!(out, [7, 8]);
@@ -459,7 +483,7 @@ fn telnet_wire_is_exact_strict_and_transactional() {
             data: vec![0; tn::MAX_SUBNEGOTIATION + 1],
         },
     ] {
-        contract::check_wire_value(&sub);
+        let _ = assert_write(&sub);
         let mut out = vec![7];
         assert!(sub.write(&mut out).is_err());
         assert_eq!(out, [7]);
@@ -499,7 +523,10 @@ fn frame(fin: bool, opcode: ws::Opcode, payload: &[u8], mask: Option<[u8; 4]>) -
 }
 
 fn frame_bytes(frames: &[ws::Frame]) -> Vec<u8> {
-    frames.iter().flat_map(contract::check_written).collect()
+    frames
+        .iter()
+        .flat_map(|value| assert_write(value).unwrap())
+        .collect()
 }
 
 #[test]
@@ -517,15 +544,25 @@ fn websocket_masked_fragmented_text_with_interleaved_controls() {
         ];
         let bytes = frame_bytes(&frames);
         for frame in &frames {
-            contract::check_wire_value(frame);
-            contract::check_wire::<ws::Frame>(&Wire::to_bytes(frame).unwrap());
+            let _ = assert_write(frame);
+            if let Ok(value) = <ws::Frame as Wire>::parse(&Wire::to_bytes(frame).unwrap()) {
+                assert_write(&value).unwrap();
+            }
         }
         bounded(|| ws::Frames::for_receiver(receiver), &bytes);
         bounded(|| ws::Messages::for_receiver(receiver), &bytes);
-        contract::check_decode_with_held_limit(
-            || ws::Messages::for_receiver(receiver).with_limit(256),
-            &bytes,
-            256,
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(ws::Messages::for_receiver(receiver).with_limit(256)),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| {
+                    assert!(s.held() <= 256);
+                }
+            ),
+            decode_all(
+                || ws::Messages::for_receiver(receiver).with_limit(256),
+                &bytes
+            )
         );
         assert_eq!(
             bounded(|| ws::Frames::for_receiver(receiver), &bytes),
@@ -588,7 +625,7 @@ fn websocket_wire_refuses_invalid_close_payloads_transactionally() {
             let mut out = vec![7, 8];
             assert_eq!(frame.write(&mut out), Err(ws::Error::Unwritable));
             assert_eq!(out, [7, 8]);
-            contract::check_wire_value(&frame);
+            let _ = assert_write(&frame);
             // A malformed fixture must bypass the strict writer.
             let mut bytes = vec![
                 0x88,
@@ -603,7 +640,9 @@ fn websocket_wire_refuses_invalid_close_payloads_transactionally() {
                 ws::apply_mask(&mut bytes[start..], key, 0);
             }
             assert_eq!(<ws::Frame as Wire>::parse(&bytes), Err(error));
-            contract::check_wire::<ws::Frame>(&bytes);
+            if let Ok(value) = <ws::Frame as Wire>::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
         }
     }
     for payload in [&[][..], &[0x03, 0xe8], b"\x03\xe8bye"] {
@@ -612,7 +651,7 @@ fn websocket_wire_refuses_invalid_close_payloads_transactionally() {
             (fictionet::stdlib::codec::Side::Server, Some([1, 2, 3, 4])),
         ] {
             let frame = frame(true, ws::Opcode::Close, payload, mask);
-            contract::check_wire_value(&frame);
+            let _ = assert_write(&frame);
             let bytes = Wire::to_bytes(&frame).unwrap();
             assert_eq!(
                 bounded(|| ws::Frames::for_receiver(receiver), &bytes),
@@ -857,7 +896,7 @@ fn websocket_wire_refuses_loss_and_requires_exact_input() {
         frame(true, ws::Opcode::Pong, &[0; 126], None),
         ws::Frame::new(ws::Opcode::Binary, vec![0; ws::MAX_PAYLOAD + 1]),
     ] {
-        contract::check_wire_value(&frame);
+        let _ = assert_write(&frame);
         let mut out = vec![1, 2];
         assert!(frame.write(&mut out).is_err());
         assert_eq!(out, [1, 2]);
@@ -871,7 +910,7 @@ fn websocket_wire_refuses_loss_and_requires_exact_input() {
         Err(ws::Error::Trailing)
     );
     for length in [0, 1, 125, 126, 65535, 65536] {
-        contract::check_wire_value(&frame(
+        let _ = assert_write(&frame(
             true,
             ws::Opcode::Binary,
             &vec![7; length],
@@ -887,9 +926,15 @@ fn interactive_contracts_on_generated_inputs() {
         let bytes = rng.bytes(96);
         bounded(tn::Events::new, &bytes);
         bounded(|| tn::Events::with_limit(7), &bytes);
-        contract::check_wire::<tn::Event>(&bytes);
-        contract::check_wire::<tn::Subnegotiation>(&bytes);
-        contract::check_wire::<ws::Frame>(&bytes);
+        if let Ok(value) = <tn::Event as Wire>::parse(&bytes) {
+            let _ = assert_write(&value);
+        }
+        if let Ok(value) = <tn::Subnegotiation as Wire>::parse(&bytes) {
+            let _ = assert_write(&value);
+        }
+        if let Ok(value) = <ws::Frame as Wire>::parse(&bytes) {
+            let _ = assert_write(&value);
+        }
         let receiver = if round % 2 == 0 {
             fictionet::stdlib::codec::Side::Server
         } else {

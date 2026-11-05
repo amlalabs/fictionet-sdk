@@ -1,9 +1,9 @@
 //! RESP (Redis) commands and values through the shared codec driver.
 
 use fictionet::stdlib::codec::{Decode, Fail, Lcg, Stream, Wire, finish, pump};
-use fictionet::stdlib::test_support::contract;
 
 use fictionet::stdlib::protocols::resp;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
 use fictionet::stdlib::test_support::{decode_all, mutate};
 
 const RESP_LIMIT: usize = 128;
@@ -22,10 +22,15 @@ fn resp_requests_and_replies() {
     Wire::write(&command, &mut input).unwrap();
     input.extend_from_slice(b"GET key\n");
     let expected = [command, resp::Command::new(["GET", "key"])];
-    contract::check_decode_with_alloc_limit(
-        || resp::Commands::with_limits(resp_limits()),
-        &input,
-        2 * RESP_LIMIT,
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(resp::Commands::with_limits(resp_limits())),
+            chunks(&input, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 2 * RESP_LIMIT);
+            }
+        ),
+        decode_all(|| resp::Commands::with_limits(resp_limits()), &input)
     );
     let (commands, error) = decode_all(|| resp::Commands::with_limits(resp_limits()), &input);
     assert_eq!(error, None);
@@ -33,7 +38,9 @@ fn resp_requests_and_replies() {
     let mut replies = Vec::new();
     for command in commands {
         let request = Wire::to_bytes(&command).unwrap();
-        contract::check_wire::<resp::Command>(&request);
+        if let Ok(value) = <resp::Command as Wire>::parse(&request) {
+            assert_write(&value).unwrap();
+        }
         assert_eq!(
             <resp::Command as Wire>::parse(&request),
             Ok(command.clone())
@@ -45,17 +52,24 @@ fn resp_requests_and_replies() {
         };
         Wire::write(&reply, &mut replies).unwrap();
     }
-    contract::check_decode_with_alloc_limit(
-        || resp::Values::with_limits(resp_limits()),
-        &replies,
-        2 * RESP_LIMIT,
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(resp::Values::with_limits(resp_limits())),
+            chunks(&replies, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 2 * RESP_LIMIT);
+            }
+        ),
+        decode_all(|| resp::Values::with_limits(resp_limits()), &replies)
     );
     let (values, error) = decode_all(|| resp::Values::with_limits(resp_limits()), &replies);
     assert_eq!(error, None);
     assert_eq!(values, [resp::Value::ok(), resp::Value::bulk("value")]);
     for value in values {
         let bytes = Wire::to_bytes(&value).unwrap();
-        contract::check_wire::<resp::Value>(&bytes);
+        if let Ok(value) = <resp::Value as Wire>::parse(&bytes) {
+            assert_write(&value).unwrap();
+        }
         assert_eq!(<resp::Value as Wire>::parse(&bytes), Ok(value));
     }
 }
@@ -84,10 +98,16 @@ fn resp_limits_and_terminal_errors() {
     );
     assert!(values.next().is_none());
     for bytes in [&b"+OK\r\n$9\r\nabc"[..], b"+OK\r\n:bad\r\n+later\r\n"] {
-        contract::check_decode_with_alloc_limit(
-            resp::Values::new,
-            bytes,
-            2 * resp::Values::new().capacity(),
+        let alloc_limit = 2 * resp::Values::new().capacity();
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(resp::Values::new()),
+                chunks(bytes, &[1, 7, 64]),
+                |s| {
+                    assert!(s.allocated() <= alloc_limit);
+                }
+            ),
+            decode_all(resp::Values::new, bytes)
         );
         let (values, error) = decode_all(resp::Values::new, bytes);
         assert_eq!(values, [resp::Value::ok()]);
@@ -101,10 +121,16 @@ fn resp_limits_and_terminal_errors() {
         );
     }
     let bytes = b"PING\r\n*1\r\n+bad\r\nGET x\r\n";
-    contract::check_decode_with_alloc_limit(
-        resp::Commands::new,
-        bytes,
-        2 * resp::Commands::new().capacity(),
+    let alloc_limit = 2 * resp::Commands::new().capacity();
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(resp::Commands::new()),
+            chunks(bytes, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= alloc_limit);
+            }
+        ),
+        decode_all(resp::Commands::new, bytes)
     );
     assert_eq!(
         decode_all(resp::Commands::new, bytes),
@@ -120,11 +146,27 @@ fn resp_limits_and_terminal_errors() {
         };
         let make = || resp::Values::with_limits(limits);
         assert!(make().capacity() <= resp::MAX_FRAME_LEN);
-        contract::check_decode_with_alloc_limit(make, b"_\r\n+tail", 2 * make().capacity());
-        contract::check_decode_with_alloc_limit(
-            || resp::Commands::with_limits(limits),
-            b"\n*0\r\nPING\n",
-            2 * (resp::Commands::with_limits(limits)).capacity(),
+        let alloc_limit = 2 * make().capacity();
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(make()),
+                chunks(b"_\r\n+tail", &[1, 7, 64]),
+                |s| {
+                    assert!(s.allocated() <= alloc_limit);
+                }
+            ),
+            decode_all(make, b"_\r\n+tail")
+        );
+        let alloc_limit = 2 * (resp::Commands::with_limits(limits)).capacity();
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(resp::Commands::with_limits(limits)),
+                chunks(b"\n*0\r\nPING\n", &[1, 7, 64]),
+                |s| {
+                    assert!(s.allocated() <= alloc_limit);
+                }
+            ),
+            decode_all(|| resp::Commands::with_limits(limits), b"\n*0\r\nPING\n")
         );
     }
 }
@@ -152,13 +194,21 @@ fn resp_strict_writers_preserve_types_and_roll_back() {
         )]),
     ];
     for value in values {
-        contract::check_wire_value(&value);
+        let _ = assert_write(&value);
         let bytes = Wire::to_bytes(&value).unwrap();
-        contract::check_wire::<resp::Value>(&bytes);
-        contract::check_decode_with_alloc_limit(
-            resp::Values::new,
-            &bytes,
-            2 * resp::Values::new().capacity(),
+        if let Ok(value) = <resp::Value as Wire>::parse(&bytes) {
+            assert_write(&value).unwrap();
+        }
+        let alloc_limit = 2 * resp::Values::new().capacity();
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(resp::Values::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| {
+                    assert!(s.allocated() <= alloc_limit);
+                }
+            ),
+            decode_all(resp::Values::new, &bytes)
         );
     }
     for value in [
@@ -168,7 +218,7 @@ fn resp_strict_writers_preserve_types_and_roll_back() {
         resp::Value::Array(vec![resp::Value::Push(vec![resp::Value::simple("bad")])]),
         resp::Value::simple(vec![b'x'; resp::MAX_LINE_LEN + 1]),
     ] {
-        contract::check_wire_value(&value);
+        let _ = assert_write(&value);
         let mut out = b"prefix".to_vec();
         assert_eq!(Wire::write(&value, &mut out), Err(resp::Error::Unwritable));
         assert_eq!(out, b"prefix");
@@ -181,7 +231,7 @@ fn resp_strict_writers_preserve_types_and_roll_back() {
     let command = resp::Command {
         args: vec![vec![0; resp::MAX_BULK_LEN + 1]],
     };
-    contract::check_wire_value(&command);
+    let _ = assert_write(&command);
     assert_eq!(Wire::to_bytes(&command), Err(resp::Error::Unwritable));
     assert_eq!(
         <resp::Value as Wire>::parse(b"+OK\r\n+more\r\n"),
@@ -195,7 +245,9 @@ fn resp_strict_writers_preserve_types_and_roll_back() {
         <resp::Command as Wire>::parse(b"PING\nGET x\n"),
         Err(resp::Error::Trailing)
     );
-    contract::check_wire::<resp::Command>(b"\r\n");
+    if let Ok(value) = <resp::Command as Wire>::parse(b"\r\n") {
+        assert_write(&value).unwrap();
+    }
     // NaN is not reflexive under Value's existing PartialEq. Its wire form is.
     let bytes = Wire::to_bytes(&resp::Value::Double(f64::NAN)).unwrap();
     assert_eq!(bytes, b",nan\r\n");
@@ -213,7 +265,16 @@ fn resp_scan_resumes_across_lines_and_aggregates() {
     bytes.extend_from_slice(b";0\r\n+");
     bytes.extend(std::iter::repeat_n(b'y', resp::MAX_LINE_LEN));
     bytes.extend_from_slice(b"\r\n.\r\n");
-    contract::check_decode_with_alloc_limit(resp::Values::new, &bytes, 2 * resp::MAX_FRAME_LEN);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(resp::Values::new()),
+            chunks(&bytes, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 2 * resp::MAX_FRAME_LEN);
+            }
+        ),
+        decode_all(resp::Values::new, &bytes)
+    );
     let (values, error) = decode_all(resp::Values::new, &bytes);
     assert_eq!(error, None);
     assert_eq!(
@@ -228,7 +289,16 @@ fn resp_scan_resumes_across_lines_and_aggregates() {
         args: vec![vec![b'z'; 1]; 4096],
     };
     let bytes = Wire::to_bytes(&command).unwrap();
-    contract::check_decode_with_alloc_limit(resp::Commands::new, &bytes, 2 * resp::MAX_FRAME_LEN);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(resp::Commands::new()),
+            chunks(&bytes, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 2 * resp::MAX_FRAME_LEN);
+            }
+        ),
+        decode_all(resp::Commands::new, &bytes)
+    );
     let mut got = Vec::new();
     pump(&mut stream, &bytes, |c| got.push(c)).unwrap();
     finish(&mut stream, |c| got.push(c)).unwrap();
@@ -242,7 +312,16 @@ fn small_resp_capacity_drains_a_long_pipeline() {
         ..resp::Limits::DEFAULT
     };
     let bytes = b"_\r\n".repeat(100);
-    contract::check_decode_with_alloc_limit(|| resp::Values::with_limits(limits), &bytes, 8);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(resp::Values::with_limits(limits)),
+            chunks(&bytes, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 8);
+            }
+        ),
+        decode_all(|| resp::Values::with_limits(limits), &bytes)
+    );
     assert_eq!(
         decode_all(|| resp::Values::with_limits(limits), &bytes),
         (vec![resp::Value::Null; 100], None)
@@ -261,15 +340,29 @@ fn resp_contracts_on_mutated_values() {
         let end = rng.index(bytes.len() + 1);
         bytes.truncate(end);
         // Compare strict encodings so NaN retains its wire equality.
-        contract::check_decode_with_alloc_limit(
-            || resp::Values::new().map(|v| Wire::to_bytes(&v)),
-            &bytes,
-            2 * (resp::Values::new().map(|v| Wire::to_bytes(&v))).capacity(),
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(resp::Values::new().map(|v| Wire::to_bytes(&v))),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| {
+                    assert!(
+                        s.allocated()
+                            <= 2 * (resp::Values::new().map(|v| Wire::to_bytes(&v))).capacity()
+                    );
+                }
+            ),
+            decode_all(|| resp::Values::new().map(|v| Wire::to_bytes(&v)), &bytes)
         );
-        contract::check_decode_with_alloc_limit(
-            resp::Commands::new,
-            &bytes,
-            2 * resp::Commands::new().capacity(),
+        let alloc_limit = 2 * resp::Commands::new().capacity();
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(resp::Commands::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| {
+                    assert!(s.allocated() <= alloc_limit);
+                }
+            ),
+            decode_all(resp::Commands::new, &bytes)
         );
     }
 }

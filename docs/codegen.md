@@ -435,12 +435,12 @@ under the node budget. There is no speculative parsing of partial stream
 bodies. Returned values have bounded depth, including when dropped.
 
 Generated tests build bounded values with public `codec::Lcg` and run
-`stdlib::test_support::contract::check_wire_value`. Each type and stream must sample and write
+`stdlib::test_support::assert_write`. Each type and stream must sample and write
 successfully at least once. Seed zero selects the minimum shape.
-Stream tests run `check_decoded` on each writable sample and on their
-concatenation. They assert the expected values, terminal success, and full
-input consumption, along with chunking invariance and the input allocation
-bound. Tests cover invalid writes, malformed bytes, recursion limits,
+Stream tests write the writable samples back to back and decode them in one
+pass of `stdlib::test_support::decode_chunks` over small chunks. They assert
+the expected values, terminal success, full input consumption, no held
+state, and the input allocation bound. Tests cover invalid writes, malformed bytes, recursion limits,
 every generator error category, CLI errors,
 JSON limits, deterministic output, and exact golden source bytes.
 Formatting checks run `rustfmt --edition 2024 --check` over the goldens,

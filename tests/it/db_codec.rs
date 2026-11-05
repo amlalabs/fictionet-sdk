@@ -4,7 +4,7 @@ use core::fmt::Debug;
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Decode, Fail, Lcg, Step, Stream, Wire, finish};
 use fictionet::stdlib::protocols::{git_protocol, mongodb, mysql, sftp, tds};
-use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
 
 fn check_frames<D>(make: impl Fn() -> D, values: &[D::Item])
 where
@@ -12,9 +12,16 @@ where
     D::Item: Wire + Clone + PartialEq + Debug,
     D::Error: Clone + PartialEq + Debug,
 {
-    let bytes: Vec<u8> = values.iter().flat_map(contract::check_written).collect();
+    let bytes: Vec<u8> = values
+        .iter()
+        .flat_map(|value| assert_write(value).unwrap())
+        .collect();
+    let alloc_limit = 2 * make().capacity();
     assert_eq!(
-        contract::check_decode_limits(&make, &bytes, 0, 2 * make().capacity()),
+        decode_chunks(&mut Stream::new(make()), chunks(&bytes, &[1, 7, 64]), |s| {
+            assert_eq!(s.held(), 0);
+            assert!(s.allocated() <= alloc_limit);
+        }),
         (values.to_vec(), None)
     );
 }
@@ -25,8 +32,11 @@ where
     D::Item: PartialEq + Debug,
     D::Error: Clone + PartialEq + Debug,
 {
+    let alloc_limit = 2 * make().capacity();
     assert_eq!(
-        contract::check_decode_with_alloc_limit(make, header, 2 * make().capacity()),
+        decode_chunks(&mut Stream::new(make()), chunks(header, &[1, 7, 64]), |s| {
+            assert!(s.allocated() <= alloc_limit);
+        }),
         (vec![], Some(Fail::Protocol(error.clone())))
     );
     let mut stream = Stream::new(make());
@@ -51,14 +61,32 @@ where
     D::Item: Wire + Clone + PartialEq + Debug,
     D::Error: Clone + PartialEq + Debug,
 {
-    let bytes = contract::check_written(&value);
-    contract::check_truncated(make, &bytes);
+    let bytes = assert_write(&value).unwrap();
+    assert_eq!(decode_all(make, &[]), (vec![], None));
+    for cut in 1..bytes.len() {
+        assert_eq!(
+            decode_all(make, &bytes[..cut]),
+            (vec![], Some(Fail::Truncated { unread: cut })),
+            "prefix {cut}"
+        );
+    }
     assert_eq!(
-        contract::check_decode_with_held_limit(make, &bytes, 0),
+        decode_chunks(&mut Stream::new(make()), chunks(&bytes, &[1, 7, 64]), |s| {
+            assert_eq!(s.held(), 0);
+        }),
         (vec![value], None)
     );
     for cut in 0..bytes.len() {
-        contract::check_decode_with_held_limit(make, &bytes[..cut], 0);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(make()),
+                chunks(&bytes[..cut], &[1, 7, 64]),
+                |s| {
+                    assert_eq!(s.held(), 0);
+                }
+            ),
+            decode_all(make, &bytes[..cut])
+        );
     }
 }
 
@@ -164,7 +192,20 @@ fn mongodb_truncated_frame_at_eof() {
 #[test]
 fn mongodb_wire_is_exact_and_transactional() {
     let value = mongo_ping();
-    let bytes = contract::check_exact(&value);
+    let bytes = assert_write(&value).unwrap();
+    for cut in 0..bytes.len() {
+        assert!(
+            <mongodb::Message as Wire>::parse(&bytes[..cut]).is_err(),
+            "prefix {cut}"
+        );
+    }
+    for tail in [0x00, 0xff] {
+        let trailing = [bytes.as_slice(), &[tail]].concat();
+        assert!(
+            <mongodb::Message as Wire>::parse(&trailing).is_err(),
+            "trailing byte {tail}"
+        );
+    }
     assert!(
         <mongodb::Message as Wire>::parse(&[bytes.as_slice(), bytes.as_slice()].concat()).is_err()
     );
@@ -177,11 +218,12 @@ fn mongodb_wire_is_exact_and_transactional() {
         panic!("expected OP_MSG")
     };
     msg.flags = 1 << 20;
-    contract::check_refused(&mongodb::Message {
+    assert_write(&mongodb::Message {
         request_id: 1,
         response_to: 0,
         body: mongodb::Body::Msg(msg),
-    });
+    })
+    .unwrap_err();
     let mut invalid = mongo_ping();
     invalid.body = mongodb::Body::Query(mongodb::Query {
         flags: 0,
@@ -191,15 +233,16 @@ fn mongodb_wire_is_exact_and_transactional() {
         query: mongodb::Document::new(),
         fields: None,
     });
-    contract::check_refused(&invalid);
-    contract::check_refused(&mongodb::Message {
+    assert_write(&invalid).unwrap_err();
+    assert_write(&mongodb::Message {
         request_id: 1,
         response_to: 0,
         body: mongodb::Body::Other {
             op_code: mongodb::op_code::MSG,
             data: vec![],
         },
-    });
+    })
+    .unwrap_err();
 }
 
 #[test]
@@ -211,7 +254,14 @@ fn mongodb_body_recovery_and_terminal_failure() {
     bad.extend_from_slice(&[0; 4]); // No body section.
     let mut input = bad.clone();
     Wire::write(&good, &mut input).unwrap();
-    contract::check_decode(Frames::<mongodb::Message>::new, &input);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<mongodb::Message>::new()),
+            chunks(&input, &[1, 7, 64]),
+            |_| {}
+        ),
+        decode_all(Frames::<mongodb::Message>::new, &input)
+    );
 
     let mut stream = Stream::new(Frames::<mongodb::Message>::new());
     assert_eq!(stream.push(&input), input.len());
@@ -305,7 +355,20 @@ fn mysql_wire_is_exact_and_transactional() {
         seq: 7,
         payload: vec![0, 1, 2],
     };
-    let bytes = contract::check_exact(&value);
+    let bytes = assert_write(&value).unwrap();
+    for cut in 0..bytes.len() {
+        assert!(
+            <mysql::Packet as Wire>::parse(&bytes[..cut]).is_err(),
+            "prefix {cut}"
+        );
+    }
+    for tail in [0x00, 0xff] {
+        let trailing = [bytes.as_slice(), &[tail]].concat();
+        assert!(
+            <mysql::Packet as Wire>::parse(&trailing).is_err(),
+            "trailing byte {tail}"
+        );
+    }
     assert!(
         <mysql::Packet as Wire>::parse(&[bytes.as_slice(), bytes.as_slice()].concat()).is_err()
     );
@@ -314,10 +377,11 @@ fn mysql_wire_is_exact_and_transactional() {
         <mysql::Packet as Wire>::parse(&joined),
         Err(mysql::Error::Trailing)
     );
-    contract::check_refused(&mysql::Packet {
+    assert_write(&mysql::Packet {
         seq: 7,
         payload: vec![0; mysql::MAX_PACKET_PAYLOAD + 1],
-    });
+    })
+    .unwrap_err();
     let mut empty = Frames::<mysql::Packet>::with_limit(0);
     assert_eq!(
         empty.decode(&[0, 0, 0, 255], false),
@@ -420,7 +484,20 @@ fn tds_truncated_frame_at_eof() {
 #[test]
 fn tds_wire_is_exact_and_transactional() {
     let value = tds_packet();
-    let bytes = contract::check_exact(&value);
+    let bytes = assert_write(&value).unwrap();
+    for cut in 0..bytes.len() {
+        assert!(
+            <tds::Packet as Wire>::parse(&bytes[..cut]).is_err(),
+            "prefix {cut}"
+        );
+    }
+    for tail in [0x00, 0xff] {
+        let trailing = [bytes.as_slice(), &[tail]].concat();
+        assert!(
+            <tds::Packet as Wire>::parse(&trailing).is_err(),
+            "trailing byte {tail}"
+        );
+    }
     assert!(<tds::Packet as Wire>::parse(&[bytes.as_slice(), bytes.as_slice()].concat()).is_err());
     assert_eq!(bytes, value.to_bytes().unwrap());
     let joined = [bytes.as_slice(), &[0xff]].concat();
@@ -432,12 +509,12 @@ fn tds_wire_is_exact_and_transactional() {
         data: vec![0; tds::MAX_PACKET - tds::HEADER_LEN + 1],
         ..tds_packet()
     };
-    contract::check_refused(&large);
+    assert_write(&large).unwrap_err();
     let maximum = tds::Packet {
         data: vec![0; tds::MAX_PACKET - tds::HEADER_LEN],
         ..tds_packet()
     };
-    contract::check_wire_value(&maximum);
+    let _ = assert_write(&maximum);
     assert_eq!(Wire::to_bytes(&maximum).unwrap().len(), tds::MAX_PACKET);
 }
 
@@ -527,7 +604,20 @@ fn git_wire_is_exact_and_transactional() {
         Packet::Data(vec![]),
         Packet::Data(vec![1; 10]),
     ] {
-        let bytes = contract::check_exact(&value);
+        let bytes = assert_write(&value).unwrap();
+        for cut in 0..bytes.len() {
+            assert!(
+                <git_protocol::Packet as Wire>::parse(&bytes[..cut]).is_err(),
+                "prefix {cut}"
+            );
+        }
+        for tail in [0x00, 0xff] {
+            let trailing = [bytes.as_slice(), &[tail]].concat();
+            assert!(
+                <git_protocol::Packet as Wire>::parse(&trailing).is_err(),
+                "trailing byte {tail}"
+            );
+        }
         assert!(
             <git_protocol::Packet as Wire>::parse(&[bytes.as_slice(), bytes.as_slice()].concat())
                 .is_err()
@@ -540,14 +630,16 @@ fn git_wire_is_exact_and_transactional() {
         );
     }
     let upper = b"000Aabcdef";
-    contract::check_wire::<Packet>(upper);
+    if let Ok(value) = <Packet as Wire>::parse(upper) {
+        assert_write(&value).unwrap();
+    }
     assert_eq!(
         Wire::to_bytes(&<Packet as Wire>::parse(upper).unwrap()).unwrap(),
         b"000aabcdef"
     );
     let large = Packet::Data(vec![0; git_protocol::MAX_DATA + 1]);
-    contract::check_refused(&large);
-    contract::check_wire_value(&Packet::Data(vec![0; git_protocol::MAX_DATA]));
+    assert_write(&large).unwrap_err();
+    let _ = assert_write(&Packet::Data(vec![0; git_protocol::MAX_DATA]));
 }
 
 #[test]
@@ -632,7 +724,20 @@ fn sftp_truncated_frame_at_eof() {
 #[test]
 fn sftp_wire_is_exact_and_transactional() {
     let value = sftp_packet();
-    let bytes = contract::check_exact(&value);
+    let bytes = assert_write(&value).unwrap();
+    for cut in 0..bytes.len() {
+        assert!(
+            <sftp::Packet as Wire>::parse(&bytes[..cut]).is_err(),
+            "prefix {cut}"
+        );
+    }
+    for tail in [0x00, 0xff] {
+        let trailing = [bytes.as_slice(), &[tail]].concat();
+        assert!(
+            <sftp::Packet as Wire>::parse(&trailing).is_err(),
+            "trailing byte {tail}"
+        );
+    }
     assert!(<sftp::Packet as Wire>::parse(&[bytes.as_slice(), bytes.as_slice()].concat()).is_err());
     assert_eq!(bytes, value.to_bytes().unwrap());
     let joined = [bytes.as_slice(), &[0xff]].concat();
@@ -644,8 +749,8 @@ fn sftp_wire_is_exact_and_transactional() {
         kind: 0xff,
         body: vec![0; sftp::MAX_PACKET],
     };
-    contract::check_refused(&large);
-    contract::check_wire_value(&sftp::Packet {
+    assert_write(&large).unwrap_err();
+    let _ = assert_write(&sftp::Packet {
         kind: 0xff,
         body: vec![0; sftp::MAX_PACKET - 1],
     });
@@ -653,7 +758,20 @@ fn sftp_wire_is_exact_and_transactional() {
         kind: 0,
         body: vec![],
     };
-    let empty_bytes = contract::check_exact(&empty);
+    let empty_bytes = assert_write(&empty).unwrap();
+    for cut in 0..empty_bytes.len() {
+        assert!(
+            <sftp::Packet as Wire>::parse(&empty_bytes[..cut]).is_err(),
+            "prefix {cut}"
+        );
+    }
+    for tail in [0x00, 0xff] {
+        let trailing = [empty_bytes.as_slice(), &[tail]].concat();
+        assert!(
+            <sftp::Packet as Wire>::parse(&trailing).is_err(),
+            "trailing byte {tail}"
+        );
+    }
     assert!(
         <sftp::Packet as Wire>::parse(&[empty_bytes.as_slice(), empty_bytes.as_slice()].concat())
             .is_err()
@@ -723,36 +841,71 @@ fn arbitrary_bytes_obey_decoder_and_wire_contracts() {
     for size in [0, 1, 3, 4, 7, 8, 16, 31, 64, 257] {
         let mut data = vec![0; size];
         rng.fill(&mut data);
-        contract::check_decode_with_alloc_limit(
-            Frames::<mongodb::Message>::new,
-            &data,
-            2 * mongodb::MAX_MESSAGE_SIZE,
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<mongodb::Message>::new()),
+                chunks(&data, &[1, 7, 64]),
+                |s| {
+                    assert!(s.allocated() <= 2 * mongodb::MAX_MESSAGE_SIZE);
+                }
+            ),
+            decode_all(Frames::<mongodb::Message>::new, &data)
         );
-        contract::check_decode_with_alloc_limit(
-            Frames::<mysql::Packet>::new,
-            &data,
-            2 * mysql::MAX_FRAME,
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<mysql::Packet>::new()),
+                chunks(&data, &[1, 7, 64]),
+                |s| {
+                    assert!(s.allocated() <= 2 * mysql::MAX_FRAME);
+                }
+            ),
+            decode_all(Frames::<mysql::Packet>::new, &data)
         );
-        contract::check_decode_with_alloc_limit(
-            Frames::<tds::Packet>::new,
-            &data,
-            2 * tds::MAX_PACKET,
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<tds::Packet>::new()),
+                chunks(&data, &[1, 7, 64]),
+                |s| {
+                    assert!(s.allocated() <= 2 * tds::MAX_PACKET);
+                }
+            ),
+            decode_all(Frames::<tds::Packet>::new, &data)
         );
-        contract::check_decode_with_alloc_limit(
-            Frames::<git_protocol::Packet>::new,
-            &data,
-            2 * git_protocol::MAX_PACKET,
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<git_protocol::Packet>::new()),
+                chunks(&data, &[1, 7, 64]),
+                |s| {
+                    assert!(s.allocated() <= 2 * git_protocol::MAX_PACKET);
+                }
+            ),
+            decode_all(Frames::<git_protocol::Packet>::new, &data)
         );
-        contract::check_decode_with_alloc_limit(
-            Frames::<sftp::Packet>::new,
-            &data,
-            2 * sftp::MAX_FRAME,
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<sftp::Packet>::new()),
+                chunks(&data, &[1, 7, 64]),
+                |s| {
+                    assert!(s.allocated() <= 2 * sftp::MAX_FRAME);
+                }
+            ),
+            decode_all(Frames::<sftp::Packet>::new, &data)
         );
-        contract::check_wire::<mongodb::Message>(&data);
-        contract::check_wire::<mysql::Packet>(&data);
-        contract::check_wire::<tds::Packet>(&data);
-        contract::check_wire::<git_protocol::Packet>(&data);
-        contract::check_wire::<sftp::Packet>(&data);
+        if let Ok(value) = <mongodb::Message as Wire>::parse(&data) {
+            let _ = assert_write(&value);
+        }
+        if let Ok(value) = <mysql::Packet as Wire>::parse(&data) {
+            let _ = assert_write(&value);
+        }
+        if let Ok(value) = <tds::Packet as Wire>::parse(&data) {
+            let _ = assert_write(&value);
+        }
+        if let Ok(value) = <git_protocol::Packet as Wire>::parse(&data) {
+            let _ = assert_write(&value);
+        }
+        if let Ok(value) = <sftp::Packet as Wire>::parse(&data) {
+            let _ = assert_write(&value);
+        }
     }
 }
 
@@ -763,7 +916,13 @@ where
     D::Error: Clone + PartialEq + Debug,
 {
     let bytes = value.to_bytes().unwrap();
-    contract::check_decode_with_alloc_limit(make, &bytes, 2 * make().capacity());
+    let alloc_limit = 2 * make().capacity();
+    assert_eq!(
+        decode_chunks(&mut Stream::new(make()), chunks(&bytes, &[1, 7, 64]), |s| {
+            assert!(s.allocated() <= alloc_limit);
+        }),
+        decode_all(make, &bytes)
+    );
     let mut stream = Stream::new(make());
     assert_eq!(stream.push(&bytes), bytes.len());
     assert_eq!(
@@ -838,7 +997,7 @@ fn mongodb_wire_size_limit() {
         panic!("expected raw body")
     };
     data.push(0);
-    contract::check_refused(&value);
+    assert_write(&value).unwrap_err();
 }
 
 #[test]
@@ -936,18 +1095,20 @@ fn payload_readers_refuse_trailing_bytes() {
 #[test]
 fn mysql_writers_preserve_flags_and_optional_fields() {
     use mysql::{Error, HandshakeResponse, OkPacket, capability};
-    contract::check_refused(&HandshakeResponse::default());
+    assert_write(&HandshakeResponse::default()).unwrap_err();
     for capabilities in [0, capability::SSL, capability::PROTOCOL_41] {
-        contract::check_refused(&mysql::SslRequest {
+        assert_write(&mysql::SslRequest {
             capabilities,
             ..mysql::SslRequest::default()
-        });
+        })
+        .unwrap_err();
     }
-    contract::check_refused(&mysql::Handshake {
+    assert_write(&mysql::Handshake {
         auth_data: vec![1; 21],
         auth_plugin: b"plugin".to_vec(),
         ..mysql::Handshake::default()
-    });
+    })
+    .unwrap_err();
     let base = HandshakeResponse {
         capabilities: capability::PROTOCOL_41,
         ..HandshakeResponse::default()
@@ -970,7 +1131,7 @@ fn mysql_writers_preserve_flags_and_optional_fields() {
             ..base
         },
     ] {
-        contract::check_refused(&response);
+        assert_write(&response).unwrap_err();
     }
     for ok in [
         OkPacket {
@@ -1015,20 +1176,23 @@ fn tds_payload_limits_and_complete_messages() {
         Some(Err(tds::Error::Limit("response past MAX_MESSAGE")))
     );
     assert_eq!(tokens.next(), None);
-    contract::check_refused(&tds::Message {
+    assert_write(&tds::Message {
         packet_type: 1,
         status: 0,
         spid: 0,
         data: vec![],
-    });
-    contract::check_refused(&tds::Login7 {
+    })
+    .unwrap_err();
+    assert_write(&tds::Login7 {
         features: Some(vec![]),
         ..tds::Login7::new()
-    });
-    contract::check_refused(&tds::Login7 {
+    })
+    .unwrap_err();
+    assert_write(&tds::Login7 {
         option_flags3: tds::option_flags3::EXTENSION,
         ..tds::Login7::new()
-    });
+    })
+    .unwrap_err();
     let oversized_batch = tds::SqlBatch {
         headers: None,
         text: "x".repeat(tds::MAX_MESSAGE / 2 + 1),

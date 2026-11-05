@@ -352,6 +352,8 @@ impl<T> Step<T> {
 /// `Self::Error: Clone`. Modes change only between items.
 /// [`Stream`] reports a decoder that over-consumes, grows held state across
 /// `Need` or never finishes as [`Fail::Stuck`].
+/// [`crate::stdlib::test_support::decode_chunks`] drives a decoder over
+/// chosen chunks so tests can check these rules.
 pub trait Decode {
     /// An owned decoded unit. Recoverable unit errors belong here.
     type Item;
