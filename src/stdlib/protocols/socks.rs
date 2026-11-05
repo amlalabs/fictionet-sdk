@@ -1533,8 +1533,9 @@ mod tests {
     use codec::{Decode, Fail, Lcg, Stream};
     use fictionet::assert_cases;
 
-    use fictionet::stdlib::test_support::contract;
-    use fictionet::stdlib::test_support::{chunks, decode_all, mutate};
+    use fictionet::stdlib::test_support::{
+        assert_write, chunks, decode_all, decode_chunks, mutate,
+    };
 
     fn auth_request(username: Vec<u8>, password: Vec<u8>) -> AuthRequest {
         AuthRequest { username, password }
@@ -1572,14 +1573,14 @@ mod tests {
             assert_eq!(Method::from_code(c).code(), c);
             assert_eq!(ReplyCode::from_code(c).code(), c);
             assert_eq!(Socks4Code::from_code(c).code(), c);
-            contract::check_wire_value(&Selection {
+            let _ = assert_write(&Selection {
                 method: Method::from_code(c),
             });
-            contract::check_wire_value(&Selection {
+            let _ = assert_write(&Selection {
                 method: Method::Other(c),
             });
-            contract::check_wire_value(&Reply::failure(ReplyCode::Other(c)));
-            contract::check_wire_value(&Socks4Reply {
+            let _ = assert_write(&Reply::failure(ReplyCode::Other(c)));
+            let _ = assert_write(&Socks4Reply {
                 code: Socks4Code::Other(c),
                 port: 0,
                 ip: Ipv4Addr::LOCALHOST,
@@ -1639,7 +1640,9 @@ mod tests {
                 for n in 0..bytes.len() {
                     assert_eq!(Request::parse(&bytes[..n]), Err(Error::Truncated));
                 }
-                contract::check_wire::<Request>(&bytes);
+                if let Ok(value) = Request::parse(&bytes) {
+                    assert_write(&value).unwrap();
+                }
             }
             let reply = Reply {
                 code: ReplyCode::Succeeded,
@@ -1651,7 +1654,7 @@ mod tests {
             for n in 0..bytes.len() {
                 assert_eq!(Reply::parse(&bytes[..n]), Err(Error::Truncated));
             }
-            contract::check_wire_value(&reply);
+            let _ = assert_write(&reply);
         }
         assert_eq!(
             Reply::failure(ReplyCode::HostUnreachable)
@@ -1710,9 +1713,9 @@ mod tests {
         let bytes = full.to_bytes().unwrap();
         assert_eq!(bytes.len(), 65_527);
         assert_eq!(UdpDatagram::parse(&bytes), Ok(full.clone()));
-        contract::check_wire_value(&full);
+        let _ = assert_write(&full);
         assert_eq!(
-            contract::check_refused(&header.datagram(vec![7; MAX_DATAGRAM - 9])),
+            assert_write(&header.datagram(vec![7; MAX_DATAGRAM - 9])).unwrap_err(),
             Error::Unwritable
         );
         assert_eq!(
@@ -1762,7 +1765,7 @@ mod tests {
             ip: Ipv4Addr::new(1, 2, 3, 4),
         };
         assert_eq!(reply.to_bytes().unwrap(), [0, 90, 0x12, 0x34, 1, 2, 3, 4]);
-        contract::check_wire_value(&reply);
+        let _ = assert_write(&reply);
         let longest = Socks4Request {
             command: Socks4Command::Connect,
             port: 80,
@@ -1775,7 +1778,14 @@ mod tests {
             Socks4Request::parse(&bytes[..MAX_MESSAGE - 1]),
             Err(Error::Truncated)
         );
-        contract::check_decode_with_alloc_limit(ClientMessages::new, &bytes, 2 * MAX_MESSAGE);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(ClientMessages::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_MESSAGE)
+            ),
+            decode_all(ClientMessages::new, &bytes)
+        );
         assert_eq!(
             decode_all(ClientMessages::new, &bytes),
             (vec![Ok(ClientMessage::Socks4(longest))], None)
@@ -1796,19 +1806,21 @@ mod tests {
             Socks4Destination::Domain(b"a\0b".to_vec()),
         ] {
             assert_eq!(
-                contract::check_refused(&Socks4Request {
+                assert_write(&Socks4Request {
                     destination,
                     ..req.clone()
-                }),
+                })
+                .unwrap_err(),
                 Error::Unwritable
             );
         }
         for user_id in [b"ab\0cd".to_vec(), vec![b'u'; 256]] {
             assert_eq!(
-                contract::check_refused(&Socks4Request {
+                assert_write(&Socks4Request {
                     user_id,
                     ..req.clone()
-                }),
+                })
+                .unwrap_err(),
                 Error::Unwritable
             );
         }
@@ -1848,7 +1860,7 @@ mod tests {
 
     #[test]
     fn writers_refuse_changes() {
-        assert_cases!(|input| contract::check_refused(input);
+        assert_cases!(|input| assert_write(input).unwrap_err();
             excess_methods: &Greeting { methods: vec![Method::NoAuth; MAX_METHODS + 1] } => Error::Unwritable,
             reserved_method: &Greeting { methods: vec![Method::Other(0)] } => Error::Unwritable,
             long_username: &auth_request(vec![0; 256], vec![]) => Error::Unwritable,
@@ -1871,16 +1883,16 @@ mod tests {
             methods: vec![Method::NoAuth; MAX_METHODS],
         };
         assert!(greeting.to_bytes().is_ok());
-        contract::check_wire_value(&greeting);
+        let _ = assert_write(&greeting);
         let auth = auth_request(vec![0; MAX_USERNAME], vec![0; MAX_PASSWORD]);
         assert!(auth.to_bytes().is_ok());
-        contract::check_wire_value(&auth);
+        let _ = assert_write(&auth);
         let request = Request {
             address: Address::Domain(vec![0; MAX_DOMAIN]),
             ..request()
         };
         assert!(request.to_bytes().is_ok());
-        contract::check_wire_value(&request);
+        let _ = assert_write(&request);
     }
 
     #[test]
@@ -2002,9 +2014,10 @@ mod tests {
         let mut offered = vec![Method::NoAuth; MAX_METHODS];
         offered.push(Method::Other(4));
         assert_eq!(
-            contract::check_refused(&Greeting {
+            assert_write(&Greeting {
                 methods: offered.clone()
-            }),
+            })
+            .unwrap_err(),
             Error::Unwritable
         );
         let mut d = ServerMessages::socks5_offering(Command::Connect, &offered);
@@ -2104,7 +2117,14 @@ mod tests {
             d
         };
         let bytes = vec![0; MAX_MESSAGE + 10];
-        contract::check_decode_with_alloc_limit(make, &bytes, 2 * MAX_MESSAGE);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(make()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_MESSAGE)
+            ),
+            decode_all(make, &bytes)
+        );
         assert_eq!(
             decode_all(make, &bytes).1,
             Some(Fail::Protocol(FrameError::DecisionRequired(
@@ -2128,15 +2148,29 @@ mod tests {
                 rng.bytes(80)
             };
             mutate(&mut rng, &mut bytes);
-            contract::check_decode_with_alloc_limit(ClientMessages::new, &bytes, 2 * MAX_MESSAGE);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(ClientMessages::new()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_MESSAGE)
+                ),
+                decode_all(ClientMessages::new, &bytes)
+            );
             for make in [
                 || ServerMessages::socks5(Command::Connect),
                 || ServerMessages::socks5(Command::Bind),
                 || ServerMessages::socks4(Socks4Command::Bind),
             ] {
-                contract::check_decode_with_alloc_limit(make, &bytes, 2 * MAX_MESSAGE);
+                assert_eq!(
+                    decode_chunks(
+                        &mut Stream::new(make()),
+                        chunks(&bytes, &[1, 7, 64]),
+                        |s| assert!(s.allocated() <= 2 * MAX_MESSAGE)
+                    ),
+                    decode_all(make, &bytes)
+                );
             }
-            macro_rules! wires { ($($ty:ty),+) => {$(contract::check_wire::<$ty>(&bytes);)+}; }
+            macro_rules! wires { ($($ty:ty),+) => {$(if let Ok(value) = <$ty>::parse(&bytes) { assert_write(&value).unwrap(); };)+}; }
             wires!(
                 Greeting,
                 Selection,

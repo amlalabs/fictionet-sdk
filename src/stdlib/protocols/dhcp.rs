@@ -399,7 +399,7 @@ impl Wire for Message {
 mod tests {
     use super::*;
     use fictionet::assert_cases;
-    use fictionet::stdlib::test_support::contract::{check_wire, check_wire_value};
+    use fictionet::stdlib::test_support::assert_write;
 
     fn discover() -> Message {
         let mut m = Message::new(BOOTREQUEST, 0x1234_5678);
@@ -461,8 +461,10 @@ mod tests {
             (m.message_type(), m.option_addr(opt::REQUESTED_IP)),
             (Some(DISCOVER), Some(Ipv4Addr::new(10, 0, 0, 2)))
         );
-        check_wire::<Message>(&bytes);
-        check_wire_value(&m);
+        if let Ok(value) = Message::parse(&bytes) {
+            assert_write(&value).unwrap();
+        }
+        let _ = assert_write(&m);
     }
 
     /// RFC 3396: an option split over several entries reads as one value,
@@ -480,7 +482,9 @@ mod tests {
         assert_eq!(&bytes[at + 514..at + 516], &[77, 90]);
         assert_eq!(&bytes[at + 606..], &[12, 0, opt::END]);
         assert_eq!(Message::parse(&bytes), Ok(m.clone()));
-        check_wire::<Message>(&bytes);
+        if let Ok(value) = Message::parse(&bytes) {
+            assert_write(&value).unwrap();
+        }
         // Entries of one option apart from each other join too, at the
         // first one's place.
         let mut split = discover().to_bytes().unwrap();
@@ -491,7 +495,9 @@ mod tests {
             m.options,
             [(6, vec![1, 1, 1, 1, 8, 8, 8, 8]), (53, vec![3])]
         );
-        check_wire::<Message>(&split);
+        if let Ok(value) = Message::parse(&split) {
+            assert_write(&value).unwrap();
+        }
     }
 
     #[test]
@@ -526,7 +532,7 @@ mod tests {
             let mut m = discover();
             m.push(code, [1]);
             assert_eq!(m.write(&mut out), Err(err));
-            check_wire_value(&m);
+            let _ = assert_write(&m);
         }
         let mut m = discover();
         m.push(77, vec![0; MAX_MESSAGE]);
@@ -537,7 +543,7 @@ mod tests {
         let room = MAX_MESSAGE - MIN_MESSAGE - 1;
         m.push(77, vec![0; room / 257 * 255 + (room % 257 - 2)]);
         assert_eq!(m.to_bytes().map(|b| b.len()), Ok(MAX_MESSAGE));
-        check_wire_value(&m);
+        let _ = assert_write(&m);
     }
 
     #[test]
@@ -546,12 +552,16 @@ mod tests {
         m.push(77, vec![9; 300]);
         let bytes = m.to_bytes().unwrap();
         for n in 0..bytes.len() {
-            check_wire::<Message>(&bytes[..n]);
+            if let Ok(value) = Message::parse(&bytes[..n]) {
+                assert_write(&value).unwrap();
+            }
         }
         for i in MIN_MESSAGE..bytes.len() {
             let mut b = bytes.clone();
             b[i] ^= 0xff;
-            check_wire::<Message>(&b);
+            if let Ok(value) = Message::parse(&b) {
+                assert_write(&value).unwrap();
+            }
         }
     }
 }

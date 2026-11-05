@@ -1003,16 +1003,21 @@ mod tests {
     use super::harness::total_fields;
     use super::*;
     use fictionet::assert_cases;
-    use fictionet::stdlib::codec::Lcg;
-    use fictionet::stdlib::codec::{Fail, Stream, finish, pump};
-    use fictionet::stdlib::test_support::contract;
-    use fictionet::stdlib::test_support::{decode_all, mutate, rounds};
+    use fictionet::stdlib::codec::{Fail, finish, pump};
+    use fictionet::stdlib::codec::{Lcg, Stream};
+    use fictionet::stdlib::test_support::{
+        assert_write, chunks, decode_all, decode_chunks, mutate, rounds,
+    };
 
     fn check(input: &[u8]) {
-        contract::check_decode_with_alloc_limit(
-            Frames::<Frame>::new,
-            input,
-            2 * Frames::<Frame>::new().capacity(),
+        let alloc = 2 * Frames::<Frame>::new().capacity();
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Frame>::new()),
+                chunks(input, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= alloc)
+            ),
+            decode_all(Frames::<Frame>::new, input)
         );
     }
 
@@ -1429,7 +1434,7 @@ mod tests {
             data: vec![0; MAX_MESSAGE + 1],
         };
         assert_eq!(big.to_bytes(), Err(Error::TooLong));
-        contract::check_wire_value(&big);
+        let _ = assert_write(&big);
         let max = Frame {
             data: vec![0; MAX_MESSAGE],
         };
@@ -1447,11 +1452,14 @@ mod tests {
         };
         let bytes = Wire::to_bytes(&frame).unwrap();
         assert_eq!(bytes, [1, 0, 0, 0, 2, 0x08, 0x01]);
-        contract::check_wire_value(&frame);
-        contract::check_decode_with_alloc_limit(
-            Frames::<grpc::Message>::new,
-            &bytes,
-            2 * (grpc::HEADER_LEN + grpc::DEFAULT_MAX_MESSAGE),
+        let _ = assert_write(&frame);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<grpc::Message>::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * (grpc::HEADER_LEN + grpc::DEFAULT_MAX_MESSAGE))
+            ),
+            decode_all(Frames::<grpc::Message>::new, &bytes)
         );
         let (frames, error) = decode_all(Frames::<grpc::Message>::new, &bytes);
         assert_eq!(frames, [frame]);
@@ -1661,9 +1669,15 @@ mod tests {
                     }
                 }
                 check(input);
-                contract::check_wire::<Frame>(input);
-                contract::check_wire::<Message>(input);
-                contract::check_wire::<Varint>(input);
+                if let Ok(value) = Frame::parse(input) {
+                    assert_write(&value).unwrap();
+                }
+                if let Ok(value) = Message::parse(input) {
+                    assert_write(&value).unwrap();
+                }
+                if let Ok(value) = Varint::parse(input) {
+                    assert_write(&value).unwrap();
+                }
             }
         }
     }

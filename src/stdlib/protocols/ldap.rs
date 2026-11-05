@@ -2501,8 +2501,8 @@ fictionet::prefixed! {
 #[doc(hidden)]
 pub mod harness {
     use super::*;
-    use fictionet::stdlib::codec::Frames;
-    use fictionet::stdlib::test_support::{contract, decode_all};
+    use fictionet::stdlib::codec::{Frames, Stream};
+    use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
 
     /// Checks binary messages, streams, and CLDAP datagrams.
     pub fn check_bytes(data: &[u8]) {
@@ -2518,10 +2518,26 @@ pub mod harness {
             }
         }
         let whole = decode_all(Frames::<Message>::new, data);
-        contract::check_decode_with_alloc_limit(Frames::<Message>::new, data, 2 * MAX_MESSAGE);
-        contract::check_wire::<Message>(data);
-        contract::check_decode(|| Frames::<Message>::with_limit(64), data);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Message>::new()),
+                chunks(data, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_MESSAGE)
+            ),
+            whole
+        );
+        if let Ok(value) = Message::parse(data) {
+            assert_write(&value).unwrap();
+        }
         let smaller = decode_all(|| Frames::<Message>::with_limit(64), data);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Message>::with_limit(64)),
+                chunks(data, &[1, 7, 64]),
+                |_| {}
+            ),
+            smaller
+        );
         assert!(whole.0.starts_with(&smaller.0));
         // A message read can be written, reads back the same, and is written
         // the same again.
@@ -2561,7 +2577,7 @@ pub mod harness {
                 }),
                 controls: Vec::new(),
             };
-            contract::check_written(&m);
+            assert_write(&m).unwrap();
         }
         if let Ok(dn) = Dn::parse(text) {
             let t = dn.to_text().unwrap();
@@ -2576,9 +2592,10 @@ mod tests {
     use super::harness::{check_bytes, check_text};
     use super::*;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream};
-    use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::rounds;
-    use fictionet::stdlib::test_support::{chunks, decode_all, mutate};
+    use fictionet::stdlib::test_support::{
+        assert_write, chunks, decode_all, decode_chunks, mutate,
+    };
 
     fn equal(attribute: String, value: Vec<u8>) -> Filter {
         Filter::Equal { attribute, value }
@@ -2733,7 +2750,7 @@ mod tests {
                 0x04, 0x02, 1, 2
             ]
         );
-        contract::check_written(&m);
+        assert_write(&m).unwrap();
     }
 
     #[test]
@@ -2880,7 +2897,7 @@ mod tests {
             }),
         ];
         for (i, op) in ops.into_iter().enumerate() {
-            contract::check_written(&msg(i as u32, op));
+            assert_write(&msg(i as u32, op)).unwrap();
         }
     }
 
@@ -2914,7 +2931,7 @@ mod tests {
                 "{text} -> {again}"
             );
             let m = msg(1, Op::SearchRequest(search(f)));
-            contract::check_written(&m);
+            assert_write(&m).unwrap();
         }
         fictionet::assert_cases!(|input| Filter::parse_text(input);
             equality: "(cn=Babs Jensen)" => Ok(eq("cn", "Babs Jensen")),
@@ -3030,7 +3047,7 @@ mod tests {
         assert!(matches!(dn_rule.to_text(), Err(Error::Unwritable(_))));
         let other = other_filter(12, false, vec![1]);
         assert!(matches!(other.to_text(), Err(Error::Unwritable(_))));
-        contract::check_written(&msg(1, Op::SearchRequest(search(other))));
+        assert_write(&msg(1, Op::SearchRequest(search(other)))).unwrap();
         let other_low = other_filter(7, false, vec![]);
         assert!(matches!(
             msg(1, Op::SearchRequest(search(other_low))).to_bytes(),
@@ -3066,7 +3083,7 @@ mod tests {
             let f = substrings("cn".into(), initial, any, last);
             assert!(matches!(f.to_text(), Err(Error::Unwritable(_))), "{f:?}");
             // The BER form still holds it.
-            contract::check_written(&msg(1, Op::SearchRequest(search(f))));
+            assert_write(&msg(1, Op::SearchRequest(search(f)))).unwrap();
         }
     }
 
@@ -3098,7 +3115,7 @@ mod tests {
                 critical: true,
                 value: Some(vec![1]),
             });
-            contract::check_written(&m);
+            assert_write(&m).unwrap();
             let mut d = Stream::new(Frames::<Message>::new());
             put(&mut d, &m.to_bytes().unwrap());
             assert_eq!(d.next(), Some(Ok(m)));
@@ -3495,7 +3512,7 @@ mod tests {
             msg(1, other(3)).to_bytes(),
             Err(Error::Unwritable(_))
         ));
-        contract::check_written(&msg(1, other(u32::MAX)));
+        assert_write(&msg(1, other(u32::MAX))).unwrap();
         // Too large: the writer stops at MAX_MESSAGE.
         let big = msg(1, Op::DelRequest("x".repeat(MAX_MESSAGE)));
         assert!(matches!(big.to_bytes(), Err(Error::TooLarge(_))));
@@ -3512,7 +3529,7 @@ mod tests {
         assert_eq!(ResultCode(9).to_string(), "result code 9");
         assert_eq!(ResultCode::OTHER.name(), Some("other"));
         for c in [0u32, 1, 80, 4000, u32::MAX] {
-            contract::check_written(&msg(1, Op::DelResponse(LdapResult::new(ResultCode(c)))));
+            assert_write(&msg(1, Op::DelResponse(LdapResult::new(ResultCode(c))))).unwrap();
         }
         for n in 0..4 {
             assert_eq!(DerefAliases::from_code(n).map(DerefAliases::code), Some(n));
@@ -3801,10 +3818,11 @@ mod tests {
         ];
         assert!(Message::parse(&empty_referral).is_err());
         // A search result entry's attribute may have none.
-        contract::check_written(&msg(
+        assert_write(&msg(
             1,
             Op::SearchResultEntry(entry("cn=x".into(), vec![attribute("cn".into(), vec![])])),
-        ));
+        ))
+        .unwrap();
     }
 
     #[test]
@@ -3829,7 +3847,7 @@ mod tests {
             assert!(matches!(m.to_bytes(), Err(Error::Unwritable(_))));
         }
         s.scope = Scope::Other(3);
-        contract::check_written(&msg(1, Op::SearchRequest(s)));
+        assert_write(&msg(1, Op::SearchRequest(s))).unwrap();
     }
 
     #[test]
@@ -4192,7 +4210,14 @@ mod tests {
             check_text(&String::from_utf8_lossy(&tf));
         }
         // Check the generated stream across chunk boundaries and at EOF.
-        contract::check_decode_with_alloc_limit(Frames::<Message>::new, &stream, 2 * MAX_MESSAGE);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Message>::new()),
+                chunks(&stream, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_MESSAGE)
+            ),
+            decode_all(Frames::<Message>::new, &stream)
+        );
         let (all, err) = decode_all(Frames::<Message>::new, &stream);
         assert_eq!(all.len(), ROUNDS);
         assert_eq!(err, None);
@@ -4201,7 +4226,7 @@ mod tests {
     #[test]
     fn codec_frames_obey_small_limits_and_report_once() {
         use fictionet::stdlib::codec::{Fail, Stream};
-        use fictionet::stdlib::test_support::contract;
+        use fictionet::stdlib::test_support::{chunks, decode_all, decode_chunks};
         let bytes = Message {
             id: 1,
             op: Op::UnbindRequest,
@@ -4211,10 +4236,17 @@ mod tests {
         .unwrap();
         for limit in 0..=16 {
             assert_eq!(Frames::<Message>::with_limit(limit).capacity(), 16);
-            contract::check_decode_with_alloc_limit(
-                || Frames::<Message>::with_limit(limit),
-                &bytes,
-                2 * Frames::<Message>::with_limit(limit).capacity(),
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Frames::<Message>::with_limit(limit)),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |s| {
+                        assert!(
+                            s.allocated() <= 2 * Frames::<Message>::with_limit(limit).capacity()
+                        );
+                    }
+                ),
+                decode_all(|| Frames::<Message>::with_limit(limit), &bytes)
             );
         }
         assert_eq!(
@@ -4234,18 +4266,20 @@ mod tests {
     #[test]
     fn codec_message_writer_rolls_back() {
         use fictionet::stdlib::codec::Wire;
-        use fictionet::stdlib::test_support::contract;
+        use fictionet::stdlib::test_support::assert_write;
         let mut message = Message {
             id: 1,
             op: Op::UnbindRequest,
             controls: Vec::new(),
         };
-        contract::check_wire_value(&message);
-        contract::check_wire::<Message>(&message.to_bytes().unwrap());
+        let _ = assert_write(&message);
+        if let Ok(value) = Message::parse(&message.to_bytes().unwrap()) {
+            assert_write(&value).unwrap();
+        }
         message.id = MAX_INT + 1;
         let mut out = vec![42];
         assert!(message.write(&mut out).is_err());
         assert_eq!(out, [42]);
-        contract::check_wire_value(&message);
+        let _ = assert_write(&message);
     }
 }

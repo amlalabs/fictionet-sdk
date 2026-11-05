@@ -1603,8 +1603,8 @@ fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
 #[doc(hidden)]
 pub mod harness {
     use super::*;
-    use fictionet::stdlib::codec::Frames;
-    use fictionet::stdlib::test_support::{contract, decode_all};
+    use fictionet::stdlib::codec::{Frames, Stream};
+    use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
 
     /// AVP formats checked by the wire tests.
     pub const FORMATS: [Format; 14] = [
@@ -1626,12 +1626,30 @@ pub mod harness {
 
     /// Exercises framing, semantic checks, and every named wire unit.
     pub fn check_bytes(data: &[u8]) {
-        contract::check_decode_capacity(Frames::<Message>::new, data);
-        contract::check_decode_capacity(|| Frames::<Message>::with_limit(0), data);
-        contract::check_decode_capacity(|| Frames::<Message>::with_limit(64), data);
-        contract::check_wire::<Message>(data);
-        contract::check_wire::<Avp>(data);
-        contract::check_wire::<Address>(data);
+        for frames in [
+            Frames::<Message>::new(),
+            Frames::<Message>::with_limit(0),
+            Frames::<Message>::with_limit(64),
+        ] {
+            let alloc = 2 * frames.capacity();
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(frames),
+                    chunks(data, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= alloc)
+                ),
+                decode_all(|| frames, data)
+            );
+        }
+        if let Ok(value) = Message::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Avp::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Address::parse(data) {
+            assert_write(&value).unwrap();
+        }
         if let Ok(address) = Address::parse(data) {
             assert_eq!(address.to_bytes().unwrap(), data);
         }
@@ -1640,8 +1658,7 @@ pub mod harness {
             assert!(malformed.header.avps.is_empty());
         }
         for message in items.into_iter().flatten() {
-            contract::check_wire_value(&message);
-            let bytes = message.to_bytes().unwrap();
+            let bytes = assert_write(&message).unwrap();
             assert_eq!(Message::parse(&bytes).as_ref(), Ok(&message));
             let _ = check(&message.avps, |code, vendor| {
                 if vendor.is_none() {
@@ -1653,7 +1670,7 @@ pub mod harness {
             // Every AVP read as grouped goes down to the depth limit.
             let _ = check(&message.avps, |_, _| Some(Format::Grouped));
             let reply = message.answer();
-            contract::check_wire_value(&reply);
+            let _ = assert_write(&reply);
             assert_eq!(Message::parse(&reply.to_bytes().unwrap()).unwrap(), reply);
             // Each AVP in every format: a value read writes bytes that read
             // back to the same bytes. Only URIs (case) and grouped AVPs
@@ -1705,11 +1722,11 @@ mod tests {
     use super::harness::{check_bytes, check_text};
     use super::*;
     use fictionet::assert_cases;
-    use fictionet::stdlib::codec::{Decode, Step};
-    use fictionet::stdlib::codec::{Fail, Lcg, Stream};
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::codec::{Decode, Fail, Lcg, Step, Stream};
     use fictionet::stdlib::test_support::rounds;
-    use fictionet::stdlib::test_support::{decode_all, mutate};
+    use fictionet::stdlib::test_support::{
+        assert_write, chunks, decode_all, decode_chunks, mutate,
+    };
 
     fn address_other(family: u16, bytes: Vec<u8>) -> Address {
         Address::Other { family, bytes }
@@ -2238,7 +2255,14 @@ mod tests {
             .avps
             .push(Avp::new(avp::RESULT_CODE, &Value::Unsigned32(2001)).unwrap());
         let data = [dwr_bytes(), second.to_bytes().unwrap()].concat();
-        contract::check_decode_with_alloc_limit(Frames::<Message>::new, &data, 2 * DEFAULT_LIMIT);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Message>::new()),
+                chunks(&data, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * DEFAULT_LIMIT)
+            ),
+            decode_all(Frames::<Message>::new, &data)
+        );
         assert_eq!(
             decode_all(Frames::<Message>::new, &data),
             (vec![Ok(dwr()), Ok(second)], None)
@@ -2291,11 +2315,11 @@ mod tests {
     #[test]
     fn writers_refuse_what_does_not_fit() {
         let huge = avp(1, Some(1), false, false, vec![7; MAX_AVP_DATA + 100]);
-        contract::check_wire_value(&huge);
+        let _ = assert_write(&huge);
         assert_eq!(huge.to_bytes(), Err(Error::Unwritable));
         let mut message = Message::request(1, 2, 3, 4);
         message.avps = vec![huge.clone(), huge];
-        contract::check_wire_value(&message);
+        let _ = assert_write(&message);
         assert_eq!(message.to_bytes(), Err(Error::Unwritable));
         let text = "é".repeat(MAX_AVP_DATA / 2 + 4);
         assert_eq!(
@@ -2304,7 +2328,7 @@ mod tests {
         );
         let address = address_other(9, vec![0; MAX_AVP_DATA]);
         assert_eq!(address.to_bytes(), Err(Error::Unwritable));
-        contract::check_wire_value(&address);
+        let _ = assert_write(&address);
         assert_eq!(
             Message::request(0xff00_0101, 0, 0, 0).to_bytes(),
             Err(Error::Unwritable)
@@ -2391,7 +2415,7 @@ mod tests {
             address_other(2, vec![0xff; 20]),
         ] {
             assert_eq!(address.to_bytes(), Err(Error::Unwritable));
-            contract::check_wire_value(&address);
+            let _ = assert_write(&address);
         }
     }
 
@@ -2426,7 +2450,14 @@ mod tests {
     #[test]
     fn stream_holds_at_most_its_limit() {
         let data = dwr_bytes().repeat(100);
-        contract::check_decode_with_alloc_limit(|| Frames::<Message>::with_limit(64), &data, 128);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Message>::with_limit(64)),
+                chunks(&data, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 128)
+            ),
+            decode_all(|| Frames::<Message>::with_limit(64), &data)
+        );
         assert_eq!(
             decode_all(|| Frames::<Message>::with_limit(64), &data),
             (vec![Ok(dwr()); 100], None)
@@ -2611,12 +2642,12 @@ mod tests {
         assert_eq!(e, Error::HeaderBits(flags::REQUEST | flags::ERROR));
         assert_eq!(e.result_code(), result::INVALID_HDR_BITS);
         assert!(!e.to_string().is_empty());
-        contract::check_wire_value(&m);
+        let _ = assert_write(&m);
         assert_eq!(m.to_bytes().unwrap(), b);
         let mut a = dwr().answer();
         a.retransmit = true;
         assert_eq!(a.check_header(), Err(Error::HeaderBits(flags::RETRANSMIT)));
-        contract::check_wire_value(&a);
+        let _ = assert_write(&a);
         // An error answer and a retransmitted request are fine.
         let mut a = dwr().answer();
         a.error = true;
@@ -2624,7 +2655,7 @@ mod tests {
         let mut r = dwr();
         r.retransmit = true;
         r.check_header().unwrap();
-        contract::check_wire_value(&r);
+        let _ = assert_write(&r);
     }
 
     #[test]
@@ -2648,7 +2679,7 @@ mod tests {
         assert_eq!(check(&[g], base), Err(e));
         let mut m = dwr();
         m.avps.push(a);
-        contract::check_wire_value(&m);
+        let _ = assert_write(&m);
     }
 
     #[test]
@@ -2661,7 +2692,7 @@ mod tests {
         let one = avp(1, None, false, false, vec![]);
         let mut m = Message::request(1, 0, 0, 0);
         m.avps = vec![one; MAX_AVPS];
-        contract::check_wire_value(&m);
+        let _ = assert_write(&m);
         m.avps.push(m.avps[0].clone());
         assert_eq!(m.to_bytes(), Err(Error::Unwritable));
         // The largest AVP fits on its own, but not with another after it.
@@ -2706,7 +2737,14 @@ mod tests {
             (0x1234_5678, 0x9abc_def0)
         );
         assert_eq!(messages[1], Ok(dwr()));
-        contract::check_decode_with_alloc_limit(Frames::<Message>::new, &data, 2 * DEFAULT_LIMIT);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Message>::new()),
+                chunks(&data, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * DEFAULT_LIMIT)
+            ),
+            decode_all(Frames::<Message>::new, &data)
+        );
     }
 
     fn random_value(r: &mut Lcg, depth: u32) -> Value {

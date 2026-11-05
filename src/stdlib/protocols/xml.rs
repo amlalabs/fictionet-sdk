@@ -2299,11 +2299,12 @@ fn escape(out: &mut String, s: &str, attr: bool, limit: usize) -> Result<(), Err
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::Lcg;
-    use fictionet::stdlib::codec::{Fail, Stream, pump};
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::codec::{Fail, pump};
+    use fictionet::stdlib::codec::{Lcg, Stream};
     use fictionet::stdlib::test_support::rounds;
-    use fictionet::stdlib::test_support::{decode_all, mutate};
+    use fictionet::stdlib::test_support::{
+        assert_write, chunks, decode_all, decode_chunks, mutate,
+    };
 
     fn built_text(builder: Builder) -> Result<String, ErrorKind> {
         let document = builder.build()?;
@@ -2315,7 +2316,14 @@ mod tests {
     }
 
     fn check(input: &[u8]) {
-        contract::check_decode_with_alloc_limit(Events::new, input, 2 * (MAX_DOCUMENT + 1));
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Events::new()),
+                chunks(input, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * (MAX_DOCUMENT + 1))
+            ),
+            decode_all(Events::new, input)
+        );
     }
 
     #[test]
@@ -3029,7 +3037,9 @@ mod tests {
             let doc = random_doc(&mut rng);
             let (events, err) = decode_all(Events::new, &doc);
             check(&doc);
-            contract::check_wire::<Document>(&doc);
+            if let Ok(value) = Document::parse(&doc) {
+                assert_write(&value).unwrap();
+            }
             let mut changed = doc.clone();
             mutate(&mut rng, &mut changed);
             check(&changed);

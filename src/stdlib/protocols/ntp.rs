@@ -745,7 +745,7 @@ impl Wire for Timestamp {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::Lcg;
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::assert_write;
 
     /// A server reply as an SNTP client might receive it: version 4,
     /// stratum 2, reference ID 192.0.2.1, and a 20-byte key ID and MAC.
@@ -1124,16 +1124,16 @@ mod tests {
         for version in [0, 8, 200] {
             p.version = version;
             assert_eq!(p.to_bytes(), Err(Error::Unwritable));
-            contract::check_wire_value(&p);
+            let _ = assert_write(&p);
         }
         p.version = 4;
         for len in [MAX_TRAILER + 5000, 23] {
             p.trailer = vec![9; len];
             assert_eq!(p.to_bytes(), Err(Error::Unwritable));
-            contract::check_wire_value(&p);
+            let _ = assert_write(&p);
         }
         p.trailer = vec![9; MAX_TRAILER];
-        contract::check_wire_value(&p);
+        let _ = assert_write(&p);
         assert_eq!(p.to_bytes().unwrap().len(), MAX_PACKET);
     }
 
@@ -1231,9 +1231,15 @@ mod tests {
                 // Often a readable first byte: version 1 to 7, mode 1 to 5.
                 b[0] = (b[0] & 0xc0) | ((1 + rng.index(7) as u8) << 3) | (1 + rng.index(5) as u8);
             }
-            contract::check_wire::<Packet>(&b);
-            contract::check_wire::<Timestamp>(&b);
-            contract::check_wire::<KissCode>(&b);
+            if let Ok(value) = Packet::parse(&b) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = Timestamp::parse(&b) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = KissCode::parse(&b) {
+                assert_write(&value).unwrap();
+            }
             if let Ok(p) = Packet::parse(&b) {
                 read += 1;
                 assert_eq!(p.to_bytes().unwrap(), b);

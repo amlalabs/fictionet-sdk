@@ -1086,11 +1086,11 @@ enum Integrity {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::Lcg;
-    use fictionet::stdlib::codec::{Fail, Stream, Wire, finish, pump};
+    use fictionet::stdlib::codec::{Fail, Wire, finish, pump};
+    use fictionet::stdlib::codec::{Lcg, Stream};
     use fictionet::stdlib::test_support;
-    use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::rounds;
+    use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
 
     fn other_attribute(typ: u16, value: Vec<u8>) -> Attribute {
         Attribute::Other { typ, value }
@@ -1527,7 +1527,7 @@ mod tests {
             error_code(400, "w".repeat(200)),
             Attribute::Username("x".repeat(MAX_TEXT)),
         ];
-        contract::check_wire_value(&message);
+        let _ = assert_write(&message);
         assert!(!message.within_sending_limits());
         assert_eq!(Message::parse(&message.to_bytes().unwrap()), Ok(message));
     }
@@ -1767,7 +1767,14 @@ mod tests {
         let one = Message::binding_request([1; 12]).to_bytes().unwrap();
         let n = rounds(100_000);
         let bytes = one.repeat(n);
-        contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &bytes, 2 * MAX_MESSAGE);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Frame>::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_MESSAGE)
+            ),
+            decode_all(Frames::<Frame>::new, &bytes)
+        );
         let mut stream = Stream::new(Frames::<Frame>::new());
         let took = stream.push(&bytes);
         assert_eq!(took, MAX_MESSAGE);
@@ -1821,7 +1828,7 @@ mod tests {
         for s in samples() {
             let frame = d.next().unwrap().unwrap();
             assert_eq!(frame.0, s);
-            assert_eq!(contract::check_written(&frame), s);
+            assert_eq!(assert_write(&frame).unwrap(), s);
             assert!(Message::parse(&frame.0).is_ok());
         }
         assert_eq!(d.next(), None);
@@ -1931,9 +1938,16 @@ mod tests {
         }
 
         // Mixed attribute and header errors obey the decoder contract.
-        contract::check_decode(
-            || Frames::<Frame>::new().map(|frame| Message::parse(&frame.0)),
-            &bytes,
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Frame>::new().map(|frame| Message::parse(&frame.0))),
+                chunks(&bytes, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(
+                || Frames::<Frame>::new().map(|frame| Message::parse(&frame.0)),
+                &bytes
+            )
         );
     }
 
@@ -1974,13 +1988,31 @@ mod tests {
     #[test]
     fn codec_contracts_and_capacity() {
         for sample in samples() {
-            contract::check_decode(Frames::<Frame>::new, sample);
-            contract::check_decode(
-                || Frames::<Frame>::new().map(|frame| Message::parse(&frame.0)),
-                sample,
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Frames::<Frame>::new()),
+                    chunks(sample, &[1, 7, 64]),
+                    |_| {}
+                ),
+                decode_all(Frames::<Frame>::new, sample)
             );
-            contract::check_wire::<Message>(sample);
-            contract::check_wire::<Frame>(sample);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Frames::<Frame>::new().map(|frame| Message::parse(&frame.0))),
+                    chunks(sample, &[1, 7, 64]),
+                    |_| {}
+                ),
+                decode_all(
+                    || Frames::<Frame>::new().map(|frame| Message::parse(&frame.0)),
+                    sample
+                )
+            );
+            if let Ok(value) = Message::parse(sample) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = Frame::parse(sample) {
+                assert_write(&value).unwrap();
+            }
         }
         let mut message = Message::binding_request([1; 12]);
         message
@@ -1990,12 +2022,28 @@ mod tests {
         assert_eq!(bytes.len(), MAX_MESSAGE);
         assert_eq!(Frames::<Frame>::new().capacity(), MAX_MESSAGE);
         assert_eq!(Frames::<Frame>::new().held(), 0);
-        contract::check_decode(Frames::<Frame>::new, &bytes);
-        contract::check_decode(
-            || Frames::<Frame>::new().map(|frame| Message::parse(&frame.0)),
-            &bytes,
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Frame>::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(Frames::<Frame>::new, &bytes)
         );
-        contract::check_wire::<Message>(&bytes);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Frame>::new().map(|frame| Message::parse(&frame.0))),
+                chunks(&bytes, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(
+                || Frames::<Frame>::new().map(|frame| Message::parse(&frame.0)),
+                &bytes
+            )
+        );
+        if let Ok(value) = Message::parse(&bytes) {
+            assert_write(&value).unwrap();
+        }
 
         let mut stream = Stream::new(Frames::<Frame>::new());
         assert_eq!(stream.push(&bytes), MAX_MESSAGE);
@@ -2024,7 +2072,9 @@ mod tests {
         message.fingerprint = true;
         let bytes = Wire::to_bytes(&message).unwrap();
         assert_eq!(Message::parse(&bytes), Ok(message.clone()));
-        contract::check_wire::<Message>(&bytes);
+        if let Ok(value) = Message::parse(&bytes) {
+            assert_write(&value).unwrap();
+        }
 
         let mut appended = SAMPLE_REQUEST.to_vec();
         message.write(&mut appended).unwrap();
@@ -2043,8 +2093,8 @@ mod tests {
     }
 
     fn assert_write_error(message: &Message, error: Error) {
-        assert_eq!(contract::check_refused(message), error);
-        contract::check_wire_value(message);
+        assert_eq!(assert_write(message).unwrap_err(), error);
+        let _ = assert_write(message);
         assert_eq!(message.to_bytes(), Err(error));
     }
 
@@ -2109,7 +2159,9 @@ mod tests {
             sha256.clone(),
         ];
         let bytes = Wire::to_bytes(&message).unwrap();
-        contract::check_wire::<Message>(&bytes);
+        if let Ok(value) = Message::parse(&bytes) {
+            assert_write(&value).unwrap();
+        }
         for (first, second) in [
             (sha1.clone(), Attribute::Software("ignored".into())),
             (sha1.clone(), sha1.clone()),
@@ -2126,11 +2178,15 @@ mod tests {
     fn strict_writer_checks_body_and_attribute_limits() {
         let mut message = Message::binding_request([0; 12]);
         message.attributes = vec![other_attribute(0x8099, vec![]); MAX_ATTRIBUTES];
-        contract::check_wire::<Message>(&Wire::to_bytes(&message).unwrap());
+        if let Ok(value) = Message::parse(&Wire::to_bytes(&message).unwrap()) {
+            assert_write(&value).unwrap();
+        }
         message.fingerprint = true;
         assert_write_error(&message, Error::TooManyAttributes);
         message.attributes.pop();
-        contract::check_wire::<Message>(&Wire::to_bytes(&message).unwrap());
+        if let Ok(value) = Message::parse(&Wire::to_bytes(&message).unwrap()) {
+            assert_write(&value).unwrap();
+        }
         message.fingerprint = false;
         message.attributes = vec![other_attribute(0x8099, vec![0; MAX_VALUE])];
         assert_eq!(Wire::to_bytes(&message).unwrap().len(), MAX_MESSAGE);
@@ -2139,22 +2195,28 @@ mod tests {
         message.attributes = vec![other_attribute(0x8099, vec![0; MAX_VALUE - 8])];
         let bytes = Wire::to_bytes(&message).unwrap();
         assert_eq!(bytes.len(), MAX_MESSAGE);
-        contract::check_wire::<Message>(&bytes);
+        if let Ok(value) = Message::parse(&bytes) {
+            assert_write(&value).unwrap();
+        }
         message.fingerprint = false;
         message.attributes.push(other_attribute(0x8099, vec![0; 5]));
         assert_write_error(&message, Error::BodyTooLong);
     }
 
     fn check_round_trip(bytes: &[u8]) {
-        contract::check_wire::<Frame>(bytes);
-        contract::check_wire::<Message>(bytes);
+        if let Ok(value) = Frame::parse(bytes) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Message::parse(bytes) {
+            assert_write(&value).unwrap();
+        }
         if let Ok(message) = Message::parse(bytes) {
             assert_eq!(
                 Message::parse(&message.to_bytes().unwrap()),
                 Ok(message.clone())
             );
             if let Some(reply) = answer_binding(&message, "10.0.0.1:9".parse().unwrap()) {
-                contract::check_wire_value(&reply);
+                let _ = assert_write(&reply);
             }
         }
     }
@@ -2164,16 +2226,23 @@ mod tests {
     }
 
     fn check_stream(bytes: &[u8]) -> usize {
-        contract::check_decode(
-            || Frames::<Frame>::new().map(|frame| Message::parse(&frame.0)),
-            bytes,
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Frame>::new().map(|frame| Message::parse(&frame.0))),
+                chunks(bytes, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(
+                || Frames::<Frame>::new().map(|frame| Message::parse(&frame.0)),
+                bytes
+            )
         );
         let (frames, _) = test_support::decode_all(Frames::<Frame>::new, bytes);
         frames
             .iter()
             .filter_map(|frame| Message::parse(&frame.0).ok())
             .inspect(|message| {
-                contract::check_wire_value(message);
+                let _ = assert_write(message);
             })
             .count()
     }

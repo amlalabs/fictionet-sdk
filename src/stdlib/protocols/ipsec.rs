@@ -728,18 +728,50 @@ impl Wire for AhHeader {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::Lcg;
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::codec::{Collect, CollectError, Fail, Stream};
+    use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
+
     use fictionet::stdlib::test_support::mutate;
 
     fn check<M>(limit: usize, b: &[u8]) -> Result<M, Error>
     where
         M: Wire<ParseError = Error, WriteError = Error> + Clone + std::fmt::Debug + PartialEq,
     {
-        let parsed = contract::check_collect::<M>(b, limit);
+        let parsed = M::parse(b);
+        if let Ok(value) = &parsed {
+            assert_write(value).unwrap();
+        }
+        let decoded = decode_chunks(
+            &mut Stream::new(Collect::<M>::new(limit)),
+            chunks(b, &[1, 7, 64]),
+            |s| assert!(s.allocated() <= 2 * (limit + 1)),
+        );
+        if b.len() <= limit {
+            assert_eq!(
+                decoded,
+                (
+                    parsed.clone().ok().into_iter().collect(),
+                    parsed
+                        .clone()
+                        .err()
+                        .map(|e| Fail::Protocol(CollectError::Parse(e))),
+                )
+            );
+        } else {
+            assert_eq!(
+                decoded,
+                (
+                    vec![],
+                    Some(Fail::Protocol(CollectError::TooLong { limit }))
+                )
+            );
+        }
         if let Ok(p) = &parsed {
             assert_eq!(p.to_bytes().unwrap(), b);
         }
-        contract::check_wire::<Plaintext>(b);
+        if let Ok(value) = Plaintext::parse(b) {
+            assert_write(&value).unwrap();
+        }
         parsed
     }
 
@@ -1380,8 +1412,7 @@ mod tests {
                     + std::fmt::Debug
                     + PartialEq,
             {
-                contract::check_wire_value(&value);
-                let bytes = value.to_bytes().unwrap();
+                let bytes = assert_write(&value).unwrap();
                 assert_eq!(check::<M>(limit, &bytes), Ok(value));
                 bytes
             }

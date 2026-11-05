@@ -1368,7 +1368,7 @@ mod tests {
     use super::*;
     use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::protocols::netbios::{ENCODED_LEN, MAX_LABEL};
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::assert_write;
     use fictionet::stdlib::test_support::hex;
     use fictionet::stdlib::test_support::mutate;
     use fictionet::stdlib::test_support::rounds;
@@ -1809,11 +1809,11 @@ mod tests {
         });
         p.opcode = Opcode::Other(5);
         assert_eq!(p.to_bytes(), Err(Error::Unwritable));
-        contract::check_wire_value(&p);
+        let _ = assert_write(&p);
         p.answers[0].data = RData::Nb(vec![owner(1)]);
         assert_eq!(p.to_bytes(), Err(Error::Unwritable));
         p.opcode = Opcode::Registration;
-        contract::check_wire_value(&p);
+        let _ = assert_write(&p);
     }
 
     #[test]
@@ -1949,7 +1949,9 @@ mod tests {
         bytes.extend_from_slice(&(data_len as u16).to_be_bytes());
         bytes.resize(MAX_PACKET, 0);
         assert_eq!(Packet::parse(&bytes), Err(Error::ExpansionTooLong));
-        contract::check_wire::<Packet>(&bytes);
+        if let Ok(value) = Packet::parse(&bytes) {
+            assert_write(&value).unwrap();
+        }
     }
 
     #[test]
@@ -1957,7 +1959,9 @@ mod tests {
         let mut b = query_bytes();
         b.extend_from_slice(&[1, 2, 3]);
         assert_eq!(Packet::parse(&b), Packet::parse(&query_bytes()));
-        contract::check_wire::<Packet>(&b);
+        if let Ok(value) = Packet::parse(&b) {
+            assert_write(&value).unwrap();
+        }
     }
 
     #[test]
@@ -1965,7 +1969,7 @@ mod tests {
         let mut name = Name::new("FRED", 0x20);
         for scope in [vec![vec![]], vec![vec![b'a'; 100]], vec![vec![b'b'; 63]; 4]] {
             name.scope = scope;
-            contract::check_wire_value(&name);
+            let _ = assert_write(&name);
             assert_eq!(name.to_bytes(), Err(Error::Unwritable));
         }
         let name = Name::new("X", 0);
@@ -1988,16 +1992,16 @@ mod tests {
                 ttl: 0,
                 data,
             });
-            contract::check_wire_value(&packet);
+            let _ = assert_write(&packet);
             assert_eq!(packet.to_bytes(), Err(Error::Unwritable));
         }
         let mut packet = Packet::name_query(1, name, false);
         packet.questions = vec![packet.questions[0].clone(); MAX_RECORDS + 1];
-        contract::check_wire_value(&packet);
+        let _ = assert_write(&packet);
         assert_eq!(packet.to_bytes(), Err(Error::Unwritable));
         packet.questions.truncate(1);
         packet.rcode = 0xff;
-        contract::check_wire_value(&packet);
+        let _ = assert_write(&packet);
         assert_eq!(packet.to_bytes(), Err(Error::Unwritable));
     }
 
@@ -2042,8 +2046,7 @@ mod tests {
                         1,
                     ),
                 ] {
-                    contract::check_wire_value(&reply);
-                    let bytes = reply.to_bytes().unwrap();
+                    let bytes = assert_write(&reply).unwrap();
                     assert!(bytes.len() <= MAX_DATAGRAM);
                     assert_eq!(Packet::parse(&bytes), Ok(reply.clone()));
                     let retained = match &reply.answers[0].data {
@@ -2074,11 +2077,11 @@ mod tests {
         assert!(!packet.flags.truncated);
         packet.answers[0].data = RData::Nb(vec![owner(1); MAX_NB_ENTRIES + 1]);
         assert_eq!(packet.to_bytes(), Err(Error::Unwritable));
-        contract::check_wire_value(&packet);
+        let _ = assert_write(&packet);
         let mut many = Packet::name_query(1, Name::new("FRED", 0x20), false);
         many.questions = vec![many.questions[0].clone(); MAX_RECORDS + 1];
         assert_eq!(many.to_bytes(), Err(Error::Unwritable));
-        contract::check_wire_value(&many);
+        let _ = assert_write(&many);
     }
 
     #[test]
@@ -2093,7 +2096,7 @@ mod tests {
         let long = Name::new("FRED", 0x20).with_scope(&"x.".repeat(111));
         assert_eq!(long.scope.len(), 111);
         assert_eq!(long.to_bytes(), Err(Error::Unwritable));
-        contract::check_wire_value(&long);
+        let _ = assert_write(&long);
         let huge = Name::new("FRED", 0x20).with_scope(&"a.".repeat(rounds(100_000)));
         assert_eq!(huge.to_bytes(), Err(Error::Unwritable));
         // A label of MAX_LABEL bytes is written; one byte more is refused.
@@ -2102,11 +2105,11 @@ mod tests {
         let wide = Name::new("FRED", 0x20).with_scope(&"x".repeat(MAX_LABEL + 1));
         assert_eq!(wide.scope, vec![vec![b'x'; MAX_LABEL + 1]]);
         assert_eq!(wide.to_bytes(), Err(Error::Unwritable));
-        contract::check_wire_value(&wide);
+        let _ = assert_write(&wide);
         let domain = RrName::domain(&"x".repeat(MAX_LABEL + 1));
         assert_eq!(domain, RrName::Domain(vec![vec![b'x'; MAX_LABEL + 1]]));
         assert_eq!(domain.to_bytes(), Err(Error::Unwritable));
-        contract::check_wire_value(&domain);
+        let _ = assert_write(&domain);
     }
 
     #[test]
@@ -2198,12 +2201,12 @@ mod tests {
         let mut built = p.clone();
         built.authority[0].data = other_data(rr_type::NS, vec![0xc0, 0x5f]);
         assert_eq!(built.to_bytes(), Err(Error::Unwritable));
-        contract::check_wire_value(&built);
+        let _ = assert_write(&built);
         // Opaque NS data that would read as Ns is also refused.
         built.authority[0].data = other_data(rr_type::NS, b"\x03COM\x00".to_vec());
         assert_eq!(built.to_bytes(), Err(Error::Unwritable));
         built.authority[0].data = RData::Ns(vec![b"COM".to_vec()]);
-        contract::check_wire_value(&built);
+        let _ = assert_write(&built);
     }
 
     #[test]
@@ -2225,9 +2228,15 @@ mod tests {
     }
 
     fn check(data: &[u8]) {
-        contract::check_wire::<Name>(data);
-        contract::check_wire::<RrName>(data);
-        contract::check_wire::<Packet>(data);
+        if let Ok(value) = Name::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = RrName::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Packet::parse(data) {
+            assert_write(&value).unwrap();
+        }
 
         if let Ok(p) = Packet::parse(data) {
             let bytes = p.to_bytes().unwrap();

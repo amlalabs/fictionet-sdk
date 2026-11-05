@@ -709,7 +709,7 @@ fn reserve(out: &mut Vec<u8>, size: usize) -> Result<(), Error> {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{Fail, Stream, finish, pump};
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::assert_write;
     use fictionet::stdlib::test_support::decode_all;
 
     fn ignored(name: String, value: String) -> Line {
@@ -1070,16 +1070,16 @@ mod tests {
     #[test]
     fn event_writer_refusals_are_transactional() {
         for kind in ["", "a\rb", "a\nb"] {
-            contract::check_refused(&event(kind, "x", ""));
+            assert_write(&event(kind, "x", "")).unwrap_err();
         }
         for id in ["a\rb", "a\nb", "a\0b"] {
-            contract::check_refused(&event("message", "x", id));
+            assert_write(&event("message", "x", id)).unwrap_err();
         }
-        contract::check_refused(&Event::new("a\rb"));
-        contract::check_refused(&Event::new("x".repeat(MAX_LINE)));
-        contract::check_refused(&Event::new("x\n".repeat(MAX_EVENT / 2)));
-        contract::check_refused(&event(&"x".repeat(MAX_LINE), "", ""));
-        contract::check_refused(&event("message", "", &"x".repeat(MAX_LINE)));
+        assert_write(&Event::new("a\rb")).unwrap_err();
+        assert_write(&Event::new("x".repeat(MAX_LINE))).unwrap_err();
+        assert_write(&Event::new("x\n".repeat(MAX_EVENT / 2))).unwrap_err();
+        assert_write(&event(&"x".repeat(MAX_LINE), "", "")).unwrap_err();
+        assert_write(&event("message", "", &"x".repeat(MAX_LINE))).unwrap_err();
     }
 
     #[test]
@@ -1101,7 +1101,7 @@ mod tests {
             ignored("retry".into(), "10".into()),
             ignored("id".into(), "ok".into()),
         ] {
-            contract::check_refused(&line);
+            assert_write(&line).unwrap_err();
         }
     }
 

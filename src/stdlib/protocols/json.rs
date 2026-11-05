@@ -1029,14 +1029,22 @@ fn is_scalar_byte(c: u8) -> bool {
 mod tests {
     use super::*;
     use fictionet::assert_cases;
-    use fictionet::stdlib::codec::Lcg;
-    use fictionet::stdlib::codec::{Fail, Stream, finish, pump};
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::codec::{Fail, finish, pump};
+    use fictionet::stdlib::codec::{Lcg, Stream};
     use fictionet::stdlib::test_support::rounds;
-    use fictionet::stdlib::test_support::{decode_all, mutate};
+    use fictionet::stdlib::test_support::{
+        assert_write, chunks, decode_all, decode_chunks, mutate,
+    };
 
     fn check(input: &[u8]) {
-        contract::check_decode_with_alloc_limit(Values::new, input, 2 * (MAX_SIZE + 1));
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Values::new()),
+                chunks(input, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * (MAX_SIZE + 1))
+            ),
+            decode_all(Values::new, input)
+        );
     }
 
     fn s(v: &str) -> Value {
@@ -1113,7 +1121,7 @@ mod tests {
             keys,
             ["Width", "Height", "Title", "Thumbnail", "Animated", "IDs"]
         );
-        String::from_utf8(contract::check_written(&v)).unwrap();
+        String::from_utf8(assert_write(&v).unwrap()).unwrap();
     }
 
     #[test]
@@ -1152,7 +1160,7 @@ mod tests {
         assert_eq!(lon.text(), "-122.026020");
         assert_eq!(lon.as_f64(), -122.02602);
         assert_eq!(items[0].get("Address").and_then(Value::as_str), Some(""));
-        String::from_utf8(contract::check_written(&v)).unwrap();
+        String::from_utf8(assert_write(&v).unwrap()).unwrap();
     }
 
     #[test]
@@ -1278,14 +1286,12 @@ mod tests {
         // The writer escapes only what it must.
         let w = written_text(&s("q\"b\\/\n\u{1}\u{7f}é😀"));
         assert_eq!(w, "\"q\\\"b\\\\/\\n\\u0001\u{7f}é😀\"");
-        String::from_utf8(contract::check_written(&s(
-            "q\"b\\/\n\u{1}\u{1f}\u{7f}é😀\u{2028}",
-        )))
-        .unwrap();
+        String::from_utf8(assert_write(&s("q\"b\\/\n\u{1}\u{1f}\u{7f}é😀\u{2028}")).unwrap())
+            .unwrap();
         for c in 0..0x20u32 {
-            String::from_utf8(contract::check_written(&Value::String(
-                char::from_u32(c).unwrap().to_string(),
-            )))
+            String::from_utf8(
+                assert_write(&Value::String(char::from_u32(c).unwrap().to_string())).unwrap(),
+            )
             .unwrap();
         }
     }
@@ -1411,7 +1417,7 @@ mod tests {
     fn limits() {
         let at = format!("{}{}", "[".repeat(MAX_DEPTH), "]".repeat(MAX_DEPTH));
         let v = Value::parse(at.as_bytes()).unwrap();
-        String::from_utf8(contract::check_written(&v)).unwrap();
+        String::from_utf8(assert_write(&v).unwrap()).unwrap();
         let tight = Limits {
             depth: 2,
             size: 20,
@@ -1484,7 +1490,7 @@ mod tests {
         let Value::Array(inner) = &mut deep else {
             panic!()
         };
-        String::from_utf8(contract::check_written(&inner.pop().unwrap())).unwrap();
+        String::from_utf8(assert_write(&inner.pop().unwrap()).unwrap()).unwrap();
         let big = Value::String("x".repeat(MAX_SIZE));
         assert_eq!(big.to_bytes().unwrap_err().kind, ErrorKind::TooLarge);
         assert!(Value::String("x".repeat(MAX_SIZE - 2)).to_bytes().is_ok());
@@ -1496,7 +1502,7 @@ mod tests {
             ErrorKind::TooManyElements
         );
         let ok = Value::Array(vec![Value::Null; MAX_ELEMENTS - 1]);
-        String::from_utf8(contract::check_written(&ok)).unwrap();
+        String::from_utf8(assert_write(&ok).unwrap()).unwrap();
         let tight = Limits {
             depth: 1,
             size: 10,
@@ -1539,7 +1545,7 @@ mod tests {
             ),
             ("n".into(), Value::from("again")),
         ]);
-        String::from_utf8(contract::check_written(&v)).unwrap();
+        String::from_utf8(assert_write(&v).unwrap()).unwrap();
         let text = written_text(&v);
         assert_eq!(written_text(&Value::parse(text.as_bytes()).unwrap()), text);
         // Whitespace anywhere it may go.
@@ -1740,7 +1746,15 @@ mod tests {
             ),
         ] {
             let make = || Values::with_limits(limits);
-            contract::check_decode_with_alloc_limit(make, bytes, 2 * make().capacity());
+            let alloc = 2 * make().capacity();
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(make()),
+                    chunks(bytes, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= alloc)
+                ),
+                decode_all(make, bytes)
+            );
             assert_eq!(decode_all(make, bytes).1, Some(Fail::Protocol(expected)));
         }
         for input in [
@@ -1925,7 +1939,7 @@ mod tests {
         assert!(parsed > 100, "only {parsed} parsed inputs");
         for _ in 0..5_000 {
             let value = random_value(&mut rng, 0);
-            contract::check_wire_value(&value);
+            let _ = assert_write(&value);
             let mut bytes = value.to_bytes().unwrap();
             assert_eq!(decode_all(Values::new, &bytes), (vec![value], None));
             mutate(&mut rng, &mut bytes);
@@ -1935,7 +1949,9 @@ mod tests {
 
     fn check_parsed(data: &[u8]) -> bool {
         check(data);
-        contract::check_wire::<Value>(data);
+        if let Ok(value) = Value::parse(data) {
+            assert_write(&value).unwrap();
+        }
         if let Ok(value) = Value::parse(data) {
             assert_eq!(decode_all(Values::new, data), (vec![value], None));
             true

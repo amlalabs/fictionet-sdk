@@ -177,14 +177,14 @@ mod tests {
 
     #[test]
     fn integers_edges_overflow_and_strict_writers() {
-        use fictionet::stdlib::test_support::contract;
+        use fictionet::stdlib::test_support::assert_write;
         assert_eq!(Integer::<5>::parse(&hex("0a")).unwrap().value, 10);
         assert_eq!(Integer::<5>::parse(&hex("1f9a0a")).unwrap().value, 1337);
         assert_eq!(Integer::<8>::parse(&hex("2a")).unwrap().value, 42);
         for value in [0, 30, 31, 32, 127, 255, 256, u32::MAX as u64, u64::MAX] {
-            contract::check_wire_value(&Integer::<1> { flags: 0xfe, value });
-            contract::check_wire_value(&Integer::<5> { flags: 0xa0, value });
-            contract::check_wire_value(&Integer::<8> { flags: 0, value });
+            let _ = assert_write(&Integer::<1> { flags: 0xfe, value });
+            let _ = assert_write(&Integer::<5> { flags: 0xa0, value });
+            let _ = assert_write(&Integer::<8> { flags: 0, value });
         }
         assert_eq!(Integer::<5>::parse(&[31]), Err(Error::Truncated));
         assert_eq!(Integer::<5>::parse(&[0, 0]), Err(Error::Trailing));
@@ -199,8 +199,8 @@ mod tests {
         );
         // Nonminimal encodings are permitted, within the fixed integer byte bound.
         assert_eq!(Integer::<5>::parse(&hex("1f8000")).unwrap().value, 31);
-        contract::check_wire_value(&Integer::<0> { flags: 0, value: 0 });
-        contract::check_wire_value(&Integer::<9> { flags: 0, value: 0 });
-        contract::check_wire_value(&Integer::<8> { flags: 1, value: 0 });
+        let _ = assert_write(&Integer::<0> { flags: 0, value: 0 });
+        let _ = assert_write(&Integer::<9> { flags: 0, value: 0 });
+        let _ = assert_write(&Integer::<8> { flags: 1, value: 0 });
     }
 }

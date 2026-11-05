@@ -1429,7 +1429,7 @@ impl Wire for Version {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::Lcg;
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::assert_write;
     use fictionet::stdlib::test_support::mutate;
 
     /// The CHALLENGE message from \[MS-NLMP\] section 4.2.4.3.
@@ -2488,19 +2488,45 @@ mod tests {
 
     /// Whatever reads is written back and reads back the same.
     fn check(b: &[u8]) {
-        contract::check_wire::<AvPair>(b);
-        contract::check_wire::<AvPairs>(b);
-        contract::check_wire::<Version>(b);
-        contract::check_wire::<Message>(b);
-        contract::check_wire::<Negotiate>(b);
-        contract::check_wire::<Challenge>(b);
-        contract::check_wire::<Authenticate>(b);
-        contract::check_wire::<NtResponse>(b);
-        contract::check_wire::<NtlmV2Response>(b);
-        contract::check_wire::<ClientChallenge>(b);
-        contract::check_wire::<LmV2Response>(b);
-        contract::check_wire::<UnicodeName>(b);
-        contract::check_wire::<MicInput>(b);
+        if let Ok(value) = AvPair::parse(b) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = AvPairs::parse(b) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Version::parse(b) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Message::parse(b) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Negotiate::parse(b) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Challenge::parse(b) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Authenticate::parse(b) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = NtResponse::parse(b) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = NtlmV2Response::parse(b) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = ClientChallenge::parse(b) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = LmV2Response::parse(b) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = UnicodeName::parse(b) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = MicInput::parse(b) {
+            assert_write(&value).unwrap();
+        }
 
         if let Ok(m) = Message::parse(b) {
             // What a message holds reads with its own reader.

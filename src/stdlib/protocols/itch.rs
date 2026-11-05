@@ -1125,11 +1125,10 @@ fn level(price: Price4, a: &Aggregate) -> Level {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{Fail, Lcg};
-    use fictionet::stdlib::test_support::contract::{
-        check_decode, check_decode_with_alloc_limit, check_wire, check_wire_value,
+    use fictionet::stdlib::codec::{Fail, Lcg, Stream};
+    use fictionet::stdlib::test_support::{
+        assert_write, chunks, decode_all, decode_chunks, mutate,
     };
-    use fictionet::stdlib::test_support::{decode_all, mutate};
     use std::collections::BTreeMap;
 
     #[test]
@@ -1314,7 +1313,9 @@ mod tests {
         b.extend_from_slice(&3u32.to_be_bytes());
         b.extend_from_slice(&4u32.to_be_bytes());
         assert_eq!(m.to_bytes().unwrap(), b);
-        check_wire::<Message>(&b);
+        if let Ok(value) = Message::parse(&b) {
+            assert_write(&value).unwrap();
+        }
     }
 
     // 1.6: I, paired 11, imbalance 19, direction 27, stock 28, far 36,
@@ -1392,7 +1393,7 @@ mod tests {
         assert_eq!(&b[11..19], &500_012_345_678u64.to_be_bytes());
         assert_eq!(m.level1.to_string(), "5000.12345678");
         assert_eq!(m.level2.to_string(), "0.00000001");
-        check_wire_value(&Message::from(m));
+        let _ = assert_write(&Message::from(m));
     }
 
     // 1.8: O, the DLCR message.
@@ -1414,7 +1415,9 @@ mod tests {
         assert_eq!(b[19], b'Y');
         assert_eq!(&b[32..40], &0xdead_beefu64.to_be_bytes());
         assert_eq!(&b[44..48], &110_000u32.to_be_bytes());
-        check_wire::<Message>(&b);
+        if let Ok(value) = Message::parse(&b) {
+            assert_write(&value).unwrap();
+        }
     }
 
     #[test]
@@ -1641,12 +1644,13 @@ mod tests {
         let kinds: Vec<u8> = samples.iter().map(Message::kind).collect();
         assert_eq!(kinds, Message::KINDS);
         for m in &samples {
-            check_wire_value(m);
-            let b = m.to_bytes().unwrap();
+            let b = assert_write(m).unwrap();
             assert_eq!(b.len(), m.wire_len());
             assert_eq!(b[0], m.kind());
             assert_eq!(m.header().locate, 42);
-            check_wire::<Message>(&b);
+            if let Ok(value) = Message::parse(&b) {
+                assert_write(&value).unwrap();
+            }
         }
     }
 
@@ -1667,9 +1671,30 @@ mod tests {
         bytes.extend_from_slice(&[0, 3, b'z', 1, 2]);
         bytes.extend_from_slice(&[0, 0]);
         bytes.extend_from_slice(&framed(&samples[..1]));
-        check_decode(Frames::<Message>::default, &bytes);
-        check_decode(|| Frames::<Message>::with_limit(MAX_MESSAGE_LENGTH), &bytes);
-        check_decode_with_alloc_limit(Frames::<Message>::default, &bytes, 2 * (MAX_FRAME + 2));
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Message>::default()),
+                chunks(&bytes, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(Frames::<Message>::default, &bytes)
+        );
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Message>::with_limit(MAX_MESSAGE_LENGTH)),
+                chunks(&bytes, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(|| Frames::<Message>::with_limit(MAX_MESSAGE_LENGTH), &bytes)
+        );
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Message>::default()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * (MAX_FRAME + 2))
+            ),
+            decode_all(Frames::<Message>::default, &bytes)
+        );
         let (items, failure) = decode_all(Frames::<Message>::default, &bytes);
         assert!(failure.is_none());
         assert_eq!(items.len(), samples.len() + 3);
@@ -1722,9 +1747,15 @@ mod tests {
             for _ in 0..=rng.below(3) {
                 mutate(&mut rng, &mut bytes);
             }
-            check_wire::<Message>(&bytes);
-            check_wire::<AddOrder>(&bytes);
-            check_wire::<Noii>(&bytes);
+            if let Ok(value) = Message::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = AddOrder::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = Noii::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
             if let Ok(m) = Message::parse(&bytes) {
                 let mut book = Book::new(BookConfig::default()).unwrap();
                 let _ = book.apply(&m);
@@ -1735,7 +1766,14 @@ mod tests {
             for _ in 0..=rng.below(4) {
                 mutate(&mut rng, &mut bytes);
             }
-            check_decode(Frames::<Message>::default, &bytes);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Frames::<Message>::default()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |_| {}
+                ),
+                decode_all(Frames::<Message>::default, &bytes)
+            );
         }
     }
 

@@ -1292,18 +1292,19 @@ fn packet_reader(packet: &Packet) -> Result<Reader<'_>, Error> {
 #[doc(hidden)]
 pub mod harness {
     use super::{Packet, Request, Response};
+
     use fictionet::stdlib::codec::Wire;
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::assert_write;
 
     /// Checks typed packet readers and writers.
     pub fn check_packet(packet: &Packet) {
         if let Ok(request) = Request::from_packet(packet) {
             assert!(request.to_bytes().is_ok(), "{request:?}");
-            contract::check_wire_value(&request);
+            let _ = assert_write(&request);
         }
         if let Ok(response) = Response::from_packet(packet) {
             assert!(response.to_bytes().is_ok(), "{response:?}");
-            contract::check_wire_value(&response);
+            let _ = assert_write(&response);
         }
     }
 }
@@ -1312,11 +1313,11 @@ pub mod harness {
 mod tests {
     use super::harness::check_packet;
     use super::*;
-    use fictionet::stdlib::codec::{Decode, Step};
-    use fictionet::stdlib::codec::{Fail, Lcg, Stream};
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::codec::{Decode, Fail, Lcg, Step, Stream};
     use fictionet::stdlib::test_support::rounds;
-    use fictionet::stdlib::test_support::{decode_all, mutate};
+    use fictionet::stdlib::test_support::{
+        assert_write, chunks, decode_all, decode_chunks, mutate,
+    };
 
     fn s(v: &[u8]) -> Vec<u8> {
         v.to_vec()
@@ -1664,7 +1665,7 @@ mod tests {
                 language: vec![],
             };
             assert_eq!(response.to_bytes(), Err(Error::Unwritable));
-            contract::check_wire_value(&response);
+            let _ = assert_write(&response);
         }
         assert_eq!(Status::NoSuchFile.to_string(), "no such file");
         assert_eq!(Error::UnknownType(77).status(), Status::OpUnsupported);
@@ -1936,7 +1937,14 @@ mod tests {
         };
         let b = stat.to_bytes().unwrap();
         let bytes = [&a[..], &b].concat();
-        contract::check_decode_with_alloc_limit(Frames::<Packet>::new, &bytes, 2 * MAX_FRAME);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Packet>::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_FRAME)
+            ),
+            decode_all(Frames::<Packet>::new, &bytes)
+        );
         let (packets, failure) = decode_all(Frames::<Packet>::new, &bytes);
         assert_eq!(failure, None);
         assert_eq!(packets.len(), 2);
@@ -1974,8 +1982,8 @@ mod tests {
     #[test]
     fn writers_refuse_values_they_would_shorten() {
         fn refused<T: Wire<WriteError = Error> + std::fmt::Debug + PartialEq>(value: T) {
-            assert_eq!(contract::check_refused(&value), Error::Unwritable);
-            contract::check_wire_value(&value);
+            assert_eq!(assert_write(&value).unwrap_err(), Error::Unwritable);
+            let _ = assert_write(&value);
         }
         let big = vec![b'a'; 2 * MAX_PACKET];
         let many_ext = vec![
@@ -2067,7 +2075,7 @@ mod tests {
         });
         let packet = Packet { kind: 9, body: big };
         assert!(packet.to_bytes().is_err());
-        contract::check_wire_value(&packet);
+        let _ = assert_write(&packet);
         for value in [
             Response::Name {
                 id: 1,
@@ -2187,10 +2195,13 @@ mod tests {
         .to_bytes()
         .unwrap();
         let bytes = one.repeat(100);
-        contract::check_decode_with_alloc_limit(
-            || Frames::<Packet>::with_limit(64),
-            &bytes,
-            2 * (LENGTH_LEN + 64),
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Packet>::with_limit(64)),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * (LENGTH_LEN + 64))
+            ),
+            decode_all(|| Frames::<Packet>::with_limit(64), &bytes)
         );
         assert_eq!(
             decode_all(|| Frames::<Packet>::with_limit(64), &bytes)
@@ -2212,7 +2223,7 @@ mod tests {
             };
             assert_eq!(message, text.as_bytes());
             assert_eq!(response.to_bytes(), Err(Error::Unwritable));
-            contract::check_wire_value(&response);
+            let _ = assert_write(&response);
             let language = Response::Status {
                 id: 1,
                 status: Status::Failure,
@@ -2231,7 +2242,7 @@ mod tests {
                 language: vec![],
             };
             assert_eq!(response.to_bytes().is_ok(), n == MAX_TEXT);
-            contract::check_wire_value(&response);
+            let _ = assert_write(&response);
         }
     }
 
@@ -2314,11 +2325,26 @@ mod tests {
                 rng.bytes(64)
             };
             mutate(&mut rng, &mut bytes);
-            contract::check_decode_with_alloc_limit(Frames::<Packet>::new, &bytes, 2 * MAX_FRAME);
-            contract::check_wire::<Packet>(&bytes);
-            contract::check_wire::<Request>(&bytes);
-            contract::check_wire::<Response>(&bytes);
-            contract::check_wire::<Attrs>(&bytes);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Frames::<Packet>::new()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_FRAME)
+                ),
+                decode_all(Frames::<Packet>::new, &bytes)
+            );
+            if let Ok(value) = Packet::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = Request::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = Response::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = Attrs::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
             for kind in 0..=255 {
                 let packet = Packet {
                     kind,

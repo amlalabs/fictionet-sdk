@@ -665,12 +665,31 @@ fn v4_addresses(b: &[u8]) -> Vec<Ipv4Addr> {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::Lcg;
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::codec::{Collect, CollectError, Decode, Fail, Stream};
+    use fictionet::stdlib::test_support::{chunks, decode_chunks};
+
     use fictionet::stdlib::test_support::mutate;
     use fictionet::stdlib::test_support::rounds;
 
     fn collect(b: &[u8], e: &Endpoints) -> Result<Advertisement, Error> {
-        contract::check_collect_with(b, MAX_MESSAGE, |b| Advertisement::parse(b, e))
+        let parsed = Advertisement::parse(b, e);
+        let decoded = decode_chunks(
+            &mut Stream::new(Collect::bytes(MAX_MESSAGE).map(|d| Advertisement::parse(&d, e))),
+            chunks(b, &[1, 7, 64]),
+            |s| assert!(s.allocated() <= 2 * (MAX_MESSAGE + 1)),
+        );
+        if b.len() <= MAX_MESSAGE {
+            assert_eq!(decoded, (vec![parsed.clone()], None));
+        } else {
+            assert_eq!(
+                decoded,
+                (
+                    vec![],
+                    Some(Fail::Protocol(CollectError::TooLong { limit: MAX_MESSAGE }))
+                )
+            );
+        }
+        parsed
     }
 
     fn ip4(a: u8, b: u8, c: u8, d: u8) -> Ipv4Addr {

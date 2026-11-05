@@ -1762,18 +1762,44 @@ pub mod harness {
         band_packets,
     };
     use fictionet::stdlib::codec::{Frames, Stream, Wire};
-    use fictionet::stdlib::test_support::{contract, decode_all};
+    use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
 
     /// Checks packet, payload, and sideband contracts.
     pub fn check(data: &[u8]) {
-        contract::check_decode_with_alloc_limit(Frames::<Packet>::new, data, 2 * MAX_PACKET);
-        contract::check_decode_with_alloc_limit(|| Bands, data, 2 * MAX_PACKET);
-        contract::check_wire::<Packet>(data);
-        contract::check_wire::<ProtoRequest>(data);
-        contract::check_wire::<ServiceHeader>(data);
-        contract::check_wire::<Advertisement>(data);
-        contract::check_wire::<CapabilityAdvertisement>(data);
-        contract::check_wire::<V2Request>(data);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Packet>::new()),
+                chunks(data, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_PACKET)
+            ),
+            decode_all(Frames::<Packet>::new, data)
+        );
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Bands),
+                chunks(data, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_PACKET)
+            ),
+            decode_all(|| Bands, data)
+        );
+        if let Ok(value) = Packet::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = ProtoRequest::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = ServiceHeader::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Advertisement::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = CapabilityAdvertisement::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = V2Request::parse(data) {
+            assert_write(&value).unwrap();
+        }
         // Bytes still buffered are handed over without changes, even after a bad packet.
         let mut stream = Stream::new(Frames::<Packet>::new());
         let pushed = stream.push(data);
@@ -1785,13 +1811,21 @@ pub mod harness {
         assert_eq!(buffer.unread(), &data[used..pushed]);
         for packet in decode_all(Frames::<Packet>::new, data).0 {
             if let Some(bytes) = packet.data() {
-                contract::check_wire::<ClientLine>(bytes);
-                contract::check_wire::<ServerLine>(bytes);
-                contract::check_wire::<LsRef>(bytes);
-                contract::check_wire::<LsRefsArg>(bytes);
+                if let Ok(value) = ClientLine::parse(bytes) {
+                    assert_write(&value).unwrap();
+                }
+                if let Ok(value) = ServerLine::parse(bytes) {
+                    assert_write(&value).unwrap();
+                }
+                if let Ok(value) = LsRef::parse(bytes) {
+                    assert_write(&value).unwrap();
+                }
+                if let Ok(value) = LsRefsArg::parse(bytes) {
+                    assert_write(&value).unwrap();
+                }
                 if let Ok(request) = ProtoRequest::from_data(bytes) {
                     assert!(request.to_bytes().is_ok(), "{request:?}");
-                    contract::check_wire_value(&request);
+                    let _ = assert_write(&request);
                 }
             }
         }
@@ -1799,13 +1833,13 @@ pub mod harness {
             if let Ok(args) = command.fetch_args() {
                 for arg in args {
                     assert!(arg.to_bytes().is_ok(), "{arg:?}");
-                    contract::check_wire_value(&arg);
+                    let _ = assert_write(&arg);
                 }
             }
             if let Ok(args) = command.ls_refs_args() {
                 for arg in args {
                     assert!(arg.to_bytes().is_ok(), "{arg:?}");
-                    contract::check_wire_value(&arg);
+                    let _ = assert_write(&arg);
                 }
             }
         }
@@ -1833,9 +1867,10 @@ mod tests {
     use super::*;
     use fictionet::assert_cases;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream};
-    use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::rounds;
-    use fictionet::stdlib::test_support::{decode_all, mutate};
+    use fictionet::stdlib::test_support::{
+        assert_write, chunks, decode_all, decode_chunks, mutate,
+    };
 
     fn advertised_ref(id: ObjectId, name: String) -> AdvertisedRef {
         AdvertisedRef { id, name }
@@ -1988,23 +2023,32 @@ mod tests {
     fn packet_writers_refuse_oversized_values() {
         let packet = Packet::Data(vec![b'x'; MAX_DATA + 100]);
         assert!(packet.to_bytes().is_err());
-        contract::check_wire_value(&packet);
+        let _ = assert_write(&packet);
         let long = "é".repeat(MAX_DATA);
         let packet = Packet::text(&long);
         assert_eq!(packet.data().unwrap().len(), long.len() + 1);
         assert!(packet.to_bytes().is_err());
-        contract::check_wire_value(&packet);
+        let _ = assert_write(&packet);
         let packet = Packet::Data(vec![0; MAX_DATA]);
         let bytes = packet.to_bytes().unwrap();
         assert_eq!(bytes.len(), MAX_PACKET);
         assert_eq!(&bytes[..4], b"fff0");
-        contract::check_wire::<Packet>(&bytes);
+        if let Ok(value) = Packet::parse(&bytes) {
+            assert_write(&value).unwrap();
+        }
     }
 
     #[test]
     fn stream_splits_packets() {
         let bytes = pkt(&["want x\n", "0001", "0000", "done\n"]);
-        contract::check_decode_with_alloc_limit(Frames::<Packet>::new, &bytes, 2 * MAX_PACKET);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Packet>::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_PACKET)
+            ),
+            decode_all(Frames::<Packet>::new, &bytes)
+        );
         assert_eq!(
             decode_all(Frames::<Packet>::new, &bytes),
             (
@@ -2161,7 +2205,7 @@ mod tests {
             },
         ] {
             assert_eq!(request.to_bytes(), Err(Error::Unwritable));
-            contract::check_wire_value(&request);
+            let _ = assert_write(&request);
         }
         let request = ProtoRequest {
             path: "/a\nb".into(),
@@ -2265,7 +2309,7 @@ mod tests {
             ..Advertisement::default()
         };
         assert_eq!(odd.to_bytes(), Err(Error::Unwritable));
-        contract::check_wire_value(&odd);
+        let _ = assert_write(&odd);
     }
 
     // Git reads capabilities^{} as "no refs" only with a zero id
@@ -2403,13 +2447,13 @@ mod tests {
         // A command whose name has nothing a key may hold is refused.
         let empty = V2Request::Command(command_fixture("?!".into(), vec![], vec!["x".into()]));
         assert_eq!(empty.to_bytes(), Err(Error::Unwritable));
-        contract::check_wire_value(&empty);
+        let _ = assert_write(&empty);
         let cap = Capability::with_value("é x", "v");
         let ad = CapabilityAdvertisement {
             capabilities: vec![cap.clone(), Capability::new("~")],
         };
         assert_eq!(ad.to_bytes(), Err(Error::Unwritable));
-        contract::check_wire_value(&ad);
+        let _ = assert_write(&ad);
     }
 
     #[test]
@@ -2470,14 +2514,14 @@ mod tests {
             shallow: vec![],
         };
         assert_eq!(ad.to_bytes(), Err(Error::Unwritable));
-        contract::check_wire_value(&ad);
+        let _ = assert_write(&ad);
         // Many long capabilities stop where the line is full.
         let full = Advertisement {
             capabilities: vec![Capability::with_value("k", &"v".repeat(MAX_TEXT - 10)); 40],
             ..Advertisement::default()
         };
         assert_eq!(full.to_bytes(), Err(Error::Unwritable));
-        contract::check_wire_value(&full);
+        let _ = assert_write(&full);
     }
 
     // gitprotocol-v2, "Capability Advertisement".
@@ -2530,7 +2574,7 @@ mod tests {
             capabilities: vec![Capability::new("ERR x"), Capability::new("=")],
         };
         assert_eq!(odd.to_bytes(), Err(Error::Unwritable));
-        contract::check_wire_value(&odd);
+        let _ = assert_write(&odd);
     }
 
     // gitprotocol-v2, "ls-refs" and "fetch".
@@ -2650,7 +2694,7 @@ mod tests {
             vec!["x\ny".into(), "z".repeat(MAX_DATA * 2)],
         ));
         assert_eq!(req.to_bytes(), Err(Error::Unwritable));
-        contract::check_wire_value(&req);
+        let _ = assert_write(&req);
     }
 
     // gitprotocol-pack, "Packfile Negotiation".
@@ -2816,7 +2860,7 @@ mod tests {
             peeled: None,
         };
         assert_eq!(odd.to_bytes(), Err(Error::Unwritable));
-        contract::check_wire_value(&odd);
+        let _ = assert_write(&odd);
         let empty = LsRef {
             id: Some(id(A)),
             name: String::new(),
@@ -2853,7 +2897,14 @@ mod tests {
         {
             packet.write(&mut bytes).unwrap();
         }
-        contract::check_decode_with_alloc_limit(|| Bands, &bytes, 2 * MAX_PACKET);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Bands),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_PACKET)
+            ),
+            decode_all(|| Bands, &bytes)
+        );
         let (items, failure) = decode_all(|| Bands, &bytes);
         assert_eq!(failure, None);
         let mut got = Vec::new();
@@ -2950,10 +3001,13 @@ mod tests {
         assert_eq!(stream.push(b"0000"), 0);
         assert_eq!(stream.next(), Some(Ok(Packet::Flush)));
         assert_eq!(stream.push(b"0000"), 4);
-        contract::check_decode_with_alloc_limit(
-            Frames::<Packet>::new,
-            &bytes[..1024],
-            2 * MAX_PACKET,
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Packet>::new()),
+                chunks(&bytes[..1024], &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_PACKET)
+            ),
+            decode_all(Frames::<Packet>::new, &bytes[..1024])
         );
         let mut bands = Stream::new(Bands);
         assert_eq!(bands.push(&bytes), MAX_PACKET);
@@ -3097,7 +3151,7 @@ mod tests {
             shallow: vec![id(B), id(C)],
         };
         assert_eq!(ad.to_bytes(), Err(Error::Unwritable));
-        contract::check_wire_value(&ad);
+        let _ = assert_write(&ad);
         let mut caps = vec![Capability::with_value("k", &"v".repeat(MAX_TEXT - 10)); 40];
         caps.push(Capability::with_value("object-format", "sha256"));
         let full = Advertisement {
@@ -3105,7 +3159,7 @@ mod tests {
             ..ad
         };
         assert_eq!(full.to_bytes(), Err(Error::Unwritable));
-        contract::check_wire_value(&full);
+        let _ = assert_write(&full);
     }
 
     // gitprotocol-v2, "fetch": deepen-since and deepen-not cannot be used

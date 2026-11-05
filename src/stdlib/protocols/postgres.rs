@@ -2711,9 +2711,10 @@ mod tests {
 
     use super::*;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream};
-    use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::rounds;
-    use fictionet::stdlib::test_support::{decode_all, mutate};
+    use fictionet::stdlib::test_support::{
+        assert_write, chunks, decode_all, decode_chunks, mutate,
+    };
 
     #[test]
     fn cstr_errors_keep_position_and_tag() {
@@ -2746,19 +2747,23 @@ mod tests {
     #[test]
     fn all_message_variants_obey_wire_contract() {
         for message in all_frontend() {
-            contract::check_wire_value(&message);
+            let _ = assert_write(&message);
             let bytes = Wire::to_bytes(&message).unwrap();
             assert_eq!(
                 frontend_size(&message),
                 bytes.len() - usize::from(message.tag().is_some())
             );
-            contract::check_wire::<FrontendMessage>(&bytes);
+            if let Ok(value) = FrontendMessage::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
         }
         for message in all_backend() {
-            contract::check_wire_value(&message);
+            let _ = assert_write(&message);
             let bytes = Wire::to_bytes(&message).unwrap();
             assert_eq!(backend_size(&message), bytes.len() - 1);
-            contract::check_wire::<BackendMessage>(&bytes);
+            if let Ok(value) = BackendMessage::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
         }
     }
 
@@ -3139,8 +3144,10 @@ mod tests {
             let length = sasl.data.as_ref().map_or(-1, |bytes| bytes.len() as i32);
             assert_eq!(&body[14..18], &length.to_be_bytes());
             assert_eq!(SaslInitialResponse::parse(&body), Ok(sasl.clone()));
-            contract::check_wire_value(&sasl);
-            contract::check_wire::<SaslInitialResponse>(&body);
+            let _ = assert_write(&sasl);
+            if let Ok(value) = SaslInitialResponse::parse(&body) {
+                assert_write(&value).unwrap();
+            }
         }
         let none = SaslInitialResponse {
             mechanism: "X".into(),
@@ -3187,7 +3194,7 @@ mod tests {
         for len in [MAX_AUTH_MESSAGE - 5, MAX_AUTH_MESSAGE - 4] {
             let password = Password("x".repeat(len));
             assert_eq!(password.to_bytes().is_ok(), len == MAX_AUTH_MESSAGE - 5);
-            contract::check_wire_value(&password);
+            let _ = assert_write(&password);
         }
     }
 
@@ -3748,10 +3755,14 @@ mod tests {
         for message in &messages {
             message.write(&mut input).unwrap();
         }
-        contract::check_decode_with_alloc_limit(
-            BackendEvents::new,
-            &input,
-            2 * BackendEvents::new().capacity(),
+        let alloc = 2 * BackendEvents::new().capacity();
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(BackendEvents::new()),
+                chunks(&input, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= alloc)
+            ),
+            decode_all(BackendEvents::new, &input)
         );
         assert_eq!(
             decode_all(BackendEvents::new, &input),
@@ -3780,15 +3791,21 @@ mod tests {
     #[test]
     fn stream_holds_at_most_its_capacity() {
         let input = vec![b'?'; 65_536];
-        contract::check_decode_with_alloc_limit(
-            || FrontendMessages::with_limit(10_000),
-            &input,
-            2 * (MAX_STARTUP + 4),
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(FrontendMessages::with_limit(10_000)),
+                chunks(&input, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * (MAX_STARTUP + 4))
+            ),
+            decode_all(|| FrontendMessages::with_limit(10_000), &input)
         );
-        contract::check_decode_with_alloc_limit(
-            || BackendEvents::with_limit(10_000),
-            &input,
-            2 * 10_001,
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(BackendEvents::with_limit(10_000)),
+                chunks(&input, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * 10_001)
+            ),
+            decode_all(|| BackendEvents::with_limit(10_000), &input)
         );
     }
 
@@ -4015,8 +4032,8 @@ mod tests {
     fn constructed_writes_are_transactional() {
         let mut rng = Lcg::new(7);
         for _ in 0..3000 {
-            contract::check_wire_value(&random_frontend(&mut rng));
-            contract::check_wire_value(&random_backend(&mut rng));
+            let _ = assert_write(&random_frontend(&mut rng));
+            let _ = assert_write(&random_backend(&mut rng));
         }
     }
 
@@ -4025,20 +4042,24 @@ mod tests {
         let mut rng = Lcg::new(1);
         for _ in 0..3000 {
             let message = random_frontend(&mut rng);
-            contract::check_wire_value(&message);
+            let _ = assert_write(&message);
             let bytes = message.to_bytes();
             assert_eq!(bytes.is_ok(), clean_frontend(&message), "{message:?}");
             if let Ok(bytes) = bytes {
                 assert_eq!(FrontendMessage::parse(&bytes), Ok(message));
-                contract::check_wire::<FrontendMessage>(&bytes);
+                if let Ok(value) = FrontendMessage::parse(&bytes) {
+                    assert_write(&value).unwrap();
+                }
             }
             let message = random_backend(&mut rng);
-            contract::check_wire_value(&message);
+            let _ = assert_write(&message);
             let bytes = message.to_bytes();
             assert_eq!(bytes.is_ok(), clean_backend(&message), "{message:?}");
             if let Ok(bytes) = bytes {
                 assert_eq!(BackendMessage::parse(&bytes), Ok(message));
-                contract::check_wire::<BackendMessage>(&bytes);
+                if let Ok(value) = BackendMessage::parse(&bytes) {
+                    assert_write(&value).unwrap();
+                }
             }
         }
     }
@@ -4069,14 +4090,31 @@ mod tests {
                 (make, &startup),
                 (|| FrontendMessages::established(SMALL_MESSAGE), &data),
             ] {
-                contract::check_decode_with_alloc_limit(make, input, 2 * make().capacity());
+                let alloc = 2 * make().capacity();
+                assert_eq!(
+                    decode_chunks(
+                        &mut Stream::new(make()),
+                        chunks(input, &[1, 7, 64]),
+                        |s| assert!(s.allocated() <= alloc)
+                    ),
+                    decode_all(make, input)
+                );
                 for m in decode_all(make, input).0.into_iter().flatten() {
                     let b = m.to_bytes().unwrap();
                     assert_eq!(FrontendMessage::parse(&b), Ok(m));
-                    contract::check_wire::<FrontendMessage>(&b);
+                    if let Ok(value) = FrontendMessage::parse(&b) {
+                        assert_write(&value).unwrap();
+                    }
                 }
             }
-            contract::check_decode_with_alloc_limit(|| BackendEvents::with_limit(64), &data, 130);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(BackendEvents::with_limit(64)),
+                    chunks(&data, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 130)
+                ),
+                decode_all(|| BackendEvents::with_limit(64), &data)
+            );
             for item in decode_all(|| BackendEvents::with_limit(64), &data)
                 .0
                 .into_iter()
@@ -4085,22 +4123,42 @@ mod tests {
                 if let BackendEvent::Message(m) = item {
                     let b = m.to_bytes().unwrap();
                     assert_eq!(BackendMessage::parse(&b), Ok(m));
-                    contract::check_wire::<BackendMessage>(&b);
+                    if let Ok(value) = BackendMessage::parse(&b) {
+                        assert_write(&value).unwrap();
+                    }
                 }
             }
             let make = || BackendEvents::with_limit(SMALL_MESSAGE);
-            contract::check_decode_with_alloc_limit(make, &data, 2 * make().capacity());
+            let alloc = 2 * make().capacity();
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(make()),
+                    chunks(&data, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= alloc)
+                ),
+                decode_all(make, &data)
+            );
             for item in decode_all(make, &data).0.into_iter().flatten() {
                 if let BackendEvent::Message(m) = item {
                     let b = m.to_bytes().unwrap();
                     assert_eq!(BackendMessage::parse(&b), Ok(m));
-                    contract::check_wire::<BackendMessage>(&b);
+                    if let Ok(value) = BackendMessage::parse(&b) {
+                        assert_write(&value).unwrap();
+                    }
                 }
             }
-            contract::check_wire::<FrontendMessage>(&data);
-            contract::check_wire::<BackendMessage>(&data);
-            contract::check_wire::<Password>(&data);
-            contract::check_wire::<SaslInitialResponse>(&data);
+            if let Ok(value) = FrontendMessage::parse(&data) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = BackendMessage::parse(&data) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = Password::parse(&data) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = SaslInitialResponse::parse(&data) {
+                assert_write(&value).unwrap();
+            }
         }
     }
 
@@ -4116,7 +4174,15 @@ mod tests {
                 .unwrap();
         }
         let make = || FrontendMessages::with_limit(SMALL_MESSAGE);
-        contract::check_decode_with_alloc_limit(make, &input, 2 * make().capacity());
+        let alloc = 2 * make().capacity();
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(make()),
+                chunks(&input, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= alloc)
+            ),
+            decode_all(make, &input)
+        );
         let (got, failure) = decode_all(make, &input);
         assert_eq!(failure, None);
         assert_eq!(got.len(), 3002);
@@ -4127,7 +4193,15 @@ mod tests {
             .unwrap()
             .repeat(3000);
         let make = || BackendEvents::with_limit(SMALL_MESSAGE);
-        contract::check_decode_with_alloc_limit(make, &input, 2 * make().capacity());
+        let alloc = 2 * make().capacity();
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(make()),
+                chunks(&input, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= alloc)
+            ),
+            decode_all(make, &input)
+        );
         assert_eq!(decode_all(make, &input).0.len(), 3000);
     }
 
@@ -4142,8 +4216,13 @@ mod tests {
         ready.write(&mut input).unwrap();
         input.extend_from_slice(tail);
         let make = || BackendEvents::with_limit(SMALL_MESSAGE);
+        let alloc = 2 * make().capacity();
+        let decoded = decode_chunks(&mut Stream::new(make()), chunks(&input, &[1, 7, 64]), |s| {
+            assert!(s.allocated() <= alloc)
+        });
+        assert_eq!(decoded, decode_all(make, &input));
         assert_eq!(
-            contract::check_decode_with_alloc_limit(make, &input, 2 * make().capacity()),
+            decoded,
             (
                 vec![
                     Ok(BackendEvent::Message(row)),
@@ -4153,8 +4232,13 @@ mod tests {
             )
         );
         let make = || BackendEvents::with_limit(64);
+        let alloc = 2 * make().capacity();
+        let decoded = decode_chunks(&mut Stream::new(make()), chunks(&input, &[1, 7, 64]), |s| {
+            assert!(s.allocated() <= alloc)
+        });
+        assert_eq!(decoded, decode_all(make, &input));
         assert_eq!(
-            contract::check_decode_with_alloc_limit(make, &input, 2 * make().capacity()),
+            decoded,
             (
                 vec![],
                 Some(Fail::Protocol(FrameError::TooLong { length, max: 64 })),
@@ -4171,16 +4255,26 @@ mod tests {
         FrontendMessage::Sync.write(&mut input).unwrap();
         input.extend_from_slice(tail);
         let make = || FrontendMessages::with_limit(SMALL_MESSAGE);
+        let alloc = 2 * make().capacity();
+        let decoded = decode_chunks(&mut Stream::new(make()), chunks(&input, &[1, 7, 64]), |s| {
+            assert!(s.allocated() <= alloc)
+        });
+        assert_eq!(decoded, decode_all(make, &input));
         assert_eq!(
-            contract::check_decode_with_alloc_limit(make, &input, 2 * make().capacity()),
+            decoded,
             (
                 vec![Ok(startup.clone()), Ok(query), Ok(FrontendMessage::Sync)],
                 Some(Fail::Protocol(FrameError::BadLength(3))),
             )
         );
         let make = || FrontendMessages::with_limit(64);
+        let alloc = 2 * make().capacity();
+        let decoded = decode_chunks(&mut Stream::new(make()), chunks(&input, &[1, 7, 64]), |s| {
+            assert!(s.allocated() <= alloc)
+        });
+        assert_eq!(decoded, decode_all(make, &input));
         assert_eq!(
-            contract::check_decode_with_alloc_limit(make, &input, 2 * make().capacity()),
+            decoded,
             (
                 vec![Ok(startup)],
                 Some(Fail::Protocol(FrameError::TooLong { length, max: 64 })),
@@ -4286,8 +4380,8 @@ mod tests {
     }
 
     fn assert_unwritable<M: Wire<WriteError = Error> + PartialEq + std::fmt::Debug>(value: &M) {
-        contract::check_wire_value(value);
-        assert_eq!(contract::check_refused(value), Error::Unwritable);
+        let _ = assert_write(value);
+        assert_eq!(assert_write(value).unwrap_err(), Error::Unwritable);
     }
 
     fn random_value(rng: &mut Lcg) -> Value {

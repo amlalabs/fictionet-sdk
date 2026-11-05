@@ -955,7 +955,7 @@ impl Present for Capture {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{Stream, Wire, pump};
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{chunks, decode_all, decode_chunks};
 
     fn raw(kind: u8, flags: u8, stream: u32, body: &[u8]) -> Vec<u8> {
         let mut out = FrameHeader {
@@ -974,7 +974,15 @@ mod tests {
     fn capture_follows_the_codec_contract() {
         let mut rng = fictionet::stdlib::codec::Lcg::new(0x6832);
         for _ in 0..128 {
-            contract::check_decode(|| Capture::new(1024), &rng.bytes(128));
+            let data = rng.bytes(128);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Capture::new(1024)),
+                    chunks(&data, &[1, 7, 64]),
+                    |_| {}
+                ),
+                decode_all(|| Capture::new(1024), &data)
+            );
         }
     }
 

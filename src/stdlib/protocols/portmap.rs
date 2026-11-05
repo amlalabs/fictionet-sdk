@@ -1202,11 +1202,11 @@ pub mod harness {
 mod tests {
     use super::harness::check;
     use super::*;
-    use fictionet::stdlib::codec::Lcg;
-    use fictionet::stdlib::codec::{Assembled, Stream, Wire, finish, pump};
+    use fictionet::stdlib::codec::{Assembled, Wire, finish, pump};
+    use fictionet::stdlib::codec::{Lcg, Stream};
     use fictionet::stdlib::protocols::onc_rpc::{MAX_RECORD, Record, records};
     use fictionet::stdlib::test_support;
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{chunks, decode_all, decode_chunks};
 
     fn rpcb_request(version: u32, request: RpcbRequest) -> Request {
         Request::Rpcb { version, request }
@@ -2162,10 +2162,19 @@ mod tests {
                 stream.extend_from_slice(&Record(bytes.to_vec()).to_bytes().unwrap());
                 want.push(bytes);
             }
-            contract::check_decode_with_alloc_limit(
-                || records(MAX_RECORD),
-                &stream,
-                2 * (MAX_RECORD + fictionet::stdlib::protocols::onc_rpc::RECORD_MARK_LEN),
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(records(MAX_RECORD)),
+                    chunks(&stream, &[1, 7, 64]),
+                    |s| {
+                        assert!(
+                            s.allocated()
+                                <= 2 * (MAX_RECORD
+                                    + fictionet::stdlib::protocols::onc_rpc::RECORD_MARK_LEN)
+                        );
+                    }
+                ),
+                decode_all(|| records(MAX_RECORD), &stream)
             );
             {
                 let (items, failure) = test_support::decode_all(|| records(MAX_RECORD), &stream);

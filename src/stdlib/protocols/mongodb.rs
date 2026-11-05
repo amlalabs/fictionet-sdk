@@ -1723,11 +1723,11 @@ fn parse_reply(data: &[u8]) -> Result<Reply, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{Decode, Step};
-    use fictionet::stdlib::codec::{Fail, Lcg, Stream};
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::codec::{Decode, Fail, Lcg, Step, Stream};
     use fictionet::stdlib::test_support::rounds;
-    use fictionet::stdlib::test_support::{decode_all, mutate};
+    use fictionet::stdlib::test_support::{
+        assert_write, chunks, decode_all, decode_chunks, mutate,
+    };
 
     fn s(v: &str) -> Bson {
         Bson::String(v.to_owned())
@@ -2673,10 +2673,13 @@ mod tests {
             .unwrap();
         for (body, terminal) in [(&[0, 0, 0, 0, 9][..], true), (&[0, 0, 0, 0][..], false)] {
             let bytes = [&a[..], &frame(op_code::MSG, body), &b].concat();
-            contract::check_decode_with_alloc_limit(
-                Frames::<Message>::new,
-                &bytes,
-                2 * MAX_MESSAGE_SIZE,
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Frames::<Message>::new()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_MESSAGE_SIZE)
+                ),
+                decode_all(Frames::<Message>::new, &bytes)
             );
             let (items, failure) = decode_all(Frames::<Message>::new, &bytes);
             let ids: Vec<_> = items.into_iter().map(|m| m.map(|m| m.request_id)).collect();
@@ -2743,10 +2746,13 @@ mod tests {
             .to_bytes()
             .unwrap();
         let bytes = a.repeat(1000);
-        contract::check_decode_with_alloc_limit(
-            || Frames::<Message>::with_limit(a.len()),
-            &bytes,
-            2 * a.len(),
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Message>::with_limit(a.len())),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * a.len())
+            ),
+            decode_all(|| Frames::<Message>::with_limit(a.len()), &bytes)
         );
         assert_eq!(
             decode_all(|| Frames::<Message>::with_limit(a.len()), &bytes)
@@ -3039,16 +3045,27 @@ mod tests {
     }
 
     fn check(data: &[u8]) {
-        contract::check_wire::<Document>(data);
-        contract::check_wire::<Message>(data);
-        contract::check_decode_with_alloc_limit(Frames::<Message>::new, data, 2 * MAX_MESSAGE_SIZE);
+        if let Ok(value) = Document::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Message::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Message>::new()),
+                chunks(data, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_MESSAGE_SIZE)
+            ),
+            decode_all(Frames::<Message>::new, data)
+        );
         for message in decode_all(Frames::<Message>::new, data)
             .0
             .into_iter()
             .flatten()
         {
             assert!(message.to_bytes().is_ok(), "{message:?}");
-            contract::check_wire_value(&message);
+            let _ = assert_write(&message);
         }
     }
 
@@ -3169,13 +3186,15 @@ mod tests {
                 // Rebuild the length so a body mutation cannot swallow the next frame.
                 let middle = frame(op, &body);
                 let bytes = [&a[..], &middle, &b].concat();
-                let checked = contract::check_decode_with_alloc_limit(
-                    Frames::<Message>::new,
-                    &bytes,
-                    2 * MAX_MESSAGE_SIZE,
-                );
                 let decoded = decode_all(Frames::<Message>::new, &bytes);
-                assert_eq!(checked, decoded);
+                assert_eq!(
+                    decode_chunks(
+                        &mut Stream::new(Frames::<Message>::new()),
+                        chunks(&bytes, &[1, 7, 64]),
+                        |s| assert!(s.allocated() <= 2 * MAX_MESSAGE_SIZE),
+                    ),
+                    decoded
+                );
                 let (items, failure) = decoded;
                 let ids: Vec<_> = items.into_iter().map(|m| m.map(|m| m.request_id)).collect();
                 if failure.is_some() {
@@ -3190,12 +3209,17 @@ mod tests {
                     assert_eq!(ids[2], Ok(2));
                 }
 
-                let limited = contract::check_decode_capacity(
-                    || Frames::<Message>::with_limit(limit),
-                    &bytes,
-                );
+                let limited = Frames::<Message>::with_limit(limit);
+                let alloc = 2 * limited.capacity();
                 let limited_decoded = decode_all(|| Frames::<Message>::with_limit(limit), &bytes);
-                assert_eq!(limited, limited_decoded);
+                assert_eq!(
+                    decode_chunks(
+                        &mut Stream::new(limited),
+                        chunks(&bytes, &[1, 7, 64]),
+                        |s| assert!(s.allocated() <= alloc)
+                    ),
+                    limited_decoded
+                );
                 let (items, limited_failure) = limited_decoded;
                 let limited_ids: Vec<_> =
                     items.into_iter().map(|m| m.map(|m| m.request_id)).collect();

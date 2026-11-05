@@ -806,12 +806,11 @@ mod tests {
     }
 
     use super::*;
-    use fictionet::stdlib::codec::{Fail, Lcg};
+    use fictionet::stdlib::codec::{Fail, Lcg, Stream};
     use fictionet::stdlib::test_support::check_atomic;
-    use fictionet::stdlib::test_support::contract::{
-        check_decode, check_decode_with_alloc_limit, check_wire, check_wire_value,
+    use fictionet::stdlib::test_support::{
+        assert_write, chunks, decode_all, decode_chunks, mutate,
     };
-    use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn session() -> Session {
         Session::left_padded("SESSION1").unwrap()
@@ -895,7 +894,7 @@ mod tests {
         bytes[10..18].copy_from_slice(&u64::MAX.to_be_bytes());
         assert_eq!(Downstream::parse(&bytes), Err(Error::Sequence));
         // u64::MAX - 1 plus one message ends exactly at u64::MAX.
-        check_wire_value(&packet(u64::MAX - 1, &[b"a"]));
+        let _ = assert_write(&packet(u64::MAX - 1, &[b"a"]));
         for refused in [
             packet(1, &[]),
             packet(1, &[&vec![0; MAX_MESSAGE + 1]]),
@@ -905,10 +904,10 @@ mod tests {
             },
             packet(1, &[&vec![0; 40_000], &vec![0; 40_000]]),
         ] {
-            check_wire_value(&refused);
+            let _ = assert_write(&refused);
             assert!(refused.to_bytes().is_err());
         }
-        check_wire_value(&packet(1, &[&vec![0; MAX_PACKET_SIZE - 22]]));
+        let _ = assert_write(&packet(1, &[&vec![0; MAX_PACKET_SIZE - 22]]));
         assert_eq!(Session::left_padded("ELEVEN CHAR"), Err(Error::Field));
     }
 
@@ -923,10 +922,12 @@ mod tests {
                 ..heartbeat(u64::MAX)
             },
         ] {
-            check_wire_value(&p);
-            check_wire::<Downstream>(&p.to_bytes().unwrap());
+            let _ = assert_write(&p);
+            if let Ok(value) = Downstream::parse(&p.to_bytes().unwrap()) {
+                assert_write(&value).unwrap();
+            }
         }
-        check_wire_value(&fixture_request(session(), u64::MAX, u16::MAX));
+        let _ = assert_write(&fixture_request(session(), u64::MAX, u16::MAX));
     }
 
     #[test]
@@ -936,8 +937,22 @@ mod tests {
             bytes.extend_from_slice(&(m.len() as u16).to_be_bytes());
             bytes.extend_from_slice(m);
         }
-        check_decode(|| Blocks, &bytes);
-        check_decode_with_alloc_limit(|| Blocks, &bytes, 2 * (MAX_MESSAGE + 2));
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Blocks),
+                chunks(&bytes, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(|| Blocks, &bytes)
+        );
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Blocks),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * (MAX_MESSAGE + 2))
+            ),
+            decode_all(|| Blocks, &bytes)
+        );
         let (items, failure) = decode_all(|| Blocks, &bytes);
         assert!(failure.is_none());
         assert_eq!(items, [b"abc".to_vec(), Vec::new(), vec![0xff; 300]]);
@@ -961,9 +976,20 @@ mod tests {
             for _ in 0..=rng.below(4) {
                 mutate(&mut rng, &mut bytes);
             }
-            check_wire::<Downstream>(&bytes);
-            check_wire::<Request>(&bytes);
-            check_decode(|| Blocks, &bytes);
+            if let Ok(value) = Downstream::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = Request::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Blocks),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |_| {}
+                ),
+                decode_all(|| Blocks, &bytes)
+            );
             if let Ok(p) = Downstream::parse(&bytes) {
                 let mut r = Receiver::new(ReceiverConfig::default()).unwrap();
                 let _ = r.receive(&p, 0).unwrap();
@@ -1211,7 +1237,7 @@ mod tests {
         assert_eq!(answer.sequence, 3);
         assert_eq!(answer.messages(), [vec![2; 4], vec![3; 4], vec![4; 4]]);
         assert!(answer.wire_len() <= HEADER_LENGTH + 18);
-        check_wire_value(&answer);
+        let _ = assert_write(&answer);
         assert_eq!(
             s.answer(&Request {
                 sequence: 2,

@@ -574,13 +574,20 @@ impl Decode for Fields {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::Lcg;
-    use fictionet::stdlib::codec::{Fail, Stream, pump};
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::codec::{Fail, pump};
+    use fictionet::stdlib::codec::{Lcg, Stream};
     use fictionet::stdlib::test_support::decode_all;
+    use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
 
     fn check(input: &[u8]) {
-        contract::check_decode_with_alloc_limit(Fields::new, input, 2 * (MAX_INPUT + 1));
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Fields::new()),
+                chunks(input, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * (MAX_INPUT + 1))
+            ),
+            decode_all(Fields::new, input)
+        );
     }
 
     fn decoded(input: &[u8]) -> Result<Vec<(String, String)>, Error> {
@@ -1027,8 +1034,10 @@ mod tests {
         bytes.extend_from_slice(&vec![0xff; MAX_INPUT / 8]);
         assert!(decoded(&bytes).is_ok());
         assert_eq!(Form::parse(&bytes), Err(Error::TooLong));
-        contract::check_wire::<Form>(&bytes);
-        contract::check_wire_value(&PercentEncoded { text: "é".into() });
+        if let Ok(value) = Form::parse(&bytes) {
+            assert_write(&value).unwrap();
+        }
+        let _ = assert_write(&PercentEncoded { text: "é".into() });
         assert_eq!(
             PercentEncoded { text: "é".into() }.to_bytes(),
             Err(Error::Unwritable)
@@ -1040,7 +1049,9 @@ mod tests {
             PercentEncoded::parse(b"%+%zz").unwrap().to_bytes().unwrap(),
             b"%+%zz"
         );
-        contract::check_wire::<PercentEncoded>(b"%+%zz");
+        if let Ok(value) = PercentEncoded::parse(b"%+%zz") {
+            assert_write(&value).unwrap();
+        }
     }
 
     #[test]
@@ -1061,8 +1072,12 @@ mod tests {
             let got = decoded(&buf).unwrap();
             check(&buf);
             assert_eq!(Form::parse(&buf).unwrap().pairs, got, "round {round}");
-            contract::check_wire::<Form>(&buf);
-            contract::check_wire::<Field>(&buf);
+            if let Ok(value) = Form::parse(&buf) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = Field::parse(&buf) {
+                assert_write(&value).unwrap();
+            }
             // What is read can be written, and reads back the same.
             let s = serialized(&got).unwrap();
             assert_eq!(decoded(s.as_bytes()).unwrap(), got, "round {round}");

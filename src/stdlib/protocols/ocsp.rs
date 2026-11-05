@@ -1499,19 +1499,31 @@ pub mod harness {
         BasicResponse, Frame, MAX_MESSAGE, MAX_NONCE, Request, Response, ResponseData,
         decode_get_path, encode_get_path,
     };
-    use fictionet::stdlib::codec::{Frames, Wire};
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::codec::{Frames, Stream, Wire};
+    use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
 
     /// Checks message framing, DER and GET-path round trips, and nonce bounds.
     /// Returns how many of Request, Response and BasicResponse parse the input.
     pub fn check(b: &[u8]) -> usize {
-        contract::check_wire::<Request>(b);
-        contract::check_wire::<Response>(b);
-        contract::check_wire::<BasicResponse>(b);
-        contract::check_wire::<ResponseData>(b);
-        let decoded = contract::check_decode(Frames::<Frame>::new, b);
+        if let Ok(value) = Request::parse(b) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Response::parse(b) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = BasicResponse::parse(b) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = ResponseData::parse(b) {
+            assert_write(&value).unwrap();
+        }
+        let decoded = decode_all(Frames::<Frame>::new, b);
         assert_eq!(
-            contract::check_decode_with_alloc_limit(Frames::<Frame>::new, b, 2 * MAX_MESSAGE),
+            decode_chunks(
+                &mut Stream::new(Frames::<Frame>::new()),
+                chunks(b, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_MESSAGE)
+            ),
             decoded
         );
         for m in &decoded.0 {
@@ -2677,11 +2689,18 @@ mod tests {
     #[test]
     fn codec_frames_bound_headers_and_report_once() {
         use fictionet::stdlib::codec::{Fail, Stream};
-        use fictionet::stdlib::test_support::contract;
+        use fictionet::stdlib::test_support::{chunks, decode_all, decode_chunks};
         assert_eq!(Frames::<Frame>::new().capacity(), MAX_MESSAGE);
         let mut stream = Stream::new(Frames::<Frame>::new());
         let bytes = [0x30, 0x83, 1, 0, 0];
-        contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &bytes, 2 * MAX_MESSAGE);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Frame>::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_MESSAGE)
+            ),
+            decode_all(Frames::<Frame>::new, &bytes)
+        );
         assert_eq!(stream.push(&bytes), bytes.len());
         assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::TooLong))));
         assert_eq!(stream.next(), None);
@@ -2691,11 +2710,13 @@ mod tests {
     #[test]
     fn codec_writers_are_exact_and_transactional() {
         use fictionet::stdlib::codec::Wire;
-        use fictionet::stdlib::test_support::contract;
+        use fictionet::stdlib::test_support::assert_write;
         let response = Response::error(ResponseStatus::TryLater);
-        contract::check_wire_value(&response);
+        let _ = assert_write(&response);
         let mut bytes = <Response as Wire>::to_bytes(&response).unwrap();
-        contract::check_wire::<Response>(&bytes);
+        if let Ok(value) = Response::parse(&bytes) {
+            assert_write(&value).unwrap();
+        }
         bytes.push(0);
         assert!(<Response as Wire>::parse(&bytes).is_err());
         let mut out = vec![42];

@@ -1718,11 +1718,11 @@ pub mod harness {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{Decode, Step};
-    use fictionet::stdlib::codec::{Fail, Lcg, Stream, pump};
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::codec::{Decode, Fail, Lcg, Step, Stream, pump};
     use fictionet::stdlib::test_support::rounds;
-    use fictionet::stdlib::test_support::{decode_all, mutate};
+    use fictionet::stdlib::test_support::{
+        assert_write, chunks, decode_all, decode_chunks, mutate,
+    };
 
     fn get(path: &str, id: u16, token: &[u8]) -> Message {
         let mut m = Message::new(Type::Confirmable, Code::GET, id);
@@ -1927,7 +1927,7 @@ mod tests {
         for message in [observe, block, reply] {
             let bytes = message.to_bytes().unwrap();
             assert_eq!(Message::parse(&bytes), Ok(message.clone()));
-            contract::check_wire_value(&message);
+            let _ = assert_write(&message);
         }
         let mut options = Options::new();
         options.add(option::URI_PATH, b"a".to_vec());
@@ -2151,7 +2151,7 @@ mod tests {
         }
         m.payload = b"new".to_vec();
         assert!(m.to_bytes().is_err());
-        contract::check_wire_value(&m);
+        let _ = assert_write(&m);
         m.options.remove(option::URI_QUERY);
         m.options.add(option::URI_QUERY, b"k".to_vec());
         let back = Message::parse(&m.to_bytes().unwrap()).unwrap();
@@ -2181,7 +2181,7 @@ mod tests {
         invalid.push(unsorted);
         for value in invalid {
             assert!(value.to_bytes().is_err());
-            contract::check_wire_value(&value);
+            let _ = assert_write(&value);
         }
         assert_eq!(Message::reset(1).to_bytes().unwrap(), [0x70, 0, 0, 1]);
         let f = Frame {
@@ -2191,25 +2191,32 @@ mod tests {
             payload: Vec::new(),
         };
         assert!(f.to_bytes().is_err());
-        contract::check_wire_value(&f);
+        let _ = assert_write(&f);
         let f = Frame {
             token: vec![1; 8],
             ..f
         };
-        contract::check_wire_value(&f);
+        let _ = assert_write(&f);
         let f = Frame {
             payload: vec![0; MAX_FRAME_BODY],
             ..f
         };
         assert!(f.to_bytes().is_err());
-        contract::check_wire_value(&f);
+        let _ = assert_write(&f);
     }
 
     #[test]
     fn stream_holds_at_most_max_buffered() {
         let mut junk = vec![0; MAX_BUFFERED + 100];
         junk[0] = 9;
-        contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &junk, 2 * MAX_BUFFERED);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Frame>::new()),
+                chunks(&junk, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_BUFFERED)
+            ),
+            decode_all(Frames::<Frame>::new, &junk)
+        );
         assert_eq!(
             decode_all(Frames::<Frame>::new, &junk).1,
             Some(Fail::Protocol(Error::TokenLength(9)))
@@ -2223,7 +2230,14 @@ mod tests {
         let one = big.to_bytes().unwrap();
         assert_eq!(one.len(), MAX_BUFFERED);
         let bytes = one.repeat(3);
-        contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &bytes, 2 * MAX_BUFFERED);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Frame>::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_BUFFERED)
+            ),
+            decode_all(Frames::<Frame>::new, &bytes)
+        );
         assert_eq!(
             decode_all(Frames::<Frame>::new, &bytes),
             (vec![big; 3], None)
@@ -2274,7 +2288,7 @@ mod tests {
         ] {
             let m = Message::new(kind, code, 1);
             assert!(m.to_bytes().is_err());
-            contract::check_wire_value(&m);
+            let _ = assert_write(&m);
         }
     }
 
@@ -2360,7 +2374,7 @@ mod tests {
         let block = m.options.block1().unwrap();
         assert!(block.is_bert());
         assert_eq!(m.bad_block(), Some(option::BLOCK1));
-        contract::check_wire_value(&m);
+        let _ = assert_write(&m);
         assert!(m.to_bytes().is_ok());
         let err = Reassembler::new(100).push(block, &m.payload).unwrap_err();
         assert_eq!((err, err.code()), (Error::BlockSize, Code::BAD_REQUEST));
@@ -2790,7 +2804,14 @@ mod tests {
             a.to_bytes().unwrap(),
         ]
         .concat();
-        contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &bytes, 2 * MAX_BUFFERED);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Frame>::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_BUFFERED)
+            ),
+            decode_all(Frames::<Frame>::new, &bytes)
+        );
         assert_eq!(
             decode_all(Frames::<Frame>::new, &bytes),
             (vec![a, b, Frame::csm(1152, true)], None)
@@ -2831,7 +2852,7 @@ mod tests {
         }
         m.payload = vec![1; 1000];
         assert!(m.to_bytes().is_err());
-        contract::check_wire_value(&m);
+        let _ = assert_write(&m);
         for f in [
             Frame {
                 token: vec![2; 9],
@@ -2860,7 +2881,7 @@ mod tests {
             },
         ] {
             assert!(f.to_bytes().is_err());
-            contract::check_wire_value(&f);
+            let _ = assert_write(&f);
         }
     }
 
@@ -2936,11 +2957,22 @@ mod tests {
             }
         }
         let _ = peek_header(b);
-        contract::check_wire::<Message>(b);
-        contract::check_wire::<Frame>(b);
-        contract::check_decode_with_alloc_limit(Frames::<Frame>::new, b, 2 * MAX_BUFFERED);
+        if let Ok(value) = Message::parse(b) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Frame::parse(b) {
+            assert_write(&value).unwrap();
+        }
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Frame>::new()),
+                chunks(b, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_BUFFERED)
+            ),
+            decode_all(Frames::<Frame>::new, b)
+        );
         for f in decode_all(Frames::<Frame>::new, b).0 {
-            contract::check_wire_value(&f);
+            let _ = assert_write(&f);
             let _ = (f.bad_option(), f.max_message_size(), f.pong());
         }
     }
@@ -3005,8 +3037,7 @@ mod tests {
                 );
             }
             m.payload = rng.bytes(39);
-            contract::check_wire_value(&m);
-            let bytes = m.to_bytes().unwrap();
+            let bytes = assert_write(&m).unwrap();
             let back = Message::parse(&bytes).unwrap();
             assert_eq!(
                 (back.kind, back.code, back.message_id),
@@ -3022,8 +3053,7 @@ mod tests {
                 options: m.options,
                 payload: m.payload,
             };
-            contract::check_wire_value(&f);
-            let bytes = f.to_bytes().unwrap();
+            let bytes = assert_write(&f).unwrap();
             assert_eq!(Frame::parse(&bytes), Ok(f));
             check_bytes(&bytes);
         }

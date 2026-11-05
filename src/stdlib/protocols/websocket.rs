@@ -1495,8 +1495,8 @@ fn sha1_block(h: &mut [u32; 5], block: &[u8]) {
 #[doc(hidden)]
 pub mod harness {
     use super::*;
-    use fictionet::stdlib::codec::Decode;
-    use fictionet::stdlib::test_support::{contract, decode_all};
+    use fictionet::stdlib::codec::{Decode, Stream};
+    use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
 
     /// Checks decoding with at most twice the decoder capacity allocated.
     pub fn bounded<D: Decode>(make: impl Fn() -> D, bytes: &[u8])
@@ -1505,7 +1505,14 @@ pub mod harness {
         D::Error: Clone + PartialEq + core::fmt::Debug,
     {
         let limit = make().capacity().checked_mul(2).unwrap();
-        contract::check_decode_with_alloc_limit(make, bytes, limit);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(make()),
+                chunks(bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= limit)
+            ),
+            decode_all(make, bytes)
+        );
     }
 
     fn check_clone(mut decoder: Messages, data: &[u8]) {
@@ -1542,8 +1549,12 @@ pub mod harness {
     /// generator. Handshake checks remain in `random_headers_never_panic` and
     /// the fuzz target.
     pub fn check_buffer(data: &[u8], limit: usize, fragment: usize) {
-        contract::check_wire::<Frame>(data);
-        contract::check_wire::<Close>(data);
+        if let Ok(value) = Frame::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Close::parse(data) {
+            assert_write(&value).unwrap();
+        }
         if let Ok(close) = Close::parse(data) {
             assert_eq!(close.to_bytes().unwrap(), data);
         }
@@ -1552,7 +1563,14 @@ pub mod harness {
             let messages = || Messages::for_receiver(receiver).with_limit(limit);
             bounded(frames, data);
             bounded(messages, data);
-            contract::check_decode_with_held_limit(messages, data, limit);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(messages()),
+                    chunks(data, &[1, 7, 64]),
+                    |s| assert!(s.held() <= limit)
+                ),
+                decode_all(messages, data)
+            );
             check_clone(messages(), data);
             let mask = if receiver == Side::Server {
                 Some([1, 2, 3, 4])
@@ -1561,7 +1579,7 @@ pub mod harness {
             };
             for message in decode_all(messages, data).0 {
                 let frame = message.to_frame(mask).unwrap();
-                contract::check_wire_value(&frame);
+                let _ = assert_write(&frame);
                 assert_eq!(
                     decode_all(messages, &frame.to_bytes().unwrap()),
                     (vec![message.clone()], None)
@@ -1585,7 +1603,7 @@ pub mod harness {
             }
             let mut written = Vec::new();
             for frame in decode_all(|| Frames::for_receiver(receiver), data).0 {
-                contract::check_wire_value(&frame);
+                let _ = assert_write(&frame);
                 frame.write(&mut written).unwrap();
             }
             assert!(data.starts_with(&written));
@@ -1599,7 +1617,7 @@ pub mod harness {
             Opcode::Ping,
             Opcode::Pong,
         ] {
-            contract::check_wire_value(&Frame {
+            let _ = assert_write(&Frame {
                 fin: data.first().is_some_and(|b| b & 1 != 0),
                 opcode,
                 mask: data
@@ -1618,7 +1636,7 @@ pub mod harness {
             code,
             reason: reason.clone(),
         };
-        contract::check_wire_value(&close);
+        let _ = assert_write(&close);
         for message in [
             Message::Ping(payload.clone()),
             Message::Pong(payload.clone()),
@@ -1628,7 +1646,7 @@ pub mod harness {
             Message::Close(None),
         ] {
             if let Ok(frame) = message.to_frame(Some([7; 4])) {
-                contract::check_wire_value(&frame);
+                let _ = assert_write(&frame);
                 assert_eq!(
                     decode_all(
                         || Messages::for_receiver(Side::Server),
@@ -1649,9 +1667,10 @@ mod tests {
     use super::harness::check_buffer;
     use super::*;
     use fictionet::stdlib::codec::{AssembleError, Decode, Fail, Lcg, Stream};
-    use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::rounds;
-    use fictionet::stdlib::test_support::{decode_all, mutate};
+    use fictionet::stdlib::test_support::{
+        assert_write, chunks, decode_all, decode_chunks, mutate,
+    };
 
     // RFC 6455 section 5.7.
     const HELLO: [u8; 7] = [0x81, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f];
@@ -2166,10 +2185,13 @@ mod tests {
             Message::Text("Hello".into()),
         ];
         assert_eq!(decode(Side::Client, &stream), (want.clone(), None));
-        contract::check_decode_with_alloc_limit(
-            || Messages::for_receiver(Side::Client),
-            &stream,
-            2 * (MAX_HEADER_LEN + MAX_PAYLOAD),
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Messages::for_receiver(Side::Client)),
+                chunks(&stream, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * (MAX_HEADER_LEN + MAX_PAYLOAD))
+            ),
+            decode_all(|| Messages::for_receiver(Side::Client), &stream)
         );
         // Server side.
         let stream: Vec<u8> = [&HELLO_MASKED[..], &PONG_MASKED].concat();
@@ -2445,7 +2467,9 @@ mod tests {
             }
         );
         assert_eq!(c.to_bytes().unwrap(), p);
-        contract::check_wire::<Close>(&p);
+        if let Ok(value) = Close::parse(&p) {
+            assert_write(&value).unwrap();
+        }
         assert_eq!(Close::parse(&[]), Err(Error::CloseShort));
         assert_eq!(Close::parse(&[3]), Err(Error::CloseShort));
         assert_eq!(Close::parse(&[0x03, 0xe8, 0xc3]), Err(Error::CloseUtf8));
@@ -2457,7 +2481,7 @@ mod tests {
                 Err(Error::CloseCode(code))
             );
             assert_eq!(Close::new(code).to_bytes(), Err(Error::Unwritable));
-            contract::check_wire_value(&Close::new(code));
+            let _ = assert_write(&Close::new(code));
         }
         for code in [
             1000u16, 1001, 1002, 1003, 1007, 1011, 1012, 1014, 3000, 4999,
@@ -2470,7 +2494,7 @@ mod tests {
             ("a".repeat(123), true),
         ] {
             let close = Close { code: 4000, reason };
-            contract::check_wire_value(&close);
+            let _ = assert_write(&close);
             assert_eq!(close.to_bytes().is_ok(), valid);
         }
         for e in [
@@ -2498,7 +2522,7 @@ mod tests {
             let mut out = vec![7];
             assert_eq!(frame.write(&mut out), Err(Error::Unwritable));
             assert_eq!(out, [7]);
-            contract::check_wire_value(&frame);
+            let _ = assert_write(&frame);
         }
         let mut text = "a".repeat(MAX_MESSAGE - 1);
         text.push('é');
@@ -2553,10 +2577,13 @@ mod tests {
                 }
             }
             assert_eq!(decode(Side::Server, &stream), (messages.to_vec(), None));
-            contract::check_decode_with_alloc_limit(
-                || Messages::for_receiver(Side::Server),
-                &stream,
-                2 * (MAX_HEADER_LEN + MAX_PAYLOAD),
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Messages::for_receiver(Side::Server)),
+                    chunks(&stream, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * (MAX_HEADER_LEN + MAX_PAYLOAD))
+                ),
+                decode_all(|| Messages::for_receiver(Side::Server), &stream)
             );
         }
         assert_eq!(Message::Text("x".into()).opcode(), Opcode::Text);
@@ -2641,10 +2668,13 @@ mod tests {
                     .position(|m| matches!(m, Message::Close(_)))
                     .map_or(sent.len(), |i| i + 1);
                 assert_eq!(decode(receiver, &data), (sent[..ends].to_vec(), None));
-                contract::check_decode_with_alloc_limit(
-                    || Messages::for_receiver(receiver),
-                    &data,
-                    2 * (MAX_HEADER_LEN + MAX_PAYLOAD),
+                assert_eq!(
+                    decode_chunks(
+                        &mut Stream::new(Messages::for_receiver(receiver)),
+                        chunks(&data, &[1, 7, 64]),
+                        |s| assert!(s.allocated() <= 2 * (MAX_HEADER_LEN + MAX_PAYLOAD))
+                    ),
+                    decode_all(|| Messages::for_receiver(receiver), &data)
                 );
                 for _ in 0..rng.index(4) {
                     mutate(&mut rng, &mut data);

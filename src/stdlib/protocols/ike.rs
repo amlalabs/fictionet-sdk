@@ -1530,7 +1530,7 @@ fictionet::codec_from!(Error, Truncated, |_| Error::Short);
 pub mod harness {
     use super::*;
     use fictionet::stdlib::protocols::ipsec::Envelope;
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::assert_write;
 
     fn check_chain(first: u8, data: &[u8]) {
         if let Ok(payloads) = parse_payloads(first, data) {
@@ -1544,8 +1544,7 @@ pub mod harness {
                     message_id,
                     payloads: payloads.clone(),
                 };
-                contract::check_wire_value(&message);
-                let bytes = message.to_bytes().unwrap();
+                let bytes = assert_write(&message).unwrap();
                 assert_eq!(bytes[16], first);
                 assert_eq!(
                     parse_payloads(first, &bytes[HEADER_LEN..]).as_ref(),
@@ -1568,9 +1567,15 @@ pub mod harness {
             }
         };
         assert_eq!(NatT::parse(data), datagram);
-        contract::check_wire::<Header>(data);
-        contract::check_wire::<Message>(data);
-        contract::check_wire::<NatT>(data);
+        if let Ok(value) = Header::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Message::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = NatT::parse(data) {
+            assert_write(&value).unwrap();
+        }
         check_chain(0, data);
         check_chain(33, data);
         check_chain(40, data);
@@ -1588,7 +1593,7 @@ pub mod harness {
                 Ok(&message.payloads)
             );
             let natt = NatT::Ike(message);
-            contract::check_wire_value(&natt);
+            let _ = assert_write(&natt);
             assert!(natt.to_bytes().is_ok());
         }
         if let Some((&first, rest)) = data.split_first() {
@@ -1616,7 +1621,7 @@ mod tests {
 
     use super::*;
     use fictionet::stdlib::codec::Lcg;
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::assert_write;
     use fictionet::stdlib::test_support::mutate;
     use fictionet::stdlib::test_support::rounds;
 
@@ -2104,9 +2109,9 @@ mod tests {
             parse_payloads(payload::SA, &bytes[HEADER_LEN..]),
             Ok(chain.payloads.clone())
         );
-        contract::check_wire_value(&chain);
-        contract::check_wire_value(&message(payloads));
-        contract::check_wire_value(&message(vec![]));
+        let _ = assert_write(&chain);
+        let _ = assert_write(&message(payloads));
+        let _ = assert_write(&message(vec![]));
     }
 
     #[test]
@@ -2173,7 +2178,7 @@ mod tests {
             assert!(message(vec![encrypted.clone()]).to_bytes().is_ok());
             let m = message(vec![encrypted, Payload::new(Body::Nonce(vec![4; 16]))]);
             assert_eq!(m.to_bytes(), Err(Error::Unwritable));
-            contract::check_wire_value(&m);
+            let _ = assert_write(&m);
         }
     }
 
@@ -2230,7 +2235,7 @@ mod tests {
         ] {
             let m = message(vec![bad, nonce.clone()]);
             assert_eq!(m.to_bytes(), Err(Error::Unwritable));
-            contract::check_wire_value(&m);
+            let _ = assert_write(&m);
         }
     }
 
@@ -2247,7 +2252,7 @@ mod tests {
             Payload::new(Body::Nonce(vec![2; 16])),
         ]);
         assert_eq!(m.to_bytes(), Err(Error::Unwritable));
-        contract::check_wire_value(&m);
+        let _ = assert_write(&m);
         // Delete SPIs of the wrong size, and selectors typed as Other.
         let m = message(vec![
             Payload::new(Body::Delete(Delete {
@@ -2265,14 +2270,14 @@ mod tests {
         for payload in &m.payloads {
             let one = message(vec![payload.clone()]);
             assert_eq!(one.to_bytes(), Err(Error::Unwritable));
-            contract::check_wire_value(&one);
+            let _ = assert_write(&one);
         }
         // Reserved flag bits and high minor-version bits.
         let mut m = message(vec![]);
         m.flags = 0xff;
         m.minor_version = 0xf3;
         assert_eq!(m.to_bytes(), Err(Error::Unwritable));
-        contract::check_wire_value(&m);
+        let _ = assert_write(&m);
     }
 
     #[test]
@@ -2283,7 +2288,7 @@ mod tests {
             Payload::new(Body::VendorId(huge.clone())),
         ]);
         assert_eq!(m.to_bytes(), Err(Error::Unwritable));
-        contract::check_wire_value(&m);
+        let _ = assert_write(&m);
         // A long chain of every kind of oversized body.
         // Each attribute value is too long on its own, and the counts are
         // past the limits.
@@ -2377,7 +2382,7 @@ mod tests {
         for b in &bodies {
             let m = message(vec![Payload::new(b.clone())]);
             assert_eq!(m.to_bytes(), Err(Error::Unwritable));
-            contract::check_wire_value(&m);
+            let _ = assert_write(&m);
             // Behind a full nonce, there is little room left.
             let m = message(vec![
                 Payload::new(Body::Nonce(vec![0; MAX_BODY - 10])),
@@ -2534,11 +2539,13 @@ mod tests {
         assert_eq!(NatT::parse(&[0, 0, 0]), Err(Error::Short));
         assert_eq!(NatT::parse(&[0, 0, 0, 0]), Err(Error::Short));
         let mut largest = vec![1; MAX_MESSAGE + NON_ESP_MARKER.len()];
-        contract::check_wire::<NatT>(&largest);
+        if let Ok(value) = NatT::parse(&largest) {
+            assert_write(&value).unwrap();
+        }
         assert!(matches!(NatT::parse(&largest), Ok(NatT::Esp(_))));
         largest.push(1);
         assert_eq!(NatT::parse(&largest), Err(Error::Limit("datagram bytes")));
-        contract::check_wire_value(&NatT::Esp(largest));
+        let _ = assert_write(&NatT::Esp(largest));
         for n in 0..bytes.len() {
             assert!(NatT::parse(&bytes[..n]).is_err() || bytes[..n] == [0xff]);
         }

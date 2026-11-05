@@ -2032,9 +2032,11 @@ mod tests {
     use super::harness::check_attribute;
     use super::*;
     use codec::{Lcg, Stream};
-    use fictionet::stdlib::test_support::contract;
+
     use fictionet::stdlib::test_support::rounds;
-    use fictionet::stdlib::test_support::{decode_all, mutate};
+    use fictionet::stdlib::test_support::{
+        assert_write, chunks, decode_all, decode_chunks, mutate,
+    };
 
     /// The example in RFC 8866, section 5.
     const RFC_EXAMPLE: &[u8] = b"v=0\r\n\
@@ -2086,12 +2088,22 @@ mod tests {
 
     // Adapter and chunking checks: Wire::parse also uses SessionDescriptions.
     fn check_description(b: &[u8]) -> Result<SessionDescription, Error> {
-        contract::check_decode_with_alloc_limit(
-            SessionDescriptions::new,
-            b,
-            2 * (MAX_LINE_LEN + 2),
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(SessionDescriptions::new()),
+                chunks(b, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * (MAX_LINE_LEN + 2))
+            ),
+            decode_all(SessionDescriptions::new, b)
         );
-        contract::check_decode_with_held_limit(SessionDescriptions::new, b, MAX_LEN);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(SessionDescriptions::new()),
+                chunks(b, &[1, 7, 64]),
+                |s| assert!(s.held() <= MAX_LEN)
+            ),
+            decode_all(SessionDescriptions::new, b)
+        );
         let (mut items, failure) = decode_all(SessionDescriptions::new, b);
         match failure {
             Some(codec::Fail::Protocol(error)) => Err(error),
@@ -2842,7 +2854,9 @@ mod tests {
     fn check_bytes(b: &[u8]) {
         let got = SessionDescription::parse(b);
         assert_eq!(check_description(b), got);
-        contract::check_wire::<SessionDescription>(b);
+        if let Ok(value) = SessionDescription::parse(b) {
+            assert_write(&value).unwrap();
+        }
         if let Ok(desc) = got {
             let out = desc.to_bytes().unwrap();
             assert_eq!(SessionDescription::parse(&out), Ok(desc.clone()));
@@ -2946,7 +2960,7 @@ mod tests {
                     _ => d.uri = Some(w),
                 }
             }
-            contract::check_wire_value(&d);
+            let _ = assert_write(&d);
             if let Ok(bytes) = d.to_bytes() {
                 written += 1;
                 assert_eq!(SessionDescription::parse(&bytes), Ok(d.clone()));

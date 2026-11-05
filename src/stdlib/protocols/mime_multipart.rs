@@ -1481,8 +1481,8 @@ mod tests {
     use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::codec::{Fail, Stream, finish, pump};
 
-    use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::decode_all;
+    use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
 
     // Tests of raw HTTP bodies omit the entity's Content-Type header.
     fn raw(input: &[u8]) -> &[u8] {
@@ -1496,7 +1496,15 @@ mod tests {
     fn check(input: &[u8], boundary: &str) {
         let input = raw(input);
         let make = || Parts::new(boundary).unwrap();
-        contract::check_decode_with_alloc_limit(make, input, 2 * make().capacity());
+        let alloc = 2 * make().capacity();
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(make()),
+                chunks(input, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= alloc)
+            ),
+            decode_all(make, input)
+        );
         let (parts, error) = decode_all(make, input);
         match Multipart::parse(input, boundary) {
             Ok(multipart) => assert_eq!((parts, error), (multipart.parts, None)),
@@ -1638,7 +1646,7 @@ Content-Type: text/plain
                 .expect("a parsed body picks a boundary");
             let bytes = entity.to_bytes().expect("a parsed body writes again");
             assert_eq!(Entity::parse(&bytes).as_ref(), Ok(&entity));
-            contract::check_wire_value(&Body {
+            let _ = assert_write(&Body {
                 boundary: entity.boundary,
                 multipart: entity.multipart,
             });
@@ -1708,7 +1716,7 @@ Content-Type: text/plain
             let mut out = b"keep".to_vec();
             assert_eq!(value.write(&mut out), Err(expected));
             assert_eq!(out, b"keep");
-            contract::check_wire_value(&value);
+            let _ = assert_write(&value);
         }
     }
 
@@ -1726,8 +1734,7 @@ Content-Type: text/plain
         }
         .with_boundary("b");
         // A compact header keeps a part exactly at its limit writable.
-        contract::check_wire_value(&entity);
-        let bytes = entity.to_bytes().unwrap();
+        let bytes = assert_write(&entity).unwrap();
         assert_eq!(Entity::parse(&bytes), Ok(entity));
         let oversized = Multipart {
             epilogue: vec![b'e'; MAX_ENTITY],
@@ -1735,7 +1742,7 @@ Content-Type: text/plain
         }
         .with_boundary("b");
         assert_eq!(oversized.to_bytes(), Err(Error::EntityTooLong));
-        contract::check_wire_value(&oversized);
+        let _ = assert_write(&oversized);
         assert_eq!(
             Multipart::parse(&vec![b'x'; MAX_ENTITY + 1], "b"),
             Err(Error::EntityTooLong)
@@ -1745,9 +1752,11 @@ Content-Type: text/plain
             params: vec![],
         };
         assert_eq!(long.to_bytes(), Err(Error::HeaderTooLong));
-        contract::check_wire_value(&long);
+        let _ = assert_write(&long);
         assert_eq!(ParamValue::parse(b"x\r\ny"), Err(Error::Header));
-        contract::check_wire::<ParamValue>(b"x;n=\"a b\"");
+        if let Ok(value) = ParamValue::parse(b"x;n=\"a b\"") {
+            assert_write(&value).unwrap();
+        }
         assert_eq!(
             Entity::parse(
                 b"Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\n\r\nx--b\r\n--b--\r\n"
@@ -1759,7 +1768,9 @@ Content-Type: text/plain
             b"Content-Type: multipart/mixed; boundary=b\r\nX: y\r\n\r\n--b--",
             b"Content-Type: multipart/mixed; boundary=b; boundary=c\r\n\r\n--b--",
         ] {
-            contract::check_wire::<Entity>(input);
+            if let Ok(value) = Entity::parse(input) {
+                assert_write(&value).unwrap();
+            }
             assert!(Entity::parse(input).is_err());
         }
     }
@@ -2498,7 +2509,7 @@ Content-Type: text/plain
             assert_eq!(parsed.value, "text/plain");
             assert_eq!(parsed.get("charset"), Some("us-ascii"));
             assert_eq!(part.headers.get("content-type"), Some(value));
-            contract::check_wire_value(&part);
+            let _ = assert_write(&part);
         }
         let part = Part::parse(
             b"Content-Disposition: form-data (form); name=field (name); filename=\"a(1).txt\" (file)\r\n\r\nx",
@@ -2506,7 +2517,7 @@ Content-Type: text/plain
         .unwrap();
         assert_eq!(part.name().as_deref(), Some("field"));
         assert_eq!(part.filename().as_deref(), Some("a(1).txt"));
-        contract::check_wire_value(&part);
+        let _ = assert_write(&part);
     }
 
     #[test]
@@ -2523,12 +2534,12 @@ Content-Type: text/plain
             assert_eq!(parsed.value, "text/plain");
             assert_eq!(parsed.get("charset"), Some("us-ascii"));
             assert_eq!(part.headers.get("content-type"), Some(value));
-            contract::check_wire_value(&part);
+            let _ = assert_write(&part);
         }
         let value = ParamValue::parse(b"text / plain (literal); name=\"a / (b)\"").unwrap();
         assert_eq!(value.value, "text / plain (literal)");
         assert_eq!(value.get("name"), Some("a / (b)"));
-        contract::check_wire_value(&value);
+        let _ = assert_write(&value);
     }
 
     #[test]
@@ -2572,7 +2583,7 @@ Content-Type: text/plain
             let part = Part::parse(input.as_bytes()).unwrap();
             assert_eq!(part.headers.content_type(), None);
             assert_eq!(part.headers.content_disposition(), None);
-            contract::check_wire_value(&part);
+            let _ = assert_write(&part);
         }
     }
 
@@ -2581,7 +2592,7 @@ Content-Type: text/plain
         let value = ParamValue::parse(b"text/plain (literal); name=\"a(1)\\\".txt\"").unwrap();
         assert_eq!(value.value, "text/plain (literal)");
         assert_eq!(value.get("name"), Some("a(1)\".txt"));
-        contract::check_wire_value(&value);
+        let _ = assert_write(&value);
         assert_eq!(
             ParamValue::parse(b"text/plain; charset=us-ascii (comment)"),
             Err(Error::Header)
@@ -2599,7 +2610,7 @@ Content-Type: text/plain
             let input = format!("Content-Type: {value}\r\n\r\n--{boundary}--");
             let entity = Multipart::default().with_boundary(boundary);
             assert_eq!(Entity::parse(input.as_bytes()), Ok(entity.clone()));
-            contract::check_wire_value(&entity);
+            let _ = assert_write(&entity);
         }
         for value in [
             "multipart/mixed; boundary=b (open",
@@ -2711,7 +2722,7 @@ Content-Type: text/plain
             if let Ok(m) = whole {
                 oks += 1;
                 let entity = m.clone().with_free_boundary("a").unwrap();
-                contract::check_wire_value(&entity);
+                let _ = assert_write(&entity);
                 let b = entity.boundary.clone();
                 let bytes = entity.to_bytes().unwrap();
                 assert_eq!(Entity::parse(&bytes).as_ref(), Ok(&entity));
@@ -2770,7 +2781,7 @@ Content-Type: text/plain
             }
             let base = ["a", "y", "a: y", "a:y", "-a"][r.index(5)];
             let entity = m.clone().with_free_boundary(base).unwrap();
-            contract::check_wire_value(&entity);
+            let _ = assert_write(&entity);
             let b = entity.boundary.clone();
             let out = entity.to_bytes().unwrap();
             assert_eq!(Entity::parse(&out).as_ref(), Ok(&entity));

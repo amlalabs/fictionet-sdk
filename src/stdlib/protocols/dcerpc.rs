@@ -1701,12 +1701,13 @@ fictionet::codec_from!(Error, Truncated, |_| Error::Truncated);
 #[doc(hidden)]
 pub mod harness {
     use super::{AUTH_PAD_ALIGN, Body, Error, MAX_FRAG, Pdu, SEC_TRAILER_LEN};
+
     use fictionet::stdlib::codec::Wire;
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::assert_write;
 
     /// Checks PDU round trips and fragment limits including authentication padding.
     pub fn rewrite(pdu: &Pdu) {
-        contract::check_wire_value(pdu);
+        let _ = assert_write(pdu);
         match pdu.to_bytes() {
             Ok(bytes) => {
                 assert!(bytes.len() <= MAX_FRAG);
@@ -1778,9 +1779,10 @@ mod tests {
     use super::harness::rewrite;
     use super::*;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream};
-    use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::rounds;
-    use fictionet::stdlib::test_support::{decode_all, mutate};
+    use fictionet::stdlib::test_support::{
+        assert_write, chunks, decode_all, decode_chunks, mutate,
+    };
 
     /// An endpoint mapper bind as Windows sends it: one context, the
     /// endpoint mapper over NDR.
@@ -1938,7 +1940,7 @@ mod tests {
 
     #[test]
     fn codec_writes_each_body_in_both_byte_orders() {
-        use fictionet::stdlib::test_support::contract;
+        use fictionet::stdlib::test_support::assert_write;
 
         for mut pdu in all_bodies() {
             for drep in [DataRep::LITTLE_ENDIAN, DataRep::BIG_ENDIAN] {
@@ -1946,8 +1948,10 @@ mod tests {
                 let bytes = Wire::to_bytes(&pdu).unwrap();
                 assert!(bytes.len() <= MAX_FRAG);
                 assert_eq!(bytes, pdu.to_bytes().unwrap());
-                contract::check_wire::<Pdu>(&bytes);
-                contract::check_wire_value(&pdu);
+                if let Ok(value) = Pdu::parse(&bytes) {
+                    assert_write(&value).unwrap();
+                }
+                let _ = assert_write(&pdu);
                 if matches!(pdu.body, Body::BindNak(_) | Body::Shutdown) {
                     continue;
                 }
@@ -1960,8 +1964,10 @@ mod tests {
                 ));
                 let bytes = Wire::to_bytes(&authenticated).unwrap();
                 assert!(bytes.len() <= MAX_FRAG);
-                contract::check_wire::<Pdu>(&bytes);
-                contract::check_wire_value(&authenticated);
+                if let Ok(value) = Pdu::parse(&bytes) {
+                    assert_write(&value).unwrap();
+                }
+                let _ = assert_write(&authenticated);
             }
         }
     }
@@ -1969,10 +1975,10 @@ mod tests {
     #[test]
     fn every_body_round_trips_in_both_byte_orders() {
         for mut p in all_bodies() {
-            contract::check_written(&p);
+            assert_write(&p).unwrap();
             p.drep = DataRep::BIG_ENDIAN;
             p.version_minor = 1;
-            let bytes = contract::check_written(&p);
+            let bytes = assert_write(&p).unwrap();
             for n in 0..bytes.len() {
                 assert_eq!(Pdu::parse(&bytes[..n]), Err(Error::Incomplete));
             }
@@ -1985,7 +1991,7 @@ mod tests {
                 3,
                 vec![0xaa; 16],
             ));
-            let bytes = contract::check_written(&p);
+            let bytes = assert_write(&p).unwrap();
             for n in 0..bytes.len() {
                 assert_eq!(Pdu::parse(&bytes[..n]), Err(Error::Incomplete));
             }
@@ -2011,11 +2017,11 @@ mod tests {
                 contexts: vec![context(v)],
             }),
         );
-        let b = contract::check_written(&p);
+        let b = assert_write(&p).unwrap();
         assert_eq!(b[48..52], [3, 0, 1, 0]);
         // Big-endian, the u32 0x0001_0003 puts the minor version first.
         p.drep = DataRep::BIG_ENDIAN;
-        let b = contract::check_written(&p);
+        let b = assert_write(&p).unwrap();
         assert_eq!(b[48..52], [0, 1, 0, 3]);
         let mut be = b.clone();
         be[48..52].copy_from_slice(&[0, 0, 0, 2]);
@@ -2043,7 +2049,7 @@ mod tests {
                 results: vec![ContextResult::accept(NDR)],
             }),
         );
-        let b = contract::check_written(&p);
+        let b = assert_write(&p).unwrap();
         assert_eq!(b.len(), 60);
         assert_eq!(b[24..30], [4, 0, b'1', b'3', b'5', 0]);
         // Two bytes of padding to a multiple of 4, then one result.
@@ -2054,7 +2060,7 @@ mod tests {
 
     #[test]
     fn request_and_response_layout() {
-        let b = contract::check_written(&request(vec![0xde, 0xad]));
+        let b = assert_write(&request(vec![0xde, 0xad])).unwrap();
         assert_eq!(
             b,
             [
@@ -2077,7 +2083,7 @@ mod tests {
             },
         );
         assert_eq!(p.flags & flags::OBJECT_UUID, flags::OBJECT_UUID);
-        let b = contract::check_written(&p);
+        let b = assert_write(&p).unwrap();
         assert_eq!(
             b[24..40],
             [4, 3, 2, 1, 6, 5, 8, 7, 9, 10, 11, 12, 13, 14, 15, 16]
@@ -2093,7 +2099,7 @@ mod tests {
                 stub: vec![],
             },
         );
-        let b = contract::check_written(&fault);
+        let b = assert_write(&fault).unwrap();
         assert_eq!(b.len(), 32);
         assert_eq!(b[24..28], [3, 0, 1, 0x1c]);
         // A fault without the reserved word still reads.
@@ -2111,7 +2117,7 @@ mod tests {
             0,
             vec![7; 16],
         ));
-        let b = contract::check_written(&p);
+        let b = assert_write(&p).unwrap();
         // Stub of 3 padded to 16, then the trailer and the 16-byte token.
         assert_eq!(b.len(), 24 + 16 + 8 + 16);
         assert_eq!(b[10..12], [16, 0]);
@@ -2124,13 +2130,13 @@ mod tests {
             0,
             vec![1; 40],
         ));
-        let b = contract::check_written(&p);
+        let b = assert_write(&p).unwrap();
         assert_eq!(b.len(), 72 + 8 + 40);
         assert_eq!(b[74], 0);
         // Auth3 carries 4 bytes of padding before the trailer.
         let mut p = Pdu::new(3, Body::Auth3);
         p.auth = Some(fixture_auth(0x0a, 2, 0, vec![1, 2]));
-        let b = contract::check_written(&p);
+        let b = assert_write(&p).unwrap();
         assert_eq!(b.len(), 20 + 8 + 2);
     }
 
@@ -2240,7 +2246,7 @@ mod tests {
             Err(Error::Unwritable)
         );
         // The longest request fits exactly.
-        contract::check_written(&request(vec![0; MAX_FRAG - 24]));
+        assert_write(&request(vec![0; MAX_FRAG - 24])).unwrap();
         assert_eq!(
             request(vec![0; MAX_FRAG - 23]).to_bytes(),
             Err(Error::Unwritable)
@@ -2302,7 +2308,7 @@ mod tests {
         assert_eq!(parts[9].flags, flags::LAST_FRAG);
         let mut r = Reassembler::default();
         for (i, p) in parts.iter().enumerate() {
-            let bytes = contract::check_written(p);
+            let bytes = assert_write(p).unwrap();
             assert!(bytes.len() <= 124);
             let got = r.push(p.clone()).unwrap();
             if i < 9 {
@@ -2711,8 +2717,8 @@ mod tests {
             )
         };
         assert_eq!(ack(b"135").to_bytes(), Err(Error::Unwritable));
-        contract::check_written(&ack(b"135\0"));
-        contract::check_written(&ack(b""));
+        assert_write(&ack(b"135\0")).unwrap();
+        assert_write(&ack(b"")).unwrap();
         let mut b = ack(b"135\0").to_bytes().unwrap();
         b[29] = b'6';
         assert_eq!(Pdu::parse(&b), Err(Error::Address));
@@ -2733,7 +2739,7 @@ mod tests {
                 stub: vec![1, 2, 3, 4],
             },
         );
-        let b = contract::check_written(&p);
+        let b = assert_write(&p).unwrap();
         assert_eq!(b[23], 1);
     }
 
@@ -2777,7 +2783,14 @@ mod tests {
         // A PDU with a bad body, then a good one: the stream goes on.
         stream.extend_from_slice(&[5, 0, 9, 3, 0x10, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0]);
         stream.extend(BIND);
-        contract::check_decode_with_alloc_limit(Frames::<Pdu>::new, &stream, 2 * MAX_FRAG);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Pdu>::new()),
+                chunks(&stream, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_FRAG)
+            ),
+            decode_all(Frames::<Pdu>::new, &stream)
+        );
         let (whole, error) = decode_all(Frames::<Pdu>::new, &stream);
         assert_eq!(error, None);
         assert_eq!(whole.len(), all_bodies().len() + 2);
@@ -2861,8 +2874,17 @@ mod tests {
                 bytes
             };
             mutate(&mut rng, &mut data);
-            contract::check_decode_with_alloc_limit(Frames::<Pdu>::new, &data, 2 * MAX_FRAG);
-            contract::check_wire::<Pdu>(&data);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Frames::<Pdu>::new()),
+                    chunks(&data, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_FRAG)
+                ),
+                decode_all(Frames::<Pdu>::new, &data)
+            );
+            if let Ok(value) = Pdu::parse(&data) {
+                assert_write(&value).unwrap();
+            }
             let (whole, _) = decode_all(Frames::<Pdu>::new, &data);
             let mut r = Reassembler::new(64);
             for p in whole.into_iter().flatten() {

@@ -2515,12 +2515,12 @@ mod tests {
 
     use super::harness::check;
     use super::*;
-    use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::codec::{Assembled, Wire};
+    use fictionet::stdlib::codec::{Lcg, Stream};
     use fictionet::stdlib::protocols::onc_rpc::{Body, MAX_RECORD, Record, records};
     use fictionet::stdlib::test_support;
-    use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::rounds;
+    use fictionet::stdlib::test_support::{chunks, decode_all, decode_chunks};
 
     fn fh(b: &[u8]) -> FileHandle {
         FileHandle(b.to_vec())
@@ -3047,7 +3047,7 @@ mod tests {
         use fictionet::stdlib::{
             codec::{Decode, Wire},
             protocols::onc_rpc,
-            test_support::contract,
+            test_support::{assert_write, chunks, decode_all, decode_chunks},
         };
 
         const RECORD_LIMIT: usize = 4096;
@@ -3064,11 +3064,17 @@ mod tests {
         for request in requests() {
             let message = request.call(19).unwrap();
             let bytes = <Message as Wire>::to_bytes(&message).unwrap();
-            contract::check_wire::<Message>(&bytes);
-            contract::check_decode_with_alloc_limit(
-                make,
-                &onc_rpc::encode_fragments(&bytes, 5).unwrap(),
-                2 * (RECORD_LIMIT + onc_rpc::RECORD_MARK_LEN),
+            if let Ok(value) = Message::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            let records = onc_rpc::encode_fragments(&bytes, 5).unwrap();
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(make()),
+                    chunks(&records, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * (RECORD_LIMIT + onc_rpc::RECORD_MARK_LEN))
+                ),
+                decode_all(make, &records)
             );
         }
     }
@@ -3763,7 +3769,14 @@ mod tests {
         );
         let mut got = Vec::new();
         let mut mounts = Vec::new();
-        contract::check_decode(|| records(MAX_RECORD), &stream);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(records(MAX_RECORD)),
+                chunks(&stream, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(|| records(MAX_RECORD), &stream)
+        );
         let (records, failure) = test_support::decode_all(|| records(MAX_RECORD), &stream);
         assert_eq!(failure, None);
         for Assembled::Message(record) in records {
@@ -3926,7 +3939,14 @@ mod tests {
             let b = rng.bytes(63);
             stream.extend(Record(b.to_vec()).to_bytes().unwrap());
         }
-        contract::check_decode(|| records(1 << 16), &stream);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(records(1 << 16)),
+                chunks(&stream, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(|| records(1 << 16), &stream)
+        );
         let (decoded, failure) = test_support::decode_all(|| records(1 << 16), &stream);
         assert_eq!(failure, None);
         for record in decoded {

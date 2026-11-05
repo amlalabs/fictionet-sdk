@@ -197,7 +197,7 @@ impl Present for TlsRecords {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{Lcg, Stream};
-    use fictionet::stdlib::test_support::contract::check_decode;
+    use fictionet::stdlib::test_support::{chunks, decode_all, decode_chunks};
 
     #[test]
     fn empty_datagrams_end_without_a_display_item() {
@@ -210,35 +210,101 @@ mod tests {
         let mut random = Lcg::new(17);
         for n in [0, 1, 5, 17, 64, 257] {
             let bytes = random.bytes(n);
-            check_decode(|| Dns::new(true), &bytes);
-            check_decode(|| Dns::new(false), &bytes);
-            check_decode(Dhcp::default, &bytes);
-            check_decode(Http1::default, &bytes);
-            check_decode(TlsRecords::default, &bytes);
-            check_decode(|| Modbus::new(true), &bytes);
-            check_decode(|| Modbus::new(false), &bytes);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Dns::new(true)),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |_| {}
+                ),
+                decode_all(|| Dns::new(true), &bytes)
+            );
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Dns::new(false)),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |_| {}
+                ),
+                decode_all(|| Dns::new(false), &bytes)
+            );
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Dhcp::default()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |_| {}
+                ),
+                decode_all(Dhcp::default, &bytes)
+            );
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Http1::default()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |_| {}
+                ),
+                decode_all(Http1::default, &bytes)
+            );
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(TlsRecords::default()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |_| {}
+                ),
+                decode_all(TlsRecords::default, &bytes)
+            );
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Modbus::new(true)),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |_| {}
+                ),
+                decode_all(|| Modbus::new(true), &bytes)
+            );
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Modbus::new(false)),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |_| {}
+                ),
+                decode_all(|| Modbus::new(false), &bytes)
+            );
         }
         for bytes in [
             &b"POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhelloGET /x HTTP/1.1\r\n\r\n"[..],
             &b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhe\r\n3;ext\r\nllo\r\n0\r\n\r\nGET / HTTP/1.1\r\n\r\n"[..],
             &b"HTTP/1.1 200 OK\r\n\r\na body until close"[..],
-        ] { check_decode(Http1::default, bytes); }
+        ] { assert_eq!(decode_chunks(&mut Stream::new(Http1::default()), chunks(bytes, &[1, 7, 64]), |_| {}), decode_all(Http1::default, bytes)); }
         for line in ["zz", "", "+1", "-1", "0x1", "10000000000000000"] {
             for body in ["", "3\r\nabc\r\n"] {
                 let bytes = format!(
                     "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{body}{line}\r\n\r\nHTTP/1.1 204 No Content\r\n\r\n"
                 );
-                let (items, failure) = check_decode(Http1::default, bytes.as_bytes());
+                let (items, failure) = decode_all(Http1::default, bytes.as_bytes());
                 assert_eq!(failure, None);
                 assert_eq!(items.len(), 2, "{line:?}");
                 assert!(items[1].tags.contains(&"malformed"), "{line:?}");
             }
         }
-        check_decode(
-            || Dns::new(true),
-            &[0, 12, 0x12, 0x34, 0x81, 0x80, 0, 0, 0, 0, 0, 0, 0, 0],
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Dns::new(true)),
+                chunks(
+                    &[0, 12, 0x12, 0x34, 0x81, 0x80, 0, 0, 0, 0, 0, 0, 0, 0],
+                    &[1, 7, 64]
+                ),
+                |_| {}
+            ),
+            decode_all(
+                || Dns::new(true),
+                &[0, 12, 0x12, 0x34, 0x81, 0x80, 0, 0, 0, 0, 0, 0, 0, 0]
+            )
         );
-        check_decode(TlsRecords::default, &[23, 3, 3, 0, 3, 1, 2, 3]);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(TlsRecords::default()),
+                chunks(&[23, 3, 3, 0, 3, 1, 2, 3], &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(TlsRecords::default, &[23, 3, 3, 0, 3, 1, 2, 3])
+        );
     }
 
     #[test]

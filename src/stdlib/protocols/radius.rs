@@ -1838,10 +1838,11 @@ mod tests {
     use super::harness::check_datagram;
     use super::*;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream};
-    use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::hex;
     use fictionet::stdlib::test_support::rounds;
-    use fictionet::stdlib::test_support::{decode_all, mutate};
+    use fictionet::stdlib::test_support::{
+        assert_write, chunks, decode_all, decode_chunks, mutate,
+    };
 
     // RFC 2865, section 7.1: User Telnet to Specified Host.
     const ACCESS_REQUEST: &str = "01 00 00 38 0f 40 3f 94 73 97 80 57 bd 83 d5 cb
@@ -1988,7 +1989,14 @@ mod tests {
                 }
                 assert_eq!(Packet::parse_datagram(&bytes[..n]), Err(e));
             }
-            contract::check_decode_with_alloc_limit(Frames::<Packet>::new, &bytes, 2 * MAX_PACKET);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Frames::<Packet>::new()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_PACKET)
+                ),
+                decode_all(Frames::<Packet>::new, &bytes)
+            );
             assert_eq!(
                 decode_all(Frames::<Packet>::new, &bytes),
                 (vec![Packet::parse(&bytes).unwrap()], None)
@@ -2848,7 +2856,14 @@ mod tests {
     fn stream_splits_packets() {
         let a = hex(ACCESS_REQUEST);
         let data = [a.clone(), hex(ACCESS_ACCEPT)].concat();
-        contract::check_decode_with_alloc_limit(Frames::<Packet>::new, &data, 2 * MAX_PACKET);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Packet>::new()),
+                chunks(&data, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_PACKET)
+            ),
+            decode_all(Frames::<Packet>::new, &data)
+        );
         let (packets, error) = decode_all(Frames::<Packet>::new, &data);
         assert_eq!(error, None);
         assert_eq!(
@@ -3126,8 +3141,17 @@ mod tests {
     /// same.
     fn check(data: &[u8]) {
         check_datagram(data);
-        contract::check_decode_with_alloc_limit(Frames::<Packet>::new, data, 2 * MAX_PACKET);
-        contract::check_wire::<Packet>(data);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Packet>::new()),
+                chunks(data, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_PACKET)
+            ),
+            decode_all(Frames::<Packet>::new, data)
+        );
+        if let Ok(value) = Packet::parse(data) {
+            assert_write(&value).unwrap();
+        }
     }
 
     #[test]

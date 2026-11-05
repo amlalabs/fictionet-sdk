@@ -503,9 +503,10 @@ mod tests {
     use super::*;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream};
     use fictionet::stdlib::protocols::netbios::{MAX_LABEL, decode_first_level};
-    use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::rounds;
-    use fictionet::stdlib::test_support::{decode_all, mutate};
+    use fictionet::stdlib::test_support::{
+        assert_write, chunks, decode_all, decode_chunks, mutate,
+    };
 
     /// "FRED" padded with spaces, from RFC 1002, section 4.1.
     const FRED: &[u8; 32] = b"EGFCEFEECACACACACACACACACACACACA";
@@ -663,10 +664,13 @@ mod tests {
     #[test]
     fn stream_bounds() {
         let data = [0x85, 0, 0, 0].repeat(1_000);
-        contract::check_decode_with_alloc_limit(
-            || Frames::<Packet>::with_limit(0),
-            &data,
-            2 * HEADER_LEN,
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Packet>::with_limit(0)),
+                chunks(&data, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * HEADER_LEN)
+            ),
+            decode_all(|| Frames::<Packet>::with_limit(0), &data)
         );
         let (packets, error) = decode_all(|| Frames::<Packet>::with_limit(0), &data);
         assert_eq!(packets, vec![Packet::KeepAlive; 1_000]);
@@ -920,7 +924,14 @@ mod tests {
             },
         ];
         let stream: Vec<u8> = packets.iter().flat_map(|p| p.to_bytes().unwrap()).collect();
-        contract::check_decode_with_alloc_limit(Frames::<Packet>::new, &stream, 2 * MAX_PACKET);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Packet>::new()),
+                chunks(&stream, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_PACKET)
+            ),
+            decode_all(Frames::<Packet>::new, &stream)
+        );
         assert_eq!(
             decode_all(Frames::<Packet>::new, &stream),
             (packets.to_vec(), None)
@@ -966,9 +977,20 @@ mod tests {
                 bytes
             };
             mutate(&mut rng, &mut data);
-            contract::check_decode_with_alloc_limit(Frames::<Packet>::new, &data, 2 * MAX_PACKET);
-            contract::check_wire::<Packet>(&data);
-            contract::check_wire::<Name>(&data);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Frames::<Packet>::new()),
+                    chunks(&data, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_PACKET)
+                ),
+                decode_all(Frames::<Packet>::new, &data)
+            );
+            if let Ok(value) = Packet::parse(&data) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = Name::parse(&data) {
+                assert_write(&value).unwrap();
+            }
             let mut scope: Vec<Vec<u8>> =
                 data.chunks(rng.index(80) + 1).map(<[u8]>::to_vec).collect();
             if rng.index(8) == 0 {
@@ -990,9 +1012,9 @@ mod tests {
                         .sum::<usize>()
                     <= MAX_NAME_LEN;
             assert_eq!(name.to_bytes().is_ok(), fits);
-            contract::check_wire_value(&name);
-            contract::check_wire_value(&fixture_packet_request(name, fred()));
-            contract::check_wire_value(&Packet::Negative(NegativeCode::Other(rng.next() as u8)));
+            let _ = assert_write(&name);
+            let _ = assert_write(&fixture_packet_request(name, fred()));
+            let _ = assert_write(&Packet::Negative(NegativeCode::Other(rng.next() as u8)));
         }
     }
 }

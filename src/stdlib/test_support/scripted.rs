@@ -82,8 +82,8 @@ where
 mod tests {
     use super::*;
     use fictionet::stdlib::{
-        codec::{Ending, Lines},
-        test_support::contract,
+        codec::{Ending, Lines, Stream},
+        test_support::{chunks, decode_all, decode_chunks},
     };
 
     struct Probe {
@@ -187,7 +187,12 @@ mod tests {
                 },
             )
         };
-        let (items, failure) = contract::check_decode(make, b"one\r\ntwo\r\n");
+        let data = b"one\r\ntwo\r\n";
+        let (items, failure) = decode_all(make, data);
+        assert_eq!(
+            decode_chunks(&mut Stream::new(make()), chunks(data, &[1, 7, 64]), |_| {}),
+            (items.clone(), failure.clone())
+        );
         assert_eq!(failure, None);
         assert_eq!(items, [(Ok(b"one".to_vec()), 0), (Ok(b"two".to_vec()), 1)]);
     }

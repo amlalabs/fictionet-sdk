@@ -899,7 +899,7 @@ mod tests {
     use super::*;
     use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::protocols::netbios::{MAX_LABEL, MAX_NAME_LEN, decode_first_level};
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::assert_write;
     use fictionet::stdlib::test_support::mutate;
     use fictionet::stdlib::test_support::rounds;
 
@@ -1207,19 +1207,19 @@ mod tests {
             scope: vec![vec![b'x'; 100]; 10],
         };
         assert_eq!(name.to_bytes(), Err(Error::Unwritable));
-        contract::check_wire_value(&name);
+        let _ = assert_write(&name);
         let mut p = sample_datagram();
         if let Body::Datagram(d) = &mut p.body {
             d.data = vec![7; 70_000];
         }
         assert_eq!(p.to_bytes(), Err(Error::Unwritable));
-        contract::check_wire_value(&p);
+        let _ = assert_write(&p);
         let n = Name {
             bytes: [b'A'; 16],
             scope: vec![vec![], b"x".to_vec()],
         };
         assert_eq!(n.to_bytes(), Err(Error::Unwritable));
-        contract::check_wire_value(&n);
+        let _ = assert_write(&n);
     }
 
     #[test]
@@ -1230,14 +1230,14 @@ mod tests {
             scope: vec![vec![b'x'; MAX_LABEL + 1]],
         };
         assert_eq!(wide.to_bytes(), Err(Error::Unwritable));
-        contract::check_wire_value(&wide);
+        let _ = assert_write(&wide);
         // Five legal labels that make a 354-byte name.
         let long = Name {
             bytes: [b'A'; 16],
             scope: vec![vec![b'x'; MAX_LABEL]; 5],
         };
         assert_eq!(long.to_bytes(), Err(Error::Unwritable));
-        contract::check_wire_value(&long);
+        let _ = assert_write(&long);
         // A name of exactly MAX_NAME_LEN bytes is written and reads back.
         let mut scope = vec![vec![b'x'; MAX_LABEL]; 3];
         scope.push(vec![b'y'; 28]);
@@ -1248,12 +1248,12 @@ mod tests {
         let wire = full.to_bytes().unwrap();
         assert_eq!(wire.len(), MAX_NAME_LEN);
         assert_eq!(Name::parse(&wire), Ok(full.clone()));
-        contract::check_wire_value(&full);
+        let _ = assert_write(&full);
         // One more byte in the last label passes it.
         let mut over = full;
         over.scope[3].push(b'y');
         assert_eq!(over.to_bytes(), Err(Error::Unwritable));
-        contract::check_wire_value(&over);
+        let _ = assert_write(&over);
     }
 
     fn independent_fragments() -> (Vec<u8>, Vec<u8>) {
@@ -1382,12 +1382,12 @@ mod tests {
         let mut invalid = Packet::parse(&last).unwrap();
         invalid.flags.more = true;
         assert_eq!(invalid.to_bytes(), Err(Error::Unwritable));
-        contract::check_wire_value(&invalid);
+        let _ = assert_write(&invalid);
         let mut whole = sample_datagram();
         whole.flags.more = true;
         assert_eq!(whole.to_bytes(), Err(Error::Unwritable));
         assert_eq!(whole.split(80), Err(Error::Unwritable));
-        contract::check_wire_value(&whole);
+        let _ = assert_write(&whole);
     }
 
     #[test]
@@ -1616,8 +1616,12 @@ mod tests {
     }
 
     fn check(data: &[u8], r: &mut Reassembler) {
-        contract::check_wire::<Name>(data);
-        contract::check_wire::<Packet>(data);
+        if let Ok(value) = Name::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Packet::parse(data) {
+            assert_write(&value).unwrap();
+        }
 
         if let Ok(p) = Packet::parse(data) {
             let bytes = p.to_bytes().unwrap();

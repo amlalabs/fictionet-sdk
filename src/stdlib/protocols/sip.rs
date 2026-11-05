@@ -2073,12 +2073,13 @@ fictionet::text_wire!(Error, MAX_HEAD,
 #[doc(hidden)]
 pub mod harness {
     use super::{CSeq, Contacts, Error, Message, NameAddr};
+
     use fictionet::stdlib::codec::Wire;
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::assert_write;
 
     /// Checks parsed values and their public accessors.
     pub fn round_trip(message: &Message) {
-        contract::check_wire_value(message);
+        let _ = assert_write(message);
         if let Err(error) = message.to_bytes() {
             assert!(
                 matches!(error, Error::TooLong | Error::TooMany),
@@ -2088,13 +2089,13 @@ pub mod harness {
         }
         if let Ok(vias) = message.vias() {
             for value in vias {
-                contract::check_wire_value(&value);
+                let _ = assert_write(&value);
                 value.to_bytes().unwrap();
             }
         }
         for read in [Message::from, Message::to] {
             if let Ok(value) = read(message) {
-                contract::check_wire_value(&value);
+                let _ = assert_write(&value);
                 value.to_bytes().unwrap();
             }
         }
@@ -2102,7 +2103,7 @@ pub mod harness {
             cseq_round_trip(&value);
         }
         if let Ok(value) = message.contacts() {
-            contract::check_wire_value(&value);
+            let _ = assert_write(&value);
             if let Err(error) = value.to_bytes() {
                 assert_eq!(value, Contacts::List(vec![]), "{error:?}");
             }
@@ -2110,7 +2111,7 @@ pub mod harness {
         if let Some(uri) = message.request_uri()
             && let Ok(value) = NameAddr::new(uri).sip_uri()
         {
-            contract::check_wire_value(&value);
+            let _ = assert_write(&value);
             value.to_bytes().unwrap();
             for param in &value.params {
                 assert!(value.param(&param.name).is_some());
@@ -2119,7 +2120,7 @@ pub mod harness {
         if message.method().is_some() {
             let mut reply = message.reply(100, "Trying");
             reply.set_header("Content-Length", "0");
-            contract::check_wire_value(&reply);
+            let _ = assert_write(&reply);
             assert!(matches!(
                 reply.to_bytes(),
                 Ok(_) | Err(Error::TooLong | Error::TooMany)
@@ -2129,7 +2130,7 @@ pub mod harness {
 
     /// Checks parsed values and their public accessors.
     pub fn cseq_round_trip(value: &CSeq) {
-        contract::check_wire_value(value);
+        let _ = assert_write(value);
         if let Err(error) = value.to_bytes() {
             assert!(value.seq >= 1 << 31, "{error:?} for {value:?}");
         }
@@ -2142,7 +2143,7 @@ pub mod harness {
         value: Result<T, Error>,
     ) {
         if let Ok(value) = value {
-            contract::check_wire_value(&value);
+            let _ = assert_write(&value);
             assert!(
                 matches!(value.to_bytes(), Ok(_) | Err(Error::TooLong)),
                 "{value:?}"
@@ -2168,10 +2169,11 @@ mod tests {
     }
 
     use super::*;
-    use fictionet::stdlib::codec::Lcg;
-    use fictionet::stdlib::codec::{Fail, Stream};
-    use fictionet::stdlib::test_support::contract;
-    use fictionet::stdlib::test_support::{decode_all, mutate};
+    use fictionet::stdlib::codec::Fail;
+    use fictionet::stdlib::codec::{Lcg, Stream};
+    use fictionet::stdlib::test_support::{
+        assert_write, chunks, decode_all, decode_chunks, mutate,
+    };
 
     fn cseq_value(seq: u32, method: String) -> CSeq {
         CSeq { seq, method }
@@ -3094,7 +3096,14 @@ mod tests {
     #[test]
     fn stream_framing() {
         let bytes = [b"\r\n\r\n".as_slice(), &invite(), b"\r\n", &ok()].concat();
-        contract::check_decode_with_alloc_limit(Messages::new, &bytes, 2 * MAX_MESSAGE);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Messages::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_MESSAGE)
+            ),
+            decode_all(Messages::new, &bytes)
+        );
         assert_eq!(
             decode_all(Messages::new, &bytes),
             (
@@ -3120,7 +3129,14 @@ mod tests {
         );
         assert_eq!(stream.unread(), missing);
         let bytes = vec![b'X'; MAX_HEAD];
-        contract::check_decode_with_alloc_limit(Messages::new, &bytes, 2 * MAX_MESSAGE);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Messages::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_MESSAGE)
+            ),
+            decode_all(Messages::new, &bytes)
+        );
         assert_eq!(
             decode_all(Messages::new, &bytes).1,
             Some(Fail::Protocol(Error::TooLong))
@@ -3150,7 +3166,14 @@ mod tests {
     #[test]
     fn every_truncated_prefix() {
         for whole in [invite(), ok(), compact()] {
-            contract::check_decode_with_alloc_limit(Messages::new, &whole, 2 * MAX_MESSAGE);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Messages::new()),
+                    chunks(&whole, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_MESSAGE)
+                ),
+                decode_all(Messages::new, &whole)
+            );
             for n in 0..whole.len() {
                 let part = &whole[..n];
                 assert_eq!(
@@ -3191,7 +3214,7 @@ mod tests {
                     assert_ne!(result, expected, "prefix {n} of {text:?}");
                 }
                 if let Ok(value) = result {
-                    contract::check_wire_value(&value);
+                    let _ = assert_write(&value);
                 }
             }
         }
@@ -3280,9 +3303,25 @@ mod tests {
     }
 
     fn check(data: &[u8]) -> usize {
-        contract::check_decode_with_alloc_limit(Messages::new, data, 2 * MAX_MESSAGE);
-        contract::check_decode_with_held_limit(Messages::new, data, 0);
-        contract::check_wire::<Message>(data);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Messages::new()),
+                chunks(data, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_MESSAGE)
+            ),
+            decode_all(Messages::new, data)
+        );
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Messages::new()),
+                chunks(data, &[1, 7, 64]),
+                |s| assert_eq!(s.held(), 0)
+            ),
+            decode_all(Messages::new, data)
+        );
+        if let Ok(value) = Message::parse(data) {
+            assert_write(&value).unwrap();
+        }
         let (items, _) = decode_all(Messages::new, data);
         for message in items.iter().flatten() {
             round_trip(message);
@@ -3302,7 +3341,7 @@ mod tests {
     fn values_round_trip(bytes: &[u8]) {
         macro_rules! check {
             ($($ty:ty),+) => {$(
-                contract::check_wire::<$ty>(bytes);
+                if let Ok(value) = <$ty>::parse(bytes) { assert_write(&value).unwrap(); };
                 // Read text directly so a writer failure cannot hide as a parse refusal.
                 if let Ok(text) = core::str::from_utf8(bytes) {
                     text_value(<$ty>::read_value(text));
@@ -3310,7 +3349,9 @@ mod tests {
             )+};
         }
         check!(Uri, NameAddr, Via, Contacts);
-        contract::check_wire::<CSeq>(bytes);
+        if let Ok(value) = CSeq::parse(bytes) {
+            assert_write(&value).unwrap();
+        }
         if let Ok(text) = core::str::from_utf8(bytes)
             && let Ok(value) = CSeq::read_value(text)
         {
@@ -3411,7 +3452,7 @@ mod tests {
             for _ in 0..rng.index(2) {
                 u.headers.push((text(&mut rng, 3), text(&mut rng, 3)));
             }
-            contract::check_wire_value(&u);
+            let _ = assert_write(&u);
             if let Ok(text) = wire_text(&u) {
                 assert_eq!(Uri::parse(text.as_bytes()).unwrap(), u, "{text}");
                 written += 1;
@@ -3439,7 +3480,7 @@ mod tests {
                 uri: text(&mut rng, 10),
                 params: params.clone(),
             };
-            contract::check_wire_value(&a);
+            let _ = assert_write(&a);
             if let Ok(text) = wire_text(&a) {
                 assert_eq!(NameAddr::parse(text.as_bytes()).unwrap(), a, "{text}");
                 written += 1;
@@ -3455,13 +3496,13 @@ mod tests {
                 port,
                 params,
             };
-            contract::check_wire_value(&v);
+            let _ = assert_write(&v);
             if let Ok(text) = wire_text(&v) {
                 assert_eq!(Via::parse(text.as_bytes()).unwrap(), v, "{text}");
                 written += 1;
             }
             let c = cseq_value(rng.next() as u32, text(&mut rng, 5));
-            contract::check_wire_value(&c);
+            let _ = assert_write(&c);
             if let Ok(text) = wire_text(&c) {
                 assert_eq!(CSeq::parse(text.as_bytes()).unwrap(), c);
             }
@@ -3477,7 +3518,7 @@ mod tests {
             }
             m.body = text(&mut rng, 6).into_bytes();
             m.set_header("Content-Length", &m.body.len().to_string());
-            contract::check_wire_value(&m);
+            let _ = assert_write(&m);
             if let Ok(bytes) = m.to_bytes() {
                 assert_eq!(Message::parse(&bytes).unwrap(), m);
                 written += 1;
@@ -3507,7 +3548,14 @@ mod tests {
         let (items, failure) = decode_all(Messages::new, &crlfs);
         assert_eq!(failure, None);
         assert_eq!(items, [Ok(Message::parse(one).unwrap())]);
-        contract::check_decode_with_alloc_limit(Messages::new, &crlfs, 2 * MAX_MESSAGE);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Messages::new()),
+                chunks(&crlfs, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_MESSAGE)
+            ),
+            decode_all(Messages::new, &crlfs)
+        );
     }
 
     #[test]

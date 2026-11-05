@@ -3260,10 +3260,7 @@ mod tests {
     use super::*;
     use fictionet::stdlib::codec::{Stream, finish, pump};
     use fictionet::stdlib::test_support::check_atomic;
-    use fictionet::stdlib::test_support::contract::{
-        check_decode_with_alloc_limit, check_wire, check_wire_value,
-    };
-    use fictionet::stdlib::test_support::{chunks, decode_all};
+    use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
 
     fn templates(fields: &str) -> Templates {
         xml_templates(&format!(
@@ -3292,7 +3289,14 @@ mod tests {
             decode_all(|| Messages::new(t.clone()), &bytes),
             (values.to_vec(), None)
         );
-        check_decode_with_alloc_limit(|| Messages::new(t.clone()), &bytes, 2 * MAX_MESSAGE_BYTES);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Messages::new(t.clone())),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_MESSAGE_BYTES)
+            ),
+            decode_all(|| Messages::new(t.clone()), &bytes)
+        );
         bytes
     }
     fn exact<T: Wire<ParseError = Error, WriteError = Error> + std::fmt::Debug + PartialEq>(
@@ -3301,8 +3305,10 @@ mod tests {
     ) {
         assert_eq!(value.to_bytes().unwrap(), bytes);
         assert_eq!(T::parse(bytes).unwrap(), value);
-        check_wire::<T>(bytes);
-        check_wire_value(&value);
+        if let Ok(value) = T::parse(bytes) {
+            assert_write(&value).unwrap();
+        }
+        let _ = assert_write(&value);
     }
     #[test]
     fn appendix_3_1_integer_examples_and_extremes() {
@@ -3320,19 +3326,19 @@ mod tests {
         exact(Nullable(Some(UInt32(0))), &[0x81]);
         exact(Nullable(Some(UInt32(u32::MAX))), &[0x10, 0, 0, 0, 0x80]);
         for n in [i64::MIN, i64::MAX, -8193, -65, -64, -1, 0, 63, 64, 8192] {
-            check_wire_value(&Int64(n));
-            check_wire_value(&Nullable(Some(Int64(n))));
+            let _ = assert_write(&Int64(n));
+            let _ = assert_write(&Nullable(Some(Int64(n))));
         }
         for n in [0, 127, 128, u64::MAX] {
-            check_wire_value(&UInt64(n));
-            check_wire_value(&Nullable(Some(UInt64(n))));
+            let _ = assert_write(&UInt64(n));
+            let _ = assert_write(&Nullable(Some(UInt64(n))));
         }
         for n in [i32::MIN, i32::MAX, 0] {
-            check_wire_value(&Int32(n));
-            check_wire_value(&Nullable(Some(Int32(n))));
+            let _ = assert_write(&Int32(n));
+            let _ = assert_write(&Nullable(Some(Int32(n))));
         }
-        check_wire_value(&Nullable::<Int64>(None));
-        check_wire_value(&Nullable::<UInt64>(None));
+        let _ = assert_write(&Nullable::<Int64>(None));
+        let _ = assert_write(&Nullable::<UInt64>(None));
         assert_eq!(UInt32::parse(&[0x10, 0, 0, 0, 0x80]), Err(Error::Range));
         assert_eq!(
             UInt64::parse(&[2, 0, 0, 0, 0, 0, 0, 0, 0, 0x80]),
@@ -3398,14 +3404,14 @@ mod tests {
         exact(Nullable::<Decimal>(None), &[0x80]);
         for exponent in [-63, 0, 63] {
             for mantissa in [i64::MIN, 0, i64::MAX] {
-                check_wire_value(&Decimal { exponent, mantissa });
+                let _ = assert_write(&Decimal { exponent, mantissa });
             }
         }
-        check_wire_value(&Decimal {
+        let _ = assert_write(&Decimal {
             exponent: 64,
             mantissa: 1,
         });
-        check_wire_value(&Ascii("é".into()));
+        let _ = assert_write(&Ascii("é".into()));
         assert_eq!(Unicode::parse(&[0x81, 0xff]), Err(Error::Text));
     }
     #[test]
@@ -3423,8 +3429,8 @@ mod tests {
         assert_eq!(Int64::parse(&[]), Err(Error::Truncated));
         assert_eq!(ByteVector::parse(&[0x83, 1, 2]), Err(Error::Truncated));
         let long = vec![b'a'; MAX_STRING_BYTES + 1];
-        check_wire_value(&ByteVector(long.clone()));
-        check_wire_value(&Ascii(String::from_utf8(long.clone()).unwrap()));
+        let _ = assert_write(&ByteVector(long.clone()));
+        let _ = assert_write(&Ascii(String::from_utf8(long.clone()).unwrap()));
         let mut stop = long;
         *stop.last_mut().unwrap() |= 0x80;
         assert!(matches!(
@@ -3461,10 +3467,13 @@ mod tests {
             Messages::new(t.clone()).parse_exact(&[0xe0, 0x81]),
             Err(Error::Presence)
         );
-        check_decode_with_alloc_limit(
-            || Messages::new(t.clone()),
-            &[0xe0, 0x81],
-            2 * MAX_MESSAGE_BYTES,
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Messages::new(t.clone())),
+                chunks(&[0xe0, 0x81], &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_MESSAGE_BYTES)
+            ),
+            decode_all(|| Messages::new(t.clone()), &[0xe0, 0x81])
         );
         let fields = (0..9)
             .map(|i| format!("<uInt32 name=\"f{i}\"><default value=\"0\"/></uInt32>"))
@@ -3895,10 +3904,13 @@ mod tests {
             decode_all(|| Blocks, &bytes),
             (vec![vec![0xc0, 0x81, 0x80], vec![0x80]], None)
         );
-        check_decode_with_alloc_limit(
-            || Blocks,
-            &bytes,
-            2 * (MAX_MESSAGE_BYTES + MAX_INTEGER_BYTES),
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Blocks),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * (MAX_MESSAGE_BYTES + MAX_INTEGER_BYTES))
+            ),
+            decode_all(|| Blocks, &bytes)
         );
         let t = templates("<uInt32 name=\"n\"><increment value=\"1\"/></uInt32>");
         let make = || BlockMessages::new(Messages::new(t.clone()));
@@ -3909,12 +3921,22 @@ mod tests {
                 None
             )
         );
-        check_decode_with_alloc_limit(make, &bytes, 2 * MAX_MESSAGE_BYTES);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(make()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_MESSAGE_BYTES)
+            ),
+            decode_all(make, &bytes)
+        );
         for n in 0..=255u8 {
-            check_decode_with_alloc_limit(
-                || Blocks,
-                &[n, 0x81, 0x80],
-                2 * (MAX_MESSAGE_BYTES + MAX_INTEGER_BYTES),
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Blocks),
+                    chunks(&[n, 0x81, 0x80], &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * (MAX_MESSAGE_BYTES + MAX_INTEGER_BYTES))
+                ),
+                decode_all(|| Blocks, &[n, 0x81, 0x80])
             );
         }
     }
@@ -3956,17 +3978,27 @@ mod tests {
             &[0x80],
             &[0, 0x81, 0x80],
         ] {
-            check_decode_with_alloc_limit(make, input, 2 * MAX_MESSAGE_BYTES);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(make()),
+                    chunks(input, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_MESSAGE_BYTES)
+                ),
+                decode_all(make, input)
+            );
         }
     }
     #[test]
     fn blocks_refuse_zero_excessive_and_unterminated_sizes() {
         for bytes in [&[0x80][..], &[0, 0x80]] {
             assert_eq!(Blocks.decode(bytes, false), Err(Error::BlockSize));
-            check_decode_with_alloc_limit(
-                || Blocks,
-                bytes,
-                2 * (MAX_MESSAGE_BYTES + MAX_INTEGER_BYTES),
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Blocks),
+                    chunks(bytes, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * (MAX_MESSAGE_BYTES + MAX_INTEGER_BYTES))
+                ),
+                decode_all(|| Blocks, bytes)
             );
         }
         let mut over = Vec::new();
@@ -3982,10 +4014,13 @@ mod tests {
             Err(Error::Limit("MAX_INTEGER_BYTES"))
         );
         for bytes in [&over[..], &[0; MAX_INTEGER_BYTES], &[0], &[0x82, 0x80]] {
-            check_decode_with_alloc_limit(
-                || Blocks,
-                bytes,
-                2 * (MAX_MESSAGE_BYTES + MAX_INTEGER_BYTES),
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Blocks),
+                    chunks(bytes, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * (MAX_MESSAGE_BYTES + MAX_INTEGER_BYTES))
+                ),
+                decode_all(|| Blocks, bytes)
             );
         }
         let mut maximum = vec![0; MAX_INTEGER_BYTES - 1];
@@ -4289,7 +4324,14 @@ mod tests {
             Messages::new(t.clone()).parse_exact(&bytes),
             Err(Error::Limit("MAX_SEQUENCE_LENGTH"))
         );
-        check_decode_with_alloc_limit(|| Messages::new(t.clone()), &bytes, 2 * MAX_MESSAGE_BYTES);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Messages::new(t.clone())),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_MESSAGE_BYTES)
+            ),
+            decode_all(|| Messages::new(t.clone()), &bytes)
+        );
         let t = templates(
             "<sequence name=\"outer\"><length><constant value=\"4096\"/></length><sequence name=\"inner\"><length><constant value=\"4096\"/></length></sequence></sequence>",
         );
@@ -4297,10 +4339,13 @@ mod tests {
             Messages::new(t.clone()).parse_exact(&[0xc0, 0x81]),
             Err(Error::Limit("MAX_VALUES"))
         );
-        check_decode_with_alloc_limit(
-            || Messages::new(t.clone()),
-            &[0xc0, 0x81],
-            2 * MAX_MESSAGE_BYTES,
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Messages::new(t.clone())),
+                chunks(&[0xc0, 0x81], &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_MESSAGE_BYTES)
+            ),
+            decode_all(|| Messages::new(t.clone()), &[0xc0, 0x81])
         );
         let t = templates("<templateRef/>");
         let bytes = [vec![0xc0, 0x81], vec![0x80; MAX_DEPTH]].concat();
@@ -4308,7 +4353,14 @@ mod tests {
             Messages::new(t.clone()).parse_exact(&bytes),
             Err(Error::Limit("MAX_DEPTH"))
         );
-        check_decode_with_alloc_limit(|| Messages::new(t.clone()), &bytes, 2 * MAX_MESSAGE_BYTES);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Messages::new(t.clone())),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_MESSAGE_BYTES)
+            ),
+            decode_all(|| Messages::new(t.clone()), &bytes)
+        );
     }
     #[test]
     fn fragmented_long_fields_keep_bounded_state_and_progress() {
@@ -4338,18 +4390,37 @@ mod tests {
         );
         for n in 0..=255u8 {
             let bytes = [n, n.rotate_left(3), 0x81, n.wrapping_add(1), 0x80, n, 0xff];
-            check_wire::<Int64>(&bytes);
-            check_wire::<Nullable<UInt64>>(&bytes);
-            check_wire::<Ascii>(&bytes);
-            check_wire::<Nullable<Ascii>>(&bytes);
-            check_wire::<Unicode>(&bytes);
-            check_wire::<ByteVector>(&bytes);
-            check_wire::<Decimal>(&bytes);
-            check_wire::<PresenceMap>(&bytes);
-            check_decode_with_alloc_limit(
-                || Messages::new(t.clone()),
-                &bytes,
-                2 * MAX_MESSAGE_BYTES,
+            if let Ok(value) = Int64::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = <Nullable<UInt64>>::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = Ascii::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = <Nullable<Ascii>>::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = Unicode::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = ByteVector::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = Decimal::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = PresenceMap::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Messages::new(t.clone())),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_MESSAGE_BYTES)
+                ),
+                decode_all(|| Messages::new(t.clone()), &bytes)
             );
         }
     }
@@ -4604,10 +4675,13 @@ mod tests {
     fn cloned_decoders_preserve_framing_reservations() {
         let t = templates("<group name=\"g\"><string name=\"s\"/></group>");
         let original = Messages::new(t);
-        check_decode_with_alloc_limit(
-            || original.clone(),
-            &[0xc0, 0x81, b'A', 0xc2],
-            2 * MAX_MESSAGE_BYTES,
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(original.clone()),
+                chunks(&[0xc0, 0x81, b'A', 0xc2], &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_MESSAGE_BYTES)
+            ),
+            decode_all(|| original.clone(), &[0xc0, 0x81, b'A', 0xc2])
         );
         let mut partial = original.clone();
         assert_eq!(partial.decode(&[0xc0, 0x81, b'A'], false), Ok(Step::Need));

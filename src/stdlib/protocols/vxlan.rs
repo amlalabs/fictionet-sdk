@@ -343,7 +343,7 @@ mod tests {
 
     use super::*;
     use fictionet::stdlib::codec::Lcg;
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::assert_write;
     use fictionet::stdlib::test_support::rounds;
 
     /// The ARP request from the module doc: VNI 5001 and a 14-byte frame.
@@ -556,8 +556,12 @@ mod tests {
     }
 
     fn check(data: &[u8]) {
-        contract::check_wire::<Packet>(data);
-        contract::check_wire::<GpePacket>(data);
+        if let Ok(value) = Packet::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = GpePacket::parse(data) {
+            assert_write(&value).unwrap();
+        }
 
         if let Ok(p) = Packet::parse(data) {
             let bytes = p.to_bytes().unwrap();

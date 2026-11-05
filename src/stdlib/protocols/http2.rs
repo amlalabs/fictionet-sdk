@@ -864,8 +864,8 @@ impl Inputs {
     }
     /// Enables capture policy: accepts an optional preface, reports bad
     /// frames as items, and skips incomplete oversized payloads.
-    /// `check_decode` does not apply above the chosen limit; complete
-    /// frames in read-ahead are retained.
+    /// Above the chosen limit, items can depend on chunk boundaries.
+    /// Complete frames in read-ahead are retained.
     pub fn for_observation(limit: usize) -> Self {
         Self {
             preface: 2,
@@ -2451,7 +2451,8 @@ mod tests {
     }
 
     use super::*;
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::codec::Stream;
+    use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
 
     fn raw(kind: u8, flags: u8, stream: u32, body: &[u8]) -> Vec<u8> {
         let mut out = FrameHeader {
@@ -2521,15 +2522,22 @@ mod tests {
             raw(255, 255, 3, b"opaque"),
         ];
         for bytes in &frames {
-            contract::check_wire::<Frame>(bytes);
             let frame = Frame::parse(bytes).unwrap();
+            assert_write(&frame).unwrap();
             assert_eq!(frame.to_bytes().unwrap(), *bytes);
             let mut trailing = bytes.clone();
             trailing.push(0);
             assert!(Frame::parse(&trailing).is_err());
-            contract::check_decode(|| Inputs::with_limit(128), bytes);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Inputs::with_limit(128)),
+                    chunks(bytes, &[1, 7, 64]),
+                    |_| {}
+                ),
+                decode_all(|| Inputs::with_limit(128), bytes)
+            );
         }
-        macro_rules! wire { ($($ty:ty => $i:expr),+) => { $(contract::check_wire::<$ty>(&frames[$i]);)+ }; }
+        macro_rules! wire { ($($ty:ty => $i:expr),+) => { $(if let Ok(value) = <$ty>::parse(&frames[$i]) { assert_write(&value).unwrap(); };)+ }; }
         wire!(Data => 0, Headers => 1, Priority => 2, Reset => 3, Settings => 4, PushPromise => 5,
             Ping => 6, GoAway => 7, WindowUpdate => 8, Continuation => 9, Unknown => 10);
         let mut out = vec![7, 8];
@@ -2552,7 +2560,9 @@ mod tests {
         };
         assert!(h.write(&mut out).is_err());
         assert_eq!(out, [7, 8]);
-        contract::check_wire::<FrameHeader>(&frames[0][..9]);
+        if let Ok(value) = FrameHeader::parse(&frames[0][..9]) {
+            assert_write(&value).unwrap();
+        }
     }
     #[test]
     fn padding_round_trips_for_data_headers_and_push_promise() {
@@ -2871,7 +2881,14 @@ mod tests {
         assert!(
             matches!(&expected[4], Ok(Event::Trailers { fields, .. }) if fields[0].name == b"grpc-status")
         );
-        contract::check_decode(|| Inputs::client_side(DEFAULT_FRAME_SIZE), &bytes);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Inputs::client_side(DEFAULT_FRAME_SIZE)),
+                chunks(&bytes, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(|| Inputs::client_side(DEFAULT_FRAME_SIZE), &bytes)
+        );
     }
     #[test]
     fn continuation_failures_and_eof_are_reported_once() {
@@ -3564,9 +3581,20 @@ mod tests {
         let mut rng = fictionet::stdlib::codec::Lcg::new(0x6832);
         for _ in 0..128 {
             let bytes = rng.bytes(128);
-            contract::check_wire::<Frame>(&bytes);
-            contract::check_wire::<FrameHeader>(&bytes);
-            contract::check_decode(|| Inputs::with_limit(128), &bytes);
+            if let Ok(value) = Frame::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = FrameHeader::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Inputs::with_limit(128)),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |_| {}
+                ),
+                decode_all(|| Inputs::with_limit(128), &bytes)
+            );
         }
     }
 }

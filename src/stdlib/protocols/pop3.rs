@@ -1313,9 +1313,11 @@ mod tests {
     use super::*;
     use codec::{Fail, Lcg, Stream};
     use fictionet::assert_cases;
-    use fictionet::stdlib::test_support::contract;
+
     use fictionet::stdlib::test_support::rounds;
-    use fictionet::stdlib::test_support::{decode_all, mutate};
+    use fictionet::stdlib::test_support::{
+        assert_write, chunks, decode_all, decode_chunks, mutate,
+    };
 
     fn request_apop(name: String, digest: [u8; 16]) -> Request {
         Request::Apop { name, digest }
@@ -1680,14 +1682,19 @@ mod tests {
             reply.to_bytes().unwrap(),
             b"+OK 120 octets\r\nSubject: hi\r\n\r\n..\r\n...more\r\nx\r\n.\r\n"
         );
-        contract::check_decode_with_alloc_limit(
-            || reply_reader(true),
-            wire,
-            2 * (MAX_AUTH_LINE + 2),
-        );
-        contract::check_wire::<Reply>(wire);
         assert_eq!(
-            contract::check_refused(&Reply::ok("x").with_body(b".a\nb".to_vec())),
+            decode_chunks(
+                &mut Stream::new(reply_reader(true)),
+                chunks(wire, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * (MAX_AUTH_LINE + 2))
+            ),
+            decode_all(|| reply_reader(true), wire)
+        );
+        if let Ok(value) = Reply::parse(wire) {
+            assert_write(&value).unwrap();
+        }
+        assert_eq!(
+            assert_write(&Reply::ok("x").with_body(b".a\nb".to_vec())).unwrap_err(),
             Error::Unwritable
         );
         let empty = Reply::ok("").with_body(vec![]);
@@ -1698,7 +1705,7 @@ mod tests {
         assert_eq!(stream.next(), Some(Ok(Ok(Output::Reply(Reply::err("no"))))));
         assert_eq!(stream.unread(), b"1 2\r\n.\r\n");
         assert_eq!(
-            contract::check_refused(&Reply::err("no").with_body(b"x".to_vec())),
+            assert_write(&Reply::err("no").with_body(b"x".to_vec())).unwrap_err(),
             Error::Unwritable
         );
     }
@@ -1787,7 +1794,14 @@ mod tests {
             Ok(Input::Command(command(b"QUIT").unwrap())),
         ];
         assert_eq!(decode_all(Inputs::new, &wire), (expected, None));
-        contract::check_decode_with_alloc_limit(Inputs::new, &wire, 2 * (MAX_AUTH_LINE + 2));
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Inputs::new()),
+                chunks(&wire, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * (MAX_AUTH_LINE + 2))
+            ),
+            decode_all(Inputs::new, &wire)
+        );
     }
 
     #[test]
@@ -1813,10 +1827,13 @@ mod tests {
             b"-ERR [SYS/TEMP] later\r\n",
         ] {
             let multi = wire.starts_with(b"+OK");
-            contract::check_decode_with_alloc_limit(
-                || reply_reader(multi),
-                wire,
-                2 * (MAX_AUTH_LINE + 2),
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(reply_reader(multi)),
+                    chunks(wire, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * (MAX_AUTH_LINE + 2))
+                ),
+                decode_all(|| reply_reader(multi), wire)
             );
             for cut in 0..wire.len() {
                 let (items, _) = decode_all(|| reply_reader(multi), &wire[..cut]);
@@ -1856,7 +1873,7 @@ mod tests {
         let mut wire = Vec::new();
         for request in &requests {
             request.write(&mut wire).unwrap();
-            contract::check_wire_value(request);
+            let _ = assert_write(request);
         }
         let (items, error) = decode_all(Inputs::new, &wire);
         assert_eq!(error, None);
@@ -1870,7 +1887,14 @@ mod tests {
             })
             .collect();
         assert_eq!(got, requests);
-        contract::check_decode_with_alloc_limit(Inputs::new, &wire, 2 * (MAX_AUTH_LINE + 2));
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Inputs::new()),
+                chunks(&wire, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * (MAX_AUTH_LINE + 2))
+            ),
+            decode_all(Inputs::new, &wire)
+        );
     }
 
     #[test]
@@ -1886,7 +1910,7 @@ mod tests {
             request_apop("u".repeat(216), [0; 16]),
             Request::Other(command_fixture("user".into(), Some("x".into()))),
         ] {
-            assert_eq!(contract::check_refused(&request), Error::Unwritable);
+            assert_eq!(assert_write(&request).unwrap_err(), Error::Unwritable);
         }
         for (keyword, argument) in [
             ("R\r\n", Some("x\ny")),
@@ -1898,10 +1922,8 @@ mod tests {
             ("NOOP", Some("a\tb")),
         ] {
             assert_eq!(
-                contract::check_refused(&command_fixture(
-                    keyword.into(),
-                    argument.map(String::from)
-                )),
+                assert_write(&command_fixture(keyword.into(), argument.map(String::from)))
+                    .unwrap_err(),
                 Error::Unwritable
             );
         }
@@ -1914,7 +1936,7 @@ mod tests {
             Reply::err("t").with_code(&"A".repeat(600)),
             Reply::err("t").with_code(&format!("{}/{}", "A".repeat(300), "B".repeat(300))),
         ] {
-            assert_eq!(contract::check_refused(&reply), Error::Unwritable);
+            assert_eq!(assert_write(&reply).unwrap_err(), Error::Unwritable);
         }
     }
 
@@ -1926,7 +1948,7 @@ mod tests {
         );
         assert_eq!(command(b"\xc3\xa9AB"), Err(Error::BadKeyword));
         assert_eq!(
-            contract::check_refused(&command_fixture("x-ab".into(), None)),
+            assert_write(&command_fixture("x-ab".into(), None)).unwrap_err(),
             Error::Unwritable
         );
         assert_eq!(command(b"x-ab").unwrap().to_bytes().unwrap(), b"X-AB\r\n");
@@ -1939,7 +1961,7 @@ mod tests {
         let request = Request::User(user.into());
         assert_eq!(Request::parse(&request.to_bytes().unwrap()), Ok(request));
         assert_eq!(
-            contract::check_refused(&request_apop(user.repeat(10), [1; 16])),
+            assert_write(&request_apop(user.repeat(10), [1; 16])).unwrap_err(),
             Error::Unwritable
         );
     }
@@ -1968,7 +1990,14 @@ mod tests {
                 None
             )
         );
-        contract::check_decode_with_alloc_limit(make, wire, 2 * (MAX_AUTH_LINE + 2));
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(make()),
+                chunks(wire, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * (MAX_AUTH_LINE + 2))
+            ),
+            decode_all(make, wire)
+        );
     }
 
     #[test]
@@ -1980,17 +2009,17 @@ mod tests {
             let body = body_reply.body.as_mut().unwrap();
             body.clear();
             body.resize(size * 8, b'\n');
-            assert_eq!(contract::check_refused(&body_reply), Error::Unwritable);
+            assert_eq!(assert_write(&body_reply).unwrap_err(), Error::Unwritable);
             text_reply.text.clear();
             text_reply.text.extend(std::iter::repeat_n('t', size));
-            assert_eq!(contract::check_refused(&text_reply), Error::Unwritable);
+            assert_eq!(assert_write(&text_reply).unwrap_err(), Error::Unwritable);
             for request in &mut requests {
                 let (Request::Pass(text) | Request::User(text)) = request else {
                     unreachable!()
                 };
                 text.clear();
                 text.extend(std::iter::repeat_n('t', size));
-                assert_eq!(contract::check_refused(request), Error::Unwritable);
+                assert_eq!(assert_write(request).unwrap_err(), Error::Unwritable);
             }
         }
     }
@@ -2006,11 +2035,21 @@ mod tests {
             assert_eq!(Reply::parse(&body(n)).unwrap().lines().count(), n);
         }
         let (wire, body) = (wire(50_000), body(50_000));
-        contract::check_decode_with_alloc_limit(Inputs::new, &wire, 2 * (MAX_AUTH_LINE + 2));
-        contract::check_decode_with_alloc_limit(
-            || reply_reader(true),
-            &body,
-            2 * (MAX_AUTH_LINE + 2),
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Inputs::new()),
+                chunks(&wire, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * (MAX_AUTH_LINE + 2))
+            ),
+            decode_all(Inputs::new, &wire)
+        );
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(reply_reader(true)),
+                chunks(&body, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * (MAX_AUTH_LINE + 2))
+            ),
+            decode_all(|| reply_reader(true), &body)
         );
     }
 
@@ -2026,7 +2065,14 @@ mod tests {
                 Ok(Input::Command(command(b"QUIT").unwrap()))
             ]
         );
-        contract::check_decode_with_alloc_limit(Inputs::new, &wire, 2 * (MAX_AUTH_LINE + 2));
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Inputs::new()),
+                chunks(&wire, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * (MAX_AUTH_LINE + 2))
+            ),
+            decode_all(Inputs::new, &wire)
+        );
         for multi in [false, true] {
             let make = || {
                 let mut r = reply_reader(multi);
@@ -2038,16 +2084,30 @@ mod tests {
                 decode_all(make, &wire).1,
                 Some(Fail::Protocol(FrameError::Line(_)))
             ));
-            contract::check_decode_with_alloc_limit(make, &wire, 2 * (MAX_AUTH_LINE + 2));
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(make()),
+                    chunks(&wire, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * (MAX_AUTH_LINE + 2))
+                ),
+                decode_all(make, &wire)
+            );
         }
         let many = b"NOOP\r\n".repeat(1 << 17);
-        contract::check_decode_with_alloc_limit(Inputs::new, &many, 2 * (MAX_AUTH_LINE + 2));
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Inputs::new()),
+                chunks(&many, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * (MAX_AUTH_LINE + 2))
+            ),
+            decode_all(Inputs::new, &many)
+        );
     }
 
     #[test]
     fn bodies_that_do_not_fit_are_refused_not_cut() {
         let line = [vec![b'b'; MAX_DATA_LINE - 2], b"\r\n".to_vec()].concat();
-        assert_cases!(|input| contract::check_refused(input);
+        assert_cases!(|input| assert_write(input).unwrap_err();
             long_data_line: &Reply::ok("1 message")
                 .with_body([vec![b'a'; MAX_DATA_LINE], b"\r\n".to_vec()].concat()) => Error::Unwritable,
             long_body: &Reply::ok("").with_body(line.repeat(MAX_BODY / line.len() + 1)) => Error::Unwritable,
@@ -2076,7 +2136,7 @@ mod tests {
         assert_eq!(request(b"TOP 1 2 3 "), Err(Error::ArgumentSpacing));
         assert_eq!(request(b"USER a b c d"), Err(Error::ExtraArgument));
         assert_eq!(
-            contract::check_refused(&Reply::err("").with_code(&"A".repeat(rounds(16 << 20)))),
+            assert_write(&Reply::err("").with_code(&"A".repeat(rounds(16 << 20)))).unwrap_err(),
             Error::Unwritable
         );
         let reply = Reply::ok("").with_body(b"a\nb\r\nc".to_vec());
@@ -2089,7 +2149,7 @@ mod tests {
     #[test]
     fn credentials_are_written_unchanged() {
         assert_eq!(
-            contract::check_refused(&Request::Pass("p".repeat(249))),
+            assert_write(&Request::Pass("p".repeat(249))).unwrap_err(),
             Error::Unwritable
         );
         for request in [
@@ -2104,7 +2164,7 @@ mod tests {
                 Request::parse(&request.to_bytes().unwrap()),
                 Ok(request.clone())
             );
-            contract::check_wire_value(&request);
+            let _ = assert_write(&request);
         }
     }
 
@@ -2120,7 +2180,7 @@ mod tests {
             "aé".into(),
         ] {
             assert_eq!(
-                contract::check_refused(&UniqueIdListing { message: n(1), id }),
+                assert_write(&UniqueIdListing { message: n(1), id }).unwrap_err(),
                 Error::Unwritable
             );
         }
@@ -2141,14 +2201,13 @@ mod tests {
         assert_eq!(reply.text.len(), 499);
         assert_eq!(reply.to_bytes().unwrap(), wire);
         assert_eq!(
-            contract::check_refused(
-                &Reply::err(&format!(" {}", "y".repeat(498))).with_code("AUTH")
-            ),
+            assert_write(&Reply::err(&format!(" {}", "y".repeat(498))).with_code("AUTH"))
+                .unwrap_err(),
             Error::Unwritable
         );
         for text in [" more", "more", "é"] {
             assert_eq!(
-                contract::check_refused(&Reply::ok(text).with_code(&"A".repeat(MAX_CODE - 1))),
+                assert_write(&Reply::ok(text).with_code(&"A".repeat(MAX_CODE - 1))).unwrap_err(),
                 Error::Unwritable
             );
         }
@@ -2158,13 +2217,15 @@ mod tests {
             Reply::ok(&"t".repeat(508)),
             Reply::err("x").with_body(vec![]),
         ] {
-            assert_eq!(contract::check_refused(&reply), Error::Unwritable);
+            assert_eq!(assert_write(&reply).unwrap_err(), Error::Unwritable);
         }
         assert_eq!(
             Reply::ok(&"t".repeat(506)).to_bytes().unwrap().len(),
             MAX_REPLY_LINE
         );
-        contract::check_wire::<Reply>(&wire);
+        if let Ok(value) = Reply::parse(&wire) {
+            assert_write(&value).unwrap();
+        }
     }
 
     #[test]
@@ -2208,7 +2269,14 @@ mod tests {
             decode_all(make, &long).1,
             Some(Fail::Protocol(FrameError::Line(_)))
         ));
-        contract::check_decode_with_alloc_limit(make, &long, 2 * (MAX_AUTH_LINE + 2));
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(make()),
+                chunks(&long, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * (MAX_AUTH_LINE + 2))
+            ),
+            decode_all(make, &long)
+        );
     }
 
     #[test]
@@ -2270,23 +2338,43 @@ mod tests {
             for _ in 0..rng.index(5) {
                 mutate(&mut rng, &mut data);
             }
-            contract::check_decode_with_alloc_limit(Inputs::new, &data, 2 * (MAX_AUTH_LINE + 2));
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Inputs::new()),
+                    chunks(&data, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * (MAX_AUTH_LINE + 2))
+                ),
+                decode_all(Inputs::new, &data)
+            );
             for multi in [false, true] {
-                contract::check_decode_with_alloc_limit(
-                    || reply_reader(multi),
-                    &data,
-                    2 * (MAX_AUTH_LINE + 2),
+                assert_eq!(
+                    decode_chunks(
+                        &mut Stream::new(reply_reader(multi)),
+                        chunks(&data, &[1, 7, 64]),
+                        |s| assert!(s.allocated() <= 2 * (MAX_AUTH_LINE + 2))
+                    ),
+                    decode_all(|| reply_reader(multi), &data)
                 );
             }
-            contract::check_wire::<Command>(&data);
-            contract::check_wire::<Request>(&data);
-            contract::check_wire::<Reply>(&data);
-            contract::check_wire::<ScanListing>(&data);
-            contract::check_wire::<UniqueIdListing>(&data);
+            if let Ok(value) = Command::parse(&data) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = Request::parse(&data) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = Reply::parse(&data) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = ScanListing::parse(&data) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = UniqueIdListing::parse(&data) {
+                assert_write(&value).unwrap();
+            }
             let text = rng.text(530);
             let other = rng.text(530);
-            contract::check_wire_value(&command_fixture(rng.text(8), Some(text.clone())));
-            contract::check_wire_value(&Reply {
+            let _ = assert_write(&command_fixture(rng.text(8), Some(text.clone())));
+            let _ = assert_write(&Reply {
                 ok: rng.coin(),
                 code: rng.coin().then(|| other.clone()),
                 text: text.clone(),
@@ -2297,13 +2385,13 @@ mod tests {
                 Request::Pass(other.clone()),
                 request_apop(text, [rng.next() as u8; 16]),
             ] {
-                contract::check_wire_value(&request);
+                let _ = assert_write(&request);
             }
-            contract::check_wire_value(&UniqueIdListing {
+            let _ = assert_write(&UniqueIdListing {
                 message: n(1),
                 id: other,
             });
-            contract::check_wire_value(&ScanListing {
+            let _ = assert_write(&ScanListing {
                 message: n(1),
                 octets: (rng.next() << 33) | (rng.next() << 2) | rng.below(4),
             });

@@ -1337,9 +1337,10 @@ mod tests {
     use super::*;
     use fictionet::assert_cases;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream, finish, pump};
-    use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::rounds;
-    use fictionet::stdlib::test_support::{decode_all, mutate};
+    use fictionet::stdlib::test_support::{
+        assert_write, chunks, decode_all, decode_chunks, mutate,
+    };
 
     fn event_negotiation(verb: Verb, option: u8) -> Event {
         Event::Negotiation { verb, option }
@@ -1490,7 +1491,7 @@ mod tests {
             let mut out = vec![7];
             assert_eq!(sub.write(&mut out), Err(Error::Unwritable));
             assert_eq!(out, [7]);
-            contract::check_wire_value(&sub);
+            let _ = assert_write(&sub);
         }
     }
 
@@ -1626,7 +1627,7 @@ mod tests {
     fn writers_refuse_values_that_would_change() {
         for name in ["xterm\t256color", "", "é", &"A".repeat(100)] {
             let sub = Subnegotiation::TerminalTypeIs(name.into());
-            contract::check_wire_value(&sub);
+            let _ = assert_write(&sub);
             assert_eq!(sub.to_bytes(), Err(Error::Unwritable));
         }
         let sub = Subnegotiation::TerminalTypeIs("MTTS 137".into());
@@ -1743,11 +1744,21 @@ mod tests {
     #[test]
     fn partitions_and_prefixes_obey_contract() {
         let bytes = sample();
-        contract::check_decode_with_alloc_limit(Events::new, &bytes, 2 * MAX_EVENT_WIRE);
-        contract::check_decode_with_alloc_limit(
-            || Events::with_limit(MAX_DATA),
-            &bytes,
-            2 * MAX_EVENT_WIRE,
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Events::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_EVENT_WIRE)
+            ),
+            decode_all(Events::new, &bytes)
+        );
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Events::with_limit(MAX_DATA)),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_EVENT_WIRE)
+            ),
+            decode_all(|| Events::with_limit(MAX_DATA), &bytes)
         );
         let whole = decode(&bytes);
         for cut in 0..=bytes.len() {
@@ -2125,11 +2136,31 @@ mod tests {
                 decoder.set_binary(binary);
                 decoder
             };
-            contract::check_decode_with_alloc_limit(make, &bytes, 2 * MAX_EVENT_WIRE);
-            contract::check_decode_with_held_limit(make, &bytes, 0);
-            contract::check_wire::<Event>(&bytes);
-            contract::check_wire::<BinaryEvent>(&bytes);
-            contract::check_wire::<Subnegotiation>(&bytes);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(make()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_EVENT_WIRE)
+                ),
+                decode_all(make, &bytes)
+            );
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(make()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |s| assert_eq!(s.held(), 0)
+                ),
+                decode_all(make, &bytes)
+            );
+            if let Ok(value) = Event::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = BinaryEvent::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = Subnegotiation::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
             let (events, _) = decode_all(make, &bytes);
             let kept: Vec<_> = events
                 .into_iter()
@@ -2139,17 +2170,17 @@ mod tests {
             for event in &kept {
                 if binary {
                     let event = BinaryEvent(event.clone());
-                    contract::check_wire_value(&event);
+                    let _ = assert_write(&event);
                     event.write(&mut written).unwrap();
                 } else {
-                    contract::check_wire_value(event);
+                    let _ = assert_write(event);
                     event.write(&mut written).unwrap();
                 }
                 if let Event::Subnegotiation { option, data } = event
                     && let Ok(sub) = Subnegotiation::parse_data(*option, data)
                 {
                     assert_eq!(sub.to_event().unwrap(), *event);
-                    contract::check_wire_value(&sub);
+                    let _ = assert_write(&sub);
                 }
             }
             let (back, failure) = decode_all(make, &written);
@@ -2157,18 +2188,18 @@ mod tests {
             assert_eq!(merged(back), merged(kept));
             for option in [option::TERMINAL_TYPE, option::NAWS, option::LINEMODE] {
                 if let Ok(sub) = Subnegotiation::parse_data(option, &bytes) {
-                    contract::check_wire_value(&sub);
+                    let _ = assert_write(&sub);
                     assert_eq!(
                         sub.to_event().unwrap(),
                         event_subnegotiation(option, bytes.clone())
                     );
                 }
-                contract::check_wire_value(&Subnegotiation::Other {
+                let _ = assert_write(&Subnegotiation::Other {
                     option,
                     data: bytes.clone(),
                 });
             }
-            contract::check_wire_value(&Subnegotiation::TerminalTypeIs(
+            let _ = assert_write(&Subnegotiation::TerminalTypeIs(
                 String::from_utf8_lossy(&bytes).into_owned(),
             ));
         }

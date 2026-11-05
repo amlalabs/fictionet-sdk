@@ -3394,31 +3394,51 @@ pub mod harness {
     use super::{
         Login7, Message, Messages, Packet, Prelogin, SqlBatch, TokenReader, TokenStream, Version,
     };
-    use fictionet::stdlib::codec::{Decode, Wire};
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::codec::{Decode, Stream, Wire};
+    use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
 
     /// Checks payload codecs and message assembly under the supplied data limit.
     pub fn check_payload(bytes: &[u8], limit: usize) {
-        let (messages, _) = contract::check_decode_limits(
-            || Messages::with_limit(limit),
-            bytes,
-            limit,
-            2 * Messages::with_limit(limit).capacity(),
+        let alloc = 2 * Messages::with_limit(limit).capacity();
+        let decoded = decode_all(|| Messages::with_limit(limit), bytes);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Messages::with_limit(limit)),
+                chunks(bytes, &[1, 7, 64]),
+                |s| {
+                    assert!(s.held() <= limit);
+                    assert!(s.allocated() <= alloc);
+                }
+            ),
+            decoded
         );
+        let (messages, _) = decoded;
         for message in messages {
             assert!(
                 message.data.len() <= limit,
                 "message data exceeds named limit"
             );
             assert!(message.to_bytes().is_ok(), "{message:?}");
-            contract::check_wire_value(&message);
+            let _ = assert_write(&message);
         }
-        contract::check_wire::<Prelogin>(bytes);
-        contract::check_wire::<Login7>(bytes);
-        contract::check_wire::<Version>(bytes);
-        contract::check_wire::<Packet>(bytes);
-        contract::check_wire::<Message>(bytes);
-        contract::check_wire::<TokenStream>(bytes);
+        if let Ok(value) = Prelogin::parse(bytes) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Login7::parse(bytes) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Version::parse(bytes) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Packet::parse(bytes) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Message::parse(bytes) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = TokenStream::parse(bytes) {
+            assert_write(&value).unwrap();
+        }
         for all_headers in [true, false] {
             if let Ok(batch) = SqlBatch::parse(bytes, all_headers) {
                 assert_eq!(
@@ -3430,7 +3450,7 @@ pub mod harness {
         let tokens: Vec<_> = TokenReader::new(bytes).map_while(Result::ok).collect();
         let stream = TokenStream(tokens);
         assert!(stream.to_bytes().is_ok(), "{stream:?}");
-        contract::check_wire_value(&stream);
+        let _ = assert_write(&stream);
     }
 }
 
@@ -3445,10 +3465,11 @@ mod tests {
 
     use super::*;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream};
-    use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::hex;
     use fictionet::stdlib::test_support::rounds;
-    use fictionet::stdlib::test_support::{decode_all, mutate};
+    use fictionet::stdlib::test_support::{
+        assert_write, chunks, decode_all, decode_chunks, mutate,
+    };
 
     // Examples from MS-TDS section 4.
 
@@ -3947,7 +3968,14 @@ mod tests {
                 Ok(Step::Need)
             );
         }
-        contract::check_decode_with_alloc_limit(Messages::new, &bytes, 2 * MAX_PACKET);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Messages::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_PACKET)
+            ),
+            decode_all(Messages::new, &bytes)
+        );
         assert_eq!(one_message(&bytes), m);
         let empty = Message::new(packet_type::ATTENTION, vec![]);
         assert_eq!(empty.to_bytes().unwrap(), [6, 1, 0, 8, 0, 0, 1, 0]);
@@ -4004,7 +4032,14 @@ mod tests {
             Some(Fail::Protocol(Error::Incomplete))
         );
         for bytes in [&changed[..], &oversized, &incomplete] {
-            contract::check_decode_with_alloc_limit(|| Messages::with_limit(10), bytes, 36);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Messages::with_limit(10)),
+                    chunks(bytes, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 36)
+                ),
+                decode_all(|| Messages::with_limit(10), bytes)
+            );
         }
         for error in [
             Error::Length(1),
@@ -4566,7 +4601,7 @@ mod tests {
         p.options.swap(0, 1);
         assert_eq!(p.to_bytes(), Err(Error::Unwritable));
         p.set(prelogin_option::VERSION, vec![1, 2, 3, 0, 0, 0]);
-        contract::check_wire_value(&p);
+        let _ = assert_write(&p);
         assert_eq!(Prelogin::default().to_bytes(), Err(Error::Unwritable));
     }
 
@@ -4802,10 +4837,13 @@ mod tests {
         let (messages, failure) = decode_all(|| Messages::with_limit(600), &bytes);
         assert_eq!(failure, None);
         assert_eq!(messages.len(), 400);
-        contract::check_decode_with_alloc_limit(
-            || Messages::with_limit(600),
-            &bytes,
-            2 * (600 + HEADER_LEN),
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Messages::with_limit(600)),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * (600 + HEADER_LEN))
+            ),
+            decode_all(|| Messages::with_limit(600), &bytes)
         );
     }
 
@@ -4827,7 +4865,7 @@ mod tests {
         assert_eq!(tokens.write(&mut out), Err(Error::Unwritable));
         assert_eq!(out, [7]);
         tokens.0[1] = Token::Row(vec![Value::Bytes(vec![1; 1000])]);
-        contract::check_wire_value(&tokens);
+        let _ = assert_write(&tokens);
     }
 
     /// MS-TDS 2.2.5.6: a value may not be longer than its column says.
@@ -5614,10 +5652,13 @@ mod tests {
                 }
             }
             harness::check_payload(&stream, 64);
-            contract::check_decode_with_alloc_limit(
-                || Frames::<Packet>::with_limit(64),
-                &stream,
-                128,
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Frames::<Packet>::with_limit(64)),
+                    chunks(&stream, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 128)
+                ),
+                decode_all(|| Frames::<Packet>::with_limit(64), &stream)
             );
         }
     }

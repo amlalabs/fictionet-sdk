@@ -1016,22 +1016,41 @@ pub mod harness {
     use super::{
         Error, ErrorTpdu, MAX_MESSAGE, Reassembler, Tpdu, messages, over_tpkt, segment, tpdus,
     };
-    use fictionet::stdlib::codec::{Frames, Wire};
+    use fictionet::stdlib::codec::{Frames, Stream, Wire};
     use fictionet::stdlib::protocols::tpkt;
-    use fictionet::stdlib::test_support::{contract, decode_all};
+    use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
 
     /// Checks decoder and writer contracts, TPDU round trips, connection
     /// confirms, error replies, and segment reassembly. `message_limit` bounds
     /// message decoding and retained TPDU data.
     pub fn check_buffer(data: &[u8], message_limit: usize) {
-        contract::check_decode(Frames::<tpkt::Packet>::new, data);
-        contract::check_decode(|| tpdus(tpkt::MAX_PACKET), data);
-        contract::check_decode_with_held_limit(
-            || messages(tpkt::MAX_PACKET, message_limit),
-            data,
-            message_limit,
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<tpkt::Packet>::new()),
+                chunks(data, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(Frames::<tpkt::Packet>::new, data)
         );
-        contract::check_wire::<Tpdu>(data);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(tpdus(tpkt::MAX_PACKET)),
+                chunks(data, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(|| tpdus(tpkt::MAX_PACKET), data)
+        );
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(messages(tpkt::MAX_PACKET, message_limit)),
+                chunks(data, &[1, 7, 64]),
+                |s| assert!(s.held() <= message_limit)
+            ),
+            decode_all(|| messages(tpkt::MAX_PACKET, message_limit), data)
+        );
+        if let Ok(value) = Tpdu::parse(data) {
+            assert_write(&value).unwrap();
+        }
         let (packets, _) = decode_all(Frames::<tpkt::Packet>::new, data);
 
         let mut messages = Reassembler::with_limit(message_limit);
@@ -1041,17 +1060,18 @@ pub mod harness {
             .map(|packet| packet.payload.as_slice())
             .chain([data])
         {
-            contract::check_wire::<Tpdu>(payload);
+            if let Ok(value) = Tpdu::parse(payload) {
+                assert_write(&value).unwrap();
+            }
             let packet = tpkt::Packet::new(payload.to_vec());
-            contract::check_wire_value(&packet);
+            let _ = assert_write(&packet);
             let parsed = Tpdu::parse(payload);
             // These check the documented delegation to Tpdu::parse.
             assert_eq!(parsed, <Tpdu as Wire>::parse(payload));
             assert_eq!(parsed, over_tpkt::tpdu(&packet));
             match parsed {
                 Ok(t) => {
-                    contract::check_wire_value(&t);
-                    let bytes = t.to_bytes().unwrap();
+                    let bytes = assert_write(&t).unwrap();
                     assert_eq!(Tpdu::parse(&bytes), Ok(t.clone()), "{payload:?}");
                     let bytes = over_tpkt::from_tpdu(&t).unwrap().to_bytes().unwrap();
                     let (packet, used) = tpkt::Packet::parse_prefix(&bytes).unwrap().unwrap();
@@ -1111,7 +1131,7 @@ mod codec_tests {
     use super::*;
     use fictionet::stdlib::codec::{AssembleError, Assembled, Fail, Stream, finish, pump};
     use fictionet::stdlib::test_support;
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
 
     fn strict_packet(tpdu: &Tpdu) -> tpkt::Packet {
         tpkt::Packet {
@@ -1318,7 +1338,14 @@ mod codec_tests {
             let mut rng = fictionet::stdlib::codec::Lcg::new(seed);
             check(test_support::random_chunks(&wire, &mut rng, 199).collect());
         }
-        contract::check_decode_with_held_limit(|| messages(132, 1024), &wire, 1024);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(messages(132, 1024)),
+                chunks(&wire, &[1, 7, 64]),
+                |s| assert!(s.held() <= 1024)
+            ),
+            decode_all(|| messages(132, 1024), &wire)
+        );
 
         // The message writer uses the same packet and TPDU layers.
         let written = over_tpkt::write_message(&message, 128).unwrap();
@@ -1392,8 +1419,22 @@ mod codec_tests {
                 Assembled::Message(b"ab".to_vec()),
             ]
         );
-        contract::check_decode(|| tpdus(tpkt::MAX_PACKET), &wire);
-        contract::check_decode_with_held_limit(|| messages(tpkt::MAX_PACKET, 2), &wire, 2);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(tpdus(tpkt::MAX_PACKET)),
+                chunks(&wire, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(|| tpdus(tpkt::MAX_PACKET), &wire)
+        );
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(messages(tpkt::MAX_PACKET, 2)),
+                chunks(&wire, &[1, 7, 64]),
+                |s| assert!(s.held() <= 2)
+            ),
+            decode_all(|| messages(tpkt::MAX_PACKET, 2), &wire)
+        );
     }
 
     #[test]
@@ -1416,7 +1457,14 @@ mod codec_tests {
             assert_eq!(stream.next(), Some(Err(error.clone())));
             assert_eq!(stream.next(), None);
             assert_eq!(stream.failed(), Some(&error));
-            contract::check_decode_with_held_limit(|| messages(tpkt::MAX_PACKET, 3), &wire, 3);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(messages(tpkt::MAX_PACKET, 3)),
+                    chunks(&wire, &[1, 7, 64]),
+                    |s| assert!(s.held() <= 3)
+                ),
+                decode_all(|| messages(tpkt::MAX_PACKET, 3), &wire)
+            );
         }
         let mut wire = Vec::new();
         for eot in [false, true] {
@@ -1435,7 +1483,14 @@ mod codec_tests {
         assert_eq!(stream.held(), 2);
         assert_eq!(stream.next(), None);
         assert_eq!(stream.failed(), Some(&error));
-        contract::check_decode_with_held_limit(|| messages(tpkt::MAX_PACKET, 3), &wire, 3);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(messages(tpkt::MAX_PACKET, 3)),
+                chunks(&wire, &[1, 7, 64]),
+                |s| assert!(s.held() <= 3)
+            ),
+            decode_all(|| messages(tpkt::MAX_PACKET, 3), &wire)
+        );
 
         let empty = Tpdu::Data(Data {
             eot: true,
@@ -1508,7 +1563,7 @@ mod codec_tests {
             }),
         ];
         for value in invalid {
-            contract::check_wire_value(&value);
+            let _ = assert_write(&value);
             let mut out = vec![0x55, 0xaa];
             assert_eq!(value.write(&mut out), Err(Error::Unwritable));
             assert_eq!(out, [0x55, 0xaa]);
@@ -1540,7 +1595,9 @@ mod codec_tests {
             }),
         ] {
             let bytes = Wire::to_bytes(&value).unwrap();
-            contract::check_wire::<Tpdu>(&bytes);
+            if let Ok(value) = Tpdu::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
             assert_eq!(<Tpdu as Wire>::parse(&bytes), Ok(value));
         }
     }
@@ -1562,7 +1619,7 @@ mod codec_tests {
             let mut out = vec![0x55];
             assert_eq!(tpdu.write(&mut out), Err(Error::Unwritable));
             assert_eq!(out, [0x55]);
-            contract::check_wire_value(&tpdu);
+            let _ = assert_write(&tpdu);
         }
     }
 }
@@ -1571,11 +1628,11 @@ mod codec_tests {
 mod tests {
     use super::*;
     use fictionet::assert_cases;
-    use fictionet::stdlib::codec::Lcg;
-    use fictionet::stdlib::codec::{Fail, Stream, pump};
+    use fictionet::stdlib::codec::{Fail, pump};
+    use fictionet::stdlib::codec::{Lcg, Stream};
     use fictionet::stdlib::test_support;
-    use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::rounds;
+    use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
     use tpkt::{MAX_PACKET, MAX_PAYLOAD, Packet};
 
     fn parameter(code: u8, value: Vec<u8>) -> Parameter {
@@ -1671,10 +1728,13 @@ mod tests {
             rng.fill(&mut message);
             for tpdu_size in [0usize, 128, 1024, 8192, MAX_PAYLOAD, usize::MAX] {
                 let bytes = over_tpkt::write_message(&message, tpdu_size).unwrap();
-                contract::check_decode_with_alloc_limit(
-                    Frames::<tpkt::Packet>::new,
-                    &bytes,
-                    2 * MAX_PACKET,
+                assert_eq!(
+                    decode_chunks(
+                        &mut Stream::new(Frames::<tpkt::Packet>::new()),
+                        chunks(&bytes, &[1, 7, 64]),
+                        |s| assert!(s.allocated() <= 2 * MAX_PACKET)
+                    ),
+                    decode_all(Frames::<tpkt::Packet>::new, &bytes)
                 );
                 let (packets, err) = test_support::decode_all(Frames::<tpkt::Packet>::new, &bytes);
                 assert_eq!(err, None);
@@ -2238,7 +2298,14 @@ mod tests {
             .to_bytes()
             .unwrap();
         let bytes: Vec<u8> = a.iter().chain(&b).copied().collect();
-        contract::check_decode(Frames::<tpkt::Packet>::new, &bytes);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<tpkt::Packet>::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(Frames::<tpkt::Packet>::new, &bytes)
+        );
         let mut stream = Stream::new(Frames::<tpkt::Packet>::new());
         let mut got = Vec::new();
         pump(&mut stream, &bytes, |packet| got.push(packet.payload)).unwrap();
@@ -2379,10 +2446,13 @@ mod tests {
         let one = packet.to_bytes().unwrap();
         let mut bytes = one.repeat(1000);
         bytes.extend_from_slice(&one[..10]);
-        contract::check_decode_with_alloc_limit(
-            Frames::<tpkt::Packet>::new,
-            &bytes,
-            2 * tpkt::MAX_PACKET,
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<tpkt::Packet>::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * tpkt::MAX_PACKET)
+            ),
+            decode_all(Frames::<tpkt::Packet>::new, &bytes)
         );
         let mut stream = Stream::new(Frames::<tpkt::Packet>::new());
         let mut count = 0;
@@ -2479,7 +2549,7 @@ mod tests {
                     variable,
                 }),
             };
-            contract::check_wire_value(&t);
+            let _ = assert_write(&t);
             let Ok(packet) = over_tpkt::from_tpdu(&t) else {
                 continue;
             };

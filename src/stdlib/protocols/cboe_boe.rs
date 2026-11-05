@@ -3477,12 +3477,11 @@ fn value(id: FieldId, fcx: &Context<'_>) -> Option<Opt> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{Fail, Lcg};
-    use fictionet::stdlib::test_support::contract::{
-        check_decode, check_decode_with_alloc_limit, check_wire, check_wire_value, check_written,
-    };
+    use fictionet::stdlib::codec::{Fail, Lcg, Stream};
     use fictionet::stdlib::test_support::hex;
-    use fictionet::stdlib::test_support::{decode_all, mutate};
+    use fictionet::stdlib::test_support::{
+        assert_write, chunks, decode_all, decode_chunks, mutate,
+    };
 
     fn header(unit: u8, sequence: u32) -> Header {
         Header { unit, sequence }
@@ -3508,12 +3507,16 @@ mod tests {
     fn inbound(bytes: &[u8], want: Inbound) {
         assert_eq!(Inbound::parse(bytes).unwrap(), want);
         assert_eq!(want.to_bytes().unwrap(), bytes);
-        check_wire::<Inbound>(bytes);
+        if let Ok(value) = Inbound::parse(bytes) {
+            assert_write(&value).unwrap();
+        }
     }
     fn outbound(bytes: &[u8], want: Outbound) {
         assert_eq!(Outbound::parse(bytes).unwrap(), want);
         assert_eq!(want.to_bytes().unwrap(), bytes);
-        check_wire::<Outbound>(bytes);
+        if let Ok(value) = Outbound::parse(bytes) {
+            assert_write(&value).unwrap();
+        }
     }
     fn returns(fields: Vec<Opt>) -> Optional<ReturnTable> {
         let mut o = Optional::new();
@@ -3597,7 +3600,9 @@ mod tests {
         assert_eq!(r.tail.units[3].sequence, 41_337);
         assert_eq!(r.tail.groups.0.len(), 3);
         assert_eq!(Outbound::from(r).to_bytes().unwrap(), bytes);
-        check_wire::<Outbound>(&bytes);
+        if let Ok(value) = Outbound::parse(&bytes) {
+            assert_write(&value).unwrap();
+        }
     }
 
     // "Logout Response Message Example". Its MessageLength reads 55 00
@@ -3750,7 +3755,9 @@ mod tests {
         };
         assert_eq!(p.purge.fields.symbol(), Some(text("ABCDE")));
         assert!(p.purge.risk_group_ids.is_empty());
-        check_wire::<Inbound>(&bytes);
+        if let Ok(value) = Inbound::parse(&bytes) {
+            assert_write(&value).unwrap();
+        }
     }
 
     #[test]
@@ -4096,7 +4103,7 @@ mod tests {
             }]),
             ..LoginRequest::default()
         };
-        check_wire_value(&Inbound::from(login));
+        let _ = assert_write(&Inbound::from(login));
         let purge = PurgeOrders {
             purge: PurgeFields {
                 fields: Optional::new(),
@@ -4122,9 +4129,30 @@ mod tests {
         MassCancelAcknowledgment::default()
             .write(&mut bytes)
             .unwrap();
-        check_decode(Frames::<Outbound>::default, &bytes);
-        check_decode(|| Frames::<Outbound>::with_limit(12), &bytes);
-        check_decode_with_alloc_limit(Frames::<Outbound>::default, &bytes, 2 * MAX_MESSAGE);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Outbound>::default()),
+                chunks(&bytes, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(Frames::<Outbound>::default, &bytes)
+        );
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Outbound>::with_limit(12)),
+                chunks(&bytes, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(|| Frames::<Outbound>::with_limit(12), &bytes)
+        );
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Outbound>::default()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_MESSAGE)
+            ),
+            decode_all(Frames::<Outbound>::default, &bytes)
+        );
         let (items, failure) = decode_all(Frames::<Outbound>::default, &bytes);
         assert!(failure.is_none());
         assert_eq!(items.len(), 5);
@@ -4148,7 +4176,14 @@ mod tests {
         bytes[4] = 0x99;
         assert_eq!(Inbound::parse(&bytes), Err(Error::Type(0x99)));
         good.write(&mut bytes).unwrap();
-        check_decode(Frames::<Inbound>::default, &bytes);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Inbound>::default()),
+                chunks(&bytes, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(Frames::<Inbound>::default, &bytes)
+        );
         assert_eq!(
             decode_all(Frames::<Inbound>::default, &bytes),
             (vec![Err(Error::Type(0x99)), Ok(good)], None)
@@ -4463,7 +4498,7 @@ mod tests {
                 }
                 for action in &actions {
                     if let Action::Send(message) = action {
-                        check_written(message);
+                        assert_write(message).unwrap();
                     }
                 }
                 let Action::Send(Outbound::LoginResponse(response)) = &actions[0] else {
@@ -4530,7 +4565,7 @@ mod tests {
                 else {
                     panic!("missing login refusal")
                 };
-                assert_eq!(check_written(response).len(), MAX_MESSAGE);
+                assert_eq!(assert_write(response).unwrap().len(), MAX_MESSAGE);
                 assert_ne!(response.status, b'A');
                 assert_eq!(response.tail.groups, request.params);
                 assert!(response.tail.units.is_empty());
@@ -4710,7 +4745,7 @@ mod tests {
                 Opt::ClearingAccount(Text::default()),
             ]
         );
-        check_wire_value(&Outbound::from(ack));
+        let _ = assert_write(&Outbound::from(ack));
         assert_eq!(x.accept(id, 2, 2), Err(Error::UnknownOrder(id)));
         // Fill 100: ClearingFirm, ClearingAccount, OrderQty, LeavesQty.
         let Outbound::OrderExecution(e) = x.execute(id, 100, Price(99_000), b'A', 3).unwrap()
@@ -4821,11 +4856,11 @@ mod tests {
                     x.receive(&good("A1", 300), 1),
                     [Action::Event(OrderEvent::NewOrderRequested(id))]
                 );
-                check_written(&x.accept(id, 2, 2).unwrap());
+                assert_write(&x.accept(id, 2, 2).unwrap()).unwrap();
                 let shares = if completed { 300 } else { 100 };
-                check_written(&x.execute(id, shares, Price(99_000), b'A', 3).unwrap());
+                assert_write(&x.execute(id, shares, Price(99_000), b'A', 3).unwrap()).unwrap();
                 if !completed {
-                    check_written(&x.cancel(id, codes::reason::USER_REQUESTED, 4).unwrap());
+                    assert_write(&x.cancel(id, codes::reason::USER_REQUESTED, 4).unwrap()).unwrap();
                 }
                 assert!(x.order(id).is_none());
                 if reused {
@@ -4843,11 +4878,11 @@ mod tests {
                         ),
                         5,
                     );
-                    check_written(&x.accept(id, 3, 6).unwrap());
+                    assert_write(&x.accept(id, 3, 6).unwrap()).unwrap();
                 }
                 let before = x.order(id).cloned();
                 let bust = x.bust(1, Price(98_000), 7).unwrap();
-                check_written(&bust);
+                assert_write(&bust).unwrap();
                 assert_eq!(
                     bust,
                     TradeCancelOrCorrect {
@@ -4941,7 +4976,7 @@ mod tests {
                 fields.set(f).unwrap();
             }
             let bust = x.bust(2, Price(0), 8).unwrap();
-            check_written(&bust);
+            assert_write(&bust).unwrap();
             let Outbound::TradeCancelOrCorrect(t) = bust else {
                 panic!()
             };
@@ -5286,8 +5321,7 @@ mod tests {
             Outbound::KINDS
         );
         for m in &inbound {
-            check_wire_value(m);
-            let b = m.to_bytes().unwrap();
+            let b = assert_write(m).unwrap();
             assert_eq!(b.len(), m.wire_len());
             assert_eq!(
                 Inbound::fixed_of(m.kind()).map(|f| f <= b.len()),
@@ -5295,7 +5329,7 @@ mod tests {
             );
         }
         for m in &outbound {
-            check_wire_value(m);
+            let _ = assert_write(m);
             assert_eq!(m.to_bytes().unwrap().len(), m.wire_len());
         }
         // Every field in a table has a size and reads its zero value.
@@ -5320,15 +5354,23 @@ mod tests {
             for _ in 0..=rng.below(3) {
                 mutate(&mut rng, &mut bytes);
             }
-            check_wire::<Inbound>(&bytes);
-            check_wire::<Outbound>(&bytes);
-            check_wire::<NewOrder>(&bytes);
-            check_wire::<LoginResponse>(&bytes);
+            if let Ok(value) = Inbound::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = Outbound::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = NewOrder::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = LoginResponse::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
             if let Ok(m) = Inbound::parse(&bytes) {
                 let mut x = exchange();
                 for a in x.receive(&m, 0) {
                     if let Action::Send(out) = a {
-                        check_wire_value(&out);
+                        let _ = assert_write(&out);
                     }
                 }
                 let mut server = Server::new(Timers::default(), 0).unwrap();
@@ -5340,8 +5382,22 @@ mod tests {
             for _ in 0..=rng.below(4) {
                 mutate(&mut rng, &mut bytes);
             }
-            check_decode(Frames::<Inbound>::default, &bytes);
-            check_decode(Frames::<Outbound>::default, &bytes);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Frames::<Inbound>::default()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |_| {}
+                ),
+                decode_all(Frames::<Inbound>::default, &bytes)
+            );
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Frames::<Outbound>::default()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |_| {}
+                ),
+                decode_all(Frames::<Outbound>::default, &bytes)
+            );
         }
     }
 

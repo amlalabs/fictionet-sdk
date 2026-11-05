@@ -1556,7 +1556,7 @@ impl DataLevel {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::Lcg;
-    use fictionet::stdlib::test_support::{contract, rounds};
+    use fictionet::stdlib::test_support::{assert_write, rounds};
 
     // Keys and random numbers for hosts A (the initiator) and B (the
     // listener). The tokens, IDSNs and HMACs below were computed from
@@ -1581,7 +1581,7 @@ mod tests {
         assert_eq!(option[0], KIND);
         assert_eq!(usize::from(option[1]), option.len());
         assert_eq!(MptcpOption::parse(&option[2..]).as_ref(), Ok(value));
-        assert_eq!(contract::check_written(value), option[2..]);
+        assert_eq!(assert_write(value).unwrap(), option[2..]);
         for cut in 2..option.len() {
             assert_ne!(MptcpOption::parse(&option[2..cut]).as_ref(), Ok(value));
         }
@@ -1673,7 +1673,7 @@ mod tests {
         data.extend_from_slice(&[0, 1]);
         assert_eq!(MptcpOption::parse(&data), bad(24));
         assert_eq!(
-            contract::check_refused(&capable(0, 0x81, Keys::Absent)),
+            assert_write(&capable(0, 0x81, Keys::Absent)).unwrap_err(),
             Error::Unwritable
         );
         let data = Keys::Data {
@@ -1683,7 +1683,7 @@ mod tests {
             checksum: None,
         };
         assert_eq!(
-            contract::check_refused(&capable(0, 0x81, data)),
+            assert_write(&capable(0, 0x81, data)).unwrap_err(),
             Error::Unwritable
         );
     }
@@ -1813,7 +1813,7 @@ mod tests {
                             length += size(Some(m.data_sequence_number)) + 6;
                             length += if m.checksum.is_some() { 2 } else { 0 };
                         }
-                        let bytes = contract::check_written(&dss);
+                        let bytes = assert_write(&dss).unwrap();
                         assert_eq!(bytes.len() + 2, length, "{dss:?}");
                         assert!(length <= 28);
                     }
@@ -2064,7 +2064,7 @@ mod tests {
     fn writers_refuse_what_would_not_read_back() {
         for (version, flags) in [(16, 0x81), (1, 0x80), (1, 0x00)] {
             assert_eq!(
-                contract::check_refused(&capable(version, flags, Keys::Absent)),
+                assert_write(&capable(version, flags, Keys::Absent)).unwrap_err(),
                 Error::Unwritable
             );
         }
@@ -2075,17 +2075,17 @@ mod tests {
                 _ => unreachable!(),
             }
         });
-        assert_eq!(contract::check_refused(&wide), Error::Unwritable);
+        assert_eq!(assert_write(&wide).unwrap_err(), Error::Unwritable);
         let remove = |n| MptcpOption::RemoveAddr {
             address_ids: vec![1; n],
         };
-        assert_eq!(contract::check_refused(&remove(0)), Error::Unwritable);
+        assert_eq!(assert_write(&remove(0)).unwrap_err(), Error::Unwritable);
         assert_eq!(
-            contract::check_refused(&remove(MAX_REMOVE_IDS + 1)),
+            assert_write(&remove(MAX_REMOVE_IDS + 1)).unwrap_err(),
             Error::Unwritable
         );
         assert_eq!(
-            contract::check_written(&remove(MAX_REMOVE_IDS)).len() + 2,
+            assert_write(&remove(MAX_REMOVE_IDS)).unwrap().len() + 2,
             MAX_LEN
         );
     }
@@ -2199,20 +2199,24 @@ mod tests {
                     *b |= 1;
                 }
             }
-            contract::check_wire::<MptcpOption>(&data);
+            if let Ok(value) = MptcpOption::parse(&data) {
+                assert_write(&value).unwrap();
+            }
             if let Ok(value) = MptcpOption::parse(&data) {
                 parsed += 1;
                 assert_eq!(value.to_bytes().unwrap().len(), data.len());
             }
             for n in 0..data.len() {
-                contract::check_wire::<MptcpOption>(&data[..n]);
+                if let Ok(value) = MptcpOption::parse(&data[..n]) {
+                    assert_write(&value).unwrap();
+                }
             }
         }
         assert!(parsed > 1000, "{parsed}");
         // Built options: a write keeps the whole value or refuses it.
         for _ in 0..rounds(20_000) {
             let value = random_option(&mut rng);
-            contract::check_wire_value(&value);
+            let _ = assert_write(&value);
             if let Ok(bytes) = value.to_bytes() {
                 assert!(bytes.len() + 2 <= MAX_LEN);
                 assert_eq!(bytes[0] >> 4, value.subtype());

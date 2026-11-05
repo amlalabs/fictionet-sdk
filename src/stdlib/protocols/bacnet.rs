@@ -2150,10 +2150,10 @@ fictionet::codec_from!(Error, Trailing, |_| Error::TrailingBytes);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::codec::{Decode, Step};
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::codec::{Lcg, Stream};
     use fictionet::stdlib::test_support::hex;
+    use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
 
     fn value(bytes: &[u8]) -> Value {
         Value::parse(bytes).unwrap()
@@ -2428,7 +2428,7 @@ mod tests {
                 instance: u32::MAX,
             }),
         ] {
-            contract::check_wire_value(&value);
+            let _ = assert_write(&value);
             assert_eq!(value.to_bytes(), Err(Error::Unwritable));
         }
         // Bit strings of every length up to 17 round trip.
@@ -2474,7 +2474,7 @@ mod tests {
         let big = WhoIs {
             range: Some((0, u32::MAX)),
         };
-        contract::check_wire_value(&big);
+        let _ = assert_write(&big);
         assert_eq!(big.to_bytes(), Err(Error::Unwritable));
     }
 
@@ -2522,10 +2522,14 @@ mod tests {
         let mut bytes = vec![0; MAX_MESSAGE + 1];
         bytes[0] = NPDU_VERSION;
         assert_eq!(Npdu::parse(&bytes), Err(Error::TooLong));
-        contract::check_wire::<Npdu>(&bytes);
+        if let Ok(value) = Npdu::parse(&bytes) {
+            assert_write(&value).unwrap();
+        }
         bytes[0] = 0xff;
         assert_eq!(Npdu::parse(&bytes), Err(Error::TooLong));
-        contract::check_wire::<Npdu>(&bytes);
+        if let Ok(value) = Npdu::parse(&bytes) {
+            assert_write(&value).unwrap();
+        }
     }
 
     #[test]
@@ -2533,35 +2537,51 @@ mod tests {
         let mut bytes = vec![0; MAX_MESSAGE + 1];
         bytes[..2].copy_from_slice(&[0x10, unconfirmed::WHO_IS]);
         assert_eq!(Apdu::parse(&bytes), Err(Error::TooLong));
-        contract::check_wire::<Apdu>(&bytes);
+        if let Ok(value) = Apdu::parse(&bytes) {
+            assert_write(&value).unwrap();
+        }
         bytes[0] = 0xff;
         assert_eq!(Apdu::parse(&bytes), Err(Error::TooLong));
-        contract::check_wire::<Apdu>(&bytes);
+        if let Ok(value) = Apdu::parse(&bytes) {
+            assert_write(&value).unwrap();
+        }
     }
 
     #[test]
     fn prefix_readers_obey_bounded_decode_contracts() {
         use fictionet::stdlib::test_support::decode_all;
         let tags = [0x3e, 0x3f, 0xf9, 15];
-        contract::check_decode_with_alloc_limit(
-            Frames::<Tag>::new,
-            &tags,
-            2 * Frames::<Tag>::new().capacity(),
+        let alloc = 2 * Frames::<Tag>::new().capacity();
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Tag>::new()),
+                chunks(&tags, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= alloc)
+            ),
+            decode_all(Frames::<Tag>::new, &tags)
         );
         assert_eq!(decode_all(Frames::<Tag>::new, &tags).0.len(), 3);
         let values = ValueList(vec![Value::Real(72.3), Value::Unsigned(85)]);
         let bytes = values.to_bytes().unwrap();
-        contract::check_decode_with_alloc_limit(
-            Frames::<Value>::new,
-            &bytes,
-            2 * Frames::<Value>::new().capacity(),
+        let alloc = 2 * Frames::<Value>::new().capacity();
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Value>::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= alloc)
+            ),
+            decode_all(Frames::<Value>::new, &bytes)
         );
         assert_eq!(decode_all(Frames::<Value>::new, &bytes), (values.0, None));
         let oversized = [0x65, 255, 0xff, 0xff, 0xff, 0xff];
-        contract::check_decode_with_alloc_limit(
-            Frames::<Value>::new,
-            &oversized,
-            2 * Frames::<Value>::new().capacity(),
+        let alloc = 2 * Frames::<Value>::new().capacity();
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Value>::new()),
+                chunks(&oversized, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= alloc)
+            ),
+            decode_all(Frames::<Value>::new, &oversized)
         );
         assert!(Frames::<Value>::new().decode(&oversized, false).is_err());
     }
@@ -2890,7 +2910,7 @@ mod tests {
             }),
             ..Npdu::local(vec![])
         };
-        contract::check_wire_value(&n);
+        let _ = assert_write(&n);
         assert_eq!(n.to_bytes(), Err(Error::Unwritable));
         // A vendor on a standard message type is not written.
         let n = Npdu {
@@ -3012,7 +3032,7 @@ mod tests {
             },
             Bvlc::ReadFdtAck(vec![entry; 7000]),
         ] {
-            contract::check_wire_value(&value);
+            let _ = assert_write(&value);
             assert_eq!(value.to_bytes(), Err(Error::Unwritable));
         }
     }
@@ -3066,7 +3086,7 @@ mod tests {
         ] {
             assert_eq!(id.to_u32(), None);
             let value = Value::ObjectId(id);
-            contract::check_wire_value(&value);
+            let _ = assert_write(&value);
             assert_eq!(value.to_bytes(), Err(Error::Unwritable));
         }
     }
@@ -3313,7 +3333,7 @@ mod tests {
             ..Npdu::local(hex("10 08"))
         };
         assert_eq!(n.to_bytes(), Err(Error::Unwritable));
-        contract::check_wire_value(&n);
+        let _ = assert_write(&n);
     }
 
     #[test]
@@ -3323,7 +3343,7 @@ mod tests {
             "a".repeat(MAX_VALUE_LEN - 3) + "\u{1F600}",
         ] {
             let value = Value::CharacterString(CharString::utf8(&text));
-            contract::check_wire_value(&value);
+            let _ = assert_write(&value);
             assert_eq!(value.to_bytes(), Err(Error::Unwritable));
         }
         for charset in [3, 4] {
@@ -3331,7 +3351,7 @@ mod tests {
                 charset,
                 bytes: vec![0; MAX_VALUE_LEN + 8],
             });
-            contract::check_wire_value(&value);
+            let _ = assert_write(&value);
             assert_eq!(value.to_bytes(), Err(Error::Unwritable));
         }
     }
@@ -3352,7 +3372,7 @@ mod tests {
             segmentation: Segmentation::NoSegmentation,
             vendor: 15,
         };
-        contract::check_wire_value(&i_am);
+        let _ = assert_write(&i_am);
         assert_eq!(i_am.to_bytes(), Err(Error::Unwritable));
     }
 
@@ -3375,14 +3395,30 @@ mod tests {
     /// Reads `b` every way this module can, checking that what reads also
     /// writes and reads back the same.
     fn check(b: &[u8]) {
-        contract::check_wire::<Tag>(b);
-        contract::check_wire::<Value>(b);
-        contract::check_wire::<ValueList>(b);
-        contract::check_wire::<Bvlc>(b);
-        contract::check_wire::<Npdu>(b);
-        contract::check_wire::<Apdu>(b);
-        contract::check_wire::<WhoIs>(b);
-        contract::check_wire::<IAm>(b);
+        if let Ok(value) = Tag::parse(b) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Value::parse(b) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = ValueList::parse(b) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Bvlc::parse(b) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Npdu::parse(b) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Apdu::parse(b) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = WhoIs::parse(b) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = IAm::parse(b) {
+            assert_write(&value).unwrap();
+        }
 
         if let Ok(v) = Bvlc::parse(b) {
             assert_eq!(v.to_bytes().unwrap(), b);
@@ -3412,19 +3448,45 @@ mod tests {
         if let Ok(i) = IAm::parse(b) {
             assert_eq!(IAm::parse(&i.to_bytes().unwrap()), Ok(i));
         }
-        contract::check_wire::<ContextValue<0>>(b);
-        contract::check_wire::<ContextValue<1>>(b);
-        contract::check_wire::<ContextValue<2>>(b);
-        contract::check_wire::<ContextValue<3>>(b);
-        contract::check_wire::<ContextValue<4>>(b);
-        contract::check_wire::<ContextValue<5>>(b);
-        contract::check_wire::<ContextValue<6>>(b);
-        contract::check_wire::<ContextValue<7>>(b);
-        contract::check_wire::<ContextValue<8>>(b);
-        contract::check_wire::<ContextValue<9>>(b);
-        contract::check_wire::<ContextValue<10>>(b);
-        contract::check_wire::<ContextValue<11>>(b);
-        contract::check_wire::<ContextValue<12>>(b);
+        if let Ok(value) = <ContextValue<0>>::parse(b) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = <ContextValue<1>>::parse(b) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = <ContextValue<2>>::parse(b) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = <ContextValue<3>>::parse(b) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = <ContextValue<4>>::parse(b) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = <ContextValue<5>>::parse(b) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = <ContextValue<6>>::parse(b) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = <ContextValue<7>>::parse(b) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = <ContextValue<8>>::parse(b) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = <ContextValue<9>>::parse(b) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = <ContextValue<10>>::parse(b) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = <ContextValue<11>>::parse(b) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = <ContextValue<12>>::parse(b) {
+            assert_write(&value).unwrap();
+        }
     }
 
     /// Passes `b` to every reader one byte at a time: each prefix in turn,
@@ -3606,8 +3668,7 @@ mod tests {
                         number,
                         value: v.clone(),
                     };
-                    contract::check_wire_value(&context);
-                    let bytes = context.to_bytes().unwrap();
+                    let bytes = assert_write(&context).unwrap();
                     assert_eq!(ContextValue::<{ $typ }>::parse(&bytes), Ok(context));
                 }};
             }

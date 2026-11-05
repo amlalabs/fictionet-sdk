@@ -2062,11 +2062,13 @@ fictionet::codec_from!(Error, Truncated, |_| Error::Truncated);
 pub mod harness {
     use super::Payload;
     use fictionet::stdlib::codec::Wire;
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::assert_write;
 
     /// Checks payload round trips and encoded lengths.
     pub fn check_payload(bytes: &[u8]) {
-        contract::check_wire::<Payload>(bytes);
+        if let Ok(value) = Payload::parse(bytes) {
+            assert_write(&value).unwrap();
+        }
         if let Ok(payload) = Payload::parse(bytes) {
             assert!(payload.to_bytes().unwrap().len() <= bytes.len());
         }
@@ -2080,7 +2082,7 @@ mod tests {
     use fictionet::assert_cases;
     use fictionet::stdlib::codec::Lcg;
 
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::assert_write;
     use fictionet::stdlib::test_support::hex;
     use fictionet::stdlib::test_support::mutate;
     use fictionet::stdlib::test_support::rounds;
@@ -3558,7 +3560,7 @@ mod tests {
             let mut out = vec![9, 8];
             assert_eq!(payload.write(&mut out), Err(Error::Unwritable));
             assert_eq!(out, [9, 8]);
-            contract::check_wire_value(&payload);
+            let _ = assert_write(&payload);
         }
         let packet = short_packet(
             false,
@@ -3571,7 +3573,7 @@ mod tests {
             Datagram::<0>(vec![packet.clone()]).to_bytes(),
             Err(Error::Unwritable)
         );
-        contract::check_wire_value(&Datagram::<8>(vec![packet]));
+        let _ = assert_write(&Datagram::<8>(vec![packet]));
     }
 
     #[test]
@@ -3591,13 +3593,13 @@ mod tests {
         let (packets, error) = split_datagram(&bytes, 0);
         assert_eq!(error, Some(Error::Truncated));
         assert_eq!(packets, prefix.0);
-        contract::check_wire_value(&Datagram::<0>(packets.clone()));
+        let _ = assert_write(&Datagram::<0>(packets.clone()));
         for packet in packets {
             assert_eq!(
                 Payload::parse(packet.payload().unwrap()),
                 Ok(payload.clone())
             );
-            contract::check_wire_value(&Datagram::<0>(vec![packet]));
+            let _ = assert_write(&Datagram::<0>(vec![packet]));
         }
     }
 
@@ -3618,11 +3620,19 @@ mod tests {
                 seeds[rng.index(seeds.len())].clone()
             };
             mutate(&mut rng, &mut bytes);
-            contract::check_wire::<VarInt>(&bytes);
-            contract::check_wire::<Frame>(&bytes);
+            if let Ok(value) = VarInt::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = Frame::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
             check_payload(&bytes);
-            contract::check_wire::<Datagram<0>>(&bytes);
-            contract::check_wire::<Datagram<8>>(&bytes);
+            if let Ok(value) = <Datagram<0>>::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = <Datagram<8>>::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
             for dcid_len in 0..=20 {
                 let (packets, _) = split_datagram(&bytes, dcid_len);
                 if !packets.is_empty() {
@@ -3665,9 +3675,9 @@ mod tests {
                 .map(|_| random_frame(&mut rng))
                 .collect();
             for frame in &frames {
-                contract::check_wire_value(frame);
+                let _ = assert_write(frame);
             }
-            contract::check_wire_value(&Payload(frames));
+            let _ = assert_write(&Payload(frames));
             let number = PacketNumber {
                 value: (rng.next() >> rng.index(32)) as u32,
                 len: rng.index(6) as u8,

@@ -483,7 +483,9 @@ mod tests {
     use super::*;
     use fictionet::assert_cases;
     use fictionet::stdlib::codec::Lcg;
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::codec::{Collect, CollectError, Fail, Stream};
+    use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
+
     use fictionet::stdlib::test_support::mutate;
 
     fn packet_fixture(header: Header, payload: Vec<u8>) -> Packet {
@@ -491,7 +493,36 @@ mod tests {
     }
 
     fn collect(b: &[u8]) -> Result<Packet, Error> {
-        contract::check_collect::<Packet>(b, MAX_PACKET)
+        let parsed = Packet::parse(b);
+        if let Ok(value) = &parsed {
+            assert_write(value).unwrap();
+        }
+        let decoded = decode_chunks(
+            &mut Stream::new(Collect::<Packet>::new(MAX_PACKET)),
+            chunks(b, &[1, 7, 64]),
+            |s| assert!(s.allocated() <= 2 * (MAX_PACKET + 1)),
+        );
+        if b.len() <= MAX_PACKET {
+            assert_eq!(
+                decoded,
+                (
+                    parsed.clone().ok().into_iter().collect(),
+                    parsed
+                        .clone()
+                        .err()
+                        .map(|e| Fail::Protocol(CollectError::Parse(e))),
+                )
+            );
+        } else {
+            assert_eq!(
+                decoded,
+                (
+                    vec![],
+                    Some(Fail::Protocol(CollectError::TooLong { limit: MAX_PACKET }))
+                )
+            );
+        }
+        parsed
     }
 
     fn gre(protocol: u16, checksum: bool, key: Option<u32>, sequence: Option<u32>) -> Header {

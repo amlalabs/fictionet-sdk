@@ -2004,9 +2004,11 @@ mod tests {
     use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::protocols::prefix_int::Integer;
 
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::codec::Stream;
     use fictionet::stdlib::test_support::hex;
-    use fictionet::stdlib::test_support::{decode_all, mutate};
+    use fictionet::stdlib::test_support::{
+        assert_write, chunks, decode_all, decode_chunks, mutate,
+    };
 
     fn apply(table: &mut Table, bytes: &[u8]) -> Result<(), Error> {
         let (items, error) = decode_all(Frames::<EncoderInstruction>::new, bytes);
@@ -2103,8 +2105,7 @@ mod tests {
                 u64::MAX,
             ] {
                 let unit = Integer::<P> { flags: 0, value };
-                contract::check_wire_value(&unit);
-                let bytes = unit.to_bytes().unwrap();
+                let bytes = assert_write(&unit).unwrap();
                 let mut c = Reader::new(&bytes);
                 if value > MAX_VARINT {
                     assert!(matches!(c.int(P), Err(Stop::Bad(Error::IntegerOverflow))));
@@ -2187,10 +2188,13 @@ mod tests {
         let s4 = hex("0381 10 11");
         held.push(blocked(&table, 4, &s4)).unwrap();
         let enc = hex("3fbd01 c00f7777772e6578616d706c652e636f6d c10c2f73616d706c652f70617468");
-        contract::check_decode_with_alloc_limit(
-            Frames::<EncoderInstruction>::new,
-            &enc,
-            2 * MAX_INSTRUCTION,
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<EncoderInstruction>::new()),
+                chunks(&enc, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_INSTRUCTION)
+            ),
+            decode_all(Frames::<EncoderInstruction>::new, &enc)
         );
         apply(&mut table, &enc).unwrap();
         assert_eq!(table.size(), 106);
@@ -2365,8 +2369,7 @@ mod tests {
             },
         ];
         for rep in &reps {
-            contract::check_wire_value(rep);
-            let bytes = rep.to_bytes().unwrap();
+            let bytes = assert_write(rep).unwrap();
             for n in 0..bytes.len() {
                 assert_eq!(Representation::parse(&bytes[..n]), Err(Error::Incomplete));
             }
@@ -2418,11 +2421,14 @@ mod tests {
             EncoderInstruction::Duplicate(MAX_VARINT),
         ];
         for ins in &enc {
-            contract::check_wire_value(ins);
-            contract::check_decode_with_alloc_limit(
-                Frames::<EncoderInstruction>::new,
-                &ins.to_bytes().unwrap(),
-                2 * MAX_INSTRUCTION,
+            let _ = assert_write(ins);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Frames::<EncoderInstruction>::new()),
+                    chunks(&ins.to_bytes().unwrap(), &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_INSTRUCTION)
+                ),
+                decode_all(Frames::<EncoderInstruction>::new, &ins.to_bytes().unwrap())
             );
         }
         assert_eq!(
@@ -2440,11 +2446,14 @@ mod tests {
             ),
         ] {
             assert_eq!(ins.to_bytes().unwrap(), bytes);
-            contract::check_wire_value(&ins);
-            contract::check_decode_with_alloc_limit(
-                Frames::<DecoderInstruction>::new,
-                &bytes,
-                2 * MAX_INTEGER_BYTES,
+            let _ = assert_write(&ins);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Frames::<DecoderInstruction>::new()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_INTEGER_BYTES)
+                ),
+                decode_all(Frames::<DecoderInstruction>::new, &bytes)
             );
         }
         assert_eq!(
@@ -2647,7 +2656,7 @@ mod tests {
             .unwrap();
         for (stream, name, value) in [(0, "x-a", "1"), (4, "x-a", "1"), (4, "x-b", "2")] {
             let section = encoder.section(stream, &[Field::new(name, value)]).unwrap();
-            contract::check_wire_value(&section);
+            let _ = assert_write(&section);
         }
         assert_eq!(encoder.set_capacity(36), Err(Error::Referenced));
         let mut bytes = Vec::new();
@@ -2816,21 +2825,37 @@ mod tests {
                 vec![0, 0, 0xd1, 0x50, 1, b'x']
             };
             mutate(&mut rng, &mut data);
-            contract::check_decode_with_alloc_limit(
-                Frames::<EncoderInstruction>::new,
-                &data,
-                2 * MAX_INSTRUCTION,
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Frames::<EncoderInstruction>::new()),
+                    chunks(&data, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_INSTRUCTION)
+                ),
+                decode_all(Frames::<EncoderInstruction>::new, &data)
             );
-            contract::check_decode_with_alloc_limit(
-                Frames::<DecoderInstruction>::new,
-                &data,
-                2 * MAX_INTEGER_BYTES,
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Frames::<DecoderInstruction>::new()),
+                    chunks(&data, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_INTEGER_BYTES)
+                ),
+                decode_all(Frames::<DecoderInstruction>::new, &data)
             );
-            contract::check_wire::<EncoderInstruction>(&data);
-            contract::check_wire::<DecoderInstruction>(&data);
-            contract::check_wire::<Representation>(&data);
-            contract::check_wire::<huffman::HuffmanString>(&data);
-            contract::check_wire::<FieldSection>(&data);
+            if let Ok(value) = EncoderInstruction::parse(&data) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = DecoderInstruction::parse(&data) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = Representation::parse(&data) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = huffman::HuffmanString::parse(&data) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = FieldSection::parse(&data) {
+                assert_write(&value).unwrap();
+            }
             let mut table = Table::new(220);
             let _ = apply(&mut table, &[]);
             let (items, _) = decode_all(Frames::<EncoderInstruction>::new, &data);
@@ -2876,10 +2901,13 @@ mod tests {
             {
                 assert!(fields.iter().map(Field::size).sum::<u64>() <= 1 << 14);
             }
-            contract::check_decode_with_alloc_limit(
-                Frames::<EncoderInstruction>::new,
-                &data,
-                2 * MAX_INSTRUCTION,
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Frames::<EncoderInstruction>::new()),
+                    chunks(&data, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_INSTRUCTION)
+                ),
+                decode_all(Frames::<EncoderInstruction>::new, &data)
             );
             let mut changed = table.clone();
             let (instructions, _) = decode_all(Frames::<EncoderInstruction>::new, &data);
@@ -2957,10 +2985,13 @@ mod tests {
                 value: vec![b'1'; size],
             };
             let bytes = ins.to_bytes().unwrap();
-            contract::check_decode_with_alloc_limit(
-                Frames::<EncoderInstruction>::new,
-                &bytes,
-                2 * MAX_INSTRUCTION,
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Frames::<EncoderInstruction>::new()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_INSTRUCTION)
+                ),
+                decode_all(Frames::<EncoderInstruction>::new, &bytes)
             );
             let mut table = Table::new(MAX_TABLE_CAPACITY);
             table.set_capacity(MAX_TABLE_CAPACITY).unwrap();
@@ -3095,15 +3126,21 @@ mod tests {
 
     #[test]
     fn stream_readers_keep_bounded_buffers() {
-        contract::check_decode_with_alloc_limit(
-            Frames::<EncoderInstruction>::new,
-            &vec![0x20; 4096],
-            2 * MAX_INSTRUCTION,
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<EncoderInstruction>::new()),
+                chunks(&vec![0x20; 4096], &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_INSTRUCTION)
+            ),
+            decode_all(Frames::<EncoderInstruction>::new, &vec![0x20; 4096])
         );
-        contract::check_decode_with_alloc_limit(
-            Frames::<DecoderInstruction>::new,
-            &vec![0x40; 4096],
-            2 * MAX_INTEGER_BYTES,
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<DecoderInstruction>::new()),
+                chunks(&vec![0x40; 4096], &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_INTEGER_BYTES)
+            ),
+            decode_all(Frames::<DecoderInstruction>::new, &vec![0x40; 4096])
         );
         let ins = EncoderInstruction::InsertWithLiteralName {
             name: b"n".to_vec(),
@@ -3111,10 +3148,13 @@ mod tests {
         };
         let mut bytes = EncoderInstruction::SetCapacity(4096).to_bytes().unwrap();
         ins.write(&mut bytes).unwrap();
-        contract::check_decode_with_alloc_limit(
-            Frames::<EncoderInstruction>::new,
-            &bytes,
-            2 * MAX_INSTRUCTION,
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<EncoderInstruction>::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_INSTRUCTION)
+            ),
+            decode_all(Frames::<EncoderInstruction>::new, &bytes)
         );
         let mut table = Table::new(4096);
         apply(&mut table, &bytes).unwrap();

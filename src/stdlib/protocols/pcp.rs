@@ -1634,7 +1634,7 @@ mod tests {
 
     use super::*;
     use fictionet::stdlib::codec::Lcg;
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::assert_write;
     use fictionet::stdlib::test_support::mutate;
 
     const LAPTOP: Ipv4Addr = Ipv4Addr::new(192, 168, 1, 20);
@@ -2162,8 +2162,10 @@ mod tests {
             reply.to_bytes().unwrap()[HEADER_LEN..],
             request[HEADER_LEN..]
         );
-        contract::check_wire_value(&reply);
-        contract::check_wire::<Response>(&reply.to_bytes().unwrap());
+        let _ = assert_write(&reply);
+        if let Ok(value) = Response::parse(&reply.to_bytes().unwrap()) {
+            assert_write(&value).unwrap();
+        }
     }
 
     #[test]
@@ -2172,7 +2174,7 @@ mod tests {
         let short = [3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9, 8, 7];
         let reply = error_reply(&short, ResultCode::UnsuppVersion, 1800, 9);
         assert_eq!(reply.reserved, [9, 8, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-        contract::check_wire_value(&reply);
+        let _ = assert_write(&reply);
         // Under 2 bytes, and responses: dropped.
         assert_eq!(receive(&[2], Speaks::Both, laptop(), 0), Incoming::Ignore);
         let resp = map_request()
@@ -2567,13 +2569,13 @@ mod tests {
         let many = vec![fixture_pcp_option_other(200, vec![1; 40]); 100];
         let r = with(map_request(), many.clone());
         assert_eq!(r.to_bytes(), Err(Error::Unwritable));
-        contract::check_wire_value(&r);
+        let _ = assert_write(&r);
         let resp = Response {
             options: many,
             ..map_request().reply(ResultCode::Success, 0, 0)
         };
         assert_eq!(resp.to_bytes(), Err(Error::Unwritable));
-        contract::check_wire_value(&resp);
+        let _ = assert_write(&resp);
         // An oversized option refuses the whole value.
         let r = with(
             map_request(),
@@ -2600,26 +2602,26 @@ mod tests {
             options: vec![],
         };
         assert_eq!(r.to_bytes(), Err(Error::Unwritable));
-        contract::check_wire_value(&r);
+        let _ = assert_write(&r);
         let resp = Response {
             operation: fixture_operation_other(1, vec![]),
             ..Response::announce(0)
         };
-        contract::check_wire_value(&resp);
+        let _ = assert_write(&resp);
         // NAT-PMP.
         let r = NatPmpRequest::Unsupported {
             opcode: 1,
             data: vec![0; 5000],
         };
         assert_eq!(r.to_bytes(), Err(Error::Unwritable));
-        contract::check_wire_value(&r);
+        let _ = assert_write(&r);
         for opcode in [0, 1, 2, 0x80, 0x81, 3, 77] {
             let r = NatPmpResponse::Other {
                 opcode,
                 result: NatPmpResult::Success,
                 data: vec![],
             };
-            contract::check_wire_value(&r);
+            let _ = assert_write(&r);
             assert_eq!(r.to_bytes().is_ok(), matches!(opcode, 3 | 77));
         }
         let r = NatPmpResponse::Other {
@@ -2649,11 +2651,21 @@ mod tests {
 
     /// Everything a reader of `b` must hold to.
     fn exercise(b: &[u8]) {
-        contract::check_wire::<Request>(b);
-        contract::check_wire::<Response>(b);
-        contract::check_wire::<NatPmpRequest>(b);
-        contract::check_wire::<NatPmpResponse>(b);
-        contract::check_wire::<Reply>(b);
+        if let Ok(value) = Request::parse(b) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Response::parse(b) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = NatPmpRequest::parse(b) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = NatPmpResponse::parse(b) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Reply::parse(b) {
+            assert_write(&value).unwrap();
+        }
 
         if let Ok(r) = Request::parse(b) {
             let bytes = r.to_bytes().unwrap();
@@ -2806,32 +2818,32 @@ mod tests {
                 operation,
                 options,
             };
-            contract::check_wire_value(&r);
+            let _ = assert_write(&r);
             if let Ok(b) = r.to_bytes() {
                 let source = unmapped(r.client);
                 if let Incoming::Reply(reply) = receive(&b, Speaks::Both, source, 9) {
-                    contract::check_wire_value(&reply);
+                    let _ = assert_write(&reply);
                 }
             }
             let resp = Response {
                 reserved: [rng.next() as u8; 12],
                 ..r.reply(ResultCode::from_code(rng.next() as u8), 1, 2)
             };
-            contract::check_wire_value(&resp);
+            let _ = assert_write(&resp);
             let n = NatPmpResponse::Other {
                 opcode: rng.next() as u8,
                 result: NatPmpResult::from_code(rng.next() as u16),
                 data: bytes(&mut rng, &[0, 1, 3, 20, 2000]),
             };
-            contract::check_wire_value(&n);
+            let _ = assert_write(&n);
             let n = NatPmpRequest::Unsupported {
                 opcode: rng.next() as u8,
                 data: bytes(&mut rng, &[0, 1, 2, 3, 2000]),
             };
-            contract::check_wire_value(&n);
+            let _ = assert_write(&n);
             if let Ok(b) = n.to_bytes() {
                 let read = NatPmpRequest::parse(&b).unwrap();
-                contract::check_wire_value(&read.refuse(NatPmpResult::UnsupportedOpcode, 1));
+                let _ = assert_write(&read.refuse(NatPmpResult::UnsupportedOpcode, 1));
             }
         }
     }

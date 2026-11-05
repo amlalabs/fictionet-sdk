@@ -1037,9 +1037,11 @@ impl Decode for CollectedResponses {
 mod tests {
     use super::*;
     use codec::{Lcg, Stream};
-    use fictionet::stdlib::test_support::contract;
+
     use fictionet::stdlib::test_support::rounds;
-    use fictionet::stdlib::test_support::{decode_all, mutate};
+    use fictionet::stdlib::test_support::{
+        assert_write, chunks, decode_all, decode_chunks, mutate,
+    };
 
     fn flag<'a>(name: &'a str, argument: Option<&'a str>) -> Flag<'a> {
         Flag { name, argument }
@@ -1236,7 +1238,14 @@ mod tests {
         let mut bytes = vec![b'a'; 3000];
         bytes.extend_from_slice(b"\r\nok\r\n");
         let got = decode_all(Queries::new, &bytes).0;
-        contract::check_decode_with_alloc_limit(Queries::new, &bytes, 2 * (MAX_QUERY + 2));
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Queries::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * (MAX_QUERY + 2))
+            ),
+            decode_all(Queries::new, &bytes)
+        );
         assert_eq!(
             got,
             [Err(Error::QueryTooLong), Ok(Query::new("ok").unwrap())]
@@ -1536,10 +1545,13 @@ mod tests {
         let r = &items[0].response;
         assert_eq!(r.as_bytes().len(), MAX_RESPONSE);
         assert_eq!(r.as_bytes().last(), Some(&b'y'));
-        contract::check_decode_with_alloc_limit(
-            CollectedResponses::new,
-            &bytes,
-            2 * RESPONSE_WINDOW,
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(CollectedResponses::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * RESPONSE_WINDOW)
+            ),
+            decode_all(CollectedResponses::new, &bytes)
         );
         let r = Response::new(b"owner: M\xfcller\n").unwrap();
         assert_eq!(r.fields().unwrap()[0].value, "M\u{fffd}ller");
@@ -1588,16 +1600,30 @@ mod tests {
                 data.extend_from_slice(b"\r\nexample.com\r\n");
             }
             mutate(&mut rng, &mut data);
-            contract::check_decode_with_alloc_limit(Queries::new, &data, 2 * (MAX_QUERY + 2));
-            contract::check_decode_with_alloc_limit(
-                CollectedResponses::new,
-                &data,
-                2 * RESPONSE_WINDOW,
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Queries::new()),
+                    chunks(&data, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * (MAX_QUERY + 2))
+                ),
+                decode_all(Queries::new, &data)
             );
-            contract::check_wire::<Query>(&data);
-            contract::check_wire::<Response>(&data);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(CollectedResponses::new()),
+                    chunks(&data, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * RESPONSE_WINDOW)
+                ),
+                decode_all(CollectedResponses::new, &data)
+            );
+            if let Ok(value) = Query::parse(&data) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = Response::parse(&data) {
+                assert_write(&value).unwrap();
+            }
             for q in decode_all(Queries::new, &data).0.iter().flatten() {
-                contract::check_wire_value(q);
+                let _ = assert_write(q);
                 q.to_bytes().unwrap();
                 assert!(q.flags().len() <= q.as_str().len());
                 assert!(q.terms().len() <= q.as_str().len());
@@ -1613,13 +1639,13 @@ mod tests {
                     .collect();
                 assert_eq!(words, parts);
                 assert_eq!(query.terms(), trim(terms));
-                contract::check_wire_value(&query);
+                let _ = assert_write(&query);
             }
             let response = &decode_all(CollectedResponses::new, &data).0[0].response;
             let fields = response.fields().unwrap();
             if let Ok(response) = Response::from_fields(&fields) {
                 assert_eq!(response.fields().unwrap(), fields);
-                contract::check_wire_value(&response);
+                let _ = assert_write(&response);
             }
             for field in &fields {
                 if let Some(referral) = Referral::from_field(field) {
@@ -1657,7 +1683,7 @@ mod tests {
             }
             if let Ok(response) = Response::from_fields(&fields) {
                 assert_eq!(response.fields().unwrap(), fields);
-                contract::check_wire_value(&response);
+                let _ = assert_write(&response);
             }
         }
     }
@@ -1676,7 +1702,14 @@ mod tests {
                     decode_all(Queries::new, &data),
                     (vec![expected, Query::new("next")], None)
                 );
-                contract::check_decode_with_alloc_limit(Queries::new, &data, 2 * (MAX_QUERY + 2));
+                assert_eq!(
+                    decode_chunks(
+                        &mut Stream::new(Queries::new()),
+                        chunks(&data, &[1, 7, 64]),
+                        |s| assert!(s.allocated() <= 2 * (MAX_QUERY + 2))
+                    ),
+                    decode_all(Queries::new, &data)
+                );
             }
         }
     }
@@ -1884,10 +1917,13 @@ mod tests {
             }
             let resp = Response::from_fields(&fields).unwrap();
             assert_eq!(resp.fields().unwrap(), fields);
-            contract::check_decode_with_alloc_limit(
-                CollectedResponses::new,
-                resp.as_bytes(),
-                2 * RESPONSE_WINDOW,
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(CollectedResponses::new()),
+                    chunks(resp.as_bytes(), &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * RESPONSE_WINDOW)
+                ),
+                decode_all(CollectedResponses::new, resp.as_bytes())
             );
             assert_eq!(
                 decode_all(CollectedResponses::new, resp.as_bytes()).0[0]

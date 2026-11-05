@@ -2726,7 +2726,7 @@ mod tests {
     use super::*;
     use fictionet::stdlib::codec::{Fail, Stream};
     use fictionet::stdlib::test_support;
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
     use std::sync::OnceLock;
 
     fn named(name: &str, value: Value) -> NamedValue {
@@ -2815,13 +2815,22 @@ mod tests {
             ]
         );
         assert_eq!(wire.to_bytes().unwrap(), bytes);
-        contract::check_wire::<MessageWire<MarketNulls>>(&bytes);
-        contract::check_decode_with_alloc_limit(|| Messages::new(s), &bytes, 2 * MAX_MESSAGE_BYTES);
+        if let Ok(value) = <MessageWire<MarketNulls>>::parse(&bytes) {
+            assert_write(&value).unwrap();
+        }
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Messages::new(s)),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_MESSAGE_BYTES)
+            ),
+            decode_all(|| Messages::new(s), &bytes)
+        );
         wire.message.fields[0].value = int(i64::from(i32::MAX));
         let mut out = vec![1, 2, 3];
         assert_eq!(wire.write(&mut out), Err(Error::Value));
         assert_eq!(out, [1, 2, 3]);
-        contract::check_wire_value(&wire);
+        let _ = assert_write(&wire);
     }
 
     #[test]
@@ -2851,10 +2860,13 @@ mod tests {
             let mut out = Vec::new();
             s.write(&m, &mut out).unwrap();
             assert_eq!(out, bytes);
-            contract::check_decode_with_alloc_limit(
-                || Messages::new(&s),
-                &bytes,
-                2 * MAX_MESSAGE_BYTES,
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Messages::new(&s)),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_MESSAGE_BYTES)
+                ),
+                decode_all(|| Messages::new(&s), &bytes)
             );
         }
     }
@@ -2882,10 +2894,13 @@ mod tests {
             let mut out = Vec::new();
             s.write(&m, &mut out).unwrap();
             assert_eq!(out, bytes);
-            contract::check_decode_with_alloc_limit(
-                || Messages::new(&s),
-                &bytes,
-                2 * MAX_MESSAGE_BYTES,
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Messages::new(&s)),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_MESSAGE_BYTES)
+                ),
+                decode_all(|| Messages::new(&s), &bytes)
             );
         }
     }
@@ -3013,10 +3028,13 @@ mod tests {
             let mut out = Vec::new();
             s.write(&m, &mut out).unwrap();
             assert_eq!(out, bytes);
-            contract::check_decode_with_alloc_limit(
-                || Messages::new(&s),
-                &bytes,
-                2 * MAX_MESSAGE_BYTES,
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Messages::new(&s)),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_MESSAGE_BYTES)
+                ),
+                decode_all(|| Messages::new(&s), &bytes)
             );
             let mut bad = bytes.clone();
             bad[16] = 255; // A later member remains required.
@@ -3127,7 +3145,14 @@ mod tests {
         let mut out = Vec::new();
         s.write(&m, &mut out).unwrap();
         assert_eq!(out, bytes);
-        contract::check_decode(|| Messages::new(&s), &bytes);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Messages::new(&s)),
+                chunks(&bytes, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(|| Messages::new(&s), &bytes)
+        );
         let mut bad = m.clone();
         bad.fields[0].value =
             Value::Composite(vec![named("time", uint(1)), named("unit", uint(3))]);
@@ -3194,7 +3219,14 @@ mod tests {
         small.extend_from_slice(&[0; 4]);
         let frames = Messages::with_limit(&s, small.len());
         assert_eq!(frames.capacity(), small.len());
-        contract::check_decode(|| Messages::with_limit(&s, small.len()), &small);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Messages::with_limit(&s, small.len())),
+                chunks(&small, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(|| Messages::with_limit(&s, small.len()), &small)
+        );
         // Truncated below the limit: Need at EOF, so the driver reports it.
         let cut = &small[..small.len() - 1];
         assert_eq!(
@@ -3357,12 +3389,17 @@ mod tests {
         assert_eq!(s.block_length(1, 2), Ok(20));
         assert_eq!(s.template_name(1), Some("Car"));
         assert_eq!(wire.to_bytes().unwrap(), CAR_BYTES);
-        contract::check_wire::<MessageWire<Car>>(CAR_BYTES);
-        contract::check_wire_value(&wire);
-        contract::check_decode_with_alloc_limit(
-            || Messages::new(s),
-            CAR_BYTES,
-            2 * MAX_MESSAGE_BYTES,
+        if let Ok(value) = <MessageWire<Car>>::parse(CAR_BYTES) {
+            assert_write(&value).unwrap();
+        }
+        let _ = assert_write(&wire);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Messages::new(s)),
+                chunks(CAR_BYTES, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_MESSAGE_BYTES)
+            ),
+            decode_all(|| Messages::new(s), CAR_BYTES)
         );
         let mut twice = CAR_BYTES.to_vec();
         twice.extend_from_slice(CAR_BYTES);
@@ -3393,11 +3430,16 @@ mod tests {
         let encoded = wire.to_bytes().unwrap();
         assert_eq!(&encoded[28..30], &[0, 0]);
         assert_eq!(&encoded[36..38], &[0, 0]);
-        contract::check_wire::<MessageWire<Car>>(&bytes);
-        contract::check_decode_with_alloc_limit(
-            || Messages::new(Car::schema().unwrap()),
-            &bytes,
-            2 * MAX_MESSAGE_BYTES,
+        if let Ok(value) = <MessageWire<Car>>::parse(&bytes) {
+            assert_write(&value).unwrap();
+        }
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Messages::new(Car::schema().unwrap())),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_MESSAGE_BYTES)
+            ),
+            decode_all(|| Messages::new(Car::schema().unwrap()), &bytes)
         );
     }
 
@@ -3416,19 +3458,30 @@ mod tests {
         }
         assert_eq!(s.block_length(1, 0), Ok(19));
         assert_eq!(wire.to_bytes().unwrap(), old);
-        contract::check_wire::<MessageWire<Car>>(&old);
-        contract::check_decode_with_alloc_limit(|| Messages::new(s), &old, 2 * MAX_MESSAGE_BYTES);
+        if let Ok(value) = <MessageWire<Car>>::parse(&old) {
+            assert_write(&value).unwrap();
+        }
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Messages::new(s)),
+                chunks(&old, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_MESSAGE_BYTES)
+            ),
+            decode_all(|| Messages::new(s), &old)
+        );
         let mut future = CAR_BYTES.to_vec();
         future[6] = 3;
         future[0] = 21;
         future.insert(28, 99);
         let newer = MessageWire::<Car>::parse(&future).unwrap();
         assert_eq!(newer.message.header.version, 3);
-        contract::check_wire::<MessageWire<Car>>(&future);
+        if let Ok(value) = <MessageWire<Car>>::parse(&future) {
+            assert_write(&value).unwrap();
+        }
         let mut unavailable = wire.clone();
         *field_mut(&mut unavailable.message.fields, "rating") = uint(9);
         assert!(unavailable.to_bytes().is_err());
-        contract::check_wire_value(&unavailable);
+        let _ = assert_write(&unavailable);
         let mut invalid_enum = old.clone();
         invalid_enum[12] = b'B';
         assert_eq!(s.decode(&invalid_enum), Err(Error::Value));
@@ -3602,10 +3655,13 @@ mod tests {
         assert_eq!(out, bytes);
         let oversized = packet(0, &[1, 0, 1, 0, 0x10, 0]); // 1 MiB + 1 data bytes, declared only
         assert_eq!(s.decode(&oversized), Err(Error::Limit("MAX_MESSAGE_BYTES")));
-        contract::check_decode_with_alloc_limit(
-            || Messages::new(&s),
-            &oversized,
-            2 * MAX_MESSAGE_BYTES,
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Messages::new(&s)),
+                chunks(&oversized, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_MESSAGE_BYTES)
+            ),
+            decode_all(|| Messages::new(&s), &oversized)
         );
         let null = packet(0, &[1, 0, 255, 255, 255, 255]);
         assert_eq!(s.decode(&null), Err(Error::Value));
@@ -3622,7 +3678,9 @@ mod tests {
                 Err(Error::Truncated),
                 "cut {cut}"
             );
-            contract::check_wire::<MessageWire<Car>>(&CAR_BYTES[..cut]);
+            if let Ok(value) = <MessageWire<Car>>::parse(&CAR_BYTES[..cut]) {
+                assert_write(&value).unwrap();
+            }
         }
         for (at, byte, error) in [
             (0, 19, Error::BlockLength),
@@ -3634,10 +3692,13 @@ mod tests {
             let mut bytes = CAR_BYTES.to_vec();
             bytes[at] = byte;
             assert_eq!(s.decode(&bytes), Err(error));
-            contract::check_decode_with_alloc_limit(
-                || Messages::new(s),
-                &bytes,
-                2 * MAX_MESSAGE_BYTES,
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Messages::new(s)),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_MESSAGE_BYTES)
+                ),
+                decode_all(|| Messages::new(s), &bytes)
             );
         }
         let good = MessageWire::<Car>::parse(CAR_BYTES).unwrap();
@@ -3660,7 +3721,7 @@ mod tests {
             let mut out = vec![0x55, 0xaa];
             assert!(bad.write(&mut out).is_err());
             assert_eq!(out, [0x55, 0xaa]);
-            contract::check_wire_value(&bad);
+            let _ = assert_write(&bad);
         }
     }
 
@@ -3809,10 +3870,13 @@ mod tests {
             s.decode(&bytes),
             Err(Error::Limit("MAX_ARRAY_LENGTH"))
         ));
-        contract::check_decode_with_alloc_limit(
-            || Messages::new(&s),
-            &bytes,
-            2 * MAX_MESSAGE_BYTES,
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Messages::new(&s)),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_MESSAGE_BYTES)
+            ),
+            decode_all(|| Messages::new(&s), &bytes)
         );
         let bytes = packet(0, &[0, 0, 0, 0, 1, 0]);
         assert!(matches!(s.decode(&bytes), Err(Error::Limit("MAX_VALUES"))));
@@ -3856,10 +3920,13 @@ mod tests {
         let mut out = Vec::new();
         s.write(&message, &mut out).unwrap();
         assert_eq!(out, bytes);
-        contract::check_decode_with_alloc_limit(
-            || Messages::new(&s),
-            &bytes,
-            2 * MAX_MESSAGE_BYTES,
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Messages::new(&s)),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_MESSAGE_BYTES)
+            ),
+            decode_all(|| Messages::new(&s), &bytes)
         );
     }
 

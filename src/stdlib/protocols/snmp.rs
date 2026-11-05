@@ -1651,8 +1651,9 @@ fictionet::prefixed! {
 #[doc(hidden)]
 pub mod harness {
     use super::{Element, ErrorStatus, Message, Oid};
+
     use fictionet::stdlib::codec::Wire;
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::assert_write;
 
     /// Checks message and response round trips and lengths.
     pub fn check_message(data: &[u8]) {
@@ -1691,8 +1692,12 @@ pub mod harness {
         if let Ok(o) = Oid::parse(data) {
             assert_eq!(Oid::parse(&o.to_bytes().unwrap()), Ok(o));
         }
-        contract::check_wire::<Element>(data);
-        contract::check_wire::<Oid>(data);
+        if let Ok(value) = Element::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Oid::parse(data) {
+            assert_write(&value).unwrap();
+        }
     }
 }
 
@@ -1712,9 +1717,10 @@ mod tests {
     use super::harness::{check_message, check_scalars};
     use super::*;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream, pump};
-    use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::rounds;
-    use fictionet::stdlib::test_support::{decode_all, mutate};
+    use fictionet::stdlib::test_support::{
+        assert_write, chunks, decode_all, decode_chunks, mutate,
+    };
 
     fn oid(s: &str) -> Oid {
         s.parse().unwrap()
@@ -2704,7 +2710,14 @@ mod tests {
         let mut stream = Stream::new(Frames::<Message>::new());
         assert_eq!(stream.push(&bytes), MAX_MESSAGE);
         assert_eq!(stream.push(&bytes), 0);
-        contract::check_decode_with_alloc_limit(Frames::<Message>::new, &bytes, 2 * MAX_MESSAGE);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Message>::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_MESSAGE)
+            ),
+            decode_all(Frames::<Message>::new, &bytes)
+        );
         let (items, failure) = decode_all(Frames::<Message>::new, &bytes);
         assert_eq!(items.len(), n);
         assert!(items.iter().all(Result::is_ok));
@@ -2727,7 +2740,14 @@ mod tests {
             .iter()
             .flat_map(|m| m.to_bytes().unwrap())
             .collect();
-        contract::check_decode_with_alloc_limit(Frames::<Message>::new, &bytes, 2 * MAX_MESSAGE);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Message>::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_MESSAGE)
+            ),
+            decode_all(Frames::<Message>::new, &bytes)
+        );
         assert_eq!(
             decode_all(Frames::<Message>::new, &bytes),
             (messages.into_iter().map(Ok).collect(), None)
@@ -2747,8 +2767,17 @@ mod tests {
     fn check(data: &[u8]) {
         check_message(data);
         check_scalars(data);
-        contract::check_decode_with_alloc_limit(Frames::<Message>::new, data, 2 * MAX_MESSAGE);
-        contract::check_wire::<Message>(data);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Message>::new()),
+                chunks(data, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_MESSAGE)
+            ),
+            decode_all(Frames::<Message>::new, data)
+        );
+        if let Ok(value) = Message::parse(data) {
+            assert_write(&value).unwrap();
+        }
     }
 
     #[test]

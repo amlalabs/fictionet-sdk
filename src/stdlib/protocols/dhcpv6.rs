@@ -1479,9 +1479,10 @@ mod tests {
 
     use super::*;
     use fictionet::stdlib::codec::{Lcg, Stream};
-    use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::rounds;
-    use fictionet::stdlib::test_support::{decode_all, mutate, pump_with_copy_bound};
+    use fictionet::stdlib::test_support::{
+        assert_write, chunks, decode_all, decode_chunks, mutate, pump_with_copy_bound,
+    };
 
     fn a(s: &str) -> Ipv6Addr {
         s.parse().unwrap()
@@ -1528,8 +1529,10 @@ mod tests {
             };
             assert_eq!(Duid::parse(&bytes), expected);
             assert_eq!(Duid(bytes.clone()).to_bytes().is_ok(), valid);
-            contract::check_wire::<Duid>(&bytes);
-            contract::check_wire_value(&Duid(bytes));
+            if let Ok(value) = Duid::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            let _ = assert_write(&Duid(bytes));
         }
     }
 
@@ -1967,7 +1970,7 @@ mod tests {
                 ..Message::new(msg::SOLICIT, 1)
             };
             assert!(value.to_bytes().is_err());
-            contract::check_wire_value(&value);
+            let _ = assert_write(&value);
         }
         // Section 21.13: a status message is not null-terminated.
         let nul = with_option(opt::STATUS_CODE, &[0, 0, b'o', b'k', 0]);
@@ -1987,7 +1990,7 @@ mod tests {
                 ..Message::new(msg::REPLY, 1)
             };
             assert!(value.to_bytes().is_err());
-            contract::check_wire_value(&value);
+            let _ = assert_write(&value);
         }
     }
 
@@ -2011,7 +2014,7 @@ mod tests {
             .answer(msg::REPLY, &Duid::en(1, b"s"));
         let repl = read.relay_reply(&answer).unwrap();
         assert!(repl.to_bytes().is_err());
-        contract::check_wire_value(&repl);
+        let _ = assert_write(&repl);
     }
 
     #[test]
@@ -2124,10 +2127,13 @@ mod tests {
             let framed = Frame(Message::parse(&full).unwrap().clone())
                 .to_bytes()
                 .unwrap();
-            contract::check_decode_with_alloc_limit(
-                Frames::<Message>::new,
-                &framed,
-                2 * MAX_BUFFERED,
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Frames::<Message>::new()),
+                    chunks(&framed, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_BUFFERED)
+                ),
+                decode_all(Frames::<Message>::new, &framed)
             );
             for n in 0..framed.len() {
                 assert_eq!(
@@ -2145,7 +2151,14 @@ mod tests {
         let mut bytes = Frame(first.clone()).to_bytes().unwrap();
         bytes.extend_from_slice(&[0, 3, 1, 0, 0]);
         bytes.extend_from_slice(&Frame(second.clone()).to_bytes().unwrap());
-        contract::check_decode_with_alloc_limit(Frames::<Message>::new, &bytes, 2 * MAX_BUFFERED);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Message>::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_BUFFERED)
+            ),
+            decode_all(Frames::<Message>::new, &bytes)
+        );
         assert_eq!(
             decode_all(Frames::<Message>::new, &bytes),
             (vec![Ok(first), Err(Error::Short), Ok(second)], None)
@@ -2197,7 +2210,7 @@ mod tests {
         let mut m = Message::new(msg::REPLY, 1);
         m.options.push(o);
         assert!(m.to_bytes().is_err());
-        contract::check_wire_value(&m);
+        let _ = assert_write(&m);
     }
 
     #[test]
@@ -2235,7 +2248,7 @@ mod tests {
                 ..Message::new(msg::REPLY, 1)
             };
             assert!(value.to_bytes().is_err(), "{:?}", value.options);
-            contract::check_wire_value(&value);
+            let _ = assert_write(&value);
         }
         for (option, fits) in [
             (
@@ -2268,7 +2281,7 @@ mod tests {
                 assert_eq!(value.write(&mut out), Err(Error::Unwritable));
                 assert_eq!(out, [0x5a]);
             }
-            contract::check_wire_value(&value);
+            let _ = assert_write(&value);
         }
 
         // A relay whose inner message does not fit is refused.
@@ -2390,7 +2403,7 @@ mod tests {
         let mut r = Lcg::new(0x5eed);
         for _ in 0..3000 {
             let mut m = random_message(&mut r);
-            contract::check_wire_value(&m);
+            let _ = assert_write(&m);
             if r.coin() {
                 if m.is_relay() {
                     m.transaction = 0;
@@ -2400,17 +2413,17 @@ mod tests {
                     m.link_address = Ipv6Addr::UNSPECIFIED;
                 }
             }
-            contract::check_wire_value(&m);
+            let _ = assert_write(&m);
             if let Ok(bytes) = m.to_bytes() {
                 let back = Message::parse(&bytes).unwrap();
                 assert_eq!(back, m);
                 if m.is_relay() {
-                    contract::check_wire_value(&back.relay_reply(&m).unwrap());
+                    let _ = assert_write(&back.relay_reply(&m).unwrap());
                 } else {
-                    contract::check_wire_value(&back.answer(msg::REPLY, &Duid::en(1, b"x")));
+                    let _ = assert_write(&back.answer(msg::REPLY, &Duid::en(1, b"x")));
                 }
             }
-            contract::check_wire_value(&Frame(m));
+            let _ = assert_write(&Frame(m));
         }
     }
 
@@ -2451,19 +2464,26 @@ mod tests {
             for _ in 0..1 + r.index(4) {
                 mutate(&mut r, &mut data);
             }
-            contract::check_wire::<Message>(&data);
-            contract::check_wire::<Frame>(&data);
+            if let Ok(value) = Message::parse(&data) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = Frame::parse(&data) {
+                assert_write(&value).unwrap();
+            }
             if let Ok(m) = Message::parse(&data) {
                 accepted += 1;
                 assert_eq!(m.to_bytes().unwrap(), data);
                 if let Some(Ok(inner)) = m.relayed() {
-                    contract::check_wire_value(&inner);
+                    let _ = assert_write(&inner);
                 }
             }
-            contract::check_decode_with_alloc_limit(
-                Frames::<Message>::new,
-                &data,
-                2 * MAX_BUFFERED,
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Frames::<Message>::new()),
+                    chunks(&data, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_BUFFERED)
+                ),
+                decode_all(Frames::<Message>::new, &data)
             );
         }
         assert!(accepted > 500, "{accepted}");
@@ -2480,7 +2500,14 @@ mod tests {
         let value = Frame::parse(&frame).unwrap();
         assert_eq!(value.to_bytes().unwrap(), frame);
         assert!(value.0.to_bytes().is_err());
-        contract::check_decode_with_alloc_limit(Frames::<Message>::new, &frame, 2 * MAX_BUFFERED);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Message>::new()),
+                chunks(&frame, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_BUFFERED)
+            ),
+            decode_all(Frames::<Message>::new, &frame)
+        );
     }
 
     #[test]
@@ -2534,7 +2561,7 @@ mod tests {
                 ..Message::new(msg::REPLY, 1)
             };
             assert!(value.to_bytes().is_err());
-            contract::check_wire_value(&value);
+            let _ = assert_write(&value);
         }
     }
 
@@ -2554,10 +2581,13 @@ mod tests {
         assert_eq!(stream.buffered(), MAX_BUFFERED);
         assert_eq!(stream.next(), Some(Ok(Err(Error::Short))));
         assert_eq!(stream.push(&[0; 4096]), 2);
-        contract::check_decode_with_alloc_limit(
-            Frames::<Message>::new,
-            &[0; 4096],
-            2 * MAX_BUFFERED,
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Message>::new()),
+                chunks(&[0; 4096], &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_BUFFERED)
+            ),
+            decode_all(Frames::<Message>::new, &[0; 4096])
         );
     }
 

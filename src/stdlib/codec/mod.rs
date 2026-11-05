@@ -350,7 +350,8 @@ impl<T> Step<T> {
 /// move or expand that state. Each step need not reduce [`held`](Self::held).
 /// EOF must terminate. An error is terminal. Driving a stream requires
 /// `Self::Error: Clone`. Modes change only between items.
-/// See [`fictionet::stdlib::test_support::contract`] for executable checks.
+/// [`Stream`] reports a decoder that over-consumes, grows held state across
+/// `Need` or never finishes as [`Fail::Stuck`].
 pub trait Decode {
     /// An owned decoded unit. Recoverable unit errors belong here.
     type Item;

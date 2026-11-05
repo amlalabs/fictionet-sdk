@@ -2924,19 +2924,34 @@ pub mod harness {
         RevokedCertificate, SubjectAltName, SubjectKeyIdentifier, TbsCertList, TbsCertificate,
         Value,
     };
+
     use fictionet::stdlib::codec::Wire;
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::assert_write;
 
     /// Checks DER and PEM round trips on one input, and that a certificate
     /// or CRL whose tbs changed after reading no longer writes.
     pub fn check(data: &[u8]) {
-        contract::check_wire::<Certificate>(data);
-        contract::check_wire::<Crl>(data);
-        contract::check_wire::<TbsCertificate>(data);
-        contract::check_wire::<TbsCertList>(data);
-        contract::check_wire::<Name>(data);
-        contract::check_wire::<PublicKeyInfo>(data);
-        contract::check_wire::<Value>(data);
+        if let Ok(value) = Certificate::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Crl::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = TbsCertificate::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = TbsCertList::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Name::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = PublicKeyInfo::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Value::parse(data) {
+            assert_write(&value).unwrap();
+        }
         if let Ok(c) = Certificate::parse(data) {
             assert_eq!(c.to_bytes().unwrap(), data);
             let tbs = c.tbs.to_bytes().unwrap();
@@ -2995,7 +3010,9 @@ pub mod harness {
 
     /// Checks extension parsing, writing, and extension bytes.
     pub fn round_trip<T: ExtensionValue + PartialEq + std::fmt::Debug>(data: &[u8]) {
-        contract::check_wire::<T>(data);
+        if let Ok(value) = T::parse(data) {
+            assert_write(&value).unwrap();
+        }
         if let Ok(v) = T::parse(data) {
             let der = v.to_bytes().unwrap();
             assert_eq!(T::parse(&der).unwrap(), v);
@@ -3025,8 +3042,9 @@ mod tests {
     use super::*;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream, finish as finish_stream, pump};
 
-    use fictionet::stdlib::test_support::contract;
-    use fictionet::stdlib::test_support::{chunks, decode_all, mutate};
+    use fictionet::stdlib::test_support::{
+        assert_write, chunks, decode_all, decode_chunks, mutate,
+    };
 
     /// A self-signed P-256 certificate made with OpenSSL, with every
     /// extension this module reads.
@@ -4372,12 +4390,16 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
     #[test]
     fn pem_stream_splits_blocks_and_reports_eof() {
         let text = format!("junk\n{CERT_PEM}{CRL_PEM}{CERT_PEM}");
-        contract::check_decode_with_alloc_limit(
-            PemBlocks::new,
-            text.as_bytes(),
-            2 * PemBlocks::new().capacity(),
-        );
         let whole = decode_all(PemBlocks::new, text.as_bytes());
+        let alloc = 2 * PemBlocks::new().capacity();
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(PemBlocks::new()),
+                chunks(text.as_bytes(), &[1, 7, 64]),
+                |s| assert!(s.allocated() <= alloc)
+            ),
+            whole
+        );
         assert_eq!(whole.0.len(), 3);
         assert!(whole.1.is_none());
         let mut stream = Stream::new(PemBlocks::new());
@@ -4392,10 +4414,14 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
         );
         assert_eq!(stream.next(), None);
         let bad = b"-----BEGIN X-----\n!!!\n-----END X-----";
-        contract::check_decode_with_alloc_limit(
-            PemBlocks::new,
-            bad,
-            2 * PemBlocks::new().capacity(),
+        let alloc = 2 * PemBlocks::new().capacity();
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(PemBlocks::new()),
+                chunks(bad, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= alloc)
+            ),
+            decode_all(PemBlocks::new, bad)
         );
         let mut stream = Stream::new(PemBlocks::new());
         assert_eq!(
@@ -4535,10 +4561,14 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
                 text.extend_from_slice(CERT_PEM.as_bytes());
             }
             let whole = decode_all(PemBlocks::new, &text);
-            contract::check_decode_with_alloc_limit(
-                PemBlocks::new,
-                &text,
-                2 * PemBlocks::new().capacity(),
+            let alloc = 2 * PemBlocks::new().capacity();
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(PemBlocks::new()),
+                    chunks(&text, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= alloc)
+                ),
+                whole
             );
             match pem_decode(&text) {
                 Ok(blocks) => {
@@ -4668,10 +4698,14 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
             assert_eq!(blocks[0].data, cert_der());
             let whole = decode_all(PemBlocks::new, text.as_bytes());
             assert_eq!(whole, (blocks.clone(), None));
-            contract::check_decode_with_alloc_limit(
-                PemBlocks::new,
-                text.as_bytes(),
-                2 * PemBlocks::new().capacity(),
+            let alloc = 2 * PemBlocks::new().capacity();
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(PemBlocks::new()),
+                    chunks(text.as_bytes(), &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= alloc)
+                ),
+                whole
             );
         }
         // Vertical tabs and form feeds are whitespace in base64 text (W in
@@ -4722,7 +4756,7 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
             extensions: vec![],
         };
         // A nonminimal byte representation cannot pass the Wire contract.
-        contract::check_wire_value(&tbs);
+        let _ = assert_write(&tbs);
         assert_eq!(tbs.to_bytes(), Err(Error::Unwritable));
         tbs.revoked[0].serial = vec![0x05];
         let der = tbs.to_bytes().unwrap();
@@ -5282,23 +5316,25 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
         let mut out = vec![42];
         assert_eq!(name.write(&mut out), Err(Error::Unwritable));
         assert_eq!(out, [42]);
-        contract::check_wire_value(&name);
+        let _ = assert_write(&name);
         name.rdns[0].reverse();
         assert_eq!(Name::parse(&name.to_bytes().unwrap()), Ok(name.clone()));
-        contract::check_wire_value(&name);
+        let _ = assert_write(&name);
     }
 
     #[test]
     fn codec_pem_wire_is_exact_and_transactional() {
         use fictionet::stdlib::codec::Wire;
-        use fictionet::stdlib::test_support::contract;
+        use fictionet::stdlib::test_support::assert_write;
         let block = PemBlock {
             label: "TEST".into(),
             data: vec![1, 2, 3, 4],
         };
-        contract::check_wire_value(&block);
+        let _ = assert_write(&block);
         let bytes = <PemBlock as Wire>::to_bytes(&block).unwrap();
-        contract::check_wire::<PemBlock>(&bytes);
+        if let Ok(value) = PemBlock::parse(&bytes) {
+            assert_write(&value).unwrap();
+        }
         for tail in [&b"text"[..], &bytes] {
             let mut bad = bytes.clone();
             bad.extend_from_slice(tail);
@@ -5330,18 +5366,26 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
     #[test]
     fn codec_pem_scans_without_retaining_partial_bytes() {
         use fictionet::stdlib::codec::{Decode, Fail, Stream, finish, pump};
-        use fictionet::stdlib::test_support::contract;
+        use fictionet::stdlib::test_support::{chunks, decode_all, decode_chunks};
         let text = b"-----BEGIN TEST-----\r\nAQID\r\n-----END TEST-----\r\n";
-        contract::check_decode_with_alloc_limit(
-            PemBlocks::new,
-            text,
-            2 * PemBlocks::new().capacity(),
+        let alloc = 2 * PemBlocks::new().capacity();
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(PemBlocks::new()),
+                chunks(text, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= alloc)
+            ),
+            decode_all(PemBlocks::new, text)
         );
         for limit in 0..=text.len() {
-            contract::check_decode_with_alloc_limit(
-                || PemBlocks::with_limit(limit),
-                text,
-                2 * PemBlocks::with_limit(limit).capacity(),
+            let alloc = 2 * PemBlocks::with_limit(limit).capacity();
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(PemBlocks::with_limit(limit)),
+                    chunks(text, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= alloc)
+                ),
+                decode_all(|| PemBlocks::with_limit(limit), text)
             );
         }
         assert_eq!(PemBlocks::with_limit(usize::MAX).limit(), MAX_PEM_FRAME);
@@ -5351,10 +5395,14 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
             b"-----BEGIN TEST-----\nAQID\n-----END TEST-----\t",
             b"just text",
         ] {
-            contract::check_decode_with_alloc_limit(
-                PemBlocks::new,
-                text,
-                2 * PemBlocks::new().capacity(),
+            let alloc = 2 * PemBlocks::new().capacity();
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(PemBlocks::new()),
+                    chunks(text, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= alloc)
+                ),
+                decode_all(PemBlocks::new, text)
             );
             let mut stream = Stream::new(PemBlocks::new());
             let mut blocks = Vec::new();

@@ -849,11 +849,11 @@ impl Scanner<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{Decode, Step};
-    use fictionet::stdlib::codec::{Fail, Lcg, Stream, finish, pump};
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::codec::{Decode, Fail, Lcg, Step, Stream, finish, pump};
     use fictionet::stdlib::test_support::rounds;
-    use fictionet::stdlib::test_support::{decode_all, mutate};
+    use fictionet::stdlib::test_support::{
+        assert_write, chunks, decode_all, decode_chunks, mutate,
+    };
 
     fn packet_bytes(flags: u8, data: &[u8], reserved: u32) -> Vec<u8> {
         let mut v = b"ZBXD".to_vec();
@@ -915,17 +915,17 @@ mod tests {
             data_len: 1,
             reserved: 1 << 40,
         };
-        contract::check_wire_value(&h);
+        let _ = assert_write(&h);
         assert_eq!(h.to_bytes(), Err(Error::Unwritable));
         let h = Header { flags: 0x07, ..h };
-        contract::check_wire_value(&h);
+        let _ = assert_write(&h);
         assert_eq!(Header::parse(&h.to_bytes().unwrap()), Ok(h));
         let p = Packet {
             flags: 0xf8,
             reserved: 0,
             data: vec![],
         };
-        contract::check_wire_value(&p);
+        let _ = assert_write(&p);
         assert_eq!(p.to_bytes(), Err(Error::Unwritable));
     }
 
@@ -1022,7 +1022,7 @@ mod tests {
             reserved: 1 << 40,
             data: vec![1],
         };
-        contract::check_wire_value(&p);
+        let _ = assert_write(&p);
         assert_eq!(p.to_bytes(), Err(Error::Unwritable));
         assert!(
             !Error::ReservedTooLarge { len: 1, limit: 0 }
@@ -1368,10 +1368,14 @@ mod tests {
         };
         let mut bytes = a.to_bytes().unwrap();
         b.write(&mut bytes).unwrap();
-        contract::check_decode_with_alloc_limit(
-            Frames::<Packet>::new,
-            &bytes,
-            2 * Frames::<Packet>::new().capacity(),
+        let alloc = 2 * Frames::<Packet>::new().capacity();
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Packet>::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= alloc)
+            ),
+            decode_all(Frames::<Packet>::new, &bytes)
         );
         assert_eq!(
             decode_all(Frames::<Packet>::new, &bytes),
@@ -1403,19 +1407,29 @@ mod tests {
     }
 
     fn check_stream(data: &[u8], limit: usize) {
-        contract::check_decode_with_alloc_limit(
-            || Frames::<Packet>::with_limit(limit),
-            data,
-            2 * Frames::<Packet>::with_limit(limit).capacity(),
+        let alloc = 2 * Frames::<Packet>::with_limit(limit).capacity();
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Packet>::with_limit(limit)),
+                chunks(data, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= alloc)
+            ),
+            decode_all(|| Frames::<Packet>::with_limit(limit), data)
         );
-        contract::check_wire::<Packet>(data);
-        contract::check_wire::<Header>(data);
-        contract::check_wire::<Message>(data);
+        if let Ok(value) = Packet::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Header::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Message::parse(data) {
+            assert_write(&value).unwrap();
+        }
         for p in decode_all(|| Frames::<Packet>::with_limit(limit), data).0 {
-            contract::check_wire_value(&p);
+            let _ = assert_write(&p);
             if let Ok(m) = Message::parse(&p.data) {
                 assert_eq!(m.json().as_bytes(), &p.data[..]);
-                contract::check_wire_value(&m);
+                let _ = assert_write(&m);
                 assert_eq!(Message::parse(&m.to_packet().data), Ok(m));
             }
         }
