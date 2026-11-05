@@ -381,11 +381,22 @@ pub trait Answer: Send {
 
     /// IPv4 options and an optional source-route hop for an accepted SYN-ACK.
     /// Called only for IPv4, after `syn` accepts. Retransmissions of a retained
-    /// SYN use the original reply. `None` drops the SYN without an answer.
+    /// SYN use the original reply unless [`Self::retransmit_ipv4_options`]
+    /// refreshes it. `None` drops the SYN without an answer.
     /// The default sends no IPv4 options.
     fn ipv4_options(&self, syn: &Syn<'_>) -> Option<Ipv4Reply> {
         let _ = syn;
         Some(Ipv4Reply::default())
+    }
+
+    /// Refreshes IPv4 options when a retained SYN-ACK is sent again, whether
+    /// prompted by another SYN or by its retransmission timer. The handshake
+    /// retains the first SYN and first reply; this changes only the emitted
+    /// options, not the source-route next hop. `None` or options that cannot
+    /// be encoded leave the original reply unchanged. The default retains it.
+    fn retransmit_ipv4_options(&self, handshake: &Handshake) -> Option<Vec<Ipv4Option>> {
+        let _ = handshake;
+        None
     }
 
     /// What the SYN and SYN-ACK of `handshake`, answered with a SYN cookie,
@@ -734,10 +745,23 @@ pub struct Settings {
     pub socket: SocketSettings,
     /// Stateless handshake codec. With none, a full SYN queue drops new SYNs.
     pub cookies: Option<&'static dyn SynCookies>,
-    /// Per-connection timestamp offset drawn from the world's random stream.
-    pub timestamp_offset: Option<fn(&Cx) -> u32>,
-    /// Timestamp clock; an offset is added separately for each connection.
+    /// Optional pending connection limit for each peer address on a port.
+    /// `None` uses only the port's total backlog limit.
+    pub backlog_per_peer: Option<usize>,
+    /// Whether an ECN-capable SYN may negotiate ECN, given its IP ECN bits
+    /// and TCP reserved bits.
+    pub ecn_syn: fn(u8, u8) -> bool,
+    /// Initial identification for each IPv4 socket; subsequent packets
+    /// increment it. With none, packets use identification zero.
+    pub ipv4_id: Option<fn(&Cx) -> u16>,
+    /// Timestamp offset derived from the endpoint secret and address pair.
+    pub timestamp_offset: Option<TimestampOffset>,
+    /// Timestamp clock; the configured address-pair offset is added separately.
     pub timestamp_clock: Option<smoltcp::wire::TcpTimestampGenerator>,
+    /// Time without a peer response before giving up a connection.
+    pub timeout: Option<Duration>,
+    /// Idle interval before sending keepalive probes; `None` disables them.
+    pub keep_alive: Option<Duration>,
     /// How long an incomplete handshake may occupy the backlog.
     pub handshake_timeout: Duration,
     /// How long a detached connection may remain in FIN-WAIT-2.
@@ -749,13 +773,22 @@ pub struct Settings {
     pub ignore_malformed_options: bool,
 }
 
+/// Derives a timestamp offset from an endpoint secret and its local and
+/// remote addresses, in that order.
+pub type TimestampOffset = fn(&[u8; 32], IpAddr, IpAddr) -> u32;
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
             socket: SocketSettings::default(),
             cookies: None,
+            backlog_per_peer: Some(BACKLOG_PER_PEER),
+            ecn_syn: |_, _| true,
+            ipv4_id: None,
             timestamp_offset: None,
             timestamp_clock: Some(|now| (now.total_micros() / 1000) as u32),
+            timeout: Some(TIMEOUT),
+            keep_alive: Some(KEEPALIVE),
             handshake_timeout: TIMEOUT,
             orphan_timeout: TIMEOUT,
             reset_full_queue: false,
@@ -765,7 +798,7 @@ impl Default for Settings {
 }
 
 /// TCP socket settings and option layout, independent of an operating system.
-pub use smoltcp::socket::tcp::Settings as SocketSettings;
+pub use smoltcp::socket::tcp::{KeepAlivePayload, Settings as SocketSettings};
 pub use smoltcp::wire::{OptionLayout, OptionOrder};
 
 /// Starts TCP for a machine with address `addr`, on the TCP packets of
@@ -878,8 +911,9 @@ impl Options {
     /// arrived but not been accepted yet: handshakes under way, and
     /// connections waiting for [`Listener::accept`]. The default is 4,096.
     /// Values below 1 or above 65,536 are raised or lowered to those
-    /// limits. At most 256 attempts from one peer address keep handshake
-    /// state, whatever the backlog. A configured cookie codec can answer
+    /// limits. By default at most 256 attempts from one peer address keep
+    /// handshake state; [`Settings::backlog_per_peer`] changes that limit.
+    /// A configured cookie codec can answer
     /// further SYNs without allocating connection state.
     ///
     /// Past the backlog, a SYN is dropped unless [`Settings::cookies`]
@@ -1125,6 +1159,8 @@ struct State {
 /// One listening port.
 #[derive(Default)]
 struct Listen {
+    /// Connections not accepted yet, including incomplete handshakes.
+    backlog: usize,
     /// Sockets in LISTEN, waiting for a SYN.
     idle: Vec<Id>,
     /// Sockets that got a SYN and wait for the handshake to finish, each
@@ -1393,8 +1429,6 @@ fn new_socket(buffer: usize) -> (stcp::Socket<'static>, Option<Pages>) {
     };
     s.set_tsval_generator(Some(|now| (now.total_micros() / 1000) as u32));
     s.set_nagle_enabled(false);
-    s.set_timeout(Some(TIMEOUT.into()));
-    s.set_keep_alive(Some(KEEPALIVE.into()));
     (s, pages)
 }
 
@@ -1408,11 +1442,24 @@ impl State {
     /// Adds a socket made by [`new_socket`].
     fn add_socket(&mut self, (mut s, pages): (stcp::Socket<'static>, Option<Pages>)) -> Id {
         s.set_settings(self.settings.socket);
+        if let Some(id) = self.settings.ipv4_id {
+            s.set_ipv4_identification(id(&self.fcx));
+        }
+        s.set_timeout(self.settings.timeout.map(Into::into));
+        s.set_keep_alive(self.settings.keep_alive.map(Into::into));
         if s.state() != TcpState::SynReceived {
             s.set_tsval_generator(self.settings.timestamp_clock);
         }
-        if let Some(offset) = self.settings.timestamp_offset {
-            s.set_timestamp_offset(offset(&self.fcx));
+        if let (Some(offset), Some(local), Some(remote)) = (
+            self.settings.timestamp_offset,
+            s.local_endpoint(),
+            s.remote_endpoint(),
+        ) {
+            s.set_timestamp_offset(offset(
+                &self.cookie_key,
+                SocketAddr::from(local).ip(),
+                SocketAddr::from(remote).ip(),
+            ));
         }
         let h = Id(self.next_id);
         self.next_id += 1;
@@ -1562,7 +1609,7 @@ impl State {
 
     /// Records the sequence number of an outgoing SYN, for ICMP checks, or
     /// of a SYN-ACK, for the connection's [`Handshake`].
-    fn sent(&mut self, packet: &mut [u8]) {
+    fn sent(&mut self, packet: &mut Vec<u8>) {
         let Some(ip) = Header::parse_whole(packet) else {
             return;
         };
@@ -1590,6 +1637,7 @@ impl State {
             }
         }
         let remote = SocketAddr::new(destination, u16::from_be_bytes([t[2], t[3]]));
+        let mut refreshed = None;
         if let Some(h) = self.by_tuple.get(&(local, remote)) {
             let c = self.conns.get_mut(h).unwrap();
             let seq = u32::from_be_bytes([t[4], t[5], t[6], t[7]]);
@@ -1597,16 +1645,40 @@ impl State {
                 (Side::Client, 0x02) => {
                     c.iss.get_or_insert(seq);
                 }
-                (Side::Server, 0x12) => c.handshake.iss = seq,
+                (Side::Server, 0x12) => {
+                    c.handshake.iss = seq;
+                    if c.iss.replace(seq).is_some()
+                        && local.is_ipv4()
+                        && let Some(answer) = self
+                            .listeners
+                            .get(&local.port())
+                            .and_then(|listener| listener.answer.as_ref())
+                    {
+                        refreshed = answer.retransmit_ipv4_options(&c.handshake);
+                    }
+                }
                 _ => {}
             }
             if c.ecn && t[13] & 0x04 == 0 && (t[13] & 0x12 == 0x12 || c.congestion_echo) {
-                let t = &mut packet[ip.payload];
+                let t = &mut packet[ip.payload.clone()];
                 t[13] |= 0x40;
                 t[16..18].fill(0);
                 let sum = transport_checksum(local.ip(), remote.ip(), TCP, t);
                 t[16..18].copy_from_slice(&sum.to_be_bytes());
             }
+        }
+        if let Some(options) = refreshed
+            && let Ok(mut bytes) = encode_ipv4_options(&options)
+        {
+            bytes.resize(bytes.len().div_ceil(4) * 4, 0);
+            let header_len = 20 + bytes.len();
+            let Ok(length) = u16::try_from(packet.len() + header_len - ip.payload.start) else {
+                return;
+            };
+            packet.splice(20..ip.payload.start, bytes);
+            packet[0] = 0x40 | (header_len / 4) as u8;
+            packet[2..4].copy_from_slice(&length.to_be_bytes());
+            fictionet::stdlib::network::ip::set_header_checksum(&mut packet[..header_len]);
         }
     }
 
@@ -1739,14 +1811,21 @@ impl State {
         let dst = SocketAddr::new(ip.dst, u16::from_be_bytes([t[2], t[3]]));
         let arrived = Arrived::of(src, dst, t, repr.payload.len());
         let flags = t[13];
-        let congestion = if ip.src.is_ipv4() {
-            packet[1] & 3 == 3
+        let ip_ecn = if ip.src.is_ipv4() {
+            packet[1] & 3
         } else {
-            packet[1] >> 4 & 3 == 3
+            packet[1] >> 4 & 3
         };
+        let congestion = ip_ecn == 3;
+        let ecn = flags & 0xc0 == 0xc0 && (self.settings.ecn_syn)(ip_ecn, t[12] & 15);
         let (syn, rst, ack) = (flags & 6 == 2, flags & 4 != 0, flags & 16 != 0);
         let new =
             !self.by_tuple.contains_key(&(dst, src)) && self.listeners.contains_key(&dst.port());
+        // LISTEN ignores segments without SYN, ACK or RST (RFC 9293).
+        // Idle sockets are allocated lazily, so handle this before dispatch.
+        if new && !syn && !ack && !rst {
+            return false;
+        }
         // A SYN for a listener that smoltcp is to take: its options, and
         // what the listener's answer adds to the SYN-ACK.
         let mut attempt = None;
@@ -1754,6 +1833,7 @@ impl State {
             let Some(taken) = self.attempt(
                 arrived,
                 t,
+                ecn,
                 if src.is_ipv4() {
                     Some(ipv4_options(&packet).expect("validated IPv4 header"))
                 } else {
@@ -1883,7 +1963,7 @@ impl State {
                     .set_syn_ipv4_options(&ipv4_reply.options, ipv4_reply.destination)
                     .expect("attempt checked IPv4 options");
                 let mut conn = Conn::new(local, remote, Side::Server);
-                conn.ecn = flags & 0xc0 == 0xc0;
+                conn.ecn = ecn;
                 conn.handshake.syn_ipv4 = syn_ipv4.map(Arc::from);
                 conn.handshake.syn_ack_ipv4 = local.is_ipv4().then(|| ipv4_reply.options.into());
                 conn.handshake.syn = Some(syn);
@@ -1906,20 +1986,21 @@ impl State {
         &mut self,
         arrived: Arrived,
         t: &[u8],
+        ecn: bool,
         syn_ipv4: Option<Vec<Ipv4Option>>,
         now: smoltcp::time::Instant,
     ) -> Option<Attempt> {
         let (src, dst) = (arrived.from, arrived.to);
         let l = &self.listeners[&dst.port()];
-        let peer_full = l
-            .per_peer
-            .get(&src.ip())
-            .is_some_and(|&n| n >= BACKLOG_PER_PEER);
-        if l.ready.len() >= self.backlog && self.settings.reset_full_queue {
+        let peer_full = self
+            .settings
+            .backlog_per_peer
+            .is_some_and(|limit| l.per_peer.get(&src.ip()).is_some_and(|&n| n >= limit));
+        if l.ready.len() >= l.backlog && self.settings.reset_full_queue {
             self.dev.tx.push(arrived.reset(&[]));
             return None;
         }
-        if l.ready.len() >= self.backlog
+        if l.ready.len() >= l.backlog
             || (peer_full
                 && self
                     .isolated_peer
@@ -1929,7 +2010,7 @@ impl State {
             return None;
         }
         let syn = segment_options(t);
-        let cookie = l.embryonic.len() + l.ready.len() >= self.backlog || peer_full;
+        let cookie = l.embryonic.len() + l.ready.len() >= l.backlog || peer_full;
         let asked = Syn {
             options: &syn,
             ipv4_options: syn_ipv4.as_deref().unwrap_or_default(),
@@ -1973,7 +2054,7 @@ impl State {
                 sequence: arrived.seq,
                 now: Duration::from_micros(now.total_micros().max(0) as u64),
                 options: &syn,
-                ecn: t[13] & 0xc0 == 0xc0,
+                ecn,
             };
             let CookieReply {
                 sequence: iss,
@@ -2039,7 +2120,7 @@ impl State {
             socket.set_timestamp_offset(
                 self.settings
                     .timestamp_offset
-                    .map_or(0, |offset| offset(&self.fcx)),
+                    .map_or(0, |offset| offset(&self.cookie_key, dst.ip(), src.ip())),
             );
         }
         Some(Attempt {
@@ -2078,11 +2159,11 @@ impl State {
             return true;
         };
         let l = &self.listeners[&dst.port()];
-        if l.ready.len() >= self.backlog
-            || (l
-                .per_peer
-                .get(&src.ip())
-                .is_some_and(|&n| n >= BACKLOG_PER_PEER)
+        if l.ready.len() >= l.backlog
+            || (self
+                .settings
+                .backlog_per_peer
+                .is_some_and(|limit| l.per_peer.get(&src.ip()).is_some_and(|&n| n >= limit))
                 && self
                     .isolated_peer
                     .as_ref()
@@ -2539,7 +2620,14 @@ impl Endpoint {
                 self.shared.addr
             )));
         }
-        st.listeners.insert(port, Listen::default());
+        let backlog = st.backlog;
+        st.listeners.insert(
+            port,
+            Listen {
+                backlog,
+                ..Listen::default()
+            },
+        );
         st.take_port(port);
         Ok(Listener {
             shared: self.shared.clone(),
@@ -2652,6 +2740,19 @@ pub struct Listener {
 }
 
 impl Listener {
+    /// Sets this port's limit of connections not accepted yet, including
+    /// incomplete handshakes. Uses the bounds of [`Options::backlog`].
+    /// Existing connections remain when the limit is lowered.
+    pub fn backlog(&mut self, connections: usize) {
+        self.shared
+            .state
+            .lock()
+            .listeners
+            .get_mut(&self.port)
+            .expect("a listener has its port")
+            .backlog = connections.clamp(1, MAX_BACKLOG);
+    }
+
     /// Answers each connection attempt from now on with `answer`.
     ///
     /// [`Answer::syn`] sees each SYN's options. [`SynAnswer::Accept`] adds
@@ -2901,8 +3002,10 @@ impl GoneWatch {
     pub fn set_keep_alive(&self, interval: Option<Duration>) {
         let mut st = self.shared.state.lock();
         if st.conns.get(&self.handle).is_some_and(|c| !c.orphaned) {
-            st.sock(self.handle)
-                .set_keep_alive(interval.map(Into::into));
+            let now = smol_now(&st.fcx);
+            let socket = st.sock(self.handle);
+            socket.set_keep_alive(interval.map(Into::into));
+            socket.restart_keep_alive(now);
             st.kick();
         }
     }
@@ -4875,6 +4978,42 @@ mod tests {
     }
 
     #[test]
+    fn listener_backlogs_are_independent() {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
+            let (_raw, side) = pair();
+            let address = "10.0.0.1".parse()?;
+            let server = endpoint_with(&fcx, side, address, cookie_options().backlog(4));
+            let mut small = server.listen(80)?;
+            let _large = server.listen(81)?;
+            small.backlog(1);
+            let now = smol_now(&fcx);
+            {
+                let mut st = server.shared.state.lock();
+                for port in [80, 81] {
+                    for source in [1000, 1001] {
+                        let peer = SocketAddr::new("10.0.0.2".parse()?, source);
+                        let local = SocketAddr::new(address, port);
+                        st.ingress(address, now, segment(peer, local, 7, 0, 0x02).0);
+                        assert_eq!(egress(&mut st, now).len(), 1);
+                    }
+                }
+                assert_eq!(st.listeners[&80].embryonic.len(), 1);
+                assert_eq!(st.listeners[&81].embryonic.len(), 2);
+            }
+            small.backlog(0);
+            assert_eq!(server.shared.state.lock().listeners[&80].backlog, 1);
+            small.backlog(usize::MAX);
+            assert_eq!(
+                server.shared.state.lock().listeners[&80].backlog,
+                MAX_BACKLOG
+            );
+            fcx.cancel();
+            Ok(())
+        }))
+        .unwrap();
+    }
+
+    #[test]
     fn spoofed_syns_cannot_block_a_real_peer_cookie_handshake() {
         block_on(lab(Seed::from_u64(1), |fcx| async move {
             let (_raw, side) = pair();
@@ -5475,6 +5614,79 @@ mod tests {
             Err::<(), fictionet::Error>(fictionet::Error::msg("done"))
         }));
         assert_eq!(result.unwrap_err().to_string(), "done");
+    }
+
+    #[test]
+    fn syn_ack_timer_refreshes_wire_ipv4_options_and_retains_the_first_reply() {
+        struct Refresh(Option<Vec<Ipv4Option>>);
+
+        impl Answer for Refresh {
+            fn syn(&self, _: &Syn<'_>) -> SynAnswer {
+                SynAnswer::Accept(Vec::new())
+            }
+
+            fn ipv4_options(&self, _: &Syn<'_>) -> Option<Ipv4Reply> {
+                Some(Ipv4Reply {
+                    options: vec![Ipv4Option::NoOperation],
+                    destination: None,
+                })
+            }
+
+            fn retransmit_ipv4_options(&self, handshake: &Handshake) -> Option<Vec<Ipv4Option>> {
+                assert_eq!(handshake.syn_ipv4.as_deref(), Some([].as_slice()));
+                assert_eq!(
+                    handshake.syn_ack_ipv4.as_deref(),
+                    Some([Ipv4Option::NoOperation].as_slice())
+                );
+                self.0.clone()
+            }
+        }
+
+        for replacement in [
+            None,
+            Some(vec![Ipv4Option::RouterAlert(1), Ipv4Option::RouterAlert(2)]),
+            Some(vec![Ipv4Option::Unknown {
+                kind: 222,
+                data: vec![0; 40],
+            }]),
+        ] {
+            block_on(lab(Seed::from_u64(7), |fcx| async move {
+                let (_raw, side) = pair();
+                let local: SocketAddr = "10.0.0.1:80".parse()?;
+                let peer: SocketAddr = "10.0.0.2:1000".parse()?;
+                let endpoint = endpoint(&fcx, side, local.ip());
+                let mut listener = endpoint.listen(local.port())?;
+                listener.answer(Box::new(Refresh(replacement.clone())));
+                let mut state = endpoint.shared.state.lock();
+                let now = smol_now(&fcx);
+                state.ingress(local.ip(), now, segment(peer, local, 100, 0, 2).0);
+                let first = egress(&mut state, now).remove(0);
+                let first_header = Header::parse_whole(&first).unwrap();
+                assert_eq!(&first[20..first_header.payload.start], &[1, 0, 0, 0]);
+                let second =
+                    egress(&mut state, now + smoltcp::time::Duration::from_millis(1000)).remove(0);
+                let second_header = Header::parse_whole(&second).unwrap();
+                let expected = replacement
+                    .as_ref()
+                    .and_then(|options| encode_ipv4_options(options).ok());
+                assert_eq!(
+                    &second[20..second_header.payload.start],
+                    expected.as_deref().unwrap_or(&[1, 0, 0, 0])
+                );
+                assert_eq!(second_header.payload(&second), first_header.payload(&first));
+                assert_eq!(
+                    transport_checksum(local.ip(), peer.ip(), TCP, second_header.payload(&second)),
+                    0
+                );
+                let handle = state.by_tuple[&(local, peer)];
+                assert_eq!(
+                    state.conns[&handle].handshake.syn_ack_ipv4.as_deref(),
+                    Some([Ipv4Option::NoOperation].as_slice())
+                );
+                Ok(())
+            }))
+            .unwrap();
+        }
     }
 
     #[test]

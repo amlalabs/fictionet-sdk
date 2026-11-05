@@ -240,6 +240,7 @@ impl Repr {
     ) -> Self {
         match (src_addr, dst_addr) {
             (Address::Ipv4(src_addr), Address::Ipv4(dst_addr)) => Self::Ipv4(Ipv4Repr {
+                identification: 0,
                 options: crate::wire::Ipv4OptionBytes::EMPTY,
                 wire_dst: None,
                 src_addr,

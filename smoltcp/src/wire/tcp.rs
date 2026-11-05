@@ -855,14 +855,6 @@ impl TcpTimestampRepr {
         Self { tsval, tsecr }
     }
 
-    pub(crate) fn generate_reply(
-        &self,
-        generator: Option<TcpTimestampGenerator>,
-        now: crate::time::Instant,
-    ) -> Option<Self> {
-        Self::generate_reply_with_tsval(generator, self.tsval, now)
-    }
-
     pub(crate) fn generate_reply_with_tsval(
         generator: Option<TcpTimestampGenerator>,
         tsval: u32,

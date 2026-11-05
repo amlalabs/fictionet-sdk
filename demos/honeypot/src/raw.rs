@@ -10,7 +10,8 @@ use fictionet::stdlib::network::ethernet::host::{self, Host, Ipv4Config, Ipv6Con
 use fictionet::sync::Mutex;
 use fictionet::time::Instant;
 use fictionet::{Cx, Interface, Packet};
-use fictionet_host::raw::{EthernetFrame, RawAttachment, RawSender};
+use fictionet_host::raw::{EthernetFrame, RawAttachment, RawReceiveStats, RawSender};
+use serde::Serialize;
 
 use crate::observe::{Direction, Hex, Sink, Sinks};
 use crate::{Clock, Config, Honeypot, INTERNET};
@@ -22,20 +23,36 @@ struct Capture {
     writer: Sink,
     lost: u64,
     clock: Clock,
+    receive_stats: RawReceiveStats,
+    reported_queue_dropped: u64,
+}
+
+#[derive(Serialize)]
+struct FrameRecord {
+    at_us: u64,
+    direction: Direction,
+    bytes: Hex,
+    lost: u64,
+    rx_queue_dropped: u64,
+    nic_rx_dropped: Option<u64>,
 }
 
 impl Capture {
     fn frame(&mut self, fcx: &Cx, direction: Direction, bytes: &[u8]) {
-        let record = serde_json::json!({
-            "at_us": self.clock.micros(fcx.now()),
-            "direction": direction,
-            "bytes": Hex(bytes.to_vec()),
-            "lost": self.lost,
-        });
+        let queue_dropped = self.receive_stats.queue_dropped();
+        let record = FrameRecord {
+            at_us: self.clock.micros(fcx.now()),
+            direction,
+            bytes: Hex(bytes.to_vec()),
+            lost: self.lost,
+            rx_queue_dropped: queue_dropped.saturating_sub(self.reported_queue_dropped),
+            nic_rx_dropped: None,
+        };
         let mut line = serde_json::to_vec(&record).expect("a frame record is serializable");
         line.push(b'\n');
         if self.writer.put(&line) {
             self.lost = 0;
+            self.reported_queue_dropped = queue_dropped;
         } else {
             self.lost = self.lost.saturating_add(1);
         }
@@ -103,10 +120,13 @@ fn host(config: &Config, mac: Mac, now: Instant) -> fictionet::Result<Host> {
 
 /// Starts the existing honeypot behind a complete Ethernet attachment.
 ///
-/// `raw_log` receives every frame, both ways, including malformed headers,
-/// VLAN tags, unknown EtherTypes and Ethernet padding, as hexadecimal JSON
-/// lines before parsing. Refused records are counted in the next accepted
-/// record; partial records are completed before the next one. `sinks`
+/// `raw_log` receives every frame reaching the world, both ways, including
+/// malformed headers, VLAN tags, unknown EtherTypes and Ethernet padding,
+/// as hexadecimal JSON lines before parsing. `lost` counts refused log records and
+/// `rx_queue_dropped` counts frames the full host receive queue discarded,
+/// both since the last accepted record. `nic_rx_dropped` is null because
+/// device and backend losses are unavailable, not zero. Partial records
+/// are completed before the next one. `sinks`
 /// retain the existing IP capture and TCP option observations.
 ///
 /// The link-layer work is done by an
@@ -140,6 +160,7 @@ pub fn start_raw(
     raw_log: Box<dyn Write + Send>,
 ) -> fictionet::Result<Honeypot> {
     let host = host(config, raw.mac_address(), fcx.now())?;
+    let receive_stats = raw.receive_stats();
     let (sender, mut receiver) = raw.split();
     let (attacher, attachments) = fictionet::attachments();
     let end = Arc::new(Mutex::new(attacher.attach(INTERNET)?));
@@ -150,6 +171,8 @@ pub fn start_raw(
             writer: Sink::new(raw_log),
             lost: 0,
             clock,
+            receive_stats,
+            reported_queue_dropped: 0,
         },
         sender,
         timer: None,
@@ -360,6 +383,70 @@ mod tests {
                 })
                 .collect()
         }
+    }
+
+    #[test]
+    fn receive_losses_survive_a_refused_log_record() {
+        struct Refusing {
+            log: Shared,
+            refuse: bool,
+        }
+
+        impl Write for Refusing {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if std::mem::take(&mut self.refuse) {
+                    return Err(std::io::Error::other("disk full"));
+                }
+                self.log.write(bytes)
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        fictionet::block_on(fictionet::run(
+            fictionet::Seed::from_u64(0),
+            move |fcx| async move {
+                let (raw, wire) = RawAttachment::in_memory(MAC);
+                while wire.try_send(EthernetFrame(vec![0; 14]))? {}
+                let log = Shared::default();
+                let mut capture = Capture {
+                    writer: Sink::new(Box::new(Refusing {
+                        log: log.clone(),
+                        refuse: true,
+                    })),
+                    lost: 0,
+                    clock: Clock::at_unix_secs(1_800_000_000),
+                    receive_stats: raw.receive_stats(),
+                    reported_queue_dropped: 0,
+                };
+                capture.frame(&fcx, Direction::In, &[1; 14]);
+                assert!(log.0.lock().unwrap().is_empty());
+                for _ in 0..2 {
+                    assert!(!wire.try_send(EthernetFrame(vec![0; 14]))?);
+                }
+                capture.frame(&fcx, Direction::Out, &[2; 14]);
+                assert!(!wire.try_send(EthernetFrame(vec![0; 14]))?);
+                capture.frame(&fcx, Direction::In, &[3; 14]);
+                capture.frame(&fcx, Direction::Out, &[4; 14]);
+                let log = log.0.lock().unwrap();
+                let records: Vec<Value> = std::str::from_utf8(&log)
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                assert_eq!(records.len(), 3);
+                for (record, (lost, dropped)) in records.iter().zip([(1, 3), (0, 1), (0, 0)]) {
+                    assert_eq!(record["lost"], lost);
+                    assert_eq!(record["rx_queue_dropped"], dropped);
+                    assert!(record["nic_rx_dropped"].is_null());
+                    assert!(record.as_object().unwrap().contains_key("nic_rx_dropped"));
+                }
+                Ok(())
+            },
+        ))
+        .unwrap();
     }
 
     /// Starts the raw honeypot with `config` on an in-memory wire, and runs

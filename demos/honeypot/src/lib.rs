@@ -7,10 +7,10 @@
 //!
 //! The world is one host at a public IPv4 address ([`Config::address`]),
 //! and at a public IPv6 address too when it has one
-//! ([`Config::address_v6`]), with MPTCP listeners on its open ports: SSH
-//! with an OpenSSH identification line and HTTP with nginx's default page
-//! ([`services`]). Both addresses serve the same ports. A SYN with
-//! MP_CAPABLE gets an RFC 8684 SYN-ACK with MP_CAPABLE and a key, its data
+//! ([`Config::address_v6`]), with ordinary OpenSSH on port 22 and Caddy's
+//! packaged HTTP site on port 80 ([`services`]). The explicit nginx profile
+//! uses ordinary TCP for HTTP. Both addresses serve the same ports. On a
+//! Caddy port, a SYN with MP_CAPABLE gets an RFC 8684 SYN-ACK with a key, its data
 //! then carries DSS, and an MP_JOIN is answered, taken or refused as Linux
 //! answers, takes and refuses it ([`mptcp`]). The internet reaches the
 //! host through an attachment called [`INTERNET`], which carries both
@@ -61,7 +61,7 @@ pub mod raw;
 #[cfg(all(feature = "raw-virtio", target_os = "linux"))]
 pub use raw::start_raw;
 
-pub use config::{Args, Config, Port, Service};
+pub use config::{Args, Config, HttpProfile, Port, Service};
 use mptcp::{Listener, Tokens};
 use observe::{Direction, Observer, Sinks};
 
@@ -109,25 +109,43 @@ impl Clock {
 pub fn network(fcx: &Cx, config: &Config, clock: Clock, tokens: &Arc<Tokens>) -> Net {
     let mut server = Host::new("server")
         .at(config.address)
-        .tcp_options(fictionet_extras::linux::tcp());
+        .tcp_options(fictionet_extras::linux::tcp())
+        .icmp_options(fictionet_extras::linux::icmp(fcx));
     server = match config.address_v6 {
         Some(address_v6) => server.at(address_v6),
         None => server.ipv4_only(),
     };
     for port in &config.ports {
+        let timestamp = {
+            let fcx = fcx.clone();
+            move || ((clock.micros(fcx.now()) / 1000) % 86_400_000) as u32
+        };
         server = match port.service {
             Service::Ssh => server.port_server(
                 port.number,
-                Listener::new(fcx, clock, tokens.clone(), port.number, services::Ssh),
+                fictionet_extras::linux::with_ipv4_options(services::Ssh, timestamp),
             ),
-            Service::Http => server.port_server(
+            Service::Http if config.http_profile == HttpProfile::Caddy => server.port_server(
                 port.number,
                 Listener::new(
                     fcx,
                     clock,
                     tokens.clone(),
                     port.number,
-                    services::Http { clock },
+                    services::Http {
+                        clock,
+                        profile: config.http_profile,
+                    },
+                ),
+            ),
+            Service::Http => server.port_server(
+                port.number,
+                fictionet_extras::linux::with_ipv4_options(
+                    services::Http {
+                        clock,
+                        profile: config.http_profile,
+                    },
+                    timestamp,
                 ),
             ),
         };

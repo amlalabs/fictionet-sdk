@@ -1,19 +1,20 @@
 //! Linux transport choices for worlds that emulate a Linux host.
 //!
-//! Based on Linux v6.12: `net/ipv4/tcp_output.c` (`tcp_options_write`,
+//! Based on Linux v6.8: `net/ipv4/tcp_output.c` (`tcp_options_write`,
 //! `tcp_select_initial_window`), `net/ipv4/syncookies.c`,
 //! `net/ipv6/syncookies.c`, and `include/net/tcp.h` (`TCP_TIMEWAIT_LEN`).
 //! The window values assume an Ethernet MTU of 1500 and default receive
 //! memory settings. Linux sysctls and route metrics can change them.
 //!
-//! Sources: [TCP output](https://github.com/torvalds/linux/blob/v6.12/net/ipv4/tcp_output.c),
-//! [IPv4 cookies](https://github.com/torvalds/linux/blob/v6.12/net/ipv4/syncookies.c),
-//! [IPv6 cookies](https://github.com/torvalds/linux/blob/v6.12/net/ipv6/syncookies.c),
-//! [TCP timers](https://github.com/torvalds/linux/blob/v6.12/include/net/tcp.h),
-//! and [MPTCP options](https://github.com/torvalds/linux/blob/v6.12/net/mptcp/options.c).
+//! Sources: [TCP output](https://github.com/torvalds/linux/blob/v6.8/net/ipv4/tcp_output.c),
+//! [IPv4 cookies](https://github.com/torvalds/linux/blob/v6.8/net/ipv4/syncookies.c),
+//! [IPv6 cookies](https://github.com/torvalds/linux/blob/v6.8/net/ipv6/syncookies.c),
+//! [TCP timers](https://github.com/torvalds/linux/blob/v6.8/include/net/tcp.h),
+//! [timestamp offsets](https://github.com/torvalds/linux/blob/v6.8/net/core/secure_seq.c),
+//! [challenge ACKs](https://github.com/torvalds/linux/blob/v6.8/net/ipv4/tcp_input.c),
+//! and [MPTCP options](https://github.com/torvalds/linux/blob/v6.8/net/mptcp/options.c).
 
-use fictionet::Cx;
-use fictionet::stdlib::network::ip::{Ipv4Option, Ipv4Reply};
+use fictionet::stdlib::network::ip::{Ipv4Option, Ipv4Reply, Ipv4Timestamp};
 use fictionet::stdlib::network::tcp::{
     self, CookieInput, CookieReply, CookieState, SynCookies, TcpOption,
 };
@@ -21,7 +22,114 @@ use siphasher::sip::SipHasher24;
 use std::hash::Hasher;
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
+use std::sync::Arc;
 use std::time::Duration;
+
+/// Adds Linux's IPv4 SYN reply options to a port's handshake policy.
+/// `timestamp` supplies milliseconds since midnight UTC in the world's clock.
+/// The underlying service still chooses its TCP options and backlog.
+pub fn with_ipv4_options<S, F>(
+    server: S,
+    timestamp: F,
+) -> impl fictionet::stdlib::world::net::PortServer
+where
+    S: fictionet::stdlib::world::net::PortServer,
+    F: Fn() -> u32 + Send + Sync + 'static,
+{
+    Ipv4Server {
+        server,
+        timestamp: Arc::new(timestamp),
+    }
+}
+
+struct Ipv4Server<S, F> {
+    server: S,
+    timestamp: Arc<F>,
+}
+
+impl<S, F> fictionet::stdlib::world::net::PortServer for Ipv4Server<S, F>
+where
+    S: fictionet::stdlib::world::net::PortServer,
+    F: Fn() -> u32 + Send + Sync + 'static,
+{
+    fn serve(
+        &self,
+        fcx: fictionet::Cx,
+        arrival: fictionet::stdlib::world::net::Arrival,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        self.server.serve(fcx, arrival)
+    }
+
+    fn backlog(&self) -> Option<usize> {
+        self.server.backlog()
+    }
+
+    fn alpn(&self) -> Vec<Vec<u8>> {
+        self.server.alpn()
+    }
+
+    fn answer(&self) -> Option<Box<dyn tcp::Answer>> {
+        Some(Box::new(Ipv4Answers {
+            inner: self.server.answer(),
+            timestamp: self.timestamp.clone(),
+        }))
+    }
+}
+
+struct Ipv4Answers<F> {
+    inner: Option<Box<dyn tcp::Answer>>,
+    timestamp: Arc<F>,
+}
+
+impl<F: Fn() -> u32 + Send + Sync> tcp::Answer for Ipv4Answers<F> {
+    fn syn(&self, syn: &tcp::Syn<'_>) -> tcp::SynAnswer {
+        self.inner.as_ref().map_or_else(
+            || tcp::SynAnswer::Accept(Vec::new()),
+            |inner| inner.syn(syn),
+        )
+    }
+
+    fn ipv4_options(&self, syn: &tcp::Syn<'_>) -> Option<Ipv4Reply> {
+        let (IpAddr::V4(local), IpAddr::V4(remote)) = (syn.to.ip(), syn.from.ip()) else {
+            return Some(Ipv4Reply::default());
+        };
+        ipv4_options(
+            syn.ipv4_options,
+            local,
+            remote,
+            (self.timestamp)(),
+            |address| {
+                address != local
+                    && !address.is_unspecified()
+                    && !address.is_loopback()
+                    && !address.is_multicast()
+                    && !address.is_broadcast()
+            },
+        )
+    }
+
+    fn retransmit_ipv4_options(&self, handshake: &tcp::Handshake) -> Option<Vec<Ipv4Option>> {
+        retransmit_ipv4_options(
+            handshake.syn_ipv4.as_deref()?,
+            handshake.syn_ack_ipv4.as_deref()?,
+            (self.timestamp)(),
+        )
+    }
+
+    fn cookie(&self, from: std::net::SocketAddr, handshake: &tcp::Handshake) -> Option<tcp::Kept> {
+        self.inner.as_ref()?.cookie(from, handshake)
+    }
+
+    fn ack(&self, handshake: &tcp::Handshake) -> tcp::AckAnswer {
+        self.inner
+            .as_ref()
+            .map_or(tcp::AckAnswer::Accept, |inner| inner.ack(handshake))
+    }
+
+    fn segments(&self, handshake: &tcp::Handshake) -> Option<Box<dyn tcp::Segments>> {
+        self.inner.as_ref()?.segments(handshake)
+    }
+}
 
 /// IPv4 reply options following Linux receive compilation, option echo and build.
 ///
@@ -33,7 +141,7 @@ use std::time::Duration;
 /// Unknown options are not echoed. Source routes return their first hop
 /// separately; TCP's checksum still uses the original peer address.
 ///
-/// See [Linux option handling](https://github.com/torvalds/linux/blob/v6.12/net/ipv4/ip_options.c),
+/// See [Linux option handling](https://github.com/torvalds/linux/blob/v6.8/net/ipv4/ip_options.c),
 /// [IPv4 options](https://www.rfc-editor.org/rfc/rfc791.html#section-3.1), and
 /// [source routes](https://www.rfc-editor.org/rfc/rfc1812.html#section-5.2.4.1).
 pub fn ipv4_options(
@@ -152,9 +260,108 @@ pub fn ipv4_options(
     Some(reply)
 }
 
+/// Refreshes the send timestamp in a retained IPv4 SYN-ACK's options.
+///
+/// `syn` is the original received option list and `reply` is its first
+/// [`ipv4_options`] result. Only a timestamp slot reserved for sending is
+/// updated. The receive timestamp, pointers, overflow, addresses and unused
+/// slots retain their first values. `None` means there is no send timestamp.
+pub fn retransmit_ipv4_options(
+    syn: &[Ipv4Option],
+    reply: &[Ipv4Option],
+    timestamp: u32,
+) -> Option<Vec<Ipv4Option>> {
+    let received = syn
+        .iter()
+        .take_while(|option| !matches!(option, Ipv4Option::EndOfList))
+        .find_map(|option| match option {
+            Ipv4Option::Timestamp { pointer, .. } => Some(u16::from(*pointer)),
+            _ => None,
+        })?;
+    let mut refreshed = reply.to_vec();
+    for option in &mut refreshed {
+        let Ipv4Option::Timestamp {
+            pointer,
+            timestamps,
+            ..
+        } = option
+        else {
+            continue;
+        };
+        let step = match timestamps {
+            Ipv4Timestamp::Timestamps(_) => 4,
+            Ipv4Timestamp::Addresses(_) | Ipv4Timestamp::Prespecified(_) => 8,
+            Ipv4Timestamp::Unknown { .. } => return None,
+        };
+        if u16::from(*pointer) != received + 2 * step {
+            return None;
+        }
+        let end = usize::from(*pointer) - 1;
+        let mut bytes =
+            fictionet::stdlib::network::ip::encode_ipv4_options(std::slice::from_ref(option))
+                .ok()?;
+        bytes
+            .get_mut(end.checked_sub(4)?..end)?
+            .copy_from_slice(&timestamp.to_be_bytes());
+        *option = fictionet::stdlib::network::ip::Ipv4Options::new(&bytes).next()?;
+        return Some(refreshed);
+    }
+    None
+}
+
 /// TCP settings for a Linux server with the default Ethernet window.
 pub fn tcp() -> tcp::Options {
     tcp::Options::default().settings(settings())
+}
+
+/// ICMP replies for the Ubuntu generic kernel on a host with two GiB of RAM.
+///
+/// IPv4 echo replies preserve the request's TOS and code. Errors use Internet
+/// Control precedence. Both use the shared hashed identification counters,
+/// with random perturbation below the elapsed number of 1000 Hz ticks.
+/// The 32768 buckets match Linux's allocation of one bucket per 64 KiB.
+/// See [ICMP replies](https://github.com/torvalds/linux/blob/v6.8/net/ipv4/icmp.c)
+/// and [identification allocation](https://github.com/torvalds/linux/blob/v6.8/net/ipv4/route.c).
+pub fn icmp(fcx: &fictionet::Cx) -> fictionet::stdlib::network::icmp::Options {
+    use fictionet::Entropy;
+    use fictionet::stdlib::network::{icmp, ip};
+    use fictionet::sync::Mutex;
+    use std::sync::Arc;
+
+    let mut key = [0; 16];
+    fcx.fill_random(&mut key);
+    let counters = Mutex::new(
+        (0..32768)
+            .map(|_| (fcx.random_u64() as u32, 0u32))
+            .collect::<Vec<_>>(),
+    );
+    let fcx = fcx.clone();
+    icmp::Options {
+        echo_nonzero_code: true,
+        ipv4_fields: Some(Arc::new(move |source, destination, tos, error| {
+            let mut hash = SipHasher24::new_with_key(&key);
+            hash.write(&destination.octets());
+            hash.write(&source.octets());
+            hash.write(&u32::from(ip::protocol::ICMP).to_le_bytes());
+            let mut counters = counters.lock();
+            let counter = &mut counters[hash.finish() as usize & 32767];
+            let tick = fcx.now().since_start().as_millis() as u32;
+            if counter.1 != tick {
+                counter.0 = counter
+                    .0
+                    .wrapping_add(fcx.random_below(u64::from(tick.wrapping_sub(counter.1))) as u32);
+                counter.1 = tick;
+            }
+            let id = counter.0 as u16;
+            counter.0 = counter.0.wrapping_add(1);
+            ip::Fields {
+                ttl: 64,
+                tos: if error { (tos & 0x1e) | 0xc0 } else { tos },
+                id,
+                dont_fragment: false,
+            }
+        })),
+    }
 }
 
 /// Linux choices, available separately for worlds with custom buffer limits.
@@ -173,12 +380,23 @@ pub fn settings() -> tcp::Settings {
         ack_segments: 1,
         ack_inclusive: false,
         window_update_ratio: 2,
+        challenge_ack_interval: Duration::from_millis(500).into(),
+        keep_alive_payload: tcp::KeepAlivePayload::Empty,
     };
     tcp::Settings {
         socket,
         cookies: Some(&Cookies),
+        backlog_per_peer: None,
+        ecn_syn: |ecn, reserved| ecn == 0 || reserved != 0,
+        ipv4_id: Some(|cx| {
+            let mut bytes = [0; 2];
+            cx.fill_random(&mut bytes);
+            u16::from_le_bytes(bytes)
+        }),
         timestamp_offset: Some(offset),
         timestamp_clock: Some(|now| (now.total_micros() / 1000) as u32),
+        timeout: None,
+        keep_alive: None,
         handshake_timeout: Duration::from_secs(63),
         orphan_timeout: Duration::from_secs(60),
         reset_full_queue: false,
@@ -186,10 +404,15 @@ pub fn settings() -> tcp::Settings {
     }
 }
 
-fn offset(cx: &Cx) -> u32 {
-    let mut bytes = [0; 4];
-    cx.fill_random(&mut bytes);
-    u32::from_le_bytes(bytes)
+fn offset(key: &[u8; 32], local: IpAddr, remote: IpAddr) -> u32 {
+    let mut hash = SipHasher24::new_with_key(key[..16].try_into().unwrap());
+    for address in [local, remote] {
+        match address {
+            IpAddr::V4(a) => hash.write(&a.octets()),
+            IpAddr::V6(a) => hash.write(&a.octets()),
+        }
+    }
+    hash.finish() as u32
 }
 
 /// Linux SYN cookie encoding, including options in the timestamp echo.
@@ -219,19 +442,6 @@ fn hash(input: &CookieInput<'_>, count: u32, key: usize) -> u32 {
             hash.write(&input.local.port().to_be_bytes());
         }
         _ => unreachable!("a TCP tuple has one address family"),
-    }
-    hash.finish() as u32
-}
-
-fn timestamp_offset(input: &CookieInput<'_>) -> u32 {
-    // A secret-derived offset can be recovered without retaining the SYN.
-    let mut hash = SipHasher24::new_with_key(input.key[..16].try_into().unwrap());
-    hash.write(b"timestamp");
-    for address in [input.local.ip(), input.remote.ip()] {
-        match address {
-            IpAddr::V4(a) => hash.write(&a.octets()),
-            IpAddr::V6(a) => hash.write(&a.octets()),
-        }
     }
     hash.finish() as u32
 }
@@ -279,7 +489,7 @@ impl SynCookies for Cookies {
                 options.extend([TcpOption::NoOperation, TcpOption::NoOperation]);
             }
             options.push(TcpOption::Timestamps {
-                tsval: stamp.wrapping_add(timestamp_offset(input)),
+                tsval: stamp.wrapping_add(offset(input.key, input.local.ip(), input.remote.ip())),
                 tsecr: remote,
             });
             if scale.is_some() {
@@ -315,7 +525,7 @@ impl SynCookies for Cookies {
             TcpOption::Timestamps { tsval, tsecr } => Some((*tsval, *tsecr)),
             _ => None,
         }) {
-            let offset = timestamp_offset(input);
+            let offset = offset(input.key, input.local.ip(), input.remote.ip());
             let bits = echo.wrapping_sub(offset);
             state.scale = (bits & 15 != 15).then_some((bits & 15) as u8);
             state.sack = bits & 16 != 0;

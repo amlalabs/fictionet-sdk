@@ -651,6 +651,7 @@ impl<T: AsRef<[u8]>> AsRef<[u8]> for Packet<T> {
 /// A high-level representation of an Internet Protocol version 4 packet header.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(crate) struct Repr {
+    pub(crate) identification: u16,
     pub(crate) src_addr: Address,
     pub(crate) dst_addr: Address,
     pub(crate) next_header: Protocol,
@@ -684,6 +685,7 @@ impl Repr {
         // All ECN values are acceptable, since ECN requires opt-in from both endpoints.
         // All TTL values are acceptable, since we do not perform routing.
         Ok(Repr {
+            identification: NetworkEndian::read_u16(&packet.buffer.as_ref()[field::IDENT]),
             src_addr: packet.src_addr(),
             dst_addr: packet.dst_addr(),
             next_header: packet.next_header(),
@@ -711,7 +713,7 @@ impl Repr {
         let total_len = packet.header_len() as u16 + self.payload_len as u16;
 
         packet.set_total_len(total_len);
-        packet.set_ident(0);
+        packet.set_ident(self.identification);
         packet.clear_flags();
         packet.set_more_frags(false);
         packet.set_dont_frag(true);
@@ -1061,6 +1063,7 @@ pub(crate) mod test {
 
     const fn packet_repr() -> Repr {
         Repr {
+            identification: 0,
             src_addr: Address::new(0x11, 0x12, 0x13, 0x14),
             dst_addr: Address::new(0x21, 0x22, 0x23, 0x24),
             next_header: Protocol::Icmp,

@@ -2,11 +2,12 @@
 //!
 //! This link carries Ethernet frames, not the IP packets of Fictionet's
 //! `Interface`. Each direction holds at most 64 frames, plus one the
-//! driver thread holds. When the receive queue is full, the thread stops
-//! reading, and the NIC may drop frames.
+//! driver thread holds. When the receive queue is full, the thread keeps
+//! reading and counts discarded frames. Drops before the driver receives
+//! a frame are not observable through this device's negotiated features.
 
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -28,6 +29,42 @@ pub struct RawAttachment {
     sender: RawSender,
     receiver: RawReceiver,
     mac: [u8; 6],
+    receive_stats: RawReceiveStats,
+}
+
+/// Receive losses the host can observe. Device and backend losses are unknown.
+#[derive(Clone, Default)]
+pub struct RawReceiveStats {
+    queue_dropped: Arc<AtomicU64>,
+}
+
+impl RawReceiveStats {
+    /// Frames discarded because the world's receive queue was full, since
+    /// attachment creation. The counter saturates rather than wrapping.
+    pub fn queue_dropped(&self) -> u64 {
+        self.queue_dropped.load(Ordering::Relaxed)
+    }
+
+    fn enqueue(
+        &self,
+        incoming: &mpsc::Sender<EthernetFrame>,
+        frame: EthernetFrame,
+    ) -> Result<bool> {
+        match incoming.try_send(frame) {
+            Ok(()) => Ok(true),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                let _ =
+                    self.queue_dropped
+                        .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                            Some(count.saturating_add(1))
+                        });
+                Ok(false)
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(Error::msg("raw Ethernet attachment closed"))
+            }
+        }
+    }
 }
 
 /// The sending half of a raw attachment.
@@ -68,6 +105,11 @@ fn closed(failure: &Mutex<Option<Error>>) -> Error {
 }
 
 impl RawAttachment {
+    /// A live view of receive queue losses, retained across [`Self::split`].
+    pub fn receive_stats(&self) -> RawReceiveStats {
+        self.receive_stats.clone()
+    }
+
     /// The device's configured Ethernet address.
     pub fn mac_address(&self) -> [u8; 6] {
         self.mac
@@ -102,6 +144,7 @@ impl RawAttachment {
 pub struct RawWire {
     incoming: mpsc::Sender<EthernetFrame>,
     outgoing: mpsc::Receiver<Command>,
+    receive_stats: RawReceiveStats,
 }
 
 impl RawAttachment {
@@ -112,6 +155,7 @@ impl RawAttachment {
         let (incoming, rx) = mpsc::channel(CAPACITY);
         let (tx, outgoing) = mpsc::channel(CAPACITY);
         let failure = Arc::new(Mutex::new(None));
+        let receive_stats = RawReceiveStats::default();
         (
             RawAttachment {
                 sender: RawSender {
@@ -120,13 +164,25 @@ impl RawAttachment {
                 },
                 receiver: RawReceiver { rx, failure },
                 mac,
+                receive_stats: receive_stats.clone(),
             },
-            RawWire { incoming, outgoing },
+            RawWire {
+                incoming,
+                outgoing,
+                receive_stats,
+            },
         )
     }
 }
 
 impl RawWire {
+    /// Puts a frame on the wire without waiting, counting a full receive
+    /// queue's discarded frame just as the NIC polling thread does.
+    pub fn try_send(&self, frame: EthernetFrame) -> Result<bool> {
+        check_length(&frame)?;
+        self.receive_stats.enqueue(&self.incoming, frame)
+    }
+
     /// Puts `frame` on the wire to the world, waiting for room.
     pub async fn send(&self, fcx: &Cx, frame: EthernetFrame) -> Result {
         check_length(&frame)?;
@@ -204,7 +260,7 @@ impl RawSender {
 ///
 /// Dropping this handle stops the thread and resets the device, discarding
 /// queued traffic. Call the attachment's `flush` before shutdown when delivery
-/// matters. An idle or backpressured driver parks between hardware polls.
+/// matters. An idle driver parks between hardware polls.
 pub struct RawPump {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<Result>>,
@@ -220,13 +276,14 @@ impl RawPump {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = stop.clone();
         let thread_failure = failure.clone();
+        let receive_stats = RawReceiveStats::default();
+        let thread_stats = receive_stats.clone();
         let thread = thread::Builder::new()
             .name("raw-ethernet".into())
             .spawn(move || {
                 // Keep channels alive until the failure is published, so waiters see it.
-                let mut incoming = incoming;
                 let mut outgoing = outgoing;
-                let result = pump(nic, &thread_stop, &mut incoming, &mut outgoing);
+                let result = pump(nic, &thread_stop, &incoming, &mut outgoing, &thread_stats);
                 if let Err(error) = &result {
                     *thread_failure.lock().unwrap() = Some(error.clone());
                 }
@@ -244,6 +301,7 @@ impl RawPump {
                 },
                 receiver: RawReceiver { rx, failure },
                 mac,
+                receive_stats,
             },
         ))
     }
@@ -274,28 +332,25 @@ impl Drop for RawPump {
 fn pump(
     mut nic: VirtioNet,
     stop: &AtomicBool,
-    incoming: &mut mpsc::Sender<EthernetFrame>,
+    incoming: &mpsc::Sender<EthernetFrame>,
     outgoing: &mut mpsc::Receiver<Command>,
+    receive_stats: &RawReceiveStats,
 ) -> Result {
     let mut buffer = [0u8; MAX_FRAME];
-    let mut pending_rx = None;
     let mut pending_tx = None;
     while !stop.load(Ordering::Acquire) {
         if incoming.is_closed() {
             return Ok(());
         }
         let mut progress = false;
-        if pending_rx.is_none()
-            && let Some(len) = nic.receive(&mut buffer)?
-        {
-            pending_rx = Some(EthernetFrame(buffer[..len].to_vec()));
-        }
-        if let Some(frame) = pending_rx.take() {
-            match incoming.try_send(frame) {
-                Ok(()) => progress = true,
-                Err(mpsc::error::TrySendError::Full(frame)) => pending_rx = Some(frame),
-                Err(mpsc::error::TrySendError::Closed(_)) => return Ok(()),
+        if let Some(len) = nic.receive(&mut buffer)? {
+            if receive_stats
+                .enqueue(incoming, EthernetFrame(buffer[..len].to_vec()))
+                .is_err()
+            {
+                return Ok(());
             }
+            progress = true;
         }
         if pending_tx.is_none() {
             match outgoing.try_recv() {
@@ -337,6 +392,35 @@ mod tests {
     use super::*;
     use std::future::{Future, poll_fn};
     use std::task::Poll;
+
+    #[test]
+    fn receive_queue_counts_only_full_queue_discards_and_recovers() {
+        let (mut raw, wire) = RawAttachment::in_memory([2; 6]);
+        let stats = raw.receive_stats();
+        for byte in 0..CAPACITY {
+            assert!(wire.try_send(EthernetFrame(vec![byte as u8; 14])).unwrap());
+        }
+        for _ in 0..3 {
+            assert!(!wire.try_send(EthernetFrame(vec![0xff; 14])).unwrap());
+        }
+        assert!(wire.try_send(EthernetFrame(vec![0; 13])).is_err());
+        assert_eq!(stats.queue_dropped(), 3);
+        fictionet::block_on(fictionet::run(
+            fictionet::Seed::from_u64(0),
+            move |fcx| async move {
+                for byte in 0..CAPACITY {
+                    assert_eq!(raw.recv(&fcx).await?, EthernetFrame(vec![byte as u8; 14]));
+                }
+                assert!(wire.try_send(EthernetFrame(vec![0xaa; 14]))?);
+                assert_eq!(raw.recv(&fcx).await?, EthernetFrame(vec![0xaa; 14]));
+                drop(raw);
+                assert!(wire.try_send(EthernetFrame(vec![0; 14])).is_err());
+                assert_eq!(stats.queue_dropped(), 3);
+                Ok(())
+            },
+        ))
+        .unwrap();
+    }
 
     #[test]
     fn bounded_send_waits_and_cancels_without_queueing() {
