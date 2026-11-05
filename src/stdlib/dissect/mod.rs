@@ -150,6 +150,16 @@ pub(crate) const MAX_DETAIL: usize = 1 << 20;
 /// The longest list line kept.
 const MAX_INFO: usize = 1024;
 
+/// Ordering of summaries within one protocol level.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SummaryPriority {
+    /// A summary appended in arrival order.
+    #[default]
+    Normal,
+    /// A primary message that leads accompanying control information.
+    Primary,
+}
+
 /// A decoded packet.
 #[derive(Debug, Default)]
 pub struct Decoded {
@@ -166,6 +176,7 @@ pub struct Decoded {
     /// How high the protocol in `proto` is: 0 for IP and transport, 1 for
     /// TLS, 2 for what TLS carries and other applications.
     pub(crate) level: u8,
+    summary_priority: SummaryPriority,
     /// Protocol layers in display order.
     pub layers: Vec<Layer>,
     /// Bytes other than the packet that layers point into, such as
@@ -181,13 +192,31 @@ impl Decoded {
     /// Updates the packet summary at an application level: 1 for TLS,
     /// 2 for its payload or another application protocol.
     pub fn application(&mut self, level: u8, protocol: &str, text: &str) {
+        self.application_with_priority(level, protocol, text, SummaryPriority::Normal);
+    }
+
+    /// Updates the summary, putting a higher-priority message before existing
+    /// summaries at the same protocol level. Equal priorities retain arrival order.
+    pub fn application_with_priority(
+        &mut self,
+        level: u8,
+        protocol: &str,
+        text: &str,
+        priority: SummaryPriority,
+    ) {
         if level > self.level {
             self.level = level;
+            self.summary_priority = priority;
             self.proto = protocol.into();
             self.info = text.to_owned();
         } else if level == self.level {
-            self.info.push_str(", ");
-            self.info.push_str(text);
+            if priority > self.summary_priority {
+                self.info = format!("{text}, {}", self.info);
+                self.summary_priority = priority;
+            } else {
+                self.info.push_str(", ");
+                self.info.push_str(text);
+            }
         }
         self.cap_info();
     }

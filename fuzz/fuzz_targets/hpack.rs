@@ -1,6 +1,7 @@
 //! HPACK wire contracts, complete blocks, table recovery, and round trips.
 #![no_main]
 use fictionet::stdlib::codec::{Stream, Wire};
+use fictionet::stdlib::dissect::http2::PartialTable;
 use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
 use fictionet::stdlib::{
     codec::Collect,
@@ -37,12 +38,12 @@ fuzz_target!(|input: &[u8]| {
         ),
         decode_all(|| Collect::<Field>::new(hpack::MAX_BLOCK), short),
     );
-    for mut decoder in [Table::default(), Table::new(0), Table::for_observation()] {
+    for mut decoder in [Table::default(), Table::new(0)] {
         let _ = decoder.decode_block(bytes, hpack::MAX_DECODED);
         assert!(decoder.table_size() <= hpack::MAX_TABLE);
         for (i, piece) in short.chunks(32).enumerate() {
             if i % 3 == 0 {
-                decoder.forget();
+                decoder = Table::new(decoder.settings_limit());
             }
             if i % 5 == 0 {
                 decoder.set_settings_limit(usize::from(piece[0]));
@@ -51,6 +52,17 @@ fuzz_target!(|input: &[u8]| {
             assert!(decoder.table_size() <= hpack::MAX_TABLE);
             assert!(decoder.table_len() <= hpack::MAX_TABLE / hpack::ENTRY_OVERHEAD);
         }
+    }
+    let mut observed = PartialTable::default();
+    let _ = observed.decode_block(bytes, hpack::MAX_DECODED);
+    assert!(observed.table_size() <= hpack::MAX_TABLE);
+    for (i, piece) in short.chunks(32).enumerate() {
+        if i % 3 == 0 {
+            observed.forget();
+        }
+        let _ = observed.decode_block(piece, i);
+        assert!(observed.table_size() <= hpack::MAX_TABLE);
+        assert!(observed.table_len() <= hpack::MAX_TABLE / hpack::ENTRY_OVERHEAD);
     }
     let integer = short
         .iter()
@@ -78,14 +90,8 @@ fuzz_target!(|input: &[u8]| {
         let block = decoder.decode_block(&out, hpack::MAX_DECODED).unwrap();
         assert_eq!(block.more, 0);
         assert_eq!(block.headers.len(), 1);
-        assert_eq!(
-            block.headers[0].name.as_deref(),
-            Some(field.name.as_slice())
-        );
-        assert_eq!(
-            block.headers[0].value.as_deref(),
-            Some(field.value.as_slice())
-        );
+        assert_eq!(block.headers[0].name, field.name);
+        assert_eq!(block.headers[0].value, field.value);
         assert_eq!(block.headers[0].never_index, field.never_index);
         assert_eq!(encoder.table_size(), decoder.table_size());
     }

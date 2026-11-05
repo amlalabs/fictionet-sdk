@@ -10,7 +10,6 @@ use http::header::HOST;
 use http::{HeaderName, HeaderValue, Request, Response, StatusCode, Version};
 use http_body::{Body as _, Frame};
 
-use fictionet::stdlib::codec::{Decode, Step};
 use fictionet::stdlib::protocols::http1::{self, Event as H1, RequestHead};
 use fictionet::stdlib::services::serve::{self, Driver, Flow, Pending, PendingDriver, WakeHandle};
 use fictionet::time::Instant;
@@ -160,33 +159,6 @@ impl Http1 {
             Flow::Continue
         }
     }
-}
-
-/// The head at the start of `unread`, read with an empty Host field added
-/// after its request line, if that makes it a request head: an HTTP/1.1
-/// request that named no host.
-fn without_host(unread: &[u8]) -> Option<(RequestHead, http1::RequestEvents, usize)> {
-    let line_end = unread.windows(2).position(|w| w == b"\r\n")?;
-    let head_end = unread.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
-    if head_end <= line_end {
-        return None;
-    }
-    let mut patched = unread[..line_end + 2].to_vec();
-    patched.extend_from_slice(b"Host:\r\n");
-    patched.extend_from_slice(&unread[line_end + 2..head_end]);
-    let mut decoder = http1::RequestEvents::new();
-    let Step::Item(H1::Head(mut head), _) = decoder.decode(&patched, false).ok()? else {
-        return None;
-    };
-    // Preserve the request as it came, without the field added.
-    if head
-        .headers
-        .first()
-        .is_some_and(|h| h.name == "Host" && h.value.is_empty())
-    {
-        head.headers.remove(0);
-    }
-    Some((head, decoder, head_end))
 }
 
 /// A request body that ends early: `bytes`, then an error saying `why`.
@@ -417,36 +389,19 @@ impl serve::Service for Http1 {
             self.dispatch(driver, body, true, held);
             return Ok(());
         }
-        if matches!(
-            error,
-            fictionet::stdlib::codec::Fail::Protocol(http1::Error::Host)
-        ) && let Some((head, mut decoder, head_end)) = without_host(driver.unread())
+        if let fictionet::stdlib::codec::Fail::Protocol(http1::RequestError::Rejected(rejected)) =
+            error
+            && rejected.error == http1::Error::Host
+            && rejected.framing.is_ok()
+            && !rejected
+                .head
+                .headers
+                .iter()
+                .any(|h| h.name.eq_ignore_ascii_case("host"))
         {
-            // The service answers an HTTP/1.1 request with no Host field
-            // with `400` and `no_host`, then closes the connection.
             self.started = driver.now();
-
-            let mut unread = &driver.unread()[head_end..];
-            let mut received_bytes = 0;
-            loop {
-                match decoder.decode(unread, false) {
-                    Ok(Step::Item(H1::Body(bytes), n)) => {
-                        received_bytes += bytes.len();
-                        unread = &unread[n..];
-                    }
-                    Ok(Step::Skip(n)) => unread = &unread[n..],
-                    Ok(Step::Item(H1::Done, _)) => break,
-                    _ => {
-                        let len = decoder.pending_body_len(unread.len());
-
-                        received_bytes += len;
-                        break;
-                    }
-                }
-            }
-            self.too_big = received_bytes > self.opts.body;
-
-            self.head = Some(head);
+            self.too_big = rejected.received_body_bytes > self.opts.body;
+            self.head = Some(rejected.head.clone());
             self.dispatch(driver, Body::empty(), true, 0);
             return Ok(());
         }
@@ -454,7 +409,8 @@ impl serve::Service for Http1 {
         let date = date_header(self.date, driver.now());
         let status = if matches!(
             error,
-            fictionet::stdlib::codec::Fail::Protocol(http1::Error::UnsupportedTransferCoding)
+            fictionet::stdlib::codec::Fail::Protocol(error)
+                if error.reason() == http1::Error::UnsupportedTransferCoding
         ) {
             StatusCode::NOT_IMPLEMENTED
         } else {
@@ -466,7 +422,8 @@ impl serve::Service for Http1 {
 }
 
 mod serve_fail {
-    pub type Fail = fictionet::stdlib::codec::Fail<fictionet::stdlib::protocols::http1::Error>;
+    pub type Fail =
+        fictionet::stdlib::codec::Fail<fictionet::stdlib::protocols::http1::RequestError>;
 }
 
 /// A handler's response, on its way.

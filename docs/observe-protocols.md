@@ -97,11 +97,12 @@ can retain a terminal error while reporting it once.
 
 HTTP/2's `Capture::register` uses `register_with_buffer` with
 `fictionet::stdlib::dissect::http2::CAPTURE_READ_AHEAD`. Copy `src/stdlib/dissect/http2.rs` to
-customize presentation; it uses only public SDK APIs. It reads frames with
-`stdlib::protocols::http2::Inputs::for_observation` and header blocks with
-`stdlib::protocols::http2::HeaderBlocks::for_observation`, the same frame parser and
-header assembly that strict `Frames` and `Session` use, which notes what
-it cannot read instead of failing. Strict `Frames` and `Session` check
+customize presentation; it uses only public SDK APIs. Capture owns optional
+preface detection, skipped payloads, header assembly recovery and partial HPACK
+evidence. It shares the frame parser, `HeaderPayload`, HPACK `Representations`
+and `DynamicTable` with endpoint decoding. `dissect::http2::PartialHeader`
+represents missing names or values explicitly; endpoint `hpack::Field` always
+contains complete name and value octets. Strict `Frames` and `Session` check
 RFC 9113 framing and directional state. Announce a request's opening HEADERS
 to the response direction's `Session::peer_open` before routing WINDOW_UPDATE.
 The direction that reads a PUSH_PROMISE registers its promised stream. This
@@ -115,16 +116,16 @@ openings in stream ID order so lower active streams remain tracked. `lost`
 clears state and stops decoding because a TCP gap does not identify the next
 frame boundary.
 
-`http2::BlockRead::diagnostics` returns typed `http2::BlockDiagnostic`
-values. Match those variants rather than field labels or sentences. They
-report continuation state, promised stream IDs, interruptions, invalid
-fragments and byte limits. Strict assembly also reports continuation and
-promised-stream facts. `fictionet::stdlib::dissect::http2::Capture` renders these
-values as labels and sentences.
+`dissect::http2::PartialRead::diagnostics` returns typed `BlockDiagnostic`
+values. They report continuation state, promised stream IDs, interruptions,
+invalid fragments and byte limits. `Capture` renders these facts as labels and
+sentences. `Decoded::application_with_priority` orders primary message summaries
+before control information without interpreting either summary's wording.
 
 Capture policy keeps complete frames already present in bounded read-ahead.
 An incomplete oversized frame becomes a header-only item, followed by `Skip`
-for its payload. Header blocks share the stdlib HPACK decoder. Recognized
+for its payload. Header blocks share the stdlib HPACK representation parser and table operations.
+Unknown settings do not permit size updates after header fields. Recognized
 gRPC calls use `codec::Frames<grpc::Message>` through `codec::Demux`, with an 8 MiB aggregate
 DATA budget shared by every connection from the built-in registry and its
 clones, including nested TLS streams, through `Capture::pair_in`.

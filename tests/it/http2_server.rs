@@ -840,8 +840,8 @@ fn zero_stream_window_is_a_stream_error_and_large_headers_get_431() {
             status = decoded
                 .headers
                 .into_iter()
-                .find(|h| h.name.as_deref() == Some(b":status"))
-                .and_then(|h| h.value);
+                .find(|h| h.name == b":status")
+                .map(|h| h.value);
         }
     }
     assert_eq!(status.as_deref(), Some(b"431".as_slice()));
@@ -930,8 +930,8 @@ fn statuses(output: &[Frame]) -> Vec<(u32, Vec<u8>)> {
                 block
                     .headers
                     .into_iter()
-                    .find(|h| h.name.as_deref() == Some(b":status"))
-                    .and_then(|h| h.value)
+                    .find(|h| h.name == b":status")
+                    .map(|h| h.value)
                     .map(|value| (read.stream, value))
             })
         })

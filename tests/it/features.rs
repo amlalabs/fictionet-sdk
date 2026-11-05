@@ -122,8 +122,8 @@ mod http {
                     status = block
                         .headers
                         .into_iter()
-                        .find(|h| h.name.as_deref() == Some(b":status"))
-                        .and_then(|h| h.value);
+                        .find(|h| h.name == b":status")
+                        .map(|h| h.value);
                 }
                 match frame {
                     http2::Frame::Settings(s) if s.flags & 1 == 0 => {

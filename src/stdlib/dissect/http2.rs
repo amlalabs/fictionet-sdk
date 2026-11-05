@@ -1,23 +1,19 @@
 //! HTTP/2 and gRPC in a capture:
 //! [`Capture`](fictionet::stdlib::dissect::http2::Capture) presents each direction's
-//! frames, header blocks and gRPC messages, on
-//! [`stdlib::protocols::http2`](fictionet::stdlib::protocols::http2)'s
-//! observation readers
-//! ([`Inputs::for_observation`](fictionet::stdlib::protocols::http2::Inputs::for_observation)
-//! and
-//! [`HeaderBlocks::for_observation`](fictionet::stdlib::protocols::http2::HeaderBlocks::for_observation))
-//! and
-//! [`codec::Frames<grpc::Message>`](fictionet::stdlib::codec::Frames<grpc::Message>).
+//! frames, partial header blocks and gRPC messages. Frame grammar and HPACK
+//! representations come from the protocol modules; missing capture evidence,
+//! recovery and presentation belong here.
 //!
 //! The file uses only public dissector and stdlib APIs, so a copy of it can
 //! replace the built-in, registered the same way.
 
 use fictionet::stdlib::codec::{Decode, Demux, Fail, Spans, Step, Wire, be32};
 use fictionet::stdlib::dissect::Transport;
-use fictionet::stdlib::dissect::{Decoded, Layer, Match, Placement, Present, Registry};
+use fictionet::stdlib::dissect::{
+    Decoded, Layer, Match, Placement, Present, Registry, SummaryPriority,
+};
 use fictionet::stdlib::protocols::http2::{
-    BlockDiagnostic, Error, ErrorCode, Frame, FrameHeader, HEADER_LEN, HeaderBlocks, Input, Inputs,
-    MAX_WINDOW, PREFACE, Setting,
+    Error, ErrorCode, Frame, FrameHeader, HEADER_LEN, HeaderPayload, MAX_WINDOW, PREFACE, Setting,
 };
 use fictionet::stdlib::protocols::{grpc, hpack};
 use fictionet::sync::Mutex;
@@ -25,6 +21,488 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::sync::Arc;
 
+/// A captured header whose referenced dynamic entry may be unavailable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PartialHeader {
+    /// Name octets, when the name was observed.
+    pub name: Option<Vec<u8>>,
+    /// Value octets, when the value was observed.
+    pub value: Option<Vec<u8>>,
+    /// Whether the literal was marked never indexed.
+    pub never_index: bool,
+}
+/// Retained evidence from one captured HPACK block.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PartialBlock {
+    /// Headers in wire order, including explicitly unknown entries.
+    pub headers: Vec<PartialHeader>,
+    /// Headers omitted from presentation that still updated the table.
+    pub more: usize,
+}
+impl PartialBlock {
+    fn keep(
+        &mut self,
+        limit: usize,
+        used: &mut usize,
+        name: Option<&[u8]>,
+        value: Option<&[u8]>,
+        never_index: bool,
+    ) {
+        let len = name
+            .map_or(0, <[u8]>::len)
+            .saturating_add(value.map_or(0, <[u8]>::len));
+        if self.headers.len() >= hpack::MAX_HEADERS || len > limit.saturating_sub(*used) {
+            self.more = self.more.saturating_add(1);
+            return;
+        }
+        *used += len;
+        self.headers.push(PartialHeader {
+            name: name.map(<[u8]>::to_vec),
+            value: value.map(<[u8]>::to_vec),
+            never_index,
+        });
+    }
+}
+/// HPACK evidence for one capture direction, independent of endpoint settings.
+/// Newest known entries survive missing older entries. Size updates must still
+/// precede fields, even when the peer's settings were not captured.
+#[derive(Clone, Debug)]
+pub struct PartialTable {
+    table: hpack::DynamicTable,
+    max: Option<usize>,
+    unsure: bool,
+}
+impl Default for PartialTable {
+    fn default() -> Self {
+        Self {
+            table: hpack::DynamicTable::default(),
+            max: Some(4096),
+            unsure: false,
+        }
+    }
+}
+impl PartialTable {
+    /// Discards evidence after a missing or malformed block.
+    pub fn forget(&mut self) {
+        self.table.clear();
+        self.max = None;
+        self.unsure = true;
+    }
+    /// The latest observed capacity, or unknown after a missing block.
+    pub fn table_capacity(&self) -> Option<usize> {
+        self.max
+    }
+    /// Retained entry sizes, including HPACK entry overhead.
+    pub fn table_size(&self) -> usize {
+        self.table.size()
+    }
+    /// Number of retained entries.
+    pub fn table_len(&self) -> usize {
+        self.table.len()
+    }
+    /// Whether older dynamic entries may be unknown.
+    pub fn is_unsure(&self) -> bool {
+        self.unsure
+    }
+    /// Allocated storage for retained entries.
+    pub fn held(&self) -> usize {
+        self.table.held()
+    }
+    fn evict(&mut self) {
+        if let Some(max) = self.max {
+            self.table.evict(max);
+        }
+        if self.table.evict(hpack::MAX_TABLE) {
+            self.unsure = true;
+        }
+        if self
+            .max
+            .is_some_and(|max| self.table.size().saturating_add(hpack::ENTRY_OVERHEAD) > max)
+        {
+            self.unsure = false;
+        }
+    }
+    /// Decodes a complete block while retaining bounded presentation and table
+    /// storage. Invalid input forgets the table; unavailable entries remain partial.
+    pub fn decode_block(
+        &mut self,
+        bytes: &[u8],
+        limit: usize,
+    ) -> Result<PartialBlock, hpack::Error> {
+        let result = self.read_block(bytes, limit.min(hpack::MAX_DECODED));
+        if result.is_err() {
+            self.forget();
+        }
+        result
+    }
+    fn read_block(&mut self, bytes: &[u8], limit: usize) -> Result<PartialBlock, hpack::Error> {
+        let mut out = PartialBlock::default();
+        let mut used = 0;
+        for representation in hpack::Representations::new(bytes, hpack::MAX_BLOCK * 8 / 5)? {
+            match representation? {
+                hpack::Representation::SizeUpdate(size) => {
+                    self.max = Some(size);
+                    self.evict();
+                }
+                hpack::Representation::Indexed(index) => match self.table.get(index)? {
+                    Some(entry) => {
+                        out.keep(limit, &mut used, Some(entry.name), Some(entry.value), false)
+                    }
+                    None if self.unsure => out.keep(limit, &mut used, None, None, false),
+                    None => return Err(hpack::Error::Index),
+                },
+                hpack::Representation::Literal {
+                    name,
+                    value,
+                    indexing,
+                } => {
+                    let name = match name {
+                        hpack::Name::Literal(name) => Some(Arc::<[u8]>::from(name)),
+                        hpack::Name::Index(index) => match self.table.name(index)? {
+                            name @ Some(_) => name,
+                            None if self.unsure => None,
+                            None => return Err(hpack::Error::Index),
+                        },
+                    };
+                    out.keep(
+                        limit,
+                        &mut used,
+                        name.as_deref(),
+                        Some(&value),
+                        indexing == hpack::Indexing::Never,
+                    );
+                    if indexing == hpack::Indexing::Incremental {
+                        if let Some(name) = name {
+                            self.table.insert(name, value);
+                            self.evict();
+                        } else {
+                            self.forget();
+                        }
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CaptureInput {
+    Preface,
+    Frame(Frame),
+    Refused { error: Error, oversized: bool },
+}
+struct CaptureInputs {
+    preface: bool,
+    skip: usize,
+}
+impl Default for CaptureInputs {
+    fn default() -> Self {
+        Self {
+            preface: true,
+            skip: 0,
+        }
+    }
+}
+impl CaptureInputs {
+    fn pending(&self) -> bool {
+        self.skip != 0
+    }
+}
+impl Decode for CaptureInputs {
+    type Item = CaptureInput;
+    type Error = Error;
+    const NAME: &'static str = "HTTP/2";
+    fn capacity(&self) -> usize {
+        (HEADER_LEN + CAPTURE_FRAME_LIMIT).max(PREFACE.len())
+    }
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<CaptureInput>, Error> {
+        if self.skip != 0 {
+            let n = input.len().min(self.skip);
+            if n == 0 {
+                return if eof {
+                    Err(size("truncated skipped payload"))
+                } else {
+                    Ok(Step::Need)
+                };
+            }
+            self.skip -= n;
+            return Ok(Step::Skip(n));
+        }
+        if self.preface {
+            if input.len() < PREFACE.len() && PREFACE.starts_with(input) {
+                return Ok(Step::Need);
+            }
+            if input.starts_with(PREFACE) {
+                self.preface = false;
+                return Ok(Step::Item(CaptureInput::Preface, PREFACE.len()));
+            }
+        }
+        let Some(bytes) = input.get(..HEADER_LEN) else {
+            return Ok(Step::Need);
+        };
+        let header = FrameHeader::parse(bytes)?;
+        let total = HEADER_LEN + header.length;
+        if header.length > CAPTURE_FRAME_LIMIT && input.len() < total {
+            self.skip = header.length;
+            self.preface = false;
+            return Ok(Step::Item(
+                CaptureInput::Refused {
+                    error: size("frame exceeds configured limit"),
+                    oversized: true,
+                },
+                HEADER_LEN,
+            ));
+        }
+        let Some(bytes) = input.get(..total) else {
+            return Ok(Step::Need);
+        };
+        let item = match Frame::parse(bytes) {
+            Ok(frame) => CaptureInput::Frame(frame),
+            Err(error) => CaptureInput::Refused {
+                error,
+                oversized: false,
+            },
+        };
+        self.preface = false;
+        Ok(Step::Item(item, total))
+    }
+}
+
+struct Pending {
+    stream: u32,
+    end: bool,
+    promised: Option<u32>,
+    bytes: Option<Vec<u8>>,
+}
+struct HeaderFragment<'a> {
+    bytes: &'a [u8],
+    promised: Option<u32>,
+}
+/// A fact found while assembling a header block, without display wording.
+/// Capture recovery keeps incomplete evidence separate from endpoint decoding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockDiagnostic {
+    /// This frame interrupted an open block. The HPACK table was forgotten.
+    Interrupted {
+        /// The stream whose block was interrupted.
+        stream: u32,
+    },
+    /// This PUSH_PROMISE fragment names a promised stream.
+    PromisedStream {
+        /// The promised stream ID.
+        stream: u32,
+    },
+    /// The fragment cannot be read because its padding or required fields do not fit.
+    InvalidFragment,
+    /// A CONTINUATION arrived without an open block on its stream.
+    UnexpectedContinuation,
+    /// The assembled encoded block exceeded the byte limit.
+    LimitExceeded {
+        /// The maximum encoded bytes retained for one block.
+        limit: usize,
+    },
+    /// Block bytes were unavailable or discarded. Later HPACK references may be unknown.
+    NotDecoded,
+    /// The retained block needs another CONTINUATION before it can be decoded.
+    Continues,
+    /// HPACK decoding rejected the complete block.
+    InvalidHpack,
+}
+/// What capture header assembly found in one frame.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PartialRead {
+    /// The frame's stream.
+    pub stream: u32,
+    /// Whether the header block ends its stream (END_STREAM on its HEADERS).
+    pub end: bool,
+    /// The stream a PUSH_PROMISE promises.
+    pub promised: Option<u32>,
+    /// The decoded block, once its last fragment is read.
+    pub block: Option<PartialBlock>,
+    /// Capture assembly facts in detection order.
+    pub diagnostics: Vec<BlockDiagnostic>,
+    /// Whether the frame broke the header block rules.
+    pub malformed: bool,
+    /// Whether this frame cut off a header block still open.
+    /// [`BlockDiagnostic::Interrupted`] identifies that block's stream.
+    pub interrupted: bool,
+}
+/// Capture header assembly retaining incomplete blocks and recovery diagnostics.
+pub struct PartialBlocks {
+    table: PartialTable,
+    pending: Option<Pending>,
+    limit: usize,
+    decoded: usize,
+}
+impl Default for PartialBlocks {
+    fn default() -> Self {
+        Self {
+            table: PartialTable::default(),
+            pending: None,
+            limit: fictionet::stdlib::protocols::http2::Limits::default().header_block,
+            decoded: hpack::MAX_DECODED,
+        }
+    }
+}
+impl PartialBlocks {
+    /// Drops a block in progress and the HPACK table, as after a gap in
+    /// the capture.
+    pub fn forget(&mut self) {
+        self.pending = None;
+        self.table.forget();
+    }
+    /// Bytes held: the HPACK table and a block in progress.
+    pub fn held(&self) -> usize {
+        self.table.table_size().saturating_add(
+            self.pending
+                .as_ref()
+                .and_then(|p| p.bytes.as_ref())
+                .map_or(0, Vec::len),
+        )
+    }
+    /// Whether a header block waits for its CONTINUATION.
+    pub fn pending(&self) -> bool {
+        self.pending.is_some()
+    }
+    /// Sets the most decoded header bytes the next block may hold. A
+    /// capture sets it to the room left in its display.
+    pub fn set_list_limit(&mut self, bytes: usize) {
+        self.decoded = bytes;
+    }
+    /// Reads one frame's part of a header block. Inputs other than
+    /// HEADERS, PUSH_PROMISE and CONTINUATION only check that no block is
+    /// open. `payload` is `None` for a frame whose payload a capture could
+    /// not keep: that block is then not decoded, and HPACK is forgotten,
+    /// but the CONTINUATION boundary is kept.
+    pub fn read(&mut self, h: FrameHeader, payload: Option<&[u8]>) -> Result<PartialRead, Error> {
+        let fragment = if matches!(h.kind, 1 | 5 | 9) {
+            payload.map(|p| {
+                let payload = HeaderPayload::parse(p, h.kind, h.flags)?;
+                Ok(HeaderFragment {
+                    bytes: payload.fragment,
+                    promised: if h.kind == 5 {
+                        Some(u32_at(payload.fields, 0)? & MAX_WINDOW)
+                    } else {
+                        None
+                    },
+                })
+            })
+        } else {
+            None
+        };
+        self.read_fragment(h, fragment)
+    }
+    fn read_fragment(
+        &mut self,
+        h: FrameHeader,
+        fragment: Option<Result<HeaderFragment<'_>, Error>>,
+    ) -> Result<PartialRead, Error> {
+        let mut out = PartialRead {
+            stream: h.stream,
+            end: h.kind == 1 && h.flags & 1 != 0,
+            promised: None,
+            block: None,
+            diagnostics: Vec::new(),
+            malformed: false,
+            interrupted: false,
+        };
+        if let Some(p) = self
+            .pending
+            .as_ref()
+            .filter(|p| h.kind != 9 || h.stream != p.stream)
+        {
+            out.diagnostics
+                .push(BlockDiagnostic::Interrupted { stream: p.stream });
+            self.forget();
+            out.interrupted = true;
+            out.malformed = true;
+        }
+        if !matches!(h.kind, 1 | 5 | 9) {
+            return Ok(out);
+        }
+        let fragment = match fragment {
+            Some(Ok(fragment)) => {
+                if let Some(id) = fragment.promised {
+                    out.promised = Some(id);
+                    out.diagnostics
+                        .push(BlockDiagnostic::PromisedStream { stream: id });
+                }
+                Some(fragment.bytes)
+            }
+            Some(Err(_)) => {
+                out.diagnostics.push(BlockDiagnostic::InvalidFragment);
+                out.malformed = true;
+                None
+            }
+            None => None,
+        };
+        let mut p = if h.kind == 9 {
+            let Some(p) = self.pending.take() else {
+                out.diagnostics
+                    .push(BlockDiagnostic::UnexpectedContinuation);
+                out.malformed = true;
+                self.table.forget();
+                return Ok(out);
+            };
+            p
+        } else {
+            Pending {
+                stream: h.stream,
+                end: out.end,
+                promised: out.promised,
+                bytes: Some(Vec::new()),
+            }
+        };
+        out.end = p.end;
+        match (&mut p.bytes, fragment) {
+            (Some(bytes), Some(f))
+                if bytes
+                    .len()
+                    .checked_add(f.len())
+                    .is_some_and(|n| n <= self.limit) =>
+            {
+                bytes.try_reserve(f.len()).map_err(|_| Error {
+                    code: ErrorCode::EnhanceYourCalm,
+                    reason: "header allocation failed",
+                })?;
+                bytes.extend_from_slice(f);
+            }
+            (Some(_), fragment) => {
+                if fragment.is_some() {
+                    out.diagnostics
+                        .push(BlockDiagnostic::LimitExceeded { limit: self.limit });
+                }
+                p.bytes = None;
+                self.table.forget();
+            }
+            _ => {}
+        }
+        let Some(bytes) = &p.bytes else {
+            out.diagnostics.push(BlockDiagnostic::NotDecoded);
+            if h.flags & 4 == 0 {
+                self.pending = Some(p);
+            }
+            return Ok(out);
+        };
+        if h.flags & 4 == 0 {
+            out.diagnostics.push(BlockDiagnostic::Continues);
+            self.pending = Some(p);
+            return Ok(out);
+        }
+        match self.table.decode_block(bytes, self.decoded) {
+            Ok(block) => {
+                out.promised = p.promised;
+                out.block = Some(block);
+            }
+            Err(_) => {
+                out.diagnostics.push(BlockDiagnostic::InvalidHpack);
+                out.malformed = true;
+            }
+        }
+        Ok(out)
+    }
+}
 fn protocol(reason: &'static str) -> Error {
     Error {
         code: ErrorCode::ProtocolError,
@@ -88,6 +566,7 @@ struct MessageDisplay {
 pub struct CaptureItem {
     layer: Layer,
     info: String,
+    priority: SummaryPriority,
     buffer: &'static str,
     malformed: bool,
     reset: bool,
@@ -228,8 +707,8 @@ impl core::error::Error for CaptureError {}
 
 /// HTTP/2 capture decoding through [`Present`] and
 /// [`fictionet::stdlib::dissect::Observed`]. Uses the same frame parser and header
-/// assembly as [`Session`](fictionet::stdlib::protocols::http2::Session), with
-/// tolerant HPACK and header-only oversized items followed by `Skip`. Complete
+/// primitives as [`Session`](fictionet::stdlib::protocols::http2::Session), with
+/// capture-owned partial HPACK evidence and header-only oversized items followed by `Skip`. Complete
 /// frames already available in bounded read-ahead are displayed. Missing bytes
 /// stop the direction and clear HPACK and DATA state.
 ///
@@ -248,8 +727,8 @@ impl core::error::Error for CaptureError {}
 /// http2::Capture::register(&mut registry, &budget);
 /// ```
 pub struct Capture {
-    frames: Inputs,
-    blocks: HeaderBlocks,
+    frames: CaptureInputs,
+    blocks: PartialBlocks,
     calls: Arc<Mutex<CaptureCalls>>,
     reverse: bool,
     offset: u64,
@@ -292,8 +771,8 @@ impl Capture {
     }
     fn in_budget(budget: &CaptureBudget) -> Self {
         Self {
-            frames: Inputs::for_observation(CAPTURE_FRAME_LIMIT),
-            blocks: HeaderBlocks::for_observation(),
+            frames: CaptureInputs::default(),
+            blocks: PartialBlocks::default(),
             calls: Arc::new(Mutex::new(CaptureCalls::new(budget.clone()))),
             reverse: false,
             offset: 0,
@@ -467,6 +946,11 @@ fn capture_layer(h: FrameHeader, raw: &[u8]) -> CaptureItem {
     );
     layer.field("Stream", h.stream.to_string(), (5, 9));
     CaptureItem {
+        priority: if h.kind == 1 {
+            SummaryPriority::Primary
+        } else {
+            SummaryPriority::Normal
+        },
         layer,
         info: format!("{}[{}]", h.name(), h.stream),
         buffer: "Reassembled HTTP/2 frame",
@@ -504,7 +988,7 @@ fn present_diagnostic(layer: &mut Layer, diagnostic: &BlockDiagnostic) {
     };
     layer.note("Header block", note);
 }
-fn present_block(item: &mut CaptureItem, block: &hpack::Block) {
+fn present_block(item: &mut CaptureItem, block: &PartialBlock) {
     let get = |name: &[u8]| {
         block
             .headers
@@ -619,7 +1103,7 @@ impl Decode for Capture {
         };
         let start = self.offset;
         self.offset = self.offset.saturating_add(n as u64);
-        if frame == Input::Preface {
+        if frame == CaptureInput::Preface {
             {
                 let mut calls = self.calls.lock();
                 calls.client = Some(self.reverse);
@@ -630,6 +1114,7 @@ impl Decode for Capture {
                 CaptureItem {
                     layer,
                     info: "Magic".into(),
+                    priority: SummaryPriority::Normal,
                     buffer: "HTTP/2 preface",
                     malformed: false,
                     reset: false,
@@ -646,14 +1131,14 @@ impl Decode for Capture {
         )?;
         let oversized = matches!(
             frame,
-            Input::Refused {
+            CaptureInput::Refused {
                 oversized: true,
                 ..
             }
         );
         let mut item = capture_layer(h, raw);
         item.offset = start;
-        if let Input::Refused {
+        if let CaptureInput::Refused {
             oversized: false,
             error,
             ..
@@ -689,7 +1174,7 @@ impl Decode for Capture {
         match h.kind {
             0 => {
                 let data = match &frame {
-                    Input::Frame(Frame::Data(data)) => Some(data.data.as_slice()),
+                    CaptureInput::Frame(Frame::Data(data)) => Some(data.data.as_slice()),
                     _ => unpad(body, h.flags),
                 };
                 let data = match data {
@@ -773,7 +1258,7 @@ impl Decode for Capture {
             }
             3 if body.len() >= 4 => {
                 let code = match &frame {
-                    Input::Frame(Frame::Reset(reset)) => reset.code,
+                    CaptureInput::Frame(Frame::Reset(reset)) => reset.code,
                     _ => u32_at(body, 0)?,
                 };
                 let e = display_error(code);
@@ -792,7 +1277,7 @@ impl Decode for Capture {
             4 => {
                 let partial;
                 let entries = match &frame {
-                    Input::Frame(Frame::Settings(settings)) => &settings.entries,
+                    CaptureInput::Frame(Frame::Settings(settings)) => &settings.entries,
                     _ => {
                         partial = body
                             .as_chunks::<6>()
@@ -836,7 +1321,7 @@ impl Decode for Capture {
             6 => item.info = if h.flags & 1 != 0 { "PING ack" } else { "PING" }.into(),
             7 if body.len() >= 8 => {
                 let (last_stream, code) = match &frame {
-                    Input::Frame(Frame::GoAway(goaway)) => (goaway.last_stream, goaway.code),
+                    CaptureInput::Frame(Frame::GoAway(goaway)) => (goaway.last_stream, goaway.code),
                     _ => (u32_at(body, 0)? & MAX_WINDOW, u32_at(body, 4)?),
                 };
                 let e = display_error(code);
@@ -854,7 +1339,7 @@ impl Decode for Capture {
             }
             8 if body.len() >= 4 => {
                 let inc = match &frame {
-                    Input::Frame(Frame::WindowUpdate(update)) => update.increment,
+                    CaptureInput::Frame(Frame::WindowUpdate(update)) => update.increment,
                     _ => u32_at(body, 0)? & MAX_WINDOW,
                 };
                 item.layer
@@ -895,16 +1380,7 @@ impl Present for Capture {
         if item.reset {
             packet.tag("reset");
         }
-        if packet.level() == 2
-            && item.info.starts_with("HEADERS")
-            && !packet.info.starts_with("HEADERS")
-        {
-            // Requests and responses lead the summary even after control frames.
-            packet.info = format!("{}, {}", item.info, packet.info);
-            packet.cap_info();
-        } else {
-            packet.application(2, "HTTP/2", &item.info);
-        }
+        packet.application_with_priority(2, "HTTP/2", &item.info, item.priority);
         for message in &item.messages {
             let mut layer = Layer::new("gRPC", 0, (0, message.bytes.len()));
             layer.summary = grpc_summary(&message.message);
@@ -946,7 +1422,7 @@ impl Present for Capture {
     fn reset(&mut self) {
         self.blocks.forget();
         self.clear_calls();
-        self.frames = Inputs::for_observation(CAPTURE_FRAME_LIMIT);
+        self.frames = CaptureInputs::default();
         self.stopped = true;
     }
 }
@@ -955,7 +1431,35 @@ impl Present for Capture {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{Stream, Wire, pump};
-    use fictionet::stdlib::test_support::{chunks, decode_all, decode_chunks};
+    use fictionet::stdlib::protocols::{huffman, prefix_int::Integer};
+    use fictionet::stdlib::test_support::{chunks, decode_all, decode_chunks, hex};
+    use hpack::MAX_DECODED;
+    impl PartialTable {
+        fn decode_all(&mut self, bytes: &[u8]) -> Vec<PartialHeader> {
+            let block = self.decode_block(bytes, MAX_DECODED).unwrap();
+            assert_eq!(block.more, 0);
+            block.headers
+        }
+    }
+    fn pairs(headers: &[PartialHeader]) -> Vec<(&str, &str)> {
+        headers
+            .iter()
+            .map(|header| {
+                (
+                    header
+                        .name
+                        .as_deref()
+                        .map(|bytes| std::str::from_utf8(bytes).unwrap_or("\u{fffd}"))
+                        .unwrap_or(""),
+                    header
+                        .value
+                        .as_deref()
+                        .map(|bytes| std::str::from_utf8(bytes).unwrap_or("\u{fffd}"))
+                        .unwrap_or(""),
+                )
+            })
+            .collect()
+    }
 
     fn raw(kind: u8, flags: u8, stream: u32, body: &[u8]) -> Vec<u8> {
         let mut out = FrameHeader {
@@ -1285,5 +1789,294 @@ mod tests {
         assert_eq!(calls.total(), 8);
         calls.remove(&3);
         assert_eq!(calls.total(), 0);
+    }
+
+    #[test]
+    fn capture_header_diagnostics_report_recovery_conditions() {
+        for (kind, flags, body, diagnostics, malformed) in [
+            (
+                1,
+                12,
+                vec![2],
+                vec![
+                    BlockDiagnostic::InvalidFragment,
+                    BlockDiagnostic::NotDecoded,
+                ],
+                true,
+            ),
+            (
+                9,
+                4,
+                vec![0x82],
+                vec![BlockDiagnostic::UnexpectedContinuation],
+                true,
+            ),
+            (
+                1,
+                4,
+                vec![0x82; 3],
+                vec![
+                    BlockDiagnostic::LimitExceeded { limit: 2 },
+                    BlockDiagnostic::NotDecoded,
+                ],
+                false,
+            ),
+            (1, 4, vec![0x80], vec![BlockDiagnostic::InvalidHpack], true),
+        ] {
+            let mut blocks = PartialBlocks {
+                limit: 2,
+                ..PartialBlocks::default()
+            };
+            let bytes = raw(kind, flags, 1, &body);
+            let result = blocks
+                .read(FrameHeader::parse(&bytes[..9]).unwrap(), Some(&bytes[9..]))
+                .unwrap();
+            assert_eq!(result.diagnostics, diagnostics);
+            assert_eq!(result.malformed, malformed);
+            assert!(!result.interrupted);
+            assert!(result.block.is_none());
+            assert!(!blocks.pending());
+        }
+
+        let mut blocks = PartialBlocks::default();
+        let first = raw(1, 0, 1, &[0x82]);
+        blocks
+            .read(FrameHeader::parse(&first[..9]).unwrap(), Some(&first[9..]))
+            .unwrap();
+        let next = raw(9, 4, 3, &[0x84]);
+        let result = blocks
+            .read(FrameHeader::parse(&next[..9]).unwrap(), Some(&next[9..]))
+            .unwrap();
+        assert_eq!(
+            result.diagnostics,
+            [
+                BlockDiagnostic::Interrupted { stream: 1 },
+                BlockDiagnostic::UnexpectedContinuation
+            ]
+        );
+        assert!(result.interrupted && result.malformed);
+        assert!(result.block.is_none());
+        assert!(!blocks.pending());
+
+        let result = blocks
+            .read(FrameHeader::parse(&first[..9]).unwrap(), None)
+            .unwrap();
+        assert_eq!(result.diagnostics, [BlockDiagnostic::NotDecoded]);
+        assert!(!result.interrupted && !result.malformed);
+        assert!(result.block.is_none());
+        assert!(blocks.pending());
+        let last = raw(9, 4, 1, &[0x84]);
+        let result = blocks
+            .read(FrameHeader::parse(&last[..9]).unwrap(), Some(&last[9..]))
+            .unwrap();
+        assert_eq!(result.diagnostics, [BlockDiagnostic::NotDecoded]);
+        assert!(!result.interrupted && !result.malformed);
+        assert!(result.block.is_none());
+        assert!(!blocks.pending());
+    }
+    #[test]
+    fn broken_blocks_forget_the_table() {
+        for bytes in [vec![0xff], vec![0x41, 0x85, 0xff]] {
+            let mut d = PartialTable::default();
+            d.decode_all(&hex("400178036f6c64"));
+            assert_eq!(d.table_len(), 1);
+            assert!(d.decode_block(&bytes, MAX_DECODED).is_err());
+            assert!(d.is_unsure());
+            assert_eq!(d.table_len(), 0);
+            assert_eq!(d.table_size(), 0);
+            assert_eq!(d.table_capacity(), None);
+        }
+        assert!(huffman::decode(&[0xff, 0xff, 0xff, 0xff]).is_err());
+    }
+
+    #[test]
+    fn a_forgotten_table_shows_unknown_not_stale() {
+        let mut d = PartialTable::default();
+        d.decode_all(&hex("4001 7803 6f6c 64")); // x: old
+        d.forget();
+        d.decode_all(&hex("4001 7903 6e65 77")); // y: new
+        let b = d.decode_block(&[0xbe, 0xbf, 0x82], MAX_DECODED).unwrap();
+        assert_eq!(
+            pairs(&b.headers),
+            [("y", "new"), ("", ""), (":method", "GET")]
+        );
+        assert_eq!(
+            b.headers
+                .iter()
+                .map(|h| h.name.is_some())
+                .collect::<Vec<_>>(),
+            [true, false, true]
+        );
+        // A literal named after an unknown entry has a known value.
+        let b = d.decode_block(&hex("0f30 0161"), MAX_DECODED).unwrap();
+        assert_eq!(
+            (b.headers[0].name.as_deref(), b.headers[0].value.as_deref()),
+            (None, Some(b"a".as_slice()))
+        );
+        // Once known entries fill the table, nothing older can be left.
+        let mut d = PartialTable::default();
+        d.forget();
+        d.decode_all(&hex("3f3b 4001 7801 61")); // size 90, then x: a (34)
+        assert!(d.unsure, "an entry of 32 bytes or more may be left");
+        d.decode_all(&hex("4001 7901 62")); // y: b, 68 in all
+        assert!(!d.unsure, "no room for an older entry");
+        assert!(
+            d.decode_block(&[0xc0], MAX_DECODED).is_err(),
+            "index 64 cannot exist"
+        );
+    }
+
+    /// A table larger than the decoder keeps: entries past what it keeps
+    /// are unknown, not missing.
+    #[test]
+    fn a_table_past_what_is_kept_is_unsure() {
+        let mut d = PartialTable::default();
+        // Size update to 1 MiB: 0x3f, then 1,048,576 - 31 as an integer.
+        let mut block = vec![0x3f];
+        let mut v = (1usize << 20) - 31;
+        while v >= 0x80 {
+            block.push((v as u8 & 0x7f) | 0x80);
+            v >>= 7;
+        }
+        block.push(v as u8);
+        d.decode_all(&block);
+        // a: 16,000 bytes, a literal of length 127 + 15,873.
+        let mut big = vec![0x40, 0x01, b'a', 0x7f, 0x81, 0x7c];
+        big.extend(std::iter::repeat_n(b'v', 16_000));
+        for _ in 0..5 {
+            d.decode_all(&big);
+        }
+        assert_eq!(d.table.len(), 4, "only 64 KiB is kept");
+        assert!(d.unsure);
+        let b = d.decode_block(&[0xc2], MAX_DECODED).unwrap(); // index 66, the fifth
+        assert!(b.headers[0].value.is_none());
+    }
+
+    /// A block not decoded may have changed the table's maximum, so after
+    /// it, entries are kept until a size update says what the maximum is.
+    #[test]
+    fn a_forgotten_table_forgets_its_maximum() {
+        let mut d = PartialTable::default();
+        d.decode_all(&hex("20")); // size 0
+        d.forget(); // the block not decoded set it to 4,096
+        d.decode_all(&hex("4001 7803 6e65 77")); // x: new
+        assert_eq!(pairs(&d.decode_all(&[0xbe])), [("x", "new")]);
+        d.decode_all(&hex("3f e11f")); // size 4,096
+        assert_eq!(d.max, Some(4096));
+    }
+
+    #[test]
+    fn observation_accepts_huffman_expansion_and_keeps_the_table() {
+        let mut d = PartialTable::default();
+        d.decode_all(&hex("400178036f6c64")); // x: old
+        let mut bytes = vec![0x00, 0x01, b'x'];
+        Integer::<7> {
+            flags: 0x80,
+            value: 60_000,
+        }
+        .write(&mut bytes)
+        .unwrap();
+        bytes.extend(vec![0; 60_000]);
+        assert!(bytes.len() < 64 << 10);
+        let block = d.decode_block(&bytes, MAX_DECODED).unwrap();
+        assert_eq!((block.headers.len(), block.more), (0, 1));
+        assert!(!d.is_unsure());
+        assert_eq!(d.table_len(), 1);
+        assert_eq!(d.table_capacity(), Some(4096));
+        assert_eq!(pairs(&d.decode_all(&[0xbe])), [("x", "old")]);
+        assert_eq!(
+            hpack::Table::default().decode_block(&bytes, MAX_DECODED),
+            Err(hpack::Error::StringTooLong)
+        );
+    }
+
+    #[test]
+    fn unknown_settings_preserve_size_update_grammar() {
+        let mut table = PartialTable::default();
+        assert!(
+            table
+                .decode_block(&[0x21, 0x20, 0x20, 0x82], MAX_DECODED)
+                .is_ok()
+        );
+        assert_eq!(
+            table.decode_block(&[0x82, 0x20], MAX_DECODED),
+            Err(hpack::Error::SizeUpdateOrder)
+        );
+        assert!(table.is_unsure());
+        assert_eq!(table.decode_all(&[0xbe])[0].name, None);
+    }
+
+    #[test]
+    fn captured_fragments_preserve_padding_priorities_and_promises() {
+        use fictionet::stdlib::protocols::http2::{Dependency, Headers, PushPromise};
+        for pad in [None, Some(0), Some(1), Some(255)] {
+            for kind in [1, 5] {
+                for priority in [false, true] {
+                    let mut encoder = hpack::Encoder::default();
+                    let fields = [hpack::Field::new("x-saved", "value")];
+                    let mut block = Vec::new();
+                    encoder.encode_block(&fields, &mut block).unwrap();
+                    let mut indexed = Vec::new();
+                    encoder.encode_block(&fields, &mut indexed).unwrap();
+                    assert!(indexed.len() < block.len());
+                    for split in 0..=block.len() {
+                        let padding = pad.map(|n| vec![0xa5; n]);
+                        let flags = if pad.is_some() { 8 } else { 0 };
+                        let first = if kind == 1 {
+                            Frame::Headers(Headers {
+                                stream: 1,
+                                flags: flags | 1 | if priority { 0x20 } else { 0 },
+                                fragment: block[..split].to_vec(),
+                                priority: priority.then_some(Dependency {
+                                    stream: 3,
+                                    exclusive: true,
+                                    weight: 255,
+                                }),
+                                padding,
+                            })
+                        } else {
+                            Frame::PushPromise(PushPromise {
+                                stream: 1,
+                                flags,
+                                promised: 2,
+                                fragment: block[..split].to_vec(),
+                                padding,
+                            })
+                        }
+                        .to_bytes()
+                        .unwrap();
+                        let mut blocks = PartialBlocks::default();
+                        let first = blocks
+                            .read(FrameHeader::parse(&first[..9]).unwrap(), Some(&first[9..]))
+                            .unwrap();
+                        let mut diagnostics = Vec::new();
+                        if kind == 5 {
+                            diagnostics.push(BlockDiagnostic::PromisedStream { stream: 2 });
+                        }
+                        diagnostics.push(BlockDiagnostic::Continues);
+                        assert_eq!(first.diagnostics, diagnostics);
+                        assert_eq!(first.promised, (kind == 5).then_some(2));
+                        assert_eq!(first.end, kind == 1);
+                        assert!(first.block.is_none());
+                        assert!(blocks.pending());
+                        let last = raw(9, 4, 1, &block[split..]);
+                        let last = blocks
+                            .read(FrameHeader::parse(&last[..9]).unwrap(), Some(&last[9..]))
+                            .unwrap();
+                        assert_eq!(last.end, kind == 1);
+                        assert_eq!(last.promised, (kind == 5).then_some(2));
+                        assert_eq!(pairs(&last.block.unwrap().headers), [("x-saved", "value")]);
+                        assert!(last.diagnostics.is_empty());
+                        assert!(!last.malformed && !last.interrupted);
+                        assert!(!blocks.pending());
+                        let next = raw(1, 4, 3, &indexed);
+                        let next = blocks
+                            .read(FrameHeader::parse(&next[..9]).unwrap(), Some(&next[9..]))
+                            .unwrap();
+                        assert_eq!(pairs(&next.block.unwrap().headers), [("x-saved", "value")]);
+                    }
+                }
+            }
+        }
     }
 }
