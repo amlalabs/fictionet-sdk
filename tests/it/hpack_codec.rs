@@ -70,18 +70,9 @@ fn settings_table_eviction_and_round_trips_through_public_api() {
         encoder.encode_block(&fields, &mut bytes).unwrap();
         let block = decoder.decode_block(&bytes, hpack::MAX_DECODED).unwrap();
         assert_eq!(block.more, 0);
-        let back: Vec<_> = block
-            .headers
-            .into_iter()
-            .map(|h| Field {
-                name: h.name.unwrap(),
-                value: h.value.unwrap(),
-                never_index: h.never_index,
-            })
-            .collect();
-        assert_eq!(back, fields);
+        assert_eq!(block.headers, fields);
         assert_eq!(decoder.table_size(), encoder.table_size());
-        assert!(decoder.table_size() <= decoder.settings_limit().unwrap());
+        assert!(decoder.table_size() <= decoder.settings_limit());
     }
 }
 
@@ -116,10 +107,7 @@ fn fields_huffman_strings_and_prefix_integers_keep_the_public_contracts() {
     let result = hpack::Table::default()
         .decode_block(&bytes, hpack::MAX_DECODED)
         .unwrap();
-    assert_eq!(
-        result.headers[0].name.as_deref(),
-        Some(b"x-owned".as_slice())
-    );
+    assert_eq!(result.headers[0].name, b"x-owned");
     assert_eq!(
         huffman::decode(&huffman::HuffmanString(vec![0, 255]).to_bytes().unwrap()).unwrap(),
         [0, 255]

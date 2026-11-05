@@ -292,6 +292,86 @@ fn an_http11_request_with_no_host_gets_400_from_the_service() {
 }
 
 #[test]
+fn missing_host_preserves_body_limit_precedence_and_pipeline_boundaries() {
+    for (fields, body, status) in [
+        ("Content-Length: 5\r\n", "hello", 413),
+        ("Content-Length: 20\r\n", "hello", 413),
+        ("Content-Length: 20\r\n", "he", 400),
+        ("Content-Length: 20\r\n", "", 400),
+        (
+            "Content-Length: 2\r\n",
+            "heGET /next HTTP/1.1\r\nHost: a\r\n\r\n",
+            400,
+        ),
+        (
+            "Transfer-Encoding: chunked\r\n",
+            "2\r\nhe\r\n3\r\nllo\r\n0\r\n\r\n",
+            413,
+        ),
+        ("Transfer-Encoding: chunked\r\n", "2\r\nhe\r\n9\r\nllo", 413),
+        ("Transfer-Encoding: chunked\r\n", "2\r\nhe\r\n9", 400),
+        (
+            "Transfer-Encoding: chunked\r\n",
+            "2\r\nhe\r\n0\r\n\r\nGET /next HTTP/1.1\r\nHost: a\r\n\r\n",
+            400,
+        ),
+        ("Content-Length: 1\r\nContent-Length: 2\r\n", "hello", 400),
+    ] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let handler = fictionet_test_support::handler(move |_, _| {
+            count.fetch_add(1, Ordering::SeqCst);
+            http::Response::new(Bytes::from("unexpected"))
+        });
+        let opts = httpd::Limits {
+            body: 2,
+            ..httpd::Limits::default()
+        };
+        let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::with(handler, opts), ());
+        let request = format!("POST /original HTTP/1.1\r\n{fields}\r\n{body}");
+        let Err(fictionet::stdlib::services::serve::HarnessError::Decode(
+            fictionet::stdlib::codec::Fail::Protocol(
+                fictionet::stdlib::protocols::http1::RequestError::Rejected(rejected),
+            ),
+        )) = h.push(request.as_bytes())
+        else {
+            panic!("expected the rejected request context");
+        };
+        assert_eq!(rejected.head.method, "POST");
+        assert_eq!(rejected.head.target, "/original");
+        assert_eq!(
+            rejected.error,
+            fictionet::stdlib::protocols::http1::Error::Host
+        );
+        let response = http_text(&h);
+        assert!(
+            response.starts_with(&format!("HTTP/1.1 {status} ")),
+            "{request:?}: {response}"
+        );
+        assert_eq!(response.matches("HTTP/1.1 ").count(), 1);
+        assert!(h.closed());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[test]
+fn missing_host_preserves_head_response_semantics() {
+    let handler =
+        fictionet_test_support::handler(|_, _| panic!("rejected request reached handler"));
+    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(handler), ());
+    assert!(h.push(b"HEAD /original HTTP/1.1\r\n\r\n").is_err());
+    let response = http_text(&h);
+    assert!(response.starts_with("HTTP/1.1 400 Bad Request"));
+    assert!(response.ends_with("\r\n\r\n"));
+    assert!(
+        response
+            .to_ascii_lowercase()
+            .contains("content-length: 27\r\n")
+    );
+    assert!(h.closed());
+}
+
+#[test]
 fn an_http11_absolute_request_with_no_host_gets_400_from_the_service() {
     let calls = Arc::new(AtomicUsize::new(0));
     let count = calls.clone();

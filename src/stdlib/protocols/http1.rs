@@ -9,6 +9,13 @@
 //! them with [`ResponseEvents::skip_chunk_extras`]. Requests may use only the chunked
 //! transfer coding. Requests ignore Upgrade offers and continue as HTTP;
 //! 101 responses end HTTP for handoff without handling Upgrade.
+//!
+//! [`RequestEvents`] reports a rejected parsed head through [`RequestError`],
+//! preserving the original fields and known body framing. Rejected requests
+//! never produce head or body events. [`RequestEvents::rejected_body_len`]
+//! counts buffered payload bytes through the same body framer, including
+//! partial bodies, so an endpoint can retain its body-limit rejection policy.
+//! Whole-message and `Wire` parsers report the underlying [`Error`].
 
 use fictionet::stdlib::codec::ascii::{self, trim_ows as trim};
 use fictionet::stdlib::codec::{
@@ -369,6 +376,60 @@ pub enum Event<H> {
     Done,
 }
 
+/// A streaming request failure. Syntax and body failures carry their reason;
+/// a rejected, syntactically complete head also preserves its framing evidence.
+/// Every failure is terminal: callers must close or discard the stream.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RequestError {
+    /// Parsing could not produce a complete request head, or its body failed.
+    Parse(Error),
+    /// A complete request head failed endpoint validation.
+    Rejected(Box<RejectedRequest>),
+}
+
+/// A request head rejected by endpoint validation. It is never a Head event.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RejectedRequest {
+    /// The validation failure.
+    pub error: Error,
+    /// The original parsed head, without repaired or invented fields.
+    pub head: RequestHead,
+    /// Bytes occupied by this head in the decoder's current input.
+    pub head_bytes: usize,
+    /// Body framing, or the reason its boundary cannot be trusted.
+    pub framing: Result<Framing, Error>,
+}
+
+impl RequestError {
+    /// The syntax, validation, framing, or limit failure.
+    pub fn reason(&self) -> Error {
+        match self {
+            Self::Parse(error) => *error,
+            Self::Rejected(request) => request.error,
+        }
+    }
+}
+
+impl From<Error> for RequestError {
+    fn from(error: Error) -> Self {
+        Self::Parse(error)
+    }
+}
+
+impl fmt::Display for RequestError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.reason().fmt(f)
+    }
+}
+
+impl std::error::Error for RequestError {}
+
+impl From<RequestError> for Error {
+    fn from(error: RequestError) -> Self {
+        error.reason()
+    }
+}
+
 /// Streaming requests built on [`Lines`], with bounded input and no body
 /// accumulation. Chunk extensions and non-empty trailers are refused.
 /// Framing follows [RFC 9112 section 6.3](https://www.rfc-editor.org/rfc/rfc9112.html#section-6.3),
@@ -398,9 +459,18 @@ pub enum Event<H> {
 pub struct RequestEvents {
     core: Reader,
     empty_lines: usize,
+    rejected_body_bytes: usize,
 }
 
 impl RequestEvents {
+    /// Payload bytes already buffered when a head was rejected. The ordinary
+    /// body framer counts these, including a partial body block, and stops at
+    /// the message boundary or malformed framing. Chunk metadata and later
+    /// pipelined requests are excluded. No rejected body is emitted as an event.
+    pub fn rejected_body_len(&self) -> usize {
+        self.rejected_body_bytes
+    }
+
     /// Number of body bytes at the start of an unread buffer of `buffered`
     /// bytes that has not yet filled a body event. Use after decoding stops
     /// to observe a partial body.
@@ -426,6 +496,7 @@ impl RequestEvents {
         Self {
             core: Reader::new(limits),
             empty_lines: 0,
+            rejected_body_bytes: 0,
         }
     }
 }
@@ -438,13 +509,15 @@ impl Default for RequestEvents {
 
 impl Decode for RequestEvents {
     type Item = Event<RequestHead>;
-    type Error = Error;
+    type Error = RequestError;
     const NAME: &'static str = "HTTP/1 requests";
     fn capacity(&self) -> usize {
         self.core.capacity()
     }
-    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Self::Item>, Error> {
-        Ok(self.scan(input, eof)?.map(BorrowedEvent::into_owned))
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Self::Item>, RequestError> {
+        Ok(self
+            .scan_request(input, eof)?
+            .map(BorrowedEvent::into_owned))
     }
 }
 
@@ -718,12 +791,12 @@ trait Framed<H> {
     fn parse_head(bytes: &[u8]) -> Result<H, Error>;
 }
 
-impl Framed<RequestHead> for RequestEvents {
-    fn scan<'a>(
+impl RequestEvents {
+    fn scan_request<'a>(
         &mut self,
         input: &'a [u8],
         eof: bool,
-    ) -> Result<Step<BorrowedEvent<'a, RequestHead>>, Error> {
+    ) -> Result<Step<BorrowedEvent<'a, RequestHead>>, RequestError> {
         if let Some(step) = self.core.body(input, eof)? {
             return Ok(step);
         }
@@ -733,7 +806,7 @@ impl Framed<RequestHead> for RequestEvents {
             }
             if input.starts_with(b"\r\n") {
                 if self.empty_lines >= MAX_EMPTY_LINES {
-                    return Err(Error::StartLine);
+                    return Err(Error::StartLine.into());
                 }
                 self.empty_lines = self.empty_lines.saturating_add(1);
                 self.core.lines = Lines::new(self.core.limits.start_line, Ending::Crlf);
@@ -743,11 +816,52 @@ impl Framed<RequestHead> for RequestEvents {
         let Some(n) = self.core.head(input)? else {
             return Ok(Step::Need);
         };
-        let (head, info, framing) = request_head(&input[..n])?;
+        let head = request_syntax(&input[..n], false)?;
+        let (info, framing) = match request_info(&head) {
+            Ok(info) => info,
+            Err(error) => {
+                let framing = fields(&head.headers, head.version).and_then(request_framing);
+                self.rejected_body_bytes = 0;
+                if let Ok(framing) = framing {
+                    self.core.begin(framing, true);
+                    let mut rest = &input[n..];
+                    loop {
+                        match self.core.body::<RequestHead>(rest, eof) {
+                            Ok(Some(Step::Item(BorrowedEvent::Body(bytes), used))) => {
+                                self.rejected_body_bytes += bytes.len();
+                                rest = &rest[used..];
+                            }
+                            Ok(Some(Step::Skip(used))) => rest = &rest[used..],
+                            _ => {
+                                self.rejected_body_bytes += self.pending_body_len(rest.len());
+                                break;
+                            }
+                        }
+                    }
+                }
+                return Err(RequestError::Rejected(Box::new(RejectedRequest {
+                    error,
+                    head,
+                    head_bytes: n,
+                    framing,
+                })));
+            }
+        };
         self.empty_lines = 0;
         self.core
             .begin(framing, info.close || head.method == "CONNECT");
         Ok(Step::Item(BorrowedEvent::Head(head), n))
+    }
+}
+
+impl Framed<RequestHead> for RequestEvents {
+    fn scan<'a>(
+        &mut self,
+        input: &'a [u8],
+        eof: bool,
+    ) -> Result<Step<BorrowedEvent<'a, RequestHead>>, Error> {
+        self.scan_request(input, eof)
+            .map_err(|error| error.reason())
     }
     fn reader(&self) -> &Reader {
         &self.core
@@ -1148,11 +1262,16 @@ impl Method {
     }
 }
 
-#[derive(Clone, Copy)]
-enum Framing {
+/// The body boundary established by a parsed HTTP head.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Framing {
+    /// No body follows the head.
     Empty,
+    /// Exactly this many payload bytes follow the head.
     Length(u64),
+    /// Chunk sizes and their terminating zero chunk delimit the body.
     Chunked,
+    /// The response body ends at connection EOF.
     Close,
 }
 #[derive(Clone, Copy)]
@@ -1563,7 +1682,7 @@ fn request_framing(info: Fields) -> Result<Framing, Error> {
         }
         Ok(Framing::Chunked)
     } else {
-        Ok(Framing::Length(info.length.unwrap_or(0)))
+        Ok(info.length.map_or(Framing::Empty, Framing::Length))
     }
 }
 fn response_framing(head: &ResponseHead, info: Fields, method: Method) -> Result<Framing, Error> {
@@ -1958,10 +2077,10 @@ fn exact_head(b: &[u8]) -> Result<(), Error> {
     }
     Ok(())
 }
-fn whole<H, D: Decode<Item = Event<H>, Error = Error>>(
-    decoder: D,
-    b: &[u8],
-) -> Result<(H, Vec<u8>), Error> {
+fn whole<H, D: Decode<Item = Event<H>>>(decoder: D, b: &[u8]) -> Result<(H, Vec<u8>), Error>
+where
+    D::Error: Clone + Into<Error>,
+{
     let mut stream = Stream::new(decoder);
     let mut head = None;
     let mut body = Vec::new();
@@ -2014,9 +2133,9 @@ fn whole<H, D: Decode<Item = Event<H>, Error = Error>>(
     Ok((head.ok_or(Error::Incomplete)?, body))
 }
 
-fn wire_failure(failure: Fail<Error>) -> Error {
+fn wire_failure<E: Into<Error>>(failure: Fail<E>) -> Error {
     match failure {
-        Fail::Protocol(error) => error,
+        Fail::Protocol(error) => error.into(),
         Fail::Truncated { .. } => Error::Incomplete,
         Fail::Stuck { .. } | Fail::Refused { .. } => Error::State,
     }
@@ -2267,7 +2386,10 @@ mod tests {
     }
     fn request_error(bytes: &[u8], expected: Error) {
         let (_, error) = test_support::decode_all(RequestEvents::default, bytes);
-        assert_eq!(error, Some(Fail::Protocol(expected)), "{bytes:?}");
+        assert!(
+            matches!(error, Some(Fail::Protocol(ref error)) if error.reason() == expected),
+            "{bytes:?}: {error:?}"
+        );
         assert_eq!(
             decode_chunks(
                 &mut Stream::new(RequestEvents::default()),
@@ -2288,6 +2410,104 @@ mod tests {
             ),
             decode_all(ResponseEvents::default, bytes)
         );
+    }
+
+    #[test]
+    fn rejected_request_keeps_head_framing_and_received_payload() {
+        for (fields, body, framing, received) in [
+            (
+                "Content-Length: 5\r\n",
+                "helloGET /next HTTP/1.1\r\n\r\n",
+                Framing::Length(5),
+                5,
+            ),
+            ("Content-Length: 9\r\n", "hello", Framing::Length(9), 5),
+            ("Content-Length: 9\r\n", "", Framing::Length(9), 0),
+            (
+                "Content-Length: 0\r\n",
+                "GET /next HTTP/1.1\r\n\r\n",
+                Framing::Length(0),
+                0,
+            ),
+            (
+                "Transfer-Encoding: chunked\r\n",
+                "2\r\nhe\r\n3\r\nllo\r\n0\r\n\r\nGET /next HTTP/1.1\r\n\r\n",
+                Framing::Chunked,
+                5,
+            ),
+            (
+                "Transfer-Encoding: chunked\r\n",
+                "2\r\nhe\r\n9\r\nllo",
+                Framing::Chunked,
+                5,
+            ),
+            (
+                "Transfer-Encoding: chunked\r\n",
+                "2\r\nhe\r\n9",
+                Framing::Chunked,
+                2,
+            ),
+            (
+                "Transfer-Encoding: chunked\r\n",
+                "2\r\nheXbad ending",
+                Framing::Chunked,
+                2,
+            ),
+            ("", "GET /next HTTP/1.1\r\n\r\n", Framing::Empty, 0),
+        ] {
+            let head = format!("POST /original HTTP/1.1\r\nX-Raw: keep\r\n{fields}\r\n");
+            let bytes = format!("{head}{body}");
+            for body_chunk in [1, 2, 8192] {
+                let mut decoder = RequestEvents::with_limits(Limits {
+                    body_chunk,
+                    ..Limits::default()
+                });
+                let Err(RequestError::Rejected(rejected)) = decoder.decode(bytes.as_bytes(), false)
+                else {
+                    panic!("expected rejected head: {bytes:?}");
+                };
+                assert_eq!(rejected.error, Error::Host);
+                assert_eq!(rejected.head.method, "POST");
+                assert_eq!(rejected.head.target, "/original");
+                assert_eq!(rejected.head.headers[0].name, "X-Raw");
+                assert_eq!(rejected.head.headers[0].value, b"keep");
+                assert!(
+                    !rejected
+                        .head
+                        .headers
+                        .iter()
+                        .any(|h| h.name.eq_ignore_ascii_case("host"))
+                );
+                assert_eq!(rejected.head_bytes, head.len());
+                assert_eq!(rejected.framing, Ok(framing));
+                assert_eq!(decoder.rejected_body_len(), received);
+            }
+        }
+    }
+
+    #[test]
+    fn rejected_request_preserves_ambiguous_framing_and_host_validation() {
+        for host in ["", "Host: a\r\nHost: b\r\n", "Host: bad host\r\n"] {
+            let bytes = format!(
+                "POST / HTTP/1.1\r\n{host}Content-Length: 1\r\nContent-Length: 2\r\n\r\nhello"
+            );
+            let mut decoder = RequestEvents::new();
+            let Err(RequestError::Rejected(rejected)) = decoder.decode(bytes.as_bytes(), false)
+            else {
+                panic!("expected rejected head");
+            };
+            assert_eq!(rejected.error, Error::Host);
+            assert_eq!(rejected.framing, Err(Error::ConflictingContentLength));
+            assert_eq!(decoder.rejected_body_len(), 0);
+            assert_eq!(
+                rejected.head.headers.len(),
+                2 + host.matches("Host:").count()
+            );
+        }
+        assert!(matches!(
+            RequestEvents::new().decode(b"GET / HTTP/1.1\n\n", false),
+            Err(RequestError::Parse(Error::LineEnding))
+        ));
     }
 
     #[test]
@@ -2387,7 +2607,7 @@ mod tests {
         for (limits, error) in cases {
             assert_eq!(
                 test_support::decode_all(|| RequestEvents::with_limits(limits), bytes).1,
-                Some(Fail::Protocol(error))
+                Some(Fail::Protocol(RequestError::Parse(error)))
             );
             assert_eq!(
                 decode_chunks(

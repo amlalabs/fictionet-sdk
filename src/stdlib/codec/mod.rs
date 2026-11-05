@@ -212,13 +212,10 @@
 //! presenter are independent of hyper's live server. Adding a frame or a
 //! capture feature here does not add it to hyper.
 //!
-//! HTTP/2 capture uses
-//! [`Inputs::for_observation`](super::protocols::http2::Inputs::for_observation)
-//! and
-//! [`HeaderBlocks::for_observation`](super::protocols::http2::HeaderBlocks::for_observation).
-//! They report unreadable input for presentation where strict frame and session
-//! decoding would fail. This is a capture policy, not permission for a live
-//! endpoint to accept the same bytes.
+//! HTTP/2 [`Capture`](super::dissect::http2::Capture) owns partial header
+//! evidence and recovery. It shares the protocol frame parser and HPACK
+//! representation and table operations with endpoint decoding. Unreadable
+//! capture input is presented explicitly; endpoint headers remain complete.
 //!
 //! [`http3`](super::protocols::http3) supplies frames and caller-driven stream
 //! state. Callers supply ordered QUIC stream bytes and manage QPACK tables,

@@ -3,8 +3,8 @@
 //! Keep one [`Table`] and [`Encoder`] per direction. Pass complete header
 //! blocks to [`Table::decode_block`]; HTTP/2 framing supplies their boundaries.
 //! [`Table::set_settings_limit`] applies an acknowledged header table setting.
-//! [`Table::for_observation`] handles captures with missing settings or blocks.
-//! Call [`Table::forget`] after a gap to avoid reading stale table entries.
+//! [`Representations`] and [`DynamicTable`] supply neutral parsing and storage
+//! for capture reconstruction in [`dissect::http2`](crate::stdlib::dissect::http2).
 //! Names and values stay as octets. Text conversion belongs to the caller.
 //! A server using this module must advertise SETTINGS_HEADER_TABLE_SIZE
 //! at most [`MAX_TABLE`].
@@ -16,7 +16,7 @@
 //! let mut bytes = Vec::new();
 //! encoder.encode_block(&fields, &mut bytes)?;
 //! let block = Table::new(4096).decode_block(&bytes, MAX_DECODED)?;
-//! assert_eq!(block.headers[1].value.as_deref(), Some(b"blue".as_slice()));
+//! assert_eq!(block.headers[1].value, b"blue");
 //! # Ok::<(), fictionet::stdlib::protocols::hpack::Error>(())
 //! ```
 
@@ -35,7 +35,7 @@ pub const MAX_HEADERS: usize = 256;
 pub const MAX_DECODED: usize = 64 << 10;
 /// The largest encoded block accepted by the decoder.
 pub const MAX_BLOCK: usize = 256 << 10;
-/// The largest encoded or decoded string literal in strict mode.
+/// The largest encoded or decoded string literal accepted by an endpoint.
 pub const MAX_STRING: usize = huffman::MAX_STRING;
 /// The most entry bytes retained in a dynamic table, including overhead.
 pub const MAX_TABLE: usize = 64 << 10;
@@ -51,8 +51,8 @@ pub enum Error {
     Trailing,
     /// An integer exceeds `u64` or its prefix width is invalid.
     IntegerOverflow,
-    /// A string exceeds its encoded or decoded limit. Strict mode uses
-    /// [`MAX_STRING`]; observation uses `MAX_BLOCK * 8 / 5`.
+    /// A string exceeds its supplied encoded or decoded limit.
+    /// Endpoints use [`MAX_STRING`].
     StringTooLong,
     /// A Huffman string has invalid codes, EOS, or padding.
     Huffman,
@@ -60,9 +60,9 @@ pub enum Error {
     Index,
     /// A size update exceeds the acknowledged settings limit.
     TableSize,
-    /// Strict mode requires size updates before fields. It also permits at most
-    /// two updates in nondecreasing order. The count and order checks are
-    /// stricter than RFC 7541 requires of decoders. Observation skips these checks.
+    /// Size updates must precede fields. Endpoint validation also permits at most
+    /// two updates in nondecreasing order. Those count and order checks are
+    /// stricter than RFC 7541 requires of decoders.
     SizeUpdateOrder,
     /// A settings reduction requires a size update at the next block's start.
     MissingSizeUpdate,
@@ -295,21 +295,236 @@ impl Wire for Field {
     }
 }
 
-/// A decoded field. Missing octets refer to entries lost from a capture.
+/// A name literal or table reference in an HPACK representation.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Header {
-    /// The name, or `None` if the referenced entry is unknown.
-    pub name: Option<Vec<u8>>,
-    /// The value, or `None` if the referenced entry is unknown.
-    pub value: Option<Vec<u8>>,
-    /// Whether the literal was marked never indexed.
-    pub never_index: bool,
+pub enum Name {
+    /// Name octets carried in this representation.
+    Literal(Vec<u8>),
+    /// A one-based static or dynamic table index.
+    Index(u64),
 }
-/// The retained part of one decoded header block.
+
+/// The indexing instruction carried by a literal field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Indexing {
+    /// Insert the field into the dynamic table.
+    Incremental,
+    /// Leave the table unchanged.
+    Without,
+    /// Leave the table unchanged and preserve the never-indexed instruction.
+    Never,
+}
+
+/// One decoded representation, before resolving table references.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Representation {
+    /// A complete field referenced by its one-based table index.
+    Indexed(u64),
+    /// A literal field, possibly referencing an existing name.
+    Literal {
+        /// The literal name or its table index.
+        name: Name,
+        /// Decoded value octets.
+        value: Vec<u8>,
+        /// The wire instruction for indexing this field.
+        indexing: Indexing,
+    },
+    /// A dynamic table capacity update at the start of a block.
+    SizeUpdate(usize),
+}
+
+/// Reads a complete block's representations without choosing a table or settings.
+/// Integer, string, Huffman and block grammar checks are shared by endpoints
+/// and captures. Settings validation and table knowledge belong to the consumer.
+#[derive(Debug)]
+pub struct Representations<'a> {
+    reader: Reader<'a>,
+    string_limit: usize,
+    fields_started: bool,
+    failed: bool,
+}
+impl<'a> Representations<'a> {
+    /// Bounds the encoded block by [`MAX_BLOCK`] and each encoded or decoded
+    /// string by `string_limit`. Updates must precede every field.
+    pub fn new(bytes: &'a [u8], string_limit: usize) -> Result<Self, Error> {
+        if bytes.len() > MAX_BLOCK {
+            return Err(Error::BlockTooLong);
+        }
+        Ok(Self {
+            reader: Reader::new(bytes),
+            string_limit,
+            fields_started: false,
+            failed: false,
+        })
+    }
+
+    fn read(&mut self) -> Result<Representation, Error> {
+        let first = self.reader.peek_u8().ok_or(Error::Truncated)?;
+        if first & 0xe0 == 0x20 {
+            if self.fields_started {
+                return Err(Error::SizeUpdateOrder);
+            }
+            let size = usize::try_from(self.reader.integer(5)?).map_err(|_| Error::TableSize)?;
+            return Ok(Representation::SizeUpdate(size));
+        }
+        self.fields_started = true;
+        if first & 0x80 != 0 {
+            let index = self.reader.integer(7)?;
+            if index == 0 {
+                return Err(Error::Index);
+            }
+            return Ok(Representation::Indexed(index));
+        }
+        let indexing = if first & 0x40 != 0 {
+            Indexing::Incremental
+        } else if first & 0x10 != 0 {
+            Indexing::Never
+        } else {
+            Indexing::Without
+        };
+        let index = self.reader.integer(if indexing == Indexing::Incremental {
+            6
+        } else {
+            4
+        })?;
+        let name = if index == 0 {
+            Name::Literal(self.reader.string(self.string_limit)?)
+        } else {
+            Name::Index(index)
+        };
+        let value = self.reader.string(self.string_limit)?;
+        Ok(Representation::Literal {
+            name,
+            value,
+            indexing,
+        })
+    }
+}
+impl Iterator for Representations<'_> {
+    type Item = Result<Representation, Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.failed || self.reader.is_empty() {
+            return None;
+        }
+        let result = self.read();
+        self.failed = result.is_err();
+        Some(result)
+    }
+}
+
+/// A known static or dynamic table entry, borrowed without copying its octets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Entry<'a> {
+    /// Header name octets.
+    pub name: &'a [u8],
+    /// Header value octets.
+    pub value: &'a [u8],
+}
+
+/// Known dynamic entries, newest first, with shared name storage.
+/// Consumers supply the capacity and track whether older entries are known.
+#[derive(Clone, Debug, Default)]
+pub struct DynamicTable {
+    entries: VecDeque<(Arc<[u8]>, Vec<u8>)>,
+    size: usize,
+}
+impl DynamicTable {
+    /// Resolves a static or retained dynamic index. A missing dynamic entry
+    /// returns `None`; index zero is always an error.
+    pub fn get(&self, index: u64) -> Result<Option<Entry<'_>>, Error> {
+        if index == 0 {
+            return Err(Error::Index);
+        }
+        if let Some((name, value)) = index
+            .checked_sub(1)
+            .and_then(|n| usize::try_from(n).ok())
+            .and_then(|n| STATIC_TABLE.get(n))
+        {
+            return Ok(Some(Entry {
+                name: name.as_bytes(),
+                value: value.as_bytes(),
+            }));
+        }
+        Ok(index
+            .checked_sub(62)
+            .and_then(|n| usize::try_from(n).ok())
+            .and_then(|n| self.entries.get(n))
+            .map(|(name, value)| Entry { name, value }))
+    }
+
+    /// Resolves a name, sharing storage when it names a retained dynamic entry.
+    pub fn name(&self, index: u64) -> Result<Option<Arc<[u8]>>, Error> {
+        if index == 0 {
+            return Err(Error::Index);
+        }
+        if let Some((name, _)) = index
+            .checked_sub(1)
+            .and_then(|n| usize::try_from(n).ok())
+            .and_then(|n| STATIC_TABLE.get(n))
+        {
+            return Ok(Some(name.as_bytes().into()));
+        }
+        Ok(index
+            .checked_sub(62)
+            .and_then(|n| usize::try_from(n).ok())
+            .and_then(|n| self.entries.get(n))
+            .map(|(name, _)| Arc::clone(name)))
+    }
+
+    /// Inserts a known field. Call [`Self::evict`] with the consumer's capacity.
+    pub fn insert(&mut self, name: Arc<[u8]>, value: Vec<u8>) {
+        self.size += name.len() + value.len() + ENTRY_OVERHEAD;
+        self.entries.push_front((name, value));
+    }
+
+    /// Removes oldest entries until their total size fits. Returns whether any
+    /// entries were removed, including an inserted entry larger than capacity.
+    pub fn evict(&mut self, capacity: usize) -> bool {
+        let mut removed = false;
+        while self.size > capacity {
+            let Some((name, value)) = self.entries.pop_back() else {
+                break;
+            };
+            self.size -= name.len() + value.len() + ENTRY_OVERHEAD;
+            removed = true;
+        }
+        removed
+    }
+
+    /// Releases all retained entries and allocated slots.
+    pub fn clear(&mut self) {
+        self.entries = VecDeque::new();
+        self.size = 0;
+    }
+    /// Retained entry bytes, including [`ENTRY_OVERHEAD`] per entry.
+    pub fn size(&self) -> usize {
+        self.size
+    }
+    /// Number of retained entries.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+    /// Whether there are no retained entries.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+    /// Allocated dynamic-table storage, including entry slots and string capacity.
+    pub fn held(&self) -> usize {
+        self.entries.capacity() * std::mem::size_of::<(Arc<[u8]>, Vec<u8>)>()
+            + self
+                .entries
+                .iter()
+                .map(|(name, value)| name.len() + value.capacity())
+                .sum::<usize>()
+    }
+}
+
+/// The retained complete fields of one decoded endpoint header block.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Block {
     /// Headers in wire order, up to [`MAX_HEADERS`] and the caller's byte limit.
-    pub headers: Vec<Header>,
+    pub headers: Vec<Field>,
     /// Headers processed for table updates but omitted from `headers`.
     pub more: usize,
 }
@@ -318,47 +533,39 @@ impl Block {
         &mut self,
         limit: usize,
         used: &mut usize,
-        name: Option<&[u8]>,
-        value: Option<&[u8]>,
+        name: &[u8],
+        value: &[u8],
         never_index: bool,
     ) {
-        let len = name
-            .map_or(0, <[u8]>::len)
-            .saturating_add(value.map_or(0, <[u8]>::len));
+        let len = name.len().saturating_add(value.len());
         if self.headers.len() >= MAX_HEADERS || len > limit.saturating_sub(*used) {
             // At most one omitted header per byte of bounded block input.
             self.more = self.more.saturating_add(1);
             return;
         }
         *used += len;
-        self.headers.push(Header {
-            name: name.map(<[u8]>::to_vec),
-            value: value.map(<[u8]>::to_vec),
+        self.headers.push(Field {
+            name: name.to_vec(),
+            value: value.to_vec(),
             never_index,
         });
     }
 }
 
-/// Reads complete blocks while retaining one direction's bounded dynamic table.
+/// An endpoint's complete dynamic table and acknowledged settings.
+/// Capture reconstruction uses the neutral [`Representations`] and [`DynamicTable`]
+/// primitives with its own incomplete evidence.
 #[derive(Clone, Debug)]
 pub struct Table {
-    table: VecDeque<(Arc<[u8]>, Vec<u8>)>,
-    size: usize,
-    max: Option<usize>,
-    unsure: bool,
-    settings: Option<usize>,
+    table: DynamicTable,
+    max: usize,
+    settings: usize,
     required_min: Option<usize>,
 }
 impl Default for Table {
     fn default() -> Self {
         Self::new(4096)
     }
-}
-
-enum Entry<'a> {
-    Known(&'a [u8], &'a [u8]),
-    Dynamic(&'a Arc<[u8]>, &'a [u8]),
-    Unknown,
 }
 impl Table {
     /// Starts with the agreed settings limit, capped at [`MAX_TABLE`].
@@ -367,199 +574,107 @@ impl Table {
     pub fn new(settings_limit: usize) -> Self {
         let settings_limit = settings_limit.min(MAX_TABLE);
         Self {
-            table: VecDeque::new(),
-            size: 0,
-            max: Some(4096),
-            unsure: false,
-            settings: Some(settings_limit),
+            table: DynamicTable::default(),
+            max: 4096,
+            settings: settings_limit,
             required_min: (settings_limit < 4096).then_some(settings_limit),
         }
     }
-    /// Starts a capture decoder without a known settings bound. Tables larger
-    /// than [`MAX_TABLE`] retain their newest entries and mark older ones unknown.
-    /// Strings may expand to `MAX_BLOCK * 8 / 5` decoded octets.
-    /// Size updates may follow fields, repeat, or decrease.
-    /// Block syntax and the derived string limit are still checked.
-    pub fn for_observation() -> Self {
-        Self {
-            settings: None,
-            ..Self::default()
-        }
-    }
-
     /// Applies an acknowledged SETTINGS_HEADER_TABLE_SIZE, capped at [`MAX_TABLE`].
-    /// A reduction below the current maximum requires an update at the next
-    /// block's start. Multiple changes retain the smallest required reduction.
+    /// Multiple changes retain the smallest required reduction.
     pub fn set_settings_limit(&mut self, limit: usize) {
         let limit = limit.min(MAX_TABLE);
-        self.settings = Some(limit);
-        if self.max.is_none_or(|max| limit < max) {
+        self.settings = limit;
+        if limit < self.max {
             self.required_min = Some(self.required_min.map_or(limit, |old| old.min(limit)));
         }
     }
-    /// The settings bound, or `None` when observing without settings.
-    pub fn settings_limit(&self) -> Option<usize> {
+    /// The acknowledged settings bound.
+    pub fn settings_limit(&self) -> usize {
         self.settings
     }
-    /// The current table maximum, or `None` after missing a block.
-    pub fn table_capacity(&self) -> Option<usize> {
+    /// The current table maximum.
+    pub fn table_capacity(&self) -> usize {
         self.max
     }
-    /// The retained table size, including [`ENTRY_OVERHEAD`] per entry.
+    /// Retained entry bytes, including [`ENTRY_OVERHEAD`] per entry.
     pub fn table_size(&self) -> usize {
-        self.size
+        self.table.size()
     }
-    /// Allocated dynamic-table storage, including entry slots and string capacity.
+    /// Allocated dynamic-table storage, including spare entry slots.
     pub fn held(&self) -> usize {
-        self.table.capacity() * std::mem::size_of::<(Arc<[u8]>, Vec<u8>)>()
-            + self
-                .table
-                .iter()
-                .map(|(name, value)| name.len() + value.capacity())
-                .sum::<usize>()
+        self.table.held()
     }
     /// The number of retained table entries.
     pub fn table_len(&self) -> usize {
         self.table.len()
     }
-    /// Whether older dynamic entries may be unknown.
-    pub fn is_unsure(&self) -> bool {
-        self.unsure
-    }
-
-    /// Discards entries and the last size update after a missing or malformed block.
-    /// Settings bounds remain in effect. Later references to lost entries are unknown.
-    pub fn forget(&mut self) {
-        self.table = VecDeque::new();
-        self.size = 0;
-        self.unsure = true;
-        self.max = None;
-    }
 
     /// Reads one complete block, retaining at most `limit.min(MAX_DECODED)`
     /// name and value octets and [`MAX_HEADERS`] headers. Omitted headers still
-    /// update the table. Refuses malformed input, size update violations,
-    /// string limits, and input above [`MAX_BLOCK`]. Errors forget the table.
+    /// update the table. Errors clear retained entries; an endpoint must close
+    /// the connection after a compression error.
     pub fn decode_block(&mut self, bytes: &[u8], limit: usize) -> Result<Block, Error> {
         let result = self.read_block(bytes, limit.min(MAX_DECODED));
         if result.is_err() {
-            self.forget();
+            self.table.clear();
         }
         result
     }
 
-    fn get(&self, index: u64) -> Result<Entry<'_>, Error> {
-        if index == 0 {
-            return Err(Error::Index);
-        }
-        if let Some(index) = index.checked_sub(1).and_then(|n| usize::try_from(n).ok())
-            && let Some((name, value)) = STATIC_TABLE.get(index)
-        {
-            return Ok(Entry::Known(name.as_bytes(), value.as_bytes()));
-        }
-        let entry = index
-            .checked_sub(62)
-            .and_then(|n| usize::try_from(n).ok())
-            .and_then(|n| self.table.get(n));
-        match entry {
-            Some((name, value)) => Ok(Entry::Dynamic(name, value)),
-            None if self.unsure => Ok(Entry::Unknown),
-            None => Err(Error::Index),
-        }
-    }
-    fn pop(&mut self) {
-        if let Some((name, value)) = self.table.pop_back() {
-            self.size = self
-                .size
-                .saturating_sub(name.len() + value.len() + ENTRY_OVERHEAD);
-        }
-    }
-    fn evict(&mut self) {
-        while self.max.is_some_and(|max| self.size > max) {
-            self.pop();
-        }
-        while self.size > MAX_TABLE {
-            self.pop();
-            self.unsure = true;
-        }
-        if self
-            .max
-            .is_some_and(|max| self.size.saturating_add(ENTRY_OVERHEAD) > max)
-        {
-            self.unsure = false;
-        }
-    }
-    fn insert(&mut self, name: Arc<[u8]>, value: Vec<u8>) {
-        // Each string is bounded by MAX_BLOCK * 8 / 5 and the old size by MAX_TABLE.
-        self.size += name.len() + value.len() + ENTRY_OVERHEAD;
-        self.table.push_front((name, value));
-        self.evict();
-    }
     fn read_block(&mut self, bytes: &[u8], limit: usize) -> Result<Block, Error> {
-        if bytes.len() > MAX_BLOCK {
-            return Err(Error::BlockTooLong);
-        }
         let mut out = Block::default();
         let mut used = 0;
-        let mut c = Reader::new(bytes);
-        let string_limit = if self.settings.is_none() {
-            MAX_BLOCK * 8 / 5
-        } else {
-            MAX_STRING
-        };
-        let mut fields_started = false;
         let mut updates = 0;
         let mut previous = 0;
-        while c.position() < bytes.len() {
-            let first = c.peek_u8().ok_or(Error::Truncated)?;
-            if first & 0xe0 == 0x20 {
-                let size = usize::try_from(c.integer(5)?).map_err(|_| Error::TableSize)?;
-                if self.settings.is_some()
-                    && (fields_started || updates == 2 || (updates == 1 && size < previous))
-                {
-                    return Err(Error::SizeUpdateOrder);
+        for representation in Representations::new(bytes, MAX_STRING)? {
+            match representation? {
+                Representation::SizeUpdate(size) => {
+                    // Endpoint validation deliberately also bounds the number and
+                    // order of initial updates, beyond the shared wire grammar.
+                    if updates == 2 || (updates == 1 && size < previous) {
+                        return Err(Error::SizeUpdateOrder);
+                    }
+                    if size > self.settings {
+                        return Err(Error::TableSize);
+                    }
+                    if self.required_min.is_some_and(|min| size > min) {
+                        return Err(Error::MissingSizeUpdate);
+                    }
+                    self.required_min = None;
+                    self.max = size;
+                    self.table.evict(size);
+                    updates += 1;
+                    previous = size;
                 }
-                if self.settings.is_some_and(|limit| size > limit) {
-                    return Err(Error::TableSize);
-                }
-                if self.required_min.is_some_and(|min| size > min) {
-                    return Err(Error::MissingSizeUpdate);
-                }
-                self.required_min = None;
-                self.max = Some(size);
-                self.evict();
-                updates += 1;
-                previous = size;
-                continue;
-            }
-            if self.required_min.is_some() {
-                return Err(Error::MissingSizeUpdate);
-            }
-            fields_started = true;
-            if first & 0x80 != 0 {
-                match self.get(c.integer(7)?)? {
-                    Entry::Known(n, v) => out.keep(limit, &mut used, Some(n), Some(v), false),
-                    Entry::Dynamic(n, v) => out.keep(limit, &mut used, Some(n), Some(v), false),
-                    Entry::Unknown => out.keep(limit, &mut used, None, None, false),
-                }
-            } else {
-                let indexing = first & 0x40 != 0;
-                let never_index = !indexing && first & 0x10 != 0;
-                let index = c.integer(if indexing { 6 } else { 4 })?;
-                let name: Option<Arc<[u8]>> = match index {
-                    0 => Some(c.string(string_limit)?.into()),
-                    n => match self.get(n)? {
-                        Entry::Known(name, _) => Some(name.into()),
-                        Entry::Dynamic(name, _) => Some(name.clone()),
-                        Entry::Unknown => None,
-                    },
-                };
-                let value = c.string(string_limit)?;
-                out.keep(limit, &mut used, name.as_deref(), Some(&value), never_index);
-                match (indexing, name) {
-                    (true, Some(name)) => self.insert(name, value),
-                    (true, None) => self.forget(),
-                    (false, _) => {}
+                field => {
+                    if self.required_min.is_some() {
+                        return Err(Error::MissingSizeUpdate);
+                    }
+                    match field {
+                        Representation::Indexed(index) => {
+                            let entry = self.table.get(index)?.ok_or(Error::Index)?;
+                            out.keep(limit, &mut used, entry.name, entry.value, false);
+                        }
+                        Representation::Literal {
+                            name,
+                            value,
+                            indexing,
+                        } => {
+                            let name: Arc<[u8]> = match name {
+                                Name::Literal(name) => name.into(),
+                                Name::Index(index) => {
+                                    self.table.name(index)?.ok_or(Error::Index)?
+                                }
+                            };
+                            out.keep(limit, &mut used, &name, &value, indexing == Indexing::Never);
+                            if indexing == Indexing::Incremental {
+                                self.table.insert(name, value);
+                                self.table.evict(self.max);
+                            }
+                        }
+                        Representation::SizeUpdate(_) => unreachable!(),
+                    }
                 }
             }
         }
@@ -602,7 +717,7 @@ impl Encoder {
     }
     /// The retained dynamic table size, including entry overhead.
     pub fn table_size(&self) -> usize {
-        self.table.size
+        self.table.table.size()
     }
     /// Allocated dynamic-table storage, including spare entry slots.
     pub fn held(&self) -> usize {
@@ -612,15 +727,15 @@ impl Encoder {
     /// A reduction shrinks the table and queues the required size update.
     pub fn set_settings_limit(&mut self, limit: usize) {
         let limit = limit.min(MAX_TABLE);
-        self.table.settings = Some(limit);
-        if self.table.max.is_some_and(|max| max > limit) {
+        self.table.settings = limit;
+        if self.table.max > limit {
             self.resize(limit);
         }
     }
     /// Chooses a table capacity. Refuses a size above the peer's settings limit
     /// or [`MAX_TABLE`], leaving the encoder unchanged.
     pub fn set_capacity(&mut self, capacity: usize) -> Result<(), Error> {
-        if capacity > self.table.settings.unwrap_or(0) || capacity > MAX_TABLE {
+        if capacity > self.table.settings || capacity > MAX_TABLE {
             return Err(Error::TableSize);
         }
         self.resize(capacity);
@@ -628,8 +743,8 @@ impl Encoder {
     }
     fn resize(&mut self, capacity: usize) {
         self.pending_min = Some(self.pending_min.map_or(capacity, |old| old.min(capacity)));
-        self.table.max = Some(capacity);
-        self.table.evict();
+        self.table.max = capacity;
+        self.table.table.evict(capacity);
     }
 
     /// Appends a complete block. Refuses more than [`MAX_HEADERS`] fields,
@@ -666,7 +781,7 @@ impl Encoder {
     fn write_block(&mut self, fields: &[Field], out: &mut Vec<u8>) -> Result<(), Error> {
         if let Some(min) = self.pending_min.take() {
             put_integer(out, 5, 0x20, min as u64)?;
-            let capacity = self.table.max.unwrap_or(0);
+            let capacity = self.table.max;
             if capacity != min {
                 put_integer(out, 5, 0x20, capacity as u64)?;
             }
@@ -678,6 +793,7 @@ impl Encoder {
                 .chain(
                     self.table
                         .table
+                        .entries
                         .iter()
                         .map(|(n, v)| (n.as_ref(), v.as_slice())),
                 );
@@ -700,7 +816,7 @@ impl Encoder {
             }
             let (prefix, flags) = if field.never_index {
                 (4, 0x10)
-            } else if self.table.max == Some(0) {
+            } else if self.table.max == 0 {
                 (4, 0)
             } else {
                 (6, 0x40)
@@ -710,9 +826,11 @@ impl Encoder {
                 put_string(out, &field.name, self.huffman)?;
             }
             put_string(out, &field.value, self.huffman)?;
-            if !field.never_index && self.table.max != Some(0) {
+            if !field.never_index && self.table.max != 0 {
                 self.table
+                    .table
                     .insert(field.name.as_slice().into(), field.value.clone());
+                self.table.table.evict(self.table.max);
             }
         }
         Ok(())
@@ -729,18 +847,12 @@ mod tests {
     use fictionet::stdlib::protocols::prefix_int::Integer;
     use fictionet::stdlib::test_support::hex;
 
-    fn pairs(h: &[Header]) -> Vec<(&str, &str)> {
+    fn pairs(h: &[Field]) -> Vec<(&str, &str)> {
         h.iter()
             .map(|h| {
                 (
-                    h.name
-                        .as_deref()
-                        .map(|b| std::str::from_utf8(b).unwrap_or("\u{fffd}"))
-                        .unwrap_or(""),
-                    h.value
-                        .as_deref()
-                        .map(|b| std::str::from_utf8(b).unwrap_or("\u{fffd}"))
-                        .unwrap_or(""),
+                    std::str::from_utf8(&h.name).unwrap_or("\u{fffd}"),
+                    std::str::from_utf8(&h.value).unwrap_or("\u{fffd}"),
                 )
             })
             .collect()
@@ -750,7 +862,7 @@ mod tests {
     /// dynamic table.
     #[test]
     fn rfc_7541_requests_with_huffman() {
-        let mut d = Table::for_observation();
+        let mut d = Table::default();
         let h = d.decode_all(&hex("8286 8441 8cf1 e3c2 e5f2 3a6b a0ab 90f4 ff"));
         assert_eq!(
             pairs(&h),
@@ -775,8 +887,8 @@ mod tests {
     #[test]
     fn rfc_7541_response() {
         let mut d = Table {
-            max: Some(256),
-            ..Table::for_observation()
+            max: 256,
+            ..Table::default()
         };
         let h = d
             .decode_all(&hex(
@@ -793,28 +905,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn broken_blocks_forget_the_table() {
-        for bytes in [vec![0xff], vec![0x41, 0x85, 0xff]] {
-            let mut d = Table::for_observation();
-            d.decode_all(&hex("400178036f6c64"));
-            assert_eq!(d.table_len(), 1);
-            assert!(d.decode_block(&bytes, MAX_DECODED).is_err());
-            assert!(d.is_unsure());
-            assert_eq!(d.table_len(), 0);
-            assert_eq!(d.table_size(), 0);
-            assert_eq!(d.table_capacity(), None);
-        }
-        assert!(huffman::decode(&[0xff, 0xff, 0xff, 0xff]).is_err());
-    }
-
     /// One 4 KiB entry named 10,000 times would be 40 MB of headers: only
     /// as many as the limit allows are kept, and the rest are counted.
     #[test]
     fn a_block_keeps_only_what_the_limit_allows() {
         let mut block = vec![0x40, 0x01, b'x', 0x7f, 0xa1, 0x1e];
         block.extend(std::iter::repeat_n(b'v', 4000));
-        let mut d = Table::for_observation();
+        let mut d = Table::default();
         assert_eq!(d.decode_all(&block).len(), 1);
         let b = d.decode_block(&vec![0xbe; 10_000], MAX_DECODED).unwrap();
         assert_eq!(b.headers.len(), MAX_DECODED / 4001);
@@ -827,7 +924,7 @@ mod tests {
     /// 256 headers is seen by the next block.
     #[test]
     fn headers_past_the_limit_still_update_the_table() {
-        let mut d = Table::for_observation();
+        let mut d = Table::default();
         d.decode_all(&hex("4001 7803 6f6c 64")); // x: old
         let mut block = vec![0x82; 256];
         block.extend(hex("4001 7803 6e65 77")); // x: new
@@ -841,97 +938,19 @@ mod tests {
     /// takes one byte of the table.
     #[test]
     fn table_sizes_count_octets() {
-        let mut d = Table::for_observation();
+        let mut d = Table::default();
         // Table size 35, then x: 0xff, which takes 1 + 1 + 32 = 34 bytes.
         d.decode_all(&hex("3f04 4001 7801 ff"));
         let h = d.decode_all(&[0xbe]);
         assert_eq!(pairs(&h), [("x", "\u{fffd}")]);
-        assert_eq!(d.size, 34);
-    }
-
-    /// A block that was not decoded leaves the table unknown: entries
-    /// added later are known, older ones show as unknown, not stale.
-    #[test]
-    fn a_forgotten_table_shows_unknown_not_stale() {
-        let mut d = Table::for_observation();
-        d.decode_all(&hex("4001 7803 6f6c 64")); // x: old
-        d.forget();
-        d.decode_all(&hex("4001 7903 6e65 77")); // y: new
-        let b = d.decode_block(&[0xbe, 0xbf, 0x82], MAX_DECODED).unwrap();
-        assert_eq!(
-            pairs(&b.headers),
-            [("y", "new"), ("", ""), (":method", "GET")]
-        );
-        assert_eq!(
-            b.headers
-                .iter()
-                .map(|h| h.name.is_some())
-                .collect::<Vec<_>>(),
-            [true, false, true]
-        );
-        // A literal named after an unknown entry has a known value.
-        let b = d.decode_block(&hex("0f30 0161"), MAX_DECODED).unwrap();
-        assert_eq!(
-            (b.headers[0].name.as_deref(), b.headers[0].value.as_deref()),
-            (None, Some(b"a".as_slice()))
-        );
-        // Once known entries fill the table, nothing older can be left.
-        let mut d = Table::for_observation();
-        d.forget();
-        d.decode_all(&hex("3f3b 4001 7801 61")); // size 90, then x: a (34)
-        assert!(d.unsure, "an entry of 32 bytes or more may be left");
-        d.decode_all(&hex("4001 7901 62")); // y: b, 68 in all
-        assert!(!d.unsure, "no room for an older entry");
-        assert!(
-            d.decode_block(&[0xc0], MAX_DECODED).is_err(),
-            "index 64 cannot exist"
-        );
-    }
-
-    /// A table larger than the decoder keeps: entries past what it keeps
-    /// are unknown, not missing.
-    #[test]
-    fn a_table_past_what_is_kept_is_unsure() {
-        let mut d = Table::for_observation();
-        // Size update to 1 MiB: 0x3f, then 1,048,576 - 31 as an integer.
-        let mut block = vec![0x3f];
-        let mut v = (1usize << 20) - 31;
-        while v >= 0x80 {
-            block.push((v as u8 & 0x7f) | 0x80);
-            v >>= 7;
-        }
-        block.push(v as u8);
-        d.decode_all(&block);
-        // a: 16,000 bytes, a literal of length 127 + 15,873.
-        let mut big = vec![0x40, 0x01, b'a', 0x7f, 0x81, 0x7c];
-        big.extend(std::iter::repeat_n(b'v', 16_000));
-        for _ in 0..5 {
-            d.decode_all(&big);
-        }
-        assert_eq!(d.table.len(), 4, "only 64 KiB is kept");
-        assert!(d.unsure);
-        let b = d.decode_block(&[0xc2], MAX_DECODED).unwrap(); // index 66, the fifth
-        assert!(b.headers[0].value.is_none());
-    }
-
-    /// A block not decoded may have changed the table's maximum, so after
-    /// it, entries are kept until a size update says what the maximum is.
-    #[test]
-    fn a_forgotten_table_forgets_its_maximum() {
-        let mut d = Table::for_observation();
-        d.decode_all(&hex("20")); // size 0
-        d.forget(); // the block not decoded set it to 4,096
-        d.decode_all(&hex("4001 7803 6e65 77")); // x: new
-        assert_eq!(pairs(&d.decode_all(&[0xbe])), [("x", "new")]);
-        d.decode_all(&hex("3f e11f")); // size 4,096
-        assert_eq!(d.max, Some(4096));
+        assert_eq!(d.table_size(), 34);
     }
 
     /// A literal that names a long entry shares its name, so a block of
     /// such literals costs no more than its own bytes.
     #[test]
     fn literals_share_long_names() {
-        let mut d = Table::for_observation();
+        let mut d = Table::new(MAX_TABLE);
         // Size 65,536, then an entry with a 4,000-byte name.
         let mut block = vec![0x3f, 0xe1, 0xff, 0x03, 0x40, 0x7f, 0xa1, 0x1e];
         block.extend(std::iter::repeat_n(b'n', 4000));
@@ -941,11 +960,16 @@ mod tests {
         let b = d.decode_block(&[0x7e, 0x00].repeat(3000), 0).unwrap();
         assert_eq!(b.more, 3000);
         assert_eq!(d.table.len(), 16);
-        assert!(d.table.iter().all(|(n, _)| Arc::ptr_eq(n, &d.table[0].0)));
+        assert!(
+            d.table
+                .entries
+                .iter()
+                .all(|(n, _)| Arc::ptr_eq(n, &d.table.entries[0].0))
+        );
     }
 
     impl Table {
-        fn decode_all(&mut self, b: &[u8]) -> Vec<Header> {
+        fn decode_all(&mut self, b: &[u8]) -> Vec<Field> {
             let block = self.decode_block(b, MAX_DECODED).unwrap();
             assert_eq!(block.more, 0);
             block.headers
@@ -1089,8 +1113,8 @@ mod tests {
                 assert_eq!(encoder.table_size(), size);
             }
             assert_eq!(d.table_len(), 3);
-            assert_eq!(d.table.front().unwrap().0.as_ref(), b"set-cookie");
-            assert_eq!(d.table.back().unwrap().0.as_ref(), b"date");
+            assert_eq!(d.table.entries.front().unwrap().0.as_ref(), b"set-cookie");
+            assert_eq!(d.table.entries.back().unwrap().0.as_ref(), b"date");
         }
     }
 
@@ -1113,30 +1137,21 @@ mod tests {
 
     #[test]
     fn size_updates_and_settings_reductions() {
-        for (block, capacity) in [
-            (vec![0x82, 0x20], 0),
-            (vec![0x20, 0x20, 0x20], 0),
-            (vec![0x21, 0x20], 0),
-            (hex("3f453082"), 16),
-            (hex("203fe11f2082"), 0),
+        for block in [
+            vec![0x82, 0x20],
+            vec![0x20, 0x20, 0x20],
+            vec![0x21, 0x20],
+            hex("3f453082"),
+            hex("203fe11f2082"),
         ] {
             assert_eq!(
                 Table::default().decode_block(&block, 0),
                 Err(Error::SizeUpdateOrder)
             );
-            let mut observed = Table::for_observation();
-            let decoded = observed.decode_block(&block, MAX_DECODED).unwrap();
-            assert_eq!(observed.table_capacity(), Some(capacity));
-            assert!(!observed.is_unsure());
-            if block.contains(&0x82) {
-                assert_eq!(pairs(&decoded.headers), [(":method", "GET")]);
-            } else {
-                assert!(decoded.headers.is_empty());
-            }
         }
         let mut d = Table::default();
         assert_eq!(d.decode_block(&update(4097), 0), Err(Error::TableSize));
-        assert!(d.is_unsure());
+        assert_eq!(d.table_len(), 0);
         let mut d = Table::default();
         d.set_settings_limit(128);
         d.set_settings_limit(512);
@@ -1148,8 +1163,8 @@ mod tests {
         block.extend(update(512));
         block.push(0x82);
         assert!(d.decode_block(&block, MAX_DECODED).is_ok());
-        assert_eq!(d.table_capacity(), Some(512));
-        assert_eq!(d.settings_limit(), Some(512));
+        assert_eq!(d.table_capacity(), 512);
+        assert_eq!(d.settings_limit(), 512);
         for bytes in [vec![], vec![0x82]] {
             let mut d = Table::default();
             d.set_settings_limit(0);
@@ -1157,7 +1172,7 @@ mod tests {
         }
         let mut d = Table::new(MAX_TABLE);
         assert!(d.decode_block(&update(MAX_TABLE), 0).is_ok());
-        assert_eq!(Table::new(usize::MAX).settings_limit(), Some(MAX_TABLE));
+        assert_eq!(Table::new(usize::MAX).settings_limit(), MAX_TABLE);
         assert_eq!(
             d.decode_block(&update(MAX_TABLE + 1), 0),
             Err(Error::TableSize)
@@ -1177,34 +1192,9 @@ mod tests {
         assert_eq!(d.table_len(), 0);
         assert_eq!(d.decode_block(&[0xbe], 0), Err(Error::Index));
         d.decode_block(&[0x20], 0).unwrap();
-        assert!(!d.is_unsure());
+        assert_eq!(d.table_capacity(), 0);
         d.decode_all(&hex("4001780161"));
         assert_eq!(d.table_size(), 0);
-    }
-
-    #[test]
-    fn observation_accepts_huffman_expansion_and_keeps_the_table() {
-        let mut d = Table::for_observation();
-        d.decode_all(&hex("400178036f6c64")); // x: old
-        let mut bytes = vec![0x00, 0x01, b'x'];
-        Integer::<7> {
-            flags: 0x80,
-            value: 60_000,
-        }
-        .write(&mut bytes)
-        .unwrap();
-        bytes.extend(vec![0; 60_000]);
-        assert!(bytes.len() < 64 << 10);
-        let block = d.decode_block(&bytes, MAX_DECODED).unwrap();
-        assert_eq!((block.headers.len(), block.more), (0, 1));
-        assert!(!d.is_unsure());
-        assert_eq!(d.table_len(), 1);
-        assert_eq!(d.table_capacity(), Some(4096));
-        assert_eq!(pairs(&d.decode_all(&[0xbe])), [("x", "old")]);
-        assert_eq!(
-            Table::default().decode_block(&bytes, MAX_DECODED),
-            Err(Error::StringTooLong)
-        );
     }
 
     #[test]
@@ -1237,7 +1227,7 @@ mod tests {
     #[test]
     fn constructors_require_the_initial_reduction() {
         let mut d = Table::new(256);
-        assert_eq!(d.table_capacity(), Some(4096));
+        assert_eq!(d.table_capacity(), 4096);
         assert_eq!(
             d.decode_block(&[0x82], MAX_DECODED),
             Err(Error::MissingSizeUpdate)

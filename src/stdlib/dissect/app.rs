@@ -160,6 +160,29 @@ mod tests {
         assert!(d.info.starts_with("HEADERS[2]: 200"), "{}", d.info);
     }
 
+    #[test]
+    fn response_headers_lead_promises_and_control_frames() {
+        let headers = frame(1, 4, 2, &[0x88]);
+        let promise = frame(5, 4, 1, &[0, 0, 0, 2, 0x82, 0x84]);
+        let ping = frame(6, 0, 0, b"12345678");
+        for frames in [
+            [&ping, &promise, &headers],
+            [&promise, &headers, &ping],
+            [&headers, &ping, &promise],
+        ] {
+            let mut feeder = Feeder::h2();
+            let bytes: Vec<_> = frames.into_iter().flatten().copied().collect();
+            let packet = feeder.send(true, &bytes, bytes.len());
+            assert!(
+                packet.info.starts_with("HEADERS[2]: 200, "),
+                "{}",
+                packet.info
+            );
+            assert!(packet.info.contains("PUSH_PROMISE[1] promised 2: GET /"));
+            assert!(packet.info.contains("PING"));
+        }
+    }
+
     /// A header block goes on only in CONTINUATION frames of its own
     /// stream. One that is cut off is not joined to another frame's
     /// bytes, and the table it may have changed is forgotten.

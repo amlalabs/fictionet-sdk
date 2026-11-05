@@ -376,9 +376,7 @@ impl Http2 {
         let list_size: usize = block
             .headers
             .iter()
-            .map(|h| {
-                h.name.as_ref().map_or(0, Vec::len) + h.value.as_ref().map_or(0, Vec::len) + 32
-            })
+            .map(|h| h.name.len() + h.value.len() + 32)
             .sum();
         if block.more != 0
             || block.headers.len() > self.limits.head.headers
@@ -713,7 +711,7 @@ impl serve::Service for Http2 {
     type Error = Infallible;
 
     fn decoder(&self) -> Inputs {
-        Inputs::for_server(wire::DEFAULT_FRAME_SIZE)
+        Inputs::client_side(wire::DEFAULT_FRAME_SIZE)
     }
 
     fn on_open(
@@ -749,7 +747,17 @@ impl serve::Service for Http2 {
     ) -> Result<Flow, Infallible> {
         let result = match item {
             Input::Frame(frame) => self.frame(frame, driver),
-            Input::Refused { header, error, .. } => {
+            Input::Refused {
+                scope: wire::ErrorScope::Connection,
+                error,
+                ..
+            } => Err(error),
+            Input::Refused {
+                header,
+                error,
+                scope: wire::ErrorScope::Stream,
+                ..
+            } => {
                 // PRIORITY may name a stream in any state (RFC 9113 section
                 // 6.3), so a bad one resets just that stream. RST_STREAM may
                 // not name an idle stream (section 6.4), so there it ends the
@@ -946,12 +954,9 @@ fn content_length(headers: &http::HeaderMap) -> Result<Option<u64>, ()> {
 fn valid_trailers(block: &hpack::Block) -> bool {
     block.more == 0
         && block.headers.iter().all(|h| {
-            h.name
-                .as_ref()
-                .is_some_and(|n| !n.starts_with(b":") && valid_name(n))
-                && h.value
-                    .as_ref()
-                    .is_some_and(|v| HeaderValue::from_bytes(v).is_ok())
+            !h.name.starts_with(b":")
+                && valid_name(&h.name)
+                && HeaderValue::from_bytes(&h.value).is_ok()
         })
 }
 
@@ -977,7 +982,7 @@ fn request(block: hpack::Block, limits: Limits) -> Option<Request<Body>> {
     let mut cookie: Option<Vec<u8>> = None;
     let mut list_size = 0usize;
     for h in block.headers {
-        let (name, value) = (h.name?, h.value?);
+        let (name, value) = (h.name, h.value);
         list_size = list_size.checked_add(name.len() + value.len() + 32)?;
         if list_size > limits.head.head {
             return None;
@@ -1431,9 +1436,9 @@ mod tests {
                             && let Some(status) = block
                                 .headers
                                 .into_iter()
-                                .find(|header| header.name.as_deref() == Some(b":status"))
+                                .find(|header| header.name == b":status")
                         {
-                            return Poll::Ready(status.value.unwrap());
+                            return Poll::Ready(status.value);
                         }
                     }
                     Poll::Pending
@@ -1495,6 +1500,70 @@ mod tests {
             bytes = &bytes[end..];
         }
         frames
+    }
+
+    #[test]
+    fn self_dependent_headers_preserve_compression_across_continuations() {
+        for fragmented in [false, true] {
+            let mut harness =
+                serve::Harness::new(fictionet::Seed::from_u64(1), Http2::new(NotFound), ());
+            harness.push(&client_preface()).unwrap();
+            let mut encoder = hpack::Encoder::new(4096);
+            let fields = [
+                hpack::Field::new(":method", "GET"),
+                hpack::Field::new(":scheme", "http"),
+                hpack::Field::new(":path", "/"),
+                hpack::Field::new("x-saved", "retained"),
+            ];
+            let mut block = Vec::new();
+            encoder.encode_block(&fields, &mut block).unwrap();
+            let split = if fragmented {
+                block.len() / 2
+            } else {
+                block.len()
+            };
+            let mut input = wire::FrameHeader {
+                length: 5 + split,
+                kind: 1,
+                flags: if fragmented { 0x21 } else { 0x25 },
+                stream: 1,
+            }
+            .to_bytes()
+            .unwrap();
+            input.extend_from_slice(&[0, 0, 0, 1, 0]);
+            input.extend_from_slice(&block[..split]);
+            if fragmented {
+                wire::Continuation {
+                    stream: 1,
+                    flags: 4,
+                    fragment: block[split..].to_vec(),
+                }
+                .write(&mut input)
+                .unwrap();
+            }
+            let mut indexed = Vec::new();
+            encoder.encode_block(&fields, &mut indexed).unwrap();
+            assert!(indexed.len() < block.len());
+            wire::Headers {
+                stream: 3,
+                flags: 5,
+                fragment: indexed,
+                priority: None,
+                padding: None,
+            }
+            .write(&mut input)
+            .unwrap();
+            let output = frames(&harness.push(&input).unwrap());
+            assert!(output.iter().any(|f| matches!(f, Frame::Reset(r)
+                if r.stream == 1 && r.code == ErrorCode::ProtocolError as u32)));
+            assert!(
+                output
+                    .iter()
+                    .any(|f| matches!(f, Frame::Headers(h) if h.stream == 3))
+            );
+            assert!(!output.iter().any(|f| matches!(f, Frame::GoAway(_))));
+            assert!(!harness.closed());
+        }
     }
 
     #[test]
