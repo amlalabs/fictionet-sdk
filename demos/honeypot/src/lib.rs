@@ -109,7 +109,8 @@ impl Clock {
 pub fn network(fcx: &Cx, config: &Config, clock: Clock, tokens: &Arc<Tokens>) -> Net {
     let mut server = Host::new("server")
         .at(config.address)
-        .tcp_options(fictionet_extras::linux::tcp());
+        .tcp_options(fictionet_extras::linux::tcp())
+        .icmp_options(fictionet_extras::linux::icmp(fcx));
     server = match config.address_v6 {
         Some(address_v6) => server.at(address_v6),
         None => server.ipv4_only(),

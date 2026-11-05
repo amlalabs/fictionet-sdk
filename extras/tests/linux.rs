@@ -5,6 +5,61 @@ use fictionet_extras::linux::{self, Cookies};
 use std::net::SocketAddr;
 use std::time::Duration;
 
+#[test]
+fn icmp_echo_and_errors_share_fresh_identifications_and_linux_header_choices() {
+    block_on(lab(Seed::from_u64(19), |fcx| async move {
+        let options = linux::icmp(&fcx);
+        let local = "203.0.113.10".parse().unwrap();
+        let remote = "192.0.2.1".parse().unwrap();
+        let mut echo = vec![8, 9, 0, 0, 0x12, 0x34, 0, 1, 5, 6, 7, 8];
+        let checksum = ip::checksum(&echo);
+        echo[2..4].copy_from_slice(&checksum.to_be_bytes());
+        let request = ip::packet_with(
+            remote,
+            local,
+            1,
+            ip::Fields {
+                id: 0x1234,
+                tos: 0x5b,
+                ..Default::default()
+            },
+            &echo,
+        );
+        let first = options.echo_reply(&request, local).unwrap();
+        let id = |packet: &Packet| u16::from_be_bytes([packet.0[4], packet.0[5]]);
+        assert_ne!(id(&first), 0x1234);
+        assert_eq!(first.0[1], 0x5b);
+        assert_eq!(first.0[6] & 0x40, 0);
+        assert_eq!(&first.0[20..22], &[0, 9]);
+        assert_eq!(&first.0[24..], &echo[4..]);
+        assert_eq!(ip::checksum(&first.0[..20]), 0);
+        assert_eq!(ip::checksum(&first.0[20..]), 0);
+        let udp = ip::packet_with(
+            remote,
+            local,
+            17,
+            ip::Fields {
+                tos: 0xff,
+                ..Default::default()
+            },
+            &[0; 8],
+        );
+        let error = options.error(&udp.0, local, 3, 3, 0).unwrap();
+        assert_eq!(id(&error), id(&first).wrapping_add(1));
+        assert_eq!(error.0[1], 0xde);
+        assert_eq!(error.0[6] & 0x40, 0);
+        assert_eq!(&error.0[20..22], &[3, 3]);
+        assert_eq!(&error.0[28..], &udp.0);
+        assert_eq!(ip::checksum(&error.0[..20]), 0);
+        assert_eq!(ip::checksum(&error.0[20..]), 0);
+        fcx.sleep(Duration::from_secs(1)).await?;
+        let later = options.echo_reply(&request, local).unwrap();
+        assert!((1..=250).contains(&id(&later).wrapping_sub(id(&error))));
+        Ok(())
+    }))
+    .unwrap();
+}
+
 fn ipv4_reply(bytes: &[u8]) -> Option<ip::Ipv4Reply> {
     let local = "203.0.113.10".parse().unwrap();
     linux::ipv4_options(
@@ -307,6 +362,127 @@ fn syn_ack_bytes_offsets_and_repeated_syn() {
 }
 
 #[test]
+fn ecn_negotiation_checks_syn_ip_marking_and_reserved_bits() {
+    block_on(lab(Seed::from_u64(23), |cx| async move {
+        let (mut raw, side) = pair();
+        let local: SocketAddr = "10.0.0.1:80".parse()?;
+        let server = tcp::endpoint_with(&cx, side, local.ip(), linux::tcp().backlog(1));
+        let _listener = server.listen(80)?;
+        let options = [1, 1, 8, 10, 0, 0, 0, 1, 0, 0, 0, 0];
+        for (n, (ecn, reserved)) in [(0, 0), (1, 0), (2, 0), (3, 0), (2, 1), (3, 1)]
+            .into_iter()
+            .enumerate()
+        {
+            let peer = SocketAddr::new("10.0.0.2".parse()?, 1000 + n as u16);
+            let request = packet(peer, local, 100, 0, 0xc2, &options);
+            let mut segment = request.0[20..].to_vec();
+            segment[12] |= reserved;
+            segment[16..18].fill(0);
+            let sum = transport_checksum(peer.ip(), local.ip(), 6, &segment);
+            segment[16..18].copy_from_slice(&sum.to_be_bytes());
+            raw.send(ip::packet_with(
+                peer.ip(),
+                local.ip(),
+                6,
+                ip::Fields {
+                    tos: ecn,
+                    ..ip::Fields::default()
+                },
+                &segment,
+            ));
+            assert_eq!(
+                receive(&mut raw, &cx).await[13],
+                if ecn == 0 || reserved != 0 {
+                    0x52
+                } else {
+                    0x12
+                }
+            );
+        }
+        cx.cancel();
+        Ok(())
+    }))
+    .unwrap();
+}
+
+#[test]
+fn established_challenges_keep_timestamps_and_increment_ipv4_identification() {
+    block_on(lab(Seed::from_u64(29), |cx| async move {
+        let (mut raw, side) = pair();
+        let local: SocketAddr = "10.0.0.1:80".parse()?;
+        let peer: SocketAddr = "10.0.0.2:1000".parse()?;
+        let server = tcp::endpoint_with(&cx, side, local.ip(), linux::tcp());
+        let mut listener = server.listen(80)?;
+        let options = [1, 1, 8, 10, 0, 0, 0, 1, 0, 0, 0, 0];
+        raw.send(packet(peer, local, 100, 0, 2, &options));
+        let syn_ack = raw.recv(&cx).await?;
+        assert_eq!(&syn_ack.0[4..6], &[0, 0]);
+        let syn_ack = Header::parse_whole(&syn_ack.0).unwrap().payload(&syn_ack.0);
+        let next = sequence(syn_ack).wrapping_add(1);
+        let mut options = vec![1, 1, 8, 10, 0, 0, 0, 2];
+        options.extend_from_slice(&timestamp(syn_ack).to_be_bytes());
+        raw.send(packet(peer, local, 101, next, 16, &options));
+        let _connection = listener.accept(&cx).await?;
+        raw.send(packet(peer, local, 101, 0, 2, &[]));
+        let first = raw.recv(&cx).await?;
+        let id = u16::from_be_bytes(first.0[4..6].try_into().unwrap());
+        let tcp = Header::parse_whole(&first.0).unwrap().payload(&first.0);
+        assert_eq!(tcp[13], 16);
+        assert_eq!(tcp.len(), 32);
+        assert_eq!(&tcp[20..24], &[1, 1, 8, 10]);
+        assert_eq!(&tcp[28..32], &2u32.to_be_bytes());
+        cx.sleep(Duration::from_millis(500)).await?;
+        raw.send(packet(peer, local, 102, 0, 4, &[]));
+        let second = raw.recv(&cx).await?;
+        assert_eq!(
+            u16::from_be_bytes(second.0[4..6].try_into().unwrap()),
+            id.wrapping_add(1)
+        );
+        assert_eq!(
+            Header::parse_whole(&second.0)
+                .unwrap()
+                .payload(&second.0)
+                .len(),
+            32
+        );
+        cx.cancel();
+        Ok(())
+    }))
+    .unwrap();
+}
+
+#[test]
+fn listening_port_ignores_segments_without_syn_ack_or_reset() {
+    block_on(lab(Seed::from_u64(31), |cx| async move {
+        let (mut raw, side) = pair();
+        let local: SocketAddr = "10.0.0.1:80".parse()?;
+        let peer: SocketAddr = "10.0.0.2:1000".parse()?;
+        let server = tcp::endpoint_with(&cx, side, local.ip(), linux::tcp());
+        let _listener = server.listen(80)?;
+        for flags in [0, 1, 8, 32] {
+            raw.send(packet(peer, local, 100, 0, flags, &[]));
+            assert!(
+                cx.race(Some(cx.now() + Duration::from_millis(10)), raw.recv(&cx))
+                    .await
+                    .is_err()
+            );
+        }
+        raw.send(packet(
+            peer,
+            SocketAddr::new(local.ip(), 81),
+            100,
+            0,
+            0,
+            &[],
+        ));
+        assert_eq!(receive(&mut raw, &cx).await[13], 0x14);
+        cx.cancel();
+        Ok(())
+    }))
+    .unwrap();
+}
+
+#[test]
 fn idle_connections_do_not_probe_or_expire_without_socket_options() {
     block_on(lab(Seed::from_u64(19), |cx| async move {
         let (mut raw, side) = pair();
@@ -553,7 +729,9 @@ fn time_wait_expires_after_sixty_seconds() {
         assert_eq!(fin[13] & 1, 1);
         let fin = packet(peer, local, 101, next.wrapping_add(1), 17, &[]);
         raw.send(fin.clone());
-        assert_eq!(receive(&mut raw, &cx).await[13], 16);
+        let ack = raw.recv(&cx).await?;
+        assert_eq!(Header::parse_whole(&ack.0).unwrap().payload(&ack.0)[13], 16);
+        assert_eq!(&ack.0[4..6], &[0, 0]);
         cx.sleep(Duration::from_secs(59)).await?;
         raw.send(fin.clone());
         assert_eq!(receive(&mut raw, &cx).await[13], 16);

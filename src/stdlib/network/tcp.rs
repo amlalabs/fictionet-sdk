@@ -737,6 +737,12 @@ pub struct Settings {
     /// Optional pending connection limit for each peer address on a port.
     /// `None` uses only the port's total backlog limit.
     pub backlog_per_peer: Option<usize>,
+    /// Whether an ECN-capable SYN may negotiate ECN, given its IP ECN bits
+    /// and TCP reserved bits.
+    pub ecn_syn: fn(u8, u8) -> bool,
+    /// Initial identification for each IPv4 socket; subsequent packets
+    /// increment it. With none, packets use identification zero.
+    pub ipv4_id: Option<fn(&Cx) -> u16>,
     /// Timestamp offset derived from the endpoint secret and address pair.
     pub timestamp_offset: Option<TimestampOffset>,
     /// Timestamp clock; the configured address-pair offset is added separately.
@@ -766,6 +772,8 @@ impl Default for Settings {
             socket: SocketSettings::default(),
             cookies: None,
             backlog_per_peer: Some(BACKLOG_PER_PEER),
+            ecn_syn: |_, _| true,
+            ipv4_id: None,
             timestamp_offset: None,
             timestamp_clock: Some(|now| (now.total_micros() / 1000) as u32),
             timeout: Some(TIMEOUT),
@@ -1007,6 +1015,7 @@ pub fn prepare_endpoint(
             isolated_peer: None,
             cookie_key,
             settings: options.settings,
+            fcx: fcx.clone(),
         }),
     });
     let driver = shared.clone();
@@ -1131,6 +1140,7 @@ struct State {
     /// The key of this endpoint's SYN cookies.
     cookie_key: [u8; 32],
     settings: Settings,
+    fcx: Cx,
     /// Sources whose ownership the enclosing network verifies.
     isolated_peer: Option<Box<dyn Fn(IpAddr) -> bool + Send>>,
 }
@@ -1421,6 +1431,9 @@ impl State {
     /// Adds a socket made by [`new_socket`].
     fn add_socket(&mut self, (mut s, pages): (stcp::Socket<'static>, Option<Pages>)) -> Id {
         s.set_settings(self.settings.socket);
+        if let Some(id) = self.settings.ipv4_id {
+            s.set_ipv4_identification(id(&self.fcx));
+        }
         s.set_timeout(self.settings.timeout.map(Into::into));
         s.set_keep_alive(self.settings.keep_alive.map(Into::into));
         if s.state() != TcpState::SynReceived {
@@ -1762,14 +1775,21 @@ impl State {
         let dst = SocketAddr::new(ip.dst, u16::from_be_bytes([t[2], t[3]]));
         let arrived = Arrived::of(src, dst, t, repr.payload.len());
         let flags = t[13];
-        let congestion = if ip.src.is_ipv4() {
-            packet[1] & 3 == 3
+        let ip_ecn = if ip.src.is_ipv4() {
+            packet[1] & 3
         } else {
-            packet[1] >> 4 & 3 == 3
+            packet[1] >> 4 & 3
         };
+        let congestion = ip_ecn == 3;
+        let ecn = flags & 0xc0 == 0xc0 && (self.settings.ecn_syn)(ip_ecn, t[12] & 15);
         let (syn, rst, ack) = (flags & 6 == 2, flags & 4 != 0, flags & 16 != 0);
         let new =
             !self.by_tuple.contains_key(&(dst, src)) && self.listeners.contains_key(&dst.port());
+        // LISTEN ignores segments without SYN, ACK or RST (RFC 9293).
+        // Idle sockets are allocated lazily, so handle this before dispatch.
+        if new && !syn && !ack && !rst {
+            return false;
+        }
         // A SYN for a listener that smoltcp is to take: its options, and
         // what the listener's answer adds to the SYN-ACK.
         let mut attempt = None;
@@ -1777,6 +1797,7 @@ impl State {
             let Some(taken) = self.attempt(
                 arrived,
                 t,
+                ecn,
                 if src.is_ipv4() {
                     Some(ipv4_options(&packet).expect("validated IPv4 header"))
                 } else {
@@ -1906,7 +1927,7 @@ impl State {
                     .set_syn_ipv4_options(&ipv4_reply.options, ipv4_reply.destination)
                     .expect("attempt checked IPv4 options");
                 let mut conn = Conn::new(local, remote, Side::Server);
-                conn.ecn = flags & 0xc0 == 0xc0;
+                conn.ecn = ecn;
                 conn.handshake.syn_ipv4 = syn_ipv4.map(Arc::from);
                 conn.handshake.syn_ack_ipv4 = local.is_ipv4().then(|| ipv4_reply.options.into());
                 conn.handshake.syn = Some(syn);
@@ -1929,6 +1950,7 @@ impl State {
         &mut self,
         arrived: Arrived,
         t: &[u8],
+        ecn: bool,
         syn_ipv4: Option<Vec<Ipv4Option>>,
         now: smoltcp::time::Instant,
     ) -> Option<Attempt> {
@@ -1996,7 +2018,7 @@ impl State {
                 sequence: arrived.seq,
                 now: Duration::from_micros(now.total_micros().max(0) as u64),
                 options: &syn,
-                ecn: t[13] & 0xc0 == 0xc0,
+                ecn,
             };
             let CookieReply {
                 sequence: iss,

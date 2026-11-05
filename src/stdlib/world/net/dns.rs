@@ -50,7 +50,7 @@ pub(super) fn start_dns(
     let datagrams = context.clone();
     fcx.spawn(move |fcx| dns_udp(fcx, socket, datagrams));
     fcx.spawn(move |fcx| dns_tcp(fcx, listener, context));
-    fcx.spawn(move |fcx| pings(fcx, icmp, addr));
+    fcx.spawn(move |fcx| pings(fcx, icmp, addr, Default::default()));
     Ok(tcp)
 }
 

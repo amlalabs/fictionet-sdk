@@ -540,6 +540,8 @@ pub struct Socket<'a> {
     /// tsval generator - if some, tcp timestamp is enabled
     tsval_generator: Option<TcpTimestampGenerator>,
     timestamp_offset: u32,
+    /// Private identification counter, when configured by the endpoint.
+    ipv4_identification: Option<u16>,
     settings: Settings,
 
     /// 0 if not seen or timestamp not enabled
@@ -762,6 +764,7 @@ impl<'a> Socket<'a> {
             nagle: true,
             tsval_generator: None,
             timestamp_offset: 0,
+            ipv4_identification: None,
             settings: Settings::default(),
             last_remote_tsval: 0,
             congestion_controller: reno::Reno::new(),
@@ -795,6 +798,33 @@ impl<'a> Socket<'a> {
     /// Keeps an offset for this connection's timestamp clock.
     pub fn set_timestamp_offset(&mut self, offset: u32) {
         self.timestamp_offset = offset;
+    }
+
+    /// Uses a private IPv4 identification counter for this socket.
+    /// Passive SYN and TIME-WAIT replies carry identification zero.
+    pub fn set_ipv4_identification(&mut self, initial: u16) {
+        self.ipv4_identification = Some(initial);
+    }
+
+    fn identify_ipv4(&self, ip: &mut IpRepr) {
+        if !matches!(
+            self.state,
+            State::Listen | State::SynReceived | State::TimeWait
+        ) && let (Some(id), IpRepr::Ipv4(ip)) = (self.ipv4_identification, ip)
+        {
+            ip.identification = id;
+        }
+    }
+
+    fn advance_ipv4_identification(&mut self, ip: &IpRepr) {
+        if !matches!(
+            self.state,
+            State::Listen | State::SynReceived | State::TimeWait
+        ) && matches!(ip, IpRepr::Ipv4(_))
+            && let Some(id) = &mut self.ipv4_identification
+        {
+            *id = id.wrapping_add(1);
+        }
     }
 
     /// Restores options negotiated by a stateless handshake.
@@ -1626,13 +1656,15 @@ impl<'a> Socket<'a> {
         repr: &TcpRepr,
     ) -> (IpRepr, TcpRepr<'static>) {
         let (mut ip_reply_repr, mut reply_repr) = Self::reply(ip_repr, repr);
-        reply_repr.timestamp = repr
-            .timestamp
-            .and_then(|tcp_ts| tcp_ts.generate_reply(self.tsval_generator, cx.now()))
-            .map(|mut ts| {
-                ts.tsval = ts.tsval.wrapping_add(self.timestamp_offset);
-                ts
-            });
+        reply_repr.timestamp = TcpTimestampRepr::generate_reply_with_tsval(
+            self.tsval_generator,
+            self.last_remote_tsval,
+            cx.now(),
+        )
+        .map(|mut ts| {
+            ts.tsval = ts.tsval.wrapping_add(self.timestamp_offset);
+            ts
+        });
         reply_repr.layout = self.settings.layout;
 
         // From RFC 793:
@@ -1687,6 +1719,8 @@ impl<'a> Socket<'a> {
 
         // Since the sACK option may have changed the length of the payload, update that.
         ip_reply_repr.set_payload_len(reply_repr.buffer_len());
+        self.identify_ipv4(&mut ip_reply_repr);
+        self.advance_ipv4_identification(&ip_reply_repr);
         (ip_reply_repr, reply_repr)
     }
 
@@ -2792,7 +2826,15 @@ impl<'a> Socket<'a> {
 
         // Advance send state only after the device accepts the packet.
         ip_repr.set_payload_len(repr.buffer_len());
+        self.identify_ipv4(&mut ip_repr);
+        let increment_id = !matches!(
+            self.state,
+            State::Listen | State::SynReceived | State::TimeWait
+        ) && matches!(ip_repr, IpRepr::Ipv4(_));
         emit(cx, (ip_repr, repr))?;
+        if increment_id && let Some(id) = &mut self.ipv4_identification {
+            *id = id.wrapping_add(1);
+        }
 
         self.pending_fast_retransmit = false;
         self.local_seq_max = self.local_seq_max.max(repr.seq_number + repr.segment_len());
@@ -2946,6 +2988,7 @@ pub(crate) mod test {
     };
 
     const SEND_IP_TEMPL: IpRepr = IpReprIpvX(IpvXRepr {
+        identification: 0,
         options: crate::wire::Ipv4OptionBytes::EMPTY,
         wire_dst: None,
         src_addr: LOCAL_ADDR,
@@ -3024,6 +3067,7 @@ pub(crate) mod test {
         socket.cx.set_now(timestamp);
 
         let ip_repr = IpReprIpvX(IpvXRepr {
+            identification: 0,
             options: crate::wire::Ipv4OptionBytes::EMPTY,
             wire_dst: None,
             src_addr: REMOTE_ADDR,
@@ -3957,6 +4001,7 @@ pub(crate) mod test {
         let mut s = socket_established();
         s.set_segment_options(Box::new(AskOn254));
         let ip_repr = IpReprIpvX(IpvXRepr {
+            identification: 0,
             options: crate::wire::Ipv4OptionBytes::EMPTY,
             wire_dst: None,
             src_addr: REMOTE_ADDR,
@@ -4234,6 +4279,7 @@ pub(crate) mod test {
         let mut s = socket_established();
         let seen = stamped(&mut s, false);
         let ip_repr = IpReprIpvX(IpvXRepr {
+            identification: 0,
             options: crate::wire::Ipv4OptionBytes::EMPTY,
             wire_dst: None,
             src_addr: REMOTE_ADDR,
@@ -11276,6 +11322,7 @@ pub(crate) mod test {
         };
 
         let ip_repr = IpReprIpvX(IpvXRepr {
+            identification: 0,
             options: crate::wire::Ipv4OptionBytes::EMPTY,
             wire_dst: None,
             src_addr: REMOTE_ADDR,
@@ -11287,6 +11334,7 @@ pub(crate) mod test {
         assert!(s.socket.accepts(&mut s.cx, &ip_repr, &tcp_repr));
 
         let ip_repr_wrong_src = IpReprIpvX(IpvXRepr {
+            identification: 0,
             options: crate::wire::Ipv4OptionBytes::EMPTY,
             wire_dst: None,
             src_addr: OTHER_ADDR,
@@ -11298,6 +11346,7 @@ pub(crate) mod test {
         assert!(!s.socket.accepts(&mut s.cx, &ip_repr_wrong_src, &tcp_repr));
 
         let ip_repr_wrong_dst = IpReprIpvX(IpvXRepr {
+            identification: 0,
             options: crate::wire::Ipv4OptionBytes::EMPTY,
             wire_dst: None,
             src_addr: REMOTE_ADDR,

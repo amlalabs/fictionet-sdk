@@ -158,6 +158,56 @@ pub fn tcp() -> tcp::Options {
     tcp::Options::default().settings(settings())
 }
 
+/// ICMP replies for the Ubuntu generic kernel on a host with two GiB of RAM.
+///
+/// IPv4 echo replies preserve the request's TOS and code. Errors use Internet
+/// Control precedence. Both use the shared hashed identification counters,
+/// with random perturbation below the elapsed number of 250 Hz ticks.
+/// The 32768 buckets match Linux's allocation of one bucket per 64 KiB.
+/// See [ICMP replies](https://github.com/torvalds/linux/blob/v6.8/net/ipv4/icmp.c)
+/// and [identification allocation](https://github.com/torvalds/linux/blob/v6.8/net/ipv4/route.c).
+pub fn icmp(fcx: &fictionet::Cx) -> fictionet::stdlib::network::icmp::Options {
+    use fictionet::Entropy;
+    use fictionet::stdlib::network::{icmp, ip};
+    use fictionet::sync::Mutex;
+    use std::sync::Arc;
+
+    let mut key = [0; 16];
+    fcx.fill_random(&mut key);
+    let counters = Mutex::new(
+        (0..32768)
+            .map(|_| (fcx.random_u64() as u32, 0u32))
+            .collect::<Vec<_>>(),
+    );
+    let fcx = fcx.clone();
+    icmp::Options {
+        echo_nonzero_code: true,
+        ipv4_fields: Some(Arc::new(move |source, destination, tos, error| {
+            let mut hash = SipHasher24::new_with_key(&key);
+            hash.write(&destination.octets());
+            hash.write(&source.octets());
+            hash.write(&u32::from(ip::protocol::ICMP).to_le_bytes());
+            let mut counters = counters.lock();
+            let counter = &mut counters[hash.finish() as usize & 32767];
+            let tick = (fcx.now().since_start().as_micros() / 4000) as u32;
+            if counter.1 != tick {
+                counter.0 = counter
+                    .0
+                    .wrapping_add(fcx.random_below(u64::from(tick.wrapping_sub(counter.1))) as u32);
+                counter.1 = tick;
+            }
+            let id = counter.0 as u16;
+            counter.0 = counter.0.wrapping_add(1);
+            ip::Fields {
+                ttl: 64,
+                tos: if error { (tos & 0x1e) | 0xc0 } else { tos },
+                id,
+                dont_fragment: false,
+            }
+        })),
+    }
+}
+
 /// Linux choices, available separately for worlds with custom buffer limits.
 pub fn settings() -> tcp::Settings {
     let socket = tcp::SocketSettings {
@@ -180,6 +230,12 @@ pub fn settings() -> tcp::Settings {
         socket,
         cookies: Some(&Cookies),
         backlog_per_peer: None,
+        ecn_syn: |ecn, reserved| ecn == 0 || reserved != 0,
+        ipv4_id: Some(|cx| {
+            let mut bytes = [0; 2];
+            cx.fill_random(&mut bytes);
+            u16::from_le_bytes(bytes)
+        }),
         timestamp_offset: Some(offset),
         timestamp_clock: Some(|now| (now.total_micros() / 1000) as u32),
         timeout: None,

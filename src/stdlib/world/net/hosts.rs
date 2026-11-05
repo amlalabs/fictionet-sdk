@@ -241,6 +241,7 @@ pub struct Host {
     pub(super) ports: Vec<(u16, PortSpec)>,
     lan: Option<super::Lan>,
     tcp_options: tcp::Options,
+    icmp_options: icmp::Options,
 }
 
 impl Host {
@@ -255,12 +256,19 @@ impl Host {
             ports: Vec::new(),
             lan: None,
             tcp_options: tcp::Options::default(),
+            icmp_options: icmp::Options::default(),
         }
     }
 
     /// Sets transport choices for this host's TCP endpoints.
     pub fn tcp_options(mut self, options: tcp::Options) -> Self {
         self.tcp_options = options;
+        self
+    }
+
+    /// Sets this host's echo and UDP error reply choices.
+    pub fn icmp_options(mut self, options: icmp::Options) -> Self {
+        self.icmp_options = options;
         self
     }
 
@@ -734,6 +742,7 @@ impl Installation<'_> {
                     &label,
                     world.machines.get(&addr),
                     host.tcp_options,
+                    host.icmp_options.clone(),
                 );
                 let ports = machine.machine.prepare(&host)?;
                 Ok((machine, ports))
@@ -793,6 +802,7 @@ impl Installation<'_> {
             label,
             world.machines.get(&addr),
             host.tcp_options,
+            host.icmp_options.clone(),
         );
         let ports = machine.machine.prepare(host)?;
         // Joining is the last fallible step. No service or task has started.
@@ -1044,6 +1054,7 @@ impl Machine {
         _label: &str,
         existing: Option<&Arc<Machine>>,
         options: tcp::Options,
+        icmp_options: icmp::Options,
     ) -> PreparedMachine {
         if let Some(machine) = existing {
             return PreparedMachine {
@@ -1059,6 +1070,7 @@ impl Machine {
         let hooks = installation.admission.hooks.clone();
         tcp.limit_isolated_peers(move |addr| hooks.by_addr.lock().contains_key(&addr));
         let (udp, udp_task) = udp::prepare_endpoint(&fcx, udp, addr);
+        udp.icmp_options(icmp_options.clone());
         let machine = Arc::new(Machine {
             fcx: fcx.clone(),
             addr,
@@ -1076,7 +1088,7 @@ impl Machine {
                 split.start(&fcx);
                 tcp_task.start(&fcx);
                 udp_task.start(&fcx);
-                fcx.spawn(move |fcx| pings(fcx, icmp, addr));
+                fcx.spawn(move |fcx| pings(fcx, icmp, addr, icmp_options));
             })),
         }
     }
@@ -1419,10 +1431,15 @@ async fn connection(
 }
 
 /// Answers pings to `addr`.
-pub(super) async fn pings(fcx: Cx, mut icmp: End, addr: IpAddr) -> fictionet::Result {
+pub(super) async fn pings(
+    fcx: Cx,
+    mut icmp: End,
+    addr: IpAddr,
+    options: icmp::Options,
+) -> fictionet::Result {
     let mut run = 0;
     while let Ok(packet) = icmp.recv(&fcx).await {
-        if let Some(reply) = icmp::echo_reply(&packet, addr) {
+        if let Some(reply) = options.echo_reply(&packet, addr) {
             icmp.send(reply);
         }
         run = (run + 1) % 64;
