@@ -165,7 +165,8 @@ impl Profile {
 /// 9.6's `user_specific_delay`, then its doubling rule for elapsed processing
 /// time. The base is five milliseconds plus up to about 4.295 milliseconds.
 /// Pass the time already spent authenticating. The initial `none` probe does
-/// not use this delay. PAM may add its own delay, which is not modeled here.
+/// not use this delay. For stock Ubuntu password failures that reach PAM,
+/// [`password_failure_delay`] also models PAM's preceding delay.
 /// The caller schedules the result on the world's clock; this function never
 /// sleeps and does not generate a secret or consult the host clock.
 #[cfg(not(target_arch = "wasm32"))]
@@ -189,6 +190,47 @@ pub fn authentication_delay(secret: u64, username: &[u8], elapsed: Duration) -> 
         target *= 2;
     }
     target - elapsed
+}
+
+/// Remaining delay for a password failure through Ubuntu 24.04's stock PAM stack.
+///
+/// Ubuntu's [PAM package] enables `pam_unix` without `nodelay` in
+/// `debian/pam-configs/unix`. Its [password verification] requests two seconds;
+/// Linux-PAM's [delay implementation] varies this using three pseudo-random
+/// draws, producing a delay between one and three seconds. OpenSSH then applies
+/// [`authentication_delay`] to elapsed time including that PAM delay, so the
+/// combined delay can be longer than three seconds.
+///
+/// Supply PAM's seconds-based seed as `pam_seed`: real PAM uses the low 32 bits
+/// of Unix time when authentication starts. A world may supply its own clock or
+/// a seeded epoch offset. `elapsed` is time already spent before PAM's wait.
+/// Linux-PAM 1.5.3 sleeps for the full sampled delay, without subtracting elapsed
+/// authentication time; its recorded start time only seeds the sampler.
+/// No clock is read and no sleeping occurs here. OpenSSH's [password path]
+/// rejects empty or overlong passwords before PAM, and its [request handler]
+/// rejects password changes; these should use [`authentication_delay`] alone.
+/// Customized PAM stacks have different timing.
+///
+/// [PAM package]: https://archive.ubuntu.com/ubuntu/pool/main/p/pam/pam_1.5.3-5ubuntu5.debian.tar.xz
+/// [password verification]: https://github.com/linux-pam/linux-pam/blob/v1.5.3/modules/pam_unix/support.c
+/// [delay implementation]: https://github.com/linux-pam/linux-pam/blob/v1.5.3/libpam/pam_delay.c
+/// [password path]: https://github.com/openssh/openssh-portable/blob/V_9_6_P1/auth-passwd.c
+/// [request handler]: https://github.com/openssh/openssh-portable/blob/V_9_6_P1/auth2-passwd.c
+#[cfg(not(target_arch = "wasm32"))]
+pub fn password_failure_delay(
+    secret: u64,
+    username: &[u8],
+    mut pam_seed: u32,
+    elapsed: Duration,
+) -> Duration {
+    let mut sum = 0.0;
+    for _ in 0..3 {
+        pam_seed = pam_seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        sum += f64::from((pam_seed / 10) % 1_000_000);
+    }
+    let variation = (sum / 3.0) / 1_000_000.0 - 0.5;
+    let pam = Duration::from_micros((2_000_000.0 * (1.0 + variation)) as u64);
+    pam + authentication_delay(secret, username, elapsed.saturating_add(pam))
 }
 
 fn names(list: &str) -> Vec<String> {

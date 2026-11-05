@@ -15,7 +15,9 @@ use fictionet::stdlib::protocols::{
 };
 use fictionet::stdlib::services::{serve, ssh};
 use fictionet::sync::Mutex;
-use fictionet_extras::ssh::{Profile, authentication_delay, honeypot, terminal};
+use fictionet_extras::ssh::{
+    Profile, authentication_delay, honeypot, password_failure_delay, terminal,
+};
 
 use crate::config::SshAuth;
 use crate::observe::Observer;
@@ -76,7 +78,7 @@ impl ssh::Handler for Application {
     type Session = Session;
     fn authenticate(
         &self,
-        _: &ssh::Context<'_>,
+        context: &ssh::Context<'_>,
         attempt: &ssh::AuthAttempt<'_>,
     ) -> ssh::AuthDecision {
         let accepted = match (&self.policy, &attempt.request.method) {
@@ -105,6 +107,21 @@ impl ssh::Handler for Application {
                 partial_success: false,
                 delay: if matches!(attempt.request.method, auth::Method::None) {
                     Duration::ZERO
+                } else if matches!(
+                    &attempt.request.method,
+                    auth::Method::Password { password, new_password: None }
+                        if !password.is_empty() && password.len() <= 1024
+                ) {
+                    // A seeded epoch offset supplies PAM's seconds-based seed
+                    // from the world clock without consulting the host clock.
+                    let pam_seed = (self.delay_secret as u32)
+                        .wrapping_add(context.now.since_start().as_secs() as u32);
+                    password_failure_delay(
+                        self.delay_secret,
+                        attempt.request.user.as_bytes(),
+                        pam_seed,
+                        Duration::ZERO,
+                    )
                 } else {
                     authentication_delay(
                         self.delay_secret,
@@ -298,7 +315,7 @@ impl ssh::Session for Session {
     }
     fn held(&self) -> usize {
         match self {
-            Self::Shell(shell) => shell.terminal.held(),
+            Self::Shell(shell) => shell.user.capacity() + shell.terminal.held(),
             Self::Sftp { input, .. } => input.held(),
         }
     }
