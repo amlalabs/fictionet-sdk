@@ -8,7 +8,7 @@ where to send them.
 
 | Module | What it gives |
 |---|---|
-| `serve` | The `Service` trait, the driver that runs a service over a connection (`connection`, `listen`, `datagram`), a `Harness` for tests |
+| `serve` | The `Service` trait and the driver that runs it over a connection (`connection`, `listen`), a `Harness` for tests, and `DatagramService` with its runner for a UDP socket (`datagram`) |
 | `net` | `Net`: the sandboxes' subnet, DNS, routing, one machine per address, and each `Host`'s services |
 | `httpd` | HTTP as a service: `Handler`, the `tower` adapter for axum, `VirtualHosts`, `Http1` |
 | `web` | `Sites`, a preset on `Net` for a world of websites |
@@ -257,12 +257,11 @@ result for its HTTP and SOCKS error replies.
 ### One protocol, two framings
 
 Kerberos frames a message with a four-byte length over TCP, and sends one
-message per datagram over UDP. `Service::Decoder` is one type, so write
-two thin services over one core of your own: each picks its decoder and
-hands the message to the shared code. `driver.conn().transport` says which
-one the call came over, so the KDC can answer `KRB_ERR_RESPONSE_TOO_BIG`
-on UDP. Serve them with `Host::tcp(88, ..)` and `Host::udp(88, ..)` and
-the same `State`.
+message per datagram over UDP. Write a thin `Service` for TCP and a thin
+`DatagramService` for UDP over one core of your own: each picks its
+decoder and hands the message to the shared code, and the UDP side can
+answer `KRB_ERR_RESPONSE_TOO_BIG`. Serve them with `Host::tcp(88, ..)` and
+`Host::udp(88, ..)` and the same `State`.
 
 ### FTP control framing
 
@@ -524,11 +523,14 @@ Other kinds of port:
 
 - `tcp_with(port, world, make, opts)`: the same, with `ServeOptions` for
   a connection cap, an idle limit or a STARTTLS config.
-- `udp(port, world, make)`: one service for the port, which gets every
-  datagram, each decoded on its own as DNS and Modbus over UDP frame their
-  messages. It can send several datagrams to anyone (`driver.send_to`) and
-  run timers, as a MoldUDP64 server does for retransmissions and
-  heartbeats.
+- `udp(port, world, make)`: one `DatagramService` for the port, which
+  gets every datagram, each decoded on its own as DNS and Modbus over UDP
+  frame their messages. Its `on_item` replies to the datagram's sender and
+  says whether to go on with the rest of the datagram (`DatagramFlow`).
+  Any call can send datagrams to anyone (`send_to`) and run timers, as a
+  MoldUDP64 server does for retransmissions and heartbeats. A datagram
+  service has no deferred work, upgrades or connection ends. `udp_with`
+  adds a budget its calls can check.
 - `tls(port, sni, config, world, make)`: TLS first, picked by the name the
   client sends (`Sni::Any`, `Sni::Names` for the host's DNS names, or one
   name); several calls on one port route by SNI.
@@ -833,5 +835,6 @@ new `Line` variant. Raw responses are emitted only when the caller selects
 them. Existing command and DATA parsing keeps its grammar and limits.
 
 `Driver::decoder()` changes the active decoder between items.
-`Driver::peek_decoder()` reads its state. Over UDP, decoder access applies
-to the current datagram; each new datagram starts with a fresh decoder.
+`Driver::peek_decoder()` reads its state. `DatagramDriver::decoder()` does
+the same for the current datagram; each new datagram starts with a fresh
+decoder.

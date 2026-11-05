@@ -14,7 +14,7 @@ mod driver;
 mod network;
 mod tls;
 
-use echo_service::{Echo, Ticker};
+use echo_service::{Echo, EchoDatagrams, Ticker};
 use fictionet_test_support::sandbox::{Machine, machine};
 use io::read_some;
 use world::world;
@@ -42,8 +42,8 @@ use fictionet::stdlib::protocols::modbus::{
 };
 use fictionet::stdlib::services::serve::ConnInfo;
 use fictionet::stdlib::services::serve::{
-    self, Budget, Flow, Harness, HarnessError, Pending, PendingDriver, ServeOptions, Served,
-    Upgrade,
+    self, Budget, DatagramFlow, DatagramOptions, Flow, Harness, HarnessError, Pending,
+    PendingDriver, ServeOptions, Served, Upgrade,
 };
 use fictionet::stdlib::web::httpd::{self, Http1};
 use fictionet::stdlib::world::net::{Arrival, Host, Net, PortServer, PreparedShare, Sni};

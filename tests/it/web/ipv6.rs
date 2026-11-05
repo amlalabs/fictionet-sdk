@@ -367,12 +367,12 @@ fn endpoint_scoped_sites(shared_v6: bool, defaults: bool) {
 #[test]
 fn late_host_failure_keeps_http_defaults_names_and_tls_unchanged() {
     use fictionet::stdlib::codec::{Ending, LineError, Lines};
-    use fictionet::stdlib::services::serve::{Driver, Flow, Service};
+    use fictionet::stdlib::services::serve::{DatagramDriver, DatagramFlow, DatagramService};
     use fictionet::stdlib::web::httpd;
     use fictionet::stdlib::world::net::{Host, Net};
 
     struct Quiet;
-    impl Service for Quiet {
+    impl DatagramService for Quiet {
         type Timer = ();
         type Decoder = Lines;
         type State = ();
@@ -384,9 +384,9 @@ fn late_host_failure_keeps_http_defaults_names_and_tls_unchanged() {
             &mut self,
             _: Result<Vec<u8>, LineError>,
             _: &(),
-            _: &mut Driver<'_, Lines>,
-        ) -> Result<Flow, Infallible> {
-            Ok(Flow::Continue)
+            _: &mut DatagramDriver<'_, Lines>,
+        ) -> Result<DatagramFlow, Infallible> {
+            Ok(DatagramFlow::Continue)
         }
     }
 

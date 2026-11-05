@@ -4,7 +4,9 @@ use fictionet::stdlib::codec::Decode;
 use fictionet::stdlib::network::route::{Prefix, Router};
 use fictionet::stdlib::network::{ConnError, Connection, icmp, ip, tcp, udp};
 use fictionet::stdlib::services::serve::ConnInfo;
-use fictionet::stdlib::services::serve::{self, Budget, Counted, ServeOptions, Service};
+use fictionet::stdlib::services::serve::{
+    self, Budget, Counted, DatagramOptions, DatagramService, ServeOptions, Service,
+};
 use fictionet::stdlib::services::tls::ServerConfig;
 use fictionet::sync::Mutex;
 use fictionet::time::Instant;
@@ -182,7 +184,7 @@ where
 /// Starts serving a UDP port of a machine: the socket, its address,
 /// and who the sandboxes are.
 pub(super) type UdpStart =
-    Arc<dyn Fn(&Cx, udp::Socket, SocketAddr, Option<serve::SandboxOf>) + Send + Sync>;
+    Arc<dyn Fn(&Cx, udp::Socket, SocketAddr, serve::SandboxOf) + Send + Sync>;
 
 /// Which names a TLS service on a port answers to, by the SNI the client
 /// sends.
@@ -402,39 +404,49 @@ impl Host {
         self
     }
 
-    /// Serves UDP `port` with one [`Service`] made by `make`, which gets
-    /// every datagram ([`serve::datagram`]).
+    /// Serves UDP `port` with one [`DatagramService`] made by `make`, which
+    /// gets every datagram ([`serve::datagram`]). The network names each
+    /// datagram's sandbox.
     /// Port zero asks the endpoint to choose a free port ([`udp::Endpoint::bind`]).
     pub fn udp<S, M>(self, port: u16, state: Arc<S::State>, make: M) -> Host
     where
-        S: Service,
+        S: DatagramService,
         M: Fn() -> S + Send + Sync + 'static,
         <S::Decoder as Decode>::Error: Clone + Send,
     {
-        self.udp_with(port, state, make, ServeOptions::default())
+        self.udp_port(port, state, make, None)
     }
 
-    /// The same with these options. The network names each datagram's
-    /// sandbox ([`ServeOptions::sandbox`]).
-    pub fn udp_with<S, M>(
+    /// The same, with a budget the service's calls can check
+    /// ([`DatagramOptions::budget`]).
+    pub fn udp_with<S, M>(self, port: u16, state: Arc<S::State>, make: M, budget: Budget) -> Host
+    where
+        S: DatagramService,
+        M: Fn() -> S + Send + Sync + 'static,
+        <S::Decoder as Decode>::Error: Clone + Send,
+    {
+        self.udp_port(port, state, make, Some(budget))
+    }
+
+    fn udp_port<S, M>(
         mut self,
         port: u16,
         state: Arc<S::State>,
         make: M,
-        opts: ServeOptions,
+        budget: Option<Budget>,
     ) -> Host
     where
-        S: Service,
+        S: DatagramService,
         M: Fn() -> S + Send + Sync + 'static,
         <S::Decoder as Decode>::Error: Clone + Send,
     {
         let start: UdpStart = Arc::new(move |fcx, socket, local, sandbox| {
             let mut service = make();
             let state = state.clone();
-            let mut opts = opts.clone();
-            if sandbox.is_some() {
-                opts.sandbox = sandbox;
-            }
+            let opts = DatagramOptions {
+                budget: budget.clone(),
+                sandbox: Some(sandbox),
+            };
             fcx.spawn(move |fcx| async move {
                 Ok(serve::datagram(&fcx, socket, local, &mut service, &state, &opts).await?)
             });
@@ -1213,7 +1225,7 @@ impl Machine {
 
     /// Installs the prepared services in declaration order without failure.
     fn add(self: &Arc<Self>, prepared: Vec<PreparedPort>) {
-        let sandbox = Some(self.admission.sandbox());
+        let sandbox = self.admission.sandbox();
         for prepared in prepared {
             match prepared {
                 PreparedPort::Udp {

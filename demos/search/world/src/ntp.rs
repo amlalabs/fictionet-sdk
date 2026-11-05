@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use fictionet::stdlib::codec::{Collect, Wire};
 use fictionet::stdlib::protocols::ntp::{self, Packet, ServerInfo, Timestamp};
-use fictionet::stdlib::services::serve::{self, Driver, Service};
+use fictionet::stdlib::services::serve::{DatagramDriver, DatagramFlow, DatagramService};
 use fictionet::stdlib::world::net::Host;
 
 use crate::pages::Pages;
@@ -24,7 +24,7 @@ pub(crate) fn host(pages: Arc<Pages>) -> Host {
 
 struct TimeServer;
 
-impl Service for TimeServer {
+impl DatagramService for TimeServer {
     type Timer = ();
     type Decoder = Collect<Packet>;
     type State = Pages;
@@ -38,8 +38,8 @@ impl Service for TimeServer {
         &mut self,
         request: Packet,
         pages: &Pages,
-        driver: &mut Driver<'_, Collect<Packet>, ()>,
-    ) -> Result<serve::Flow, Self::Error> {
+        driver: &mut DatagramDriver<'_, Collect<Packet>, ()>,
+    ) -> Result<DatagramFlow, Self::Error> {
         let at = pages.session_now();
         let now = timestamp(at);
         // Answers as a stratum 2 pool server does: synced to an upstream
@@ -57,7 +57,7 @@ impl Service for TimeServer {
         {
             driver.reply().extend_from_slice(&bytes);
         }
-        Ok(serve::Flow::Continue)
+        Ok(DatagramFlow::Continue)
     }
 }
 

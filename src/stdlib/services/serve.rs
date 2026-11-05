@@ -11,9 +11,14 @@
 //! service, writes its reply, honors its timers, and closes. [`listen`]
 //! runs [`connection`] for every connection an [`Accept`] listener accepts, with a
 //! cap on how many are open, and TLS first when the options ask for it.
-//! [`datagram`] does the same for a UDP socket. The driver and the
-//! [`Harness`] share one state machine, so a service that passes its
-//! harness tests behaves the same over a real connection.
+//! The driver and the [`Harness`] share one state machine, so a service
+//! that passes its harness tests behaves the same over a real connection.
+//!
+//! A [`DatagramService`] is the server side of one protocol for one UDP
+//! socket, and [`datagram`] runs it: each datagram is decoded on its own,
+//! and the service can send datagrams to anyone. It shares the clock,
+//! entropy, timers and wakes with a [`Service`], and has nothing of a
+//! stream's deferred work, upgrades or ends.
 //!
 //! A service that echoes each line back, and closes on `quit`:
 //!
@@ -62,7 +67,7 @@
 //! # fn start(fcx: &Cx, side: fictionet::End) -> Result {
 //! let (tcp, _udp, _icmp, _other) = ip::split_protocols(fcx, side);
 //! let machine = tcp::endpoint(fcx, tcp, "10.0.0.10".parse()?);
-//! serve::listen(fcx, machine.listen(7)?, Arc::new(()), || Echo, serve::ServeOptions::default());
+//! serve::listen(fcx, machine.listen(7)?, Arc::new(()), || Echo, serve::ServeOptions::default(), None);
 //! # Ok(())
 //! # }
 //! ```
@@ -84,8 +89,8 @@
 //!   whether or not they make an item, so a decoder that skips a long run
 //!   of bytes is never mistaken for a stuck one. A decoder that breaks
 //!   the [`Decode`] contract fails with
-//!   [`Fail::Stuck`]. Input the buffer cannot take (a failed allocation,
-//!   a datagram larger than the buffer) fails with [`Fail::Refused`].
+//!   [`Fail::Stuck`]. Input the buffer cannot take (a failed allocation)
+//!   fails with [`Fail::Refused`].
 //!   [`Service::on_fail`] hears both.
 //! - **Timers.** [`Driver::set_timer`] arms a named timer; several can
 //!   run at once. Each counts from when the call's reply is written. A due
@@ -245,7 +250,7 @@ use fictionet::stdlib::network::{Accept, Accepted, DatagramSocket};
 use fictionet::stdlib::network::{ConnError, Connection, ConnectionExt};
 use fictionet::stdlib::services::tls::{self, HandshakeError, ServerConfig, TlsConnection};
 use fictionet::time::Instant;
-use fictionet::{Cancelled, Cx, ErrorChain, RaceError, RecvError, Task};
+use fictionet::{Cancelled, Cx, RaceError, RecvError, Task};
 
 // ---------------------------------------------------------------------------
 // The service
@@ -258,10 +263,9 @@ use fictionet::{Cancelled, Cx, ErrorChain, RaceError, RecvError, Task};
 /// or an order book, is the `State`, passed to every call.
 ///
 /// A protocol that frames the same messages two ways, such as Kerberos
-/// (a length prefix over TCP, one message per datagram over UDP), is two
-/// thin services over one core of its own: each picks its decoder and
-/// hands the message to the shared code. [`ConnInfo::transport`] says
-/// which one a call came over.
+/// (a length prefix over TCP, one message per datagram over UDP), is a
+/// thin `Service` and a thin [`DatagramService`] over one core of its own:
+/// each picks its decoder and hands the message to the shared code.
 pub trait Service: Send + 'static {
     /// This service's timer names. Use an enum, or `()` when no timers are needed.
     type Timer: Copy + Eq + Send + 'static;
@@ -725,6 +729,65 @@ impl Drop for Charge {
     }
 }
 
+/// The calls whose meaning is the same for a [`Service`] and a
+/// [`DatagramService`]: the clock, entropy, timers, the connection and
+/// wakes. Each context type has the fields `now`, `conn`, `timers` and
+/// `s`, a scratch with `entropy`, `timers` and `wake`.
+macro_rules! common_calls {
+    () => {
+        /// The run's clock, read by the driver before this call.
+        pub fn now(&self) -> Instant {
+            self.now
+        }
+
+        /// The run's entropy source, or the standalone harness's seeded source.
+        pub fn entropy(&self) -> &dyn Entropy {
+            self.s.entropy.as_ref()
+        }
+
+        /// A random number from the run's stream, or the standalone harness's stream.
+        pub fn random_u64(&mut self) -> u64 {
+            self.s.entropy.random_u64()
+        }
+
+        /// Arms the timer `name` to go off `d` after this call's output is
+        /// written, replacing it if it is armed.
+        pub fn set_timer(&mut self, name: T, d: Duration) {
+            self.s.timers.retain(|(n, _)| *n != name);
+            self.s.timers.push((name, Some(d)));
+        }
+
+        /// Disarms the timer `name`.
+        pub fn cancel_timer(&mut self, name: T) {
+            self.s.timers.retain(|(n, _)| *n != name);
+            self.s.timers.push((name, None));
+        }
+
+        /// When the timer `name` goes off, if it is armed. A timer set in this
+        /// call says `now` plus its duration.
+        pub fn timer(&self, name: T) -> Option<Instant> {
+            if let Some((_, d)) = self.s.timers.iter().find(|(n, _)| *n == name) {
+                return d.map(|d| self.now + d);
+            }
+            self.timers
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, at)| *at)
+        }
+
+        /// The connection: its number, sandbox, addresses and transport.
+        pub fn conn(&self) -> &ConnInfo {
+            self.conn
+        }
+
+        /// A handle that wakes this service from anywhere: see
+        /// [`WakeHandle`].
+        pub fn wake_handle(&self) -> WakeHandle {
+            self.s.wake.clone()
+        }
+    };
+}
+
 /// The service's side of the driver, for one call: the reply, the clock
 /// reading the driver took, seeded randomness, and
 /// what the call asked for. Every [`Service`] method takes it as `driver`.
@@ -738,6 +801,8 @@ pub struct Driver<'a, D, T = ()> {
 }
 
 impl<D, T: Copy + Eq> Driver<'_, D, T> {
+    common_calls!();
+
     /// The connection's budget, for rejecting a request before retaining it.
     /// The driver still charges all service and deferred-work holdings.
     pub fn budget(&self) -> Option<&Budget> {
@@ -745,67 +810,18 @@ impl<D, T: Copy + Eq> Driver<'_, D, T> {
     }
 
     /// The active decoder, read-only.
-    /// Over UDP, this selects the same decoder as [`Self::decoder`].
     pub fn peek_decoder(&self) -> &D {
         self.decoder
     }
 
     /// The active decoder.
-    /// Over UDP, item and failure calls access the current datagram's decoder.
-    /// Other calls use a separate decoder whose changes do not affect datagrams.
     pub fn decoder(&mut self) -> &mut D {
         self.decoder
     }
 
-    /// Bytes to send, after anything already there. Over UDP, they go to
-    /// the sender of the datagram being handled, as one datagram.
+    /// Bytes to send, after anything already there.
     pub fn reply(&mut self) -> &mut Vec<u8> {
         &mut self.s.reply
-    }
-
-    /// The run's clock, read by the driver before this call.
-    pub fn now(&self) -> Instant {
-        self.now
-    }
-
-    /// The run's entropy source, or the standalone harness's seeded source.
-    pub fn entropy(&self) -> &dyn Entropy {
-        self.s.entropy.as_ref()
-    }
-
-    /// A random number from the run's stream, or the standalone harness's stream.
-    pub fn random_u64(&mut self) -> u64 {
-        self.s.entropy.random_u64()
-    }
-
-    /// Arms the timer `name` to go off `d` after this call's reply is
-    /// written, replacing it if it is armed.
-    pub fn set_timer(&mut self, name: T, d: Duration) {
-        self.s.timers.retain(|(n, _)| *n != name);
-        self.s.timers.push((name, Some(d)));
-    }
-
-    /// Disarms the timer `name`.
-    pub fn cancel_timer(&mut self, name: T) {
-        self.s.timers.retain(|(n, _)| *n != name);
-        self.s.timers.push((name, None));
-    }
-
-    /// When the timer `name` goes off, if it is armed. A timer set in this
-    /// call says `now` plus its duration.
-    pub fn timer(&self, name: T) -> Option<Instant> {
-        if let Some((_, d)) = self.s.timers.iter().find(|(n, _)| *n == name) {
-            return d.map(|d| self.now + d);
-        }
-        self.timers
-            .iter()
-            .find(|(n, _)| *n == name)
-            .map(|(_, at)| *at)
-    }
-
-    /// The connection: its number, sandbox, addresses and transport.
-    pub fn conn(&self) -> &ConnInfo {
-        self.conn
     }
 
     /// How many bytes the client has sent so far.
@@ -840,26 +856,11 @@ impl<D, T: Copy + Eq> Driver<'_, D, T> {
     pub fn cancel_keyed(&mut self, key: u64) {
         self.s.keyed.push((key, None));
     }
-
-    /// A handle that wakes this connection's service from anywhere: see
-    /// [`WakeHandle`].
-    pub fn wake_handle(&self) -> WakeHandle {
-        self.s.wake.clone()
-    }
-
-    /// Sends `bytes` as one datagram to `to`. For datagram services
-    /// ([`datagram`]): several per call, to anyone, at any time, such
-    /// as a retransmission in packets that fit the path, or a heartbeat
-    /// from [`Service::on_timer`]. A connection's driver drops them.
-    pub fn send_to(&mut self, to: SocketAddr, bytes: Vec<u8>) {
-        self.s.datagrams.push((to, bytes));
-    }
 }
 
 /// What the per-connection state looks like to a call.
 struct Scratch<T> {
     reply: Vec<u8>,
-    datagrams: Vec<(SocketAddr, Vec<u8>)>,
     entropy: Arc<dyn Entropy>,
     timers: Vec<(T, Option<Duration>)>,
     ordered: Vec<Box<dyn Pending>>,
@@ -873,7 +874,6 @@ impl<T> Scratch<T> {
     fn new(entropy: Arc<dyn Entropy>) -> Scratch<T> {
         Scratch {
             reply: Vec::new(),
-            datagrams: Vec::new(),
             entropy,
             timers: Vec::new(),
             ordered: Vec::new(),
@@ -888,7 +888,6 @@ impl<T> Scratch<T> {
     /// written.
     fn discard(&mut self) {
         self.reply.clear();
-        self.datagrams.clear();
         self.ordered.clear();
         self.keyed.clear();
     }
@@ -974,19 +973,21 @@ impl Drop for PanicNote {
 // ---------------------------------------------------------------------------
 // Options
 
-/// Names the sandbox at an address, for the [`ConnInfo`] of a datagram
-/// ([`ServeOptions::sandbox`]).
+/// Names the sandbox at an address, for the [`ConnInfo`] of a connection
+/// [`listen`] accepts or a datagram [`datagram`] receives.
 pub type SandboxOf = Arc<dyn Fn(std::net::IpAddr) -> Option<Sandbox> + Send + Sync>;
 
 /// Chooses the TLS config for a handshake from the client's SNI. `None`
 /// rejects the handshake with `unrecognized_name`.
 pub type TlsSelect = Arc<dyn Fn(Option<&str>, &Cx) -> Option<Arc<ServerConfig>> + Send + Sync>;
 
-/// How [`listen`] and [`connection`] run.
+/// How [`listen`] and [`connection`] run a stream service.
 #[derive(Clone)]
 pub struct ServeOptions {
-    /// Connections served at once; past this, a new one is reset as soon
-    /// as it is accepted, and counts until its socket is gone. Default 64.
+    /// Connections served at once, by a listener ([`listen`], or a port of
+    /// [`Net`](fictionet::stdlib::world::net::Net)); past this, a new one is
+    /// reset as soon as it is accepted, and counts until its socket is
+    /// gone. Default 64.
     pub max_conns: usize,
     /// Close a connection after this long with no bytes from the client,
     /// while the driver waits for them. Default 10 seconds. `None` waits
@@ -1009,10 +1010,6 @@ pub struct ServeOptions {
     pub read_buffer: usize,
     /// The bytes each connection's holdings are charged to. Default none.
     pub budget: Option<Budget>,
-    /// Names the sandbox each datagram came from, in its [`ConnInfo`].
-    /// [`Net`](fictionet::stdlib::world::net::Net) sets it; a connection's sandbox is
-    /// given with its `ConnInfo` instead.
-    pub sandbox: Option<SandboxOf>,
 }
 
 impl Default for ServeOptions {
@@ -1026,7 +1023,6 @@ impl Default for ServeOptions {
             handshake: Duration::from_secs(10),
             read_buffer: 0,
             budget: None,
-            sandbox: None,
         }
     }
 }
@@ -1539,7 +1535,6 @@ where
     fn collect(&mut self) {
         let reply = std::mem::take(&mut self.s.reply);
         self.push_out(reply, None);
-        self.s.datagrams.clear();
         for pending in std::mem::take(&mut self.s.ordered) {
             let work = self.new_work(pending);
             self.ordered.push_back(work);
@@ -2354,7 +2349,9 @@ pub async fn accept_tls<C: Connection, F: Future<Output = Option<Arc<ServerConfi
 /// hands first. Past [`ServeOptions::max_conns`], a new connection is
 /// reset; each counts until its socket is gone, so a client that never
 /// finishes closing cannot open more. Connections are numbered from 1, in
-/// the order they are accepted. Returns the accepting task.
+/// the order they are accepted. `sandbox` names the sandbox each
+/// connection came from, by its peer address, in its [`ConnInfo`].
+/// Returns the accepting task.
 ///
 /// A connection's failure ends its task with `Ok`, so it does not fail the world.
 pub fn listen<S, M, A: Accept>(
@@ -2363,6 +2360,7 @@ pub fn listen<S, M, A: Accept>(
     state: Arc<S::State>,
     make: M,
     opts: ServeOptions,
+    sandbox: Option<SandboxOf>,
 ) -> Task
 where
     S: Service,
@@ -2383,7 +2381,7 @@ where
             info.handshake = conn.handshake();
             info.sandbox = info
                 .peer
-                .and_then(|peer| opts.sandbox.as_ref().and_then(|f| f(peer.ip())));
+                .and_then(|peer| sandbox.as_ref().and_then(|f| f(peer.ip())));
             let Some(guard) = Counted::enter(&open, opts.max_conns) else {
                 conn.reset();
                 continue;
@@ -2423,26 +2421,225 @@ impl Drop for Counted {
 // ---------------------------------------------------------------------------
 // Datagrams
 
-type DatagramCall<'a, S> = dyn FnMut(
-        &mut Driver<'_, <S as Service>::Decoder, <S as Service>::Timer>,
-    ) -> Result<Flow, <S as Service>::Error>
-    + 'a;
-
-/// Serves every datagram on `socket` with one `service`, until the socket
-/// closes or the region is cancelled.
+/// A sans-IO server for one UDP socket of one protocol, run by
+/// [`datagram`]. The runner owns the socket and the output; the service
+/// owns its state.
 ///
 /// Each datagram is decoded on its own, with a fresh decoder that sees the
 /// end of input after it, as DNS, DHCP, Kerberos and Modbus over UDP frame
 /// their messages. The reply bytes of one datagram's items go back to its
-/// sender as one datagram; [`Driver::send_to`] sends more, to anyone.
-/// The service's [`ConnInfo`] names the sender in `peer`, with
-/// [`Transport::Udp`]. [`Service::on_open`] is called once at the start,
-/// timers and wakes work as over a connection (with no sender: use
-/// `send_to`), and a decoder failure is answered with
-/// [`Service::on_fail`]. [`Flow::Close`] drops the rest of a datagram.
-/// Deferred work is not run. Serving continues after a service error.
-/// A panic is not caught: it ends the run, as it
-/// does over a connection.
+/// sender as one datagram; [`DatagramContext::send_to`] sends more, to
+/// anyone, from any call.
+///
+/// An error a call returns ends that call: the rest of the current
+/// datagram is dropped, what the call asked for is still sent, and serving
+/// goes on with the next datagram.
+pub trait DatagramService: Send + 'static {
+    /// This service's timer names. Use an enum, or `()` when no timers are needed.
+    type Timer: Copy + Eq + Send + 'static;
+    /// How one datagram's bytes become items.
+    type Decoder: Decode + Send + 'static;
+    /// State shared with the rest of the world, such as a directory.
+    type State: Send + Sync + 'static;
+    /// Why the service gives up on a call.
+    type Error: core::error::Error + Send + Sync + 'static;
+
+    /// A fresh decoder, for each datagram.
+    fn decoder(&self) -> Self::Decoder;
+
+    /// Serving starts, before the first datagram.
+    fn on_open(
+        &mut self,
+        _state: &Self::State,
+        _cx: &mut DatagramContext<'_, Self::Timer>,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    /// One decoded item of the current datagram. Append reply bytes for
+    /// its sender with [`DatagramDriver::reply`].
+    fn on_item(
+        &mut self,
+        item: <Self::Decoder as Decode>::Item,
+        state: &Self::State,
+        driver: &mut DatagramDriver<'_, Self::Decoder, Self::Timer>,
+    ) -> Result<DatagramFlow, Self::Error>;
+
+    /// The timer named `timer`, set with [`DatagramContext::set_timer`],
+    /// went off.
+    fn on_timer(
+        &mut self,
+        _timer: Self::Timer,
+        _state: &Self::State,
+        _cx: &mut DatagramContext<'_, Self::Timer>,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    /// The service's [`WakeHandle`] was woken. Several wakes before the
+    /// runner gets to it are one call.
+    fn on_wake(
+        &mut self,
+        _state: &Self::State,
+        _cx: &mut DatagramContext<'_, Self::Timer>,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    /// The decoder failed on the current datagram, or the datagram was
+    /// larger than the decoder could hold ([`Fail::Refused`]). A reply,
+    /// such as an error message, still goes to its sender; the rest of the
+    /// datagram is dropped.
+    fn on_fail(
+        &mut self,
+        _error: &Fail<<Self::Decoder as Decode>::Error>,
+        _state: &Self::State,
+        _driver: &mut DatagramDriver<'_, Self::Decoder, Self::Timer>,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+/// What [`DatagramService::on_item`] does with the rest of its datagram.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DatagramFlow {
+    /// Decode the next item of the datagram.
+    Continue,
+    /// Drop the rest of the datagram, and send the reply.
+    Finish,
+}
+
+/// How [`datagram`] runs.
+#[derive(Clone, Default)]
+pub struct DatagramOptions {
+    /// A budget the service's calls can check
+    /// ([`DatagramContext::budget`]). The runner charges nothing to it.
+    pub budget: Option<Budget>,
+    /// Names the sandbox each datagram came from, in its [`ConnInfo`].
+    pub sandbox: Option<SandboxOf>,
+}
+
+impl std::fmt::Debug for DatagramOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DatagramOptions")
+            .field("budget", &self.budget)
+            .field("sandbox", &self.sandbox.is_some())
+            .finish()
+    }
+}
+
+/// What every [`DatagramService`] call can do: read the clock and
+/// entropy, run timers, hand out a wake handle, and send datagrams.
+/// [`DatagramService::on_open`], `on_timer` and `on_wake` take it as
+/// `cx`; [`DatagramDriver`] derefs to it.
+pub struct DatagramContext<'a, T = ()> {
+    s: &'a mut DatagramScratch<T>,
+    now: Instant,
+    conn: &'a ConnInfo,
+    timers: &'a [(T, Instant)],
+    budget: Option<&'a Budget>,
+}
+
+impl<T: Copy + Eq> DatagramContext<'_, T> {
+    common_calls!();
+
+    /// The budget [`DatagramOptions::budget`] gave, for rejecting a
+    /// request before retaining it. Nothing is charged to it for the
+    /// service.
+    pub fn budget(&self) -> Option<&Budget> {
+        self.budget
+    }
+
+    /// How many bytes the socket has received so far, from every sender.
+    pub fn bytes_in(&self) -> u64 {
+        self.s.bytes_in
+    }
+
+    /// Sends `bytes` as one datagram to `to`, once this call returns.
+    /// Several per call, to anyone: a retransmission in packets that fit
+    /// the path, or a heartbeat from [`DatagramService::on_timer`].
+    pub fn send_to(&mut self, to: SocketAddr, bytes: Vec<u8>) {
+        self.s.sends.push((to, bytes));
+    }
+}
+
+/// What a [`DatagramService`] call about one datagram sees: the
+/// datagram's decoder, the reply to its sender, and everything of a
+/// [`DatagramContext`]. [`DatagramService::on_item`] and `on_fail` take it
+/// as `driver`.
+pub struct DatagramDriver<'a, D, T = ()> {
+    decoder: &'a mut D,
+    reply: &'a mut Vec<u8>,
+    unread: &'a [u8],
+    cx: DatagramContext<'a, T>,
+}
+
+impl<D, T> DatagramDriver<'_, D, T> {
+    /// The current datagram's decoder, read-only.
+    pub fn peek_decoder(&self) -> &D {
+        self.decoder
+    }
+
+    /// The current datagram's decoder. Changes apply to the rest of this
+    /// datagram; the next one starts with a fresh decoder.
+    pub fn decoder(&mut self) -> &mut D {
+        self.decoder
+    }
+
+    /// Bytes to send to the datagram's sender, after anything already
+    /// there. The replies to one datagram's items go back as one datagram.
+    pub fn reply(&mut self) -> &mut Vec<u8> {
+        self.reply
+    }
+
+    /// In [`DatagramService::on_fail`], the bytes of the datagram the
+    /// decoder could not use. Empty in [`DatagramService::on_item`].
+    pub fn unread(&self) -> &[u8] {
+        self.unread
+    }
+}
+
+impl<'a, D, T> std::ops::Deref for DatagramDriver<'a, D, T> {
+    type Target = DatagramContext<'a, T>;
+
+    fn deref(&self) -> &DatagramContext<'a, T> {
+        &self.cx
+    }
+}
+
+impl<'a, D, T> std::ops::DerefMut for DatagramDriver<'a, D, T> {
+    fn deref_mut(&mut self) -> &mut DatagramContext<'a, T> {
+        &mut self.cx
+    }
+}
+
+/// What a datagram service's calls ask for, between calls.
+struct DatagramScratch<T> {
+    entropy: Arc<dyn Entropy>,
+    timers: Vec<(T, Option<Duration>)>,
+    wake: WakeHandle,
+    sends: Vec<(SocketAddr, Vec<u8>)>,
+    bytes_in: u64,
+}
+
+impl<T> DatagramScratch<T> {
+    /// Sends the datagrams the last call asked for.
+    fn send(&mut self, socket: &mut impl DatagramSocket) {
+        for (to, bytes) in self.sends.drain(..) {
+            socket.send_to(&bytes, to);
+        }
+    }
+}
+
+/// Serves every datagram on `socket` with one `service`, until the socket
+/// closes or the region is cancelled.
+///
+/// The service's [`ConnInfo`] names the socket in `local`, with
+/// [`Transport::Udp`], and in calls about a datagram its sender in `peer`
+/// and the sender's sandbox ([`DatagramOptions::sandbox`]).
+/// [`DatagramService::on_open`] is called once at the start; timers and
+/// wakes work as over a connection. A panic is not caught: it ends the
+/// run, as it does over a connection.
 ///
 /// Returns `Ok(())` once the socket closes, and [`Cancelled`] if `fcx`'s
 /// [region](fictionet::Cx#regions) is cancelled.
@@ -2452,10 +2649,10 @@ pub async fn datagram<S, D: DatagramSocket>(
     local: SocketAddr,
     service: &mut S,
     state: &S::State,
-    opts: &ServeOptions,
+    opts: &DatagramOptions,
 ) -> Result<(), Cancelled>
 where
-    S: Service,
+    S: DatagramService,
     <S::Decoder as Decode>::Error: Clone + Send,
 {
     let base = ConnInfo {
@@ -2464,81 +2661,55 @@ where
         ..ConnInfo::default()
     };
     let _note = PanicNote::new(std::any::type_name::<S>(), &base);
-    let mut s = Scratch::new(Arc::new(fcx.clone()));
+    let mut s = DatagramScratch {
+        entropy: Arc::new(fcx.clone()),
+        timers: Vec::new(),
+        wake: WakeHandle::new(),
+        sends: Vec::new(),
+        bytes_in: 0,
+    };
     let mut timers: Vec<(S::Timer, Instant)> = Vec::new();
     let wake = s.wake.clone();
-    // One call, then its datagrams. The reply stays for the
-    // caller to send, or drop.
-    let mut lifecycle_decoder = service.decoder();
-    let called = |decoder: &mut S::Decoder,
-                  s: &mut Scratch<S::Timer>,
-                  timers: &[(S::Timer, Instant)],
-                  socket: &mut D,
-                  info: &ConnInfo,
-                  f: &mut DatagramCall<'_, S>|
-     -> Flow {
-        let result = {
-            let mut driver = Driver {
-                decoder,
-                s: &mut *s,
-                now: fcx.now(),
-                conn: info,
-                timers,
-                budget: opts.budget.as_ref(),
-            };
-            f(&mut driver)
-        };
-        let flow = match result {
-            Err(e) => {
-                let _e = ErrorChain(&e);
-
-                Flow::Close
-            }
-            Ok(flow) => flow,
-        };
-        for (to, bytes) in s.datagrams.drain(..) {
-            socket.send_to(&bytes, to);
-        }
-        s.ordered.clear();
-        s.keyed.clear();
-        flow
-    };
-    called(
-        &mut lifecycle_decoder,
-        &mut s,
-        &timers,
-        &mut socket,
-        &base,
-        &mut |driver| service.on_open(state, driver),
+    let budget = opts.budget.as_ref();
+    // An error ends only the call that returned it: serving goes on.
+    let _ = service.on_open(
+        state,
+        &mut DatagramContext {
+            s: &mut s,
+            now: fcx.now(),
+            conn: &base,
+            timers: &timers,
+            budget,
+        },
     );
-    s.reply.clear();
+    s.send(&mut socket);
     let mut run = 0u32;
     let ended = loop {
         let now = fcx.now();
         arm(&mut timers, &mut s.timers, now);
         if let Some(i) = due(&timers, now) {
             let (name, _) = timers.remove(i);
-            called(
-                &mut lifecycle_decoder,
-                &mut s,
-                &timers,
-                &mut socket,
-                &base,
-                &mut |driver| service.on_timer(name, state, driver),
-            );
-            s.reply.clear();
+            let mut cx = DatagramContext {
+                s: &mut s,
+                now,
+                conn: &base,
+                timers: &timers,
+                budget,
+            };
+            let _ = service.on_timer(name, state, &mut cx);
+            s.send(&mut socket);
             continue;
         }
         if wake.take() {
-            called(
-                &mut lifecycle_decoder,
-                &mut s,
-                &timers,
-                &mut socket,
-                &base,
-                &mut |driver| service.on_wake(state, driver),
-            );
-            s.reply.clear();
+            let mut cx = DatagramContext {
+                s: &mut s,
+                now,
+                conn: &base,
+                timers: &timers,
+                budget,
+            };
+            let _ = service.on_wake(state, &mut cx);
+            s.send(&mut socket);
             continue;
         }
         let deadline = timers.iter().map(|(_, at)| *at).min();
@@ -2567,10 +2738,9 @@ where
             Err(RecvError::Closed) => break Ok(()),
             Err(RecvError::Cancelled) => break Err(Cancelled),
         };
-        let sandbox = opts.sandbox.as_ref().and_then(|f| f(from.ip()));
         let info = ConnInfo {
             peer: Some(from),
-            sandbox,
+            sandbox: opts.sandbox.as_ref().and_then(|f| f(from.ip())),
             ..base.clone()
         };
         let _note = PanicNote::new(std::any::type_name::<S>(), &info);
@@ -2578,66 +2748,58 @@ where
         let mut stream = Stream::with_buffer(service.decoder(), datagram.len());
         let taken = stream.push(&datagram);
         stream.end();
+        let mut reply = Vec::new();
         loop {
-            let flow = match stream.next() {
+            let now = fcx.now();
+            let (fail, unread) = match stream.next() {
                 Some(Ok(item)) => {
-                    let mut item = Some(item);
-                    called(
-                        stream.decoder(),
-                        &mut s,
-                        &timers,
-                        &mut socket,
-                        &info,
-                        &mut |driver| match item.take() {
-                            Some(item) => service.on_item(item, state, driver),
-                            None => Ok(Flow::Close),
+                    let mut driver = DatagramDriver {
+                        decoder: stream.decoder(),
+                        reply: &mut reply,
+                        unread: &[],
+                        cx: DatagramContext {
+                            s: &mut s,
+                            now,
+                            conn: &info,
+                            timers: &timers,
+                            budget,
                         },
-                    )
-                }
-                Some(Err(fail)) => {
-                    s.unread = stream.unread().to_vec();
-                    let flow = called(
-                        stream.decoder(),
-                        &mut s,
-                        &timers,
-                        &mut socket,
-                        &info,
-                        &mut |driver| service.on_fail(&fail, state, driver).map(|()| Flow::Close),
-                    );
-                    s.unread = Vec::new();
-                    flow
-                }
-                None => {
-                    if taken < datagram.len() {
-                        // Longer than the decoder could hold at once.
-                        let fail = Fail::Refused {
-                            unread: datagram.len(),
-                            limit: stream.limit(),
-                        };
-                        s.unread = datagram.clone();
-                        let flow = called(
-                            stream.decoder(),
-                            &mut s,
-                            &timers,
-                            &mut socket,
-                            &info,
-                            &mut |driver| {
-                                service.on_fail(&fail, state, driver).map(|()| Flow::Close)
-                            },
-                        );
-                        s.unread = Vec::new();
-                        flow
-                    } else {
-                        Flow::Close
+                    };
+                    let flow = service.on_item(item, state, &mut driver);
+                    s.send(&mut socket);
+                    if let Ok(DatagramFlow::Continue) = flow {
+                        continue;
                     }
+                    break;
                 }
+                Some(Err(fail)) => (fail, Some(stream.unread().to_vec())),
+                // Longer than the decoder could hold at once.
+                None if taken < datagram.len() => {
+                    let fail = Fail::Refused {
+                        unread: datagram.len(),
+                        limit: stream.limit(),
+                    };
+                    (fail, None)
+                }
+                None => break,
             };
-            if flow != Flow::Continue {
-                break;
-            }
+            let mut driver = DatagramDriver {
+                decoder: stream.decoder(),
+                reply: &mut reply,
+                unread: unread.as_deref().unwrap_or(&datagram),
+                cx: DatagramContext {
+                    s: &mut s,
+                    now,
+                    conn: &info,
+                    timers: &timers,
+                    budget,
+                },
+            };
+            let _ = service.on_fail(&fail, state, &mut driver);
+            s.send(&mut socket);
+            break;
         }
         // The replies to one datagram's items go back as one datagram.
-        let reply = std::mem::take(&mut s.reply);
         if !reply.is_empty() {
             socket.send_to(&reply, from);
         }

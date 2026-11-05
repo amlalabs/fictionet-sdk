@@ -1,6 +1,6 @@
 //! Services change protocol framing between items through the driver.
 use fictionet::Seed;
-use fictionet::stdlib::services::serve::{Flow, Harness, ServeOptions};
+use fictionet::stdlib::services::serve::{Flow, Harness};
 use fictionet::stdlib::{
     codec::Wire,
     protocols::{imap, postgres, smtp},
@@ -162,11 +162,37 @@ fn postgres_refused_ssl_reads_startup_from_the_same_chunk() {
 
 #[test]
 fn datagram_decoder_access_uses_the_current_datagram() {
+    use fictionet::stdlib::services::serve::{DatagramFlow, DatagramOptions};
     use std::{
         collections::VecDeque,
         net::SocketAddr,
         sync::{Arc, Mutex},
     };
+    /// The same as `Mail`, one datagram at a time.
+    #[derive(Default)]
+    struct DatagramMail {
+        messages: Vec<Vec<u8>>,
+    }
+    datagram_fixture! {
+        DatagramMail => (smtp::Inputs, (), smtp::Error);
+        decoder(self) {
+            smtp::Inputs::new()
+        }
+        on_item(self, item: Result<smtp::Input, smtp::Error>; _, driver) -> DatagramFlow {
+            match item? {
+                smtp::Input::Command(command) if command.verb == "DATA" => {
+                    driver.decoder().start_data().unwrap();
+                    driver.reply().extend_from_slice(b"354 Send data\r\n");
+                }
+                smtp::Input::Message(bytes) => {
+                    self.messages.push(bytes);
+                    driver.reply().extend_from_slice(b"250 Queued\r\n");
+                }
+                _ => {}
+            }
+            Ok(DatagramFlow::Continue)
+        }
+    }
     struct Socket {
         input: VecDeque<Vec<u8>>,
         output: Arc<Mutex<Vec<Vec<u8>>>>,
@@ -194,14 +220,14 @@ fn datagram_decoder_access_uses_the_current_datagram() {
             ]),
             output: output.clone(),
         };
-        let mut service = Mail::default();
+        let mut service = DatagramMail::default();
         fictionet::stdlib::services::serve::datagram(
             &cx,
             socket,
             "192.0.2.1:25".parse().unwrap(),
             &mut service,
             &(),
-            &ServeOptions::default(),
+            &DatagramOptions::default(),
         )
         .await?;
         assert_eq!(service.messages, [b"one\r\n".to_vec(), b"two\r\n".to_vec()]);

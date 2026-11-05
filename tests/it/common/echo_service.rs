@@ -3,7 +3,9 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use fictionet::stdlib::codec::{Ending, LineError, Lines};
-use fictionet::stdlib::services::serve::{Ended, Flow, Pending, PendingDriver, Upgrade};
+use fictionet::stdlib::services::serve::{
+    DatagramFlow, Ended, Flow, Pending, PendingDriver, Upgrade,
+};
 
 /// Echoes each line, closes on `quit`, hands over on `handoff`, and on
 /// `later` answers through deferred work.
@@ -50,6 +52,23 @@ service_fixture! {
             driver.reply().extend_from_slice(b"eof\n");
         }
         Ok(())
+    }
+}
+
+/// Echoes each line of a datagram back to its sender.
+pub(crate) struct EchoDatagrams;
+
+datagram_fixture! {
+    EchoDatagrams => (Lines, (), Infallible);
+
+    decoder(self) {
+        Lines::new(64, Ending::LfOrCrlf)
+    }
+
+    on_item(self, line: Result<Vec<u8>, LineError>; _, driver) -> DatagramFlow {
+        driver.reply().extend_from_slice(&line.unwrap_or_default());
+        driver.reply().push(b'\n');
+        Ok(DatagramFlow::Continue)
     }
 }
 

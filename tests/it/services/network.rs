@@ -151,17 +151,18 @@ fn failed_host_binding_leaves_no_route_service_or_registration() {
                 .port_server(80, server.clone())
                 .udp(9, Arc::new(()), move || {
                     count.fetch_add(1, Ordering::SeqCst);
-                    Echo
+                    EchoDatagrams
                 });
             let config = |_: &Cx| -> Arc<fictionet::stdlib::services::tls::ServerConfig> {
                 panic!("no handshake for a rejected host")
             };
             let bad = match failure {
-                "bind" => bad
-                    .udp(0, Arc::new(()), || Echo)
-                    .udp(49152, Arc::new(()), || Echo),
+                "bind" => {
+                    bad.udp(0, Arc::new(()), || EchoDatagrams)
+                        .udp(49152, Arc::new(()), || EchoDatagrams)
+                }
                 "port-zero" => bad.tcp(0, Arc::new(()), || Echo),
-                "udp-duplicate" => bad.udp(9, Arc::new(()), || Echo),
+                "udp-duplicate" => bad.udp(9, Arc::new(()), || EchoDatagrams),
                 "tcp-duplicate" => bad
                     .tcp(81, Arc::new(()), || Echo)
                     .tcp(81, Arc::new(()), || Echo),
@@ -180,8 +181,8 @@ fn failed_host_binding_leaves_no_route_service_or_registration() {
                             .ipv4_only()
                             .at(addr)
                             .tcp(80, Arc::new(()), || Echo)
-                            .udp(9, Arc::new(()), || Echo)
-                            .udp(49152, Arc::new(()), || Echo),
+                            .udp(9, Arc::new(()), || EchoDatagrams)
+                            .udp(49152, Arc::new(()), || EchoDatagrams),
                     ),
                     _ => None,
                 })
@@ -217,7 +218,7 @@ fn failed_lan_join_or_missing_tls_names_does_not_commit_services() {
                     .port_server(80, server.clone())
                     .udp(9, Arc::new(()), move || {
                         count.fetch_add(1, Ordering::SeqCst);
-                        Echo
+                        EchoDatagrams
                     });
             let net = if lan {
                 let corp = Lan::new("corp", "192.168.56.0/24".parse()?);
@@ -253,7 +254,7 @@ fn a_second_family_bind_failure_preserves_existing_services() {
                 .at(v6)
                 .ipv6_only()
                 .port_server(80, server.clone())
-                .udp(0, Arc::new(()), || Echo);
+                .udp(0, Arc::new(()), || EchoDatagrams);
             let mut net = Net::new().add_host(first);
             if existing_v4 {
                 net = net.add_host(
@@ -270,14 +271,14 @@ fn a_second_family_bind_failure_preserves_existing_services() {
                 .at(v6)
                 .port_server(80, server.clone())
                 .tcp(81, Arc::new(()), || Echo)
-                .udp(9, Arc::new(()), || Echo)
-                .udp(49152, Arc::new(()), || Echo);
+                .udp(9, Arc::new(()), || EchoDatagrams)
+                .udp(49152, Arc::new(()), || EchoDatagrams);
             let good = Host::new("good")
                 .at(v4)
                 .at(v6)
                 .port_server(80, server.clone())
                 .tcp(81, Arc::new(()), || Echo)
-                .udp(9, Arc::new(()), || Echo);
+                .udp(9, Arc::new(()), || EchoDatagrams);
             let (attacher, attachments) = fictionet::attachments();
             net.resolve(move |name| match name {
                 "bad.test" => Some(bad.clone()),
@@ -510,17 +511,16 @@ fn net_serves_udp_services_and_trusted_sandboxes() {
         let counter = Arc::new(AtomicUsize::new(0));
         /// Counts datagrams.
         struct Udp;
-        service_fixture! {
+        datagram_fixture! {
             Udp => (Lines, AtomicUsize, Infallible);
             decoder(self) {
                 Lines::new(64, Ending::LfOrCrlf)
             }
-            on_item(self, _: Result<Vec<u8>, LineError>; n, driver) -> Flow {
-
+            on_item(self, _: Result<Vec<u8>, LineError>; n, driver) -> DatagramFlow {
                 driver.reply().extend_from_slice(
                     format!("{}\n", n.fetch_add(1, Ordering::SeqCst) + 1).as_bytes(),
                 );
-                Ok(Flow::Continue)
+                Ok(DatagramFlow::Continue)
             }
         }
         let (attacher, attachments) = fictionet::attachments();
@@ -669,8 +669,8 @@ fn net_refuses_a_host_it_cannot_serve() {
         );
         let udp = fail(Net::new().host("c", |h| {
             h.at(Ipv4Addr::new(10, 40, 0, 2))
-                .udp(9, Arc::new(()), || Echo)
-                .udp(9, Arc::new(()), || Echo)
+                .udp(9, Arc::new(()), || EchoDatagrams)
+                .udp(9, Arc::new(()), || EchoDatagrams)
         }));
         assert!(udp.is_some(), "{udp:?}");
         // TLS and plain on one port, in either order. Before, the port
@@ -715,22 +715,22 @@ fn net_refuses_a_host_it_cannot_serve() {
 fn hosts_and_members_share_a_lan_on_the_net() {
     /// Sends `tick` to a multicast group every 20 ms.
     struct Feed;
-    service_fixture! {
+    datagram_fixture! {
         Feed => (Lines, SocketAddr, Infallible);
         decoder(self) {
             Lines::new(64, Ending::LfOrCrlf)
         }
-        on_open(self; _, driver) -> Flow {
-            driver.set_timer((), Duration::from_millis(20));
-            Ok(Flow::Continue)
+        on_open(self; _, cx) -> () {
+            cx.set_timer((), Duration::from_millis(20));
+            Ok(())
         }
-        on_item(self, _: Result<Vec<u8>, LineError>; _, _) -> Flow {
-            Ok(Flow::Continue)
+        on_item(self, _: Result<Vec<u8>, LineError>; _, _) -> DatagramFlow {
+            Ok(DatagramFlow::Continue)
         }
-        on_timer(self, _: (); group, driver) -> Flow {
-            driver.send_to(*group, b"tick".to_vec());
-            driver.set_timer((), Duration::from_millis(20));
-            Ok(Flow::Continue)
+        on_timer(self, _: (); group, cx) -> () {
+            cx.send_to(*group, b"tick".to_vec());
+            cx.set_timer((), Duration::from_millis(20));
+            Ok(())
         }
     }
     crate::common::world::world(Duration::from_secs(60), |fcx| async move {

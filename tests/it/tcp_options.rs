@@ -545,6 +545,7 @@ fn a_service_sees_the_syn_options_in_its_conn_info() {
             seen.clone(),
             || RecordSyn,
             serve::ServeOptions::default(),
+            None,
         );
         raw.send(segment(4000, 1000, 0, SYN, &LINUX_SYN));
         let syn_ack = next(&fcx, &mut raw).await.expect("a SYN-ACK");

@@ -3,14 +3,16 @@
 
 use super::hosts::{Admission, Lookup, pings};
 use super::normalize;
-use fictionet::stdlib::codec::{Collect, CollectError, Decode, Step};
+use fictionet::stdlib::codec::{Collect, Decode, Step};
 use fictionet::stdlib::network::{ConnError, ip, tcp, udp};
 use fictionet::stdlib::protocols::dns::op::{Edns, Message, MessageType, OpCode, ResponseCode};
 use fictionet::stdlib::protocols::dns::rr::{
     DNSClass, RData, Record, RecordType, rdata::A, rdata::AAAA,
 };
 use fictionet::stdlib::services::serve::ConnInfo;
-use fictionet::stdlib::services::serve::{self, ServeOptions, Service};
+use fictionet::stdlib::services::serve::{
+    self, DatagramFlow, DatagramOptions, DatagramService, ServeOptions, Service,
+};
 use fictionet::{Cx, End, Error};
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -120,25 +122,49 @@ fn answer(lookup: &LookupName, bytes: &[u8]) -> Option<Vec<u8>> {
     reply.to_vec().ok()
 }
 
-/// Framing for a DNS query over UDP or TCP.
-struct DnsQueries {
-    tcp: bool,
-    datagram: Collect<Vec<u8>, true>,
+/// The largest DNS message, as its two-byte length prefix over TCP and
+/// a UDP datagram allow.
+const MAX_MESSAGE: usize = 65535;
+
+/// DNS over UDP: one query per datagram, answered to its sender.
+struct DnsUdp;
+
+impl DatagramService for DnsUdp {
+    type Timer = ();
+    type Decoder = Collect<Vec<u8>, true>;
+    type State = State;
+    type Error = core::convert::Infallible;
+
+    fn decoder(&self) -> Collect<Vec<u8>, true> {
+        Collect::bytes(MAX_MESSAGE)
+    }
+
+    fn on_item(
+        &mut self,
+        query: Vec<u8>,
+        state: &State,
+        driver: &mut serve::DatagramDriver<'_, Collect<Vec<u8>, true>, ()>,
+    ) -> Result<DatagramFlow, Self::Error> {
+        if let Some(reply) = answer(&*state.lookup, &query) {
+            driver.reply().extend_from_slice(&reply);
+        }
+        Ok(DatagramFlow::Continue)
+    }
 }
 
-impl Decode for DnsQueries {
+/// Framing for DNS queries over TCP: each after its two-byte length.
+struct TcpQueries;
+
+impl Decode for TcpQueries {
     type Item = Vec<u8>;
-    type Error = CollectError<core::convert::Infallible>;
+    type Error = core::convert::Infallible;
     const NAME: &'static str = "DNS query";
 
     fn capacity(&self) -> usize {
-        65537
+        2 + MAX_MESSAGE
     }
 
-    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Vec<u8>>, Self::Error> {
-        if !self.tcp {
-            return self.datagram.decode(input, eof);
-        }
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Vec<u8>>, Self::Error> {
         let Some(prefix) = input.get(..2) else {
             return Ok(Step::Need);
         };
@@ -150,36 +176,31 @@ impl Decode for DnsQueries {
     }
 }
 
-struct Dns {
-    tcp: bool,
-}
+/// DNS over TCP: queries after their lengths, closed once the client has
+/// been quiet for [`State::tcp_idle`].
+struct DnsTcp;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum QueryTimer {
     Idle,
 }
 
-impl Service for Dns {
+impl Service for DnsTcp {
     type Timer = QueryTimer;
-    type Decoder = DnsQueries;
+    type Decoder = TcpQueries;
     type State = State;
     type Error = core::convert::Infallible;
 
-    fn decoder(&self) -> DnsQueries {
-        DnsQueries {
-            tcp: self.tcp,
-            datagram: Collect::bytes(65535),
-        }
+    fn decoder(&self) -> TcpQueries {
+        TcpQueries
     }
 
     fn on_open(
         &mut self,
         state: &State,
-        driver: &mut serve::Driver<'_, DnsQueries, QueryTimer>,
+        driver: &mut serve::Driver<'_, TcpQueries, QueryTimer>,
     ) -> Result<serve::Flow, Self::Error> {
-        if self.tcp {
-            driver.set_timer(QueryTimer::Idle, state.tcp_idle);
-        }
+        driver.set_timer(QueryTimer::Idle, state.tcp_idle);
         Ok(serve::Flow::Continue)
     }
 
@@ -187,26 +208,23 @@ impl Service for Dns {
         &mut self,
         query: Vec<u8>,
         state: &State,
-        driver: &mut serve::Driver<'_, DnsQueries, QueryTimer>,
+        driver: &mut serve::Driver<'_, TcpQueries, QueryTimer>,
     ) -> Result<serve::Flow, Self::Error> {
-        if let Some(reply) = answer(&*state.lookup, &query) {
-            if self.tcp {
-                if let Ok(n) = u16::try_from(reply.len()) {
-                    driver.reply().extend_from_slice(&n.to_be_bytes());
-                    driver.reply().extend_from_slice(&reply);
-                }
-            } else {
-                driver.reply().extend_from_slice(&reply);
-            }
+        if let Some(reply) = answer(&*state.lookup, &query)
+            && let Ok(n) = u16::try_from(reply.len())
+        {
+            driver.reply().extend_from_slice(&n.to_be_bytes());
+            driver.reply().extend_from_slice(&reply);
         }
-        self.on_open(state, driver)
+        driver.set_timer(QueryTimer::Idle, state.tcp_idle);
+        Ok(serve::Flow::Continue)
     }
 
     fn on_timer(
         &mut self,
         _: QueryTimer,
         _: &State,
-        _: &mut serve::Driver<'_, DnsQueries, QueryTimer>,
+        _: &mut serve::Driver<'_, TcpQueries, QueryTimer>,
     ) -> Result<serve::Flow, Self::Error> {
         Ok(serve::Flow::Close)
     }
@@ -215,19 +233,11 @@ impl Service for Dns {
 /// DNS over UDP on the gateway's port 53.
 async fn dns_udp(fcx: Cx, socket: udp::Socket, context: Context) -> fictionet::Result {
     let local = socket.local_addr();
-    let opts = ServeOptions {
+    let opts = DatagramOptions {
         sandbox: Some(context.admission.sandbox()),
-        ..ServeOptions::default()
+        ..DatagramOptions::default()
     };
-    let _ = serve::datagram(
-        &fcx,
-        socket,
-        local,
-        &mut Dns { tcp: false },
-        &context.state,
-        &opts,
-    )
-    .await;
+    let _ = serve::datagram(&fcx, socket, local, &mut DnsUdp, &context.state, &opts).await;
     Ok(())
 }
 
@@ -267,15 +277,7 @@ async fn dns_conn(fcx: &Cx, conn: tcp::TcpConnection, context: &Context) -> Resu
             .and_then(|sandbox| context.admission.hooks.budget(sandbox.id)),
         ..ServeOptions::default()
     };
-    let _ = serve::connection(
-        fcx,
-        conn,
-        info,
-        &mut Dns { tcp: true },
-        &context.state,
-        &opts,
-    )
-    .await;
+    let _ = serve::connection(fcx, conn, info, &mut DnsTcp, &context.state, &opts).await;
     Ok(())
 }
 
@@ -334,9 +336,9 @@ mod tests {
                     &fcx,
                     socket,
                     "10.0.0.1:53".parse().unwrap(),
-                    &mut Dns { tcp: false },
+                    &mut DnsUdp,
                     &state,
-                    &ServeOptions::default(),
+                    &DatagramOptions::default(),
                 )
                 .await;
                 Ok(())

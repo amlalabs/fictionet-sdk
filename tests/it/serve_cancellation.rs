@@ -60,6 +60,7 @@ fn cancelling_deferred_end_work_keeps_the_world_running() {
                     Arc::new(()),
                     || Svc,
                     serve::ServeOptions::default(),
+                    None,
                 );
                 let mut conn = client.connect(&fcx, "10.0.0.1:7".parse()?).await?;
                 conn.write_all(&fcx, b"bye\n").await?;

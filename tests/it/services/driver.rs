@@ -96,7 +96,7 @@ fn listen_serves_each_connection() {
     crate::common::world::world(Duration::from_secs(60), |fcx| async move {
         let (server, _su, client, _cu) = two_machines(&fcx);
         let opts = ServeOptions::default();
-        serve::listen(&fcx, server.listen(7)?, Arc::new(()), || Echo, opts);
+        serve::listen(&fcx, server.listen(7)?, Arc::new(()), || Echo, opts, None);
         let mut conn = client
             .connect(&fcx, SocketAddr::new(SERVER.into(), 7))
             .await?;
@@ -120,6 +120,7 @@ fn timers_tick_and_idle_connections_close() {
             Arc::new(()),
             || Ticker { ticks: 0 },
             ServeOptions::default(),
+            None,
         );
         let mut conn = client
             .connect(&fcx, SocketAddr::new(SERVER.into(), 1))
@@ -129,7 +130,7 @@ fn timers_tick_and_idle_connections_close() {
         assert!(fcx.now().since_start() - started.since_start() >= Duration::from_millis(90));
 
         let opts = ServeOptions::default().idle(Some(Duration::from_millis(100)));
-        serve::listen(&fcx, server.listen(2)?, Arc::new(()), || Echo, opts);
+        serve::listen(&fcx, server.listen(2)?, Arc::new(()), || Echo, opts, None);
         let mut conn = client
             .connect(&fcx, SocketAddr::new(SERVER.into(), 2))
             .await?;
@@ -191,6 +192,7 @@ fn a_connection_cap_resets_connections_past_it() {
             Arc::new(()),
             || Echo,
             ServeOptions::default().max_conns(2),
+            None,
         );
         let to = SocketAddr::new(SERVER.into(), 7);
         let mut a = client.connect(&fcx, to).await?;
@@ -211,17 +213,17 @@ fn a_connection_cap_resets_connections_past_it() {
 fn datagram_answers_each_datagram() {
     /// Answers a datagram of lines with their count.
     struct Count;
-    service_fixture! {
+    datagram_fixture! {
         Count => (Lines, AtomicUsize, Infallible);
         decoder(self) {
             Lines::new(64, Ending::LfOrCrlf)
         }
-        on_item(self, _: Result<Vec<u8>, LineError>; n, driver) -> Flow {
+        on_item(self, _: Result<Vec<u8>, LineError>; n, driver) -> DatagramFlow {
             let total = n.fetch_add(1, Ordering::SeqCst) + 1;
             driver
                 .reply()
                 .extend_from_slice(format!("{total};").as_bytes());
-            Ok(Flow::Continue)
+            Ok(DatagramFlow::Continue)
         }
     }
     world(Duration::from_secs(60), |fcx| async move {
@@ -235,7 +237,7 @@ fn datagram_answers_each_datagram() {
                 local,
                 &mut Count,
                 &AtomicUsize::new(0),
-                &ServeOptions::default(),
+                &DatagramOptions::default(),
             )
             .await;
             Ok(())
@@ -330,6 +332,7 @@ fn a_decoder_that_skips_a_long_line_keeps_the_connection_open() {
             Arc::new(()),
             || Short,
             ServeOptions::default(),
+            None,
         );
         let mut conn = client
             .connect(&fcx, SocketAddr::new(SERVER.into(), 7))
@@ -433,6 +436,7 @@ fn another_connection_wakes_a_service_to_push_a_fill() {
                 inbox: Arc::default(),
             },
             ServeOptions::default(),
+            None,
         );
         let to = SocketAddr::new(SERVER.into(), 9000);
         let mut a = client.connect(&fcx, to).await?;
@@ -551,6 +555,7 @@ fn continuous_input_cannot_starve_a_timer() {
             Arc::new(()),
             || Session { lines: 0, beats: 0 },
             ServeOptions::default(),
+            None,
         );
         let mut conn = client
             .connect(&fcx, SocketAddr::new(SERVER.into(), 7))
@@ -699,6 +704,7 @@ fn keyed_work_interleaves_two_responses_while_reads_go_on() {
                 baton: shared.clone(),
             },
             ServeOptions::default(),
+            None,
         );
         let mut conn = client
             .connect(&fcx, SocketAddr::new(SERVER.into(), 7))
@@ -723,34 +729,35 @@ fn datagram_services_send_several_datagrams_and_tick() {
     /// MoldUDP64 in miniature: `req N` is answered with N datagrams, and a
     /// heartbeat goes to the world's subscriber every 20 ms.
     struct Mold;
-    service_fixture! {
+    datagram_fixture! {
         Mold => (Lines, SocketAddr, Infallible);
         decoder(self) {
             Lines::new(64, Ending::LfOrCrlf)
         }
-        on_open(self; _, driver) -> Flow {
-            driver.set_timer((), Duration::from_millis(20));
-            Ok(Flow::Continue)
+        on_open(self; _, cx) -> () {
+            cx.set_timer((), Duration::from_millis(20));
+            Ok(())
         }
-        on_item(self, line: Result<Vec<u8>, LineError>; _, driver) -> Flow {
+        on_item(self, line: Result<Vec<u8>, LineError>; _, driver) -> DatagramFlow {
             let line = String::from_utf8(line.unwrap_or_default()).unwrap_or_default();
             let n: u32 = line
                 .strip_prefix("req ")
                 .and_then(|n| n.parse().ok())
                 .unwrap_or(0);
             let to = driver.conn().peer.unwrap();
+            let transport = driver.conn().transport;
             for i in 1..=n {
                 driver.send_to(
                     to,
-                    format!("packet {i} over {}", driver.conn().transport.as_str()).into_bytes(),
+                    format!("packet {i} over {}", transport.as_str()).into_bytes(),
                 );
             }
-            Ok(Flow::Continue)
+            Ok(DatagramFlow::Continue)
         }
-        on_timer(self, _: (); subscriber, driver) -> Flow {
-            driver.send_to(*subscriber, b"heartbeat".to_vec());
-            driver.set_timer((), Duration::from_millis(20));
-            Ok(Flow::Continue)
+        on_timer(self, _: (); subscriber, cx) -> () {
+            cx.send_to(*subscriber, b"heartbeat".to_vec());
+            cx.set_timer((), Duration::from_millis(20));
+            Ok(())
         }
     }
     world(Duration::from_secs(60), |fcx| async move {
@@ -766,7 +773,7 @@ fn datagram_services_send_several_datagrams_and_tick() {
                 local,
                 &mut Mold,
                 &subscriber,
-                &ServeOptions::default(),
+                &DatagramOptions::default(),
             )
             .await;
             Ok(())
@@ -884,6 +891,7 @@ fn a_seeded_run_repeats_its_randomness() {
                     Arc::new(()),
                     || Dice,
                     ServeOptions::default(),
+                    None,
                 );
                 let mut got = Vec::new();
                 for _ in 0..2 {
@@ -919,6 +927,7 @@ fn a_connection_counts_until_its_socket_is_gone() {
             Arc::new(()),
             || Echo,
             ServeOptions::default().max_conns(1),
+            None,
         );
         let to = SocketAddr::new(SERVER.into(), 7);
         let mut a = client.connect(&fcx, to).await?;
@@ -966,6 +975,17 @@ where
 /// `tokio` feature, a connection read through tokio's traits.
 #[test]
 fn every_serving_wait_reports_a_cancel() {
+    /// Answers nothing.
+    struct Quiet;
+    datagram_fixture! {
+        Quiet => (Lines, (), Infallible);
+        decoder(self) {
+            Lines::new(64, Ending::LfOrCrlf)
+        }
+        on_item(self, _: Result<Vec<u8>, LineError>; _, _) -> DatagramFlow {
+            Ok(DatagramFlow::Continue)
+        }
+    }
     world(Duration::from_secs(60), |fcx| async move {
         let (server, server_udp, client, _cu) = two_machines(&fcx);
         let mut listener = server.listen(7)?;
@@ -1032,9 +1052,9 @@ fn every_serving_wait_reports_a_cancel() {
                 &region_fcx,
                 socket,
                 local,
-                &mut Echo,
+                &mut Quiet,
                 &(),
-                &ServeOptions::default(),
+                &DatagramOptions::default(),
             )
             .await
         })
