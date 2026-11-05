@@ -580,6 +580,51 @@ fn the_mirror_places_a_server_at_referral_glue_before_the_reply_leaves() {
     });
 }
 
+/// A server the mirror placed answers ANY as its real server did, here
+/// with every RRset of the name, never with a HINFO of its own.
+#[test]
+fn a_placed_server_answers_any_as_its_real_server_did() {
+    world(Duration::from_secs(60), |fcx| async move {
+        let hierarchy = Hierarchy::new();
+        let at = place();
+        let (attacher, attachments) = fictionet::attachments();
+        let net = Net::new().ipv4_only();
+        let handle = net.handle();
+        let mirror = mirror(hierarchy.clone(), handle.clone());
+        net.hosts(at.root_servers(|s| mirror.server(s)))
+            .start(&fcx, attachments)?;
+        let m = machine(&fcx, attacher.attach("client")?, ME);
+        let ns = v4(45, 33, 5, 53);
+        ask(
+            &fcx,
+            &m,
+            ROOT_SERVERS[0].v4,
+            &query(1, "www.direct.", RecordType::A, false),
+        )
+        .await
+        .expect("a referral");
+        assert!(handle.has_machine(ns));
+
+        let reply = ask(&fcx, &m, ns, &query(2, "direct.", RecordType::ANY, false))
+            .await
+            .expect("an answer from the placed server");
+        assert!(reply.metadata.authoritative);
+        let mut types: Vec<RecordType> = reply
+            .answers
+            .iter()
+            .map(|record| record.record_type())
+            .collect();
+        types.sort();
+        assert_eq!(types, [RecordType::NS, RecordType::SOA]);
+        assert_eq!(
+            hierarchy.asked_for("direct.", RecordType::ANY),
+            vec![ns],
+            "the question asked of the real server"
+        );
+        Ok(())
+    });
+}
+
 /// The mirror knows the names of its name servers, the targets of the NS
 /// RRsets it filed, before an observer sees the filing that named them.
 /// A web name at a name server's address is none of them.

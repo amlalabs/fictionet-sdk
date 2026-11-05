@@ -3,8 +3,10 @@
 //! [`search`] renders search engines; [`sites`] supplies reusable site skins and
 //! their local assets. Neither module performs network requests.
 //! [`models`] serves provider APIs through the standard library's host client.
-//! [`warc`] reads and writes captured pages, and [`dns`] the DNS exchanges
-//! captured beside them.
+//! [`warc`] reads and writes captured pages. [`dns`] keeps the DNS exchanges
+//! captured beside them, and plays the real internet's DNS: copies of the
+//! real servers at their addresses, each learned from what its own server
+//! answered, and the public resolvers.
 //!
 //! ```
 //! use fictionet_extras::{search, sites};

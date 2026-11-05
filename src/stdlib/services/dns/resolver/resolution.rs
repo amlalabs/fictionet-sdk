@@ -1996,9 +1996,24 @@ impl<V: Verify> Resolver<V> {
             .filter(|set| inside(set.name()))
             .map(normalized)
             .collect();
-        let authority: Vec<RecordSet> = rrsets(&message.authorities)
+        let authority = rrsets(&message.authorities);
+        // A forwarder answers the whole question (RFC 1034 §4.3.1), so
+        // its negative answer carries the SOA of the zone that holds the
+        // name, and that zone's denial records, even when its apex lies
+        // above the forward zone (RFC 2308 §2.1). Such an authority
+        // section is bounded by that zone.
+        let bound = authority
             .iter()
-            .filter(|set| inside(set.name()))
+            .filter(|_| exchange.forwarded)
+            .find(|set| {
+                set.record_type() == RecordType::SOA
+                    && set.name().zone_of(&sname)
+                    && set.name().zone_of(&zone)
+            })
+            .map_or_else(|| zone.clone(), |soa| soa.name().to_lowercase());
+        let authority: Vec<RecordSet> = authority
+            .iter()
+            .filter(|set| bound.zone_of(set.name()))
             .map(normalized)
             .collect();
         let additional: Vec<RecordSet> = rrsets(&message.additionals)

@@ -27,16 +27,14 @@
 (*   cached     whether the answer comes from the resolver's cache, with   *)
 (*              the validation an earlier query without CD made            *)
 (*                                                                         *)
-(* The provider (Complete or Lazy) says where the records come from. Both  *)
-(* are the world's own zones: the world signs them over their data, its    *)
-(* edits included, and both publish the same records                       *)
-(* (Lean: lazy_agrees_complete). The signer implementation (A or B)        *)
-(* produces the same records by contract (signer_agnostic). The validator  *)
-(* must see neither the provider nor the implementation. RecordsOnly is    *)
-(* checked by self-composition: two copies of the validator, each with     *)
-(* its own provider and signer, get records of their own, which differ     *)
-(* where the second copy's changed2 makes them differ, and must agree      *)
-(* whenever their records are equal.                                       *)
+(* The world's own zones, complete or lazy, publish the same records       *)
+(* (Lean: lazy_agrees_complete), so where the records come from is not     *)
+(* modelled here. The signer implementation (A or B) produces the same     *)
+(* records by contract (signer_agnostic), and the validator must not see   *)
+(* it. RecordsOnly is checked by self-composition: two copies of the       *)
+(* validator, each with its own signer, get records of their own, which    *)
+(* differ where the second copy's changed2 makes them differ, and must     *)
+(* agree whenever their records are equal.                                 *)
 (*                                                                         *)
 (* Ablation flags: PolicyAlgs is the policy value (adding "sha1" accepts   *)
 (* algorithm 5), TrustUpstreamAd copies an upstream AD bit,                *)
@@ -47,7 +45,7 @@ EXTENDS Naturals, Sequences, FiniteSets, TLC
 
 CONSTANTS
     AnchorChoices, SignerChoices, ProofChoices, WindowChoices, AlgChoices,
-    ChangedChoices, EditedChoices, ClockChoices, ReachChoices, ProviderChoices, ImplChoices,
+    ChangedChoices, EditedChoices, ClockChoices, ReachChoices, ImplChoices,
     PolicyAlgs,        \* the algorithms AlgorithmPolicy.validate admits
     TrustUpstreamAd,   \* ablation: AD from upstream reaches the client
     MissingAsInsecure, \* ablation: a failed fetch is Insecure
@@ -63,11 +61,11 @@ VARIABLES
     anchor, signer, proof, window, alg, changed, edited, clock, reach,
     do, adq, cd, upstreamAd,       \* the query's DO, AD, and CD bits; the upstream reply's AD bit
     cached,                        \* the answer comes from the cache, validated by an earlier query
-    provider1, impl1, provider2, impl2,
+    impl1, impl2,
     changed2                       \* what changed after signing in the second copy's records
 
 vars == <<anchor, signer, proof, window, alg, changed, edited, clock, reach, do, adq, cd,
-          upstreamAd, cached, provider1, impl1, provider2, impl2, changed2>>
+          upstreamAd, cached, impl1, impl2, changed2>>
 
 Init ==
     /\ anchor \in AnchorChoices
@@ -81,18 +79,17 @@ Init ==
     /\ reach \in [Zones -> ReachChoices]
     /\ do \in BOOLEAN /\ adq \in BOOLEAN /\ cd \in BOOLEAN /\ upstreamAd \in BOOLEAN
     /\ cached \in BOOLEAN
-    /\ provider1 \in ProviderChoices /\ impl1 \in ImplChoices
-    /\ provider2 \in ProviderChoices /\ impl2 \in ImplChoices
+    /\ impl1 \in ImplChoices /\ impl2 \in ImplChoices
     /\ changed2 \in [Zones -> ChangedChoices]
 
 Next == UNCHANGED vars
 Spec == Init /\ [][Next]_vars
 
 -----------------------------------------------------------------------------
-(* Published records. Every signer, and both providers, publish the same   *)
-(* records for the same zone data (Lean: lazy_agrees_complete and          *)
-(* signer_agnostic). The faults are what the validator's fetches and       *)
-(* clock see.                                                              *)
+(* Published records. Every signer publishes the same records for the      *)
+(* same zone data (Lean: signer_agnostic), and so do the world's complete  *)
+(* and lazy zones (lazy_agrees_complete). The faults are what the          *)
+(* validator's fetches and clock see.                                      *)
 
 (* Whether z's records, as copy `run` of the validator gets them, changed  *)
 (* after they were signed. The world signs its zones over their edits, so  *)
@@ -233,8 +230,8 @@ Sha1Insecure ==
          /\ (i = 1 \/ (proof[Path[i]] \in {"DsA", "DsB"} /\ reach[Path[i]])))
         => Result.kind = "Insecure"
 
-(* Two validators fed equal records from different providers and signers   *)
-(* reach the same result.                                                 *)
+(* Two validators fed equal records from different signers reach the       *)
+(* same result.                                                            *)
 RecordsOnly ==
     Records(1) = Records(2) => Result = Result2
 
@@ -263,7 +260,7 @@ AllDs(p) == \A c \in Children : proof[c] = p
 \* A zone of the world's own that it edited, signed with the world's key
 \* under the world's anchor, validates Secure: the world signs its edits.
 EditedWorldZoneSecure ==
-    provider1 \in {"Complete", "Lazy"} /\ anchor = "B" /\ AllSignedBy("B") /\ AllDs("DsB")
+    anchor = "B" /\ AllSignedBy("B") /\ AllDs("DsB")
     /\ (\E z \in Zones : edited[z])
     /\ Result.kind = "Secure"
 

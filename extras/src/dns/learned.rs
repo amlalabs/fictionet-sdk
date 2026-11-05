@@ -39,7 +39,11 @@ use fictionet::sync::Mutex;
 ///   gave or stand against a filed NODATA, and which are served only as
 ///   additional data, never as an answer (RFC 2181 §5.4.1): such an RRset
 ///   may be glue below a cut the zone does not hold yet, or sent without
-///   its RRSIGs. One at or below a cut the zone holds, as the addresses
+///   its RRSIGs. Where its records or TTL differ from those of the RRset
+///   an answer gave at its owner, as glue differs from the child zone's
+///   own RRset that a minimal answer gave before the cut was filed, it
+///   is still what the copy sends there as additional data, as the
+///   server did. One at or below a cut the zone holds, as the addresses
 ///   of the root servers lie below `net`, is that cut's glue, and stays
 ///   so when the cut is filed after it. A DNAME is kept, and the CNAME synthesized from it is not
 ///   (RFC 6672 §3.4); a YXDOMAIN gives the DNAME whose new name would pass
@@ -105,7 +109,7 @@ use fictionet::sync::Mutex;
 /// name, a target of the CNAME and DNAME chain from it, or a wildcard
 /// that could answer for one) is present with its RRsets only when the
 /// data holds the fact the question's type needs there: an RRset of that
-/// type from an answer or authority section, a CNAME from one unless the
+/// type from an answer section, a CNAME from one unless the
 /// question asks for NSEC and the name is not known to lack it, or the
 /// type known absent. A wildcard's absent type answers only a question
 /// for the wildcard itself: a name the wildcard answers for needs the
@@ -207,10 +211,15 @@ struct Known {
     /// answer to an NSEC question followed; and NSEC at a cut a referral
     /// answered an NSEC question for.
     absent: BTreeSet<RecordType>,
+    /// The address RRsets the server last sent as additional data here,
+    /// by type.
+    additional: BTreeMap<RecordType, RecordSet>,
     /// A zone cut's NS RRset and glue. Its DS RRset is in `sets`.
     cut: Option<(RecordSet, Vec<RecordSet>)>,
     /// The node `sets` and `cut` make, for views.
     node: Node,
+    /// The node additional data reads ([`Known::for_additional`]).
+    extra: Node,
 }
 
 impl Default for Known {
@@ -218,8 +227,31 @@ impl Default for Known {
         Known {
             sets: BTreeMap::new(),
             absent: BTreeSet::new(),
+            additional: BTreeMap::new(),
             cut: None,
             node: Node::Data(BTreeMap::new()),
+            extra: Node::Data(BTreeMap::new()),
+        }
+    }
+}
+
+impl Known {
+    /// The RRset of `rtype` that the server sends here as additional
+    /// data. A server may hold two RRsets at one name: glue below a cut
+    /// in one zone, and the child zone's own RRset in another
+    /// (RFC 1034 §4.2.1), as the root servers hold the addresses of
+    /// `a.root-servers.net`. A minimal answer from the child does not show
+    /// its zone (RFC 2181 §6.1), so it may be filed here before the cut
+    /// is. So the RRset the server sent as additional data stands for
+    /// additional data where its records or TTL differ from the held
+    /// RRset's. Where they agree, the held RRset, which may carry RRSIGs
+    /// a response left out for room, stands.
+    fn for_additional(&self, rtype: RecordType) -> Option<&RecordSet> {
+        let held = self.sets.get(&rtype).map(|(_, set)| set);
+        match (held, self.additional.get(&rtype)) {
+            (Some(held), Some(sent)) if same_data(held, sent) => Some(held),
+            (_, Some(sent)) => Some(sent),
+            (held, None) => held,
         }
     }
 }
@@ -660,6 +692,7 @@ impl Facts {
                     known.absent.insert(filed.qtype);
                     // Such as additional data filed before.
                     known.sets.remove(&filed.qtype);
+                    known.additional.remove(&filed.qtype);
                     self.rebuild(&end);
                 }
                 self.proofs.insert(
@@ -787,9 +820,11 @@ impl Facts {
                 self.names
                     .range(cut.clone()..)
                     .take_while(|(held, _)| cut.zone_of(held))
-                    .flat_map(|(_, known)| known.sets.values())
-                    .map(|(_, set)| set)
-                    .filter(|set| matches!(set.record_type(), RecordType::A | RecordType::AAAA))
+                    .flat_map(|(_, known)| {
+                        [RecordType::A, RecordType::AAAA]
+                            .into_iter()
+                            .filter_map(|rtype| known.for_additional(rtype))
+                    })
                     .cloned(),
             )
             .collect();
@@ -910,7 +945,9 @@ impl Facts {
 
     /// Keeps `set` at its owner, unless an RRset of the same type is held
     /// from a section that outranks `rank`, or `rank` is the additional
-    /// section's and a filed NODATA says the owner has no such RRset.
+    /// section's and a filed NODATA says the owner has no such RRset. An
+    /// RRset from the additional section is kept as what the server sends
+    /// as additional data there in either case ([`Known::for_additional`]).
     /// Whether it was kept.
     fn put(&mut self, apex: &LowerName, set: RecordSet, rank: Section) -> bool {
         let owner = LowerName::new(set.name());
@@ -918,12 +955,20 @@ impl Facts {
         let known = self.names.entry(owner.clone()).or_default();
         let rtype = set.record_type();
         let replaces = known.sets.get(&rtype).is_none_or(|(held, _)| *held <= rank);
-        let denied = rank == Section::Additional && known.absent.contains(&rtype);
-        if denied || !replaces {
+        let additional = rank == Section::Additional;
+        if additional && known.absent.contains(&rtype) {
             return false;
         }
-        known.sets.insert(rtype, (rank, set));
-        known.absent.remove(&rtype);
+        if additional {
+            known.additional.insert(rtype, set.clone());
+        }
+        if replaces {
+            known.sets.insert(rtype, (rank, set));
+            known.absent.remove(&rtype);
+        }
+        if !replaces && !additional {
+            return false;
+        }
         self.rebuild(&owner);
         true
     }
@@ -989,7 +1034,8 @@ impl Facts {
         let Some(known) = self.names.get_mut(name) else {
             return;
         };
-        known.node = node_of(known);
+        known.node = node_of(known, false);
+        known.extra = node_of(known, true);
     }
 
     /// Whether `name`, below `apex`, or a name above it is absent.
@@ -1169,12 +1215,20 @@ fn at_alias(apex: &LowerName, name: &LowerName, denial: &[RecordSet]) -> bool {
     proof::alias(&name, &zone, denial, u16::MAX) == Proof::Proven
 }
 
-/// The node `known` makes from its cut and its RRsets.
-fn node_of(known: &Known) -> Node {
+/// The node `known` makes from its cut and its RRsets, or, for
+/// `additional` data, from the RRsets the server sends as such
+/// ([`Known::for_additional`]).
+fn node_of(known: &Known, additional: bool) -> Node {
     let mut sets: BTreeMap<RecordType, RecordSet> = known
         .sets
         .iter()
-        .map(|(rtype, (_, set))| (*rtype, set.clone()))
+        .map(|(rtype, (_, set))| {
+            let set = match additional {
+                true => known.for_additional(*rtype).unwrap_or(set),
+                false => set,
+            };
+            (*rtype, set.clone())
+        })
         .collect();
     match &known.cut {
         Some((ns, glue)) => Node::Cut {
@@ -1192,6 +1246,21 @@ fn node_of(known: &Known) -> Node {
 /// Whether `a` and `b` are RRsets of one owner and type.
 fn same_rrset(a: &RecordSet, b: &RecordSet) -> bool {
     a.record_type() == b.record_type() && LowerName::new(a.name()) == LowerName::new(b.name())
+}
+
+/// Whether `a` and `b`, RRsets of one owner and type, hold the same
+/// records with the same TTL, whatever RRSIGs either carries.
+fn same_data(a: &RecordSet, b: &RecordSet) -> bool {
+    let data = |set: &RecordSet| -> Vec<RData> {
+        set.records_without_rrsigs()
+            .map(|record| record.data.clone())
+            .collect()
+    };
+    let (a_data, b_data) = (data(a), data(b));
+    // An RRset holds each record once (RFC 2181 §5).
+    a.ttl() == b.ttl()
+        && a_data.len() == b_data.len()
+        && a_data.iter().all(|record| b_data.contains(record))
 }
 
 /// `set` with `owner` as the owner of every record and RRSIG.
@@ -1287,23 +1356,26 @@ static EMPTY: Node = Node::Empty;
 
 impl LearnedView {
     /// Whether `known` holds the fact an answer of the view's type reads
-    /// at `name`: an RRset of that type from an answer or authority
-    /// section; a CNAME from one, which answers every type
+    /// at `name`: an RRset of that type from an answer section; a CNAME
+    /// from one, which answers every type
     /// (RFC 1034 §3.6.2) but NSEC, whose RRset may sit beside it
     /// (RFC 4035 §2.5), unless the name is known to have none or the
     /// server stopped there for the question's name; or the type known
     /// absent where the chain reaches `name`. A wildcard's absent type is
     /// the proof for the wildcard's own name, which a name it answers for
     /// cannot use (RFC 5155 §7.2.5). Additional data never answers
-    /// (RFC 2181 §5.4.1). ANY and RRSIG are answered from their own
-    /// responses instead.
+    /// (RFC 2181 §5.4.1), and neither does the apex NS RRset another
+    /// answer carried in its authority section: a server fits additional
+    /// data to each response (RFC 2181 §9), so the addresses it sends
+    /// with its NS answer come only in the response to that question.
+    /// ANY and RRSIG are answered from their own responses instead.
     fn knows(&self, name: &LowerName, known: &Known) -> bool {
         let qtype = self.qtype;
         let answers = |rtype: RecordType| {
             known
                 .sets
                 .get(&rtype)
-                .is_some_and(|(rank, _)| *rank > Section::Additional)
+                .is_some_and(|(rank, _)| *rank == Section::Answer)
         };
         let alias = answers(RecordType::CNAME)
             && (qtype != RecordType::NSEC
@@ -1365,10 +1437,10 @@ impl View for LearnedView {
             match &known.node {
                 Node::Cut { .. } => return self.cut(name, known),
                 // A name the answer only passes, or reads addresses at,
-                // never ends it.
-                node if !self.answering.contains(name) || self.knows(name, known) => {
-                    return Fact::Present(node);
-                }
+                // never ends it, and its addresses are those the server
+                // sends as additional data.
+                _ if !self.answering.contains(name) => return Fact::Present(&known.extra),
+                node if self.knows(name, known) => return Fact::Present(node),
                 _ => {}
             }
         }

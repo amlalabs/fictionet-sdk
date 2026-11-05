@@ -1287,6 +1287,45 @@ fn an_apex_ns_answer_keeps_its_addresses_below_a_cut() {
     }
 }
 
+/// A copy answers an NS question at the apex from the response to that
+/// question, not from the NS RRset another response carried in its
+/// authority section. A server leaves out additional data to fit each
+/// response (RFC 2181 §9), so only the NS question's own response carries
+/// the addresses the server sends with that answer.
+#[test]
+fn an_apex_ns_question_is_answered_from_its_own_response() {
+    for (signing, zone) in three_ways(EXAMPLE) {
+        let real = Zones::new(vec![Arc::new(zone) as Arc<dyn ZoneData>]);
+        // The server sends the apex NS RRset in the SOA answer's authority
+        // section, as BIND does, and leaves the addresses out, as a
+        // server short of room does.
+        let answer = |lookup: &Lookup| {
+            let mut reply = reply_of(&real, lookup);
+            if lookup.question.query_type() == RecordType::SOA {
+                let apex = Query::query(name("example."), RecordType::NS);
+                let ns = reply_of(
+                    &real,
+                    &Lookup::new(lookup.server, lookup.zone.clone(), &apex),
+                );
+                reply.authorities.extend(ns.answers);
+                reply.additionals.clear();
+            }
+            reply
+        };
+        let local: SocketAddr = "192.0.2.53:53".parse().unwrap();
+        let copies = Copies::new();
+        copies.serves(local.ip(), &lower("example."));
+        let soa = request("example.", RecordType::SOA, true);
+        through(&copies, &answer, local, &soa);
+        let ns = request("example.", RecordType::NS, true);
+        let want = reply_of(&real, &own(local, &ns));
+        assert!(!additionals(&want).is_empty(), "{signing}");
+        let (got, looked) = through(&copies, &answer, local, &ns);
+        assert_eq!(shape(&got), shape(&want), "{signing}");
+        assert_eq!(looked, vec![own(local, &ns)], "{signing}");
+    }
+}
+
 /// What each address filed belongs to its session. When the session
 /// advances, every address looks its questions up again, a response to a
 /// lookup of the session before files nothing when it comes late, and
@@ -2447,6 +2486,53 @@ root-servers.net. 3600000 IN SOA a.root-servers.net. nstld.verisign-grs.com. 1 1
 root-servers.net. 3600000 IN NS a.root-servers.net.
 a.root-servers.net. 3600000 IN A 198.41.0.4
 ";
+
+/// The root zone with its servers' glue below the cut at `net`, and
+/// `arpa` delegated to a root server.
+const ROOT_WITH_GLUE: &str = "\
+. 86400 IN SOA a.root-servers.net. nstld.verisign-grs.com. 1 1800 900 604800 86400
+. 518400 IN NS a.root-servers.net.
+a.root-servers.net. 518400 IN A 198.41.0.4
+net. 172800 IN NS a.gtld-servers.net.
+a.gtld-servers.net. 172800 IN A 192.5.6.30
+arpa. 172800 IN NS a.root-servers.net.
+";
+
+/// A root letter whose server answers `a.root-servers.net A` minimally,
+/// from `root-servers.net`, with nothing that shows that zone, still
+/// sends the root zone's glue for that name as additional data, as its
+/// server does: with the root's NS RRset and in a referral, whichever
+/// question came first.
+#[test]
+fn a_minimal_answer_from_a_child_keeps_the_parents_additional_data() {
+    for signing in 0..3 {
+        let real = Zones::new(vec![
+            mixed_zone(ROOT_WITH_GLUE, signing),
+            mixed_zone(ROOT_SERVERS_NET, 0),
+        ]);
+        let answer = |lookup: &Lookup| reply_of(&real, lookup);
+        let local: SocketAddr = "170.247.170.2:53".parse().unwrap();
+        let copies = Copies::new();
+        copies.serves(local.ip(), &LowerName::new(&Name::root()));
+        for (qname, qtype) in [
+            (".", RecordType::NS),
+            ("a.root-servers.net.", RecordType::A),
+            (".", RecordType::NS),
+            ("arpa.", RecordType::NS),
+            ("a.root-servers.net.", RecordType::A),
+        ] {
+            for dnssec_ok in [false, true] {
+                let req = request(qname, qtype, dnssec_ok);
+                let got = answer_through(&copies, &answer, local, &req).unwrap();
+                assert_eq!(
+                    shape(&got),
+                    shape(&real_at(&real, local, &req)),
+                    "signing {signing}: {qname} {qtype} DO {dnssec_ok}"
+                );
+            }
+        }
+    }
+}
 
 /// A root letter answers DS at `root-servers.net`'s apex from that zone,
 /// since the zone that holds the cut there is `net`'s, which it does not

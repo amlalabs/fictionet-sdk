@@ -16,7 +16,7 @@ use fictionet::stdlib::network::ip::non_public_address;
 use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RData};
 use fictionet::stdlib::protocols::dns::{Request, dname_substitute};
 use fictionet::stdlib::services::dns::authority::{Authority, ServerConfig, Step};
-use fictionet::stdlib::services::dns::zone::dname_target;
+use fictionet::stdlib::services::dns::zone::{AnyResponse, dname_target};
 use fictionet::stdlib::services::dns::{Client, Generation, Looked, Lookup};
 use fictionet::stdlib::world::net::dns::{Authoritative, Namespace, PerSession, Upstream};
 use fictionet::stdlib::world::net::{Host, NetHandle};
@@ -386,12 +386,21 @@ impl Inner {
             });
             fronts.retain(|(addr, _, _)| !non_public_address(*addr) && placed.fronts.insert(*addr));
         }
+        // A placed server's copies hold the real server's own answer to
+        // ANY, which may be every RRset, a subset, or a made-up HINFO
+        // (RFC 8482 §4), so the server sends every RRset they hold for it.
+        // The copies ask with DO, so a client without DO gets the RRSIGs
+        // too, as BIND sends them for ANY.
+        let config = ServerConfig {
+            any: AnyResponse::All,
+            ..ServerConfig::generic()
+        };
         // The network refuses an address on the sandboxes' subnet or a
         // LAN; such an address stays without a server.
         for (addr, name, _) in servers {
             let host = only_at(&name.to_ascii(), addr)
                 .delay(self.delay)
-                .program(self.server(ServerConfig::generic()));
+                .program(self.server(config.clone()));
             let _ = self.handle.add_host(host);
         }
         for (addr, name, build) in fronts {

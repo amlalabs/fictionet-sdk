@@ -12,7 +12,7 @@ proof of the rule and the counterexample that shows why it is there.
 | `Resolution.tla` | The resolver against zones `.`, `tld`, `sld.tld`, and `alt.tld`, each with one good and one lame server; an address, a CNAME, an empty non-terminal, a missing name, a glued nameserver, a CNAME loop across two zones, and a wildcard; questions of type A and AAAA; queries from a port and with a DNS ID drawn for each, and an off-path attacker forging replies; a rogue server adding a record outside its bailiwick; two clients; a network that loses and truncates; one world edit; TTLs of 1 and 2 | `services/dns/resolver/{mod,cache,resolution,front}.rs` |
 | `Exchanges.tla` | The step contract of `Engine`: tokens with a generation and an exchange identity, matching on the token and the tuple, duplicate, late, and spoofed replies, `Gone`, `Advance`, one resolution shared by two clients | `services/dns/exchange.rs` (`Token`, `Generation`, `Input`, `Action`, `Engine`), kept by `AuthorityEngine` and `Resolver` |
 | `Authority.tla` | `AuthorityEngine` at a root, a TLD, and an edited zone's address: at the root and TLD, a base authority that answers from what lookups filed and returns `Need` for what it does not hold, its lookups going through an `Only` policy to an upstream that delays and fails, each lookup shared by the requests that need it; `Overlay` reading the edited zone's apex NS RRset and its target's addresses and then asking its base for its DS; `Lazy` over a `Provider` whose facts are present, absent, or unknown and change as the world runs | `services/dns/authority/{mod,engine,overlay}.rs`, `services/dns/zone/{data,lazy}.rs`, `world/net/dns/upstream.rs` |
-| `Validation.tla` | The validator on a path root, tld, sld, with the data free per config (signer, parent proof, window, algorithm, changes after signing, the world's edits), clock skew, unreachable zones, the AD/CD rendering, `check_chain`, and two validators with providers, signers, and records of their own | `protocols/dns/dnssec/{validate,policy,proof}.rs`, `services/dns/zone/chain.rs`, `services/dns/resolver/front.rs` |
+| `Validation.tla` | The validator on a path root, tld, sld, with the data free per config (signer, parent proof, window, algorithm, changes after signing, the world's edits), clock skew, unreachable zones, the AD/CD rendering, `check_chain`, and two validators with signers and records of their own | `protocols/dns/dnssec/{validate,policy,proof}.rs`, `services/dns/zone/chain.rs`, `services/dns/resolver/front.rs` |
 
 ## Properties
 
@@ -53,7 +53,7 @@ proof of the rule and the counterexample that shows why it is there.
 | | `BogusServfails` | invariant | Bogus with CD=0 is SERVFAIL |
 | | `CdPassesData` | invariant | with CD=1 the data reaches the client whatever the validation found |
 | | `Sha1Insecure` | invariant | under the default policy a zone whose DS names algorithm 5 or 7 below a validated chain is Insecure, never Secure (RFC 9905 section 2) |
-| | `RecordsOnly` | invariant | two validators, each with its own provider, signer, and records, reach the same result whenever their records are equal |
+| | `RecordsOnly` | invariant | two validators, each with its own signer and records, reach the same result whenever their records are equal |
 | | `CheckChainAgrees` | invariant | a tree `check_chain` passes validates Secure or Insecure everywhere |
 | | `EditedWorldZoneSecure` | reachability | a zone of the world's own that it edited and signed validates Secure under the world's anchor; its `Never...` form must fail |
 | | `EditedUnderRealAnchorBogus`, `InventedUnderOptOutInsecure`, `InventedTldUnderNsecBogus`, `WorldRootAllSecure`, `UnsignedWithIanaAnchorBogus`, `NoAnchorsNotPerformed` | reachability | each scenario happens; its `Never...` form must fail |
@@ -90,7 +90,7 @@ Configs:
   `_unknownasabsent`, `_mixedrevision`, `_reask`, `_parkinview`,
   `_noshare`, `_wakeone`.
 * **Validation:** `_paths`, `_skew`, `_unreachable`, `_policy`,
-  `_providers`, `_witnesses` (every reachability witness, each expected to fail), and
+  `_signers`, `_witnesses` (every reachability witness, each expected to fail), and
   `_edits` (the witness that an edited zone of the world's own can be
   Secure). Ablations: `_trustupstreamad`, `_nopolicy`,
   `_missingasinsecure`, `_signerpeek`.
@@ -175,11 +175,11 @@ in `_concurrent` explores the same states as the invariants there.
 | Authority_parkinview | `NoLockAcrossAsk` | violated | 5 | 3 | 0 s | ReadOverlay, Step: the overlay reads the lazy zone, then parks on its DS lookup while it still holds that read |
 | Authority_noshare | `OneAskPerNeed` | violated | 6 | 3 | 0 s | Step, Step: two requests for www.real at the root server each put a lookup of it |
 | Authority_wakeone | `EveryParkedAnswered` | violated | 210 | stuttering | 0 s | the two requests for www.real at the root server wait on one lookup; when it ends, only the first is woken, and the second stays parked |
-| Validation_paths | the 11 invariants | pass | 497664 | 1 | 1-2 s | |
+| Validation_paths | the 11 invariants | pass | 124416 | 1 | 1-2 s | |
 | Validation_skew | the 11 invariants | pass | 10368 | 1 | 0-1 s | |
 | Validation_unreachable | the 11 invariants | pass | 147456 | 1 | 0-1 s | |
 | Validation_policy | the 11 invariants | pass | 3456 | 1 | 0-1 s | |
-| Validation_providers | the 11 invariants | pass | 262144 | 1 | 1 s | |
+| Validation_signers | the 11 invariants | pass | 65536 | 1 | 0-1 s | |
 | Validation_witnesses | each of the 6 `Never...` forms, alone | violated (reachable) | 1 | 1 | 0-1 s | an initial state of each scenario |
 | Validation_edits | `NeverEditedWorldZoneSecure` | violated (reachable) | 1 | 1 | 1 s | a world zone signed with key B under anchor B, an RRset of it edited and signed again: Secure |
 | Validation_trustupstreamad | `AdOnlySecure` | violated | 1 | 1 | 0 s | no anchors configured (NotPerformed), the upstream reply has AD, the client gets AD |
@@ -385,9 +385,9 @@ Validation:
   validate a fresh answer: it is NotPerformed and gets AD=0. An answer from
   the cache keeps what an earlier query without CD established (`cached`),
   so Secure data can still carry AD, and Bogus data passes with AD=0.
-* Signer implementations, and the world's own providers (Complete and
-  Lazy), publish the same records, by the contract Lean proves
-  (`lazy_agrees_complete`, `signer_agnostic`). The check here is that the
+* Signer implementations publish the same records, and so do the world's
+  complete and lazy zones, by the contracts Lean proves
+  (`signer_agnostic`, `lazy_agrees_complete`). The check here is that the
   validator reads nothing else; `SignerPeek` lets it skip the signature
   check for signer A's records.
 * The world signs its zones over their edits, so an edit (`edited`) is
@@ -397,7 +397,7 @@ Validation:
   `WindowClosed`, `UnsupportedAlgorithm`, and `SignatureInvalid`. A zone
   whose RRset changed after signing (a `Zone::with` after `Zone::signed`)
   has none of the first four, yet validates Bogus; with only those,
-  `CheckChainAgrees` fails in `_providers` on a tree signed with key A
+  `CheckChainAgrees` fails in `_signers` on a tree signed with key A
   whose answer RRset changed after signing. `ChainProblem::SignatureInvalid
   { apex, owner, rtype }` is the fifth, for an RRset with no RRSIG that
   verifies under its zone's keys.
@@ -468,5 +468,5 @@ Validation:
 | result kinds | `Validation::{NotPerformed, Secure, Insecure(Insecure), Bogus(EdeCode), Indeterminate}`; reasons `Insecure::{ProvenNoDs, OptOutCovered, NoAnchor, UnsupportedAlgorithm}` and EDE codes 5, 6, 7, 8, 9, 12 |
 | `Established`, `Rendered` | what `Resolver` established (NotPerformed for a fresh answer under CD) and its front: AD, CD, SERVFAIL |
 | `ChainProblems` | `check_chain -> Vec<ChainProblem>` |
-| `provider1`, `impl1` | `Zone` or `Lazy`; two `Sign` implementations |
+| `impl1`, `impl2` | two `Sign` implementations |
 | `edited`, `Stale` | a world's edit to a zone, which the world signs again; an RRset changed after signing (a `Zone::with` after `Zone::signed`) |

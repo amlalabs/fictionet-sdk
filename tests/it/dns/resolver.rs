@@ -2690,6 +2690,72 @@ fn the_ds_of_a_forward_zone_is_asked_where_its_parent_is() {
     assert_eq!(ds, [ip(ORG)]);
 }
 
+/// A forward zone below its zone's apex gets negative answers that carry
+/// the SOA and denial records of that zone, above the forward zone's
+/// name. They are taken whole (RFC 2308 §2.1): the client sees them, the
+/// negative is cached by them (RFC 2308 §5), and a signed denial
+/// validates (RFC 4035 §5.4), just as when the forward zone is the apex.
+#[test]
+fn a_forward_zone_below_an_apex_takes_the_zone_s_negative_answers() {
+    for signed in [false, true] {
+        let (mut net, anchors) = internet(signed);
+        let mut resolver = resolver(Config {
+            forward: vec![(
+                name("y.example.com."),
+                vec![SocketAddr::new(ip(EXAMPLE_TOO), 53)],
+            )],
+            ..config(anchors)
+        });
+        for (seconds, qname, qtype, rcode) in [
+            (
+                0,
+                "nx.y.example.com.",
+                RecordType::A,
+                ResponseCode::NXDomain,
+            ),
+            (
+                1,
+                "x.y.example.com.",
+                RecordType::TXT,
+                ResponseCode::NoError,
+            ),
+        ] {
+            let reply = ask(
+                &mut resolver,
+                &mut net,
+                seconds,
+                query(client(1), qname, qtype, dnssec_ok),
+            );
+            assert_eq!(reply.metadata.response_code, rcode, "{qname} {signed}");
+            assert_eq!(reply.metadata.authentic_data, signed, "{qname}");
+            assert!(reply.answers.is_empty(), "{qname}");
+            assert_eq!(reply.authorities[0].name, name("example.com."));
+            assert_eq!(reply.authorities[0].record_type(), RecordType::SOA);
+            let denial = reply
+                .authorities
+                .iter()
+                .any(|record| record.record_type() == RecordType::NSEC);
+            assert_eq!(denial, signed, "{qname}");
+
+            let before = net.recording().exchanges().len();
+            let reply = ask(
+                &mut resolver,
+                &mut net,
+                seconds + 2,
+                query(client(1), qname, qtype, dnssec_ok),
+            );
+            assert_eq!(reply.metadata.response_code, rcode, "{qname} {signed}");
+            assert_eq!(reply.metadata.authentic_data, signed, "{qname}");
+            assert_eq!(reply.authorities[0].record_type(), RecordType::SOA);
+            assert_eq!(
+                net.recording().exchanges().len(),
+                before,
+                "{qname} {signed}: answered from the cache"
+            );
+        }
+    }
+}
+
 /// An upstream that validates, playing a zone whose signatures fail: it
 /// answers SERVFAIL to a question without CD, and the data to one with
 /// CD (RFC 4035 §3.2.2).

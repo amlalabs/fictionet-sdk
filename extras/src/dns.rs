@@ -421,15 +421,21 @@ impl Replay {
         let name = &question.name;
         // An authoritative server answers from the deepest zone it serves
         // that holds the name (RFC 1034 §4.3.2 step 2), and DS from the
-        // zone above the name's own (RFC 4035 §3.1.4.1).
+        // zone above the name's own when it serves one, or else from the
+        // name's own (RFC 4035 §3.1.4.1).
         let parents = question.qtype == RecordType::DS && !name.is_root();
         let answering = |address: IpAddr| {
-            self.zones
-                .get(&address)
-                .into_iter()
-                .flatten()
-                .filter(|zone| zone.zone_of(name) && !(parents && *zone == name))
+            let holding = || {
+                self.zones
+                    .get(&address)
+                    .into_iter()
+                    .flatten()
+                    .filter(|zone| zone.zone_of(name))
+            };
+            holding()
+                .filter(|zone| !(parents && *zone == name))
                 .max_by_key(|zone| label_count(zone))
+                .or_else(|| holding().max_by_key(|zone| label_count(zone)))
         };
         // Within a capture the server's own response ranks above any
         // other.
@@ -503,7 +509,7 @@ mod tests {
     };
     use fictionet::stdlib::protocols::dns::op::{Edns, OpCode};
     use fictionet::stdlib::protocols::dns::rr::Record;
-    use fictionet::stdlib::protocols::dns::rr::rdata::{A, NS};
+    use fictionet::stdlib::protocols::dns::rr::rdata::{A, NS, SOA};
     use std::net::Ipv4Addr;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -848,6 +854,98 @@ mod tests {
                     .await,
             );
             assert_eq!(ds.queries[0].query_type(), RecordType::DS);
+        });
+    }
+
+    const NS1: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 53);
+    const NS2: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2)), 53);
+
+    /// `com` at COM refers `example.com` to ns1 and ns2, which serve
+    /// `example.com` alone: they answer its A records, and its DS, which
+    /// they do not have, with a NODATA from `example.com`.
+    struct ChildOnly;
+
+    impl Upstream for ChildOnly {
+        fn lookup<'a>(
+            &'a self,
+            _fcx: &'a Cx,
+            lookup: Lookup,
+        ) -> Pin<Box<dyn Future<Output = Looked> + Send + 'a>> {
+            let mut reply = response_to(&lookup);
+            let qname = lookup.question.name().clone();
+            if lookup.server == COM {
+                for (server, address) in [("ns1.example.com.", NS1), ("ns2.example.com.", NS2)] {
+                    reply.add_authority(Record::from_rdata(
+                        name("example.com."),
+                        172800,
+                        RData::NS(NS(name(server))),
+                    ));
+                    let IpAddr::V4(ip) = address.ip() else {
+                        unreachable!("the servers here have IPv4 addresses")
+                    };
+                    reply.add_additional(Record::from_rdata(name(server), 172800, RData::A(A(ip))));
+                }
+            } else {
+                reply.metadata.authoritative = true;
+                if lookup.question.query_type() == RecordType::A {
+                    reply.add_answer(Record::from_rdata(
+                        qname,
+                        300,
+                        RData::A(A::new(192, 0, 2, 80)),
+                    ));
+                } else {
+                    let soa = SOA::new(
+                        name("ns1.example.com."),
+                        name("hostmaster.example.com."),
+                        1,
+                        7200,
+                        3600,
+                        1_209_600,
+                        300,
+                    );
+                    reply.add_authority(Record::from_rdata(
+                        name("example.com."),
+                        300,
+                        RData::SOA(soa),
+                    ));
+                }
+            }
+            Box::pin(ready(Looked::Response(reply)))
+        }
+    }
+
+    /// A server that serves a zone but not the zone above it answers DS
+    /// at the apex from the zone itself (RFC 4035 §3.1.4.1), so another
+    /// server of that zone's recorded answer stands in for it.
+    #[test]
+    fn a_recorded_ds_at_an_apex_answers_for_the_other_servers_of_the_zone() {
+        let path = archive("child-ds");
+        run(async move |fcx| {
+            let capture = Capture::new(ChildOnly);
+            for lookup in [
+                lookup(COM, "example.com.", RecordType::NS),
+                lookup(NS1, "www.example.com.", RecordType::A),
+                lookup(NS1, "example.com.", RecordType::DS),
+            ] {
+                capture.lookup(&fcx, lookup).await;
+            }
+            capture.write(&path).unwrap();
+            let replay = Replay::open([path.clone()]).unwrap();
+
+            let www = reply(
+                replay
+                    .lookup(&fcx, lookup(NS2, "www.example.com.", RecordType::A))
+                    .await,
+            );
+            assert_eq!(www.answers[0].data, RData::A(A::new(192, 0, 2, 80)));
+            let ds = reply(
+                replay
+                    .lookup(&fcx, lookup(NS2, "example.com.", RecordType::DS))
+                    .await,
+            );
+            assert!(ds.metadata.authoritative && ds.answers.is_empty());
+            assert_eq!(ds.authorities[0].record_type(), RecordType::SOA);
+            assert_eq!(ds.authorities[0].name, name("example.com."));
         });
     }
 
