@@ -35,7 +35,13 @@ const TARGETS: [Target; 2] = [
     },
 ];
 
-pub fn run(directory: &Path) -> Result {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Selection {
+    All,
+    Defaults,
+}
+
+pub fn run(directory: &Path, selection: Selection) -> Result {
     if !fs::read_to_string("/sys/class/dmi/id/sys_vendor")?.contains("QEMU")
         || !Path::new("/run/fictionet-comparison-guest").is_file()
     {
@@ -44,14 +50,16 @@ pub fn run(directory: &Path) -> Result {
     fs::create_dir_all(directory)?;
     // Write proposals first so the reference service's actual configuration
     // is available while the slower packet and OS probes run.
-    for target in &TARGETS {
-        save(directory, target, "ssh", observation(ssh_probe(target)))?;
-        save(
-            directory,
-            target,
-            "ssh-client",
-            observation(ssh_client_probe(directory, target)),
-        )?;
+    if selection == Selection::All {
+        for target in &TARGETS {
+            save(directory, target, "ssh", observation(ssh_probe(target)))?;
+            save(
+                directory,
+                target,
+                "ssh-client",
+                observation(ssh_client_probe(directory, target)),
+            )?;
+        }
     }
     std::thread::scope(|scope| -> Result {
         let idle: Vec<_> = TARGETS
@@ -67,36 +75,38 @@ pub fn run(directory: &Path) -> Result {
                 })
             })
             .collect();
-        for target in &TARGETS {
-            save(directory, target, "raw", observation(raw_probes(target)))?;
-            save(directory, target, "http", observation(http_probe(target)))?;
-            let scan = Command::new("nmap")
-                .args([
-                    "-O",
-                    "-d",
-                    "--packet-trace",
-                    "-sS",
-                    "-Pn",
-                    "-n",
-                    "-p22,80,81",
-                    "--max-os-tries",
-                    "1",
-                    "--host-timeout",
-                    "60s",
-                    "-e",
-                    target.name,
-                ])
-                .arg(target.address.to_string())
-                .output();
-            let scan = match scan {
-                Ok(output) => json!({
-                    "status": output.status.code(),
-                    "stdout": String::from_utf8_lossy(&output.stdout),
-                    "stderr": String::from_utf8_lossy(&output.stderr),
-                }),
-                Err(error) => json!({"error": error.to_string()}),
-            };
-            save(directory, target, "nmap", scan)?;
+        if selection == Selection::All {
+            for target in &TARGETS {
+                save(directory, target, "raw", observation(raw_probes(target)))?;
+                save(directory, target, "http", observation(http_probe(target)))?;
+                let scan = Command::new("nmap")
+                    .args([
+                        "-O",
+                        "-d",
+                        "--packet-trace",
+                        "-sS",
+                        "-Pn",
+                        "-n",
+                        "-p22,80,81",
+                        "--max-os-tries",
+                        "1",
+                        "--host-timeout",
+                        "60s",
+                        "-e",
+                        target.name,
+                    ])
+                    .arg(target.address.to_string())
+                    .output();
+                let scan = match scan {
+                    Ok(output) => json!({
+                        "status": output.status.code(),
+                        "stdout": String::from_utf8_lossy(&output.stdout),
+                        "stderr": String::from_utf8_lossy(&output.stderr),
+                    }),
+                    Err(error) => json!({"error": error.to_string()}),
+                };
+                save(directory, target, "nmap", scan)?;
+            }
         }
         for thread in idle {
             thread

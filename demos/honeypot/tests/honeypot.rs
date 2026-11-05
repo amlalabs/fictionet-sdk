@@ -612,22 +612,22 @@ fn http_closes_after_one_thousand_requests() {
 }
 
 #[test]
-fn http_idle_timeout_is_sixty_five_seconds() {
+fn http_idle_timeout_is_seventy_five_seconds() {
     honeypot(Config::default(), |mut net| async move {
         let mut client = Client::open(&mut net, 80).await;
         client.send(&mut net, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
         client.response(&mut net, false).await;
         let answered = net.fcx.now();
-        net.fcx.sleep(Duration::from_secs(64)).await?;
+        net.fcx.sleep(Duration::from_secs(74)).await?;
         let fin = net
             .fcx
             .race(
-                Some(answered + Duration::from_secs(66)),
+                Some(answered + Duration::from_secs(76)),
                 net.end.recv(&net.fcx),
             )
             .await??;
         assert_eq!(flags(&fin) & 1, 1);
-        assert_eq!(net.fcx.now(), answered + Duration::from_secs(65));
+        assert_eq!(net.fcx.now(), answered + Duration::from_secs(75));
         Ok(())
     });
 }
@@ -638,7 +638,7 @@ fn http_next_request_gets_a_header_deadline_after_idle() {
         let mut client = Client::open(&mut net, 80).await;
         client.send(&mut net, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
         client.response(&mut net, false).await;
-        net.fcx.sleep(Duration::from_secs(64)).await?;
+        net.fcx.sleep(Duration::from_secs(74)).await?;
         client.send(&mut net, b"G");
         net.fcx.sleep(Duration::from_secs(59)).await?;
         client.send(&mut net, b"ET / HTTP/1.1\r\nHost: x\r\n\r\n");
@@ -668,7 +668,7 @@ fn http_chunked_body_does_not_become_the_next_request() {
 #[test]
 fn service_backlogs_start_cookies_at_their_own_limits() {
     honeypot(Config::default(), |mut net| async move {
-        for (port, backlog) in [(22, 128), (80, 511)] {
+        for (port, backlog) in [(22, 4096), (80, 511)] {
             for n in 0..=backlog {
                 let from = client(1, 42000 + n);
                 net.send(segment(
@@ -1583,7 +1583,7 @@ fn dst_of(p: &Packet) -> SocketAddr {
 fn a_spoofed_syn_flood_leaves_room_for_the_real_attacker() {
     honeypot(Config::default(), |mut net| async move {
         let spoofed = |n: u32| SocketAddr::new(IpAddr::V4(Ipv4Addr::from(0x0b00_0000 + n)), 50000);
-        for n in 0..4096 {
+        for n in 0..4097 {
             net.send(segment(
                 spoofed(n),
                 server(22),
@@ -1669,7 +1669,7 @@ fn a_spoofed_syn_flood_leaves_room_for_the_real_attacker() {
             seen.push(p?);
         }
         assert!(seen.iter().all(|p| flags(p) & RST == 0), "no RST");
-        for (n, expected) in [(0, 6), (127, 6), (128, 1), (4095, 1)] {
+        for (n, expected) in [(0, 6), (127, 6), (128, 6), (4095, 6), (4096, 1)] {
             let syn_acks = seen.iter().filter(|p| dst_of(p) == spoofed(n)).count();
             assert_eq!(syn_acks, expected, "SYN-ACKs to spoofed source {n}");
         }

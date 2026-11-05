@@ -62,7 +62,7 @@ target. Both the configuration dump and timed observation are retained.
 
 ## After changes
 
-The final run used the modified honeypot after the transport, service and
+The full run used the modified honeypot after the transport, service and
 1,000 Hz identification-clock changes. Both targets returned one correlated
 reply for every one of the fourteen fixed packet probes, plus the repeated
 established-connection SYN. Unrelated packets were recorded separately.
@@ -74,6 +74,8 @@ Evidence is in `logs/honeypot-diff/final/`: `reference-raw.json` and
 the `*-nmap.json` files include packet traces; `*-ssh.json` holds the raw
 KEXINIT and its decoded lists; `*-ssh-client.stderr.log` holds OpenSSH's trace;
 `*-http.json` and `*-http-idle.json` hold the HTTP exchanges and timing.
+The idle-close and backlog rows below use the later targeted checks described
+below; the other rows retain the full run's observations.
 
 | Probe | Ubuntu reply | Modified honeypot reply | Same or different |
 | --- | --- | --- | --- |
@@ -98,17 +100,39 @@ KEXINIT and its decoded lists; `*-ssh-client.stderr.log` holds OpenSSH's trace;
 | Real OpenSSH client | Receives KEXINIT, selects sntrup761x25519/ssh-ed25519/chacha20-poly1305, completes key exchange, then authentication is denied | Receives KEXINIT and selects the same algorithms; waits for `SSH2_MSG_KEX_ECDH_REPLY` until the 5-second observation ends | Same initial proposal; different subsequent exchange |
 | HTTP/1.1 `GET /`, then `GET /missing` on one connection | 200 with 615-byte body, then 404 with 162-byte body; keep-alive | Same statuses, byte-identical bodies and connection reuse | Same behavior |
 | HTTP response headers | nginx banner, Last-Modified, ETag and Accept-Ranges on `/` | Same header names/order and formatting; wall-clock/file-age values differ | Same structure; different Date/Last-Modified/ETag values |
-| Idle after HTTP response | EOF after 74672 ms | EOF after 64998 ms | Different: approximately 75 versus 65 seconds |
+| Idle after HTTP response | EOF after 75005 ms | EOF after 74995 ms | Same approximately 75-second timeout; measured times differ by 10 ms |
+| SSH listener backlog (guest inspection; honeypot packet test) | `ss` Send-Q 4096, owned by systemd | 4096 pending stateful handshakes; next SYN receives a cookie | Same configured limit; external saturation not compared |
+| HTTP listener backlog (guest inspection; honeypot packet test) | `ss` Send-Q 511, owned by nginx | 511 pending stateful handshakes; next SYN receives a cookie | Same configured limit; external saturation not compared |
 
-The final Nmap label is a classifier result, not the running kernel version;
+The full run's Nmap label is a classifier result, not the running kernel version;
 the guest's `uname` still reported 6.8.0-147. These probes do not establish
 general OS indistinguishability or validate IPv6, retransmission behavior,
 receive-window growth under traffic, or HTTP ranges and malformed requests.
 
-Guest listener inspection (`listeners.txt` and `ssh-socket.txt`) showed nginx
-backlog 511 and SSH backlog 4096 owned by systemd's socket unit. The requested
-SSH backlog 128 and HTTP idle timeout 65 were retained; the reference's defaults
-were not changed to make the comparison agree. External backlog saturation was
-not measured. The remaining packet discrepancy is the established receive
-window; MP_CAPABLE negotiation and the SSH exchange after KEXINIT also remain
-different in the probes above.
+## Stock service defaults
+
+The targeted rerun used `cargo xtask honeypot-diff defaults stock-defaults`
+after changing the honeypot's HTTP idle timeout to 75 seconds and SSH backlog
+to 4096. HTTP backlog remains 511. Its evidence is retained under
+`logs/honeypot-diff/stock-defaults/`. The freshly prepared guest reported the
+same kernel and package versions listed above. Only HTTP idle-close probes
+and guest configuration inspection ran; unrelated network probes were not
+repeated.
+
+Both `*-http-idle.json` records report EOF without an error or extra bytes.
+The nginx configuration has no keepalive-timeout or listen-backlog override;
+75 seconds and 511 are nginx's built-in defaults for
+[keepalive_timeout](https://nginx.org/en/docs/http/ngx_http_core_module.html#keepalive_timeout)
+and Linux [listen](https://nginx.org/en/docs/http/ngx_http_core_module.html#listen).
+The refreshed `listeners.txt` confirms the backlogs on both IPv4 and IPv6.
+`ssh-socket.txt` records systemd's `ssh.socket`, its effective
+`Backlog=2147483647`, and the guest kernel's `net.core.somaxconn=4096`, which
+caps the listener backlog.
+
+The focused honeypot packet tests passed at both backlog boundaries, including
+the first cookie beyond each limit and successful cookie handshakes under a
+full SSH backlog. The idle test checks closure at exactly 75 seconds, and a
+request started after 74 seconds still receives its own header deadline.
+These tests verify the honeypot's behavior; external backlog saturation against
+Ubuntu was not measured. The established receive window, MP_CAPABLE negotiation
+and SSH exchange after KEXINIT remain different in the earlier probes above.

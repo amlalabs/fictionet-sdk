@@ -26,14 +26,14 @@ from `0.0.0.0/0` and `::/0` unless `--internet` narrows one of them.
   120 seconds pass, as sshd's `LoginGraceTime` does. No keepalives: on
   Linux sshd's first comes after two hours idle, so a client sees none.
 - **HTTP** (`--http`, 80 by default): nginx's default page, with HTTP/1.1
-  connection reuse for up to 1,000 requests and 65 seconds between requests.
+  connection reuse for up to 1,000 requests and 75 seconds between requests.
   TCP keepalives remain disabled, as in nginx.
 
 The transport profile targets Ubuntu 24.04's Linux 6.8 kernel. The measured
 comparison and remaining differences are in [DIFF.md](DIFF.md).
-The requested 65-second HTTP timeout and 128-entry SSH backlog are explicit
-profile choices: the updated reference guest measured 75 seconds and an SSH
-socket owned by systemd with backlog 4,096. nginx's backlog was 511.
+The HTTP idle timeout follows nginx's built-in default. Listener backlogs match
+the updated reference guest: 4,096 for systemd's `ssh.socket`, capped by the
+kernel's `net.core.somaxconn`, and nginx's built-in Linux default of 511.
 
 The MPTCP listener follows RFC 8684, and reads MPTCP options as Linux does:
 an option Linux ignores counts for nothing, and of several that count the
@@ -160,7 +160,7 @@ to 63 seconds, the listener's handshake timeout, and an MPTCP token only while
 its connection is open. Burst, answer and probe state expires even when traffic is
 quiet, so a flood from spoofed addresses leaves no permanent state.
 
-Spoofed SYNs cannot shut real attackers out either. SSH holds 128 pending
+Spoofed SYNs cannot shut real attackers out either. SSH holds 4,096 pending
 handshakes and HTTP holds 511. Past that, the server answers with SYN cookies and
 keeps nothing until the ACK that returns one. A handshake whose last ACK never
 comes gets six SYN-ACKs, at 0, 1, 3, 7, 15 and 31 seconds, and is dropped at 63
@@ -214,6 +214,12 @@ seeds and results stay under the ignored `target/honeypot-diff` directory.
 Prepared disks are reused; remove that directory to provision fresh updates.
 Each run requires a new name so observations cannot be overwritten. An optional
 third argument selects a previously built honeypot binary for baseline runs.
+
+Use `cargo xtask honeypot-diff defaults NAME [HONEYPOT_BINARY]` in the same
+systemd scope to repeat only the HTTP idle-close probes and guest configuration
+inspection, including listener backlogs. This omits SSH, raw packet and Nmap
+probes. The honeypot's exact backlog boundaries are covered by
+`service_backlogs_start_cookies_at_their_own_limits` in its integration tests.
 
 The result directory is `target/honeypot-diff/share/comparison`. It holds
 the guest kernel and package versions, sshd/nginx configurations, wire bytes

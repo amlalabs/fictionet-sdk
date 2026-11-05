@@ -1,6 +1,6 @@
 //! Ubuntu comparison over QEMU userspace Ethernet links.
 
-use crate::Result;
+use crate::{Result, honeypot_probe::Selection};
 use fictionet::relay::{self, Hello, Message, unix};
 use fictionet::stdlib::network::ethernet::frame::{self, Frame};
 use std::fs::{self, File};
@@ -59,7 +59,11 @@ pub async fn run(args: &[String]) -> Result {
     let root = root.canonicalize()?;
     match args.first().map(String::as_str) {
         Some("prepare") if args.len() == 1 => prepare(&root).await,
-        Some("run") if (2..=3).contains(&args.len()) => {
+        Some(mode @ ("run" | "defaults")) if (2..=3).contains(&args.len()) => {
+            let selection = match mode {
+                "defaults" => Selection::Defaults,
+                _ => Selection::All,
+            };
             let label = &args[1];
             if label.is_empty()
                 || !label
@@ -72,9 +76,9 @@ pub async fn run(args: &[String]) -> Result {
                 .get(2)
                 .map(PathBuf::from)
                 .unwrap_or_else(|| root.parent().unwrap().join("debug/honeypot"));
-            compare(&root, label, &binary.canonicalize()?)
+            compare(&root, label, &binary.canonicalize()?, selection)
         }
-        _ => Err("usage: cargo xtask honeypot-diff prepare | run NAME [HONEYPOT_BINARY]".into()),
+        _ => Err("usage: cargo xtask honeypot-diff prepare | run NAME [HONEYPOT_BINARY] | defaults NAME [HONEYPOT_BINARY]".into()),
     }
 }
 
@@ -327,7 +331,7 @@ fn guest_executable(root: &Path) -> Result {
     Ok(())
 }
 
-fn compare(root: &Path, label: &str, binary: &Path) -> Result {
+fn compare(root: &Path, label: &str, binary: &Path, selection: Selection) -> Result {
     for name in ["ubuntu", "probe"] {
         if !root.join("share").join(format!("{name}-prepared")).exists() {
             return Err("run cargo xtask honeypot-diff prepare first".into());
@@ -402,7 +406,7 @@ fn compare(root: &Path, label: &str, binary: &Path) -> Result {
     commands.push(command(&[
         "sh",
         "-ec",
-        &format!("cat /boot/config-$(uname -r) > {guest_result}/ubuntu-kernel-config.txt; ss -ltnp > {guest_result}/listeners.txt; systemctl cat ssh.socket > {guest_result}/ssh-socket.txt"),
+        &format!("cat /boot/config-$(uname -r) > {guest_result}/ubuntu-kernel-config.txt; ss -ltnp > {guest_result}/listeners.txt; {{ systemctl cat ssh.socket; systemctl show ssh.socket -p Backlog; printf 'net.core.somaxconn='; cat /proc/sys/net/core/somaxconn; }} > {guest_result}/ssh-socket.txt"),
     ]));
     commands.push(command(&["sh", "-ec", &format!(
         "uname -r > {guest_result}/ubuntu-kernel.txt; case $(uname -r) in 6.8.*) ;; *) exit 1;; esac; printf '1\\n' > /proc/sys/net/mptcp/enabled; cat /proc/sys/net/mptcp/enabled > {guest_result}/mptcp-enabled.txt; /usr/sbin/sshd -T > {guest_result}/sshd-config.txt; nginx -T > {guest_result}/nginx-config.txt 2>&1; dpkg-query -W linux-generic openssh-server nginx > {guest_result}/ubuntu-packages.txt; touch {guest_result}/ubuntu-ready"
@@ -430,8 +434,12 @@ fn compare(root: &Path, label: &str, binary: &Path) -> Result {
     }
     let mut commands = mount_commands();
     commands.push(command(&["touch", "/run/fictionet-comparison-guest"]));
+    let selection_arg = match selection {
+        Selection::All => "",
+        Selection::Defaults => " --defaults",
+    };
     commands.push(command(&["sh", "-c", &format!(
-        "/mnt/comparison/lib/ld-linux-x86-64.so.2 --library-path /mnt/comparison/lib /mnt/comparison/xtask honeypot-probe {guest_result} > {guest_result}/probe.log 2>&1; echo $? > {guest_result}/probe-status; poweroff"
+        "/mnt/comparison/lib/ld-linux-x86-64.so.2 --library-path /mnt/comparison/lib /mnt/comparison/xtask honeypot-probe {guest_result}{selection_arg} > {guest_result}/probe.log 2>&1; echo $? > {guest_result}/probe-status; poweroff"
     )]));
     let iso = seed(root, &format!("{label}-probe"), true, true, commands)?;
     let disk = root.join(format!("{label}-probe.qcow2"));

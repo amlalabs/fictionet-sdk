@@ -32,8 +32,8 @@ pub const HEADER_TIMEOUT: Duration = Duration::from_secs(60);
 /// nginx permits several large header buffers; this service caps the total.
 pub const HEADER_LIMIT: usize = 8 * 1024;
 
-/// Idle time between requests on a persistent connection.
-pub const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(65);
+/// nginx's built-in keepalive timeout, unchanged by Ubuntu 24.04's configuration.
+pub const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(75);
 
 /// nginx's maximum number of requests on one connection.
 pub const KEEPALIVE_REQUESTS: usize = 1000;
@@ -231,7 +231,9 @@ impl PortServer for Ssh {
     }
 
     fn backlog(&self) -> Option<usize> {
-        Some(128)
+        // Ubuntu 24.04's systemd ssh.socket owns the listener; the kernel's
+        // net.core.somaxconn caps its backlog at 4096, as measured with ss.
+        Some(4096)
     }
 }
 
@@ -341,6 +343,7 @@ impl PortServer for Http {
     }
 
     fn backlog(&self) -> Option<usize> {
+        // nginx's built-in listen backlog on Linux, unchanged by Ubuntu 24.04.
         Some(511)
     }
 }

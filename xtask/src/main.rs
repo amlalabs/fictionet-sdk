@@ -24,10 +24,15 @@ async fn main() -> Result {
     }
     if task == "honeypot-probe" {
         let directory = PathBuf::from(args.next().ok_or("missing probe output directory")?);
+        let selection = match args.next().as_deref() {
+            None => honeypot_probe::Selection::All,
+            Some("--defaults") => honeypot_probe::Selection::Defaults,
+            _ => return Err("expected --defaults".into()),
+        };
         if args.next().is_some() {
             return Err("unexpected probe argument".into());
         }
-        return honeypot_probe::run(&directory);
+        return honeypot_probe::run(&directory, selection);
     }
     if task == "mptcp-verify" {
         return mptcp_verify::run(&args.collect::<Vec<_>>());
