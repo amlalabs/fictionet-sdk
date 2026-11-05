@@ -1656,8 +1656,8 @@ mod tests {
         }
     }
 
-    // RFC 764 pairs can span DATA blocks. The shared contract exercises
-    // splits and EOF, including a final CR.
+    // RFC 764 pairs can span DATA blocks. Chunked decoding checks splits
+    // and EOF, including a final CR.
     #[test]
     fn netascii_across_blocks() {
         use fictionet::stdlib::test_support::decode_all;

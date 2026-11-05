@@ -18,8 +18,6 @@ extern crate alloc;
 use alloc::vec::Vec;
 use fictionet::stdlib::codec::{Decode, Fail, Lcg, Stream, finish, pump};
 
-pub mod contract;
-
 mod decode;
 pub use decode::decode_chunks;
 mod wire;

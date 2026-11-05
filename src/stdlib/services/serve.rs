@@ -2729,7 +2729,7 @@ impl Wake for Flag {
 }
 
 /// Runs a service with no I/O and no runtime: push the client's bytes,
-/// get the reply. For unit tests, fuzz targets and contract checks. It
+/// get the reply. For unit tests and fuzz targets. It
 /// runs the same state machine as [`connection`], so timers, wakes, deferred
 /// work, upgrades and ends behave as they do over a connection. The clock
 /// stands still until [`advance`](Self::advance) moves it, unless bound

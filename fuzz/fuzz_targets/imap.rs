@@ -33,29 +33,53 @@ fn refusals(choices: &[u8]) -> impl Decode<Item = Result<Input, Error>, Error = 
 
 fuzz_target!(|data: &[u8]| {
     let commands = decode_all(Inputs::new, data);
-    assert_eq!(decode_chunks(&mut Stream::new(Inputs::new()), chunks(data, &[1, 7, 64]), |s| {
-        assert!(s.held() <= MAX_HELD);
-        assert!(s.allocated() <= 2 * MAX_LINE);
-    }), commands);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Inputs::new()),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.held() <= MAX_HELD);
+                assert!(s.allocated() <= 2 * MAX_LINE);
+            }
+        ),
+        commands
+    );
     let responses = decode_all(Responses::new, data);
-    assert_eq!(decode_chunks(&mut Stream::new(Responses::new()), chunks(data, &[1, 7, 64]), |s| {
-        assert!(s.held() <= MAX_HELD);
-        assert!(s.allocated() <= 2 * MAX_LINE);
-    }), responses);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Responses::new()),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.held() <= MAX_HELD);
+                assert!(s.allocated() <= 2 * MAX_LINE);
+            }
+        ),
+        responses
+    );
     let raw = || {
         let mut commands = Inputs::new();
         commands.expect_line().unwrap();
         commands
     };
-    assert_eq!(decode_chunks(&mut Stream::new(raw()), chunks(data, &[1]), |s| {
-        assert!(s.held() <= MAX_HELD);
-        assert!(s.allocated() <= 2 * MAX_LINE);
-    }), decode_all(raw, data));
+    assert_eq!(
+        decode_chunks(&mut Stream::new(raw()), chunks(data, &[1]), |s| {
+            assert!(s.held() <= MAX_HELD);
+            assert!(s.allocated() <= 2 * MAX_LINE);
+        }),
+        decode_all(raw, data)
+    );
     let choices = data.get(..8).unwrap_or(data);
-    assert_eq!(decode_chunks(&mut Stream::new(refusals(choices)), chunks(data, &[1]), |s| {
-        assert!(s.held() <= MAX_HELD);
-        assert!(s.allocated() <= 2 * MAX_LINE);
-    }), decode_all(|| refusals(choices), data));
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(refusals(choices)),
+            chunks(data, &[1]),
+            |s| {
+                assert!(s.held() <= MAX_HELD);
+                assert!(s.allocated() <= 2 * MAX_LINE);
+            }
+        ),
+        decode_all(|| refusals(choices), data)
+    );
     if let Ok(command) = Command::parse(data) {
         let _ = assert_write(&command);
     }
@@ -64,7 +88,9 @@ fuzz_target!(|data: &[u8]| {
     }
     for item in commands.0 {
         if let Ok(Input::Command(command)) = item {
-            let Ok(bytes) = assert_write(&command) else { continue };
+            let Ok(bytes) = assert_write(&command) else {
+                continue;
+            };
             let offsets = Command::continuation_offsets(&bytes).unwrap();
             assert!(offsets.windows(2).all(|w| w[0] < w[1]));
             assert!(offsets.iter().all(|&at| at <= bytes.len()));

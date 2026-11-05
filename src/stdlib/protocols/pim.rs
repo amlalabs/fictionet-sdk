@@ -2847,7 +2847,7 @@ mod tests {
         }
     }
 
-    /// Checks parsing against bounded collection under the chunk contract.
+    /// Checks parsing against bounded collection decoded in chunks.
     /// Whatever parses, except a C-RP-Adv with no groups, writes back to
     /// bytes that read the same.
     fn check_bytes(data: &[u8], e: &Endpoints) {

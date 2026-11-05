@@ -1963,7 +1963,7 @@ mod tests {
             }
             check(&r);
 
-            // A stream of tokens, with chunking checked by the contract.
+            // A stream of tokens, decoded in chunks and whole.
             let mut stream = Vec::new();
             for _ in 0..rng.index(4) {
                 stream.extend_from_slice(&make_token(&mut rng).to_bytes().unwrap());

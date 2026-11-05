@@ -38,7 +38,7 @@ fuzz_target!(|data: &[u8]| {
         Err(_) => assert!(handle.len() > MAX_FH || name.len() > MAX_NAME),
     }
 
-    // The bytes as a TCP stream of calls, across the contract partitions.
+    // The bytes as a TCP stream of calls, decoded in chunks and whole.
     let limit = 1 << 16;
     assert_eq!(
         decode_chunks(
