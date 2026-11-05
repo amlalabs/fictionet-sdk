@@ -2944,9 +2944,10 @@ mod tests {
     use super::harness::no_longer;
     use super::*;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream};
-    use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::rounds;
-    use fictionet::stdlib::test_support::{decode_all, mutate};
+    use fictionet::stdlib::test_support::{
+        assert_write, chunks, decode_all, decode_chunks, mutate,
+    };
 
     fn request_body(req: &Request) -> Result<Vec<u8>, Error> {
         req.message(0).map(|m| m.body)
@@ -4260,7 +4261,14 @@ mod tests {
             Frame::from_packet(&second).unwrap().to_bytes().unwrap(),
         ]
         .concat();
-        contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &bytes, 2 * MAX_FRAME);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Frame>::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_FRAME)
+            ),
+            decode_all(Frames::<Frame>::new, &bytes)
+        );
         let (frames, error) = decode_all(Frames::<Frame>::new, &bytes);
         assert_eq!(error, None);
         assert_eq!(
@@ -5547,7 +5555,9 @@ mod tests {
                 payload[at] = rng.index(130) as u8;
             }
             mutate(&mut rng, &mut payload);
-            contract::check_wire::<Packet>(&payload);
+            if let Ok(value) = Packet::parse(&payload) {
+                assert_write(&value).unwrap();
+            }
             let status = [
                 0,
                 status::BUFFER_OVERFLOW,
@@ -5578,7 +5588,14 @@ mod tests {
                 .unwrap();
             }
             mutate(&mut rng, &mut stream);
-            contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &stream, 2 * MAX_FRAME);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Frames::<Frame>::new()),
+                    chunks(&stream, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_FRAME)
+                ),
+                decode_all(Frames::<Frame>::new, &stream)
+            );
             for frame in decode_all(Frames::<Frame>::new, &stream).0 {
                 read_everything(&frame.payload, status);
             }

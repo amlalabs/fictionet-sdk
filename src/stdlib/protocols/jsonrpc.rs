@@ -1163,7 +1163,7 @@ impl Decode for Messages {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::assert_write;
     use fictionet::stdlib::test_support::decode_all;
     use fictionet::stdlib::test_support::rounds;
 
@@ -1185,7 +1185,7 @@ mod tests {
     }
     fn assert_value(message: Message, expected: &str) {
         assert_eq!(message.to_value().unwrap(), value(expected));
-        contract::check_wire_value(&message);
+        let _ = assert_write(&message);
     }
 
     // A tiny test dispatcher exercises the specification examples, including
@@ -1251,7 +1251,7 @@ mod tests {
             "{input}"
         );
         if let Some(body) = actual {
-            contract::check_wire_value(&body);
+            let _ = assert_write(&body);
         }
     }
 
@@ -1352,8 +1352,8 @@ mod tests {
                 reply.outcome().unwrap(),
                 Outcome::Result(value(r#"{"z":1.0,"a":-0}"#))
             );
-            contract::check_wire_value(&Message::Request(req));
-            contract::check_wire_value(&Message::Response(reply));
+            let _ = assert_write(&Message::Request(req));
+            let _ = assert_write(&Message::Response(reply));
         }
         let input = r#"{"x":-0,"result":{"z":1e400,"a":1.0},"jsonrpc":"2.0","id":-0,"x":1.0}"#;
         let mut edited = message(input);
@@ -1374,7 +1374,7 @@ mod tests {
         let response = Response::with_error(Id::Null, error.clone());
         assert_eq!(response.outcome().unwrap(), Outcome::Error(error.clone()));
         assert_eq!(error.to_value().unwrap(), error.value);
-        contract::check_wire_value(&Message::Response(response));
+        let _ = assert_write(&Message::Response(response));
     }
 
     #[test]
@@ -1659,7 +1659,7 @@ mod tests {
         ] {
             let mut bad = good.clone();
             set(bad.value_mut(), key, replacement);
-            contract::check_wire_value(&bad);
+            let _ = assert_write(&bad);
             let mut out = b"prefix".to_vec();
             assert!(matches!(bad.write(&mut out), Err(e) if e.kind != ErrorKind::Allocation));
             assert!(matches!(
@@ -1672,7 +1672,7 @@ mod tests {
         let bad = Message::Request(Request {
             value: good.value().clone(),
         });
-        contract::check_wire_value(&bad);
+        let _ = assert_write(&bad);
         assert!(bad.to_bytes().is_err());
         for batch in [
             Batch { messages: vec![] },
@@ -1680,9 +1680,9 @@ mod tests {
                 messages: vec![bad],
             },
         ] {
-            contract::check_wire_value(&batch);
+            let _ = assert_write(&batch);
             assert!(batch.to_value().is_err());
-            contract::check_wire_value(&Body::Batch(batch));
+            let _ = assert_write(&Body::Batch(batch));
         }
         let mut deep = Value::Null;
         for _ in 0..json::MAX_DEPTH {
@@ -1774,7 +1774,7 @@ mod tests {
                 Value::from("x".repeat(json::MAX_SIZE - overhead + 1)),
             );
         }
-        contract::check_wire_value(&batch);
+        let _ = assert_write(&batch);
         assert!(batch.to_bytes().is_err());
 
         let many = Message::Response(Response::success(
@@ -1818,7 +1818,7 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":null,"result":1,"id":2}"#,
         ] {
             let message = Message::Response(Response { value: value(text) });
-            contract::check_wire_value(&message);
+            let _ = assert_write(&message);
             let mut out = vec![42];
             assert!(message.write_line(&mut out).is_err());
             assert_eq!(out, [42]);
@@ -1827,7 +1827,7 @@ mod tests {
             value: value(r#"{"jsonrpc":"2.0","method":"x","params":1,"id":null}"#),
         });
         assert!(invalid.to_bytes().is_err());
-        contract::check_wire_value(&invalid);
+        let _ = assert_write(&invalid);
         assert!(
             Params::Array(vec![Value::Null; json::MAX_ELEMENTS])
                 .to_value()
@@ -1910,7 +1910,7 @@ mod tests {
             let mut out = vec![42];
             assert!(reply.write_line(&mut out).is_err());
             assert_eq!(out, [42]);
-            contract::check_wire_value(&reply);
+            let _ = assert_write(&reply);
         }
         assert!(dispatch(Ok(Message::Request(request))).is_none());
         assert!(
@@ -1935,11 +1935,11 @@ mod tests {
             request.error(INTERNAL_ERROR, "Internal error").unwrap(),
         ] {
             assert_eq!(reply.id().unwrap(), id);
-            contract::check_wire_value(&Message::Response(reply));
+            let _ = assert_write(&Message::Response(reply));
         }
         // Accessors do not relax strict conversion or writing.
         assert!(request.to_value().is_err());
-        contract::check_wire_value(&Message::Request(request.clone()));
+        let _ = assert_write(&Message::Request(request.clone()));
         set(&mut request.value, "method", Value::Null);
         assert_eq!(request.id().unwrap_err().kind, ErrorKind::Method);
         assert!(request.success(Value::Null).is_err());
@@ -1958,7 +1958,7 @@ mod tests {
         ] {
             let reply = Response::error(id.clone(), INTERNAL_ERROR, "Internal error");
             assert_eq!(reply.id().unwrap(), id);
-            contract::check_wire_value(&Message::Response(reply));
+            let _ = assert_write(&Message::Response(reply));
         }
     }
 

@@ -1828,10 +1828,12 @@ mod tests {
     use super::harness::wire_same;
     use super::*;
     use codec::{Lcg, Step as Decoded, Stream};
+
     use fictionet::stdlib::test_support;
-    use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::rounds;
-    use fictionet::stdlib::test_support::{decode_all, mutate};
+    use fictionet::stdlib::test_support::{
+        assert_write, chunks, decode_all, decode_chunks, mutate,
+    };
 
     fn value_step(b: &[u8], limits: Limits) -> Result<Decoded<Value>, Error> {
         Values::with_limits(limits).decode(b, false)
@@ -1843,18 +1845,27 @@ mod tests {
 
     fn check_values(b: &[u8], limits: Limits) {
         // NaN compares through its canonical encoding.
-        contract::check_decode_with_alloc_limit(
-            || Values::with_limits(limits).map(|value| value.to_bytes()),
-            b,
-            2 * limits.frame.clamp(1, MAX_FRAME_LEN),
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Values::with_limits(limits).map(|value| value.to_bytes())),
+                chunks(b, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * limits.frame.clamp(1, MAX_FRAME_LEN))
+            ),
+            decode_all(
+                || Values::with_limits(limits).map(|value| value.to_bytes()),
+                b
+            )
         );
     }
 
     fn check_commands(b: &[u8], limits: Limits) {
-        contract::check_decode_with_alloc_limit(
-            || Commands::with_limits(limits),
-            b,
-            2 * limits.frame.clamp(1, MAX_FRAME_LEN),
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Commands::with_limits(limits)),
+                chunks(b, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * limits.frame.clamp(1, MAX_FRAME_LEN))
+            ),
+            decode_all(|| Commands::with_limits(limits), b)
         );
     }
 
@@ -2254,9 +2265,11 @@ mod tests {
             ),
         ] {
             assert_eq!(Resp2::mapped(v.clone()).to_bytes().unwrap(), r2, "{v:?}");
-            contract::check_wire_value(&Resp2::mapped(v.clone()));
+            let _ = assert_write(&Resp2::mapped(v.clone()));
             assert_eq!(v.to_bytes().unwrap(), r3, "{v:?}");
-            contract::check_wire::<Resp2>(r2);
+            if let Ok(value) = Resp2::parse(r2) {
+                assert_write(&value).unwrap();
+            }
             assert_eq!(Resp2::parse(r2).unwrap().to_bytes().unwrap(), r2);
         }
     }
@@ -2265,7 +2278,9 @@ mod tests {
     fn resp2_parse_accepts_only_resp2_forms() {
         for bytes in &VALID[..17] {
             assert_eq!(Resp2::parse(bytes), Ok(Resp2(one(bytes))));
-            contract::check_wire::<Resp2>(bytes);
+            if let Ok(value) = Resp2::parse(bytes) {
+                assert_write(&value).unwrap();
+            }
         }
         for bytes in &VALID[17..] {
             assert!(Resp2::parse(bytes).is_err(), "{}", bytes.escape_ascii());
@@ -2274,7 +2289,7 @@ mod tests {
             assert!(Resp2::parse(&nested).is_err(), "{}", nested.escape_ascii());
         }
         let binary = Resp2(Value::bulk(b"_\r\n$?\r\n*?\r\n\0\xff"));
-        contract::check_wire_value(&binary);
+        let _ = assert_write(&binary);
         for bytes in [&b""[..], b"$3\r\nab", b"*1\r\n"] {
             assert_eq!(Resp2::parse(bytes), Err(Error::Incomplete));
         }
@@ -2283,7 +2298,9 @@ mod tests {
         assert_eq!(Resp2::parse(b":x\r\n"), Err(Error::ValueSyntax(b':')));
         let mut deep = b"*1\r\n".repeat(MAX_DEPTH);
         deep.extend_from_slice(b"$-1\r\n");
-        contract::check_wire::<Resp2>(&deep);
+        if let Ok(value) = Resp2::parse(&deep) {
+            assert_write(&value).unwrap();
+        }
         assert_eq!(Resp2::parse(&deep).unwrap().to_bytes().unwrap(), deep);
         deep.splice(..0, b"*1\r\n".iter().copied());
         assert_eq!(Resp2::parse(&deep), Err(Error::TooDeep));
@@ -2353,7 +2370,7 @@ mod tests {
                     nested = Value::Array(vec![Value::ok(), nested]);
                 }
                 let reply = Resp2(nested);
-                contract::check_wire_value(&reply);
+                let _ = assert_write(&reply);
                 let mut out = b"prefix".to_vec();
                 assert_eq!(reply.write(&mut out), Err(Error::Unwritable));
                 assert_eq!(out, b"prefix");
@@ -2387,7 +2404,7 @@ mod tests {
             Value::Push(vec![Value::Null; MAX_ELEMENTS + 1]),
         ] {
             let reply = Resp2::mapped(value);
-            contract::check_wire_value(&reply);
+            let _ = assert_write(&reply);
             let mut out = b"prefix".to_vec();
             assert_eq!(reply.write(&mut out), Err(Error::Unwritable));
             assert_eq!(out, b"prefix");
@@ -2401,10 +2418,11 @@ mod tests {
             ])),
         };
         let reply = Resp2::mapped(value);
-        contract::check_wire_value(&reply);
-        let bytes = reply.to_bytes().unwrap();
+        let bytes = assert_write(&reply).unwrap();
         assert_eq!(bytes, b"*2\r\n*0\r\n*1\r\n:1\r\n");
-        contract::check_wire::<Resp2>(&bytes);
+        if let Ok(value) = Resp2::parse(&bytes) {
+            assert_write(&value).unwrap();
+        }
         assert_eq!(
             Resp2::mapped(Value::BulkError(vec![b'x'; MAX_LINE_LEN]))
                 .to_bytes()
@@ -2419,7 +2437,7 @@ mod tests {
         for text in [String::new(), "12x".into(), "1".repeat(MAX_LINE_LEN + 1)] {
             let reply = Resp2::mapped(Value::BigNumber(text.clone()));
             assert_eq!(reply, Resp2(Value::Bulk(text.into_bytes())));
-            contract::check_wire_value(&reply);
+            let _ = assert_write(&reply);
         }
     }
 
@@ -2708,7 +2726,7 @@ mod tests {
             Value::Set(vec![Value::Null; MAX_ELEMENTS + 1]),
             Value::Map(vec![(Value::Null, Value::Null); MAX_ELEMENTS + 1]),
         ] {
-            contract::check_wire_value(&value);
+            let _ = assert_write(&value);
             assert_eq!(value.to_bytes(), Err(Error::Unwritable));
             if let Value::Verbatim { text, .. } = &value {
                 // Its format prefix is omitted in RESP2, so this text fits.
@@ -2716,7 +2734,7 @@ mod tests {
                 assert_eq!(Resp2::parse(&bytes), Ok(Resp2(Value::Bulk(text.clone()))));
             } else {
                 let reply = Resp2(value);
-                contract::check_wire_value(&reply);
+                let _ = assert_write(&reply);
                 assert_eq!(reply.to_bytes(), Err(Error::Unwritable));
             }
         }
@@ -2728,7 +2746,7 @@ mod tests {
                 args: vec![vec![]; MAX_ELEMENTS + 1],
             },
         ] {
-            contract::check_wire_value(&command);
+            let _ = assert_write(&command);
             assert_eq!(command.to_bytes(), Err(Error::Unwritable));
         }
         // Bulk errors retain line breaks in their length-delimited form.
@@ -2801,16 +2819,15 @@ mod tests {
         for _ in 0..2000 {
             for resp2 in [true, false] {
                 let value = random(&mut r, 0, resp2);
-                contract::check_wire_value(&value);
-                let bytes = value.to_bytes().unwrap();
+                let bytes = assert_write(&value).unwrap();
                 assert_eq!(Value::parse(&bytes), Ok(value.clone()));
-                contract::check_wire_value(&Resp2(value.clone()));
-                contract::check_wire_value(&Resp2::mapped(value));
+                let _ = assert_write(&Resp2(value.clone()));
+                let _ = assert_write(&Resp2::mapped(value));
             }
             let command = Command {
                 args: (0..r.index(5)).map(|_| r.bytes(10)).collect(),
             };
-            contract::check_wire_value(&command);
+            let _ = assert_write(&command);
             assert_eq!(Command::parse(&command.to_bytes().unwrap()), Ok(command));
         }
     }
@@ -2947,24 +2964,28 @@ mod tests {
                 check_commands(&b, limits);
                 check_one_shot(&b, limits);
                 for command in decode_all(|| Commands::with_limits(limits), &b).0 {
-                    contract::check_wire_value(&command);
+                    let _ = assert_write(&command);
                 }
                 for value in decode_all(|| Values::with_limits(limits), &b).0 {
                     // NaN compares through its canonical wire bytes.
                     if let Ok(bytes) = value.to_bytes() {
                         assert_eq!(Value::parse(&bytes).unwrap().to_bytes().unwrap(), bytes);
                     }
-                    contract::check_wire_value(&Resp2(value.clone()));
-                    contract::check_wire_value(&Resp2::mapped(value));
+                    let _ = assert_write(&Resp2(value.clone()));
+                    let _ = assert_write(&Resp2::mapped(value));
                 }
             }
-            contract::check_wire::<Resp2>(&b);
+            if let Ok(value) = Resp2::parse(&b) {
+                assert_write(&value).unwrap();
+            }
             // NaN compares through its canonical wire bytes.
             if let Ok(value) = Value::parse(&b) {
                 let bytes = value.to_bytes().unwrap();
                 assert_eq!(Value::parse(&bytes).unwrap().to_bytes().unwrap(), bytes);
             }
-            contract::check_wire::<Command>(&b);
+            if let Ok(value) = Command::parse(&b) {
+                assert_write(&value).unwrap();
+            }
         }
     }
 
@@ -3234,7 +3255,7 @@ mod tests {
             attr.to_bytes().unwrap(),
             b"|1\r\n+k\r\n+v\r\n$10\r\n0123456789\r\n"
         );
-        contract::check_wire_value(&attr);
+        let _ = assert_write(&attr);
         let big = Value::Attribute {
             attributes: (0..3)
                 .map(|_| (Value::Bulk(vec![0; MAX_BULK_LEN]), Value::Null))
@@ -3242,12 +3263,12 @@ mod tests {
             value: Box::new(Value::Bulk(vec![1; MAX_BULK_LEN])),
         };
         assert_eq!(big.to_bytes(), Err(Error::Unwritable));
-        contract::check_wire_value(&big);
+        let _ = assert_write(&big);
         let attr = Value::Attribute {
             attributes: vec![(s("k"), s("v"))],
             value: Box::new(Value::Array(vec![bulk("0123456789"); 3])),
         };
-        contract::check_wire_value(&attr);
+        let _ = assert_write(&attr);
         assert_eq!(Value::parse(&attr.to_bytes().unwrap()), Ok(attr));
     }
 
@@ -3302,14 +3323,14 @@ mod tests {
         assert_eq!(Command::parse(&bytes), Ok(command.clone()));
         assert!(Resp2::parse(&bytes).is_ok());
         // Existing output is outside this frame's size budget.
-        contract::check_wire_value(&command);
-        contract::check_wire_value(&command.to_value());
-        contract::check_wire_value(&Resp2(command.to_value()));
+        let _ = assert_write(&command);
+        let _ = assert_write(&command.to_value());
+        let _ = assert_write(&Resp2(command.to_value()));
         command.args[4].push(3);
         assert_eq!(command.to_bytes(), Err(Error::Unwritable));
-        contract::check_wire_value(&command);
+        let _ = assert_write(&command);
         let value = command.to_value();
-        contract::check_wire_value(&value);
+        let _ = assert_write(&value);
         assert_eq!(value.to_bytes(), Err(Error::Unwritable));
         let mut out = b"prefix".to_vec();
         assert_eq!(Resp2(value).write(&mut out), Err(Error::Unwritable));

@@ -2277,11 +2277,11 @@ pub mod harness {
 mod tests {
     use super::harness::{check_frame, encode};
     use super::*;
-    use fictionet::stdlib::codec::{Decode, Step};
-    use fictionet::stdlib::codec::{Fail, Lcg, Stream, finish, pump};
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::codec::{Decode, Fail, Lcg, Step, Stream, finish, pump};
     use fictionet::stdlib::test_support::rounds;
-    use fictionet::stdlib::test_support::{decode_all, mutate};
+    use fictionet::stdlib::test_support::{
+        assert_write, chunks, decode_all, decode_chunks, mutate,
+    };
 
     const TWO: Context = Context {
         four_octet_as: false,
@@ -3373,7 +3373,7 @@ mod tests {
         for (b, negotiated) in samples() {
             let m = decode(&b, &negotiated).unwrap();
             if let Message::Open(open) = &m {
-                contract::check_wire_value(open);
+                let _ = assert_write(open);
             }
             assert_eq!(encode(&m, &negotiated).unwrap(), b, "{m:?}");
         }
@@ -3414,7 +3414,14 @@ mod tests {
             .filter(|(_, c)| *c == TWO)
             .flat_map(|(b, _)| b.clone())
             .collect();
-        contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &bytes, 2 * MAX_MESSAGE_LEN);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Frame>::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_MESSAGE_LEN)
+            ),
+            decode_all(Frames::<Frame>::new, &bytes)
+        );
         let (frames, error) = decode_all(Frames::<Frame>::new, &bytes);
         assert_eq!(error, None);
         assert_eq!(
@@ -3479,8 +3486,17 @@ mod tests {
                     }
                 }
             }
-            contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &b, 2 * MAX_MESSAGE_LEN);
-            contract::check_wire::<Frame>(&b);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Frames::<Frame>::new()),
+                    chunks(&b, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_MESSAGE_LEN)
+                ),
+                decode_all(Frames::<Frame>::new, &b)
+            );
+            if let Ok(value) = Frame::parse(&b) {
+                assert_write(&value).unwrap();
+            }
             for frame in decode_all(Frames::<Frame>::new, &b).0 {
                 check_frame(&frame);
             }

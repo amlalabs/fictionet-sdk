@@ -1633,9 +1633,10 @@ mod tests {
     use super::*;
     use fictionet::assert_cases;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream, finish as finish_stream, pump};
-    use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::rounds;
-    use fictionet::stdlib::test_support::{chunks, decode_all, mutate};
+    use fictionet::stdlib::test_support::{
+        assert_write, chunks, decode_all, decode_chunks, mutate,
+    };
 
     fn ap_rep_fixture(enc_part: EncryptedData) -> ApRep {
         ApRep { enc_part }
@@ -2357,10 +2358,13 @@ mod tests {
         let mut bytes = one.repeat(2);
         bytes.extend_from_slice(&(MAX_MESSAGE as u32 + 1).to_be_bytes());
         bytes.extend_from_slice(&[0; 1000]);
-        contract::check_decode_with_alloc_limit(
-            Frames::<Frame>::new,
-            &bytes,
-            2 * (TCP_HEADER_LEN + MAX_MESSAGE),
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Frame>::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * (TCP_HEADER_LEN + MAX_MESSAGE))
+            ),
+            decode_all(Frames::<Frame>::new, &bytes)
         );
         let mut stream = Stream::new(Frames::<Frame>::new());
         let mut got = Vec::new();
@@ -2592,16 +2596,29 @@ mod tests {
                 }
             }
         }
-        contract::check_wire::<Ticket>(data);
-        contract::check_wire::<EncryptedData>(data);
-        contract::check_wire::<KdcReqBody>(data);
-        contract::check_wire::<MethodData>(data);
-        contract::check_decode_with_alloc_limit(
-            Frames::<Frame>::new,
-            data,
-            2 * (TCP_HEADER_LEN + MAX_MESSAGE),
+        if let Ok(value) = Ticket::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = EncryptedData::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = KdcReqBody::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = MethodData::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Frame>::new()),
+                chunks(data, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * (TCP_HEADER_LEN + MAX_MESSAGE))
+            ),
+            decode_all(Frames::<Frame>::new, data)
         );
-        contract::check_wire::<Message>(data);
+        if let Ok(value) = Message::parse(data) {
+            assert_write(&value).unwrap();
+        }
         read
     }
 
@@ -2644,7 +2661,7 @@ mod tests {
     #[test]
     fn codec_frames_bound_input_and_keep_empty_records() {
         use fictionet::stdlib::codec::{Fail, Stream, Wire};
-        use fictionet::stdlib::test_support::contract;
+        use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
         assert_eq!(
             Frames::<Frame>::new().capacity(),
             TCP_HEADER_LEN + MAX_MESSAGE
@@ -2655,10 +2672,13 @@ mod tests {
         assert_eq!(stream.push(&bytes), bytes.len());
         assert_eq!(stream.push(&[0]), 0);
         assert_eq!(stream.next(), Some(Ok(frame.0)));
-        contract::check_decode_with_alloc_limit(
-            Frames::<Frame>::new,
-            &[0, 0, 0, 0, 0x80, 0, 0, 0],
-            2 * (TCP_HEADER_LEN + MAX_MESSAGE),
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Frame>::new()),
+                chunks(&[0, 0, 0, 0, 0x80, 0, 0, 0], &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * (TCP_HEADER_LEN + MAX_MESSAGE))
+            ),
+            decode_all(Frames::<Frame>::new, &[0, 0, 0, 0, 0x80, 0, 0, 0])
         );
         assert_eq!(stream.push(&[0x80, 0, 0, 0]), 4);
         assert_eq!(
@@ -2666,16 +2686,18 @@ mod tests {
             Some(Err(Fail::Protocol(Error::ReservedLength(0x8000_0000))))
         );
         assert_eq!(stream.next(), None);
-        contract::check_wire_value(&Frame(Vec::new()));
+        let _ = assert_write(&Frame(Vec::new()));
     }
 
     #[test]
     fn codec_writers_are_exact_and_transactional() {
         use fictionet::stdlib::codec::Wire;
-        use fictionet::stdlib::test_support::contract;
+        use fictionet::stdlib::test_support::assert_write;
         for message in all_messages() {
-            contract::check_wire_value(&message);
-            contract::check_wire::<Message>(&message.to_bytes().unwrap());
+            let _ = assert_write(&message);
+            if let Ok(value) = Message::parse(&message.to_bytes().unwrap()) {
+                assert_write(&value).unwrap();
+            }
         }
         let mut out = vec![42];
         let oversized = Frame(vec![0; MAX_MESSAGE + 1]);
@@ -2720,6 +2742,8 @@ mod tests {
         let bytes = build(MAX_MESSAGE - overhead);
         assert_eq!(bytes.len(), MAX_MESSAGE);
         assert_eq!(Message::parse(&bytes), Err(Error::TooLong));
-        contract::check_wire::<Message>(&bytes);
+        if let Ok(value) = Message::parse(&bytes) {
+            assert_write(&value).unwrap();
+        }
     }
 }

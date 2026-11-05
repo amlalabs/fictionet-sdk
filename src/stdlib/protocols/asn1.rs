@@ -2551,7 +2551,8 @@ pub mod harness {
         Class, Element, Elements, Error, Frame, MAX_INPUT, Oid, Reader, Rules, StringKind, Tag,
         Writer, check_generalized_time, check_utc_time, element_len,
     };
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::codec::{Stream, Wire};
+    use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
 
     /// ASN.1 string kinds.
     const ALL_KINDS: [StringKind; 11] = [
@@ -2699,9 +2700,18 @@ pub mod harness {
     /// Checks BER and DER framing and writer round trips.
     pub fn check(data: &[u8]) {
         for rules in [Rules::Ber, Rules::Der] {
-            contract::check_decode_with_alloc_limit(|| Elements::new(rules), data, 2 * MAX_INPUT);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Elements::new(rules)),
+                    chunks(data, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_INPUT)
+                ),
+                decode_all(|| Elements::new(rules), data)
+            );
         }
-        contract::check_wire::<Frame>(data);
+        if let Ok(value) = Frame::parse(data) {
+            assert_write(&value).unwrap();
+        }
         // DER is BER: what DER frames, BER frames the same.
         if let Ok(Some(n)) = element_len(data, Rules::Der) {
             assert_eq!(element_len(data, Rules::Ber), Ok(Some(n)));
@@ -4279,10 +4289,12 @@ mod tests {
     #[test]
     fn codec_wire_is_exact_and_transactional() {
         use fictionet::stdlib::codec::Wire;
-        use fictionet::stdlib::test_support::contract;
+        use fictionet::stdlib::test_support::assert_write;
         for bytes in [&[5, 0][..], &[0x30, 0x80, 5, 0, 0, 0], &[4], &[5, 0, 5, 0]] {
-            contract::check_wire::<Frame>(bytes);
-            contract::check_wire_value(&Frame(bytes.to_vec()));
+            if let Ok(value) = Frame::parse(bytes) {
+                assert_write(&value).unwrap();
+            }
+            let _ = assert_write(&Frame(bytes.to_vec()));
         }
         assert_eq!(<Frame as Wire>::parse(&[5, 0, 5, 0]), Err(Error::Trailing));
         let mut out = vec![42];
@@ -4296,7 +4308,8 @@ mod tests {
     #[test]
     fn codec_indefinite_scan_survives_compaction() {
         use fictionet::stdlib::codec::Stream;
-        use fictionet::stdlib::test_support::contract;
+
+        use fictionet::stdlib::test_support::{chunks, decode_all, decode_chunks};
         let mut w = Writer::new();
         w.octet_string(&[1; 256]);
         let first = w.finish().unwrap();
@@ -4320,15 +4333,21 @@ mod tests {
         assert_eq!(stream.decoder().rules(), Rules::Ber);
         assert_eq!(stream.decoder().held(), 0);
         bytes.extend_from_slice(&[0x30, 0x80, 5, 0, 0, 0, 0, 0, 5, 0]);
-        contract::check_decode_with_alloc_limit(
-            || Elements::new(Rules::Ber),
-            &bytes,
-            2 * MAX_INPUT,
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Elements::new(Rules::Ber)),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_INPUT)
+            ),
+            decode_all(|| Elements::new(Rules::Ber), &bytes)
         );
-        contract::check_decode_with_alloc_limit(
-            || Elements::new(Rules::Der),
-            &bytes,
-            2 * MAX_INPUT,
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Elements::new(Rules::Der)),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_INPUT)
+            ),
+            decode_all(|| Elements::new(Rules::Der), &bytes)
         );
     }
 }

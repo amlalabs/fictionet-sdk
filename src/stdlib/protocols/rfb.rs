@@ -2369,9 +2369,11 @@ pub mod harness {
 mod tests {
     use super::*;
     use codec::Lcg;
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::codec::Stream;
     use fictionet::stdlib::test_support::rounds;
-    use fictionet::stdlib::test_support::{chunks, decode_all, mutate};
+    use fictionet::stdlib::test_support::{
+        assert_write, chunks, decode_all, decode_chunks, mutate,
+    };
 
     fn server_init(width: u16, height: u16, format: PixelFormat, name: Vec<u8>) -> ServerInit {
         ServerInit {
@@ -3051,7 +3053,7 @@ mod tests {
             {
                 normal += 1;
                 assert!(message.to_bytes().is_ok());
-                contract::check_wire_value(message);
+                let _ = assert_write(message);
             }
             let version = versions[rng.index(versions.len())];
             let mut data = to_client[rng.index(to_client.len())].clone();
@@ -3918,14 +3920,30 @@ mod tests {
     fn normal_units_follow_the_contract() {
         for message in sample_client_messages() {
             let bytes = message.to_bytes().unwrap();
-            contract::check_wire::<ClientMessage>(&bytes);
-            contract::check_decode_with_alloc_limit(normal_client, &bytes, 2 * MAX_CLIENT_MESSAGE);
+            if let Ok(value) = ClientMessage::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(normal_client()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_CLIENT_MESSAGE)
+                ),
+                decode_all(normal_client, &bytes)
+            );
             assert_eq!(decode_all(normal_client, &bytes), (vec![Ok(message)], None));
         }
         for message in sample_server_messages() {
             let f = PixelFormat::TRUE_COLOR_32;
             let bytes = server_bytes(&message, Dialect::V3_8, &f).unwrap();
-            contract::check_decode_with_alloc_limit(|| normal_server(f), &bytes, 2 * MAX_MESSAGE);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(normal_server(f)),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_MESSAGE)
+                ),
+                decode_all(|| normal_server(f), &bytes)
+            );
             assert_eq!(
                 decode_all(|| normal_server(f), &bytes),
                 (vec![Ok(message)], None)
@@ -3939,9 +3957,23 @@ mod tests {
             &f,
         )
         .unwrap();
-        contract::check_decode_with_alloc_limit(|| normal_server(f), &bytes, 2 * MAX_MESSAGE);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(normal_server(f)),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_MESSAGE)
+            ),
+            decode_all(|| normal_server(f), &bytes)
+        );
         let bytes = pointer(0, 1, 1).to_bytes().unwrap().repeat(rounds(20_000));
-        contract::check_decode_with_alloc_limit(normal_client, &bytes, 2 * MAX_CLIENT_MESSAGE);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(normal_client()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_CLIENT_MESSAGE)
+            ),
+            decode_all(normal_client, &bytes)
+        );
     }
 
     #[test]
@@ -3955,26 +3987,62 @@ mod tests {
                     .unwrap();
             }
             mutate(&mut rng, &mut bytes);
-            contract::check_decode_with_alloc_limit(normal_client, &bytes, 2 * MAX_CLIENT_MESSAGE);
-            contract::check_decode_with_alloc_limit(
-                || normal_server(PixelFormat::TRUE_COLOR_32),
-                &bytes,
-                2 * MAX_MESSAGE,
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(normal_client()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_CLIENT_MESSAGE)
+                ),
+                decode_all(normal_client, &bytes)
             );
-            contract::check_decode_with_alloc_limit(
-                ClientMessages::new,
-                &bytes,
-                2 * MAX_CLIENT_MESSAGE,
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(normal_server(PixelFormat::TRUE_COLOR_32)),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_MESSAGE)
+                ),
+                decode_all(|| normal_server(PixelFormat::TRUE_COLOR_32), &bytes)
             );
-            contract::check_decode_with_alloc_limit(ServerMessages::new, &bytes, 2 * MAX_MESSAGE);
-            contract::check_wire::<Version>(&bytes);
-            contract::check_wire::<PixelFormat>(&bytes);
-            contract::check_wire::<ServerInit>(&bytes);
-            contract::check_wire::<ClientMessage>(&bytes);
-            contract::check_wire::<SecurityChoice>(&bytes);
-            contract::check_wire::<VncResponse>(&bytes);
-            contract::check_wire::<ClientInit>(&bytes);
-            contract::check_wire::<Text>(&bytes);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(ClientMessages::new()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_CLIENT_MESSAGE)
+                ),
+                decode_all(ClientMessages::new, &bytes)
+            );
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(ServerMessages::new()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_MESSAGE)
+                ),
+                decode_all(ServerMessages::new, &bytes)
+            );
+            if let Ok(value) = Version::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = PixelFormat::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = ServerInit::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = ClientMessage::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = SecurityChoice::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = VncResponse::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = ClientInit::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = Text::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
         }
     }
     #[test]
@@ -3999,7 +4067,7 @@ mod tests {
                     rng.next() as u16,
                 ),
             };
-            contract::check_wire_value(&message);
+            let _ = assert_write(&message);
             let format = PixelFormat {
                 bits_per_pixel: rng.next() as u8,
                 depth: rng.next() as u8,
@@ -4012,8 +4080,8 @@ mod tests {
                 green_shift: rng.next() as u8,
                 blue_shift: rng.next() as u8,
             };
-            contract::check_wire_value(&format);
-            contract::check_wire_value(&ClientMessage::SetPixelFormat(format));
+            let _ = assert_write(&format);
+            let _ = assert_write(&ClientMessage::SetPixelFormat(format));
             let bpp = [8, 16, 32][rng.index(3)];
             let format = PixelFormat {
                 bits_per_pixel: bpp,

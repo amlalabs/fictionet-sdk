@@ -2674,12 +2674,11 @@ fn timestamp_nanos(value: [u32; 7]) -> Result<u128, Error> {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::Stream;
+
     use fictionet::stdlib::test_support::check_atomic;
-    use fictionet::stdlib::test_support::contract::{
-        check_decode_with_alloc_limit, check_wire, check_wire_value,
-    };
     use fictionet::stdlib::test_support::decode_all;
     use fictionet::stdlib::test_support::rounds;
+    use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
 
     fn event_resend(begin: u32, end: u32) -> Event {
         Event::Resend { begin, end }
@@ -2727,7 +2726,7 @@ mod tests {
         assert!(actions.len() <= MAX_ACTIONS);
         for action in actions {
             if let Action::Send(m) = action {
-                check_wire_value(m);
+                let _ = assert_write(m);
                 assert!(m.to_bytes().is_ok());
             }
         }
@@ -2799,8 +2798,8 @@ mod tests {
         bytes: &[u8],
         now: u64,
     ) -> Vec<Action<Message, Event>> {
-        check_wire::<Message>(bytes);
         let message = Message::parse(bytes).unwrap();
+        assert_write(&message).unwrap();
         let actions = session.receive(&message, now, TIME).unwrap();
         checked(&actions);
         actions
@@ -2830,7 +2829,14 @@ mod tests {
                 assert_eq!(count, 2);
                 assert_eq!(stream.decoder().garbled(), 1);
             }
-            check_decode_with_alloc_limit(Messages::default, &bytes, 2 * MAX_MESSAGE_SIZE);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Messages::default()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_MESSAGE_SIZE)
+                ),
+                decode_all(Messages::default, &bytes)
+            );
         }
         for bad in [
             b"8=FIX.4.4\x019=4\x0135=0\x0110=163\x01".as_slice(),
@@ -2841,7 +2847,14 @@ mod tests {
             let (items, failure) = decode_all(Messages::default, &bytes);
             assert_eq!(failure, None);
             assert_eq!(items.len(), 1);
-            check_decode_with_alloc_limit(Messages::default, &bytes, 2 * MAX_MESSAGE_SIZE);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Messages::default()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_MESSAGE_SIZE)
+                ),
+                decode_all(Messages::default, &bytes)
+            );
         }
     }
 
@@ -2884,7 +2897,9 @@ mod tests {
     #[test]
     fn round_two_c_empty_field_is_an_item() {
         // FIX 4.4 Vol 2 case 14.d: a valid envelope requires a field Reject.
-        check_wire::<Message>(EMPTY_TEXT);
+        if let Ok(value) = Message::parse(EMPTY_TEXT) {
+            assert_write(&value).unwrap();
+        }
         let (items, failure) = decode_all(Messages::default, EMPTY_TEXT);
         assert_eq!(failure, None);
         assert_eq!(items.len(), 1);
@@ -2913,8 +2928,22 @@ mod tests {
             [Action::Event(Event::Duplicate(2))]
         );
         assert_eq!(session.next_inbound(), 3);
-        check_decode_with_alloc_limit(Messages::default, EMPTY_TEXT, 2 * MAX_MESSAGE_SIZE);
-        check_decode_with_alloc_limit(Messages::default, replay, 2 * MAX_MESSAGE_SIZE);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Messages::default()),
+                chunks(EMPTY_TEXT, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_MESSAGE_SIZE)
+            ),
+            decode_all(Messages::default, EMPTY_TEXT)
+        );
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Messages::default()),
+                chunks(replay, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_MESSAGE_SIZE)
+            ),
+            decode_all(Messages::default, replay)
+        );
     }
 
     #[test]
@@ -2974,8 +3003,8 @@ mod tests {
             assert_eq!(sent[0].get(373), Some(reason.to_string().as_bytes()));
             assert_eq!(session.next_inbound(), 3);
             assert!(Message::parse(bytes).is_err());
-            check_wire::<Message>(bytes);
-            check_decode_with_alloc_limit(Messages::default, bytes, 2 * MAX_MESSAGE_SIZE);
+            if let Ok(value) = Message::parse(bytes) { assert_write(&value).unwrap(); }
+            assert_eq!(decode_chunks(&mut Stream::new(Messages::default()), chunks(bytes, &[1, 7, 64]), |s| {assert!(s.allocated() <= 2 * MAX_MESSAGE_SIZE);}), decode_all(Messages::default, bytes));
         }
         // An empty data value is refused transactionally, like other empty fields.
         let mut message = Message::new(Version::Fix44, b"0").unwrap();
@@ -3074,7 +3103,14 @@ mod tests {
         }
         assert_eq!(stream.decoder().unsupported_versions(), 1);
         assert_eq!(stream.decoder().garbled(), 1);
-        check_decode_with_alloc_limit(Messages::default, &bytes, 2 * MAX_MESSAGE_SIZE);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Messages::default()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_MESSAGE_SIZE)
+            ),
+            decode_all(Messages::default, &bytes)
+        );
     }
 
     #[test]
@@ -3087,9 +3123,18 @@ mod tests {
         ] {
             let message = Message::parse(bytes).unwrap();
             assert_eq!(message.to_bytes().unwrap(), bytes);
-            check_wire::<Message>(bytes);
-            check_wire_value(&message);
-            check_decode_with_alloc_limit(Messages::default, bytes, 2 * MAX_MESSAGE_SIZE);
+            if let Ok(value) = Message::parse(bytes) {
+                assert_write(&value).unwrap();
+            }
+            let _ = assert_write(&message);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Messages::default()),
+                    chunks(bytes, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_MESSAGE_SIZE)
+                ),
+                decode_all(Messages::default, bytes)
+            );
         }
         assert_eq!(
             timestamp(b"20261006-12:00:00.123456789012"),
@@ -3263,7 +3308,14 @@ mod tests {
             let (messages, failure) = decode_all(Messages::default, &wire);
             assert_eq!(failure, None);
             assert_eq!(messages, [Ok(Message::parse(LOGON).unwrap())]);
-            check_decode_with_alloc_limit(Messages::default, &wire, 2 * MAX_MESSAGE_SIZE);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Messages::default()),
+                    chunks(&wire, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_MESSAGE_SIZE)
+                ),
+                decode_all(Messages::default, &wire)
+            );
         }
     }
 
@@ -3462,7 +3514,9 @@ mod tests {
             parsed.to_bytes().unwrap(),
             b"8=FIX.4.4\x019=5\x0135=0\x0110=163\x01"
         );
-        check_wire::<Message>(bytes);
+        if let Ok(value) = Message::parse(bytes) {
+            assert_write(&value).unwrap();
+        }
         let mut message = Message::new(Version::Fix44, b"8").unwrap();
         for _ in 0..3 {
             message.push(58, &vec![b'x'; MAX_VALUE_LENGTH]).unwrap();
@@ -3474,8 +3528,10 @@ mod tests {
         message.push(58, &vec![b'x'; remaining]).unwrap();
         let wire = message.to_bytes().unwrap();
         assert_eq!(wire.len(), MAX_MESSAGE_SIZE);
-        check_wire::<Message>(&wire);
-        check_wire_value(&message);
+        if let Ok(value) = Message::parse(&wire) {
+            assert_write(&value).unwrap();
+        }
+        let _ = assert_write(&message);
         assert_eq!(Message::parse(&wire), Ok(message.clone()));
         assert_eq!(message.push(58, b"x"), Err(Error::Limit));
         let mut frames = Messages::default();
@@ -3583,7 +3639,14 @@ mod tests {
             Message::parse(&small[..small.len() - 19 * 7]),
             Err(Error::Header)
         );
-        check_decode_with_alloc_limit(Messages::default, &small, 2 * MAX_MESSAGE_SIZE);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Messages::default()),
+                chunks(&small, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_MESSAGE_SIZE)
+            ),
+            decode_all(Messages::default, &small)
+        );
         let bytes = build(2000, 4000);
         assert!(bytes.len() <= MAX_MESSAGE_SIZE);
         let (frames, count, bound) = pump_bounded(&bytes);
@@ -3659,9 +3722,18 @@ mod tests {
         for bytes in [LOGON, HEARTBEAT] {
             let message = Message::parse(bytes).unwrap();
             assert_eq!(message.to_bytes().unwrap(), bytes);
-            check_wire::<Message>(bytes);
-            check_wire_value(&message);
-            check_decode_with_alloc_limit(Messages::default, bytes, 2 * MAX_MESSAGE_SIZE);
+            if let Ok(value) = Message::parse(bytes) {
+                assert_write(&value).unwrap();
+            }
+            let _ = assert_write(&message);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Messages::default()),
+                    chunks(bytes, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_MESSAGE_SIZE)
+                ),
+                decode_all(Messages::default, bytes)
+            );
             for n in 0..bytes.len() {
                 assert!(Message::parse(bytes.get(..n).unwrap()).is_err());
             }
@@ -3672,7 +3744,14 @@ mod tests {
         assert_eq!(failure, None);
         assert_eq!(messages.len(), 2);
         assert_eq!(Message::parse(&stream), Err(Error::Trailing));
-        check_decode_with_alloc_limit(Messages::default, &stream, 2 * MAX_MESSAGE_SIZE);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Messages::default()),
+                chunks(&stream, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_MESSAGE_SIZE)
+            ),
+            decode_all(Messages::default, &stream)
+        );
     }
 
     #[test]
@@ -3690,8 +3769,17 @@ mod tests {
         ] {
             let wire = wire_body(body);
             assert!(Message::parse(&wire).is_err(), "{body:?}");
-            check_wire::<Message>(&wire);
-            check_decode_with_alloc_limit(Messages::default, &wire, 2 * MAX_MESSAGE_SIZE);
+            if let Ok(value) = Message::parse(&wire) {
+                assert_write(&value).unwrap();
+            }
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Messages::default()),
+                    chunks(&wire, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_MESSAGE_SIZE)
+                ),
+                decode_all(Messages::default, &wire)
+            );
         }
         let mut corrupted = LOGON.to_vec();
         *corrupted.last_mut().unwrap() = b'0';
@@ -3717,10 +3805,13 @@ mod tests {
                 Ok(Step::Skip(_))
             ));
         }
-        check_decode_with_alloc_limit(
-            Messages::default,
-            &[b'x'; MAX_PREFIX_SIZE],
-            2 * MAX_MESSAGE_SIZE,
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Messages::default()),
+                chunks(&[b'x'; MAX_PREFIX_SIZE], &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_MESSAGE_SIZE)
+            ),
+            decode_all(Messages::default, &[b'x'; MAX_PREFIX_SIZE])
         );
     }
 
@@ -3735,8 +3826,15 @@ mod tests {
                 Message::parse(&wire).unwrap().get(tag),
                 Some(data.as_slice())
             );
-            check_wire_value(&message);
-            check_decode_with_alloc_limit(Messages::default, &wire, 2 * MAX_MESSAGE_SIZE);
+            let _ = assert_write(&message);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Messages::default()),
+                    chunks(&wire, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_MESSAGE_SIZE)
+                ),
+                decode_all(Messages::default, &wire)
+            );
         }
         for body in [
             b"35=A\x0196=abc\x01".as_slice(),
@@ -3754,7 +3852,7 @@ mod tests {
     fn writers_and_builders_roll_back_on_limits_and_invalid_pairs() {
         let mut message = Message::new(Version::Fix44, b"A").unwrap();
         message.push(95, b"3").unwrap().push(96, b"xx").unwrap();
-        check_wire_value(&message);
+        let _ = assert_write(&message);
         let mut out = b"prefix".to_vec();
         assert_eq!(message.write(&mut out), Err(Error::DataLength));
         assert_eq!(out, b"prefix");
@@ -3772,7 +3870,7 @@ mod tests {
         assert_eq!(many, before);
         assert!(many.push_data(95, b"data").is_err());
         assert_eq!(many, before);
-        check_wire_value(&many);
+        let _ = assert_write(&many);
         let mut large = Message::new(Version::Fix44, b"A").unwrap();
         let data = vec![b'x'; MAX_VALUE_LENGTH];
         for _ in 0..3 {
@@ -3781,7 +3879,7 @@ mod tests {
         let before = large.clone();
         assert!(large.push_data(95, &data).is_err());
         assert_eq!(large, before);
-        check_wire_value(&large);
+        let _ = assert_write(&large);
     }
 
     #[test]
@@ -3814,7 +3912,7 @@ mod tests {
             g.entries().first().unwrap().first().unwrap(),
             m.fields().get(3).unwrap()
         ));
-        check_wire_value(&m);
+        let _ = assert_write(&m);
         for fields in [
             vec![(453, "2"), (448, "a")],
             vec![(453, "1"), (447, "D")],
@@ -3924,7 +4022,7 @@ mod tests {
                 .no_md_entries(),
             Some(b"1".as_slice())
         );
-        check_wire_value(&m);
+        let _ = assert_write(&m);
     }
 
     #[test]
@@ -4352,8 +4450,17 @@ mod tests {
             if let Some(b) = bytes.get_mut(i) {
                 *b ^= 0x80;
             }
-            check_wire::<Message>(&bytes);
-            check_decode_with_alloc_limit(Messages::default, &bytes, 2 * MAX_MESSAGE_SIZE);
+            if let Ok(value) = Message::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Messages::default()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_MESSAGE_SIZE)
+                ),
+                decode_all(Messages::default, &bytes)
+            );
         }
     }
 

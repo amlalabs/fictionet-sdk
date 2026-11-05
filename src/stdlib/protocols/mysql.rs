@@ -2278,26 +2278,41 @@ pub mod harness {
         Column, Command, Eof, ErrPacket, Handshake, HandshakeResponse, LenencInt, LocalInfile,
         OkPacket, ResultReader, Row, SslRequest, parse_row,
     };
+
     use fictionet::stdlib::codec::Wire;
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::assert_write;
 
     /// Checks payload codecs under the supplied capability sets.
     pub fn check_payload(bytes: &[u8], capabilities: &[u32]) {
-        contract::check_wire::<Handshake>(bytes);
-        contract::check_wire::<HandshakeResponse>(bytes);
-        contract::check_wire::<SslRequest>(bytes);
-        contract::check_wire::<Column>(bytes);
-        contract::check_wire::<Row>(bytes);
-        contract::check_wire::<LenencInt>(bytes);
-        if let Ok(row) = parse_row(bytes, 1) {
-            contract::check_wire_value(&row);
+        if let Ok(value) = Handshake::parse(bytes) {
+            assert_write(&value).unwrap();
         }
-        contract::check_wire::<LocalInfile>(bytes);
+        if let Ok(value) = HandshakeResponse::parse(bytes) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = SslRequest::parse(bytes) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Column::parse(bytes) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Row::parse(bytes) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = LenencInt::parse(bytes) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(row) = parse_row(bytes, 1) {
+            let _ = assert_write(&row);
+        }
+        if let Ok(value) = LocalInfile::parse(bytes) {
+            assert_write(&value).unwrap();
+        }
         for &caps in capabilities {
             if let Ok(value) = OkPacket::parse(bytes, caps) {
                 let message = value.message(0, caps).unwrap();
                 assert!(message.to_bytes().is_ok(), "{message:?}");
-                contract::check_wire_value(&message);
+                let _ = assert_write(&message);
                 assert_eq!(OkPacket::parse(&message.payload, caps), Ok(value.clone()));
                 if let Ok(message) = value.end_message(0, caps) {
                     assert_eq!(OkPacket::parse(&message.payload, caps), Ok(value));
@@ -2326,7 +2341,7 @@ pub mod harness {
         for columns in 0..4 {
             if let Ok(row) = parse_row(bytes, columns) {
                 assert!(row.to_bytes().is_ok(), "{row:?}");
-                contract::check_wire_value(&row);
+                let _ = assert_write(&row);
             }
         }
     }
@@ -2340,10 +2355,11 @@ mod tests {
 
     use super::*;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream, pump};
-    use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::hex;
     use fictionet::stdlib::test_support::rounds;
-    use fictionet::stdlib::test_support::{decode_all, mutate};
+    use fictionet::stdlib::test_support::{
+        assert_write, chunks, decode_all, decode_chunks, mutate,
+    };
 
     const CAPS41: u32 =
         capability::PROTOCOL_41 | capability::SECURE_CONNECTION | capability::TRANSACTIONS;
@@ -3284,7 +3300,14 @@ mod tests {
         }
         assert_eq!(bytes, [0, 0, 0, 0, 3, 0, 0, 1, b'a', b'b', b'c']);
         assert_eq!(messages[1].next_seq(), 2);
-        contract::check_decode_with_alloc_limit(Messages::new, &bytes, 2 * MAX_FRAME);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Messages::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_FRAME)
+            ),
+            decode_all(Messages::new, &bytes)
+        );
         assert_eq!(decode_all(Messages::new, &bytes), (messages, None));
     }
 
@@ -3327,10 +3350,13 @@ mod tests {
         assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::TooLong(17)))));
         assert_eq!(stream.next(), None);
         let bytes = [1, 0, 0, 0, b'x'].repeat(1000);
-        contract::check_decode_with_alloc_limit(
-            || Messages::with_limit(16),
-            &bytes,
-            2 * (16 + HEADER_LEN),
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Messages::with_limit(16)),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * (16 + HEADER_LEN))
+            ),
+            decode_all(|| Messages::with_limit(16), &bytes)
         );
         let message = fixture_message(0, vec![7; MAX_PACKET_PAYLOAD + 10]);
         assert_eq!(
@@ -3807,21 +3833,29 @@ mod tests {
                 }
             }
             let limit = 8 + rng.index(64);
-            contract::check_decode_with_alloc_limit(
-                || Messages::with_limit(limit),
-                &bytes,
-                2 * (limit + HEADER_LEN),
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Messages::with_limit(limit)),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * (limit + HEADER_LEN))
+                ),
+                decode_all(|| Messages::with_limit(limit), &bytes)
             );
-            contract::check_decode_with_alloc_limit(
-                || Frames::<Packet>::with_limit(limit),
-                &bytes,
-                2 * (limit + HEADER_LEN),
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Frames::<Packet>::with_limit(limit)),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * (limit + HEADER_LEN))
+                ),
+                decode_all(|| Frames::<Packet>::with_limit(limit), &bytes)
             );
-            contract::check_wire::<Message>(&bytes);
+            if let Ok(value) = Message::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
             for message in decode_all(|| Messages::with_limit(limit), &bytes).0 {
                 check_payload(&message.payload);
                 assert!(message.to_bytes().is_ok(), "{message:?}");
-                contract::check_wire_value(&message);
+                let _ = assert_write(&message);
                 for caps in CAPS_SETS {
                     let _ = ResultReader::new(caps).push(&message.payload);
                 }

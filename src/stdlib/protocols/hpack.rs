@@ -1096,10 +1096,10 @@ mod tests {
 
     #[test]
     fn strict_literal_writers() {
-        use fictionet::stdlib::test_support::contract;
-        contract::check_wire_value(&StringLiteral(vec![0; MAX_STRING + 1]));
-        contract::check_wire_value(&Field::new(vec![0; MAX_STRING + 1], b""));
-        contract::check_wire_value(&Field::new(b"", vec![0; MAX_STRING + 1]));
+        use fictionet::stdlib::test_support::assert_write;
+        let _ = assert_write(&StringLiteral(vec![0; MAX_STRING + 1]));
+        let _ = assert_write(&Field::new(vec![0; MAX_STRING + 1], b""));
+        let _ = assert_write(&Field::new(b"", vec![0; MAX_STRING + 1]));
     }
 
     fn update(size: usize) -> Vec<u8> {

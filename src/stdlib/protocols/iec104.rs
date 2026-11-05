@@ -463,8 +463,8 @@ impl Wire for Asdu {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{Fail, Stream};
-    use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::decode_all;
+    use fictionet::stdlib::test_support::{chunks, decode_chunks};
 
     fn object(address: u32, value: Vec<u8>) -> Object {
         Object { address, value }
@@ -564,7 +564,14 @@ mod tests {
         let encoded = frame.to_bytes().unwrap();
         assert_eq!(encoded.len(), MAX_FRAME);
         let bytes = encoded.repeat(7);
-        contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &bytes, 2 * MAX_FRAME);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Frame>::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_FRAME)
+            ),
+            decode_all(Frames::<Frame>::new, &bytes)
+        );
         let (frames, failure) = decode_all(Frames::<Frame>::new, &bytes);
         assert!(failure.is_none());
         assert_eq!(frames, vec![frame; 7]);

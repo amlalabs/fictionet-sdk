@@ -781,11 +781,42 @@ mod tests {
     use super::harness::conforms;
     use super::*;
     use fictionet::stdlib::codec::Lcg;
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::codec::{Collect, CollectError, Fail, Stream};
+    use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
+
     use fictionet::stdlib::test_support::mutate;
 
     fn collect(b: &[u8]) -> Result<Message, Error> {
-        contract::check_collect::<Message>(b, MAX_MESSAGE)
+        let parsed = Message::parse(b);
+        if let Ok(value) = &parsed {
+            assert_write(value).unwrap();
+        }
+        let decoded = decode_chunks(
+            &mut Stream::new(Collect::<Message>::new(MAX_MESSAGE)),
+            chunks(b, &[1, 7, 64]),
+            |s| assert!(s.allocated() <= 2 * (MAX_MESSAGE + 1)),
+        );
+        if b.len() <= MAX_MESSAGE {
+            assert_eq!(
+                decoded,
+                (
+                    parsed.clone().ok().into_iter().collect(),
+                    parsed
+                        .clone()
+                        .err()
+                        .map(|e| Fail::Protocol(CollectError::Parse(e))),
+                )
+            );
+        } else {
+            assert_eq!(
+                decoded,
+                (
+                    vec![],
+                    Some(Fail::Protocol(CollectError::TooLong { limit: MAX_MESSAGE }))
+                )
+            );
+        }
+        parsed
     }
 
     fn ip(a: u8, b: u8, c: u8, d: u8) -> Ipv4Addr {
@@ -804,7 +835,7 @@ mod tests {
     }
 
     fn round_trip(m: &Message) -> Vec<u8> {
-        let b = contract::check_written(m);
+        let b = assert_write(m).unwrap();
         assert_eq!(b.len(), m.encoded_len().unwrap());
         assert_eq!(checksum(&b), 0);
         assert_eq!(collect(&b).as_ref(), Ok(m));
@@ -985,11 +1016,13 @@ mod tests {
         assert_eq!(decode_code(0xff), MAX_CODE_VALUE);
         for c in 0..=255u8 {
             assert_eq!(Code(decode_code(c)).to_bytes(), Ok(vec![c]));
-            contract::check_wire::<Code>(&[c]);
+            if let Ok(value) = Code::parse(&[c]) {
+                assert_write(&value).unwrap();
+            }
         }
         for v in [129, 255, 1000, 31_743, 40_000, u32::MAX] {
             assert_eq!(Code(v).to_bytes(), Err(Error::Unwritable));
-            contract::check_wire_value(&Code(v));
+            let _ = assert_write(&Code(v));
         }
         assert_eq!(Code(992).to_bytes(), Ok(vec![0xaf]));
         assert_eq!(Code::parse(&[0xaf]), Ok(Code(992)));

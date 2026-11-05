@@ -2496,12 +2496,15 @@ pub mod harness {
         ActivePdu, CapabilitySet, ClientInfo, DataBlock, DataBlocks, GccConference, LicenseError,
         MAX_GCC_DATA, MAX_PDU, McsConnect, McsPdu, Negotiation, SecurityPayload,
     };
+
     use fictionet::stdlib::codec::Wire;
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::assert_write;
 
     /// Checks a parsed wire value and its PDU size bound.
     pub fn roundtrip<T: Wire + PartialEq + core::fmt::Debug>(data: &[u8]) {
-        contract::check_wire::<T>(data);
+        if let Ok(value) = T::parse(data) {
+            assert_write(&value).unwrap();
+        }
         if let Ok(value) = T::parse(data) {
             assert!(value.to_bytes().unwrap().len() <= MAX_PDU);
         }
@@ -2524,7 +2527,9 @@ pub mod harness {
         roundtrip::<McsPdu>(data);
         roundtrip::<SecurityPayload>(data);
         plaintext(data);
-        contract::check_wire::<DataBlocks>(data);
+        if let Ok(value) = DataBlocks::parse(data) {
+            assert_write(&value).unwrap();
+        }
         if let Ok(blocks) = DataBlocks::parse(data) {
             assert!(blocks.to_bytes().unwrap().len() <= MAX_GCC_DATA);
         }
@@ -2551,9 +2556,8 @@ mod tests {
 
     use super::*;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream, pump};
-    use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::hex;
-    use fictionet::stdlib::test_support::{self, decode_all};
+    use fictionet::stdlib::test_support::{self, chunks, decode_all, decode_chunks};
 
     fn other_block(kind: u16, data: Vec<u8>) -> DataBlock {
         DataBlock::Other { kind, data }
@@ -3903,7 +3907,14 @@ mod tests {
             fast_path(0x80, vec![0xab; 128]).to_bytes().unwrap(),
         ];
         for b in samples {
-            contract::check_decode(Frames::<Frame>::new, &b);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Frames::<Frame>::new()),
+                    chunks(&b, &[1, 7, 64]),
+                    |_| {}
+                ),
+                decode_all(Frames::<Frame>::new, &b)
+            );
             for n in 0..b.len() {
                 assert_eq!(Frame::parse_prefix(&b[..n]), Ok(None));
             }
@@ -3963,7 +3974,14 @@ mod tests {
     #[test]
     fn streaming_backpressure_and_terminal_error() {
         let bytes = [0, 2].repeat(MAX_FRAME);
-        contract::check_decode(Frames::<Frame>::new, &bytes);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Frame>::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(Frames::<Frame>::new, &bytes)
+        );
         let mut stream = Stream::new(Frames::<Frame>::new());
         let mut count = 0;
         pump(&mut stream, &bytes, |_| count += 1).unwrap();
@@ -3988,14 +4006,28 @@ mod tests {
     fn maximum_frames_bytewise_and_mixed_stream() {
         let f = Frame::SlowPath(write_data(&vec![0; MAX_PDU]).unwrap());
         let b = f.to_bytes().unwrap();
-        contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &b, 2 * MAX_FRAME);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Frame>::new()),
+                chunks(&b, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_FRAME)
+            ),
+            decode_all(Frames::<Frame>::new, &b)
+        );
         let (frames, failure) = decode_all(Frames::<Frame>::new, &b);
         assert!(failure.is_none());
         assert_eq!(frames, [f]);
         let mut b = connection().to_packet().unwrap().to_bytes().unwrap();
         b.extend_from_slice(&fast_path(0xc0, vec![1; 130]).to_bytes().unwrap());
         b.extend_from_slice(&write_data(&[0x28]).unwrap().to_bytes().unwrap());
-        contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &b, 2 * MAX_FRAME);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Frame>::new()),
+                chunks(&b, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_FRAME)
+            ),
+            decode_all(Frames::<Frame>::new, &b)
+        );
         let (frames, failure) = decode_all(Frames::<Frame>::new, &b);
         assert!(failure.is_none());
         assert_eq!(frames.len(), 3);
@@ -4204,13 +4236,27 @@ mod tests {
         for _ in 0..2500 {
             let random = rng.bytes(511);
             check_parsers(&random);
-            contract::check_decode(Frames::<Frame>::new, &random);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Frames::<Frame>::new()),
+                    chunks(&random, &[1, 7, 64]),
+                    |_| {}
+                ),
+                decode_all(Frames::<Frame>::new, &random)
+            );
             let mut b = seeds[rng.index(seeds.len())].clone();
             for _ in 0..rng.below(4) {
                 test_support::mutate(&mut rng, &mut b);
             }
             check_parsers(&b);
-            contract::check_decode(Frames::<Frame>::new, &b);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Frames::<Frame>::new()),
+                    chunks(&b, &[1, 7, 64]),
+                    |_| {}
+                ),
+                decode_all(Frames::<Frame>::new, &b)
+            );
         }
     }
 }

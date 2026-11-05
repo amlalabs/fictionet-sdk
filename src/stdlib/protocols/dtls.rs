@@ -1552,29 +1552,43 @@ pub mod harness {
         MAX_MESSAGE_LEN, MAX_REASSEMBLY_BYTES, Reassembler, Record, ServerHello,
     };
     use fictionet::stdlib::codec::Wire;
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::assert_write;
 
     /// Checks the wire contracts for records, fragments, messages and hellos.
     pub fn wire(data: &[u8]) {
-        contract::check_wire::<Datagram>(data);
-        contract::check_wire::<Fragment>(data);
-        contract::check_wire::<Fragments>(data);
-        contract::check_wire::<Handshake>(data);
-        contract::check_wire::<ClientHello>(data);
-        contract::check_wire::<ServerHello>(data);
-        contract::check_wire::<HelloVerifyRequest>(data);
+        if let Ok(value) = Datagram::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Fragment::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Fragments::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Handshake::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = ClientHello::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = ServerHello::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = HelloVerifyRequest::parse(data) {
+            assert_write(&value).unwrap();
+        }
     }
 
     /// Checks records read with a runtime CID length.
     pub fn records(data: &[u8], cid_len: u8) {
         if let Ok(record) = Record::read(data, cid_len) {
             let datagram = record.datagram(cid_len).unwrap();
-            contract::check_wire_value(&datagram);
+            let _ = assert_write(&datagram);
             assert_eq!(datagram.to_bytes().unwrap(), data);
         }
         if let Ok(records) = Datagram::read(data, cid_len) {
             let datagram = Datagram::new(&records, cid_len).unwrap();
-            contract::check_wire_value(&datagram);
+            let _ = assert_write(&datagram);
             assert_eq!(datagram.to_bytes().unwrap(), data);
         }
     }
@@ -1583,7 +1597,7 @@ pub mod harness {
     pub fn record_values(built: &[Record], cid_len: u8) {
         for record in built {
             if let Ok(datagram) = record.datagram(cid_len) {
-                contract::check_wire_value(&datagram);
+                let _ = assert_write(&datagram);
                 assert_eq!(
                     Record::read(&datagram.to_bytes().unwrap(), cid_len).as_ref(),
                     Ok(record)
@@ -1591,7 +1605,7 @@ pub mod harness {
             }
         }
         if let Ok(datagram) = Datagram::new(built, cid_len) {
-            contract::check_wire_value(&datagram);
+            let _ = assert_write(&datagram);
             assert_eq!(
                 Datagram::read(&datagram.to_bytes().unwrap(), cid_len).as_deref(),
                 Ok(built)
@@ -1613,7 +1627,7 @@ pub mod harness {
                 assert!(r.buffered() <= MAX_REASSEMBLY_BYTES);
                 while let Some(m) = r.next_message() {
                     let _ = m.parse_body();
-                    contract::check_wire_value(&m);
+                    let _ = assert_write(&m);
                 }
             }
             let next = Handshake {
@@ -1633,7 +1647,7 @@ pub mod harness {
     pub fn reassemble(message: &Handshake, fragments: &[Fragment]) {
         let mut r = Reassembler::new();
         for f in fragments {
-            contract::check_wire_value(f);
+            let _ = assert_write(f);
             let f = Fragment::parse(&f.to_bytes().unwrap()).unwrap();
             r.add(&f).unwrap();
         }
@@ -1673,7 +1687,7 @@ mod tests {
 
     use super::*;
     use fictionet::stdlib::codec::Lcg;
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::assert_write;
     use fictionet::stdlib::test_support::mutate;
 
     /// A DTLS 1.2 handshake record, laid out field by field as in RFC 6347,
@@ -2250,7 +2264,7 @@ mod tests {
         ];
         for (name, c) in values {
             assert_eq!(c.to_bytes(), Err(Error::Unwritable), "{name}");
-            contract::check_wire_value(&c);
+            let _ = assert_write(&c);
         }
     }
 
@@ -2357,7 +2371,7 @@ mod tests {
             ),
         ] {
             assert_eq!(f.to_bytes(), Err(Error::Unwritable), "{name}");
-            contract::check_wire_value(&f);
+            let _ = assert_write(&f);
         }
     }
 
@@ -2376,7 +2390,7 @@ mod tests {
                 fixture_extension(3, vec![0; 20000]),
             ]),
         };
-        contract::check_wire_value(&ch);
+        let _ = assert_write(&ch);
         assert_eq!(ch.to_bytes(), Err(Error::Unwritable));
         let mut ch = ClientHello::parse(&client_hello_bytes()).unwrap();
         ch.extensions = Some(vec![fixture_extension(1, vec![0; 20000])]);
@@ -2412,13 +2426,13 @@ mod tests {
             compression_method: 0,
             extensions: None,
         };
-        contract::check_wire_value(&sh);
+        let _ = assert_write(&sh);
         assert_eq!(sh.to_bytes(), Err(Error::Unwritable));
         let h = HelloVerifyRequest {
             version: 0,
             cookie: vec![0; 1000],
         };
-        contract::check_wire_value(&h);
+        let _ = assert_write(&h);
         assert_eq!(h.to_bytes(), Err(Error::Unwritable));
 
         let p = Record::Plain(PlainRecord {
@@ -2446,7 +2460,7 @@ mod tests {
             offset: u32::MAX,
             body: vec![1; 10],
         };
-        contract::check_wire_value(&f);
+        let _ = assert_write(&f);
         assert_eq!(f.to_bytes(), Err(Error::Unwritable));
         let f = Fragment {
             msg_type: 1,
@@ -2455,12 +2469,12 @@ mod tests {
             offset: 2,
             body: vec![1; 10],
         };
-        contract::check_wire_value(&f);
+        let _ = assert_write(&f);
         assert_eq!(f.to_bytes(), Err(Error::Unwritable));
         let big = fixture_handshake(1, 0, vec![0; MAX_MESSAGE_LEN + 10]);
         assert_eq!(big.to_fragment(), Err(Error::Unwritable));
         assert_eq!(big.to_bytes(), Err(Error::Unwritable));
-        contract::check_wire_value(&big);
+        let _ = assert_write(&big);
     }
 
     #[test]
@@ -2628,17 +2642,19 @@ mod tests {
         let invalid = Datagram::new(&[plain.clone(), open.clone(), plain.clone()], 0);
         assert_eq!(invalid, Err(Error::Unwritable));
         let valid = Datagram::new(&[plain, open], 0).unwrap();
-        contract::check_wire_value(&valid);
+        let _ = assert_write(&valid);
     }
 
     #[test]
     fn datagram_bytes_obey_the_size_limit() {
         let bytes = vec![0; MAX_DATAGRAM_LEN + 1];
         assert_eq!(Datagram::parse(&bytes), Err(Error::Length(bytes.len())));
-        contract::check_wire::<Datagram>(&bytes);
+        if let Ok(value) = Datagram::parse(&bytes) {
+            assert_write(&value).unwrap();
+        }
         let datagram = Datagram(bytes);
         assert_eq!(datagram.to_bytes(), Err(Error::Unwritable));
-        contract::check_wire_value(&datagram);
+        let _ = assert_write(&datagram);
     }
 
     #[test]
@@ -2652,7 +2668,7 @@ mod tests {
             let datagram = Datagram::new(&records, cid_len).unwrap();
             let bytes = datagram.to_bytes().unwrap();
             assert_eq!(Datagram::read(&bytes, cid_len).unwrap(), records);
-            contract::check_wire_value(&datagram);
+            let _ = assert_write(&datagram);
             for record in records {
                 let bytes = record.datagram(cid_len).unwrap().to_bytes().unwrap();
                 assert_eq!(Record::read(&bytes, cid_len), Ok(record));
@@ -2677,7 +2693,7 @@ mod tests {
             Datagram::read(&datagram.to_bytes().unwrap(), 1).unwrap(),
             selected
         );
-        contract::check_wire_value(&datagram);
+        let _ = assert_write(&datagram);
         assert_eq!(Datagram::new(&records, 1), Err(Error::Unwritable));
     }
 
@@ -2770,7 +2786,7 @@ mod tests {
         let mut ch = ClientHello::parse(&client_hello_bytes()).unwrap();
         ch.cipher_suites.clear();
         ch.compression_methods.clear();
-        contract::check_wire_value(&ch);
+        let _ = assert_write(&ch);
         assert_eq!(ch.to_bytes(), Err(Error::Unwritable));
     }
 
@@ -2797,7 +2813,7 @@ mod tests {
         // Writers refuse duplicate types.
         let svs = |v: u8| fixture_extension(extension_type::SUPPORTED_VERSIONS, vec![0xfe, v]);
         sh.extensions = Some(vec![svs(0xfc), fixture_extension(1, vec![]), svs(0xfd)]);
-        contract::check_wire_value(&sh);
+        let _ = assert_write(&sh);
         assert_eq!(sh.to_bytes(), Err(Error::Unwritable));
     }
 

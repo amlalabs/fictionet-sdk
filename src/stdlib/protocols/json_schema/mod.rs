@@ -3028,7 +3028,7 @@ mod tests {
     use super::*;
     use fictionet::stdlib::protocols::json;
     use fictionet::stdlib::test_support;
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::assert_write;
 
     fn value(text: &str) -> Value {
         json::parse_with(text.as_bytes(), &json::Limits::default()).unwrap()
@@ -3567,7 +3567,7 @@ mod tests {
                     .unwrap_or_else(|e| panic!("{text} seed {seed}: {e}"));
                 assert!(s.validate(&v).is_valid(), "{text}: {v:?}");
                 assert_eq!(s.generate(seed, GenerationLimits::default()).unwrap(), v);
-                contract::check_wire_value(&v);
+                let _ = assert_write(&v);
             }
         }
         for text in [
@@ -3851,7 +3851,7 @@ mod tests {
         for _ in 0..json::MAX_DEPTH {
             instance = Value::Object(vec![("next".into(), instance)]);
         }
-        contract::check_wire_value(&instance);
+        let _ = assert_write(&instance);
         let report = s.validate(&instance);
         assert!(report.is_valid(), "{report:?}");
     }

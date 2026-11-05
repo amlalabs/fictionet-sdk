@@ -2236,13 +2236,17 @@ fn ip_version(endpoints: &Endpoints) -> Version {
 pub mod harness {
     use super::{Error, LSA_HEADER_LEN, Lsa, LsaBody, LsaBodyFrame, LsaFrame, MAX_LSA, Version};
     use fictionet::stdlib::codec::Wire;
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::assert_write;
 
     /// Checks standalone LSA and body wire contracts, parsed write-back,
     /// header checksum and length, and the body parse limit on one buffer.
     pub fn check_lsa(data: &[u8], v: Version) {
-        contract::check_wire::<LsaFrame>(data);
-        contract::check_wire::<LsaBodyFrame>(data);
+        if let Ok(value) = LsaFrame::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = LsaBodyFrame::parse(data) {
+            assert_write(&value).unwrap();
+        }
         if let Ok((lsa, n)) = Lsa::parse(data, v) {
             // An LSA read writes back to the same bytes, so its header is the
             // one received (RFC 2328 sections 13.1 and 13.7).
@@ -2279,7 +2283,9 @@ mod tests {
     use super::*;
     use fictionet::assert_cases;
     use fictionet::stdlib::codec::Lcg;
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::codec::{Collect, CollectError, Decode, Fail, Stream};
+    use fictionet::stdlib::test_support::{chunks, decode_chunks};
+
     use fictionet::stdlib::test_support::mutate;
 
     fn prefix_fixture(length: u8, options: u8, address: Ipv6Addr) -> Prefix {
@@ -2299,7 +2305,24 @@ mod tests {
     }
 
     fn collect(b: &[u8], e: &Endpoints) -> Result<Packet, Error> {
-        contract::check_collect_with(b, MAX_MESSAGE, |b| Packet::parse(b, e))
+        let parsed = Packet::parse(b, e);
+        let decoded = decode_chunks(
+            &mut Stream::new(Collect::bytes(MAX_MESSAGE).map(|d| Packet::parse(&d, e))),
+            chunks(b, &[1, 7, 64]),
+            |s| assert!(s.allocated() <= 2 * (MAX_MESSAGE + 1)),
+        );
+        if b.len() <= MAX_MESSAGE {
+            assert_eq!(decoded, (vec![parsed.clone()], None));
+        } else {
+            assert_eq!(
+                decoded,
+                (
+                    vec![],
+                    Some(Fail::Protocol(CollectError::TooLong { limit: MAX_MESSAGE }))
+                )
+            );
+        }
+        parsed
     }
 
     fn ip4(a: u8, b: u8, c: u8, d: u8) -> Ipv4Addr {

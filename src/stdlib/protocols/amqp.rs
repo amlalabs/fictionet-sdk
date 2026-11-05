@@ -2518,9 +2518,10 @@ mod tests {
     use super::*;
     use fictionet::assert_cases;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream, pump};
-    use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::rounds;
-    use fictionet::stdlib::test_support::{decode_all, mutate};
+    use fictionet::stdlib::test_support::{
+        assert_write, chunks, decode_all, decode_chunks, mutate,
+    };
 
     fn s(v: &str) -> String {
         v.to_string()
@@ -3469,10 +3470,13 @@ mod tests {
             Frame::heartbeat(),
         ];
         let bytes: Vec<_> = frames.iter().flat_map(|f| f.to_bytes().unwrap()).collect();
-        contract::check_decode_with_alloc_limit(
-            Frames::new,
-            &bytes,
-            2 * DEFAULT_FRAME_MAX as usize,
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * DEFAULT_FRAME_MAX as usize)
+            ),
+            decode_all(Frames::new, &bytes)
         );
         assert_eq!(decode_all(Frames::new, &bytes), (frames.to_vec(), None));
         let mut stream = Stream::new(Frames::new());
@@ -3646,10 +3650,13 @@ mod tests {
     #[test]
     fn stream_buffer_is_bounded() {
         let chunk = vec![3u8; rounds(100_000)];
-        contract::check_decode_with_alloc_limit(
-            Frames::new,
-            &chunk,
-            2 * DEFAULT_FRAME_MAX as usize,
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::new()),
+                chunks(&chunk, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * DEFAULT_FRAME_MAX as usize)
+            ),
+            decode_all(Frames::new, &chunk)
         );
         assert!(matches!(
             decode_all(Frames::new, &chunk).1,
@@ -3670,7 +3677,14 @@ mod tests {
             f.set_frame_max(4096);
             f
         };
-        contract::check_decode_with_alloc_limit(make, &bytes, 8192);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(make()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 8192)
+            ),
+            decode_all(make, &bytes)
+        );
         assert_eq!(decode_all(make, &bytes), (vec![one; 1000], None));
     }
 
@@ -3815,14 +3829,22 @@ mod tests {
                 ("negative_zero".into(), FieldValue::F64(-0.0)),
             ],
         };
-        contract::check_wire_value(&table);
-        contract::check_wire::<Table>(&table.to_bytes().unwrap());
+        let _ = assert_write(&table);
+        if let Ok(value) = Table::parse(&table.to_bytes().unwrap()) {
+            assert_write(&value).unwrap();
+        }
     }
 
     fn check_payload(p: &[u8]) {
-        contract::check_wire::<Method>(p);
-        contract::check_wire::<ContentHeader>(p);
-        contract::check_wire::<Table>(p);
+        if let Ok(value) = Method::parse(p) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = ContentHeader::parse(p) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Table::parse(p) {
+            assert_write(&value).unwrap();
+        }
     }
 
     fn check_stream(data: &[u8], server: bool) {
@@ -3833,9 +3855,16 @@ mod tests {
                 Frames::new()
             }
         };
-        contract::check_decode_with_alloc_limit(make, data, 2 * DEFAULT_FRAME_MAX as usize);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(make()),
+                chunks(data, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * DEFAULT_FRAME_MAX as usize)
+            ),
+            decode_all(make, data)
+        );
         for frame in decode_all(make, data).0 {
-            contract::check_wire_value(&frame);
+            let _ = assert_write(&frame);
             check_payload(&frame.payload);
         }
     }

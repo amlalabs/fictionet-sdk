@@ -919,9 +919,10 @@ mod tests {
 
     use super::*;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream};
-    use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::rounds;
-    use fictionet::stdlib::test_support::{decode_all, mutate};
+    use fictionet::stdlib::test_support::{
+        assert_write, chunks, decode_all, decode_chunks, mutate,
+    };
 
     fn wire(packet: &Packet) -> Result<Vec<u8>, Error> {
         let mut out = Vec::new();
@@ -1490,7 +1491,7 @@ mod tests {
                 assert_eq!(result, Err(Error::Unwritable));
                 assert_eq!(runtime_out, prefix);
             }
-            contract::check_wire_value(&typed);
+            let _ = assert_write(&typed);
         }
         let mut packets = samples();
         for hmac_len in [0, 32, 64] {
@@ -1737,7 +1738,14 @@ mod tests {
         let a = envelope(&samples()[0]).unwrap();
         let b = envelope(&samples()[5]).unwrap();
         let bytes = [a.clone(), b.clone()].concat();
-        contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &bytes, 2 * MAX_TCP_FRAME);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Frame>::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_TCP_FRAME)
+            ),
+            decode_all(Frames::<Frame>::new, &bytes)
+        );
         assert_eq!(
             decode_all(Frames::<Frame>::new, &bytes),
             (vec![Frame(a[2..].to_vec()), Frame(b[2..].to_vec())], None)
@@ -1752,7 +1760,14 @@ mod tests {
     #[test]
     fn stream_holds_a_bounded_number_of_bytes() {
         let longest = Frame(vec![0x30; MAX_PACKET]).to_bytes().unwrap();
-        contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &longest, 2 * MAX_TCP_FRAME);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Frame>::new()),
+                chunks(&longest, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_TCP_FRAME)
+            ),
+            decode_all(Frames::<Frame>::new, &longest)
+        );
         assert_eq!(
             decode_all(Frames::<Frame>::new, &longest),
             (vec![Frame(longest[2..].to_vec())], None)
@@ -1831,13 +1846,35 @@ mod tests {
                     Err(Error::HmacLen(MAX_HMAC_LEN + 1))
                 );
             }
-            contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &b, 2 * MAX_TCP_FRAME);
-            contract::check_wire::<Frame>(&b);
-            contract::check_wire::<Packet>(&b);
-            contract::check_wire::<Authenticated<20>>(&b);
-            contract::check_wire::<Encrypted>(&b);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Frames::<Frame>::new()),
+                    chunks(&b, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_TCP_FRAME)
+                ),
+                decode_all(Frames::<Frame>::new, &b)
+            );
+            if let Ok(value) = Frame::parse(&b) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = Packet::parse(&b) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = <Authenticated<20>>::parse(&b) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = Encrypted::parse(&b) {
+                assert_write(&value).unwrap();
+            }
             mutate(&mut rng, &mut b);
-            contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &b, 2 * MAX_TCP_FRAME);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Frames::<Frame>::new()),
+                    chunks(&b, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_TCP_FRAME)
+                ),
+                decode_all(Frames::<Frame>::new, &b)
+            );
         }
         // Built packets with random fields: each is written and read back
         // as the same value, or refused for the reason it breaks.

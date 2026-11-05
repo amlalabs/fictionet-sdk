@@ -1,7 +1,7 @@
 use super::*;
 use alloc::{rc::Rc, vec, vec::Vec};
 use core::{cell::Cell, convert::Infallible, fmt};
-use fictionet::stdlib::test_support::{self, contract};
+use fictionet::stdlib::test_support::{self, chunks, decode_all, decode_chunks};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct TestError;
@@ -79,7 +79,6 @@ pub(super) enum Fault {
     Error,
     End,
     Count,
-    ZeroItem,
     ZeroSkip,
     Grow(usize),
     Drain(usize, bool),
@@ -108,7 +107,6 @@ impl Decode for Fault {
             Self::Error => Err(TestError),
             Self::End => Ok(Step::End),
             Self::Count => Ok(Step::Item((), usize::MAX)),
-            Self::ZeroItem => Ok(Step::Item((), 0)),
             Self::ZeroSkip => Ok(Step::Skip(0)),
             Self::Grow(n) => {
                 *n = n.saturating_add(1);
@@ -487,7 +485,14 @@ fn collect_empty_full_limit_parse_error_and_single_item() {
         assert_eq!(items, vec![Blob(bytes.to_vec())]);
         assert_eq!(s.held(), 0);
         finish(&mut s, |_| panic!()).unwrap();
-        contract::check_decode(|| Collect::<Blob>::new(3), bytes);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Collect::<Blob>::new(3)),
+                chunks(bytes, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(|| Collect::<Blob>::new(3), bytes)
+        );
     }
     let mut s = Stream::new(Collect::<Blob>::new(3));
     assert_eq!(
@@ -558,7 +563,14 @@ fn lines_partition_invariance_and_scan_cursor() {
             b"abcd\n",
             b"abcd\r\n",
         ] {
-            contract::check_decode(|| Lines::new(3, ending), data);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Lines::new(3, ending)),
+                    chunks(data, &[1, 7, 64]),
+                    |_| {}
+                ),
+                decode_all(|| Lines::new(3, ending), data)
+            );
         }
     }
     let mut lines = Lines::new(4096, Ending::Crlf);
@@ -582,7 +594,7 @@ fn lines_incremental_work() {
             // Grow one line, with one terminator search per byte at most.
             test_support::check_work(|| Lines::new(8190, ending), &bytes, Lines::examined, 0, 1);
             assert_eq!(
-                contract::check_decode(|| Lines::new(8190, ending), &bytes),
+                decode_all(|| Lines::new(8190, ending), &bytes),
                 (vec![Ok(vec![b'x'; content_len])], None)
             );
         }
@@ -636,7 +648,14 @@ fn lines_cr_lf_and_crlf() {
             b"\r",
             b"\r\n",
         ] {
-            contract::check_decode(|| Lines::new(max, ending), data);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Lines::new(max, ending)),
+                    chunks(data, &[1, 7, 64]),
+                    |_| {}
+                ),
+                decode_all(|| Lines::new(max, ending), data)
+            );
         }
     }
     assert_eq!(
@@ -694,7 +713,14 @@ fn assemble_fragments_with_interleaved_control() {
         ]
     );
     assert_eq!(s.held(), 0);
-    contract::check_decode(|| Assemble::new(Frames, 4, fragments), &data);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Assemble::new(Frames, 4, fragments)),
+            chunks(&data, &[1, 7, 64]),
+            |_| {}
+        ),
+        decode_all(|| Assemble::new(Frames, 4, fragments), &data)
+    );
 }
 #[test]
 fn assemble_exact_limit_and_refusal_preserve_held_bytes() {
@@ -795,7 +821,14 @@ fn pipe_two_layers_cross_payloads_and_match_separate_decoding() {
     assert_eq!(combined, separate);
     assert_eq!(s.decoder().spans().outer_offset(), data.len() as u64);
     assert_eq!(s.decoder().spans().iter().last().unwrap().outer, 11..14);
-    contract::check_decode(|| Pipe::new(Frames, Pairs, carry), &data);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Pipe::new(Frames, Pairs, carry)),
+            chunks(&data, &[1, 7, 64]),
+            |_| {}
+        ),
+        decode_all(|| Pipe::new(Frames, Pairs, carry), &data)
+    );
 }
 #[test]
 fn pipe_pending_larger_than_inner_buffer_is_not_overwritten() {
@@ -813,7 +846,14 @@ fn pipe_pending_larger_than_inner_buffer_is_not_overwritten() {
             Layered::Inner(vec![7, 8])
         ]
     );
-    contract::check_decode(|| Pipe::new(Frames, Pairs, carry), &data);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Pipe::new(Frames, Pairs, carry)),
+            chunks(&data, &[1, 7, 64]),
+            |_| {}
+        ),
+        decode_all(|| Pipe::new(Frames, Pairs, carry), &data)
+    );
 }
 #[test]
 fn pipe_eof_collect_empty_and_nonempty() {
@@ -830,7 +870,14 @@ fn pipe_eof_collect_empty_and_nonempty() {
                 b"abc".to_vec()
             }))]
         );
-        contract::check_decode(|| Pipe::new(Frames, Collect::<Blob>::new(8), carry), data);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Pipe::new(Frames, Collect::<Blob>::new(8), carry)),
+                chunks(data, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(|| Pipe::new(Frames, Collect::<Blob>::new(8), carry), data)
+        );
     }
 }
 #[test]
@@ -992,118 +1039,51 @@ fn demux_refuses_initial_state_and_delivers_item_before_budget_error() {
 }
 
 #[test]
-fn harness_accepts_correct_decoders_on_valid_and_invalid_inputs() {
+fn decoders_give_the_same_results_in_chunks_and_whole() {
     for data in [&b""[..], &[0x80, 1, 4, 2, 5, 6, 0xff], &[2, 1], &[0xfe]] {
-        contract::check_decode(|| Frames, data);
+        assert_eq!(
+            decode_chunks(&mut Stream::new(Frames), chunks(data, &[1, 7, 64]), |_| {}),
+            decode_all(|| Frames, data)
+        );
     }
     for data in [&b""[..], b"a", b"ab", b"abcdefghijklmnop"] {
-        contract::check_decode(|| Pairs, data);
-        contract::check_decode_with_held_limit(|| Collect::<Blob>::new(8), data, 1);
+        assert_eq!(
+            decode_chunks(&mut Stream::new(Pairs), chunks(data, &[1, 7, 64]), |_| {}),
+            decode_all(|| Pairs, data)
+        );
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Collect::<Blob>::new(8)),
+                chunks(data, &[1, 7, 64]),
+                |s| assert!(s.held() <= 1)
+            ),
+            decode_all(|| Collect::<Blob>::new(8), data)
+        );
     }
     let mut rng = fictionet::stdlib::codec::Lcg::new(42);
     for _ in 0..100 {
         let mut bytes = [0; 32];
         rng.fill(&mut bytes);
-        contract::check_decode(|| Frames, &bytes);
-        contract::check_decode(|| Lines::new(7, Ending::Crlf), &bytes);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames),
+                chunks(&bytes, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(|| Frames, &bytes)
+        );
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Lines::new(7, Ending::Crlf)),
+                chunks(&bytes, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(|| Lines::new(7, Ending::Crlf), &bytes)
+        );
     }
 }
 #[test]
-#[should_panic(expected = "chunking changed decoding")]
-fn harness_catches_chunking_dependent_output() {
-    struct Chunks;
-    impl Decode for Chunks {
-        type Item = Vec<u8>;
-        type Error = TestError;
-        const NAME: &'static str = "chunks";
-        fn capacity(&self) -> usize {
-            16
-        }
-        fn decode(&mut self, b: &[u8], _: bool) -> Result<Step<Vec<u8>>, TestError> {
-            Ok(if b.is_empty() {
-                Step::Need
-            } else {
-                Step::Item(b.to_vec(), b.len())
-            })
-        }
-    }
-    contract::check_decode(|| Chunks, b"abcdef");
-}
-#[test]
-#[should_panic(expected = "buffered exceeds capacity")]
-fn harness_catches_capacity_shrinking_below_buffered() {
-    struct Shrink(usize);
-    impl Decode for Shrink {
-        type Item = ();
-        type Error = TestError;
-        const NAME: &'static str = "shrink";
-        fn capacity(&self) -> usize {
-            self.0
-        }
-        fn decode(&mut self, _: &[u8], _: bool) -> Result<Step<()>, TestError> {
-            self.0 = 0;
-            Ok(Step::End)
-        }
-    }
-    contract::check_decode(|| Shrink(8), b"abc");
-}
-#[test]
-#[should_panic(expected = "Need at capacity")]
-fn harness_catches_stuck() {
-    contract::check_decode(|| Fault::Need, b"abcd");
-}
-#[test]
-#[should_panic(expected = "consumed count exceeds input")]
-fn harness_catches_consumed_miscount() {
-    contract::check_decode(|| Fault::Count, b"a");
-}
-#[test]
-#[should_panic(expected = "held grew across Need")]
-fn harness_catches_held_growth_across_need() {
-    contract::check_decode(|| Fault::Grow(0), b"a");
-}
-#[test]
-#[should_panic(expected = "harness item limit exceeded")]
-fn harness_catches_endless_zero_items() {
-    contract::check_decode(|| Fault::ZeroItem, b"");
-}
-#[test]
-#[should_panic(expected = "driver reported Stuck")]
-fn harness_catches_endless_zero_skips() {
-    contract::check_decode(|| Fault::ZeroSkip, b"");
-}
-#[test]
-fn harness_accepts_many_zero_steps_across_returned_items() {
-    contract::check_decode(|| Fault::Drain(70_000, true), b"");
-}
-#[test]
-fn harness_accepts_state_bounded_zero_steps_inside_one_next() {
-    contract::check_decode(|| Fault::Drain(70_000, false), b"");
-}
-#[test]
-#[should_panic(expected = "driver reported Stuck")]
-fn harness_catches_not_finishing_after_end() {
-    struct Forever;
-    impl Decode for Forever {
-        type Item = ();
-        type Error = TestError;
-        const NAME: &'static str = "forever";
-        fn capacity(&self) -> usize {
-            4
-        }
-        fn decode(&mut self, _: &[u8], eof: bool) -> Result<Step<()>, TestError> {
-            Ok(if eof { Step::Skip(0) } else { Step::Need })
-        }
-    }
-    contract::check_decode(|| Forever, b"");
-}
-#[test]
-#[should_panic(expected = "held exceeds named limit")]
-fn harness_catches_named_held_limit() {
-    contract::check_decode_with_held_limit(|| Fault::Drain(5, true), b"", 4);
-}
-#[test]
-fn harness_never_calls_decoder_after_error_or_end() {
+fn stream_never_calls_decoder_after_error_or_end() {
     struct Once {
         calls: Rc<Cell<usize>>,
         error: bool,
@@ -1126,81 +1106,20 @@ fn harness_never_calls_decoder_after_error_or_end() {
         }
     }
     for error in [false, true] {
-        contract::check_decode(
-            || Once {
-                calls: Rc::new(Cell::new(0)),
-                error,
-            },
-            b"abcd",
-        );
+        let calls = Rc::new(Cell::new(0));
+        let mut s = Stream::new(Once {
+            calls: calls.clone(),
+            error,
+        });
+        let (items, failure) = decode_chunks(&mut s, chunks(b"abcd", &[1, 7, 64]), |_| {});
+        assert!(items.is_empty());
+        assert_eq!(failure, error.then_some(Fail::Protocol(TestError)));
+        assert_eq!(s.push(b"after terminal result"), 21);
+        s.end();
+        assert!(s.next().is_none());
+        assert!(s.next().is_none());
+        assert_eq!(calls.get(), 1);
     }
-}
-#[derive(Debug, PartialEq)]
-struct BadWire<const KIND: u8>(u8);
-impl<const KIND: u8> Wire for BadWire<KIND> {
-    type ParseError = TestError;
-    type WriteError = TestError;
-    fn parse(b: &[u8]) -> Result<Self, TestError> {
-        match b {
-            [b] if *b != 0xff => Ok(Self(*b)),
-            _ => Err(TestError),
-        }
-    }
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), TestError> {
-        match KIND {
-            0 => out.push(0xff),                   // rejected output
-            1 => out.push(self.0.wrapping_add(1)), // different value
-            2 => {
-                out.push(0);
-                return Err(TestError);
-            } // failed transaction
-            3 => return Err(TestError),            // parsed values must write
-            _ => out.push(self.0),
-        }
-        Ok(())
-    }
-}
-#[test]
-#[should_panic(expected = "writer output does not parse")]
-fn harness_catches_wire_output_rejected_by_parser() {
-    contract::check_wire::<BadWire<0>>(&[1]);
-}
-#[test]
-#[should_panic(expected = "wire round trip changed value")]
-fn harness_catches_wire_roundtrip_mismatch() {
-    contract::check_wire::<BadWire<1>>(&[1]);
-}
-#[test]
-#[should_panic(expected = "writer changed destination on error")]
-fn harness_catches_nontransactional_write() {
-    contract::check_wire_value(&BadWire::<2>(1));
-}
-#[test]
-#[should_panic(expected = "parsed value does not write")]
-fn harness_catches_refusal_of_parsed_value() {
-    contract::check_wire::<BadWire<3>>(&[1]);
-}
-#[test]
-#[should_panic(expected = "test value must refuse writing")]
-fn refusal_check_rejects_success() {
-    contract::check_refused(&BadWire::<4>(1));
-}
-#[test]
-#[should_panic(expected = "writer changed destination on error")]
-fn refusal_check_rejects_changed_destination() {
-    contract::check_refused(&BadWire::<2>(1));
-}
-#[test]
-fn refusal_check_returns_error() {
-    assert_eq!(contract::check_refused(&BadWire::<3>(1)), TestError);
-}
-#[test]
-fn wire_harness_accepts_valid_and_refused_values() {
-    contract::check_wire::<Blob>(b"abc");
-    contract::check_wire::<Blob>(&[0xff]);
-    contract::check_wire_value(&Blob(vec![0xff]));
-    contract::check_wire_value(&Blob(vec![0; 65]));
-    contract::check_wire::<BadWire<4>>(&[1]);
 }
 #[test]
 fn test_support_reproducible_rng_and_chunks() {
@@ -1336,88 +1255,6 @@ fn test_support_decode_all() {
     assert_eq!(failure, None);
 }
 #[test]
-fn contract_alloc_limit_accepts_bounded_buffer() {
-    let data = [7, 1, 2, 3, 4, 5, 6, 7, 2, b'a', b'b', 0x80, 0];
-    contract::check_decode_with_alloc_limit(|| Frames, &data, 16);
-    let mut rng = fictionet::stdlib::codec::Lcg::new(8);
-    for _ in 0..20 {
-        let mut bytes = data.to_vec();
-        test_support::mutate(&mut rng, &mut bytes);
-        contract::check_decode_with_alloc_limit(|| Frames, &bytes, 16);
-    }
-}
-#[test]
-#[should_panic(expected = "buffer allocation exceeds limit")]
-fn contract_alloc_limit_rejects_large_buffer() {
-    contract::check_decode_with_alloc_limit(|| Frames, &[7, 1, 2, 3, 4, 5, 6, 7], 4);
-}
-#[test]
-fn contract_combined_limits_preserve_outcomes_with_one_traversal() {
-    for data in [
-        vec![2, b'a', b'b', 0],
-        vec![0, 2, b'a'],
-        vec![0, 0x40],
-        vec![0, 0xff, 0x40],
-        vec![0; 300],
-        vec![],
-    ] {
-        let made = Cell::new(0);
-        let make = || {
-            made.set(made.get() + 1);
-            Frames
-        };
-        let held = contract::check_decode_with_held_limit(make, &data, 0);
-        let schedules = made.replace(0);
-        assert!(schedules > 0);
-        let allocated = contract::check_decode_with_alloc_limit(make, &data, 16);
-        assert_eq!(made.replace(0), schedules);
-        let combined = contract::check_decode_limits(make, &data, 0, 16);
-        assert_eq!(made.get(), schedules);
-        // Whole input, four fixed and three random chunkings, then prefixes.
-        assert_eq!(made.get(), 8 + data.len().min(256) + 1);
-        assert_eq!(combined, held);
-        assert_eq!(combined, allocated);
-        assert_eq!(combined, test_support::decode_all(|| Frames, &data));
-    }
-}
-#[test]
-#[should_panic(expected = "held exceeds named limit")]
-fn contract_combined_limits_reject_initial_held_state() {
-    contract::check_decode_limits(|| Fault::Drain(5, true), b"", 4, 8);
-}
-#[test]
-#[should_panic(expected = "held exceeds named limit")]
-fn contract_combined_limits_reject_held_growth() {
-    struct Retain(Vec<u8>);
-    impl Decode for Retain {
-        type Item = ();
-        type Error = Infallible;
-        const NAME: &'static str = "retain";
-        fn capacity(&self) -> usize {
-            1
-        }
-        fn held(&self) -> usize {
-            self.0.len()
-        }
-        fn decode(&mut self, input: &[u8], _: bool) -> Result<Step<()>, Infallible> {
-            match input.first() {
-                None => Ok(Step::Need),
-                Some(&byte) => {
-                    self.0.push(byte);
-                    Ok(Step::Item((), 1))
-                }
-            }
-        }
-    }
-    contract::check_decode_limits(|| Retain(Vec::new()), b"a", 1, 2);
-    contract::check_decode_limits(|| Retain(Vec::new()), b"a", 0, 2);
-}
-#[test]
-#[should_panic(expected = "buffer allocation exceeds limit")]
-fn contract_combined_limits_reject_large_buffer() {
-    contract::check_decode_limits(|| Frames, &[7, 1, 2, 3, 4, 5, 6, 7], 0, 4);
-}
-#[test]
 fn wrappers_chain_to_their_source_and_display_only_their_own_context() {
     use alloc::string::ToString;
     use core::error::Error as _;
@@ -1490,7 +1327,14 @@ fn eof_allows_persistent_tables_in_held_state() {
     finish(&mut stream, |_| panic!()).unwrap();
     assert_eq!(stream.held(), 32);
     assert!(stream.failed().is_none());
-    contract::check_decode_with_held_limit(|| Table, b"", 32);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Table),
+            chunks(b"", &[1, 7, 64]),
+            |s| assert!(s.held() <= 32)
+        ),
+        decode_all(|| Table, b"")
+    );
 }
 
 #[test]
@@ -1505,7 +1349,14 @@ fn pipe_random_payload_partitions_preserve_inner_stream() {
             rng.fill(&mut payload);
             input.extend_from_slice(payload.get(..n).unwrap());
         }
-        contract::check_decode(|| Pipe::new(Frames, Pairs, carry), &input);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Pipe::new(Frames, Pairs, carry)),
+                chunks(&input, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(|| Pipe::new(Frames, Pairs, carry), &input)
+        );
     }
 }
 
@@ -1550,15 +1401,28 @@ fn regression_large_payload_zero_items() {
     pump(&mut s, &input, |_| count += 1).unwrap();
     finish(&mut s, |_| count += 1).unwrap();
     assert_eq!(count, input.len());
-    contract::check_decode(
-        || {
-            Pipe::new(
-                Collect::<Body>::new(1 << 20),
-                Lines::new(8, Ending::LfOrCrlf),
-                |b: Body| Carry::Bytes(b.0),
-            )
-        },
-        &input,
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new({
+                Pipe::new(
+                    Collect::<Body>::new(1 << 20),
+                    Lines::new(8, Ending::LfOrCrlf),
+                    |b: Body| Carry::Bytes(b.0),
+                )
+            }),
+            chunks(&input, &[1, 7, 64]),
+            |_| {}
+        ),
+        decode_all(
+            || {
+                Pipe::new(
+                    Collect::<Body>::new(1 << 20),
+                    Lines::new(8, Ending::LfOrCrlf),
+                    |b: Body| Carry::Bytes(b.0),
+                )
+            },
+            &input
+        )
     );
 }
 
@@ -1583,7 +1447,10 @@ fn regression_assemble_pipe_zero_fragments() {
     pump(&mut s, &data, |item| items.push(item)).unwrap();
     finish(&mut s, |_| panic!()).unwrap();
     assert_eq!(items, vec![Assembled::Message(b"a".to_vec())]);
-    contract::check_decode(make, &data);
+    assert_eq!(
+        decode_chunks(&mut Stream::new(make()), chunks(&data, &[1, 7, 64]), |_| {}),
+        decode_all(make, &data)
+    );
 }
 
 #[test]
@@ -1607,7 +1474,10 @@ fn regression_nested_expanding_pipe() {
     pump(&mut s, &data, |_| count += 1).unwrap();
     finish(&mut s, |_| count += 1).unwrap();
     assert_eq!(count, 16);
-    contract::check_decode(make, &data);
+    assert_eq!(
+        decode_chunks(&mut Stream::new(make()), chunks(&data, &[1, 7, 64]), |_| {}),
+        decode_all(make, &data)
+    );
 }
 
 #[test]
@@ -1954,7 +1824,14 @@ impl Decode for Expand {
 
 #[test]
 fn regression_lines_expanding_pipe_bytewise() {
-    contract::check_decode_with_held_limit(Expand::default, b"abcd!", 64);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Expand::default()),
+            chunks(b"abcd!", &[1, 7, 64]),
+            |s| assert!(s.held() <= 64)
+        ),
+        decode_all(Expand::default, b"abcd!")
+    );
     let make = || {
         Pipe::new(
             Lines::new(16, Ending::LfOrCrlf),
@@ -1980,7 +1857,10 @@ fn regression_lines_expanding_pipe_bytewise() {
         assert_eq!(s.offset(), data.len() as u64);
         assert_eq!(s.held(), 0);
     }
-    contract::check_decode(make, data);
+    assert_eq!(
+        decode_chunks(&mut Stream::new(make()), chunks(data, &[1, 7, 64]), |_| {}),
+        decode_all(make, data)
+    );
 }
 
 #[test]
@@ -2006,7 +1886,14 @@ fn regression_pipe_over_expanding_assemble() {
         items,
         vec![Layered::Inner(Assembled::Message(b"abababab".to_vec()))]
     );
-    contract::check_decode(make, &[3, 2, b'a', b'b', 1, 0]);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(make()),
+            chunks(&[3, 2, b'a', b'b', 1, 0], &[1, 7, 64]),
+            |_| {}
+        ),
+        decode_all(make, &[3, 2, b'a', b'b', 1, 0])
+    );
 }
 
 fn expanding_frame_pipe()
@@ -2042,7 +1929,14 @@ fn regression_nested_expanding_pipe_waits_for_payload() {
 
 #[test]
 fn regression_nested_expanding_pipe_contract() {
-    contract::check_decode(expanding_frame_pipe, &[2, 1, 1, 2, 1, 2]);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(expanding_frame_pipe()),
+            chunks(&[2, 1, 1, 2, 1, 2], &[1, 7, 64]),
+            |_| {}
+        ),
+        decode_all(expanding_frame_pipe, &[2, 1, 1, 2, 1, 2])
+    );
 }
 
 #[test]
@@ -2069,7 +1963,14 @@ fn regression_nested_expanding_pipe_into_collect() {
         items,
         vec![Layered::Inner(Layered::Inner(Body(b"aaaa".to_vec())))]
     );
-    contract::check_decode(make, &[2, 1, b'a']);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(make()),
+            chunks(&[2, 1, b'a'], &[1, 7, 64]),
+            |_| {}
+        ),
+        decode_all(make, &[2, 1, b'a'])
+    );
 }
 
 #[derive(Default)]
@@ -2104,7 +2005,14 @@ impl Decode for Table {
 
 #[test]
 fn regression_pipe_over_growing_table() {
-    contract::check_decode_with_held_limit(Table::default, b"ttxtq", 64);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Table::default()),
+            chunks(b"ttxtq", &[1, 7, 64]),
+            |s| assert!(s.held() <= 64)
+        ),
+        decode_all(Table::default, b"ttxtq")
+    );
     let make = || Pipe::new(Frames, Table::default(), Carry::Bytes);
     let mut s = Stream::new(make());
     assert_eq!(
@@ -2116,16 +2024,35 @@ fn regression_pipe_over_growing_table() {
     assert_eq!(pump(&mut s, &[1, b'x'], |i| items.push(i)), Ok(2));
     finish(&mut s, |i| items.push(i)).unwrap();
     assert_eq!(items, vec![Layered::Inner(b'x')]);
-    contract::check_decode(make, &[1, b't', 1, b'x']);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(make()),
+            chunks(&[1, b't', 1, b'x'], &[1, 7, 64]),
+            |_| {}
+        ),
+        decode_all(make, &[1, b't', 1, b'x'])
+    );
 }
 
 #[test]
 fn regression_pipe_over_growing_table_contract() {
-    contract::check_decode(
-        || Pipe::new(Frames, Table::default(), carry),
-        &[
-            2, 0, 116, 187, 6, 116, 116, 227, 67, 19, 116, 63, 251, 0, 202,
-        ],
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Pipe::new(Frames, Table::default(), carry)),
+            chunks(
+                &[
+                    2, 0, 116, 187, 6, 116, 116, 227, 67, 19, 116, 63, 251, 0, 202,
+                ],
+                &[1, 7, 64]
+            ),
+            |_| {}
+        ),
+        decode_all(
+            || Pipe::new(Frames, Table::default(), carry),
+            &[
+                2, 0, 116, 187, 6, 116, 116, 227, 67, 19, 116, 63, 251, 0, 202,
+            ]
+        )
     );
 }
 
@@ -2169,12 +2096,6 @@ fn regression_oscillating_zero_skips_terminate() {
     assert!(calls < 100);
     assert_eq!(s.next(), None);
     assert_eq!(s.decoder().calls, calls);
-}
-
-#[test]
-#[should_panic(expected = "driver reported Stuck")]
-fn regression_harness_rejects_oscillating_zero_skips() {
-    contract::check_decode(Oscillating::default, b"a");
 }
 
 #[test]

@@ -937,9 +937,10 @@ mod tests {
     use super::*;
     use fictionet::assert_cases;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream};
-    use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::rounds;
-    use fictionet::stdlib::test_support::{chunks, decode_all, mutate};
+    use fictionet::stdlib::test_support::{
+        assert_write, chunks, decode_all, decode_chunks, mutate,
+    };
 
     #[test]
     fn asn1_error_source_and_display() {
@@ -1340,7 +1341,7 @@ mod tests {
             let mut out = vec![42];
             assert_eq!(wrapper.write(&mut out), Err(Error::WrappedResp));
             assert_eq!(out, [42]);
-            contract::check_wire_value(&wrapper);
+            let _ = assert_write(&wrapper);
 
             // Received wrappers still need the same check.
             let mut bytes = vec![
@@ -1358,10 +1359,12 @@ mod tests {
             bytes.extend_from_slice(inner);
             assert_eq!(InitialContextToken::parse(&bytes), Err(Error::WrappedResp));
             assert_eq!(NegotiationToken::parse(&bytes), Err(Error::WrappedResp));
-            contract::check_wire::<InitialContextToken>(&bytes);
+            if let Ok(value) = InitialContextToken::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
 
             // Other mechanisms retain their own inner-token syntax.
-            contract::check_wire_value(&initial_context_token(Mech::Ntlm, inner.to_vec()));
+            let _ = assert_write(&initial_context_token(Mech::Ntlm, inner.to_vec()));
         }
     }
 
@@ -1831,7 +1834,14 @@ mod tests {
             0x04, 0x00,
         ];
         assert_eq!(NegotiationToken::parse(&b), Err(Error::HintAddress));
-        contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &b, 2 * MAX_TOKEN);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Frame>::new()),
+                chunks(&b, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_TOKEN)
+            ),
+            decode_all(Frames::<Frame>::new, &b)
+        );
     }
 
     #[test]
@@ -1912,8 +1922,12 @@ mod tests {
     /// Whatever a parse gives, writing it and reading it back gives the
     /// same value.
     fn check(b: &[u8]) {
-        contract::check_wire::<NegotiationToken>(b);
-        contract::check_wire::<InitialContextToken>(b);
+        if let Ok(value) = NegotiationToken::parse(b) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = InitialContextToken::parse(b) {
+            assert_write(&value).unwrap();
+        }
         if let Ok(Some(n)) = token_len(b) {
             assert!(n <= b.len());
         }
@@ -1957,7 +1971,14 @@ mod tests {
             if !rng.coin() {
                 stream.extend_from_slice(&m);
             }
-            contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &stream, 2 * MAX_TOKEN);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Frames::<Frame>::new()),
+                    chunks(&stream, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_TOKEN)
+                ),
+                decode_all(Frames::<Frame>::new, &stream)
+            );
             for token in decode_all(Frames::<Frame>::new, &stream).0 {
                 check(&token);
             }
@@ -1967,11 +1988,18 @@ mod tests {
     #[test]
     fn codec_frames_bound_headers_and_report_once() {
         use fictionet::stdlib::codec::{Fail, Stream};
-        use fictionet::stdlib::test_support::contract;
+        use fictionet::stdlib::test_support::{chunks, decode_all, decode_chunks};
         assert_eq!(Frames::<Frame>::new().capacity(), MAX_TOKEN);
         let mut stream = Stream::new(Frames::<Frame>::new());
         let bytes = [GSS_TAG, 0x83, 1, 0, 0];
-        contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &bytes, 2 * MAX_TOKEN);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Frame>::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_TOKEN)
+            ),
+            decode_all(Frames::<Frame>::new, &bytes)
+        );
         assert_eq!(stream.push(&bytes), bytes.len());
         assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::TooLong))));
         assert_eq!(stream.next(), None);
@@ -1981,7 +2009,7 @@ mod tests {
     #[test]
     fn codec_wire_domain_excludes_hint_addresses() {
         use fictionet::stdlib::codec::Wire;
-        use fictionet::stdlib::test_support::contract;
+        use fictionet::stdlib::test_support::assert_write;
         // A received hint address is outside the Wire domain.
         let bytes = [0xa0, 10, 0x30, 8, 0xa3, 6, 0x30, 4, 0xa1, 2, 4, 0];
         let token = NegotiationToken::Init(NegTokenInit {
@@ -1993,15 +2021,17 @@ mod tests {
             <NegotiationToken as Wire>::parse(&bytes),
             Err(Error::HintAddress)
         );
-        contract::check_wire::<NegotiationToken>(&bytes);
-        contract::check_wire_value(&token);
+        if let Ok(value) = NegotiationToken::parse(&bytes) {
+            assert_write(&value).unwrap();
+        }
+        let _ = assert_write(&token);
         let mut out = vec![42];
         assert_eq!(token.write(&mut out), Err(Error::HintAddress));
         assert_eq!(out, [42]);
         let good = NegotiationToken::Resp(NegTokenResp::default());
-        contract::check_wire_value(&good);
+        let _ = assert_write(&good);
         let wrapper = initial_context_token(Mech::Kerberos, vec![1, 0, 5, 0]);
-        contract::check_wire_value(&wrapper);
+        let _ = assert_write(&wrapper);
         let mut bytes = wrapper.to_bytes().unwrap();
         bytes.push(0);
         assert!(<InitialContextToken as Wire>::parse(&bytes).is_err());

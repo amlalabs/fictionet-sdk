@@ -1446,11 +1446,11 @@ pub mod harness {
 mod tests {
     use super::harness::strings;
     use super::*;
-    use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::codec::Step;
-    use fictionet::stdlib::codec::{Decode, Fail, Stream, finish, pump};
+    use fictionet::stdlib::codec::{Decode, Fail, finish, pump};
+    use fictionet::stdlib::codec::{Lcg, Stream};
     use fictionet::stdlib::test_support;
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
 
     #[test]
     fn status_details_refuse_varint_overflow() {
@@ -1617,7 +1617,7 @@ mod tests {
                 out,
                 [prefix.as_slice(), &message.to_bytes().unwrap()].concat()
             );
-            contract::check_wire_value(&message);
+            let _ = assert_write(&message);
         }
         let too_large = Message {
             compressed: false,
@@ -1632,7 +1632,7 @@ mod tests {
             })
         );
         assert_eq!(out, prefix);
-        contract::check_wire_value(&too_large);
+        let _ = assert_write(&too_large);
     }
 
     #[test]
@@ -1657,8 +1657,17 @@ mod tests {
         for _ in 0..128 {
             let mut data = [0; 64];
             rng.fill(&mut data);
-            contract::check_decode(Frames::<Message>::new, &data);
-            contract::check_wire::<Message>(&data);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Frames::<Message>::new()),
+                    chunks(&data, &[1, 7, 64]),
+                    |_| {}
+                ),
+                decode_all(Frames::<Message>::new, &data)
+            );
+            if let Ok(value) = Message::parse(&data) {
+                assert_write(&value).unwrap();
+            }
 
             let mut bytes = Vec::new();
             for payload in data.chunks(8) {
@@ -1667,20 +1676,28 @@ mod tests {
                     data: payload.to_vec(),
                 };
                 let encoded = message.to_bytes().unwrap();
-                contract::check_wire::<Message>(&encoded);
+                if let Ok(value) = Message::parse(&encoded) {
+                    assert_write(&value).unwrap();
+                }
                 bytes.extend(encoded);
             }
             // Exercise accepted messages, small-limit refusals, and every EOF prefix.
             for limit in [0, 7, 8, MAX_MESSAGE] {
-                contract::check_decode_with_held_limit(
-                    || Frames::<Message>::with_limit(limit),
-                    &bytes,
-                    0,
+                assert_eq!(
+                    decode_chunks(
+                        &mut Stream::new(Frames::<Message>::with_limit(limit)),
+                        chunks(&bytes, &[1, 7, 64]),
+                        |s| assert_eq!(s.held(), 0)
+                    ),
+                    decode_all(|| Frames::<Message>::with_limit(limit), &bytes)
                 );
-                contract::check_decode_with_alloc_limit(
-                    || Frames::<Message>::with_limit(limit),
-                    &bytes,
-                    2 * (HEADER_LEN + limit),
+                assert_eq!(
+                    decode_chunks(
+                        &mut Stream::new(Frames::<Message>::with_limit(limit)),
+                        chunks(&bytes, &[1, 7, 64]),
+                        |s| assert!(s.allocated() <= 2 * (HEADER_LEN + limit))
+                    ),
+                    decode_all(|| Frames::<Message>::with_limit(limit), &bytes)
                 );
             }
         }
@@ -1770,7 +1787,14 @@ mod tests {
         let (b, used2) = Message::parse_prefix(&stream[8..]).unwrap().unwrap();
         assert_eq!((b, used2), (c.clone(), 5));
         assert_eq!(Message::parse_prefix(&stream[13..]), Ok(None));
-        contract::check_decode(|| Frames::<Message>::with_limit(MAX_MESSAGE), &stream);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Message>::with_limit(MAX_MESSAGE)),
+                chunks(&stream, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(|| Frames::<Message>::with_limit(MAX_MESSAGE), &stream)
+        );
     }
 
     #[test]
@@ -1781,7 +1805,14 @@ mod tests {
         }
         .to_bytes()
         .unwrap();
-        contract::check_decode(Frames::<Message>::new, &bytes);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Message>::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(Frames::<Message>::new, &bytes)
+        );
         for n in 0..bytes.len() {
             let mut stream = Stream::new(Frames::<Message>::new());
             assert_eq!(stream.push(&bytes[..n]), n);
@@ -1910,7 +1941,14 @@ mod tests {
             })
             .collect();
         let stream: Vec<u8> = msgs.iter().flat_map(|m| m.to_bytes().unwrap()).collect();
-        contract::check_decode(Frames::<Message>::new, &stream);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Message>::new()),
+                chunks(&stream, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(Frames::<Message>::new, &stream)
+        );
         let mut decoder = Stream::new(Frames::<Message>::new());
         let mut got = Vec::new();
         codec::pump(&mut decoder, &stream, |message| got.push(message)).unwrap();
@@ -2656,8 +2694,17 @@ mod tests {
                     i += HEADER_LEN + usize::from(data[i + 4]);
                 }
             }
-            contract::check_decode(|| Frames::<Message>::with_limit(MAX_MESSAGE), &data);
-            contract::check_wire::<Message>(&data);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Frames::<Message>::with_limit(MAX_MESSAGE)),
+                    chunks(&data, &[1, 7, 64]),
+                    |_| {}
+                ),
+                decode_all(|| Frames::<Message>::with_limit(MAX_MESSAGE), &data)
+            );
+            if let Ok(value) = Message::parse(&data) {
+                assert_write(&value).unwrap();
+            }
             // Header readers on the same bytes.
             if let Ok(t) = Timeout::parse(&data) {
                 assert_eq!(Timeout::parse(t.to_header().as_bytes()), Ok(t));

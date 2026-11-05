@@ -978,9 +978,9 @@ impl Wire for Packet {
 mod tests {
     use super::*;
     use fictionet::assert_cases;
-    use fictionet::stdlib::codec::Lcg;
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::codec::{Lcg, Stream};
     use fictionet::stdlib::test_support::mutate;
+    use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
 
     fn data_packet(block: u16, data: Vec<u8>) -> Packet {
         Packet::Data { block, data }
@@ -1200,7 +1200,7 @@ mod tests {
             },
         ] {
             assert_eq!(packet.to_bytes(), Err(Error::Unwritable));
-            contract::check_wire_value(&packet);
+            let _ = assert_write(&packet);
         }
     }
 
@@ -1227,7 +1227,7 @@ mod tests {
             },
         ] {
             assert_eq!(packet.to_bytes(), Err(Error::Unwritable), "{packet:?}");
-            contract::check_wire_value(&packet);
+            let _ = assert_write(&packet);
         }
         let fine = Packet::ReadRequest(request("a", vec![TftpOption::new("blksize", "512")]));
         assert_eq!(Packet::parse(&fine.to_bytes().unwrap()), Ok(fine));
@@ -1421,7 +1421,7 @@ mod tests {
             let p =
                 Packet::WriteRequest(request_fixture(filename, Mode::NetAscii, options.clone()));
             assert_eq!(p.to_bytes(), Err(Error::Unwritable));
-            contract::check_wire_value(&p);
+            let _ = assert_write(&p);
         }
         let bounded = Packet::WriteRequest(request_fixture(
             "a".into(),
@@ -1429,7 +1429,7 @@ mod tests {
             options[..7].to_vec(),
         ));
         assert!(bounded.to_bytes().unwrap().len() <= MAX_REQUEST);
-        contract::check_wire_value(&bounded);
+        let _ = assert_write(&bounded);
     }
 
     // RFC 2347: "An option may only be specified once."
@@ -1448,7 +1448,7 @@ mod tests {
             options: vec![TftpOption::new("tsize", "1"), TftpOption::new("TSIZE", "2")],
         };
         assert_eq!(p.to_bytes(), Err(Error::Unwritable));
-        contract::check_wire_value(&p);
+        let _ = assert_write(&p);
         // negotiate() ignores every repeat, even after a first value it
         // could not accept, as its doc says.
         let n = negotiate(
@@ -1652,7 +1652,7 @@ mod tests {
         }
         assert_eq!(out, b"a\r\nb\r\0c");
         for byte in 0..=u8::MAX {
-            contract::check_wire_value(&NetasciiByte(byte));
+            let _ = assert_write(&NetasciiByte(byte));
         }
     }
 
@@ -1670,7 +1670,14 @@ mod tests {
                 &b"x\r\n\n\ry\r\r\0\r\rz\r\n\r"[..],
             ),
         ] {
-            contract::check_decode_with_alloc_limit(|| NetasciiBytes, wire, 4);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(NetasciiBytes),
+                    chunks(wire, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 4)
+                ),
+                decode_all(|| NetasciiBytes, wire)
+            );
             let (items, error) = decode_all(|| NetasciiBytes, wire);
             assert_eq!(error, None);
             assert_eq!(items.into_iter().map(|c| c.0).collect::<Vec<_>>(), text);
@@ -1705,7 +1712,9 @@ mod tests {
                 }
                 b
             };
-            contract::check_wire::<Packet>(&buf);
+            if let Ok(value) = Packet::parse(&buf) {
+                assert_write(&value).unwrap();
+            }
             if let Ok(p) = Packet::parse(&buf) {
                 assert_eq!(
                     Packet::parse(&p.to_bytes().unwrap()),
@@ -1753,7 +1762,14 @@ mod tests {
                 fictionet::stdlib::test_support::decode_all(|| NetasciiBytes, &encoded);
             assert_eq!(error, None);
             assert_eq!(text.into_iter().map(|c| c.0).collect::<Vec<_>>(), buf);
-            contract::check_decode_with_alloc_limit(|| NetasciiBytes, &buf, 4);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(NetasciiBytes),
+                    chunks(&buf, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 4)
+                ),
+                decode_all(|| NetasciiBytes, &buf)
+            );
         }
     }
 }

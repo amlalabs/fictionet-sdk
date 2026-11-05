@@ -1633,7 +1633,7 @@ fictionet::codec_from!(Error, Truncated, |_| Error::Truncated);
 pub mod harness {
     use super::{EncodedMessage, Error, MAX_MESSAGE, Message, Vec};
     use fictionet::stdlib::codec::{Decode, Fail, Stream, Wire};
-    use fictionet::stdlib::test_support::{contract, decode_all};
+    use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
 
     /// Parses prefixes within the decoder's `MAX_MESSAGE + 1` window.
     /// Running out of bytes in a full window reports `TooLong`.
@@ -1699,9 +1699,26 @@ pub mod harness {
             }
             (expected, actual) => assert_eq!(*actual, expected, "unexpected stream failure"),
         }
-        contract::check_decode_with_alloc_limit(&make, bytes, 2 * make().capacity());
-        contract::check_decode_with_held_limit(&make, bytes, make().held());
-        contract::check_wire::<EncodedMessage>(bytes);
+        let alloc = 2 * make().capacity();
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(make()),
+                chunks(bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= alloc)
+            ),
+            decode_all(&make, bytes)
+        );
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(make()),
+                chunks(bytes, &[1, 7, 64]),
+                |s| assert!(s.held() <= make().held())
+            ),
+            decode_all(&make, bytes)
+        );
+        if let Ok(value) = EncodedMessage::parse(bytes) {
+            assert_write(&value).unwrap();
+        }
         let mut stream = Stream::new(make());
         let mut pushed = 0;
         let mut start = 0;
@@ -1714,7 +1731,7 @@ pub mod harness {
                 let Ok(value) = item else { break };
                 let end = usize::try_from(stream.offset()).unwrap();
                 assert_eq!(EncodedMessage::parse(&bytes[start..end]), Ok(value.clone()));
-                contract::check_wire_value(&value);
+                let _ = assert_write(&value);
                 start = end;
             }
         }
@@ -1726,9 +1743,10 @@ pub mod harness {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream, finish, pump};
-    use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::rounds;
-    use fictionet::stdlib::test_support::{chunks, decode_all, mutate};
+    use fictionet::stdlib::test_support::{
+        assert_write, chunks, decode_all, decode_chunks, mutate,
+    };
 
     fn encoded(message: Message, protocol: Protocol) -> EncodedMessage {
         EncodedMessage { message, protocol }
@@ -1955,10 +1973,10 @@ mod tests {
         // Maps: an empty one is one zero byte; otherwise size, then types.
         let m = map(Type::I32, Type::Binary, vec![]);
         let typed = ValueBody::<true, 13>(Value::Map(m));
-        contract::check_wire_value(&typed);
+        let _ = assert_write(&typed);
         assert_eq!(typed.to_bytes(), Err(Error::Unwritable));
         let empty = ValueBody::<true, 13>(Value::Map(map(Type::Byte, Type::Byte, vec![])));
-        contract::check_wire_value(&empty);
+        let _ = assert_write(&empty);
         assert_eq!(empty.to_bytes().unwrap(), [0]);
         assert_eq!(
             Value::parse_prefix(c, Type::Map, &[0]),
@@ -2322,7 +2340,7 @@ mod tests {
         let value = add_call().to_frame(Protocol::Compact).unwrap();
         let bytes = value.to_bytes().unwrap();
         assert_eq!(bytes[..4], (value.0.len() as u32).to_be_bytes());
-        contract::check_wire_value(&value);
+        let _ = assert_write(&value);
         assert_eq!(Frame::parse(&bytes), Ok(value));
         for n in 0..bytes.len() {
             assert_eq!(
@@ -2351,10 +2369,14 @@ mod tests {
         .unwrap();
         let mut bytes = a.to_bytes().unwrap();
         b.write(&mut bytes).unwrap();
-        contract::check_decode_with_alloc_limit(
-            Frames::<Frame>::new,
-            &bytes,
-            2 * Frames::<Frame>::new().capacity(),
+        let alloc = 2 * Frames::<Frame>::new().capacity();
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Frame>::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= alloc)
+            ),
+            decode_all(Frames::<Frame>::new, &bytes)
         );
         assert_eq!(decode_all(Frames::<Frame>::new, &bytes), (vec![a, b], None));
         let mut stream = Stream::new(Frames::<Frame>::new());
@@ -2745,7 +2767,7 @@ mod tests {
             ..add_call()
         };
         let value = encoded(message, Protocol::Binary);
-        contract::check_wire_value(&value);
+        let _ = assert_write(&value);
         assert_eq!(value.to_bytes(), Err(Error::Unwritable));
         let mut bytes = vec![
             0x80, 1, 0, 1, 0, 0, 0, 3, b'a', b'd', b'd', 0, 0, 0, 1, 11, 0, 1,
@@ -2878,24 +2900,42 @@ mod tests {
                     Err(Error::TooDeep)
                 );
             }
-            contract::check_decode_with_held_limit(EncodedMessages::new, &bytes, held);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(EncodedMessages::new()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |s| assert!(s.held() <= held)
+                ),
+                decode_all(EncodedMessages::new, &bytes)
+            );
         }
         for protocol in PROTOCOLS {
             let bytes = encoded(add_call(), protocol).to_bytes().unwrap();
             for at in 0..bytes.len() {
                 let mut malformed = bytes.clone();
                 malformed[at] = 0xff;
-                contract::check_decode_with_alloc_limit(
-                    EncodedMessages::new,
-                    &malformed,
-                    2 * EncodedMessages::new().capacity(),
+                let alloc = 2 * EncodedMessages::new().capacity();
+                assert_eq!(
+                    decode_chunks(
+                        &mut Stream::new(EncodedMessages::new()),
+                        chunks(&malformed, &[1, 7, 64]),
+                        |s| assert!(s.allocated() <= alloc)
+                    ),
+                    decode_all(EncodedMessages::new, &malformed)
                 );
             }
         }
-        contract::check_decode_with_alloc_limit(
-            EncodedMessages::new,
-            &[0x82, 0x21, 0, 0, 0x19, 0xf9, 0x05, 0x0e],
-            2 * EncodedMessages::new().capacity(),
+        let alloc = 2 * EncodedMessages::new().capacity();
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(EncodedMessages::new()),
+                chunks(&[0x82, 0x21, 0, 0, 0x19, 0xf9, 0x05, 0x0e], &[1, 7, 64]),
+                |s| assert!(s.allocated() <= alloc)
+            ),
+            decode_all(
+                EncodedMessages::new,
+                &[0x82, 0x21, 0, 0, 0x19, 0xf9, 0x05, 0x0e]
+            )
         );
     }
 
@@ -3109,10 +3149,14 @@ mod tests {
                 let at = r.index(stream.len());
                 stream[at] = r.next() as u8;
             }
-            contract::check_decode_with_alloc_limit(
-                Frames::<Frame>::new,
-                &stream,
-                2 * Frames::<Frame>::new().capacity(),
+            let alloc = 2 * Frames::<Frame>::new().capacity();
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Frames::<Frame>::new()),
+                    chunks(&stream, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= alloc)
+                ),
+                decode_all(Frames::<Frame>::new, &stream)
             );
             let frames = decode_all(Frames::<Frame>::new, &stream).0;
             // The same messages without frames, sometimes damaged.

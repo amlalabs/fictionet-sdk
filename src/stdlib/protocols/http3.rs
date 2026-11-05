@@ -2301,8 +2301,9 @@ mod tests {
     use super::*;
     use fictionet::assert_cases;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream};
-    use fictionet::stdlib::test_support::contract;
-    use fictionet::stdlib::test_support::{decode_all, mutate};
+    use fictionet::stdlib::test_support::{
+        assert_write, chunks, decode_all, decode_chunks, mutate,
+    };
 
     fn priority(urgency: Option<u8>, incremental: Option<bool>) -> Priority {
         Priority {
@@ -2396,7 +2397,7 @@ mod tests {
         out
     }
     fn roundtrip(frame: &Frame) {
-        let bytes = contract::check_written(frame);
+        let bytes = assert_write(frame).unwrap();
         assert!(bytes.len() <= MAX_FRAME);
     }
     fn messages(side: MessageSide, frames: &[Frame]) -> (Vec<Event>, Result<(), Error>) {
@@ -2687,8 +2688,15 @@ mod tests {
             unknown_fixture(MAX_VARINT, vec![1, 2]),
         ] {
             let bytes = frame.to_bytes().unwrap();
-            contract::check_wire_value(&frame);
-            contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &bytes, 2 * MAX_FRAME);
+            let _ = assert_write(&frame);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Frames::<Frame>::new()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_FRAME)
+                ),
+                decode_all(Frames::<Frame>::new, &bytes)
+            );
             assert_eq!(
                 decode_all(Frames::<Frame>::new, &bytes),
                 (vec![Ok(frame)], None)
@@ -2706,12 +2714,15 @@ mod tests {
             StreamHeader::Unknown(0x21),
         ] {
             let mut bytes = header.to_bytes().unwrap();
-            contract::check_wire_value(&header);
+            let _ = assert_write(&header);
             bytes.extend_from_slice(b"body");
-            contract::check_decode_with_alloc_limit(
-                StreamHeaders::new,
-                &bytes,
-                2 * MAX_STREAM_HEADER,
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(StreamHeaders::new()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_STREAM_HEADER)
+                ),
+                decode_all(StreamHeaders::new, &bytes)
             );
             let mut stream = Stream::new(StreamHeaders::new());
             assert_eq!(stream.push(&bytes), bytes.len());
@@ -2735,7 +2746,14 @@ mod tests {
         let big = Frame::Data(vec![0xab; MAX_FRAME_PAYLOAD]);
         let frames = [Frame::Data(vec![]), big.clone(), big];
         let bytes = join(&frames);
-        contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &bytes, 2 * MAX_FRAME);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Frame>::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_FRAME)
+            ),
+            decode_all(Frames::<Frame>::new, &bytes)
+        );
         assert_eq!(
             decode_all(Frames::<Frame>::new, &bytes),
             (frames.into_iter().map(Ok).collect(), None)
@@ -2849,10 +2867,13 @@ mod tests {
             unknown_fixture(0x21, vec![0; 20]),
         ];
         let bytes = join(&frames);
-        contract::check_decode_with_alloc_limit(
-            || ControlFrames::new(Side::Client),
-            &bytes,
-            2 * MAX_FRAME,
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(ControlFrames::new(Side::Client)),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_FRAME)
+            ),
+            decode_all(|| ControlFrames::new(Side::Client), &bytes)
         );
         let (items, error) = decode_all(|| ControlFrames::new(Side::Client), &bytes);
         assert_eq!(items, frames.into_iter().map(Ok).collect::<Vec<_>>());
@@ -2904,7 +2925,14 @@ mod tests {
             headers(&fields(&[("x-check", "ok")])),
         ];
         let bytes = join(&frames);
-        contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &bytes, 2 * MAX_FRAME);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Frame>::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_FRAME)
+            ),
+            decode_all(Frames::<Frame>::new, &bytes)
+        );
         let (events, result) = messages(MessageSide::Request, &frames);
         assert_eq!(
             events,
@@ -3682,10 +3710,13 @@ mod tests {
             Frame::Data(vec![42; 100]),
             headers(&fields(&[("x", "end")])),
         ];
-        contract::check_decode_with_alloc_limit(
-            Frames::<Frame>::new,
-            &join(&frames),
-            2 * MAX_FRAME,
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Frame>::new()),
+                chunks(&join(&frames), &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_FRAME)
+            ),
+            decode_all(Frames::<Frame>::new, &join(&frames))
         );
         for push in [false, true] {
             let mut state = if push {
@@ -3919,21 +3950,39 @@ mod tests {
         for _ in 0..FUZZ_CASES {
             let mut bytes = rng.bytes(MAX_TEST_BYTES);
             mutate(&mut rng, &mut bytes);
-            contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &bytes, 2 * MAX_FRAME);
-            contract::check_decode_with_alloc_limit(
-                StreamHeaders::new,
-                &bytes,
-                2 * MAX_STREAM_HEADER,
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Frames::<Frame>::new()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_FRAME)
+                ),
+                decode_all(Frames::<Frame>::new, &bytes)
             );
-            contract::check_wire::<Frame>(&bytes);
-            contract::check_wire::<Settings>(&bytes);
-            contract::check_wire::<Priority>(&bytes);
-            contract::check_wire::<StreamHeader>(&bytes);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(StreamHeaders::new()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_STREAM_HEADER)
+                ),
+                decode_all(StreamHeaders::new, &bytes)
+            );
+            if let Ok(value) = Frame::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = Settings::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = Priority::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = StreamHeader::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
             let budget = MAX_FRAME + MAX_TEST_BYTES;
             check_session_budget(&bytes, budget);
             let (items, _) = decode_all(Frames::<Frame>::new, &bytes);
             for frame in items.iter().flatten() {
-                contract::check_wire_value(frame);
+                let _ = assert_write(frame);
             }
             for extended_connect in [false, true] {
                 for mut state in [

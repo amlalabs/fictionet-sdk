@@ -1829,9 +1829,10 @@ mod tests {
     use std::net::SocketAddrV6;
 
     use codec::{Fail, Lcg, Stream};
-    use fictionet::stdlib::test_support::contract;
 
-    use fictionet::stdlib::test_support::{decode_all, mutate};
+    use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
+
+    use fictionet::stdlib::test_support::mutate;
 
     fn commands(bytes: &[u8]) -> Vec<Result<Command, Error>> {
         decode_all(Commands::new, bytes).0
@@ -2113,7 +2114,14 @@ mod tests {
             (b"RETR \r\0\0\r\n", Error::Text),
         ] {
             assert_eq!(Command::parse(line), Err(error));
-            contract::check_decode_with_alloc_limit(Commands::new, line, 2 * MAX_LINE);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Commands::new()),
+                    chunks(line, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_LINE)
+                ),
+                decode_all(Commands::new, line)
+            );
         }
         assert_eq!(Command::parse(b"RETR a\nb\r\n"), Err(Error::Trailing));
         assert_eq!(Command::parse(&[b'A'; MAX_LINE]), Err(Error::LineTooLong));
@@ -2355,12 +2363,22 @@ mod tests {
                 assert_eq!(got[0], Err(Error::LineTooLong));
             }
             assert_eq!(got[1], Ok(Command::new("NOOP", None)));
-            contract::check_decode_with_alloc_limit(Commands::new, &stream, 2 * MAX_LINE);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Commands::new()),
+                    chunks(&stream, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_LINE)
+                ),
+                decode_all(Commands::new, &stream)
+            );
         }
-        contract::check_decode_with_alloc_limit(
-            Commands::new,
-            &vec![b'x'; 3 * MAX_LINE],
-            2 * MAX_LINE,
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Commands::new()),
+                chunks(&vec![b'x'; 3 * MAX_LINE], &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_LINE)
+            ),
+            decode_all(Commands::new, &vec![b'x'; 3 * MAX_LINE])
         );
     }
 
@@ -2416,7 +2434,7 @@ mod tests {
             reply.to_bytes().unwrap(),
             "220-123 first\r\n 220\r\n 220 done\r\n 230 Logged in\r\n 999-x\r\n12\r\né23\r\n220 end\r\n".as_bytes()
         );
-        contract::check_wire_value(&reply);
+        let _ = assert_write(&reply);
         let one = Reply::from_lines(code::READY, vec!["220 text".into()]).unwrap();
         assert_eq!(one, Reply::new(code::READY, "220 text"));
         for lines in [
@@ -2437,7 +2455,7 @@ mod tests {
             if fits {
                 let reply = reply.unwrap();
                 assert_eq!(reply.lines[1].len(), MAX_CONTENT);
-                contract::check_wire_value(&reply);
+                let _ = assert_write(&reply);
             } else {
                 assert_eq!(reply, Err(Error::LineTooLong));
             }
@@ -2491,7 +2509,7 @@ mod tests {
         let fits = "x".repeat(MAX_LINE - 7);
         let request = Request::Stor(fits.clone());
         assert_eq!(request.to_bytes().unwrap().len(), MAX_LINE);
-        contract::check_wire_value(&request);
+        let _ = assert_write(&request);
         assert_eq!(
             Request::Stor(format!("{}\r", &fits[1..])).to_bytes(),
             Err(Error::LineTooLong)
@@ -2562,7 +2580,7 @@ mod tests {
         assert_eq!(Reply::feature_list(&many), Err(Error::Unwritable));
         let reply = Reply::feature_list(&many[..MAX_FEATURES]).unwrap();
         assert_eq!(reply.features().unwrap().len(), MAX_FEATURES);
-        contract::check_wire_value(&reply);
+        let _ = assert_write(&reply);
     }
 
     #[test]
@@ -2631,10 +2649,24 @@ mod tests {
             Ok(Command::new("QUIT", None)),
         ];
         assert_eq!(commands(stream), want);
-        contract::check_decode_with_alloc_limit(Commands::new, stream, 2 * MAX_LINE);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Commands::new()),
+                chunks(stream, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_LINE)
+            ),
+            decode_all(Commands::new, stream)
+        );
         let stream = b"220 hi\r\n150-a\r\n b\r\n150 c\r\n226 done\n";
         let got = replies(stream);
-        contract::check_decode_with_alloc_limit(Replies::new, stream, 2 * MAX_LINE);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Replies::new()),
+                chunks(stream, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_LINE)
+            ),
+            decode_all(Replies::new, stream)
+        );
         assert_eq!(got.len(), 3);
         assert_eq!(got[1].as_ref().unwrap().lines, ["a", " b", "c"]);
     }
@@ -2667,7 +2699,14 @@ mod tests {
         want.push(Err(Error::LineTooLong));
         want.push(Ok(Command::new("QUIT", None)));
         assert_eq!(commands(&long), want);
-        contract::check_decode_with_alloc_limit(Commands::new, &long, 2 * MAX_LINE);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Commands::new()),
+                chunks(&long, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_LINE)
+            ),
+            decode_all(Commands::new, &long)
+        );
     }
 
     #[test]
@@ -2677,7 +2716,14 @@ mod tests {
             commands(&big),
             [Err(Error::LineTooLong), Ok(Command::new("NOOP", None))]
         );
-        contract::check_decode_with_alloc_limit(Commands::new, &big, 2 * MAX_LINE);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Commands::new()),
+                chunks(&big, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_LINE)
+            ),
+            decode_all(Commands::new, &big)
+        );
         let mut stream = Stream::new(Commands::new());
         let many = b"NOOP\r\n".repeat(MAX_LINE);
         assert_eq!(stream.push(&many), MAX_LINE);
@@ -2690,7 +2736,14 @@ mod tests {
             failure,
             Some(Fail::Protocol(FrameError::Reply(Error::LineTooLong)))
         );
-        contract::check_decode_with_alloc_limit(Replies::new, &big, 2 * MAX_LINE);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Replies::new()),
+                chunks(&big, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_LINE)
+            ),
+            decode_all(Replies::new, &big)
+        );
     }
 
     #[test]
@@ -2700,10 +2753,13 @@ mod tests {
             commands(b"STOR foo\r\0\nboo.bar\r\n"),
             [Ok(Command::new("STOR", Some("foo\r\nboo.bar")))]
         );
-        contract::check_decode_with_alloc_limit(
-            Commands::new,
-            b"STOR foo\r\0\nboo.bar\r\n",
-            2 * MAX_LINE,
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Commands::new()),
+                chunks(b"STOR foo\r\0\nboo.bar\r\n", &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_LINE)
+            ),
+            decode_all(Commands::new, b"STOR foo\r\0\nboo.bar\r\n")
         );
         assert_eq!(
             Request::Stor("foo\r\nboo.bar".into()).to_bytes().unwrap(),
@@ -2753,7 +2809,14 @@ mod tests {
             Ok(Reply::new(code::READY, "next")),
         ];
         assert_eq!(replies(&s), want);
-        contract::check_decode_with_alloc_limit(Replies::new, &s, 2 * MAX_LINE);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Replies::new()),
+                chunks(&s, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_LINE)
+            ),
+            decode_all(Replies::new, &s)
+        );
     }
 
     #[test]
@@ -2803,28 +2866,52 @@ mod tests {
                 data.extend_from_slice(b"\r\nNOOP\r\n");
             }
             mutate(&mut rng, &mut data);
-            contract::check_decode_with_alloc_limit(Commands::new, &data, 2 * MAX_LINE);
-            contract::check_decode_with_alloc_limit(Replies::new, &data, 2 * MAX_LINE);
-            contract::check_wire::<Command>(&data);
-            contract::check_wire::<Reply>(&data);
-            contract::check_wire::<Request>(&data);
-            contract::check_wire::<PortAddress>(&data);
-            contract::check_wire::<EprtAddress>(&data);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Commands::new()),
+                    chunks(&data, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_LINE)
+                ),
+                decode_all(Commands::new, &data)
+            );
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Replies::new()),
+                    chunks(&data, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_LINE)
+                ),
+                decode_all(Replies::new, &data)
+            );
+            if let Ok(value) = Command::parse(&data) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = Reply::parse(&data) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = Request::parse(&data) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = PortAddress::parse(&data) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = EprtAddress::parse(&data) {
+                assert_write(&value).unwrap();
+            }
             let address = SocketAddrV4::new(Ipv4Addr::from(rng.next() as u32), rng.next() as u16);
-            contract::check_wire_value(&PortAddress { address });
-            contract::check_wire_value(&EprtAddress {
+            let _ = assert_write(&PortAddress { address });
+            let _ = assert_write(&EprtAddress {
                 address: address.into(),
             });
             for command in commands(&data).iter().flatten() {
-                contract::check_wire_value(command);
+                let _ = assert_write(command);
                 command.to_bytes().unwrap();
                 if let Ok(request) = Request::from_command(command) {
-                    contract::check_wire_value(&request);
+                    let _ = assert_write(&request);
                     request.to_bytes().unwrap();
                 }
             }
             for reply in replies(&data).iter().flatten() {
-                contract::check_wire_value(reply);
+                let _ = assert_write(reply);
                 if let Ok(features) = reply.features() {
                     assert_eq!(
                         Reply::feature_list(&features).unwrap().features(),
@@ -2844,14 +2931,14 @@ mod tests {
             let bytes = rng.bytes(128);
             let text = String::from_utf8_lossy(&bytes).into_owned();
             let (verb, arg) = text.split_once(' ').unwrap_or((&text, ""));
-            contract::check_wire_value(&Command::new(verb, Some(arg)));
-            contract::check_wire_value(&Command::new("RETR", Some(&text)));
+            let _ = assert_write(&Command::new(verb, Some(arg)));
+            let _ = assert_write(&Command::new("RETR", Some(&text)));
             for request in [
                 Request::Allo(text.clone()),
                 Request::Rest(text.clone()),
                 Request::Opts(text.clone()),
             ] {
-                contract::check_wire_value(&request);
+                let _ = assert_write(&request);
             }
             let lines: Vec<String> = text
                 .split('\n')
@@ -2864,7 +2951,7 @@ mod tests {
             if let Some(code) = ReplyCode::new(100 + rng.index(500) as u16)
                 && let Ok(reply) = Reply::from_lines(code, lines.clone())
             {
-                contract::check_wire_value(&reply);
+                let _ = assert_write(&reply);
                 assert_eq!(
                     Reply::parse(&reply.to_bytes().unwrap()).as_ref(),
                     Ok(&reply)

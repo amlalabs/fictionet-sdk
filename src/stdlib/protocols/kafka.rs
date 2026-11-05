@@ -1954,11 +1954,11 @@ fictionet::codec_from!(Error, Trailing, |error| Error::Trailing(error.0));
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{Decode, Step};
-    use fictionet::stdlib::codec::{Fail, Lcg, Stream, finish, pump};
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::codec::{Decode, Fail, Lcg, Step, Stream, finish, pump};
     use fictionet::stdlib::test_support::rounds;
-    use fictionet::stdlib::test_support::{decode_all, mutate};
+    use fictionet::stdlib::test_support::{
+        assert_write, chunks, decode_all, decode_chunks, mutate,
+    };
 
     enum BodyCase {
         Request(Request),
@@ -2873,10 +2873,14 @@ mod tests {
         let b = Frame(vec![0, 18, 0, 0, 0, 0, 0, 2, 0xff, 0xff]);
         let mut bytes = a.to_bytes().unwrap();
         b.write(&mut bytes).unwrap();
-        contract::check_decode_with_alloc_limit(
-            Frames::<Frame>::new,
-            &bytes,
-            2 * Frames::<Frame>::new().capacity(),
+        let alloc = 2 * Frames::<Frame>::new().capacity();
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Frame>::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= alloc)
+            ),
+            decode_all(Frames::<Frame>::new, &bytes)
         );
         assert_eq!(decode_all(Frames::<Frame>::new, &bytes), (vec![a, b], None));
         for (limit, header, error) in [
@@ -2948,14 +2952,24 @@ mod tests {
 
     /// Exercises framing, exact requests, and contextual responses.
     fn check(data: &[u8]) {
-        contract::check_decode_with_alloc_limit(
-            Frames::<Frame>::new,
-            data,
-            2 * Frames::<Frame>::new().capacity(),
+        let alloc = 2 * Frames::<Frame>::new().capacity();
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Frame>::new()),
+                chunks(data, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= alloc)
+            ),
+            decode_all(Frames::<Frame>::new, data)
         );
-        contract::check_wire::<Frame>(data);
-        contract::check_wire::<Request>(data);
-        contract::check_wire::<RequestHeader>(data);
+        if let Ok(value) = Frame::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Request::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = RequestHeader::parse(data) {
+            assert_write(&value).unwrap();
+        }
         if let Ok(fields) = Reader::new(data).tagged_fields() {
             let bytes = encoded(|w| w.tagged_fields(&fields));
             assert_eq!(Reader::new(&bytes).tagged_fields(), Ok(fields));
@@ -3276,8 +3290,7 @@ mod tests {
                 }
             }
             let req = Request { header, body };
-            contract::check_wire_value(&req);
-            let bytes = req.to_bytes().unwrap();
+            let bytes = assert_write(&req).unwrap();
             assert_eq!(Request::parse(&bytes), Ok(req.clone()));
             let frame = req.to_frame().unwrap();
             assert_eq!(
@@ -3327,7 +3340,7 @@ mod tests {
                 body: rbody,
             };
             let frame = resp.to_frame(key, version).unwrap();
-            contract::check_wire_value(&frame);
+            let _ = assert_write(&frame);
             assert_eq!(Response::parse(&frame.0, key, version), Ok(resp));
         }
     }

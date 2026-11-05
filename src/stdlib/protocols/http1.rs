@@ -2148,11 +2148,11 @@ mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
         Assemble, Assembled, Carry, Collect, CollectError, Demux, Fragment, Layered, Lcg, Pipe,
-        pump,
+        Stream, pump,
     };
     use fictionet::stdlib::test_support;
-    use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::rounds;
+    use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
 
     const GET: &[u8] = b"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n";
     const POST: &[u8] =
@@ -2268,24 +2268,41 @@ mod tests {
     fn request_error(bytes: &[u8], expected: Error) {
         let (_, error) = test_support::decode_all(RequestEvents::default, bytes);
         assert_eq!(error, Some(Fail::Protocol(expected)), "{bytes:?}");
-        contract::check_decode(RequestEvents::default, bytes);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(RequestEvents::default()),
+                chunks(bytes, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(RequestEvents::default, bytes)
+        );
     }
     fn response_error(bytes: &[u8], expected: Error) {
         let (_, error) = test_support::decode_all(ResponseEvents::default, bytes);
         assert_eq!(error, Some(Fail::Protocol(expected)), "{bytes:?}");
-        contract::check_decode(ResponseEvents::default, bytes);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(ResponseEvents::default()),
+                chunks(bytes, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(ResponseEvents::default, bytes)
+        );
     }
 
     #[test]
     fn requests_and_responses_round_trip() {
         for bytes in [GET, POST, CHUNKED] {
             let request = Request::parse(bytes).unwrap();
-            contract::check_wire::<Request>(bytes);
-            contract::check_wire_value(&request.head);
-            contract::check_decode_with_held_limit(
-                || RequestEvents::with_limits(small()),
-                bytes,
-                0,
+            assert_write(&request).unwrap();
+            let _ = assert_write(&request.head);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(RequestEvents::with_limits(small())),
+                    chunks(bytes, &[1, 7, 64]),
+                    |s| assert_eq!(s.held(), 0)
+                ),
+                decode_all(|| RequestEvents::with_limits(small()), bytes)
             );
             let (events, failure) =
                 test_support::decode_all(|| RequestEvents::with_limits(small()), bytes);
@@ -2303,18 +2320,23 @@ mod tests {
         }
         let chunked = response_with("Transfer-Encoding: chunked\r\n", b"5\r\nhello\r\n0\r\n\r\n");
         for bytes in [OK, chunked.as_slice(), b"HTTP/1.0 200 Fine\r\n\r\nhello"] {
-            contract::check_wire::<Response>(bytes);
             let response = Response::parse(bytes).unwrap();
+            assert_write(&response).unwrap();
             assert_eq!(response.body, b"hello");
-            contract::check_wire_value(&response.head);
-            contract::check_decode_with_held_limit(
-                || ResponseEvents::with_limits(small()),
-                bytes,
-                MAX_PENDING_REQUESTS,
+            let _ = assert_write(&response.head);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(ResponseEvents::with_limits(small())),
+                    chunks(bytes, &[1, 7, 64]),
+                    |s| assert!(s.held() <= MAX_PENDING_REQUESTS)
+                ),
+                decode_all(|| ResponseEvents::with_limits(small()), bytes)
             );
         }
         for bytes in [b"5\r\nhello\r\n".as_slice(), b"0\r\n\r\n", b"000\r\n\r\n"] {
-            contract::check_wire::<Chunk>(bytes);
+            if let Ok(value) = Chunk::parse(bytes) {
+                assert_write(&value).unwrap();
+            }
         }
     }
 
@@ -2367,7 +2389,14 @@ mod tests {
                 test_support::decode_all(|| RequestEvents::with_limits(limits), bytes).1,
                 Some(Fail::Protocol(error))
             );
-            contract::check_decode(|| RequestEvents::with_limits(limits), bytes);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(RequestEvents::with_limits(limits)),
+                    chunks(bytes, &[1, 7, 64]),
+                    |_| {}
+                ),
+                decode_all(|| RequestEvents::with_limits(limits), bytes)
+            );
         }
         let response = b"HTTP/1.1 204 No Content\r\nX: y\r\n\r\n";
         let exact = Limits {
@@ -2405,7 +2434,14 @@ mod tests {
                     .1
                     .is_some()
             );
-            contract::check_decode(|| ResponseEvents::with_limits(limits), response);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(ResponseEvents::with_limits(limits)),
+                    chunks(response, &[1, 7, 64]),
+                    |_| {}
+                ),
+                decode_all(|| ResponseEvents::with_limits(limits), response)
+            );
         }
         let huge = Limits {
             start_line: usize::MAX,
@@ -2554,18 +2590,24 @@ mod tests {
         );
         let bytes = response_with("Transfer-Encoding: gzip\r\n", b"abc");
         assert_eq!(Response::parse(&bytes).unwrap().body, b"abc");
-        contract::check_wire::<Response>(&bytes);
+        if let Ok(value) = Response::parse(&bytes) {
+            assert_write(&value).unwrap();
+        }
         for fields in [
             "Content-Length: 5, 005\r\n",
             "Content-Length: 5\r\ncontent-length: 5\r\n",
         ] {
             let bytes = request_with(fields, b"hello");
             assert_eq!(Request::parse(&bytes).unwrap().body, b"hello");
-            contract::check_wire::<Request>(&bytes);
+            if let Ok(value) = Request::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
         }
         let bytes = request_with("Transfer-Encoding: CHUNKED\r\n", b"3\r\nzip\r\n0\r\n\r\n");
         assert_eq!(Request::parse(&bytes).unwrap().body, b"zip");
-        contract::check_wire::<Request>(&bytes);
+        if let Ok(value) = Request::parse(&bytes) {
+            assert_write(&value).unwrap();
+        }
     }
 
     #[test]
@@ -2583,8 +2625,17 @@ mod tests {
             let (events, failure) = test_support::decode_all(RequestEvents::default, &bytes);
             assert_eq!(failure, None, "{fields}");
             assert_eq!(events.len(), 4, "{fields}");
-            contract::check_decode(RequestEvents::default, &bytes);
-            contract::check_wire::<Request>(&request);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(RequestEvents::default()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |_| {}
+                ),
+                decode_all(RequestEvents::default, &bytes)
+            );
+            if let Ok(value) = Request::parse(&request) {
+                assert_write(&value).unwrap();
+            }
         }
         for fields in [
             "Transfer-Encoding: , chunked\r\n",
@@ -2596,18 +2647,45 @@ mod tests {
             let response = response_with(fields, b"1\r\na\r\n0\r\n\r\n");
             assert_eq!(Request::parse(&request).unwrap().body, b"a");
             assert_eq!(Response::parse(&response).unwrap().body, b"a");
-            contract::check_decode(RequestEvents::default, &request);
-            contract::check_decode(ResponseEvents::default, &response);
-            contract::check_wire::<Request>(&request);
-            contract::check_wire::<Response>(&response);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(RequestEvents::default()),
+                    chunks(&request, &[1, 7, 64]),
+                    |_| {}
+                ),
+                decode_all(RequestEvents::default, &request)
+            );
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(ResponseEvents::default()),
+                    chunks(&response, &[1, 7, 64]),
+                    |_| {}
+                ),
+                decode_all(ResponseEvents::default, &response)
+            );
+            if let Ok(value) = Request::parse(&request) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = Response::parse(&response) {
+                assert_write(&value).unwrap();
+            }
         }
         let response = response_with(
             "Transfer-Encoding: ,gzip,, chunked, ,\r\n",
             b"1\r\na\r\n0\r\n\r\n",
         );
         assert_eq!(Response::parse(&response).unwrap().body, b"a");
-        contract::check_decode(ResponseEvents::default, &response);
-        contract::check_wire::<Response>(&response);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(ResponseEvents::default()),
+                chunks(&response, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(ResponseEvents::default, &response)
+        );
+        if let Ok(value) = Response::parse(&response) {
+            assert_write(&value).unwrap();
+        }
         request_error(
             &request_with("Content-Length: ,0\r\n", b""),
             Error::ContentLength,
@@ -2644,7 +2722,14 @@ mod tests {
                 events.iter().filter(|e| matches!(e, Event::Done)).count(),
                 expected
             );
-            contract::check_decode(RequestEvents::default, &bytes);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(RequestEvents::default()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |_| {}
+                ),
+                decode_all(RequestEvents::default, &bytes)
+            );
         }
         request_error(
             &b"\r\n".repeat(MAX_EMPTY_LINES.saturating_add(1)),
@@ -2661,7 +2746,14 @@ mod tests {
                 })
             };
             assert_eq!(test_support::decode_all(make, b"\r\n").1, None);
-            contract::check_decode(make, b"\r\n");
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(make()),
+                    chunks(b"\r\n", &[1, 7, 64]),
+                    |_| {}
+                ),
+                decode_all(make, b"\r\n")
+            );
         }
     }
 
@@ -2699,8 +2791,17 @@ mod tests {
             let bytes = format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n");
             let head = RequestHead::parse(bytes.as_bytes()).unwrap();
             assert_eq!(head.headers[0].value, host.as_bytes());
-            contract::check_wire::<RequestHead>(bytes.as_bytes());
-            contract::check_decode(RequestEvents::default, bytes.as_bytes());
+            if let Ok(value) = RequestHead::parse(bytes.as_bytes()) {
+                assert_write(&value).unwrap();
+            }
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(RequestEvents::default()),
+                    chunks(bytes.as_bytes(), &[1, 7, 64]),
+                    |_| {}
+                ),
+                decode_all(RequestEvents::default, bytes.as_bytes())
+            );
         }
         for authority in ["a", "a:", "[::1]:"] {
             let bytes = format!("CONNECT {authority} HTTP/1.1\r\nHost: a\r\n\r\n");
@@ -2718,9 +2819,20 @@ mod tests {
             response.to_bytes().unwrap(),
             b"HTTP/1.1 200 \r\nContent-Length:0\r\n\r\n"
         );
-        contract::check_wire::<Response>(bytes);
-        contract::check_wire::<ResponseHead>(bytes);
-        contract::check_decode(ResponseEvents::default, bytes);
+        if let Ok(value) = Response::parse(bytes) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = ResponseHead::parse(bytes) {
+            assert_write(&value).unwrap();
+        }
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(ResponseEvents::default()),
+                chunks(bytes, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(ResponseEvents::default, bytes)
+        );
         for (method, bytes) in [
             (
                 "HEAD",
@@ -2802,8 +2914,10 @@ mod tests {
                     };
                     assert_eq!(head.to_bytes().unwrap(), bytes);
                     head.headers[1].value[0] = b'b';
-                    contract::check_wire_value(&head);
-                    contract::check_wire::<Request>(&bytes);
+                    let _ = assert_write(&head);
+                    if let Ok(value) = Request::parse(&bytes) {
+                        assert_write(&value).unwrap();
+                    }
                     let (values, failure) =
                         test_support::decode_all(|| Collect::<Request>::new(bytes.len()), &bytes);
                     assert_eq!(failure, None);
@@ -2817,8 +2931,10 @@ mod tests {
                     };
                     assert_eq!(head.to_bytes().unwrap(), bytes);
                     head.headers[1].value[0] = b'b';
-                    contract::check_wire_value(&head);
-                    contract::check_wire::<Response>(&bytes);
+                    let _ = assert_write(&head);
+                    if let Ok(value) = Response::parse(&bytes) {
+                        assert_write(&value).unwrap();
+                    }
                 }
             }
         }
@@ -2875,8 +2991,22 @@ mod tests {
                 test_support::decode_all(ResponseEvents::default, &response).1,
                 Some(Fail::Truncated { unread: 1 })
             );
-            contract::check_decode(RequestEvents::default, &request);
-            contract::check_decode(ResponseEvents::default, &response);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(RequestEvents::default()),
+                    chunks(&request, &[1, 7, 64]),
+                    |_| {}
+                ),
+                decode_all(RequestEvents::default, &request)
+            );
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(ResponseEvents::default()),
+                    chunks(&response, &[1, 7, 64]),
+                    |_| {}
+                ),
+                decode_all(ResponseEvents::default, &response)
+            );
             assert_eq!(Chunk::parse(body), Err(Error::Incomplete));
         }
         let request = request_with("Content-Length: 3\r\n", b"ab");
@@ -2903,8 +3033,22 @@ mod tests {
                 unread: response.len()
             })
         );
-        contract::check_decode(RequestEvents::default, request);
-        contract::check_decode(ResponseEvents::default, response);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(RequestEvents::default()),
+                chunks(request, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(RequestEvents::default, request)
+        );
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(ResponseEvents::default()),
+                chunks(response, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(ResponseEvents::default, response)
+        );
     }
 
     #[test]
@@ -2928,7 +3072,14 @@ mod tests {
                 Event::Done
             ]
         );
-        contract::check_decode(make, &bytes);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(make()),
+                chunks(&bytes, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(make, &bytes)
+        );
         let small = || {
             let mut decoder = ResponseEvents::with_limits(Limits {
                 header_line: 32,
@@ -2958,7 +3109,14 @@ mod tests {
             let bytes = response_with("Transfer-Encoding: chunked\r\n", body.as_bytes());
             let (_, failure) = test_support::decode_all(small, &bytes);
             assert_eq!(failure, Some(Fail::Protocol(error)), "{body:?}");
-            contract::check_decode(small, &bytes);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(small()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |_| {}
+                ),
+                decode_all(small, &bytes)
+            );
         }
     }
 
@@ -2994,7 +3152,7 @@ mod tests {
             assert_eq!(stream.is_done(), closed);
             assert!(stream.unread().is_empty());
             assert_eq!(stream.failed(), None);
-            contract::check_decode(make, bytes);
+            assert_eq!(decode_chunks(&mut Stream::new(make()), chunks(bytes, &[1, 7, 64]), |_| {}), decode_all(make, bytes));
         }
     }
 
@@ -3085,8 +3243,22 @@ mod tests {
                 ..small()
             })
         };
-        contract::check_decode_with_held_limit(make, &pipeline, CHUNKED.len() + 5);
-        contract::check_decode_with_alloc_limit(make, &pipeline, (CHUNKED.len() + 1) * 2);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(make()),
+                chunks(&pipeline, &[1, 7, 64]),
+                |s| assert!(s.held() <= CHUNKED.len() + 5)
+            ),
+            decode_all(make, &pipeline)
+        );
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(make()),
+                chunks(&pipeline, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= (CHUNKED.len() + 1) * 2)
+            ),
+            decode_all(make, &pipeline)
+        );
         let (messages, error) = test_support::decode_all(make, &pipeline);
         assert_eq!(error, None);
         assert_eq!(
@@ -3109,7 +3281,10 @@ mod tests {
                 test_support::decode_all(make, bytes).1,
                 Some(Fail::Protocol(Error::BodyTooLong))
             );
-            contract::check_decode(make, bytes);
+            assert_eq!(
+                decode_chunks(&mut Stream::new(make()), chunks(bytes, &[1, 7, 64]), |_| {}),
+                decode_all(make, bytes)
+            );
             let make = || {
                 Requests::with_limits(Limits {
                     body: 5,
@@ -3121,19 +3296,35 @@ mod tests {
                 test_support::decode_all(make, bytes).1,
                 Some(Fail::Protocol(Error::MessageTooLong))
             );
-            contract::check_decode(make, bytes);
+            assert_eq!(
+                decode_chunks(&mut Stream::new(make()), chunks(bytes, &[1, 7, 64]), |_| {}),
+                decode_all(make, bytes)
+            );
         }
         for bytes in [GET, b"", b"\r", b"\r\n", b"GET"] {
             for limit in [0, 1, 2, GET.len() - 1, GET.len()] {
-                contract::check_decode(
-                    || {
-                        Requests::with_limits(Limits {
-                            body: 0,
-                            message: limit,
-                            ..small()
-                        })
-                    },
-                    bytes,
+                assert_eq!(
+                    decode_chunks(
+                        &mut Stream::new({
+                            Requests::with_limits(Limits {
+                                body: 0,
+                                message: limit,
+                                ..small()
+                            })
+                        }),
+                        chunks(bytes, &[1, 7, 64]),
+                        |_| {}
+                    ),
+                    decode_all(
+                        || {
+                            Requests::with_limits(Limits {
+                                body: 0,
+                                message: limit,
+                                ..small()
+                            })
+                        },
+                        bytes
+                    )
                 );
             }
         }
@@ -3148,7 +3339,14 @@ mod tests {
             decoder
         };
         let bytes = b"HTTP/1.1 103 Early Hints\r\nConnection: close\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 90\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
-        contract::check_decode_with_held_limit(make, bytes, 135);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(make()),
+                chunks(bytes, &[1, 7, 64]),
+                |s| assert!(s.held() <= 135)
+            ),
+            decode_all(make, bytes)
+        );
         let (responses, error) = test_support::decode_all(make, bytes);
         assert_eq!(error, None);
         assert_eq!(responses.len(), 3);
@@ -3162,7 +3360,10 @@ mod tests {
                     ..small()
                 })
             };
-            contract::check_decode(make, bytes);
+            assert_eq!(
+                decode_chunks(&mut Stream::new(make()), chunks(bytes, &[1, 7, 64]), |_| {}),
+                decode_all(make, bytes)
+            );
             assert_eq!(
                 test_support::decode_all(make, bytes),
                 (vec![Response::parse(bytes).unwrap()], None)
@@ -3174,7 +3375,10 @@ mod tests {
                     ..small()
                 })
             };
-            contract::check_decode(make, bytes);
+            assert_eq!(
+                decode_chunks(&mut Stream::new(make()), chunks(bytes, &[1, 7, 64]), |_| {}),
+                decode_all(make, bytes)
+            );
             assert_eq!(
                 test_support::decode_all(make, bytes).1,
                 Some(Fail::Protocol(Error::BodyTooLong))
@@ -3184,7 +3388,14 @@ mod tests {
         let mut tiny = request_with("Transfer-Encoding: chunked\r\n", b"");
         tiny.extend_from_slice(&b"0001\r\nx\r\n".repeat(256));
         tiny.extend_from_slice(b"0\r\n\r\n");
-        contract::check_decode(Requests::default, &tiny);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Requests::default()),
+                chunks(&tiny, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(Requests::default, &tiny)
+        );
         assert_eq!(
             test_support::decode_all(Requests::default, &tiny).0[0]
                 .body
@@ -3210,7 +3421,10 @@ mod tests {
             assert_eq!(stream.next(), None);
             assert!(stream.is_done());
             assert_eq!(stream.unread(), b"tunnel");
-            contract::check_decode(make, bytes);
+            assert_eq!(
+                decode_chunks(&mut Stream::new(make()), chunks(bytes, &[1, 7, 64]), |_| {}),
+                decode_all(make, bytes)
+            );
         }
         let mut decoder = Responses::default();
         assert_eq!(decoder.expect_method("bad method"), Err(Error::StartLine));
@@ -3229,8 +3443,12 @@ mod tests {
                 Request::parse(&bytes).map(|r| r.head),
                 RequestHead::parse(&bytes)
             );
-            contract::check_wire::<Request>(&bytes);
-            contract::check_wire::<RequestHead>(&bytes);
+            if let Ok(value) = Request::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = RequestHead::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
         }
     }
 
@@ -3247,7 +3465,14 @@ mod tests {
             test_support::decode_all(|| ResponseEvents::with_limits(limits), short).1,
             Some(Fail::Protocol(Error::HeadTooLong))
         );
-        contract::check_decode(|| ResponseEvents::with_limits(limits), short);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(ResponseEvents::with_limits(limits)),
+                chunks(short, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(|| ResponseEvents::with_limits(limits), short)
+        );
         let limits = Limits {
             start_line: 12,
             ..Limits::default()
@@ -3265,19 +3490,26 @@ mod tests {
             test_support::decode_all(|| ResponseEvents::with_limits(limits), short).1,
             None
         );
-        contract::check_decode(|| ResponseEvents::with_limits(limits), short);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(ResponseEvents::with_limits(limits)),
+                chunks(short, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(|| ResponseEvents::with_limits(limits), short)
+        );
         let mut head = response.head;
         head.reason = vec![b'a'; Limits::default().start_line - 13];
-        contract::check_wire_value(&head);
+        let _ = assert_write(&head);
         head.reason.push(b'a');
-        assert_eq!(contract::check_refused(&head), Error::StartLineTooLong);
+        assert_eq!(assert_write(&head).unwrap_err(), Error::StartLineTooLong);
     }
 
     #[test]
     fn response_constructors_use_wire_and_json() {
         for status in [100, 202, 204, 304, 404] {
             let response = Response::status(status);
-            contract::check_wire_value(&response);
+            let _ = assert_write(&response);
             assert_eq!(
                 named(&response.head.headers, "content-length").next(),
                 if [100, 204, 304].contains(&status) {
@@ -3288,7 +3520,7 @@ mod tests {
             );
         }
         assert_eq!(
-            contract::check_refused(&Response::status(99)),
+            assert_write(&Response::status(99)).unwrap_err(),
             Error::StartLine
         );
         let response = Response::json(b" {\"ok\": true} \n").unwrap();
@@ -3297,7 +3529,7 @@ mod tests {
             named(&response.head.headers, "content-type").next(),
             Some(b"application/json".as_slice())
         );
-        contract::check_wire_value(&response);
+        let _ = assert_write(&response);
         assert!(Response::json(b"not JSON").is_ok());
         assert_eq!(
             Response::json(&vec![b'x'; MAX_BODY + 1]),
@@ -3319,14 +3551,14 @@ mod tests {
             value.get("detail").and_then(json::Value::as_str),
             Some(detail)
         );
-        contract::check_wire_value(&response);
+        let _ = assert_write(&response);
         assert_eq!(Response::problem(204, "bad"), Err(Error::StartLine));
         assert_eq!(
             Response::problem(400, &"\n".repeat(json::MAX_SIZE)),
             Err(Error::BodyTooLong)
         );
         let head = Response::event_stream("session-1");
-        contract::check_wire_value(&head);
+        let _ = assert_write(&head);
         assert_eq!(
             named(&head.headers, "content-type").next(),
             Some(b"text/event-stream".as_slice())
@@ -3350,7 +3582,7 @@ mod tests {
         Chunk(Vec::new()).write(&mut out).unwrap();
         assert_eq!(Response::parse(&out).unwrap().body, b"data: {}\n\n");
         assert_eq!(
-            contract::check_refused(&Response::event_stream("bad\r\nfield")),
+            assert_write(&Response::event_stream("bad\r\nfield")).unwrap_err(),
             Error::Header
         );
     }
@@ -3366,7 +3598,14 @@ mod tests {
         assert!(stream.is_done());
         assert_eq!(stream.failed(), None);
         assert_eq!(stream.unread(), b"tunnel");
-        contract::check_decode(ResponseEvents::default, bytes);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(ResponseEvents::default()),
+                chunks(bytes, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(ResponseEvents::default, bytes)
+        );
     }
 
     #[test]
@@ -3378,8 +3617,17 @@ mod tests {
             assert_eq!(error, None);
             assert_eq!(events.len(), 2);
             assert_eq!(events[1], Event::Done);
-            contract::check_wire::<Response>(bytes.as_bytes());
-            contract::check_decode(ResponseEvents::default, bytes.as_bytes());
+            if let Ok(value) = Response::parse(bytes.as_bytes()) {
+                assert_write(&value).unwrap();
+            }
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(ResponseEvents::default()),
+                    chunks(bytes.as_bytes(), &[1, 7, 64]),
+                    |_| {}
+                ),
+                decode_all(ResponseEvents::default, bytes.as_bytes())
+            );
         }
         // RFC 9112 section 6.3: these fields do not create a response body.
         for (method, status) in [("HEAD", 200), ("GET", 100), ("GET", 204), ("GET", 304)] {
@@ -3390,7 +3638,14 @@ mod tests {
                 d
             };
             assert_eq!(test_support::decode_all(make, bytes.as_bytes()).0.len(), 2);
-            contract::check_decode(make, bytes.as_bytes());
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(make()),
+                    chunks(bytes.as_bytes(), &[1, 7, 64]),
+                    |_| {}
+                ),
+                decode_all(make, bytes.as_bytes())
+            );
         }
         let bytes = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 50\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
         let make = || {
@@ -3403,7 +3658,10 @@ mod tests {
         assert_eq!(error, None);
         assert_eq!(events.len(), 7);
         assert_eq!(events[5], Event::Body(b"hi".to_vec()));
-        contract::check_decode(make, bytes);
+        assert_eq!(
+            decode_chunks(&mut Stream::new(make()), chunks(bytes, &[1, 7, 64]), |_| {}),
+            decode_all(make, bytes)
+        );
         let mut d = ResponseEvents::default();
         assert_eq!(d.expect_method("bad method"), Err(Error::StartLine));
         assert_eq!(d.held(), 0);
@@ -3427,12 +3685,26 @@ mod tests {
             events.iter().filter(|e| matches!(e, Event::Done)).count(),
             4
         );
-        contract::check_decode(RequestEvents::default, &pipeline);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(RequestEvents::default()),
+                chunks(&pipeline, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(RequestEvents::default, &pipeline)
+        );
         let mut responses = Vec::new();
         for _ in 0..4 {
             responses.extend_from_slice(OK);
         }
-        contract::check_decode(ResponseEvents::default, &responses);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(ResponseEvents::default()),
+                chunks(&responses, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(ResponseEvents::default, &responses)
+        );
         assert_eq!(
             test_support::decode_all(ResponseEvents::default, &responses)
                 .0
@@ -3450,7 +3722,14 @@ mod tests {
             assert_eq!(stream.next(), None);
             assert!(stream.is_done());
             assert_eq!(stream.into_parts().0.unread(), b"tail");
-            contract::check_decode(RequestEvents::default, bytes);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(RequestEvents::default()),
+                    chunks(bytes, &[1, 7, 64]),
+                    |_| {}
+                ),
+                decode_all(RequestEvents::default, bytes)
+            );
         }
         let bytes = b"GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\nGET / HTTP/1.0\r\n\r\n";
         assert_eq!(
@@ -3468,7 +3747,14 @@ mod tests {
         assert_eq!(stream.next(), None);
         assert!(stream.is_done());
         assert_eq!(stream.into_parts().0.unread(), b"tail");
-        contract::check_decode(ResponseEvents::default, bytes);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(ResponseEvents::default()),
+                chunks(bytes, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(ResponseEvents::default, bytes)
+        );
     }
 
     #[test]
@@ -3485,7 +3771,14 @@ mod tests {
         assert_eq!(stream.next(), Some(Ok(Event::Done)));
         assert_eq!(stream.next(), None);
         assert!(stream.is_done());
-        contract::check_decode(|| ResponseEvents::with_limits(small()), bytes);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(ResponseEvents::with_limits(small())),
+                chunks(bytes, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(|| ResponseEvents::with_limits(small()), bytes)
+        );
     }
 
     #[test]
@@ -3522,7 +3815,14 @@ mod tests {
         assert!(stream.is_done());
         assert_eq!(stream.failed(), None);
         assert_eq!(stream.next(), None);
-        contract::check_decode(RequestEvents::default, bytes);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(RequestEvents::default()),
+                chunks(bytes, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(RequestEvents::default, bytes)
+        );
     }
 
     #[test]
@@ -3551,7 +3851,14 @@ mod tests {
                 assert!(stream.is_done());
                 assert_eq!(stream.into_parts().0.unread(), tunnel);
             }
-            contract::check_decode(RequestEvents::default, &bytes);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(RequestEvents::default()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |_| {}
+                ),
+                decode_all(RequestEvents::default, &bytes)
+            );
         }
     }
 
@@ -3608,7 +3915,14 @@ mod tests {
             assert_eq!(stream.next(), None);
             assert!(stream.is_done());
             assert_eq!(stream.into_parts().0.unread(), b"tunnel");
-            contract::check_decode(make, &response);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(make()),
+                    chunks(&response, &[1, 7, 64]),
+                    |_| {}
+                ),
+                decode_all(make, &response)
+            );
         }
         let make = || {
             let mut d = ResponseEvents::default();
@@ -3624,7 +3938,7 @@ mod tests {
         let mut out = Vec::new();
         value.write_for("HEAD", &mut out).unwrap();
         assert_eq!(out, head);
-        assert_eq!(contract::check_refused(&value), Error::BodyLength);
+        assert_eq!(assert_write(&value).unwrap_err(), Error::BodyLength);
         assert_eq!(
             value.write_for("CONNECT", &mut out),
             Err(Error::ForbiddenFraming)
@@ -3671,7 +3985,9 @@ mod tests {
         assert_eq!(request.head.headers[0].name, "hOsT");
         assert_eq!(request.head.headers[0].value, b"x");
         assert_eq!(request.head.headers[1].value, b"\xff\tvalue");
-        contract::check_wire::<Request>(bytes);
+        if let Ok(value) = Request::parse(bytes) {
+            assert_write(&value).unwrap();
+        }
         for line in [
             "GET http://example.test:80/a?b HTTP/1.1",
             "OPTIONS * HTTP/1.1",
@@ -3693,13 +4009,13 @@ mod tests {
         let base = Request::parse(POST).unwrap();
         let mut value = base.clone();
         value.body.push(0);
-        assert_eq!(contract::check_refused(&value), Error::BodyLength);
+        assert_eq!(assert_write(&value).unwrap_err(), Error::BodyLength);
         value = base.clone();
         value.head.method = "GET\r\n".into();
-        assert_eq!(contract::check_refused(&value), Error::StartLine);
+        assert_eq!(assert_write(&value).unwrap_err(), Error::StartLine);
         value = base.clone();
         value.head.target = "/bad target".into();
-        assert_eq!(contract::check_refused(&value), Error::StartLine);
+        assert_eq!(assert_write(&value).unwrap_err(), Error::StartLine);
         for (name, bytes) in [
             ("bad name", b"value".as_slice()),
             ("X", b"\r"),
@@ -3713,8 +4029,8 @@ mod tests {
                 name: name.into(),
                 value: bytes.to_vec(),
             });
-            assert_eq!(contract::check_refused(&value), Error::Header);
-            contract::check_wire_value(&value);
+            assert_eq!(assert_write(&value).unwrap_err(), Error::Header);
+            let _ = assert_write(&value);
         }
         value = base.clone();
         value.head.headers.push(Header {
@@ -3722,53 +4038,56 @@ mod tests {
             value: b"chunked".to_vec(),
         });
         assert_eq!(
-            contract::check_refused(&value),
+            assert_write(&value).unwrap_err(),
             Error::TransferEncodingAndContentLength
         );
         value = base.clone();
         value.body = vec![0; MAX_BODY.saturating_add(1)];
-        assert_eq!(contract::check_refused(&value), Error::BodyTooLong);
+        assert_eq!(assert_write(&value).unwrap_err(), Error::BodyTooLong);
         assert_eq!(
-            contract::check_refused(&Chunk(vec![0; MAX_BODY.saturating_add(1)])),
+            assert_write(&Chunk(vec![0; MAX_BODY.saturating_add(1)])).unwrap_err(),
             Error::BodyTooLong
         );
         value = base.clone();
         value.head.target = format!("/{}", "a".repeat(8192));
-        assert_eq!(contract::check_refused(&value), Error::StartLineTooLong);
+        assert_eq!(assert_write(&value).unwrap_err(), Error::StartLineTooLong);
         value = base.clone();
         value.head.headers.push(Header {
             name: "X".into(),
             value: vec![b'a'; 8192],
         });
-        assert_eq!(contract::check_refused(&value), Error::HeaderLineTooLong);
+        assert_eq!(assert_write(&value).unwrap_err(), Error::HeaderLineTooLong);
         value = base.clone();
         value.head.headers.extend((0..100).map(|_| Header {
             name: "X".into(),
             value: Vec::new(),
         }));
-        assert_eq!(contract::check_refused(&value), Error::TooManyHeaders);
+        assert_eq!(assert_write(&value).unwrap_err(), Error::TooManyHeaders);
         value = base;
         value.head.headers.extend((0..9).map(|_| Header {
             name: "X".into(),
             value: vec![b'a'; 8000],
         }));
-        assert_eq!(contract::check_refused(&value), Error::HeadTooLong);
+        assert_eq!(assert_write(&value).unwrap_err(), Error::HeadTooLong);
         let mut response = Response::parse(OK).unwrap();
         for status in [0, 99, 600, 1000] {
             response.head.status = status;
-            assert_eq!(contract::check_refused(&response), Error::StartLine);
+            assert_eq!(assert_write(&response).unwrap_err(), Error::StartLine);
         }
         response.head.status = 200;
         response.head.reason = b"OK\r\nX: bad".to_vec();
-        assert_eq!(contract::check_refused(&response), Error::StartLine);
+        assert_eq!(assert_write(&response).unwrap_err(), Error::StartLine);
         response = Response::parse(OK).unwrap();
         response.head.status = 204;
-        assert_eq!(contract::check_refused(&response), Error::ForbiddenFraming);
+        assert_eq!(
+            assert_write(&response).unwrap_err(),
+            Error::ForbiddenFraming
+        );
         response.head.status = 304;
-        assert_eq!(contract::check_refused(&response), Error::BodyLength);
+        assert_eq!(assert_write(&response).unwrap_err(), Error::BodyLength);
         response.head.status = 200;
         response.body.clear();
-        assert_eq!(contract::check_refused(&response), Error::BodyLength);
+        assert_eq!(assert_write(&response).unwrap_err(), Error::BodyLength);
         assert_eq!(
             Request::parse(&[GET, b"tail"].concat()),
             Err(Error::Trailing)
@@ -3785,7 +4104,10 @@ mod tests {
     #[test]
     fn collect_assemble_pipe_and_demux_use_public_contracts() {
         let make = || Collect::<Request>::new(POST.len());
-        contract::check_decode(make, POST);
+        assert_eq!(
+            decode_chunks(&mut Stream::new(make()), chunks(POST, &[1, 7, 64]), |_| {}),
+            decode_all(make, POST)
+        );
         let (items, error) = test_support::decode_all(make, POST);
         assert_eq!(error, None);
         assert_eq!(items, vec![Request::parse(POST).unwrap()]);
@@ -3809,7 +4131,14 @@ mod tests {
                 },
             })
         };
-        contract::check_decode(assemble, CHUNKED);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(assemble()),
+                chunks(CHUNKED, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(assemble, CHUNKED)
+        );
         let (items, error) = test_support::decode_all(assemble, CHUNKED);
         assert_eq!(error, None);
         assert_eq!(items.len(), 2);
@@ -3825,7 +4154,14 @@ mod tests {
                 },
             )
         };
-        contract::check_decode(pipe, &bytes);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(pipe()),
+                chunks(&bytes, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(pipe, &bytes)
+        );
         let (items, error) = test_support::decode_all(pipe, &bytes);
         assert_eq!(error, None);
         assert!(items.contains(&Layered::Inner(Ok(b"a".to_vec()))));
@@ -3851,20 +4187,58 @@ mod tests {
                 CHUNKED.to_vec()
             };
             test_support::mutate(&mut rng, &mut bytes);
-            contract::check_decode(|| RequestEvents::with_limits(small()), &bytes);
-            contract::check_wire::<Request>(&bytes);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(RequestEvents::with_limits(small())),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |_| {}
+                ),
+                decode_all(|| RequestEvents::with_limits(small()), &bytes)
+            );
+            if let Ok(value) = Request::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
             let mut response = OK.to_vec();
             test_support::mutate(&mut rng, &mut response);
-            contract::check_decode(|| ResponseEvents::with_limits(small()), &response);
-            contract::check_wire::<Response>(&response);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(ResponseEvents::with_limits(small())),
+                    chunks(&response, &[1, 7, 64]),
+                    |_| {}
+                ),
+                decode_all(|| ResponseEvents::with_limits(small()), &response)
+            );
+            if let Ok(value) = Response::parse(&response) {
+                assert_write(&value).unwrap();
+            }
         }
         for _ in 0..16 {
             let bytes = rng.bytes(128);
-            contract::check_decode(RequestEvents::default, &bytes);
-            contract::check_decode(ResponseEvents::default, &bytes);
-            contract::check_wire::<RequestHead>(&bytes);
-            contract::check_wire::<ResponseHead>(&bytes);
-            contract::check_wire::<Chunk>(&bytes);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(RequestEvents::default()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |_| {}
+                ),
+                decode_all(RequestEvents::default, &bytes)
+            );
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(ResponseEvents::default()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |_| {}
+                ),
+                decode_all(ResponseEvents::default, &bytes)
+            );
+            if let Ok(value) = RequestHead::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = ResponseHead::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = Chunk::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
         }
     }
 }

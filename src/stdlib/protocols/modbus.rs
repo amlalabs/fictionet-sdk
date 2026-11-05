@@ -855,11 +855,10 @@ fn pack_bits(bits: &[bool]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{Decode, Step};
-    use fictionet::stdlib::codec::{Fail, Stream, finish, pump, try_pump};
+    use fictionet::stdlib::codec::{Decode, Fail, Step, Stream, finish, pump, try_pump};
     use fictionet::stdlib::test_support;
-    use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::rounds;
+    use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
 
     // Examples from the Modbus Application Protocol Specification v1.1b3,
     // section 6.
@@ -1059,7 +1058,9 @@ mod tests {
             };
             let bytes = frame.to_bytes().unwrap();
             assert_eq!(<Frame as Wire>::parse(&bytes), Ok(frame.clone()));
-            contract::check_wire::<Frame>(&bytes);
+            if let Ok(value) = Frame::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
             for cut in 0..bytes.len() {
                 let prefix = bytes.get(..cut).unwrap();
                 assert_eq!(<Frame as Wire>::parse(prefix), Err(Error::Truncated));
@@ -1092,7 +1093,7 @@ mod tests {
                 unit: 1,
                 pdu: vec![0x41; length],
             };
-            contract::check_wire_value(&frame);
+            let _ = assert_write(&frame);
             let prefix = [0x12, 0x34];
             let mut out = prefix.to_vec();
             let result = frame.write(&mut out);
@@ -1139,7 +1140,14 @@ mod tests {
         }
         assert_eq!(Frames::<Frame>::new().capacity(), MAX_FRAME);
         assert_eq!(Frames::<Frame>::new().held(), 0);
-        contract::check_decode(Frames::<Frame>::new, &bytes);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Frame>::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(Frames::<Frame>::new, &bytes)
+        );
         for sizes in [&[][..], &[1][..], &[7, 1, MAX_FRAME][..]] {
             let mut stream = Stream::new(Frames::<Frame>::new());
             let mut expected = frames.iter();
@@ -1208,7 +1216,14 @@ mod tests {
             (&[0, 1, 0, 0, 0, 1, 1][..], Error::Length(1)),
             (&[0, 1, 0, 0, 0, 255, 1][..], Error::Length(255)),
         ] {
-            contract::check_decode(Frames::<Frame>::new, bad);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Frames::<Frame>::new()),
+                    chunks(bad, &[1, 7, 64]),
+                    |_| {}
+                ),
+                decode_all(Frames::<Frame>::new, bad)
+            );
             let mut stream = Stream::new(Frames::<Frame>::new());
             assert_eq!(stream.push(bad), bad.len());
             assert_eq!(stream.next(), Some(Err(Fail::Protocol(error))));
@@ -1305,7 +1320,14 @@ mod tests {
                 (frame, request)
             })
         };
-        contract::check_decode(make_requests, &input);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(make_requests()),
+                chunks(&input, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(make_requests, &input)
+        );
         for sizes in [&[][..], &[1][..], &[7, 1, 13][..]] {
             let mut registers = [0u16; 10];
             let mut server = Stream::new(make_requests());
@@ -1436,7 +1458,14 @@ mod tests {
         // hold, and the header it sees is already broken.
         let mut d = Stream::new(Frames::<Frame>::new());
         let zeros = vec![0u8; 64 * 1024];
-        contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &zeros, 2 * MAX_FRAME);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Frame>::new()),
+                chunks(&zeros, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_FRAME)
+            ),
+            decode_all(Frames::<Frame>::new, &zeros)
+        );
         let took = d.push(&zeros);
         assert!(took <= MAX_FRAME);
         assert!(d.buffered() <= MAX_FRAME);
@@ -1457,7 +1486,14 @@ mod tests {
                 .unwrap(),
             );
         }
-        contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &stream, 2 * MAX_FRAME);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Frame>::new()),
+                chunks(&stream, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_FRAME)
+            ),
+            decode_all(Frames::<Frame>::new, &stream)
+        );
         let (frames, failure) = test_support::decode_all(Frames::<Frame>::new, &stream);
         assert_eq!(failure, None);
         assert_eq!(frames.len(), 50);

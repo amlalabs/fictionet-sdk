@@ -1878,8 +1878,9 @@ fn check_size(n: usize) -> Result<(), Error> {
 #[doc(hidden)]
 pub mod harness {
     use super::{Compound, Datagram, Packet, check_compound, classify};
+
     use fictionet::stdlib::codec::Wire;
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::assert_write;
 
     /// Reads `data` every way there is, and checks what reads writes back
     /// and reads the same.
@@ -1894,19 +1895,26 @@ pub mod harness {
                 check_compound(&packets).is_ok()
             );
         }
-        contract::check_wire::<Packet>(data);
-        contract::check_wire::<Datagram>(data);
-        contract::check_wire::<Compound>(data);
+        if let Ok(value) = Packet::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Datagram::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Compound::parse(data) {
+            assert_write(&value).unwrap();
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{Fail, Lcg};
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::codec::{Fail, Lcg, Stream};
     use fictionet::stdlib::test_support::rounds;
-    use fictionet::stdlib::test_support::{decode_all, mutate};
+    use fictionet::stdlib::test_support::{
+        assert_write, chunks, decode_all, decode_chunks, mutate,
+    };
 
     fn rr(ssrc: u32) -> Packet {
         Body::ReceiverReport(ReceiverReport {
@@ -1942,7 +1950,7 @@ mod tests {
 
     /// Writes a packet and checks it reads back the same.
     fn round_trip(p: &Packet) -> Vec<u8> {
-        let bytes = contract::check_written(p);
+        let bytes = assert_write(p).unwrap();
         assert_eq!(bytes.len() % 4, 0);
         bytes
     }
@@ -2825,7 +2833,14 @@ mod tests {
         let frames = vec![Frame(a), Frame(vec![]), Frame(b)];
         let mut bytes: Vec<u8> = frames.iter().flat_map(|f| f.to_bytes().unwrap()).collect();
         bytes.extend_from_slice(&[0, 9, 1]);
-        contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &bytes, 2 * (2 + MAX_FRAME));
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Frame>::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * (2 + MAX_FRAME))
+            ),
+            decode_all(Frames::<Frame>::new, &bytes)
+        );
         assert_eq!(
             decode_all(Frames::<Frame>::new, &bytes),
             (frames, Some(Fail::Truncated { unread: 3 }))
@@ -3422,10 +3437,13 @@ mod tests {
             harness::datagram(&data);
             let mut bytes = Frame(data.clone()).to_bytes().unwrap();
             bytes.extend_from_slice(&data);
-            contract::check_decode_with_alloc_limit(
-                Frames::<Frame>::new,
-                &bytes,
-                2 * (2 + MAX_FRAME),
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Frames::<Frame>::new()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * (2 + MAX_FRAME))
+                ),
+                decode_all(Frames::<Frame>::new, &bytes)
             );
             assert_eq!(
                 decode_all(Frames::<Frame>::new, &bytes).0.first(),
@@ -3441,7 +3459,7 @@ mod tests {
         let mut kinds = std::collections::BTreeSet::new();
         for _ in 0..rounds(20_000) {
             let p = random_packet(&mut r);
-            contract::check_wire_value(&p);
+            let _ = assert_write(&p);
             if let Ok(bytes) = p.to_bytes() {
                 written += 1;
                 kinds.insert((bytes[1], bytes[0] & 0x1f));

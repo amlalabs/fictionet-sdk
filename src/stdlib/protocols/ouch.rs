@@ -1905,8 +1905,8 @@ fn canceled(token: Token, quantity: u32, reason: u8, now: u64) -> Outbound {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{Lcg, Wire};
+    use fictionet::stdlib::test_support::assert_write;
     use fictionet::stdlib::test_support::check_atomic;
-    use fictionet::stdlib::test_support::contract::{check_wire, check_wire_value};
     use fictionet::stdlib::test_support::mutate;
 
     #[test]
@@ -2050,7 +2050,9 @@ mod tests {
         b.extend_from_slice(b"C             ");
         b.extend_from_slice(&[0, 3, 2, 28, 3]);
         assert_eq!(m.to_bytes().unwrap(), b);
-        check_wire::<Outbound>(&b);
+        if let Ok(value) = Outbound::parse(&b) {
+            assert_write(&value).unwrap();
+        }
     }
 
     // 3.1: System Event has no appendage: ten bytes.
@@ -2142,8 +2144,7 @@ mod tests {
             reason: b'R',
             options: all.clone(),
         });
-        check_wire_value(&m);
-        let b = m.to_bytes().unwrap();
+        let b = assert_write(&m).unwrap();
         // PegOffset -100 is two's complement.
         let peg = b
             .windows(6)
@@ -2189,7 +2190,7 @@ mod tests {
                 options: Some(Options::of(bad.clone())),
                 ..base.clone()
             };
-            check_wire_value(&m);
+            let _ = assert_write(&m);
             assert_eq!(m.to_bytes(), Err(Error::Option(bad.tag())));
         }
         let huge = CancelOrder {
@@ -2202,7 +2203,7 @@ mod tests {
             ])),
             ..base.clone()
         };
-        check_wire_value(&huge);
+        let _ = assert_write(&huge);
         assert_eq!(huge.to_bytes(), Err(Error::TooLong));
         assert_eq!(Inbound::parse(&[]), Err(Error::Length));
         assert_eq!(Inbound::parse(b"A"), Err(Error::Type(b'A')));
@@ -2474,16 +2475,18 @@ mod tests {
             ]
         );
         for m in &inbound {
-            check_wire_value(m);
-            let b = m.to_bytes().unwrap();
+            let b = assert_write(m).unwrap();
             assert_eq!(b.len(), m.wire_len());
-            check_wire::<Inbound>(&b);
+            if let Ok(value) = Inbound::parse(&b) {
+                assert_write(&value).unwrap();
+            }
         }
         for m in &outbound {
-            check_wire_value(m);
-            let b = m.to_bytes().unwrap();
+            let b = assert_write(m).unwrap();
             assert_eq!(b.len(), m.wire_len());
-            check_wire::<Outbound>(&b);
+            if let Ok(value) = Outbound::parse(&b) {
+                assert_write(&value).unwrap();
+            }
         }
     }
 
@@ -2506,23 +2509,31 @@ mod tests {
             for _ in 0..=rng.below(3) {
                 mutate(&mut rng, &mut bytes);
             }
-            check_wire::<Inbound>(&bytes);
-            check_wire::<Outbound>(&bytes);
-            check_wire::<EnterOrder>(&bytes);
+            if let Ok(value) = Inbound::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = Outbound::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = EnterOrder::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
             if let Ok(m) = Inbound::parse(&bytes) {
                 for action in exchange.receive(&m, i).unwrap() {
                     match action {
-                        Action::Send(out) => check_wire_value(&out),
+                        Action::Send(out) => {
+                            let _ = assert_write(&out);
+                        }
                         Action::Event(Event::EnterRequested(t)) => {
                             let out = if rng.coin() {
                                 exchange.accept(t, i).unwrap()
                             } else {
                                 exchange.reject(t, 1, i).unwrap()
                             };
-                            check_wire_value(&out);
+                            let _ = assert_write(&out);
                         }
                         Action::Event(Event::ReplaceRequested { replacement, .. }) => {
-                            check_wire_value(&exchange.accept(replacement, i).unwrap());
+                            let _ = assert_write(&exchange.accept(replacement, i).unwrap());
                         }
                         Action::Event(Event::Ignored(_)) => {}
                     }

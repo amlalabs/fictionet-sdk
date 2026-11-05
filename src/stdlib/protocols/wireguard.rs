@@ -677,7 +677,7 @@ impl Wire for Data {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::Lcg;
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::assert_write;
     use fictionet::stdlib::test_support::rounds;
 
     fn transport_data(receiver: u32, counter: u64, encrypted: Vec<u8>) -> Data {
@@ -1257,12 +1257,24 @@ mod tests {
 
     /// Any bytes: no panic, and what parses writes back the same.
     fn check(b: &[u8]) {
-        contract::check_wire::<Message>(b);
-        contract::check_wire::<Initiation>(b);
-        contract::check_wire::<Response>(b);
-        contract::check_wire::<CookieReply>(b);
-        contract::check_wire::<Data>(b);
-        contract::check_wire::<Plaintext>(b);
+        if let Ok(value) = Message::parse(b) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Initiation::parse(b) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Response::parse(b) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = CookieReply::parse(b) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Data::parse(b) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Plaintext::parse(b) {
+            assert_write(&value).unwrap();
+        }
 
         if let Ok(m) = Message::parse(b) {
             assert_eq!(m.to_bytes().as_deref(), Ok(b));

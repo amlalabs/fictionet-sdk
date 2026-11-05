@@ -1489,8 +1489,8 @@ pub mod harness {
         MAX_REQUESTS, Pairs, Record, RecordStream, Request, Response, Server, ServerEvent,
         UnknownType, kind,
     };
-    use fictionet::stdlib::codec::{Decode, Frames, Wire};
-    use fictionet::stdlib::test_support::{contract, decode_all};
+    use fictionet::stdlib::codec::{Decode, Frames, Stream, Wire};
+    use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
 
     /// Semantic branches reached by one input.
     #[derive(Debug, Default, PartialEq, Eq)]
@@ -1509,15 +1509,41 @@ pub mod harness {
     /// The fuzz target is exactly this call.
     pub fn check(data: &[u8]) -> Reach {
         let mut reach = Reach::default();
-        contract::check_decode_capacity(Frames::<Record>::new, data);
-        contract::check_decode_with_alloc_limit(Frames::<Record>::new, data, 2 * MAX_RECORD);
-        contract::check_wire::<Record>(data);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Record>::new()),
+                chunks(data, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_RECORD)
+            ),
+            decode_all(Frames::<Record>::new, data)
+        );
+        if let Ok(value) = Record::parse(data) {
+            assert_write(&value).unwrap();
+        }
         let limit = usize::from(data.first().copied().unwrap_or(0));
-        contract::check_decode_capacity(|| Frames::<Record>::with_limit(limit), data);
-        contract::check_decode_with_alloc_limit(
-            || Frames::<Record>::new().map(|record| BeginRequest::parse(&record.content)),
-            data,
-            2 * Frames::<Record>::new().capacity(),
+        let limited = Frames::<Record>::with_limit(limit);
+        let alloc = 2 * limited.capacity();
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(limited),
+                chunks(data, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= alloc)
+            ),
+            decode_all(|| Frames::<Record>::with_limit(limit), data)
+        );
+        let alloc = 2 * Frames::<Record>::new().capacity();
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(
+                    Frames::<Record>::new().map(|record| BeginRequest::parse(&record.content))
+                ),
+                chunks(data, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= alloc)
+            ),
+            decode_all(
+                || Frames::<Record>::new().map(|record| BeginRequest::parse(&record.content)),
+                data
+            )
         );
         let built = Record {
             kind: data.first().copied().unwrap_or(0),
@@ -1525,7 +1551,7 @@ pub mod harness {
             content: data.iter().take(MAX_CONTENT + 1).copied().collect(),
             padding: data.last().copied().unwrap_or(0),
         };
-        contract::check_wire_value(&built);
+        let _ = assert_write(&built);
 
         let whole = decode_all(Frames::<Record>::new, data).0;
 
@@ -1600,20 +1626,34 @@ pub mod harness {
             assert!(client.held() <= MAX_HELD);
         }
 
-        contract::check_wire::<Pairs>(data);
-        contract::check_wire::<BeginRequest>(data);
-        contract::check_wire::<EndRequest>(data);
-        contract::check_wire::<UnknownType>(data);
-        contract::check_wire::<RecordStream>(data);
-        contract::check_wire::<Request>(data);
-        contract::check_wire::<Response>(data);
+        if let Ok(value) = Pairs::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = BeginRequest::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = EndRequest::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = UnknownType::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = RecordStream::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Request::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Response::parse(data) {
+            assert_write(&value).unwrap();
+        }
 
         let stream = RecordStream {
             kind: kind::STDOUT,
             request_id: 1,
             data: data.to_vec(),
         };
-        contract::check_wire_value(&stream);
+        let _ = assert_write(&stream);
         if let Ok(bytes) = stream.to_bytes() {
             let mut client = Client::new();
             let mut got = Vec::new();
@@ -1648,11 +1688,11 @@ mod tests {
     use super::harness::check;
     use super::*;
     use fictionet::assert_cases;
-    use fictionet::stdlib::codec::{Decode, Step};
-    use fictionet::stdlib::codec::{Fail, Lcg, Stream, finish, pump};
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::codec::{Decode, Fail, Lcg, Step, Stream, finish, pump};
     use fictionet::stdlib::test_support::rounds;
-    use fictionet::stdlib::test_support::{decode_all, mutate};
+    use fictionet::stdlib::test_support::{
+        assert_write, chunks, decode_all, decode_chunks, mutate,
+    };
 
     fn begin_request(role: Role, flags: u8) -> BeginRequest {
         BeginRequest { role, flags }
@@ -1854,7 +1894,7 @@ mod tests {
             content: vec![7; MAX_CONTENT + 10],
             padding: 255,
         };
-        contract::check_wire_value(&big);
+        let _ = assert_write(&big);
         assert_eq!(big.to_bytes(), Err(Error::Unwritable));
         big.content.truncate(MAX_CONTENT);
         let bytes = big.to_bytes().unwrap();
@@ -1911,7 +1951,7 @@ mod tests {
             MAX_PAIRS
         );
         let too_many: Vec<(Vec<u8>, Vec<u8>)> = (0..MAX_PAIRS + 5).map(|_| pair("", "")).collect();
-        contract::check_wire_value(&Pairs(too_many.clone()));
+        let _ = assert_write(&Pairs(too_many.clone()));
         assert_eq!(Pairs(too_many).to_bytes(), Err(Error::Unwritable));
     }
 
@@ -2210,7 +2250,7 @@ mod tests {
         );
         // Management IDs cannot name a request.
         let zero = Request { id: 0, ..filter };
-        contract::check_wire_value(&zero);
+        let _ = assert_write(&zero);
         assert_eq!(zero.to_bytes(), Err(Error::Unwritable));
     }
 
@@ -2344,12 +2384,12 @@ mod tests {
             stdin: vec![9; MAX_STREAM + 100],
             data: Vec::new(),
         };
-        contract::check_wire_value(&req);
+        let _ = assert_write(&req);
         assert_eq!(req.to_bytes(), Err(Error::Unwritable));
         req.stdin.truncate(MAX_STREAM);
         assert_eq!(req.to_bytes(), Err(Error::Unwritable));
         req.params.0.truncate(200);
-        contract::check_wire_value(&req);
+        let _ = assert_write(&req);
         assert_eq!(Request::parse(&req.to_bytes().unwrap()), Ok(req.clone()));
         for bad in [
             Request {
@@ -2369,7 +2409,7 @@ mod tests {
                 ..req
             },
         ] {
-            contract::check_wire_value(&bad);
+            let _ = assert_write(&bad);
             assert_eq!(bad.to_bytes(), Err(Error::Unwritable));
         }
         let mut resp = Response {
@@ -2379,13 +2419,13 @@ mod tests {
             app_status: 1,
             protocol_status: ProtocolStatus::RequestComplete,
         };
-        contract::check_wire_value(&resp);
+        let _ = assert_write(&resp);
         assert_eq!(resp.to_bytes(), Err(Error::Unwritable));
         resp.stdout.truncate(MAX_STREAM);
-        contract::check_wire_value(&resp);
+        let _ = assert_write(&resp);
         assert_eq!(Response::parse(&resp.to_bytes().unwrap()), Ok(resp.clone()));
         resp.id = 0;
-        contract::check_wire_value(&resp);
+        let _ = assert_write(&resp);
         assert_eq!(resp.to_bytes(), Err(Error::Unwritable));
         let empty = RecordStream {
             kind: kind::STDIN,
@@ -2404,7 +2444,14 @@ mod tests {
         let b = Record::new(kind::STDIN, 1, &[]);
         let mut bytes = a.to_bytes().unwrap();
         b.write(&mut bytes).unwrap();
-        contract::check_decode_with_alloc_limit(Frames::<Record>::new, &bytes, 2 * MAX_RECORD);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Record>::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_RECORD)
+            ),
+            decode_all(Frames::<Record>::new, &bytes)
+        );
         assert_eq!(
             decode_all(Frames::<Record>::new, &bytes),
             (vec![a, b], None)
@@ -2669,8 +2716,15 @@ mod tests {
                 },
             };
             let bytes = req.to_bytes().unwrap();
-            contract::check_wire_value(&req);
-            contract::check_decode_with_alloc_limit(Frames::<Record>::new, &bytes, 2 * MAX_RECORD);
+            let _ = assert_write(&req);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Frames::<Record>::new()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_RECORD)
+                ),
+                decode_all(Frames::<Record>::new, &bytes)
+            );
             assert_eq!(Request::parse(&bytes), Ok(req));
             // Every truncated prefix leaves the request unfinished.
             let cut = rng.index(bytes.len());
@@ -2769,10 +2823,10 @@ mod tests {
                 request_id: 1,
                 data: vec![1; limit + 1],
             };
-            contract::check_wire_value(&value);
+            let _ = assert_write(&value);
             assert_eq!(value.to_bytes(), Err(Error::Unwritable));
             value.data.truncate(limit);
-            contract::check_wire_value(&value);
+            let _ = assert_write(&value);
             assert_eq!(RecordStream::parse(&value.to_bytes().unwrap()), Ok(value));
         }
         let mut server = Server::new();

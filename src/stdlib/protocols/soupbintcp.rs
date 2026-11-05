@@ -931,9 +931,10 @@ impl Server {
 #[doc(hidden)]
 pub mod harness {
     use super::{Alpha, Event, Login, Packet};
+
     use fictionet::stdlib::codec::Wire;
     use fictionet::stdlib::protocols::session::Action;
-    use fictionet::stdlib::test_support::contract::check_wire_value;
+    use fictionet::stdlib::test_support::assert_write;
 
     /// Returns the session login fixture.
     pub fn login() -> Login {
@@ -950,7 +951,7 @@ pub mod harness {
         assert!(actions.len() <= 2);
         for action in actions {
             if let Action::Send(packet) = action {
-                check_wire_value(packet);
+                let _ = assert_write(packet);
                 assert!(packet.to_bytes().is_ok());
             }
         }
@@ -963,10 +964,9 @@ mod tests {
     use super::*;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream};
     use fictionet::stdlib::test_support::check_atomic;
-    use fictionet::stdlib::test_support::contract::{
-        check_decode, check_decode_with_alloc_limit, check_wire, check_wire_value,
+    use fictionet::stdlib::test_support::{
+        assert_write, chunks, decode_all, decode_chunks, mutate,
     };
-    use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn session() -> Alpha<SESSION_LENGTH> {
         Alpha::left_padded("ABCDEFGHIJ").unwrap()
@@ -1079,7 +1079,9 @@ mod tests {
                     sequence: 7
                 }
             );
-            check_wire::<Packet>(&b);
+            if let Ok(value) = Packet::parse(&b) {
+                assert_write(&value).unwrap();
+            }
         }
         let mut blank = bytes.clone();
         blank.extend_from_slice(&[b' '; 20]);
@@ -1100,7 +1102,7 @@ mod tests {
             session: session(),
             sequence: u64::MAX,
         };
-        check_wire_value(&max);
+        let _ = assert_write(&max);
     }
 
     #[test]
@@ -1117,31 +1119,46 @@ mod tests {
         bad[3] = 0x07;
         assert_eq!(Packet::parse(&bad), Err(Error::Field));
         let long = Packet::SequencedData(vec![0; MAX_PAYLOAD + 1]);
-        check_wire_value(&long);
+        let _ = assert_write(&long);
         assert_eq!(long.to_bytes(), Err(Error::TooLong));
         let full = Packet::SequencedData(vec![7; MAX_PAYLOAD]);
         let bytes = full.to_bytes().unwrap();
         assert_eq!(bytes.len(), MAX_PACKET);
         assert_eq!(&bytes[..2], &[0xff, 0xff]);
-        check_wire_value(&full);
+        let _ = assert_write(&full);
     }
 
     #[test]
     fn every_packet_round_trips() {
         for p in every_packet() {
-            check_wire_value(&p);
-            let bytes = p.to_bytes().unwrap();
+            let bytes = assert_write(&p).unwrap();
             assert_eq!(Packet::parse(&bytes).unwrap(), p);
             assert_eq!(bytes.len(), LENGTH_PREFIX + 1 + p.payload_len());
-            check_wire::<Packet>(&bytes);
+            if let Ok(value) = Packet::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
         }
     }
 
     #[test]
     fn frames_follow_the_contract() {
         let bytes = stream_of(&every_packet());
-        check_decode(Frames::<Packet>::default, &bytes);
-        check_decode_with_alloc_limit(|| Frames::<Packet>::with_limit(64), &bytes, 2 * (64 + 3));
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Packet>::default()),
+                chunks(&bytes, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(Frames::<Packet>::default, &bytes)
+        );
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Packet>::with_limit(64)),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * (64 + 3))
+            ),
+            decode_all(|| Frames::<Packet>::with_limit(64), &bytes)
+        );
         let (items, failure) = decode_all(Frames::<Packet>::default, &bytes);
         assert!(failure.is_none());
         assert_eq!(
@@ -1154,7 +1171,14 @@ mod tests {
     fn frames_pass_unparsed_packets_as_items() {
         let mut bytes = vec![0, 0, 0, 1, b'Q', 0, 2, b'H', 0];
         Packet::ServerHeartbeat.write(&mut bytes).unwrap();
-        check_decode(Frames::<Packet>::default, &bytes);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Packet>::default()),
+                chunks(&bytes, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(Frames::<Packet>::default, &bytes)
+        );
         let (items, failure) = decode_all(Frames::<Packet>::default, &bytes);
         assert!(failure.is_none());
         assert_eq!(
@@ -1192,11 +1216,20 @@ mod tests {
             for _ in 0..=rng.below(4) {
                 mutate(&mut rng, &mut bytes);
             }
-            check_wire::<Packet>(&bytes);
-            check_decode_with_alloc_limit(|| Frames::<Packet>::with_limit(256), &bytes, 2 * 259);
+            if let Ok(value) = Packet::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Frames::<Packet>::with_limit(256)),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * 259)
+                ),
+                decode_all(|| Frames::<Packet>::with_limit(256), &bytes)
+            );
             let (items, _) = decode_all(Frames::<Packet>::default, &bytes);
             for item in items.into_iter().flatten() {
-                check_wire_value(&item);
+                let _ = assert_write(&item);
             }
         }
     }
@@ -1206,7 +1239,7 @@ mod tests {
             .iter()
             .filter_map(|a| match a {
                 Action::Send(p) => {
-                    check_wire_value(p);
+                    let _ = assert_write(p);
                     Some(p.clone())
                 }
                 Action::Event(_) => None,
@@ -1622,7 +1655,7 @@ mod tests {
                     .chain(&server.tick(now).unwrap())
                 {
                     if let Action::Send(p) = a {
-                        check_wire_value(p);
+                        let _ = assert_write(p);
                     }
                 }
             }

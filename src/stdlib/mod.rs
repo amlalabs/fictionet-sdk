@@ -178,7 +178,8 @@
 //!    the supported wire format, limits and caller responsibilities, with
 //!    runnable doctests. Implement [`codec::Wire`] for complete values and
 //!    [`codec::Prefixed`] or [`codec::Decode`] where stream framing is needed.
-//!    Check decoder contracts with [`test_support::contract`]. A large
+//!    Test decoders with [`test_support::decode_chunks`] and writers with
+//!    [`test_support::assert_write`]. A large
 //!    protocol may be a directory whose `mod.rs` declares private child
 //!    modules and re-exports their items, as `protocols/smb2/` does.
 //! 2. Declare it with `pub mod` in `src/stdlib/protocols/mod.rs`, and add a

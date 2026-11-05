@@ -1455,9 +1455,10 @@ fictionet::codec_from!(Error, Truncated, |_| Error::Truncated);
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream, pump};
-    use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::rounds;
-    use fictionet::stdlib::test_support::{chunks, decode_all, mutate};
+    use fictionet::stdlib::test_support::{
+        assert_write, chunks, decode_all, decode_chunks, mutate,
+    };
     fn names(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
     }
@@ -1884,7 +1885,7 @@ mod tests {
         }
         let valid = NameList(names(&["aes@x.org", "b", "x@y"]));
         assert!(valid.to_bytes().is_ok());
-        contract::check_wire_value(&valid);
+        let _ = assert_write(&valid);
         assert_eq!(
             NameList(vec!["a".repeat(MAX_NAME); 600]).to_bytes(),
             Err(Error::Unwritable)
@@ -1945,14 +1946,14 @@ mod tests {
         let id = Identification::parse(text.as_bytes()).unwrap();
         assert_eq!(id.comments(), Some("café\tok 1-2"));
         assert_eq!(id.to_bytes().unwrap(), text.as_bytes());
-        contract::check_wire_value(&id);
+        let _ = assert_write(&id);
     }
 
     #[test]
     fn banner_lines() {
         let line = Line::Banner(b"Welcome to the tank farm".to_vec());
         assert_eq!(line.to_bytes().unwrap(), b"Welcome to the tank farm\r\n");
-        contract::check_wire_value(&line);
+        let _ = assert_write(&line);
         assert_eq!(Line::parse(b"\n"), Ok(Line::Banner(vec![])));
         assert_eq!(Line::parse(b"a\0b\n"), Err(Error::Nul));
         assert_eq!(
@@ -1960,7 +1961,9 @@ mod tests {
             Err(Error::LineTooLong)
         );
         let longest = [vec![b'x'; MAX_BANNER_LINE - 1], vec![b'\n']].concat();
-        contract::check_wire::<Line>(&longest);
+        if let Ok(value) = Line::parse(&longest) {
+            assert_write(&value).unwrap();
+        }
         for bad in [
             b"SSH-2.0-x".as_slice(),
             b"a\nb",
@@ -1977,13 +1980,20 @@ mod tests {
             vec![b'x'; MAX_BANNER_LINE - 1],
             vec![b'x'; MAX_BANNER_LINE - 2],
         ] {
-            contract::check_wire_value(&Line::Banner(text));
+            let _ = assert_write(&Line::Banner(text));
         }
         let line = b"SSH-2.0-OpenSSH_9.6 c\r\n";
         for n in 0..line.len() {
             assert_eq!(Line::parse(&line[..n]), Err(Error::Truncated));
         }
-        contract::check_decode_with_alloc_limit(Lines::new, line, 2 * MAX_BANNER_LINE);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Lines::new()),
+                chunks(line, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_BANNER_LINE)
+            ),
+            decode_all(Lines::new, line)
+        );
     }
 
     #[test]
@@ -1999,7 +2009,7 @@ mod tests {
             payload: vec![1, 2, 3],
             padding: vec![9; 8],
         };
-        contract::check_wire_value(&exact);
+        let _ = assert_write(&exact);
         for padding in [0, 3, 5, 256, 300] {
             assert_eq!(
                 Packet {
@@ -2025,7 +2035,7 @@ mod tests {
             Packet::parse(&[0, 0, 0x88, 0xb4, 4]),
             Err(Error::PayloadTooLong(34991))
         );
-        contract::check_wire_value(&Packet::new(vec![2; MAX_PAYLOAD]));
+        let _ = assert_write(&Packet::new(vec![2; MAX_PAYLOAD]));
         assert_eq!(
             Packet::new(vec![2; MAX_PAYLOAD + 100]).to_bytes(),
             Err(Error::Unwritable)
@@ -2037,10 +2047,10 @@ mod tests {
         for m in samples() {
             let payload = m.to_bytes().unwrap();
             assert_eq!(payload[0], m.number());
-            contract::check_wire_value(&m);
+            let _ = assert_write(&m);
             let packet = Packet::from_message(&m).unwrap();
             assert_eq!(packet.payload, payload);
-            contract::check_wire_value(&packet);
+            let _ = assert_write(&packet);
             for n in 0..payload.len() {
                 if matches!(m, Message::Other { .. }) && n > 0 {
                     continue;
@@ -2100,7 +2110,7 @@ mod tests {
             },
         ] {
             assert_eq!(m.to_bytes(), Err(Error::Unwritable));
-            contract::check_wire_value(&m);
+            let _ = assert_write(&m);
         }
         assert_eq!(
             SshString(vec![0; MAX_PAYLOAD + 1]).to_bytes(),
@@ -2130,7 +2140,14 @@ mod tests {
     #[test]
     fn stream_reads_exchange_and_sequence_numbers() {
         let bytes = stream();
-        contract::check_decode_with_alloc_limit(Events::new, &bytes, 2 * MAX_PACKET);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Events::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_PACKET)
+            ),
+            decode_all(Events::new, &bytes)
+        );
         let (events, failure) = decode_all(Events::new, &bytes);
         assert_eq!(failure, None);
         assert_eq!(events.len(), 3 + samples().len());
@@ -2191,18 +2208,35 @@ mod tests {
             .to_bytes()
             .unwrap();
         let bytes = big.repeat(3);
-        contract::check_decode_with_alloc_limit(Events::after_version, &bytes, 2 * MAX_PACKET);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Events::after_version()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_PACKET)
+            ),
+            decode_all(Events::after_version, &bytes)
+        );
         assert_eq!(decode_all(Events::after_version, &bytes).0.len(), 3);
         let long_line = vec![b'x'; rounds(200_000)];
-        contract::check_decode_with_alloc_limit(Events::new, &long_line, 2 * MAX_PACKET);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Events::new()),
+                chunks(&long_line, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_PACKET)
+            ),
+            decode_all(Events::new, &long_line)
+        );
         assert_eq!(
             decode_all(Events::new, &long_line).1,
             Some(Fail::Protocol(Error::LineTooLong))
         );
-        contract::check_decode_with_alloc_limit(
-            Frames::<Packet>::new,
-            &[0, 0, 0x88, 0xb4, 4],
-            2 * MAX_PACKET,
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Packet>::new()),
+                chunks(&[0, 0, 0x88, 0xb4, 4], &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_PACKET)
+            ),
+            decode_all(Frames::<Packet>::new, &[0, 0, 0x88, 0xb4, 4])
         );
         assert_eq!(
             decode_all(Events::after_version, &[0, 0, 0x88, 0xb4, 4]).1,
@@ -2280,22 +2314,68 @@ mod tests {
             for sample in &payloads {
                 let mut payload = sample.clone();
                 mutate(&mut g, &mut payload);
-                contract::check_wire::<Message>(&payload);
+                if let Ok(value) = Message::parse(&payload) {
+                    assert_write(&value).unwrap();
+                }
             }
             let mut bytes = if g.coin() { g.bytes(300) } else { base.clone() };
             mutate(&mut g, &mut bytes);
-            contract::check_decode_with_alloc_limit(Events::new, &bytes, 2 * MAX_PACKET);
-            contract::check_decode_with_alloc_limit(Events::after_version, &bytes, 2 * MAX_PACKET);
-            contract::check_decode_with_alloc_limit(Frames::<Packet>::new, &bytes, 2 * MAX_PACKET);
-            contract::check_decode_with_alloc_limit(Lines::new, &bytes, 2 * MAX_BANNER_LINE);
-            contract::check_wire::<Message>(&bytes);
-            contract::check_wire::<Packet>(&bytes);
-            contract::check_wire::<Line>(&bytes);
-            contract::check_wire::<Identification>(&bytes);
-            contract::check_wire::<Mpint>(&bytes);
-            contract::check_wire::<NameList>(&bytes);
-            contract::check_wire::<SshString>(&bytes);
-            contract::check_wire::<Boolean>(&bytes);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Events::new()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_PACKET)
+                ),
+                decode_all(Events::new, &bytes)
+            );
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Events::after_version()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_PACKET)
+                ),
+                decode_all(Events::after_version, &bytes)
+            );
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Frames::<Packet>::new()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_PACKET)
+                ),
+                decode_all(Frames::<Packet>::new, &bytes)
+            );
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Lines::new()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_BANNER_LINE)
+                ),
+                decode_all(Lines::new, &bytes)
+            );
+            if let Ok(value) = Message::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = Packet::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = Line::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = Identification::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = Mpint::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = NameList::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = SshString::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = Boolean::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
             let message = match g.index(7) {
                 0 => Message::Disconnect {
                     reason: if g.coin() {
@@ -2338,19 +2418,19 @@ mod tests {
                 5 => Message::Ignore(g.bytes(40)),
                 _ => Message::Unimplemented(g.next() as u32),
             };
-            contract::check_wire_value(&message);
-            contract::check_wire_value(&NameList(list(&mut g)));
+            let _ = assert_write(&message);
+            let _ = assert_write(&NameList(list(&mut g)));
             let packet = Packet {
                 payload: g.bytes(40),
                 padding: g.bytes(20),
             };
-            contract::check_wire_value(&packet);
+            let _ = assert_write(&packet);
             if let Ok(id) =
                 Identification::new(&text(&mut g, 3), &text(&mut g, 10), Some(&text(&mut g, 3)))
             {
-                contract::check_wire_value(&id);
+                let _ = assert_write(&id);
             }
-            contract::check_wire_value(&Line::Banner(g.bytes(100)));
+            let _ = assert_write(&Line::Banner(g.bytes(100)));
         }
     }
 }

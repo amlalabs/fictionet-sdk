@@ -1118,19 +1118,35 @@ impl Wire for Packet {
 #[doc(hidden)]
 pub mod harness {
     use super::*;
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::assert_write;
 
     /// Checks wire round trips, prefixes, reserved bits and constructed values.
     pub fn check(data: &[u8]) {
-        contract::check_wire::<Avp>(data);
-        contract::check_wire::<ControlMessage>(data);
-        contract::check_wire::<V2Packet>(data);
-        contract::check_wire::<V3Control>(data);
-        contract::check_wire::<V3Data<0>>(data);
-        contract::check_wire::<V3Data<4>>(data);
-        contract::check_wire::<V3Data<8>>(data);
-        contract::check_wire::<Packet>(data);
-        contract::check_wire_value(&ControlMessage::zlb());
+        if let Ok(value) = Avp::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = ControlMessage::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = V2Packet::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = V3Control::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = <V3Data<0>>::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = <V3Data<4>>::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = <V3Data<8>>::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Packet::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        let _ = assert_write(&ControlMessage::zlb());
         assert!(ControlMessage::zlb().to_bytes().is_ok());
         for n in 0..=data.len().min(256) {
             let part = Packet::parse(&data[..n]);
@@ -1141,7 +1157,7 @@ pub mod harness {
         }
         if let Ok(message) = ControlMessage::parse(data) {
             let control = V3Control::new(1, 2, 3, &message).unwrap();
-            contract::check_wire_value(&control);
+            let _ = assert_write(&control);
             assert!(control.to_bytes().is_ok());
             assert_eq!(control.message(), Ok(message.clone()));
             let body = message.to_bytes().unwrap();
@@ -1153,7 +1169,7 @@ pub mod harness {
                     nr: 0,
                     payload: long,
                 };
-                contract::check_wire_value(&control);
+                let _ = assert_write(&control);
                 assert_eq!(control.to_bytes(), Err(Error::Unwritable));
             }
         }
@@ -1182,14 +1198,14 @@ pub mod harness {
             attribute: code,
             value: data[..data.len().min(MAX_AVP_VALUE + 1)].to_vec(),
         };
-        contract::check_wire_value(&avp);
+        let _ = assert_write(&avp);
         let message = ControlMessage {
             message_type: (byte(2) & 4 != 0).then(|| MessageType::from_code(code)),
             mandatory: byte(2) & 1 != 0,
             vendor: u16::from(byte(4)),
             avps: vec![avp],
         };
-        contract::check_wire_value(&message);
+        let _ = assert_write(&message);
         let packet = V2Packet {
             control: byte(2) & 1 != 0,
             has_length: byte(2) & 2 != 0,
@@ -1200,16 +1216,16 @@ pub mod harness {
             session: code,
             payload: data[..data.len().min(MAX_DATAGRAM + 1)].to_vec(),
         };
-        contract::check_wire_value(&packet);
+        let _ = assert_write(&packet);
         let cookie = data[..data.len().min(12)].to_vec();
         macro_rules! cookie {
-            ($len:expr) => {
-                contract::check_wire_value(&V3Data::<$len> {
+            ($len:expr) => {{
+                let _ = assert_write(&V3Data::<$len> {
                     session: 1,
                     cookie,
                     payload: vec![],
-                })
-            };
+                });
+            }};
         }
         match cookie.len() {
             4 => cookie!(4),
@@ -1223,7 +1239,7 @@ pub mod harness {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::Lcg;
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::assert_write;
     use fictionet::stdlib::test_support::mutate;
     use fictionet::stdlib::test_support::rounds;
 
@@ -1267,7 +1283,9 @@ mod tests {
         let mut longer = bytes.clone();
         longer.extend_from_slice(&[0xaa, 0xbb]);
         assert_eq!(V2Packet::parse(&longer), Ok(p));
-        contract::check_wire::<V2Packet>(&longer);
+        if let Ok(value) = V2Packet::parse(&longer) {
+            assert_write(&value).unwrap();
+        }
     }
 
     #[test]
@@ -1291,7 +1309,7 @@ mod tests {
             ..ControlMessage::zlb()
         };
         assert_eq!(odd.to_bytes(), Err(Error::Unwritable));
-        contract::check_wire_value(&odd);
+        let _ = assert_write(&odd);
     }
 
     #[test]
@@ -1363,16 +1381,18 @@ mod tests {
         assert_eq!(a.to_bytes().unwrap(), zeroed);
         let r = Avp::parse(&[0x84, 8, 0, 0, 0, 9, 0, 7]).unwrap();
         assert_eq!(Avp::reserved_bits(&bytes), Ok(5));
-        contract::check_wire::<Avp>(&bytes);
+        if let Ok(value) = Avp::parse(&bytes) {
+            assert_write(&value).unwrap();
+        }
         assert_eq!(r.to_bytes().unwrap(), [0x80, 8, 0, 0, 0, 9, 0, 7]);
         assert_eq!(Avp::parse(&bytes[..9]), Err(Error::Truncated));
         assert_eq!(Avp::parse(&[0x80, 5, 0, 0, 0, 0]), Err(Error::AvpLength(5)));
         // An oversized value cannot fit the length field.
         let big = Avp::new(attribute::CHALLENGE, vec![7; 5000]);
         assert_eq!(big.to_bytes(), Err(Error::Unwritable));
-        contract::check_wire_value(&big);
+        let _ = assert_write(&big);
         let boundary = Avp::new(attribute::CHALLENGE, vec![7; MAX_AVP_VALUE]);
-        contract::check_wire_value(&boundary);
+        let _ = assert_write(&boundary);
     }
 
     #[test]
@@ -1441,7 +1461,9 @@ mod tests {
         assert_eq!(m.to_bytes().unwrap(), [0x80, 8, 0, 0, 0, 0, 0, 6]);
         assert_eq!(Avp::reserved_bits(&m.to_bytes().unwrap()), Ok(0));
         assert_eq!(Avp::reserved_bits(&[]), Err(Error::Truncated));
-        contract::check_wire::<ControlMessage>(&bytes);
+        if let Ok(value) = ControlMessage::parse(&bytes) {
+            assert_write(&value).unwrap();
+        }
     }
 
     #[test]
@@ -1658,7 +1680,7 @@ mod tests {
         p.sequence = Some((1, 2));
         p.offset_pad = Some(huge.clone());
         assert_eq!(p.to_bytes(), Err(Error::Unwritable));
-        contract::check_wire_value(&p);
+        let _ = assert_write(&p);
         let c = V3Control {
             connection: 1,
             ns: 0,
@@ -1666,14 +1688,14 @@ mod tests {
             payload: huge.clone(),
         };
         assert_eq!(c.to_bytes(), Err(Error::Unwritable));
-        contract::check_wire_value(&c);
+        let _ = assert_write(&c);
         let d = V3Data::<8> {
             session: 1,
             cookie: vec![0; 8],
             payload: huge,
         };
         assert_eq!(d.to_bytes(), Err(Error::Unwritable));
-        contract::check_wire_value(&d);
+        let _ = assert_write(&d);
         let many = ControlMessage::new(
             MessageType::Hello,
             vec![Avp::from_u16(50, 1); MAX_AVPS + 10],
@@ -1684,7 +1706,7 @@ mod tests {
         );
         for message in [many, fat] {
             assert_eq!(message.to_bytes(), Err(Error::Unwritable));
-            contract::check_wire_value(&message);
+            let _ = assert_write(&message);
             assert_eq!(
                 V2Packet::control(1, 0, 0, 0, &message),
                 Err(Error::Unwritable)
@@ -1754,7 +1776,7 @@ mod tests {
             payload: vec![],
         };
         assert_eq!(p.to_bytes(), Err(Error::Unwritable));
-        contract::check_wire_value(&p);
+        let _ = assert_write(&p);
     }
 
     #[test]
@@ -1813,7 +1835,7 @@ mod tests {
             {
                 avp.value.resize(MAX_AVP_VALUE + 1, 0);
             }
-            contract::check_wire_value(&message);
+            let _ = assert_write(&message);
             let Ok(body) = message.to_bytes() else {
                 continue;
             };
@@ -1839,7 +1861,7 @@ mod tests {
                 session: u16r(&mut rng),
                 payload: body.clone(),
             };
-            contract::check_wire_value(&v2);
+            let _ = assert_write(&v2);
             let c = V3Control::new(
                 u32::from(u16r(&mut rng)) << 16,
                 u16r(&mut rng),
@@ -1860,7 +1882,7 @@ mod tests {
                         cookie,
                         payload: body,
                     };
-                    contract::check_wire_value(&d);
+                    let _ = assert_write(&d);
                 }};
             }
             match cookie.len() {

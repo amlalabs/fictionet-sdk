@@ -3597,9 +3597,8 @@ mod tests {
     use super::harness::check_reader;
     use super::*;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream, pump};
-    use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::rounds;
-    use fictionet::stdlib::test_support::{self, decode_all};
+    use fictionet::stdlib::test_support::{self, assert_write, chunks, decode_all, decode_chunks};
 
     /// Writes chunks and fails the test with the original error on refusal.
     fn wire_chunks(chunks: Vec<Chunk>) -> Vec<u8> {
@@ -4478,26 +4477,36 @@ mod tests {
     fn messages_are_chunked_and_put_back_together() {
         let body: Vec<u8> = (0..30_000u32).map(|i| i as u8).collect();
         let m = msg(1, u32::MAX - 1, 5, body);
-        let chunks = match &m {
+        let pieces = match &m {
             Message::Secure(s) => s.chunks(&Limits::default()).unwrap(),
             _ => unreachable!(),
         };
-        assert_eq!(chunks.len(), 4);
+        assert_eq!(pieces.len(), 4);
         assert!(
-            chunks
+            pieces
                 .iter()
                 .all(|c| c.body.len() + HEADER_LEN <= MIN_BUFFER_SIZE as usize)
         );
-        assert_eq!(chunks[0].chunk_type, ChunkType::Intermediate);
-        assert_eq!(chunks[3].chunk_type, ChunkType::Final);
+        assert_eq!(pieces[0].chunk_type, ChunkType::Intermediate);
+        assert_eq!(pieces[3].chunk_type, ChunkType::Final);
         // The sequence numbers wrap past u32::MAX.
-        assert_eq!(chunks[2].body[8..12], le32(0));
-        let bytes = wire_chunks(chunks);
-        contract::check_decode_with_held_limit(Messages::new, &bytes, MAX_MESSAGE_SIZE as usize);
-        contract::check_decode_with_alloc_limit(
-            Messages::new,
-            &bytes,
-            2 * MAX_HANDSHAKE_SIZE as usize,
+        assert_eq!(pieces[2].body[8..12], le32(0));
+        let bytes = wire_chunks(pieces);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Messages::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.held() <= MAX_MESSAGE_SIZE as usize)
+            ),
+            decode_all(Messages::new, &bytes)
+        );
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Messages::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_HANDSHAKE_SIZE as usize)
+            ),
+            decode_all(Messages::new, &bytes)
         );
         let mut stream = Stream::new(Messages::new());
         let mut messages = Vec::new();
@@ -5066,10 +5075,13 @@ mod tests {
     #[test]
     fn every_truncated_prefix_waits_or_fails() {
         for bytes in samples() {
-            contract::check_decode_with_held_limit(
-                Messages::new,
-                &bytes,
-                MAX_MESSAGE_SIZE as usize,
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Messages::new()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |s| assert!(s.held() <= MAX_MESSAGE_SIZE as usize)
+                ),
+                decode_all(Messages::new, &bytes)
             );
             for cut in 0..bytes.len() {
                 let mut stream = Stream::new(Messages::new());
@@ -5622,7 +5634,7 @@ mod tests {
             server_picoseconds: Some(MAX_PICOSECONDS),
             ..d
         };
-        contract::check_wire_value(&d);
+        let _ = assert_write(&d);
     }
 
     #[test]
@@ -5811,10 +5823,13 @@ mod tests {
             } else {
                 Limits::default()
             };
-            contract::check_decode_with_held_limit(
-                || Messages::with_limits(limits),
-                &b,
-                limits.message_limit() as usize,
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Messages::with_limits(limits)),
+                    chunks(&b, &[1, 7, 64]),
+                    |s| assert!(s.held() <= limits.message_limit() as usize)
+                ),
+                decode_all(|| Messages::with_limits(limits), &b)
             );
             let (first, _) = decode_all(|| Messages::with_limits(limits), &b);
             for m in &first {
@@ -5828,27 +5843,49 @@ mod tests {
                 assert_eq!(d.push(&out), out.len());
                 assert_eq!(d.next().as_ref(), Some(&Ok(m.clone())));
                 if let Message::Secure(s) = m {
-                    contract::check_wire::<Service>(&s.body);
+                    if let Ok(value) = Service::parse(&s.body) {
+                        assert_write(&value).unwrap();
+                    }
                     if let Ok(Service::Other { body, .. }) = Service::parse(&s.body) {
-                        contract::check_wire::<Variant>(&body);
+                        if let Ok(value) = Variant::parse(&body) {
+                            assert_write(&value).unwrap();
+                        }
                         check_reader::<Variant>(&body);
                     }
                 }
             }
 
             // The same bytes as values.
-            contract::check_wire::<Variant>(&b);
-            contract::check_wire::<DataValue>(&b);
-            contract::check_wire::<DiagnosticInfo>(&b);
+            if let Ok(value) = Variant::parse(&b) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = DataValue::parse(&b) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = DiagnosticInfo::parse(&b) {
+                assert_write(&value).unwrap();
+            }
             check_reader::<Variant>(&b);
             check_reader::<DataValue>(&b);
             check_reader::<DiagnosticInfo>(&b);
-            contract::check_wire::<ExpandedNodeId>(&b);
-            contract::check_wire::<NodeId>(&b);
-            contract::check_wire::<LocalizedText>(&b);
-            contract::check_wire::<ExtensionObject>(&b);
-            contract::check_wire::<ResponseHeader>(&b);
-            contract::check_wire::<Service>(&b);
+            if let Ok(value) = ExpandedNodeId::parse(&b) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = NodeId::parse(&b) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = LocalizedText::parse(&b) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = ExtensionObject::parse(&b) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = ResponseHeader::parse(&b) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = Service::parse(&b) {
+                assert_write(&value).unwrap();
+            }
             // Every value at every offset, one byte at a time through a reader.
             let mut r = Reader::new(&b);
             while r.remaining() > 0 {

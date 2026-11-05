@@ -1697,30 +1697,55 @@ pub mod harness {
         BsdMessage, BsdTimestamp, Entry, Frame, Frames, MAX_BUFFERED, MAX_MESSAGE_LEN, Message,
         Timestamp,
     };
-    use fictionet::stdlib::codec::{Decode, Wire};
-    use fictionet::stdlib::test_support::{contract, decode_all};
+    use fictionet::stdlib::codec::{Decode, Stream, Wire};
+    use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
 
     /// Checks message and timestamp round trips.
     pub fn check_round_trip(raw: &[u8]) {
-        contract::check_wire::<Message>(raw);
-        contract::check_wire::<BsdMessage>(raw);
-        contract::check_wire::<Entry>(raw);
-        contract::check_wire::<Timestamp>(raw);
-        contract::check_wire::<BsdTimestamp>(raw);
+        if let Ok(value) = Message::parse(raw) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = BsdMessage::parse(raw) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Entry::parse(raw) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Timestamp::parse(raw) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = BsdTimestamp::parse(raw) {
+            assert_write(&value).unwrap();
+        }
     }
 
     /// Checks frame and entry decoding, frame bounds, and round trips.
     pub fn check_stream(data: &[u8]) {
-        contract::check_decode_with_alloc_limit(Frames::new, data, 2 * MAX_BUFFERED);
-        contract::check_decode_with_alloc_limit(
-            || Frames::new().map(|frame| Entry::parse(&frame.message)),
-            data,
-            2 * MAX_BUFFERED,
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::new()),
+                chunks(data, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_BUFFERED)
+            ),
+            decode_all(Frames::new, data)
         );
-        contract::check_wire::<Frame>(data);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::new().map(|frame| Entry::parse(&frame.message))),
+                chunks(data, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_BUFFERED)
+            ),
+            decode_all(
+                || Frames::new().map(|frame| Entry::parse(&frame.message)),
+                data
+            )
+        );
+        if let Ok(value) = Frame::parse(data) {
+            assert_write(&value).unwrap();
+        }
         for frame in decode_all(Frames::new, data).0 {
             assert!(!frame.message.is_empty() && frame.message.len() <= MAX_MESSAGE_LEN);
-            contract::check_wire_value(&frame);
+            let _ = assert_write(&frame);
             check_round_trip(&frame.message);
         }
     }
@@ -1735,9 +1760,10 @@ mod tests {
     use super::harness::{check_round_trip, check_stream};
     use super::*;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream, pump};
-    use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::rounds;
-    use fictionet::stdlib::test_support::{decode_all, mutate};
+    use fictionet::stdlib::test_support::{
+        assert_write, chunks, decode_all, decode_chunks, mutate,
+    };
 
     /// The four examples of RFC 5424 section 6.5, with the BOM bytes in
     /// place of "BOM" and the third one's text shortened.
@@ -1754,7 +1780,9 @@ mod tests {
         let message = Message::parse(bytes).unwrap();
         assert_eq!(message.structured_data[0].params.len(), 2);
         assert_eq!(message.to_bytes().unwrap(), bytes);
-        contract::check_wire::<Message>(bytes);
+        if let Ok(value) = Message::parse(bytes) {
+            assert_write(&value).unwrap();
+        }
     }
 
     #[test]
@@ -2241,7 +2269,7 @@ mod tests {
         });
         for m in values {
             assert!(m.to_bytes().is_err());
-            contract::check_wire_value(&m);
+            let _ = assert_write(&m);
         }
         let t = Timestamp::parse(b"2003-02-28T12:00:00Z").unwrap();
         for bad in [
@@ -2269,7 +2297,7 @@ mod tests {
             },
         ] {
             assert!(bad.to_bytes().is_err());
-            contract::check_wire_value(&bad);
+            let _ = assert_write(&bad);
             assert!(
                 Message {
                     timestamp: Some(bad),
@@ -2295,7 +2323,7 @@ mod tests {
             BsdTimestamp { second: 70, ..t },
         ] {
             assert!(bad.to_bytes().is_err());
-            contract::check_wire_value(&bad);
+            let _ = assert_write(&bad);
         }
         for bad in [
             BsdMessage {
@@ -2328,7 +2356,7 @@ mod tests {
             },
         ] {
             assert!(bad.to_bytes().is_err());
-            contract::check_wire_value(&bad);
+            let _ = assert_write(&bad);
         }
     }
 
@@ -2382,7 +2410,7 @@ mod tests {
             },
         ] {
             assert!(frame.to_bytes().is_err());
-            contract::check_wire_value(&frame);
+            let _ = assert_write(&frame);
         }
     }
 
@@ -2465,7 +2493,14 @@ mod tests {
             // Framed, every prefix yields no frame and no error.
             for framing in [Framing::OctetCounting, Framing::NonTransparent] {
                 let framed = Frame::new(framing, raw.to_vec()).to_bytes().unwrap();
-                contract::check_decode_with_alloc_limit(Frames::new, &framed, 2 * MAX_BUFFERED);
+                assert_eq!(
+                    decode_chunks(
+                        &mut Stream::new(Frames::new()),
+                        chunks(&framed, &[1, 7, 64]),
+                        |s| assert!(s.allocated() <= 2 * MAX_BUFFERED)
+                    ),
+                    decode_all(Frames::new, &framed)
+                );
                 for n in 0..framed.len() {
                     assert_eq!(Frames::new().decode(&framed[..n], false), Ok(Step::Need));
                 }
@@ -2517,7 +2552,7 @@ mod tests {
             let mut m = Message::new(Priority::new(Facility::User, Severity::Notice));
             m.structured_data.push(SdElement::new(id));
             assert_eq!(m.to_bytes().is_ok(), id == "x@32473", "{id}");
-            contract::check_wire_value(&m);
+            let _ = assert_write(&m);
         }
         let mut m = Message::new(Priority::new(Facility::User, Severity::Notice));
         m.structured_data.push(SdElement::new("x@32473"));
@@ -2562,7 +2597,14 @@ mod tests {
         let crlf = [long.as_slice(), b"\r\n"].concat();
         for framed in [counted, nl, crlf] {
             let stream = [framed.as_slice(), b"<13>next\n"].concat();
-            contract::check_decode_with_alloc_limit(Frames::new, &stream, 2 * MAX_BUFFERED);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Frames::new()),
+                    chunks(&stream, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_BUFFERED)
+                ),
+                decode_all(Frames::new, &stream)
+            );
             let (got, error) = decode_all(Frames::new, &stream);
             assert_eq!(error, None);
             assert_eq!(got.len(), 2);
@@ -2631,7 +2673,14 @@ mod tests {
         assert_eq!(decode_all(Frames::new, b""), (vec![], None));
         for len in [MAX_MESSAGE_LEN + 1, MAX_MESSAGE_LEN + 2] {
             let bytes = vec![b'<'; len];
-            contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_BUFFERED);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Frames::new()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_BUFFERED)
+                ),
+                decode_all(Frames::new, &bytes)
+            );
             let (frames, error) = decode_all(Frames::new, &bytes);
             assert_eq!(error, None);
             assert_eq!(frames.len(), 1);
@@ -2712,7 +2761,14 @@ mod tests {
     #[test]
     fn stream_holds_a_bounded_number_of_bytes() {
         let big = vec![b'<'; rounds(4 << 20)];
-        contract::check_decode_with_alloc_limit(Frames::new, &big, 2 * MAX_BUFFERED);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::new()),
+                chunks(&big, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_BUFFERED)
+            ),
+            decode_all(Frames::new, &big)
+        );
         let (frames, error) = decode_all(Frames::new, &big);
         assert_eq!(error, None);
         assert_eq!(frames.len(), 1);
@@ -2793,7 +2849,7 @@ mod tests {
         );
         m.tag = Some("app".into());
         assert!(m.to_bytes().is_err());
-        contract::check_wire_value(&m);
+        let _ = assert_write(&m);
     }
 
     #[test]
@@ -2813,7 +2869,7 @@ mod tests {
             "1 - - - - - -",
         ));
         assert!(e.to_bytes().is_err());
-        contract::check_wire_value(&e);
+        let _ = assert_write(&e);
     }
 
     #[test]
@@ -2821,9 +2877,9 @@ mod tests {
         let msg = b"<13>1 - - - - - - first\nsecond".to_vec();
         let f = Frame::new(Framing::NonTransparent, msg.clone());
         assert!(f.to_bytes().is_err());
-        contract::check_wire_value(&f);
+        let _ = assert_write(&f);
         let f = Frame::new(Framing::OctetCounting, msg);
-        contract::check_wire_value(&f);
+        let _ = assert_write(&f);
     }
 
     #[test]
@@ -2989,7 +3045,7 @@ mod tests {
             if round % 2 == 0 {
                 assert!(m.to_bytes().is_ok());
             }
-            contract::check_wire_value(&m);
+            let _ = assert_write(&m);
             if let Ok(bytes) = m.to_bytes() {
                 let framing = if rng.coin() {
                     Framing::OctetCounting
@@ -2997,7 +3053,7 @@ mod tests {
                     Framing::NonTransparent
                 };
                 let frame = Frame::new(framing, bytes);
-                contract::check_wire_value(&frame);
+                let _ = assert_write(&frame);
                 if let Ok(bytes) = frame.to_bytes() {
                     check_stream(&bytes);
                 }
@@ -3018,7 +3074,7 @@ mod tests {
             }
             b.tag = rng.coin().then(|| rng.text(8));
             b.pid = rng.coin().then(|| rng.text(4));
-            contract::check_wire_value(&b);
+            let _ = assert_write(&b);
         }
     }
 }

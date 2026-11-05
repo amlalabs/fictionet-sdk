@@ -989,8 +989,11 @@ impl Wire for NgMessage {
 mod tests {
     use super::*;
     use fictionet::assert_cases;
-    use fictionet::stdlib::codec::{Collect, Lcg, Stream};
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::codec::{Collect, CollectError, Fail, Stream};
+    use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
+
+    use fictionet::stdlib::codec::Lcg;
+    use fictionet::stdlib::test_support::decode_all;
     use fictionet::stdlib::test_support::mutate;
     use fictionet::stdlib::test_support::rounds;
 
@@ -1004,7 +1007,36 @@ mod tests {
     }
 
     fn collect(b: &[u8]) -> Result<Message, Error> {
-        contract::check_collect::<Message>(b, MAX_MESSAGE)
+        let parsed = Message::parse(b);
+        if let Ok(value) = &parsed {
+            assert_write(value).unwrap();
+        }
+        let decoded = decode_chunks(
+            &mut Stream::new(Collect::<Message>::new(MAX_MESSAGE)),
+            chunks(b, &[1, 7, 64]),
+            |s| assert!(s.allocated() <= 2 * (MAX_MESSAGE + 1)),
+        );
+        if b.len() <= MAX_MESSAGE {
+            assert_eq!(
+                decoded,
+                (
+                    parsed.clone().ok().into_iter().collect(),
+                    parsed
+                        .clone()
+                        .err()
+                        .map(|e| Fail::Protocol(CollectError::Parse(e))),
+                )
+            );
+        } else {
+            assert_eq!(
+                decoded,
+                (
+                    vec![],
+                    Some(Fail::Protocol(CollectError::TooLong { limit: MAX_MESSAGE }))
+                )
+            );
+        }
+        parsed
     }
 
     fn ip4(a: u8, b: u8, c: u8, d: u8) -> Ipv4Addr {
@@ -1060,7 +1092,38 @@ mod tests {
     }
 
     fn ng_collect(b: &[u8]) -> Result<NgMessage, Error> {
-        contract::check_collect::<NgMessage>(b, MAX_NG_MESSAGE)
+        let parsed = NgMessage::parse(b);
+        if let Ok(value) = &parsed {
+            assert_write(value).unwrap();
+        }
+        let decoded = decode_chunks(
+            &mut Stream::new(Collect::<NgMessage>::new(MAX_NG_MESSAGE)),
+            chunks(b, &[1, 7, 64]),
+            |s| assert!(s.allocated() <= 2 * (MAX_NG_MESSAGE + 1)),
+        );
+        if b.len() <= MAX_NG_MESSAGE {
+            assert_eq!(
+                decoded,
+                (
+                    parsed.clone().ok().into_iter().collect(),
+                    parsed
+                        .clone()
+                        .err()
+                        .map(|e| Fail::Protocol(CollectError::Parse(e))),
+                )
+            );
+        } else {
+            assert_eq!(
+                decoded,
+                (
+                    vec![],
+                    Some(Fail::Protocol(CollectError::TooLong {
+                        limit: MAX_NG_MESSAGE
+                    }))
+                )
+            );
+        }
+        parsed
     }
 
     fn check(b: &[u8]) -> Result<Message, Error> {
@@ -1691,10 +1754,13 @@ mod tests {
         assert_eq!(collect(&[7]), Err(Error::Command(7)));
         assert_eq!(ng_collect(&[1, 2]), Err(Error::Version(2)));
         let b = [2, 2, 0, 0, 0, 2].repeat(rounds(10_000));
-        contract::check_decode_with_alloc_limit(
-            || Collect::<Message>::new(MAX_MESSAGE),
-            &b,
-            2 * (MAX_MESSAGE + 1),
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Collect::<Message>::new(MAX_MESSAGE)),
+                chunks(&b, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * (MAX_MESSAGE + 1))
+            ),
+            decode_all(|| Collect::<Message>::new(MAX_MESSAGE), &b)
         );
     }
 

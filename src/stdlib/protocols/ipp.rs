@@ -1814,7 +1814,7 @@ pub mod harness {
         Value, tag,
     };
     use fictionet::stdlib::codec::{Decode, Fail, Step, Stream, Wire};
-    use fictionet::stdlib::test_support::{contract, decode_all};
+    use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
 
     /// Semantic branches reached by one input.
     #[derive(Debug, Default, PartialEq, Eq)]
@@ -1831,14 +1831,33 @@ pub mod harness {
     /// The fuzz target is exactly this call.
     pub fn check(data: &[u8]) -> Reach {
         let mut reach = Reach::default();
-        contract::check_decode_with_alloc_limit(Head::new, data, 2 * MAX_HEAD);
-        let (_, limited_failure) =
-            contract::check_decode_with_alloc_limit(|| Head::with_limit(64), data, 128);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Head::new()),
+                chunks(data, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_HEAD)
+            ),
+            decode_all(Head::new, data)
+        );
+        let limited = decode_all(|| Head::with_limit(64), data);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Head::with_limit(64)),
+                chunks(data, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 128)
+            ),
+            limited
+        );
+        let (_, limited_failure) = limited;
         if limited_failure == Some(Fail::Protocol(FrameError::TooLong)) {
             reach.head_too_long += 1;
         }
-        contract::check_wire::<Header>(data);
-        contract::check_wire::<Message>(data);
+        if let Ok(value) = Header::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Message::parse(data) {
+            assert_write(&value).unwrap();
+        }
         let (items, failure) = decode_all(Head::new, data);
         match Message::parse(data) {
             Ok(message) => {
@@ -1896,7 +1915,9 @@ pub mod harness {
                 Some(Ok(Ok(header))) => {
                     let b = header.to_bytes().unwrap();
                     assert_eq!(Header::parse(&b), Ok(header.clone()));
-                    contract::check_wire::<Header>(&b);
+                    if let Ok(value) = Header::parse(&b) {
+                        assert_write(&value).unwrap();
+                    }
                     header.request_id
                 }
                 Some(Ok(Err(Error::BadRequest { request_id, .. }))) => request_id,
@@ -1915,9 +1936,9 @@ pub mod harness {
                 Value::OctetString(data.get(..MAX_FIELD + 1).unwrap_or(data).to_vec()),
             ),
         );
-        contract::check_wire_value(&message);
+        let _ = assert_write(&message);
         let built = Header::from(message);
-        contract::check_wire_value(&built);
+        let _ = assert_write(&built);
         let mut body = Header {
             version: (1, 1),
             code: 2,
@@ -1927,7 +1948,14 @@ pub mod harness {
         .to_bytes()
         .unwrap();
         body.extend_from_slice(data.get(..4096).unwrap_or(data));
-        contract::check_decode_with_alloc_limit(|| Head::with_limit(64), &body, 128);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Head::with_limit(64)),
+                chunks(&body, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 128)
+            ),
+            decode_all(|| Head::with_limit(64), &body)
+        );
         reach
     }
 }
@@ -1938,9 +1966,10 @@ mod tests {
     use super::*;
     use fictionet::assert_cases;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream};
-    use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::rounds;
-    use fictionet::stdlib::test_support::{decode_all, mutate};
+    use fictionet::stdlib::test_support::{
+        assert_write, chunks, decode_all, decode_chunks, mutate,
+    };
 
     fn value_unknown(tag: u8, data: Vec<u8>) -> Value {
         Value::Unknown { tag, data }
@@ -2246,7 +2275,8 @@ mod tests {
 
     #[test]
     fn strict_head_covers_all_values_and_bounds_collection_depth() {
-        use fictionet::stdlib::test_support::contract;
+        use fictionet::stdlib::codec::Stream;
+        use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
         let mut message = Message::request(operation::PRINT_JOB, 3);
         message.add(tag::JOB_ATTRIBUTES, attribute("all".into(), every_value()));
         message.add(
@@ -2257,15 +2287,24 @@ mod tests {
             ),
         );
         let head = Header::from(message);
-        contract::check_wire_value(&head);
+        let _ = assert_write(&head);
         let bytes = Wire::to_bytes(&head).unwrap();
-        contract::check_wire::<Header>(&bytes);
-        contract::check_decode_with_alloc_limit(Head::new, &bytes, 2 * MAX_HEAD);
+        if let Ok(value) = Header::parse(&bytes) {
+            assert_write(&value).unwrap();
+        }
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Head::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_HEAD)
+            ),
+            decode_all(Head::new, &bytes)
+        );
         for (depth, accepted) in [(MAX_DEPTH, true), (MAX_DEPTH + 1, false)] {
             let mut message = Message::request(operation::PRINT_JOB, 3);
             message.add(tag::JOB_ATTRIBUTES, Attribute::new("nested", nested(depth)));
             let head = Header::from(message);
-            contract::check_wire_value(&head);
+            let _ = assert_write(&head);
             let mut out = b"prefix".to_vec();
             assert_eq!(head.write(&mut out).is_ok(), accepted);
             if !accepted {
@@ -2428,7 +2467,14 @@ mod tests {
             decode_all(Head::new, &long).1,
             Some(Fail::Protocol(FrameError::TooLong))
         );
-        contract::check_decode_with_alloc_limit(Head::new, &long, 2 * MAX_HEAD);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Head::new()),
+                chunks(&long, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_HEAD)
+            ),
+            decode_all(Head::new, &long)
+        );
         // Every message shows its error.
         for e in [
             Error::TooLong,
@@ -2657,14 +2703,28 @@ mod tests {
                 assert_eq!(parsed.groups, message.groups);
                 assert_eq!(parsed.data, bytes[used..n]);
             }
-            contract::check_decode_with_alloc_limit(Head::new, &bytes, 2 * MAX_HEAD);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Head::new()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_HEAD)
+                ),
+                decode_all(Head::new, &bytes)
+            );
         }
     }
 
     #[test]
     fn head_preserves_document_bytes() {
         let bytes = print_job();
-        contract::check_decode_with_alloc_limit(Head::new, &bytes, 2 * MAX_HEAD);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Head::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_HEAD)
+            ),
+            decode_all(Head::new, &bytes)
+        );
         let mut stream = Stream::new(Head::new());
         assert_eq!(stream.push(&bytes), bytes.len());
         let header = stream.next().unwrap().unwrap().unwrap();
@@ -2700,7 +2760,14 @@ mod tests {
             }
             let bytes = message.to_bytes().unwrap();
             assert!(bytes.len() < MAX_HEAD);
-            contract::check_decode_with_alloc_limit(Head::new, &bytes, 2 * MAX_HEAD);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Head::new()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_HEAD)
+                ),
+                decode_all(Head::new, &bytes)
+            );
             assert_eq!(
                 decode_all(Head::new, &bytes),
                 (vec![Ok(Header::from(message))], None)
@@ -2888,7 +2955,14 @@ mod tests {
             Some(Err(Fail::Protocol(FrameError::TooLong)))
         );
         assert_eq!(stream.next(), None);
-        contract::check_decode_with_alloc_limit(Head::new, &long, 2 * MAX_HEAD);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Head::new()),
+                chunks(&long, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_HEAD)
+            ),
+            decode_all(Head::new, &long)
+        );
         let mut partial = vec![1, 1, 0, 2, 0, 0, 0, 1, 1];
         for _ in 0..30 {
             partial.extend(rec(0x30, "", &[0; 30000]));
@@ -3175,8 +3249,8 @@ mod tests {
     }
 
     fn assert_unwritable<M: Wire<WriteError = Error> + PartialEq + std::fmt::Debug>(value: &M) {
-        contract::check_wire_value(value);
-        assert_eq!(contract::check_refused(value), Error::Unwritable);
+        let _ = assert_write(value);
+        assert_eq!(assert_write(value).unwrap_err(), Error::Unwritable);
     }
 
     #[test]

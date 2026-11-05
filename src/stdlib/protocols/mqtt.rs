@@ -1112,11 +1112,11 @@ fictionet::codec_from!(Error, Trailing, |_| Error::TrailingBytes);
 mod tests {
     use super::*;
     use fictionet::assert_cases;
-    use fictionet::stdlib::codec::{Decode, Step};
-    use fictionet::stdlib::codec::{Fail, Lcg, Stream, pump};
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::codec::{Decode, Fail, Lcg, Step, Stream, pump};
     use fictionet::stdlib::test_support::rounds;
-    use fictionet::stdlib::test_support::{decode_all, mutate};
+    use fictionet::stdlib::test_support::{
+        assert_write, chunks, decode_all, decode_chunks, mutate,
+    };
 
     fn connect_bytes() -> Vec<u8> {
         // The variable header from the standard's example in section
@@ -1258,10 +1258,13 @@ mod tests {
     #[test]
     fn every_prefix_is_incomplete() {
         for (packet, bytes) in samples() {
-            contract::check_decode_with_alloc_limit(
-                Frames::<Packet>::new,
-                &bytes,
-                2 * DEFAULT_MAX_PACKET,
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Frames::<Packet>::new()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * DEFAULT_MAX_PACKET)
+                ),
+                decode_all(Frames::<Packet>::new, &bytes)
             );
             for n in 0..bytes.len() {
                 assert_eq!(
@@ -1705,7 +1708,14 @@ mod tests {
         let bytes = [0xc0, 0].repeat(1000);
         let make = || Frames::<Packet>::with_limit(2);
         assert_eq!(make().capacity(), 5);
-        contract::check_decode_with_alloc_limit(make, &bytes, 10);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(make()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 10)
+            ),
+            decode_all(make, &bytes)
+        );
         assert_eq!(
             decode_all(make, &bytes),
             (vec![Packet::PingReq; 1000], None)
@@ -1748,10 +1758,13 @@ mod tests {
         let samples = samples();
         let bytes: Vec<_> = samples.iter().flat_map(|(_, b)| b.clone()).collect();
         let want: Vec<_> = samples.into_iter().map(|(p, _)| p).collect();
-        contract::check_decode_with_alloc_limit(
-            Frames::<Packet>::new,
-            &bytes,
-            2 * DEFAULT_MAX_PACKET,
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Packet>::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * DEFAULT_MAX_PACKET)
+            ),
+            decode_all(Frames::<Packet>::new, &bytes)
         );
         assert_eq!(decode_all(Frames::<Packet>::new, &bytes), (want, None));
     }
@@ -1885,16 +1898,29 @@ mod tests {
     }
 
     fn check(data: &[u8], small: usize) {
-        contract::check_wire::<Packet>(data);
-        contract::check_decode_with_alloc_limit(
-            Frames::<Packet>::new,
-            data,
-            2 * DEFAULT_MAX_PACKET,
+        if let Ok(value) = Packet::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Packet>::new()),
+                chunks(data, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * DEFAULT_MAX_PACKET)
+            ),
+            decode_all(Frames::<Packet>::new, data)
         );
         let make = || Frames::<Packet>::with_limit(small);
-        contract::check_decode_with_alloc_limit(make, data, 2 * make().capacity());
+        let alloc = 2 * make().capacity();
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(make()),
+                chunks(data, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= alloc)
+            ),
+            decode_all(make, data)
+        );
         for packet in decode_all(Frames::<Packet>::new, data).0 {
-            contract::check_wire_value(&packet);
+            let _ = assert_write(&packet);
             assert_eq!(packet.encoded_len(), Ok(packet.to_bytes().unwrap().len()));
         }
     }

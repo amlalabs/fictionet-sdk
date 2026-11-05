@@ -2516,9 +2516,10 @@ mod tests {
     use super::*;
 
     use codec::{Lcg, Stream};
-    use fictionet::stdlib::test_support::contract;
 
-    use fictionet::stdlib::test_support::{check_work, decode_all, mutate};
+    use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
+
+    use fictionet::stdlib::test_support::{check_work, mutate};
 
     fn commands(bytes: &[u8]) -> Vec<Result<Command, Error>> {
         decode_all(Commands::new, bytes).0
@@ -2940,7 +2941,14 @@ mod tests {
     fn every_truncated_prefix_waits() {
         for command in sample_commands() {
             let bytes = command.to_bytes().unwrap();
-            contract::check_decode_with_alloc_limit(Commands::new, &bytes, 2 * MAX_LINE);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Commands::new()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_LINE)
+                ),
+                decode_all(Commands::new, &bytes)
+            );
             for end in 1..bytes.len() {
                 assert!(Command::parse(&bytes[..end]).is_err());
                 assert_eq!(
@@ -2951,7 +2959,14 @@ mod tests {
         }
         for response in sample_responses() {
             let bytes = response.to_bytes().unwrap();
-            contract::check_decode_with_alloc_limit(Responses::new, &bytes, 2 * MAX_LINE);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Responses::new()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_LINE)
+                ),
+                decode_all(Responses::new, &bytes)
+            );
             for end in 1..bytes.len() {
                 assert!(Response::parse(&bytes[..end]).is_err());
                 assert_eq!(
@@ -3072,7 +3087,14 @@ mod tests {
         );
         let bad = b"ms k 4 v \x7f\r\nquit\r\nmn\r\n";
         assert_eq!(commands(bad), [Err(Error::Format), Ok(Command::MetaNoop)]);
-        contract::check_decode_with_alloc_limit(Commands::new, bad, 2 * MAX_LINE);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Commands::new()),
+                chunks(bad, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_LINE)
+            ),
+            decode_all(Commands::new, bad)
+        );
         // Too many flags is refused before the length is read, so the
         // block is read as a command.
         let many = format!("ms k 4{}\r\nquit\r\n", " v".repeat(MAX_META_FLAGS + 1));
@@ -3145,8 +3167,22 @@ mod tests {
             commands(&stream),
             [Err(Error::TooLarge(n)), Ok(Command::Version)]
         );
-        contract::check_decode_with_alloc_limit(Commands::new, &stream, 2 * MAX_LINE);
-        contract::check_decode_with_held_limit(Commands::new, &stream, MAX_TEXT_HELD);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Commands::new()),
+                chunks(&stream, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_LINE)
+            ),
+            decode_all(Commands::new, &stream)
+        );
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Commands::new()),
+                chunks(&stream, &[1, 7, 64]),
+                |s| assert!(s.held() <= MAX_TEXT_HELD)
+            ),
+            decode_all(Commands::new, &stream)
+        );
         let mut big = format!("VALUE k 0 {n}\r\n").into_bytes();
         big.extend(vec![0; n + 2]);
         big.extend_from_slice(b"END\r\n");
@@ -3453,10 +3489,13 @@ mod tests {
             packets.iter().map(|p| p.magic).collect::<Vec<_>>(),
             [Magic::Request, Magic::Response]
         );
-        contract::check_decode_with_alloc_limit(
-            Frames::<Packet>::new,
-            &bytes,
-            2 * MAX_BINARY_BUFFERED,
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Packet>::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_BINARY_BUFFERED)
+            ),
+            decode_all(Frames::<Packet>::new, &bytes)
         );
         let mut stream = Stream::new(Frames::<Packet>::new());
         assert_eq!(stream.push(&[0]), 1);
@@ -3574,7 +3613,14 @@ mod tests {
         // work within one growing line.
         let line = [vec![b' '; MAX_LINE - 3], b"\r\n".to_vec()].concat();
         for n in [5, 4 * (5)] {
-            contract::check_decode_with_alloc_limit(Commands::new, &line.repeat(n), 2 * MAX_LINE);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Commands::new()),
+                    chunks(&line.repeat(n), &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_LINE)
+                ),
+                decode_all(Commands::new, &line.repeat(n))
+            );
         }
     }
 
@@ -3587,7 +3633,7 @@ mod tests {
             // One valid line grows; each byte needs at most one terminator scan.
             check_work(Commands::new, &bytes, Commands::examined, 0, 1);
             assert_eq!(
-                contract::check_decode(Commands::new, &bytes),
+                decode_all(Commands::new, &bytes),
                 (vec![Ok(Command::Version)], None)
             );
         }
@@ -3604,7 +3650,7 @@ mod tests {
             // Both line count and key count stay fixed as the line grows.
             check_work(Commands::new, &bytes, Commands::examined, 0, 2);
             assert_eq!(
-                contract::check_decode(Commands::new, &bytes),
+                decode_all(Commands::new, &bytes),
                 (
                     vec![Ok(Command::Get {
                         keys: vec![b"k".to_vec()],
@@ -3624,7 +3670,7 @@ mod tests {
             // One valid response grows; each byte is searched at most once.
             check_work(Responses::new, &bytes, Responses::examined, 0, 1);
             assert_eq!(
-                contract::check_decode(Responses::new, &bytes),
+                decode_all(Responses::new, &bytes),
                 (vec![Ok(response)], None)
             );
         }
@@ -3658,21 +3704,37 @@ mod tests {
         let mut rng = Lcg::new(1);
         for _ in 0..4000 {
             let bytes = fuzz_buffer(&mut rng, &pieces);
-            contract::check_decode_with_alloc_limit(Commands::new, &bytes, 2 * MAX_LINE);
-            contract::check_decode_with_alloc_limit(Responses::new, &bytes, 2 * MAX_LINE);
-            contract::check_wire::<Command>(&bytes);
-            contract::check_wire::<Response>(&bytes);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Commands::new()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_LINE)
+                ),
+                decode_all(Commands::new, &bytes)
+            );
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Responses::new()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_LINE)
+                ),
+                decode_all(Responses::new, &bytes)
+            );
+            if let Ok(value) = Command::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = Response::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
             for command in commands(&bytes).iter().flatten() {
-                contract::check_wire_value(command);
-                let bytes = command.to_bytes().unwrap();
+                let bytes = assert_write(command).unwrap();
                 assert_eq!(
                     decode_all(Commands::new, &bytes),
                     (vec![Ok(command.clone())], None)
                 );
             }
             for response in responses(&bytes).iter().flatten() {
-                contract::check_wire_value(response);
-                let bytes = response.to_bytes().unwrap();
+                let bytes = assert_write(response).unwrap();
                 assert_eq!(
                     decode_all(Responses::new, &bytes),
                     (vec![Ok(response.clone())], None)
@@ -3701,19 +3763,34 @@ mod tests {
         let mut rng = Lcg::new(2);
         for _ in 0..4000 {
             let bytes = fuzz_buffer(&mut rng, &pieces);
-            contract::check_decode_with_alloc_limit(
-                Frames::<Packet>::new,
-                &bytes,
-                2 * MAX_BINARY_BUFFERED,
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Frames::<Packet>::new()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_BINARY_BUFFERED)
+                ),
+                decode_all(Frames::<Packet>::new, &bytes)
             );
-            contract::check_wire::<Packet>(&bytes);
-            contract::check_wire::<UdpFrame>(&bytes);
-            contract::check_wire::<StoreExtras>(&bytes);
-            contract::check_wire::<CounterExtras>(&bytes);
+            if let Ok(value) = Packet::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = UdpFrame::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = StoreExtras::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = CounterExtras::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
             for packet in decode_all(Frames::<Packet>::new, &bytes).0 {
-                contract::check_wire_value(&packet);
-                contract::check_wire::<StoreExtras>(&packet.extras);
-                contract::check_wire::<CounterExtras>(&packet.extras);
+                let _ = assert_write(&packet);
+                if let Ok(value) = StoreExtras::parse(&packet.extras) {
+                    assert_write(&value).unwrap();
+                }
+                if let Ok(value) = CounterExtras::parse(&packet.extras) {
+                    assert_write(&value).unwrap();
+                }
             }
         }
     }
@@ -3721,17 +3798,34 @@ mod tests {
     #[test]
     fn decoders_hold_a_bounded_number_of_bytes() {
         let flood = vec![b'a'; 4 * MAX_LINE];
-        contract::check_decode_with_alloc_limit(Commands::new, &flood, 2 * MAX_LINE);
-        contract::check_decode_with_alloc_limit(Responses::new, &flood, 2 * MAX_LINE);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Commands::new()),
+                chunks(&flood, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_LINE)
+            ),
+            decode_all(Commands::new, &flood)
+        );
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Responses::new()),
+                chunks(&flood, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_LINE)
+            ),
+            decode_all(Responses::new, &flood)
+        );
         let mut stream = Stream::new(Commands::new());
         let bytes = b"get k\r\n".repeat(MAX_LINE);
         assert_eq!(stream.push(&bytes), MAX_LINE);
         assert_eq!(stream.push(&bytes), 0);
         assert_eq!(commands(&bytes).len(), MAX_LINE);
-        contract::check_decode_with_alloc_limit(
-            Frames::<Packet>::new,
-            &[0; 4096],
-            2 * MAX_BINARY_BUFFERED,
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Packet>::new()),
+                chunks(&[0; 4096], &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_BINARY_BUFFERED)
+            ),
+            decode_all(Frames::<Packet>::new, &[0; 4096])
         );
         let mut packet = Packet::parse(&GET_REQUEST).unwrap();
         packet.value = vec![0; MAX_BODY - packet.key.len()];
@@ -3740,10 +3834,13 @@ mod tests {
             decode_all(Frames::<Packet>::new, &bytes),
             (vec![packet], None)
         );
-        contract::check_decode_with_alloc_limit(
-            Frames::<Packet>::new,
-            &bytes,
-            2 * MAX_BINARY_BUFFERED,
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Packet>::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_BINARY_BUFFERED)
+            ),
+            decode_all(Frames::<Packet>::new, &bytes)
         );
     }
 
@@ -4037,10 +4134,13 @@ mod tests {
             (b"VALUE \x01 0 3\r\nEND\r\nEND\r\n") => [Err(Error::Key), Ok(Response::End)],
             (b"VA 3 \x01\r\nEND\r\nEND\r\n") => [Err(Error::Format), Ok(Response::End)],
         }
-        contract::check_decode_with_alloc_limit(
-            Responses::new,
-            b"VALUE k 0 8 nope\r\nSTORED\r\n\r\nEND\r\n",
-            2 * MAX_LINE,
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Responses::new()),
+                chunks(b"VALUE k 0 8 nope\r\nSTORED\r\n\r\nEND\r\n", &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_LINE)
+            ),
+            decode_all(Responses::new, b"VALUE k 0 8 nope\r\nSTORED\r\n\r\nEND\r\n")
         );
     }
 
@@ -4080,7 +4180,14 @@ mod tests {
         stream.extend_from_slice(&gets.to_bytes().unwrap()[4..]);
         stream.extend_from_slice(b"mn\r\n");
         assert_eq!(commands(&stream), [Ok(gets.clone()), Ok(Command::MetaNoop)]);
-        contract::check_decode_with_alloc_limit(Commands::new, &stream, 2 * MAX_LINE);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Commands::new()),
+                chunks(&stream, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_LINE)
+            ),
+            decode_all(Commands::new, &stream)
+        );
         // Other long lines still break the stream, as does a get after more
         // than 100 spaces, and one past MAX_GET_LINE.
         let mut far = format!("{}get", " ".repeat(101)).into_bytes();

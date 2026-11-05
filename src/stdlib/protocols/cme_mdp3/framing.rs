@@ -175,8 +175,8 @@ impl fictionet::stdlib::codec::Decode for Messages {
 mod framing_tests {
     use super::super::{__wire, AdminHeartbeat12};
     use super::*;
-    use fictionet::stdlib::codec::Wire;
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::codec::{Stream, Wire};
+    use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
 
     fn sample(seed: u64) -> Option<Message> {
         <Message as __wire::Codec>::sample(&mut __wire::Sampler::seed(seed)).ok()
@@ -264,13 +264,12 @@ mod framing_tests {
         }
         assert!(messages.len() > 32);
         let expected: Vec<_> = messages.iter().cloned().map(Ok).collect();
-        contract::check_decoded(
-            || Messages,
-            &stream,
-            &expected,
-            usize::MAX,
-            4 * usize::from(u16::MAX),
-        );
+        let mut decoder = Stream::new(Messages);
+        let decoded = decode_chunks(&mut decoder, chunks(&stream, &[1, 7, 64]), |s| {
+            assert!(s.allocated() <= 4 * usize::from(u16::MAX))
+        });
+        assert_eq!(decoded, (expected, None));
+        assert_eq!(decoder.offset(), stream.len() as u64);
         let packet = Packet {
             header: PacketHeader {
                 sequence: 1,
@@ -278,15 +277,23 @@ mod framing_tests {
             },
             messages,
         };
-        contract::check_wire_value(&packet);
-        let bytes = packet.to_bytes().unwrap();
+        let bytes = assert_write(&packet).unwrap();
         let mut rng = fictionet::stdlib::codec::Lcg::new(9);
         for _ in 0..256 {
             let mut mutated = bytes.clone();
             let at = rng.index(mutated.len());
             mutated[at] = rng.next() as u8;
-            contract::check_wire::<Packet>(&mutated);
-            contract::check_decode(|| Messages, &mutated[PACKET_HEADER..]);
+            if let Ok(value) = Packet::parse(&mutated) {
+                assert_write(&value).unwrap();
+            }
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Messages),
+                    chunks(&mutated[PACKET_HEADER..], &[1, 7, 64]),
+                    |_| {}
+                ),
+                decode_all(|| Messages, &mutated[PACKET_HEADER..])
+            );
         }
         let mut too_many = packet.clone();
         too_many.messages =

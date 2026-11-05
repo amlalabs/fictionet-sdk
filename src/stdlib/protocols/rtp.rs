@@ -471,10 +471,11 @@ fictionet::codec_from!(Error, Truncated, |_| Error::Truncated);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::Lcg;
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::codec::{Lcg, Stream};
     use fictionet::stdlib::test_support::rounds;
-    use fictionet::stdlib::test_support::{decode_all, mutate};
+    use fictionet::stdlib::test_support::{
+        assert_write, chunks, decode_all, decode_chunks, mutate,
+    };
     fn rtp(payload: &[u8]) -> Packet {
         Packet {
             marker: false,
@@ -790,7 +791,7 @@ mod tests {
     fn rtp_writer_refuses_clipping() {
         let mut p = rtp(&[]);
         p.payload_type = 128;
-        contract::check_wire_value(&p);
+        let _ = assert_write(&p);
         assert_eq!(p.to_bytes(), Err(Error::Unwritable));
         p.payload_type = 127;
         p.csrcs = vec![0; 16];
@@ -810,7 +811,7 @@ mod tests {
             data: vec![0; 16],
         }]));
         assert!(p.to_bytes().is_ok());
-        contract::check_wire_value(&p);
+        let _ = assert_write(&p);
         for (name, app_bits, id, data) in [
             ("large app bits", 16, 1, vec![]),
             ("zero id", 0, 0, vec![]),
@@ -852,20 +853,26 @@ mod tests {
                 rtcp::Frame(vec![]).to_bytes().unwrap(),
             ]
             .concat();
-            contract::check_decode_with_alloc_limit(
-                Frames::<rtcp::Frame>::new,
-                &bytes,
-                2 * (MAX_PACKET + 2),
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Frames::<rtcp::Frame>::new()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * (MAX_PACKET + 2))
+                ),
+                decode_all(Frames::<rtcp::Frame>::new, &bytes)
             );
             let (items, error) = decode_all(Frames::<rtcp::Frame>::new, &bytes);
             assert_eq!(error, None);
             assert_eq!(items, [rtcp::Frame(vec![]), a.clone(), rtcp::Frame(vec![])]);
             assert_eq!(Demux::parse(&items[1].0), Ok(Demux::Rtp(rtp(&[1]))));
             let large = rtcp::Frame(vec![1; MAX_PACKET]).to_bytes().unwrap();
-            contract::check_decode_with_alloc_limit(
-                Frames::<rtcp::Frame>::new,
-                &large,
-                2 * (MAX_PACKET + 2),
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Frames::<rtcp::Frame>::new()),
+                    chunks(&large, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * (MAX_PACKET + 2))
+                ),
+                decode_all(Frames::<rtcp::Frame>::new, &large)
             );
             assert_eq!(
                 rtcp::Frame(vec![1; MAX_PACKET + 1]).to_bytes(),
@@ -984,7 +991,9 @@ mod tests {
         }
         for seed in &seeds {
             assert!(Demux::parse(seed).is_ok());
-            contract::check_wire::<Demux>(seed);
+            if let Ok(value) = Demux::parse(seed) {
+                assert_write(&value).unwrap();
+            }
         }
         let stream: Vec<u8> = seeds
             .iter()
@@ -1004,12 +1013,19 @@ mod tests {
                 {
                     *first = (*first & 0x3f) | (VERSION << 6);
                 }
-                contract::check_wire::<Packet>(&bytes);
-                contract::check_wire::<Demux>(&bytes);
-                contract::check_decode_with_alloc_limit(
-                    Frames::<rtcp::Frame>::new,
-                    &bytes,
-                    2 * (MAX_PACKET + 2),
+                if let Ok(value) = Packet::parse(&bytes) {
+                    assert_write(&value).unwrap();
+                }
+                if let Ok(value) = Demux::parse(&bytes) {
+                    assert_write(&value).unwrap();
+                }
+                assert_eq!(
+                    decode_chunks(
+                        &mut Stream::new(Frames::<rtcp::Frame>::new()),
+                        chunks(&bytes, &[1, 7, 64]),
+                        |s| assert!(s.allocated() <= 2 * (MAX_PACKET + 2))
+                    ),
+                    decode_all(Frames::<rtcp::Frame>::new, &bytes)
                 );
                 mutate(&mut rng, &mut bytes);
             }
@@ -1049,8 +1065,8 @@ mod tests {
                     data: rng.bytes(24),
                 }),
             };
-            contract::check_wire_value(&p);
-            contract::check_wire_value(&Demux::Rtp(p));
+            let _ = assert_write(&p);
+            let _ = assert_write(&Demux::Rtp(p));
         }
     }
 }

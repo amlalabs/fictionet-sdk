@@ -342,8 +342,10 @@ pub fn wakes(payload: &[u8], mac: Mac, password: Option<&Password>) -> bool {
 mod tests {
     use super::*;
     use codec::{Lcg, Stream};
-    use fictionet::stdlib::test_support::contract;
-    use fictionet::stdlib::test_support::{decode_all, mutate};
+
+    use fictionet::stdlib::test_support::{
+        assert_write, chunks, decode_all, decode_chunks, mutate,
+    };
 
     const MAC: Mac = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
 
@@ -355,8 +357,17 @@ mod tests {
             Err(error) => (vec![], Some(codec::Fail::Protocol(error))),
         };
         assert_eq!(decode_all(MagicPackets::new, payload), expected);
-        contract::check_decode_with_alloc_limit(MagicPackets::new, payload, 2 * (MAX_PAYLOAD + 1));
-        contract::check_wire::<MagicPacket>(payload);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(MagicPackets::new()),
+                chunks(payload, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * (MAX_PAYLOAD + 1))
+            ),
+            decode_all(MagicPackets::new, payload)
+        );
+        if let Ok(value) = MagicPacket::parse(payload) {
+            assert_write(&value).unwrap();
+        }
         whole
     }
 

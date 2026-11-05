@@ -2213,12 +2213,13 @@ fictionet::text_wire!(Error, MAX_HEAD,
 #[doc(hidden)]
 pub mod harness {
     use super::{Error, Frame, Transports};
+
     use fictionet::stdlib::codec::Wire;
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::assert_write;
 
     /// Checks parsed values and their public accessors.
     pub fn round_trip(item: &Frame) {
-        contract::check_wire_value(item);
+        let _ = assert_write(item);
         if let Frame::Interleaved(frame) = item {
             frame.to_bytes().unwrap();
             return;
@@ -2232,23 +2233,23 @@ pub mod harness {
         }
         if let Frame::Message(message) = item {
             if let Ok(value) = message.session() {
-                contract::check_wire_value(&value);
+                let _ = assert_write(&value);
                 value.to_bytes().unwrap();
             }
             if let Ok(value) = message.range() {
-                contract::check_wire_value(&value);
+                let _ = assert_write(&value);
                 value.to_bytes().unwrap();
             }
             if let Ok(values) = message.transports()
                 && !values.is_empty()
             {
                 let value = Transports { values };
-                contract::check_wire_value(&value);
+                let _ = assert_write(&value);
                 value.to_bytes().unwrap();
             }
             if message.method().is_some() {
                 let reply = message.reply(100, "Continue");
-                contract::check_wire_value(&reply);
+                let _ = assert_write(&reply);
                 assert!(matches!(
                     reply.to_bytes(),
                     Ok(_) | Err(Error::TooLong | Error::TooMany)
@@ -2264,7 +2265,7 @@ pub mod harness {
         value: Result<T, Error>,
     ) {
         if let Ok(value) = value {
-            contract::check_wire_value(&value);
+            let _ = assert_write(&value);
             assert!(
                 matches!(value.to_bytes(), Ok(_) | Err(Error::TooLong)),
                 "{value:?}"
@@ -2290,10 +2291,11 @@ mod tests {
     }
 
     use super::*;
-    use fictionet::stdlib::codec::Lcg;
-    use fictionet::stdlib::codec::{Fail, Stream};
-    use fictionet::stdlib::test_support::contract;
-    use fictionet::stdlib::test_support::{decode_all, mutate};
+    use fictionet::stdlib::codec::Fail;
+    use fictionet::stdlib::codec::{Lcg, Stream};
+    use fictionet::stdlib::test_support::{
+        assert_write, chunks, decode_all, decode_chunks, mutate,
+    };
 
     fn session(id: String, timeout: Option<u64>) -> Session {
         Session { id, timeout }
@@ -3240,7 +3242,14 @@ mod tests {
         ];
         items.push(interleaved(3, vec![1, 2, 3, 4, 5]).to_bytes().unwrap());
         for bytes in &items {
-            contract::check_decode_with_alloc_limit(Frames::new, bytes, 2 * MAX_MESSAGE);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Frames::new()),
+                    chunks(bytes, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_MESSAGE)
+                ),
+                decode_all(Frames::new, bytes)
+            );
             for n in 0..bytes.len() {
                 assert_eq!(Frame::parse(&bytes[..n]), Err(Error::Incomplete));
             }
@@ -3292,7 +3301,14 @@ mod tests {
         bytes.extend(describe_ok());
         frame.write(&mut bytes).unwrap();
         bytes.extend(PLAY2);
-        contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_MESSAGE);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_MESSAGE)
+            ),
+            decode_all(Frames::new, &bytes)
+        );
         let want = vec![
             Ok(Frame::Message(msg(OPTIONS))),
             Ok(Frame::Interleaved(frame.clone())),
@@ -3330,7 +3346,14 @@ mod tests {
             message.body = vec![b'x'; size];
             message.push_header("Content-Length", &size.to_string());
             let bytes = message.to_bytes().unwrap();
-            contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_MESSAGE);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Frames::new()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_MESSAGE)
+                ),
+                decode_all(Frames::new, &bytes)
+            );
             assert_eq!(
                 decode_all(Frames::new, &bytes),
                 (vec![Ok(Frame::Message(message))], None)
@@ -3345,11 +3368,31 @@ mod tests {
     }
 
     fn check(data: &[u8]) -> usize {
-        contract::check_decode_with_alloc_limit(Frames::new, data, 2 * MAX_MESSAGE);
-        contract::check_decode_with_held_limit(Frames::new, data, 0);
-        contract::check_wire::<Message>(data);
-        contract::check_wire::<Frame>(data);
-        contract::check_wire::<Interleaved>(data);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::new()),
+                chunks(data, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_MESSAGE)
+            ),
+            decode_all(Frames::new, data)
+        );
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::new()),
+                chunks(data, &[1, 7, 64]),
+                |s| assert_eq!(s.held(), 0)
+            ),
+            decode_all(Frames::new, data)
+        );
+        if let Ok(value) = Message::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Frame::parse(data) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Interleaved::parse(data) {
+            assert_write(&value).unwrap();
+        }
         let (items, _) = decode_all(Frames::new, data);
         for item in items.iter().flatten() {
             round_trip(item);
@@ -3361,7 +3404,7 @@ mod tests {
     fn values_round_trip(bytes: &[u8]) {
         macro_rules! check {
             ($($ty:ty),+) => {$(
-                contract::check_wire::<$ty>(bytes);
+                if let Ok(value) = <$ty>::parse(bytes) { assert_write(&value).unwrap(); };
                 // Read text directly so a writer failure cannot hide as a parse refusal.
                 if let Ok(text) = core::str::from_utf8(bytes) {
                     text_value(<$ty>::read_value(text));
@@ -3487,13 +3530,13 @@ mod tests {
                 lowers[rng.index(lowers.len())].clone(),
                 params,
             );
-            contract::check_wire_value(&t);
+            let _ = assert_write(&t);
             if let Ok(text) = wire_text(&t) {
                 assert_eq!(Transport::parse(text.as_bytes()).unwrap(), t, "{text}");
                 written += 1;
             }
             let s = session(w(&mut rng), rng.coin().then(|| rng.next()));
-            contract::check_wire_value(&s);
+            let _ = assert_write(&s);
             if let Ok(text) = wire_text(&s) {
                 assert_eq!(Session::parse(text.as_bytes()).unwrap(), s);
             }
@@ -3527,7 +3570,7 @@ mod tests {
                 n.is_multiple_of(4)
                     .then(|| "19970123T153600.1Z".to_string()),
             );
-            contract::check_wire_value(&r);
+            let _ = assert_write(&r);
             if let Ok(text) = wire_text(&r) {
                 assert_eq!(Range::parse(text.as_bytes()).unwrap(), r, "{text}");
                 written += 1;
@@ -3540,7 +3583,7 @@ mod tests {
             m.push_header(&w(&mut rng), &w(&mut rng));
             m.body = rng.bytes(3);
             m.set_header("Content-Length", &m.body.len().to_string());
-            contract::check_wire_value(&m);
+            let _ = assert_write(&m);
             if let Ok(b) = m.to_bytes() {
                 let back = Message::parse(&b).unwrap();
                 assert_eq!(back.start, m.start);

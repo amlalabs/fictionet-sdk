@@ -1413,15 +1413,15 @@ fictionet::codec_from!(Error, Truncated, |_| Error::Short);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::Lcg;
-    use fictionet::stdlib::codec::{Fail, Stream, finish, pump};
+    use fictionet::stdlib::codec::{Fail, finish, pump};
+    use fictionet::stdlib::codec::{Lcg, Stream};
     use fictionet::stdlib::protocols::portmap::{
         self, IPPROTO_TCP, IPPROTO_UDP, Mapping, PMAP_PROGRAM, PmapRequest, PmapResult, Request,
         Rpcb, RpcbRequest, RpcbResult, procedure, silent_on_failure,
     };
     use fictionet::stdlib::test_support;
-    use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::rounds;
+    use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
     use std::net::SocketAddr;
 
     fn auth_sys(stamp: u32, machine_name: String, uid: u32, gid: u32, gids: Vec<u32>) -> AuthSys {
@@ -1474,15 +1474,21 @@ mod tests {
         let mut wire = vec![0; RECORD_MARK_LEN]; // Empty nonfinal fragment.
         wire.extend(encode_fragments(payload, 3).unwrap());
         wire.extend(Record((b"").to_vec()).to_bytes().unwrap());
-        contract::check_decode_with_alloc_limit(
-            || Fragments::with_limit(payload.len()),
-            &wire,
-            2 * (payload.len() + RECORD_MARK_LEN),
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Fragments::with_limit(payload.len())),
+                chunks(&wire, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * (payload.len() + RECORD_MARK_LEN))
+            ),
+            decode_all(|| Fragments::with_limit(payload.len()), &wire)
         );
-        contract::check_decode_with_held_limit(
-            || super::records(payload.len()),
-            &wire,
-            payload.len(),
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(super::records(payload.len())),
+                chunks(&wire, &[1, 7, 64]),
+                |s| assert!(s.held() <= payload.len())
+            ),
+            decode_all(|| super::records(payload.len()), &wire)
         );
 
         let mut stream = Stream::new(super::records(payload.len()));
@@ -1529,10 +1535,13 @@ mod tests {
         );
 
         let wire = [0, 0, 0, 2, 1, 2, 0x80, 0, 0, 2];
-        contract::check_decode_with_alloc_limit(
-            || super::records(3),
-            &wire,
-            2 * (3 + RECORD_MARK_LEN),
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(super::records(3)),
+                chunks(&wire, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * (3 + RECORD_MARK_LEN))
+            ),
+            decode_all(|| super::records(3), &wire)
         );
         let mut stream = Stream::new(super::records(3));
         let error = Fail::Protocol(AssembleError::Inner(Error::RecordTooLong(3)));
@@ -1587,8 +1596,22 @@ mod tests {
                 })
             );
         }
-        contract::check_decode(|| super::records(0), &[0, 0, 0, 0, 0x80, 0, 0, 0]);
-        contract::check_decode(|| super::records(0), &[0, 0, 0, 1]);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(super::records(0)),
+                chunks(&[0, 0, 0, 0, 0x80, 0, 0, 0], &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(|| super::records(0), &[0, 0, 0, 0, 0x80, 0, 0, 0])
+        );
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(super::records(0)),
+                chunks(&[0, 0, 0, 1], &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(|| super::records(0), &[0, 0, 0, 1])
+        );
         let mut empty = Stream::new(super::records(0));
         assert_eq!(finish(&mut empty, |_| panic!("empty stream")), Ok(()));
     }
@@ -1597,10 +1620,12 @@ mod tests {
     fn codec_record_wire_is_exact_and_strict() {
         for data in [Vec::new(), b"record".to_vec(), vec![7; MAX_RECORD]] {
             let record = Record(data.clone());
-            contract::check_wire_value(&record);
+            let _ = assert_write(&record);
             let segmented = encode_fragments(&data, 127).unwrap();
             assert_eq!(Record::parse(&segmented), Ok(record));
-            contract::check_wire::<Record>(&segmented);
+            if let Ok(value) = Record::parse(&segmented) {
+                assert_write(&value).unwrap();
+            }
         }
         let oversized = Record(vec![3; MAX_RECORD + 1]);
         let mut out = vec![1, 2, 3];
@@ -1623,7 +1648,7 @@ mod tests {
     #[test]
     fn codec_message_wire_round_trips() {
         let call = Message::parse(&nfs_call_bytes()).unwrap();
-        contract::check_wire::<Message>(&nfs_call_bytes());
+        assert_write(&call).unwrap();
         let mut messages = vec![call.clone()];
         for status in [
             Accept::Success(vec![1, 2, 3]),
@@ -1662,7 +1687,7 @@ mod tests {
             }));
         }
         for message in messages {
-            contract::check_wire_value(&message);
+            let _ = assert_write(&message);
             assert_eq!(
                 <Message as Wire>::to_bytes(&message),
                 Ok(message.to_bytes().unwrap())
@@ -1723,7 +1748,7 @@ mod tests {
                 let mut out = vec![1, 2, 3];
                 assert_eq!(message.write(&mut out), Err(error));
                 assert_eq!(out, [1, 2, 3]);
-                contract::check_wire_value(&message);
+                let _ = assert_write(&message);
                 assert_eq!(message.to_bytes(), Err(error));
             }
         }
@@ -1732,7 +1757,7 @@ mod tests {
             Body::Reply(Reply::Denied(Reject::AuthError(AuthStat::Other(0)))),
         );
         assert_eq!(alias.write(&mut Vec::new()), Err(Error::Unwritable));
-        contract::check_wire_value(&alias);
+        let _ = assert_write(&alias);
     }
 
     #[test]
@@ -1745,7 +1770,7 @@ mod tests {
                 <Message as Wire>::to_bytes(&message).unwrap().len(),
                 MAX_RECORD
             );
-            contract::check_wire_value(&message);
+            let _ = assert_write(&message);
             let mut too_long = message.clone();
             match &mut too_long.body {
                 Body::Call(call) => call.args.push(1),
@@ -2060,7 +2085,14 @@ mod tests {
         let mut bytes = one.clone();
         bytes.extend(encode_fragments(&msg, 5).unwrap());
         bytes.extend(Record(Vec::new()).to_bytes().unwrap());
-        contract::check_decode(|| super::records(MAX_RECORD), &bytes);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(super::records(MAX_RECORD)),
+                chunks(&bytes, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(|| super::records(MAX_RECORD), &bytes)
+        );
         let mut stream = Stream::new(super::records(MAX_RECORD));
         let mut got = Vec::new();
         codec::pump(&mut stream, &bytes, |item| got.push(item)).unwrap();
@@ -2127,7 +2159,7 @@ mod tests {
             call.cred = auth;
             let message = message(1, Body::Call(call));
             assert_eq!(message.to_bytes(), Err(Error::Unwritable));
-            contract::check_wire_value(&message);
+            let _ = assert_write(&message);
         }
         let message = message(
             1,
@@ -2253,7 +2285,14 @@ mod tests {
             &[0, 0, 0, 0, 0x80, 0, 0][..],
             &[0x80, 0, 0, 4, 1][..],
         ] {
-            contract::check_decode(|| super::records(MAX_RECORD), bytes);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(super::records(MAX_RECORD)),
+                    chunks(bytes, &[1, 7, 64]),
+                    |_| {}
+                ),
+                decode_all(|| super::records(MAX_RECORD), bytes)
+            );
             let mut stream = Stream::new(super::records(MAX_RECORD));
             assert_eq!(stream.push(bytes), bytes.len());
             assert_eq!(stream.next(), None);
@@ -2533,7 +2572,7 @@ mod tests {
         };
         let message = message(0, Body::Call(call));
         assert!(message.to_bytes().is_err());
-        contract::check_wire_value(&message);
+        let _ = assert_write(&message);
         let other = other_auth(9, vec![1; 1000]);
         let mut writer = Writer::new();
         other.write(&mut writer);
@@ -2665,7 +2704,7 @@ mod tests {
     /// short, or with bytes added.
     fn random_bytes(rng: &mut Lcg) -> Vec<u8> {
         let message = random_message(rng);
-        let mut b = contract::check_written(&message);
+        let mut b = assert_write(&message).unwrap();
         for _ in 0..rng.below(3) {
             test_support::mutate(rng, &mut b);
         }
@@ -2697,7 +2736,7 @@ mod tests {
         };
         for _ in 0..rounds(20_000) {
             let message = random_message(&mut rng);
-            contract::check_written(&message);
+            assert_write(&message).unwrap();
             match &message.body {
                 Body::Call(call) => {
                     record_auth(&call.cred);
@@ -2740,9 +2779,20 @@ mod tests {
             let mut r = Reader::new(&bytes);
             let _ = r.array(64, |r| r.optional(|r| r.opaque(64).map(<[u8]>::to_vec)));
             let limit = rng.index(64);
-            contract::check_decode(|| super::records(limit), &bytes);
-            contract::check_wire::<Message>(&bytes);
-            contract::check_wire::<Record>(&bytes);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(super::records(limit)),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |_| {}
+                ),
+                decode_all(|| super::records(limit), &bytes)
+            );
+            if let Ok(value) = Message::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = Record::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
             let wire = encode_fragments(&bytes, 1 + rng.index(16)).unwrap();
             assert_eq!(Record::parse(&wire), Ok(Record(bytes.clone())));
         }

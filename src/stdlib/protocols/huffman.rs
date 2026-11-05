@@ -207,7 +207,7 @@ pub fn decode_limited(bytes: &[u8], limit: usize) -> Result<Vec<u8>, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::assert_write;
     use fictionet::stdlib::test_support::hex;
     // RFC 7541 Appendix C.4: Huffman-coded strings.
 
@@ -312,8 +312,8 @@ mod tests {
     #[test]
     fn huffman_writer_refuses_truncation() {
         let long = HuffmanString(vec![b'0'; MAX_STRING + 1]);
-        contract::check_wire_value(&long);
+        let _ = assert_write(&long);
         assert_eq!(long.to_bytes(), Err(Error::Unwritable));
-        contract::check_wire_value(&HuffmanString(vec![b'0'; MAX_STRING]));
+        let _ = assert_write(&HuffmanString(vec![b'0'; MAX_STRING]));
     }
 }

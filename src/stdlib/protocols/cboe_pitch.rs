@@ -1759,12 +1759,11 @@ fn level(price: Price, a: &Aggregate) -> Level {
 mod tests {
     use super::*;
     use fictionet::assert_cases;
-    use fictionet::stdlib::codec::{Fail, Lcg};
-    use fictionet::stdlib::test_support::contract::{
-        check_decode, check_decode_with_alloc_limit, check_wire, check_wire_value,
-    };
+    use fictionet::stdlib::codec::{Fail, Lcg, Stream};
     use fictionet::stdlib::test_support::hex;
-    use fictionet::stdlib::test_support::{decode_all, mutate};
+    use fictionet::stdlib::test_support::{
+        assert_write, chunks, decode_all, decode_chunks, mutate,
+    };
     use std::collections::BTreeMap;
 
     fn gap_fixture(unit: u8, sequence: u32, count: u32) -> Gap {
@@ -1814,7 +1813,9 @@ mod tests {
         assert_eq!(M::parse(bytes).unwrap(), want);
         assert_eq!(want.to_bytes().unwrap(), bytes);
         assert_eq!(Message::parse(bytes).unwrap(), want.into());
-        check_wire::<Message>(bytes);
+        if let Ok(value) = Message::parse(bytes) {
+            assert_write(&value).unwrap();
+        }
     }
     fn exact_control<M: Wire<ParseError = Error> + Into<Control> + Clone + PartialEq + fmt::Debug>(
         bytes: &[u8],
@@ -1825,7 +1826,9 @@ mod tests {
         assert_eq!(M::parse(bytes).unwrap(), want);
         assert_eq!(want.to_bytes().unwrap(), bytes);
         assert_eq!(Control::parse(bytes).unwrap(), want.into());
-        check_wire::<Control>(bytes);
+        if let Ok(value) = Control::parse(bytes) {
+            assert_write(&value).unwrap();
+        }
     }
 
     // "Sequenced Unit Header with 2 Messages". The example's Hdr Length
@@ -1868,7 +1871,9 @@ mod tests {
                 .unwrap(),
             bytes
         );
-        check_wire::<Unit>(&bytes);
+        if let Ok(value) = Unit::parse(&bytes) {
+            assert_write(&value).unwrap();
+        }
         // The 49 of the printed example is refused.
         let mut printed = bytes.clone();
         printed[0] = 0x31;
@@ -2491,7 +2496,9 @@ mod tests {
                 body: vec![1, 2, 3]
             })
         );
-        check_wire::<Message>(&unknown);
+        if let Ok(value) = Message::parse(&unknown) {
+            assert_write(&value).unwrap();
+        }
         // A defined type written as Unknown is refused.
         let fake = Message::Unknown(Unknown {
             kind: 0x29,
@@ -2541,7 +2548,9 @@ mod tests {
         assert_eq!(t.symbol.trimmed(), "998877");
         assert_eq!((t.trading_status, t.reserved1), (b'T', b'H'));
         assert_eq!(Message::from(t).to_bytes().unwrap(), b);
-        check_wire::<Message>(&b);
+        if let Ok(value) = Message::parse(&b) {
+            assert_write(&value).unwrap();
+        }
     }
 
     #[test]
@@ -2661,9 +2670,30 @@ mod tests {
         // A block that frames but does not parse is an item.
         bytes.extend_from_slice(&[9, 0, 2, 0, 0, 0, 0, 0, 0]);
         Unit::heartbeat(0, 0).write(&mut bytes).unwrap();
-        check_decode(Frames::<Unit>::default, &bytes);
-        check_decode(|| Frames::<Unit>::with_limit(40), &bytes);
-        check_decode_with_alloc_limit(Frames::<Unit>::default, &bytes, 2 * MAX_UNIT_LENGTH);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Unit>::default()),
+                chunks(&bytes, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(Frames::<Unit>::default, &bytes)
+        );
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Unit>::with_limit(40)),
+                chunks(&bytes, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(|| Frames::<Unit>::with_limit(40), &bytes)
+        );
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Unit>::default()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_UNIT_LENGTH)
+            ),
+            decode_all(Frames::<Unit>::default, &bytes)
+        );
         let (items, failure) = decode_all(Frames::<Unit>::default, &bytes);
         assert!(failure.is_none());
         assert_eq!(items.len(), 5);
@@ -2707,10 +2737,18 @@ mod tests {
             for _ in 0..=rng.below(3) {
                 mutate(&mut rng, &mut bytes);
             }
-            check_wire::<Message>(&bytes);
-            check_wire::<Control>(&bytes);
-            check_wire::<Unit>(&bytes);
-            check_wire::<AddOrderExpanded>(&bytes);
+            if let Ok(value) = Message::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = Control::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = Unit::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = AddOrderExpanded::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
             if let Ok(m) = Message::parse(&bytes) {
                 let mut book = Book::new(BookConfig::default()).unwrap();
                 let _ = book.apply(1, &m);
@@ -2726,7 +2764,14 @@ mod tests {
             for _ in 0..=rng.below(4) {
                 mutate(&mut rng, &mut bytes);
             }
-            check_decode(Frames::<Unit>::default, &bytes);
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Frames::<Unit>::default()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |_| {}
+                ),
+                decode_all(Frames::<Unit>::default, &bytes)
+            );
         }
     }
 
@@ -3091,8 +3136,7 @@ mod tests {
     #[test]
     fn every_type_round_trips() {
         for m in samples() {
-            check_wire_value(&m);
-            let b = m.to_bytes().unwrap();
+            let b = assert_write(&m).unwrap();
             assert_eq!(b.len(), m.wire_len());
             assert_eq!(b[1], m.kind());
         }

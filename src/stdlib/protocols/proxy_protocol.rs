@@ -1435,8 +1435,9 @@ mod tests {
     use super::*;
     use codec::{Lcg, Stream};
 
-    use fictionet::stdlib::test_support::contract;
-    use fictionet::stdlib::test_support::{chunks, decode_all, mutate};
+    use fictionet::stdlib::test_support::{
+        assert_write, chunks, decode_all, decode_chunks, mutate,
+    };
 
     fn tcp4() -> Header {
         Header::V2(V2 {
@@ -1922,7 +1923,7 @@ mod tests {
         );
         let sub = SslTlv::from_raw(0xe0, &[0; MAX_TLV_VALUE - SSL_FIXED_LEN - 3]).unwrap();
         assert!(sub.to_bytes().is_ok());
-        contract::check_wire_value(&sub);
+        let _ = assert_write(&sub);
         // The longest that fits reads, and writes back whole.
         ssl.truncate(MAX_TLV_VALUE - (MAX_TLV_VALUE - SSL_FIXED_LEN) % 3);
         let s = Ssl::parse(&ssl).unwrap();
@@ -2064,14 +2065,14 @@ mod tests {
             b"foo".to_vec(),
         ] {
             assert_eq!(
-                contract::check_refused(&Header::V1(V1::Unknown(rest))),
+                assert_write(&Header::V1(V1::Unknown(rest))).unwrap_err(),
                 Error::Unwritable
             );
         }
         for rest in [b" \r".to_vec(), vec![b' '; V1_MAX_UNKNOWN_REST]] {
             let header = Header::V1(V1::Unknown(rest));
             assert!(header.to_bytes().is_ok());
-            contract::check_wire_value(&header);
+            let _ = assert_write(&header);
         }
         for tlv in [
             Tlv::UniqueId(vec![5; MAX_UNIQUE_ID + 1]),
@@ -2094,11 +2095,12 @@ mod tests {
             }),
         ] {
             assert_eq!(
-                contract::check_refused(&Header::V2(V2 {
+                assert_write(&Header::V2(V2 {
                     command: Command::Proxy,
                     addresses: Addresses::Unspec,
                     tlvs: vec![tlv]
-                })),
+                }))
+                .unwrap_err(),
                 Error::Unwritable
             );
         }
@@ -2108,11 +2110,12 @@ mod tests {
             vec![Tlv::Crc32c(0)],
         ] {
             assert_eq!(
-                contract::check_refused(&Header::V2(V2 {
+                assert_write(&Header::V2(V2 {
                     command: Command::Proxy,
                     addresses: Addresses::Unspec,
                     tlvs
-                })),
+                }))
+                .unwrap_err(),
                 Error::Unwritable
             );
         }
@@ -2124,12 +2127,21 @@ mod tests {
         let bytes = h.to_bytes().unwrap();
         assert_eq!(bytes.len(), MAX_HEADER_LEN);
         assert_eq!(Header::parse(&bytes), Ok(h.clone()));
-        contract::check_decode_with_alloc_limit(Headers::new, &bytes, 2 * MAX_HEADER_LEN);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Headers::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * MAX_HEADER_LEN)
+            ),
+            decode_all(Headers::new, &bytes)
+        );
         assert_eq!(decode_all(Headers::new, &bytes), (vec![Ok(h)], None));
         for command in [Command::Local, Command::Proxy] {
             let bytes = checksum_header(command);
             assert_eq!(Header::parse(&bytes).unwrap().to_bytes().unwrap(), bytes);
-            contract::check_wire::<Header>(&bytes);
+            if let Ok(value) = Header::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
         }
     }
 
@@ -2217,7 +2229,7 @@ mod tests {
         .with_checksum()
         .unwrap();
         assert_eq!(longest.to_bytes().unwrap().len(), V2_MAX_LEN);
-        contract::check_wire_value(&longest);
+        let _ = assert_write(&longest);
     }
 
     #[test]
@@ -2339,20 +2351,39 @@ mod tests {
                 rng.bytes(80)
             };
             mutate(&mut rng, &mut bytes);
-            contract::check_decode_with_alloc_limit(Headers::new, &bytes, 2 * MAX_HEADER_LEN);
-            contract::check_wire::<Header>(&bytes);
-            contract::check_wire::<V1>(&bytes);
-            contract::check_wire::<V2>(&bytes);
-            contract::check_wire::<Tlv>(&bytes);
-            contract::check_wire::<Ssl>(&bytes);
-            contract::check_wire::<SslTlv>(&bytes);
-            contract::check_wire_value(&Header::V1(V1::Unknown(rng.text(120).into_bytes())));
-            contract::check_wire_value(&fixture_tlv_other(rng.next() as u8, rng.bytes(40)));
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Headers::new()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |s| assert!(s.allocated() <= 2 * MAX_HEADER_LEN)
+                ),
+                decode_all(Headers::new, &bytes)
+            );
+            if let Ok(value) = Header::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = V1::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = V2::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = Tlv::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = Ssl::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = SslTlv::parse(&bytes) {
+                assert_write(&value).unwrap();
+            }
+            let _ = assert_write(&Header::V1(V1::Unknown(rng.text(120).into_bytes())));
+            let _ = assert_write(&fixture_tlv_other(rng.next() as u8, rng.bytes(40)));
             let header = random_v2(&mut rng);
-            contract::check_wire_value(&header);
+            let _ = assert_write(&header);
             if let Ok(header) = header.with_checksum() {
                 assert!(header.to_bytes().is_ok());
-                contract::check_wire_value(&header);
+                let _ = assert_write(&header);
             }
         }
     }

@@ -1639,23 +1639,28 @@ pub mod harness {
         Cpf, ForwardCloseRequest, ForwardCloseResponse, ForwardOpenRequest, ForwardOpenResponse,
         Identity, MessageRequest, MessageResponse, Packet, SendData,
     };
+
     use fictionet::stdlib::codec::Wire;
-    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::assert_write;
 
     /// Checks packet validation and the CIP values nested in its payload.
     pub fn check_packet(p: &Packet) {
-        contract::check_wire_value(p);
+        let _ = assert_write(p);
         // Validation and writing must agree on whether a packet is allowed.
         assert_eq!(p.check().is_ok(), p.to_bytes().is_ok());
         // The data as each CIP structure: any that reads must write back to
         // bytes that read the same.
-        contract::check_wire::<SendData>(&p.data);
+        if let Ok(value) = SendData::parse(&p.data) {
+            assert_write(&value).unwrap();
+        }
         if let Ok(send) = <SendData as Wire>::parse(&p.data) {
             for it in &send.cpf.items {
                 check_item(&it.data);
             }
         }
-        contract::check_wire::<Cpf>(&p.data);
+        if let Ok(value) = Cpf::parse(&p.data) {
+            assert_write(&value).unwrap();
+        }
         if let Ok(cpf) = <Cpf as Wire>::parse(&p.data) {
             for it in &cpf.items {
                 check_item(&it.data);
@@ -1667,16 +1672,30 @@ pub mod harness {
     /// The bytes of one item as each CIP structure, and the bodies inside a
     /// message: any that reads must write back to bytes that read the same.
     pub fn check_item(b: &[u8]) {
-        contract::check_wire::<MessageRequest>(b);
-        contract::check_wire::<MessageResponse>(b);
-        contract::check_wire::<Identity>(b);
+        if let Ok(value) = MessageRequest::parse(b) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = MessageResponse::parse(b) {
+            assert_write(&value).unwrap();
+        }
+        if let Ok(value) = Identity::parse(b) {
+            assert_write(&value).unwrap();
+        }
         if let Ok(req) = <MessageRequest as Wire>::parse(b) {
-            contract::check_wire::<ForwardOpenRequest>(&req.data);
-            contract::check_wire::<ForwardCloseRequest>(&req.data);
+            if let Ok(value) = ForwardOpenRequest::parse(&req.data) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = ForwardCloseRequest::parse(&req.data) {
+                assert_write(&value).unwrap();
+            }
         }
         if let Ok(resp) = <MessageResponse as Wire>::parse(b) {
-            contract::check_wire::<ForwardOpenResponse>(&resp.data);
-            contract::check_wire::<ForwardCloseResponse>(&resp.data);
+            if let Ok(value) = ForwardOpenResponse::parse(&resp.data) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = ForwardCloseResponse::parse(&resp.data) {
+                assert_write(&value).unwrap();
+            }
         }
     }
 }
@@ -1692,9 +1711,8 @@ mod tests {
 
     use super::*;
     use fictionet::stdlib::codec::{Lcg, Stream, pump};
-    use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::rounds;
-    use fictionet::stdlib::test_support::{self, decode_all};
+    use fictionet::stdlib::test_support::{self, assert_write, chunks, decode_all, decode_chunks};
 
     #[test]
     fn register_session_round_trip() {
@@ -1777,7 +1795,14 @@ mod tests {
         stream.extend_from_slice(&b.to_bytes().unwrap());
         let mut d = Stream::new(Frames::<Packet>::new());
         let mut got = Vec::new();
-        contract::check_decode(Frames::<Packet>::new, &stream);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Packet>::new()),
+                chunks(&stream, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(Frames::<Packet>::new, &stream)
+        );
         pump(&mut d, &stream, |packet| got.push(packet)).unwrap();
         assert_eq!(got, vec![a, b]);
         assert_eq!(d.buffered(), 0);
@@ -2115,7 +2140,14 @@ mod tests {
         let mut big = vec![0u8; HEADER_LEN];
         big[2..4].copy_from_slice(&u16::MAX.to_le_bytes());
         big.resize(PACKETS_CAPACITY, 0);
-        contract::check_decode_with_alloc_limit(Frames::<Packet>::new, &big, 2 * PACKETS_CAPACITY);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Packet>::new()),
+                chunks(&big, &[1, 7, 64]),
+                |s| assert!(s.allocated() <= 2 * PACKETS_CAPACITY)
+            ),
+            decode_all(Frames::<Packet>::new, &big)
+        );
         assert_eq!(d.push(&big), PACKETS_CAPACITY);
         let p = d.next().unwrap().unwrap();
         assert_eq!(p.data.len(), u16::MAX as usize);
@@ -2636,7 +2668,9 @@ mod tests {
         let parsed = <Identity as Wire>::parse(&noncanonical).unwrap();
         assert_eq!(parsed, id);
         assert_eq!(parsed.to_bytes().unwrap(), bytes);
-        contract::check_wire::<Identity>(&noncanonical);
+        if let Ok(value) = Identity::parse(&noncanonical) {
+            assert_write(&value).unwrap();
+        }
         for n in 0..bytes.len() {
             assert_eq!(
                 Identity::parse(&bytes[..n]),
@@ -2853,7 +2887,14 @@ mod tests {
             Stream::new(Frames::<Packet>::new()).push(data),
             data.len().min(PACKETS_CAPACITY)
         );
-        contract::check_decode(Frames::<Packet>::new, data);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Packet>::new()),
+                chunks(data, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(Frames::<Packet>::new, data)
+        );
         let (packets, _) = decode_all(Frames::<Packet>::new, data);
         for p in &packets {
             harness::check_packet(p);
@@ -2880,17 +2921,37 @@ mod tests {
             }
             check(&data);
             // Every parsed CIP value must write and read back unchanged.
-            contract::check_wire::<Cpf>(&data);
-            contract::check_wire::<SendData>(&data);
-            contract::check_wire::<MessageRequest>(&data);
-            contract::check_wire::<MessageResponse>(&data);
+            if let Ok(value) = Cpf::parse(&data) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = SendData::parse(&data) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = MessageRequest::parse(&data) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = MessageResponse::parse(&data) {
+                assert_write(&value).unwrap();
+            }
             let _ = parse_path(&data);
-            contract::check_wire::<ForwardOpenRequest>(&data);
-            contract::check_wire::<ForwardOpenResponse>(&data);
-            contract::check_wire::<ForwardCloseRequest>(&data);
-            contract::check_wire::<ForwardCloseResponse>(&data);
-            contract::check_wire::<RegisterSession>(&data);
-            contract::check_wire::<Identity>(&data);
+            if let Ok(value) = ForwardOpenRequest::parse(&data) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = ForwardOpenResponse::parse(&data) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = ForwardCloseRequest::parse(&data) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = ForwardCloseResponse::parse(&data) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = RegisterSession::parse(&data) {
+                assert_write(&value).unwrap();
+            }
+            if let Ok(value) = Identity::parse(&data) {
+                assert_write(&value).unwrap();
+            }
         }
         assert!(read > 500, "{read} packets read");
     }
