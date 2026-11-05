@@ -436,7 +436,6 @@ fn port_unreachable(packet: &[u8], addr: IpAddr) -> Option<Packet> {
     }
 }
 
-fictionet::cfg_std! {
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -509,6 +508,4 @@ mod tests {
         }));
         assert_eq!(result.unwrap_err().to_string(), "done");
     }
-}
-
 }

@@ -16,9 +16,7 @@ use fictionet::stdlib::world::net::{
     Arrival, ConfigFor, ConfigFuture, Host, PortServer, PreparedShare, Sni,
 };
 
-use super::{
-    Body, Exchange, Handler, HttpOptions, Limits, Reply, serve_connection, text,
-};
+use super::{Body, Exchange, Handler, HttpOptions, Limits, Reply, serve_connection, text};
 
 pub use fictionet::stdlib::world::net::normalize;
 
@@ -171,9 +169,9 @@ impl Handler for VirtualHosts {
         };
         let misdirected = || {
             Reply::Now(text(
-                    StatusCode::MISDIRECTED_REQUEST,
-                    "This server does not serve that host.\n",
-                ))
+                StatusCode::MISDIRECTED_REQUEST,
+                "This server does not serve that host.\n",
+            ))
         };
         let Some((site, routing)) = self.site_or_default(&host) else {
             return misdirected();
@@ -329,7 +327,6 @@ impl Server {
         self
     }
 
-
     /// Serves HTTPS on 443 with a config selected for each handshake.
     /// Port 80 redirects to HTTPS unless [`plain_http`](Self::plain_http) was selected.
     pub fn tls_with(
@@ -347,7 +344,9 @@ impl Server {
         F: Future<Output = Arc<ServerConfig>> + Send + 'static,
     {
         self.vhost.https = true;
-        self.tls = Some(Arc::new(move |fcx| Box::pin(config_for(fcx)) as ConfigFuture));
+        self.tls = Some(Arc::new(move |fcx| {
+            Box::pin(config_for(fcx)) as ConfigFuture
+        }));
         self
     }
 

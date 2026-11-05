@@ -6,11 +6,11 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
+use crate::sandbox;
+use crate::sandbox::Machine;
 use fictionet::stdlib::protocols::dns::op::ResponseCode;
 use fictionet::stdlib::protocols::dns::rr::{RData, RecordType};
-use crate::sandbox::Machine;
 use fictionet::stdlib::{network::tcp, protocols::http1};
-use crate::sandbox;
 use fictionet::{Attacher, Cx};
 use http::{HeaderMap, StatusCode};
 use rustls::ClientConfig;

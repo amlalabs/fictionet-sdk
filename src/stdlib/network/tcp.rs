@@ -1258,7 +1258,6 @@ impl Conn {
     }
 }
 
-fictionet::cfg_std! { items {
 /// A socket's two buffers, in an anonymous mapping of their own.
 ///
 /// smoltcp buffers are fixed slices. Taking them from the heap would keep
@@ -1374,28 +1373,6 @@ impl Pages {
     unsafe fn release(&self) {
         match *self {}
     }
-}
-
-} else {
-enum Pages {}
-
-impl Pages {
-    fn map(_buffer: usize) -> Option<Pages> {
-        None
-    }
-
-    /// SAFETY: as on a host; no `Pages` exists to call it on.
-    unsafe fn halves(&self) -> (&'static mut [u8], &'static mut [u8]) {
-        match *self {}
-    }
-
-    /// SAFETY: as on a host; no `Pages` exists to call it on.
-    unsafe fn release(&self) {
-        match *self {}
-    }
-}
-
-}
 }
 
 /// A socket with two buffers of `buffer` bytes.
@@ -3074,7 +3051,6 @@ impl Connection for TcpConnection {
     }
 }
 
-fictionet::cfg_std! {
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3094,18 +3070,29 @@ mod tests {
             message.extend_from_slice(&input.sequence.to_be_bytes());
             message.extend_from_slice(&(input.now.as_secs() / 37).to_be_bytes());
             let tag = ring::hmac::sign(&key, &message);
-            CookieReply { sequence: u32::from_be_bytes(tag.as_ref()[..4].try_into().unwrap()), options: Vec::new(), ecn: false }
+            CookieReply {
+                sequence: u32::from_be_bytes(tag.as_ref()[..4].try_into().unwrap()),
+                options: Vec::new(),
+                ecn: false,
+            }
         }
 
         fn validate(&self, input: &CookieInput<'_>, cookie: u32) -> Option<CookieState> {
             (self.issue(input).sequence == cookie).then_some(CookieState {
-                mss: 536, scale: None, sack: false, ecn: false, timestamp: None,
+                mss: 536,
+                scale: None,
+                sack: false,
+                ecn: false,
+                timestamp: None,
             })
         }
     }
 
     fn cookie_options() -> Options {
-        Options::default().settings(Settings { cookies: Some(&TestCookies), ..Settings::default() })
+        Options::default().settings(Settings {
+            cookies: Some(&TestCookies),
+            ..Settings::default()
+        })
     }
 
     /// Sets the IP length fields and the checksums of a TCP packet that ends at
@@ -3154,11 +3141,19 @@ mod tests {
             let mut st = ep.shared.state.lock();
             st.ingress(local.ip(), now, segment(peer, local, 100, 0, 2).0);
             let syn_ack = egress(&mut st, now);
-            let t = Header::parse_whole(&syn_ack[0]).unwrap().payload(&syn_ack[0]);
+            let t = Header::parse_whole(&syn_ack[0])
+                .unwrap()
+                .payload(&syn_ack[0]);
             let ack = u32::from_be_bytes(t[4..8].try_into().unwrap()).wrapping_add(1);
             st.ingress(local.ip(), now, segment(peer, local, 101, ack, 16).0);
             st.housekeeping();
-            let h = st.listeners.get_mut(&80).unwrap().ready.pop_front().unwrap();
+            let h = st
+                .listeners
+                .get_mut(&80)
+                .unwrap()
+                .ready
+                .pop_front()
+                .unwrap();
             st.orphan(h, true);
             for _ in 0..EGRESS_PACKETS {
                 st.dev.transmit(now).unwrap().consume(40, |_| {});
@@ -3166,16 +3161,22 @@ mod tests {
             let st = &mut *st;
             st.iface.poll_egress(now, &mut st.dev, &mut st.sockets);
             st.housekeeping();
-            assert!(st.conns.contains_key(&h), "unsent reset must keep its socket");
+            assert!(
+                st.conns.contains_key(&h),
+                "unsent reset must keep its socket"
+            );
             st.dev.tx.clear();
             let packets = egress(st, now);
             assert_eq!(packets.len(), 1);
-            let t = Header::parse_whole(&packets[0]).unwrap().payload(&packets[0]);
+            let t = Header::parse_whole(&packets[0])
+                .unwrap()
+                .payload(&packets[0]);
             assert_eq!(t[13] & 4, 4);
             st.housekeeping();
             assert!(!st.conns.contains_key(&h));
             Ok(())
-        })).unwrap();
+        }))
+        .unwrap();
     }
 
     /// Handshakes a connection. Returns its socket and next send sequence.
@@ -3187,7 +3188,9 @@ mod tests {
     ) -> (Id, u32) {
         st.ingress(local.ip(), now, segment(peer, local, 100, 0, 2).0);
         let syn_ack = egress(st, now);
-        let t = Header::parse_whole(&syn_ack[0]).unwrap().payload(&syn_ack[0]);
+        let t = Header::parse_whole(&syn_ack[0])
+            .unwrap()
+            .payload(&syn_ack[0]);
         let ack = u32::from_be_bytes(t[4..8].try_into().unwrap()).wrapping_add(1);
         st.ingress(local.ip(), now, segment(peer, local, 101, ack, 16).0);
         st.housekeeping();
@@ -3208,7 +3211,10 @@ mod tests {
         let (h, ack) = established(st, now, local, peer);
         st.sock(h).close();
         let fin = egress(st, now);
-        assert_eq!(Header::parse_whole(&fin[0]).unwrap().payload(&fin[0])[13], 0x11);
+        assert_eq!(
+            Header::parse_whole(&fin[0]).unwrap().payload(&fin[0])[13],
+            0x11
+        );
         let peer_fin = segment(peer, local, 101, ack.wrapping_add(1), 0x11);
         st.ingress(local.ip(), now, peer_fin.0.clone());
         assert_eq!(st.get(h).state(), TcpState::TimeWait);
@@ -3228,12 +3234,19 @@ mod tests {
             let mut st = ep.shared.state.lock();
             let (h, fin) = time_wait(&mut st, now, local, peer);
             drop(st);
-            let watch = GoneWatch { shared: ep.shared.clone(), handle: h };
+            let watch = GoneWatch {
+                shared: ep.shared.clone(),
+                handle: h,
+            };
             let held = Arc::new(());
             watch.hold_until_gone(Box::new(held.clone()));
             let log = Arc::new(Mutex::new(Vec::new()));
             let waker = Waker::from(Arc::new(WakeLog(0, log.clone())));
-            assert!(watch.poll_gone(&mut Context::from_waker(&waker)).is_pending());
+            assert!(
+                watch
+                    .poll_gone(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
             let mut st = ep.shared.state.lock();
             while st.dev.tx.len() < EGRESS_PACKETS {
                 st.dev.transmit(now).unwrap().consume(40, |_| {});
@@ -3244,7 +3257,10 @@ mod tests {
                 st.iface.poll_egress(later, &mut st.dev, &mut st.sockets);
             }
             st.housekeeping();
-            assert!(st.conns.contains_key(&h), "full egress must retain TIME-WAIT");
+            assert!(
+                st.conns.contains_key(&h),
+                "full egress must retain TIME-WAIT"
+            );
             assert_eq!(Arc::strong_count(&held), 1);
             assert_eq!(*log.lock(), [0]);
             drop(st);
@@ -3258,7 +3274,9 @@ mod tests {
             st.dev.tx.clear();
             let packets = egress(st, later);
             assert_eq!(packets.len(), 1);
-            let t = Header::parse_whole(&packets[0]).unwrap().payload(&packets[0]);
+            let t = Header::parse_whole(&packets[0])
+                .unwrap()
+                .payload(&packets[0]);
             assert_eq!(t[13], 0x10);
             assert_eq!(u32::from_be_bytes(t[8..12].try_into().unwrap()), 102);
             // FINs near expiry restart the two-MSL timer, even past the
@@ -3268,7 +3286,9 @@ mod tests {
                 st.ingress(local.ip(), retry, fin.0.clone());
                 let packets = egress(st, retry);
                 assert_eq!(packets.len(), 1);
-                let t = Header::parse_whole(&packets[0]).unwrap().payload(&packets[0]);
+                let t = Header::parse_whole(&packets[0])
+                    .unwrap()
+                    .payload(&packets[0]);
                 assert_eq!(t[13], 0x10);
             }
             let before = now + smoltcp::time::Duration::from_secs(1912);
@@ -3286,7 +3306,8 @@ mod tests {
             assert!(st.time_wait.is_empty());
             assert_eq!(Arc::strong_count(&held), 1);
             Ok(())
-        })).unwrap();
+        }))
+        .unwrap();
     }
 
     #[test]
@@ -3295,7 +3316,12 @@ mod tests {
             let (_raw, side) = pair();
             let local: SocketAddr = "10.0.0.1:80".parse()?;
             let peer: IpAddr = "10.0.0.2".parse()?;
-            let ep = endpoint_with(&fcx, side, local.ip(), Options::default().buffer(MIN_BUFFER));
+            let ep = endpoint_with(
+                &fcx,
+                side,
+                local.ip(),
+                Options::default().buffer(MIN_BUFFER),
+            );
             let _listener = ep.listen(local.port())?;
             let now = smol_now(&fcx);
             let mut st = ep.shared.state.lock();
@@ -3330,7 +3356,10 @@ mod tests {
             assert!(st.conns.contains_key(&recent));
             assert!(!st.conns.contains_key(&dropped[0]));
             assert!(!st.handles.contains_key(&dropped[0]));
-            assert!(!st.by_tuple.contains_key(&(local, SocketAddr::new(peer, 1002))));
+            assert!(
+                !st.by_tuple
+                    .contains_key(&(local, SocketAddr::new(peer, 1002)))
+            );
             assert!(dropped[1..].iter().all(|h| st.conns.contains_key(h)));
             // Eviction itself emits nothing. Normal expiry frees the rest.
             assert!(egress(&mut st, later).is_empty());
@@ -3342,7 +3371,8 @@ mod tests {
             assert_eq!(st.conns.len(), 1);
             assert!(st.conns.contains_key(&kept));
             Ok(())
-        })).unwrap();
+        }))
+        .unwrap();
     }
 
     struct WakeLog(u16, Arc<Mutex<Vec<u16>>>);
@@ -3367,7 +3397,11 @@ mod tests {
                 let log = Arc::new(Mutex::new(Vec::new()));
                 for (i, watch) in watches.iter().enumerate() {
                     let waker = Waker::from(Arc::new(WakeLog(i as u16, log.clone())));
-                    assert!(watch.poll_gone(&mut Context::from_waker(&waker)).is_pending());
+                    assert!(
+                        watch
+                            .poll_gone(&mut Context::from_waker(&waker))
+                            .is_pending()
+                    );
                 }
                 let mut conn = Some(conn);
                 match reset {
@@ -3400,12 +3434,17 @@ mod tests {
                     let st = &mut *st;
                     st.iface.poll_egress(now, &mut st.dev, &mut st.sockets);
                     st.housekeeping();
-                    assert!(st.conns.contains_key(&h), "unsent reset must keep its socket");
+                    assert!(
+                        st.conns.contains_key(&h),
+                        "unsent reset must keep its socket"
+                    );
                     assert!(st.get(h).remote_endpoint().is_some());
                     st.dev.tx.clear();
                     let packets = egress(st, now);
                     assert_eq!(packets.len(), 1);
-                    let t = Header::parse_whole(&packets[0]).unwrap().payload(&packets[0]);
+                    let t = Header::parse_whole(&packets[0])
+                        .unwrap()
+                        .payload(&packets[0]);
                     assert_eq!(t[13] & 4, 4);
                     st.housekeeping();
                     assert_eq!(st.conns.contains_key(&h), conn.is_some());
@@ -3417,7 +3456,8 @@ mod tests {
                 drop(st);
                 fcx.cancel();
                 Ok(())
-            })).unwrap();
+            }))
+            .unwrap();
         }
     }
 
@@ -3434,7 +3474,11 @@ mod tests {
             let log = Arc::new(Mutex::new(Vec::new()));
             for (i, watch) in watches.iter().enumerate() {
                 let waker = Waker::from(Arc::new(WakeLog(i as u16, log.clone())));
-                assert!(watch.poll_gone(&mut Context::from_waker(&waker)).is_pending());
+                assert!(
+                    watch
+                        .poll_gone(&mut Context::from_waker(&waker))
+                        .is_pending()
+                );
             }
             server.shared.stop();
             assert_eq!(*log.lock(), [0, 1]);
@@ -3453,7 +3497,8 @@ mod tests {
             assert!(server.shared.state.lock().conns.contains_key(&conn.handle));
             fcx.cancel();
             Ok(())
-        })).unwrap();
+        }))
+        .unwrap();
     }
 
     #[test]
@@ -3629,11 +3674,27 @@ mod tests {
                     icmp::error(&syn, "10.0.0.254".parse().unwrap(), 3, 4, 1400).unwrap();
                 st.ingress(local.ip(), now, fragmentation_needed.0);
                 assert_eq!(st.get(h).state(), TcpState::SynSent, "fragmentation needed");
-                let error = icmp::host_unreachable(&syn, "10.0.0.254".parse().unwrap()).unwrap().0;
+                let error = icmp::host_unreachable(&syn, "10.0.0.254".parse().unwrap())
+                    .unwrap()
+                    .0;
                 for fault in [
-                    "outer_ip", "icmp_checksum", "type", "code", "destination", "version",
-                    "quoted_ip", "protocol", "fragment", "local_ip", "remote_ip",
-                    "local_port", "remote_port", "sequence", "flags", "tcp_checksum", "length",
+                    "outer_ip",
+                    "icmp_checksum",
+                    "type",
+                    "code",
+                    "destination",
+                    "version",
+                    "quoted_ip",
+                    "protocol",
+                    "fragment",
+                    "local_ip",
+                    "remote_ip",
+                    "local_port",
+                    "remote_port",
+                    "sequence",
+                    "flags",
+                    "tcp_checksum",
+                    "length",
                 ] {
                     let mut p = error.clone();
                     match fault {
@@ -3656,13 +3717,19 @@ mod tests {
                         "length" => p[31] = 28,
                         _ => unreachable!(),
                     }
-                    if matches!(fault, "local_ip" | "remote_ip" | "local_port" | "remote_port" | "sequence") {
+                    if matches!(
+                        fault,
+                        "local_ip" | "remote_ip" | "local_port" | "remote_port" | "sequence"
+                    ) {
                         // The minimum quote has no TCP checksum to mask a tuple mismatch.
                         p.truncate(56);
                         p[2..4].copy_from_slice(&56u16.to_be_bytes());
                     }
                     // Keep unrelated checksums valid so each rejection is tested.
-                    if !matches!(fault, "outer_ip" | "icmp_checksum" | "quoted_ip" | "version") {
+                    if !matches!(
+                        fault,
+                        "outer_ip" | "icmp_checksum" | "quoted_ip" | "version"
+                    ) {
                         ip::set_header_checksum(&mut p[28..48]);
                         ip::set_header_checksum(&mut p[..20]);
                     }
@@ -3708,7 +3775,8 @@ mod tests {
             drop(st);
             fcx.cancel();
             Ok(())
-        })).unwrap();
+        }))
+        .unwrap();
     }
 
     #[test]
@@ -3734,7 +3802,8 @@ mod tests {
             drop(st);
             fcx.cancel();
             Ok(())
-        })).unwrap();
+        }))
+        .unwrap();
     }
 
     #[test]
@@ -3756,7 +3825,12 @@ mod tests {
             let peer: SocketAddr = peer.parse().unwrap();
             block_on(lab(Seed::from_u64(1), |fcx| async move {
                 let (_raw, side) = pair();
-                let ep = endpoint_with(&fcx, side, local.ip(), Options::default().buffer(MIN_BUFFER));
+                let ep = endpoint_with(
+                    &fcx,
+                    side,
+                    local.ip(),
+                    Options::default().buffer(MIN_BUFFER),
+                );
                 let now = smol_now(&fcx);
                 let mut st = ep.shared.state.lock();
                 let mut s = new_socket(MIN_BUFFER);
@@ -3765,7 +3839,9 @@ mod tests {
                 st.conns.insert(h, Conn::new(local, peer, Side::Client));
                 st.by_tuple.insert((local, peer), h);
                 let packets = egress(&mut st, now);
-                let t = Header::parse_whole(&packets[0]).unwrap().payload(&packets[0]);
+                let t = Header::parse_whole(&packets[0])
+                    .unwrap()
+                    .payload(&packets[0]);
                 let ack = u32::from_be_bytes(t[4..8].try_into().unwrap()).wrapping_add(1);
                 let irs = u32::MAX - 3;
                 if established {
@@ -3775,7 +3851,14 @@ mod tests {
                 }
                 let before = st.get(h).state();
                 for fault in [
-                    "empty_checksum", "checksum", "ack", "offset", "options", "flags", "ip", "none",
+                    "empty_checksum",
+                    "checksum",
+                    "ack",
+                    "offset",
+                    "options",
+                    "flags",
+                    "ip",
+                    "none",
                 ] {
                     // A valid SYN-ACK can establish, and RST can close the socket.
                     if matches!(fault, "none" | "flags") && !established
@@ -3843,7 +3926,9 @@ mod tests {
                     st.conns.insert(h, Conn::new(local, peer, Side::Client));
                     st.by_tuple.insert((local, peer), h);
                     let packets = egress(&mut st, now);
-                    let t = Header::parse_whole(&packets[0]).unwrap().payload(&packets[0]);
+                    let t = Header::parse_whole(&packets[0])
+                        .unwrap()
+                        .payload(&packets[0]);
                     let ack = u32::from_be_bytes(t[4..8].try_into().unwrap()).wrapping_add(1);
                     let seq = irs.wrapping_sub(MIN_BUFFER as u32);
                     let mut p = segment(peer, local, seq, ack, 0x16).0;
@@ -3885,7 +3970,9 @@ mod tests {
             st.ingress(local.ip(), now, segment(peer, local, u32::MAX, 0, 0x02).0);
             assert_eq!(st.get(h).state(), TcpState::SynReceived);
             let packets = egress(&mut st, now);
-            let t = Header::parse_whole(&packets[0]).unwrap().payload(&packets[0]);
+            let t = Header::parse_whole(&packets[0])
+                .unwrap()
+                .payload(&packets[0]);
             assert_eq!(t[13], 0x12);
             assert_eq!(u32::from_be_bytes(t[8..12].try_into().unwrap()), 0);
             drop(st);
@@ -3931,7 +4018,12 @@ mod tests {
             st.ingress(local.ip(), now, segment(peer, local, 102, 100, 0x10).0);
             let packets = egress(&mut st, now);
             assert_eq!(packets.len(), 1);
-            assert_eq!(Header::parse_whole(&packets[0]).unwrap().payload(&packets[0])[13], 4);
+            assert_eq!(
+                Header::parse_whole(&packets[0])
+                    .unwrap()
+                    .payload(&packets[0])[13],
+                4
+            );
             assert!(!st.by_tuple.contains_key(&(local, peer)));
             let (h, start) = established(&mut st, now, local, peer);
             assert_eq!(st.sock(h).send_slice(b"abcdefgh").unwrap(), 8);
@@ -3949,16 +4041,23 @@ mod tests {
                     assert!(packets.is_empty());
                 } else {
                     assert_eq!(packets.len(), 1);
-                    let t = Header::parse_whole(&packets[0]).unwrap().payload(&packets[0]);
+                    let t = Header::parse_whole(&packets[0])
+                        .unwrap()
+                        .payload(&packets[0]);
                     assert_eq!(u32::from_be_bytes(t[8..12].try_into().unwrap()), 101);
                 }
             }
-            st.ingress(local.ip(), now, segment(peer, local, 101, start.wrapping_add(4), 0x10).0);
+            st.ingress(
+                local.ip(),
+                now,
+                segment(peer, local, 101, start.wrapping_add(4), 0x10).0,
+            );
             assert_eq!(st.get(h).send_queue(), 4);
             drop(st);
             fcx.cancel();
             Ok(())
-        })).unwrap();
+        }))
+        .unwrap();
     }
 
     /// Bytes the peer sent before its FIN were acknowledged, so they stay
@@ -4011,7 +4110,8 @@ mod tests {
             drop(conn);
             fcx.cancel();
             Ok(())
-        })).unwrap();
+        }))
+        .unwrap();
     }
 
     #[test]
@@ -4030,8 +4130,16 @@ mod tests {
                 st.conns.insert(h, Conn::new(local, peer, Side::Client));
                 st.by_tuple.insert((local, peer), h);
                 let packets = egress(&mut st, now);
-                let t = Header::parse_whole(&packets[0]).unwrap().payload(&packets[0]);
-                assert_eq!(TcpPacket::new_unchecked(t).options_summary().unwrap().window_scale, Some(3));
+                let t = Header::parse_whole(&packets[0])
+                    .unwrap()
+                    .payload(&packets[0]);
+                assert_eq!(
+                    TcpPacket::new_unchecked(t)
+                        .options_summary()
+                        .unwrap()
+                        .window_scale,
+                    Some(3)
+                );
                 assert_eq!(t[13] & 16, 0, "a SYN has no ACK");
                 let start = st.conns[&h].iss.unwrap().wrapping_add(1);
                 let mut p = segment(peer, local, 7, start, 0x12).0;
@@ -4049,7 +4157,10 @@ mod tests {
                 let shift = if scaled { 3 } else { 0 };
                 let win = (u16::from_be_bytes([t[14], t[15]]) as u32) << shift;
                 assert_eq!(win, if scaled { BUFFER as u32 } else { 65535 });
-                assert_eq!(u32::from_be_bytes(t[8..12].try_into().unwrap()).wrapping_add(win), 8 + win);
+                assert_eq!(
+                    u32::from_be_bytes(t[8..12].try_into().unwrap()).wrapping_add(win),
+                    8 + win
+                );
                 drop(st);
                 fcx.cancel();
                 Ok(())
@@ -4079,8 +4190,18 @@ mod tests {
                 let start = u32::from_be_bytes(t[4..8].try_into().unwrap()).wrapping_add(1);
                 let origin = irs.wrapping_add(1);
                 let h = st.by_tuple[&(local, peer)];
-                assert_eq!(TcpPacket::new_unchecked(t).options_summary().unwrap().window_scale, Some(3));
-                assert_eq!(u32::from_be_bytes(t[8..12].try_into().unwrap()).wrapping_add(u16::from_be_bytes([t[14], t[15]]) as u32), origin.wrapping_add(65535));
+                assert_eq!(
+                    TcpPacket::new_unchecked(t)
+                        .options_summary()
+                        .unwrap()
+                        .window_scale,
+                    Some(3)
+                );
+                assert_eq!(
+                    u32::from_be_bytes(t[8..12].try_into().unwrap())
+                        .wrapping_add(u16::from_be_bytes([t[14], t[15]]) as u32),
+                    origin.wrapping_add(65535)
+                );
                 st.ingress(local.ip(), now, segment(peer, local, origin, start, 0x10).0);
                 st.sock(h).set_ack_delay(None);
                 assert_eq!(st.sock(h).send_slice(b"abcdefgh").unwrap(), 8);
@@ -4091,7 +4212,11 @@ mod tests {
                 }));
                 let edge = origin.wrapping_add(BUFFER as u32);
                 let t = Header::parse_whole(&sent[0]).unwrap().payload(&sent[0]);
-                assert_eq!(u32::from_be_bytes(t[8..12].try_into().unwrap()).wrapping_add((u16::from_be_bytes([t[14], t[15]]) as u32) << 3), edge);
+                assert_eq!(
+                    u32::from_be_bytes(t[8..12].try_into().unwrap())
+                        .wrapping_add((u16::from_be_bytes([t[14], t[15]]) as u32) << 3),
+                    edge
+                );
                 let expected = pattern(BUFFER, 7);
                 let incoming = |begin: usize, end: usize, ack: u32| {
                     let mut p =
@@ -4149,8 +4274,14 @@ mod tests {
                 assert_eq!(st.sock(h).recv_slice(&mut got).unwrap(), BUFFER);
                 assert_eq!(got, expected);
                 let sent = egress(&mut st, now);
-                let t = Header::parse_whole(sent.last().unwrap()).unwrap().payload(sent.last().unwrap());
-                assert_eq!(u32::from_be_bytes(t[8..12].try_into().unwrap()).wrapping_add((u16::from_be_bytes([t[14], t[15]]) as u32) << 3), edge.wrapping_add(BUFFER as u32));
+                let t = Header::parse_whole(sent.last().unwrap())
+                    .unwrap()
+                    .payload(sent.last().unwrap());
+                assert_eq!(
+                    u32::from_be_bytes(t[8..12].try_into().unwrap())
+                        .wrapping_add((u16::from_be_bytes([t[14], t[15]]) as u32) << 3),
+                    edge.wrapping_add(BUFFER as u32)
+                );
                 drop(st);
                 fcx.cancel();
                 Ok(())
@@ -4250,14 +4381,17 @@ mod tests {
             assert!(!st.by_tuple.contains_key(&(local, peer)));
             let packets = egress(&mut st, now);
             assert_eq!(packets.len(), 1);
-            let t = Header::parse_whole(&packets[0]).unwrap().payload(&packets[0]);
+            let t = Header::parse_whole(&packets[0])
+                .unwrap()
+                .payload(&packets[0]);
             assert_eq!(t[13], 4);
             assert_eq!(u32::from_be_bytes(t[4..8].try_into().unwrap()), 100);
             assert_eq!(transport_checksum(local.ip(), peer.ip(), TCP, t), 0);
             drop(st);
             fcx.cancel();
             Ok(())
-        })).unwrap();
+        }))
+        .unwrap();
     }
 
     #[test]
@@ -4277,8 +4411,15 @@ mod tests {
                 fix_lengths(&mut syn, 20, peer.ip(), local.ip());
                 st.ingress(local.ip(), now, syn);
                 let packets = egress(&mut st, now);
-                let t = Header::parse_whole(&packets[0]).unwrap().payload(&packets[0]);
-                assert!(TcpPacket::new_unchecked(t).options_summary().unwrap().sack_permitted);
+                let t = Header::parse_whole(&packets[0])
+                    .unwrap()
+                    .payload(&packets[0]);
+                assert!(
+                    TcpPacket::new_unchecked(t)
+                        .options_summary()
+                        .unwrap()
+                        .sack_permitted
+                );
                 let start = u32::from_be_bytes(t[4..8].try_into().unwrap()).wrapping_add(1);
                 st.ingress(local.ip(), now, segment(peer, local, 8, start, 16).0);
                 let h = st.by_tuple[&(local, peer)];
@@ -4300,12 +4441,18 @@ mod tests {
                 let packets = egress(&mut st, now);
                 assert_eq!(packets.len(), usize::from(old != 0));
                 if old != 0 {
-                    let t = Header::parse_whole(&packets[0]).unwrap().payload(&packets[0]);
+                    let t = Header::parse_whole(&packets[0])
+                        .unwrap()
+                        .payload(&packets[0]);
                     assert_eq!(&t[((t[12] >> 4) as usize) * 4..], b"abcdefgh");
                 }
                 for i in 0..3 {
                     // Changing nonzero windows still count toward fast retransmit.
-                    st.ingress(local.ip(), now, ack(if win == 456 { win - i } else { win }, true));
+                    st.ingress(
+                        local.ip(),
+                        now,
+                        ack(if win == 456 { win - i } else { win }, true),
+                    );
                     let packets = egress(&mut st, now);
                     let sends = old == 0 && i == 0 || old != 0 && win != 0 && i == 2;
                     assert_eq!(packets.len(), usize::from(sends));
@@ -4320,7 +4467,8 @@ mod tests {
                 drop(st);
                 fcx.cancel();
                 Ok(())
-            })).unwrap();
+            }))
+            .unwrap();
         }
     }
 
@@ -4335,7 +4483,12 @@ mod tests {
             for (offset, keep) in [(-10i32, 10usize), (0, 0), (10, 0), (-20, 20)] {
                 block_on(lab(Seed::from_u64(1), |fcx| async move {
                     let (_raw, side) = pair();
-                    let ep = endpoint_with(&fcx, side, local.ip(), Options::default().buffer(MIN_BUFFER));
+                    let ep = endpoint_with(
+                        &fcx,
+                        side,
+                        local.ip(),
+                        Options::default().buffer(MIN_BUFFER),
+                    );
                     let _listener = ep.listen(local.port())?;
                     let now = smol_now(&fcx);
                     let mut st = ep.shared.state.lock();
@@ -4343,14 +4496,23 @@ mod tests {
                     let origin = irs.wrapping_add(1);
                     st.ingress(local.ip(), now, segment(peer, local, irs, 0, 2).0);
                     let packets = egress(&mut st, now);
-                    let t = Header::parse_whole(&packets[0]).unwrap().payload(&packets[0]);
+                    let t = Header::parse_whole(&packets[0])
+                        .unwrap()
+                        .payload(&packets[0]);
                     let start = u32::from_be_bytes(t[4..8].try_into().unwrap()).wrapping_add(1);
                     st.ingress(local.ip(), now, segment(peer, local, origin, start, 16).0);
                     let h = st.by_tuple[&(local, peer)];
                     st.sock(h).set_ack_delay(None);
                     let expected = pattern(MIN_BUFFER + 49, 7);
                     let incoming = |begin: usize, end: usize, fin: bool| {
-                        let mut p = segment(peer, local, origin.wrapping_add(begin as u32), start, 16 | u8::from(fin)).0;
+                        let mut p = segment(
+                            peer,
+                            local,
+                            origin.wrapping_add(begin as u32),
+                            start,
+                            16 | u8::from(fin),
+                        )
+                        .0;
                         let tcp_at = Header::parse_whole(&p).unwrap().payload.start;
                         p.extend_from_slice(&expected[begin..end]);
                         fix_lengths(&mut p, tcp_at, peer.ip(), local.ip());
@@ -4382,12 +4544,21 @@ mod tests {
                     assert!(!st.conns[&h].fin);
                     let packets = egress(&mut st, now);
                     assert_eq!(packets.len(), 1);
-                    let t = Header::parse_whole(&packets[0]).unwrap().payload(&packets[0]);
-                    assert_eq!(u32::from_be_bytes(t[8..12].try_into().unwrap()), origin.wrapping_add(19));
+                    let t = Header::parse_whole(&packets[0])
+                        .unwrap()
+                        .payload(&packets[0]);
+                    assert_eq!(
+                        u32::from_be_bytes(t[8..12].try_into().unwrap()),
+                        origin.wrapping_add(19)
+                    );
                     assert_eq!(transport_checksum(local.ip(), peer.ip(), TCP, t), 0);
                     let gap_end = edge - keep;
                     for at in (19..gap_end).step_by(1024) {
-                        st.ingress(local.ip(), now, incoming(at, (at + 1024).min(gap_end), false));
+                        st.ingress(
+                            local.ip(),
+                            now,
+                            incoming(at, (at + 1024).min(gap_end), false),
+                        );
                         egress(&mut st, now);
                     }
                     let mut got = vec![0; MIN_BUFFER];
@@ -4399,8 +4570,13 @@ mod tests {
                     st.ingress(local.ip(), now, incoming(edge, begin + 20, true));
                     let packets = egress(&mut st, now);
                     assert_eq!(packets.len(), 1);
-                    let t = Header::parse_whole(&packets[0]).unwrap().payload(&packets[0]);
-                    assert_eq!(u32::from_be_bytes(t[8..12].try_into().unwrap()), origin.wrapping_add((begin + 21) as u32));
+                    let t = Header::parse_whole(&packets[0])
+                        .unwrap()
+                        .payload(&packets[0]);
+                    assert_eq!(
+                        u32::from_be_bytes(t[8..12].try_into().unwrap()),
+                        origin.wrapping_add((begin + 21) as u32)
+                    );
                     assert_eq!(transport_checksum(local.ip(), peer.ip(), TCP, t), 0);
                     let mut tail = [0; 30];
                     if begin + 20 != edge {
@@ -4408,12 +4584,16 @@ mod tests {
                         assert_eq!(len, begin + 20 - edge);
                         assert_eq!(&tail[..len], &expected[edge..begin + 20]);
                     }
-                    assert_eq!(st.sock(h).recv_slice(&mut tail), Err(stcp::RecvError::Finished));
+                    assert_eq!(
+                        st.sock(h).recv_slice(&mut tail),
+                        Err(stcp::RecvError::Finished)
+                    );
                     assert!(st.conns[&h].fin);
                     drop(st);
                     fcx.cancel();
                     Ok(())
-                })).unwrap();
+                }))
+                .unwrap();
             }
         }
     }
@@ -4712,11 +4892,17 @@ mod tests {
                 st.ingress(local.ip(), now, segment(peer(9000), local, 0, 0, 0x02).0);
                 let packets = egress(&mut st, now);
                 assert_eq!(packets.len(), 1);
-                let t = Header::parse_whole(&packets[0]).unwrap().payload(&packets[0]);
+                let t = Header::parse_whole(&packets[0])
+                    .unwrap()
+                    .payload(&packets[0]);
                 assert_eq!(t[13], 0x12);
                 let iss = u32::from_be_bytes(t[4..8].try_into().unwrap());
                 assert_eq!(st.listeners[&80].embryonic.len(), BACKLOG_PER_PEER);
-                st.ingress(local.ip(), now, segment(peer(9000), local, 1, iss.wrapping_add(1), 0x10).0);
+                st.ingress(
+                    local.ip(),
+                    now,
+                    segment(peer(9000), local, 1, iss.wrapping_add(1), 0x10).0,
+                );
                 assert_eq!(st.listeners[&80].ready.len(), 1);
             }
             let accepted = listener.accept(&fcx).await?;
@@ -4726,7 +4912,8 @@ mod tests {
             assert!(handshake.syn.is_none());
             fcx.cancel();
             Ok(())
-        })).unwrap();
+        }))
+        .unwrap();
     }
 
     /// A burst of handshakes that the peer resets in SYN-RECEIVED leaves
@@ -4804,7 +4991,10 @@ mod tests {
                 assert_eq!(l.per_peer.len(), sources as usize);
             }
             // The SYN-ACKs are sent again, unanswered, until the timeout.
-            fcx.spawn(move |fcx| async move { while raw.recv(&fcx).await.is_ok() {} Ok(()) });
+            fcx.spawn(move |fcx| async move {
+                while raw.recv(&fcx).await.is_ok() {}
+                Ok(())
+            });
             fcx.sleep(TIMEOUT + Duration::from_secs(5)).await?;
             let st = server.shared.state.lock();
             let l = &st.listeners[&80];
@@ -4832,7 +5022,8 @@ mod tests {
             let server = endpoint(&fcx, side, "10.0.0.1".parse().unwrap());
             let mut listener = server.listen(80)?;
             let to: SocketAddr = "10.0.0.1:80".parse().unwrap();
-            let from = |n: u32| SocketAddr::new(std::net::Ipv4Addr::from(0x0b00_0000 + n).into(), 4000);
+            let from =
+                |n: u32| SocketAddr::new(std::net::Ipv4Addr::from(0x0b00_0000 + n).into(), 4000);
             let start = fcx.now();
             // Two batches of SYNs, ten seconds apart, each answered.
             let mut isn = HashMap::new();
@@ -4869,17 +5060,24 @@ mod tests {
             raw.send(segment(late, to, 8, isn[&late.ip()].wrapping_add(1), 0x10));
             let conn = listener.accept(&fcx).await?;
             assert_eq!(conn.peer_addr(), late);
-            fcx.spawn(move |fcx| async move { while raw.recv(&fcx).await.is_ok() {} Ok(()) });
+            fcx.spawn(move |fcx| async move {
+                while raw.recv(&fcx).await.is_ok() {}
+                Ok(())
+            });
             // Each batch expires at the configured handshake deadline, the second
             // ten seconds later.
-            fcx.sleep_until(start + Settings::default().handshake_timeout + Duration::from_secs(5)).await?;
+            fcx.sleep_until(start + Settings::default().handshake_timeout + Duration::from_secs(5))
+                .await?;
             {
                 let st = server.shared.state.lock();
                 let (waiting, _, touched) = due(&st);
                 assert_eq!(waiting, 99);
                 assert_eq!(touched, 0);
             }
-            fcx.sleep_until(start + Settings::default().handshake_timeout + Duration::from_secs(15)).await?;
+            fcx.sleep_until(
+                start + Settings::default().handshake_timeout + Duration::from_secs(15),
+            )
+            .await?;
             let st = server.shared.state.lock();
             assert!(st.listeners[&80].embryonic.is_empty());
             assert_eq!(st.next_expiry(), None);
@@ -4910,7 +5108,13 @@ mod tests {
             let _cookies = server.listen(81)?;
             let martians = ["0.0.0.0", "224.0.0.1", "239.1.2.3", "255.255.255.255"];
             // The backlog of port 81 is full.
-            raw.send(segment("10.0.0.9:4000".parse().unwrap(), "10.0.0.1:81".parse().unwrap(), 7, 0, 0x02));
+            raw.send(segment(
+                "10.0.0.9:4000".parse().unwrap(),
+                "10.0.0.1:81".parse().unwrap(),
+                7,
+                0,
+                0x02,
+            ));
             let p = raw.recv(&fcx).await?;
             assert_eq!(Header::parse_whole(&p.0).unwrap().payload(&p.0)[13], 0x12);
             for port in [80, 81] {
@@ -4921,7 +5125,9 @@ mod tests {
                 }
             }
             // Shorter than the second before the first SYN-ACK is sent again.
-            let quiet = fcx.race(Some(fcx.now() + Duration::from_millis(500)), raw.recv(&fcx)).await;
+            let quiet = fcx
+                .race(Some(fcx.now() + Duration::from_millis(500)), raw.recv(&fcx))
+                .await;
             assert!(quiet.is_err(), "an answer: {quiet:?}");
             // A host's address gets the RST and the SYN cookie.
             for port in [80, 81] {
@@ -4946,7 +5152,10 @@ mod tests {
             let (a, b) = pair();
             // Exercise reclamation with a short configured segment lifetime.
             let settings = Settings {
-                socket: SocketSettings { time_wait: smoltcp::time::Duration::from_secs(10), ..SocketSettings::default() },
+                socket: SocketSettings {
+                    time_wait: smoltcp::time::Duration::from_secs(10),
+                    ..SocketSettings::default()
+                },
                 ..Settings::default()
             };
             let options = Options::default().settings(settings);
@@ -5335,7 +5544,8 @@ mod tests {
                 let ip = Header::parse_whole(p).unwrap();
                 let t = ip.payload(p);
                 let to = SocketAddr::new(ip.dst, u16::from_be_bytes([t[2], t[3]]));
-                (to == peer && t[13] == 0x12).then(|| u32::from_be_bytes(t[4..8].try_into().unwrap()))
+                (to == peer && t[13] == 0x12)
+                    .then(|| u32::from_be_bytes(t[4..8].try_into().unwrap()))
             })
             .expect("a SYN-ACK to the peer")
     }
@@ -5356,15 +5566,26 @@ mod tests {
             st.ingress(local.ip(), now, segment(first, local, 101, 0, 0x04).0);
             st.ingress(local.ip(), now, segment(second, local, 500, 0, 0x02).0);
             let isn = syn_ack_to(&egress(&mut st, now), second);
-            st.ingress(local.ip(), now, segment(second, local, 501, isn.wrapping_add(1), 0x10).0);
+            st.ingress(
+                local.ip(),
+                now,
+                segment(second, local, 501, isn.wrapping_add(1), 0x10).0,
+            );
             st.housekeeping();
             for (&h, c) in &st.conns {
                 if let Some(remote) = st.get(h).remote_endpoint() {
-                    assert_eq!(c.remote, SocketAddr::from(remote), "the peer its socket talks to");
+                    assert_eq!(
+                        c.remote,
+                        SocketAddr::from(remote),
+                        "the peer its socket talks to"
+                    );
                 }
             }
             let l = &st.listeners[&80];
-            let h = *l.ready.front().expect("the second peer's connection is ready");
+            let h = *l
+                .ready
+                .front()
+                .expect("the second peer's connection is ready");
             assert_eq!(st.conns[&h].remote, second);
             assert_eq!(st.by_tuple.get(&(local, second)), Some(&h));
             assert_eq!(l.per_peer.get(&second.ip()), Some(&1));
@@ -5391,14 +5612,26 @@ mod tests {
             st.ingress(local.ip(), now, segment(peer, local, 101, 0, 0x04).0);
             st.ingress(local.ip(), now, segment(peer, local, 300, 0, 0x02).0);
             let isn = syn_ack_to(&egress(&mut st, now), peer);
-            st.ingress(local.ip(), now, segment(peer, local, 301, isn.wrapping_add(1), 0x10).0);
+            st.ingress(
+                local.ip(),
+                now,
+                segment(peer, local, 301, isn.wrapping_add(1), 0x10).0,
+            );
             st.housekeeping();
-            let h = *st.listeners[&80].ready.front().expect("the new handshake finished");
+            let h = *st.listeners[&80]
+                .ready
+                .front()
+                .expect("the new handshake finished");
             assert_eq!(st.get(h).state(), TcpState::Established);
             drop(st);
-            let watch = GoneWatch { shared: ep.shared.clone(), handle: h };
+            let watch = GoneWatch {
+                shared: ep.shared.clone(),
+                handle: h,
+            };
             assert!(
-                watch.poll_gone(&mut Context::from_waker(Waker::noop())).is_pending(),
+                watch
+                    .poll_gone(&mut Context::from_waker(Waker::noop()))
+                    .is_pending(),
                 "an established connection is not gone"
             );
             fcx.cancel();
@@ -5422,14 +5655,24 @@ mod tests {
             assert_eq!(st.get(h).state(), TcpState::CloseWait);
             egress(&mut st, now);
             let mut buf = [0; 8];
-            assert_eq!(st.sock(h).recv_slice(&mut buf), Err(stcp::RecvError::Finished));
+            assert_eq!(
+                st.sock(h).recv_slice(&mut buf),
+                Err(stcp::RecvError::Finished)
+            );
             // The peer sends more after its FIN, next in sequence.
             let mut late = segment(peer, local, 102, ack, 0x18).0;
             late.extend_from_slice(b"late");
             fix_lengths(&mut late, 20, peer.ip(), local.ip());
             st.ingress(local.ip(), now, late);
-            assert_eq!(st.get(h).recv_queue(), 0, "bytes after the FIN entered the stream");
-            assert_eq!(st.sock(h).recv_slice(&mut buf), Err(stcp::RecvError::Finished));
+            assert_eq!(
+                st.get(h).recv_queue(),
+                0,
+                "bytes after the FIN entered the stream"
+            );
+            assert_eq!(
+                st.sock(h).recv_slice(&mut buf),
+                Err(stcp::RecvError::Finished)
+            );
             drop(st);
             fcx.cancel();
             Ok(())
@@ -5460,12 +5703,22 @@ mod tests {
             // The connect is abandoned, which drops its connection.
             st.orphan(h, false);
             assert_eq!(st.get(h).state(), TcpState::FinWait1);
-            assert!(egress(&mut st, now).iter().all(|p| {
-                Header::parse_whole(p).unwrap().payload(p)[13] & 1 == 0
-            }));
+            assert!(
+                egress(&mut st, now)
+                    .iter()
+                    .all(|p| { Header::parse_whole(p).unwrap().payload(p)[13] & 1 == 0 })
+            );
             // The peer acknowledges our SYN, not a FIN it never saw.
-            st.ingress(local.ip(), now, segment(peer, local, 8, iss.wrapping_add(1), 0x10).0);
-            assert_eq!(st.get(h).state(), TcpState::FinWait1, "only our SYN was acknowledged");
+            st.ingress(
+                local.ip(),
+                now,
+                segment(peer, local, 8, iss.wrapping_add(1), 0x10).0,
+            );
+            assert_eq!(
+                st.get(h).state(),
+                TcpState::FinWait1,
+                "only our SYN was acknowledged"
+            );
             let sent = egress(&mut st, now);
             assert!(
                 sent.iter().any(|p| {
@@ -5507,9 +5760,16 @@ mod tests {
             // The second peer sends no MSS option: RFC 9293 says 536 then.
             st.ingress(local.ip(), now, segment(second, local, 500, 0, 0x02).0);
             let isn = syn_ack_to(&egress(&mut st, now), second);
-            st.ingress(local.ip(), now, segment(second, local, 501, isn.wrapping_add(1), 0x10).0);
+            st.ingress(
+                local.ip(),
+                now,
+                segment(second, local, 501, isn.wrapping_add(1), 0x10).0,
+            );
             st.housekeeping();
-            let h = *st.listeners[&80].ready.front().expect("the second connection");
+            let h = *st.listeners[&80]
+                .ready
+                .front()
+                .expect("the second connection");
             assert_eq!(h, spare[0], "the spare socket served the second peer");
             assert_eq!(st.sock(h).send_slice(&[0x5a; 2000]).unwrap(), 2000);
             let sent = egress(&mut st, now);
@@ -5522,13 +5782,14 @@ mod tests {
                 .max()
                 .unwrap();
             assert!(largest > 0);
-            assert!(largest <= 536, "sent a {largest}-byte segment to a peer that offered no MSS");
+            assert!(
+                largest <= 536,
+                "sent a {largest}-byte segment to a peer that offered no MSS"
+            );
             drop(st);
             fcx.cancel();
             Ok(())
         }))
         .unwrap();
     }
-}
-
 }

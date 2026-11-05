@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use http::{HeaderValue, Request, Response, StatusCode};
 
-use fictionet::stdlib::services::serve::ConnInfo;
 use fictionet::stdlib::network::Connection;
+use fictionet::stdlib::services::serve::ConnInfo;
 use fictionet::sync::Mutex;
 use fictionet::time::Instant;
 use fictionet::{Cx, Error};
@@ -63,7 +63,6 @@ pub enum Reply {
     Now(Response<Body>),
     /// Work that makes the response.
     Later(Later),
-
 }
 
 /// Answers HTTP requests. See the [module docs](super).

@@ -1,9 +1,9 @@
 //! The web fixture for real proxy and upload requests.
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
-use fictionet_extras::web_world;
 use fictionet::Result;
 use fictionet::stdlib::web;
+use fictionet_extras::web_world;
 use rustls::pki_types::PrivateKeyDer;
 pub fn world(
     fcx: &fictionet::Cx,

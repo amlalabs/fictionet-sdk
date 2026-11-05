@@ -15,7 +15,6 @@
 //! server, and a PLC, with DNS names for each:
 //!
 //! ```
-//! # fictionet::cfg_std! {
 //! # use std::sync::Arc;
 //! # use fictionet::{Attachments, Cx, Result};
 //! # use fictionet::stdlib::{web::httpd, world::net::{Host, Net}, services::serve};
@@ -38,7 +37,6 @@
 //!     .host("plc1", |h| h.at("10.30.0.5".parse::<std::net::Ipv4Addr>().unwrap()).tcp(502, plant, || Plc))
 //!     .start(&fcx, attachments)?;
 //! # Ok(())
-//! # }
 //! # }
 //! ```
 //!
@@ -125,10 +123,8 @@ use fictionet::stdlib::network::{icmp, tcp};
 use fictionet::stdlib::services::serve::{Budget, ServeOptions, Service};
 use fictionet::{Attachments, Cx, End, Error, Interface, InterfaceExt};
 
-fictionet::cfg_std! {
 #[cfg(doc)]
 use fictionet::stdlib::web::httpd;
-}
 
 mod addresses;
 mod attachments;
@@ -814,14 +810,13 @@ async fn unreachable(
     Ok(())
 }
 
-fictionet::cfg_std! {
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::attachments::answered_closed;
-    use fictionet::stdlib::network::{ip, udp};
-    use fictionet::stdlib::network::ConnectionExt;
+    use super::*;
     use crate::stdlib::services::serve::ConnInfo;
+    use fictionet::stdlib::network::ConnectionExt;
+    use fictionet::stdlib::network::{ip, udp};
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1083,7 +1078,10 @@ mod tests {
 
         fn answer(&self) -> Option<Box<dyn tcp::Answer>> {
             Some(Box::new(|syn: &tcp::Syn<'_>| {
-                if syn.options.contains(&tcp::TcpOption::Unknown { kind: 253, data: vec![1] }) {
+                if syn.options.contains(&tcp::TcpOption::Unknown {
+                    kind: 253,
+                    data: vec![1],
+                }) {
                     tcp::SynAnswer::Refuse(vec![tcp::TcpOption::Unknown {
                         kind: 253,
                         data: vec![0],
@@ -1110,7 +1108,9 @@ mod tests {
                 let (attacher, attachments) = fictionet::attachments();
                 Net::new()
                     .ipv4_only()
-                    .host("svc", |h| h.at(server).port_server(22, Answers { from: from.clone() }))
+                    .host("svc", |h| {
+                        h.at(server).port_server(22, Answers { from: from.clone() })
+                    })
                     .route("internet", "198.51.100.0/24".parse()?)
                     .start(&fcx, attachments)?;
                 let mut internet = attacher.attach("internet")?;
@@ -1137,7 +1137,10 @@ mod tests {
                 let answered = tcp::options(&syn_ack).unwrap();
                 assert_eq!(
                     answered.last(),
-                    Some(&tcp::TcpOption::Unknown { kind: 253, data: vec![9] })
+                    Some(&tcp::TcpOption::Unknown {
+                        kind: 253,
+                        data: vec![9]
+                    })
                 );
                 let iss = u32::from_be_bytes(syn_ack[4..8].try_into().unwrap());
                 internet.send(syn(4000, 101, iss.wrapping_add(1), 0x10, &[]));
@@ -1152,7 +1155,10 @@ mod tests {
                 assert_eq!(refused[13] & 0x06, 0x04, "a RST");
                 assert_eq!(
                     tcp::options(&refused),
-                    Ok(vec![tcp::TcpOption::Unknown { kind: 253, data: vec![0] }])
+                    Ok(vec![tcp::TcpOption::Unknown {
+                        kind: 253,
+                        data: vec![0]
+                    }])
                 );
                 fcx.sleep(Duration::from_secs(1)).await?;
                 let from = from.lock();
@@ -1160,11 +1166,21 @@ mod tests {
                 assert_eq!(from[0].peer, Some(SocketAddr::new(client.into(), 4000)));
                 assert_eq!(
                     from[0].handshake.as_ref().unwrap().syn.as_deref(),
-                    Some(&[tcp::TcpOption::Unknown { kind: 253, data: vec![2] }][..])
+                    Some(
+                        &[tcp::TcpOption::Unknown {
+                            kind: 253,
+                            data: vec![2]
+                        }][..]
+                    )
                 );
                 assert_eq!(
                     from[0].handshake.as_ref().unwrap().syn_ack.as_deref(),
-                    Some(&[tcp::TcpOption::Unknown { kind: 253, data: vec![9] }][..])
+                    Some(
+                        &[tcp::TcpOption::Unknown {
+                            kind: 253,
+                            data: vec![9]
+                        }][..]
+                    )
                 );
                 drop(from);
                 fcx.cancel();
@@ -1306,8 +1322,13 @@ mod tests {
             let dst: IpAddr = dst.parse().unwrap();
             let packet = |u: &[u8]| ip::packet(src, dst, PROTO_UDP, u).0;
             let mut u = [0; 10];
-            udp::encode(SocketAddr::new(src, 5000), SocketAddr::new(dst, 9), b"hi", &mut u)
-                .unwrap();
+            udp::encode(
+                SocketAddr::new(src, 5000),
+                SocketAddr::new(dst, 9),
+                b"hi",
+                &mut u,
+            )
+            .unwrap();
             let mut trailing = u.to_vec();
             trailing.extend_from_slice(b"outside UDP");
             assert!(answered_closed(&packet(&trailing), |_, _| false));
@@ -1331,9 +1352,6 @@ mod tests {
             }
         }
     }
-
-}
-
 }
 
 #[cfg(test)]

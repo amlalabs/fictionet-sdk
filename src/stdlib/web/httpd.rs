@@ -104,10 +104,10 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use fictionet::RaceError;
-use fictionet::stdlib::services::serve::ConnInfo;
 use fictionet::stdlib::network::Connection;
 use fictionet::stdlib::network::ConnectionExt;
 use fictionet::stdlib::protocols::http1;
+use fictionet::stdlib::services::serve::ConnInfo;
 use fictionet::stdlib::services::serve::Prefixed;
 use fictionet::stdlib::services::serve::{self, Budget, ServeOptions};
 use fictionet::{Cancelled, Cx};
@@ -128,8 +128,6 @@ pub use http2::{Http2, Timer as Http2Timer};
 pub use native::{Http1, Timer as Http1Timer};
 pub use response::{date_header, http_date};
 pub use sites::{Routing, Server, Target, VHost, VirtualHosts, normalize, request_host};
-
-
 
 /// How receipt of a request ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -67,15 +67,11 @@ use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddr
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::pad_to_4 as padded;
-use fictionet::stdlib::codec::{Prefixed, Wire, be16, be32};
+use fictionet::stdlib::codec::{Prefixed, Wire, be16, be32, crc32};
 
 use fictionet::stdlib::codec;
 #[cfg(test)]
 use fictionet::stdlib::codec::Decode;
-
-/// Compatibility re-export of [`codec::crc32`](fictionet::stdlib::codec::crc32()), the
-/// CRC-32 that FINGERPRINT uses.
-pub use fictionet::stdlib::codec::crc32;
 
 /// The UDP and TCP port STUN servers listen on.
 pub const PORT: u16 = 3478;

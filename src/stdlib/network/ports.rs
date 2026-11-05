@@ -289,7 +289,6 @@ impl<I: Interface> Ports<I> {
     }
 }
 
-fictionet::cfg_std! {
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,6 +318,4 @@ mod tests {
             Ok(())
         })).unwrap();
     }
-}
-
 }

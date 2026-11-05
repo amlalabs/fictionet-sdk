@@ -68,19 +68,15 @@ use std::fmt;
 
 use fictionet::stdlib::codec::{Decode, Step, Wire, ber};
 
-/// Compatibility re-export of [`codec::write_checked`](fictionet::stdlib::codec::write_checked).
-pub use fictionet::stdlib::codec::write_checked;
-
 /// Implements DER [`Wire`] parsing and checked writing for a protocol item.
 ///
-/// Pass the local ASN.1 module path, item and error types, the refusal value,
+/// Pass the item and error types, the refusal value,
 /// and optional docs for each method. Omitting docs uses the standard DER
 /// refusals. The item supplies `encode` and `decode` methods.
-/// The module path keeps copied protocol modules independent of this crate.
 #[macro_export]
 macro_rules! der_wire {
-    ($asn1:ident, impl Wire for $item:ty, $error:ty, $unwritable:expr) => {
-        fictionet::der_wire!($asn1, impl Wire for $item, $error, $unwritable, [
+    (impl Wire for $item:ty, $error:ty, $unwritable:expr) => {
+        fictionet::der_wire!(impl Wire for $item, $error, $unwritable, [
             /// Reads one complete DER value. Refuses malformed fields,
             /// trailing bytes, and exceeded limits. See this type's docs.
         ], [
@@ -89,7 +85,7 @@ macro_rules! der_wire {
             /// Leaves the destination unchanged on error.
         ]);
     };
-    ($asn1:ident, impl Wire for $item:ty, $error:ty, $unwritable:expr,
+    (impl Wire for $item:ty, $error:ty, $unwritable:expr,
      [$(#[$parse:meta])*], [$(#[$write:meta])*]) => {
         impl fictionet::stdlib::codec::Wire for $item {
             type ParseError = $error;
@@ -102,7 +98,7 @@ macro_rules! der_wire {
 
             $(#[$write])*
             fn write(&self, out: &mut Vec<u8>) -> Result<(), $error> {
-                $asn1::write_checked(self, Self::encode, Self::decode, $unwritable, out)
+                fictionet::stdlib::codec::write_checked(self, Self::encode, Self::decode, $unwritable, out)
             }
         }
     };

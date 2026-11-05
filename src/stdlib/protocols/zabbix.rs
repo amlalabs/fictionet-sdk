@@ -839,50 +839,10 @@ impl Scanner<'_> {
     /// A string starting at the opening quote, decoded. The input is
     /// already known to be UTF-8, so the lexer finds no invalid UTF-8.
     fn string(&mut self) -> Result<String, Error> {
-        let (text, end) =
-            json_syntax::read_string(self.b, self.i).map_err(|error| self.string_error(error))?;
+        let (text, end) = json_syntax::read_string(self.b, self.i)
+            .map_err(|error| Error::Syntax(error.offset()))?;
         self.i = end;
         Ok(text)
-    }
-
-    fn string_error(&self, error: json_syntax::Error) -> Error {
-        let offset = match error {
-            json_syntax::Error::InvalidUtf8(_) => return Error::Utf8,
-            json_syntax::Error::LoneSurrogate(at) => {
-                // The lexer points to the first backslash. Zabbix points
-                // past the escape, or past both when the second is not low.
-                let high = matches!(self.b[at + 3], b'8'..=b'9' | b'a' | b'A' | b'b' | b'B');
-                at + if high && self.b.get(at + 6..at + 8) == Some(b"\\u") {
-                    12
-                } else {
-                    6
-                }
-            }
-            json_syntax::Error::UnexpectedEnd(at) => {
-                // For a high surrogate followed only by a backslash, the
-                // lexer consumes that backslash. Zabbix leaves it unread.
-                let trailing_high = at
-                    .checked_sub(7)
-                    .filter(|&start| start > self.i)
-                    .is_some_and(|start| {
-                        let tail = &self.b[start..at];
-                        tail.starts_with(b"\\u")
-                            && matches!(tail[2], b'd' | b'D')
-                            && matches!(tail[3], b'8'..=b'9' | b'a' | b'A' | b'b' | b'B')
-                            && tail[6] == b'\\'
-                            && self.b[self.i + 1..start]
-                                .iter()
-                                .rev()
-                                .take_while(|&&c| c == b'\\')
-                                .count()
-                                % 2
-                                == 0
-                    });
-                at - usize::from(trailing_high)
-            }
-            _ => error.offset(),
-        };
-        Error::Syntax(offset)
     }
 }
 
@@ -1282,18 +1242,18 @@ mod tests {
             (b"\"abc\\", 5),
             (br#""\q""#, 2),
             (br#""\u12g4""#, 5),
-            (br#""\ud800""#, 7),
-            (br#""\ud800\n""#, 7),
-            (br#""\ud800\"#, 7),
+            (br#""\ud800""#, 1),
+            (br#""\ud800\n""#, 1),
+            (br#""\ud800\"#, 8),
             (br#""\ud800\u"#, 9),
-            (br#""\ud800\u0041""#, 13),
-            (br#""\ud800\udbff""#, 13),
+            (br#""\ud800\u0041""#, 1),
+            (br#""\ud800\udbff""#, 1),
             (br#""\ud800\u12g4""#, 11),
-            (br#""\udc00""#, 7),
-            (br#""\udfff\udc00""#, 7),
+            (br#""\udc00""#, 1),
+            (br#""\udfff\udc00""#, 1),
             (br#""\\ud800\"#, 9),
-            (br#""\\\ud800\"#, 9),
-            (br#""a\uD800\"#, 8),
+            (br#""\\\ud800\"#, 10),
+            (br#""a\uD800\"#, 9),
             (br#""\ud800\udc00\"#, 14),
             (b"\"a\x01\"", 2),
         ] {
@@ -1342,10 +1302,9 @@ mod tests {
         for end in 0..token.len() {
             let mut input = prefix.to_vec();
             input.extend_from_slice(&token[..end]);
-            let offset = if end == 8 { 7 } else { end };
             assert_eq!(
                 Message::parse(&input),
-                Err(Error::Syntax(prefix.len() + offset)),
+                Err(Error::Syntax(prefix.len() + end)),
                 "{end} bytes"
             );
         }

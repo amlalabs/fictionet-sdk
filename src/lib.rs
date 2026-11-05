@@ -378,14 +378,6 @@ macro_rules! cfg_tokio {
     ($($enabled:tt)*) => {};
 }
 
-/// Includes the standard library branch. Fictionet always uses `std`.
-#[macro_export]
-macro_rules! cfg_std {
-    (items { $($enabled:tt)* } else { $($disabled:tt)* }) => { $($enabled)* };
-    ({ $($enabled:tt)* } else { $($disabled:tt)* }) => {{ $($enabled)* }};
-    ($($enabled:tt)*) => { $($enabled)* };
-}
-
 /// Includes tokens when the SDK's `web-proxy` feature is enabled.
 ///
 /// An optional `else` block supplies the tokens for builds without the

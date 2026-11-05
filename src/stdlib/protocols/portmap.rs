@@ -1162,8 +1162,8 @@ fn string(w: &mut Writer, s: &str) -> Result<(), Error> {
 #[cfg(any(test, fuzzing))]
 #[doc(hidden)]
 pub mod harness {
-    use super::{PmapResult, Request, RpcbResult, format_uaddr, parse_uaddr};
-    use fictionet::stdlib::protocols::onc_rpc::{Call, PMAP_PROGRAM};
+    use super::{PMAP_PROGRAM, PmapResult, Request, RpcbResult, format_uaddr, parse_uaddr};
+    use fictionet::stdlib::protocols::onc_rpc::Call;
 
     /// Reads any bytes as the arguments of every procedure of versions 1 to
     /// 5, and as the results of every procedure. Whatever reads is written

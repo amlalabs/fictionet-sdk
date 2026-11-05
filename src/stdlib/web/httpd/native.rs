@@ -12,21 +12,16 @@ use http_body::{Body as _, Frame};
 
 use fictionet::stdlib::codec::{Decode, Step};
 use fictionet::stdlib::protocols::http1::{self, Event as H1, RequestHead};
-use fictionet::stdlib::services::serve::{
-    self, Driver, Flow, Pending, PendingDriver, WakeHandle,
-};
+use fictionet::stdlib::services::serve::{self, Driver, Flow, Pending, PendingDriver, WakeHandle};
 use fictionet::time::Instant;
 use fictionet::{Cx, Error};
 
 use super::body::Inner;
 use super::handlers::status_only;
-use super::response::{
-    Asked, ResponsePolicy, error_response, head_held, request_held,
-};
+use super::response::{Asked, ResponsePolicy, error_response, head_held, request_held};
 use super::sites::no_host;
 use super::{
-    Body, Exchange, Handler, Later, Limits, PIECE, Reply, Reset, UpgradeHandler,
-    date_header,
+    Body, Exchange, Handler, Later, Limits, PIECE, Reply, Reset, UpgradeHandler, date_header,
 };
 
 // ---------------------------------------------------------------------------
@@ -83,7 +78,6 @@ impl Http1 {
         self.date = Some(start);
         self
     }
-
 
     fn respond(&mut self, driver: &mut Driver<'_, http1::RequestEvents, Timer>) -> Flow {
         let held = self.body.capacity();
@@ -148,7 +142,6 @@ impl Http1 {
         let (work, response) = match reply {
             Reply::Now(response) => (None, Some(response)),
             Reply::Later(work) => (Some(work), None),
-
         };
         let streaming = Streaming::new(work, response, version, wants, close)
             .dated(self.date, now)
@@ -367,7 +360,6 @@ impl serve::Service for Http1 {
                 self.too_big = false;
             }
             H1::Body(bytes) => {
-
                 if self.body.len() + bytes.len() > self.opts.body {
                     self.too_big = true;
                 } else {
@@ -402,8 +394,7 @@ impl serve::Service for Http1 {
     }
 
     fn held(&self) -> usize {
-        self.body.capacity()
-            + self.head.as_ref().map_or(0, head_held)
+        self.body.capacity() + self.head.as_ref().map_or(0, head_held)
     }
 
     fn on_fail(
@@ -413,7 +404,6 @@ impl serve::Service for Http1 {
         driver: &mut Driver<'_, http1::RequestEvents, Timer>,
     ) -> Result<(), Infallible> {
         if self.head.is_some() {
-
             // The body was cut off: the handler still sees what came, as a
             // body that ends in an error. Of the unread bytes, only body
             // data counts: chunk framing and later requests are not body.
@@ -436,27 +426,25 @@ impl serve::Service for Http1 {
             // with `400` and `no_host`, then closes the connection.
             self.started = driver.now();
 
-                let mut unread = &driver.unread()[head_end..];
-                let mut received_bytes = 0;
-                loop {
-                    match decoder.decode(unread, false) {
-                        Ok(Step::Item(H1::Body(bytes), n)) => {
-
-                            received_bytes += bytes.len();
-                            unread = &unread[n..];
-                        }
-                        Ok(Step::Skip(n)) => unread = &unread[n..],
-                        Ok(Step::Item(H1::Done, _)) => break,
-                        _ => {
-                            let len = decoder.pending_body_len(unread.len());
-
-                            received_bytes += len;
-                            break;
-                        }
+            let mut unread = &driver.unread()[head_end..];
+            let mut received_bytes = 0;
+            loop {
+                match decoder.decode(unread, false) {
+                    Ok(Step::Item(H1::Body(bytes), n)) => {
+                        received_bytes += bytes.len();
+                        unread = &unread[n..];
                     }
-                };
-                self.too_big = received_bytes > self.opts.body;
+                    Ok(Step::Skip(n)) => unread = &unread[n..],
+                    Ok(Step::Item(H1::Done, _)) => break,
+                    _ => {
+                        let len = decoder.pending_body_len(unread.len());
 
+                        received_bytes += len;
+                        break;
+                    }
+                }
+            }
+            self.too_big = received_bytes > self.opts.body;
 
             self.head = Some(head);
             self.dispatch(driver, Body::empty(), true, 0);
@@ -475,7 +463,6 @@ impl serve::Service for Http1 {
         write_simple(driver.reply(), Version::HTTP_11, status, date);
         Ok(())
     }
-
 }
 
 mod serve_fail {
@@ -568,12 +555,10 @@ impl Streaming {
         }
     }
 
-
     /// Hands the driver `bytes`, of which `body` are body bytes.
     fn piece(&mut self, bytes: Vec<u8>, _body: usize) -> Poll<Option<Result<Vec<u8>, Error>>> {
         Poll::Ready(Some(Ok(bytes)))
     }
-
 
     /// `piece` as it goes on the wire: a chunk, when chunked.
     fn frame(&self, piece: &[u8], out: &mut Vec<u8>) {
@@ -610,17 +595,14 @@ impl Pending for Streaming {
                     Poll::Ready(Ok(r)) => r,
                     // An error on the connection's work closes it unanswered.
                     Poll::Ready(Err(e)) if e.is::<Reset>() => return Poll::Ready(Some(Err(e))),
-                    Poll::Ready(Err(e)) => {
-                        error_response(&e)
-                    }
+                    Poll::Ready(Err(e)) => error_response(&e),
                 };
                 self.making = None;
                 self.request_held = 0;
                 self.response = Some(response);
             }
             if let Some(response) = self.response.take() {
-                let (parts, body) =
-                    response.into_parts();
+                let (parts, body) = response.into_parts();
                 let now = driver.fcx().map_or(self.asked, Cx::now);
                 let policy = ResponsePolicy::new(
                     &parts,
@@ -695,7 +677,6 @@ impl Pending for Streaming {
         }
     }
 
-
     fn held(&self) -> usize {
         let response = self.response.as_ref().map_or(0, |r| r.body().full_len());
         let body = self.body.as_ref().map_or(0, Body::full_len);
@@ -706,7 +687,7 @@ impl Pending for Streaming {
 #[cfg(test)]
 mod router_tests {
     use super::*;
-    
+
     use fictionet::sync::Mutex;
 
     #[test]
@@ -730,7 +711,7 @@ mod router_tests {
         }
         struct Start(Option<Checked>);
         impl Service for Start {
-    type Timer = ();
+            type Timer = ();
             type Decoder = Lines;
             type State = ();
             type Error = Infallible;
@@ -771,10 +752,7 @@ mod router_tests {
             (),
         );
         harness.open().unwrap();
-        assert_eq!(
-            &held.lock()[..3],
-            &[3 * PIECE, 3 * PIECE, 0]
-        );
+        assert_eq!(&held.lock()[..3], &[3 * PIECE, 3 * PIECE, 0]);
         assert_eq!(held.lock().last(), Some(&0));
     }
 }

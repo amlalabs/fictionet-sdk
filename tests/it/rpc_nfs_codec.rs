@@ -10,21 +10,19 @@ use onc_rpc::{Accept, Body, Message, Reply};
 const RECORD_LIMIT: usize = 4096;
 
 #[test]
-fn portmap_procedure_compatibility() {
-    use onc_rpc::procedure as compat;
+fn portmap_procedure_numbers() {
     use portmap::procedure;
 
-    for (canonical, alias, expected) in [
-        (procedure::NULL, compat::NULL, 0),
-        (procedure::SET, compat::SET, 1),
-        (procedure::UNSET, compat::UNSET, 2),
-        (procedure::GETPORT, compat::GETPORT, 3),
-        (procedure::GETADDR, compat::GETADDR, 3),
-        (procedure::DUMP, compat::DUMP, 4),
-        (procedure::CALLIT, compat::CALLIT, 5),
+    for (procedure, expected) in [
+        (procedure::NULL, 0),
+        (procedure::SET, 1),
+        (procedure::UNSET, 2),
+        (procedure::GETPORT, 3),
+        (procedure::GETADDR, 3),
+        (procedure::DUMP, 4),
+        (procedure::CALLIT, 5),
     ] {
-        assert_eq!(canonical, expected);
-        assert_eq!(alias, canonical);
+        assert_eq!(procedure, expected);
     }
 }
 

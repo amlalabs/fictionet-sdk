@@ -487,7 +487,7 @@ mod tests {
     }
 
     #[test]
-    fn uncompressed_name_limits_and_compatibility() {
+    fn uncompressed_name_limits() {
         for b in 0..=255u8 {
             let name = [b; NAME_LEN];
             assert_eq!(decode_first_level(&encode_first_level(&name)), Some(name));
@@ -503,9 +503,6 @@ mod tests {
         assert_eq!(&out[..prefix.len()], &prefix);
         assert_eq!(&out[prefix.len() + 1..prefix.len() + 33], FRED);
         assert_eq!(Name::parse(&out[prefix.len()..]).unwrap().scope, scope);
-        let mut legacy = prefix.clone();
-        fictionet::stdlib::protocols::nbns::write_name(&mut legacy, &name, &scope).unwrap();
-        assert_eq!(legacy, out);
 
         scope.last_mut().unwrap().push(b'y');
         for invalid in [vec![Vec::new()], vec![vec![0; MAX_LABEL + 1]], scope] {
@@ -513,13 +510,6 @@ mod tests {
             assert_eq!(
                 write_name(&mut out, &name, &invalid),
                 Err(Error::Unwritable)
-            );
-            assert_eq!(out, prefix);
-            let result: Result<(), fictionet::stdlib::protocols::nbns::Error> =
-                fictionet::stdlib::protocols::nbns::write_name(&mut out, &name, &invalid);
-            assert_eq!(
-                result,
-                Err(fictionet::stdlib::protocols::nbns::Error::Unwritable)
             );
             assert_eq!(out, prefix);
         }

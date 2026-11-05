@@ -692,7 +692,6 @@ impl Site {
         }
     }
 
-
     /// Serves the site at `addr`, for example the address it has on the
     /// real internet. `addr` may be an [`Ipv4Addr`], an [`Ipv6Addr`] or an
     /// [`IpAddr`], and sets the site's address of that family. A site that

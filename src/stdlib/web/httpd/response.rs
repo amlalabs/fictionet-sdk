@@ -164,4 +164,3 @@ pub fn http_date(secs: u64) -> String {
         rest % 60
     )
 }
-

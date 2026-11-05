@@ -1735,7 +1735,6 @@ pub fn hop(packet: &mut [u8]) -> Hop {
     }
 }
 
-fictionet::cfg_std! {
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1815,10 +1814,20 @@ mod tests {
             }
         }
         for address in [
-            "104.18.0.1", "104.19.255.254", "2606:4700:100::1",
-            "172.15.255.255", "172.32.0.0", "100.63.255.255", "100.128.0.0",
-            "169.253.255.255", "169.255.0.0", "fe7f:ffff::1", "fec0::1",
-            "fbff::1", "fe00::1", "::ffff:104.18.0.1",
+            "104.18.0.1",
+            "104.19.255.254",
+            "2606:4700:100::1",
+            "172.15.255.255",
+            "172.32.0.0",
+            "100.63.255.255",
+            "100.128.0.0",
+            "169.253.255.255",
+            "169.255.0.0",
+            "fe7f:ffff::1",
+            "fec0::1",
+            "fbff::1",
+            "fe00::1",
+            "::ffff:104.18.0.1",
         ] {
             let address = address.parse().unwrap();
             assert!(!reserved_address(address), "{address}");
@@ -2484,7 +2493,10 @@ mod tests {
             );
         }
         for split in (0..data.len()).step_by(2) {
-            assert_eq!(fold(sum(sum(0, &data[..split]), &data[split..1999])), checksum(&data[..1999]));
+            assert_eq!(
+                fold(sum(sum(0, &data[..split]), &data[split..1999])),
+                checksum(&data[..1999])
+            );
         }
         assert_eq!(
             checksum(&[0xff; 65_536]),
@@ -2659,6 +2671,4 @@ mod tests {
         assert!(!udp_checksum_ok(v6a, v6b, &u));
         assert!(!udp_checksum_ok(v4a, v4b, &u));
     }
-}
-
 }

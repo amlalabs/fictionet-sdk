@@ -344,23 +344,21 @@ fn der_validation_preserves_virtual_wrapper_sizes() {
 }
 
 #[test]
-fn checked_writer_imports_are_compatible() {
+fn checked_writer_appends_to_destination() {
     use fictionet::stdlib::codec::write_checked;
 
-    for write in [write_checked, asn1::write_checked] {
-        let mut out = vec![42];
-        assert_eq!(
-            write(
-                &7u16,
-                |v: &u16| Ok(vec![*v as u8]),
-                |b: &[u8]| Ok(u16::from(b[0])),
-                asn1::Error::Integer,
-                &mut out,
-            ),
-            Ok(())
-        );
-        assert_eq!(out, [42, 7]);
-    }
+    let mut out = vec![42];
+    assert_eq!(
+        write_checked(
+            &7u16,
+            |v: &u16| Ok(vec![*v as u8]),
+            |b: &[u8]| Ok(u16::from(b[0])),
+            asn1::Error::Integer,
+            &mut out,
+        ),
+        Ok(())
+    );
+    assert_eq!(out, [42, 7]);
 }
 
 fn round_trip<D: Decode>(make: impl Fn() -> D, bytes: &[u8], expected: &[D::Item])

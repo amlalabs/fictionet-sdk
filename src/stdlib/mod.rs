@@ -389,7 +389,7 @@ pub mod network;
 pub mod protocols;
 pub mod services;
 pub mod test_support;
-fictionet::cfg_std! { pub mod web; }
+pub mod web;
 pub mod world;
 
 /// Opt-in packet dissection built on the stdlib decoders.

@@ -16,16 +16,12 @@ use http_body::Body as _;
 use fictionet::stdlib::codec::{Fail, Wire};
 use fictionet::stdlib::protocols::hpack;
 use fictionet::stdlib::protocols::http2::{self as wire, ErrorCode, Frame, Input, Inputs};
-use fictionet::stdlib::services::serve::{
-    self, Done, Driver, Ended, Flow, Pending, PendingDriver,
-};
+use fictionet::stdlib::services::serve::{self, Done, Driver, Ended, Flow, Pending, PendingDriver};
 use fictionet::sync::Mutex;
 use fictionet::time::Instant;
 use fictionet::{Cx, Error};
 
-use super::response::{
-    Asked, ResponsePolicy, error_response, request_held,
-};
+use super::response::{Asked, ResponsePolicy, error_response, request_held};
 use super::{Body, Exchange, Handler, Later, Limits, Received, Reply, Reset, text};
 
 /// HTTP/2 stream deadline.
@@ -145,7 +141,6 @@ impl Http2 {
         }
     }
 
-
     /// Begins graceful shutdown on the next driver wake or input.
     /// A GOAWAY and PING round trip establishes which requests were in flight;
     /// those requests finish before the connection closes.
@@ -258,18 +253,21 @@ impl Http2 {
                 &mut Exchange::new(driver.now(), driver.entropy(), driver.conn()),
             ),
             Received::TooLarge => Reply::Now(text(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "The request body is too large.\n",
-                )),
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "The request body is too large.\n",
+            )),
             Received::Budget => Reply::Now(text(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "The server cannot hold this request now.\n",
-                )),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "The server cannot hold this request now.\n",
+            )),
             Received::Timeout => Reply::Now(text(
-                    StatusCode::REQUEST_TIMEOUT,
-                    "The request body took too long.\n",
-                )),
-            Received::CutOff => Reply::Now(text(StatusCode::BAD_REQUEST, "The request body was cut off.\n")),
+                StatusCode::REQUEST_TIMEOUT,
+                "The request body took too long.\n",
+            )),
+            Received::CutOff => Reply::Now(text(
+                StatusCode::BAD_REQUEST,
+                "The request body was cut off.\n",
+            )),
         };
         let (work, response) = match reply {
             Reply::Now(response) => {
@@ -284,7 +282,6 @@ impl Http2 {
                 (None, Some(response))
             }
             Reply::Later(work) => (Some(work), None),
-
         };
         driver.defer_keyed(
             u64::from(id),
@@ -420,8 +417,6 @@ impl Http2 {
             request_held(&request) + std::mem::size_of::<Stream>(),
             0,
         ) {
-
-
             return self.reset(id, ErrorCode::RefusedStream, driver);
         }
         request.extensions_mut().insert(driver.conn().clone());
@@ -530,7 +525,11 @@ impl Http2 {
         Ok(())
     }
 
-    fn frame(&mut self, frame: Frame, driver: &mut Driver<'_, Inputs, Timer>) -> Result<(), wire::Error> {
+    fn frame(
+        &mut self,
+        frame: Frame,
+        driver: &mut Driver<'_, Inputs, Timer>,
+    ) -> Result<(), wire::Error> {
         if !self.received_settings && !matches!(&frame, Frame::Settings(s) if s.flags & 1 == 0) {
             return Err(problem(
                 ErrorCode::ProtocolError,
@@ -717,7 +716,11 @@ impl serve::Service for Http2 {
         Inputs::for_server(wire::DEFAULT_FRAME_SIZE)
     }
 
-    fn on_open(&mut self, _: &(), driver: &mut Driver<'_, Inputs, Timer>) -> Result<Flow, Infallible> {
+    fn on_open(
+        &mut self,
+        _: &(),
+        driver: &mut Driver<'_, Inputs, Timer>,
+    ) -> Result<Flow, Infallible> {
         write(
             &wire::Settings {
                 flags: 0,
@@ -810,7 +813,11 @@ impl serve::Service for Http2 {
         Ok(self.flow(driver))
     }
 
-    fn on_wake(&mut self, _: &(), driver: &mut Driver<'_, Inputs, Timer>) -> Result<Flow, Infallible> {
+    fn on_wake(
+        &mut self,
+        _: &(),
+        driver: &mut Driver<'_, Inputs, Timer>,
+    ) -> Result<Flow, Infallible> {
         Ok(self.flow(driver))
     }
 
@@ -1090,9 +1097,9 @@ fn response_held(response: &Response<Body>) -> usize {
 
 fn over_budget() -> Response<Body> {
     text(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "The server cannot hold this response now.\n",
-        )
+        StatusCode::SERVICE_UNAVAILABLE,
+        "The server cannot hold this response now.\n",
+    )
 }
 
 type Making = Pin<Box<dyn Future<Output = Result<Response<Body>, Error>> + Send>>;
@@ -1115,8 +1122,6 @@ struct Sending {
 }
 
 impl Sending {
-
-
     fn headers(&self, fields: &[hpack::Field], end: bool) -> Result<Vec<u8>, Error> {
         let mut block = Vec::new();
         // A zero-capacity table keeps response storage bounded while still
@@ -1172,9 +1177,7 @@ impl Pending for Sending {
                 Poll::Ready(Err(error)) if error.is::<Reset>() => {
                     return Poll::Ready(Some(Err(error)));
                 }
-                Poll::Ready(Err(error)) => {
-                    error_response(&error)
-                }
+                Poll::Ready(Err(error)) => error_response(&error),
             };
             self.making = None;
             // The response replaces the request in the budget. One it cannot
@@ -1185,11 +1188,7 @@ impl Pending for Sending {
                 self.request_held,
             );
             self.request_held = 0;
-            self.response = Some(if room {
-                response
-            } else {
-                over_budget()
-            });
+            self.response = Some(if room { response } else { over_budget() });
         }
         if let Some(response) = self.response.take() {
             let (parts, body) = response.into_parts();
@@ -1272,7 +1271,6 @@ impl Pending for Sending {
                 ));
             }
             if self.end_sent {
-
                 return Poll::Ready(None);
             }
             let Some(body) = &mut self.body else {
@@ -1293,7 +1291,6 @@ impl Pending for Sending {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(None) => self.body = None,
                 Poll::Ready(Some(Err(error))) => {
-
                     return Poll::Ready(Some(Err(error)));
                 }
                 Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
@@ -1301,7 +1298,6 @@ impl Pending for Sending {
                         // The headers are out, so a chunk the budget cannot
                         // hold resets this stream alone.
                         if !fits(self.budget.as_ref(), data.len(), held) {
-
                             return Poll::Ready(Some(Err(Error::msg(
                                 "response body exceeds budget",
                             ))));
@@ -1325,9 +1321,7 @@ impl Pending for Sending {
         }
     }
 
-    fn cancel(&mut self, _driver: &mut PendingDriver<'_>) {
-
-    }
+    fn cancel(&mut self, _driver: &mut PendingDriver<'_>) {}
 
     fn held(&self) -> usize {
         self.request_held
@@ -1341,8 +1335,8 @@ impl Pending for Sending {
 mod tests {
     use super::super::{HttpOptions, PREFACE};
     use super::*;
-    use fictionet::stdlib::services::serve::ConnInfo;
     use fictionet::stdlib::network::{ConnError, Connection};
+    use fictionet::stdlib::services::serve::ConnInfo;
     use std::future::poll_fn;
     use std::pin::pin;
     struct StalledBody {
@@ -1424,18 +1418,27 @@ mod tests {
                     assert!(served.as_mut().poll(cx).is_pending());
                     let output = output.lock();
                     while output.len() >= consumed + 9 {
-                        let header = wire::FrameHeader::parse(&output[consumed..consumed + 9]).unwrap();
+                        let header =
+                            wire::FrameHeader::parse(&output[consumed..consumed + 9]).unwrap();
                         let end = consumed + 9 + header.length;
-                        if end > output.len() { break; }
+                        if end > output.len() {
+                            break;
+                        }
                         let frame = Frame::parse(&output[consumed..end]).unwrap();
                         consumed = end;
                         let read = blocks.read_frame(&frame).unwrap();
                         if let Some(block) = read.block
-                            && let Some(status) = block.headers.into_iter().find(|header| header.name.as_deref() == Some(b":status"))
-                        { return Poll::Ready(status.value.unwrap()); }
+                            && let Some(status) = block
+                                .headers
+                                .into_iter()
+                                .find(|header| header.name.as_deref() == Some(b":status"))
+                        {
+                            return Poll::Ready(status.value.unwrap());
+                        }
                     }
                     Poll::Pending
-                }).await;
+                })
+                .await;
                 assert_eq!(status, b"408");
                 assert_eq!(fcx.now().since_start(), duration);
                 Ok(())

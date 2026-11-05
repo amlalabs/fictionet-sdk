@@ -64,11 +64,6 @@ use fictionet::stdlib::codec::{
     self, Assemble, AssembleError, Assembled, Decode, Reader as ByteReader, Step, Truncated, Wire,
 };
 
-pub use fictionet::stdlib::protocols::portmap::{
-    IPPROTO_TCP, IPPROTO_UDP, MAX_RPCB_STRING, PMAP_PROGRAM, PMAP_VERSION, PORT, RPCB_VERSION_HIGH,
-    RPCB_VERSION_LOW,
-};
-
 /// The ONC RPC version every call names (RFC 5531).
 pub const RPC_VERSION: u32 = 2;
 
@@ -105,15 +100,6 @@ pub mod flavor {
     pub const SHORT: u32 = 2;
     pub const DH: u32 = 3;
     pub const RPCSEC_GSS: u32 = 6;
-}
-
-/// Procedure numbers of the portmapper (version 2) and rpcbind (versions
-/// 3 and 4). GETPORT and GETADDR share a number.
-/// Re-exported from [`portmap::procedure`](fictionet::stdlib::protocols::portmap::procedure).
-pub mod procedure {
-    pub use fictionet::stdlib::protocols::portmap::procedure::{
-        CALLIT, DUMP, GETADDR, GETPORT, NULL, SET, UNSET,
-    };
 }
 
 /// Why bytes are not the XDR a reader expected or a TCP record, or why a
@@ -1430,8 +1416,8 @@ mod tests {
     use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::codec::{Fail, Stream, finish, pump};
     use fictionet::stdlib::protocols::portmap::{
-        self, Mapping, PmapRequest, PmapResult, Request, Rpcb, RpcbRequest, RpcbResult,
-        silent_on_failure,
+        self, IPPROTO_TCP, IPPROTO_UDP, Mapping, PMAP_PROGRAM, PmapRequest, PmapResult, Request,
+        Rpcb, RpcbRequest, RpcbResult, procedure, silent_on_failure,
     };
     use fictionet::stdlib::test_support;
     use fictionet::stdlib::test_support::contract;

@@ -462,12 +462,11 @@ impl Bindings {
     }
 }
 
-fictionet::cfg_std! {
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use super::super::*;
     use super::super::hosts::{Lookup, PortSpec, UdpStart};
+    use super::super::*;
+    use super::*;
     use fictionet::stdlib::test_support::{assert_linear, rounds};
 
     #[test]
@@ -484,93 +483,110 @@ mod tests {
 
     #[test]
     fn failed_hosts_reuse_automatic_addresses_even_without_negative_caching() {
-        fictionet::block_on(fictionet::lab(fictionet::Seed::from_u64(1), |fcx| async move {
-            let shared = Arc::new(Shared {
-                fcx: fcx.clone(),
-                resolver: Some(Arc::new(|name| Some(match name {
-                    "address.test" => Host::new(name).at(Ipv6Addr::LOCALHOST),
-                    "bind.test" => {
-                        let mut host = Host::new(name);
-                        let start: UdpStart = Arc::new(|_, _, _, _| panic!("not committed"));
-                        host.ports.push((0, PortSpec::Udp(start.clone())));
-                        host.ports.push((49152, PortSpec::Udp(start)));
-                        host
-                    }
-                    _ => Host::new(name),
-                }))),
-                subnet: Subnet::new("10.0.0.0/24".parse().unwrap()).unwrap(),
-                subnet6: Some(Subnet6::new("2001:db8::/64".parse().unwrap()).unwrap()),
-                router: route::router(&fcx, Vec::new()),
-                world: Arc::new(Mutex::new(World::new(MAX_HOSTS))),
-                leases: Arc::default(),
-                gateway_tcp: Arc::default(),
-                hooks: Arc::new(Hooks {
-                    by_addr: Mutex::default(),
-                    routes: Mutex::default(),
-                    conns: AtomicU64::new(0),
-                    attached: Mutex::default(),
-                }),
-                fixed: Vec::new(),
-                peers: Peers::new(Limits::default().connections_per_peer),
-                limits: Limits::default(),
-                lans: BTreeMap::new(),
-            });
-            shared.world.lock().max_unknown = 0;
-            for name in ["address.test", "bind.test", "bind.test"] {
-                assert!(matches!(shared.lookup(name), Lookup::NoHost));
-                let world = shared.world.lock();
-                assert!(world.machines.is_empty());
-                assert!(world.names.is_empty());
-                assert_eq!(world.resolved, 0);
-                assert_eq!((world.addresses.next_auto, world.addresses.next_auto6), (1, 1));
-                assert!(!world.addresses.auto_full);
-            }
-            let Lookup::Host(placed) = shared.lookup("good.test") else {
-                panic!("a valid host fits after rejected hosts");
-            };
-            assert_eq!(placed.v4, Some("104.18.0.1".parse().unwrap()));
-            assert_eq!(placed.v6, Some("2606:4700:100::1".parse().unwrap()));
-            fcx.cancel();
-            Ok(())
-        })).unwrap();
+        fictionet::block_on(fictionet::lab(
+            fictionet::Seed::from_u64(1),
+            |fcx| async move {
+                let shared = Arc::new(Shared {
+                    fcx: fcx.clone(),
+                    resolver: Some(Arc::new(|name| {
+                        Some(match name {
+                            "address.test" => Host::new(name).at(Ipv6Addr::LOCALHOST),
+                            "bind.test" => {
+                                let mut host = Host::new(name);
+                                let start: UdpStart =
+                                    Arc::new(|_, _, _, _| panic!("not committed"));
+                                host.ports.push((0, PortSpec::Udp(start.clone())));
+                                host.ports.push((49152, PortSpec::Udp(start)));
+                                host
+                            }
+                            _ => Host::new(name),
+                        })
+                    })),
+                    subnet: Subnet::new("10.0.0.0/24".parse().unwrap()).unwrap(),
+                    subnet6: Some(Subnet6::new("2001:db8::/64".parse().unwrap()).unwrap()),
+                    router: route::router(&fcx, Vec::new()),
+                    world: Arc::new(Mutex::new(World::new(MAX_HOSTS))),
+                    leases: Arc::default(),
+                    gateway_tcp: Arc::default(),
+                    hooks: Arc::new(Hooks {
+                        by_addr: Mutex::default(),
+                        routes: Mutex::default(),
+                        conns: AtomicU64::new(0),
+                        attached: Mutex::default(),
+                    }),
+                    fixed: Vec::new(),
+                    peers: Peers::new(Limits::default().connections_per_peer),
+                    limits: Limits::default(),
+                    lans: BTreeMap::new(),
+                });
+                shared.world.lock().max_unknown = 0;
+                for name in ["address.test", "bind.test", "bind.test"] {
+                    assert!(matches!(shared.lookup(name), Lookup::NoHost));
+                    let world = shared.world.lock();
+                    assert!(world.machines.is_empty());
+                    assert!(world.names.is_empty());
+                    assert_eq!(world.resolved, 0);
+                    assert_eq!(
+                        (world.addresses.next_auto, world.addresses.next_auto6),
+                        (1, 1)
+                    );
+                    assert!(!world.addresses.auto_full);
+                }
+                let Lookup::Host(placed) = shared.lookup("good.test") else {
+                    panic!("a valid host fits after rejected hosts");
+                };
+                assert_eq!(placed.v4, Some("104.18.0.1".parse().unwrap()));
+                assert_eq!(placed.v6, Some("2606:4700:100::1".parse().unwrap()));
+                fcx.cancel();
+                Ok(())
+            },
+        ))
+        .unwrap();
     }
 
     #[test]
     fn failed_hosts_remember_an_exhausted_automatic_range() {
-        fictionet::block_on(fictionet::lab(fictionet::Seed::from_u64(1), |fcx| async move {
-            let shared = Arc::new(Shared {
-                fcx: fcx.clone(),
-                resolver: Some(Arc::new(|name| Some(Host::new(name)))),
-                subnet: Subnet::new("104.18.0.0/15".parse().unwrap()).unwrap(),
-                subnet6: None,
-                router: route::router(&fcx, Vec::new()),
-                world: Arc::new(Mutex::new(World::new(MAX_HOSTS))),
-                leases: Arc::default(),
-                gateway_tcp: Arc::default(),
-                hooks: Arc::new(Hooks {
-                    by_addr: Mutex::default(),
-                    routes: Mutex::default(),
-                    conns: AtomicU64::new(0),
-                    attached: Mutex::default(),
-                }),
-                fixed: Vec::new(),
-                peers: Peers::new(Limits::default().connections_per_peer),
-                limits: Limits::default(),
-                lans: BTreeMap::new(),
-            });
-            shared.world.lock().max_unknown = 0;
-            for name in ["first.test", "second.test"] {
-                assert!(matches!(shared.lookup(name), Lookup::NoHost));
-                let world = shared.world.lock();
-                assert!(world.addresses.auto_full);
-                assert!(world.machines.is_empty());
-                assert!(world.names.is_empty());
-                assert_eq!(world.resolved, 0);
-                assert_eq!((world.addresses.next_auto, world.addresses.next_auto6), (1, 1));
-            }
-            fcx.cancel();
-            Ok(())
-        })).unwrap();
+        fictionet::block_on(fictionet::lab(
+            fictionet::Seed::from_u64(1),
+            |fcx| async move {
+                let shared = Arc::new(Shared {
+                    fcx: fcx.clone(),
+                    resolver: Some(Arc::new(|name| Some(Host::new(name)))),
+                    subnet: Subnet::new("104.18.0.0/15".parse().unwrap()).unwrap(),
+                    subnet6: None,
+                    router: route::router(&fcx, Vec::new()),
+                    world: Arc::new(Mutex::new(World::new(MAX_HOSTS))),
+                    leases: Arc::default(),
+                    gateway_tcp: Arc::default(),
+                    hooks: Arc::new(Hooks {
+                        by_addr: Mutex::default(),
+                        routes: Mutex::default(),
+                        conns: AtomicU64::new(0),
+                        attached: Mutex::default(),
+                    }),
+                    fixed: Vec::new(),
+                    peers: Peers::new(Limits::default().connections_per_peer),
+                    limits: Limits::default(),
+                    lans: BTreeMap::new(),
+                });
+                shared.world.lock().max_unknown = 0;
+                for name in ["first.test", "second.test"] {
+                    assert!(matches!(shared.lookup(name), Lookup::NoHost));
+                    let world = shared.world.lock();
+                    assert!(world.addresses.auto_full);
+                    assert!(world.machines.is_empty());
+                    assert!(world.names.is_empty());
+                    assert_eq!(world.resolved, 0);
+                    assert_eq!(
+                        (world.addresses.next_auto, world.addresses.next_auto6),
+                        (1, 1)
+                    );
+                }
+                fcx.cancel();
+                Ok(())
+            },
+        ))
+        .unwrap();
     }
 
     #[test]
@@ -643,10 +659,16 @@ mod tests {
             w.free_auto6(&subnet),
             Some("2606:4700:100:ffff:ffff:ffff:ffff:ffff".parse().unwrap())
         );
-        assert_eq!(w.free_auto6(&subnet), Some("2606:4700:100::1".parse().unwrap()));
+        assert_eq!(
+            w.free_auto6(&subnet),
+            Some("2606:4700:100::1".parse().unwrap())
+        );
         w.addresses.next_auto6 = (1 << 80) - 2;
         let end = subnet6("2606:4700:100:ffff:ffff:ffff:ffff:fffc/126").unwrap();
-        assert_eq!(w.free_auto6(&end), Some("2606:4700:100::1".parse().unwrap()));
+        assert_eq!(
+            w.free_auto6(&end),
+            Some("2606:4700:100::1".parse().unwrap())
+        );
         assert_eq!(w.free_auto6(&subnet6("2606:4700:100::/48").unwrap()), None);
     }
 
@@ -687,7 +709,10 @@ mod tests {
         assert_eq!(w.free_auto6(&s), Some("2606:4700:100::2".parse().unwrap()));
         let mut w = World::new(MAX_HOSTS);
         let inside = subnet6("2606:4700:100::/120").unwrap();
-        assert_eq!(w.free_auto6(&inside), Some("2606:4700:100::100".parse().unwrap()));
+        assert_eq!(
+            w.free_auto6(&inside),
+            Some("2606:4700:100::100".parse().unwrap())
+        );
         assert_eq!(
             World::new(MAX_HOSTS).free_auto6(&subnet6("2606::/16").unwrap()),
             None
@@ -719,5 +744,4 @@ mod tests {
         assert!(p.contains("10.0.9.200".parse().unwrap()));
         assert!(!p.contains("2001:db8::1".parse().unwrap()));
     }
-}
 }

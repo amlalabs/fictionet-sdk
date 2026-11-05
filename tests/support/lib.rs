@@ -19,18 +19,10 @@ pub use response::response;
 pub use timeout::timeout;
 pub use within::within;
 
-fictionet::cfg_std! {
-    pub mod harness;
-}
+pub mod harness;
 
-fictionet::cfg_std! {
-    pub mod bench;
-}
+pub mod bench;
 
-fictionet::cfg_std! {
-    pub mod web_fixture;
-}
+pub mod web_fixture;
 
-fictionet::cfg_std! {
-    pub use response::{handler, async_handler, reply_handler, EchoSocket};
-}
+pub use response::{EchoSocket, async_handler, handler, reply_handler};

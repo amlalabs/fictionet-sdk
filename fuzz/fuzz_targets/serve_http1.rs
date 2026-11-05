@@ -45,8 +45,11 @@ impl Handler for Pages {
 
 fn run(chunks: &[&[u8]]) -> (Vec<u8>, usize, bool) {
     let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let mut h =
-        Harness::new(fictionet::Seed::from_u64(0), Http1::new(Pages(calls.clone())), ());
+    let mut h = Harness::new(
+        fictionet::Seed::from_u64(0),
+        Http1::new(Pages(calls.clone())),
+        (),
+    );
     for chunk in chunks {
         if h.push(chunk).is_err() {
             break;

@@ -21,8 +21,7 @@
 //! [`Messages::for_receiver`]. The side names the receiving endpoint:
 //! `Side::Server` requires masked frames from a client, and `Side::Client`
 //! requires unmasked frames from a server. [`Frames::receiver`] returns
-//! that endpoint. The old `new` constructors and `Frames::role` accessor
-//! remain as deprecated aliases with the same masking behavior.
+//! that endpoint.
 //!
 //! Nothing here reads a socket. A world that plays a WebSocket server
 //! parses the request line and header fields itself, hands the fields to
@@ -42,7 +41,6 @@
 //! sends before it drops the connection.
 //!
 //! ```
-//! # fictionet::cfg_std! {
 //! use fictionet::stdlib::codec::{Side, Stream, Wire};
 //! use fictionet::stdlib::protocols::websocket::{check_request, Frame, Message, Messages, Opcode};
 //!
@@ -73,7 +71,6 @@
 //! // A server sends its frames unmasked.
 //! let frame = Frame::new(Opcode::Text, b"Hello".to_vec());
 //! assert_eq!(Wire::to_bytes(&frame).unwrap(), [0x81, 0x05, b'H', b'e', b'l', b'l', b'o']);
-//! # }
 //! ```
 
 use fictionet::stdlib::codec::ascii::is_tchar;
@@ -804,12 +801,6 @@ impl Frames {
         }
     }
 
-    /// Reads frames for the receiving `role`. Use [`Self::for_receiver`].
-    #[deprecated(note = "Use Frames::for_receiver; the side names the receiving endpoint")]
-    pub fn new(role: Side) -> Self {
-        Self::for_receiver(role)
-    }
-
     /// Sets the data payload limit, clamped to [`MAX_PAYLOAD`]. Zero
     /// permits empty data frames. Control frames keep their protocol limit.
     pub fn with_limit(self, limit: usize) -> Self {
@@ -827,12 +818,6 @@ impl Frames {
     /// The endpoint receiving these frames.
     pub fn receiver(&self) -> Side {
         self.receiver
-    }
-
-    /// The endpoint receiving these frames. Use [`Self::receiver`].
-    #[deprecated(note = "Use Frames::receiver; the side names the receiving endpoint")]
-    pub fn role(&self) -> Side {
-        self.receiver()
     }
 
     fn header(&self, input: &[u8]) -> Result<Option<Header>, Error> {
@@ -925,12 +910,6 @@ impl Messages {
             Frames::for_receiver(receiver).with_limit(MAX_MESSAGE),
             MAX_MESSAGE,
         )
-    }
-
-    /// Reads messages for the receiving `role`. Use [`Self::for_receiver`].
-    #[deprecated(note = "Use Messages::for_receiver; the side names the receiving endpoint")]
-    pub fn new(role: Side) -> Self {
-        Self::for_receiver(role)
     }
 
     /// Uses `limit` for data frames and assembled messages, clamped to

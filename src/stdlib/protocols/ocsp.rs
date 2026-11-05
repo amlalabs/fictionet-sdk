@@ -943,7 +943,7 @@ pub fn decode_get_path(segment: &str) -> Result<Vec<u8>, Error> {
     Ok(out)
 }
 
-fictionet::der_wire!(asn1, impl Wire for Request, Error, Error::Unwritable, [
+fictionet::der_wire!(impl Wire for Request, Error, Error::Unwritable, [
     /// Reads a request from its DER, such as a POST body.
     /// Refuses trailing bytes, invalid fields, empty requests, exceeded lists,
     /// and input over [`MAX_MESSAGE`]. Signed requests must name a requestor.
@@ -956,7 +956,7 @@ fictionet::der_wire!(asn1, impl Wire for Request, Error, Error::Unwritable, [
     /// Refuses values that change when encoded. Leaves `out` unchanged on error.
 ]);
 
-fictionet::der_wire!(asn1, impl Wire for Response, Error, Error::Unwritable, [
+fictionet::der_wire!(impl Wire for Response, Error, Error::Unwritable, [
     /// Reads a response from its DER, such as an HTTP reply's body. A basic
     /// response inside is read too, and an error in it is an error here.
     /// Refuses trailing bytes, unknown status codes, status/bytes mismatches,
@@ -970,7 +970,7 @@ fictionet::der_wire!(asn1, impl Wire for Response, Error, Error::Unwritable, [
     /// Refuses values that change when encoded. Leaves `out` unchanged on error.
 ]);
 
-fictionet::der_wire!(asn1, impl Wire for BasicResponse, Error, Error::Unwritable, [
+fictionet::der_wire!(impl Wire for BasicResponse, Error, Error::Unwritable, [
     /// Reads a basic response from its DER: the contents of a response's
     /// OCTET STRING.
     /// Refuses trailing bytes, invalid fields, exceeded lists, and input over
@@ -1481,7 +1481,7 @@ fn write_single_response(w: &mut Writer, r: &SingleResponse) {
     });
 }
 
-fictionet::der_wire!(asn1, impl Wire for ResponseData, Error, Error::Unwritable, [
+fictionet::der_wire!(impl Wire for ResponseData, Error, Error::Unwritable, [
     /// Reads one complete DER ResponseData. Refuses invalid fields, exceeded
     /// lists, trailing bytes, and input over [`MAX_MESSAGE`].
 ], [

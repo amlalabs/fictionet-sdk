@@ -192,7 +192,8 @@ fn stun_padded_request() -> Vec<u8> {
     // Preserve nonzero USERNAME padding, with a fingerprint over those bytes.
     bytes[stun::HEADER_LEN + 7] = 0xa5;
     let fingerprint_at = bytes.len() - 8;
-    let fingerprint = stun::crc32(&bytes[..fingerprint_at]) ^ stun::FINGERPRINT_XOR;
+    let fingerprint =
+        fictionet::stdlib::codec::crc32(&bytes[..fingerprint_at]) ^ stun::FINGERPRINT_XOR;
     bytes[fingerprint_at + 4..].copy_from_slice(&fingerprint.to_be_bytes());
     bytes
 }

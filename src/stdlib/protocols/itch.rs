@@ -117,11 +117,6 @@ pub enum Error {
     Timestamp,
     /// A decimal price with more places than the field, or too large.
     Price,
-    /// Retained for source compatibility. Nothing in this module returns it.
-    /// [`codec::Frames<Message>`](fictionet::stdlib::codec::Frames) reports
-    /// [`FrameError::TooLong`] when a length prefix exceeds its limit.
-    #[deprecated(note = "Nothing in this module returns this variant; use FrameError::TooLong")]
-    TooLong,
     /// A configuration value outside its named limits.
     Config,
     /// An execute, cancel, delete or replace names an order not on the
@@ -148,8 +143,6 @@ fictionet::error_display!(Error, f, {
     Error::Side(s) => write!(f, "invalid ITCH buy/sell indicator {s:#04x}"),
     Error::Timestamp => f.write_str("ITCH timestamp does not fit six bytes"),
     Error::Price => f.write_str("ITCH price is invalid"),
-    #[allow(deprecated)]
-    Error::TooLong => f.write_str("ITCH frame is too long"),
     Error::Config => f.write_str("ITCH book configuration is out of range"),
     Error::UnknownOrder(r) => write!(f, "ITCH order {r} is not on the book"),
     Error::DuplicateOrder(r) => write!(f, "ITCH order {r} is already on the book"),

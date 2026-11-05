@@ -879,7 +879,6 @@ impl<I: Interface> Lan<I> {
     }
 }
 
-fictionet::cfg_std! {
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -922,8 +921,12 @@ mod tests {
     }
 
     fn ip(src: &str, dst: &str, ttl: u8) -> Packet {
-        let mut p =
-            fictionet::stdlib::network::ip::packet(src.parse().unwrap(), dst.parse().unwrap(), 17, &[0; 8]);
+        let mut p = fictionet::stdlib::network::ip::packet(
+            src.parse().unwrap(),
+            dst.parse().unwrap(),
+            17,
+            &[0; 8],
+        );
         if p.0[0] >> 4 == 4 {
             p.0[8] = ttl;
             ip::set_header_checksum(&mut p.0[..20]);
@@ -1113,10 +1116,7 @@ mod tests {
         assert!(!floods(p("10.0.0.0/31"), a("10.0.0.1")));
         assert!(!floods(p("10.0.0.1/32"), a("10.0.0.1")));
         assert!(floods(p("10.0.0.0/31"), a("255.255.255.255")));
-        assert_eq!(
-            p("0.0.0.0/0").broadcast(),
-            Some(Ipv4Addr::BROADCAST)
-        );
+        assert_eq!(p("0.0.0.0/0").broadcast(), Some(Ipv4Addr::BROADCAST));
         // A length past the address is the whole address, so no shift
         // reaches 32.
         assert_eq!(
@@ -1146,8 +1146,7 @@ mod tests {
         fictionet::block_on(fictionet::run(
             fictionet::Seed::random(),
             |fcx| async move {
-                let lan =
-                    lan::<Box<dyn Interface>>(&fcx, "192.168.56.0/24".parse()?);
+                let lan = lan::<Box<dyn Interface>>(&fcx, "192.168.56.0/24".parse()?);
                 for bad in [
                     "192.168.57.1",
                     "192.168.56.255",
@@ -1175,8 +1174,6 @@ mod tests {
         ))
         .unwrap();
     }
-
-
 
     /// Once the LAN's task has ended, adding fails and the interface is
     /// dropped.
@@ -1214,8 +1211,4 @@ mod tests {
         ))
         .unwrap();
     }
-
-
-}
-
 }

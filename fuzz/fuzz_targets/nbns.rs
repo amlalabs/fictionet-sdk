@@ -4,9 +4,9 @@
 
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::protocols::nbns::{
-    Error, MAX_DATAGRAM, MAX_PACKET, Name, NbEntry, NodeName, NodeType, Packet, RrName,
-    decode_first_level, rcode,
+    Error, MAX_DATAGRAM, MAX_PACKET, Name, NbEntry, NodeName, NodeType, Packet, RrName, rcode,
 };
+use fictionet::stdlib::protocols::netbios::decode_first_level;
 use fictionet::stdlib::test_support::contract;
 use libfuzzer_sys::fuzz_target;
 use std::net::Ipv4Addr;

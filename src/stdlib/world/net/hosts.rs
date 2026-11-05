@@ -22,10 +22,8 @@ use std::time::Duration;
 #[cfg(doc)]
 use super::{Limits, Net};
 
-fictionet::cfg_std! {
 #[cfg(doc)]
 use fictionet::stdlib::web::httpd;
-}
 
 /// At most this many names that have no host are remembered (about 35 MB).
 const MAX_UNKNOWN_NAMES: usize = 100_000;
@@ -1417,11 +1415,10 @@ pub(super) async fn pings(fcx: Cx, mut icmp: End, addr: IpAddr) -> fictionet::Re
     Ok(())
 }
 
-fictionet::cfg_std! {
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::{MAX_HOSTS, Net};
+    use super::*;
 
     #[test]
     fn tls_sharing_uses_the_first_installed_accept() {
@@ -1500,7 +1497,9 @@ mod tests {
                 fictionet::Seed::random(),
                 move |fcx| async move {
                     let mut net = Net::new().ipv4_only();
-                    for (name, answers) in [("a.test", answering_first), ("b.test", !answering_first)] {
+                    for (name, answers) in
+                        [("a.test", answering_first), ("b.test", !answering_first)]
+                    {
                         net = net.host(name, |h| {
                             let h = h.at(addr);
                             if answers {
@@ -1544,5 +1543,4 @@ mod tests {
         w.remember(&"\\255".repeat(64), Known::NoHost);
         assert!(w.names.is_empty());
     }
-}
 }

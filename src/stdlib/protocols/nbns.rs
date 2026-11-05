@@ -67,9 +67,11 @@ use fictionet::stdlib::protocols::netbios;
 
 use std::net::Ipv4Addr;
 
-pub use fictionet::stdlib::protocols::netbios::{
-    ENCODED_LEN, MAX_LABEL, MAX_NAME_LEN, NAME_LEN, decode_first_level, encode_first_level,
-};
+#[cfg(test)]
+use fictionet::stdlib::protocols::netbios::ENCODED_LEN;
+#[cfg(any(doc, test))]
+use fictionet::stdlib::protocols::netbios::MAX_LABEL;
+use fictionet::stdlib::protocols::netbios::{MAX_NAME_LEN, NAME_LEN, decode_first_level};
 
 /// The UDP port the name service listens on.
 pub const PORT: u16 = 137;
@@ -1177,17 +1179,6 @@ fn read_labels(msg: &[u8], start: usize) -> Result<(Vec<Vec<u8>>, usize), Error>
     Ok((labels, after.unwrap_or(pos + 1)))
 }
 
-/// Appends an uncompressed NetBIOS name and scope.
-/// Refuses empty or oversized labels and names above [`MAX_NAME_LEN`].
-/// Errors leave the destination unchanged.
-pub fn write_name(
-    dst: &mut Vec<u8>,
-    bytes: &[u8; NAME_LEN],
-    scope: &[Vec<u8>],
-) -> Result<(), Error> {
-    netbios::write_name(dst, bytes, scope).map_err(|_| Error::Unwritable)
-}
-
 impl Wire for Name {
     type ParseError = Error;
     type WriteError = Error;
@@ -1204,7 +1195,7 @@ impl Wire for Name {
     /// Appends the uncompressed name. Refuses empty or oversized scope labels and
     /// names above [`MAX_NAME_LEN`]. Leaves the destination unchanged on error.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
-        write_name(dst, &self.bytes, &self.scope)
+        netbios::write_name(dst, &self.bytes, &self.scope).map_err(|_| Error::Unwritable)
     }
 }
 
