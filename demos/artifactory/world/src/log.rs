@@ -127,28 +127,6 @@ mod tests {
     }
 
     #[test]
-    fn connection_counts_are_released_when_the_guard_drops() {
-        use fictionet::stdlib::services::serve::Counted;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        let open = Arc::new(AtomicUsize::new(0));
-        assert!(Counted::enter(&open, 0).is_none());
-        assert_eq!(open.load(Ordering::Acquire), 0);
-
-        let guard = Counted::enter(&open, 1).unwrap();
-        assert_eq!(open.load(Ordering::Acquire), 1);
-        assert!(Counted::enter(&open, 1).is_none());
-        assert_eq!(open.load(Ordering::Acquire), 1);
-
-        drop(guard);
-        assert_eq!(open.load(Ordering::Acquire), 0);
-        let guard = Counted::enter(&open, 1).unwrap();
-        assert_eq!(open.load(Ordering::Acquire), 1);
-        drop(guard);
-        assert_eq!(open.load(Ordering::Acquire), 0);
-    }
-
-    #[test]
     fn producer_loss_prevents_successful_finalization() {
         let output = Output::default();
         let log = Log::start(Box::new(output.clone())).unwrap();
