@@ -3,8 +3,7 @@
 
 use fictionet::stdlib::protocols::json::{self, Value};
 use fictionet::stdlib::protocols::json_schema::{
-    CompileKind, Dialect, ErrorMode, FormatPolicy, GenerationLimits, Limits, Options,
-    PatternPolicy, Schema,
+    CompileKind, Dialect, ErrorMode, FormatPolicy, GenerationLimits, Limits, Options, Schema,
 };
 use fictionet::stdlib::test_support::assert_write;
 use libfuzzer_sys::fuzz_target;
@@ -34,11 +33,6 @@ fuzz_target!(|input: &[u8]| {
             Dialect::Draft202012
         } else {
             Dialect::OpenApi30
-        },
-        patterns: if flags & 2 == 0 {
-            PatternPolicy::Reject
-        } else {
-            PatternPolicy::Annotate
         },
         formats: if flags & 4 == 0 {
             FormatPolicy::Annotate
@@ -130,6 +124,8 @@ fuzz_target!(|input: &[u8]| {
         check(schema);
     }
     for keyword in [
+        "pattern",
+        "patternProperties",
         "unevaluatedProperties",
         "unevaluatedItems",
         "$dynamicRef",
@@ -139,12 +135,17 @@ fuzz_target!(|input: &[u8]| {
     ] {
         let source = Value::Object(vec![(keyword.into(), instance.clone())]);
         if let Err(error) = Schema::compile_with(&source, options) {
-            assert!(matches!(
-                error.kind,
-                CompileKind::UnsupportedKeyword(_)
-                    | CompileKind::Limit(_)
-                    | CompileKind::DuplicateKey
-            ));
+            let expected = match keyword {
+                "pattern" | "patternProperties" => CompileKind::UnsupportedPattern,
+                _ => CompileKind::UnsupportedKeyword(keyword.into()),
+            };
+            assert!(
+                error.kind == expected
+                    || matches!(
+                        error.kind,
+                        CompileKind::Limit(_) | CompileKind::DuplicateKey
+                    )
+            );
         } else {
             panic!("unsupported keyword compiled: {keyword}");
         }

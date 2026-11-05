@@ -2,7 +2,7 @@
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::protocols::json::{self, Value};
 use fictionet::stdlib::protocols::json_schema::{
-    Dialect, ErrorMode, GenerationLimits, Options, Schema, ValidationKind,
+    CompileKind, Dialect, ErrorMode, GenerationLimits, Options, Schema, ValidationKind,
 };
 use fictionet::stdlib::test_support;
 use fictionet::stdlib::test_support::assert_write;
@@ -118,6 +118,38 @@ fn schema_module_composes_with_sdk_json() {
     assert!(schema.validate(&Value::from(5)).is_valid());
     let example = schema.generate(12, Default::default()).unwrap();
     assert!(schema.validate(&example).is_valid());
+}
+
+#[test]
+fn document_entries_reject_reachable_regex_assertions() {
+    let document = parse(
+        br##"{
+            "components":{
+                "name":{"type":"string","pattern":"^x+$"},
+                "record":{"patternProperties":{"^x":{"type":"integer"}},"additionalProperties":false},
+                "supported":{"type":"integer"}
+            },
+            "body":{"$ref":"#/components/name"},
+            "records":{"items":{"$ref":"#/components/record"}}
+        }"##,
+    );
+    for dialect in [Dialect::Draft202012, Dialect::OpenApi30] {
+        let options = Options {
+            dialect,
+            ..Options::default()
+        };
+        for (entry, path) in [
+            ("/body", "/components/name/pattern"),
+            ("/records", "/components/record/patternProperties"),
+        ] {
+            let error = Schema::compile_at(&document, entry, options).unwrap_err();
+            assert_eq!(error.kind, CompileKind::UnsupportedPattern);
+            assert_eq!(error.schema_path, path);
+        }
+        let schema = Schema::compile_at(&document, "/components/supported", options).unwrap();
+        let example = schema.generate(0, GenerationLimits::default()).unwrap();
+        assert!(schema.validate(&example).is_valid());
+    }
 }
 
 #[test]

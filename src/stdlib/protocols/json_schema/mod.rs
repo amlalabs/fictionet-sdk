@@ -16,9 +16,7 @@
 //! URI uses RFC 3986 syntax. Checks do not perform DNS or network lookups.
 //! Generation uses these formats when a value fits the string length bounds;
 //! otherwise it tries letters, which asserted formats may reject.
-//! There is no regex engine: `pattern` and `patternProperties` are rejected by
-//! default. [`PatternPolicy::Annotate`] records and ignores them, including
-//! their effect on `additionalProperties`. Generation refuses such schemas.
+//! There is no regex engine: `pattern` and `patternProperties` fail compilation.
 //!
 //! Numbers use their decimal text, including for equality and `multipleOf`. No
 //! floating point rounding or tolerance is used by validation. Precision is
@@ -69,25 +67,6 @@ pub enum Dialect {
     Draft202012,
     /// OpenAPI 3.0 JSON bodies, with the differences described in this module.
     OpenApi30,
-}
-
-/// Handling of keywords that require a regex engine.
-///
-/// ```
-/// use fictionet::stdlib::protocols::{json::Value, json_schema::{Options, PatternPolicy, Schema}};
-/// let source = Value::Object(vec![("pattern".into(), Value::from("^id-"))]);
-/// let options = Options { patterns: PatternPolicy::Annotate, ..Options::default() };
-/// let schema = Schema::compile_with(&source, options).unwrap();
-/// assert_eq!(schema.annotations()[0].keyword, "pattern");
-/// ```
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum PatternPolicy {
-    /// Refuse compilation at the unsupported keyword. This is the default.
-    #[default]
-    Reject,
-    /// Ignore the keyword and expose it in schema annotations.
-    /// Generation returns [`GenerationError::UnsupportedPattern`].
-    Annotate,
 }
 
 /// Whether the common string formats listed in this module are asserted.
@@ -175,16 +154,14 @@ impl Limits {
 /// Compilation settings.
 ///
 /// ```
-/// use fictionet::stdlib::protocols::json_schema::{Options, PatternPolicy};
-/// let options = Options { patterns: PatternPolicy::Annotate, ..Options::default() };
-/// assert_eq!(options.patterns, PatternPolicy::Annotate);
+/// use fictionet::stdlib::protocols::json_schema::{FormatPolicy, Options};
+/// let options = Options { formats: FormatPolicy::Assert, ..Options::default() };
+/// assert_eq!(options.formats, FormatPolicy::Assert);
 /// ```
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Options {
     /// Keyword meanings. Defaults to 2020-12.
     pub dialect: Dialect,
-    /// Regex keyword policy. Defaults to rejection.
-    pub patterns: PatternPolicy,
     /// String format policy. Defaults to annotations.
     pub formats: FormatPolicy,
     /// Shared resource bounds, retained by the compiled schema.
@@ -214,7 +191,7 @@ pub enum CompileKind {
     InvalidKeyword,
     /// An object repeats a name.
     DuplicateKey,
-    /// Regex assertions need an explicit annotation-only policy.
+    /// Regex assertions are not supported.
     UnsupportedPattern,
     /// An assertion keyword is not implemented. The string names the keyword.
     UnsupportedKeyword(String),
@@ -233,9 +210,7 @@ impl std::fmt::Display for CompileKind {
         match self {
             Self::InvalidKeyword => f.write_str("invalid keyword value"),
             Self::DuplicateKey => f.write_str("duplicate object name"),
-            Self::UnsupportedPattern => {
-                f.write_str("regex assertions require an annotation-only policy")
-            }
+            Self::UnsupportedPattern => f.write_str("regex assertions are not supported"),
             Self::UnsupportedKeyword(name) => write!(f, "unsupported assertion keyword {name}"),
             Self::ExternalReference => f.write_str("reference to another document"),
             Self::InvalidReference => f.write_str("invalid or missing reference target"),
@@ -313,12 +288,12 @@ impl std::fmt::Display for ValidationError {
 }
 impl std::error::Error for ValidationError {}
 
-/// A recorded format or ignored regex keyword.
+/// A recorded format annotation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Annotation {
     /// Absolute pointer to the keyword.
     pub schema_path: String,
-    /// `format`, `pattern`, or `patternProperties`.
+    /// The `format` keyword.
     pub keyword: &'static str,
     /// Original keyword value.
     pub value: Value,
@@ -402,8 +377,6 @@ impl GenerationLimits {
 /// failure does not prove that the mathematical schema is unsatisfiable.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GenerationError {
-    /// The compiled document contains a regex keyword that was ignored.
-    UnsupportedPattern,
     /// A named search bound was reached.
     Limit(&'static str),
     /// All attempted candidates failed assertions or size bounds.
@@ -416,9 +389,6 @@ impl std::fmt::Display for GenerationError {
     /// Formats the generation failure.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::UnsupportedPattern => {
-                f.write_str("example generation cannot enforce ignored regex keywords")
-            }
             Self::Limit(name) => write!(f, "example generation exceeded the {name} limit"),
             Self::NoCandidate => f.write_str("example generation found no acceptable candidate"),
             Self::Validation(_) => f.write_str("example generation could not validate a candidate"),
@@ -1231,23 +1201,13 @@ impl<'a> Compiler<'a> {
                 "$defs" | "definitions" => {
                     v.as_object().ok_or_else(invalid)?;
                 }
-                "properties" | "dependentSchemas" | "patternProperties" => {
+                "properties" | "dependentSchemas" => {
                     let entries = v.as_object().ok_or_else(invalid)?;
-                    if key == "patternProperties" {
-                        if self.options.patterns == PatternPolicy::Reject {
-                            return Err(self.error(p, CompileKind::UnsupportedPattern));
-                        }
-                        self.annotations.push(StoredAnnotation {
-                            path: p,
-                            keyword: "patternProperties",
-                            value: v.clone(),
-                        });
-                    }
                     for (name, child) in entries {
                         let at = self.enqueue(child, self.at(child))?;
                         if key == "properties" {
                             node.properties.insert(name.clone(), at);
-                        } else if key == "dependentSchemas" {
+                        } else {
                             node.dependent_schemas.insert(name.clone(), at);
                         }
                     }
@@ -1264,22 +1224,15 @@ impl<'a> Compiler<'a> {
                 "allOf" => node.all_of = Some(self.group(v, p)?),
                 "anyOf" => node.any_of = Some(self.group(v, p)?),
                 "oneOf" => node.one_of = Some(self.group(v, p)?),
-                "pattern" | "format" => {
+                "pattern" | "patternProperties" => {
+                    return Err(self.error(p, CompileKind::UnsupportedPattern));
+                }
+                "format" => {
                     let name = v.as_str().ok_or_else(invalid)?;
-                    if key == "format" {
-                        node.format = Some(name.into());
-                    }
-                    let k = if key == "pattern" {
-                        "pattern"
-                    } else {
-                        "format"
-                    };
-                    if k == "pattern" && self.options.patterns == PatternPolicy::Reject {
-                        return Err(self.error(p, CompileKind::UnsupportedPattern));
-                    }
+                    node.format = Some(name.into());
                     self.annotations.push(StoredAnnotation {
                         path: p,
-                        keyword: k,
+                        keyword: "format",
                         value: v.clone(),
                     });
                 }
@@ -1450,7 +1403,7 @@ impl Schema {
     pub fn options(&self) -> Options {
         self.options
     }
-    /// Returns format and ignored regex keywords in reachable schemas.
+    /// Returns format annotations in reachable schemas.
     /// These are static metadata, not a record of successful evaluation paths.
     /// Pointers and values are materialized only when this method is called.
     pub fn annotations(&self) -> Vec<Annotation> {
@@ -2402,9 +2355,6 @@ impl Schema {
     /// Known string formats guide synthesis even when they are annotations.
     /// Identical seeds, schemas, and limits produce identical results.
     pub fn generate(&self, seed: u64, limits: GenerationLimits) -> Result<Value, GenerationError> {
-        if self.annotations.iter().any(|a| a.keyword != "format") {
-            return Err(GenerationError::UnsupportedPattern);
-        }
         let limits = limits.bounded();
         let mut generator = Generator {
             schema: self,
@@ -3270,35 +3220,50 @@ mod tests {
     }
 
     #[test]
-    fn patterns_are_explicit_and_formats_are_annotations() {
-        for text in [
-            r#"{"pattern":"^x+$"}"#,
-            r#"{"patternProperties":{"^x":{"type":"integer"}}}"#,
+    fn patterns_fail_compilation() {
+        for (text, path) in [
+            (r#"{"pattern":"^x+$"}"#, "/pattern"),
+            (
+                r#"{"patternProperties":{"^x":{"type":"integer"}},"additionalProperties":false}"#,
+                "/patternProperties",
+            ),
+            (
+                r#"{"properties":{"name":{"pattern":"^x+$"}}}"#,
+                "/properties/name/pattern",
+            ),
+            (
+                r#"{"items":{"patternProperties":{"^x":{"type":"integer"}}}}"#,
+                "/items/patternProperties",
+            ),
         ] {
-            assert_eq!(
-                Schema::compile(&value(text)).unwrap_err().kind,
-                CompileKind::UnsupportedPattern
-            );
-            let s = Schema::compile_with(
-                &value(text),
-                Options {
-                    patterns: PatternPolicy::Annotate,
-                    ..Options::default()
-                },
-            )
-            .unwrap();
-            assert_eq!(s.annotations().len(), 1);
-            let r = s.validate(&value(r#"{"x":false}"#));
-            assert!(r.is_valid());
-            assert_eq!(s.annotations().len(), 1);
-            assert_eq!(
-                s.generate(0, GenerationLimits::default()),
-                Err(GenerationError::UnsupportedPattern)
-            );
+            for dialect in [Dialect::Draft202012, Dialect::OpenApi30] {
+                for formats in [FormatPolicy::Annotate, FormatPolicy::Assert] {
+                    let error = Schema::compile_with(
+                        &value(text),
+                        Options {
+                            dialect,
+                            formats,
+                            ..Options::default()
+                        },
+                    )
+                    .unwrap_err();
+                    assert_eq!(error.kind, CompileKind::UnsupportedPattern);
+                    assert_eq!(error.schema_path, path);
+                }
+            }
         }
-        let s = schema(r#"{"type":"string","format":"email","unknown":{"type":7}}"#);
+    }
+
+    #[test]
+    fn formats_are_annotations() {
+        let s = schema(
+            r#"{"type":"string","format":"email","unknown":{"type":7,"pattern":"x","patternProperties":{"x":false}}}"#,
+        );
         assert!(s.validate(&Value::from("not an email")).is_valid());
+        assert_eq!(s.annotations().len(), 1);
         assert_eq!(s.annotations()[0].keyword, "format");
+        assert_eq!(s.annotations()[0].schema_path, "/format");
+        assert_eq!(s.annotations()[0].value, Value::from("email"));
     }
 
     #[test]
@@ -3340,7 +3305,9 @@ mod tests {
         );
         assert!(Schema::compile_with(&value(r#"{"exclusiveMinimum":2}"#), options).is_err());
         assert!(Schema::compile_with(&value(r#"{"type":["string","null"]}"#), options).is_err());
-        let source = value(r##"{"$ref":"#/$defs/n","type":17,"$defs":{"n":{"type":"integer"}}}"##);
+        let source = value(
+            r##"{"$ref":"#/$defs/n","type":17,"pattern":"x","patternProperties":{"x":false},"$defs":{"n":{"type":"integer"}}}"##,
+        );
         assert!(
             Schema::compile_with(&source, options)
                 .unwrap()
