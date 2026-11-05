@@ -162,7 +162,7 @@ pub fn tcp() -> tcp::Options {
 ///
 /// IPv4 echo replies preserve the request's TOS and code. Errors use Internet
 /// Control precedence. Both use the shared hashed identification counters,
-/// with random perturbation below the elapsed number of 250 Hz ticks.
+/// with random perturbation below the elapsed number of 1000 Hz ticks.
 /// The 32768 buckets match Linux's allocation of one bucket per 64 KiB.
 /// See [ICMP replies](https://github.com/torvalds/linux/blob/v6.8/net/ipv4/icmp.c)
 /// and [identification allocation](https://github.com/torvalds/linux/blob/v6.8/net/ipv4/route.c).
@@ -189,7 +189,7 @@ pub fn icmp(fcx: &fictionet::Cx) -> fictionet::stdlib::network::icmp::Options {
             hash.write(&u32::from(ip::protocol::ICMP).to_le_bytes());
             let mut counters = counters.lock();
             let counter = &mut counters[hash.finish() as usize & 32767];
-            let tick = (fcx.now().since_start().as_micros() / 4000) as u32;
+            let tick = fcx.now().since_start().as_millis() as u32;
             if counter.1 != tick {
                 counter.0 = counter
                     .0

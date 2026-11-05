@@ -52,9 +52,23 @@ fn icmp_echo_and_errors_share_fresh_identifications_and_linux_header_choices() {
         assert_eq!(&error.0[28..], &udp.0);
         assert_eq!(ip::checksum(&error.0[..20]), 0);
         assert_eq!(ip::checksum(&error.0[20..]), 0);
+        let mut previous = id(&error);
+        let mut perturbed = false;
+        for _ in 0..16 {
+            fcx.sleep(Duration::from_millis(2)).await?;
+            let next = options.echo_reply(&request, local).unwrap();
+            let advance = id(&next).wrapping_sub(previous);
+            assert!((1..=2).contains(&advance));
+            perturbed |= advance == 2;
+            previous = id(&next);
+        }
+        assert!(
+            perturbed,
+            "two milliseconds allow an identification perturbation"
+        );
         fcx.sleep(Duration::from_secs(1)).await?;
         let later = options.echo_reply(&request, local).unwrap();
-        assert!((1..=250).contains(&id(&later).wrapping_sub(id(&error))));
+        assert!((1..=1000).contains(&id(&later).wrapping_sub(previous)));
         Ok(())
     }))
     .unwrap();
