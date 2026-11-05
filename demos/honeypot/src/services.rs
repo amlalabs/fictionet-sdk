@@ -250,6 +250,7 @@ impl PortServer for Http {
         Box::pin(async move {
             let mut input = Stream::new(RequestEvents::with_limits(http1::Limits {
                 head: HEADER_LIMIT,
+                headers: usize::MAX,
                 ..http1::Limits::default()
             }));
             let mut deadline = fcx.now() + HEADER_TIMEOUT;

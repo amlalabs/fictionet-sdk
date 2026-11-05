@@ -540,6 +540,20 @@ impl Client {
 }
 
 #[test]
+fn http_accepts_many_short_headers_within_the_head_limit() {
+    honeypot(Config::default(), |mut net| async move {
+        let mut client = Client::open(&mut net, 80).await;
+        let mut request = String::from("GET / HTTP/1.1\r\nHost: x\r\n");
+        request.push_str(&"X: a\r\n".repeat(200));
+        request.push_str("\r\n");
+        client.send(&mut net, request.as_bytes());
+        let response = String::from_utf8(client.response(&mut net, false).await).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        Ok(())
+    });
+}
+
+#[test]
 fn http_reuses_connections_and_consumes_request_bodies() {
     honeypot(Config::default(), |mut net| async move {
         let mut client = Client::open(&mut net, 80).await;
