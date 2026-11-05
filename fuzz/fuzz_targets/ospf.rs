@@ -19,10 +19,7 @@ use fictionet::stdlib::protocols::ospf::{
     RouterInterface, RouterLink, RouterLsa, RouterLsaV3, SummaryLsa, TosMetric, Version, checksum,
     lsa_checksum, lsa_type_v2, lsa_type_v3,
 };
-use fictionet::stdlib::{
-    codec::{Collect, Wire},
-    protocols::ospf,
-};
+use fictionet::stdlib::{codec::Collect, protocols::ospf};
 use libfuzzer_sys::fuzz_target;
 
 fn ends() -> [Endpoints; 2] {
@@ -393,13 +390,10 @@ fn built(data: &[u8]) -> Result<()> {
                 Endpoints::V6 { .. } => Version::V3,
             },
         )?;
-        if let Ok(bytes) = l
-            .frame(match e {
-                Endpoints::V4 { .. } => Version::V2,
-                Endpoints::V6 { .. } => Version::V3,
-            })
-            .and_then(|frame| frame.to_bytes())
-        {
+        if let Ok(bytes) = l.frame(match e {
+            Endpoints::V4 { .. } => Version::V2,
+            Endpoints::V6 { .. } => Version::V3,
+        }) {
             let n = bytes.len();
             assert_eq!(
                 Lsa::parse(
