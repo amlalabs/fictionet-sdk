@@ -186,7 +186,7 @@ fn serve(
             });
             let server = httpd::Server::shared(handler.clone()).default_host();
             let (attacher, attachments) = fictionet::attachments();
-            Net::new()
+            Net::new(fictionet_extras::network::cdn_pools())
                 .ipv4_only()
                 .host("site", |host| {
                     host.at(SITE)

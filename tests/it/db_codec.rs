@@ -1084,7 +1084,9 @@ fn payload_readers_refuse_trailing_bytes() {
         tds::Prelogin::parse(&bytes),
         Err(tds::Error::Invalid("bytes after PRELOGIN"))
     );
-    let mut bytes = tds::Login7::new().to_bytes().unwrap();
+    let mut bytes = fictionet_extras::sql_server::odbc_login()
+        .to_bytes()
+        .unwrap();
     bytes.push(0);
     assert_eq!(
         tds::Login7::parse(&bytes),
@@ -1185,12 +1187,12 @@ fn tds_payload_limits_and_complete_messages() {
     .unwrap_err();
     assert_write(&tds::Login7 {
         features: Some(vec![]),
-        ..tds::Login7::new()
+        ..fictionet_extras::sql_server::odbc_login()
     })
     .unwrap_err();
     assert_write(&tds::Login7 {
         option_flags3: tds::option_flags3::EXTENSION,
-        ..tds::Login7::new()
+        ..fictionet_extras::sql_server::odbc_login()
     })
     .unwrap_err();
     let oversized_batch = tds::SqlBatch {

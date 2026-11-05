@@ -4,6 +4,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 
+use fictionet::stdlib::network::ethernet::frame::Mac;
 use fictionet::stdlib::network::ethernet::{Cidr, Family};
 
 /// Where attach writes the DNS servers.
@@ -97,6 +98,8 @@ pub(crate) struct TapArgs {
     pub(crate) vm: VmLink,
     /// The network namespace the VM's TAP device is in, for `tap:<name>`.
     pub(crate) netns: Option<PathBuf>,
+    /// The gateway's MAC, as the VM sees it (`--gateway-mac`).
+    pub(crate) gateway_mac: Mac,
     pub(crate) v4: Family<Ipv4Addr>,
     pub(crate) v6: Family<Ipv6Addr>,
     pub(crate) mtu: u16,

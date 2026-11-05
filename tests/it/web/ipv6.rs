@@ -251,7 +251,7 @@ fn endpoint_scoped_sites(shared_v6: bool, defaults: bool) {
                     .unwrap(),
             );
             let (attacher, attachments) = fictionet::attachments();
-            web::Sites::new(move |name| {
+            web::Sites::new(fictionet_extras::network::cdn_pools(), move |name| {
                 let site = match name {
                     "a.test" => web::Site::new(Plain("a")).at(shared).at(other),
                     "b.test" => {
@@ -431,7 +431,7 @@ fn late_host_failure_keeps_http_defaults_names_and_tls_unchanged() {
             .udp(49152, Arc::new(()), || Quiet);
         let good = site("good", false).served_by(Host::new("good").at(v4).at(v6));
         let (attacher, attachments) = fictionet::attachments();
-        Net::new()
+        Net::new(fictionet_extras::network::cdn_pools())
             .add_host(first)
             .add_host(occupied)
             .resolve(move |name| match name {
@@ -778,7 +778,7 @@ where
 #[test]
 fn an_ipv4_only_network_drops_ipv6_and_answers_aaaa_with_nodata() {
     let make = || {
-        web::Sites::new(|host| match host {
+        web::Sites::new(fictionet_extras::network::cdn_pools(), |host| match host {
             "six.test" => Some(web::Site::new(Plain("six")).ipv6_only()),
             h => h
                 .ends_with(".test")
@@ -818,7 +818,7 @@ fn an_ipv4_only_network_drops_ipv6_and_answers_aaaa_with_nodata() {
 fn automatic_ipv6_addresses_skip_the_sandboxes_subnet() {
     // A subnet inside 2606:4700:100::/48: automatic addresses jump past it.
     let make = || {
-        web::Sites::new(|host| {
+        web::Sites::new(fictionet_extras::network::cdn_pools(), |host| {
             host.ends_with(".test")
                 .then(|| web::Site::new(Plain("auto")))
         })
@@ -860,7 +860,7 @@ fn automatic_ipv6_addresses_skip_the_sandboxes_subnet() {
     // A subnet that covers all of 2606:4700:100::/48 leaves no automatic IPv6
     // addresses. Sites then have IPv4 only.
     let make = || {
-        web::Sites::new(|host| {
+        web::Sites::new(fictionet_extras::network::cdn_pools(), |host| {
             host.ends_with(".test")
                 .then(|| web::Site::new(Plain("auto")))
         })
@@ -1197,8 +1197,12 @@ fn dns_drops_a_zero_udp_checksum_over_ipv6() {
 /// and the names that have sites keep working.
 #[test]
 fn dns_makes_no_more_sites_than_the_limit() {
-    let make =
-        || web::Sites::new(|_| Some(web::Site::new(Plain("wildcard")).ipv6_only())).max_sites(8);
+    let make = || {
+        web::Sites::new(fictionet_extras::network::cdn_pools(), |_| {
+            Some(web::Site::new(Plain("wildcard")).ipv6_only())
+        })
+        .max_sites(8)
+    };
     world_of(make, |fcx, attacher| async move {
         let mut raw = attacher.attach("a").unwrap();
         for i in 0..8 {

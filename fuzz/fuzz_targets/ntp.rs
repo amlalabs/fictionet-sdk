@@ -4,7 +4,7 @@
 
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::protocols::ntp::{
-    KissCode, Mode, Packet, ServerInfo, Timestamp, kiss_reply, server_reply,
+    KissCode, Leap, Mode, Packet, ServerInfo, Timestamp, kiss_reply, server_reply,
 };
 use fictionet::stdlib::test_support::assert_write;
 use libfuzzer_sys::fuzz_target;
@@ -31,7 +31,16 @@ fuzz_target!(|data: &[u8]| {
             Mode::SymmetricActive if p.version <= 4 => Some(Mode::SymmetricPassive),
             _ => None,
         };
-        let r = server_reply(&p, &ServerInfo::default(), p.receive, p.transmit);
+        let server = ServerInfo {
+            leap: Leap::None,
+            stratum: 1,
+            precision: -20,
+            root_delay: 0,
+            root_dispersion: 0,
+            reference_id: *b"GPS\0",
+            reference: p.reference,
+        };
+        let r = server_reply(&p, &server, p.receive, p.transmit);
         assert_eq!(
             r.as_ref().ok().map(|r| (r.mode, r.version)),
             answer.map(|m| (m, p.version))

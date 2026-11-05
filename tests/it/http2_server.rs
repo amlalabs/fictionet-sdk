@@ -256,7 +256,7 @@ fn replay() -> Trace {
         let config = Arc::new(tls::config_builder(&cx, date).with_safe_default_protocol_versions()?.with_no_client_auth().with_single_cert(vec![cert], key)?);
         let router = fictionet_test_support::handler(|ex: &mut fictionet::stdlib::web::httpd::Exchange<'_>, _: http::Request<bytes::Bytes>| http::Response::new(Bytes::from(ex.random_u64().to_be_bytes().to_vec())));
         let (attach, arrivals) = fictionet::attachments();
-        net::Net::new().ipv4_only().host("site", |host| host.at(SITE).dns_name("localhost").tls_accept(443, "localhost", move |_| config.clone(), httpd::Server::new(router).https())).start(&cx, arrivals)?;
+        net::Net::new(fictionet_extras::network::cdn_pools()).ipv4_only().host("site", |host| host.at(SITE).dns_name("localhost").tls_accept(443, "localhost", move |_| config.clone(), httpd::Server::new(router).https())).start(&cx, arrivals)?;
         let cable = filter(&cx, attach.attach("client")?, move |_, direction, packet| {
             packets.lock().unwrap().packets.push((direction == fictionet::stdlib::network::Direction::FromInner, packet.0.clone()));
             true
@@ -525,7 +525,7 @@ Reply::Now(http::Response::builder().status(404).body(Body::empty()).unwrap())
 })
 };
                     let (attach, arrivals) = fictionet::attachments();
-                    net::Net::new().ipv4_only().host("site", |host| host.at(SITE).dns_name("localhost").tls_accept(443, "localhost", move |_| config.clone(), httpd::Server::new(Site { handler: Arc::new(router), facts: observed, cancelled }).limits(httpd::Limits { body: 1024, ..Default::default() }).https())).start(&cx, arrivals)?;
+                    net::Net::new(fictionet_extras::network::cdn_pools()).ipv4_only().host("site", |host| host.at(SITE).dns_name("localhost").tls_accept(443, "localhost", move |_| config.clone(), httpd::Server::new(Site { handler: Arc::new(router), facts: observed, cancelled }).limits(httpd::Limits { body: 1024, ..Default::default() }).https())).start(&cx, arrivals)?;
                     let machine = sandbox::machine(&cx, attach.attach("client")?, Ipv4Addr::new(10, 0, 0, 2));
                     let listener = tokio::net::TcpListener::from_std(listener)?;
                     cx.spawn(move |cx| async move {

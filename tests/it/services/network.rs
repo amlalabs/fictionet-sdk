@@ -1,5 +1,5 @@
 use super::*;
-use fictionet::stdlib::world::net::Lan;
+use fictionet::stdlib::world::net::{Lan, Pools};
 use fictionet_test_support::ended_with_done;
 
 // ---------------------------------------------------------------------------
@@ -95,7 +95,7 @@ fn rejected_port_sharing_discards_preparations_at_every_endpoint() {
             let first = host("first.test");
             let (bad, good) = (host("bad.test"), host("good.test"));
             let (attacher, attachments) = fictionet::attachments();
-            Net::new()
+            Net::new(fictionet_extras::network::cdn_pools())
                 .add_host(first)
                 .resolve(move |name| match name {
                     "bad.test" => Some(bad.clone()),
@@ -173,7 +173,7 @@ fn failed_host_binding_leaves_no_route_service_or_registration() {
                 _ => unreachable!(),
             };
             let (attacher, attachments) = fictionet::attachments();
-            Net::new()
+            Net::new(fictionet_extras::network::cdn_pools())
                 .resolve(move |name| match name {
                     "bad.test" => Some(bad.clone()),
                     "good.test" => Some(
@@ -222,11 +222,11 @@ fn failed_lan_join_or_missing_tls_names_does_not_commit_services() {
                     });
             let net = if lan {
                 let corp = Lan::new("corp", "192.168.56.0/24".parse()?);
-                Net::new()
+                Net::new(fictionet_extras::network::cdn_pools())
                     .lan(&corp)
                     .add_host(host.on(&corp).at(Ipv4Addr::new(192, 168, 56, 255)))
             } else {
-                Net::new().add_host(host.tls_accept(
+                Net::new(fictionet_extras::network::cdn_pools()).add_host(host.tls_accept(
                     443,
                     Sni::Names,
                     |_| panic!("no handshake"),
@@ -255,7 +255,7 @@ fn a_second_family_bind_failure_preserves_existing_services() {
                 .ipv6_only()
                 .port_server(80, server.clone())
                 .udp(0, Arc::new(()), || EchoDatagrams);
-            let mut net = Net::new().add_host(first);
+            let mut net = Net::new(fictionet_extras::network::cdn_pools()).add_host(first);
             if existing_v4 {
                 net = net.add_host(
                     Host::new("first4")
@@ -336,7 +336,7 @@ fn a_rejected_host_does_not_install_http_names_or_a_default() {
             .port_server(80, server().default_host())
             .port_server(81, Spy::default());
         let (attacher, attachments) = fictionet::attachments();
-        Net::new()
+        Net::new(fictionet_extras::network::cdn_pools())
             .add_host(first)
             .resolve(move |_| Some(bad.clone()))
             .start(&fcx, attachments)?;
@@ -388,7 +388,7 @@ fn a_plc_and_a_web_server_on_one_net_with_observe_decoding_both() {
         // dashboard's decoder below.
         let packets: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
         let (attacher, attachments) = fictionet::attachments();
-        Net::new()
+        Net::new(fictionet_extras::network::cdn_pools())
             .ipv4_only()
             .host("plc", |h| {
                 h.at(PLC_ADDR)
@@ -524,7 +524,7 @@ fn net_serves_udp_services_and_trusted_sandboxes() {
             }
         }
         let (attacher, attachments) = fictionet::attachments();
-        Net::new()
+        Net::new(fictionet_extras::network::cdn_pools())
             .ipv4_only()
             .host("svc", |h| {
                 h.at(Ipv4Addr::new(10, 40, 0, 1))
@@ -604,7 +604,7 @@ fn net_caps_connections_per_service_and_bytes_per_sandbox() {
             sandbox_budget: 100 << 10,
             ..Default::default()
         };
-        Net::new()
+        Net::new(fictionet_extras::network::cdn_pools())
             .ipv4_only()
             .limits(limits)
             .host("svc", |h| {
@@ -641,7 +641,7 @@ fn net_serves_the_default_cap_of_connections_on_a_tcp_port() {
     crate::common::world::world(Duration::from_secs(60), |fcx| async move {
         let (attacher, attachments) = fictionet::attachments();
         let addr = Ipv4Addr::new(10, 40, 0, 3);
-        Net::new()
+        Net::new(fictionet_extras::network::cdn_pools())
             .ipv4_only()
             .host("svc", |h| h.at(addr).tcp(7, Arc::new(()), || Echo))
             .start(&fcx, attachments)?;
@@ -676,30 +676,36 @@ fn net_refuses_a_host_it_cannot_serve() {
                 .err()
                 .map(|e| e.to_string())
         };
-        let twice = fail(Net::new().host("a", |h| {
-            h.at(Ipv4Addr::new(10, 40, 0, 1))
-                .tcp(7, Arc::new(()), || Echo)
-                .tcp(7, Arc::new(()), || Echo)
-        }));
+        let twice = fail(
+            Net::new(fictionet_extras::network::cdn_pools()).host("a", |h| {
+                h.at(Ipv4Addr::new(10, 40, 0, 1))
+                    .tcp(7, Arc::new(()), || Echo)
+                    .tcp(7, Arc::new(()), || Echo)
+            }),
+        );
         assert!(
             twice
                 .as_deref()
                 .is_some_and(|e| e.contains("already served")),
             "{twice:?}"
         );
-        let bad = fail(Net::new().host("b", |h| {
-            h.at(Ipv4Addr::new(224, 0, 0, 1))
-                .tcp(7, Arc::new(()), || Echo)
-        }));
+        let bad = fail(
+            Net::new(fictionet_extras::network::cdn_pools()).host("b", |h| {
+                h.at(Ipv4Addr::new(224, 0, 0, 1))
+                    .tcp(7, Arc::new(()), || Echo)
+            }),
+        );
         assert!(
             bad.as_deref().is_some_and(|e| e.contains("224.0.0.1")),
             "{bad:?}"
         );
-        let udp = fail(Net::new().host("c", |h| {
-            h.at(Ipv4Addr::new(10, 40, 0, 2))
-                .udp(9, Arc::new(()), || EchoDatagrams)
-                .udp(9, Arc::new(()), || EchoDatagrams)
-        }));
+        let udp = fail(
+            Net::new(fictionet_extras::network::cdn_pools()).host("c", |h| {
+                h.at(Ipv4Addr::new(10, 40, 0, 2))
+                    .udp(9, Arc::new(()), || EchoDatagrams)
+                    .udp(9, Arc::new(()), || EchoDatagrams)
+            }),
+        );
         assert!(udp.is_some(), "{udp:?}");
         // TLS and plain on one port, in either order. Before, the port
         // served only TLS.
@@ -707,25 +713,29 @@ fn net_refuses_a_host_it_cannot_serve() {
             unreachable!("no handshake happens")
         };
         let at = Ipv4Addr::new(10, 40, 0, 3);
-        let tls_first = fail(Net::new().host("d", |h| {
-            h.at(at)
-                .tls_accept(443, Sni::Any, config, Spy::default())
-                .tcp(443, Arc::new(()), || Echo)
-        }));
+        let tls_first = fail(
+            Net::new(fictionet_extras::network::cdn_pools()).host("d", |h| {
+                h.at(at)
+                    .tls_accept(443, Sni::Any, config, Spy::default())
+                    .tcp(443, Arc::new(()), || Echo)
+            }),
+        );
         assert!(
             tls_first
                 .as_deref()
                 .is_some_and(|e| e.contains("serves TLS")),
             "{tls_first:?}"
         );
-        let plain_first = fail(Net::new().host("e", |h| {
-            h.at(at).tcp(443, Arc::new(()), || Echo).tls_accept(
-                443,
-                Sni::Any,
-                config,
-                Spy::default(),
-            )
-        }));
+        let plain_first = fail(
+            Net::new(fictionet_extras::network::cdn_pools()).host("e", |h| {
+                h.at(at).tcp(443, Arc::new(()), || Echo).tls_accept(
+                    443,
+                    Sni::Any,
+                    config,
+                    Spy::default(),
+                )
+            }),
+        );
         assert!(
             plain_first
                 .as_deref()
@@ -767,7 +777,7 @@ fn hosts_and_members_share_a_lan_on_the_net() {
         let dc: Ipv4Addr = "192.168.56.10".parse()?;
         let ws: Ipv4Addr = "192.168.56.31".parse()?;
         let group = SocketAddr::new(Ipv4Addr::new(239, 1, 1, 1).into(), 30001);
-        Net::new()
+        Net::new(fictionet_extras::network::cdn_pools())
             .ipv4_only()
             .lan(&corp)
             .host("dc01", |h| {
@@ -844,7 +854,7 @@ fn trusted_routes_attribute_requests_and_refusals() {
     crate::common::world::world(Duration::from_secs(10), |fcx| async move {
         let (attacher, attachments) = fictionet::attachments();
         let address: Ipv4Addr = "192.168.56.50".parse()?;
-        Net::new()
+        Net::new(fictionet_extras::network::cdn_pools())
             .ipv4_only()
             .host("office", |host| {
                 host.at(PLC_ADDR).dns_name("office.internal")
@@ -887,28 +897,35 @@ fn net_refuses_lans_that_overlap() {
         };
         let p = |s: &str| s.parse::<Prefix>().unwrap();
         assert!(
-            fail(Net::new().lan(&Lan::new("a", p("10.0.0.0/16"))))
-                .is_some_and(|e| e.contains("sandboxes"))
+            fail(
+                Net::new(fictionet_extras::network::cdn_pools())
+                    .lan(&Lan::new("a", p("10.0.0.0/16")))
+            )
+            .is_some_and(|e| e.contains("sandboxes"))
         );
         assert!(
             fail(
-                Net::new()
+                Net::new(fictionet_extras::network::cdn_pools())
                     .lan(&Lan::new("a", p("192.168.0.0/16")))
                     .lan(&Lan::new("b", p("192.168.56.0/24")))
             )
             .is_some_and(|e| e.contains("overlaps LAN a"))
         );
         assert!(
-            fail(Net::new().lan(&Lan::new("a", p("192.168.56.0/24"))).member(
-                "vm",
-                &Lan::new("a", p("192.168.56.0/24")),
-                "192.168.56.1".parse().unwrap()
-            ))
+            fail(
+                Net::new(fictionet_extras::network::cdn_pools())
+                    .lan(&Lan::new("a", p("192.168.56.0/24")))
+                    .member(
+                        "vm",
+                        &Lan::new("a", p("192.168.56.0/24")),
+                        "192.168.56.1".parse().unwrap()
+                    )
+            )
             .is_some()
         );
         assert!(
             fail(
-                Net::new()
+                Net::new(fictionet_extras::network::cdn_pools())
                     .lan(&Lan::new("a", p("192.168.56.0/24")))
                     .host("x", |h| h.at(Ipv4Addr::new(192, 168, 56, 5)))
             )
@@ -977,7 +994,7 @@ fn net_keeps_one_budget_per_attachment() {
         let me6: Ipv6Addr = "2001:db8::2".parse()?;
         let spy = Spy::default();
         let budgets = spy.0.clone();
-        Net::new()
+        Net::new(fictionet_extras::network::cdn_pools())
             .host("svc", |h| {
                 h.at(addr)
                     .at(addr6)
@@ -1050,7 +1067,7 @@ fn a_lan_member_detaches_like_any_sandbox() {
         let ws: Ipv4Addr = "192.168.56.31".parse()?;
         {
             let corp = Lan::new("corp", "192.168.56.0/24".parse()?);
-            Net::new()
+            Net::new(fictionet_extras::network::cdn_pools())
                 .ipv4_only()
                 .lan(&corp)
                 .host("dc01", |h| {
@@ -1086,7 +1103,7 @@ fn a_lan_member_detaches_like_any_sandbox() {
 fn lan_cannot_overlap_the_automatic_address_pool() {
     world(Duration::from_secs(60), |fcx| async move {
         let (_, attachments) = fictionet::attachments();
-        let error = Net::new()
+        let error = Net::new(fictionet_extras::network::cdn_pools())
             .ipv4_only()
             .lan(&Lan::new("lab", "104.18.0.0/24".parse()?))
             .start(&fcx, attachments)
@@ -1100,11 +1117,79 @@ fn lan_cannot_overlap_the_automatic_address_pool() {
 fn ipv6_lan_cannot_overlap_the_automatic_address_pool() {
     world(Duration::from_secs(60), |fcx| async move {
         let (_, attachments) = fictionet::attachments();
-        let error = Net::new()
+        let error = Net::new(fictionet_extras::network::cdn_pools())
             .lan(&Lan::new("lab", "2606:4700:100::/64".parse()?))
             .start(&fcx, attachments)
             .expect_err("overlapping LAN is refused");
         assert!(error.to_string().contains("automatic address pool"));
+        Ok(())
+    });
+}
+
+/// Hosts without `at` take addresses from the pools the world gives, and
+/// LANs are checked against those pools, not any other range.
+#[test]
+fn hosts_and_lans_follow_the_supplied_pools() {
+    let other = Pools {
+        v4: Some("23.32.0.0/11".parse().unwrap()),
+        v6: Some("2a02:26f0::/32".parse().unwrap()),
+    };
+    for (pools, first) in [
+        (fictionet_extras::network::cdn_pools(), "104.18.0.1"),
+        (other, "23.32.0.1"),
+    ] {
+        world(Duration::from_secs(60), move |fcx| async move {
+            let (attacher, attachments) = fictionet::attachments();
+            Net::new(pools)
+                .ipv4_only()
+                .host("www", |h| {
+                    h.dns_name("www.test").tcp(7, Arc::new(()), || Echo)
+                })
+                .host("plc", |h| {
+                    h.dns_name("plc.test").tcp(7, Arc::new(()), || Echo)
+                })
+                .start(&fcx, attachments)?;
+            let m = machine(&fcx, attacher.attach("client")?, ME);
+            let first: Ipv4Addr = first.parse()?;
+            assert_eq!(lookup(&fcx, &m, "www.test").await, Some(first));
+            assert_eq!(
+                lookup(&fcx, &m, "plc.test").await,
+                Some(Ipv4Addr::from(u32::from(first) + 1))
+            );
+            Ok(())
+        });
+    }
+    world(Duration::from_secs(60), move |fcx| async move {
+        let (_, attachments) = fictionet::attachments();
+        let error = Net::new(other)
+            .lan(&Lan::new("lab", "23.32.4.0/24".parse()?))
+            .start(&fcx, attachments)
+            .expect_err("a LAN in the supplied pool is refused");
+        assert!(error.to_string().contains("automatic address pool"));
+        Ok(())
+    });
+    world(Duration::from_secs(60), move |fcx| async move {
+        let (_, attachments) = fictionet::attachments();
+        Net::new(other)
+            .lan(&Lan::new("lab", "104.18.0.0/24".parse()?))
+            .lan(&Lan::new("lab6", "2606:4700:100::/64".parse()?))
+            .start(&fcx, attachments)?;
+        Ok(())
+    });
+}
+
+/// With no pools, every host needs `at`.
+#[test]
+fn without_pools_a_host_needs_an_address() {
+    world(Duration::from_secs(60), |fcx| async move {
+        let (_, attachments) = fictionet::attachments();
+        let error = Net::new(Pools::NONE)
+            .host("www", |h| {
+                h.dns_name("www.test").tcp(7, Arc::new(()), || Echo)
+            })
+            .start(&fcx, attachments)
+            .expect_err("a host with no address is refused");
+        assert!(error.to_string().contains("no address"), "{error}");
         Ok(())
     });
 }

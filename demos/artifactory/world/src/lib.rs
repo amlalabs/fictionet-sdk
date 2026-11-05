@@ -197,7 +197,7 @@ pub fn network(
         .tls(configs[i].clone());
         Some(if i == 0 { s.default_host() } else { s })
     };
-    let mut net = web::Sites::new(|_| None)
+    let mut net = web::Sites::new(fictionet_extras::network::cdn_pools(), |_| None)
         .into_net()
         .subnet(route::Prefix {
             addr: SUBNET.0.into(),

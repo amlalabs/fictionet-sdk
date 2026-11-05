@@ -31,7 +31,7 @@
 //! let directory = Arc::new(Directory);
 //! let plant = Arc::new(Plant);
 //! let intranet = httpd::tower(axum::Router::new().route("/", axum::routing::get(|| async { "intranet\n" })));
-//! Net::new()
+//! Net::new(fictionet_extras::network::cdn_pools())
 //!     .host("dc01", |h| h.at("10.20.0.10".parse::<std::net::Ipv4Addr>().unwrap()).dns_name("dc01.corp.test").tcp(389, directory.clone(), || Ldap))
 //!     .host("www", |h| h.dns_name("intranet.corp.test").port_server(80, httpd::Server::new(intranet)))
 //!     .host("plc1", |h| h.at("10.30.0.5".parse::<std::net::Ipv4Addr>().unwrap()).tcp(502, plant, || Plc))
@@ -68,8 +68,8 @@
 //!   each host's names, NODATA for other types, NXDOMAIN for every other
 //!   name.
 //! - **Addresses.** A host with [`Host::at`] uses that address; otherwise
-//!   it gets a free one from `104.18.0.0/15` (IPv4) and `2606:4700:100::/48`
-//!   (IPv6). Hosts with the same address share one machine.
+//!   it gets a free one from the world's [`Pools`], one per address family.
+//!   Hosts with the same address share one machine.
 //! - **A router** with one route per machine. A packet for any other address
 //!   gets ICMP "host unreachable" (ICMPv6 "address unreachable"), or is silently
 //!   dropped with [`Net::drop_unrouted`]. The router is
@@ -132,7 +132,7 @@ mod dns;
 mod hosts;
 mod names;
 
-use addresses::{AUTO, AUTO6, Leases, Subnet, Subnet6};
+use addresses::{Leases, Subnet, Subnet6, check_pools};
 use attachments::{Hooks, filter, udp_packet};
 use dns::start_dns;
 use hosts::{
@@ -199,9 +199,9 @@ type Resolver = dyn Fn(&str) -> Option<Host> + Send + Sync;
 /// A LAN definition shared by a network, its hosts and attached members.
 ///
 /// ```
-/// use fictionet::stdlib::world::net::{Lan, Net};
+/// use fictionet::stdlib::world::net::{Lan, Net, Pools};
 /// let office = Lan::new("office", "192.168.56.0/24".parse()?);
-/// let net = Net::new().lan(&office)
+/// let net = Net::new(Pools::NONE).lan(&office)
 ///     .host("directory", |host| host.on(&office))
 ///     .member("workstation", &office, "192.168.56.20".parse()?);
 /// # Ok::<(), fictionet::Error>(())
@@ -222,9 +222,58 @@ impl Lan {
     }
 }
 
+/// Where hosts without a fixed address ([`Host::at`]) get theirs, one
+/// prefix per address family. The world chooses them: the addresses are
+/// what sandboxes see in DNS answers and connections.
+/// `fictionet_extras::network::cdn_pools` gives public CDN space.
+///
+/// A family with no pool has no automatic addresses: its hosts need
+/// [`Host::at`], or have only the other family. An IPv4 pool must have a
+/// length of at most 30, and its first and last addresses are never handed
+/// out; an IPv6 pool at most 127, and its first address is never handed
+/// out. Otherwise [`Net::start`] fails. Addresses in the sandboxes'
+/// subnets and addresses no host may have are skipped.
+///
+/// ```
+/// use fictionet::stdlib::world::net::{Net, Pools};
+/// let cdn = Net::new(fictionet_extras::network::cdn_pools());
+/// let own = Net::new(Pools {
+///     v4: Some("104.16.0.0/13".parse()?),
+///     v6: None,
+/// });
+/// let explicit = Net::new(Pools::NONE);
+/// # Ok::<(), fictionet::Error>(())
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pools {
+    /// The IPv4 pool.
+    pub v4: Option<Prefix>,
+    /// The IPv6 pool.
+    pub v6: Option<Prefix>,
+}
+
+impl Pools {
+    /// No automatic addresses: every host needs [`Host::at`].
+    pub const NONE: Pools = Pools { v4: None, v6: None };
+}
+
+/// The pools the network's own tests use.
+#[cfg(test)]
+const TEST_POOLS: Pools = Pools {
+    v4: Some(Prefix {
+        addr: IpAddr::V4(Ipv4Addr::new(104, 18, 0, 0)),
+        len: 15,
+    }),
+    v6: Some(Prefix {
+        addr: IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x100, 0, 0, 0, 0, 0)),
+        len: 48,
+    }),
+};
+
 /// A network of hosts and services, and the sandboxes' side of it. See the
 /// [module docs](self).
 pub struct Net {
+    pools: Pools,
     subnet: Prefix,
     subnet_v6: Prefix,
     ipv6: bool,
@@ -240,16 +289,12 @@ pub struct Net {
     members: Vec<(String, Lan, IpAddr)>,
 }
 
-impl Default for Net {
-    fn default() -> Net {
-        Net::new()
-    }
-}
-
 impl Net {
-    /// An empty network with the default subnets, dual-stack.
-    pub fn new() -> Net {
+    /// An empty network with the default subnets, dual-stack, whose hosts
+    /// without [`Host::at`] get addresses from `pools`.
+    pub fn new(pools: Pools) -> Net {
         Net {
+            pools,
             subnet: Prefix {
                 addr: Ipv4Addr::new(10, 0, 0, 0).into(),
                 len: 24,
@@ -383,8 +428,8 @@ impl Net {
     /// for members to use.
     ///
     /// [`start`](Net::start) fails if the LAN prefix overlaps the sandboxes'
-    /// subnets, the automatic address pools (`104.18.0.0/15` and
-    /// `2606:4700:100::/48`), or another LAN, or leaves no room for members.
+    /// subnets, the network's [`Pools`], or another LAN, or leaves no room
+    /// for members.
     pub fn lan(mut self, lan: &Lan) -> Net {
         self.lans.push(lan.clone());
         self
@@ -419,6 +464,7 @@ impl Net {
 
     /// [`start`](Net::start), returning the state the network's tasks share.
     fn launch(self, fcx: &Cx, mut attachments: Attachments) -> Result<Arc<Shared>, Error> {
+        check_pools(&self.pools)?;
         let subnet = Subnet::new(self.subnet)?;
         let subnet6 = if self.ipv6 {
             Some(Subnet6::new(self.subnet_v6)?)
@@ -469,9 +515,9 @@ impl Net {
         let lans = make_lans(
             fcx,
             &router,
-            &hooks,
             &subnet,
             subnet6.as_ref(),
+            &self.pools,
             self.lans,
             &self.members,
         )?;
@@ -483,7 +529,7 @@ impl Net {
             subnet6,
             router,
             world: Arc::new(Mutex::new({
-                let mut world = World::new(self.max_hosts);
+                let mut world = World::new(self.max_hosts, self.pools);
                 if !self.keep_misses {
                     world.max_unknown = 0;
                 }
@@ -654,15 +700,19 @@ struct LanSeg {
 fn make_lans(
     fcx: &Cx,
     router: &Router<Box<dyn Interface>>,
-    _hooks: &Arc<Hooks>,
     subnet: &Subnet,
     subnet6: Option<&Subnet6>,
+    pools: &Pools,
     lans: Vec<Lan>,
     members: &[(String, Lan, IpAddr)],
 ) -> Result<BTreeMap<String, LanSeg>, Error> {
     let mut made: BTreeMap<String, LanSeg> = BTreeMap::new();
     for Lan { name, prefix } in lans {
-        if prefix.overlaps(AUTO) || prefix.overlaps(AUTO6) {
+        if [pools.v4, pools.v6]
+            .into_iter()
+            .flatten()
+            .any(|pool| prefix.overlaps(pool))
+        {
             return Err(fictionet::Error::msg(format!(
                 "LAN {name}: {}/{} overlaps the automatic address pool",
                 prefix.addr, prefix.len
@@ -835,9 +885,9 @@ mod tests {
                 let lans = make_lans(
                     &fcx,
                     &router,
-                    &hooks,
                     &subnet,
                     None,
+                    &TEST_POOLS,
                     [
                         ("z", "10.0.1.0/24"),
                         ("a", "10.0.3.0/24"),
@@ -853,7 +903,7 @@ mod tests {
                     subnet,
                     subnet6: None,
                     router,
-                    world: Arc::new(Mutex::new(World::new(MAX_HOSTS))),
+                    world: Arc::new(Mutex::new(World::new(MAX_HOSTS, TEST_POOLS))),
                     leases: Arc::default(),
                     gateway_tcp: Arc::default(),
                     hooks,
@@ -929,7 +979,7 @@ mod tests {
                     gone: gone.clone(),
                 };
                 let (attacher, attachments) = fictionet::attachments();
-                let net = Net::new()
+                let net = Net::new(TEST_POOLS)
                     .ipv4_only()
                     .host("svc", |h| {
                         h.at(server)
@@ -1061,7 +1111,7 @@ mod tests {
                 let server = Ipv4Addr::new(10, 40, 0, 1);
                 let from = Arc::new(Mutex::new(Vec::new()));
                 let (attacher, attachments) = fictionet::attachments();
-                Net::new()
+                Net::new(TEST_POOLS)
                     .ipv4_only()
                     .host("svc", |h| {
                         h.at(server).port_server(22, Answers { from: from.clone() })
@@ -1157,7 +1207,7 @@ mod tests {
                 let server = Ipv4Addr::new(10, 40, 0, 1);
                 let from = Arc::new(Mutex::new(Vec::new()));
                 let (attacher, attachments) = fictionet::attachments();
-                Net::new()
+                Net::new(TEST_POOLS)
                     .ipv4_only()
                     .host("svc", |h| {
                         h.at(server).port_server(
@@ -1223,7 +1273,7 @@ mod tests {
                 let server6: IpAddr = "2001:db8:40::1".parse()?;
                 let from = Arc::new(Mutex::new(Vec::new()));
                 let (attacher, attachments) = fictionet::attachments();
-                Net::new()
+                Net::new(TEST_POOLS)
                     .host("svc", |h| {
                         h.at(server4).at(server6).port_server(
                             22,
@@ -1281,7 +1331,7 @@ mod unreachable_tests {
                 let facts = Arc::new(Mutex::new(Vec::new()));
                 let recorded = facts.clone();
                 let (attacher, attachments) = fictionet::attachments();
-                Net::new()
+                Net::new(TEST_POOLS)
                     .drop_unrouted()
                     .on_unreachable(move |fact| recorded.lock().push(fact))
                     .start(&cx, attachments)?;
@@ -1323,7 +1373,7 @@ mod unreachable_tests {
                 let facts = Arc::new(Mutex::new(Vec::new()));
                 let recorded = facts.clone();
                 let (attacher, attachments) = fictionet::attachments();
-                Net::new()
+                Net::new(TEST_POOLS)
                     .on_unreachable(move |fact| recorded.lock().push(fact))
                     .start(&cx, attachments)?;
                 let mut guest = attacher.attach("guest")?;

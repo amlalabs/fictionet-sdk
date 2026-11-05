@@ -60,7 +60,7 @@
 //! let message = stream.next().unwrap().unwrap();
 //! assert_eq!(Prelogin::parse(&message.data), Ok(hello));
 //!
-//! let mut login = Login7::new();
+//! let mut login = fictionet_extras::sql_server::odbc_login();
 //! login.user_name = "sa".into();
 //! login.password = "hunter2".into();
 //! let bytes = Message::new(packet_type::LOGIN7, login.to_bytes().unwrap()).to_bytes().unwrap();
@@ -74,7 +74,8 @@
 //! let message = stream.next().unwrap().unwrap();
 //! assert_eq!(SqlBatch::parse(&message.data, true), Ok(batch));
 //!
-//! let name = Column::new("name", TypeInfo::string(data_type::NVARCHAR, 100));
+//! let collation = fictionet_extras::sql_server::LATIN1_GENERAL_CI_AS;
+//! let name = Column::new("name", TypeInfo::string(data_type::NVARCHAR, 100, collation));
 //! let reply = TokenStream(vec![
 //!     Token::ColMetadata(Some(vec![name])),
 //!     Token::Row(vec![Value::Text("alice".into())]),
@@ -135,9 +136,6 @@ pub const MAX_COLUMNS: usize = 4096;
 const MAX_DECODED_UNITS: usize = 1 << 20;
 /// The decoded-unit budget's name in [`Error::Limit`].
 const DECODED_UNITS: &str = "response decoded units";
-/// The collation SQL Server sends by default: Latin1_General_CI_AS
-/// (US English, case insensitive, accent sensitive).
-pub const DEFAULT_COLLATION: [u8; 5] = [0x09, 0x04, 0xd0, 0x00, 0x34];
 
 /// Packet types: what kind of message a packet belongs to.
 pub mod packet_type {
@@ -1119,44 +1117,7 @@ pub struct Login7 {
     pub features: Option<Vec<Feature>>,
 }
 
-impl Default for Login7 {
-    fn default() -> Login7 {
-        Login7::new()
-    }
-}
-
 impl Login7 {
-    /// A TDS 7.4 login asking for 4096-byte packets, with the option bits
-    /// an ODBC client sends and every string empty.
-    pub fn new() -> Login7 {
-        Login7 {
-            tds_version: tds_version::V7_4,
-            packet_size: 4096,
-            client_prog_ver: 0,
-            client_pid: 0,
-            connection_id: 0,
-            option_flags1: 0xe0,
-            option_flags2: 0x03,
-            type_flags: 0,
-            option_flags3: 0,
-            client_time_zone: 0,
-            client_lcid: 0x0409,
-            host_name: String::new(),
-            user_name: String::new(),
-            password: String::new(),
-            app_name: String::new(),
-            server_name: String::new(),
-            client_interface: String::new(),
-            language: String::new(),
-            database: String::new(),
-            client_id: [0; 6],
-            sspi: Vec::new(),
-            attach_db_file: String::new(),
-            change_password: String::new(),
-            features: None,
-        }
-    }
-
     fn read(data: &[u8]) -> Result<Login7, Error> {
         if data.len() < LOGIN7_FIXED_LEN {
             return Err(Error::Truncated);
@@ -1731,12 +1692,13 @@ impl TypeInfo {
     }
 
     /// A character column, such as [`data_type::NVARCHAR`], of at most
-    /// `max_len` bytes, with the [`DEFAULT_COLLATION`]. A `max_len` of
-    /// 0xFFFF makes it varchar(max) or nvarchar(max).
-    pub fn string(ty: u8, max_len: u16) -> TypeInfo {
+    /// `max_len` bytes, with `collation`: the five bytes of a TDS
+    /// collation (MS-TDS 2.2.5.1.2). A `max_len` of 0xFFFF makes it
+    /// varchar(max) or nvarchar(max).
+    pub fn string(ty: u8, max_len: u16, collation: [u8; 5]) -> TypeInfo {
         TypeInfo {
             max_len: u32::from(max_len),
-            collation: Some(DEFAULT_COLLATION),
+            collation: Some(collation),
             ..TypeInfo::bare(ty)
         }
     }
@@ -3463,6 +3425,40 @@ mod tests {
         Token::Other { token, data }
     }
 
+    /// Latin1_General_CI_AS, the collation of the tests' character columns.
+    const COLLATION: [u8; 5] = [0x09, 0x04, 0xd0, 0x00, 0x34];
+
+    /// A TDS 7.4 login asking for 4096-byte packets, with the option bits
+    /// an ODBC client sends, US English, and every string empty.
+    fn fixture_login() -> Login7 {
+        Login7 {
+            tds_version: tds_version::V7_4,
+            packet_size: 4096,
+            client_prog_ver: 0,
+            client_pid: 0,
+            connection_id: 0,
+            option_flags1: 0xe0,
+            option_flags2: 0x03,
+            type_flags: 0,
+            option_flags3: 0,
+            client_time_zone: 0,
+            client_lcid: 0x0409,
+            host_name: String::new(),
+            user_name: String::new(),
+            password: String::new(),
+            app_name: String::new(),
+            server_name: String::new(),
+            client_interface: String::new(),
+            language: String::new(),
+            database: String::new(),
+            client_id: [0; 6],
+            sspi: Vec::new(),
+            attach_db_file: String::new(),
+            change_password: String::new(),
+            features: None,
+        }
+    }
+
     use super::*;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream};
     use fictionet::stdlib::test_support::hex;
@@ -3617,13 +3613,13 @@ mod tests {
         // 0x00 becomes 0xA5.
         let login = Login7 {
             password: "a".into(),
-            ..Login7::new()
+            ..fixture_login()
         };
         let bytes = login.to_bytes().unwrap();
         let start = usize::from(le16(&bytes, 44).unwrap());
         assert_eq!(&bytes[start..start + 2], &[0xb3, 0xa5]);
         assert_eq!(Login7::parse(&bytes), Ok(login));
-        let mut l = Login7::new();
+        let mut l = fixture_login();
         l.password = "s3cr\u{e9}t".to_string();
         l.option_flags3 = option_flags3::CHANGE_PASSWORD;
         l.change_password = "n\u{1f600}w".to_string();
@@ -3635,7 +3631,7 @@ mod tests {
 
     #[test]
     fn login_round_trip_with_everything() {
-        let mut l = Login7::new();
+        let mut l = fixture_login();
         l.host_name = "WS-17".into();
         l.user_name = "agent".into();
         l.password = "pw".into();
@@ -3681,7 +3677,7 @@ mod tests {
                     .collect(),
             ),
             option_flags3: option_flags3::EXTENSION,
-            ..Login7::new()
+            ..fixture_login()
         };
         assert_eq!(Login7::parse(&fits.to_bytes().unwrap()), Ok(fits.clone()));
         let mut bad = Vec::new();
@@ -3720,7 +3716,7 @@ mod tests {
     fn login_errors() {
         let good = Login7 {
             user_name: "sa".into(),
-            ..Login7::new()
+            ..fixture_login()
         }
         .to_bytes()
         .unwrap();
@@ -3756,7 +3752,7 @@ mod tests {
             Err(Error::Invalid("LOGIN7 extension length"))
         );
         // A feature block without its terminator, and one pointing away.
-        let mut l = Login7::new();
+        let mut l = fixture_login();
         l.option_flags3 |= option_flags3::EXTENSION;
         l.features = Some(vec![fixture_feature(1, vec![9])]);
         let b = l.to_bytes().unwrap();
@@ -3871,7 +3867,7 @@ mod tests {
             tokens[2],
             Token::EnvChange(EnvChange::Bytes {
                 kind: env_type::COLLATION,
-                new: DEFAULT_COLLATION.to_vec(),
+                new: COLLATION.to_vec(),
                 old: vec![]
             })
         );
@@ -3921,7 +3917,7 @@ mod tests {
         let col = Column {
             user_type: 0,
             flags: 0x0020,
-            type_info: TypeInfo::string(data_type::BIGVARCHAR, 3),
+            type_info: TypeInfo::string(data_type::BIGVARCHAR, 3, COLLATION),
             name: "bar".into(),
         };
         assert_eq!(
@@ -4161,9 +4157,12 @@ mod tests {
         v.push(Column::new("t", TypeInfo::scaled(TIMEN, 7)));
         v.push(Column::new("t2", TypeInfo::scaled(DATETIME2N, 3)));
         v.push(Column::new("to", TypeInfo::scaled(DATETIMEOFFSETN, 0)));
-        v.push(Column::new("s", TypeInfo::string(NVARCHAR, 40)));
-        v.push(Column::new("m", TypeInfo::string(NVARCHAR, 0xffff)));
-        v.push(Column::new("c", TypeInfo::string(BIGCHAR, 4)));
+        v.push(Column::new("s", TypeInfo::string(NVARCHAR, 40, COLLATION)));
+        v.push(Column::new(
+            "m",
+            TypeInfo::string(NVARCHAR, 0xffff, COLLATION),
+        ));
+        v.push(Column::new("c", TypeInfo::string(BIGCHAR, 4, COLLATION)));
         v.push(Column::new("b", TypeInfo::binary(BIGVARBINARY, 0xffff)));
         v.push(Column::new("bb", TypeInfo::binary(BIGBINARY, 2)));
         v.push(Column {
@@ -4474,7 +4473,7 @@ mod tests {
             (TypeInfo::fixed(data_type::DATEN), &[2, 0, 0]) => Err(Error::Invalid("date length")),
             (TypeInfo::scaled(data_type::TIMEN, 7), &[3, 0, 0, 0]) =>
                 Err(Error::Invalid("time length")),
-            (TypeInfo::string(data_type::NVARCHAR, 10), &[1, 0, 0]) =>
+            (TypeInfo::string(data_type::NVARCHAR, 10, COLLATION), &[1, 0, 0]) =>
                 Err(Error::Invalid("UTF-16 text of odd length")),
             (
                 TypeInfo::binary(data_type::BIGVARBINARY, 0xffff),
@@ -4507,7 +4506,7 @@ mod tests {
     /// ibChangePassword at byte 86, in that order.
     #[test]
     fn login_attach_file_and_change_password_offsets() {
-        let mut l = Login7::new();
+        let mut l = fixture_login();
         l.attach_db_file = "a.mdf".into();
         l.option_flags3 = option_flags3::CHANGE_PASSWORD;
         l.change_password = "new".into();
@@ -4528,7 +4527,7 @@ mod tests {
     fn login_spec_rules() {
         let good = Login7 {
             user_name: "sa".into(),
-            ..Login7::new()
+            ..fixture_login()
         }
         .to_bytes()
         .unwrap();
@@ -4549,7 +4548,7 @@ mod tests {
             Login7::parse(&b),
             Err(Error::Invalid("LOGIN7 field outside the record"))
         );
-        let mut l = Login7::new();
+        let mut l = fixture_login();
         l.option_flags3 |= option_flags3::EXTENSION;
         l.features = Some(vec![fixture_feature(1, vec![])]);
         let b = l.to_bytes().unwrap();
@@ -4733,7 +4732,7 @@ mod tests {
         block.extend(std::iter::repeat_n(7u8, 65000));
         block.push(0xff);
         block.resize(MAX_SSPI, 0);
-        let mut l = Login7::new();
+        let mut l = fixture_login();
         for s in [
             &mut l.host_name,
             &mut l.user_name,
@@ -4881,7 +4880,7 @@ mod tests {
         );
         assert_eq!(takes(intn.clone(), Value::Int(5)), Ok(()));
         assert_eq!(takes(intn.clone(), Value::SmallInt(5)), Ok(()));
-        let s = TypeInfo::string(NVARCHAR, 2);
+        let s = TypeInfo::string(NVARCHAR, 2, COLLATION);
         assert_eq!(
             takes(s.clone(), Value::Text("ab".into())),
             Err(Error::Unwritable)
@@ -5170,9 +5169,9 @@ mod tests {
     /// 0. A new password was written without the flag, and read.
     #[test]
     fn change_password_needs_its_flag() {
-        let b = Login7::new().to_bytes().unwrap();
+        let b = fixture_login().to_bytes().unwrap();
         assert_eq!(le16(&b, 86).unwrap(), 0);
-        let mut l = Login7::new();
+        let mut l = fixture_login();
         l.change_password = "new".into();
         assert_eq!(l.to_bytes(), Err(Error::Unwritable));
         l.option_flags3 = option_flags3::CHANGE_PASSWORD;
@@ -5195,7 +5194,7 @@ mod tests {
         let l = Login7 {
             features: Some(vec![]),
             option_flags3: option_flags3::EXTENSION,
-            ..Login7::new()
+            ..fixture_login()
         };
         let mut b = l.to_bytes().unwrap();
         assert_eq!(b.len(), 98);
@@ -5232,7 +5231,7 @@ mod tests {
         assert_eq!(ok(&[0x29, 1, 8, 1, 0, 0, 0, 0]), Err(Error::Unwritable));
         // nvarchar of max length 4, holding "ab", then too long, then odd.
         let mut nv = vec![0xe7, 7];
-        nv.extend_from_slice(&DEFAULT_COLLATION);
+        nv.extend_from_slice(&COLLATION);
         nv.extend_from_slice(&4u16.to_le_bytes());
         assert_eq!(ok(&[&nv[..], &[b'a', 0, b'b', 0]].concat()), Ok(()));
         assert_eq!(
@@ -5614,7 +5613,7 @@ mod tests {
             strip(LOGIN_RESPONSE_EXAMPLE),
             strip(BATCH_RESPONSE_EXAMPLE),
         ];
-        let mut l = Login7::new();
+        let mut l = fixture_login();
         l.password = "pw".into();
         l.sspi = vec![1, 2, 3];
         l.option_flags3 |= option_flags3::EXTENSION;

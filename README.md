@@ -112,7 +112,7 @@ fn world(
     wikipedia_tls: Arc<ServerConfig>,
     stripe_tls: Arc<ServerConfig>,
 ) -> Result {
-    web::Sites::new(move |host: &str| match host {
+    web::Sites::new(fictionet_extras::network::cdn_pools(), move |host: &str| match host {
         "en.wikipedia.org" => Some(
             web::Site::new(wiki.clone())
                 .at(Ipv4Addr::new(185, 15, 59, 224))

@@ -1,6 +1,7 @@
 //! Ethernet frames between one guest and its attachment.
 
 use super::net::RxQueue;
+use fictionet::stdlib::network::ethernet::frame::Mac;
 use fictionet::stdlib::network::ethernet::{Family, FromVm, Link};
 use fictionet::{Cx, End, Interface, InterfaceExt, Packet, RecvError};
 use tokio::sync::mpsc::Receiver;
@@ -13,11 +14,12 @@ pub async fn run(
     rx: RxQueue,
     mut sandbox: End,
     fcx: Cx,
+    gateway: Mac,
     family: Family<std::net::Ipv4Addr>,
     address: tokio::sync::watch::Sender<Option<std::net::Ipv4Addr>>,
 ) {
-    let mut link =
-        Link::new(family, Family::Off, super::MTU).expect("Guest::validate built this card");
+    let mut link = Link::new(gateway, family, Family::Off, super::MTU)
+        .expect("Guest::validate built this card");
     loop {
         tokio::select! {
             frame = to_world.recv() => {

@@ -123,9 +123,10 @@ fn dates_come_from_the_world() {
                         }),
                     )
                     .fallback(|| async { "hello" });
-                let mut sites = web::Sites::new(move |name: &str| {
-                    (name == "dated.test").then(|| web::Site::new(site.clone()))
-                });
+                let mut sites =
+                    web::Sites::new(fictionet_extras::network::cdn_pools(), move |name: &str| {
+                        (name == "dated.test").then(|| web::Site::new(site.clone()))
+                    });
                 if let Some(date) = date {
                     sites = sites.date(date);
                 }
@@ -393,7 +394,7 @@ async fn the_proxy_answers_502_when_the_real_site_cannot_be_reached() {
         run(fictionet::Seed::random(), |fcx| async move {
             let (attacher, attachments) = fictionet::attachments();
             let upstream = web::proxy(&fcx, std::sync::Arc::new(fictionet_host::Client::new()))?;
-            web::Sites::new(move |h| {
+            web::Sites::new(fictionet_extras::network::cdn_pools(), move |h| {
                 (h == "nowhere.invalid").then(|| web::Site::new(upstream.clone()))
             })
             .start(&fcx, attachments)?;
@@ -480,7 +481,7 @@ async fn the_proxy_refuses_hosts_routed_by_default_host() {
         run(fictionet::Seed::random(), move |fcx| async move {
             let (attacher, attachments) = fictionet::attachments();
             let proxy = web::proxy(&fcx, std::sync::Arc::new(fictionet_host::Client::new()))?;
-            web::Sites::new(move |h| {
+            web::Sites::new(fictionet_extras::network::cdn_pools(), move |h| {
                 (h == "allowed.test").then(|| {
                     web::Site::new(ToTestUpstream {
                         proxy: proxy.clone(),
@@ -600,8 +601,10 @@ async fn websockets_work_through_sites() {
         Duration::from_secs(30),
         run(fictionet::Seed::random(), |fcx| async move {
             let (attacher, attachments) = fictionet::attachments();
-            web::Sites::new(|h| (h == "ws.test").then(|| web::Site::handler(echo_socket())))
-                .start(&fcx, attachments)?;
+            web::Sites::new(fictionet_extras::network::cdn_pools(), |h| {
+                (h == "ws.test").then(|| web::Site::handler(echo_socket()))
+            })
+            .start(&fcx, attachments)?;
             let m = default_machine(&fcx, &attacher);
             let addr = lookup(&fcx, &m, "ws.test").await;
             let mut conn = m
@@ -988,7 +991,7 @@ fn eager_sites_send_the_world_date_without_a_lookup() {
                     site = site.date(date);
                 }
                 let addr = Ipv4Addr::new(203, 0, 113, 10);
-                web::Sites::new(|_| None)
+                web::Sites::new(fictionet_extras::network::cdn_pools(), |_| None)
                     .into_net()
                     .add_host(site.at(addr).into_host("dated.test"))
                     .start(&fcx, attachments)?;
@@ -1020,11 +1023,14 @@ async fn forwarding_bypasses_a_world_host_at_the_upstream_address() {
         run(fictionet::Seed::random(), move |fcx| async move {
             let (attacher, attachments) = fictionet::attachments();
             let forward = web::forward(&fcx, upstream, Arc::new(fictionet_host::Client::new()))?;
-            web::Sites::new(move |name| match name {
-                "world.test" => Some(web::Site::new(Plain("world")).at(address)),
-                "forward.test" => Some(web::Site::new(forward.clone())),
-                _ => None,
-            })
+            web::Sites::new(
+                fictionet_extras::network::cdn_pools(),
+                move |name| match name {
+                    "world.test" => Some(web::Site::new(Plain("world")).at(address)),
+                    "forward.test" => Some(web::Site::new(forward.clone())),
+                    _ => None,
+                },
+            )
             .start(&fcx, attachments)?;
             let m = default_machine(&fcx, &attacher);
             assert_eq!(lookup(&fcx, &m, "world.test").await, address);

@@ -369,7 +369,7 @@ async fn catalog_request(cx: &Cx, site: Model, request: Request<Body>) -> Respon
     use fictionet::stdlib::world::net;
     use std::net::{Ipv4Addr, SocketAddr};
     let (attacher, attachments) = fictionet::attachments();
-    net::Net::new()
+    net::Net::new(crate::network::cdn_pools())
         .host("catalog", |host| {
             host.at(Ipv4Addr::new(104, 18, 0, 1))
                 .dns_name("chatgpt.com")

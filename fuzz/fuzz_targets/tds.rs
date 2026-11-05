@@ -174,7 +174,26 @@ fuzz_target!(|data: &[u8]| {
         user_name: text.chars().take(200).collect(),
         password: text.chars().rev().take(200).collect(),
         change_password: text.chars().skip(3).take(5).collect(),
-        ..Login7::new()
+        tds_version: tds_version::V7_4,
+        packet_size: 4096,
+        client_prog_ver: 0,
+        client_pid: 0,
+        connection_id: 0,
+        option_flags1: 0xe0,
+        option_flags2: 0x03,
+        type_flags: 0,
+        client_time_zone: 0,
+        client_lcid: 0x0409,
+        host_name: String::new(),
+        app_name: String::new(),
+        server_name: String::new(),
+        client_interface: String::new(),
+        language: String::new(),
+        database: String::new(),
+        client_id: [0; 6],
+        sspi: Vec::new(),
+        attach_db_file: String::new(),
+        features: None,
     };
     if let Err(error) = login.to_bytes() {
         assert_eq!(error, Error::Unwritable);
@@ -218,7 +237,8 @@ fuzz_target!(|data: &[u8]| {
         },
         TypeInfo::scaled(data_type::TIMEN, head.get(1).map_or(0, |s| s % 8)),
         TypeInfo::scaled(data_type::DATETIMEOFFSETN, head.get(2).map_or(0, |s| s % 8)),
-        TypeInfo::string(data_type::NVARCHAR, 40),
+        // Latin1_General_CI_AS.
+        TypeInfo::string(data_type::NVARCHAR, 40, [0x09, 0x04, 0xd0, 0x00, 0x34]),
         TypeInfo {
             max_len: 8016,
             ..TypeInfo::binary(data_type::SSVARIANT, 0)

@@ -574,7 +574,7 @@ use fictionet::stdlib::web::{self, httpd};
 use http::{Request, StatusCode};
 use tower::{ServiceExt, service_fn};
 
-let sites = web::Sites::new(|host: &str| {
+let sites = web::Sites::new(fictionet_extras::network::cdn_pools(), |host: &str| {
     if !matches!(host, "pypi.org" | "files.pythonhosted.org") {
         return None;
     }

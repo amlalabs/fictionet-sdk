@@ -43,7 +43,7 @@ impl Client {
     /// Opens a connection to `model` served on port 80 of a world host.
     async fn connect(cx: &Cx, model: Model) -> tcp::TcpConnection {
         let (attacher, attachments) = fictionet::attachments();
-        net::Net::new()
+        net::Net::new(crate::network::cdn_pools())
             .host("api", |host| {
                 host.at(Ipv4Addr::new(104, 18, 0, 1))
                     .dns_name("api.openai.com")

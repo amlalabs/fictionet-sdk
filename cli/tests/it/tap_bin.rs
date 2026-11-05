@@ -18,7 +18,8 @@ use fictionet_test_support::{poll, temp, within};
 
 const BIN: &str = env!("CARGO_BIN_EXE_fictionet");
 const VM: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
-const GATEWAY: [u8; 6] = [0x74, 0x83, 0xc2, 0x9a, 0x47, 0xd1];
+/// The gateway MAC every attach here gets (`--gateway-mac`).
+const GATEWAY: [u8; 6] = [0x00, 0x1d, 0xaa, 0x41, 0x0c, 0x5e];
 
 fn ipv4(src: [u8; 4], dst: [u8; 4], proto: u8, payload: &[u8]) -> Vec<u8> {
     let mut p = vec![0x45, 0];
@@ -105,6 +106,7 @@ fn a_fake_qemu_gets_dhcp_arp_and_the_world() {
             "vm1",
         ])
         .arg(format!("--vm=qemu:{}", vm_sock.display()))
+        .arg("--gateway-mac=00:1d:aa:41:0c:5e")
         .args([
             "--ip-addr",
             "10.0.0.2/24",
@@ -258,6 +260,7 @@ fn a_fake_qemu_gets_dhcpv6_after_malformed_requests() {
             "vm6",
         ])
         .arg(format!("--vm=qemu:{}", vm_sock.display()))
+        .arg("--gateway-mac=00:1d:aa:41:0c:5e")
         .args([
             "--no-ip-addr",
             "--ip-addr-v6",
@@ -407,6 +410,7 @@ fn a_live_socket_is_refused_and_a_stale_one_replaced() {
                 "vm1",
             ])
             .arg(format!("--vm=qemu:{}", path.display()))
+            .arg("--gateway-mac=00:1d:aa:41:0c:5e")
             .output()
             .unwrap()
     };
@@ -451,6 +455,7 @@ fn a_second_attach_leaves_the_waiting_one_alone() {
                 name,
             ])
             .arg(format!("--vm=qemu:{}", vm_sock.display()))
+            .arg("--gateway-mac=00:1d:aa:41:0c:5e")
             .arg(format!("--ready-file={}", ready.display()))
             .stderr(Stdio::piped())
             .spawn()
@@ -477,6 +482,7 @@ fn a_second_attach_leaves_the_waiting_one_alone() {
             "vm3",
         ])
         .arg("--vm=qemu:./vm one.sock")
+        .arg("--gateway-mac=00:1d:aa:41:0c:5e")
         .arg(format!("--ready-file={}", ready.display()))
         .output()
         .unwrap();
@@ -586,6 +592,7 @@ fn messages_from_the_world_are_checked_while_waiting_for_qemu() {
                 "vm1",
             ])
             .arg(format!("--vm=qemu:{}", vm_sock.display()))
+            .arg("--gateway-mac=00:1d:aa:41:0c:5e")
             .arg(format!("--ready-file={}", ready.display()))
             .stderr(Stdio::piped())
             .spawn()

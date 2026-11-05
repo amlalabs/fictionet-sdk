@@ -33,7 +33,7 @@ mod http {
 
     async fn client(fcx: &Cx, router: impl httpd::Handler) -> tcp::TcpConnection {
         let (attacher, attachments) = fictionet::attachments();
-        net::Net::new()
+        net::Net::new(fictionet_extras::network::cdn_pools())
             .host("site", |host| {
                 host.at(Ipv4Addr::new(104, 18, 0, 1))
                     .dns_name("example.test")

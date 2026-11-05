@@ -11,7 +11,8 @@
 //!   kernel redirect every frame between the two with traffic control.
 //!
 //! Either way, attach answers the link-local questions itself (ARP, IPv6
-//! neighbor discovery, and DHCP when the address flags are given), strips
+//! neighbor discovery, and DHCP when the address flags are given) as the
+//! gateway whose MAC `--gateway-mac` gives, strips
 //! the Ethernet header from the VM's IP packets on their way to the world,
 //! and adds one to the world's packets on their way back.
 
@@ -89,7 +90,7 @@ fn take_ready_file(args: &TapArgs, lock: &mut Option<OwnedFd>, held: OwnedFd) {
 }
 
 fn relay_and_report(args: &TapArgs, port: &mut Port, world: RawFd) -> Result<End, Failure> {
-    let mut link = Link::new(args.v4.clone(), args.v6.clone(), args.mtu)
+    let mut link = Link::new(args.gateway_mac, args.v4.clone(), args.v6.clone(), args.mtu)
         .map_err(|e| Failure::Error(e.to_string()))?;
     let (end, stats) = relay(&mut link, port, world)?;
     stats.report();

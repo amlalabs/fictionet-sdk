@@ -1147,7 +1147,7 @@ fn partial_200_not_rejection() {
 fn peer_admission_is_shared_by_machines_and_dns() {
     world(Duration::from_secs(10), |fcx| async move {
         let (attacher, attachments) = fictionet::attachments();
-        fictionet::stdlib::world::net::Net::new()
+        fictionet::stdlib::world::net::Net::new(fictionet_extras::network::cdn_pools())
             .ipv4_only()
             .limits(fictionet::stdlib::world::net::Limits {
                 connections_per_peer: 1,
@@ -1200,7 +1200,7 @@ fn peer_admission_is_shared_by_machines_and_dns() {
 fn dns_tcp_uses_the_sandbox_service_budget() {
     world(Duration::from_secs(10), |fcx| async move {
         let (attacher, attachments) = fictionet::attachments();
-        fictionet::stdlib::world::net::Net::new()
+        fictionet::stdlib::world::net::Net::new(fictionet_extras::network::cdn_pools())
             .ipv4_only()
             .limits(fictionet::stdlib::world::net::Limits {
                 sandbox_budget: 1,

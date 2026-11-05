@@ -19,11 +19,6 @@ pub type Mac = [u8; 6];
 /// The broadcast MAC.
 pub const BROADCAST: Mac = [0xff; 6];
 
-/// The link's own MAC, on the VM's side: the gateway's, as the VM sees
-/// it. It uses a Ubiquiti prefix and stays the same every run, so a
-/// VM that keeps running while the link restarts keeps a valid ARP entry.
-pub const GATEWAY_MAC: Mac = [0x74, 0x83, 0xc2, 0x9a, 0x47, 0xd1];
-
 /// The EtherType of IPv4.
 pub const IPV4: u16 = 0x0800;
 /// The EtherType of ARP.
@@ -262,7 +257,7 @@ pub fn multicast_mac(group: Ipv6Addr) -> Mac {
 // ARP and neighbor discovery
 
 /// The answer to an ARP request from the VM: a reply frame that gives
-/// [`GATEWAY_MAC`] for the asked address. The link answers for every
+/// `gateway`, the link's own MAC, for the asked address. The link answers for every
 /// address, as a proxy ARP router does, so every packet the VM sends
 /// reaches the link, and the world decides what is there. It does not
 /// answer:
@@ -273,7 +268,12 @@ pub fn multicast_mac(group: Ipv6Addr) -> Mac {
 /// - questions about `own`, the address the link handed the VM, for the same
 ///   reason;
 /// - anything that is not an Ethernet/IPv4 request.
-pub(super) fn arp_reply(payload: &[u8], vm: Mac, own: Option<Ipv4Addr>) -> Option<Vec<u8>> {
+pub(super) fn arp_reply(
+    payload: &[u8],
+    vm: Mac,
+    gateway: Mac,
+    own: Option<Ipv4Addr>,
+) -> Option<Vec<u8>> {
     let request = arp::Packet::receive(payload).ok()?;
     if request.operation != arp::Operation::Request
         || request.sender_ip.is_unspecified()
@@ -282,8 +282,8 @@ pub(super) fn arp_reply(payload: &[u8], vm: Mac, own: Option<Ipv4Addr>) -> Optio
     {
         return None;
     }
-    let reply = request.reply(GATEWAY_MAC);
-    Some(frame(vm, GATEWAY_MAC, ARP, &reply.encode()))
+    let reply = request.reply(gateway);
+    Some(frame(vm, gateway, ARP, &reply.encode()))
 }
 
 /// What the link needs to know about the transport of one IP packet from
@@ -391,7 +391,7 @@ pub(super) fn problem_hides_neighbor_discovery(packet: &[u8]) -> bool {
 }
 
 /// The answer to a neighbor solicitation from the VM: a neighbor
-/// advertisement that gives [`GATEWAY_MAC`] for the target, for the same
+/// advertisement that gives `gateway`, the link's own MAC, for the target, for the same
 /// reason [`arp_reply`] answers every address. It does not answer
 /// duplicate address detection (source `::`), a target that is the source,
 /// `own` or multicast, or a solicitation with invalid fields or options.
@@ -399,6 +399,7 @@ pub(super) fn neighbor_advert(
     packet: &[u8],
     msg: &[u8],
     vm: Mac,
+    gateway: Mac,
     own: Option<Ipv6Addr>,
 ) -> Option<Vec<u8>> {
     let Some(ndp::Message::NeighborSolicitation(ns)) = neighbor_discovery(packet, msg) else {
@@ -415,11 +416,11 @@ pub(super) fn neighbor_advert(
         solicited: true,
         overrides: true,
         target,
-        options: vec![NdOption::TargetLinkLayer(GATEWAY_MAC)],
+        options: vec![NdOption::TargetLinkLayer(gateway)],
     });
     // A source no answer can go to, such as a multicast one, gets none.
     let ip = na.packet(target, src).ok()?;
-    Some(frame(vm, GATEWAY_MAC, IPV6, &ip))
+    Some(frame(vm, gateway, IPV6, &ip))
 }
 
 /// The UDP destination port and payload of an IPv4 or IPv6 packet that
@@ -461,6 +462,8 @@ pub(super) mod tests {
     use super::*;
 
     pub(crate) const VM: Mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+    /// The link's MAC in these tests.
+    pub(crate) const GATEWAY: Mac = [0x74, 0x83, 0xc2, 0x9a, 0x47, 0xd1];
 
     pub(crate) fn v6_checksum_ok(packet: &[u8]) -> bool {
         let src = source_v6(packet);
@@ -478,18 +481,11 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn gateway_mac_is_a_universal_unicast_address() {
-        assert_eq!(GATEWAY_MAC[0] & 3, 0);
-        assert_eq!(&GATEWAY_MAC[..3], &[0x74, 0x83, 0xc2]);
-        assert!(!GATEWAY_MAC.windows(2).any(|bytes| bytes == [0x66, 0x6e]));
-    }
-
-    #[test]
     fn frames_parse_and_build() {
-        let f = frame(VM, GATEWAY_MAC, IPV4, &[1, 2, 3]);
+        let f = frame(VM, GATEWAY, IPV4, &[1, 2, 3]);
         assert_eq!(f.len(), 60, "padded to the minimum");
         let p = Frame::parse(&f).unwrap();
-        assert_eq!((p.dst, p.src, p.ethertype), (VM, GATEWAY_MAC, IPV4));
+        assert_eq!((p.dst, p.src, p.ethertype), (VM, GATEWAY, IPV4));
         assert_eq!(&p.payload[..3], &[1, 2, 3]);
         assert!(Frame::parse(&f[..13]).is_none());
         assert!(is_group(&BROADCAST) && is_group(&[0x33, 0x33, 0, 0, 0, 1]) && !is_group(&VM));
@@ -515,7 +511,7 @@ pub(super) mod tests {
         let mut bad = p.clone();
         bad[0] = 0x44;
         assert_eq!(ip_packet(IPV4, &bad), None, "header length under 20");
-        let p6 = udp6(link_local(VM), 1, link_local(GATEWAY_MAC), 2, b"hi");
+        let p6 = udp6(link_local(VM), 1, link_local(GATEWAY), 2, b"hi");
         let mut padded = p6.clone();
         padded.extend_from_slice(&[0; 4]);
         assert_eq!(ip_packet(IPV6, &padded), Some(&p6[..]));
@@ -543,7 +539,7 @@ pub(super) mod tests {
             0,
             "UDP over IPv4"
         );
-        let p = udp6(link_local(GATEWAY_MAC), 547, link_local(VM), 546, b"odd");
+        let p = udp6(link_local(GATEWAY), 547, link_local(VM), 546, b"odd");
         assert!(v6_checksum_ok(&p));
         assert_eq!(udp_to(&p), Some((546, &b"odd"[..])));
     }
@@ -629,7 +625,7 @@ pub(super) mod tests {
     #[test]
     fn extension_headers_are_skipped() {
         let src = link_local(VM);
-        let ra = router_advert(&lease6(), 1500);
+        let ra = router_advert(&lease6(), 1500, GATEWAY);
         // The same message behind a hop-by-hop header.
         let mut ext = vec![ICMPV6, 0, 1, 4, 0, 0, 0, 0];
         ext.extend_from_slice(&ra[40..]);
@@ -680,7 +676,7 @@ pub(super) mod tests {
     fn complete_udp_uses_the_shared_boundary_without_checking_checksums() {
         for p in [
             udp4(Ipv4Addr::UNSPECIFIED, 68, Ipv4Addr::BROADCAST, 67, b"odd"),
-            udp6(link_local(VM), 546, link_local(GATEWAY_MAC), 547, b"odd"),
+            udp6(link_local(VM), 546, link_local(GATEWAY), 547, b"odd"),
         ] {
             let h = Header::parse_whole(&p).unwrap();
             let mut bytes = h.payload(&p).to_vec();
@@ -773,7 +769,7 @@ pub(super) mod tests {
             "fe80::5054:ff:fe12:3456".parse::<Ipv6Addr>().unwrap()
         );
         assert_eq!(
-            link_local(GATEWAY_MAC),
+            link_local(GATEWAY),
             "fe80::7683:c2ff:fe9a:47d1".parse::<Ipv6Addr>().unwrap()
         );
     }

@@ -847,7 +847,7 @@ fn an_error_closes_only_its_connection_and_a_panic_ends_the_run() {
     let to = SocketAddr::new(addr.into(), 7);
     crate::common::world::world(Duration::from_secs(60), move |fcx| async move {
         let (attacher, attachments) = fictionet::attachments();
-        Net::new()
+        Net::new(fictionet_extras::network::cdn_pools())
             .ipv4_only()
             .host("svc", |h| h.at(addr).tcp(7, Arc::new(()), || Fragile))
             .start(&fcx, attachments)?;
@@ -861,7 +861,7 @@ fn an_error_closes_only_its_connection_and_a_panic_ends_the_run() {
     let ran = std::thread::spawn(move || {
         block_on(lab(fictionet::Seed::from_u64(1), move |fcx| async move {
             let (attacher, attachments) = fictionet::attachments();
-            Net::new()
+            Net::new(fictionet_extras::network::cdn_pools())
                 .ipv4_only()
                 .host("svc", |h| h.at(addr).tcp(7, Arc::new(()), || Fragile))
                 .start(&fcx, attachments)?;

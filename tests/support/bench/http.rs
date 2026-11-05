@@ -154,8 +154,9 @@ fn http_world(case: HttpCase, result: Arc<Mutex<Option<HttpRun>>>) -> World {
                 .with_single_cert(chain, key)?,
         );
         let page = Page(Bytes::from(vec![b'x'; case.body]));
-        let sites =
-            web::Sites::new(move |_| Some(web::Site::new(page.clone()).tls(config.clone())));
+        let sites = web::Sites::new(fictionet_extras::network::cdn_pools(), move |_| {
+            Some(web::Site::new(page.clone()).tls(config.clone()))
+        });
         sites.start(&fcx, attachments)?;
         let machines: Vec<Machine> = (0..case.sandboxes)
             .map(|i| {

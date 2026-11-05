@@ -33,7 +33,7 @@ fn sandbox_looks_up_connects_and_requests_with_optional_roots() {
             let roots = Arc::new(roots);
             let config = leaf.server_config(&fcx, start)?;
             let (attacher, attachments) = fictionet::attachments();
-            web::Sites::new(move |name| {
+            web::Sites::new(fictionet_extras::network::cdn_pools(), move |name| {
                 (name == "site.test").then(|| {
                     web::Site::new(axum::Router::new().fallback(|| async { "hello" }))
                         .tls(config.clone())
@@ -100,7 +100,7 @@ fn installing_cloned_servers_keeps_virtual_hosts_separate() {
                 },
             ));
             let (attacher, attachments) = fictionet::attachments();
-            Net::new()
+            Net::new(fictionet_extras::network::cdn_pools())
                 .add_host(
                     server.clone().served_by(
                         Host::new("one")

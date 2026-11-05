@@ -21,7 +21,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
-//! use fictionet::stdlib::protocols::ntp::{Mode, Packet, ServerInfo, Timestamp, server_reply};
+//! use fictionet::stdlib::protocols::ntp::{Leap, Mode, Packet, ServerInfo, Timestamp, server_reply};
 //!
 //! // A client asks for the time. Its own clock says 2023-11-14 22:13:20 UTC.
 //! let request = Packet::client_request(Timestamp::from_unix(1_700_000_000, 0));
@@ -32,7 +32,17 @@
 //! // The world answers that it is 2019-03-14 00:00:00.5 UTC.
 //! let asked = Packet::parse(&bytes).unwrap();
 //! let now = Timestamp::from_unix(1_552_521_600, 500_000_000);
-//! let reply = server_reply(&asked, &ServerInfo::default(), now, now).unwrap();
+//! // A stratum 2 server, synchronized to 192.0.2.7 a minute earlier.
+//! let server = ServerInfo {
+//!     leap: Leap::None,
+//!     stratum: 2,
+//!     precision: -24,
+//!     root_delay: 0x0000_00a4,
+//!     root_dispersion: 0x0000_0049,
+//!     reference_id: [192, 0, 2, 7],
+//!     reference: Timestamp::from_unix(1_552_521_536, 0),
+//! };
+//! let reply = server_reply(&asked, &server, now, now).unwrap();
 //!
 //! let answer = Packet::parse(&reply.to_bytes().unwrap()).unwrap();
 //! assert_eq!(answer.mode, Mode::Server);
@@ -528,23 +538,6 @@ pub struct ServerInfo {
     pub reference: Timestamp,
 }
 
-impl Default for ServerInfo {
-    /// A stratum 1 server with a GPS clock, precise to about a microsecond,
-    /// with no leap second coming. Its reference time is zero; set it to a
-    /// time shortly before the replies, as a real server's would be.
-    fn default() -> ServerInfo {
-        ServerInfo {
-            leap: Leap::None,
-            stratum: 1,
-            precision: -20,
-            root_delay: 0,
-            root_dispersion: 0,
-            reference_id: *b"GPS\0",
-            reference: Timestamp::ZERO,
-        }
-    }
-}
-
 /// The mode a reply to `request` takes: server (4) for a client request
 /// (3), and symmetric passive (2) for a symmetric active peer (1), as RFC
 /// 4330, section 5, says. Only versions 1 to 4 are answered.
@@ -746,6 +739,19 @@ mod tests {
     use super::*;
     use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::test_support::assert_write;
+
+    /// A stratum 1 server with a GPS clock, as the tests' time server.
+    fn server() -> ServerInfo {
+        ServerInfo {
+            leap: Leap::None,
+            stratum: 1,
+            precision: -20,
+            root_delay: 0,
+            root_dispersion: 0,
+            reference_id: *b"GPS\0",
+            reference: Timestamp::ZERO,
+        }
+    }
 
     /// A server reply as an SNTP client might receive it: version 4,
     /// stratum 2, reference ID 192.0.2.1, and a 20-byte key ID and MAC.
@@ -949,7 +955,7 @@ mod tests {
             stratum: 2,
             reference_id: [192, 0, 2, 7],
             reference: Timestamp::from_unix(1_699_999_000, 0),
-            ..ServerInfo::default()
+            ..server()
         };
         let t2 = Timestamp::from_unix(1_700_000_000, 300_000_000);
         let t3 = Timestamp::from_unix(1_700_000_000, 300_100_000);
@@ -1007,7 +1013,7 @@ mod tests {
         b[0] = 0x21; // LI 0, version 4, symmetric active.
         let req = Packet::parse(&b).unwrap();
         let t = Timestamp::from_unix(1_700_000_001, 0);
-        let reply = server_reply(&req, &ServerInfo::default(), t, t).unwrap();
+        let reply = server_reply(&req, &server(), t, t).unwrap();
         assert_eq!(reply.mode, Mode::SymmetricPassive);
         assert_eq!(reply.origin, req.transmit);
         assert_eq!(reply.to_bytes().unwrap()[0], 0x22);
@@ -1029,7 +1035,7 @@ mod tests {
             b[0] = (v << 3) | 3;
             let req = Packet::parse(&b).unwrap();
             assert_eq!(req.to_bytes().unwrap(), b);
-            let r = server_reply(&req, &ServerInfo::default(), t, t);
+            let r = server_reply(&req, &server(), t, t);
             let k = kiss_reply(&req, KissCode::Deny);
             if v <= 4 {
                 assert_eq!(r.unwrap().version, v);
@@ -1044,7 +1050,7 @@ mod tests {
         let mut req = Packet::client_request(t);
         req.version = 0;
         assert_eq!(
-            server_reply(&req, &ServerInfo::default(), t, t),
+            server_reply(&req, &server(), t, t),
             Err(Error::ReplyVersion(0))
         );
     }
@@ -1064,8 +1070,7 @@ mod tests {
         let mut p = Packet::client_request(Timestamp::ZERO);
         for mode in [Mode::SymmetricPassive, Mode::Server, Mode::Broadcast] {
             p.mode = mode;
-            let e = server_reply(&p, &ServerInfo::default(), Timestamp::ZERO, Timestamp::ZERO)
-                .unwrap_err();
+            let e = server_reply(&p, &server(), Timestamp::ZERO, Timestamp::ZERO).unwrap_err();
             assert_eq!(e, Error::NotClient(mode));
             assert_eq!(kiss_reply(&p, KissCode::Deny), Err(Error::NotClient(mode)));
             assert!(!e.to_string().is_empty());
@@ -1191,7 +1196,7 @@ mod tests {
         for (stratum, sent) in [(1, 1), (15, 15), (16, 0), (17, 0), (255, 0)] {
             let server = ServerInfo {
                 stratum,
-                ..ServerInfo::default()
+                ..server()
             };
             assert_eq!(
                 server_reply(&req, &server, t, t).unwrap().stratum,
@@ -1250,7 +1255,7 @@ mod tests {
                 // Nanoseconds are coarser than 2⁻³² s, so this comes back within a few units,
                 // measured round the era: the last fraction of an era comes back as second 0.
                 assert!(gap(t, p.transmit) <= 3, "{:?}", p.transmit);
-                if let Ok(r) = server_reply(&p, &ServerInfo::default(), p.receive, p.reference) {
+                if let Ok(r) = server_reply(&p, &server(), p.receive, p.reference) {
                     assert_eq!(Packet::parse(&r.to_bytes().unwrap()).unwrap(), r);
                 }
                 if let Ok(r) = kiss_reply(&p, KissCode::from_bytes(p.reference_id)) {

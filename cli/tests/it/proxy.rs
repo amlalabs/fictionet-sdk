@@ -108,16 +108,24 @@ impl World {
                         .route("/upload", post(upload).layer(DefaultBodyLimit::disable()));
                     let secure = axum::Router::new().route("/", get(|| async { "secure site\n" }));
 
-                    let mut net = web::Sites::new(move |host: &str| match host {
-                        "plain.test" => Some(web::Site::new(app.clone())),
-                        "ws.test" => Some(web::Site::handler(fictionet_test_support::EchoSocket)),
-                        "secure.test" => Some(
-                            web::Site::new(secure.clone())
-                                .at(SECURE)
-                                .tls(config.clone()),
-                        ),
-                        _ => None,
-                    })
+                    let mut net = web::Sites::new(
+                        fictionet::stdlib::world::net::Pools {
+                            v4: Some("104.18.0.0/15".parse().unwrap()),
+                            v6: Some("2606:4700:100::/48".parse().unwrap()),
+                        },
+                        move |host: &str| match host {
+                            "plain.test" => Some(web::Site::new(app.clone())),
+                            "ws.test" => {
+                                Some(web::Site::handler(fictionet_test_support::EchoSocket))
+                            }
+                            "secure.test" => Some(
+                                web::Site::new(secure.clone())
+                                    .at(SECURE)
+                                    .tls(config.clone()),
+                            ),
+                            _ => None,
+                        },
+                    )
                     .into_net();
                     if let Some(raw) = raw {
                         net = net.host("reset", |h| {

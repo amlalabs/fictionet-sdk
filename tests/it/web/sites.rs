@@ -219,14 +219,14 @@ fn a_subnet_that_cannot_work_is_an_error() {
                 "2001:db8::/4",
             ] {
                 let (_attacher, attachments) = fictionet::attachments();
-                let r = web::Sites::new(|_| None)
+                let r = web::Sites::new(fictionet_extras::network::cdn_pools(), |_| None)
                     .subnet(bad.parse()?)
                     .start(&fcx, attachments);
                 assert!(r.is_err(), "{bad}");
             }
             // Another subnet works, with its gateway at .1.
             let (attacher, attachments) = fictionet::attachments();
-            web::Sites::new(|_| None)
+            web::Sites::new(fictionet_extras::network::cdn_pools(), |_| None)
                 .subnet("172.16.5.0/24".parse()?)
                 .start(&fcx, attachments)?;
             let mut a = attacher.attach("a").unwrap();
@@ -252,8 +252,10 @@ fn the_sites_keep_running_after_the_world_returns() {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let r = block_on(run(fictionet::Seed::random(), move |fcx| async move {
-            web::Sites::new(|h| (h == "plain.test").then(|| web::Site::new(Plain("plain"))))
-                .start(&fcx, attachments)?;
+            web::Sites::new(fictionet_extras::network::cdn_pools(), |h| {
+                (h == "plain.test").then(|| web::Site::new(Plain("plain")))
+            })
+            .start(&fcx, attachments)?;
             let _ = tx.send(fcx.clone());
             Ok(())
         }));
@@ -311,7 +313,7 @@ where
     let subnet: fictionet::stdlib::network::route::Prefix = subnet.parse().unwrap();
     run_world::world(Duration::from_secs(60), move |fcx| async move {
         let (attacher, attachments) = fictionet::attachments();
-        web::Sites::new(|host| {
+        web::Sites::new(fictionet_extras::network::cdn_pools(), |host| {
             host.ends_with(".test")
                 .then(|| web::Site::new(Plain("auto")))
         })

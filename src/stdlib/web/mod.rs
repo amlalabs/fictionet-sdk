@@ -38,7 +38,7 @@
 //!
 //!     let client = Arc::new(fictionet_host::Client::new());
 //!     let upstream = web::proxy(&fcx, client)?;
-//!     web::Sites::new(move |host: &str| match host {
+//!     web::Sites::new(fictionet_extras::network::cdn_pools(), move |host: &str| match host {
 //!         "en.wikipedia.org" | "www.wikipedia.org" => Some(
 //!             web::Site::new(wiki.clone())
 //!                 .at(Ipv4Addr::new(185, 15, 59, 224))
@@ -226,7 +226,7 @@
 //! #     let (attacher, attachments) = fictionet::attachments();
 //!     let client = Arc::new(fictionet_host::Client::new());
 //!     let gmail = web::forward(&fcx, upstream, client)?;
-//!     web::Sites::new(move |name: &str| match name {
+//!     web::Sites::new(fictionet_extras::network::cdn_pools(), move |name: &str| match name {
 //!         "gmail.googleapis.com" => Some(
 //!             web::Site::new(gmail.clone()).tls(config.clone()),
 //!         ),
@@ -330,8 +330,8 @@
 //!   is made [`ipv4_only`](Site::ipv4_only) or
 //!   [`ipv6_only`](Site::ipv6_only). A site with [`at`](Site::at) uses the
 //!   addresses given there. For a family without one, it gets a free
-//!   address from the automatic pools: `104.18.0.0/15` for IPv4,
-//!   `2606:4700:100::/48` for IPv6. Sites with the same address share one
+//!   address from the world's [`Pools`],
+//!   given to [`Sites::new`]. Sites with the same address share one
 //!   machine.
 //! - **A router** with one route per machine, added as sites appear. A
 //!   packet for any other address gets an ICMP "host unreachable" reply, or
@@ -400,8 +400,6 @@
 //!   rules of RFC 6724, and with a unique local source address they prefer
 //!   IPv4 for every site with a global address. With a global-looking
 //!   source address, they prefer IPv6, as on a real dual-stack network.
-//! - **Sites' automatic addresses, `2606:4700:100::/48`,** use public CDN
-//!   space, as `104.18.0.0/15` does for IPv4.
 //!
 //! How IPv6 works here:
 //!
@@ -462,12 +460,12 @@
 //! - **Names.** The callback gets each name in lowercase, without the
 //!   trailing dot. Lookups of `Example.COM.` and `example.com` are the same
 //!   lookup. Answers have a TTL of 60 seconds.
-//! - **Automatic addresses** are handed out in order from `104.18.0.1` and
-//!   `2606:4700:100::1`. Addresses inside the sandboxes' subnets are skipped, so a
-//!   subnet such as `104.18.0.0/24` works too. A subnet that covers all of
-//!   `104.18.0.0/15` or `2606:4700:100::/48` leaves no automatic addresses of that
-//!   family: sites without [`at`](Site::at) then have only the other
-//!   family, and a site with neither gets NXDOMAIN.
+//! - **Automatic addresses** are handed out in order from each pool's
+//!   second address. Addresses inside the sandboxes' subnets are skipped, so a
+//!   subnet inside a pool works too. A family with no pool, or whose pool a
+//!   subnet covers, has no automatic addresses: sites without
+//!   [`at`](Site::at) then have only the other family, and a site with
+//!   neither gets NXDOMAIN.
 //! - **Machines** answer pings, refuse TCP on ports other than 80 and 443
 //!   with a RST, and answer UDP with ICMP "port unreachable", over both
 //!   families. The gateway answers pings, and DNS on UDP and TCP port 53.
@@ -544,7 +542,7 @@ use http::{Request, Response};
 
 use fictionet::stdlib::network::route::Prefix;
 use fictionet::stdlib::services::tls::ServerConfig;
-use fictionet::stdlib::world::net::{Host, Net};
+use fictionet::stdlib::world::net::{Host, Net, Pools};
 use fictionet::{Attachments, Cx, Error};
 pub use httpd::{Body, Routing, Target};
 use httpd::{Handler, Server};
@@ -563,19 +561,21 @@ type SiteFor = dyn Fn(&str) -> Option<Site> + Send + Sync;
 impl Sites {
     /// Sites decided by `site_for`, which gets a hostname and returns the
     /// site for it, or `None` if it does not exist. It runs once per name.
+    /// Sites without [`Site::at`] get addresses from `pools`
+    /// ([`Net::new`]).
     ///
     /// The name is in lowercase, without a trailing dot: `en.wikipedia.org`.
     ///
     /// `site_for` must return quickly and must not block. It runs inside the
     /// DNS task, and every sandbox's lookups wait while it runs. It decides.
     /// It does not fetch. Slow work belongs in the site's handler.
-    pub fn new<F>(site_for: F) -> Sites
+    pub fn new<F>(pools: Pools, site_for: F) -> Sites
     where
         F: Fn(&str) -> Option<Site> + Send + Sync + 'static,
     {
         Sites {
             site_for: Arc::new(site_for),
-            net: Net::new(),
+            net: Net::new(pools),
             date: None,
         }
     }
@@ -637,7 +637,8 @@ impl Sites {
     /// [region](fictionet::Cx#regions), and keeps running after the world
     /// returns, until that region is cancelled.
     ///
-    /// Fails only if a [`subnet`](Sites::subnet) is not one it can use.
+    /// Fails only if a [`subnet`](Sites::subnet) or a pool is not one it
+    /// can use.
     pub fn start(self, fcx: &Cx, attachments: Attachments) -> Result<(), Error> {
         self.into_net().start(fcx, attachments)
     }
@@ -708,8 +709,8 @@ impl Site {
     /// # drop(site);
     /// ```
     ///
-    /// A family without `at` gets a free address from that family's pool:
-    /// `104.18.0.0/15` for IPv4, `2606:4700:100::/48` for IPv6. An address given
+    /// A family without `at` gets a free address from that family's pool
+    /// ([`Sites::new`]). An address given
     /// for a family the site does not have (see
     /// [`ipv4_only`](Site::ipv4_only)) is not used.
     ///

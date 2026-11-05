@@ -46,7 +46,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fictionet::stdlib::network::ip::{self, Intake, Reassembly};
 use fictionet::stdlib::network::ports::{Event, Ports};
-use fictionet::stdlib::world::net::{Host, Net};
+use fictionet::stdlib::world::net::{Host, Net, Pools};
 use fictionet::sync::Mutex;
 use fictionet::time::Instant;
 use fictionet::{Attachment, Attachments, Cx, End, Interface};
@@ -132,7 +132,7 @@ pub fn network(fcx: &Cx, config: &Config, clock: Clock, tokens: &Arc<Tokens>) ->
             ),
         };
     }
-    let net = Net::new()
+    let net = Net::new(Pools::NONE)
         .add_host(server)
         .route(INTERNET, config.internet.ipv4);
     match config.address_v6 {

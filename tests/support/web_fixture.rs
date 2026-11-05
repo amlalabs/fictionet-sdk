@@ -21,7 +21,7 @@ pub fn world(
         .route("/upload", post(upload).layer(DefaultBodyLimit::disable()));
     let sites = web_world::sites(fcx, chain, key, app, plain)?;
     let upstream = web::proxy(fcx, std::sync::Arc::new(fictionet_host::Client::new()))?;
-    web::Sites::new(move |host: &str| {
+    web::Sites::new(fictionet_extras::network::cdn_pools(), move |host: &str| {
         if host == "upstream" {
             println!("lookup {host}");
             Some(web::Site::new(upstream.clone()))

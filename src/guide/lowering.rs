@@ -110,10 +110,14 @@
 //! # `tap`: Ethernet frames, with the Ethernet taken off
 //!
 //! The address flags (`--ip-addr`, `--gateway`, `--dns` and their IPv6
-//! forms) decide some of what happens below.
-//! [`Link::new`](crate::stdlib::network::ethernet::Link::new) checks the leases
-//! before any frames arrive. It rejects invalid prefixes and IPv4 leases
-//! with no address for the DHCP server.
+//! forms) decide some of what happens below. `--gateway-mac` is attach's
+//! own MAC: the gateway's, as the VM sees it. Every frame attach sends
+//! comes from it, and its ARP and neighbor answers, router advertisements,
+//! IPv6 link-local address and DHCPv6 server ID are made from it.
+//! [`Link::new`](crate::stdlib::network::ethernet::Link::new) checks the MAC
+//! and the leases before any frames arrive. It rejects a MAC that is not
+//! unicast, invalid prefixes, and IPv4 leases with no address for the DHCP
+//! server.
 //!
 //! **What the sandbox sends.** A VM's kernel has an Ethernet card, such as
 //! a virtio-net card under QEMU. It sends Ethernet frames: IP packets with
@@ -162,7 +166,7 @@
 //! EtherType:
 //!
 //! - **ARP.** `frame::arp_reply` answers every request with attach's own
-//!   MAC, `74:83:c2:9a:47:d1`, whatever address is asked for, as a proxy
+//!   MAC, whatever address is asked for, as a proxy
 //!   ARP router does. It stays quiet for ARP probes, gratuitous ARP, and
 //!   the address attach handed the VM, so the VM never sees its own
 //!   address as taken. ARP never reaches the world.
@@ -429,8 +433,8 @@
 //! ## `tap`
 //!
 //! The sandbox is a Debian 13 VM under QEMU, attached with
-//! `--vm qemu:<path> --ip-addr 10.0.0.2/24 --gateway 10.0.0.1 --dns
-//! 10.0.0.1 --no-ip-addr-v6`. The capture
+//! `--vm qemu:<path> --gateway-mac 74:83:c2:9a:47:d1 --ip-addr 10.0.0.2/24
+//! --gateway 10.0.0.1 --dns 10.0.0.1 --no-ip-addr-v6`. The capture
 //! ran from before QEMU started until it exited.
 //!
 //! 1. While the VM boots, its DHCP client broadcasts a DISCOVER.

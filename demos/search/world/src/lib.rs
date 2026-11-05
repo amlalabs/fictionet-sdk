@@ -155,7 +155,7 @@ pub fn net(
     // Live-Depth's names come into being as pages bring links to them, and
     // a session can switch modes in the running world: a name refused
     // before resolves once the mode in use serves it.
-    fictionet::stdlib::world::net::Net::new()
+    fictionet::stdlib::world::net::Net::new(fictionet_extras::network::cdn_pools())
         .ipv4_only()
         .drop_unrouted()
         .resolve(site_for)

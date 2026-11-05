@@ -88,7 +88,7 @@ fn net_routes_tls_by_name_to_each_service() {
             let (attacher, attachments) = fictionet::attachments();
             let (ca, cb) = (config.clone(), config.clone());
             let addr = Ipv4Addr::new(10, 40, 0, 2);
-            Net::new()
+            Net::new(fictionet_extras::network::cdn_pools())
                 .ipv4_only()
                 .add_host(
                     fictionet::stdlib::world::net::Host::new("tls")
@@ -193,7 +193,7 @@ fn net_performs_starttls_for_a_service_that_asks() {
             let (attacher, attachments) = fictionet::attachments();
             let addr = Ipv4Addr::new(10, 40, 0, 25);
             let opts = ServeOptions::default().starttls(config.clone());
-            Net::new()
+            Net::new(fictionet_extras::network::cdn_pools())
                 .ipv4_only()
                 .host("mail", |h| {
                     h.at(addr).dns_name("mail.test").tcp_with(
@@ -245,7 +245,7 @@ fn net_limits_a_starttls_handshake() {
             ..Default::default()
         };
         let opts = ServeOptions::default().starttls(config);
-        Net::new()
+        Net::new(fictionet_extras::network::cdn_pools())
             .ipv4_only()
             .limits(limits)
             .host("mail", |h| {

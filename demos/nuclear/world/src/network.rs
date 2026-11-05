@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use fictionet::stdlib::network::route::Prefix;
 use fictionet::stdlib::protocols::modbus;
-use fictionet::stdlib::world::net::Net;
+use fictionet::stdlib::world::net::{Net, Pools};
 use fictionet::{Attachments, Cx, Error};
 
 use crate::driver::Driver;
@@ -53,7 +53,7 @@ pub const CONTROLLERS: [(&str, Plc, Ipv4Addr); 4] = [
 /// controller as a host on port 502.
 pub fn builder(driver: &Driver) -> Net {
     let plant = driver.plant();
-    let mut net = Net::new().subnet(OPERATIONS).ipv4_only();
+    let mut net = Net::new(Pools::NONE).subnet(OPERATIONS).ipv4_only();
     for (label, plc, addr) in CONTROLLERS {
         let plant = plant.clone();
         // `Host::tcp` takes an `Arc` of the service's state. The state is the

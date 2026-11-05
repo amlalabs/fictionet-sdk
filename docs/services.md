@@ -456,16 +456,18 @@ it on the next call. Drive it with `test_support::decode_chunks` to check chunki
 ## 3. A network
 
 `Net` builds the network around its hosts. Each host has addresses (given
-with `at`, or picked from `104.18.0.0/15` and `2606:4700:100::/48`), DNS names,
-and services on its ports:
+with `at`, or picked from the `Pools` the world passes to `Net::new`), DNS
+names, and services on its ports. `fictionet_extras::network::cdn_pools`
+gives public CDN space; `Pools::NONE` gives no automatic addresses, so every
+host needs `at`:
 
 ```rust
 use std::sync::Arc;
-use fictionet::stdlib::world::net::Net;
+use fictionet::stdlib::world::net::{Net, Pools};
 
 let password = Arc::new("hunter2".to_owned());
 let at: std::net::Ipv4Addr = "10.20.0.5".parse()?;
-Net::new()
+Net::new(Pools::NONE)
     .host("vault", |h| h.at(at).dns_name("vault.corp.test").tcp(2323, password.clone(), || Prompt))
     .start(&fcx, attachments)?;
 ```
@@ -596,7 +598,7 @@ members, and the LAN's drops are recorded as `net.blocked` repeats with
 `why` `Lan` (see Events below):
 
 ```rust
-Net::new()
+Net::new(Pools::NONE)
     .lan("corp", "192.168.56.0/24".parse()?)
     .host("dc01", |h| h.on("corp").at(dc01).dns_name("dc01.corp.test").tcp(389, directory, || Ldap))
     .member("ws01", "corp", "192.168.56.31".parse()?)
@@ -654,8 +656,9 @@ does:
 
 ```rust
 use fictionet::stdlib::web::httpd::Server;
+use fictionet_extras::network::cdn_pools;
 
-Net::new()
+Net::new(cdn_pools())
     .host("intranet", |h| h.dns_name("intranet.corp.test").port_server(80, Server::new(api.clone())))
     .add_host(Server::new(api).tls_with(move |_| config.clone()).served_by(Host::new("www").dns_name("www.corp.test")))
     /* ... */;

@@ -93,19 +93,25 @@ pub fn serve(fcx: &Cx, cert: &fictionet::stdlib::services::ca::Leaf) -> Attacher
             .with_single_cert(cert.chain.clone(), cert.key.clone_key())
             .unwrap(),
     );
-    let sites = web::Sites::new(move |host| {
-        let c = config.clone();
-        match host {
-            "plain.test" => Some(web::Site::new(Echo)),
-            "tls.test" => Some(web::Site::new(Echo).at(SITE_ADDR).tls(c)),
-            "both.test" => Some(web::Site::new(Echo).at(SITE_ADDR).tls(c).plain_http()),
-            "broken.test" => Some(web::Site::new(Broken).at(SITE_ADDR)),
-            "default.test" => Some(web::Site::new(Echo).at(DEFAULT_ADDR).default_host()),
-            "other.test" => Some(web::Site::new(Echo).at(DEFAULT_ADDR)),
-            h if h.ends_with(".wild.test") => Some(web::Site::new(Echo)),
-            _ => None,
-        }
-    });
+    let sites = web::Sites::new(
+        fictionet::stdlib::world::net::Pools {
+            v4: Some("104.18.0.0/15".parse().unwrap()),
+            v6: Some("2606:4700:100::/48".parse().unwrap()),
+        },
+        move |host| {
+            let c = config.clone();
+            match host {
+                "plain.test" => Some(web::Site::new(Echo)),
+                "tls.test" => Some(web::Site::new(Echo).at(SITE_ADDR).tls(c)),
+                "both.test" => Some(web::Site::new(Echo).at(SITE_ADDR).tls(c).plain_http()),
+                "broken.test" => Some(web::Site::new(Broken).at(SITE_ADDR)),
+                "default.test" => Some(web::Site::new(Echo).at(DEFAULT_ADDR).default_host()),
+                "other.test" => Some(web::Site::new(Echo).at(DEFAULT_ADDR)),
+                h if h.ends_with(".wild.test") => Some(web::Site::new(Echo)),
+                _ => None,
+            }
+        },
+    );
     let (attacher, attachments) = attachments();
     sites.start(fcx, attachments).unwrap();
     attacher

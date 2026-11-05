@@ -199,7 +199,8 @@
 //!
 //! async fn world(fcx: Cx, attachments: Attachments) -> Result {
 //!     let site = tower(axum::Router::new().route("/", axum::routing::get(|| async { "hello\n" })));
-//!     Net::new()
+//!     // Hosts without a fixed address get one from public CDN space.
+//!     Net::new(fictionet_extras::network::cdn_pools())
 //!         .host("www", |h| h.dns_name("www.example.test").port_server(80, Server::new(site)))
 //!         .host("echo", |h| h.dns_name("echo.example.test").tcp(7, Arc::new(()), || Echo))
 //!         .start(&fcx, attachments)

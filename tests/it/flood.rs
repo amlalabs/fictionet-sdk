@@ -191,12 +191,13 @@ fn one_sandbox_flooding_everything_stays_bounded_and_others_are_served() {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let result = block_on(lab(fictionet::Seed::from_u64(1), |fcx| async move {
-            let sites = web::Sites::new(|host| match host {
-                "plain.test" => Some(web::Site::new(Hello)),
-                h if h.ends_with(".wild.test") => Some(web::Site::new(Hello)),
-                _ => None,
-            })
-            .max_sites(1_000);
+            let sites =
+                web::Sites::new(fictionet_extras::network::cdn_pools(), |host| match host {
+                    "plain.test" => Some(web::Site::new(Hello)),
+                    h if h.ends_with(".wild.test") => Some(web::Site::new(Hello)),
+                    _ => None,
+                })
+                .max_sites(1_000);
             let (attacher, attachments) = fictionet::attachments();
             sites.start(&fcx, attachments)?;
             let mut raw = attacher.attach("agent").unwrap();
@@ -390,8 +391,9 @@ fn sandboxes_sending_as_fast_as_they_can_do_not_grow_the_world() {
     let world_path = path.clone();
     std::thread::spawn(move || {
         let result = block_on(run(fictionet::Seed::random(), move |fcx| async move {
-            let sites =
-                web::Sites::new(|host| (host == "plain.test").then(|| web::Site::new(Hello)));
+            let sites = web::Sites::new(fictionet_extras::network::cdn_pools(), |host| {
+                (host == "plain.test").then(|| web::Site::new(Hello))
+            });
             sites.start(&fcx, attachments)?;
             let other = machine(
                 &fcx,

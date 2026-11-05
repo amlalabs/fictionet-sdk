@@ -285,7 +285,7 @@ async fn dns_conn(fcx: &Cx, conn: tcp::TcpConnection, context: &Context) -> Resu
 mod tests {
     use super::super::addresses::Placed;
     use super::super::hosts::{Known, Peers, World};
-    use super::super::{Hooks, Limits, MAX_HOSTS, Shared, Subnet, route};
+    use super::super::{Hooks, Limits, MAX_HOSTS, Shared, Subnet, TEST_POOLS, route};
     use super::*;
     use fictionet::stdlib::network::DatagramSocket;
     use fictionet::stdlib::protocols::dns::{op::Query, rr::Name};
@@ -465,7 +465,7 @@ mod tests {
                     subnet: Subnet::new("10.0.0.0/24".parse().unwrap()).unwrap(),
                     subnet6: None,
                     router: route::router(&fcx, Vec::new()),
-                    world: Arc::new(Mutex::new(World::new(MAX_HOSTS))),
+                    world: Arc::new(Mutex::new(World::new(MAX_HOSTS, TEST_POOLS))),
                     leases: Arc::default(),
                     gateway_tcp: Arc::default(),
                     hooks: Arc::new(Hooks {
@@ -517,7 +517,7 @@ mod tests {
             subnet: Subnet::new("10.0.0.0/24".parse().unwrap()).unwrap(),
             subnet6: None,
             router: route::router(fcx, Vec::new()),
-            world: Arc::new(Mutex::new(World::new(MAX_HOSTS))),
+            world: Arc::new(Mutex::new(World::new(MAX_HOSTS, TEST_POOLS))),
             leases: Arc::default(),
             gateway_tcp: Arc::default(),
             hooks: Arc::new(Hooks {

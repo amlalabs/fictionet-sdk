@@ -1,4 +1,4 @@
-use super::udp_packet;
+use super::{Pools, udp_packet};
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::network::route::Prefix;
 use fictionet::stdlib::protocols::dhcp::{self, opt};
@@ -11,21 +11,6 @@ use std::sync::Arc;
 /// How long a DHCP lease lasts. The binding itself lasts until the sandbox
 /// detaches; the lease time only tells the client when to renew.
 const LEASE: u32 = 3600;
-
-// Public CDN space keeps automatic hosts in ordinary internet ranges.
-/// Where hosts without an IPv4 [`super::Host::at`] get their addresses:
-/// `104.18.0.0/15`.
-pub(super) const AUTO: Prefix = Prefix {
-    addr: IpAddr::V4(Ipv4Addr::new(104, 18, 0, 0)),
-    len: 15,
-};
-
-/// Where hosts without an IPv6 [`super::Host::at`] get theirs: `2606:4700:100::/48`,
-/// matching the public CDN space used for IPv4.
-pub(super) const AUTO6: Prefix = Prefix {
-    addr: IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x100, 0, 0, 0, 0, 0)),
-    len: 48,
-};
 
 /// The sandboxes' subnet.
 #[derive(Clone, Copy, Debug)]
@@ -161,47 +146,103 @@ pub(super) fn may_serve_v6(a: Ipv6Addr, subnet: &Subnet6) -> bool {
         || a.to_ipv4_mapped().is_some())
 }
 
-/// Automatic host address cursors. Occupied addresses come from installation.
+/// Prefixes inside which no host may have an IPv6 address, beside the
+/// sandboxes' subnet: `::` and `::1`, IPv4-mapped addresses, link-local
+/// unicast and multicast. [`may_serve_v6`] refuses the same addresses.
+const NOT_HOSTS_V6: [Prefix; 4] = [
+    Prefix {
+        addr: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        len: 127,
+    },
+    Prefix {
+        addr: IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0, 0)),
+        len: 96,
+    },
+    Prefix {
+        addr: IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0)),
+        len: 10,
+    },
+    Prefix {
+        addr: IpAddr::V6(Ipv6Addr::new(0xff00, 0, 0, 0, 0, 0, 0, 0)),
+        len: 8,
+    },
+];
+
+/// Checks the world's pools: each of its own family, with room for a
+/// host. An IPv4 pool's first and last addresses are never handed out,
+/// nor an IPv6 pool's first.
+pub(super) fn check_pools(pools: &Pools) -> Result<(), Error> {
+    if let Some(p) = pools.v4
+        && (!p.addr.is_ipv4() || p.len > 30)
+    {
+        return Err(Error::msg(format!(
+            "the IPv4 pool {}/{} must be IPv4 with a length of at most 30",
+            p.addr, p.len
+        )));
+    }
+    if let Some(p) = pools.v6
+        && (!p.addr.is_ipv6() || p.len > 127)
+    {
+        return Err(Error::msg(format!(
+            "the IPv6 pool {}/{} must be IPv6 with a length of at most 127",
+            p.addr, p.len
+        )));
+    }
+    Ok(())
+}
+
+/// Automatic host addresses from the world's pools, with their cursors:
+/// each the offset from its pool's first address of the next one to try.
+/// Occupied addresses come from installation.
 pub(super) struct Allocator {
+    pools: Pools,
     pub(super) next_auto: u32,
     pub(super) next_auto6: u128,
     pub(super) auto_full: bool,
 }
 
-impl Default for Allocator {
-    fn default() -> Self {
-        Self {
+impl Allocator {
+    /// Cursors at the start of `pools`, which [`check_pools`] accepted.
+    pub(super) fn new(pools: Pools) -> Allocator {
+        Allocator {
+            pools: Pools {
+                v4: pools.v4.map(Prefix::canonical),
+                v6: pools.v6.map(Prefix::canonical),
+            },
             next_auto: 1,
             next_auto6: 1,
             auto_full: false,
         }
     }
-}
 
-impl Allocator {
+    /// The next free IPv4 address of the pool, after the last one handed
+    /// out: not the pool's first or last address, not occupied, and one a
+    /// host may have here. `None` when there is no pool or it is full; a
+    /// full pool is remembered, so it is not searched again.
     pub(super) fn free_auto<T>(
         &mut self,
         subnet: &Subnet,
         occupied: &BTreeMap<IpAddr, T>,
     ) -> Option<Ipv4Addr> {
+        let pool = self.pools.v4?;
         if self.auto_full {
             return None;
         }
-        let size = u32::try_from(AUTO.size().expect("the IPv4 pool has a finite size"))
-            .expect("the IPv4 pool size fits in u32");
-        for _ in 0..size {
+        // The offset of the pool's last address. Its length is at most 30.
+        let last = u32::MAX >> pool.len;
+        for _ in 0..=u64::from(last) {
             let n = self.next_auto;
-            self.next_auto = (self.next_auto + 1) % size;
-            if n == 0 || n == size - 1 {
+            self.next_auto = if n >= last { 0 } else { n + 1 };
+            if n == 0 || n == last {
                 continue;
             }
-            let IpAddr::V4(a) = AUTO
+            let IpAddr::V4(a) = pool
                 .nth(n.into())
                 .expect("the cursor is inside the IPv4 pool")
             else {
                 unreachable!("the IPv4 pool contains IPv4 addresses")
             };
-            if !subnet.contains(a) && !occupied.contains_key(&a.into()) {
+            if may_serve_v4(a, subnet) && !occupied.contains_key(&a.into()) {
                 return Some(a);
             }
         }
@@ -209,29 +250,44 @@ impl Allocator {
         None
     }
 
+    /// The next free IPv6 address of the pool, after the last one handed
+    /// out: not the pool's first address, not occupied, and one a host may
+    /// have here. Ranges no host may have are stepped over whole, so the
+    /// search takes at most one step per occupied address and two per such
+    /// range. `None` when there is no pool or it is full.
     pub(super) fn free_auto6<T>(
         &mut self,
         subnet: &Subnet6,
         occupied: &BTreeMap<IpAddr, T>,
     ) -> Option<Ipv6Addr> {
-        let size = AUTO6.size().expect("the IPv6 pool has a finite size");
-        if subnet.prefix.len <= AUTO6.len && subnet.prefix.overlaps(AUTO6) {
+        let pool = self.pools.v6?;
+        let mut skipped = NOT_HOSTS_V6.to_vec();
+        skipped.push(subnet.prefix);
+        if skipped
+            .iter()
+            .any(|s| s.len <= pool.len && s.overlaps(pool))
+        {
             return None;
         }
-        for _ in 0..occupied.len() + 4 {
+        // The offset of the pool's last address. Its length is at most 127.
+        let last = u128::MAX >> pool.len;
+        for _ in 0..occupied.len() + 2 * skipped.len() + 2 {
             let n = self.next_auto6;
-            self.next_auto6 = (self.next_auto6 + 1) % size;
+            self.next_auto6 = n.wrapping_add(1) & last;
             if n == 0 {
                 continue;
             }
-            let IpAddr::V6(a) = AUTO6.nth(n).expect("the cursor is inside the IPv6 pool") else {
+            let IpAddr::V6(a) = pool.nth(n).expect("the cursor is inside the IPv6 pool") else {
                 unreachable!("the IPv6 pool contains IPv6 addresses")
             };
-            if subnet.contains(a) {
-                let IpAddr::V6(last) = subnet.prefix.last() else {
-                    unreachable!("an IPv6 subnet has an IPv6 last address")
+            if let Some(range) = skipped.iter().find(|s| s.contains(a.into())) {
+                let IpAddr::V6(end) = range.last() else {
+                    unreachable!("an IPv6 range has an IPv6 last address")
                 };
-                self.next_auto6 = (n + (u128::from(last) - u128::from(a)) + 1) % size;
+                self.next_auto6 = n
+                    .wrapping_add(u128::from(end) - u128::from(a))
+                    .wrapping_add(1)
+                    & last;
                 continue;
             }
             if !occupied.contains_key(&a.into()) {
@@ -469,16 +525,101 @@ mod tests {
     use super::*;
     use fictionet::stdlib::test_support::rounds;
 
-    #[test]
-    fn default_pools_avoid_non_public_ranges() {
-        use fictionet::stdlib::network::ip::{LOCAL_RANGES, RESERVED_RANGES, non_public_address};
-        for pool in [AUTO, AUTO6] {
-            assert!(!non_public_address(pool.addr));
-            assert!(!non_public_address(pool.last()));
-            for reserved in RESERVED_RANGES.into_iter().chain(LOCAL_RANGES) {
-                assert!(!pool.overlaps(reserved), "{pool:?} overlaps {reserved:?}");
-            }
+    fn pools(v4: &str, v6: &str) -> Pools {
+        Pools {
+            v4: Some(v4.parse().unwrap()),
+            v6: Some(v6.parse().unwrap()),
         }
+    }
+
+    #[test]
+    fn automatic_addresses_come_from_the_supplied_pools() {
+        let subnet = Subnet::new("10.0.0.0/24".parse().unwrap()).unwrap();
+        let s6 = subnet6("2001:db8::/64").unwrap();
+        for (pools, first, first6) in [
+            (TEST_POOLS, "104.18.0.1", "2606:4700:100::1"),
+            (
+                pools("23.32.0.0/11", "2a02:26f0::/32"),
+                "23.32.0.1",
+                "2a02:26f0::1",
+            ),
+        ] {
+            let mut w = World::new(MAX_HOSTS, pools);
+            assert_eq!(w.free_auto(&subnet), Some(first.parse().unwrap()));
+            assert_eq!(w.free_auto6(&s6), Some(first6.parse().unwrap()));
+        }
+        let mut w = World::new(MAX_HOSTS, Pools::NONE);
+        assert_eq!(w.free_auto(&subnet), None);
+        assert_eq!(w.free_auto6(&s6), None);
+    }
+
+    #[test]
+    fn pools_are_checked_for_family_and_room() {
+        for good in [
+            Pools::NONE,
+            TEST_POOLS,
+            pools("0.0.0.0/0", "::/0"),
+            pools("192.0.2.0/30", "2001:db8:1::/127"),
+        ] {
+            assert!(check_pools(&good).is_ok(), "{good:?}");
+        }
+        for bad in [
+            pools("192.0.2.0/31", "2001:db8:1::/64"),
+            pools("192.0.2.0/24", "2001:db8:1::/128"),
+            pools("2001:db8:1::/64", "2001:db8:1::/64"),
+            pools("192.0.2.0/24", "192.0.2.0/24"),
+        ] {
+            assert!(check_pools(&bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn whole_address_space_pools_wrap_without_overflow() {
+        let subnet = Subnet::new("10.0.0.0/24".parse().unwrap()).unwrap();
+        let s6 = subnet6("2001:db8::/64").unwrap();
+        let mut w = World::new(MAX_HOSTS, pools("0.0.0.0/0", "::/0"));
+        assert_eq!(w.free_auto(&subnet), Some("0.0.0.1".parse().unwrap()));
+        w.addresses.next_auto = u32::MAX - 1;
+        assert_eq!(
+            w.free_auto(&subnet),
+            Some("255.255.255.254".parse().unwrap())
+        );
+        assert_eq!(w.free_auto(&subnet), Some("0.0.0.1".parse().unwrap()));
+        // `::1` is loopback, so `::2` is the first.
+        assert_eq!(w.free_auto6(&s6), Some("::2".parse().unwrap()));
+        // Multicast runs to the end of the space; the search wraps to the start.
+        w.addresses.next_auto6 = u128::MAX - 1;
+        assert_eq!(w.free_auto6(&s6), Some("::2".parse().unwrap()));
+        // The subnet and link-local space are stepped over whole.
+        w.addresses.next_auto6 = u128::from("2001:db8::5".parse::<Ipv6Addr>().unwrap());
+        assert_eq!(w.free_auto6(&s6), Some("2001:db8:0:1::".parse().unwrap()));
+        w.addresses.next_auto6 = u128::from("fe80::".parse::<Ipv6Addr>().unwrap());
+        assert_eq!(w.free_auto6(&s6), Some("fec0::".parse().unwrap()));
+    }
+
+    #[test]
+    fn the_smallest_pools_hand_out_their_usable_addresses() {
+        let subnet = Subnet::new("10.0.0.0/24".parse().unwrap()).unwrap();
+        let s6 = subnet6("2001:db8::/64").unwrap();
+        let mut w = World::new(MAX_HOSTS, pools("192.0.2.4/30", "2001:db8:1::/127"));
+        let mut occupied = BTreeMap::new();
+        for want in ["192.0.2.5", "192.0.2.6"] {
+            let a = w.addresses.free_auto(&subnet, &occupied).unwrap();
+            assert_eq!(a, want.parse::<Ipv4Addr>().unwrap());
+            occupied.insert(IpAddr::V4(a), ());
+        }
+        assert_eq!(w.addresses.free_auto(&subnet, &occupied), None);
+        assert!(w.addresses.auto_full);
+        let a = w.addresses.free_auto6(&s6, &occupied).unwrap();
+        assert_eq!(a, "2001:db8:1::1".parse::<Ipv6Addr>().unwrap());
+        occupied.insert(IpAddr::V6(a), ());
+        assert_eq!(w.addresses.free_auto6(&s6, &occupied), None);
+        let mut w = World::new(MAX_HOSTS, pools("192.0.2.0/24", "fe80:1::/64"));
+        assert_eq!(
+            w.free_auto6(&s6),
+            None,
+            "no host may have link-local addresses"
+        );
     }
 
     #[test]
@@ -505,7 +646,7 @@ mod tests {
                     subnet: Subnet::new("10.0.0.0/24".parse().unwrap()).unwrap(),
                     subnet6: Some(Subnet6::new("2001:db8::/64".parse().unwrap()).unwrap()),
                     router: route::router(&fcx, Vec::new()),
-                    world: Arc::new(Mutex::new(World::new(MAX_HOSTS))),
+                    world: Arc::new(Mutex::new(World::new(MAX_HOSTS, TEST_POOLS))),
                     leases: Arc::default(),
                     gateway_tcp: Arc::default(),
                     hooks: Arc::new(Hooks {
@@ -555,7 +696,7 @@ mod tests {
                     subnet: Subnet::new("104.18.0.0/15".parse().unwrap()).unwrap(),
                     subnet6: None,
                     router: route::router(&fcx, Vec::new()),
-                    world: Arc::new(Mutex::new(World::new(MAX_HOSTS))),
+                    world: Arc::new(Mutex::new(World::new(MAX_HOSTS, TEST_POOLS))),
                     leases: Arc::default(),
                     gateway_tcp: Arc::default(),
                     hooks: Arc::new(Hooks {
@@ -592,7 +733,7 @@ mod tests {
     #[test]
     fn a_full_automatic_range_is_not_scanned_again() {
         for size in [rounds(2_000_000), 4 * (rounds(2_000_000))] {
-            let mut w = World::new(MAX_HOSTS);
+            let mut w = World::new(MAX_HOSTS, TEST_POOLS);
             let subnet = Subnet::new(Prefix {
                 addr: Ipv4Addr::new(104, 0, 0, 0).into(),
                 len: 8,
@@ -633,7 +774,7 @@ mod tests {
 
     #[test]
     fn automatic_pool_boundaries() {
-        let mut w = World::new(MAX_HOSTS);
+        let mut w = World::new(MAX_HOSTS, TEST_POOLS);
         let subnet = Subnet::new("10.0.0.0/24".parse().unwrap()).unwrap();
         w.addresses.next_auto = (1 << 17) - 2;
         assert_eq!(
@@ -644,7 +785,7 @@ mod tests {
         let inside = Subnet::new("104.18.0.0/16".parse().unwrap()).unwrap();
         assert_eq!(w.free_auto(&inside), Some("104.19.0.0".parse().unwrap()));
         assert_eq!(
-            World::new(MAX_HOSTS)
+            World::new(MAX_HOSTS, TEST_POOLS)
                 .free_auto(&Subnet::new("104.18.0.0/15".parse().unwrap()).unwrap()),
             None
         );
@@ -699,18 +840,18 @@ mod tests {
 
     #[test]
     fn automatic_ipv6_addresses_count_up_and_skip_the_subnet() {
-        let mut w = World::new(MAX_HOSTS);
+        let mut w = World::new(MAX_HOSTS, TEST_POOLS);
         let s = subnet6("2001:db8::/64").unwrap();
         assert_eq!(w.free_auto6(&s), Some("2606:4700:100::1".parse().unwrap()));
         assert_eq!(w.free_auto6(&s), Some("2606:4700:100::2".parse().unwrap()));
-        let mut w = World::new(MAX_HOSTS);
+        let mut w = World::new(MAX_HOSTS, TEST_POOLS);
         let inside = subnet6("2606:4700:100::/120").unwrap();
         assert_eq!(
             w.free_auto6(&inside),
             Some("2606:4700:100::100".parse().unwrap())
         );
         assert_eq!(
-            World::new(MAX_HOSTS).free_auto6(&subnet6("2606::/16").unwrap()),
+            World::new(MAX_HOSTS, TEST_POOLS).free_auto6(&subnet6("2606::/16").unwrap()),
             None
         );
     }

@@ -138,7 +138,7 @@ async fn episode(
     let (attacher, attachments) = fictionet::attachments();
     let office = fictionet::stdlib::world::net::Lan::new("office", "192.168.10.0/24".parse()?);
     let web_lan = fictionet::stdlib::world::net::Lan::new("web", "192.168.20.0/24".parse()?);
-    Net::new()
+    Net::new(fictionet_extras::network::cdn_pools())
         .ipv4_only()
         .lan(&office)
         .lan(&web_lan)
@@ -339,7 +339,7 @@ fn https_sites_with_lab_ca_and_axum_repeat() {
                 async move { format!("hello {draw}") }
             });
             let (attacher, attachments) = fictionet::attachments();
-            web::Sites::new(move |name| {
+            web::Sites::new(fictionet_extras::network::cdn_pools(), move |name| {
                 (name == "site.test").then(|| web::Site::new(app.clone()).tls(config.clone()))
             })
             .date(date)

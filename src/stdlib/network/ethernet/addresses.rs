@@ -19,7 +19,7 @@ use fictionet::stdlib::protocols::ndp::{
     self, ALL_NODES, NdOption, PrefixInformation, RouterAdvertisement,
 };
 
-use super::frame;
+use super::frame::{self, Mac};
 
 /// An address with its prefix length, such as `10.0.0.2/24`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -157,7 +157,8 @@ fn mask4(prefix: u8) -> Ipv4Addr {
 // Router advertisements
 
 /// A router advertisement for the VM's link, as an IPv6 packet from
-/// the link's link-local address to all nodes. It says:
+/// the link-local address of `gateway`, the link's MAC, to all nodes. It
+/// says:
 ///
 /// - addresses come from DHCPv6 (the "managed" and "other" flags), so the
 ///   VM takes the one address the link hands out, not one of its own making;
@@ -165,7 +166,7 @@ fn mask4(prefix: u8) -> Ipv4Addr {
 ///   that subnet directly;
 /// - the link is the default router, if the lease has a gateway;
 /// - the MTU, and the lease's DNS server, if there is one.
-pub(super) fn router_advert(lease: &Lease<Ipv6Addr>, mtu: u16) -> Vec<u8> {
+pub(super) fn router_advert(lease: &Lease<Ipv6Addr>, mtu: u16, gateway: Mac) -> Vec<u8> {
     let IpAddr::V6(net) = (Prefix {
         addr: lease.addr.addr.into(),
         len: lease.addr.prefix,
@@ -174,7 +175,7 @@ pub(super) fn router_advert(lease: &Lease<Ipv6Addr>, mtu: u16) -> Vec<u8> {
         unreachable!("an IPv6 lease has an IPv6 network address")
     };
     let mut options = vec![
-        NdOption::SourceLinkLayer(frame::GATEWAY_MAC),
+        NdOption::SourceLinkLayer(gateway),
         NdOption::Mtu(u32::from(mtu)),
         // On-link, but not for making addresses.
         NdOption::PrefixInformation(PrefixInformation {
@@ -203,18 +204,20 @@ pub(super) fn router_advert(lease: &Lease<Ipv6Addr>, mtu: u16) -> Vec<u8> {
         retrans_timer: 0,
         options,
     })
-    .packet(frame::link_local(frame::GATEWAY_MAC), ALL_NODES)
+    .packet(frame::link_local(gateway), ALL_NODES)
     .expect("a router advertisement from a link-local address to all nodes is valid")
 }
 
 // DHCPv6
 
-/// The link's DHCPv6 server ID: a DUID made from its MAC (DUID-LL).
-fn server_duid() -> Duid {
-    Duid::ll(dhcpv6::hardware::ETHERNET, &frame::GATEWAY_MAC)
+/// The link's DHCPv6 server ID: a DUID made from its MAC, `gateway`
+/// (DUID-LL).
+pub(super) fn server_duid(gateway: Mac) -> Duid {
+    Duid::ll(dhcpv6::hardware::ETHERNET, &gateway)
 }
 
-/// The answer to one DHCPv6 message from the VM, as the UDP payload.
+/// The answer to one DHCPv6 message from the VM, as the UDP payload, from
+/// the server whose DUID is made from `gateway`.
 /// `None` when no answer is due: a malformed message, one for another server,
 /// one missing a required client ID, or a type a server does not answer. Returns
 /// `None` if the answer exceeds `budget` bytes or an option or UDP length limit.
@@ -222,6 +225,7 @@ fn server_duid() -> Duid {
 /// others get UseMulticast.
 pub(super) fn dhcp6(
     lease: &Lease<Ipv6Addr>,
+    gateway: Mac,
     budget: usize,
     request: &[u8],
     multicast: bool,
@@ -231,7 +235,7 @@ pub(super) fn dhcp6(
     if request.client_id().is_none() && kind != msg::INFORMATION_REQUEST {
         return None;
     }
-    let server = server_duid();
+    let server = server_duid(gateway);
     let server_ok = match kind {
         msg::SOLICIT | msg::CONFIRM | msg::REBIND => request.server_id().is_none(),
         msg::REQUEST | msg::RENEW | msg::RELEASE | msg::DECLINE => {
@@ -376,11 +380,11 @@ fn confirm(lease: &Lease<Ipv6Addr>, request: &Message) -> Option<u16> {
 
 #[cfg(test)]
 pub(super) mod tests {
-    use super::frame::tests::{VM, v6_checksum_ok};
+    use super::frame::tests::{GATEWAY, VM, v6_checksum_ok};
     use super::*;
 
     fn dhcp6(lease: &Lease<Ipv6Addr>, budget: usize, request: &[u8]) -> Option<Vec<u8>> {
-        super::dhcp6(lease, budget, request, true)
+        super::dhcp6(lease, GATEWAY, budget, request, true)
     }
 
     pub(crate) fn lease4() -> Lease<Ipv4Addr> {
@@ -630,10 +634,10 @@ pub(super) mod tests {
 
     #[test]
     fn router_advert_says_managed_on_link_and_dns() {
-        let p = router_advert(&lease6(), 1500);
+        let p = router_advert(&lease6(), 1500, GATEWAY);
         assert!(v6_checksum_ok(&p));
         assert_eq!(p[7], 255);
-        assert_eq!(frame::source_v6(&p), frame::link_local(frame::GATEWAY_MAC));
+        assert_eq!(frame::source_v6(&p), frame::link_local(GATEWAY));
         assert_eq!(&p[24..40], &ALL_NODES.octets());
         let ra = &p[40..];
         assert_eq!(ra[0], ndp::kind::ROUTER_ADVERTISEMENT);
@@ -665,6 +669,7 @@ pub(super) mod tests {
                 ..lease6()
             },
             1500,
+            GATEWAY,
         );
         assert_eq!(
             u16::from_be_bytes([p[46], p[47]]),
@@ -682,7 +687,7 @@ pub(super) mod tests {
             msg::REQUEST | msg::RENEW | msg::RELEASE | msg::DECLINE
         ) && !options.iter().any(|o| matches!(o, DhcpOption::ServerId(_)))
         {
-            m.options.push(DhcpOption::ServerId(server_duid()));
+            m.options.push(DhcpOption::ServerId(server_duid(GATEWAY)));
         }
         m.options.extend(options);
         m
@@ -785,9 +790,9 @@ pub(super) mod tests {
         assert_eq!(adv.msg_type, msg::ADVERTISE);
         assert_eq!(adv.transaction, 0xabcdef);
         assert_eq!(adv.client_id(), Some(&Duid(CLIENT.to_vec())));
-        assert_eq!(adv.server_id(), Some(&server_duid()));
+        assert_eq!(adv.server_id(), Some(&server_duid(GATEWAY)));
         assert_eq!(
-            server_duid().0,
+            server_duid(GATEWAY).0,
             [0, 3, 0, 1, 0x74, 0x83, 0xc2, 0x9a, 0x47, 0xd1]
         );
         assert_eq!(
@@ -945,7 +950,7 @@ pub(super) mod tests {
                     msg::REQUEST,
                     &[
                         (opt::CLIENTID, CLIENT),
-                        (opt::SERVERID, &server_duid().0),
+                        (opt::SERVERID, &server_duid(GATEWAY).0),
                         (code, &vec![7; len]),
                     ],
                 );
@@ -1073,7 +1078,7 @@ pub(super) mod tests {
             &[
                 (opt::CLIENTID, CLIENT),
                 (opt::CLIENTID, &[7; dhcpv6::MIN_DUID]),
-                (opt::SERVERID, &server_duid().0),
+                (opt::SERVERID, &server_duid(GATEWAY).0),
                 (opt::SERVERID, &[7; dhcpv6::MIN_DUID]),
                 (65000, &[0xff]),
                 // Unusual DNS label bytes stay opaque under the shared codec.
@@ -1083,7 +1088,7 @@ pub(super) mod tests {
         let reply = dhcp6(&lease6(), 1500 - 48, &request).unwrap();
         let reply = Message::parse(&reply).unwrap();
         assert_eq!(reply.client_id(), Some(&Duid(CLIENT.to_vec())));
-        assert_eq!(reply.server_id(), Some(&server_duid()));
+        assert_eq!(reply.server_id(), Some(&server_duid(GATEWAY)));
         assert!(reply.option(65000).is_none());
     }
 }

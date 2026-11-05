@@ -13,6 +13,7 @@ pub mod ssh;
 mod util;
 pub mod vm;
 use fictionet::stdlib::network::ethernet::Family;
+use fictionet::stdlib::network::ethernet::frame::Mac;
 use fictionet::{Attachments, Cx, Seed};
 pub use page::{PAGE_PORT, PageAccess};
 use std::future::Future;
@@ -124,6 +125,7 @@ pub struct Guest<P = Installation> {
     memory_mib: u32,
     manufacturer: String,
     product: String,
+    gateway: Mac,
     family: Family<Ipv4Addr>,
     desktop: Option<(u16, String)>,
     terminal: Option<String>,
@@ -131,8 +133,10 @@ pub struct Guest<P = Installation> {
 }
 
 impl<P: Software> Guest<P> {
-    /// Creates an Ubuntu guest with 2 vCPUs, 2048 MiB, and `Family::FromWorld`.
-    /// DMI defaults to manufacturer `LENOVO` and product `20UES000-WS`.
+    /// Creates an Ubuntu guest with 2 vCPUs, 2048 MiB, and a card behind a
+    /// Ubiquiti router ([`fictionet_extras::network::UBIQUITI_ROUTER`]) with
+    /// `Family::FromWorld`. DMI defaults to manufacturer `LENOVO` and
+    /// product `20UES000-WS`.
     fn base(hostname: &str, user: &str, software: P) -> Self {
         Self {
             software,
@@ -144,6 +148,7 @@ impl<P: Software> Guest<P> {
             memory_mib: 2048,
             manufacturer: "LENOVO".into(),
             product: "20UES000-WS".into(),
+            gateway: fictionet_extras::network::UBIQUITI_ROUTER,
             family: Family::FromWorld,
             desktop: None,
             terminal: None,
@@ -168,8 +173,10 @@ impl<P: Software> Guest<P> {
         self.product = product.into();
         self
     }
-    /// Sets the card family, defaulting to `Family::FromWorld` for DHCP.
-    pub fn card(mut self, family: Family<Ipv4Addr>) -> Self {
+    /// Sets the card: the MAC of the gateway it sees, and its family,
+    /// defaulting to a Ubiquiti router and `Family::FromWorld` for DHCP.
+    pub fn card(mut self, gateway: Mac, family: Family<Ipv4Addr>) -> Self {
+        self.gateway = gateway;
         self.family = family;
         self
     }
@@ -237,8 +244,13 @@ impl<P: Software> Guest<P> {
                 )));
             }
         }
-        fictionet::stdlib::network::ethernet::Link::new(self.family.clone(), Family::Off, MTU)
-            .map_err(|e| io::Error::other(format!("{}: invalid card: {e}", self.hostname)))?;
+        fictionet::stdlib::network::ethernet::Link::new(
+            self.gateway,
+            self.family.clone(),
+            Family::Off,
+            MTU,
+        )
+        .map_err(|e| io::Error::other(format!("{}: invalid card: {e}", self.hostname)))?;
         if self.attachment.is_empty()
             || self.attachment == JUMP
             || self.vcpus == 0
@@ -488,6 +500,7 @@ impl<P: Software + Into<Boot>> Guest<P> {
             memory_mib: self.memory_mib,
             manufacturer: self.manufacturer,
             product: self.product,
+            gateway: self.gateway,
             family: self.family,
             desktop: self.desktop,
             terminal: self.terminal,
@@ -815,6 +828,7 @@ struct Bridge {
     frames: tokio::sync::mpsc::Receiver<Vec<u8>>,
     queue: net::RxQueue,
     link: fictionet::End,
+    gateway: Mac,
     family: Family<Ipv4Addr>,
     address: watch::Sender<Option<Ipv4Addr>>,
 }
@@ -907,6 +921,7 @@ fn prepare<P: Software + Into<Boot>>(
             frames,
             queue,
             link,
+            gateway: guest.gateway,
             family: guest.family.clone(),
             address: tx_addr,
         });
@@ -1017,6 +1032,7 @@ impl Run {
                             b.queue,
                             b.link,
                             fcx.clone(),
+                            b.gateway,
                             b.family,
                             b.address,
                         ))

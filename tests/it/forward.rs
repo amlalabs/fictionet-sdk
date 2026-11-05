@@ -140,7 +140,7 @@ async fn a_chunked_upstream_answer_reaches_the_agent_chunked() {
             upstream,
             std::sync::Arc::new(fictionet_host::Client::new()),
         )?;
-        web::Sites::new(move |name: &str| {
+        web::Sites::new(fictionet_extras::network::cdn_pools(), move |name: &str| {
             (name == "clone.test").then(|| web::Site::new(forward.clone()))
         })
         .start(&fcx, attachments)?;

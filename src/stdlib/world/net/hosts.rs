@@ -552,7 +552,7 @@ pub(super) struct World {
 }
 
 impl World {
-    pub(super) fn new(max_hosts: usize) -> World {
+    pub(super) fn new(max_hosts: usize, pools: super::Pools) -> World {
         World {
             names: Names::default(),
             unknown: 0,
@@ -560,7 +560,7 @@ impl World {
             resolved: 0,
             max_hosts,
             machines: BTreeMap::new(),
-            addresses: Allocator::default(),
+            addresses: Allocator::new(pools),
         }
     }
 
@@ -1426,7 +1426,7 @@ pub(super) async fn pings(fcx: Cx, mut icmp: End, addr: IpAddr) -> fictionet::Re
 
 #[cfg(test)]
 mod tests {
-    use super::super::{MAX_HOSTS, Net};
+    use super::super::{MAX_HOSTS, Net, TEST_POOLS};
     use super::*;
 
     #[test]
@@ -1451,7 +1451,7 @@ mod tests {
             fictionet::Seed::random(),
             |fcx| async move {
                 let log = Arc::new(Mutex::new(Vec::new()));
-                let mut net = Net::new().ipv4_only();
+                let mut net = Net::new(TEST_POOLS).ipv4_only();
                 for name in ["z.test", "a.test", "m.test", "b.test", "y.test"] {
                     net = net.host(name, |h| {
                         h.at(Ipv4Addr::new(203, 0, 113, 8)).tls_accept(
@@ -1505,7 +1505,7 @@ mod tests {
             fictionet::block_on(fictionet::run(
                 fictionet::Seed::random(),
                 move |fcx| async move {
-                    let mut net = Net::new().ipv4_only();
+                    let mut net = Net::new(TEST_POOLS).ipv4_only();
                     for (name, answers) in
                         [("a.test", answering_first), ("b.test", !answering_first)]
                     {
@@ -1531,7 +1531,7 @@ mod tests {
 
     #[test]
     fn names_without_a_host_are_remembered_up_to_a_limit() {
-        let mut w = World::new(MAX_HOSTS);
+        let mut w = World::new(MAX_HOSTS, TEST_POOLS);
         assert_eq!(w.max_unknown, 100_000);
         w.max_unknown = 3;
         for i in 0..10 {
@@ -1548,7 +1548,7 @@ mod tests {
             );
         }
         assert_eq!((w.names.len(), w.resolved), (13, 10));
-        let mut w = World::new(MAX_HOSTS);
+        let mut w = World::new(MAX_HOSTS, TEST_POOLS);
         w.remember(&"\\255".repeat(64), Known::NoHost);
         assert!(w.names.is_empty());
     }

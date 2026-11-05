@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use crate::config::{AttachArgs, ProxyArgs, ProxyKind, ResolvConf, TapArgs, VmLink};
 use clap::{Args, Parser, Subcommand};
+use fictionet::stdlib::network::ethernet::frame::{self, Mac};
 use fictionet::stdlib::network::ethernet::{Cidr, Family, Lease};
 
 #[derive(Parser)]
@@ -76,6 +77,10 @@ struct Tap {
     vm: VmLink,
     #[arg(long)]
     netns: Option<PathBuf>,
+    /// The gateway's MAC, as the VM sees it, such as 74:83:c2:9a:47:d1.
+    /// Keep it the same across restarts.
+    #[arg(long, value_parser = parse_mac)]
+    gateway_mac: Mac,
     /// Supply an IPv4 lease. Omit to pass the VM's DHCP to the world.
     #[arg(long, value_parser = parse_v4, conflicts_with = "no_ip_addr")]
     ip_addr: Option<Cidr<Ipv4Addr>>,
@@ -192,6 +197,7 @@ pub(crate) fn parse_attach(args: &[String]) -> Result<Parsed, String> {
                 world_wait: Duration::from_secs(t.common.world_wait.into()),
                 vm: t.vm,
                 netns: t.netns,
+                gateway_mac: t.gateway_mac,
                 mtu: t.mtu,
                 v4: family(t.ip_addr, t.gateway, t.dns, t.no_ip_addr),
                 v6: family(t.ip_addr_v6, t.gateway_v6, t.dns_v6, t.no_ip_addr_v6),
@@ -264,6 +270,27 @@ fn parse_vm(s: &str) -> Result<VmLink, String> {
         Some(("tap", name)) => parse_ifname(name).map(VmLink::Tap),
         _ => Err("--vm must be qemu:<path> or tap:<ifname>".into()),
     }
+}
+
+/// A unicast MAC written as six pairs of hex digits joined by colons.
+fn parse_mac(s: &str) -> Result<Mac, String> {
+    let mut mac = [0; 6];
+    let mut parts = s.split(':');
+    for byte in &mut mac {
+        let part = parts
+            .next()
+            .filter(|p| p.len() == 2)
+            .ok_or("expected a MAC such as 74:83:c2:9a:47:d1")?;
+        *byte =
+            u8::from_str_radix(part, 16).map_err(|_| "expected a MAC such as 74:83:c2:9a:47:d1")?;
+    }
+    if parts.next().is_some() {
+        return Err("expected a MAC such as 74:83:c2:9a:47:d1".into());
+    }
+    if frame::is_group(&mac) || mac == [0; 6] {
+        return Err("the gateway MAC must be a unicast address".into());
+    }
+    Ok(mac)
 }
 
 fn parse_cidr<A: std::str::FromStr>(s: &str, max: u8) -> Result<Cidr<A>, String> {
@@ -352,16 +379,18 @@ mod tests {
                 );
             }
         }
-        assert!(parse("tap --world unix:/w --name a --vm qemu:/v --resolv-conf /r").is_err());
+        assert!(parse("tap --world unix:/w --name a --vm qemu:/v --gateway-mac 74:83:c2:9a:47:d1 --resolv-conf /r").is_err());
         assert!(parse("tun --world unix:/w --name a --listen 127.0.0.1:0").is_err());
     }
 
     #[test]
     fn tap_distinguishes_supplied_forwarded_and_disabled_leases() {
-        let base = "tap --world unix:/w --name a --vm tap:vm0 --netns /n";
+        let base =
+            "tap --world unix:/w --name a --vm tap:vm0 --netns /n --gateway-mac 74:83:c2:9a:47:d1";
         let Parsed::Tap(t) = parse(base).unwrap() else {
             panic!()
         };
+        assert_eq!(t.gateway_mac, [0x74, 0x83, 0xc2, 0x9a, 0x47, 0xd1]);
         assert_eq!(t.v4, Family::FromWorld);
         assert_eq!(t.v6, Family::FromWorld);
         let Parsed::Tap(t) = parse(&format!(
@@ -403,11 +432,34 @@ mod tests {
         ] {
             assert!(
                 parse(&format!(
-                    "tap --world unix:/w --name a --vm qemu:/v {extra}"
+                    "tap --world unix:/w --name a --vm qemu:/v --gateway-mac 74:83:c2:9a:47:d1 {extra}"
                 ))
                 .is_err(),
                 "{extra}"
             );
+        }
+    }
+
+    #[test]
+    fn tap_needs_a_unicast_gateway_mac() {
+        let base = "tap --world unix:/w --name a --vm qemu:/v";
+        let Parsed::Tap(t) = parse(&format!("{base} --gateway-mac 00:1d:aa:41:0c:5e")).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(t.gateway_mac, [0x00, 0x1d, 0xaa, 0x41, 0x0c, 0x5e]);
+        for bad in [
+            "",
+            "--gateway-mac 74:83:c2:9a:47",
+            "--gateway-mac 74:83:c2:9a:47:d1:00",
+            "--gateway-mac 74-83-c2-9a-47-d1",
+            "--gateway-mac 74:83:c2:9a:47:zz",
+            "--gateway-mac 74:83:c2:9a:47:d",
+            "--gateway-mac 01:00:5e:00:00:01",
+            "--gateway-mac ff:ff:ff:ff:ff:ff",
+            "--gateway-mac 00:00:00:00:00:00",
+        ] {
+            assert!(parse(&format!("{base} {bad}")).is_err(), "{bad}");
         }
     }
 

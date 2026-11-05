@@ -32,6 +32,9 @@ pub mod args;
 pub mod hyper_io;
 pub mod linux;
 pub mod log;
+pub mod network;
+pub mod ntp;
+pub mod sql_server;
 pub mod whois;
 
 #[cfg(not(target_arch = "wasm32"))]

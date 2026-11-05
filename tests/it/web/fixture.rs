@@ -176,7 +176,7 @@ pub(super) fn sites(fcx: &Cx) -> TestSites {
             }
         },
     );
-    let sites = web::Sites::new(move |host| {
+    let sites = web::Sites::new(fictionet_extras::network::cdn_pools(), move |host| {
         calls.fetch_add(1, Ordering::SeqCst);
         match host {
             "secure.test" => Some(

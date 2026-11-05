@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use fictionet::stdlib::codec::{Collect, Wire};
-use fictionet::stdlib::protocols::ntp::{self, Packet, ServerInfo, Timestamp};
+use fictionet::stdlib::protocols::ntp::{self, Leap, Packet, ServerInfo, Timestamp};
 use fictionet::stdlib::services::serve::{DatagramDriver, DatagramFlow, DatagramService};
 use fictionet::stdlib::world::net::Host;
 
@@ -43,12 +43,16 @@ impl DatagramService for TimeServer {
         let at = pages.session_now();
         let now = timestamp(at);
         // Answers as a stratum 2 pool server does: synced to an upstream
-        // server a minute ago.
+        // server a minute ago, a few milliseconds away, with a clock read
+        // to tens of nanoseconds and no leap second coming.
         let server = ServerInfo {
+            leap: Leap::None,
             stratum: 2,
+            precision: -24,
+            root_delay: 0x0000_00a4,
+            root_dispersion: 0x0000_0049,
             reference_id: [194, 58, 204, 148],
             reference: timestamp(at - std::time::Duration::from_secs(64)),
-            ..ServerInfo::default()
         };
         // A packet that is not a request, such as a server's reply, gets
         // no answer, as from a real server.

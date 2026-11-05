@@ -274,10 +274,16 @@ impl Proxy {
                         );
                         let page = Page(Bytes::from_static(b"plain site\n"));
 
-                        web::Sites::new(move |host: &str| {
-                            (host == "plain.test")
-                                .then(|| web::Site::new(page.clone()).plain_http())
-                        })
+                        web::Sites::new(
+                            fictionet::stdlib::world::net::Pools {
+                                v4: Some("104.18.0.0/15".parse().unwrap()),
+                                v6: Some("2606:4700:100::/48".parse().unwrap()),
+                            },
+                            move |host: &str| {
+                                (host == "plain.test")
+                                    .then(|| web::Site::new(page.clone()).plain_http())
+                            },
+                        )
                         .start(&fcx, attachments)?;
                         while !stop.load(Ordering::Acquire) {
                             fcx.sleep(fictionet::time::ms(10)).await?;
